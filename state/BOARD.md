@@ -1,6 +1,6 @@
 # Recursion board — live registry
 
-Tick: 2026-08-10T15:15:01Z  ·  rendered 2026-09-02T21:08:45Z
+Tick: 2026-08-10T15:15:01Z  ·  rendered 2026-09-02T21:10:08Z
 
 | Workstream | Tier | Model | State | Started | Tokens | $ metered | Note |
 |---|---|---|---|---|---|---|---|
@@ -11,3 +11,4 @@ Tick: 2026-08-10T15:15:01Z  ·  rendered 2026-09-02T21:08:45Z
 | guerra-construction-group | cursor | cursor | blocked | 20:32:07Z | - | 0.0000 | invalid worker result |
 | guerra-construction-group | cursor | cursor | running | 20:59:58Z | - | - | Add the minimal reduced-motion-aware Len |
 | guerra-construction-group | cursor | cursor | done | 21:04:39Z | - | 0.0000 | passed -> loop/work/guerra-004-phase5-lenis-wire-canary at e5b0514a4fe2155a22c4b7290c029c9e372eefc3 (independently verified) metered:cursor |
+| guerra-construction-group | cursor | cursor | running | 21:10:08Z | - | - | Add the minimal reduced-motion-aware Len |

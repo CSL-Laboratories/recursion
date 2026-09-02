@@ -11,12 +11,12 @@ workdir: apps/web
 allowed_paths: apps/web/src/components/motion
 non_goals: auth, portal, API, GSAP pinning, content rewrites, dependency upgrades beyond what is required to import lenis (lenis already in package.json)
 autonomy: supervised
-status: running
-lease_expires: 1788339142
-finished_at: 2026-09-02T07:18:28Z
+status: failed
+lease_expires: 0
+finished_at: 2026-09-02T07:27:33Z
 evidence: acceptance test failed after retry
-event_seq: 14
-last_transition_id: transition-153e64a363ad90778b58228e38708df1
+event_seq: 15
+last_transition_id: transition-3f9cca445a61b1571f65eb1ee5d2d386
 lease_owner: work.sh:378282@gs-recursion-nbg
 attempts: 7
 started_at: 2026-09-02T07:22:22Z

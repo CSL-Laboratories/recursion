@@ -223,3 +223,11 @@ Close it with: `recursion resolve guerra-001-lenis-provider "<what you decided>"
 
 ## REQUEUED 2026-09-02T07:22:15Z — guerra-001-lenis-provider
 acceptance fix: drop redundant cd apps/web (workdir already apps/web)
+
+## build escalation — guerra-001-lenis-provider  (2026-09-02T07:27:33Z)
+**Workstream:** guerra-construction-group
+**Pointer:** state/tasks/guerra-001-lenis-provider.md · branch loop/work/guerra-001-lenis-provider · arm log loop/logs/2026-09-02-arm-guerra-001-lenis-provider-072217.out
+Blocked on: acceptance test failed after retry
+Acceptance: `npm ci && npm run build` exited 1
+Options: inspect the worktree/branch, fix the task or its acceptance, then `recursion work guerra-001-lenis-provider` (or `recursion requeue guerra-001-lenis-provider`).
+Close it with: `recursion resolve guerra-001-lenis-provider "<what you decided>"`.

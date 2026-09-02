@@ -11,12 +11,12 @@ workdir: apps/web
 allowed_paths: apps/web/src/components/motion
 non_goals: auth, portal, API, GSAP pinning, content rewrites, dependency upgrades beyond what is required to import lenis (lenis already in package.json)
 autonomy: supervised
-status: running
-lease_expires: 1788338749
-finished_at: 2026-09-02T07:15:15Z
-evidence: SCOPE VIOLATION — the arm went outside its boundary, so the acceptance result is not trusted and was not run: modified paths outside allowed scope: .cursor-runner-state/agent-cli-state.json, .cursor-runner-state/ai-tracking/ai-code-tracking.db, .cursor-runner-state/chats/eab0d61a99b6696edb3d2aff87b585e8/2cc98ba2-229a-45b9-8df4-df48823cda16/meta.json, .cursor-runner-state/chats/eab0d61a99b6696edb3d2aff87b585e8/2cc98ba2-229a-45b9-8df4-df48823cda16/store.db, .cursor-runner-state/cli-config.json, .cursor-runner-state/projects/workspace/.workspace-trusted, .cursor-runner-state/projects/workspace/agent-tools/71c5c10c-8dfa-40bb-a91d-fd7067f8ce65.txt, .cursor-runner-state/projects/workspace/agent-transcripts/2cc98ba2-229a-45b9-8df4-df48823cda16/2cc98ba2-229a-45b9-8df4-df48823cda16.jsonl, .cursor-runner-state/skills-cursor/.sync-manifest.json, .cursor-runner-state/skills-cursor/autopilot/SKILL.md
-event_seq: 12
-last_transition_id: transition-e65eca60dab471582b2ee483eba740c1
+status: failed
+lease_expires: 0
+finished_at: 2026-09-02T07:18:28Z
+evidence: acceptance test failed after retry
+event_seq: 13
+last_transition_id: transition-053c4e097a789663fc85e318a920de09
 lease_owner: work.sh:372001@gs-recursion-nbg
 attempts: 6
 started_at: 2026-09-02T07:15:49Z

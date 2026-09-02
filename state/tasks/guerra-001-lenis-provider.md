@@ -11,14 +11,14 @@ workdir: apps/web
 allowed_paths: apps/web/src/components/motion
 non_goals: auth, portal, API, GSAP pinning, content rewrites, dependency upgrades beyond what is required to import lenis (lenis already in package.json)
 autonomy: supervised
-status: escalated
-lease_expires: 0
+status: running
+lease_expires: 1788338246
 finished_at: 2026-09-02T07:02:29Z
 evidence: arm dispatch error (code 127)
-event_seq: 3
-last_transition_id: transition-8e9c86aae87672ffb03529b4cd3cbe97
-lease_owner: work.sh:355349@gs-recursion-nbg
-attempts: 1
-started_at: 2026-09-02T07:02:25Z
+event_seq: 4
+last_transition_id: transition-0f8d459bacb7293df429d12b11536ab9
+lease_owner: work.sh:359996@gs-recursion-nbg
+attempts: 2
+started_at: 2026-09-02T07:07:26Z
 
 Create ONLY apps/web/src/components/motion/LenisProvider.tsx — client component wrapping children with Lenis smooth scroll; if prefers-reduced-motion, render children without Lenis. Do not edit layout yet unless required to export; prefer standalone provider file only. Do not run npm yourself. Minimal correct > fancy.

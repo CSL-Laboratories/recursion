@@ -290,11 +290,17 @@ cleanup(){
 trap 'cleanup; exit 143' TERM INT
 trap cleanup EXIT
 
+# ProtectHome=yes makes /home inaccessible and prevents BindPaths under it (systemd.exec).
+# When we bind RUNNER_HOME -> /home/runner, use tmpfs so the bind is visible.
+PROTECT_HOME=yes
+if [ "$ENGINE" != gate ] && [ -n "$RUNNER_HOME" ] && [ -d "$RUNNER_HOME" ]; then
+  PROTECT_HOME=tmpfs
+fi
 RUN=(systemd-run --quiet --wait --collect --pipe --service-type=exec --unit "$UNIT"
   --uid "$RUNNER_USER" --gid "$RUNNER_GID" --working-directory "$SANDBOX_CWD"
   --property NoNewPrivileges=yes --property CapabilityBoundingSet=
   --property AmbientCapabilities= --property PrivateTmp=yes --property PrivateDevices=yes
-  --property ProtectSystem=strict --property ProtectHome=yes
+  --property ProtectSystem=strict --property "ProtectHome=$PROTECT_HOME"
   --property ProtectKernelTunables=yes --property ProtectKernelModules=yes
   --property ProtectKernelLogs=yes --property ProtectControlGroups=yes
   --property RestrictSUIDSGID=yes --property LockPersonality=yes
@@ -338,19 +344,37 @@ if [ "$NETWORK_POLICY" = none ]; then
 else
   RUN+=(--property "NetworkNamespacePath=$PROVIDER_NETNS")
 fi
-if [ "$ENGINE" = claude ]; then
-  # Claude's provider request is the only intentional egress.  The namespace has no route or
-  # non-loopback interface, so clearing these variables cannot fall back to the host network.
-  RUN+=(--setenv HTTPS_PROXY=http://127.0.0.1:18080
-        --setenv HTTP_PROXY=http://127.0.0.1:18080
-        --setenv CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1)
-fi
+case "$ENGINE" in
+  claude|cursor)
+    # Provider request is the only intentional egress.  The namespace has no route or
+    # non-loopback interface, so clearing these variables cannot fall back to the host network.
+    RUN+=(--setenv HTTPS_PROXY=http://127.0.0.1:18080
+          --setenv HTTP_PROXY=http://127.0.0.1:18080)
+    if [ "$ENGINE" = claude ]; then
+      RUN+=(--setenv CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1)
+    fi
+    ;;
+esac
 for name in RECURSION_VERIFICATION_COMMIT RECURSION_IMPLEMENTER_RUN_ID; do
   value="${!name:-}"; [ -z "$value" ] || RUN+=(--setenv "$name=$value")
 done
 
 if [ "$ENGINE" != gate ] && [ -n "$RUNNER_HOME" ] && [ -d "$RUNNER_HOME" ]; then
   RUN+=(--property "BindReadOnlyPaths=$RUNNER_HOME:/home/runner")
+  # Cursor needs writable ~/.cursor (projects/cache). Keep auth via RO home (.config),
+  # then override ~/.cursor with a WT-owned writable dir (later BindPaths wins).
+  if [ "$ENGINE" = cursor ]; then
+    # Keep Cursor CLI state OUT of the worktree so path-scope checks do not see it as
+    # an out-of-boundary modify. Host path under recursion-runner-writable; bind over ~/.cursor.
+    CURSOR_STATE="/var/lib/recursion-runner-writable/cursor-home"
+    install -d -o "$RUNNER_UID" -g "$RUNNER_GID" -m 700 "$CURSOR_STATE"
+    install -d -o "$RUNNER_UID" -g "$RUNNER_GID" -m 700 "$CURSOR_STATE/projects"
+    install -d -o "$RUNNER_UID" -g "$RUNNER_GID" -m 700 "$CURSOR_STATE/projects/workspace"
+    if [ -f "$RUNNER_HOME/.cursor/cli-config.json" ] && [ ! -f "$CURSOR_STATE/cli-config.json" ]; then
+      install -o "$RUNNER_UID" -g "$RUNNER_GID" -m 600 "$RUNNER_HOME/.cursor/cli-config.json" "$CURSOR_STATE/cli-config.json"
+    fi
+    RUN+=(--property "BindPaths=$CURSOR_STATE:/home/runner/.cursor")
+  fi
 fi
 if [ "${RECURSION_TEST_WORKER:-}" = sandbox ]; then
   case "$(realpath -m "$ROOT")" in /tmp/*) ;; *) echo "worker-sandbox: sandbox test env refused" >&2; exit 95;; esac

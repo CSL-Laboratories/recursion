@@ -3,11 +3,40 @@
   "name": "cursor",
   "description": "Cursor CLI (cursor-agent), headless print mode. Argv is provisional pending on-box flag verification (docs/plans/engine-plugin-architecture.md, deployment step 2) -- measure, don't assume.",
   "executable": "cursor-agent",
-  "argv": ["{{EXE}}", "-p", "{{PROMPT}}", "--output-format", "text", "--force"],
-  "model": { "required": false, "argv_suffix": ["--model", "{{MODEL}}"] },
-  "roles": ["implementer", "verifier"],
-  "billing": { "basis": "metered", "provider": "cursor" },
-  "network": { "policy": "provider-only", "endpoints": ["api.cursor.com", "api2.cursor.sh"] },
+  "argv": [
+    "{{EXE}}",
+    "-p",
+    "--trust",
+    "{{PROMPT}}",
+    "--output-format",
+    "text",
+    "--force"
+  ],
+  "model": {
+    "required": false,
+    "argv_suffix": [
+      "--model",
+      "{{MODEL}}"
+    ]
+  },
+  "roles": [
+    "implementer",
+    "verifier"
+  ],
+  "billing": {
+    "basis": "flat-subscription",
+    "provider": "cursor"
+  },
+  "network": {
+    "policy": "provider-only",
+    "endpoints": [
+      "api.cursor.com",
+      "api2.cursor.sh",
+      "agentn.global.api5.cursor.sh",
+      "agentn.global.api5lat.cursor.sh",
+      "agentn.global.api5geo.cursor.sh"
+    ]
+  },
   "availability_probe": null,
   "concurrency_cap": null,
   "env_passthrough": []

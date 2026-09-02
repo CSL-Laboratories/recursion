@@ -273,3 +273,6 @@ Close it with: `recursion resolve guerra-003-phase5-lenis-wire-canary "<what you
 Blocked on: RESULT CONTRACT VIOLATION — ERR blocker must be a string
 Options: inspect the worktree/branch, fix the task or its acceptance, then `recursion work guerra-003-phase5-lenis-wire-canary` (or `recursion requeue guerra-003-phase5-lenis-wire-canary`).
 Close it with: `recursion resolve guerra-003-phase5-lenis-wire-canary "<what you decided>"`.
+
+## REQUEUED 2026-09-02T20:53:05Z — guerra-004-phase5-lenis-wire-canary
+requeue after wrong composer-2.5-fast pin; env now composer-2.5

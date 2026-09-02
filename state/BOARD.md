@@ -1,6 +1,6 @@
 # Recursion board — live registry
 
-Tick: 2026-08-10T15:15:01Z  ·  rendered 2026-09-02T20:49:52Z
+Tick: 2026-08-10T15:15:01Z  ·  rendered 2026-09-02T20:53:30Z
 
 | Workstream | Tier | Model | State | Started | Tokens | $ metered | Note |
 |---|---|---|---|---|---|---|---|
@@ -9,4 +9,4 @@ Tick: 2026-08-10T15:15:01Z  ·  rendered 2026-09-02T20:49:52Z
 | guerra-construction-group | cursor | cursor | done | 07:52:41Z | - | 0.0000 | passed -> loop/work/guerra-001-lenis-provider metered:cursor |
 | guerra-construction-group | cursor | cursor | done | 16:53:00Z | - | 0.0000 | passed -> loop/work/guerra-002-wire-lenis-provider metered:cursor |
 | guerra-construction-group | cursor | cursor | blocked | 20:32:07Z | - | 0.0000 | invalid worker result |
-| guerra-construction-group | cursor | cursor | running | 20:49:52Z | - | - | Add the minimal reduced-motion-aware Len |
+| guerra-construction-group | cursor | cursor | running | 20:53:30Z | - | - | Add the minimal reduced-motion-aware Len |

@@ -25,12 +25,14 @@ controller_gate_files: scripts/gates/guerra-lenis-wire-v1.sh,scripts/gates/guerr
 acceptance: npm ci --offline --cache /opt/recursion/cache/npm && /opt/recursion/scripts/gates/guerra-lenis-wire-v1.sh
 autonomy: supervised
 status: running
-lease_owner: work.sh:710615@gs-recursion-nbg
-lease_expires: 1788387593
-attempts: 1
-started_at: 2026-09-02T20:49:53Z
-event_seq: 1
-last_transition_id: transition-c59f717bd57acd1e4e64beef1a83d68d
+lease_owner: work.sh:715600@gs-recursion-nbg
+lease_expires: 1788387811
+attempts: 2
+started_at: 2026-09-02T20:53:31Z
+event_seq: 18
+last_transition_id: transition-38085677d5c139d8eae0896b6bf09c11
+finished_at: 2026-09-02T20:52:26Z
+evidence: killed: wrong model pin composer-2.5-fast; will requeue with composer-2.5
 
 Starting from current clean main, create a minimal client-side LenisProvider that renders children without Lenis when prefers-reduced-motion is enabled, and wrap the application layout with it. Implement the change directly; do not cherry-pick or copy a prior loop/work branch. Touch only allowed_paths. Do not run npm—the controller owns installation and the build gate.
 

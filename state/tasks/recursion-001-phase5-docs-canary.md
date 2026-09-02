@@ -23,13 +23,15 @@ expected_change: required
 gate_class: light
 acceptance: test -f docs/PHASE5-HARNESS-READY.md && grep -qi 'phase5 harness ready' docs/PHASE5-HARNESS-READY.md
 autonomy: supervised
-status: running
+status: passed
 lease_owner: work.sh:751502@gs-recursion-nbg
-lease_expires: 1788390431
+lease_expires: 0
 attempts: 1
 started_at: 2026-09-02T21:37:11Z
-event_seq: 1
-last_transition_id: transition-a18e288e9192c75371b42045b92a562a
+event_seq: 7
+last_transition_id: transition-bd85341c9ff9e7b966de4b7b31367b61
+finished_at: 2026-09-02T21:38:01Z
+evidence: passed -> loop/work/recursion-001-phase5-docs-canary at d4c4e89124435cafbbfb8f71f9a4cf2a643c8e1b (independently verified)
 
 Create docs/PHASE5-HARNESS-READY.md containing exactly one short paragraph that includes the phrase "phase5 harness ready" and notes implementer pin composer-2.5 (non-fast) with verifier gpt-5.6-luna-high. Touch only allowed_paths. Do not modify scripts, state, deploy, or any other file.
 

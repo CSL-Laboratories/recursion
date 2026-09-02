@@ -24,15 +24,15 @@ gate_class: light
 controller_gate_files: scripts/gates/guerra-lenis-wire-v1.sh,scripts/gates/guerra-next-font-mock-v1.cjs
 acceptance: npm ci --offline --cache /opt/recursion/cache/npm && /opt/recursion/scripts/gates/guerra-lenis-wire-v1.sh
 autonomy: supervised
-status: running
+status: escalated
 lease_owner: work.sh:715600@gs-recursion-nbg
-lease_expires: 1788387811
+lease_expires: 0
 attempts: 2
 started_at: 2026-09-02T20:53:31Z
-event_seq: 18
-last_transition_id: transition-38085677d5c139d8eae0896b6bf09c11
-finished_at: 2026-09-02T20:52:26Z
-evidence: killed: wrong model pin composer-2.5-fast; will requeue with composer-2.5
+event_seq: 31
+last_transition_id: transition-bf980977341f7f2021566479ee07a7ea
+finished_at: 2026-09-02T20:58:12Z
+evidence: INDEPENDENT VERIFICATION REFUSED — verifier run guerra-004-phase5-lenis-wire-canary-verify-205326-715600 did not return a clean pass for exact commit 982f212217d4e008ff1cedd03b2d6d47e7c04697
 
 Starting from current clean main, create a minimal client-side LenisProvider that renders children without Lenis when prefers-reduced-motion is enabled, and wrap the application layout with it. Implement the change directly; do not cherry-pick or copy a prior loop/work branch. Touch only allowed_paths. Do not run npm—the controller owns installation and the build gate.
 

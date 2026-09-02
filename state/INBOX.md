@@ -237,3 +237,6 @@ resolved by operator
 
 ## REQUEUED 2026-09-02T07:52:27Z — guerra-001-lenis-provider
 smoke-run-4: acceptance fixed for offline npm+fonts; re-run under PAUSE discipline
+
+## REQUEUED 2026-09-02T07:52:42Z — guerra-001-lenis-provider
+run-4: offline acceptance via host node_modules seed-copy + npm run build (network-none)

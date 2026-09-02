@@ -24,13 +24,13 @@ gate_class: light
 controller_gate_files: scripts/gates/guerra-lenis-wire-v1.sh,scripts/gates/guerra-next-font-mock-v1.cjs
 acceptance: npm ci --offline --cache /opt/recursion/cache/npm && /opt/recursion/scripts/gates/guerra-lenis-wire-v1.sh
 autonomy: supervised
-status: escalated
-lease_owner: work.sh:715600@gs-recursion-nbg
-lease_expires: 0
-attempts: 2
-started_at: 2026-09-02T20:53:31Z
-event_seq: 31
-last_transition_id: transition-bf980977341f7f2021566479ee07a7ea
+status: running
+lease_owner: work.sh:728850@gs-recursion-nbg
+lease_expires: 1788388479
+attempts: 3
+started_at: 2026-09-02T21:04:39Z
+event_seq: 32
+last_transition_id: transition-6978864a6c733b019490617f8fa003df
 finished_at: 2026-09-02T20:58:12Z
 evidence: INDEPENDENT VERIFICATION REFUSED — verifier run guerra-004-phase5-lenis-wire-canary-verify-205326-715600 did not return a clean pass for exact commit 982f212217d4e008ff1cedd03b2d6d47e7c04697
 

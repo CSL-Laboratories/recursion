@@ -283,3 +283,6 @@ requeue after wrong composer-2.5-fast pin; env now composer-2.5
 Blocked on: INDEPENDENT VERIFICATION REFUSED — verifier run guerra-004-phase5-lenis-wire-canary-verify-205326-715600 did not return a clean pass for exact commit 982f212217d4e008ff1cedd03b2d6d47e7c04697
 Options: inspect the worktree/branch, fix the task or its acceptance, then `recursion work guerra-004-phase5-lenis-wire-canary` (or `recursion requeue guerra-004-phase5-lenis-wire-canary`).
 Close it with: `recursion resolve guerra-004-phase5-lenis-wire-canary "<what you decided>"`.
+
+## REQUEUED 2026-09-02T21:03:42Z — guerra-004-phase5-lenis-wire-canary
+requeue after verifier evidence materialization fix; keep composer-2.5

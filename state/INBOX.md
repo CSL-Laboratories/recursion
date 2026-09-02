@@ -259,3 +259,10 @@ resolved by operator
 
 ## SUPERVISED RESUME 2026-09-02T16:52:22Z — guerra-002-wire-lenis-provider
 reason: supervised guerra-002 wire LenisProvider
+
+## build escalation — guerra-003-phase5-lenis-wire-canary  (2026-09-02T20:31:08Z)
+**Workstream:** guerra-construction-group
+**Pointer:** state/tasks/guerra-003-phase5-lenis-wire-canary.md · branch loop/work/guerra-003-phase5-lenis-wire-canary · arm log loop/logs/2026-09-02-arm-guerra-003-phase5-lenis-wire-canary-203107.out
+Blocked on: a required engine (engine=cursor, verifier_engine=cursor) is not an enabled plugin (plugins disabled, manifest absent/invalid, or role refused) — see the arm log
+Options: inspect the worktree/branch, fix the task or its acceptance, then `recursion work guerra-003-phase5-lenis-wire-canary` (or `recursion requeue guerra-003-phase5-lenis-wire-canary`).
+Close it with: `recursion resolve guerra-003-phase5-lenis-wire-canary "<what you decided>"`.

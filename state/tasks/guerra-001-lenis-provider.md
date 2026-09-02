@@ -11,12 +11,12 @@ workdir: apps/web
 allowed_paths: apps/web/src/components/motion
 non_goals: auth, portal, API, GSAP pinning, content rewrites, dependency upgrades beyond what is required to import lenis (lenis already in package.json)
 autonomy: supervised
-status: running
-lease_expires: 1788338528
-finished_at: 2026-09-02T07:08:45Z
+status: escalated
+lease_expires: 0
+finished_at: 2026-09-02T07:12:33Z
 evidence: arm dispatch error (code 1)
-event_seq: 8
-last_transition_id: transition-8bd08b527b8987e51860fc80c48b6744
+event_seq: 9
+last_transition_id: transition-a262e41d7d35723a4640e560e1889ae3
 lease_owner: work.sh:364832@gs-recursion-nbg
 attempts: 4
 started_at: 2026-09-02T07:12:08Z

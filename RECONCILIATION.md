@@ -49,3 +49,35 @@ divergent / not fast-forwardable" *status* is stale.
 
 **Merge order for the current review queue** (a dependency lands before what builds on it):
 `loop/auto` → then the `rebase/*` branches in their numbered order.
+
+---
+
+## 2026-08-28 — Laptop divergence closed — `reconcile/laptop-20260828`
+
+**Situation.** The laptop checkout (rescue id `r-laptop-recursion-0011`) sat 5 ahead / 352
+behind `origin/master`: the 2026-08-05 build-loop v2 line (`8341be4`..`20c1fa7` — work.sh
+executor + task model, hermes file-writing arm, GSC oracle bridge, delegation design docs,
+chiron/cubic-castles task files) plus a dirty tree (8 modified, 14 untracked files). None of
+those commits were contained in `origin/master`.
+
+**Audit result: zero unique content.** Every path in the full laptop delta (merge-base
+`3f19c5c` → dirty archive `a4bf9de`) is either byte-identical on `origin/master` (9 files —
+including files that were only ever *untracked* on the laptop, which is the proof that the
+2026-08-26 rescue transported the laptop's content into the box line) or a strict ancestor of
+origin's version (same text plus reviewed evolution — e.g. `scripts/work.sh` 307 → 1,669
+lines; task files gained `schema_version`/`goal_id`/`allowed_paths`/`non_goals`). The few doc
+lines dropped along the way are stale status/roadmap phrasing, deliberately rewritten in
+reviewed commits and still recoverable from the rescue branches.
+
+**Resolution policy** (follows the 2026-08-06 precedent above): `origin/master` wins
+everywhere — it is the reviewed, deployed *descendant* of this very content, so re-applying
+laptop hunks could only regress it. The merge is `-s ours`: history closure only, tree
+byte-identical to `origin/master`. Nothing carried over.
+
+**Archives.** `rescue/laptop/recursion/20260826/r-laptop-recursion-0011-master` (= laptop tip
+`20c1fa7`) and `…-master-dirty` (= `a4bf9de`) remain the record; the laptop working tree was
+verified byte-identical to the dirty archive on 2026-08-28 — nothing new since the rescue.
+
+**After this lands on `master`:** the laptop fast-forwards cleanly (`git checkout master &&
+git pull --ff-only`) once its dirty tree is cleared — safe to discard, every byte is in
+`a4bf9de`.

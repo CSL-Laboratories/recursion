@@ -188,3 +188,6 @@ sandbox fix2: writable ~/.cursor/projects overlay
 Blocked on: arm dispatch error (code 1)
 Options: inspect the worktree/branch, fix the task or its acceptance, then `recursion work guerra-001-lenis-provider` (or `recursion requeue guerra-001-lenis-provider`).
 Close it with: `recursion resolve guerra-001-lenis-provider "<what you decided>"`.
+
+## REQUEUED 2026-09-02T07:12:01Z — guerra-001-lenis-provider
+sandbox fix3: ProtectHome=tmpfs + WT .cursor-runner-state writable bind

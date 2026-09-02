@@ -158,3 +158,6 @@ guerra phase2 smoke prep — ready for lift
 Blocked on: a required engine (engine=cursor, verifier_engine=cursor) bills as metered — a human sets RECURSION_ALLOW_METERED=1 in .env to allow it
 Options: inspect the worktree/branch, fix the task or its acceptance, then `recursion work guerra-001-lenis-provider` (or `recursion requeue guerra-001-lenis-provider`).
 Close it with: `recursion resolve guerra-001-lenis-provider "<what you decided>"`.
+
+## REQUEUED 2026-09-02T07:02:02Z — guerra-001-lenis-provider
+billing fixed to flat-subscription; retry smoke

@@ -231,3 +231,9 @@ Blocked on: acceptance test failed after retry
 Acceptance: `npm ci && npm run build` exited 1
 Options: inspect the worktree/branch, fix the task or its acceptance, then `recursion work guerra-001-lenis-provider` (or `recursion requeue guerra-001-lenis-provider`).
 Close it with: `recursion resolve guerra-001-lenis-provider "<what you decided>"`.
+
+## RESOLVED 2026-09-02T07:41:58Z — --help
+resolved by operator
+
+## REQUEUED 2026-09-02T07:52:27Z — guerra-001-lenis-provider
+smoke-run-4: acceptance fixed for offline npm+fonts; re-run under PAUSE discipline

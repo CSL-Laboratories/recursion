@@ -11,12 +11,14 @@ workdir: apps/web
 allowed_paths: apps/web/src/components/motion/LenisProvider.tsx, apps/web/src/app/layout.tsx
 non_goals: GSAP ScrollTrigger effects, reveals, page choreography, package.json churn unless build proves missing dep, content/copy/brand, auth, portal, API, automerge
 autonomy: supervised
-status: running
+status: passed
 lease_owner: work.sh:602888@gs-recursion-nbg
-lease_expires: 1788373380
+lease_expires: 0
 attempts: 1
 started_at: 2026-09-02T16:53:00Z
-event_seq: 1
-last_transition_id: transition-55e284546ae370b35d059f0d6a59423d
+event_seq: 2
+last_transition_id: transition-be518e26d992a8cfca33bd412fcc71c4
+finished_at: 2026-09-02T16:56:03Z
+evidence: passed -> loop/work/guerra-002-wire-lenis-provider
 
 Bring Lenis smooth-scroll onto main by ensuring `apps/web/src/components/motion/LenisProvider.tsx` exists (reuse/adapt from branch loop/work/guerra-001-lenis-provider @ 3778854 if helpful) AND wrapping the app in `apps/web/src/app/layout.tsx` with LenisProvider. Honor prefers-reduced-motion (no Lenis when reduced). Do not run npm yourself. Minimal correct. Only touch allowed_paths.

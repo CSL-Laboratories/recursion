@@ -45,7 +45,7 @@ def main() -> int:
         if not isinstance(risks, list) or any(not isinstance(item, str) for item in risks):
             fail("risks must be a string array")
         if not isinstance(blocker, str):
-            fail("blocker must be a string")
+            fail(f"blocker must be a string (got {type(blocker).__name__}: {blocker!r})")
         observed = sorted(scope.get("paths") or [])
         if sorted(files) != observed:
             fail(f"reported files do not match observed scope: reported={sorted(files)!r} observed={observed!r}")

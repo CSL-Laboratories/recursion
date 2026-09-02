@@ -13,7 +13,7 @@
     "--force"
   ],
   "model": {
-    "required": false,
+    "required": true,
     "argv_suffix": [
       "--model",
       "{{MODEL}}"

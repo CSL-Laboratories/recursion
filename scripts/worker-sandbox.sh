@@ -317,13 +317,19 @@ RUN=(systemd-run --quiet --wait --collect --pipe --service-type=exec --unit "$UN
 # /run and /var/run carry host Unix sockets (systemd's private bus, Docker, journald) and other
 # confused deputies. Masking them per-arm here (and in the shared base above) keeps every arm from
 # reaching host sockets; Claude's provider egress is the TCP loopback CONNECT proxy, never a socket.
-if [ "$ENGINE" != gate ]; then
-  RUN+=(--property "InaccessiblePaths=/opt /srv -/workspace/.git /run /var/run")
-else
+if [ "$ENGINE" = gate ]; then
   # Git must remain readable to acceptance suites, but the suite is worker-authored code.
   # Protect the worktree pointer itself; ProtectSystem=strict separately keeps its controller
   # gitdir/refs read-only when that pointer resolves outside /workspace.
   RUN+=(--property "ReadOnlyPaths=-/workspace/.git")
+elif [ "$ROLE" = verifier ]; then
+  # Phase-5 independent verifier must inspect base..candidate via git, but must not reach /opt
+  # controller gates (machine-gate evidence is already recorded). Keep .git read-only.
+  RUN+=(--property "InaccessiblePaths=/opt /srv /run /var/run")
+  RUN+=(--property "ReadOnlyPaths=-/workspace/.git")
+else
+  # Implementer and other model workers: no git, no /opt.
+  RUN+=(--property "InaccessiblePaths=/opt /srv -/workspace/.git /run /var/run")
 fi
 
 if [ "$READ_ONLY_WORKTREE" = 1 ]; then

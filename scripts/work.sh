@@ -493,7 +493,10 @@ validate_worker_metadata(){
     reject_preworker_contract model-alias-engine-mismatch 2; exit $?
   fi
 }
-if [ "$STRICT_PHASE5" = 1 ] && [ -n "${PILOT_ID:-}" ]; then
+# Phase-5 model pins must resolve BEFORE plugin admission: model.required=true
+# refuses an empty RESOLVED_MODEL/RESOLVED_VERIFIER_MODEL. Formerly gated on
+# pilot_id only, which left non-pilot worker-result-v1 canaries failing closed.
+if [ "$STRICT_PHASE5" = 1 ]; then
   validate_worker_metadata
 fi
 
@@ -705,9 +708,8 @@ fi
 # Preserve the historical non-pilot precedence: an invalid gate remains the primary durable
 # escalation when a legacy task also has malformed envelope metadata.  Exact-digest pilots use
 # the category-precise early check above.
-if [ "$STRICT_PHASE5" = 1 ] && [ -z "${PILOT_ID:-}" ]; then
-  validate_worker_metadata
-fi
+# validate_worker_metadata already ran pre-plugin for STRICT_PHASE5
+
 
 # --- create the isolated worktree on loop/work/<id> (never touches the main tree) -------
 mk_worktree(){
@@ -889,8 +891,11 @@ WHEN DONE — write .recursion-result.json in the repo root:
   \"files_changed\": [\"path\", ...],
   \"tests_run\": \"what you ran and what it said\",
   \"risks\": [\"anything a reviewer should check\"],
-  \"blocker\": \"the precise question, if status is blocked\"
+  \"blocker\": \"\"
 }
+RESULT SCHEMA RULE — blocker MUST always be a JSON string, never null or omitted:
+  - status done or no-op: \"blocker\": \"\" (empty string)
+  - status blocked: \"blocker\": \"the precise question\"
 \"no-op\" is legitimate: if the correct action is to change nothing, say so and explain why.
 Do not manufacture a change to look productive.
 
@@ -909,6 +914,8 @@ DEADLINE: ${DEADLINE_SECONDS}s
 NETWORK POLICY: $NETWORK_POLICY
 EVIDENCE CONTRACT: $EVIDENCE_CONTRACT
 VERIFICATION: a distinct $VERIFIER_MODEL_ALIAS run will review the exact machine-gated commit.
+RESULT CONTRACT (worker-result-v1): .recursion-result.json blocker MUST be a JSON string.
+For status done or no-op write \"blocker\":\"\" (empty string). Never null. Never omit.
 Changing tests, fixtures, gate files, result policy, model routing, or any out-of-scope path
 invalidates the run even if committed before the controller inspects the worktree."
 fi
@@ -1278,9 +1285,17 @@ run_independent_verifier(){
     LAST_RUN_EVIDENCE="$impl_evidence"; IMPLEMENTER_RUN_ID="$impl_run"
     return 99
   fi
+  # Materialize controller-owned review artifacts into /evidence (sandbox masks host /opt and .git).
+  git -C "$REPO_DIR" diff --stat "$BASE_COMMIT..$CANDIDATE_OID" >"$evidence_dir/diff.stat" 2>>"$LOG" || true
+  git -C "$REPO_DIR" diff "$BASE_COMMIT..$CANDIDATE_OID" >"$evidence_dir/diff.patch" 2>>"$LOG" || true
+  git -C "$REPO_DIR" log --oneline "$BASE_COMMIT..$CANDIDATE_OID" >"$evidence_dir/commits.txt" 2>>"$LOG" || true
+  if [ -n "$impl_evidence" ] && [ -f "$impl_evidence" ]; then
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); json.dump(d.get("machine_gate") or {}, open(sys.argv[2],"w"), indent=2)' \
+      "$impl_evidence" "$evidence_dir/machine_gate.json" 2>>"$LOG" || true
+  fi
   prompt="You are an INDEPENDENT VERIFIER, not the implementer. Review task $ID for goal ${GOAL_ID:-unknown}.
 The checkout is an isolated read-only worktree at exact commit $CANDIDATE_OID, based on $BASE_COMMIT.
-Inspect the complete base..commit diff, the task boundary, and the machine gate evidence.
+Inspect provided evidence artifacts and checkout files only; do not run git npm or gates in sandbox.
 Do not modify source, tests, fixtures, gates, or the implementer's branch. You are not allowed
 to repair the change you review. Write only /evidence/verdict.json with this schema:
 {\"verdict\":\"pass|fail|blocked\",\"commit_oid\":\"$CANDIDATE_OID\",\"implementer_run_id\":\"$impl_run\",\"summary\":\"...\",\"evidence\":[\"...\"],\"risks\":[\"...\"]}

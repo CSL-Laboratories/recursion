@@ -5,11 +5,11 @@
   "topic": 9,
   "charter": "Operate only within guerra-construction-group under an approved project goal and machine gate. Portfolio priority, policy, credentials, deployment, and merge are excluded.",
   "model_policy": "project-pilot",
-  "concurrency_limit": 0,
+  "concurrency_limit": 1,
   "budget": {
     "max_decisions_per_turn": 1,
-    "max_inflight_workers": 0,
-    "publication": false
+    "max_inflight_workers": 1,
+    "publication": true
   },
   "notification_targets": [
     "project-topic:telegram:-1003894008732:9",

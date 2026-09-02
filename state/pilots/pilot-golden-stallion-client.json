@@ -28,10 +28,10 @@
       "scripts/gates/gsc-shade-tops-v1.json"
     ]
   },
-  "concurrency_limit": 1,
+  "concurrency_limit": 0,
   "budget": {
     "max_decisions_per_turn": 1,
-    "max_inflight_workers": 1,
+    "max_inflight_workers": 0,
     "publication": false
   },
   "notification_targets": [

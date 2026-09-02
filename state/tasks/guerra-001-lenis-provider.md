@@ -11,12 +11,12 @@ workdir: apps/web
 allowed_paths: apps/web/src/components/motion
 non_goals: auth, portal, API, GSAP pinning, content rewrites, dependency upgrades beyond what is required to import lenis (lenis already in package.json)
 autonomy: supervised
-status: running
-lease_expires: 1788337945
-finished_at: 2026-09-02T07:00:18Z
-evidence: a required engine (engine=cursor, verifier_engine=cursor) bills as metered — a human sets RECURSION_ALLOW_METERED=1 in .env to allow it
-event_seq: 2
-last_transition_id: transition-b133a063543693015c6529841df6f62b
+status: escalated
+lease_expires: 0
+finished_at: 2026-09-02T07:02:29Z
+evidence: arm dispatch error (code 127)
+event_seq: 3
+last_transition_id: transition-8e9c86aae87672ffb03529b4cd3cbe97
 lease_owner: work.sh:355349@gs-recursion-nbg
 attempts: 1
 started_at: 2026-09-02T07:02:25Z

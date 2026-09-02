@@ -201,3 +201,11 @@ Close it with: `recursion resolve guerra-001-lenis-provider "<what you decided>"
 
 ## REQUEUED 2026-09-02T07:13:21Z — guerra-001-lenis-provider
 sandbox fix4: allowlist agentn.global.api5.cursor.sh on provider proxy
+
+## build escalation — guerra-001-lenis-provider  (2026-09-02T07:15:15Z)
+**Workstream:** guerra-construction-group
+**Pointer:** state/tasks/guerra-001-lenis-provider.md · branch loop/work/guerra-001-lenis-provider · arm log loop/logs/2026-09-02-arm-guerra-001-lenis-provider-071324.out
+Blocked on: SCOPE VIOLATION — the arm went outside its boundary, so the acceptance result is not trusted and was not run:
+modified paths outside allowed scope: .cursor-runner-state/agent-cli-state.json, .cursor-runner-state/ai-tracking/ai-code-tracking.db, .cursor-runner-state/chats/eab0d61a99b6696edb3d2aff87b585e8/2cc98ba2-229a-45b9-8df4-df48823cda16/meta.json, .cursor-runner-state/chats/eab0d61a99b6696edb3d2aff87b585e8/2cc98ba2-229a-45b9-8df4-df48823cda16/store.db, .cursor-runner-state/cli-config.json, .cursor-runner-state/projects/workspace/.workspace-trusted, .cursor-runner-state/projects/workspace/agent-tools/71c5c10c-8dfa-40bb-a91d-fd7067f8ce65.txt, .cursor-runner-state/projects/workspace/agent-transcripts/2cc98ba2-229a-45b9-8df4-df48823cda16/2cc98ba2-229a-45b9-8df4-df48823cda16.jsonl, .cursor-runner-state/skills-cursor/.sync-manifest.json, .cursor-runner-state/skills-cursor/autopilot/SKILL.md
+Options: inspect the worktree/branch, fix the task or its acceptance, then `recursion work guerra-001-lenis-provider` (or `recursion requeue guerra-001-lenis-provider`).
+Close it with: `recursion resolve guerra-001-lenis-provider "<what you decided>"`.

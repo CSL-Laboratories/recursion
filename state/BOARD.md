@@ -1,6 +1,6 @@
 # Recursion board — live registry
 
-Tick: 2026-08-10T15:15:01Z  ·  rendered 2026-09-02T21:14:13Z
+Tick: 2026-08-10T15:15:01Z  ·  rendered 2026-09-02T21:37:11Z
 
 | Workstream | Tier | Model | State | Started | Tokens | $ metered | Note |
 |---|---|---|---|---|---|---|---|
@@ -12,3 +12,4 @@ Tick: 2026-08-10T15:15:01Z  ·  rendered 2026-09-02T21:14:13Z
 | guerra-construction-group | cursor | cursor | running | 20:59:58Z | - | - | Add the minimal reduced-motion-aware Len |
 | guerra-construction-group | cursor | cursor | done | 21:04:39Z | - | 0.0000 | passed -> loop/work/guerra-004-phase5-lenis-wire-canary at e5b0514a4fe2155a22c4b7290c029c9e372eefc3 (independently verified) metered:cursor |
 | guerra-construction-group | cursor | cursor | done | 21:10:08Z | - | 0.0000 | passed -> loop/work/guerra-006-phase5-lenis-wire-canary at 705b464d2b45fd0a207c8fc2463f3457a451da76 (independently verified) metered:cursor |
+| recursion | cursor | cursor | running | 21:37:11Z | - | - | Add a one-line docs note proving Phase-5 |

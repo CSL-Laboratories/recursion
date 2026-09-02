@@ -240,3 +240,22 @@ smoke-run-4: acceptance fixed for offline npm+fonts; re-run under PAUSE discipli
 
 ## REQUEUED 2026-09-02T07:52:42Z — guerra-001-lenis-provider
 run-4: offline acceptance via host node_modules seed-copy + npm run build (network-none)
+
+## [esc-0021] 2026-09-02 09:15 — Choose the September subscription and loop posture
+**Workstream:** supervision
+**Pointer:** OPEN DECISIONS ledger slices D-002, D-005, D-006, D-007, and D-008; CURRENT INBOX esc-0013 through esc-0020
+**Blocked on:** August `ccusage`, fallback-spend, and merged/verified-output evidence needed to evaluate the recorded falsifiers.
+**Context:** All five reviews were due 2026-09-01. ANCHOR permits renewing the second subscription only if capacity passed while the review queue stayed clear.
+**Options:** provide and review the evidence now; extend the review with a defined evidence-collection deadline; reduce to one subscription plus fallback pending evidence.
+## 2026-09-02 09:15 — Supply the first Fall 2026 physics block or explicitly defer scheduling
+**Workstream:** physics-coursework
+**Pointer:** SYLLABUS LEAD ledger slice: Fall 2026 contains only `_fill from actual syllabus once posted_`; CURRENT INBOX esc-0004 through esc-0012 and subsequent duplicate physics entries
+**Blocked on:** the course, first topic block, and first lecture date from the actual syllabus.
+**Context:** Berkeley began 2026-08-26. The three-week lead target and below-one-week pause rule cannot be evaluated without a real lecture block.
+**Options:** provide the official syllabus; provide only the first course/topic/date; explicitly defer physics scheduling.
+
+## RESOLVED 2026-09-02T16:50:21Z — --help
+resolved by operator
+
+## SUPERVISED RESUME 2026-09-02T16:52:22Z — guerra-002-wire-lenis-provider
+reason: supervised guerra-002 wire LenisProvider

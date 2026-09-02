@@ -6,7 +6,7 @@ engine: cursor
 verifier_engine: cursor
 repo: /opt/guerra-construction-group
 sshkey: ~/.ssh/guerra-construction-group_deploy
-acceptance: test -x node_modules/.bin/next || cp -a /opt/guerra-construction-group/apps/web/node_modules ./node_modules; npm run build
+acceptance: npm ci --offline --cache /opt/recursion/cache/npm && NEXT_FONT_GOOGLE_MOCKED_RESPONSES=/opt/recursion/cache/guerra-web/next-font-google-mocked-responses.js npm run build
 workdir: apps/web
 allowed_paths: apps/web/src/components/motion
 non_goals: auth, portal, API, GSAP pinning, content rewrites, dependency upgrades beyond what is required to import lenis (lenis already in package.json)

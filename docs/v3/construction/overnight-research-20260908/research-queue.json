@@ -1,0 +1,33 @@
+{
+  "campaign": "SC-CUT-SOURCE-01",
+  "order": ["source_authority", "coupled_adversarial", "bounded_scaling"],
+  "all_work_within_one_campaign": true,
+  "items": [
+    {
+      "id": "source_authority",
+      "depends_on": [],
+      "question": "What concrete protocol establishes that a cut covers the registered original intent, admission and attempt set at its authoritative append boundary?",
+      "work": "Research primary sources; construct bounded alternatives in both inherited representations and a third independent relation. Derive completeness from registration, append and collection transitions, never an unexplained complete=true oracle.",
+      "faults": ["omitted or delayed record", "new attempt during collection", "append between collection and publication", "equal-version append versus fork", "foreign reservation or attempt mapping", "source incarnation restart", "lost reply and duplicate request"],
+      "done": "Complete declared finite baseline with positive guard triggers and distinguishing mutants, or a concrete refutation/blocker."
+    },
+    {
+      "id": "coupled_adversarial",
+      "depends_on": ["source_authority"],
+      "question": "Does source admission preserve the existing publication, reader and uncertain-effect contracts under interference?",
+      "work": "Compose the selected bounded protocol with publication/readers, pure literal join, reconciliation, PAUSE, quota/reset, replay, worker lifetime and typed consultation. Preserve the original A6/B6 pool10 and full four-event flow.",
+      "faults": ["current head with incomplete inventory", "stale installation after append", "duplicate receipt after restart, revoke or retire", "PAUSE between stage and commit", "copied versus owned wait", "quota reset manufacturing allowance", "changed-body identifier conflict"],
+      "done": "Triggered preservation checks and guard sensitivities, with precise support and residuals for all six obligations and 27 trace rows."
+    },
+    {
+      "id": "bounded_scaling",
+      "depends_on": ["coupled_adversarial"],
+      "question": "Which registered larger finite bounds or adversarial orderings change the supported conclusions?",
+      "work": "Preregister expanded attempt, record and interleaving domains within unchanged resource caps. Label exhaustive exploration separately from seeded fuzzing and metamorphic tests; partitioned or sampled checks do not establish the full Cartesian product.",
+      "faults": ["minimum and maximum inventory", "duplicate multiplicity and repeated restart", "source/publisher/reader interference", "alternative topological orders", "cross-partition residuals"],
+      "done": "Zero remaining frontier for each exhaustive claim, or explicit incomplete disposition; stop when evidence converges."
+    }
+  ],
+  "advance_rule": "Respect dependencies. In-scope hypothesis repair is authorized after activation. Do not advance past an unresolved dependency by assuming its conclusion.",
+  "convergence_rule": "Twelve hours is a ceiling, not a target. Do not invent another campaign or filler work when this queue converges."
+}

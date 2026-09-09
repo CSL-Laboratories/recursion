@@ -1,0 +1,243 @@
+{
+  "preparation_start_commit": "ec4232e95722d58dc0eff03289fb629b58d29247",
+  "prepared_at": "2026-09-09T03:33:35.102624+00:00",
+  "preparation_branch": "codex/v3-overnight-handoff-20260908",
+  "preparation_gate": "python -X utf8 -B docs/v3/construction/overnight-research-20260908/check_packet.py",
+  "preparation_allowed_paths": [
+    "docs/v3/construction/overnight-research-20260908/**"
+  ],
+  "predecessor_pr": {
+    "number": 109,
+    "url": "https://github.com/NotSkittlz/recursion/pull/109",
+    "state_at_preparation": "MERGED",
+    "head": "e4b844b1af6c309263812c6961ccb50b3e5b8a82",
+    "merge": "ec4232e95722d58dc0eff03289fb629b58d29247",
+    "identical_trees": true
+  },
+  "predecessor_completion_sha256": "5187d9c0fff0a7077dcf291eda205009d076641c5eda17c4933e9b89eea2a8b1",
+  "verified_external_files": 245,
+  "usage_snapshot": {
+    "used_percent": 30,
+    "remaining_percent": 70,
+    "shared_account": true,
+    "twelve_hour_guarantee": false,
+    "reset_credits_used": 0
+  },
+  "frozen_gates": [
+    {
+      "commit": "e4b844b1af6c309263812c6961ccb50b3e5b8a82",
+      "branch": "codex/v3-cut-publication-20260908",
+      "script": "experiments/v3/cut-publication/check.py"
+    },
+    {
+      "commit": "ed8841e47b32ced6ed2364306d036463ebe4541f",
+      "branch": "codex/v3-coupled-cut-pause-20260908",
+      "script": "experiments/v3/coupled-cut-pause/check.py"
+    },
+    {
+      "commit": "6bbbbdedb328eb457abce1ca337f48e041a04a2d",
+      "branch": "codex/v3-coupled-construction-20260908",
+      "script": "experiments/v3/coupled-construction/check.py"
+    },
+    {
+      "commit": "27ab6bada7ae339069616bd5b44c634a6bc40f32",
+      "branch": "codex/v3-typed-consultation-20260908",
+      "script": "experiments/v3/typed-consultation/check.py"
+    },
+    {
+      "commit": "191cf5d06a95b509f6b98748b93afa3188eb4ecf",
+      "branch": "codex/v3-wire-correspondence-20260908",
+      "script": "experiments/v3/wire-correspondence/check.py"
+    },
+    {
+      "commit": "f1a68cd8d3d0091dc0a91c32197c32c707620ed4",
+      "branch": "codex/v3-shared-reservations-20260908",
+      "script": "experiments/v3/shared-reservations/check.py"
+    },
+    {
+      "commit": "68d50fcde039504ad9519cca119cc39034d71dc7",
+      "branch": "codex/v3-shared-composition-20260908",
+      "script": "experiments/v3/shared-composition/check.py"
+    },
+    {
+      "commit": "c9a51c0a0bcfa0946b410733b7910f477d89f1cc",
+      "branch": "codex/v3-effect-evidence-20260908",
+      "script": "experiments/v3/effect-evidence/check.py"
+    },
+    {
+      "commit": "ace2d4272047dccde05e1863e126aa39b2306c9c",
+      "branch": "codex/v3-composition-model-20260908",
+      "script": "experiments/v3/composition-model/check.py"
+    },
+    {
+      "commit": "c6c05ad69e50d4acbeb429dfa3a15a8c3455d2a0",
+      "branch": "codex/v3-generation-authority-20260907",
+      "script": "experiments/v3/generation-authority/check.py"
+    },
+    {
+      "commit": "04b664c58bddb72674d297f4bcf4bef5435bda0f",
+      "branch": "codex/v3-replay-store-evidence-20260907",
+      "script": "experiments/v3/replay-store-evidence/check.py"
+    },
+    {
+      "commit": "03fd11014a5be99006d637ad5eb692faa0557f8f",
+      "branch": "codex/v3-flow-recovery-integration-20260907",
+      "script": "experiments/v3/flow-recovery-integration/check.py"
+    },
+    {
+      "commit": "f86f169c61ca6db4a3d7870353f270e35ef954d6",
+      "branch": "codex/v3-reset-mapping-20260907",
+      "script": "experiments/v3/reset-mapping/check.py"
+    },
+    {
+      "commit": "c87f492780087772e3bcb06249ef14d89e812a25",
+      "branch": "codex/v3-formal-comparison-20260907",
+      "script": "experiments/v3/formal-comparison/check.py"
+    },
+    {
+      "commit": "a497bae10dddc3adf176242aed878f83b4519316",
+      "branch": "codex/v3-interface-probes-20260907",
+      "script": "experiments/v3/interface-probes/check.py"
+    },
+    {
+      "commit": "51733c48537d91ad17774b0c05c48ec289a75517",
+      "branch": "codex/v3-formal-model-experiment",
+      "script": "docs/v3/foundation-research/mark2-research/mark3-comparison/check.py"
+    }
+  ],
+  "regression_commands": [
+    [
+      "python",
+      "-B",
+      "schemas/control-plane/v3/planning/materialize.py",
+      "--check"
+    ],
+    [
+      "python",
+      "-B",
+      "scripts/tests/v3/planning/materialize_fixtures.py",
+      "--check"
+    ],
+    [
+      "python",
+      "-B",
+      "scripts/tests/v3/planning/red_fixture.test.py",
+      "--validate-only"
+    ],
+    [
+      "python",
+      "-B",
+      "scripts/tests/v3/planning/adversarial.test.py"
+    ],
+    [
+      "python",
+      "-B",
+      "scripts/tests/v3/planning/conformance.test.py"
+    ],
+    [
+      "python",
+      "-B",
+      "scripts/tests/v3/planning/property.test.py"
+    ],
+    [
+      "python",
+      "-B",
+      "scripts/tests/v3/planning/red_fixture.test.py"
+    ],
+    [
+      "python",
+      "-B",
+      "scripts/tests/v3/planning/schema.test.py"
+    ],
+    [
+      "python",
+      "-B",
+      "scripts/tests/v3/planning/static.test.py"
+    ],
+    [
+      "python",
+      "-B",
+      "scripts/tests/v3/planning/validation.test.py"
+    ],
+    [
+      "python",
+      "-B",
+      "schemas/control-plane/v3/execution/materialize.py",
+      "--check"
+    ],
+    [
+      "python",
+      "-B",
+      "scripts/tests/v3/execution/materialize_fixtures.py",
+      "--check"
+    ],
+    [
+      "python",
+      "-B",
+      "scripts/tests/v3/execution/adversarial.test.py"
+    ],
+    [
+      "python",
+      "-B",
+      "scripts/tests/v3/execution/conformance.test.py"
+    ],
+    [
+      "python",
+      "-B",
+      "scripts/tests/v3/execution/fixture.test.py"
+    ],
+    [
+      "python",
+      "-B",
+      "scripts/tests/v3/execution/schema.test.py"
+    ],
+    [
+      "python",
+      "-B",
+      "scripts/tests/v3/execution/static.test.py"
+    ],
+    [
+      "python",
+      "-B",
+      "schemas/control-plane/v3/integrity/materialize.py",
+      "--check"
+    ],
+    [
+      "python",
+      "-B",
+      "scripts/tests/v3/integrity/materialize_fixtures.py",
+      "--check"
+    ],
+    [
+      "python",
+      "-B",
+      "scripts/tests/v3/integrity/adversarial.test.py"
+    ],
+    [
+      "python",
+      "-B",
+      "scripts/tests/v3/integrity/conformance.test.py"
+    ],
+    [
+      "python",
+      "-B",
+      "scripts/tests/v3/integrity/fixture.test.py"
+    ],
+    [
+      "python",
+      "-B",
+      "scripts/tests/v3/integrity/schema.test.py"
+    ],
+    [
+      "python",
+      "-B",
+      "scripts/tests/v3/integrity/static.test.py"
+    ],
+    [
+      "python",
+      "-B",
+      "-u",
+      "scripts/tests/recursion-v2-mvp.test.py"
+    ]
+  ]
+}

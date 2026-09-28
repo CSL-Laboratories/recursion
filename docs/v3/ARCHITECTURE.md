@@ -384,7 +384,7 @@ Every engine adapter negotiates a versioned capability descriptor for thread/tur
 stream ordering, tool-intent and settlement boundaries, approval bridging, interrupt semantics,
 process ownership, checkpoint/resume, native compaction, usage evidence and stale-notification
 filtering. Unsupported invariants fail closed for that route. External engines may own provider
-sampling, provider-specific wire/tool syntax and native retry/stream parsing; they do not own
+sampling, provider-specific wire/tool syntax and native retry; they normalize upstream deltas into Recursion's canonical stream events and do not own
 Recursion actor/goal/task identity, authority, budgets, PAUSE epochs, process lifetime, evidence,
 canonical events or publication.
 
@@ -636,3 +636,13 @@ retained duplicate publication depends on durable request identity, not call spe
 Atomic registration/start and pending registration are bounded alternatives, not product
 architecture selection. Physical source truth, recovery and common-writer migration remain
 premises or residuals. See [evidence](construction/cut-source-overnight-20260908/findings.md).
+
+## Stream and prompt ownership - 2026-09-28
+
+Recursion owns the canonical prompt and the model token stream in **both** execution lanes. The
+native loop emits model output directly into the canonical per-turn `TurnStream`; an upstream
+engine adapter only **normalizes** upstream deltas into the same `StreamEvent` types. No adapter
+owns cursors, credits, coalescing or multiplexing, and no adapter constructs the canonical prompt:
+Recursion assembles the invariant prefix + volatile suffix from the `ContextCapsule`, and the
+adapter serializes it. This is the governing change for UI/GUI multiplexing, system-prompt control
+and cross-session compaction.

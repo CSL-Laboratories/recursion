@@ -267,3 +267,13 @@ Minimum acceptance requires synthetic multi-ARM conversation fixtures, duplicate
 delivery, edited/deleted messages, transport restart, token revocation, PAUSE, GoalSpec
 amendment, actor replacement and a proof that no chat topology creates a second portfolio
 executive.
+
+## Canonical stream, ACP roles and /goal - 2026-09-28
+
+The canonical stream and its multiplexing are **Recursion-owned in both native and upstream
+modes**; adapters emit normalized stream events and own no cursor or credit. Declare two ACP
+roles explicitly: **ACP client** (Recursion drives upstream ACP agents as engines) now, and **ACP
+agent/host** (editors/IDEs drive Recursion) later. Reconcile per-route ACP vs SDK vs CLI selection;
+ACP never grants authority. Cross-session agent chat is **bounded** - typed answer/decline/blocker
+with an adoption record, plus UI projections (side chat, share, project/session views) over that
+envelope; never a free-form authority-bearing transcript.

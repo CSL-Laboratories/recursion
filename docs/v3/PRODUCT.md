@@ -111,7 +111,7 @@ authentication wording still needs route-specific evidence. The historical cohor
 
 ## Thesis
 
-Recursion is a self-hosted, headless harness for sustained, high-quality autonomous software development across models, subscriptions, APIs, CLIs, repositories, and machines. It turns an owner's intent into reviewable development while preserving authority, privacy, quota, machine responsiveness, and evidence.
+Recursion is a self-hosted, provider-neutral agent operating system and native harness: it runs its own goal-driven loop and drives a pluggable suite of endpoints (local models, BYOK APIs, subscription/OAuth routes, and upstream harness engines) behind one durable contract of authority, budget, context, evidence, and recovery. It turns an owner's intent into reviewable development while preserving authority, privacy, quota, machine responsiveness, and evidence.
 
 Its distinguishing value is not another graphical chat UI or provider router. V3 owns the
 durable orchestration harness: actor identity, goals, delegation, routing, state, context,
@@ -217,3 +217,34 @@ V3 is one monumental product release built as independently testable internal mi
   creating conflicting authority, instruction loss or an AI ARM Manager.
 - Scientific Research ARM output withstands false-citation, outdated-source, contradiction,
   reproducibility, copyright, privacy and independent-source-verification gates.
+
+## Recursion identity, model plane, and /goal - 2026-09-28
+
+This section supersedes the harness-only framing above where they differ.
+
+Recursion is a self-hosted, provider-neutral **agent operating system and native harness**. It
+runs its own goal-driven loop and drives a pluggable suite of endpoints behind one durable
+contract of authority, budget, context, evidence and recovery. It is the middleman between the
+owner and the AI suite, so prompt and compaction stay clean and the owner is never locked into one
+ecosystem. **`/goal` is the primary interface**; the owner keeps sovereignty and final say.
+
+The model plane has four first-class **endpoint kinds**, orthogonal to `BillingBasis` and to
+`Engine`/`Provider`: `local` (llama.cpp / Ollama / OpenAI-compatible), `byok` (raw provider keys),
+`subscription` (OAuth/plan entitlement), and `upstream-harness` (a vendor binary performs
+inference). `local`, `byok` and `upstream-harness` are first-class in v1; `subscription` rolls out
+per route with fail-closed eligibility.
+
+Two auth planes stay separate: **route auth** (provider-native sign-in, BYOK key, or a
+subscription's sign-in performed by the upstream binary - Recursion must not collect, intercept or
+pool upstream session tokens) and **Recursion operator auth** (installation trust root, operator
+credential, device roles).
+
+**Recursion owns the canonical prompt and the model token stream in both execution lanes**;
+adapters only normalize upstream deltas. Recursion can be driven over ACP by editors or drive
+upstream ACP agents as engines.
+
+**Onboarding and migration are first-class.** Recursion is the central engine for a person's
+agentic engineering work without locking them into one ecosystem. First-run onboarding must detect
+existing harness installs and credentials, import goals/config from supported harnesses in one
+command, and let the owner bring their own subscriptions or keys with no manual re-entry. Migration
+cost is a product metric, not an afterthought. See [ONBOARDING-AND-MIGRATION](ONBOARDING-AND-MIGRATION.md).

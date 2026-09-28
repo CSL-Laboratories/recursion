@@ -88,7 +88,7 @@ workers. The kernel owns neither portfolio priorities nor ARM plans.
 | `CapacityPool` | Bounded subscription, metered, local or remote capacity with billing and fallback policy |
 | `Host` | Machine on which the engine/process executes |
 | `SandboxProfile` | Filesystem, process, network and resource boundary applied to execution |
-| `ProviderSession` | Disposable route-local continuity/cache affinity handle; never canonical actor identity |
+| `ProviderSession` | Disposable route-local continuity/cache affinity handle. Zero or more map to exactly one `RecursionSession`; never canonical actor identity |
 | `RouteCapabilityDescriptor` | Dated evidence about supported context, tools, controls, billing/privacy unknowns and expiry |
 
 A model listing does not create a route. A route exists only when all required objects resolve
@@ -115,3 +115,12 @@ One aggregate has one writable authority at a time. JSONL/JSON Sequence plus CAS
 metadata plus the same CAS remain competing future stores; Git/Markdown/JSON views
 remain configuration, evidence exports or compatibility projections. None may silently become
 a second runtime writer. See [CURRENT-AND-MIGRATION.md](CURRENT-AND-MIGRATION.md).
+
+## Recursion-native session and endpoint kinds - 2026-09-28
+
+| Object | Definition |
+|---|---|
+| `RecursionSession` / `SessionId` | Kernel-minted, project-scoped canonical session. Spans turns, route/provider epochs, engine switches, detach/resume and compaction transitions; bound to one logical actor and `GoalSpec`. Zero or more `ProviderSession`s map to exactly one. A projection over the canonical event ledger plus the artifact index - not a second writer. |
+| `TurnStream` / `StreamEvent` | The canonical model-output stream for one turn, emitted by Recursion in both native and upstream lanes. Adapters normalize upstream deltas into `StreamEvent`s; they never own cursors or credits. |
+| `ViewSubscription` | A view's attachment to the canonical stream (attach/detach); one canonical append fans out to N views. |
+| `EndpointKind` | `local` / `byok` / `subscription` / `upstream-harness` - orthogonal to `BillingBasis` and to `Engine`/`Provider`. |

@@ -332,3 +332,16 @@ After the architecture-proof research, ask only the smallest still-decisive ques
    should M1A first establish the language-neutral vectors in the existing implementation language?
 5. Which benchmark task families may be used for the sealed attribution corpus without creating
    unacceptable training-exposure or licensing risk?
+
+## 2026-09-28 - identity, ownership, session and auth decisions
+
+| ID | Decision | Status |
+|---|---|---|
+| OR-040 | Recursion owns the canonical prompt and the model token stream and their multiplexing in both native and upstream execution; adapters normalize upstream deltas, own no cursor/credit, and fail closed on unsupported stream invariants. | accepted direction |
+| OR-041 | One canonical `RecursionSession` spans turns, route/provider epochs, engine switches and detach; provider sessions map N:1 and remain disposable; one compaction governor per session; the same GoalSpec revision + capsule digest must compile to an equivalent control prefix on every engine. | accepted direction |
+| OR-042 | Four first-class endpoint kinds (`local` / `byok` / `subscription` / `upstream-harness`); `local`, `byok` and `upstream-harness` are v1, and `subscription` rolls out per route with fail-closed eligibility. | accepted direction |
+| OR-043 | Two auth planes: route auth (native sign-in / BYOK / OAuth by the upstream binary, no token interception) is separate from Recursion operator auth. | accepted direction |
+| OR-044 | `/goal` is in-session Goal mode compiling to one bounded GoalSpec/ArmRun with Stop-mode cancellation; it is not an autonomous loop. | accepted direction |
+| OR-045 | Recursion is an ACP client (drives upstream ACP agents as engines) and, later, an ACP agent/host; ACP never grants authority. | accepted direction |
+| OR-046 | `decision.foundation.authentication` resolves to option 1 (route-specific BYOK + user-authenticated upstream binaries; no token interception); a companion amendment (CA-V3-007) covers the provider-neutral route model and the two auth planes. | accepted direction |
+| OR-047 | Easy onboarding and migration are first-class: first-run detection/import of supported harnesses and credentials, reuse of existing subscriptions/keys without re-entry or interception, and portable canonical artifacts so migration in and out is low-cost. | accepted direction |

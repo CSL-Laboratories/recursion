@@ -327,3 +327,22 @@ constant.
 ## Stable observer interface
 
 Scheduled tasks and external assistants receive a versioned read-only interface for status, events, budgets, blockers, health, and evidence references. Scoped control is a separate authenticated capability. This lets monitoring tools check Recursion without parsing terminal prose or receiving implementation authority.
+
+## /goal and the endpoint suite - 2026-09-28
+
+`/goal <objective>` starts **Goal mode** in the current session: the text is both the first prompt
+and the completion criteria (Outcome / Constraints / Verification). It compiles to one bounded
+`GoalSpec` and one bounded `ArmRun`; a progress row supports pause / resume / edit / clear, and
+follow-up messages steer it live. Cancellation maps to the existing Stop modes (Aggressive / Full /
+Lazy) and immediate PAUSE. It does not grant broader access.
+
+Owner-authorized **route suite** management: `recursion model local add|list` (llama.cpp / Ollama /
+OpenAI-compatible), `recursion provider auth|key|probe` (subscription sign-in vs BYOK),
+`recursion route suite show|edit`. Normative: Recursion never collects or intercepts upstream
+session tokens; the upstream binary performs its own sign-in.
+
+**Onboarding:** `recursion init` (first-run wizard that detects host, existing harness installs,
+auth homes and local runtimes, then proposes a route suite), `recursion import <harness>` (imports
+goals/config/instructions and reuses existing subscriptions/keys in place), and `recursion doctor`.
+Migration is one command per supported harness and must never require re-entering existing
+subscriptions or keys.

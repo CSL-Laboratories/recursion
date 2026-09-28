@@ -321,3 +321,12 @@ The authoritative lease, stale-transition and route-replacement rules are canoni
 - When is a long-lived provider session more valuable than a fresh session with a compact capsule?
 - How should planning models be authorized under a future provider-neutral amendment to the current constitution?
 - On PAUSE or revocation, which classes of already-started operation may finish, which must be killed, and which outputs must be quarantined?
+
+## Assistant identity and consultation (promoted) - 2026-09-28
+
+Promote `AssistantIdentity` (stable id, project memberships, profile revision, scoped memory) and
+the consultation envelope from proposal to specified: a consultation binds parent goal/task, both
+role leases, decision class, permitted capsule, response schema, expiry, depth/cycle bound and
+shared budget; the receiver answers / declines / returns a typed blocker, and the caller records
+adoption + evidence. Cross-session chat is a bounded projection over this envelope. Identity
+survives model/provider/session/node swaps without carrying stale authority.

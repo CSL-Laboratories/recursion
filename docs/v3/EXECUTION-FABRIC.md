@@ -479,3 +479,16 @@ A6. Existing publication receipts, reader pins/copies, worker lifetime, quota/re
 and classification remain distinct. Pending registry scaling to4 does not authorize
 additional original literal attempts or external execution.
 See [scope and results](construction/cut-source-overnight-20260908/findings.md).
+
+## Endpoint kinds and adapter session mapping - 2026-09-28
+
+Add `EndpointKind` (`local` / `byok` / `subscription` / `upstream-harness`) as an explicit route
+resolution axis, orthogonal to `BillingBasis` and to `Engine`/`Provider`. An owner authorizes a
+set as a route suite inside `RoutePolicyEnvelope@1`; unknown/expired eligibility blocks rather than
+falls back.
+
+Engine-adapter contract additions: (a) accept the Recursion `SessionId` + capsule; (b) report
+native session ids only as affinity evidence (N:1 mapping); (c) bind accounting
+`SessionId -> parent goal/pool`; (d) expose resume/fork/compaction as typed **candidate** events
+that never advance the session epoch. A subscription route is admitted only inside the envelope; a
+subscription-to-metered switch remains a billing-authority transition.

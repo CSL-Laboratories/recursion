@@ -249,3 +249,11 @@ recorded with immutable pins and limitations. The Owner has resolved Meta's inte
 to Muse Code; its external integration protocol and route-specific eligibility remain unverified.
 No source inventory grants runtime eligibility. Upgrades require staged semantic replay and
 explicit route-epoch promotion under a still-proposed support window. FND-007/FND-016.
+
+## Local runtimes and new suite members - 2026-09-28
+
+First-class **local runtime adapters** in v1: llama.cpp, Ollama, and an OpenAI-compatible base URL.
+vLLM/SGLang remain optional cache adapters until local eligibility (incl. Windows) is established.
+Add **Command Code GOAT** as a candidate upstream-harness engine; record **OpenCode Go** as a
+distinct subscription capacity pool *behind the OpenCode engine*, not a separate engine. Add a
+rollout state `subscription-eligible-unverified` that maps to block/defer under fail-closed.

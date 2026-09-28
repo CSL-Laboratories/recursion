@@ -210,3 +210,11 @@ Required proof includes:
 - How should artifact encryption keys rotate without breaking content identity?
 - Which projections must be transactionally synchronous and which may be eventually rebuilt?
 - What measured event volume and database size should define the VPS acceptance envelope?
+
+## Session aggregate - 2026-09-28
+
+A `RecursionSession` (`SessionId`) is a projection over the canonical event ledger plus the
+artifact index; there is **no separate session store and no second writer**. Session lifecycle is
+represented as canonical events: created, checkpointed, compacted, route-switched, forked,
+resumed, closed. Raw transcript remains a retention-class artifact, and the `ContextCapsule` is the
+durable carrier across engines and nodes.

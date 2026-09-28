@@ -231,3 +231,15 @@ separate from agent execution authority.
 - disconnected node publishing stale work;
 - public event sizes, timing, identifiers, or raw content revealing private project membership;
 - owner-hostile defaults that make local recovery impossible.
+
+## Two auth planes - 2026-09-28
+
+Keep two planes distinct and separately receipted:
+
+- **Plane R - route auth.** How Recursion reaches a model: provider-native auth homes, a BYOK key,
+  or a subscription's sign-in performed **by the upstream binary**. Normative rule: *Recursion MUST
+  NOT collect, intercept, pool or replay upstream session tokens.* Some subscriptions (e.g.
+  Anthropic) do not permit OAuth into third-party harnesses; the vendor-binary own-sign-in is the
+  workaround. Only an opaque `account_ref` is stored.
+- **Plane O - Recursion operator auth.** How the owner/API authenticates into Recursion:
+  installation trust root, operator credential, device roles, risk-based step-up.

@@ -64,7 +64,7 @@ conversation; it does not establish every tool or effect is mediated by a deny r
 
 ## Mark 2 continuity and value — research synthesis 2026-09-07
 
-Keep the non-droppable capsule and one compaction governor per route epoch. Assistant memory
+Keep the non-droppable capsule and one compaction governor per Recursion session, authoritative across the session's route epochs. Assistant memory
 adds explicit source/audience/revision/expiry, including revoked instructions and pending
 questions/approvals. A transform may preserve reference integrity while losing semantic quality;
 deterministic validation and independent task-quality assessment are separate requirements.
@@ -259,3 +259,18 @@ Context artifacts inherit the strictest classification of their inputs. Cross-pr
 - Session affinity benefits versus fresh-session capsule quality.
 - Repository-map invalidation accuracy by commit and configuration digest.
 - Cache-hit observability and billing behavior for every supported route.
+
+## Canonical prompt assembly ownership - 2026-09-28
+
+Recursion assembles the canonical prompt from the `ContextCapsule` (invariant instruction/schema
+prefix + volatile task suffix). Provider adapters only serialize it into a route's shape; provider
+prompt caches remain adapter-local. One compaction governor is authoritative **per Recursion
+session** (spanning that session's route epochs), not merely per route epoch; native/session and
+plugin compactors return candidate artifacts and never advance the session's authoritative epoch.
+
+## Cross-session prompt-consistency contract - 2026-09-28
+
+Define a content-addressed **compiled-prompt manifest** derived from the capsule and a per-adapter
+**compile receipt**. The same `GoalSpec` revision + capsule digest must compile to an equivalent
+control prefix on every engine; a divergence is a blocker, not a best-effort conversion. This is
+what keeps prompt/compaction clean when the owner switches engine, provider or session.

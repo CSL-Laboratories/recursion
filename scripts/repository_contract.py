@@ -181,29 +181,6 @@ def _require_path_subset(child: list[str], parent: list[str], *, field: str) -> 
     return child
 
 
-def _contains_legacy_chiron(value: object) -> bool:
-    pending: list[object] = [value]
-    while pending:
-        current = pending.pop()
-        if isinstance(current, (list, tuple, set)):
-            pending.extend(current)
-            continue
-        if isinstance(current, dict):
-            pending.extend(current.values())
-            continue
-        if not isinstance(current, str):
-            continue
-        try:
-            normalized = re.sub(r"/{2,}", "/", current.replace("\\", "/")).lower()
-            normalized = re.sub(r"/\./", "/", normalized)
-            normalized = re.sub(r"(^|[\s'\"=:])\./", r"\1", normalized)
-            if re.search(r"(?<![a-z0-9_])apps/chiron(?![a-z0-9_])", normalized):
-                return True
-        except _BOUNDARY_ERRORS as exc:
-            raise ContractError("legacy path input could not be inspected") from exc
-    return False
-
-
 def _valid_git_ref(value: object) -> bool:
     if not isinstance(value, str) or not value or "*" in value \
             or any(ord(char) < 32 for char in value):
@@ -1009,12 +986,6 @@ def admit_task(contract: dict[str, Any], task: dict[str, Any], repo: Path, *, ne
     if "controller_gate_files" in task:
         task_controller_gate_files = _normalized_gate_files(
             task["controller_gate_files"], field="task controller_gate_files")
-    if new_generation and any(_contains_legacy_chiron(task.get(key)) for key in (
-        "workdir", "acceptance", "gate_command", "gate_commands", "seed", "repo", "goal",
-    )):
-        raise ContractError("new task generation may not target apps/chiron", "unauthorized-result")
-    if new_generation and any(_contains_legacy_chiron(item) for item in contract["gate_commands"]):
-        raise ContractError("new task generation may not target apps/chiron", "unauthorized-result")
     required_gate_profile = _required_gate_profile(contract)
     if task_gate_files is not None:
         expected_gate_files = required_gate_profile["gate_files"] if required_gate_profile else []
@@ -1074,8 +1045,6 @@ def admit_task(contract: dict[str, Any], task: dict[str, Any], repo: Path, *, ne
     except _BOUNDARY_ERRORS as exc:
         raise ContractError("task source repository does not match project", "unauthorized-result") from exc
     allowed = _normalized_paths(task.get("allowed_paths", contract["allowed_paths"]), field="task allowed_paths")
-    if new_generation and any(_contains_legacy_chiron(item) for item in allowed):
-        raise ContractError("new task generation may not target apps/chiron", "unauthorized-result")
     _require_path_subset(allowed, contract["allowed_paths"], field="task allowed_paths")
     target = task.get("target_branch")
     if target is not None:

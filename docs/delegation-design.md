@@ -28,9 +28,7 @@ gates, and only a green gate earns an auto-commit.*
 | Bulk generation / breadth | OpenRouter -> Deepseek-class, price-sorted | metered (fenced) | first drafts, boilerplate, many-in-parallel coverage, test-case generation |
 | Depth + verification | Claude Opus, `claude -p` | flat Max (off 24/7 path) | hard multi-file coding, architecture, and CHECKING the cheap output |
 | Planning + gating | GPT 5.6 Terra/Sol on the sub | flat (~$0) | turn a goal into tasks, score acceptance ambiguity, decide auto vs escalate |
-| Ground-truth verify | the GSC machine oracle (PC-local) | — | the strongest checker where it exists (native mesh @0x006FA210) |
-
-Correctness-preserving pattern: **Deepseek generates -> Opus or the oracle verifies.** Cheap
+Correctness-preserving pattern: **Deepseek generates -> Opus or a machine oracle verifies.** Cheap
 where generation is solved; strong only where verification isn't.
 
 ## The task model
@@ -38,14 +36,14 @@ where generation is solved; strong only where verification isn't.
 A task is a small file in `state/tasks/<id>.md` (or a `.jsonl` queue — decide at build time):
 
 ```
-id:         guerra-001
-workstream: guerra-construction
-goal:       "Scaffold a Next.js static site that builds and serves the landing page"
+id:         task-001
+workstream: <workstream>
+goal:       "Scaffold an app that builds and serves a landing page"
 engine:     claude            # or deepseek | hermes
 acceptance: "npm ci && npm run build && test -d out"   # MUST exit 0 to pass
 autonomy:   auto              # auto | escalate  (per-task override of the ceiling)
 status:     queued            # queued | running | passed | failed | escalated
-branch:     loop/work/guerra-001
+branch:     loop/work/task-001
 ```
 
 The **acceptance line is the contract.** If it can't be written as a command that a machine can
@@ -87,20 +85,7 @@ Autonomy scales with machine-verifiability (architecture.md).
 
 | Workstream | Ceiling | Why / constraint |
 |---|---|---|
-| cubic-castles (GSC client) | **high** | has the machine oracle — BUT oracle is PC-local; VPS does planning/code, PC verifies |
-| guerra-construction (site) | **high** | static site, fully VPS-verifiable (builds/deploys/renders), safe |
-| chiron (the app) | **medium** | app scaffold is buildable/verifiable; the LEARNING loop is foreground — do not autonomize |
-| golden-stallion / fleet | medium | auto the reversible; escalate costly/risky; mining = DO-NOT-DEPLOY |
-| physics-coursework (learning) | **low** | foreground by design — the value is the live Socratic loop, not autonomous output |
-
-## The GSC oracle bridge (for cubic-castles)
-
-The oracle can't move to the headless VPS, so GSC uses a two-part executor:
-- **VPS side:** planning + code that needs no live measurement (an Opus arm), committed to a work branch.
-- **PC side:** an intermittent worker that drains an `oracle-jobs` queue when the PC is on —
-  runs the CheatEngine measurement, writes scores back to the ledger. The VPS never blocks on it;
-  oracle-gated tasks simply wait in the queue. This is the one workstream that pauses when the PC
-  is off (architecture.md "GSC oracle exception"). Build this bridge before running GSC build tasks.
+| fleet | medium | auto the reversible; escalate costly/risky; mining = DO-NOT-DEPLOY |
 
 ## Safety & guardrails (inherited, non-negotiable)
 
@@ -124,7 +109,6 @@ The oracle can't move to the headless VPS, so GSC uses a two-part executor:
 | Gate control (`work.selftest.sh`: green integrates, red escalates) | ✅ v2 (2026-08-05) |
 | `recursion work` / `recursion tasks` CLI | ✅ v2 (2026-08-05) |
 | Planner (`plan.sh`: goal -> tasks with acceptance) | ❌ (tasks hand-written for now) |
-| GSC oracle bridge (PC intermittent worker + oracle-jobs queue) | ❌ |
 | Deepseek bulk budget + per-project fences | ❌ |
 
 ## Arm economics — measured 2026-08-05 (load-bearing)
@@ -138,7 +122,7 @@ The build-arm cost model is NOT what the roster implied. Measured on gs-recursio
   its cost lands on the BOARD.
 - **`claude -p` is the free-ish file-writing arm** (flat Claude Max) — but it needs a one-time
   interactive `claude /login` on the box; before that it exits 0 having written nothing (the
-  gate catches the no-op and escalates). Logged in 2026-08-05; chiron-001 built green at $0.00.
+  gate catches the no-op and escalates). Logged in 2026-08-05; the first build task ran green at $0.00.
 - Net routing for BUILD tasks today: `engine: claude` = free-ish depth/scaffold arm (default);
   `engine: hermes` = metered fallback (fenced); `engine: deepseek|openrouter` = raw
   chat-completion, still needs a file-emission protocol before it can write a tree (later).
@@ -155,14 +139,14 @@ The build-arm cost model is NOT what the roster implied. Measured on gs-recursio
 
 ## First build slice — PROVEN 2026-08-05
 
-The minimal vertical that proves the machine ran end to end: task `chiron-001` (hand-written,
-`state/tasks/chiron-001.md`) -> the claude/Opus arm scaffolded `apps/chiron` in an isolated
-worktree on `loop/work/chiron-001` -> the executor ran the acceptance command
+The minimal vertical that proves the machine ran end to end: task `task-001` (hand-written,
+`state/tasks/task-001.md`) -> the claude/Opus arm scaffolded an app in an isolated
+worktree on `loop/work/task-001` -> the executor ran the acceptance command
 `npm install && npm run build` -> it compiled clean (`✓ Generating static pages (4/4)`) ->
-auto-committed to `loop/work/chiron-001` (ba02110) at $0.00 on flat Max -> BOARD shows it.
+auto-committed to `loop/work/task-001` (ba02110) at $0.00 on flat Max -> BOARD shows it.
 The gate control (`work.selftest.sh`) separately proves a KNOWN-BAD task fails and escalates,
 so a green is meaningful and not a false pass.
 
-Next candidates in safety order: **guerra site** (VPS-verifiable) -> **cubic-castles** (needs
-the oracle bridge first). A `plan.sh` that emits tasks from a goal, and a real Deepseek bulk
-leg with a budget, remain the next build steps.
+Next candidates in safety order: workstreams whose acceptance is fully VPS-verifiable first, then
+those that need a machine-oracle bridge. A `plan.sh` that emits tasks from a goal, and a real
+Deepseek bulk leg with a budget, remain the next build steps.

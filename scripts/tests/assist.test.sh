@@ -5,7 +5,7 @@
 # WHY. The escalation loop was one-directional: an arm could stop with a precise question, and a
 # human could close or requeue it, but the ANSWER landed in state/INBOX.md — a file the arm never
 # reads. The next run then produced the identical prompt and the identical block. Nothing in the
-# system could tell that apart from progress, which is why the GSC pilot (whose blockers are all
+# system could tell that apart from progress, which is why the SAMPLE pilot (whose blockers are all
 # "only Lucas can supply this") could not run.
 #
 # ★ Test 1 is the CONTROL and it is the whole point: the answer TEXT must appear in the arm's
@@ -92,27 +92,27 @@ QUESTION='Does op 0x6c carry the overlay tint, or is the tint a separate pass? I
 ANSWER='Separate pass. The tint splits the two features — see the 0x6c overlay note, captures/S-series-04.bin @ 0x1f40.'
 
 # --- 1) the arm blocks -> an assist exists, and the task is blocked --------------------------
-mktask gsc-help
-STUB_RESULT="$(blocked_result "$QUESTION")" run_work gsc-help
-if [ "$(st gsc-help)" = "blocked" ] && [ -f "$R/state/assists/gsc-help.md" ] && [ "$(a_field gsc-help status)" = "open" ]; then
+mktask sample-help
+STUB_RESULT="$(blocked_result "$QUESTION")" run_work sample-help
+if [ "$(st sample-help)" = "blocked" ] && [ -f "$R/state/assists/sample-help.md" ] && [ "$(a_field sample-help status)" = "open" ]; then
   ok "an arm that stops on ambiguity produces an OPEN assist carrying its question"
 else
-  no "no assist was opened (status=$(st gsc-help), assist=$(a_field gsc-help status))"
+  no "no assist was opened (status=$(st sample-help), assist=$(a_field sample-help status))"
   tail -4 "$TMP/w.out" | sed 's/^/        /'
 fi
 
 # --- 2) answering requeues that task ---------------------------------------------------------
-rc=$(assist answer gsc-help "$ANSWER")
-if [ "$rc" = "0" ] && [ "$(st gsc-help)" = "queued" ] && [ "$(a_field gsc-help status)" = "answered" ]; then
+rc=$(assist answer sample-help "$ANSWER")
+if [ "$rc" = "0" ] && [ "$(st sample-help)" = "queued" ] && [ "$(a_field sample-help status)" = "answered" ]; then
   ok "answering an assist requeues the task and marks the assist answered"
 else
-  no "answer did not requeue (rc=$rc status=$(st gsc-help) assist=$(a_field gsc-help status)): $(cat "$TMP/a.out")"
+  no "answer did not requeue (rc=$rc status=$(st sample-help) assist=$(a_field sample-help status)): $(cat "$TMP/a.out")"
 fi
 
 # --- 3) ★ THE CONTROL: the answer TEXT reaches the arm --------------------------------------
 # Everything above is bookkeeping. This is the seam.
 : > "$TMP/prompt.txt"
-STUB_RESULT='{"status":"done","summary":"used the guidance","files_changed":[]}' run_work gsc-help
+STUB_RESULT='{"status":"done","summary":"used the guidance","files_changed":[]}' run_work sample-help
 if grep -qF "$ANSWER" "$TMP/prompt.txt" && grep -q 'HUMAN GUIDANCE' "$TMP/prompt.txt"; then
   ok "★ CONTROL — the human's answer is INSIDE the arm's prompt (the seam actually delivers)"
 else
@@ -157,13 +157,13 @@ fi
 # This is the case the seam exists to make impossible-to-miss: the answer did not land, and
 # silently re-asking would burn a human every cycle while looking like the system working.
 : > "$TMP/prompt.txt"
-rc=$(assist open gsc-help decision "$QUESTION")
+rc=$(assist open sample-help decision "$QUESTION")
 if [ "$rc" = "3" ] && grep -q '^LOOP' "$TMP/a.out"; then
   ok "★ re-blocking on an ALREADY-ANSWERED question is detected as a LOOP, not re-asked"
 else
   no "★ LOOP UNDETECTED (rc=$rc): the same question would be put to a human again every cycle"
 fi
-esc="$( ( cd "$R" && RECURSION_ROOT="$R" bash scripts/taskctl.sh esc-list open 2>/dev/null ) | grep -c 'assist-loop-gsc-help' )"
+esc="$( ( cd "$R" && RECURSION_ROOT="$R" bash scripts/taskctl.sh esc-list open 2>/dev/null ) | grep -c 'assist-loop-sample-help' )"
 [ "$esc" = "1" ] && ok "the loop raises its own escalation (distinct from 'the arm has a question')" \
                  || no "no distinct escalation for the loop case (found $esc)"
 

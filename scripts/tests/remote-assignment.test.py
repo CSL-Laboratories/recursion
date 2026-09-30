@@ -55,8 +55,8 @@ OTHER_SHA = "fedcba9876543210fedcba9876543210fedcba98"
 
 ASSIGNMENT = {
     "task_id": "t-0042",
-    "project_id": "chiron",
-    "source_repository": "https://github.com/NotSkittlz/chiron",
+    "project_id": "example-ops",
+    "source_repository": "https://github.com/NotSkittlz/example-ops",
     "source_branch": "main",
     "source_sha": SHA,
     "engine": "cursor",
@@ -115,13 +115,13 @@ check(raises("assignment-invalid", ra.validate_assignment, variant(source_sha=SH
 # --- repository references ---------------------------------------------------------------
 
 check(raises("assignment-invalid", ra.validate_assignment,
-             variant(source_repository="git@github.com:NotSkittlz/chiron.git")),
+             variant(source_repository="git@github.com:NotSkittlz/example-ops.git")),
       "an scp-style ssh remote is refused")
 check(raises("assignment-invalid", ra.validate_assignment,
-             variant(source_repository="https://user:pw@github.com/NotSkittlz/chiron")),
+             variant(source_repository="https://user:pw@github.com/NotSkittlz/example-ops")),
       "a URL carrying userinfo is refused -- that is a credential in a non-secret field")
 check(raises("assignment-invalid", ra.validate_assignment,
-             variant(source_repository="http://github.com/NotSkittlz/chiron")),
+             variant(source_repository="http://github.com/NotSkittlz/example-ops")),
       "a plain http remote is refused")
 check(raises("assignment-invalid", ra.validate_assignment,
              variant(source_repository="https://github.com")),

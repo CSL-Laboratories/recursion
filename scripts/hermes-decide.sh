@@ -160,7 +160,7 @@ build_brief(){
   echo "===== AUTHORITY (you are bound by this) ====="
   cat CONTROL_PLANE.md 2>/dev/null || echo "(CONTROL_PLANE.md absent)"
   echo; echo "===== INSTRUCTIONS FROM LUCAS (highest priority — he is the principal) ====="
-  # What he actually said, in his words, from the cockpit. These outrank the roadmaps: a roadmap
+  # What he actually said, in his words, from the dashboard. These outrank the roadmaps: a roadmap
   # is what was planned, an open instruction is what he wants now.
   # Project-topic instructions are owned by their durable project pilot. Head Hermes sees only
   # explicit head routing (portfolio/policy/cross-project/credentials/production) here.
@@ -445,7 +445,7 @@ actions are both annotated here and contain the exact ownership refusal stated a
 - no spaces, no colons, no punctuation beyond . _ and -. Name the existing goal id, or the new
 goal id you are proposing. A purpose statement in this field is rejected at normalization and
 the whole decision is DISCARDED, silently, so the run reads as if you never decided.
-  good: architecture-rebase   goal-gsc-client-reconstruction   goal-pause-safety
+  good: architecture-rebase   goal-sample-client-reconstruction   goal-pause-safety
   bad:  PAUSE safety: preserve operational awareness while execution remains halted
 
 =================== STATE (ground truth, re-derived this run) ===================

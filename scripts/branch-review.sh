@@ -22,8 +22,6 @@ discover_repos(){
     git -C "$d" remote get-url origin >/dev/null 2>&1 || continue
     key=""
     [ -f "$HOME/.ssh/${name}_deploy" ] && key="$HOME/.ssh/${name}_deploy"
-    # golden-stallion-client predates the <name>_deploy convention
-    [ "$name" = "golden-stallion-client" ] && [ -f "$HOME/.ssh/gsc_deploy" ] && key="$HOME/.ssh/gsc_deploy"
     [ "$name" = "recursion" ] && key=""    # uses the default key
     printf '%s|%s|%s\n' "$name" "$d" "$key"
   done

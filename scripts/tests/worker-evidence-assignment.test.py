@@ -144,7 +144,7 @@ def make_obsolete_assignment(tmp_path: Path) -> tuple[Path, str]:
     """Build the old Phase 3 shape solely to prove strict starts refuse it."""
     value = amod.resolve_assignment(
         task_id="task-1", project_id="proj-1", role="implementer",
-        source_repository="/opt/golden-stallion", source_branch="loop/work/task-1",
+        source_repository="/opt/example-project", source_branch="loop/work/task-1",
         source_sha="a" * 40, engine="claude", provider="anthropic-claude-code",
         capacity_pool=None, host="gs-recursion", sandbox_profile="strict-linux",
         network_profile="provider-only", allowed_paths=["apps/api"],

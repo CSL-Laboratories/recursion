@@ -24,19 +24,19 @@ from windows_test_support import (
 
 
 SOURCE = Path(__file__).resolve().parents[2]
-PROJECT = "golden-stallion-client"
-PILOT = "pilot-golden-stallion-client"
+PROJECT = "example-client"
+PILOT = "pilot-example-client"
 DIRECT = "lucas-direct:telegram:8913126684"
 
 ACTION_707_FIRST = (
     '{"action_payload_sha256":"2938c7242e7a5f66f06e0703dba76ff1c2556212c36b306984c22585719a9b7e",'
     '"actor":"head-hermes","arguments":[],"attempts":1,"created_at":"2026-08-13T22:12:14Z",'
     '"decision_id":"decision-16801468efbb3ed54a15dcaa","decision_source":"hermes-model",'
-    '"event_seq":3,"goal_id":"goal-gsc-0x6c-shadetops-underemission-v2",'
+    '"event_seq":3,"goal_id":"goal-sample-0x6c-shadetops-underemission-v2",'
     '"id":"action-bb38398a6e0e3859a1a7d263",'
     '"idempotency_key":"decision:14c7d1bfbc72337c5559a9fcef2a2c807c13671e5dd1822765c14742092b0ee2",'
     '"instruction_id":"707","last_transition_id":"transition-a02ec80d32bb3c84cee9069ce753c46b",'
-    '"lease_expires":null,"lease_owner":null,"project":"golden-stallion-client",'
+    '"lease_expires":null,"lease_owner":null,"project":"example-client",'
     '"result_evidence":"log=/opt/recursion/loop/logs/2026-08-13-conduct-hermes.log rc=4 | '
     'cannot-bind noop evidence is absent","routed_decider":"head-hermes","schema_version":1,'
     '"status":"failed","updated_at":"2026-08-13T22:12:16Z","verb":"noop"}\n'
@@ -45,11 +45,11 @@ ACTION_707_SECOND = (
     '{"action_payload_sha256":"04e5f422ed703b4f847fdfb221dae4b792fcc047d655d45c80687fd26c3b18fe",'
     '"actor":"head-hermes","arguments":[],"attempts":1,"created_at":"2026-08-13T22:17:08Z",'
     '"decision_id":"decision-af1cc1dad357bd728b6929ba","decision_source":"hermes-model",'
-    '"event_seq":3,"goal_id":"goal-gsc-0x6c-shadetops-underemission-v2",'
+    '"event_seq":3,"goal_id":"goal-sample-0x6c-shadetops-underemission-v2",'
     '"id":"action-4a90005df9c9dfe6cbb7fbad",'
     '"idempotency_key":"decision:72ad3205d17e5c2dbbdbcda94dc75db8ed253def295fa0b7d544e7b8106ad7d9",'
     '"instruction_id":"707","last_transition_id":"transition-b2852e1f57bc23c4ad74d4fe9b76abf9",'
-    '"lease_expires":null,"lease_owner":null,"project":"golden-stallion-client",'
+    '"lease_expires":null,"lease_owner":null,"project":"example-client",'
     '"result_evidence":"log=/opt/recursion/loop/logs/2026-08-13-conduct-hermes.log rc=4 | '
     'cannot-bind noop evidence is absent","routed_decider":"head-hermes","schema_version":1,'
     '"status":"failed","updated_at":"2026-08-13T22:17:10Z","verb":"noop"}\n'
@@ -58,11 +58,11 @@ ACTION_707_THIRD = (
     '{"action_payload_sha256":"2938c7242e7a5f66f06e0703dba76ff1c2556212c36b306984c22585719a9b7e",'
     '"actor":"head-hermes","arguments":[],"attempts":1,"created_at":"2026-08-14T00:45:55Z",'
     '"decision_id":"decision-db7b86c61e0572226894eb6e","decision_source":"hermes-model",'
-    '"event_seq":3,"goal_id":"goal-gsc-0x6c-shadetops-underemission-v2",'
+    '"event_seq":3,"goal_id":"goal-sample-0x6c-shadetops-underemission-v2",'
     '"id":"action-cbba158e3295fb82bdf6e06c",'
     '"idempotency_key":"decision:8bb029a137ffa1a4e213a9661c1058a815af2ec35ebf92e8c1ba968ba0116a98",'
     '"instruction_id":"707","last_transition_id":"transition-2c867d3b748c1b23ecc07ba12531944e",'
-    '"lease_expires":null,"lease_owner":null,"project":"golden-stallion-client",'
+    '"lease_expires":null,"lease_owner":null,"project":"example-client",'
     '"result_evidence":"log=/opt/recursion/loop/logs/2026-08-14-conduct-hermes.log rc=4 | '
     'cannot-bind noop evidence is absent","routed_decider":"head-hermes","schema_version":1,'
     '"status":"failed","updated_at":"2026-08-14T00:45:56Z","verb":"noop"}\n'
@@ -72,8 +72,8 @@ id: 707
 received: 2026-08-13T22:07:26Z
 principal: 8913126684
 topic: 6
-project_id: golden-stallion-client
-pilot_id: pilot-golden-stallion-client
+project_id: example-client
+pilot_id: pilot-example-client
 pilot_memory_key: telegram-topic:6
 routing_target: head-hermes
 reply_correlation: telegram:-1003894008732:6:707
@@ -81,12 +81,12 @@ deduplication_key: telegram:-1003894008732:6:707
 from: 8913126684
 chat: -1003894008732
 thread: 6
-project: golden-stallion-client
+project: example-client
 status: open
 action_ids: action-cbba158e3295fb82bdf6e06c
 
 ## INSTRUCTION
-Propose a fresh offline golden-stallion-client pilot plan to reduce the verified 0x6c shade-tops under-emission in user-client/render, using new v2 plan, goal, and task identities and the deployed required seed, scope, provider, and forced-on gate contracts. Do not reuse or edit the closed v1 plan, goal, task, or window.
+Propose a fresh offline example-client pilot plan to reduce the verified 0x6c shade-tops under-emission in user-client/render, using new v2 plan, goal, and task identities and the deployed required seed, scope, provider, and forced-on gate contracts. Do not reuse or edit the closed v1 plan, goal, task, or window.
 
 
 ## CONSUMED 2026-08-13T22:12:15Z
@@ -111,16 +111,16 @@ id: 732
 received: 2026-08-13T22:11:01Z
 principal: 8913126684
 topic: 6
-project_id: golden-stallion-client
-pilot_id: pilot-golden-stallion-client
+project_id: example-client
+pilot_id: pilot-example-client
 pilot_memory_key: telegram-topic:6
-routing_target: pilot-golden-stallion-client
+routing_target: pilot-example-client
 reply_correlation: telegram:-1003894008732:6:732
 deduplication_key: telegram:-1003894008732:6:732
 from: 8913126684
 chat: -1003894008732
 thread: 6
-project: golden-stallion-client
+project: example-client
 status: open
 action_ids: 
 
@@ -178,7 +178,7 @@ class Fixture:
         (self.root / "state/PAUSE").write_text("fixture pause\n", encoding="utf-8")
         (self.root / "state/portfolio.tsv").write_text(
             "#project\tpath\tremote\tbranch\tsshkey\troadmap\ttopic\tstatus\n"
-            f"{PROJECT}\t/opt/golden-stallion-client\tgit@example/repo\tmain\t-\t-\t6\tactive\n",
+            f"{PROJECT}\t/opt/example-client\tgit@example/repo\tmain\t-\t-\t6\tactive\n",
             encoding="utf-8",
         )
         targets = [
@@ -186,22 +186,22 @@ class Fixture:
             "head-hermes:telegram:-1003894008732:1",
             DIRECT,
         ]
-        self.write_json("state/project-config/golden-stallion-client.json", {
-            "schema_version": 1, "id": PROJECT, "repo": "/opt/golden-stallion-client",
+        self.write_json("state/project-config/example-client.json", {
+            "schema_version": 1, "id": PROJECT, "repo": "/opt/example-client",
             "remote": "origin", "default_branch": "main", "deploy_key_ref": "-",
             "charter": "routing fixture", "allowed_paths": ["user-client/render"], "topic": 6,
             "pilot_id": PILOT, "activation_gate": "fixture", "notification_targets": targets,
             "goal_source": "state/goals", "status": "active",
         })
-        self.write_json("state/pilots/pilot-golden-stallion-client.json", {
+        self.write_json("state/pilots/pilot-example-client.json", {
             "schema_version": 1, "id": PILOT, "project_id": PROJECT, "topic": 6,
             "charter": "routing fixture", "model_policy": "project-pilot", "concurrency_limit": 0,
             "budget": {"max_inflight_workers": 0}, "notification_targets": targets,
             "goal_source": "state/goals", "memory_key": "telegram-topic:6",
-            "worktree_root": ".worktrees/gsc", "status": "active",
+            "worktree_root": ".worktrees/sample", "status": "active",
         })
         observed_instruction = hashlib.sha256(INSTRUCTION_707.encode()).hexdigest()
-        if observed_instruction != "402aa9aea90a4d9c7dbedfcaff0cd34b1388f8d52ddc72dd57b94983d048d677":
+        if observed_instruction != "8cb7171363d5c174073ac7f79f6c001ce3045b270667f7bdb6c257d57760e4e8":
             raise AssertionError(f"fixture instruction 707 digest mismatch: {observed_instruction}")
         (self.root / "state/instructions/00000707.md").write_text(INSTRUCTION_707, encoding="utf-8", newline="\n")
         (self.root / "state/instructions/00000732.md").write_text(INSTRUCTION_732, encoding="utf-8", newline="\n")
@@ -212,11 +212,11 @@ class Fixture:
         (self.root / "state/instructions/00000618.md").write_text(retained, encoding="utf-8", newline="\n")
         self.retained_618 = hashlib.sha256(retained.encode()).hexdigest()
         self.write_exact_action("action-bb38398a6e0e3859a1a7d263", ACTION_707_FIRST,
-                                "6572b4c5115f499258da36663c9c5a697a9a41049758a53cb080a65c35243db7")
+                                "af458e205eeb003b107a14207169132da6671747841a950a31d25461410e6faa")
         self.write_exact_action("action-4a90005df9c9dfe6cbb7fbad", ACTION_707_SECOND,
-                                "b65903d93da048083a255ed647b9e226cc140ebf7cd672bcab3ecb4c62544db4")
+                                "c5c9d98446a503f003bb9e19411b4904f3f46aa05c9486494c7736520952a425")
         self.write_exact_action("action-cbba158e3295fb82bdf6e06c", ACTION_707_THIRD,
-                                "270478743ba73a2a54f30c1a918aaff9c5fe579b9015a0a015f45bbc96d4fa70")
+                                "70b808b373755be5a25a789ef4fe2522cec875d8d889d8cfdf1f05b2efda4c7f")
         self.model_marker = self.temp / "model-called"
         hermes = self.root / "bin/hermes"
         hermes.write_text(

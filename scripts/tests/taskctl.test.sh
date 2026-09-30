@@ -144,14 +144,14 @@ fi
 
 # ============================ escalation identity ============================
 K="approve-the-native-diff-frontier"
-r1="$(tc esc-record "$K" "Approve the Cubic Castles native-diff frontier" cubic-castles ptr)"
+r1="$(tc esc-record "$K" "Approve the Example-game native-diff frontier" example-game ptr)"
 case "$r1" in NEW*) ok "esc: first sighting is NEW ($r1)" ;; *) no "esc: first sighting returned '$r1'" ;; esac
 EID="${r1#NEW }"
 
 # ★ the four-times bug: the same ask, three more cycles
 dups=0
 for _ in 1 2 3; do
-  r="$(tc esc-record "$K" "Approve the Cubic Castles native-diff frontier" cubic-castles ptr)"
+  r="$(tc esc-record "$K" "Approve the Example-game native-diff frontier" example-game ptr)"
   case "$r" in DUP\ "$EID"*) dups=$((dups+1)) ;; esac
 done
 if [ "$dups" = "3" ]; then
@@ -165,14 +165,14 @@ rows="$(grep -c "	$K	" "$R/state/escalations.tsv")"
 [ "$rows" = "1" ] && ok "esc: exactly ONE row for the ask" || no "esc: $rows rows for one ask"
 
 # CONTROL: a DIFFERENT ask must still open a new escalation, or dedup is just swallowing.
-r2="$(tc esc-record "some-other-question" "A different ask" chiron ptr2)"
+r2="$(tc esc-record "some-other-question" "A different ask" example-ops ptr2)"
 case "$r2" in NEW*) ok "CONTROL — a different ask still opens a NEW escalation ($r2)" ;;
               *)    no "CONTROL FAILED — dedup swallowed a genuinely different ask ('$r2')" ;; esac
 
 # resolve, then the same key may open again (the ask can legitimately recur later)
 tc esc-resolve "$EID" "decided" >/dev/null 2>&1
 [ "$(tc esc-list open | grep -c "	$K	")" = "0" ] && ok "esc: resolved drops out of the open list" || no "esc: still open after resolve"
-r3="$(tc esc-record "$K" "same ask, new cycle" cubic-castles ptr)"
+r3="$(tc esc-record "$K" "same ask, new cycle" example-game ptr)"
 case "$r3" in NEW*) ok "CONTROL — after resolution the ask can be raised again ($r3)" ;;
               *)    no "CONTROL FAILED — a resolved ask can never be re-raised ('$r3')" ;; esac
 

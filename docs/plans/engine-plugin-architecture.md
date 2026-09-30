@@ -322,7 +322,7 @@ the implementing commit turns it green. Same discipline as every phase since Pha
    Recursion requeues rather than blocks.
 6. Sequencing vs the promotion program: land this before running promotion gates 2–5 so
    the pilots and soak exercise the engine roster that will actually run in September.
-   Gate-1 GSC window work in flight is unaffected (all plugins inert until step 4).
+   Gate-1 window work in flight is unaffected (all plugins inert until step 4).
 
 ## Addendum 2026-08-26 (same session, later) — telemetry, governance, hygiene
 

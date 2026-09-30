@@ -2,55 +2,13 @@
 
 (reset 2026-08-12 for first production launch on Lucas's instruction; pre-Hermes content archived at /var/backups/recursion/pre-launch-scrape-20260812T075324Z)
 
-## [esc-0004] 2026-08-12 12:15 — Supply the first Fall 2026 physics lecture block so the lead can be scheduled
-**Workstream:** physics-coursework
-**Pointer:** SYLLABUS LEAD ledger slice: Fall 2026 table contains only the `_fill from actual syllabus once posted_` placeholder; ANCHOR sets Berkeley start at 2026-08-26 and a three-week lead target
-**Blocked on:** the course/topic and first lecture date from the actual syllabus
-**Context:** lead, target dates, and the pause-new-blocks rule cannot be evaluated without a real lecture block
-**Options:** provide the official syllabus; provide only the first course/topic/date; explicitly defer physics scheduling until the syllabus is available
-
-## [esc-0005] 2026-08-12 15:15 — Supply the first Fall 2026 physics lecture block
-**Workstream:** physics-coursework
-**Pointer:** SYLLABUS LEAD ledger slice: the Fall 2026 table contains only `_fill from actual syllabus once posted_`; ANCHOR sets Berkeley start at 2026-08-26 and a three-week lead target.
-**Blocked on:** the course, topic, and first lecture date from the actual syllabus.
-**Context:** lead, target dates, and the pause-new-blocks rule cannot be evaluated without a real lecture block.
-**Options:** provide the official syllabus; provide only the first course/topic/date; explicitly defer physics scheduling until the syllabus is available.
-
-## [esc-0006] 2026-08-13 09:15 — Supply the first Fall 2026 physics lecture block or defer scheduling
-**Workstream:** physics-coursework
-**Pointer:** SYLLABUS LEAD ledger slice: the Fall 2026 table contains only `_fill from actual syllabus once posted_`; CURRENT INBOX `esc-0004` and `esc-0005` identify the same unresolved blocker.
-**Blocked on:** the course, first topic block, and first lecture date from the actual syllabus.
-**Context:** ANCHOR requires a three-week lecture lead; syllabus rules require pausing new blocks if lead falls below one week. Neither can be evaluated without the first block.
-**Options:** provide the official syllabus; provide the first course/topic/date only; explicitly defer physics scheduling until the syllabus is available.
-
-## [esc-0008] 2026-08-14 15:15 — Supply the first Fall 2026 physics lecture block or explicitly defer scheduling
-**Workstream:** physics-coursework
-**Pointer:** SYLLABUS LEAD ledger slice: the Fall 2026 table contains only `_fill from actual syllabus once posted_`; CURRENT INBOX esc-0004 through esc-0006 record the same unresolved blocker.
-**Blocked on:** the course, first topic block, and first lecture date from the actual syllabus.
-**Context:** ANCHOR requires a three-week lecture lead; syllabus rules require pausing new blocks below one week. Neither can be evaluated without the first block.
-**Options:** provide the official syllabus; provide the first course/topic/date only; explicitly defer physics scheduling until the syllabus is available.
-
-## [esc-0009] 2026-08-15 18:15 — Provide the first Fall 2026 physics lecture block or explicitly defer scheduling
-**Workstream:** physics-coursework
-**Pointer:** SYLLABUS LEAD ledger slice: the Fall 2026 table contains only `_fill from actual syllabus once posted_`; CURRENT INBOX esc-0004, esc-0005, esc-0006, and esc-0008 are duplicate unresolved instances.
-**Blocked on:** the course, first topic block, and first lecture date from the actual syllabus.
-**Context:** ANCHOR requires a three-week lecture lead; the syllabus rule requires pausing new blocks below one week. Neither can be evaluated without the first block.
-**Options:** provide the official syllabus; provide only the first course/topic/date; explicitly defer physics scheduling until the syllabus is available.
-
-## [esc-0010] 2026-08-18 06:15 — Provide the first Fall 2026 physics lecture block or defer scheduling
-**Workstream:** physics-coursework
-**Pointer:** SYLLABUS LEAD ledger slice contains only `_fill from actual syllabus once posted_`; CURRENT INBOX esc-0004, esc-0005, esc-0006, esc-0008, and esc-0009 are duplicate unresolved instances.
-**Blocked on:** the course, first topic block, and first lecture date from the actual syllabus.
-**Context:** ANCHOR requires a three-week lecture lead, and the syllabus rules require pausing new blocks below one week. Neither can be evaluated from the current ledger.
-**Options:** provide the official syllabus; provide only the first course/topic/date; explicitly defer physics scheduling until the syllabus is available.
-
 ## [esc-0002] 2026-08-29 — May a v2 acceptance gate have side effects?
 **Workstream:** recursion-v2 execution fabric
 **Pointer:** `scripts/validate-gate.py` (Phase 2, `codex/v2-adapters` @ `33fb08c`);
 `scripts/tests/hermes-pilot-phase5-red.test.sh:411` (Phase 5, `codex/v2-cursor-runtime`);
 measurement `tmp/integ-p2c` = `8056ace`.
 **Blocked on:** a decision on whether an acceptance gate may mutate state, which is not recorded in
-`DECISIONS.md`. D-009 governs the GSC native-diff gate and does not speak to this.
+`DECISIONS.md`. D-009 governs the native-diff gate and does not speak to this.
 
 **Context.** Phase 2 closed a reviewed blocker by deleting four non-strict relaxations, so direct commands
 now run one validator and one grammar in both modes. That closure is correct on its own terms — the same
@@ -296,68 +254,9 @@ writer widened the grammar and bare `touch` became an admissible gate.
 **esc-0003 remains open** and does not block: whether a packaged non-Git controller is a supported
 deployment. Failing closed stays in place meanwhile.
 
-## [esc-0011] 2026-08-30 — An active project with a paused pilot fails the Phase 4 audit
-
-<!-- Recorded on 2026-08-30 as "esc-0004", which collided with the physics escalation of that
-     number at the top of this file. Renumbered to esc-0011; commit messages and EVIDENCE.md
-     written before the collision was noticed still say esc-0004. -->
-
-
-**Status:** open, human decision required. Does not block the v2 integration.
-
-`scripts/audit/hermes-pilot-phase4-green.sh` exits 4 before its first assertion, on line 28:
-
-```
-RECURSION_ROOT="$SRC" python3 "$SRC/scripts/project-pilot.py" verify-registry
-project-pilot: project pilot golden-stallion-client is not active
-```
-
-The state it is reporting:
-
-- `state/project-config/golden-stallion-client.json` -> `"status": "active"`
-- `state/pilots/pilot-golden-stallion-client.json`   -> `"status": "paused"`, with
-
-```
-"pause_reason": "Phase 0: the source-bound GSC pilot is stale and must be explicitly
-                 rebound through a new immutable assignment before any resume."
-```
-
-`verify-registry` requires every tracked active project to have an active pilot, so it refuses. The
-audit is correct; the repository is internally inconsistent.
-
-I previously carried this as an inherited environment condition because it reproduces at `a84525d`.
-That was wrong: reproducing at the base only establishes that no phase introduced it, not that it is
-benign. The failure is a true statement about control state.
-
-**Two resolutions exist and both are control-plane decisions:**
-
-- **A.** Set `state/project-config/golden-stallion-client.json` to `paused` so the project matches
-  its pilot. Consistent, but it changes the recorded status of a live project.
-- **B.** Change `verify-registry` to accept a paused pilot for an active project, on the grounds
-  that pausing a pilot is a normal operational state rather than a registry defect.
-
-I am not choosing. A is a control-plane state edit; B changes what the registry invariant means.
-
-**Not in scope to fix here, and specifically must not be "fixed" by the merge.** Phase 5's branch
-predates the pause and still carries that pilot as active. I verified the merge outcome rather than
-assuming it:
-
-```
-merge-tree(tmp/integ-all, codex/v2-cursor-runtime):state/pilots/pilot-golden-stallion-client.json
-  -> 2a7268f828   (paused)
-```
-
-Phase 5's blob is identical to the phases' common ancestor `9c7a42c`, so the pause is a one-sided
-change and survives the merge without a conflict. Any future merge that resumes this pilot as a side
-effect is a defect, not a resolution of this escalation.
-
-Until this is answered, `hermes-pilot-phase4-green.sh` is expected to fail on this line and stays
-visible in every gate summary rather than being suppressed.
-
-
 ## [esc-0012] 2026-08-30 — The Phase 5 merge left two assignment systems wired into each other
 
-<!-- Recorded on 2026-08-30 as "esc-0005", which collided with the physics escalation of that
+<!-- Recorded on 2026-08-30 as "esc-0005", which collided with an earlier escalation of that
      number at the top of this file. Renumbered to esc-0012; commit messages and EVIDENCE.md
      written before the collision was noticed still say esc-0005. -->
 

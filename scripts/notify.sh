@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # notify.sh — send to Telegram, into the RIGHT forum topic.
 #
-# Everything used to land in one stream, so a GSC gate result, a chiron build and a portfolio
+# Everything used to land in one stream, so a project gate result, a build and a portfolio
 # escalation were interleaved in the order they happened and had to be told apart by reading
-# them. The Cockpit (-100…) is a forum, so each project gets a topic and each message goes to
-# the topic that owns it. Routing is the whole feature: a cockpit whose messages all arrive in
+# them. The dashboard (-100…) is a forum, so each project gets a topic and each message goes to
+# the topic that owns it. Routing is the whole feature: a dashboard whose messages all arrive in
 # one channel is the thing it replaces.
 #
 # Usage:
@@ -188,7 +188,7 @@ fi
 
 [ "${RECURSION_NO_NOTIFY:-0}" = "1" ] && exit 0
 
-# The cockpit chat. RECURSION_TELEGRAM_CHAT is the forum supergroup; TELEGRAM_CHAT_ID stays the
+# The dashboard chat. RECURSION_TELEGRAM_CHAT is the forum supergroup; TELEGRAM_CHAT_ID stays the
 # fallback so nothing that worked before this change stops working.
 CHAT="${RECURSION_TELEGRAM_CHAT:-${TELEGRAM_CHAT_ID:-}}"
 HOME_THREAD="${RECURSION_TELEGRAM_HOME_THREAD:-}"

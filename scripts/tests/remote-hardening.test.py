@@ -153,9 +153,9 @@ with tempfile.TemporaryDirectory(prefix="recursion-remote-hardening-") as raw:
     rb.write_session(input_base, "cursor-cloud", "dispatch-input", {
         "kind": "cursor-cloud-session", "dispatch_id": "dispatch-input",
         "run_id": "provider-run", "assignment_digest": "a" * 64,
-        "source_repository": "https://github.com/NotSkittlz/chiron",
+        "source_repository": "https://github.com/NotSkittlz/example-ops",
         "authorized_repositories": [{
-            "repository": "https://github.com/NotSkittlz/chiron",
+            "repository": "https://github.com/NotSkittlz/example-ops",
             "source_branch": "main", "source_sha": "b" * 40,
         }],
     })

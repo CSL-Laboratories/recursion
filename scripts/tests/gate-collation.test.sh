@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gate-collation.test.sh — guards the set-comparison soundness of gsc-conformance-gate.sh.
+# gate-collation.test.sh — guards the set-comparison soundness of sample-conformance-gate.sh.
 #
 # WHY THIS EXISTS. On 2026-08-06 the gate reported REGRESSION against a pass set that was a
 # strict SUPERSET of the baseline — impossible by construction. Cause: under en_US.UTF-8,
@@ -23,8 +23,8 @@ if [ "$(uname -s)" != "Linux" ]; then
 fi
 
 ROOT="${RECURSION_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
-BASELINE="${GSC_BASELINE:-$ROOT/state/gsc/baseline-pass.txt}"
-GATE="${GSC_CONFORMANCE_GATE:-$ROOT/scripts/gsc-conformance-gate.sh}"
+BASELINE="${SAMPLE_BASELINE:-$ROOT/state/sample/baseline-pass.txt}"
+GATE="${SAMPLE_CONFORMANCE_GATE:-$ROOT/scripts/sample-conformance-gate.sh}"
 fails=0
 ok(){ printf 'ok    %s\n' "$1"; }
 no(){ printf 'FAIL  %s\n' "$1"; fails=$((fails+1)); }
@@ -81,7 +81,7 @@ fi
 # fault (exit 3), never a pass or a regression.
 printf '%s\n' 'b title' 'A title' > "$TMP/badbaseline"   # not C-sorted: 'A' < 'b' in C
 set +e
-OUT="$(cd "$TMP" && GSC_BASELINE="$TMP/badbaseline" bash "$GATE" --no-progress 2>&1)"; rc=$?
+OUT="$(cd "$TMP" && SAMPLE_BASELINE="$TMP/badbaseline" bash "$GATE" --no-progress 2>&1)"; rc=$?
 set -e
 if [ "$rc" = "3" ] && printf '%s' "$OUT" | grep -q 'HARNESS'; then
   ok "non-C-collated baseline is rejected as a harness fault (exit 3)"

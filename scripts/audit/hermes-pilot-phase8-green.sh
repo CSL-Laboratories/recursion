@@ -9,9 +9,9 @@ bash -n scripts/conduct-hermes.sh scripts/hermes-actuator.sh scripts/hermes-deci
   scripts/assist.sh scripts/taskctl.sh scripts/work.sh scripts/notify.sh scripts/digest.sh \
   scripts/cycle.sh scripts/provider-network.sh scripts/worker-sandbox.sh loop/supervisor/run.sh \
   scripts/resync.sh scripts/tests/resync.test.sh \
-  scripts/gsc-conformance-gate.sh scripts/gsc-conformance-gate-v2.sh \
+  scripts/sample-conformance-gate.sh scripts/sample-conformance-gate-v2.sh \
   scripts/tests/gate-collation.test.sh \
-  scripts/tests/gsc-conformance-reporter.test.sh \
+  scripts/tests/sample-conformance-reporter.test.sh \
   scripts/tests/hermes-pilot-phase8-red.test.sh scripts/tests/provider-network-root.test.sh
 python3 -m py_compile scripts/project-pilot.py scripts/project_authority.py scripts/pilot_instruction.py scripts/instruction_routing.py scripts/project-reconcile.py scripts/decision-queue.py \
   scripts/seed_contract.py scripts/tests/seed-contract.test.py \
@@ -35,18 +35,18 @@ python3 -m py_compile scripts/project-pilot.py scripts/project_authority.py scri
   scripts/tests/phase8-exact-instruction-turn.test.py \
   scripts/tests/project-pilot-status-fail-closed.test.py \
   scripts/provider-connect-proxy.py scripts/tests/provider-connect-proxy.test.py \
-  scripts/gsc-shade-tops-gate.py scripts/tests/gsc-shade-tops-gate.test.py \
-  scripts/tests/gsc-profile-immutability.test.py \
-  scripts/tests/gsc-profile-promotion.test.py \
+  scripts/sample-shade-tops-gate.py scripts/tests/sample-shade-tops-gate.test.py \
+  scripts/tests/sample-profile-immutability.test.py \
+  scripts/tests/sample-profile-promotion.test.py \
   scripts/tests/phase8-authority-availability.test.py \
   scripts/tests/validate-gate.test.py scripts/tests/allowed-path.test.py
 python3 - <<'PY'
 import json
 json.load(open('schemas/control-plane/v1/schema.json',encoding='utf-8'))
 PY
-python3 scripts/tests/gsc-profile-immutability.test.py
+python3 scripts/tests/sample-profile-immutability.test.py
 python3 scripts/tests/phase8-windows-harness.test.py
-python3 scripts/tests/gsc-profile-promotion.test.py
+python3 scripts/tests/sample-profile-promotion.test.py
 python3 scripts/tests/phase8-authority-availability.test.py
 bash scripts/tests/resync.test.sh
 python3 scripts/tests/hermes-gateway-shutdown.test.py
@@ -420,9 +420,9 @@ echo "ok    PAUSE interlocks the sole sender and resumed brief/digest delivery e
 
 bash scripts/tests/hermes-pilot-phase8-red.test.sh
 bash scripts/tests/gate-collation.test.sh
-GSC_CONFORMANCE_GATE="$ROOT/scripts/gsc-conformance-gate-v2.sh" \
+SAMPLE_CONFORMANCE_GATE="$ROOT/scripts/sample-conformance-gate-v2.sh" \
   bash scripts/tests/gate-collation.test.sh
-bash scripts/tests/gsc-conformance-reporter.test.sh
+bash scripts/tests/sample-conformance-reporter.test.sh
 python3 scripts/tests/seed-contract.test.py
 python3 scripts/tests/hermes-pilot-phase8-notification-red.py
 python3 scripts/tests/decision-identity.test.py
@@ -436,7 +436,7 @@ python3 scripts/tests/phase8-notification-authentication.test.py
 python3 scripts/tests/pilot-instruction.test.py
 python3 scripts/tests/phase8-head-window-admission.test.py
 python3 scripts/tests/provider-connect-proxy.test.py
-python3 scripts/tests/gsc-shade-tops-gate.test.py
+python3 scripts/tests/sample-shade-tops-gate.test.py
 python3 scripts/tests/validate-gate.test.py
 python3 scripts/tests/allowed-path.test.py
 echo "hermes-pilot-phase8-green: ALL PASS"

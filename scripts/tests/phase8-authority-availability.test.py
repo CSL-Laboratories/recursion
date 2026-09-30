@@ -289,13 +289,13 @@ def repeated_deferrals_bump_one_escalation_identity() -> bool:
         remote_error = RuntimeError("simulated remote timeout")
         provider_error = RuntimeError("simulated provider outage")
         record_authority_deferral(
-            root, "chiron", "goal-chiron", "remote-unavailable", remote_error,
+            root, "example-ops", "goal-example-ops", "remote-unavailable", remote_error,
         )
         record_authority_deferral(
-            root, "chiron", "goal-chiron", "provider-unavailable", provider_error,
+            root, "example-ops", "goal-example-ops", "provider-unavailable", provider_error,
         )
         record_authority_deferral(
-            root, "chiron", "goal-chiron", "remote-unavailable", remote_error,
+            root, "example-ops", "goal-example-ops", "remote-unavailable", remote_error,
         )
         keys = [argv[3] for argv in commands if len(argv) > 3 and argv[2] == "esc-record"]
         events = [
@@ -308,7 +308,7 @@ def repeated_deferrals_bump_one_escalation_identity() -> bool:
             and {row["detail"]["reason"] for row in events}
             == {"remote-unavailable", "provider-unavailable"}
             and all(set(row["detail"]) == {"reason"} for row in events)
-            and keys == ["phase8-authority-proof:chiron:goal-chiron"] * 3
+            and keys == ["phase8-authority-proof:example-ops:goal-example-ops"] * 3
         )
     finally:
         globals_["subprocess"].run = original_run
@@ -326,10 +326,10 @@ def final_window_revocation_is_typed_as_deferral() -> bool:
     observed_codes: list[int] = []
     try:
         globals_["read_fields"] = lambda *_args, **_kwargs: {
-            "project_id": "chiron", "goal_id": "goal-chiron",
+            "project_id": "example-ops", "goal_id": "goal-example-ops",
         }
         globals_["verify_phase8_goal_contract"] = lambda *_args, **_kwargs: {
-            "project_id": "chiron", "goal_id": "goal-chiron",
+            "project_id": "example-ops", "goal_id": "goal-example-ops",
         }
         globals_["require_provider_capability"] = lambda *_args, **_kwargs: None
 
@@ -339,7 +339,7 @@ def final_window_revocation_is_typed_as_deferral() -> bool:
 
         globals_["require_window"] = revoked
         try:
-            admit_work(Path("/fixture"), "task-chiron")
+            admit_work(Path("/fixture"), "task-example-ops")
         except ReconcileError as exc:
             return observed_codes == [75] and exc.code == 75 \
                 and "window authority is absent" in str(exc)
@@ -357,7 +357,7 @@ def hard_refusal_survives_audit_failure() -> bool:
     }
     try:
         globals_["read_fields"] = lambda *_args, **_kwargs: {
-            "project_id": "chiron", "goal_id": "goal-chiron",
+            "project_id": "example-ops", "goal_id": "goal-example-ops",
         }
 
         def invalid(*_args, **_kwargs):
@@ -369,7 +369,7 @@ def hard_refusal_survives_audit_failure() -> bool:
         globals_["verify_phase8_goal_contract"] = invalid
         globals_["append_event"] = audit_failed
         try:
-            admit_work(Path("/fixture"), "task-chiron")
+            admit_work(Path("/fixture"), "task-example-ops")
         except ReconcileError as exc:
             return exc.code == 4 and "proved authority contradiction" in str(exc)
         return False
@@ -385,17 +385,17 @@ def unreadable_authority_records_are_unavailable_not_invalid() -> bool:
         (root / "state/pilots").mkdir(parents=True)
         (root / "state/portfolio.tsv").write_text(
             "#project\tpath\tremote\tbranch\tkey\troadmap\ttopic\tstatus\n"
-            "chiron\t/repo\torigin\tmain\t-\t-\t6\tactive\n",
+            "example-ops\t/repo\torigin\tmain\t-\t-\t6\tactive\n",
             encoding="utf-8",
         )
-        config_path = root / "state/project-config/chiron.json"
-        pilot_path = root / "state/pilots/pilot-chiron.json"
+        config_path = root / "state/project-config/example-ops.json"
+        pilot_path = root / "state/pilots/pilot-example-ops.json"
         config_path.write_text(json.dumps({
-            "id": "chiron", "pilot_id": "pilot-chiron", "topic": "6",
+            "id": "example-ops", "pilot_id": "pilot-example-ops", "topic": "6",
             "charter": "charter", "status": "active",
         }), encoding="utf-8")
         pilot_path.write_text(json.dumps({
-            "id": "pilot-chiron", "project_id": "chiron", "topic": "6",
+            "id": "pilot-example-ops", "project_id": "example-ops", "topic": "6",
             "charter": "charter", "status": "active",
         }), encoding="utf-8")
 
@@ -408,7 +408,7 @@ def unreadable_authority_records_are_unavailable_not_invalid() -> bool:
         previous_registry = os.environ.get("RECURSION_PORTFOLIO")
         os.environ["RECURSION_PORTFOLIO"] = str(ambient)
         try:
-            ambient_ignored = pilot_records(root, "chiron", active=True)[0].get("id") == "chiron"
+            ambient_ignored = pilot_records(root, "example-ops", active=True)[0].get("id") == "example-ops"
         except SystemExit:
             ambient_ignored = False
         finally:
@@ -420,7 +420,7 @@ def unreadable_authority_records_are_unavailable_not_invalid() -> bool:
         healthy = False
         healthy_code = 0
         try:
-            healthy = pilot_records(root, "chiron", active=True)[0].get("id") == "chiron"
+            healthy = pilot_records(root, "example-ops", active=True)[0].get("id") == "example-ops"
         except SystemExit as exc:
             healthy_code = int(exc.code)
 
@@ -435,7 +435,7 @@ def unreadable_authority_records_are_unavailable_not_invalid() -> bool:
         Path.open = denied
         unavailable = 0
         try:
-            pilot_records(root, "chiron", active=True, unavailable_code=74)
+            pilot_records(root, "example-ops", active=True, unavailable_code=74)
         except SystemExit as exc:
             unavailable = int(exc.code)
         finally:
@@ -443,13 +443,13 @@ def unreadable_authority_records_are_unavailable_not_invalid() -> bool:
         config_path.write_text("{malformed\n", encoding="utf-8")
         malformed = 0
         try:
-            pilot_records(root, "chiron", active=True, unavailable_code=74)
+            pilot_records(root, "example-ops", active=True, unavailable_code=74)
         except SystemExit as exc:
             malformed = int(exc.code)
         config_path.unlink()
         absent = 0
         try:
-            pilot_records(root, "chiron", active=True, unavailable_code=74)
+            pilot_records(root, "example-ops", active=True, unavailable_code=74)
         except SystemExit as exc:
             absent = int(exc.code)
         return (
@@ -545,12 +545,12 @@ def invalid_worker_authority_identity_is_rejected_before_read() -> bool:
 
 def worker_authority_task_reads_preserve_availability_typing() -> bool:
     root = Path(tempfile.mkdtemp(prefix="phase8-worker-task-read-"))
-    task_path = root / "state/tasks/task-chiron.md"
+    task_path = root / "state/tasks/task-example-ops.md"
     original_read_text = Path.read_text
     try:
         task_path.parent.mkdir(parents=True)
         task_path.write_text(
-            "id: task-chiron\nproject_id: chiron\ngoal_id: goal-chiron\n",
+            "id: task-example-ops\nproject_id: example-ops\ngoal_id: goal-example-ops\n",
             encoding="utf-8",
         )
 
@@ -563,7 +563,7 @@ def worker_authority_task_reads_preserve_availability_typing() -> bool:
         Path.read_text = denied
         for check in (admit_work, check_work_authority):
             try:
-                check(root, "task-chiron")
+                check(root, "task-example-ops")
             except ReconcileError as exc:
                 unavailable.append(exc.code)
         Path.read_text = original_read_text
@@ -571,7 +571,7 @@ def worker_authority_task_reads_preserve_availability_typing() -> bool:
         absent: list[int] = []
         for check in (admit_work, check_work_authority):
             try:
-                check(root, "task-chiron")
+                check(root, "task-example-ops")
             except ReconcileError as exc:
                 absent.append(exc.code)
         return unavailable == [74, 74] and absent == [4, 4] \
@@ -583,13 +583,13 @@ def worker_authority_task_reads_preserve_availability_typing() -> bool:
 
 def window_record_reads_preserve_availability_typing() -> bool:
     root = Path(tempfile.mkdtemp(prefix="phase8-window-record-read-"))
-    window_path = root / "state/pilot-windows/window-chiron.json"
+    window_path = root / "state/pilot-windows/window-example-ops.json"
     original_read_text = Path.read_text
     try:
         window_path.parent.mkdir(parents=True)
         window_path.write_text(
             json.dumps({
-                "id": "window-chiron", "project_id": "chiron", "goal_id": "goal-chiron",
+                "id": "window-example-ops", "project_id": "example-ops", "goal_id": "goal-example-ops",
                 "status": "open", "expires_at_epoch": int(time.time()) + 300,
             }) + "\n",
             encoding="utf-8",
@@ -603,7 +603,7 @@ def window_record_reads_preserve_availability_typing() -> bool:
         Path.read_text = denied
         unavailable = 0
         try:
-            open_window(root, "chiron", "goal-chiron", {"window_required": True})
+            open_window(root, "example-ops", "goal-example-ops", {"window_required": True})
         except ReconcileError as exc:
             unavailable = exc.code
         finally:
@@ -611,7 +611,7 @@ def window_record_reads_preserve_availability_typing() -> bool:
         window_path.write_text("{malformed\n", encoding="utf-8")
         invalid = 0
         try:
-            open_window(root, "chiron", "goal-chiron", {"window_required": True})
+            open_window(root, "example-ops", "goal-example-ops", {"window_required": True})
         except ReconcileError as exc:
             invalid = exc.code
         return unavailable == 74 and invalid == 4 \
@@ -627,16 +627,16 @@ def terminal_source_pin_receipt_io_is_unavailable() -> bool:
     originals = {name: globals_[name] for name in names}
     try:
         window = {
-            "schema_version": 1, "id": "window-chiron", "project_id": "chiron",
-            "pilot_id": "pilot-chiron", "goal_id": "goal-chiron", "plan_id": "plan-chiron",
+            "schema_version": 1, "id": "window-example-ops", "project_id": "example-ops",
+            "pilot_id": "pilot-example-ops", "goal_id": "goal-example-ops", "plan_id": "plan-example-ops",
             "status": "open", "expires_at_epoch": int(time.time()) + 300,
         }
-        globals_["status_files"] = lambda *_args, **_kwargs: [Path("/window-chiron.json")]
+        globals_["status_files"] = lambda *_args, **_kwargs: [Path("/window-example-ops.json")]
         globals_["read_json"] = lambda *_args, **_kwargs: dict(window)
         globals_["goal_for"] = lambda *_args, **_kwargs: (
-            Path("/goal-chiron.md"),
+            Path("/goal-example-ops.md"),
             {
-                "id": "goal-chiron", "project_id": "chiron", "status": "achieved",
+                "id": "goal-example-ops", "project_id": "example-ops", "status": "achieved",
                 "last_transition_from": "verifying", "last_transition_reason": "verified",
                 "version": "3",
             },
@@ -647,7 +647,7 @@ def terminal_source_pin_receipt_io_is_unavailable() -> bool:
 
         globals_["authenticated_transition"] = unavailable
         try:
-            pilot_active_source_pin(Path("/fixture"), "chiron")
+            pilot_active_source_pin(Path("/fixture"), "example-ops")
         except SystemExit as exc:
             return int(exc.code) == 74
         return False
@@ -661,7 +661,7 @@ def worker_admission_keeps_original_unavailability_when_audit_fails() -> bool:
     originals = {name: globals_[name] for name in names}
     try:
         globals_["read_fields"] = lambda *_args, **_kwargs: {
-            "project_id": "chiron", "goal_id": "goal-chiron",
+            "project_id": "example-ops", "goal_id": "goal-example-ops",
         }
 
         def unavailable(*_args, **_kwargs):
@@ -673,7 +673,7 @@ def worker_admission_keeps_original_unavailability_when_audit_fails() -> bool:
         globals_["verify_phase8_goal_contract"] = unavailable
         globals_["record_authority_deferral"] = audit_failed
         try:
-            admit_work(Path("/fixture"), "task-chiron")
+            admit_work(Path("/fixture"), "task-example-ops")
         except ReconcileError as exc:
             return exc.code == 74 and str(exc) == "original remote proof outage"
         return False
@@ -817,27 +817,27 @@ def main() -> int:
     non_object = fixture(0, [])
     malformed = fixture(0, raw="{malformed")
     bad_oid = fixture(0, {
-        "project_id": "chiron", "goal_id": "goal-chiron", "source_head": "bad",
+        "project_id": "example-ops", "goal_id": "goal-example-ops", "source_head": "bad",
     })
     missing_helper = Path(tempfile.mkdtemp(prefix="phase8-authority-missing-helper-"))
     (missing_helper / "scripts").mkdir()
     source = "1" * 40
-    valid = fixture(0, {"project_id": "chiron", "goal_id": "goal-chiron", "source_head": source})
+    valid = fixture(0, {"project_id": "example-ops", "goal_id": "goal-example-ops", "source_head": source})
     try:
         controls = [
             (
-                phase8_fresh_base(unavailable, "chiron", "goal-chiron")
+                phase8_fresh_base(unavailable, "example-ops", "goal-example-ops")
                 == (None, "", "authority-proof-unavailable"),
                 "an unavailable remote proof defers without claiming immutable staleness",
             ),
             (
-                phase8_fresh_base(invalid, "chiron", "goal-chiron")
+                phase8_fresh_base(invalid, "example-ops", "goal-example-ops")
                 == (False, "", "authority-contract-stale"),
                 "a proved contract failure remains terminally blockable",
             ),
             (
                 all(
-                    phase8_fresh_base(root, "chiron", "goal-chiron")
+                    phase8_fresh_base(root, "example-ops", "goal-example-ops")
                     == (None, "", "authority-proof-unavailable")
                     for root in (
                         crashed, argparse_mismatch, non_object, malformed, bad_oid, missing_helper,
@@ -846,7 +846,7 @@ def main() -> int:
                 "missing, crashed, incompatible, and malformed verifiers defer as unavailable",
             ),
             (
-                phase8_fresh_base(valid, "chiron", "goal-chiron") == (True, source, "fresh"),
+                phase8_fresh_base(valid, "example-ops", "goal-example-ops") == (True, source, "fresh"),
                 "valid exact authority returns the measured source and never the remote tip",
             ),
             (

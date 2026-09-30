@@ -2,7 +2,7 @@
 # telegram-routing.test.sh — a message must reach the topic that owns it, and the bot token must
 # never appear in anything this code emits.
 #
-# WHY. The Cockpit is a forum. Routing IS the feature: a cockpit whose messages all land in one
+# WHY. The Dashboard is a forum. Routing IS the feature: a dashboard whose messages all land in one
 # channel is exactly the undifferentiated stream it replaces, and it fails silently — every
 # message still arrives, just in the wrong place, which looks fine until you need to find one.
 #
@@ -63,8 +63,8 @@ chmod +x "$BIN/hermes" "$BIN/curl"
 export HERMES_LOG="$TMP/hermes.log" CURL_LOG="$TMP/curl.log"
 
 printf '#project\tpath\tremote\tbranch\tsshkey\troadmap\ttopic\tstatus\n' > "$R/state/portfolio.tsv"
-printf 'gsc\t/opt/gsc\tgit@github.com:x/gsc.git\tmain\t-\t-\t4242\tactive\n'    >> "$R/state/portfolio.tsv"
-printf 'chiron\t/opt/chiron\tgit@github.com:x/ch.git\tmain\t-\t-\t7777\tactive\n' >> "$R/state/portfolio.tsv"
+printf 'sample\t/opt/sample\tgit@github.com:x/sample.git\tmain\t-\t-\t4242\tactive\n'    >> "$R/state/portfolio.tsv"
+printf 'example-ops\t/opt/example-ops\tgit@github.com:x/ch.git\tmain\t-\t-\t7777\tactive\n' >> "$R/state/portfolio.tsv"
 printf 'newbie\t/opt/newbie\tgit@github.com:x/nb.git\tmain\t-\t-\t-\tactive\n'  >> "$R/state/portfolio.tsv"
 
 CHAT="-1003894008732"
@@ -111,18 +111,18 @@ else
 fi
 
 # --- 2) a project routes to ITS topic ---------------------------------------------------------
-notify --project gsc "gate result" >/dev/null
+notify --project sample "gate result" >/dev/null
 if grep -q -- "-t telegram:$CHAT:4242" "$HERMES_LOG"; then
   ok "a project message is addressed to that project's topic"
 else
-  no "wrong target for gsc: $(cat "$HERMES_LOG")"
+  no "wrong target for sample: $(cat "$HERMES_LOG")"
 fi
-notify --project chiron "build done" >/dev/null
+notify --project example-ops "build done" >/dev/null
 grep -q -- "-t telegram:$CHAT:7777" "$HERMES_LOG" && ok "a second project routes to a DIFFERENT topic" \
-  || no "chiron did not route to 7777: $(cat "$HERMES_LOG")"
+  || no "example-ops did not route to 7777: $(cat "$HERMES_LOG")"
 
 # --- 3) the repo PATH resolves too (work.sh knows a path, not a project name) -------------------
-notify --project /opt/chiron "from a repo path" >/dev/null
+notify --project /opt/example-ops "from a repo path" >/dev/null
 grep -q -- "-t telegram:$CHAT:7777" "$HERMES_LOG" && ok "a repo path resolves to the same topic as its project name" \
   || no "path lookup failed: $(cat "$HERMES_LOG")"
 
@@ -153,7 +153,7 @@ grep -q -- "-t telegram:$CHAT:999" "$HERMES_LOG" && ok "an explicit --thread ove
 : > "$HERMES_LOG"; : > "$CURL_LOG"
 ( cd "$R" && PATH="$BIN:$PATH" RECURSION_ROOT="$R" RECURSION_TELEGRAM_CHAT="$CHAT" \
     RECURSION_TELEGRAM_HOME_THREAD=1 STUB_HERMES_FAIL=1 \
-    bash scripts/notify.sh --project gsc "fallback path" ) >"$TMP/out" 2>"$TMP/err"
+    bash scripts/notify.sh --project sample "fallback path" ) >"$TMP/out" 2>"$TMP/err"
 if grep -q 'message_thread_id=4242' "$CURL_LOG"; then
   ok "the raw-API fallback sets message_thread_id (or every message lands in General)"
 else
@@ -183,7 +183,7 @@ grep -q '2>/dev/null' "$R/scripts/notify.sh" \
 # real portfolio failures. The guard belongs in notify.sh because that is the one place every
 # caller passes through.
 : > "$HERMES_LOG"; : > "$CURL_LOG"
-( cd "$R" && PATH="$BIN:$PATH" RECURSION_ROOT="$R" RECURSION_TELEGRAM_CHAT="$CHAT"     RECURSION_NO_NOTIFY=1 bash scripts/notify.sh --project gsc "must not be delivered" ) >/dev/null 2>&1
+( cd "$R" && PATH="$BIN:$PATH" RECURSION_ROOT="$R" RECURSION_TELEGRAM_CHAT="$CHAT"     RECURSION_NO_NOTIFY=1 bash scripts/notify.sh --project sample "must not be delivered" ) >/dev/null 2>&1
 if [ ! -s "$HERMES_LOG" ] && [ ! -s "$CURL_LOG" ]; then
   ok "★ RECURSION_NO_NOTIFY=1 suppresses delivery in notify.sh itself (no fixture can page Lucas)"
 else
@@ -223,7 +223,7 @@ fi
 # --- 10) ★ an ERROR is not an ABSENCE: the topic-existence verdict --------------------------
 # topics.sh check probed a topic by "editing" it to the name it already had and read ok=false as
 # "gone" — reporting all eight freshly-created topics as MISSING. These three bodies are the
-# REAL responses captured from the API against the live cockpit, so this tests the shipped
+# REAL responses captured from the API against the live dashboard, so this tests the shipped
 # classifier against ground truth rather than against my belief about it.
 v(){ ( cd "$R" && RECURSION_ROOT="$R" bash scripts/topics.sh verdict "$1" ) 2>/dev/null; }
 [ "$(v '{"ok":false,"error_code":400,"description":"Bad Request: TOPIC_NOT_MODIFIED"}')" = "EXISTS" ]   && ok "★ TOPIC_NOT_MODIFIED means the topic EXISTS (ok=false, and it proves presence)"   || no "★ TOPIC_NOT_MODIFIED misread — every live topic would report as deleted"

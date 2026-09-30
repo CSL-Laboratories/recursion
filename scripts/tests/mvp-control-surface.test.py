@@ -42,23 +42,13 @@ def work(ident="task-one", status="running", summary="Bounded source task"):
             "assignment_digest": "d" * 64, "evidence_refs": ["evidence-one"]}
 
 
-def snapshot(*, paused=False, chiron_status="not-ready"):
-    chiron = {
-        "status": chiron_status, "canonical_ref": "origin/main",
-        "source_sha": "e" * 40 if chiron_status != "unknown" else None,
-        "last_fetched_at": "2026-08-31T19:59:00Z" if chiron_status != "unknown" else None,
-        "gates": [{"id": "gate-source", "status": "pass" if chiron_status == "ready" else "pending",
-                   "evidence_ref": "evidence-one"}],
-        "blockers": [] if chiron_status == "ready" else ["Product v6 prerequisites remain open"],
-        "evidence_refs": ["evidence-one"],
-    }
+def snapshot(*, paused=False):
     body = {
         "schema_version": 1, "kind": "control_snapshot", "source_sha": SOURCE_SHA,
         "observed_at": "2026-08-31T19:59:30Z", "expires_at": "2026-08-31T20:05:00Z",
         "pause_observed": paused, "today": [work()], "active_work": [work()],
         "reasons": ["The MVP is the current authorized task"],
         "next_work": [work("task-two", "queued", "Independent verification")],
-        "chiron": chiron,
         "budget": {"quota_status": "available", "active_workers": 1, "worker_capacity": 3,
                    "review_queue": 1, "review_capacity": 2, "month_spend_cents": 0,
                    "month_ceiling_cents": 0, "automatic_metered_spend_allowed": False,
@@ -96,7 +86,7 @@ def heartbeat(sequence, sent_at, *, key=b"0123456789abcdef0123456789abcdef", sig
 
 
 class ControlSurfaceTests(unittest.TestCase):
-    def test_all_six_read_commands_are_fresh_evidenced_and_available_under_pause(self):
+    def test_all_read_commands_are_fresh_evidenced_and_available_under_pause(self):
         snap = snapshot(paused=True)
         for index, command in enumerate(sorted(surface.READ_COMMANDS)):
             result = surface.handle_command(request(command, snap, ident=f"request-{index}"), snap,
@@ -107,20 +97,6 @@ class ControlSurfaceTests(unittest.TestCase):
             self.assertEqual(result["evidence_refs"], ["evidence-one"])
             self.assertEqual(result["result_digest"], surface._digest(result, "result_digest"))
             self.assertIsNone(result["intent"])
-
-    def test_chiron_never_infers_ready_and_names_exact_ref(self):
-        snap = snapshot(chiron_status="unknown")
-        result = surface.handle_command(request("/chiron", snap), snap, reference_time=NOW)
-        self.assertIn("unknown at origin/main", result["message"])
-        self.assertIn("Product v6 prerequisites", result["message"])
-        ready = snapshot(chiron_status="ready")
-        self.assertIn("ready at origin/main@", surface.handle_command(
-            request("/chiron", ready), ready, reference_time=NOW)["message"])
-        forged = snapshot(chiron_status="ready")
-        forged["chiron"]["gates"][0]["status"] = "pending"
-        forged = seal(forged, "snapshot_digest")
-        with self.assertRaisesRegex(surface.ControlSurfaceError, "ready Chiron"):
-            surface.validate_snapshot(forged, reference_time=NOW)
 
     def test_stale_tampered_unknown_and_unbound_requests_fail_closed(self):
         snap = snapshot()

@@ -26,7 +26,7 @@ sys.path.insert(0, str(SCRIPTS))
 SOURCE_BASELINE = "907e66cc9ba6ee45256615f2726fa03a3315e9ea"
 FORBIDDEN_DIAGNOSTIC = "2175561a2fc3c17e88193aab8d6004fa47e42f73"
 TASK = ROOT / "state" / "tasks" / "recursion-v2-mvp.md"
-CHIRON_AUDIT = ROOT / "docs" / "audits" / "recursion-v2-mvp-chiron-pilot-2026-08-31.md"
+EXAMPLE_OPS_AUDIT = ROOT / "docs" / "audits" / "recursion-v2-mvp-example-ops-pilot-2026-08-31.md"
 COMPLETION_AUDIT = ROOT / "docs" / "audits" / "recursion-v2-mvp-completion-2026-08-31.md"
 
 FOCUSED_GATES = (
@@ -68,7 +68,7 @@ class MVPCompletionTests(unittest.TestCase):
         task = TASK.read_text(encoding="utf-8")
         self.assertIn("acceptance: python3 scripts/tests/recursion-v2-mvp.test.py", task)
         self.assertRegex(task, r"(?m)^status: passed$")
-        self.assertTrue(CHIRON_AUDIT.is_file(), "Chiron pilot evidence is absent")
+        self.assertTrue(EXAMPLE_OPS_AUDIT.is_file(), "Example-ops pilot evidence is absent")
         self.assertTrue(COMPLETION_AUDIT.is_file(), "MVP completion audit is absent")
         completion = COMPLETION_AUDIT.read_text(encoding="utf-8")
         self.assertIn(SOURCE_BASELINE, completion)

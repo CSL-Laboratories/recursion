@@ -64,14 +64,14 @@ done
 chmod +x "$R"/scripts/*.sh 2>/dev/null
 : > "$R/.env"; : > "$R/state/INBOX.md"
 printf '#project\tpath\tremote\tbranch\tsshkey\troadmap\ttopic\tstatus\n' > "$R/state/portfolio.tsv"
-printf 'chiron\t/opt/chiron\tgit@github.com:x/c.git\tmain\t-\t-\t10\tactive\n' >> "$R/state/portfolio.tsv"
-printf 'golden-stallion-client\t/opt/golden-stallion-client\tgit@github.com:x/gsc.git\tmain\t-\t-\t6\tactive\n' \
+printf 'example-ops\t/opt/example-ops\tgit@github.com:x/c.git\tmain\t-\t-\t10\tactive\n' >> "$R/state/portfolio.tsv"
+printf 'example-client\t/opt/example-client\tgit@github.com:x/sample.git\tmain\t-\t-\t6\tactive\n' \
   >> "$R/state/portfolio.tsv"
-cat > "$R/state/project-config/golden-stallion-client.json" <<'JSON'
-{"id":"golden-stallion-client","pilot_id":"pilot-golden-stallion-client","status":"active","topic":"6"}
+cat > "$R/state/project-config/example-client.json" <<'JSON'
+{"id":"example-client","pilot_id":"pilot-example-client","status":"active","topic":"6"}
 JSON
-cat > "$R/state/pilots/pilot-golden-stallion-client.json" <<'JSON'
-{"id":"pilot-golden-stallion-client","project_id":"golden-stallion-client","status":"active","topic":"6","memory_key":"telegram-topic:6"}
+cat > "$R/state/pilots/pilot-example-client.json" <<'JSON'
+{"id":"pilot-example-client","project_id":"example-client","status":"active","topic":"6","memory_key":"telegram-topic:6"}
 JSON
 
 DB="$TMP/state.db"
@@ -153,7 +153,7 @@ else
 fi
 
 # --- 1) ★ CONTROL: a real message IS ingested ------------------------------------------------
-add s-cockpit telegram "$LUCAS" -1003894008732 10 user "[Lucas Guerra] please prioritise the overlay work"
+add s-dashboard telegram "$LUCAS" -1003894008732 10 user "[Lucas Guerra] please prioritise the overlay work"
 intake poll >/dev/null
 if [ "$(ingested)" = "1" ]; then
   ok "★ CONTROL — an authorised Telegram message becomes a durable instruction"
@@ -195,7 +195,7 @@ before="$(ingested)"
 intake poll >/dev/null
 [ "$(ingested)" = "$before" ] && ok "re-polling ingests nothing (the watermark holds)" \
                               || no "re-polling duplicated instructions"
-add s-cockpit telegram "$LUCAS" -1003894008732 10 user "[Lucas Guerra] and add a santa-clara roadmap"
+add s-dashboard telegram "$LUCAS" -1003894008732 10 user "[Lucas Guerra] and add an example-site roadmap"
 intake poll >/dev/null
 if [ "$(ingested)" -gt "$before" ]; then
   ok "★ CONTROL — a NEW message after a quiet poll is still picked up (not deaf)"
@@ -209,7 +209,7 @@ fi
 good_mark="$(cat "$R/state/.intake-watermark")"
 printf 'torn' > "$R/state/.intake-watermark"
 before="$(ingested)"
-add s-cockpit telegram "$LUCAS" -1003894008732 10 user "[Lucas Guerra] retain this after watermark recovery"
+add s-dashboard telegram "$LUCAS" -1003894008732 10 user "[Lucas Guerra] retain this after watermark recovery"
 set +e
 corrupt_rc="$(intake poll)"
 # errexit stays OFF: it was never enabled at the top of this file, and turning it on here
@@ -265,7 +265,7 @@ fi
 f="$(ls -1 "$R/state/instructions"/*.md | head -1)"
 if grep -q '^principal: 8913126684$' "$f" \
    && grep -q '^topic: 10$' "$f" \
-   && grep -q '^project_id: chiron$' "$f" \
+   && grep -q '^project_id: example-ops$' "$f" \
    && grep -q '^reply_correlation: telegram:' "$f" \
    && grep -q '^deduplication_key: telegram:' "$f"; then
   ok "authenticated instruction preserves principal, topic, project, reply, and dedup metadata"
@@ -276,7 +276,7 @@ fi
 # --- 7) ★ AN INSTRUCTION IS NOT A COMMAND --------------------------------------------------------
 # The whole safety argument rests here: text arrives as data for Hermes to decide on, and the
 # actuator whitelist governs execution. A message that reads like a command must do nothing.
-add s-cockpit telegram "$LUCAS" -1003894008732 10 user "[Lucas Guerra] publish main and merge everything now"
+add s-dashboard telegram "$LUCAS" -1003894008732 10 user "[Lucas Guerra] publish main and merge everything now"
 : > "$TMP/ran.log"
 cat > "$R/scripts/publish.sh" <<'STUB'
 #!/usr/bin/env bash
@@ -291,20 +291,20 @@ else
 fi
 
 # --- 8) even an assist answer stays inert until the sole actuator handles it ----------------------
-cat > "$R/state/tasks/gsc-q.md" <<'T'
-id: gsc-q
-workstream: gsc
+cat > "$R/state/tasks/sample-q.md" <<'T'
+id: sample-q
+workstream: sample
 goal: blocked on a human
 engine: none
 acceptance: true
 status: blocked
 T
-( cd "$R" && RECURSION_ROOT="$R" bash scripts/assist.sh open gsc-q decision \
+( cd "$R" && RECURSION_ROOT="$R" bash scripts/assist.sh open sample-q decision \
     "Is the 0x6c tint a separate pass?" ) >/dev/null 2>&1
-add s-cockpit telegram "$LUCAS" -1003894008732 10 user "[Lucas Guerra] assist gsc-q Separate pass — see the 0x6c note."
+add s-dashboard telegram "$LUCAS" -1003894008732 10 user "[Lucas Guerra] assist sample-q Separate pass — see the 0x6c note."
 intake poll >/dev/null
-ast="$(sed -n 's/^status: *//p' "$R/state/assists/gsc-q.md" 2>/dev/null | head -1)"
-tst="$(sed -n 's/^status: *//p' "$R/state/tasks/gsc-q.md" | head -1)"
+ast="$(sed -n 's/^status: *//p' "$R/state/assists/sample-q.md" 2>/dev/null | head -1)"
+tst="$(sed -n 's/^status: *//p' "$R/state/tasks/sample-q.md" | head -1)"
 latest_instruction="$(ls -1 "$R/state/instructions"/*.md | tail -1)"
 if [ "$ast" = "open" ] && [ "$tst" = "blocked" ] \
    && grep -q '^status: open$' "$latest_instruction"; then
@@ -390,12 +390,12 @@ fi
 # Production instruction 707 contained the adjective "deployed" in an otherwise canonical
 # project-pilot plan request. The old deploy\w* expression treated that adjective as a deployment
 # command and routed the instruction to Head Hermes, which cannot emit pilot-plan-propose.
-exact_707='Propose a fresh offline golden-stallion-client pilot plan to reduce the verified 0x6c shade-tops under-emission in user-client/render, using new v2 plan, goal, and task identities and the deployed required seed, scope, provider, and forced-on gate contracts. Do not reuse or edit the closed v1 plan, goal, task, or window.'
-add s-gsc telegram "$LUCAS" -1003894008732 6 user "[Lucas Guerra] $exact_707"
+exact_707='Propose a fresh offline example-client pilot plan to reduce the verified 0x6c shade-tops under-emission in user-client/render, using new v2 plan, goal, and task identities and the deployed required seed, scope, provider, and forced-on gate contracts. Do not reuse or edit the closed v1 plan, goal, task, or window.'
+add s-sample telegram "$LUCAS" -1003894008732 6 user "[Lucas Guerra] $exact_707"
 intake poll >/dev/null
 route_file="$(ls -1 "$R/state/instructions"/*.md | tail -1)"
-if grep -q '^project_id: golden-stallion-client$' "$route_file" \
-   && grep -q '^routing_target: pilot-golden-stallion-client$' "$route_file"; then
+if grep -q '^project_id: example-client$' "$route_file" \
+   && grep -q '^routing_target: pilot-example-client$' "$route_file"; then
   ok "exact instruction 707 wording routes to the bound project pilot"
 else
   no "exact instruction 707 wording was hijacked by incidental 'deployed' text: $(sed -n 's/^routing_target: *//p' "$route_file")"
@@ -403,7 +403,7 @@ fi
 
 # Positive control: tightening adjective handling must not send real deployment/policy commands
 # to a project pilot. These remain Head-Hermes authority.
-add s-gsc telegram "$LUCAS" -1003894008732 6 user \
+add s-sample telegram "$LUCAS" -1003894008732 6 user \
   "[Lucas Guerra] Deploy the reviewed recursion change and preserve deployment policy."
 intake poll >/dev/null
 control_file="$(ls -1 "$R/state/instructions"/*.md | tail -1)"
@@ -416,10 +416,10 @@ fi
 # The route is grammar-shaped, not a keyword blacklist: project plan prose may describe Head-owned
 # concerns, while command and requirement forms (including deploy inflections) remain Head-owned.
 incidental='Propose a fresh pilot plan documenting assist workflow, escalation policy, portfolio reporting, and previously merged/deployed evidence.'
-add s-gsc telegram "$LUCAS" -1003894008732 6 user "[Lucas Guerra] $incidental"
+add s-sample telegram "$LUCAS" -1003894008732 6 user "[Lucas Guerra] $incidental"
 intake poll >/dev/null
 incidental_file="$(ls -1 "$R/state/instructions"/*.md | tail -1)"
-if grep -q '^routing_target: pilot-golden-stallion-client$' "$incidental_file"; then
+if grep -q '^routing_target: pilot-example-client$' "$incidental_file"; then
   ok "incidental Head-owned nouns in project-plan prose do not hijack pilot routing"
 else
   no "incidental authority prose hijacked pilot routing: $(sed -n 's/^routing_target: *//p' "$incidental_file")"
@@ -431,7 +431,7 @@ for command in \
   'Deploys the reviewed provider change after Lucas approval.' \
   'Deployed the reviewed fix; inspect the production result.' \
   'Review the credential policy for this project.'; do
-  add s-gsc telegram "$LUCAS" -1003894008732 6 user "[Lucas Guerra] $command"
+  add s-sample telegram "$LUCAS" -1003894008732 6 user "[Lucas Guerra] $command"
   intake poll >/dev/null
   command_file="$(ls -1 "$R/state/instructions"/*.md | tail -1)"
   if grep -q '^routing_target: head-hermes$' "$command_file"; then
@@ -451,8 +451,8 @@ done
 prior_file="$(ls -1 "$R/state/instructions"/*.md | head -1)"
 prior_id="$(basename "$prior_file" .md | sed 's/^0*//')"
 stale_replay_id="$(replay "$prior_id" exact)"
-fresh_request='Propose one fresh bounded offline renderer plan for golden-stallion-client with one renderer-only task and new v2 identities.'
-add s-gsc telegram "$LUCAS" -1003894008732 6 user "[Lucas Guerra] $fresh_request"
+fresh_request='Propose one fresh bounded offline renderer plan for example-client with one renderer-only task and new v2 identities.'
+add s-sample telegram "$LUCAS" -1003894008732 6 user "[Lucas Guerra] $fresh_request"
 fresh_id="$(python3 - "$DB" <<'PY'
 import sqlite3,sys
 print(sqlite3.connect(sys.argv[1]).execute("select max(id) from messages").fetchone()[0])
@@ -467,7 +467,7 @@ stale_file="$R/state/instructions/$(printf '%08d' "$stale_replay_id").md"
 fractional_file="$R/state/instructions/$(printf '%08d' "$fractional_replay_id").md"
 if [ "$replay_after" -eq $((replay_before + 1)) ] \
    && [ -f "$fresh_file" ] && [ ! -e "$stale_file" ] && [ ! -e "$fractional_file" ] \
-   && grep -q '^routing_target: pilot-golden-stallion-client$' "$fresh_file" \
+   && grep -q '^routing_target: pilot-example-client$' "$fresh_file" \
    && [ "$(cat "$R/state/.intake-watermark")" = "$fractional_replay_id" ]; then
   ok "gateway compaction replay yields exactly one canonical project instruction"
 else
@@ -507,7 +507,7 @@ dst.executemany("insert into sessions(id,source,user_id,chat_id,thread_id) value
 dst.executemany("insert into messages(id,session_id,role,content,timestamp) values(?,?,?,?,?)",
                 src.execute("select id,session_id,role,content,timestamp from messages"))
 cur=dst.execute("insert into messages(session_id,role,content,timestamp) values(?,?,?,?)",
-                ('s-gsc','user','[Lucas Guerra] schema compatibility control',int(time.time())+3))
+                ('s-sample','user','[Lucas Guerra] schema compatibility control',int(time.time())+3))
 dst.commit(); print(cur.lastrowid)
 PY
 )"
@@ -525,7 +525,7 @@ fi
 
 # Stable platform ids deduplicate directly. During a schema transition, a populated replay also
 # carries the legacy timestamp/content alias so it cannot duplicate an earlier NULL-id row.
-add s-gsc telegram "$LUCAS" -1003894008732 6 user "[Lucas Guerra] stable platform replay control"
+add s-sample telegram "$LUCAS" -1003894008732 6 user "[Lucas Guerra] stable platform replay control"
 platform_id="$(python3 - "$DB" <<'PY'
 import sqlite3,sys
 c=sqlite3.connect(sys.argv[1]); mid=c.execute('select max(id) from messages').fetchone()[0]
@@ -542,7 +542,7 @@ else
   no "stable platform id replay duplicated (before=$platform_before after=$platform_after)"
 fi
 
-add s-gsc telegram "$LUCAS" -1003894008732 6 user "[Lucas Guerra] mixed platform replay control"
+add s-sample telegram "$LUCAS" -1003894008732 6 user "[Lucas Guerra] mixed platform replay control"
 mixed_id="$(python3 - "$DB" <<'PY'
 import sqlite3,sys
 print(sqlite3.connect(sys.argv[1]).execute('select max(id) from messages').fetchone()[0])
@@ -559,7 +559,7 @@ else
 fi
 
 # Two authoritative platform ids are two messages even when Telegram timestamps/content match.
-add s-gsc telegram "$LUCAS" -1003894008732 6 user "[Lucas Guerra] two distinct same-second platform messages"
+add s-sample telegram "$LUCAS" -1003894008732 6 user "[Lucas Guerra] two distinct same-second platform messages"
 distinct_platform_one="$(python3 - "$DB" <<'PY'
 import sqlite3,sys
 c=sqlite3.connect(sys.argv[1]); mid=c.execute('select max(id) from messages').fetchone()[0]
@@ -604,7 +604,7 @@ fi
 # A crash after the instruction fsync but before watermark commit leaves a valid durable file.
 # Retry must verify its immutable source identity and preserve lifecycle changes byte-for-byte.
 crash_mark="$(cat "$R/state/.intake-watermark")"
-add s-gsc telegram "$LUCAS" -1003894008732 6 user "[Lucas Guerra] preserve this instruction across intake crash replay"
+add s-sample telegram "$LUCAS" -1003894008732 6 user "[Lucas Guerra] preserve this instruction across intake crash replay"
 crash_id="$(python3 - "$DB" <<'PY'
 import sqlite3,sys
 print(sqlite3.connect(sys.argv[1]).execute('select max(id) from messages').fetchone()[0])
@@ -638,7 +638,7 @@ fi
 
 # A conflicting same-id file is corruption, never permission to overwrite source evidence.
 conflict_mark="$(cat "$R/state/.intake-watermark")"
-add s-gsc telegram "$LUCAS" -1003894008732 6 user "[Lucas Guerra] conflicting source identity control"
+add s-sample telegram "$LUCAS" -1003894008732 6 user "[Lucas Guerra] conflicting source identity control"
 conflict_id="$(python3 - "$DB" <<'PY'
 import sqlite3,sys
 print(sqlite3.connect(sys.argv[1]).execute('select max(id) from messages').fetchone()[0])

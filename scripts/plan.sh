@@ -10,8 +10,8 @@
 #     engine: claude
 #     repo: /opt/recursion
 #     sshkey: ~/.ssh/id_deploy
-#     workdir: apps/chiron
-#     acceptance: cd apps/chiron && npm install && npm run build
+#     workdir: apps/example
+#     acceptance: cd apps/example && npm install && npm run build
 #
 # `automerge:` / `automerge_scope:` are NOT roadmap-grantable (esc-0001). A roadmap says what to
 # build; it does not hand out default-branch write authority. Headers carrying them are dropped
@@ -180,21 +180,6 @@ GATE_COMMANDS="$(hget gate_commands)"
 GATE_FILES="$(hget gate_files)"
 CONTROLLER_GATE_FILES="$(hget controller_gate_files)"
 GOAL_ID="${GOAL_ID:-goal-$WS}"
-# Phase 2 repository boundary. The frozen in-repository Chiron tree is historical residue, not a
-# destination for new work. A canonical Chiron project may still be planned from /opt/chiron;
-# only the legacy apps/chiron path is refused.
-contains_legacy_chiron(){
-  # Normalize separators, redundant ./ and trailing slashes before matching every command/path
-  # field. This catches shell, Windows, and comma-separated roadmap spellings alike.
-  printf '%s\n' "$1" | tr '\\' '/' | sed -E 's#/{2,}#/#g; s#/\./#/#g; s#(^|[[:space:]])\./#\1#g; s#/$##' \
-    | grep -qiE "(^|[^[:alnum:]_])apps/chiron([^[:alnum:]_]|$)"
-}
-for generated_field in "$WORKDIR" "$ALLOWED" "$ACC" "$GATE_COMMANDS" "$SEED" "$REPO" "$GOAL" "$NON_GOALS" "$ENGINE" "$MODEL" "$WORKER_CLASS" "$DEPS" "$SSHKEY" "$GOAL_ID"; do
-  if contains_legacy_chiron "$generated_field"; then
-    echo "plan: REFUSED new task targeting historical apps/chiron; use the canonical Chiron project repository" >&2
-    exit 6
-  fi
-done
 # Registered projects must bind the task to the exact current source tip. Disposable planner
 # fixtures intentionally have no descriptor/checkout and retain their v1 compatibility path.
 SOURCE_BRANCH=""; SOURCE_SHA=""; PROJECT_CONFIG=""; REPO_CANONICAL="$REPO"
@@ -270,10 +255,10 @@ PY
   printf '%s' "$SOURCE_SHA" | grep -qE '^[0-9a-f]{40,64}$' \
     || { echo "plan: registered project source branch is unavailable; exact source SHA cannot be admitted" >&2; exit 74; }
 fi
-# The planner does not grant automerge (esc-0001). Copying the header through is how chiron-001
-# and chiron-003 acquired `automerge: yes` from a roadmap edit rather than a human decision. The
-# fields are read only so the drop can be announced: a header that is silently ignored looks
-# exactly like a header that was honored.
+# The planner does not grant automerge (esc-0001). Copying the header through is how a task
+# acquired `automerge: yes` from a roadmap edit rather than a human decision. The fields are read
+# only so the drop can be announced: a header that is silently ignored looks exactly like a
+# header that was honored.
 if [ -n "$AM" ] || [ -n "$AMS" ]; then
   echo "plan: REFUSED automerge from $RM (automerge='$AM' automerge_scope='$AMS') — not copied into $ID; publication stays review-branch-only. Remove it from the roadmap header." >&2
 fi

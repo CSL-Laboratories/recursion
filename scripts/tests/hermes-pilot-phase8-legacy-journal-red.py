@@ -20,7 +20,7 @@ SOURCE = Path(__file__).resolve().parents[2]
 LEGACY_HASHES = (
     "d589999830dbae9f212aaefaa95dab3562e89654c799426799f6ce71e3afe081",
     "726c5d82795ee7b42def62b2601f36d0662cb0f5de6f5e4886b11b77f597cc8a",
-    "3bd740a2f8242645af25a01dda28f3db636d8e67fb066db1c6c39e793fb6d7ee",
+    "42d4663038df766c987f7555cdf3c3d6a858ff156f5416ce040a0fa62f8b941e",
     "160cee2fed8ead1e0154bb3635cb19588a3ad312fb4ae4c5501a3b9da4e7784b",
     "6c14cb6556f79e81bc3b1b4a0a4cb3c14593cb22902e7170410c990372678dda",
 )
@@ -59,8 +59,8 @@ def legacy_rows() -> list[dict]:
         },
         {
             "args": [], "confidence": "high", "cost_usd": "0.0",
-            "goal": "GSC-first sequencing: reach a usable Cubic Castles reconstruction checkpoint against the August game-update clock",
-            "project": "gsc", "provider": "openai-codex", "text": "",
+            "goal": "SAMPLE-first sequencing: reach a usable example-game reconstruction checkpoint against the August game-update clock",
+            "project": "sample", "provider": "openai-codex", "text": "",
             "ts": "2026-08-07T09:15:01Z", "verb": "noop",
             "why": "PAUSED explicitly restricts executable decisions to noop. No open Lucas instruction overrides the halt.",
             "wrong_if": "The runtime PAUSE state is lifted or shown inaccurate before this decision is executed.",

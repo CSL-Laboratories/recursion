@@ -44,7 +44,7 @@ TASKDIR="state/tasks"
 EVENTS="state/events.jsonl"
 ESCIDX="state/escalations.tsv"
 LOCKDIR="state/.locks"
-LEASE_TTL="${RECURSION_LEASE_TTL_S:-5400}"   # 90 min; a GSC arm run is ~60 min
+LEASE_TTL="${RECURSION_LEASE_TTL_S:-5400}"   # 90 min; a typical arm run is ~60 min
 
 mkdir -p "$TASKDIR" "$LOCKDIR" "$(dirname "$EVENTS")" 2>/dev/null
 

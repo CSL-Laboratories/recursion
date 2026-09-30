@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# topics.sh — one forum topic per project in The Cockpit, and the registry remembers which.
+# topics.sh — one forum topic per project in the operator surface, and the registry remembers which.
 #
 # The topic id is the routing key, so it belongs with the rest of what the control plane knows
 # about a repo: state/portfolio.tsv column 7. Keeping it there rather than in .env means a new

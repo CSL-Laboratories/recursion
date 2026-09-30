@@ -50,7 +50,7 @@ chmod +x "$R"/scripts/*.sh 2>/dev/null
 : > "$R/.env"; : > "$R/state/INBOX.md"; echo "anchor" > "$R/ANCHOR.md"
 # A deliberately tiny controller stub keeps this suite focused on resync's interpretation of
 # an already validated source pin.  The real controller and its Git ancestry proof are covered
-# by gsc-profile-promotion.test.py; malformed stub output still has to fail closed here.
+# by a sample profile-promotion gate; malformed stub output still has to fail closed here.
 cat > "$R/scripts/project-pilot.py" <<'PY'
 #!/usr/bin/env python3
 import json, pathlib, sys

@@ -223,20 +223,20 @@ def main() -> int:
             root = make_root(
                 tmp / "c2", [row("classic", "git@github.com:own/classic.git")],
                 tasks={
-                    "chiron-001.md": "id: chiron-001\nautomerge: yes\nautomerge_scope: apps/chiron\n"
+                    "example-ops-001.md": "id: example-ops-001\nautomerge: yes\nautomerge_scope: apps/example-ops\n"
                                      "status: passed\n\nbody mentioning automerge: yes harmlessly\n",
-                    "chiron-002.md": "id: chiron-002\nautomerge: no\nstatus: passed\n\nbody\n",
-                    "chiron-003.md": "id: chiron-003\nstatus: queued\n\nautomerge: yes\n",
+                    "example-ops-002.md": "id: example-ops-002\nautomerge: no\nstatus: passed\n\nbody\n",
+                    "example-ops-003.md": "id: example-ops-003\nstatus: queued\n\nautomerge: yes\n",
                 })
             done = run(root, base, TOKEN)
             captured += [done.stdout, done.stderr]
             check(done.returncode == 1,
                   f"a task carrying automerge is a violation, exit 1 (got {done.returncode})")
-            check("state/tasks/chiron-001.md" in done.stdout,
+            check("state/tasks/example-ops-001.md" in done.stdout,
                   "the task violation names the offending file")
-            check("chiron-002" not in done.stdout,
+            check("example-ops-002" not in done.stdout,
                   "`automerge: no` is not reported as a violation")
-            check("chiron-003" not in done.stdout,
+            check("example-ops-003" not in done.stdout,
                   "* an automerge line in the BODY is not a header grant (header ends at the "
                   "first blank line)")
 

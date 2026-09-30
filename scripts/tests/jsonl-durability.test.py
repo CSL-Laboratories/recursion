@@ -774,12 +774,12 @@ printf 'esc-0001\\t%s\\topen\\t2026-08-10T00:00:00Z\\t2026-08-10T00:00:00Z\\t1\\
     taskctl.chmod(0o700)
     source = {
         "schema_version": 1, "id": "source-assist", "ts": "2026-08-10T00:00:00Z",
-        "event": "assist-open", "task": "task-one", "project": "chiron",
+        "event": "assist-open", "task": "task-one", "project": "example-ops",
         "goal": "goal-one", "pid": 1, "detail": "decision: needs Lucas",
     }
     (root / "state/tasks/task-one.md").write_text(
-        "schema_version: 1\nid: task-one\nproject_id: chiron\n"
-        "pilot_id: pilot-chiron\ngoal_id: goal-one\nstatus: blocked\n",
+        "schema_version: 1\nid: task-one\nproject_id: example-ops\n"
+        "pilot_id: pilot-example-ops\ngoal_id: goal-one\nstatus: blocked\n",
         encoding="utf-8",
     )
     (root / "state/assists/task-one.md").write_text(
@@ -794,13 +794,13 @@ printf 'esc-0001\\t%s\\topen\\t2026-08-10T00:00:00Z\\t2026-08-10T00:00:00Z\\t1\\
             "head-hermes:telegram:-100:12",
             "lucas-direct:telegram:123",
         ]
-        (root / "state/project-config/chiron.json").write_text(
-            json.dumps({"id": "chiron", "pilot_id": "pilot-chiron", "status": "active",
+        (root / "state/project-config/example-ops.json").write_text(
+            json.dumps({"id": "example-ops", "pilot_id": "pilot-example-ops", "status": "active",
                         "notification_targets": targets}) + "\n",
             encoding="utf-8",
         )
-        (root / "state/pilots/pilot-chiron.json").write_text(
-            json.dumps({"id": "pilot-chiron", "project_id": "chiron", "status": "active",
+        (root / "state/pilots/pilot-example-ops.json").write_text(
+            json.dumps({"id": "pilot-example-ops", "project_id": "example-ops", "status": "active",
                         "notification_targets": targets}) + "\n",
             encoding="utf-8",
         )

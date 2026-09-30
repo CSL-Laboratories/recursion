@@ -29,7 +29,7 @@ merges, or destructive cleanup. Those remain human seams under `CONTROL_PLANE.md
 The source-only MVP is implemented and independently accepted. The completed slice includes strict
 v2 records, the task-packet/context kernel, five provider adapters, deterministic placement and
 durable recovery, depth-2 orchestration with immutable child budgets, independent verification and
-review admission, the Telegram command/watchdog source boundary, and a source-only Chiron pilot.
+review admission, the Telegram command/watchdog source boundary, and a source-only pilot.
 The one-command gate is `python3 -u scripts/tests/recursion-v2-mvp.test.py`; exact SHAs and counts
 are recorded in `docs/audits/recursion-v2-mvp-completion-2026-08-31.md`.
 
@@ -37,7 +37,7 @@ This checkpoint does not close the larger production plan below. Cursor Cloud is
 fake transport, Codex and Cursor complete hermetic evidence flows, and no production credential,
 provider call, Telegram delivery, second-box notification, deployment, restart, PAUSE change, or
 metered spend occurred. Grok Bot, registered-machine live execution, production process isolation,
-off-host restore, live outage/quota soak, Chiron migration cleanup, and Lucas's broader-autonomy
+off-host restore, live outage/quota soak, migration cleanup, and Lucas's broader-autonomy
 decision remain open. The phase descriptions are preserved as the production roadmap; source-MVP
 completion must not be mistaken for their live completion.
 
@@ -431,8 +431,7 @@ Work:
    registered repository heads.
 3. Preserve the dirty live `loop/auto` state in an immutable review artifact.
 4. Reconcile live Recursion with current `origin/master` without force or default-branch mutation.
-5. Supersede, rebind, or close the stale GSC pilot.
-6. Correct stale board/projection state only through the reviewed state path.
+5. Correct stale board/projection state only through the reviewed state path.
 
 Gate:
 
@@ -469,12 +468,9 @@ Work:
 2. Add canonical candidate import and serialized integration planning.
 3. Make source SHA mandatory for new tasks.
 4. Implement typed stale-base outcomes.
-5. Prepare the Chiron duplicate-removal branch after parity and reference checks.
 
 Gate:
 
-- no new task generator emits `apps/chiron`;
-- historical Chiron tasks remain unchanged;
 - no executor can target a default or integration branch;
 - duplicate candidate import is idempotent;
 - advancing a remote branch during a run cannot overwrite new work.
@@ -591,13 +587,10 @@ Gate:
 
 Work:
 
-1. Pilot Chiron with one bounded task and an independent verifier.
-2. Pilot one low-risk offline GSC task without the live oracle.
-3. Run a full operational soak covering cron, gateway/actuator restart, host loss, provider outage,
+1. Run a full operational soak covering cron, gateway/actuator restart, host loss, provider outage,
    Cloud/Grok cancellation, quota exhaustion, stale branches, and publication retry.
-4. Remove the frozen Chiron product tree only after all migration gates pass.
-5. Remove hardcoded Claude/task-routing assumptions only after compatibility evidence passes.
-6. Update architecture, operator runbooks, decisions, and status projections.
+2. Remove hardcoded Claude/task-routing assumptions only after compatibility evidence passes.
+3. Update architecture, operator runbooks, decisions, and status projections.
 
 Gate:
 
@@ -639,8 +632,6 @@ Every phase must define rollback before mutation:
 - remote adapters can be disabled without invalidating canonical state;
 - no phase requires force-pushing or rewriting default-branch history;
 - integration branches are disposable review artifacts, not production;
-- Chiron deletion occurs only after the canonical repo and historical evidence are independently
-  verified;
 - credential and firewall windows have separate operator runbooks and receipts.
 
 ## Autonomous-session boot sequence
@@ -673,6 +664,6 @@ Recursion v2 is operational as the basis for development when:
 - every result is independently attributable and verifiable;
 - quota and spend policies fail closed;
 - controller restart, stale branches, duplicate delivery, and host loss are proven safe;
-- Chiron is no longer duplicated as live-looking product code in Recursion;
+- no other project's product code is duplicated as live-looking code in Recursion;
 - a full soak passes without unauthorized writes, orphaned work, silent spend, or review backlog;
 - Lucas explicitly approves broader autonomy and removes PAUSE through the human-owned procedure.

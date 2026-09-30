@@ -78,8 +78,8 @@ MANIFEST_SOURCE = {
 
 ASSIGNMENT = {
     "task_id": "t-0042",
-    "project_id": "chiron",
-    "source_repository": "https://github.com/NotSkittlz/chiron",
+    "project_id": "example-ops",
+    "source_repository": "https://github.com/NotSkittlz/example-ops",
     "source_branch": "main",
     "source_sha": SHA,
     "engine": "grok-bot",

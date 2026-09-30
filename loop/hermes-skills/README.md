@@ -23,7 +23,7 @@ can load them in the live chat channel).
 
 | Skill | Role | Read-only? |
 |---|---|---|
-| `recursion-status` | REPORT box/build-loop/GSC status from ground truth via the `recursion` CLI | yes (reporting only) |
+| `recursion-status` | REPORT box/build-loop status from ground truth via the `recursion` CLI | yes (reporting only) |
 | `recursion-project-pilot` | Resolve one Telegram topic to one chartered pilot and read only scoped live project evidence | yes (reporting only; mutations remain intake) |
 | `recursion-ops`    | ACT on Lucas's ops requests (resolve/requeue/plan/drain/pause/publish) with the loop's guardrails; defer STRUCTURAL changes to an authoring session | no (acts, but fenced by discipline) |
 

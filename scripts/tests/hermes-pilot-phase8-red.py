@@ -16,7 +16,7 @@ from windows_test_support import bash_executable, prepare_shell_env
 
 SOURCE = Path(__file__).resolve().parents[2]
 CONTROLS = [
-    "a fresh instruction produces a canonical charter-inheriting repo-bound plan without reusing legacy Chiron state",
+    "a fresh instruction produces a canonical charter-inheriting repo-bound plan without reusing legacy Example-ops state",
     "a malformed, unsafe-network, or invalid repo gate plan is rejected without partial state",
     "Lucas exact-digest approval revalidates the repo contract and materializes one new goal DAG idempotently",
     "only the exact goal in an open bounded pilot window is schedulable",
@@ -44,7 +44,7 @@ def fields(path: Path) -> dict[str, str]:
 
 def required_non_goals(fixture: "Fixture") -> set[str]:
     config = json.loads(
-        (fixture.root / "state/project-config/chiron.json").read_text(encoding="utf-8")
+        (fixture.root / "state/project-config/example-ops.json").read_text(encoding="utf-8")
     )
     return set(config["required_non_goals"])
 
@@ -65,8 +65,8 @@ class Fixture:
             )
         for relative in (
             "state/project-config", "state/pilots", "state/goals", "state/tasks",
-            "state/plans/chiron", "state/pilot-windows", "state/instructions",
-            "state/actions", "state/assists", "state/pilot-requests/chiron",
+            "state/plans/example-ops", "state/pilot-windows", "state/instructions",
+            "state/actions", "state/assists", "state/pilot-requests/example-ops",
             "state/decision-queue/pending", "state/decision-queue/running",
             "state/decision-queue/succeeded", "state/decision-queue/failed",
             "state/deliveries", "state/notification-events", "state/.locks", "loop/logs",
@@ -91,7 +91,7 @@ class Fixture:
         self._write_repo()
         self._write_project()
         self._write_legacy_state()
-        self._write_instruction("101", "pilot-chiron")
+        self._write_instruction("101", "pilot-example-ops")
         self.planner_plan = self._plan()
         self.plan = json.loads(json.dumps(self.planner_plan))
         self.plan_id = str(self.plan["id"])
@@ -101,7 +101,7 @@ class Fixture:
         shutil.rmtree(self.temp, ignore_errors=True)
 
     def _write_repo(self) -> None:
-        self.repo = self.temp / "chiron-repo"
+        self.repo = self.temp / "example-ops-repo"
         self.project = self.repo
         self.gate_path = self.repo / "user-client/render/tools/native-diff.cjs"
         implementation = self.repo / "user-client/render/shade-tops.js"
@@ -122,34 +122,34 @@ class Fixture:
     def _write_project(self) -> None:
         (self.root / "state/portfolio.tsv").write_text(
             "#project\tpath\tremote\tbranch\tsshkey\troadmap\ttopic\tstatus\n"
-            f"chiron\t{self.repo}\torigin\tmain\t-\t-\t10\tactive\n",
+            f"example-ops\t{self.repo}\torigin\tmain\t-\t-\t10\tactive\n",
             encoding="utf-8",
         )
         config = {
-            "schema_version": 1, "id": "chiron", "repo": str(self.repo),
+            "schema_version": 1, "id": "example-ops", "repo": str(self.repo),
             "remote": str(self.repo), "default_branch": "main", "deploy_key_ref": "-",
-            "charter": "Build-verifiable Chiron application changes only.",
+            "charter": "Build-verifiable Example-ops application changes only.",
             "allowed_paths": ["user-client/render"],
             "required_non_goals": [
                 "tests", "fixtures", "oracles", "baselines", "live-game-access",
                 "credentials", "merge", "deploy",
             ],
-            "topic": 10, "pilot_id": "pilot-chiron",
+            "topic": 10, "pilot_id": "pilot-example-ops",
             "activation_gate": "clone-auth-freshness-v1",
             "notification_targets": ["project-topic:telegram:-100:10", "head-hermes:telegram:-100:1"],
             "goal_source": "state/goals", "status": "active",
         }
         pilot = {
-            "schema_version": 1, "id": "pilot-chiron", "project_id": "chiron", "topic": 10,
+            "schema_version": 1, "id": "pilot-example-ops", "project_id": "example-ops", "topic": 10,
             "charter": config["charter"], "model_policy": "project-pilot",
             "required_non_goals": config["required_non_goals"],
             "concurrency_limit": 1, "budget": {"max_inflight_workers": 1},
             "notification_targets": config["notification_targets"], "goal_source": "state/goals",
-            "memory_key": "telegram-topic:10", "worktree_root": ".worktrees/chiron",
+            "memory_key": "telegram-topic:10", "worktree_root": ".worktrees/example-ops",
             "window_required": True, "status": "active",
         }
-        self.write_json("state/project-config/chiron.json", config)
-        self.write_json("state/pilots/pilot-chiron.json", pilot)
+        self.write_json("state/project-config/example-ops.json", config)
+        self.write_json("state/pilots/pilot-example-ops.json", pilot)
 
     def install_seed_contract(self, manifest: str = "data/corpus\n") -> None:
         (self.project / "data/corpus").mkdir(parents=True, exist_ok=True)
@@ -165,20 +165,20 @@ class Fixture:
         )
 
     def _write_legacy_state(self) -> None:
-        (self.root / "state/goals/goal-chiron-legacy.md").write_text(
-            "schema_version: 1\nversion: 1\nid: goal-chiron-legacy\nproject_id: chiron\n"
+        (self.root / "state/goals/goal-example-ops-legacy.md").write_text(
+            "schema_version: 1\nversion: 1\nid: goal-example-ops-legacy\nproject_id: example-ops\n"
             "status: active\noutcome: Historical shell.\nacceptance_suite: npm run build\n"
             "falsifier: The historical build fails.\nbudget: historical\n",
             encoding="utf-8",
         )
-        (self.root / "state/tasks/chiron-legacy-task.md").write_text(
-            "schema_version: 1\nversion: 1\nid: chiron-legacy-task\nproject_id: chiron\n"
-            "goal_id: goal-chiron-legacy\nstatus: passed\nacceptance: npm run build\n",
+        (self.root / "state/tasks/example-ops-legacy-task.md").write_text(
+            "schema_version: 1\nversion: 1\nid: example-ops-legacy-task\nproject_id: example-ops\n"
+            "goal_id: goal-example-ops-legacy\nstatus: passed\nacceptance: npm run build\n",
             encoding="utf-8",
         )
         self.legacy_hash = canonical_digest({
-            "goal": (self.root / "state/goals/goal-chiron-legacy.md").read_text(encoding="utf-8"),
-            "task": (self.root / "state/tasks/chiron-legacy-task.md").read_text(encoding="utf-8"),
+            "goal": (self.root / "state/goals/goal-example-ops-legacy.md").read_text(encoding="utf-8"),
+            "task": (self.root / "state/tasks/example-ops-legacy-task.md").read_text(encoding="utf-8"),
         })
 
     def _write_instruction(self, iid: str, target: str, body: str = "fixture instruction") -> None:
@@ -187,8 +187,8 @@ class Fixture:
         # intentionally leaves their project/pilot projection empty; the authority-bearing
         # identifiers live in the authenticated command body and the validated decision.
         topic = "1" if target == "head-hermes" else "10"
-        project = "" if target == "head-hermes" else "chiron"
-        pilot = "" if target == "head-hermes" else "pilot-chiron"
+        project = "" if target == "head-hermes" else "example-ops"
+        pilot = "" if target == "head-hermes" else "pilot-example-ops"
         (self.root / "state/instructions" / name).write_text(
             f"schema_version: 1\nid: {iid}\nprincipal: 8913126684\ntopic: {topic}\n"
             f"project_id: {project}\npilot_id: {pilot}\nrouting_target: {target}\n"
@@ -200,16 +200,16 @@ class Fixture:
     def _plan() -> dict:
         return {
             "schema_version": 1,
-            "id": "chiron-phase8-plan",
-            "project_id": "chiron",
+            "id": "example-ops-phase8-plan",
+            "project_id": "example-ops",
             "goal": {
-                "id": "goal-chiron-phase8-smoke",
-                "outcome": "Add one reversible build-verifiable Chiron smoke marker.",
+                "id": "goal-example-ops-phase8-smoke",
+                "outcome": "Add one reversible build-verifiable Example-ops smoke marker.",
                 "acceptance_suite": "node user-client/render/tools/native-diff.cjs --metric",
                 "gate_class": "heavy",
                 "gate_files": ["user-client/render/tools/native-diff.cjs"],
                 "controller_gate_files": [],
-                "falsifier": "The exact candidate commit does not pass the clean Chiron build.",
+                "falsifier": "The exact candidate commit does not pass the clean Example-ops build.",
                 "budget": {
                     "max_concurrency": 1, "max_tokens": 12000, "max_cost_usd": 5,
                     "max_wall_clock_seconds": 3600, "max_task_attempts": 2,
@@ -218,7 +218,7 @@ class Fixture:
                 },
             },
             "tasks": [{
-                "id": "chiron-phase8-smoke", "intent": "Add the bounded smoke marker.",
+                "id": "example-ops-phase8-smoke", "intent": "Add the bounded smoke marker.",
                 "dependencies": [], "allowed_paths": ["user-client/render"],
                 "non_goals": ["learning-loop", "credentials", "merge", "deploy"],
                 "worker_class": "claude", "engine": "claude", "model_alias": "sonnet-routine",
@@ -242,7 +242,7 @@ class Fixture:
                  text: str, extra: dict | None = None) -> Path:
         value = {
             "schema_version": 1, "id": f"decision-{verb}-{iid}", "actor": actor,
-            "verb": verb, "args": args, "arguments": args, "project": "chiron",
+            "verb": verb, "args": args, "arguments": args, "project": "example-ops",
             "goal": goal, "goal_id": goal, "text": text, "instruction_id": iid,
             "why": "Phase 8 bounded pilot control.", "reason": "Phase 8 bounded pilot control.",
             "wrong_if": "Exact correlated state or evidence disagrees.",
@@ -256,19 +256,19 @@ class Fixture:
 
     def legacy_unchanged(self) -> bool:
         return self.legacy_hash == canonical_digest({
-            "goal": (self.root / "state/goals/goal-chiron-legacy.md").read_text(encoding="utf-8"),
-            "task": (self.root / "state/tasks/chiron-legacy-task.md").read_text(encoding="utf-8"),
+            "goal": (self.root / "state/goals/goal-example-ops-legacy.md").read_text(encoding="utf-8"),
+            "task": (self.root / "state/tasks/example-ops-legacy-task.md").read_text(encoding="utf-8"),
         })
 
 
 def test_fresh_plan(f: Fixture) -> bool:
     decision = f.decision(
-        verb="pilot-plan-propose", args=["chiron", f.plan_id], iid="101",
-        actor="pilot-chiron", goal=str(f.plan["goal"]["id"]),
-        text="Propose a fresh bounded Chiron Phase 8 plan.", extra={"plan": f.plan},
+        verb="pilot-plan-propose", args=["example-ops", f.plan_id], iid="101",
+        actor="pilot-example-ops", goal=str(f.plan["goal"]["id"]),
+        text="Propose a fresh bounded Example-ops Phase 8 plan.", extra={"plan": f.plan},
     )
     result = f.run("python3", "scripts/project-pilot.py", "execute", str(decision))
-    path = f.root / f"state/plans/chiron/{f.plan_id}.json"
+    path = f.root / f"state/plans/example-ops/{f.plan_id}.json"
     if result.returncode or not path.is_file() or not f.legacy_unchanged():
         return False
     record = json.loads(path.read_text(encoding="utf-8"))
@@ -285,22 +285,22 @@ def test_fresh_plan(f: Fixture) -> bool:
         and task.get("gate_class") == "heavy"
         and set((task.get("gate_contract") or {}).get("gate_files") or {})
             == {"user-client/render/tools/native-diff.cjs"}
-        and not (f.root / "state/goals/goal-chiron-phase8-smoke.md").exists()
+        and not (f.root / "state/goals/goal-example-ops-phase8-smoke.md").exists()
     )
 
 
 def test_invalid_plan(f: Fixture) -> bool:
     def refused(suffix: str, mutate) -> bool:
-        bad = json.loads(json.dumps(f.planner_plan)); bad["id"] = f"chiron-phase8-invalid-{suffix}"
+        bad = json.loads(json.dumps(f.planner_plan)); bad["id"] = f"example-ops-phase8-invalid-{suffix}"
         mutate(bad)
         decision = f.decision(
-            verb="pilot-plan-propose", args=["chiron", bad["id"]], iid="101",
-            actor="pilot-chiron", goal=str(bad["goal"]["id"]), text="Propose an invalid plan.",
+            verb="pilot-plan-propose", args=["example-ops", bad["id"]], iid="101",
+            actor="pilot-example-ops", goal=str(bad["goal"]["id"]), text="Propose an invalid plan.",
             extra={"plan": bad, "id": f"decision-invalid-{suffix}",
                    "idempotency_key": f"phase8:invalid:{suffix}"},
         )
         result = f.run("python3", "scripts/project-pilot.py", "execute", str(decision))
-        return result.returncode != 0 and not (f.root / f"state/plans/chiron/{bad['id']}.json").exists()
+        return result.returncode != 0 and not (f.root / f"state/plans/example-ops/{bad['id']}.json").exists()
 
     return all((
         refused("gate", lambda p: p["tasks"][0].__setitem__("acceptance", "true")),
@@ -321,7 +321,7 @@ def test_invalid_plan(f: Fixture) -> bool:
 def test_approval(f: Fixture) -> bool:
     f._write_instruction("102", "head-hermes", f"approve {f.plan_id} {f.digest}")
     decision = f.decision(
-        verb="pilot-plan-approve", args=["chiron", f.plan_id, f.digest], iid="102",
+        verb="pilot-plan-approve", args=["example-ops", f.plan_id, f.digest], iid="102",
         actor="head-hermes", goal=str(f.plan["goal"]["id"]),
         text="Approve exactly this plan digest for materialization.",
     )
@@ -329,15 +329,15 @@ def test_approval(f: Fixture) -> bool:
     f.gate_path.write_bytes(gate_bytes + b"// drift before approval\n")
     drifted = f.run("python3", "scripts/project-pilot.py", "execute", str(decision))
     f.gate_path.write_bytes(gate_bytes)
-    if drifted.returncode == 0 or (f.root / "state/goals/goal-chiron-phase8-smoke.md").exists():
+    if drifted.returncode == 0 or (f.root / "state/goals/goal-example-ops-phase8-smoke.md").exists():
         return False
     first = f.run("python3", "scripts/project-pilot.py", "execute", str(decision))
     second = f.run("python3", "scripts/project-pilot.py", "execute", str(decision))
-    goal_path = f.root / "state/goals/goal-chiron-phase8-smoke.md"
-    task_path = f.root / "state/tasks/chiron-phase8-smoke.md"
+    goal_path = f.root / "state/goals/goal-example-ops-phase8-smoke.md"
+    task_path = f.root / "state/tasks/example-ops-phase8-smoke.md"
     if first.returncode or second.returncode or not goal_path.is_file() or not task_path.is_file():
         return False
-    proposal = json.loads((f.root / f"state/plans/chiron/{f.plan_id}.json").read_text(encoding="utf-8"))
+    proposal = json.loads((f.root / f"state/plans/example-ops/{f.plan_id}.json").read_text(encoding="utf-8"))
     f._write_instruction("111", "head-hermes", f"approve {f.plan_id} {f.digest}")
     conflicting_instruction = f.root / "state/instructions/00000111.md"
     conflicting_instruction.write_text(
@@ -347,18 +347,18 @@ def test_approval(f: Fixture) -> bool:
         encoding="utf-8",
     )
     conflicting = f.decision(
-        verb="pilot-plan-approve", args=["chiron", f.plan_id, f.digest], iid="111",
+        verb="pilot-plan-approve", args=["example-ops", f.plan_id, f.digest], iid="111",
         actor="head-hermes", goal=str(f.plan["goal"]["id"]),
         text="Conflicting projected ownership must not authorize approval.",
     )
     conflicting_refused = f.run(
         "python3", "scripts/project-pilot.py", "execute", str(conflicting),
     ).returncode != 0
-    f._write_instruction("110", "pilot-chiron", "add an extra task")
+    f._write_instruction("110", "pilot-example-ops", "add an extra task")
     extra = f.decision(
         verb="pilot-task-create",
-        args=["chiron", "goal-chiron-phase8-smoke", "unapproved-extra", "user-client/render"],
-        iid="110", actor="pilot-chiron", goal="goal-chiron-phase8-smoke",
+        args=["example-ops", "goal-example-ops-phase8-smoke", "unapproved-extra", "user-client/render"],
+        iid="110", actor="pilot-example-ops", goal="goal-example-ops-phase8-smoke",
         text="Try to mutate the approved DAG.",
     )
     frozen = f.run("python3", "scripts/project-pilot.py", "execute", str(extra))
@@ -367,7 +367,7 @@ def test_approval(f: Fixture) -> bool:
         and fields(goal_path).get("instruction_id") == "101"
         and fields(goal_path).get("plan_id") == f.plan_id
         and fields(task_path).get("status") == "proposed"
-        and fields(task_path).get("workstream") == "chiron"
+        and fields(task_path).get("workstream") == "example-ops"
         and fields(task_path).get("acceptance") == "node user-client/render/tools/native-diff.cjs --metric"
         and fields(task_path).get("gate_class") == "heavy"
         and fields(task_path).get("source_head") == proposal["plan"]["authority_contract"]["source_head"]
@@ -376,8 +376,8 @@ def test_approval(f: Fixture) -> bool:
         and required_non_goals(f) <= set(fields(task_path).get("non_goals", "").split(","))
         and proposal.get("status") == "approved"
         and proposal.get("approval_instruction_id") == "102"
-        and len(list((f.root / "state/goals").glob("goal-chiron-phase8-smoke.md"))) == 1
-        and len(list((f.root / "state/tasks").glob("chiron-phase8-smoke.md"))) == 1
+        and len(list((f.root / "state/goals").glob("goal-example-ops-phase8-smoke.md"))) == 1
+        and len(list((f.root / "state/tasks").glob("example-ops-phase8-smoke.md"))) == 1
         and conflicting_refused
         and frozen.returncode != 0
         and "an exact-digest Phase 8 goal has an immutable task DAG" in frozen.stderr
@@ -389,14 +389,14 @@ def test_approval(f: Fixture) -> bool:
 def open_window(f: Fixture) -> bool:
     f._write_instruction(
         "103", "head-hermes",
-        "Open pilot window chiron-window-1 for chiron, "
-        "goal goal-chiron-phase8-smoke, for 900 seconds."
+        "Open pilot window example-ops-window-1 for example-ops, "
+        "goal goal-example-ops-phase8-smoke, for 900 seconds."
     )
     decision = f.decision(
         verb="pilot-window-open",
-        args=["chiron", "goal-chiron-phase8-smoke", "chiron-window-1", "900"], iid="103",
-        actor="head-hermes", goal="goal-chiron-phase8-smoke",
-        text="Authorize only the Chiron success pilot window.",
+        args=["example-ops", "goal-example-ops-phase8-smoke", "example-ops-window-1", "900"], iid="103",
+        actor="head-hermes", goal="goal-example-ops-phase8-smoke",
+        text="Authorize only the Example-ops success pilot window.",
     )
     (f.root / "state/PAUSE").write_text("phase8-preflight\n", encoding="utf-8")
     result = f.run("python3", "scripts/project-pilot.py", "execute", str(decision))
@@ -405,7 +405,7 @@ def open_window(f: Fixture) -> bool:
 
 
 def test_window_admission(f: Fixture) -> bool:
-    sink = f.run(bash_executable(), "scripts/work.sh", "chiron-phase8-smoke")
+    sink = f.run(bash_executable(), "scripts/work.sh", "example-ops-phase8-smoke")
     if sink.returncode != 75:
         return False
     before = f.run("python3", "scripts/project-reconcile.py", "schedule")
@@ -413,7 +413,7 @@ def test_window_admission(f: Fixture) -> bool:
         return False
     # A matching duration in metadata is not human authority. The exact bound must be a
     # token in the instruction body itself.
-    f._write_instruction("109", "head-hermes", "authorize goal-chiron-phase8-smoke chiron-window-bad")
+    f._write_instruction("109", "head-hermes", "authorize goal-example-ops-phase8-smoke example-ops-window-bad")
     bad_instruction = f.root / "state/instructions/00000109.md"
     bad_instruction.write_text(
         bad_instruction.read_text(encoding="utf-8").replace("topic: 1", "topic: 900"),
@@ -421,24 +421,24 @@ def test_window_admission(f: Fixture) -> bool:
     )
     bad_decision = f.decision(
         verb="pilot-window-open",
-        args=["chiron", "goal-chiron-phase8-smoke", "chiron-window-bad", "900"], iid="109",
-        actor="head-hermes", goal="goal-chiron-phase8-smoke",
+        args=["example-ops", "goal-example-ops-phase8-smoke", "example-ops-window-bad", "900"], iid="109",
+        actor="head-hermes", goal="goal-example-ops-phase8-smoke",
         text="Metadata must not satisfy an omitted instruction-body bound.",
     )
     (f.root / "state/PAUSE").write_text("phase8-preflight\n", encoding="utf-8")
     bad = f.run("python3", "scripts/project-pilot.py", "execute", str(bad_decision))
     (f.root / "state/PAUSE").unlink(missing_ok=True)
-    if bad.returncode == 0 or (f.root / "state/pilot-windows/chiron-window-bad.json").exists():
+    if bad.returncode == 0 or (f.root / "state/pilot-windows/example-ops-window-bad.json").exists():
         return False
     f._write_instruction(
         "108", "head-hermes",
-        "For golden-stallion-client: Open pilot window chiron-window-wrong-project "
-        "for goal goal-chiron-phase8-smoke for 900 seconds.",
+        "For example-client: Open pilot window example-ops-window-wrong-project "
+        "for goal goal-example-ops-phase8-smoke for 900 seconds.",
     )
     wrong_project_decision = f.decision(
         verb="pilot-window-open",
-        args=["chiron", "goal-chiron-phase8-smoke", "chiron-window-wrong-project", "900"],
-        iid="108", actor="head-hermes", goal="goal-chiron-phase8-smoke",
+        args=["example-ops", "goal-example-ops-phase8-smoke", "example-ops-window-wrong-project", "900"],
+        iid="108", actor="head-hermes", goal="goal-example-ops-phase8-smoke",
         text="A different named project must not authorize this window.",
     )
     (f.root / "state/PAUSE").write_text("phase8-preflight\n", encoding="utf-8")
@@ -447,26 +447,26 @@ def test_window_admission(f: Fixture) -> bool:
     )
     (f.root / "state/PAUSE").unlink(missing_ok=True)
     if wrong_project.returncode == 0 \
-            or (f.root / "state/pilot-windows/chiron-window-wrong-project.json").exists():
+            or (f.root / "state/pilot-windows/example-ops-window-wrong-project.json").exists():
         return False
     gate_bytes = f.gate_path.read_bytes()
     f.gate_path.write_bytes(gate_bytes + b"// drift before window\n")
     drift_refused = open_window(f)
     f.gate_path.write_bytes(gate_bytes)
     (f.root / "state/PAUSE").unlink(missing_ok=True)
-    if drift_refused or (f.root / "state/pilot-windows/chiron-window-1.json").exists():
+    if drift_refused or (f.root / "state/pilot-windows/example-ops-window-1.json").exists():
         return False
     if not open_window(f):
         return False
     if "probe" not in f.provider_calls.read_text(encoding="utf-8").splitlines():
         return False
-    task_path = f.root / "state/tasks/chiron-phase8-smoke.md"
+    task_path = f.root / "state/tasks/example-ops-phase8-smoke.md"
     original_task = task_path.read_text(encoding="utf-8")
     task_path.write_text(original_task.replace(
         "acceptance: node user-client/render/tools/native-diff.cjs --metric",
         "acceptance: true"), encoding="utf-8")
     projection_refused = f.run("python3", "scripts/project-reconcile.py", "schedule")
-    armed = json.loads((f.root / "state/pilot-windows/chiron-window-1.json").read_text(encoding="utf-8"))
+    armed = json.loads((f.root / "state/pilot-windows/example-ops-window-1.json").read_text(encoding="utf-8"))
     task_path.write_text(original_task, encoding="utf-8")
     if projection_refused.returncode or projection_refused.stdout.strip() != "0" \
             or armed.get("status") != "armed":
@@ -476,12 +476,12 @@ def test_window_admission(f: Fixture) -> bool:
     rows = [json.loads(path.read_text(encoding="utf-8")) for path in (f.root / "state/decision-queue/pending").glob("*.json")]
     provider_after_schedule = f.provider_calls.read_text(encoding="utf-8").splitlines()
     admitted = f.run(
-        "python3", "scripts/project-reconcile.py", "admit-work", "chiron-phase8-smoke",
+        "python3", "scripts/project-reconcile.py", "admit-work", "example-ops-phase8-smoke",
     )
     provider_after_admit = f.provider_calls.read_text(encoding="utf-8").splitlines()
     heartbeat = f.run(
         "python3", "scripts/project-reconcile.py", "check-work-authority",
-        "chiron-phase8-smoke",
+        "example-ops-phase8-smoke",
     )
     provider_after_heartbeat = f.provider_calls.read_text(encoding="utf-8").splitlines()
     return (
@@ -492,15 +492,15 @@ def test_window_admission(f: Fixture) -> bool:
         and heartbeat.returncode == 0
         and provider_after_heartbeat == provider_after_admit
         and rows[0].get("verb") == "reconcile-goal"
-        and rows[0].get("args") == ["chiron", "goal-chiron-phase8-smoke"]
-        and rows[0].get("project") == "chiron"
+        and rows[0].get("args") == ["example-ops", "goal-example-ops-phase8-smoke"]
+        and rows[0].get("project") == "example-ops"
     )
 
 
 def test_pause_closes_window(f: Fixture) -> bool:
     (f.root / "state/PAUSE").write_text("phase8-test\n", encoding="utf-8")
     result = f.run("python3", "scripts/project-reconcile.py", "schedule")
-    window = f.root / "state/pilot-windows/chiron-window-1.json"
+    window = f.root / "state/pilot-windows/example-ops-window-1.json"
     if result.returncode or not window.is_file():
         return False
     value = json.loads(window.read_text(encoding="utf-8"))
@@ -509,21 +509,21 @@ def test_pause_closes_window(f: Fixture) -> bool:
 
 def test_assist_resume(f: Fixture) -> bool:
     (f.root / "state/PAUSE").unlink(missing_ok=True)
-    goal_path = f.root / "state/goals/goal-chiron-phase8-smoke.md"
-    task_path = f.root / "state/tasks/chiron-phase8-smoke.md"
+    goal_path = f.root / "state/goals/goal-example-ops-phase8-smoke.md"
+    task_path = f.root / "state/tasks/example-ops-phase8-smoke.md"
     goal_text = goal_path.read_text(encoding="utf-8").replace("status: active", "status: blocked")
     task_text = task_path.read_text(encoding="utf-8").replace("status: proposed", "status: blocked")
     goal_path.write_text(goal_text, encoding="utf-8")
     task_path.write_text(task_text + "blocked_on: ambiguous marker placement\n", encoding="utf-8")
-    (f.root / "state/assists/chiron-phase8-smoke.md").write_text(
-        "task: chiron-phase8-smoke\nkind: decision\nstatus: open\nasked: now\nasked_by: worker\n"
+    (f.root / "state/assists/example-ops-phase8-smoke.md").write_text(
+        "task: example-ops-phase8-smoke\nkind: decision\nstatus: open\nasked: now\nasked_by: worker\n"
         "answered:\nanswered_by:\n\n## QUESTION\nWhich marker?\n\n## WHAT WOULD SATISFY THIS\nA decision.\n"
         "\n## ANSWER\n_(unanswered)_\n",
         encoding="utf-8",
     )
 
 
-    assist_path = f.root / "state/assists/chiron-phase8-smoke.md"
+    assist_path = f.root / "state/assists/example-ops-phase8-smoke.md"
     assist_path.write_text(
         assist_path.read_text(encoding="utf-8")
         .replace("answered:\n", "answered: 2026-08-10T00:00:00Z\n")
@@ -531,23 +531,23 @@ def test_assist_resume(f: Fixture) -> bool:
         .replace("_(unanswered)_", "Use the marker after the canonical header."),
         encoding="utf-8",
     )
-    first = f.run("python3", "scripts/project-reconcile.py", "resume-assist", "chiron-phase8-smoke", "104")
-    second = f.run("python3", "scripts/project-reconcile.py", "resume-assist", "chiron-phase8-smoke", "104")
+    first = f.run("python3", "scripts/project-reconcile.py", "resume-assist", "example-ops-phase8-smoke", "104")
+    second = f.run("python3", "scripts/project-reconcile.py", "resume-assist", "example-ops-phase8-smoke", "104")
     events = []
     for line in (f.root / "state/events.jsonl").read_text(encoding="utf-8").splitlines():
         try:
             row = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if row.get("event") == "assist-answer" and row.get("task") == "chiron-phase8-smoke":
+        if row.get("event") == "assist-answer" and row.get("task") == "example-ops-phase8-smoke":
             events.append(row)
     return (
         first.returncode == 0 and second.returncode == 0
         and fields(goal_path).get("status") == "active"
         and fields(task_path).get("status") == "queued"
         and len(events) == 1
-        and events[0].get("project") == "chiron"
-        and events[0].get("goal") == "goal-chiron-phase8-smoke"
+        and events[0].get("project") == "example-ops"
+        and events[0].get("goal") == "goal-example-ops-phase8-smoke"
         and fields(assist_path).get("status") == "answered"
         and fields(assist_path).get("resume_applied") == "1"
     )
@@ -560,14 +560,14 @@ def test_seed_binding(_fixture: Fixture) -> bool:
     try:
         good.install_seed_contract()
         propose = good.decision(
-            verb="pilot-plan-propose", args=["chiron", good.plan_id], iid="101",
-            actor="pilot-chiron", goal=str(good.plan["goal"]["id"]), text="Bind the seed contract.",
+            verb="pilot-plan-propose", args=["example-ops", good.plan_id], iid="101",
+            actor="pilot-example-ops", goal=str(good.plan["goal"]["id"]), text="Bind the seed contract.",
             extra={"plan": good.plan},
         )
         result = good.run("python3", "scripts/project-pilot.py", "execute", str(propose))
         if result.returncode:
             return False
-        record = json.loads((good.root / f"state/plans/chiron/{good.plan_id}.json").read_text(encoding="utf-8"))
+        record = json.loads((good.root / f"state/plans/example-ops/{good.plan_id}.json").read_text(encoding="utf-8"))
         contract = record.get("plan", {}).get("seed_contract", {})
         digest = record.get("plan_digest", "")
         if not (
@@ -580,12 +580,12 @@ def test_seed_binding(_fixture: Fixture) -> bool:
             return False
         good._write_instruction("102", "head-hermes", f"approve {good.plan_id} {digest}")
         approve = good.decision(
-            verb="pilot-plan-approve", args=["chiron", good.plan_id, digest], iid="102",
+            verb="pilot-plan-approve", args=["example-ops", good.plan_id, digest], iid="102",
             actor="head-hermes", goal=str(good.plan["goal"]["id"]), text="Approve the bound seed plan.",
         )
         approved = good.run("python3", "scripts/project-pilot.py", "execute", str(approve))
-        goal = fields(good.root / "state/goals/goal-chiron-phase8-smoke.md")
-        task = fields(good.root / "state/tasks/chiron-phase8-smoke.md")
+        goal = fields(good.root / "state/goals/goal-example-ops-phase8-smoke.md")
+        task = fields(good.root / "state/tasks/example-ops-phase8-smoke.md")
         materialized = (
             approved.returncode == 0
             and goal.get("seed") == "data/corpus" == task.get("seed")
@@ -596,36 +596,36 @@ def test_seed_binding(_fixture: Fixture) -> bool:
 
         stale.install_seed_contract()
         stale_propose = stale.decision(
-            verb="pilot-plan-propose", args=["chiron", stale.plan_id], iid="101",
-            actor="pilot-chiron", goal=str(stale.plan["goal"]["id"]), text="Bind stale seed.",
+            verb="pilot-plan-propose", args=["example-ops", stale.plan_id], iid="101",
+            actor="pilot-example-ops", goal=str(stale.plan["goal"]["id"]), text="Bind stale seed.",
             extra={"plan": stale.plan},
         )
         if stale.run("python3", "scripts/project-pilot.py", "execute", str(stale_propose)).returncode:
             return False
         stale_record = json.loads(
-            (stale.root / f"state/plans/chiron/{stale.plan_id}.json").read_text(encoding="utf-8")
+            (stale.root / f"state/plans/example-ops/{stale.plan_id}.json").read_text(encoding="utf-8")
         )
         stale_digest = stale_record["plan_digest"]
         (stale.project / "data/corpus/oracle.bin").write_bytes(b"changed after proposal\n")
         stale._write_instruction("102", "head-hermes", f"approve {stale.plan_id} {stale_digest}")
         stale_approve = stale.decision(
-            verb="pilot-plan-approve", args=["chiron", stale.plan_id, stale_digest], iid="102",
+            verb="pilot-plan-approve", args=["example-ops", stale.plan_id, stale_digest], iid="102",
             actor="head-hermes", goal=str(stale.plan["goal"]["id"]), text="Must refuse drift.",
         )
         drift_refused = (
             stale.run("python3", "scripts/project-pilot.py", "execute", str(stale_approve)).returncode != 0
-            and not (stale.root / "state/goals/goal-chiron-phase8-smoke.md").exists()
+            and not (stale.root / "state/goals/goal-example-ops-phase8-smoke.md").exists()
         )
 
         hostile.install_seed_contract("data/corpus\ndata/corpus\n")
         hostile_plan = hostile.decision(
-            verb="pilot-plan-propose", args=["chiron", hostile.plan_id], iid="101",
-            actor="pilot-chiron", goal=str(hostile.plan["goal"]["id"]), text="Must refuse duplicate seed.",
+            verb="pilot-plan-propose", args=["example-ops", hostile.plan_id], iid="101",
+            actor="pilot-example-ops", goal=str(hostile.plan["goal"]["id"]), text="Must refuse duplicate seed.",
             extra={"plan": hostile.plan},
         )
         duplicate_refused = (
             hostile.run("python3", "scripts/project-pilot.py", "execute", str(hostile_plan)).returncode != 0
-            and not (hostile.root / f"state/plans/chiron/{hostile.plan_id}.json").exists()
+            and not (hostile.root / f"state/plans/example-ops/{hostile.plan_id}.json").exists()
         )
         return materialized and drift_refused and duplicate_refused
     finally:
@@ -636,13 +636,13 @@ def test_source_and_provider_admission(_fixture: Fixture) -> bool:
     stale = Fixture(); provider = Fixture()
     try:
         proposed = stale.decision(
-            verb="pilot-plan-propose", args=["chiron", stale.plan_id], iid="101",
-            actor="pilot-chiron", goal=str(stale.plan["goal"]["id"]), text="Bind source HEAD.",
+            verb="pilot-plan-propose", args=["example-ops", stale.plan_id], iid="101",
+            actor="pilot-example-ops", goal=str(stale.plan["goal"]["id"]), text="Bind source HEAD.",
             extra={"plan": stale.plan},
         )
         if stale.run("python3", "scripts/project-pilot.py", "execute", str(proposed)).returncode:
             return False
-        record = json.loads((stale.root / f"state/plans/chiron/{stale.plan_id}.json").read_text())
+        record = json.loads((stale.root / f"state/plans/example-ops/{stale.plan_id}.json").read_text())
         digest = record["plan_digest"]
         implementation = stale.repo / "user-client/render/shade-tops.js"
         implementation.write_text("export const shadeTops = true;\n", encoding="utf-8")
@@ -652,12 +652,12 @@ def test_source_and_provider_admission(_fixture: Fixture) -> bool:
                         "user.email=fixture@example.invalid", "commit", "-qm", "source drift"], check=True)
         stale._write_instruction("102", "head-hermes", f"approve {stale.plan_id} {digest}")
         approval = stale.decision(
-            verb="pilot-plan-approve", args=["chiron", stale.plan_id, digest], iid="102",
+            verb="pilot-plan-approve", args=["example-ops", stale.plan_id, digest], iid="102",
             actor="head-hermes", goal=str(stale.plan["goal"]["id"]), text="Refuse stale source.",
         )
         source_refused = stale.run(
             "python3", "scripts/project-pilot.py", "execute", str(approval),
-        ).returncode != 0 and not (stale.root / "state/goals/goal-chiron-phase8-smoke.md").exists()
+        ).returncode != 0 and not (stale.root / "state/goals/goal-example-ops-phase8-smoke.md").exists()
 
         if not test_fresh_plan(provider) or not test_approval(provider):
             return False
@@ -665,7 +665,7 @@ def test_source_and_provider_admission(_fixture: Fixture) -> bool:
             "#!/usr/bin/env bash\nexit 96\n", encoding="utf-8",
         )
         capability_refused = not open_window(provider) \
-            and not (provider.root / "state/pilot-windows/chiron-window-1.json").exists()
+            and not (provider.root / "state/pilot-windows/example-ops-window-1.json").exists()
         return source_refused and capability_refused
     finally:
         stale.close(); provider.close()
@@ -674,8 +674,8 @@ def test_source_and_provider_admission(_fixture: Fixture) -> bool:
 def test_required_gate_profile(_fixture: Fixture) -> bool:
     fixture = Fixture()
     try:
-        config_path = fixture.root / "state/project-config/chiron.json"
-        pilot_path = fixture.root / "state/pilots/pilot-chiron.json"
+        config_path = fixture.root / "state/project-config/example-ops.json"
+        pilot_path = fixture.root / "state/pilots/pilot-example-ops.json"
         config = json.loads(config_path.read_text(encoding="utf-8"))
         pilot = json.loads(pilot_path.read_text(encoding="utf-8"))
         required = {
@@ -686,29 +686,29 @@ def test_required_gate_profile(_fixture: Fixture) -> bool:
         }
         config["required_gate_profile"] = required
         pilot["required_gate_profile"] = required
-        fixture.write_json("state/project-config/chiron.json", config)
-        fixture.write_json("state/pilots/pilot-chiron.json", pilot)
+        fixture.write_json("state/project-config/example-ops.json", config)
+        fixture.write_json("state/pilots/pilot-example-ops.json", pilot)
 
         substitute = json.loads(json.dumps(fixture.plan))
         substitute["goal"]["acceptance_suite"] = "node user-client/render/tools/native-diff.cjs --other-profile"
         substitute["tasks"][0]["acceptance"] = substitute["goal"]["acceptance_suite"]
         decision = fixture.decision(
-            verb="pilot-plan-propose", args=["chiron", fixture.plan_id], iid="101",
-            actor="pilot-chiron", goal=str(substitute["goal"]["id"]), text="Try a substitute gate.",
+            verb="pilot-plan-propose", args=["example-ops", fixture.plan_id], iid="101",
+            actor="pilot-example-ops", goal=str(substitute["goal"]["id"]), text="Try a substitute gate.",
             extra={"plan": substitute},
         )
         refused = fixture.run(
             "python3", "scripts/project-pilot.py", "execute", str(decision),
-        ).returncode != 0 and not (fixture.root / f"state/plans/chiron/{fixture.plan_id}.json").exists()
+        ).returncode != 0 and not (fixture.root / f"state/plans/example-ops/{fixture.plan_id}.json").exists()
 
         good = fixture.decision(
-            verb="pilot-plan-propose", args=["chiron", fixture.plan_id], iid="101",
-            actor="pilot-chiron", goal=str(fixture.plan["goal"]["id"]), text="Use the exact gate.",
+            verb="pilot-plan-propose", args=["example-ops", fixture.plan_id], iid="101",
+            actor="pilot-example-ops", goal=str(fixture.plan["goal"]["id"]), text="Use the exact gate.",
             extra={"plan": fixture.plan},
         )
         accepted = fixture.run(
             "python3", "scripts/project-pilot.py", "execute", str(good),
-        ).returncode == 0 and (fixture.root / f"state/plans/chiron/{fixture.plan_id}.json").is_file()
+        ).returncode == 0 and (fixture.root / f"state/plans/example-ops/{fixture.plan_id}.json").is_file()
         return refused and accepted
     finally:
         fixture.close()

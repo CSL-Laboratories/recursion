@@ -12,15 +12,15 @@ related:
 
 # Parallel loops
 
-**Goal (roadmap item 1b).** Build the *capacity* to run several workstreams at once — `chiron`,
-`gsc`, and future ones — before we load heavy work (GSC) onto the box. Today execution is SERIAL:
+**Goal (roadmap item 1b).** Build the *capacity* to run several workstreams at once before we load
+heavy work onto the box. Today execution is SERIAL:
 one global `state/.work.lock` means one `work.sh` across the whole box, and `drain.sh` runs queued
 tasks strictly one at a time. The subs are $0 and under-loaded, so **capacity is the constraint, not
 cost** (Lucas, 2026-08-05).
 
 **Granularity: one build per WORKSTREAM, N workstreams at once.** Not "N of the same workstream" —
-chiron pages must serialize (page N+1 builds on page N's merged base; see the build-chain bootstrap
-rule), and GSC gaps share a native-diff baseline. The parallelism that is safe and wanted is
+tasks in one workstream must serialize (step N+1 builds on step N's merged base; see the build-chain
+bootstrap rule), and tasks that share a baseline must serialize. The parallelism that is safe and wanted is
 *across* workstreams. So the unit of concurrency is the workstream.
 
 ## Design (extends the proven serial code; does not fork it)
@@ -46,8 +46,7 @@ commit attribution is coarse. Acceptable for a ledger.
 `mk_worktree` runs `git worktree remove/prune/add` + a `fetch` on `REPO_DIR`. Two workstreams that
 share a repo (e.g. two recursion-internal streams both in `$ROOT`) could race git's ref/index locks.
 Guard those ops with `state/.locks/wt-<hash(REPO_DIR)>.lock` (released right after `worktree add`,
-before seeding). Cross-repo streams (chiron in `$ROOT`, gsc in `/opt/golden-stallion-client`) never
-contend, so this only bites the same-repo case.
+  before seeding). Cross-repo streams never contend, so this only bites the same-repo case.
 
 ### 4. `conduct.sh` — the parallel continuation engine (new; drain.sh stays as the serial fallback)
 - Launches up to `RECURSION_CONDUCT_CONCURRENCY` (default **2**) builds at once, **at most one per
@@ -60,7 +59,7 @@ contend, so this only bites the same-repo case.
   while slots + budget remain → sleep. On stop, let in-flight builds finish (bounded), then reap.
 - **Concurrency default is 2, not `nproc-2`.** The box has 2 cores, but the arms are *remote-API*
   bound (`claude -p`, delegate), not local-CPU bound, so cores don't gate throughput; the real cap is
-  the number of workstreams with queued work (chiron + gsc = 2 today). Tune via the env var.
+  the number of workstreams with queued work. Tune via the env var.
 
 ### 5. Wiring (human-gated, rule 3)
 - `bin/recursion` gains a `conduct` verb.

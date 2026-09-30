@@ -200,10 +200,10 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertEqual(task["source_sha"], self.source)
         with self.assertRaisesRegex(rc.ContractError, "exact source_sha"):
             rc.admit_task(self.contract, {"id": "task-two", "source_branch": "main"}, self.repo)
-        with self.assertRaisesRegex(rc.ContractError, "apps/chiron"):
+        with self.assertRaisesRegex(rc.ContractError, "apps/example-ops"):
             rc.admit_task(self.contract, {
                 "id": "task-three", "source_branch": "main", "source_sha": self.source,
-                "allowed_paths": ["apps/chiron"],
+                "allowed_paths": ["apps/example-ops"],
             }, self.repo)
         with self.assertRaisesRegex(rc.ContractError, "widens"):
             rc.admit_task(self.contract, {
@@ -298,8 +298,8 @@ class RepositoryContractTests(unittest.TestCase):
 
     def test_gate_profile_compares_resolved_paths_but_rejects_a_divergent_gate(self) -> None:
         controller_root = Path(__file__).parents[2].resolve()
-        script = "scripts/gsc-shade-tops-gate.py"
-        profile_path = "scripts/gates/gsc-shade-tops-v1.json"
+        script = "scripts/sample-shade-tops-gate.py"
+        profile_path = "scripts/gates/sample-shade-tops-v1.json"
         relative = f"python3 {script} --repo . --profile {profile_path}"
         absolute = f"{controller_root / script} --repo . --profile {controller_root / profile_path}"
         profile = {"acceptance": absolute, "gate_class": "heavy", "gate_files": [],
@@ -393,20 +393,20 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertEqual(rc.branch_kind(self.contract, "cursor/task-one"), "external")
         self.assertEqual(rc.task_branch(self.contract, "task-one"), "recursion/task/task-one")
 
-    def test_all_new_generation_fields_reject_legacy_chiron(self) -> None:
+    def test_all_new_generation_fields_reject_legacy_example_ops(self) -> None:
         for field in ("workdir", "acceptance", "gate_command", "gate_commands", "seed", "goal"):
             task = {"id": "task-one", "source_branch": "main", "source_sha": self.source,
-                    "allowed_paths": ["src"], field: ".\\apps\\chiron/"}
+                    "allowed_paths": ["src"], field: ".\\apps\\example-ops/"}
             if field == "gate_commands":
                 task[field] = [task[field]]
-            with self.subTest(field=field), self.assertRaisesRegex(rc.ContractError, "apps/chiron"):
+            with self.subTest(field=field), self.assertRaisesRegex(rc.ContractError, "apps/example-ops"):
                 rc.admit_task(self.contract, task, self.repo)
         punctuation = {"id": "task-one", "source_branch": "main", "source_sha": self.source,
-                       "allowed_paths": ["src"], "acceptance": "cd apps/chiron;)&|"}
-        with self.assertRaisesRegex(rc.ContractError, "apps/chiron"):
+                       "allowed_paths": ["src"], "acceptance": "cd apps/example-ops;)&|"}
+        with self.assertRaisesRegex(rc.ContractError, "apps/example-ops"):
             rc.admit_task(self.contract, punctuation, self.repo)
-        dotted = dict(punctuation, acceptance="cd apps/./chiron;", goal="safe")
-        with self.assertRaisesRegex(rc.ContractError, "apps/chiron"):
+        dotted = dict(punctuation, acceptance="cd apps/./example-ops;", goal="safe")
+        with self.assertRaisesRegex(rc.ContractError, "apps/example-ops"):
             rc.admit_task(self.contract, dotted, self.repo)
 
     def test_verified_import_is_idempotent_and_cas(self) -> None:
@@ -576,7 +576,7 @@ class RepositoryContractTests(unittest.TestCase):
     def test_malformed_task_fields_are_typed_before_legacy_guard(self) -> None:
         for field in ("acceptance", "goal", "workdir", "gate_command", "seed"):
             task = {"id": "task-one", "source_branch": "main", "source_sha": self.source,
-                    "allowed_paths": ["src"], field: {"apps/chiron": True}}
+                    "allowed_paths": ["src"], field: {"apps/example-ops": True}}
             with self.subTest(field=field), self.assertRaisesRegex(rc.ContractError, "must be a string"):
                 rc.admit_task(self.contract, task, self.repo)
 

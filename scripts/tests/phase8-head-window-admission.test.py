@@ -28,8 +28,8 @@ import pilot_instruction  # noqa: E402
 
 
 INSTRUCTION_BODY = (
-    "Open pilot window window-gsc-pilot-5 for golden-stallion-client, "
-    "goal goal-gsc-0x6c-shadetops-underemission-v2, for 14400 seconds."
+    "Open pilot window window-sample-pilot-5 for example-client, "
+    "goal goal-sample-0x6c-shadetops-underemission-v2, for 14400 seconds."
 )
 OLD_FAILURE = (
     "project-pilot: Lucas instruction does not name the exact Phase 8 command and bounds"
@@ -58,11 +58,11 @@ class HeadWindowAdmissionTest(unittest.TestCase):
         ):
             shutil.copy2(SOURCE / "scripts" / name, self.root / "scripts" / name)
         (self.root / "state/PAUSE").write_text("paused for deterministic admission control\n", encoding="utf-8")
-        (self.root / "state/project-config/golden-stallion-client.json").write_text(
+        (self.root / "state/project-config/example-client.json").write_text(
             json.dumps({
                 "schema_version": 1,
-                "id": "golden-stallion-client",
-                "pilot_id": "pilot-golden-stallion-client",
+                "id": "example-client",
+                "pilot_id": "pilot-example-client",
                 "status": "active",
             }),
             encoding="utf-8",
@@ -132,9 +132,9 @@ class HeadWindowAdmissionTest(unittest.TestCase):
         self.assertIsNotNone(result)
         decision = result["decision"]
         expected = [
-            "golden-stallion-client",
-            "goal-gsc-0x6c-shadetops-underemission-v2",
-            "window-gsc-pilot-5",
+            "example-client",
+            "goal-sample-0x6c-shadetops-underemission-v2",
+            "window-sample-pilot-5",
             "14400",
         ]
         self.assertEqual(decision["actor"], "head-hermes")
@@ -213,10 +213,10 @@ class HeadWindowAdmissionTest(unittest.TestCase):
             "verb": "escalate",
             "args": [
                 "pilot-window-command-binding",
-                "Authorize exact pilot-window-open command for golden-stallion-client",
+                "Authorize exact pilot-window-open command for example-client",
             ],
-            "project": "golden-stallion-client",
-            "goal": "goal-gsc-0x6c-shadetops-underemission-v2",
+            "project": "example-client",
+            "goal": "goal-sample-0x6c-shadetops-underemission-v2",
             "wrong_if": "The actuator accepts instruction 920 without a corrected instruction.",
         }
         run = subprocess.run(
@@ -253,11 +253,11 @@ class HeadWindowAdmissionTest(unittest.TestCase):
 
     def test_noncanonical_bound_tokens_never_enter_the_exact_parser(self) -> None:
         variants = [
-            INSTRUCTION_BODY.replace("window-gsc-pilot-5", "window-gsc-pilot-5'"),
-            INSTRUCTION_BODY.replace("golden-stallion-client,", "golden-stallion-client',"),
+            INSTRUCTION_BODY.replace("window-sample-pilot-5", "window-sample-pilot-5'"),
+            INSTRUCTION_BODY.replace("example-client,", "example-client',"),
             INSTRUCTION_BODY.replace(
-                "goal-gsc-0x6c-shadetops-underemission-v2,",
-                "goal-gsc-0x6c-shadetops-underemission-v2',",
+                "goal-sample-0x6c-shadetops-underemission-v2,",
+                "goal-sample-0x6c-shadetops-underemission-v2',",
             ),
             INSTRUCTION_BODY.replace("14400 seconds", "14400' seconds"),
             INSTRUCTION_BODY.replace("14400 seconds", "86401 seconds"),

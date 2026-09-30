@@ -18,8 +18,8 @@ adversarial ledger, artifact, dependency, reservation and cancellation tests;
 review of frozen implementation bytes with retained model identity and response;
 findings disposition; clean candidate and review-branch publication.
 
-Reuse cockpit PR86's frozen briefs, domain coordination, unique attempt filings,
-separate synthesis and preserved dissent. Do not import cockpit financial policy.
+Reuse a prior fleet PR86's frozen briefs, domain coordination, unique attempt filings,
+separate synthesis and preserved dissent. Do not import that fleet's financial policy.
 Current implementation deliberately brokers model reasoning as tool-denied packets;
 proposed code is staged separately and executed only in an isolated test job.
 Neither model-written PASS nor a schema-valid filing is independent acceptance.

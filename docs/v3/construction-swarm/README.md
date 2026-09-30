@@ -1,6 +1,6 @@
 # Build Recursion with a construction swarm
 
-This tool applies cockpit PR86's method to **building Recursion**. It is not a
+This tool applies that prior fleet PR86's method to **building Recursion**. It is not a
 Recursion runtime integration, does not select v3's product language/store, and
 does not operate the portfolio. Lucas owns objectives and merges; the current
 authorized lead supplies packets, reviews results, and integrates changes.

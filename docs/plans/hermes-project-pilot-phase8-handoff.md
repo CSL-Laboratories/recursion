@@ -30,7 +30,7 @@ related:
 - `hermes-actuator`, `hermes-gateway`, `cron`, `recursion-provider-network`, and
   `recursion-provider-proxy` are active and enabled with zero restarts. Pending/running
   decisions, worker units, and matching worker processes are all zero.
-- Expired `window-gsc-pilot-1` was lawfully closed by instruction 699 and remains closed.
+- The expired v1 pilot window was lawfully closed by instruction 699 and remains closed.
   It must never be reused.
 - Fresh-plan instruction 707 was accidentally routed to Head Hermes because incidental
   wording matched the broad deployment routing expression. Two supervised Head Hermes
@@ -86,15 +86,14 @@ deployed" describe their capture time and are superseded by the snapshot above.
 The exact commands, OIDs, results, live snapshot, GitHub inventory, rollback gates, and raw-log
 hashes are appended to `docs/plans/hermes-project-pilot-phase0-evidence.md`.
 
-## Why the previous Chiron plan is not executable
+## Why any previous plan is not executable
 
-The production Chiron registry still contains the pre-Phase-8 goal
-`goal-chiron-learning-shell` and legacy tasks `chiron-001` through `chiron-003`. That state predates
-the Hermes plan-synthesis contract and is not a valid autonomous Phase 8 plan. Phase 8 therefore
-does not reopen, reinterpret, or silently upgrade it.
+Any pre-Phase-8 goal or legacy task state predates the Hermes plan-synthesis contract and is not a
+valid autonomous Phase 8 plan. Phase 8 therefore does not reopen, reinterpret, or silently upgrade
+it.
 
-A Chiron pilot can begin only from a fresh Lucas instruction that produces a new, schema-complete
-plan with new plan, goal, and task identities. The plan must contain:
+A pilot can begin only from a fresh Lucas instruction that produces a new, schema-complete plan
+with new plan, goal, and task identities. The plan must contain:
 
 - a bounded Phase 6 budget and complete Phase 5 worker/verifier task envelopes;
 - an acyclic dependency graph, exact allowed paths, and explicit non-goals;
@@ -150,7 +149,7 @@ The implementation provides:
 - backup coverage for plans, windows, decisions, actions, goals, tasks, assists, runs, events,
   reports, and delivery state.
 
-The checked-in Chiron and golden-stallion-client pilot records gain only
+The checked-in pilot records gain only
 `"window_required": true`. Their production concurrency remains zero. No model alias or global
 concurrency value was configured.
 
@@ -187,7 +186,7 @@ The final snapshot at `2026-08-08T17:18:24Z` found:
 | workers | zero `recursion-worker-*` units; zero active project-worktree processes |
 | delivery state | zero notification events and zero deliveries for all nine registered projects |
 | pending execution | no decision/action/run/lease directories and no pending/running decision or action files |
-| pilot capacity | Chiron and GSC `concurrency_limit=0`, `max_inflight_workers=0`, publication false |
+| pilot capacity | every pilot `concurrency_limit=0`, `max_inflight_workers=0`, publication false |
 | runtime routing | `RECURSION_PILOT_MODEL`, `RECURSION_DECIDE_MODEL`, and `RECURSION_PILOT_GLOBAL_CONCURRENCY` unset |
 | live Phase 1 audit | return `1` with exactly the two known deployment gates: unrestricted/root gateway and advisories in `aiohttp==3.14.1` plus `cryptography==48.0.1` |
 | branch protection | authenticated protection endpoint returned HTTP 403 for every registered repository; none is verifiably protected |
@@ -211,18 +210,6 @@ Phase 8 implementation are deployment and pilot gates, not waivers.
 > gates are the unset pilot model alias, zero configured capacity, and the undeployed
 > Phase 8 code.
 
-## Santa Clara repository evidence
-
-GitHub reports `NotSkittlz/santa-clara-construction` as a private, unarchived repository with
-default branch `main`, size zero, and this account holding admin/push access. Its deploy-key endpoint
-contains one verified writable key titled `gs-recursion`, created `2026-08-06T08:00:05Z`.
-
-On `gs-recursion`, `/root/.ssh/santa-clara-construction_deploy` is readable, has ED25519 fingerprint
-`SHA256:AioH/xSd+WQNtGNqvSjKLJQwbWf74Dgo5lNOFqyp4lk`, and authenticates to GitHub specifically as
-`NotSkittlz/santa-clara-construction`. No key bytes were printed. The remote is empty, and the
-project has no topic, goal, or actionable charter, so it correctly remains pending with concurrency
-zero. Phase 8 did not clone or activate it.
-
 ## Rollback gates for future authorized actions
 
 Every item below is a runbook, not current authorization. Before each action, recapture the exact
@@ -235,15 +222,15 @@ becomes the rollback OID only after the same read-only checks pass.
    supervisor and all worker units, restore the pre-deploy snapshot into staging and verify its
    manifest, then deploy a reviewed inverse commit returning the code to the captured pre-deploy
    OID/tree. Never reset, force-push, or use the dirty local master.
-2. **Chiron success window.** PAUSE is removed only after the new plan digest and exact goal/window
+2. **Success window.** PAUSE is removed only after the new plan digest and exact goal/window
    instruction are recorded. Rollback is to restore the same 189-byte PAUSE file and verify its
    SHA-256, observe automatic window closure, terminate/verify zero worker units, leave any review
    branch unmerged, and reconcile the goal to a deterministic stopped state. Restore the pre-window
    runtime snapshot if any chain object is missing or duplicated.
-3. **Chiron assist window.** Use a distinct exact-goal window. Rollback is identical, plus prove the
+3. **Assist window.** Use a distinct exact-goal window. Rollback is identical, plus prove the
    assist and instruction remain durably correlated and the task has not resumed more than once.
    Never fabricate an answer or create a replacement task.
-4. **GSC offline window.** Capture the product HEAD plus hashes of the conformance/native-diff gate,
+4. **Offline window.** Capture the product HEAD plus hashes of the conformance/native-diff gate,
    tests, fixtures, oracle, baseline, and corpus manifest first. On any hash change or live-game
    dependency, reassert PAUSE, close the window, terminate the worker, leave the review branch
    unmerged, restore runtime state if required, and reject the result. Do not rewrite a baseline to
@@ -265,7 +252,7 @@ evidence is a no-go for the next window.
 
 ## Authorization boundary and next action
 
-Lucas approved the Phase 8 implementation plan and replacement of the old Chiron plan shape,
+Lucas approved the Phase 8 implementation plan and replacement of the old plan shape,
 reviewed and merged the implementation and evidence branches, and separately authorized one fresh
 PAUSE-held actuator deployment. That production authorization did not include a retry, data
 migration, compatibility repair, configuration/capacity change, PAUSE removal, human-visible
@@ -277,7 +264,7 @@ invalid decisions, deterministically handle already-existing legacy no-op record
 failure in actuator evidence, and include a live-journal-shaped regression proving the current
 valid PAUSE-safe no-op executes exactly once. Only after that patch is reviewed, merged, and
 pruned may a fresh preflight and separately authorized deployment retry be proposed. The first
-Chiron window still additionally requires deployed Phase 8 code, a configured human-owned pilot
+first pilot window still additionally requires deployed Phase 8 code, a configured human-owned pilot
 model alias and bounded capacity, a fresh Lucas goal instruction, exact plan-digest approval, and
 exact window authorization.
 
@@ -315,14 +302,13 @@ billing setting was changed.
 
 Lucas subsequently activated personal GitHub Pro and explicitly authorized protection for every
 initialized personal repository. Classic rules now protect `recursion/master` plus the `main`
-branches of `golden-stallion`, `golden-stallion-extension`, `golden-stallion-client`,
-`ai-investment-cockpit`, `edgar-morning-brew`, `guerra-construction-group`, and `chiron`.
+branches of the other initialized repositories.
 
 All eight persisted rules were re-opened and field-audited: pull requests required; approval count
 not required to avoid a one-user deadlock; conversations resolved; administrators unable to
 bypass; force pushes and deletions disabled; status, signature, deployment, linear-history, and
-lock requirements inactive. The empty Santa Clara repository remains deferred until its first
-`main` branch. No organization budget or billing setting was changed.
+lock requirements inactive. The one empty repository remains deferred until its first `main`
+branch. No organization budget or billing setting was changed.
 
 The initialized-project branch-protection gate is closed. Remaining pre-deployment gates are the
 two unchanged live Phase 1 findings. After those are remediated through a reviewed, PAUSE-held
@@ -1671,7 +1657,7 @@ Hermes one was stale.
 if record["max_inflight_workers"] < 1: fail("pilot window has zero worker capacity")
 ```
 
-`pilot-golden-stallion-client.json` has `concurrency_limit: 0` **and**
+The chosen pilot record has `concurrency_limit: 0` **and**
 `budget.max_inflight_workers: 0`. The earlier note in this document ("raise that pilot's
 `max_inflight_workers` to 1") is half the fix -- the `min()` still yields 0. A third bound
 applies at dispatch: `project-reconcile.py` takes `min(concurrency_limit, max_inflight_workers,
@@ -1719,7 +1705,7 @@ One line changed; the brief, cycle and watch entries are byte-identical to the b
 fire is `06:45Z`. **Restoring the reviewed value was preferred over inventing a third schedule**
 - the drift is what caused the defect.
 
-**B3.** `pilot-golden-stallion-client.json`, the two fields the `min()` reads:
+**B3.** The chosen pilot record, the two fields the `min()` reads:
 
 ```diff
 -  "concurrency_limit": 0,

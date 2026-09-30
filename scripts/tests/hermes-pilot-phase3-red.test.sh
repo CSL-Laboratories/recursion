@@ -74,13 +74,13 @@ printf '%s|%s|%s\n' "$1" "$2" "$3" > "$AUTHOR_LOG"
 STUB
 chmod +x "$A/scripts/"*.sh
 cat > "$TMP/author.json" <<'J'
-{"id":"author-1","verb":"roadmap-add","args":["chiron"],"text":"add a reviewed pilot control","goal":"g","wrong_if":"text lost"}
+{"id":"author-1","verb":"roadmap-add","args":["example-ops"],"text":"add a reviewed pilot control","goal":"g","wrong_if":"text lost"}
 J
 normalize_head_decision "$A" "$TMP/author.json"
 ( cd "$A" && AUTHOR_LOG="$TMP/author.log" RECURSION_ROOT="$A" \
     bash scripts/conduct-hermes.sh --file "$TMP/author.json" ) >"$TMP/author.out" 2>&1
 author_rc=$?
-if [ "$author_rc" -eq 0 ] && grep -qF 'roadmap-add|chiron|add a reviewed pilot control' "$TMP/author.log" 2>/dev/null; then
+if [ "$author_rc" -eq 0 ] && grep -qF 'roadmap-add|example-ops|add a reviewed pilot control' "$TMP/author.log" 2>/dev/null; then
   ok "validated authoring text reached the sole actuator"
 else
   no "validated authoring text was dropped before actuation (rc=$author_rc)"
@@ -101,7 +101,7 @@ from: principal
 status: open
 
 ## INSTRUCTION
-plan chiron
+plan example-ops
 T
 ( cd "$I" && RECURSION_ROOT="$I" bash scripts/intake.sh handled 42 'done' ) >"$TMP/handled.out" 2>&1
 handled_rc=$?

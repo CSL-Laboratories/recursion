@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# intake.sh — the inbound half of the cockpit: what Lucas SAYS becomes durable state.
+# intake.sh — the inbound half of the dashboard: what Lucas SAYS becomes durable state.
 #
 # Until now Telegram was one-directional. notify.sh could page him; nothing could hear him back.
 # So every instruction — "set up this project", "deprioritise that", "yes, do it" — had to be

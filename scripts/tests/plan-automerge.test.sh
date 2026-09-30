@@ -3,7 +3,7 @@
 #
 # WHY. `automerge:` on a task is the one field that can turn a review-branch loop into a
 # default-branch writer, and it never came from a human decision — plan.sh COPIED it out of a
-# roadmap header. That is how chiron-001 and chiron-003 ended up `status: passed` with
+# roadmap header. That is how example-ops-001 and example-ops-003 ended up `status: passed` with
 # `automerge: yes`: somebody edited a roadmap, and the planner promoted a scope note into a
 # permission. Roadmaps say WHAT to build; they do not grant authority.
 #

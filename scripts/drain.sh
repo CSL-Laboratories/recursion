@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # drain.sh — the continuation engine. Runs QUEUED tasks one at a time (any workstream) until the
 # queue is empty or a bound trips. This is what lets the loop keep going after a review/merge
-# without a human hand-running each task. Generic successor to gsc-overnight.sh.
+# without a human hand-running each task.
 #
 # Bounds (so it can never run away / grind Max quota):
 #   - RECURSION_DRAIN_MAX      max tasks per run           (default 6)

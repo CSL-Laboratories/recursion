@@ -26,7 +26,7 @@ commands remain available under PAUSE; mutating commands never alter state direc
 | `/status` | PAUSE state and active work |
 | `/why` | recorded decision rationale |
 | `/next` | next eligible work |
-| `/chiron` | exact canonical ref, source SHA, readiness, and blockers |
+| `/project` | exact canonical ref, source SHA, readiness, and blockers |
 | `/budget` | quota, worker/review capacity, observed spend, and no-metered-spend posture |
 | `/pause` | authenticated Lucas-only intent for the canonical actuator |
 | `/resume` | authenticated, approval-required intent held locally while PAUSE remains present |

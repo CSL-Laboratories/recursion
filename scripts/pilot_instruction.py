@@ -26,7 +26,7 @@ OPPOSITE_PATTERN = {
     ),
 }
 # Apostrophes keep contractions intact. Dots, slashes, and hyphens keep authority identifiers
-# intact so a word embedded in (for example) ``chiron-window-close`` is never treated as prose.
+# intact so a word embedded in (for example) ``project-window-close`` is never treated as prose.
 TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/'-]{0,127}")
 AUTHORITY_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 

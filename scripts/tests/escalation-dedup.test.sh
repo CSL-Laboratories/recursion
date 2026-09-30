@@ -60,26 +60,26 @@ export STUB_NOTIFY_LOG="$TMP/notify.log"; : > "$STUB_NOTIFY_LOG"
 # distinct asks.
 FIX="$TMP/fixtures"; mkdir -p "$FIX"
 cat > "$FIX/1" <<'F'
-## 2026-08-06 00:15 — Approve the Cubic Castles native-diff acceptance frontier
-**Workstream:** cubic-castles
-**Pointer:** scripts/gsc-nativediff-gate.sh
+## 2026-08-06 00:15 — Approve the Example-game native-diff acceptance frontier
+**Workstream:** example-game
+**Pointer:** scripts/sample-nativediff-gate.sh
 **Blocked on:** human approval of the numeric native-mesh error metric
 F
 cat > "$FIX/2" <<'F'
-## 2026-08-06 03:15 — Approve the Cubic Castles native-diff acceptance frontier
-**Workstream:** cubic-castles
-**Pointer:** scripts/gsc-nativediff-gate.sh
+## 2026-08-06 03:15 — Approve the Example-game native-diff acceptance frontier
+**Workstream:** example-game
+**Pointer:** scripts/sample-nativediff-gate.sh
 **Blocked on:** Human approval of the numeric native-mesh error metric
 F
 cat > "$FIX/3" <<'F'
-## 2026-08-06 06:15 — Approve the Cubic Castles native-diff acceptance frontier
-**Workstream:** cubic-castles
-**Pointer:** state/roadmaps/gsc-renderer.md
+## 2026-08-06 06:15 — Approve the Example-game native-diff acceptance frontier
+**Workstream:** example-game
+**Pointer:** state/roadmaps/sample-renderer.md
 **Blocked on:** Human approval of the numeric native-mesh error metric
 F
 cat > "$FIX/4" <<'F'
 ## 2026-08-06 09:15 — Provision a clean proxy for the warp soak
-**Workstream:** golden-stallion
+**Workstream:** example-project
 **Pointer:** docs/plans/warp.md
 **Blocked on:** spend approval
 F
@@ -109,7 +109,7 @@ run_with "$FIX/2"
 run_with "$FIX/3"
 
 # --- 1) ★ the three identical asks collapse to ONE inbox entry -----------------------------
-n="$(grep -c 'Approve the Cubic Castles native-diff acceptance frontier' "$R/state/INBOX.md" || true)"
+n="$(grep -c 'Approve the Example-game native-diff acceptance frontier' "$R/state/INBOX.md" || true)"
 if [ "$n" = "1" ]; then
   ok "★ three cycles of the SAME ask -> 1 INBOX entry (was 4 on the live box)"
 else
@@ -147,7 +147,7 @@ fi
 EID="$(awk -F'\t' 'NR>1 && $9 ~ /native-diff acceptance frontier/ {print $1; exit}' "$R/state/escalations.tsv")"
 RECURSION_ROOT="$R" bash "$R/scripts/taskctl.sh" esc-resolve "$EID" "decided" >/dev/null 2>&1
 run_with "$FIX/3"
-n2="$(grep -c 'Approve the Cubic Castles native-diff acceptance frontier' "$R/state/INBOX.md" || true)"
+n2="$(grep -c 'Approve the Example-game native-diff acceptance frontier' "$R/state/INBOX.md" || true)"
 [ "$n2" = "2" ] && ok "after resolution the ask can be raised again (a real re-ask is not lost)" \
                 || no "after resolution the ask reappeared $n2 times (want 2)"
 

@@ -107,14 +107,6 @@ matches GitHub's default branch. The protection endpoint returned `403` for ever
 | Project | Registry status | Default | Protection result |
 |---|---|---|---|
 | recursion | active | `master` | `403`, feature unavailable |
-| golden-stallion | active | `main` | `403`, feature unavailable |
-| golden-stallion-extension | active | `main` | `403`, feature unavailable |
-| golden-stallion-client | active | `main` | `403`, feature unavailable |
-| ai-investment-cockpit | active | `main` | `403`, feature unavailable |
-| edgar-morning-brew | active | `main` | `403`, feature unavailable |
-| guerra-construction-group | active | `main` | `403`, feature unavailable |
-| chiron | active | `main` | `403`, feature unavailable |
-| santa-clara-construction | pending | `main` | `403`, feature unavailable |
 
 These branches are not verifiably protected. No repository setting was changed. Publication must
 therefore fail closed locally and remain review-branch-only; protection cannot be treated as a
@@ -127,19 +119,11 @@ No token or message content was read. Stable IDs came from `.env` destination fi
 
 | Intended destination | Stable ID | Current state |
 |---|---|---|
-| Lucas direct account | chat/user `8913126684` | configured as `TELEGRAM_CHAT_ID`, but currently only a fallback because the Cockpit chat is configured |
-| Head Hermes / home | chat `-1003894008732`, thread `1` | configured as the Cockpit home thread; not yet a separately named durable outbox destination |
+| Lucas direct account | chat/user `8913126684` | configured as `TELEGRAM_CHAT_ID`, but currently only a fallback because the control-plane home chat is configured |
+| Head Hermes / home | chat `-1003894008732`, thread `1` | configured as the control-plane home thread; not yet a separately named durable outbox destination |
 | recursion topic | chat `-1003894008732`, thread `3` | registered active |
-| golden-stallion topic | chat `-1003894008732`, thread `4` | registered active |
-| golden-stallion-extension topic | chat `-1003894008732`, thread `5` | registered active |
-| golden-stallion-client topic | chat `-1003894008732`, thread `6` | registered active |
-| ai-investment-cockpit topic | chat `-1003894008732`, thread `7` | registered active |
-| edgar-morning-brew topic | chat `-1003894008732`, thread `8` | registered active |
-| guerra-construction-group topic | chat `-1003894008732`, thread `9` | registered active |
-| chiron topic | chat `-1003894008732`, thread `10` | registered active |
-| santa-clara-construction topic | none | pending project; cannot activate without a topic and key |
 
-"All accounts" therefore means project topic + Cockpit home/Head Hermes + Lucas direct account,
+"All accounts" therefore means project topic + control-plane home/Head Hermes + Lucas direct account,
 with an extensible destination list. Current `notify.sh` selects one target; it does not fan one
 event out to all three classes. Phase 7 owns that outbox behavior, but the stable IDs above are the
 Phase 0 inventory.
@@ -160,7 +144,7 @@ ships atomic state and fail-closed locks, backups require a human-approved quies
    versions, and file owner/mode. Do not copy deploy keys or tokens into the review bundle.
 4. Copy runtime state with metadata: `state/PAUSE`, `.board*`, `.intake-watermark`, instructions,
    assists, decisions, latest pointer, events, escalations, leases/locks metadata, future action and
-   delivery queues, GSC runtime baselines, and any checksummed seed manifests/corpora.
+   delivery queues, runtime baselines, and any checksummed seed manifests/corpora.
 5. Snapshot the Hermes SQLite store with SQLite's online backup API, including a subsequent
    `PRAGMA integrity_check`; do not raw-copy a live WAL database.
 6. Back up `.env` and gateway credentials separately in the operator's encrypted secret store.
@@ -1309,7 +1293,7 @@ from that exact merged commit. The dirty user-owned `master` remained at
 ### Aligned Phase 8 design boundary
 
 Lucas approved the presented Phase 8 implementation plan and explicitly rejected using the old
-Chiron plan shape for autonomy. The approved local-authoring scope was:
+plan shape for autonomy. The approved local-authoring scope was:
 
 1. require a fresh schema-complete plan synthesized from a new Lucas instruction;
 2. require a separate authenticated Lucas instruction naming the exact plan ID and SHA-256 before
@@ -1337,7 +1321,7 @@ bash scripts/tests/hermes-pilot-phase8-red.test.sh
 ```
 
 The six intended failures proved the base lacked: a fresh schema-complete plan that cannot reuse
-legacy Chiron state; atomic rejection of malformed/vacuous plans; exact-digest approval and
+legacy state; atomic rejection of malformed/vacuous plans; exact-digest approval and
 idempotent materialization; exact-goal bounded admission; PAUSE window revocation; and one-time
 same-task assist resumption through the durable notification path.
 
@@ -1363,8 +1347,8 @@ scheduler, executor, publisher, store, sender, or worker launcher. It adds:
   and
 - runtime backup coverage for plan/window state.
 
-The only tracked production-policy changes are `window_required: true` in the Chiron and GSC pilot
-records. Their concurrency remains zero and no environment/configuration value was changed.
+The only tracked production-policy changes are `window_required: true` in the pilot records. Their
+concurrency remains zero and no environment/configuration value was changed.
 
 ### Exact implementation Linux matrix
 
@@ -1491,12 +1475,11 @@ event, escalation, inbox, and related awareness state. An untracked `.env.bak.17
 observed but not read or changed. The default recursion deploy key currently cannot authenticate
 `git ls-remote origin`; that finding was not repaired or bypassed.
 
-`python3 scripts/project-pilot.py verify-registry` returned `OK`. Chiron and GSC were clean/fresh at
-their remote heads. Both pilot records remained active but configured with
-`concurrency_limit=0`, `max_inflight_workers=0`, and publication false. The old Chiron goal/tasks
-remain in the registry but are ineligible for Phase 8 plan reuse. GSC has exactly the existing two
-proposed offline native-diff tasks; no test, fixture, oracle, baseline, corpus, or product repository
-was touched.
+`python3 scripts/project-pilot.py verify-registry` returned `OK`. The pilot records were clean/fresh
+at their remote heads. They remained active but configured with `concurrency_limit=0`,
+`max_inflight_workers=0`, and publication false. The old goals/tasks remain in the registry but are
+ineligible for Phase 8 plan reuse. The existing proposed offline native-diff tasks were the only
+pending work; no test, fixture, oracle, baseline, corpus, or product repository was touched.
 
 For every registered project, `notification-outbox.py status` reported `paused:true`, zero events,
 and zero deliveries. Runtime decision/action/run/lease/delivery/outbox/report/dead-letter
@@ -1509,41 +1492,17 @@ and the host had about 25.8 GB available. Exact fixture backup/restore, PAUSE pr
 hash verification, and crash recovery passed in the Phase 2/6/7/8 audits. No production snapshot or
 restore drill has been authorized or demonstrated, so promotion remains blocked on that gate.
 
-### Authenticated GitHub and Santa Clara inventory
+### Authenticated GitHub inventory
 
 Authenticated GitHub REST reads returned HTTP 403 for the default-branch protection endpoint of
-all nine registered repositories: recursion, golden-stallion, golden-stallion-extension,
-golden-stallion-client, ai-investment-cockpit, edgar-morning-brew, guerra-construction-group,
-chiron, and santa-clara-construction. This matches the existing private-repository plan limitation;
-none is verifiably protected and nothing was changed.
-
-The GitHub repository connector and authenticated REST API confirmed:
-
-```text
-repository=NotSkittlz/santa-clara-construction
-visibility=private
-default_branch=main
-size=0
-archived=false
-account_permissions=admin,maintain,pull,push,triage
-deploy_key_title=gs-recursion
-deploy_key_verified=true
-deploy_key_read_only=false
-deploy_key_created_at=2026-08-06T08:00:05Z
-```
-
-On `gs-recursion`, `/root/.ssh/santa-clara-construction_deploy` was readable and had fingerprint
-`SHA256:AioH/xSd+WQNtGNqvSjKLJQwbWf74Dgo5lNOFqyp4lk`. A direct batch SSH authentication test returned
-GitHub's successful-authentication/no-shell response for exactly
-`NotSkittlz/santa-clara-construction`. No key bytes or credential values were logged. The project
-remains pending because the repository is empty and it has no topic, approved goal, or actionable
-charter; no clone or activation occurred.
+every registered repository. This matches the existing private-repository plan limitation; none is
+verifiably protected and nothing was changed.
 
 ### Rollback, pilot windows, and final Phase 8 boundary
 
 No production action or observed pilot window occurred, so there is no fabricated pilot/soak audit
-chain or rollback execution to report. The exact rollback gates for deployment, Chiron success,
-Chiron assist, GSC offline, parallel, and soak fault sub-windows are recorded in
+chain or rollback execution to report. The exact rollback gates for deployment, success, assist,
+offline, parallel, and soak fault sub-windows are recorded in
 `docs/plans/hermes-project-pilot-phase8-handoff.md`. Each begins with the same mandatory boundary:
 capture a manifest-hashed pre-action snapshot while PAUSE is asserted, and on any mismatch restore
 the exact PAUSE bytes/hash, close the window, terminate and verify zero workers, preserve review
@@ -1675,7 +1634,7 @@ bash "$STAGE/scripts/audit/hermes-pilot-phase7-green.sh"
 Registry verification passed. Two repeated PAUSE-held recovery cycles left runtime-file count at
 zero with zero duplicates. The Phase 0 baseline passed all 17 suites; Phase 2 backup/restore,
 Phase 6 crash recovery, and Phase 7 delivery recovery audits all ended `ALL PASS`. No product
-repository, GSC test, fixture, oracle, corpus, or baseline was involved or changed.
+repository, test, fixture, oracle, corpus, or baseline was involved or changed.
 
 Three negative observations were preserved rather than hidden. First, the initially stopped
 gateway reported systemd state `failed`, not `inactive`; the attempt failed closed and its exit trap
@@ -1726,25 +1685,17 @@ organization billing setting was changed.
 Lucas subsequently upgraded the personal `NotSkittlz` account to GitHub Pro. The authenticated
 personal licensing page exposed `Switch to yearly billing` and `Downgrade to Free`, establishing
 that the personal account is on the monthly Pro plan. This is separate from the paid Team plan that
-was observed on the `Golden-Stallion` organization. No organization billing, subscription, budget,
+was observed on a different organization. No organization billing, subscription, budget,
 or alert control was changed by this work.
 
 GitHub Pro removed the prior private-repository HTTP 403 gate. Lucas then explicitly authorized the
-same protection policy for every initialized personal repository. The empty
-`santa-clara-construction` repository remains deferred until it has an initial `main` branch. The
-following classic branch-protection rules were created and then re-opened by their persisted rule
-IDs at `2026-08-08T23:51:43Z`:
+same protection policy for every initialized personal repository. The empty repository remains
+deferred until it has an initial `main` branch. The following classic branch-protection rules were
+created and then re-opened by their persisted rule IDs at `2026-08-08T23:51:43Z`:
 
 | Repository | Branch | Rule ID |
 |---|---|---:|
 | `NotSkittlz/recursion` | `master` | `81491567` |
-| `NotSkittlz/golden-stallion` | `main` | `81491591` |
-| `NotSkittlz/golden-stallion-extension` | `main` | `81491615` |
-| `NotSkittlz/golden-stallion-client` | `main` | `81491628` |
-| `NotSkittlz/ai-investment-cockpit` | `main` | `81491658` |
-| `NotSkittlz/edgar-morning-brew` | `main` | `81491685` |
-| `NotSkittlz/guerra-construction-group` | `main` | `81491718` |
-| `NotSkittlz/chiron` | `main` | `81491732` |
 
 Every persisted rule independently returned the same effective state:
 
@@ -1772,7 +1723,7 @@ was created until Lucas completed that authentication; the returned branches pag
 `Branch protection rule created.` and the rule was re-opened for field-level verification. During
 the remaining bounded rollout, transient Chrome/CDP readback delays occurred. They were not treated
 as evidence: each affected repository was inspected at its persisted edit URL. One unsaved
-investment-cockpit form temporarily contained `mainmain` after a retry; pre-submit state inspection
+repository form temporarily contained `mainmain` after a retry; pre-submit state inspection
 caught and corrected it to exact `main` before creation. The final eight-rule audit returned seven
 immediate matches and one transient extension read timeout; a separate retry of exact rule
 `81491615` matched every field. Final result: `8/8` initialized personal default branches enforce
@@ -2794,8 +2745,8 @@ runtime comparison -> sealed manifest. Because the queue was never claimed, ther
 no new instruction/goal/task/run/action/gate/verifier/review/report/delivery chain and no human
 send. This is zero state delta after rollback, not partial pilot evidence.
 
-Phase 8 remains undeployed. No promotion gate is claimed, and Chiron success, Chiron assist, GSC
-offline, parallel, and soak remain blocked. The next admissible action is a separate reviewable
+Phase 8 remains undeployed. No promotion gate is claimed, and success, assist, offline, parallel,
+and soak remain blocked. The next admissible action is a separate reviewable
 legacy decision-journal compatibility patch. A new production retry would still require that patch
 to be reviewed, merged, and pruned, followed by another fresh full preflight and separate explicit
 Lucas authorization.

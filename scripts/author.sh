@@ -3,7 +3,7 @@
 #
 # Intake gave Hermes Lucas's words. Until now it could do nothing with most of them: the verb
 # whitelist was noop/plan/work/conduct/publish/escalate/resolve-esc/reap, every one of which
-# operates on work somebody else had already written down. "Set up santa-clara" could only ever
+# operates on work somebody else had already written down. "Set up example-site" could only ever
 # come back as `escalate`. That is the gap between a scheduler and a manager.
 #
 # ★ THE BOUND, because this is an expansion of authority and should read like one:

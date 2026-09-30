@@ -38,7 +38,7 @@ Hermes is **top of the automation chain**. It holds the canonical portfolio and 
 direct orders from Lucas.
 
 Hermes owns:
-- the canonical portfolio, goal, task, and event state;
+- the canonical goal, task, and event state;
 - turning Lucas's intentions into measurable goals, interactively;
 - decomposition, dependency ordering, prioritisation, and assignment;
 - deciding whether a bounded task goes to Claude, another engine, a verifier, or Lucas;
@@ -84,10 +84,9 @@ family than the implementer.
 
 ### 6. Lucas's local operator instance — the human/live seam
 
-Handles Cheat Engine captures, live Cubic Castles observation, browser and visual
-acceptance, deployment, secrets, and every other human-only operation. Receives a
-self-contained runbook from Hermes and returns structured evidence against the
-originating blocker.
+Handles live-system observation, browser and visual acceptance, deployment, secrets, and
+every other human-only operation. Receives a self-contained runbook from Hermes and returns
+structured evidence against the originating blocker.
 
 ## Non-negotiable invariants
 
@@ -137,9 +136,8 @@ verb, and does not authorize ordinary conduct or any external side effect.
 
 ## Git is the transport
 
-Every registered project is a live git clone on the box. Status is derived from git and
-the working tree, never from a hand-copied status file. Copied state goes stale silently
-and reads exactly like working state; a fetch cannot.
+State is derived from git and the working tree, never from a hand-copied status file.
+Copied state goes stale silently and reads exactly like working state; a fetch cannot.
 
 The honest exception: data that genuinely cannot live in git — large gitignored binary
 corpora, live captures, and secrets. Those are carried by an explicit, checksummed seed

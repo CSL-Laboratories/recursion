@@ -188,12 +188,12 @@ publisher/sender, bypass exact-commit verification, or accept a model/process cl
 
 Run the observed pilots from the production plan in order, with a go/no-go gate and rollback between
 them:
-1. Chiron success: one small reversible build-verifiable goal from Lucas instruction through the
+1. Success: one small reversible build-verifiable goal from Lucas instruction through the
    project pilot, bounded worker, independent verifier, review branch, terminal reports, exact
    delivery acknowledgements, and deterministic stop.
-2. Chiron assist: force a genuine ambiguity; prove pilot -> Head Hermes -> Lucas -> answer -> the
+2. Assist: force a genuine ambiguity; prove pilot -> Head Hermes -> Lucas -> answer -> the
    same task resumes once without duplicate work or notification.
-3. GSC offline: one existing offline machine-gated task only; no live game action; preserve the
+3. Offline: one existing offline machine-gated task only; no live game action; preserve the
    conformance/native-diff stack and prove no test, fixture, oracle, or baseline changed.
 4. Parallel: two project topics and one goal each; prove state/worktree/memory isolation, global and
    per-project capacity, independent verification, reporting isolation, and no shared-state damage.

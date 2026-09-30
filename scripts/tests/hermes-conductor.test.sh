@@ -51,14 +51,14 @@ STUB
   chmod +x "$R/scripts/$s.sh"
 done
 
-cat > "$R/state/roadmaps/chiron.md" <<'T'
+cat > "$R/state/roadmaps/example-ops.md" <<'T'
 acceptance: true
 
 - [ ] a planned item
 T
 cat > "$R/state/tasks/good-001.md" <<'T'
 id: good-001
-workstream: chiron
+workstream: example-ops
 goal: a real goal
 acceptance: true
 status: queued
@@ -67,7 +67,7 @@ body
 T
 cat > "$R/state/tasks/nogate-001.md" <<'T'
 id: nogate-001
-workstream: chiron
+workstream: example-ops
 goal: a task with no gate
 status: queued
 
@@ -75,8 +75,8 @@ body
 T
 cat > "$R/state/tasks/pilot-deferred-001.md" <<'T'
 id: pilot-deferred-001
-pilot_id: pilot-chiron
-workstream: chiron
+pilot_id: pilot-example-ops
+workstream: example-ops
 goal: a pilot task waiting on final window authority
 acceptance: true
 status: queued
@@ -262,14 +262,14 @@ val(){ python3 "$R/scripts/validate-decision.py" "noop plan work conduct publish
   && ok "validator rejects an off-whitelist verb" || no "off-whitelist verb accepted"
 
 pilot_val(){ python3 "$R/scripts/validate-decision.py" \
-  "noop plan work conduct publish escalate pilot-plan-propose" "$1" pilot-chiron 2>&1 | cut -d' ' -f1; }
-[ "$(pilot_val '{"actor":"pilot-chiron","verb":"conduct","args":[],"goal":"g","wrong_if":"w"}')" = ERR ] \
+  "noop plan work conduct publish escalate pilot-plan-propose" "$1" pilot-example-ops 2>&1 | cut -d' ' -f1; }
+[ "$(pilot_val '{"actor":"pilot-example-ops","verb":"conduct","args":[],"goal":"g","wrong_if":"w"}')" = ERR ] \
   && ok "a routed project pilot cannot validate a Head-Hermes verb" \
   || no "project-pilot authority escaped through advisory prompting"
-[ "$(pilot_val '{"actor":"pilot-chiron","verb":"noop","args":[],"goal":"g","wrong_if":"w"}')" = OK ] \
+[ "$(pilot_val '{"actor":"pilot-example-ops","verb":"noop","args":[],"goal":"g","wrong_if":"w"}')" = OK ] \
   && ok "a routed project pilot retains the safe noop control" \
   || no "project-pilot authority gate rejected noop"
-decide '{"actor":"pilot-chiron","routed_decider":"pilot-chiron","decision_source":"hermes-model","verb":"conduct","args":[],"goal":"g","wrong_if":"w"}'
+decide '{"actor":"pilot-example-ops","routed_decider":"pilot-example-ops","decision_source":"hermes-model","verb":"conduct","args":[],"goal":"g","wrong_if":"w"}'
 [ "$(conduct)" != 0 ] && ok "the actuator independently rejects a project-pilot Head-Hermes verb" \
                        || no "the actuator trusted a project pilot to drain the portfolio"
 

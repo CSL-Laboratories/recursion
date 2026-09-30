@@ -49,7 +49,7 @@ def make_fixture(tmp_path: Path):
     root = tmp_path / "assignments"
     value = amod.resolve_assignment(
         task_id="task-1", project_id="proj-1", role="implementer",
-        source_repository="/opt/golden-stallion", source_branch="loop/work/task-1",
+        source_repository="/opt/example-project", source_branch="loop/work/task-1",
         source_sha="a" * 40, engine="claude", provider="anthropic-claude-code",
         host="gs-recursion", sandbox_profile="strict-linux", network_profile="provider-only",
         allowed_paths=["apps/api"], publication_policy="verified-integration-only",

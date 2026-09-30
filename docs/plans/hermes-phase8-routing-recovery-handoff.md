@@ -178,8 +178,6 @@ The final read-only snapshot on 2026-08-13 found:
 | services | actuator, gateway, cron, provider network, provider proxy active/enabled; all `NRestarts=0` |
 | decision queues | pending 0; running 0 |
 | workers | zero running `recursion-worker-*` units; zero matching processes |
-| GSC checkout | `/opt/golden-stallion-client`, `main`, clean at `ad4bb39a8cf3a9f3ad7e17b21dd89fcdf4252b39` |
-| old GSC window | `window-gsc-pilot-1` closed at `2026-08-13T22:04:13Z` by instruction 699 |
 | current pilot activity | none; Gate 6 has not started |
 
 The merged/deployed hardening includes the Phase-8 seed/scope/gate contracts and provider-only
@@ -246,7 +244,7 @@ Instruction 699 lawfully closed the expired v1 window:
 
 Lucas then sent a fresh-plan request. The text included the incidental word `deployed`, which
 matched the intake routing expression `deploy\w*`. The request became instruction 707 with
-`routing_target: head-hermes`, although only `pilot-golden-stallion-client` can lawfully emit
+`routing_target: head-hermes`, although only the bound project pilot can lawfully emit
 the required `pilot-plan-propose` action.
 
 Two separately authorized, supervised Head Hermes turns were attempted. Both emitted `noop`
@@ -258,7 +256,7 @@ surface. The hardened same-instruction noop evidence guard rejected both with `r
 - failed action `action-4a90005df9c9dfe6cbb7fbad`.
 
 Instruction 707 remains open. Instruction 732, routed to
-`pilot-golden-stallion-client`, also remains open with no action. The conditional project-pilot
+the bound project pilot, also remains open with no action. The conditional project-pilot
 turn for 732 was correctly not run because escalation of 707 did not succeed.
 
 Do not retry the same Head Hermes turn. It has now failed the same way twice and another model
@@ -282,7 +280,7 @@ the failure against the exact merged bytes and preserve red tests. The patch sho
 
 Minimum red-to-green coverage:
 
-- the exact 707 wording routes to `pilot-golden-stallion-client` after the fix;
+- the exact 707 wording routes to the bound project pilot after the fix;
 - true deployment/policy commands still route to Head Hermes;
 - actor/verb mismatch produces one authenticated escalation/refusal without a model call;
 - replay does not duplicate the action, event, attention, or delivery;
@@ -321,30 +319,29 @@ PAUSE-held deployment:
 2. Use only the reviewed coupled recovery path to terminalize instruction 707.
 3. Only after 707 succeeds, lawfully terminalize instruction 732.
 4. Ask Lucas to send a new project-topic instruction whose wording avoids control-plane verbs.
-5. Poll intake and require routing to `pilot-golden-stallion-client` before any decide turn.
+5. Poll intake and require routing to the bound project pilot before any decide turn.
 6. Require a fresh v2 plan, goal, and task with the deployed required non-goals, tracked seed
    contract, provider-only model network, heavy forced-on shade-tops gate, immutable gate files,
    source HEAD, and publication disabled.
 7. Present the exact canonical plan digest to Lucas for a separate approval instruction.
-8. Use a new window identity such as `window-gsc-pilot-2`; never reuse v1.
+8. Use a new window identity such as `window-<project>-pilot-2`; never reuse v1.
 9. Perform the complete Gate-6 preflight, snapshot/restore drill, rollback arming, and live
    observation setup. Request a separate exact PAUSE-lift authorization only then.
 
 The recommended future project-topic request, after 707 and 732 are closed, is:
 
-> Propose one fresh bounded offline renderer plan for golden-stallion-client: reduce the
-> verified 0x6c shade-tops under-emission through the required forced-on native-diff gate,
-> with all implementation changes confined to user-client/render, one task, independent
-> verification, and new v2 plan, goal, and task IDs. Do not reuse the v1 identities or the
-> closed window.
+> Propose one fresh bounded offline renderer plan for the project: reduce the verified render
+> defect through the required forced-on native-diff gate, with all implementation changes
+> confined to the renderer path, one task, independent verification, and new v2 plan, goal,
+> and task IDs. Do not reuse the v1 identities or the closed window.
 
 ## Remaining promotion gates
 
 Resolving this routing incident does not promote Recursion. The remaining program is:
 
-1. fresh GSC v2 plan, digest approval, new window, Gate-6 observed PAUSE lift, and Gate-7 closure;
-2. a distinct Chiron success pilot;
-3. a Chiron ambiguity/assist pilot proving exact-once same-task resumption;
+1. fresh v2 plan, digest approval, new window, Gate-6 observed PAUSE lift, and Gate-7 closure;
+2. a distinct success pilot;
+3. an ambiguity/assist pilot proving exact-once same-task resumption;
 4. a two-project parallel isolation pilot;
 5. a 24-hour soak covering scheduler ticks, gateway restart, host reboot, PAUSE during a worker,
    notification retry, and usage/cost reconciliation; and
@@ -376,7 +373,7 @@ rerun either recovery or another Head Hermes turn.
 
 The next operator gate is a genuinely new project-topic instruction from Lucas using the
 recommended wording in this handoff. If it has not arrived, report that gate and stop. If it has
-arrived, poll intake and prove it routes to `pilot-golden-stallion-client` before requesting
+arrived, poll intake and prove it routes to the bound project pilot before requesting
 separate authority for any model turn. Require fresh v2 plan/goal/task identities, the deployed
 seed/scope/provider/heavy-gate contracts, source HEAD binding, and publication disabled. Present
 the exact canonical plan digest to Lucas for separate approval. Keep PAUSE asserted; account for

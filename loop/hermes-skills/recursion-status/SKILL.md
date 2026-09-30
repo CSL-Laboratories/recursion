@@ -15,14 +15,14 @@ metadata:
 
 The Recursion cron/operator control plane runs as root on `/opt/recursion`, but the Telegram gateway
 deliberately runs as the unprivileged `hermes-gateway` user. When the user (Lucas) asks
-anything like *"what's the box doing?"*, *"status"*, *"how's chiron / the golden-stallion-client
-renderer going?"*, *"any escalations?"*, *"what did you build?"* — you answer from **live CLI output,
+anything like *"what's the box doing?"*, *"status"*, *"how are the workstreams going?"*,
+*"any escalations?"*, *"what did you build?"* — you answer from **live CLI output,
 never from memory and never a guess.** A wrong status costs trust; an honest "the command returned X"
 never does.
 
 ## When to Use
 
-- Lucas asks for the status of the Recursion box, the build-loop, chiron, or the GSC renderer.
+- Lucas asks for the status of the Recursion box, the build-loop, or a registered workstream.
 - Lucas asks what's queued, what's building, what needs a decision, or what was recently learned.
 - Any "is it still running / did it work / what happened overnight" question about this box.
 
@@ -37,15 +37,6 @@ The `recursion` CLI is on PATH. Run what the question needs; do not run all of t
 - `recursion brief` — the latest daily brief (one page).
 - `recursion tasks` — the task queue, optionally `recursion tasks <status>`.
 - `recursion pilot status <project>` — scoped live task/run/git evidence for any registered project.
-
-Project-specific legacy details (use only after the scoped pilot status above):
-- **Chiron** (a Next.js app the build-loop is building): its progress is the checklist in
-  `state/roadmaps/chiron.md` — run `grep -n "^- \[" /opt/recursion/state/roadmaps/chiron.md`
-  (`[x]` done, `[~]` planned/in-flight, `[ ]` not started). The built branch is `loop/work/chiron-001`.
-- **golden-stallion-client (GSC) renderer**: two gates. Conformance (regression) — genuine passing
-  count is `wc -l < /opt/recursion/state/gsc/baseline-pass.txt`. Quality (native-diff) — per-world
-  Σ|per-slot triangle error| baselines in `/opt/recursion/state/gsc/nativediff-baseline.tsv` (lower
-  is closer to native). Frontier queue: `state/roadmaps/gsc-renderer.md` (geometry axis only).
 
 ## Rules
 

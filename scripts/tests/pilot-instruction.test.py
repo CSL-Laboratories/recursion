@@ -23,46 +23,46 @@ class PilotInstructionTest(unittest.TestCase):
     def test_reviewed_natural_commands_are_allowed(self):
         digest = "a" * 64
         self.assert_allowed(
-            f"Approve pilot plan plan-gsc-v2 with digest {digest}.",
-            "pilot-plan-approve", ["plan-gsc-v2", digest])
+            f"Approve pilot plan plan-sample-v2 with digest {digest}.",
+            "pilot-plan-approve", ["plan-sample-v2", digest])
         self.assert_allowed(
-            "Open pilot window window-gsc-pilot-2 for goal goal-gsc-v2 for 14400 seconds.",
-            "pilot-window-open", ["goal-gsc-v2", "window-gsc-pilot-2", "14400"])
+            "Open pilot window window-sample-pilot-2 for goal goal-sample-v2 for 14400 seconds.",
+            "pilot-window-open", ["goal-sample-v2", "window-sample-pilot-2", "14400"])
         self.assert_allowed(
-            "Close pilot window window-gsc-pilot-1 in golden-stallion-client",
-            "pilot-window-close", ["window-gsc-pilot-1"])
+            "Close pilot window window-sample-pilot-1 in example-client",
+            "pilot-window-close", ["window-sample-pilot-1"])
         self.assert_allowed(
-            "Authorize goal-gsc-v2 chiron-window-close 900",
-            "pilot-window-open", ["goal-gsc-v2", "chiron-window-close", "900"])
+            "Authorize goal-sample-v2 example-ops-window-close 900",
+            "pilot-window-open", ["goal-sample-v2", "example-ops-window-close", "900"])
         self.assert_allowed(
-            "Close pilot window chiron-window-open",
-            "pilot-window-close", ["chiron-window-open"])
+            "Close pilot window example-ops-window-open",
+            "pilot-window-close", ["example-ops-window-open"])
         self.assert_allowed(
             f"Approve pilot plan reject-plan with digest {digest}",
             "pilot-plan-approve", ["reject-plan", digest])
 
     def test_project_named_window_command_binds_every_authority_value(self):
         body = (
-            "Open pilot window window-gsc-pilot-5 for golden-stallion-client, "
-            "goal goal-gsc-0x6c-shadetops-underemission-v2, for 14400 seconds."
+            "Open pilot window window-sample-pilot-5 for example-client, "
+            "goal goal-sample-0x6c-shadetops-underemission-v2, for 14400 seconds."
         )
         terms = [
-            "golden-stallion-client",
-            "goal-gsc-0x6c-shadetops-underemission-v2",
-            "window-gsc-pilot-5",
+            "example-client",
+            "goal-sample-0x6c-shadetops-underemission-v2",
+            "window-sample-pilot-5",
             "14400",
         ]
         self.assert_allowed(body, "pilot-window-open", terms)
         self.assert_refused(
             body,
             "pilot-window-open",
-            ["chiron", terms[1], terms[2], terms[3]],
+            ["example-ops", terms[1], terms[2], terms[3]],
         )
         self.assert_refused(
-            "For golden-stallion-client: Open pilot window window-gsc-pilot-5 "
-            "for goal goal-gsc-0x6c-shadetops-underemission-v2 for 14400 seconds.",
+            "For example-client: Open pilot window window-sample-pilot-5 "
+            "for goal goal-sample-0x6c-shadetops-underemission-v2 for 14400 seconds.",
             "pilot-window-open",
-            ["chiron", terms[1], terms[2], terms[3]],
+            ["example-ops", terms[1], terms[2], terms[3]],
         )
         self.assert_refused(
             "Do not " + body[0].lower() + body[1:],
@@ -75,53 +75,53 @@ class PilotInstructionTest(unittest.TestCase):
             terms,
         )
         self.assert_allowed(
-            "Open pilot window window-gsc-pilot-5 for goal "
-            "goal-gsc-0x6c-shadetops-underemission-v2 for 14400 seconds.",
+            "Open pilot window window-sample-pilot-5 for goal "
+            "goal-sample-0x6c-shadetops-underemission-v2 for 14400 seconds.",
             "pilot-window-open",
             terms,
         )
         self.assert_allowed(
-            "Open pilot window window-gsc-pilot-5 for goal "
-            "goal-gsc-0x6c-shadetops-underemission-v2 for 14400 seconds.",
+            "Open pilot window window-sample-pilot-5 for goal "
+            "goal-sample-0x6c-shadetops-underemission-v2 for 14400 seconds.",
             "pilot-window-open",
             terms[1:],
         )
         self.assert_allowed(
-            "Open pilot window window-gsc-pilot-5 for chiron-window-close, "
-            "goal goal-gsc-0x6c-shadetops-underemission-v2, for 14400 seconds.",
+            "Open pilot window window-sample-pilot-5 for example-ops-window-close, "
+            "goal goal-sample-0x6c-shadetops-underemission-v2, for 14400 seconds.",
             "pilot-window-open",
-            ["chiron-window-close", terms[1], terms[2], terms[3]],
+            ["example-ops-window-close", terms[1], terms[2], terms[3]],
         )
 
     def test_negated_reversed_or_reordered_commands_are_refused(self):
         digest = "b" * 64
         cases = (
-            (f"Do not approve plan-gsc-v2 {digest}", "pilot-plan-approve",
-             ["plan-gsc-v2", digest]),
-            (f"Reject plan-gsc-v2 {digest}", "pilot-plan-approve",
-             ["plan-gsc-v2", digest]),
-            ("Authorize window-gsc-pilot-2 goal-gsc-v2 14400", "pilot-window-open",
-             ["goal-gsc-v2", "window-gsc-pilot-2", "14400"]),
-            ("Close window-gsc-pilot-2", "pilot-window-open",
-             ["goal-gsc-v2", "window-gsc-pilot-2", "14400"]),
-            ("Authorize goal-gsc-v2 chiron-window-close 900 then close it", "pilot-window-open",
-             ["goal-gsc-v2", "chiron-window-close", "900"]),
-            ("Authorize goal-gsc-v2 chiron-window-close 900 then re-close it", "pilot-window-open",
-             ["goal-gsc-v2", "chiron-window-close", "900"]),
-            ("Authorize goal-gsc-v2 win-900 900 do-not close", "pilot-window-open",
-             ["goal-gsc-v2", "win-900", "900"]),
-            ("Authorize goal-gsc-v2 win-900 900 close2", "pilot-window-open",
-             ["goal-gsc-v2", "win-900", "900"]),
-            ("Authorize goal-gsc-v2 win-900 900 then reclose it", "pilot-window-open",
-             ["goal-gsc-v2", "win-900", "900"]),
-            ("Authorize goal-gsc-v2 win-900 900 then shut it", "pilot-window-open",
-             ["goal-gsc-v2", "win-900", "900"]),
-            ("Open window-gsc-pilot-1", "pilot-window-close", ["window-gsc-pilot-1"]),
-            ("Close pilot window chiron-window-open then open it", "pilot-window-close",
-             ["chiron-window-open"]),
-            ("Close pilot window chiron-window-open then re-open it", "pilot-window-close",
-             ["chiron-window-open"]),
-            ("Close pilot window win-900 after chiron-window-open", "pilot-window-close",
+            (f"Do not approve plan-sample-v2 {digest}", "pilot-plan-approve",
+             ["plan-sample-v2", digest]),
+            (f"Reject plan-sample-v2 {digest}", "pilot-plan-approve",
+             ["plan-sample-v2", digest]),
+            ("Authorize window-sample-pilot-2 goal-sample-v2 14400", "pilot-window-open",
+             ["goal-sample-v2", "window-sample-pilot-2", "14400"]),
+            ("Close window-sample-pilot-2", "pilot-window-open",
+             ["goal-sample-v2", "window-sample-pilot-2", "14400"]),
+            ("Authorize goal-sample-v2 example-ops-window-close 900 then close it", "pilot-window-open",
+             ["goal-sample-v2", "example-ops-window-close", "900"]),
+            ("Authorize goal-sample-v2 example-ops-window-close 900 then re-close it", "pilot-window-open",
+             ["goal-sample-v2", "example-ops-window-close", "900"]),
+            ("Authorize goal-sample-v2 win-900 900 do-not close", "pilot-window-open",
+             ["goal-sample-v2", "win-900", "900"]),
+            ("Authorize goal-sample-v2 win-900 900 close2", "pilot-window-open",
+             ["goal-sample-v2", "win-900", "900"]),
+            ("Authorize goal-sample-v2 win-900 900 then reclose it", "pilot-window-open",
+             ["goal-sample-v2", "win-900", "900"]),
+            ("Authorize goal-sample-v2 win-900 900 then shut it", "pilot-window-open",
+             ["goal-sample-v2", "win-900", "900"]),
+            ("Open window-sample-pilot-1", "pilot-window-close", ["window-sample-pilot-1"]),
+            ("Close pilot window example-ops-window-open then open it", "pilot-window-close",
+             ["example-ops-window-open"]),
+            ("Close pilot window example-ops-window-open then re-open it", "pilot-window-close",
+             ["example-ops-window-open"]),
+            ("Close pilot window win-900 after example-ops-window-open", "pilot-window-close",
              ["win-900"]),
             ("Close pilot window win-900 then reopen it", "pilot-window-close",
              ["win-900"]),

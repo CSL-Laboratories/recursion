@@ -8,8 +8,7 @@ Signal `brief` if ANY of these is true:
 - a project status reports health red, or lists a new Blocked-on / Decisions-due item;
 - state/INBOX.md has an unanswered item (anything other than "_(empty)_");
 - a project's status changed materially since yesterday's snapshot;
-- anything touches mining (DO-NOT-DEPLOY) or spends money/proxies;
-- a syllabus/lecture date has crossed a threshold that changes what to study.
+- anything touches mining (DO-NOT-DEPLOY) or spends money/proxies.
 
 Otherwise signal `quiet`. Bias toward `quiet` — a false wake costs Lucas's trust. Routine,
 reversible, already-decided things are `quiet`.

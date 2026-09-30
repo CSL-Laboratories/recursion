@@ -107,14 +107,14 @@ VERIFIER_DEADLINE_SECONDS="${VERIFIER_DEADLINE_SECONDS:-${RECURSION_VERIFIER_TIM
 NETWORK_POLICY="${NETWORK_POLICY:-provider-only}"; EXPECTED_CHANGE="${EXPECTED_CHANGE:-optional}"
 CAPACITY_POOL="${CAPACITY_POOL:-}"
 # repo: which git repo the arm builds in. Default = this repo ($ROOT). An external repo
-# (e.g. /opt/golden-stallion-client) lets the loop build another codebase; its build output
+# (e.g. /opt/example-client) lets the loop build another codebase; its build output
 # and loop/work/<id> branch live in THAT repo, gated by whatever acceptance the task names.
 REPO_DIR="$(field repo)"; REPO_DIR="${REPO_DIR:-$ROOT}"
 REPO_DIR="$(realpath -e "$REPO_DIR" 2>/dev/null || printf '%s' "$REPO_DIR")"
 # seed: gitignored paths (space/comma separated, relative to REPO_DIR) to COPY into each fresh
 # worktree. git worktree does NOT inherit gitignored files, so a required-but-untracked data
-# corpus (e.g. the GSC block-model corpus user-client/render/data/models) is absent in a new
-# worktree and every test that needs it fails. Declaring it here makes the dependency explicit.
+# corpus (e.g. data/models) is absent in a new worktree and every test that needs it fails.
+# Declaring it here makes the dependency explicit.
 SEED="$(field seed)"; SEED="${SEED//,/ }"
 SEED_MANIFEST="$(field seed_manifest)"
 SEED_MANIFEST_SHA256="$(field seed_manifest_sha256)"

@@ -41,14 +41,6 @@ both fabric and orchestration remained typed reject-only.
 No provider, production Telegram transport, credential, live controller, deployment,
 restart, PAUSE mutation, on-demand billing, or metered spend was used.
 
-## Chiron and quota
-
-Canonical Chiron `origin/main@7525af525ab538f31c2e5b6f117a83fe8e4ac6d2`
-passes its 39-slice ledger validation, TypeScript check, and production source build. The v6
-study pilot is not ready: H2 browser smoke is next, B0 requires Lucas, and B10 remains behind
-B2, B4, B5, B6, S5, and S6. `npm audit` reported three high-severity dependency findings.
-No account quota was consumed; all provider evidence was hermetic or fake transport.
-
 ## Remaining human seams
 
 This is not production completion. Lucas still owns the approved publisher enablement and

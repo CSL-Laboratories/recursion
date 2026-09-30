@@ -74,8 +74,8 @@ MANIFEST_SOURCE = {
 
 ASSIGNMENT = {
     "task_id": "t-0042",
-    "project_id": "chiron",
-    "source_repository": "https://github.com/NotSkittlz/chiron",
+    "project_id": "example-ops",
+    "source_repository": "https://github.com/NotSkittlz/example-ops",
     "source_branch": "main",
     "source_sha": SHA,
     "engine": "cursor",
@@ -567,12 +567,12 @@ check(raises("unauthorized-result", adapter.reconciliation_input, DISPATCH,
 base, transport, adapter = with_session()
 check(raises("unauthorized-result", adapter.reconciliation_input, DISPATCH,
              {"status": "FINISHED", "repositories": [
-                 {"repository": "https://github.com/NotSkittlz/golden-stallion",
+                 {"repository": "https://github.com/NotSkittlz/example-project",
                   "branch": "cursor/x", "commit": RESULT_COMMIT}]}),
       "a result for a repository the assignment did not authorise is unauthorized")
 
 multi_assignment = assignment(authorized_repositories=[
-    {"repository": "https://github.com/NotSkittlz/golden-stallion",
+    {"repository": "https://github.com/NotSkittlz/example-project",
      "source_branch": "main", "source_sha": "1" * 40},
 ])
 base, transport, adapter = fresh()
@@ -581,12 +581,12 @@ adapter.create_run(multi_assignment, "x", DISPATCH)
 multi = adapter.reconciliation_input(
     DISPATCH,
     {"status": "FINISHED", "repositories": [
-        {"repository": "https://github.com/NotSkittlz/chiron",
+        {"repository": "https://github.com/NotSkittlz/example-ops",
          "branch": "cursor/one", "commit": RESULT_COMMIT},
-        {"repository": "https://github.com/NotSkittlz/golden-stallion",
+        {"repository": "https://github.com/NotSkittlz/example-project",
          "branch": "cursor/two", "commit": "2" * 40}]},
-    authorized_repositories=["https://github.com/NotSkittlz/chiron",
-                             "https://github.com/NotSkittlz/golden-stallion"])
+    authorized_repositories=["https://github.com/NotSkittlz/example-ops",
+                             "https://github.com/NotSkittlz/example-project"])
 check(len(multi["repositories"]) == 2
       and {row["result_branch"] for row in multi["repositories"]} == {"cursor/one", "cursor/two"},
       "a multi-repository run records source, branch and commit separately per repository")
@@ -606,17 +606,17 @@ check(raises("malformed-response", adapter.reconciliation_input, DISPATCH,
 base, transport, adapter = with_session()
 check(raises("unauthorized-result", adapter.reconciliation_input, DISPATCH,
              {"status": "FINISHED", "repositories": [
-                 {"repository": "https://github.com/NotSkittlz/chiron",
+                 {"repository": "https://github.com/NotSkittlz/example-ops",
                   "branch": "../cursor/x", "commit": RESULT_COMMIT}]},
-             authorized_repositories=["https://github.com/NotSkittlz/chiron"]),
+             authorized_repositories=["https://github.com/NotSkittlz/example-ops"]),
       "a returned branch is validated before fnmatch and traversal-shaped refs are refused")
 
 base, transport, adapter = with_session()
 check(raises("unauthorized-result", adapter.reconciliation_input, DISPATCH,
              {"status": "FINISHED", "repositories": [
-                 {"repository": "https://github.com/NotSkittlz/golden-stallion",
+                 {"repository": "https://github.com/NotSkittlz/example-project",
                   "branch": "cursor/x", "commit": RESULT_COMMIT}]},
-             authorized_repositories=["https://github.com/NotSkittlz/golden-stallion"]),
+             authorized_repositories=["https://github.com/NotSkittlz/example-project"]),
       "a caller cannot widen the immutable authorized repository scope")
 
 # Two concurrent, different reconciliation inputs have one durable winner. Identify the winner

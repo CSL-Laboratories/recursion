@@ -23,7 +23,7 @@ cp "$SRC/scripts/intake.sh" "$SRC/scripts/instruction_routing.py" \
    "$SRC/scripts/transition_receipt.py" "$SRC/scripts/jsonl_durable.py" \
    "$SRC/scripts/runtime-state.py" "$I/scripts/"
 printf '#project\tpath\tremote\tbranch\tsshkey\troadmap\ttopic\tstatus\n' > "$I/state/portfolio.tsv"
-printf 'chiron\t/opt/chiron\tgit@example/chiron\tmain\t-\t-\t10\tactive\n' >> "$I/state/portfolio.tsv"
+printf 'example-ops\t/opt/example-ops\tgit@example/example-ops\tmain\t-\t-\t10\tactive\n' >> "$I/state/portfolio.tsv"
 DB="$TMP/gateway.db"
 python3 - "$DB" <<'PY'
 import sqlite3,sys
@@ -31,7 +31,7 @@ c=sqlite3.connect(sys.argv[1])
 c.execute('create table sessions(id text primary key,source text,user_id text,chat_id text,thread_id text)')
 c.execute('create table messages(id integer primary key,session_id text,role text,content text,timestamp real)')
 c.execute('insert into sessions values(?,?,?,?,?)',('s','telegram','8913126684','-1003894008732','10'))
-c.execute('insert into messages values(?,?,?,?,?)',(42,'s','user','plan chiron',1.0))
+c.execute('insert into messages values(?,?,?,?,?)',(42,'s','user','plan example-ops',1.0))
 c.commit()
 PY
 ( cd "$I" && RECURSION_ROOT="$I" RECURSION_HERMES_DB="$DB" RECURSION_INTAKE_ALLOW=8913126684 \
@@ -39,7 +39,7 @@ PY
 INS="$I/state/instructions/00000042.md"
 grep -q '^principal: 8913126684$' "$INS"
 grep -q '^topic: 10$' "$INS"
-grep -q '^project_id: chiron$' "$INS"
+grep -q '^project_id: example-ops$' "$INS"
 grep -q '^reply_correlation: telegram:-1003894008732:10:42$' "$INS"
 grep -q '^deduplication_key: telegram:-1003894008732:10:42$' "$INS"
 grep -q '^status: open$' "$INS"
@@ -127,7 +127,7 @@ schema_version: 1
 id: 42
 principal: 8913126684
 topic: 10
-project_id: chiron
+project_id: example-ops
 deduplication_key: telegram:test:42
 status: open
 action_ids:
@@ -169,8 +169,8 @@ reject '```json {"verb":"noop","args":[],"goal":"g","wrong_if":"w"} ```'
 reject '{"verb":"work","args":["x;touch"],"goal":"g","wrong_if":"w"}'
 reject '{"verb":"publish","args":["../../main"],"goal":"g","wrong_if":"w"}'
 reject '{"verb":"deploy","args":[],"goal":"g","wrong_if":"w"}'
-reject '{"verb":"roadmap-add","args":["chiron"],"text":"**markdown**","goal":"g","wrong_if":"w"}'
-oversized="$(python3 -c 'import json;print(json.dumps({"verb":"roadmap-add","args":["chiron"],"text":"x"*501,"goal":"g","wrong_if":"w"}))')"
+reject '{"verb":"roadmap-add","args":["example-ops"],"text":"**markdown**","goal":"g","wrong_if":"w"}'
+oversized="$(python3 -c 'import json;print(json.dumps({"verb":"roadmap-add","args":["example-ops"],"text":"x"*501,"goal":"g","wrong_if":"w"}))')"
 reject "$oversized"
 echo "ok    Markdown, shell text, traversal, unknown verbs, and oversized prose were inert"
 

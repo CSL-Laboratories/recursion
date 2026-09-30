@@ -17,11 +17,3 @@
 #
 #project	path	remote	branch	sshkey	roadmap	topic	status
 recursion	/opt/recursion	git@github.com:NotSkittlz/recursion.git	master	~/.ssh/id_deploy	-	3	active
-golden-stallion	/opt/golden-stallion	git@github.com:NotSkittlz/golden-stallion.git	main	~/.ssh/golden-stallion_deploy	-	4	active
-golden-stallion-extension	/opt/golden-stallion-extension	git@github.com:NotSkittlz/golden-stallion-extension.git	main	~/.ssh/golden-stallion-extension_deploy	-	5	active
-golden-stallion-client	/opt/golden-stallion-client	git@github.com:NotSkittlz/golden-stallion-client.git	main	~/.ssh/gsc_deploy	state/roadmaps/gsc-renderer.md	6	active
-ai-investment-cockpit	/opt/ai-investment-cockpit	git@github.com:NotSkittlz/ai-investment-cockpit.git	main	~/.ssh/ai-investment-cockpit_deploy	-	7	active
-edgar-morning-brew	/opt/edgar-morning-brew	git@github.com:NotSkittlz/edgar-morning-brew.git	main	~/.ssh/edgar-morning-brew_deploy	-	8	active
-guerra-construction-group	/opt/guerra-construction-group	git@github.com:NotSkittlz/guerra-construction-group.git	main	~/.ssh/guerra-construction-group_deploy	-	9	active
-chiron	/opt/chiron	git@github.com:NotSkittlz/chiron.git	main	~/.ssh/chiron_deploy	state/roadmaps/chiron.md	10	active
-santa-clara-construction	/opt/santa-clara-construction	git@github.com:NotSkittlz/santa-clara-construction.git	main	~/.ssh/santa-clara-construction_deploy	-	-	pending

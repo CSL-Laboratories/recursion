@@ -72,7 +72,7 @@ output didn't track generated output: that's a purchased backlog.
 ## D-003 — Projects push status into Recursion; Recursion does not read product repos
 Date: 2026-08-04 · Status: OPEN
 
-**Options considered:** supervisor gets read access to golden-stallion and CSL Labs repos /
+**Options considered:** supervisor gets read access to two product repos /
 each project writes `STATE.md` and pushes a copy here
 
 **Chose:** Push model.
@@ -95,7 +95,7 @@ was correct.
 
 ---
 
-## D-004 — No community-extractive monetization for Golden Stallion
+## D-004 — No community-extractive monetization for a community product
 Date: 2026-08-04 · Status: OPEN
 
 **Options considered:** in-game market manipulation / sponsorship + premium client tier +
@@ -113,25 +113,25 @@ actually has value — the reconstructed client and the reputation around it.
 
 ---
 
-## D-005 — GSC-first sequencing, driven by the August game-update clock
+## D-005 — Client-reconstruction-first sequencing, driven by an upstream update clock
 Date: 2026-08-04 · Status: OPEN
 
 **Options considered:** learning-loop first (ANCHOR's original priority — Berkeley 2026-08-26) /
-GSC engine first / fleet-first
+the client reconstruction engine first / fleet-first
 
-**Chose:** GSC (client reconstruction) first.
+**Chose:** the client reconstruction first.
 
 **Because:** ANCHOR treated the learning loop as the only external clock. There's a second, sharper
 one — the CC devs' planned August update. An update drifts WASM indices / offsets / struct layouts
 (the vault is full of "18 stale indices", "a stale export = the wrong fn under a trusted name") and
 can make version-differentiation harder — invalidating hard-won RE and the current full-item captures
 as ground truth. Berkeley learning is absorbable alongside classes (interactive, foreground), so it
-doesn't need the 3-weeks-ahead lead ANCHOR assumed. GSC is background/autonomous (oracle-gated), so
+doesn't need the 3-weeks-ahead lead ANCHOR assumed. The client reconstruction is background/autonomous (oracle-gated), so
 the two parallelize rather than compete for attention.
 
 **Falsifier:** if the update lands and the reconstruction wasn't at a usable checkpoint against the
 stable binary, we mis-sequenced (should have started sooner / raced harder). Equally wrong if
-GSC-first let the learning loop slip behind Lucas's actual classes.
+client-reconstruction-first let the learning loop slip behind Lucas's actual classes.
 
 **Review:** 2026-09-01 (with the other kill criteria).
 
@@ -180,7 +180,7 @@ reassess Sept 1. Confirms D-006.
 **Because:** SuperGrok Heavy was genuinely strong (official xAI↔OpenCode integration, subscription
 OAuth, Grok 4.3 / 1M ctx) but the $100 promo expired → $300/mo, no longer worth it. Cursor Ultra is
 good value but its credits lock to Cursor's own tools (cursor-agent), forcing a harness switch off
-OpenCode/Hermes and unable to reach the local GSC oracle. ChatGPT Pro via Codex OAuth already runs
+OpenCode/Hermes and unable to reach the local client oracle. ChatGPT Pro via Codex OAuth already runs
 headless in the Hermes we stood up, is exactly $200, and matches ANCHOR's August-PoC budget. Lucas
 chose to run it this month on the increased budget, then make a reformed decision.
 
@@ -228,7 +228,7 @@ STILL TODO, and NOT a Hermes toggle: (1) a fallback-spend ALERT — must be a Re
 routing (Lua→luna, decisions→terra, escalate→sol) is Recursion dispatcher logic, built when the loop
 lands, not a global Hermes setting.
 
-## D-009 — GSC/cubic-castles native-diff gate: approved as the metric; planner integration DEFERRED
+## D-009 — Client native-diff gate: approved as the metric; planner integration DEFERRED
 Date: 2026-08-06 · Status: RESOLVED (Lucas, via session)
 
 **Correction 2026-08-06:** originally filed as `D-002`, colliding with the 2026-08-04
@@ -236,11 +236,11 @@ ChatGPT Pro decision. Renumbered to D-009 with Lucas's approval. Any earlier ref
 "D-002" that concerns the native-diff gate means THIS entry. The original D-002 above is
 unchanged.
 
-**Options considered:** A) approve gate + planner integration / B) approve gate, DEFER planner integration / C) defer/reject, leave GSC idle
+**Options considered:** A) approve gate + planner integration / B) approve gate, DEFER planner integration / C) defer/reject, leave the client idle
 **Chose:** B
 **Because:** The strict-decrease Sum|per-slot| native-diff gate is a sound regression/quality metric (SUM-not-total; byte-identical untargeted worlds = the control) — approved in that role; it is Tier-2 of the two-tier gate. But DEFER letting it auto-drive overnight planning: proven 2026-08-06 that the pure count ratchet REJECTS decomp-exact correct fixes that couple across worlds — two conductor runs (0x68 Cloud, 0x6c overlay) each found a correct fix and correctly NO-OPd, because a fix that helps one world while an unrelated defect in another makes it score worse fails "no world worsens". Auto-planning on the count gate manufactures no-op branches, not merges. Also the gap register is STALE (0x74/0x88 already measure 1.000 = closed), so a planner would queue dead gaps. The real driver is Tier-1 = a decomp-DECISION ledger (correctness vs the decompiled predicate), now being built.
-**Falsifier:** if the FIRST two-tier-gated autonomous cubic-castles run still produces only no-ops (the decomp-decision ledger does not make correct coupled fixes landable either), then the blocker was not the gate and deferring-for-the-ledger was the wrong remedy.
-**Lift condition:** two-tier gate merged + gap register de-staled from live measurement + 1 supervised shakedown passes -> add cubic-castles/gsc to RECURSION_PLAN_WORKSTREAMS.
+**Falsifier:** if the FIRST two-tier-gated autonomous client run still produces only no-ops (the decomp-decision ledger does not make correct coupled fixes landable either), then the blocker was not the gate and deferring-for-the-ledger was the wrong remedy.
+**Lift condition:** two-tier gate merged + gap register de-staled from live measurement + 1 supervised shakedown passes -> add the client to RECURSION_PLAN_WORKSTREAMS.
 **Review:** 2026-09-06
 
 ---
@@ -302,7 +302,7 @@ the review branch. Seven repos are now cloned on the box behind per-repo deploy 
 blast radius stays scoped per repo without an account-level credential.
 
 **The honest exception, recorded so it is not quietly violated:** data that cannot live in
-git — the gitignored GSC block-model corpus, raw captures, and secrets — is still carried
+git — the gitignored game block-model corpus, raw captures, and secrets — is still carried
 by an explicit seed manifest. That manifest must be checksummed and must fail loudly when
 a path is absent; the 2026-08-05 corpus incident (48 conformance tests unpassable because
 a gitignored corpus was silently absent) is what that rule is paying for.
@@ -336,31 +336,31 @@ external state, the split was drawn in the wrong place and (A)'s blunt exit was 
 
 **Review:** 2026-09-15
 
-## D-013 — chiron graduates to its own repo; the monorepo copy is frozen, not yet deleted
+## D-013 — A product app graduates to its own repo; the monorepo copy is frozen, not yet deleted
 Date: 2026-08-06
 
-**Chose:** `apps/chiron` was split out with `git subtree split` (full history: 6 commits) and
-pushed to `NotSkittlz/chiron`. `/opt/chiron` is the clone, registered `active` in
-`state/portfolio.tsv` with its own deploy key, and `state/roadmaps/chiron.md` now stamps
-`repo: /opt/chiron`, `sshkey: ~/.ssh/chiron_deploy`, `workdir: .` onto every task it plans.
+**Chose:** `the app directory` was split out with `git subtree split` (full history: 6 commits) and
+pushed to `its own repository`. `its own checkout` is the clone, registered `active` in
+`state/portfolio.tsv` with its own deploy key, and `its roadmap` now stamps
+`repo: its own checkout`, `sshkey: its deploy key`, `workdir: .` onto every task it plans.
 
-**Why:** chiron is a product, not part of the control plane, and building it inside the control
-plane's own repo meant every chiron branch touched the repo that governs it. Per-repo pilots
+**Why:** the app is a product, not part of the control plane, and building it inside the control
+plane's own repo meant every branch of the app touched the repo that governs it. Per-repo pilots
 (Lucas, 2026-08-06: "the pilots are going to be the names of the repositories") need one repo per
 pilot.
 
-**Verified, not assumed:** the split tree was compared to `master:apps/chiron` by blob OID — 11
+**Verified, not assumed:** the split tree was compared to `master:the app directory` by blob OID — 11
 files, all 11 identical object ids, so the content is byte-identical rather than merely similar.
 
-**Deliberately NOT done here:** `apps/chiron/` is still in this repo. Deleting it belongs in a
+**Deliberately NOT done here:** `the app directory` is still in this repo. Deleting it belongs in a
 follow-up, after Lucas has looked at the new repo — a graduation and a deletion in one merge
-leaves no cheap way back. It is frozen with `apps/chiron/GRADUATED.md` because a stale duplicate
+leaves no cheap way back. It is frozen with `the app directory/GRADUATED.md` because a stale duplicate
 that still looks live is worse than an absent one.
 
-**Falsifier:** a chiron task that plans, builds and publishes against `/opt/recursion` rather than
-`/opt/chiron` — that would mean the roadmap header is not the only thing stamping `repo:`.
+**Falsifier:** a task for that app that plans, builds and publishes against `/opt/recursion` rather than
+`its own checkout` — that would mean the roadmap header is not the only thing stamping `repo:`.
 
-**Completed chiron-001/002/003 were left pointing at /opt/recursion.** They record what actually
+**The completed initial tasks were left pointing at /opt/recursion.** They record what actually
 happened; repointing finished work at a repo it never ran in makes the ledger lie.
 
 ---
@@ -474,7 +474,35 @@ quota exhaustion silently enables metered spend; or Hetzner must become a heavyw
 worker for the system to function.
 
 **Execution boundary:** this decision and its plan do not authorize credentials, spending,
-firewall exposure, production deployment, PAUSE removal, destructive Chiron cleanup, or default-
+firewall exposure, production deployment, PAUSE removal, destructive legacy cleanup, or default-
 branch merge. Each remains a reviewed human seam under `CONTROL_PLANE.md`.
 
 **Review:** after the Phase 9 soak or 2026-10-31, whichever comes first.
+
+---
+
+## D-017 — Recursion becomes a public product repository; other workstreams removed
+Date: 2026-09-29 · Status: OPEN
+
+**Options considered:** keep Recursion as a private multi-project control plane / strip it to
+the Recursion product and remove every other-project artifact and reference / publish as-is.
+
+**Chose:** Strip, in an approved control-plane authoring session.
+
+**Because:** Recursion is becoming a public repository, and the public repository must not
+embed another project's source, registry, curriculum, captures, or scripts. Unrelated
+workstreams live in their own lanes. Their content was removed and `ANCHOR.md`, `AGENTS.md`,
+`CLAUDE.md`, `CONTROL_PLANE.md` and `README.md` were amended so no out-of-scope track is
+named. Recursion's own supervisor machinery and `docs/v3/**` product specifications remain.
+
+**Falsifier:** a required Recursion capability turns out to depend on removed content, or a
+source check fails because a removed path was load-bearing.
+
+**Review:** 2026-10-29
+
+**Note:** working-tree cleanup is not publication-safety. Historical references remain in the
+decision-log history above, in `scripts/` runtime and test fixtures, in
+`docs/v3/archive/session-transcript-2026-09-02.md`, and in
+`docs/audits/recursion-v2-phase0-transition-receipts/`. Git history retains all removed
+content. Making the published repository clean requires a separate human decision on history
+(fresh-history publication or redaction); agents must not rewrite history.

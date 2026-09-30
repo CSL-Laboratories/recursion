@@ -1,53 +1,45 @@
 # Anchor
 
-Reread this when deciding what to work on. If a task doesn't serve something below,
-it's not in scope.
+Reread this when deciding what to work on. If a task doesn't serve something below, it's
+not in scope.
 
-Last reviewed: 2026-08-04 · Next review: 2026-11-01
+Last reviewed: 2026-09-29 · Next review: 2026-12-01
+
+---
+
+## What Recursion is
+
+Recursion is a provider-neutral agent platform: a small deterministic kernel with typed
+adapters, native and upstream execution, persistent goal-scoped assistants, configurable
+context and compaction, plugins, interactive terminal control, and Windows/Linux operation
+and recovery. The current development target is **Recursion v3**.
+
+Other workstreams are separate repositories with their own lanes. Recursion does not embed
+another project's source, curriculum, captures, or registry.
 
 ---
 
 ## Success criteria (12 month horizon)
 
-**1. Physics foundation.** Cover a physics major's core material in 2–3 years, with
-understanding verified by re-explanation, not by grades alone. Arrive at lecture already
-stuck on the material so lecture is resolution rather than first contact. Running target:
-three weeks ahead of syllabus.
+**1. Shipped product.** Recursion v3 is buildable and publicly released, with every release
+gate passing on a frozen candidate and a person outside this repository able to install and
+run it.
 
-**2. Shipped work.** Cubic Castles client reconstructed, optimized, publicly released.
-This is the portfolio artifact — the thing that demonstrates capability to someone deciding
-whether to hire or fund.
+**2. Verified behavior.** Accepted behavior is backed by deterministic source checks and
+independent review. A provider return, an implementer's self-report, or model consensus is
+never ground truth.
 
-**3. Employable stack.** Physics + reverse engineering + systems/inference infrastructure.
-Rare combination. Mostly a consequence of (1) and (2) done well.
-
-### What these are not
-
-The portfolio is a *long-horizon* goal, not a 12-month one. Tooling spend converts to
-income via shipped work and rare skills, not via returns. CSL Labs' near-term deliverable
-is research throughput and better-informed decisions — **not alpha**. Any plan that
-requires investment returns this year is a plan that fails.
-
----
-
-## Not this year
-
-Written down so it stops re-entering scope:
-
-- Roblox development — dormant until winter break at the earliest
-- Golden Stallion feature work — maintenance only through fall
-- Any monetization that extracts from the community. Ruled out on values, and it
-  destroys the asset. See `state/DECISIONS.md`.
-- New projects. Eight concurrent threads is already over capacity.
+**3. Durable platform.** Authority, state, evidence, and recovery invariants hold under
+crash, cancellation, restart, route change, and ambiguous external effects.
 
 ---
 
 ## Rationing rule
 
-The constraint is review throughput, not tokens. Generated work that isn't verified is
-a liability, not an asset.
+The constraint is review throughput, not tokens. Generated work that isn't verified is a
+liability, not an asset.
 
-- **Opus / frontier:** hard multi-file reasoning, physics at the edge of understanding, architecture calls
+- **Opus / frontier:** hard multi-file reasoning, architecture calls, security boundaries
 - **Mid tier:** mechanical passes, refactors, test generation
 - **Cheap tier / local:** the supervisor loop, summarization, triage, overnight batch
 - **Local (4090 / Qwen):** unattended high-volume mechanical work
@@ -57,56 +49,12 @@ not more capacity.
 
 ---
 
-## August 2026 proof of concept
+## Out of scope
 
-Running 2× $200 subscriptions for one month. Highest-availability month of the year;
-correct time to test the ceiling. Reversible, month-to-month.
+Written down so it stops re-entering scope:
 
-**Deadline: Berkeley starts 2026-08-26.** Realistically one system gets built well before
-then. Priority is the learning loop — it's the only one with an external clock that
-doesn't move.
-
-### Kill criteria — decide in September, not by feel
-
-| System | Pass condition |
-|---|---|
-| Learning loop | Produced problem sets actually worked, gap map matched real weak spots |
-| Supervisor | Surfaced ≥1 thing that would have been missed; wrong <⅓ of escalations |
-| Build loop | Session-resume time measurably dropped |
-| Capacity | Hit limits *while shipping*, and the review queue stayed clear |
-
-**Renew the second subscription only if capacity passes AND review queue stayed clear.**
-Otherwise drop to one subscription + cheap OpenRouter fallback. Two of three systems
-failing means drop back — that is a successful experiment, not a failure.
-
-Measure with `ccusage` weekly. "I felt faster" is not a result.
-
----
-
-## 2026-08-06 amendment — portfolio operating model (supersedes the WIP cap)
-
-Recursion is now a Hermes-led control plane (see `CONTROL_PLANE.md`, D-010). Hermes is the
-executive: it holds the portfolio, takes direct orders from Lucas, decomposes them into
-goals, and dispatches bounded workers. That changes how scope gets limited.
-
-**Superseded — "New projects. Eight concurrent threads is already over capacity."**
-The portfolio is explicitly multi-project and repo-keyed. Projects are registered and
-activated by configuration, not limited by a count. Registered ≠ active.
-
-**Preserved — the reason for the cap still holds.** *Generated work that isn't verified is
-a liability, not an asset.* That is now enforced by two mechanisms instead of a number:
-
-1. **Goal linkage.** No task exists without a defined parent goal. Work that does not
-   serve a registered goal is never scheduled. That is the scope limit.
-2. **Capacity admission control.** Hermes tracks box resources (CPU, RAM, swap, disk,
-   in-flight arms, heavy gates) and subscription quota, and refuses to launch work that
-   would throttle the machine or the subs. Concurrency is bounded by measured headroom.
-
-The rationing rule above (model tier by task difficulty) is unchanged, and so is its
-conclusion: if output accumulates faster than it is reviewed, the answer is less
-generation, not more capacity.
-
-**Still open — not decided by this amendment.** "Golden Stallion feature work —
-maintenance only through fall" (above) has not been lifted. The portfolio now *monitors*
-three Golden Stallion repos, but monitoring is not feature work. Until Lucas rules, GS
-work stays maintenance-only and the registry marks those projects accordingly.
+- Any repository, product, curriculum, capture, or dataset that is not Recursion itself.
+  Those live in their own lanes.
+- Market, investment, or "alpha" research. Near-term tooling spend converts to income via
+  shipped work and rare skills, not via returns.
+- Any autonomy that extracts from or acts against a third-party service's terms.

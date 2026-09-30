@@ -15,8 +15,8 @@ from windows_test_support import bash_command, prepare_shell_env
 
 
 SOURCE = Path(__file__).resolve().parents[2]
-PROJECT = "golden-stallion-client"
-PILOT = "pilot-golden-stallion-client"
+PROJECT = "example-client"
+PILOT = "pilot-example-client"
 
 
 def require(condition: bool, message: str) -> None:
@@ -98,19 +98,19 @@ class Fixture:
                 newline="\n",
             )
             flock_stub.chmod(0o755)
-        self.write_json("state/project-config/golden-stallion-client.json", {
-            "schema_version": 1, "id": PROJECT, "repo": "/nonexistent/gsc",
+        self.write_json("state/project-config/example-client.json", {
+            "schema_version": 1, "id": PROJECT, "repo": "/nonexistent/sample",
             "remote": "origin", "default_branch": "main", "deploy_key_ref": "-",
             "charter": "fixture", "allowed_paths": ["user-client/render"], "topic": 6,
             "pilot_id": PILOT, "activation_gate": "fixture", "notification_targets": [],
             "goal_source": "state/goals", "status": "active",
         })
-        self.write_json("state/pilots/pilot-golden-stallion-client.json", {
+        self.write_json("state/pilots/pilot-example-client.json", {
             "schema_version": 1, "id": PILOT, "project_id": PROJECT, "topic": 6,
             "charter": "fixture", "model_policy": "project-pilot", "concurrency_limit": 0,
             "budget": {"max_inflight_workers": 0}, "notification_targets": [],
             "goal_source": "state/goals", "memory_key": "telegram-topic:6",
-            "worktree_root": ".worktrees/gsc", "status": "active",
+            "worktree_root": ".worktrees/sample", "status": "active",
         })
         self.write_instruction(930, "head-hermes", PROJECT, "old-head-marker")
         self.write_instruction(934, PILOT, PROJECT, "fresh-pilot-marker")

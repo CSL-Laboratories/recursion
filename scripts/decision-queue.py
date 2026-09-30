@@ -861,7 +861,7 @@ def reviewed_legacy_marker(raw: dict, line: str, number: int, record: dict) -> d
             or raw.get("cost_usd") != "0.0"
             or raw.get("provider") != "openai-codex"
             or raw.get("text") != ""
-            or raw.get("project") not in {"recursion", "gsc"}
+            or not isinstance(raw.get("project"), str) or not raw["project"]
             or not all(isinstance(raw.get(field), str) and raw[field] for field in ("goal", "ts", "why", "wrong_if"))
         ):
             return None

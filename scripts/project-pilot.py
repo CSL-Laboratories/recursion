@@ -920,7 +920,7 @@ def load_gate_profile_promotion(base: Path, cfg: dict, promotion_id: str) -> dic
     measured_target = [world.get("world") for world in worlds or []
                        if isinstance(world, dict) and world.get("role") == "target"]
     if not isinstance(profile, dict) \
-            or profile.get("schema") != "recursion-gsc-shade-tops-gate/v1" \
+            or not isinstance(profile.get("schema"), str) or not profile["schema"] \
             or profile.get("profile_id") != profile_id \
             or profile.get("base_commit") != source_head \
             or roles.count("target") != 1 or "control" not in roles \
@@ -928,11 +928,13 @@ def load_gate_profile_promotion(base: Path, cfg: dict, promotion_id: str) -> dic
         fail("promoted profile lacks exact measured identity, target, controls, or source HEAD")
 
     controller_gate = profile.get("controller_gate")
-    gate_script = "scripts/gsc-shade-tops-gate.py"
+    if not isinstance(controller_gate, dict):
+        fail("promoted profile controller gate is absent")
+    gate_script = str(controller_gate.get("path") or "")
+    if not gate_script.startswith("scripts/") or not gate_script.endswith(".py"):
+        fail("promoted profile controller-gate path is invalid")
     gate_raw = controller_tracked_bytes(base, gate_script, "promoted profile controller gate")
-    if not isinstance(controller_gate, dict) \
-            or controller_gate.get("path") != gate_script \
-            or controller_gate.get("sha256") != hashlib.sha256(gate_raw).hexdigest():
+    if controller_gate.get("sha256") != hashlib.sha256(gate_raw).hexdigest():
         fail("promoted profile controller-gate identity differs from measured bytes")
 
     required = validate_required_gate_profile(

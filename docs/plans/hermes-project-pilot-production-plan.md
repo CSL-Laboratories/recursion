@@ -265,11 +265,11 @@ started. See `docs/plans/hermes-project-pilot-phase8-handoff.md`.
 
 Run pilots through the real hierarchy, not by manually driving worker commands.
 
-1. **Chiron success pilot:** one small, reversible, build-verifiable goal from Telegram instruction to
+1. **Success pilot:** one small, reversible, build-verifiable goal from Telegram instruction to
    project pilot, Claude worker, independent verifier, review branch, terminal reports, and stop.
-2. **Chiron assist pilot:** force a real ambiguity; verify pilot -> Head Hermes -> Lucas -> answer ->
+2. **Assist pilot:** force a real ambiguity; verify pilot -> Head Hermes -> Lucas -> answer ->
    same task resumes with the answer and does not double-run.
-3. **GSC offline pilot:** one existing offline machine-gated task only. No live game action. Preserve
+3. **Offline pilot:** one existing offline machine-gated task only. No live game action. Preserve
    the existing conformance/native-diff stack and prove no test, fixture, oracle, or baseline changed.
 4. **Parallel pilot:** two project topics, one goal each, proving isolation, capacity control, and
    correct reporting without shared-state corruption.
@@ -305,7 +305,7 @@ Production promotion requires:
 - Workers create review branches only. Lucas remains the only merge/deploy authority.
 ## Explicit non-goals
 
-- No live Cubic Castles/game automation in this plan.
+- No live game automation in this plan.
 - No autonomous protected-branch merge or production deployment.
 - No replacement of the canonical file/event store with Hermes Kanban or model memory.
 - No permanently burning model process per project; pilots are durable identities invoked by events.

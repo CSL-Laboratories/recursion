@@ -10,18 +10,9 @@ D-010). Hermes is the executive control plane; Claude Code is a bounded executor
 final authority and merges every review branch himself. Read it before changing how the
 loop is driven.
 
-This repository contains the existing supervisory system and the specifications,
-experiments and construction tooling for Recursion v3, a provider-neutral agent platform.
-
-**Not** part of Golden Stallion or CSL Labs — it supervises them without being one of them.
-
-<!-- superseded-by: CONTROL_PLANE.md (2026-08-06, D-011) -->
-> **Changed 2026-08-06 (D-011).** This used to read "those push status *into* here; this
-> repo never reaches into them." Recursion now keeps a **live git clone** of every
-> registered project and derives status from git, because hand-pushed copies went stale
-> silently and read exactly like working state. The original intent — a small blast radius
-> — is preserved by **per-repo deploy keys** rather than by refusing to read: each key
-> reaches exactly one repo, and no account-level credential lives on the box.
+This repository contains the Recursion v3 product: its kernel and adapter contracts,
+specifications, experiments, and construction tooling. Recursion is a provider-neutral
+agent platform. Other repositories and workstreams are separate and are not embedded here.
 
 ## Layout
 
@@ -38,9 +29,7 @@ experiments and construction tooling for Recursion v3, a provider-neutral agent 
 | `schemas/control-plane/v2/` | Reviewed | Strict wire contracts for control-plane records |
 | `scripts/mvp_*.py` | Reviewed | MVP contracts, packet kernel, adapters, orchestration, and control surface |
 | `scripts/execution_fabric.py` | Reviewed | Placement, leases, recovery, verification receipts, and review integration |
-| `research/` | Stable | Deep research reports + "what this changes" notes. Git history here is valuable |
-| `state/` | Runtime | Canonical goals, tasks, decisions, events, inbox, and generated views; project status comes from live git clones |
-| `curriculum/` | Weekly | Syllabus map, generated problem sets |
+| `state/` | Runtime | Canonical goals, tasks, decisions, events, inbox, and generated views |
 | `loop/` | Rare | Supervisor scripts, prompts, routing config |
 | `docs/` | Reviewed | Architecture, operator guides, plans, and exact-source audits |
 
@@ -55,7 +44,7 @@ The custom harness is implemented and independently accepted on
   and local Qwen;
 - host/pool-aware placement, durable leases, replay-safe results, restart recovery,
   authenticated verification receipts, and serialized same-project integration;
-- Telegram command semantics for `/today`, `/status`, `/why`, `/next`, `/chiron`,
+- Telegram command semantics for `/today`, `/status`, `/why`, `/next`,
   `/budget`, `/pause`, `/resume`, and `/approve`;
 - a source-only second-box controller-death watchdog;
 - review-only publication through `scripts/publish.sh`.

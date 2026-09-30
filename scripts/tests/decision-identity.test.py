@@ -32,18 +32,18 @@ spec.loader.exec_module(queue)
 def raw(**changes: object) -> dict:
     value: dict = {
         "id": "decision-fixed",
-        "actor": "pilot-chiron",
+        "actor": "pilot-example-ops",
         "verb": "work",
         "args": ["task-one"],
         "text": "first effect",
         "plan": {"step": "one"},
         "instruction_id": "instruction-one",
-        "project": "chiron",
+        "project": "example-ops",
         "goal": "goal-one",
         "why": "deterministic reconciliation",
         "wrong_if": "state changed",
         "decision_source": "project-reconciler",
-        "routed_decider": "pilot-chiron",
+        "routed_decider": "pilot-example-ops",
         "idempotency_key": "fixed-key",
     }
     value.update(changes)

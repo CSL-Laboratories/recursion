@@ -100,8 +100,6 @@ CTX="$(
   echo; bash scripts/board-summary.sh --ledger 2>/dev/null || true
   echo; echo "===== DURABLE LESSONS (the box's own memory) ====="; cat state/LESSONS.md 2>/dev/null || true
   echo; echo "===== OPEN SELF-IMPROVEMENT PROPOSALS (surface, don't apply) ====="; tail -n 40 state/PROPOSALS.md 2>/dev/null || true
-  echo; echo "===== PHYSICS GAP MAP ====="; cat state/gap-map.json 2>/dev/null || true
-  echo; echo "===== SYLLABUS LEAD ====="; cat curriculum/syllabus-map.md 2>/dev/null || true
   echo; echo "===== CURRENT INBOX ====="; cat state/INBOX.md 2>/dev/null || true
   echo; echo "===== YESTERDAY'S SNAPSHOT (for the 'changed since' diff) ====="; cat "$SNAP" 2>/dev/null || true
 )" || true

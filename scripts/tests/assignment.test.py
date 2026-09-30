@@ -39,7 +39,7 @@ def check(condition: bool, label: str) -> None:
 
 BASE_KWARGS = dict(
     task_id="task-001", project_id="proj-001", role="implementer",
-    source_repository="/opt/golden-stallion", source_branch="loop/work/task-001",
+    source_repository="/opt/example-project", source_branch="loop/work/task-001",
     source_sha="a" * 40, engine="claude", provider="anthropic-claude-code",
     host="gs-recursion", sandbox_profile="strict-linux", network_policy="provider-only",
     network_profile="anthropic",

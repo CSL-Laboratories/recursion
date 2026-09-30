@@ -1,7 +1,7 @@
 # Operating rules — Recursion
 
-This repo supervises other work. Agents operating here have write access to state that
-other systems read. Treat mistakes as expensive.
+This repo is the Recursion product and its control plane. Agents operating here have write
+access to state that other systems read. Treat mistakes as expensive.
 
 Read `CONTROL_PLANE.md` first — it says who decides. Read `ANCHOR.md` before any planning
 task — it says what is in scope.
@@ -39,13 +39,8 @@ advance. If you are not certain you are in one, you are not.
    `state/INBOX.md`) and stop. A human flips flags — including turning autonomy *down*.
 4. **No secrets in tracked files, logs, or notifications.** Credentials live in `.env`
    (gitignored). If you find a secret committed, stop and report — do not rewrite history.
-5. ~~**Never modify files under `state/projects/`.**~~
-   <!-- superseded-by: CONTROL_PLANE.md (2026-08-06, D-011) -->
-   > **SUPERSEDED 2026-08-06 (D-011).** Those files were hand-pushed copies, and all four
-   > sat unchanged for days while the supervisor quoted them as current status. Project
-   > state is now read from **live git clones** on the box, so there is no copy to protect.
-   > The rule that replaces it: **never fabricate project status.** If a clone cannot be
-   > fetched or a required file is absent, that is a blocker — not a status line.
+5. **Never fabricate status.** If a required source cannot be read or a needed file is
+   absent, that is a blocker — not a status line.
 6. **Never edit the control plane as part of a product task.** `CONTROL_PLANE.md`,
    `ANCHOR.md`, `state/DECISIONS.md`, `scripts/`, and `.env` are protected paths. A build
    arm that touches them fails its gate.
@@ -59,8 +54,7 @@ write to `state/INBOX.md` instead of choosing when:
 
 - A task could be interpreted two materially different ways
 - Completing it requires a decision not recorded in `DECISIONS.md`
-- A source conflicts with something in `research/`
-- A physics answer can't be verified against a known-solution source
+- A source conflicts with the accepted product specifications in `docs/`
 
 A stopped job with a clear question beats four hours of plausible wrong work.
 
@@ -70,18 +64,6 @@ The morning brief is **one page**. Hard cap.
 
 Generating more material than can be reviewed creates a backlog, not progress. When there's
 more to say, prioritize and drop the rest — do not append.
-
-Problem sets: 3–6 problems, targeting current gaps. Not comprehensive coverage.
-
-## Physics-specific
-
-- **Ground on verified problems.** Source from real problem sets with known solutions.
-  Generate *sequencing*, not problems, unless explicitly asked.
-- **Do not deliver solutions on request.** The struggle is the point. Hints escalate in
-  stages; full solutions only after a genuine attempt exists in the log.
-- Run dimensional analysis and limiting-case checks on any derivation before presenting it.
-- If confidence in a physics claim is low, say so in-line. Confident wrong physics is the
-  worst possible output of this system.
 
 ## Style
 

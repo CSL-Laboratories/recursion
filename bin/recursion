@@ -58,7 +58,7 @@ case "$CMD" in
 
   open)
     # Assemble a context handle for a workstream — the deep-dive escape hatch.
-    WS="${1:?workstream (a state/projects/<name> stem, e.g. golden-stallion)}"
+    WS="${1:?workstream (a state/projects/<name> stem)}"
     PF="state/projects/$WS.md"
     echo "=== RECURSION CONTEXT HANDLE — workstream: $WS ==="
     echo "generated: $(date -u +%FT%TZ)"

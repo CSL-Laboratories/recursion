@@ -24,7 +24,7 @@ from typing import Any, Mapping, Sequence
 import mvp_contracts as contracts
 
 
-READ_COMMANDS = frozenset({"/today", "/status", "/why", "/next", "/chiron", "/budget"})
+READ_COMMANDS = frozenset({"/today", "/status", "/why", "/next", "/budget"})
 MUTATING_COMMANDS = frozenset({"/pause", "/resume", "/approve"})
 COMMANDS = READ_COMMANDS | MUTATING_COMMANDS
 SHA256_ZERO = "0" * 64
@@ -223,49 +223,6 @@ def _work_items(value: Any, label: str, evidence_ids: set[str]) -> list[dict[str
     return result
 
 
-def _validate_chiron(value: Any, evidence_ids: set[str]) -> dict[str, Any]:
-    fields = {"status", "canonical_ref", "source_sha", "last_fetched_at", "gates",
-              "blockers", "evidence_refs"}
-    record = _strict(value, fields, "chiron status")
-    if record["status"] not in {"ready", "not-ready", "unknown"}:
-        raise ControlSurfaceError("INVALID_FIELD", "chiron status is invalid")
-    _text(record["canonical_ref"], "chiron canonical_ref", maximum=256)
-    if record["source_sha"] is not None:
-        _source_sha(record["source_sha"], "chiron source_sha")
-    if record["last_fetched_at"] is not None:
-        _instant(record["last_fetched_at"], "chiron last_fetched_at")
-    if not isinstance(record["blockers"], list) or len(record["blockers"]) > MAX_ITEMS:
-        raise ControlSurfaceError("INVALID_FIELD", "chiron blockers must be a bounded list")
-    for blocker in record["blockers"]:
-        _text(blocker, "chiron blocker", maximum=1_024)
-    if not isinstance(record["gates"], list) or len(record["gates"]) > MAX_ITEMS:
-        raise ControlSurfaceError("INVALID_FIELD", "chiron gates must be a bounded list")
-    gate_ids = set()
-    for gate in record["gates"]:
-        checked = _strict(gate, {"id", "status", "evidence_ref"}, "chiron gate")
-        ident = _ident(checked["id"], "chiron gate id")
-        if ident in gate_ids:
-            raise ControlSurfaceError("INVALID_FIELD", "duplicate chiron gate")
-        gate_ids.add(ident)
-        if checked["status"] not in {"pass", "fail", "pending", "unknown"}:
-            raise ControlSurfaceError("INVALID_FIELD", "chiron gate status is invalid")
-        _ident(checked["evidence_ref"], "chiron gate evidence_ref")
-        if checked["evidence_ref"] not in evidence_ids:
-            raise ControlSurfaceError("EVIDENCE_MISMATCH", "chiron gate evidence is absent")
-    refs = _ids(record["evidence_refs"], "chiron evidence_refs", allow_empty=False)
-    if not set(refs).issubset(evidence_ids):
-        raise ControlSurfaceError("EVIDENCE_MISMATCH", "chiron evidence is absent")
-    statuses = {gate["status"] for gate in record["gates"]}
-    if record["status"] == "ready" and (record["source_sha"] is None or record["blockers"]
-                                         or statuses - {"pass"} or not record["gates"]):
-        raise ControlSurfaceError("CHIRON_CONTRADICTION", "ready Chiron status lacks passing evidence")
-    if record["status"] == "not-ready" and not record["blockers"]:
-        raise ControlSurfaceError("CHIRON_CONTRADICTION", "not-ready Chiron status lacks blockers")
-    if record["status"] == "unknown" and not record["blockers"]:
-        raise ControlSurfaceError("CHIRON_CONTRADICTION", "unknown Chiron status must explain missing truth")
-    return record
-
-
 def _validate_budget(value: Any) -> dict[str, Any]:
     fields = {"quota_status", "active_workers", "worker_capacity", "review_queue",
               "review_capacity", "month_spend_cents", "month_ceiling_cents",
@@ -293,7 +250,7 @@ def _validate_budget(value: Any) -> dict[str, Any]:
 
 _SNAPSHOT_FIELDS = {"schema_version", "kind", "source_sha", "observed_at", "expires_at",
                     "pause_observed", "today", "active_work", "reasons", "next_work",
-                    "chiron", "budget", "evidence_refs", "snapshot_digest"}
+                    "budget", "evidence_refs", "snapshot_digest"}
 
 
 @_boundary("control snapshot")
@@ -316,7 +273,6 @@ def validate_snapshot(value: Any, *, reference_time: Any | None = None) -> dict[
         raise ControlSurfaceError("INVALID_FIELD", "reasons must be a bounded list")
     for reason in record["reasons"]:
         _text(reason, "reason")
-    _validate_chiron(record["chiron"], evidence_ids)
     _validate_budget(record["budget"])
     _sha256(record["snapshot_digest"], "snapshot_digest")
     if not hmac.compare_digest(record["snapshot_digest"], _digest(record, "snapshot_digest")):
@@ -480,13 +436,6 @@ def _read_message(command: str, snapshot: Mapping[str, Any]) -> str:
         return "Why: " + ("; ".join(displayed) + suffix if reasons else "no rationale recorded in the current snapshot.")
     if command == "/next":
         return _format_items("Next", snapshot["next_work"])
-    if command == "/chiron":
-        chiron = snapshot["chiron"]
-        revision = f"{chiron['canonical_ref']}@{chiron['source_sha']}" if chiron["source_sha"] else chiron["canonical_ref"]
-        shown = chiron["blockers"][:8]
-        suffix = f"; plus {len(chiron['blockers']) - len(shown)} more" if len(chiron["blockers"]) > len(shown) else ""
-        blockers = "; ".join(shown) + suffix if shown else "none"
-        return f"Chiron: {chiron['status']} at {revision}. Blockers: {blockers}."
     budget = snapshot["budget"]
     return (f"Budget: quota {budget['quota_status']}; workers {budget['active_workers']}/"
             f"{budget['worker_capacity']}; review queue {budget['review_queue']}/"

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # conduct.sh — the PARALLEL continuation engine (parallel-loops.md). Where drain.sh runs queued
 # tasks strictly one at a time, conduct.sh runs up to N at once — at most ONE build per workstream
-# (work.sh's per-workstream lock is the backstop), so chiron / gsc / future workstreams build
+# (work.sh's per-workstream lock is the backstop), so independent workstreams build
 # concurrently. Same bounds as drain so it can never run away or grind the Max quota.
 #
 # Bounds (env, human-set):

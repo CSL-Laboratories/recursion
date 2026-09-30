@@ -89,8 +89,8 @@ state/escalations.tsv
 #   loop/prompts/   scratch prompts handed to a reviewer model
 #   loop/artifacts/ arm reports. STAGING, not the canonical home: an arm commits its note into
 #                   the TARGET repo on loop/work/<id>. Verified before adding this line — all 5
-#                   notes present were byte-identical (md5) to their copies in
-#                   golden-stallion-client origin/main, so nothing unique is being hidden.
+#                   notes present were byte-identical (md5) to their copies on the target repo's
+#                   default branch, so nothing unique is being hidden.
 .hermes/
 loop/prompts/
 loop/artifacts/

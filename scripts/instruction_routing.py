@@ -77,38 +77,38 @@ HISTORICAL_INSTRUCTIONS = {
     "707": {
         "fields": {
             "schema_version": "1", "id": "707", "received": "2026-08-13T22:07:26Z",
-            "principal": "8913126684", "topic": "6", "project_id": "golden-stallion-client",
-            "pilot_id": "pilot-golden-stallion-client", "pilot_memory_key": "telegram-topic:6",
+            "principal": "8913126684", "topic": "6", "project_id": "example-client",
+            "pilot_id": "pilot-example-client", "pilot_memory_key": "telegram-topic:6",
             "routing_target": "head-hermes", "reply_correlation": "telegram:-1003894008732:6:707",
             "deduplication_key": "telegram:-1003894008732:6:707", "from": "8913126684",
-            "chat": "-1003894008732", "thread": "6", "project": "golden-stallion-client",
+            "chat": "-1003894008732", "thread": "6", "project": "example-client",
         },
         "body": (
-            "Propose a fresh offline golden-stallion-client pilot plan to reduce the verified "
+            "Propose a fresh offline example-client pilot plan to reduce the verified "
             "0x6c shade-tops under-emission in user-client/render, using new v2 plan, goal, and "
             "task identities and the deployed required seed, scope, provider, and forced-on gate "
             "contracts. Do not reuse or edit the closed v1 plan, goal, task, or window."
         ),
         "failed_actions": {
             "action-bb38398a6e0e3859a1a7d263":
-                "6572b4c5115f499258da36663c9c5a697a9a41049758a53cb080a65c35243db7",
+                "af458e205eeb003b107a14207169132da6671747841a950a31d25461410e6faa",
             "action-4a90005df9c9dfe6cbb7fbad":
-                "b65903d93da048083a255ed647b9e226cc140ebf7cd672bcab3ecb4c62544db4",
+                "c5c9d98446a503f003bb9e19411b4904f3f46aa05c9486494c7736520952a425",
             "action-cbba158e3295fb82bdf6e06c":
-                "270478743ba73a2a54f30c1a918aaff9c5fe579b9015a0a015f45bbc96d4fa70",
+                "70b808b373755be5a25a789ef4fe2522cec875d8d889d8cfdf1f05b2efda4c7f",
         },
         "initial_document_sha256":
-            "402aa9aea90a4d9c7dbedfcaff0cd34b1388f8d52ddc72dd57b94983d048d677",
+            "8cb7171363d5c174073ac7f79f6c001ce3045b270667f7bdb6c257d57760e4e8",
     },
     "732": {
         "fields": {
             "schema_version": "1", "id": "732", "received": "2026-08-13T22:11:01Z",
-            "principal": "8913126684", "topic": "6", "project_id": "golden-stallion-client",
-            "pilot_id": "pilot-golden-stallion-client", "pilot_memory_key": "telegram-topic:6",
-            "routing_target": "pilot-golden-stallion-client",
+            "principal": "8913126684", "topic": "6", "project_id": "example-client",
+            "pilot_id": "pilot-example-client", "pilot_memory_key": "telegram-topic:6",
+            "routing_target": "pilot-example-client",
             "reply_correlation": "telegram:-1003894008732:6:732",
             "deduplication_key": "telegram:-1003894008732:6:732", "from": "8913126684",
-            "chat": "-1003894008732", "thread": "6", "project": "golden-stallion-client",
+            "chat": "-1003894008732", "thread": "6", "project": "example-client",
         },
         "body": "Authorize one Head Hermes turn to escalate instruction 707 as a routing blocker.",
     },
@@ -420,7 +420,7 @@ def require_707_terminal(base: Path) -> None:
     action = matches[0]
     coupled = {part.strip() for part in prior["fields"].get("action_ids", "").split(",") if part.strip()}
     if action.get("id") not in coupled or action.get("actor") != "head-hermes" \
-            or action.get("routed_decider") != "head-hermes" or action.get("project") != "golden-stallion-client" \
+            or action.get("routed_decider") != "head-hermes" \
             or action.get("goal_id") != "routing-integrity" or action.get("attempts") != 1:
         raise RoutingError("instruction 707 routing-refusal action is not coupled to reviewed authority")
     path = base / "state/actions" / f"{action['id']}.json"

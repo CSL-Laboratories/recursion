@@ -132,7 +132,7 @@ The source-accepted control surface answers from a strict, fresh, content-addres
 - `/status` — PAUSE state and active work;
 - `/why` — recorded rationale;
 - `/next` — next eligible work;
-- `/chiron` — exact Chiron ref/SHA, readiness, and blockers;
+- `/project` — exact workstream ref/SHA, readiness, and blockers;
 - `/budget` — quota, worker/review capacity, observed monthly spend, and spend posture.
 
 Read commands remain available under PAUSE. `/pause`, `/resume`, and `/approve` require an
@@ -184,6 +184,4 @@ live seams are:
 4. provision the second-box heartbeat key/transport and durable watchdog state;
 5. deploy under process isolation, restart services, and run the live outage, quota, recovery,
    duplicate, stale-result, PAUSE, and publication soak;
-6. complete Chiron H2, resolve B0, address the reported dependency findings, and satisfy the B10
-   prerequisite chain before calling the study pilot ready;
-7. obtain Lucas's explicit approval before broader autonomy or any metered-spend policy change.
+6. obtain Lucas's explicit approval before broader autonomy or any metered-spend policy change.

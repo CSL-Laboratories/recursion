@@ -3,14 +3,14 @@
 #
 # WHY THIS AND NOT ONE BIG BRIEF. The daily brief is a portfolio view for the supervisor, and it
 # is the right shape for "what should happen next across everything". It is the wrong shape for
-# "how is chiron doing", which is the question actually asked in a project's thread.
+# "how is a project doing", which is the question actually asked in a project's thread.
 #
 # ★ AND IT IS WHAT MAKES A TOPIC INTO A PILOT. The hermes gateway keys a conversational session
 # per (chat, thread) — verified: agent:main:telegram:group:-1003894008732:1. So every project
 # topic ALREADY gets its own session with its own history. What it lacks is any idea which
 # project it belongs to: it is the generic assistant, with no roadmap, no gates, no branches.
 # Posting this digest into the topic puts those facts INTO that session's history, so when Lucas
-# asks a question in the chiron thread the answer is grounded in chiron rather than in nothing.
+# asks a question in a project's thread the answer is grounded in that project's state.
 # The identity comes from the thread's contents, which costs one message instead of a second
 # agent per project.
 #

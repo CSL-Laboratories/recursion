@@ -34,17 +34,13 @@ front + shared brain; the workstreams report into it, it routes work out.
 
 | Workstream | Runs on | Interaction | Autonomy ceiling | Why |
 |---|---|---|---|---|
-| GSC engine (client reconstruction) | **local Windows** (needs live `cubic.exe` + CheatEngine oracle) | background | **high** | machine oracle: native mesh @0x006FA210 scores its own output |
 | Fleet ops (vend/disco/holla) | gs-worker-nbg + operator API | background | medium | auto-fix reversible; escalate costly/risky; mining = DO-NOT-DEPLOY |
-| Learning loop | interactive, anywhere; state in Recursion | **foreground** | low (by design) | the value is the live Socratic loop |
 | Supervision + routing | gs-recursion-nbg (always-on) | background | — | the dispatcher + ledger + alerting |
 
-**Key principle: autonomy scales with machine-verifiability.** GSC has a ground-truth oracle, so
-autonomous iteration there is self-reviewing and can't create the unreviewable backlog ANCHOR warns
-about. Fleet work is partially checkable → auto the safe part, escalate the rest. Learning is
-interactive by nature. Because GSC + fleet are background and learning is foreground, they
-parallelize: Lucas lives in the tutoring while the renderer grinds and the fleet self-heals, all
-reporting into one ledger.
+**Key principle: autonomy scales with machine-verifiability.** A workstream with a ground-truth
+oracle is self-reviewing and can't create the unreviewable backlog ANCHOR warns about. Fleet work is
+partially checkable → auto the safe part, escalate the rest. Background workstreams then run
+concurrently: the fleet self-heals while the rest of the work proceeds, all reporting into one ledger.
 
 ## Recursion v2 harness — accepted source architecture
 
@@ -89,12 +85,12 @@ bounded workers behind that harness. **This is what makes a 24/7 brain fit the q
 Tiers (names are a skin over the function — rename freely):
 
 - **Lua — routine heartbeat.** Cheap, frequent health/status checkins (fleet alive? queue draining?
-  GSC loop progressing? anything new in the ledger?). Runs on the cheapest tier (local rules /
+  build loop progressing? anything new in the ledger?). Runs on the cheapest tier (local rules /
   OpenRouter). Escalates up only on a real signal.
 - **Terra & Sol — decision agents (mid-tier reasoning).** Fire only when Lua surfaces something.
   - **Terra** — infrastructure/fleet: keep workers alive, refill queues, replace jailed accounts
     within guardrails, "build/repair infra" moves.
-  - **Sol** — keep the productive loop going: GSC iteration direction, learning-loop scheduling.
+  - **Sol** — keep the productive loop going: iteration direction and scheduling.
   - Run on `claude -p` (Claude subscription, flat) for hard reasoning, or GPT/Codex, or cheap
     OpenRouter per `routing.yaml`.
 - **Hermes — the front/router.** The single interface Lucas talks to + the message bus between tiers
@@ -158,13 +154,13 @@ reasons; it does not write the renderer. When something needs DOING it spawns an
 
 | Arm | Runs on | Cost | For |
 |---|---|---|---|
-| Claude Opus (top tier), `claude -p` | Claude Max sub (flat) | ~$0 at margin, kept OFF the 24/7 path (weekly limit) | deep single-focus work — GSC client/RE, renderer, hard multi-file coding — and the conductor session you drop into |
+| Claude Opus (top tier), `claude -p` | Claude Max sub (flat) | ~$0 at margin, kept OFF the 24/7 path (weekly limit) | deep single-focus work — hard multi-file coding and long independent tasks — and the conductor session you drop into |
 
 <!-- superseded-by: CONTROL_PLANE.md (2026-08-06, D-010) -->
 > **SUPERSEDED — the Claude row only.** Claude is a **bounded executor**, not "the conductor session
 > you drop into": one task, one worktree, allowed paths, explicit non-goals, a machine-checkable
 > gate. Deep steering happens with Hermes. *Still true:* Claude is the deep single-focus arm for
-> GSC / RE / renderer work and stays off the 24/7 path — that cost and capability reasoning is
+> hard independent work and stays off the 24/7 path — that cost and capability reasoning is
 > unchanged, and is exactly why it remains the executor of choice for hard work.
 | OpenRouter → Deepseek-class, price-sorted | metered ($) | the ONLY per-token spend | (a) bulk PARALLEL cheap coverage; (b) last-resort fallback if Codex OAuth is down |
 
@@ -187,13 +183,13 @@ $200 sub is maximized — the entire 24/7 brain lives inside it.
 Every proposed action is scored on **reversibility × cost × ambiguity × verifiability.** Higher on
 any axis → higher it escalates.
 
-- **Auto (act, log only)** — reversible, cheap, machine-verifiable. GSC iterations that pass the
-  oracle. Fleet: kick a wedged bot, restart a crashed worker, refill a queue.
+- **Auto (act, log only)** — reversible, cheap, machine-verifiable. Oracle-gated iterations that pass.
+  Fleet: kick a wedged bot, restart a crashed worker, refill a queue.
 - **Notify (act, then tell Lucas async)** — worth knowing, didn't need approval. Committed a branch;
   auto-replaced an account within the jail-plague guardrail. → daily digest + Telegram.
 - **Escalate (block on Lucas)** — irreversible / expensive / ambiguous / unverifiable. Provisioning
-  accounts (spends money + proxies), major reconfig, merging GSC to `main`, ANYTHING mining
-  (DO-NOT-DEPLOY), a decision not in `DECISIONS.md`, a physics claim unverifiable against a known
+  accounts (spends money + proxies), major reconfig, merging a workstream to `main`, ANYTHING mining
+  (DO-NOT-DEPLOY), a decision not in `DECISIONS.md`, a claim unverifiable against a known
   solution. → `state/INBOX.md` + Telegram ping, and WAIT.
 
 This is the scaffold's "escalate, don't guess" made mechanical.
@@ -226,8 +222,8 @@ prioritized, drop rather than append.
 - **Carry no state.** Every scheduled run RE-DERIVES current state from the ledger + ground truth
   (oracle / fleet-status / DB) at run time. A state block baked into a prompt rots in days and reads
   as working (memory: `handoff-prompts-must-carry-no-state`).
-- **Per-workstream working set.** Each loop keeps its own small state (GSC: current gap + last oracle
-  scores; fleet: health snapshot; learning: gap-map) — not one bloated shared context.
+- **Per-workstream working set.** Each loop keeps its own small state (e.g. current gap + last check
+  scores; a fleet health snapshot) — not one bloated shared context.
 - **Route context depth by tier**, like compute: Lua gets the check only; Terra/Sol get the relevant
   slice; the conductor gets the full ledger on demand.
 - **Guard the digest.** Summaries drop quiet-but-important facts (memory: `digests-miss-inert`).
@@ -254,8 +250,6 @@ OpenRouter? (the $ column, cross-checked by `fallback-watch.sh`) and is generati
 
 ## Where everything runs
 
-- **Windows (Lucas's box):** GSC oracle loop (live `cubic.exe` + CheatEngine MCP + client code). GSC
-  autonomy is local.
 - **gs-worker-nbg (Hetzner):** fleet workers (vend/disco/holla) via German residential proxy.
 - **gs-recursion-nbg (Hetzner, always-on):** dispatcher (Lua/Terra/Sol/Hermes), state ledger, cron,
   fleet monitor, alerting.
@@ -271,13 +265,6 @@ Luna/Terra/Sol supervisor are all thin API CLIENTS — the model itself runs in 
 OpenRouter's cloud. They execute on gs-recursion-nbg and reach those APIs over the network. So the
 brain and nearly every arm are 24/7 and do NOT need your computer on. That is the whole reason
 Recursion gets its own always-on box (D-I).
-
-**The one exception — the GSC oracle.** The client-reconstruction loop scores itself against the
-native mesh in live `cubic.exe` via CheatEngine — Windows-local, game-bound, and it CANNOT move to a
-headless VPS. So oracle-gated GSC iteration is the single workstream that pauses when your PC is off.
-Recursion handles this by treating your PC as an INTERMITTENT worker: it queues oracle jobs and hands
-them to a local runner when the box is up, and keeps everything else flowing on the VPS meanwhile.
-Non-oracle GSC work (planning, code that needs no live measurement) still runs on the VPS.
 
 **What actually costs money — it is NOT VPS traffic.** Three cost buckets, only one scales:
 - *Bandwidth:* negligible and flat. The Hetzner CX box includes ~20 TB/mo egress; AI API calls are
@@ -303,9 +290,7 @@ one thing per tier — see "The model roster" above. No rename needed.
 
 ## Build order — the dispatcher is the enabler, not a blocked step (2026-08-05)
 
-The dispatcher does NOT wait on Chiron or the GSC client; those are workstreams it supervises, not
+The dispatcher does NOT wait on any particular workstream; those are workstreams it supervises, not
 prerequisites. So: fleet first (active, near-done), the **dispatcher second** — the moment it exists,
 every other workstream plugs into it and is run *through* Recursion instead of hand-opened. Building
-it early changes how the later work gets worked; it is not step 2 of a queue. (GSC = build the
-working *client* — net/crypto/protocol/world/behaviors/game + the custom renderer — not the renderer
-alone.)
+it early changes how the later work gets worked; it is not step 2 of a queue.

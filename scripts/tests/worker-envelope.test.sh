@@ -43,7 +43,7 @@ STUB
 chmod +x "$BIN/claude"
 
 # disposable repo with a realistic shape (a protected tree and a product tree)
-R="$TMP/repo"; mkdir -p "$R/scripts/tests" "$R/apps/chiron" "$R/other" "$R/state/tasks" "$R/loop/logs"
+R="$TMP/repo"; mkdir -p "$R/scripts/tests" "$R/apps/example-ops" "$R/other" "$R/state/tasks" "$R/loop/logs"
 cp "$SRC/scripts/work.sh" "$R/scripts/"
 cp "$SRC/scripts/assignment-token.py" "$R/scripts/"
 cp "$SRC/scripts/worker-sandbox.sh" "$R/scripts/"
@@ -89,7 +89,7 @@ cp "$SRC/scripts/engine_contract.py" "$R/scripts/"
 cp "$SRC/scripts/pilot_instruction.py" "$R/scripts/"
 cp "$SRC/scripts/seed_contract.py" "$R/scripts/"
 cp "$SRC/scripts/project_authority.py" "$R/scripts/"
-printf 'seed\n' > "$R/apps/chiron/seed.txt"
+printf 'seed\n' > "$R/apps/example-ops/seed.txt"
 printf 'protected fixture\n' > "$R/scripts/tests/existing.test.cjs"
 : > "$R/.env"
 # The repo gets a real (local, bare) origin and a registry row, because work.sh will not build
@@ -180,8 +180,8 @@ PY
 }
 
 # --- 1) ★ CONTROL: an in-scope change with a green gate must PASS ---------------------------
-mktask t-ok "apps/chiron" "test -s apps/chiron/new.txt"
-run_case t-ok 'mkdir -p apps/chiron && echo hello > apps/chiron/new.txt'
+mktask t-ok "apps/example-ops" "test -s apps/example-ops/new.txt"
+run_case t-ok 'mkdir -p apps/example-ops && echo hello > apps/example-ops/new.txt'
 if [ "$(status_of t-ok)" = "passed" ]; then
   ok "★ CONTROL — an in-scope change with a green gate PASSES (the gate is not refusing everything)"
 else
@@ -190,8 +190,8 @@ else
 fi
 
 # --- 2) writing a CONTROL-PLANE file is refused --------------------------------------------
-mktask t-cp "apps/chiron" "test -s apps/chiron/a.txt"
-run_case t-cp 'mkdir -p apps/chiron && echo x > apps/chiron/a.txt && echo "evil" > scripts/pwn.sh'
+mktask t-cp "apps/example-ops" "test -s apps/example-ops/a.txt"
+run_case t-cp 'mkdir -p apps/example-ops && echo x > apps/example-ops/a.txt && echo "evil" > scripts/pwn.sh'
 if [ "$(status_of t-cp)" != "passed" ] && inbox_tail | grep -q 'SCOPE VIOLATION'; then
   ok "control-plane write (scripts/) is REFUSED and escalated"
 else
@@ -199,8 +199,8 @@ else
 fi
 
 # --- 3) editing a TEST file is refused (the gate cannot see this) ---------------------------
-mktask t-test "apps/chiron" "test -s apps/chiron/b.txt"
-run_case t-test 'mkdir -p apps/chiron && echo x > apps/chiron/b.txt && echo "assert(true)" >> scripts/tests/existing.test.cjs'
+mktask t-test "apps/example-ops" "test -s apps/example-ops/b.txt"
+run_case t-test 'mkdir -p apps/example-ops && echo x > apps/example-ops/b.txt && echo "assert(true)" >> scripts/tests/existing.test.cjs'
 if [ "$(status_of t-test)" != "passed" ]; then
   ok "editing a *.test.cjs is REFUSED (tamper path the acceptance gate cannot detect)"
 else
@@ -208,8 +208,8 @@ else
 fi
 
 # --- 4) wandering outside allowed_paths is refused ------------------------------------------
-mktask t-out "apps/chiron" "test -s apps/chiron/c.txt"
-run_case t-out 'mkdir -p apps/chiron other && echo x > apps/chiron/c.txt && echo y > other/stray.txt'
+mktask t-out "apps/example-ops" "test -s apps/example-ops/c.txt"
+run_case t-out 'mkdir -p apps/example-ops other && echo x > apps/example-ops/c.txt && echo y > other/stray.txt'
 if [ "$(status_of t-out)" != "passed" ] && inbox_tail | grep -qF 'other/stray.txt'; then
   ok "a write outside allowed_paths is REFUSED and names the offending path"
 else
@@ -219,8 +219,8 @@ fi
 
 # --- 5) ★ ORDER: the scope check runs BEFORE the acceptance gate ----------------------------
 # The predicate is valid and side-effect-free. On a scope violation it must never be recorded.
-mktask t-order "apps/chiron" "test -s apps/chiron/d.txt" worker-result-v1
-run_case t-order 'mkdir -p apps/chiron && echo x > apps/chiron/d.txt && echo evil > scripts/pwn2.sh'
+mktask t-order "apps/example-ops" "test -s apps/example-ops/d.txt" worker-result-v1
+run_case t-order 'mkdir -p apps/example-ops && echo x > apps/example-ops/d.txt && echo evil > scripts/pwn2.sh'
 order_gate_evidence="$(machine_gate_evidence t-order)"
 if [ "$order_gate_evidence" = absent ] && [ "$(status_of t-order)" != "passed" ]; then
   ok "★ the scope check runs BEFORE the gate (implementer record has no machine_gate entry)"
@@ -233,7 +233,7 @@ fi
 # --- 6) a `blocked` result escalates the arm's QUESTION and skips the gate -------------------
 # A blocked result short-circuits before the gate: work.sh escalates the arm's own question and
 # never runs the acceptance command. Two deliberate choices here:
-#  - The gate is a valid non-vacuous predicate (apps/chiron/seed.txt is never created in scope),
+#  - The gate is a valid non-vacuous predicate (apps/example-ops/seed.txt is never created in scope),
 #    so it passes validate-gate.py's anti-vacuity check but WOULD FAIL if it ran.
 #  - The task is intentionally NOT under the worker-result-v1 strict contract. A minimal blocked
 #    result does not satisfy that schema, so requiring it would make the arm escalate on a
@@ -242,7 +242,7 @@ fi
 # gate was skipped -- no separate run-record witness is needed for this case (unlike t-order,
 # where status and the escalation reason cannot distinguish scope-before-gate from
 # scope-after-gate, so the machine_gate witness is required there).
-mktask t-blocked "apps/chiron" "test -s apps/chiron/seed.txt"
+mktask t-blocked "apps/example-ops" "test -s apps/example-ops/seed.txt"
 run_case t-blocked 'printf "{\"status\":\"blocked\",\"summary\":\"two readings\",\"blocker\":\"Which realm is the target?\"}" > .recursion-result.json'
 if [ "$(status_of t-blocked)" = "blocked" ] && inbox_tail | grep -q 'Which realm is the target'; then
   ok "an ambiguity STOP is recorded as blocked and carries the arm's own question (blocked, not failed, so the gate was skipped)"
@@ -263,7 +263,7 @@ done
 exit 0
 STUB
 chmod +x "$BIN/claude"
-mktask t-prompt "apps/chiron" "test -s apps/chiron/seed.txt"
+mktask t-prompt "apps/example-ops" "test -s apps/example-ops/seed.txt"
 export STUB_PROMPT_OUT="$TMP/prompt.txt"
 ( cd "$R" && PATH="$BIN:$PATH" RECURSION_ROOT="$R" RECURSION_NO_NOTIFY=1 RECURSION_GIT_FETCH=0 \
     RECURSION_TEST_WORKER=logical STUB_PROMPT_OUT="$TMP/prompt.txt" bash scripts/work.sh t-prompt ) >/dev/null 2>&1

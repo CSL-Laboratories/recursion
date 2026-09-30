@@ -100,7 +100,7 @@ if [ -x scripts/resync.sh ]; then
 fi
 
 # --- 0.6) Intake. AWARENESS, so it runs even while paused. ---------------------------------
-# Reads what Lucas said in the cockpit out of the gateway's own store and files it as durable
+# Reads what Lucas said in the dashboard out of the gateway's own store and files it as durable
 # instructions. It does NOT poll Telegram — the hermes gateway already long-polls getUpdates on
 # this token, and two pollers steal updates from each other, losing messages silently.
 #

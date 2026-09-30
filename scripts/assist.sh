@@ -7,7 +7,7 @@
 # `blocked_on:` and appends a note to state/INBOX.md, which is a file the arm never reads. So on
 # the next run the arm receives the IDENTICAL prompt, reasons identically, and blocks on the
 # identical question. That is not an escalation; it is a loop with a human inside it, and it is
-# the reason the GSC pilot cannot run — GSC work blocks on things only Lucas can supply (a live
+# the reason a pilot cannot run — project work blocks on things only Lucas can supply (a live
 # capture, an in-game observation, a call about what the RE actually means).
 #
 # So an assist is a first-class object with two halves that must both exist:
@@ -43,8 +43,8 @@ TASKCTL="$ROOT/scripts/taskctl.sh"
 NOTIFY="$ROOT/scripts/notify.sh"
 CMD="${1:-list}"; shift 2>/dev/null || true
 now(){ date -u +%FT%TZ; }
-# An assist is routed by the TASK's repo, so a GSC question lands in the GSC topic rather
-# than in a general stream where it competes with build noise for attention.
+# An assist is routed by the TASK's repo, so a project question lands in that project's topic
+# rather than in a general stream where it competes with build noise for attention.
 taskrepo(){ sed -n 's/^repo: *//p' "$ROOT/state/tasks/$1.md" 2>/dev/null | head -1 | tr -d '\r'; }
 ASSIST_PROJECT="$(taskrepo "${1:-}" 2>/dev/null || true)"
 DURABLE_REPORTING=0

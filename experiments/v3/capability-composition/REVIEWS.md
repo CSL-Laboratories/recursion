@@ -60,8 +60,21 @@ independently observed behavior. Treat this suite as a **scaffold**.
   dead + 4 shadowed mutants, **R3** observed-lane record missing provenance/disposition — all fixed
   in the cleanup commit. **R4** the oracle manifest mirrors the candidate's construction (independence
   rests on the literal anchor); **R5** inherited partial fidelity.
-- **Still open:** F12 wrapper/role coverage and strict absent-vs-null matching in the invariants
-  lane. The cleanup commit changes tested code, so re-verification is required.
+- **Second independent verification (OpenAI Codex GPT-6, candidate `c08c93f`):** **REJECT** the
+  strengthened-conformance claim, with executed probes — F06 accepted an always-refusing candidate
+  (the positive control bypassed `M.admit_import`), F16 accepted an empty recorded completion when
+  the returned text looked valid, and F11 accepted corrupted changed-core bytes. This was correct:
+  a rerun-only ACCEPT is insufficient without adversarial-candidate probes.
+- **Slice 5 (2026-10-02):** closes the confirmed counterexamples — F06 now exercises the authorized
+  path **through the candidate** and asserts admitted effect + useful completion (always-refuse and
+  quiet mutants detected); F16 binds the returned artifact to the **recorded completion payload**
+  (hash/length) and derives validity from it, with an empty-completion-but-valid-return mutant and an
+  all-refusing candidate exercised; F11 asserts **exact changed-core bytes** and detects a corrupt-core
+  mutant. Also: strict (key-present) matching in the invariants lane; per-case result records;
+  `check_suite.py` now **fails closed** on any unreferenced mutant.
+- **Still open:** F12 wrapper/role coverage; fuller per-case provenance in the observed/fixture lanes;
+  strict absent-vs-null across every case. The Slice-5 commit changes tested code, so another
+  independently pinned verification is required.
 
 ## Rule
 

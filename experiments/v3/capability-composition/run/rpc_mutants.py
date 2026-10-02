@@ -64,6 +64,15 @@ def m_forged_authority(sink, ledger, envelope, *, op_id) -> dict:
     return {"outcome": "completed"}
 
 
+def m_always_refuse(sink, ledger, envelope, *, op_id) -> dict:
+    sink.perform(op_id, None)
+    return {"outcome": "refused"}
+
+
+def m_quiet_no_effect(sink, ledger, envelope, *, op_id) -> dict:
+    return {"outcome": "completed"}
+
+
 # --- F08 evidence conflict ---
 def m_evidence_synth(sources) -> dict:
     return {"refs": [sources[0]["ref"]], "disagreement": False, "decision": sources[0]["value"]}
@@ -150,6 +159,19 @@ def m_graph_selected_presence_only(graph) -> dict:
 # --- F16 useful worker (observed) ---
 def m_worker_silent(boundary, mode, *, op_id="op.work", subject="owner:grant7") -> dict:
     return {"outcome": "pass", "artifact": ""}
+
+
+def m_worker_refuse(boundary, mode, *, op_id="op.work", subject="owner:grant7") -> dict:
+    boundary.sink.perform(op_id, None)
+    return {"outcome": "pass", "artifact": ""}
+
+
+def m_invalid_emit_valid_return(boundary, mode, *, op_id="op.work", subject="owner:grant7") -> dict:
+    artifact = {"normal_A": "answer-A\n", "normal_B": "answer-B\n", "invalid": ""}.get(mode, "")
+    proof = boundary.ledger.issue_proof(subject)
+    if boundary.sink.perform(op_id, proof):
+        boundary.sink.complete(op_id, b"")
+    return {"outcome": "pass", "artifact": artifact}
 
 
 # --- F07 procedure precedence ---

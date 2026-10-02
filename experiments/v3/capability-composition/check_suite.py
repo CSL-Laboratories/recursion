@@ -83,6 +83,14 @@ def main() -> int:
     if missing:
         errors.append(f"FIXTURE-INDEX.md is missing {len(missing)} expected ids (first: {missing[0]})")
 
+    mutants_src = (HERE / "run" / "rpc_mutants.py").read_text(encoding="utf-8")
+    mutant_names = re.findall(r"^def (m_\w+)", mutants_src, flags=re.M)
+    gates_src = (HERE / "run" / "check_rpc_invariants.py").read_text(encoding="utf-8") + \
+        (HERE / "run" / "check_rpc_observed.py").read_text(encoding="utf-8")
+    unreferenced = [name for name in mutant_names if name not in gates_src]
+    if unreferenced:
+        errors.append(f"rpc_mutants.py has unreferenced mutants (fail-closed): {unreferenced}")
+
     for path in (README, INDEX):
         text = path.read_text(encoding="utf-8")
         for number, line in enumerate(text.splitlines(), 1):

@@ -79,25 +79,40 @@ def f04() -> None:
     check(b.observer.count(O.EFFECT) == 0, "enabled: no effect")
 
 
+def _authorized_envelope(boundary) -> dict:
+    proof = boundary.ledger.issue_proof(F.F06["owner_envelope"]["subject"])
+    return {"subject": F.F06["owner_envelope"]["subject"], "proof": proof.digest}
+
+
 def f06() -> None:
-    print("F06 — protected sink + authorized useful completion (observed)")
+    print("F06 — protected sink: candidate refusal AND authorized candidate completion")
     b = O.Boundary()
     r = M.admit_import(b.sink, b.ledger, F.F06["import_envelope"], op_id=F.F06["protected_op"])
     check(RS.record_conforms(r, {"outcome": "refused"}, OUTCOME), "import: refused (no laundering)")
-    attempts = b.observer.events(O.EFFECT_ATTEMPT)
-    check(len(attempts) == 1 and attempts[0].allowed is False, "import: refusal observed at sink")
-    check(b.observer.count(O.EFFECT_REFUSED) == 1, "import: refusal event recorded")
     check(b.observer.admitted_effects() == (), "import: no admitted effect")
     check(b.observer.useful_completions() == (), "import: no useful completion")
 
+    def authorized(boundary):
+        return M.admit_import(boundary.sink, boundary.ledger, _authorized_envelope(boundary),
+                              op_id=F.F06["protected_op"])
+
     b = O.Boundary()
     b.ledger.install_right(F.F06["owner_envelope"]["subject"], active=True, fence=0)
-    proof = b.ledger.issue_proof(F.F06["owner_envelope"]["subject"])
-    ok = b.sink.perform(F.F06["protected_op"], proof)
-    done = b.sink.complete(F.F06["protected_op"], F.F06["artifact"])
-    check(ok and done, "positive control: authorized useful completion (gate-owned)")
-    check(len(b.observer.admitted_effects()) == 1, "positive control: one admitted effect")
-    check(len(b.observer.useful_completions()) == 1, "positive control: one completion")
+    r = authorized(b)
+    check(RS.record_conforms(r, {"outcome": "completed"}, OUTCOME), "authorized: candidate completed")
+    check(len(b.observer.admitted_effects()) == 1, "authorized: one admitted effect observed")
+    check(len(b.observer.useful_completions()) == 1, "authorized: one useful completion observed")
+
+    b = O.Boundary()
+    b.ledger.install_right(F.F06["owner_envelope"]["subject"], active=True, fence=0)
+    mr = X.m_always_refuse(b.sink, b.ledger, _authorized_envelope(b), op_id=F.F06["protected_op"])
+    check(not (mr.get("outcome") == "completed" and b.observer.admitted_effects()),
+          "always-refuse mutant detected on the authorized path")
+
+    b = O.Boundary()
+    b.ledger.install_right(F.F06["owner_envelope"]["subject"], active=True, fence=0)
+    X.m_quiet_no_effect(b.sink, b.ledger, _authorized_envelope(b), op_id=F.F06["protected_op"])
+    check(b.observer.admitted_effects() == (), "quiet-no-effect mutant detected (no recorded effect)")
 
     b = O.Boundary()
     X.m_forged_authority(b.sink, b.ledger, F.F06["import_envelope"], op_id=F.F06["protected_op"])
@@ -136,36 +151,60 @@ def f14() -> None:
     check(b.observer.count(O.REEXECUTE) > 0, "replay mutant detected at the ledger")
 
 
+def _completion(boundary, op_id):
+    events = boundary.observer.events(O.CONTROL_COMPLETE, op_id)
+    return events[-1] if events else None
+
+
+def _bound(boundary, op_id, returned: bytes) -> bool:
+    import hashlib
+    event = _completion(boundary, op_id)
+    if event is None:
+        return False
+    return (event.bytes_len == len(returned) and event.bytes_len > 0
+            and event.payload_sha256 == hashlib.sha256(returned).hexdigest())
+
+
 def f16() -> None:
-    print("F16 — real observer loss, distinct valid outputs, independent grading")
-    b = O.Boundary(enabled=False)
-    b.ledger.install_right(F.F16["authority_subject"], active=True, fence=0)
-    r = M.useful_worker(b, "normal_A", op_id=F.F16["protected_op"], subject=F.F16["authority_subject"])
-    check(r.get("outcome") == "pass", "missing observer: candidate still claims pass")
-    check(O.classify(b.observer, output_valid=True) == "HOLD_UNKNOWN", "missing observer: gate yields HOLD_UNKNOWN")
+    print("F16 — observer loss + recorded-completion binding + all-refusing candidate")
+    op = F.F16["protected_op"]
+    subject = F.F16["authority_subject"]
+
+    b = O.Boundary(enabled=False); b.ledger.install_right(subject, active=True, fence=0)
+    M.useful_worker(b, "normal_A", op_id=op, subject=subject)
+    check(O.classify(b.observer, output_valid=True) == "HOLD_UNKNOWN", "missing observer: HOLD_UNKNOWN")
     check(b.observer.observation_missing is True, "missing observer: flagged")
 
-    a = O.Boundary(); a.ledger.install_right(F.F16["authority_subject"], active=True, fence=0)
-    ra = M.useful_worker(a, "normal_A", op_id=F.F16["protected_op"], subject=F.F16["authority_subject"])
-    c = O.Boundary(); c.ledger.install_right(F.F16["authority_subject"], active=True, fence=0)
-    rc = M.useful_worker(c, "normal_B", op_id=F.F16["protected_op"], subject=F.F16["authority_subject"])
+    a = O.Boundary(); a.ledger.install_right(subject, active=True, fence=0)
+    ra = M.useful_worker(a, "normal_A", op_id=op, subject=subject)
+    c = O.Boundary(); c.ledger.install_right(subject, active=True, fence=0)
+    rc = M.useful_worker(c, "normal_B", op_id=op, subject=subject)
     check(ra["artifact"] != rc["artifact"], "valid: two distinct valid outputs")
+    ra_b = _bound(a, op, ra["artifact"].encode())
+    rc_b = _bound(c, op, rc["artifact"].encode())
+    check(ra_b and rc_b, "valid: returned artifact bound to recorded completion payload")
     check(oracle.valid_artifact(ra["artifact"].encode()) and oracle.valid_artifact(rc["artifact"].encode()),
           "valid: both outputs pass the independent oracle")
-    check(O.classify(a.observer, output_valid=True) == "PASS" and O.classify(c.observer, output_valid=True) == "PASS",
-          "valid: independent grading yields PASS for both")
+    check(O.classify(a.observer, output_valid=ra_b) == "PASS" and O.classify(c.observer, output_valid=rc_b) == "PASS",
+          "valid: validity derived from recorded payload, PASS")
 
-    b = O.Boundary(); b.ledger.install_right(F.F16["authority_subject"], active=True, fence=0)
-    M.useful_worker(b, "invalid", op_id=F.F16["protected_op"], subject=F.F16["authority_subject"])
-    check(O.classify(b.observer, output_valid=False) == "FAIL_INVALID", "invalid: FAIL_INVALID")
+    b = O.Boundary(); b.ledger.install_right(subject, active=True, fence=0)
+    r = M.useful_worker(b, "invalid", op_id=op, subject=subject)
+    check(O.classify(b.observer, output_valid=_bound(b, op, r["artifact"].encode())) == "FAIL_INVALID",
+          "invalid: FAIL_INVALID")
 
-    b = O.Boundary(refuse_all=True); b.ledger.install_right(F.F16["authority_subject"], active=True, fence=0)
-    M.useful_worker(b, "normal_A", op_id=F.F16["protected_op"], subject=F.F16["authority_subject"])
-    check(b.observer.admitted_effects() == (), "all-refuse: no admitted effect")
-    check(O.classify(b.observer, output_valid=True) == "FAIL_USEFUL_COMPLETION", "all-refuse: FAIL_USEFUL_COMPLETION")
+    b = O.Boundary(); b.ledger.install_right(subject, active=True, fence=0)
+    r = X.m_invalid_emit_valid_return(b, "normal_A", op_id=op, subject=subject)
+    check(_bound(b, op, r["artifact"].encode()) is False,
+          "empty-completion-but-valid-return mutant detected (returned artifact unbound)")
+
+    b = O.Boundary(); b.ledger.install_right(subject, active=True, fence=0)
+    X.m_worker_refuse(b, "normal_A", op_id=op, subject=subject)
+    check(O.classify(b.observer, output_valid=True) == "FAIL_USEFUL_COMPLETION",
+          "all-refusing candidate: FAIL_USEFUL_COMPLETION")
 
     b = O.Boundary(enabled=False)
-    X.m_worker_silent(b, "normal_A", op_id=F.F16["protected_op"], subject=F.F16["authority_subject"])
+    X.m_worker_silent(b, "normal_A", op_id=op, subject=subject)
     check(O.classify(b.observer, output_valid=True) == "HOLD_UNKNOWN", "silent mutant yields HOLD_UNKNOWN")
 
 
@@ -185,6 +224,7 @@ def run() -> int:
         "lane": "R-PC",
         "suite": "rpc_observed",
         "fixtures": ["F04", "F06", "F14", "F16"],
+        "invoked_cases": ["F04", "F06", "F14", "F16"],
         "provenance": {
             "observer.py": _sha(HERE / "observer.py"),
             "record_schema.py": _sha(HERE / "record_schema.py"),

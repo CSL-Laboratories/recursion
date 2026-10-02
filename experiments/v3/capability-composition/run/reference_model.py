@@ -86,3 +86,13 @@ def render_invalid_coordinate(sources: list[Source]):
 def render_gap_spans(sources: list[Source]):
     out, ranges, spans = render(sources)
     return out, ranges, list(spans[:-1])
+
+
+def render_corrupt_core(sources: list[Source]):
+    """Keeps length/ranges but corrupts the core bytes (detected by exact-byte assertions)."""
+    out, ranges, spans = render(sources)
+    corrupted = bytearray(out)
+    start, end = ranges.get("core", (0, 0))
+    for i in range(start, end):
+        corrupted[i] = ord("X")
+    return bytes(corrupted), ranges, spans

@@ -92,6 +92,9 @@ def run() -> int:
         "core change shifts offsets to [9,19) [19,24)",
     )
     check(out_core[:18] != out_a[:18], "core change changes the prefix")
+    check(out_core == b"CONTROL2\nPROCEDURE\nDATA\n", "F11 exact changed-core bytes")
+    corrupt_out, _, _ = candidate.render_corrupt_core(to_sources(rpc.CORE_CHANGE))
+    check(corrupt_out != out_core, "corrupt-core mutant detected by the exact-byte assertion")
 
     print("R-PC F12 — span/role coverage, Unicode byte units")
     out_u, ranges_u, _ = candidate.render(to_sources(rpc.UNICODE))
@@ -124,6 +127,7 @@ def run() -> int:
         "lane": "R-PC",
         "suite": "rpc_fixtures",
         "fixtures": ["F01", "F11", "F12"],
+        "invoked_cases": ["F01", "F11", "F12"],
         "provenance": {
             "reference_model.py": _sha(HERE / "reference_model.py"),
             "oracle.py": _sha(HERE / "oracle.py"),

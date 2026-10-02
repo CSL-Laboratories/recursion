@@ -26,10 +26,16 @@ import, no dynamic import); every planted mutant detected; per-case provenance p
 `results/*.json`; and the still-open items (F12 wrapper/role coverage; strict absent-vs-null matching
 in the invariants lane) are **not** over-claimed. A changed candidate again restarts verification.
 
-**Status.** The strengthened suite was accepted at `c08c93f` (GLM-5.3-Flash) with residuals R1–R3
-(stale committed results hashes; 6 dead + 4 shadowed mutants; observed-lane record missing
-provenance/disposition), now fixed in the cleanup commit. Because that commit changes tested code,
-verify the **cleanup commit** (PR #165 head) with the same commands and checks.
+**Status.** Two independent verifications disagree, and the stronger one governs:
+- GLM-5.3-Flash **ACCEPT** at `c08c93f` (rerun + mutant detection), later **REJECTED** by
+  OpenAI Codex GPT-6 with executed probes: F06 always-refusing-candidate, F16 empty-completion with
+  a valid-looking return, F11 corrupted changed-core bytes. See
+  `results/c08c93fb…-openai-codex-gpt-6.md`.
+- **Slice 5** closes those three counterexamples (candidate-routed F06 authorized path;
+  recorded-completion binding in F16; exact changed-core bytes + corrupt-core mutant in F11), adds
+  strict matching, per-case records and a fail-closed mutant-registry check.
+- The Slice-5 commit changes tested code, so verify the **current PR #165 head** with the same
+  commands. Open: F12 wrapper/role coverage and fuller per-case provenance.
 
 ## Verdict
 

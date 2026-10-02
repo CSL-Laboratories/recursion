@@ -26,6 +26,7 @@ from fixtures import rpc_invariants as F  # noqa: E402
 RESULTS = HERE.parent / "results"
 failures: list[str] = []
 invoked: list[str] = []
+case_results: list[dict] = []
 
 
 def _sha(path: Path) -> str:
@@ -40,7 +41,8 @@ def check(condition: bool, message: str) -> None:
 
 
 def matches(got: dict, expected: dict) -> bool:
-    return all(got.get(k) == v for k, v in expected.items())
+    # Strict: expected keys must be PRESENT (absent is not accepted as None) and equal.
+    return all(k in got and got[k] == v for k, v in expected.items())
 
 
 def case(name: str, fn, mutant_fn=None) -> None:
@@ -50,8 +52,12 @@ def case(name: str, fn, mutant_fn=None) -> None:
     ok = matches(got, expected)
     detail = "" if ok else f" got={got} expected_subset={expected}"
     check(ok, f"{name}: candidate matches expected{detail}")
+    detected = None
     if mutant_fn is not None:
-        check(not matches(mutant_fn(), expected), f"{name}: planted mutant is detected")
+        detected = not matches(mutant_fn(), expected)
+        check(detected, f"{name}: planted mutant is detected")
+    case_results.append({"case": name, "expected": expected, "observed": got,
+                         "candidate_ok": ok, "mutant_detected": detected})
 
 
 def run() -> int:
@@ -152,6 +158,7 @@ def run() -> int:
         "expected_cases": sorted(E.EXPECTED),
         "invoked_cases": invoked,
         "case_count": len(invoked),
+        "case_results": case_results,
         "provenance": {
             "rpc_model.py": _sha(HERE / "rpc_model.py"),
             "rpc_expected.py": _sha(HERE / "rpc_expected.py"),

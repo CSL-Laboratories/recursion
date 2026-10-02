@@ -6,10 +6,15 @@
     "F11",
     "F12"
   ],
+  "invoked_cases": [
+    "F01",
+    "F11",
+    "F12"
+  ],
   "provenance": {
-    "reference_model.py": "d1c3550d0ea9dbe1c6791145b78a00d2d70ce5023b16c08727f43001e99afd2b",
+    "reference_model.py": "1ac7098c6e026a5dfaff3a2cda65bd140a6eee02c701980bfc2a4c40f894d870",
     "oracle.py": "cf4376972ffbeccda6aaf99f1ee8b55cb2ee15c4be30407ef9f3a093825915a3",
-    "gate": "98a83e416c3d2aeb54d5498f256e3db60c582f421b55762cf5b6f2aecf97ac99",
+    "gate": "1acb0f63af7027315772727e10229aafd85b935cb5d4a18f11ef480a196093b7",
     "python": "3.12.10"
   },
   "disposition": "PASS",

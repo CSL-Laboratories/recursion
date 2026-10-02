@@ -10,6 +10,12 @@ def m_summary_equal_seed(summary_a: dict, summary_b: dict) -> dict:
     return {"a_ref": b"same", "b_ref": b"same", "distinct": False}
 
 
+def m_summary_concatenation(summary_a: dict, summary_b: dict) -> dict:
+    ref_a = summary_a["input"] + b"|" + summary_a["output"]
+    ref_b = summary_b["input"] + b"|" + summary_b["output"]
+    return {"a_ref": ref_a, "b_ref": ref_b, "distinct": ref_a != ref_b}
+
+
 def m_replay_regenerates(recorded: bytes | None) -> dict:
     return {"outcome": "ok", "bytes": b"regenerated", "model_calls": 1}
 

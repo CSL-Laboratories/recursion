@@ -7,11 +7,18 @@ gate (`check_rpc_observed.py`).
 """
 from __future__ import annotations
 
+# Third, literal anchor for the F01 canonical manifest (independent of candidate<->oracle agreement).
+RPC_EXPECTED_MANIFEST_F01 = (
+    b'{"profile":"rpc-canonical:v1","ranges":{"core":[0,8],"evidence":[18,23],'
+    b'"skill":[8,18]},"total":23}'
+)
+
 EXPECTED: dict[str, dict] = {
     # F02 generated-summary identity
     "F02_identity": {"distinct": True},
     "F02_replay": {"outcome": "ok", "model_calls": 0},
     "F02_missing": {"outcome": "reproduction_input_unavailable"},
+    "F02_collision": {"distinct": True},
     # F03 closure over a dependency graph
     "F03_valid": {"outcome": "ok", "dispatched": True, "mandatory": ["S02:v1", "S03:v1"],
                   "loaded": ["O1:v1", "S02:v1", "S03:v1"], "dropped": ["O2:v1", "O3:v1"]},

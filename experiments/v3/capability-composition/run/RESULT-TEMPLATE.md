@@ -5,6 +5,8 @@
 - Date (YYYY-MM-DD):
 - Candidate repository + commit SHA:
 - Fresh checkout? (yes/no):
+- Provenance (source/candidate hashes from results/*.json):
+- Disposition vs failures (results/*.json `disposition` / `failures`):
 
 ## Commands run (raw outputs inline or attached)
 

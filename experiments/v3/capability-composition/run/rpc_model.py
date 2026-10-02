@@ -7,10 +7,16 @@ from __future__ import annotations
 
 
 # --- F02 generated-summary identity -------------------------------------------------------------
-def summary_identity(summary_a: dict, summary_b: dict) -> dict:
-    ref_a = summary_a["input"] + b"|" + summary_a["output"]
-    ref_b = summary_b["input"] + b"|" + summary_b["output"]
-    return {"a_ref": ref_a, "b_ref": ref_b, "distinct": ref_a != ref_b}
+def identity_encoding(input_bytes: bytes, output_bytes: bytes, profile: str = "rpc-identity:v1") -> bytes:
+    fields = (b"profile", profile.encode(), b"input", input_bytes, b"output", output_bytes)
+    return b"".join(len(f).to_bytes(8, "big") + f for f in fields)
+
+
+def summary_identity(summary_a: dict, summary_b: dict, profile: str = "rpc-identity:v1") -> dict:
+    import hashlib
+    ref_a = hashlib.sha256(identity_encoding(summary_a["input"], summary_a["output"], profile)).digest()
+    ref_b = hashlib.sha256(identity_encoding(summary_b["input"], summary_b["output"], profile)).digest()
+    return {"a_ref": ref_a, "b_ref": ref_b, "distinct": ref_a != ref_b, "profile": profile}
 
 
 def replay(recorded: bytes | None) -> dict:

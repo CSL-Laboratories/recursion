@@ -25,6 +25,12 @@ from fixtures import rpc_invariants as F  # noqa: E402
 
 RESULTS = HERE.parent / "results"
 failures: list[str] = []
+invoked: list[str] = []
+
+
+def _sha(path: Path) -> str:
+    import hashlib
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def check(condition: bool, message: str) -> None:
@@ -38,6 +44,7 @@ def matches(got: dict, expected: dict) -> bool:
 
 
 def case(name: str, fn, mutant_fn=None) -> None:
+    invoked.append(name)
     expected = E.EXPECTED[name]
     got = fn()
     ok = matches(got, expected)
@@ -53,6 +60,8 @@ def run() -> int:
          lambda: X.m_summary_equal_seed(F.SUMMARY_A, F.SUMMARY_B))
     case("F02_replay", lambda: M.replay(b"summary-A"), lambda: X.m_replay_regenerates(b"summary-A"))
     case("F02_missing", lambda: M.replay(None))
+    case("F02_collision", lambda: M.summary_identity(F.SUMMARY_COLLISION[0], F.SUMMARY_COLLISION[1]),
+         lambda: X.m_summary_concatenation(F.SUMMARY_COLLISION[0], F.SUMMARY_COLLISION[1]))
 
     # F03 closure over a dependency graph
     def f03_valid():
@@ -140,8 +149,18 @@ def run() -> int:
         "suite": "rpc_invariants",
         "fixtures": ["F02", "F03", "F05", "F07", "F08", "F09", "F10", "F13", "F15"],
         "deferred": ["F17", "F18"],
-        "cases": len(E.EXPECTED),
+        "expected_cases": sorted(E.EXPECTED),
+        "invoked_cases": invoked,
+        "case_count": len(invoked),
+        "provenance": {
+            "rpc_model.py": _sha(HERE / "rpc_model.py"),
+            "rpc_expected.py": _sha(HERE / "rpc_expected.py"),
+            "rpc_mutants.py": _sha(HERE / "rpc_mutants.py"),
+            "gate": _sha(HERE / "check_rpc_invariants.py"),
+            "python": sys.version.split()[0],
+        },
         "failures": failures,
+        "disposition": "PASS" if not failures else "FAIL",
         "scope": "bounded synthetic; provider-free; not Owner acceptance",
     }
     RESULTS.mkdir(exist_ok=True)

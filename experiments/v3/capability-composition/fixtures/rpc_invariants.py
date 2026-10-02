@@ -9,6 +9,11 @@ from __future__ import annotations
 # F02 — recorded summaries with equal generation settings but different actual outputs
 SUMMARY_A = {"input": b"prompt-A", "output": b"summary-A"}
 SUMMARY_B = {"input": b"prompt-A", "output": b"summary-B"}
+# Adversarial pair that a naive `input|output` concatenation would collide (Q09).
+SUMMARY_COLLISION = [
+    {"input": b"a|b", "output": b"c"},
+    {"input": b"a", "output": b"b|c"},
+]
 
 # F03 — mandatory closure S02->S03 with optional distractors under two capacities
 CLOSURE = {

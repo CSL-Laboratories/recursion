@@ -1,10 +1,19 @@
 {
   "lane": "R-PC",
+  "suite": "rpc_fixtures",
   "fixtures": [
     "F01",
     "F11",
     "F12"
   ],
+  "provenance": {
+    "reference_model.py": "d1c3550d0ea9dbe1c6791145b78a00d2d70ce5023b16c08727f43001e99afd2b",
+    "oracle.py": "cf4376972ffbeccda6aaf99f1ee8b55cb2ee15c4be30407ef9f3a093825915a3",
+    "gate": "98a83e416c3d2aeb54d5498f256e3db60c582f421b55762cf5b6f2aecf97ac99",
+    "python": "3.12.10"
+  },
+  "disposition": "PASS",
+  "failures": [],
   "results": {
     "F01": {
       "output_hex": "434f4e54524f4c0a50524f4345445552450a444154410a",

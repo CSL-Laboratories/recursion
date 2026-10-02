@@ -46,8 +46,14 @@ independently observed behavior. Treat this suite as a **scaffold**.
   (governor compare-and-install over a transition history), **F13** (admitted route registry),
   **F15** (validated provider selection), **F05** (coalesced preference history + positive control)
   and **F07** (permutation-invariant authorized override); stronger one-field mutants.
-- Remaining: **Slice 4** (span/manifest/prefix + identity framing + per-case provenance). Re-
-  verification is required after these tested-code changes.
+- **Slice 4 (2026-10-02):** F01/F11/F12 now assert exact spans + byte-complete coverage, an
+  independent canonical manifest (plus a literal byte anchor), and the prefix plan, with
+  empty-span/invalid-coordinate/gap mutants detected (Q01); F02 uses length-prefixed identity framing
+  with a collision mutant (Q09); both lane gates record per-case provenance (source hashes, invoked
+  case set, disposition) and `check_suite.py` uses exact id-token matching (Q10).
+- **Still open:** F12 wrapper/role coverage (generated delimiters + imported-role no-authority) and
+  strict (absent-vs-null) matching in the invariants lane. Re-verification is required after these
+  tested-code changes.
 
 ## Rule
 

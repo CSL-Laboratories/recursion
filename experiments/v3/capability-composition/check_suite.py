@@ -78,7 +78,8 @@ def main() -> int:
         return 1
 
     index_text = INDEX.read_text(encoding="utf-8")
-    missing = [fid for fid in EXPECTED_IDS if fid not in index_text]
+    tokens = set(re.findall(r"[A-Za-z0-9-]+", index_text))
+    missing = [fid for fid in EXPECTED_IDS if fid not in tokens]
     if missing:
         errors.append(f"FIXTURE-INDEX.md is missing {len(missing)} expected ids (first: {missing[0]})")
 

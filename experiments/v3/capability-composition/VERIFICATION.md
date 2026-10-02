@@ -9,6 +9,23 @@ handoff is superseded by this record.
 established** (findings Q01–Q10). The affected fixtures are marked `partial` in `FIXTURE-INDEX.md`.
 See `REVIEWS.md`. Treat this suite as a **scaffold**, not full conformance evidence.
 
+**Re-verification (strengthened suite, slices 1–4).** The tested code changed after the `050936e`
+ACCEPT, so that ACCEPT no longer applies. Verify the strengthened suite at the PR #165 merge commit:
+
+```text
+python -X utf8 -B experiments/v3/capability-composition/check_suite.py
+python -X utf8 -B experiments/v3/capability-composition/run/check_rpc_fixtures.py
+python -X utf8 -B experiments/v3/capability-composition/run/check_rpc_invariants.py
+python -X utf8 -B experiments/v3/capability-composition/run/check_rpc_observed.py
+python -X utf8 -B tools/check_public_scope.py
+```
+
+Expected: `capability-composition suite structure clean`, `RPC_FIXTURE_PASS`, `RPC_INVARIANTS_PASS`,
+`RPC_OBSERVED_PASS`. Checks beyond rerun: oracle/observer/expectation independence (no candidate
+import, no dynamic import); every planted mutant detected; per-case provenance present in both
+`results/*.json`; and the still-open items (F12 wrapper/role coverage; strict absent-vs-null matching
+in the invariants lane) are **not** over-claimed. A changed candidate again restarts verification.
+
 ## Verdict
 
 - Independent verifier: **GLM-5.3-Flash** (Z.ai), model id `cheaper-inference/glm-5.3-flash`, 2026-10-02.

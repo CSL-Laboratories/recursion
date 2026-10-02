@@ -26,6 +26,11 @@ import, no dynamic import); every planted mutant detected; per-case provenance p
 `results/*.json`; and the still-open items (F12 wrapper/role coverage; strict absent-vs-null matching
 in the invariants lane) are **not** over-claimed. A changed candidate again restarts verification.
 
+**Status.** The strengthened suite was accepted at `c08c93f` (GLM-5.3-Flash) with residuals R1–R3
+(stale committed results hashes; 6 dead + 4 shadowed mutants; observed-lane record missing
+provenance/disposition), now fixed in the cleanup commit. Because that commit changes tested code,
+verify the **cleanup commit** (PR #165 head) with the same commands and checks.
+
 ## Verdict
 
 - Independent verifier: **GLM-5.3-Flash** (Z.ai), model id `cheaper-inference/glm-5.3-flash`, 2026-10-02.

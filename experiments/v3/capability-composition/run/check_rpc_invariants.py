@@ -92,7 +92,7 @@ def run() -> int:
     policy, reqs = F.PRECEDENCE_POLICY, F.PRECEDENCE["reqs"]
     case("F07_hold", lambda: M.resolve_precedence(reqs, policy, None))
     case("F07_override", lambda: M.resolve_precedence(reqs, policy, "skillA"),
-         lambda: X.m_precedence_last_loaded_v2(reqs, policy, "skillA"))
+         lambda: X.m_precedence_last_loaded(reqs, policy, "skillA"))
     case("F07_override_unauthorized", lambda: M.resolve_precedence(reqs, policy, "skillC"),
          lambda: X.m_precedence_accept_any_override(reqs, policy, "skillC"))
     winners = {M.resolve_precedence(list(perm), policy, "skillA")["winner"] for perm in itertools.permutations(reqs)}

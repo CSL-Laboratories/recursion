@@ -27,6 +27,12 @@ from fixtures import rpc_invariants as F  # noqa: E402
 RESULTS = HERE.parent / "results"
 OUTCOME = RS.RecordSpec((RS.FieldSpec("outcome", str),))
 failures: list[str] = []
+invoked: list[str] = []
+
+
+def _sha(path: Path) -> str:
+    import hashlib
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def check(condition: bool, message: str) -> None:
@@ -179,7 +185,15 @@ def run() -> int:
         "lane": "R-PC",
         "suite": "rpc_observed",
         "fixtures": ["F04", "F06", "F14", "F16"],
+        "provenance": {
+            "observer.py": _sha(HERE / "observer.py"),
+            "record_schema.py": _sha(HERE / "record_schema.py"),
+            "rpc_model.py": _sha(HERE / "rpc_model.py"),
+            "gate": _sha(HERE / "check_rpc_observed.py"),
+            "python": sys.version.split()[0],
+        },
         "failures": failures,
+        "disposition": "PASS" if not failures else "FAIL",
         "scope": "bounded synthetic; provider-free; not Owner acceptance",
     }
     (RESULTS / "rpc_observed_results.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")

@@ -51,9 +51,17 @@ independently observed behavior. Treat this suite as a **scaffold**.
   empty-span/invalid-coordinate/gap mutants detected (Q01); F02 uses length-prefixed identity framing
   with a collision mutant (Q09); both lane gates record per-case provenance (source hashes, invoked
   case set, disposition) and `check_suite.py` uses exact id-token matching (Q10).
-- **Still open:** F12 wrapper/role coverage (generated delimiters + imported-role no-authority) and
-  strict (absent-vs-null) matching in the invariants lane. Re-verification is required after these
-  tested-code changes.
+- **Independent verification (GLM-5.3-Flash, candidate `c08c93f`):** **ACCEPT** — all five gates
+  pass; oracle/observer/expectation/schema modules candidate-free (no dynamic import/eval); all
+  exercised mutants detected including event-level ones; F04/F06/F14/F16 assert on harness-recorded
+  events (F16 turns a candidate "pass" into `HOLD_UNKNOWN` under real observer loss); F01
+  span/manifest/prefix triangulated against §9 and the literal anchor; provenance present; open items
+  honestly partial; non-proofs preserved. Residuals: **R1** stale committed results hashes, **R2** 6
+  dead + 4 shadowed mutants, **R3** observed-lane record missing provenance/disposition — all fixed
+  in the cleanup commit. **R4** the oracle manifest mirrors the candidate's construction (independence
+  rests on the literal anchor); **R5** inherited partial fidelity.
+- **Still open:** F12 wrapper/role coverage and strict absent-vs-null matching in the invariants
+  lane. The cleanup commit changes tested code, so re-verification is required.
 
 ## Rule
 

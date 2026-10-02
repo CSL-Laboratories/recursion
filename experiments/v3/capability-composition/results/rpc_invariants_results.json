@@ -1,5 +1,6 @@
 {
   "lane": "R-PC",
+  "suite": "rpc_invariants",
   "fixtures": [
     "F02",
     "F03",
@@ -15,7 +16,7 @@
     "F17",
     "F18"
   ],
-  "cases": 19,
+  "cases": 31,
   "failures": [],
   "scope": "bounded synthetic; provider-free; not Owner acceptance"
 }

@@ -41,9 +41,13 @@ independently observed behavior. Treat this suite as a **scaffold**.
   schema (`run/record_schema.py`) applied to **F04/F06/F14/F16** in a new gate
   `run/check_rpc_observed.py` — Q02/Q05 addressed for those fixtures; the weak duplicates were
   removed from `check_rpc_invariants.py`.
-- Remaining: **Slice 3** (finite state models F03/F05/F07/F09/F10/F13/F15), **Slice 4**
-  (span/manifest/prefix + identity framing + per-case provenance). Re-verification is required after
-  these tested-code changes.
+- **Slice 3 (2026-10-02):** finite state models for **F03** (dependency-graph closure, exact
+  versions, before-use loads, loss record), **F09** (ABA revision capture + bounded retry), **F10**
+  (governor compare-and-install over a transition history), **F13** (admitted route registry),
+  **F15** (validated provider selection), **F05** (coalesced preference history + positive control)
+  and **F07** (permutation-invariant authorized override); stronger one-field mutants.
+- Remaining: **Slice 4** (span/manifest/prefix + identity framing + per-case provenance). Re-
+  verification is required after these tested-code changes.
 
 ## Rule
 

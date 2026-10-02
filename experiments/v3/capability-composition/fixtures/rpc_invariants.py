@@ -83,3 +83,81 @@ F16 = {
     "protected_op": "op.work",
     "authority_subject": "owner:grant7",
 }
+
+# --- Slice 3 finite state models -----------------------------------------------------------------
+
+# F03 closure over an exact-version dependency graph
+CLOSURE_GRAPH = {
+    "S02:v1": {"requires": ["S03:v1"], "cost": 4, "installed": True, "enabled": True, "authorized": True},
+    "S03:v1": {"requires": [], "cost": 4, "installed": True, "enabled": True, "authorized": True},
+    "O1:v1": {"requires": [], "cost": 3, "installed": True, "enabled": True, "authorized": True},
+    "O2:v1": {"requires": [], "cost": 3, "installed": True, "enabled": True, "authorized": True},
+    "O3:v1": {"requires": [], "cost": 3, "installed": True, "enabled": True, "authorized": True},
+}
+CLOSURE_GRAPH_MISSING = {
+    "S02:v1": {"requires": ["S03:v1"], "cost": 4, "installed": True, "enabled": True, "authorized": True},
+}
+CLOSURE_ROOTS = ["S02:v1"]
+CLOSURE_OPTIONAL = ["O1:v1", "O2:v1", "O3:v1"]
+CLOSURE_CAPACITY_OK = 12
+CLOSURE_CAPACITY_LOW = 6
+
+# F09 coherent cut with ABA
+CUT_ATTEMPTS = {
+    "valid": [
+        {"config": {"revision": "r1", "required_schema": "u2"}, "schema": {"revision": "r1", "value": "u2"}},
+        {"config": {"revision": "r1", "required_schema": "u2"}, "schema": {"revision": "r1", "value": "u2"}},
+    ],
+    "mixed": [
+        {"config": {"revision": "r1", "required_schema": "u2"}, "schema": {"revision": "r1", "value": "u1"}},
+        {"config": {"revision": "r1", "required_schema": "u2"}, "schema": {"revision": "r1", "value": "u1"}},
+    ],
+    "aba_unstable": [
+        {"config": {"revision": "r1", "required_schema": "u2"}, "schema": {"revision": "r1", "value": "u2"}},
+        {"config": {"revision": "r3", "required_schema": "u2"}, "schema": {"revision": "r3", "value": "u2"}},
+    ],
+    "aba_recovered": [
+        {"config": {"revision": "r1", "required_schema": "u2"}, "schema": {"revision": "r1", "value": "u2"}},
+        {"config": {"revision": "r3", "required_schema": "u2"}, "schema": {"revision": "r3", "value": "u2"}},
+        {"config": {"revision": "r3", "required_schema": "u2"}, "schema": {"revision": "r3", "value": "u2"}},
+    ],
+}
+
+# F10 one governor + compare-and-install over a transition history
+GOVERNOR_INITIAL = {"parent": "c1", "epoch": 1, "directive_rev": "d1"}
+GOVERNOR_INSTALL = {
+    "first": [{"type": "install", "id": "A", "parent": "c1", "epoch": 2, "directive_rev": "d1"}],
+    "late": [
+        {"type": "install", "id": "A", "parent": "c1", "epoch": 2, "directive_rev": "d1"},
+        {"type": "install", "id": "B", "parent": "c1", "epoch": 2, "directive_rev": "d1"},
+    ],
+    "duplicate": [
+        {"type": "install", "id": "A", "parent": "c1", "epoch": 2, "directive_rev": "d1"},
+        {"type": "install", "id": "B", "parent": "c2", "epoch": 2, "directive_rev": "d1"},
+    ],
+    "directive": [
+        {"type": "install", "id": "A", "parent": "c1", "epoch": 2, "directive_rev": "d1"},
+        {"type": "directive", "rev": "d2"},
+        {"type": "install", "id": "B", "parent": "c2", "epoch": 3, "directive_rev": "d1"},
+    ],
+}
+
+# F13 route/schema drift
+ROUTE_CURRENT = {"descriptor": "d4", "schema": "u1"}
+ROUTE_REGISTRY = {"d4": {"admitted": True, "schemas": ["u1"]}, "d5": {"admitted": True, "schemas": ["u2"]}}
+ROUTE_REQUEST_READMIT = {"descriptor": "d5", "schema": "u2", "tool_visibility_known": True}
+ROUTE_REQUEST_HOLD = {"descriptor": "d5", "schema": "u2", "tool_visibility_known": False}
+
+# F15 validated provider selection
+PROVIDER_INVALID = {"nodes": {"A": {"deps": []}}, "providers": {"cap": ["p1", "p2"]}, "selected": {"cap": "p3"}}
+PROVIDER_VALID = {"nodes": {"A": {"deps": []}}, "providers": {"cap": ["p1", "p2"]}, "selected": {"cap": "p1"}}
+
+# F05 coalesced preferences with a revoke fence
+PREF_EVENTS = [
+    {"type": "pref", "rev": "p1"},
+    {"type": "revoke", "fence": 8, "grant": "grant7"},
+    {"type": "pref", "rev": "p3"},
+]
+
+# F07 precedence policy
+PRECEDENCE_POLICY = {"admitted": ["skillA", "skillB"], "override_allowed": True}

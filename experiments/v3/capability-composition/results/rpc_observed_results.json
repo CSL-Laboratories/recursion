@@ -17,9 +17,27 @@
     "observer.py": "fbf86bee40230d6047050b780d48272e7ea2d12ce10cf292947197660fca6f62",
     "record_schema.py": "7761708abbbc8581e45d384cce77c8b450fc1cae0289502a92fc76235f9fd14c",
     "rpc_model.py": "3b736364cb346a62328cdf992ca6234704e02c013e1e28498761086c51112eaf",
-    "gate": "9357fda9b6c1927a0ff4333cc832c589605429f2ac24071c4c0b070a3a16622c",
+    "gate": "c509dcf66e4548097524bc93f77944e715de8f2ac64eff36bcfffbcd62a051e5",
     "python": "3.12.10"
   },
+  "case_results": [
+    {
+      "fixture": "F04",
+      "checks_failed": []
+    },
+    {
+      "fixture": "F06",
+      "checks_failed": []
+    },
+    {
+      "fixture": "F14",
+      "checks_failed": []
+    },
+    {
+      "fixture": "F16",
+      "checks_failed": []
+    }
+  ],
   "failures": [],
   "disposition": "PASS",
   "scope": "bounded synthetic; provider-free; not Owner acceptance"

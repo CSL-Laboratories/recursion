@@ -10,6 +10,7 @@ certifies structure only.
 """
 from __future__ import annotations
 
+import json
 import re
 import sys
 from pathlib import Path
@@ -83,13 +84,31 @@ def main() -> int:
     if missing:
         errors.append(f"FIXTURE-INDEX.md is missing {len(missing)} expected ids (first: {missing[0]})")
 
-    mutants_src = (HERE / "run" / "rpc_mutants.py").read_text(encoding="utf-8")
-    mutant_names = re.findall(r"^def (m_\w+)", mutants_src, flags=re.M)
-    gates_src = (HERE / "run" / "check_rpc_invariants.py").read_text(encoding="utf-8") + \
-        (HERE / "run" / "check_rpc_observed.py").read_text(encoding="utf-8")
-    unreferenced = [name for name in mutant_names if name not in gates_src]
-    if unreferenced:
-        errors.append(f"rpc_mutants.py has unreferenced mutants (fail-closed): {unreferenced}")
+    # Closed, unique mutant registry across rpc_mutants.py, reference_model.py and oracle.py.
+    registry = json.loads((HERE / "mutant-registry.json").read_text(encoding="utf-8"))
+    registered = {entry["name"]: entry for entry in registry["mutants"]}
+    patterns = {
+        "rpc_mutants.py": r"^def (m_\w+)",
+        "reference_model.py": r"^def (render_\w+)",
+        "oracle.py": r"^def (expected_ranges_by_codepoint)\b",
+    }
+    declared: dict[str, set[str]] = {}
+    for rel, pattern in patterns.items():
+        names = re.findall(pattern, (HERE / "run" / rel).read_text(encoding="utf-8"), flags=re.M)
+        dups = sorted({n for n in names if names.count(n) > 1})
+        if dups:
+            errors.append(f"run/{rel}: duplicate (shadowed) mutant definitions: {dups}")
+        declared[rel] = {n for n in names if n != "render"}
+    all_declared = set().union(*declared.values())
+    for name in sorted(all_declared - set(registered)):
+        errors.append(f"mutant not in registry (fail-closed): {name}")
+    for name, meta in registered.items():
+        if name not in declared.get(meta["module"], set()):
+            errors.append(f"registry entry not found in module {meta['module']}: {name}")
+            continue
+        gate_src = (HERE / "run" / meta["gate"]).read_text(encoding="utf-8")
+        if f"X.{name}" not in gate_src and f"{name}(" not in gate_src:
+            errors.append(f"registered mutant not referenced by its gate {meta['gate']}: {name}")
 
     for path in (README, INDEX):
         text = path.read_text(encoding="utf-8")

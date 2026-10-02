@@ -10,6 +10,7 @@ acceptance.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -29,8 +30,11 @@ failures: list[str] = []
 
 
 def _sha(path: Path) -> str:
-    import hashlib
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _sha_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
 
 
 def check(condition: bool, message: str) -> None:
@@ -128,6 +132,11 @@ def run() -> int:
         "suite": "rpc_fixtures",
         "fixtures": ["F01", "F11", "F12"],
         "invoked_cases": ["F01", "F11", "F12"],
+        "case_results": [
+            {"fixture": "F01", "output_hex": out_a.hex(), "manifest_sha256": _sha_bytes(cand_manifest)},
+            {"fixture": "F11", "tail_preserves_prefix": out_tail[:18] == out_a[:18], "core_len": len(out_core)},
+            {"fixture": "F12", "total": len(out_u), "note_range": list(ranges_u["note"])},
+        ],
         "provenance": {
             "reference_model.py": _sha(HERE / "reference_model.py"),
             "oracle.py": _sha(HERE / "oracle.py"),

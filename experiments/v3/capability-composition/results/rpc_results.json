@@ -11,10 +11,30 @@
     "F11",
     "F12"
   ],
+  "case_results": [
+    {
+      "fixture": "F01",
+      "output_hex": "434f4e54524f4c0a50524f4345445552450a444154410a",
+      "manifest_sha256": "25bc891a8dd30b66da193006074e085af4595d81f8fd2bb740eeb4dc22f0efe4"
+    },
+    {
+      "fixture": "F11",
+      "tail_preserves_prefix": true,
+      "core_len": 24
+    },
+    {
+      "fixture": "F12",
+      "total": 25,
+      "note_range": [
+        23,
+        25
+      ]
+    }
+  ],
   "provenance": {
     "reference_model.py": "1ac7098c6e026a5dfaff3a2cda65bd140a6eee02c701980bfc2a4c40f894d870",
     "oracle.py": "cf4376972ffbeccda6aaf99f1ee8b55cb2ee15c4be30407ef9f3a093825915a3",
-    "gate": "1acb0f63af7027315772727e10229aafd85b935cb5d4a18f11ef480a196093b7",
+    "gate": "3413f838e679413f15370ac28a67541151cfc4dec22d8ef188de556602460352",
     "python": "3.12.10"
   },
   "disposition": "PASS",

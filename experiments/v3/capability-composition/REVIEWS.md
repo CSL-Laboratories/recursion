@@ -72,9 +72,18 @@ independently observed behavior. Treat this suite as a **scaffold**.
   all-refusing candidate exercised; F11 asserts **exact changed-core bytes** and detects a corrupt-core
   mutant. Also: strict (key-present) matching in the invariants lane; per-case result records;
   `check_suite.py` now **fails closed** on any unreferenced mutant.
-- **Still open:** F12 wrapper/role coverage; fuller per-case provenance in the observed/fixture lanes;
-  strict absent-vs-null across every case. The Slice-5 commit changes tested code, so another
-  independently pinned verification is required.
+- **Static re-review (openai, candidate `2ad590b`):** confirmed the three probe fixes at source level
+  (detection *expected*, not executed) but **rejected the full acceptance claim** on two concrete
+  static gaps — the mutant-registry guard was lexical/incomplete (substring-only, omitted
+  `reference_model`/`oracle` mutants, no uniqueness/invocation enforcement) and per-case provenance
+  was missing in the observed/fixture lanes.
+- **Slice 6 (2026-10-02):** closed those — a **closed `mutant-registry.json`** (32 mutants across
+  `rpc_mutants.py`/`reference_model.py`/`oracle.py`) enforced **fail-closed** by `check_suite.py`
+  (unique per module, registered, gate-referenced), and **per-case records** added to the observed
+  and fixture lanes.
+- **Still open:** F12 wrapper/role coverage; strict absent-vs-null across every case. The Slice-6
+  commit changes tested code, so a fresh **executed** independent verification (authorized run) is
+  required.
 
 ## Rule
 

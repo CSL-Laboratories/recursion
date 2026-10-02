@@ -28,6 +28,13 @@ RESULTS = HERE.parent / "results"
 OUTCOME = RS.RecordSpec((RS.FieldSpec("outcome", str),))
 failures: list[str] = []
 invoked: list[str] = []
+case_results: list[dict] = []
+
+
+def _record(fixture: str, fn) -> None:
+    before = len(failures)
+    fn()
+    case_results.append({"fixture": fixture, "checks_failed": list(failures[before:])})
 
 
 def _sha(path: Path) -> str:
@@ -209,10 +216,10 @@ def f16() -> None:
 
 
 def run() -> int:
-    f04()
-    f06()
-    f14()
-    f16()
+    _record("F04", f04)
+    _record("F06", f06)
+    _record("F14", f14)
+    _record("F16", f16)
 
     obs_src = (HERE / "observer.py").read_text(encoding="utf-8")
     obs_imports = [ln.strip() for ln in obs_src.splitlines() if ln.strip().startswith(("import ", "from "))]
@@ -232,6 +239,7 @@ def run() -> int:
             "gate": _sha(HERE / "check_rpc_observed.py"),
             "python": sys.version.split()[0],
         },
+        "case_results": case_results,
         "failures": failures,
         "disposition": "PASS" if not failures else "FAIL",
         "scope": "bounded synthetic; provider-free; not Owner acceptance",

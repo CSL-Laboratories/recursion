@@ -96,7 +96,7 @@ the Owner ratifies it.
   defines **SB-01…SB-26** with separately recorded bounded synthetic outcomes. The M1A/B/C fixtures
   are the inventory (§7). None of these alone qualifies a production receiver or durability profile.
 - **Status/unknowns:** kernel freeze **conditional**; broker-inclusive vs split model undecided;
-  store (JS1 vs SQL1, §7) and language unselected; power-loss durability unproven.
+  store (JS1 vs SQL1, §3.E) and language unselected; power-loss durability unproven.
 
 ### B. Authority, safety, security, privacy, Stop, sandbox, trusted launch
 - **Owns:** admission authority; monotonic writer fence and revocation; per-adapter effect fencing;

@@ -70,6 +70,10 @@ candidate contract (see the synthesis's local handoff).
   (R-LANG core-language/reconstruction; R-CS control-surface study; Astra static review of the R-PC
   suite + verifier reconciliation). Research evidence only; no technology selected; the R-PC suite is
   a scaffold (rerun ACCEPT, full-spec fidelity ISSUES/NEEDS-EVIDENCE).
+- **Packet-F R-AUDIT return + PR #165 review:** `docs/v3/research-lane/packet-f-raudit-20261002/`
+  (A1–A10 corrections + M1 executable corpus + R-LANG C1–C6 + architecture revision guide; PR #165
+  executed REJECT). Next: revise `docs/v3/architecture/LANGUAGE-AGNOSTIC-ARCHITECTURE.md` (#161)
+  against it, then re-review. R-PLAN/R-OPS not run.
 
 ## Next steps in order
 

@@ -1,0 +1,698 @@
+{
+  "repository": "NotSkittlz/recursion",
+  "source_sha": "9f4122b50dc8117b185b2cd52244a10df3eb4285",
+  "retrieval_date": "2026-10-02",
+  "scope": "Static source inspection only; no project imports/tests/gates executed; no repository writes",
+  "inventory_totals": {
+    "planning": {
+      "bundles": 23,
+      "case_count": 37,
+      "command_count": 267,
+      "receipt_count": 267,
+      "event_count": 253,
+      "decode_failure_count": 11,
+      "replay_case_count": 10,
+      "bytes": 5872494,
+      "alphabets": {
+        "closed_command_types": 22,
+        "closed_event_types": 27,
+        "closed_error_codes": 28,
+        "domain_record_types": 25,
+        "projection_terminal_states": 4,
+        "schema_definitions": 133
+      }
+    },
+    "execution": {
+      "bundles": 24,
+      "lanes": {
+        "RouteFixtureBundle@1": 8,
+        "PluginFixtureBundle@1": 6,
+        "DisabledPluginFixtureBundle@1": 1,
+        "PluginReloadFixtureBundle@1": 1,
+        "ProcessFixtureBundle@1": 4,
+        "BrokerFixtureBundle@1": 4
+      }
+    },
+    "integrity": {
+      "bundles": 24,
+      "lanes": {
+        "EvidenceFixtureBundle@1": 5,
+        "EffectFixtureBundle@1": 5,
+        "PublicationFixtureBundle@1": 5,
+        "StateFixtureBundle@1": 5,
+        "RetentionFixtureBundle@1": 4
+      }
+    }
+  },
+  "files": [
+    {
+      "path": "scripts/tests/v3/planning/fixtures/manifest.json",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/tests/v3/planning/fixtures/manifest.json",
+      "blob_sha": "73cb83e9b50a381214314ba328a880370a3c6654",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 691
+    },
+    {
+      "path": "scripts/tests/v3/execution/fixtures/manifest.json",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/tests/v3/execution/fixtures/manifest.json",
+      "blob_sha": "612cd899f93e50b21c9e3d1d65c5542329027956",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 175
+    },
+    {
+      "path": "scripts/tests/v3/integrity/fixtures/manifest.json",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/tests/v3/integrity/fixtures/manifest.json",
+      "blob_sha": "5884ea57386291f33f04b96bcd8af1a82696a4c9",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 175
+    },
+    {
+      "path": "scripts/tests/v3/planning/conformance.test.py",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/tests/v3/planning/conformance.test.py",
+      "blob_sha": "2140ee8d289178d6140b9ed6f5a02ee999fe6063",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 107
+    },
+    {
+      "path": "scripts/tests/v3/planning/static.test.py",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/tests/v3/planning/static.test.py",
+      "blob_sha": "b27c955a44301d224880476db8835f07e9e6ffa4",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 86
+    },
+    {
+      "path": "scripts/tests/v3/planning/schema.test.py",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/tests/v3/planning/schema.test.py",
+      "blob_sha": "5f514ed8fc657a5b1624985f4acf6dcdde0de86b",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 491
+    },
+    {
+      "path": "scripts/tests/v3/planning/adversarial.test.py",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/tests/v3/planning/adversarial.test.py",
+      "blob_sha": "0247272f98aa6319d0fd585dc5d6f2739199f122",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 323
+    },
+    {
+      "path": "scripts/tests/v3/execution/conformance.test.py",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/tests/v3/execution/conformance.test.py",
+      "blob_sha": "2a573efa89c0adbc079fdbf7823a82e6b50e5fe4",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 65
+    },
+    {
+      "path": "scripts/tests/v3/execution/static.test.py",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/tests/v3/execution/static.test.py",
+      "blob_sha": "f8239b5418b0232b907a510023aee96e8af5e169",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 69
+    },
+    {
+      "path": "scripts/tests/v3/execution/schema.test.py",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/tests/v3/execution/schema.test.py",
+      "blob_sha": "7788673b936daafb3b59679ebf565c54e0e4e296",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 451
+    },
+    {
+      "path": "scripts/tests/v3/execution/adversarial.test.py",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/tests/v3/execution/adversarial.test.py",
+      "blob_sha": "8aaea7ac997a577737b3a7e2c2b9a666271e65ba",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 552
+    },
+    {
+      "path": "scripts/tests/v3/integrity/conformance.test.py",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/tests/v3/integrity/conformance.test.py",
+      "blob_sha": "20da447064c3e673ab081838bafbb8039da1a7a3",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 102
+    },
+    {
+      "path": "scripts/tests/v3/integrity/static.test.py",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/tests/v3/integrity/static.test.py",
+      "blob_sha": "dafa5f08503d571179056ee93e0dc35284311491",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 132
+    },
+    {
+      "path": "scripts/tests/v3/integrity/schema.test.py",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/tests/v3/integrity/schema.test.py",
+      "blob_sha": "e2ca913535a1f54d896c9d66dae7c427c4aacff7",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 883
+    },
+    {
+      "path": "scripts/tests/v3/integrity/adversarial.test.py",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/tests/v3/integrity/adversarial.test.py",
+      "blob_sha": "7acf0f43a66b7556e7a6059397be9288f3fd3d61",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 786
+    },
+    {
+      "path": "scripts/tests/v3/planning/red_fixture.test.py",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/tests/v3/planning/red_fixture.test.py",
+      "blob_sha": "9d8cc8f2ba240f2e9aeff385f4c909e90e05818d",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 815
+    },
+    {
+      "path": "scripts/tests/v3/planning/property.test.py",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/tests/v3/planning/property.test.py",
+      "blob_sha": "de53f0c2577e0525ba277ff6d9c54ad26d10d26d",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 149
+    },
+    {
+      "path": "scripts/tests/v3/planning/validation.test.py",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/tests/v3/planning/validation.test.py",
+      "blob_sha": "a9fe02143a20ee64ad1fe7fa6f522f79fbb32dc8",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 65
+    },
+    {
+      "path": "scripts/tests/v3/execution/fixture.test.py",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/tests/v3/execution/fixture.test.py",
+      "blob_sha": "0fe5aa80a942da3411d53dc33b1472c16aa81eab",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 150
+    },
+    {
+      "path": "scripts/tests/v3/integrity/fixture.test.py",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/tests/v3/integrity/fixture.test.py",
+      "blob_sha": "584fabd506a3348a22f1291e2a2d04c088774de6",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 149
+    },
+    {
+      "path": "docs/v3/M1A-FIXTURE-ORACLES.md",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/docs/v3/M1A-FIXTURE-ORACLES.md",
+      "blob_sha": "5d43cb513f2ae9d98a2d18b43994359eb7e34ee2",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 223
+    },
+    {
+      "path": "docs/v3/M1B-FIXTURE-ORACLES.md",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/docs/v3/M1B-FIXTURE-ORACLES.md",
+      "blob_sha": "870da17c87b89edf805bf7a10d597def8bb916a5",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 77
+    },
+    {
+      "path": "docs/v3/M1C-FIXTURE-ORACLES.md",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/docs/v3/M1C-FIXTURE-ORACLES.md",
+      "blob_sha": "49a1fa96c0f82e6cbdd352d399f16529828c48d1",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 104
+    },
+    {
+      "path": "docs/v3/research-lane/followups-20261002/synthesis/FU-03-formal-model-vectors.md",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/docs/v3/research-lane/followups-20261002/synthesis/FU-03-formal-model-vectors.md",
+      "blob_sha": "227cca3156dba1b0f3dfb95142ce49ea1d68e79a",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 161
+    },
+    {
+      "path": "experiments/v3/fu-03-kernel-session-a/README.md",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/experiments/v3/fu-03-kernel-session-a/README.md",
+      "blob_sha": "8d5fb8a8389c8495b796630ca5e550ea54746179",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 70
+    },
+    {
+      "path": "experiments/v3/fu-03-kernel-session-a/VERIFICATION.md",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/experiments/v3/fu-03-kernel-session-a/VERIFICATION.md",
+      "blob_sha": "d5601e325b45f4560e13f856c62739ecc7492290",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 83
+    },
+    {
+      "path": "experiments/v3/fu-03-stage-b/README.md",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/experiments/v3/fu-03-stage-b/README.md",
+      "blob_sha": "d9b3039dfb51eb40c5d7692157d41b39ddb212cd",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 198
+    },
+    {
+      "path": "docs/v3/research-lane/core-language-control-surfaces-20261002/rlang/report.md",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/docs/v3/research-lane/core-language-control-surfaces-20261002/rlang/report.md",
+      "blob_sha": "aa1956a0c2a6222a14843471f36ea81831c26621",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 605
+    },
+    {
+      "path": "scripts/v3/planning/replay/kernel.py",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/v3/planning/replay/kernel.py",
+      "blob_sha": "680015a88cbf9faf620da3d6e8b409bf56aa8387",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 721
+    },
+    {
+      "path": "scripts/v3/planning/validation/canonical.py",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/v3/planning/validation/canonical.py",
+      "blob_sha": "52f3c6f14d315b452824d26f49b2f59b4427fe8e",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 1622
+    },
+    {
+      "path": "scripts/v3/planning/validation/contracts.py",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/v3/planning/validation/contracts.py",
+      "blob_sha": "22e16ff004f8aac051ebf151a96f3bd96d2181d1",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 529
+    },
+    {
+      "path": "scripts/tests/v3/execution/reference_oracle.py",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/tests/v3/execution/reference_oracle.py",
+      "blob_sha": "1d5293f4eea77bffd4012f763621986ecb361948",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 675
+    },
+    {
+      "path": "scripts/tests/v3/integrity/reference_oracle.py",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/tests/v3/integrity/reference_oracle.py",
+      "blob_sha": "57211a7b3fd6398c200a848b111b0be0b4d943aa",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 913
+    },
+    {
+      "path": "docs/v3/M1A-CONSTRUCTION-CAMPAIGN.md",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/docs/v3/M1A-CONSTRUCTION-CAMPAIGN.md",
+      "blob_sha": "4e9a534aa3ade81101abf7f21059481c7106bdaf",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 631
+    },
+    {
+      "path": "docs/v3/M1B-CONSTRUCTION-CAMPAIGN.md",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/docs/v3/M1B-CONSTRUCTION-CAMPAIGN.md",
+      "blob_sha": "5dfc73cd1d67b01a0ab6cc12a97db00003990ed9",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 261
+    },
+    {
+      "path": "docs/v3/M1C-CONSTRUCTION-CAMPAIGN.md",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/docs/v3/M1C-CONSTRUCTION-CAMPAIGN.md",
+      "blob_sha": "0161dab02e7a8eb087895dac089104e0e41a8822",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 279
+    },
+    {
+      "path": "docs/v3/M1A-WIRE-PROFILE.md",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/docs/v3/M1A-WIRE-PROFILE.md",
+      "blob_sha": "bd34b0fe94457477f5b5262c2809ec4292c75e58",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 629
+    },
+    {
+      "path": "docs/v3/M1B-WIRE-PROFILE.md",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/docs/v3/M1B-WIRE-PROFILE.md",
+      "blob_sha": "04e942544342a45d5f9e60877d5d558ae90d2ba7",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 294
+    },
+    {
+      "path": "docs/v3/M1C-WIRE-PROFILE.md",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/docs/v3/M1C-WIRE-PROFILE.md",
+      "blob_sha": "ed6c6f859a293fb0d6d8826eb7e0e080e65e0e4d",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 307
+    },
+    {
+      "path": "docs/v3/ACCEPTANCE.md",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/docs/v3/ACCEPTANCE.md",
+      "blob_sha": "6cd792647a64f6ac8cb0ac93c693b9951ce5b313",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 536
+    },
+    {
+      "path": "experiments/v3/fu-03-kernel-session-a/FIXTURE-QUALIFICATION.md",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/experiments/v3/fu-03-kernel-session-a/FIXTURE-QUALIFICATION.md",
+      "blob_sha": "9ff52201aa19d372cb42ee1df81dd040e6ed2819",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 22
+    },
+    {
+      "path": "docs/v3/research-lane/followups-20261002/raw/ds-FU-03-formal-model-vectors.md",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/docs/v3/research-lane/followups-20261002/raw/ds-FU-03-formal-model-vectors.md",
+      "blob_sha": "c99c28d3f553e8df8112b4f130c39b54899199ea",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 779
+    },
+    {
+      "path": "experiments/v3/fu-03-kernel-session-a/RECONCILIATION.md",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/experiments/v3/fu-03-kernel-session-a/RECONCILIATION.md",
+      "blob_sha": "7a18dc7161f9dbe9d80158a9ccd874a1353ce7c0",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 30
+    },
+    {
+      "path": "experiments/v3/fu-03-kernel-session-a/verification/results/74fb18d-muse-spark-1-3.md",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/experiments/v3/fu-03-kernel-session-a/verification/results/74fb18d-muse-spark-1-3.md",
+      "blob_sha": "83cd0e9a1d2ed610b295c0cbcb3a2ffe8cca5d1f",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 68
+    },
+    {
+      "path": "experiments/v3/fu-03-kernel-session-a/verification/results/6fcaaba-samefamily-repro.md",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/experiments/v3/fu-03-kernel-session-a/verification/results/6fcaaba-samefamily-repro.md",
+      "blob_sha": "76875c3825d1411c92dd1f4e0f5cb47b30d0d34d",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 51
+    },
+    {
+      "path": "experiments/v3/fu-03-kernel-session-a/mutants-registry.json",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/experiments/v3/fu-03-kernel-session-a/mutants-registry.json",
+      "blob_sha": "047e49e1e02d9e708107d70adef8e948d87a8271",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 55
+    },
+    {
+      "path": "experiments/v3/fu-03-kernel-session-a/oracle/README.md",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/experiments/v3/fu-03-kernel-session-a/oracle/README.md",
+      "blob_sha": "63a615230e47a4a3fad5d9aff90e8714f7e2cc75",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 101
+    },
+    {
+      "path": "experiments/v3/fu-03-kernel-session-a/oracle/check_oracle.py",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/experiments/v3/fu-03-kernel-session-a/oracle/check_oracle.py",
+      "blob_sha": "b2c5c3cd03a2d4c726b0b964495a27d216abf0f4",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 315
+    },
+    {
+      "path": "experiments/v3/fu-03-kernel-session-a/model/results/mutants.json",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/experiments/v3/fu-03-kernel-session-a/model/results/mutants.json",
+      "blob_sha": "aeb92d313a36f02c7f1ac380545e54417f08af63",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 477
+    },
+    {
+      "path": "experiments/v3/fu-03-kernel-session-a/model/results/baselines.json",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/experiments/v3/fu-03-kernel-session-a/model/results/baselines.json",
+      "blob_sha": "345282103293e86da9a4a48ca2bf825d7efcf776",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 15
+    },
+    {
+      "path": "experiments/v3/fu-03-kernel-session-a/model/RBig.cfg",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/experiments/v3/fu-03-kernel-session-a/model/RBig.cfg",
+      "blob_sha": "273c1b8429a16919274d6553e255d22db7cbad0a",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 17
+    },
+    {
+      "path": "experiments/v3/fu-03-kernel-session-a/model/RFixed.cfg",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/experiments/v3/fu-03-kernel-session-a/model/RFixed.cfg",
+      "blob_sha": "273c1b8429a16919274d6553e255d22db7cbad0a",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "lines": 17
+    },
+    {
+      "path": "AGENTS.md",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/AGENTS.md",
+      "blob_sha": "3938d6817247d584a4a6df0cf9cf8c6c6ddfb54d",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "shared_source": "Retrieved by architecture audit lane; read in corpus lane"
+    },
+    {
+      "path": "CONTROL_PLANE.md",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/CONTROL_PLANE.md",
+      "blob_sha": "dda15881c6e6109371f296aa3121976fa8a5caab",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "shared_source": "Retrieved by architecture audit lane; read in corpus lane"
+    },
+    {
+      "path": "ANCHOR.md",
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/ANCHOR.md",
+      "blob_sha": "f7e658bde817833b457d0c54a6e34e95b3fafc6a",
+      "retrieved": "2026-10-02",
+      "evidence_class": "source-documented/static-source",
+      "shared_source": "Retrieved by architecture audit lane; read in corpus lane"
+    }
+  ],
+  "references": {
+    "GOV": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/CONTROL_PLANE.md#L1-L77",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "ANCHOR": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/ANCHOR.md#L24-L58",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "AOR": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/docs/v3/M1A-FIXTURE-ORACLES.md#L23-L223",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "BOR": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/docs/v3/M1B-FIXTURE-ORACLES.md#L9-L77",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "COR": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/docs/v3/M1C-FIXTURE-ORACLES.md#L9-L104",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "AM": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/tests/v3/planning/fixtures/manifest.json#L1-L690",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "BM": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/tests/v3/execution/fixtures/manifest.json#L1-L174",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "CM": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/tests/v3/integrity/fixtures/manifest.json#L1-L174",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "AG": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/tests/v3/planning/red_fixture.test.py#L622-L805",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "BG": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/tests/v3/execution/fixture.test.py#L52-L142",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "CG": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/tests/v3/integrity/fixture.test.py#L47-L141",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "AC": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/tests/v3/planning/conformance.test.py#L19-L97",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "BC": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/tests/v3/execution/conformance.test.py#L34-L63",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "CC": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/tests/v3/integrity/conformance.test.py#L31-L100",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "AST": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/tests/v3/planning/static.test.py#L52-L75",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "BST": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/tests/v3/execution/static.test.py#L27-L62",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "CST": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/tests/v3/integrity/static.test.py#L34-L122",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "KERNEL": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/v3/planning/replay/kernel.py#L282-L350",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "AWIRE": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/docs/v3/M1A-WIRE-PROFILE.md#L567-L594",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "QUAL": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/experiments/v3/fu-03-kernel-session-a/FIXTURE-QUALIFICATION.md#L1-L22",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "DISABLED": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/tests/v3/execution/reference_oracle.py#L385-L390",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "STATE": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/scripts/tests/v3/integrity/reference_oracle.py#L664-L794",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "AREC": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/docs/v3/M1A-CONSTRUCTION-CAMPAIGN.md#L605-L630",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "BREC": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/docs/v3/M1B-CONSTRUCTION-CAMPAIGN.md#L228-L260",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "CREC": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/docs/v3/M1C-CONSTRUCTION-CAMPAIGN.md#L242-L278",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "AREQ": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/docs/v3/M1A-CONSTRUCTION-CAMPAIGN.md#L68-L86",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "BREQ": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/docs/v3/M1B-CONSTRUCTION-CAMPAIGN.md#L88-L105",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "CREQ": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/docs/v3/M1C-CONSTRUCTION-CAMPAIGN.md#L189-L207",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "SAREAD": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/experiments/v3/fu-03-kernel-session-a/README.md#L1-L69",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "SAREC": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/experiments/v3/fu-03-kernel-session-a/verification/results/74fb18d-muse-spark-1-3.md#L6-L67",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "SAOR": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/experiments/v3/fu-03-kernel-session-a/oracle/README.md#L34-L100",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "SB": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/experiments/v3/fu-03-stage-b/README.md#L88-L156",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "FUSCOPE": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/docs/v3/research-lane/followups-20261002/raw/ds-FU-03-formal-model-vectors.md#L16-L35",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "FUBOUND": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/docs/v3/research-lane/followups-20261002/raw/ds-FU-03-formal-model-vectors.md#L76-L105",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "FUMUT": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/docs/v3/research-lane/followups-20261002/raw/ds-FU-03-formal-model-vectors.md#L251-L310",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "FUVEC": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/docs/v3/research-lane/followups-20261002/raw/ds-FU-03-formal-model-vectors.md#L438-L448",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "FUAB": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/docs/v3/research-lane/followups-20261002/raw/ds-FU-03-formal-model-vectors.md#L655-L663",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "FUEND": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/docs/v3/research-lane/followups-20261002/raw/ds-FU-03-formal-model-vectors.md#L695-L722",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "RLANG": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/docs/v3/research-lane/core-language-control-surfaces-20261002/rlang/report.md#L203-L244",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    },
+    "PAUSE": {
+      "url": "https://github.com/NotSkittlz/recursion/blob/9f4122b50dc8117b185b2cd52244a10df3eb4285/docs/v3/M1A-FIXTURE-ORACLES.md#L199-L200",
+      "retrieval_date": "2026-10-02",
+      "evidence_class": "source-documented"
+    }
+  },
+  "tree": {
+    "url": "https://api.github.com/repos/NotSkittlz/recursion/git/trees/9f4122b50dc8117b185b2cd52244a10df3eb4285?recursive=1",
+    "retrieval_date": "2026-10-02",
+    "truncated": false,
+    "entries": 1703,
+    "evidence_class": "source-documented/static-metadata"
+  }
+}

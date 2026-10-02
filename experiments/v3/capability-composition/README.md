@@ -45,5 +45,9 @@ python -X utf8 -B experiments/v3/capability-composition/check_suite.py
 
 ## Status
 
-Foundation only — no fixture is executed yet. Lane order follows the runbook (R-PC → R-UI → R-MOB),
-with each lane implemented as a vertical slice (fixture + oracle + mutation + gate) before the next.
+- **R-PC** F01/F11/F12 and F02–F10/F13–F16 are implemented and **independently accepted** at
+  `050936e` (GLM-5.3-Flash; see `VERIFICATION.md` and `results/`). F17/F18 are `deferred` (scripted;
+  not provider-free behavioral evidence).
+- **R-UI** and **R-MOB** are not started. Lane order: R-PC → R-UI → R-MOB, each a vertical slice
+  (fixture + independent oracle + detected mutant + gate) before the next.
+- Verified on CPython 3.12.10; the suite is stdlib-only pure functions.

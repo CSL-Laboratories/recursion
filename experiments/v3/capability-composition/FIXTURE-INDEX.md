@@ -41,6 +41,11 @@ Gate: `run/check_rpc_fixtures.py` (F01, F11, F12) and `run/check_rpc_invariants.
 F13–F16). F17/F18 are `deferred`: scripted accounting/analysis, not provider-free behavioral
 evidence.
 
+**Verification:** independently **ACCEPT** at `050936e` (GLM-5.3-Flash; result in `results/`; see
+`VERIFICATION.md`). Open residual: F01's canonical-manifest predicate is only partially exercised
+(output bytes/ranges checked; `canonical_manifest`/`prefix_plan` and the no-model/network counter are
+not) — strengthening it requires re-verification. R-UI/R-MOB remain `specified`.
+
 ## R-UI — UI projection conformance (UI-01…UI-20)
 
 Source: `docs/v3/research-lane/capability-composition-20261002d/rui/report.md` (candidate-2).

@@ -66,6 +66,10 @@ candidate contract (see the synthesis's local handoff).
 - **iOS/Android design + language expansion (O-04):** `docs/v3/research-lane/ios-android-20261002/`
   (advisory iOS Swift/SwiftUI and Android Kotlin/Compose stacks; shared `MP01…MP11` fixtures;
   +`check_intake.py`). Research evidence only; prototypes/tests unexecuted; no stack selected.
+- **Packet-E return + PR #160 review:** `docs/v3/research-lane/core-language-control-surfaces-20261002/`
+  (R-LANG core-language/reconstruction; R-CS control-surface study; Astra static review of the R-PC
+  suite + verifier reconciliation). Research evidence only; no technology selected; the R-PC suite is
+  a scaffold (rerun ACCEPT, full-spec fidelity ISSUES/NEEDS-EVIDENCE).
 
 ## Next steps in order
 

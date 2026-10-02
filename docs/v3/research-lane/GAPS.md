@@ -230,6 +230,24 @@ Outcome:
   framework, transport, authentication mechanism, push provider or renderer selected.
 - **Reinforces** D-019/D-021/D-022/D-024/D-029/D-031/D-033/D-034; no conflict found.
 
+## Status update — 2026-10-02 packet-E return + PR #160 review
+
+The packet-E return and the static R-PC suite review are intaken at
+`docs/v3/research-lane/core-language-control-surfaces-20261002/` (7 files sha256-verified).
+
+- **R-LANG** (advisory): no language selected; Rust/Go/CPython shortlist, C#/.NET first expanded
+  challenger; JS1-vs-SQL1 store unmeasured; language-neutral plugin contract **P1**; reconstruction
+  **RC-01…RC-09** and an unresolved-seam register to author. Feeds D-039.
+- **R-CS** (advisory): T3 Code v0.0.45 and peers; D-034's moat is the combined composition+authority+
+  continuity+accounting+portability contract; strong-baseline falsifier; **G-32 open**.
+- **R-PC suite review:** rerun/reproducibility **ACCEPT** (GLM-5.3-Flash) but **full F01–F16
+  specification fidelity ISSUES FOUND / NEEDS EVIDENCE** (Astra Q01–Q10). The suite is a scaffold;
+  repairs are ordered in `experiments/v3/capability-composition/REVIEWS.md`. Any change to the tested
+  files restarts verification.
+- **Queued:** revise the D-039 outline against R-LANG; strengthen R-PC; start R-UI UI-05 with
+  independent qualification asserts; correct the UI-01 wording.
+- No technology selected; no protected path edited; all target tests unexecuted.
+
 ## Status update — 2026-10-02 iOS/Android design + language expansion (O-04)
 
 The separately requested OS/language expansion is intaken at

@@ -70,7 +70,9 @@ path (a ruled-out approach without its reason is a dead end waiting to be redisc
 | Capability-driven composition prompts | `prompts/dot-research-20261002d/` (+`check_research_stack.py`) | issued (zip: `Recursion_Dot_Research_Packet_20261002d.zip`) |
 | Capability-composition return (R-PC/R-UI/R-MOB, rev 2) | `research-lane/capability-composition-20261002d/` (+`check_intake.py`) | intaken; 5 files sha256-verified; R-UI `@candidate-2`; all target tests unexecuted |
 | iOS/Android design + language expansion (O-04) | `research-lane/ios-android-20261002/` (+`check_intake.py`) | intaken; 3 files sha256-verified; advisory Swift/SwiftUI + Kotlin/Compose; all prototypes/tests unexecuted |
+| Capability-composition conformance suite (D-037) | `experiments/v3/capability-composition/` (+`check_suite.py`) | R-PC F01–F16 implemented; **independently ACCEPT** at `050936e` (GLM-5.3-Flash); F17/F18 deferred; R-UI/R-MOB pending |
 | Competitive note — T3 Code v0.0.45 (control surface) | `research-lane/competitive-notes/20261002-t3code-v0.0.45.md` | source-documented (public release notes); not installed/executed; no adoption |
+| Packet-E return + PR #160 review | `research-lane/core-language-control-surfaces-20261002/` (+`check_intake.py`) | intaken; 7 files sha256-verified; R-LANG/R-CS advisory; PR #160 static review ISSUES/NEEDS-EVIDENCE; all target tests unexecuted |
 | Architecture edge map | `research-lane/ARCHITECTURE-COVERAGE.md` | maintained |
 | Per-harness coverage matrix | `research-lane/HARNESS-COVERAGE.md` | maintained |
 | Next-phase runbook | `research-lane/NEXT-PHASE.md` | maintained |

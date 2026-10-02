@@ -4,6 +4,11 @@ Status: **ACCEPT** — independent verifier recommendation. This is **not Owner 
 Lucas accepts (`CONTROL_PLANE.md` "Independent verifiers"; `AGENTS.md` rule 6). The pre-verification
 handoff is superseded by this record.
 
+**Fidelity qualification (2026-10-02).** This ACCEPT covers *rerunning the current gates* at
+`050936e`. A separate static review found that full F01–F16 **specification fidelity is not
+established** (findings Q01–Q10). The affected fixtures are marked `partial` in `FIXTURE-INDEX.md`.
+See `REVIEWS.md`. Treat this suite as a **scaffold**, not full conformance evidence.
+
 ## Verdict
 
 - Independent verifier: **GLM-5.3-Flash** (Z.ai), model id `cheaper-inference/glm-5.3-flash`, 2026-10-02.

@@ -171,7 +171,10 @@ def run() -> int:
         "scope": "bounded synthetic; provider-free; not Owner acceptance",
     }
     RESULTS.mkdir(exist_ok=True)
-    (RESULTS / "rpc_invariants_results.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    (RESULTS / "rpc_invariants_results.json").write_text(
+        json.dumps(record, indent=2, default=lambda o: o.hex() if isinstance(o, bytes) else str(o)) + "\n",
+        encoding="utf-8",
+    )
 
     if failures:
         print(f"RPC_INVARIANTS_FAIL ({len(failures)} failures)")

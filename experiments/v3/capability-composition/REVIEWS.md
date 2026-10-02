@@ -35,6 +35,16 @@ independently observed behavior. Treat this suite as a **scaffold**.
 4. Keep F17/F18 pending.
 5. Independent runtime acceptance by the separate verifier.
 
+## Strengthening progress
+
+- **Slice 2 (2026-10-02):** harness-owned observation boundary (`run/observer.py`) + strict result
+  schema (`run/record_schema.py`) applied to **F04/F06/F14/F16** in a new gate
+  `run/check_rpc_observed.py` — Q02/Q05 addressed for those fixtures; the weak duplicates were
+  removed from `check_rpc_invariants.py`.
+- Remaining: **Slice 3** (finite state models F03/F05/F07/F09/F10/F13/F15), **Slice 4**
+  (span/manifest/prefix + identity framing + per-case provenance). Re-verification is required after
+  these tested-code changes.
+
 ## Rule
 
 Any change to the tested files (`reference_model.py`, `oracle.py`, `rpc_model.py`, `rpc_expected.py`,

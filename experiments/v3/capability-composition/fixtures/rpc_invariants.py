@@ -51,3 +51,35 @@ GRAPHS = {
     "exclusive_conflict": {"nodes": {"A": {"deps": []}}, "providers": {}, "exclusive": {"res": ["owner1", "owner2"]}},
     "valid": {"nodes": {"A": {"deps": []}, "B": {"deps": ["A"]}}, "providers": {"cap": ["p1"]}, "exclusive": {"res": ["owner1"]}},
 }
+
+# F04 — observed disabled inertness (slice 2)
+F04 = {"capability": "cap.skillQ", "source": "src.skillQ", "content": b"PROCEDURE\n"}
+
+# F06 — authority laundering at a protected sink (slice 2)
+F06 = {
+    "import_envelope": {"subject": "imported:doc-7", "proof": "forged"},
+    "owner_envelope": {"subject": "owner:grant7"},
+    "protected_op": "op.protected.write",
+    "artifact": b"useful\n",
+}
+
+# F14 — checkpoint resume with an observed rights ledger (slice 2)
+F14 = {
+    "valid_manifest_refs": ["skillX", "procY", "skillZ"],
+    "omitting_refs": ["skillX", "procY"],
+    "active_skill": "skillZ",
+    "rights": {
+        "skillX": {"active": True, "fence": 11},
+        "procY": {"active": False, "fence": 12},
+        "skillZ": {"active": True, "fence": 11},
+    },
+    "current_fence": 12,
+}
+
+# F16 — observer loss / distinct valid outputs / independent grading (slice 2)
+F16 = {
+    "valid_artifacts": [b"answer-A\n", b"answer-B\n"],
+    "invalid_artifact": b"",
+    "protected_op": "op.work",
+    "authority_subject": "owner:grant7",
+}

@@ -36,13 +36,17 @@ def resolve_closure(required: list[str], optional: list[str], cost: dict[str, in
     return {"outcome": "ok", "dispatched": True, "loaded": sorted(loaded), "dropped": sorted(dropped)}
 
 
-# --- F04 disabled capability zero contribution --------------------------------------------------
-def contribution(installed: bool, enabled: bool) -> dict:
+# --- F04 disabled capability zero contribution (observed boundary) ------------------------------
+def contribution(catalog, installed: bool, enabled: bool, *, capability_id: str, source_id: str) -> dict:
     if not installed:
-        return {"operational_bytes": 0, "events": [], "admin_bytes": 0}
+        return {"outcome": "absent"}
     if not enabled:
-        return {"operational_bytes": 0, "events": [], "admin_bytes": 8}
-    return {"operational_bytes": 64, "events": ["register", "load"], "admin_bytes": 8}
+        catalog.register(capability_id, enabled=False)
+        return {"outcome": "disabled"}
+    catalog.register(capability_id, enabled=True)
+    catalog.read(source_id)
+    catalog.load_body(capability_id)
+    return {"outcome": "enabled"}
 
 
 # --- F05 immediate revocation with coalesced preferences ----------------------------------------
@@ -52,18 +56,13 @@ def access(grant: str, fence: int, revoke_fence: int) -> dict:
     return {"outcome": "allow"}
 
 
-# --- F06 authority laundering -------------------------------------------------------------------
-def admit_import(claim_authority: bool) -> dict:
-    envelope = {"authority_carried_none": True}
-    sink_events: list[str] = []
-    if not envelope["authority_carried_none"]:
-        sink_events.append("unauthorized_effect")
-    return {
-        "authority_carried_none": envelope["authority_carried_none"],
-        "sink_events": sink_events,
-        "control": "completed",
-        "quarantined": bool(claim_authority),
-    }
+# --- F06 authority laundering (observed protected sink) -----------------------------------------
+def admit_import(sink, ledger, envelope: dict, *, op_id: str) -> dict:
+    proof = ledger.authority_for(envelope)
+    admitted = sink.perform(op_id, proof)
+    if admitted:
+        sink.complete(op_id, b"useful\n")
+    return {"outcome": "completed" if admitted else "refused"}
 
 
 # --- F07 procedure precedence -------------------------------------------------------------------
@@ -99,19 +98,14 @@ def bind_route(new_descriptor: str | None, schema_valid: bool, hidden_visibility
     return {"outcome": "ok"}
 
 
-# --- F14 checkpoint resume ----------------------------------------------------------------------
-def restore(manifest_refs: list[str], active_skill: str) -> dict:
+# --- F14 checkpoint resume (observed rights ledger) ---------------------------------------------
+def restore(ledger, manifest_refs: list[str], active_skill: str, *, operation_id: str = "O1") -> dict:
     if active_skill not in manifest_refs:
         return {"outcome": "reject_missing_reference"}
-    return {
-        "outcome": "ok",
-        "rechecked_rights": True,
-        "operation_o1": "O1",
-        "liability": "held",
-        "reexecuted": False,
-        "reapproved": False,
-        "funds_reset": False,
-    }
+    for ref in manifest_refs:
+        ledger.check_rights(ref, ledger.current_fence)
+    ledger.record_operation(operation_id, "resume", refs=tuple(manifest_refs))
+    return {"outcome": "ok", "restored": tuple(manifest_refs)}
 
 
 # --- F15 graph errors before load ---------------------------------------------------------------
@@ -160,3 +154,14 @@ def observe_gate(observed: bool, output_valid: bool, refuse_all: bool) -> dict:
     if not output_valid:
         return {"outcome": "fail_invalid"}
     return {"outcome": "pass"}
+
+
+# --- F16 useful worker over the observed boundary -----------------------------------------------
+def useful_worker(boundary, mode: str, *, op_id: str = "op.work", subject: str = "owner:grant7") -> dict:
+    artifacts = {"normal_A": b"answer-A\n", "normal_B": b"answer-B\n", "invalid": b""}
+    artifact = artifacts.get(mode, b"")
+    proof = boundary.ledger.issue_proof(subject)
+    ok = boundary.sink.perform(op_id, proof)
+    if ok:
+        boundary.sink.complete(op_id, artifact)
+    return {"outcome": "pass", "artifact": artifact.decode("utf-8", "replace")}

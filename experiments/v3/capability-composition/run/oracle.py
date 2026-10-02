@@ -36,3 +36,8 @@ def expected_ranges_by_codepoint(items: list[tuple[str, bytes, int]]) -> dict[st
         ranges[sid] = (cursor, cursor + length)
         cursor = cursor + length
     return ranges
+
+
+def valid_artifact(payload: bytes) -> bool:
+    """Independent acceptance predicate for F16 (non-empty, bounded, newline-terminated, ASCII)."""
+    return 0 < len(payload) <= 64 and payload.endswith(b"\n") and all(b < 128 for b in payload)

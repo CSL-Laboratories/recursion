@@ -1,0 +1,12 @@
+{
+  "lane": "R-PC",
+  "suite": "rpc_observed",
+  "fixtures": [
+    "F04",
+    "F06",
+    "F14",
+    "F16"
+  ],
+  "failures": [],
+  "scope": "bounded synthetic; provider-free; not Owner acceptance"
+}

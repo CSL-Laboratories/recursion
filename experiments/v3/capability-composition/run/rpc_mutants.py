@@ -68,3 +68,40 @@ def m_silence_pass(observed, output_valid, refuse_all) -> dict:
     if not output_valid:
         return {"outcome": "fail_invalid"}
     return {"outcome": "pass"}
+
+
+class _ForgedRight:
+    def __init__(self, subject: str) -> None:
+        self.subject = subject
+        self.digest = "forged"
+
+
+def m_disabled_reads(catalog, installed, enabled, *, capability_id, source_id) -> dict:
+    catalog.register(capability_id, enabled=True)
+    catalog.read(source_id)
+    return {"outcome": "disabled"}
+
+
+def m_forged_authority(sink, ledger, envelope, *, op_id) -> dict:
+    sink.perform(op_id, _ForgedRight(envelope.get("subject", "")))
+    return {"outcome": "completed"}
+
+
+def m_quiet_no_effect(sink, ledger, envelope, *, op_id) -> dict:
+    return {"outcome": "completed"}
+
+
+def m_restore_reexecute(ledger, manifest_refs, active_skill, *, operation_id="O1") -> dict:
+    if active_skill not in manifest_refs:
+        return {"outcome": "reject_missing_reference"}
+    for ref in manifest_refs:
+        ledger.check_rights(ref, ledger.current_fence)
+    ledger.record_operation(operation_id, "resume", refs=tuple(manifest_refs))
+    ledger.reexecute(operation_id)
+    ledger.reapprove(operation_id)
+    ledger.reset_funds(operation_id)
+    return {"outcome": "ok", "restored": tuple(manifest_refs)}
+
+
+def m_worker_silent(boundary, mode, *, op_id="op.work", subject="owner:grant7") -> dict:
+    return {"outcome": "pass", "artifact": ""}

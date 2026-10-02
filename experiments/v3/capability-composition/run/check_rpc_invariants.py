@@ -58,17 +58,9 @@ def run() -> int:
     case("F03_case1", lambda: M.resolve_closure(F.CLOSURE["required"], F.CLOSURE["optional"], F.CLOSURE["cost"], F.CLOSURE["capacity_case1"]), lambda: X.m_closure_auto_budget(F.CLOSURE["required"], F.CLOSURE["optional"], F.CLOSURE["cost"], F.CLOSURE["capacity_case2"]))
     case("F03_case2", lambda: M.resolve_closure(F.CLOSURE["required"], F.CLOSURE["optional"], F.CLOSURE["cost"], F.CLOSURE["capacity_case2"]), None)
 
-    # F04 disabled inertness
-    case("F04_absent", lambda: M.contribution(False, False), None)
-    case("F04_disabled", lambda: M.contribution(True, False), lambda: X.m_disabled_leaks(True, False))
-    case("F04_enabled", lambda: M.contribution(True, True), None)
-
     # F05 immediate revocation
     r = F.REVOCATION
     case("F05", lambda: M.access(r["grant"], r["fence"], r["revoke_fence"]), lambda: X.m_revoke_delayed(r["grant"], r["fence"], r["revoke_fence"]))
-
-    # F06 authority laundering
-    case("F06", lambda: M.admit_import(True), lambda: X.m_trust_claim(True))
 
     # F07 procedure precedence
     p = F.PRECEDENCE
@@ -91,10 +83,6 @@ def run() -> int:
     # F13 route/schema drift
     case("F13", lambda: M.bind_route("d5", schema_valid=False, hidden_visibility_known=False), lambda: X.m_route_name_only("d5", False, False))
 
-    # F14 checkpoint resume
-    case("F14_missing", lambda: M.restore(F.RESTORE["valid_manifest_refs"], F.RESTORE["active_skill"]), None)
-    case("F14_valid", lambda: M.restore(F.RESTORE["valid_manifest_refs"] + [F.RESTORE["active_skill"]], F.RESTORE["active_skill"]), lambda: X.m_restore_replay(None, None))
-
     # F15 graph errors before load
     g = F.GRAPHS
     case("F15_missing_dependency", lambda: M.validate_graph(g["missing_dependency"]), lambda: X.m_graph_import_to_discover(g["missing_dependency"]))
@@ -103,12 +91,6 @@ def run() -> int:
     case("F15_exclusive_conflict", lambda: M.validate_graph(g["exclusive_conflict"]), lambda: X.m_graph_import_to_discover(g["exclusive_conflict"]))
     case("F15_valid", lambda: M.validate_graph(g["valid"]), None)
 
-    # F16 observer/oracle sensitivity
-    case("F16_missing_observer", lambda: M.observe_gate(False, True, False), lambda: X.m_silence_pass(False, True, False))
-    case("F16_invalid", lambda: M.observe_gate(True, False, False), None)
-    case("F16_valid", lambda: M.observe_gate(True, True, False), None)
-    case("F16_all_refuse", lambda: M.observe_gate(True, True, True), None)
-
     # Oracle independence: expectations must not import the candidate model.
     src = (HERE / "rpc_expected.py").read_text(encoding="utf-8")
     imports = [ln.strip() for ln in src.splitlines() if ln.strip().startswith(("import ", "from "))]
@@ -116,7 +98,7 @@ def run() -> int:
 
     record = {
         "lane": "R-PC",
-        "fixtures": ["F02", "F03", "F04", "F05", "F06", "F07", "F08", "F09", "F10", "F13", "F14", "F15", "F16"],
+        "fixtures": ["F02", "F03", "F05", "F07", "F08", "F09", "F10", "F13", "F15"],
         "deferred": ["F17", "F18"],
         "cases": len(E.EXPECTED),
         "failures": failures,
@@ -128,7 +110,7 @@ def run() -> int:
     if failures:
         print(f"RPC_INVARIANTS_FAIL ({len(failures)} failures)")
         return 1
-    print("RPC_INVARIANTS_PASS F02-F10 F13-F16; mutants detected; expectations independent")
+    print("RPC_INVARIANTS_PASS F02 F03 F05 F07-F10 F13 F15; mutants detected; expectations independent")
     return 0
 
 

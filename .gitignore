@@ -96,3 +96,6 @@ state/.intake-watermark
 # presence depends on which branch is checked out is not a safety control. Same class as
 # events.jsonl: state ON the box, not in its history.
 state/PAUSE
+cache/
+*.bak*
+*.private.*

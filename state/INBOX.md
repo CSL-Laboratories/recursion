@@ -286,3 +286,592 @@ Close it with: `recursion resolve guerra-004-phase5-lenis-wire-canary "<what you
 
 ## REQUEUED 2026-09-02T21:03:42Z — guerra-004-phase5-lenis-wire-canary
 requeue after verifier evidence materialization fix; keep composer-2.5
+
+## [esc-0024] 2026-09-03 03:15 — Decide the September subscription and loop posture from the overdue August PoC review
+**Workstream:** supervision
+**Pointer:** OPEN DECISIONS ledger slices D-002, D-005, D-006, D-007, and D-008; CURRENT INBOX esc-0013 through esc-0021
+**Blocked on:** August `ccusage`, fallback-spend, and merged/verified-output evidence required to evaluate the recorded falsifiers.
+**Context:** All five reviews were due 2026-09-01. ANCHOR permits renewal of the second subscription only if capacity passed while the review queue stayed clear.
+**Options:** provide and review the evidence now; extend review with a defined evidence-collection deadline; reduce to one subscription plus fallback pending evidence.
+## 2026-09-03 03:15 — Supply the first Fall 2026 physics block or explicitly defer scheduling
+**Workstream:** physics-coursework
+**Pointer:** SYLLABUS LEAD ledger slice: Fall 2026 contains only `_fill from actual syllabus once posted_`; CURRENT INBOX esc-0004 through esc-0012 and subsequent duplicate physics entries
+**Blocked on:** the course, first topic block, and first lecture date from the actual syllabus.
+**Context:** Berkeley began 2026-08-26. The three-week lead target and below-one-week pause rule cannot be evaluated without a real lecture block.
+**Options:** provide the official syllabus; provide only the first course/topic/date; explicitly defer physics scheduling.
+## 2026-09-03 03:15 — Choose how to unblock the Cursor-dependent Guerra Lenis canaries
+**Workstream:** supervision
+**Pointer:** BUILD-LOOP STATUS: `guerra-003-phase5-lenis-wire-canary` and `guerra-005-phase5-lenis-wire-canary`; CURRENT INBOX build escalation for `guerra-003-phase5-lenis-wire-canary` at 2026-09-02T20:31:08Z
+**Blocked on:** whether Cursor plugin execution should be enabled/repaired under D-015’s still-unratified plugin architecture, or these tasks should move to a supported engine.
+**Context:** Both remaining canaries request the same minimal reduced-motion-aware Lenis provider wiring and are blocked because Cursor is not an enabled plugin.
+**Options:** ratify and enable the Cursor plugin path; requeue the tasks on an already supported engine; defer the canaries until D-015’s review branch is merged.
+
+## [esc-0025] 2026-09-03 12:15 — Decide September subscription and loop posture from the overdue August PoC review
+**Workstream:** supervision
+**Pointer:** OPEN DECISIONS ledger slices D-002, D-005, D-006, D-007, and D-008; CURRENT INBOX esc-0013 through esc-0024
+**Blocked on:** August `ccusage`, fallback-spend, and merged/verified-output evidence needed to evaluate the recorded falsifiers.
+**Context:** All five reviews were due 2026-09-01. ANCHOR permits renewal of the second subscription only if capacity passed while the review queue stayed clear.
+**Options:** provide and review the evidence now; extend review with a defined evidence-collection deadline; reduce to one subscription plus fallback pending evidence.
+## 2026-09-03 12:15 — Supply the first Fall 2026 physics block or explicitly defer scheduling
+**Workstream:** physics-coursework
+**Pointer:** SYLLABUS LEAD ledger slice: Fall 2026 contains only `_fill from actual syllabus once posted_`; CURRENT INBOX esc-0004 through esc-0012 and subsequent duplicate physics entries
+**Blocked on:** the course, first topic block, and first lecture date from the actual syllabus.
+**Context:** Berkeley began 2026-08-26. The three-week lead target and below-one-week pause rule cannot be evaluated without a real lecture block.
+**Options:** provide the official syllabus; provide only the first course/topic/date; explicitly defer physics scheduling.
+## 2026-09-03 12:15 — Choose how to unblock the Cursor-dependent Guerra Lenis canaries
+**Workstream:** supervision
+**Pointer:** BUILD-LOOP STATUS: `guerra-003-phase5-lenis-wire-canary` and `guerra-005-phase5-lenis-wire-canary`; CURRENT INBOX build escalation for `guerra-003-phase5-lenis-wire-canary` at 2026-09-02T20:31:08Z
+**Blocked on:** whether Cursor plugin execution should be enabled/repaired under D-015’s still-unratified plugin architecture, or these tasks should move to a supported engine.
+**Context:** Both remaining canaries request the same minimal reduced-motion-aware Lenis provider wiring and are blocked because Cursor is not an enabled plugin.
+**Options:** ratify and enable the Cursor plugin path; requeue the tasks on an already supported engine; defer the canaries until D-015’s review branch is merged.
+
+## [esc-0026] 2026-09-03 15:15 — Choose the September subscription and loop posture from the overdue August PoC review
+**Workstream:** supervision
+**Pointer:** OPEN DECISIONS ledger slices D-002, D-005, D-006, D-007, and D-008; CURRENT INBOX esc-0013 through esc-0025
+**Blocked on:** August `ccusage`, fallback-spend, and merged/verified-output evidence required to evaluate the recorded falsifiers
+**Context:** All five reviews were due 2026-09-01. ANCHOR permits renewing the second subscription only if capacity passed while the review queue stayed clear.
+**Options:** provide and review the August evidence now; extend the review with a defined evidence-collection deadline; reduce to one subscription plus fallback pending evidence
+## 2026-09-03 15:15 — Supply the first Fall 2026 physics block or explicitly defer scheduling
+**Workstream:** physics-coursework
+**Pointer:** SYLLABUS LEAD ledger slice: Fall 2026 contains only `_fill from actual syllabus once posted_`; CURRENT INBOX esc-0004 through esc-0025
+**Blocked on:** the course, first topic block, and first lecture date from the actual syllabus
+**Context:** Berkeley began 2026-08-26. The three-week lead target and below-one-week pause rule cannot be evaluated without a real lecture block.
+**Options:** provide the official syllabus; provide only the first course/topic/date; explicitly defer physics scheduling
+## 2026-09-03 15:15 — Decide how to unblock the Cursor-dependent Guerra Lenis canaries
+**Workstream:** supervision
+**Pointer:** BUILD-LOOP STATUS: `guerra-003-phase5-lenis-wire-canary` and `guerra-005-phase5-lenis-wire-canary`; CURRENT INBOX build escalation for `guerra-003-phase5-lenis-wire-canary` at 2026-09-02T20:31:08Z
+**Blocked on:** whether Cursor plugin execution should be enabled or repaired under D-015’s still-unratified plugin architecture, or these tasks should move to a supported engine
+**Context:** Both remaining canaries request the same minimal reduced-motion-aware Lenis provider wiring and are blocked because Cursor is not an enabled plugin.
+**Options:** ratify and enable the Cursor plugin path; requeue the tasks on an already supported engine; defer the canaries until D-015’s review branch is merged
+
+## [esc-0027] 2026-09-05 18:15 — Decide the September subscription and loop posture
+**Workstream:** supervision
+**Pointer:** OPEN DECISIONS ledger slices D-002, D-005, D-006, D-007, and D-008; CURRENT INBOX esc-0013 through esc-0026
+**Blocked on:** August `ccusage`, fallback-spend, and merged/verified-output evidence needed to evaluate the recorded falsifiers.
+**Context:** The August PoC reviews were due 2026-09-01. ANCHOR permits renewing the second subscription only if capacity passed while the review queue stayed clear.
+**Options:** provide and review the evidence now; extend the review with a defined evidence-collection deadline; reduce to one subscription plus fallback pending evidence.
+## 2026-09-05 18:15 — Supply the first Fall 2026 physics block or explicitly defer scheduling
+**Workstream:** physics-coursework
+**Pointer:** SYLLABUS LEAD ledger slice: Fall 2026 contains only `_fill from actual syllabus once posted_`; CURRENT INBOX esc-0004 through esc-0026
+**Blocked on:** the course, first topic block, and first lecture date from the actual syllabus.
+**Context:** Berkeley began 2026-08-26. The three-week lead target and below-one-week pause rule cannot be evaluated without a real lecture block.
+**Options:** provide the official syllabus; provide only the first course/topic/date; explicitly defer physics scheduling.
+
+## [esc-0028] 2026-09-06 09:15 — Decide September subscription and loop posture
+**Workstream:** supervision
+**Pointer:** OPEN DECISIONS D-002, D-005, D-006, D-007, and D-008; CURRENT INBOX esc-0013 through esc-0027
+**Blocked on:** August `ccusage`, fallback-spend, and merged/verified-output evidence needed to evaluate the recorded falsifiers.
+**Context:** Reviews were due 2026-09-01. ANCHOR permits renewing the second subscription only if capacity passed while the review queue stayed clear.
+**Options:** provide and review the evidence now; extend review with a defined evidence-collection deadline; reduce to one subscription plus fallback pending evidence.
+## 2026-09-06 09:15 — Supply the first Fall 2026 physics block or explicitly defer scheduling
+**Workstream:** physics-coursework
+**Pointer:** SYLLABUS LEAD ledger slice contains only `_fill from actual syllabus once posted_`; CURRENT INBOX esc-0004 through esc-0012 and later duplicate physics entries
+**Blocked on:** the course, first topic block, and first lecture date from the actual syllabus.
+**Context:** Berkeley began 2026-08-26. The three-week lead target and below-one-week pause rule cannot be evaluated without a real lecture block.
+**Options:** provide the official syllabus; provide only the first course/topic/date; explicitly defer physics scheduling.
+
+## [esc-0029] 2026-09-07 09:15 — Choose September subscription and loop posture
+**Workstream:** supervision
+**Pointer:** OPEN DECISIONS D-002, D-005, D-006, D-007, and D-008; CURRENT INBOX esc-0013 through esc-0028
+**Blocked on:** August `ccusage`, fallback-spend, and merged/verified-output evidence needed to evaluate the recorded falsifiers.
+**Context:** Reviews were due 2026-09-01. ANCHOR permits renewal of the second subscription only if capacity passed while the review queue stayed clear.
+**Options:** provide and review the evidence now; extend review with a defined evidence-collection deadline; reduce to one subscription plus fallback pending evidence.
+## 2026-09-07 09:15 — Supply the first Fall 2026 physics block or explicitly defer scheduling
+**Workstream:** physics-coursework
+**Pointer:** SYLLABUS LEAD ledger slice contains only `_fill from actual syllabus once posted_`; PHYSICS GAP MAP; CURRENT INBOX esc-0004 through esc-0028
+**Blocked on:** the course, first topic block, and first lecture date from the actual syllabus.
+**Context:** Berkeley began 2026-08-26. The three-week lead target and below-one-week pause rule cannot be evaluated without a real lecture block.
+**Options:** provide the official syllabus; provide only the first course/topic/date; explicitly defer physics scheduling.
+## 2026-09-07 09:15 — Choose how to unblock Cursor-dependent Guerra Lenis canaries
+**Workstream:** supervision
+**Pointer:** BUILD-LOOP STATUS: `guerra-003-phase5-lenis-wire-canary` and `guerra-005-phase5-lenis-wire-canary`; OPEN DECISION D-015; CURRENT INBOX 2026-09-03 Cursor-canary entries
+**Blocked on:** whether Cursor plugin execution should be enabled/repaired under D-015’s unratified plugin architecture, or the tasks should move to a supported engine.
+**Context:** Both remaining canaries request the same reduced-motion-aware Lenis provider wiring and are blocked because Cursor is not an enabled plugin.
+**Options:** ratify and enable the Cursor plugin path; requeue on an already supported engine; defer until D-015’s review branch merges.
+
+## [esc-0030] 2026-09-10 03:15 — Choose the September subscription and loop posture using the overdue August PoC review
+**Workstream:** supervision
+**Pointer:** OPEN DECISIONS ledger slices D-002, D-005, D-006, D-007, and D-008; CURRENT INBOX esc-0013 through esc-0029
+**Blocked on:** August `ccusage`, fallback-spend, and merged/verified-output evidence needed to evaluate the recorded falsifiers.
+**Context:** Reviews were due 2026-09-01. ANCHOR permits renewing the second subscription only if capacity passed while the review queue stayed clear.
+**Options:** provide and review the evidence now; extend review with a defined evidence-collection deadline; reduce to one subscription plus fallback pending evidence.
+## 2026-09-10 03:15 — Supply the first Fall 2026 physics block or explicitly defer scheduling
+**Workstream:** physics-coursework
+**Pointer:** SYLLABUS LEAD ledger slice: Fall 2026 contains only `_fill from actual syllabus once posted_`; PHYSICS GAP MAP; CURRENT INBOX esc-0004 through esc-0029
+**Blocked on:** the course, first topic block, and first lecture date from the actual syllabus.
+**Context:** Berkeley began 2026-08-26. The three-week lead target and below-one-week pause rule cannot be evaluated without a real lecture block.
+**Options:** provide the official syllabus; provide only the first course/topic/date; explicitly defer physics scheduling.
+## 2026-09-10 03:15 — Choose how to unblock Cursor-dependent Guerra Lenis canaries
+**Workstream:** supervision
+**Pointer:** BUILD-LOOP STATUS: `guerra-003-phase5-lenis-wire-canary` and `guerra-005-phase5-lenis-wire-canary`; OPEN DECISION D-015; CURRENT INBOX 2026-09-07 Cursor-canary entry
+**Blocked on:** whether Cursor plugin execution should be enabled under D-015’s still-unratified plugin architecture, or the tasks should move to a supported engine.
+**Context:** Both canaries request the same reduced-motion-aware Lenis provider wiring and are blocked because Cursor is not an enabled plugin.
+**Options:** ratify and enable the Cursor plugin path; requeue on an already supported engine; defer until D-015’s review branch merges.
+
+## [esc-0031] 2026-09-14 09:15 — Choose September subscription and loop posture after the overdue August PoC review
+**Workstream:** supervision
+**Pointer:** OPEN DECISIONS ledger slices D-002, D-005, D-006, D-007, and D-008; CURRENT INBOX esc-0013 through esc-0030
+**Blocked on:** August `ccusage`, fallback-spend, and merged/verified-output evidence needed to evaluate the recorded falsifiers.
+**Context:** All five reviews were due 2026-09-01. ANCHOR permits renewal of the second subscription only if capacity passed while the review queue stayed clear.
+**Options:** provide and review the evidence now; extend the review with a defined evidence-collection deadline; reduce to one subscription plus fallback pending evidence.
+## 2026-09-14 09:15 — Supply the first Fall 2026 physics block or explicitly defer scheduling
+**Workstream:** physics-coursework
+**Pointer:** SYLLABUS LEAD ledger slice: Fall 2026 contains only `_fill from actual syllabus once posted_`; PHYSICS GAP MAP; CURRENT INBOX esc-0004 through esc-0030
+**Blocked on:** the course, first topic block, and first lecture date from the actual syllabus.
+**Context:** Berkeley began 2026-08-26. The three-week lead target and below-one-week pause rule cannot be evaluated without a real lecture block.
+**Options:** provide the official syllabus; provide only the first course/topic/date; explicitly defer physics scheduling.
+
+## [esc-0032] 2026-09-15 12:15 — Complete the overdue August PoC review and choose September loop posture
+**Workstream:** supervision
+**Pointer:** OPEN DECISIONS D-002, D-005, D-006, D-007, and D-008; CURRENT INBOX esc-0031
+**Blocked on:** August `ccusage`, fallback-spend, and merged/verified-output evidence required by the recorded falsifiers.
+**Context:** Reviews were due 2026-09-01; ANCHOR permits renewal of the second subscription only if capacity passed while the review queue stayed clear.
+**Options:** provide and review the evidence now; extend the review with a defined evidence-collection deadline; reduce to one subscription plus fallback pending evidence.
+## 2026-09-15 12:15 — Supply the first Fall 2026 physics block or explicitly defer scheduling
+**Workstream:** physics-coursework
+**Pointer:** SYLLABUS LEAD ledger slice; PHYSICS GAP MAP; CURRENT INBOX esc-0031
+**Blocked on:** the course, first topic block, and first lecture date from the actual syllabus.
+**Context:** Berkeley began 2026-08-26. The three-week lead and below-one-week pause rule cannot be evaluated from the placeholder-only syllabus map.
+**Options:** provide the official syllabus; provide only the first course/topic/date; explicitly defer physics scheduling.
+
+## [esc-0033] 2026-09-16 06:15 — Complete the overdue August PoC review
+**Workstream:** supervision
+**Pointer:** OPEN DECISIONS D-002, D-005, D-006, D-007, and D-008; CURRENT INBOX esc-0032
+**Blocked on:** August `ccusage`, fallback-spend, and merged/verified-output evidence required by the recorded falsifiers.
+**Context:** Reviews were due 2026-09-01; ANCHOR permits renewing the second subscription only if capacity passed while the review queue stayed clear.
+**Options:** provide and review the evidence now; extend the review with a defined evidence-collection deadline; reduce to one subscription plus fallback pending evidence.
+## 2026-09-16 06:15 — Choose how to unblock the Cursor-dependent Guerra Lenis canaries
+**Workstream:** supervision
+**Pointer:** BUILD-LOOP STATUS: `guerra-003-phase5-lenis-wire-canary` and `guerra-005-phase5-lenis-wire-canary`; OPEN DECISION D-015
+**Blocked on:** whether Cursor plugin execution may be enabled under D-015’s unratified plugin architecture, or whether both tasks should use a supported engine.
+**Context:** Both canaries are blocked because Cursor is not an enabled plugin; they request the same reduced-motion-aware Lenis provider wiring.
+**Options:** ratify and enable the Cursor plugin path; requeue both on an already supported engine; defer until D-015’s review branch merges.
+## 2026-09-16 06:15 — Supply the first Fall 2026 physics block or explicitly defer scheduling
+**Workstream:** physics-coursework
+**Pointer:** SYLLABUS LEAD ledger slice; PHYSICS GAP MAP; CURRENT INBOX esc-0032
+**Blocked on:** the course, first topic block, and first lecture date from the actual syllabus.
+**Context:** Berkeley began 2026-08-26. The three-week lead and below-one-week pause rule cannot be evaluated from the placeholder-only syllabus map.
+**Options:** provide the official syllabus; provide only the first course/topic/date; explicitly defer physics scheduling.
+
+## [esc-0034] 2026-09-16 18:15 — Complete the overdue August PoC review and set September loop posture
+**Workstream:** supervision
+**Pointer:** OPEN DECISIONS D-002, D-005, D-006, D-007, and D-008; CURRENT INBOX esc-0033
+**Blocked on:** August `ccusage`, fallback-spend, and merged/verified-output evidence required by the recorded falsifiers.
+**Context:** Reviews were due 2026-09-01. ANCHOR permits renewal of the second subscription only if capacity passed while the review queue stayed clear.
+**Options:** provide and review the evidence now; extend the review with a defined evidence-collection deadline; reduce to one subscription plus fallback pending evidence.
+## 2026-09-16 18:15 — Choose how to unblock the Cursor-dependent Guerra Lenis canaries
+**Workstream:** supervision
+**Pointer:** BUILD-LOOP STATUS: `guerra-003-phase5-lenis-wire-canary` and `guerra-005-phase5-lenis-wire-canary`; OPEN DECISION D-015
+**Blocked on:** whether Cursor plugin execution may be enabled under D-015’s unratified plugin architecture, or whether both tasks should use a supported engine.
+**Context:** Both canaries are blocked because Cursor is not an enabled plugin; they request the same reduced-motion-aware Lenis provider wiring.
+**Options:** ratify and enable the Cursor plugin path; requeue both on an already supported engine; defer until D-015’s review branch merges.
+## 2026-09-16 18:15 — Supply the first Fall 2026 physics block or explicitly defer scheduling
+**Workstream:** physics-coursework
+**Pointer:** SYLLABUS LEAD ledger slice; PHYSICS GAP MAP; CURRENT INBOX esc-0033
+**Blocked on:** the course, first topic block, and first lecture date from the actual syllabus.
+**Context:** Berkeley began 2026-08-26. The three-week lead and below-one-week pause rule cannot be evaluated from the placeholder-only syllabus map.
+**Options:** provide the official syllabus; provide only the first course/topic/date; explicitly defer physics scheduling.
+
+## [esc-0035] 2026-09-16 21:15 — Set September subscription and loop posture from the overdue August PoC review
+**Workstream:** supervision
+**Pointer:** OPEN DECISIONS D-002, D-005, D-006, D-007, and D-008; CURRENT INBOX esc-0034
+**Blocked on:** August `ccusage`, fallback-spend, and merged/verified-output evidence required by the recorded falsifiers.
+**Context:** Reviews were due 2026-09-01. Renewal of the second subscription is permitted only if capacity passed while the review queue stayed clear.
+**Options:** review the evidence and choose a posture; explicitly extend review with an evidence-collection deadline; reduce to one subscription plus fallback pending evidence.
+
+## 2026-09-16 21:15 — Choose how to unblock the Cursor-dependent Guerra Lenis canaries
+**Workstream:** supervision
+**Pointer:** BUILD-LOOP STATUS: `guerra-003-phase5-lenis-wire-canary` and `guerra-005-phase5-lenis-wire-canary`; OPEN DECISION D-015
+**Blocked on:** whether Cursor plugin execution may be enabled under D-015’s unratified architecture, or whether both tasks should use a supported engine.
+**Context:** Both canaries request the same reduced-motion-aware Lenis provider wiring and are blocked because Cursor is not an enabled plugin.
+**Options:** ratify and enable the Cursor plugin path; requeue both on an already supported engine; defer until D-015’s review branch merges.
+
+## 2026-09-16 21:15 — Supply the first Fall 2026 physics lecture block or explicitly defer scheduling
+**Workstream:** physics-coursework
+**Pointer:** SYLLABUS LEAD ledger slice; PHYSICS GAP MAP; CURRENT INBOX esc-0034
+**Blocked on:** the course, first topic block, and first lecture date from the actual syllabus.
+**Context:** Berkeley began 2026-08-26. The three-week lead and below-one-week pause rule cannot be evaluated from the placeholder-only syllabus map.
+**Options:** provide the official syllabus; provide only the first course/topic/date; explicitly defer physics scheduling.
+
+## [esc-0036] 2026-09-17 06:30 — Complete the overdue decision reviews with their required evidence
+**Workstream:** supervision
+**Pointer:** OPEN DECISIONS ledger slices D-001, D-002, D-005, D-006, D-007, D-008, D-009, D-010, D-012, and D-014; their reviews were due 2026-09-01, 2026-09-06, or 2026-09-15
+**Blocked on:** current evidence required by the recorded falsifiers: August `ccusage`, fallback-spend, merged/verified-output and review-queue evidence; native-diff/two-tier shakedown results; live supervision, PAUSE, notification, and killed-worker state evidence
+**Context:** recorded review dates have passed, but the ledger contains no evidence with which to mark the decisions HELD, FAILED, or UNCLEAR
+**Options:** provide and review the required evidence now; explicitly extend each review with an evidence-collection deadline; reduce or pause the affected subscription/loop posture pending evidence
+## 2026-09-17 06:30 — Supply the first Fall 2026 physics lecture block or explicitly defer scheduling
+**Workstream:** physics-coursework
+**Pointer:** SYLLABUS LEAD ledger slice contains only `_fill from actual syllabus once posted_`; PHYSICS GAP MAP is dated 2026-08-04
+**Blocked on:** the course, first topic block, and first lecture date from the actual syllabus
+**Context:** Berkeley began 2026-08-26. The three-week lead target and below-one-week pause rule cannot be evaluated from the placeholder-only syllabus map
+**Options:** provide the official syllabus; provide only the first course/topic/date; explicitly defer physics scheduling
+
+## [esc-0037] 2026-09-17 09:15 — Complete overdue decision reviews with required evidence
+**Workstream:** supervision
+**Pointer:** OPEN DECISIONS D-001, D-002, D-005, D-006, D-007, D-008, D-009, D-010, D-012, and D-014; BUILD-LOOP STATUS
+**Blocked on:** Evidence for recorded falsifiers: August `ccusage`, fallback spend, verified output and review-queue evidence; native-diff/two-tier shakedown results; and live supervision/PAUSE/notification/killed-worker evidence.
+**Context:** Reviews due 2026-09-01, 2026-09-06, and 2026-09-15 remain OPEN; the ledger has no evidence to mark them HELD, FAILED, or UNCLEAR.
+**Options:** review the required evidence now; explicitly extend each review with an evidence-collection deadline; reduce or pause affected subscription/loop posture pending evidence.
+## 2026-09-17 09:15 — Supply the first Fall 2026 physics lecture block or defer scheduling
+**Workstream:** physics-coursework
+**Pointer:** SYLLABUS LEAD ledger slice contains only `_fill from actual syllabus once posted_`; PHYSICS GAP MAP is dated 2026-08-04.
+**Blocked on:** The course, first topic block, and first lecture date from the actual syllabus.
+**Context:** Berkeley began 2026-08-26. The three-week lead target and below-one-week pause rule cannot be evaluated from the placeholder-only syllabus map.
+**Options:** provide the official syllabus; provide the first course/topic/date only; explicitly defer physics scheduling.
+## 2026-09-17 09:15 — Choose how to unblock the Cursor-dependent Guerra Lenis canaries
+**Workstream:** supervision
+**Pointer:** BUILD-LOOP STATUS: `guerra-003-phase5-lenis-wire-canary` and `guerra-005-phase5-lenis-wire-canary`; OPEN DECISION D-015.
+**Blocked on:** Whether Cursor plugin execution may be enabled under D-015’s unratified plugin architecture, or whether both tasks should use a supported engine.
+**Context:** Both canaries request the same reduced-motion-aware Lenis provider wiring and are blocked because Cursor is not an enabled plugin.
+**Options:** ratify and enable the Cursor plugin path; requeue both on an already supported engine; defer until D-015’s review branch merges.
+
+## [esc-0038] 2026-09-17 15:15 — Complete overdue decision reviews with evidence
+**Workstream:** supervision
+**Pointer:** OPEN DECISIONS D-001, D-002, D-005, D-006, D-007, D-008, D-009, D-010, D-012, and D-014; CURRENT INBOX esc-0036/esc-0037
+**Blocked on:** Evidence required by recorded falsifiers: August `ccusage`, fallback spend, verified output/review-queue results, native-diff two-tier shakedown results, and live supervision/PAUSE/notification/killed-worker evidence.
+**Context:** Reviews due 2026-09-01, 2026-09-06, and 2026-09-15 remain unresolved; subscription renewal and loop posture affect spend and cannot be judged by feel.
+**Options:** Review the evidence and mark each decision; set explicit evidence-collection deadlines; reduce or pause affected subscription/loop posture pending evidence.
+## 2026-09-17 15:15 — Choose the execution path for blocked Guerra Lenis canaries
+**Workstream:** supervision
+**Pointer:** BUILD-LOOP STATUS: `guerra-003-phase5-lenis-wire-canary` and `guerra-005-phase5-lenis-wire-canary`; OPEN DECISION D-015
+**Blocked on:** Whether Cursor plugin execution may be enabled under D-015’s unratified architecture, or whether both tasks should use a supported engine.
+**Context:** Both canaries request the same reduced-motion-aware Lenis provider wiring and are blocked because Cursor is not an enabled plugin.
+**Options:** Ratify and enable the Cursor plugin path; requeue both on a supported engine; defer until D-015’s review branch merges.
+## 2026-09-17 15:15 — Supply the first Fall 2026 physics lecture block or defer scheduling
+**Workstream:** physics-coursework
+**Pointer:** SYLLABUS LEAD ledger slice contains only `_fill from actual syllabus once posted_`; PHYSICS GAP MAP is dated 2026-08-04
+**Blocked on:** The course, first topic block, and first lecture date from the actual syllabus.
+**Context:** Berkeley began 2026-08-26. The three-week lead target and below-one-week pause rule cannot be evaluated from the placeholder-only syllabus map.
+**Options:** Provide the official syllabus; provide the first course/topic/date only; explicitly defer physics scheduling.
+
+## [esc-0039] 2026-09-17 18:15 — Complete overdue decision reviews with their required evidence
+**Workstream:** supervision
+**Pointer:** OPEN DECISIONS D-001, D-002, D-005, D-006, D-007, D-008, D-009, D-010, D-012, and D-014; BUILD-LOOP STATUS
+**Blocked on:** August `ccusage`, fallback-spend, verified-output/review-queue evidence; native-diff shakedown evidence; and live supervision, PAUSE, notification, and killed-worker-state evidence.
+**Context:** Reviews due 2026-09-01, 2026-09-06, and 2026-09-15 remain unresolved. Subscription renewal can spend money and recorded falsifiers cannot be evaluated from this ledger.
+**Options:** review the evidence and mark each decision; set evidence-collection deadlines; reduce or pause affected subscription/loop posture pending evidence.
+## 2026-09-17 18:15 — Choose the execution path for blocked Guerra Lenis canaries
+**Workstream:** supervision
+**Pointer:** BUILD-LOOP STATUS: `guerra-003-phase5-lenis-wire-canary` and `guerra-005-phase5-lenis-wire-canary`; OPEN DECISION D-015
+**Blocked on:** Whether Cursor plugin execution may be enabled under D-015’s unratified plugin architecture, or whether both tasks should use a supported engine.
+**Context:** Both canaries request reduced-motion-aware Lenis provider wiring and are blocked because Cursor is not an enabled plugin.
+**Options:** ratify and enable the Cursor plugin path; requeue both on a supported engine; defer until D-015’s review branch merges.
+## 2026-09-17 18:15 — Supply the first Fall 2026 physics lecture block or defer scheduling
+**Workstream:** physics-coursework
+**Pointer:** SYLLABUS LEAD ledger slice contains only `_fill from actual syllabus once posted_`; PHYSICS GAP MAP is dated 2026-08-04
+**Blocked on:** The course, first topic block, and first lecture date from the actual syllabus.
+**Context:** Berkeley began 2026-08-26. The three-week lead target and below-one-week pause rule cannot be evaluated from the placeholder-only syllabus map.
+**Options:** provide the official syllabus; provide the first course/topic/date only; explicitly defer physics scheduling.
+
+## [esc-0040] 2026-09-18 00:15 — Complete overdue decision reviews using their required evidence
+**Workstream:** supervision
+**Pointer:** OPEN DECISIONS D-001, D-002, D-005, D-006, D-007, D-008, D-009, D-010, D-012, and D-014; reviews due 2026-09-01, 2026-09-06, and 2026-09-15
+**Blocked on:** August `ccusage`, fallback-spend, verified-output/review-queue evidence, native-diff shakedown evidence, and live supervision/PAUSE/notification/killed-worker evidence
+**Context:** The ledger contains no evidence sufficient to evaluate the recorded falsifiers. Subscription posture can spend money and must not be decided by feel.
+**Options:** review and mark each decision now; set explicit evidence-collection deadlines; reduce or pause affected subscription/loop posture pending evidence
+
+## 2026-09-18 00:15 — Supply the first Fall 2026 physics lecture block or explicitly defer scheduling
+**Workstream:** physics-coursework
+**Pointer:** SYLLABUS LEAD ledger slice contains only `_fill from actual syllabus once posted_`; PHYSICS GAP MAP last updated 2026-08-04
+**Blocked on:** course, first topic block, and first lecture date from the actual syllabus
+**Context:** Berkeley began 2026-08-26. The three-week lead target and below-one-week pause rule cannot be evaluated from the placeholder-only syllabus map.
+**Options:** provide the official syllabus; provide the first course/topic/date only; explicitly defer physics scheduling
+
+## 2026-09-18 00:15 — Choose the execution path for blocked Guerra Lenis canaries
+**Workstream:** supervision
+**Pointer:** BUILD-LOOP STATUS: `guerra-003-phase5-lenis-wire-canary` and `guerra-005-phase5-lenis-wire-canary`; OPEN DECISION D-015
+**Blocked on:** whether Cursor plugin execution may be enabled under D-015’s unratified architecture, or whether both tasks should use a supported engine
+**Context:** Both canaries request reduced-motion-aware Lenis provider wiring and are blocked because Cursor is not an enabled plugin.
+**Options:** ratify and enable the Cursor plugin path; requeue both on a supported engine; defer until D-015’s review branch merges
+
+## [esc-0041] 2026-09-18 03:15 — Complete overdue decision reviews and set loop posture
+**Workstream:** supervision
+**Pointer:** OPEN DECISIONS: D-001, D-002, D-005, D-006, D-007, D-008, D-009, D-010, D-012, D-014; CURRENT INBOX esc-0040
+**Blocked on:** Evidence required by their falsifiers: August `ccusage`, fallback spend, verified-output and review-queue evidence; native-diff/two-tier shakedown results; and live supervision, PAUSE, notification, and killed-worker evidence.
+**Context:** Reviews due 2026-09-01, 2026-09-06, and 2026-09-15 remain open. Subscription continuation can spend money and cannot be evaluated from this ledger.
+**Options:** review and mark each decision now; set explicit evidence-collection deadlines; reduce or pause affected subscription/loop posture pending evidence.
+## 2026-09-18 03:15 — Choose the execution path for blocked Guerra Lenis canaries
+**Workstream:** supervision
+**Pointer:** BUILD-LOOP STATUS: `guerra-003-phase5-lenis-wire-canary` and `guerra-005-phase5-lenis-wire-canary`; OPEN DECISION D-015
+**Blocked on:** Whether Cursor plugin execution may be enabled under D-015’s unratified architecture, or whether both tasks should use a supported engine.
+**Context:** Both canaries request reduced-motion-aware Lenis provider wiring and are blocked because Cursor is not an enabled plugin.
+**Options:** ratify and enable the Cursor plugin path; requeue both on a supported engine; defer until D-015’s review branch merges.
+## 2026-09-18 03:15 — Supply the first Fall 2026 physics lecture block or defer scheduling
+**Workstream:** physics-coursework
+**Pointer:** SYLLABUS LEAD ledger slice contains only `_fill from actual syllabus once posted_`; PHYSICS GAP MAP last updated 2026-08-04
+**Blocked on:** Course, first topic block, and first lecture date from the actual syllabus.
+**Context:** Berkeley began 2026-08-26. The three-week lead target and below-one-week pause rule cannot be evaluated from the placeholder-only syllabus map.
+**Options:** provide the official syllabus; provide the first course/topic/date only; explicitly defer physics scheduling.
+
+## [esc-0042] 2026-09-18 09:15 — Complete overdue decision reviews and set the September loop posture
+**Workstream:** supervision
+**Pointer:** OPEN DECISIONS D-001, D-002, D-005, D-006, D-007, D-008, D-009, D-010, D-012, and D-014; their reviews were due 2026-09-01, 2026-09-06, or 2026-09-15
+**Blocked on:** Evidence required by recorded falsifiers: August `ccusage`, fallback spend, verified-output/review-queue evidence; native-diff/two-tier shakedown results; and live supervision, PAUSE, notification, and killed-worker evidence
+**Context:** Subscription continuation can spend money, and the ledger contains no evidence sufficient to mark these decisions HELD, FAILED, or UNCLEAR.
+**Options:** review and mark each decision now; set explicit evidence-collection deadlines; reduce or pause affected subscription/loop posture pending evidence
+## 2026-09-18 09:15 — Supply the first Fall 2026 physics lecture block or explicitly defer scheduling
+**Workstream:** physics-coursework
+**Pointer:** SYLLABUS LEAD ledger slice contains only `_fill from actual syllabus once posted_`; PHYSICS GAP MAP was last updated 2026-08-04
+**Blocked on:** Course, first topic block, and first lecture date from the actual syllabus
+**Context:** Berkeley began 2026-08-26. The three-week lead target and below-one-week pause rule cannot be evaluated from the placeholder-only map.
+**Options:** provide the official syllabus; provide the first course/topic/date only; explicitly defer physics scheduling
+## 2026-09-18 09:15 — Choose the execution path for blocked Guerra Lenis canaries
+**Workstream:** supervision
+**Pointer:** BUILD-LOOP STATUS: `guerra-003-phase5-lenis-wire-canary` and `guerra-005-phase5-lenis-wire-canary`; OPEN DECISION D-015
+**Blocked on:** Whether Cursor plugin execution may be enabled under D-015’s unratified architecture, or whether both tasks should use a supported engine
+**Context:** Both canaries request reduced-motion-aware Lenis provider wiring and are blocked because Cursor is not an enabled plugin.
+**Options:** ratify and enable the Cursor plugin path; requeue both on a supported engine; defer until D-015’s review branch merges
+
+## [esc-0043] 2026-09-18 15:15 — Complete overdue decision reviews and set September loop posture
+**Workstream:** supervision
+**Pointer:** OPEN DECISIONS D-001, D-002, D-005, D-006, D-007, D-008, D-009, D-010, D-012, and D-014; reviews due 2026-09-01, 2026-09-06, and 2026-09-15
+**Blocked on:** Evidence required by recorded falsifiers: August `ccusage`, fallback spend, verified-output/review-queue evidence; native-diff/two-tier shakedown results; and live supervision, PAUSE, notification, and killed-worker evidence.
+**Context:** Subscription continuation can spend money, and the ledger contains no evidence sufficient to mark the overdue decisions HELD, FAILED, or UNCLEAR.
+**Options:** review and mark each decision now; set explicit evidence-collection deadlines; reduce or pause affected subscription/loop posture pending evidence.
+## 2026-09-18 15:15 — Choose the execution path for blocked Guerra Lenis canaries
+**Workstream:** supervision
+**Pointer:** BUILD-LOOP STATUS: `guerra-003-phase5-lenis-wire-canary` and `guerra-005-phase5-lenis-wire-canary`; OPEN DECISION D-015
+**Blocked on:** Whether Cursor plugin execution may be enabled under D-015’s unratified architecture, or whether both tasks should use a supported engine.
+**Context:** Both canaries request reduced-motion-aware Lenis provider wiring and are blocked because Cursor is not an enabled plugin.
+**Options:** ratify and enable the Cursor plugin path; requeue both on a supported engine; defer until D-015’s review branch merges.
+
+## [esc-0044] 2026-09-19 00:15 — Complete overdue decision reviews and set the loop posture
+**Workstream:** supervision
+**Pointer:** OPEN DECISIONS D-001, D-002, D-005, D-006, D-007, D-008, D-009, D-010, D-012, and D-014; reviews due 2026-09-01, 2026-09-06, and 2026-09-15
+**Blocked on:** Evidence required by the recorded falsifiers: August `ccusage`, fallback-spend, verified-output/review-queue results, native-diff two-tier shakedown, and live supervision/PAUSE/notification/killed-worker evidence
+**Context:** Subscription continuation can spend money; the ledger contains no evidence sufficient to mark the overdue decisions HELD, FAILED, or UNCLEAR.
+**Options:** review and mark the decisions now; set explicit evidence-collection deadlines; reduce or pause affected subscription/loop posture pending evidence
+## 2026-09-19 00:15 — Supply the first Fall 2026 physics lecture block or explicitly defer scheduling
+**Workstream:** physics-coursework
+**Pointer:** SYLLABUS LEAD ledger slice contains only `_fill from actual syllabus once posted_`; PHYSICS GAP MAP was last updated 2026-08-04
+**Blocked on:** Course, first topic block, and first lecture date from the actual syllabus
+**Context:** Berkeley began 2026-08-26. The three-week lead target and below-one-week pause rule cannot be evaluated from the placeholder-only map.
+**Options:** provide the official syllabus; provide the first course/topic/date only; explicitly defer physics scheduling
+## 2026-09-19 00:15 — Choose the execution path for blocked Guerra Lenis canaries
+**Workstream:** supervision
+**Pointer:** BUILD-LOOP STATUS: `guerra-003-phase5-lenis-wire-canary` and `guerra-005-phase5-lenis-wire-canary`; OPEN DECISION D-015
+**Blocked on:** Whether Cursor plugin execution may be enabled under D-015’s unratified architecture, or whether both tasks should use a supported engine
+**Context:** Both canaries request reduced-motion-aware Lenis provider wiring and are blocked because Cursor is not an enabled plugin.
+**Options:** ratify and enable the Cursor plugin path; requeue both on a supported engine; defer until D-015’s review branch merges
+
+## [esc-0045] 2026-09-19 18:15 — Set loop posture from overdue decision reviews
+**Workstream:** supervision
+**Pointer:** OPEN DECISIONS D-001, D-002, D-005, D-006, D-007, D-008, D-009, D-010, D-012, and D-014; BUILD-LOOP STATUS
+**Blocked on:** Evidence required by the recorded falsifiers: August `ccusage`, fallback spend, verified-output/review-queue results, native-diff two-tier shakedown, and live supervision/PAUSE/notification/killed-worker evidence.
+**Context:** Reviews due 2026-09-01, 2026-09-06, and 2026-09-15 remain open. Subscription continuation can spend money and cannot be decided from this ledger.
+**Options:** review and mark the decisions now; set explicit evidence-collection deadlines; reduce or pause affected loop/subscription posture pending evidence.
+## 2026-09-19 18:15 — Choose execution path for blocked Guerra Lenis canaries
+**Workstream:** supervision
+**Pointer:** BUILD-LOOP STATUS: `guerra-003-phase5-lenis-wire-canary` and `guerra-005-phase5-lenis-wire-canary`; OPEN DECISION D-015
+**Blocked on:** Whether Cursor plugin execution may be enabled under D-015’s unratified architecture, or whether both tasks should use a supported engine.
+**Context:** Both canaries request reduced-motion-aware Lenis provider wiring and are blocked because Cursor is not an enabled plugin.
+**Options:** ratify and enable the Cursor plugin path; requeue both on a supported engine; defer until D-015’s review branch merges.
+## 2026-09-19 18:15 — Supply the first Fall 2026 physics lecture block or defer scheduling
+**Workstream:** physics-coursework
+**Pointer:** SYLLABUS LEAD ledger slice contains only `_fill from actual syllabus once posted_`; PHYSICS GAP MAP was last updated 2026-08-04
+**Blocked on:** Course, first topic block, and first lecture date from the actual syllabus.
+**Context:** Berkeley began 2026-08-26. The three-week lead target and below-one-week pause rule cannot be evaluated from the placeholder-only map.
+**Options:** provide the official syllabus; provide the first course/topic/date only; explicitly defer physics scheduling.
+
+## [esc-0046] 2026-09-20 00:15 — Set loop and subscription posture from overdue evidence-based reviews
+**Workstream:** supervision
+**Pointer:** OPEN DECISIONS D-001, D-002, D-005, D-006, D-007, D-008, D-009, D-010, D-012, and D-014; their reviews were due 2026-09-01, 2026-09-06, or 2026-09-15
+**Blocked on:** Evidence required by the falsifiers: August `ccusage`, fallback spend, verified output/review-queue results, native-diff two-tier shakedown results, and live supervision/PAUSE/notification/killed-worker evidence
+**Context:** Subscription continuation can spend money; the ledger cannot support a HELD/FAILED/UNCLEAR review.
+**Options:** review and mark the decisions now; set evidence-collection deadlines; reduce or pause the affected loop/subscription posture pending evidence
+## 2026-09-20 00:15 — Choose the execution path for blocked Guerra Lenis canaries
+**Workstream:** supervision
+**Pointer:** BUILD-LOOP STATUS: `guerra-003-phase5-lenis-wire-canary` and `guerra-005-phase5-lenis-wire-canary`; OPEN DECISION D-015
+**Blocked on:** Whether Cursor plugin execution may be enabled under D-015’s unratified architecture, or whether both tasks should use a supported engine
+**Context:** Both canaries are blocked because Cursor is not an enabled plugin.
+**Options:** ratify and enable Cursor; requeue both on a supported engine; defer until D-015’s review branch merges
+## 2026-09-20 00:15 — Supply the first Fall 2026 physics block or explicitly defer scheduling
+**Workstream:** physics-coursework
+**Pointer:** SYLLABUS LEAD ledger slice contains only `_fill from actual syllabus once posted_`; PHYSICS GAP MAP last updated 2026-08-04
+**Blocked on:** Course, first topic block, and first lecture date from the actual syllabus
+**Context:** Berkeley began 2026-08-26; the three-week lead target and below-one-week pause rule cannot be evaluated from the placeholder-only map.
+**Options:** provide the official syllabus; provide the first course/topic/date only; explicitly defer physics scheduling
+
+## [esc-0047] 2026-09-20 06:15 — Complete overdue decision reviews and set loop/subscription posture
+**Workstream:** supervision
+**Pointer:** OPEN DECISIONS D-001, D-002, D-005, D-006, D-007, D-008, D-009, D-010, D-012, and D-014; reviews due 2026-09-01, 2026-09-06, or 2026-09-15
+**Blocked on:** Evidence required by their falsifiers: August `ccusage`, fallback-spend, verified-output/review-queue results, native-diff two-tier shakedown results, and live supervision/PAUSE/notification/killed-worker evidence
+**Context:** Subscription continuation can spend money, and the ledger has no basis to mark these overdue decisions HELD, FAILED, or UNCLEAR.
+**Options:** review and mark the decisions now; set explicit evidence-collection deadlines; reduce or pause the affected loop/subscription posture pending evidence
+## 2026-09-20 06:15 — Choose the execution path for blocked Guerra Lenis canaries
+**Workstream:** supervision
+**Pointer:** BUILD-LOOP STATUS: `guerra-003-phase5-lenis-wire-canary` and `guerra-005-phase5-lenis-wire-canary`; OPEN DECISION D-015
+**Blocked on:** Whether Cursor plugin execution may be enabled under D-015’s unratified architecture, or whether both tasks should use a supported engine
+**Context:** Both canaries are blocked because Cursor is not an enabled plugin.
+**Options:** ratify and enable Cursor; requeue both on a supported engine; defer until D-015’s review branch merges
+## 2026-09-20 06:15 — Supply the first Fall 2026 physics block or explicitly defer scheduling
+**Workstream:** physics-coursework
+**Pointer:** SYLLABUS LEAD ledger slice contains only `_fill from actual syllabus once posted_`; PHYSICS GAP MAP last updated 2026-08-04
+**Blocked on:** Course, first topic block, and first lecture date from the actual syllabus
+**Context:** Berkeley began 2026-08-26; the three-week lead target and below-one-week pause rule cannot be evaluated from the placeholder-only map.
+**Options:** provide the official syllabus; provide the first course/topic/date only; explicitly defer physics scheduling
+
+## [esc-0048] 2026-09-20 06:30 — Complete overdue evidence-based reviews and set loop/subscription posture
+**Workstream:** supervision
+**Pointer:** OPEN DECISIONS D-001, D-002, D-005, D-006, D-007, D-008, D-009, D-010, D-012, and D-014; reviews due 2026-09-01, 2026-09-06, or 2026-09-15
+**Blocked on:** Evidence required by the recorded falsifiers: August `ccusage`, fallback-spend, verified-output/review-queue results, native-diff two-tier shakedown, and live supervision/PAUSE/notification/killed-worker evidence
+**Context:** Subscription continuation can spend money; the ledger cannot support HELD, FAILED, or UNCLEAR determinations.
+**Options:** review and mark the decisions now; set explicit evidence-collection deadlines; reduce or pause affected loop/subscription posture pending evidence
+## 2026-09-20 06:30 — Choose an execution path for the blocked Guerra Lenis canaries
+**Workstream:** supervision
+**Pointer:** BUILD-LOOP STATUS: `guerra-003-phase5-lenis-wire-canary` and `guerra-005-phase5-lenis-wire-canary`; OPEN DECISION D-015
+**Blocked on:** Whether Cursor plugin execution may be enabled under D-015’s unratified architecture, or whether both tasks should use a supported engine
+**Context:** Both canaries are blocked because Cursor is not an enabled plugin.
+**Options:** ratify and enable Cursor; requeue both on a supported engine; defer until D-015’s review branch merges
+## 2026-09-20 06:30 — Supply the first Fall 2026 physics block or explicitly defer scheduling
+**Workstream:** physics-coursework
+**Pointer:** SYLLABUS LEAD ledger slice contains only `_fill from actual syllabus once posted_`; PHYSICS GAP MAP last updated 2026-08-04
+**Blocked on:** Course, first topic block, and first lecture date from the actual syllabus
+**Context:** Berkeley began 2026-08-26; the three-week lead target and below-one-week pause rule cannot be evaluated from the placeholder-only map.
+**Options:** provide the official syllabus; provide the first course/topic/date only; explicitly defer physics scheduling
+
+## [esc-0049] 2026-09-20 21:15 — Complete overdue evidence-based decision reviews and set loop/subscription posture
+**Workstream:** supervision
+**Pointer:** OPEN DECISIONS D-001, D-002, D-005, D-006, D-007, D-008, D-009, D-010, D-012, and D-014; BUILD-LOOP STATUS
+**Blocked on:** Evidence required by their falsifiers: August `ccusage`, fallback spend, verified-output/review-queue results, native-diff two-tier shakedown, and live supervision/PAUSE/notification/killed-worker evidence
+**Context:** Reviews due 2026-09-01, 2026-09-06, and 2026-09-15 remain open. Subscription continuation can spend money and cannot be decided from this ledger.
+**Options:** review and mark the decisions now; set explicit evidence-collection deadlines; reduce or pause affected loop/subscription posture pending evidence
+## 2026-09-20 21:15 — Choose an execution path for blocked Guerra Lenis canaries
+**Workstream:** supervision
+**Pointer:** BUILD-LOOP STATUS: `guerra-003-phase5-lenis-wire-canary` and `guerra-005-phase5-lenis-wire-canary`; OPEN DECISION D-015
+**Blocked on:** Whether Cursor plugin execution may be enabled under D-015’s unratified architecture, or whether both tasks should use a supported engine
+**Context:** Both canaries are blocked because Cursor is not an enabled plugin.
+**Options:** ratify and enable Cursor; requeue both on a supported engine; defer until D-015’s review branch merges
+## 2026-09-20 21:15 — Supply the first Fall 2026 physics block or explicitly defer scheduling
+**Workstream:** physics-coursework
+**Pointer:** SYLLABUS LEAD ledger slice contains only `_fill from actual syllabus once posted_`; PHYSICS GAP MAP last updated 2026-08-04
+**Blocked on:** Course, first topic block, and first lecture date from the actual syllabus
+**Context:** Berkeley began 2026-08-26; the three-week lead target and below-one-week pause rule cannot be evaluated from the placeholder-only map.
+**Options:** provide the official syllabus; provide the first course/topic/date only; explicitly defer physics scheduling
+
+## [esc-0050] 2026-09-21 09:15 — Complete overdue evidence-based decision reviews and set loop posture
+**Workstream:** supervision
+**Pointer:** OPEN DECISIONS D-001, D-002, D-005, D-006, D-007, D-008, D-009, D-010, D-012, and D-014; reviews due 2026-09-01, 2026-09-06, or 2026-09-15
+**Blocked on:** Evidence required by their falsifiers: August `ccusage`, fallback-spend, verified-output/review-queue results, native-diff two-tier shakedown results, and live supervision/PAUSE/notification/killed-worker evidence.
+**Context:** Subscription continuation can spend money, and the ledger cannot support HELD, FAILED, or UNCLEAR determinations.
+**Options:** Review and mark the decisions now; set explicit evidence-collection deadlines; reduce or pause affected loop/subscription posture pending evidence.
+## 2026-09-21 09:15 — Choose an execution path for blocked Guerra Lenis canaries
+**Workstream:** supervision
+**Pointer:** BUILD-LOOP STATUS: `guerra-003-phase5-lenis-wire-canary` and `guerra-005-phase5-lenis-wire-canary`; OPEN DECISION D-015
+**Blocked on:** Whether Cursor plugin execution may be enabled under D-015’s unratified architecture, or whether both tasks should use a supported engine.
+**Context:** Both canaries are blocked because Cursor is not an enabled plugin.
+**Options:** Ratify and enable Cursor; requeue both on a supported engine; defer until D-015’s review branch merges.
+## 2026-09-21 09:15 — Supply the first Fall 2026 physics block or explicitly defer scheduling
+**Workstream:** physics-coursework
+**Pointer:** SYLLABUS LEAD ledger slice contains only `_fill from actual syllabus once posted_`; PHYSICS GAP MAP last updated 2026-08-04
+**Blocked on:** Course, first topic block, and first lecture date from the actual syllabus.
+**Context:** Berkeley began 2026-08-26; the three-week lead target and below-one-week pause rule cannot be evaluated from the placeholder-only map.
+**Options:** Provide the official syllabus; provide the first course/topic/date only; explicitly defer physics scheduling.
+
+## [esc-0051] 2026-09-21 12:15 — Complete overdue evidence-based reviews and set loop posture
+**Workstream:** supervision
+**Pointer:** OPEN DECISIONS D-001, D-002, D-005, D-006, D-007, D-008, D-009, D-010, D-012, and D-014; BUILD-LOOP STATUS
+**Blocked on:** Evidence required by the falsifiers: August `ccusage`, fallback spend, verified-output/review-queue results, native-diff two-tier shakedown, and live supervision/PAUSE/notification/killed-worker evidence.
+**Context:** Reviews due 2026-09-01, 2026-09-06, and 2026-09-15 remain open. Subscription continuation can spend money and cannot be decided from this ledger.
+**Options:** Review and mark the decisions now; set explicit evidence-collection deadlines; reduce or pause the affected loop/subscription posture pending evidence.
+## 2026-09-21 12:15 — Choose an execution path for the blocked Guerra Lenis canaries
+**Workstream:** supervision
+**Pointer:** BUILD-LOOP STATUS: `guerra-003-phase5-lenis-wire-canary` and `guerra-005-phase5-lenis-wire-canary`; OPEN DECISION D-015
+**Blocked on:** Whether Cursor plugin execution may be enabled under D-015’s unratified architecture, or whether both tasks should use a supported engine.
+**Context:** Both canaries request reduced-motion-aware Lenis provider wiring and are blocked because Cursor is not an enabled plugin.
+**Options:** Ratify and enable Cursor; requeue both on a supported engine; defer until D-015’s review branch merges.
+## 2026-09-21 12:15 — Supply the first Fall 2026 physics block or explicitly defer scheduling
+**Workstream:** physics-coursework
+**Pointer:** SYLLABUS LEAD ledger slice contains only `_fill from actual syllabus once posted_`; PHYSICS GAP MAP last updated 2026-08-04.
+**Blocked on:** Course, first topic block, and first lecture date from the actual syllabus.
+**Context:** Berkeley began 2026-08-26; the three-week lead target and below-one-week pause rule cannot be evaluated from the placeholder-only map.
+**Options:** Provide the official syllabus; provide the first course/topic/date only; explicitly defer physics scheduling.
+
+## [esc-0052] 2026-09-22 15:15 — Set loop/subscription posture from overdue evidence-based reviews
+**Workstream:** supervision
+**Pointer:** OPEN DECISIONS D-001, D-002, D-005, D-006, D-007, D-008, D-009, D-010, D-012, and D-014; BUILD-LOOP STATUS
+**Blocked on:** Evidence required by the recorded falsifiers: August `ccusage`, fallback spend, verified-output/review-queue results, native-diff two-tier shakedown results, and live supervision/PAUSE/notification/killed-worker evidence.
+**Context:** Reviews due 2026-09-01, 2026-09-06, and 2026-09-15 remain open. Subscription continuation can spend money and cannot be decided from this ledger.
+**Options:** Review and mark each decision now; set explicit evidence-collection deadlines; reduce or pause affected loop/subscription posture pending evidence.
+## 2026-09-22 15:15 — Choose an execution path for blocked Guerra Lenis canaries
+**Workstream:** supervision
+**Pointer:** BUILD-LOOP STATUS: `guerra-003-phase5-lenis-wire-canary` and `guerra-005-phase5-lenis-wire-canary`; OPEN DECISION D-015
+**Blocked on:** Whether Cursor plugin execution may be enabled under D-015’s unratified architecture, or whether both tasks should use a supported engine.
+**Context:** Both canaries request reduced-motion-aware Lenis provider wiring and are blocked because Cursor is not an enabled plugin.
+**Options:** Ratify and enable Cursor; requeue both on a supported engine; defer until D-015’s review branch merges.
+## 2026-09-22 15:15 — Supply the first Fall 2026 physics block or explicitly defer scheduling
+**Workstream:** physics-coursework
+**Pointer:** SYLLABUS LEAD ledger slice contains only `_fill from actual syllabus once posted_`; PHYSICS GAP MAP last updated 2026-08-04.
+**Blocked on:** Course, first topic block, and first lecture date from the actual syllabus.
+**Context:** Berkeley began 2026-08-26; the three-week lead target and below-one-week pause rule cannot be evaluated from the placeholder-only map.
+**Options:** Provide the official syllabus; provide the first course/topic/date only; explicitly defer physics scheduling.
+
+## [esc-0054] 2026-09-29 03:15 — Set loop and subscription posture from overdue PoC reviews
+**Workstream:** supervision
+**Pointer:** OPEN DECISIONS ledger slices D-002, D-005, D-006, D-007, and D-008; BUILD-LOOP STATUS
+**Blocked on:** August `ccusage`, fallback-spend, verified-output, and review-queue evidence required by the recorded falsifiers.
+**Context:** Reviews were due 2026-09-01. Subscription continuation and fallback configuration can spend money; the ledger cannot support a HELD, FAILED, or UNCLEAR determination.
+**Options:** review the evidence and mark the decisions; set explicit evidence-collection deadlines; reduce or pause the affected loop/subscription posture pending evidence.
+## 2026-09-29 03:15 — Supply the first Fall 2026 physics block or explicitly defer scheduling
+**Workstream:** physics-coursework
+**Pointer:** SYLLABUS LEAD ledger slice contains only `_fill from actual syllabus once posted_`; PHYSICS GAP MAP is dated 2026-08-04.
+**Blocked on:** Course, first topic block, and first lecture date from the actual syllabus.
+**Context:** Berkeley began 2026-08-26. The three-week lead target and below-one-week pause-new-blocks rule cannot be evaluated from the placeholder-only map.
+**Options:** provide the official syllabus; provide the first course/topic/date only; explicitly defer physics scheduling.
+## 2026-09-29 03:15 — Choose an execution path for blocked Guerra Lenis canaries
+**Workstream:** supervision
+**Pointer:** BUILD-LOOP STATUS: `guerra-003-phase5-lenis-wire-canary` and `guerra-005-phase5-lenis-wire-canary`; OPEN DECISION D-015.
+**Blocked on:** Whether Cursor plugin execution may be enabled under D-015’s unratified architecture, or whether both tasks should use a supported engine.
+**Context:** Both tasks request the same reduced-motion-aware Lenis provider wiring and are escalated because Cursor is not an enabled plugin.
+**Options:** ratify and enable Cursor; requeue both on a supported engine; defer until D-015’s review branch merges.
+
+## [esc-0055] 2026-09-29 06:15 — Set September loop and subscription posture from overdue PoC reviews
+**Workstream:** supervision
+**Pointer:** OPEN DECISIONS ledger slices D-002, D-005, D-006, D-007, and D-008; BUILD-LOOP STATUS
+**Blocked on:** August `ccusage`, fallback-spend, verified-output, and review-queue evidence required by the recorded falsifiers
+**Context:** Reviews were due 2026-09-01. Subscription continuation and fallback configuration can spend money; the ledger cannot support a HELD, FAILED, or UNCLEAR determination.
+**Options:** review and mark the decisions; set explicit evidence-collection deadlines; reduce or pause the affected loop/subscription posture pending evidence
+## 2026-09-29 06:15 — Choose an execution path for blocked Guerra Lenis canaries
+**Workstream:** supervision
+**Pointer:** BUILD-LOOP STATUS: `guerra-003-phase5-lenis-wire-canary` and `guerra-005-phase5-lenis-wire-canary`; OPEN DECISION D-015
+**Blocked on:** whether Cursor plugin execution may be enabled under D-015’s unratified architecture, or whether both tasks should use a supported engine
+**Context:** Both tasks request the same reduced-motion-aware Lenis provider wiring and are escalated because Cursor is not an enabled plugin.
+**Options:** ratify and enable Cursor; requeue both on a supported engine; defer until D-015’s review branch merges
+## 2026-09-29 06:15 — Supply the first Fall 2026 physics block or explicitly defer scheduling
+**Workstream:** physics-coursework
+**Pointer:** SYLLABUS LEAD ledger slice contains only `_fill from actual syllabus once posted_`; PHYSICS GAP MAP is dated 2026-08-04
+**Blocked on:** course, first topic block, and first lecture date from the actual syllabus
+**Context:** Berkeley began 2026-08-26. The three-week lead target and below-one-week pause-new-blocks rule cannot be evaluated from the placeholder-only map.
+**Options:** provide the official syllabus; provide the first course/topic/date only; explicitly defer physics scheduling
+
+## [esc-0056] 2026-09-29 12:15 — Complete overdue PoC reviews before retaining or changing loop spend
+**Workstream:** supervision
+**Pointer:** OPEN DECISIONS D-002, D-005, D-006, D-007, and D-008; BUILD-LOOP STATUS
+**Blocked on:** August `ccusage`, fallback-spend, verified-output, and review-queue evidence required by the recorded falsifiers
+**Context:** Reviews were due 2026-09-01. Subscription continuation and fallback configuration can spend money; the ledger cannot support HELD, FAILED, or UNCLEAR determinations.
+**Options:** review and mark the decisions with the evidence; set explicit evidence-collection deadlines; reduce or pause the affected loop/subscription posture pending evidence
+## 2026-09-29 12:15 — Provide the first Fall 2026 physics block or explicitly defer scheduling
+**Workstream:** physics-coursework
+**Pointer:** SYLLABUS LEAD ledger slice contains only `_fill from actual syllabus once posted_`; PHYSICS GAP MAP is dated 2026-08-04
+**Blocked on:** course, first topic block, and first lecture date from the actual syllabus
+**Context:** Berkeley began 2026-08-26. The three-week lead target and below-one-week pause-new-blocks rule cannot be evaluated from the placeholder-only map.
+**Options:** provide the official syllabus; provide the first course/topic/date only; explicitly defer physics scheduling
+
+## [esc-0057] 2026-09-30 00:15 — Complete overdue evidence-based reviews before retaining or changing loop spend
+**Workstream:** supervision
+**Pointer:** OPEN DECISIONS D-001, D-002, D-005, D-006, D-007, D-008, D-009, D-010, D-012, and D-014; BUILD-LOOP STATUS re-derived 2026-09-30T00:15:39Z
+**Blocked on:** The evidence named by the decisions’ falsifiers: August `ccusage`, fallback-spend, verified-output/review-queue results, native-diff two-tier shakedown results, and live supervision/PAUSE/notification/killed-worker evidence.
+**Context:** Reviews due 2026-09-01, 2026-09-06, and 2026-09-15 remain OPEN. Subscription continuation and fallback configuration can spend money; the ledger cannot support HELD, FAILED, or UNCLEAR determinations.
+**Options:** Review and mark the decisions with evidence; set explicit evidence-collection deadlines; reduce or pause affected loop/subscription posture pending evidence.
+## 2026-09-30 00:15 — Choose an execution path for the blocked Guerra Lenis canaries
+**Workstream:** supervision
+**Pointer:** BUILD-LOOP STATUS: `guerra-003-phase5-lenis-wire-canary` and `guerra-005-phase5-lenis-wire-canary`; OPEN DECISION D-015, review 2026-09-30
+**Blocked on:** Whether Cursor plugin execution may be human-enabled under D-015’s unratified architecture, or whether both tasks should use a supported engine.
+**Context:** Both tasks request the same reduced-motion-aware Lenis provider wiring and are escalated because Cursor is not an enabled plugin.
+**Options:** Ratify and enable Cursor; requeue both on a supported engine; defer until D-015’s review branch merges.
+## 2026-09-30 00:15 — Supply the first Fall 2026 physics block or explicitly defer scheduling
+**Workstream:** physics-coursework
+**Pointer:** SYLLABUS LEAD ledger slice contains only `_fill from actual syllabus once posted_`; PHYSICS GAP MAP is dated 2026-08-04
+**Blocked on:** Course, first topic block, and first lecture date from the actual syllabus.
+**Context:** Berkeley began 2026-08-26. The three-week lead target and below-one-week pause-new-blocks rule cannot be evaluated from the placeholder-only map.
+**Options:** Provide the official syllabus; provide the first course/topic/date only; explicitly defer physics scheduling.

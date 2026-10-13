@@ -103,14 +103,15 @@ jobs:
       - name: Provider-free gate
         run: python -X utf8 -B tools/ci_gate.py --force
 
+  # GitHub-hosted macOS is not run on master pushes. Nightly master coverage
+  # lives in ci-macos-nightly.yml (07:17 UTC, skipped if no commits in 24h).
   macos:
     name: macos
     needs: linux
     if: >
       needs.linux.result == 'success' &&
       needs.linux.outputs.run_full == 'true' &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_dispatch' ||
        (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:full')))
     runs-on: macos-latest
     timeout-minutes: 15

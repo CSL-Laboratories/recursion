@@ -25,6 +25,8 @@ ROOT = Path(__file__).resolve().parents[1]
 ZERO_SHA = "0" * 40
 GIT = ["git", "-c", "core.longpaths=true"]
 RUN_TIMEOUT = 180
+# delegated-Q fake controls resolve this TASK_BASE tree; shallow clones omit it.
+DQ_TASK_BASE = "0c908f6833e715af0eaa01b6f6788120eb577efd"
 
 # Paths that can break the provider-free gate. Markdown/docs-only diffs skip.
 GATE_PREFIXES = (
@@ -150,6 +152,25 @@ def whitespace_check() -> None:
         raise SystemExit("whitespace check failed (git diff --check)")
 
 
+def ensure_commit(sha: str) -> None:
+    try:
+        git("cat-file", "-e", f"{sha}^{{commit}}")
+        return
+    except subprocess.CalledProcessError:
+        pass
+    print(f"fetching missing commit {sha[:12]}", flush=True)
+    result = subprocess.run(
+        [*GIT, "fetch", "--no-tags", "--prune", "--depth=1", "origin", sha],
+        cwd=ROOT,
+        check=False,
+    )
+    if result.returncode:
+        raise SystemExit(
+            f"git object {sha} is not in this clone and could not be fetched; "
+            "use a full-history checkout (fetch-depth: 0)"
+        )
+
+
 def byte_compile() -> None:
     targets = ["tools", "scripts", "schemas", "experiments", "docs"]
     print("RUN python -m compileall " + " ".join(targets), flush=True)
@@ -164,6 +185,7 @@ def byte_compile() -> None:
 
 
 def run_suite() -> None:
+    ensure_commit(DQ_TASK_BASE)
     whitespace_check()
     byte_compile()
     run_program(["tools/check_public_scope.py"])

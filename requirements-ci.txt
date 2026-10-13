@@ -1,0 +1,3 @@
+# Provider-free CI/test dependency. The M1 schema tests import jsonschema
+# (Draft 2020-12). No other third-party packages are required for the gate.
+jsonschema==4.23.0

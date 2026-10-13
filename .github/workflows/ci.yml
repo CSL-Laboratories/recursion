@@ -1,0 +1,134 @@
+# Recursion v3 — tiered provider-free CI.
+#
+# Required status check (branch protection): linux
+# Windows and macOS are extra OS coverage, not required on every PR.
+#
+# Excluded from this gate (not general CI / not runnable here):
+# - tools/check_v3_orientation.py — frozen 2026-09-13 allowed-path repair
+# - docs/v3/construction/next-work-20260914/check_handoff.py — T-01 spec freeze
+#   (already fails on master: ACCEPTANCE.md changed after that packet)
+# - delegated-q check.py --mode preflight — packet-scoped source_gate (seven
+#   additive paths from TASK_BASE only)
+# - delegated-q check.py --mode execute — Owner-gated scientific admission;
+#   needs secrets, a trusted controller, and live resource observations
+# - tools/check_next_phase.py — needs Java/TLA+, not the current product suite
+name: CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: utf-8
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  linux:
+    name: linux
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 15
+    outputs:
+      run_full: ${{ steps.paths.outputs.run_full }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch comparison SHA
+        if: github.event_name == 'pull_request' || github.event_name == 'push'
+        env:
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ -n "$CI_BASE_SHA" ] && [ "$CI_BASE_SHA" != "0000000000000000000000000000000000000000" ]; then
+            git fetch --no-tags --prune --depth=1 origin "$CI_BASE_SHA"
+          fi
+
+      - name: Path filter
+        id: paths
+        env:
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python3 -X utf8 -B tools/ci_gate.py --paths-only
+
+      - name: Set up Python
+        if: steps.paths.outputs.run_full == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-ci.txt
+
+      - name: Install dependencies
+        if: steps.paths.outputs.run_full == 'true'
+        run: python -m pip install -r requirements-ci.txt
+
+      - name: Provider-free gate
+        if: steps.paths.outputs.run_full == 'true'
+        env:
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python -X utf8 -B tools/ci_gate.py --force
+
+  windows:
+    name: windows
+    needs: linux
+    if: >
+      needs.linux.result == 'success' &&
+      needs.linux.outputs.run_full == 'true' &&
+      (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:full')))
+    runs-on: blacksmith-2vcpu-windows-2025
+    timeout-minutes: 20
+    steps:
+      - name: Enable Git long paths
+        run: git config --global core.longpaths true
+
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-ci.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements-ci.txt
+
+      - name: Provider-free gate
+        run: python -X utf8 -B tools/ci_gate.py --force
+
+  macos:
+    name: macos
+    needs: linux
+    if: >
+      needs.linux.result == 'success' &&
+      needs.linux.outputs.run_full == 'true' &&
+      (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:full')))
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-ci.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements-ci.txt
+
+      - name: Provider-free gate
+        run: python -X utf8 -B tools/ci_gate.py --force

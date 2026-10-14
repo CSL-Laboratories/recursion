@@ -11,7 +11,8 @@ This is the command the GitHub Actions `linux` job runs. It is not v3 release
 acceptance, live-provider qualification, or scientific admission.
 
 Path filter: when CI_BASE_SHA is set (PR base or push-before), a docs-only
-diff exits 0 without running the suite. --force always runs the suite.
+diff skips the contract-test suite but still runs whitespace_check and
+check_public_scope. --force always runs the suite.
 """
 from __future__ import annotations
 
@@ -23,7 +24,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 ZERO_SHA = "0" * 40
-GIT = ["git", "-c", "core.longpaths=true"]
+GIT = ["git", "-c", "core.longpaths=true", "-c", "core.quotePath=false"]
 RUN_TIMEOUT = 180
 # delegated-Q fake controls resolve this TASK_BASE tree; shallow clones omit it.
 DQ_TASK_BASE = "0c908f6833e715af0eaa01b6f6788120eb577efd"
@@ -63,6 +64,12 @@ def git(*args: str) -> str:
     ).strip()
 
 
+def git_nul(*args: str) -> list[str]:
+    """Run git and split -z output on NUL. Do not strip: a trailing NUL is a terminator."""
+    raw = subprocess.check_output([*GIT, *args], cwd=ROOT)
+    return [part.decode("utf-8") for part in raw.split(b"\0") if part]
+
+
 def is_gate_path(path: str) -> bool:
     posix = path.replace("\\", "/")
     if posix in GATE_NAMES:
@@ -81,7 +88,9 @@ def comparison_sha() -> str | None:
 
 
 def changed_paths(base: str) -> list[str]:
-    return [line for line in git("diff", "--name-only", base, "HEAD").splitlines() if line]
+    # --no-renames: a source file moved into docs still counts the source path.
+    # -z + core.quotePath=false: non-ASCII names are unquoted NUL-terminated paths.
+    return git_nul("diff", "-z", "--name-only", "--no-renames", base, "HEAD")
 
 
 def docs_only(base: str) -> bool:
@@ -104,7 +113,11 @@ def decide_run_full(force: bool) -> bool:
         return True
     if docs_only(base):
         paths = changed_paths(base)
-        print(f"docs-only diff against {base[:12]} ({len(paths)} paths); skipping suite", flush=True)
+        print(
+            f"docs-only diff against {base[:12]} ({len(paths)} paths); "
+            "skipping suite, running public-scope and whitespace",
+            flush=True,
+        )
         return False
     print(f"gate paths changed against {base[:12]}; running suite", flush=True)
     return True
@@ -184,11 +197,17 @@ def byte_compile() -> None:
         raise SystemExit("byte-compile failed")
 
 
+def run_lightweight() -> None:
+    """Repository-wide checks that must run even for docs-only diffs."""
+    whitespace_check()
+    run_program(["tools/check_public_scope.py"])
+
+
 def run_suite() -> None:
     ensure_commit(DQ_TASK_BASE)
-    whitespace_check()
+    run_lightweight()
     byte_compile()
-    run_program(["tools/check_public_scope.py"])
+    run_program(["tools/test_ci_gate.py"])
     for program in contract_programs():
         run_program(list(program))
     run_program(["experiments/v3/recovery-ledger-20260914/test_ledger.py"])
@@ -208,9 +227,10 @@ def main() -> int:
     if args.paths_only:
         print(f"run_full={str(run_full).lower()}", flush=True)
         return 0
-    if not run_full:
-        return 0
-    run_suite()
+    if run_full:
+        run_suite()
+    else:
+        run_lightweight()
     return 0
 
 

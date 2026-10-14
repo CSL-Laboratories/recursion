@@ -71,6 +71,13 @@ jobs:
           CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: python -X utf8 -B tools/ci_gate.py --force
 
+      # Public-scope (and whitespace) must still run when the suite is skipped.
+      - name: Docs-only lightweight checks
+        if: steps.paths.outputs.run_full != 'true'
+        env:
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python3 -X utf8 -B tools/ci_gate.py
+
   windows:
     name: windows
     needs: linux

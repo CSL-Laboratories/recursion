@@ -68,7 +68,7 @@ Current tools. Do not add paid services or raise spend limits.
     top-level `/review` and no `/ci` without an argument.
   - MCP: `https://csl-discord-bot-production.up.railway.app/mcp`, declared in
     `.cursor/mcp.json` and `.mcp.json`. Each dev mints a bearer token via `/connect`.
-    Never commit the token; reference it via env var `CSL_BOT_MCP_TOKEN` only.
+    Never commit the token; reference it via env var `CSL_DISCORD_BOT_MCP_TOKEN` only.
   - Tools: `issue_create`, `issue_list`, `issue_status`, `issue_assign`, `plan`, `debug`,
     `feature`, `standup`, `ci_full`, `ci_run`, `devin_review`, `devin_run`,
     `devin_status`, `telemetry`.

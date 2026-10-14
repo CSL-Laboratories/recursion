@@ -9,6 +9,11 @@ from __future__ import annotations
 # F02 — recorded summaries with equal generation settings but different actual outputs
 SUMMARY_A = {"input": b"prompt-A", "output": b"summary-A"}
 SUMMARY_B = {"input": b"prompt-A", "output": b"summary-B"}
+# Adversarial pair that a naive `input|output` concatenation would collide (Q09).
+SUMMARY_COLLISION = [
+    {"input": b"a|b", "output": b"c"},
+    {"input": b"a", "output": b"b|c"},
+]
 
 # F03 — mandatory closure S02->S03 with optional distractors under two capacities
 CLOSURE = {
@@ -51,3 +56,136 @@ GRAPHS = {
     "exclusive_conflict": {"nodes": {"A": {"deps": []}}, "providers": {}, "exclusive": {"res": ["owner1", "owner2"]}},
     "valid": {"nodes": {"A": {"deps": []}, "B": {"deps": ["A"]}}, "providers": {"cap": ["p1"]}, "exclusive": {"res": ["owner1"]}},
 }
+
+# F04 — observed disabled inertness (slice 2)
+F04 = {"capability": "cap.skillQ", "source": "src.skillQ", "content": b"PROCEDURE\n"}
+
+# F06 — authority laundering at a protected sink (slice 2)
+F06 = {
+    "import_envelope": {"subject": "imported:doc-7", "proof": "forged"},
+    "owner_envelope": {"subject": "owner:grant7"},
+    "protected_op": "op.protected.write",
+    "artifact": b"useful\n",
+}
+
+# F14 — checkpoint resume with an observed rights ledger (slice 2)
+F14 = {
+    "valid_manifest_refs": ["skillX", "procY", "skillZ"],
+    "omitting_refs": ["skillX", "procY"],
+    "active_skill": "skillZ",
+    "rights": {
+        "skillX": {"active": True, "fence": 11},
+        "procY": {"active": False, "fence": 12},
+        "skillZ": {"active": True, "fence": 11},
+    },
+    "current_fence": 12,
+}
+
+# F16 — observer loss / distinct valid outputs / independent grading (slice 2)
+F16 = {
+    "valid_artifacts": [b"answer-A\n", b"answer-B\n"],
+    "invalid_artifact": b"",
+    "protected_op": "op.work",
+    "authority_subject": "owner:grant7",
+}
+
+# --- Slice 3 finite state models -----------------------------------------------------------------
+
+# F03 closure over an exact-version dependency graph
+CLOSURE_GRAPH = {
+    "S02:v1": {"requires": ["S03:v1"], "cost": 4, "installed": True, "enabled": True, "authorized": True},
+    "S03:v1": {"requires": [], "cost": 4, "installed": True, "enabled": True, "authorized": True},
+    "O1:v1": {"requires": [], "cost": 3, "installed": True, "enabled": True, "authorized": True},
+    "O2:v1": {"requires": [], "cost": 3, "installed": True, "enabled": True, "authorized": True},
+    "O3:v1": {"requires": [], "cost": 3, "installed": True, "enabled": True, "authorized": True},
+}
+CLOSURE_GRAPH_MISSING = {
+    "S02:v1": {"requires": ["S03:v1"], "cost": 4, "installed": True, "enabled": True, "authorized": True},
+}
+CLOSURE_ROOTS = ["S02:v1"]
+CLOSURE_OPTIONAL = ["O1:v1", "O2:v1", "O3:v1"]
+CLOSURE_CAPACITY_OK = 12
+CLOSURE_CAPACITY_LOW = 6
+CLOSURE_GRAPH_INACTIVE_OPTIONAL = {
+    "S02:v1": {"requires": ["S03:v1"], "cost": 4, "installed": True, "enabled": True, "authorized": True},
+    "S03:v1": {"requires": [], "cost": 4, "installed": True, "enabled": True, "authorized": True},
+    "O1:v1": {"requires": ["S99:v1"], "cost": 3, "installed": False, "enabled": False, "authorized": False},
+}
+CLOSURE_OPTIONAL_INACTIVE = ["O1:v1"]
+
+# F09 coherent cut with ABA
+CUT_ATTEMPTS = {
+    "valid": [
+        {"config": {"revision": "r1", "required_schema": "u2"}, "schema": {"revision": "r1", "value": "u2"}},
+        {"config": {"revision": "r1", "required_schema": "u2"}, "schema": {"revision": "r1", "value": "u2"}},
+    ],
+    "mixed": [
+        {"config": {"revision": "r1", "required_schema": "u2"}, "schema": {"revision": "r1", "value": "u1"}},
+        {"config": {"revision": "r1", "required_schema": "u2"}, "schema": {"revision": "r1", "value": "u1"}},
+    ],
+    "aba_unstable": [
+        {"config": {"revision": "r1", "required_schema": "u2"}, "schema": {"revision": "r1", "value": "u2"}},
+        {"config": {"revision": "r3", "required_schema": "u2"}, "schema": {"revision": "r3", "value": "u2"}},
+    ],
+    "aba_recovered": [
+        {"config": {"revision": "r1", "required_schema": "u2"}, "schema": {"revision": "r1", "value": "u2"}},
+        {"config": {"revision": "r3", "required_schema": "u2"}, "schema": {"revision": "r3", "value": "u2"}},
+        {"config": {"revision": "r3", "required_schema": "u2"}, "schema": {"revision": "r3", "value": "u2"}},
+    ],
+    "incomplete": [
+        {"config": {}, "schema": {}},
+        {"config": {}, "schema": {}},
+    ],
+}
+
+# F10 one governor + compare-and-install over a transition history
+GOVERNOR_INITIAL = {"parent": "c1", "epoch": 1, "directive_rev": "d1"}
+GOVERNOR_INITIAL_REBASE = {
+    "parent": "c1", "epoch": 1, "directive_rev": "d1", "admitted_rebase_inputs": ["new"],
+}
+GOVERNOR_INSTALL = {
+    "first": [{"type": "install", "id": "A", "parent": "c1", "epoch": 2, "directive_rev": "d1"}],
+    "late": [
+        {"type": "install", "id": "A", "parent": "c1", "epoch": 2, "directive_rev": "d1"},
+        {"type": "install", "id": "B", "parent": "c1", "epoch": 2, "directive_rev": "d1"},
+    ],
+    "duplicate": [
+        {"type": "install", "id": "A", "parent": "c1", "epoch": 2, "directive_rev": "d1"},
+        {"type": "install", "id": "B", "parent": "c2", "epoch": 2, "directive_rev": "d1"},
+    ],
+    "directive": [
+        {"type": "install", "id": "A", "parent": "c1", "epoch": 2, "directive_rev": "d1"},
+        {"type": "directive", "rev": "d2"},
+        {"type": "install", "id": "B", "parent": "c2", "epoch": 3, "directive_rev": "d1"},
+    ],
+    "rebase_stale": [
+        {"type": "install", "id": "A", "parent": "c1", "epoch": 2, "directive_rev": "d1"},
+        {"type": "install", "id": "B", "parent": "c0", "epoch": 1, "directive_rev": "d1",
+         "rebase": True, "new_input_ref": "new"},
+    ],
+    "rebase_ok": [
+        {"type": "install", "id": "A", "parent": "c1", "epoch": 2, "directive_rev": "d1"},
+        {"type": "install", "id": "B", "parent": "c2", "epoch": 3, "directive_rev": "d1",
+         "rebase": True, "new_input_ref": "new"},
+    ],
+}
+
+# F13 route/schema drift
+ROUTE_CURRENT = {"descriptor": "d4", "schema": "u1"}
+ROUTE_REGISTRY = {"d4": {"admitted": True, "schemas": ["u1"]}, "d5": {"admitted": True, "schemas": ["u2"]}}
+ROUTE_REQUEST_READMIT = {"descriptor": "d5", "schema": "u2", "tool_visibility_known": True}
+ROUTE_REQUEST_HOLD = {"descriptor": "d5", "schema": "u2", "tool_visibility_known": False}
+
+# F15 validated provider selection
+PROVIDER_INVALID = {"nodes": {"A": {"deps": []}}, "providers": {"cap": ["p1", "p2"]}, "selected": {"cap": "p3"}}
+PROVIDER_VALID = {"nodes": {"A": {"deps": []}}, "providers": {"cap": ["p1", "p2"]}, "selected": {"cap": "p1"}}
+
+# F05 coalesced preferences with a revoke fence
+PREF_EVENTS = [
+    {"type": "pref", "rev": "p1"},
+    {"type": "revoke", "fence": 8, "grant": "grant7"},
+    {"type": "pref", "rev": "p3"},
+]
+
+# F07 precedence policy
+PRECEDENCE_POLICY = {"admitted": ["skillA", "skillB"], "override_allowed": True}

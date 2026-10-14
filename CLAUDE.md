@@ -52,7 +52,9 @@ Current tools. Do not add paid services or raise spend limits.
 
 - **Parallel Search MCP** — web search and fetch. Prefer `parallel-search` (`web_search` /
   `web_fetch`) for web lookups. Declared in `.cursor/mcp.json` and `.mcp.json`
-  (https://search.parallel.ai/mcp). No API key.
+  (https://search.parallel.ai/mcp). No API key. Never put secrets, proprietary code,
+  private data, or unreleased research details in queries — keep them generic. Anything
+  sensitive needs human approval first.
 - **Context7 MCP** — up-to-date library docs (https://mcp.context7.com/mcp). Works without a
   key. Same two config files, alongside Parallel.
 - **Linear** — source of truth for work. Workspace **CSL laboratories**, team key **CSL**,

@@ -55,7 +55,8 @@ Current tools. Do not add paid services or raise spend limits.
 - **Context7 MCP** — up-to-date library docs (https://mcp.context7.com/mcp). Works without a
   key. Same two config files, alongside Parallel.
 - **Linear** — source of truth for work. Workspace **CSL laboratories**, team key **CSL**,
-  project **recursion**.
+  project **recursion**. Use the Linear MCP (`https://mcp.linear.app/mcp`) or the Devin
+  Linear integration. Declared in `.cursor/mcp.json` and `.mcp.json`.
 - **GitHub** — org **CSL-Laboratories**.
 - **Devin** — automated PR review on PR creation; on-demand reviews.
 - **Blacksmith CI** — see [CI](#ci).
@@ -65,17 +66,32 @@ Current tools. Do not add paid services or raise spend limits.
 
 ## Linear-first workflow
 
-Every change starts from a Linear issue (`CSL-N`). Authority, protected paths, and merge still
-follow `CONTROL_PLANE.md`; this section is how work is filed and shipped.
+Every change starts from a Linear issue (`CSL-N`). Be Linear-aware and proactive. Authority,
+protected paths, and merge still follow `CONTROL_PLANE.md`.
+
+**Before starting.** Find or create the issue (team **CSL**, project **recursion**) via the
+Linear MCP or the Devin Linear integration. Do not start code without `CSL-N`.
+
+**Filing and shipping.**
 
 - Use Linear's copied branch name so the PR auto-links.
 - PR title includes `CSL-N`.
 - One issue per PR; keep PRs small and stackable.
-- New ideas and review findings become Triage issues with one Type label, the repo label
-  `recursion`, and the `recursion` project — not drive-by changes on an unrelated PR.
+- Comment progress on the issue. Move status to **In Progress** when work starts, then **In
+  Review** when the PR is up.
 - Address Devin and CI review comments, then resolve the threads.
 - Humans make the load-bearing decisions (architecture, specs, merge order). Agents propose;
   humans decide.
+
+**Follow-ups.** When work reveals follow-ups, bugs, or next steps, create new **Triage**
+issues: one Type label, the repo label `recursion`, the `recursion` project, and a link back
+to the parent issue or PR. Not drive-by changes on an unrelated PR. Ambiguous tasks and
+unverifiable claims still stop in `state/INBOX.md`.
+
+**Assignees.** The three founders are Lucas (NotSkittlz), Chaandan (CDanTheMan), and Samir
+(samir-shah-ahmed). All are admins, and ownership changes over time, so never hardcode
+owners. Check the current assignee or project lead in Linear. Assign new issues to the owner
+of the parent issue, or leave them in Triage unassigned when unclear.
 
 ## CI
 

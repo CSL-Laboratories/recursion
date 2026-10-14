@@ -272,6 +272,12 @@ candidate:
 8. **Independent verification:** a verifier on a different model family reruns the exact candidate;
    attestations live outside the candidate.
 
+RC-01–RC-04 and RC-06 from the packet-F reconstruction checklist map into items 1–8 of **this**
+gate. **RC-05 (native crash equivalence), RC-08 (bounded reconstruction cost) and RC-09 (safe
+migration) are not this gate.** They belong to the separate native/release qualification bar in the
+three blocking-condition kinds below. No numerical reconstruction-cost ceiling is established
+(unmeasured until experiment admission).
+
 **Inability claims are bounded witnesses, not language verdicts:** "language L cannot express
 invariant I" identifies the exact language + runtime + toolchain + topology + allowed primitives +
 host profile, the minimal counterexample, the independent expected behavior and the permitted

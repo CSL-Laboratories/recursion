@@ -15,8 +15,9 @@ ways, stop and record a blocker in `state/INBOX.md` — do not pick one.
 ## Hard rules
 
 1. **Never `git push --force`.** Under any circumstance, in any script, for any reason.
-2. **Never commit to or merge into `master`.** Use Linear's copied branch name for the issue
-   (`CSL-N`) and open a review branch; Lucas reviews and merges.
+2. **Never commit to or merge into `master`.** Commit to `loop/work/<task-id>` and open a
+   review branch; Lucas reviews and merges. Put the Linear key (`CSL-N`) in the task id
+   (for example `loop/work/CSL-26`) and in the PR title so Linear still links.
 3. **Never modify a protected path** — `CONTROL_PLANE.md`, `ANCHOR.md`, `state/DECISIONS.md`,
    `.env`, or auth/credential configuration. Propose changes in `state/PROPOSALS.md`.
 4. **No secrets in tracked files, logs or notifications.**
@@ -84,8 +85,9 @@ Linear MCP or the Devin Linear integration. Do not start code without `CSL-N`.
 
 **Filing and shipping.**
 
-- Use Linear's copied branch name so the PR auto-links.
-- PR title includes `CSL-N`.
+- Branch `loop/work/<task-id>` with `CSL-N` in the task id (example: `loop/work/CSL-26`).
+  Do not use Linear's copied branch name as the git branch.
+- PR title includes `CSL-N` so Linear auto-links.
 - One issue per PR; keep PRs small and stackable.
 - Comment progress on the issue. Move status to **In Progress** when work starts, then **In
   Review** when the PR is up.

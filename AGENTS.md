@@ -49,4 +49,5 @@ weight.
 
 Prefer the `parallel-search` MCP server (`web_search` / `web_fetch`) for web lookups. It is
 declared in `.cursor/mcp.json` and `.mcp.json` (https://search.parallel.ai/mcp). No API key
-is required.
+is required. Never put secrets, proprietary code, private data, or unreleased research
+details in queries — keep them generic. Anything sensitive needs human approval first.

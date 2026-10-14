@@ -1,6 +1,6 @@
 # PR165 static evidence and provenance notes
 
-Date: 2026-10-02 UTC. Reviewer family: OpenAI; exact runtime model identifier unavailable.  
+Date: 2026-10-02 UTC. Reviewer family: OpenAI; exact runtime model identifier unavailable.\
 Target: user-authorized current head c08c93fb475ca770d56dd1e1996d8e6e94c33f81. User current-head instruction at 21:45:57 UTC superseded the original merge-commit request.
 
 ## What was and was not done
@@ -43,9 +43,9 @@ Committed sources of recorded values: [results/rpc_results.json L9–16](https:/
 
 **Interpretation:** all seven compared recorded hashes can be reconciled to the current Git source by the stated byte representations. This supports an EOL explanation and does not prove the author ran this exact tree. It is not evidence of stale semantic source. A Linux fresh checkout may legitimately rewrite the five EOL-sensitive fields; raw result byte equality must be evaluated with checkout policy in view.
 
-**Recommendation:** record commit, Git blob identity, checkout-byte digest and EOL policy separately, and hash fixture/oracle/observer/schema/spec inputs too.  
-**Rival:** platform-local byte hashes alone are adequate for a local rerun.  
-**Falsifier:** a recorded input cannot be mapped to the actual pinned bytes, a required input lacks an identity, or a current invocation cannot be reconstructed from the evidence.  
+**Recommendation:** record commit, Git blob identity, checkout-byte digest and EOL policy separately, and hash fixture/oracle/observer/schema/spec inputs too.\
+**Rival:** platform-local byte hashes alone are adequate for a local rerun.\
+**Falsifier:** a recorded input cannot be mapped to the actual pinned bytes, a required input lacks an identity, or a current invocation cannot be reconstructed from the evidence.\
 **Non-proof:** reconciled hashes establish input identity, not observed execution or correct behavior.
 
 ## Complete local source identity table

@@ -88,7 +88,7 @@ The authorized positive control bypasses candidate.admit_import entirely. An alw
 
 The claim that each mutant violates exactly one predicate should be interpreted cautiously. For example, replay_regenerates changes both bytes and model_calls; evidence_synth drops refs, changes disagreement and synthesizes a decision; restore_reexecute emits three forbidden operations. A detected multi-fault mutant does not prove detection of each fault independently. The strengthened successor mutants likewise set multiple output fields incorrectly, although accepted=B alone provides a checked discriminator.
 
-**Recommendation:** derive the active inventory mechanically, require unique declaration IDs, call every active mutant through the same observation/checker route as its positive candidate and record the exact failing field. Use one-fault mutations when claiming sensitivity to each independent predicate.  
-**Rival:** these are intentionally smoke-test bundles and obsolete definitions are retained for context. If so, label the retired definitions explicitly and narrow “every planted mutant.”  
-**Falsifier:** any active mutant lacks a call or passes the checker; a bundled fault's supposedly tested sub-fault survives when isolated.  
+**Recommendation:** derive the active inventory mechanically, require unique declaration IDs, call every active mutant through the same observation/checker route as its positive candidate and record the exact failing field. Use one-fault mutations when claiming sensitivity to each independent predicate.\
+**Rival:** these are intentionally smoke-test bundles and obsolete definitions are retained for context. If so, label the retired definitions explicitly and narrow “every planted mutant.”\
+**Falsifier:** any active mutant lacks a call or passes the checker; a bundled fault's supposedly tested sub-fault survives when isolated.\
 **Non-proof:** complete coverage of this finite inventory is not exhaustive mutation adequacy, model quality, natural-workload error rate or security proof.

@@ -1,8 +1,8 @@
 # Packet F PR165 strengthened R-PC static verification
 
-Date: 2026-10-02 UTC  
-Reviewer family: OpenAI. Exact runtime model identifier was not exposed and is not guessed.  
-Implementer family: deepseek-v4.1-flash, as reported by the user and the candidate verification record.  
+Date: 2026-10-02 UTC\
+Reviewer family: OpenAI. Exact runtime model identifier was not exposed and is not guessed.\
+Implementer family: deepseek-v4.1-flash, as reported by the user and the candidate verification record.\
 Evidence boundary: **STATIC ONLY. NO TARGET CODE RUN. NO CLONE, IMPORT, TEST EXECUTION, REPOSITORY EDIT OR COMMIT.**
 
 ## Decision

@@ -2,6 +2,9 @@
 # Nightly coverage of master at 07:17 UTC (off-peak US), skipped when master
 # has no commits in the last 24 hours. PR/dispatch macOS stays in ci.yml
 # behind workflow_dispatch and the ci:full label.
+#
+# The recent-commit check runs on a cheap Blacksmith Ubuntu runner so idle
+# nights never allocate a macOS runner.
 name: CI macos nightly
 
 on:
@@ -21,8 +24,34 @@ env:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
 jobs:
+  recent:
+    name: recent-commits
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 5
+    outputs:
+      run_macos: ${{ steps.check.outputs.run_macos }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: master
+
+      - name: Check for recent commits on master
+        id: check
+        run: |
+          count="$(git rev-list --count --since='24 hours ago' HEAD)"
+          echo "commits_in_24h=${count}"
+          if [ "${count}" -eq 0 ]; then
+            echo "No master commits in the last 24 hours; skipping macOS runner."
+            echo "run_macos=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_macos=true" >> "$GITHUB_OUTPUT"
+          fi
+
   macos:
     name: macos
+    needs: recent
+    if: needs.recent.outputs.run_macos == 'true'
     runs-on: macos-latest
     timeout-minutes: 15
     steps:
@@ -31,21 +60,7 @@ jobs:
           fetch-depth: 0
           ref: master
 
-      - name: Skip if master had no commits in 24h
-        id: recent
-        run: |
-          count="$(git rev-list --count --since='24 hours ago' HEAD)"
-          echo "commits_in_24h=${count}"
-          echo "commits_in_24h=${count}" >> "$GITHUB_OUTPUT"
-          if [ "${count}" -eq 0 ]; then
-            echo "No master commits in the last 24 hours; skipping macOS suite."
-            echo "run_suite=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "run_suite=true" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Set up Python
-        if: steps.recent.outputs.run_suite == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -53,9 +68,7 @@ jobs:
           cache-dependency-path: requirements-ci.txt
 
       - name: Install dependencies
-        if: steps.recent.outputs.run_suite == 'true'
         run: python -m pip install -r requirements-ci.txt
 
       - name: Provider-free gate
-        if: steps.recent.outputs.run_suite == 'true'
         run: python -X utf8 -B tools/ci_gate.py --force

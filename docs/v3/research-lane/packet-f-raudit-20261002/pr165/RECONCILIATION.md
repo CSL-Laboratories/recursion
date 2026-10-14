@@ -6,7 +6,7 @@ Date: 2026-10-02. Candidate: [PR165 head c08c93fb475ca770d56dd1e1996d8e6e94c33f8
 
 **REJECT the strengthened-suite conformance-evidence claim. All five prescribed commands passed.** These statements concern different predicates: successful execution of the current tests versus whether those tests can reject the faults they claim to detect. The independently executed report is the authority for the new observations; this reconciliation does not create additional test results.
 
-Execution evidence, locally observed by the Sentry verifier on 2026-10-02: [executed-result summary](executed/RESULT-SUMMARY.md), with the full exact committed report attached separately in chat. Source-inspection evidence, retrieved 2026-10-02: [static report](static/report.md), [mutant audit](static/mutant-audit.md), [provenance audit](static/provenance-notes.md), each with immutable repository citations.
+Execution evidence, locally observed by the Sentry verifier on 2026-10-02: [executed-result summary](executed/RESULT-SUMMARY.md) and the bundled full report [c08c93fb475ca770d56dd1e1996d8e6e94c33f81-openai-codex-gpt-6.md](executed/c08c93fb475ca770d56dd1e1996d8e6e94c33f81-openai-codex-gpt-6.md). Source-inspection evidence, retrieved 2026-10-02: [static report](static/report.md), [mutant audit](static/mutant-audit.md), [provenance audit](static/provenance-notes.md), each with immutable repository citations.
 
 | Check | Static conclusion | Executed result or retained limitation |
 |---|---|---|
@@ -33,7 +33,7 @@ The static report's provisional NEEDS EVIDENCE was appropriate before execution.
 - Only that report was committed. Original tracked bytes were unchanged; generated result files were preserved externally and restored; working tree clean; **no push**. These are the completed verifier's custody observations, not a claim that this local commit exists on GitHub.
 - Model family: OpenAI Codex, runtime-described as based on GPT-6. Exact variant/snapshot metadata was unavailable and is not invented. Different family from the user-reported DeepSeek V4.1 Flash implementer; implementer identity was not independently attested.
 
-The execution used a fresh clone and targeted checks on the same frozen head. Source-file hashes can vary with checkout LF/CRLF representation; the report records checkout and byte identities rather than calling every EOL mismatch stale code. The exact report was uploaded and hash-checked by the producing verifier and attached separately. This chat was denied retrieval into the ZIP by selected-file scope; no alternate retrieval was attempted. The ZIP summary is not a verbatim copy and does not claim an independent local byte comparison.
+The execution used a fresh clone and targeted checks on the same frozen head. Source-file hashes can vary with checkout LF/CRLF representation; the report records checkout and byte identities rather than calling every EOL mismatch stale code. The exact report is bundled in this packet at `pr165/executed/c08c93fb475ca770d56dd1e1996d8e6e94c33f81-openai-codex-gpt-6.md` and hashed in `SHA256SUMS.txt`. The summary is a reading guide, not a substitute for those bytes.
 
 ## Proposed next acceptance boundary
 

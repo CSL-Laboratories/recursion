@@ -8,7 +8,7 @@ Prepared for Lucas on 2026-10-02. Research lane: **R-AUDIT only**, with the sepa
 2. [Correction register](corrections/report.md): A1–A10, paste-ready replacements, candidate hedges and stale-status corrections.
 3. [M1 executable corpus](corpus/report.md): exact inventory, enforcement locations, historical-result limits and two current code/wire discrepancies.
 4. [R-LANG-informed checklist](language/report.md): six replacement paragraphs, language-specific feasibility facts, canonicalization/digest testing and host-boundary obligations. [Source ledger](language/source-ledger.md) and [future verification handoff](language/local-verification-handoff.md) accompany it.
-5. [PR165 executed-result summary](pr165/executed/RESULT-SUMMARY.md) and [reconciliation](pr165/RECONCILIATION.md): the actual five-gate rerun, additional falsifiers, verdict and local-commit custody.
+5. [PR165 executed-result summary](pr165/executed/RESULT-SUMMARY.md), [full executed report](pr165/executed/c08c93fb475ca770d56dd1e1996d8e6e94c33f81-openai-codex-gpt-6.md) and [reconciliation](pr165/RECONCILIATION.md): the actual five-gate rerun, additional falsifiers, verdict and local-commit custody.
 6. [PR165 static review](pr165/static/report.md): seven requested checks, [complete mutant audit](pr165/static/mutant-audit.md), and [provenance details](pr165/static/provenance-notes.md).
 
 ## Architecture conclusion
@@ -37,7 +37,7 @@ Architecture, M1 corpus, language research and the static PR165 report are stati
 
 **Executed PR165 verdict: REJECT the strengthened-suite conformance claim; all five prescribed gates passed.** Independent probes reproduced false positives in F06, F16 and F11. Mutant coverage and per-case provenance remain incomplete. This result does not reject the narrower fact that these exact commands successfully ran. See [the executed-result summary](pr165/executed/RESULT-SUMMARY.md) for locally observed evidence on Sentry, commands, seven-check dispositions and non-proofs.
 
-The full exact committed report is attached separately in chat. Its retrieval into this ZIP was denied by the selected-file access scope; that restriction was respected. The ZIP contains a clearly labeled summary, not a purported verbatim copy.
+The full exact committed report is in this packet at [pr165/executed/c08c93fb475ca770d56dd1e1996d8e6e94c33f81-openai-codex-gpt-6.md](pr165/executed/c08c93fb475ca770d56dd1e1996d8e6e94c33f81-openai-codex-gpt-6.md) (41,047 bytes, SHA-256 `e7a81f8a78ee20b56e7fdcdf6be46f914eff97b079d0e989e8567a7019128321`). Reviewers do not need a separate chat attachment.
 
 Only the report was committed locally as **ab412249e129dbe6a01f48b3da6fc88ba2369468**, on **loop/work/verify-capcomp2-20261002**. The verifier reports unchanged original tracked bytes, clean working tree and **no push**. The exact-report SHA-256 is recorded in the reconciliation. The static template under pr165/static/results is not an execution receipt; its provisional NEEDS EVIDENCE is superseded for the executed decision by the separately scoped REJECT report.
 

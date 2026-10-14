@@ -1,6 +1,6 @@
 # PR165 executed verification summary
 
-Date: 2026-10-02. This is a summary of the completed Sentry verification receipt, not a byte-for-byte copy of the committed report. The complete report was delivered separately as a native attachment named **c08c93fb475ca770d56dd1e1996d8e6e94c33f81-openai-codex-gpt-6.md**.
+Date: 2026-10-02. This is a summary of the completed Sentry verification receipt. The complete report is in this packet at **pr165/executed/c08c93fb475ca770d56dd1e1996d8e6e94c33f81-openai-codex-gpt-6.md** (41,047 bytes, SHA-256 `e7a81f8a78ee20b56e7fdcdf6be46f914eff97b079d0e989e8567a7019128321`). Reviewers do not need a separate attachment to inspect raw outputs.
 
 ## Verdict
 
@@ -59,7 +59,7 @@ The separate static review predicted the first two and identified the third miss
 - Report path inside clone: **experiments/v3/capability-composition/results/c08c93fb475ca770d56dd1e1996d8e6e94c33f81-openai-codex-gpt-6.md**.
 - Exact committed/uploaded report: **41,047 bytes**, SHA-256 **e7a81f8a78ee20b56e7fdcdf6be46f914eff97b079d0e989e8567a7019128321**.
 - The verifier reports unchanged original tracked bytes, externally preserved then restored generated results, a clean working tree, and **no push**.
-- Library upload of the exact report succeeded and its hash was checked by the producing verifier. Retrieval into this packet was denied by this chat's selected-file access scope, so the denial was respected and the original was attached separately. This summary does not claim an independent byte-for-byte comparison by the packet compiler.
+- The exact report is now in this packet at `pr165/executed/c08c93fb475ca770d56dd1e1996d8e6e94c33f81-openai-codex-gpt-6.md`. SHA-256 `e7a81f8a78ee20b56e7fdcdf6be46f914eff97b079d0e989e8567a7019128321` matches the verifier's recorded hash.
 
 No verification tests were rerun during delivery. One Codex/Work task was authorized for this verification only; no future use follows from that permission.
 

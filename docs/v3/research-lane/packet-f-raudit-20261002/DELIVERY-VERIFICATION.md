@@ -16,7 +16,7 @@ Date: 2026-10-02. These are document/package checks, not another execution of Re
 
 The full original GLM architecture review was not available in the inspected source set. The supplied packet's A1–A10 disputes were verified against pinned project sources rather than attributed to unseen review text.
 
-The full executed PR165 report was uploaded and hash-checked by the Sentry verifier, then attached separately in chat. Retrieving it into this ZIP was denied by selected-file access scope. That restriction was respected. This ZIP contains a clearly labeled executed-result summary and reconciliation; it does not contain or claim an independent byte check of the exact committed report. Its reported identity is 41,047 bytes, SHA-256 e7a81f8a78ee20b56e7fdcdf6be46f914eff97b079d0e989e8567a7019128321.
+The full executed PR165 report is in this packet at `pr165/executed/c08c93fb475ca770d56dd1e1996d8e6e94c33f81-openai-codex-gpt-6.md` and is sha256-verified by `SHA256SUMS.txt` (41,047 bytes, SHA-256 e7a81f8a78ee20b56e7fdcdf6be46f914eff97b079d0e989e8567a7019128321). The executed-result summary and reconciliation remain the reading guides; they point at that bundled report rather than a separate chat attachment.
 
 Static source-review clearance is not a conformance ACCEPT. The independent executed PR165 disposition is REJECT for the strengthened-suite claim, with all five prescribed gates passing at the frozen head. No other target suite was run for this packet.
 

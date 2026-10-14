@@ -54,7 +54,7 @@ Language, store, renderer, framework, transport and plugin-host selection can re
 
 R-PLAN and R-OPS have not been run. This packet identifies their required ownership seams only. Their deeper designs should not be fabricated from a correction register or treated as completed merely because their headings appear in the outline.
 
-The separately authorized PR165 execution is complete: [executed-result summary](pr165/executed/RESULT-SUMMARY.md), with the exact committed report attached separately in chat. Its narrow gate PASS and broader conformance REJECT are distinct. It does not qualify the entire M1 corpus, ratify the architecture, or authorize a merge.
+The separately authorized PR165 execution is complete: [executed-result summary](pr165/executed/RESULT-SUMMARY.md) and the bundled full report [c08c93fb475ca770d56dd1e1996d8e6e94c33f81-openai-codex-gpt-6.md](pr165/executed/c08c93fb475ca770d56dd1e1996d8e6e94c33f81-openai-codex-gpt-6.md). Its narrow gate PASS and broader conformance REJECT are distinct. It does not qualify the entire M1 corpus, ratify the architecture, or authorize a merge.
 
 ## Primary source links
 

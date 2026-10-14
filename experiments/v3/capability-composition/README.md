@@ -45,9 +45,9 @@ python -X utf8 -B experiments/v3/capability-composition/check_suite.py
 
 ## Status
 
-- **R-PC** F01/F11/F12 and F02–F10/F13–F16 are implemented and **independently accepted** at
-  `050936e` (GLM-5.3-Flash; see `VERIFICATION.md` and `results/`). F17/F18 are `deferred` (scripted;
-  not provider-free behavioral evidence).
+- **R-PC** F01–F16 are implemented and **rerun-verified** at `050936e` (GLM-5.3-Flash; see
+  `VERIFICATION.md` and `results/`), but a static review found **full specification fidelity is not
+  established** (Q01–Q10) — treat them as `partial` (see `REVIEWS.md`). F17/F18 are `deferred`.
 - **R-UI** and **R-MOB** are not started. Lane order: R-PC → R-UI → R-MOB, each a vertical slice
   (fixture + independent oracle + detected mutant + gate) before the next.
 - Verified on CPython 3.12.10; the suite is stdlib-only pure functions.

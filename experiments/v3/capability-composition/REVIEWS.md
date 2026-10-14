@@ -35,6 +35,56 @@ independently observed behavior. Treat this suite as a **scaffold**.
 4. Keep F17/F18 pending.
 5. Independent runtime acceptance by the separate verifier.
 
+## Strengthening progress
+
+- **Slice 2 (2026-10-02):** harness-owned observation boundary (`run/observer.py`) + strict result
+  schema (`run/record_schema.py`) applied to **F04/F06/F14/F16** in a new gate
+  `run/check_rpc_observed.py` — Q02/Q05 addressed for those fixtures; the weak duplicates were
+  removed from `check_rpc_invariants.py`.
+- **Slice 3 (2026-10-02):** finite state models for **F03** (dependency-graph closure, exact
+  versions, before-use loads, loss record), **F09** (ABA revision capture + bounded retry), **F10**
+  (governor compare-and-install over a transition history), **F13** (admitted route registry),
+  **F15** (validated provider selection), **F05** (coalesced preference history + positive control)
+  and **F07** (permutation-invariant authorized override); stronger one-field mutants.
+- **Slice 4 (2026-10-02):** F01/F11/F12 now assert exact spans + byte-complete coverage, an
+  independent canonical manifest (plus a literal byte anchor), and the prefix plan, with
+  empty-span/invalid-coordinate/gap mutants detected (Q01); F02 uses length-prefixed identity framing
+  with a collision mutant (Q09); both lane gates record per-case provenance (source hashes, invoked
+  case set, disposition) and `check_suite.py` uses exact id-token matching (Q10).
+- **Independent verification (GLM-5.3-Flash, candidate `c08c93f`):** **ACCEPT** — all five gates
+  pass; oracle/observer/expectation/schema modules candidate-free (no dynamic import/eval); all
+  exercised mutants detected including event-level ones; F04/F06/F14/F16 assert on harness-recorded
+  events (F16 turns a candidate "pass" into `HOLD_UNKNOWN` under real observer loss); F01
+  span/manifest/prefix triangulated against §9 and the literal anchor; provenance present; open items
+  honestly partial; non-proofs preserved. Residuals: **R1** stale committed results hashes, **R2** 6
+  dead + 4 shadowed mutants, **R3** observed-lane record missing provenance/disposition — all fixed
+  in the cleanup commit. **R4** the oracle manifest mirrors the candidate's construction (independence
+  rests on the literal anchor); **R5** inherited partial fidelity.
+- **Second independent verification (OpenAI Codex GPT-6, candidate `c08c93f`):** **REJECT** the
+  strengthened-conformance claim, with executed probes — F06 accepted an always-refusing candidate
+  (the positive control bypassed `M.admit_import`), F16 accepted an empty recorded completion when
+  the returned text looked valid, and F11 accepted corrupted changed-core bytes. This was correct:
+  a rerun-only ACCEPT is insufficient without adversarial-candidate probes.
+- **Slice 5 (2026-10-02):** closes the confirmed counterexamples — F06 now exercises the authorized
+  path **through the candidate** and asserts admitted effect + useful completion (always-refuse and
+  quiet mutants detected); F16 binds the returned artifact to the **recorded completion payload**
+  (hash/length) and derives validity from it, with an empty-completion-but-valid-return mutant and an
+  all-refusing candidate exercised; F11 asserts **exact changed-core bytes** and detects a corrupt-core
+  mutant. Also: strict (key-present) matching in the invariants lane; per-case result records;
+  `check_suite.py` now **fails closed** on any unreferenced mutant.
+- **Static re-review (openai, candidate `2ad590b`):** confirmed the three probe fixes at source level
+  (detection *expected*, not executed) but **rejected the full acceptance claim** on two concrete
+  static gaps — the mutant-registry guard was lexical/incomplete (substring-only, omitted
+  `reference_model`/`oracle` mutants, no uniqueness/invocation enforcement) and per-case provenance
+  was missing in the observed/fixture lanes.
+- **Slice 6 (2026-10-02):** closed those — a **closed `mutant-registry.json`** (32 mutants across
+  `rpc_mutants.py`/`reference_model.py`/`oracle.py`) enforced **fail-closed** by `check_suite.py`
+  (unique per module, registered, gate-referenced), and **per-case records** added to the observed
+  and fixture lanes.
+- **Still open:** F12 wrapper/role coverage; strict absent-vs-null across every case. The Slice-6
+  commit changes tested code, so a fresh **executed** independent verification (authorized run) is
+  required.
+
 ## Rule
 
 Any change to the tested files (`reference_model.py`, `oracle.py`, `rpc_model.py`, `rpc_expected.py`,

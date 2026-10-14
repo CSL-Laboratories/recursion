@@ -157,6 +157,103 @@ class LightweightControlTests(unittest.TestCase):
         self.assertTrue(ci_gate.is_gate_path(paths[1]))
 
 
+class TestInventoryTests(unittest.TestCase):
+    def test_repo_test_files_are_run_or_excluded(self) -> None:
+        run = ci_gate.assert_tests_accounted()
+        discovered = set(ci_gate.discover_all_test_files())
+        exclude = set(ci_gate.TEST_EXCLUDE)
+        self.assertEqual(discovered, set(run) | exclude)
+        self.assertFalse(set(run) & exclude)
+        for path in ci_gate.REQUIRED_SUITE_TESTS:
+            self.assertIn(path, run)
+        for path in exclude:
+            self.assertTrue((ROOT / path).is_file(), path)
+            self.assertNotIn(path, run)
+
+    def test_unaccounted_test_file_fails_guard(self) -> None:
+        run, unaccounted, stale, missing = ci_gate.classify_tests(
+            discovered=["tools/test_ci_gate.py", "orphan/test_orphan.py"],
+            globbed=["tools/test_ci_gate.py"],
+            exclude=set(),
+            required=set(),
+        )
+        self.assertEqual(run, ["tools/test_ci_gate.py"])
+        self.assertEqual(unaccounted, ["orphan/test_orphan.py"])
+        self.assertEqual(stale, [])
+        self.assertEqual(missing, [])
+
+    def test_excluded_test_is_not_run(self) -> None:
+        run, unaccounted, stale, missing = ci_gate.classify_tests(
+            discovered=["tools/test_ci_gate.py", "tools/test_slow.py"],
+            globbed=["tools/test_ci_gate.py", "tools/test_slow.py"],
+            exclude={"tools/test_slow.py"},
+            required={"tools/test_ci_gate.py"},
+        )
+        self.assertEqual(run, ["tools/test_ci_gate.py"])
+        self.assertEqual(unaccounted, [])
+        self.assertEqual(stale, [])
+        self.assertEqual(missing, [])
+
+    def test_stale_exclude_and_missing_required(self) -> None:
+        run, unaccounted, stale, missing = ci_gate.classify_tests(
+            discovered=["tools/test_ci_gate.py"],
+            globbed=["tools/test_ci_gate.py"],
+            exclude={"gone/test_gone.py"},
+            required={"tools/test_ci_gate.py", "tools/test_missing.py"},
+        )
+        self.assertEqual(run, ["tools/test_ci_gate.py"])
+        self.assertEqual(unaccounted, [])
+        self.assertEqual(stale, ["gone/test_gone.py"])
+        self.assertEqual(missing, ["tools/test_missing.py"])
+
+    def test_new_tools_test_is_globbed(self) -> None:
+        repo = Path(tempfile.mkdtemp(prefix="ci-gate-disc-"))
+        try:
+            write(repo / "tools" / "test_new.py", "x = 1\n")
+            globbed = ci_gate.glob_suite_tests(repo)
+            discovered = ci_gate.discover_all_test_files(repo)
+            self.assertIn("tools/test_new.py", globbed)
+            self.assertIn("tools/test_new.py", discovered)
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
+
+    def test_orphan_test_is_discovered_but_not_globbed(self) -> None:
+        repo = Path(tempfile.mkdtemp(prefix="ci-gate-disc-"))
+        try:
+            write(repo / "orphan" / "test_orphan.py", "x = 1\n")
+            globbed = ci_gate.glob_suite_tests(repo)
+            discovered = ci_gate.discover_all_test_files(repo)
+            self.assertNotIn("orphan/test_orphan.py", globbed)
+            self.assertIn("orphan/test_orphan.py", discovered)
+            _, unaccounted, _, _ = ci_gate.classify_tests(
+                discovered=discovered,
+                globbed=globbed,
+                exclude=set(),
+                required=set(),
+            )
+            self.assertEqual(unaccounted, ["orphan/test_orphan.py"])
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
+
+    def test_extra_suite_preserves_experiment_order(self) -> None:
+        tests = [
+            "tools/test_ci_gate.py",
+            "scripts/tests/v3/planning/schema.test.py",
+            "experiments/v3/delegated-q-coupling-20260914/test_contract.py",
+            "experiments/v3/recovery-ledger-20260914/test_ledger.py",
+            "experiments/v3/new/test_added.py",
+        ]
+        extras = ci_gate.extra_suite_programs(tests)
+        self.assertEqual(
+            extras,
+            [
+                ("experiments/v3/recovery-ledger-20260914/test_ledger.py",),
+                ("experiments/v3/delegated-q-coupling-20260914/test_contract.py",),
+                ("experiments/v3/new/test_added.py",),
+            ],
+        )
+
+
 if __name__ == "__main__":
     if Path.cwd().resolve() != ROOT.resolve():
         raise SystemExit(f"run from the repository root ({ROOT})")

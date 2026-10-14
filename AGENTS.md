@@ -58,8 +58,9 @@ Current tools. Do not add paid services or raise spend limits.
   project **recursion**. Use the Linear MCP (`https://mcp.linear.app/mcp`) or the Devin
   Linear integration. Declared in `.cursor/mcp.json` and `.mcp.json`.
 - **GitHub** — org **CSL-Laboratories**.
-- **Devin** — automated PR review on PR creation; on-demand reviews.
-- **Blacksmith CI** — see [CI](#ci).
+- **Devin** — only GitHub PR reviewer and review auto-fixer (on PR creation and on
+  demand). See [Review roles](#review-roles).
+- **Blacksmith CI** — only CI. See [CI](#ci).
 - **Google Workspace** (`csl-laboratories.com`) — meetings and notes.
 - **Discord bot** (`csl-bot-operations`) — Liaison. Commands and MCP; see below. Trigger CI
   and reviews through these (or the `ci:full` label), not by editing config.
@@ -88,7 +89,8 @@ Linear MCP or the Devin Linear integration. Do not start code without `CSL-N`.
 - One issue per PR; keep PRs small and stackable.
 - Comment progress on the issue. Move status to **In Progress** when work starts, then **In
   Review** when the PR is up.
-- Address Devin and CI review comments, then resolve the threads.
+- On your own PR, address Devin and CI comments, then resolve the threads. Do not
+  review-fix other agents' PRs.
 - Humans make the load-bearing decisions (architecture, specs, merge order). Agents propose;
   humans decide.
 
@@ -113,10 +115,45 @@ Trigger CI and reviews through the Discord bot (`/ci full|run`, `/devin review
 pr:<url>|run|status`, or MCP `ci_full` / `ci_run` / `devin_review`) or the `ci:full`
 label, not by editing config.
 
+## Review roles
+
+- **Devin** is the only GitHub PR reviewer and review auto-fixer. **Blacksmith** is the
+  only CI.
+- Cursor, Claude Code, Codex, and Grok develop features from Linear issues. They must not
+  post review verdicts or run review-fix loops on other agents' PRs. The author agent may
+  fix CI failures on its own PR.
+- Humans still merge (`CONTROL_PLANE.md`). Independent task gates still apply; they are not
+  a substitute for Devin PR review.
+
+## Automations
+
+Devin automations (**Main CI failure fixer** and **Weekly dead-code sweep**, Wednesdays
+10 AM PT) are human-managed. Other agents must not create, edit, or trigger Devin
+automations, and must not edit Devin settings.
+
+## Post-merge
+
+- A CI failure on `master` triggers the Devin fixer, which opens a Linear Bug (run id in
+  the title) and a fix PR. The Discord bot posts the failure to the alerts channel.
+- The weekly dead-code sweep opens a Linear Chore plus a cleanup PR.
+- The Discord bot sends a weekly digest of stale PRs and issues.
+
+## Security
+
+- Never commit secrets (hard rule 4).
+- GitHub secret scanning and push protection are enabled. A blocked push means remove the
+  secret and rotate it. Never bypass.
+- Dependabot security updates are on. Its PRs follow the normal review flow.
+
+## Performance
+
+Speed regressions must be flagged. A benchmark CI step is tracked in Linear; until it
+lands, note perf impact in the PR description for performance-sensitive changes.
+
 ## Guardrails (MUST)
 
 Do **not** edit CI/runner configuration (`.github/workflows/**`, Blacksmith runner labels,
-caching, concurrency), Devin configuration, repo rulesets, or the MCP server list, unless a
-Linear issue explicitly assigned by a human asks for it.
+caching, concurrency), Devin configuration or settings, Devin automations, repo rulesets,
+or the MCP server list, unless a Linear issue explicitly assigned by a human asks for it.
 
 Do not add paid services or raise spend limits.

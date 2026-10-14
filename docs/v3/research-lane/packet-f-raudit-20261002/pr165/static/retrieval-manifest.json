@@ -1,0 +1,269 @@
+{
+  "pr": {
+    "url": "https://github.com/NotSkittlz/recursion/pull/165",
+    "number": 165,
+    "state": "open",
+    "merged": false,
+    "base": "master",
+    "base_sha": "9f4122b50dc8117b185b2cd52244a10df3eb4285",
+    "head": "loop/work/capcomp-rpc-strengthen-20261002",
+    "head_sha": "c08c93fb475ca770d56dd1e1996d8e6e94c33f81",
+    "merge_commit_sha": "92bebe2974f2efbec9382f71e3de0796a3dbfb7d"
+  },
+  "files": [
+    {
+      "path": "experiments/v3/capability-composition/VERIFICATION.md",
+      "github_blob_sha": "bc3c4cf0ba25850670d0c91d16b32aa388cadbab",
+      "url": "https://github.com/NotSkittlz/recursion/blob/c08c93fb475ca770d56dd1e1996d8e6e94c33f81/experiments/v3/capability-composition/VERIFICATION.md",
+      "ref": "c08c93fb475ca770d56dd1e1996d8e6e94c33f81",
+      "evidence": "authenticated GitHub connector source read at user-authorized unmerged head",
+      "retrieval_date": "2026-10-02",
+      "local_git_blob_verified": true,
+      "local_sha256": "4806a4102c75ccb1f8fca4904627ae7aa68c09cdc18a057267ddb09c8b7c66b6"
+    },
+    {
+      "path": "experiments/v3/capability-composition/run/RESULT-TEMPLATE.md",
+      "github_blob_sha": "8d302d47c6ebe9f1b51465ad02efd6de4799ac86",
+      "url": "https://github.com/NotSkittlz/recursion/blob/c08c93fb475ca770d56dd1e1996d8e6e94c33f81/experiments/v3/capability-composition/run/RESULT-TEMPLATE.md",
+      "ref": "c08c93fb475ca770d56dd1e1996d8e6e94c33f81",
+      "evidence": "authenticated GitHub connector source read at user-authorized unmerged head",
+      "retrieval_date": "2026-10-02",
+      "local_git_blob_verified": true,
+      "local_sha256": "f8cdaa6588f1b91c54e6c1420a14e34887111441b45c6644a1aeb71fb01dc531"
+    },
+    {
+      "path": "experiments/v3/capability-composition/README.md",
+      "github_blob_sha": "44d37f637b69f351fca19a031fd2ace5ae3b730d",
+      "url": "https://github.com/NotSkittlz/recursion/blob/c08c93fb475ca770d56dd1e1996d8e6e94c33f81/experiments/v3/capability-composition/README.md",
+      "ref": "c08c93fb475ca770d56dd1e1996d8e6e94c33f81",
+      "evidence": "authenticated GitHub connector source read at user-authorized unmerged head",
+      "retrieval_date": "2026-10-02",
+      "local_git_blob_verified": true,
+      "local_sha256": "73edc758c90e345c4ac2f5e543e4326b189339235fc95c74309231f0574131c3"
+    },
+    {
+      "path": "experiments/v3/capability-composition/run/README.md",
+      "github_blob_sha": "c9bb5673e6cda941c83bb003339104bae6758085",
+      "url": "https://github.com/NotSkittlz/recursion/blob/c08c93fb475ca770d56dd1e1996d8e6e94c33f81/experiments/v3/capability-composition/run/README.md",
+      "ref": "c08c93fb475ca770d56dd1e1996d8e6e94c33f81",
+      "evidence": "authenticated GitHub connector source read at user-authorized unmerged head",
+      "retrieval_date": "2026-10-02",
+      "local_git_blob_verified": true,
+      "local_sha256": "5a39f267d90776221f18a5429341c63b9aa7eeb81b762fa467c71d05c238dfe2"
+    },
+    {
+      "path": "experiments/v3/capability-composition/FIXTURE-INDEX.md",
+      "github_blob_sha": "2fdcc11f010426d68e8605e867def042fbf63321",
+      "url": "https://github.com/NotSkittlz/recursion/blob/c08c93fb475ca770d56dd1e1996d8e6e94c33f81/experiments/v3/capability-composition/FIXTURE-INDEX.md",
+      "ref": "c08c93fb475ca770d56dd1e1996d8e6e94c33f81",
+      "evidence": "authenticated GitHub connector source read at user-authorized unmerged head",
+      "retrieval_date": "2026-10-02",
+      "local_git_blob_verified": true,
+      "local_sha256": "4c71f65ddb2a51daa1a95d7b846e3844462dc3ae8be4f14f2fea87feb22e21df"
+    },
+    {
+      "path": "experiments/v3/capability-composition/run/oracle.py",
+      "github_blob_sha": "acd9573ea249ac1be8ffb51db92aeaad6b2fc699",
+      "url": "https://github.com/NotSkittlz/recursion/blob/c08c93fb475ca770d56dd1e1996d8e6e94c33f81/experiments/v3/capability-composition/run/oracle.py",
+      "ref": "c08c93fb475ca770d56dd1e1996d8e6e94c33f81",
+      "evidence": "authenticated GitHub connector source read at user-authorized unmerged head",
+      "retrieval_date": "2026-10-02",
+      "local_git_blob_verified": true,
+      "local_sha256": "20d0d371f954e79bde5db88e9b386dfdd130bd34f1ebdf83f0e64130bd011458"
+    },
+    {
+      "path": "experiments/v3/capability-composition/run/observer.py",
+      "github_blob_sha": "99a26ff89da9af5a4e8159ac07089d16b6b8f0b1",
+      "url": "https://github.com/NotSkittlz/recursion/blob/c08c93fb475ca770d56dd1e1996d8e6e94c33f81/experiments/v3/capability-composition/run/observer.py",
+      "ref": "c08c93fb475ca770d56dd1e1996d8e6e94c33f81",
+      "evidence": "authenticated GitHub connector source read at user-authorized unmerged head",
+      "retrieval_date": "2026-10-02",
+      "local_git_blob_verified": true,
+      "local_sha256": "ebfaf8395df2efb06c6575c32a44b32b7dedcf6626209909d543e1895c190bf2"
+    },
+    {
+      "path": "experiments/v3/capability-composition/run/record_schema.py",
+      "github_blob_sha": "a8844c026b1698df10946a621b51ee7f584c6304",
+      "url": "https://github.com/NotSkittlz/recursion/blob/c08c93fb475ca770d56dd1e1996d8e6e94c33f81/experiments/v3/capability-composition/run/record_schema.py",
+      "ref": "c08c93fb475ca770d56dd1e1996d8e6e94c33f81",
+      "evidence": "authenticated GitHub connector source read at user-authorized unmerged head",
+      "retrieval_date": "2026-10-02",
+      "local_git_blob_verified": true,
+      "local_sha256": "2ef29a120ddf993302815e49c23e0285b109461f821232d38cb2922972a99cef"
+    },
+    {
+      "path": "experiments/v3/capability-composition/run/rpc_expected.py",
+      "github_blob_sha": "a3cf827bac0fc72b6a7a8022008dc051ed034b18",
+      "url": "https://github.com/NotSkittlz/recursion/blob/c08c93fb475ca770d56dd1e1996d8e6e94c33f81/experiments/v3/capability-composition/run/rpc_expected.py",
+      "ref": "c08c93fb475ca770d56dd1e1996d8e6e94c33f81",
+      "evidence": "authenticated GitHub connector source read at user-authorized unmerged head",
+      "retrieval_date": "2026-10-02",
+      "local_git_blob_verified": true,
+      "local_sha256": "f30054d244361d3ed5da571b068d45224a593d4587de194f7356cf40d8aab18a"
+    },
+    {
+      "path": "experiments/v3/capability-composition/run/rpc_mutants.py",
+      "github_blob_sha": "23f16122a4bbe3a513ab574a77115ff7b4d27180",
+      "url": "https://github.com/NotSkittlz/recursion/blob/c08c93fb475ca770d56dd1e1996d8e6e94c33f81/experiments/v3/capability-composition/run/rpc_mutants.py",
+      "ref": "c08c93fb475ca770d56dd1e1996d8e6e94c33f81",
+      "evidence": "authenticated GitHub connector source read at user-authorized unmerged head",
+      "retrieval_date": "2026-10-02",
+      "local_git_blob_verified": true,
+      "local_sha256": "3dde3e17cd616a4d6c43ed74568a01e60789ada29eb35c0e0c1b52cae3a46bf6"
+    },
+    {
+      "path": "experiments/v3/capability-composition/run/reference_model.py",
+      "github_blob_sha": "00fb834e78f325a9a05631472e5ce9f7b353667b",
+      "url": "https://github.com/NotSkittlz/recursion/blob/c08c93fb475ca770d56dd1e1996d8e6e94c33f81/experiments/v3/capability-composition/run/reference_model.py",
+      "ref": "c08c93fb475ca770d56dd1e1996d8e6e94c33f81",
+      "evidence": "authenticated GitHub connector source read at user-authorized unmerged head",
+      "retrieval_date": "2026-10-02",
+      "local_git_blob_verified": true,
+      "local_sha256": "f39d9b572245c15ac868d733d47bfd9331da9b3bf0fcfe18945c19cfaf4fae93"
+    },
+    {
+      "path": "experiments/v3/capability-composition/run/check_rpc_fixtures.py",
+      "github_blob_sha": "9e94d1de962f82616dfbf5b8923b4d6ad9a917ab",
+      "url": "https://github.com/NotSkittlz/recursion/blob/c08c93fb475ca770d56dd1e1996d8e6e94c33f81/experiments/v3/capability-composition/run/check_rpc_fixtures.py",
+      "ref": "c08c93fb475ca770d56dd1e1996d8e6e94c33f81",
+      "evidence": "authenticated GitHub connector source read at user-authorized unmerged head",
+      "retrieval_date": "2026-10-02",
+      "local_git_blob_verified": true,
+      "local_sha256": "fcb2b8f2cab7957f9f4452a95a64a7e859dac920ef6188734301597e157d418b"
+    },
+    {
+      "path": "experiments/v3/capability-composition/run/check_rpc_invariants.py",
+      "github_blob_sha": "613b4b6955c7d1323479ad74f1acc96874ddeaab",
+      "url": "https://github.com/NotSkittlz/recursion/blob/c08c93fb475ca770d56dd1e1996d8e6e94c33f81/experiments/v3/capability-composition/run/check_rpc_invariants.py",
+      "ref": "c08c93fb475ca770d56dd1e1996d8e6e94c33f81",
+      "evidence": "authenticated GitHub connector source read at user-authorized unmerged head",
+      "retrieval_date": "2026-10-02",
+      "local_git_blob_verified": true,
+      "local_sha256": "0670898237ffca66d959a4ddf2329f21e8deb3b9268b5d5a039b9c66d430d52e"
+    },
+    {
+      "path": "experiments/v3/capability-composition/run/check_rpc_observed.py",
+      "github_blob_sha": "cde8bb02ef4f77c915d47b596ebfb6e1e77e3af2",
+      "url": "https://github.com/NotSkittlz/recursion/blob/c08c93fb475ca770d56dd1e1996d8e6e94c33f81/experiments/v3/capability-composition/run/check_rpc_observed.py",
+      "ref": "c08c93fb475ca770d56dd1e1996d8e6e94c33f81",
+      "evidence": "authenticated GitHub connector source read at user-authorized unmerged head",
+      "retrieval_date": "2026-10-02",
+      "local_git_blob_verified": true,
+      "local_sha256": "64ec51faa38e89ba1f5dd12c5f8fe26e7490789267f40b2f2f9bfc953a8b2f13"
+    },
+    {
+      "path": "experiments/v3/capability-composition/run/rpc_model.py",
+      "github_blob_sha": "5955b14f8ca90b5f1b6b8b7d54f0fb59227efd34",
+      "url": "https://github.com/NotSkittlz/recursion/blob/c08c93fb475ca770d56dd1e1996d8e6e94c33f81/experiments/v3/capability-composition/run/rpc_model.py",
+      "ref": "c08c93fb475ca770d56dd1e1996d8e6e94c33f81",
+      "evidence": "authenticated GitHub connector source read at user-authorized unmerged head",
+      "retrieval_date": "2026-10-02",
+      "local_git_blob_verified": true,
+      "local_sha256": "f27124ee4de8129e9fed451dd87a15c90fbf66f15f70b9ffee145357908b46be"
+    },
+    {
+      "path": "experiments/v3/capability-composition/fixtures/rpc_invariants.py",
+      "github_blob_sha": "848802a8cc3afad7485d666a9d1900479cb36b8d",
+      "url": "https://github.com/NotSkittlz/recursion/blob/c08c93fb475ca770d56dd1e1996d8e6e94c33f81/experiments/v3/capability-composition/fixtures/rpc_invariants.py",
+      "ref": "c08c93fb475ca770d56dd1e1996d8e6e94c33f81",
+      "evidence": "authenticated GitHub connector source read at user-authorized unmerged head",
+      "retrieval_date": "2026-10-02",
+      "local_git_blob_verified": true,
+      "local_sha256": "a94df407995afb3bc6d08d1b358d639ed220ec4372f801d8ddebb7938675490b"
+    },
+    {
+      "path": "experiments/v3/capability-composition/check_suite.py",
+      "github_blob_sha": "3942b765bc3c3f75e3660b15bda5c504ced983a5",
+      "url": "https://github.com/NotSkittlz/recursion/blob/c08c93fb475ca770d56dd1e1996d8e6e94c33f81/experiments/v3/capability-composition/check_suite.py",
+      "ref": "c08c93fb475ca770d56dd1e1996d8e6e94c33f81",
+      "evidence": "authenticated GitHub connector source read at user-authorized unmerged head",
+      "retrieval_date": "2026-10-02",
+      "local_git_blob_verified": true,
+      "local_sha256": "56319d4f000fd0f43bf4c283c7f871d0533f7460e391dcf825034b8818d679b4"
+    },
+    {
+      "path": "experiments/v3/capability-composition/REVIEWS.md",
+      "github_blob_sha": "18ee27108d8a993e7cc3f308993ab411b5da8697",
+      "url": "https://github.com/NotSkittlz/recursion/blob/c08c93fb475ca770d56dd1e1996d8e6e94c33f81/experiments/v3/capability-composition/REVIEWS.md",
+      "ref": "c08c93fb475ca770d56dd1e1996d8e6e94c33f81",
+      "evidence": "authenticated GitHub connector source read at user-authorized unmerged head",
+      "retrieval_date": "2026-10-02",
+      "local_git_blob_verified": true,
+      "local_sha256": "d2cdc2bef0b44338887d203e9468fe056251406a092456d923c2842696a120ec"
+    },
+    {
+      "path": "experiments/v3/capability-composition/results/rpc_results.json",
+      "github_blob_sha": "423af5848247531d27f45e8720c6beb09fb692c6",
+      "url": "https://github.com/NotSkittlz/recursion/blob/c08c93fb475ca770d56dd1e1996d8e6e94c33f81/experiments/v3/capability-composition/results/rpc_results.json",
+      "ref": "c08c93fb475ca770d56dd1e1996d8e6e94c33f81",
+      "evidence": "authenticated GitHub connector source read at user-authorized unmerged head",
+      "retrieval_date": "2026-10-02",
+      "local_git_blob_verified": true,
+      "local_sha256": "3b75598ea46b7c55e7c0c1631f8c89791100d9f4637cd54a16b0a10ea23ac9b2"
+    },
+    {
+      "path": "experiments/v3/capability-composition/results/rpc_invariants_results.json",
+      "github_blob_sha": "a0bcb08e1d2dc0be05a612de7a6c129774782449",
+      "url": "https://github.com/NotSkittlz/recursion/blob/c08c93fb475ca770d56dd1e1996d8e6e94c33f81/experiments/v3/capability-composition/results/rpc_invariants_results.json",
+      "ref": "c08c93fb475ca770d56dd1e1996d8e6e94c33f81",
+      "evidence": "authenticated GitHub connector source read at user-authorized unmerged head",
+      "retrieval_date": "2026-10-02",
+      "local_git_blob_verified": true,
+      "local_sha256": "f5ca637334d42a915b0fa0347e69c513c55abf6d378b8165f1f57550bffb90f3"
+    },
+    {
+      "path": "experiments/v3/capability-composition/results/rpc_observed_results.json",
+      "github_blob_sha": "adc41a990fa3975802bcf419ad8e9aa79752d28c",
+      "url": "https://github.com/NotSkittlz/recursion/blob/c08c93fb475ca770d56dd1e1996d8e6e94c33f81/experiments/v3/capability-composition/results/rpc_observed_results.json",
+      "ref": "c08c93fb475ca770d56dd1e1996d8e6e94c33f81",
+      "evidence": "authenticated GitHub connector source read at user-authorized unmerged head",
+      "retrieval_date": "2026-10-02",
+      "local_git_blob_verified": true,
+      "local_sha256": "1431ff566667644816a4d2783877c57cbd3cc715c86148d94e04765179a7661a"
+    },
+    {
+      "path": "experiments/v3/capability-composition/fixtures/rpc.py",
+      "github_blob_sha": "917a235e4e57c3437af26fe9d7e206627dc61ba6",
+      "url": "https://github.com/NotSkittlz/recursion/blob/c08c93fb475ca770d56dd1e1996d8e6e94c33f81/experiments/v3/capability-composition/fixtures/rpc.py",
+      "ref": "c08c93fb475ca770d56dd1e1996d8e6e94c33f81",
+      "evidence": "authenticated GitHub connector source read at user-authorized unmerged head",
+      "retrieval_date": "2026-10-02",
+      "local_git_blob_verified": true,
+      "local_sha256": "2cb09981103be13b20a0ec6fc32a6531c2353b721a0cae5f7798e02a7f1b278a"
+    },
+    {
+      "path": "docs/v3/research-lane/capability-composition-20261002d/rpc/report.md",
+      "github_blob_sha": "bb702f654f966e29ea20b080e26b2d09e7b86322",
+      "url": "https://github.com/NotSkittlz/recursion/blob/c08c93fb475ca770d56dd1e1996d8e6e94c33f81/docs/v3/research-lane/capability-composition-20261002d/rpc/report.md",
+      "ref": "c08c93fb475ca770d56dd1e1996d8e6e94c33f81",
+      "evidence": "authenticated GitHub connector source read at user-authorized unmerged head",
+      "retrieval_date": "2026-10-02",
+      "local_git_blob_verified": true,
+      "local_sha256": "4d4940f5bcea4c4cd084876e311c1baddef3016da3fef889d31150e3d8f8614b"
+    },
+    {
+      "path": "tools/check_public_scope.py",
+      "github_blob_sha": "d325fc3db489ebaf45a84dd039b591819b4576ee",
+      "url": "https://github.com/NotSkittlz/recursion/blob/c08c93fb475ca770d56dd1e1996d8e6e94c33f81/tools/check_public_scope.py",
+      "ref": "c08c93fb475ca770d56dd1e1996d8e6e94c33f81",
+      "evidence": "authenticated GitHub connector source read at user-authorized unmerged head",
+      "retrieval_date": "2026-10-02",
+      "local_git_blob_verified": true,
+      "local_sha256": "2148cf303f90c2981ad84e94457f6174b8dd0b19a4999c845e095debcc9718d8"
+    }
+  ],
+  "review_status": "STATIC ONLY / NOT RUN / provisional NEEDS EVIDENCE pending separate executed verification",
+  "target_authorization": {
+    "time_utc": "2026-10-02T21:45:57Z",
+    "scope": "User explicitly authorized verification of PR165 current head, superseding original merge-commit request.",
+    "commit": "c08c93fb475ca770d56dd1e1996d8e6e94c33f81"
+  },
+  "pr_status_rechecked_utc_approx": [
+    "2026-10-02T21:46:00Z",
+    "2026-10-02T21:55:00Z"
+  ],
+  "no_target_execution": true,
+  "no_clone": true,
+  "no_repository_edits": true,
+  "note": "This manifest describes the static review only. Raw repository source snapshots are not bundled."
+}

@@ -10,6 +10,7 @@ certifies structure only.
 """
 from __future__ import annotations
 
+import json
 import re
 import sys
 from pathlib import Path
@@ -78,9 +79,42 @@ def main() -> int:
         return 1
 
     index_text = INDEX.read_text(encoding="utf-8")
-    missing = [fid for fid in EXPECTED_IDS if fid not in index_text]
+    tokens = set(re.findall(r"[A-Za-z0-9-]+", index_text))
+    missing = [fid for fid in EXPECTED_IDS if fid not in tokens]
     if missing:
         errors.append(f"FIXTURE-INDEX.md is missing {len(missing)} expected ids (first: {missing[0]})")
+
+    # Closed, unique mutant registry across rpc_mutants.py, reference_model.py and oracle.py.
+    registry = json.loads((HERE / "mutant-registry.json").read_text(encoding="utf-8"))
+    registry_names = [entry["name"] for entry in registry["mutants"]]
+    registry_dups = sorted({n for n in registry_names if registry_names.count(n) > 1})
+    if registry_dups:
+        errors.append(f"mutant-registry.json: duplicate names: {registry_dups}")
+    registered = {entry["name"]: entry for entry in registry["mutants"]}
+    patterns = {
+        "rpc_mutants.py": r"^def (m_\w+)",
+        "reference_model.py": r"^def (render_\w+)",
+        "oracle.py": r"^def (expected_ranges_by_codepoint)\b",
+    }
+    declared: dict[str, set[str]] = {}
+    for rel, pattern in patterns.items():
+        names = re.findall(pattern, (HERE / "run" / rel).read_text(encoding="utf-8"), flags=re.M)
+        dups = sorted({n for n in names if names.count(n) > 1})
+        if dups:
+            errors.append(f"run/{rel}: duplicate (shadowed) mutant definitions: {dups}")
+        declared[rel] = {n for n in names if n != "render"}
+    all_declared = set().union(*declared.values())
+    for name in sorted(all_declared - set(registered)):
+        errors.append(f"mutant not in registry (fail-closed): {name}")
+    for name, meta in registered.items():
+        if name not in declared.get(meta["module"], set()):
+            errors.append(f"registry entry not found in module {meta['module']}: {name}")
+            continue
+        gate_src = (HERE / "run" / meta["gate"]).read_text(encoding="utf-8")
+        live = "\n".join(line.split("#", 1)[0] for line in gate_src.splitlines())
+        invoked = f"X.{name}(" in live if meta["module"] == "rpc_mutants.py" else f"{name}(" in live
+        if not invoked:
+            errors.append(f"registered mutant not invoked by its gate {meta['gate']}: {name}")
 
     for path in (README, INDEX):
         text = path.read_text(encoding="utf-8")

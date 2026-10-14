@@ -1,0 +1,4 @@
+# Custom Blacksmith runner used by this repository's workflows.
+self-hosted-runner:
+  labels:
+    - blacksmith-2vcpu-ubuntu-2404

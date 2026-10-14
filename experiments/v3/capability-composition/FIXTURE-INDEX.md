@@ -6,10 +6,10 @@ last-updated: 2026-10-02
 # Capability-composition fixture index
 
 Reconciled registry of every fixture across the three lanes. Status values: `specified` (defined in
-the source report), `implemented` (fixture + oracle + mutation exist in this suite), `verified`
-(independently reviewed). `implemented` means a fixture plus an independent oracle and a detected
-mutant exist and the lane gate passes; it is not Owner acceptance. `deferred` means specified but
-not provider-free behavioral evidence.
+the source report), `partial` (fixture + independent oracle + detected mutant + gate exist, but the
+advertised full predicate set is not yet asserted — see `REVIEWS.md`), `implemented`, `verified`
+(independently reviewed), `deferred` (specified but not provider-free behavioral evidence). Neither
+`partial` nor `implemented` is full conformance evidence or Owner acceptance.
 
 ## R-PC — composition conformance (F01–F18)
 
@@ -18,22 +18,22 @@ acceptance). Corpus: the synthetic benchmark corpus (immutable input).
 
 | ID | Fixture | Status |
 |---|---|---|
-| F01 | Frozen reproduction — 23-byte literal specimen; reversed source enumeration reproduces the same bytes | implemented |
-| F02 | Generated-summary identity — outputs A and B are distinct; replaying A executes no regeneration | implemented |
-| F03 | Mandatory closure under pressure — required members survive overflow handling | implemented |
-| F04 | Disabled capability zero contribution — zero bytes/registrations/selector queries | implemented |
-| F05 | Immediate revocation with coalesced preferences — revocation not erased by coalescing | implemented |
-| F06 | Authority laundering — imported content cannot authorize a protected action | implemented |
-| F07 | Procedure precedence — declared precedence/override, never load order | implemented |
-| F08 | Evidence conflict — both sources preserved; no synthesized decision | implemented |
-| F09 | Coherent read cut incl. ABA — cut unavailable rather than guessed | implemented |
-| F10 | One governor + stale parent — compare-and-install rejects stale parent | implemented |
-| F11 | Prefix continuity + required forfeiture — correctness beats reuse | implemented |
-| F12 | Span/role coverage incl. Unicode byte mutation and omitted wrapper | implemented |
-| F13 | Route/schema drift — re-admit disclosure; no cache-continuity shortcut | implemented |
-| F14 | Checkpoint resume — historical grants never reactivate | implemented |
-| F15 | Graph errors before load — cycle/ambiguity fails before body loading | implemented |
-| F16 | Observer/oracle sensitivity — independent oracle detects planted faults | implemented |
+| F01 | Frozen reproduction — 23-byte literal specimen; reversed source enumeration reproduces the same bytes | partial |
+| F02 | Generated-summary identity — outputs A and B are distinct; replaying A executes no regeneration | partial |
+| F03 | Mandatory closure under pressure — required members survive overflow handling | partial |
+| F04 | Disabled capability zero contribution — zero bytes/registrations/selector queries | partial |
+| F05 | Immediate revocation with coalesced preferences — revocation not erased by coalescing | partial |
+| F06 | Authority laundering — imported content cannot authorize a protected action | partial |
+| F07 | Procedure precedence — declared precedence/override, never load order | partial |
+| F08 | Evidence conflict — both sources preserved; no synthesized decision | partial |
+| F09 | Coherent read cut incl. ABA — cut unavailable rather than guessed | partial |
+| F10 | One governor + stale parent — compare-and-install rejects stale parent | partial |
+| F11 | Prefix continuity + required forfeiture — correctness beats reuse | partial |
+| F12 | Span/role coverage incl. Unicode byte mutation and omitted wrapper | partial |
+| F13 | Route/schema drift — re-admit disclosure; no cache-continuity shortcut | partial |
+| F14 | Checkpoint resume — historical grants never reactivate | partial |
+| F15 | Graph errors before load — cycle/ambiguity fails before body loading | partial |
+| F16 | Observer/oracle sensitivity — independent oracle detects planted faults | partial |
 | F17 | N-increment accounting — 5 increments × 4 arms × 6 tasks = 120 scripted cells | deferred |
 | F18 | Scaling adjudication sensitivity — scripted-only disposition labels | deferred |
 
@@ -41,10 +41,10 @@ Gate: `run/check_rpc_fixtures.py` (F01, F11, F12) and `run/check_rpc_invariants.
 F13–F16). F17/F18 are `deferred`: scripted accounting/analysis, not provider-free behavioral
 evidence.
 
-**Verification:** independently **ACCEPT** at `050936e` (GLM-5.3-Flash; result in `results/`; see
-`VERIFICATION.md`). Open residual: F01's canonical-manifest predicate is only partially exercised
-(output bytes/ranges checked; `canonical_manifest`/`prefix_plan` and the no-model/network counter are
-not) — strengthening it requires re-verification. R-UI/R-MOB remain `specified`.
+**Verification:** rerun **ACCEPT** at `050936e` (GLM-5.3-Flash; result in `results/`). **Full
+F01–F16 specification fidelity is ISSUES FOUND / NEEDS EVIDENCE** (static review Q01–Q10) — hence the
+`partial` status; see `REVIEWS.md`. Strengthening the tested code requires re-verification. R-UI/R-MOB
+remain `specified`.
 
 ## R-UI — UI projection conformance (UI-01…UI-20)
 
@@ -52,7 +52,7 @@ Source: `docs/v3/research-lane/capability-composition-20261002d/rui/report.md` (
 
 | ID | Fixture | Status |
 |---|---|---|
-| UI-01 | Determinism — 24 permutations × 100 repeats byte-identical | specified |
+| UI-01 | Determinism — 100 baseline runs plus 24 permutations (124 outputs) byte-identical | specified |
 | UI-02 | Locale/profile precision — equal profile ⇒ equal tree; lexical ID order preserved | specified |
 | UI-03 | Unknown/version — typed omission/blocker; no synonym/default version | specified |
 | UI-04 | Downgrade bypass — every ingress refuses missing mandatory semantics | specified |

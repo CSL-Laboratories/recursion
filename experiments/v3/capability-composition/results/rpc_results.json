@@ -1,10 +1,44 @@
 {
   "lane": "R-PC",
+  "suite": "rpc_fixtures",
   "fixtures": [
     "F01",
     "F11",
     "F12"
   ],
+  "invoked_cases": [
+    "F01",
+    "F11",
+    "F12"
+  ],
+  "case_results": [
+    {
+      "fixture": "F01",
+      "output_hex": "434f4e54524f4c0a50524f4345445552450a444154410a",
+      "manifest_sha256": "25bc891a8dd30b66da193006074e085af4595d81f8fd2bb740eeb4dc22f0efe4"
+    },
+    {
+      "fixture": "F11",
+      "tail_preserves_prefix": true,
+      "core_len": 24
+    },
+    {
+      "fixture": "F12",
+      "total": 25,
+      "note_range": [
+        23,
+        25
+      ]
+    }
+  ],
+  "provenance": {
+    "reference_model.py": "d1029105a129a3acd4c3e743dbc16b50db56d53f4fb380479cbf1fb30ce31c7c",
+    "oracle.py": "20d0d371f954e79bde5db88e9b386dfdd130bd34f1ebdf83f0e64130bd011458",
+    "gate": "437fac61978f9733f623c537a6ed5c5b46a9cbfd2a95f26543cb8c9721794321",
+    "python": "3.12.3"
+  },
+  "disposition": "PASS",
+  "failures": [],
   "results": {
     "F01": {
       "output_hex": "434f4e54524f4c0a50524f4345445552450a444154410a",

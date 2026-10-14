@@ -248,6 +248,26 @@ The packet-E return and the static R-PC suite review are intaken at
   independent qualification asserts; correct the UI-01 wording.
 - No technology selected; no protected path edited; all target tests unexecuted.
 
+## Status update — 2026-10-02 packet-F R-AUDIT return + PR #165 review
+
+The packet-F R-AUDIT return is intaken at `docs/v3/research-lane/packet-f-raudit-20261002/`
+(21 files sha256-verified).
+
+- **A1–A10 corrections** resolve the D-039 outline's disputed claims (F20-A–G belongs to R-SC Q20;
+  the orientation gate is historical; G-20 is performance, G-09 configuration; eleven grant
+  dimensions; `rlc-candidate/0` unsupported; R-V is a candidate; O1 is three-way with a shared CAS;
+  the plugin contract is `PluginManifest@1`, not D-035; mobile floors open; MOB/MP must reconcile).
+  Candidate hedges and stale-status fixes (scoped Session A / Stage B receipts exist) recorded.
+- **M1 executable corpus:** 71 bundles (23/24/24); two source-documented code/wire discrepancies —
+  WorkPacket correlation identity and effect attenuation — are blockers before freezing the
+  behavioral contract.
+- **PR #165:** executed **REJECT** of the strengthened-conformance claim (F06/F16/F11 false
+  positives) at `c08c93f`; the Slice-5 repair on #165 addresses exactly the proposed next
+  acceptance boundary, but a fresh independent verification of the Slice-5 head is still required.
+- **Next:** revise the D-039 outline (#161) against the corrections, the R-LANG C1–C6 paragraphs,
+  the corpus inventory and the revision guide's three blocker classes; then re-review. R-PLAN/R-OPS
+  remain unrun.
+
 ## Status update — 2026-10-02 iOS/Android design + language expansion (O-04)
 
 The separately requested OS/language expansion is intaken at

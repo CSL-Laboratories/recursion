@@ -164,7 +164,7 @@ class TestInventoryTests(unittest.TestCase):
         exclude = set(ci_gate.TEST_EXCLUDE)
         self.assertEqual(discovered, set(run) | exclude)
         self.assertFalse(set(run) & exclude)
-        for path in ci_gate.REQUIRED_SUITE_TESTS:
+        for path in ci_gate.REQUIRED_SUITE_TESTS | ci_gate.M1_REQUIRED_TESTS:
             self.assertIn(path, run)
         for path in exclude:
             self.assertTrue((ROOT / path).is_file(), path)
@@ -252,6 +252,67 @@ class TestInventoryTests(unittest.TestCase):
                 ("experiments/v3/new/test_added.py",),
             ],
         )
+
+    def test_m1_tests_are_required(self) -> None:
+        self.assertEqual(len(ci_gate.M1_REQUIRED_TESTS), 17)
+        required = set(ci_gate.REQUIRED_SUITE_TESTS | ci_gate.M1_REQUIRED_TESTS)
+        run, _, _, missing = ci_gate.classify_tests(
+            discovered=sorted(required | {"scripts/tests/v3/execution/another.test.py"}),
+            globbed=sorted(
+                (required - {"scripts/tests/v3/planning/schema.test.py"})
+                | {"scripts/tests/v3/execution/another.test.py"}
+            ),
+            exclude=set(),
+            required=required,
+        )
+        self.assertIn("scripts/tests/v3/execution/another.test.py", run)
+        self.assertIn("scripts/tests/v3/planning/schema.test.py", missing)
+
+    def test_venv_test_files_are_not_discovered(self) -> None:
+        repo = Path(tempfile.mkdtemp(prefix="ci-gate-disc-"))
+        try:
+            write(repo / "tools" / "test_ok.py", "x = 1\n")
+            write(repo / ".venv" / "lib" / "test_widget.py", "x = 1\n")
+            write(repo / "venv" / "lib" / "test_other.py", "x = 1\n")
+            discovered = ci_gate.discover_all_test_files(repo)
+            self.assertEqual(discovered, ["tools/test_ok.py"])
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
+
+    def test_unittest_module_without_main_is_executed(self) -> None:
+        repo = Path(tempfile.mkdtemp(prefix="ci-gate-disc-"))
+        try:
+            write(
+                repo / "tools" / "test_added.py",
+                "import unittest\n"
+                "class Added(unittest.TestCase):\n"
+                "    def test_ok(self):\n"
+                "        self.assertTrue(True)\n",
+            )
+            ci_gate.run_test_file("tools/test_added.py", root=repo)
+            write(
+                repo / "tools" / "test_added.py",
+                "import unittest\n"
+                "class Added(unittest.TestCase):\n"
+                "    def test_fail(self):\n"
+                "        self.fail('should run')\n",
+            )
+            with self.assertRaises(SystemExit) as ctx:
+                ci_gate.run_test_file("tools/test_added.py", root=repo)
+            self.assertIn("unittest", str(ctx.exception))
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
+
+    def test_script_entry_ignores_comment_mentions(self) -> None:
+        repo = Path(tempfile.mkdtemp(prefix="ci-gate-disc-"))
+        try:
+            script = repo / "tools" / "test_script.py"
+            write(script, "# if __name__ == \"__main__\":\nx = 1\n")
+            self.assertFalse(ci_gate.has_script_entry(script))
+            write(script, 'if __name__ == "__main__":\n    raise SystemExit(0)\n')
+            self.assertTrue(ci_gate.has_script_entry(script))
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
 
 
 if __name__ == "__main__":

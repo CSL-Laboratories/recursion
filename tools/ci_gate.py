@@ -86,7 +86,17 @@ REQUIRED_SUITE_TESTS = frozenset(
 )
 M1_MIN_PROGRAMS = 23  # 6 materialize checks + 17 *.test.py
 M1_AREAS = ("planning", "execution", "integrity")
-SKIP_DIR_NAMES = {".git", "__pycache__", ".ruff_cache", "node_modules", ".venv"}
+SKIP_DIR_NAMES = {
+    ".git",
+    "__pycache__",
+    ".ruff_cache",
+    "node_modules",
+    ".venv",
+    "venv",
+    ".tox",
+    ".nox",
+    "site-packages",
+}
 # Original M1 contract tests. Pinned so a swap cannot hide lost coverage.
 M1_REQUIRED_TESTS = frozenset(
     f"scripts/tests/v3/{area}/{name}.test.py"
@@ -205,6 +215,36 @@ def is_test_filename(name: str) -> bool:
     return name.endswith((".test.py", "_test.py", "_tests.py"))
 
 
+def has_script_entry(path: Path) -> bool:
+    """True when the file has an unindented ``if __name__ == "__main__":`` guard."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return MAIN_GUARD_RE.search(text) is not None
+
+
+def run_test_file(rel: str, *, root: Path | None = None, timeout: int = RUN_TIMEOUT) -> None:
+    """Run a discovered test. Script-style files keep their entry point; others use unittest."""
+    base = root or ROOT
+    path = base / rel
+    if has_script_entry(path):
+        cmd = [rel]
+        display = rel
+    else:
+        cmd = ["-m", "unittest", rel]
+        display = " ".join(cmd)
+    print(f"RUN {display}", flush=True)
+    result = subprocess.run(
+        [sys.executable, "-X", "utf8", "-B", *cmd],
+        cwd=base,
+        timeout=timeout,
+        check=False,
+    )
+    if result.returncode:
+        raise SystemExit(f"gate failed: {display} (exit {result.returncode})")
+
+
 def _posix_rel(path: Path, root: Path) -> str:
     return path.relative_to(root).as_posix()
 
@@ -257,15 +297,6 @@ def assert_tests_accounted(root: Path | None = None) -> list[str]:
         required=set(REQUIRED_SUITE_TESTS | M1_REQUIRED_TESTS),
     )
     errors: list[str] = []
-    base = root or ROOT
-    # Tests run as scripts; a module without a __main__ runner exits 0 untested.
-    no_main = [
-        path
-        for path in run
-        if not MAIN_GUARD_RE.search((base / path).read_text(encoding="utf-8", errors="replace"))
-    ]
-    if no_main:
-        errors.append("no __main__ runner (would pass untested):\n  " + "\n  ".join(no_main))
     if unaccounted:
         errors.append("neither run nor excluded:\n  " + "\n  ".join(unaccounted))
     if stale_exclude:
@@ -376,11 +407,14 @@ def run_suite() -> None:
     run_lightweight()
     byte_compile()
     tests = suite_test_files()
-    run_program(["tools/test_ci_gate.py"])
+    run_test_file("tools/test_ci_gate.py")
     for program in contract_programs(tests):
-        run_program(list(program))
+        if len(program) == 1:
+            run_test_file(program[0])
+        else:
+            run_program(list(program))
     for program in extra_suite_programs(tests):
-        run_program(list(program))
+        run_test_file(program[0])
     print("CI_GATE_PASS provider_calls=0 scientific_admission=false", flush=True)
 
 

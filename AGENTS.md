@@ -62,7 +62,7 @@ Current tools. Do not add paid services or raise spend limits.
 - **Devin** — GitHub PR reviewer only (on PR creation and on demand). See
   [Review roles](#review-roles).
 - **Claude Code Action** — PR fixer for Devin findings and `@claude` mentions
-  (`.github/workflows/claude.yml`).
+  on same-repo OWNER/MEMBER PRs (`.github/workflows/claude.yml`).
 - **Blacksmith CI** — only CI. See [CI](#ci).
 - **Google Workspace** (`csl-laboratories.com`) — meetings and notes.
 - **Discord bot** (`csl-bot-operations`) — Liaison. Commands and MCP; see below. Trigger CI
@@ -95,10 +95,10 @@ Linear MCP or the Devin Linear integration. Do not start code without `CSL-N`.
 - One issue per PR; keep PRs small and stackable.
 - Comment progress on the issue. Move status to **In Progress** when work starts, then **In
   Review** when the PR is up.
-- On your own PR, address CI comments, then resolve the threads. Devin findings
-  and `@claude` mentions are handled by the Claude Code Action
-  (`.github/workflows/claude.yml`). Do not run review-fix loops on other
-  agents' PRs.
+- On your own PR, address CI comments, then resolve the threads. Eligible Devin
+  findings and `@claude` mentions are handled by the Claude Code Action
+  (`.github/workflows/claude.yml`; see [Review roles](#review-roles)). Do not
+  run review-fix loops on other agents' PRs.
 - Humans make the load-bearing decisions (architecture, specs, merge order). Agents propose;
   humans decide.
 
@@ -127,7 +127,9 @@ label, not by editing config.
 
 - **Devin** is the only GitHub PR reviewer. It does not auto-fix.
 - **Claude Code Action** (`.github/workflows/claude.yml`) is the fixer for Devin
-  findings and `@claude` mentions.
+  findings and `@claude` mentions. It runs only on open same-repo PRs whose
+  author is an org OWNER or MEMBER. `@claude` also requires a human OWNER or
+  MEMBER commenter. Fork and nonmember PRs are not auto-fixed.
 - **Blacksmith** is the only CI.
 - Cursor, Codex, Grok, and interactive Claude Code develop features from Linear
   issues. They must not post review verdicts or run review-fix loops on other

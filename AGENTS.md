@@ -16,7 +16,8 @@ ways, stop and record a blocker in `state/INBOX.md` — do not pick one.
 
 1. **Never `git push --force`.** Under any circumstance, in any script, for any reason.
 2. **Never commit to or merge into `master`.** Commit to `loop/work/<task-id>` and open a
-   review branch; Lucas reviews and merges.
+   review branch; Lucas reviews and merges. Put the Linear key (`CSL-N`) in the task id
+   (for example `loop/work/CSL-26`) and in the PR title so Linear still links.
 3. **Never modify a protected path** — `CONTROL_PLANE.md`, `ANCHOR.md`, `state/DECISIONS.md`,
    `.env`, or auth/credential configuration. Propose changes in `state/PROPOSALS.md`.
 4. **No secrets in tracked files, logs or notifications.**
@@ -44,3 +45,119 @@ distinct: source-documented, locally observed, inferred and unmeasured are diffe
 
 Plain markdown. Dates as `YYYY-MM-DD`. Keep files skimmable — anything not reread is dead
 weight.
+
+## Engineering stack (Oct 2026)
+
+Current tools. Do not add paid services or raise spend limits.
+
+- **Parallel Search MCP** — web search and fetch. Prefer `parallel-search` (`web_search` /
+  `web_fetch`) for web lookups. Declared in `.cursor/mcp.json` and `.mcp.json`
+  (https://search.parallel.ai/mcp). No API key.
+- **Context7 MCP** — up-to-date library docs (https://mcp.context7.com/mcp). Works without a
+  key. Same two config files, alongside Parallel.
+- **Linear** — source of truth for work. Workspace **CSL laboratories**, team key **CSL**,
+  project **recursion**. Use the Linear MCP (`https://mcp.linear.app/mcp`) or the Devin
+  Linear integration. Declared in `.cursor/mcp.json` and `.mcp.json`.
+- **GitHub** — org **CSL-Laboratories**.
+- **Devin** — only GitHub PR reviewer and review auto-fixer (on PR creation and on
+  demand). See [Review roles](#review-roles).
+- **Blacksmith CI** — only CI. See [CI](#ci).
+- **Google Workspace** (`csl-laboratories.com`) — meetings and notes.
+- **Discord bot** (`csl-bot-operations`) — Liaison. Commands and MCP; see below. Trigger CI
+  and reviews through these (or the `ci:full` label), not by editing config.
+  - Commands: `/issue`, `/plan`, `/debug`, `/feature`, `/standup`; `/ci full|run`;
+    `/devin review pr:<url>|run|status`; `/telemetry`, `/help`, `/connect`. There is no
+    top-level `/review` and no `/ci` without an argument.
+  - MCP: `https://csl-discord-bot-production.up.railway.app/mcp`, declared in
+    `.cursor/mcp.json` and `.mcp.json`. Human-assigned authorization:
+    [CSL-65](https://linear.app/csl-laboratories/issue/CSL-65) (Lucas; parent CSL-26).
+    Each dev mints a bearer token via `/connect`. Never commit the token; reference it
+    via env var `CSL_DISCORD_BOT_MCP_TOKEN` only.
+  - Tools: `issue_create`, `issue_list`, `issue_status`, `issue_assign`, `plan`, `debug`,
+    `feature`, `standup`, `ci_full`, `ci_run`, `devin_review`, `devin_run`,
+    `devin_status`, `telemetry`.
+
+## Linear-first workflow
+
+Every change starts from a Linear issue (`CSL-N`). Be Linear-aware and proactive. Authority,
+protected paths, and merge still follow `CONTROL_PLANE.md`.
+
+**Before starting.** Find or create the issue (team **CSL**, project **recursion**) via the
+Linear MCP or the Devin Linear integration. Do not start code without `CSL-N`.
+
+**Filing and shipping.**
+
+- Branch `loop/work/<task-id>` with `CSL-N` in the task id (example: `loop/work/CSL-26`).
+  Do not use Linear's copied branch name as the git branch.
+- PR title includes `CSL-N` so Linear auto-links.
+- One issue per PR; keep PRs small and stackable.
+- Comment progress on the issue. Move status to **In Progress** when work starts, then **In
+  Review** when the PR is up.
+- On your own PR, address Devin and CI comments, then resolve the threads. Do not
+  review-fix other agents' PRs.
+- Humans make the load-bearing decisions (architecture, specs, merge order). Agents propose;
+  humans decide.
+
+**Follow-ups.** When work reveals follow-ups, bugs, or next steps, create new **Triage**
+issues: one Type label, the repo label `recursion`, the `recursion` project, and a link back
+to the parent issue or PR. Not drive-by changes on an unrelated PR. Ambiguous tasks and
+unverifiable claims still stop in `state/INBOX.md`.
+
+**Assignees.** The three founders are Lucas (NotSkittlz), Chaandan (CDanTheMan), and Samir
+(samir-shah-ahmed). All are admins, and ownership changes over time, so never hardcode
+owners. Check the current assignee or project lead in Linear. Assign new issues to the owner
+of the parent issue, or leave them in Triage unassigned when unclear.
+
+## CI
+
+- Required check: `linux` (Blacksmith).
+- Windows and macOS run on the `ci:full` label, on manual dispatch, and on `master` (macOS
+  nightly at 07:17 UTC).
+- Superseded runs are cancelled.
+
+Trigger CI and reviews through the Discord bot (`/ci full|run`, `/devin review
+pr:<url>|run|status`, or MCP `ci_full` / `ci_run` / `devin_review`) or the `ci:full`
+label, not by editing config.
+
+## Review roles
+
+- **Devin** is the only GitHub PR reviewer and review auto-fixer. **Blacksmith** is the
+  only CI.
+- Cursor, Claude Code, Codex, and Grok develop features from Linear issues. They must not
+  post review verdicts or run review-fix loops on other agents' PRs. The author agent may
+  fix CI failures on its own PR.
+- Humans still merge (`CONTROL_PLANE.md`). Independent task gates still apply; they are not
+  a substitute for Devin PR review.
+
+## Automations
+
+Devin automations (**Main CI failure fixer** and **Weekly dead-code sweep**, Wednesdays
+10 AM PT) are human-managed. Other agents must not create, edit, or trigger Devin
+automations, and must not edit Devin settings.
+
+## Post-merge
+
+- A CI failure on `master` triggers the Devin fixer, which opens a Linear Bug (run id in
+  the title) and a fix PR. The Discord bot posts the failure to the alerts channel.
+- The weekly dead-code sweep opens a Linear Chore plus a cleanup PR.
+- The Discord bot sends a weekly digest of stale PRs and issues.
+
+## Security
+
+- Never commit secrets (hard rule 4).
+- GitHub secret scanning and push protection are enabled. A blocked push means remove the
+  secret and rotate it. Never bypass.
+- Dependabot security updates are on. Its PRs follow the normal review flow.
+
+## Performance
+
+Speed regressions must be flagged. A benchmark CI step is tracked in Linear; until it
+lands, note perf impact in the PR description for performance-sensitive changes.
+
+## Guardrails (MUST)
+
+Do **not** edit CI/runner configuration (`.github/workflows/**`, Blacksmith runner labels,
+caching, concurrency), Devin configuration or settings, Devin automations, repo rulesets,
+or the MCP server list, unless a Linear issue explicitly assigned by a human asks for it.
+
+Do not add paid services or raise spend limits.

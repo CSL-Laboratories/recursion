@@ -1,8 +1,43 @@
 # Capability-composition conformance suite — verification record
 
-Status: **ACCEPT** — independent verifier recommendation. This is **not Owner acceptance**; only
-Lucas accepts (`CONTROL_PLANE.md` "Independent verifiers"; `AGENTS.md` rule 6). The pre-verification
-handoff is superseded by this record.
+Status: **UNVERIFIED** for the current PR #165 candidate. The historical ACCEPT at `050936e` does
+not apply to this head. This is **not Owner acceptance**; only Lucas accepts (`CONTROL_PLANE.md`
+"Independent verifiers"; `AGENTS.md` rule 6). The pre-verification handoff is superseded by this
+record.
+
+**Fidelity qualification (2026-10-02).** The historical ACCEPT covered *rerunning the then-current
+gates* at `050936e`. A separate static review found that full F01–F16 **specification fidelity is
+not established** (findings Q01–Q10). The affected fixtures are marked `partial` in
+`FIXTURE-INDEX.md`. See `REVIEWS.md`. Treat this suite as a **scaffold**, not full conformance
+evidence.
+
+**Re-verification (strengthened suite, slices 1–4).** The tested code changed after the `050936e`
+ACCEPT, so that ACCEPT no longer applies. Verify the strengthened suite at the PR #165 merge commit:
+
+```text
+python -X utf8 -B experiments/v3/capability-composition/check_suite.py
+python -X utf8 -B experiments/v3/capability-composition/run/check_rpc_fixtures.py
+python -X utf8 -B experiments/v3/capability-composition/run/check_rpc_invariants.py
+python -X utf8 -B experiments/v3/capability-composition/run/check_rpc_observed.py
+python -X utf8 -B tools/check_public_scope.py
+```
+
+Expected: `capability-composition suite structure clean`, `RPC_FIXTURE_PASS`, `RPC_INVARIANTS_PASS`,
+`RPC_OBSERVED_PASS`. Checks beyond rerun: oracle/observer/expectation independence (no candidate
+import, no dynamic import); every planted mutant detected; per-case provenance present in both
+`results/*.json`; and the still-open items (F12 wrapper/role coverage; strict absent-vs-null matching
+in the invariants lane) are **not** over-claimed. A changed candidate again restarts verification.
+
+**Status.** Two independent verifications disagree, and the stronger one governs:
+- GLM-5.3-Flash **ACCEPT** at `c08c93f` (rerun + mutant detection), later **REJECTED** by
+  OpenAI Codex GPT-6 with executed probes: F06 always-refusing-candidate, F16 empty-completion with
+  a valid-looking return, F11 corrupted changed-core bytes. See
+  `results/c08c93fb…-openai-codex-gpt-6.md`.
+- **Slice 5** closes those three counterexamples (candidate-routed F06 authorized path;
+  recorded-completion binding in F16; exact changed-core bytes + corrupt-core mutant in F11), adds
+  strict matching, per-case records and a fail-closed mutant-registry check.
+- The Slice-5 commit changes tested code, so verify the **current PR #165 head** with the same
+  commands. Open: F12 wrapper/role coverage and fuller per-case provenance.
 
 ## Verdict
 

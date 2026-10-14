@@ -10,6 +10,7 @@ acceptance.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -20,11 +21,20 @@ sys.path.insert(0, str(HERE.parent))
 
 import oracle  # noqa: E402
 import reference_model as candidate  # noqa: E402
+import rpc_expected as RE  # noqa: E402
 from fixtures import rpc  # noqa: E402
 
 RESULTS = HERE.parent / "results"
 
 failures: list[str] = []
+
+
+def _sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _sha_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
 
 
 def check(condition: bool, message: str) -> None:
@@ -57,6 +67,21 @@ def run() -> int:
     check(mutant_a == exp_out, "planted enumeration mutant passes the base case")
     check(mutant_b != exp_out, "planted enumeration mutant is detected on reversed enumeration")
 
+    check(spans_a == [("core", 0, 8), ("skill", 8, 18), ("evidence", 18, 23)], "F01 exact spans")
+    check(candidate.verify_spans(spans_a, 23)["outcome"] == "ok", "F01 span coverage complete")
+    cand_manifest = candidate.canonical_manifest(ranges_a, 23)
+    check(cand_manifest == oracle.expected_manifest(base), "F01 canonical manifest equals independent oracle")
+    check(cand_manifest == RE.RPC_EXPECTED_MANIFEST_F01, "F01 canonical manifest equals literal anchor")
+    check(candidate.prefix_plan(out_a) == out_a[:18] and len(candidate.prefix_plan(out_a)) == 18,
+          "F01 prefix plan is first 18 bytes")
+    e_out, e_ranges, e_spans = candidate.render_empty_spans(sources)
+    check(e_out == out_a and e_ranges == ranges_a, "empty-span mutant keeps bytes/ranges")
+    check(candidate.verify_spans(e_spans, 23)["outcome"] == "refuse", "empty-span mutant detected")
+    _, _, i_spans = candidate.render_invalid_coordinate(sources)
+    check(candidate.verify_spans(i_spans, 23)["reason"] == "invalid_coordinate", "invalid-coordinate mutant detected")
+    _, _, g_spans = candidate.render_gap_spans(sources)
+    check(candidate.verify_spans(g_spans, 23)["reason"] == "uncovered_output_byte", "gap-span mutant detected")
+
     print("R-PC F11 — prefix continuity and required forfeiture")
     out_tail, ranges_tail, _ = candidate.render(to_sources(rpc.TAIL_CHANGE))
     exp_tail, _ = oracle.expected(rpc.TAIL_CHANGE)
@@ -71,6 +96,9 @@ def run() -> int:
         "core change shifts offsets to [9,19) [19,24)",
     )
     check(out_core[:18] != out_a[:18], "core change changes the prefix")
+    check(out_core == b"CONTROL2\nPROCEDURE\nDATA\n", "F11 exact changed-core bytes")
+    corrupt_out, _, _ = candidate.render_corrupt_core(to_sources(rpc.CORE_CHANGE))
+    check(corrupt_out != out_core, "corrupt-core mutant detected by the exact-byte assertion")
 
     print("R-PC F12 — span/role coverage, Unicode byte units")
     out_u, ranges_u, _ = candidate.render(to_sources(rpc.UNICODE))
@@ -84,6 +112,8 @@ def run() -> int:
         "planted codepoint-counting mutant disagrees with byte ranges (detected)",
     )
     check(mutant_ranges != ranges_u, "codepoint mutant is detected")
+    _, _, spans_u = candidate.render(to_sources(rpc.UNICODE))
+    check(candidate.verify_spans(spans_u, len(out_u))["outcome"] == "ok", "F12 span coverage complete")
 
     print("Oracle independence")
     oracle_src = (HERE / "oracle.py").read_text(encoding="utf-8")
@@ -99,7 +129,22 @@ def run() -> int:
 
     record = {
         "lane": "R-PC",
+        "suite": "rpc_fixtures",
         "fixtures": ["F01", "F11", "F12"],
+        "invoked_cases": ["F01", "F11", "F12"],
+        "case_results": [
+            {"fixture": "F01", "output_hex": out_a.hex(), "manifest_sha256": _sha_bytes(cand_manifest)},
+            {"fixture": "F11", "tail_preserves_prefix": out_tail[:18] == out_a[:18], "core_len": len(out_core)},
+            {"fixture": "F12", "total": len(out_u), "note_range": list(ranges_u["note"])},
+        ],
+        "provenance": {
+            "reference_model.py": _sha(HERE / "reference_model.py"),
+            "oracle.py": _sha(HERE / "oracle.py"),
+            "gate": _sha(HERE / "check_rpc_fixtures.py"),
+            "python": sys.version.split()[0],
+        },
+        "disposition": "PASS" if not failures else "FAIL",
+        "failures": failures,
         "results": {
             "F01": {"output_hex": out_a.hex(), "ranges": {k: list(v) for k, v in ranges_a.items()}},
             "F11": {

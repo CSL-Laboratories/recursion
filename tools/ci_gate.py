@@ -65,9 +65,13 @@ def git(*args: str) -> str:
 
 
 def git_nul(*args: str) -> list[str]:
-    """Run git and split -z output on NUL. Do not strip: a trailing NUL is a terminator."""
+    """Run git and split -z output on NUL. Do not strip: a trailing NUL is a terminator.
+
+    Paths are decoded with os.fsdecode (surrogateescape on POSIX) so invalid
+    UTF-8 bytes in a Git name do not abort the path filter.
+    """
     raw = subprocess.check_output([*GIT, *args], cwd=ROOT)
-    return [part.decode("utf-8") for part in raw.split(b"\0") if part]
+    return [os.fsdecode(part) for part in raw.split(b"\0") if part]
 
 
 def is_gate_path(path: str) -> bool:

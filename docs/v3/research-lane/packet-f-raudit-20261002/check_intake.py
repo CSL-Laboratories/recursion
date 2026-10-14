@@ -4,6 +4,10 @@
 Verifies the delivered files against SHA256SUMS.txt, then scans prose for secret patterns and
 forbidden foreign-project identifiers (reusing tools/check_public_scope.py).
 
+The checksum manifest is not the inventory: on-disk files (except this script and
+SHA256SUMS.txt) must match the parsed checksum paths exactly. Malformed or duplicate
+manifest lines fail closed.
+
     python -X utf8 -B docs/v3/research-lane/packet-f-raudit-20261002/check_intake.py
 """
 from __future__ import annotations
@@ -15,10 +19,12 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 SUMS = HERE / "SHA256SUMS.txt"
+SELF = Path(__file__).resolve()
 SECRET = re.compile(
     r"(?i)(?<![A-Za-z0-9])(?:sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{20,}|"
     r"bearer\s+[A-Za-z0-9._\-]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)"
 )
+SUM_LINE = re.compile(r"^([0-9a-fA-F]{64})\s+\*?(.+)$")
 
 
 def repo_root() -> Path:
@@ -43,22 +49,55 @@ def fail(message: str) -> None:
     raise SystemExit(1)
 
 
-def main() -> int:
+def delivered_paths() -> set[str]:
+    found: set[str] = set()
+    for path in HERE.rglob("*"):
+        if not path.is_file():
+            continue
+        if path.resolve() == SELF or path.name == SUMS.name:
+            continue
+        found.add(path.relative_to(HERE).as_posix())
+    return found
+
+
+def parse_manifest() -> dict[str, str]:
     if not SUMS.exists():
         fail("missing SHA256SUMS.txt")
-    entries = 0
-    for line in SUMS.read_text(encoding="utf-8").splitlines():
-        m = re.match(r"^([0-9a-fA-F]{64})\s+\*?(.+)$", line.strip())
+    listed: dict[str, str] = {}
+    for lineno, raw in enumerate(SUMS.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw.strip()
+        if not line:
+            fail(f"malformed SHA256SUMS.txt line {lineno}: empty")
+        m = SUM_LINE.match(line)
         if not m:
-            continue
-        expected, name = m.group(1).lower(), m.group(2).strip()
+            fail(f"malformed SHA256SUMS.txt line {lineno}: {raw!r}")
+        digest, name = m.group(1).lower(), m.group(2).strip()
+        if name in listed:
+            fail(f"duplicate SHA256SUMS.txt entry: {name}")
+        if name in {SUMS.name, SELF.name}:
+            fail(f"SHA256SUMS.txt must not list {name}")
+        listed[name] = digest
+    return listed
+
+
+def main() -> int:
+    listed = parse_manifest()
+    on_disk = delivered_paths()
+    missing = sorted(on_disk - listed.keys())
+    extra = sorted(listed.keys() - on_disk)
+    if missing or extra:
+        parts = []
+        if missing:
+            parts.append("on disk but not in SHA256SUMS.txt: " + ", ".join(missing))
+        if extra:
+            parts.append("in SHA256SUMS.txt but missing on disk: " + ", ".join(extra))
+        fail("; ".join(parts))
+
+    for name, expected in listed.items():
         path = HERE / name
-        if not path.exists():
-            fail(f"missing delivered file: {name}")
         actual = hashlib.sha256(path.read_bytes()).hexdigest()
         if actual != expected:
             fail(f"hash mismatch: {name}")
-        entries += 1
 
     forbidden = forbidden_pattern()
     prose = 0
@@ -73,7 +112,7 @@ def main() -> int:
             if hit:
                 fail(f"forbidden identifier in {path.relative_to(HERE)}: {hit.group(0)!r}")
 
-    print(f"PASS: {entries} delivered files sha256-verified; {prose} prose files clean")
+    print(f"PASS: {len(listed)} delivered files sha256-verified; {prose} prose files clean")
     return 0
 
 

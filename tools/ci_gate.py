@@ -82,7 +82,20 @@ REQUIRED_SUITE_TESTS = frozenset(
 )
 M1_MIN_PROGRAMS = 23  # 6 materialize checks + 17 *.test.py
 M1_AREAS = ("planning", "execution", "integrity")
-SKIP_DIR_NAMES = {".git", "__pycache__", ".ruff_cache", "node_modules"}
+SKIP_DIR_NAMES = {".git", "__pycache__", ".ruff_cache", "node_modules", ".venv"}
+# Original M1 contract tests. Pinned so a swap cannot hide lost coverage.
+M1_REQUIRED_TESTS = frozenset(
+    f"scripts/tests/v3/{area}/{name}.test.py"
+    for area, names in {
+        "planning": (
+            "conformance", "adversarial", "red_fixture", "property", "validation",
+            "static", "schema",
+        ),
+        "execution": ("fixture", "static", "conformance", "schema", "adversarial"),
+        "integrity": ("fixture", "static", "conformance", "schema", "adversarial"),
+    }.items()
+    for name in names
+)
 
 # Frozen packet gates — not general CI. See the workflow comment for why.
 #   tools/check_v3_orientation.py          frozen 2026-09-13 allowed-path repair
@@ -237,9 +250,18 @@ def assert_tests_accounted(root: Path | None = None) -> list[str]:
         discovered=discover_all_test_files(root),
         globbed=glob_suite_tests(root),
         exclude=set(TEST_EXCLUDE),
-        required=set(REQUIRED_SUITE_TESTS),
+        required=set(REQUIRED_SUITE_TESTS | M1_REQUIRED_TESTS),
     )
     errors: list[str] = []
+    base = root or ROOT
+    # Tests run as scripts; a module without a __main__ runner exits 0 untested.
+    no_main = [
+        path
+        for path in run
+        if "__main__" not in (base / path).read_text(encoding="utf-8", errors="replace")
+    ]
+    if no_main:
+        errors.append("no __main__ runner (would pass untested):\n  " + "\n  ".join(no_main))
     if unaccounted:
         errors.append("neither run nor excluded:\n  " + "\n  ".join(unaccounted))
     if stale_exclude:

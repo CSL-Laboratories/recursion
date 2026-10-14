@@ -19,6 +19,7 @@ DEVIN_STATES = frozenset({"commented", "changes_requested"})
 MENTION_EVENTS = frozenset({"issue_comment", "pull_request_review_comment"})
 MENTION_RE = re.compile(r"(?<![A-Za-z0-9_])@claude(?![A-Za-z0-9_])")
 SAFE_REF_RE = re.compile(r"^(?!.*\.\.)[A-Za-z0-9._/-]+$")
+SAFE_SHA_RE = re.compile(r"^[0-9a-f]{40}$|^[0-9a-f]{64}$")
 
 
 def is_whole_word_mention(text: str | None) -> bool:
@@ -36,6 +37,13 @@ def is_human(user_type: str | None) -> bool:
 def safe_head_ref(ref: str | None) -> str:
     value = ref or ""
     if not SAFE_REF_RE.fullmatch(value):
+        return ""
+    return value
+
+
+def safe_head_sha(sha: str | None) -> str:
+    value = (sha or "").lower()
+    if not SAFE_SHA_RE.fullmatch(value):
         return ""
     return value
 
@@ -61,24 +69,27 @@ def evaluate(
             "devin": "false",
             "same_repo": "false",
             "head_ref": "",
+            "head_sha": "",
             "pr_number": str(issue.get("number") or ""),
             "reason": "missing-pr-payload",
         }
     if payload is None:
         return _skip("not-a-pr")
 
-    head_ref = safe_head_ref((payload.get("head") or {}).get("ref"))
-    if not head_ref:
+    head = payload.get("head") or {}
+    head_ref = safe_head_ref(head.get("ref"))
+    head_sha = safe_head_sha(head.get("sha"))
+    if not head_ref or not head_sha:
         return _skip("unsafe-or-empty-ref")
 
     number = str(payload.get("number") or issue.get("number") or "")
     same_repo = _head_repo(payload) == repository
     state = str(payload.get("state") or issue.get("state") or "")
     author_member = is_member(payload.get("author_association"))
-    open_same = same_repo and state == "open"
+    open_same_member = same_repo and state == "open" and author_member
 
     mention = "false"
-    if event_name in MENTION_EVENTS and open_same:
+    if event_name in MENTION_EVENTS and open_same_member:
         comment = event.get("comment") or {}
         if (
             is_whole_word_mention(comment.get("body"))
@@ -91,8 +102,7 @@ def evaluate(
     devin = "false"
     if (
         event_name == "pull_request_review"
-        and open_same
-        and author_member
+        and open_same_member
         and (review.get("user") or {}).get("login") == DEVIN_BOT
         and str(review.get("state") or "").lower() in DEVIN_STATES
     ):
@@ -103,6 +113,7 @@ def evaluate(
         "devin": devin,
         "same_repo": "true" if same_repo else "false",
         "head_ref": head_ref,
+        "head_sha": head_sha,
         "pr_number": number,
         "reason": "ok" if (mention == "true" or devin == "true" or same_repo) else "fork-or-skip",
     }
@@ -114,6 +125,7 @@ def _skip(reason: str) -> dict[str, str]:
         "devin": "false",
         "same_repo": "false",
         "head_ref": "",
+        "head_sha": "",
         "pr_number": "",
         "reason": reason,
     }

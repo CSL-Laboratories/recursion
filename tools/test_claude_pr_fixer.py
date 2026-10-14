@@ -43,13 +43,14 @@ def pr_payload(
     state: str = "open",
     head_repo: str = REPO,
     head_ref: str = "feature/fix",
+    head_sha: str = "a" * 40,
     author_association: str = "MEMBER",
 ) -> dict:
     return {
         "number": number,
         "state": state,
         "author_association": author_association,
-        "head": {"ref": head_ref, "repo": {"full_name": head_repo}},
+        "head": {"ref": head_ref, "sha": head_sha, "repo": {"full_name": head_repo}},
     }
 
 
@@ -76,6 +77,20 @@ class MentionMatrixTests(unittest.TestCase):
         self.assertEqual(got["devin"], "false")
         self.assertEqual(got["same_repo"], "true")
         self.assertEqual(got["head_ref"], "feature/fix")
+        self.assertEqual(got["head_sha"], "a" * 40)
+
+    def test_member_mention_on_outsider_pr_is_skipped(self) -> None:
+        event = {
+            "comment": comment(body="@claude please"),
+            "issue": {"number": 42, "state": "open", "pull_request": {"url": "x"}},
+        }
+        got = decide(
+            "issue_comment",
+            event,
+            pr=pr_payload(author_association="CONTRIBUTOR"),
+        )
+        self.assertEqual(got["mention"], "false")
+        self.assertEqual(got["same_repo"], "true")
 
     def test_review_comment_mention(self) -> None:
         event = {
@@ -192,8 +207,14 @@ class DevinMatrixTests(unittest.TestCase):
     def test_unsafe_ref_is_rejected(self) -> None:
         got = decide("pull_request_review", self._review(head_ref="feat/../master"))
         self.assertEqual(got["head_ref"], "")
+        self.assertEqual(got["head_sha"], "")
         self.assertEqual(got["devin"], "false")
         self.assertEqual(got["reason"], "unsafe-or-empty-ref")
+
+    def test_missing_sha_is_rejected(self) -> None:
+        got = decide("pull_request_review", self._review(head_sha="not-a-sha"))
+        self.assertEqual(got["head_sha"], "")
+        self.assertEqual(got["devin"], "false")
 
 
 class WholeWordTests(unittest.TestCase):
@@ -233,12 +254,13 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn("needs.resolve-pr.outputs.devin == 'true'", devin)
         self.assertIn("needs.resolve-pr.outputs.same_repo == 'true'", devin)
 
-    def test_every_privileged_checkout_uses_pr_head_ref(self) -> None:
+    def test_every_privileged_checkout_uses_pr_head_sha(self) -> None:
         mention = self._job("claude-mention")
         devin = self._job("devin-review-fix")
-        needle = "ref: ${{ needs.resolve-pr.outputs.head_ref }}"
+        needle = "ref: ${{ needs.resolve-pr.outputs.head_sha }}"
         self.assertIn(needle, mention)
         self.assertIn(needle, devin)
+        self.assertNotIn("ref: ${{ needs.resolve-pr.outputs.head_ref }}", mention)
         self.assertNotIn("ref: ${{ github.event.pull_request.head.ref }}", mention)
 
     def test_prompt_treats_review_and_files_as_untrusted(self) -> None:
@@ -275,6 +297,7 @@ class WorkflowStructureTests(unittest.TestCase):
     def test_plain_issues_are_not_resolved(self) -> None:
         resolve = self._job("resolve-pr")
         self.assertIn("github.event.issue.pull_request", resolve)
+        self.assertIn("head_sha: ${{ steps.pr.outputs.head_sha }}", resolve)
 
     def _job(self, name: str) -> str:
         marker = f"  {name}:"
@@ -319,6 +342,7 @@ class GateCliTests(unittest.TestCase):
             body = output_path.read_text(encoding="utf-8")
             self.assertIn("mention=true", body)
             self.assertIn("head_ref=feature/fix", body)
+            self.assertIn("head_sha=" + "a" * 40, body)
 
 
 class ActionlintTests(unittest.TestCase):

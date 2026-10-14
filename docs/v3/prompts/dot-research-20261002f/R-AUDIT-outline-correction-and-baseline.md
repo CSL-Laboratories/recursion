@@ -102,7 +102,11 @@ not treat them as public-web facts):
 - `scripts/tests/v3/planning/`, `scripts/tests/v3/execution/`, `scripts/tests/v3/integrity/`
   (fixture inventories and closed-count tests)
 - `tools/check_v3_orientation.py` (what the orientation-repair gate actually checks)
-- `experiments/v3/` gates named in `## Baked context`
+- `experiments/v3/fu-03-kernel-session-a/check_session_a.py` (FU-03 Session A)
+- `experiments/v3/fu-03-stage-b/run/check_stage_b_run.py` (Stage B crash-cut run)
+- `experiments/v3/capability-composition/check_suite.py` (R-PC suite structure)
+- `experiments/v3/capability-composition/run/check_rpc_fixtures.py`
+- `experiments/v3/capability-composition/run/check_rpc_invariants.py`
 
 The session may also retrieve public primary sources and must pin every claim to a path or URL
 and retrieval date. Where a claim still depends on material that is not listed here, mark it

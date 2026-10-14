@@ -59,8 +59,10 @@ Current tools. Do not add paid services or raise spend limits.
   project **recursion**. Use the Linear MCP (`https://mcp.linear.app/mcp`) or the Devin
   Linear integration. Declared in `.cursor/mcp.json` and `.mcp.json`.
 - **GitHub** — org **CSL-Laboratories**.
-- **Devin** — only GitHub PR reviewer and review auto-fixer (on PR creation and on
-  demand). See [Review roles](#review-roles).
+- **Devin** — GitHub PR reviewer only (on PR creation and on demand). See
+  [Review roles](#review-roles).
+- **Claude Code Action** — PR fixer for Devin findings and `@claude` mentions
+  (`.github/workflows/claude.yml`).
 - **Blacksmith CI** — only CI. See [CI](#ci).
 - **Google Workspace** (`csl-laboratories.com`) — meetings and notes.
 - **Discord bot** (`csl-bot-operations`) — Liaison. Commands and MCP; see below. Trigger CI
@@ -93,8 +95,10 @@ Linear MCP or the Devin Linear integration. Do not start code without `CSL-N`.
 - One issue per PR; keep PRs small and stackable.
 - Comment progress on the issue. Move status to **In Progress** when work starts, then **In
   Review** when the PR is up.
-- On your own PR, address Devin and CI comments, then resolve the threads. Do not
-  review-fix other agents' PRs.
+- On your own PR, address CI comments, then resolve the threads. Devin findings
+  and `@claude` mentions are handled by the Claude Code Action
+  (`.github/workflows/claude.yml`). Do not run review-fix loops on other
+  agents' PRs.
 - Humans make the load-bearing decisions (architecture, specs, merge order). Agents propose;
   humans decide.
 
@@ -121,11 +125,13 @@ label, not by editing config.
 
 ## Review roles
 
-- **Devin** is the only GitHub PR reviewer and review auto-fixer. **Blacksmith** is the
-  only CI.
-- Cursor, Claude Code, Codex, and Grok develop features from Linear issues. They must not
-  post review verdicts or run review-fix loops on other agents' PRs. The author agent may
-  fix CI failures on its own PR.
+- **Devin** is the only GitHub PR reviewer. It does not auto-fix.
+- **Claude Code Action** (`.github/workflows/claude.yml`) is the fixer for Devin
+  findings and `@claude` mentions.
+- **Blacksmith** is the only CI.
+- Cursor, Codex, Grok, and interactive Claude Code develop features from Linear
+  issues. They must not post review verdicts or run review-fix loops on other
+  agents' PRs. The author agent may fix CI failures on its own PR.
 - Humans still merge (`CONTROL_PLANE.md`). Independent task gates still apply; they are not
   a substitute for Devin PR review.
 

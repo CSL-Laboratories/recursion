@@ -168,8 +168,9 @@ def main() -> int:
                     errors.append(f"{rel}: duplicate title (also {seen_titles[title]})")
                 seen_titles[title] = rel
 
+        headings = set(re.findall(r"(?m)^## [^\n]+$", text))
         for heading in REQUIRED_HEADINGS:
-            if heading not in text:
+            if heading not in headings:
                 errors.append(f"{rel}: missing heading '{heading}'")
 
         if DIRECTIVE_MARK not in text:

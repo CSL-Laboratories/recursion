@@ -32,9 +32,11 @@ be reconstructed without re-deriving the architecture. No language, store or fra
 The review flagged these outline claims. Establish the correct, source-documented facts for each and
 state the evidence class; do not restate the disputed wording as if true.
 
-- **A1:** the outline cited "FU-03 crash-cut/receiver-fence fixtures (F20-A–G)". No such identifier is
-  known. Establish the real crash-cut/fence/permission artifact names (for example: an FU-02 fault
-  matrix cell set, FU-03 trace prefixes, and a Stage B `SB-*` fixture set) and cite where each lives.
+- **A1:** the outline cited "FU-03 crash-cut/receiver-fence fixtures (F20-A–G)". That **FU-03
+  attribution is not established**. `F20-A–G` already names synthetic receiver-fence vectors in
+  `docs/v3/research-lane/shared-contracts-20261002/Recursion_Shared_Contract_Reconciliation.md`.
+  Verify that source (and FU-02 / Stage B `SB-*` names) rather than declaring the identifier
+  unknown without checking it. Do not restyle the FU-03 attribution as fact.
 - **A2:** the outline claimed `tools/check_v3_orientation.py --contracts` passes. It is a
   point-in-time orientation-repair gate with a fixed allow-list and fails on a current tree. Establish
   the correct way to cite reconstruction/behavior evidence and what this gate actually checks.
@@ -91,11 +93,20 @@ items stay `unknown`/`unsupported`, never zero and never asserted.
 
 ## Inputs to read
 
-None from this repository by necessity: the disputed claims and the relevant register/contract names
-are summarized in `## Baked context`. The session must retrieve and cite the public primary sources
-it uses (official specifications, standards documents, and the project's own published contracts
-where supplied) and pin every claim to a URL and retrieval date. Where a claim depends on
-repository-private material that is not supplied, mark it `unknown` rather than guessing.
+Pinned in this repository (use these for fixture counts, gate behavior and identifier lookup; do
+not treat them as public-web facts):
+
+- `docs/v3/research-lane/shared-contracts-20261002/Recursion_Shared_Contract_Reconciliation.md`
+  (`F20-A–G` receiver-fence vectors)
+- `docs/v3/architecture/LANGUAGE-AGNOSTIC-ARCHITECTURE.md` §7 (M1 corpus counts)
+- `scripts/tests/v3/planning/`, `scripts/tests/v3/execution/`, `scripts/tests/v3/integrity/`
+  (fixture inventories and closed-count tests)
+- `tools/check_v3_orientation.py` (what the orientation-repair gate actually checks)
+- `experiments/v3/` gates named in `## Baked context`
+
+The session may also retrieve public primary sources and must pin every claim to a path or URL
+and retrieval date. Where a claim still depends on material that is not listed here, mark it
+`unknown` rather than guessing.
 
 ## Research questions
 

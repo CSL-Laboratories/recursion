@@ -61,8 +61,17 @@ Current tools. Do not add paid services or raise spend limits.
 - **Devin** — automated PR review on PR creation; on-demand reviews.
 - **Blacksmith CI** — see [CI](#ci).
 - **Google Workspace** (`csl-laboratories.com`) — meetings and notes.
-- **Discord bot** (`csl-bot-operations`) — commands, including `/ci`, `/review`, and
-  `/devin review|run|status`.
+- **Discord bot** (`csl-bot-operations`) — Liaison. Commands and MCP; see below. Trigger CI
+  and reviews through these (or the `ci:full` label), not by editing config.
+  - Commands: `/issue`, `/plan`, `/debug`, `/feature`, `/standup`; `/ci full|run`;
+    `/devin review pr:<url>|run|status`; `/telemetry`, `/help`, `/connect`. There is no
+    top-level `/review` and no `/ci` without an argument.
+  - MCP: `https://csl-discord-bot-production.up.railway.app/mcp`, declared in
+    `.cursor/mcp.json` and `.mcp.json`. Each dev mints a bearer token via `/connect`.
+    Never commit the token; reference it via env var `CSL_BOT_MCP_TOKEN` only.
+  - Tools: `issue_create`, `issue_list`, `issue_status`, `issue_assign`, `plan`, `debug`,
+    `feature`, `standup`, `ci_full`, `ci_run`, `devin_review`, `devin_run`,
+    `devin_status`, `telemetry`.
 
 ## Linear-first workflow
 
@@ -100,8 +109,9 @@ of the parent issue, or leave them in Triage unassigned when unclear.
   nightly at 07:17 UTC).
 - Superseded runs are cancelled.
 
-Trigger CI and reviews through the Discord bot (`/ci`, `/review`, `/devin review|run|status`)
-or the `ci:full` label, not by editing config.
+Trigger CI and reviews through the Discord bot (`/ci full|run`, `/devin review
+pr:<url>|run|status`, or MCP `ci_full` / `ci_run` / `devin_review`) or the `ci:full`
+label, not by editing config.
 
 ## Guardrails (MUST)
 

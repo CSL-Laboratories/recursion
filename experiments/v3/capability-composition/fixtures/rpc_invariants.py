@@ -106,6 +106,12 @@ CLOSURE_ROOTS = ["S02:v1"]
 CLOSURE_OPTIONAL = ["O1:v1", "O2:v1", "O3:v1"]
 CLOSURE_CAPACITY_OK = 12
 CLOSURE_CAPACITY_LOW = 6
+CLOSURE_GRAPH_INACTIVE_OPTIONAL = {
+    "S02:v1": {"requires": ["S03:v1"], "cost": 4, "installed": True, "enabled": True, "authorized": True},
+    "S03:v1": {"requires": [], "cost": 4, "installed": True, "enabled": True, "authorized": True},
+    "O1:v1": {"requires": ["S99:v1"], "cost": 3, "installed": False, "enabled": False, "authorized": False},
+}
+CLOSURE_OPTIONAL_INACTIVE = ["O1:v1"]
 
 # F09 coherent cut with ABA
 CUT_ATTEMPTS = {
@@ -126,10 +132,17 @@ CUT_ATTEMPTS = {
         {"config": {"revision": "r3", "required_schema": "u2"}, "schema": {"revision": "r3", "value": "u2"}},
         {"config": {"revision": "r3", "required_schema": "u2"}, "schema": {"revision": "r3", "value": "u2"}},
     ],
+    "incomplete": [
+        {"config": {}, "schema": {}},
+        {"config": {}, "schema": {}},
+    ],
 }
 
 # F10 one governor + compare-and-install over a transition history
 GOVERNOR_INITIAL = {"parent": "c1", "epoch": 1, "directive_rev": "d1"}
+GOVERNOR_INITIAL_REBASE = {
+    "parent": "c1", "epoch": 1, "directive_rev": "d1", "admitted_rebase_inputs": ["new"],
+}
 GOVERNOR_INSTALL = {
     "first": [{"type": "install", "id": "A", "parent": "c1", "epoch": 2, "directive_rev": "d1"}],
     "late": [
@@ -144,6 +157,16 @@ GOVERNOR_INSTALL = {
         {"type": "install", "id": "A", "parent": "c1", "epoch": 2, "directive_rev": "d1"},
         {"type": "directive", "rev": "d2"},
         {"type": "install", "id": "B", "parent": "c2", "epoch": 3, "directive_rev": "d1"},
+    ],
+    "rebase_stale": [
+        {"type": "install", "id": "A", "parent": "c1", "epoch": 2, "directive_rev": "d1"},
+        {"type": "install", "id": "B", "parent": "c0", "epoch": 1, "directive_rev": "d1",
+         "rebase": True, "new_input_ref": "new"},
+    ],
+    "rebase_ok": [
+        {"type": "install", "id": "A", "parent": "c1", "epoch": 2, "directive_rev": "d1"},
+        {"type": "install", "id": "B", "parent": "c2", "epoch": 3, "directive_rev": "d1",
+         "rebase": True, "new_input_ref": "new"},
     ],
 }
 

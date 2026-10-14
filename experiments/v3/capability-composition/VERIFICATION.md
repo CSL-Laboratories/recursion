@@ -1,13 +1,15 @@
 # Capability-composition conformance suite — verification record
 
-Status: **ACCEPT** — independent verifier recommendation. This is **not Owner acceptance**; only
-Lucas accepts (`CONTROL_PLANE.md` "Independent verifiers"; `AGENTS.md` rule 6). The pre-verification
-handoff is superseded by this record.
+Status: **UNVERIFIED** for the current PR #165 candidate. The historical ACCEPT at `050936e` does
+not apply to this head. This is **not Owner acceptance**; only Lucas accepts (`CONTROL_PLANE.md`
+"Independent verifiers"; `AGENTS.md` rule 6). The pre-verification handoff is superseded by this
+record.
 
-**Fidelity qualification (2026-10-02).** This ACCEPT covers *rerunning the current gates* at
-`050936e`. A separate static review found that full F01–F16 **specification fidelity is not
-established** (findings Q01–Q10). The affected fixtures are marked `partial` in `FIXTURE-INDEX.md`.
-See `REVIEWS.md`. Treat this suite as a **scaffold**, not full conformance evidence.
+**Fidelity qualification (2026-10-02).** The historical ACCEPT covered *rerunning the then-current
+gates* at `050936e`. A separate static review found that full F01–F16 **specification fidelity is
+not established** (findings Q01–Q10). The affected fixtures are marked `partial` in
+`FIXTURE-INDEX.md`. See `REVIEWS.md`. Treat this suite as a **scaffold**, not full conformance
+evidence.
 
 **Re-verification (strengthened suite, slices 1–4).** The tested code changed after the `050936e`
 ACCEPT, so that ACCEPT no longer applies. Verify the strengthened suite at the PR #165 merge commit:

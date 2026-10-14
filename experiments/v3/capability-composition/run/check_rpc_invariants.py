@@ -85,6 +85,8 @@ def run() -> int:
     case("F03_missing", lambda: M.resolve_closure(F.CLOSURE_GRAPH_MISSING, F.CLOSURE_ROOTS, F.CLOSURE_OPTIONAL, F.CLOSURE_CAPACITY_OK))
     case("F03_unfittable", lambda: M.resolve_closure(F.CLOSURE_GRAPH, F.CLOSURE_ROOTS, F.CLOSURE_OPTIONAL, F.CLOSURE_CAPACITY_LOW),
          lambda: X.m_closure_auto_budget(F.CLOSURE_GRAPH, F.CLOSURE_ROOTS, F.CLOSURE_OPTIONAL, F.CLOSURE_CAPACITY_LOW))
+    case("F03_inactive_optional", lambda: M.resolve_closure(
+        F.CLOSURE_GRAPH_INACTIVE_OPTIONAL, F.CLOSURE_ROOTS, F.CLOSURE_OPTIONAL_INACTIVE, F.CLOSURE_CAPACITY_OK))
 
     # F05 immediate revocation with coalesced preferences
     r = F.REVOCATION
@@ -114,6 +116,7 @@ def run() -> int:
     case("F09_aba_unstable", lambda: M.validate_cut(cut["aba_unstable"], 1),
          lambda: X.m_cut_values_only(cut["aba_unstable"], 1))
     case("F09_aba_recovered", lambda: M.validate_cut(cut["aba_recovered"], 3))
+    case("F09_incomplete", lambda: M.validate_cut(cut["incomplete"], 2))
 
     # F10 one governor + compare-and-install
     initial, gov = F.GOVERNOR_INITIAL, F.GOVERNOR_INSTALL
@@ -123,6 +126,8 @@ def run() -> int:
          lambda: X.m_successor_duplicate_adopt(initial, gov["duplicate"]))
     case("F10_directive", lambda: M.govern(initial, gov["directive"]),
          lambda: X.m_successor_directive_ignored(initial, gov["directive"]))
+    case("F10_rebase_stale", lambda: M.govern(F.GOVERNOR_INITIAL_REBASE, gov["rebase_stale"]))
+    case("F10_rebase_ok", lambda: M.govern(F.GOVERNOR_INITIAL_REBASE, gov["rebase_ok"]))
 
     # F13 route/schema drift
     case("F13_valid_current", lambda: M.bind_route(F.ROUTE_CURRENT, None, F.ROUTE_REGISTRY))

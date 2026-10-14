@@ -20,7 +20,8 @@
 |---|---|---|
 | `check_suite.py` passes (structure, ids, sources) | | |
 | `check_rpc_fixtures.py` passes (F01/F11/F12) | | |
-| `check_rpc_invariants.py` passes (F02–F10, F13–F16) | | |
+| `check_rpc_invariants.py` passes (F02/F03/F05/F07–F10/F13/F15) | | |
+| `check_rpc_observed.py` passes (F04/F06/F14/F16) | | |
 | Oracle/expectations do not import or derive from the candidate | | |
 | Every planted mutant is detected | | |
 | Fidelity to report §9 (literal specimen / predicates) | | |

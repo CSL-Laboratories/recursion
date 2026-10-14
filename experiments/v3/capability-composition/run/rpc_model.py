@@ -34,6 +34,29 @@ class Recorder:
         self.events.append((tag,) + args)
 
 
+def _eligible(spec) -> bool:
+    return bool(spec and spec.get("installed") and spec.get("enabled") and spec.get("authorized"))
+
+
+def _expand_optional(graph, start: str, already: set[str]):
+    """Return extra nodes for an optional start, or (None, reason_id) if ineligible."""
+    extra: list[str] = []
+    seen = set(already)
+    stack = [start]
+    while stack:
+        qid = stack.pop()
+        if qid in seen:
+            continue
+        spec = graph.get(qid)
+        if spec is None or not _eligible(spec):
+            return None, qid
+        seen.add(qid)
+        extra.append(qid)
+        for dep in spec.get("requires", []):
+            stack.append(dep)
+    return extra, None
+
+
 def resolve_closure(graph, roots, optional, capacity, recorder=None) -> dict:
     recorder = recorder if recorder is not None else Recorder()
     mandatory: list[str] = []
@@ -42,7 +65,7 @@ def resolve_closure(graph, roots, optional, capacity, recorder=None) -> dict:
     while stack:
         qid = stack.pop()
         spec = graph.get(qid)
-        if spec is None or not (spec.get("installed") and spec.get("enabled") and spec.get("authorized")):
+        if spec is None or not _eligible(spec):
             return {"outcome": "closure_required_missing", "reason": qid, "dispatched": False, "loaded": []}
         if qid in seen:
             continue
@@ -57,19 +80,26 @@ def resolve_closure(graph, roots, optional, capacity, recorder=None) -> dict:
     if mandatory_cost > capacity:
         return {"outcome": "mandatory_context_unfittable", "dispatched": False, "loaded": [], "dropped": []}
     loaded = list(mandatory)
+    loaded_set = set(mandatory)
     used = mandatory_cost
     selected: list[str] = []
     dropped: list[str] = []
+    loss_record: list[dict] = []
     for qid in sorted(optional):
-        if qid not in graph:
+        extra, reason = _expand_optional(graph, qid, loaded_set)
+        if extra is None:
+            dropped.append(qid)
+            loss_record.append({"ref": qid, "reason": "optional_inactive_or_unclosed", "missing": reason})
             continue
-        if used + graph[qid]["cost"] <= capacity:
+        extra_cost = sum(graph[n]["cost"] for n in extra)
+        if used + extra_cost <= capacity:
             selected.append(qid)
-            loaded.append(qid)
-            used += graph[qid]["cost"]
+            loaded.extend(extra)
+            loaded_set.update(extra)
+            used += extra_cost
         else:
             dropped.append(qid)
-    loss_record = [{"ref": q, "reason": "dropped_optional_for_fit"} for q in sorted(dropped)]
+            loss_record.append({"ref": qid, "reason": "dropped_optional_for_fit"})
     for qid in sorted(loaded):
         recorder.emit("load", qid)
     for qid in mandatory:
@@ -137,17 +167,34 @@ def _value_key(domain: str, read: dict):
     return read.get("required_schema") if domain == "config" else read.get("value")
 
 
+def _complete_read(domain: str, read) -> bool:
+    if not isinstance(read, dict):
+        return False
+    revision = read.get("revision")
+    if revision is None or revision == "":
+        return False
+    key = "required_schema" if domain == "config" else "value"
+    return key in read and read[key] is not None
+
+
+def _attempt_complete(attempt: dict) -> bool:
+    return _complete_read("config", attempt.get("config")) and _complete_read("schema", attempt.get("schema"))
+
+
 def validate_cut(attempts: list[dict], budget: int) -> dict:
     prev = None
     aba = False
     for i, attempt in enumerate(attempts):
-        if prev is not None:
+        complete = _attempt_complete(attempt)
+        if prev is not None and complete and _attempt_complete(prev):
             for domain in ("config", "schema"):
                 cur, old = attempt.get(domain, {}), prev.get(domain, {})
                 if _value_key(domain, old) == _value_key(domain, cur) and old.get("revision") != cur.get("revision"):
                     aba = True
-        coherent = attempt.get("config", {}).get("required_schema") == attempt.get("schema", {}).get("value")
-        if i > 0 and prev is not None and coherent:
+        coherent = complete and (
+            attempt.get("config", {}).get("required_schema") == attempt.get("schema", {}).get("value")
+        )
+        if i > 0 and prev is not None and coherent and _attempt_complete(prev):
             same_rev = all(attempt.get(d, {}).get("revision") == prev.get(d, {}).get("revision")
                            for d in ("config", "schema"))
             if same_rev:
@@ -169,14 +216,11 @@ def govern(initial: dict, events: list[dict]) -> dict:
             state["directive_rev"] = ev["rev"]
             steps.append(("directive", ev["rev"]))
             continue
-        if ev.get("rebase") and ev.get("new_input_ref"):
-            accepted = ev["id"]
-            previous_preserved = True
-            state["epoch"] = ev.get("epoch", state["epoch"])
-            state["parent"] = ev.get("parent", state["parent"])
-            state["directive_rev"] = ev.get("directive_rev", state["directive_rev"])
-            steps.append(("install", ev["id"]))
-            continue
+        if ev.get("rebase"):
+            admitted = tuple(state.get("admitted_rebase_inputs") or ())
+            if not ev.get("new_input_ref") or ev.get("new_input_ref") not in admitted:
+                steps.append(("rebase_input_reject", ev["id"]))
+                continue
         if ev["parent"] != state["parent"]:
             steps.append(("stale_reject", ev["id"]))
         elif ev["epoch"] <= state["epoch"]:

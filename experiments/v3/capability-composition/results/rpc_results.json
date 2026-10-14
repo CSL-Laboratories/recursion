@@ -32,10 +32,10 @@
     }
   ],
   "provenance": {
-    "reference_model.py": "1ac7098c6e026a5dfaff3a2cda65bd140a6eee02c701980bfc2a4c40f894d870",
-    "oracle.py": "cf4376972ffbeccda6aaf99f1ee8b55cb2ee15c4be30407ef9f3a093825915a3",
-    "gate": "3413f838e679413f15370ac28a67541151cfc4dec22d8ef188de556602460352",
-    "python": "3.12.10"
+    "reference_model.py": "d1029105a129a3acd4c3e743dbc16b50db56d53f4fb380479cbf1fb30ce31c7c",
+    "oracle.py": "20d0d371f954e79bde5db88e9b386dfdd130bd34f1ebdf83f0e64130bd011458",
+    "gate": "437fac61978f9733f623c537a6ed5c5b46a9cbfd2a95f26543cb8c9721794321",
+    "python": "3.12.3"
   },
   "disposition": "PASS",
   "failures": [],

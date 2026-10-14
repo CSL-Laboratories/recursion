@@ -21,6 +21,7 @@
     "F02_identity",
     "F02_missing",
     "F02_replay",
+    "F03_inactive_optional",
     "F03_missing",
     "F03_unfittable",
     "F03_valid",
@@ -33,12 +34,15 @@
     "F08",
     "F09_aba_recovered",
     "F09_aba_unstable",
+    "F09_incomplete",
     "F09_mixed",
     "F09_valid",
     "F10_directive",
     "F10_duplicate",
     "F10_first",
     "F10_late",
+    "F10_rebase_ok",
+    "F10_rebase_stale",
     "F13_drift_readmit",
     "F13_hold_unknown",
     "F13_valid_current",
@@ -58,6 +62,7 @@
     "F03_valid",
     "F03_missing",
     "F03_unfittable",
+    "F03_inactive_optional",
     "F05_revoked",
     "F05_positive",
     "F05_pending",
@@ -69,10 +74,13 @@
     "F09_mixed",
     "F09_aba_unstable",
     "F09_aba_recovered",
+    "F09_incomplete",
     "F10_first",
     "F10_late",
     "F10_duplicate",
     "F10_directive",
+    "F10_rebase_stale",
+    "F10_rebase_ok",
     "F13_valid_current",
     "F13_drift_readmit",
     "F13_hold_unknown",
@@ -84,7 +92,7 @@
     "F15_invalid_selection",
     "F15_valid_selection"
   ],
-  "case_count": 32,
+  "case_count": 36,
   "case_results": [
     {
       "case": "F02_identity",
@@ -222,6 +230,49 @@
       },
       "candidate_ok": true,
       "mutant_detected": true
+    },
+    {
+      "case": "F03_inactive_optional",
+      "expected": {
+        "outcome": "ok",
+        "dispatched": true,
+        "mandatory": [
+          "S02:v1",
+          "S03:v1"
+        ],
+        "loaded": [
+          "S02:v1",
+          "S03:v1"
+        ],
+        "dropped": [
+          "O1:v1"
+        ]
+      },
+      "observed": {
+        "outcome": "ok",
+        "dispatched": true,
+        "mandatory": [
+          "S02:v1",
+          "S03:v1"
+        ],
+        "loaded": [
+          "S02:v1",
+          "S03:v1"
+        ],
+        "optional_selected": [],
+        "dropped": [
+          "O1:v1"
+        ],
+        "loss_record": [
+          {
+            "ref": "O1:v1",
+            "reason": "optional_inactive_or_unclosed",
+            "missing": "O1:v1"
+          }
+        ]
+      },
+      "candidate_ok": true,
+      "mutant_detected": null
     },
     {
       "case": "F05_revoked",
@@ -379,6 +430,19 @@
       "mutant_detected": null
     },
     {
+      "case": "F09_incomplete",
+      "expected": {
+        "outcome": "composition_cut_unavailable"
+      },
+      "observed": {
+        "outcome": "composition_cut_unavailable",
+        "retries": 1,
+        "aba_detected": false
+      },
+      "candidate_ok": true,
+      "mutant_detected": null
+    },
+    {
       "case": "F10_first",
       "expected": {
         "outcome": "installed",
@@ -478,6 +542,56 @@
       },
       "candidate_ok": true,
       "mutant_detected": true
+    },
+    {
+      "case": "F10_rebase_stale",
+      "expected": {
+        "outcome": "installed",
+        "accepted": "A"
+      },
+      "observed": {
+        "outcome": "installed",
+        "accepted": "A",
+        "epoch": 2,
+        "previous_preserved": true,
+        "steps": [
+          [
+            "install",
+            "A"
+          ],
+          [
+            "stale_reject",
+            "B"
+          ]
+        ]
+      },
+      "candidate_ok": true,
+      "mutant_detected": null
+    },
+    {
+      "case": "F10_rebase_ok",
+      "expected": {
+        "outcome": "installed",
+        "accepted": "B"
+      },
+      "observed": {
+        "outcome": "installed",
+        "accepted": "B",
+        "epoch": 3,
+        "previous_preserved": true,
+        "steps": [
+          [
+            "install",
+            "A"
+          ],
+          [
+            "install",
+            "B"
+          ]
+        ]
+      },
+      "candidate_ok": true,
+      "mutant_detected": null
     },
     {
       "case": "F13_valid_current",
@@ -630,11 +744,11 @@
     }
   ],
   "provenance": {
-    "rpc_model.py": "3b736364cb346a62328cdf992ca6234704e02c013e1e28498761086c51112eaf",
-    "rpc_expected.py": "4f14db9fe285dd0a71240fe1a5de1a80034dbdf84bf773dfeb9c77664af16f44",
-    "rpc_mutants.py": "bfcf8a4cdceeef6fe4aa5c9b6900b0667fa587ea3669dc11f2622cfd0bcd2b19",
-    "gate": "e8456240944812d57588f90de41ba997fb0bdb2790d53ccd7da0409aea18f71c",
-    "python": "3.12.10"
+    "rpc_model.py": "5b484646b32b73f3a04bdaafe5c4abb0b1dcc59d9c66b14e20803591d0742980",
+    "rpc_expected.py": "a093aa786157245c97660e0ab73004e9595f6c13f0bf13c9f43e6a7647b85a68",
+    "rpc_mutants.py": "019aad6b99483e0f1a1fafc281ca53586d826365d86e7252113756c56f739d59",
+    "gate": "3e776c3f50aea679414d77c9053958b6da1e2a0ae6d91dd19b52d10cdd5b4d76",
+    "python": "3.12.3"
   },
   "failures": [],
   "disposition": "PASS",

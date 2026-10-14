@@ -24,6 +24,8 @@ EXPECTED: dict[str, dict] = {
                   "loaded": ["O1:v1", "S02:v1", "S03:v1"], "dropped": ["O2:v1", "O3:v1"]},
     "F03_missing": {"outcome": "closure_required_missing", "reason": "S03:v1", "dispatched": False},
     "F03_unfittable": {"outcome": "mandatory_context_unfittable", "dispatched": False},
+    "F03_inactive_optional": {"outcome": "ok", "dispatched": True, "mandatory": ["S02:v1", "S03:v1"],
+                              "loaded": ["S02:v1", "S03:v1"], "dropped": ["O1:v1"]},
     # F05 immediate revocation with coalesced preferences
     "F05_revoked": {"outcome": "refuse"},
     "F05_positive": {"outcome": "allow"},
@@ -39,11 +41,14 @@ EXPECTED: dict[str, dict] = {
     "F09_mixed": {"outcome": "composition_cut_unavailable"},
     "F09_aba_unstable": {"outcome": "composition_cut_unavailable", "aba_detected": True},
     "F09_aba_recovered": {"outcome": "ok", "aba_detected": True},
+    "F09_incomplete": {"outcome": "composition_cut_unavailable"},
     # F10 one governor + compare-and-install
     "F10_first": {"outcome": "installed", "accepted": "A", "previous_preserved": True},
     "F10_late": {"outcome": "installed", "accepted": "A"},
     "F10_duplicate": {"outcome": "installed", "accepted": "A"},
     "F10_directive": {"outcome": "installed", "accepted": "A"},
+    "F10_rebase_stale": {"outcome": "installed", "accepted": "A"},
+    "F10_rebase_ok": {"outcome": "installed", "accepted": "B"},
     # F13 route/schema drift
     "F13_valid_current": {"outcome": "ok"},
     "F13_drift_readmit": {"outcome": "ok", "binding": {"descriptor": "d5", "schema": "u2"}},

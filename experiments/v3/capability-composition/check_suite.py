@@ -86,6 +86,10 @@ def main() -> int:
 
     # Closed, unique mutant registry across rpc_mutants.py, reference_model.py and oracle.py.
     registry = json.loads((HERE / "mutant-registry.json").read_text(encoding="utf-8"))
+    registry_names = [entry["name"] for entry in registry["mutants"]]
+    registry_dups = sorted({n for n in registry_names if registry_names.count(n) > 1})
+    if registry_dups:
+        errors.append(f"mutant-registry.json: duplicate names: {registry_dups}")
     registered = {entry["name"]: entry for entry in registry["mutants"]}
     patterns = {
         "rpc_mutants.py": r"^def (m_\w+)",
@@ -107,8 +111,10 @@ def main() -> int:
             errors.append(f"registry entry not found in module {meta['module']}: {name}")
             continue
         gate_src = (HERE / "run" / meta["gate"]).read_text(encoding="utf-8")
-        if f"X.{name}" not in gate_src and f"{name}(" not in gate_src:
-            errors.append(f"registered mutant not referenced by its gate {meta['gate']}: {name}")
+        live = "\n".join(line.split("#", 1)[0] for line in gate_src.splitlines())
+        invoked = f"X.{name}(" in live if meta["module"] == "rpc_mutants.py" else f"{name}(" in live
+        if not invoked:
+            errors.append(f"registered mutant not invoked by its gate {meta['gate']}: {name}")
 
     for path in (README, INDEX):
         text = path.read_text(encoding="utf-8")

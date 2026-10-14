@@ -221,10 +221,10 @@ class Boundary:
 def classify(observer: Observer, *, output_valid: bool, require_useful: bool = True) -> str:
     if observer.observation_missing:
         return "HOLD_UNKNOWN"
+    if require_useful and not (observer.admitted_effects() and observer.useful_completions()):
+        return "FAIL_USEFUL_COMPLETION"
     if not observer.snapshot():
         return "HOLD_UNKNOWN"
     if not output_valid:
         return "FAIL_INVALID"
-    if require_useful and not (observer.admitted_effects() and observer.useful_completions()):
-        return "FAIL_USEFUL_COMPLETION"
     return "PASS"

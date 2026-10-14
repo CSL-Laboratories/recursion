@@ -29,12 +29,45 @@ OUTCOME = RS.RecordSpec((RS.FieldSpec("outcome", str),))
 failures: list[str] = []
 invoked: list[str] = []
 case_results: list[dict] = []
+_boundaries: list = []
+_OrigBoundary = O.Boundary
+
+
+class _TrackedBoundary(_OrigBoundary):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        _boundaries.append(self)
+
+
+O.Boundary = _TrackedBoundary
+
+
+def _event_record(event) -> dict:
+    return {
+        "kind": event.kind,
+        "target": event.target,
+        "allowed": event.allowed,
+        "detail": event.detail,
+        "bytes_len": event.bytes_len,
+        "payload_sha256": event.payload_sha256,
+    }
 
 
 def _record(fixture: str, fn) -> None:
+    _boundaries.clear()
     before = len(failures)
     fn()
-    case_results.append({"fixture": fixture, "checks_failed": list(failures[before:])})
+    case_results.append({
+        "fixture": fixture,
+        "checks_failed": list(failures[before:]),
+        "boundaries": [
+            {
+                "observation_missing": b.observer.observation_missing,
+                "events": [_event_record(e) for e in b.events()],
+            }
+            for b in _boundaries
+        ],
+    })
 
 
 def _sha(path: Path) -> str:
@@ -122,8 +155,14 @@ def f06() -> None:
     check(b.observer.admitted_effects() == (), "quiet-no-effect mutant detected (no recorded effect)")
 
     b = O.Boundary()
-    X.m_forged_authority(b.sink, b.ledger, F.F06["import_envelope"], op_id=F.F06["protected_op"])
-    check(b.observer.admitted_effects() == (), "forged-authority mutant detected (no admitted effect)")
+    mr = X.m_forged_authority(b.sink, b.ledger, F.F06["import_envelope"], op_id=F.F06["protected_op"])
+    forged_matches_required = (
+        mr.get("outcome") == "refused"
+        and b.observer.admitted_effects() == ()
+        and b.observer.useful_completions() == ()
+    )
+    check(not forged_matches_required,
+          "forged-authority mutant detected (outcome or trace differs from refused+no-effects)")
 
 
 def f14() -> None:
@@ -210,9 +249,17 @@ def f16() -> None:
     check(O.classify(b.observer, output_valid=True) == "FAIL_USEFUL_COMPLETION",
           "all-refusing candidate: FAIL_USEFUL_COMPLETION")
 
-    b = O.Boundary(enabled=False)
+    b = O.Boundary()
+    b.ledger.install_right(subject, active=True, fence=0)
     X.m_worker_silent(b, "normal_A", op_id=op, subject=subject)
-    check(O.classify(b.observer, output_valid=True) == "HOLD_UNKNOWN", "silent mutant yields HOLD_UNKNOWN")
+    check(O.classify(b.observer, output_valid=True) == "FAIL_USEFUL_COMPLETION",
+          "silent mutant on enabled observer: FAIL_USEFUL_COMPLETION")
+
+    b = O.Boundary(enabled=False)
+    b.ledger.install_right(subject, active=True, fence=0)
+    X.m_worker_silent(b, "normal_A", op_id=op, subject=subject)
+    check(O.classify(b.observer, output_valid=True) == "HOLD_UNKNOWN",
+          "silent mutant on disabled observer remains HOLD_UNKNOWN")
 
 
 def run() -> int:

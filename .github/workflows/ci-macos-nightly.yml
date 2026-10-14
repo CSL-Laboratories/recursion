@@ -30,6 +30,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       run_macos: ${{ steps.check.outputs.run_macos }}
+      sha: ${{ steps.check.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -39,6 +40,9 @@ jobs:
       - name: Check for recent commits on master
         id: check
         run: |
+          sha="$(git rev-parse HEAD)"
+          echo "sha=${sha}"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
           count="$(git rev-list --count --since='24 hours ago' HEAD)"
           echo "commits_in_24h=${count}"
           if [ "${count}" -eq 0 ]; then
@@ -58,7 +62,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: master
+          ref: ${{ needs.recent.outputs.sha }}
 
       - name: Set up Python
         uses: actions/setup-python@v5

@@ -1,6 +1,8 @@
 # Operating rules — Recursion
 
-> **How CSL works:** start with the Linear doc [How CSL works](https://linear.app/csl-laboratories/document/how-csl-works-922e0df6026f).
+> **How CSL works:** the Linear doc [How CSL works](https://linear.app/csl-laboratories/document/how-csl-works-922e0df6026f)
+> is background on the team and tooling. It does not change the reading order below;
+> `CONTROL_PLANE.md` is still read first and wins on any conflict.
 
 This repository builds Recursion v3, a provider-neutral agent harness. Read
 `CONTROL_PLANE.md` first — it says who decides. Read `ANCHOR.md` before any planning task —

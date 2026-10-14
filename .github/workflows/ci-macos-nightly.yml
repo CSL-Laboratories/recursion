@@ -1,0 +1,78 @@
+# GitHub-hosted macOS is ~$0.08/min. Do not run it on every master push.
+# Nightly coverage of master at 07:17 UTC (off-peak US), skipped when master
+# has no commits in the last 24 hours. PR/dispatch macOS stays in ci.yml
+# behind workflow_dispatch and the ci:full label.
+#
+# The recent-commit check runs on a cheap Blacksmith Ubuntu runner so idle
+# nights never allocate a macOS runner.
+name: CI macos nightly
+
+on:
+  schedule:
+    - cron: "17 7 * * *"
+
+concurrency:
+  group: ci-macos-nightly
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: utf-8
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  recent:
+    name: recent-commits
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 5
+    outputs:
+      run_macos: ${{ steps.check.outputs.run_macos }}
+      sha: ${{ steps.check.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: master
+
+      - name: Check for recent commits on master
+        id: check
+        run: |
+          sha="$(git rev-parse HEAD)"
+          echo "sha=${sha}"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          count="$(git rev-list --count --since='24 hours ago' HEAD)"
+          echo "commits_in_24h=${count}"
+          if [ "${count}" -eq 0 ]; then
+            echo "No master commits in the last 24 hours; skipping macOS runner."
+            echo "run_macos=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_macos=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  macos:
+    name: macos
+    needs: recent
+    if: needs.recent.outputs.run_macos == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.recent.outputs.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-ci.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements-ci.txt
+
+      - name: Provider-free gate
+        run: python -X utf8 -B tools/ci_gate.py --force

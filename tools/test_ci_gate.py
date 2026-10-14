@@ -151,7 +151,7 @@ class LightweightControlTests(unittest.TestCase):
         with mock.patch.object(ci_gate.subprocess, "check_output", return_value=payload):
             paths = ci_gate.git_nul("diff", "-z", "--name-only")
         self.assertEqual(len(paths), 2)
-        self.assertEqual(paths[0], os.fsdecode(b"docs/note-\xff.md"))
+        self.assertEqual(paths[0], b"docs/note-\xff.md".decode("utf-8", errors="surrogateescape"))
         self.assertEqual(paths[1], "tools/ok.py")
         self.assertFalse(ci_gate.is_gate_path(paths[0]))
         self.assertTrue(ci_gate.is_gate_path(paths[1]))

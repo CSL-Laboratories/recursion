@@ -21,9 +21,13 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
+
+# A real entry point: an unindented `if __name__ == "__main__":` line, not a comment.
+MAIN_GUARD_RE = re.compile(r"^if\s+__name__\s*==\s*[\"']__main__[\"']\s*:", re.MULTILINE)
 
 ROOT = Path(__file__).resolve().parents[1]
 ZERO_SHA = "0" * 40
@@ -258,7 +262,7 @@ def assert_tests_accounted(root: Path | None = None) -> list[str]:
     no_main = [
         path
         for path in run
-        if "__main__" not in (base / path).read_text(encoding="utf-8", errors="replace")
+        if not MAIN_GUARD_RE.search((base / path).read_text(encoding="utf-8", errors="replace"))
     ]
     if no_main:
         errors.append("no __main__ runner (would pass untested):\n  " + "\n  ".join(no_main))

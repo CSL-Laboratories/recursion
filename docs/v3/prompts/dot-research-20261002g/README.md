@@ -31,7 +31,8 @@ every recommendation, and select no language, store, framework, transport, provi
 - M1B represents **eleven** grant dimensions (functional capability + workspace scope + nine
   permissions); `PluginManifest@1` is the plugin/edition contract (D-035 is repository topology).
 - Two source-documented code/wire discrepancies (WorkPacket correlation identity; effect attenuation)
-  are blockers before freezing the behavioral contract.
+  are blockers before freezing the behavioral contract. R-PLAN question 3 asks a future session to
+  resolve them conceptually; **this packet does not resolve them**.
 - **Mobile floors are open** (Android min/target API; iOS OS/device); D-028 covers desktop only.
 - G-09 = configuration conformance; G-20 = performance comparison / R11 ablation / disabled-plugin
   benchmark.

@@ -73,6 +73,7 @@ path (a ruled-out approach without its reason is a dead end waiting to be redisc
 | Capability-composition conformance suite (D-037) | `experiments/v3/capability-composition/` (+`check_suite.py`) | R-PC F01–F16 implemented; **independently ACCEPT** at `050936e` (GLM-5.3-Flash); F17/F18 deferred; R-UI/R-MOB pending |
 | Competitive note — T3 Code v0.0.45 (control surface) | `research-lane/competitive-notes/20261002-t3code-v0.0.45.md` | source-documented (public release notes); not installed/executed; no adoption |
 | Packet-E return + PR #160 review | `research-lane/core-language-control-surfaces-20261002/` (+`check_intake.py`) | intaken; 7 files sha256-verified; R-LANG/R-CS advisory; PR #160 static review ISSUES/NEEDS-EVIDENCE; all target tests unexecuted |
+| R-PLAN + R-OPS prompts (packet 2026-10-02g) | `prompts/dot-research-20261002g/` (+`check_research_stack.py`) | issued; two handoffs (planning/executives; operations/lifecycle); M1A discrepancies remain open research questions |
 | Architecture edge map | `research-lane/ARCHITECTURE-COVERAGE.md` | maintained |
 | Per-harness coverage matrix | `research-lane/HARNESS-COVERAGE.md` | maintained |
 | Next-phase runbook | `research-lane/NEXT-PHASE.md` | maintained |

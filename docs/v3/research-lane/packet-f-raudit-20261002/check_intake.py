@@ -5,8 +5,8 @@ Verifies the delivered files against SHA256SUMS.txt, then scans prose for secret
 forbidden foreign-project identifiers (reusing tools/check_public_scope.py).
 
 The checksum manifest is not the inventory: on-disk files (except this script and
-SHA256SUMS.txt) must match the parsed checksum paths exactly. Malformed or duplicate
-manifest lines fail closed.
+the packet-root SHA256SUMS.txt) must match the parsed checksum paths exactly. Nested
+checksum files are inventory. Malformed or duplicate manifest lines fail closed.
 
     python -X utf8 -B docs/v3/research-lane/packet-f-raudit-20261002/check_intake.py
 """
@@ -54,7 +54,7 @@ def delivered_paths() -> set[str]:
     for path in HERE.rglob("*"):
         if not path.is_file():
             continue
-        if path.resolve() == SELF or path.name == SUMS.name:
+        if path.resolve() == SELF or path.resolve() == SUMS:
             continue
         found.add(path.relative_to(HERE).as_posix())
     return found

@@ -4,9 +4,13 @@ from __future__ import annotations
 
 def last_n(items: list[int] | None, n: int) -> list[int]:
     """Return the last n items of a list (empty list for None)."""
-    return items[len(items) - n - 1:]
+    if items is None or n <= 0:
+        return []
+    return items[-n:]
 
 
 def average(values: list[float]) -> float:
     """Arithmetic mean of values."""
+    if not values:
+        raise ValueError("average() requires at least one value")
     return sum(values) / len(values)

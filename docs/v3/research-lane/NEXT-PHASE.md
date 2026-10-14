@@ -70,6 +70,10 @@ candidate contract (see the synthesis's local handoff).
   (R-LANG core-language/reconstruction; R-CS control-surface study; Astra static review of the R-PC
   suite + verifier reconciliation). Research evidence only; no technology selected; the R-PC suite is
   a scaffold (rerun ACCEPT, full-spec fidelity ISSUES/NEEDS-EVIDENCE).
+- **R-PLAN + R-OPS prompts (packet 2026-10-02g):** `docs/v3/prompts/dot-research-20261002g/`
+  (planning/executives facet; operations/lifecycle facet; +`check_research_stack.py`). Issued;
+  two handoffs. M1A discrepancies remain open research questions; this packet does not resolve
+  them.
 
 ## Next steps in order
 
@@ -119,7 +123,9 @@ local bytes change.
 ## Resume checklist for a fresh context
 
 1. `git fetch origin && git checkout <branch> && git pull`
-2. Read: `docs/v3/START-HERE.md`, this file, `SYNTHESIS.md`, `GAPS.md`.
+2. Read: `docs/v3/START-HERE.md`, this file, `SYNTHESIS.md`, `GAPS.md`,
+   `RESEARCH-INDEX.md`, and issued packet-g prompts at
+   `docs/v3/prompts/dot-research-20261002g/`.
 3. Run `python -X utf8 -B tools/check_next_phase.py` and resolve any MISSING line.
 4. Ask Lucas for G-06 (and the authority-reconciliation approval) before any construction.
 5. Begin FU-03/FU-04 in separate worktrees with their own gates.

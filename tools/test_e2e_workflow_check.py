@@ -6,10 +6,17 @@ def test_average_simple() -> None:
 
 
 def test_last_n_full() -> None:
-    assert last_n([1, 2, 3], 3)[-1] == 3
+    assert last_n([1, 2, 3], 3) == [1, 2, 3]
+
+
+def test_last_n_partial_and_empty() -> None:
+    assert last_n([1, 2, 3], 2) == [2, 3]
+    assert last_n([1, 2, 3], 0) == []
+    assert last_n(None, 2) == []
 
 
 if __name__ == "__main__":
     test_average_simple()
     test_last_n_full()
+    test_last_n_partial_and_empty()
     print("ok")

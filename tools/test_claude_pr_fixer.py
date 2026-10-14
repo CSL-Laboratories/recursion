@@ -216,6 +216,12 @@ class DevinMatrixTests(unittest.TestCase):
         self.assertEqual(got["head_sha"], "")
         self.assertEqual(got["devin"], "false")
 
+    def test_default_branch_ref_is_rejected(self) -> None:
+        for name in ("master", "main", "HEAD"):
+            got = decide("pull_request_review", self._review(head_ref=name))
+            self.assertEqual(got["head_ref"], "", name)
+            self.assertEqual(got["devin"], "false", name)
+
 
 class WholeWordTests(unittest.TestCase):
     def test_patterns(self) -> None:
@@ -269,8 +275,13 @@ class WorkflowStructureTests(unittest.TestCase):
         attach = 'git checkout -B "$HEAD_REF" "$HEAD_SHA"'
         self.assertIn(attach, mention)
         self.assertIn(attach, devin)
-        self.assertIn("Bash(git push origin HEAD:refs/heads/*)", mention)
-        self.assertIn("Bash(git push origin HEAD:refs/heads/*)", devin)
+        push = (
+            "Bash(git push origin HEAD:refs/heads/"
+            "${{ needs.resolve-pr.outputs.head_ref }})"
+        )
+        self.assertIn(push, mention)
+        self.assertIn(push, devin)
+        self.assertNotIn("HEAD:refs/heads/*", mention)
 
     def test_prompt_treats_review_and_files_as_untrusted(self) -> None:
         self.assertIn("UNTRUSTED DATA", self.text)

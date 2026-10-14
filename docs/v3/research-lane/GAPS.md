@@ -251,7 +251,7 @@ The packet-E return and the static R-PC suite review are intaken at
 ## Status update — 2026-10-02 packet-F R-AUDIT return + PR #165 review
 
 The packet-F R-AUDIT return is intaken at `docs/v3/research-lane/packet-f-raudit-20261002/`
-(19 files sha256-verified).
+(20 files sha256-verified).
 
 - **A1–A10 corrections** resolve the D-039 outline's disputed claims (F20-A–G belongs to R-SC Q20;
   the orientation gate is historical; G-20 is performance, G-09 configuration; eleven grant

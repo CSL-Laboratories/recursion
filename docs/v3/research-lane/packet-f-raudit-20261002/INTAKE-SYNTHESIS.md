@@ -14,11 +14,12 @@ PR #165 execution.
 
 ## Delivery identity
 
-19 delivered files, all sha256-verified (see `SHA256SUMS.txt`): `README.md`,
-`DELIVERY-VERIFICATION.md`, `ARCHITECTURE-REVISION-GUIDE.md`, `corrections/report.md` +
-`source-manifest.json`, `corpus/report.md` + `source-ledger.json`, `language/report.md` +
-`source-ledger.md` + `local-verification-handoff.md`, and `pr165/` (executed summary, reconciliation,
-static report + mutant audit + provenance notes + retrieval manifest + source hashes).
+20 delivered files, all sha256-verified (see `SHA256SUMS.txt`): `README.md`,
+`DELIVERY-VERIFICATION.md`, `INTAKE-SYNTHESIS.md`, `ARCHITECTURE-REVISION-GUIDE.md`,
+`corrections/report.md` + `source-manifest.json`, `corpus/report.md` + `source-ledger.json`,
+`language/report.md` + `source-ledger.md` + `local-verification-handoff.md`, and `pr165/`
+(executed summary, reconciliation, static report + mutant audit + provenance notes +
+retrieval manifest + source hashes).
 
 ## 1. Corrections register (A1–A10) — applied to the outline next
 

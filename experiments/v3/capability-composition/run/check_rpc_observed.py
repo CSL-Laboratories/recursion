@@ -36,10 +36,16 @@ _OrigBoundary = O.Boundary
 class _TrackedBoundary(_OrigBoundary):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        self.trace_role = "candidate"
         _boundaries.append(self)
 
 
 O.Boundary = _TrackedBoundary
+
+
+def _mutant(boundary):
+    boundary.trace_role = "mutant"
+    return boundary
 
 
 def _event_record(event) -> dict:
@@ -62,6 +68,7 @@ def _record(fixture: str, fn) -> None:
         "checks_failed": list(failures[before:]),
         "boundaries": [
             {
+                "role": getattr(b, "trace_role", "candidate"),
                 "observation_missing": b.observer.observation_missing,
                 "events": [_event_record(e) for e in b.events()],
             }
@@ -103,7 +110,7 @@ def f04() -> None:
     regs = b.observer.events(O.REGISTER)
     check(len(regs) == 1 and regs[0].detail == "disabled", "disabled: only a disabled registration")
 
-    b = O.Boundary()
+    b = _mutant(O.Boundary())
     X.m_disabled_reads(b.catalog, True, False, capability_id=F.F04["capability"], source_id=F.F04["source"])
     check(b.observer.count(O.CATALOG_READ) > 0 or b.observer.operational_bytes() > 0,
           "disabled: leaked-read mutant detected")
@@ -143,19 +150,23 @@ def f06() -> None:
     check(len(b.observer.admitted_effects()) == 1, "authorized: one admitted effect observed")
     check(len(b.observer.useful_completions()) == 1, "authorized: one useful completion observed")
 
-    b = O.Boundary()
+    b = _mutant(O.Boundary())
     b.ledger.install_right(F.F06["owner_envelope"]["subject"], active=True, fence=0)
     mr = X.m_always_refuse(b.sink, b.ledger, _authorized_envelope(b), op_id=F.F06["protected_op"])
     check(not (mr.get("outcome") == "completed" and b.observer.admitted_effects()),
           "always-refuse mutant detected on the authorized path")
 
-    b = O.Boundary()
+    b = _mutant(O.Boundary())
     b.ledger.install_right(F.F06["owner_envelope"]["subject"], active=True, fence=0)
     X.m_quiet_no_effect(b.sink, b.ledger, _authorized_envelope(b), op_id=F.F06["protected_op"])
     check(b.observer.admitted_effects() == (), "quiet-no-effect mutant detected (no recorded effect)")
 
-    b = O.Boundary()
+    b = _mutant(O.Boundary())
     mr = X.m_forged_authority(b.sink, b.ledger, F.F06["import_envelope"], op_id=F.F06["protected_op"])
+    check(b.observer.admitted_effects() == (),
+          "forged-authority: boundary admitted no effect for forged proof")
+    check(b.observer.useful_completions() == (),
+          "forged-authority: no useful completion for forged proof")
     forged_matches_required = (
         mr.get("outcome") == "refused"
         and b.observer.admitted_effects() == ()
@@ -190,7 +201,7 @@ def f14() -> None:
           and b.observer.count(O.FUNDS_RESET) == 0, "valid: no replay")
     check(b.ledger.liability("O1") == "held", "valid: liability held")
 
-    b = O.Boundary(current_fence=F.F14["current_fence"])
+    b = _mutant(O.Boundary(current_fence=F.F14["current_fence"]))
     _seed_ledger(b)
     b.ledger.set_liability("O1", "held")
     X.m_restore_reexecute(b.ledger, F.F14["valid_manifest_refs"], F.F14["active_skill"])
@@ -239,23 +250,23 @@ def f16() -> None:
     check(O.classify(b.observer, output_valid=_bound(b, op, r["artifact"].encode())) == "FAIL_INVALID",
           "invalid: FAIL_INVALID")
 
-    b = O.Boundary(); b.ledger.install_right(subject, active=True, fence=0)
+    b = _mutant(O.Boundary()); b.ledger.install_right(subject, active=True, fence=0)
     r = X.m_invalid_emit_valid_return(b, "normal_A", op_id=op, subject=subject)
     check(_bound(b, op, r["artifact"].encode()) is False,
           "empty-completion-but-valid-return mutant detected (returned artifact unbound)")
 
-    b = O.Boundary(); b.ledger.install_right(subject, active=True, fence=0)
+    b = _mutant(O.Boundary()); b.ledger.install_right(subject, active=True, fence=0)
     X.m_worker_refuse(b, "normal_A", op_id=op, subject=subject)
     check(O.classify(b.observer, output_valid=True) == "FAIL_USEFUL_COMPLETION",
           "all-refusing candidate: FAIL_USEFUL_COMPLETION")
 
-    b = O.Boundary()
+    b = _mutant(O.Boundary())
     b.ledger.install_right(subject, active=True, fence=0)
     X.m_worker_silent(b, "normal_A", op_id=op, subject=subject)
     check(O.classify(b.observer, output_valid=True) == "FAIL_USEFUL_COMPLETION",
           "silent mutant on enabled observer: FAIL_USEFUL_COMPLETION")
 
-    b = O.Boundary(enabled=False)
+    b = _mutant(O.Boundary(enabled=False))
     b.ledger.install_right(subject, active=True, fence=0)
     X.m_worker_silent(b, "normal_A", op_id=op, subject=subject)
     check(O.classify(b.observer, output_valid=True) == "HOLD_UNKNOWN",

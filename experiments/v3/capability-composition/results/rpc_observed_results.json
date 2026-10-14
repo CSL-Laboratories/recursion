@@ -17,7 +17,7 @@
     "observer.py": "28168e892832bbca272a643480bf8911162e7432c8d388626c3a19653f17cfd4",
     "record_schema.py": "2ef29a120ddf993302815e49c23e0285b109461f821232d38cb2922972a99cef",
     "rpc_model.py": "5b484646b32b73f3a04bdaafe5c4abb0b1dcc59d9c66b14e20803591d0742980",
-    "gate": "85ef7c914c011326a35dc81b55ab6a41899e7c34710b7e41190c99b64817932b",
+    "gate": "407f697f1145e16f2f47f8054fc235bdd4fb17a10fd9eb1cd27613653d26af6c",
     "python": "3.12.3"
   },
   "case_results": [
@@ -26,10 +26,12 @@
       "checks_failed": [],
       "boundaries": [
         {
+          "role": "candidate",
           "observation_missing": false,
           "events": []
         },
         {
+          "role": "candidate",
           "observation_missing": false,
           "events": [
             {
@@ -43,6 +45,7 @@
           ]
         },
         {
+          "role": "mutant",
           "observation_missing": false,
           "events": [
             {
@@ -64,6 +67,7 @@
           ]
         },
         {
+          "role": "candidate",
           "observation_missing": false,
           "events": [
             {
@@ -99,6 +103,7 @@
       "checks_failed": [],
       "boundaries": [
         {
+          "role": "candidate",
           "observation_missing": false,
           "events": [
             {
@@ -120,6 +125,7 @@
           ]
         },
         {
+          "role": "candidate",
           "observation_missing": false,
           "events": [
             {
@@ -149,6 +155,7 @@
           ]
         },
         {
+          "role": "mutant",
           "observation_missing": false,
           "events": [
             {
@@ -170,10 +177,12 @@
           ]
         },
         {
+          "role": "mutant",
           "observation_missing": false,
           "events": []
         },
         {
+          "role": "mutant",
           "observation_missing": false,
           "events": [
             {
@@ -201,10 +210,12 @@
       "checks_failed": [],
       "boundaries": [
         {
+          "role": "candidate",
           "observation_missing": false,
           "events": []
         },
         {
+          "role": "candidate",
           "observation_missing": false,
           "events": [
             {
@@ -242,6 +253,7 @@
           ]
         },
         {
+          "role": "mutant",
           "observation_missing": false,
           "events": [
             {
@@ -309,10 +321,12 @@
       "checks_failed": [],
       "boundaries": [
         {
+          "role": "candidate",
           "observation_missing": true,
           "events": []
         },
         {
+          "role": "candidate",
           "observation_missing": false,
           "events": [
             {
@@ -342,6 +356,7 @@
           ]
         },
         {
+          "role": "candidate",
           "observation_missing": false,
           "events": [
             {
@@ -371,6 +386,7 @@
           ]
         },
         {
+          "role": "candidate",
           "observation_missing": false,
           "events": [
             {
@@ -400,6 +416,7 @@
           ]
         },
         {
+          "role": "mutant",
           "observation_missing": false,
           "events": [
             {
@@ -429,6 +446,7 @@
           ]
         },
         {
+          "role": "mutant",
           "observation_missing": false,
           "events": [
             {
@@ -450,10 +468,12 @@
           ]
         },
         {
+          "role": "mutant",
           "observation_missing": false,
           "events": []
         },
         {
+          "role": "mutant",
           "observation_missing": true,
           "events": []
         }

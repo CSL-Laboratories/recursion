@@ -488,7 +488,7 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(shim.read_bytes(), b"@echo off\r\nexit /b 1\r\n")
 
     def test_checked_in_stream_fixtures_match_the_parsers(self) -> None:
-        from scripts.v3.harness.streams import assistant_text
+        from scripts.v3.harness.streams import assistant_text, claude_last_message
 
         names = sorted(path.name for path in FIXTURE_DIR.glob("*.txt"))
         self.assertEqual(
@@ -555,6 +555,30 @@ class HarnessTests(unittest.TestCase):
             for text in ("Review complete.", "VERDICT approve\n")
         )
         self.assertEqual(parse_verdict(two_messages)[0], "approve")
+        stale_verdict = "\n".join(
+            json.dumps(
+                {"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}
+            )
+            for text in ("VERDICT approve\n", "Need another pass.\n")
+        )
+        self.assertIn("VERDICT approve", stale_verdict)
+        self.assertEqual(claude_last_message(stale_verdict), "Need another pass.\n")
+        self.assertEqual(parse_verdict(stale_verdict)[0], "revise")
+        trailing_empty = "\n".join(
+            (
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {"content": [{"type": "text", "text": "VERDICT approve\n"}]},
+                    }
+                ),
+                json.dumps(
+                    {"type": "assistant", "message": {"content": [{"type": "text", "text": ""}]}},
+                ),
+            )
+        )
+        self.assertEqual(claude_last_message(trailing_empty), "VERDICT approve\n")
+        self.assertEqual(parse_verdict(trailing_empty)[0], "approve")
         tool_then_empty = json.dumps(
             {
                 "type": "assistant",

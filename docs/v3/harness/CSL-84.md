@@ -30,10 +30,13 @@ A published line that is not valid JSON is omitted, and the header says so.
 usage parsers read the stream fixtures. Claude verdict text is
 `message.content`, and the stream fixture's `result` string is different, so
 the test fails if the parser reads `result`. Separate assistant messages are
-joined with a newline. Inside one message, a `tool_use` block starts the
-next text on a new line, and an empty text block after that tool call keeps
-the break so a later `VERDICT` line stays readable. A stream with no
-assistant content still falls back to `result`. The doctor parser reads the
+joined with a newline for the displayed text. The verdict uses only the
+last assistant message that has text (`claude_last_message`). No verdict
+line in that message is revise, even when an earlier message said approve.
+An empty trailing message does not count. Inside one message, a `tool_use`
+block starts the next text on a new line, and an empty text block after
+that tool call keeps the break so a later `VERDICT` line stays readable. A
+stream with no assistant content still falls back to `result`. The doctor parser reads the
 Claude auth-status fixtures, including exit 1 with `loggedIn: true`. The
 redaction fixture's stdout contains `SECRET-TOKEN-VALUE`; the rendered doctor
 report does not.

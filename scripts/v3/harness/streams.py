@@ -66,16 +66,23 @@ def _nested_text(events: list[dict]) -> str:
             if isinstance(content, str):
                 parts.append(content)
             elif isinstance(content, list):
-                blocks = [
-                    block["text"]
-                    for block in content
-                    if isinstance(block, dict)
-                    and block.get("type") == "text"
-                    and isinstance(block.get("text"), str)
-                ]
-                # Keep block text contiguous. A line break stays only when a block already contains one.
-                if blocks:
-                    parts.append("".join(blocks))
+                chunks: list[str] = []
+                gap = False
+                for block in content:
+                    if (
+                        isinstance(block, dict)
+                        and block.get("type") == "text"
+                        and isinstance(block.get("text"), str)
+                    ):
+                        # Adjacent text stays one line. A dropped tool block is a line break.
+                        if gap and chunks:
+                            chunks.append("\n")
+                        chunks.append(block["text"])
+                        gap = False
+                    else:
+                        gap = True
+                if chunks:
+                    parts.append("".join(chunks))
         elif kind == "text" and isinstance(event.get("part"), dict):
             value = event["part"].get("text")
             if isinstance(value, str):

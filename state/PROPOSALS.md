@@ -74,7 +74,8 @@ growing, the default is to **stay monorepo** until the prerequisites above hold.
 ## P-002 — Replace the legacy branch name in `CONTROL_PLANE.md`
 
 - Date: 2026-10-15
-- Status: **proposed**. Not authorized. CSL-76 does not edit this protected path.
+- Status: **accepted** 2026-10-15. Lucas approved on PR #189 and required this update in
+  that PR. Applied as D-040.
 - Owner: Lucas.
 - Issue: [CSL-76](https://linear.app/csl-laboratories/issue/CSL-76).
 
@@ -96,6 +97,6 @@ Keep invariant 1's force-push, merge, and deployment limits. Name the review bra
 
 ### Non-goals
 
-- No edit to `CONTROL_PLANE.md`, `ANCHOR.md`, or `state/DECISIONS.md` in CSL-76.
+- No edit to `ANCHOR.md`.
 - No edit to `.github/workflows/**`. Workflow, pr-lint, script, and Claude/Devin
-  findings are listed on the CSL-76 PR for Lucas.
+  findings stay listed on the CSL-76 PR.

@@ -590,11 +590,12 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn("addition to Search/Extract", self.agents)
         self.assertIn("options, tradeoffs,", self.agents)
         self.assertIn("target metrics", self.agents)
-        self.assertIn("The developer decides", self.agents)
-        self.assertIn("a coding agent @mentions its developer", self.agents)
-        self.assertIn("does not decide", self.agents)
-        self.assertNotIn("then decide or @mention", self.agents)
-        self.assertIn("not an immediate `@codex review`", self.agents)
+        agents_flat = " ".join(self.agents.split())
+        self.assertIn("The developer decides", agents_flat)
+        self.assertIn("a coding agent @mentions its developer", agents_flat)
+        self.assertIn("does not decide", agents_flat)
+        self.assertNotIn("then decide or @mention", agents_flat)
+        self.assertIn("not an immediate `@codex review`", agents_flat)
         self.assertEqual(self.agents, CLAUDE_MD_PATH.read_text(encoding="utf-8"))
 
     def test_human_mention_job_is_not_daily_capped(self) -> None:

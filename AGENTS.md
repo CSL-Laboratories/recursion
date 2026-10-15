@@ -95,10 +95,11 @@ Linear MCP or the Devin Linear integration. Do not start code without `CSL-N`.
 
 **Direction and architecture.** When you are the assignee (developer or their
 coding agent working in the repo) of an issue that needs a decision or sets
-direction, run Parallel Task API deep research before proposing, in addition
-to Search/Extract. Post the cited brief (options, tradeoffs, recommendation,
-target metrics) on the Linear issue. The developer decides, or @mentions the
-approver; a coding agent @mentions its developer and does not decide.
+direction, run Parallel Task API deep research before proposing, in
+addition to Search/Extract. Post the cited brief (options, tradeoffs,
+recommendation, target metrics) on the Linear issue. The developer decides,
+or @mentions the approver; a coding agent @mentions its developer and does
+not decide.
 
 **Filing and shipping.**
 

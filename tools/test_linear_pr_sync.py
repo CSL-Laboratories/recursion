@@ -377,7 +377,7 @@ class HttpGuardTests(unittest.TestCase):
         self.assertEqual(snap.mergeable_state, "unknown")
         slept.assert_not_called()
 
-    def test_later_prs_retry_mergeable_under_shared_budget(self) -> None:
+    def test_later_prs_get_own_mergeable_retries(self) -> None:
         fetches: dict[int, int] = {n: 0 for n in range(1, 6)}
 
         def payload(number: int, state: str, mergeable: bool | None) -> dict[str, Any]:
@@ -415,9 +415,9 @@ class HttpGuardTests(unittest.TestCase):
         self.assertTrue(all(snap is not None and snap.mergeable_state == "dirty" for snap in snaps))
         self.assertTrue(all(count >= 2 for count in fetches.values()))
         self.assertEqual(slept.call_count, 5)
-        self.assertLessEqual(slept.call_count * mod.MERGEABLE_WAIT_S, mod.MERGEABLE_BUDGET_S)
+        self.assertLessEqual(slept.call_count * mod.MERGEABLE_WAIT_S, mod.MERGEABLE_DEADLINE_S)
 
-    def test_settle_mergeable_round_robin_respects_budget(self) -> None:
+    def test_settle_mergeable_deadline_caps_total_sleep(self) -> None:
         fetches: dict[int, int] = {}
 
         def payload(number: int) -> dict[str, Any]:
@@ -445,7 +445,7 @@ class HttpGuardTests(unittest.TestCase):
             return payload(number)
 
         client = mod.GitHubClient(cfg())
-        client._mergeable_budget_s = mod.MERGEABLE_WAIT_S * 2
+        client._mergeable_deadline_s = mod.MERGEABLE_WAIT_S * 2
         with mock.patch.object(client, "_request", side_effect=fake_request), mock.patch.object(
             mod.time, "sleep"
         ) as slept:
@@ -457,7 +457,7 @@ class HttpGuardTests(unittest.TestCase):
         self.assertEqual(fetches[13], 1)
         self.assertEqual([s.mergeable_state for s in snaps], ["unknown", "unknown", "unknown"])
 
-    def test_mergeable_retries_share_a_budget(self) -> None:
+    def test_load_pull_retries_are_per_pr(self) -> None:
         pending = {
             "number": 191,
             "title": "CSL-87: x",
@@ -477,19 +477,60 @@ class HttpGuardTests(unittest.TestCase):
         def fake_request(url: str, *, method: str = "GET") -> Any:
             if "/reviews" in url or "/files" in url:
                 return []
-            return pending
+            payload = dict(pending)
+            payload["number"] = int(url.rstrip("/").rsplit("/", 1)[-1])
+            return payload
 
         client = mod.GitHubClient(cfg())
-        client._mergeable_budget_s = mod.MERGEABLE_WAIT_S
         with mock.patch.object(client, "_request", side_effect=fake_request), mock.patch.object(
             mod.time, "sleep"
         ) as slept:
             first = client.load_pull(191)
             second = client.load_pull(192)
         assert first is not None and second is not None
-        self.assertEqual(slept.call_count, 1)
+        self.assertEqual(slept.call_count, 2 * mod.MERGEABLE_RETRIES)
         self.assertEqual(first.mergeable_state, "unknown")
         self.assertEqual(second.mergeable_state, "unknown")
+
+    def test_settle_refresh_error_does_not_abort_later_prs(self) -> None:
+        fetches: dict[int, int] = {}
+
+        def payload(number: int, state: str, mergeable: bool | None) -> dict[str, Any]:
+            return {
+                "number": number,
+                "title": f"CSL-87: pr {number}",
+                "html_url": f"https://github.com/CSL-Laboratories/recursion/pull/{number}",
+                "user": {"login": "a"},
+                "state": "open",
+                "draft": False,
+                "merged": False,
+                "mergeable": mergeable,
+                "mergeable_state": state,
+                "head": {
+                    "sha": "abc",
+                    "repo": {"full_name": "CSL-Laboratories/recursion"},
+                },
+            }
+
+        def fake_request(url: str, *, method: str = "GET") -> Any:
+            if "/reviews" in url or "/files" in url:
+                return []
+            number = int(url.rstrip("/").rsplit("/", 1)[-1])
+            fetches[number] = fetches.get(number, 0) + 1
+            if number == 11 and fetches[number] > 1:
+                raise TimeoutError("timed out")
+            if fetches[number] == 1:
+                return payload(number, "unknown", None)
+            return payload(number, "dirty", False)
+
+        client = mod.GitHubClient(cfg())
+        with mock.patch.object(client, "_request", side_effect=fake_request), mock.patch.object(
+            mod.time, "sleep"
+        ):
+            snaps = [client.load_pull(n, wait=False) for n in (11, 12)]
+            snaps = client.settle_mergeable(snaps)
+        self.assertEqual(snaps[0].mergeable_state, "unknown")
+        self.assertEqual(snaps[1].mergeable_state, "dirty")
 
     def test_reviews_paginate_until_devin_on_head(self) -> None:
         pr = {

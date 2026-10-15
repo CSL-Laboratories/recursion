@@ -36,7 +36,9 @@ BEHIND_STATES = frozenset({"dirty", "behind"})
 PENDING_MERGEABLE = frozenset({"", "unknown"})
 MERGEABLE_RETRIES = 3
 MERGEABLE_WAIT_S = 2.0
-MERGEABLE_BUDGET_S = 20.0
+# Run-wide sleep cap so a bulk refresh cannot fill the 5-minute job.
+# Each PR still has its own MERGEABLE_RETRIES allowance inside that window.
+MERGEABLE_DEADLINE_S = 90.0
 REVIEW_PAGES = 10
 FORBIDDEN_GITHUB_PATH = re.compile(
     r"/(merge|merge-upstream|resolve|dismissals)(/|$)",
@@ -233,7 +235,7 @@ class GitHubClient:
     def __init__(self, cfg: Config, opener: Callable[..., Any] | None = None) -> None:
         self.cfg = cfg
         self._opener = opener or urllib.request.urlopen
-        self._mergeable_budget_s = MERGEABLE_BUDGET_S
+        self._mergeable_deadline_s = MERGEABLE_DEADLINE_S
 
     def _request(self, url: str, *, method: str = "GET") -> Any:
         parsed = urlparse(url)
@@ -307,14 +309,8 @@ class GitHubClient:
         if not data or not data.get("number"):
             return None
         tries = 0
-        while (
-            wait
-            and mergeable_pending(data)
-            and tries < MERGEABLE_RETRIES
-            and self._mergeable_budget_s >= MERGEABLE_WAIT_S
-        ):
+        while wait and mergeable_pending(data) and tries < MERGEABLE_RETRIES:
             time.sleep(MERGEABLE_WAIT_S)
-            self._mergeable_budget_s -= MERGEABLE_WAIT_S
             data = self._request(url)
             tries += 1
         files_url = (
@@ -352,11 +348,12 @@ class GitHubClient:
         return f"{GITHUB_API}/repos/{self.cfg.owner}/{self.cfg.name}/pulls/{number}"
 
     def settle_mergeable(self, pulls: list[PullSnapshot]) -> list[PullSnapshot]:
-        """Round-robin extra fetches so later PRs share the mergeable wait budget.
+        """Give each pending PR its own mergeable retries, round-robin.
 
-        First snapshots come from load_pull(wait=False). This pass sleeps at most
-        MERGEABLE_WAIT_S per turn, caps each PR at MERGEABLE_RETRIES extra fetches,
-        and stops when the shared budget is gone — early PRs cannot spend it all.
+        First snapshots come from load_pull(wait=False). Each PR may sleep up to
+        MERGEABLE_RETRIES times. A run-wide deadline caps total sleep so a large
+        scan cannot fill the job timeout; it does not let early PRs spend later
+        PRs' retry allowance.
         """
         out = list(pulls)
         pending = [
@@ -365,13 +362,14 @@ class GitHubClient:
             if (pull.mergeable_state or "").strip().lower() in PENDING_MERGEABLE
         ]
         attempts = [0] * len(out)
-        while pending and self._mergeable_budget_s >= MERGEABLE_WAIT_S:
+        remaining = self._mergeable_deadline_s
+        while pending and remaining >= MERGEABLE_WAIT_S:
             index = pending.pop(0)
             time.sleep(MERGEABLE_WAIT_S)
-            self._mergeable_budget_s -= MERGEABLE_WAIT_S
+            remaining -= MERGEABLE_WAIT_S
             try:
                 data = self._request(self._pr_url(out[index].number))
-            except RuntimeError as exc:
+            except Exception as exc:  # noqa: BLE001 — keep refreshing later PRs
                 notice(f"PR #{out[index].number} mergeable refresh skipped: {exc}")
                 continue
             if not isinstance(data, dict) or not data.get("number"):

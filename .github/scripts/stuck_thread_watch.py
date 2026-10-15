@@ -154,6 +154,17 @@ def any_resolve_marker(body: str) -> bool:
     return f"<!-- {RESOLVE_PREFIX}:" in (body or "")
 
 
+CAP_MARKER_RE = re.compile(
+    rf"<!--\s*(?:{CITE_PREFIX}|{RESOLVE_PREFIX}):([^\s>]+)\s*-->",
+    re.IGNORECASE,
+)
+
+
+def resolve_cap_thread_ids(body: str) -> frozenset[str]:
+    """Thread ids from today's cite or success markers (one slot per thread)."""
+    return frozenset(match.group(1) for match in CAP_MARKER_RE.finditer(body or ""))
+
+
 def normalize_sha(value: str | None) -> str:
     text = (value or "").strip().lower()
     return text if SAFE_SHA_RE.fullmatch(text) else ""
@@ -498,20 +509,22 @@ def resolves_today(
     threads: Iterable[Thread],
     cfg: Config,
 ) -> int:
+    """Count unique threads that consumed a resolve slot today.
+
+    A cite without a success marker still counts: GraphQL may have closed
+    the thread before both marker writes failed. Cite + success marker
+    for the same thread is one slot.
+    """
     start = utc_day_start(cfg.now)
     seen: list[Comment] = []
     seen.extend(issue_comments)
     for thread in threads:
         seen.extend(thread.comments)
-    count = 0
+    ids: set[str] = set()
     for comment in seen:
-        if (
-            comment.created_at >= start
-            and any_resolve_marker(comment.body)
-            and _trusted_marker_comment(comment, cfg)
-        ):
-            count += 1
-    return count
+        if comment.created_at >= start and _trusted_marker_comment(comment, cfg):
+            ids.update(resolve_cap_thread_ids(comment.body))
+    return len(ids)
 
 
 def check_run_ok(node: dict[str, Any]) -> bool:
@@ -1400,7 +1413,9 @@ def resolve_eligible_thread(
     The on-thread cite is required before resolve. The success marker is
     written only after resolveReviewThread succeeds, so a later-open thread
     with that marker is a deliberate reopen. A cite without a success marker
-    is a failed resolve and may be retried.
+    is a failed resolve and may be retried. A GraphQL resolve that cannot
+    persist the success marker still consumes the daily cap (return True)
+    but does not increment counters.resolved.
     """
     refresher = getattr(github, "refresh_head", None)
     if callable(refresher):
@@ -1456,9 +1471,12 @@ def resolve_eligible_thread(
         counters.resolve_failed += 1
         notice(
             f"resolved PR #{pull.number} {thread.id} without a success marker; "
-            "not counting as success so a later reopen cannot be auto-closed"
+            "cap consumed, but not counted as success so a later reopen "
+            "cannot be auto-closed"
         )
-        return pull, False
+        # True: GraphQL resolve succeeded, so this run and later scans
+        # (via the on-thread cite) consume a daily-cap slot.
+        return pull, True
     counters.resolved += 1
     log(f"resolved PR #{pull.number} thread {thread.id} on {pull.head_sha[:12]}")
     return pull, True

@@ -976,6 +976,19 @@ class VerdictAndResolveTests(unittest.TestCase):
             "resolve",
         )
 
+    def test_cite_and_resolve_markers_count_as_one_cap_slot(self) -> None:
+        comments = [
+            comment("pat-user", f"{mod.cite_marker('PRRT_1')}\nHEAD {HEAD}", hours_ago=1),
+            comment("pat-user", mod.resolve_marker("PRRT_1"), hours_ago=1),
+            comment("pat-user", f"{mod.cite_marker('PRRT_2')}\nHEAD {HEAD}", hours_ago=1),
+            comment("mallory", mod.resolve_marker("PRRT_3"), hours_ago=1),
+            comment("pat-user", mod.resolve_marker("PRRT_2"), hours_ago=30),
+        ]
+        self.assertEqual(
+            mod.resolves_today(comments, (), cfg(mediator_login="pat-user")),
+            2,
+        )
+
     def test_both_success_markers_fail_does_not_count_resolved(self) -> None:
         class BoomMarkers(FakeGitHub):
             def post_comment(self, number: int, body: str) -> None:
@@ -1002,6 +1015,66 @@ class VerdictAndResolveTests(unittest.TestCase):
             any("<!-- codex-thread-resolved:" in body for _, body in gh.comments)
         )
         self.assertEqual(mod.exit_code(counters), 1)
+
+    def test_unmarked_resolve_still_consumes_daily_cap(self) -> None:
+        class FirstUnmarked(FakeGitHub):
+            def post_comment(self, number: int, body: str) -> None:
+                if "codex-thread-resolved:PRRT_0" in body:
+                    raise RuntimeError("403 comment")
+                super().post_comment(number, body)
+
+            def reply_on_thread(self, thread_id: str, body: str) -> None:
+                if thread_id == "PRRT_0" and "codex-thread-resolved" in body:
+                    raise RuntimeError("403 reply")
+                super().reply_on_thread(thread_id, body)
+
+        threads = []
+        comments = []
+        reviews = []
+        for i in range(4):
+            tid = f"PRRT_{i}"
+            threads.append(thread(tid=tid, comments=stuck_pair()))
+            comments.append(comment("pat-user", mod.mediation_marker(tid), hours_ago=0.4))
+            reviews.append(comment(CODEX, verdict_block(tid), hours_ago=0.1))
+        gh = FirstUnmarked(
+            [pull(threads=threads, issue_comments=comments, reviews=reviews)]
+        )
+        counters = mod.scan(cfg(mediator_login="pat-user"), gh, FakeLinear())  # type: ignore[arg-type]
+        self.assertEqual(gh.resolves, ["PRRT_0", "PRRT_1", "PRRT_2"])
+        self.assertEqual(counters.resolved, 2)
+        self.assertEqual(counters.resolve_failed, 1)
+        self.assertEqual(counters.skipped_resolve_cap, 1)
+        self.assertEqual(mod.exit_code(counters), 1)
+
+    def test_todays_cites_count_toward_resolve_cap(self) -> None:
+        old = [
+            thread(
+                tid=f"PRRT_old{i}",
+                comments=stuck_pair()
+                + [
+                    comment(
+                        "pat-user",
+                        f"{mod.cite_marker(f'PRRT_old{i}')}\nHEAD {HEAD}",
+                        hours_ago=1,
+                    )
+                ],
+                resolved=True,
+            )
+            for i in range(3)
+        ]
+        new = thread(tid="PRRT_new", comments=stuck_pair())
+        asked = [comment("pat-user", mod.mediation_marker("PRRT_new"), hours_ago=0.4)]
+        ruling = comment(CODEX, verdict_block("PRRT_new"), hours_ago=0.1)
+        p = pull(threads=[*old, new], issue_comments=asked, reviews=[ruling])
+        self.assertEqual(
+            mod.resolves_today(p.issue_comments, p.threads, cfg(mediator_login="pat-user")),
+            3,
+        )
+        gh = FakeGitHub([p])
+        counters = mod.scan(cfg(mediator_login="pat-user"), gh, FakeLinear())  # type: ignore[arg-type]
+        self.assertEqual(counters.resolved, 0)
+        self.assertEqual(counters.skipped_resolve_cap, 1)
+        self.assertEqual(gh.resolves, [])
 
     def test_already_resolved_thread_is_skipped(self) -> None:
         t = thread(tid="PRRT_1", comments=stuck_pair(), resolved=True)

@@ -7,6 +7,7 @@ is set. The harness does not read or store credentials.
 from __future__ import annotations
 
 import re
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -222,24 +223,34 @@ class GrokHeadlessProvider(HeadlessCLI):
     )
     CAPABILITIES = ("execute", "streaming-json", "subscription")
 
-    def argv(self, request: ProviderRequest) -> tuple[str, ...]:
+    def argv(self, request: ProviderRequest, prompt: Path | None = None) -> tuple[str, ...]:
         argv = list(self.STATIC_ARGV)
-        argv.extend(["--prompt-file", str(grok_prompt_path(request.packet_id))])
+        path = grok_prompt_path(request.packet_id) if prompt is None else prompt
+        argv.extend(["--prompt-file", str(path)])
         if request.cwd:
             argv.extend(["--cwd", request.cwd])
         return tuple(argv)
 
     def prepare(self, request: ProviderRequest) -> _Prepared:
-        path = grok_prompt_path(request.packet_id)
-        path.write_text(request.task, encoding="utf-8")
+        # mkdtemp creates a fresh 0700 directory, so no other local user can
+        # precreate, read or swap the prompt file.
+        directory = Path(tempfile.mkdtemp(prefix="recursion-grok-"))
+        path = directory / grok_prompt_path(request.packet_id).name
+        try:
+            path.write_text(request.task, encoding="utf-8")
+        except OSError:
+            shutil.rmtree(directory, ignore_errors=True)
+            raise
 
         def cleanup() -> None:
-            path.unlink(missing_ok=True)
+            shutil.rmtree(directory, ignore_errors=True)
 
-        return _Prepared(self.argv(request), None, cleanup)
+        return _Prepared(self.argv(request, path), None, cleanup)
 
 
 def grok_prompt_path(packet_id: str) -> Path:
+    """Name of the prompt file for a packet. ``prepare`` places it in a private directory."""
+
     safe = _PROMPT_ID.sub("", packet_id)[:80] or "task"
     return Path(tempfile.gettempdir()) / f"recursion-grok-{safe}.txt"
 
@@ -281,6 +292,10 @@ def _noop() -> None:
 
 
 def _default_runner(argv: list[str], stdin_text: str | None, timeout: int, cwd: str | None):
+    # CreateProcess only appends .exe, so resolve npm .cmd shims first.
+    resolved = shutil.which(argv[0])
+    if resolved is not None:
+        argv = [resolved, *argv[1:]]
     return subprocess.run(
         argv,
         input=stdin_text,

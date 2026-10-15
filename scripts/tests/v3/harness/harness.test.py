@@ -208,20 +208,22 @@ class HarnessTests(unittest.TestCase):
     def test_grok_adapter_writes_the_prompt_and_returns_stdout(self) -> None:
         request = ProviderRequest(task="Say hello", packet_id="run-aabbccddeeff", kind="review")
         path = grok_prompt_path(request.packet_id)
-        seen: dict[str, bool] = {}
+        seen: dict = {}
 
         def runner(argv, stdin_text, timeout, cwd):
             del stdin_text, timeout, cwd
             self.assertIn("--prompt-file", argv)
             prompt = Path(argv[argv.index("--prompt-file") + 1])
-            self.assertEqual(prompt, path)
+            self.assertEqual(prompt.name, path.name)
+            self.assertNotEqual(prompt, path)
             self.assertEqual(prompt.read_text(encoding="utf-8"), "Say hello")
             seen["during"] = True
+            seen["path"] = prompt
             return _completed(argv, 0, stdout=GROK_APPROVE)
 
         result = GrokHeadlessProvider().execute(request, allow_live=True, runner=runner)
         self.assertTrue(seen["during"])
-        self.assertFalse(path.exists())
+        self.assertFalse(seen["path"].parent.exists())
         self.assertEqual(parse_verdict(result.text)[0], "approve")
         self.assertTrue(result.live)
 

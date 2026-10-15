@@ -149,7 +149,7 @@ def _provider_row(item: dict, *, platform: str, home: Path, path: str, run) -> d
         version=version,
         signed_in=signed_in,
         auth_method=auth_method,
-        usable=installed,
+        usable=installed and signed_in != "signed-out",
     )
 
 

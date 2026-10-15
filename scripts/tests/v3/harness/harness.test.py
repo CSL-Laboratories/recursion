@@ -423,7 +423,9 @@ class HarnessTests(unittest.TestCase):
             enabled = {item["name"] for item in written["providers"] if item["enabled"]}
             self.assertEqual(enabled, {"fixture", "fixture-b"})
             self.assertEqual(written["budgets"]["max_input_tokens"], DEFAULT_MAX_INPUT_TOKENS)
-            self.assertIn(str(target), stdout.getvalue())
+            emitted = json.loads(stdout.getvalue())
+            self.assertEqual(set(emitted["enabled"]), {"fixture", "fixture-b"})
+            self.assertEqual(Path(emitted["path"]), target)
 
     def test_windows_shim_resolves_and_posix_does_not(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -658,10 +660,11 @@ class HarnessTests(unittest.TestCase):
                 open_adapter=lambda name: Watch("fixture", "hello"),
             )
             cwd = Path(str(seen["cwd"]))
+            expected = (state / record["run_id"] / "workspace").resolve()
             self.assertTrue(seen["allow_live"])
-            self.assertEqual(cwd, state / record["run_id"] / "workspace")
-            self.assertTrue(cwd.is_dir())
-            self.assertEqual(record["workspace"], str(cwd))
+            self.assertEqual(cwd.resolve(), expected)
+            self.assertTrue(expected.is_dir())
+            self.assertEqual(Path(str(record["workspace"])).resolve(), expected)
             if os.name == "posix":
                 self.assertEqual(cwd.stat().st_mode & 0o777, 0o700)
                 self.assertEqual(cwd.parent.stat().st_mode & 0o777, 0o700)

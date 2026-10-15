@@ -9,9 +9,10 @@ from this checkout; each tree supplies only its planning kernel.
     python -X utf8 -B tools/perf_ci.py
 
 CI sets CI_BASE_SHA to the pull request base. PERF_REGRESSION_RATIO overrides
-the default 1.10 limit. Regressions print GitHub warning annotations and a
-step summary, then exit 0. A harness crash, missing kernel, or invalid report
-exits 1.
+the default 1.10 limit. PERF_ABSOLUTE_FLOOR_S overrides the default 50 us
+floor. A warning requires both. Regressions print GitHub warning annotations
+and a step summary, then exit 0. A harness crash, missing kernel, or invalid
+report exits 1.
 """
 from __future__ import annotations
 
@@ -43,6 +44,19 @@ def _ratio_limit() -> float:
         raise PerfCIError(f"PERF_REGRESSION_RATIO={raw!r} is not a number") from exc
     if value <= 1:
         raise PerfCIError("PERF_REGRESSION_RATIO must be greater than 1")
+    return value
+
+
+def _absolute_floor() -> float:
+    raw = os.environ.get("PERF_ABSOLUTE_FLOOR_S", "").strip()
+    if not raw:
+        return perf_compare.DEFAULT_ABSOLUTE_FLOOR_S
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise PerfCIError(f"PERF_ABSOLUTE_FLOOR_S={raw!r} is not a number") from exc
+    if value < 0:
+        raise PerfCIError("PERF_ABSOLUTE_FLOOR_S must be >= 0")
     return value
 
 
@@ -110,7 +124,8 @@ def _print_side(label: str, report: dict) -> None:
     for row in report["benchmarks"]:
         print(
             f"PERF_BENCH side={label} name={row['name']} median_s={row['median_s']:.9f} "
-            f"rounds={row['rounds']} iters={row['iterations_per_round']}",
+            f"rounds={row['rounds']} repeats={row.get('repeats', 1)} "
+            f"iters={row['iterations_per_round']}",
             flush=True,
         )
 
@@ -121,6 +136,7 @@ def main() -> int:
     tree: Path | None = None
     try:
         limit = _ratio_limit()
+        floor = _absolute_floor()
         if not base_sha or base_sha == "0" * 40:
             head = run_suite(HARNESS_ROOT)
             _print_side("head", head)
@@ -131,7 +147,9 @@ def main() -> int:
         baseline, head = run_paired(tree, HARNESS_ROOT)
         _print_side("base", baseline)
         _print_side("head", head)
-        report = perf_compare.compare_reports(baseline, head, ratio_limit=limit)
+        report = perf_compare.compare_reports(
+            baseline, head, ratio_limit=limit, absolute_floor_s=floor,
+        )
         _emit(report, baseline_label=base_sha[:12], candidate_label="head")
         print(f"PERF_CI_SECONDS={time.perf_counter() - started:.3f}", flush=True)
         print(f"PERF_REGRESSIONS={len(report['regressions'])}", flush=True)

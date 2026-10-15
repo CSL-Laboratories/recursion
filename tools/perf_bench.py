@@ -29,6 +29,7 @@ DEFAULT_WARMUP_MS = 30
 # Paired PR comparison. Rounds alternate which side goes first so a warm cache
 # does not land on only one tree. 8 * 50ms * 2 sides * 4 benches is a few seconds.
 PAIRED_ROUNDS = 8
+PAIRED_REPEATS = 3
 PAIRED_ROUND_S = 0.05
 PAIRED_WARMUP_S = 0.02
 PAIRED_DEADLINE_S = 40
@@ -269,10 +270,33 @@ def _timed_call(fn, iterations: int) -> float:
     return elapsed / iterations
 
 
-def measure_pair(base_fn, head_fn, *, rounds: int, round_s: float, warmup_s: float) -> tuple[dict, dict]:
-    """Interleave both sides and return median seconds per call for each."""
+def _one_pass(base_fn, head_fn, *, rounds: int, base_iters: int, head_iters: int) -> tuple[list[float], list[float]]:
+    base_samples: list[float] = []
+    head_samples: list[float] = []
+    for index in range(rounds):
+        if index % 2 == 0:
+            base_samples.append(_timed_call(base_fn, base_iters))
+            head_samples.append(_timed_call(head_fn, head_iters))
+        else:
+            head_samples.append(_timed_call(head_fn, head_iters))
+            base_samples.append(_timed_call(base_fn, base_iters))
+    return base_samples, head_samples
+
+
+def measure_pair(
+    base_fn,
+    head_fn,
+    *,
+    rounds: int,
+    round_s: float,
+    warmup_s: float,
+    repeats: int = PAIRED_REPEATS,
+) -> tuple[dict, dict]:
+    """Interleave both sides. The reported time is the median of repeat medians."""
     if rounds < 2 or rounds % 2:
         raise BenchError("paired rounds must be an even number >= 2")
+    if repeats < 1:
+        raise BenchError("repeats must be >= 1")
     for fn in (base_fn, head_fn):
         deadline = time.perf_counter() + warmup_s
         while time.perf_counter() < deadline:
@@ -284,20 +308,35 @@ def measure_pair(base_fn, head_fn, *, rounds: int, round_s: float, warmup_s: flo
     # side cannot multiply the fast side's iteration count and blow the deadline.
     base_iters = _calibrate_iterations(base_fn, round_s)
     head_iters = _calibrate_iterations(head_fn, round_s)
+    base_passes: list[float] = []
+    head_passes: list[float] = []
     base_samples: list[float] = []
     head_samples: list[float] = []
-    for index in range(rounds):
-        if index % 2 == 0:
-            base_samples.append(_timed_call(base_fn, base_iters))
-            head_samples.append(_timed_call(head_fn, head_iters))
-        else:
-            head_samples.append(_timed_call(head_fn, head_iters))
-            base_samples.append(_timed_call(base_fn, base_iters))
+    for _repeat in range(repeats):
+        base_round, head_round = _one_pass(
+            base_fn, head_fn, rounds=rounds, base_iters=base_iters, head_iters=head_iters,
+        )
+        base_passes.append(_positive_median(base_round))
+        head_passes.append(_positive_median(head_round))
+        base_samples.extend(base_round)
+        head_samples.extend(head_round)
     return (
-        {"median_s": _positive_median(base_samples), "samples_s": base_samples,
-         "rounds": rounds, "iterations_per_round": base_iters},
-        {"median_s": _positive_median(head_samples), "samples_s": head_samples,
-         "rounds": rounds, "iterations_per_round": head_iters},
+        {
+            "median_s": _positive_median(base_passes),
+            "pass_medians_s": base_passes,
+            "samples_s": base_samples,
+            "rounds": rounds,
+            "repeats": repeats,
+            "iterations_per_round": base_iters,
+        },
+        {
+            "median_s": _positive_median(head_passes),
+            "pass_medians_s": head_passes,
+            "samples_s": head_samples,
+            "rounds": rounds,
+            "repeats": repeats,
+            "iterations_per_round": head_iters,
+        },
     )
 
 
@@ -325,6 +364,7 @@ def run_paired(
     candidate_root: Path,
     *,
     rounds: int = PAIRED_ROUNDS,
+    repeats: int = PAIRED_REPEATS,
     round_s: float = PAIRED_ROUND_S,
     warmup_s: float = PAIRED_WARMUP_S,
     deadline_s: float = PAIRED_DEADLINE_S,
@@ -356,7 +396,8 @@ def run_paired(
             raise BenchError(f"paired benchmark exceeded {deadline_s:.0f}s")
         try:
             base_sample, head_sample = measure_pair(
-                base_fn, head_fn, rounds=rounds, round_s=round_s, warmup_s=warmup_s,
+                base_fn, head_fn,
+                rounds=rounds, repeats=repeats, round_s=round_s, warmup_s=warmup_s,
             )
         except BenchError:
             raise

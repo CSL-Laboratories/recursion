@@ -67,6 +67,43 @@ class CompareTests(unittest.TestCase):
 
     def test_default_limit_is_about_ten_percent(self) -> None:
         self.assertEqual(perf_compare.DEFAULT_RATIO_LIMIT, 1.10)
+        self.assertEqual(perf_compare.DEFAULT_ABSOLUTE_FLOOR_S, 50e-6)
+
+    def test_percent_without_absolute_floor_is_not_a_regression(self) -> None:
+        # +20% of 100 us is 20 us, under the 50 us floor.
+        report = perf_compare.compare_reports(
+            _report({"decode_command": 100e-6}),
+            _report({"decode_command": 120e-6}),
+        )
+        self.assertFalse(report["flagged"])
+        self.assertEqual(report["rows"][0]["status"], "within_floor")
+
+    def test_percent_and_absolute_floor_both_required(self) -> None:
+        report = perf_compare.compare_reports(
+            _report({"canonical_digest": 1e-3}),
+            _report({"canonical_digest": 1.2e-3}),
+        )
+        self.assertTrue(report["flagged"])
+        self.assertEqual(report["rows"][0]["status"], "regression")
+        self.assertGreater(report["rows"][0]["delta_s"], perf_compare.DEFAULT_ABSOLUTE_FLOOR_S)
+
+    def test_absolute_floor_is_strict(self) -> None:
+        # Binary-exact seconds so the equality check is not a float artifact.
+        floor = 0.125
+        baseline = 0.5
+        equal = perf_compare.compare_reports(
+            _report({"canonical_digest": baseline}),
+            _report({"canonical_digest": baseline + floor}),
+            absolute_floor_s=floor,
+        )
+        self.assertFalse(equal["flagged"])
+        self.assertEqual(equal["rows"][0]["status"], "within_floor")
+        over = perf_compare.compare_reports(
+            _report({"canonical_digest": baseline}),
+            _report({"canonical_digest": baseline + floor + 0.0625}),
+            absolute_floor_s=floor,
+        )
+        self.assertTrue(over["flagged"])
 
     def test_zero_median_is_rejected(self) -> None:
         with self.assertRaises(perf_compare.CompareError):
@@ -76,7 +113,7 @@ class CompareTests(unittest.TestCase):
 class BenchTests(unittest.TestCase):
     def test_paired_run_times_both_sides(self) -> None:
         baseline, candidate = perf_bench.run_paired(
-            ROOT, ROOT, rounds=2, round_s=0.005, warmup_s=0.001,
+            ROOT, ROOT, rounds=2, repeats=1, round_s=0.005, warmup_s=0.001,
         )
         self.assertEqual(baseline["provider_calls"], 0)
         self.assertEqual(candidate["provider_calls"], 0)
@@ -84,6 +121,21 @@ class BenchTests(unittest.TestCase):
             [row["name"] for row in baseline["benchmarks"]],
             [row["name"] for row in candidate["benchmarks"]],
         )
+
+    def test_measure_pair_reports_median_of_repeats(self) -> None:
+        def work() -> int:
+            total = 0
+            for value in range(40):
+                total += value
+            return total
+
+        base, head = perf_bench.measure_pair(
+            work, work, rounds=2, repeats=3, round_s=0.002, warmup_s=0.0,
+        )
+        self.assertEqual(base["repeats"], 3)
+        self.assertEqual(len(base["pass_medians_s"]), 3)
+        self.assertEqual(base["median_s"], perf_bench._positive_median(base["pass_medians_s"]))
+        self.assertEqual(head["median_s"], perf_bench._positive_median(head["pass_medians_s"]))
 
     def test_short_suite_is_provider_free(self) -> None:
         report = perf_bench.run_suite(ROOT, rounds=2, round_s=0.005, warmup_s=0.005)

@@ -43,9 +43,41 @@ def assistant_text(raw: str) -> str:
             value = event.get(key)
             if isinstance(value, str) and value.strip():
                 return value
+    nested = _nested_text(events)
+    if nested:
+        return nested
     if plain:
         return "\n".join(plain)
     return ""
+
+
+def _nested_text(events: list[dict]) -> str:
+    """Join assistant text from Gemini, Cursor and OpenCode event shapes."""
+
+    parts: list[str] = []
+    for event in events:
+        kind = event.get("type")
+        if kind == "message" and event.get("role") == "assistant":
+            content = event.get("content")
+            if isinstance(content, str):
+                parts.append(content)
+        elif kind == "assistant" and isinstance(event.get("message"), dict):
+            content = event["message"].get("content")
+            if isinstance(content, str):
+                parts.append(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if (
+                        isinstance(block, dict)
+                        and block.get("type") == "text"
+                        and isinstance(block.get("text"), str)
+                    ):
+                        parts.append(block["text"])
+        elif kind == "text" and isinstance(event.get("part"), dict):
+            value = event["part"].get("text")
+            if isinstance(value, str):
+                parts.append(value)
+    return "".join(parts)
 
 
 def _object(line: str) -> dict | None:

@@ -41,7 +41,7 @@ def run_task(
     worker, reviewers = select_route(config, provider)
     opener = open_provider if open_adapter is None else open_adapter
     run_id = new_run_id() if run_id is None else run_id
-    run_branch = _branch_name(run_branch)
+    run_branch = _branch_name(run_branch, repo)
     budgets = config["budgets"]
     usage = empty_usage()
     reviews: list[dict] = []
@@ -233,7 +233,7 @@ def _finish(config, state_dir, **fields) -> dict:
         "reviews": _scrub(fields["reviews"], secrets),
         "run_id": fields["run_id"],
         "status": fields["status"],
-        "task": fields["task"],
+        "task": _scrub(fields["task"], secrets),
         "text": text,
         "usage": fields["usage"],
     }
@@ -246,10 +246,10 @@ def _finish(config, state_dir, **fields) -> dict:
     branch = fields.get("run_branch")
     if branch:
         record["run_branch"] = branch
-        if record["accepted"]:
-            reviewed = _branch_tip(repo, branch)
-            if reviewed:
-                record["reviewed_commit"] = reviewed
+    if record["accepted"]:
+        reviewed = _branch_tip(repo, branch or f"recursion/run/{fields['run_id']}")
+        if reviewed:
+            record["reviewed_commit"] = reviewed
     save_run(state_dir, record)
     append_event(
         state_dir,
@@ -295,11 +295,24 @@ def _branch_tip(repo: Path | None, branch: str) -> str | None:
     return sha
 
 
-def _branch_name(name: str | None) -> str | None:
+def _branch_name(name: str | None, repo: Path | None = None) -> str | None:
     if name is None:
         return None
     if not isinstance(name, str) or name != name.strip() or not name:
         raise HarnessError("invalid branch name")
     if name.startswith("-") or any(char in name for char in "\n\r "):
         raise HarnessError("invalid branch name")
+    if repo is not None:
+        try:
+            checked = subprocess.run(
+                ["git", "check-ref-format", "--branch", name],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            return name
+        if checked.returncode != 0:
+            raise HarnessError("invalid branch name")
     return name

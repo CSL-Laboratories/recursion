@@ -325,13 +325,13 @@ class OpenCodeHeadlessProvider(HeadlessCLI):
     def argv(self, request: ProviderRequest) -> tuple[str, ...]:
         argv = _with_flag(self.STATIC_ARGV, "--dir", request.cwd)
         if _prompt_fits(request.task):
-            return argv + (request.task,)
+            return argv + ("--", request.task)
         return argv + (_OPENCODE_LONG_PROMPT, "--file", "<prompt-file>")
 
     def prepare(self, request: ProviderRequest) -> _Prepared:
         argv = _with_flag(self.STATIC_ARGV, "--dir", request.cwd)
         if _prompt_fits(request.task):
-            return _Prepared(argv + (request.task,), None, _noop)
+            return _Prepared(argv + ("--", request.task), None, _noop)
         path = _write_private_prompt(request.task, prefix="recursion-opencode-", label="opencode")
 
         def cleanup() -> None:

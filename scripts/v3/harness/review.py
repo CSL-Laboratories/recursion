@@ -42,7 +42,11 @@ def parse_verdict(text: str) -> tuple[str, str]:
         else:
             # Verdict comes from the last message. Its notes come first so a
             # long earlier message cannot crowd them out of NOTE_LIMIT.
-            final = lines[:index] + lines[index + 1 :]
+            final = [
+                line
+                for pos, line in enumerate(lines)
+                if pos != index and _VERDICT.fullmatch(line) is None
+            ]
             earlier = [
                 line
                 for line in full[: max(len(full) - len(lines), 0)]

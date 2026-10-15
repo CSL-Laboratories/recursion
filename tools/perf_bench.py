@@ -280,23 +280,24 @@ def measure_pair(base_fn, head_fn, *, rounds: int, round_s: float, warmup_s: flo
     for _ in range(8):
         base_fn()
         head_fn()
-    iterations = max(
-        _calibrate_iterations(base_fn, round_s),
-        _calibrate_iterations(head_fn, round_s),
-    )
+    # Per-side counts keep each round near round_s, so a large regression on one
+    # side cannot multiply the fast side's iteration count and blow the deadline.
+    base_iters = _calibrate_iterations(base_fn, round_s)
+    head_iters = _calibrate_iterations(head_fn, round_s)
     base_samples: list[float] = []
     head_samples: list[float] = []
     for index in range(rounds):
         if index % 2 == 0:
-            base_samples.append(_timed_call(base_fn, iterations))
-            head_samples.append(_timed_call(head_fn, iterations))
+            base_samples.append(_timed_call(base_fn, base_iters))
+            head_samples.append(_timed_call(head_fn, head_iters))
         else:
-            head_samples.append(_timed_call(head_fn, iterations))
-            base_samples.append(_timed_call(base_fn, iterations))
-    shared = {"rounds": rounds, "iterations_per_round": iterations}
+            head_samples.append(_timed_call(head_fn, head_iters))
+            base_samples.append(_timed_call(base_fn, base_iters))
     return (
-        {"median_s": _positive_median(base_samples), "samples_s": base_samples, **shared},
-        {"median_s": _positive_median(head_samples), "samples_s": head_samples, **shared},
+        {"median_s": _positive_median(base_samples), "samples_s": base_samples,
+         "rounds": rounds, "iterations_per_round": base_iters},
+        {"median_s": _positive_median(head_samples), "samples_s": head_samples,
+         "rounds": rounds, "iterations_per_round": head_iters},
     )
 
 

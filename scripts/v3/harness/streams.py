@@ -69,12 +69,45 @@ def _object(line: str) -> dict | None:
     return None
 
 
+def claude_last_message(raw: str) -> str | None:
+    """Return the last Claude assistant message that has text.
+
+    ``None`` when the stream has no such message, so other providers keep
+    their own text. A verdict is read from this message only. An earlier
+    message's verdict does not apply when this message has no verdict line.
+    """
+
+    messages = _claude_messages(_events(raw))
+    if not messages:
+        return None
+    return messages[-1]
+
+
+def _events(raw: str) -> list[dict]:
+    events: list[dict] = []
+    for line in raw.splitlines():
+        payload = _object(line.strip())
+        if payload is not None:
+            events.append(payload)
+    return events
+
+
 def _claude_text(events: list[dict]) -> str:
     """Join Claude ``assistant`` message content, one line break between messages.
 
-    Text blocks inside one message stay adjacent. The caller falls back to the
-    ``result`` string only when no assistant text exists.
+    Text blocks inside one message stay adjacent. A non-text block such as
+    ``tool_use`` starts the next text block on a new line. An empty text
+    block after that tool call keeps the break, so a later ``VERDICT`` line
+    is not glued to the previous sentence. The caller falls back to the
+    ``result`` string only when no assistant text exists. Verdict parsing
+    uses ``claude_last_message``, not this joined text.
     """
+
+    return "\n".join(_claude_messages(events))
+
+
+def _claude_messages(events: list[dict]) -> list[str]:
+    """Claude assistant messages that have text, in stream order."""
 
     messages: list[str] = []
     for event in events:
@@ -83,27 +116,32 @@ def _claude_text(events: list[dict]) -> str:
         message = event.get("message")
         if not isinstance(message, dict):
             continue
-        parts: list[str] = []
-        content = message.get("content")
-        if isinstance(content, str):
-            if content.strip():
-                parts.append(content)
-        elif isinstance(content, list):
+        text = _claude_content_text(message.get("content"))
+        if text.strip():
+            messages.append(text)
+    return messages
+
+
+def _claude_content_text(content: object) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    chunks: list[str] = []
+    gap = False
+    for block in content:
+        if (
+            isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+        ):
+            if gap and chunks:
+                chunks.append("\n")
+            chunks.append(block["text"])
             gap = False
-            for block in content:
-                if not isinstance(block, dict) or block.get("type") != "text":
-                    gap = True
-                    continue
-                value = block.get("text")
-                if not isinstance(value, str) or not value.strip():
-                    continue
-                if gap and parts:
-                    parts.append("\n")
-                parts.append(value)
-                gap = False
-        if parts:
-            messages.append("".join(parts))
-    return "\n".join(messages)
+        else:
+            gap = True
+    return "".join(chunks)
 
 
 def _grok_text(events: list[dict]) -> str:

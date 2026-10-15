@@ -81,12 +81,12 @@ growing, the default is to **stay monorepo** until the prerequisites above hold.
 
 ### Motivation
 
-Current operating docs (`AGENTS.md`, `CLAUDE.md`, `CONTRIBUTING.md`, the PR template,
-`docs/v3/START-HERE.md`, and `docs/v3/RESEARCH-SCOPE.md`) name review branches
-`csl-<N>-<slug>`, with an optional GitHub username prefix. Invariant 1 of
-`CONTROL_PLANE.md` still tells agents to commit to `loop/work/<task-id>`. That file
-outranks the operating docs on conflict, and changing it needs an Owner authoring
-session recorded in `state/DECISIONS.md`.
+Historical, as of the proposal on 2026-10-15. The operating docs already named review
+branches `csl-<N>-<slug>`, with an optional GitHub username prefix, while invariant 1
+of `CONTROL_PLANE.md` still told agents to commit to `loop/work/<task-id>`. That file
+outranked the operating docs, so the change needed an Owner authoring session recorded
+in `state/DECISIONS.md`. D-040 applied that session. Invariant 1 no longer names
+`loop/work/<task-id>`.
 
 ### Proposed replacement
 

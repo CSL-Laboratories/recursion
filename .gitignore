@@ -108,3 +108,6 @@ state/.intake-watermark
 # presence depends on which branch is checked out is not a safety control. Same class as
 # events.jsonl: state ON the box, not in its history.
 state/PAUSE
+
+# Harness run records (CSL-27). Runtime state, not review history.
+.recursion/

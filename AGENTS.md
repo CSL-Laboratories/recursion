@@ -146,7 +146,9 @@ label, not by editing config.
   MEMBER commenter. Fork and nonmember PRs are not auto-fixed.
 - **Stuck-thread watch** (`.github/workflows/stuck-thread-watch.yml`) asks Codex
   to mediate Devin threads Claude could not settle. Codex is a mediator, not a
-  reviewer of record and not a fixer: it must not push code.
+  reviewer of record and not a fixer: it must not push code. The workflow may
+  auto-resolve a thread after a trusted `CODEX-THREAD: RESOLVE` ruling (see
+  [Review loop](#review-loop)).
 - **Blacksmith** is the only CI.
 - Cursor, Codex, Grok, and interactive Claude Code develop features from Linear
   issues. They must not post review verdicts or run review-fix loops on other
@@ -162,8 +164,20 @@ still open more than six hours (configurable) after Claude's last reply —
 [`.github/workflows/stuck-thread-watch.yml`](.github/workflows/stuck-thread-watch.yml)
 posts one `@codex review` comment (via `CODEX_TRIGGER_PAT`; skipped with a
 notice if that secret is missing) and files a Linear Triage issue labelled
-`needs-decision`. Humans decide. Caps: one mediation per thread, three per PR
-per UTC day. The watcher never resolves threads, pushes, or merges.
+`needs-decision`. Codex is asked to emit a per-thread
+`CODEX-THREAD: RESOLVE|DECIDE|MISSING|AMBIGUOUS` block plus the inspected
+`HEAD` SHA. If the ruling is `RESOLVE`, that SHA is the PR's current head,
+and required checks on that head are green, the watcher replies on the
+thread citing the ruling and SHA, then resolves it
+(`resolveReviewThread` via `CODEX_TRIGGER_PAT` — the same user token that
+posted `@codex review`. `github.token` stays `pull-requests: read` and
+would otherwise attribute the resolve to `github-actions[bot]`).
+`DECIDE`, `MISSING`, `AMBIGUOUS`, a stale HEAD, or pending/failing
+required checks stay on the needs-decision path. Human-authored threads
+are never resolved unless Codex was explicitly asked about them (trusted
+mediation marker or a human `@codex review` that names the thread id).
+Caps: one mediation per thread and one auto-resolve per thread; three of
+each per PR per UTC day. The watcher never pushes or merges.
 
 ## Automations
 

@@ -50,8 +50,11 @@ same-repo member PRs. Unresolved Devin threads that Claude cannot settle are
 picked up by
 [`.github/workflows/stuck-thread-watch.yml`](.github/workflows/stuck-thread-watch.yml),
 which asks Codex to mediate (`@codex review`) and files a Linear Triage issue
-labelled `needs-decision`. Humans decide. The watcher never resolves threads,
-pushes, or merges.
+labelled `needs-decision`. If Codex emits `CODEX-THREAD: RESOLVE` for a
+thread it was asked about, the ruling's HEAD is the current PR head, and
+required checks on that head are green, the watcher replies on the thread
+and resolves it via `CODEX_TRIGGER_PAT`. Otherwise a human decides. The
+watcher never pushes or merges.
 
 ## Run a gate
 

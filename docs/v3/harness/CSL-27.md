@@ -52,8 +52,9 @@ An upstream CLI broker:
 
 1. Load `config/harness.json` (version 1). It names providers, capabilities,
    and session budgets. It refuses credential-shaped keys.
-2. Choose the worker deterministically: the first enabled provider in
-   `routing.preference` that has every required capability. No model call.
+2. Choose the worker deterministically: the highest-weight enabled provider
+   (`routing.weights`, CSL-83; ties keep `routing.preference` order) that has every
+   required capability. No model call.
 3. Run that adapter. `fixture` and `fixture-b` never start a process. `claude`,
    `codex`, and `grok` start only with `--allow-live`.
 4. When another capable provider is enabled, ask it to review. The verdict is

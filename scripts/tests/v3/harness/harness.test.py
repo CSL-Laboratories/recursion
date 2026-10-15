@@ -881,28 +881,6 @@ class HarnessTests(unittest.TestCase):
             self.assertIn("[truncated]", prompt)
 
     def test_pre_call_budget_refuses_before_the_adapter(self) -> None:
-        opened: list[str] = []
-
-        class Spy:
-            def execute(self, request, *, allow_live=False, timeout_seconds=None, runner=None):
-                raise AssertionError(request.kind)
-
-        config = starter_config({"fixture"})
-        config["budgets"]["max_input_tokens"] = 4
-        config["review"]["max_rounds"] = 0
-        with tempfile.TemporaryDirectory() as directory:
-            record = run_task(
-                "Say hello",
-                config=config,
-                state_dir=Path(directory),
-                open_adapter=lambda name: opened.append(name) or Spy(),
-            )
-        self.assertEqual(opened, [])
-        self.assertEqual(record["status"], "budget-exceeded")
-        self.assertFalse(record["accepted"])
-        self.assertEqual(record["attempts"][0]["reason"], "budget")
-        self.assertEqual(record["text"], "")
-
         calls: list[str] = []
 
         class Worker:
@@ -915,7 +893,7 @@ class HarnessTests(unittest.TestCase):
                 return ProviderResult(
                     self.name,
                     ("stub",),
-                    '{"usage":{"input_tokens":90,"output_tokens":1}}\nhello',
+                    '{"usage":{"input_tokens":100,"output_tokens":1}}\nhello',
                     False,
                 )
 
@@ -931,7 +909,7 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(calls, ["fixture"])
         self.assertEqual(stopped["status"], "budget-exceeded")
         self.assertEqual(stopped["reviews"], [])
-        self.assertEqual(stopped["usage"]["input_tokens"], 90)
+        self.assertEqual(stopped["usage"]["input_tokens"], 100)
         self.assertEqual(stopped["attempts"][-1]["reason"], "budget")
         self.assertEqual(stopped["attempts"][-1]["provider"], "fixture-b")
 

@@ -68,7 +68,9 @@ def validate_config(payload: object) -> dict:
     preference = list(payload["routing"]["preference"])
     if sorted(preference) != sorted(names):
         raise HarnessError("routing.preference must list each provider once")
-    weights = payload["routing"]["weights"]
+    weights = payload["routing"].get("weights")
+    if weights is None:
+        weights = {name: 1 for name in names}
     if set(weights) != set(names):
         raise HarnessError("routing.weights must list each provider once")
     budgets = payload["budgets"]
@@ -84,7 +86,9 @@ def validate_config(payload: object) -> dict:
             "max_rounds": payload["review"]["max_rounds"],
         },
         "routing": {
-            "cooldown_seconds": payload["routing"]["cooldown_seconds"],
+            "cooldown_seconds": payload["routing"].get(
+                "cooldown_seconds", DEFAULT_COOLDOWN_SECONDS
+            ),
             "preference": preference,
             "required_capabilities": list(payload["routing"]["required_capabilities"]),
             "weights": {name: int(weights[name]) for name in names},

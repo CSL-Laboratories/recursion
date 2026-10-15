@@ -13,7 +13,11 @@ from scripts.v3.harness.errors import (
 )
 
 
-_ISO = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+_ISO = re.compile(
+    r"(?:resets?(?:[_ ]?at)?|until|available (?:again )?at)\W{0,4}"
+    r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)",
+    re.IGNORECASE,
+)
 _RETRY_AFTER = re.compile(r"retry[- ]after:?\s*(\d+)", re.IGNORECASE)
 _TRY_AGAIN = re.compile(r"try again in\s+(\d+)\s*(second|minute)s?", re.IGNORECASE)
 _AUTH = (
@@ -145,7 +149,7 @@ def _contains(text: str, phrases: tuple[str, ...]) -> bool:
 
 def _reset(stderr: str) -> tuple[str | None, float | None]:
     found = _ISO.search(stderr)
-    until = found.group(0) if found else None
+    until = found.group(1) if found else None
     retry = _RETRY_AFTER.search(stderr)
     if retry:
         return until, float(retry.group(1))

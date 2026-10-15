@@ -14,7 +14,12 @@ from pathlib import Path
 from scripts.v3.harness.cooldowns import CooldownStore, resolve_until
 from scripts.v3.harness.context import task_prompt
 from scripts.v3.harness.doctor import _scrub, _secret_values
-from scripts.v3.harness.errors import HarnessError, ProviderAvailability, ProviderTimeout
+from scripts.v3.harness.errors import (
+    HarnessError,
+    LiveProviderDisabled,
+    ProviderAvailability,
+    ProviderTimeout,
+)
 from scripts.v3.harness.providers import ProviderRequest, open_provider
 from scripts.v3.harness.review import parse_verdict, review_prompt
 from scripts.v3.harness.routing import select_route
@@ -45,6 +50,7 @@ def run_task(
         raise HarnessError("task must not be empty")
     worker, reviewers = select_route(config, provider)
     candidates = [worker, *reviewers]
+    worker_candidates = [worker] if provider is not None else candidates
     opener = open_provider if open_adapter is None else open_adapter
     run_id = new_run_id() if run_id is None else run_id
     budgets = config["budgets"]
@@ -54,8 +60,8 @@ def run_task(
     attempts: list[dict] = []
     shown = ""
     workspace = _live_workspace(state_dir, run_id) if allow_live else None
-    current_task = task
     worker_task = task_prompt(task, dependencies)
+    current_task = worker_task
     review_diff = diff or ""
     store = CooldownStore(Path(state_dir) / "cooldowns.json")
     clock = time.time if now is None else now
@@ -71,7 +77,7 @@ def run_task(
             run_id=run_id,
             task=task,
             provider=holder["provider"],
-            reviewers=reviewers,
+            reviewers=[name for name in candidates if name != holder["provider"]],
             text=shown,
             reviews=reviews,
             usage=usage,
@@ -85,8 +91,9 @@ def run_task(
     def dispatch(names: list[str], request: ProviderRequest, *, on_exhaust: str) -> tuple[str, object]:
         """Try each provider. Availability failures cool down and move on."""
 
+        active = snapshot()
+        disabled: LiveProviderDisabled | None = None
         for name in names:
-            active = snapshot()
             if name in active:
                 attempts.append(
                     {
@@ -111,6 +118,12 @@ def run_task(
             except ProviderTimeout as exc:
                 save_failure("timed-out", exc)
                 raise
+            except LiveProviderDisabled as exc:
+                disabled = disabled or exc
+                attempts.append(
+                    {"error": "LiveProviderDisabled", "ok": False, "provider": name}
+                )
+                continue
             except ProviderAvailability as exc:
                 moment = clock()
                 store.record(
@@ -134,7 +147,7 @@ def run_task(
             return "ok", result
         if on_exhaust == "skip":
             return "skipped", None
-        exc = HarnessError("no capable provider completed the task")
+        exc = disabled or HarnessError("no capable provider completed the task")
         save_failure("failed", exc)
         raise exc
 
@@ -145,7 +158,7 @@ def run_task(
             run_id=run_id,
             task=task,
             provider=provider_name,
-            reviewers=reviewers,
+            reviewers=[name for name in candidates if name != provider_name],
             text=shown,
             reviews=reviews,
             usage=usage,
@@ -155,7 +168,7 @@ def run_task(
             cooldowns=snapshot(),
         )
 
-    kind, result = dispatch(candidates, _request(worker_task, run_id, "execute", workspace), on_exhaust="fail")
+    kind, result = dispatch(worker_candidates, _request(worker_task, run_id, "execute", workspace), on_exhaust="fail")
     if kind == "budget":
         return finish("budget-exceeded", holder["provider"])
     holder["provider"] = result.provider

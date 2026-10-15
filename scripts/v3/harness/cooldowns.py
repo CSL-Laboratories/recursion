@@ -44,7 +44,7 @@ class CooldownStore:
                         continue
                     until = item.get("until")
                     epoch = _parse(until)
-                    if epoch is None or epoch > moment:
+                    if epoch is not None and epoch > moment:
                         kept[name] = {"reason": item.get("reason"), "until": until}
                 if set(kept) != set(providers):
                     self._write({"providers": kept})
@@ -82,10 +82,10 @@ def resolve_until(
     now: float,
     cooldown_seconds: float,
 ) -> float:
-    """Prefer a reported reset time, then a retry delay, then the config cooldown."""
+    """Prefer a future reset time, then a retry delay, then the config cooldown."""
 
     parsed = _parse(until)
-    if parsed is not None:
+    if parsed is not None and parsed > now:
         return parsed
     if isinstance(retry_after, (int, float)) and not isinstance(retry_after, bool) and retry_after >= 0:
         return now + float(retry_after)

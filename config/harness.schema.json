@@ -29,7 +29,7 @@
     "routing": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["required_capabilities", "preference", "weights", "cooldown_seconds"],
+      "required": ["required_capabilities", "preference"],
       "properties": {
         "required_capabilities": {
           "type": "array",

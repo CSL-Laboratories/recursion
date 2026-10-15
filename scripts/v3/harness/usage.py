@@ -61,22 +61,13 @@ def add_usage(total: dict, extra: dict) -> dict:
 def call_fits(spent: dict, budgets: dict, prompt: str) -> bool:
     """False when starting this call would pass a known ceiling.
 
-    A known figure already at its ceiling refuses the call. The prompt's
-    character length is the minimum input this call will send. It is added
-    to known input usage. Missing prior usage is not treated as zero: only
-    the prompt is counted until a provider reports a figure. This is not a
-    tokenizer and it does not change the configured ceiling.
+    A known figure already at its ceiling refuses the call. The prompt is not
+    measured: character length is not a lower bound on token count, and the
+    post-call check still enforces the ceiling.
     """
 
-    if _at_or_over(spent, budgets):
-        return False
-    limit = budgets.get("max_input_tokens")
-    if limit is None:
-        return True
-    text = prompt if isinstance(prompt, str) else ""
-    known = spent.get("input_tokens")
-    projected = len(text) if known is None else known + len(text)
-    return projected <= limit
+    del prompt
+    return not _at_or_over(spent, budgets)
 
 
 def exceeded(spent: dict, budgets: dict) -> bool:

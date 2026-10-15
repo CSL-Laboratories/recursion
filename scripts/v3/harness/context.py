@@ -45,7 +45,8 @@ def dependency_context(dependencies: list) -> str:
         return ""
     section = "Dependency context:\n" + "\n\n".join(blocks)
     if len(section) > CONTEXT_LIMIT:
-        return section[:CONTEXT_LIMIT] + "\n[dependency context truncated]"
+        marker = "\n[dependency context truncated]"
+        return section[: CONTEXT_LIMIT - len(marker)] + marker
     return section
 
 

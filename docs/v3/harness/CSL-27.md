@@ -107,20 +107,23 @@ includes the code they sit in, and the tests are stubs.
 ## Review of the first slice
 
 1. The Grok prompt is a new file from `tempfile.mkstemp` (`O_EXCL`), then
-   forced to mode `0600`. The name is not derived from the run id.
+   forced to mode `0600`. The name is not derived from the run id. The write
+   continues until every byte is stored, then `fsync`s.
 2. Doctor marks a live provider usable only when it is installed and signed
    in. A signed-out CLI does not count. A Grok `XAI_API_KEY` in the
    environment counts as signed in. The value is not stored.
 3. `init` turns on `fixture` and `fixture-b` only, including when a live CLI
    is on `PATH`.
 4. A live run creates `<state>/<run-id>/workspace` at mode `0700` and uses
-   that directory as the process working folder. A headless adapter refuses
-   to start when no working folder was given, so it does not inherit the
-   repository root. This directory is not a sandbox.
+   that absolute directory as the process working folder, including when
+   `--state` is relative. A headless adapter refuses to start when no working
+   folder was given, so it does not inherit the repository root. This
+   directory is not a sandbox.
 5. A provider error or timeout is saved before the exception is re-raised.
    `status` shows `failed` or `timed-out`, the error text, and any usage or
-   assistant text already collected. Saved assistant text is scrubbed for
-   environment secrets and token-shaped strings.
+   assistant text already collected. Saved assistant text, review notes, and
+   provider error text are scrubbed for environment secrets and token-shaped
+   strings.
 6. A revise round sends the previous answer with the review notes. The last
    `VERDICT` line in the assistant text wins. `max_rounds` of 0 stays
    unreviewed unless `accept_unreviewed` is set. Codex `item.completed`

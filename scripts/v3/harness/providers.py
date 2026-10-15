@@ -245,18 +245,25 @@ def _grok_argv(request: ProviderRequest, prompt_file: str) -> tuple[str, ...]:
 def _write_grok_prompt(task: str) -> Path:
     """Write the prompt to a new owner-only file. The name is not predictable."""
 
-    fd, name = tempfile.mkstemp(prefix="recursion-grok-", suffix=".txt")
+    try:
+        fd, name = tempfile.mkstemp(prefix="recursion-grok-", suffix=".txt")
+    except OSError as exc:
+        raise HarnessError("grok prompt file could not be created") from exc
     path = Path(name)
     try:
         if hasattr(os, "fchmod"):
             os.fchmod(fd, 0o600)
-        data = memoryview(task.encode("utf-8"))
-        while data:
-            data = data[os.write(fd, data) :]
-    except OSError:
+        payload = memoryview(task.encode("utf-8"))
+        while payload:
+            written = os.write(fd, payload)
+            if written <= 0:
+                raise OSError("prompt write made no progress")
+            payload = payload[written:]
+        os.fsync(fd)
+    except OSError as exc:
         os.close(fd)
         path.unlink(missing_ok=True)
-        raise
+        raise HarnessError("grok prompt file could not be written") from exc
     os.close(fd)
     return path
 

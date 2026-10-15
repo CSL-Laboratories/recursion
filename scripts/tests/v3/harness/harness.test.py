@@ -767,6 +767,49 @@ class HarnessTests(unittest.TestCase):
                 self.assertEqual(cwd.stat().st_mode & 0o777, 0o700)
                 self.assertEqual(cwd.parent.stat().st_mode & 0o777, 0o700)
 
+    def test_relative_state_is_an_absolute_folder_for_codex_and_grok(self) -> None:
+        seen: dict[str, str] = {}
+
+        class Capture:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def execute(self, request, *, allow_live=False, timeout_seconds=None, runner=None):
+                del allow_live, timeout_seconds, runner
+                seen[self.name] = request.cwd
+                if request.kind == "review":
+                    return ProviderResult(self.name, ("stub",), "VERDICT approve\nok", False)
+                return ProviderResult(self.name, ("stub",), "hello", False)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            previous = Path.cwd()
+            os.chdir(root)
+            try:
+                record = run_task(
+                    "Say hello",
+                    config=starter_config({"codex", "grok"}),
+                    state_dir=Path("relative-state"),
+                    allow_live=True,
+                    open_adapter=lambda name: Capture(name),
+                )
+            finally:
+                os.chdir(previous)
+            expected = (root / "relative-state" / record["run_id"] / "workspace").resolve()
+            for name in ("codex", "grok"):
+                folder = seen[name]
+                self.assertTrue(Path(folder).is_absolute())
+                self.assertEqual(Path(folder), expected)
+            codex_argv = CodexExecProvider().argv(
+                ProviderRequest(task="Say hello", packet_id=record["run_id"], cwd=seen["codex"])
+            )
+            grok_argv = GrokHeadlessProvider().argv(
+                ProviderRequest(task="Say hello", packet_id=record["run_id"], cwd=seen["grok"])
+            )
+            self.assertEqual(codex_argv[codex_argv.index("--cd") + 1], str(expected))
+            self.assertEqual(grok_argv[grok_argv.index("--cwd") + 1], str(expected))
+            self.assertEqual(record["workspace"], str(expected))
+
     def test_provider_error_is_saved_for_status(self) -> None:
         class Boom:
             def execute(self, request, *, allow_live=False, timeout_seconds=None, runner=None):
@@ -846,6 +889,83 @@ class HarnessTests(unittest.TestCase):
                 )
             self.assertNotIn(secret, json.dumps(record))
             self.assertIn("[redacted]", record["text"])
+
+    def test_assistant_text_and_provider_errors_are_both_scrubbed(self) -> None:
+        secret = "SECRET-TOKEN-VALUE"
+        token = "sk-abcdEFGH1234"
+
+        class Pair:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def execute(self, request, *, allow_live=False, timeout_seconds=None, runner=None):
+                del allow_live, timeout_seconds, runner
+                if request.kind == "review":
+                    return ProviderResult(self.name, ("stub",), f"VERDICT approve\nnote {secret}", False)
+                return ProviderResult(self.name, ("stub",), f"answer {token}", False)
+
+        class Boom:
+            def execute(self, request, *, allow_live=False, timeout_seconds=None, runner=None):
+                del request, allow_live, timeout_seconds, runner
+                raise HarnessError(f"codex exited 1 {secret} {token}")
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {"ANTHROPIC_API_KEY": secret}):
+                record = run_task(
+                    "Say hello",
+                    config=starter_config({"fixture", "fixture-b"}),
+                    state_dir=Path(directory),
+                    open_adapter=lambda name: Pair(name),
+                )
+            saved = json.dumps(record)
+            self.assertNotIn(secret, saved)
+            self.assertNotIn(token, saved)
+            self.assertIn("[redacted]", record["text"])
+            self.assertIn("[redacted]", record["reviews"][0]["notes"])
+
+            with patch.dict(os.environ, {"ANTHROPIC_API_KEY": secret}):
+                with self.assertRaises(HarnessError):
+                    run_task(
+                        "Say hello",
+                        config=starter_config({"fixture"}),
+                        state_dir=Path(directory) / "failed",
+                        open_adapter=lambda name: Boom(),
+                    )
+            failed = load_run(Path(directory) / "failed", list_runs(Path(directory) / "failed")[0])
+            rendered = json.dumps(failed)
+            self.assertNotIn(secret, rendered)
+            self.assertNotIn(token, rendered)
+            self.assertIn("[redacted]", failed["error"])
+            self.assertEqual(failed["text"], "")
+
+    def test_grok_prompt_write_finishes_short_counts_and_fsyncs(self) -> None:
+        import scripts.v3.harness.providers as providers
+
+        task = "Say hello in full"
+        real_write = providers.os.write
+        real_fsync = providers.os.fsync
+        seen = {"fsync": 0}
+
+        def short_write(fd, data):
+            chunk = bytes(data[:1])
+            return real_write(fd, chunk)
+
+        def counting_fsync(fd):
+            seen["fsync"] += 1
+            return real_fsync(fd)
+
+        with tempfile.TemporaryDirectory() as directory:
+            request = ProviderRequest(task=task, packet_id="run-aabbccddeeff", cwd=directory)
+
+            def runner(argv, stdin_text, timeout, cwd):
+                del stdin_text, timeout, cwd
+                prompt = Path(argv[argv.index("--prompt-file") + 1])
+                self.assertEqual(prompt.read_text(encoding="utf-8"), task)
+                return _completed(argv, 0, stdout="ok")
+
+            with patch.object(providers.os, "write", short_write), patch.object(providers.os, "fsync", counting_fsync):
+                GrokHeadlessProvider().execute(request, allow_live=True, runner=runner)
+            self.assertEqual(seen["fsync"], 1)
 
     def test_grok_env_key_counts_as_signed_in(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -198,14 +198,15 @@ def _timeout(config: dict, name: str) -> int:
 
 def _finish(config, state_dir, **fields) -> dict:
     del config
-    text = _scrub(fields["text"], _secret_values(os.environ))
+    secrets = _secret_values(os.environ)
+    text = _scrub(fields["text"], secrets)
     if len(text) > RECORD_LIMIT:
         text = text[:RECORD_LIMIT] + "\n[truncated]"
     record = {
         "accepted": fields["status"] == "completed",
         "provider": fields["provider"],
         "reviewers": list(fields["reviewers"]),
-        "reviews": fields["reviews"],
+        "reviews": _scrub(fields["reviews"], secrets),
         "run_id": fields["run_id"],
         "status": fields["status"],
         "task": fields["task"],
@@ -214,7 +215,7 @@ def _finish(config, state_dir, **fields) -> dict:
     }
     error = fields.get("error")
     if error:
-        record["error"] = _scrub(error, _secret_values(os.environ))
+        record["error"] = _scrub(error, secrets)
     workspace = fields.get("workspace")
     if workspace:
         record["workspace"] = workspace

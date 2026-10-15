@@ -329,6 +329,11 @@ class TestInventoryTests(unittest.TestCase):
             )
             write(repo / "scripts" / "tests" / "new.test.py", case)
             ci_gate.run_test_file("scripts/tests/new.test.py", root=repo)
+            write(repo / "experiments" / "v3" / "hyphen-dir" / "test_added.py", case)
+            ci_gate.run_test_file("experiments/v3/hyphen-dir/test_added.py", root=repo)
+            write(repo / "tools" / "test_empty.py", "x = 1\n")
+            with self.assertRaises(SystemExit):
+                ci_gate.run_test_file("tools/test_empty.py", root=repo)
             write(repo / "tools" / "test_funcs.py", "def test_failure():\n    assert False\n")
             with self.assertRaises(SystemExit):
                 ci_gate.run_test_file("tools/test_funcs.py", root=repo)

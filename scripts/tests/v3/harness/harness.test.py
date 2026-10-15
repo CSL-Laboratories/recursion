@@ -6,6 +6,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -33,7 +34,7 @@ from scripts.v3.harness.providers import (  # noqa: E402
 from scripts.v3.harness.review import parse_verdict  # noqa: E402
 from scripts.v3.harness.routing import capable_providers, select_route  # noqa: E402
 from scripts.v3.harness.run import run_task  # noqa: E402
-from scripts.v3.harness.state import list_runs, load_run  # noqa: E402
+from scripts.v3.harness.state import list_runs, load_run, save_run  # noqa: E402
 from scripts.v3.harness.usage import (  # noqa: E402
     CODEX_SESSION_METER,
     DEFAULT_MAX_INPUT_TOKENS,
@@ -186,6 +187,23 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(parse_usage(trailing)["input_tokens"], 1)
         self.assertEqual(codex_session_meter("no usage here"), empty_unknown())
         self.assertFalse(exceeded(usage, load_config()["budgets"]))
+
+    def test_codex_meter_drops_a_stale_total_when_the_last_turn_omits_usage(self) -> None:
+        stale = "\n".join(
+            (
+                json.dumps(
+                    {"type": "turn.completed", "usage": {"input_tokens": 900, "output_tokens": 10}}
+                ),
+                json.dumps({"type": "turn.completed"}),
+            )
+        )
+        self.assertEqual(codex_session_meter(stale), empty_unknown())
+        failed = stale.splitlines()[0] + "\n" + json.dumps({"type": "turn.failed"})
+        self.assertEqual(codex_session_meter(failed)["input_tokens"], 900)
+        recovered = stale + "\n" + json.dumps(
+            {"type": "turn.completed", "usage": {"input_tokens": 1200, "output_tokens": 4}}
+        )
+        self.assertEqual(codex_session_meter(recovered)["input_tokens"], 1200)
 
     def test_grok_stream_verdict_is_approve_when_the_first_line_is_json(self) -> None:
         self.assertTrue(GROK_APPROVE.splitlines()[0].startswith("{"))
@@ -697,6 +715,56 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(record["usage"]["input_tokens"], 12)
             self.assertEqual(record["reviews"], [])
             self.assertFalse(record["accepted"])
+
+    def test_save_run_refuses_a_hard_link(self) -> None:
+        run_id = "run-abc123def456"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            state.mkdir()
+            other = root / "other.txt"
+            other.write_text("keep-me", encoding="utf-8")
+            linked = state / f"{run_id}.json"
+            os.link(other, linked)
+            self.assertGreater(linked.stat().st_nlink, 1)
+            with self.assertRaises(HarnessError):
+                save_run(state, {"run_id": run_id, "task": "new task"})
+            self.assertEqual(other.read_text(encoding="utf-8"), "keep-me")
+            self.assertEqual(linked.read_text(encoding="utf-8"), "keep-me")
+            linked.unlink()
+            linked.symlink_to(other)
+            with self.assertRaises(HarnessError):
+                save_run(state, {"run_id": run_id, "task": "new task"})
+            self.assertEqual(other.read_text(encoding="utf-8"), "keep-me")
+
+    def test_save_run_publishes_task_text_at_mode_0600(self) -> None:
+        run_id = "run-abc123def456"
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            path = save_run(state, {"run_id": run_id, "task": "first"})
+            path.chmod(0o644)
+            path.write_text("old\n", encoding="utf-8")
+            seen: dict = {}
+            real_replace = os.replace
+
+            def replace(src, dst):
+                info = os.lstat(src)
+                seen["mode"] = stat.S_IMODE(info.st_mode)
+                seen["nlink"] = info.st_nlink
+                seen["src"] = Path(src).read_text(encoding="utf-8")
+                seen["dst"] = Path(dst).read_text(encoding="utf-8")
+                return real_replace(src, dst)
+
+            with patch("scripts.v3.harness.state.os.replace", replace):
+                save_run(state, {"run_id": run_id, "task": "private task"})
+            self.assertEqual(seen["nlink"], 1)
+            self.assertIn("private task", seen["src"])
+            self.assertEqual(seen["dst"], "old\n")
+            self.assertIn("private task", path.read_text(encoding="utf-8"))
+            self.assertNotIn("old", path.read_text(encoding="utf-8"))
+            if os.name == "posix":
+                self.assertEqual(seen["mode"], 0o600)
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
     def test_saved_run_scrubs_a_secret_from_the_environment(self) -> None:
         secret = "SECRET-TOKEN-VALUE"

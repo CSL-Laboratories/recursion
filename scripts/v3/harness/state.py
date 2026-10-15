@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import uuid
 from pathlib import Path
 
@@ -19,20 +20,70 @@ def new_run_id() -> str:
 
 
 def save_run(state_dir: Path, record: dict) -> Path:
+    """Write one private run record.
+
+    A symlink or hard link at the record path is refused, so the write cannot
+    truncate another file. The bytes are written to a new mode-0600 file and
+    published with ``os.replace``.
+    """
+
     path = run_path(state_dir, record["run_id"])
     path.parent.mkdir(parents=True, exist_ok=True)
+    _refuse_linked_record(path)
     text = json.dumps(record, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
-    if path.is_symlink():
-        raise HarnessError(f"refusing to write through symlink {path.name}")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        fd = os.open(path, flags, 0o600)
-    except OSError as exc:
-        raise HarnessError(f"cannot write run {record['run_id']}") from exc
-    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-        handle.write(text)
-        os.fchmod(handle.fileno(), 0o600) if hasattr(os, "fchmod") else None
+    _publish_private(path, text)
     return path
+
+
+def _refuse_linked_record(path: Path) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(info.st_mode) or info.st_nlink > 1:
+        raise HarnessError(f"refusing to write linked run record {path.name}")
+
+
+def _publish_private(path: Path, text: str) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    fd = -1
+    opened = False
+    published = False
+    try:
+        fd = os.open(temporary, flags, 0o600)
+        opened = True
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        if os.fstat(fd).st_nlink != 1:
+            raise HarnessError(f"refusing to publish linked run record {path.name}")
+        payload = memoryview(text.encode("utf-8"))
+        while payload:
+            written = os.write(fd, payload)
+            if written <= 0:
+                raise OSError("run record write made no progress")
+            payload = payload[written:]
+        os.fsync(fd)
+        if os.fstat(fd).st_nlink != 1:
+            raise HarnessError(f"refusing to publish linked run record {path.name}")
+        os.close(fd)
+        fd = -1
+        os.replace(temporary, path)
+        published = True
+    except HarnessError:
+        raise
+    except OSError as exc:
+        raise HarnessError(f"cannot write run {path.stem}") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if opened and not published:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
 
 
 def load_run(state_dir: Path, run_id: str) -> dict:

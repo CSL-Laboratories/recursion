@@ -176,7 +176,7 @@ def _request(task: str, run_id: str, kind: str, workspace: str | None) -> Provid
 def _live_workspace(state_dir, run_id: str) -> str:
     """Private folder for one live run. Headless processes use this directory as cwd."""
 
-    root = Path(state_dir) / run_id
+    root = (Path(state_dir) / run_id).resolve()
     path = root / "workspace"
     path.mkdir(parents=True, exist_ok=True)
     root.chmod(0o700)
@@ -214,7 +214,7 @@ def _finish(config, state_dir, **fields) -> dict:
     }
     error = fields.get("error")
     if error:
-        record["error"] = error
+        record["error"] = _scrub(error, _secret_values(os.environ))
     workspace = fields.get("workspace")
     if workspace:
         record["workspace"] = workspace

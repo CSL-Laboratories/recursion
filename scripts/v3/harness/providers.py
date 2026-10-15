@@ -250,7 +250,9 @@ def _write_grok_prompt(task: str) -> Path:
     try:
         if hasattr(os, "fchmod"):
             os.fchmod(fd, 0o600)
-        os.write(fd, task.encode("utf-8"))
+        data = memoryview(task.encode("utf-8"))
+        while data:
+            data = data[os.write(fd, data) :]
     except OSError:
         os.close(fd)
         path.unlink(missing_ok=True)

@@ -23,7 +23,8 @@ ways, stop and record a blocker in `state/INBOX.md` — do not pick one.
    PR; Lucas reviews and merges. Name the branch `csl-<N>-<slug>` (for example
    `csl-26-short-slug`), optionally prefixed with a GitHub username (for example
    `chaandansaini101/csl-26-short-slug`). Put `CSL-N` in the PR title so Linear links
-   the issue. pr-lint requires `CSL-[0-9]+` in the branch name or the PR title.
+   the issue. pr-lint matches `CSL-[0-9]+` case-sensitively, so a lowercase branch
+   name alone does not pass. The `CSL-N` key in the PR title satisfies the check.
 3. **Never modify a protected path** — `CONTROL_PLANE.md`, `ANCHOR.md`, `state/DECISIONS.md`,
    `.env`, or auth/credential configuration. Propose changes in `state/PROPOSALS.md`.
 4. **No secrets in tracked files, logs or notifications.**
@@ -99,8 +100,9 @@ Linear MCP or the Devin Linear integration. Do not start code without `CSL-N`.
 
 - Branch from up-to-date `master` as `csl-<N>-<slug>` (example: `csl-26-short-slug`).
   A GitHub username prefix is optional (`chaandansaini101/csl-26-short-slug`).
-- PR title includes `CSL-N` so Linear auto-links. pr-lint requires `CSL-[0-9]+` in the
-  branch name or the PR title.
+- PR title includes `CSL-N` so Linear auto-links. pr-lint matches `CSL-[0-9]+`
+  case-sensitively, so a lowercase branch name alone does not pass. The `CSL-N`
+  key in the PR title satisfies the check.
 - One issue per PR; keep PRs small and stackable.
 - Comment progress on the issue. Move status to **In Progress** when work starts, then **In
   Review** when the PR is up.

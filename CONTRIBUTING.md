@@ -37,8 +37,9 @@ For a research or evidence task:
 
 - Branch from up-to-date `master` as `csl-<N>-<slug>` (example `csl-26-short-slug`).
   A GitHub username prefix is optional (`chaandansaini101/csl-26-short-slug`).
-- Put `CSL-N` in the PR title. pr-lint requires `CSL-[0-9]+` in the branch name or the
-  PR title.
+- Put `CSL-N` in the PR title. pr-lint matches `CSL-[0-9]+` case-sensitively, so a
+  lowercase branch name alone does not pass. The `CSL-N` key in the PR title
+  satisfies the check.
 - Never commit to `master` directly and never force-push.
 - Open a PR for review. **Lucas merges every review branch himself**; an automated run only
   ever produces a review branch.

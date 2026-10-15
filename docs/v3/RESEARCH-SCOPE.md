@@ -84,6 +84,8 @@ instead of choosing.
 # clean fetched worktree pinned to the reviewed base
 git fetch --all --prune
 # branch: csl-<N>-<slug>, optional username prefix (chaandansaini101/csl-<N>-<slug>)
+# pr-lint matches CSL-[0-9]+ case-sensitively; a lowercase branch alone does not pass.
+# The CSL-N key in the PR title satisfies the check.
 git worktree add ../recursion-<task> -b csl-<N>-<slug> origin/master
 
 # run the gate; capture the receipt externally

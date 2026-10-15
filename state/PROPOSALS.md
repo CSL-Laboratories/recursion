@@ -90,8 +90,9 @@ session recorded in `state/DECISIONS.md`.
 ### Proposed replacement
 
 Keep invariant 1's force-push, merge, and deployment limits. Name the review branch
-`csl-<N>-<slug>`, optionally prefixed with a GitHub username. pr-lint still requires
-`CSL-[0-9]+` in the branch name or the PR title.
+`csl-<N>-<slug>`, optionally prefixed with a GitHub username. pr-lint matches
+`CSL-[0-9]+` case-sensitively, so a lowercase branch name alone does not pass. The
+`CSL-N` key in the PR title satisfies the check.
 
 ### Non-goals
 

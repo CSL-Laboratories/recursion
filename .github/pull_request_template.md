@@ -4,7 +4,7 @@ Linear: CSL-___
 <!-- What changed and why. -->
 
 ## Branch
-<!-- `csl-<N>-<slug>`, or `username/csl-<N>-<slug>`. pr-lint requires CSL-[0-9]+ in the branch name or this PR title. -->
+<!-- `csl-<N>-<slug>`, or `username/csl-<N>-<slug>`. pr-lint matches CSL-[0-9]+ case-sensitively, so a lowercase branch name alone does not pass. The CSL-N key in this PR title satisfies the check. -->
 
 ## Checklist
 - [ ] Devin review completed on the current head commit

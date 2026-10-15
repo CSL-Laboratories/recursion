@@ -110,6 +110,7 @@ def _merge(repo: Path, target: str, run_branch: str, message: str) -> str:
     env = os.environ.copy()
     for key in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"):
         env.pop(key, None)
+    before = _run(repo, "rev-parse", "HEAD").stdout.strip()
     completed = _run(repo, *_author_config(repo), "merge", "--no-ff", "-m", message, run_branch, env=env)
     if completed.returncode != 0:
         listed = _run(repo, "diff", "--name-only", "--diff-filter=U")
@@ -121,6 +122,8 @@ def _merge(repo: Path, target: str, run_branch: str, message: str) -> str:
     shown = _run(repo, "rev-parse", "HEAD")
     if shown.returncode != 0:
         raise HarnessError("git rev-parse failed")
+    if shown.stdout.strip() == before:
+        raise HarnessError("run branch is already merged")
     return shown.stdout.strip()
 
 

@@ -12,8 +12,8 @@ _SECRET_KEY = re.compile(
 _TOKEN = re.compile(
     "|".join(
         (
-            r"sk-[A-Za-z0-9_-]{8,}",
-            r"xai-[A-Za-z0-9_-]{8,}",
+            r"\bsk-[A-Za-z0-9_-]{8,}",
+            r"\bxai-[A-Za-z0-9_-]{8,}",
             r"ghp_[A-Za-z0-9]{20,}",
             r"github_pat_[A-Za-z0-9_]{16,}",
             r"AIza[0-9A-Za-z_-]{20,}",

@@ -327,7 +327,7 @@ class OpenCodeHeadlessProvider(HeadlessCLI):
         argv = _with_flag(self.STATIC_ARGV, "--dir", request.cwd)
         if _prompt_fits(request.task):
             return argv + (request.task,)
-        return argv + ("--file", "<prompt-file>", _OPENCODE_LONG_PROMPT)
+        return argv + (_OPENCODE_LONG_PROMPT, "--file", "<prompt-file>")
 
     def prepare(self, request: ProviderRequest) -> _Prepared:
         argv = _with_flag(self.STATIC_ARGV, "--dir", request.cwd)
@@ -338,7 +338,7 @@ class OpenCodeHeadlessProvider(HeadlessCLI):
         def cleanup() -> None:
             path.unlink(missing_ok=True)
 
-        return _Prepared(argv + ("--file", str(path), _OPENCODE_LONG_PROMPT), None, cleanup)
+        return _Prepared(argv + (_OPENCODE_LONG_PROMPT, "--file", str(path)), None, cleanup)
 
 
 # Launch-critical names from the accepted compatibility matrix. Claude, Grok,

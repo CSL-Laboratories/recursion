@@ -55,10 +55,10 @@ def _open(record: dict) -> bool:
 
 def _delete(state_dir: Path, run_id: str) -> None:
     record_path = run_path(state_dir, run_id)
-    record_path.unlink(missing_ok=True)
-    record_path.with_suffix(".jsonl").unlink(missing_ok=True)
     folder = Path(state_dir) / run_id
     if folder.is_symlink():
         folder.unlink()
     elif folder.is_dir():
         shutil.rmtree(folder)
+    record_path.with_suffix(".jsonl").unlink(missing_ok=True)
+    record_path.unlink(missing_ok=True)

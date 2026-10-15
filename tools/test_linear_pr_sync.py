@@ -119,6 +119,13 @@ class ParseTests(unittest.TestCase):
             {"user": {"login": DEVIN}, "commit_id": "abc123def456", "state": "COMMENTED"},
         ]
         self.assertTrue(mod.devin_on_head(reviews, "abc123def456", DEVIN))
+        self.assertTrue(
+            mod.devin_on_head(
+                [{"user": {"login": "devin-ai-integration"}, "commit_id": "abc123def456", "state": "COMMENTED"}],
+                "abc123def456",
+                DEVIN,
+            )
+        )
         self.assertFalse(mod.devin_on_head(reviews, "other", DEVIN))
         self.assertFalse(mod.devin_on_head([], "abc123def456", DEVIN))
 
@@ -290,6 +297,8 @@ class WorkflowAndDocsTests(unittest.TestCase):
         self.assertIn("ready_for_review", text)
         self.assertIn("closed", text)
         self.assertIn("linear_pr_sync.py", text)
+        self.assertIn("github.event.repository.default_branch", text)
+        self.assertIn("not on the default branch yet; skip", text)
         self.assertNotIn("blacksmith", text.lower())
         self.assertNotRegex(text, r"git push|--force|mergePullRequest")
         ci = CI.read_text(encoding="utf-8")

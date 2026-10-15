@@ -116,8 +116,24 @@ class ClassifyTests(unittest.TestCase):
         self.assertTrue(mod.needs_human("This needs a human"))
         self.assertTrue(mod.needs_human("A human needs to look at the remaining findings"))
         self.assertTrue(mod.needs_human("I cannot fix the protected-path edit"))
+        self.assertTrue(mod.needs_human("I can't fix this"))
         self.assertFalse(mod.needs_human("Fixed in abc123. Gate passed."))
         self.assertFalse(mod.needs_human(""))
+
+    def test_same_login_strips_bot_suffix(self) -> None:
+        self.assertTrue(mod.same_login("claude[bot]", "claude"))
+        self.assertTrue(mod.same_login("devin-ai-integration", "devin-ai-integration[bot]"))
+        self.assertFalse(mod.same_login("claude[bot]", "devin-ai-integration[bot]"))
+        self.assertFalse(mod.same_login("", ""))
+
+    def test_graphql_bot_logins_match_rest_form(self) -> None:
+        t = thread(
+            comments=[
+                comment("devin-ai-integration", "Please clarify this wording.", hours_ago=8),
+                comment("claude", "I couldn't fix this; it needs a human.", hours_ago=7),
+            ]
+        )
+        self.assertEqual(mod.classify_thread(t, (), cfg()), "stuck-human")
 
     def test_stuck_when_claude_needs_human(self) -> None:
         t = thread(comments=stuck_pair())
@@ -175,6 +191,19 @@ class ClassifyTests(unittest.TestCase):
         existing = [comment("watcher", mod.mediation_marker("PRRT_9"), hours_ago=0.5)]
         self.assertEqual(mod.classify_thread(t, existing, cfg()), "mediated")
 
+    def test_spoofed_marker_ignored_when_mediator_login_set(self) -> None:
+        t = thread(tid="PRRT_9", comments=stuck_pair())
+        existing = [comment("mallory", mod.mediation_marker("PRRT_9"), hours_ago=0.5)]
+        self.assertEqual(
+            mod.classify_thread(t, existing, cfg(mediator_login="pat-user")),
+            "stuck-human",
+        )
+        trusted = [comment("pat-user", mod.mediation_marker("PRRT_9"), hours_ago=0.5)]
+        self.assertEqual(
+            mod.classify_thread(t, trusted, cfg(mediator_login="pat-user")),
+            "mediated",
+        )
+
     def test_timeout_threshold_is_exclusive(self) -> None:
         t = thread(
             comments=[
@@ -212,6 +241,7 @@ class CapAndBodyTests(unittest.TestCase):
         self.assertIn("Do **not** push code", body)
         self.assertIn("Please clarify this wording.", body)
         self.assertIn("couldn't fix", body)
+        self.assertIn("UNTRUSTED DATA", body)
         self.assertIn("Linear record: https://linear.app/x", body)
         self.assertNotIn("git push", body.lower())
 
@@ -322,6 +352,34 @@ class ScanTests(unittest.TestCase):
         self.assertEqual(counters.mediated, 1)
         self.assertEqual(len(gh.comments), 1)
         self.assertIn("<!-- codex-mediation:PRRT_err -->", gh.comments[0][1])
+        self.assertEqual(gh.labels, [(186, ["needs-decision"])])
+
+    def test_missing_linear_key_on_linear_repo_still_labels(self) -> None:
+        t = thread(comments=stuck_pair())
+        gh = FakeGitHub([pull(threads=[t])])
+        counters = mod.scan(cfg(linear_api_key=""), gh, FakeLinear())  # type: ignore[arg-type]
+        self.assertEqual(counters.mediated, 1)
+        self.assertEqual(counters.linear, 0)
+        self.assertEqual(gh.labels, [(186, ["needs-decision"])])
+
+    def test_post_comment_error_continues_to_later_prs(self) -> None:
+        class BoomThenOk(FakeGitHub):
+            def post_comment(self, number: int, body: str) -> None:
+                if number == 1:
+                    raise RuntimeError("403 forbidden")
+                super().post_comment(number, body)
+
+        t = thread(comments=stuck_pair())
+        gh = BoomThenOk(
+            [
+                pull(number=1, threads=[t]),
+                pull(number=2, threads=[thread(tid="PRRT_2", comments=stuck_pair())]),
+            ]
+        )
+        counters = mod.scan(cfg(), gh, FakeLinear())  # type: ignore[arg-type]
+        self.assertEqual(counters.mediated, 1)
+        self.assertEqual(gh.comments, [(2, gh.comments[0][1])])
+        self.assertTrue(gh.comments[0][1].startswith("<!-- codex-mediation:PRRT_2 -->") or "PRRT_2" in gh.comments[0][1])
 
     def test_linear_dedupes_by_marker(self) -> None:
         t = thread(tid="PRRT_z", comments=stuck_pair())
@@ -374,6 +432,42 @@ class ScanTests(unittest.TestCase):
         counters = mod.scan(cfg(), gh, FakeLinear())  # type: ignore[arg-type]
         # Second copy is skipped after the in-run marker is appended.
         self.assertEqual(counters.mediated, 1)
+
+
+    def test_collect_connection_nodes_keeps_later_claude_reply(self) -> None:
+        recent = "2026-10-15T11:30:00Z"
+        pages = {
+            "c1": {
+                "nodes": [
+                    {
+                        "body": "needs a human",
+                        "author": {"login": "claude"},
+                        "createdAt": "2026-10-15T10:00:00Z",
+                    }
+                ],
+                "pageInfo": {"hasNextPage": True, "endCursor": "c2"},
+            },
+            "c2": {
+                "nodes": [
+                    {
+                        "body": "Fixed in abc123. Gate passed.",
+                        "author": {"login": "claude"},
+                        "createdAt": recent,
+                    }
+                ],
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+            },
+        }
+        nodes = mod.collect_connection_nodes(pages["c1"], lambda cursor: pages[cursor])
+        comments = tuple(mod._parse_comment(n) for n in nodes)
+        t = thread(
+            comments=(
+                comment("devin-ai-integration", "please fix", hours_ago=3),
+                *comments,
+            )
+        )
+        # Last Claude reply is the page-2 fix, so this is waiting, not stuck-human.
+        self.assertEqual(mod.classify_thread(t, (), cfg()), "waiting")
 
 
 class HttpGuardTests(unittest.TestCase):
@@ -472,6 +566,8 @@ class WorkflowAndDocsTests(unittest.TestCase):
         self.assertIn("CODEX_TRIGGER_PAT", text)
         self.assertIn("LINEAR_API_KEY", text)
         self.assertIn("stuck_thread_watch.py", text)
+        self.assertIn("github.event.repository.default_branch", text)
+        self.assertIn("not on the default branch yet; skip", text)
         self.assertNotIn("pytest", text)
         self.assertNotIn("ci_gate", text)
         self.assertNotRegex(text, r"git push|--force|mergePullRequest|resolveReviewThread")

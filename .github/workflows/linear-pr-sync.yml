@@ -33,6 +33,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          # Always the default branch so pull_request events cannot run
+          # PR-head code with LINEAR_API_KEY.
+          ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
           sparse-checkout: |
             .github/scripts/linear_pr_sync.py
@@ -44,4 +47,10 @@ jobs:
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: python3 -X utf8 -B .github/scripts/linear_pr_sync.py
+        run: |
+          script=.github/scripts/linear_pr_sync.py
+          if [ ! -f "$script" ]; then
+            echo "::notice::$script is not on the default branch yet; skip"
+            exit 0
+          fi
+          python3 -X utf8 -B "$script"

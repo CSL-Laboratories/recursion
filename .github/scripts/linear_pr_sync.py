@@ -108,14 +108,20 @@ def purpose_excerpt(body: str, *, max_lines: int = PURPOSE_LINES, max_chars: int
     return text or "_(no description)_"
 
 
+def _norm_login(value: str | None) -> str:
+    text = (value or "").strip().casefold()
+    suffix = "[bot]"
+    return text[: -len(suffix)] if text.endswith(suffix) else text
+
+
 def devin_on_head(reviews: list[dict[str, Any]], head_sha: str, devin_login: str) -> bool:
     want = (head_sha or "").strip().lower()
-    login = (devin_login or "").strip().casefold()
+    login = _norm_login(devin_login)
     if not want or not login:
         return False
     for review in reviews:
         user = review.get("user") or {}
-        if (user.get("login") or "").strip().casefold() != login:
+        if _norm_login(user.get("login")) != login:
             continue
         commit = (review.get("commit_id") or "").strip().lower()
         state = (review.get("state") or "").upper()

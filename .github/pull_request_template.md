@@ -9,6 +9,7 @@ Fixes CSL-___
 ## Checklist
 - [ ] Claimed in Linear by assigning yourself
 - [ ] CSL key in branch name and PR title
+- [ ] Linear issue updated, and any follow-ups filed to Triage
 - [ ] No secrets in tracked files, logs, or notifications
 - [ ] Perf impact noted (or N/A)
 - [ ] Devin review completed on the current head commit

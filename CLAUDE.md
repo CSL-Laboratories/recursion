@@ -122,6 +122,23 @@ unverifiable claims still stop in `state/INBOX.md`.
 owners. Check the current assignee or project lead in Linear. Assign new issues to the owner
 of the parent issue, or leave them in Triage unassigned when unclear.
 
+## Linear is how we communicate
+
+Any agent or Grok Bot working on an issue keeps it current in Linear as work progresses:
+status, a short progress comment at meaningful milestones (started, blocked, PR opened,
+done), and the PR link.
+
+When blocked or needing help or approval, comment on the Linear issue and @mention the
+relevant teammate (look owners up dynamically; never hardcode them). Add the
+`needs-decision` label for approvals.
+
+Anything that comes up during a dev session gets filed as a new Linear issue in **Triage**
+instead of being dropped: ideas discussed, bugs or oddities found in development, and
+areas to develop or test further. Link it to the current issue when related, and dedupe
+against existing issues first.
+
+Linear is the team's primary async channel, alongside Google Meet and Discord.
+
 ## CI
 
 - Required check: `linux` (Blacksmith).

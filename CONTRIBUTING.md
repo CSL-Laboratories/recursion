@@ -39,7 +39,9 @@ Work starts in Linear (team **CSL**, project **recursion**), not as a GitHub iss
 yourself before you start. Branch `loop/work/CSL-N` (keep this convention; do not use
 Linear's copied branch name). Title the PR `CSL-N: ...` and include `Fixes CSL-N` in the
 body so Linear and GitHub stay linked. Statuses move via the GitHub integration — do not
-move them by hand. File follow-ups to **Triage**.
+move them by hand. File follow-ups to **Triage**. Keep the Linear issue current as work
+progresses, and file anything that comes up in a session to **Triage** instead of dropping
+it; Linear is the primary async channel, alongside Google Meet and Discord.
 
 ## Branch and review flow
 

@@ -101,6 +101,14 @@ Linear MCP or the Devin Linear integration. Do not start code without `CSL-N`.
 - One issue per PR; keep PRs small and stackable.
 - Comment progress on the issue. Move status to **In Progress** when work starts, then **In
   Review** when the PR is up.
+- **Shared files.** [`.github/workflows/linear-pr-sync.yml`](.github/workflows/linear-pr-sync.yml)
+  upserts one Linear comment per PR, marked `<!-- pr-sync:<repo>#<n> -->` (edit in
+  place, never a second comment). It shows the PR link, author, purpose, status
+  (draft/open/merged/closed), mergeable state, head SHA, Devin review on head,
+  and the top changed files. A push to the default branch refreshes every open
+  PR and flags `out of date / conflicts with <default-branch>`. **Grok Bots
+  must read those Linear PR-sync comments before touching shared files** —
+  three people work at once. This workflow is not a required check.
 - On your own PR, address CI comments, then resolve the threads. Eligible Devin
   findings and `@claude` mentions are handled by the Claude Code Action
   (`.github/workflows/claude.yml`; see [Review roles](#review-roles)). Do not

@@ -218,6 +218,18 @@ class HarnessTests(unittest.TestCase):
         )
         self.assertEqual(parse_verdict(feedback), ("revise", "Restore the missing error branch."))
 
+        crowded = "\n".join(
+            (
+                assistant_event([{"type": "text", "text": "x" * 1100}]),
+                assistant_event(
+                    [{"type": "text", "text": "Change the error branch.\nVERDICT revise"}]
+                ),
+            )
+        )
+        verdict, notes = parse_verdict(crowded)
+        self.assertEqual(verdict, "revise")
+        self.assertTrue(notes.startswith("Change the error branch."))
+
         stale = "\n".join(
             (
                 assistant_event([{"type": "text", "text": "VERDICT approve"}]),

@@ -93,9 +93,12 @@ protected paths, and merge still follow `CONTROL_PLANE.md`.
 **Before starting.** Find or create the issue (team **CSL**, project **recursion**) via the
 Linear MCP or the Devin Linear integration. Do not start code without `CSL-N`.
 
-**Direction and architecture.** Before proposing or deciding direction or architecture
-on an issue, run Parallel deep research (the Task API, not Search/Extract) or link an
-existing Linear comment titled **Deep research brief**, and cite it on the issue.
+**Direction and architecture.** When you are the assignee (developer or their
+coding agent working in the repo) of an issue that needs a decision or sets
+direction, run Parallel Task API deep research before proposing or deciding, in
+addition to Search/Extract. Post the cited brief (options, tradeoffs,
+recommendation, target metrics) on the Linear issue, then decide or @mention
+for approval.
 
 **Filing and shipping.**
 

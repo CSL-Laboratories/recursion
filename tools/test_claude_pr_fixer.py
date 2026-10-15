@@ -545,6 +545,11 @@ class FixerGateAndPromptTests(unittest.TestCase):
             self.assertIn("git commit -m with a short message", body, job)
             self.assertIn("use Edit/Write for files", body, job)
             self.assertIn("the gate result", body, job)
+            self.assertIn("Linear-first (CSL-88)", body, job)
+            self.assertIn("PR-sync comment", body, job)
+            self.assertIn("Context7", body, job)
+            self.assertIn("Parallel", body, job)
+            self.assertIn("Triage", body, job)
 
     def test_denials_are_reported_after_each_fixer(self) -> None:
         for job in ("claude-mention", "devin-review-fix"):
@@ -914,6 +919,10 @@ class ConflictJobStructureTests(unittest.TestCase):
         self.assertIn("no heredocs, loops, or &&", job)
         self.assertIn("exactly as written above", job)
         self.assertIn("tools/ci_gate.py --force", job)
+        self.assertIn("Linear-first (CSL-88)", job)
+        self.assertIn("PR-sync comment", job)
+        self.assertIn("Context7", job)
+        self.assertIn("Parallel", job)
 
     def test_resolver_comments_or_labels(self) -> None:
         job = self._job("conflict-resolve")

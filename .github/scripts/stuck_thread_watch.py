@@ -25,6 +25,12 @@ MEDIATION_PREFIX = "codex-mediation"
 NEEDS_DECISION_LABEL = "needs-decision"
 LINEAR_LABELS = (NEEDS_DECISION_LABEL, "recursion", "auto-filed", "Chore")
 QUOTE_LIMIT = 1500
+LINEAR_FIRST = (
+    "Linear-first (CSL-88): Work from the CSL Linear issue. Check it and its "
+    "PR-sync comment for overlap first. Post status and questions there. File "
+    "new findings to Triage. Use current docs (Context7) and web research "
+    "(Parallel) before implementing."
+)
 DEFAULT_LINEAR_REPOS = (
     "CSL-Laboratories/recursion",
 )
@@ -347,6 +353,7 @@ def mediation_body(
     return (
         f"{mediation_marker(thread.id)}\n"
         "@codex review\n\n"
+        f"{LINEAR_FIRST}\n\n"
         "Mediate this stuck GitHub review thread. Do **not** push code, commit, "
         "merge, or resolve the thread. Say which side is right and propose the "
         "minimal fix as text only.\n\n"

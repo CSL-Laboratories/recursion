@@ -150,6 +150,11 @@ class BodyTests(unittest.TestCase):
         self.assertIn("**Devin review on head:** yes", body)
         self.assertIn("Replace the out-of-repo watch.", body)
         self.assertIn("`.github/workflows/linear-pr-sync.yml`", body)
+        self.assertIn("Linear-first (CSL-88)", body)
+        self.assertIn("PR-sync comment", body)
+        self.assertIn("Context7", body)
+        self.assertIn("Parallel", body)
+        self.assertLess(body.index("<!-- pr-sync:recursion#191 -->"), body.index("Linear-first (CSL-88)"))
         self.assertNotIn("**Flag:**", body)
 
     def test_comment_flags_conflicts_with_default_branch(self) -> None:

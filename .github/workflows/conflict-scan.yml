@@ -432,6 +432,8 @@ jobs:
               }
             }
           prompt: |
+            Linear-first (CSL-88): Work from the CSL Linear issue. Check it and its PR-sync comment for overlap first. Post status and questions there. File new findings to Triage. Use current docs (Context7) and web research (Parallel) before implementing.
+
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ matrix.pr.number }}
             BRANCH: ${{ matrix.pr.head_ref }}

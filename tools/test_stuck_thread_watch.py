@@ -243,6 +243,11 @@ class CapAndBodyTests(unittest.TestCase):
         self.assertIn("couldn't fix", body)
         self.assertIn("UNTRUSTED DATA", body)
         self.assertIn("Linear record: https://linear.app/x", body)
+        self.assertIn("Linear-first (CSL-88)", body)
+        self.assertIn("PR-sync comment", body)
+        self.assertIn("Context7", body)
+        self.assertIn("Parallel", body)
+        self.assertLess(body.index("@codex review"), body.index("Linear-first (CSL-88)"))
         self.assertNotIn("git push", body.lower())
 
     def test_quote_truncates(self) -> None:

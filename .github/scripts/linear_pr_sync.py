@@ -26,6 +26,12 @@ DEVIN_DEFAULT = "devin-ai-integration[bot]"
 TOP_FILES_DEFAULT = 10
 PURPOSE_LINES = 8
 PURPOSE_CHARS = 800
+LINEAR_FIRST = (
+    "Linear-first (CSL-88): Work from the CSL Linear issue. Check it and its "
+    "PR-sync comment for overlap first. Post status and questions there. File "
+    "new findings to Triage. Use current docs (Context7) and web research "
+    "(Parallel) before implementing."
+)
 BEHIND_STATES = frozenset({"dirty", "behind"})
 PENDING_MERGEABLE = frozenset({"", "unknown"})
 MERGEABLE_RETRIES = 3
@@ -208,6 +214,7 @@ def comment_body(pull: PullSnapshot, cfg: Config) -> str:
     mergeable = pull.mergeable_state or "unknown"
     return (
         f"{marker}\n"
+        f"{LINEAR_FIRST}\n\n"
         f"## GitHub PR {repo_short_name(cfg.repo)}#{pull.number}\n\n"
         f"- **PR:** {pull.url}\n"
         f"- **Author:** {pull.author or '(unknown)'}\n"

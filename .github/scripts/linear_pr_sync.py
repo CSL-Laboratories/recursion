@@ -371,11 +371,15 @@ class GitHubClient:
         attempts = [0] * len(out)
         deadline = self._clock() + self._mergeable_deadline_s
         while pending:
-            if self._clock() >= deadline:
+            remaining = deadline - self._clock()
+            if remaining <= 0:
                 break
             index = pending.pop(0)
-            time.sleep(MERGEABLE_WAIT_S)
-            timeout = min(MERGEABLE_REFRESH_TIMEOUT_S, max(1.0, deadline - self._clock()))
+            time.sleep(min(MERGEABLE_WAIT_S, remaining))
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                break
+            timeout = min(MERGEABLE_REFRESH_TIMEOUT_S, remaining)
             try:
                 data = self._request(self._pr_url(out[index].number), timeout=timeout)
             except Exception as exc:  # noqa: BLE001 — keep refreshing later PRs

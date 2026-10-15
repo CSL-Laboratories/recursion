@@ -458,7 +458,7 @@ class HttpGuardTests(unittest.TestCase):
             snaps = client.settle_mergeable(snaps)
         self.assertEqual(slept.call_count, 2)
         self.assertEqual(fetches[11], 2)
-        self.assertEqual(fetches[12], 2)
+        self.assertEqual(fetches[12], 1)
         self.assertEqual(fetches[13], 1)
         self.assertEqual([s.mergeable_state for s in snaps], ["unknown", "unknown", "unknown"])
 

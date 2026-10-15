@@ -164,9 +164,9 @@ def run_task(
         raise exc
 
     def notify_replacement(provider_name: str) -> None:
-        if holder.get("notified") or provider is None or not provider_name or provider_name == provider:
+        if holder.get("notified") == provider_name or provider is None or not provider_name or provider_name == provider:
             return
-        holder["notified"] = True
+        holder["notified"] = provider_name
         print(
             f"notice: requested provider {provider} was replaced by {provider_name}",
             file=sys.stderr,
@@ -275,6 +275,7 @@ def run_task(
             break
         result = revised
         holder["provider"] = result.provider
+        notify_replacement(result.provider)
         add_usage(usage, parse_usage(result.text))
         shown = assistant_text(result.text)
         if exceeded(usage, budgets):

@@ -139,9 +139,32 @@ label, not by editing config.
 - **Blacksmith** is the only CI.
 - Cursor, Codex, Grok, and interactive Claude Code develop features from Linear
   issues. They must not post review verdicts or run review-fix loops on other
-  agents' PRs. The author agent may fix CI failures on its own PR.
+  agents' PRs, except the Codex `CODEX-GATE:` line in [Code Review Rules](#code-review-rules).
+  The author agent may fix CI failures on its own PR.
 - Humans still merge (`CONTROL_PLANE.md`). Independent task gates still apply; they are not
   a substitute for Devin PR review.
+
+## Code Review Rules
+
+Codex GitHub reviews are the CI/fixer gate on this repository (CSL-102), not a
+reviewer of record. Devin still reviews; Claude still fixes. End **every** Codex
+review with exactly one of these lines as the last line of the review body
+(not in a code fence, not only in an inline comment):
+
+CODEX-GATE: FIX
+CODEX-GATE: READY
+CODEX-GATE: MEDIATE
+
+- **FIX** — Devin findings (or other review issues) still need one batched
+  Claude PR Fixer run (`devin-review-fix`).
+- **READY** — no fixer; apply the `ci:full` label so the full CI matrix runs.
+- **MEDIATE** — Devin and Claude are stuck; hand off to
+  `.github/workflows/stuck-thread-watch.yml`. Do not push, merge, or resolve
+  threads.
+
+Do not omit the verdict line. A human `@claude` mention still runs the mention
+fixer immediately and bypasses the per-PR daily fixer cap (3 batched fixer
+runs per UTC day).
 
 ## Automations
 

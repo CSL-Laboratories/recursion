@@ -295,6 +295,42 @@ class DevinMatrixTests(unittest.TestCase):
         event["review"]["user"]["login"] = "alice"
         self.assertEqual(decide("pull_request_review", event)["devin"], "false")
 
+    def test_dispatch_on_member_same_repo_pr_sets_devin(self) -> None:
+        event = {"inputs": {"pr_number": "42"}}
+        got = decide("workflow_dispatch", event, pr=pr_payload())
+        self.assertEqual(got["devin"], "true")
+        self.assertEqual(got["mention"], "false")
+        self.assertEqual(got["head_ref"], "feature/fix")
+
+    def test_repository_dispatch_sets_devin(self) -> None:
+        event = {"client_payload": {"pr_number": 42}}
+        got = decide("repository_dispatch", event, pr=pr_payload())
+        self.assertEqual(got["devin"], "true")
+
+    def test_dispatch_on_fork_is_skipped(self) -> None:
+        event = {"inputs": {"pr_number": "42"}}
+        got = decide("workflow_dispatch", event, pr=pr_payload(head_repo="evil/fork"))
+        self.assertEqual(got["devin"], "false")
+        self.assertEqual(got["same_repo"], "false")
+
+    def test_dispatch_pr_number_rejects_junk(self) -> None:
+        self.assertEqual(
+            gate.dispatch_pr_number("workflow_dispatch", {"inputs": {"pr_number": "42"}}),
+            "42",
+        )
+        self.assertEqual(
+            gate.dispatch_pr_number("repository_dispatch", {"client_payload": {"pr_number": 9}}),
+            "9",
+        )
+        self.assertEqual(
+            gate.dispatch_pr_number("workflow_dispatch", {"inputs": {"pr_number": "0"}}),
+            "",
+        )
+        self.assertEqual(
+            gate.dispatch_pr_number("workflow_dispatch", {"inputs": {"pr_number": "../7"}}),
+            "",
+        )
+
     def test_unsafe_ref_is_rejected(self) -> None:
         got = decide("pull_request_review", self._review(head_ref="feat/../master"))
         self.assertEqual(got["head_ref"], "")
@@ -350,6 +386,23 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn("needs.resolve-pr.outputs.same_repo == 'true'", mention)
         self.assertIn("needs.resolve-pr.outputs.devin == 'true'", devin)
         self.assertIn("needs.resolve-pr.outputs.same_repo == 'true'", devin)
+        self.assertIn("github.event_name == 'workflow_dispatch'", devin)
+        self.assertIn("github.event_name == 'repository_dispatch'", devin)
+
+    def test_resolve_pr_job_if_skips_bots(self) -> None:
+        resolve = self._job("resolve-pr")
+        header = resolve.split("runs-on:", 1)[0]
+        self.assertIn("github.event.sender.type != 'Bot'", header)
+        self.assertIn("github.event.comment.user.type != 'Bot'", header)
+        self.assertIn("contains(github.event.comment.body, '@claude')", header)
+        self.assertIn("devin-ai-integration[bot]", header)
+        self.assertIn("chatgpt-codex-connector[bot]", header)
+        self.assertIn("workflow_dispatch", header)
+        self.assertIn("repository_dispatch", header)
+        self.assertNotIn(
+            "github.event_name == 'pull_request_review_comment' ||",
+            header,
+        )
 
     def test_every_privileged_checkout_uses_pr_head_sha(self) -> None:
         mention = self._job("claude-mention")
@@ -392,6 +445,7 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn("collaborators/{login}/permission", source)
         self.assertNotIn("MEMBER_ASSOC", source)
         self.assertIn("GH_TOKEN: ${{ github.token }}", self._job("resolve-pr"))
+        self.assertIn("DISPATCH_EVENTS", source)
 
     def test_acceptance_gates_before_push(self) -> None:
         devin = self._job("devin-review-fix")
@@ -869,7 +923,9 @@ class ConflictJobStructureTests(unittest.TestCase):
         fixer_on = self.fixer.split("jobs:", 1)[0]
         scan_on = self.text.split("jobs:", 1)[0]
         self.assertNotIn("schedule:", fixer_on)
-        self.assertNotIn("workflow_dispatch:", fixer_on)
+        self.assertIn("workflow_dispatch:", fixer_on)
+        self.assertIn("repository_dispatch:", fixer_on)
+        self.assertIn("devin-review-fix", fixer_on)
         self.assertNotIn("\n  conflict-scan:\n", self.fixer)
         self.assertNotIn("\n  conflict-resolve:\n", self.fixer)
         self.assertIn(SCAN_CRON, scan_on)
@@ -940,7 +996,13 @@ class ActionlintTests(unittest.TestCase):
         if not exe:
             self.skipTest("actionlint not on PATH")
         result = subprocess.run(
-            [exe, "-color", str(WORKFLOW_PATH), str(SCAN_WORKFLOW_PATH)],
+            [
+                exe,
+                "-color",
+                str(WORKFLOW_PATH),
+                str(SCAN_WORKFLOW_PATH),
+                str(ROOT / ".github" / "workflows" / "codex-gate.yml"),
+            ],
             cwd=ROOT,
             check=False,
             capture_output=True,

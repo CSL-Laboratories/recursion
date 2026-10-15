@@ -36,9 +36,10 @@ BEHIND_STATES = frozenset({"dirty", "behind"})
 PENDING_MERGEABLE = frozenset({"", "unknown"})
 MERGEABLE_RETRIES = 3
 MERGEABLE_WAIT_S = 2.0
-# Run-wide sleep cap so a bulk refresh cannot fill the 5-minute job.
-# Each PR still has its own MERGEABLE_RETRIES allowance inside that window.
+# Run-wide wall-clock cap (sleep + requests) so settle cannot fill the
+# 5-minute job. Each PR still has its own MERGEABLE_RETRIES allowance.
 MERGEABLE_DEADLINE_S = 90.0
+MERGEABLE_REFRESH_TIMEOUT_S = 10.0
 REVIEW_PAGES = 10
 FORBIDDEN_GITHUB_PATH = re.compile(
     r"/(merge|merge-upstream|resolve|dismissals)(/|$)",
@@ -232,12 +233,18 @@ def comment_body(pull: PullSnapshot, cfg: Config) -> str:
 
 
 class GitHubClient:
-    def __init__(self, cfg: Config, opener: Callable[..., Any] | None = None) -> None:
+    def __init__(
+        self,
+        cfg: Config,
+        opener: Callable[..., Any] | None = None,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
         self.cfg = cfg
         self._opener = opener or urllib.request.urlopen
+        self._clock = clock or time.monotonic
         self._mergeable_deadline_s = MERGEABLE_DEADLINE_S
 
-    def _request(self, url: str, *, method: str = "GET") -> Any:
+    def _request(self, url: str, *, method: str = "GET", timeout: float = 60) -> Any:
         parsed = urlparse(url)
         if parsed.scheme != "https" or parsed.netloc != "api.github.com":
             raise RuntimeError(f"refusing non-GitHub URL: {parsed.netloc or url}")
@@ -253,7 +260,7 @@ class GitHubClient:
         }
         req = urllib.request.Request(url, headers=headers, method=method)
         try:
-            with self._opener(req, timeout=60) as resp:
+            with self._opener(req, timeout=timeout) as resp:
                 body = resp.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:300]
@@ -350,10 +357,10 @@ class GitHubClient:
     def settle_mergeable(self, pulls: list[PullSnapshot]) -> list[PullSnapshot]:
         """Give each pending PR its own mergeable retries, round-robin.
 
-        First snapshots come from load_pull(wait=False). Each PR may sleep up to
-        MERGEABLE_RETRIES times. A run-wide deadline caps total sleep so a large
-        scan cannot fill the job timeout; it does not let early PRs spend later
-        PRs' retry allowance.
+        First snapshots come from load_pull(wait=False). Each PR may retry up to
+        MERGEABLE_RETRIES times. A wall-clock deadline (sleep plus request time)
+        stops refresh work in time for Linear writes; it does not let early PRs
+        spend later PRs' retry allowance.
         """
         out = list(pulls)
         pending = [
@@ -362,13 +369,15 @@ class GitHubClient:
             if (pull.mergeable_state or "").strip().lower() in PENDING_MERGEABLE
         ]
         attempts = [0] * len(out)
-        remaining = self._mergeable_deadline_s
-        while pending and remaining >= MERGEABLE_WAIT_S:
+        deadline = self._clock() + self._mergeable_deadline_s
+        while pending:
+            if self._clock() >= deadline:
+                break
             index = pending.pop(0)
             time.sleep(MERGEABLE_WAIT_S)
-            remaining -= MERGEABLE_WAIT_S
+            timeout = min(MERGEABLE_REFRESH_TIMEOUT_S, max(1.0, deadline - self._clock()))
             try:
-                data = self._request(self._pr_url(out[index].number))
+                data = self._request(self._pr_url(out[index].number), timeout=timeout)
             except Exception as exc:  # noqa: BLE001 — keep refreshing later PRs
                 notice(f"PR #{out[index].number} mergeable refresh skipped: {exc}")
                 continue

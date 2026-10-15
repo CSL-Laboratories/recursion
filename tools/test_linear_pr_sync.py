@@ -330,7 +330,7 @@ class HttpGuardTests(unittest.TestCase):
             },
         ]
 
-        def fake_request(url: str, *, method: str = "GET") -> Any:
+        def fake_request(url: str, *, method: str = "GET", **_kwargs: Any) -> Any:
             if "/reviews" in url:
                 return []
             if "/files" in url:
@@ -363,7 +363,7 @@ class HttpGuardTests(unittest.TestCase):
             },
         }
 
-        def fake_request(url: str, *, method: str = "GET") -> Any:
+        def fake_request(url: str, *, method: str = "GET", **_kwargs: Any) -> Any:
             if "/reviews" in url or "/files" in url:
                 return []
             return pending
@@ -397,7 +397,7 @@ class HttpGuardTests(unittest.TestCase):
                 },
             }
 
-        def fake_request(url: str, *, method: str = "GET") -> Any:
+        def fake_request(url: str, *, method: str = "GET", **_kwargs: Any) -> Any:
             if "/reviews" in url or "/files" in url:
                 return []
             number = int(url.rstrip("/").rsplit("/", 1)[-1])
@@ -437,17 +437,22 @@ class HttpGuardTests(unittest.TestCase):
                 },
             }
 
-        def fake_request(url: str, *, method: str = "GET") -> Any:
+        def fake_request(url: str, *, method: str = "GET", **_kwargs: Any) -> Any:
             if "/reviews" in url or "/files" in url:
                 return []
             number = int(url.rstrip("/").rsplit("/", 1)[-1])
             fetches[number] = fetches.get(number, 0) + 1
             return payload(number)
 
-        client = mod.GitHubClient(cfg())
+        now = [0.0]
+
+        def sleep(sec: float) -> None:
+            now[0] += sec
+
+        client = mod.GitHubClient(cfg(), clock=lambda: now[0])
         client._mergeable_deadline_s = mod.MERGEABLE_WAIT_S * 2
         with mock.patch.object(client, "_request", side_effect=fake_request), mock.patch.object(
-            mod.time, "sleep"
+            mod.time, "sleep", side_effect=sleep
         ) as slept:
             snaps = [client.load_pull(n, wait=False) for n in (11, 12, 13)]
             snaps = client.settle_mergeable(snaps)
@@ -474,7 +479,7 @@ class HttpGuardTests(unittest.TestCase):
             },
         }
 
-        def fake_request(url: str, *, method: str = "GET") -> Any:
+        def fake_request(url: str, *, method: str = "GET", **_kwargs: Any) -> Any:
             if "/reviews" in url or "/files" in url:
                 return []
             payload = dict(pending)
@@ -512,7 +517,7 @@ class HttpGuardTests(unittest.TestCase):
                 },
             }
 
-        def fake_request(url: str, *, method: str = "GET") -> Any:
+        def fake_request(url: str, *, method: str = "GET", **_kwargs: Any) -> Any:
             if "/reviews" in url or "/files" in url:
                 return []
             number = int(url.rstrip("/").rsplit("/", 1)[-1])
@@ -531,6 +536,50 @@ class HttpGuardTests(unittest.TestCase):
             snaps = client.settle_mergeable(snaps)
         self.assertEqual(snaps[0].mergeable_state, "unknown")
         self.assertEqual(snaps[1].mergeable_state, "dirty")
+
+    def test_settle_wall_clock_includes_request_time(self) -> None:
+        now = [0.0]
+        fetches: dict[int, int] = {}
+
+        def payload(number: int) -> dict[str, Any]:
+            return {
+                "number": number,
+                "title": f"CSL-87: pr {number}",
+                "html_url": f"https://github.com/CSL-Laboratories/recursion/pull/{number}",
+                "user": {"login": "a"},
+                "state": "open",
+                "draft": False,
+                "merged": False,
+                "mergeable": None,
+                "mergeable_state": "unknown",
+                "head": {
+                    "sha": "abc",
+                    "repo": {"full_name": "CSL-Laboratories/recursion"},
+                },
+            }
+
+        def fake_request(url: str, *, method: str = "GET", timeout: float = 60, **_kwargs: Any) -> Any:
+            if "/reviews" in url or "/files" in url:
+                return []
+            number = int(url.rstrip("/").rsplit("/", 1)[-1])
+            fetches[number] = fetches.get(number, 0) + 1
+            if fetches[number] > 1:
+                now[0] += min(5.0, timeout)
+            return payload(number)
+
+        def sleep(sec: float) -> None:
+            now[0] += sec
+
+        client = mod.GitHubClient(cfg(), clock=lambda: now[0])
+        client._mergeable_deadline_s = 12.0
+        with mock.patch.object(client, "_request", side_effect=fake_request), mock.patch.object(
+            mod.time, "sleep", side_effect=sleep
+        ):
+            snaps = [client.load_pull(n, wait=False) for n in range(1, 16)]
+            snaps = client.settle_mergeable(snaps)
+        self.assertEqual(len(snaps), 15)
+        self.assertLess(sum(1 for count in fetches.values() if count > 1), 15)
+        self.assertLessEqual(now[0], 12.0)
 
     def test_reviews_paginate_until_devin_on_head(self) -> None:
         pr = {
@@ -559,7 +608,7 @@ class HttpGuardTests(unittest.TestCase):
             }
         ]
 
-        def fake_request(url: str, *, method: str = "GET") -> Any:
+        def fake_request(url: str, *, method: str = "GET", **_kwargs: Any) -> Any:
             if url.endswith("/pulls/191"):
                 return pr
             if "/files" in url:

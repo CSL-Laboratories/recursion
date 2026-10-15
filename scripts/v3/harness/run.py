@@ -91,9 +91,9 @@ def run_task(
     def dispatch(names: list[str], request: ProviderRequest, *, on_exhaust: str) -> tuple[str, object]:
         """Try each provider. Availability failures cool down and move on."""
 
-        active = snapshot()
         disabled: LiveProviderDisabled | None = None
         for name in names:
+            active = snapshot()
             if name in active:
                 attempts.append(
                     {
@@ -119,6 +119,14 @@ def run_task(
                 save_failure("timed-out", exc)
                 raise
             except LiveProviderDisabled as exc:
+                if on_exhaust == "fail":
+                    # A worker must not fall through to an offline adapter and
+                    # be recorded as a real completion.
+                    attempts.append(
+                        {"error": "LiveProviderDisabled", "ok": False, "provider": name}
+                    )
+                    save_failure("failed", exc)
+                    raise
                 disabled = disabled or exc
                 attempts.append(
                     {"error": "LiveProviderDisabled", "ok": False, "provider": name}

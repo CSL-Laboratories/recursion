@@ -62,12 +62,20 @@ def call_fits(spent: dict, budgets: dict, prompt: str) -> bool:
     """False when starting this call would pass a known ceiling.
 
     A known figure already at its ceiling refuses the call. The prompt is not
-    measured: character length is not a lower bound on token count, and the
+    measured: character length is not a lower bound on token count, but a
+    nonempty prompt costs at least one input token, so an input allowance
+    below one refuses the call even when prior usage is unknown. The
     post-call check still enforces the ceiling.
     """
 
-    del prompt
-    return not _at_or_over(spent, budgets)
+    if _at_or_over(spent, budgets):
+        return False
+    limit = budgets.get("max_input_tokens")
+    if limit is not None and prompt:
+        used = spent.get("input_tokens")
+        if limit - (0 if used is None else used) < 1:
+            return False
+    return True
 
 
 def exceeded(spent: dict, budgets: dict) -> bool:

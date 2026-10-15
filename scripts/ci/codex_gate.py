@@ -25,7 +25,6 @@ ACTED_PREFIX = "codex-gate-acted"
 FIXER_RUN_PREFIX = "codex-fixer-run"
 DEVIN_REVIEW_LOGIN = "devin-ai-integration[bot]"
 CODEX_REVIEW_LOGIN = "chatgpt-codex-connector[bot]"
-ALLOWED_REVIEW_LOGINS = frozenset({DEVIN_REVIEW_LOGIN, CODEX_REVIEW_LOGIN})
 DISPATCH_EVENTS = frozenset({"workflow_dispatch", "repository_dispatch"})
 MENTION_EVENTS = frozenset({"issue_comment", "pull_request_review_comment"})
 VERDICT_RE = re.compile(r"^CODEX-GATE:\s*(FIX|READY|MEDIATE)\s*$", re.MULTILINE)
@@ -61,11 +60,7 @@ def _norm_login(value: str | None) -> str:
 
 
 def is_codex_login(login: str | None) -> bool:
-    return _norm_login(login) == "chatgpt-codex-connector"
-
-
-def is_devin_login(login: str | None) -> bool:
-    return _norm_login(login) == "devin-ai-integration"
+    return _norm_login(login) == _norm_login(CODEX_REVIEW_LOGIN)
 
 
 def is_bot_type(user_type: str | None) -> bool:
@@ -124,8 +119,8 @@ def cap_reached(bodies: list[str], day: str, *, bypass: bool = False) -> bool:
 def admit_resolve_pr(event_name: str, event: dict[str, Any]) -> bool:
     """Mirror of the claude.yml resolve-pr job-level `if:`.
 
-    Skipped events must not allocate a runner. Allow only Devin/Codex submitted
-    reviews, human @claude comments, and fixer dispatch events.
+    Skipped events must not allocate a runner. Allow only human @claude comments
+    and fixer dispatch events. Devin/Codex reviews are handled by codex-gate.yml.
     """
     if event_name in DISPATCH_EVENTS:
         return True
@@ -140,9 +135,6 @@ def admit_resolve_pr(event_name: str, event: dict[str, Any]) -> bool:
         if is_bot_type(user.get("type")):
             return False
         return "@claude" in (comment.get("body") or "")
-    if event_name == "pull_request_review":
-        login = login_of(((event.get("review") or {}).get("user") or {}).get("login"))
-        return login in ALLOWED_REVIEW_LOGINS
     return False
 
 
@@ -155,7 +147,7 @@ def request_comment_body(sha: str) -> str:
         "CODEX-GATE: FIX\n"
         "CODEX-GATE: READY\n"
         "CODEX-GATE: MEDIATE\n\n"
-        "- FIX: Devin findings still need one batched Claude PR Fixer run.\n"
+        "- FIX: unresolved Devin review threads still need one batched fixer run.\n"
         "- READY: no fixer; the `ci:full` label should be applied.\n"
         "- MEDIATE: Devin and Claude are stuck; hand off to stuck-thread-watch.\n\n"
         "Do not push, merge, or resolve threads.\n"
@@ -169,10 +161,12 @@ def acted_comment_body(sha: str, verdict: str, extra: str = "") -> str:
 
 
 def fixer_dispatch_comment_body(sha: str, day: str, reason: str) -> str:
+    # Acted marker only. The daily-run marker is posted by claude.yml when a
+    # fixer job actually starts, so a failed `gh workflow run` cannot consume
+    # a cap slot and a successful dispatch is not double-counted.
     return (
-        f"{fixer_run_marker(day)}\n"
         f"{acted_marker(sha)}\n"
-        f"Codex gate: dispatching batched Devin review fixer ({reason}).\n"
+        f"Codex gate: dispatching batched Devin review fixer ({reason}) on {day}.\n"
     )
 
 
@@ -274,18 +268,37 @@ def _gh(args: list[str], token: str, input_text: str | None = None) -> str:
     return result.stdout
 
 
+class ListingError(ValueError):
+    """gh --paginate produced a listing we cannot parse. Fail closed."""
+
+
 def _parse_json_list(raw: str) -> list[Any]:
-    text = (raw or "").strip()
-    if not text:
+    """Parse one JSON array or gh --paginate's concatenated/newline-separated pages.
+
+    Fail closed on malformed input: callers must not treat a parse failure as
+    an empty history (that would miss markers and blow the daily cap).
+    """
+    text = raw or ""
+    if not text.strip():
         return []
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
+    items: list[Any] = []
+    decoder = json.JSONDecoder()
+    idx = 0
+    length = len(text)
+    while idx < length:
+        while idx < length and text[idx].isspace():
+            idx += 1
+        if idx >= length:
+            break
         try:
-            data = json.loads("[" + text.replace("][", ",") + "]")
-        except json.JSONDecodeError:
-            return []
-    return data if isinstance(data, list) else []
+            data, end = decoder.raw_decode(text, idx)
+        except json.JSONDecodeError as exc:
+            raise ListingError("malformed JSON listing") from exc
+        if not isinstance(data, list):
+            raise ListingError("listing is not a JSON array")
+        items.extend(data)
+        idx = end
+    return items
 
 
 def list_comment_bodies(repo: str, number: str, token: str, gh: GhCall = _gh) -> list[str]:
@@ -376,8 +389,11 @@ def run_request(
         try:
             comments = list_comment_bodies(repo, number, read_token, gh=gh)
             reviews = list_reviews(repo, number, read_token, gh=gh)
-        except (OSError, subprocess.CalledProcessError, json.JSONDecodeError, ValueError):
-            comments, reviews = [], []
+        except (OSError, subprocess.CalledProcessError, json.JSONDecodeError, ListingError, ValueError):
+            notice("failed to list PR comments/reviews; skipping (no failure)")
+            out = {"proceed": "false", "pr_number": number, "head_sha": sha, "action": "skip-listing"}
+            emit(out)
+            return out
     decision = decide_request(
         pat=pat,
         same_repo=same_repo,
@@ -421,10 +437,6 @@ def _dispatch_fixer(
     if not pat:
         notice("CODEX_TRIGGER_PAT is missing; skipping fixer dispatch (no failure)")
         return False
-    try:
-        post_comment(repo, number, fixer_dispatch_comment_body(sha, day, reason), pat, gh=gh)
-    except (OSError, subprocess.CalledProcessError):
-        notice("failed to post fixer-run marker; continuing to dispatch")
     ok = dispatch_workflow(
         repo,
         FIXER_WORKFLOW,
@@ -435,9 +447,13 @@ def _dispatch_fixer(
     )
     if not ok:
         notice(f"fixer dispatch to {FIXER_WORKFLOW} failed; skipping (no failure)")
-    else:
-        log(f"dispatched {FIXER_WORKFLOW} for PR #{number} ({reason})")
-    return ok
+        return False
+    try:
+        post_comment(repo, number, fixer_dispatch_comment_body(sha, day, reason), pat, gh=gh)
+    except (OSError, subprocess.CalledProcessError):
+        notice("dispatched fixer but failed to post run marker")
+    log(f"dispatched {FIXER_WORKFLOW} for PR #{number} ({reason})")
+    return True
 
 
 def run_verdict(
@@ -455,12 +471,18 @@ def run_verdict(
     number = safe_pr_number(pr.get("number"))
     sha = safe_head_sha(review.get("commit_id") or (pr.get("head") or {}).get("sha"))
     login = ((review.get("user") or {}).get("login"))
+    if _head_repo(pr) != repo or bool(pr.get("draft")):
+        notice("skipping Codex verdict on a fork or draft PR")
+        emit({"action": "skip-fork", "pr_number": number, "head_sha": sha})
+        return {"action": "skip-fork", "verdict": ""}
     comments: list[str] = []
     if number and read_token:
         try:
             comments = list_comment_bodies(repo, number, read_token, gh=gh)
-        except (OSError, subprocess.CalledProcessError, json.JSONDecodeError, ValueError):
-            comments = []
+        except (OSError, subprocess.CalledProcessError, json.JSONDecodeError, ListingError, ValueError):
+            notice("failed to list PR comments; skipping verdict (no failure)")
+            emit({"action": "skip-listing", "pr_number": number, "head_sha": sha})
+            return {"action": "skip-listing", "verdict": ""}
     today = day or utc_day()
     decision = decide_verdict(
         login=login,
@@ -534,8 +556,10 @@ def run_fallback(
         try:
             comments = list_comment_bodies(repo, number, read_token, gh=gh)
             reviews = list_reviews(repo, number, read_token, gh=gh)
-        except (OSError, subprocess.CalledProcessError, json.JSONDecodeError, ValueError):
-            comments, reviews = [], []
+        except (OSError, subprocess.CalledProcessError, json.JSONDecodeError, ListingError, ValueError):
+            notice("failed to list PR comments/reviews; skipping timeout fallback (no failure)")
+            emit({"action": "skip-listing", "pr_number": number, "head_sha": sha})
+            return {"action": "skip-listing"}
     today = day or utc_day()
     decision = decide_fallback(sha=sha, comments=comments, reviews=reviews, day=today)
     action = decision["action"]

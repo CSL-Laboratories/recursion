@@ -395,8 +395,9 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn("github.event.sender.type != 'Bot'", header)
         self.assertIn("github.event.comment.user.type != 'Bot'", header)
         self.assertIn("contains(github.event.comment.body, '@claude')", header)
-        self.assertIn("devin-ai-integration[bot]", header)
-        self.assertIn("chatgpt-codex-connector[bot]", header)
+        self.assertNotIn("devin-ai-integration[bot]", header)
+        self.assertNotIn("chatgpt-codex-connector[bot]", header)
+        self.assertNotIn("github.event_name == 'pull_request_review' &&", header)
         self.assertIn("workflow_dispatch", header)
         self.assertIn("repository_dispatch", header)
         self.assertNotIn(
@@ -868,10 +869,14 @@ class ConflictScanTests(unittest.TestCase):
 
         self.assertTrue(self.mod.fixer_busy(REPO, "1", make([{"id": 2, "event": "issue_comment"}])))
         self.assertTrue(self.mod.fixer_busy(REPO, "1", make([{"id": 2, "event": "pull_request_review"}])))
+        self.assertTrue(self.mod.fixer_busy(REPO, "1", make([{"id": 2, "event": "workflow_dispatch"}])))
+        self.assertTrue(self.mod.fixer_busy(REPO, "1", make([{"id": 2, "event": "repository_dispatch"}])))
         self.assertFalse(self.mod.fixer_busy(REPO, "1", make([{"id": 1, "event": "issue_comment"}])))
         self.assertFalse(self.mod.fixer_busy(REPO, "1", make([{"id": 2, "event": "schedule"}])))
         self.assertFalse(self.mod.fixer_busy(REPO, "1", make([{"id": 2, "event": "pull_request"}])))
         self.assertTrue(self.mod.fixer_busy(REPO, "1", lambda path: {"message": "error"}))
+        self.assertIn("workflow_dispatch", self.mod.FIXER_EVENTS)
+        self.assertIn("repository_dispatch", self.mod.FIXER_EVENTS)
 
     def test_fixer_busy_follows_run_pages(self) -> None:
         def get(path):
@@ -1025,7 +1030,13 @@ class FixerLoopCapTests(unittest.TestCase):
         end = text.index("\n      - ", run)
         cls.script = textwrap.dedent(text[run:end])
 
-    def _run(self, commits: list[tuple[str, str]], comments: list[str]) -> tuple[str, str]:
+    def _run(
+        self,
+        commits: list[tuple[str, str]],
+        comments: list[str],
+        *,
+        bypass_cap: str | None = None,
+    ) -> tuple[str, str]:
         import os
         import shutil
         import subprocess
@@ -1052,6 +1063,8 @@ class FixerLoopCapTests(unittest.TestCase):
             out.write_text("", encoding="utf-8")
             env = dict(os.environ, PATH=f"{d}{os.pathsep}{os.environ.get('PATH', '')}", GITHUB_OUTPUT=str(out),
                        REPO="o/r", PR_NUMBER="1", HEAD_SHA="abc123", GH_TOKEN="x")
+            if bypass_cap is not None:
+                env["BYPASS_CAP"] = bypass_cap
             subprocess.run(["bash", "-c", self.script], env=env, check=True, capture_output=True)
             posted = (d / "posted").read_text(encoding="utf-8") if (d / "posted").exists() else ""
             return out.read_text(encoding="utf-8"), posted
@@ -1063,6 +1076,31 @@ class FixerLoopCapTests(unittest.TestCase):
 
     def test_two_claude_commits_runs(self) -> None:
         out, posted = self._run([("alice", "Alice")] + [("claude[bot]", "claude[bot]")] * 2, [])
+        self.assertIn("skip=false", out)
+        self.assertEqual(posted.count("posted"), 1)
+
+    def test_daily_fixer_cap_skips_after_three_markers(self) -> None:
+        from datetime import datetime, timezone
+
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        marker = f"<!-- codex-fixer-run:{day} -->"
+        out, posted = self._run(
+            [("alice", "Alice")],
+            [marker] * 3,
+        )
+        self.assertIn("skip=true", out)
+        self.assertEqual(posted, "")
+
+    def test_bypass_cap_ignores_daily_markers(self) -> None:
+        from datetime import datetime, timezone
+
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        marker = f"<!-- codex-fixer-run:{day} -->"
+        out, posted = self._run(
+            [("alice", "Alice")],
+            [marker] * 3,
+            bypass_cap="true",
+        )
         self.assertIn("skip=false", out)
         self.assertEqual(posted, "")
 

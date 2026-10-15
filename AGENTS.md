@@ -155,8 +155,8 @@ CODEX-GATE: FIX
 CODEX-GATE: READY
 CODEX-GATE: MEDIATE
 
-- **FIX** — Devin findings (or other review issues) still need one batched
-  Claude PR Fixer run (`devin-review-fix`).
+- **FIX** — unresolved Devin review threads still need one batched Claude PR
+  Fixer run (`devin-review-fix`). The fixer only addresses Devin threads.
 - **READY** — no fixer; apply the `ci:full` label so the full CI matrix runs.
 - **MEDIATE** — Devin and Claude are stuck; hand off to
   `.github/workflows/stuck-thread-watch.yml`. Do not push, merge, or resolve

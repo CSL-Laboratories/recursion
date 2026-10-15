@@ -37,6 +37,10 @@ def load_gate():
 gate = load_gate()
 
 
+def gh_blob(args: list) -> str:
+    return " ".join(str(a) for a in args)
+
+
 def review_event(*, login: str, body: str, sha: str = SHA, number: int = 7) -> dict:
     return {
         "review": {
@@ -85,6 +89,11 @@ class MarkerAndVerdictTests(unittest.TestCase):
         self.assertIn(gate.gate_marker(SHA), body)
         for verdict in ("FIX", "READY", "MEDIATE"):
             self.assertIn(f"CODEX-GATE: {verdict}", body)
+
+    def test_dispatch_comment_does_not_consume_daily_cap(self) -> None:
+        body = gate.fixer_dispatch_comment_body(SHA, "2026-10-15", "codex-fix")
+        self.assertIn(gate.acted_marker(SHA), body)
+        self.assertNotIn(gate.fixer_run_marker("2026-10-15"), body)
 
     def test_fixer_run_cap(self) -> None:
         day = "2026-10-15"
@@ -144,14 +153,14 @@ class AdmitResolvePrTests(unittest.TestCase):
         }
         self.assertFalse(gate.admit_resolve_pr("pull_request_review_comment", event))
 
-    def test_devin_and_codex_reviews_are_admitted(self) -> None:
-        for login in ("devin-ai-integration[bot]", "chatgpt-codex-connector[bot]"):
+    def test_reviews_are_rejected_resolve_pr_does_not_run_for_them(self) -> None:
+        for login in (
+            gate.DEVIN_REVIEW_LOGIN,
+            gate.CODEX_REVIEW_LOGIN,
+            "cursor[bot]",
+        ):
             event = {"review": {"user": {"login": login}}}
-            self.assertTrue(gate.admit_resolve_pr("pull_request_review", event), login)
-
-    def test_other_bot_review_is_rejected(self) -> None:
-        event = {"review": {"user": {"login": "cursor[bot]"}}}
-        self.assertFalse(gate.admit_resolve_pr("pull_request_review", event))
+            self.assertFalse(gate.admit_resolve_pr("pull_request_review", event), login)
 
     def test_dispatch_is_admitted(self) -> None:
         self.assertTrue(gate.admit_resolve_pr("workflow_dispatch", {}))
@@ -277,16 +286,37 @@ class DecisionTests(unittest.TestCase):
         )
 
 
+class ListingParseTests(unittest.TestCase):
+    def test_parse_json_list_pages_and_fails_closed(self) -> None:
+        self.assertEqual(gate._parse_json_list(""), [])
+        self.assertEqual(gate._parse_json_list("[]"), [])
+        self.assertEqual(
+            gate._parse_json_list('[{"a": 1}]\n[{"a": 2}]'),
+            [{"a": 1}, {"a": 2}],
+        )
+        self.assertEqual(
+            gate._parse_json_list('[{"a": 1}][{"a": 2}]'),
+            [{"a": 1}, {"a": 2}],
+        )
+        with self.assertRaises(gate.ListingError):
+            gate._parse_json_list('{"not": "a list"}')
+        with self.assertRaises(gate.ListingError):
+            gate._parse_json_list('[{"a": 1}] trash')
+        with self.assertRaises(gate.ListingError):
+            gate._parse_json_list("not-json")
+
+
 class NoticeAndIoTests(unittest.TestCase):
     def test_run_request_missing_pat_emits_notice_and_does_not_post(self) -> None:
         calls: list[list[str]] = []
 
         def gh(args, token, input_text=None):
             calls.append(args)
-            self.assertNotIn("secret-pat", " ".join(args))
-            if "/comments" in args[1] and not any(a == "--input" for a in args):
+            blob = gh_blob(args)
+            self.assertNotIn("secret-pat", blob)
+            if "/comments" in blob and "--input" not in args:
                 return "[]"
-            if "/reviews" in args[1]:
+            if "/reviews" in blob:
                 return "[]"
             return ""
 
@@ -315,13 +345,13 @@ class NoticeAndIoTests(unittest.TestCase):
         def gh(args, token, input_text=None):
             if args[:1] == ["workflow"]:
                 return ""
-            path = args[1] if len(args) > 1 else ""
-            if path.endswith("/comments") and "--input" in args:
+            blob = gh_blob(args)
+            if "/comments" in blob and "--input" in args:
                 posted.append(input_text or "")
                 return "{}"
-            if "/comments?" in path:
+            if "/comments?" in blob:
                 return "[]"
-            if "/reviews?" in path:
+            if "/reviews?" in blob:
                 return "[]"
             return "[]"
 
@@ -343,7 +373,8 @@ class NoticeAndIoTests(unittest.TestCase):
 
         def gh(args, token, input_text=None):
             calls.append((list(args), input_text or ""))
-            if "/comments?" in (args[1] if len(args) > 1 else ""):
+            blob = gh_blob(args)
+            if "/comments?" in blob:
                 return "[]"
             return "{}"
 
@@ -371,11 +402,15 @@ class NoticeAndIoTests(unittest.TestCase):
 
     def test_run_verdict_fix_dispatches_claude_workflow(self) -> None:
         calls: list[list[str]] = []
+        posted: list[str] = []
 
         def gh(args, token, input_text=None):
             calls.append(list(args))
-            if "/comments?" in (args[1] if len(args) > 1 else ""):
+            blob = gh_blob(args)
+            if "/comments?" in blob:
                 return "[]"
+            if "--input" in args:
+                posted.append(input_text or "")
             return "{}"
 
         event = review_event(login="chatgpt-codex-connector[bot]", body="CODEX-GATE: FIX")
@@ -387,6 +422,67 @@ class NoticeAndIoTests(unittest.TestCase):
                 os.environ.pop("GITHUB_OUTPUT", None)
         self.assertTrue(any(c[:2] == ["workflow", "run"] and "claude.yml" in c for c in calls))
         self.assertTrue(any("pr_number=7" in " ".join(c) for c in calls))
+        self.assertTrue(any("codex-gate-acted" in body for body in posted))
+        self.assertFalse(any("codex-fixer-run:" in body for body in posted))
+        run_idx = next(i for i, c in enumerate(calls) if c[:2] == ["workflow", "run"])
+        post_idx = next(i for i, c in enumerate(calls) if "--input" in c)
+        self.assertLess(run_idx, post_idx)
+
+    def test_failed_dispatch_does_not_post_run_or_acted_marker(self) -> None:
+        posted: list[str] = []
+
+        def gh(args, token, input_text=None):
+            if args[:2] == ["workflow", "run"]:
+                raise subprocess.CalledProcessError(1, args)
+            blob = gh_blob(args)
+            if "/comments?" in blob:
+                return "[]"
+            if "--input" in args:
+                posted.append(input_text or "")
+            return "{}"
+
+        event = review_event(login="chatgpt-codex-connector[bot]", body="CODEX-GATE: FIX")
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["GITHUB_OUTPUT"] = str(Path(tmp) / "out")
+            try:
+                gate.run_verdict(event, REPO, "pat", "read-token", "master", gh=gh, day="2026-10-15")
+            finally:
+                os.environ.pop("GITHUB_OUTPUT", None)
+        self.assertEqual(posted, [])
+
+    def test_run_verdict_skips_fork_and_does_not_label(self) -> None:
+        calls: list[list[str]] = []
+
+        def gh(args, token, input_text=None):
+            calls.append(list(args))
+            return "{}"
+
+        event = review_event(login="chatgpt-codex-connector[bot]", body="CODEX-GATE: READY")
+        event["pull_request"]["head"]["repo"]["full_name"] = "evil/fork"
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["GITHUB_OUTPUT"] = str(Path(tmp) / "out")
+            try:
+                got = gate.run_verdict(
+                    event, REPO, "pat", "read-token", "master", gh=gh, day="2026-10-15"
+                )
+            finally:
+                os.environ.pop("GITHUB_OUTPUT", None)
+        self.assertEqual(got["action"], "skip-fork")
+        self.assertFalse(calls)
+
+    def test_run_request_listing_failure_skips(self) -> None:
+        def gh(args, token, input_text=None):
+            return "not-json"
+
+        event = pr_event()
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["GITHUB_OUTPUT"] = str(Path(tmp) / "out")
+            try:
+                got = gate.run_request(event, REPO, "pat", "read-token", gh=gh)
+            finally:
+                os.environ.pop("GITHUB_OUTPUT", None)
+        self.assertEqual(got["action"], "skip-listing")
+        self.assertEqual(got["proceed"], "false")
 
     def test_tokens_never_appear_in_argv(self) -> None:
         secret = "ghs_not_a_real_secret_value"
@@ -395,9 +491,10 @@ class NoticeAndIoTests(unittest.TestCase):
             blob = " ".join(args) + " " + (input_text or "")
             if secret in blob:
                 raise AssertionError("secret leaked into gh argv")
-            if "/comments?" in (args[1] if len(args) > 1 else ""):
+            joined = gh_blob(args)
+            if "/comments?" in joined:
                 return "[]"
-            if "/reviews?" in (args[1] if len(args) > 1 else ""):
+            if "/reviews?" in joined:
                 return "[]"
             return "{}"
 
@@ -440,6 +537,12 @@ class WorkflowStructureTests(unittest.TestCase):
 
     def test_codex_review_login_filter(self) -> None:
         self.assertIn("chatgpt-codex-connector[bot]", self.text)
+
+    def test_concurrency_isolates_verdict_from_request_wait(self) -> None:
+        self.assertIn(
+            "codex-gate-${{ github.event.pull_request.number }}-${{ github.event_name == 'pull_request_review' && 'verdict' || 'request' }}",
+            self.text,
+        )
 
     def test_fixer_dispatch_is_not_on_every_devin_review(self) -> None:
         start = self.fixer.index("  devin-review-fix:\n")

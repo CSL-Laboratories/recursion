@@ -1,0 +1,82 @@
+# Stuck Devin/Claude review threads → Codex mediator.
+#
+# Own file on purpose: a cron inside claude.yml never fired because of event
+# noise. Lightweight GitHub-hosted runner, no test jobs.
+#
+# Caps: one mediation per thread, max 3 per PR per UTC day.
+# Never resolve threads, never push, never merge.
+name: Stuck-thread watch
+
+on:
+  schedule:
+    - cron: "23 */2 * * *"
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Only scan this PR number (optional)"
+        required: false
+        default: ""
+  # Cheap paths only: Claude replies are the moment a thread may become stuck.
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+
+# Tunables. Edit here; the script reads them from the environment.
+env:
+  STUCK_AFTER_HOURS: "6"
+  MAX_MEDIATIONS_PER_PR_PER_DAY: "3"
+  LINEAR_REPOS: "CSL-Laboratories/recursion"
+  DEVIN_LOGIN: "devin-ai-integration[bot]"
+  CLAUDE_LOGIN: "claude[bot]"
+  LINEAR_TEAM_KEY: "CSL"
+
+concurrency:
+  group: stuck-thread-watch
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: write
+
+jobs:
+  watch:
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request &&
+        github.event.comment.user.login == 'claude[bot]'
+      ) ||
+      (
+        github.event_name == 'pull_request_review_comment' &&
+        github.event.comment.user.login == 'claude[bot]'
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Always the default branch: comment/review triggers would otherwise
+          # run PR-head code with CODEX_TRIGGER_PAT and LINEAR_API_KEY.
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: |
+            .github/scripts/stuck_thread_watch.py
+          sparse-checkout-cone-mode: false
+
+      - name: Scan stuck threads
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CODEX_TRIGGER_PAT: ${{ secrets.CODEX_TRIGGER_PAT }}
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          PR_NUMBER: ${{ github.event.inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}
+        run: |
+          script=.github/scripts/stuck_thread_watch.py
+          if [ ! -f "$script" ]; then
+            echo "::notice::$script is not on the default branch yet; skip"
+            exit 0
+          fi
+          python3 -X utf8 -B "$script"

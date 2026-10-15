@@ -1,7 +1,10 @@
 """Separate assistant text from headless JSON streams.
 
-Tool output and reasoning chunks are not the assistant text. A stream with
-no assistant text becomes an empty string, not the raw JSON.
+Tool output and reasoning chunks are not the assistant text. Claude Code
+stream-json uses assistant message content when that content is non-empty,
+with a line break between assistant messages. When that content is empty,
+the result string is the fallback. A stream with neither becomes an empty
+string, not the raw JSON.
 """
 
 from __future__ import annotations
@@ -38,6 +41,9 @@ def assistant_text(raw: str) -> str:
             and item["text"].strip()
         ):
             return item["text"]
+    claude = _claude_text(events)
+    if claude:
+        return claude
     for event in reversed(events):
         for key in ("text", "result"):
             value = event.get(key)
@@ -49,45 +55,6 @@ def assistant_text(raw: str) -> str:
     if plain:
         return "\n".join(plain)
     return ""
-
-
-def _nested_text(events: list[dict]) -> str:
-    """Join assistant text from Gemini, Cursor and OpenCode event shapes."""
-
-    parts: list[str] = []
-    for event in events:
-        kind = event.get("type")
-        if kind == "message" and event.get("role") == "assistant":
-            content = event.get("content")
-            if isinstance(content, str):
-                parts.append(content)
-        elif kind == "assistant" and isinstance(event.get("message"), dict):
-            content = event["message"].get("content")
-            if isinstance(content, str):
-                parts.append(content)
-            elif isinstance(content, list):
-                chunks: list[str] = []
-                gap = False
-                for block in content:
-                    if (
-                        isinstance(block, dict)
-                        and block.get("type") == "text"
-                        and isinstance(block.get("text"), str)
-                    ):
-                        # Adjacent text stays one line. A dropped tool block is a line break.
-                        if gap and chunks:
-                            chunks.append("\n")
-                        chunks.append(block["text"])
-                        gap = False
-                    else:
-                        gap = True
-                if chunks:
-                    parts.append("".join(chunks))
-        elif kind == "text" and isinstance(event.get("part"), dict):
-            value = event["part"].get("text")
-            if isinstance(value, str):
-                parts.append(value)
-    return "".join(parts)
 
 
 def _object(line: str) -> dict | None:
@@ -102,6 +69,43 @@ def _object(line: str) -> dict | None:
     return None
 
 
+def _claude_text(events: list[dict]) -> str:
+    """Join Claude ``assistant`` message content, one line break between messages.
+
+    Text blocks inside one message stay adjacent. The caller falls back to the
+    ``result`` string only when no assistant text exists.
+    """
+
+    messages: list[str] = []
+    for event in events:
+        if event.get("type") != "assistant":
+            continue
+        message = event.get("message")
+        if not isinstance(message, dict):
+            continue
+        parts: list[str] = []
+        content = message.get("content")
+        if isinstance(content, str):
+            if content.strip():
+                parts.append(content)
+        elif isinstance(content, list):
+            gap = False
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "text":
+                    gap = True
+                    continue
+                value = block.get("text")
+                if not isinstance(value, str) or not value.strip():
+                    continue
+                if gap and parts:
+                    parts.append("\n")
+                parts.append(value)
+                gap = False
+        if parts:
+            messages.append("".join(parts))
+    return "\n".join(messages)
+
+
 def _grok_text(events: list[dict]) -> str:
     """Join Grok ``type: text`` chunks. Thoughts and tool calls are skipped."""
 
@@ -114,4 +118,21 @@ def _grok_text(events: list[dict]) -> str:
             if isinstance(value, str):
                 parts.append(value)
                 break
+    return "".join(parts)
+
+
+def _nested_text(events: list[dict]) -> str:
+    """Join Gemini and OpenCode assistant text. Claude content is handled earlier."""
+
+    parts: list[str] = []
+    for event in events:
+        kind = event.get("type")
+        if kind == "message" and event.get("role") == "assistant":
+            content = event.get("content")
+            if isinstance(content, str):
+                parts.append(content)
+        elif kind == "text" and isinstance(event.get("part"), dict):
+            value = event["part"].get("text")
+            if isinstance(value, str):
+                parts.append(value)
     return "".join(parts)

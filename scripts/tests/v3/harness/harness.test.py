@@ -176,6 +176,36 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(assistant_text(separated), "Looks fine.\nVERDICT approve")
         self.assertEqual(parse_verdict(separated), ("approve", "Looks fine."))
 
+        hidden = json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "Looks fine."},
+                        {"type": "tool_use", "id": "tool-1", "name": "read"},
+                        {"type": "text", "text": ""},
+                        {"type": "text", "text": "VERDICT approve"},
+                    ]
+                },
+            }
+        )
+        self.assertEqual(assistant_text(hidden), "Looks fine.\nVERDICT approve")
+        self.assertEqual(parse_verdict(hidden), ("approve", "Looks fine."))
+
+        content_before_result = "\n".join(
+            (
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {"content": [{"type": "text", "text": "VERDICT approve"}]},
+                    }
+                ),
+                json.dumps({"type": "result", "result": "session finished without a verdict line"}),
+            )
+        )
+        self.assertEqual(assistant_text(content_before_result), "VERDICT approve")
+        self.assertEqual(parse_verdict(content_before_result)[0], "approve")
+
     def test_fixture_run_reviews_end_to_end(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             stdout = io.StringIO()

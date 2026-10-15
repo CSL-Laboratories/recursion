@@ -9,6 +9,7 @@ The budget is checked before each call.
 from __future__ import annotations
 
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -182,6 +183,11 @@ def run_task(
     kind, result = dispatch(worker_candidates, _request(worker_task, run_id, "execute", workspace), on_exhaust="fail")
     if kind == "budget":
         return finish("budget-exceeded", holder["provider"])
+    if provider is not None and result.provider != provider:
+        print(
+            f"notice: requested provider {provider} was replaced by {result.provider}",
+            file=sys.stderr,
+        )
     holder["provider"] = result.provider
     add_usage(usage, parse_usage(result.text))
     shown = assistant_text(result.text)

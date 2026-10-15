@@ -888,6 +888,53 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(record["status"], "completed")
         self.assertTrue(record["accepted"])
 
+    def test_pinned_fixture_rate_limit_falls_back_to_fixture_b(self) -> None:
+        calls: list[str] = []
+
+        class Adapter:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def execute(self, request, *, allow_live=False, timeout_seconds=None, runner=None):
+                del timeout_seconds, runner
+                calls.append(f"{self.name}:{request.kind}")
+                if not allow_live:
+                    raise AssertionError("allow_live was not set")
+                if self.name in {"claude", "codex", "grok"}:
+                    raise AssertionError(f"{self.name} was called")
+                if self.name == "fixture":
+                    raise ProviderRateLimited("fixture was rate-limited")
+                return ProviderResult(self.name, ("stub",), "hello from fixture-b", False)
+
+        config = starter_config({"fixture", "fixture-b", "claude", "codex", "grok"})
+        config["review"]["max_rounds"] = 0
+        config["review"]["accept_unreviewed"] = True
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            with redirect_stderr(stderr):
+                record = run_task(
+                    "Say hello",
+                    config=config,
+                    state_dir=Path(directory),
+                    provider="fixture",
+                    allow_live=True,
+                    open_adapter=lambda name: Adapter(name),
+                    now=lambda: NOW,
+                )
+        self.assertEqual(calls, ["fixture:execute", "fixture-b:execute"])
+        self.assertEqual(record["provider"], "fixture-b")
+        self.assertEqual(record["status"], "completed")
+        failed = [item for item in record["attempts"] if item["provider"] == "fixture"]
+        self.assertEqual(len(failed), 1)
+        self.assertFalse(failed[0]["ok"])
+        self.assertEqual(failed[0]["error"], "ProviderRateLimited")
+        self.assertEqual(failed[0]["reason"], "rate-limited")
+        notice = stderr.getvalue()
+        self.assertIn("notice: requested provider fixture was replaced by fixture-b", notice)
+        for name in ("claude", "codex", "grok"):
+            self.assertNotIn(name, calls)
+            self.assertNotIn(name, notice)
+
     def test_live_failure_falls_back_to_another_live_provider(self) -> None:
         calls: list[str] = []
 

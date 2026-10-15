@@ -25,8 +25,11 @@ a different meter).
 ## Behavior
 
 1. **Weights.** Enabled providers that have the required capabilities are
-   ordered by weight. An explicit `--provider` still runs first. A weight
-   that is not a positive integer is rejected.
+   ordered by weight. An explicit `--provider` still runs first. If that
+   provider is rate-limited, out of quota, or unauthenticated, the next
+   provider of the same class runs, and the run prints a notice that the
+   requested provider was replaced. A weight that is not a positive integer
+   is rejected.
 2. **Cooldown.** A rate limit, exhausted quota, or expired auth is recorded
    in `<state-dir>/cooldowns.json` and copied onto the run record. The file
    stores a reason and a reset time, not process output. A reported reset

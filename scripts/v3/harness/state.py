@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import uuid
 from pathlib import Path
@@ -20,11 +21,11 @@ def new_run_id() -> str:
 def save_run(state_dir: Path, record: dict) -> Path:
     path = run_path(state_dir, record["run_id"])
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(record, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-        newline="\n",
-    )
+    text = json.dumps(record, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
+    path.chmod(0o600)
     return path
 
 

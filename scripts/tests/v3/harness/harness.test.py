@@ -93,6 +93,18 @@ class HarnessTests(unittest.TestCase):
         )
         self.assertEqual(assistant_text(stream), "Done")
 
+    def test_codex_joins_messages_and_ignores_earlier_turns(self) -> None:
+        from scripts.v3.harness.streams import assistant_text
+
+        def message(text: str) -> str:
+            return json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": text}})
+
+        started = json.dumps({"type": "turn.started"})
+        joined = "\n".join([started, message("The answer is 42."), message("Because 6 x 7 = 42.")])
+        self.assertEqual(assistant_text(joined), "The answer is 42.\nBecause 6 x 7 = 42.")
+        stale = "\n".join([started, message("VERDICT approve"), started])
+        self.assertEqual(assistant_text(stale), "")
+
     def test_later_codex_verdict_wins(self) -> None:
         stream = "\n".join(
             [

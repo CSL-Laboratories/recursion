@@ -28,16 +28,15 @@ def assistant_text(raw: str) -> str:
     grok = _grok_text(events)
     if grok:
         return grok
-    for event in reversed(events):
-        item = event.get("item")
-        if (
-            event.get("type") == "item.completed"
-            and isinstance(item, dict)
-            and item.get("type") == "agent_message"
-            and isinstance(item.get("text"), str)
-            and item["text"].strip()
-        ):
-            return item["text"]
+    scoped = events
+    starts = [i for i, event in enumerate(events) if event.get("type") == "turn.started"]
+    if starts:
+        scoped = events[starts[-1] + 1 :]
+    messages = [text for text in (_agent_message(event) for event in scoped) if text]
+    if messages:
+        return "\n".join(messages)
+    if starts:
+        return ""
     for event in reversed(events):
         for key in ("text", "result"):
             value = event.get(key)
@@ -45,6 +44,19 @@ def assistant_text(raw: str) -> str:
                 return value
     if plain:
         return "\n".join(plain)
+    return ""
+
+
+def _agent_message(event: dict) -> str:
+    item = event.get("item")
+    if (
+        event.get("type") == "item.completed"
+        and isinstance(item, dict)
+        and item.get("type") == "agent_message"
+        and isinstance(item.get("text"), str)
+        and item["text"].strip()
+    ):
+        return item["text"]
     return ""
 
 

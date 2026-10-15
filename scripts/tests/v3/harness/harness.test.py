@@ -555,6 +555,24 @@ class HarnessTests(unittest.TestCase):
             for text in ("Review complete.", "VERDICT approve\n")
         )
         self.assertEqual(parse_verdict(two_messages)[0], "approve")
+        tool_then_empty = json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "Review complete."},
+                        {"type": "tool_use", "name": "Bash", "input": {}},
+                        {"type": "text", "text": ""},
+                        {"type": "text", "text": "VERDICT approve\n"},
+                    ]
+                },
+            }
+        )
+        self.assertEqual(
+            assistant_text(tool_then_empty),
+            "Review complete.\nVERDICT approve\n",
+        )
+        self.assertEqual(parse_verdict(tool_then_empty)[0], "approve")
         result_only = json.dumps({"type": "result", "result": "fallback text"})
         self.assertEqual(assistant_text(result_only), "fallback text")
         claude_usage = parse_usage(claude_stream)

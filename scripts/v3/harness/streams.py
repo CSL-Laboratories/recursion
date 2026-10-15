@@ -69,7 +69,10 @@ def _object(line: str) -> dict | None:
 def _claude_text(events: list[dict]) -> str:
     """Join Claude ``assistant`` message content, one line break between messages.
 
-    Text blocks inside one message stay adjacent. The caller falls back to the
+    Text blocks inside one message stay adjacent. A non-text block such as
+    ``tool_use`` starts the next text block on a new line. An empty text
+    block after that tool call keeps the break, so a later ``VERDICT`` line
+    is not glued to the previous sentence. The caller falls back to the
     ``result`` string only when no assistant text exists.
     """
 
@@ -80,21 +83,32 @@ def _claude_text(events: list[dict]) -> str:
         message = event.get("message")
         if not isinstance(message, dict):
             continue
-        parts: list[str] = []
-        content = message.get("content")
-        if isinstance(content, str):
-            if content.strip():
-                parts.append(content)
-        elif isinstance(content, list):
-            for block in content:
-                if not isinstance(block, dict) or block.get("type") != "text":
-                    continue
-                value = block.get("text")
-                if isinstance(value, str) and value.strip():
-                    parts.append(value)
-        if parts:
-            messages.append("".join(parts))
+        text = _claude_content_text(message.get("content"))
+        if text.strip():
+            messages.append(text)
     return "\n".join(messages)
+
+
+def _claude_content_text(content: object) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    chunks: list[str] = []
+    gap = False
+    for block in content:
+        if (
+            isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+        ):
+            if gap and chunks:
+                chunks.append("\n")
+            chunks.append(block["text"])
+            gap = False
+        else:
+            gap = True
+    return "".join(chunks)
 
 
 def _grok_text(events: list[dict]) -> str:

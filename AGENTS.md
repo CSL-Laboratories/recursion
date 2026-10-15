@@ -136,12 +136,26 @@ label, not by editing config.
   findings and `@claude` mentions. It runs only on open same-repo PRs whose
   author is an org OWNER or MEMBER. `@claude` also requires a human OWNER or
   MEMBER commenter. Fork and nonmember PRs are not auto-fixed.
+- **Stuck-thread watch** (`.github/workflows/stuck-thread-watch.yml`) asks Codex
+  to mediate Devin threads Claude could not settle. Codex is a mediator, not a
+  reviewer of record and not a fixer: it must not push code.
 - **Blacksmith** is the only CI.
 - Cursor, Codex, Grok, and interactive Claude Code develop features from Linear
   issues. They must not post review verdicts or run review-fix loops on other
   agents' PRs. The author agent may fix CI failures on its own PR.
 - Humans still merge (`CONTROL_PLANE.md`). Independent task gates still apply; they are not
   a substitute for Devin PR review.
+
+## Review loop
+
+Devin reviews. Claude fixes (`.github/workflows/claude.yml`). If a Devin thread
+stays stuck — Claude said it needs a human / could not fix, or the thread is
+still open more than six hours (configurable) after Claude's last reply —
+[`.github/workflows/stuck-thread-watch.yml`](.github/workflows/stuck-thread-watch.yml)
+posts one `@codex review` comment (via `CODEX_TRIGGER_PAT`; skipped with a
+notice if that secret is missing) and files a Linear Triage issue labelled
+`needs-decision`. Humans decide. Caps: one mediation per thread, three per PR
+per UTC day. The watcher never resolves threads, pushes, or merges.
 
 ## Automations
 

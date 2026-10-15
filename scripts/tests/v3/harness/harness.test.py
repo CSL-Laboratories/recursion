@@ -238,6 +238,19 @@ class HarnessTests(unittest.TestCase):
         )
         self.assertEqual(parse_verdict(stale)[0], "revise")
 
+        changing = assistant_event(
+            [
+                {
+                    "type": "text",
+                    "text": "Fix X.\nVERDICT approve\nActually no.\nVERDICT revise",
+                }
+            ]
+        )
+        verdict, notes = parse_verdict(changing)
+        self.assertEqual(verdict, "revise")
+        self.assertEqual(notes, "Fix X.\nActually no.")
+        self.assertNotIn("VERDICT", notes)
+
         content_before_result = "\n".join(
             (
                 json.dumps(

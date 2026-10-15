@@ -586,6 +586,8 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn("CODEX-GATE: FIX", self.agents)
         self.assertIn("CODEX-GATE: READY", self.agents)
         self.assertIn("CODEX-GATE: MEDIATE", self.agents)
+        self.assertIn("Deep research brief", self.agents)
+        self.assertIn("the Task API, not Search/Extract", self.agents)
         self.assertEqual(self.agents, CLAUDE_MD_PATH.read_text(encoding="utf-8"))
 
     def test_human_mention_job_is_not_daily_capped(self) -> None:

@@ -932,7 +932,7 @@ class HarnessTests(unittest.TestCase):
         notice = stderr.getvalue()
         self.assertIn("notice: requested provider fixture was replaced by fixture-b", notice)
         for name in ("claude", "codex", "grok"):
-            self.assertNotIn(name, calls)
+            self.assertFalse(any(call.startswith(f"{name}:") for call in calls))
             self.assertNotIn(name, notice)
 
     def test_live_failure_falls_back_to_another_live_provider(self) -> None:

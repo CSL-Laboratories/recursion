@@ -208,7 +208,15 @@ class HarnessTests(unittest.TestCase):
             )
         )
         self.assertEqual(assistant_text(across_events), "Looks fine.\nVERDICT approve")
-        self.assertEqual(parse_verdict(across_events), ("approve", ""))
+        self.assertEqual(parse_verdict(across_events), ("approve", "Looks fine."))
+
+        feedback = "\n".join(
+            (
+                assistant_event([{"type": "text", "text": "Restore the missing error branch."}]),
+                assistant_event([{"type": "text", "text": "VERDICT revise"}]),
+            )
+        )
+        self.assertEqual(parse_verdict(feedback), ("revise", "Restore the missing error branch."))
 
         stale = "\n".join(
             (

@@ -68,3 +68,33 @@ referenced by digest**, not vendored source.
 Any actual split requires Lucas's explicit approval recorded via an authoring session. This file is
 a proposal and confers no authorization. Because the repository is still in R&D and is still
 growing, the default is to **stay monorepo** until the prerequisites above hold.
+
+---
+
+## P-002 — Replace the legacy branch name in `CONTROL_PLANE.md`
+
+- Date: 2026-10-15
+- Status: **proposed**. Not authorized. CSL-76 does not edit this protected path.
+- Owner: Lucas.
+- Issue: [CSL-76](https://linear.app/csl-laboratories/issue/CSL-76).
+
+### Motivation
+
+Current operating docs (`AGENTS.md`, `CLAUDE.md`, `CONTRIBUTING.md`, the PR template,
+`docs/v3/START-HERE.md`, and `docs/v3/RESEARCH-SCOPE.md`) name review branches
+`csl-<N>-<slug>`, with an optional GitHub username prefix. Invariant 1 of
+`CONTROL_PLANE.md` still tells agents to commit to `loop/work/<task-id>`. That file
+outranks the operating docs on conflict, and changing it needs an Owner authoring
+session recorded in `state/DECISIONS.md`.
+
+### Proposed replacement
+
+Keep invariant 1's force-push, merge, and deployment limits. Name the review branch
+`csl-<N>-<slug>`, optionally prefixed with a GitHub username. pr-lint still requires
+`CSL-[0-9]+` in the branch name or the PR title.
+
+### Non-goals
+
+- No edit to `CONTROL_PLANE.md`, `ANCHOR.md`, or `state/DECISIONS.md` in CSL-76.
+- No edit to `.github/workflows/**`. Workflow, pr-lint, script, and Claude/Devin
+  findings are listed on the CSL-76 PR for Lucas.

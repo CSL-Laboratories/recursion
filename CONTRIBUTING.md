@@ -35,7 +35,10 @@ For a research or evidence task:
 
 ## Branch and review flow
 
-- Branch from up-to-date `master`: `loop/work/<task-id>` for build output.
+- Branch from up-to-date `master` as `csl-<N>-<slug>` (example `csl-26-short-slug`).
+  A GitHub username prefix is optional (`chaandansaini101/csl-26-short-slug`).
+- Put `CSL-N` in the PR title. pr-lint requires `CSL-[0-9]+` in the branch name or the
+  PR title.
 - Never commit to `master` directly and never force-push.
 - Open a PR for review. **Lucas merges every review branch himself**; an automated run only
   ever produces a review branch.

@@ -83,7 +83,8 @@ instead of choosing.
 ```text
 # clean fetched worktree pinned to the reviewed base
 git fetch --all --prune
-git worktree add ../recursion-<task> -b loop/work/<task-id> origin/master
+# branch: csl-<N>-<slug>, optional username prefix (chaandansaini101/csl-<N>-<slug>)
+git worktree add ../recursion-<task> -b csl-<N>-<slug> origin/master
 
 # run the gate; capture the receipt externally
 python -X utf8 -B <gate> --candidate <FULL_SHA>

@@ -29,19 +29,26 @@ def parse_verdict(text: str) -> tuple[str, str]:
     """
 
     last = claude_last_message(text)
-    body = assistant_text(text) if last is None else last
-    lines = [_clean_line(line) for line in body.splitlines()]
-    lines = [line for line in lines if line]
+    full = _lines(assistant_text(text))
+    lines = full if last is None else _lines(last)
     if not lines:
         return "revise", "reviewer returned no verdict"
     for index in range(len(lines) - 1, -1, -1):
-        line = lines[index]
-        match = _VERDICT.fullmatch(line)
+        match = _VERDICT.fullmatch(lines[index])
         if match is None:
             continue
-        notes = "\n".join(lines[:index] + lines[index + 1 :])[:NOTE_LIMIT]
-        return match.group(1).lower(), notes
+        if last is None:
+            kept = lines[:index] + lines[index + 1 :]
+        else:
+            # Verdict comes from the last message; notes keep earlier feedback.
+            kept = [line for line in full if _VERDICT.fullmatch(line) is None]
+        return match.group(1).lower(), "\n".join(kept)[:NOTE_LIMIT]
     return "revise", "reviewer returned an unreadable verdict"
+
+
+def _lines(body: str) -> list[str]:
+    lines = [_clean_line(line) for line in body.splitlines()]
+    return [line for line in lines if line]
 
 
 def review_prompt(task: str, output: str) -> str:

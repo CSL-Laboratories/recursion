@@ -555,6 +555,16 @@ class HarnessTests(unittest.TestCase):
             for text in ("Review complete.", "VERDICT approve\n")
         )
         self.assertEqual(parse_verdict(two_messages)[0], "approve")
+        feedback_first = "\n".join(
+            json.dumps(
+                {"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}
+            )
+            for text in ("Restore the missing error branch.", "VERDICT revise\n")
+        )
+        self.assertEqual(
+            parse_verdict(feedback_first),
+            ("revise", "Restore the missing error branch."),
+        )
         stale_verdict = "\n".join(
             json.dumps(
                 {"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}

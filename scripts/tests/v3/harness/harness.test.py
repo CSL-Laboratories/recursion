@@ -74,6 +74,19 @@ class _Stub:
 
 
 class HarnessTests(unittest.TestCase):
+    def test_codex_jsonl_agent_message_is_the_assistant_text(self) -> None:
+        from scripts.v3.harness.streams import assistant_text
+
+        stream = "\n".join(
+            [
+                json.dumps({"type": "thread.started"}),
+                json.dumps({"type": "item.completed", "item": {"type": "command_execution", "text": "ls"}}),
+                json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "Done"}}),
+                json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}}),
+            ]
+        )
+        self.assertEqual(assistant_text(stream), "Done")
+
     def test_shipped_config_enables_fixtures_and_raises_the_codex_ceiling(self) -> None:
         config = load_config()
         enabled = {item["name"] for item in config["providers"] if item["enabled"]}

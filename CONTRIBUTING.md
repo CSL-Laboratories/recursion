@@ -35,13 +35,14 @@ For a research or evidence task:
 
 ## Linear workflow
 
-Work starts in Linear (team **CSL**, project **recursion**), not as a GitHub issue. Assign
-yourself before you start. Branch `loop/work/CSL-N` (keep this convention; do not use
-Linear's copied branch name). Title the PR `CSL-N: ...` and include `Fixes CSL-N` in the
-body so Linear and GitHub stay linked. Statuses move via the GitHub integration — do not
-move them by hand. File follow-ups to **Triage**. Keep the Linear issue current as work
-progresses, and file anything that comes up in a session to **Triage** instead of dropping
-it; Linear is the primary async channel, alongside Google Meet and Discord.
+Work starts in Linear (team **CSL**, project **recursion**), not as a GitHub issue. When you
+start, assign yourself and move the issue to **In Progress**. Branch `loop/work/CSL-N` (keep
+this convention; do not use Linear's copied branch name). Title the PR `CSL-N: ...` and
+include `Fixes CSL-N` in the body — that links the PR, and merging moves the issue to
+**Done** automatically. If the PR does not move the issue to **In Review**, move it yourself.
+File follow-ups to **Triage**. Keep the Linear issue current as work progresses, and file
+anything that comes up in a session to **Triage** instead of dropping it; Linear is the
+primary async channel, alongside Google Meet and Discord.
 
 ## Branch and review flow
 

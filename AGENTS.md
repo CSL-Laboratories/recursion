@@ -91,16 +91,20 @@ Every change starts from a Linear issue (`CSL-N`). Be Linear-aware and proactive
 protected paths, and merge still follow `CONTROL_PLANE.md`.
 
 **Before starting.** Find or create the issue (team **CSL**, project **recursion**) via the
-Linear MCP or the Devin Linear integration. Do not start code without `CSL-N`.
+Linear MCP or the Devin Linear integration. Do not start code without `CSL-N`. Claim it by
+assigning yourself in Linear before you start; unassign if you stop.
 
 **Filing and shipping.**
 
 - Branch `loop/work/<task-id>` with `CSL-N` in the task id (example: `loop/work/CSL-26`).
   Do not use Linear's copied branch name as the git branch.
-- PR title includes `CSL-N` so Linear auto-links.
+- PR title includes `CSL-N` so Linear auto-links (example: `CSL-26: ...`). Put `Fixes CSL-N`
+  in the PR body.
 - One issue per PR; keep PRs small and stackable.
-- Comment progress on the issue. Move status to **In Progress** when work starts, then **In
-  Review** when the PR is up.
+- Comment progress on the issue. Statuses move automatically via the GitHub integration —
+  do not move them by hand.
+- Route issues with `for-devin`, `for-claude`, or `for-cursor`. Use `needs-decision` when a
+  human direction call is needed.
 - On your own PR, address CI comments, then resolve the threads. Eligible Devin
   findings and `@claude` mentions are handled by the Claude Code Action
   (`.github/workflows/claude.yml`; see [Review roles](#review-roles)). Do not

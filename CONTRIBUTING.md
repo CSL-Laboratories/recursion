@@ -33,6 +33,14 @@ For a research or evidence task:
 4. Record what the check proves and what it does **not** prove. Missing verification is
    never a pass; an implementer's own PASS is not acceptance.
 
+## Linear workflow
+
+Work starts in Linear (team **CSL**, project **recursion**), not as a GitHub issue. Assign
+yourself before you start. Branch `loop/work/CSL-N` (keep this convention; do not use
+Linear's copied branch name). Title the PR `CSL-N: ...` and include `Fixes CSL-N` in the
+body so Linear and GitHub stay linked. Statuses move via the GitHub integration — do not
+move them by hand. File follow-ups to **Triage**.
+
 ## Branch and review flow
 
 - Branch from up-to-date `master`: `loop/work/<task-id>` for build output.

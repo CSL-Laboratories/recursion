@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: File work in Linear
+    url: https://linear.app/csl-laboratories/team/CSL
+    about: Open and track work on the CSL team in Linear. GitHub issues are disabled.
+  - name: How CSL works
+    url: https://linear.app/csl-laboratories/document/how-csl-works-922e0df6026f
+    about: Operating model for CSL-Laboratories — Linear, routing labels, and the PR loop.

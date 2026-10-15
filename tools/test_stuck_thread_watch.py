@@ -320,6 +320,9 @@ class FakeGitHub:
     def resolve_thread(self, thread_id: str) -> None:
         self.resolves.append(thread_id)
 
+    def refresh_head(self, pull: "mod.Pull") -> "mod.Pull":
+        return pull
+
     def pat_login(self) -> str:
         return "pat-user"
 
@@ -769,7 +772,7 @@ class VerdictAndResolveTests(unittest.TestCase):
         self.assertEqual(counters.resolved, 1)
         self.assertEqual(gh.resolves, ["PRRT_h"])
 
-    def test_idempotent_second_scan_retries_resolve_only(self) -> None:
+    def test_reopened_thread_stays_open_after_successful_resolve_marker(self) -> None:
         t = thread(
             tid="PRRT_1",
             comments=stuck_pair()
@@ -780,13 +783,106 @@ class VerdictAndResolveTests(unittest.TestCase):
         p = pull(threads=[t], issue_comments=asked, reviews=[ruling])
         self.assertEqual(
             mod.classify_resolve(p, t, cfg(mediator_login="pat-user")),
-            "retry-resolve",
+            "already-marked",
         )
         gh = FakeGitHub([p])
         counters = mod.scan(cfg(mediator_login="pat-user"), gh, FakeLinear())  # type: ignore[arg-type]
-        self.assertEqual(counters.resolved, 1)
-        self.assertEqual(gh.resolves, ["PRRT_1"])
+        self.assertEqual(counters.resolved, 0)
+        self.assertEqual(gh.resolves, [])
         self.assertEqual(gh.replies, [])
+
+    def test_quoted_verdict_is_ignored(self) -> None:
+        quoted = "\n".join(f"> {line}" for line in verdict_block("PRRT_1").splitlines())
+        parsed = mod.parse_thread_verdicts(comment(CODEX, quoted, hours_ago=0.1))
+        self.assertEqual(parsed, ())
+        t = thread(tid="PRRT_1", comments=stuck_pair())
+        asked = [comment("pat-user", mod.mediation_marker("PRRT_1"), hours_ago=0.4)]
+        ruling = comment(CODEX, quoted, hours_ago=0.1)
+        p = pull(threads=[t], issue_comments=asked, reviews=[ruling])
+        self.assertEqual(mod.classify_resolve(p, t, cfg(mediator_login="pat-user")), "no-verdict")
+
+    def test_fenced_verdict_is_ignored(self) -> None:
+        fenced = "```\n" + verdict_block("PRRT_1") + "```\n"
+        parsed = mod.parse_thread_verdicts(comment(CODEX, fenced, hours_ago=0.1))
+        self.assertEqual(parsed, ())
+
+    def test_unread_check_page_is_not_green(self) -> None:
+        self.assertFalse(
+            mod.required_checks_are_green(
+                {"state": "SUCCESS"},
+                contexts=[
+                    {
+                        "__typename": "CheckRun",
+                        "name": "linux",
+                        "status": "COMPLETED",
+                        "conclusion": "SUCCESS",
+                        "isRequired": True,
+                    }
+                ],
+                has_next_page=True,
+            )
+        )
+        self.assertFalse(
+            mod.required_checks_are_green(
+                {
+                    "state": "SUCCESS",
+                    "contexts": {
+                        "nodes": [],
+                        "pageInfo": {"hasNextPage": True},
+                    },
+                }
+            )
+        )
+
+    def test_refresh_stale_head_blocks_resolve(self) -> None:
+        class MovingHead(FakeGitHub):
+            def refresh_head(self, pull: mod.Pull) -> mod.Pull:
+                return mod.replace(pull, head_sha=STALE)
+
+        t = thread(tid="PRRT_1", comments=stuck_pair())
+        asked = [comment("pat-user", mod.mediation_marker("PRRT_1"), hours_ago=0.4)]
+        ruling = comment(CODEX, verdict_block("PRRT_1"), hours_ago=0.1)
+        p = pull(threads=[t], issue_comments=asked, reviews=[ruling], head_sha=HEAD)
+        gh = MovingHead([p])
+        counters = mod.scan(cfg(mediator_login="pat-user"), gh, FakeLinear())  # type: ignore[arg-type]
+        self.assertEqual(counters.resolved, 0)
+        self.assertEqual(counters.skipped_stale, 1)
+        self.assertEqual(gh.resolves, [])
+
+    def test_resolve_happens_before_reply(self) -> None:
+        order: list[str] = []
+
+        class OrderGitHub(FakeGitHub):
+            def resolve_thread(self, thread_id: str) -> None:
+                order.append("resolve")
+                super().resolve_thread(thread_id)
+
+            def reply_on_thread(self, thread_id: str, body: str) -> None:
+                order.append("reply")
+                super().reply_on_thread(thread_id, body)
+
+        t = thread(tid="PRRT_1", comments=stuck_pair())
+        asked = [comment("pat-user", mod.mediation_marker("PRRT_1"), hours_ago=0.4)]
+        ruling = comment(CODEX, verdict_block("PRRT_1"), hours_ago=0.1)
+        gh = OrderGitHub([pull(threads=[t], issue_comments=asked, reviews=[ruling])])
+        counters = mod.scan(cfg(mediator_login="pat-user"), gh, FakeLinear())  # type: ignore[arg-type]
+        self.assertEqual(counters.resolved, 1)
+        self.assertEqual(order, ["resolve", "reply"])
+
+    def test_failed_resolve_does_not_reply_or_count_cap(self) -> None:
+        class BoomResolve(FakeGitHub):
+            def resolve_thread(self, thread_id: str) -> None:
+                raise RuntimeError("403")
+
+        t = thread(tid="PRRT_1", comments=stuck_pair())
+        asked = [comment("pat-user", mod.mediation_marker("PRRT_1"), hours_ago=0.4)]
+        ruling = comment(CODEX, verdict_block("PRRT_1"), hours_ago=0.1)
+        gh = BoomResolve([pull(threads=[t], issue_comments=asked, reviews=[ruling])])
+        counters = mod.scan(cfg(mediator_login="pat-user"), gh, FakeLinear())  # type: ignore[arg-type]
+        self.assertEqual(counters.resolved, 0)
+        self.assertEqual(counters.resolve_failed, 1)
+        self.assertEqual(gh.replies, [])
+        self.assertEqual(mod.exit_code(counters), 1)
 
     def test_already_resolved_thread_is_skipped(self) -> None:
         t = thread(tid="PRRT_1", comments=stuck_pair(), resolved=True)

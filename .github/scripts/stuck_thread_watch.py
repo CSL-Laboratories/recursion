@@ -371,10 +371,26 @@ def is_known_bot_login(login: str | None, cfg: Config) -> bool:
     )
 
 
+def strip_quoted_and_fenced(text: str) -> str:
+    """Drop quoted lines and fenced code so echoed verdicts cannot authorize."""
+    kept: list[str] = []
+    in_fence = False
+    for line in (text or "").replace("\r\n", "\n").split("\n"):
+        stripped = line.lstrip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence or stripped.startswith(">"):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
 def parse_thread_verdicts(comment: Comment) -> tuple[ThreadVerdict, ...]:
     """Parse zero or more per-thread blocks from one Codex comment/review."""
     found: list[ThreadVerdict] = []
-    for match in VERDICT_BLOCK_RE.finditer(comment.body or ""):
+    source = strip_quoted_and_fenced(comment.body or "")
+    for match in VERDICT_BLOCK_RE.finditer(source):
         block = match.group("body") or ""
         actions = VERDICT_ACTION_RE.findall(block)
         heads = VERDICT_HEAD_RE.findall(block)
@@ -486,8 +502,11 @@ def required_checks_are_green(
     rollup: dict[str, Any] | None,
     *,
     contexts: Iterable[dict[str, Any]] | None = None,
+    has_next_page: bool = False,
 ) -> bool:
-    """Fail closed: missing rollup is not green. Required contexts win."""
+    """Fail closed: missing rollup, unread pages, or a failing required check."""
+    if has_next_page:
+        return False
     if not rollup and contexts is None:
         return False
     nodes: list[dict[str, Any]] = []
@@ -497,6 +516,9 @@ def required_checks_are_green(
         raw = rollup.get("contexts") or {}
         if isinstance(raw, dict):
             nodes = [n for n in (raw.get("nodes") or []) if n]
+            page = raw.get("pageInfo") or {}
+            if page.get("hasNextPage"):
+                return False
         elif isinstance(raw, list):
             nodes = [n for n in raw if n]
     required = [n for n in nodes if n.get("isRequired")]
@@ -511,17 +533,20 @@ def classify_resolve(
     thread: Thread,
     cfg: Config,
 ) -> str:
-    """Return a stable reason. 'resolve' and 'retry-resolve' are actionable."""
+    """Return a stable reason. Only 'resolve' is actionable."""
     if thread.is_resolved:
         return "resolved"
     if not thread.id:
         return "no-thread-id"
     if not codex_was_asked(thread, pull.issue_comments, cfg):
         return "not-asked"
-    marked = already_resolve_marked(thread, pull.issue_comments, cfg)
+    if already_resolve_marked(thread, pull.issue_comments, cfg):
+        # Marker is written only after a successful resolve. A later open
+        # thread is a deliberate reopen, not a failed mutation.
+        return "already-marked"
     verdict = latest_thread_verdict(thread.id, pull_verdict_comments(pull), cfg)
     if verdict is None:
-        return "already-marked" if marked else "no-verdict"
+        return "no-verdict"
     if verdict.action != "RESOLVE":
         return verdict.action.lower()
     if not verdict.head_sha or verdict.head_sha != normalize_sha(pull.head_sha):
@@ -530,8 +555,6 @@ def classify_resolve(
         return "stale-sha"
     if not pull.required_checks_green:
         return "checks"
-    if marked:
-        return "retry-resolve"
     return "resolve"
 
 
@@ -861,9 +884,15 @@ class GitHubClient:
                     c_done = True
         assert pr_meta is not None
         threads = tuple(self._parse_thread_with_all_comments(node) for node in raw_threads)
-        head_sha = normalize_sha(str(pr_meta.get("headRefOid") or ""))
+        head_sha, checks_green = self._load_head_state(number)
+        live = normalize_sha(str(pr_meta.get("headRefOid") or ""))
+        if live and head_sha and live != head_sha:
+            checks_green = False
+            head_sha = live
+        elif live and not head_sha:
+            head_sha = live
+            checks_green = False
         reviews = self._load_reviews(number)
-        checks_green = self._load_required_checks_green(number, head_sha)
         return Pull(
             number=int(pr_meta["number"]),
             url=str(pr_meta.get("url") or ""),
@@ -917,9 +946,12 @@ class GitHubClient:
             cursor = page.get("endCursor")
         return tuple(comments)
 
-    def _load_required_checks_green(self, number: int, head_sha: str) -> bool:
-        if not head_sha:
-            return False
+    def refresh_head(self, pull: Pull) -> Pull:
+        """Re-read head SHA and required checks immediately before a resolve."""
+        head_sha, checks_green = self._load_head_state(pull.number)
+        return replace(pull, head_sha=head_sha, required_checks_green=checks_green)
+
+    def _load_head_state(self, number: int) -> tuple[str, bool]:
         query = """
         query($owner: String!, $name: String!, $number: Int!) {
           repository(owner: $owner, name: $name) {
@@ -932,18 +964,19 @@ class GitHubClient:
                     statusCheckRollup {
                       state
                       contexts(first: 80) {
+                        pageInfo { hasNextPage }
                         nodes {
                           __typename
                           ... on CheckRun {
                             name
                             conclusion
                             status
-                            isRequired
+                            isRequired(pullRequestNumber: $number)
                           }
                           ... on StatusContext {
                             context
                             state
-                            isRequired
+                            isRequired(pullRequestNumber: $number)
                           }
                         }
                       }
@@ -963,19 +996,17 @@ class GitHubClient:
             )
         except Exception as exc:  # noqa: BLE001 — fail closed
             notice(f"required-check lookup skipped: {exc}")
-            return False
+            return "", False
         pr = ((data.get("repository") or {}).get("pullRequest")) or {}
         live_head = normalize_sha(str(pr.get("headRefOid") or ""))
-        if live_head and live_head != head_sha:
-            return False
         commits = ((pr.get("commits") or {}).get("nodes")) or []
         if not commits:
-            return False
+            return live_head, False
         commit = (commits[-1] or {}).get("commit") or {}
         commit_oid = normalize_sha(str(commit.get("oid") or ""))
-        if commit_oid and commit_oid != head_sha:
-            return False
-        return required_checks_are_green(commit.get("statusCheckRollup"))
+        if commit_oid and live_head and commit_oid != live_head:
+            return live_head, False
+        return live_head, required_checks_are_green(commit.get("statusCheckRollup"))
 
     def _thread_comment_page(self, thread_id: str, cursor: str) -> dict[str, Any]:
         query = """
@@ -1325,32 +1356,50 @@ def resolve_eligible_thread(
     cfg: Config,
     github: GitHubClient,
     counters: Counters,
-    *,
-    retry_only: bool = False,
-) -> bool:
+) -> tuple[Pull, bool]:
+    """Resolve first, then cite. Marker after success so reopens stay open."""
+    refresher = getattr(github, "refresh_head", None)
+    if callable(refresher):
+        try:
+            pull = refresher(pull)
+        except Exception as exc:  # noqa: BLE001 — fail closed
+            notice(f"head refresh skipped: {exc}")
+            counters.skipped_stale += 1
+            return pull, False
+    reason = classify_resolve(pull, thread, cfg)
+    if reason == "stale-sha":
+        counters.skipped_stale += 1
+        log(f"skip (stale SHA after refresh): PR #{pull.number} {thread.id}")
+        return pull, False
+    if reason == "checks":
+        counters.skipped_checks += 1
+        log(f"skip (required checks after refresh): PR #{pull.number} {thread.id}")
+        return pull, False
+    if reason != "resolve":
+        return pull, False
     verdict = latest_thread_verdict(thread.id, pull_verdict_comments(pull), cfg)
     if verdict is None:
-        return False
-    if not retry_only:
-        body = resolve_reply_body(thread, verdict, pull.head_sha)
-        try:
-            github.reply_on_thread(thread.id, body)
-        except Exception as exc:  # noqa: BLE001 — keep scanning later threads
-            notice(f"thread reply skipped: {exc}")
-            counters.resolve_failed += 1
-            return False
+        return pull, False
     try:
         github.resolve_thread(thread.id)
     except Exception as exc:  # noqa: BLE001 — keep scanning later threads
         notice(f"resolveReviewThread skipped: {exc}")
         counters.resolve_failed += 1
-        return False
+        return pull, False
+    body = resolve_reply_body(thread, verdict, pull.head_sha)
+    try:
+        github.reply_on_thread(thread.id, body)
+    except Exception as exc:  # noqa: BLE001 — resolve already landed; persist marker
+        notice(f"thread reply skipped after resolve: {exc}")
+        try:
+            github.post_comment(pull.number, body)
+        except Exception as post_exc:  # noqa: BLE001
+            notice(f"resolve marker comment skipped: {post_exc}")
+            counters.resolve_failed += 1
+            return pull, False
     counters.resolved += 1
-    log(
-        f"resolved PR #{pull.number} thread {thread.id} "
-        f"on {pull.head_sha[:12]} ({'retry' if retry_only else 'resolve'})"
-    )
-    return True
+    log(f"resolved PR #{pull.number} thread {thread.id} on {pull.head_sha[:12]}")
+    return pull, True
 
 
 def scan(
@@ -1443,7 +1492,7 @@ def scan(
                 counters.skipped_checks += 1
                 log(f"skip (required checks): PR #{pull.number} {thread.id}")
                 continue
-            if reason not in {"resolve", "retry-resolve"}:
+            if reason != "resolve":
                 continue
             if not cfg.codex_pat:
                 log(f"skip resolve (no PAT): PR #{pull.number} {thread.id}")
@@ -1458,13 +1507,8 @@ def scan(
                     f"PR #{pull.number} {thread.id}"
                 )
                 continue
-            posted = resolve_eligible_thread(
-                pull,
-                thread,
-                cfg,
-                github,
-                counters,
-                retry_only=(reason == "retry-resolve"),
+            pull, posted = resolve_eligible_thread(
+                pull, thread, cfg, github, counters
             )
             if not posted:
                 continue

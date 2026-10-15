@@ -337,6 +337,12 @@ class TestInventoryTests(unittest.TestCase):
             write(repo / "tools" / "test_funcs.py", "def test_failure():\n    assert False\n")
             with self.assertRaises(SystemExit):
                 ci_gate.run_test_file("tools/test_funcs.py", root=repo)
+            write(
+                repo / "tools" / "test_async.py",
+                "async def test_failure():\n    assert False\n",
+            )
+            with self.assertRaises(SystemExit):
+                ci_gate.run_test_file("tools/test_async.py", root=repo)
         finally:
             shutil.rmtree(repo, ignore_errors=True)
 

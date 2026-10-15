@@ -22,10 +22,16 @@ def save_run(state_dir: Path, record: dict) -> Path:
     path = run_path(state_dir, record["run_id"])
     path.parent.mkdir(parents=True, exist_ok=True)
     text = json.dumps(record, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    if path.is_symlink():
+        raise HarnessError(f"refusing to write through symlink {path.name}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise HarnessError(f"cannot write run {record['run_id']}") from exc
     with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
         handle.write(text)
-    path.chmod(0o600)
+        os.fchmod(handle.fileno(), 0o600) if hasattr(os, "fchmod") else None
     return path
 
 

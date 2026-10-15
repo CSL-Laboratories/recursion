@@ -548,6 +548,15 @@ class HarnessTests(unittest.TestCase):
         self.assertNotIn("VERDICT", claude_result)
         self.assertEqual(assistant_text(claude_stream), claude_content)
         self.assertEqual(parse_verdict(claude_stream)[0], "approve")
+        two_messages = "\n".join(
+            json.dumps(
+                {"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}
+            )
+            for text in ("Review complete.", "VERDICT approve\n")
+        )
+        self.assertEqual(parse_verdict(two_messages)[0], "approve")
+        result_only = json.dumps({"type": "result", "result": "fallback text"})
+        self.assertEqual(assistant_text(result_only), "fallback text")
         claude_usage = parse_usage(claude_stream)
         self.assertEqual(claude_usage["input_tokens"], 150)
         self.assertEqual(claude_usage["output_tokens"], 70)

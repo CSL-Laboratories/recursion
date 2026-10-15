@@ -65,29 +65,34 @@ def _object(line: str) -> dict | None:
 
 
 def _claude_text(events: list[dict]) -> str:
-    """Join Claude ``assistant`` message content. The result string is ignored."""
+    """Join Claude ``assistant`` message content, one line break between messages.
 
-    parts: list[str] = []
+    Text blocks inside one message stay adjacent. The caller falls back to the
+    ``result`` string only when no assistant text exists.
+    """
+
+    messages: list[str] = []
     for event in events:
         if event.get("type") != "assistant":
             continue
         message = event.get("message")
         if not isinstance(message, dict):
             continue
+        parts: list[str] = []
         content = message.get("content")
         if isinstance(content, str):
             if content.strip():
                 parts.append(content)
-            continue
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if not isinstance(block, dict) or block.get("type") != "text":
-                continue
-            value = block.get("text")
-            if isinstance(value, str) and value.strip():
-                parts.append(value)
-    return "".join(parts)
+        elif isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "text":
+                    continue
+                value = block.get("text")
+                if isinstance(value, str) and value.strip():
+                    parts.append(value)
+        if parts:
+            messages.append("".join(parts))
+    return "\n".join(messages)
 
 
 def _grok_text(events: list[dict]) -> str:

@@ -455,7 +455,7 @@ class HarnessTests(unittest.TestCase):
                 del timeout
                 self.assertEqual(Path(argv[0]).name.casefold(), "claude.cmd")
                 if argv[1:] == ["--version"]:
-                    return _completed(argv, 0, stdout="claude 2.1.299\n")
+                    return _completed(argv, 0, stdout="claude 2.1.300\n")
                 if argv[1:] == ["auth", "status"]:
                     return _completed(argv, int(header["exit-code"]), stdout=raw)
                 raise AssertionError(argv)
@@ -557,7 +557,7 @@ class HarnessTests(unittest.TestCase):
             def run(argv, timeout):
                 del timeout
                 if argv[1:] == ["--version"]:
-                    return _completed(argv, 0, stdout="claude 2.1.299\n")
+                    return _completed(argv, 0, stdout="claude 2.1.300\n")
                 if argv[1:] == ["auth", "status"]:
                     return _completed(argv, int(header["exit-code"]), stdout=stdout)
                 raise AssertionError(argv)

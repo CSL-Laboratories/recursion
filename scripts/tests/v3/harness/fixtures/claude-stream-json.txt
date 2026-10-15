@@ -1,9 +1,9 @@
 # provider: claude
 # evidence: synthetic
-# cli-version: unpinned
+# cli-version: 2.1.300
 # source: https://code.claude.com/docs/en/cli-reference
 # retrieved: 2026-10-15
-# note: Synthetic stream-json. Field names follow the CLI reference (assistant and result events, --output-format stream-json) and the cost-tracking page (usage input_tokens and output_tokens, total_cost_usd). Token counts and the VERDICT line were written for the parsers. Not a capture. Changelog head on 2026-10-15 was 2.1.299.
+# note: Synthetic stream-json. Field names follow the CLI reference (assistant and result events, --output-format stream-json) and the cost-tracking page (usage input_tokens and output_tokens, total_cost_usd). Token counts and the VERDICT line were written for the parsers. Not a capture. CLI version is the CSL-81 changelog pin, Claude Code 2.1.300 dated 2026-10-14 (https://code.claude.com/docs/en/changelog). That version did not produce this file.
 
 {"type":"assistant","message":{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"The change matches the task.\nVERDICT approve\n"}],"usage":{"input_tokens":120,"output_tokens":45}}}
 {"type":"result","subtype":"success","is_error":false,"result":"The change matches the task.\nVERDICT approve\n","total_cost_usd":0.0123,"usage":{"input_tokens":150,"output_tokens":70}}

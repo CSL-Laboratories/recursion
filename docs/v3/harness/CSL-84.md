@@ -16,9 +16,9 @@ Directory: `scripts/tests/v3/harness/fixtures/`.
 | `grok-review.txt` | synthetic | unpinned |
 | `codex-exec-jsonl.txt` | source-documented | unpinned on the OpenAI page |
 | `codex-cumulative.txt` | synthetic | unpinned; 6.9M figure is the example in openai/codex#17539 |
-| `claude-auth-status.txt` | source-documented | Claude Code 2.x, as that source names it |
-| `claude-auth-status-exit-1.txt` | synthetic | unpinned; changelog head on 2026-10-15 was 2.1.299 |
-| `claude-stream-json.txt` | synthetic | unpinned; same changelog note |
+| `claude-auth-status.txt` | source-documented | 2.1.300, the CSL-81 changelog pin (2026-10-14). The paste itself says Claude Code 2.x |
+| `claude-auth-status-exit-1.txt` | synthetic | 2.1.300, the same CSL-81 pin. That binary did not produce the file |
+| `claude-stream-json.txt` | synthetic | 2.1.300, the same CSL-81 pin. That binary did not produce the file |
 
 `# evidence: synthetic` is the synthetic mark. Every file has `# cli-version:`.
 A published line that is not valid JSON is omitted, and the header says so.

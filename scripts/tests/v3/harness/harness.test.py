@@ -437,7 +437,7 @@ class HarnessTests(unittest.TestCase):
                 main(["--help"])
         self.assertEqual(caught.exception.code, 0)
         text = stdout.getvalue()
-        for name in ("doctor", "init", "run", "status"):
+        for name in ("doctor", "init", "run", "status", "logs", "land", "clean"):
             self.assertIn(name, text)
 
     def test_doctor_cli_on_the_shipped_config(self) -> None:

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from scripts.v3.harness.doctor import _scrub, _secret_values
 from scripts.v3.harness.errors import HarnessError, ProviderTimeout
+from scripts.v3.harness.log import append_event
 from scripts.v3.harness.providers import ProviderRequest, open_provider
 from scripts.v3.harness.review import parse_verdict, review_prompt
 from scripts.v3.harness.routing import select_route
@@ -27,6 +28,7 @@ def run_task(
     allow_live: bool = False,
     open_adapter=None,
     run_id: str | None = None,
+    run_branch: str | None = None,
 ) -> dict:
     """Route one task, review it when a second provider is enabled, and save the run."""
 
@@ -35,6 +37,7 @@ def run_task(
     worker, reviewers = select_route(config, provider)
     opener = open_provider if open_adapter is None else open_adapter
     run_id = new_run_id() if run_id is None else run_id
+    run_branch = _branch_name(run_branch)
     budgets = config["budgets"]
     usage = empty_usage()
     reviews: list[dict] = []
@@ -56,6 +59,7 @@ def run_task(
             status=status,
             error=str(exc),
             workspace=workspace,
+            run_branch=run_branch,
         )
 
     def call(name: str, request: ProviderRequest):
@@ -74,6 +78,7 @@ def run_task(
             save_failure("failed", exc)
             raise
 
+    append_event(state_dir, run_id, "run.started", provider=worker)
     result = call(worker, _request(current_task, run_id, "execute", workspace))
     add_usage(usage, parse_usage(result.text))
     shown = assistant_text(result.text)
@@ -90,6 +95,7 @@ def run_task(
             usage=usage,
             status="budget-exceeded",
             workspace=workspace,
+            run_branch=run_branch,
         )
 
     max_rounds = config["review"]["max_rounds"]
@@ -116,6 +122,7 @@ def run_task(
             usage=usage,
             status=status,
             workspace=workspace,
+            run_branch=run_branch,
         )
 
     status = "review-rejected"
@@ -134,6 +141,13 @@ def run_task(
                 "round": round_index,
                 "verdict": verdict,
             }
+        )
+        append_event(
+            state_dir,
+            run_id,
+            "review.verdict",
+            provider=reviewer,
+            verdict=verdict,
         )
         if exceeded(usage, budgets):
             status = "budget-exceeded"
@@ -166,6 +180,7 @@ def run_task(
         usage=usage,
         status=status,
         workspace=workspace,
+        run_branch=run_branch,
     )
 
 
@@ -219,5 +234,25 @@ def _finish(config, state_dir, **fields) -> dict:
     workspace = fields.get("workspace")
     if workspace:
         record["workspace"] = workspace
+    branch = fields.get("run_branch")
+    if branch:
+        record["run_branch"] = branch
     save_run(state_dir, record)
+    append_event(
+        state_dir,
+        record["run_id"],
+        "run.finished",
+        provider=record["provider"],
+        status=record["status"],
+    )
     return record
+
+
+def _branch_name(name: str | None) -> str | None:
+    if name is None:
+        return None
+    if not isinstance(name, str) or name != name.strip() or not name:
+        raise HarnessError("invalid branch name")
+    if name.startswith("-") or any(char in name for char in "\n\r "):
+        raise HarnessError("invalid branch name")
+    return name

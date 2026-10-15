@@ -245,27 +245,115 @@ def _grok_argv(request: ProviderRequest, prompt_file: str) -> tuple[str, ...]:
 def _write_grok_prompt(task: str) -> Path:
     """Write the prompt to a new owner-only file. The name is not predictable."""
 
-    try:
-        fd, name = tempfile.mkstemp(prefix="recursion-grok-", suffix=".txt")
-    except OSError as exc:
-        raise HarnessError("grok prompt file could not be created") from exc
-    path = Path(name)
-    try:
-        if hasattr(os, "fchmod"):
-            os.fchmod(fd, 0o600)
-        payload = memoryview(task.encode("utf-8"))
-        while payload:
-            written = os.write(fd, payload)
-            if written <= 0:
-                raise OSError("prompt write made no progress")
-            payload = payload[written:]
-        os.fsync(fd)
-    except OSError as exc:
-        os.close(fd)
-        path.unlink(missing_ok=True)
-        raise HarnessError("grok prompt file could not be written") from exc
-    os.close(fd)
-    return path
+    return _write_private_prompt(task, prefix="recursion-grok-", label="grok")
+
+
+_PROMPT_ARGV_LIMIT = 7000
+_GEMINI_LONG_PROMPT = " "
+_OPENCODE_LONG_PROMPT = "Carry out the task in the attached file."
+
+
+class GeminiHeadlessProvider(HeadlessCLI):
+    """Gemini CLI headless mode.
+
+    ``-p`` is the prompt. ``--output-format stream-json`` writes JSON events.
+    ``--approval-mode yolo`` approves tool calls and ``--skip-trust`` accepts
+    the workspace. A prompt that does not fit in argv is stdin, and ``-p`` is
+    a single space so the flag still has a value. The process cwd is the
+    working folder. The process starts only when ``allow_live`` is set.
+    """
+
+    name = "gemini"
+    STATIC_ARGV = (
+        "gemini",
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--approval-mode",
+        "yolo",
+        "--skip-trust",
+    )
+    CAPABILITIES = ("execute", "stream-json", "subscription")
+
+    def argv(self, request: ProviderRequest) -> tuple[str, ...]:
+        prompt = request.task if _prompt_fits(request.task) else _GEMINI_LONG_PROMPT
+        return _insert_after(self.STATIC_ARGV, "-p", prompt)
+
+    def prepare(self, request: ProviderRequest) -> _Prepared:
+        stdin = None if _prompt_fits(request.task) else request.task
+        return _Prepared(self.argv(request), stdin, _noop)
+
+
+class CursorHeadlessProvider(HeadlessCLI):
+    """Cursor Agent print mode.
+
+    The documented command is ``agent``. ``-p`` prints instead of opening the
+    UI. ``--force`` allows commands and ``--trust`` accepts the workspace.
+    ``--workspace`` is the working folder. A short prompt is the positional
+    argument. A longer prompt is stdin. The process starts only when
+    ``allow_live`` is set.
+    """
+
+    name = "cursor"
+    STATIC_ARGV = ("agent", "-p", "--output-format", "stream-json", "--force", "--trust")
+    CAPABILITIES = ("execute", "stream-json", "subscription")
+
+    def argv(self, request: ProviderRequest) -> tuple[str, ...]:
+        argv = _with_flag(self.STATIC_ARGV, "--workspace", request.cwd)
+        if _prompt_fits(request.task):
+            return argv + ("--", request.task)
+        return argv
+
+    def prepare(self, request: ProviderRequest) -> _Prepared:
+        stdin = None if _prompt_fits(request.task) else request.task
+        return _Prepared(self.argv(request), stdin, _noop)
+
+
+class OpenCodeHeadlessProvider(HeadlessCLI):
+    """OpenCode non-interactive mode: ``opencode run --format json --auto``.
+
+    ``--format json`` writes one JSON event per line. ``--auto`` approves
+    permissions that are not explicitly denied. ``--dir`` is the working
+    folder. ``-p`` on this command is a password flag and is not used. A
+    longer task is a private file passed with ``--file``. The process starts
+    only when ``allow_live`` is set.
+    """
+
+    name = "opencode"
+    STATIC_ARGV = ("opencode", "run", "--format", "json", "--auto")
+    CAPABILITIES = ("execute", "json")
+
+    def argv(self, request: ProviderRequest) -> tuple[str, ...]:
+        argv = _with_flag(self.STATIC_ARGV, "--dir", request.cwd)
+        if _prompt_fits(request.task):
+            return argv + (request.task,)
+        return argv + ("--file", "<prompt-file>", _OPENCODE_LONG_PROMPT)
+
+    def prepare(self, request: ProviderRequest) -> _Prepared:
+        argv = _with_flag(self.STATIC_ARGV, "--dir", request.cwd)
+        if _prompt_fits(request.task):
+            return _Prepared(argv + (request.task,), None, _noop)
+        path = _write_private_prompt(request.task, prefix="recursion-opencode-", label="opencode")
+
+        def cleanup() -> None:
+            path.unlink(missing_ok=True)
+
+        return _Prepared(argv + ("--file", str(path), _OPENCODE_LONG_PROMPT), None, cleanup)
+
+
+# Launch-critical names from the accepted compatibility matrix. Claude, Grok,
+# Cursor, Gemini, and OpenCode have a one-shot headless CLI behind
+# ``--allow-live``. ChatGPT and Hermes do not: the interface named here is
+# the one this slice does not speak.
+LAUNCH_CRITICAL = {
+    "ChatGPT": {"deferred": "codex app-server JSON-RPC over stdio (--listen stdio://)"},
+    "Claude": {"adapter": "claude"},
+    "Cursor": {"adapter": "cursor"},
+    "Gemini": {"adapter": "gemini"},
+    "Grok": {"adapter": "grok"},
+    "Hermes": {"deferred": "TUI gateway JSON-RPC"},
+    "OpenCode": {"adapter": "opencode"},
+}
 
 
 def adapters() -> dict[str, type[ProviderAdapter]]:
@@ -277,6 +365,9 @@ def adapters() -> dict[str, type[ProviderAdapter]]:
         ClaudeHeadlessProvider,
         CodexExecProvider,
         GrokHeadlessProvider,
+        GeminiHeadlessProvider,
+        CursorHeadlessProvider,
+        OpenCodeHeadlessProvider,
     )
     return {cls.name: cls for cls in classes}
 
@@ -302,6 +393,50 @@ def _fixture_verdict(name: str, task: str) -> str:
 
 def _noop() -> None:
     return None
+
+
+def _prompt_fits(task: str) -> bool:
+    """True when ``task`` can sit in argv without nearing the Windows limit."""
+
+    return len(task) <= _PROMPT_ARGV_LIMIT
+
+
+def _insert_after(argv: tuple[str, ...], flag: str, value: str) -> tuple[str, ...]:
+    items = list(argv)
+    items.insert(items.index(flag) + 1, value)
+    return tuple(items)
+
+
+def _with_flag(argv: tuple[str, ...], flag: str, value: str | None) -> tuple[str, ...]:
+    if not value:
+        return argv
+    return argv + (flag, value)
+
+
+def _write_private_prompt(task: str, *, prefix: str, label: str) -> Path:
+    """Write the prompt to a new owner-only file. The name is not predictable."""
+
+    try:
+        fd, name = tempfile.mkstemp(prefix=prefix, suffix=".txt")
+    except OSError as exc:
+        raise HarnessError(f"{label} prompt file could not be created") from exc
+    path = Path(name)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        payload = memoryview(task.encode("utf-8"))
+        while payload:
+            written = os.write(fd, payload)
+            if written <= 0:
+                raise OSError("prompt write made no progress")
+            payload = payload[written:]
+        os.fsync(fd)
+    except OSError as exc:
+        os.close(fd)
+        path.unlink(missing_ok=True)
+        raise HarnessError(f"{label} prompt file could not be written") from exc
+    os.close(fd)
+    return path
 
 
 def _default_runner(argv: list[str], stdin_text: str | None, timeout: int, cwd: str | None):

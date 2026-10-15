@@ -73,8 +73,9 @@ def _nested_text(events: list[dict]) -> str:
                     and block.get("type") == "text"
                     and isinstance(block.get("text"), str)
                 ]
+                # Keep block text contiguous. A line break stays only when a block already contains one.
                 if blocks:
-                    parts.append("\n".join(blocks))
+                    parts.append("".join(blocks))
         elif kind == "text" and isinstance(event.get("part"), dict):
             value = event["part"].get("text")
             if isinstance(value, str):

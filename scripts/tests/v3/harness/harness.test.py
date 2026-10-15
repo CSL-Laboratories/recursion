@@ -130,6 +130,37 @@ class HarnessTests(unittest.TestCase):
         self.assertNotIn("SECRET", notes)
         self.assertEqual(parse_verdict("**VERDICT: approve**")[0], "approve")
 
+    def test_split_verdict_blocks_stay_one_line(self) -> None:
+        from scripts.v3.harness.streams import assistant_text
+
+        split = json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "VERDICT "},
+                        {"type": "text", "text": "approve"},
+                    ]
+                },
+            }
+        )
+        self.assertEqual(assistant_text(split), "VERDICT approve")
+        self.assertEqual(parse_verdict(split)[0], "approve")
+
+        lined = json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "looks good\n"},
+                        {"type": "text", "text": "VERDICT approve"},
+                    ]
+                },
+            }
+        )
+        self.assertEqual(assistant_text(lined), "looks good\nVERDICT approve")
+        self.assertEqual(parse_verdict(lined), ("approve", "looks good"))
+
     def test_fixture_run_reviews_end_to_end(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             stdout = io.StringIO()

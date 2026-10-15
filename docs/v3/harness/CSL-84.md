@@ -29,7 +29,9 @@ A published line that is not valid JSON is omitted, and the header says so.
 `scripts/tests/v3/harness/harness.test.py` loads these files. The verdict and
 usage parsers read the stream fixtures. Claude verdict text is
 `message.content`, and the stream fixture's `result` string is different, so
-the test fails if the parser reads `result`. The doctor parser reads the
+the test fails if the parser reads `result`. Separate assistant messages are
+joined with a newline. A stream with no assistant content still falls back
+to `result`. The doctor parser reads the
 Claude auth-status fixtures, including exit 1 with `loggedIn: true`. The
 redaction fixture's stdout contains `SECRET-TOKEN-VALUE`; the rendered doctor
 report does not.

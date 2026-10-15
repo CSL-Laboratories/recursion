@@ -1,8 +1,10 @@
 """Separate assistant text from headless JSON streams.
 
 Tool output and reasoning chunks are not the assistant text. Claude Code
-stream-json text is the assistant message content, not the result string.
-A stream with no assistant text becomes an empty string, not the raw JSON.
+stream-json uses assistant message content when that content is non-empty,
+with a line break between assistant messages. When that content is empty,
+the result string is the fallback. A stream with neither becomes an empty
+string, not the raw JSON.
 """
 
 from __future__ import annotations

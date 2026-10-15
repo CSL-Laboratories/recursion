@@ -36,6 +36,7 @@ BEHIND_STATES = frozenset({"dirty", "behind"})
 PENDING_MERGEABLE = frozenset({"", "unknown"})
 MERGEABLE_RETRIES = 3
 MERGEABLE_WAIT_S = 2.0
+MERGEABLE_BUDGET_S = 20.0
 REVIEW_PAGES = 10
 FORBIDDEN_GITHUB_PATH = re.compile(
     r"/(merge|merge-upstream|resolve|dismissals)(/|$)",
@@ -232,6 +233,7 @@ class GitHubClient:
     def __init__(self, cfg: Config, opener: Callable[..., Any] | None = None) -> None:
         self.cfg = cfg
         self._opener = opener or urllib.request.urlopen
+        self._mergeable_budget_s = MERGEABLE_BUDGET_S
 
     def _request(self, url: str, *, method: str = "GET") -> Any:
         parsed = urlparse(url)
@@ -305,8 +307,13 @@ class GitHubClient:
         if not data or not data.get("number"):
             return None
         tries = 0
-        while mergeable_pending(data) and tries < MERGEABLE_RETRIES:
+        while (
+            mergeable_pending(data)
+            and tries < MERGEABLE_RETRIES
+            and self._mergeable_budget_s >= MERGEABLE_WAIT_S
+        ):
             time.sleep(MERGEABLE_WAIT_S)
+            self._mergeable_budget_s -= MERGEABLE_WAIT_S
             data = self._request(url)
             tries += 1
         files_url = (
@@ -467,7 +474,7 @@ def upsert_comment(linear: LinearClient, issue_id: str, marker: str, body: str) 
 
 
 def sync_pull(pull: PullSnapshot, cfg: Config, linear: LinearClient) -> str:
-    if pull.head_repo and pull.head_repo.casefold() != cfg.repo.casefold():
+    if pull.head_repo.casefold() != cfg.repo.casefold():
         log(f"skip PR #{pull.number}: fork head")
         return "skipped-fork"
     key = extract_csl_key(pull.title)

@@ -189,7 +189,10 @@ class ClassifyTests(unittest.TestCase):
     def test_already_mediated_is_skipped(self) -> None:
         t = thread(tid="PRRT_9", comments=stuck_pair())
         existing = [comment("watcher", mod.mediation_marker("PRRT_9"), hours_ago=0.5)]
-        self.assertEqual(mod.classify_thread(t, existing, cfg()), "mediated")
+        self.assertEqual(
+            mod.classify_thread(t, existing, cfg(mediator_login="watcher")),
+            "mediated",
+        )
 
     def test_spoofed_marker_ignored_when_mediator_login_set(self) -> None:
         t = thread(tid="PRRT_9", comments=stuck_pair())
@@ -230,7 +233,7 @@ class CapAndBodyTests(unittest.TestCase):
             comment("w", "<!-- codex-mediation:c -->", hours_ago=30),
             comment("w", "unrelated", hours_ago=1),
         ]
-        self.assertEqual(mod.mediations_today(comments, cfg()), 2)
+        self.assertEqual(mod.mediations_today(comments, cfg(mediator_login="w")), 2)
 
     def test_mediation_body_has_marker_and_codex_mention(self) -> None:
         t = thread(tid="PRRT_abc", comments=stuck_pair())
@@ -283,6 +286,9 @@ class FakeGitHub:
 
     def add_labels(self, number: int, labels: list[str]) -> None:
         self.labels.append((number, labels))
+
+    def pat_login(self) -> str:
+        return "pat-user"
 
 
 class FakeLinear:
@@ -342,7 +348,7 @@ class ScanTests(unittest.TestCase):
         ]
         t = thread(tid="PRRT_new", comments=stuck_pair())
         gh = FakeGitHub([pull(threads=[t], issue_comments=existing)])
-        counters = mod.scan(cfg(), gh, FakeLinear())  # type: ignore[arg-type]
+        counters = mod.scan(cfg(mediator_login="w"), gh, FakeLinear())  # type: ignore[arg-type]
         self.assertEqual(counters.mediated, 0)
         self.assertEqual(counters.skipped_cap, 1)
 
@@ -383,8 +389,32 @@ class ScanTests(unittest.TestCase):
         )
         counters = mod.scan(cfg(), gh, FakeLinear())  # type: ignore[arg-type]
         self.assertEqual(counters.mediated, 1)
+        self.assertEqual(counters.comment_failed, 1)
+        self.assertEqual(mod.exit_code(counters), 1)
         self.assertEqual(gh.comments, [(2, gh.comments[0][1])])
         self.assertTrue(gh.comments[0][1].startswith("<!-- codex-mediation:PRRT_2 -->") or "PRRT_2" in gh.comments[0][1])
+
+    def test_pat_login_failure_skips_mediation_and_fails_run(self) -> None:
+        class BoomLogin(FakeGitHub):
+            def pat_login(self) -> str:
+                raise RuntimeError("401")
+
+        t = thread(tid="PRRT_9", comments=stuck_pair())
+        existing = [comment("mallory", mod.mediation_marker("PRRT_9"), hours_ago=0.5)]
+        gh = BoomLogin([pull(threads=[t], issue_comments=existing)])
+        counters = mod.scan(cfg(), gh, FakeLinear())  # type: ignore[arg-type]
+        self.assertEqual(counters.mediated, 0)
+        self.assertEqual(counters.skipped_login, 1)
+        self.assertEqual(gh.comments, [])
+        self.assertEqual(mod.exit_code(counters), 1)
+        self.assertEqual(mod.classify_thread(t, existing, cfg()), "stuck-human")
+
+    def test_missing_pat_still_exits_zero(self) -> None:
+        t = thread(comments=stuck_pair())
+        gh = FakeGitHub([pull(threads=[t])])
+        counters = mod.scan(cfg(codex_pat=""), gh, FakeLinear())  # type: ignore[arg-type]
+        self.assertEqual(counters.skipped_pat, 1)
+        self.assertEqual(mod.exit_code(counters), 0)
 
     def test_linear_dedupes_by_marker(self) -> None:
         t = thread(tid="PRRT_z", comments=stuck_pair())

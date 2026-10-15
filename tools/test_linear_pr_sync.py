@@ -238,6 +238,12 @@ class UpsertTests(unittest.TestCase):
         self.assertEqual(result, "skipped-fork")
         self.assertEqual(linear.created, 0)
 
+    def test_skips_empty_head_repo(self) -> None:
+        linear = FakeLinear()
+        result = mod.sync_pull(pull(head_repo=""), cfg(), linear)
+        self.assertEqual(result, "skipped-fork")
+        self.assertEqual(linear.created, 0)
+
     def test_missing_issue_does_not_abort_later_prs(self) -> None:
         class BoomThenOk(FakeLinear):
             def resolve_issue(self, key: str) -> str:
@@ -339,6 +345,40 @@ class HttpGuardTests(unittest.TestCase):
         assert snap is not None
         self.assertEqual(snap.mergeable_state, "dirty")
         self.assertEqual(slept.call_count, 1)
+
+    def test_mergeable_retries_share_a_budget(self) -> None:
+        pending = {
+            "number": 191,
+            "title": "CSL-87: x",
+            "html_url": "https://github.com/CSL-Laboratories/recursion/pull/191",
+            "user": {"login": "a"},
+            "state": "open",
+            "draft": False,
+            "merged": False,
+            "mergeable": None,
+            "mergeable_state": "unknown",
+            "head": {
+                "sha": "abc",
+                "repo": {"full_name": "CSL-Laboratories/recursion"},
+            },
+        }
+
+        def fake_request(url: str, *, method: str = "GET") -> Any:
+            if "/reviews" in url or "/files" in url:
+                return []
+            return pending
+
+        client = mod.GitHubClient(cfg())
+        client._mergeable_budget_s = mod.MERGEABLE_WAIT_S
+        with mock.patch.object(client, "_request", side_effect=fake_request), mock.patch.object(
+            mod.time, "sleep"
+        ) as slept:
+            first = client.load_pull(191)
+            second = client.load_pull(192)
+        assert first is not None and second is not None
+        self.assertEqual(slept.call_count, 1)
+        self.assertEqual(first.mergeable_state, "unknown")
+        self.assertEqual(second.mergeable_state, "unknown")
 
     def test_reviews_paginate_until_devin_on_head(self) -> None:
         pr = {

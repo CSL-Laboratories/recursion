@@ -267,7 +267,8 @@ def claude_comments(thread: Thread, cfg: Config) -> tuple[Comment, ...]:
 
 def _trusted_marker_comment(comment: Comment, cfg: Config) -> bool:
     if not cfg.mediator_login:
-        return True
+        # PAT present but login unknown: do not trust any author.
+        return not cfg.codex_pat
     return same_login(comment.login, cfg.mediator_login)
 
 
@@ -819,6 +820,8 @@ class Counters:
     mediated: int = 0
     skipped_cap: int = 0
     skipped_pat: int = 0
+    skipped_login: int = 0
+    comment_failed: int = 0
     linear: int = 0
     labeled: int = 0
 
@@ -863,6 +866,7 @@ def mediate_thread(
         github.post_comment(pull.number, body)
     except Exception as exc:  # noqa: BLE001 — keep scanning later PRs/threads
         notice(f"mediation comment skipped: {exc}")
+        counters.comment_failed += 1
         return False
     counters.mediated += 1
     log(f"mediated PR #{pull.number} thread {thread.id} ({reason})")
@@ -883,14 +887,20 @@ def scan(
         # Still walk PRs so the log shows what would have fired.
     if not cfg.mediator_login and cfg.codex_pat:
         getter = getattr(github, "pat_login", None)
+        login = ""
         if callable(getter):
             try:
                 login = getter() or ""
-            except Exception as exc:  # noqa: BLE001 — unfiltered markers if lookup fails
+            except Exception as exc:  # noqa: BLE001 — fail closed; do not trust markers
                 notice(f"PAT login lookup skipped: {exc}")
                 login = ""
-            if login:
-                cfg = replace(cfg, mediator_login=login)
+        if login:
+            cfg = replace(cfg, mediator_login=login)
+        else:
+            notice(
+                "PAT login unavailable; skipping mediation so forged markers cannot apply"
+            )
+            counters.skipped_login = 1
     numbers = github.list_open_pr_numbers()
     for number in numbers:
         pull = github.load_pr(number)
@@ -911,6 +921,9 @@ def scan(
             counters.stuck += 1
             if not cfg.codex_pat:
                 log(f"skip (no PAT): PR #{pull.number} {thread.id} {reason}")
+                continue
+            if not cfg.mediator_login:
+                log(f"skip (no PAT login): PR #{pull.number} {thread.id} {reason}")
                 continue
             if remaining <= 0:
                 counters.skipped_cap += 1
@@ -943,9 +956,17 @@ def scan(
         "stuck-thread-watch: "
         f"scanned={counters.scanned} stuck={counters.stuck} "
         f"mediated={counters.mediated} cap={counters.skipped_cap} "
+        f"failed={counters.comment_failed} login_skip={counters.skipped_login} "
         f"linear={counters.linear} labeled={counters.labeled}"
     )
     return counters
+
+
+def exit_code(counters: Counters) -> int:
+    """Missing PAT stays 0. Failed posts or PAT-login lookup fail the run."""
+    if counters.comment_failed or counters.skipped_login:
+        return 1
+    return 0
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -959,8 +980,7 @@ def main(argv: list[str] | None = None) -> int:
     cfg = Config.from_env(dry_run=args.dry_run)
     github = GitHubClient(cfg)
     linear = LinearClient(cfg) if cfg.linear_enabled and cfg.linear_api_key else None
-    scan(cfg, github, linear)
-    return 0
+    return exit_code(scan(cfg, github, linear))
 
 
 if __name__ == "__main__":

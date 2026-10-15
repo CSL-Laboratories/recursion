@@ -164,6 +164,15 @@ label, not by editing config.
 - Humans still merge (`CONTROL_PLANE.md`). Independent task gates still apply; they are not
   a substitute for Devin PR review.
 
+## When Claude can't fix a review thread
+
+Devin reviews only and never fixes, so a thread is never handed back to Devin. Claude
+leaves the thread open and replies with why. It @mentions the PR author on the PR, then
+posts a comment on the linked Linear issue with the PR link and the open question, and
+adds the `needs-decision` label. The PR author's Grok Bot or agent watches for these and
+either resolves the thread or escalates to the human. A human can merge past it with the
+admin bypass only after that decision.
+
 ## Automations
 
 Devin automations (**Main CI failure fixer** and **Weekly dead-code sweep**, Wednesdays

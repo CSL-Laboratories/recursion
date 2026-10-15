@@ -10,14 +10,18 @@ issues and PRs.
   issue.
 - Every review request, blocker, or question for a dev must be posted as an @mention
   comment on the matching CSL Linear issue, so the Linear bot notifies them. A GitHub
-  mention alone is not enough. Linear handles: Chaandan = @chaandansaini101, Samir =
-  @samirshahahmed, Lucas = @lucassalvador987.
-- **Wait for jobs before reviewing.** No human or bot approves or requests changes on a
-  PR until Devin Review, the Claude fixer jobs (`devin-review-fix`, `resolve-pr`), and
-  required CI have all finished on the current head commit. A review on a stale head
-  does not count. After new pushes, the reviewer reviews again. Review requests and
-  their status are posted as @mention comments on the CSL Linear issue, and a watcher
-  posts there when a PR is ready for review.
+  mention alone is not enough. Current Linear handles (check Linear if ownership has
+  changed): Chaandan = @chaandansaini101, Samir = @samirshahahmed, Lucas =
+  @lucassalvador987. This applies to interactive agents and Grok Bot. The GitHub-only
+  Claude Code Action fixer has no Linear tooling; it replies on the PR threads, and the
+  PR author relays anything it cannot fix to the Linear issue.
+- **Wait for jobs before human sign-off.** Order: Devin Review runs first, then the
+  Claude fixer jobs (`devin-review-fix`, `resolve-pr`) act on its findings, then required
+  CI reruns on the fixer's push. No human approves or requests changes on a PR until all
+  of these have finished on the current head commit. A review on a stale head does not
+  count. After new pushes, the reviewer reviews again. Review requests and their status
+  are posted as @mention comments on the CSL Linear issue, and a watcher posts there when
+  a PR is ready for review.
 - Autonomously file research findings, ideas and bugs to Triage, deduped.
 - Ground every implementation in the best available research: Parallel search for web
   research and Context7 for current library docs.
@@ -151,9 +155,9 @@ status, a short progress comment at meaningful milestones (started, blocked, PR 
 done), and the PR link.
 
 When blocked or needing help or approval, comment on the Linear issue and @mention the
-relevant teammate with their Linear handle (Chaandan = @chaandansaini101, Samir =
-@samirshahahmed, Lucas = @lucassalvador987). A GitHub mention alone is not enough. Add
-the `needs-decision` label for approvals.
+relevant teammate (the issue owner or project lead; handles listed above are the current
+ones, not a fixed owner list). A GitHub mention alone is not enough. Add the
+`needs-decision` label for approvals.
 
 Anything that comes up during a dev session gets filed as a new Linear issue in **Triage**
 instead of being dropped: ideas discussed, bugs or oddities found in development, and

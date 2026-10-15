@@ -250,9 +250,13 @@ def _write_grok_prompt(task: str) -> Path:
     try:
         if hasattr(os, "fchmod"):
             os.fchmod(fd, 0o600)
-        data = memoryview(task.encode("utf-8"))
-        while data:
-            data = data[os.write(fd, data) :]
+        payload = memoryview(task.encode("utf-8"))
+        while payload:
+            written = os.write(fd, payload)
+            if written <= 0:
+                raise OSError("prompt write made no progress")
+            payload = payload[written:]
+        os.fsync(fd)
     except OSError:
         os.close(fd)
         path.unlink(missing_ok=True)

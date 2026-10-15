@@ -21,8 +21,16 @@ if str(ROOT) not in sys.path:
 
 from scripts.v3.harness.cli import main  # noqa: E402
 from scripts.v3.harness.config import load_config, starter_config, validate_config, write_starter  # noqa: E402
+from scripts.v3.harness.cooldowns import CooldownStore, format_until  # noqa: E402
 from scripts.v3.harness.doctor import diagnose, discover_installed, resolve_executable  # noqa: E402
-from scripts.v3.harness.errors import HarnessError, LiveProviderDisabled, ProviderTimeout  # noqa: E402
+from scripts.v3.harness.errors import (  # noqa: E402
+    HarnessError,
+    LiveProviderDisabled,
+    ProviderAuthExpired,
+    ProviderQuotaExhausted,
+    ProviderRateLimited,
+    ProviderTimeout,
+)
 from scripts.v3.harness.providers import (  # noqa: E402
     ClaudeHeadlessProvider,
     CodexExecProvider,
@@ -47,6 +55,7 @@ CODEX_SESSION = (
     '{"type":"turn.completed","usage":{"input_tokens":1000,"output_tokens":10}}\n'
     '{"type":"turn.completed","usage":{"input_tokens":6900000,"output_tokens":4000}}\n'
 )
+NOW = 1_700_000_000
 GROK_APPROVE = "\n".join(
     (
         json.dumps({"type": "thought", "data": "Checking the diff"}),
@@ -731,3 +740,231 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(row["signed_in"], "signed-in")
             self.assertEqual(row["auth_method"], "env")
             self.assertTrue(row["usable"])
+
+    def test_weights_prefer_the_higher_weight_and_reject_a_bad_weight(self) -> None:
+        config = load_config()
+        self.assertEqual(config["routing"]["cooldown_seconds"], 60)
+        self.assertEqual(config["routing"]["weights"]["fixture"], 1)
+        self.assertEqual(config["budgets"]["max_input_tokens"], DEFAULT_MAX_INPUT_TOKENS)
+        self.assertEqual(config["budgets"]["max_output_tokens"], DEFAULT_MAX_OUTPUT_TOKENS)
+        ranked = starter_config({"fixture", "fixture-b", "grok"})
+        ranked["routing"]["weights"]["grok"] = 5
+        self.assertEqual(select_route(ranked)[0], "grok")
+        self.assertEqual(select_route(ranked, "fixture")[0], "fixture")
+        payload = starter_config({"fixture"})
+        payload["routing"]["weights"]["fixture"] = True
+        with self.assertRaises(HarnessError) as caught:
+            validate_config(payload)
+        self.assertIn("weights", str(caught.exception))
+
+    def test_rate_limit_cooldown_persists_and_falls_back(self) -> None:
+        calls: list[str] = []
+
+        class Adapter:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def execute(self, request, *, allow_live=False, timeout_seconds=None, runner=None):
+                del allow_live, timeout_seconds, runner
+                calls.append(f"{self.name}:{request.kind}")
+                if self.name == "fixture" and request.kind == "execute":
+                    raise ProviderRateLimited(
+                        "fixture was rate-limited",
+                        until="2026-10-14T08:35:00Z",
+                    )
+                if request.kind == "review":
+                    return ProviderResult(self.name, ("stub",), "VERDICT approve\nok", False)
+                return ProviderResult(self.name, ("stub",), "hello from " + self.name, False)
+
+        config = starter_config({"fixture", "fixture-b", "grok"})
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            record = run_task(
+                "Say hello",
+                config=config,
+                state_dir=state,
+                open_adapter=lambda name: Adapter(name),
+                now=lambda: NOW,
+            )
+            self.assertEqual(record["status"], "completed")
+            self.assertEqual(record["provider"], "fixture-b")
+            self.assertEqual(record["reviews"][0]["provider"], "grok")
+            self.assertEqual(record["reviews"][0]["verdict"], "approve")
+            self.assertEqual(record["cooldowns"]["fixture"]["reason"], "rate-limited")
+            self.assertEqual(record["cooldowns"]["fixture"]["until"], "2026-10-14T08:35:00Z")
+            body = (state / "cooldowns.json").read_text(encoding="utf-8")
+            self.assertNotIn("SECRET", body)
+            self.assertEqual(json.loads(body)["providers"]["fixture"]["until"], "2026-10-14T08:35:00Z")
+            self.assertEqual(calls, ["fixture:execute", "fixture-b:execute", "grok:review"])
+            calls.clear()
+            again = run_task(
+                "Say hello",
+                config=config,
+                state_dir=state,
+                open_adapter=lambda name: Adapter(name),
+                now=lambda: NOW,
+            )
+            self.assertEqual(again["provider"], "fixture-b")
+            self.assertNotIn("fixture:execute", calls)
+            self.assertIn("fixture-b:execute", calls)
+            self.assertNotIn("fixture", CooldownStore(state / "cooldowns.json").active(NOW + 10**9))
+
+    def test_quota_and_auth_fall_back_without_a_live_provider(self) -> None:
+        calls: list[str] = []
+
+        class Adapter:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def execute(self, request, *, allow_live=False, timeout_seconds=None, runner=None):
+                del request, allow_live, timeout_seconds, runner
+                calls.append(self.name)
+                if self.name == "fixture":
+                    raise ProviderQuotaExhausted("fixture quota is exhausted")
+                if self.name == "fixture-b":
+                    raise ProviderAuthExpired("fixture-b authentication expired", retry_after=30)
+                return ProviderResult(self.name, ("stub",), "done", False)
+
+        config = starter_config({"fixture", "fixture-b", "grok"})
+        config["review"]["accept_unreviewed"] = True
+        with tempfile.TemporaryDirectory() as directory:
+            record = run_task(
+                "Say hello",
+                config=config,
+                state_dir=Path(directory),
+                open_adapter=lambda name: Adapter(name),
+                now=lambda: NOW,
+            )
+        self.assertEqual(calls, ["fixture", "fixture-b", "grok"])
+        self.assertEqual(record["provider"], "grok")
+        self.assertEqual(record["status"], "completed")
+        self.assertTrue(record["accepted"])
+        self.assertEqual(record["cooldowns"]["fixture"]["reason"], "quota-exhausted")
+        self.assertEqual(record["cooldowns"]["fixture"]["until"], format_until(NOW + 60))
+        self.assertEqual(record["cooldowns"]["fixture-b"]["reason"], "auth-expired")
+        self.assertEqual(record["cooldowns"]["fixture-b"]["until"], format_until(NOW + 30))
+        self.assertEqual(record["reviews"][0]["verdict"], "skipped")
+
+    def test_large_diff_is_clipped_before_the_adapter(self) -> None:
+        token = "LARGE-DIFF-TOKEN"
+        huge = token * 4000
+        seen: list[str] = []
+
+        class Capture:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def execute(self, request, *, allow_live=False, timeout_seconds=None, runner=None):
+                del allow_live, timeout_seconds, runner
+                seen.append(request.task)
+                if request.kind == "review":
+                    return ProviderResult(self.name, ("stub",), "VERDICT approve\nok", False)
+                return ProviderResult(self.name, ("stub",), "done", False)
+
+        with tempfile.TemporaryDirectory() as directory:
+            record = run_task(
+                "Say hello",
+                config=starter_config({"fixture", "fixture-b"}),
+                state_dir=Path(directory),
+                diff=huge,
+                dependencies=[{"id": "build", "text": "built", "diff": huge}],
+                open_adapter=lambda name: Capture(name),
+            )
+        self.assertEqual(record["status"], "completed")
+        self.assertGreaterEqual(len(seen), 2)
+        self.assertTrue(any(prompt.startswith("Say hello") for prompt in seen))
+        self.assertTrue(any(prompt.startswith("Review this completed task.") for prompt in seen))
+        for prompt in seen:
+            self.assertNotIn(huge, prompt)
+            self.assertLess(prompt.count(token), huge.count(token))
+            self.assertIn("[truncated]", prompt)
+
+    def test_pre_call_budget_refuses_before_the_adapter(self) -> None:
+        opened: list[str] = []
+
+        class Spy:
+            def execute(self, request, *, allow_live=False, timeout_seconds=None, runner=None):
+                raise AssertionError(request.kind)
+
+        config = starter_config({"fixture"})
+        config["budgets"]["max_input_tokens"] = 4
+        config["review"]["max_rounds"] = 0
+        with tempfile.TemporaryDirectory() as directory:
+            record = run_task(
+                "Say hello",
+                config=config,
+                state_dir=Path(directory),
+                open_adapter=lambda name: opened.append(name) or Spy(),
+            )
+        self.assertEqual(opened, [])
+        self.assertEqual(record["status"], "budget-exceeded")
+        self.assertFalse(record["accepted"])
+        self.assertEqual(record["attempts"][0]["reason"], "budget")
+        self.assertEqual(record["text"], "")
+
+        calls: list[str] = []
+
+        class Worker:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def execute(self, request, *, allow_live=False, timeout_seconds=None, runner=None):
+                del request, allow_live, timeout_seconds, runner
+                calls.append(self.name)
+                return ProviderResult(
+                    self.name,
+                    ("stub",),
+                    '{"usage":{"input_tokens":90,"output_tokens":1}}\nhello',
+                    False,
+                )
+
+        low = starter_config({"fixture", "fixture-b"})
+        low["budgets"]["max_input_tokens"] = 100
+        with tempfile.TemporaryDirectory() as directory:
+            stopped = run_task(
+                "Say hello",
+                config=low,
+                state_dir=Path(directory),
+                open_adapter=lambda name: Worker(name),
+            )
+        self.assertEqual(calls, ["fixture"])
+        self.assertEqual(stopped["status"], "budget-exceeded")
+        self.assertEqual(stopped["reviews"], [])
+        self.assertEqual(stopped["usage"]["input_tokens"], 90)
+        self.assertEqual(stopped["attempts"][-1]["reason"], "budget")
+        self.assertEqual(stopped["attempts"][-1]["provider"], "fixture-b")
+
+    def test_stubbed_rate_limit_is_classified_without_a_live_process(self) -> None:
+        def limited(argv, stdin_text, timeout, cwd):
+            del stdin_text, timeout
+            return _completed(argv, 429, stderr="SECRET too many requests retry-after: 15")
+
+        def exhausted(argv, stdin_text, timeout, cwd):
+            del stdin_text, timeout
+            return _completed(argv, 402, stderr="SECRET quota exceeded")
+
+        def expired(argv, stdin_text, timeout, cwd):
+            del stdin_text, timeout, cwd
+            stdout = '{"type":"result","is_error":true,"result":"Not logged in SECRET"}'
+            return _completed(argv, 1, stdout=stdout, stderr="SECRET")
+
+        with tempfile.TemporaryDirectory() as directory:
+            request = ProviderRequest(
+                task="Say hello",
+                packet_id="run-aabbccddeeff",
+                cwd=directory,
+            )
+            with self.assertRaises(ProviderRateLimited) as limited_error:
+                CodexExecProvider().execute(request, allow_live=True, runner=limited)
+            self.assertEqual(limited_error.exception.reason, "rate-limited")
+            self.assertEqual(limited_error.exception.retry_after, 15)
+            self.assertNotIn("SECRET", str(limited_error.exception))
+            with self.assertRaises(ProviderQuotaExhausted) as quota_error:
+                CodexExecProvider().execute(request, allow_live=True, runner=exhausted)
+            self.assertEqual(quota_error.exception.reason, "quota-exhausted")
+            self.assertNotIn("SECRET", str(quota_error.exception))
+            with self.assertRaises(ProviderAuthExpired) as auth_error:
+                ClaudeHeadlessProvider().execute(request, allow_live=True, runner=expired)
+            self.assertEqual(auth_error.exception.reason, "auth-expired")
+            self.assertNotIn("SECRET", str(auth_error.exception))
+            self.assertNotIn("logged in", str(auth_error.exception))

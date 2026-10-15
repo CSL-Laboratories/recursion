@@ -141,9 +141,9 @@ includes the code they sit in, and the tests are stubs.
   --approve-for-me` and grok `--always-approve`, `--prompt-file`, and
   `--cwd` stay on [CSL-81](https://linear.app/csl-laboratories/issue/CSL-81).
   The tests stub the process runner.
-- Budgets are applied after a call returns, so one live call can pass a
-  ceiling. A pre-check is [CSL-83](https://linear.app/csl-laboratories/issue/CSL-83),
-  not this slice.
+- Budgets were applied after a call returned, so one live call could pass
+  a ceiling. The pre-call check is
+  [CSL-83](https://linear.app/csl-laboratories/issue/CSL-83).
 
 ## What this does not prove
 

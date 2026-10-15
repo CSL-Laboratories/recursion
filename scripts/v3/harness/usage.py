@@ -58,6 +58,27 @@ def add_usage(total: dict, extra: dict) -> dict:
     return total
 
 
+def call_fits(spent: dict, budgets: dict, prompt: str) -> bool:
+    """False when starting this call would pass a known ceiling.
+
+    A known figure already at its ceiling refuses the call. The prompt's
+    character length is the minimum input this call will send. It is added
+    to known input usage. Missing prior usage is not treated as zero: only
+    the prompt is counted until a provider reports a figure. This is not a
+    tokenizer and it does not change the configured ceiling.
+    """
+
+    if _at_or_over(spent, budgets):
+        return False
+    limit = budgets.get("max_input_tokens")
+    if limit is None:
+        return True
+    text = prompt if isinstance(prompt, str) else ""
+    known = spent.get("input_tokens")
+    projected = len(text) if known is None else known + len(text)
+    return projected <= limit
+
+
 def exceeded(spent: dict, budgets: dict) -> bool:
     """True when a known figure is strictly above its ceiling."""
 
@@ -70,6 +91,22 @@ def exceeded(spent: dict, budgets: dict) -> bool:
         limit = budgets.get(limit_key)
         value = spent.get(spent_key)
         if limit is not None and value is not None and value > limit:
+            return True
+    return False
+
+
+def _at_or_over(spent: dict, budgets: dict) -> bool:
+    """True when a known figure is already at or above its ceiling."""
+
+    pairs = (
+        ("input_tokens", "max_input_tokens"),
+        ("output_tokens", "max_output_tokens"),
+        ("cost", "max_cost"),
+    )
+    for spent_key, limit_key in pairs:
+        limit = budgets.get(limit_key)
+        value = spent.get(spent_key)
+        if limit is not None and value is not None and value >= limit:
             return True
     return False
 

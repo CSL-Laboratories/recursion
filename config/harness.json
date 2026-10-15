@@ -19,7 +19,15 @@
       "claude",
       "codex",
       "grok"
-    ]
+    ],
+    "cooldown_seconds": 60,
+    "weights": {
+      "fixture": 1,
+      "fixture-b": 1,
+      "claude": 1,
+      "codex": 1,
+      "grok": 1
+    }
   },
   "providers": [
     {

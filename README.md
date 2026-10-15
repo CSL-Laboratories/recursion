@@ -28,7 +28,7 @@ Start here:
 | `experiments/v3/` | v3 research experiments and provider-free evidence checks |
 | `schemas/control-plane/v3/` | v3 contract schemas (planning, execution, integrity) |
 | `scripts/v3/` | v3 planning replay and validation |
-| `scripts/v3/harness/` | CSL-27 upstream CLI harness slice |
+| `scripts/v3/harness/` | CSL-27 upstream CLI harness slice; CSL-83 weights, cooldowns, and caps |
 | `config/harness.json` | shipped harness config (offline fixtures only) |
 | `scripts/tests/v3/` | v3 M1 test programs and fixtures |
 | `tools/check_v3_orientation.py` | the frozen 2026-09-13 orientation-repair gate |
@@ -40,7 +40,10 @@ CSL-27 adds a minimal upstream CLI harness. It routes one task through an
 adapter and can review it with a second adapter. The shipped config enables
 only the offline `fixture` and `fixture-b` providers. `claude`, `codex`, and
 `grok` start only with `--allow-live`. The architecture note is
-[docs/v3/harness/CSL-27.md](docs/v3/harness/CSL-27.md).
+[docs/v3/harness/CSL-27.md](docs/v3/harness/CSL-27.md). CSL-83 adds preference
+weights, a cooldown after rate-limit, quota, and auth failures, fallback to
+the next capable provider, and size caps on review prompts and dependency
+context. The note is [docs/v3/harness/CSL-83.md](docs/v3/harness/CSL-83.md).
 
 From the repository root:
 

@@ -556,3 +556,45 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(record["usage"]["input_tokens"], 12)
             self.assertEqual(record["reviews"], [])
             self.assertFalse(record["accepted"])
+
+    def test_saved_run_scrubs_a_secret_from_the_environment(self) -> None:
+        secret = "SECRET-TOKEN-VALUE"
+
+        class Echo(_Stub):
+            def execute(self, request, *, allow_live=False, timeout_seconds=None, runner=None):
+                del request, allow_live, timeout_seconds, runner
+                return ProviderResult(self.name, ("stub",), f"token {secret}", False)
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {"ANTHROPIC_API_KEY": secret}):
+                record = run_task(
+                    "Say hello",
+                    config=starter_config({"fixture"}),
+                    state_dir=Path(directory),
+                    open_adapter=lambda name: Echo("fixture", ""),
+                )
+            self.assertNotIn(secret, json.dumps(record))
+            self.assertIn("[redacted]", record["text"])
+
+    def test_grok_env_key_counts_as_signed_in(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bindir = Path(directory) / "bin"
+            home = Path(directory) / "home"
+            bindir.mkdir()
+            home.mkdir()
+            (bindir / "grok").write_text("", encoding="utf-8")
+            report = diagnose(
+                starter_config({"grok"}),
+                environ={"XAI_API_KEY": SECRET},
+                platform="linux",
+                home=home,
+                path=str(bindir),
+                run=lambda argv, timeout: _completed(argv, 0, stdout="grok 1.0\n"),
+                git_run=lambda argv, timeout: _completed(argv, 0, stdout="git version 2.45.0\n"),
+            )
+            rendered = json.dumps(report)
+            self.assertNotIn(SECRET, rendered)
+            row = {item["name"]: item for item in report["providers"]}["grok"]
+            self.assertEqual(row["signed_in"], "signed-in")
+            self.assertEqual(row["auth_method"], "env")
+            self.assertTrue(row["usable"])

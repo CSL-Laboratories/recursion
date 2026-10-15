@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
+from scripts.v3.harness.doctor import _scrub, _secret_values
 from scripts.v3.harness.errors import HarnessError, ProviderTimeout
 from scripts.v3.harness.providers import ProviderRequest, open_provider
 from scripts.v3.harness.review import parse_verdict, review_prompt
@@ -196,7 +198,7 @@ def _timeout(config: dict, name: str) -> int:
 
 def _finish(config, state_dir, **fields) -> dict:
     del config
-    text = fields["text"]
+    text = _scrub(fields["text"], _secret_values(os.environ))
     if len(text) > RECORD_LIMIT:
         text = text[:RECORD_LIMIT] + "\n[truncated]"
     record = {

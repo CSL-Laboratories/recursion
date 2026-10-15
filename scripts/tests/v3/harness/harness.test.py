@@ -449,7 +449,7 @@ class HarnessTests(unittest.TestCase):
             home = root / "home"
             home.mkdir()
             shim = root / "claude.cmd"
-            shim.write_text("@echo off\r\nexit /b 1\r\n", encoding="utf-8")
+            shim.write_bytes(b"@echo off\r\nexit /b 1\r\n")
 
             def run(argv, timeout):
                 del timeout
@@ -482,7 +482,7 @@ class HarnessTests(unittest.TestCase):
             self.assertTrue(str(row["resolved"]).casefold().endswith("claude.cmd"))
             self.assertEqual(row["signed_in"], "signed-in")
             self.assertEqual(row["auth_method"], "claude.ai")
-            self.assertEqual(shim.read_text(encoding="utf-8"), "@echo off\r\nexit /b 1\r\n")
+            self.assertEqual(shim.read_bytes(), b"@echo off\r\nexit /b 1\r\n")
 
     def test_checked_in_stream_fixtures_match_the_parsers(self) -> None:
         from scripts.v3.harness.streams import assistant_text

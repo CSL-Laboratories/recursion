@@ -475,12 +475,22 @@ def already_cited(
     thread: Thread,
     issue_comments: Iterable[Comment],
     cfg: Config,
+    *,
+    head_sha: str = "",
 ) -> bool:
+    """Trusted on-thread cite for this thread and the current head only."""
+    del issue_comments  # PR-level comments are not an on-thread citation.
     marker = cite_marker(thread.id)
-    return any(
-        marker in (comment.body or "") and _trusted_marker_comment(comment, cfg)
-        for comment in (*thread.comments, *issue_comments)
-    )
+    want = normalize_sha(head_sha)
+    if not want:
+        return False
+    for comment in thread.comments:
+        if not _trusted_marker_comment(comment, cfg):
+            continue
+        body = comment.body or ""
+        if marker in body and want in body.lower():
+            return True
+    return False
 
 
 def resolves_today(
@@ -572,7 +582,7 @@ def classify_resolve(
         return "stale-sha"
     if not pull.required_checks_green:
         return "checks"
-    if already_cited(thread, pull.issue_comments, cfg):
+    if already_cited(thread, pull.issue_comments, cfg, head_sha=pull.head_sha):
         return "retry-resolve"
     return "resolve"
 
@@ -1429,14 +1439,26 @@ def resolve_eligible_thread(
         notice(f"resolveReviewThread skipped: {exc}")
         counters.resolve_failed += 1
         return pull, False
+    marked = False
     try:
         github.post_comment(pull.number, resolve_success_body(thread, pull.head_sha))
-    except Exception as exc:  # noqa: BLE001 — thread is already cited and resolved
+        marked = True
+    except Exception as exc:  # noqa: BLE001 — try an on-thread success marker next
         notice(f"resolve success marker skipped: {exc}")
         try:
-            github.reply_on_thread(thread.id, resolve_marker(thread.id))
+            github.reply_on_thread(
+                thread.id, resolve_success_body(thread, pull.head_sha)
+            )
+            marked = True
         except Exception as reply_exc:  # noqa: BLE001
             notice(f"resolve success marker reply skipped: {reply_exc}")
+    if not marked:
+        counters.resolve_failed += 1
+        notice(
+            f"resolved PR #{pull.number} {thread.id} without a success marker; "
+            "not counting as success so a later reopen cannot be auto-closed"
+        )
+        return pull, False
     counters.resolved += 1
     log(f"resolved PR #{pull.number} thread {thread.id} on {pull.head_sha[:12]}")
     return pull, True

@@ -164,6 +164,11 @@ def run_task(
         raise exc
 
     def finish(status: str, provider_name: str):
+        if provider is not None and provider_name and provider_name != provider:
+            print(
+                f"notice: requested provider {provider} was replaced by {provider_name}",
+                file=sys.stderr,
+            )
         return _finish(
             config,
             state_dir,
@@ -183,11 +188,6 @@ def run_task(
     kind, result = dispatch(worker_candidates, _request(worker_task, run_id, "execute", workspace), on_exhaust="fail")
     if kind == "budget":
         return finish("budget-exceeded", holder["provider"])
-    if provider is not None and result.provider != provider:
-        print(
-            f"notice: requested provider {provider} was replaced by {result.provider}",
-            file=sys.stderr,
-        )
     holder["provider"] = result.provider
     add_usage(usage, parse_usage(result.text))
     shown = assistant_text(result.text)

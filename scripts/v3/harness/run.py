@@ -163,12 +163,17 @@ def run_task(
         save_failure("failed", exc)
         raise exc
 
+    def notify_replacement(provider_name: str) -> None:
+        if holder.get("notified") or provider is None or not provider_name or provider_name == provider:
+            return
+        holder["notified"] = True
+        print(
+            f"notice: requested provider {provider} was replaced by {provider_name}",
+            file=sys.stderr,
+        )
+
     def finish(status: str, provider_name: str):
-        if provider is not None and provider_name and provider_name != provider:
-            print(
-                f"notice: requested provider {provider} was replaced by {provider_name}",
-                file=sys.stderr,
-            )
+        notify_replacement(provider_name)
         return _finish(
             config,
             state_dir,
@@ -189,6 +194,7 @@ def run_task(
     if kind == "budget":
         return finish("budget-exceeded", holder["provider"])
     holder["provider"] = result.provider
+    notify_replacement(result.provider)
     add_usage(usage, parse_usage(result.text))
     shown = assistant_text(result.text)
     if exceeded(usage, budgets):

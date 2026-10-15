@@ -47,9 +47,8 @@ distinct: source-documented, locally observed, inferred and unmeasured are diffe
 
 ## Recorded decisions
 
-Before proposing architecture or direction, read `state/DECISIONS.md` (the accepted
-decision log) and `docs/adr/` and the linked decision issues; do not re-argue a
-recorded decision without new evidence.
+Before proposing architecture or direction, read `docs/adr/` and the linked
+decision issues; do not re-argue a recorded decision without new evidence.
 
 ## Style
 

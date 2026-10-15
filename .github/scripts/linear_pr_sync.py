@@ -13,7 +13,7 @@ import re
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable
 from urllib.parse import urlparse
 
@@ -296,8 +296,8 @@ class GitHubClient:
             page += 1
         return tuple(reviews)
 
-    def load_pull(self, number: int) -> PullSnapshot | None:
-        url = f"{GITHUB_API}/repos/{self.cfg.owner}/{self.cfg.name}/pulls/{number}"
+    def load_pull(self, number: int, *, wait: bool = True) -> PullSnapshot | None:
+        url = self._pr_url(number)
         try:
             data = self._request(url)
         except RuntimeError as exc:
@@ -308,7 +308,8 @@ class GitHubClient:
             return None
         tries = 0
         while (
-            mergeable_pending(data)
+            wait
+            and mergeable_pending(data)
             and tries < MERGEABLE_RETRIES
             and self._mergeable_budget_s >= MERGEABLE_WAIT_S
         ):
@@ -346,6 +347,43 @@ class GitHubClient:
             reviews=reviews,
             head_repo=head_repo,
         )
+
+    def _pr_url(self, number: int) -> str:
+        return f"{GITHUB_API}/repos/{self.cfg.owner}/{self.cfg.name}/pulls/{number}"
+
+    def settle_mergeable(self, pulls: list[PullSnapshot]) -> list[PullSnapshot]:
+        """Round-robin extra fetches so later PRs share the mergeable wait budget.
+
+        First snapshots come from load_pull(wait=False). This pass sleeps at most
+        MERGEABLE_WAIT_S per turn, caps each PR at MERGEABLE_RETRIES extra fetches,
+        and stops when the shared budget is gone — early PRs cannot spend it all.
+        """
+        out = list(pulls)
+        pending = [
+            i
+            for i, pull in enumerate(out)
+            if (pull.mergeable_state or "").strip().lower() in PENDING_MERGEABLE
+        ]
+        attempts = [0] * len(out)
+        while pending and self._mergeable_budget_s >= MERGEABLE_WAIT_S:
+            index = pending.pop(0)
+            time.sleep(MERGEABLE_WAIT_S)
+            self._mergeable_budget_s -= MERGEABLE_WAIT_S
+            try:
+                data = self._request(self._pr_url(out[index].number))
+            except RuntimeError as exc:
+                notice(f"PR #{out[index].number} mergeable refresh skipped: {exc}")
+                continue
+            if not isinstance(data, dict) or not data.get("number"):
+                continue
+            out[index] = replace(
+                out[index],
+                mergeable_state=str(data.get("mergeable_state") or ""),
+            )
+            attempts[index] += 1
+            if mergeable_pending(data) and attempts[index] < MERGEABLE_RETRIES:
+                pending.append(index)
+        return out
 
 
 class LinearClient:
@@ -495,15 +533,25 @@ def scan(cfg: Config, github: GitHubClient, linear: LinearClient | None) -> int:
     if not cfg.github_token:
         raise SystemExit("GH_TOKEN / GITHUB_TOKEN is required to read pull requests")
     synced = 0
+    loaded: list[PullSnapshot] = []
     for number in github.list_open_pr_numbers() if not cfg.pr_number else [cfg.pr_number]:
         try:
-            pull = github.load_pull(number)
+            pull = github.load_pull(number, wait=False)
             if pull is None:
                 notice(f"PR #{number} not found")
                 continue
+            loaded.append(pull)
+        except Exception as exc:  # noqa: BLE001 — keep refreshing later PRs
+            notice(f"PR #{number} load skipped: {exc}")
+            continue
+    settle = getattr(github, "settle_mergeable", None)
+    if callable(settle) and loaded:
+        loaded = settle(loaded)
+    for pull in loaded:
+        try:
             result = sync_pull(pull, cfg, linear)
         except Exception as exc:  # noqa: BLE001 — keep refreshing later PRs
-            notice(f"PR #{number} sync skipped: {exc}")
+            notice(f"PR #{pull.number} sync skipped: {exc}")
             continue
         if result in {"created", "updated"}:
             synced += 1

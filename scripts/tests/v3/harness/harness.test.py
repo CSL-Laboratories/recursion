@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[4]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from scripts.v3.harness.availability import classify_failure  # noqa: E402
 from scripts.v3.harness.cli import main  # noqa: E402
 from scripts.v3.harness.config import load_config, starter_config, validate_config, write_starter  # noqa: E402
 from scripts.v3.harness.cooldowns import CooldownStore, format_until  # noqa: E402
@@ -968,3 +969,19 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(auth_error.exception.reason, "auth-expired")
             self.assertNotIn("SECRET", str(auth_error.exception))
             self.assertNotIn("logged in", str(auth_error.exception))
+
+        bare_auth = classify_failure("codex", 401, "")
+        self.assertIsInstance(bare_auth, HarnessError)
+        self.assertNotIsInstance(bare_auth, ProviderAuthExpired)
+        self.assertIn("exited 401", str(bare_auth))
+        bare_quota = classify_failure("codex", 402, "")
+        self.assertNotIsInstance(bare_quota, ProviderQuotaExhausted)
+        self.assertIn("exited 402", str(bare_quota))
+        self.assertIsInstance(
+            classify_failure("codex", 1, "unexpected status 401 Unauthorized"),
+            ProviderAuthExpired,
+        )
+        self.assertIsInstance(
+            classify_failure("codex", 1, "HTTP 402 quota exceeded"),
+            ProviderQuotaExhausted,
+        )

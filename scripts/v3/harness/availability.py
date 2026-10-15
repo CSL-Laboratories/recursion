@@ -74,13 +74,15 @@ def classify_failure(
     if returncode == 0 and not signals:
         return None
     text = "\n".join(part for part in ((stderr or ""), signals) if part).lower()
+    # Process exit codes stop at 255, so 401 and 402 are not exit codes.
+    # Auth and quota are classified from the error text.
     code = returncode if returncode else 1
     until, retry_after = _reset("\n".join(part for part in ((stderr or ""), signals) if part))
-    if code == 401 or _contains(text, _AUTH):
+    if _contains(text, _AUTH):
         return ProviderAuthExpired(
             f"{name} authentication expired", until=until, retry_after=retry_after
         )
-    if code == 402 or _contains(text, _QUOTA):
+    if _contains(text, _QUOTA):
         return ProviderQuotaExhausted(
             f"{name} quota is exhausted", until=until, retry_after=retry_after
         )

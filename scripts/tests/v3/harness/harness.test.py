@@ -192,6 +192,24 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(assistant_text(hidden), "Looks fine.\nVERDICT approve")
         self.assertEqual(parse_verdict(hidden), ("approve", "Looks fine."))
 
+        def assistant_event(content: list[dict]) -> str:
+            return json.dumps({"type": "assistant", "message": {"content": content}})
+
+        across_events = "\n".join(
+            (
+                assistant_event([{"type": "text", "text": "Looks fine."}]),
+                assistant_event(
+                    [
+                        {"type": "tool_use", "id": "tool-1", "name": "read"},
+                        {"type": "text", "text": ""},
+                    ]
+                ),
+                assistant_event([{"type": "text", "text": "VERDICT approve"}]),
+            )
+        )
+        self.assertEqual(assistant_text(across_events), "Looks fine.\nVERDICT approve")
+        self.assertEqual(parse_verdict(across_events), ("approve", "Looks fine."))
+
         content_before_result = "\n".join(
             (
                 json.dumps(

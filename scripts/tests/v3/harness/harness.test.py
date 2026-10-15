@@ -502,7 +502,7 @@ class HarnessTests(unittest.TestCase):
             )
             cwd = Path(str(seen["cwd"]))
             self.assertTrue(seen["allow_live"])
-            self.assertEqual(cwd, state / record["run_id"] / "workspace")
+            self.assertEqual(cwd, (state / record["run_id"] / "workspace").resolve())
             self.assertTrue(cwd.is_dir())
             self.assertEqual(record["workspace"], str(cwd))
             if os.name == "posix":

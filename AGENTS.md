@@ -122,8 +122,8 @@ start, assign yourself and move the issue to **In Progress**; unassign if you st
 
 **Filing and shipping.**
 
-- Branch `loop/work/<task-id>` with `CSL-N` in the task id (example: `loop/work/CSL-26`).
-  Do not use Linear's copied branch name as the git branch.
+- Branch naming is deferred to [#189](https://github.com/CSL-Laboratories/recursion/pull/189)
+  (CSL-76).
 - PR title includes `CSL-N` so Linear auto-links (example: `CSL-26: ...`). Put `Fixes CSL-N`
   in the PR body — that links the PR, and merging moves the issue to **Done** automatically.
 - One issue per PR; keep PRs small and stackable.
@@ -208,7 +208,8 @@ label, not by editing config.
 
 Devin reviews only and never fixes, so a thread is never handed back to Devin. Claude
 leaves the thread open, replies explaining why it couldn't fix it, and @mentions the PR
-author.
+author. If no `Stuck PR threads: recursion#<PR>` issue appears within one watcher
+cycle, the PR author files it.
 
 ## Review loop
 
@@ -227,7 +228,8 @@ Caps: one mediation per thread, three per PR per UTC day. The watcher never
 resolves threads, pushes, or merges.
 
 Before merging any PR, check Linear for an open `Stuck PR threads: recursion#<PR>`
-issue tied to it, and resolve the checklist or record the decision first.
+issue tied to it, and resolve the checklist or record the decision first. If no
+such issue appears within one watcher cycle, the PR author files it.
 
 ## Automations
 

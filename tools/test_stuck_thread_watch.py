@@ -8,6 +8,7 @@ Acceptance gate:
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sys
 import unittest
@@ -312,6 +313,18 @@ class CapAndBodyTests(unittest.TestCase):
             ),
             "",
         )
+        self.assertEqual(
+            mod.skip_pr_reason(
+                pull(
+                    threads=[t],
+                    review_decision="APPROVED",
+                    checks_state="SUCCESS",
+                    head_oid="abc",
+                    approved_head_oids=(),
+                )
+            ),
+            "",
+        )
 
 
 class FakeGitHub:
@@ -345,12 +358,22 @@ class FakeLinear:
         self.existing = existing or {}
         self.existing_ids: dict[str, str] = {}
         self.existing_states: dict[str, str] = {}
+        self.existing_descriptions: dict[str, str] = {}
+        self.marker_matches: dict[str, list[mod.LinearIssue]] = {}
         self.created: list[tuple[str, str]] = []
         self.updated: list[tuple[str, str]] = []
         self.canceled: list[str] = []
         self.rollups: list[mod.LinearIssue] = []
 
     def find_by_marker(self, marker: str) -> mod.LinearIssue | None:
+        matches = list(self.marker_matches.get(marker) or [])
+        if matches:
+            active = [
+                issue
+                for issue in matches
+                if (issue.state_type or "").lower() not in {"canceled", "completed"}
+            ]
+            return active[0] if active else matches[0]
         url = self.existing.get(marker, "")
         if not url:
             return None
@@ -364,6 +387,7 @@ class FakeLinear:
             identifier="CSL-EXIST",
             title=title,
             state_type=self.existing_states.get(marker, "triage"),
+            description=self.existing_descriptions.get(marker, ""),
         )
 
     def create_triage_issue(self, *, title: str, description: str) -> mod.LinearIssue:
@@ -408,6 +432,8 @@ class ScanTests(unittest.TestCase):
         self.assertIn("<!-- stuck-pr-threads:recursion#186 -->", lin.created[0][1])
         self.assertIn("AGENTS.md:104", lin.created[0][1])
         self.assertIn("- [ ]", lin.created[0][1])
+        self.assertIn("<!-- thread:PRRT_x -->", lin.created[0][1])
+        self.assertIn("## Human decision", lin.created[0][1])
         self.assertNotIn("<!-- codex-mediation:PRRT_x -->", lin.created[0][1])
         self.assertEqual(gh.labels, [])
 
@@ -633,6 +659,142 @@ class ScanTests(unittest.TestCase):
         self.assertEqual(counters.mediated, 0)
         self.assertEqual(lin.canceled, ["iss_99"])
 
+    def test_preserves_checked_items_and_human_decision(self) -> None:
+        t1 = thread(tid="PRRT_a", path="AGENTS.md", line=10, comments=stuck_pair())
+        t2 = thread(tid="PRRT_b", path="CLAUDE.md", line=20, comments=stuck_pair())
+        p = pull(threads=[t1, t2])
+        previous = mod.linear_description(p, [(t1, "stuck-human")], cfg())
+        previous = previous.replace("- [ ] [`AGENTS.md:10`]", "- [x] [`AGENTS.md:10`]")
+        previous = previous.replace(
+            mod.DEFAULT_HUMAN_DECISION, "Keep the AGENTS.md wording."
+        )
+        marker = mod.rollup_marker(p)
+        lin = FakeLinear({marker: "https://linear.app/existing"})
+        lin.existing_descriptions[marker] = previous
+        gh = FakeGitHub([p])
+        mod.scan(cfg(), gh, lin)  # type: ignore[arg-type]
+        self.assertEqual(len(lin.updated), 1)
+        updated = lin.updated[0][1]
+        self.assertIn("- [x] [`AGENTS.md:10`]", updated)
+        self.assertIn("- [ ] [`CLAUDE.md:20`]", updated)
+        self.assertIn("Keep the AGENTS.md wording.", updated)
+
+    def test_sweep_skips_other_repo_rollups(self) -> None:
+        lin = FakeLinear()
+        lin.rollups = [
+            mod.LinearIssue(
+                id="iss_alpha",
+                url="https://linear.app/csl-laboratories/issue/CSL-A",
+                identifier="CSL-A",
+                title="Stuck PR threads: alpha#12",
+                state_type="triage",
+            )
+        ]
+        gh = FakeGitHub([])
+        counters = mod.scan(cfg(), gh, lin)  # type: ignore[arg-type]
+        self.assertEqual(lin.canceled, [])
+        self.assertEqual(counters.linear, 0)
+
+    def test_find_by_marker_prefers_active_issue(self) -> None:
+        t = thread(tid="PRRT_dup", comments=stuck_pair())
+        p = pull(threads=[t])
+        marker = mod.rollup_marker(p)
+        canceled = mod.LinearIssue(
+            id="iss_old",
+            url="https://linear.app/canceled",
+            identifier="CSL-OLD",
+            title="Stuck PR threads: recursion#186",
+            state_type="canceled",
+            description=marker,
+        )
+        active = mod.LinearIssue(
+            id="iss_live",
+            url="https://linear.app/live",
+            identifier="CSL-LIVE",
+            title="Stuck PR threads: recursion#186",
+            state_type="triage",
+            description=marker + "\n## Human decision\n\nKeep this.\n",
+        )
+        lin = FakeLinear()
+        lin.marker_matches[marker] = [canceled, active]
+        gh = FakeGitHub([p])
+        counters = mod.scan(cfg(), gh, lin)  # type: ignore[arg-type]
+        self.assertEqual(lin.created, [])
+        self.assertEqual(len(lin.updated), 1)
+        self.assertEqual(lin.updated[0][0], "iss_live")
+        self.assertIn("Keep this.", lin.updated[0][1])
+        self.assertEqual(counters.linear, 0)
+
+    def test_linear_error_on_closed_pr_does_not_abort_scan(self) -> None:
+        class BoomLinear(FakeLinear):
+            def find_by_marker(self, marker: str) -> mod.LinearIssue | None:
+                raise RuntimeError("linear down")
+
+        class ListClosedThenOpen(FakeGitHub):
+            def list_open_pr_numbers(self) -> list[int]:
+                return [1, 2]
+
+        t = thread(comments=stuck_pair())
+        gh = ListClosedThenOpen(
+            [
+                pull(number=1, threads=[t], state="CLOSED"),
+                pull(number=2, threads=[thread(tid="PRRT_2", comments=stuck_pair())]),
+            ]
+        )
+        counters = mod.scan(cfg(), gh, BoomLinear())  # type: ignore[arg-type]
+        self.assertEqual(counters.mediated, 1)
+        self.assertEqual(gh.comments[0][0], 2)
+
+    def test_search_rollups_follows_page_cursors(self) -> None:
+        calls: list[str | None] = []
+
+        def opener(req: Request, timeout: int = 0):
+            payload = json.loads(req.data.decode("utf-8"))
+            after = (payload.get("variables") or {}).get("after")
+            calls.append(after)
+            if after is None:
+                body = {
+                    "data": {
+                        "searchIssues": {
+                            "pageInfo": {"hasNextPage": True, "endCursor": "c2"},
+                            "nodes": [
+                                {
+                                    "id": "iss_old",
+                                    "identifier": "CSL-OLD",
+                                    "url": "https://linear.app/old",
+                                    "title": "Stuck PR threads: recursion#1",
+                                    "description": "",
+                                    "state": {"type": "canceled", "name": "Canceled"},
+                                }
+                            ],
+                        }
+                    }
+                }
+            else:
+                body = {
+                    "data": {
+                        "searchIssues": {
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                            "nodes": [
+                                {
+                                    "id": "iss_new",
+                                    "identifier": "CSL-NEW",
+                                    "url": "https://linear.app/new",
+                                    "title": "Stuck PR threads: recursion#99",
+                                    "description": "",
+                                    "state": {"type": "triage", "name": "Triage"},
+                                }
+                            ],
+                        }
+                    }
+                }
+            return BytesIO(json.dumps(body).encode("utf-8"))
+
+        client = mod.LinearClient(cfg(), opener=opener)
+        found = client.search_rollups()
+        self.assertEqual([issue.id for issue in found], ["iss_old", "iss_new"])
+        self.assertEqual(calls, [None, "c2"])
+
 
     def test_collect_connection_nodes_keeps_later_claude_reply(self) -> None:
         recent = "2026-10-15T11:30:00Z"
@@ -748,14 +910,24 @@ class WorkflowAndDocsTests(unittest.TestCase):
         self.assertEqual(self.agents, self.claude)
 
     def test_docs_point_at_the_workflow(self) -> None:
-        for text in (self.agents, self.claude, self.contributing):
+        for text in (self.agents, self.claude):
             self.assertIn("stuck-thread-watch.yml", text)
             self.assertIn("Devin reviews", text)
             self.assertIn("@codex review", text)
             self.assertIn("needs-decision", text)
             self.assertIn("Stuck PR threads: recursion#", text)
             self.assertRegex(text, r"do not\s+file one issue per thread")
+            self.assertIn("one watcher cycle", text)
+            self.assertIn("the PR author files it", text)
+            self.assertIn("Branch naming is deferred to", text)
+            self.assertIn("pull/189", text)
         self.assertIn(".github/workflows/stuck-thread-watch.yml", self.agents)
+        self.assertIn(
+            "AGENTS.md#when-claude-cant-fix-a-review-thread", self.contributing
+        )
+        self.assertIn("Branch naming is deferred to", self.contributing)
+        self.assertIn("pull/189", self.contributing)
+        self.assertNotIn("keep this convention", self.contributing)
         template = (ROOT / ".github" / "pull_request_template.md").read_text(encoding="utf-8")
         self.assertIn("Stuck PR threads: recursion#<PR>", template)
 

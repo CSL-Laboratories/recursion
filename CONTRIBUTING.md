@@ -62,19 +62,18 @@ For a research or evidence task:
 ## Linear workflow
 
 Work starts in Linear (team **CSL**, project **recursion**), not as a GitHub issue. When you
-start, assign yourself and move the issue to **In Progress**. Branch `loop/work/CSL-N` (keep
-this convention; do not use Linear's copied branch name). Title the PR `CSL-N: ...` and
-include `Fixes CSL-N` in the body — that links the PR, and merging moves the issue to
-**Done** automatically. If the PR does not move the issue to **In Review**, move it yourself.
+start, assign yourself and move the issue to **In Progress**. Branch naming is deferred to
+[#189](https://github.com/CSL-Laboratories/recursion/pull/189) (CSL-76). Title the PR
+`CSL-N: ...` and include `Fixes CSL-N` in the body — that links the PR, and merging moves
+the issue to **Done** automatically. If the PR does not move the issue to **In Review**,
+move it yourself.
 File follow-ups to **Triage**. Keep the Linear issue current as work progresses, and file
 anything that comes up in a session to **Triage** instead of dropping it; Linear is the
 primary async channel, alongside Google Meet and Discord.
 
 ## When Claude can't fix a review thread
 
-Devin reviews only and never fixes, so a thread is never handed back to Devin. Claude
-leaves the thread open, replies explaining why it couldn't fix it, and @mentions the PR
-author.
+See [AGENTS.md#when-claude-cant-fix-a-review-thread](AGENTS.md#when-claude-cant-fix-a-review-thread).
 
 ## Branch and review flow
 
@@ -88,17 +87,8 @@ author.
 
 ## Review loop
 
-Devin reviews. Claude (`.github/workflows/claude.yml`) fixes Devin findings on
-same-repo member PRs. Unresolved Devin threads that Claude cannot settle are
-picked up by
-[`.github/workflows/stuck-thread-watch.yml`](.github/workflows/stuck-thread-watch.yml),
-which asks Codex to mediate (`@codex review`). A Codex **MEDIATE** verdict
-updates one Linear Triage roll-up per PR titled `Stuck PR threads: recursion#<PR>`,
-labelled `needs-decision`, with a checklist of stuck threads (update that issue;
-do not file one issue per thread). The watcher skips drafts, merged/closed PRs,
-and PRs approved on the current head with green checks, and cancels the roll-up
-when the PR merges or every stuck thread is resolved. Humans decide. The
-watcher never resolves threads, pushes, or merges.
+See [AGENTS.md#review-loop](AGENTS.md#review-loop). The stuck-thread author
+fallback lives in [When Claude can't fix a review thread](AGENTS.md#when-claude-cant-fix-a-review-thread).
 
 ## Run a gate
 

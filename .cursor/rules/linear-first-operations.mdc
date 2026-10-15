@@ -15,6 +15,12 @@ issues and PRs.
   comment on the matching CSL Linear issue, so the Linear bot notifies them. A GitHub
   mention alone is not enough. Linear handles: Chaandan = @chaandansaini101, Samir =
   @samirshahahmed, Lucas = @lucassalvador987.
+- **Wait for jobs before reviewing.** No human or bot approves or requests changes on a
+  PR until Devin Review, the Claude fixer jobs (`devin-review-fix`, `resolve-pr`), and
+  required CI have all finished on the current head commit. A review on a stale head
+  does not count. After new pushes, the reviewer reviews again. Review requests and
+  their status are posted as @mention comments on the CSL Linear issue, and a watcher
+  posts there when a PR is ready for review.
 - Autonomously file research findings, ideas and bugs to Triage, deduped.
 - Ground every implementation in the best available research: Parallel search for web
   research and Context7 for current library docs.

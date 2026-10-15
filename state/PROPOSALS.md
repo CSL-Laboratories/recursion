@@ -74,8 +74,9 @@ growing, the default is to **stay monorepo** until the prerequisites above hold.
 ## P-002 — Replace the legacy branch name in `CONTROL_PLANE.md`
 
 - Date: 2026-10-15
-- Status: **accepted** 2026-10-15. Lucas approved on PR #189 and required this update in
-  that PR. Applied as D-040.
+- Status: **adopted** 2026-10-15. Lucas's owner decision on PR #189 authorizes the
+  protected-policy change, retires `loop/work/<task-id>`, and keeps the force-push,
+  merge, and deployment limits. Applied as D-040.
 - Owner: Lucas.
 - Issue: [CSL-76](https://linear.app/csl-laboratories/issue/CSL-76).
 

@@ -507,8 +507,9 @@ Date: 2026-10-15 · Status: ACCEPTED
 B) name review branches `csl-<N>-<slug>`, with an optional GitHub username prefix, and
 satisfy pr-lint with `CSL-N` in the PR title.
 
-**Chose:** B. Lucas approved this on PR #189 (2026-10-15) and required the invariant update
-in that PR. Proposal P-002.
+**Chose:** B. Lucas's owner decision on PR #189 (2026-10-15) adopts P-002: review
+branches are `csl-<N>-<slug>`, optionally prefixed by a GitHub username, and PR titles
+keep uppercase `CSL-N`. Force-push, merge, and deployment limits stay as they were.
 
 **Because:** `loop/` branch names belong to the retired recursion release. The current
 harness keys work to Linear issues. pr-lint matches `CSL-[0-9]+` case-sensitively, so a

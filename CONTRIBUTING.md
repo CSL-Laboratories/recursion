@@ -76,16 +76,6 @@ Devin reviews only and never fixes, so a thread is never handed back to Devin. C
 leaves the thread open, replies explaining why it couldn't fix it, and @mentions the PR
 author.
 
-The CSL Observability stuck-thread watcher — an external Grok Bot routine, not a GitHub
-workflow — then scans open PRs on a schedule and files a Linear issue in **Triage** titled
-`Stuck PR thread: repo#PR – topic`, labeled `needs-decision`, and linked to the PR's
-`CSL-N` issue. It runs outside this repository, so it will not appear in
-`.github/workflows` and reviewers should not look for it in-repo. For urgent cases the PR
-author may also file one by hand.
-
-Before merging any PR, check Linear for open `Stuck PR thread` issues tied to it, and
-resolve them or record the decision first.
-
 ## Branch and review flow
 
 - Branch from up-to-date `master`: `loop/work/<task-id>` for build output.
@@ -102,9 +92,13 @@ Devin reviews. Claude (`.github/workflows/claude.yml`) fixes Devin findings on
 same-repo member PRs. Unresolved Devin threads that Claude cannot settle are
 picked up by
 [`.github/workflows/stuck-thread-watch.yml`](.github/workflows/stuck-thread-watch.yml),
-which asks Codex to mediate (`@codex review`) and files a Linear Triage issue
-labelled `needs-decision`. Humans decide. The watcher never resolves threads,
-pushes, or merges.
+which asks Codex to mediate (`@codex review`). A Codex **MEDIATE** verdict
+updates one Linear Triage roll-up per PR titled `Stuck PR threads: recursion#<PR>`,
+labelled `needs-decision`, with a checklist of stuck threads (update that issue;
+do not file one issue per thread). The watcher skips drafts, merged/closed PRs,
+and PRs approved on the current head with green checks, and cancels the roll-up
+when the PR merges or every stuck thread is resolved. Humans decide. The
+watcher never resolves threads, pushes, or merges.
 
 ## Run a gate
 

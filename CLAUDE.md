@@ -193,8 +193,10 @@ label, not by editing config.
   author is an org OWNER or MEMBER. `@claude` also requires a human OWNER or
   MEMBER commenter. Fork and nonmember PRs are not auto-fixed.
 - **Stuck-thread watch** (`.github/workflows/stuck-thread-watch.yml`) asks Codex
-  to mediate Devin threads Claude could not settle. Codex is a mediator, not a
-  reviewer of record and not a fixer: it must not push code.
+  to mediate Devin threads Claude could not settle. A **MEDIATE** verdict
+  updates one Linear roll-up per PR (`Stuck PR threads: recursion#<PR>`), not
+  one issue per thread. Codex is a mediator, not a reviewer of record and not
+  a fixer: it must not push code.
 - **Blacksmith** is the only CI.
 - Cursor, Codex, Grok, and interactive Claude Code develop features from Linear
   issues. They must not post review verdicts or run review-fix loops on other

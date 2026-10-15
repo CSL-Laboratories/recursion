@@ -83,6 +83,7 @@ def main(argv: list[str] | None = None) -> int:
                 provider=args.provider,
                 allow_live=args.allow_live,
                 run_branch=args.branch,
+                repo=Path.cwd(),
             )
             _emit(record)
             return _EXIT.get(record["status"], 1)

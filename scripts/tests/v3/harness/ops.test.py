@@ -19,6 +19,7 @@ if str(ROOT) not in sys.path:
 
 from scripts.v3.harness.cli import main  # noqa: E402
 from scripts.v3.harness.config import load_config, starter_config  # noqa: E402
+from scripts.v3.harness.doctor import diagnose  # noqa: E402
 from scripts.v3.harness.errors import HarnessError, LiveProviderDisabled  # noqa: E402
 from scripts.v3.harness.providers import (  # noqa: E402
     LAUNCH_CRITICAL,
@@ -71,6 +72,16 @@ def _init_repo(repo: Path) -> None:
     _git(repo, "commit", "-m", "base")
 
 
+def _on_dev(repo: Path) -> None:
+    _git(repo, "checkout", "-b", "dev")
+
+
+def _accept(state: Path, sha: str, **kwargs) -> None:
+    payload = _record(RUN_ID, status="completed", accepted=True, **kwargs)
+    payload["reviewed_commit"] = sha
+    save_run(state, payload)
+
+
 def _record(run_id: str, *, status: str, accepted: bool, branch: str | None = "feature") -> dict:
     payload = {
         "accepted": accepted,
@@ -102,39 +113,116 @@ class _Tree:
 
 
 class LandCleanLogTests(unittest.TestCase):
-    def test_land_merges_an_accepted_branch(self) -> None:
+    def test_land_merges_the_reviewed_commit(self) -> None:
         tree = _Tree()
         self.addCleanup(tree.close)
+        _on_dev(tree.repo)
         _git(tree.repo, "checkout", "-b", "feature")
         (tree.repo / "extra.txt").write_text("extra\n", encoding="utf-8")
         _git(tree.repo, "add", "extra.txt")
         _git(tree.repo, "commit", "-m", "feature")
-        _git(tree.repo, "checkout", "master")
-        save_run(tree.state, _record(RUN_ID, status="completed", accepted=True))
+        sha = _git(tree.repo, "rev-parse", "HEAD").stdout.strip()
+        _git(tree.repo, "checkout", "dev")
+        _accept(tree.state, sha)
 
         stdout = io.StringIO()
         with redirect_stdout(stdout):
-            code = main(["land", RUN_ID, "--state", str(tree.state), "--repo", str(tree.repo), "--into", "master"])
+            code = main(["land", RUN_ID, "--state", str(tree.state), "--repo", str(tree.repo), "--into", "dev"])
         self.assertEqual(code, 0, stdout.getvalue())
         self.assertEqual((tree.repo / "extra.txt").read_text(encoding="utf-8"), "extra\n")
         self.assertEqual(_git(tree.repo, "status", "--porcelain").stdout, "")
         subject = _git(tree.repo, "log", "-1", "--format=%s").stdout.strip()
         self.assertEqual(subject, f"recursion: land {RUN_ID}")
+        self.assertEqual(_git(tree.repo, "rev-parse", "HEAD^2").stdout.strip(), sha)
         record = json.loads(stdout.getvalue())
         self.assertEqual(record["land"]["status"], "merged")
         self.assertTrue(record["land"]["commit"])
 
-    def test_land_refuses_a_dirty_tree(self) -> None:
+    def test_land_refuses_a_tip_the_reviewer_did_not_approve(self) -> None:
         tree = _Tree()
         self.addCleanup(tree.close)
+        _on_dev(tree.repo)
         _git(tree.repo, "checkout", "-b", "feature")
         (tree.repo / "extra.txt").write_text("extra\n", encoding="utf-8")
         _git(tree.repo, "add", "extra.txt")
         _git(tree.repo, "commit", "-m", "feature")
-        _git(tree.repo, "checkout", "master")
+        sha = _git(tree.repo, "rev-parse", "HEAD").stdout.strip()
+        _git(tree.repo, "checkout", "dev")
+        _accept(tree.state, sha)
+        _git(tree.repo, "checkout", "feature")
+        (tree.repo / "later.txt").write_text("later\n", encoding="utf-8")
+        _git(tree.repo, "add", "later.txt")
+        _git(tree.repo, "commit", "-m", "later")
+        _git(tree.repo, "checkout", "dev")
+        before = _git(tree.repo, "rev-parse", "HEAD").stdout.strip()
+
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            code = main(["land", RUN_ID, "--state", str(tree.state), "--repo", str(tree.repo)])
+        self.assertEqual(code, 1)
+        self.assertIn("branch tip differs from the reviewed commit", stderr.getvalue())
+        self.assertFalse((tree.repo / "extra.txt").exists())
+        self.assertFalse((tree.repo / "later.txt").exists())
+        self.assertEqual(_git(tree.repo, "rev-parse", "HEAD").stdout.strip(), before)
+        self.assertEqual(load_run(tree.state, RUN_ID)["land"]["status"], "refused")
+
+    def test_land_refuses_when_acceptance_did_not_record_a_commit(self) -> None:
+        tree = _Tree()
+        self.addCleanup(tree.close)
+        _on_dev(tree.repo)
+        _git(tree.repo, "checkout", "-b", "feature")
+        (tree.repo / "extra.txt").write_text("extra\n", encoding="utf-8")
+        _git(tree.repo, "add", "extra.txt")
+        _git(tree.repo, "commit", "-m", "feature")
+        _git(tree.repo, "checkout", "dev")
+        save_run(tree.state, _record(RUN_ID, status="completed", accepted=True))
+
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            code = main(["land", RUN_ID, "--state", str(tree.state), "--repo", str(tree.repo)])
+        self.assertEqual(code, 1)
+        self.assertIn("reviewed commit is missing", stderr.getvalue())
+        self.assertFalse((tree.repo / "extra.txt").exists())
+        self.assertEqual(load_run(tree.state, RUN_ID)["land"]["status"], "refused")
+
+    def test_land_refuses_master_and_main(self) -> None:
+        for name in ("master", "main"):
+            with self.subTest(name=name):
+                tree = _Tree()
+                self.addCleanup(tree.close)
+                if name == "main":
+                    _git(tree.repo, "checkout", "-b", "main")
+                _git(tree.repo, "checkout", "-b", "feature")
+                (tree.repo / "extra.txt").write_text("extra\n", encoding="utf-8")
+                _git(tree.repo, "add", "extra.txt")
+                _git(tree.repo, "commit", "-m", "feature")
+                sha = _git(tree.repo, "rev-parse", "HEAD").stdout.strip()
+                _git(tree.repo, "checkout", name)
+                before = _git(tree.repo, "rev-parse", "HEAD").stdout.strip()
+                _accept(tree.state, sha)
+
+                stderr = io.StringIO()
+                with redirect_stderr(stderr):
+                    code = main(["land", RUN_ID, "--state", str(tree.state), "--repo", str(tree.repo)])
+                self.assertEqual(code, 1)
+                self.assertIn(f"refusing to merge into {name}", stderr.getvalue())
+                self.assertFalse((tree.repo / "extra.txt").exists())
+                self.assertEqual(_git(tree.repo, "rev-parse", "HEAD").stdout.strip(), before)
+                self.assertEqual(load_run(tree.state, RUN_ID)["land"]["status"], "refused")
+
+    def test_land_refuses_a_dirty_tree(self) -> None:
+        tree = _Tree()
+        self.addCleanup(tree.close)
+        _on_dev(tree.repo)
+        _git(tree.repo, "checkout", "-b", "feature")
+        (tree.repo / "extra.txt").write_text("extra\n", encoding="utf-8")
+        _git(tree.repo, "add", "extra.txt")
+        _git(tree.repo, "commit", "-m", "feature")
+        sha = _git(tree.repo, "rev-parse", "HEAD").stdout.strip()
+        _git(tree.repo, "checkout", "dev")
         (tree.repo / "base.txt").write_text("dirty\n", encoding="utf-8")
         before = _git(tree.repo, "rev-parse", "HEAD").stdout.strip()
-        save_run(tree.state, _record(RUN_ID, status="completed", accepted=True))
+        _accept(tree.state, sha)
 
         stderr = io.StringIO()
         with redirect_stderr(stderr):
@@ -146,17 +234,71 @@ class LandCleanLogTests(unittest.TestCase):
         self.assertEqual((tree.repo / "base.txt").read_text(encoding="utf-8"), "dirty\n")
         self.assertEqual(load_run(tree.state, RUN_ID)["land"]["status"], "refused")
 
+    def test_land_refuses_to_overwrite_an_ignored_file(self) -> None:
+        tree = _Tree()
+        self.addCleanup(tree.close)
+        _on_dev(tree.repo)
+        (tree.repo / ".gitignore").write_text("secret.txt\n", encoding="utf-8")
+        _git(tree.repo, "add", ".gitignore")
+        _git(tree.repo, "commit", "-m", "ignore secret")
+        _git(tree.repo, "checkout", "-b", "feature")
+        (tree.repo / "secret.txt").write_text("from-branch\n", encoding="utf-8")
+        _git(tree.repo, "add", "-f", "secret.txt")
+        _git(tree.repo, "commit", "-m", "add secret")
+        sha = _git(tree.repo, "rev-parse", "HEAD").stdout.strip()
+        _git(tree.repo, "checkout", "dev")
+        (tree.repo / "secret.txt").write_text("local-secret\n", encoding="utf-8")
+        self.assertEqual(_git(tree.repo, "status", "--porcelain").stdout, "")
+        before = _git(tree.repo, "rev-parse", "HEAD").stdout.strip()
+        _accept(tree.state, sha)
+
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            code = main(["land", RUN_ID, "--state", str(tree.state), "--repo", str(tree.repo)])
+        self.assertEqual(code, 1)
+        self.assertIn("working tree is dirty", stderr.getvalue())
+        self.assertEqual((tree.repo / "secret.txt").read_text(encoding="utf-8"), "local-secret\n")
+        self.assertEqual(_git(tree.repo, "rev-parse", "HEAD").stdout.strip(), before)
+        self.assertFalse((tree.repo / ".git" / "MERGE_HEAD").exists())
+        self.assertEqual(load_run(tree.state, RUN_ID)["land"]["status"], "refused")
+
+    def test_an_unrelated_ignored_file_does_not_block_land(self) -> None:
+        tree = _Tree()
+        self.addCleanup(tree.close)
+        _on_dev(tree.repo)
+        (tree.repo / ".gitignore").write_text("other.txt\n", encoding="utf-8")
+        _git(tree.repo, "add", ".gitignore")
+        _git(tree.repo, "commit", "-m", "ignore other")
+        _git(tree.repo, "checkout", "-b", "feature")
+        (tree.repo / "extra.txt").write_text("extra\n", encoding="utf-8")
+        _git(tree.repo, "add", "extra.txt")
+        _git(tree.repo, "commit", "-m", "feature")
+        sha = _git(tree.repo, "rev-parse", "HEAD").stdout.strip()
+        _git(tree.repo, "checkout", "dev")
+        (tree.repo / "other.txt").write_text("keep\n", encoding="utf-8")
+        self.assertEqual(_git(tree.repo, "status", "--porcelain").stdout, "")
+        _accept(tree.state, sha)
+
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            code = main(["land", RUN_ID, "--state", str(tree.state), "--repo", str(tree.repo)])
+        self.assertEqual(code, 0, stdout.getvalue())
+        self.assertEqual((tree.repo / "extra.txt").read_text(encoding="utf-8"), "extra\n")
+        self.assertEqual((tree.repo / "other.txt").read_text(encoding="utf-8"), "keep\n")
+
     def test_land_refuses_a_conflict_and_aborts(self) -> None:
         tree = _Tree()
         self.addCleanup(tree.close)
+        _on_dev(tree.repo)
         _git(tree.repo, "checkout", "-b", "feature")
         (tree.repo / "base.txt").write_text("feature\n", encoding="utf-8")
         _git(tree.repo, "commit", "-am", "feature")
-        _git(tree.repo, "checkout", "master")
+        sha = _git(tree.repo, "rev-parse", "HEAD").stdout.strip()
+        _git(tree.repo, "checkout", "dev")
         (tree.repo / "base.txt").write_text("main\n", encoding="utf-8")
         _git(tree.repo, "commit", "-am", "main")
         before = _git(tree.repo, "rev-parse", "HEAD").stdout.strip()
-        save_run(tree.state, _record(RUN_ID, status="completed", accepted=True))
+        _accept(tree.state, sha)
 
         stderr = io.StringIO()
         with redirect_stderr(stderr):
@@ -269,6 +411,35 @@ class LandCleanLogTests(unittest.TestCase):
             self.assertIn("review.verdict", names)
             self.assertEqual(names[-1], "run.finished")
 
+    def test_acceptance_saves_the_reviewed_commit(self) -> None:
+        tree = _Tree()
+        self.addCleanup(tree.close)
+        _git(tree.repo, "checkout", "-b", "feature")
+        (tree.repo / "extra.txt").write_text("extra\n", encoding="utf-8")
+        _git(tree.repo, "add", "extra.txt")
+        _git(tree.repo, "commit", "-m", "feature")
+        sha = _git(tree.repo, "rev-parse", "HEAD").stdout.strip()
+        record = run_task(
+            "Say hello",
+            config=starter_config({"fixture", "fixture-b"}),
+            state_dir=tree.state,
+            run_branch="feature",
+            repo=tree.repo,
+        )
+        self.assertTrue(record["accepted"])
+        self.assertEqual(record["reviewed_commit"], sha)
+        self.assertEqual(load_run(tree.state, record["run_id"])["reviewed_commit"], sha)
+
+        missing = run_task(
+            "Say hello",
+            config=starter_config({"fixture", "fixture-b"}),
+            state_dir=tree.state,
+            run_branch="does-not-exist",
+            repo=tree.repo,
+        )
+        self.assertTrue(missing["accepted"])
+        self.assertNotIn("reviewed_commit", missing)
+
 
 class AdapterTests(unittest.TestCase):
     def test_launch_critical_names_are_implemented_or_deferred(self) -> None:
@@ -327,12 +498,25 @@ class AdapterTests(unittest.TestCase):
                 self.assertEqual(argv[0], cls.STATIC_ARGV[0])
 
             gemini = GeminiHeadlessProvider().argv(request)
-            self.assertEqual(
-                gemini[:6],
-                ("gemini", "-p", "Say hello", "--output-format", "stream-json", "--approval-mode"),
-            )
+            self.assertNotIn("Say hello", gemini)
+            self.assertEqual(gemini[gemini.index("-p") + 1], " ")
             self.assertIn("yolo", gemini)
             self.assertIn("--skip-trust", gemini)
+            captured: dict[str, object] = {}
+
+            def capture(argv, stdin_text, timeout, cwd):
+                del timeout, cwd
+                captured["argv"] = tuple(argv)
+                captured["stdin"] = stdin_text
+                return _completed(argv, 0, stdout="ok")
+
+            GeminiHeadlessProvider().execute(request, allow_live=True, runner=capture)
+            self.assertEqual(captured["stdin"], "Say hello")
+            self.assertNotIn("Say hello", captured["argv"])
+            long_request = ProviderRequest(task="y" * 7001, packet_id=RUN_ID, cwd=directory)
+            GeminiHeadlessProvider().execute(long_request, allow_live=True, runner=capture)
+            self.assertEqual(captured["stdin"], "y" * 7001)
+            self.assertNotIn("y" * 7001, captured["argv"])
             cursor = CursorHeadlessProvider().argv(request)
             self.assertEqual(cursor[0], "agent")
             self.assertIn("--force", cursor)
@@ -365,6 +549,74 @@ class AdapterTests(unittest.TestCase):
             self.assertNotIn("x" * 7001, argv)
             if sys.platform != "win32":
                 self.assertEqual(seen["mode"], 0o600)
+
+    def test_unknown_sign_in_is_reported_and_does_not_block_unprobed_adapters(self) -> None:
+        commands = {"gemini": "gemini", "cursor": "agent", "opencode": "opencode"}
+        for name, command in commands.items():
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as directory:
+                    bindir = Path(directory) / "bin"
+                    home = Path(directory) / "home"
+                    bindir.mkdir()
+                    home.mkdir()
+                    (bindir / command).write_text("", encoding="utf-8")
+
+                    def run(argv, timeout, command=command):
+                        del timeout
+                        if argv[1:] == ["--version"]:
+                            return _completed(argv, 0, stdout=f"{command} 1.0\n")
+                        raise AssertionError(argv)
+
+                    report = diagnose(
+                        starter_config({name}),
+                        environ={},
+                        platform="linux",
+                        home=home,
+                        path=str(bindir),
+                        run=run,
+                        git_run=lambda argv, timeout: _completed(argv, 0, stdout="git version 2.45.0\n"),
+                    )
+                    row = {item["name"]: item for item in report["providers"]}[name]
+                    self.assertEqual(row["signed_in"], "unknown")
+                    self.assertIsNone(row["auth_method"])
+                    self.assertEqual(row["warning"], "sign-in is unknown")
+                    self.assertTrue(row["installed"])
+                    self.assertTrue(row["usable"])
+                    self.assertTrue(report["ok"])
+
+        def refuse_probe(argv, timeout):
+            del timeout
+            raise AssertionError(argv)
+
+        missing = diagnose(
+            starter_config({"gemini"}),
+            environ={},
+            platform="linux",
+            home=Path("/tmp"),
+            path="",
+            run=refuse_probe,
+            git_run=lambda argv, timeout: _completed(argv, 0, stdout="git version 2.45.0\n"),
+        )
+        gemini = {item["name"]: item for item in missing["providers"]}["gemini"]
+        self.assertEqual(gemini["signed_in"], "unknown")
+        self.assertFalse(gemini["installed"])
+        self.assertFalse(gemini["usable"])
+        self.assertEqual(gemini["warning"], "sign-in is unknown")
+
+        shipped = diagnose(
+            load_config(),
+            environ={},
+            platform="linux",
+            home=Path("/tmp"),
+            path="",
+            run=refuse_probe,
+            git_run=lambda argv, timeout: _completed(argv, 0, stdout="git version 2.45.0\n"),
+        )
+        rows = {item["name"]: item for item in shipped["providers"]}
+        for name in ("gemini", "cursor", "opencode"):
+            self.assertEqual(rows[name]["signed_in"], "skipped")
+            self.assertFalse(rows[name]["usable"])
+            self.assertNotIn("warning", rows[name])
 
 
 if __name__ == "__main__":

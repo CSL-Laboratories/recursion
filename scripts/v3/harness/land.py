@@ -1,13 +1,19 @@
-"""Merge an accepted run branch. A dirty tree or a conflict is refused."""
+"""Merge the commit saved when a run was accepted. A dirty tree or a conflict is refused."""
 
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
+from typing import NoReturn
 
 from scripts.v3.harness.errors import HarnessError
 from scripts.v3.harness.state import load_run, save_run
+
+
+_PROTECTED = {"master", "main"}
+_SHA = re.compile(r"^[0-9a-f]{40}$")
 
 
 class _Conflict(Exception):
@@ -16,10 +22,13 @@ class _Conflict(Exception):
 
 
 def land_run(state_dir, run_id: str, *, repo: Path, into: str | None = None) -> dict:
-    """Merge the accepted run branch into ``into`` or the current branch.
+    """Merge the reviewed commit into ``into`` or the current branch.
 
-    The merge is ``--no-ff``. A dirty worktree is refused before git writes.
-    A conflict aborts the merge and leaves the tree as it was.
+    The merge is ``--no-ff`` of the SHA saved at acceptance, and only when
+    that SHA is still the branch tip. A dirty worktree is refused before git
+    writes, including an ignored file the merge would overwrite. A conflict
+    aborts the merge and leaves the tree as it was. ``master`` and ``main``
+    are refused.
     """
 
     root = Path(repo)
@@ -27,13 +36,19 @@ def land_run(state_dir, run_id: str, *, repo: Path, into: str | None = None) -> 
     if record.get("accepted") is not True or record.get("status") != "completed":
         raise HarnessError("run is not accepted")
     branch = _run_branch(root, record, run_id)
-    if _dirty(root):
-        _remember(state_dir, run_id, branch=branch, commit=None, status="refused", error="working tree is dirty")
-        raise HarnessError("working tree is dirty")
+    reviewed = _reviewed_commit(record)
+    if reviewed is None:
+        _refuse(state_dir, run_id, branch, "reviewed commit is missing")
+    if _commit(root, f"refs/heads/{branch}") != reviewed:
+        _refuse(state_dir, run_id, branch, "branch tip differs from the reviewed commit")
     target = _target(root, into)
+    if target in _PROTECTED:
+        _refuse(state_dir, run_id, target, f"refusing to merge into {target}")
+    if _dirty(root, reviewed):
+        _refuse(state_dir, run_id, branch, "working tree is dirty")
     message = f"recursion: land {run_id}"
     try:
-        commit = _merge(root, target, branch, message)
+        commit = _merge(root, target, reviewed, message)
     except _Conflict as exc:
         _remember(
             state_dir,
@@ -104,14 +119,26 @@ def _check_name(repo: Path, name: str, *, must_exist: bool = False) -> str:
     return name
 
 
-def _merge(repo: Path, target: str, run_branch: str, message: str) -> str:
+def _refuse(state_dir, run_id: str, branch: str, error: str) -> NoReturn:
+    _remember(state_dir, run_id, branch=branch, commit=None, status="refused", error=error)
+    raise HarnessError(error)
+
+
+def _reviewed_commit(record: dict) -> str | None:
+    saved = record.get("reviewed_commit")
+    if isinstance(saved, str) and _SHA.fullmatch(saved):
+        return saved
+    return None
+
+
+def _merge(repo: Path, target: str, commit: str, message: str) -> str:
     if _current_branch(repo) != target:
         raise HarnessError("pass a checkout of the target branch; this slice does not switch branches")
     env = os.environ.copy()
     for key in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"):
         env.pop(key, None)
     before = _run(repo, "rev-parse", "HEAD").stdout.strip()
-    completed = _run(repo, *_author_config(repo), "merge", "--no-ff", "-m", message, run_branch, env=env)
+    completed = _run(repo, *_author_config(repo), "merge", "--no-ff", "-m", message, commit, env=env)
     if completed.returncode != 0:
         listed = _run(repo, "diff", "--name-only", "--diff-filter=U")
         paths = [line for line in listed.stdout.splitlines() if line.strip()][:20]
@@ -143,11 +170,48 @@ def _setting(repo: Path, key: str) -> str:
     return completed.stdout.strip()
 
 
-def _dirty(repo: Path) -> bool:
+def _dirty(repo: Path, commit: str) -> bool:
     completed = _run(repo, "status", "--porcelain")
     if completed.returncode != 0:
         raise HarnessError("git status failed")
-    return bool(completed.stdout.strip())
+    if completed.stdout.strip():
+        return True
+    return bool(_ignored_overwrites(repo, commit))
+
+
+def _ignored_overwrites(repo: Path, commit: str) -> list[str]:
+    """Ignored worktree paths whose contents the merge of ``commit`` would replace."""
+
+    merged = _run(repo, "merge-tree", "--write-tree", "HEAD", commit)
+    if merged.returncode not in (0, 1):
+        raise HarnessError("git merge-tree failed")
+    lines = [line.strip() for line in merged.stdout.splitlines() if line.strip()]
+    if not lines or _SHA.fullmatch(lines[0]) is None:
+        raise HarnessError("git merge-tree failed")
+    diff = _run(repo, "diff", "--name-only", "-z", "HEAD", lines[0])
+    if diff.returncode != 0:
+        raise HarnessError("git diff failed")
+    hits = []
+    for path in diff.stdout.split("\0"):
+        if not path or path.endswith("/"):
+            continue
+        local = repo / path
+        if not local.exists() and not local.is_symlink():
+            continue
+        check = _run(repo, "check-ignore", "--quiet", "--", path)
+        if check.returncode == 0:
+            hits.append(path)
+    return hits
+
+
+def _commit(repo: Path, rev: str) -> str | None:
+    completed = _run(repo, "rev-parse", "--verify", "--end-of-options", rev)
+    if completed.returncode != 0:
+        return None
+    sha = completed.stdout.strip()
+    if _SHA.fullmatch(sha) is None:
+        return None
+    return sha
 
 
 def _current_branch(repo: Path) -> str | None:
@@ -176,4 +240,4 @@ def _run(cwd: Path, *args: str, env: dict[str, str] | None = None) -> subprocess
     }
     if env is not None:
         kwargs["env"] = env
-    return subprocess.run(["git", "-c", "core.longpaths=true", *args], **kwargs)
+    return subprocess.run(["git", "--no-pager", "-c", "core.longpaths=true", *args], **kwargs)

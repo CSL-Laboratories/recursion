@@ -17,12 +17,14 @@ Gemini, Cursor, or OpenCode.
 
 ## Commands
 
-`land <run-id>` merges an accepted run branch into the checked-out branch
-with `--no-ff`. The branch is `run_branch` on the run record, or
-`recursion/run/<run-id>` when that field is absent. A run that is not
-accepted is refused. A dirty worktree is refused before git writes. A
-conflict aborts the merge and leaves the tree clean. This slice does not
-switch branches and does not create a worktree.
+`land <run-id>` merges the commit saved at acceptance into the checked-out
+branch with `--no-ff`. It merges that SHA, and it refuses when the branch
+tip is different. `master` and `main` are refused. The branch is
+`run_branch` on the run record, or `recursion/run/<run-id>` when that field
+is absent. A run that is not accepted is refused. A dirty worktree is
+refused before git writes, including an ignored file the merge would
+overwrite. A conflict aborts the merge and leaves the tree clean. This slice
+does not switch branches and does not create a worktree.
 
 `clean` deletes a finished run's record, log, and private workspace folder.
 Finished statuses are `completed`, `unreviewed`, `review-rejected`,
@@ -34,8 +36,13 @@ lists the others under `refused`.
 with `[redacted]` when the event is written and again when it is printed.
 Ordinary words stay.
 
-`run --branch NAME` stores the branch `land` will merge after the run is
-accepted. It does not create the branch.
+`run --branch NAME` stores the branch and, when the run is accepted and that
+branch already exists in the working repo, the commit SHA `land` will merge.
+It does not create the branch.
+
+Doctor reports `unknown` for Gemini, Cursor, and OpenCode sign-in. That
+value stays `unknown`. It does not by itself mark an installed adapter
+unusable.
 
 ## Launch-critical adapters
 
@@ -66,9 +73,11 @@ as the custom-host surface.
 
 Cursor's documented command is `agent`. `agent acp` is a separate server and
 is not this adapter. Gemini has no working-directory flag in this command, so
-the process cwd is the run's private folder. OpenCode's `-p` is a password
-flag and is not used. A long OpenCode prompt is a private file passed with
-`--file` and removed when the process returns.
+the process cwd is the run's private folder. The Gemini task is stdin.
+`-p` is a single space so the flag has a value, and the task text is not a
+command-line argument. OpenCode's `-p` is a password flag and is not used. A
+long OpenCode prompt is a private file passed with `--file` and removed when
+the process returns.
 
 Shipped config still enables only `fixture` and `fixture-b`.
 

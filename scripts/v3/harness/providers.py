@@ -256,11 +256,11 @@ _OPENCODE_LONG_PROMPT = "Carry out the task in the attached file."
 class GeminiHeadlessProvider(HeadlessCLI):
     """Gemini CLI headless mode.
 
-    ``-p`` is the prompt. ``--output-format stream-json`` writes JSON events.
+    The task is stdin, never an argv element. ``-p`` is a single space so the
+    flag still has a value. ``--output-format stream-json`` writes JSON events.
     ``--approval-mode yolo`` approves tool calls and ``--skip-trust`` accepts
-    the workspace. A prompt that does not fit in argv is stdin, and ``-p`` is
-    a single space so the flag still has a value. The process cwd is the
-    working folder. The process starts only when ``allow_live`` is set.
+    the workspace. The process cwd is the working folder. The process starts
+    only when ``allow_live`` is set.
     """
 
     name = "gemini"
@@ -276,12 +276,11 @@ class GeminiHeadlessProvider(HeadlessCLI):
     CAPABILITIES = ("execute", "stream-json", "subscription")
 
     def argv(self, request: ProviderRequest) -> tuple[str, ...]:
-        prompt = request.task if _prompt_fits(request.task) else _GEMINI_LONG_PROMPT
-        return _insert_after(self.STATIC_ARGV, "-p", prompt)
+        del request
+        return _insert_after(self.STATIC_ARGV, "-p", _GEMINI_LONG_PROMPT)
 
     def prepare(self, request: ProviderRequest) -> _Prepared:
-        stdin = None if _prompt_fits(request.task) else request.task
-        return _Prepared(self.argv(request), stdin, _noop)
+        return _Prepared(self.argv(request), request.task, _noop)
 
 
 class CursorHeadlessProvider(HeadlessCLI):

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import re
+import subprocess
 from pathlib import Path
 
 from scripts.v3.harness.doctor import _scrub, _secret_values
@@ -17,6 +19,7 @@ from scripts.v3.harness.usage import add_usage, empty_usage, exceeded, parse_usa
 
 
 RECORD_LIMIT = 8000
+_SHA = re.compile(r"^[0-9a-f]{40}$")
 
 
 def run_task(
@@ -29,6 +32,7 @@ def run_task(
     open_adapter=None,
     run_id: str | None = None,
     run_branch: str | None = None,
+    repo: Path | None = None,
 ) -> dict:
     """Route one task, review it when a second provider is enabled, and save the run."""
 
@@ -60,6 +64,7 @@ def run_task(
             error=str(exc),
             workspace=workspace,
             run_branch=run_branch,
+            repo=repo,
         )
 
     def call(name: str, request: ProviderRequest):
@@ -96,6 +101,7 @@ def run_task(
             status="budget-exceeded",
             workspace=workspace,
             run_branch=run_branch,
+            repo=repo,
         )
 
     max_rounds = config["review"]["max_rounds"]
@@ -123,6 +129,7 @@ def run_task(
             status=status,
             workspace=workspace,
             run_branch=run_branch,
+            repo=repo,
         )
 
     status = "review-rejected"
@@ -181,6 +188,7 @@ def run_task(
         status=status,
         workspace=workspace,
         run_branch=run_branch,
+        repo=repo,
     )
 
 
@@ -213,6 +221,7 @@ def _timeout(config: dict, name: str) -> int:
 
 def _finish(config, state_dir, **fields) -> dict:
     del config
+    repo = fields.pop("repo", None)
     secrets = _secret_values(os.environ)
     text = _scrub(fields["text"], secrets)
     if len(text) > RECORD_LIMIT:
@@ -237,6 +246,10 @@ def _finish(config, state_dir, **fields) -> dict:
     branch = fields.get("run_branch")
     if branch:
         record["run_branch"] = branch
+        if record["accepted"]:
+            reviewed = _branch_tip(repo, branch)
+            if reviewed:
+                record["reviewed_commit"] = reviewed
     save_run(state_dir, record)
     append_event(
         state_dir,
@@ -246,6 +259,37 @@ def _finish(config, state_dir, **fields) -> dict:
         status=record["status"],
     )
     return record
+
+
+def _branch_tip(repo: Path | None, branch: str) -> str | None:
+    """Return the current SHA of ``branch`` when ``repo`` has that ref."""
+
+    if repo is None:
+        return None
+    completed = subprocess.run(
+        [
+            "git",
+            "--no-pager",
+            "-c",
+            "core.longpaths=true",
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            f"refs/heads/{branch}",
+        ],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if completed.returncode != 0:
+        return None
+    sha = completed.stdout.strip()
+    if _SHA.fullmatch(sha) is None:
+        return None
+    return sha
 
 
 def _branch_name(name: str | None) -> str | None:

@@ -14,5 +14,5 @@ Fixes CSL-___
 - [ ] Perf impact noted (or N/A)
 - [ ] Devin review completed on the current head commit
 - [ ] All review threads resolved (or answered with rationale)
-- [ ] Linear checked for an open `Stuck PR threads: recursion#<PR>` roll-up on this PR
+- [ ] Linear checked for an open `Stuck PR threads: recursion#<PR>` roll-up on this PR (if you file the fallback, first description line is `<!-- stuck-pr-threads:recursion#<PR> -->`)
 - [ ] Tests run locally and/or green in CI (name the commands)

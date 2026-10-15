@@ -45,9 +45,12 @@ ways, stop and record a blocker in `state/INBOX.md` — do not pick one.
 ## Hard rules
 
 1. **Never `git push --force`.** Under any circumstance, in any script, for any reason.
-2. **Never commit to or merge into `master`.** Commit to `loop/work/<task-id>` and open a
-   review branch; Lucas reviews and merges. Put the Linear key (`CSL-N`) in the task id
-   (for example `loop/work/CSL-26`) and in the PR title so Linear still links.
+2. **Never commit to or merge into `master`.** Commit on a review branch and open a
+   PR; Lucas reviews and merges. Name the branch `csl-<N>-<slug>` (for example
+   `csl-26-short-slug`), optionally prefixed with a GitHub username (for example
+   `chaandansaini101/csl-26-short-slug`). Put `CSL-N` in the PR title so Linear links
+   the issue. pr-lint matches `CSL-[0-9]+` case-sensitively, so a lowercase branch
+   name alone does not pass. The `CSL-N` key in the PR title satisfies the check.
 3. **Never modify a protected path** — `CONTROL_PLANE.md`, `ANCHOR.md`, `state/DECISIONS.md`,
    `.env`, or auth/credential configuration. Propose changes in `state/PROPOSALS.md`.
 4. **No secrets in tracked files, logs or notifications.**
@@ -209,7 +212,8 @@ label, not by editing config.
 Devin reviews only and never fixes, so a thread is never handed back to Devin. Claude
 leaves the thread open, replies explaining why it couldn't fix it, and @mentions the PR
 author. If no `Stuck PR threads: recursion#<PR>` issue appears within one watcher
-cycle, the PR author files it.
+cycle, the PR author files it titled `Stuck PR threads: recursion#<PR>` with
+`<!-- stuck-pr-threads:recursion#<PR> -->` as the first line of the description.
 
 ## Review loop
 
@@ -229,7 +233,9 @@ resolves threads, pushes, or merges.
 
 Before merging any PR, check Linear for an open `Stuck PR threads: recursion#<PR>`
 issue tied to it, and resolve the checklist or record the decision first. If no
-such issue appears within one watcher cycle, the PR author files it.
+such issue appears within one watcher cycle, the PR author files it titled
+`Stuck PR threads: recursion#<PR>` with `<!-- stuck-pr-threads:recursion#<PR> -->`
+as the first line of the description.
 
 ## Automations
 

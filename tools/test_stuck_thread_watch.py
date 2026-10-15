@@ -360,20 +360,30 @@ class FakeLinear:
         self.existing_states: dict[str, str] = {}
         self.existing_descriptions: dict[str, str] = {}
         self.marker_matches: dict[str, list[mod.LinearIssue]] = {}
+        self.title_matches: dict[str, list[mod.LinearIssue]] = {}
         self.created: list[tuple[str, str]] = []
         self.updated: list[tuple[str, str]] = []
         self.canceled: list[str] = []
         self.rollups: list[mod.LinearIssue] = []
 
-    def find_by_marker(self, marker: str) -> mod.LinearIssue | None:
+    def find_by_marker(self, marker: str, *, title: str = "") -> mod.LinearIssue | None:
         matches = list(self.marker_matches.get(marker) or [])
+        if title:
+            matches.extend(self.title_matches.get(title) or [])
         if matches:
+            seen: set[str] = set()
+            unique: list[mod.LinearIssue] = []
+            for issue in matches:
+                if issue.id in seen:
+                    continue
+                seen.add(issue.id)
+                unique.append(issue)
             active = [
                 issue
-                for issue in matches
+                for issue in unique
                 if (issue.state_type or "").lower() not in {"canceled", "completed"}
             ]
-            return active[0] if active else matches[0]
+            return active[0] if active else unique[0]
         url = self.existing.get(marker, "")
         if not url:
             return None
@@ -473,7 +483,7 @@ class ScanTests(unittest.TestCase):
 
     def test_linear_error_still_posts_github_comment(self) -> None:
         class BoomLinear(FakeLinear):
-            def find_by_marker(self, marker: str) -> mod.LinearIssue | None:
+            def find_by_marker(self, marker: str, *, title: str = "") -> mod.LinearIssue | None:
                 raise RuntimeError("linear down")
 
         t = thread(tid="PRRT_err", comments=stuck_pair())
@@ -727,7 +737,7 @@ class ScanTests(unittest.TestCase):
 
     def test_linear_error_on_closed_pr_does_not_abort_scan(self) -> None:
         class BoomLinear(FakeLinear):
-            def find_by_marker(self, marker: str) -> mod.LinearIssue | None:
+            def find_by_marker(self, marker: str, *, title: str = "") -> mod.LinearIssue | None:
                 raise RuntimeError("linear down")
 
         class ListClosedThenOpen(FakeGitHub):
@@ -794,6 +804,49 @@ class ScanTests(unittest.TestCase):
         found = client.search_rollups()
         self.assertEqual([issue.id for issue in found], ["iss_old", "iss_new"])
         self.assertEqual(calls, [None, "c2"])
+
+    def test_canceled_rollup_does_not_carry_checks_or_decision(self) -> None:
+        t = thread(tid="PRRT_a", path="AGENTS.md", line=10, comments=stuck_pair())
+        p = pull(threads=[t])
+        stale = mod.linear_description(p, [(t, "stuck-human")], cfg())
+        stale = stale.replace("- [ ] [`AGENTS.md:10`]", "- [x] [`AGENTS.md:10`]")
+        stale = stale.replace(mod.DEFAULT_HUMAN_DECISION, "Merge as-is.")
+        marker = mod.rollup_marker(p)
+        lin = FakeLinear({marker: "https://linear.app/canceled"})
+        lin.existing_states[marker] = "canceled"
+        lin.existing_descriptions[marker] = stale
+        gh = FakeGitHub([p])
+        counters = mod.scan(cfg(), gh, lin)  # type: ignore[arg-type]
+        self.assertEqual(len(lin.created), 1)
+        self.assertEqual(lin.updated, [])
+        created = lin.created[0][1]
+        self.assertIn("- [ ] [`AGENTS.md:10`]", created)
+        self.assertNotIn("- [x] [`AGENTS.md:10`]", created)
+        self.assertIn(mod.DEFAULT_HUMAN_DECISION, created)
+        self.assertNotIn("Merge as-is.", created)
+        self.assertEqual(counters.linear, 1)
+
+    def test_adopts_author_filed_title_without_marker(self) -> None:
+        t = thread(tid="PRRT_hand", comments=stuck_pair())
+        p = pull(threads=[t])
+        title = mod.linear_title(p)
+        author = mod.LinearIssue(
+            id="iss_author",
+            url="https://linear.app/author",
+            identifier="CSL-HAND",
+            title=title,
+            state_type="triage",
+            description="Filed by the PR author after a missed watcher cycle.",
+        )
+        lin = FakeLinear()
+        lin.title_matches[title] = [author]
+        gh = FakeGitHub([p])
+        counters = mod.scan(cfg(), gh, lin)  # type: ignore[arg-type]
+        self.assertEqual(lin.created, [])
+        self.assertEqual(len(lin.updated), 1)
+        self.assertEqual(lin.updated[0][0], "iss_author")
+        self.assertIn(mod.rollup_marker(p), lin.updated[0][1])
+        self.assertEqual(counters.linear, 0)
 
 
     def test_collect_connection_nodes_keeps_later_claude_reply(self) -> None:
@@ -919,8 +972,11 @@ class WorkflowAndDocsTests(unittest.TestCase):
             self.assertRegex(text, r"do not\s+file one issue per thread")
             self.assertIn("one watcher cycle", text)
             self.assertIn("the PR author files it", text)
+            self.assertIn("<!-- stuck-pr-threads:recursion#<PR> -->", text)
             self.assertIn("Branch naming is deferred to", text)
             self.assertIn("pull/189", text)
+            self.assertIn("csl-<N>-<slug>", text)
+            self.assertNotIn("Commit to `loop/work/<task-id>`", text)
         self.assertIn(".github/workflows/stuck-thread-watch.yml", self.agents)
         self.assertIn(
             "AGENTS.md#when-claude-cant-fix-a-review-thread", self.contributing

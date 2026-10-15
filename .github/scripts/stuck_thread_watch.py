@@ -425,6 +425,13 @@ HUMAN_DECISION_RE = re.compile(
 DEFAULT_HUMAN_DECISION = (
     "_(Record the merge decision here. The watcher preserves this section.)_"
 )
+TERMINAL_STATES = frozenset({"canceled", "completed"})
+
+
+def is_active_issue(issue: LinearIssue | None) -> bool:
+    if issue is None or not issue.id:
+        return False
+    return (issue.state_type or "").lower() not in TERMINAL_STATES
 
 
 def parse_rollup_title(title: str) -> tuple[str, int] | None:
@@ -964,19 +971,31 @@ class LinearClient:
             seen += 1
         return found
 
-    def find_by_marker(self, marker: str) -> LinearIssue | None:
-        matches = [
-            issue
-            for issue in self._search_issues(marker)
-            if marker in (issue.description or "") or marker in (issue.title or "")
-        ]
+    def _matches_rollup(self, issue: LinearIssue, marker: str, title: str) -> bool:
+        desc = issue.description or ""
+        issue_title = (issue.title or "").strip()
+        if marker and (marker in desc or marker in issue_title):
+            return True
+        if title and issue_title == title.strip():
+            parsed = parse_rollup_title(issue_title)
+            return bool(parsed) and parsed[0].casefold() == self.cfg.name.casefold()
+        return False
+
+    def find_by_marker(self, marker: str, *, title: str = "") -> LinearIssue | None:
+        matches: list[LinearIssue] = []
+        seen: set[str] = set()
+        terms = [part for part in (marker, title) if part]
+        for term in terms:
+            for issue in self._search_issues(term):
+                if issue.id in seen:
+                    continue
+                if not self._matches_rollup(issue, marker, title):
+                    continue
+                seen.add(issue.id)
+                matches.append(issue)
         if not matches:
             return None
-        active = [
-            issue
-            for issue in matches
-            if (issue.state_type or "").lower() not in {"canceled", "completed"}
-        ]
+        active = [issue for issue in matches if is_active_issue(issue)]
         return active[0] if active else matches[0]
 
     def search_rollups(self) -> list[LinearIssue]:
@@ -1085,12 +1104,12 @@ def upsert_linear_rollup(
     counters: Counters,
 ) -> str:
     marker = rollup_marker(pull)
-    existing = linear.find_by_marker(marker)
-    previous = existing.description if existing else ""
-    description = linear_description(pull, stuck, cfg, previous=previous)
     title = linear_title(pull)
+    existing = linear.find_by_marker(marker, title=title)
+    previous = existing.description if is_active_issue(existing) else ""
+    description = linear_description(pull, stuck, cfg, previous=previous)
     if existing and existing.id:
-        if (existing.state_type or "").lower() in {"canceled", "completed"}:
+        if not is_active_issue(existing):
             created = linear.create_triage_issue(title=title, description=description)
             if created:
                 counters.linear += 1
@@ -1109,9 +1128,7 @@ def upsert_linear_rollup(
 
 
 def cancel_linear_rollup(issue: LinearIssue, linear: LinearClient, counters: Counters) -> None:
-    if not issue.id:
-        return
-    if (issue.state_type or "").lower() in {"canceled", "completed"}:
+    if not is_active_issue(issue):
         return
     linear.cancel_issue(issue.id)
     counters.linear += 1
@@ -1188,7 +1205,9 @@ def scan(
         if skip in {"draft", "closed", "not-open"}:
             if skip == "closed" and linear is not None:
                 try:
-                    existing = linear.find_by_marker(rollup_marker(pull))
+                    existing = linear.find_by_marker(
+                        rollup_marker(pull), title=linear_title(pull)
+                    )
                     if existing:
                         cancel_linear_rollup(existing, linear, counters)
                 except Exception as extra_exc:  # noqa: BLE001
@@ -1198,7 +1217,9 @@ def scan(
             log(f"skip (approved on head with green checks): PR #{pull.number}")
             if linear is not None and not rollup:
                 try:
-                    existing = linear.find_by_marker(rollup_marker(pull))
+                    existing = linear.find_by_marker(
+                        rollup_marker(pull), title=linear_title(pull)
+                    )
                     if existing:
                         cancel_linear_rollup(existing, linear, counters)
                 except Exception as extra_exc:  # noqa: BLE001
@@ -1215,7 +1236,9 @@ def scan(
                             pull, rollup, cfg, linear, counters
                         )
                 else:
-                    existing = linear.find_by_marker(rollup_marker(pull))
+                    existing = linear.find_by_marker(
+                        rollup_marker(pull), title=linear_title(pull)
+                    )
                     if existing:
                         cancel_linear_rollup(existing, linear, counters)
             except Exception as exc:  # noqa: BLE001 — mediation still proceeds

@@ -7,6 +7,7 @@ is set. The harness does not read or store credentials.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -295,6 +296,10 @@ def _noop() -> None:
 
 
 def _default_runner(argv: list[str], stdin_text: str | None, timeout: int, cwd: str | None):
+    # CreateProcess only appends .exe, so resolve npm .cmd shims first.
+    resolved = shutil.which(argv[0])
+    if resolved is not None:
+        argv = [resolved, *argv[1:]]
     return subprocess.run(
         argv,
         input=stdin_text,

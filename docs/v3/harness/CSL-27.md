@@ -119,7 +119,12 @@ includes the code they sit in, and the tests are stubs.
 5. A provider error or timeout is saved before the exception is re-raised.
    `status` shows `failed` or `timed-out`, the error text, and any usage or
    assistant text already collected.
-6. `tools/ci_gate.py` collects `scripts/tests/v3/harness/harness.test.py`
+6. A revise round sends the previous answer with the review notes. The last
+   `VERDICT` line in the assistant text wins. `max_rounds` of 0 stays
+   unreviewed unless `accept_unreviewed` is set. Codex `item.completed`
+   agent messages are read as assistant text. The default process runner
+   resolves the executable, including a Windows `.cmd` shim.
+7. `tools/ci_gate.py` collects `scripts/tests/v3/harness/harness.test.py`
    through `scripts/tests/**/*.test.py` and runs it by path. The linux job
    on the first slice logged `RUN unittest` for that file (16 tests). The
    path is now in `REQUIRED_SUITE_TESTS`, so dropping it fails the gate.

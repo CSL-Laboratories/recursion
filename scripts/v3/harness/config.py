@@ -136,9 +136,12 @@ def write_starter(path: Path, enabled: set[str], *, force: bool = False) -> dict
         raise HarnessError(f"refusing to overwrite {target}; pass --force")
     payload = starter_config(enabled)
     validate_config(payload)
-    target.parent.mkdir(parents=True, exist_ok=True)
     text = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
-    target.write_text(text, encoding="utf-8", newline="\n")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8", newline="\n")
+    except OSError as exc:
+        raise HarnessError(f"cannot write {target}: {exc.strerror or 'filesystem error'}") from exc
     return payload
 
 

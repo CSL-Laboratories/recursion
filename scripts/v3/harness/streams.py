@@ -29,6 +29,16 @@ def assistant_text(raw: str) -> str:
     if grok:
         return grok
     for event in reversed(events):
+        item = event.get("item")
+        if (
+            event.get("type") == "item.completed"
+            and isinstance(item, dict)
+            and item.get("type") == "agent_message"
+            and isinstance(item.get("text"), str)
+            and item["text"].strip()
+        ):
+            return item["text"]
+    for event in reversed(events):
         for key in ("text", "result"):
             value = event.get(key)
             if isinstance(value, str) and value.strip():

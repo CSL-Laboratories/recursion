@@ -19,8 +19,10 @@ on:
 concurrency:
   # Isolate review handling from the 20-minute wait. A verdictless Codex
   # review must not cancel fallback. New pushes still cancel the prior wait.
-  group: codex-gate-${{ github.event.pull_request.number }}-${{ github.event_name == 'pull_request_review' && 'verdict' || 'request' }}
-  cancel-in-progress: true
+  # Each review.id gets its own group so Devin/human reviews cannot cancel a
+  # running Codex verdict. Review runs never cancel-in-progress.
+  group: codex-gate-${{ github.event.pull_request.number }}-${{ github.event_name == 'pull_request_review' && format('verdict-{0}', github.event.review.id) || 'request' }}
+  cancel-in-progress: ${{ github.event_name != 'pull_request_review' }}
 
 permissions:
   contents: read

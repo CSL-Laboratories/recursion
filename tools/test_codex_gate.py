@@ -305,6 +305,30 @@ class ListingParseTests(unittest.TestCase):
         with self.assertRaises(gate.ListingError):
             gate._parse_json_list("not-json")
 
+    def test_retry_listing_retries_transport_then_succeeds(self) -> None:
+        n = {"c": 0}
+
+        def fn():
+            n["c"] += 1
+            if n["c"] < 3:
+                raise subprocess.CalledProcessError(1, ["gh"])
+            return ["ok"]
+
+        got = gate._retry_listing(fn, sleep=lambda _s: None)
+        self.assertEqual(got, ["ok"])
+        self.assertEqual(n["c"], 3)
+
+    def test_retry_listing_does_not_retry_malformed(self) -> None:
+        n = {"c": 0}
+
+        def fn():
+            n["c"] += 1
+            raise gate.ListingError("malformed JSON listing")
+
+        with self.assertRaises(gate.ListingError):
+            gate._retry_listing(fn, sleep=lambda _s: None)
+        self.assertEqual(n["c"], 1)
+
 
 class NoticeAndIoTests(unittest.TestCase):
     def test_run_request_missing_pat_emits_notice_and_does_not_post(self) -> None:
@@ -540,7 +564,11 @@ class WorkflowStructureTests(unittest.TestCase):
 
     def test_concurrency_isolates_verdict_from_request_wait(self) -> None:
         self.assertIn(
-            "codex-gate-${{ github.event.pull_request.number }}-${{ github.event_name == 'pull_request_review' && 'verdict' || 'request' }}",
+            "codex-gate-${{ github.event.pull_request.number }}-${{ github.event_name == 'pull_request_review' && format('verdict-{0}', github.event.review.id) || 'request' }}",
+            self.text,
+        )
+        self.assertIn(
+            "cancel-in-progress: ${{ github.event_name != 'pull_request_review' }}",
             self.text,
         )
 

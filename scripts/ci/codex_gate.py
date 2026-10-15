@@ -13,10 +13,13 @@ import os
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from typing import Any, Callable
 
 MAX_FIXER_RUNS_PER_PR_PER_DAY = 3
+LISTING_ATTEMPTS = 3
+LISTING_RETRY_SECONDS = 1.0
 CI_FULL_LABEL = "ci:full"
 FIXER_WORKFLOW = "claude.yml"
 MEDIATE_WORKFLOW = "stuck-thread-watch.yml"
@@ -272,6 +275,25 @@ class ListingError(ValueError):
     """gh --paginate produced a listing we cannot parse. Fail closed."""
 
 
+def _retry_listing(
+    fn: Callable[[], Any],
+    *,
+    attempts: int = LISTING_ATTEMPTS,
+    sleep: Callable[[float], None] = time.sleep,
+) -> Any:
+    """Retry transient gh failures. Do not retry ListingError (malformed history)."""
+    last: BaseException | None = None
+    for index in range(attempts):
+        try:
+            return fn()
+        except (OSError, subprocess.CalledProcessError) as exc:
+            last = exc
+            if index == attempts - 1:
+                raise
+            sleep(LISTING_RETRY_SECONDS)
+    raise last  # pragma: no cover
+
+
 def _parse_json_list(raw: str) -> list[Any]:
     """Parse one JSON array or gh --paginate's concatenated/newline-separated pages.
 
@@ -387,8 +409,10 @@ def run_request(
     reviews: list[dict[str, Any]] = []
     if number and read_token:
         try:
-            comments = list_comment_bodies(repo, number, read_token, gh=gh)
-            reviews = list_reviews(repo, number, read_token, gh=gh)
+            comments = _retry_listing(
+                lambda: list_comment_bodies(repo, number, read_token, gh=gh)
+            )
+            reviews = _retry_listing(lambda: list_reviews(repo, number, read_token, gh=gh))
         except (OSError, subprocess.CalledProcessError, json.JSONDecodeError, ListingError, ValueError):
             notice("failed to list PR comments/reviews; skipping (no failure)")
             out = {"proceed": "false", "pr_number": number, "head_sha": sha, "action": "skip-listing"}
@@ -478,7 +502,9 @@ def run_verdict(
     comments: list[str] = []
     if number and read_token:
         try:
-            comments = list_comment_bodies(repo, number, read_token, gh=gh)
+            comments = _retry_listing(
+                lambda: list_comment_bodies(repo, number, read_token, gh=gh)
+            )
         except (OSError, subprocess.CalledProcessError, json.JSONDecodeError, ListingError, ValueError):
             notice("failed to list PR comments; skipping verdict (no failure)")
             emit({"action": "skip-listing", "pr_number": number, "head_sha": sha})
@@ -554,8 +580,10 @@ def run_fallback(
     reviews: list[dict[str, Any]] = []
     if number and read_token:
         try:
-            comments = list_comment_bodies(repo, number, read_token, gh=gh)
-            reviews = list_reviews(repo, number, read_token, gh=gh)
+            comments = _retry_listing(
+                lambda: list_comment_bodies(repo, number, read_token, gh=gh)
+            )
+            reviews = _retry_listing(lambda: list_reviews(repo, number, read_token, gh=gh))
         except (OSError, subprocess.CalledProcessError, json.JSONDecodeError, ListingError, ValueError):
             notice("failed to list PR comments/reviews; skipping timeout fallback (no failure)")
             emit({"action": "skip-listing", "pr_number": number, "head_sha": sha})

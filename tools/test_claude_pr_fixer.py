@@ -537,6 +537,21 @@ class FixerGateAndPromptTests(unittest.TestCase):
             self.assertIn("prompt: |", body, job)
             self.assertIn("commit SHA", body, job)
             self.assertIn("do NOT resolve the thread", body, job)
+            self.assertIn("gh api repos/REPO/pulls/PR/comments/ID/replies", body, job)
+            self.assertIn(
+                "Bash(gh api repos/*/pulls/*/comments/*/replies:*)",
+                body,
+                job,
+            )
+            self.assertIn(
+                "Bash(gh api --method POST repos/*/pulls/*/comments/*/replies:*)",
+                body,
+                job,
+            )
+            self.assertIn("Bash(gh api graphql:*resolveReviewThread*)", body, job)
+            self.assertIn("resolveReviewThread call only", body, job)
+            self.assertIn("Do not resolve a thread you have not answered", body, job)
+            self.assertIn("Do not use graphql for any other mutation", body, job)
             self.assertIn("do NOT push", body, job)
             self.assertIn("Never exit without either pushing or posting that failure reply", body, job)
             self.assertIn("UNTRUSTED DATA", body, job)

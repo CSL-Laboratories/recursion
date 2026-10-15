@@ -12,6 +12,11 @@
 # - delegated-q check.py --mode execute — Owner-gated scientific admission;
 #   needs secrets, a trusted controller, and live resource observations
 # - tools/check_next_phase.py — needs Java/TLA+, not the current product suite
+#
+# PRs also run tools/perf_ci.py inside the linux job. It times the provider-free
+# planning kernel against the PR base and warns above a 10% slowdown. That
+# warning does not fail the required linux check, and it does not start a
+# second runner.
 name: CI
 
 on:
@@ -70,6 +75,13 @@ jobs:
         env:
           CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: python -X utf8 -B tools/ci_gate.py --force
+
+      # Same job and runner as the gate. Exit 0 on a slowdown; annotations warn.
+      - name: Performance regression check
+        if: github.event_name == 'pull_request' && steps.paths.outputs.run_full == 'true'
+        env:
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python -X utf8 -B tools/perf_ci.py
 
       # Public-scope (and whitespace) must still run when the suite is skipped.
       - name: Docs-only lightweight checks

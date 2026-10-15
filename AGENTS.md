@@ -167,10 +167,10 @@ label, not by editing config.
 ## When Claude can't fix a review thread
 
 Devin reviews only and never fixes, so a thread is never handed back to Devin. Claude
-leaves the thread open, replies with why, and @mentions the PR author. A watcher then
-files a Linear issue titled `Stuck PR thread: repo#PR – topic`, labeled `needs-decision`,
-and linked to the PR's `CSL-N` issue. Developers resolve it from Linear like any other
-issue.
+leaves the thread open, replies with why, and @mentions the PR author. No automation
+files the follow-up yet, so the PR author files a Linear issue titled
+`Stuck PR thread: repo#PR – topic`, labeled `needs-decision`, linked to the PR's `CSL-N`
+issue and assigned to that issue's owner. It is resolved from Linear like any other issue.
 
 Before merging any PR, check Linear for open `Stuck PR thread` issues tied to it, and
 resolve them or record the decision first.

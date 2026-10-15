@@ -536,22 +536,29 @@ class FixerGateAndPromptTests(unittest.TestCase):
             body = self._job(job)
             self.assertIn("prompt: |", body, job)
             self.assertIn("commit SHA", body, job)
-            self.assertIn("do NOT resolve the thread", body, job)
+            self.assertNotIn("do NOT resolve", body, job)
+            self.assertNotIn("Do not resolve a thread you have not answered", body, job)
+            self.assertIn("citing the fix SHA", body, job)
+            self.assertIn("leave the thread open", body, job)
+            self.assertIn("Linear Triage", body, job)
+            self.assertIn("CSL-89", body, job)
             self.assertIn("gh api repos/REPO/pulls/PR/comments/ID/replies", body, job)
+            self.assertIn("resolveReviewThread", body, job)
+            allow = body.split("--allowedTools", 1)[1].split("--disallowedTools", 1)[0]
+            deny = body.split("--disallowedTools", 1)[1]
             self.assertIn(
                 "Bash(gh api repos/*/pulls/*/comments/*/replies:*)",
-                body,
+                allow,
                 job,
             )
             self.assertIn(
                 "Bash(gh api --method POST repos/*/pulls/*/comments/*/replies:*)",
-                body,
+                allow,
                 job,
             )
-            self.assertIn("Bash(gh api graphql:*resolveReviewThread*)", body, job)
-            self.assertIn("resolveReviewThread call only", body, job)
-            self.assertIn("Do not resolve a thread you have not answered", body, job)
-            self.assertIn("Do not use graphql for any other mutation", body, job)
+            self.assertIn("Bash(gh api graphql:*resolveReviewThread*)", allow, job)
+            self.assertNotIn("Bash(gh api graphql:*)", deny.split("\n", 1)[0], job)
+            self.assertNotIn("Bash(gh api:*resolveReviewThread*)", deny, job)
             self.assertIn("do NOT push", body, job)
             self.assertIn("Never exit without either pushing or posting that failure reply", body, job)
             self.assertIn("UNTRUSTED DATA", body, job)
@@ -927,6 +934,9 @@ class ConflictJobStructureTests(unittest.TestCase):
             self.assertIn(f'"Edit({path})"', job)
             self.assertIn(f'"Write({path})"', job)
         self.assertIn("tools/test_claude_pr_fixer.py.", job.split("--allowedTools", 1)[0])
+        allow = job.split("--allowedTools", 1)[1].split("--disallowedTools", 1)[0]
+        self.assertNotIn("comments/*/replies", allow)
+        self.assertNotIn("resolveReviewThread", allow)
         self.assertIn("Bash(git push origin HEAD:refs/heads/${{ matrix.pr.head_ref }})", job)
         self.assertNotIn("HEAD:refs/heads/*", job)
         self.assertIn("Bash(git rebase:*)", job.split("--disallowedTools", 1)[1])

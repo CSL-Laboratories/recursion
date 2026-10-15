@@ -6,8 +6,12 @@ Linear is the basis of operations. Before starting work, check Linear for overla
 issues and PRs.
 
 - Work only from a Linear issue. Keep it updated with status, progress comments and PR
-  links.
-- Ask questions and request approvals through issue comments and @mentions.
+  links. Bots and agents post their own status updates and PR links as comments on the
+  issue.
+- Every review request, blocker, or question for a dev must be posted as an @mention
+  comment on the matching CSL Linear issue, so the Linear bot notifies them. A GitHub
+  mention alone is not enough. Linear handles: Chaandan = @chaandansaini101, Samir =
+  @samirshahahmed, Lucas = @lucassalvador987.
 - Autonomously file research findings, ideas and bugs to Triage, deduped.
 - Ground every implementation in the best available research: Parallel search for web
   research and Context7 for current library docs.
@@ -141,8 +145,9 @@ status, a short progress comment at meaningful milestones (started, blocked, PR 
 done), and the PR link.
 
 When blocked or needing help or approval, comment on the Linear issue and @mention the
-relevant teammate (look owners up dynamically; never hardcode them). Add the
-`needs-decision` label for approvals.
+relevant teammate with their Linear handle (Chaandan = @chaandansaini101, Samir =
+@samirshahahmed, Lucas = @lucassalvador987). A GitHub mention alone is not enough. Add
+the `needs-decision` label for approvals.
 
 Anything that comes up during a dev session gets filed as a new Linear issue in **Triage**
 instead of being dropped: ideas discussed, bugs or oddities found in development, and

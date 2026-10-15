@@ -96,7 +96,7 @@ def diagnose(
     invoke = _default_run if run is None else run
     git_invoke = _default_run if git_run is None else git_run
     rows = [
-        _provider_row(item, platform=system, home=root, path=search, run=invoke)
+        _provider_row(item, platform=system, home=root, path=search, run=invoke, environ=env)
         for item in config["providers"]
     ]
     report = {
@@ -107,7 +107,7 @@ def diagnose(
     return _scrub(report, _secret_values(env))
 
 
-def _provider_row(item: dict, *, platform: str, home: Path, path: str, run) -> dict:
+def _provider_row(item: dict, *, platform: str, home: Path, path: str, run, environ) -> dict:
     name = item["name"]
     command = item["argv"][0]
     enabled = bool(item["enabled"])
@@ -139,7 +139,7 @@ def _provider_row(item: dict, *, platform: str, home: Path, path: str, run) -> d
             usable=False,
         )
     version = _version(run, resolved) if resolved is not None else None
-    signed_in, auth_method = _signed_in(name, resolved, home=home, run=run)
+    signed_in, auth_method = _signed_in(name, resolved, home=home, run=run, environ=environ)
     return _row(
         name=name,
         command=command,
@@ -157,9 +157,14 @@ def _row(**fields) -> dict:
     return fields
 
 
-def _signed_in(name: str, resolved: Path | None, *, home: Path, run) -> tuple[str, str | None]:
+def _signed_in(
+    name: str, resolved: Path | None, *, home: Path, run, environ: Mapping[str, str]
+) -> tuple[str, str | None]:
     if name == "grok":
-        return _file_auth(home / ".grok" / "auth.json")
+        state, method = _file_auth(home / ".grok" / "auth.json")
+        if state == "signed-out" and str(environ.get("XAI_API_KEY", "")).strip():
+            return "signed-in", "env"
+        return state, method
     if resolved is None:
         return "unknown", None
     if name == "claude":

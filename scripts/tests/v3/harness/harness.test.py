@@ -93,6 +93,41 @@ class HarnessTests(unittest.TestCase):
         )
         self.assertEqual(assistant_text(stream), "Done")
 
+    def test_later_codex_verdict_wins(self) -> None:
+        stream = "\n".join(
+            [
+                json.dumps({"type": "turn.started"}),
+                json.dumps(
+                    {"type": "item.completed", "item": {"type": "agent_message", "text": "VERDICT approve"}}
+                ),
+                json.dumps(
+                    {"type": "item.completed", "item": {"type": "agent_message", "text": "VERDICT revise"}}
+                ),
+                json.dumps({"type": "turn.completed", "usage": {"input_tokens": 3, "output_tokens": 1}}),
+            ]
+        )
+        self.assertEqual(parse_verdict(stream)[0], "revise")
+        self.assertEqual(parse_verdict("VERDICT approve\nVERDICT revise")[0], "revise")
+
+        config = starter_config({"fixture", "codex"})
+        codex = _Stub("codex", stream)
+
+        def open_adapter(name: str):
+            if name == "codex":
+                return codex
+            return _Stub(name, "hello")
+
+        with tempfile.TemporaryDirectory() as directory:
+            finished = run_task(
+                "Say hello",
+                config=config,
+                state_dir=Path(directory),
+                open_adapter=open_adapter,
+            )
+        self.assertEqual([item["verdict"] for item in finished["reviews"]], ["revise", "revise"])
+        self.assertEqual(finished["status"], "review-rejected")
+        self.assertFalse(finished["accepted"])
+
     def test_shipped_config_enables_fixtures_and_raises_the_codex_ceiling(self) -> None:
         config = load_config()
         enabled = {item["name"] for item in config["providers"] if item["enabled"]}
@@ -769,3 +804,38 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(row["signed_in"], "signed-in")
             self.assertEqual(row["auth_method"], "env")
             self.assertTrue(row["usable"])
+
+    def test_grok_env_key_counts_when_the_auth_file_is_unreadable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bindir = Path(directory) / "bin"
+            home = Path(directory) / "home"
+            bindir.mkdir()
+            home.mkdir()
+            (bindir / "grok").write_text("", encoding="utf-8")
+            auth = home / ".grok" / "auth.json"
+            auth.parent.mkdir()
+            auth.write_text("cached", encoding="utf-8")
+            real_stat = Path.stat
+
+            def stat(self, *args, **kwargs):
+                if self.name == "auth.json":
+                    raise OSError("unreadable")
+                return real_stat(self, *args, **kwargs)
+
+            with patch.object(Path, "stat", stat):
+                report = diagnose(
+                    starter_config({"grok"}),
+                    environ={"XAI_API_KEY": SECRET},
+                    platform="linux",
+                    home=home,
+                    path=str(bindir),
+                    run=lambda argv, timeout: _completed(argv, 0, stdout="grok 1.0\n"),
+                    git_run=lambda argv, timeout: _completed(argv, 0, stdout="git version 2.45.0\n"),
+                )
+            rendered = json.dumps(report)
+            self.assertNotIn(SECRET, rendered)
+            row = {item["name"]: item for item in report["providers"]}["grok"]
+            self.assertEqual(row["signed_in"], "signed-in")
+            self.assertEqual(row["auth_method"], "env")
+            self.assertTrue(row["usable"])
+            self.assertTrue(report["ok"])

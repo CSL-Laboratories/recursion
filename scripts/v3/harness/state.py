@@ -40,6 +40,8 @@ def _refuse_linked_record(path: Path) -> None:
         info = path.lstat()
     except FileNotFoundError:
         return
+    except OSError as exc:
+        raise HarnessError(f"cannot inspect run record {path.name}") from exc
     if stat.S_ISLNK(info.st_mode) or info.st_nlink > 1:
         raise HarnessError(f"refusing to write linked run record {path.name}")
 

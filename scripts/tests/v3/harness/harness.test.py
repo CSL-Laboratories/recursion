@@ -188,7 +188,7 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(codex_session_meter("no usage here"), empty_unknown())
         self.assertFalse(exceeded(usage, load_config()["budgets"]))
 
-    def test_codex_meter_drops_a_stale_total_when_the_last_turn_omits_usage(self) -> None:
+    def test_codex_meter_keeps_the_earlier_total_when_the_last_turn_omits_usage(self) -> None:
         stale = "\n".join(
             (
                 json.dumps(
@@ -197,7 +197,7 @@ class HarnessTests(unittest.TestCase):
                 json.dumps({"type": "turn.completed"}),
             )
         )
-        self.assertEqual(codex_session_meter(stale), empty_unknown())
+        self.assertEqual(codex_session_meter(stale)["input_tokens"], 900)
         failed = stale.splitlines()[0] + "\n" + json.dumps({"type": "turn.failed"})
         self.assertEqual(codex_session_meter(failed)["input_tokens"], 900)
         recovered = stale + "\n" + json.dumps(

@@ -51,8 +51,8 @@ def codex_session_meter(text: str) -> dict:
 
     The reading is a cumulative session total (``CODEX_SESSION_METER``).
     Events in this stream are not summed. A stream with no such usage stays
-    unknown. A later ``turn.completed`` that omits usage clears an earlier
-    total. Callers may add totals from separate exec processes that do not
+    unknown. A later ``turn.completed`` that omits usage keeps the earlier
+    total as a lower bound on spend. Callers may add totals from separate exec processes that do not
     resume or fork the same session.
     """
 
@@ -61,9 +61,10 @@ def codex_session_meter(text: str) -> dict:
         if payload.get("type") != "turn.completed":
             continue
         parsed = _from_event(payload)
-        # A completed turn with no usage is the final reading. Keeping an
-        # earlier total would report a stale session snapshot as known spend.
-        found = parsed if parsed is not None else empty_usage()
+        # The total is cumulative, so an earlier reading is a lower bound on
+        # spend. A later turn without usage must not erase it from the budget.
+        if parsed is not None:
+            found = parsed
     return found
 
 

@@ -103,8 +103,8 @@ Evidence class: **source-documented**, not a measurement from this repo.
 The meter does not use per-turn `last` usage. That field is not in the JSONL.
 It does not sum `turn.completed` events inside one stream: they are snapshots
 of one session. A missing usage stays unknown, including a `turn.failed`
-with no usage object. A later `turn.completed` that omits usage replaces an
-earlier total with unknown. `turn.failed` does not clear a completed total. `cached_input_tokens` and `reasoning_output_tokens` are
+with no usage object. A later `turn.completed` that omits usage keeps the
+earlier total as a lower bound on spend, so the budget check still sees it. `turn.failed` does not clear a completed total. `cached_input_tokens` and `reasoning_output_tokens` are
 not added into `input_tokens` or `output_tokens`. Whether `input_tokens`
 already includes the cached count is **unmeasured**.
 

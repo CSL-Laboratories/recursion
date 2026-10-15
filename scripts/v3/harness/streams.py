@@ -66,13 +66,15 @@ def _nested_text(events: list[dict]) -> str:
             if isinstance(content, str):
                 parts.append(content)
             elif isinstance(content, list):
-                for block in content:
-                    if (
-                        isinstance(block, dict)
-                        and block.get("type") == "text"
-                        and isinstance(block.get("text"), str)
-                    ):
-                        parts.append(block["text"])
+                blocks = [
+                    block["text"]
+                    for block in content
+                    if isinstance(block, dict)
+                    and block.get("type") == "text"
+                    and isinstance(block.get("text"), str)
+                ]
+                if blocks:
+                    parts.append("\n".join(blocks))
         elif kind == "text" and isinstance(event.get("part"), dict):
             value = event["part"].get("text")
             if isinstance(value, str):

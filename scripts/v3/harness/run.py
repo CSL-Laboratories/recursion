@@ -11,6 +11,9 @@ from scripts.v3.harness.streams import assistant_text
 from scripts.v3.harness.usage import add_usage, empty_usage, exceeded, parse_usage
 
 
+RECORD_LIMIT = 8000
+
+
 def run_task(
     task: str,
     *,
@@ -57,7 +60,7 @@ def run_task(
 
     max_rounds = config["review"]["max_rounds"]
     if max_rounds <= 0 or not reviewers:
-        status = "completed" if config["review"]["accept_unreviewed"] or max_rounds <= 0 else "unreviewed"
+        status = "completed" if config["review"]["accept_unreviewed"] else "unreviewed"
         if status == "unreviewed":
             reviews.append(
                 {
@@ -113,7 +116,9 @@ def run_task(
         if round_index == max_rounds:
             status = "review-rejected"
             break
-        current_task = task + "\n\nReview notes:\n" + notes
+        current_task = (
+            task + "\n\nPrevious answer:\n" + shown[:RECORD_LIMIT] + "\n\nReview notes:\n" + notes
+        )
         result = _execute(
             opener,
             worker,
@@ -156,8 +161,8 @@ def _timeout(config: dict, name: str) -> int:
 def _finish(config, state_dir, **fields) -> dict:
     del config
     text = fields["text"]
-    if len(text) > 8000:
-        text = text[:8000] + "\n[truncated]"
+    if len(text) > RECORD_LIMIT:
+        text = text[:RECORD_LIMIT] + "\n[truncated]"
     record = {
         "accepted": fields["status"] == "completed",
         "provider": fields["provider"],

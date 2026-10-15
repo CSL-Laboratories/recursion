@@ -28,7 +28,8 @@ def parse_verdict(text: str) -> tuple[str, str]:
     lines = [line for line in lines if line]
     if not lines:
         return "revise", "reviewer returned no verdict"
-    for index, line in enumerate(lines):
+    for index in range(len(lines) - 1, -1, -1):
+        line = lines[index]
         match = _VERDICT.fullmatch(line)
         if match is None:
             continue
@@ -59,7 +60,7 @@ def _clean_line(line: str) -> str:
     return text
 
 
-def _clip(text: str, limit: int = 2000) -> str:
+def _clip(text: str, limit: int = 8000) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + "\n[truncated]"

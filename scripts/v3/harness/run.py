@@ -51,11 +51,9 @@ def run_task(
         raise HarnessError("task must not be empty")
     worker, reviewers = select_route(config, provider)
     candidates = [worker, *reviewers]
-    # A pinned worker stays pinned. An unpinned worker only falls back inside
-    # its own class, so --allow-live cannot turn an offline failure into a
-    # paid CLI call.
-    worker_pool = _same_class(candidates, worker)
-    worker_candidates = [worker] if provider is not None else worker_pool
+    # A requested worker goes first. Fallback only stays inside its own class,
+    # so --allow-live cannot turn an offline failure into a paid CLI call.
+    worker_candidates = _same_class(candidates, worker)
     opener = open_provider if open_adapter is None else open_adapter
     run_id = new_run_id() if run_id is None else run_id
     budgets = config["budgets"]

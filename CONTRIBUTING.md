@@ -16,7 +16,7 @@ issues and PRs.
   Claude Code Action fixer has no Linear tooling; it replies on the PR threads, and the
   PR author relays anything it cannot fix to the Linear issue.
 - **Wait for jobs before human sign-off.** Order: Devin Review runs first, then the
-  Claude fixer jobs (`devin-review-fix`, `resolve-pr`) act on its findings, then required
+  Claude fixer job (`devin-review-fix`) acts on its findings, then required
   CI reruns on the fixer's push. No human approves or requests changes on a PR until all
   of these have finished on the current head commit. A review on a stale head does not
   count. After new pushes, the reviewer reviews again. Review requests and their status

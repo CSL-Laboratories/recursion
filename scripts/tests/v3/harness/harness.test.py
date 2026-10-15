@@ -35,8 +35,10 @@ from scripts.v3.harness.routing import capable_providers, select_route  # noqa: 
 from scripts.v3.harness.run import run_task  # noqa: E402
 from scripts.v3.harness.state import list_runs, load_run  # noqa: E402
 from scripts.v3.harness.usage import (  # noqa: E402
+    CODEX_SESSION_METER,
     DEFAULT_MAX_INPUT_TOKENS,
     DEFAULT_MAX_OUTPUT_TOKENS,
+    codex_session_meter,
     exceeded,
     parse_usage,
 )
@@ -55,6 +57,10 @@ GROK_APPROVE = "\n".join(
         json.dumps({"type": "usage", "usage": {"input_tokens": 12, "output_tokens": 4}}),
     )
 )
+
+
+def empty_unknown() -> dict:
+    return {"cost": None, "input_tokens": None, "output_tokens": None}
 
 
 def _completed(argv, code: int, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess[str]:
@@ -115,6 +121,24 @@ class HarnessTests(unittest.TestCase):
                 {"max_cost": None, "max_input_tokens": 1_000_000, "max_output_tokens": 1_000_000},
             )
         )
+
+    def test_codex_session_meter_keeps_the_last_turn_completed_total(self) -> None:
+        self.assertEqual(CODEX_SESSION_METER, "cumulative-session-total")
+        self.assertEqual(DEFAULT_MAX_INPUT_TOKENS, 50_000_000)
+        self.assertEqual(DEFAULT_MAX_OUTPUT_TOKENS, 8_000_000)
+        trailing = (
+            '{"type":"turn.completed","usage":{"input_tokens":24763,'
+            '"cached_input_tokens":24448,"output_tokens":122,"reasoning_output_tokens":0}}\n'
+            + CODEX_SESSION
+            + '{"type":"item.completed","usage":{"input_tokens":1,"output_tokens":1}}\n'
+        )
+        usage = codex_session_meter(trailing)
+        self.assertEqual(usage["input_tokens"], 6_900_000)
+        self.assertEqual(usage["output_tokens"], 4000)
+        self.assertIsNone(usage["cost"])
+        self.assertEqual(parse_usage(trailing)["input_tokens"], 1)
+        self.assertEqual(codex_session_meter("no usage here"), empty_unknown())
+        self.assertFalse(exceeded(usage, load_config()["budgets"]))
 
     def test_grok_stream_verdict_is_approve_when_the_first_line_is_json(self) -> None:
         self.assertTrue(GROK_APPROVE.splitlines()[0].startswith("{"))
@@ -217,6 +241,20 @@ class HarnessTests(unittest.TestCase):
             )
             self.assertEqual(stopped["status"], "budget-exceeded")
             self.assertFalse(stopped["accepted"])
+
+            trailing = (
+                CODEX_SESSION
+                + '{"type":"item.completed","usage":{"input_tokens":1,"output_tokens":1}}\n'
+            )
+            metered = run_task(
+                "Say hello",
+                config=low,
+                state_dir=Path(directory),
+                provider="codex",
+                open_adapter=lambda name: _Stub("codex", trailing),
+            )
+            self.assertEqual(metered["usage"]["input_tokens"], 6_900_000)
+            self.assertEqual(metered["status"], "budget-exceeded")
 
     def test_grok_adapter_writes_the_prompt_and_returns_stdout(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

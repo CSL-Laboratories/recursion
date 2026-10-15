@@ -12,7 +12,7 @@ from scripts.v3.harness.review import parse_verdict, review_prompt
 from scripts.v3.harness.routing import select_route
 from scripts.v3.harness.state import new_run_id, save_run
 from scripts.v3.harness.streams import assistant_text
-from scripts.v3.harness.usage import add_usage, empty_usage, exceeded, parse_usage
+from scripts.v3.harness.usage import add_usage, codex_session_meter, empty_usage, exceeded, parse_usage
 
 
 RECORD_LIMIT = 8000
@@ -75,7 +75,7 @@ def run_task(
             raise
 
     result = call(worker, _request(current_task, run_id, "execute", workspace))
-    add_usage(usage, parse_usage(result.text))
+    add_usage(usage, _usage_for(worker, result.text))
     shown = assistant_text(result.text)
     if exceeded(usage, budgets):
         return _finish(
@@ -125,7 +125,7 @@ def run_task(
             reviewer,
             _request(review_prompt(current_task, shown), run_id, "review", workspace),
         )
-        add_usage(usage, parse_usage(review_result.text))
+        add_usage(usage, _usage_for(reviewer, review_result.text))
         verdict, notes = parse_verdict(review_result.text)
         reviews.append(
             {
@@ -148,7 +148,7 @@ def run_task(
             task + "\n\nPrevious answer:\n" + shown[:RECORD_LIMIT] + "\n\nReview notes:\n" + notes
         )
         result = call(worker, _request(current_task, run_id, "execute", workspace))
-        add_usage(usage, parse_usage(result.text))
+        add_usage(usage, _usage_for(worker, result.text))
         shown = assistant_text(result.text)
         if exceeded(usage, budgets):
             status = "budget-exceeded"
@@ -167,6 +167,14 @@ def run_task(
         status=status,
         workspace=workspace,
     )
+
+
+def _usage_for(name: str, text: str) -> dict:
+    """Codex streams use the session-total meter. Other providers use the last usage object."""
+
+    if name == "codex":
+        return codex_session_meter(text)
+    return parse_usage(text)
 
 
 def _request(task: str, run_id: str, kind: str, workspace: str | None) -> ProviderRequest:

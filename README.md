@@ -40,7 +40,9 @@ CSL-27 adds a minimal upstream CLI harness. It routes one task through an
 adapter and can review it with a second adapter. The shipped config enables
 only the offline `fixture` and `fixture-b` providers. `claude`, `codex`, and
 `grok` start only with `--allow-live`. The architecture note is
-[docs/v3/harness/CSL-27.md](docs/v3/harness/CSL-27.md).
+[docs/v3/harness/CSL-27.md](docs/v3/harness/CSL-27.md). CSL-81 pins the
+upstream CLI contracts and the Codex session meter in
+[docs/v3/harness/CSL-81.md](docs/v3/harness/CSL-81.md).
 
 From the repository root:
 

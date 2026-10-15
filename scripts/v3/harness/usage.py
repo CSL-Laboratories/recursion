@@ -1,8 +1,9 @@
 """Token and cost figures from provider streams.
 
 Missing figures stay unknown. They are not stored as zero. Codex
-``turn.completed`` usage is a cumulative session total, so the last event
-wins and events are not summed.
+``turn.completed`` usage is a cumulative session total. ``codex_session_meter``
+keeps the last such event and does not sum the stream. The product ceilings
+below are unchanged by that meter.
 """
 
 from __future__ import annotations
@@ -16,6 +17,10 @@ import json
 # those runs. These defaults are session ceilings, not window sizes.
 DEFAULT_MAX_INPUT_TOKENS = 50_000_000
 DEFAULT_MAX_OUTPUT_TOKENS = 8_000_000
+
+# Last ``turn.completed`` usage in one ``codex exec`` stream. That object is
+# the session total, not one API call. See docs/v3/harness/CSL-81.md.
+CODEX_SESSION_METER = "cumulative-session-total"
 
 
 def empty_usage() -> dict:
@@ -34,6 +39,33 @@ def parse_usage(text: str) -> dict:
     """Return the last usage object a stream actually reported."""
 
     found = empty_usage()
+    for payload in _objects(text):
+        parsed = _from_event(payload)
+        if parsed is not None:
+            found = parsed
+    return found
+
+
+def codex_session_meter(text: str) -> dict:
+    """Return the last ``turn.completed`` usage in one Codex exec stream.
+
+    The reading is a cumulative session total (``CODEX_SESSION_METER``).
+    Events in this stream are not summed. A stream with no such usage stays
+    unknown. Callers may add totals from separate exec processes that do not
+    resume or fork the same session.
+    """
+
+    found = empty_usage()
+    for payload in _objects(text):
+        if payload.get("type") != "turn.completed":
+            continue
+        parsed = _from_event(payload)
+        if parsed is not None:
+            found = parsed
+    return found
+
+
+def _objects(text: str):
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped.startswith("{"):
@@ -42,10 +74,8 @@ def parse_usage(text: str) -> dict:
             payload = json.loads(stripped)
         except json.JSONDecodeError:
             continue
-        parsed = _from_event(payload)
-        if parsed is not None:
-            found = parsed
-    return found
+        if isinstance(payload, dict):
+            yield payload
 
 
 def add_usage(total: dict, extra: dict) -> dict:

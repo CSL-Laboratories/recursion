@@ -149,7 +149,8 @@ includes the code they sit in, and the tests are stubs.
 
 - No live Claude, Codex, or Grok process was started here.
 - The 6.9M Codex figure is a public report, not a measurement from this repo.
-- A raised ceiling is not a qualified subscription meter.
+- A raised ceiling is not a qualified subscription meter. The contract
+  check and the Codex meter choice are in [CSL-81](CSL-81.md).
 - Passing the gate is not v3 release acceptance.
 - The private working folder does not stop a permissive CLI from writing
   outside that folder.

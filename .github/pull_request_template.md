@@ -1,4 +1,4 @@
-Linear: CSL-___
+Fixes CSL-___
 Touches other repos? (link the cross-repo Linear issue)
 
 ## Summary

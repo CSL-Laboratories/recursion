@@ -29,6 +29,8 @@ URL in the ADR.
 
 ## Index
 
+Add a row here in the same PR as the new ADR.
+
 | ADR | Title | Linear | Status |
 | --- | --- | --- | --- |
 | [0000](0000-template.md) | Template | — | template |

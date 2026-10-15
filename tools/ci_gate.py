@@ -20,14 +20,11 @@ check_public_scope. --force always runs the suite.
 from __future__ import annotations
 
 import argparse
+import ast
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
-
-# A real entry point: an unindented `if __name__ == "__main__":` line, not a comment.
-MAIN_GUARD_RE = re.compile(r"^if\s+__name__\s*==\s*[\"']__main__[\"']\s*:", re.MULTILINE)
 
 ROOT = Path(__file__).resolve().parents[1]
 ZERO_SHA = "0" * 40
@@ -215,13 +212,40 @@ def is_test_filename(name: str) -> bool:
     return name.endswith((".test.py", "_test.py", "_tests.py"))
 
 
-def has_script_entry(path: Path) -> bool:
-    """True when the file has an unindented ``if __name__ == "__main__":`` guard."""
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+def _is_main_guard(node: ast.stmt) -> bool:
+    if not isinstance(node, ast.If):
         return False
-    return MAIN_GUARD_RE.search(text) is not None
+    test = node.test
+    if not (isinstance(test, ast.Compare) and len(test.ops) == 1 and isinstance(test.ops[0], ast.Eq)):
+        return False
+    operands = [test.left, *test.comparators]
+    names = [o for o in operands if isinstance(o, ast.Name) and o.id == "__name__"]
+    consts = [o for o in operands if isinstance(o, ast.Constant) and o.value == "__main__"]
+    return len(names) == 1 and len(consts) == 1
+
+
+def has_script_entry(path: Path) -> bool:
+    """True when the file has a top-level ``if __name__ == "__main__":`` guard."""
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, SyntaxError, ValueError):
+        return False
+    return any(_is_main_guard(node) for node in tree.body)
+
+
+# Loads by path (dotted names like ``x.test.py`` are not importable) and fails when no
+# unittest tests are collected, so free-standing ``test_*`` functions cannot pass silently.
+UNITTEST_FILE_RUNNER = (
+    "import importlib.util, sys, unittest\n"
+    "spec = importlib.util.spec_from_file_location('gate_test_module', sys.argv[1])\n"
+    "mod = importlib.util.module_from_spec(spec)\n"
+    "spec.loader.exec_module(mod)\n"
+    "suite = unittest.defaultTestLoader.loadTestsFromModule(mod)\n"
+    "if suite.countTestCases() == 0:\n"
+    "    raise SystemExit('no unittest tests collected')\n"
+    "result = unittest.TextTestRunner(verbosity=2).run(suite)\n"
+    "raise SystemExit(0 if result.wasSuccessful() else 1)\n"
+)
 
 
 def run_test_file(rel: str, *, root: Path | None = None, timeout: int = RUN_TIMEOUT) -> None:
@@ -232,8 +256,8 @@ def run_test_file(rel: str, *, root: Path | None = None, timeout: int = RUN_TIME
         cmd = [rel]
         display = rel
     else:
-        cmd = ["-m", "unittest", rel]
-        display = " ".join(cmd)
+        cmd = ["-c", UNITTEST_FILE_RUNNER, rel]
+        display = f"unittest {rel}"
     print(f"RUN {display}", flush=True)
     result = subprocess.run(
         [sys.executable, "-X", "utf8", "-B", *cmd],

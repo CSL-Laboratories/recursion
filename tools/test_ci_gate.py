@@ -311,6 +311,27 @@ class TestInventoryTests(unittest.TestCase):
             self.assertFalse(ci_gate.has_script_entry(script))
             write(script, 'if __name__ == "__main__":\n    raise SystemExit(0)\n')
             self.assertTrue(ci_gate.has_script_entry(script))
+            write(script, 'if (__name__ == "__main__"):\n    pass\n')
+            self.assertTrue(ci_gate.has_script_entry(script))
+            write(script, 'if "__main__" == __name__:\n    pass\n')
+            self.assertTrue(ci_gate.has_script_entry(script))
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
+
+    def test_dotted_and_function_only_tests(self) -> None:
+        repo = Path(tempfile.mkdtemp(prefix="ci-gate-disc-"))
+        try:
+            case = (
+                "import unittest\n"
+                "class A(unittest.TestCase):\n"
+                "    def test_ok(self):\n"
+                "        pass\n"
+            )
+            write(repo / "scripts" / "tests" / "new.test.py", case)
+            ci_gate.run_test_file("scripts/tests/new.test.py", root=repo)
+            write(repo / "tools" / "test_funcs.py", "def test_failure():\n    assert False\n")
+            with self.assertRaises(SystemExit):
+                ci_gate.run_test_file("tools/test_funcs.py", root=repo)
         finally:
             shutil.rmtree(repo, ignore_errors=True)
 

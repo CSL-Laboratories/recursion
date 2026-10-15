@@ -141,6 +141,8 @@ includes the code they sit in, and the tests are stubs.
 - Budgets are applied after a call returns, so one live call can pass a
   ceiling. A pre-check is [CSL-83](https://linear.app/csl-laboratories/issue/CSL-83),
   not this slice.
+- Checked-in stream fixtures, and the doctor PATH shim on the existing
+  `ci:full` Windows job, are [CSL-84](CSL-84.md).
 
 ## What this does not prove
 

@@ -1,0 +1,13 @@
+# provider: claude
+# evidence: source-documented
+# cli-version: Claude Code 2.x
+# exit-code: 0
+# source: https://github.com/rchern/pi-claude-cli/pull/26
+# retrieved: 2026-10-15
+# note: The stdout object below is the repro paste in that PR. The PR names Claude Code 2.x and shows exit 0 for this paste. Not observed on a machine in this repository. The official CLI reference (https://code.claude.com/docs/en/cli-reference, retrieved the same day) documents auth status JSON, authMethod values, and exit 1 when not logged in. It does not paste this object.
+
+{
+  "loggedIn": true,
+  "authMethod": "claude.ai",
+  "subscriptionType": "max"
+}

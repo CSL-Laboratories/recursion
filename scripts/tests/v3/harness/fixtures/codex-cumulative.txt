@@ -1,0 +1,9 @@
+# provider: codex
+# evidence: synthetic
+# cli-version: unpinned
+# source: https://github.com/openai/codex/issues/17539
+# retrieved: 2026-10-15
+# note: Synthetic. Two turn.completed lines so the last cumulative total is kept. The issue (opened 2026-04-12, no CLI version) gives 6.9M input tokens against a 272k window as an example, not a raw event. The first event's 1000/10 counts and the integer 6900000 were constructed for the parser.
+
+{"type":"turn.completed","usage":{"input_tokens":1000,"output_tokens":10}}
+{"type":"turn.completed","usage":{"input_tokens":6900000,"output_tokens":4000}}

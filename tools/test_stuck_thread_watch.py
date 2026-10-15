@@ -688,9 +688,10 @@ class VerdictAndResolveTests(unittest.TestCase):
         self.assertEqual(counters.resolved, 1)
         self.assertEqual(gh.resolves, ["PRRT_1"])
         self.assertEqual(len(gh.replies), 1)
-        self.assertIn("<!-- codex-thread-resolved:PRRT_1 -->", gh.replies[0][1])
+        self.assertIn("<!-- codex-thread-cited:PRRT_1 -->", gh.replies[0][1])
         self.assertIn(HEAD[:12], gh.replies[0][1])
         self.assertIn("CODEX-THREAD: RESOLVE", gh.replies[0][1])
+        self.assertTrue(any("<!-- codex-thread-resolved:PRRT_1 -->" in body for _, body in gh.comments))
 
     def test_decide_missing_ambiguous_do_not_resolve(self) -> None:
         for action in ("DECIDE", "MISSING", "AMBIGUOUS"):
@@ -776,9 +777,12 @@ class VerdictAndResolveTests(unittest.TestCase):
         t = thread(
             tid="PRRT_1",
             comments=stuck_pair()
-            + [comment("pat-user", mod.resolve_marker("PRRT_1"), hours_ago=0.05)],
+            + [comment("pat-user", mod.cite_marker("PRRT_1"), hours_ago=0.05)],
         )
-        asked = [comment("pat-user", mod.mediation_marker("PRRT_1"), hours_ago=0.4)]
+        asked = [
+            comment("pat-user", mod.mediation_marker("PRRT_1"), hours_ago=0.4),
+            comment("pat-user", mod.resolve_marker("PRRT_1"), hours_ago=0.04),
+        ]
         ruling = comment(CODEX, verdict_block("PRRT_1"), hours_ago=0.1)
         p = pull(threads=[t], issue_comments=asked, reviews=[ruling])
         self.assertEqual(
@@ -849,7 +853,7 @@ class VerdictAndResolveTests(unittest.TestCase):
         self.assertEqual(counters.skipped_stale, 1)
         self.assertEqual(gh.resolves, [])
 
-    def test_resolve_happens_before_reply(self) -> None:
+    def test_cite_happens_before_resolve(self) -> None:
         order: list[str] = []
 
         class OrderGitHub(FakeGitHub):
@@ -861,15 +865,19 @@ class VerdictAndResolveTests(unittest.TestCase):
                 order.append("reply")
                 super().reply_on_thread(thread_id, body)
 
+            def post_comment(self, number: int, body: str) -> None:
+                order.append("marker")
+                super().post_comment(number, body)
+
         t = thread(tid="PRRT_1", comments=stuck_pair())
         asked = [comment("pat-user", mod.mediation_marker("PRRT_1"), hours_ago=0.4)]
         ruling = comment(CODEX, verdict_block("PRRT_1"), hours_ago=0.1)
         gh = OrderGitHub([pull(threads=[t], issue_comments=asked, reviews=[ruling])])
         counters = mod.scan(cfg(mediator_login="pat-user"), gh, FakeLinear())  # type: ignore[arg-type]
         self.assertEqual(counters.resolved, 1)
-        self.assertEqual(order, ["resolve", "reply"])
+        self.assertEqual(order, ["reply", "resolve", "marker"])
 
-    def test_failed_resolve_does_not_reply_or_count_cap(self) -> None:
+    def test_failed_resolve_keeps_citation_and_does_not_count_cap(self) -> None:
         class BoomResolve(FakeGitHub):
             def resolve_thread(self, thread_id: str) -> None:
                 raise RuntimeError("403")
@@ -881,8 +889,45 @@ class VerdictAndResolveTests(unittest.TestCase):
         counters = mod.scan(cfg(mediator_login="pat-user"), gh, FakeLinear())  # type: ignore[arg-type]
         self.assertEqual(counters.resolved, 0)
         self.assertEqual(counters.resolve_failed, 1)
-        self.assertEqual(gh.replies, [])
+        self.assertEqual(len(gh.replies), 1)
+        self.assertIn("<!-- codex-thread-cited:PRRT_1 -->", gh.replies[0][1])
+        self.assertFalse(any("<!-- codex-thread-resolved:" in body for _, body in gh.comments))
         self.assertEqual(mod.exit_code(counters), 1)
+
+    def test_reply_failure_does_not_resolve(self) -> None:
+        class BoomReply(FakeGitHub):
+            def reply_on_thread(self, thread_id: str, body: str) -> None:
+                raise RuntimeError("403")
+
+        t = thread(tid="PRRT_1", comments=stuck_pair())
+        asked = [comment("pat-user", mod.mediation_marker("PRRT_1"), hours_ago=0.4)]
+        ruling = comment(CODEX, verdict_block("PRRT_1"), hours_ago=0.1)
+        gh = BoomReply([pull(threads=[t], issue_comments=asked, reviews=[ruling])])
+        counters = mod.scan(cfg(mediator_login="pat-user"), gh, FakeLinear())  # type: ignore[arg-type]
+        self.assertEqual(counters.resolved, 0)
+        self.assertEqual(counters.resolve_failed, 1)
+        self.assertEqual(gh.resolves, [])
+        self.assertEqual(mod.exit_code(counters), 1)
+
+    def test_cited_but_unresolved_retries_resolve_only(self) -> None:
+        t = thread(
+            tid="PRRT_1",
+            comments=stuck_pair()
+            + [comment("pat-user", mod.cite_marker("PRRT_1"), hours_ago=0.05)],
+        )
+        asked = [comment("pat-user", mod.mediation_marker("PRRT_1"), hours_ago=0.4)]
+        ruling = comment(CODEX, verdict_block("PRRT_1"), hours_ago=0.1)
+        p = pull(threads=[t], issue_comments=asked, reviews=[ruling])
+        self.assertEqual(
+            mod.classify_resolve(p, t, cfg(mediator_login="pat-user")),
+            "retry-resolve",
+        )
+        gh = FakeGitHub([p])
+        counters = mod.scan(cfg(mediator_login="pat-user"), gh, FakeLinear())  # type: ignore[arg-type]
+        self.assertEqual(counters.resolved, 1)
+        self.assertEqual(gh.resolves, ["PRRT_1"])
+        self.assertEqual(gh.replies, [])
+        self.assertTrue(any("<!-- codex-thread-resolved:PRRT_1 -->" in body for _, body in gh.comments))
 
     def test_already_resolved_thread_is_skipped(self) -> None:
         t = thread(tid="PRRT_1", comments=stuck_pair(), resolved=True)

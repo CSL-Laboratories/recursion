@@ -29,6 +29,7 @@ GITHUB_API = "https://api.github.com"
 LINEAR_API = "https://api.linear.app/graphql"
 MEDIATION_PREFIX = "codex-mediation"
 VERDICT_PREFIX = "codex-thread-verdict"
+CITE_PREFIX = "codex-thread-cited"
 RESOLVE_PREFIX = "codex-thread-resolved"
 NEEDS_DECISION_LABEL = "needs-decision"
 LINEAR_LABELS = (NEEDS_DECISION_LABEL, "recursion", "auto-filed", "Chore")
@@ -139,6 +140,10 @@ def any_mediation_marker(body: str) -> bool:
 
 def verdict_marker(thread_id: str) -> str:
     return f"<!-- {VERDICT_PREFIX}:{thread_id} -->"
+
+
+def cite_marker(thread_id: str) -> str:
+    return f"<!-- {CITE_PREFIX}:{thread_id} -->"
 
 
 def resolve_marker(thread_id: str) -> str:
@@ -466,6 +471,18 @@ def already_resolve_marked(
     )
 
 
+def already_cited(
+    thread: Thread,
+    issue_comments: Iterable[Comment],
+    cfg: Config,
+) -> bool:
+    marker = cite_marker(thread.id)
+    return any(
+        marker in (comment.body or "") and _trusted_marker_comment(comment, cfg)
+        for comment in (*thread.comments, *issue_comments)
+    )
+
+
 def resolves_today(
     issue_comments: Iterable[Comment],
     threads: Iterable[Thread],
@@ -533,7 +550,7 @@ def classify_resolve(
     thread: Thread,
     cfg: Config,
 ) -> str:
-    """Return a stable reason. Only 'resolve' is actionable."""
+    """Return a stable reason. 'resolve' and 'retry-resolve' are actionable."""
     if thread.is_resolved:
         return "resolved"
     if not thread.id:
@@ -541,8 +558,8 @@ def classify_resolve(
     if not codex_was_asked(thread, pull.issue_comments, cfg):
         return "not-asked"
     if already_resolve_marked(thread, pull.issue_comments, cfg):
-        # Marker is written only after a successful resolve. A later open
-        # thread is a deliberate reopen, not a failed mutation.
+        # Success marker is written only after resolve + on-thread cite.
+        # A later open thread is a deliberate reopen, not a failed mutation.
         return "already-marked"
     verdict = latest_thread_verdict(thread.id, pull_verdict_comments(pull), cfg)
     if verdict is None:
@@ -555,6 +572,8 @@ def classify_resolve(
         return "stale-sha"
     if not pull.required_checks_green:
         return "checks"
+    if already_cited(thread, pull.issue_comments, cfg):
+        return "retry-resolve"
     return "resolve"
 
 
@@ -653,11 +672,20 @@ def mediation_body(
 def resolve_reply_body(thread: Thread, verdict: ThreadVerdict, head_sha: str) -> str:
     short = (head_sha or verdict.head_sha or "")[:12]
     return (
-        f"{resolve_marker(thread.id)}\n"
+        f"{cite_marker(thread.id)}\n"
         f"Codex ruled the fix is already present on head `{short}` and no "
         "owner/human decision is needed. Required checks on that head are "
         "green. Resolving this thread.\n\n"
         f"Ruling: `CODEX-THREAD: {verdict.action}` HEAD `{verdict.head_sha}`.\n"
+    )
+
+
+def resolve_success_body(thread: Thread, head_sha: str) -> str:
+    short = (head_sha or "")[:12]
+    return (
+        f"{resolve_marker(thread.id)}\n"
+        f"Auto-resolved thread `{thread.id}` on head `{short}` after an "
+        "on-thread Codex citation.\n"
     )
 
 
@@ -1357,7 +1385,13 @@ def resolve_eligible_thread(
     github: GitHubClient,
     counters: Counters,
 ) -> tuple[Pull, bool]:
-    """Resolve first, then cite. Marker after success so reopens stay open."""
+    """Cite on the thread, then resolve, then record success.
+
+    The on-thread cite is required before resolve. The success marker is
+    written only after resolveReviewThread succeeds, so a later-open thread
+    with that marker is a deliberate reopen. A cite without a success marker
+    is a failed resolve and may be retried.
+    """
     refresher = getattr(github, "refresh_head", None)
     if callable(refresher):
         try:
@@ -1375,28 +1409,34 @@ def resolve_eligible_thread(
         counters.skipped_checks += 1
         log(f"skip (required checks after refresh): PR #{pull.number} {thread.id}")
         return pull, False
-    if reason != "resolve":
+    if reason not in {"resolve", "retry-resolve"}:
         return pull, False
     verdict = latest_thread_verdict(thread.id, pull_verdict_comments(pull), cfg)
     if verdict is None:
         return pull, False
+    if reason == "resolve":
+        try:
+            github.reply_on_thread(
+                thread.id, resolve_reply_body(thread, verdict, pull.head_sha)
+            )
+        except Exception as exc:  # noqa: BLE001 — do not resolve without a citation
+            notice(f"thread reply skipped: {exc}")
+            counters.resolve_failed += 1
+            return pull, False
     try:
         github.resolve_thread(thread.id)
     except Exception as exc:  # noqa: BLE001 — keep scanning later threads
         notice(f"resolveReviewThread skipped: {exc}")
         counters.resolve_failed += 1
         return pull, False
-    body = resolve_reply_body(thread, verdict, pull.head_sha)
     try:
-        github.reply_on_thread(thread.id, body)
-    except Exception as exc:  # noqa: BLE001 — resolve already landed; persist marker
-        notice(f"thread reply skipped after resolve: {exc}")
+        github.post_comment(pull.number, resolve_success_body(thread, pull.head_sha))
+    except Exception as exc:  # noqa: BLE001 — thread is already cited and resolved
+        notice(f"resolve success marker skipped: {exc}")
         try:
-            github.post_comment(pull.number, body)
-        except Exception as post_exc:  # noqa: BLE001
-            notice(f"resolve marker comment skipped: {post_exc}")
-            counters.resolve_failed += 1
-            return pull, False
+            github.reply_on_thread(thread.id, resolve_marker(thread.id))
+        except Exception as reply_exc:  # noqa: BLE001
+            notice(f"resolve success marker reply skipped: {reply_exc}")
     counters.resolved += 1
     log(f"resolved PR #{pull.number} thread {thread.id} on {pull.head_sha[:12]}")
     return pull, True
@@ -1492,7 +1532,7 @@ def scan(
                 counters.skipped_checks += 1
                 log(f"skip (required checks): PR #{pull.number} {thread.id}")
                 continue
-            if reason != "resolve":
+            if reason not in {"resolve", "retry-resolve"}:
                 continue
             if not cfg.codex_pat:
                 log(f"skip resolve (no PAT): PR #{pull.number} {thread.id}")

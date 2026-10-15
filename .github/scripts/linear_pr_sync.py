@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -26,6 +27,10 @@ TOP_FILES_DEFAULT = 10
 PURPOSE_LINES = 8
 PURPOSE_CHARS = 800
 BEHIND_STATES = frozenset({"dirty", "behind"})
+PENDING_MERGEABLE = frozenset({"", "unknown"})
+MERGEABLE_RETRIES = 3
+MERGEABLE_WAIT_S = 2.0
+REVIEW_PAGES = 10
 FORBIDDEN_GITHUB_PATH = re.compile(
     r"/(merge|merge-upstream|resolve|dismissals)(/|$)",
     re.IGNORECASE,
@@ -87,6 +92,11 @@ def merge_flag(mergeable_state: str, default_branch: str) -> str:
     return ""
 
 
+def mergeable_pending(data: dict[str, Any]) -> bool:
+    state = str(data.get("mergeable_state") or "").strip().lower()
+    return data.get("mergeable") is None or state in PENDING_MERGEABLE
+
+
 def purpose_excerpt(body: str, *, max_lines: int = PURPOSE_LINES, max_chars: int = PURPOSE_CHARS) -> str:
     cleaned = HTML_COMMENT_RE.sub("", body or "")
     lines = [ln.rstrip() for ln in cleaned.replace("\r\n", "\n").split("\n")]
@@ -144,6 +154,7 @@ class PullSnapshot:
     head_sha: str
     files: tuple[str, ...]
     reviews: tuple[dict[str, Any], ...]
+    head_repo: str = ""
 
 
 @dataclass(frozen=True)
@@ -257,6 +268,25 @@ class GitHubClient:
             page += 1
         return numbers
 
+    def _list_reviews(self, number: int, head_sha: str) -> tuple[dict[str, Any], ...]:
+        reviews: list[dict[str, Any]] = []
+        page = 1
+        while page <= REVIEW_PAGES:
+            url = (
+                f"{GITHUB_API}/repos/{self.cfg.owner}/{self.cfg.name}/pulls/{number}/reviews"
+                f"?per_page=100&page={page}"
+            )
+            batch = self._request(url)
+            if not isinstance(batch, list) or not batch:
+                break
+            reviews.extend(item for item in batch if isinstance(item, dict))
+            if devin_on_head(reviews, head_sha, self.cfg.devin_login):
+                break
+            if len(batch) < 100:
+                break
+            page += 1
+        return tuple(reviews)
+
     def load_pull(self, number: int) -> PullSnapshot | None:
         url = f"{GITHUB_API}/repos/{self.cfg.owner}/{self.cfg.name}/pulls/{number}"
         try:
@@ -267,6 +297,11 @@ class GitHubClient:
             raise
         if not data or not data.get("number"):
             return None
+        tries = 0
+        while mergeable_pending(data) and tries < MERGEABLE_RETRIES:
+            time.sleep(MERGEABLE_WAIT_S)
+            data = self._request(url)
+            tries += 1
         files_url = (
             f"{GITHUB_API}/repos/{self.cfg.owner}/{self.cfg.name}/pulls/{number}/files"
             f"?per_page={self.cfg.top_files}"
@@ -277,14 +312,11 @@ class GitHubClient:
             for item in (files_raw or [])
             if item.get("filename")
         )
-        reviews_url = (
-            f"{GITHUB_API}/repos/{self.cfg.owner}/{self.cfg.name}/pulls/{number}/reviews"
-            f"?per_page=100"
-        )
-        reviews_raw = self._request(reviews_url)
-        reviews = tuple(item for item in (reviews_raw or []) if isinstance(item, dict))
         head = data.get("head") or {}
+        head_sha = str(head.get("sha") or "")
+        reviews = self._list_reviews(number, head_sha)
         user = data.get("user") or {}
+        head_repo = str(((head.get("repo") or {}).get("full_name")) or "")
         return PullSnapshot(
             number=int(data["number"]),
             title=str(data.get("title") or ""),
@@ -295,9 +327,10 @@ class GitHubClient:
             draft=bool(data.get("draft")),
             merged=bool(data.get("merged")),
             mergeable_state=str(data.get("mergeable_state") or ""),
-            head_sha=str(head.get("sha") or ""),
+            head_sha=head_sha,
             files=files,
             reviews=reviews,
+            head_repo=head_repo,
         )
 
 
@@ -427,6 +460,9 @@ def upsert_comment(linear: LinearClient, issue_id: str, marker: str, body: str) 
 
 
 def sync_pull(pull: PullSnapshot, cfg: Config, linear: LinearClient) -> str:
+    if pull.head_repo and pull.head_repo.casefold() != cfg.repo.casefold():
+        log(f"skip PR #{pull.number}: fork head")
+        return "skipped-fork"
     key = extract_csl_key(pull.title)
     if not key:
         log(f"skip PR #{pull.number}: no CSL key in title")
@@ -446,11 +482,15 @@ def scan(cfg: Config, github: GitHubClient, linear: LinearClient | None) -> int:
         raise SystemExit("GH_TOKEN / GITHUB_TOKEN is required to read pull requests")
     synced = 0
     for number in github.list_open_pr_numbers() if not cfg.pr_number else [cfg.pr_number]:
-        pull = github.load_pull(number)
-        if pull is None:
-            notice(f"PR #{number} not found")
+        try:
+            pull = github.load_pull(number)
+            if pull is None:
+                notice(f"PR #{number} not found")
+                continue
+            result = sync_pull(pull, cfg, linear)
+        except Exception as exc:  # noqa: BLE001 — keep refreshing later PRs
+            notice(f"PR #{number} sync skipped: {exc}")
             continue
-        result = sync_pull(pull, cfg, linear)
         if result in {"created", "updated"}:
             synced += 1
     log(f"linear-pr-sync: synced={synced}")

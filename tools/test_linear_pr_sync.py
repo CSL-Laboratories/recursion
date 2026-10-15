@@ -64,6 +64,7 @@ def pull(**kwargs: Any) -> mod.PullSnapshot:
         head_sha="abc123def456",
         files=(".github/workflows/linear-pr-sync.yml", "AGENTS.md"),
         reviews=(),
+        head_repo="CSL-Laboratories/recursion",
     )
     values.update(kwargs)
     return mod.PullSnapshot(**values)
@@ -226,6 +227,31 @@ class UpsertTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(linear.created, 0)
 
+    def test_skips_fork_heads(self) -> None:
+        linear = FakeLinear()
+        result = mod.sync_pull(pull(head_repo="evil/fork"), cfg(), linear)
+        self.assertEqual(result, "skipped-fork")
+        self.assertEqual(linear.created, 0)
+
+    def test_missing_issue_does_not_abort_later_prs(self) -> None:
+        class BoomThenOk(FakeLinear):
+            def resolve_issue(self, key: str) -> str:
+                if key == "CSL-9999":
+                    raise RuntimeError("Linear issue CSL-9999 not found")
+                return super().resolve_issue(key)
+
+        gh = FakeGitHub(
+            [
+                pull(number=12, title="CSL-9999: missing"),
+                pull(number=13, title="CSL-87: ok"),
+            ]
+        )
+        linear = BoomThenOk()
+        code = mod.scan(cfg(), gh, linear)  # type: ignore[arg-type]
+        self.assertEqual(code, 0)
+        self.assertEqual(linear.created, 1)
+        self.assertIn("recursion#13", linear.comments["issue-uuid-87"][0]["body"])
+
     def test_push_path_syncs_every_open_pr(self) -> None:
         gh = FakeGitHub(
             [
@@ -258,6 +284,100 @@ class HttpGuardTests(unittest.TestCase):
         with self.assertRaises(RuntimeError) as ctx:
             client._request("https://api.github.com/repos/a/b/pulls/1")
         self.assertNotIn("gh-read", str(ctx.exception))
+
+    def test_retries_unknown_mergeable_state(self) -> None:
+        payloads = [
+            {
+                "number": 191,
+                "title": "CSL-87: x",
+                "html_url": "https://github.com/CSL-Laboratories/recursion/pull/191",
+                "user": {"login": "a"},
+                "state": "open",
+                "draft": False,
+                "merged": False,
+                "mergeable": None,
+                "mergeable_state": "unknown",
+                "head": {
+                    "sha": "abc",
+                    "repo": {"full_name": "CSL-Laboratories/recursion"},
+                },
+            },
+            {
+                "number": 191,
+                "title": "CSL-87: x",
+                "html_url": "https://github.com/CSL-Laboratories/recursion/pull/191",
+                "user": {"login": "a"},
+                "state": "open",
+                "draft": False,
+                "merged": False,
+                "mergeable": False,
+                "mergeable_state": "dirty",
+                "head": {
+                    "sha": "abc",
+                    "repo": {"full_name": "CSL-Laboratories/recursion"},
+                },
+            },
+        ]
+
+        def fake_request(url: str, *, method: str = "GET") -> Any:
+            if "/reviews" in url:
+                return []
+            if "/files" in url:
+                return [{"filename": "AGENTS.md"}]
+            return payloads.pop(0)
+
+        client = mod.GitHubClient(cfg())
+        with mock.patch.object(client, "_request", side_effect=fake_request), mock.patch.object(
+            mod.time, "sleep"
+        ) as slept:
+            snap = client.load_pull(191)
+        assert snap is not None
+        self.assertEqual(snap.mergeable_state, "dirty")
+        self.assertEqual(slept.call_count, 1)
+
+    def test_reviews_paginate_until_devin_on_head(self) -> None:
+        pr = {
+            "number": 191,
+            "title": "CSL-87: x",
+            "html_url": "https://github.com/CSL-Laboratories/recursion/pull/191",
+            "user": {"login": "a"},
+            "state": "open",
+            "draft": False,
+            "merged": False,
+            "mergeable": True,
+            "mergeable_state": "clean",
+            "head": {
+                "sha": "deadbeef",
+                "repo": {"full_name": "CSL-Laboratories/recursion"},
+            },
+        }
+        page1 = [
+            {"user": {"login": "human"}, "commit_id": "old", "state": "COMMENTED"}
+        ] * 100
+        page2 = [
+            {
+                "user": {"login": "devin-ai-integration"},
+                "commit_id": "deadbeef",
+                "state": "COMMENTED",
+            }
+        ]
+
+        def fake_request(url: str, *, method: str = "GET") -> Any:
+            if url.endswith("/pulls/191"):
+                return pr
+            if "/files" in url:
+                return []
+            if "/reviews" in url and "page=2" in url:
+                return page2
+            if "/reviews" in url:
+                return page1
+            raise AssertionError(url)
+
+        client = mod.GitHubClient(cfg())
+        with mock.patch.object(client, "_request", side_effect=fake_request):
+            snap = client.load_pull(191)
+        assert snap is not None
+        self.assertTrue(mod.devin_on_head(list(snap.reviews), "deadbeef", DEVIN))
 
     def test_from_env(self) -> None:
         env = {
@@ -299,6 +419,10 @@ class WorkflowAndDocsTests(unittest.TestCase):
         self.assertIn("linear_pr_sync.py", text)
         self.assertIn("github.event.repository.default_branch", text)
         self.assertIn("not on the default branch yet; skip", text)
+        self.assertIn(
+            "github.event.pull_request.head.repo.full_name == github.repository",
+            text,
+        )
         self.assertNotIn("blacksmith", text.lower())
         self.assertNotRegex(text, r"git push|--force|mergePullRequest")
         ci = CI.read_text(encoding="utf-8")

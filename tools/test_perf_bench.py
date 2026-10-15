@@ -67,10 +67,18 @@ class CompareTests(unittest.TestCase):
 
     def test_default_limit_is_about_ten_percent(self) -> None:
         self.assertEqual(perf_compare.DEFAULT_RATIO_LIMIT, 1.10)
-        self.assertEqual(perf_compare.DEFAULT_ABSOLUTE_FLOOR_S, 50e-6)
+        self.assertEqual(perf_compare.DEFAULT_ABSOLUTE_FLOOR_S, 25e-6)
+
+    def test_large_percent_on_fast_bench_is_flagged(self) -> None:
+        # +40% of 100 us is 40 us, over the 25 us floor.
+        report = perf_compare.compare_reports(
+            _report({"decode_command": 100e-6}),
+            _report({"decode_command": 140e-6}),
+        )
+        self.assertTrue(report["flagged"])
 
     def test_percent_without_absolute_floor_is_not_a_regression(self) -> None:
-        # +20% of 100 us is 20 us, under the 50 us floor.
+        # +20% of 100 us is 20 us, under the 25 us floor.
         report = perf_compare.compare_reports(
             _report({"decode_command": 100e-6}),
             _report({"decode_command": 120e-6}),

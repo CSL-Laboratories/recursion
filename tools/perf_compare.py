@@ -3,7 +3,7 @@
 
 Lower time is better. A row is a regression only when the candidate median
 is slower by more than the ratio limit (default 1.10, about 10%) and by more
-than an absolute floor (default 50 microseconds). A large percentage on a
+than an absolute floor (default 25 microseconds). A large percentage on a
 tiny delta is runner jitter, not a warning. The comparison never decides
 that CI should fail; callers warn instead.
 """
@@ -14,9 +14,9 @@ from typing import Any
 
 SCHEMA = "recursion-perf-bench/1"
 DEFAULT_RATIO_LIMIT = 1.10
-# Fast benches are ~100–160 us, so a 10% move is tens of microseconds.
-# 50 us is above that jitter and still below a 10% move on the ~1 ms benches.
-DEFAULT_ABSOLUTE_FLOOR_S = 50e-6
+# Fast benches are ~100–160 us, so a 10% move is 10–16 us. 25 us sits above
+# paired-median jitter yet still flags a 40% move (40 us) on a 100 us bench.
+DEFAULT_ABSOLUTE_FLOOR_S = 25e-6
 
 
 class CompareError(ValueError):

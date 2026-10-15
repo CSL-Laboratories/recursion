@@ -9,7 +9,7 @@ from this checkout; each tree supplies only its planning kernel.
     python -X utf8 -B tools/perf_ci.py
 
 CI sets CI_BASE_SHA to the pull request base. PERF_REGRESSION_RATIO overrides
-the default 1.10 limit. PERF_ABSOLUTE_FLOOR_S overrides the default 50 us
+the default 1.10 limit. PERF_ABSOLUTE_FLOOR_S overrides the default 25 us
 floor. A warning requires both. Regressions print GitHub warning annotations
 and a step summary, then exit 0. A harness crash, missing kernel, or invalid
 report exits 1.

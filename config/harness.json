@@ -1,0 +1,105 @@
+{
+  "version": 1,
+  "review": {
+    "accept_unreviewed": false,
+    "max_rounds": 2
+  },
+  "budgets": {
+    "max_input_tokens": 50000000,
+    "max_output_tokens": 8000000,
+    "max_cost": null
+  },
+  "routing": {
+    "required_capabilities": [
+      "execute"
+    ],
+    "preference": [
+      "fixture",
+      "fixture-b",
+      "claude",
+      "codex",
+      "grok"
+    ]
+  },
+  "providers": [
+    {
+      "name": "fixture",
+      "enabled": true,
+      "capabilities": [
+        "execute",
+        "deterministic"
+      ],
+      "argv": [
+        "fixture-provider",
+        "--output-format",
+        "json"
+      ],
+      "timeout_seconds": 120
+    },
+    {
+      "name": "fixture-b",
+      "enabled": true,
+      "capabilities": [
+        "execute",
+        "deterministic"
+      ],
+      "argv": [
+        "fixture-b-provider",
+        "--output-format",
+        "json"
+      ],
+      "timeout_seconds": 120
+    },
+    {
+      "name": "claude",
+      "enabled": false,
+      "capabilities": [
+        "execute",
+        "stream-json",
+        "subscription"
+      ],
+      "argv": [
+        "claude",
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--dangerously-skip-permissions"
+      ],
+      "timeout_seconds": 120
+    },
+    {
+      "name": "codex",
+      "enabled": false,
+      "capabilities": [
+        "execute",
+        "jsonl",
+        "subscription"
+      ],
+      "argv": [
+        "codex",
+        "exec",
+        "--json",
+        "--approve-for-me"
+      ],
+      "timeout_seconds": 120
+    },
+    {
+      "name": "grok",
+      "enabled": false,
+      "capabilities": [
+        "execute",
+        "streaming-json",
+        "subscription"
+      ],
+      "argv": [
+        "grok",
+        "--output-format",
+        "streaming-json",
+        "--always-approve",
+        "--no-auto-update"
+      ],
+      "timeout_seconds": 120
+    }
+  ]
+}

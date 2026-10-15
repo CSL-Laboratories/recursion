@@ -131,6 +131,14 @@ start, assign yourself and move the issue to **In Progress**; unassign if you st
   it yourself.
 - Route issues with `for-devin`, `for-claude`, or `for-cursor`. Use `needs-decision` when a
   human direction call is needed.
+- **Shared files.** [`.github/workflows/linear-pr-sync.yml`](.github/workflows/linear-pr-sync.yml)
+  upserts one Linear comment per PR, marked `<!-- pr-sync:<repo>#<n> -->` (edit in
+  place, never a second comment). It shows the PR link, author, purpose, status
+  (draft/open/merged/closed), mergeable state, head SHA, Devin review on head,
+  and the top changed files. A push to the default branch refreshes every open
+  PR and flags `out of date / conflicts with <default-branch>`. **Grok Bots
+  must read those Linear PR-sync comments before touching shared files** —
+  three people work at once. This workflow is not a required check.
 - On your own PR, address CI comments, then resolve the threads. Eligible Devin
   findings and `@claude` mentions are handled by the Claude Code Action
   (`.github/workflows/claude.yml`; see [Review roles](#review-roles)). Do not
@@ -184,6 +192,9 @@ label, not by editing config.
   findings and `@claude` mentions. It runs only on open same-repo PRs whose
   author is an org OWNER or MEMBER. `@claude` also requires a human OWNER or
   MEMBER commenter. Fork and nonmember PRs are not auto-fixed.
+- **Stuck-thread watch** (`.github/workflows/stuck-thread-watch.yml`) asks Codex
+  to mediate Devin threads Claude could not settle. Codex is a mediator, not a
+  reviewer of record and not a fixer: it must not push code.
 - **Blacksmith** is the only CI.
 - Cursor, Codex, Grok, and interactive Claude Code develop features from Linear
   issues. They must not post review verdicts or run review-fix loops on other
@@ -197,15 +208,24 @@ Devin reviews only and never fixes, so a thread is never handed back to Devin. C
 leaves the thread open, replies explaining why it couldn't fix it, and @mentions the PR
 author.
 
-The CSL Observability stuck-thread watcher — an external Grok Bot routine, not a GitHub
-workflow — then scans open PRs on a schedule and files a Linear issue in **Triage** titled
-`Stuck PR thread: repo#PR – topic`, labeled `needs-decision`, and linked to the PR's
-`CSL-N` issue. It runs outside this repository, so it will not appear in
-`.github/workflows` and reviewers should not look for it in-repo. For urgent cases the PR
-author may also file one by hand.
+## Review loop
 
-Before merging any PR, check Linear for open `Stuck PR thread` issues tied to it, and
-resolve them or record the decision first.
+Devin reviews. Claude fixes (`.github/workflows/claude.yml`). If a Devin thread
+stays stuck — Claude said it needs a human / could not fix, or the thread is
+still open more than six hours (configurable) after Claude's last reply —
+[`.github/workflows/stuck-thread-watch.yml`](.github/workflows/stuck-thread-watch.yml)
+posts one `@codex review` comment (via `CODEX_TRIGGER_PAT`; skipped with a
+notice if that secret is missing). A Codex **MEDIATE** verdict updates one
+Linear Triage roll-up per PR titled `Stuck PR threads: recursion#<PR>`, labeled
+`needs-decision`, with a checklist of stuck threads (update that issue; do not
+file one issue per thread). The watcher skips drafts, merged/closed PRs, and
+PRs that are approved on the current head with green checks. It cancels the
+roll-up when the PR merges or every stuck thread is resolved. Humans decide.
+Caps: one mediation per thread, three per PR per UTC day. The watcher never
+resolves threads, pushes, or merges.
+
+Before merging any PR, check Linear for an open `Stuck PR threads: recursion#<PR>`
+issue tied to it, and resolve the checklist or record the decision first.
 
 ## Automations
 

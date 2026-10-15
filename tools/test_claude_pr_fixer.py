@@ -537,6 +537,21 @@ class FixerGateAndPromptTests(unittest.TestCase):
             self.assertIn("prompt: |", body, job)
             self.assertIn("commit SHA", body, job)
             self.assertIn("do NOT resolve the thread", body, job)
+            self.assertIn("gh api repos/REPO/pulls/PR/comments/ID/replies", body, job)
+            self.assertIn(
+                "Bash(gh api repos/*/pulls/*/comments/*/replies:*)",
+                body,
+                job,
+            )
+            self.assertIn(
+                "Bash(gh api --method POST repos/*/pulls/*/comments/*/replies:*)",
+                body,
+                job,
+            )
+            self.assertIn("Bash(gh api graphql:*resolveReviewThread*)", body, job)
+            self.assertIn("resolveReviewThread call only", body, job)
+            self.assertIn("Do not resolve a thread you have not answered", body, job)
+            self.assertIn("Do not use graphql for any other mutation", body, job)
             self.assertIn("do NOT push", body, job)
             self.assertIn("Never exit without either pushing or posting that failure reply", body, job)
             self.assertIn("UNTRUSTED DATA", body, job)
@@ -545,6 +560,13 @@ class FixerGateAndPromptTests(unittest.TestCase):
             self.assertIn("git commit -m with a short message", body, job)
             self.assertIn("use Edit/Write for files", body, job)
             self.assertIn("the gate result", body, job)
+            self.assertIn("Linear-first (CSL-88)", body, job)
+            self.assertIn("PR-sync comment", body, job)
+            self.assertIn("Context7", body, job)
+            self.assertIn("Parallel", body, job)
+            self.assertIn("Triage", body, job)
+            self.assertIn("when those tools are available", body, job)
+            self.assertIn("not a denied command that blocks the push", body, job)
 
     def test_denials_are_reported_after_each_fixer(self) -> None:
         for job in ("claude-mention", "devin-review-fix"):
@@ -914,6 +936,12 @@ class ConflictJobStructureTests(unittest.TestCase):
         self.assertIn("no heredocs, loops, or &&", job)
         self.assertIn("exactly as written above", job)
         self.assertIn("tools/ci_gate.py --force", job)
+        self.assertIn("Linear-first (CSL-88)", job)
+        self.assertIn("PR-sync comment", job)
+        self.assertIn("Context7", job)
+        self.assertIn("Parallel", job)
+        self.assertIn("when those tools are available", job)
+        self.assertIn("not a denied command that blocks the push", job)
 
     def test_resolver_comments_or_labels(self) -> None:
         job = self._job("conflict-resolve")

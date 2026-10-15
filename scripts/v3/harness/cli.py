@@ -7,8 +7,8 @@ import json
 import sys
 from pathlib import Path
 
-from scripts.v3.harness.config import load_config, write_starter
-from scripts.v3.harness.doctor import diagnose, discover_installed
+from scripts.v3.harness.config import default_enabled, load_config, write_starter
+from scripts.v3.harness.doctor import diagnose
 from scripts.v3.harness.errors import HarnessError
 from scripts.v3.harness.run import run_task
 from scripts.v3.harness.state import list_runs, load_run
@@ -53,7 +53,7 @@ def main(argv: list[str] | None = None) -> int:
             _emit(report)
             return 0 if report["ok"] else 1
         if args.command == "init":
-            enabled = set(discover_installed())
+            enabled = default_enabled()
             write_starter(args.path, enabled, force=args.force)
             _emit({"enabled": sorted(enabled), "path": str(args.path)})
             return 0

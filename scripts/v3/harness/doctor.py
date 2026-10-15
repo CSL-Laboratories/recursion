@@ -86,7 +86,8 @@ def diagnose(
     """Report git and one row per configured provider.
 
     ``ok`` is true when at least one enabled provider is usable. An offline
-    fixture is usable whenever it is enabled. A disabled provider is not probed.
+    fixture is usable whenever it is enabled. A live provider is usable only
+    when it is installed and signed in. A disabled provider is not probed.
     """
 
     env = os.environ if environ is None else environ
@@ -149,7 +150,7 @@ def _provider_row(item: dict, *, platform: str, home: Path, path: str, run) -> d
         version=version,
         signed_in=signed_in,
         auth_method=auth_method,
-        usable=installed,
+        usable=installed and signed_in == "signed-in",
     )
 
 

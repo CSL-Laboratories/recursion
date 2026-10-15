@@ -7,3 +7,7 @@ class HarnessError(Exception):
 
 class LiveProviderDisabled(HarnessError):
     """A headless CLI was requested without ``--allow-live``."""
+
+
+class ProviderTimeout(HarnessError):
+    """A provider process did not finish within its timeout."""

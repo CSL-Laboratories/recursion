@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from scripts.v3.harness.errors import HarnessError
+from pathlib import Path
+
+from scripts.v3.harness.errors import HarnessError, ProviderTimeout
 from scripts.v3.harness.providers import ProviderRequest, open_provider
 from scripts.v3.harness.review import parse_verdict, review_prompt
 from scripts.v3.harness.routing import select_route
@@ -31,14 +33,43 @@ def run_task(
     budgets = config["budgets"]
     usage = empty_usage()
     reviews: list[dict] = []
+    shown = ""
+    workspace = _live_workspace(state_dir, run_id) if allow_live else None
     current_task = task
-    result = _execute(
-        opener,
-        worker,
-        ProviderRequest(task=current_task, packet_id=run_id, kind="execute"),
-        allow_live=allow_live,
-        timeout_seconds=_timeout(config, worker),
-    )
+
+    def save_failure(status: str, exc: HarnessError) -> None:
+        _finish(
+            config,
+            state_dir,
+            run_id=run_id,
+            task=task,
+            provider=worker,
+            reviewers=reviewers,
+            text=shown,
+            reviews=reviews,
+            usage=usage,
+            status=status,
+            error=str(exc),
+            workspace=workspace,
+        )
+
+    def call(name: str, request: ProviderRequest):
+        try:
+            return _execute(
+                opener,
+                name,
+                request,
+                allow_live=allow_live,
+                timeout_seconds=_timeout(config, name),
+            )
+        except ProviderTimeout as exc:
+            save_failure("timed-out", exc)
+            raise
+        except HarnessError as exc:
+            save_failure("failed", exc)
+            raise
+
+    result = call(worker, _request(current_task, run_id, "execute", workspace))
     add_usage(usage, parse_usage(result.text))
     shown = assistant_text(result.text)
     if exceeded(usage, budgets):
@@ -53,6 +84,7 @@ def run_task(
             reviews=reviews,
             usage=usage,
             status="budget-exceeded",
+            workspace=workspace,
         )
 
     max_rounds = config["review"]["max_rounds"]
@@ -78,21 +110,15 @@ def run_task(
             reviews=reviews,
             usage=usage,
             status=status,
+            workspace=workspace,
         )
 
     status = "review-rejected"
     for round_index in range(1, max_rounds + 1):
         reviewer = reviewers[0]
-        review_result = _execute(
-            opener,
+        review_result = call(
             reviewer,
-            ProviderRequest(
-                task=review_prompt(current_task, shown),
-                packet_id=run_id,
-                kind="review",
-            ),
-            allow_live=allow_live,
-            timeout_seconds=_timeout(config, reviewer),
+            _request(review_prompt(current_task, shown), run_id, "review", workspace),
         )
         add_usage(usage, parse_usage(review_result.text))
         verdict, notes = parse_verdict(review_result.text)
@@ -114,13 +140,7 @@ def run_task(
             status = "review-rejected"
             break
         current_task = task + "\n\nReview notes:\n" + notes
-        result = _execute(
-            opener,
-            worker,
-            ProviderRequest(task=current_task, packet_id=run_id, kind="execute"),
-            allow_live=allow_live,
-            timeout_seconds=_timeout(config, worker),
-        )
+        result = call(worker, _request(current_task, run_id, "execute", workspace))
         add_usage(usage, parse_usage(result.text))
         shown = assistant_text(result.text)
         if exceeded(usage, budgets):
@@ -138,7 +158,23 @@ def run_task(
         reviews=reviews,
         usage=usage,
         status=status,
+        workspace=workspace,
     )
+
+
+def _request(task: str, run_id: str, kind: str, workspace: str | None) -> ProviderRequest:
+    return ProviderRequest(task=task, packet_id=run_id, kind=kind, cwd=workspace)
+
+
+def _live_workspace(state_dir, run_id: str) -> str:
+    """Private folder for one live run. Headless processes use this directory as cwd."""
+
+    root = Path(state_dir) / run_id
+    path = root / "workspace"
+    path.mkdir(parents=True, exist_ok=True)
+    root.chmod(0o700)
+    path.chmod(0o700)
+    return str(path)
 
 
 def _execute(opener, name: str, request: ProviderRequest, *, allow_live: bool, timeout_seconds: int):
@@ -169,5 +205,11 @@ def _finish(config, state_dir, **fields) -> dict:
         "text": text,
         "usage": fields["usage"],
     }
+    error = fields.get("error")
+    if error:
+        record["error"] = error
+    workspace = fields.get("workspace")
+    if workspace:
+        record["workspace"] = workspace
     save_run(state_dir, record)
     return record

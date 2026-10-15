@@ -21,19 +21,19 @@ if str(ROOT) not in sys.path:
 
 from scripts.v3.harness.cli import main  # noqa: E402
 from scripts.v3.harness.config import load_config, starter_config, validate_config, write_starter  # noqa: E402
-from scripts.v3.harness.doctor import diagnose, resolve_executable  # noqa: E402
-from scripts.v3.harness.errors import HarnessError, LiveProviderDisabled  # noqa: E402
+from scripts.v3.harness.doctor import diagnose, discover_installed, resolve_executable  # noqa: E402
+from scripts.v3.harness.errors import HarnessError, LiveProviderDisabled, ProviderTimeout  # noqa: E402
 from scripts.v3.harness.providers import (  # noqa: E402
     ClaudeHeadlessProvider,
+    CodexExecProvider,
     GrokHeadlessProvider,
     ProviderRequest,
     ProviderResult,
-    grok_prompt_path,
 )
 from scripts.v3.harness.review import parse_verdict  # noqa: E402
 from scripts.v3.harness.routing import capable_providers, select_route  # noqa: E402
 from scripts.v3.harness.run import run_task  # noqa: E402
-from scripts.v3.harness.state import load_run  # noqa: E402
+from scripts.v3.harness.state import list_runs, load_run  # noqa: E402
 from scripts.v3.harness.usage import (  # noqa: E402
     DEFAULT_MAX_INPUT_TOKENS,
     DEFAULT_MAX_OUTPUT_TOKENS,
@@ -206,34 +206,66 @@ class HarnessTests(unittest.TestCase):
             self.assertFalse(stopped["accepted"])
 
     def test_grok_adapter_writes_the_prompt_and_returns_stdout(self) -> None:
-        request = ProviderRequest(task="Say hello", packet_id="run-aabbccddeeff", kind="review")
-        path = grok_prompt_path(request.packet_id)
-        seen: dict[str, bool] = {}
+        with tempfile.TemporaryDirectory() as directory:
+            request = ProviderRequest(
+                task="Say hello",
+                packet_id="run-aabbccddeeff",
+                kind="review",
+                cwd=directory,
+            )
+            predictable = Path(tempfile.gettempdir()) / "recursion-grok-run-aabbccddeeff.txt"
+            predictable.write_text("sentinel", encoding="utf-8")
+            seen: dict[str, Path] = {}
 
-        def runner(argv, stdin_text, timeout, cwd):
-            del stdin_text, timeout, cwd
-            self.assertIn("--prompt-file", argv)
-            prompt = Path(argv[argv.index("--prompt-file") + 1])
-            self.assertEqual(prompt, path)
-            self.assertEqual(prompt.read_text(encoding="utf-8"), "Say hello")
-            seen["during"] = True
-            return _completed(argv, 0, stdout=GROK_APPROVE)
+            def runner(argv, stdin_text, timeout, cwd):
+                del stdin_text, timeout
+                self.assertEqual(cwd, directory)
+                self.assertEqual(argv[argv.index("--cwd") + 1], directory)
+                prompt = Path(argv[argv.index("--prompt-file") + 1])
+                self.assertNotEqual(prompt, predictable)
+                self.assertTrue(prompt.name.startswith("recursion-grok-"))
+                self.assertEqual(prompt.read_text(encoding="utf-8"), "Say hello")
+                self.assertFalse(prompt.is_symlink())
+                if os.name == "posix":
+                    self.assertEqual(prompt.stat().st_mode & 0o777, 0o600)
+                seen["prompt"] = prompt
+                return _completed(argv, 0, stdout=GROK_APPROVE)
 
-        result = GrokHeadlessProvider().execute(request, allow_live=True, runner=runner)
-        self.assertTrue(seen["during"])
-        self.assertFalse(path.exists())
-        self.assertEqual(parse_verdict(result.text)[0], "approve")
-        self.assertTrue(result.live)
+            try:
+                result = GrokHeadlessProvider().execute(request, allow_live=True, runner=runner)
+                self.assertIn("prompt", seen)
+                self.assertFalse(seen["prompt"].exists())
+                self.assertEqual(predictable.read_text(encoding="utf-8"), "sentinel")
+                self.assertEqual(parse_verdict(result.text)[0], "approve")
+                self.assertTrue(result.live)
+            finally:
+                predictable.unlink(missing_ok=True)
 
         def missing(argv, stdin_text, timeout, cwd):
-            del argv, stdin_text, timeout, cwd
+            del stdin_text, timeout, cwd
+            prompt = Path(argv[argv.index("--prompt-file") + 1])
+            self.assertTrue(prompt.is_file())
             raise FileNotFoundError("missing")
 
-        with self.assertRaises(HarnessError):
-            GrokHeadlessProvider().execute(request, allow_live=True, runner=missing)
-        self.assertFalse(path.exists())
+        with tempfile.TemporaryDirectory() as directory:
+            bounded = ProviderRequest(
+                task="Say hello",
+                packet_id="run-aabbccddeeff",
+                kind="review",
+                cwd=directory,
+            )
+            with self.assertRaises(HarnessError):
+                GrokHeadlessProvider().execute(bounded, allow_live=True, runner=missing)
+        bare = ProviderRequest(task="Say hello", packet_id="run-aabbccddeeff", kind="review")
+
+        def refuse(argv, stdin_text, timeout, cwd):
+            raise AssertionError((argv, stdin_text, timeout, cwd))
+
+        with self.assertRaises(HarnessError) as caught:
+            GrokHeadlessProvider().execute(bare, allow_live=True, runner=refuse)
+        self.assertIn("working folder", str(caught.exception))
         with self.assertRaises(LiveProviderDisabled):
-            ClaudeHeadlessProvider().execute(request, allow_live=False)
+            ClaudeHeadlessProvider().execute(bare, allow_live=False)
 
     def test_claude_logged_in_json_wins_over_exit_code(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -266,6 +298,8 @@ class HarnessTests(unittest.TestCase):
             claude = {item["name"]: item for item in report["providers"]}["claude"]
             self.assertEqual(claude["signed_in"], "signed-in")
             self.assertEqual(claude["auth_method"], "claude.ai")
+            self.assertTrue(claude["usable"])
+            self.assertTrue(report["ok"])
             self.assertIn("[redacted]", claude["version"])
 
             def signed_out(argv, timeout):
@@ -291,6 +325,9 @@ class HarnessTests(unittest.TestCase):
             )
             row = {item["name"]: item for item in out["providers"]}["claude"]
             self.assertEqual(row["signed_in"], "signed-out")
+            self.assertTrue(row["installed"])
+            self.assertFalse(row["usable"])
+            self.assertFalse(out["ok"])
 
             def stderr_only(argv, timeout):
                 del timeout
@@ -339,7 +376,13 @@ class HarnessTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "harness.json"
-            with patch.dict(os.environ, {"PATH": str(directory)}):
+            bindir = Path(directory) / "bin"
+            bindir.mkdir()
+            claude = bindir / "claude"
+            claude.write_text("#!/bin/sh\n", encoding="utf-8")
+            claude.chmod(0o755)
+            with patch.dict(os.environ, {"PATH": str(bindir)}):
+                self.assertIn("claude", discover_installed())
                 stdout = io.StringIO()
                 with redirect_stdout(stdout):
                     code = main(["init", str(target)])
@@ -394,3 +437,122 @@ class HarnessTests(unittest.TestCase):
         rows = {item["name"]: item for item in report["providers"]}
         self.assertEqual(rows["fixture"]["signed_in"], "not-applicable")
         self.assertEqual(rows["claude"]["signed_in"], "skipped")
+
+    def test_live_cli_requires_a_working_folder(self) -> None:
+        request = ProviderRequest(task="Say hello", packet_id="run-aabbccddeeff")
+
+        def runner(argv, stdin_text, timeout, cwd):
+            raise AssertionError((argv, stdin_text, timeout, cwd))
+
+        with self.assertRaises(HarnessError) as caught:
+            CodexExecProvider().execute(request, allow_live=True, runner=runner)
+        self.assertIn("working folder", str(caught.exception))
+
+        with tempfile.TemporaryDirectory() as directory:
+            seen: dict[str, object] = {}
+
+            def bounded_runner(argv, stdin_text, timeout, cwd):
+                del stdin_text, timeout
+                seen["argv"] = argv
+                seen["cwd"] = cwd
+                return _completed(argv, 0, stdout="ok")
+
+            bounded = ProviderRequest(task="Say hello", packet_id="run-aabbccddeeff", cwd=directory)
+            CodexExecProvider().execute(bounded, allow_live=True, runner=bounded_runner)
+            self.assertEqual(seen["cwd"], directory)
+            self.assertIn(directory, seen["argv"])
+
+    def test_live_run_defaults_to_a_private_workspace(self) -> None:
+        seen: dict[str, object] = {}
+
+        class Watch(_Stub):
+            def execute(self, request, *, allow_live=False, timeout_seconds=None, runner=None):
+                seen["cwd"] = request.cwd
+                seen["allow_live"] = allow_live
+                return super().execute(
+                    request,
+                    allow_live=allow_live,
+                    timeout_seconds=timeout_seconds,
+                    runner=runner,
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            config = starter_config({"fixture"})
+            config["review"]["max_rounds"] = 0
+            record = run_task(
+                "Say hello",
+                config=config,
+                state_dir=state,
+                allow_live=True,
+                open_adapter=lambda name: Watch("fixture", "hello"),
+            )
+            cwd = Path(str(seen["cwd"]))
+            self.assertTrue(seen["allow_live"])
+            self.assertEqual(cwd, state / record["run_id"] / "workspace")
+            self.assertTrue(cwd.is_dir())
+            self.assertEqual(record["workspace"], str(cwd))
+            if os.name == "posix":
+                self.assertEqual(cwd.stat().st_mode & 0o777, 0o700)
+                self.assertEqual(cwd.parent.stat().st_mode & 0o777, 0o700)
+
+    def test_provider_error_is_saved_for_status(self) -> None:
+        class Boom:
+            def execute(self, request, *, allow_live=False, timeout_seconds=None, runner=None):
+                del request, allow_live, timeout_seconds, runner
+                raise HarnessError("fixture exited 1")
+
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(HarnessError):
+                run_task(
+                    "Say hello",
+                    config=starter_config({"fixture"}),
+                    state_dir=Path(directory),
+                    open_adapter=lambda name: Boom(),
+                )
+            ids = list_runs(Path(directory))
+            self.assertEqual(ids, [load_run(Path(directory), ids[0])["run_id"]])
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                code = main(["status", "--run", ids[0], "--state", directory])
+            self.assertEqual(code, 0)
+            record = json.loads(stdout.getvalue())
+            self.assertEqual(record["status"], "failed")
+            self.assertEqual(record["error"], "fixture exited 1")
+            self.assertFalse(record["accepted"])
+            self.assertEqual(record["reviews"], [])
+            self.assertEqual(record["text"], "")
+
+    def test_timeout_keeps_the_work_already_done(self) -> None:
+        class Worker:
+            def execute(self, request, *, allow_live=False, timeout_seconds=None, runner=None):
+                del allow_live, timeout_seconds, runner
+                if request.kind == "review":
+                    raise ProviderTimeout("grok timed out")
+                return ProviderResult(
+                    provider="fixture",
+                    argv=(),
+                    text=(
+                        '{"type":"turn.completed","usage":{"input_tokens":12,"output_tokens":3}}\n'
+                        "hello"
+                    ),
+                    live=False,
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(ProviderTimeout):
+                run_task(
+                    "Say hello",
+                    config=starter_config({"fixture", "grok"}),
+                    state_dir=Path(directory),
+                    open_adapter=lambda name: Worker(),
+                )
+            ids = list_runs(Path(directory))
+            self.assertEqual(len(ids), 1)
+            record = load_run(Path(directory), ids[0])
+            self.assertEqual(record["status"], "timed-out")
+            self.assertEqual(record["error"], "grok timed out")
+            self.assertEqual(record["text"], "hello")
+            self.assertEqual(record["usage"]["input_tokens"], 12)
+            self.assertEqual(record["reviews"], [])
+            self.assertFalse(record["accepted"])

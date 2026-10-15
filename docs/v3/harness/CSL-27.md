@@ -104,9 +104,42 @@ includes the code they sit in, and the tests are stubs.
    Stdout and stderr are both read. The report does not keep the command
    output. Disabled providers are not probed.
 
+## Review of the first slice
+
+1. The Grok prompt is a new file from `tempfile.mkstemp` (`O_EXCL`), then
+   forced to mode `0600`. The name is not derived from the run id.
+2. Doctor marks a live provider usable only when it is installed and signed
+   in. A signed-out CLI does not count.
+3. `init` turns on `fixture` and `fixture-b` only, including when a live CLI
+   is on `PATH`.
+4. A live run creates `<state>/<run-id>/workspace` at mode `0700` and uses
+   that directory as the process working folder. A headless adapter refuses
+   to start when no working folder was given, so it does not inherit the
+   repository root. This directory is not a sandbox.
+5. A provider error or timeout is saved before the exception is re-raised.
+   `status` shows `failed` or `timed-out`, the error text, and any usage or
+   assistant text already collected.
+6. `tools/ci_gate.py` collects `scripts/tests/v3/harness/harness.test.py`
+   through `scripts/tests/**/*.test.py` and runs it by path. The linux job
+   on the first slice logged `RUN unittest` for that file (16 tests). The
+   path is now in `REQUIRED_SUITE_TESTS`, so dropping it fails the gate.
+   The file was not renamed.
+
+## Left for later issues
+
+- Live flag names are not checked against a real binary. `codex exec
+  --approve-for-me` and grok `--always-approve`, `--prompt-file`, and
+  `--cwd` stay on [CSL-81](https://linear.app/csl-laboratories/issue/CSL-81).
+  The tests stub the process runner.
+- Budgets are applied after a call returns, so one live call can pass a
+  ceiling. A pre-check is [CSL-83](https://linear.app/csl-laboratories/issue/CSL-83),
+  not this slice.
+
 ## What this does not prove
 
 - No live Claude, Codex, or Grok process was started here.
 - The 6.9M Codex figure is a public report, not a measurement from this repo.
 - A raised ceiling is not a qualified subscription meter.
 - Passing the gate is not v3 release acceptance.
+- The private working folder does not stop a permissive CLI from writing
+  outside that folder.

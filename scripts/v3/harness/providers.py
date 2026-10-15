@@ -6,16 +6,13 @@ is set. The harness does not read or store credentials.
 
 from __future__ import annotations
 
-import re
+import os
 import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from scripts.v3.harness.errors import HarnessError, LiveProviderDisabled
-
-
-_PROMPT_ID = re.compile(r"[^A-Za-z0-9_-]")
+from scripts.v3.harness.errors import HarnessError, LiveProviderDisabled, ProviderTimeout
 
 
 @dataclass(frozen=True)
@@ -134,6 +131,8 @@ class HeadlessCLI(ProviderAdapter):
             raise LiveProviderDisabled(
                 f"{self.name} headless CLI is not started unless --allow-live is set"
             )
+        if not request.cwd:
+            raise HarnessError(f"{self.name} live runs require an explicit working folder")
         timeout = 120 if timeout_seconds is None else timeout_seconds
         prepared = self.prepare(request)
         invoke = _default_runner if runner is None else runner
@@ -141,7 +140,7 @@ class HeadlessCLI(ProviderAdapter):
             try:
                 completed = invoke(list(prepared.argv), prepared.stdin_text, timeout, request.cwd)
             except subprocess.TimeoutExpired as exc:
-                raise HarnessError(f"{self.name} timed out") from exc
+                raise ProviderTimeout(f"{self.name} timed out") from exc
             except FileNotFoundError as exc:
                 raise HarnessError(f"{self.name} CLI was not found") from exc
         finally:
@@ -223,25 +222,40 @@ class GrokHeadlessProvider(HeadlessCLI):
     CAPABILITIES = ("execute", "streaming-json", "subscription")
 
     def argv(self, request: ProviderRequest) -> tuple[str, ...]:
-        argv = list(self.STATIC_ARGV)
-        argv.extend(["--prompt-file", str(grok_prompt_path(request.packet_id))])
-        if request.cwd:
-            argv.extend(["--cwd", request.cwd])
-        return tuple(argv)
+        return _grok_argv(request, "<prompt-file>")
 
     def prepare(self, request: ProviderRequest) -> _Prepared:
-        path = grok_prompt_path(request.packet_id)
-        path.write_text(request.task, encoding="utf-8")
+        path = _write_grok_prompt(request.task)
 
         def cleanup() -> None:
             path.unlink(missing_ok=True)
 
-        return _Prepared(self.argv(request), None, cleanup)
+        return _Prepared(_grok_argv(request, str(path)), None, cleanup)
 
 
-def grok_prompt_path(packet_id: str) -> Path:
-    safe = _PROMPT_ID.sub("", packet_id)[:80] or "task"
-    return Path(tempfile.gettempdir()) / f"recursion-grok-{safe}.txt"
+def _grok_argv(request: ProviderRequest, prompt_file: str) -> tuple[str, ...]:
+    argv = list(GrokHeadlessProvider.STATIC_ARGV)
+    argv.extend(["--prompt-file", prompt_file])
+    if request.cwd:
+        argv.extend(["--cwd", request.cwd])
+    return tuple(argv)
+
+
+def _write_grok_prompt(task: str) -> Path:
+    """Write the prompt to a new owner-only file. The name is not predictable."""
+
+    fd, name = tempfile.mkstemp(prefix="recursion-grok-", suffix=".txt")
+    path = Path(name)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        os.write(fd, task.encode("utf-8"))
+    except OSError:
+        os.close(fd)
+        path.unlink(missing_ok=True)
+        raise
+    os.close(fd)
+    return path
 
 
 def adapters() -> dict[str, type[ProviderAdapter]]:

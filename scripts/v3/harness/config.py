@@ -87,6 +87,12 @@ def validate_config(payload: object) -> dict:
     }
 
 
+def default_enabled() -> set[str]:
+    """Providers a new config turns on. Live CLIs stay off."""
+
+    return {name for name, cls in adapters().items() if getattr(cls, "OFFLINE", False)}
+
+
 def starter_config(enabled: set[str]) -> dict:
     """Build a version-1 config. ``enabled`` names the providers that start on."""
 

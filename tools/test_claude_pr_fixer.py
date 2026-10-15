@@ -550,6 +550,8 @@ class FixerGateAndPromptTests(unittest.TestCase):
             self.assertIn("Context7", body, job)
             self.assertIn("Parallel", body, job)
             self.assertIn("Triage", body, job)
+            self.assertIn("when those tools are available", body, job)
+            self.assertIn("not a denied command that blocks the push", body, job)
 
     def test_denials_are_reported_after_each_fixer(self) -> None:
         for job in ("claude-mention", "devin-review-fix"):
@@ -923,6 +925,8 @@ class ConflictJobStructureTests(unittest.TestCase):
         self.assertIn("PR-sync comment", job)
         self.assertIn("Context7", job)
         self.assertIn("Parallel", job)
+        self.assertIn("when those tools are available", job)
+        self.assertIn("not a denied command that blocks the push", job)
 
     def test_resolver_comments_or_labels(self) -> None:
         job = self._job("conflict-resolve")

@@ -34,8 +34,11 @@ a different meter).
    Later runs in that state directory skip the provider until the reset
    time. Other failures do not cool down and do not fall back.
 3. **Fallback.** When the selected provider fails for one of those three
-   reasons, the next capable provider runs. A cooled provider is not called.
-   A review uses a different provider than the worker. If every reviewer is
+   reasons, the next capable provider of the same class runs. An offline
+   provider falls back only to another offline provider, and a live provider
+   falls back only to another live provider. `--allow-live` does not let an
+   offline failure start a paid CLI. A cooled provider is not called. A
+   review uses a different provider than the worker. If every reviewer is
    cooled or fails the same way, the run is unreviewed unless
    `accept_unreviewed` is set.
 4. **Caps.** Review output is clipped at 8,000 characters, a review diff at
@@ -43,15 +46,16 @@ a different meter).
    each summary and diff, then the whole section at 6,000 characters. The
    clip happens before the adapter receives the prompt.
 5. **Pre-call budget.** Before each adapter call, a known figure already at
-   its ceiling refuses the call. The prompt's character length is the
-   minimum input that call will send. It is added to known input usage.
-   Missing prior usage is not stored as zero. The call is not started when
-   that minimum would pass `max_input_tokens`. Provider-reported usage is
-   still checked after the call returns.
+   its ceiling refuses the call. A nonempty prompt reserves one input token.
+   If the remaining known input allowance is below one, the call is refused,
+   including when prior usage is still unknown. Character length is not a
+   token estimate and is not added to usage. Missing prior usage is not
+   stored as zero. Provider-reported usage is still checked after the call
+   returns.
 
 ## What this does not prove
 
 - No live Claude, Codex, or Grok process is started.
-- Character length is not a token meter. It only stops a prompt that cannot
-  fit under the existing ceiling.
+- Reserving one input token is not a token meter. It only refuses a
+  nonempty prompt when the remaining known input allowance is below one.
 - Passing the gate is not v3 release acceptance.

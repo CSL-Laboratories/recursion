@@ -1,7 +1,8 @@
 """Run one task on a routed provider and, when another provider exists, review it.
 
 A rate limit, exhausted quota, or expired auth records a cooldown in the run
-state and the next capable provider is tried. Other failures stop the run.
+state and the next capable provider of the same class is tried: offline falls
+back to offline, and live falls back to live. Other failures stop the run.
 The budget is checked before each call.
 """
 
@@ -20,7 +21,7 @@ from scripts.v3.harness.errors import (
     ProviderAvailability,
     ProviderTimeout,
 )
-from scripts.v3.harness.providers import ProviderRequest, open_provider
+from scripts.v3.harness.providers import ProviderRequest, adapters, open_provider
 from scripts.v3.harness.review import parse_verdict, review_prompt
 from scripts.v3.harness.routing import select_route
 from scripts.v3.harness.state import new_run_id, save_run
@@ -50,7 +51,11 @@ def run_task(
         raise HarnessError("task must not be empty")
     worker, reviewers = select_route(config, provider)
     candidates = [worker, *reviewers]
-    worker_candidates = [worker] if provider is not None else candidates
+    # A pinned worker stays pinned. An unpinned worker only falls back inside
+    # its own class, so --allow-live cannot turn an offline failure into a
+    # paid CLI call.
+    worker_pool = _same_class(candidates, worker)
+    worker_candidates = [worker] if provider is not None else worker_pool
     opener = open_provider if open_adapter is None else open_adapter
     run_id = new_run_id() if run_id is None else run_id
     budgets = config["budgets"]
@@ -248,7 +253,10 @@ def run_task(
             + notes
         )
         revise_kind, revised = dispatch(
-            [result.provider, *[name for name in candidates if name != result.provider]],
+            _same_class(
+                [result.provider, *[name for name in candidates if name != result.provider]],
+                result.provider,
+            ),
             _request(current_task, run_id, "execute", workspace),
             on_exhaust="fail",
         )
@@ -264,6 +272,18 @@ def run_task(
             break
 
     return finish(status, result.provider)
+
+
+def _provider_offline(name: str) -> bool:
+    cls = adapters().get(name)
+    return cls is not None and bool(getattr(cls, "OFFLINE", False))
+
+
+def _same_class(names: list[str], anchor: str) -> list[str]:
+    """Keep names that match the anchor: offline with offline, live with live."""
+
+    offline = _provider_offline(anchor)
+    return [name for name in names if _provider_offline(name) is offline]
 
 
 def _request(task: str, run_id: str, kind: str, workspace: str | None) -> ProviderRequest:

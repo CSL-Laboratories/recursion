@@ -833,22 +833,94 @@ class HarnessTests(unittest.TestCase):
         config = starter_config({"fixture", "fixture-b", "grok"})
         config["review"]["accept_unreviewed"] = True
         with tempfile.TemporaryDirectory() as directory:
-            record = run_task(
-                "Say hello",
-                config=config,
-                state_dir=Path(directory),
-                open_adapter=lambda name: Adapter(name),
-                now=lambda: NOW,
-            )
-        self.assertEqual(calls, ["fixture", "fixture-b", "grok"])
-        self.assertEqual(record["provider"], "grok")
-        self.assertEqual(record["status"], "completed")
-        self.assertTrue(record["accepted"])
+            state = Path(directory)
+            with self.assertRaises(HarnessError) as caught:
+                run_task(
+                    "Say hello",
+                    config=config,
+                    state_dir=state,
+                    open_adapter=lambda name: Adapter(name),
+                    now=lambda: NOW,
+                )
+            record = load_run(state, list_runs(state)[0])
+        self.assertIn("no capable provider", str(caught.exception))
+        self.assertEqual(calls, ["fixture", "fixture-b"])
+        self.assertNotIn("grok", calls)
+        self.assertEqual(record["status"], "failed")
+        self.assertFalse(record["accepted"])
         self.assertEqual(record["cooldowns"]["fixture"]["reason"], "quota-exhausted")
         self.assertEqual(record["cooldowns"]["fixture"]["until"], format_until(NOW + 60))
         self.assertEqual(record["cooldowns"]["fixture-b"]["reason"], "auth-expired")
         self.assertEqual(record["cooldowns"]["fixture-b"]["until"], format_until(NOW + 30))
-        self.assertEqual(record["reviews"][0]["verdict"], "skipped")
+
+    def test_offline_failure_with_allow_live_does_not_pick_a_live_provider(self) -> None:
+        calls: list[str] = []
+
+        class Adapter:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def execute(self, request, *, allow_live=False, timeout_seconds=None, runner=None):
+                del timeout_seconds, runner
+                calls.append(f"{self.name}:{request.kind}")
+                if not allow_live:
+                    raise AssertionError("allow_live was not set")
+                if self.name in {"claude", "codex", "grok"}:
+                    raise AssertionError(f"{self.name} was called")
+                if self.name == "fixture":
+                    raise ProviderRateLimited("fixture was rate-limited")
+                return ProviderResult(self.name, ("stub",), "hello from fixture-b", False)
+
+        config = starter_config({"fixture", "fixture-b", "claude", "codex", "grok"})
+        config["review"]["max_rounds"] = 0
+        config["review"]["accept_unreviewed"] = True
+        with tempfile.TemporaryDirectory() as directory:
+            record = run_task(
+                "Say hello",
+                config=config,
+                state_dir=Path(directory),
+                allow_live=True,
+                open_adapter=lambda name: Adapter(name),
+                now=lambda: NOW,
+            )
+        self.assertEqual(calls, ["fixture:execute", "fixture-b:execute"])
+        self.assertEqual(record["provider"], "fixture-b")
+        self.assertEqual(record["status"], "completed")
+        self.assertTrue(record["accepted"])
+
+    def test_live_failure_falls_back_to_another_live_provider(self) -> None:
+        calls: list[str] = []
+
+        class Adapter:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def execute(self, request, *, allow_live=False, timeout_seconds=None, runner=None):
+                del timeout_seconds, runner
+                calls.append(f"{self.name}:{request.kind}")
+                if self.name in {"fixture", "fixture-b"}:
+                    raise AssertionError(f"{self.name} was called")
+                if self.name == "grok" and request.kind == "execute":
+                    raise ProviderRateLimited("grok was rate-limited")
+                return ProviderResult(self.name, ("stub",), "hello from claude", True)
+
+        config = starter_config({"fixture", "fixture-b", "claude", "grok"})
+        config["routing"]["weights"]["grok"] = 3
+        config["routing"]["weights"]["claude"] = 2
+        config["review"]["max_rounds"] = 0
+        config["review"]["accept_unreviewed"] = True
+        with tempfile.TemporaryDirectory() as directory:
+            record = run_task(
+                "Say hello",
+                config=config,
+                state_dir=Path(directory),
+                allow_live=True,
+                open_adapter=lambda name: Adapter(name),
+                now=lambda: NOW,
+            )
+        self.assertEqual(calls, ["grok:execute", "claude:execute"])
+        self.assertEqual(record["provider"], "claude")
+        self.assertEqual(record["status"], "completed")
 
     def test_large_diff_is_clipped_before_the_adapter(self) -> None:
         token = "LARGE-DIFF-TOKEN"

@@ -1,7 +1,8 @@
 """Separate assistant text from headless JSON streams.
 
-Tool output and reasoning chunks are not the assistant text. A stream with
-no assistant text becomes an empty string, not the raw JSON.
+Tool output and reasoning chunks are not the assistant text. Claude Code
+stream-json text is the assistant message content, not the result string.
+A stream with no assistant text becomes an empty string, not the raw JSON.
 """
 
 from __future__ import annotations
@@ -38,6 +39,9 @@ def assistant_text(raw: str) -> str:
             and item["text"].strip()
         ):
             return item["text"]
+    claude = _claude_text(events)
+    if claude:
+        return claude
     for event in reversed(events):
         for key in ("text", "result"):
             value = event.get(key)
@@ -58,6 +62,32 @@ def _object(line: str) -> dict | None:
     if isinstance(payload, dict):
         return payload
     return None
+
+
+def _claude_text(events: list[dict]) -> str:
+    """Join Claude ``assistant`` message content. The result string is ignored."""
+
+    parts: list[str] = []
+    for event in events:
+        if event.get("type") != "assistant":
+            continue
+        message = event.get("message")
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            if content.strip():
+                parts.append(content)
+            continue
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "text":
+                continue
+            value = block.get("text")
+            if isinstance(value, str) and value.strip():
+                parts.append(value)
+    return "".join(parts)
 
 
 def _grok_text(events: list[dict]) -> str:

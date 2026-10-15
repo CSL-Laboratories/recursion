@@ -301,7 +301,8 @@ class HarnessTests(unittest.TestCase):
             bindir.mkdir()
             home.mkdir()
             (bindir / "claude").write_text("", encoding="utf-8")
-            header, body = _load_fixture("claude-auth-status-exit-1.txt")
+            header, body = _load_fixture("claude-auth-status-redaction.txt")
+            self.assertIn(SECRET, body)
 
             def run(argv, timeout):
                 del timeout
@@ -494,6 +495,7 @@ class HarnessTests(unittest.TestCase):
             names,
             [
                 "claude-auth-status-exit-1.txt",
+                "claude-auth-status-redaction.txt",
                 "claude-auth-status.txt",
                 "claude-stream-json.txt",
                 "codex-cumulative.txt",
@@ -537,6 +539,14 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(cumulative["output_tokens"], 4000)
 
         claude_stream = (FIXTURE_DIR / "claude-stream-json.txt").read_text(encoding="utf-8")
+        claude_events = [
+            json.loads(line) for line in claude_stream.splitlines() if line.startswith("{")
+        ]
+        claude_content = claude_events[0]["message"]["content"][0]["text"]
+        claude_result = claude_events[1]["result"]
+        self.assertNotEqual(claude_content.strip(), claude_result.strip())
+        self.assertNotIn("VERDICT", claude_result)
+        self.assertEqual(assistant_text(claude_stream), claude_content)
         self.assertEqual(parse_verdict(claude_stream)[0], "approve")
         claude_usage = parse_usage(claude_stream)
         self.assertEqual(claude_usage["input_tokens"], 150)
@@ -545,6 +555,7 @@ class HarnessTests(unittest.TestCase):
 
         self._doctor_reads_auth_fixture("claude-auth-status.txt")
         self._doctor_reads_auth_fixture("claude-auth-status-exit-1.txt", raw=True)
+        self._doctor_reads_auth_fixture("claude-auth-status-redaction.txt")
 
     def _doctor_reads_auth_fixture(self, name: str, *, raw: bool = False) -> None:
         header, body = _load_fixture(name)

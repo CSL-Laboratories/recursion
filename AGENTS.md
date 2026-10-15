@@ -95,10 +95,10 @@ Linear MCP or the Devin Linear integration. Do not start code without `CSL-N`.
 
 **Direction and architecture.** When you are the assignee (developer or their
 coding agent working in the repo) of an issue that needs a decision or sets
-direction, run Parallel Task API deep research before proposing or deciding, in
-addition to Search/Extract. Post the cited brief (options, tradeoffs,
-recommendation, target metrics) on the Linear issue, then decide or @mention
-for approval.
+direction, run Parallel Task API deep research before proposing, in addition
+to Search/Extract. Post the cited brief (options, tradeoffs, recommendation,
+target metrics) on the Linear issue. The developer decides, or @mentions the
+approver; a coding agent @mentions its developer and does not decide.
 
 **Filing and shipping.**
 
@@ -188,8 +188,11 @@ CODEX-GATE: MEDIATE
   Fixer run (`devin-review-fix`). The fixer only addresses Devin threads.
 - **READY** — no fixer; apply the `ci:full` label so the full CI matrix runs.
 - **MEDIATE** — Devin and Claude are stuck; hand off to
-  `.github/workflows/stuck-thread-watch.yml`. Do not push, merge, or resolve
-  threads.
+  `.github/workflows/stuck-thread-watch.yml` for this PR. The watcher still
+  applies its own stuck rules (Claude said it needs a human, or the thread
+  has been open more than six hours after Claude's last reply), so a MEDIATE
+  on fresh threads usually does nothing until a later scheduled run — it is
+  not an immediate `@codex review`. Do not push, merge, or resolve threads.
 
 Do not omit the verdict line. A human `@claude` mention still runs the mention
 fixer immediately and bypasses the per-PR daily fixer cap (3 batched fixer

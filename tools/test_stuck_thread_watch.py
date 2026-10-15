@@ -846,7 +846,22 @@ class ScanTests(unittest.TestCase):
         self.assertEqual(len(lin.updated), 1)
         self.assertEqual(lin.updated[0][0], "iss_author")
         self.assertIn(mod.rollup_marker(p), lin.updated[0][1])
+        self.assertIn(
+            "Filed by the PR author after a missed watcher cycle.", lin.updated[0][1]
+        )
         self.assertEqual(counters.linear, 0)
+
+    def test_author_notes_survive_later_runs(self) -> None:
+        t = thread(tid="PRRT_hand", comments=stuck_pair())
+        p = pull(threads=[t])
+        first = mod.linear_description(
+            p, [(t, "stuck-human")], cfg(), previous="Decision: defer to Lucas."
+        )
+        second = mod.linear_description(
+            p, [(t, "stuck-human")], cfg(), previous=first
+        )
+        self.assertEqual(second.count("Decision: defer to Lucas."), 1)
+        self.assertIn(mod.NOTES_HEADING, second)
 
 
     def test_collect_connection_nodes_keeps_later_claude_reply(self) -> None:

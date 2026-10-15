@@ -425,6 +425,11 @@ HUMAN_DECISION_RE = re.compile(
 DEFAULT_HUMAN_DECISION = (
     "_(Record the merge decision here. The watcher preserves this section.)_"
 )
+NOTES_HEADING = "## Author notes"
+NOTES_RE = re.compile(
+    r"## Author notes\n\n(.*?)(?=\n## Stuck threads|\Z)",
+    re.DOTALL,
+)
 TERMINAL_STATES = frozenset({"canceled", "completed"})
 
 
@@ -459,6 +464,15 @@ def existing_human_decision(description: str) -> str:
     if not match:
         return ""
     return match.group(1).strip()
+
+
+def existing_author_notes(description: str, marker: str) -> str:
+    """Free-form text to carry forward when rebuilding a roll-up description."""
+    text = description or ""
+    if marker in text:
+        match = NOTES_RE.search(text)
+        return match.group(1).strip() if match else ""
+    return text.strip()
 
 
 def is_approved_on_head_with_green_checks(pull: Pull) -> bool:
@@ -520,6 +534,8 @@ def linear_description(
     marker = rollup_marker(pull)
     checked = parse_checked_thread_ids(previous)
     human = existing_human_decision(previous) or DEFAULT_HUMAN_DECISION
+    notes = existing_author_notes(previous, marker)
+    notes_block = f"{NOTES_HEADING}\n\n{notes}\n\n" if notes else ""
     items = []
     for thread, reason in stuck:
         loc = location(thread.path, thread.line)
@@ -536,6 +552,7 @@ def linear_description(
         "One roll-up for stuck Devin/Claude threads on this PR. Codex mediates "
         "(MEDIATE updates this checklist). Do **not** file a Linear issue per "
         "thread. A human decides.\n\n"
+        f"{notes_block}"
         "## Stuck threads\n\n"
         f"{checklist}\n\n"
         "## Human decision\n\n"

@@ -808,7 +808,11 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(again["provider"], "fixture-b")
             self.assertNotIn("fixture:execute", calls)
             self.assertIn("fixture-b:execute", calls)
-            self.assertNotIn("fixture", CooldownStore(state / "cooldowns.json").active(NOW + 10**9))
+            reset = 1_791_966_900  # 2026-10-14T08:35:00Z
+            store = CooldownStore(state / "cooldowns.json")
+            self.assertIn("fixture", store.active(reset - 1))
+            self.assertNotIn("fixture", store.active(reset + 1))
+            self.assertNotIn("fixture", store.active(NOW + 10**9))
 
     def test_quota_and_auth_fall_back_without_a_live_provider(self) -> None:
         calls: list[str] = []

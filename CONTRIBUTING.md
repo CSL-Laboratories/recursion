@@ -43,6 +43,16 @@ For a research or evidence task:
   `state/DECISIONS.md`, `scripts/`, `schemas/` and `.env` are protected paths — a change
   there needs an explicitly approved control-plane authoring session, not a product PR.
 
+## Review loop
+
+Devin reviews. Claude (`.github/workflows/claude.yml`) fixes Devin findings on
+same-repo member PRs. Unresolved Devin threads that Claude cannot settle are
+picked up by
+[`.github/workflows/stuck-thread-watch.yml`](.github/workflows/stuck-thread-watch.yml),
+which asks Codex to mediate (`@codex review`) and files a Linear Triage issue
+labelled `needs-decision`. Humans decide. The watcher never resolves threads,
+pushes, or merges.
+
 ## Run a gate
 
 From the repository root, with Python 3.11+ and Git, run the gate named by your task. The

@@ -44,6 +44,22 @@ File follow-ups to **Triage**. Keep the Linear issue current as work progresses,
 anything that comes up in a session to **Triage** instead of dropping it; Linear is the
 primary async channel, alongside Google Meet and Discord.
 
+## When Claude can't fix a review thread
+
+Devin reviews only and never fixes, so a thread is never handed back to Devin. Claude
+leaves the thread open, replies explaining why it couldn't fix it, and @mentions the PR
+author.
+
+The CSL Observability stuck-thread watcher — an external Grok Bot routine, not a GitHub
+workflow — then scans open PRs on a schedule and files a Linear issue in **Triage** titled
+`Stuck PR thread: repo#PR – topic`, labeled `needs-decision`, and linked to the PR's
+`CSL-N` issue. It runs outside this repository, so it will not appear in
+`.github/workflows` and reviewers should not look for it in-repo. For urgent cases the PR
+author may also file one by hand.
+
+Before merging any PR, check Linear for open `Stuck PR thread` issues tied to it, and
+resolve them or record the decision first.
+
 ## Branch and review flow
 
 - Branch from up-to-date `master`: `loop/work/<task-id>` for build output.

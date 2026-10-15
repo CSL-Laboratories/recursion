@@ -14,4 +14,5 @@ Fixes CSL-___
 - [ ] Perf impact noted (or N/A)
 - [ ] Devin review completed on the current head commit
 - [ ] All review threads resolved (or answered with rationale)
+- [ ] Linear checked for open `Stuck PR thread` issues on this PR
 - [ ] Tests run locally and/or green in CI (name the commands)

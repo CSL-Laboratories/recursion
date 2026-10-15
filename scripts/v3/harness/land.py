@@ -13,7 +13,7 @@ from scripts.v3.harness.state import load_run, save_run
 
 
 _PROTECTED = {"master", "main"}
-_SHA = re.compile(r"^[0-9a-f]{40}$")
+_SHA = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 
 
 class _Conflict(Exception):

@@ -19,7 +19,7 @@ from scripts.v3.harness.usage import add_usage, empty_usage, exceeded, parse_usa
 
 
 RECORD_LIMIT = 8000
-_SHA = re.compile(r"^[0-9a-f]{40}$")
+_SHA = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 
 
 def run_task(
@@ -266,24 +266,27 @@ def _branch_tip(repo: Path | None, branch: str) -> str | None:
 
     if repo is None:
         return None
-    completed = subprocess.run(
-        [
-            "git",
-            "--no-pager",
-            "-c",
-            "core.longpaths=true",
-            "rev-parse",
-            "--verify",
-            "--end-of-options",
-            f"refs/heads/{branch}",
-        ],
-        cwd=repo,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            [
+                "git",
+                "--no-pager",
+                "-c",
+                "core.longpaths=true",
+                "rev-parse",
+                "--verify",
+                "--end-of-options",
+                f"refs/heads/{branch}",
+            ],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError:
+        return None
     if completed.returncode != 0:
         return None
     sha = completed.stdout.strip()

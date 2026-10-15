@@ -33,6 +33,11 @@ the test fails if the parser reads `result`. Separate assistant messages are
 joined with a newline for the displayed text. The verdict uses only the
 last assistant message that has text (`claude_last_message`). No verdict
 line in that message is revise, even when an earlier message said approve.
+A later verdict inside that same message wins, so
+`Fix X.` / `VERDICT approve` / `Actually no.` / `VERDICT revise` is revise.
+Notes put that message's non-verdict lines first. Earlier feedback fills
+whatever is left under the 1000-character note limit. Every `VERDICT` line
+is dropped from the notes, including a superseded verdict in the final message.
 An empty trailing message does not count. Inside one message, a `tool_use`
 block starts the next text on a new line, and an empty text block after
 that tool call keeps the break so a later `VERDICT` line stays readable. A

@@ -40,8 +40,19 @@ def parse_verdict(text: str) -> tuple[str, str]:
         if last is None:
             kept = lines[:index] + lines[index + 1 :]
         else:
-            # Verdict comes from the last message; notes keep earlier feedback.
-            kept = [line for line in full if _VERDICT.fullmatch(line) is None]
+            # Verdict comes from the last message. Its notes come first so a
+            # long earlier message cannot crowd them out of NOTE_LIMIT.
+            final = [
+                line
+                for pos, line in enumerate(lines)
+                if pos != index and _VERDICT.fullmatch(line) is None
+            ]
+            earlier = [
+                line
+                for line in full[: max(len(full) - len(lines), 0)]
+                if _VERDICT.fullmatch(line) is None
+            ]
+            kept = final + earlier
         return match.group(1).lower(), "\n".join(kept)[:NOTE_LIMIT]
     return "revise", "reviewer returned an unreadable verdict"
 

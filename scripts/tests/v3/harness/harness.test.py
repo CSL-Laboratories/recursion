@@ -565,6 +565,32 @@ class HarnessTests(unittest.TestCase):
             parse_verdict(feedback_first),
             ("revise", "Restore the missing error branch."),
         )
+        crowded = "\n".join(
+            json.dumps(
+                {"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}
+            )
+            for text in ("x" * 1100, "Change the error branch.\nVERDICT revise")
+        )
+        verdict, notes = parse_verdict(crowded)
+        self.assertEqual(verdict, "revise")
+        self.assertTrue(notes.startswith("Change the error branch."))
+        flipped = json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Fix X.\nVERDICT approve\nActually no.\nVERDICT revise",
+                        }
+                    ]
+                },
+            }
+        )
+        flipped_verdict, flipped_notes = parse_verdict(flipped)
+        self.assertEqual(flipped_verdict, "revise")
+        self.assertEqual(flipped_notes, "Fix X.\nActually no.")
+        self.assertNotIn("VERDICT", flipped_notes)
         stale_verdict = "\n".join(
             json.dumps(
                 {"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}

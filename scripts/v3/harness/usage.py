@@ -51,8 +51,10 @@ def codex_session_meter(text: str) -> dict:
 
     The reading is a cumulative session total (``CODEX_SESSION_METER``).
     Events in this stream are not summed. A stream with no such usage stays
-    unknown. A later ``turn.completed`` that omits usage keeps the earlier
-    total as a lower bound on spend. Callers may add totals from separate exec processes that do not
+    unknown.     A later ``turn.completed`` that omits usage keeps the earlier
+    total as a lower bound on spend. A later turn that reports only some
+    fields replaces those fields and keeps the earlier value for the rest.
+    Callers may add totals from separate exec processes that do not
     resume or fork the same session.
     """
 
@@ -62,9 +64,10 @@ def codex_session_meter(text: str) -> dict:
             continue
         parsed = _from_event(payload)
         # The total is cumulative, so an earlier reading is a lower bound on
-        # spend. A later turn without usage must not erase it from the budget.
+        # spend. A later turn without usage must not erase it. A later turn
+        # that reports only some fields replaces those fields only.
         if parsed is not None:
-            found = parsed
+            found = _keep_reported(found, parsed)
     return found
 
 
@@ -79,6 +82,16 @@ def _objects(text: str):
             continue
         if isinstance(payload, dict):
             yield payload
+
+
+def _keep_reported(previous: dict, parsed: dict) -> dict:
+    """Replace only the fields a later reading actually reported."""
+
+    merged = dict(previous)
+    for key in ("input_tokens", "output_tokens", "cost"):
+        if parsed.get(key) is not None:
+            merged[key] = parsed[key]
+    return merged
 
 
 def add_usage(total: dict, extra: dict) -> dict:

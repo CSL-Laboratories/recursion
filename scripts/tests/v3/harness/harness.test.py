@@ -204,6 +204,21 @@ class HarnessTests(unittest.TestCase):
             {"type": "turn.completed", "usage": {"input_tokens": 1200, "output_tokens": 4}}
         )
         self.assertEqual(codex_session_meter(recovered)["input_tokens"], 1200)
+        self.assertEqual(codex_session_meter(recovered)["output_tokens"], 4)
+
+    def test_codex_meter_keeps_an_omitted_field_from_the_earlier_total(self) -> None:
+        partial = "\n".join(
+            (
+                json.dumps(
+                    {"type": "turn.completed", "usage": {"input_tokens": 900, "output_tokens": 10}}
+                ),
+                json.dumps({"type": "turn.completed", "usage": {"output_tokens": 12}}),
+            )
+        )
+        usage = codex_session_meter(partial)
+        self.assertEqual(usage["input_tokens"], 900)
+        self.assertEqual(usage["output_tokens"], 12)
+        self.assertIsNone(usage["cost"])
 
     def test_grok_stream_verdict_is_approve_when_the_first_line_is_json(self) -> None:
         self.assertTrue(GROK_APPROVE.splitlines()[0].startswith("{"))

@@ -193,7 +193,7 @@ never a substitute for those actions.
 - `proposals` retains named approval packets. Each packet has `id`, `linear_issue`, `scope`,
   `contract_bindings` (`id`, `revision`, `sha256`) and `authorizations` (`action`,
   `target`, `target_digest`). The supported actions are `accept_contract`,
-  `develop_work`, `decide_capability`, and `admit_work`; the target is the exact
+  `develop_work`, `decide_capability`, `admit_work`, and `accept_no_rollback`; the target is the exact
   contract, issue, capability, or program ID. Scope contains every authorized target.
   The receipt and proposal must name the matching work issue or the explicit
   `decision_issue` on the contract, capability or admission envelope.
@@ -209,11 +209,15 @@ never a substitute for those actions.
   decisions and historical packets remain stored without granting authority.
 - `target_digest` pins the target's current fields, excluding only lifecycle fields:
   contract status/receipt; work status/stage/receipts/candidate/verification links;
-  capability maturity/target, evidence links, receipt and candidate commit;
+  capability maturity/target, evidence links, receipts and candidate commit;
   admission receipt/occupancy. Unknown links and checkpoint requirements remain bound.
   All other fields remain bound. Candidate changes require fresh verification;
   contract or scope changes require a new human receipt. Updating a receipt digest
   without a new human approval comment is forbidden, even if structurally valid.
+- `implementation_issue` and every work ID must have the `CSL-N` form. The
+  implementation issue must identify an existing work item whose parent matches
+  the program's `parent_issue`. This checks declared lineage offline, not whether
+  the issue actually exists in Linear; reviewers must corroborate the issue links.
 - Accepted contracts reference their `decision_receipt`. Developing consumers pin
   the same receipt in `contract_receipts`, keyed by contract ID. Human-gated work
   also requires its own applicable `develop_work` receipt, regardless of the legacy
@@ -269,12 +273,39 @@ never a substitute for those actions.
   At `provider_free_verified` and above, `independent` must be boolean true.
   These records attest the claimed tier's cumulative checks; they do not authorize
   live runs. Historical/candidate evidence may stay linked but cannot promote.
+- Qualified claims also require capability-approval-bound `qualification_requirements`
+  keyed by tier. Each profile contains `evidence_class` and a structured `environment`
+  with nonempty `id`, `execution_class`, and full `configuration_sha256`.
+  `locally_qualified` requires `local_observation` / `local_runtime`;
+  `release_qualified` requires `release_evidence` / `release_runtime`.
+  Evidence must exactly match its approved class and environment profile. The same
+  requirement applies to qualified composed checkpoint and recovery/rollback proof.
+  A synthetic or provider-free fixture is not runtime qualification merely because
+  its kind or environment label changes. Real local qualification may run without
+  providers; these classes do not require or authorize paid/live calls. The seed's
+  profiles remain null pending a decision about actual qualification environments.
+- Release claims require approval-bound `release_requirements`: a nonempty
+  `recovery_command`, plus `rollback_command` or a stated `no_rollback_boundary`.
+  The release row binds their full `release_requirements_digest` and links
+  `recovery_evidence_ids` and `rollback_evidence_ids`. Each successful current
+  independent proof has kind `recovery` or `rollback` and binds the same capability,
+  exact candidate, release tier, requirements digest, matching command, current
+  contracts, qualified environment/class, and artifact digest. A command or plan
+  alone is not a tested result. Requirements left null block release qualification.
+- A nonempty `no_rollback_boundary` requires the capability's `no_rollback_receipt`
+  to authorize the separate `accept_no_rollback` action on that capability. Its
+  target digest pins capability ID, candidate commit, contract IDs, qualification
+  profiles and release requirements; the packet also pins current contract revisions
+  and digests. A generic capability approval cannot grant this exception. A changed
+  candidate, profile, contract or boundary invalidates it. This waives rollback
+  proof only; recovery proof remains mandatory. Any broader exemption needs an
+  explicit owner policy and is not inferred here. No exception is present in the seed.
 - Research requirements always include `question`, `source_class`, `quota_class`,
   `stop_condition`, and `evidence_artifact`. Any recorded `research_plan` must
   supply them, and active/completed research work cannot omit its plan. Issue authors
   must use the budget and discretion prompts in the
   issue template. The checker does not read or authorize external research jobs.
 
-The seed stays candidate/researched, with open unknowns, a pending checkpoint tier, pending acceptance and
+The seed stays candidate/researched, with open unknowns, pending checkpoint/qualification/release requirements, pending acceptance and
 empty admission occupancy. No accepted receipt or successful verification is
 invented to make the example pass.

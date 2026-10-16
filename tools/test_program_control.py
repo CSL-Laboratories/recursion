@@ -36,6 +36,7 @@ class ProgramControlTests(unittest.TestCase):
         targets = {"accept_contract": {c["id"]: c for c in self.data["contracts"]},
                    "develop_work": {w["id"]: w for w in self.data["work_items"]},
                    "decide_capability": {c["id"]: c for c in self.data["capabilities"]},
+                   "accept_no_rollback": {c["id"]: c for c in self.data["capabilities"]},
                    "admit_work": {self.data["program_id"]: self.data["admission"]}}
         contract_ids = set()
         unknown_ids = set()
@@ -81,6 +82,18 @@ class ProgramControlTests(unittest.TestCase):
         capability = self.data["capabilities"][0]
         # Fixture-only policy; the checked-in seed deliberately leaves this unset.
         capability["checkpoint_requirements"][0]["required_from_tier"] = "release_qualified"
+        # These declared runtime profiles and receipts are synthetic test data,
+        # never real qualification results and never persisted to the seed.
+        capability["qualification_requirements"] = {
+            tier: {"evidence_class": evidence_class, "environment": {
+                "id": f"test-only-{tier}", "execution_class": execution_class,
+                "configuration_sha256": "e" * 64}}
+            for tier, evidence_class, execution_class in (
+                ("locally_qualified", "local_observation", "local_runtime"),
+                ("release_qualified", "release_evidence", "release_runtime"))}
+        capability["release_requirements"] = {"recovery_command": "fixture recover",
+                                             "rollback_command": "fixture rollback",
+                                             "no_rollback_boundary": None}
         for unknown in self.data["unknowns"]:
             unknown.update(status="resolved", resolution_evidence="Synthetic fixture only")
         for contract in self.data["contracts"]:
@@ -96,9 +109,24 @@ class ProgramControlTests(unittest.TestCase):
                    status="current", tier=tier, kind=kinds.get(tier, "candidate"), independent=True,
                    artifact_sha256="b" * 64,
                    contract_bindings=[checker.contract_binding(c) for c in self.data["contracts"]])
+        if tier in capability["qualification_requirements"]:
+            row.update(copy.deepcopy(capability["qualification_requirements"][tier]))
         if tier == "release_qualified":
+            self.prove_release(capability, row)
             self.close_checkpoint(capability)
         return capability, row
+
+    def prove_release(self, capability, release_row):
+        release_row["release_requirements_digest"] = checker.digest(capability["release_requirements"])
+        for kind in ("recovery", "rollback"):
+            row = copy.deepcopy(release_row)
+            row.pop("recovery_evidence_ids", None)
+            row.pop("rollback_evidence_ids", None)
+            row.update(id=f"evidence.{kind}-{len(self.data['evidence'])}", kind=kind,
+                       acceptance_command=capability["release_requirements"][f"{kind}_command"],
+                       release_requirements_digest=checker.digest(capability["release_requirements"]))
+            release_row[f"{kind}_evidence_ids"] = [row["id"]]
+            self.data["evidence"].append(row)
 
     def verify_work(self, item, candidate="a" * 40):
         if item["status"] not in checker.DONE:
@@ -136,6 +164,9 @@ class ProgramControlTests(unittest.TestCase):
                "work_bindings": [checker.work_binding(w, {item["id"]: item for item in self.data["work_items"]})
                                  for w in self.data["work_items"]
                                  if w["id"] in checkpoint["work_item_ids"]]}
+        profile = capability.get("qualification_requirements", {}).get(capability["current_maturity"])
+        if profile:
+            row.update(copy.deepcopy(profile))
         self.data["evidence"].append(row)
         return row
 
@@ -669,6 +700,151 @@ class ProgramControlTests(unittest.TestCase):
         self.assert_rejected("requires closed checkpoint")
         self.close_checkpoint(cap)
         self.assertEqual(self.errors(), [])
+
+    def test_qualified_tiers_reject_synthetic_or_unclassified_evidence(self):
+        for tier in ("locally_qualified", "release_qualified"):
+            for evidence_class in (None, "synthetic_fixture", "provider_free_fixture", "source_documented", "live_qualification"):
+                with self.subTest(tier=tier, evidence_class=evidence_class):
+                    self.setUp()
+                    _, row = self.promote(tier)
+                    row["evidence_class"] = evidence_class
+                    self.assert_rejected("qualification requires approved environment/class")
+
+    def test_qualification_environment_must_match_approved_structured_profile(self):
+        for tier in ("locally_qualified", "release_qualified"):
+            for environment in ("synthetic", "provider-free fixtures", None, {},
+                                {"id": "other", "execution_class": "local_runtime", "configuration_sha256": "d" * 64}):
+                with self.subTest(tier=tier, environment=environment):
+                    self.setUp()
+                    _, row = self.promote(tier)
+                    row["environment"] = environment
+                    self.assert_rejected("qualification requires approved environment/class")
+
+    def test_pending_qualification_profile_blocks_only_qualified_claim(self):
+        cap, _ = self.promote("locally_qualified")
+        cap["qualification_requirements"]["locally_qualified"] = None
+        self.data["decisions"][-1]["status"] = "superseded"
+        cap["decision_receipt"] = self.approve([("decide_capability", cap["id"])])
+        self.assert_rejected("qualification requires approved environment/class")
+        cap["current_maturity"] = "contract_frozen"
+        self.assertEqual(self.errors(), [])
+
+    def test_profile_changes_invalidate_approval_even_with_matching_new_evidence(self):
+        cap, row = self.promote("locally_qualified")
+        cap["qualification_requirements"]["locally_qualified"]["environment"]["configuration_sha256"] = "f" * 64
+        row.update(copy.deepcopy(cap["qualification_requirements"]["locally_qualified"]))
+        self.assert_rejected("stale authorization target")
+
+    def test_profile_cannot_authorize_synthetic_class_or_missing_environment_identity(self):
+        for field, value in (("evidence_class", "synthetic_fixture"), ("execution_class", "synthetic"),
+                             ("configuration_sha256", "branch"), ("id", "")):
+            with self.subTest(field=field):
+                self.setUp()
+                cap, row = self.promote("locally_qualified")
+                profile = cap["qualification_requirements"]["locally_qualified"]
+                (profile if field == "evidence_class" else profile["environment"])[field] = value
+                row.update(copy.deepcopy(profile))
+                self.data["decisions"][-1]["status"] = "superseded"
+                cap["decision_receipt"] = self.approve([("decide_capability", cap["id"])])
+                self.assert_rejected("qualification requires approved environment/class")
+
+    def test_qualified_composition_cannot_use_lower_evidence_class(self):
+        self.promote("release_qualified")
+        self.data["evidence"][-1]["evidence_class"] = "synthetic_fixture"
+        self.assert_rejected("requires closed checkpoint")
+
+    def test_release_requires_both_recovery_and_rollback_proof(self):
+        for key, value in (("recovery_evidence_ids", []), ("rollback_evidence_ids", []),
+                           ("recovery_evidence_ids", ["missing"]), ("release_requirements_digest", "f" * 64)):
+            with self.subTest(key=key):
+                self.setUp()
+                _, row = self.promote("release_qualified")
+                row[key] = value
+                self.assert_rejected("release requires tested recovery and rollback")
+
+    def test_recovery_and_rollback_proof_bind_current_release_scope(self):
+        variants = {"candidate_commit": "d" * 40, "capability_id": "capability.other", "tier": "locally_qualified",
+                    "result": "fail", "status": "obsolete", "independent": 1, "kind": "prototype",
+                    "acceptance_command": "different", "release_requirements_digest": "f" * 64,
+                    "contract_bindings": [], "evidence_class": "synthetic_fixture", "environment": "provider-free",
+                    "artifact": "", "artifact_sha256": "bad"}
+        for kind in ("recovery", "rollback"):
+            for key, value in variants.items():
+                with self.subTest(kind=kind, key=key):
+                    self.setUp()
+                    self.promote("release_qualified")
+                    row = next(e for e in self.data["evidence"] if e["kind"] == kind)
+                    row[key] = value
+                    self.assert_rejected("release requires tested recovery and rollback")
+
+    def no_rollback_fixture(self):
+        cap, row = self.promote("release_qualified")
+        cap["release_requirements"].update(rollback_command=None, no_rollback_boundary="Fixture-only irreversible boundary")
+        self.data["decisions"][-1]["status"] = "superseded"
+        cap["decision_receipt"] = self.approve([("decide_capability", cap["id"])])
+        self.prove_release(cap, row)
+        row["rollback_evidence_ids"] = []
+        return cap, row
+
+    def test_no_rollback_requires_separate_explicit_human_authorization(self):
+        cap, row = self.no_rollback_fixture()
+        self.assert_rejected("release requires tested recovery and rollback")
+        cap["no_rollback_receipt"] = cap["decision_receipt"]
+        self.assert_rejected("release requires tested recovery and rollback")
+        cap["no_rollback_receipt"] = self.approve([("accept_no_rollback", cap["id"])])
+        self.assertEqual(self.errors(), [])
+        row["recovery_evidence_ids"] = []
+        self.assert_rejected("release requires tested recovery and rollback")
+
+    def test_no_rollback_receipt_is_bound_to_candidate_boundary_and_profile(self):
+        for field in ("candidate_commit", "boundary", "profile", "contract"):
+            with self.subTest(field=field):
+                self.setUp()
+                cap, _ = self.no_rollback_fixture()
+                cap["no_rollback_receipt"] = self.approve([("accept_no_rollback", cap["id"])])
+                self.assertEqual(self.errors(), [])
+                if field == "candidate_commit":
+                    cap[field] = "d" * 40
+                elif field == "boundary":
+                    cap["release_requirements"]["no_rollback_boundary"] = "Changed boundary"
+                elif field == "profile":
+                    cap["qualification_requirements"]["release_qualified"]["environment"]["id"] = "Changed environment"
+                else:
+                    self.data["contracts"][0]["revision"] += 1
+                self.assert_rejected("stale")
+                self.assert_rejected("release requires tested recovery and rollback")
+
+    def test_pending_release_requirements_cannot_claim_release(self):
+        cap, _ = self.promote("release_qualified")
+        cap["release_requirements"] = None
+        self.assert_rejected("release requires tested recovery and rollback")
+
+    def test_consistently_renamed_non_linear_implementation_is_rejected(self):
+        self.data["implementation_issue"] = "not-linear"
+        self.data["work_items"][0]["id"] = "not-linear"
+        self.data["integration_checkpoints"][0]["work_item_ids"] = ["not-linear"]
+        self.assert_rejected("implementation_issue must be a CSL issue")
+        self.assert_rejected("work item not-linear must be a CSL issue")
+
+    def test_implementation_must_crosslink_existing_work_with_matching_parent(self):
+        self.data["implementation_issue"] = "CSL-999"
+        self.assert_rejected("implementation_issue must reference a work item")
+        item = copy.deepcopy(self.data["work_items"][0])
+        item.update(id="CSL-999", parent="CSL-998")
+        self.data["work_items"].append(item)
+        self.assert_rejected("implementation work parent must match parent_issue")
+        item["parent"] = self.data["parent_issue"]
+        self.assertEqual(self.errors(), [])
+
+    def test_all_work_ids_and_implementation_identifier_are_validated(self):
+        item = copy.deepcopy(self.data["work_items"][0])
+        item["id"] = "untracked"
+        self.data["work_items"].append(item)
+        self.assert_rejected("work item untracked must be a CSL issue")
+        for value in (None, 204, [], "csl-204", "CSL-204extra"):
+            with self.subTest(value=value):
+                self.data["implementation_issue"] = value
+                self.assert_rejected("implementation_issue must be a CSL issue")
 
 
 if __name__ == "__main__":

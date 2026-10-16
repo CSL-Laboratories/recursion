@@ -76,7 +76,7 @@
       "revision": 1,
       "status": "candidate",
       "path": "docs/v3/program-control/MONTH-PROGRAM.md",
-      "sha256": "981c75ff5a39c2d6015cb7c0bf3af8b1fdc0355c9b8619d5aaddf0781241dc1f",
+      "sha256": "0a76ef12b7e928ee30e0c01c6aa4e41b23e072c9ff83e67c8272dd2b64820b51",
       "decision_issue": "CSL-204"
     }
   ],
@@ -178,7 +178,13 @@
           "checkpoint_id": "checkpoint.program-control",
           "required_from_tier": null
         }
-      ]
+      ],
+      "qualification_requirements": {
+        "locally_qualified": null,
+        "release_qualified": null
+      },
+      "release_requirements": null,
+      "no_rollback_receipt": null
     }
   ],
   "evidence": [

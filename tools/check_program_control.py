@@ -41,13 +41,16 @@ def contract_binding(contract: dict[str, Any]) -> dict[str, Any]:
 
 
 def target_digest(action: str, target: dict[str, Any]) -> str:
+    if action == "accept_no_rollback":
+        return digest({key: target.get(key) for key in (
+            "id", "candidate_commit", "contract_ids", "qualification_requirements", "release_requirements")})
     # Exclude only observation/lifecycle fields, never the approved work boundary.
     excluded = {
         "accept_contract": {"status", "decision_receipt"},
         "develop_work": {"status", "stage", "decision_receipt", "contract_receipts",
                          "candidate_commit", "verification_evidence_ids"},
         "decide_capability": {"current_maturity", "month_target", "evidence_ids",
-                              "decision_receipt", "candidate_commit"},
+                              "decision_receipt", "candidate_commit", "no_rollback_receipt"},
         "admit_work": {"decision_receipt", "active_contract_consumers", "active_reviews"},
     }
     return digest({key: value for key, value in target.items() if key not in excluded[action]})
@@ -117,6 +120,8 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
         errors.append("schema_version must be 1")
     if not re.fullmatch(r"CSL-[0-9]+", str(data["parent_issue"])):
         errors.append("parent_issue must be a CSL issue")
+    if not isinstance(data["implementation_issue"], str) or not re.fullmatch(r"CSL-[0-9]+", data["implementation_issue"]):
+        errors.append("implementation_issue must be a CSL issue")
     if not re.fullmatch(r"[0-9a-f]{40}", str(data["source_commit"])):
         errors.append("source_commit must be a full lowercase commit hash")
 
@@ -149,6 +154,14 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
     proposals = _ids(data["proposals"], "proposal", errors)
     checkpoints = _ids(data["integration_checkpoints"], "checkpoint", errors)
     _ids(data["risks"], "risk", errors)
+    implementation = work.get(data["implementation_issue"]) if isinstance(data["implementation_issue"], str) else None
+    if implementation is None:
+        errors.append("implementation_issue must reference a work item")
+    elif implementation.get("parent") != data["parent_issue"]:
+        errors.append("implementation work parent must match parent_issue")
+    for item_id in work:
+        if not re.fullmatch(r"CSL-[0-9]+", item_id):
+            errors.append(f"work item {item_id} must be a CSL issue")
 
     for contract_id, contract in contracts.items():
         path = root / str(contract.get("path", ""))
@@ -179,8 +192,28 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
                 and bool(row.get("artifact")) and bool(row.get("environment"))
                 and bool(HEX64.fullmatch(str(row.get("artifact_sha256", "")))))
 
+    def qualification_matches(row: dict[str, Any], capability: dict[str, Any], tier: str) -> bool:
+        classes = {"locally_qualified": ("local_observation", "local_runtime"),
+                   "release_qualified": ("release_evidence", "release_runtime")}
+        if tier not in classes:
+            return True
+        profiles = capability.get("qualification_requirements")
+        profile = profiles.get(tier) if isinstance(profiles, dict) else None
+        if not isinstance(profile, dict):
+            return False
+        evidence_class, execution_class = classes[tier]
+        environment = profile.get("environment")
+        return (profile.get("evidence_class") == evidence_class
+                and isinstance(environment, dict)
+                and isinstance(environment.get("id"), str) and bool(environment["id"].strip())
+                and environment.get("execution_class") == execution_class
+                and bool(HEX64.fullmatch(str(environment.get("configuration_sha256", ""))))
+                and row.get("evidence_class") == evidence_class
+                and row.get("environment") == environment)
+
     targets = {"accept_contract": contracts, "develop_work": work,
-               "decide_capability": capabilities, "admit_work": {data["program_id"]: data["admission"]}}
+               "decide_capability": capabilities, "accept_no_rollback": capabilities,
+               "admit_work": {data["program_id"]: data["admission"]}}
     valid_proposals = set()
     active_proposals = {d.get("proposal_id") for d in decisions.values() if d.get("status") == "approved"}
     for proposal_id, proposal in proposals.items():
@@ -271,6 +304,37 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
         proposal = proposals[decisions[receipt]["proposal_id"]]
         return any(g.get("action") == action and g.get("target") == target
                    for g in proposal["authorizations"])
+
+    def release_supported(row: dict[str, Any], capability: dict[str, Any]) -> bool:
+        requirements = capability.get("release_requirements")
+        if (not isinstance(requirements, dict)
+                or row.get("release_requirements_digest") != digest(requirements)):
+            return False
+
+        def tested(kind: str) -> bool:
+            command = requirements.get(f"{kind}_command")
+            proof_ids = row.get(f"{kind}_evidence_ids")
+            if not isinstance(command, str) or not command.strip() or not isinstance(proof_ids, list):
+                return False
+            return any(isinstance(eid, str) and eid in evidence
+                       and successful_proof(evidence[eid], capability.get("candidate_commit"))
+                       and evidence[eid].get("capability_id") == capability["id"]
+                       and evidence[eid].get("tier") == "release_qualified"
+                       and evidence[eid].get("kind") == kind
+                       and evidence[eid].get("acceptance_command") == command
+                       and evidence[eid].get("release_requirements_digest") == digest(requirements)
+                       and qualification_matches(evidence[eid], capability, "release_qualified")
+                       and bindings_match(evidence[eid].get("contract_bindings"), capability.get("contract_ids", []))
+                       for eid in proof_ids)
+
+        boundary = requirements.get("no_rollback_boundary")
+        if boundary is None:
+            rollback = tested("rollback")
+        else:
+            rollback = (isinstance(boundary, str) and bool(boundary.strip())
+                        and authorized(capability.get("no_rollback_receipt"), "accept_no_rollback", capability["id"]))
+        # A no-rollback boundary waives rollback only, never tested recovery.
+        return tested("recovery") and rollback
 
     for contract_id, contract in contracts.items():
         if contract.get("status") == "accepted" and not authorized(
@@ -471,6 +535,7 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
                                and evidence[eid].get("checkpoint_digest") == checkpoint_binding(checkpoint)["definition_digest"]
                                and evidence[eid].get("capability_id") == capability_id
                                and evidence[eid].get("tier") == current
+                               and qualification_matches(evidence[eid], capability, current)
                                and evidence[eid].get("acceptance_command") == checkpoint.get("acceptance_command")
                                and bindings_match(evidence[eid].get("contract_bindings"),
                                                   sorted(set(checkpoint.get("requires", [])) | set(capability.get("contract_ids", []))))
@@ -492,10 +557,17 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
                         and (not independent or row.get("independent") is True)
                         and bool(row.get("artifact")) and bool(row.get("environment"))
                         and bool(HEX64.fullmatch(str(row.get("artifact_sha256", ""))))
+                        and qualification_matches(row, capability, current)
                         and bindings_match(row.get("contract_bindings"), capability.get("contract_ids", [])))
-            if not any(supports(evidence[eid]) for eid in evidence_ids if eid in evidence):
+            matching = [evidence[eid] for eid in evidence_ids if eid in evidence and supports(evidence[eid])]
+            if not matching:
                 label = "independent verification" if independent else "evidence"
                 errors.append(f"{capability_id} claims {current} without {label} for the current candidate and tier")
+            if current in {"locally_qualified", "release_qualified"} and not any(
+                    qualification_matches(evidence[eid], capability, current) for eid in evidence_ids if eid in evidence):
+                errors.append(f"{capability_id} qualification requires approved environment/class and matching evidence")
+            if current == "release_qualified" and not any(release_supported(row, capability) for row in matching):
+                errors.append(f"{capability_id} release requires tested recovery and rollback or an applicable no-rollback receipt")
         if rank[current] >= rank["contract_frozen"] and not capability.get("contract_ids"):
             errors.append(f"{capability_id} frozen maturity requires linked contracts")
         for contract_id in capability.get("contract_ids", []):

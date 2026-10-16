@@ -259,7 +259,10 @@ class HarnessTests(unittest.TestCase):
             {"type": "turn.completed", "usage": {"input_tokens": 1200, "output_tokens": 4}}
         )
         self.assertEqual(codex_session_meter(recovered)["input_tokens"], 1200)
-        self.assertEqual(codex_session_meter(recovered)["output_tokens"], 4)
+        # CSL-117 Option B. This assertion changed from 4 to 10: the later
+        # output reading is smaller, and the meter keeps the higher value.
+        # Named reviewer: Lucas (@NotSkittlz).
+        self.assertEqual(codex_session_meter(recovered)["output_tokens"], 10)
 
     def test_codex_meter_keeps_an_omitted_field_from_the_earlier_total(self) -> None:
         partial = "\n".join(
@@ -274,6 +277,26 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(usage["input_tokens"], 900)
         self.assertEqual(usage["output_tokens"], 12)
         self.assertIsNone(usage["cost"])
+
+    def test_codex_meter_keeps_the_highest_value_of_each_field(self) -> None:
+        stream = "\n".join(
+            (
+                json.dumps(
+                    {
+                        "type": "turn.completed",
+                        "usage": {"input_tokens": 50, "output_tokens": 10, "cost": 2},
+                    }
+                ),
+                json.dumps(
+                    {"type": "turn.completed", "usage": {"input_tokens": 40, "output_tokens": 4}}
+                ),
+                json.dumps({"type": "turn.completed", "usage": {"output_tokens": 7, "cost": 1}}),
+            )
+        )
+        usage = codex_session_meter(stream)
+        self.assertEqual(usage["input_tokens"], 50)
+        self.assertEqual(usage["output_tokens"], 10)
+        self.assertEqual(usage["cost"], 2.0)
 
     def test_grok_stream_verdict_is_approve_when_the_first_line_is_json(self) -> None:
         self.assertTrue(GROK_APPROVE.splitlines()[0].startswith("{"))

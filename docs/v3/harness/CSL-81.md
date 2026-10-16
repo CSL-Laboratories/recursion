@@ -16,7 +16,7 @@ and live stream below is **locally unmeasured**.
 | CLI | Version checked | Class |
 |---|---|---|
 | Claude Code | Changelog label **2.1.300**, dated 2026-10-14 ([changelog](https://code.claude.com/docs/en/changelog)). The npm page for `@anthropic-ai/claude-code` showed **2.1.296** (page date 2026-10-13) ([npm](https://www.npmjs.com/package/@anthropic-ai/claude-code)). The headless and CLI pages are unversioned living docs. | Source-documented. The two version numbers are different publications, not one install. |
-| Codex | npm `@openai/codex` **0.162.1** checked (page date 2026-10-14) ([npm](https://www.npmjs.com/package/@openai/codex)). Adapter minimum **>= 0.147.0**, the release that added `--approve-for-me`. Usage reports name earlier builds: [openai/codex#17539](https://github.com/openai/codex/issues/17539) (2026-04-12; no build in the excerpt) and [openai/codex#50586](https://github.com/openai/codex/issues/50586) (2026-10-03, source `rust-v0.158.0`). | Source-documented. Behavior of 0.162.1 was not re-measured. The 0.147.0 floor is the cited release note, not a local install. |
+| Codex | npm `@openai/codex` **0.162.1** checked (page date 2026-10-14) ([npm](https://www.npmjs.com/package/@openai/codex)). Unchecked prerequisite **>= 0.147.0** for `--approve-for-me`. Doctor records `--version` and does not compare it to that floor. Usage reports name earlier builds: [openai/codex#17539](https://github.com/openai/codex/issues/17539) (2026-04-12; no build in the excerpt) and [openai/codex#50586](https://github.com/openai/codex/issues/50586) (2026-10-03, source `rust-v0.158.0`). | Source-documented. Behavior of 0.162.1 was not re-measured. The 0.147.0 floor is an unchecked prerequisite from the cited release note, not a doctor check and not a local install. |
 | Grok | No build number on the pages checked. Headless page date 2026-06-10, reference page date 2026-07-21 ([headless](https://docs.x.ai/build/cli/headless-scripting), [reference](https://docs.x.ai/build/cli/reference)). `grok version` is the documented command. | Version **unmeasured**. |
 
 ## Claude Code
@@ -80,25 +80,28 @@ The non-interactive docs recommend it in place of the removed `--full-auto`
 ([non-interactive](https://developers.openai.com/codex/noninteractive)).
 A Codex KB dates the flag to v0.147.0
 ([v0.147.0](https://codex.danielvaughan.com/2026/08/07/codex-cli-v0147-release-approve-for-me-mcp-2026-07-28-project-trust-plugin-search-secrets-redaction/)).
-That page is not OpenAI's changelog. The adapter requires Codex >= 0.147.0.
-The argv is `codex exec --json --approve-for-me`, plus `--cd` when a workspace
-is set, and `-` for the stdin prompt. That argv passes no `--sandbox`.
+That page is not OpenAI's changelog. Codex >= 0.147.0 is an unchecked
+prerequisite for `--approve-for-me`. Doctor records the `--version` line and
+does not compare it to that floor. The argv is
+`codex exec --json --approve-for-me`, plus `--cd` when a workspace is set,
+and `-` for the stdin prompt. That argv passes no `--sandbox`.
 The 0.162.1 binary was not run here.
 
 ## Codex meter
 
-`codex_session_meter` in `scripts/v3/harness/usage.py` keeps the last
-`turn.completed` usage in one `codex exec` stream. The label is
-`cumulative-session-total`.
+`codex_session_meter` in `scripts/v3/harness/usage.py` keeps the highest
+value seen for each field on `turn.completed` in one `codex exec` stream.
+Events in that stream are not summed. The label is `cumulative-session-total`.
 
 Whether those figures are a cumulative session total or one turn is
 **unverified**. The official sample and `exec.md` name the fields and do not
 say which
 ([non-interactive](https://developers.openai.com/codex/noninteractive),
 [exec.md](https://github.com/openai/codex/blob/main/docs/exec.md)).
-A single `exec` run has one turn, so the last completed usage is the reading
-this adapter keeps. The issue reports below claim a session total. They are
-not the official docs, and this repo did not measure a multi-turn exec stream.
+Because that question is unverified, a later smaller reading does not replace
+a larger one. The highest value of each field is the budget lower bound.
+The issue reports below claim a session total. They are not the official
+docs, and this repo did not measure a multi-turn exec stream.
 
 - [openai/codex#17539](https://github.com/openai/codex/issues/17539) (2026-04-12)
   says `turn.completed` reports cumulative session totals. The interactive
@@ -121,9 +124,9 @@ The meter does not use per-turn `last` usage. That field is not in the JSONL.
 It does not sum `turn.completed` events inside one stream: they are snapshots
 of one session. A missing usage stays unknown, including a `turn.failed`
 with no usage object. A later `turn.completed` that omits usage keeps the
-earlier total as a lower bound on spend, so the budget check still sees it.
-A later turn that reports only some fields replaces those fields and keeps
-the earlier value for each omitted field. `turn.failed` does not clear a completed total. `cached_input_tokens` and `reasoning_output_tokens` are
+earlier value as a lower bound on spend, so the budget check still sees it.
+A later turn that reports only some fields updates those fields only, and
+only when the new number is higher. `turn.failed` does not clear a completed total. `cached_input_tokens` and `reasoning_output_tokens` are
 not added into `input_tokens` or `output_tokens`. Whether `input_tokens`
 already includes the cached count is **unmeasured**.
 

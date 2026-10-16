@@ -1,9 +1,9 @@
 """Token and cost figures from provider streams.
 
-Missing figures stay unknown. They are not stored as zero. Codex
-``turn.completed`` usage is a cumulative session total. ``codex_session_meter``
-keeps the last such event and does not sum the stream. The product ceilings
-below are unchanged by that meter.
+Missing figures stay unknown. They are not stored as zero. Whether a Codex
+``turn.completed`` reading is a session total or one turn is unverified.
+``codex_session_meter`` keeps the highest value seen for each field and does
+not sum the stream. The product ceilings below are unchanged by that meter.
 """
 
 from __future__ import annotations
@@ -18,8 +18,8 @@ import json
 DEFAULT_MAX_INPUT_TOKENS = 50_000_000
 DEFAULT_MAX_OUTPUT_TOKENS = 8_000_000
 
-# Last ``turn.completed`` usage in one ``codex exec`` stream. That object is
-# the session total, not one API call. See docs/v3/harness/CSL-81.md.
+# Highest ``turn.completed`` field values in one ``codex exec`` stream.
+# Whether those readings are a session total is unverified. See CSL-81.md.
 CODEX_SESSION_METER = "cumulative-session-total"
 
 
@@ -47,15 +47,15 @@ def parse_usage(text: str) -> dict:
 
 
 def codex_session_meter(text: str) -> dict:
-    """Return the last ``turn.completed`` usage in one Codex exec stream.
+    """Return a budget lower bound from ``turn.completed`` usage in one stream.
 
-    The reading is a cumulative session total (``CODEX_SESSION_METER``).
-    Events in this stream are not summed. A stream with no such usage stays
-    unknown. A later ``turn.completed`` that omits usage keeps the earlier
-    total as a lower bound on spend. A later turn that reports only some
-    fields replaces those fields and keeps the earlier value for the rest.
-    Callers may add totals from separate exec processes that do not
-    resume or fork the same session.
+    Events in this stream are not summed. Whether each reading is a session
+    total or one turn is unverified (``CODEX_SESSION_METER``). Each field
+    keeps the highest value seen, which is the safer lower bound on spend.
+    A stream with no such usage stays unknown. A later ``turn.completed``
+    that omits usage keeps the earlier value. A later turn that reports only
+    some fields updates those fields only. Callers may add totals from
+    separate exec processes that do not resume or fork the same session.
     """
 
     found = empty_usage()
@@ -63,9 +63,8 @@ def codex_session_meter(text: str) -> dict:
         if payload.get("type") != "turn.completed":
             continue
         parsed = _from_event(payload)
-        # The total is cumulative, so an earlier reading is a lower bound on
-        # spend. A later turn without usage must not erase it. A later turn
-        # that reports only some fields replaces those fields only.
+        # An omitted usage object must not erase a known lower bound. A later
+        # reading updates a field only when that field is present and higher.
         if parsed is not None:
             found = _keep_reported(found, parsed)
     return found
@@ -85,12 +84,20 @@ def _objects(text: str):
 
 
 def _keep_reported(previous: dict, parsed: dict) -> dict:
-    """Replace only the fields a later reading actually reported."""
+    """Keep the highest reported value for each field.
+
+    An omitted field keeps the earlier value. A smaller later reading does
+    not replace a larger one.
+    """
 
     merged = dict(previous)
     for key in ("input_tokens", "output_tokens", "cost"):
-        if parsed.get(key) is not None:
-            merged[key] = parsed[key]
+        incoming = parsed.get(key)
+        if incoming is None:
+            continue
+        current = merged.get(key)
+        if current is None or incoming > current:
+            merged[key] = incoming
     return merged
 
 

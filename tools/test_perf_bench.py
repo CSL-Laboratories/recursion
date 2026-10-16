@@ -227,15 +227,15 @@ class WorkflowTests(unittest.TestCase):
         )
         self.assertIn("cancel-in-progress: true", preamble)
         self.assertNotIn("label-churn", text)
-        self.assertEqual(text.count("name: linux"), 1)
-        settle = text[text.index("  settle:\n") : text.index("  linux:\n")]
+        self.assertEqual(text.count("name: linux\n"), 1)
+        settle = text[text.index("  settle:\n") : text.index("  linux-tests:\n")]
         self.assertIn("name: settle", settle)
         self.assertIn("runs-on: ubuntu-latest", settle)
         self.assertIn("sleep 120", settle)
         self.assertIn("github.event.action == 'synchronize'", settle)
         self.assertIn("github.event.pull_request.draft == false", settle)
         self.assertNotIn("blacksmith", settle)
-        linux = text[text.index("  linux:\n") : text.index("  windows:")]
+        linux = text[text.index("  linux-tests:\n") : text.index("  linux:\n")]
         self.assertIn("runs-on: blacksmith-2vcpu-ubuntu-2404", linux)
         self.assertIn("needs: settle", linux)
         self.assertIn("always() && !cancelled()", linux)

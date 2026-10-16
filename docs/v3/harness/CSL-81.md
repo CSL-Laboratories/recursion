@@ -121,9 +121,11 @@ docs, and this repo did not measure a multi-turn exec stream.
   grow across turns.
 
 The meter does not use per-turn `last` usage. That field is not in the JSONL.
-It does not sum `turn.completed` events inside one stream: they are snapshots
-of one session. A missing usage stays unknown, including a `turn.failed`
-with no usage object. A later `turn.completed` that omits usage keeps the
+It does not sum `turn.completed` events inside one stream. Not summing, and
+keeping the highest value of each field, is the conservative rule this
+adapter chose while cumulative-versus-per-turn stays unverified. It is not
+a claim that the readings are snapshots of one session. A missing usage
+stays unknown, including a `turn.failed` with no usage object. A later `turn.completed` that omits usage keeps the
 earlier value as a lower bound on spend, so the budget check still sees it.
 A later turn that reports only some fields updates those fields only, and
 only when the new number is higher. `turn.failed` does not clear a completed total. `cached_input_tokens` and `reasoning_output_tokens` are

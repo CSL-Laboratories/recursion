@@ -4,14 +4,20 @@ Status: candidate contract for [CSL-204](https://linear.app/csl-laboratories/iss
 
 This directory turns the month-long development plan into a provider-free, reviewable control surface:
 
-- [ISSUE-CONTRACT.md](ISSUE-CONTRACT.md) defines anti-drift issue readiness, proportional research, human decision receipts, lifecycle gates, and the reusable issue body.
+- [ISSUE-CONTRACT-v2.md](ISSUE-CONTRACT-v2.md) defines anti-drift issue readiness, proportional research, human decision receipts, lifecycle gates, and the reusable issue body.
 - [MONTH-PROGRAM.md](MONTH-PROGRAM.md) defines the program controls, starting issue set, rolling integration checkpoints, and month-end evidence floor.
 - [program.json](program.json) is a conservative seed ledger. It records only verified lineage and candidate status; it does not claim that downstream contracts or capabilities are accepted.
 - `python -X utf8 -B tools/check_program_control.py` validates the ledger, document digests, references, decision receipts, dependency readiness, evidence promotion, and independent-verification requirements.
 
+Revision 2 of the issue contract is the CSL-258 authority-wording candidate. [Revision 1](ISSUE-CONTRACT.md) is retained byte-for-byte for history, not as a competing authority rule. Its original digest and pending decision history are preserved; neither revision is accepted by this change. The month-program contract, receipt-channel requirements, admission caps, lifecycle sequencing and checker behavior are unchanged.
+
 ## Authority
 
-The operating model is symbiotic: agents autonomously execute an issue's approved research pass, prototype, implement, test, repair, and create follow-ups inside accepted boundaries; developers contribute product judgment, approve further quota-bearing research, accept recommendations into product contracts, and review results instead of directing every step. Only Lucas, or a human explicitly delegated by Lucas for a named scope, can accept a consequential product or architecture decision. Pending decisions block only their affected lineage. A prototype, agent recommendation, issue transition, PR approval, or merge is not a decision receipt.
+Agents execute approved research, prototypes, implementation, tests, repairs and follow-ups inside accepted boundaries. Pending decisions block only their affected lineage. A prototype, agent recommendation, issue transition, PR approval or merge is not a decision receipt.
+
+[CONTROL_PLANE.md](../../../CONTROL_PLANE.md#roles) and D-041 define the authority boundary. Any founder may decide product and implementation questions, accept research-lane outcomes, admit features within a lane, and approve research continuation within its approved budget. All three founders make the final release decision; founders merge after required review and checks. Lucas retains spending and new services, sensitive company credentials (including company API-key generation), company-server deployments, and the final tie-break. Another founder's approval cannot grant those reserved powers or raise a budget.
+
+Each developer owns their individual live actions, accounts, API keys and tests. An agent may execute a developer-approved live action only on that developer's own accounts/keys, with the route, account and spend ceiling recorded, and only after the R2a permission-profile fix has landed. Individual approval does not override Lucas's company-resource or spending approvals, authorize live capital, or grant an agent merge permission. Destructive actions outside that individual scope still require Lucas's explicit approval. This candidate grants no specific live action or acceptance of another contract.
 
 The ledger is descriptive and fail-closed. It never changes Linear, starts work, grants credentials, raises budgets, deploys, or merges.
 

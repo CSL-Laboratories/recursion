@@ -67,10 +67,10 @@
   "contracts": [
     {
       "id": "contract.issue-anti-drift",
-      "revision": 1,
+      "revision": 2,
       "status": "candidate",
-      "path": "docs/v3/program-control/ISSUE-CONTRACT.md",
-      "sha256": "2bed606d1d07b905a69a7571aefe4b111d4238d78aeeb25625da7c2517d3d614",
+      "path": "docs/v3/program-control/ISSUE-CONTRACT-v2.md",
+      "sha256": "ae4c8e3a4d8f0d28990be4d32aa533db9e036f5bde26bb582bf204b8cefe3490",
       "decision_issue": "CSL-204"
     },
     {

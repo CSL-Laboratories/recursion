@@ -96,6 +96,14 @@ protected paths, and merge still follow `CONTROL_PLANE.md`.
 **Before starting.** Find or create the issue (team **CSL**, project **recursion**) via the
 Linear MCP or the Devin Linear integration. Do not start code without `CSL-N`.
 
+**Direction and architecture.** When you are the assignee (developer or their
+coding agent working in the repo) of an issue that needs a decision or sets
+direction, run Parallel Task API deep research before proposing, in
+addition to Search/Extract. Post the cited brief (options, tradeoffs,
+recommendation, target metrics) on the Linear issue. The developer decides,
+or @mentions the approver; a coding agent @mentions its developer and does
+not decide.
+
 **Filing and shipping.**
 
 - Branch from up-to-date `master` as `csl-<N>-<slug>` (example: `csl-26-short-slug`).
@@ -155,7 +163,8 @@ label, not by editing config.
 - **Blacksmith** is the only CI.
 - Cursor, Codex, Grok, and interactive Claude Code develop features from Linear
   issues. They must not post review verdicts or run review-fix loops on other
-  agents' PRs. The author agent may fix CI failures on its own PR.
+  agents' PRs, except the Codex `CODEX-GATE:` line in [Code Review Rules](#code-review-rules).
+  The author agent may fix CI failures on its own PR.
 - Humans still merge (`CONTROL_PLANE.md`). Independent task gates still apply; they are not
   a substitute for Devin PR review.
 
@@ -169,6 +178,31 @@ posts one `@codex review` comment (via `CODEX_TRIGGER_PAT`; skipped with a
 notice if that secret is missing) and files a Linear Triage issue labelled
 `needs-decision`. Humans decide. Caps: one mediation per thread, three per PR
 per UTC day. The watcher never resolves threads, pushes, or merges.
+
+## Code Review Rules
+
+Codex GitHub reviews are the CI/fixer gate on this repository (CSL-102), not a
+reviewer of record. Devin still reviews; Claude still fixes. End **every** Codex
+review with exactly one of these lines as the last line of the review body
+(not in a code fence, not only in an inline comment):
+
+CODEX-GATE: FIX
+CODEX-GATE: READY
+CODEX-GATE: MEDIATE
+
+- **FIX** — unresolved Devin review threads still need one batched Claude PR
+  Fixer run (`devin-review-fix`). The fixer only addresses Devin threads.
+- **READY** — no fixer; apply the `ci:full` label so the full CI matrix runs.
+- **MEDIATE** — Devin and Claude are stuck; hand off to
+  `.github/workflows/stuck-thread-watch.yml` for this PR. The watcher still
+  applies its own stuck rules (Claude said it needs a human, or the thread
+  has been open more than six hours after Claude's last reply), so a MEDIATE
+  on fresh threads usually does nothing until a later scheduled run — it is
+  not an immediate `@codex review`. Do not push, merge, or resolve threads.
+
+Do not omit the verdict line. A human `@claude` mention still runs the mention
+fixer immediately and bypasses the per-PR daily fixer cap (3 batched fixer
+runs per UTC day).
 
 ## Automations
 

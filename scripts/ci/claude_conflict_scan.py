@@ -32,7 +32,13 @@ MAX_DETAIL_PRS = 200  # per scan; the window rotates every scan so no PR starves
 ROTATION_SECONDS = 1800
 MAX_RUN_PAGES = 5
 FIXER_EVENTS = frozenset(
-    {"issue_comment", "pull_request_review", "pull_request_review_comment"}
+    {
+        "issue_comment",
+        "pull_request_review",
+        "pull_request_review_comment",
+        "workflow_dispatch",
+        "repository_dispatch",
+    }
 )
 WORKFLOW_FILE = "claude.yml"
 
@@ -208,7 +214,7 @@ def fetch_prs(
 def fixer_busy(
     repository: str, current_run_id: str = "", get: Callable[[str], Any] | None = None
 ) -> bool:
-    """True if an event-driven Claude fixer run (comment/review/PR) is queued or running.
+    """True if an event-driven Claude fixer run (comment/review/dispatch) is queued or running.
 
     The resolver shares the per-PR claude-<N> concurrency group with the fixers, and
     GitHub keeps only one pending job per group. Not queueing resolvers while any

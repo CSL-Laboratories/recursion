@@ -3,8 +3,8 @@
 # has no commits in the last 24 hours. PR/dispatch macOS stays in ci.yml
 # behind workflow_dispatch and the ci:full label.
 #
-# The recent-commit check runs on a cheap Blacksmith Ubuntu runner so idle
-# nights never allocate a macOS runner.
+# The recent-commit check runs on GitHub-hosted Ubuntu (public repo: free)
+# so idle nights never allocate a macOS runner.
 name: CI macos nightly
 
 on:
@@ -26,7 +26,7 @@ env:
 jobs:
   recent:
     name: recent-commits
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       run_macos: ${{ steps.check.outputs.run_macos }}

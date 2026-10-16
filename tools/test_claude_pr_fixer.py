@@ -25,7 +25,7 @@ GATE_PATH = ROOT / "scripts" / "ci" / "claude_pr_fixer_gate.py"
 WORKFLOW_PATH = ROOT / ".github" / "workflows" / "claude.yml"
 SCAN_WORKFLOW_PATH = ROOT / ".github" / "workflows" / "conflict-scan.yml"
 HEREDOC = "CLAUDE_PR_FIXER_GATE"
-SCAN_CRON = 'cron: "11,41 * * * *"'
+SCAN_CRON = 'cron: "11 */2 * * *"'
 REPO = "acme/example"
 
 
@@ -365,6 +365,16 @@ class WorkflowStructureTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.text = WORKFLOW_PATH.read_text(encoding="utf-8")
+
+    def test_light_jobs_use_github_hosted_runners(self) -> None:
+        resolve = self._job("resolve-pr")
+        mention = self._job("claude-mention")
+        paths = self._job("event-paths")
+        fixer = self._job("devin-review-fix")
+        self.assertIn("runs-on: ubuntu-latest", resolve.split("timeout-minutes", 1)[0])
+        self.assertIn("runs-on: ubuntu-latest", mention.split("timeout-minutes", 1)[0])
+        self.assertIn("runs-on: ubuntu-latest", paths.split("timeout-minutes", 1)[0])
+        self.assertIn("runs-on: ubuntu-latest", fixer.split("timeout-minutes", 1)[0])
 
     def test_no_workflow_level_concurrency(self) -> None:
         head = self.text.split("jobs:", 1)[0]
@@ -780,6 +790,9 @@ class ConflictScanTests(unittest.TestCase):
     def _select(self, prs, lookup_fn=lookup, cap=3):
         return self.mod.select(prs, REPO, lookup_fn, max_prs=cap)
 
+    def test_rotation_matches_two_hour_schedule(self) -> None:
+        self.assertEqual(self.mod.ROTATION_SECONDS, 7200)
+
     def test_selects_conflicted_same_repo_writer_pr(self) -> None:
         chosen, audit = self._select([conflicted_pr()])
         self.assertEqual(
@@ -977,6 +990,9 @@ class ConflictJobStructureTests(unittest.TestCase):
         self.assertNotIn("write", scan.split("steps:")[0])
         self.assertIn("GH_TOKEN: ${{ github.token }}", scan)
         self.assertIn("actions: read", scan)
+        self.assertIn("runs-on: ubuntu-latest", scan.split("timeout-minutes", 1)[0])
+        resolve = self._job("conflict-resolve")
+        self.assertIn("runs-on: ubuntu-latest", resolve.split("timeout-minutes", 1)[0])
 
     def test_resolver_keeps_protections(self) -> None:
         job = self._job("conflict-resolve")
@@ -1108,17 +1124,17 @@ class FixerLoopCapTests(unittest.TestCase):
             posted = (d / "posted").read_text(encoding="utf-8") if (d / "posted").exists() else ""
             return out.read_text(encoding="utf-8"), posted
 
-    def test_three_claude_commits_after_human_skips_and_comments(self) -> None:
-        out, posted = self._run([("alice", "Alice")] + [("claude[bot]", "claude[bot]")] * 3, [])
+    def test_eight_claude_commits_after_human_skips_and_comments(self) -> None:
+        out, posted = self._run([("alice", "Alice")] + [("claude[bot]", "claude[bot]")] * 8, [])
         self.assertIn("skip=true", out)
         self.assertEqual(posted.count("posted"), 1)
 
-    def test_two_claude_commits_runs(self) -> None:
-        out, posted = self._run([("alice", "Alice")] + [("claude[bot]", "claude[bot]")] * 2, [])
+    def test_seven_claude_commits_runs(self) -> None:
+        out, posted = self._run([("alice", "Alice")] + [("claude[bot]", "claude[bot]")] * 7, [])
         self.assertIn("skip=false", out)
         self.assertEqual(posted.count("posted"), 1)
 
-    def test_daily_fixer_cap_skips_after_three_markers(self) -> None:
+    def test_daily_fixer_markers_do_not_skip(self) -> None:
         from datetime import datetime, timezone
 
         day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -1127,35 +1143,32 @@ class FixerLoopCapTests(unittest.TestCase):
             [("alice", "Alice")],
             [marker] * 3,
         )
-        self.assertIn("skip=true", out)
-        self.assertEqual(posted, "")
+        self.assertIn("skip=false", out)
+        self.assertEqual(posted.count("posted"), 1)
 
-    def test_bypass_cap_ignores_daily_markers(self) -> None:
-        from datetime import datetime, timezone
-
-        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        marker = f"<!-- codex-fixer-run:{day} -->"
+    def test_bypass_cap_skips_daily_marker(self) -> None:
         out, posted = self._run(
             [("alice", "Alice")],
-            [marker] * 3,
+            [],
             bypass_cap="true",
         )
         self.assertIn("skip=false", out)
         self.assertEqual(posted, "")
 
     def test_human_commit_resets_streak(self) -> None:
-        c = [("claude[bot]", "claude[bot]")] * 3 + [("bob", "Bob")] + [("claude[bot]", "claude[bot]")] * 2
+        c = [("claude[bot]", "claude[bot]")] * 8 + [("bob", "Bob")] + [("claude[bot]", "claude[bot]")] * 2
         out, _ = self._run(c, [])
         self.assertIn("skip=false", out)
 
     def test_other_bot_does_not_reset_streak(self) -> None:
-        c = [("alice", "Alice"), ("claude[bot]", "claude[bot]"), ("github-actions[bot]", "github-actions[bot]"),
-             ("claude[bot]", "claude[bot]"), ("claude[bot]", "claude[bot]")]
+        c = [("alice", "Alice")] + [("claude[bot]", "claude[bot]")] * 4 + [
+            ("github-actions[bot]", "github-actions[bot]"),
+        ] + [("claude[bot]", "claude[bot]")] * 4
         out, _ = self._run(c, [])
         self.assertIn("skip=true", out)
 
     def test_existing_marker_suppresses_duplicate_comment(self) -> None:
-        out, posted = self._run([("claude[bot]", "claude[bot]")] * 3, ["<!-- claude-fixer-loop-cap:abc123 -->"])
+        out, posted = self._run([("claude[bot]", "claude[bot]")] * 8, ["<!-- claude-fixer-loop-cap:abc123 -->"])
         self.assertIn("skip=true", out)
         self.assertEqual(posted, "")
 

@@ -65,7 +65,7 @@ jobs:
         github.event.comment.user.type != 'Bot' &&
         contains(github.event.comment.body, '@claude')
       )
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     # GITHUB_TOKEN reads collaborator permission (needs only repo metadata,
     # granted with any read scope) and the PR payload. No write scopes here.
@@ -375,7 +375,7 @@ jobs:
 
   event-paths:
     if: github.event_name == 'pull_request'
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
@@ -401,7 +401,7 @@ jobs:
     concurrency:
       group: claude-${{ needs.resolve-pr.outputs.pr_number }}
       cancel-in-progress: false
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: write
@@ -619,7 +619,7 @@ jobs:
     concurrency:
       group: claude-${{ needs.resolve-pr.outputs.pr_number }}
       cancel-in-progress: false
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: write
@@ -627,7 +627,7 @@ jobs:
       issues: write
       id-token: write
     steps:
-      - name: Fixer loop cap (>=3 claude[bot] commits since last human commit)
+      - name: Fixer loop cap (>=8 claude[bot] commits since last human commit)
         id: cap
         env:
           GH_TOKEN: ${{ github.token }}
@@ -637,19 +637,10 @@ jobs:
           BYPASS_CAP: ${{ github.event.inputs.bypass_cap || github.event.client_payload.bypass_cap || 'false' }}
         run: |
           set -euo pipefail
-          # Daily cap (CSL-102): 3 batched fixer runs per PR per UTC day, unless
-          # a human set bypass_cap (human @claude uses claude-mention instead).
-          existing="$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" --jq '.[].body')"
-          day="$(date -u +%F)"
-          day_marker="<!-- codex-fixer-run:$day -->"
-          day_count="$(grep -cF "$day_marker" <<< "$existing" || true)"
-          if [ "${BYPASS_CAP:-false}" != "true" ] && [ "$day_count" -ge 3 ]; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "daily fixer cap reached: $day_count runs on $day"
-            exit 0
-          fi
-          # Count claude[bot] commits after the newest human commit. Other bots
-          # (e.g. merge/dependabot) neither count nor reset the streak.
+          # Loop cap (CSL-202): pause after 8 consecutive claude[bot] commits
+          # since the last human commit. This job does not stop at 3 runs/day;
+          # it still posts <!-- codex-fixer-run:YYYY-MM-DD --> so Codex-gate
+          # (CSL-201) can keep counting dispatches until that cap is retired.
           commits="$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/commits?per_page=100" \
             --jq '.[] | [(.author.login // "-"), (.commit.author.name // "-")] | @tsv')"
           count=0
@@ -664,19 +655,19 @@ jobs:
             fi
           done < <(printf '%s\n' "$commits" | tac)
           echo "claude[bot] commits since last human commit: $count"
-          if [ "$count" -ge 3 ]; then
+          if [ "$count" -ge 8 ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
             marker="<!-- claude-fixer-loop-cap:$HEAD_SHA -->"
             # Buffer the full listing first: grep -q on a live pipe can SIGPIPE gh under pipefail.
             existing="$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" --jq '.[].body')"
             if ! grep -qF "$marker" <<< "$existing"; then
-              body="$marker"$'\n'"Claude PR Fixer paused: $count consecutive claude[bot] commits on this PR since the last human commit (cap is 3). A human needs to look at the remaining Devin findings; pushing a human commit re-arms the fixer."
+              body="$marker"$'\n'"Claude PR Fixer paused: $count consecutive claude[bot] commits on this PR since the last human commit (cap is 8). A human needs to look at the remaining Devin findings; pushing a human commit re-arms the fixer."
               gh api "repos/$REPO/issues/$PR_NUMBER/comments" -f body="$body" >/dev/null
             fi
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
-            # Count this proceeding run toward the daily cap. Always post so
-            # repeated manual workflow_dispatch cannot share one marker.
+            day="$(date -u +%F)"
+            day_marker="<!-- codex-fixer-run:$day -->"
             if [ "${BYPASS_CAP:-false}" != "true" ]; then
               gh api "repos/$REPO/issues/$PR_NUMBER/comments" -f body="$day_marker"$'\n'"Codex gate: counting this batched fixer run for $day." >/dev/null
             fi

@@ -198,44 +198,10 @@ def build_cases(product, workload: dict) -> list[tuple[str, object]]:
     ]
 
 
-def measure(fn, *, rounds: int, round_s: float, warmup_s: float) -> dict:
-    """Median seconds per call. Warmup and GC pauses sit outside the samples."""
-    if rounds < 1:
-        raise BenchError("rounds must be >= 1")
+def _warmup(fn, warmup_s: float) -> None:
     deadline = time.perf_counter() + warmup_s
     while time.perf_counter() < deadline:
         fn()
-    started = time.perf_counter()
-    counted = 0
-    while counted < 1 or (time.perf_counter() - started < min(0.01, round_s) and counted < 10000):
-        fn()
-        counted += 1
-    per_call = (time.perf_counter() - started) / counted
-    if per_call <= 0:
-        per_call = 1e-9
-    iterations = max(1, min(20000, int(round_s / per_call)))
-    samples: list[float] = []
-    for _ in range(rounds):
-        gc.collect()
-        gc.disable()
-        try:
-            start = time.perf_counter()
-            for _index in range(iterations):
-                fn()
-            elapsed = time.perf_counter() - start
-        finally:
-            gc.enable()
-        samples.append(elapsed / iterations)
-    ordered = sorted(samples)
-    median = ordered[len(ordered) // 2]
-    if median <= 0:
-        raise BenchError("median sample was not positive")
-    return {
-        "median_s": median,
-        "rounds": rounds,
-        "iterations_per_round": iterations,
-        "samples_s": samples,
-    }
 
 
 def _positive_median(samples: list[float]) -> float:
@@ -270,6 +236,24 @@ def _timed_call(fn, iterations: int) -> float:
     return elapsed / iterations
 
 
+def measure(fn, *, rounds: int, round_s: float, warmup_s: float) -> dict:
+    """Median seconds per call. Warmup and GC pauses sit outside the samples."""
+    if rounds < 1:
+        raise BenchError("rounds must be >= 1")
+    _warmup(fn, warmup_s)
+    iterations = _calibrate_iterations(fn, round_s)
+    samples: list[float] = []
+    for _ in range(rounds):
+        gc.collect()
+        samples.append(_timed_call(fn, iterations))
+    return {
+        "median_s": _positive_median(samples),
+        "rounds": rounds,
+        "iterations_per_round": iterations,
+        "samples_s": samples,
+    }
+
+
 def _one_pass(base_fn, head_fn, *, rounds: int, base_iters: int, head_iters: int) -> tuple[list[float], list[float]]:
     base_samples: list[float] = []
     head_samples: list[float] = []
@@ -298,9 +282,7 @@ def measure_pair(
     if repeats < 1:
         raise BenchError("repeats must be >= 1")
     for fn in (base_fn, head_fn):
-        deadline = time.perf_counter() + warmup_s
-        while time.perf_counter() < deadline:
-            fn()
+        _warmup(fn, warmup_s)
     for _ in range(8):
         base_fn()
         head_fn()
@@ -422,11 +404,7 @@ def run_suite(
     product = load_product(root)
     workload = load_workload()
     cases = build_cases(product, workload)
-    for name, fn in cases:
-        try:
-            fn()
-        except Exception as exc:  # noqa: BLE001 - surface the kernel error and stop
-            raise BenchError(f"{name} failed before timing: {exc}") from exc
+    _check_cases(cases)
     benchmarks = []
     for name, fn in cases:
         try:
@@ -436,14 +414,7 @@ def run_suite(
         except Exception as exc:  # noqa: BLE001
             raise BenchError(f"{name} failed during timing: {exc}") from exc
         benchmarks.append({"name": name, "unit": "s/op", **sample})
-    return {
-        "schema": SCHEMA,
-        "provider_calls": 0,
-        "python": sys.version.split()[0],
-        "root": str(root),
-        "workload": WORKLOAD_PATH.name,
-        "benchmarks": benchmarks,
-    }
+    return _report(root, benchmarks)
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -22,9 +22,11 @@ SAFE_LOGIN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
 DEVIN_BOT = "devin-ai-integration[bot]"
 DEVIN_STATES = frozenset({"commented", "changes_requested"})
 MENTION_EVENTS = frozenset({"issue_comment", "pull_request_review_comment"})
+DISPATCH_EVENTS = frozenset({"workflow_dispatch", "repository_dispatch"})
 MENTION_RE = re.compile(r"(?<![A-Za-z0-9_])@claude(?![A-Za-z0-9_])")
 SAFE_REF_RE = re.compile(r"^(?!.*\.\.)[A-Za-z0-9._/-]+$")
 SAFE_SHA_RE = re.compile(r"^[0-9a-f]{40}$|^[0-9a-f]{64}$")
+SAFE_PR_RE = re.compile(r"^[1-9][0-9]{0,9}$")
 PROTECTED_REFS = frozenset({"master", "main", "HEAD"})
 
 
@@ -78,6 +80,16 @@ def safe_head_sha(sha: str | None) -> str:
     if not SAFE_SHA_RE.fullmatch(value):
         return ""
     return value
+
+
+def dispatch_pr_number(event_name: str, event: dict[str, Any]) -> str:
+    raw = ""
+    if event_name == "workflow_dispatch":
+        raw = str((event.get("inputs") or {}).get("pr_number") or "")
+    elif event_name == "repository_dispatch":
+        raw = str((event.get("client_payload") or {}).get("pr_number") or "")
+    text = raw.strip()
+    return text if SAFE_PR_RE.fullmatch(text) else ""
 
 
 def _head_repo(pr: dict[str, Any] | None) -> str:
@@ -149,6 +161,9 @@ def evaluate(
         and (review.get("user") or {}).get("login") == DEVIN_BOT
         and str(review.get("state") or "").lower() in DEVIN_STATES
     ):
+        devin = "true"
+    elif event_name in DISPATCH_EVENTS and open_same_writer:
+        # Batched fixer from the Codex gate (or a human workflow_dispatch).
         devin = "true"
 
     return {
@@ -240,6 +255,15 @@ def main() -> int:
         return 0
     pr = event.get("pull_request") if isinstance(event.get("pull_request"), dict) else None
     issue = event.get("issue") if isinstance(event.get("issue"), dict) else None
+    if pr is None and event_name in DISPATCH_EVENTS:
+        raw = dispatch_pr_number(event_name, event)
+        if not raw:
+            emit(_skip("bad-pr-number"))
+            return 0
+        pr = fetch_pr(repository, int(raw))
+        if pr is None:
+            emit(_skip("pr-fetch-failed"))
+            return 0
     if pr is None and issue and issue.get("pull_request"):
         try:
             number = int(issue.get("number"))

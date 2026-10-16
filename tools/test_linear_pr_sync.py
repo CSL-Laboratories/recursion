@@ -650,6 +650,13 @@ class WorkflowAndDocsTests(unittest.TestCase):
         self.assertIn("pr-sync", text)
         self.assertIn("shared files", text)
 
+    def test_docs_require_agent_ci_etiquette(self) -> None:
+        text = AGENTS.read_text(encoding="utf-8")
+        self.assertIn("## Agent CI etiquette", text)
+        self.assertIn("Mark the PR ready **once**", text)
+        self.assertIn("GITHUB_TOKEN", text)
+        self.assertIn("real conflict", text)
+
     def test_workflow_is_light_and_not_a_required_check(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("runs-on: ubuntu-latest", text)

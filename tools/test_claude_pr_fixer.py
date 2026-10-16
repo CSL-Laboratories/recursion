@@ -1207,7 +1207,7 @@ class FixerLoopCapTests(unittest.TestCase):
                 f'  *"graphql"*) {"exit 1" if listing_error else graphql_reply};;\n'
                 f'  *"collaborators"*) echo {permission};;\n'
                 f'  "api repos/o/r/pulls/1") cat "{d}/pr.json";;\n'
-                f'  */commits*) cat "{d}/commits.tsv";;\n'
+                f'  */commits*) {"exit 1" if listing_error else "cat" + chr(32) + str(d / "commits.tsv")};;\n'
                 f'  */comments*) cat "{d}/comments.txt";;\n'
                 "esac\n",
                 encoding="utf-8",
@@ -1279,33 +1279,11 @@ class FixerLoopCapTests(unittest.TestCase):
         out, posted = self._run([("claude[bot]", "claude[bot]")], [], current_sha="b" * 40, findings="PRRT_late")
         self.assertIn("skip=false", out)
         self.assertIn("head_sha=" + "b" * 40, out)
-        self.assertIn("thread_ids=PRRT_late", out)
         self.assertEqual(posted, "")
-
-    def test_late_root_on_old_commit_reconciles_after_prior_fix_push(self) -> None:
-        # Review wake-up was created on A. First fixer handled known findings,
-        # late root L arrived on A, then first fixer pushed B before this job ran.
-        event = {"action": "submitted", "pull_request": pr_payload(), "review": {"user": {"login": gate.DEVIN_BOT, "type": "Bot"}, "state": "commented", "commit_id": "a" * 40}}
-        self.assertEqual(decide("pull_request_review", event, pr=pr_payload(head_sha="b" * 40))["devin"], "true")
-        def node(thread, *, resolved=False, outdated=False):
-            return {"id": thread, "isResolved": resolved, "isOutdated": outdated, "comments": {"nodes": [{"body": "Bug finding", "author": {"__typename": "Bot", "login": "devin-ai-integration"}, "commit": {"oid": "a" * 40}}]}}
-        out, _ = self._run([("claude[bot]", "claude[bot]")], [], current_sha="b" * 40, threads=[node("PRRT_done", resolved=True), node("PRRT_late"), node("PRRT_old", outdated=True)])
-        self.assertIn("skip=false", out)
-        self.assertIn("head_sha=" + "b" * 40, out)
-        self.assertIn("head_ref=feature/fix", out)
-        self.assertIn("thread_ids=PRRT_late\n", out)
-        self.assertNotIn("PRRT_done", out)
-        self.assertNotIn("PRRT_old", out)
 
     def test_invalid_live_sha_skips(self) -> None:
         out, _ = self._run([], [], current_sha="not-a-sha")
         self.assertIn("skip=true", out)
-
-    def test_no_actionable_or_invalid_thread_ids_skip(self) -> None:
-        for findings in ("", "bad thread id"):
-            out, posted = self._run([], [], findings=findings)
-            self.assertIn("skip=true", out)
-            self.assertEqual(posted, "")
 
     def test_queued_authorization_is_rechecked(self) -> None:
         for kwargs in ({"current_state": "closed"}, {"current_ref": "renamed"}, {"current_repo": "evil/fork"}, {"permission": "read"}):
@@ -1323,44 +1301,25 @@ class FixerLoopCapTests(unittest.TestCase):
     def test_historical_event_markers_do_not_block_new_or_failed_findings(self) -> None:
         out, _ = self._run([], ["<!-- claude-fixer-event:123:abc123 -->"])
         self.assertIn("skip=false", out)
-        self.assertIn("thread_ids=PRRT_1", out)
-
-    def test_live_filter_executes_against_thread_fixtures(self) -> None:
-        if shutil.which("jq") is None:
-            self.skipTest("jq unavailable")
-        import re
-        expression = re.search(r"--jq '(.data.repository.pullRequest.reviewThreads.nodes.*?)'", self.script).group(1)
-        for resolved, outdated, login, user_type, sha, expected in (
-            (False, False, "devin-ai-integration[bot]", "Bot", "abc123", "PRRT_1"),
-            (True, False, "devin-ai-integration[bot]", "Bot", "abc123", ""),
-            (False, True, "devin-ai-integration[bot]", "Bot", "abc123", ""),
-            (False, False, "another[bot]", "Bot", "abc123", ""),
-            (False, False, "devin-ai-integration", "Bot", "abc123", "PRRT_1"),
-            (False, False, "devin-ai-integration", "User", "abc123", ""),
-        ):
-            node = {"id": "PRRT_1", "isResolved": resolved, "isOutdated": outdated, "comments": {"nodes": [{"body": "Legacy bug finding", "author": {"login": login, "__typename": user_type}, "commit": {"oid": sha}}]}}
-            fixture = {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": [node]}}}}}
-            result = subprocess.run(["jq", "-r", expression], input=json.dumps(fixture), text=True, capture_output=True, check=True)
-            self.assertEqual(result.stdout.strip(), expected)
-            for kind in ("analysis", "bug"):
-                node["comments"]["nodes"][0]["body"] = '<!-- devin-review-comment ' + json.dumps({"id": "fixture", "kind": kind}) + ' -->\nFinding'
-                result = subprocess.run(["jq", "-r", expression], input=json.dumps(fixture), text=True, capture_output=True, check=True)
-                self.assertEqual(result.stdout.strip(), "" if kind == "analysis" else expected)
 
     def test_query_variables_stay_literal_with_scoped_shellcheck_directives(self) -> None:
-        self.assertEqual(self.script.count("# shellcheck disable=SC2016"), 2)
+        self.assertEqual(self.script.count("# shellcheck disable=SC2016"), 1)
         self.assertIn("# shellcheck disable=SC2016\nif ! jq", self.script)
-        self.assertIn('# shellcheck disable=SC2016\nfindings="$(gh api graphql', self.script)
         self.assertIn('.head.ref == $ref and .head.repo.full_name == $repo', self.script)
-        self.assertIn("query($owner:String!, $name:String!, $number:Int!, $endCursor:String)", self.script)
-        self.assertIn(". as $thread", self.script)
 
-    def test_live_thread_filter_is_exact_and_paginated(self) -> None:
-        self.assertIn("graphql --paginate", self.script)
-        self.assertIn(".isResolved == false and .isOutdated == false", self.script)
-        self.assertIn('.author.login == "devin-ai-integration[bot]"', self.script)
-        self.assertNotIn('.commit.oid', self.script)
-        self.assertIn('"head_sha=$HEAD_SHA"', self.script)
+    def test_receipt_helper_embedded_from_trusted_workflow_before_checkout(self) -> None:
+        source = (WORKFLOW_PATH.parents[2] / "scripts/ci/claude_fixer_receipts.py").read_text()
+        job = self.text[self.text.index("  devin-review-fix:"):]
+        begin = job.index("          #!/usr/bin/env python3", job.index("id: eligibility"))
+        end = job.index("          CLAUDE_FIXER_RECEIPTS", begin)
+        import textwrap
+        self.assertEqual(textwrap.dedent(job[begin:end]).rstrip(), source.rstrip())
+        self.assertLess(job.index("id: eligibility"), job.index("uses: actions/checkout"))
+        self.assertIn("MANUAL_RETRY: ${{ github.event_name == 'workflow_dispatch' }}", job)
+        self.assertIn("steps.eligibility.outputs.receipt_context", job)
+        self.assertIn("needs-human handoffs must remain unresolved", job)
+        for step in job.split("      - uses: actions/checkout@v4", 1)[1].split("\n      - "):
+            self.assertIn("steps.eligibility.outputs.skip != 'true'", step)
 
     def test_fixer_steps_gated_on_cap(self) -> None:
         start = self.text.index("  devin-review-fix:\n")

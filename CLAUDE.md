@@ -332,3 +332,23 @@ caching, concurrency), Devin configuration or settings, Devin automations, repo 
 or the MCP server list, unless a Linear issue explicitly assigned by a human asks for it.
 
 Do not add paid services or raise spend limits.
+
+### Batched fixer retries and handled findings
+
+Only unresolved, non-outdated roots from the verified Devin bot with valid
+`devin-review-comment` metadata whose kind is exactly `bug` are eligible. Missing
+or malformed metadata, analysis, and summary comments fail closed. Structured
+Claude result receipts bind the root ID and exact body fingerprint. An addressed
+receipt is honored only when its pushed fix descends from the recorded base and
+is reachable from the live PR head. A `needs-human` receipt stops automatic
+retries until a substantive trusted follow-up, changed finding, or authorized
+manual retry. Arbitrary prose and failed/no-push replies never prove completion.
+
+Automatic runs reserve at most three attempts per live head and unchanged
+finding set under the shared PR lock. A new head or changed findings resets this
+budget; it is not a daily cap. Exhaustion posts a human-action-needed notice,
+never a readiness verdict. Authorized workflow dispatch bypasses this retry
+budget and human-handoff receipts, but never the eight-commit guard. A human
+`@claude` request also remains available. Pre-merge action validation can consume
+a reserved attempt without running Claude; after activation on the default
+branch, use an authorized manual retry if those reservations exhausted the budget.

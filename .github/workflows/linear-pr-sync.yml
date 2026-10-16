@@ -1,0 +1,62 @@
+# Mirror each PR onto its Linear issue as one editable comment.
+# Not a required check. Missing LINEAR_API_KEY skips with a notice.
+name: Linear PR sync
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, closed]
+  # This repository's default branch is master. The job also compares
+  # github.ref_name to the repo default so a rename still stays correct.
+  push:
+    branches: [master, main]
+
+env:
+  LINEAR_TEAM_KEY: "CSL"
+  DEVIN_LOGIN: "devin-ai-integration[bot]"
+  TOP_FILES: "10"
+
+concurrency:
+  group: linear-pr-sync-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  sync:
+    if: >-
+      (
+        github.event_name == 'pull_request' &&
+        github.event.pull_request.head.repo.full_name == github.repository
+      ) ||
+      (
+        github.event_name == 'push' &&
+        github.ref_name == github.event.repository.default_branch
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Always the default branch so pull_request events cannot run
+          # PR-head code with LINEAR_API_KEY.
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: |
+            .github/scripts/linear_pr_sync.py
+          sparse-checkout-cone-mode: false
+
+      - name: Upsert Linear PR-sync comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          script=.github/scripts/linear_pr_sync.py
+          if [ ! -f "$script" ]; then
+            echo "::notice::$script is not on the default branch yet; skip"
+            exit 0
+          fi
+          python3 -X utf8 -B "$script"

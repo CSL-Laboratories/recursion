@@ -19,14 +19,20 @@ per-root context using the workflow-owned copy of the existing receipt consumer.
 It reports verified addressed receipts separately from human handoffs, missing
 receipts, invalid/superseded receipts and changed roots. Full SHA, authenticated
 Claude numeric identity, body fingerprint, captured base and remote ancestry are
-required, alongside the existing v3 generation and observation context. Changed
-meaningful replies make that captured observation unverified. A reachable push
+required, alongside the existing v3 generation and observation context. The audit
+loads bounded authenticated observation history and reuses `prepare_observations`
+with journal writes refused. Exact previously authenticated reply ID, author ID
+and body digest remain trusted after permission loss, just as in eligibility.
+Edited/deleted replies, changed generations, invalid or incomplete history and
+any required journal advance leave the captured observation unverified. Newly
+unauthenticated content never becomes historical evidence. A reachable push
 with an abbreviated receipt is reported as invalid; the workflow does not repair
 or author that receipt. This is deterministic reconciliation of observed output,
 not proof that a model will produce it.
 
 Reconciliation is read-only and does not change eligibility, reservations,
-resolution or READY. It checks at most 50 captured roots and five comment pages;
+resolution or READY. It checks at most 50 captured roots, five review-comment
+pages and five issue-comment journal pages;
 all terminal reads share a 40-call/70-second budget with a final live-head check.
 Incomplete reads, duplicate snapshots, changed heads, denied access and exhausted
 budgets report unverified. Mention runs without captured context say not

@@ -288,8 +288,9 @@ class TerminalReceiptIntegrationTests(unittest.TestCase):
         self.consumer = self.fixtures.m
         self.roots = self.fixtures.root_comments([self.fixtures.thread()])
         items = self.fixtures.findings([self.fixtures.thread()])
+        self.history = []
         if hasattr(self.fixtures, "prepare"):
-            items = self.fixtures.prepare(items)
+            items = self.fixtures.prepare(items, history=self.history)
         self.item = {**items[0], "base": A}
         self.config = CONFIG | {"receipts": [self.item]}
         self.receipt = {**self.item, "status": "addressed", "commit": B}
@@ -301,6 +302,8 @@ class TerminalReceiptIntegrationTests(unittest.TestCase):
     def read(self, path):
         if "/compare/" in path:
             return {"status": "identical" if path.endswith(f"{B}...{B}") else "ahead"}
+        if "/issues/" in path and "/comments?" in path:
+            return self.history
         if "/comments?" in path:
             return self.comments
         if "/collaborators/" in path:
@@ -388,11 +391,89 @@ class TerminalReceiptIntegrationTests(unittest.TestCase):
             self.comments = self.roots + [self.reply(self.receipt | {key: "wrong"})]
             self.assertIn("1=invalid-or-superseded", self.audit())
 
+    def captured_writer_reply(self):
+        writer = {"id": 899, "in_reply_to_id": 1,
+                  "user": {"id": 12, "login": "writer", "type": "User"},
+                  "created_at": "2026-10-16T00:00:00Z", "body": "Still failing."}
+        self.history = []
+        self.item = {**self.fixtures.prepare(self.fixtures.findings([self.fixtures.thread()]),
+                                             [writer], self.history)[0], "base": A}
+        self.config["receipts"] = [self.item]
+        self.receipt = {**self.item, "status": "addressed", "commit": B}
+        self.comments = self.roots + [writer, self.reply(self.receipt)]
+        return writer
+
+    def permission_lost(self, path):
+        if "/collaborators/" in path:
+            return {"permission": "read"}
+        return self.read(path)
+
+    def test_permission_loss_preserves_exact_previously_authenticated_content(self):
+        self.captured_writer_reply()
+        lookups = []
+        def read(path):
+            if "/collaborators/" in path:
+                lookups.append(path)
+            return self.permission_lost(path)
+        with patch.object(self.consumer, "post", side_effect=AssertionError("read-only audit")):
+            self.assertIn("1=verified-addressed", self.audit(read))
+        self.assertEqual(lookups, [])
+
+    def test_permission_loss_does_not_authenticate_edited_deleted_or_reauthored_reply(self):
+        for mutation in ("edited", "deleted", "author"):
+            writer = self.captured_writer_reply()
+            changed = {**writer, "body": "A different correction."} if mutation == "edited" else \
+                      {**writer, "user": {**writer["user"], "id": 13}}
+            self.comments = self.roots + ([] if mutation == "deleted" else [changed]) + [self.reply(self.receipt)]
+            self.assertIn("1=observation-changed-or-unverified", self.audit(self.permission_lost))
+
+    def test_new_unauthenticated_content_cannot_forge_a_valid_observation(self):
+        new = {"id": 899, "in_reply_to_id": 1, "user": {"id": 12, "login": "writer", "type": "User"},
+               "created_at": "2026-10-16T00:00:00Z", "body": "New unauthenticated content."}
+        self.comments = self.roots + [new, self.reply(self.receipt)]
+        self.assertIn("1=verified-addressed", self.audit(self.permission_lost))  # Untrusted noise is ignored.
+        forged = self.receipt | {"observation": self.consumer.observation_token([new], lambda _: "write")}
+        self.comments[-1] = self.reply(forged)
+        self.assertIn("1=invalid-or-superseded", self.audit(self.permission_lost))
+
+    def test_missing_forged_malformed_or_incomplete_journal_is_unverified(self):
+        import copy
+        self.captured_writer_reply()
+        good = copy.deepcopy(self.history)
+        for history in ([], [good[0] | {"user": self.fixtures.actor("github-actions[bot]", 1)}],
+                        [good[0] | {"body": self.consumer.marker("observation", {"root": 1})}]):
+            self.history = history
+            self.assertNotIn("=verified-", self.audit(self.permission_lost))
+        self.history = copy.deepcopy(good)
+        entry = self.consumer.records(self.history[0]["body"], "observation")[0]
+        entry["previous"] = "f" * 64
+        entry["generation"] = self.consumer.journal_generation(1, entry["fingerprint"], entry["previous"], entry["observation"])
+        self.history[0]["body"] = self.consumer.marker("observation", entry)
+        self.assertNotIn("=verified-", self.audit(self.permission_lost))
+
+    def test_journal_read_failure_duplicate_and_page_cap_fail_closed(self):
+        self.captured_writer_reply()
+        def denied(path):
+            if "/issues/" in path:
+                raise subprocess.CalledProcessError(1, "gh", stderr="(HTTP 403)")
+            return self.read(path)
+        self.assertIn("audit: unverified", self.audit(denied))
+        reads = []
+        def capped(path):
+            if "/issues/" in path:
+                reads.append(path)
+                return [{"id": i + 1} for i in range(100)]
+            return self.read(path)
+        self.assertIn("audit: unverified", self.audit(capped))
+        self.assertEqual(len(reads), 5)
+        self.history += self.history
+        self.assertIn("audit: unverified", self.audit())
+
     def test_mixed_roots_and_complete_pagination_report_each_root(self):
         threads = [self.fixtures.thread(root=2)]
         items = self.fixtures.findings(threads)
         if hasattr(self.fixtures, "prepare"):
-            items = self.fixtures.prepare(items)
+            items = self.fixtures.prepare(items, history=self.history)
         self.config["receipts"].append({**items[0], "base": A})
         self.comments += self.fixtures.root_comments(threads)
         def paged(path):

@@ -41,6 +41,23 @@ def bounded_reader():
     return read
 
 
+def bounded_comments(path, read):
+    comments = []
+    for page in range(1, 6):
+        batch = read(f"{path}?per_page=100&page={page}")
+        if not isinstance(batch, list) or any(not isinstance(c, dict) for c in batch):
+            raise ValueError("invalid comment snapshot")
+        comments.extend(batch)
+        if len(batch) < 100:
+            break
+    else:
+        raise ValueError("comment page limit reached")
+    ids = [c.get("id") for c in comments]
+    if any(type(cid) is not int or cid <= 0 for cid in ids) or len(set(ids)) != len(ids):
+        raise ValueError("inconsistent comment snapshot")
+    return comments
+
+
 def receipt_audit(config, read, consumer):
     items = config.get("receipts", [])
     if isinstance(items, list) and not items:
@@ -57,19 +74,8 @@ def receipt_audit(config, read, consumer):
                 raise ValueError("invalid captured receipt context")
             roots.add(rid)
         head = current_pr(config, read)
-        comments = []
-        for page in range(1, 6):
-            batch = read(f"repos/{config['repo']}/pulls/{config['number']}/comments?per_page=100&page={page}")
-            if not isinstance(batch, list) or any(not isinstance(c, dict) for c in batch):
-                raise ValueError("invalid comment snapshot")
-            comments.extend(batch)
-            if len(batch) < 100:
-                break
-        else:
-            raise ValueError("comment page limit reached")
-        ids = [c.get("id") for c in comments]
-        if any(type(cid) is not int or cid <= 0 for cid in ids) or len(set(ids)) != len(ids):
-            raise ValueError("inconsistent comment snapshot")
+        comments = bounded_comments(f"repos/{config['repo']}/pulls/{config['number']}/comments", read)
+        history = bounded_comments(f"repos/{config['repo']}/issues/{config['number']}/comments", read)
         cache = {}
         def cached(path):
             if path not in cache:
@@ -84,7 +90,7 @@ def receipt_audit(config, read, consumer):
                 raise
         def permission(login):
             return cached(f"repos/{config['repo']}/collaborators/{login}/permission")["permission"]
-        reports = consumer.terminal_receipts(items, comments, head, compare, permission)
+        reports = consumer.terminal_receipts(items, comments, head, compare, permission, history=history)
         if current_pr(config, read) != head:
             raise ValueError("head changed during receipt audit")
         details = "; ".join(f"{r['root']}={r['status']}" for r in reports)

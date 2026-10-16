@@ -322,7 +322,7 @@ def pending_findings(items: list[dict], comments: list[dict], head: str, compare
     return pending
 
 
-def terminal_receipts(items, comments, head, compare, permission):
+def terminal_receipts(items, comments, head, compare, permission, history=()):
     """Read-only evidence for captured roots; never changes eligibility or journals."""
     reports = []
     for item in items:
@@ -333,7 +333,17 @@ def terminal_receipts(items, comments, head, compare, permission):
             reports.append({"root": root, "status": "root-changed-or-unverified"})
             continue
         replies = [c for c in comments if c.get("in_reply_to_id") == root]
-        if observation_token(replies, permission) != item.get("observation"):
+        # Reuse the durable journal's exact ID/author/body authentication, just
+        # as eligibility does. Permission loss cannot erase unchanged evidence;
+        # edits/deletions must advance the journal, which an audit must not do.
+        def no_journal_write(_):
+            raise ValueError("terminal audit cannot advance observation history")
+        try:
+            observed = prepare_observations([item], replies, history, permission, no_journal_write)[0]
+        except ValueError:
+            reports.append({"root": root, "status": "observation-changed-or-unverified"})
+            continue
+        if any(observed.get(key) != item.get(key) for key in ("v", "observation", "generation")):
             reports.append({"root": root, "status": "observation-changed-or-unverified"})
             continue
         # Restrict this audit to the workflow-captured base. Reuse the existing

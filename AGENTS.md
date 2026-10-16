@@ -352,3 +352,10 @@ budget and human-handoff receipts, but never the eight-commit guard. A human
 `@claude` request also remains available. Pre-merge action validation can consume
 a reserved attempt without running Claude; after activation on the default
 branch, use an authorized manual retry if those reservations exhausted the budget.
+
+A trusted current fixer pause invalidates older READY decisions. Codex READY
+reconciles live unresolved findings and the current head before and after its
+label write; MEDIATE remains available. The gate records ownership of its exact
+`ci:full` label event. A later pause revokes only that owned label event, leaving
+a subsequent human label override intact. Same-head recovery requires a fresh
+verified readiness check; a READY comment alone cannot override a pause.

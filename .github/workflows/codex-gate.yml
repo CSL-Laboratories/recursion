@@ -36,6 +36,7 @@ jobs:
           persist-credentials: false
           sparse-checkout: |
             scripts/ci/codex_gate.py
+            scripts/ci/claude_fixer_receipts.py
           sparse-checkout-cone-mode: false
       - name: Post @codex review once per head SHA
         id: gate
@@ -66,6 +67,11 @@ jobs:
       )
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      # Owner-approved: authenticate label ownership/recovery receipts only here.
+      issues: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -73,6 +79,7 @@ jobs:
           persist-credentials: false
           sparse-checkout: |
             scripts/ci/codex_gate.py
+            scripts/ci/claude_fixer_receipts.py
           sparse-checkout-cone-mode: false
       - name: Act on CODEX-GATE verdict
         env:

@@ -505,7 +505,7 @@ class WorkflowStructureTests(unittest.TestCase):
         mention = self._job("claude-mention")
         devin = self._job("devin-review-fix")
         needle = "ref: ${{ needs.resolve-pr.outputs.head_sha }}"
-        self.assertIn(needle, mention)
+        self.assertIn("ref: ${{ steps.live.outputs.head_sha }}", mention)
         self.assertIn("ref: ${{ steps.cap.outputs.head_sha }}", devin)
         self.assertNotIn(needle, devin)
         self.assertNotIn("ref: ${{ needs.resolve-pr.outputs.head_ref }}", mention)
@@ -521,7 +521,7 @@ class WorkflowStructureTests(unittest.TestCase):
             "Bash(git push origin HEAD:refs/heads/"
             "${{ needs.resolve-pr.outputs.head_ref }})"
         )
-        self.assertIn(push, mention)
+        self.assertIn(push.replace("needs.resolve-pr.outputs.head_ref", "steps.live.outputs.head_ref"), mention)
         self.assertIn(push.replace("needs.resolve-pr.outputs.head_ref", "steps.cap.outputs.head_ref"), devin)
         self.assertNotIn("HEAD:refs/heads/*", mention)
 
@@ -1181,6 +1181,7 @@ class FixerLoopCapTests(unittest.TestCase):
         current_ref: str = "feature/fix",
         current_repo: str = "o/r",
         permission: str = "write",
+        commenter_permission: str = "write",
         findings: str = "PRRT_1",
         listing_error: bool = False,
         threads: list[dict] | None = None,
@@ -1205,6 +1206,7 @@ class FixerLoopCapTests(unittest.TestCase):
                 'case "$*" in\n'
                 f'  *" -f body="*) echo posted >> "{d}/posted";;\n'
                 f'  *"graphql"*) {"exit 1" if listing_error else graphql_reply};;\n'
+                f'  *"collaborators/bob/permission"*) echo {commenter_permission};;\n'
                 f'  *"collaborators"*) echo {permission};;\n'
                 f'  "api repos/o/r/pulls/1") cat "{d}/pr.json";;\n'
                 f'  */commits*) {"exit 1" if listing_error else "cat" + chr(32) + str(d / "commits.tsv")};;\n'
@@ -1216,7 +1218,7 @@ class FixerLoopCapTests(unittest.TestCase):
             out = d / "out"
             out.write_text("", encoding="utf-8")
             env = dict(os.environ, PATH=f"{d}{os.pathsep}{os.environ.get('PATH', '')}", GITHUB_OUTPUT=str(out),
-                       REPO="o/r", PR_NUMBER="1", HEAD_SHA="a" * 40, HEAD_REF="feature/fix", GH_TOKEN="x")
+                       REPO="o/r", PR_NUMBER="1", HEAD_SHA="a" * 40, HEAD_REF="feature/fix", GH_TOKEN="x", COMMENTER="bob")
             if bypass_cap is not None:
                 env["BYPASS_CAP"] = bypass_cap
             subprocess.run(["bash", "-c", self.script], env=env, check=True, capture_output=True)
@@ -1334,6 +1336,42 @@ class FixerLoopCapTests(unittest.TestCase):
         self.assertIn("devin-ai-integration[bot]", job)
         self.assertIn(".commit_id == ", job)
         self.assertIn("Devin review of head is pending", job)
+
+
+class MentionLiveHeadTests(unittest.TestCase):
+    _run = FixerLoopCapTests._run
+
+    @classmethod
+    def setUpClass(cls):
+        import textwrap
+        cls.text = WORKFLOW_PATH.read_text()
+        start = cls.text.index("        id: live\n")
+        run = cls.text.index("        run: |\n", start) + len("        run: |\n")
+        end = cls.text.index("\n      - ", run)
+        cls.script = textwrap.dedent(cls.text[run:end])
+
+    def test_queued_human_request_refreshes_head_after_earlier_writer(self):
+        out, posts = self._run([], [], current_sha="b" * 40)
+        self.assertIn("head_sha=" + "b" * 40, out)
+        self.assertIn("head_ref=feature/fix", out)
+        self.assertIn("skip=false", out)
+        self.assertEqual(posts, "")
+
+    def test_live_authorization_and_branch_boundary_rechecked(self):
+        for kwargs in ({"permission": "read"}, {"commenter_permission": "read"},
+                       {"current_state": "closed"}, {"current_repo": "evil/fork"},
+                       {"current_ref": "renamed"}, {"current_sha": "invalid"}):
+            out, _ = self._run([], [], **kwargs)
+            self.assertIn("skip=true", out)
+
+    def test_original_comment_and_fresh_branch_remain_bound(self):
+        job = self.text.split("  claude-mention:", 1)[1].split("  devin-review-fix:", 1)[0]
+        self.assertIn("COMMENTER: ${{ github.event.comment.user.login }}", job)
+        self.assertIn("COMMENT ID: ${{ github.event.comment.id }}", job)
+        self.assertIn("BRANCH: ${{ steps.live.outputs.head_ref }}", job)
+        self.assertLess(job.index("id: live"), job.index("actions/checkout"))
+        for step in job.split("      - uses: actions/checkout@v4", 1)[1].split("\n      - "):
+            self.assertIn("steps.live.outputs.skip != 'true'", step)
 
 
 if __name__ == "__main__":

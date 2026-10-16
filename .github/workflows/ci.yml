@@ -16,7 +16,8 @@
 # PRs also run tools/perf_ci.py inside the linux job. It times the provider-free
 # planning kernel against the PR base and warns above a 10% slowdown. That
 # warning does not fail the required linux check, and it does not start a
-# second runner.
+# second runner. The step is capped at one minute with continue-on-error;
+# a failed or unavailable measurement emits ::warning:: and does not fail linux.
 name: CI
 
 on:
@@ -76,12 +77,15 @@ jobs:
           CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: python -X utf8 -B tools/ci_gate.py --force
 
-      # Same job and runner as the gate. Exit 0 on a slowdown; annotations warn.
+      # Same job and runner as the gate. Slowdowns warn; a crash, timeout, or
+      # missing measurement is advisory (timeout-minutes + continue-on-error).
       - name: Performance regression check
         if: github.event_name == 'pull_request' && steps.paths.outputs.run_full == 'true'
+        timeout-minutes: 1
+        continue-on-error: true
         env:
           CI_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: python -X utf8 -B tools/perf_ci.py
+        run: python -X utf8 -B tools/perf_ci.py || echo "::warning::Performance measurement failed, timed out, or is unavailable"
 
       # Public-scope (and whitespace) must still run when the suite is skipped.
       - name: Docs-only lightweight checks

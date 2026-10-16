@@ -202,6 +202,9 @@ class WorkflowTests(unittest.TestCase):
         start = text.index("Performance regression check")
         step = text[start:text.index("Docs-only lightweight checks", start)]
         self.assertIn("pull_request", step)
+        self.assertIn("timeout-minutes: 1\n", step)
+        self.assertIn("continue-on-error: true", step)
+        self.assertIn("::warning::", step)
         self.assertNotIn("exit 1", step)
         self.assertNotIn("fail-on-alert", step)
         # The required linux job stays green when the script warns and returns 0.

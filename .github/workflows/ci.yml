@@ -22,8 +22,9 @@
 #
 # Do not listen for labeled/unlabeled. A skipped or no-op job named `linux` is
 # treated as success and would overlay a failed required check on the same SHA.
-# `ci:full` still gates windows/macos on the next real run (synchronize,
-# ready_for_review, dispatch, or master push). Discord `/ci full` retriggers.
+# Adding `ci:full` starts windows/macos from ci-full-label.yml (no linux job).
+# `ci:full` also gates windows/macos on the next synchronize / ready_for_review
+# / dispatch / master push. Discord `/ci full` retriggers.
 name: CI
 
 on:

@@ -232,6 +232,25 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("needs: linux", windows)
         self.assertIn("needs.linux.result == 'success'", windows)
         self.assertIn("'ci:full'", windows)
+        label_wf = (ROOT / ".github" / "workflows" / "ci-full-label.yml").read_text(
+            encoding="utf-8"
+        )
+        on_block = label_wf[label_wf.index("on:") : label_wf.index("concurrency:")]
+        self.assertIn("types: [labeled]", on_block)
+        self.assertNotIn("unlabeled", on_block)
+        self.assertNotRegex(label_wf, r"(?m)^  linux:")
+        self.assertNotIn("name: linux", label_wf)
+        self.assertIn("github.event.label.name == 'ci:full'", label_wf)
+        self.assertIn("name: windows", label_wf)
+        self.assertIn("name: macos", label_wf)
+        self.assertNotIn("needs: linux", label_wf)
+        for line in label_wf.splitlines():
+            if line.lstrip().startswith("run:"):
+                self.assertNotIn(
+                    "github.event.label.name",
+                    line,
+                    "label name must not enter a shell step",
+                )
         pr_lint = (ROOT / ".github" / "workflows" / "pr-lint.yml").read_text(encoding="utf-8")
         self.assertIn("runs-on: ubuntu-latest", pr_lint)
         self.assertNotIn("blacksmith", pr_lint)

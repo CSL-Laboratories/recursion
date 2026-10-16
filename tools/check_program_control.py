@@ -44,12 +44,49 @@ def target_digest(action: str, target: dict[str, Any]) -> str:
     # Exclude only observation/lifecycle fields, never the approved work boundary.
     excluded = {
         "accept_contract": {"status", "decision_receipt"},
-        "develop_work": {"status", "stage", "decision_receipt", "contract_receipts"},
-        "decide_capability": {"current_maturity", "month_target", "evidence_ids", "unknown_ids",
+        "develop_work": {"status", "stage", "decision_receipt", "contract_receipts",
+                         "candidate_commit", "verification_evidence_ids"},
+        "decide_capability": {"current_maturity", "month_target", "evidence_ids",
                               "decision_receipt", "candidate_commit"},
         "admit_work": {"decision_receipt", "active_contract_consumers", "active_reviews"},
     }
     return digest({key: value for key, value in target.items() if key not in excluded[action]})
+
+
+def work_binding(item: dict[str, Any], work: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    def boundary(row: dict[str, Any]) -> dict[str, Any]:
+        return {key: value for key, value in row.items()
+                if key not in {"status", "candidate_commit", "verification_evidence_ids"}}
+
+    # Flatten the dependency closure so upstream candidate/boundary changes also
+    # invalidate dependent and composed proofs. Cycles are reported separately.
+    seen = {item.get("id")}
+    pending = list(item.get("hard_dependencies", []))
+    dependencies = []
+    while pending:
+        dependency = pending.pop()
+        if dependency in seen or dependency not in work:
+            continue
+        seen.add(dependency)
+        row = work[dependency]
+        dependencies.append({"id": dependency, "candidate_commit": row.get("candidate_commit"),
+                             "boundary_digest": digest(boundary(row))})
+        pending.extend(row.get("hard_dependencies", []))
+    return {"id": item.get("id"), "candidate_commit": item.get("candidate_commit"),
+            "work_digest": digest({"work": boundary(item), "dependency_bindings":
+                                   sorted(dependencies, key=lambda row: row["id"])})}
+
+
+def checkpoint_binding(checkpoint: dict[str, Any]) -> dict[str, Any]:
+    boundary = {key: value for key, value in checkpoint.items()
+                if key not in {"status", "evidence_ids"}}
+    return {"id": checkpoint.get("id"), "definition_digest": digest(boundary)}
+
+
+def unknown_binding(unknown: dict[str, Any]) -> dict[str, Any]:
+    # Resolving an existing unknown need not change its approved blocking scope.
+    return {key: value for key, value in unknown.items()
+            if key not in {"status", "resolution_evidence"}}
 
 
 def _ids(rows: list[dict[str, Any]], name: str, errors: list[str]) -> dict[str, dict[str, Any]]:
@@ -110,7 +147,7 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
     unknowns = _ids(data["unknowns"], "unknown", errors)
     capabilities = _ids(data["capabilities"], "capability", errors)
     proposals = _ids(data["proposals"], "proposal", errors)
-    _ids(data["integration_checkpoints"], "checkpoint", errors)
+    checkpoints = _ids(data["integration_checkpoints"], "checkpoint", errors)
     _ids(data["risks"], "risk", errors)
 
     for contract_id, contract in contracts.items():
@@ -132,6 +169,16 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
                         for cid in contract_ids)
                 and len(set(contract_ids)) == len(contract_ids))
 
+    def exact_bindings(actual: Any, expected: list[dict[str, Any]]) -> bool:
+        return isinstance(actual, list) and len(actual) == len(expected) and all(row in actual for row in expected)
+
+    def successful_proof(row: dict[str, Any], candidate: Any) -> bool:
+        return (bool(re.fullmatch(r"[0-9a-f]{40}", str(candidate)))
+                and row.get("candidate_commit") == candidate and row.get("result") == "pass"
+                and row.get("status") == "current" and row.get("independent") is True
+                and bool(row.get("artifact")) and bool(row.get("environment"))
+                and bool(HEX64.fullmatch(str(row.get("artifact_sha256", "")))))
+
     targets = {"accept_contract": contracts, "develop_work": work,
                "decide_capability": capabilities, "admit_work": {data["program_id"]: data["admission"]}}
     valid_proposals = set()
@@ -149,6 +196,8 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
             errors.append(f"{proposal_id} requires explicit authorizations")
             continue
         needed_contracts = set()
+        needed_unknowns = set()
+        needed_checkpoints = set()
         for grant in grants:
             action, target_id = grant.get("action"), grant.get("target")
             target = targets.get(action, {}).get(target_id)
@@ -166,8 +215,25 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
                 needed_contracts.add(target_id)
             else:
                 needed_contracts.update(target.get("contract_ids", target.get("consumes_contracts", [])))
+            if action == "decide_capability":
+                needed_unknowns.update(target.get("unknown_ids", []))
+                requirements = target.get("checkpoint_requirements")
+                if isinstance(requirements, list):
+                    needed_checkpoints.update(req.get("checkpoint_id") for req in requirements
+                                              if isinstance(req, dict) and isinstance(req.get("checkpoint_id"), str))
+        for checkpoint_id in needed_checkpoints:
+            if checkpoint_id in checkpoints:
+                needed_contracts.update(checkpoints[checkpoint_id].get("requires", []))
         if not bindings_match(proposal.get("contract_bindings"), sorted(needed_contracts)):
             errors.append(f"{proposal_id} stale or incomplete contract bindings")
+        if (not needed_unknowns.issubset(unknowns) or not exact_bindings(
+                proposal.get("unknown_bindings", []),
+                [unknown_binding(unknowns[uid]) for uid in sorted(needed_unknowns) if uid in unknowns])):
+            errors.append(f"{proposal_id} stale or incomplete unknown bindings")
+        if (not needed_checkpoints.issubset(checkpoints) or not exact_bindings(
+                proposal.get("checkpoint_bindings", []),
+                [checkpoint_binding(checkpoints[cid]) for cid in needed_checkpoints if cid in checkpoints])):
+            errors.append(f"{proposal_id} stale or incomplete checkpoint bindings")
         if len(errors) == before:
             valid_proposals.add(proposal_id)
 
@@ -263,6 +329,28 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
 
     done = DONE
     stage_rank = STAGES
+    verified_work = set()
+    for item_id, item in work.items():
+        if item.get("independent_verification_required") is not True:
+            errors.append(f"{item_id} must require independent verification")
+        if item.get("status") in DONE:
+            binding = work_binding(item, work)
+            evidence_ids = item.get("verification_evidence_ids", [])
+            if not isinstance(evidence_ids, list):
+                evidence_ids = []
+            for eid in evidence_ids:
+                if eid not in evidence:
+                    errors.append(f"{item_id} references unknown verification evidence {eid}")
+            if not any(successful_proof(evidence[eid], item.get("candidate_commit"))
+                       and evidence[eid].get("kind") == "work_verification"
+                       and evidence[eid].get("work_item_id") == item_id
+                       and evidence[eid].get("work_digest") == binding["work_digest"]
+                       and evidence[eid].get("acceptance_command") == item.get("acceptance_command")
+                       and bindings_match(evidence[eid].get("contract_bindings"), item.get("consumes_contracts", []))
+                       for eid in evidence_ids if eid in evidence):
+                errors.append(f"{item_id} completed work lacks exact-candidate independent verification")
+            elif item.get("independent_verification_required") is True:
+                verified_work.add(item_id)
     for item_id, item in work.items():
         if not re.fullmatch(r"CSL-[0-9]+", str(item.get("parent", ""))):
             errors.append(f"{item_id} missing parent lineage")
@@ -280,8 +368,11 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
         for dependency in item.get("hard_dependencies", []):
             if dependency not in work:
                 errors.append(f"{item_id} references unknown hard dependency {dependency}")
-            elif (stage_rank[stage] >= stage_rank["development"] or item.get("status") in done) and work[dependency].get("status") not in done:
-                errors.append(f"{item_id} starts before hard dependency {dependency} is complete")
+            elif stage_rank[stage] >= stage_rank["development"] or item.get("status") in done:
+                if work[dependency].get("status") not in done:
+                    errors.append(f"{item_id} starts before hard dependency {dependency} is complete")
+                elif dependency not in verified_work:
+                    errors.append(f"{item_id} hard dependency {dependency} lacks independent verification")
         for contract_id in item.get("consumes_contracts", []):
             if contract_id not in contracts:
                 errors.append(f"{item_id} references unknown contract {contract_id}")
@@ -337,6 +428,55 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
         for evidence_id in evidence_ids:
             if evidence_id not in evidence:
                 errors.append(f"{capability_id} references unknown evidence {evidence_id}")
+        requirements = capability.get("checkpoint_requirements")
+        if not isinstance(requirements, list):
+            errors.append(f"{capability_id} requires explicit checkpoint requirements")
+            requirements = []
+        seen_checkpoints = set()
+        for requirement in requirements:
+            if not isinstance(requirement, dict):
+                errors.append(f"{capability_id} has invalid checkpoint requirement")
+                continue
+            checkpoint_id = requirement.get("checkpoint_id")
+            threshold = requirement.get("required_from_tier")
+            if checkpoint_id not in checkpoints or checkpoint_id in seen_checkpoints:
+                errors.append(f"{capability_id} has unknown or duplicate checkpoint {checkpoint_id}")
+                continue
+            seen_checkpoints.add(checkpoint_id)
+            if threshold is None:
+                if rank[current] >= rank["prototyped"]:
+                    errors.append(f"{capability_id} checkpoint threshold pending owner decision for {checkpoint_id}")
+                continue
+            if threshold not in rank:
+                errors.append(f"{capability_id} checkpoint has unknown required tier")
+                continue
+            if rank[current] < rank[threshold]:
+                continue
+            checkpoint = checkpoints[checkpoint_id]
+            for contract_id in checkpoint.get("requires", []):
+                if contract_id in contracts and contracts[contract_id].get("status") != "accepted":
+                    errors.append(f"{capability_id} checkpoint requires accepted contract {contract_id}")
+            inputs = checkpoint.get("work_item_ids", [])
+            if not isinstance(inputs, list) or not all(isinstance(wid, str) for wid in inputs):
+                inputs = []
+            expected_work = [work_binding(work[wid], work) for wid in inputs if wid in work]
+            proof_ids = checkpoint.get("evidence_ids", [])
+            if not isinstance(proof_ids, list):
+                proof_ids = []
+            if (checkpoint.get("status") != "closed" or not inputs
+                    or any(wid not in verified_work for wid in inputs)
+                    or not any(successful_proof(evidence[eid], capability.get("candidate_commit"))
+                               and evidence[eid].get("kind") == "composed_checkpoint"
+                               and evidence[eid].get("checkpoint_id") == checkpoint_id
+                               and evidence[eid].get("checkpoint_digest") == checkpoint_binding(checkpoint)["definition_digest"]
+                               and evidence[eid].get("capability_id") == capability_id
+                               and evidence[eid].get("tier") == current
+                               and evidence[eid].get("acceptance_command") == checkpoint.get("acceptance_command")
+                               and bindings_match(evidence[eid].get("contract_bindings"),
+                                                  sorted(set(checkpoint.get("requires", [])) | set(capability.get("contract_ids", []))))
+                               and exact_bindings(evidence[eid].get("work_bindings"), expected_work)
+                               for eid in proof_ids if eid in evidence)):
+                errors.append(f"{capability_id} requires closed checkpoint {checkpoint_id} with current composed verification")
         if rank[current] >= rank["prototyped"]:
             independent = rank[current] >= rank["provider_free_verified"]
             kinds = {"prototyped": "prototype", "implemented": "implementation",
@@ -388,6 +528,19 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
             errors.append(f"{risk.get('id')} lacks mitigation or trigger")
 
     for checkpoint in data["integration_checkpoints"]:
+        if checkpoint.get("status") not in {"open", "closed"}:
+            errors.append(f"{checkpoint.get('id')} has invalid checkpoint status")
+        inputs = checkpoint.get("work_item_ids")
+        if (not isinstance(inputs, list) or not inputs or not all(isinstance(wid, str) for wid in inputs)
+                or len(set(inputs)) != len(inputs) or any(wid not in work for wid in inputs)):
+            errors.append(f"{checkpoint.get('id')} requires unique known work inputs")
+        proof_ids = checkpoint.get("evidence_ids")
+        if not isinstance(proof_ids, list):
+            errors.append(f"{checkpoint.get('id')} requires evidence IDs as a list")
+            proof_ids = []
+        for eid in proof_ids:
+            if eid not in evidence:
+                errors.append(f"{checkpoint.get('id')} references unknown checkpoint evidence {eid}")
         for contract_id in checkpoint.get("requires", []):
             if contract_id not in contracts:
                 errors.append(f"{checkpoint.get('id')} references unknown contract {contract_id}")

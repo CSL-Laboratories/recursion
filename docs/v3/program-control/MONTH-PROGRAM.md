@@ -200,12 +200,17 @@ never a substitute for those actions.
 - An approved decision pins `proposal_id` and `proposal_digest` to the complete
   current packet. Digests use SHA-256 of UTF-8 JSON with sorted keys, ASCII escaping,
   compact separators, and no NaN (`digest` in the checker). Array order is significant.
-  The packet's contract bindings must exactly cover the contracts of its targets.
+  The packet's contract bindings must exactly cover the contracts of its targets
+  and their required checkpoints. Capability packets also pin `unknown_bindings`
+  (the linked unknown definitions excluding status/resolution evidence) and
+  `checkpoint_bindings` (`id`, `definition_digest`, hashing all checkpoint fields
+  except status/evidence links).
   Freshness applies to packets referenced by approved decisions. Superseded/pending
   decisions and historical packets remain stored without granting authority.
 - `target_digest` pins the target's current fields, excluding only lifecycle fields:
-  contract status/receipt; work status/stage/receipts; capability maturity/target,
-  evidence/unknown links, receipt and candidate commit; admission receipt/occupancy.
+  contract status/receipt; work status/stage/receipts/candidate/verification links;
+  capability maturity/target, evidence links, receipt and candidate commit;
+  admission receipt/occupancy. Unknown links and checkpoint requirements remain bound.
   All other fields remain bound. Candidate changes require fresh verification;
   contract or scope changes require a new human receipt. Updating a receipt digest
   without a new human approval comment is forbidden, even if structurally valid.
@@ -226,8 +231,36 @@ never a substitute for those actions.
   no per-task receipt is added for routine work inside an approved envelope.
 - Unknowns retain `status: open` or `resolved`; resolution requires
   `resolution_evidence`. Each linked open unknown blocks its named tier and every
-  later tier. Completion (`done`, `accepted`, `verified`) requires hard dependencies
-  to be complete even for research items, and dependency cycles are invalid.
+  later tier. Removing an unknown link or weakening its blocking definition
+  invalidates the prior capability approval; resolving the retained unknown does not.
+- Every work item declares `independent_verification_required: true`. Completion
+  (`done`, `accepted`, `verified`) requires retained `verification_evidence_ids`
+  pointing to successful, current, independent `work_verification` records. Each
+  record binds `work_item_id`, full `candidate_commit`, `work_digest`, the exact
+  `acceptance_command`, current consumed `contract_bindings`, artifact SHA-256 and
+  environment. `work_digest` hashes an object with `work` (all work fields except
+  status, candidate commit and verification links) and `dependency_bindings` (the
+  transitive hard-dependency closure, sorted by ID, with each dependency's `id`,
+  `candidate_commit`, and `boundary_digest` of the same non-lifecycle fields).
+  An upstream candidate or boundary change invalidates dependent and composed proof.
+  Development and completed work require every hard
+  dependency to be complete with this proof, including research prerequisites.
+  Dependency cycles are invalid; a completion label alone never unblocks work.
+- Every capability lists `checkpoint_requirements` as `{checkpoint_id,
+  required_from_tier}` entries. An empty list is an explicit scope decision bound
+  by the capability receipt. The contract does not prescribe the tier for each
+  checkpoint: the seed's null threshold remains an owner decision and blocks
+  `prototyped` or higher claims until resolved. It does not prevent research or
+  contract review. At and above a configured threshold, the checkpoint must be
+  closed, its required contracts accepted, and all its `work_item_ids` independently
+  verified. Its `evidence_ids` must retain a successful, current, independent
+  `composed_checkpoint` record binding `checkpoint_id`, `checkpoint_digest` (the
+  definition digest above), capability, exact candidate and claimed tier, acceptance
+  command, artifact SHA-256, environment, and the union of capability/checkpoint
+  contract bindings. Exact `work_bindings` (`id`, `candidate_commit`, `work_digest`)
+  pin the child inputs. Individually passing children and a closed label cannot
+  substitute for the composed run. Changing the requirement or definition needs
+  a new applicable approval; changing child candidates needs fresh composed proof.
 - At `prototyped` and above, successful current evidence must name the exact
   `capability_id`, full `candidate_commit`, `tier`, current `contract_bindings`,
   artifact and `artifact_sha256`, and environment. Kinds are `prototype`,
@@ -242,6 +275,6 @@ never a substitute for those actions.
   must use the budget and discretion prompts in the
   issue template. The checker does not read or authorize external research jobs.
 
-The seed stays candidate/researched, with open unknowns, pending acceptance and
+The seed stays candidate/researched, with open unknowns, a pending checkpoint tier, pending acceptance and
 empty admission occupancy. No accepted receipt or successful verification is
 invented to make the example pass.

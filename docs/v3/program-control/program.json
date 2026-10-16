@@ -76,7 +76,7 @@
       "revision": 1,
       "status": "candidate",
       "path": "docs/v3/program-control/MONTH-PROGRAM.md",
-      "sha256": "8a510e51d5be1d109a22133ad2638a76e5f7f6f69c9a3b04836416ce6054f3c7",
+      "sha256": "981c75ff5a39c2d6015cb7c0bf3af8b1fdc0355c9b8619d5aaddf0781241dc1f",
       "decision_issue": "CSL-204"
     }
   ],
@@ -172,7 +172,13 @@
         "unknown.independent-verification",
         "unknown.owner-contract-acceptance"
       ],
-      "decision_issue": "CSL-204"
+      "decision_issue": "CSL-204",
+      "checkpoint_requirements": [
+        {
+          "checkpoint_id": "checkpoint.program-control",
+          "required_from_tier": null
+        }
+      ]
     }
   ],
   "evidence": [
@@ -227,7 +233,11 @@
         "contract.issue-anti-drift",
         "contract.month-program"
       ],
-      "acceptance_command": "python -X utf8 -B tools/check_program_control.py"
+      "acceptance_command": "python -X utf8 -B tools/check_program_control.py",
+      "work_item_ids": [
+        "CSL-204"
+      ],
+      "evidence_ids": []
     }
   ],
   "proposals": []

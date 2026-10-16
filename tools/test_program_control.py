@@ -38,6 +38,8 @@ class ProgramControlTests(unittest.TestCase):
                    "decide_capability": {c["id"]: c for c in self.data["capabilities"]},
                    "admit_work": {self.data["program_id"]: self.data["admission"]}}
         contract_ids = set()
+        unknown_ids = set()
+        checkpoint_ids = set()
         authorizations = []
         for action, target_id in grants:
             target = targets[action][target_id]
@@ -47,11 +49,21 @@ class ProgramControlTests(unittest.TestCase):
                 contract_ids.add(target_id)
             else:
                 contract_ids.update(target.get("contract_ids", target.get("consumes_contracts", [])))
+            if action == "decide_capability":
+                unknown_ids.update(target.get("unknown_ids", []))
+                checkpoint_ids.update(req["checkpoint_id"] for req in target.get("checkpoint_requirements", []))
+        for checkpoint in self.data["integration_checkpoints"]:
+            if checkpoint["id"] in checkpoint_ids:
+                contract_ids.update(checkpoint["requires"])
         proposal = {"id": f"proposal.fixture-{len(self.data['proposals'])}",
                     "linear_issue": "CSL-204",
                     "scope": [target for _, target in grants],
                     "contract_bindings": [checker.contract_binding(c) for c in self.data["contracts"]
                                           if c["id"] in contract_ids],
+                    "unknown_bindings": [checker.unknown_binding(u) for u in self.data["unknowns"]
+                                         if u["id"] in unknown_ids],
+                    "checkpoint_bindings": [checker.checkpoint_binding(c) for c in self.data["integration_checkpoints"]
+                                            if c["id"] in checkpoint_ids],
                     "authorizations": authorizations}
         self.data["proposals"].append(proposal)
         receipt = {"id": f"decision.fixture-{len(self.data['decisions'])}",
@@ -67,6 +79,8 @@ class ProgramControlTests(unittest.TestCase):
 
     def promote(self, tier="provider_free_verified"):
         capability = self.data["capabilities"][0]
+        # Fixture-only policy; the checked-in seed deliberately leaves this unset.
+        capability["checkpoint_requirements"][0]["required_from_tier"] = "release_qualified"
         for unknown in self.data["unknowns"]:
             unknown.update(status="resolved", resolution_evidence="Synthetic fixture only")
         for contract in self.data["contracts"]:
@@ -82,7 +96,48 @@ class ProgramControlTests(unittest.TestCase):
                    status="current", tier=tier, kind=kinds.get(tier, "candidate"), independent=True,
                    artifact_sha256="b" * 64,
                    contract_bindings=[checker.contract_binding(c) for c in self.data["contracts"]])
+        if tier == "release_qualified":
+            self.close_checkpoint(capability)
         return capability, row
+
+    def verify_work(self, item, candidate="a" * 40):
+        if item["status"] not in checker.DONE:
+            item["status"] = "verified"
+        item["candidate_commit"] = candidate
+        eid = f"evidence.work-{item['id']}-{len(self.data['evidence'])}"
+        item["verification_evidence_ids"] = [eid]
+        row = {"id": eid, "kind": "work_verification", "work_item_id": item["id"],
+               "work_digest": checker.work_binding(item, {w["id"]: w for w in self.data["work_items"]})["work_digest"],
+               "candidate_commit": item["candidate_commit"],
+               "result": "pass", "status": "current", "independent": True,
+               "acceptance_command": item["acceptance_command"], "artifact": "Synthetic fixture only",
+               "artifact_sha256": "b" * 64, "environment": "synthetic",
+               "contract_bindings": [checker.contract_binding(c) for c in self.data["contracts"]
+                                     if c["id"] in item["consumes_contracts"]]}
+        self.data["evidence"].append(row)
+        return row
+
+    def close_checkpoint(self, capability):
+        checkpoint = self.data["integration_checkpoints"][0]
+        for item in self.data["work_items"]:
+            if item["id"] in checkpoint["work_item_ids"]:
+                self.verify_work(item)
+        checkpoint["status"] = "closed"
+        eid = f"evidence.checkpoint-{len(self.data['evidence'])}"
+        checkpoint["evidence_ids"] = [eid]
+        row = {"id": eid, "kind": "composed_checkpoint", "checkpoint_id": checkpoint["id"],
+               "checkpoint_digest": checker.checkpoint_binding(checkpoint)["definition_digest"],
+               "capability_id": capability["id"], "candidate_commit": capability["candidate_commit"],
+               "tier": capability["current_maturity"], "result": "pass", "status": "current", "independent": True,
+               "acceptance_command": checkpoint["acceptance_command"], "artifact": "Synthetic composition only",
+               "artifact_sha256": "c" * 64, "environment": "synthetic",
+               "contract_bindings": [checker.contract_binding(c) for c in self.data["contracts"]
+                                     if c["id"] in set(checkpoint["requires"]) | set(capability["contract_ids"])],
+               "work_bindings": [checker.work_binding(w, {item["id"]: item for item in self.data["work_items"]})
+                                 for w in self.data["work_items"]
+                                 if w["id"] in checkpoint["work_item_ids"]]}
+        self.data["evidence"].append(row)
+        return row
 
     def admit(self, mode="bounded_autonomy"):
         self.promote()
@@ -343,6 +398,8 @@ class ProgramControlTests(unittest.TestCase):
                     old["status"] = status
                     if field == "active_reviews":
                         old["stage"] = current["stage"] = "verification"
+                    if status in checker.DONE:
+                        self.verify_work(old)
                     admission["active_contract_consumers"] = [current["id"]]
                     admission[field] = [old["id"], current["id"]]
                     self.assert_rejected("stale or wrong-lane work")
@@ -393,10 +450,14 @@ class ProgramControlTests(unittest.TestCase):
         research.update(id="CSL-999", stage="research", status="done", hard_dependencies=["CSL-998"])
         research["research_plan"] = {field: "Fixture" for field in checker.PLAN_FIELDS}
         prerequisite["research_plan"] = {field: "Fixture" for field in checker.PLAN_FIELDS}
+        self.verify_work(research)
         self.data["work_items"].extend([research, prerequisite])
         item["hard_dependencies"] = ["CSL-999"]
         self.assert_rejected("CSL-999 starts before hard dependency CSL-998 is complete")
         prerequisite["status"] = "done"
+        self.verify_work(prerequisite)
+        self.assert_rejected("CSL-999 completed work lacks exact-candidate")
+        self.verify_work(research)
         self.assertEqual(self.errors(), [])
 
     def test_done_dependency_cycle_is_rejected(self):
@@ -435,6 +496,179 @@ class ProgramControlTests(unittest.TestCase):
         self.assertEqual(self.errors(), [])
         self.data["decisions"][1]["status"] = "approved"
         self.assert_rejected("stale or incomplete contract bindings")
+
+    def test_unknown_links_cannot_be_removed_or_replaced_under_old_approval(self):
+        for links in ([], ["unknown.owner-contract-acceptance"]):
+            with self.subTest(links=links):
+                self.setUp()
+                cap, _ = self.promote()
+                self.data["unknowns"][0]["status"] = "open"
+                cap["unknown_ids"] = links
+                self.assert_rejected("stale authorization target")
+                self.assert_rejected("lacks applicable human decision authority")
+
+    def test_unknown_blocking_definition_is_bound_but_resolution_can_progress(self):
+        self.promote()
+        unknown = self.data["unknowns"][0]
+        unknown["status"] = "open"
+        self.assert_rejected("blocked by unresolved")
+        unknown["status"] = "resolved"
+        self.assertEqual(self.errors(), [])
+        unknown["blocks"] = "release_qualified"
+        self.assert_rejected("stale or incomplete unknown bindings")
+
+    def test_pending_checkpoint_threshold_blocks_evidence_promotion(self):
+        cap, _ = self.promote()
+        cap["checkpoint_requirements"][0]["required_from_tier"] = None
+        self.data["decisions"][-1]["status"] = "superseded"
+        cap["decision_receipt"] = self.approve([("decide_capability", cap["id"])])
+        self.assert_rejected("checkpoint threshold pending owner decision")
+        cap["current_maturity"] = "contract_frozen"
+        self.assertEqual(self.errors(), [])
+
+    def test_checkpoint_requirement_cannot_be_removed_or_deferred_under_old_approval(self):
+        for requirements in ([], None, [{"checkpoint_id": "checkpoint.program-control", "required_from_tier": None}]):
+            with self.subTest(requirements=requirements):
+                self.setUp()
+                cap, _ = self.promote("release_qualified")
+                cap["checkpoint_requirements"] = requirements
+                self.assert_rejected("stale authorization target")
+
+    def test_open_checkpoint_blocks_at_configured_tier_but_not_below(self):
+        self.promote("locally_qualified")
+        self.assertEqual(self.errors(), [])
+        self.setUp()
+        self.promote("release_qualified")
+        self.assertEqual(self.errors(), [])
+        checkpoint = self.data["integration_checkpoints"][0]
+        checkpoint["status"] = "open"
+        self.assert_rejected("requires closed checkpoint")
+        checkpoint["status"] = "closed"
+        checkpoint["evidence_ids"] = []
+        self.assert_rejected("requires closed checkpoint")
+
+    def test_composed_proof_must_match_exact_current_scope(self):
+        variants = {"result": ["fail"], "status": ["obsolete"], "independent": [False, "true", 1],
+                    "candidate_commit": ["b" * 40], "capability_id": ["capability.unrelated"],
+                    "tier": ["provider_free_verified"], "kind": ["work_verification"],
+                    "checkpoint_id": ["checkpoint.unrelated"], "checkpoint_digest": ["f" * 64],
+                    "acceptance_command": ["true"], "contract_bindings": [[]], "work_bindings": [[]],
+                    "artifact": [""], "artifact_sha256": ["bad"], "environment": [""]}
+        for key, values in variants.items():
+            for value in values:
+                with self.subTest(key=key, value=value):
+                    self.setUp()
+                    self.promote("release_qualified")
+                    self.data["evidence"][-1][key] = value
+                    self.assert_rejected("requires closed checkpoint")
+
+    def test_checkpoint_definition_change_invalidates_approval_and_composed_proof(self):
+        self.promote("release_qualified")
+        self.data["integration_checkpoints"][0]["acceptance_command"] = "changed fixture"
+        self.assert_rejected("stale or incomplete checkpoint bindings")
+        self.assert_rejected("requires closed checkpoint")
+
+    def test_checkpoint_requires_current_verified_child_candidates(self):
+        self.promote("release_qualified")
+        child = self.data["work_items"][0]
+        child["candidate_commit"] = "d" * 40
+        self.assert_rejected("completed work lacks exact-candidate")
+        self.assert_rejected("requires closed checkpoint")
+        self.verify_work(child)
+        # Fresh child proof does not refresh the composed run's child binding.
+        child["candidate_commit"] = "d" * 40
+        self.data["evidence"][-1]["candidate_commit"] = "d" * 40
+        self.assertFalse(any("completed work lacks" in e for e in self.errors()))
+        self.assert_rejected("requires closed checkpoint")
+
+    def test_checkpoint_rejects_missing_or_malformed_inputs(self):
+        for inputs in ([], None, ["CSL-999"], ["CSL-204", "CSL-204"]):
+            with self.subTest(inputs=inputs):
+                self.setUp()
+                self.promote("release_qualified")
+                self.data["integration_checkpoints"][0]["work_item_ids"] = inputs
+                self.assert_rejected("requires unique known work inputs")
+
+    def completed_prerequisite(self, status="verified"):
+        prerequisite = copy.deepcopy(self.data["work_items"][0])
+        prerequisite.update(id="CSL-999", status=status, stage="research",
+                            research_plan={field: "Fixture" for field in checker.PLAN_FIELDS})
+        self.data["work_items"].append(prerequisite)
+        self.data["work_items"][0]["hard_dependencies"] = [prerequisite["id"]]
+        return prerequisite
+
+    def test_each_completed_status_requires_retained_verification_to_unblock(self):
+        for status in sorted(checker.DONE):
+            with self.subTest(status=status):
+                self.setUp()
+                prerequisite = self.completed_prerequisite(status)
+                self.assert_rejected("completed work lacks exact-candidate")
+                self.assert_rejected("hard dependency CSL-999 lacks independent verification")
+                self.verify_work(prerequisite)
+                self.assertEqual(self.errors(), [])
+
+    def test_missing_or_false_verification_flag_cannot_bypass_dependency_gate(self):
+        for flag in (None, False, "true", 1):
+            with self.subTest(flag=flag):
+                self.setUp()
+                prerequisite = self.completed_prerequisite()
+                if flag is None:
+                    del prerequisite["independent_verification_required"]
+                else:
+                    prerequisite["independent_verification_required"] = flag
+                self.verify_work(prerequisite)
+                self.assert_rejected("must require independent verification")
+                self.assert_rejected("hard dependency CSL-999 lacks independent verification")
+
+    def test_work_proof_must_match_exact_current_candidate_and_work(self):
+        variants = {"result": ["fail"], "status": ["obsolete"], "independent": [False, "true", 1],
+                    "candidate_commit": ["branch", "b" * 40], "work_item_id": ["CSL-204"],
+                    "kind": ["provider_free"], "work_digest": ["f" * 64],
+                    "acceptance_command": ["true"], "contract_bindings": [[{"id": "unrelated"}]],
+                    "artifact": [""], "artifact_sha256": ["bad"], "environment": [""]}
+        for key, values in variants.items():
+            for value in values:
+                with self.subTest(key=key, value=value):
+                    self.setUp()
+                    row = self.verify_work(self.completed_prerequisite())
+                    row[key] = value
+                    self.assert_rejected("completed work lacks exact-candidate")
+                    self.assert_rejected("hard dependency CSL-999 lacks independent verification")
+
+    def test_work_boundary_change_invalidates_retained_proof(self):
+        prerequisite = self.completed_prerequisite()
+        self.verify_work(prerequisite)
+        self.assertEqual(self.errors(), [])
+        prerequisite["stop_conditions"].append("Changed boundary")
+        self.assert_rejected("completed work lacks exact-candidate")
+
+    def test_human_gated_work_can_complete_with_fresh_proof_under_same_approval(self):
+        item = self.data["work_items"][0]
+        item["discretion_class"] = "human_gated"
+        item["decision_receipt"] = self.approve([("develop_work", item["id"])])
+        self.verify_work(item)
+        self.assertEqual(self.errors(), [])
+
+    def test_transitive_input_change_invalidates_dependent_and_composed_proofs(self):
+        prerequisite = self.completed_prerequisite()
+        upstream = copy.deepcopy(prerequisite)
+        upstream["id"] = "CSL-998"
+        prerequisite["hard_dependencies"] = [upstream["id"]]
+        self.data["work_items"].append(upstream)
+        self.verify_work(upstream)
+        self.verify_work(prerequisite)
+        cap, _ = self.promote("release_qualified")
+        self.assertEqual(self.errors(), [])
+        self.verify_work(upstream, candidate="d" * 40)
+        self.assert_rejected("CSL-999 completed work lacks exact-candidate")
+        self.assert_rejected("CSL-204 completed work lacks exact-candidate")
+        self.assert_rejected("requires closed checkpoint")
+        self.verify_work(prerequisite)
+        self.verify_work(self.data["work_items"][0])
+        self.assertFalse(any("completed work lacks" in e for e in self.errors()))
+        self.assert_rejected("requires closed checkpoint")
+        self.close_checkpoint(cap)
+        self.assertEqual(self.errors(), [])
 
 
 if __name__ == "__main__":

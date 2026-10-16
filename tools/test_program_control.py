@@ -956,6 +956,81 @@ class ProgramControlTests(unittest.TestCase):
                 target[path[-1]] = ["CSL-999"]
                 self.assert_rejected(fragment)
 
+    def test_program_status_is_candidate_only_even_with_other_approvals(self):
+        for status in ("accepted", "approved", "ratified", "arbitrary", "", None, False, [], {}):
+            with self.subTest(status=status):
+                self.setUp()
+                self.promote()
+                self.data["status"] = status
+                self.assert_rejected("program status must be candidate")
+
+    def test_work_reference_declarations_cannot_be_omitted_at_any_stage(self):
+        for stage in checker.STAGES:
+            for field in ("hard_dependencies", "consumes_contracts"):
+                with self.subTest(stage=stage, field=field):
+                    self.setUp()
+                    item = self.data["work_items"][0]
+                    item["stage"] = stage
+                    del item[field]
+                    self.assert_rejected(f"{field} must be a list")
+
+    def test_checkpoint_contract_declaration_cannot_be_omitted(self):
+        for promoted in (False, True):
+            with self.subTest(promoted=promoted):
+                self.setUp()
+                del self.data["integration_checkpoints"][0]["requires"]
+                if promoted:
+                    # No approval or proof may make an omitted declaration valid.
+                    self.data["capabilities"][0]["current_maturity"] = "release_qualified"
+                self.assert_rejected("requires must be a list")
+
+    def test_consequential_declaration_must_be_explicit_boolean(self):
+        for value in (None, 0, 1, "false", "true", [], {}):
+            with self.subTest(value=value):
+                self.setUp()
+                self.data["work_items"][0]["consequential"] = value
+                self.assert_rejected("explicit boolean consequential")
+        self.setUp()
+        del self.data["work_items"][0]["consequential"]
+        self.assert_rejected("explicit boolean consequential")
+
+    def test_active_proposal_binding_arrays_cannot_be_omitted(self):
+        for field in ("contract_bindings", "unknown_bindings", "checkpoint_bindings"):
+            with self.subTest(field=field):
+                self.setUp()
+                contract = self.data["contracts"][0]
+                receipt_id = self.approve([("accept_contract", contract["id"])])
+                contract.update(status="accepted", decision_receipt=receipt_id)
+                proposal = self.data["proposals"][-1]
+                del proposal[field]
+                self.data["decisions"][-1]["proposal_digest"] = checker.digest(proposal)
+                self.assert_rejected(f"explicit {field}")
+
+    def test_other_omitted_reference_inputs_already_fail_closed(self):
+        for path in (("admission", "active_contract_consumers"), ("admission", "active_reviews"),
+                     ("capabilities", 0, "checkpoint_requirements"),
+                     ("integration_checkpoints", 0, "work_item_ids"),
+                     ("integration_checkpoints", 0, "evidence_ids")):
+            with self.subTest(path=path):
+                self.setUp()
+                target = self.data
+                for key in path[:-1]:
+                    target = target[key]
+                del target[path[-1]]
+                self.assertTrue(self.errors())
+        self.setUp()
+        item = self.data["work_items"][0]
+        self.verify_work(item)
+        del item["verification_evidence_ids"]
+        self.assert_rejected("completed work lacks exact-candidate independent verification")
+
+    def test_explicit_empty_declarations_and_candidate_status_remain_valid(self):
+        self.data["integration_checkpoints"][0]["requires"] = []
+        self.assertEqual(self.data["status"], "candidate")
+        self.assertEqual(self.data["work_items"][0]["hard_dependencies"], [])
+        self.assertEqual(self.data["work_items"][0]["consumes_contracts"], [])
+        self.assertEqual(self.errors(), [])
+
     def test_capability_references_reject_object_keys_even_before_approval(self):
         for field in ("evidence_ids", "contract_ids", "unknown_ids"):
             with self.subTest(field=field):

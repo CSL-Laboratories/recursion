@@ -4,6 +4,20 @@
 
 **Status:** CSL-204 review candidate. It records proposed controls, not accepted product scope or release readiness.
 
+Schema version 1 requires the program-level `status` to remain `candidate`.
+Individual contract or capability receipts do not ratify the program. A future
+program-ratification path requires a separate owner-approved schema/policy change;
+this validator does not infer that authority.
+
+Every work item explicitly declares `hard_dependencies` and `consumes_contracts`
+as arrays and `consequential` as a boolean, including research/intake items.
+Every checkpoint explicitly declares its `requires` contract array. Empty arrays
+declare no such links; omitted declarations are invalid. Approved proposal packets
+explicitly include `contract_bindings`, `unknown_bindings` and `checkpoint_bindings`
+arrays, including empty arrays when that authorization has no corresponding links.
+Proof fields remain conditional: completed work must provide verification evidence,
+and qualification/release claims must provide their applicable profiles and proofs.
+
 ## Program objective
 
 Advance every product pillar in parallel without allowing issue volume, prototype volume or model consensus to substitute for an integrated product result.

@@ -123,6 +123,11 @@ def reference_errors(data: dict[str, Any]) -> list[str]:
     list_fields = {"hard_dependencies", "work_item_ids", "active_contract_consumers", "active_reviews"}
     resource_lists = {"contract_ids", "unknown_ids", "evidence_ids", "consumes_contracts",
                       "verification_evidence_ids", "recovery_evidence_ids", "rollback_evidence_ids", "requires"}
+    required_lists = {
+        "capabilities": ("contract_ids", "unknown_ids", "evidence_ids"),
+        "work_items": ("hard_dependencies", "consumes_contracts"),
+        "integration_checkpoints": ("requires",),
+    }
 
     def walk(value: Any, path: str) -> None:
         if isinstance(value, list):
@@ -168,10 +173,9 @@ def reference_errors(data: dict[str, Any]) -> list[str]:
         for index, row in enumerate(rows):
             if collection == "work_items":
                 issue(row.get("id"), f"work item {row.get('id')}")
-            if collection == "capabilities":
-                for field in ("contract_ids", "unknown_ids", "evidence_ids"):
-                    if field not in row:
-                        errors.append(f"{collection}[{index}].{field} must be a list of nonempty reference IDs")
+            for field in required_lists.get(collection, ()):
+                if field not in row:
+                    errors.append(f"{collection}[{index}].{field} must be a list of nonempty reference IDs")
             for field in fields:
                 if field not in row or field == "parent":
                     issue(row.get(field), f"{collection}[{index}].{field}")
@@ -202,6 +206,8 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
         return errors
     if data["schema_version"] != 1:
         errors.append("schema_version must be 1")
+    if data["status"] != "candidate":
+        errors.append("program status must be candidate; program ratification is not supported by this schema")
     if not re.fullmatch(r"[0-9a-f]{40}", str(data["source_commit"])):
         errors.append("source_commit must be a full lowercase commit hash")
 
@@ -298,6 +304,9 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
         if proposal_id not in active_proposals:
             continue
         before = len(errors)
+        for field in ("contract_bindings", "unknown_bindings", "checkpoint_bindings"):
+            if not isinstance(proposal.get(field), list):
+                errors.append(f"{proposal_id} requires explicit {field} as a list")
         grants = proposal.get("authorizations")
         scope = proposal.get("scope")
         if not isinstance(scope, list) or not scope or not all(isinstance(s, str) for s in scope):
@@ -498,6 +507,8 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
             errors.append(f"{item_id} has invalid stage")
             continue
         discretion = item.get("discretion_class")
+        if type(item.get("consequential")) is not bool:
+            errors.append(f"{item_id} requires explicit boolean consequential")
         if item.get("status") not in {"todo", "blocked", "in_progress", *DONE}:
             errors.append(f"{item_id} has invalid work status")
         if discretion not in {"bounded_autonomy", "collaborative_judgment", "human_gated"}:

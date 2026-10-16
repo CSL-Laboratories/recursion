@@ -162,7 +162,17 @@ Parallelism stops at unstable shared contracts. Research may fan out before free
 
 ## Dependencies and integration checkpoint
 
+## Research budget and continuation
+- Approved question and source class:
+- Expected quota/cost class:
+- Stop condition and evidence artifact:
+- Continuation trigger and human approval comment:
+
 ## Authority boundary and owner-decision triggers
+
+## Discretion class
+- bounded_autonomy / collaborative_judgment / human_gated:
+- Findings that change this class:
 
 ## Required human decision receipt(s)
 - Decision ID:

@@ -17,6 +17,7 @@
     "default": "approved_issue_pass_only",
     "required_plan_fields": [
       "question",
+      "source_class",
       "quota_class",
       "stop_condition",
       "evidence_artifact"
@@ -67,14 +68,16 @@
       "revision": 1,
       "status": "candidate",
       "path": "docs/v3/program-control/ISSUE-CONTRACT.md",
-      "sha256": "eae8fa9d2c11cd01ec40284d763b0aac0855ca84efd6a5ac60641f0ced48e5fe"
+      "sha256": "2bed606d1d07b905a69a7571aefe4b111d4238d78aeeb25625da7c2517d3d614",
+      "decision_issue": "CSL-204"
     },
     {
       "id": "contract.month-program",
       "revision": 1,
       "status": "candidate",
       "path": "docs/v3/program-control/MONTH-PROGRAM.md",
-      "sha256": "24a9eb4e1a62097ad44a0b84e72bf24d6146093a94754fb9720d7f373a12c0d2"
+      "sha256": "a0bd82510e229c5140aac19f539c40de0a2388c742d3f1967dbc0ad20b77414d",
+      "decision_issue": "CSL-204"
     }
   ],
   "decisions": [
@@ -128,7 +131,9 @@
       "research continuation beyond the accepted issue budget",
       "recommendation acceptance into a product contract"
     ],
-    "active_contract_consumers": []
+    "active_contract_consumers": [],
+    "active_reviews": [],
+    "decision_issue": "CSL-204"
   },
   "work_items": [
     {
@@ -166,7 +171,8 @@
       "unknown_ids": [
         "unknown.independent-verification",
         "unknown.owner-contract-acceptance"
-      ]
+      ],
+      "decision_issue": "CSL-204"
     }
   ],
   "evidence": [
@@ -185,13 +191,15 @@
       "id": "unknown.independent-verification",
       "blocks": "provider_free_verified",
       "resolution_issue": "CSL-204",
-      "exposure": "The implementer may have missed a structural or semantic defect."
+      "exposure": "The implementer may have missed a structural or semantic defect.",
+      "status": "open"
     },
     {
       "id": "unknown.owner-contract-acceptance",
       "blocks": "contract_frozen",
       "resolution_issue": "CSL-204",
-      "exposure": "Dependent issues cannot inherit the candidate as an accepted contract."
+      "exposure": "Dependent issues cannot inherit the candidate as an accepted contract.",
+      "status": "open"
     }
   ],
   "risks": [
@@ -221,5 +229,6 @@
       ],
       "acceptance_command": "python -X utf8 -B tools/check_program_control.py"
     }
-  ]
+  ],
+  "proposals": []
 }

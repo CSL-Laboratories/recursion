@@ -40,6 +40,10 @@ Maintain one matrix across native harness, upstream routes, BYOK, local intellig
 
 **Gate:** no lower evidence tier is described as a higher one; month-end scope names the required tier for each row.
 
+`month_target` is an aspiration, not an authority ceiling. Current maturity may exceed
+it only when the actual tier's cumulative authority, contract, unknown and evidence
+gates pass. This grants no new work, release, deployment or spending authority.
+
 ### 3. Human decision queue
 
 Keep a short queue of consequential decisions with the exact packet digest, options, recommendation, blocked dependants and required human decision-maker. A receipt closes the decision; an agent-generated conclusion does not.
@@ -178,3 +182,65 @@ At every checkpoint:
 ## What not to add
 
 Do not create a second broad architecture rewrite, a permanent owner for every pillar, a Deep Research run for every mechanical subtask, or parallel product ports before contracts and experiment inputs freeze. The missing layer is execution control and integration evidence, not more unbounded specification.
+
+## Offline ledger bindings
+
+The checker validates declarations and their consistency; it cannot authenticate a
+Linear comment or independently establish that an external artifact passed. Reviewers
+must inspect the pinned human comment and rerun the candidate. A passing ledger is
+never a substitute for those actions.
+
+- `proposals` retains named approval packets. Each packet has `id`, `linear_issue`, `scope`,
+  `contract_bindings` (`id`, `revision`, `sha256`) and `authorizations` (`action`,
+  `target`, `target_digest`). The supported actions are `accept_contract`,
+  `develop_work`, `decide_capability`, and `admit_work`; the target is the exact
+  contract, issue, capability, or program ID. Scope contains every authorized target.
+  The receipt and proposal must name the matching work issue or the explicit
+  `decision_issue` on the contract, capability or admission envelope.
+- An approved decision pins `proposal_id` and `proposal_digest` to the complete
+  current packet. Digests use SHA-256 of UTF-8 JSON with sorted keys, ASCII escaping,
+  compact separators, and no NaN (`digest` in the checker). Array order is significant.
+  The packet's contract bindings must exactly cover the contracts of its targets.
+  Freshness applies to packets referenced by approved decisions. Superseded/pending
+  decisions and historical packets remain stored without granting authority.
+- `target_digest` pins the target's current fields, excluding only lifecycle fields:
+  contract status/receipt; work status/stage/receipts; capability maturity/target,
+  evidence/unknown links, receipt and candidate commit; admission receipt/occupancy.
+  All other fields remain bound. Candidate changes require fresh verification;
+  contract or scope changes require a new human receipt. Updating a receipt digest
+  without a new human approval comment is forbidden, even if structurally valid.
+- Accepted contracts reference their `decision_receipt`. Developing consumers pin
+  the same receipt in `contract_receipts`, keyed by contract ID. Human-gated work
+  also requires its own applicable `develop_work` receipt, regardless of the legacy
+  `consequential` flag. At `human_decided` and above, a capability needs an applicable
+  `decide_capability` receipt. At `contract_frozen` and above its nonempty linked
+  contracts must all be accepted. These checks accumulate at higher tiers.
+- `active_contract_consumers` and `active_reviews` list unique existing work IDs.
+  In-progress development-or-later consumers and verification work cannot be omitted.
+  Open admission, and occupied bounded admission, require positive consumer/review
+  caps plus an `admit_work` receipt binding the actual mode, limits and policy.
+  Each list must fit its cap. Empty bounded admission may retain null limits and a
+  pending receipt; it admits no contract consumers/reviews until that envelope is
+  approved. Routine non-consuming candidate work and unrelated research continue;
+  no per-task receipt is added for routine work inside an approved envelope.
+- Unknowns retain `status: open` or `resolved`; resolution requires
+  `resolution_evidence`. Each linked open unknown blocks its named tier and every
+  later tier. Completion (`done`, `accepted`, `verified`) requires hard dependencies
+  to be complete even for research items, and dependency cycles are invalid.
+- At `prototyped` and above, successful current evidence must name the exact
+  `capability_id`, full `candidate_commit`, `tier`, current `contract_bindings`,
+  artifact and `artifact_sha256`, and environment. Kinds are `prototype`,
+  `implementation`, `provider_free`, `local_qualification`, `release_qualification`
+  respectively. Evidence must match the claimed tier, not merely a lower tier.
+  At `provider_free_verified` and above, `independent` must be boolean true.
+  These records attest the claimed tier's cumulative checks; they do not authorize
+  live runs. Historical/candidate evidence may stay linked but cannot promote.
+- Research requirements always include `question`, `source_class`, `quota_class`,
+  `stop_condition`, and `evidence_artifact`. Any recorded `research_plan` must
+  supply them, and active/completed research work cannot omit its plan. Issue authors
+  must use the budget and discretion prompts in the
+  issue template. The checker does not read or authorize external research jobs.
+
+The seed stays candidate/researched, with open unknowns, pending acceptance and
+empty admission occupancy. No accepted receipt or successful verification is
+invented to make the example pass.

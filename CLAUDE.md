@@ -369,14 +369,25 @@ bounded event visibility retries, its pre-write intent blocks automatic READY
 until an explicit human remove/re-add resolves the uncertainty; later runs never
 claim ownership of that ambiguous label.
 
-Handled receipts use version 2 and copy the exact observation token from
-preflight. The token binds the meaningful trusted follow-up comment IDs, author
-IDs and body digests observed for that root. Timestamps do not establish edit
-order: an already-observed edit does not rearm, while a new, edited or deleted
-meaningful follow-up changes the token and remains eligible. Unchanged replay
-keeps the same attempt fingerprint and the three-attempt limit. Legacy or
-malformed receipts without this proof cannot suppress findings; no deployed
-receipt migration is assumed.
+Handled receipts use version 3 and copy the exact observation token and durable
+generation from preflight. The authenticated Actions observation journal records
+each observed transition for a root, including its root-body fingerprint. Generations bind
+the predecessor and current snapshot, so an observed added/deleted or
+changed/reverted reply or root body cannot revive an older receipt. Duplicate identical
+transitions reuse one generation; conflicting or incomplete histories fail closed
+for human investigation. READY and all fixer/manual writers share the same
+per-PR queue. Journal writes must succeed before a decision relies on them.
+
+The snapshot binds meaningful trusted follow-up comment IDs, author IDs and
+body digests. Exact unchanged content retains its previously authenticated
+classification even if its author later loses permission. Content not previously
+authenticated in this history requires current authorization; restoring exact
+historical content still advances the generation when the state changes. Timestamps do not establish edit order. Legacy
+receipts without durable generation proof cannot suppress findings; no deployed
+receipt migration is assumed. Changes created and removed entirely between
+observations are not detectable from the current GitHub API snapshot and are
+not claimed as observed. Deleting trusted journal history can likewise remove
+evidence; incomplete chains are rejected rather than guessed.
 
 For an uncertain label write, inspect the label and use the exact command
 printed in the gate notice: `/claude-fixer reconcile-label <nonce> <live-head-sha>`.

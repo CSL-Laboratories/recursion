@@ -421,9 +421,10 @@ def validate_shared_writer_queues(text: str, expected_groups: list[str]) -> None
 
 
 class SharedQueuePolicyTests(unittest.TestCase):
-    def test_all_three_shared_writers_use_bounded_fifo_queue(self) -> None:
+    def test_all_four_shared_writers_use_bounded_fifo_queue(self) -> None:
         validate_shared_writer_queues(WORKFLOW_PATH.read_text(), ["claude-${{ needs.resolve-pr.outputs.pr_number }}"] * 2)
         validate_shared_writer_queues(SCAN_WORKFLOW_PATH.read_text(), ["claude-${{ matrix.pr.number }}"])
+        validate_shared_writer_queues((ROOT / ".github/workflows/codex-gate.yml").read_text(), ["claude-${{ github.event.pull_request.number }}"])
 
     def test_mutations_cannot_hide_behind_actionlint_compatibility_exception(self) -> None:
         original = WORKFLOW_PATH.read_text()
@@ -437,13 +438,27 @@ class SharedQueuePolicyTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate_shared_writer_queues(bad, ["claude-${{ needs.resolve-pr.outputs.pr_number }}"] * 2)
 
+    def test_codex_journal_writer_lock_rejects_queue_and_group_drift(self):
+        workflow = (ROOT / ".github/workflows/codex-gate.yml").read_text()
+        group = "claude-${{ github.event.pull_request.number }}"
+        for bad in (workflow.replace("queue: max", "queue: min"),
+                    workflow.replace("cancel-in-progress: false", "cancel-in-progress: true"),
+                    workflow.replace(group, "codex-independent")):
+            with self.assertRaises(ValueError):
+                validate_shared_writer_queues(bad, [group])
+        verdict = workflow.split("  verdict:", 1)[1]
+        self.assertIn("github.event_name == 'pull_request_review'", verdict)
+        self.assertNotIn("gh run watch", verdict)
+        self.assertNotIn("workflow_run", verdict)
+
     def test_actionlint_exception_is_exact_and_path_scoped(self) -> None:
         config = (ROOT / ".github/actionlint.yaml").read_text()
         pattern = '^unexpected key "queue" for "concurrency" section\\. expected one of "cancel-in-progress", "group"$'
-        self.assertEqual(config.count("      - '" + pattern + "'"), 2)
-        self.assertEqual(config.count("    ignore:"), 2)
+        self.assertEqual(config.count("      - '" + pattern + "'"), 3)
+        self.assertEqual(config.count("    ignore:"), 3)
         self.assertIn("  .github/workflows/claude.yml:", config)
         self.assertIn("  .github/workflows/conflict-scan.yml:", config)
+        self.assertIn("  .github/workflows/codex-gate.yml:", config)
         self.assertIn("blacksmith-2vcpu-ubuntu-2404", config)
 
 

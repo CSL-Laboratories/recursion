@@ -40,17 +40,28 @@ def reply(data, user=None):
             "user": user or actor(), "body": m.marker("result", data)}
 
 
+def prepare(items, comments=(), history=None, permission=lambda _: "write"):
+    if history is None:
+        history = []
+    def record(body):
+        history.append({"id": len(history) + 1, "body": body,
+                        "user": actor("github-actions[bot]", m.ACTIONS_ID)})
+    return m.prepare_observations(items, list(comments), history, permission, record)
+
+
 class ReceiptTests(unittest.TestCase):
     def setUp(self):
         sleeper = patch.object(m.time, "sleep")
         self.sleep = sleeper.start()
         self.addCleanup(sleeper.stop)
-        self.items = findings([thread()])
-        self.receipt = {"v": 2, "observation": m.observation_token([], lambda _: "write"), "root": 1, "fingerprint": self.items[0]["fingerprint"],
+        self.history = []
+        self.items = prepare(findings([thread()]), history=self.history)
+        self.receipt = {**self.items[0], "root": 1, "fingerprint": self.items[0]["fingerprint"],
                         "status": "addressed", "base": A, "commit": B}
 
     def pending(self, comments, compare=lambda base, tip: "ahead", manual=False):
-        return m.pending_findings(self.items, comments, C, compare, lambda user: "write", manual)
+        items = prepare(self.items, comments, self.history)
+        return m.pending_findings(items, comments, C, compare, lambda user: "write", manual)
 
     def test_rejections_and_head_observations_require_trusted_provenance(self):
         import subprocess
@@ -98,7 +109,7 @@ class ReceiptTests(unittest.TestCase):
                   "updated_at": "2026-10-16T01:00:00Z",
                   "user": actor("devin-ai-integration[bot]", m.DEVIN_ID), "body": "Still fails"}
         preflight = self.pending([follow])[0]
-        receipt = reply(self.receipt | {"observation": preflight["observation"]}) | {"id": 100}
+        receipt = reply(self.receipt | {"observation": preflight["observation"], "generation": preflight["generation"]}) | {"id": 100}
         # Edit was observed before preflight: equal-second receipt suppresses it.
         self.assertEqual(self.pending([receipt, follow]), [])
         # Same timestamp, changed body after preflight: retry regardless of ID.
@@ -109,12 +120,87 @@ class ReceiptTests(unittest.TestCase):
         self.assertTrue(self.pending([receipt]))  # Deletion changes snapshot.
         self.assertTrue(self.pending([receipt, follow, changed | {"id": 101}]))
         for bad in ({}, {"v": 1}, {"v": True}, {"observation": "bad"}):
-            data = self.receipt | {"observation": preflight["observation"]} | bad
+            data = self.receipt | {"observation": preflight["observation"], "generation": preflight["generation"]} | bad
             if not bad:
                 data.pop("v")
             self.assertTrue(self.pending([reply(data), follow]))
-        # An unchanged observation remains valid on later descendant heads.
-        self.assertEqual(m.pending_findings(self.items, [receipt, follow], C, lambda b,t: "ahead", lambda _: "write"), [])
+        # Returning to the earlier content never revives that old receipt.
+        self.assertTrue(self.pending([receipt, follow]))
+
+    def test_permission_loss_preserves_unchanged_observed_classification(self):
+        follow = {"id": 41, "in_reply_to_id": 1, "user": {"id": 12, "login": "writer", "type": "User"}, "body": "Correction"}
+        for status in ("addressed", "needs-human"):
+            history = []
+            first = prepare(findings([thread()]), [follow], history)[0]
+            receipt = reply({**self.receipt, **first, "status": status})
+            denied = lambda _: "read"
+            stable = prepare(findings([thread()]), [follow, receipt], history, denied)
+            self.assertEqual(first, stable[0])
+            self.assertEqual(m.pending_findings(stable, [follow, receipt], C, lambda b,t: "ahead", denied), [])
+            edited = follow | {"body": "Changed without authorization"}
+            changed = prepare(findings([thread()]), [edited, receipt], history, denied)
+            self.assertEqual(changed[0]["observation"], m.observation_token([], denied))
+            self.assertNotEqual(changed[0]["generation"], first["generation"])
+            new = follow | {"id": 42}
+            self.assertEqual(prepare(findings([thread()]), [new], [], denied)[0]["observation"], m.observation_token([], denied))
+
+    def test_journal_aba_duplicates_conflicts_and_failed_persistence(self):
+        follow = {"id": 41, "in_reply_to_id": 1, "user": actor("devin-ai-integration[bot]", m.DEVIN_ID), "body": "Correction"}
+        for status in ("addressed", "needs-human"):
+            history = []
+            original = prepare(findings([thread()]), history=history)[0]
+            receipt = reply({**self.receipt, **original, "status": status})
+            changed = prepare(findings([thread()]), [follow, receipt], history)[0]
+            reverted = prepare(findings([thread()]), [receipt], history)[0]
+            self.assertEqual(reverted["observation"], original["observation"])
+            self.assertNotEqual(reverted["generation"], original["generation"])
+            self.assertTrue(m.pending_findings([reverted], [receipt], C, lambda b,t: "ahead", lambda _: "write"))
+            self.assertEqual(reverted, prepare(findings([thread()]), [receipt], history)[0])
+            # Identical concurrent transitions from one predecessor deduplicate.
+            base = history[:1]
+            left, right = list(base), list(base)
+            litem = prepare(findings([thread()]), [follow], left)[0]
+            ritem = prepare(findings([thread()]), [follow], right)[0]
+            self.assertEqual(m.attempt_key(C, [litem]), m.attempt_key(C, [ritem]))
+            merged = base + left[1:] + right[1:]
+            self.assertEqual(litem, prepare(findings([thread()]), [follow], merged)[0])
+            other = list(base)
+            prepare(findings([thread()]), [follow | {"body": "different"}], other)
+            with self.assertRaisesRegex(ValueError, "conflicting"):
+                prepare(findings([thread()]), [follow], merged + other[1:])
+        with self.assertRaises(OSError):
+            m.prepare_observations(findings([thread()]), [], [], lambda _: "write",
+                lambda body: (_ for _ in ()).throw(OSError("cannot persist")))
+        # A change never visible in any observation is not recoverable from current API state.
+        self.assertEqual(prepare(findings([thread()]), [], list(base))[0], original)
+
+    def test_observed_root_body_aba_advances_the_same_root_chain(self):
+        history = []
+        roots = findings([thread()])
+        original = prepare(roots, history=history)[0]
+        changed_roots = findings([thread('<!-- devin-review-comment {"kind":"bug"} --> Changed root')])
+        changed = prepare(changed_roots, history=history)[0]
+        restored = prepare(roots, history=history)[0]
+        self.assertEqual(original["fingerprint"], restored["fingerprint"])
+        self.assertNotEqual(original["generation"], restored["generation"])
+        self.assertNotEqual(changed["generation"], restored["generation"])
+        receipt = reply({**self.receipt, **original})
+        self.assertTrue(m.pending_findings([restored], [receipt], C, lambda b,t: "ahead", lambda _: "write"))
+
+    def test_journal_requires_authenticated_complete_history(self):
+        follow = {"id": 41, "in_reply_to_id": 1, "user": {"id": 12, "login": "writer", "type": "User"}, "body": "Correction"}
+        history = []
+        prepare(findings([thread()]), history=history)
+        current = prepare(findings([thread()]), [follow], history)[0]
+        self.assertEqual(current, prepare(findings([thread()]), [follow], list(reversed(history)), lambda _: "read")[0])
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            prepare(findings([thread()]), [follow], history[1:])
+        forged = [c | {"user": actor("github-actions[bot]", 1)} for c in history]
+        untrusted = prepare(findings([thread()]), [follow], forged, lambda _: "read")[0]
+        self.assertNotEqual(current["observation"], untrusted["observation"])
+        # Identity changes are new content requiring current permission.
+        replaced = follow | {"user": {"id": 13, "login": "other", "type": "User"}}
+        self.assertNotEqual(current["observation"], prepare(findings([thread()]), [replaced], history, lambda _: "read")[0]["observation"])
 
     def test_exact_human_confirmation_only_settles_specific_live_intent(self):
         intent = {"nonce": "a" * 32, "head": A, "after": 0}
@@ -139,8 +225,9 @@ class ReceiptTests(unittest.TestCase):
                       "body": "> " + terminal["body"] + "\nThis still fails with empty input."}
         self.assertTrue(self.pending([terminal, correction]))
         quote_only = correction | {"body": "> " + terminal["body"]}
-        self.assertEqual(self.pending([terminal, quote_only]), [])
-        self.assertEqual(m.pending_findings(self.items, [terminal, correction], C,
+        self.assertTrue(self.pending([terminal, quote_only]))  # Observed correction cannot be forgotten.
+        self.assertEqual(m.pending_findings(prepare(self.items, [terminal, quote_only]), [terminal, quote_only], C, lambda b,t: "ahead", lambda _: "write"), [])
+        self.assertEqual(m.pending_findings(prepare(self.items, [terminal, correction], permission=lambda _: "read"), [terminal, correction], C,
             lambda b,t: "ahead", lambda u: "read"), [])
 
     def test_root_requires_rest_numeric_bot_identity(self):
@@ -161,7 +248,7 @@ class ReceiptTests(unittest.TestCase):
         resolved, outdated = thread(root=3), thread(root=4)
         resolved["isResolved"], outdated["isOutdated"] = True, True
         items = findings([old, late, resolved, outdated])
-        pending = m.pending_findings(items, [reply(self.receipt)], B,
+        pending = m.pending_findings(prepare(items), [reply(self.receipt)], B,
             lambda base, tip: "identical" if base == tip else "ahead", lambda user: "write")
         self.assertEqual([item["root"] for item in pending], [2])
 
@@ -205,9 +292,10 @@ class ReceiptTests(unittest.TestCase):
         structured = follow | {"body": '<!-- devin-review-comment {"kind":"bug"} -->\nStill broken'}
         self.assertTrue(self.pending([receipt, structured]))
         analysis = follow | {"body": '<!-- devin-review-comment {"kind":"analysis"} -->\nStill reviewing'}
-        self.assertEqual(self.pending([receipt, analysis]), [])
+        self.assertTrue(self.pending([receipt, analysis]))  # Removing a previously observed bug remains new work.
+        self.assertEqual(m.pending_findings(prepare(self.items, [receipt, analysis]), [receipt, analysis], C, lambda b,t: "ahead", lambda _: "write"), [])
         noise = follow | {"user": actor("other[bot]", 1)}
-        self.assertEqual(self.pending([receipt, noise]), [])
+        self.assertTrue(self.pending([receipt, noise]))
 
 
 class AttemptTests(unittest.TestCase):
@@ -215,7 +303,8 @@ class AttemptTests(unittest.TestCase):
         sleeper = patch.object(m.time, "sleep")
         self.sleep = sleeper.start()
         self.addCleanup(sleeper.stop)
-        self.items = m.pending_findings(findings([thread()]), [], A, lambda b,t: "ahead", lambda _: "write")
+        self.history = []
+        self.items = prepare(findings([thread()]), history=self.history)
         self.key = m.attempt_key(A, self.items)
 
     def attempts(self, count=3, user=None):
@@ -242,7 +331,7 @@ class AttemptTests(unittest.TestCase):
             "LOOP_COMMIT_COUNT": loop_count, "MANUAL_RETRY": "true" if manual else "false", "GITHUB_OUTPUT": str(Path(d) / "out"),
             "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1"}), \
                 patch.object(m.subprocess, "check_output", return_value=json.dumps(threads)), \
-                patch.object(m, "pages", side_effect=[root_comments([thread()]) + ([reply({"v": 2, "observation": m.observation_token([], lambda _: "write"), "root": 1, "fingerprint": self.items[0]["fingerprint"], "base": A, "commit": B, "status": "addressed"})] if compare_error else []), self.attempts(count)]), \
+                patch.object(m, "pages", side_effect=[root_comments([thread()]) + ([reply({**self.items[0], "root": 1, "fingerprint": self.items[0]["fingerprint"], "base": A, "commit": B, "status": "addressed"})] if compare_error else []), self.history, self.attempts(count)]), \
                 patch.object(m, "api", side_effect=api_response), \
                 patch.object(m, "revoke_owned_ci"), \
                 patch.object(m, "post", side_effect=OSError("write failed") if post_error else None) as post:

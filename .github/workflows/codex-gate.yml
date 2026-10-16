@@ -59,6 +59,12 @@ jobs:
           python3 -X utf8 -B "$script" request
 
   verdict:
+    # Serialize every observation-journal writer with the fixer/human PR writers.
+    # Dispatches are fire-and-forget; this job never waits for another writer.
+    concurrency:
+      group: claude-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+      queue: max
     if: >-
       github.event_name == 'pull_request_review' &&
       (

@@ -311,7 +311,8 @@ def current_ready_head(repo: str, number: str, sha: str, token: str, gh: GhCall 
 
 
 def readiness_blocked(repo: str, number: str, sha: str, comments: list[dict[str, Any]], token: str, gh: GhCall = _gh) -> bool:
-    return fixer_helpers().readiness_blocked(repo, number, sha, comments, read_api=lambda path: json.loads(gh(["api", path], token)))
+    return fixer_helpers().readiness_blocked(repo, number, sha, comments, read_api=lambda path: json.loads(gh(["api", path], token)),
+        record=lambda body: post_comment(repo, number, body, token, gh=gh))
 
 
 def comments_after_pause(sha: str, comments: list[dict[str, Any]], writer: dict[str, Any] | None = None) -> list[str]:

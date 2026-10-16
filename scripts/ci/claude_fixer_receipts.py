@@ -116,33 +116,109 @@ def substantive_followup(comment: dict, permission) -> bool:
     return permission(login) in {"write", "maintain", "admin"}
 
 
-def observation_token(replies, permission):
-    """Order-independent proof of the exact meaningful trusted reply snapshot."""
+def observed_replies(replies, permission, prior=()):
+    """Preserve exact previously authenticated content; authenticate changes."""
+    known = {(r["id"], r["author"], r["body"]) for r in prior}
     observed = {}
     for comment in replies:
-        if not substantive_followup(comment, permission):
-            continue
         cid, uid = comment.get("id"), (comment.get("user") or {}).get("id")
+        body = digest(str(comment.get("body") or ""))
+        if (cid, uid, body) not in known and not substantive_followup(comment, permission):
+            continue
         if type(cid) is not int or cid <= 0 or type(uid) is not int or uid <= 0:
             raise ValueError("meaningful follow-up lacks stable identity")
-        entry = {"id": cid, "author": uid, "body": digest(str(comment.get("body") or ""))}
+        entry = {"id": cid, "author": uid, "body": body}
         if cid in observed and observed[cid] != entry:
             raise ValueError("inconsistent duplicate follow-up snapshot")
         observed[cid] = entry
-    return digest(json.dumps(sorted(observed.values(), key=lambda c: (c["id"], c["author"], c["body"])), sort_keys=True, separators=(",", ":")))
+    return sorted(observed.values(), key=lambda c: (c["id"], c["author"], c["body"]))
+
+
+def snapshot_token(observed):
+    return digest(json.dumps(observed, sort_keys=True, separators=(",", ":")))
+
+
+def observation_token(replies, permission):
+    return snapshot_token(observed_replies(replies, permission))
+
+
+def journal_generation(root, fingerprint, predecessor, observation):
+    return digest(json.dumps([root, fingerprint, predecessor, observation], separators=(",", ":")))
+
+
+def prepare_observations(items, replies, history, permission, record):
+    """Durably advance a deterministic chain before relying on observed state."""
+    prepared = []
+    for item in items:
+        journals = {}
+        for comment in history:
+            if not bot(comment.get("user") or {}, "github-actions[bot]", ACTIONS_ID):
+                continue
+            for entry in records(str(comment.get("body") or ""), "observation"):
+                if entry.get("root") != item["root"]:
+                    continue
+                observed, previous = entry.get("observed"), entry.get("previous")
+                if (type(entry.get("root")) is not int or not DIGEST_RE.fullmatch(str(entry.get("fingerprint") or "")) or not isinstance(observed, list)
+                        or not isinstance(previous, str) or (previous and not DIGEST_RE.fullmatch(previous))):
+                    raise ValueError("malformed observation journal")
+                if any(not isinstance(r, dict) or type(r.get("id")) is not int or r["id"] <= 0
+                       or type(r.get("author")) is not int or r["author"] <= 0
+                       or not DIGEST_RE.fullmatch(str(r.get("body") or "")) for r in observed):
+                    raise ValueError("malformed observation entries")
+                canonical = sorted(observed, key=lambda r: (r["id"], r["author"], r["body"]))
+                if canonical != observed or len({r["id"] for r in observed}) != len(observed):
+                    raise ValueError("noncanonical observation journal")
+                token = snapshot_token(observed)
+                generation = journal_generation(item["root"], entry["fingerprint"], previous, token)
+                if entry.get("observation") != token or entry.get("generation") != generation:
+                    raise ValueError("invalid observation generation")
+                if generation in journals and journals[generation] != entry:
+                    raise ValueError("inconsistent observation generation")
+                journals[generation] = entry
+        previous_ids = {entry["previous"] for entry in journals.values() if entry["previous"]}
+        if not previous_ids.issubset(journals):
+            raise ValueError("incomplete observation history")
+        leaves = set(journals) - previous_ids
+        if journals and len(leaves) != 1:
+            raise ValueError("conflicting observation history; human investigation required")
+        previous = next(iter(leaves), "")
+        # Every accepted node must belong to the single chain, not a hidden cycle.
+        chain, cursor = set(), previous
+        while cursor:
+            if cursor in chain:
+                raise ValueError("cyclic observation history")
+            chain.add(cursor)
+            cursor = journals[cursor]["previous"]
+        if chain != set(journals):
+            raise ValueError("disconnected observation history")
+        prior = [r for entry in journals.values() for r in entry["observed"]]
+        observed = observed_replies([c for c in replies if c.get("in_reply_to_id") == item["root"]], permission, prior)
+        token = snapshot_token(observed)
+        if not previous or journals[previous]["observation"] != token or journals[previous]["fingerprint"] != item["fingerprint"]:
+            generation = journal_generation(item["root"], item["fingerprint"], previous, token)
+            entry = {"root": item["root"], "fingerprint": item["fingerprint"], "previous": previous,
+                     "generation": generation, "observation": token, "observed": observed}
+            record(marker("observation", entry))  # Failure aborts before decisions.
+        else:
+            generation = previous
+        prepared.append({**item, "v": 3, "observation": token, "generation": generation})
+    return prepared
 
 
 def pending_findings(items: list[dict], comments: list[dict], head: str, compare, permission, manual: bool = False) -> list[dict]:
     pending = []
     for item in items:
         replies = [c for c in comments if c.get("in_reply_to_id") == item["root"]]
-        observation = observation_token(replies, permission)
+        observation = item.get("observation")
+        generation = item.get("generation")
+        if not DIGEST_RE.fullmatch(str(observation or "")) or not DIGEST_RE.fullmatch(str(generation or "")):
+            raise ValueError("findings require durable observation context")
         terminal = False
         for reply in replies:
             if not bot(reply.get("user") or {}, "claude[bot]", CLAUDE_ID):
                 continue
             for receipt in records(str(reply.get("body") or ""), "result"):
-                if type(receipt.get("v")) is not int or receipt["v"] != 2 or receipt.get("observation") != observation:
+                if type(receipt.get("v")) is not int or receipt["v"] != 3 or receipt.get("observation") != observation or receipt.get("generation") != generation:
                     continue
                 if type(receipt.get("root")) is not int or receipt.get("root") != item["root"] or receipt.get("fingerprint") != item["fingerprint"]:
                     continue
@@ -159,7 +235,7 @@ def pending_findings(items: list[dict], comments: list[dict], head: str, compare
                 if valid and (status == "addressed" or not manual):
                     terminal = True
         if not terminal:
-            pending.append({**item, "v": 2, "observation": observation})
+            pending.append(item)
     return pending
 
 
@@ -213,7 +289,7 @@ def emit(items: list[dict], head: str, reason: str = "") -> None:
     print(json.dumps(ids))
 
 
-def live_state(repo: str, number: str, head: str) -> tuple[list[dict], list[dict]]:
+def live_state(repo: str, number: str, head: str, history=None, record=None) -> tuple[list[dict], list[dict]]:
     owner, name = repo.split("/")
     threads, cursor = [], None
     while True:
@@ -251,6 +327,10 @@ def live_state(repo: str, number: str, head: str) -> tuple[list[dict], list[dict
 
     review_comments = pages(f"repos/{repo}/pulls/{number}/comments")
     roots = findings(threads, review_comments, strict_snapshot=True)
+    if roots:
+        history = pages(f"repos/{repo}/issues/{number}/comments") if history is None else history
+        roots = prepare_observations(roots, review_comments, history, permission,
+            record or (lambda body: post(repo, number, body)))
     return (pending_findings(roots, review_comments, head, compare, permission, False),
             pending_findings(roots, review_comments, head, compare, permission, True))
 
@@ -440,8 +520,8 @@ def latest_ready_check(comments, head, pause):
                 for r in records(str(c.get("body") or ""), "ci-checked"))), default=0)
 
 
-def readiness_blocked(repo: str, number: str, head: str, comments: list[dict], read_api=None) -> bool:
-    """Read-only reconciliation; an obsolete fingerprint alone never blocks READY."""
+def readiness_blocked(repo: str, number: str, head: str, comments: list[dict], read_api=None, record=None) -> bool:
+    """Reconcile and durably record observations before declaring readiness."""
     pr = (read_api or api)(f"repos/{repo}/pulls/{number}")
     if (pr.get("state") != "open" or pr.get("draft") is not False
             or (pr.get("head") or {}).get("sha") != head
@@ -449,7 +529,7 @@ def readiness_blocked(repo: str, number: str, head: str, comments: list[dict], r
         return True
     # READY concerns all unsettled findings, not merely automatic retry budget.
     # The second view retains needs-human handoffs but excludes verified fixes.
-    _, unresolved = live_state(repo, number, head)
+    _, unresolved = live_state(repo, number, head, history=comments, record=record)
     return bool(unresolved)
 
 

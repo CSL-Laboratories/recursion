@@ -837,7 +837,7 @@ class RealHelperLifecycleTests(unittest.TestCase):
             gate.post_comment(repo, number, body, "read", gh=gh)
         def ready():
             return gate.run_verdict(review_event(login=gate.CODEX_REVIEW_LOGIN, body="CODEX-GATE: READY", sha=state["head"]), REPO, "pat", "read", "master", gh=gh)
-        with mock.patch.object(gate, "fixer_helpers", return_value=helper), mock.patch.object(helper, "live_state", side_effect=lambda *args: (state["pending"], state["pending"])), mock.patch.object(gate, "emit"):
+        with mock.patch.object(gate, "fixer_helpers", return_value=helper), mock.patch.object(helper, "live_state", side_effect=lambda *args, **kwargs: (state["pending"], state["pending"])), mock.patch.object(gate, "emit"):
             self.assertEqual(ready()["action"], "ready")
             self.assertTrue(state["label"])
             before = (len(state["comments"]), len(state["events"]))

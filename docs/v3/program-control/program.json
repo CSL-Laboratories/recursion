@@ -30,14 +30,14 @@
       "revision": 1,
       "status": "candidate",
       "path": "docs/v3/program-control/ISSUE-CONTRACT.md",
-      "sha256": "8b8da6a6204a0dd6d1804a3248a75507d3174af1cd327d1585b41db2e29e4919"
+      "sha256": "5cf1bc7354bfa7d3e4adbd4fdabe4d77269eacfc7564648b2856a8a27db11703"
     },
     {
       "id": "contract.month-program",
       "revision": 1,
       "status": "candidate",
       "path": "docs/v3/program-control/MONTH-PROGRAM.md",
-      "sha256": "32b7c21b91928708ed23dd36d6ef6d130aa088590434f772178c3c29916bfdb6"
+      "sha256": "bf430290d230f8aa5ce7661790ccb2fef383ee85a6cfb48624bb1cbaa2b0a4ed"
     }
   ],
   "decisions": [
@@ -67,10 +67,28 @@
     }
   ],
   "admission": {
-    "mode": "closed_pending_human_limits",
+    "mode": "bounded_autonomy",
     "max_active_contract_consumers": null,
     "max_concurrent_reviews": null,
     "decision_receipt": null,
+    "routine_work_default": "proceed",
+    "human_gate_default": "block_affected_lineage_only",
+    "allowed_agent_actions": [
+      "research",
+      "reversible implementation",
+      "local prototypes",
+      "testing and failure repair",
+      "independent verification",
+      "deduplicated follow-up issue creation"
+    ],
+    "human_decision_triggers": [
+      "product intent or public semantics",
+      "authority, privacy, or credential custody",
+      "spending or external quota",
+      "compatibility or release commitment",
+      "destructive external state",
+      "architecture costly to reverse"
+    ],
     "active_contract_consumers": []
   },
   "work_items": [
@@ -80,6 +98,7 @@
       "status": "in_progress",
       "stage": "development",
       "consequential": false,
+      "discretion_class": "bounded_autonomy",
       "hard_dependencies": [],
       "consumes_contracts": [],
       "acceptance_command": "python -X utf8 -B tools/check_program_control.py",

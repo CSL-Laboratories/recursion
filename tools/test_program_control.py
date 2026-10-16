@@ -71,6 +71,11 @@ class ProgramControlTests(unittest.TestCase):
         self.assertTrue(any("open admission lacks" in error for error in errors))
         self.assertTrue(any("positive max_concurrent_reviews" in error for error in errors))
 
+    def test_bounded_autonomy_requires_explicit_agent_and_human_boundaries(self) -> None:
+        data = copy.deepcopy(self.data)
+        data["admission"]["human_decision_triggers"] = []
+        self.assertTrue(any("non-empty human_decision_triggers" in error for error in self.errors(data)))
+
 
 if __name__ == "__main__":
     unittest.main()

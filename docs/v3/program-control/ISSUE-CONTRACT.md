@@ -1,6 +1,6 @@
 # Candidate: Recursion research-driven issue contract
 
-**Purpose:** preserve product direction while allowing developers and agents to claim and execute issues in parallel.  
+**Purpose:** preserve product direction while allowing developers and agents to claim and execute issues in parallel.
 **Status:** CSL-204 review candidate. It is non-normative until a human accepts its exact digest.
 
 ## Core rule
@@ -33,6 +33,18 @@ Consequential decisions are made by an identified human, never inferred from age
 - **Human decision-maker:** Lucas, or a human approver Lucas explicitly delegates for the named decision scope. Assignment to an agent, bot or model is not delegation of decision authority.
 - **Bounded engineering discretion:** an issue may explicitly delegate reversible implementation details within an accepted contract. That discretion does not include product intent, public semantics, authority, privacy, spending, credentials, compatibility, release scope or irreversible architecture.
 
+### Symbiotic execution model
+
+Human sovereignty is a boundary, not a requirement for humans to direct every step. The default is agent initiative inside an accepted envelope and human judgment at consequential thresholds.
+
+- **Bounded autonomy:** agents and developers may independently choose reversible implementation details, local refactors, test strategy, research tactics, prototype structure, failure repair, and linked follow-up issues when the parent outcome, accepted contracts, allowed effects, budgets, and acceptance gate remain unchanged.
+- **Collaborative judgment:** when several reversible choices could materially affect maintainability or integration, the agent produces evidence and a recommendation for the active claimant. Work may continue on non-conflicting experiments while that choice is discussed.
+- **Human gate:** explicit human confirmation is required only when a choice changes product intent, public semantics, authority, privacy, credentials, spending, compatibility commitments, release scope, destructive external state, or an architecture that is costly to reverse.
+- **Narrow blocking:** a pending human decision blocks only the affected claim and dependants. Unrelated research, tests, prototypes, and work under already accepted contracts continue.
+- **Escalation packet:** agents do not merely stop. They reduce the question to exact options, evidence, recommendation, falsifiers, affected scope, and the smallest decision needed.
+
+Routine engineering choices are recorded in the issue or PR with their evidence and remain reviewable; they do not require a human decision receipt. If a routine choice crosses a listed threshold, its discretion class changes before the consequential effect occurs.
+
 ### Required decision receipt
 
 Every accepted consequential decision must have a durable human-authored or human-confirmed receipt containing:
@@ -51,7 +63,7 @@ An agent may draft this packet, but only the human's explicit confirmation conve
 
 ### Decision gate behavior
 
-- Before a decision: label the issue `needs-decision`; research and bounded prototypes may continue only within their approved non-production boundary.
+- Before a decision: label only the affected scope `needs-decision`; research, tests, bounded prototypes, and unrelated implementation continue inside accepted boundaries.
 - At the gate: present the evidence packet and exact choices to the human; do not ask for approval of an unspecified future implementation.
 - After approval: pin the receipt identity in every dependent issue. Children inherit it without repeatedly asking the same question.
 - On material evidence or scope change: invalidate inheritance, return dependants to blocked, and request a revised human receipt.
@@ -67,7 +79,7 @@ An agent may draft this packet, but only the human's explicit confirmation conve
 6. **Research basis:** pinned repository evidence, Parallel/Context7 sources and unresolved unknowns.
 7. **Dependencies:** issues, artifacts and decisions required before start or freeze.
 8. **Authority boundary:** permitted changes/effects and actions requiring owner approval.
-9. **Decision triggers:** findings that must return to Lucas rather than be resolved by an agent.
+9. **Discretion class and decision triggers:** bounded-autonomy, collaborative-judgment, or human-gated work, plus findings that change the class.
 10. **Falsifiers:** observable results that reject the proposed approach or invalidate the task.
 11. **Acceptance gate:** deterministic or machine-checkable checks on the exact candidate.
 12. **Independent verification:** who or what reruns the candidate, preferably with a different model family.
@@ -80,7 +92,7 @@ An issue may enter development only when:
 
 - the parent contract and required dependencies are accepted or explicitly version-pinned;
 - overlap has been checked across the CSL team, project and linked PRs;
-- consequential research and owner decisions are closed, or named unknowns are within the allowed experiment boundary;
+- consequential decisions required for this exact scope are closed, or named unknowns are within the allowed experiment boundary;
 - allowed paths/effects, non-goals, product ceilings and testable acceptance are explicit;
 - fixtures and falsifiers exist before implementation where the behavior is load-bearing;
 - one claimant is accountable while active;
@@ -92,15 +104,16 @@ If two materially different implementations would satisfy the written issue but 
 
 1. **Intake:** deduplicate, identify the parent outcome, classify evidence and expose contradictions.
 2. **Research:** search current facts; use Deep Research only at the consequential decision boundary.
-3. **Decision:** present options and falsifiers; Lucas retains product and architecture authority.
-4. **Human receipt:** record explicit human approval against the exact proposal/contract digest; otherwise dependants remain blocked.
-5. **Contract freeze:** pin schemas, semantics, fixtures, host profiles and artifact identities needed by parallel children.
-6. **Develop:** implement only the claimed boundary; record discoveries as linked issues.
-7. **Test:** run focused checks, falsifier cases and exact-candidate acceptance; distinguish fixture, local qualification and release evidence.
-8. **Iterate:** repair failed acceptance. Return to research/decision if evidence changes scope or invalidates the contract.
-9. **Verify:** an independent verifier reruns the exact artifact and reconstructs the result from retained evidence.
-10. **Review:** bounded candidate enters Devin review, Claude fixing, current-head Blacksmith CI, then Codex mediation/gate under repository rules.
-11. **Close:** retain the accepted result, limitations and dependency links; open deduplicated follow-ups for unfinished work.
+3. **Classify discretion:** proceed autonomously for bounded choices, collaborate with the claimant for material reversible choices, and enter a human gate only at a consequential trigger.
+4. **Decision when triggered:** present options and falsifiers; Lucas or a delegated human retains consequential product and architecture authority.
+5. **Human receipt when triggered:** record explicit human approval against the exact proposal/contract digest; otherwise only affected dependants remain blocked.
+6. **Contract freeze:** pin schemas, semantics, fixtures, host profiles and artifact identities needed by parallel children.
+7. **Develop:** implement only the claimed boundary; record discoveries as linked issues.
+8. **Test:** run focused checks, falsifier cases and exact-candidate acceptance; distinguish fixture, local qualification and release evidence.
+9. **Iterate:** repair failed acceptance. Return to research/decision if evidence changes scope or invalidates the contract.
+10. **Verify:** an independent verifier reruns the exact artifact and reconstructs the result from retained evidence.
+11. **Review:** bounded candidate enters Devin review, Claude fixing, current-head Blacksmith CI, then Codex mediation/gate under repository rules.
+12. **Close:** retain the accepted result, limitations and dependency links; open deduplicated follow-ups for unfinished work.
 
 No new push inherits acceptance from an older head. Human approval and merge remain required.
 

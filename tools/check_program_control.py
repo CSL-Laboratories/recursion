@@ -101,8 +101,16 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
         for field in ("max_active_contract_consumers", "max_concurrent_reviews"):
             if not isinstance(admission.get(field), int) or admission[field] < 1:
                 errors.append(f"open admission requires a positive {field}")
+    elif admission.get("mode") == "bounded_autonomy":
+        if admission.get("routine_work_default") != "proceed":
+            errors.append("bounded autonomy must let routine work proceed")
+        if admission.get("human_gate_default") != "block_affected_lineage_only":
+            errors.append("bounded autonomy must narrow human-gate blocking")
+        for field in ("allowed_agent_actions", "human_decision_triggers"):
+            if not isinstance(admission.get(field), list) or not admission[field]:
+                errors.append(f"bounded autonomy requires non-empty {field}")
     elif admission.get("mode") != "closed_pending_human_limits":
-        errors.append("admission mode must be open or closed_pending_human_limits")
+        errors.append("admission mode must be open, bounded_autonomy, or closed_pending_human_limits")
 
     done = {"done", "accepted", "verified"}
     stage_rank = {"intake": 0, "research": 1, "decision": 2, "development": 3, "verification": 4, "integration": 5, "release": 6}
@@ -113,6 +121,11 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
         if stage not in stage_rank:
             errors.append(f"{item_id} has invalid stage")
             continue
+        discretion = item.get("discretion_class")
+        if discretion not in {"bounded_autonomy", "collaborative_judgment", "human_gated"}:
+            errors.append(f"{item_id} has invalid discretion class")
+        if item.get("consequential") and discretion != "human_gated":
+            errors.append(f"{item_id} consequential work must be human_gated")
         for dependency in item.get("hard_dependencies", []):
             if dependency not in work:
                 errors.append(f"{item_id} references unknown hard dependency {dependency}")

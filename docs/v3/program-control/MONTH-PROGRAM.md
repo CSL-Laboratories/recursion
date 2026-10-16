@@ -46,6 +46,8 @@ Keep a short queue of consequential decisions with the exact packet digest, opti
 
 **Gate:** a changed packet digest invalidates stale approval and re-blocks affected dependants.
 
+The queue is an exception path, not the default work queue. Agents proceed under bounded autonomy for reversible engineering choices, collaborate with the active claimant on material but reversible tradeoffs, and escalate only the smallest consequential decision. A pending decision blocks its affected contract lineage, not the entire program.
+
 ### 4. Shared contract registry
 
 Index accepted identities, lifecycle states, commands/events, refusals, wire schemas, capability rules, configuration precedence, engine boundary, adapter boundary and compatibility policy. Record owner, digest, consumers and supersession history.
@@ -54,9 +56,9 @@ Index accepted identities, lifecycle states, commands/events, refusals, wire sch
 
 ### 5. Work and review admission
 
-Subscription capacity is not unlimited integration capacity. Admit work based on available human decisions, independent reviewers, CI slots, shared-file conflicts and integration bandwidth. Preserve reserve for fixes and recovery.
+Subscription capacity is not unlimited integration capacity. Admit bounded work when it inherits accepted contracts and has independent-review, CI, shared-file, and integration capacity. Human decisions are admission prerequisites only for work that crosses a consequential decision trigger. Preserve reserve for fixes and recovery.
 
-**Gate:** stop opening implementation branches when active work exceeds review/integration capacity; research may continue on non-overlapping unknowns.
+**Gate:** stop opening implementation branches when active work exceeds review/integration capacity; research and bounded work may continue on non-overlapping scope. Do not close all admission merely because one decision lineage is waiting on a human.
 
 ### 6. Rolling integration checkpoints
 
@@ -84,7 +86,7 @@ Track unknowns separately from defects and decisions. Each entry names the issue
 
 ### 10. Stop and rescope conditions
 
-Pause new implementation intake when shared contracts churn, review debt grows, independently verified throughput falls, integration failures repeat without new evidence, or owner decisions cannot keep pace with blocked work.
+Pause affected implementation intake when shared contracts churn, review debt grows, independently verified throughput falls, integration failures repeat without new evidence, or a required human decision cannot keep pace with its blocked lineage. Keep independent bounded lanes moving.
 
 **Gate:** failed work returns evidence. A retry states what changed and why the same failure should not repeat.
 

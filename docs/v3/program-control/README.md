@@ -11,7 +11,7 @@ This directory turns the month-long development plan into a provider-free, revie
 
 ## Authority
 
-Agents may research, propose, build bounded candidates, and validate structure. Only Lucas, or a human explicitly delegated by Lucas for a named scope, can accept a consequential product or architecture decision. A prototype, agent recommendation, issue transition, PR approval, or merge is not a decision receipt.
+The operating model is symbiotic: agents autonomously research, prototype, implement, test, repair, and create follow-ups inside accepted boundaries; developers contribute judgment, review, and context instead of directing every step. Only Lucas, or a human explicitly delegated by Lucas for a named scope, can accept a consequential product or architecture decision. Pending decisions block only their affected lineage. A prototype, agent recommendation, issue transition, PR approval, or merge is not a decision receipt.
 
 The ledger is descriptive and fail-closed. It never changes Linear, starts work, grants credentials, raises budgets, deploys, or merges.
 

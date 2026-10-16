@@ -202,8 +202,11 @@ class WorkflowTests(unittest.TestCase):
         start = text.index("Performance regression check")
         step = text[start:text.index("Docs-only lightweight checks", start)]
         self.assertIn("pull_request", step)
+        self.assertIn("timeout 55 ", step)
         self.assertIn("timeout-minutes: 1\n", step)
         self.assertIn("continue-on-error: true", step)
+        self.assertIn("id: perf", step)
+        self.assertIn("always() && steps.perf.outcome == 'failure'", step)
         self.assertIn("::warning::", step)
         self.assertNotIn("exit 1", step)
         self.assertNotIn("fail-on-alert", step)

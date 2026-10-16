@@ -497,3 +497,29 @@ planning deliverable is commissioned.
 the architecture.
 
 **Review:** 2026-12-01.
+
+---
+
+## D-040 — Review branches use `csl-<N>-<slug>`, not `loop/work`
+Date: 2026-10-15 · Status: ACCEPTED
+
+**Options considered:** A) keep `loop/work/<task-id>` in `CONTROL_PLANE.md` invariant 1 /
+B) name review branches `csl-<N>-<slug>`, with an optional GitHub username prefix, and
+satisfy pr-lint with `CSL-N` in the PR title.
+
+**Chose:** B. Lucas's owner decision on PR #189 (2026-10-15) adopts P-002: review
+branches are `csl-<N>-<slug>`, optionally prefixed by a GitHub username, and PR titles
+keep uppercase `CSL-N`. Force-push, merge, and deployment limits stay as they were.
+
+**Because:** `loop/` branch names belong to the retired recursion release. The current
+harness keys work to Linear issues. pr-lint matches `CSL-[0-9]+` case-sensitively, so a
+lowercase branch name alone does not pass. The `CSL-N` key in the PR title satisfies the
+check.
+
+**Consequence:** invariant 1 no longer names `loop/work/<task-id>`. The operating docs
+already use `csl-<N>-<slug>`. Workflows were not edited in this decision.
+
+**Falsifier:** pr-lint or branch protection requires a `loop/` prefix, or a lowercase
+`csl-<N>-<slug>` branch plus a `CSL-N` title fails the Linear-key check.
+
+**Review:** 2026-12-01.

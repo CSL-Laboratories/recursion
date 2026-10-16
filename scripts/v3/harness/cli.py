@@ -1,4 +1,4 @@
-"""``python -m scripts.v3.harness`` — doctor, init, run, and status."""
+"""``python -m scripts.v3.harness`` — doctor, init, run, status, logs, land, and clean."""
 
 from __future__ import annotations
 
@@ -7,9 +7,12 @@ import json
 import sys
 from pathlib import Path
 
+from scripts.v3.harness.clean import clean_runs
 from scripts.v3.harness.config import default_enabled, load_config, write_starter
 from scripts.v3.harness.doctor import diagnose
 from scripts.v3.harness.errors import HarnessError
+from scripts.v3.harness.land import land_run
+from scripts.v3.harness.log import read_log
 from scripts.v3.harness.run import run_task
 from scripts.v3.harness.state import list_runs, load_run
 
@@ -36,11 +39,26 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--config", type=Path, help="config JSON (default: config/harness.json)")
     run.add_argument("--state", type=Path, help="directory for the saved run")
     run.add_argument("--provider", help="worker provider; other capable providers can still review")
+    run.add_argument("--branch", help="branch land merges after the run is accepted")
     run.add_argument("--allow-live", action="store_true", help="start a headless CLI; tests and CI omit this")
 
     status = commands.add_parser("status", help="show saved runs")
     status.add_argument("--state", type=Path, help="directory for saved runs")
     status.add_argument("--run", help="print one saved run")
+
+    logs = commands.add_parser("logs", help="print one run's events")
+    logs.add_argument("run_id", help="saved run id")
+    logs.add_argument("--state", type=Path, help="directory for saved runs")
+
+    land = commands.add_parser("land", help="merge an accepted run branch")
+    land.add_argument("run_id", help="saved run id")
+    land.add_argument("--state", type=Path, help="directory for saved runs")
+    land.add_argument("--repo", type=Path, help="git repository (default: the current directory)")
+    land.add_argument("--into", help="checked-out branch that receives the merge")
+
+    clean = commands.add_parser("clean", help="remove finished run state")
+    clean.add_argument("--state", type=Path, help="directory for saved runs")
+    clean.add_argument("--run", help="one run to remove; omit to remove every finished run")
     return parser
 
 
@@ -64,6 +82,8 @@ def main(argv: list[str] | None = None) -> int:
                 state_dir=_state_dir(args.state),
                 provider=args.provider,
                 allow_live=args.allow_live,
+                run_branch=args.branch,
+                repo=Path.cwd(),
             )
             _emit(record)
             return _EXIT.get(record["status"], 1)
@@ -73,6 +93,16 @@ def main(argv: list[str] | None = None) -> int:
                 _emit(load_run(state_dir, args.run))
             else:
                 _emit({"runs": list_runs(state_dir)})
+            return 0
+        if args.command == "logs":
+            _emit({"events": read_log(_state_dir(args.state), args.run_id)})
+            return 0
+        if args.command == "land":
+            repo = Path.cwd() if args.repo is None else args.repo
+            _emit(land_run(_state_dir(args.state), args.run_id, repo=repo, into=args.into))
+            return 0
+        if args.command == "clean":
+            _emit(clean_runs(_state_dir(args.state), args.run))
             return 0
     except HarnessError as exc:
         print(str(exc), file=sys.stderr)

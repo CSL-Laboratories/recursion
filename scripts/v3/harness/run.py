@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import os
+import re
+import subprocess
 from pathlib import Path
 
 from scripts.v3.harness.doctor import _scrub, _secret_values
 from scripts.v3.harness.errors import HarnessError, ProviderTimeout
+from scripts.v3.harness.log import append_event
 from scripts.v3.harness.providers import ProviderRequest, open_provider
 from scripts.v3.harness.review import parse_verdict, review_prompt
 from scripts.v3.harness.routing import select_route
@@ -16,6 +19,7 @@ from scripts.v3.harness.usage import add_usage, empty_usage, exceeded, parse_usa
 
 
 RECORD_LIMIT = 8000
+_SHA = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 
 
 def run_task(
@@ -27,6 +31,8 @@ def run_task(
     allow_live: bool = False,
     open_adapter=None,
     run_id: str | None = None,
+    run_branch: str | None = None,
+    repo: Path | None = None,
 ) -> dict:
     """Route one task, review it when a second provider is enabled, and save the run."""
 
@@ -35,6 +41,7 @@ def run_task(
     worker, reviewers = select_route(config, provider)
     opener = open_provider if open_adapter is None else open_adapter
     run_id = new_run_id() if run_id is None else run_id
+    run_branch = _branch_name(run_branch, repo)
     budgets = config["budgets"]
     usage = empty_usage()
     reviews: list[dict] = []
@@ -56,6 +63,8 @@ def run_task(
             status=status,
             error=error,
             workspace=workspace,
+            run_branch=run_branch,
+            repo=repo,
         )
 
     def save_failure(status: str, exc: HarnessError) -> None:
@@ -77,6 +86,7 @@ def run_task(
             save_failure("failed", exc)
             raise
 
+    append_event(state_dir, run_id, "run.started", provider=worker)
     result = call(worker, _request(current_task, run_id, "execute", workspace))
     add_usage(usage, parse_usage(result.text))
     shown = assistant_text(result.text)
@@ -113,6 +123,13 @@ def run_task(
                 "round": round_index,
                 "verdict": verdict,
             }
+        )
+        append_event(
+            state_dir,
+            run_id,
+            "review.verdict",
+            provider=reviewer,
+            verdict=verdict,
         )
         if exceeded(usage, budgets):
             status = "budget-exceeded"
@@ -165,6 +182,7 @@ def _timeout(config: dict, name: str) -> int:
 
 def _finish(config, state_dir, **fields) -> dict:
     del config
+    repo = fields.pop("repo", None)
     secrets = _secret_values(os.environ)
     text = _scrub(fields["text"], secrets)
     if len(text) > RECORD_LIMIT:
@@ -176,7 +194,7 @@ def _finish(config, state_dir, **fields) -> dict:
         "reviews": _scrub(fields["reviews"], secrets),
         "run_id": fields["run_id"],
         "status": fields["status"],
-        "task": fields["task"],
+        "task": _scrub(fields["task"], secrets),
         "text": text,
         "usage": fields["usage"],
     }
@@ -186,5 +204,76 @@ def _finish(config, state_dir, **fields) -> dict:
     workspace = fields.get("workspace")
     if workspace:
         record["workspace"] = workspace
+    branch = fields.get("run_branch")
+    if branch:
+        record["run_branch"] = branch
+    if record["accepted"]:
+        reviewed = _branch_tip(repo, branch or f"recursion/run/{fields['run_id']}")
+        if reviewed:
+            record["reviewed_commit"] = reviewed
     save_run(state_dir, record)
+    append_event(
+        state_dir,
+        record["run_id"],
+        "run.finished",
+        provider=record["provider"],
+        status=record["status"],
+    )
     return record
+
+
+def _branch_tip(repo: Path | None, branch: str) -> str | None:
+    """Return the current SHA of ``branch`` when ``repo`` has that ref."""
+
+    if repo is None:
+        return None
+    try:
+        completed = subprocess.run(
+            [
+                "git",
+                "--no-pager",
+                "-c",
+                "core.longpaths=true",
+                "rev-parse",
+                "--verify",
+                "--end-of-options",
+                f"refs/heads/{branch}",
+            ],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError:
+        return None
+    if completed.returncode != 0:
+        return None
+    sha = completed.stdout.strip()
+    if _SHA.fullmatch(sha) is None:
+        return None
+    return sha
+
+
+def _branch_name(name: str | None, repo: Path | None = None) -> str | None:
+    if name is None:
+        return None
+    if not isinstance(name, str) or name != name.strip() or not name:
+        raise HarnessError("invalid branch name")
+    if name.startswith("-") or any(char in name for char in "\n\r "):
+        raise HarnessError("invalid branch name")
+    if repo is not None:
+        try:
+            checked = subprocess.run(
+                ["git", "check-ref-format", "--branch", name],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            return name
+        if checked.returncode != 0:
+            raise HarnessError("invalid branch name")
+    return name

@@ -130,6 +130,141 @@ class HarnessTests(unittest.TestCase):
         self.assertNotIn("SECRET", notes)
         self.assertEqual(parse_verdict("**VERDICT: approve**")[0], "approve")
 
+    def test_split_verdict_blocks_stay_one_line(self) -> None:
+        from scripts.v3.harness.streams import assistant_text
+
+        split = json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "VERDICT "},
+                        {"type": "text", "text": "approve"},
+                    ]
+                },
+            }
+        )
+        self.assertEqual(assistant_text(split), "VERDICT approve")
+        self.assertEqual(parse_verdict(split)[0], "approve")
+
+        lined = json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "looks good\n"},
+                        {"type": "text", "text": "VERDICT approve"},
+                    ]
+                },
+            }
+        )
+        self.assertEqual(assistant_text(lined), "looks good\nVERDICT approve")
+        self.assertEqual(parse_verdict(lined), ("approve", "looks good"))
+
+        separated = json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "Looks fine."},
+                        {"type": "tool_use", "id": "tool-1", "name": "read"},
+                        {"type": "text", "text": "VERDICT approve"},
+                    ]
+                },
+            }
+        )
+        self.assertEqual(assistant_text(separated), "Looks fine.\nVERDICT approve")
+        self.assertEqual(parse_verdict(separated), ("approve", "Looks fine."))
+
+        hidden = json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "Looks fine."},
+                        {"type": "tool_use", "id": "tool-1", "name": "read"},
+                        {"type": "text", "text": ""},
+                        {"type": "text", "text": "VERDICT approve"},
+                    ]
+                },
+            }
+        )
+        self.assertEqual(assistant_text(hidden), "Looks fine.\nVERDICT approve")
+        self.assertEqual(parse_verdict(hidden), ("approve", "Looks fine."))
+
+        def assistant_event(content: list[dict]) -> str:
+            return json.dumps({"type": "assistant", "message": {"content": content}})
+
+        across_events = "\n".join(
+            (
+                assistant_event([{"type": "text", "text": "Looks fine."}]),
+                assistant_event(
+                    [
+                        {"type": "tool_use", "id": "tool-1", "name": "read"},
+                        {"type": "text", "text": ""},
+                    ]
+                ),
+                assistant_event([{"type": "text", "text": "VERDICT approve"}]),
+            )
+        )
+        self.assertEqual(assistant_text(across_events), "Looks fine.\nVERDICT approve")
+        self.assertEqual(parse_verdict(across_events), ("approve", "Looks fine."))
+
+        feedback = "\n".join(
+            (
+                assistant_event([{"type": "text", "text": "Restore the missing error branch."}]),
+                assistant_event([{"type": "text", "text": "VERDICT revise"}]),
+            )
+        )
+        self.assertEqual(parse_verdict(feedback), ("revise", "Restore the missing error branch."))
+
+        crowded = "\n".join(
+            (
+                assistant_event([{"type": "text", "text": "x" * 1100}]),
+                assistant_event(
+                    [{"type": "text", "text": "Change the error branch.\nVERDICT revise"}]
+                ),
+            )
+        )
+        verdict, notes = parse_verdict(crowded)
+        self.assertEqual(verdict, "revise")
+        self.assertTrue(notes.startswith("Change the error branch."))
+
+        stale = "\n".join(
+            (
+                assistant_event([{"type": "text", "text": "VERDICT approve"}]),
+                assistant_event([{"type": "text", "text": "Need another pass."}]),
+            )
+        )
+        self.assertEqual(parse_verdict(stale)[0], "revise")
+
+        changing = assistant_event(
+            [
+                {
+                    "type": "text",
+                    "text": "Fix X.\nVERDICT approve\nActually no.\nVERDICT revise",
+                }
+            ]
+        )
+        verdict, notes = parse_verdict(changing)
+        self.assertEqual(verdict, "revise")
+        self.assertEqual(notes, "Fix X.\nActually no.")
+        self.assertNotIn("VERDICT", notes)
+
+        content_before_result = "\n".join(
+            (
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {"content": [{"type": "text", "text": "VERDICT approve"}]},
+                    }
+                ),
+                json.dumps({"type": "result", "result": "session finished without a verdict line"}),
+            )
+        )
+        self.assertEqual(assistant_text(content_before_result), "VERDICT approve")
+        self.assertEqual(parse_verdict(content_before_result)[0], "approve")
+
     def test_fixture_run_reviews_end_to_end(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             stdout = io.StringIO()
@@ -437,7 +572,7 @@ class HarnessTests(unittest.TestCase):
                 main(["--help"])
         self.assertEqual(caught.exception.code, 0)
         text = stdout.getvalue()
-        for name in ("doctor", "init", "run", "status"):
+        for name in ("doctor", "init", "run", "status", "logs", "land", "clean"):
             self.assertIn(name, text)
 
     def test_doctor_cli_on_the_shipped_config(self) -> None:
@@ -502,6 +637,7 @@ class HarnessTests(unittest.TestCase):
             )
             cwd = Path(str(seen["cwd"]))
             self.assertTrue(seen["allow_live"])
+            self.assertEqual(cwd.resolve(), (state / record["run_id"] / "workspace").resolve())
             self.assertEqual(cwd, (state / record["run_id"] / "workspace").resolve())
             self.assertTrue(cwd.is_dir())
             self.assertEqual(record["workspace"], str(cwd))

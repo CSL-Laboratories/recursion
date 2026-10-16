@@ -613,20 +613,17 @@ class GateCliTests(unittest.TestCase):
             event_path.write_text(json.dumps(event), encoding="utf-8")
             fake_bin = Path(tmp) / "bin"
             fake_bin.mkdir()
-            fake_gh = fake_bin / "gh"
+            fake_gh = fake_bin / "gh.py"
             fake_gh.write_text(
-                "#!/bin/sh\n"
-                '[ "$GH_TOKEN" = "stub-token" ] || exit 2\n'
-                'case "$*" in\n'
-                f'  "api repos/{REPO}/collaborators/lucas/permission") '
-                "echo '{\"permission\": \"admin\"}' ;;\n"
-                f'  "api repos/{REPO}/collaborators/alice/permission") '
-                "echo '{\"permission\": \"write\"}' ;;\n"
-                "  *) exit 1 ;;\n"
-                "esac\n",
+                "import json, os, sys\n"
+                "if os.environ.get('GH_TOKEN') != 'stub-token': raise SystemExit(2)\n"
+                f"permissions = {{'api repos/{REPO}/collaborators/lucas/permission': 'admin', "
+                f"'api repos/{REPO}/collaborators/alice/permission': 'write'}}\n"
+                "permission = permissions.get(' '.join(sys.argv[1:]))\n"
+                "if permission is None: raise SystemExit(1)\n"
+                "print(json.dumps({'permission': permission}))\n",
                 encoding="utf-8",
             )
-            fake_gh.chmod(0o755)
             env = {
                 k: v for k, v in os.environ.items() if k not in ("GH_TOKEN", "GITHUB_TOKEN")
             }
@@ -641,8 +638,20 @@ class GateCliTests(unittest.TestCase):
             )
             if token is not None:
                 env["GH_TOKEN"] = token
+            # Route only the external gh executable to a real portable child
+            # process. This prevents accidental live gh calls on Windows, where
+            # an extensionless POSIX shell fixture cannot shadow gh.exe.
+            launcher = (
+                "import runpy, subprocess, sys\n"
+                "original = subprocess.check_output\n"
+                "def stub(args, **kwargs):\n"
+                "    assert args[0] == 'gh', args\n"
+                "    return original([sys.executable, sys.argv[1], *args[1:]], **kwargs)\n"
+                "subprocess.check_output = stub\n"
+                "runpy.run_path(sys.argv[2], run_name='__main__')\n"
+            )
             result = subprocess.run(
-                [sys.executable, "-X", "utf8", "-B", str(GATE_PATH)],
+                [sys.executable, "-X", "utf8", "-B", "-c", launcher, str(fake_gh), str(GATE_PATH)],
                 cwd=ROOT,
                 env=env,
                 check=False,

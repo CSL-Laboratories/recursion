@@ -30,6 +30,13 @@ on:
       - ".github/workflows/claude.yml"
       - ".github/workflows/conflict-scan.yml"
       - ".github/workflows/codex-gate.yml"
+      - ".github/workflows/ci.yml"
+      - ".github/workflows/review-gate.yml"
+      - "tools/ci_results.py"
+      - "tools/review_gate.py"
+      - "tools/test_ci_results.py"
+      - "tools/test_ci_scheduling.py"
+      - "tools/test_review_gate.py"
       - ".github/actionlint.yaml"
       - "scripts/ci/claude_pr_fixer_gate.py"
       - "scripts/ci/claude_fixer_receipts.py"
@@ -404,17 +411,25 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: Event-matrix gate
         run: python3 -X utf8 -B tools/test_claude_pr_fixer.py
       - name: Codex gate tests
         run: python3 -X utf8 -B tools/test_codex_gate.py
+      - name: CI scheduling and review evidence tests
+        run: |
+          python3 -X utf8 -B tools/test_ci_scheduling.py
+          python3 -X utf8 -B tools/test_ci_results.py
+          python3 -X utf8 -B tools/test_review_gate.py
       - name: actionlint
         env:
           ACTIONLINT_VERSION: "1.7.7"
         run: |
           set -euo pipefail
           bash <(curl -fsSL "https://raw.githubusercontent.com/rhysd/actionlint/v${ACTIONLINT_VERSION}/scripts/download-actionlint.bash") "$ACTIONLINT_VERSION"
-          ./actionlint -color .github/workflows/claude.yml .github/workflows/conflict-scan.yml .github/workflows/codex-gate.yml
+          ./actionlint -color .github/workflows/*.yml
 
   claude-mention:
     needs: resolve-pr

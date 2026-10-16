@@ -19,6 +19,8 @@ Agents execute approved research, prototypes, implementation, tests, repairs and
 
 Each developer owns their individual live actions, accounts, API keys and tests. An agent may execute a developer-approved live action only on that developer's own accounts/keys, with the route, account and spend ceiling recorded, and only after the R2a permission-profile fix has landed. Individual approval does not override Lucas's company-resource or spending approvals, authorize live capital, or grant an agent merge permission. Destructive actions outside that individual scope still require Lucas's explicit approval. This candidate grants no specific live action or acceptance of another contract.
 
+When these documents are read together, the phrase "developer approval" in [MONTH-PROGRAM's human decision queue](MONTH-PROGRAM.md#3-human-decision-queue) does not grant authority to every developer. CONTROL_PLANE takes precedence: continuation of a program research lane requires approval from a founder acting within the approved budget. Any additional spending remains reserved to Lucas; a founder's continuation approval cannot increase the budget. Owning the account or key used for research does not by itself authorize continuation of a program research lane. This is an authority-wording clarification, not a change to the queue, receipt requirements, admission caps or lifecycle gates; MONTH-PROGRAM's pinned bytes remain unchanged.
+
 The ledger is descriptive and fail-closed. It never changes Linear, starts work, grants credentials, raises budgets, deploys, or merges.
 
 Human approvals are recorded as comments on the matching Linear issue and pinned by comment identity plus proposal digest. Labels and issue transitions are not approval receipts.

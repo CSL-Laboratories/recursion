@@ -102,7 +102,7 @@ Current tools. Do not add paid services or raise spend limits.
 - **Devin** — GitHub PR reviewer only (on PR creation and on demand). See
   [Review roles](#review-roles).
 - **Claude Code Action** — PR fixer for Devin findings and `@claude` mentions
-  on same-repo OWNER/MEMBER PRs (`.github/workflows/claude.yml`).
+  on open same-repo PRs by verified repository writers (`.github/workflows/claude.yml`).
 - **Blacksmith CI** — only CI. See [CI](#ci).
 - **Google Workspace** (`csl-laboratories.com`) — meetings and notes.
 - **Discord bot** (`csl-bot-operations`) — Liaison. Commands and MCP; see below. Trigger CI
@@ -208,8 +208,12 @@ label, not by editing config.
 - **Devin** is the only GitHub PR reviewer. It does not auto-fix.
 - **Claude Code Action** (`.github/workflows/claude.yml`) is the fixer for Devin
   findings and `@claude` mentions. It runs only on open same-repo PRs whose
-  author is an org OWNER or MEMBER. `@claude` also requires a human OWNER or
-  MEMBER commenter. Fork and nonmember PRs are not auto-fixed.
+  author has write, maintain or admin repository permission. `@claude` also
+  requires a human commenter with that permission. Association is audit-only:
+  private org members may appear as CONTRIBUTOR. Forks and nonwriters are skipped.
+  Submitted Devin bot reviews on the current head start the fixer directly;
+  Codex FIX is a fallback, never a prerequisite. Every fixer shares the per-PR
+  concurrency group, without cancelling an active run.
 - **Stuck-thread watch** (`.github/workflows/stuck-thread-watch.yml`) asks Codex
   to mediate Devin threads Claude could not settle. A **MEDIATE** verdict
   updates one Linear roll-up per PR (`Stuck PR threads: recursion#<PR>`), not
@@ -287,8 +291,10 @@ CODEX-GATE: MEDIATE
   not an immediate `@codex review`. Do not push, merge, or resolve threads.
 
 Do not omit the verdict line. A human `@claude` mention still runs the mention
-fixer immediately and bypasses the per-PR daily fixer cap (3 batched fixer
-runs per UTC day).
+fixer immediately. There is no daily dispatch cap. The batched fixer pauses
+after eight Claude commits since the last human commit; other bot commits
+neither count nor reset the streak. A human commit re-arms it. Legacy
+`bypass_cap` inputs are accepted for compatibility but never bypass this guard.
 
 ## Automations
 

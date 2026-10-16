@@ -8,12 +8,14 @@ Acceptance:
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -43,6 +45,7 @@ def gh_blob(args: list) -> str:
 
 def review_event(*, login: str, body: str, sha: str = SHA, number: int = 7) -> dict:
     return {
+        "action": "submitted",
         "review": {
             "user": {"login": login, "type": "Bot"},
             "body": body,
@@ -86,22 +89,15 @@ class MarkerAndVerdictTests(unittest.TestCase):
     def test_request_comment_contains_mention_and_marker(self) -> None:
         body = gate.request_comment_body(SHA)
         self.assertIn("@codex review", body)
+        self.assertNotIn("@claude", body)
         self.assertIn(gate.gate_marker(SHA), body)
         for verdict in ("FIX", "READY", "MEDIATE"):
             self.assertIn(f"CODEX-GATE: {verdict}", body)
 
-    def test_dispatch_comment_does_not_consume_daily_cap(self) -> None:
+    def test_dispatch_comment_records_head_without_daily_marker(self) -> None:
         body = gate.fixer_dispatch_comment_body(SHA, "2026-10-15", "codex-fix")
         self.assertIn(gate.acted_marker(SHA), body)
-        self.assertNotIn(gate.fixer_run_marker("2026-10-15"), body)
-
-    def test_fixer_run_cap(self) -> None:
-        day = "2026-10-15"
-        bodies = [gate.fixer_run_marker(day)] * 3
-        self.assertTrue(gate.cap_reached(bodies, day))
-        self.assertFalse(gate.cap_reached(bodies, day, bypass=True))
-        self.assertFalse(gate.cap_reached(bodies[:2], day))
-        self.assertFalse(gate.cap_reached([gate.fixer_run_marker("2026-10-14")] * 5, day))
+        self.assertNotIn("codex-fixer-run:", body)
 
 
 class AdmitResolvePrTests(unittest.TestCase):
@@ -153,14 +149,37 @@ class AdmitResolvePrTests(unittest.TestCase):
         }
         self.assertFalse(gate.admit_resolve_pr("pull_request_review_comment", event))
 
-    def test_reviews_are_rejected_resolve_pr_does_not_run_for_them(self) -> None:
-        for login in (
-            gate.DEVIN_REVIEW_LOGIN,
-            gate.CODEX_REVIEW_LOGIN,
-            "cursor[bot]",
-        ):
-            event = {"review": {"user": {"login": login}}}
-            self.assertFalse(gate.admit_resolve_pr("pull_request_review", event), login)
+    def test_submitted_devin_findings_are_admitted(self) -> None:
+        for state in ("commented", "changes_requested"):
+            event = review_event(login=gate.DEVIN_REVIEW_LOGIN, body="finding")
+            event["review"]["state"] = state
+            self.assertTrue(gate.admit_resolve_pr("pull_request_review", event), state)
+
+    def test_review_admission_requires_exact_bot_identity_action_and_state(self) -> None:
+        cases = [
+            ("login", gate.CODEX_REVIEW_LOGIN),
+            ("login", "cursor[bot]"),
+            ("login", "devin-ai-integration"),
+            ("login", "Devin-ai-integration[bot]"),
+            ("login", "devin-ai-integration[bot] "),
+            ("type", "User"),
+            ("type", "bot"),
+            ("type", None),
+            ("action", "edited"),
+            ("action", "dismissed"),
+            ("action", None),
+            ("state", "approved"),
+            ("state", "pending"),
+            ("state", None),
+        ]
+        for key, value in cases:
+            with self.subTest(key=key, value=value):
+                event = review_event(login=gate.DEVIN_REVIEW_LOGIN, body="finding")
+                target = event if key == "action" else event["review"]
+                if key in {"login", "type"}:
+                    target = event["review"]["user"]
+                target[key] = value
+                self.assertFalse(gate.admit_resolve_pr("pull_request_review", event))
 
     def test_dispatch_is_admitted(self) -> None:
         self.assertTrue(gate.admit_resolve_pr("workflow_dispatch", {}))
@@ -227,63 +246,131 @@ class DecisionTests(unittest.TestCase):
                 body=f"looks good\nCODEX-GATE: {verdict}\n",
                 sha=SHA,
                 comments=[],
-                day="2026-10-15",
             )
             self.assertEqual(got["action"], action, verdict)
 
-    def test_verdict_ignores_non_codex_and_caps_fix(self) -> None:
+    def test_verdict_ignores_non_codex(self) -> None:
         self.assertEqual(
             gate.decide_verdict(
-                login="devin-ai-integration[bot]",
+                login=gate.DEVIN_REVIEW_LOGIN,
                 body="CODEX-GATE: FIX",
                 sha=SHA,
                 comments=[],
-                day="2026-10-15",
             )["action"],
             "skip",
         )
-        comments = [gate.fixer_run_marker("2026-10-15")] * 3
-        got = gate.decide_verdict(
-            login="chatgpt-codex-connector[bot]",
-            body="CODEX-GATE: FIX",
-            sha=SHA,
-            comments=comments,
-            day="2026-10-15",
+
+    def test_historical_daily_markers_do_not_cap_fixer(self) -> None:
+        comments = ["<!-- codex-fixer-run:2026-10-15 -->"] * 20
+        self.assertEqual(
+            gate.decide_verdict(
+                login=gate.CODEX_REVIEW_LOGIN,
+                body="CODEX-GATE: FIX",
+                sha=SHA,
+                comments=comments,
+            )["action"],
+            "fix",
         )
-        self.assertEqual(got["action"], "cap")
-        bypassed = gate.decide_verdict(
-            login="chatgpt-codex-connector[bot]",
-            body="CODEX-GATE: FIX",
-            sha=SHA,
-            comments=comments,
-            day="2026-10-15",
-            bypass=True,
+        self.assertEqual(
+            gate.decide_fallback(sha=SHA, comments=comments, reviews=[])["action"],
+            "fix",
         )
-        self.assertEqual(bypassed["action"], "fix")
+
+    def test_verdict_deduplicates_only_the_acted_head(self) -> None:
+        for verdict in ("FIX", "READY", "MEDIATE"):
+            for head, expected in ((SHA, "already-acted"), ("b" * 40, verdict.lower())):
+                with self.subTest(verdict=verdict, head=head):
+                    got = gate.decide_verdict(
+                        login=gate.CODEX_REVIEW_LOGIN,
+                        body=f"CODEX-GATE: {verdict}",
+                        sha=head,
+                        comments=[gate.acted_marker(SHA)],
+                    )
+                    self.assertEqual(got["action"], expected)
 
     def test_fallback_fail_open_and_skips(self) -> None:
-        day = "2026-10-15"
         self.assertEqual(
-            gate.decide_fallback(sha=SHA, comments=[], reviews=[], day=day)["action"],
+            gate.decide_fallback(sha=SHA, comments=[], reviews=[])["action"],
             "fix",
         )
         reviews = [{"user": {"login": "chatgpt-codex-connector[bot]"}, "commit_id": SHA, "body": "CODEX-GATE: READY"}]
         self.assertEqual(
-            gate.decide_fallback(sha=SHA, comments=[], reviews=reviews, day=day)["action"],
+            gate.decide_fallback(sha=SHA, comments=[], reviews=reviews)["action"],
             "has-verdict",
         )
         self.assertEqual(
             gate.decide_fallback(
-                sha=SHA, comments=[gate.acted_marker(SHA)], reviews=[], day=day
+                sha=SHA, comments=[gate.acted_marker(SHA)], reviews=[]
             )["action"],
             "already-acted",
         )
-        self.assertEqual(
-            gate.decide_fallback(
-                sha=SHA, comments=[gate.fixer_run_marker(day)] * 3, reviews=[], day=day
-            )["action"],
-            "cap",
-        )
+
+
+class MainModeTests(unittest.TestCase):
+    def check_mode(self, mode, argv, expected, *, process_argv=None) -> None:
+        event = pr_event()
+        with tempfile.TemporaryDirectory() as tmp:
+            event_path = Path(tmp) / "event.json"
+            event_path.write_text(json.dumps(event), encoding="utf-8")
+            env = {
+                "GITHUB_REPOSITORY": REPO,
+                "GITHUB_EVENT_PATH": str(event_path),
+                "CODEX_TRIGGER_PAT": "test-pat",
+                "GH_TOKEN": "test-read-token",
+                "DEFAULT_BRANCH": "master",
+                "PR_NUMBER": "7",
+                "HEAD_SHA": SHA,
+            }
+            if mode is not None:
+                env["CODEX_GATE_MODE"] = mode
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch.object(sys, "argv", process_argv or ["codex_gate.py"]),
+                mock.patch.object(gate, "run_request") as request,
+                mock.patch.object(gate, "run_verdict") as verdict,
+                mock.patch.object(gate, "run_fallback") as fallback,
+                mock.patch.object(gate, "emit") as emit,
+            ):
+                self.assertEqual(gate.main(argv), 0)
+                handlers = {"request": request, "verdict": verdict, "fallback": fallback}
+                for name, handler in handlers.items():
+                    self.assertEqual(handler.call_count, int(name == expected), name)
+                if expected == "request":
+                    request.assert_called_once_with(event, REPO, "test-pat", "test-read-token")
+                elif expected == "verdict":
+                    verdict.assert_called_once_with(event, REPO, "test-pat", "test-read-token", "master")
+                elif expected == "fallback":
+                    fallback.assert_called_once_with(REPO, "7", SHA, "test-pat", "test-read-token", "master")
+                else:
+                    emit.assert_called_once_with({"action": "skip", "proceed": "false"})
+                if expected:
+                    emit.assert_not_called()
+
+    def test_environment_selects_each_full_mode(self) -> None:
+        for mode in ("request", "verdict", "fallback"):
+            with self.subTest(mode=mode):
+                self.check_mode(mode, [], mode)
+
+    def test_cli_selects_each_mode_without_environment_override(self) -> None:
+        for mode in ("request", "verdict", "fallback"):
+            with self.subTest(mode=mode):
+                self.check_mode(None, [mode], mode)
+
+    def test_environment_takes_precedence_over_cli(self) -> None:
+        self.check_mode("request", ["verdict"], "request")
+        self.check_mode("unknown", ["request"], None)
+
+    def test_missing_and_unknown_modes_skip(self) -> None:
+        self.check_mode(None, [], None)
+        self.check_mode(None, ["unknown"], None)
+        self.check_mode("unknown", [], None)
+
+    def test_empty_environment_falls_back_to_cli(self) -> None:
+        self.check_mode("", ["fallback"], "fallback")
+
+    def test_none_argv_reads_process_arguments_but_empty_argv_does_not(self) -> None:
+        self.check_mode(None, None, "request", process_argv=["codex_gate.py", "request"])
+        self.check_mode(None, [], None, process_argv=["codex_gate.py", "request"])
 
 
 class ListingParseTests(unittest.TestCase):
@@ -452,6 +539,33 @@ class NoticeAndIoTests(unittest.TestCase):
         post_idx = next(i for i, c in enumerate(calls) if "--input" in c)
         self.assertLess(run_idx, post_idx)
 
+    def test_fix_and_fallback_dispatch_after_many_historical_runs(self) -> None:
+        for mode in ("verdict", "fallback"):
+            with self.subTest(mode=mode):
+                calls: list[list[str]] = []
+
+                def gh(args, token, input_text=None):
+                    calls.append(list(args))
+                    if "/comments?" in gh_blob(args):
+                        return json.dumps([
+                            {"body": "<!-- codex-fixer-run:2026-10-15 -->"}
+                        ] * 20)
+                    if "/reviews?" in gh_blob(args):
+                        return "[]"
+                    return "{}"
+
+                with mock.patch.object(gate, "emit"):
+                    if mode == "verdict":
+                        event = review_event(login=gate.CODEX_REVIEW_LOGIN, body="CODEX-GATE: FIX")
+                        got = gate.run_verdict(event, REPO, "pat", "read-token", "master", gh=gh, day="2026-10-15")
+                    else:
+                        got = gate.run_fallback(REPO, "7", SHA, "pat", "read-token", "master", gh=gh, day="2026-10-15")
+                self.assertEqual(got["action"], "fix")
+                dispatches = [args for args in calls if args[:2] == ["workflow", "run"]]
+                self.assertEqual(len(dispatches), 1)
+                self.assertIn("claude.yml", dispatches[0])
+                self.assertNotIn("bypass_cap", gh_blob(dispatches[0]))
+
     def test_failed_dispatch_does_not_post_run_or_acted_marker(self) -> None:
         posted: list[str] = []
 
@@ -572,7 +686,7 @@ class WorkflowStructureTests(unittest.TestCase):
             self.text,
         )
 
-    def test_fixer_dispatch_is_not_on_every_devin_review(self) -> None:
+    def test_fixer_accepts_direct_devin_and_dispatch_triggers(self) -> None:
         start = self.fixer.index("  devin-review-fix:\n")
         nxt = self.fixer.find("\n  ", start + 4)
         while nxt != -1 and self.fixer[nxt + 3 : nxt + 4] in (" ", "\t"):
@@ -580,6 +694,7 @@ class WorkflowStructureTests(unittest.TestCase):
         job = self.fixer[start:] if nxt == -1 else self.fixer[start:nxt]
         self.assertIn("workflow_dispatch", job)
         self.assertIn("repository_dispatch", job)
+        self.assertIn("pull_request_review", job)
 
     def test_agents_code_review_rules(self) -> None:
         self.assertIn("## Code Review Rules", self.agents)

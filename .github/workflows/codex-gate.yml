@@ -4,7 +4,8 @@
 # Posts one `@codex review` per head SHA. Codex ends with
 # `CODEX-GATE: FIX|READY|MEDIATE`. FIX / 20-minute silence → one batched
 # `devin-review-fix` dispatch. READY → `ci:full`. MEDIATE → stuck-thread-watch.
-# Cap: 3 fixer runs per PR per UTC day. Human `@claude` (claude-mention) bypasses it.
+# Devin directly starts the fixer; FIX/timeout are fallback routes, never prerequisites.
+# No daily dispatch cap. The fixer serializes each PR and enforces its 8-commit guard.
 #
 # Writes go through CODEX_TRIGGER_PAT so they can trigger other workflows.
 # Missing PAT: ::notice:: and skip (no failure). Never print secret values.

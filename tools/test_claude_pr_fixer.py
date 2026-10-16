@@ -215,8 +215,10 @@ class MentionMatrixTests(unittest.TestCase):
 class DevinMatrixTests(unittest.TestCase):
     def _review(self, **pr_kw) -> dict:
         return {
+            "action": "submitted",
             "review": {
-                "user": {"login": "devin-ai-integration[bot]"},
+                "user": {"login": "devin-ai-integration[bot]", "type": "Bot"},
+                "commit_id": "a" * 40,
                 "state": "commented",
                 "id": 1,
             },
@@ -228,6 +230,42 @@ class DevinMatrixTests(unittest.TestCase):
         self.assertEqual(got["devin"], "true")
         self.assertEqual(got["mention"], "false")
         self.assertEqual(got["head_ref"], "feature/fix")
+
+    def test_review_action_identity_and_head_are_required(self) -> None:
+        for mutate in (
+            lambda e: e.update(action="edited"),
+            lambda e: e["review"]["user"].update(type="User"),
+            lambda e: e["review"].update(commit_id="b" * 40),
+            lambda e: e["review"].pop("commit_id"),
+            lambda e: e["review"].update(state="approved"),
+        ):
+            event = self._review()
+            mutate(event)
+            self.assertEqual(decide("pull_request_review", event)["devin"], "false")
+
+    def test_main_fetches_current_head_and_fails_closed(self) -> None:
+        from unittest import mock
+        event = self._review()
+        for payload in (pr_payload(), pr_payload(head_sha="b" * 40), None):
+            with mock.patch.dict(os.environ, {
+                "GITHUB_EVENT_NAME": "pull_request_review",
+                "GITHUB_EVENT_PATH": "event.json",
+                "GITHUB_REPOSITORY": REPO,
+            }), mock.patch.object(gate, "load_event", return_value=event), mock.patch.object(
+                gate, "fetch_pr", return_value=payload
+            ) as fetch, mock.patch.object(gate, "gh_permission", return_value=lookup), mock.patch.object(gate, "emit") as emit:
+                self.assertEqual(gate.main(), 0)
+                fetch.assert_called_once_with(REPO, 42)
+                self.assertEqual(emit.call_args.args[0]["devin"], "true" if payload == pr_payload() else "false")
+
+    def test_current_fetched_pr_head_overrides_event_head(self) -> None:
+        event = self._review()
+        self.assertEqual(decide("pull_request_review", event, pr=pr_payload(head_sha="b" * 40))["devin"], "false")
+
+    def test_owner_and_member_still_require_permission(self) -> None:
+        for association in ("OWNER", "MEMBER"):
+            self.assertEqual(decide("pull_request_review", self._review(author_association=association))["devin"], "true")
+            self.assertEqual(decide("pull_request_review", self._review(author="reader", author_association=association))["devin"], "false")
 
     def test_devin_changes_requested(self) -> None:
         event = self._review()
@@ -362,10 +400,6 @@ class WholeWordTests(unittest.TestCase):
 
 
 class WorkflowStructureTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls.text = WORKFLOW_PATH.read_text(encoding="utf-8")
-
     def test_light_jobs_use_github_hosted_runners(self) -> None:
         resolve = self._job("resolve-pr")
         mention = self._job("claude-mention")
@@ -375,6 +409,10 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn("runs-on: ubuntu-latest", mention.split("timeout-minutes", 1)[0])
         self.assertIn("runs-on: ubuntu-latest", paths.split("timeout-minutes", 1)[0])
         self.assertIn("runs-on: ubuntu-latest", fixer.split("timeout-minutes", 1)[0])
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.text = WORKFLOW_PATH.read_text(encoding="utf-8")
 
     def test_no_workflow_level_concurrency(self) -> None:
         head = self.text.split("jobs:", 1)[0]
@@ -405,9 +443,9 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn("github.event.sender.type != 'Bot'", header)
         self.assertIn("github.event.comment.user.type != 'Bot'", header)
         self.assertIn("contains(github.event.comment.body, '@claude')", header)
-        self.assertNotIn("devin-ai-integration[bot]", header)
+        self.assertIn("devin-ai-integration[bot]", header)
         self.assertNotIn("chatgpt-codex-connector[bot]", header)
-        self.assertNotIn("github.event_name == 'pull_request_review' &&", header)
+        self.assertIn("github.event_name == 'pull_request_review' &&", header)
         self.assertIn("workflow_dispatch", header)
         self.assertIn("repository_dispatch", header)
         self.assertNotIn(
@@ -457,6 +495,14 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertNotIn("MEMBER_ASSOC", source)
         self.assertIn("GH_TOKEN: ${{ github.token }}", self._job("resolve-pr"))
         self.assertIn("DISPATCH_EVENTS", source)
+
+    def test_dependencies_are_installed_before_model_invocation(self) -> None:
+        for name in ("claude-mention", "devin-review-fix"):
+            job = self._job(name)
+            self.assertLess(job.index("actions/setup-python@v5"), job.index("anthropics/claude-code-action@v1"))
+            self.assertLess(job.index("pip install --disable-pip-version-check -r requirements-ci.txt"), job.index("anthropics/claude-code-action@v1"))
+            self.assertIn('python-version: "3.12"', job)
+            self.assertNotIn("continue-on-error", job)
 
     def test_acceptance_gates_before_push(self) -> None:
         devin = self._job("devin-review-fix")
@@ -777,14 +823,14 @@ def conflicted_pr(**kw) -> dict:
 
 
 class ConflictScanTests(unittest.TestCase):
+    def test_rotation_matches_two_hour_schedule(self) -> None:
+        self.assertEqual(self.mod.ROTATION_SECONDS, 7200)
+
     def setUp(self) -> None:
         self.mod = load_scan()
 
     def _select(self, prs, lookup_fn=lookup, cap=3):
         return self.mod.select(prs, REPO, lookup_fn, max_prs=cap)
-
-    def test_rotation_matches_two_hour_schedule(self) -> None:
-        self.assertEqual(self.mod.ROTATION_SECONDS, 7200)
 
     def test_selects_conflicted_same_repo_writer_pr(self) -> None:
         chosen, audit = self._select([conflicted_pr()])
@@ -1081,6 +1127,13 @@ class FixerLoopCapTests(unittest.TestCase):
         comments: list[str],
         *,
         bypass_cap: str | None = None,
+        current_sha: str = "abc123",
+        current_state: str = "open",
+        current_ref: str = "feature/fix",
+        current_repo: str = "o/r",
+        permission: str = "write",
+        findings: str = "PRRT_1\tabc123",
+        listing_error: bool = False,
     ) -> tuple[str, str]:
         import os
         import shutil
@@ -1093,11 +1146,15 @@ class FixerLoopCapTests(unittest.TestCase):
             d = Path(tmp)
             (d / "commits.tsv").write_text("".join(f"{a}\t{b}\n" for a, b in commits), encoding="utf-8")
             (d / "comments.txt").write_text("".join(c + "\n" for c in comments), encoding="utf-8")
+            (d / "pr.json").write_text(json.dumps({"state": current_state, "head": {"sha": current_sha, "ref": current_ref, "repo": {"full_name": current_repo}}, "user": {"login": "alice"}}))
             gh = d / "gh"
             gh.write_text(
                 "#!/usr/bin/env bash\n"
                 'case "$*" in\n'
                 f'  *" -f body="*) echo posted >> "{d}/posted";;\n'
+                f'  *"graphql"*) {"exit 1" if listing_error else "printf \"%s\\n\" \"" + findings + "\""};;\n'
+                f'  *"collaborators"*) echo {permission};;\n'
+                f'  "api repos/o/r/pulls/1") cat "{d}/pr.json";;\n'
                 f'  */commits*) cat "{d}/commits.tsv";;\n'
                 f'  */comments*) cat "{d}/comments.txt";;\n'
                 "esac\n",
@@ -1107,7 +1164,7 @@ class FixerLoopCapTests(unittest.TestCase):
             out = d / "out"
             out.write_text("", encoding="utf-8")
             env = dict(os.environ, PATH=f"{d}{os.pathsep}{os.environ.get('PATH', '')}", GITHUB_OUTPUT=str(out),
-                       REPO="o/r", PR_NUMBER="1", HEAD_SHA="abc123", GH_TOKEN="x")
+                       REPO="o/r", PR_NUMBER="1", HEAD_SHA="abc123", HEAD_REF="feature/fix", GH_TOKEN="x")
             if bypass_cap is not None:
                 env["BYPASS_CAP"] = bypass_cap
             subprocess.run(["bash", "-c", self.script], env=env, check=True, capture_output=True)
@@ -1122,38 +1179,40 @@ class FixerLoopCapTests(unittest.TestCase):
     def test_seven_claude_commits_runs(self) -> None:
         out, posted = self._run([("alice", "Alice")] + [("claude[bot]", "claude[bot]")] * 7, [])
         self.assertIn("skip=false", out)
-        self.assertEqual(posted.count("posted"), 1)
+        self.assertEqual(posted, "")
 
-    def test_daily_fixer_markers_do_not_skip(self) -> None:
+    def test_daily_fixer_markers_do_not_cap_runs(self) -> None:
         from datetime import datetime, timezone
 
         day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         marker = f"<!-- codex-fixer-run:{day} -->"
         out, posted = self._run(
             [("alice", "Alice")],
-            [marker] * 3,
+            [marker] * 8,
         )
         self.assertIn("skip=false", out)
-        self.assertEqual(posted.count("posted"), 1)
+        self.assertEqual(posted, "")
 
-    def test_bypass_cap_skips_daily_marker(self) -> None:
+    def test_bypass_cap_ignores_daily_markers(self) -> None:
+        from datetime import datetime, timezone
+
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        marker = f"<!-- codex-fixer-run:{day} -->"
         out, posted = self._run(
             [("alice", "Alice")],
-            [],
+            [marker] * 8,
             bypass_cap="true",
         )
         self.assertIn("skip=false", out)
         self.assertEqual(posted, "")
 
     def test_human_commit_resets_streak(self) -> None:
-        c = [("claude[bot]", "claude[bot]")] * 8 + [("bob", "Bob")] + [("claude[bot]", "claude[bot]")] * 2
+        c = [("claude[bot]", "claude[bot]")] * 8 + [("bob", "Bob")] + [("claude[bot]", "claude[bot]")] * 7
         out, _ = self._run(c, [])
         self.assertIn("skip=false", out)
 
     def test_other_bot_does_not_reset_streak(self) -> None:
-        c = [("alice", "Alice")] + [("claude[bot]", "claude[bot]")] * 4 + [
-            ("github-actions[bot]", "github-actions[bot]"),
-        ] + [("claude[bot]", "claude[bot]")] * 4
+        c = [("alice", "Alice")] + [("claude[bot]", "claude[bot]")] * 4 + [("github-actions[bot]", "github-actions[bot]")] + [("claude[bot]", "claude[bot]")] * 4
         out, _ = self._run(c, [])
         self.assertIn("skip=true", out)
 
@@ -1161,6 +1220,63 @@ class FixerLoopCapTests(unittest.TestCase):
         out, posted = self._run([("claude[bot]", "claude[bot]")] * 8, ["<!-- claude-fixer-loop-cap:abc123 -->"])
         self.assertIn("skip=true", out)
         self.assertEqual(posted, "")
+
+    def test_stale_queued_head_skips(self) -> None:
+        out, posted = self._run([], [], current_sha="newhead")
+        self.assertIn("skip=true", out)
+        self.assertEqual(posted, "")
+
+    def test_no_actionable_or_old_findings_skips(self) -> None:
+        for findings in ("", "oldhead"):
+            out, posted = self._run([], [], findings=findings)
+            self.assertIn("skip=true", out)
+            self.assertEqual(posted, "")
+
+    def test_queued_authorization_is_rechecked(self) -> None:
+        for kwargs in ({"current_state": "closed"}, {"current_ref": "renamed"}, {"current_repo": "evil/fork"}, {"permission": "read"}):
+            out, _ = self._run([], [], **kwargs)
+            self.assertIn("skip=true", out)
+
+    def test_listing_error_fails_closed(self) -> None:
+        with self.assertRaises(subprocess.CalledProcessError):
+            self._run([], [], listing_error=True)
+
+    def test_legacy_bypass_does_not_disable_eight_commit_guard(self) -> None:
+        out, _ = self._run([("claude[bot]", "claude[bot]")] * 8, [], bypass_cap="true")
+        self.assertIn("skip=true", out)
+
+    def test_historical_event_markers_do_not_block_new_or_failed_findings(self) -> None:
+        out, _ = self._run([], ["<!-- claude-fixer-event:123:abc123 -->"])
+        self.assertIn("skip=false", out)
+        self.assertIn("thread_ids=PRRT_1", out)
+
+    def test_live_filter_executes_against_thread_fixtures(self) -> None:
+        if shutil.which("jq") is None:
+            self.skipTest("jq unavailable")
+        import re
+        expression = re.search(r"--jq '(.data.repository.pullRequest.reviewThreads.nodes.*?)'", self.script).group(1)
+        for resolved, outdated, login, user_type, sha, expected in (
+            (False, False, "devin-ai-integration[bot]", "Bot", "abc123", "PRRT_1\tabc123"),
+            (True, False, "devin-ai-integration[bot]", "Bot", "abc123", ""),
+            (False, True, "devin-ai-integration[bot]", "Bot", "abc123", ""),
+            (False, False, "another[bot]", "Bot", "abc123", ""),
+            (False, False, "devin-ai-integration", "Bot", "abc123", "PRRT_1\tabc123"),
+            (False, False, "devin-ai-integration", "User", "abc123", ""),
+        ):
+            node = {"id": "PRRT_1", "isResolved": resolved, "isOutdated": outdated, "comments": {"nodes": [{"body": "Legacy bug finding", "author": {"login": login, "__typename": user_type}, "commit": {"oid": sha}}]}}
+            fixture = {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": [node]}}}}}
+            result = subprocess.run(["jq", "-r", expression], input=json.dumps(fixture), text=True, capture_output=True, check=True)
+            self.assertEqual(result.stdout.strip(), expected)
+            for kind in ("analysis", "bug"):
+                node["comments"]["nodes"][0]["body"] = '<!-- devin-review-comment ' + json.dumps({"id": "fixture", "kind": kind}) + ' -->\nFinding'
+                result = subprocess.run(["jq", "-r", expression], input=json.dumps(fixture), text=True, capture_output=True, check=True)
+                self.assertEqual(result.stdout.strip(), "" if kind == "analysis" else expected)
+
+    def test_live_thread_filter_is_exact_and_paginated(self) -> None:
+        self.assertIn("graphql --paginate", self.script)
+        self.assertIn(".isResolved == false and .isOutdated == false", self.script)
+        self.assertIn('.author.login == "devin-ai-integration[bot]"', self.script)
+        self.assertIn('[ "$sha" = "$HEAD_SHA" ]', self.script)
 
     def test_fixer_steps_gated_on_cap(self) -> None:
         start = self.text.index("  devin-review-fix:\n")

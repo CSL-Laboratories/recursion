@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Codex CI/fixer gate. Fail closed on auth; fail open on a missing verdict.
 
-Provider-free core (markers, verdicts, caps, admit_resolve_pr) is imported by
+Provider-free core (markers, verdicts, admit_resolve_pr) is imported by
 tools/test_codex_gate.py. Live GitHub I/O uses `gh` and is stubbed in tests.
 
 Never prints secret values. Missing CODEX_TRIGGER_PAT skips with a notice.
@@ -17,7 +17,6 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-MAX_FIXER_RUNS_PER_PR_PER_DAY = 3
 LISTING_ATTEMPTS = 3
 LISTING_RETRY_SECONDS = 1.0
 CI_FULL_LABEL = "ci:full"
@@ -25,7 +24,6 @@ FIXER_WORKFLOW = "claude.yml"
 MEDIATE_WORKFLOW = "stuck-thread-watch.yml"
 GATE_MARKER_PREFIX = "codex-gate"
 ACTED_PREFIX = "codex-gate-acted"
-FIXER_RUN_PREFIX = "codex-fixer-run"
 DEVIN_REVIEW_LOGIN = "devin-ai-integration[bot]"
 CODEX_REVIEW_LOGIN = "chatgpt-codex-connector[bot]"
 DISPATCH_EVENTS = frozenset({"workflow_dispatch", "repository_dispatch"})
@@ -93,10 +91,6 @@ def acted_marker(sha: str) -> str:
     return f"<!-- {ACTED_PREFIX}:{sha} -->"
 
 
-def fixer_run_marker(day: str) -> str:
-    return f"<!-- {FIXER_RUN_PREFIX}:{day} -->"
-
-
 def parse_verdict(text: str | None) -> str | None:
     if not text:
         return None
@@ -108,25 +102,23 @@ def bodies_have(marker: str, bodies: list[str]) -> bool:
     return any(marker in (body or "") for body in bodies)
 
 
-def fixer_runs_today(bodies: list[str], day: str) -> int:
-    marker = fixer_run_marker(day)
-    return sum(1 for body in bodies if marker in (body or ""))
-
-
-def cap_reached(bodies: list[str], day: str, *, bypass: bool = False) -> bool:
-    if bypass:
-        return False
-    return fixer_runs_today(bodies, day) >= MAX_FIXER_RUNS_PER_PR_PER_DAY
-
-
 def admit_resolve_pr(event_name: str, event: dict[str, Any]) -> bool:
     """Mirror of the claude.yml resolve-pr job-level `if:`.
 
     Skipped events must not allocate a runner. Allow only human @claude comments
-    and fixer dispatch events. Devin/Codex reviews are handled by codex-gate.yml.
+    and fixer dispatch events, plus submitted findings from the exact Devin bot.
     """
     if event_name in DISPATCH_EVENTS:
         return True
+    if event_name == "pull_request_review":
+        review = event.get("review") or {}
+        user = review.get("user") or {}
+        return (
+            event.get("action") == "submitted"
+            and user.get("login") == DEVIN_REVIEW_LOGIN
+            and is_bot_type(user.get("type"))
+            and review.get("state") in {"commented", "changes_requested"}
+        )
     sender = event.get("sender") or {}
     if event_name in MENTION_EVENTS:
         if event_name == "issue_comment" and not (event.get("issue") or {}).get("pull_request"):
@@ -164,9 +156,7 @@ def acted_comment_body(sha: str, verdict: str, extra: str = "") -> str:
 
 
 def fixer_dispatch_comment_body(sha: str, day: str, reason: str) -> str:
-    # Acted marker only. The daily-run marker is posted by claude.yml when a
-    # fixer job actually starts, so a failed `gh workflow run` cannot consume
-    # a cap slot and a successful dispatch is not double-counted.
+    # Record per-head deduplication only after a successful workflow dispatch.
     return (
         f"{acted_marker(sha)}\n"
         f"Codex gate: dispatching batched Devin review fixer ({reason}) on {day}.\n"
@@ -215,8 +205,6 @@ def decide_verdict(
     body: str | None,
     sha: str,
     comments: list[str],
-    day: str,
-    bypass: bool = False,
 ) -> dict[str, str]:
     if not is_codex_login(login):
         return {"action": "skip", "verdict": ""}
@@ -227,8 +215,6 @@ def decide_verdict(
     verdict = parse_verdict(body)
     if verdict is None:
         return {"action": "no-verdict", "verdict": ""}
-    if verdict == "FIX" and cap_reached(comments, day, bypass=bypass):
-        return {"action": "cap", "verdict": verdict}
     return {"action": verdict.lower(), "verdict": verdict}
 
 
@@ -237,8 +223,6 @@ def decide_fallback(
     sha: str,
     comments: list[str],
     reviews: list[dict[str, Any]],
-    day: str,
-    bypass: bool = False,
 ) -> dict[str, str]:
     if not safe_head_sha(sha):
         return {"action": "skip"}
@@ -246,8 +230,6 @@ def decide_fallback(
         return {"action": "already-acted"}
     if sha_has_verdict(reviews, sha):
         return {"action": "has-verdict"}
-    if cap_reached(comments, day, bypass=bypass):
-        return {"action": "cap"}
     return {"action": "fix"}
 
 
@@ -465,7 +447,7 @@ def _dispatch_fixer(
         repo,
         FIXER_WORKFLOW,
         ref,
-        {"pr_number": number, "reason": reason, "bypass_cap": "false"},
+        {"pr_number": number, "reason": reason},
         pat,
         gh=gh,
     )
@@ -515,12 +497,9 @@ def run_verdict(
         body=review.get("body"),
         sha=sha,
         comments=comments,
-        day=today,
     )
     action = decision["action"]
-    if action in {"skip", "already-acted", "no-verdict", "cap"}:
-        if action == "cap":
-            notice(f"fixer cap reached for PR #{number} on {today}; skipping FIX")
+    if action in {"skip", "already-acted", "no-verdict"}:
         emit({"action": action, "pr_number": number, "head_sha": sha, "verdict": decision["verdict"]})
         return decision
     if not pat:
@@ -589,11 +568,9 @@ def run_fallback(
             emit({"action": "skip-listing", "pr_number": number, "head_sha": sha})
             return {"action": "skip-listing"}
     today = day or utc_day()
-    decision = decide_fallback(sha=sha, comments=comments, reviews=reviews, day=today)
+    decision = decide_fallback(sha=sha, comments=comments, reviews=reviews)
     action = decision["action"]
-    if action == "cap":
-        notice(f"fixer cap reached for PR #{number} on {today}; skipping timeout fallback")
-    elif action == "fix" and number:
+    if action == "fix" and number:
         if not pat:
             notice("CODEX_TRIGGER_PAT is missing; skipping timeout fixer dispatch (no failure)")
             action = "skip-pat"
@@ -608,7 +585,8 @@ def run_fallback(
 
 
 def main(argv: list[str] | None = None) -> int:
-    mode = (os.environ.get("CODEX_GATE_MODE") or (argv or sys.argv[1:])[:1] or [""])[0]
+    args = sys.argv[1:] if argv is None else argv
+    mode = os.environ.get("CODEX_GATE_MODE") or (args[0] if args else "")
     repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
     event_path = os.environ.get("GITHUB_EVENT_PATH", "")
     pat = (os.environ.get("CODEX_TRIGGER_PAT") or "").strip()

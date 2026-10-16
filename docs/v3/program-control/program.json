@@ -1,0 +1,167 @@
+{
+  "schema_version": 1,
+  "program_id": "recursion.month-program.2026-10",
+  "status": "candidate",
+  "parent_issue": "CSL-45",
+  "implementation_issue": "CSL-204",
+  "source_commit": "976138272b1642775a698aac6362f23eba34d9ad",
+  "research": [
+    {
+      "kind": "parallel_deep_research",
+      "run_id": "trun_db705696fec649d8b15f52853c399530",
+      "status": "completed",
+      "url": "https://platform.parallel.ai/view/task-run/trun_db705696fec649d8b15f52853c399530"
+    }
+  ],
+  "maturity_order": [
+    "unresearched",
+    "researched",
+    "human_decided",
+    "contract_frozen",
+    "prototyped",
+    "implemented",
+    "provider_free_verified",
+    "locally_qualified",
+    "release_qualified"
+  ],
+  "contracts": [
+    {
+      "id": "contract.issue-anti-drift",
+      "revision": 1,
+      "status": "candidate",
+      "path": "docs/v3/program-control/ISSUE-CONTRACT.md",
+      "sha256": "8b8da6a6204a0dd6d1804a3248a75507d3174af1cd327d1585b41db2e29e4919"
+    },
+    {
+      "id": "contract.month-program",
+      "revision": 1,
+      "status": "candidate",
+      "path": "docs/v3/program-control/MONTH-PROGRAM.md",
+      "sha256": "32b7c21b91928708ed23dd36d6ef6d130aa088590434f772178c3c29916bfdb6"
+    }
+  ],
+  "decisions": [
+    {
+      "id": "decision.program-control-candidate",
+      "status": "approved",
+      "human_decider": "Lucas Guerra",
+      "authority_basis": "direct owner instruction",
+      "proposal_digest": "4c12391901e75c75d43066f79f515d0cb6cba6adc19449b244b9a4d1752e8906",
+      "selected_option": "Develop the program-control layer as a reviewable candidate under CSL-204.",
+      "rejected_options": [
+        "Continue the month with only loosely related implementation issues.",
+        "Treat autonomous agent recommendations as accepted product decisions."
+      ],
+      "rationale": "Parallel development needs versioned lineage, evidence promotion, human decisions, integration checkpoints, and stop conditions.",
+      "conditions": [
+        "No protected authority-path edits.",
+        "No merge, deployment, credential, spending, or downstream product authorization.",
+        "Final contract acceptance remains a separate human decision on the exact reviewed candidate."
+      ],
+      "scope": [
+        "CSL-204"
+      ],
+      "decided_on": "2026-10-16",
+      "approval_evidence": "CSL-204 owner authorization quotation",
+      "revisit_trigger": "The candidate changes product authority, public semantics, or the accepted program boundary."
+    }
+  ],
+  "admission": {
+    "mode": "closed_pending_human_limits",
+    "max_active_contract_consumers": null,
+    "max_concurrent_reviews": null,
+    "decision_receipt": null,
+    "active_contract_consumers": []
+  },
+  "work_items": [
+    {
+      "id": "CSL-204",
+      "parent": "CSL-45",
+      "status": "in_progress",
+      "stage": "development",
+      "consequential": false,
+      "hard_dependencies": [],
+      "consumes_contracts": [],
+      "acceptance_command": "python -X utf8 -B tools/check_program_control.py",
+      "independent_verification_required": true,
+      "recovery": "Revert the CSL-204 candidate; no external state is mutated.",
+      "rollback": "Remove the candidate documents and checker before merge.",
+      "stop_conditions": [
+        "A protected authority-path change becomes necessary.",
+        "The candidate would infer human approval or enable dependent product work.",
+        "The deterministic gate cannot distinguish candidate status from acceptance."
+      ]
+    }
+  ],
+  "capabilities": [
+    {
+      "id": "capability.program-control",
+      "current_maturity": "researched",
+      "month_target": "provider_free_verified",
+      "contract_ids": [
+        "contract.issue-anti-drift",
+        "contract.month-program"
+      ],
+      "evidence_ids": [
+        "evidence.program-control-candidate"
+      ],
+      "unknown_ids": [
+        "unknown.independent-verification",
+        "unknown.owner-contract-acceptance"
+      ]
+    }
+  ],
+  "evidence": [
+    {
+      "id": "evidence.program-control-candidate",
+      "kind": "local_candidate",
+      "artifact": "CSL-204 review branch",
+      "environment": "provider-free repository checkout",
+      "result": "candidate",
+      "independent": false,
+      "limitations": "Structure and fixtures are not yet independently verified or Owner-accepted."
+    }
+  ],
+  "unknowns": [
+    {
+      "id": "unknown.independent-verification",
+      "blocks": "provider_free_verified",
+      "resolution_issue": "CSL-204",
+      "exposure": "The implementer may have missed a structural or semantic defect."
+    },
+    {
+      "id": "unknown.owner-contract-acceptance",
+      "blocks": "contract_frozen",
+      "resolution_issue": "CSL-204",
+      "exposure": "Dependent issues cannot inherit the candidate as an accepted contract."
+    }
+  ],
+  "risks": [
+    {
+      "id": "risk.false-authority",
+      "severity": "high",
+      "status": "open",
+      "mitigation": "Keep contracts candidate, require exact-digest human receipts, and fail closed on missing references.",
+      "trigger": "A dependent issue treats this PR, an agent recommendation, or a merge as product approval."
+    },
+    {
+      "id": "risk.process-overhead",
+      "severity": "medium",
+      "status": "open",
+      "mitigation": "Require deep research only for consequential questions and inherit accepted parent evidence for mechanical children.",
+      "trigger": "Control work delays bounded implementation without reducing a named risk."
+    }
+  ],
+  "integration_checkpoints": [
+    {
+      "id": "checkpoint.program-control",
+      "status": "open",
+      "issue": "CSL-204",
+      "requires": [
+        "contract.issue-anti-drift",
+        "contract.month-program"
+      ],
+      "acceptance_command": "python -X utf8 -B tools/check_program_control.py"
+    }
+  ]
+}

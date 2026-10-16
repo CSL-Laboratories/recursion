@@ -673,7 +673,9 @@ class WorkflowAndDocsTests(unittest.TestCase):
         self.assertNotRegex(text, r"git push|--force|mergePullRequest")
         ci = CI.read_text(encoding="utf-8")
         self.assertNotIn("linear-pr-sync", ci)
-        self.assertIn("name: linux", ci)
+        # External ordinary/ignored names are executed in test_ci_scheduling.
+        self.assertRegex(ci, r"(?m)^  linux:$")
+        self.assertIn("'ignored-label-linux' || 'linux'", ci)
 
 
 if __name__ == "__main__":

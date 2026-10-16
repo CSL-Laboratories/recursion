@@ -13,37 +13,41 @@
 #   needs secrets, a trusted controller, and live resource observations
 # - tools/check_next_phase.py — needs Java/TLA+, not the current product suite
 #
-# PRs also run tools/perf_ci.py inside the linux job. It times the provider-free
+# PRs also run tools/perf_ci.py inside the linux-tests job. It times the provider-free
 # planning kernel against the PR base and warns above a 10% slowdown. That
 # warning does not fail the required linux check, and it does not start a
 # second runner. The step is capped at one minute with continue-on-error.
 # `timeout 55` lets the shell emit ::warning:: on hang; timeout-minutes is a
 # backstop, and a follow-up step warns if that backstop kills the shell.
 #
-# Do not listen for labeled/unlabeled. A skipped or no-op job named `linux` is
-# treated as success and would overlay a failed required check on the same SHA.
-# Adding `ci:full` starts windows/macos from ci-full-label.yml (no linux job).
-# `ci:full` also gates windows/macos on the next synchronize / ready_for_review
-# / dispatch / master push. Discord `/ci full` retriggers.
+# ci:full joins this DAG so its OS results feed the same required aggregate.
+# Ignored label events use distinct check names and concurrency groups: skipped
+# jobs must never overlay a required check or cancel an active PR run.
+# Non-docs PR platform-gates requires all OS jobs, even on a Linux-only run;
+# that staged aggregate fails until ci:full supplies complete coverage.
 #
 # Non-draft pull_request synchronize waits 120s on free GitHub-hosted Ubuntu
 # before Blacksmith jobs start. A newer push can cancel this run in that wait.
-# Cancellation after a paid job starts cannot recover elapsed cost. Label and
-# manual lanes are independent. Other events deliberately skip settle; explicit
+# Cancellation after a paid job starts cannot recover elapsed cost. Manual
+# dispatch is independent. Other events deliberately skip settle; explicit
 # status/dependency guards allow the selected platform jobs.
+# Queue coverage is staged; master-push fallback remains until owner-approved activation.
 name: CI
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
   push:
     branches: [master]
+  merge_group:
+    types: [checks_requested]
   workflow_dispatch:
 
 concurrency:
-  # Ordinary PR runs share a group across heads. Label and manual dispatch
-  # lanes are separate; a PR push does not cancel those independently requested runs.
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # ci:full shares PR concurrency across heads; ignored labels cannot cancel it.
+  # Manual dispatch remains a separate lane. Queue arrival order is not freshness
+  # proof, so a Linux-only run can never report non-docs platform-gates success.
+  group: ci-${{ github.workflow }}-${{ (github.event.action == 'labeled' && (github.event.label.name != 'ci:full' || github.event.pull_request.draft)) && format('ignored-label-{0}-{1}', github.event.pull_request.number, github.event.label.name) || github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -56,7 +60,7 @@ env:
 
 jobs:
   settle:
-    name: settle
+    name: ${{ (github.event.action == 'labeled' && (github.event.label.name != 'ci:full' || github.event.pull_request.draft)) && 'ignored-label-settle' || 'settle' }}
     if: >
       github.event_name == 'pull_request' &&
       github.event.action == 'synchronize' &&
@@ -68,10 +72,11 @@ jobs:
         run: sleep 120
 
   linux-tests:
-    name: linux-tests
+    name: ${{ (github.event.action == 'labeled' && (github.event.label.name != 'ci:full' || github.event.pull_request.draft)) && 'ignored-label-linux-tests' || 'linux-tests' }}
     needs: settle
     if: >
       always() && !cancelled() &&
+      (github.event.action != 'labeled' || (github.event.label.name == 'ci:full' && github.event.pull_request.draft == false)) &&
       (needs.settle.result == 'success' ||
        (needs.settle.result == 'skipped' &&
         !(github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.draft == false)))
@@ -79,6 +84,7 @@ jobs:
     timeout-minutes: 15
     outputs:
       run_full: ${{ steps.paths.outputs.run_full }}
+      classification: ${{ steps.paths.outputs.classification }}
     steps:
       # Full history: delegated-Q test_contract.py resolves TASK_BASE (0c908f6)^{tree}.
       # Packed repo is ~19MB, so this is cheaper than a second fetch of that commit.
@@ -89,7 +95,8 @@ jobs:
       - name: Path filter
         id: paths
         env:
-          CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          CI_HEAD_SHA: ${{ github.event.merge_group.head_sha || github.sha }}
         run: python3 -X utf8 -B tools/ci_gate.py --paths-only
 
       - name: Set up Python
@@ -107,7 +114,8 @@ jobs:
       - name: Provider-free gate
         if: steps.paths.outputs.run_full == 'true'
         env:
-          CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          CI_HEAD_SHA: ${{ github.event.merge_group.head_sha || github.sha }}
         run: python -X utf8 -B tools/ci_gate.py --force
 
       # Same job and runner as the gate. Slowdowns warn; a crash, timeout, or
@@ -130,18 +138,22 @@ jobs:
       - name: Docs-only lightweight checks
         if: steps.paths.outputs.run_full != 'true'
         env:
-          CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          CI_HEAD_SHA: ${{ github.event.merge_group.head_sha || github.sha }}
         run: python3 -X utf8 -B tools/ci_gate.py
 
   # Keep the existing required name fail-closed even when paid tests must skip.
   linux:
-    name: linux
+    name: ${{ (github.event.action == 'labeled' && (github.event.label.name != 'ci:full' || github.event.pull_request.draft)) && 'ignored-label-linux' || 'linux' }}
     needs: [settle, linux-tests]
-    if: always()
+    if: >
+      always() &&
+      (github.event.action != 'labeled' || (github.event.label.name == 'ci:full' && github.event.pull_request.draft == false))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       run_full: ${{ needs.linux-tests.outputs.run_full }}
+      classification: ${{ needs.linux-tests.outputs.classification }}
     steps:
       - name: Reject workflow cancellation
         if: cancelled()
@@ -160,18 +172,22 @@ jobs:
           fi
 
   windows:
-    name: windows
+    name: ${{ (github.event.action == 'labeled' && (github.event.label.name != 'ci:full' || github.event.pull_request.draft)) && 'ignored-label-windows' || 'windows' }}
     needs: [settle, linux]
     if: >
       always() && !cancelled() &&
+      (github.event.action != 'labeled' || (github.event.label.name == 'ci:full' && github.event.pull_request.draft == false)) &&
       (needs.settle.result == 'success' ||
        (needs.settle.result == 'skipped' &&
         !(github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.draft == false))) &&
       needs.linux.result == 'success' &&
       needs.linux.outputs.run_full == 'true' &&
       (github.event_name == 'push' ||
+       github.event_name == 'merge_group' ||
        github.event_name == 'workflow_dispatch' ||
-       (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:full')))
+       (github.event_name == 'pull_request' &&
+        (contains(github.event.pull_request.labels.*.name, 'ci:full') ||
+         (github.event.action == 'labeled' && github.event.label.name == 'ci:full'))))
     runs-on: blacksmith-2vcpu-windows-2025
     timeout-minutes: 20
     steps:
@@ -198,17 +214,21 @@ jobs:
   # GitHub-hosted macOS is not run on master pushes. Nightly master coverage
   # lives in ci-macos-nightly.yml (07:17 UTC, skipped if no commits in 24h).
   macos:
-    name: macos
+    name: ${{ (github.event.action == 'labeled' && (github.event.label.name != 'ci:full' || github.event.pull_request.draft)) && 'ignored-label-macos' || 'macos' }}
     needs: [settle, linux]
     if: >
       always() && !cancelled() &&
+      (github.event.action != 'labeled' || (github.event.label.name == 'ci:full' && github.event.pull_request.draft == false)) &&
       (needs.settle.result == 'success' ||
        (needs.settle.result == 'skipped' &&
         !(github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.draft == false))) &&
       needs.linux.result == 'success' &&
       needs.linux.outputs.run_full == 'true' &&
-      (github.event_name == 'workflow_dispatch' ||
-       (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:full')))
+      (github.event_name == 'merge_group' ||
+       github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'pull_request' &&
+        (contains(github.event.pull_request.labels.*.name, 'ci:full') ||
+         (github.event.action == 'labeled' && github.event.label.name == 'ci:full'))))
     runs-on: macos-latest
     timeout-minutes: 15
     steps:
@@ -228,3 +248,29 @@ jobs:
 
       - name: Provider-free gate
         run: python -X utf8 -B tools/ci_gate.py --force
+
+  platform-gates:
+    name: ${{ (github.event.action == 'labeled' && (github.event.label.name != 'ci:full' || github.event.pull_request.draft)) && 'ignored-label-platform-gates' || 'platform-gates' }}
+    needs: [settle, linux, windows, macos]
+    if: >
+      always() &&
+      (github.event.action != 'labeled' || (github.event.label.name == 'ci:full' && github.event.pull_request.draft == false))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Reject workflow cancellation
+        if: cancelled()
+        run: exit 1
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: tools/ci_results.py
+          sparse-checkout-cone-mode: false
+      - name: Require every selected platform result
+        env:
+          CI_NEEDS: ${{ toJSON(needs) }}
+          CI_EVENT: ${{ github.event_name }}
+          CI_ACTION: ${{ github.event.action }}
+          CI_DRAFT: ${{ github.event.pull_request.draft || false }}
+          CI_FULL: ${{ contains(github.event.pull_request.labels.*.name, 'ci:full') }}
+        run: python3 -X utf8 -B tools/ci_results.py

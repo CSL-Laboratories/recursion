@@ -1,5 +1,31 @@
 # Contributing to Recursion
 
+## Linear-first operations (applies to every agent and Grok Bot)
+
+Linear is the basis of operations. Before starting work, check Linear for overlapping
+issues and PRs.
+
+- Work only from a Linear issue. Keep it updated with status, progress comments and PR
+  links. Bots and agents post their own status updates and PR links as comments on the
+  issue.
+- Every review request, blocker, or question for a dev must be posted as an @mention
+  comment on the matching CSL Linear issue, so the Linear bot notifies them. A GitHub
+  mention alone is not enough. Current Linear handles (check Linear if ownership has
+  changed): Chaandan = @chaandansaini101, Samir = @samirshahahmed, Lucas =
+  @lucassalvador987. This applies to interactive agents and Grok Bot. The GitHub-only
+  Claude Code Action fixer has no Linear tooling; it replies on the PR threads, and the
+  PR author relays anything it cannot fix to the Linear issue.
+- **Wait for jobs before human sign-off.** Order: Devin Review runs first, then the
+  Claude fixer job (`devin-review-fix`) acts on its findings, then required
+  CI reruns on the fixer's push. No human approves or requests changes on a PR until all
+  of these have finished on the current head commit. A review on a stale head does not
+  count. After new pushes, the reviewer reviews again. Review requests and their status
+  are posted as @mention comments on the CSL Linear issue, and a watcher posts there when
+  a PR is ready for review.
+- Autonomously file research findings, ideas and bugs to Triage, deduped.
+- Ground every implementation in the best available research: Parallel search for web
+  research and Context7 for current library docs.
+
 Recursion is the supervision and execution control plane for a portfolio of projects. The
 current development target is **Recursion v3** — a provider-neutral agent platform. This
 page is the short path from "I want to help" to "my work can be reviewed and merged".
@@ -33,6 +59,21 @@ For a research or evidence task:
 4. Record what the check proves and what it does **not** prove. Missing verification is
    never a pass; an implementer's own PASS is not acceptance.
 
+## Linear workflow
+
+Work starts in Linear (team **CSL**, project **recursion**), not as a GitHub issue. When you
+start, assign yourself and move the issue to **In Progress**. Title the PR
+`CSL-N: ...` and include `Fixes CSL-N` in the body — that links the PR, and merging moves
+the issue to **Done** automatically. If the PR does not move the issue to **In Review**,
+move it yourself.
+File follow-ups to **Triage**. Keep the Linear issue current as work progresses, and file
+anything that comes up in a session to **Triage** instead of dropping it; Linear is the
+primary async channel, alongside Google Meet and Discord.
+
+## When Claude can't fix a review thread
+
+See [AGENTS.md#when-claude-cant-fix-a-review-thread](AGENTS.md#when-claude-cant-fix-a-review-thread).
+
 ## Branch and review flow
 
 - Branch from up-to-date `master` as `csl-<N>-<slug>` (example `csl-26-short-slug`).
@@ -49,16 +90,8 @@ For a research or evidence task:
 
 ## Review loop
 
-Devin reviews. Claude (`.github/workflows/claude.yml`) fixes Devin findings on
-same-repo member PRs. Unresolved Devin threads that Claude cannot settle are
-picked up by
-[`.github/workflows/stuck-thread-watch.yml`](.github/workflows/stuck-thread-watch.yml),
-which asks Codex to mediate (`@codex review`) and files a Linear Triage issue
-labelled `needs-decision`. If Codex emits `CODEX-THREAD: RESOLVE` for a
-thread it was asked about, the ruling's HEAD is the current PR head, and
-required checks on that head are green, the watcher replies on the thread
-and resolves it via `CODEX_TRIGGER_PAT`. Otherwise a human decides. The
-watcher never pushes or merges.
+See [AGENTS.md#review-loop](AGENTS.md#review-loop). The stuck-thread author
+fallback lives in [When Claude can't fix a review thread](AGENTS.md#when-claude-cant-fix-a-review-thread).
 
 ## Run a gate
 

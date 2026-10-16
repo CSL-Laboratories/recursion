@@ -12,6 +12,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -215,8 +216,10 @@ class MentionMatrixTests(unittest.TestCase):
 class DevinMatrixTests(unittest.TestCase):
     def _review(self, **pr_kw) -> dict:
         return {
+            "action": "submitted",
             "review": {
-                "user": {"login": "devin-ai-integration[bot]"},
+                "user": {"login": "devin-ai-integration[bot]", "type": "Bot"},
+                "commit_id": "a" * 40,
                 "state": "commented",
                 "id": 1,
             },
@@ -228,6 +231,44 @@ class DevinMatrixTests(unittest.TestCase):
         self.assertEqual(got["devin"], "true")
         self.assertEqual(got["mention"], "false")
         self.assertEqual(got["head_ref"], "feature/fix")
+
+    def test_review_action_identity_and_head_are_required(self) -> None:
+        for mutate in (
+            lambda e: e.update(action="edited"),
+            lambda e: e["review"]["user"].update(type="User"),
+            lambda e: e["review"].update(commit_id="invalid"),
+            lambda e: e["review"].pop("commit_id"),
+            lambda e: e["review"].update(state="approved"),
+        ):
+            event = self._review()
+            mutate(event)
+            self.assertEqual(decide("pull_request_review", event)["devin"], "false")
+
+    def test_main_fetches_current_head_and_fails_closed(self) -> None:
+        from unittest import mock
+        event = self._review()
+        for payload in (pr_payload(), pr_payload(head_sha="b" * 40), None):
+            with mock.patch.dict(os.environ, {
+                "GITHUB_EVENT_NAME": "pull_request_review",
+                "GITHUB_EVENT_PATH": "event.json",
+                "GITHUB_REPOSITORY": REPO,
+            }), mock.patch.object(gate, "load_event", return_value=event), mock.patch.object(
+                gate, "fetch_pr", return_value=payload
+            ) as fetch, mock.patch.object(gate, "gh_permission", return_value=lookup), mock.patch.object(gate, "emit") as emit:
+                self.assertEqual(gate.main(), 0)
+                fetch.assert_called_once_with(REPO, 42)
+                self.assertEqual(emit.call_args.args[0]["devin"], "true" if payload is not None else "false")
+
+    def test_current_fetched_pr_head_overrides_event_head(self) -> None:
+        event = self._review()
+        got = decide("pull_request_review", event, pr=pr_payload(head_sha="b" * 40))
+        self.assertEqual(got["devin"], "true")
+        self.assertEqual(got["head_sha"], "b" * 40)
+
+    def test_owner_and_member_still_require_permission(self) -> None:
+        for association in ("OWNER", "MEMBER"):
+            self.assertEqual(decide("pull_request_review", self._review(author_association=association))["devin"], "true")
+            self.assertEqual(decide("pull_request_review", self._review(author="reader", author_association=association))["devin"], "false")
 
     def test_devin_changes_requested(self) -> None:
         event = self._review()
@@ -361,11 +402,67 @@ class WholeWordTests(unittest.TestCase):
         self.assertFalse(gate.is_whole_word_mention(None))
 
 
-class WorkflowStructureTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls.text = WORKFLOW_PATH.read_text(encoding="utf-8")
+def validate_shared_writer_queues(text: str, expected_groups: list[str]) -> None:
+    """Strict independent gate for the one syntax feature actionlint cannot parse."""
+    groups = []
+    for match in re.finditer(r"(?m)^    concurrency:\n((?:      .*\n|\n)*)", text):
+        entries = re.findall(r"(?m)^      ([a-z-]+): (.+)$", match.group(1))
+        values = dict(entries)
+        if values.get("group", "").startswith("claude-${{") or "queue" in values:
+            if len(entries) != 3 or len(values) != 3 or set(values) != {"group", "queue", "cancel-in-progress"}:
+                raise ValueError("writer concurrency must have three unique literal keys")
+            if values["queue"] != "max" or values["cancel-in-progress"] != "false":
+                raise ValueError("writer must retain up to 100 pending jobs and one active job")
+            groups.append(values["group"])
+    if sorted(groups) != sorted(expected_groups):
+        raise ValueError("all writers must use their shared per-PR concurrency group")
+    if len(re.findall(r"(?m)^\s*queue:", text)) != len(expected_groups):
+        raise ValueError("unexpected or incorrectly indented queue key")
 
+
+class SharedQueuePolicyTests(unittest.TestCase):
+    def test_all_four_shared_writers_use_bounded_fifo_queue(self) -> None:
+        validate_shared_writer_queues(WORKFLOW_PATH.read_text(), ["claude-${{ needs.resolve-pr.outputs.pr_number }}"] * 2)
+        validate_shared_writer_queues(SCAN_WORKFLOW_PATH.read_text(), ["claude-${{ matrix.pr.number }}"])
+        validate_shared_writer_queues((ROOT / ".github/workflows/codex-gate.yml").read_text(), ["claude-${{ github.event.pull_request.number }}"])
+
+    def test_mutations_cannot_hide_behind_actionlint_compatibility_exception(self) -> None:
+        original = WORKFLOW_PATH.read_text()
+        for bad in (
+            original.replace("queue: max", "queue: single", 1),
+            original.replace("cancel-in-progress: false", "cancel-in-progress: true", 1),
+            original.replace("      queue: max\n", "", 1),
+            original.replace("      queue: max\n", "      queue: max\n      queue: single\n", 1),
+            original.replace("group: claude-${{", "group: independent-${{", 1),
+        ):
+            with self.assertRaises(ValueError):
+                validate_shared_writer_queues(bad, ["claude-${{ needs.resolve-pr.outputs.pr_number }}"] * 2)
+
+    def test_codex_journal_writer_lock_rejects_queue_and_group_drift(self):
+        workflow = (ROOT / ".github/workflows/codex-gate.yml").read_text()
+        group = "claude-${{ github.event.pull_request.number }}"
+        for bad in (workflow.replace("queue: max", "queue: min"),
+                    workflow.replace("cancel-in-progress: false", "cancel-in-progress: true"),
+                    workflow.replace(group, "codex-independent")):
+            with self.assertRaises(ValueError):
+                validate_shared_writer_queues(bad, [group])
+        verdict = workflow.split("  verdict:", 1)[1]
+        self.assertIn("github.event_name == 'pull_request_review'", verdict)
+        self.assertNotIn("gh run watch", verdict)
+        self.assertNotIn("workflow_run", verdict)
+
+    def test_actionlint_exception_is_exact_and_path_scoped(self) -> None:
+        config = (ROOT / ".github/actionlint.yaml").read_text()
+        pattern = '^unexpected key "queue" for "concurrency" section\\. expected one of "cancel-in-progress", "group"$'
+        self.assertEqual(config.count("      - '" + pattern + "'"), 3)
+        self.assertEqual(config.count("    ignore:"), 3)
+        self.assertIn("  .github/workflows/claude.yml:", config)
+        self.assertIn("  .github/workflows/conflict-scan.yml:", config)
+        self.assertIn("  .github/workflows/codex-gate.yml:", config)
+        self.assertIn("blacksmith-2vcpu-ubuntu-2404", config)
+
+
+class WorkflowStructureTests(unittest.TestCase):
     def test_light_jobs_use_github_hosted_runners(self) -> None:
         resolve = self._job("resolve-pr")
         mention = self._job("claude-mention")
@@ -375,6 +472,10 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn("runs-on: ubuntu-latest", mention.split("timeout-minutes", 1)[0])
         self.assertIn("runs-on: ubuntu-latest", paths.split("timeout-minutes", 1)[0])
         self.assertIn("runs-on: ubuntu-latest", fixer.split("timeout-minutes", 1)[0])
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.text = WORKFLOW_PATH.read_text(encoding="utf-8")
 
     def test_no_workflow_level_concurrency(self) -> None:
         head = self.text.split("jobs:", 1)[0]
@@ -405,9 +506,9 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn("github.event.sender.type != 'Bot'", header)
         self.assertIn("github.event.comment.user.type != 'Bot'", header)
         self.assertIn("contains(github.event.comment.body, '@claude')", header)
-        self.assertNotIn("devin-ai-integration[bot]", header)
+        self.assertIn("devin-ai-integration[bot]", header)
         self.assertNotIn("chatgpt-codex-connector[bot]", header)
-        self.assertNotIn("github.event_name == 'pull_request_review' &&", header)
+        self.assertIn("github.event_name == 'pull_request_review' &&", header)
         self.assertIn("workflow_dispatch", header)
         self.assertIn("repository_dispatch", header)
         self.assertNotIn(
@@ -419,8 +520,9 @@ class WorkflowStructureTests(unittest.TestCase):
         mention = self._job("claude-mention")
         devin = self._job("devin-review-fix")
         needle = "ref: ${{ needs.resolve-pr.outputs.head_sha }}"
-        self.assertIn(needle, mention)
-        self.assertIn(needle, devin)
+        self.assertIn("ref: ${{ steps.live.outputs.head_sha }}", mention)
+        self.assertIn("ref: ${{ steps.cap.outputs.head_sha }}", devin)
+        self.assertNotIn(needle, devin)
         self.assertNotIn("ref: ${{ needs.resolve-pr.outputs.head_ref }}", mention)
         self.assertNotIn("ref: ${{ github.event.pull_request.head.ref }}", mention)
 
@@ -434,8 +536,8 @@ class WorkflowStructureTests(unittest.TestCase):
             "Bash(git push origin HEAD:refs/heads/"
             "${{ needs.resolve-pr.outputs.head_ref }})"
         )
-        self.assertIn(push, mention)
-        self.assertIn(push, devin)
+        self.assertIn(push.replace("needs.resolve-pr.outputs.head_ref", "steps.live.outputs.head_ref"), mention)
+        self.assertIn(push.replace("needs.resolve-pr.outputs.head_ref", "steps.cap.outputs.head_ref"), devin)
         self.assertNotIn("HEAD:refs/heads/*", mention)
 
     def test_prompt_treats_review_and_files_as_untrusted(self) -> None:
@@ -457,6 +559,14 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertNotIn("MEMBER_ASSOC", source)
         self.assertIn("GH_TOKEN: ${{ github.token }}", self._job("resolve-pr"))
         self.assertIn("DISPATCH_EVENTS", source)
+
+    def test_dependencies_are_installed_before_model_invocation(self) -> None:
+        for name in ("claude-mention", "devin-review-fix"):
+            job = self._job(name)
+            self.assertLess(job.index("actions/setup-python@v5"), job.index("anthropics/claude-code-action@v1"))
+            self.assertLess(job.index("pip install --disable-pip-version-check -r requirements-ci.txt"), job.index("anthropics/claude-code-action@v1"))
+            self.assertIn('python-version: "3.12"', job)
+            self.assertNotIn("continue-on-error", job)
 
     def test_acceptance_gates_before_push(self) -> None:
         devin = self._job("devin-review-fix")
@@ -777,14 +887,14 @@ def conflicted_pr(**kw) -> dict:
 
 
 class ConflictScanTests(unittest.TestCase):
+    def test_rotation_matches_two_hour_schedule(self) -> None:
+        self.assertEqual(self.mod.ROTATION_SECONDS, 7200)
+
     def setUp(self) -> None:
         self.mod = load_scan()
 
     def _select(self, prs, lookup_fn=lookup, cap=3):
         return self.mod.select(prs, REPO, lookup_fn, max_prs=cap)
-
-    def test_rotation_matches_two_hour_schedule(self) -> None:
-        self.assertEqual(self.mod.ROTATION_SECONDS, 7200)
 
     def test_selects_conflicted_same_repo_writer_pr(self) -> None:
         chosen, audit = self._select([conflicted_pr()])
@@ -1081,6 +1191,15 @@ class FixerLoopCapTests(unittest.TestCase):
         comments: list[str],
         *,
         bypass_cap: str | None = None,
+        current_sha: str = "a" * 40,
+        current_state: str = "open",
+        current_ref: str = "feature/fix",
+        current_repo: str = "o/r",
+        permission: str = "write",
+        commenter_permission: str = "write",
+        findings: str = "PRRT_1",
+        listing_error: bool = False,
+        threads: list[dict] | None = None,
     ) -> tuple[str, str]:
         import os
         import shutil
@@ -1093,12 +1212,19 @@ class FixerLoopCapTests(unittest.TestCase):
             d = Path(tmp)
             (d / "commits.tsv").write_text("".join(f"{a}\t{b}\n" for a, b in commits), encoding="utf-8")
             (d / "comments.txt").write_text("".join(c + "\n" for c in comments), encoding="utf-8")
+            (d / "pr.json").write_text(json.dumps({"state": current_state, "head": {"sha": current_sha, "ref": current_ref, "repo": {"full_name": current_repo}}, "user": {"login": "alice"}}))
+            (d / "threads.json").write_text(json.dumps({"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": threads or []}}}}}))
+            graphql_reply = ('jq -r "${!#}" "' + str(d / "threads.json") + '"') if threads is not None else ('printf "%s\\n" "' + findings + '"')
             gh = d / "gh"
             gh.write_text(
                 "#!/usr/bin/env bash\n"
                 'case "$*" in\n'
                 f'  *" -f body="*) echo posted >> "{d}/posted";;\n'
-                f'  */commits*) cat "{d}/commits.tsv";;\n'
+                f'  *"graphql"*) {"exit 1" if listing_error else graphql_reply};;\n'
+                f'  *"collaborators/bob/permission"*) echo {commenter_permission};;\n'
+                f'  *"collaborators"*) echo {permission};;\n'
+                f'  "api repos/o/r/pulls/1") cat "{d}/pr.json";;\n'
+                f'  */commits*) {"exit 1" if listing_error else "cat" + chr(32) + str(d / "commits.tsv")};;\n'
                 f'  */comments*) cat "{d}/comments.txt";;\n'
                 "esac\n",
                 encoding="utf-8",
@@ -1107,60 +1233,109 @@ class FixerLoopCapTests(unittest.TestCase):
             out = d / "out"
             out.write_text("", encoding="utf-8")
             env = dict(os.environ, PATH=f"{d}{os.pathsep}{os.environ.get('PATH', '')}", GITHUB_OUTPUT=str(out),
-                       REPO="o/r", PR_NUMBER="1", HEAD_SHA="abc123", GH_TOKEN="x")
+                       REPO="o/r", PR_NUMBER="1", HEAD_SHA="a" * 40, HEAD_REF="feature/fix", GH_TOKEN="x", COMMENTER="bob")
             if bypass_cap is not None:
                 env["BYPASS_CAP"] = bypass_cap
             subprocess.run(["bash", "-c", self.script], env=env, check=True, capture_output=True)
             posted = (d / "posted").read_text(encoding="utf-8") if (d / "posted").exists() else ""
             return out.read_text(encoding="utf-8"), posted
 
-    def test_eight_claude_commits_after_human_skips_and_comments(self) -> None:
+    def test_eight_claude_commits_are_passed_to_pending_finding_guard(self) -> None:
         out, posted = self._run([("alice", "Alice")] + [("claude[bot]", "claude[bot]")] * 8, [])
-        self.assertIn("skip=true", out)
-        self.assertEqual(posted.count("posted"), 1)
+        self.assertIn("loop_commit_count=8", out)
+        self.assertIn("skip=false", out)
+        self.assertEqual(posted, "")
 
     def test_seven_claude_commits_runs(self) -> None:
         out, posted = self._run([("alice", "Alice")] + [("claude[bot]", "claude[bot]")] * 7, [])
         self.assertIn("skip=false", out)
-        self.assertEqual(posted.count("posted"), 1)
+        self.assertIn("loop_commit_count=7", out)
+        self.assertEqual(posted, "")
 
-    def test_daily_fixer_markers_do_not_skip(self) -> None:
+    def test_daily_fixer_markers_do_not_cap_runs(self) -> None:
         from datetime import datetime, timezone
 
         day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         marker = f"<!-- codex-fixer-run:{day} -->"
         out, posted = self._run(
             [("alice", "Alice")],
-            [marker] * 3,
+            [marker] * 8,
         )
         self.assertIn("skip=false", out)
-        self.assertEqual(posted.count("posted"), 1)
+        self.assertEqual(posted, "")
 
-    def test_bypass_cap_skips_daily_marker(self) -> None:
+    def test_bypass_cap_ignores_daily_markers(self) -> None:
+        from datetime import datetime, timezone
+
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        marker = f"<!-- codex-fixer-run:{day} -->"
         out, posted = self._run(
             [("alice", "Alice")],
-            [],
+            [marker] * 8,
             bypass_cap="true",
         )
         self.assertIn("skip=false", out)
         self.assertEqual(posted, "")
 
     def test_human_commit_resets_streak(self) -> None:
-        c = [("claude[bot]", "claude[bot]")] * 8 + [("bob", "Bob")] + [("claude[bot]", "claude[bot]")] * 2
+        c = [("claude[bot]", "claude[bot]")] * 8 + [("bob", "Bob")] + [("claude[bot]", "claude[bot]")] * 7
         out, _ = self._run(c, [])
         self.assertIn("skip=false", out)
+        self.assertIn("loop_commit_count=7", out)
 
     def test_other_bot_does_not_reset_streak(self) -> None:
-        c = [("alice", "Alice")] + [("claude[bot]", "claude[bot]")] * 4 + [
-            ("github-actions[bot]", "github-actions[bot]"),
-        ] + [("claude[bot]", "claude[bot]")] * 4
+        c = [("alice", "Alice")] + [("claude[bot]", "claude[bot]")] * 4 + [("github-actions[bot]", "github-actions[bot]")] + [("claude[bot]", "claude[bot]")] * 4
         out, _ = self._run(c, [])
+        self.assertIn("loop_commit_count=8", out)
+
+    def test_queued_job_refreshes_head_after_prior_fix_push(self) -> None:
+        # The previous run checked its threads, then another finding arrived,
+        # then that run pushed B. The queued wake-up for A must fix the remainder on B.
+        out, posted = self._run([("claude[bot]", "claude[bot]")], [], current_sha="b" * 40, findings="PRRT_late")
+        self.assertIn("skip=false", out)
+        self.assertIn("head_sha=" + "b" * 40, out)
+        self.assertEqual(posted, "")
+
+    def test_invalid_live_sha_skips(self) -> None:
+        out, _ = self._run([], [], current_sha="not-a-sha")
         self.assertIn("skip=true", out)
 
-    def test_existing_marker_suppresses_duplicate_comment(self) -> None:
-        out, posted = self._run([("claude[bot]", "claude[bot]")] * 8, ["<!-- claude-fixer-loop-cap:abc123 -->"])
-        self.assertIn("skip=true", out)
-        self.assertEqual(posted, "")
+    def test_queued_authorization_is_rechecked(self) -> None:
+        for kwargs in ({"current_state": "closed"}, {"current_ref": "renamed"}, {"current_repo": "evil/fork"}, {"permission": "read"}):
+            out, _ = self._run([], [], **kwargs)
+            self.assertIn("skip=true", out)
+
+    def test_listing_error_fails_closed(self) -> None:
+        with self.assertRaises(subprocess.CalledProcessError):
+            self._run([], [], listing_error=True)
+
+    def test_legacy_bypass_does_not_disable_eight_commit_guard(self) -> None:
+        out, _ = self._run([("claude[bot]", "claude[bot]")] * 8, [], bypass_cap="true")
+        self.assertIn("loop_commit_count=8", out)
+
+    def test_historical_event_markers_do_not_block_new_or_failed_findings(self) -> None:
+        out, _ = self._run([], ["<!-- claude-fixer-event:123:abc123 -->"])
+        self.assertIn("skip=false", out)
+
+    def test_query_variables_stay_literal_with_scoped_shellcheck_directives(self) -> None:
+        self.assertEqual(self.script.count("# shellcheck disable=SC2016"), 1)
+        self.assertIn("# shellcheck disable=SC2016\nif ! jq", self.script)
+        self.assertIn('.head.ref == $ref and .head.repo.full_name == $repo', self.script)
+
+    def test_receipt_helper_embedded_from_trusted_workflow_before_checkout(self) -> None:
+        source = (WORKFLOW_PATH.parents[2] / "scripts/ci/claude_fixer_receipts.py").read_text()
+        job = self.text[self.text.index("  devin-review-fix:"):]
+        begin = job.index("          #!/usr/bin/env python3", job.index("id: eligibility"))
+        end = job.index("          CLAUDE_FIXER_RECEIPTS", begin)
+        import textwrap
+        self.assertEqual(textwrap.dedent(job[begin:end]).rstrip(), source.rstrip())
+        self.assertLess(job.index("id: eligibility"), job.index("uses: actions/checkout"))
+        self.assertIn("MANUAL_RETRY: ${{ github.event_name == 'workflow_dispatch' }}", job)
+        self.assertIn("steps.eligibility.outputs.receipt_context", job)
+        self.assertIn("LOOP_COMMIT_COUNT: ${{ steps.cap.outputs.loop_commit_count }}", job)
+        self.assertIn("needs-human handoffs must remain unresolved", job)
+        for step in job.split("      - uses: actions/checkout@v4", 1)[1].split("\n      - "):
+            self.assertIn("steps.eligibility.outputs.skip != 'true'", step)
 
     def test_fixer_steps_gated_on_cap(self) -> None:
         start = self.text.index("  devin-review-fix:\n")
@@ -1176,6 +1351,42 @@ class FixerLoopCapTests(unittest.TestCase):
         self.assertIn("devin-ai-integration[bot]", job)
         self.assertIn(".commit_id == ", job)
         self.assertIn("Devin review of head is pending", job)
+
+
+class MentionLiveHeadTests(unittest.TestCase):
+    _run = FixerLoopCapTests._run
+
+    @classmethod
+    def setUpClass(cls):
+        import textwrap
+        cls.text = WORKFLOW_PATH.read_text()
+        start = cls.text.index("        id: live\n")
+        run = cls.text.index("        run: |\n", start) + len("        run: |\n")
+        end = cls.text.index("\n      - ", run)
+        cls.script = textwrap.dedent(cls.text[run:end])
+
+    def test_queued_human_request_refreshes_head_after_earlier_writer(self):
+        out, posts = self._run([], [], current_sha="b" * 40)
+        self.assertIn("head_sha=" + "b" * 40, out)
+        self.assertIn("head_ref=feature/fix", out)
+        self.assertIn("skip=false", out)
+        self.assertEqual(posts, "")
+
+    def test_live_authorization_and_branch_boundary_rechecked(self):
+        for kwargs in ({"permission": "read"}, {"commenter_permission": "read"},
+                       {"current_state": "closed"}, {"current_repo": "evil/fork"},
+                       {"current_ref": "renamed"}, {"current_sha": "invalid"}):
+            out, _ = self._run([], [], **kwargs)
+            self.assertIn("skip=true", out)
+
+    def test_original_comment_and_fresh_branch_remain_bound(self):
+        job = self.text.split("  claude-mention:", 1)[1].split("  devin-review-fix:", 1)[0]
+        self.assertIn("COMMENTER: ${{ github.event.comment.user.login }}", job)
+        self.assertIn("COMMENT ID: ${{ github.event.comment.id }}", job)
+        self.assertIn("BRANCH: ${{ steps.live.outputs.head_ref }}", job)
+        self.assertLess(job.index("id: live"), job.index("actions/checkout"))
+        for step in job.split("      - uses: actions/checkout@v4", 1)[1].split("\n      - "):
+            self.assertIn("steps.live.outputs.skip != 'true'", step)
 
 
 if __name__ == "__main__":

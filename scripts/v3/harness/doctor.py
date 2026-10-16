@@ -20,6 +20,7 @@ from scripts.v3.harness.providers import adapters
 
 
 _PROBE_TIMEOUT = 10
+_UNPROBED = frozenset({"cursor", "gemini", "opencode"})
 _CLAUDE_METHODS = {"none", "claude.ai", "oauth_token", "api_key", "api_key_helper", "third_party"}
 _SECRET_ENV = re.compile(r"(?i)(api[_-]?key|token|secret|password|authorization|credential)")
 _TOKEN_RE = re.compile(r"(?i)(?:sk-[A-Za-z0-9]{8,}|xai-[A-Za-z0-9]{8,}|bearer\s+[A-Za-z0-9._-]{12,})")
@@ -86,8 +87,10 @@ def diagnose(
     """Report git and one row per configured provider.
 
     ``ok`` is true when at least one enabled provider is usable. An offline
-    fixture is usable whenever it is enabled. A live provider is usable only
-    when it is installed and signed in. A disabled provider is not probed.
+    fixture is usable whenever it is enabled. A live provider with a sign-in
+    probe is usable when it is installed and signed in. Gemini, Cursor, and
+    OpenCode have no probe: ``unknown`` stays ``unknown`` and does not by
+    itself make an installed adapter unusable. A disabled provider is not probed.
     """
 
     env = os.environ if environ is None else environ
@@ -141,7 +144,7 @@ def _provider_row(item: dict, *, platform: str, home: Path, path: str, run, envi
         )
     version = _version(run, resolved) if resolved is not None else None
     signed_in, auth_method = _signed_in(name, resolved, home=home, run=run, environ=environ)
-    return _row(
+    row = _row(
         name=name,
         command=command,
         enabled=True,
@@ -150,12 +153,23 @@ def _provider_row(item: dict, *, platform: str, home: Path, path: str, run, envi
         version=version,
         signed_in=signed_in,
         auth_method=auth_method,
-        usable=installed and signed_in == "signed-in",
+        usable=_usable(name, installed=installed, signed_in=signed_in),
     )
+    if name in _UNPROBED and signed_in == "unknown":
+        row["warning"] = "sign-in is unknown"
+    return row
 
 
 def _row(**fields) -> dict:
     return fields
+
+
+def _usable(name: str, *, installed: bool, signed_in: str) -> bool:
+    if not installed:
+        return False
+    if signed_in == "signed-in":
+        return True
+    return name in _UNPROBED and signed_in == "unknown"
 
 
 def _signed_in(

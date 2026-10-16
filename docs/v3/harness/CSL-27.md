@@ -52,8 +52,9 @@ An upstream CLI broker:
 
 1. Load `config/harness.json` (version 1). It names providers, capabilities,
    and session budgets. It refuses credential-shaped keys.
-2. Choose the worker deterministically: the first enabled provider in
-   `routing.preference` that has every required capability. No model call.
+2. Choose the worker deterministically: the highest-weight enabled provider
+   (`routing.weights`, CSL-83; ties keep `routing.preference` order) that has every
+   required capability. No model call.
 3. Run that adapter. `fixture` and `fixture-b` never start a process. `claude`,
    `codex`, and `grok` start only with `--allow-live`.
 4. When another capable provider is enabled, ask it to review. The verdict is
@@ -72,12 +73,13 @@ flowchart LR
 ```
 
 M1B route admission is unchanged and is not called here. Binding this broker
-to a schema-valid route decision is later work. Landing, worktrees, logs,
-and the other launch-critical adapters are later work.
+to a schema-valid route decision is later work. Worktrees and cooldowns stay
+later work. Land, clean, logs, and the remaining launch-critical adapters are
+[CSL-82](CSL-82.md).
 
 The behavior is ported from the standalone fork `CDanTheMan/recursion` at
-`5897a94` (v0.1.0) and cut down to this path. Fork-only landing, worktrees,
-cooldowns, and the extra adapters are not in this slice.
+`5897a94` (v0.1.0) and cut down to this path. This first slice did not land
+work. CSL-82 adds that, on top of this path, and it is still not the native loop.
 
 ## Fixes from the live fork run
 
@@ -141,9 +143,11 @@ includes the code they sit in, and the tests are stubs.
   --approve-for-me` and grok `--always-approve`, `--prompt-file`, and
   `--cwd` stay on [CSL-81](https://linear.app/csl-laboratories/issue/CSL-81).
   The tests stub the process runner.
-- Budgets are applied after a call returns, so one live call can pass a
-  ceiling. A pre-check is [CSL-83](https://linear.app/csl-laboratories/issue/CSL-83),
-  not this slice.
+- Budgets were applied after a call returned, so one live call could pass
+  a ceiling. The pre-call check is
+  [CSL-83](https://linear.app/csl-laboratories/issue/CSL-83).
+- Checked-in stream fixtures, and the doctor PATH shim on the existing
+  `ci:full` Windows job, are [CSL-84](CSL-84.md).
 
 ## What this does not prove
 

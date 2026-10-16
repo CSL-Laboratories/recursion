@@ -20,10 +20,19 @@ ROOT = Path(__file__).resolve().parents[4]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from scripts.v3.harness.availability import classify_failure  # noqa: E402
 from scripts.v3.harness.cli import main  # noqa: E402
 from scripts.v3.harness.config import load_config, starter_config, validate_config, write_starter  # noqa: E402
+from scripts.v3.harness.cooldowns import CooldownStore, format_until  # noqa: E402
 from scripts.v3.harness.doctor import diagnose, discover_installed, resolve_executable  # noqa: E402
-from scripts.v3.harness.errors import HarnessError, LiveProviderDisabled, ProviderTimeout  # noqa: E402
+from scripts.v3.harness.errors import (  # noqa: E402
+    HarnessError,
+    LiveProviderDisabled,
+    ProviderAuthExpired,
+    ProviderQuotaExhausted,
+    ProviderRateLimited,
+    ProviderTimeout,
+)
 from scripts.v3.harness.providers import (  # noqa: E402
     ClaudeHeadlessProvider,
     CodexExecProvider,
@@ -46,18 +55,37 @@ from scripts.v3.harness.usage import (  # noqa: E402
 
 
 SECRET = "SECRET-TOKEN-VALUE"
-CODEX_SESSION = (
-    '{"type":"turn.completed","usage":{"input_tokens":1000,"output_tokens":10}}\n'
-    '{"type":"turn.completed","usage":{"input_tokens":6900000,"output_tokens":4000}}\n'
-)
-GROK_APPROVE = "\n".join(
-    (
-        json.dumps({"type": "thought", "data": "Checking the diff"}),
-        json.dumps({"type": "text", "data": "The change matches the task.\n"}),
-        json.dumps({"type": "text", "data": "VERDICT approve\n"}),
-        json.dumps({"type": "usage", "usage": {"input_tokens": 12, "output_tokens": 4}}),
-    )
-)
+FIXTURE_DIR = Path(__file__).with_name("fixtures")
+_EVIDENCE = {"source-documented", "locally observed", "synthetic"}
+_PROVIDERS = {"grok", "codex", "claude"}
+NOW = 1_700_000_000
+
+
+def _load_fixture(name: str) -> tuple[dict[str, str], str]:
+    """Return the header map and the stream body. Header lines are not events."""
+
+    raw = (FIXTURE_DIR / name).read_text(encoding="utf-8")
+    header: dict[str, str] = {}
+    body: list[str] = []
+    in_header = True
+    for line in raw.splitlines():
+        if in_header and line.startswith("# "):
+            key, separator, value = line[2:].partition(":")
+            if separator:
+                header[key.strip()] = value.strip()
+            continue
+        if in_header and not line.strip():
+            continue
+        in_header = False
+        body.append(line)
+    text = "\n".join(body)
+    if raw.endswith("\n"):
+        text += "\n"
+    return header, text
+
+
+CODEX_SESSION = _load_fixture("codex-cumulative.txt")[1]
+GROK_APPROVE = _load_fixture("grok-review.txt")[1]
 
 
 def empty_unknown() -> dict:
@@ -84,15 +112,11 @@ class HarnessTests(unittest.TestCase):
     def test_codex_jsonl_agent_message_is_the_assistant_text(self) -> None:
         from scripts.v3.harness.streams import assistant_text
 
-        stream = "\n".join(
-            [
-                json.dumps({"type": "thread.started"}),
-                json.dumps({"type": "item.completed", "item": {"type": "command_execution", "text": "ls"}}),
-                json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "Done"}}),
-                json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}}),
-            ]
+        raw = (FIXTURE_DIR / "codex-exec-jsonl.txt").read_text(encoding="utf-8")
+        self.assertEqual(
+            assistant_text(raw),
+            "Repo contains docs, sdk, and examples directories.",
         )
-        self.assertEqual(assistant_text(stream), "Done")
 
     def test_codex_joins_messages_and_ignores_earlier_turns(self) -> None:
         from scripts.v3.harness.streams import assistant_text
@@ -233,6 +257,141 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(notes, "reviewer returned an unreadable verdict")
         self.assertNotIn("SECRET", notes)
         self.assertEqual(parse_verdict("**VERDICT: approve**")[0], "approve")
+
+    def test_split_verdict_blocks_stay_one_line(self) -> None:
+        from scripts.v3.harness.streams import assistant_text
+
+        split = json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "VERDICT "},
+                        {"type": "text", "text": "approve"},
+                    ]
+                },
+            }
+        )
+        self.assertEqual(assistant_text(split), "VERDICT approve")
+        self.assertEqual(parse_verdict(split)[0], "approve")
+
+        lined = json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "looks good\n"},
+                        {"type": "text", "text": "VERDICT approve"},
+                    ]
+                },
+            }
+        )
+        self.assertEqual(assistant_text(lined), "looks good\nVERDICT approve")
+        self.assertEqual(parse_verdict(lined), ("approve", "looks good"))
+
+        separated = json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "Looks fine."},
+                        {"type": "tool_use", "id": "tool-1", "name": "read"},
+                        {"type": "text", "text": "VERDICT approve"},
+                    ]
+                },
+            }
+        )
+        self.assertEqual(assistant_text(separated), "Looks fine.\nVERDICT approve")
+        self.assertEqual(parse_verdict(separated), ("approve", "Looks fine."))
+
+        hidden = json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "Looks fine."},
+                        {"type": "tool_use", "id": "tool-1", "name": "read"},
+                        {"type": "text", "text": ""},
+                        {"type": "text", "text": "VERDICT approve"},
+                    ]
+                },
+            }
+        )
+        self.assertEqual(assistant_text(hidden), "Looks fine.\nVERDICT approve")
+        self.assertEqual(parse_verdict(hidden), ("approve", "Looks fine."))
+
+        def assistant_event(content: list[dict]) -> str:
+            return json.dumps({"type": "assistant", "message": {"content": content}})
+
+        across_events = "\n".join(
+            (
+                assistant_event([{"type": "text", "text": "Looks fine."}]),
+                assistant_event(
+                    [
+                        {"type": "tool_use", "id": "tool-1", "name": "read"},
+                        {"type": "text", "text": ""},
+                    ]
+                ),
+                assistant_event([{"type": "text", "text": "VERDICT approve"}]),
+            )
+        )
+        self.assertEqual(assistant_text(across_events), "Looks fine.\nVERDICT approve")
+        self.assertEqual(parse_verdict(across_events), ("approve", "Looks fine."))
+
+        feedback = "\n".join(
+            (
+                assistant_event([{"type": "text", "text": "Restore the missing error branch."}]),
+                assistant_event([{"type": "text", "text": "VERDICT revise"}]),
+            )
+        )
+        self.assertEqual(parse_verdict(feedback), ("revise", "Restore the missing error branch."))
+
+        crowded = "\n".join(
+            (
+                assistant_event([{"type": "text", "text": "x" * 1100}]),
+                assistant_event(
+                    [{"type": "text", "text": "Change the error branch.\nVERDICT revise"}]
+                ),
+            )
+        )
+        verdict, notes = parse_verdict(crowded)
+        self.assertEqual(verdict, "revise")
+        self.assertTrue(notes.startswith("Change the error branch."))
+
+        stale = "\n".join(
+            (
+                assistant_event([{"type": "text", "text": "VERDICT approve"}]),
+                assistant_event([{"type": "text", "text": "Need another pass."}]),
+            )
+        )
+        self.assertEqual(parse_verdict(stale)[0], "revise")
+
+        changing = assistant_event(
+            [
+                {
+                    "type": "text",
+                    "text": "Fix X.\nVERDICT approve\nActually no.\nVERDICT revise",
+                }
+            ]
+        )
+        verdict, notes = parse_verdict(changing)
+        self.assertEqual(verdict, "revise")
+        self.assertEqual(notes, "Fix X.\nActually no.")
+        self.assertNotIn("VERDICT", notes)
+
+        content_before_result = "\n".join(
+            (
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {"content": [{"type": "text", "text": "VERDICT approve"}]},
+                    }
+                ),
+                json.dumps({"type": "result", "result": "session finished without a verdict line"}),
+            )
+        )
+        self.assertEqual(assistant_text(content_before_result), "VERDICT approve")
+        self.assertEqual(parse_verdict(content_before_result)[0], "approve")
 
     def test_fixture_run_reviews_end_to_end(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -405,14 +564,20 @@ class HarnessTests(unittest.TestCase):
             bindir.mkdir()
             home.mkdir()
             (bindir / "claude").write_text("", encoding="utf-8")
-            body = json.dumps({"authMethod": "claude.ai", "loggedIn": True, "token": SECRET})
+            header, body = _load_fixture("claude-auth-status-redaction.txt")
+            self.assertIn(SECRET, body)
 
             def run(argv, timeout):
                 del timeout
                 if argv[1:] == ["--version"]:
                     return _completed(argv, 0, stdout=f"claude 2.1.0 {SECRET}\n")
                 if argv[1:] == ["auth", "status"]:
-                    return _completed(argv, 1, stdout=body + "\n", stderr=f"refresh notice {SECRET}\n")
+                    return _completed(
+                        argv,
+                        int(header["exit-code"]),
+                        stdout=body,
+                        stderr=f"refresh notice {SECRET}\n",
+                    )
                 raise AssertionError(argv)
 
             report = diagnose(
@@ -522,7 +687,9 @@ class HarnessTests(unittest.TestCase):
             enabled = {item["name"] for item in written["providers"] if item["enabled"]}
             self.assertEqual(enabled, {"fixture", "fixture-b"})
             self.assertEqual(written["budgets"]["max_input_tokens"], DEFAULT_MAX_INPUT_TOKENS)
-            self.assertEqual(json.loads(stdout.getvalue())["path"], str(target))
+            emitted = json.loads(stdout.getvalue())
+            self.assertEqual(set(emitted["enabled"]), {"fixture", "fixture-b"})
+            self.assertEqual(Path(emitted["path"]), target)
 
     def test_windows_shim_resolves_and_posix_does_not(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -536,6 +703,241 @@ class HarnessTests(unittest.TestCase):
             posix = resolve_executable("claude", path=str(root), platform="linux")
             self.assertIsNotNone(posix)
             self.assertEqual(posix.name, "claude")
+
+    @unittest.skipUnless(sys.platform == "win32", "runs on the ci:full Windows job")
+    def test_doctor_windows_path_shim_does_not_start_a_provider_cli(self) -> None:
+        """Resolve a Windows shim through doctor. The stub probe never execs it."""
+
+        raw = (FIXTURE_DIR / "claude-auth-status-exit-1.txt").read_text(encoding="utf-8")
+        header, _body = _load_fixture("claude-auth-status-exit-1.txt")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home"
+            home.mkdir()
+            shim = root / "claude.cmd"
+            shim.write_bytes(b"@echo off\r\nexit /b 1\r\n")
+
+            def run(argv, timeout):
+                del timeout
+                self.assertEqual(Path(argv[0]).name.casefold(), "claude.cmd")
+                if argv[1:] == ["--version"]:
+                    return _completed(argv, 0, stdout="claude 2.1.300\n")
+                if argv[1:] == ["auth", "status"]:
+                    return _completed(argv, int(header["exit-code"]), stdout=raw)
+                raise AssertionError(argv)
+
+            real_run = subprocess.run
+
+            def guarded_run(argv, *args, **kwargs):
+                text = " ".join(str(part) for part in argv)
+                if any(name in text.casefold() for name in ("claude", "codex", "grok")):
+                    raise AssertionError(text)
+                return real_run(argv, *args, **kwargs)
+
+            with patch("subprocess.run", guarded_run):
+                report = diagnose(
+                    starter_config({"claude"}),
+                    environ={},
+                    home=home,
+                    path=str(root),
+                    run=run,
+                    git_run=lambda argv, timeout: _completed(argv, 0, stdout="git version 2.45.0\n"),
+                )
+            row = {item["name"]: item for item in report["providers"]}["claude"]
+            self.assertTrue(row["installed"])
+            self.assertTrue(str(row["resolved"]).casefold().endswith("claude.cmd"))
+            self.assertEqual(row["signed_in"], "signed-in")
+            self.assertEqual(row["auth_method"], "claude.ai")
+            self.assertEqual(shim.read_bytes(), b"@echo off\r\nexit /b 1\r\n")
+
+    def test_checked_in_stream_fixtures_match_the_parsers(self) -> None:
+        from scripts.v3.harness.streams import assistant_text, claude_last_message
+
+        names = sorted(path.name for path in FIXTURE_DIR.glob("*.txt"))
+        self.assertEqual(
+            names,
+            [
+                "claude-auth-status-exit-1.txt",
+                "claude-auth-status-redaction.txt",
+                "claude-auth-status.txt",
+                "claude-stream-json.txt",
+                "codex-cumulative.txt",
+                "codex-exec-jsonl.txt",
+                "grok-review.txt",
+                "grok-streaming-json.txt",
+            ],
+        )
+        for name in names:
+            header, body = _load_fixture(name)
+            self.assertIn(header["provider"], _PROVIDERS)
+            self.assertIn(header["evidence"], _EVIDENCE)
+            self.assertTrue(header["cli-version"])
+            self.assertTrue(body.strip())
+            if header["evidence"] == "synthetic":
+                self.assertIn("synthetic", header["note"].casefold())
+
+        grok_review = (FIXTURE_DIR / "grok-review.txt").read_text(encoding="utf-8")
+        verdict, notes = parse_verdict(grok_review)
+        self.assertEqual(verdict, "approve")
+        self.assertIn("matches the task", notes)
+        self.assertEqual(parse_usage(grok_review)["input_tokens"], 12)
+
+        grok_doc = (FIXTURE_DIR / "grok-streaming-json.txt").read_text(encoding="utf-8")
+        self.assertEqual(parse_verdict(grok_doc)[0], "revise")
+        self.assertEqual(assistant_text(grok_doc), "Here's a summary")
+        documented = parse_usage(grok_doc)
+        self.assertEqual(documented["input_tokens"], 812)
+        self.assertEqual(documented["output_tokens"], 45)
+
+        codex_doc = (FIXTURE_DIR / "codex-exec-jsonl.txt").read_text(encoding="utf-8")
+        published = parse_usage(codex_doc)
+        self.assertEqual(published["input_tokens"], 24763)
+        self.assertEqual(published["output_tokens"], 122)
+        self.assertEqual(
+            assistant_text(codex_doc),
+            "Repo contains docs, sdk, and examples directories.",
+        )
+        cumulative = parse_usage((FIXTURE_DIR / "codex-cumulative.txt").read_text(encoding="utf-8"))
+        self.assertEqual(cumulative["input_tokens"], 6_900_000)
+        self.assertEqual(cumulative["output_tokens"], 4000)
+
+        claude_stream = (FIXTURE_DIR / "claude-stream-json.txt").read_text(encoding="utf-8")
+        claude_events = [
+            json.loads(line) for line in claude_stream.splitlines() if line.startswith("{")
+        ]
+        claude_content = claude_events[0]["message"]["content"][0]["text"]
+        claude_result = claude_events[1]["result"]
+        self.assertNotEqual(claude_content.strip(), claude_result.strip())
+        self.assertNotIn("VERDICT", claude_result)
+        self.assertEqual(assistant_text(claude_stream), claude_content)
+        self.assertEqual(parse_verdict(claude_stream)[0], "approve")
+        two_messages = "\n".join(
+            json.dumps(
+                {"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}
+            )
+            for text in ("Review complete.", "VERDICT approve\n")
+        )
+        self.assertEqual(parse_verdict(two_messages)[0], "approve")
+        feedback_first = "\n".join(
+            json.dumps(
+                {"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}
+            )
+            for text in ("Restore the missing error branch.", "VERDICT revise\n")
+        )
+        self.assertEqual(
+            parse_verdict(feedback_first),
+            ("revise", "Restore the missing error branch."),
+        )
+        crowded = "\n".join(
+            json.dumps(
+                {"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}
+            )
+            for text in ("x" * 1100, "Change the error branch.\nVERDICT revise")
+        )
+        verdict, notes = parse_verdict(crowded)
+        self.assertEqual(verdict, "revise")
+        self.assertTrue(notes.startswith("Change the error branch."))
+        flipped = json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Fix X.\nVERDICT approve\nActually no.\nVERDICT revise",
+                        }
+                    ]
+                },
+            }
+        )
+        flipped_verdict, flipped_notes = parse_verdict(flipped)
+        self.assertEqual(flipped_verdict, "revise")
+        self.assertEqual(flipped_notes, "Fix X.\nActually no.")
+        self.assertNotIn("VERDICT", flipped_notes)
+        stale_verdict = "\n".join(
+            json.dumps(
+                {"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}
+            )
+            for text in ("VERDICT approve\n", "Need another pass.\n")
+        )
+        self.assertIn("VERDICT approve", stale_verdict)
+        self.assertEqual(claude_last_message(stale_verdict), "Need another pass.\n")
+        self.assertEqual(parse_verdict(stale_verdict)[0], "revise")
+        trailing_empty = "\n".join(
+            (
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {"content": [{"type": "text", "text": "VERDICT approve\n"}]},
+                    }
+                ),
+                json.dumps(
+                    {"type": "assistant", "message": {"content": [{"type": "text", "text": ""}]}},
+                ),
+            )
+        )
+        self.assertEqual(claude_last_message(trailing_empty), "VERDICT approve\n")
+        self.assertEqual(parse_verdict(trailing_empty)[0], "approve")
+        tool_then_empty = json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "Review complete."},
+                        {"type": "tool_use", "name": "Bash", "input": {}},
+                        {"type": "text", "text": ""},
+                        {"type": "text", "text": "VERDICT approve\n"},
+                    ]
+                },
+            }
+        )
+        self.assertEqual(
+            assistant_text(tool_then_empty),
+            "Review complete.\nVERDICT approve\n",
+        )
+        self.assertEqual(parse_verdict(tool_then_empty)[0], "approve")
+        result_only = json.dumps({"type": "result", "result": "fallback text"})
+        self.assertEqual(assistant_text(result_only), "fallback text")
+        claude_usage = parse_usage(claude_stream)
+        self.assertEqual(claude_usage["input_tokens"], 150)
+        self.assertEqual(claude_usage["output_tokens"], 70)
+        self.assertEqual(claude_usage["cost"], 0.0123)
+
+        self._doctor_reads_auth_fixture("claude-auth-status.txt")
+        self._doctor_reads_auth_fixture("claude-auth-status-exit-1.txt", raw=True)
+        self._doctor_reads_auth_fixture("claude-auth-status-redaction.txt")
+
+    def _doctor_reads_auth_fixture(self, name: str, *, raw: bool = False) -> None:
+        header, body = _load_fixture(name)
+        stdout = (FIXTURE_DIR / name).read_text(encoding="utf-8") if raw else body
+        with tempfile.TemporaryDirectory() as directory:
+            bindir = Path(directory) / "bin"
+            home = Path(directory) / "home"
+            bindir.mkdir()
+            home.mkdir()
+            (bindir / "claude").write_text("", encoding="utf-8")
+
+            def run(argv, timeout):
+                del timeout
+                if argv[1:] == ["--version"]:
+                    return _completed(argv, 0, stdout="claude 2.1.300\n")
+                if argv[1:] == ["auth", "status"]:
+                    return _completed(argv, int(header["exit-code"]), stdout=stdout)
+                raise AssertionError(argv)
+
+            report = diagnose(
+                starter_config({"claude"}),
+                environ={},
+                platform="linux",
+                home=home,
+                path=str(bindir),
+                run=run,
+                git_run=lambda argv, timeout: _completed(argv, 0, stdout="git version 2.45.0\n"),
+            )
+        row = {item["name"]: item for item in report["providers"]}["claude"]
+        self.assertEqual(row["signed_in"], "signed-in")
+        self.assertEqual(row["auth_method"], "claude.ai")
+        self.assertTrue(row["usable"])
 
     def test_capability_route_skips_disabled_providers(self) -> None:
         config = starter_config({"fixture", "claude", "codex", "grok"})
@@ -555,7 +957,7 @@ class HarnessTests(unittest.TestCase):
                 main(["--help"])
         self.assertEqual(caught.exception.code, 0)
         text = stdout.getvalue()
-        for name in ("doctor", "init", "run", "status"):
+        for name in ("doctor", "init", "run", "status", "logs", "land", "clean"):
             self.assertIn(name, text)
 
     def test_doctor_cli_on_the_shipped_config(self) -> None:
@@ -619,9 +1021,12 @@ class HarnessTests(unittest.TestCase):
                 open_adapter=lambda name: Watch("fixture", "hello"),
             )
             cwd = Path(str(seen["cwd"]))
+            expected = (state / record["run_id"] / "workspace").resolve()
             self.assertTrue(seen["allow_live"])
-            self.assertEqual(cwd, (state / record["run_id"] / "workspace").resolve())
+            self.assertEqual(cwd.resolve(), expected)
+            self.assertEqual(cwd, expected)
             self.assertTrue(cwd.is_dir())
+            self.assertEqual(Path(str(record["workspace"])).resolve(), expected)
             self.assertEqual(record["workspace"], str(cwd))
             if os.name == "posix":
                 self.assertEqual(cwd.stat().st_mode & 0o777, 0o700)
@@ -934,3 +1339,348 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(row["auth_method"], "env")
             self.assertTrue(row["usable"])
             self.assertTrue(report["ok"])
+
+    def test_weights_prefer_the_higher_weight_and_reject_a_bad_weight(self) -> None:
+        config = load_config()
+        self.assertEqual(config["routing"]["cooldown_seconds"], 60)
+        self.assertEqual(config["routing"]["weights"]["fixture"], 1)
+        self.assertEqual(config["budgets"]["max_input_tokens"], DEFAULT_MAX_INPUT_TOKENS)
+        self.assertEqual(config["budgets"]["max_output_tokens"], DEFAULT_MAX_OUTPUT_TOKENS)
+        ranked = starter_config({"fixture", "fixture-b", "grok"})
+        ranked["routing"]["weights"]["grok"] = 5
+        self.assertEqual(select_route(ranked)[0], "grok")
+        self.assertEqual(select_route(ranked, "fixture")[0], "fixture")
+        payload = starter_config({"fixture"})
+        payload["routing"]["weights"]["fixture"] = True
+        with self.assertRaises(HarnessError) as caught:
+            validate_config(payload)
+        self.assertIn("weights", str(caught.exception))
+
+    def test_rate_limit_cooldown_persists_and_falls_back(self) -> None:
+        calls: list[str] = []
+
+        class Adapter:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def execute(self, request, *, allow_live=False, timeout_seconds=None, runner=None):
+                del allow_live, timeout_seconds, runner
+                calls.append(f"{self.name}:{request.kind}")
+                if self.name == "fixture" and request.kind == "execute":
+                    raise ProviderRateLimited(
+                        "fixture was rate-limited",
+                        until="2026-10-14T08:35:00Z",
+                    )
+                if request.kind == "review":
+                    return ProviderResult(self.name, ("stub",), "VERDICT approve\nok", False)
+                return ProviderResult(self.name, ("stub",), "hello from " + self.name, False)
+
+        config = starter_config({"fixture", "fixture-b", "grok"})
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            record = run_task(
+                "Say hello",
+                config=config,
+                state_dir=state,
+                open_adapter=lambda name: Adapter(name),
+                now=lambda: NOW,
+            )
+            self.assertEqual(record["status"], "completed")
+            self.assertEqual(record["provider"], "fixture-b")
+            self.assertEqual(record["reviews"][0]["provider"], "grok")
+            self.assertEqual(record["reviews"][0]["verdict"], "approve")
+            self.assertEqual(record["cooldowns"]["fixture"]["reason"], "rate-limited")
+            self.assertEqual(record["cooldowns"]["fixture"]["until"], "2026-10-14T08:35:00Z")
+            body = (state / "cooldowns.json").read_text(encoding="utf-8")
+            self.assertNotIn("SECRET", body)
+            self.assertEqual(json.loads(body)["providers"]["fixture"]["until"], "2026-10-14T08:35:00Z")
+            self.assertEqual(calls, ["fixture:execute", "fixture-b:execute", "grok:review"])
+            calls.clear()
+            again = run_task(
+                "Say hello",
+                config=config,
+                state_dir=state,
+                open_adapter=lambda name: Adapter(name),
+                now=lambda: NOW,
+            )
+            self.assertEqual(again["provider"], "fixture-b")
+            self.assertNotIn("fixture:execute", calls)
+            self.assertIn("fixture-b:execute", calls)
+            reset = 1_791_966_900  # 2026-10-14T08:35:00Z
+            store = CooldownStore(state / "cooldowns.json")
+            self.assertIn("fixture", store.active(reset - 1))
+            self.assertNotIn("fixture", store.active(reset + 1))
+            self.assertNotIn("fixture", store.active(NOW + 10**9))
+
+    def test_quota_and_auth_fall_back_without_a_live_provider(self) -> None:
+        calls: list[str] = []
+
+        class Adapter:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def execute(self, request, *, allow_live=False, timeout_seconds=None, runner=None):
+                del request, allow_live, timeout_seconds, runner
+                calls.append(self.name)
+                if self.name == "fixture":
+                    raise ProviderQuotaExhausted("fixture quota is exhausted")
+                if self.name == "fixture-b":
+                    raise ProviderAuthExpired("fixture-b authentication expired", retry_after=30)
+                return ProviderResult(self.name, ("stub",), "done", False)
+
+        config = starter_config({"fixture", "fixture-b", "grok"})
+        config["review"]["accept_unreviewed"] = True
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            with self.assertRaises(HarnessError) as caught:
+                run_task(
+                    "Say hello",
+                    config=config,
+                    state_dir=state,
+                    open_adapter=lambda name: Adapter(name),
+                    now=lambda: NOW,
+                )
+            record = load_run(state, list_runs(state)[0])
+        self.assertIn("no capable provider", str(caught.exception))
+        self.assertEqual(calls, ["fixture", "fixture-b"])
+        self.assertNotIn("grok", calls)
+        self.assertEqual(record["status"], "failed")
+        self.assertFalse(record["accepted"])
+        self.assertEqual(record["cooldowns"]["fixture"]["reason"], "quota-exhausted")
+        self.assertEqual(record["cooldowns"]["fixture"]["until"], format_until(NOW + 60))
+        self.assertEqual(record["cooldowns"]["fixture-b"]["reason"], "auth-expired")
+        self.assertEqual(record["cooldowns"]["fixture-b"]["until"], format_until(NOW + 30))
+
+    def test_offline_failure_with_allow_live_does_not_pick_a_live_provider(self) -> None:
+        calls: list[str] = []
+
+        class Adapter:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def execute(self, request, *, allow_live=False, timeout_seconds=None, runner=None):
+                del timeout_seconds, runner
+                calls.append(f"{self.name}:{request.kind}")
+                if not allow_live:
+                    raise AssertionError("allow_live was not set")
+                if self.name in {"claude", "codex", "grok"}:
+                    raise AssertionError(f"{self.name} was called")
+                if self.name == "fixture":
+                    raise ProviderRateLimited("fixture was rate-limited")
+                return ProviderResult(self.name, ("stub",), "hello from fixture-b", False)
+
+        config = starter_config({"fixture", "fixture-b", "claude", "codex", "grok"})
+        config["review"]["max_rounds"] = 0
+        config["review"]["accept_unreviewed"] = True
+        with tempfile.TemporaryDirectory() as directory:
+            record = run_task(
+                "Say hello",
+                config=config,
+                state_dir=Path(directory),
+                allow_live=True,
+                open_adapter=lambda name: Adapter(name),
+                now=lambda: NOW,
+            )
+        self.assertEqual(calls, ["fixture:execute", "fixture-b:execute"])
+        self.assertEqual(record["provider"], "fixture-b")
+        self.assertEqual(record["status"], "completed")
+        self.assertTrue(record["accepted"])
+
+    def test_pinned_fixture_rate_limit_falls_back_to_fixture_b(self) -> None:
+        calls: list[str] = []
+
+        class Adapter:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def execute(self, request, *, allow_live=False, timeout_seconds=None, runner=None):
+                del timeout_seconds, runner
+                calls.append(f"{self.name}:{request.kind}")
+                if not allow_live:
+                    raise AssertionError("allow_live was not set")
+                if self.name in {"claude", "codex", "grok"}:
+                    raise AssertionError(f"{self.name} was called")
+                if self.name == "fixture":
+                    raise ProviderRateLimited("fixture was rate-limited")
+                return ProviderResult(self.name, ("stub",), "hello from fixture-b", False)
+
+        config = starter_config({"fixture", "fixture-b", "claude", "codex", "grok"})
+        config["review"]["max_rounds"] = 0
+        config["review"]["accept_unreviewed"] = True
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            with redirect_stderr(stderr):
+                record = run_task(
+                    "Say hello",
+                    config=config,
+                    state_dir=Path(directory),
+                    provider="fixture",
+                    allow_live=True,
+                    open_adapter=lambda name: Adapter(name),
+                    now=lambda: NOW,
+                )
+        self.assertEqual(calls, ["fixture:execute", "fixture-b:execute"])
+        self.assertEqual(record["provider"], "fixture-b")
+        self.assertEqual(record["status"], "completed")
+        failed = [item for item in record["attempts"] if item["provider"] == "fixture"]
+        self.assertEqual(len(failed), 1)
+        self.assertFalse(failed[0]["ok"])
+        self.assertEqual(failed[0]["error"], "ProviderRateLimited")
+        self.assertEqual(failed[0]["reason"], "rate-limited")
+        notice = stderr.getvalue()
+        self.assertIn("notice: requested provider fixture was replaced by fixture-b", notice)
+        for name in ("claude", "codex", "grok"):
+            self.assertFalse(any(call.startswith(f"{name}:") for call in calls))
+            self.assertNotIn(name, notice)
+
+    def test_live_failure_falls_back_to_another_live_provider(self) -> None:
+        calls: list[str] = []
+
+        class Adapter:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def execute(self, request, *, allow_live=False, timeout_seconds=None, runner=None):
+                del timeout_seconds, runner
+                calls.append(f"{self.name}:{request.kind}")
+                if self.name in {"fixture", "fixture-b"}:
+                    raise AssertionError(f"{self.name} was called")
+                if self.name == "grok" and request.kind == "execute":
+                    raise ProviderRateLimited("grok was rate-limited")
+                return ProviderResult(self.name, ("stub",), "hello from claude", True)
+
+        config = starter_config({"fixture", "fixture-b", "claude", "grok"})
+        config["routing"]["weights"]["grok"] = 3
+        config["routing"]["weights"]["claude"] = 2
+        config["review"]["max_rounds"] = 0
+        config["review"]["accept_unreviewed"] = True
+        with tempfile.TemporaryDirectory() as directory:
+            record = run_task(
+                "Say hello",
+                config=config,
+                state_dir=Path(directory),
+                allow_live=True,
+                open_adapter=lambda name: Adapter(name),
+                now=lambda: NOW,
+            )
+        self.assertEqual(calls, ["grok:execute", "claude:execute"])
+        self.assertEqual(record["provider"], "claude")
+        self.assertEqual(record["status"], "completed")
+
+    def test_large_diff_is_clipped_before_the_adapter(self) -> None:
+        token = "LARGE-DIFF-TOKEN"
+        huge = token * 4000
+        seen: list[str] = []
+
+        class Capture:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def execute(self, request, *, allow_live=False, timeout_seconds=None, runner=None):
+                del allow_live, timeout_seconds, runner
+                seen.append(request.task)
+                if request.kind == "review":
+                    return ProviderResult(self.name, ("stub",), "VERDICT approve\nok", False)
+                return ProviderResult(self.name, ("stub",), "done", False)
+
+        with tempfile.TemporaryDirectory() as directory:
+            record = run_task(
+                "Say hello",
+                config=starter_config({"fixture", "fixture-b"}),
+                state_dir=Path(directory),
+                diff=huge,
+                dependencies=[{"id": "build", "text": "built", "diff": huge}],
+                open_adapter=lambda name: Capture(name),
+            )
+        self.assertEqual(record["status"], "completed")
+        self.assertGreaterEqual(len(seen), 2)
+        self.assertTrue(any(prompt.startswith("Say hello") for prompt in seen))
+        self.assertTrue(any(prompt.startswith("Review this completed task.") for prompt in seen))
+        for prompt in seen:
+            self.assertNotIn(huge, prompt)
+            self.assertLess(prompt.count(token), huge.count(token))
+            self.assertIn("[truncated]", prompt)
+
+    def test_pre_call_budget_refuses_before_the_adapter(self) -> None:
+        calls: list[str] = []
+
+        class Worker:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def execute(self, request, *, allow_live=False, timeout_seconds=None, runner=None):
+                del request, allow_live, timeout_seconds, runner
+                calls.append(self.name)
+                return ProviderResult(
+                    self.name,
+                    ("stub",),
+                    '{"usage":{"input_tokens":100,"output_tokens":1}}\nhello',
+                    False,
+                )
+
+        low = starter_config({"fixture", "fixture-b"})
+        low["budgets"]["max_input_tokens"] = 100
+        with tempfile.TemporaryDirectory() as directory:
+            stopped = run_task(
+                "Say hello",
+                config=low,
+                state_dir=Path(directory),
+                open_adapter=lambda name: Worker(name),
+            )
+        self.assertEqual(calls, ["fixture"])
+        self.assertEqual(stopped["status"], "budget-exceeded")
+        self.assertEqual(stopped["reviews"], [])
+        self.assertEqual(stopped["usage"]["input_tokens"], 100)
+        self.assertEqual(stopped["attempts"][-1]["reason"], "budget")
+        self.assertEqual(stopped["attempts"][-1]["provider"], "fixture-b")
+
+    def test_stubbed_rate_limit_is_classified_without_a_live_process(self) -> None:
+        def limited(argv, stdin_text, timeout, cwd):
+            del stdin_text, timeout
+            return _completed(argv, 429, stderr="SECRET too many requests retry-after: 15")
+
+        def exhausted(argv, stdin_text, timeout, cwd):
+            del stdin_text, timeout
+            return _completed(argv, 402, stderr="SECRET quota exceeded")
+
+        def expired(argv, stdin_text, timeout, cwd):
+            del stdin_text, timeout, cwd
+            stdout = '{"type":"result","is_error":true,"result":"Not logged in SECRET"}'
+            return _completed(argv, 1, stdout=stdout, stderr="SECRET")
+
+        with tempfile.TemporaryDirectory() as directory:
+            request = ProviderRequest(
+                task="Say hello",
+                packet_id="run-aabbccddeeff",
+                cwd=directory,
+            )
+            with self.assertRaises(ProviderRateLimited) as limited_error:
+                CodexExecProvider().execute(request, allow_live=True, runner=limited)
+            self.assertEqual(limited_error.exception.reason, "rate-limited")
+            self.assertEqual(limited_error.exception.retry_after, 15)
+            self.assertNotIn("SECRET", str(limited_error.exception))
+            with self.assertRaises(ProviderQuotaExhausted) as quota_error:
+                CodexExecProvider().execute(request, allow_live=True, runner=exhausted)
+            self.assertEqual(quota_error.exception.reason, "quota-exhausted")
+            self.assertNotIn("SECRET", str(quota_error.exception))
+            with self.assertRaises(ProviderAuthExpired) as auth_error:
+                ClaudeHeadlessProvider().execute(request, allow_live=True, runner=expired)
+            self.assertEqual(auth_error.exception.reason, "auth-expired")
+            self.assertNotIn("SECRET", str(auth_error.exception))
+            self.assertNotIn("logged in", str(auth_error.exception))
+
+        bare_auth = classify_failure("codex", 401, "")
+        self.assertIsInstance(bare_auth, HarnessError)
+        self.assertNotIsInstance(bare_auth, ProviderAuthExpired)
+        self.assertIn("exited 401", str(bare_auth))
+        bare_quota = classify_failure("codex", 402, "")
+        self.assertNotIsInstance(bare_quota, ProviderQuotaExhausted)
+        self.assertIn("exited 402", str(bare_quota))
+        self.assertIsInstance(
+            classify_failure("codex", 1, "unexpected status 401 Unauthorized"),
+            ProviderAuthExpired,
+        )
+        self.assertIsInstance(
+            classify_failure("codex", 1, "HTTP 402 quota exceeded"),
+            ProviderQuotaExhausted,
+        )

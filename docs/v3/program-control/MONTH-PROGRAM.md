@@ -224,6 +224,12 @@ never a substitute for those actions.
   Candidate routing fields and proposal `linear_issue` are required; pending or
   historical receipts may omit an undecided `linear_issue`, but present values must
   be valid. Approved receipts always require the matching issue.
+- Capability `contract_ids`, `unknown_ids` and `evidence_ids` are required arrays
+  of nonempty string IDs. The same array shape applies to recorded consumed-contract,
+  verification/recovery/rollback evidence, and checkpoint contract/evidence references.
+  Objects keyed by IDs, strings and null are not arrays; their implicit iteration
+  never substitutes for the declared shape. Empty arrays remain subject to each
+  maturity or completion gate's actual evidence/contract requirements.
 - The implementation issue identifies an existing work row with the program's
   `parent_issue`. Hard dependencies, occupancy and checkpoint work inputs refer to
   local work rows; active proofs and grants must match their current work targets.

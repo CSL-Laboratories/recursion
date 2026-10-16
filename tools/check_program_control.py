@@ -106,8 +106,8 @@ def _ids(rows: list[dict[str, Any]], name: str, errors: list[str]) -> dict[str, 
     return result
 
 
-def issue_reference_errors(data: dict[str, Any]) -> list[str]:
-    """Check issue syntax everywhere, including retained historical bindings.
+def reference_errors(data: dict[str, Any]) -> list[str]:
+    """Check reference shapes and issue syntax, including historical bindings.
 
     External routing/parent references need not be work rows in this ledger.
     Current work cross-links and approval freshness are checked by their consumers.
@@ -121,6 +121,8 @@ def issue_reference_errors(data: dict[str, Any]) -> list[str]:
     scalar_fields = {"parent_issue", "implementation_issue", "decision_issue",
                      "linear_issue", "resolution_issue", "issue", "work_item_id"}
     list_fields = {"hard_dependencies", "work_item_ids", "active_contract_consumers", "active_reviews"}
+    resource_lists = {"contract_ids", "unknown_ids", "evidence_ids", "consumes_contracts",
+                      "verification_evidence_ids", "recovery_evidence_ids", "rollback_evidence_ids", "requires"}
 
     def walk(value: Any, path: str) -> None:
         if isinstance(value, list):
@@ -141,6 +143,10 @@ def issue_reference_errors(data: dict[str, Any]) -> list[str]:
                     else:
                         for index, item in enumerate(child):
                             issue(item, f"{child_path}[{index}]")
+                elif key in resource_lists:
+                    if (not isinstance(child, list)
+                            or not all(isinstance(item, str) and item.strip() for item in child)):
+                        errors.append(f"{child_path} must be a list of nonempty reference IDs")
                 elif key in {"work_bindings", "unknown_bindings"}:
                     if not isinstance(child, list) or not all(isinstance(row, dict) for row in child):
                         errors.append(f"{child_path} must be a list of binding objects")
@@ -162,6 +168,10 @@ def issue_reference_errors(data: dict[str, Any]) -> list[str]:
         for index, row in enumerate(rows):
             if collection == "work_items":
                 issue(row.get("id"), f"work item {row.get('id')}")
+            if collection == "capabilities":
+                for field in ("contract_ids", "unknown_ids", "evidence_ids"):
+                    if field not in row:
+                        errors.append(f"{collection}[{index}].{field} must be a list of nonempty reference IDs")
             for field in fields:
                 if field not in row or field == "parent":
                     issue(row.get(field), f"{collection}[{index}].{field}")
@@ -187,7 +197,7 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
     if missing:
         errors.append(f"missing top-level fields: {', '.join(missing)}")
         return errors
-    errors.extend(issue_reference_errors(data))
+    errors.extend(reference_errors(data))
     if errors:
         return errors
     if data["schema_version"] != 1:

@@ -956,6 +956,48 @@ class ProgramControlTests(unittest.TestCase):
                 target[path[-1]] = ["CSL-999"]
                 self.assert_rejected(fragment)
 
+    def test_capability_references_reject_object_keys_even_before_approval(self):
+        for field in ("evidence_ids", "contract_ids", "unknown_ids"):
+            with self.subTest(field=field):
+                self.setUp()
+                cap = self.data["capabilities"][0]
+                cap[field] = dict.fromkeys(cap[field])
+                self.promote()
+                self.assert_rejected(f"{field} must be a list")
+
+    def test_capability_reference_arrays_are_required_and_typed(self):
+        for field in ("evidence_ids", "contract_ids", "unknown_ids"):
+            for value in (None, {}, "not-an-array", [None], [12], [[]], [{}], [""]):
+                with self.subTest(field=field, value=value):
+                    self.setUp()
+                    self.data["capabilities"][0][field] = value
+                    self.assert_rejected(f"{field} must be a list")
+            self.setUp()
+            del self.data["capabilities"][0][field]
+            self.assert_rejected(f"{field} must be a list")
+
+    def test_related_reference_arrays_reject_object_and_scalar_iterables(self):
+        paths = [("work_items", 0, "consumes_contracts"), ("work_items", 0, "verification_evidence_ids"),
+                 ("integration_checkpoints", 0, "requires"), ("integration_checkpoints", 0, "evidence_ids"),
+                 ("evidence", 0, "recovery_evidence_ids"), ("evidence", 0, "rollback_evidence_ids")]
+        for path in paths:
+            for value in ({"existing-id": None}, "existing-id", None, [[]]):
+                with self.subTest(path=path, value=value):
+                    self.setUp()
+                    target = self.data
+                    for key in path[:-1]:
+                        target = target[key]
+                    target[path[-1]] = value
+                    self.assert_rejected(f"{path[-1]} must be a list")
+
+    def test_valid_reference_arrays_preserve_candidate_and_promoted_controls(self):
+        self.assertEqual(self.errors(), [])
+        self.data["capabilities"][0]["evidence_ids"] = []
+        self.assertEqual(self.errors(), [])
+        self.setUp()
+        self.promote("release_qualified")
+        self.assertEqual(self.errors(), [])
+
 
 if __name__ == "__main__":
     unittest.main()

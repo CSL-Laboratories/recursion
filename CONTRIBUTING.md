@@ -53,9 +53,10 @@ Devin reviews. Claude (`.github/workflows/claude.yml`) fixes Devin findings on
 same-repo member PRs. Unresolved Devin threads that Claude cannot settle are
 picked up by
 [`.github/workflows/stuck-thread-watch.yml`](.github/workflows/stuck-thread-watch.yml),
-which asks Codex to mediate (`@codex review`) and files a Linear Triage issue
-labelled `needs-decision`. Humans decide. The watcher never resolves threads,
-pushes, or merges.
+which asks Codex to mediate (`@codex review`) and files one Linear roll-up per
+PR labelled `needs-decision` (checklist of threads, assigned to the PR author,
+linked to the PR's CSL issue). It does not file a new issue per thread.
+Humans decide. The watcher never resolves threads, pushes, or merges.
 
 ## Run a gate
 

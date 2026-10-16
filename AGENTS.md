@@ -180,9 +180,11 @@ stays stuck — Claude said it needs a human / could not fix, or the thread is
 still open more than six hours (configurable) after Claude's last reply —
 [`.github/workflows/stuck-thread-watch.yml`](.github/workflows/stuck-thread-watch.yml)
 posts one `@codex review` comment (via `CODEX_TRIGGER_PAT`; skipped with a
-notice if that secret is missing) and files a Linear Triage issue labelled
-`needs-decision`. Humans decide. Caps: one mediation per thread, three per PR
-per UTC day. The watcher never resolves threads, pushes, or merges.
+notice if that secret is missing) and files one Linear roll-up per PR labelled
+`needs-decision` (checklist of threads, assigned to the PR author, linked to
+the PR's CSL issue). It does not file a new issue per thread, and it does not
+re-open a canceled roll-up. Humans decide. Caps: one mediation per thread,
+three per PR per UTC day. The watcher never resolves threads, pushes, or merges.
 
 ## Code Review Rules
 

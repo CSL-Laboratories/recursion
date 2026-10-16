@@ -75,6 +75,10 @@ def pull(
     issue_comments: list[mod.Comment] | None = None,
     draft: bool = False,
     state: str = "OPEN",
+    author: str = "",
+    title: str = "",
+    head_ref: str = "",
+    review_decision: str = "",
 ) -> mod.Pull:
     return mod.Pull(
         number=number,
@@ -83,6 +87,10 @@ def pull(
         state=state,
         threads=tuple(threads or ()),
         issue_comments=tuple(issue_comments or ()),
+        author=author,
+        title=title,
+        head_ref=head_ref,
+        review_decision=review_decision,
     )
 
 
@@ -258,11 +266,14 @@ class CapAndBodyTests(unittest.TestCase):
         self.assertTrue(quoted.startswith("> "))
         self.assertLessEqual(len(quoted), 24)
 
-    def test_linear_title_includes_pr_and_path(self) -> None:
-        t = thread(path="AGENTS.md", line=104)
-        title = mod.linear_title(pull(), t)
-        self.assertIn("recursion#186", title)
-        self.assertIn("AGENTS.md:104", title)
+    def test_rollup_title_is_one_issue_per_pr(self) -> None:
+        self.assertEqual(
+            mod.rollup_title("CSL-Laboratories/recursion", 186),
+            "Stuck PR threads: recursion#186",
+        )
+        line = mod.checklist_line(thread(path="AGENTS.md", line=104, tid="PRRT_t"), cfg(), "stuck-human")
+        self.assertIn("AGENTS.md:104", line)
+        self.assertIn("<!-- codex-mediation:PRRT_t -->", line)
 
 
 class FakeGitHub:
@@ -270,6 +281,7 @@ class FakeGitHub:
         self.pulls = {p.number: p for p in pulls}
         self.comments: list[tuple[int, str]] = []
         self.labels: list[tuple[int, list[str]]] = []
+        self.user_ids: dict[str, str] = {}
 
     def list_open_pr_numbers(self) -> list[int]:
         return [
@@ -290,18 +302,53 @@ class FakeGitHub:
     def pat_login(self) -> str:
         return "pat-user"
 
+    def user_id(self, login: str) -> str:
+        return self.user_ids.get(login, "")
+
 
 class FakeLinear:
-    def __init__(self, existing: dict[str, str] | None = None) -> None:
-        self.existing = existing or {}
-        self.created: list[tuple[str, str]] = []
+    def __init__(self, rollups: list[mod.LinearIssue] | None = None) -> None:
+        self.rollups = list(rollups or [])
+        self.created: list[tuple[str, str, str]] = []
+        self.updated: list[tuple[str, str | None, str]] = []
+        self.relations: list[tuple[str, str]] = []
+        self.github_users = {"99": "linear-user"}
 
-    def find_by_marker(self, marker: str) -> str:
-        return self.existing.get(marker, "")
+    def find_rollups(self, repo: str, number: int) -> list[mod.LinearIssue]:
+        return [
+            issue
+            for issue in self.rollups
+            if mod.is_rollup_for_pr(issue, repo, number)
+        ]
 
-    def create_triage_issue(self, *, title: str, description: str) -> str:
-        self.created.append((title, description))
-        return f"https://linear.app/csl-laboratories/issue/CSL-TEST/{title[:20]}"
+    def assignee_for_github_user(self, github_user_id: str) -> str:
+        return self.github_users.get(str(github_user_id), "")
+
+    def create_rollup(self, *, title: str, description: str, assignee_id: str = "") -> mod.LinearIssue:
+        self.created.append((title, description, assignee_id))
+        issue = mod.LinearIssue(
+            id=f"created-{len(self.created)}",
+            identifier="CSL-NEW",
+            url=f"https://linear.app/csl-laboratories/issue/CSL-NEW/{len(self.created)}",
+            title=title,
+            description=description,
+            state_type="triage",
+            assignee_id=assignee_id,
+        )
+        self.rollups.append(issue)
+        return issue
+
+    def update_rollup(
+        self,
+        issue_id: str,
+        *,
+        description: str | None = None,
+        assignee_id: str = "",
+    ) -> None:
+        self.updated.append((issue_id, description, assignee_id))
+
+    def link_related(self, issue_id: str, other_key: str) -> None:
+        self.relations.append((issue_id, other_key))
 
 
 class ScanTests(unittest.TestCase):
@@ -316,7 +363,9 @@ class ScanTests(unittest.TestCase):
         self.assertIn("@codex review", gh.comments[0][1])
         self.assertIn("<!-- codex-mediation:PRRT_x -->", gh.comments[0][1])
         self.assertEqual(len(lin.created), 1)
+        self.assertEqual(lin.created[0][0], "Stuck PR threads: recursion#186")
         self.assertIn("<!-- codex-mediation:PRRT_x -->", lin.created[0][1])
+        self.assertIn("<!-- stuck-pr-threads:CSL-Laboratories/recursion#186 -->", lin.created[0][1])
         self.assertEqual(gh.labels, [])
 
     def test_missing_pat_skips_without_writes(self) -> None:
@@ -339,6 +388,9 @@ class ScanTests(unittest.TestCase):
         self.assertEqual(counters.mediated, 3)
         self.assertEqual(counters.skipped_cap, 2)
         self.assertEqual(len(gh.comments), 3)
+        self.assertEqual(len(lin.created), 1)
+        for index in range(5):
+            self.assertIn(f"<!-- codex-mediation:PRRT_{index} -->", lin.created[0][1])
 
     def test_existing_today_markers_count_toward_cap(self) -> None:
         existing = [
@@ -354,7 +406,7 @@ class ScanTests(unittest.TestCase):
 
     def test_linear_error_still_posts_github_comment(self) -> None:
         class BoomLinear(FakeLinear):
-            def find_by_marker(self, marker: str) -> str:
+            def find_rollups(self, repo: str, number: int) -> list[mod.LinearIssue]:
                 raise RuntimeError("linear down")
 
         t = thread(tid="PRRT_err", comments=stuck_pair())
@@ -418,12 +470,22 @@ class ScanTests(unittest.TestCase):
 
     def test_linear_dedupes_by_marker(self) -> None:
         t = thread(tid="PRRT_z", comments=stuck_pair())
-        gh = FakeGitHub([pull(threads=[t])])
+        gh = FakeGitHub([pull(threads=[t], title="CSL-74: backbone")])
         marker = mod.mediation_marker("PRRT_z")
-        lin = FakeLinear({marker: "https://linear.app/existing"})
+        existing = mod.LinearIssue(
+            id="abc",
+            identifier="CSL-165",
+            url="https://linear.app/existing",
+            title=mod.rollup_title("CSL-Laboratories/recursion", 186),
+            description=marker + "\nhttps://github.com/CSL-Laboratories/recursion/pull/186\n",
+            state_type="started",
+        )
+        lin = FakeLinear([existing])
         counters = mod.scan(cfg(), gh, lin)  # type: ignore[arg-type]
         self.assertEqual(counters.linear, 0)
         self.assertEqual(lin.created, [])
+        self.assertEqual(lin.updated, [])
+        self.assertEqual(lin.relations, [("abc", "CSL-74")])
         self.assertIn("https://linear.app/existing", gh.comments[0][1])
 
     def test_personal_repo_labels_instead_of_linear(self) -> None:
@@ -618,6 +680,271 @@ class WorkflowAndDocsTests(unittest.TestCase):
         self.assertIn("Never resolves threads", source)
         # Guard pattern may mention merge; the live client must not build merge URLs.
         self.assertNotIn("/pulls/", source)
+        self.assertNotIn("Stuck PR thread:", source)
+
+
+class RollupPlanTests(unittest.TestCase):
+    def test_two_stuck_threads_plan_one_create(self) -> None:
+        threads = [
+            (thread(tid="PRRT_a", comments=stuck_pair()), "stuck-human"),
+            (thread(tid="PRRT_b", path="README.md", comments=stuck_pair()), "stuck-timeout"),
+        ]
+        p = pull(title="CSL-74: backbone", author="NotSkittlz", head_ref="csl-74-backbone")
+        plan = mod.plan_rollup(p, threads, [], cfg())
+        self.assertEqual(plan.action, "create")
+        self.assertEqual(plan.csl_key, "CSL-74")
+        self.assertEqual(plan.title, "Stuck PR threads: recursion#186")
+        self.assertIn("<!-- codex-mediation:PRRT_a -->", plan.description)
+        self.assertIn("<!-- codex-mediation:PRRT_b -->", plan.description)
+        self.assertIn("@NotSkittlz", plan.description)
+        self.assertIn("**CSL issue:** CSL-74", plan.description)
+        self.assertEqual(plan.description.count("- [ ]"), 2)
+
+    def test_csl_key_falls_back_to_branch(self) -> None:
+        self.assertEqual(mod.extract_csl_key("no key", "cursor/csl-81-cli"), "CSL-81")
+        self.assertEqual(mod.extract_csl_key("CSL-12: title", "csl-81-other"), "CSL-12")
+        self.assertEqual(mod.extract_csl_key("lowercase csl-9 only", ""), "")
+
+    def test_appends_to_open_rollup_and_dedupes_marker(self) -> None:
+        existing = mod.LinearIssue(
+            id="open-1",
+            identifier="CSL-168",
+            url="https://linear.app/existing",
+            title="Stuck PR threads: recursion#190",
+            description=(
+                "<!-- stuck-pr-threads:recursion#190 -->\n"
+                "- [ ] <!-- codex-mediation:PRRT_old --> [`a.py:1`](https://example/old) — `stuck-human`\n"
+                "*Auto-filed by the watcher*\n"
+            ),
+            state_type="started",
+            assignee_id="already",
+        )
+        fresh = thread(tid="PRRT_new", comments=stuck_pair())
+        duplicate = thread(tid="PRRT_old", comments=stuck_pair())
+        p = pull(number=190, title="CSL-81: contracts")
+        plan = mod.plan_rollup(
+            p,
+            [(duplicate, "stuck-human"), (fresh, "stuck-timeout")],
+            [existing],
+            cfg(),
+        )
+        self.assertEqual(plan.action, "update")
+        self.assertEqual(plan.issue_id, "open-1")
+        self.assertEqual(plan.description.count("<!-- codex-mediation:PRRT_old -->"), 1)
+        self.assertIn("<!-- codex-mediation:PRRT_new -->", plan.description)
+        self.assertIn("*Auto-filed by the watcher*", plan.description)
+        self.assertLess(
+            plan.description.index("<!-- codex-mediation:PRRT_new -->"),
+            plan.description.index("*Auto-filed by the watcher*"),
+        )
+
+    def test_legacy_discussion_url_counts_as_listed(self) -> None:
+        comments = stuck_pair()
+        comments[1] = comment(
+            CLAUDE_BOT,
+            comments[1].body,
+            hours_ago=7,
+            url="https://github.com/CSL-Laboratories/recursion/pull/190#discussion_r4279370435",
+        )
+        legacy = mod.LinearIssue(
+            id="legacy",
+            identifier="CSL-168",
+            url="https://linear.app/legacy",
+            title="Stuck PR threads: recursion#190",
+            description="- [ ] [r4279370435](https://github.com/CSL-Laboratories/recursion/pull/190#discussion_r4279370435): flag\n",
+            state_type="started",
+        )
+        plan = mod.plan_rollup(
+            pull(number=190),
+            [(thread(tid="PRRT_legacy", comments=comments), "stuck-human")],
+            [legacy],
+            cfg(),
+        )
+        self.assertEqual(plan.action, "unchanged")
+
+    def test_canceled_rollup_is_not_reopened(self) -> None:
+        canceled = mod.LinearIssue(
+            id="closed",
+            identifier="CSL-162",
+            url="https://linear.app/closed",
+            title="Stuck PR threads: recursion#193",
+            description="<!-- codex-mediation:PRRT_done -->\n",
+            state_type="canceled",
+        )
+        plan = mod.plan_rollup(
+            pull(number=193, title="CSL-82: land"),
+            [(thread(tid="PRRT_done", comments=stuck_pair()), "stuck-human")],
+            [canceled],
+            cfg(),
+        )
+        self.assertEqual(plan.action, "skip")
+        self.assertEqual(plan.issue_id, "")
+
+    def test_new_thread_after_canceled_rollup_creates_one_rollup(self) -> None:
+        canceled = mod.LinearIssue(
+            id="closed",
+            identifier="CSL-162",
+            url="https://linear.app/closed",
+            title="Stuck PR threads: recursion#193",
+            description="<!-- codex-mediation:PRRT_done -->\n",
+            state_type="canceled",
+        )
+        plan = mod.plan_rollup(
+            pull(number=193),
+            [
+                (thread(tid="PRRT_done", comments=stuck_pair()), "stuck-human"),
+                (thread(tid="PRRT_fresh", comments=stuck_pair()), "stuck-timeout"),
+            ],
+            [canceled],
+            cfg(),
+        )
+        self.assertEqual(plan.action, "create")
+        self.assertIn("<!-- codex-mediation:PRRT_fresh -->", plan.description)
+        self.assertNotIn("<!-- codex-mediation:PRRT_done -->", plan.description)
+
+    def test_per_thread_issue_is_not_the_rollup(self) -> None:
+        per_thread = mod.LinearIssue(
+            id="thread-issue",
+            identifier="CSL-174",
+            url="https://linear.app/thread",
+            title="Stuck PR thread: recursion#193 – scripts/v3/harness/__init__.py:5",
+            description="<!-- codex-mediation:PRRT_thread -->\n",
+            state_type="triage",
+        )
+        self.assertFalse(mod.is_rollup_for_pr(per_thread, "CSL-Laboratories/recursion", 193))
+        plan = mod.plan_rollup(
+            pull(number=193),
+            [(thread(tid="PRRT_thread", comments=stuck_pair()), "stuck-human")],
+            [per_thread],
+            cfg(),
+        )
+        self.assertEqual(plan.action, "create")
+
+    def test_longer_pr_number_does_not_match(self) -> None:
+        other = mod.LinearIssue(
+            id="other",
+            identifier="CSL-1",
+            url="https://linear.app/other",
+            title="Stuck PR threads: recursion#1860",
+            description="<!-- stuck-pr-threads:CSL-Laboratories/recursion#1860 -->\n",
+            state_type="triage",
+        )
+        self.assertFalse(mod.is_rollup_for_pr(other, "CSL-Laboratories/recursion", 186))
+        self.assertFalse(
+            mod.pr_marker_in(other.description, "CSL-Laboratories/recursion", 186)
+        )
+
+    def test_skip_approved_and_merged(self) -> None:
+        self.assertEqual(mod.skip_pr_reason(pull(review_decision="APPROVED")), "approved")
+        self.assertEqual(mod.skip_pr_reason(pull(state="MERGED")), "closed")
+        self.assertEqual(mod.skip_pr_reason(pull(draft=True)), "draft")
+        self.assertEqual(mod.skip_pr_reason(pull(review_decision="CHANGES_REQUESTED")), "")
+
+    def test_scan_skips_approved_pr(self) -> None:
+        t = thread(comments=stuck_pair())
+        gh = FakeGitHub([pull(threads=[t], review_decision="APPROVED")])
+        lin = FakeLinear()
+        counters = mod.scan(cfg(), gh, lin)  # type: ignore[arg-type]
+        self.assertEqual(counters.mediated, 0)
+        self.assertEqual(counters.scanned, 0)
+        self.assertEqual(lin.created, [])
+        self.assertEqual(gh.comments, [])
+
+    def test_scan_one_rollup_for_two_threads_links_csl_and_assignee(self) -> None:
+        threads = [
+            thread(tid="PRRT_1", comments=stuck_pair()),
+            thread(tid="PRRT_2", path="README.md", comments=stuck_pair()),
+        ]
+        p = pull(
+            threads=threads,
+            author="CDanTheMan",
+            title="CSL-81: Qualify upstream CLI contracts",
+            head_ref="chaandansaini101/csl-81-cli-contracts",
+        )
+        gh = FakeGitHub([p])
+        gh.user_ids["CDanTheMan"] = "99"
+        lin = FakeLinear()
+        counters = mod.scan(cfg(), gh, lin)  # type: ignore[arg-type]
+        self.assertEqual(counters.mediated, 2)
+        self.assertEqual(counters.linear, 1)
+        self.assertEqual(len(lin.created), 1)
+        self.assertEqual(lin.created[0][2], "linear-user")
+        self.assertEqual(lin.relations, [("created-1", "CSL-81")])
+        self.assertIn("**CSL issue:** CSL-81", lin.created[0][1])
+
+    def test_scan_does_not_reopen_canceled_rollup(self) -> None:
+        t = thread(tid="PRRT_done", comments=stuck_pair())
+        canceled = mod.LinearIssue(
+            id="closed",
+            identifier="CSL-164",
+            url="https://linear.app/closed",
+            title="Stuck PR threads: recursion#189",
+            description=mod.mediation_marker("PRRT_done"),
+            state_type="canceled",
+        )
+        gh = FakeGitHub([pull(number=189, threads=[t])])
+        lin = FakeLinear([canceled])
+        counters = mod.scan(cfg(), gh, lin)  # type: ignore[arg-type]
+        self.assertEqual(counters.mediated, 1)
+        self.assertEqual(counters.linear, 0)
+        self.assertEqual(lin.created, [])
+        self.assertEqual(lin.updated, [])
+        self.assertEqual(gh.labels, [])
+        self.assertIn("https://linear.app/closed", gh.comments[0][1])
+
+    def test_create_rollup_sends_assignee_and_labels(self) -> None:
+        client = mod.LinearClient(cfg())
+        client._meta = {
+            "team_id": "team",
+            "triage_id": "triage",
+            "label_ids": ["label-needs"],
+            "project_id": "proj",
+        }
+        calls: list[dict[str, Any]] = []
+
+        def graphql(query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
+            calls.append(variables or {})
+            return {
+                "issueCreate": {
+                    "success": True,
+                    "issue": {"id": "i", "identifier": "CSL-1", "url": "https://linear.app/i"},
+                }
+            }
+
+        client.graphql = graphql  # type: ignore[method-assign]
+        created = client.create_rollup(
+            title="Stuck PR threads: recursion#1",
+            description="x",
+            assignee_id="user-1",
+        )
+        payload = calls[0]["input"]
+        self.assertEqual(created.url, "https://linear.app/i")
+        self.assertEqual(payload["assigneeId"], "user-1")
+        self.assertEqual(payload["labelIds"], ["label-needs"])
+        self.assertEqual(payload["stateId"], "triage")
+        self.assertEqual(payload["projectId"], "proj")
+
+    def test_link_related_uses_csl_identifier(self) -> None:
+        client = mod.LinearClient(cfg())
+        calls: list[dict[str, Any]] = []
+
+        def graphql(query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
+            calls.append(variables or {})
+            if "inverseRelations" in query:
+                return {
+                    "issue": {
+                        "relations": {"nodes": []},
+                        "inverseRelations": {"nodes": []},
+                    }
+                }
+            return {"issueRelationCreate": {"success": True}}
+
+        client.graphql = graphql  # type: ignore[method-assign]
+        client.link_related("issue-1", "CSL-81")
+        self.assertEqual(
+            calls[-1]["input"],
+            {"issueId": "issue-1", "relatedIssueId": "CSL-81", "type": "related"},
+        )
 
 
 if __name__ == "__main__":

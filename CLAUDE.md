@@ -140,6 +140,8 @@ not decide.
 
 - Branch from up-to-date `master` as `csl-<N>-<slug>` (example: `csl-26-short-slug`).
   A GitHub username prefix is optional (`chaandansaini101/csl-26-short-slug`).
+- Open the PR as a **draft**. Batch commits into as few pushes as possible.
+  Mark ready for review **once**, when the work is actually ready.
 - PR title includes `CSL-N` so Linear auto-links. pr-lint matches `CSL-[0-9]+`
   case-sensitively, so a lowercase branch name alone does not pass. The `CSL-N`
   key in the PR title satisfies the check. Put `Fixes CSL-N` in the PR body —
@@ -202,6 +204,21 @@ Linear is the team's primary async channel, alongside Google Meet and Discord.
 Trigger CI and reviews through the Discord bot (`/ci full|run`, `/devin review
 pr:<url>|run|status`, or MCP `ci_full` / `ci_run` / `devin_review`) or the `ci:full`
 label, not by editing config.
+
+## Agent CI etiquette
+
+Blacksmith minutes are paid. Agents and bots keep CI cheap:
+
+- Open every PR as a **draft**. Batch pushes. Mark the PR ready **once**.
+- Never merge a PR. Never rebase or merge `master` into a review branch unless
+  there is a real conflict with `master`.
+- Never edit `.github/workflows/**` or other CI/runner configuration. A
+  human-assigned Linear issue is the only exception, and it must name the
+  workflow files.
+- Bots that mark a PR ready must use their own GitHub identity (GitHub App
+  or PAT). Do not mark ready with `GITHUB_TOKEN`: GitHub does not run
+  `ready_for_review` workflows for that token, so Devin Review and CI never
+  start.
 
 ## Review roles
 

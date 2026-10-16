@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import itertools
+import os
 import re
+import shutil
+import subprocess
 import unittest
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -47,7 +50,7 @@ class SchedulingTests(unittest.TestCase):
                   ['opened', 'reopened', 'ready_for_review', 'synchronize'] for draft in [True, False]]
         events += [(e, '', False) for e in ['push', 'workflow_dispatch', 'merge_group']]
         queue_enabled = 'merge_group:' in (ROOT / '.github/workflows/ci.yml').read_text()
-        for job in ['linux', 'windows', 'macos']:
+        for job in ['linux-tests', 'windows', 'macos']:
             expression = condition(job)
             self.assertIn('always()', expression)
             self.assertIn('!cancelled()', expression)
@@ -56,7 +59,7 @@ class SchedulingTests(unittest.TestCase):
                 expected_settle = event == 'pull_request' and action == 'synchronize' and not draft
                 expected = not cancelled and (settle == 'success' or
                            (settle == 'skipped' and not expected_settle))
-                if job != 'linux':
+                if job != 'linux-tests':
                     selected = event == 'workflow_dispatch' or (event == 'pull_request' and full)
                     selected |= event == 'merge_group' and queue_enabled
                     selected |= job == 'windows' and event == 'push'
@@ -64,8 +67,25 @@ class SchedulingTests(unittest.TestCase):
                 args = dict(event=event, action=action, draft=draft, full=full,
                             settle=settle, linux=linux, cancelled=cancelled)
                 self.assertEqual(evaluate(expression, **args), expected, (job, args))
-            if job != 'linux':
+            if job != 'linux-tests':
                 self.assertFalse(evaluate(expression, event='workflow_dispatch', run_full='false'))
+
+    @unittest.skipIf(os.name == 'nt' or shutil.which('bash') is None, 'POSIX shell runner')
+    def test_required_linux_runs_actual_shell_for_every_dependency_result(self):
+        text = (ROOT / '.github/workflows/ci.yml').read_text()
+        job = text.split('  linux:\n', 1)[1].split('  windows:\n', 1)[0]
+        self.assertIn('needs: [settle, linux-tests]', job)
+        self.assertIn('if: always()', job)
+        self.assertIn('runs-on: ubuntu-latest', job)
+        self.assertIn('if: cancelled()\n        run: exit 1', job)
+        import textwrap
+        shell = textwrap.dedent(job.split('        run: |\n', 1)[1]).strip()
+        states = ['success', 'failure', 'cancelled', 'skipped', 'pending', '']
+        for settle, linux, wait in itertools.product(states, states, ['true', 'false']):
+            env = dict(os.environ, SETTLE_RESULT=settle, LINUX_RESULT=linux, WAIT_EXPECTED=wait)
+            result = subprocess.run(['bash', '-e', '-c', shell], env=env, capture_output=True)
+            expected = linux == 'success' and settle == ('success' if wait == 'true' else 'skipped')
+            self.assertEqual(result.returncode == 0, expected, (settle, linux, wait))
 
 
 if __name__ == '__main__':

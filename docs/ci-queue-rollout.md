@@ -11,6 +11,11 @@ clearance. Do not replace those branches or import unrelated policy/planning wor
 
 ## Gates and activation holds
 
+- The existing required name `linux` is now a small hosted aggregate. Paid work
+  runs as `linux-tests` only after acceptable settle. The required aggregate
+  always evaluates, fails on cancelled/failed/unexpectedly skipped settle or
+  skipped/failed Linux tests, and forwards verified path outputs. No protection
+  setting change is needed to keep failed settle from satisfying `linux`.
 - `platform-gates` waits for settle, Linux, Windows and macOS. Queue and manual full
   runs require all three platforms. Ordinary PRs require Linux and any selected
   extra OS jobs. Master push retains Linux/Windows fallback; nightly macOS remains.

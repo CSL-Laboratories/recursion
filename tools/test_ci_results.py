@@ -59,6 +59,9 @@ class AggregateTests(unittest.TestCase):
         self.assertIn('if: always()', aggregate)
         self.assertIn('if: cancelled()\n        run: exit 1', aggregate)
         self.assertIn('CI_NEEDS: ${{ toJSON(needs) }}', aggregate)
+        required_linux = text.split('  linux:\n', 1)[1].split('  windows:\n', 1)[0]
+        self.assertIn('classification: ${{ needs.linux-tests.outputs.classification }}', required_linux)
+        self.assertIn('run_full: ${{ needs.linux-tests.outputs.run_full }}', required_linux)
         self.assertIn('CI_ACTION: ${{ github.event.action }}', aggregate)
         self.assertIn('CI_DRAFT: ${{ github.event.pull_request.draft || false }}', aggregate)
         self.assertIn("CI_FULL: ${{ contains(github.event.pull_request.labels.*.name, 'ci:full') }}", aggregate)

@@ -1272,6 +1272,14 @@ class FixerLoopCapTests(unittest.TestCase):
                 result = subprocess.run(["jq", "-r", expression], input=json.dumps(fixture), text=True, capture_output=True, check=True)
                 self.assertEqual(result.stdout.strip(), "" if kind == "analysis" else expected)
 
+    def test_query_variables_stay_literal_with_scoped_shellcheck_directives(self) -> None:
+        self.assertEqual(self.script.count("# shellcheck disable=SC2016"), 2)
+        self.assertIn("# shellcheck disable=SC2016\nif ! jq", self.script)
+        self.assertIn('# shellcheck disable=SC2016\nfindings="$(gh api graphql', self.script)
+        self.assertIn('.head.sha == $sha and .head.ref == $ref and .head.repo.full_name == $repo', self.script)
+        self.assertIn("query($owner:String!, $name:String!, $number:Int!, $endCursor:String)", self.script)
+        self.assertIn(". as $thread", self.script)
+
     def test_live_thread_filter_is_exact_and_paginated(self) -> None:
         self.assertIn("graphql --paginate", self.script)
         self.assertIn(".isResolved == false and .isOutdated == false", self.script)

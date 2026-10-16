@@ -666,6 +666,8 @@ jobs:
           set -euo pipefail
           # Revalidate after acquiring the shared per-PR concurrency lock.
           current_pr="$(gh api "repos/$REPO/pulls/$PR_NUMBER")"
+          # jq variables are supplied via --arg, not expanded by the shell.
+          # shellcheck disable=SC2016
           if ! jq -e --arg sha "$HEAD_SHA" --arg repo "$REPO" --arg ref "$HEAD_REF" \
             '.state == "open" and .head.sha == $sha and .head.ref == $ref and .head.repo.full_name == $repo' <<< "$current_pr" >/dev/null; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
@@ -680,6 +682,8 @@ jobs:
           esac
           # Only unresolved, current-head Devin findings can spend fixer quota.
           # Paginate before inspecting; a failed listing aborts this step closed.
+          # GraphQL and jq variables must remain literal for their query engines.
+          # shellcheck disable=SC2016
           findings="$(gh api graphql --paginate -f owner="${REPO%/*}" -f name="${REPO#*/}" -F number="$PR_NUMBER" \
             -f query='query($owner:String!, $name:String!, $number:Int!, $endCursor:String) {
               repository(owner:$owner,name:$name) { pullRequest(number:$number) {

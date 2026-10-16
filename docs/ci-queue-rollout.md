@@ -6,7 +6,7 @@ and existing `linux` protection. Do not change repository settings in this task.
 Corrected source order: settle replacement for #213, queue replacement for #215,
 then etiquette replacement for #214. Preserve separately owned #211 -> #216 and
 their reviewer/fixer roles, receipt trust, locks, retry caps and resolver policies.
-Their source landing order and the existing after-Cockpit-#147 hold require owner
+Their source landing order and the existing cross-repository hold require owner
 clearance. Do not replace those branches or import unrelated policy/planning work.
 
 ## Gates and activation holds

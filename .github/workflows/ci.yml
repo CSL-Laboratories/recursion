@@ -218,6 +218,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      - name: Reject workflow cancellation
+        if: cancelled()
+        run: exit 1
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
@@ -230,5 +233,4 @@ jobs:
           CI_ACTION: ${{ github.event.action }}
           CI_DRAFT: ${{ github.event.pull_request.draft || false }}
           CI_FULL: ${{ contains(github.event.pull_request.labels.*.name, 'ci:full') }}
-          CI_CANCELLED: ${{ cancelled() }}
         run: python3 -X utf8 -B tools/ci_results.py

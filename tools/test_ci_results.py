@@ -57,7 +57,7 @@ class AggregateTests(unittest.TestCase):
         aggregate = text.split('  platform-gates:\n')[1]
         self.assertIn('needs: [settle, linux, windows, macos]', aggregate)
         self.assertIn('if: always()', aggregate)
-        self.assertIn('CI_CANCELLED: ${{ cancelled() }}', aggregate)
+        self.assertIn('if: cancelled()\n        run: exit 1', aggregate)
         self.assertIn('CI_NEEDS: ${{ toJSON(needs) }}', aggregate)
         self.assertNotIn('CI_HEAD_SHA:', text.split('jobs:')[0])
         self.assertNotIn('CI_HEAD_SHA: ${{ github.event.pull_request.head.sha', text)

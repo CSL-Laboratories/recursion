@@ -49,8 +49,8 @@ def run_task(
     workspace = _live_workspace(state_dir, run_id) if allow_live else None
     current_task = task
 
-    def save_failure(status: str, exc: HarnessError) -> None:
-        _finish(
+    def finish(status: str, error: str | None = None) -> dict:
+        return _finish(
             config,
             state_dir,
             run_id=run_id,
@@ -61,11 +61,14 @@ def run_task(
             reviews=reviews,
             usage=usage,
             status=status,
-            error=str(exc),
+            error=error,
             workspace=workspace,
             run_branch=run_branch,
             repo=repo,
         )
+
+    def save_failure(status: str, exc: HarnessError) -> None:
+        finish(status, error=str(exc))
 
     def call(name: str, request: ProviderRequest):
         try:
@@ -88,21 +91,7 @@ def run_task(
     add_usage(usage, parse_usage(result.text))
     shown = assistant_text(result.text)
     if exceeded(usage, budgets):
-        return _finish(
-            config,
-            state_dir,
-            run_id=run_id,
-            task=task,
-            provider=worker,
-            reviewers=reviewers,
-            text=shown,
-            reviews=reviews,
-            usage=usage,
-            status="budget-exceeded",
-            workspace=workspace,
-            run_branch=run_branch,
-            repo=repo,
-        )
+        return finish("budget-exceeded")
 
     max_rounds = config["review"]["max_rounds"]
     if max_rounds <= 0 or not reviewers:
@@ -116,21 +105,7 @@ def run_task(
                     "verdict": "skipped",
                 }
             )
-        return _finish(
-            config,
-            state_dir,
-            run_id=run_id,
-            task=task,
-            provider=worker,
-            reviewers=reviewers,
-            text=shown,
-            reviews=reviews,
-            usage=usage,
-            status=status,
-            workspace=workspace,
-            run_branch=run_branch,
-            repo=repo,
-        )
+        return finish(status)
 
     status = "review-rejected"
     for round_index in range(1, max_rounds + 1):
@@ -175,21 +150,7 @@ def run_task(
             status = "budget-exceeded"
             break
 
-    return _finish(
-        config,
-        state_dir,
-        run_id=run_id,
-        task=task,
-        provider=worker,
-        reviewers=reviewers,
-        text=shown,
-        reviews=reviews,
-        usage=usage,
-        status=status,
-        workspace=workspace,
-        run_branch=run_branch,
-        repo=repo,
-    )
+    return finish(status)
 
 
 def _request(task: str, run_id: str, kind: str, workspace: str | None) -> ProviderRequest:

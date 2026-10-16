@@ -4,6 +4,11 @@
 # noise. Lightweight GitHub-hosted runner, no test jobs.
 #
 # Caps: one mediation per thread, max 3 per PR per UTC day.
+# Linear: one open roll-up per PR (checklist of threads), deduped by
+# <!-- codex-mediation:<thread id> -->. Assigned to the PR author and
+# linked to the PR's CSL issue. Skips approved, draft, and merged/closed
+# PRs. Does not re-open a canceled roll-up and does not file one issue
+# per thread.
 # Never resolve threads, never push, never merge.
 name: Stuck-thread watch
 

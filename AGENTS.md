@@ -102,7 +102,7 @@ Current tools. Do not add paid services or raise spend limits.
 - **Devin** — GitHub PR reviewer only (on PR creation and on demand). See
   [Review roles](#review-roles).
 - **Claude Code Action** — PR fixer for Devin findings and `@claude` mentions
-  on same-repo OWNER/MEMBER PRs (`.github/workflows/claude.yml`).
+  on open same-repo PRs by verified repository writers (`.github/workflows/claude.yml`).
 - **Blacksmith CI** — only CI. See [CI](#ci).
 - **Google Workspace** (`csl-laboratories.com`) — meetings and notes.
 - **Discord bot** (`csl-bot-operations`) — Liaison. Commands and MCP; see below. Trigger CI
@@ -208,8 +208,16 @@ label, not by editing config.
 - **Devin** is the only GitHub PR reviewer. It does not auto-fix.
 - **Claude Code Action** (`.github/workflows/claude.yml`) is the fixer for Devin
   findings and `@claude` mentions. It runs only on open same-repo PRs whose
-  author is an org OWNER or MEMBER. `@claude` also requires a human OWNER or
-  MEMBER commenter. Fork and nonmember PRs are not auto-fixed.
+  author has write, maintain or admin repository permission. `@claude` also
+  requires a human commenter with that permission. Association is audit-only:
+  private org members may appear as CONTRIBUTOR. Forks and nonwriters are skipped.
+  Submitted Devin bot reviews wake the fixer directly; under the PR lock it
+  refreshes the live head and reconciles unresolved, non-outdated findings,
+  including roots on older commits.
+  Codex never dispatches fixes. Every fixer shares the per-PR
+  concurrency group, without cancelling an active run. Native `queue: max`
+  retains up to 100 pending writers in queue-entry order; further arrivals are
+  cancelled when full. This is bounded buffering, not an unlimited guarantee.
 - **Stuck-thread watch** (`.github/workflows/stuck-thread-watch.yml`) asks Codex
   to mediate Devin threads Claude could not settle. A **MEDIATE** verdict
   updates one Linear roll-up per PR (`Stuck PR threads: recursion#<PR>`), not
@@ -267,17 +275,14 @@ as the first line of the description.
 
 ## Code Review Rules
 
-Codex GitHub reviews are the CI/fixer gate on this repository (CSL-102), not a
-reviewer of record. Devin still reviews; Claude still fixes. End **every** Codex
-review with exactly one of these lines as the last line of the review body
-(not in a code fence, not only in an inline comment):
+Codex GitHub reviews route CI readiness and human mediation (CSL-102/CSL-201),
+not fixes. Devin remains reviewer of record; Devin and human requests trigger
+Claude. When ready or needing human mediation, end the Codex review with exactly one
+of these lines (not in a code fence or only an inline comment):
 
-CODEX-GATE: FIX
 CODEX-GATE: READY
 CODEX-GATE: MEDIATE
 
-- **FIX** — unresolved Devin review threads still need one batched Claude PR
-  Fixer run (`devin-review-fix`). The fixer only addresses Devin threads.
 - **READY** — no fixer; apply the `ci:full` label so the full CI matrix runs.
 - **MEDIATE** — Devin and Claude are stuck; hand off to
   `.github/workflows/stuck-thread-watch.yml` for this PR. The watcher still
@@ -286,9 +291,14 @@ CODEX-GATE: MEDIATE
   on fresh threads usually does nothing until a later scheduled run — it is
   not an immediate `@codex review`. Do not push, merge, or resolve threads.
 
-Do not omit the verdict line. A human `@claude` mention still runs the mention
-fixer immediately and bypasses the per-PR daily fixer cap (3 batched fixer
-runs per UTC day).
+If findings still need fixing without human mediation, report pending without
+a verdict. Legacy `CODEX-GATE: FIX` is ignored and produces no acted marker;
+missing verdicts never dispatch a fixer. No timeout/wait job exists. Historical
+FIX/timeout markers do not block later READY/MEDIATE. A human `@claude` mention runs the mention
+fixer immediately. There is no daily dispatch cap. The batched fixer pauses
+after eight Claude commits since the last human commit; other bot commits
+neither count nor reset the streak. A human commit re-arms it. Legacy
+`bypass_cap` inputs are accepted for compatibility but never bypass this guard.
 
 ## Automations
 
@@ -322,3 +332,89 @@ caching, concurrency), Devin configuration or settings, Devin automations, repo 
 or the MCP server list, unless a Linear issue explicitly assigned by a human asks for it.
 
 Do not add paid services or raise spend limits.
+
+### Batched fixer retries and handled findings
+
+Only unresolved, non-outdated roots from the verified Devin bot with valid
+`devin-review-comment` metadata whose kind is exactly `bug` are eligible. Missing
+or malformed metadata, analysis, and summary comments fail closed. Structured
+Claude result receipts bind the root ID and exact body fingerprint. An addressed
+receipt is honored only when its pushed fix descends from the recorded base and
+is reachable from the live PR head. A `needs-human` receipt stops automatic
+retries until a substantive trusted follow-up, changed finding, or authorized
+manual retry. Arbitrary prose and failed/no-push replies never prove completion.
+
+Automatic runs reserve at most three attempts per live head and unchanged
+finding set under the shared PR lock. A new head or changed findings resets this
+budget; it is not a daily cap. Exhaustion posts a human-action-needed notice,
+never a readiness verdict. Authorized workflow dispatch bypasses this retry
+budget and human-handoff receipts, but never the eight-commit guard. A human
+`@claude` request also remains available. Pre-merge action validation can consume
+a reserved attempt without running Claude; after activation on the default
+branch, use an authorized manual retry if those reservations exhausted the budget.
+
+A trusted current fixer pause invalidates older READY decisions. Codex READY
+reconciles live unresolved findings and the current head before and after its
+label write; MEDIATE remains available. The gate records ownership of its exact
+`ci:full` label event. A later pause revokes only that owned label event, leaving
+a subsequent human label override intact. Same-head recovery requires a fresh
+verified readiness check; a READY comment alone cannot override a pause.
+
+READY is reconciled from current unresolved findings and live label state, not
+from old READY comments. An already-present label causes no repeat label or
+audit writes. Authenticated MEDIATE deduplication remains separate. A verified
+human label removal is preserved on the head where it is observed. A fresh
+READY on a subsequent head can authorize CI again. If a label write cannot be attributed after
+bounded event visibility retries, its pre-write intent blocks automatic READY
+until an explicit human remove/re-add resolves the uncertainty; later runs never
+claim ownership of that ambiguous label.
+
+Handled receipts use version 3 and copy the exact observation token and durable
+generation from preflight. The authenticated Actions observation journal records
+each observed transition for a root, including its root-body fingerprint. Generations bind
+the predecessor and current snapshot, so an observed added/deleted or
+changed/reverted reply or root body cannot revive an older receipt. Duplicate identical
+transitions reuse one generation; conflicting or incomplete histories fail closed
+for human investigation. READY and all fixer/manual writers share the same
+per-PR queue. Journal writes must succeed before a decision relies on them. Previously tracked
+roots are reconciled before eligibility filtering, including malformed/removed
+or non-bug metadata, resolved/outdated flags and absence from both complete API
+views. Those inactive states advance history but never become fixer work.
+Contradictory GraphQL/REST presence or identity fails closed; restoring a root
+to eligible state cannot reuse its pre-inactivation generation. Before filtering,
+thread IDs, root-to-thread identity and REST comment IDs are validated. Exact
+identical pagination overlaps deduplicate; conflicting duplicates abort before
+journal writes or eligibility decisions, including inactive and untrusted variants.
+Every GraphQL root must corroborate a REST top-level root with matching body and
+actor identity before filtering; the root sets must match in both directions.
+Empty threads, missing/deleted authors, invalid flags, and dangling reply parents
+fail closed as inconsistent snapshots. API lag is retried by a later invocation,
+never interpreted as a clean finding set. Matching inactive/non-Devin roots stay
+ineligible. A tracked tombstone requires absence from both complete views.
+
+The snapshot binds meaningful trusted follow-up comment IDs, author IDs and
+body digests. Exact unchanged content retains its previously authenticated
+classification even if its author later loses permission. Content not previously
+authenticated in this history requires current authorization; restoring exact
+historical content still advances the generation when the state changes. Timestamps do not establish edit order. Legacy
+receipts without durable generation proof cannot suppress findings; no deployed
+receipt migration is assumed. Changes created and removed entirely between
+observations are not detectable from the current GitHub API snapshot and are
+not claimed as observed. Deleting trusted journal history can likewise remove
+evidence; incomplete chains are rejected rather than guessed.
+
+For an uncertain label write, inspect the label and use the exact command
+printed in the gate notice: `/claude-fixer reconcile-label <nonce> <live-head-sha>`.
+It must be the entire comment, without quotes, extra lines or surrounding text,
+from a human with current write, maintain or admin permission. The nonce selects
+one uncertain transaction and the head must still be current. This acknowledges
+uncertainty only: it does not prove gate ownership, bypass unresolved findings,
+override a same-head manual removal, or authorize unrelated work. An old-head
+command does not carry forward after a push. Explicit remove/re-add remains a
+fallback, but same-second removal cannot establish ordering and may require
+repeating that sequence in a later timestamp second.
+
+Ownership event visibility is retried after one and two seconds. A confirmed
+HTTP rejection of the label POST can close its intent; a timeout, transport
+error, server failure, or missing rejection receipt remains uncertain and
+requires the manual sequence above.

@@ -25,6 +25,11 @@
 # Adding `ci:full` starts windows/macos from ci-full-label.yml (no linux job).
 # `ci:full` also gates windows/macos on the next synchronize / ready_for_review
 # / dispatch / master push. Discord `/ci full` retriggers.
+#
+# Non-draft pull_request synchronize waits 120s on free GitHub-hosted Ubuntu
+# before Blacksmith jobs start. A newer push cancels this run (same concurrency
+# group) during that wait, so superseded heads never bill. Other events do not
+# wait: settle is skipped and linux/windows still run via always() && !cancelled().
 name: CI
 
 on:
@@ -47,8 +52,22 @@ env:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
 jobs:
+  settle:
+    name: settle
+    if: >
+      github.event_name == 'pull_request' &&
+      github.event.action == 'synchronize' &&
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Wait for the PR head to settle
+        run: sleep 120
+
   linux:
     name: linux
+    needs: settle
+    if: always() && !cancelled()
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 15
     outputs:
@@ -109,8 +128,9 @@ jobs:
 
   windows:
     name: windows
-    needs: linux
+    needs: [settle, linux]
     if: >
+      always() && !cancelled() &&
       needs.linux.result == 'success' &&
       needs.linux.outputs.run_full == 'true' &&
       (github.event_name == 'push' ||

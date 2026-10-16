@@ -221,15 +221,29 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("types: [opened, synchronize, reopened, ready_for_review, labeled", preamble)
         self.assertNotRegex(preamble, r"(?m)^if:")
         self.assertIn("ready_for_review", preamble)
+        self.assertIn(
+            "ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}",
+            preamble,
+        )
         self.assertIn("cancel-in-progress: true", preamble)
         self.assertNotIn("label-churn", text)
         self.assertEqual(text.count("name: linux"), 1)
+        settle = text[text.index("  settle:\n") : text.index("  linux:\n")]
+        self.assertIn("name: settle", settle)
+        self.assertIn("runs-on: ubuntu-latest", settle)
+        self.assertIn("sleep 120", settle)
+        self.assertIn("github.event.action == 'synchronize'", settle)
+        self.assertIn("github.event.pull_request.draft == false", settle)
+        self.assertNotIn("blacksmith", settle)
         linux = text[text.index("  linux:\n") : text.index("  windows:")]
         self.assertIn("runs-on: blacksmith-2vcpu-ubuntu-2404", linux)
+        self.assertIn("needs: settle", linux)
+        self.assertIn("always() && !cancelled()", linux)
         self.assertNotIn("github.event.pull_request.draft", linux)
         self.assertNotIn("github.event.action != 'labeled'", linux)
         windows = text[text.index("  windows:") : text.index("  macos:")]
-        self.assertIn("needs: linux", windows)
+        self.assertIn("needs: [settle, linux]", windows)
+        self.assertIn("always() && !cancelled()", windows)
         self.assertIn("needs.linux.result == 'success'", windows)
         self.assertIn("'ci:full'", windows)
         label_wf = (ROOT / ".github" / "workflows" / "ci-full-label.yml").read_text(

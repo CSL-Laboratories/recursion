@@ -21,10 +21,11 @@
 # backstop, and a follow-up step warns if that backstop kills the shell.
 #
 # Label add/remove would otherwise re-run this whole workflow (and, with
-# cancel-in-progress, abort an in-flight linux run). The workflow-level `if`
-# starts CI only for `ci:full` / `enhancement` label events. Other labels do
-# not start a run, so they cannot post a new `linux` check over a real
-# failure. Draft PRs are the same: no `linux` status until ready_for_review.
+# cancel-in-progress, abort an in-flight linux run). GitHub has no workflow-level
+# `if`, so the linux job itself is skipped for drafts and for label events
+# other than `ci:full` / `enhancement`. A skipped job is not success, so it
+# cannot turn a failed required check green. Those label events also use a
+# separate concurrency group so they cannot cancel a real suite.
 name: CI
 
 on:
@@ -48,23 +49,6 @@ concurrency:
     }}
   cancel-in-progress: true
 
-# Skip the whole workflow (no linux check run) for drafts and for label
-# events other than ci:full / enhancement. A skipped job named `linux` that
-# exits 0 would satisfy branch protection over a failed suite on the same SHA.
-if: >
-  github.event_name != 'pull_request' ||
-  (
-    github.event.pull_request.draft == false &&
-    (
-      (
-        github.event.action != 'labeled' &&
-        github.event.action != 'unlabeled'
-      ) ||
-      github.event.label.name == 'ci:full' ||
-      github.event.label.name == 'enhancement'
-    )
-  )
-
 permissions:
   contents: read
 
@@ -76,6 +60,19 @@ env:
 jobs:
   linux:
     name: linux
+    if: >
+      github.event_name != 'pull_request' ||
+      (
+        github.event.pull_request.draft == false &&
+        (
+          (
+            github.event.action != 'labeled' &&
+            github.event.action != 'unlabeled'
+          ) ||
+          github.event.label.name == 'ci:full' ||
+          github.event.label.name == 'enhancement'
+        )
+      )
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 15
     outputs:

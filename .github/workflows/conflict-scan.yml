@@ -351,6 +351,8 @@ jobs:
     concurrency:
       # Same per-PR group as the @claude/Devin fixers: serializes every Claude push to this branch.
       group: claude-${{ matrix.pr.number }}
+      # GitHub queues up to 100 pending writers; never replace a queued fixer.
+      queue: max
       cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 30

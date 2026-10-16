@@ -157,13 +157,16 @@ def evaluate(
     devin = "false"
     if (
         event_name == "pull_request_review"
+        and event.get("action") == "submitted"
         and open_same_writer
         and (review.get("user") or {}).get("login") == DEVIN_BOT
+        and (review.get("user") or {}).get("type") == "Bot"
+        and safe_head_sha(review.get("commit_id"))
         and str(review.get("state") or "").lower() in DEVIN_STATES
     ):
         devin = "true"
     elif event_name in DISPATCH_EVENTS and open_same_writer:
-        # Batched fixer from the Codex gate (or a human workflow_dispatch).
+        # Explicitly requested batched fixer dispatch; Codex never dispatches fixes.
         devin = "true"
 
     return {
@@ -255,6 +258,16 @@ def main() -> int:
         return 0
     pr = event.get("pull_request") if isinstance(event.get("pull_request"), dict) else None
     issue = event.get("issue") if isinstance(event.get("issue"), dict) else None
+    if event_name == "pull_request_review":
+        # Event payloads may be stale by the time the runner starts.
+        raw = str((pr or {}).get("number") or "")
+        if not SAFE_PR_RE.fullmatch(raw):
+            emit(_skip("bad-pr-number"))
+            return 0
+        pr = fetch_pr(repository, int(raw))
+        if pr is None:
+            emit(_skip("pr-fetch-failed"))
+            return 0
     if pr is None and event_name in DISPATCH_EVENTS:
         raw = dispatch_pr_number(event_name, event)
         if not raw:

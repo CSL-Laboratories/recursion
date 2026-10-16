@@ -8,12 +8,14 @@ Acceptance:
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,8 +43,25 @@ def gh_blob(args: list) -> str:
     return " ".join(str(a) for a in args)
 
 
+READY_EVENT_READS = 0
+
+def ready_api_reply(args):
+    global READY_EVENT_READS
+    if args[-1] == "user":
+        return json.dumps({"login": "gate-writer", "id": 99, "type": "User"})
+    if "/events?" in gh_blob(args):
+        READY_EVENT_READS += 1
+        if READY_EVENT_READS <= 2:
+            return "[]"
+        return json.dumps([{"id": 5, "event": "labeled", "label": {"name": "ci:full"}, "actor": {"login": "gate-writer"}}])
+    if args[-1] == f"repos/{REPO}/pulls/7":
+        return json.dumps({"state": "open", "draft": False, "head": {"sha": SHA, "repo": {"full_name": REPO}}})
+    return "{}"
+
+
 def review_event(*, login: str, body: str, sha: str = SHA, number: int = 7) -> dict:
     return {
+        "action": "submitted",
         "review": {
             "user": {"login": login, "type": "Bot"},
             "body": body,
@@ -86,22 +105,22 @@ class MarkerAndVerdictTests(unittest.TestCase):
     def test_request_comment_contains_mention_and_marker(self) -> None:
         body = gate.request_comment_body(SHA)
         self.assertIn("@codex review", body)
+        self.assertNotIn("@claude", body)
         self.assertIn(gate.gate_marker(SHA), body)
-        for verdict in ("FIX", "READY", "MEDIATE"):
+        for verdict in ("READY", "MEDIATE"):
             self.assertIn(f"CODEX-GATE: {verdict}", body)
 
-    def test_dispatch_comment_does_not_consume_daily_cap(self) -> None:
-        body = gate.fixer_dispatch_comment_body(SHA, "2026-10-15", "codex-fix")
-        self.assertIn(gate.acted_marker(SHA), body)
-        self.assertNotIn(gate.fixer_run_marker("2026-10-15"), body)
+    def test_request_verdict_instruction_is_conditional(self) -> None:
+        body = gate.request_comment_body(SHA)
+        self.assertIn("When ready or needing human mediation, end with exactly one", body)
+        self.assertIn("report pending without a verdict", body)
+        self.assertNotIn("End this review with exactly", body)
 
-    def test_fixer_run_cap(self) -> None:
-        day = "2026-10-15"
-        bodies = [gate.fixer_run_marker(day)] * 3
-        self.assertTrue(gate.cap_reached(bodies, day))
-        self.assertFalse(gate.cap_reached(bodies, day, bypass=True))
-        self.assertFalse(gate.cap_reached(bodies[:2], day))
-        self.assertFalse(gate.cap_reached([gate.fixer_run_marker("2026-10-14")] * 5, day))
+    def test_only_terminal_actions_deduplicate(self) -> None:
+        for body in (gate.acted_marker(SHA), gate.acted_comment_body(SHA, "FIX"), f"{gate.acted_marker(SHA)}\nCodex gate: dispatching batched Devin review fixer (timeout) on 2026-10-15."):
+            self.assertFalse(gate.has_terminal_action(SHA, [body]))
+        for verdict in ("READY", "MEDIATE"):
+            self.assertEqual(gate.has_terminal_action(SHA, [gate.acted_comment_body(SHA, verdict)]), verdict == "MEDIATE")
 
 
 class AdmitResolvePrTests(unittest.TestCase):
@@ -153,14 +172,37 @@ class AdmitResolvePrTests(unittest.TestCase):
         }
         self.assertFalse(gate.admit_resolve_pr("pull_request_review_comment", event))
 
-    def test_reviews_are_rejected_resolve_pr_does_not_run_for_them(self) -> None:
-        for login in (
-            gate.DEVIN_REVIEW_LOGIN,
-            gate.CODEX_REVIEW_LOGIN,
-            "cursor[bot]",
-        ):
-            event = {"review": {"user": {"login": login}}}
-            self.assertFalse(gate.admit_resolve_pr("pull_request_review", event), login)
+    def test_submitted_devin_findings_are_admitted(self) -> None:
+        for state in ("commented", "changes_requested"):
+            event = review_event(login=gate.DEVIN_REVIEW_LOGIN, body="finding")
+            event["review"]["state"] = state
+            self.assertTrue(gate.admit_resolve_pr("pull_request_review", event), state)
+
+    def test_review_admission_requires_exact_bot_identity_action_and_state(self) -> None:
+        cases = [
+            ("login", gate.CODEX_REVIEW_LOGIN),
+            ("login", "cursor[bot]"),
+            ("login", "devin-ai-integration"),
+            ("login", "Devin-ai-integration[bot]"),
+            ("login", "devin-ai-integration[bot] "),
+            ("type", "User"),
+            ("type", "bot"),
+            ("type", None),
+            ("action", "edited"),
+            ("action", "dismissed"),
+            ("action", None),
+            ("state", "approved"),
+            ("state", "pending"),
+            ("state", None),
+        ]
+        for key, value in cases:
+            with self.subTest(key=key, value=value):
+                event = review_event(login=gate.DEVIN_REVIEW_LOGIN, body="finding")
+                target = event if key == "action" else event["review"]
+                if key in {"login", "type"}:
+                    target = event["review"]["user"]
+                target[key] = value
+                self.assertFalse(gate.admit_resolve_pr("pull_request_review", event))
 
     def test_dispatch_is_admitted(self) -> None:
         self.assertTrue(gate.admit_resolve_pr("workflow_dispatch", {}))
@@ -217,7 +259,7 @@ class DecisionTests(unittest.TestCase):
 
     def test_verdict_routes(self) -> None:
         cases = {
-            "FIX": "fix",
+            "FIX": "ignored-fix",
             "READY": "ready",
             "MEDIATE": "mediate",
         }
@@ -227,63 +269,110 @@ class DecisionTests(unittest.TestCase):
                 body=f"looks good\nCODEX-GATE: {verdict}\n",
                 sha=SHA,
                 comments=[],
-                day="2026-10-15",
             )
             self.assertEqual(got["action"], action, verdict)
 
-    def test_verdict_ignores_non_codex_and_caps_fix(self) -> None:
+    def test_verdict_ignores_non_codex(self) -> None:
         self.assertEqual(
             gate.decide_verdict(
-                login="devin-ai-integration[bot]",
+                login=gate.DEVIN_REVIEW_LOGIN,
                 body="CODEX-GATE: FIX",
                 sha=SHA,
                 comments=[],
-                day="2026-10-15",
             )["action"],
             "skip",
         )
-        comments = [gate.fixer_run_marker("2026-10-15")] * 3
-        got = gate.decide_verdict(
-            login="chatgpt-codex-connector[bot]",
-            body="CODEX-GATE: FIX",
-            sha=SHA,
-            comments=comments,
-            day="2026-10-15",
-        )
-        self.assertEqual(got["action"], "cap")
-        bypassed = gate.decide_verdict(
-            login="chatgpt-codex-connector[bot]",
-            body="CODEX-GATE: FIX",
-            sha=SHA,
-            comments=comments,
-            day="2026-10-15",
-            bypass=True,
-        )
-        self.assertEqual(bypassed["action"], "fix")
 
-    def test_fallback_fail_open_and_skips(self) -> None:
-        day = "2026-10-15"
-        self.assertEqual(
-            gate.decide_fallback(sha=SHA, comments=[], reviews=[], day=day)["action"],
-            "fix",
-        )
-        reviews = [{"user": {"login": "chatgpt-codex-connector[bot]"}, "commit_id": SHA, "body": "CODEX-GATE: READY"}]
-        self.assertEqual(
-            gate.decide_fallback(sha=SHA, comments=[], reviews=reviews, day=day)["action"],
-            "has-verdict",
-        )
-        self.assertEqual(
-            gate.decide_fallback(
-                sha=SHA, comments=[gate.acted_marker(SHA)], reviews=[], day=day
-            )["action"],
-            "already-acted",
-        )
-        self.assertEqual(
-            gate.decide_fallback(
-                sha=SHA, comments=[gate.fixer_run_marker(day)] * 3, reviews=[], day=day
-            )["action"],
-            "cap",
-        )
+    def test_historical_fix_markers_allow_ready_and_mediate(self) -> None:
+        comments = [gate.acted_comment_body(SHA, "FIX"), f"{gate.acted_marker(SHA)}\nCodex gate: dispatching batched Devin review fixer (timeout) on 2026-10-15."]
+        for verdict in ("READY", "MEDIATE"):
+            got = gate.decide_verdict(login=gate.CODEX_REVIEW_LOGIN, body=f"CODEX-GATE: {verdict}", sha=SHA, comments=comments)
+            self.assertEqual(got["action"], verdict.lower())
+
+    def test_verdict_deduplicates_only_the_acted_head(self) -> None:
+        for verdict in ("READY", "MEDIATE"):
+            for head, expected in ((SHA, "already-acted" if verdict == "MEDIATE" else "ready"), ("b" * 40, verdict.lower())):
+                with self.subTest(verdict=verdict, head=head):
+                    got = gate.decide_verdict(
+                        login=gate.CODEX_REVIEW_LOGIN,
+                        body=f"CODEX-GATE: {verdict}",
+                        sha=head,
+                        comments=[gate.acted_comment_body(SHA, verdict)],
+                    )
+                    self.assertEqual(got["action"], expected)
+
+    def test_legacy_fallback_is_inert(self) -> None:
+        gh = mock.Mock(side_effect=AssertionError("fallback must not access GitHub"))
+        with mock.patch.object(gate, "emit"):
+            self.assertEqual(gate.run_fallback(REPO, "7", SHA, "pat", "token", "master", gh=gh), {"action": "ignored-fallback"})
+        gh.assert_not_called()
+
+
+class MainModeTests(unittest.TestCase):
+    def check_mode(self, mode, argv, expected, *, process_argv=None) -> None:
+        event = pr_event()
+        with tempfile.TemporaryDirectory() as tmp:
+            event_path = Path(tmp) / "event.json"
+            event_path.write_text(json.dumps(event), encoding="utf-8")
+            env = {
+                "GITHUB_REPOSITORY": REPO,
+                "GITHUB_EVENT_PATH": str(event_path),
+                "CODEX_TRIGGER_PAT": "test-pat",
+                "GH_TOKEN": "test-read-token",
+                "DEFAULT_BRANCH": "master",
+                "PR_NUMBER": "7",
+                "HEAD_SHA": SHA,
+            }
+            if mode is not None:
+                env["CODEX_GATE_MODE"] = mode
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch.object(sys, "argv", process_argv or ["codex_gate.py"]),
+                mock.patch.object(gate, "run_request") as request,
+                mock.patch.object(gate, "run_verdict") as verdict,
+                mock.patch.object(gate, "run_fallback") as fallback,
+                mock.patch.object(gate, "emit") as emit,
+            ):
+                self.assertEqual(gate.main(argv), 0)
+                handlers = {"request": request, "verdict": verdict, "fallback": fallback}
+                for name, handler in handlers.items():
+                    self.assertEqual(handler.call_count, int(name == expected), name)
+                if expected == "request":
+                    request.assert_called_once_with(event, REPO, "test-pat", "test-read-token")
+                elif expected == "verdict":
+                    verdict.assert_called_once_with(event, REPO, "test-pat", "test-read-token", "master")
+                elif expected == "fallback":
+                    fallback.assert_called_once_with(REPO, "7", SHA, "test-pat", "test-read-token", "master")
+                else:
+                    emit.assert_called_once_with({"action": "skip", "proceed": "false"})
+                if expected:
+                    emit.assert_not_called()
+
+    def test_environment_selects_each_full_mode(self) -> None:
+        for mode in ("request", "verdict", "fallback"):
+            with self.subTest(mode=mode):
+                self.check_mode(mode, [], mode)
+
+    def test_cli_selects_each_mode_without_environment_override(self) -> None:
+        for mode in ("request", "verdict", "fallback"):
+            with self.subTest(mode=mode):
+                self.check_mode(None, [mode], mode)
+
+    def test_environment_takes_precedence_over_cli(self) -> None:
+        self.check_mode("request", ["verdict"], "request")
+        self.check_mode("unknown", ["request"], None)
+
+    def test_missing_and_unknown_modes_skip(self) -> None:
+        self.check_mode(None, [], None)
+        self.check_mode(None, ["unknown"], None)
+        self.check_mode("unknown", [], None)
+
+    def test_empty_environment_falls_back_to_cli(self) -> None:
+        self.check_mode("", ["fallback"], "fallback")
+
+    def test_none_argv_reads_process_arguments_but_empty_argv_does_not(self) -> None:
+        self.check_mode(None, None, "request", process_argv=["codex_gate.py", "request"])
+        self.check_mode(None, [], None, process_argv=["codex_gate.py", "request"])
 
 
 class ListingParseTests(unittest.TestCase):
@@ -330,7 +419,29 @@ class ListingParseTests(unittest.TestCase):
         self.assertEqual(n["c"], 1)
 
 
+class ReadyHeadTests(unittest.TestCase):
+    def test_only_live_same_repo_open_head_can_be_ready(self):
+        valid = {"state": "open", "draft": False, "head": {"sha": SHA, "repo": {"full_name": REPO}}}
+        self.assertTrue(gate.current_ready_head(REPO, "7", SHA, "read", gh=lambda *args: json.dumps(valid)))
+        for pr in (valid | {"state": "closed"}, valid | {"draft": True},
+                   valid | {"head": {"sha": "b" * 40, "repo": {"full_name": REPO}}},
+                   valid | {"head": {"sha": SHA, "repo": {"full_name": "evil/fork"}}}):
+            self.assertFalse(gate.current_ready_head(REPO, "7", SHA, "read", gh=lambda *args: json.dumps(pr)))
+
+
 class NoticeAndIoTests(unittest.TestCase):
+    def setUp(self):
+        global READY_EVENT_READS
+        READY_EVENT_READS = 0
+        # Existing I/O fixtures isolate routing; current-head validation has its
+        # own behavioral controls below and can be overridden per scenario.
+        patcher = mock.patch.object(gate, "current_ready_head", return_value=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        ready = mock.patch.object(gate, "readiness_blocked", return_value=False)
+        ready.start()
+        self.addCleanup(ready.stop)
+
     def test_run_request_missing_pat_emits_notice_and_does_not_post(self) -> None:
         calls: list[list[str]] = []
 
@@ -372,7 +483,7 @@ class NoticeAndIoTests(unittest.TestCase):
             blob = gh_blob(args)
             if "/comments" in blob and "--input" in args:
                 posted.append(input_text or "")
-                return "{}"
+                return ready_api_reply(args)
             if "/comments?" in blob:
                 return "[]"
             if "/reviews?" in blob:
@@ -392,6 +503,109 @@ class NoticeAndIoTests(unittest.TestCase):
         self.assertIn("@codex review", posted[0])
         self.assertIn(gate.gate_marker(SHA), posted[0])
 
+    def test_paused_findings_block_ready_even_with_old_ready_marker(self) -> None:
+        comments = [{"id": 1, "body": gate.acted_comment_body(SHA, "READY")},
+                    {"id": 2, "body": "trusted pause"}]
+        calls = []
+        def gh(args, token, input_text=None):
+            calls.append((args, input_text))
+            return json.dumps(comments) if "/comments?" in gh_blob(args) else ready_api_reply(args)
+        helper = mock.Mock()
+        helper.pending_ci_intent.return_value = ""
+        helper.label_event_id.return_value = 0
+        helper.latest_pause_id.return_value = 2
+        helper.latest_ready_check.return_value = 0
+        helper.marker.return_value = "checked"
+        helper.readiness_blocked.return_value = True
+        with mock.patch.object(gate, "fixer_helpers", return_value=helper), mock.patch.object(gate, "readiness_blocked", return_value=True), mock.patch.object(gate, "emit"):
+            result = gate.run_verdict(review_event(login=gate.CODEX_REVIEW_LOGIN, body="CODEX-GATE: READY"), REPO, "pat", "read", "master", gh=gh)
+        self.assertEqual(result["action"], "paused-findings")
+        self.assertEqual(len(calls), 3)
+
+    def test_pause_invalidates_old_ready_for_mediate_and_recovered_ready(self) -> None:
+        comments = [{"id": 1, "body": gate.acted_comment_body(SHA, "READY")},
+                    {"id": 2, "body": "trusted pause"}]
+        for verdict in ("MEDIATE", "READY"):
+            calls = []
+            def gh(args, token, input_text=None):
+                calls.append((args, input_text))
+                return json.dumps(comments) if "/comments?" in gh_blob(args) else ready_api_reply(args)
+            helper = mock.Mock()
+            helper.pending_ci_intent.return_value = ""
+            helper.label_event_id.return_value = 0
+            helper.latest_pause_id.return_value = 2
+            helper.latest_ready_check.return_value = 0
+            helper.bot.return_value = False
+            helper.marker.return_value = "checked"
+            helper.readiness_blocked.return_value = False
+            with mock.patch.object(gate, "fixer_helpers", return_value=helper), mock.patch.object(gate, "emit"):
+                result = gate.run_verdict(review_event(login=gate.CODEX_REVIEW_LOGIN, body=f"CODEX-GATE: {verdict}"), REPO, "pat", "read", "master", gh=gh)
+            self.assertEqual(result["action"], verdict.lower())
+            self.assertGreater(len(calls), 1)
+            if verdict == "MEDIATE":
+                helper.readiness_blocked.assert_not_called()
+
+    def test_pause_or_head_change_after_label_revokes_without_terminal_ready(self) -> None:
+        for changed_head in (False, True):
+            calls = []
+            def gh(args, token, input_text=None):
+                calls.append((args, input_text or ""))
+                return "[]" if "/comments?" in gh_blob(args) else ready_api_reply(args)
+            helper = mock.Mock()
+            helper.pending_ci_intent.return_value = ""
+            helper.label_event_id.return_value = 0
+            helper.latest_pause_id.return_value = 0
+            helper.readiness_blocked.side_effect = [False, True]
+            helper.marker.return_value = "checked"
+            helper.records.return_value = [{"event": 5}]
+            helper.begin_ci_intent.return_value = {"nonce": "a" * 32}
+            helper.record_ci_ownership.side_effect = lambda *args, **kwargs: args[-1](REPO, "7", "owned")
+            head_checks = [True, False] if changed_head else [True, True]
+            with mock.patch.object(gate, "fixer_helpers", return_value=helper), \
+                 mock.patch.object(gate, "current_ready_head", side_effect=head_checks), \
+                 mock.patch.object(gate, "readiness_blocked", side_effect=[False, True]), \
+                 mock.patch.object(gate, "emit"):
+                result = gate.run_verdict(review_event(login=gate.CODEX_REVIEW_LOGIN, body="CODEX-GATE: READY"), REPO, "pat", "read", "master", gh=gh)
+            self.assertEqual(result["action"], "paused-findings")
+            self.assertTrue(any("labels" in gh_blob(args) for args, _ in calls))
+            helper.rollback_ci_event.assert_called_once()
+            self.assertFalse(any("Codex gate acted: READY" in body for _, body in calls))
+
+    def test_ready_failure_rolls_back_only_proven_event_and_reports_unknown_cleanup(self) -> None:
+        for failure in ("ownership", "postcheck", "terminal", "cleanup", "human-override"):
+            calls, event_reads, comment_reads = [], 0, 0
+            def gh(args, token, input_text=None):
+                nonlocal event_reads, comment_reads
+                calls.append((args, input_text or ""))
+                blob = gh_blob(args)
+                if "/events?" in blob:
+                    event_reads += 1
+                    if event_reads <= 2:
+                        return "[]"
+                    if failure == "cleanup" and event_reads >= 4:
+                        raise OSError("unavailable during cleanup")
+                    identity = 6 if failure == "human-override" and event_reads >= 4 else 5
+                    return json.dumps([{"id": identity, "event": "labeled", "label": {"name": "ci:full"}, "actor": {"login": "gate-writer" if identity == 5 else "human"}}])
+                if "/comments?" in blob:
+                    comment_reads += 1
+                    if failure == "postcheck" and comment_reads > 2:
+                        raise OSError("postcheck failed")
+                    return "[]"
+                if input_text:
+                    body = json.loads(input_text).get("body", "")
+                    if ((failure in {"ownership", "cleanup", "human-override"} and "claude-fixer-ci-owned:" in body)
+                            or (failure == "checked" and "claude-fixer-ci-checked:" in body)
+                            or (failure == "terminal" and "Codex gate acted: READY" in body)):
+                        raise OSError("receipt post failed")
+                return ready_api_reply(args)
+            with mock.patch.object(gate, "emit"), mock.patch.object(gate, "notice") as notice:
+                result = gate.run_verdict(review_event(login=gate.CODEX_REVIEW_LOGIN, body="CODEX-GATE: READY"), REPO, "pat", "read", "master", gh=gh)
+            self.assertEqual(result["action"], "skip-readiness", failure)
+            deletes = [args for args, _ in calls if "DELETE" in args]
+            self.assertEqual(len(deletes), 0 if failure in {"cleanup", "human-override"} else 1, failure)
+            if failure == "cleanup":
+                self.assertTrue(any("inspect ci:full manually" in str(call) for call in notice.call_args_list))
+
     def test_run_verdict_ready_labels_and_mediate_dispatches(self) -> None:
         calls: list[tuple[list[str], str]] = []
 
@@ -400,7 +614,7 @@ class NoticeAndIoTests(unittest.TestCase):
             blob = gh_blob(args)
             if "/comments?" in blob:
                 return "[]"
-            return "{}"
+            return ready_api_reply(args)
 
         event = review_event(login="chatgpt-codex-connector[bot]", body="CODEX-GATE: READY")
         with tempfile.TemporaryDirectory() as tmp:
@@ -424,33 +638,42 @@ class NoticeAndIoTests(unittest.TestCase):
             any(args[:2] == ["workflow", "run"] and "stuck-thread-watch.yml" in args for args, _ in calls)
         )
 
-    def test_run_verdict_fix_dispatches_claude_workflow(self) -> None:
-        calls: list[list[str]] = []
-        posted: list[str] = []
-
+    def test_run_verdict_fix_never_writes_or_dispatches(self) -> None:
+        calls = []
         def gh(args, token, input_text=None):
             calls.append(list(args))
-            blob = gh_blob(args)
-            if "/comments?" in blob:
-                return "[]"
-            if "--input" in args:
-                posted.append(input_text or "")
-            return "{}"
+            self.assertIsNone(input_text)
+            self.assertEqual(args[:2], ["api", "--paginate"])
+            return "[]"
+        event = review_event(login=gate.CODEX_REVIEW_LOGIN, body="CODEX-GATE: FIX")
+        with mock.patch.object(gate, "emit"):
+            got = gate.run_verdict(event, REPO, "pat", "token", "master", gh=gh)
+        self.assertEqual(got["action"], "ignored-fix")
+        self.assertFalse(any("workflow" in c for c in calls))
 
-        event = review_event(login="chatgpt-codex-connector[bot]", body="CODEX-GATE: FIX")
-        with tempfile.TemporaryDirectory() as tmp:
-            os.environ["GITHUB_OUTPUT"] = str(Path(tmp) / "out")
-            try:
-                gate.run_verdict(event, REPO, "pat", "read-token", "master", gh=gh, day="2026-10-15")
-            finally:
-                os.environ.pop("GITHUB_OUTPUT", None)
-        self.assertTrue(any(c[:2] == ["workflow", "run"] and "claude.yml" in c for c in calls))
-        self.assertTrue(any("pr_number=7" in " ".join(c) for c in calls))
-        self.assertTrue(any("codex-gate-acted" in body for body in posted))
-        self.assertFalse(any("codex-fixer-run:" in body for body in posted))
-        run_idx = next(i for i, c in enumerate(calls) if c[:2] == ["workflow", "run"])
-        post_idx = next(i for i, c in enumerate(calls) if "--input" in c)
-        self.assertLess(run_idx, post_idx)
+    def test_fix_and_silence_have_no_side_effects(self) -> None:
+        for body, expected in (("CODEX-GATE: FIX", "ignored-fix"), ("pending findings", "no-verdict"), ("", "no-verdict")):
+            gh = mock.Mock(return_value="[]")
+            with mock.patch.object(gate, "emit"):
+                got = gate.run_verdict(review_event(login=gate.CODEX_REVIEW_LOGIN, body=body), REPO, "pat", "token", "master", gh=gh)
+            self.assertEqual(got["action"], expected)
+            for call in gh.call_args_list:
+                self.assertEqual(call.args[0][:2], ["api", "--paginate"])
+                self.assertLess(len(call.args), 3)
+
+    def test_ready_and_mediate_work_after_legacy_fix_marker(self) -> None:
+        for verdict in ("READY", "MEDIATE"):
+            calls = []
+            def gh(args, token, input_text=None):
+                calls.append((args, input_text))
+                if "/comments?" in gh_blob(args):
+                    return json.dumps([{"id": 1, "body": gate.acted_comment_body(SHA, "FIX")}])
+                return ready_api_reply(args)
+            with mock.patch.object(gate, "emit"):
+                got = gate.run_verdict(review_event(login=gate.CODEX_REVIEW_LOGIN, body=f"CODEX-GATE: {verdict}"), REPO, "pat", "token", "master", gh=gh)
+            self.assertEqual(got["action"], verdict.lower())
+            self.assertTrue(any(("/labels" in gh_blob(a)) if verdict == "READY" else ("stuck-thread-watch.yml" in a) for a, _ in calls))
+            self.assertFalse(any("claude.yml" in a for a, _ in calls))
 
     def test_failed_dispatch_does_not_post_run_or_acted_marker(self) -> None:
         posted: list[str] = []
@@ -463,7 +686,7 @@ class NoticeAndIoTests(unittest.TestCase):
                 return "[]"
             if "--input" in args:
                 posted.append(input_text or "")
-            return "{}"
+            return ready_api_reply(args)
 
         event = review_event(login="chatgpt-codex-connector[bot]", body="CODEX-GATE: FIX")
         with tempfile.TemporaryDirectory() as tmp:
@@ -479,7 +702,7 @@ class NoticeAndIoTests(unittest.TestCase):
 
         def gh(args, token, input_text=None):
             calls.append(list(args))
-            return "{}"
+            return ready_api_reply(args)
 
         event = review_event(login="chatgpt-codex-connector[bot]", body="CODEX-GATE: READY")
         event["pull_request"]["head"]["repo"]["full_name"] = "evil/fork"
@@ -520,7 +743,7 @@ class NoticeAndIoTests(unittest.TestCase):
                 return "[]"
             if "/reviews?" in joined:
                 return "[]"
-            return "{}"
+            return ready_api_reply(args)
 
         event = pr_event()
         with tempfile.TemporaryDirectory() as tmp:
@@ -531,7 +754,215 @@ class NoticeAndIoTests(unittest.TestCase):
                 os.environ.pop("GITHUB_OUTPUT", None)
 
 
+class RealHelperLifecycleTests(unittest.TestCase):
+    def test_gh_retains_rejection_for_classifier_without_printing_stderr(self):
+        result = subprocess.CompletedProcess(["gh"], 1, "", "Forbidden (HTTP 403)")
+        with mock.patch.object(gate.subprocess, "run", return_value=result), mock.patch("builtins.print") as printed:
+            with self.assertRaises(subprocess.CalledProcessError) as raised:
+                gate._gh(["api", "example"], "token")
+        self.assertEqual(gate.fixer_helpers().known_label_rejection(raised.exception), 403)
+        printed.assert_not_called()
+
+    def test_real_helper_lifecycle_race_recovery_and_human_override(self):
+        helper = gate.fixer_helpers()
+        state = {"head": SHA, "pending": [], "comments": [], "events": [], "label": False, "race": False}
+        writer = {"login": "gate-writer", "id": 99, "type": "User"}
+        actions = {"login": "github-actions[bot]", "id": helper.ACTIONS_ID, "type": "Bot"}
+        item = {"root": 1, "thread": "PRRT_1", "fingerprint": "f" * 64}
+        clock = 0
+        def stamp():
+            nonlocal clock
+            clock += 1
+            if state.get("same_stamp"):
+                return "2026-10-16T00:00:00Z"
+            return f"2026-10-16T00:00:00.{clock:06d}Z"
+        def event(kind, actor):
+            state["events"].append({"id": len(state["events"]) + 1, "event": kind, "created_at": stamp(), "label": {"name": "ci:full"}, "actor": actor})
+        def gh(args, token, input_text=None):
+            path = next((a for a in args if str(a).startswith("repos/")), "")
+            if args[-1] == "user":
+                return json.dumps(writer)
+            if "/events?" in path:
+                if state.get("lag_reads", 0):
+                    state["lag_reads"] -= 1
+                    return "[]"
+                return json.dumps(state["events"])
+            if "/comments?" in path:
+                if state.pop("fail_next_comments", False):
+                    raise OSError("transient postcheck")
+                return json.dumps(state["comments"])
+            if "/collaborators/" in path and path.endswith("/permission"):
+                return json.dumps({"permission": state.get("permission", "write")})
+            if path == f"repos/{REPO}/pulls/7":
+                return json.dumps({"state": "open", "draft": False, "head": {"sha": state["head"], "repo": {"full_name": REPO}}, "labels": [{"name": "ci:full"}] if state["label"] else []})
+            if "/labels/ci:full" in path and "DELETE" in args:
+                state["label"] = False
+                event("unlabeled", actions)
+                return "{}"
+            if args[:2] == ["workflow", "run"]:
+                return "{}"
+            if path.endswith("/labels"):
+                if state.pop("reject_label_post", False) or state.get("fail_rejected_receipt"):
+                    raise subprocess.CalledProcessError(1, ["gh", "api"], stderr="Forbidden (HTTP 403)")
+                if state.pop("fail_label_post", False):
+                    raise OSError("POST failed before mutation")
+                if not state["label"]:
+                    state["label"] = True
+                    event("labeled", writer)
+                    if state.pop("lag_after_label", False):
+                        state["lag_reads"] = 3
+                return "{}"
+            if path.endswith("/comments") and input_text:
+                body = json.loads(input_text)["body"]
+                if "claude-fixer-ci-rejected:" in body and state.pop("fail_rejected_receipt", False):
+                    raise OSError("rejection receipt POST unavailable")
+                if "claude-fixer-ci-owned:" in body:
+                    if state.pop("fail_owned_post", False):
+                        raise OSError("transient receipt POST")
+                    if state.pop("fail_after_owned", False):
+                        state["fail_next_comments"] = True
+                # Pause after final live check, before terminal comment is written.
+                if state["race"] and "Codex gate acted: READY" in body:
+                    state["race"] = False
+                    state["pending"] = [item]
+                    helper.revoke_owned_ci(REPO, "7", state["head"], get_pages=pages, delete=delete, post_comment=post)
+                state["comments"].append({"id": len(state["comments"]) + 1, "body": body, "created_at": stamp(), "user": writer if token == "pat" else actions})
+                return "{}"
+            raise AssertionError(args)
+        def pages(path):
+            return gate._parse_json_list(gh(["api", "--paginate", path + "?per_page=100"], "read"))
+        def delete(repo, number):
+            gh(["api", "-X", "DELETE", f"repos/{repo}/issues/{number}/labels/ci:full"], "read")
+        def post(repo, number, body):
+            gate.post_comment(repo, number, body, "read", gh=gh)
+        def ready():
+            return gate.run_verdict(review_event(login=gate.CODEX_REVIEW_LOGIN, body="CODEX-GATE: READY", sha=state["head"]), REPO, "pat", "read", "master", gh=gh)
+        with mock.patch.object(gate, "fixer_helpers", return_value=helper), mock.patch.object(helper, "live_state", side_effect=lambda *args, **kwargs: (state["pending"], state["pending"])), mock.patch.object(gate, "emit"):
+            self.assertEqual(ready()["action"], "ready")
+            self.assertTrue(state["label"])
+            before = (len(state["comments"]), len(state["events"]))
+            self.assertEqual(ready()["action"], "ready-present")
+            self.assertEqual(before, (len(state["comments"]), len(state["events"])))
+            state["pending"] = [item]
+            self.assertEqual(ready()["action"], "paused-findings")
+            self.assertFalse(state["label"])
+            mediate = gate.run_verdict(review_event(login=gate.CODEX_REVIEW_LOGIN, body="CODEX-GATE: MEDIATE", sha=state["head"]), REPO, "pat", "read", "master", gh=gh)
+            self.assertEqual(mediate["action"], "mediate")
+            # A human can resolve the handoff without changing the commit.
+            # Authenticated MEDIATE history must not prevent fresh READY.
+            state["pending"] = []
+            state["race"] = True
+            self.assertEqual(ready()["action"], "ready")
+            self.assertFalse(state["label"])
+            state["pending"] = []
+            self.assertEqual(ready()["action"], "ready")
+            self.assertTrue(state["label"])
+            for failure in ("fail_after_owned", "fail_owned_post"):
+                state["pending"] = [item]
+                self.assertEqual(ready()["action"], "paused-findings")
+                state["pending"] = []
+                state[failure] = True
+                state["same_stamp"] = True
+                self.assertEqual(ready()["action"], "skip-readiness")
+                self.assertFalse(state["label"])
+                self.assertEqual(ready()["action"], "ready")
+                self.assertTrue(state["label"])
+                state["same_stamp"] = False
+            state["pending"] = [item]
+            self.assertEqual(ready()["action"], "paused-findings")
+            state["pending"] = []
+            state["reject_label_post"] = True
+            with mock.patch.object(gate, "notice") as notices:
+                self.assertEqual(ready()["action"], "skip-readiness")
+            self.assertTrue(any("safely retry" in str(call) for call in notices.call_args_list))
+            self.assertFalse(any("inspect ci:full manually" in str(call) for call in notices.call_args_list))
+            self.assertFalse(state["label"])
+            self.assertEqual(ready()["action"], "ready")
+            for failure in ("fail_label_post", "lag_after_label", "fail_rejected_receipt"):
+                state["pending"] = [item]
+                self.assertEqual(ready()["action"], "paused-findings")
+                state["pending"] = []
+                state[failure] = True
+                self.assertEqual(ready()["action"], "skip-readiness")
+                # Visibility can recover, but an uncertain old transaction is
+                # never silently adopted as a new owned label on the next run.
+                state["lag_reads"] = 0
+                before_owned = sum("claude-fixer-ci-owned:" in c["body"] for c in state["comments"])
+                self.assertEqual(ready()["action"], "unverified-ci-label")
+                self.assertEqual(before_owned, sum("claude-fixer-ci-owned:" in c["body"] for c in state["comments"]))
+                if failure == "lag_after_label":
+                    nonce = helper.pending_ci_intent(state["events"], state["comments"])
+                    command = f"/claude-fixer reconcile-label {nonce} {state['head']}"
+                    state["comments"].append({"id": len(state["comments"]) + 1, "body": command,
+                        "user": {"login": "human", "type": "User", "id": 123}})
+                    state["permission"] = "read"
+                    self.assertEqual(ready()["action"], "unverified-ci-label")
+                    state["permission"] = "write"
+                    state["pending"] = [item]
+                    self.assertEqual(ready()["action"], "paused-findings")
+                    state["pending"] = []
+                    self.assertEqual(ready()["action"], "ready-present")
+                    # Confirmation did not adopt the ambiguous existing label.
+                    self.assertEqual(before_owned, sum("claude-fixer-ci-owned:" in c["body"] for c in state["comments"]))
+                # Explicit human remove/readd settles the uncertainty. If POST
+                # never took effect, the human first adds then removes it.
+                human = {"login": "human", "id": 123, "type": "User"}
+                if not state["label"]:
+                    event("labeled", human)
+                event("unlabeled", human)
+                event("labeled", human)
+                state["label"] = True
+                self.assertEqual(ready()["action"], "ready-present")
+                self.assertEqual(before_owned, sum("claude-fixer-ci-owned:" in c["body"] for c in state["comments"]))
+                # Restore a fresh, unowned starting state for the next scenario.
+                state["events"] = []
+                state["comments"] = []
+                state["label"] = False
+                self.assertEqual(ready()["action"], "ready")
+            state["head"] = "b" * 40
+            stale = gate.run_verdict(review_event(login=gate.CODEX_REVIEW_LOGIN, body="CODEX-GATE: READY", sha=SHA), REPO, "pat", "read", "master", gh=gh)
+            self.assertEqual(stale["action"], "skip-stale-head")
+            self.assertTrue(state["label"])
+            state["pending"] = [item]
+            self.assertEqual(ready()["action"], "paused-findings")
+            self.assertFalse(state["label"])
+            state["pending"] = []
+            self.assertEqual(ready()["action"], "ready")
+            # A verified human removal remains authoritative on its observed head.
+            state["label"] = False
+            event("unlabeled", {"login": "human", "id": 123, "type": "User"})
+            state["head"] = "c" * 40
+            self.assertEqual(ready()["action"], "preserve-human-removal")
+            self.assertFalse(state["label"])
+            # Repeated same-head READY preserves the removal without comment spam.
+            count = len(state["comments"])
+            self.assertEqual(ready()["action"], "preserve-human-removal")
+            self.assertEqual(len(state["comments"]), count)
+            # A fresh READY for a subsequent head has a new authorization scope.
+            state["head"] = "d" * 40
+            self.assertEqual(ready()["action"], "ready")
+            self.assertTrue(state["label"])
+
+    def test_terminal_dedup_requires_authenticated_gate_writer(self):
+        helper = gate.fixer_helpers()
+        writer = {"login": "gate-writer", "id": 99, "type": "User"}
+        for verdict in ("READY", "MEDIATE"):
+            body = gate.acted_comment_body(SHA, verdict)
+            forged = {"id": 1, "body": body, "user": {"login": "gate-writer", "id": 1, "type": "User"}}
+            self.assertEqual(gate.comments_after_pause(SHA, [forged], writer), [])
+            self.assertEqual(gate.comments_after_pause(SHA, [forged | {"user": writer}], writer), [] if verdict == "READY" else [body])
+
+
 class WorkflowStructureTests(unittest.TestCase):
+    def test_only_verdict_job_gets_authenticated_receipt_write_permission(self):
+        text = WORKFLOW_PATH.read_text()
+        request, verdict = text.split("  verdict:", 1)
+        self.assertNotIn("issues: write", request)
+        self.assertEqual(verdict.count("issues: write"), 1)
+        self.assertIn("contents: read", verdict)
+        self.assertIn("pull-requests: read", verdict)
+        self.assertIn("scripts/ci/claude_fixer_receipts.py", verdict)
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.text = WORKFLOW_PATH.read_text(encoding="utf-8")
@@ -542,9 +973,12 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn("runs-on: ubuntu-latest", self.text)
         self.assertNotIn("blacksmith", self.text)
 
-    def test_wait_is_twenty_minutes(self) -> None:
-        self.assertIn('WAIT_SECONDS: "1200"', self.text)
-        self.assertIn('sleep "$WAIT_SECONDS"', self.text)
+    def test_no_wait_or_timeout_dispatch_job(self) -> None:
+        self.assertNotIn("WAIT_SECONDS", self.text)
+        self.assertNotIn("  wait:", self.text)
+        self.assertNotIn("  fallback:", self.text)
+        self.assertNotIn("sleep ", self.text)
+        self.assertNotIn("FIXER_WORKFLOW", GATE_PATH.read_text())
 
     def test_missing_secret_is_notice_not_failure(self) -> None:
         source = GATE_PATH.read_text(encoding="utf-8")
@@ -572,7 +1006,7 @@ class WorkflowStructureTests(unittest.TestCase):
             self.text,
         )
 
-    def test_fixer_dispatch_is_not_on_every_devin_review(self) -> None:
+    def test_fixer_accepts_direct_devin_and_dispatch_triggers(self) -> None:
         start = self.fixer.index("  devin-review-fix:\n")
         nxt = self.fixer.find("\n  ", start + 4)
         while nxt != -1 and self.fixer[nxt + 3 : nxt + 4] in (" ", "\t"):
@@ -580,6 +1014,7 @@ class WorkflowStructureTests(unittest.TestCase):
         job = self.fixer[start:] if nxt == -1 else self.fixer[start:nxt]
         self.assertIn("workflow_dispatch", job)
         self.assertIn("repository_dispatch", job)
+        self.assertIn("pull_request_review", job)
 
     def test_agents_code_review_rules(self) -> None:
         self.assertIn("## Code Review Rules", self.agents)

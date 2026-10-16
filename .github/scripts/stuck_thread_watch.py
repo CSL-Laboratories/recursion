@@ -242,6 +242,7 @@ class Thread:
     line: int | None
     comments: tuple[Comment, ...]
     is_resolved: bool = False
+    failure_evidence: str = ""
 
 
 @dataclass(frozen=True)
@@ -633,6 +634,8 @@ def classify_thread(
         return "not-devin"
     if not for_rollup and already_mediated(thread, issue_comments, cfg):
         return "mediated"
+    if thread.failure_evidence:
+        return "stuck-fixer-failed"
     claude = claude_comments(thread, cfg)
     if not claude:
         return "no-claude"
@@ -672,6 +675,7 @@ def mediation_body(
     devin = first_devin(thread, cfg)
     claude = last_claude(thread, cfg)
     reason_line = {
+        "stuck-fixer-failed": thread.failure_evidence,
         "stuck-human": "Claude replied that it needs a human / could not fix this thread.",
         "stuck-timeout": (
             f"The thread is still unresolved more than {cfg.stuck_after_hours:g} "
@@ -1807,10 +1811,28 @@ def resolve_eligible_thread(
     return pull, True
 
 
+
+def with_failure_evidence(pull, cfg, collector):
+    if collector is None:
+        return pull, None
+    import hashlib
+    evidence, failures = collector(cfg.repo, pull.number)
+    threads = []
+    for thread in pull.threads:
+        proof = failures.get(thread.id)
+        if (proof and thread.comments and not thread.is_resolved
+                and hashlib.sha256(thread.comments[0].body.encode()).hexdigest() == proof["fingerprint"]):
+            thread = replace(thread, failure_evidence=proof["description"])
+        threads.append(thread)
+    if failures and not evidence.fresh():
+        raise RuntimeError("failure evidence changed")
+    return replace(pull, threads=tuple(threads)), evidence if failures else None
+
 def scan(
     cfg: Config,
     github: GitHubClient,
     linear: LinearClient | None,
+    failure_collector=None,
 ) -> Counters:
     counters = Counters()
     if not cfg.github_token:
@@ -1871,8 +1893,15 @@ def scan(
                 except Exception as extra_exc:  # noqa: BLE001
                     notice(f"Linear cancel skipped: {extra_exc}")
             continue
+        failure_unknown = False
+        try:
+            pull, failure_evidence = with_failure_evidence(pull, cfg, failure_collector)
+        except Exception:  # noqa: BLE001 - refuse new intake, retain ordinary mediation/resolution
+            notice(f"PR #{pull.number}: failure evidence unverified; preserve Linear roll-up")
+            failure_evidence, failure_unknown = None, True
+        rollup = stuck_threads(pull, cfg, for_rollup=True)
         linear_url = ""
-        if cfg.linear_enabled and linear is not None:
+        if cfg.linear_enabled and linear is not None and not failure_unknown:
             try:
                 if rollup:
                     if not cfg.linear_api_key:
@@ -1910,6 +1939,13 @@ def scan(
                     f"PR #{pull.number} {thread.id}"
                 )
                 continue
+            if thread.failure_evidence:
+                try:
+                    if not failure_evidence.fresh():
+                        continue
+                except Exception:  # noqa: BLE001 - independently eligible ordinary threads continue
+                    notice(f"PR #{pull.number}: failure evidence recheck unavailable")
+                    continue
             posted = mediate_thread(
                 pull, thread, cfg, github, reason, counters, linear_url=linear_url
             )
@@ -1989,6 +2025,11 @@ def scan(
                 if extra is None or skip_pr_reason(extra) in {"closed", "not-open", "draft"}:
                     cancel_linear_rollup(issue, linear, counters)
                     continue
+                try:
+                    extra, _ = with_failure_evidence(extra, cfg, failure_collector)
+                except Exception:  # noqa: BLE001 - preserve this roll-up and inspect the next PR
+                    notice(f"PR #{extra.number}: preserve roll-up; failure evidence unavailable")
+                    continue
                 if not stuck_threads(extra, cfg, for_rollup=True):
                     cancel_linear_rollup(issue, linear, counters)
         except Exception as extra_exc:  # noqa: BLE001
@@ -2019,12 +2060,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+
+def load_failure_collector():
+    """Load the checked-in, read-only adapter; no workflow or permission change."""
+    import importlib.util
+    from pathlib import Path
+    path = Path(__file__).resolve().parents[2] / "scripts/ci/fixer_failure_escalation.py"
+    spec = importlib.util.spec_from_file_location("fixer_failure_escalation", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.collect
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     cfg = Config.from_env(dry_run=args.dry_run)
     github = GitHubClient(cfg)
     linear = LinearClient(cfg) if cfg.linear_enabled and cfg.linear_api_key else None
-    return exit_code(scan(cfg, github, linear))
+    return exit_code(scan(cfg, github, linear, failure_collector=load_failure_collector()))
 
 
 if __name__ == "__main__":

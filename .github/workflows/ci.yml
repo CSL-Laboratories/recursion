@@ -12,6 +12,13 @@
 # - delegated-q check.py --mode execute — Owner-gated scientific admission;
 #   needs secrets, a trusted controller, and live resource observations
 # - tools/check_next_phase.py — needs Java/TLA+, not the current product suite
+#
+# PRs also run tools/perf_ci.py inside the linux job. It times the provider-free
+# planning kernel against the PR base and warns above a 10% slowdown. That
+# warning does not fail the required linux check, and it does not start a
+# second runner. The step is capped at one minute with continue-on-error.
+# `timeout 55` lets the shell emit ::warning:: on hang; timeout-minutes is a
+# backstop, and a follow-up step warns if that backstop kills the shell.
 name: CI
 
 on:
@@ -70,6 +77,22 @@ jobs:
         env:
           CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: python -X utf8 -B tools/ci_gate.py --force
+
+      # Same job and runner as the gate. Slowdowns warn; a crash, timeout, or
+      # missing measurement is advisory. `timeout 55` keeps || runnable;
+      # timeout-minutes: 1 is a backstop whose failure is warned below.
+      - name: Performance regression check
+        id: perf
+        if: github.event_name == 'pull_request' && steps.paths.outputs.run_full == 'true'
+        timeout-minutes: 1
+        continue-on-error: true
+        env:
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: timeout 55 python -X utf8 -B tools/perf_ci.py || echo "::warning::Performance measurement failed, timed out, or is unavailable"
+
+      - name: Warn if performance measurement failed
+        if: always() && steps.perf.outcome == 'failure'
+        run: echo "::warning::Performance measurement failed, timed out, or is unavailable"
 
       # Public-scope (and whitespace) must still run when the suite is skipped.
       - name: Docs-only lightweight checks

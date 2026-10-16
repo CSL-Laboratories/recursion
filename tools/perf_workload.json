@@ -1,0 +1,291 @@
+{
+  "frozen_on": "2026-10-15",
+  "source_fixture": "scripts/tests/v3/planning/fixtures/F-M1A-002.json",
+  "source_case": "decode",
+  "command_json": "{\"actor_id\":\"OWNER-LUCAS\",\"auth_ref\":\"AUTH-UNKNOWN\",\"candidate_digest\":\"0e50f4ee832315002eff8efad7553d238fd5274b637b824cb5381b1973b634df\",\"command_id\":\"CMD-F-M1A-002-decode-01\",\"command_schema_version\":\"m1a-command-1\",\"command_type\":\"record-owner-intent\",\"content_digest\":\"8990a19a2f6b88ab4b01ebe0a4162841d32010af70453432e3d21d83af1fc93c\",\"expected_state_digest\":\"f858baa16245c716e0d4caec0b7a6020d80c77a1b6173d749a25573f661f75de\",\"expected_state_version\":0,\"goal_ref\":null,\"lease_ref\":null,\"logical_time\":1,\"payload\":{\"causation_id\":\"CMD-F-M1A-002-decode-01\",\"content_digest\":\"f46871ce1a254b7c4f6575bef53bbbceb57fdcea4dc1534dbc06d25f467bb589\",\"correlation_id\":\"CORR-M1A\",\"created_by_actor_id\":\"OWNER-LUCAS\",\"created_logical_time\":1,\"created_under_lease\":null,\"id\":\"INTENT-UNKNOWN-AUTH\",\"object_type\":\"owner-intent\",\"payload\":{\"intent_text\":\"Unknown authority must refuse.\",\"privacy_policy_ref\":{\"content_digest\":\"49b764f8e8bad681fcb62a8662f156f67808d236021e3e853777aa9bf05d7d22\",\"policy_id\":\"POLICY-PRIVACY\",\"policy_version\":1},\"source_digest\":\"350f165d9b06856e02696f73476a4ad3376dbab2ebbe52018b4c0aebacad76ef\",\"source_kind\":\"owner-prompt\",\"supersedes_ref\":null},\"schema_version\":\"m1a-owner-intent-1\",\"version\":1},\"payload_digest\":\"0e50f4ee832315002eff8efad7553d238fd5274b637b824cb5381b1973b634df\",\"plan_ref\":null}",
+  "policies": [
+    {
+      "accepted_evidence_types": [],
+      "account_class_ids": [],
+      "allowed_command_types": [
+        "accept-goal-spec",
+        "amend-goal-spec",
+        "apply-pause",
+        "derive-work-packet",
+        "propose-plan-revision",
+        "propose-replan",
+        "propose-retry",
+        "raise-blocker",
+        "raise-escalation",
+        "record-capacity-observation",
+        "record-checkpoint",
+        "record-effect-observation",
+        "record-owner-intent",
+        "record-owner-verifier-exception",
+        "replace-executive-lease",
+        "replace-route",
+        "replace-work-lease",
+        "reserve-budget",
+        "start-arm-run",
+        "submit-gate-result",
+        "submit-plan-verifier-decision",
+        "submit-worker-result"
+      ],
+      "allowed_roles": [
+        "arm",
+        "head",
+        "kernel-fixture-gate",
+        "owner",
+        "verifier",
+        "worker"
+      ],
+      "allowed_spend_classes": [],
+      "capacity_pool_ids": [],
+      "content_digest": "8ed92af03ad14bc268d88a6634456990993efcbea8ab31badcb04794ff7688a0",
+      "egress_at_most_edges": [],
+      "egress_class_ids": [],
+      "failure_capability_requirements": [],
+      "operative_pause_mode": "current-immediate",
+      "owner_verifier_exception_allowed": false,
+      "policy_id": "POLICY-AUTHORITY",
+      "policy_kind": "authority",
+      "policy_schema_version": "m1a-policy-fixture-1",
+      "policy_version": 1,
+      "privacy_at_most_edges": [],
+      "privacy_class_ids": [],
+      "representable_future_pause_modes": [],
+      "required_verifier_dimensions": [],
+      "retry_maximum": 0,
+      "route_ids": []
+    },
+    {
+      "accepted_evidence_types": [],
+      "account_class_ids": [],
+      "allowed_command_types": [],
+      "allowed_roles": [],
+      "allowed_spend_classes": [],
+      "capacity_pool_ids": [],
+      "content_digest": "d970e45be5abd5cbfc5730de46167e427e418d9ec851b006d4d259822e9097bd",
+      "egress_at_most_edges": [],
+      "egress_class_ids": [],
+      "failure_capability_requirements": [],
+      "operative_pause_mode": "current-immediate",
+      "owner_verifier_exception_allowed": true,
+      "policy_id": "POLICY-CONSTITUTION",
+      "policy_kind": "constitution",
+      "policy_schema_version": "m1a-policy-fixture-1",
+      "policy_version": 1,
+      "privacy_at_most_edges": [],
+      "privacy_class_ids": [],
+      "representable_future_pause_modes": [],
+      "required_verifier_dimensions": [],
+      "retry_maximum": 0,
+      "route_ids": []
+    },
+    {
+      "accepted_evidence_types": [
+        {
+          "evidence_types": [
+            "fixture-observation",
+            "gate-output"
+          ],
+          "failure_id": "FAIL-GATE"
+        }
+      ],
+      "account_class_ids": [
+        "ACCOUNT-INCLUDED"
+      ],
+      "allowed_command_types": [],
+      "allowed_roles": [],
+      "allowed_spend_classes": [
+        "included",
+        "none"
+      ],
+      "capacity_pool_ids": [
+        "CAPACITY-INCLUDED"
+      ],
+      "content_digest": "4a037b3d831de1695d49e94bb6f135ff8fa5ccecbde7e611db19fdd6622bf61d",
+      "egress_at_most_edges": [],
+      "egress_class_ids": [],
+      "failure_capability_requirements": [
+        {
+          "capability_ids": [
+            "CAPABILITY-REPAIR"
+          ],
+          "failure_id": "FAIL-GATE"
+        }
+      ],
+      "operative_pause_mode": "current-immediate",
+      "owner_verifier_exception_allowed": false,
+      "policy_id": "POLICY-NOVELTY",
+      "policy_kind": "novelty",
+      "policy_schema_version": "m1a-policy-fixture-1",
+      "policy_version": 1,
+      "privacy_at_most_edges": [],
+      "privacy_class_ids": [],
+      "representable_future_pause_modes": [],
+      "required_verifier_dimensions": [],
+      "retry_maximum": 0,
+      "route_ids": [
+        "ROUTE-INCLUDED",
+        "ROUTE-ZERO"
+      ]
+    },
+    {
+      "accepted_evidence_types": [],
+      "account_class_ids": [],
+      "allowed_command_types": [],
+      "allowed_roles": [],
+      "allowed_spend_classes": [],
+      "capacity_pool_ids": [],
+      "content_digest": "a2ee2a1c66b179baed3cade14f163917cf3d28915960eed12994a72e1707a378",
+      "egress_at_most_edges": [],
+      "egress_class_ids": [],
+      "failure_capability_requirements": [],
+      "operative_pause_mode": "current-immediate",
+      "owner_verifier_exception_allowed": false,
+      "policy_id": "POLICY-PAUSE",
+      "policy_kind": "pause",
+      "policy_schema_version": "m1a-policy-fixture-1",
+      "policy_version": 1,
+      "privacy_at_most_edges": [],
+      "privacy_class_ids": [],
+      "representable_future_pause_modes": [
+        "checkpoint",
+        "drain",
+        "interrupt"
+      ],
+      "required_verifier_dimensions": [],
+      "retry_maximum": 0,
+      "route_ids": []
+    },
+    {
+      "accepted_evidence_types": [],
+      "account_class_ids": [],
+      "allowed_command_types": [],
+      "allowed_roles": [],
+      "allowed_spend_classes": [],
+      "capacity_pool_ids": [],
+      "content_digest": "49b764f8e8bad681fcb62a8662f156f67808d236021e3e853777aa9bf05d7d22",
+      "egress_at_most_edges": [
+        {
+          "greater_or_equal_id": "EGRESS-SYNTHETIC",
+          "less_or_equal_id": "EGRESS-NONE"
+        }
+      ],
+      "egress_class_ids": [
+        "EGRESS-NONE",
+        "EGRESS-SYNTHETIC"
+      ],
+      "failure_capability_requirements": [],
+      "operative_pause_mode": "current-immediate",
+      "owner_verifier_exception_allowed": false,
+      "policy_id": "POLICY-PRIVACY",
+      "policy_kind": "privacy-egress",
+      "policy_schema_version": "m1a-policy-fixture-1",
+      "policy_version": 1,
+      "privacy_at_most_edges": [
+        {
+          "greater_or_equal_id": "PRIVACY-SYNTHETIC",
+          "less_or_equal_id": "PRIVACY-PUBLIC"
+        }
+      ],
+      "privacy_class_ids": [
+        "PRIVACY-PUBLIC",
+        "PRIVACY-SYNTHETIC"
+      ],
+      "representable_future_pause_modes": [],
+      "required_verifier_dimensions": [],
+      "retry_maximum": 0,
+      "route_ids": []
+    },
+    {
+      "accepted_evidence_types": [],
+      "account_class_ids": [],
+      "allowed_command_types": [],
+      "allowed_roles": [],
+      "allowed_spend_classes": [],
+      "capacity_pool_ids": [],
+      "content_digest": "b395609880d404635c18a72b0c507218e2e3b611874e5c1257503ad8839f8bb4",
+      "egress_at_most_edges": [],
+      "egress_class_ids": [],
+      "failure_capability_requirements": [],
+      "operative_pause_mode": "current-immediate",
+      "owner_verifier_exception_allowed": false,
+      "policy_id": "POLICY-RETRY",
+      "policy_kind": "retry",
+      "policy_schema_version": "m1a-policy-fixture-1",
+      "policy_version": 1,
+      "privacy_at_most_edges": [],
+      "privacy_class_ids": [],
+      "representable_future_pause_modes": [],
+      "required_verifier_dimensions": [],
+      "retry_maximum": 2,
+      "route_ids": []
+    },
+    {
+      "accepted_evidence_types": [],
+      "account_class_ids": [
+        "ACCOUNT-INCLUDED"
+      ],
+      "allowed_command_types": [],
+      "allowed_roles": [],
+      "allowed_spend_classes": [
+        "included",
+        "none"
+      ],
+      "capacity_pool_ids": [
+        "CAPACITY-INCLUDED"
+      ],
+      "content_digest": "90fb3a36b6529d0bb6e000e5fd3a1b7035bc7a41d626690c565976fcb716b898",
+      "egress_at_most_edges": [],
+      "egress_class_ids": [],
+      "failure_capability_requirements": [],
+      "operative_pause_mode": "current-immediate",
+      "owner_verifier_exception_allowed": false,
+      "policy_id": "POLICY-ROUTE",
+      "policy_kind": "route-envelope",
+      "policy_schema_version": "m1a-policy-fixture-1",
+      "policy_version": 1,
+      "privacy_at_most_edges": [],
+      "privacy_class_ids": [],
+      "representable_future_pause_modes": [],
+      "required_verifier_dimensions": [],
+      "retry_maximum": 0,
+      "route_ids": [
+        "ROUTE-INCLUDED",
+        "ROUTE-ZERO"
+      ]
+    },
+    {
+      "accepted_evidence_types": [],
+      "account_class_ids": [],
+      "allowed_command_types": [],
+      "allowed_roles": [],
+      "allowed_spend_classes": [],
+      "capacity_pool_ids": [],
+      "content_digest": "39dadbbf16db3090597520fc820ab04b810e8da9b7280ee7053be36ad67506fd",
+      "egress_at_most_edges": [],
+      "egress_class_ids": [],
+      "failure_capability_requirements": [],
+      "operative_pause_mode": "current-immediate",
+      "owner_verifier_exception_allowed": true,
+      "policy_id": "POLICY-VERIFIER",
+      "policy_kind": "verifier",
+      "policy_schema_version": "m1a-policy-fixture-1",
+      "policy_version": 1,
+      "privacy_at_most_edges": [],
+      "privacy_class_ids": [],
+      "representable_future_pause_modes": [],
+      "required_verifier_dimensions": [
+        "actor",
+        "evidence-store",
+        "host",
+        "model-family",
+        "provider"
+      ],
+      "retry_maximum": 0,
+      "route_ids": []
+    }
+  ]
+}

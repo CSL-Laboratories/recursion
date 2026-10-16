@@ -1,0 +1,11 @@
+# provider: grok
+# evidence: synthetic
+# cli-version: unpinned
+# source: https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/14-headless-mode.md
+# retrieved: 2026-10-15
+# note: Synthetic. This is the CSL-27 review stub, not a capture. Event names follow the streaming-json guide (thought, text, usage). The VERDICT line was written for the parser. Grok Build 0.2.116 (2026-07-30) added usage to streaming-json; no binary version emitted this file.
+
+{"type": "thought", "data": "Checking the diff"}
+{"type": "text", "data": "The change matches the task.\n"}
+{"type": "text", "data": "VERDICT approve\n"}
+{"type": "usage", "usage": {"input_tokens": 12, "output_tokens": 4}}

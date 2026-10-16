@@ -1,15 +1,7 @@
-# Codex CI/fixer gate (CSL-102). GitHub-hosted: skipped events here are cheap,
-# and the 20-minute wait must not run on Blacksmith.
-#
-# Posts one `@codex review` per head SHA. Codex ends with
-# `CODEX-GATE: FIX|READY|MEDIATE`. FIX / 20-minute silence → one batched
-# `devin-review-fix` dispatch. READY → `ci:full`. MEDIATE → stuck-thread-watch.
-# Devin directly starts the fixer; FIX/timeout are fallback routes, never prerequisites.
-# No daily dispatch cap. The fixer serializes each PR and enforces its 8-commit guard.
-#
-# Writes go through CODEX_TRIGGER_PAT so they can trigger other workflows.
-# Missing PAT: ::notice:: and skip (no failure). Never print secret values.
-name: Codex CI/fixer gate
+# Codex routes READY to ci:full and MEDIATE to stuck-thread-watch.
+# Devin and human requests alone trigger fixes. Missing/FIX verdicts do nothing.
+# Writes use CODEX_TRIGGER_PAT; missing PAT skips without printing secrets.
+name: Codex CI/mediation gate
 
 on:
   pull_request:
@@ -18,10 +10,7 @@ on:
     types: [submitted]
 
 concurrency:
-  # Isolate review handling from the 20-minute wait. A verdictless Codex
-  # review must not cancel fallback. New pushes still cancel the prior wait.
-  # Each review.id gets its own group so Devin/human reviews cannot cancel a
-  # running Codex verdict. Review runs never cancel-in-progress.
+  # Each review.id isolates verdict handling; new pushes cancel superseded requests.
   group: codex-gate-${{ github.event.pull_request.number }}-${{ github.event_name == 'pull_request_review' && format('verdict-{0}', github.event.review.id) || 'request' }}
   cancel-in-progress: ${{ github.event_name != 'pull_request_review' }}
 
@@ -29,9 +18,6 @@ permissions:
   contents: read
   pull-requests: read
   issues: read
-
-env:
-  WAIT_SECONDS: "1200"
 
 jobs:
   request:
@@ -41,10 +27,6 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    outputs:
-      proceed: ${{ steps.gate.outputs.proceed }}
-      pr_number: ${{ steps.gate.outputs.pr_number }}
-      head_sha: ${{ steps.gate.outputs.head_sha }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -74,48 +56,6 @@ jobs:
             exit 0
           fi
           python3 -X utf8 -B "$script" request
-
-  wait:
-    needs: request
-    if: needs.request.outputs.proceed == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    steps:
-      - name: Wait for a Codex verdict
-        env:
-          WAIT_SECONDS: ${{ env.WAIT_SECONDS }}
-        run: sleep "$WAIT_SECONDS"
-
-  fallback:
-    needs: [request, wait]
-    if: always() && needs.request.outputs.proceed == 'true' && needs.wait.result == 'success'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-          persist-credentials: false
-          sparse-checkout: |
-            scripts/ci/codex_gate.py
-          sparse-checkout-cone-mode: false
-      - name: Dispatch fixer if Codex did not answer
-        env:
-          CODEX_GATE_MODE: fallback
-          CODEX_TRIGGER_PAT: ${{ secrets.CODEX_TRIGGER_PAT }}
-          GH_TOKEN: ${{ github.token }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          PR_NUMBER: ${{ needs.request.outputs.pr_number }}
-          HEAD_SHA: ${{ needs.request.outputs.head_sha }}
-        run: |
-          set -euo pipefail
-          script=scripts/ci/codex_gate.py
-          if [ ! -f "$script" ]; then
-            echo "::notice::$script is not on the default branch yet; skip"
-            exit 0
-          fi
-          python3 -X utf8 -B "$script" fallback
 
   verdict:
     if: >-

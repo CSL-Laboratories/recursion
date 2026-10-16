@@ -91,13 +91,14 @@ class MarkerAndVerdictTests(unittest.TestCase):
         self.assertIn("@codex review", body)
         self.assertNotIn("@claude", body)
         self.assertIn(gate.gate_marker(SHA), body)
-        for verdict in ("FIX", "READY", "MEDIATE"):
+        for verdict in ("READY", "MEDIATE"):
             self.assertIn(f"CODEX-GATE: {verdict}", body)
 
-    def test_dispatch_comment_records_head_without_daily_marker(self) -> None:
-        body = gate.fixer_dispatch_comment_body(SHA, "2026-10-15", "codex-fix")
-        self.assertIn(gate.acted_marker(SHA), body)
-        self.assertNotIn("codex-fixer-run:", body)
+    def test_only_terminal_actions_deduplicate(self) -> None:
+        for body in (gate.acted_marker(SHA), gate.acted_comment_body(SHA, "FIX"), f"{gate.acted_marker(SHA)}\nCodex gate: dispatching batched Devin review fixer (timeout) on 2026-10-15."):
+            self.assertFalse(gate.has_terminal_action(SHA, [body]))
+        for verdict in ("READY", "MEDIATE"):
+            self.assertTrue(gate.has_terminal_action(SHA, [gate.acted_comment_body(SHA, verdict)]))
 
 
 class AdmitResolvePrTests(unittest.TestCase):
@@ -236,7 +237,7 @@ class DecisionTests(unittest.TestCase):
 
     def test_verdict_routes(self) -> None:
         cases = {
-            "FIX": "fix",
+            "FIX": "ignored-fix",
             "READY": "ready",
             "MEDIATE": "mediate",
         }
@@ -260,50 +261,29 @@ class DecisionTests(unittest.TestCase):
             "skip",
         )
 
-    def test_historical_daily_markers_do_not_cap_fixer(self) -> None:
-        comments = ["<!-- codex-fixer-run:2026-10-15 -->"] * 20
-        self.assertEqual(
-            gate.decide_verdict(
-                login=gate.CODEX_REVIEW_LOGIN,
-                body="CODEX-GATE: FIX",
-                sha=SHA,
-                comments=comments,
-            )["action"],
-            "fix",
-        )
-        self.assertEqual(
-            gate.decide_fallback(sha=SHA, comments=comments, reviews=[])["action"],
-            "fix",
-        )
+    def test_historical_fix_markers_allow_ready_and_mediate(self) -> None:
+        comments = [gate.acted_comment_body(SHA, "FIX"), f"{gate.acted_marker(SHA)}\nCodex gate: dispatching batched Devin review fixer (timeout) on 2026-10-15."]
+        for verdict in ("READY", "MEDIATE"):
+            got = gate.decide_verdict(login=gate.CODEX_REVIEW_LOGIN, body=f"CODEX-GATE: {verdict}", sha=SHA, comments=comments)
+            self.assertEqual(got["action"], verdict.lower())
 
     def test_verdict_deduplicates_only_the_acted_head(self) -> None:
-        for verdict in ("FIX", "READY", "MEDIATE"):
+        for verdict in ("READY", "MEDIATE"):
             for head, expected in ((SHA, "already-acted"), ("b" * 40, verdict.lower())):
                 with self.subTest(verdict=verdict, head=head):
                     got = gate.decide_verdict(
                         login=gate.CODEX_REVIEW_LOGIN,
                         body=f"CODEX-GATE: {verdict}",
                         sha=head,
-                        comments=[gate.acted_marker(SHA)],
+                        comments=[gate.acted_comment_body(SHA, "READY")],
                     )
                     self.assertEqual(got["action"], expected)
 
-    def test_fallback_fail_open_and_skips(self) -> None:
-        self.assertEqual(
-            gate.decide_fallback(sha=SHA, comments=[], reviews=[])["action"],
-            "fix",
-        )
-        reviews = [{"user": {"login": "chatgpt-codex-connector[bot]"}, "commit_id": SHA, "body": "CODEX-GATE: READY"}]
-        self.assertEqual(
-            gate.decide_fallback(sha=SHA, comments=[], reviews=reviews)["action"],
-            "has-verdict",
-        )
-        self.assertEqual(
-            gate.decide_fallback(
-                sha=SHA, comments=[gate.acted_marker(SHA)], reviews=[]
-            )["action"],
-            "already-acted",
-        )
+    def test_legacy_fallback_is_inert(self) -> None:
+        gh = mock.Mock(side_effect=AssertionError("fallback must not access GitHub"))
+        with mock.patch.object(gate, "emit"):
+            self.assertEqual(gate.run_fallback(REPO, "7", SHA, "pat", "token", "master", gh=gh), {"action": "ignored-fallback"})
+        gh.assert_not_called()
 
 
 class MainModeTests(unittest.TestCase):
@@ -511,60 +491,42 @@ class NoticeAndIoTests(unittest.TestCase):
             any(args[:2] == ["workflow", "run"] and "stuck-thread-watch.yml" in args for args, _ in calls)
         )
 
-    def test_run_verdict_fix_dispatches_claude_workflow(self) -> None:
-        calls: list[list[str]] = []
-        posted: list[str] = []
-
+    def test_run_verdict_fix_never_writes_or_dispatches(self) -> None:
+        calls = []
         def gh(args, token, input_text=None):
             calls.append(list(args))
-            blob = gh_blob(args)
-            if "/comments?" in blob:
-                return "[]"
-            if "--input" in args:
-                posted.append(input_text or "")
-            return "{}"
+            self.assertIsNone(input_text)
+            self.assertEqual(args[:2], ["api", "--paginate"])
+            return "[]"
+        event = review_event(login=gate.CODEX_REVIEW_LOGIN, body="CODEX-GATE: FIX")
+        with mock.patch.object(gate, "emit"):
+            got = gate.run_verdict(event, REPO, "pat", "token", "master", gh=gh)
+        self.assertEqual(got["action"], "ignored-fix")
+        self.assertFalse(any("workflow" in c for c in calls))
 
-        event = review_event(login="chatgpt-codex-connector[bot]", body="CODEX-GATE: FIX")
-        with tempfile.TemporaryDirectory() as tmp:
-            os.environ["GITHUB_OUTPUT"] = str(Path(tmp) / "out")
-            try:
-                gate.run_verdict(event, REPO, "pat", "read-token", "master", gh=gh, day="2026-10-15")
-            finally:
-                os.environ.pop("GITHUB_OUTPUT", None)
-        self.assertTrue(any(c[:2] == ["workflow", "run"] and "claude.yml" in c for c in calls))
-        self.assertTrue(any("pr_number=7" in " ".join(c) for c in calls))
-        self.assertTrue(any("codex-gate-acted" in body for body in posted))
-        self.assertFalse(any("codex-fixer-run:" in body for body in posted))
-        run_idx = next(i for i, c in enumerate(calls) if c[:2] == ["workflow", "run"])
-        post_idx = next(i for i, c in enumerate(calls) if "--input" in c)
-        self.assertLess(run_idx, post_idx)
+    def test_fix_and_silence_have_no_side_effects(self) -> None:
+        for body, expected in (("CODEX-GATE: FIX", "ignored-fix"), ("pending findings", "no-verdict"), ("", "no-verdict")):
+            gh = mock.Mock(return_value="[]")
+            with mock.patch.object(gate, "emit"):
+                got = gate.run_verdict(review_event(login=gate.CODEX_REVIEW_LOGIN, body=body), REPO, "pat", "token", "master", gh=gh)
+            self.assertEqual(got["action"], expected)
+            for call in gh.call_args_list:
+                self.assertEqual(call.args[0][:2], ["api", "--paginate"])
+                self.assertLess(len(call.args), 3)
 
-    def test_fix_and_fallback_dispatch_after_many_historical_runs(self) -> None:
-        for mode in ("verdict", "fallback"):
-            with self.subTest(mode=mode):
-                calls: list[list[str]] = []
-
-                def gh(args, token, input_text=None):
-                    calls.append(list(args))
-                    if "/comments?" in gh_blob(args):
-                        return json.dumps([
-                            {"body": "<!-- codex-fixer-run:2026-10-15 -->"}
-                        ] * 20)
-                    if "/reviews?" in gh_blob(args):
-                        return "[]"
-                    return "{}"
-
-                with mock.patch.object(gate, "emit"):
-                    if mode == "verdict":
-                        event = review_event(login=gate.CODEX_REVIEW_LOGIN, body="CODEX-GATE: FIX")
-                        got = gate.run_verdict(event, REPO, "pat", "read-token", "master", gh=gh, day="2026-10-15")
-                    else:
-                        got = gate.run_fallback(REPO, "7", SHA, "pat", "read-token", "master", gh=gh, day="2026-10-15")
-                self.assertEqual(got["action"], "fix")
-                dispatches = [args for args in calls if args[:2] == ["workflow", "run"]]
-                self.assertEqual(len(dispatches), 1)
-                self.assertIn("claude.yml", dispatches[0])
-                self.assertNotIn("bypass_cap", gh_blob(dispatches[0]))
+    def test_ready_and_mediate_work_after_legacy_fix_marker(self) -> None:
+        for verdict in ("READY", "MEDIATE"):
+            calls = []
+            def gh(args, token, input_text=None):
+                calls.append((args, input_text))
+                if "/comments?" in gh_blob(args):
+                    return json.dumps([{"body": gate.acted_comment_body(SHA, "FIX")}])
+                return "{}"
+            with mock.patch.object(gate, "emit"):
+                got = gate.run_verdict(review_event(login=gate.CODEX_REVIEW_LOGIN, body=f"CODEX-GATE: {verdict}"), REPO, "pat", "token", "master", gh=gh)
+            self.assertEqual(got["action"], verdict.lower())
+            self.assertTrue(any(("/labels" in gh_blob(a)) if verdict == "READY" else ("stuck-thread-watch.yml" in a) for a, _ in calls))
+            self.assertFalse(any("claude.yml" in a for a, _ in calls))
 
     def test_failed_dispatch_does_not_post_run_or_acted_marker(self) -> None:
         posted: list[str] = []
@@ -656,9 +618,12 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn("runs-on: ubuntu-latest", self.text)
         self.assertNotIn("blacksmith", self.text)
 
-    def test_wait_is_twenty_minutes(self) -> None:
-        self.assertIn('WAIT_SECONDS: "1200"', self.text)
-        self.assertIn('sleep "$WAIT_SECONDS"', self.text)
+    def test_no_wait_or_timeout_dispatch_job(self) -> None:
+        self.assertNotIn("WAIT_SECONDS", self.text)
+        self.assertNotIn("  wait:", self.text)
+        self.assertNotIn("  fallback:", self.text)
+        self.assertNotIn("sleep ", self.text)
+        self.assertNotIn("FIXER_WORKFLOW", GATE_PATH.read_text())
 
     def test_missing_secret_is_notice_not_failure(self) -> None:
         source = GATE_PATH.read_text(encoding="utf-8")

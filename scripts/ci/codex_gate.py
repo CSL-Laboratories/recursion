@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Codex CI/fixer gate. Fail closed on auth; fail open on a missing verdict.
+"""Codex READY/MEDIATE router. Missing verdicts and legacy FIX never dispatch fixes.
 
 Provider-free core (markers, verdicts, admit_resolve_pr) is imported by
 tools/test_codex_gate.py. Live GitHub I/O uses `gh` and is stubbed in tests.
@@ -14,13 +14,11 @@ import re
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
 from typing import Any, Callable
 
 LISTING_ATTEMPTS = 3
 LISTING_RETRY_SECONDS = 1.0
 CI_FULL_LABEL = "ci:full"
-FIXER_WORKFLOW = "claude.yml"
 MEDIATE_WORKFLOW = "stuck-thread-watch.yml"
 GATE_MARKER_PREFIX = "codex-gate"
 ACTED_PREFIX = "codex-gate-acted"
@@ -35,11 +33,6 @@ SAFE_REF_RE = re.compile(r"^(?!.*\.\.)[A-Za-z0-9._/-]+$")
 
 # gh(args, token, input_text=None) -> stdout. Extra positional input is allowed.
 GhCall = Callable[..., str]
-
-
-def utc_day(now: datetime | None = None) -> str:
-    stamp = now or datetime.now(timezone.utc)
-    return stamp.astimezone(timezone.utc).strftime("%Y-%m-%d")
 
 
 def notice(message: str) -> None:
@@ -139,13 +132,12 @@ def request_comment_body(sha: str) -> str:
         "@codex review\n\n"
         "Follow **Code Review Rules** in AGENTS.md. End this review with exactly "
         "one of these lines as the last line of the review body (not in a code fence):\n\n"
-        "CODEX-GATE: FIX\n"
         "CODEX-GATE: READY\n"
         "CODEX-GATE: MEDIATE\n\n"
-        "- FIX: unresolved Devin review threads still need one batched fixer run.\n"
         "- READY: no fixer; the `ci:full` label should be applied.\n"
         "- MEDIATE: Devin and Claude are stuck; hand off to stuck-thread-watch.\n\n"
-        "Do not push, merge, or resolve threads.\n"
+        "If findings still need fixing without human mediation, report pending without a verdict.\n"
+        "Only Devin and human requests trigger fixes. Do not push, merge, or resolve threads.\n"
     )
 
 
@@ -155,11 +147,12 @@ def acted_comment_body(sha: str, verdict: str, extra: str = "") -> str:
     return f"{acted_marker(sha)}\nCodex gate acted: {verdict}.{suffix}"
 
 
-def fixer_dispatch_comment_body(sha: str, day: str, reason: str) -> str:
-    # Record per-head deduplication only after a successful workflow dispatch.
-    return (
-        f"{acted_marker(sha)}\n"
-        f"Codex gate: dispatching batched Devin review fixer ({reason}) on {day}.\n"
+def has_terminal_action(sha: str, comments: list[str]) -> bool:
+    """Legacy FIX/timeout markers are nonterminal; only READY/MEDIATE deduplicate."""
+    return any(
+        body.startswith(acted_comment_body(sha, verdict).rstrip("\n"))
+        for body in comments
+        for verdict in ("READY", "MEDIATE")
     )
 
 
@@ -174,7 +167,7 @@ def sha_has_verdict(reviews: list[dict[str, Any]], sha: str) -> bool:
             continue
         if safe_head_sha(review.get("commit_id")) != want:
             continue
-        if parse_verdict(review.get("body")):
+        if parse_verdict(review.get("body")) in {"READY", "MEDIATE"}:
             return True
     return False
 
@@ -193,7 +186,7 @@ def decide_request(
     if not same_repo or draft or not safe_head_sha(sha):
         return {"action": "skip", "proceed": "false"}
     if bodies_have(gate_marker(sha), comments):
-        if sha_has_verdict(reviews, sha) or bodies_have(acted_marker(sha), comments):
+        if sha_has_verdict(reviews, sha) or has_terminal_action(sha, comments):
             return {"action": "already-verdict", "proceed": "false"}
         return {"action": "already", "proceed": "true"}
     return {"action": "post", "proceed": "true"}
@@ -210,27 +203,14 @@ def decide_verdict(
         return {"action": "skip", "verdict": ""}
     if not safe_head_sha(sha):
         return {"action": "skip", "verdict": ""}
-    if bodies_have(acted_marker(sha), comments):
-        return {"action": "already-acted", "verdict": parse_verdict(body) or ""}
     verdict = parse_verdict(body)
+    if verdict == "FIX":
+        return {"action": "ignored-fix", "verdict": "FIX"}
+    if has_terminal_action(sha, comments):
+        return {"action": "already-acted", "verdict": verdict or ""}
     if verdict is None:
         return {"action": "no-verdict", "verdict": ""}
     return {"action": verdict.lower(), "verdict": verdict}
-
-
-def decide_fallback(
-    *,
-    sha: str,
-    comments: list[str],
-    reviews: list[dict[str, Any]],
-) -> dict[str, str]:
-    if not safe_head_sha(sha):
-        return {"action": "skip"}
-    if bodies_have(acted_marker(sha), comments):
-        return {"action": "already-acted"}
-    if sha_has_verdict(reviews, sha):
-        return {"action": "has-verdict"}
-    return {"action": "fix"}
 
 
 def _token_env(token: str) -> dict[str, str]:
@@ -429,39 +409,6 @@ def run_request(
     return out
 
 
-def _dispatch_fixer(
-    repo: str,
-    number: str,
-    sha: str,
-    day: str,
-    reason: str,
-    ref: str,
-    pat: str,
-    *,
-    gh: GhCall = _gh,
-) -> bool:
-    if not pat:
-        notice("CODEX_TRIGGER_PAT is missing; skipping fixer dispatch (no failure)")
-        return False
-    ok = dispatch_workflow(
-        repo,
-        FIXER_WORKFLOW,
-        ref,
-        {"pr_number": number, "reason": reason},
-        pat,
-        gh=gh,
-    )
-    if not ok:
-        notice(f"fixer dispatch to {FIXER_WORKFLOW} failed; skipping (no failure)")
-        return False
-    try:
-        post_comment(repo, number, fixer_dispatch_comment_body(sha, day, reason), pat, gh=gh)
-    except (OSError, subprocess.CalledProcessError):
-        notice("dispatched fixer but failed to post run marker")
-    log(f"dispatched {FIXER_WORKFLOW} for PR #{number} ({reason})")
-    return True
-
-
 def run_verdict(
     event: dict[str, Any],
     repo: str,
@@ -491,7 +438,6 @@ def run_verdict(
             notice("failed to list PR comments; skipping verdict (no failure)")
             emit({"action": "skip-listing", "pr_number": number, "head_sha": sha})
             return {"action": "skip-listing", "verdict": ""}
-    today = day or utc_day()
     decision = decide_verdict(
         login=login,
         body=review.get("body"),
@@ -499,16 +445,14 @@ def run_verdict(
         comments=comments,
     )
     action = decision["action"]
-    if action in {"skip", "already-acted", "no-verdict"}:
+    if action in {"skip", "already-acted", "no-verdict", "ignored-fix"}:
         emit({"action": action, "pr_number": number, "head_sha": sha, "verdict": decision["verdict"]})
         return decision
     if not pat:
         notice("CODEX_TRIGGER_PAT is missing; skipping Codex gate (no failure)")
         emit({"action": "skip-pat", "pr_number": number, "head_sha": sha})
         return {"action": "skip-pat", "verdict": decision.get("verdict") or ""}
-    if action == "fix" and number:
-        _dispatch_fixer(repo, number, sha, today, "codex-fix", default_branch, pat, gh=gh)
-    elif action == "ready" and number:
+    if action == "ready" and number:
         try:
             post_comment(repo, number, acted_comment_body(sha, "READY"), pat, gh=gh)
         except (OSError, subprocess.CalledProcessError):
@@ -553,35 +497,10 @@ def run_fallback(
     gh: GhCall = _gh,
     day: str | None = None,
 ) -> dict[str, str]:
-    number = safe_pr_number(number)
-    sha = safe_head_sha(sha)
-    comments: list[str] = []
-    reviews: list[dict[str, Any]] = []
-    if number and read_token:
-        try:
-            comments = _retry_listing(
-                lambda: list_comment_bodies(repo, number, read_token, gh=gh)
-            )
-            reviews = _retry_listing(lambda: list_reviews(repo, number, read_token, gh=gh))
-        except (OSError, subprocess.CalledProcessError, json.JSONDecodeError, ListingError, ValueError):
-            notice("failed to list PR comments/reviews; skipping timeout fallback (no failure)")
-            emit({"action": "skip-listing", "pr_number": number, "head_sha": sha})
-            return {"action": "skip-listing"}
-    today = day or utc_day()
-    decision = decide_fallback(sha=sha, comments=comments, reviews=reviews)
-    action = decision["action"]
-    if action == "fix" and number:
-        if not pat:
-            notice("CODEX_TRIGGER_PAT is missing; skipping timeout fixer dispatch (no failure)")
-            action = "skip-pat"
-        else:
-            _dispatch_fixer(repo, number, sha, today, "timeout", default_branch, pat, gh=gh)
-    elif action == "has-verdict":
-        log("Codex verdict present; timeout fallback skipped")
-    elif action == "already-acted":
-        log("gate already acted on this SHA; timeout fallback skipped")
-    emit({"action": action, "pr_number": number, "head_sha": sha})
-    return {"action": action}
+    # Compatibility for a pre-rollout queued workflow: no reads, writes or dispatch.
+    out = {"action": "ignored-fallback"}
+    emit(out)
+    return out
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -2,3 +2,15 @@
 self-hosted-runner:
   labels:
     - blacksmith-2vcpu-ubuntu-2404
+
+# GitHub supports concurrency.queue; actionlint 1.7.7 does not yet parse it.
+# Remove this exact compatibility exception after upstream PR #654 ships:
+# https://github.com/rhysd/actionlint/pull/654
+# tools/test_claude_pr_fixer.py independently validates all shared writer queues.
+paths:
+  .github/workflows/claude.yml:
+    ignore:
+      - '^unexpected key "queue" for "concurrency" section\. expected one of "cancel-in-progress", "group"$'
+  .github/workflows/conflict-scan.yml:
+    ignore:
+      - '^unexpected key "queue" for "concurrency" section\. expected one of "cancel-in-progress", "group"$'

@@ -12,6 +12,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -397,6 +398,51 @@ class WholeWordTests(unittest.TestCase):
         self.assertFalse(gate.is_whole_word_mention("claude"))
         self.assertFalse(gate.is_whole_word_mention(""))
         self.assertFalse(gate.is_whole_word_mention(None))
+
+
+def validate_shared_writer_queues(text: str, expected_groups: list[str]) -> None:
+    """Strict independent gate for the one syntax feature actionlint cannot parse."""
+    groups = []
+    for match in re.finditer(r"(?m)^    concurrency:\n((?:      .*\n|\n)*)", text):
+        entries = re.findall(r"(?m)^      ([a-z-]+): (.+)$", match.group(1))
+        values = dict(entries)
+        if values.get("group", "").startswith("claude-${{") or "queue" in values:
+            if len(entries) != 3 or len(values) != 3 or set(values) != {"group", "queue", "cancel-in-progress"}:
+                raise ValueError("writer concurrency must have three unique literal keys")
+            if values["queue"] != "max" or values["cancel-in-progress"] != "false":
+                raise ValueError("writer must retain up to 100 pending jobs and one active job")
+            groups.append(values["group"])
+    if sorted(groups) != sorted(expected_groups):
+        raise ValueError("all writers must use their shared per-PR concurrency group")
+    if len(re.findall(r"(?m)^\s*queue:", text)) != len(expected_groups):
+        raise ValueError("unexpected or incorrectly indented queue key")
+
+
+class SharedQueuePolicyTests(unittest.TestCase):
+    def test_all_three_shared_writers_use_bounded_fifo_queue(self) -> None:
+        validate_shared_writer_queues(WORKFLOW_PATH.read_text(), ["claude-${{ needs.resolve-pr.outputs.pr_number }}"] * 2)
+        validate_shared_writer_queues(SCAN_WORKFLOW_PATH.read_text(), ["claude-${{ matrix.pr.number }}"])
+
+    def test_mutations_cannot_hide_behind_actionlint_compatibility_exception(self) -> None:
+        original = WORKFLOW_PATH.read_text()
+        for bad in (
+            original.replace("queue: max", "queue: single", 1),
+            original.replace("cancel-in-progress: false", "cancel-in-progress: true", 1),
+            original.replace("      queue: max\n", "", 1),
+            original.replace("      queue: max\n", "      queue: max\n      queue: single\n", 1),
+            original.replace("group: claude-${{", "group: independent-${{", 1),
+        ):
+            with self.assertRaises(ValueError):
+                validate_shared_writer_queues(bad, ["claude-${{ needs.resolve-pr.outputs.pr_number }}"] * 2)
+
+    def test_actionlint_exception_is_exact_and_path_scoped(self) -> None:
+        config = (ROOT / ".github/actionlint.yaml").read_text()
+        pattern = '^unexpected key "queue" for "concurrency" section\\. expected one of "cancel-in-progress", "group"$'
+        self.assertEqual(config.count("      - '" + pattern + "'"), 2)
+        self.assertEqual(config.count("    ignore:"), 2)
+        self.assertIn("  .github/workflows/claude.yml:", config)
+        self.assertIn("  .github/workflows/conflict-scan.yml:", config)
+        self.assertIn("blacksmith-2vcpu-ubuntu-2404", config)
 
 
 class WorkflowStructureTests(unittest.TestCase):

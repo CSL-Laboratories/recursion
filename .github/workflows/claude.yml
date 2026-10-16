@@ -14,9 +14,9 @@ on:
         required: true
         type: string
       reason:
-        description: "Why this fixer run was requested (codex-fix, timeout)"
+        description: "Why this human-requested fixer run was requested"
         required: false
-        default: "codex-gate"
+        default: "human-request"
         type: string
       bypass_cap:
         description: "Deprecated compatibility input; the eight-commit loop guard cannot be bypassed"
@@ -48,8 +48,8 @@ permissions:
 jobs:
   resolve-pr:
     # Job-level filter so skipped events never allocate a runner (CSL-102).
-    # Devin submissions start the fixer directly; Codex remains advisory for
-    # FIX and routes READY/MEDIATE. Other bot events never enter this job.
+    # Devin submissions start the fixer directly; Codex only routes READY/MEDIATE.
+    # Other bot events never enter this job.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event_name == 'repository_dispatch' ||
@@ -265,7 +265,7 @@ jobs:
               ):
                   devin = "true"
               elif event_name in DISPATCH_EVENTS and open_same_writer:
-                  # Batched fixer from the Codex gate (or a human workflow_dispatch).
+                  # Explicitly requested batched fixer dispatch; Codex never dispatches fixes.
                   devin = "true"
 
               return {
@@ -421,6 +421,8 @@ jobs:
       needs.resolve-pr.outputs.same_repo == 'true'
     concurrency:
       group: claude-${{ needs.resolve-pr.outputs.pr_number }}
+      # GitHub queues up to 100 pending writers; never replace a queued fixer.
+      queue: max
       cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -645,6 +647,8 @@ jobs:
       (github.event_name == 'pull_request_review' || github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch')
     concurrency:
       group: claude-${{ needs.resolve-pr.outputs.pr_number }}
+      # GitHub queues up to 100 pending writers; never replace a queued fixer.
+      queue: max
       cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 30

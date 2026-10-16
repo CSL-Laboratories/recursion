@@ -212,8 +212,10 @@ label, not by editing config.
   requires a human commenter with that permission. Association is audit-only:
   private org members may appear as CONTRIBUTOR. Forks and nonwriters are skipped.
   Submitted Devin bot reviews on the current head start the fixer directly;
-  Codex FIX is a fallback, never a prerequisite. Every fixer shares the per-PR
-  concurrency group, without cancelling an active run.
+  Codex never dispatches fixes. Every fixer shares the per-PR
+  concurrency group, without cancelling an active run. Native `queue: max`
+  retains up to 100 pending writers in queue-entry order; further arrivals are
+  cancelled when full. This is bounded buffering, not an unlimited guarantee.
 - **Stuck-thread watch** (`.github/workflows/stuck-thread-watch.yml`) asks Codex
   to mediate Devin threads Claude could not settle. A **MEDIATE** verdict
   updates one Linear roll-up per PR (`Stuck PR threads: recursion#<PR>`), not
@@ -271,17 +273,14 @@ as the first line of the description.
 
 ## Code Review Rules
 
-Codex GitHub reviews are the CI/fixer gate on this repository (CSL-102), not a
-reviewer of record. Devin still reviews; Claude still fixes. End **every** Codex
-review with exactly one of these lines as the last line of the review body
-(not in a code fence, not only in an inline comment):
+Codex GitHub reviews route CI readiness and human mediation (CSL-102/CSL-201),
+not fixes. Devin remains reviewer of record; Devin and human requests trigger
+Claude. When ready or needing human mediation, end the Codex review with one
+of these lines (not in a code fence or only an inline comment):
 
-CODEX-GATE: FIX
 CODEX-GATE: READY
 CODEX-GATE: MEDIATE
 
-- **FIX** — unresolved Devin review threads still need one batched Claude PR
-  Fixer run (`devin-review-fix`). The fixer only addresses Devin threads.
 - **READY** — no fixer; apply the `ci:full` label so the full CI matrix runs.
 - **MEDIATE** — Devin and Claude are stuck; hand off to
   `.github/workflows/stuck-thread-watch.yml` for this PR. The watcher still
@@ -290,7 +289,10 @@ CODEX-GATE: MEDIATE
   on fresh threads usually does nothing until a later scheduled run — it is
   not an immediate `@codex review`. Do not push, merge, or resolve threads.
 
-Do not omit the verdict line. A human `@claude` mention still runs the mention
+If findings still need fixing without human mediation, report pending without
+a verdict. Legacy `CODEX-GATE: FIX` is ignored and produces no acted marker;
+missing verdicts never dispatch a fixer. No timeout/wait job exists. Historical
+FIX/timeout markers do not block later READY/MEDIATE. A human `@claude` mention runs the mention
 fixer immediately. There is no daily dispatch cap. The batched fixer pauses
 after eight Claude commits since the last human commit; other bot commits
 neither count nor reset the streak. A human commit re-arms it. Legacy

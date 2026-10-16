@@ -166,7 +166,7 @@ def evaluate(
     ):
         devin = "true"
     elif event_name in DISPATCH_EVENTS and open_same_writer:
-        # Batched fixer from the Codex gate (or a human workflow_dispatch).
+        # Explicitly requested batched fixer dispatch; Codex never dispatches fixes.
         devin = "true"
 
     return {

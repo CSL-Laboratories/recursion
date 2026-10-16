@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
@@ -861,6 +862,48 @@ class ScanTests(unittest.TestCase):
             p, [(t, "stuck-human")], cfg(), previous=first
         )
         self.assertEqual(second.count("Decision: defer to Lucas."), 1)
+        self.assertIn(mod.NOTES_HEADING, second)
+
+    def test_existing_author_notes_keeps_text_after_marker_without_notes_section(
+        self,
+    ) -> None:
+        marker = "<!-- stuck-pr-threads:recursion#186 -->"
+        notes = mod.existing_author_notes(
+            f"{marker}\nDecision: defer to Lucas.",
+            marker,
+        )
+        self.assertEqual(notes, "Decision: defer to Lucas.")
+
+    def test_author_filed_with_marker_keeps_freeform_notes_across_runs(self) -> None:
+        t = thread(tid="PRRT_hand", comments=stuck_pair())
+        p = pull(threads=[t])
+        marker = mod.rollup_marker(p)
+        author_line = "Decision: defer to Lucas."
+        author = mod.LinearIssue(
+            id="iss_author_marker",
+            url="https://linear.app/author-marker",
+            identifier="CSL-HAND-M",
+            title=mod.linear_title(p),
+            state_type="triage",
+            description=f"{marker}\n{author_line}",
+        )
+        lin = FakeLinear()
+        lin.marker_matches[marker] = [author]
+        gh = FakeGitHub([p])
+        mod.scan(cfg(), gh, lin)  # type: ignore[arg-type]
+        self.assertEqual(lin.created, [])
+        self.assertEqual(len(lin.updated), 1)
+        first = lin.updated[0][1]
+        self.assertIn(author_line, first)
+        self.assertIn(mod.NOTES_HEADING, first)
+        self.assertIn("## Stuck threads", first)
+
+        lin.marker_matches[marker] = [replace(author, description=first)]
+        mod.scan(cfg(), gh, lin)  # type: ignore[arg-type]
+        self.assertEqual(len(lin.updated), 2)
+        second = lin.updated[1][1]
+        self.assertEqual(second.count(author_line), 1)
+        self.assertIn(author_line, second)
         self.assertIn(mod.NOTES_HEADING, second)
 
 

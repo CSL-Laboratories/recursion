@@ -469,10 +469,10 @@ def existing_human_decision(description: str) -> str:
 def existing_author_notes(description: str, marker: str) -> str:
     """Free-form text to carry forward when rebuilding a roll-up description."""
     text = description or ""
-    if marker in text:
+    if "## Stuck threads" in text:  # watcher-built: only the notes section carries
         match = NOTES_RE.search(text)
         return match.group(1).strip() if match else ""
-    return text.strip()
+    return text.replace(marker, "").strip()
 
 
 def is_approved_on_head_with_green_checks(pull: Pull) -> bool:

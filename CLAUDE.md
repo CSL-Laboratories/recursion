@@ -101,6 +101,14 @@ Linear MCP or the Devin Linear integration. Do not start code without `CSL-N`.
 - One issue per PR; keep PRs small and stackable.
 - Comment progress on the issue. Move status to **In Progress** when work starts, then **In
   Review** when the PR is up.
+- **Shared files.** [`.github/workflows/linear-pr-sync.yml`](.github/workflows/linear-pr-sync.yml)
+  upserts one Linear comment per PR, marked `<!-- pr-sync:<repo>#<n> -->` (edit in
+  place, never a second comment). It shows the PR link, author, purpose, status
+  (draft/open/merged/closed), mergeable state, head SHA, Devin review on head,
+  and the top changed files. A push to the default branch refreshes every open
+  PR and flags `out of date / conflicts with <default-branch>`. **Grok Bots
+  must read those Linear PR-sync comments before touching shared files** —
+  three people work at once. This workflow is not a required check.
 - On your own PR, address CI comments, then resolve the threads. Eligible Devin
   findings and `@claude` mentions are handled by the Claude Code Action
   (`.github/workflows/claude.yml`; see [Review roles](#review-roles)). Do not
@@ -136,12 +144,26 @@ label, not by editing config.
   findings and `@claude` mentions. It runs only on open same-repo PRs whose
   author is an org OWNER or MEMBER. `@claude` also requires a human OWNER or
   MEMBER commenter. Fork and nonmember PRs are not auto-fixed.
+- **Stuck-thread watch** (`.github/workflows/stuck-thread-watch.yml`) asks Codex
+  to mediate Devin threads Claude could not settle. Codex is a mediator, not a
+  reviewer of record and not a fixer: it must not push code.
 - **Blacksmith** is the only CI.
 - Cursor, Codex, Grok, and interactive Claude Code develop features from Linear
   issues. They must not post review verdicts or run review-fix loops on other
   agents' PRs. The author agent may fix CI failures on its own PR.
 - Humans still merge (`CONTROL_PLANE.md`). Independent task gates still apply; they are not
   a substitute for Devin PR review.
+
+## Review loop
+
+Devin reviews. Claude fixes (`.github/workflows/claude.yml`). If a Devin thread
+stays stuck — Claude said it needs a human / could not fix, or the thread is
+still open more than six hours (configurable) after Claude's last reply —
+[`.github/workflows/stuck-thread-watch.yml`](.github/workflows/stuck-thread-watch.yml)
+posts one `@codex review` comment (via `CODEX_TRIGGER_PAT`; skipped with a
+notice if that secret is missing) and files a Linear Triage issue labelled
+`needs-decision`. Humans decide. Caps: one mediation per thread, three per PR
+per UTC day. The watcher never resolves threads, pushes, or merges.
 
 ## Automations
 

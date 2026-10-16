@@ -45,6 +45,11 @@ Stop and write to `state/INBOX.md` when a task is ambiguous, needs a decision no
 language, store, framework or sandbox from a research recommendation. Keep evidence classes
 distinct: source-documented, locally observed, inferred and unmeasured are different things.
 
+## Recorded decisions
+
+Before proposing architecture or direction, read `docs/adr/` and the linked
+decision issues; do not re-argue a recorded decision without new evidence.
+
 ## Style
 
 Plain markdown. Dates as `YYYY-MM-DD`. Keep files skimmable — anything not reread is dead

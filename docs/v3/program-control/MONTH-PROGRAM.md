@@ -288,10 +288,24 @@ and maturity selectors fail validation before lookup or traversal.
   pending receipt; it admits no contract consumers/reviews until that envelope is
   approved. Routine non-consuming candidate work and unrelated research continue;
   no per-task receipt is added for routine work inside an approved envelope.
-- Unknowns retain `status: open` or `resolved`; resolution requires
-  `resolution_evidence`. Each linked open unknown blocks its named tier and every
+- Unknowns retain `status: open` or `resolved`; `resolution_evidence` must name an
+  evidence record of kind `unknown_resolution`, with `status: current`, `result: pass`,
+  the exact `unknown_id`, `unknown_digest` (the canonical digest of its definition
+  excluding status/resolution evidence), and matching `resolution_issue`. The record
+  includes a nonempty artifact reference, string SHA-256, the program's exact
+  `source_commit`, and current `contract_bindings` covering the union of contracts
+  on capabilities linked to that unknown. A changed definition, source snapshot or
+  linked contract invalidates the resolution. Arbitrary text, booleans and objects
+  do not stand in for a retained proof. Offline checks establish structure and
+  binding, not artifact authenticity, factual resolution or human acceptance.
+  Each linked unknown without valid resolution blocks its named tier and every
   later tier. Removing an unknown link or weakening its blocking definition
   invalidates the prior capability approval; resolving the retained unknown does not.
+- Work `recovery` and `rollback`, unknown `exposure`, and risk `mitigation` and
+  `trigger` are nonempty text descriptions. Work `stop_conditions` and bounded
+  admission `allowed_agent_actions`/`human_decision_triggers` are nonempty lists of
+  nonempty text. Truthy JSON values and whitespace are not descriptions or boundaries.
+  Registry IDs, contract paths and proposal scope entries likewise require nonempty text.
 - Every work item declares `independent_verification_required: true`. Completion
   (`done`, `accepted`, `verified`) requires retained `verification_evidence_ids`
   pointing to successful, current, independent `work_verification` records. Each

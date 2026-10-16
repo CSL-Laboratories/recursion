@@ -94,6 +94,21 @@ class ProgramControlTests(unittest.TestCase):
         capability.update(research_ids=[row["id"]], research_question=row["question"], current_maturity="researched")
         return capability, row
 
+    def resolve_unknown(self, unknown):
+        """Synthetic retained resolution only; never persisted to the seed."""
+        contract_ids = {cid for cap in self.data["capabilities"] if unknown["id"] in cap["unknown_ids"]
+                        for cid in cap["contract_ids"]}
+        row = {"id": f"evidence.resolution-{unknown['id']}", "kind": "unknown_resolution",
+               "unknown_id": unknown["id"], "unknown_digest": checker.digest(checker.unknown_binding(unknown)),
+               "resolution_issue": unknown["resolution_issue"], "result": "pass", "status": "current",
+               "source_commit": self.data["source_commit"], "artifact": "Synthetic resolution only",
+               "artifact_sha256": "f" * 64,
+               "contract_bindings": [checker.contract_binding(c) for c in self.data["contracts"]
+                                     if c["id"] in contract_ids]}
+        self.data["evidence"].append(row)
+        unknown.update(status="resolved", resolution_evidence=row["id"])
+        return row
+
     def promote(self, tier="provider_free_verified"):
         capability = self.data["capabilities"][0]
         self.research_fixture()
@@ -113,7 +128,7 @@ class ProgramControlTests(unittest.TestCase):
                                              "rollback_command": "fixture rollback",
                                              "no_rollback_boundary": None}
         for unknown in self.data["unknowns"]:
-            unknown.update(status="resolved", resolution_evidence="Synthetic fixture only")
+            self.resolve_unknown(unknown)
         for contract in self.data["contracts"]:
             contract["status"] = "accepted"
             contract["decision_receipt"] = self.approve([("accept_contract", contract["id"])])
@@ -278,7 +293,7 @@ class ProgramControlTests(unittest.TestCase):
     def test_unknown_requires_explicit_resolution_and_preserves_history(self):
         self.data["unknowns"][0]["status"] = "resolved"
         self.assert_rejected("without resolution evidence")
-        self.data["unknowns"][0]["resolution_evidence"] = "Fixture resolution"
+        self.resolve_unknown(self.data["unknowns"][0])
         self.assertEqual(self.errors(), [])
         self.data["unknowns"][0]["status"] = "waived"
         self.assert_rejected("requires open or resolved")
@@ -543,6 +558,9 @@ class ProgramControlTests(unittest.TestCase):
             contract["decision_receipt"] = self.approve([("accept_contract", contract["id"])])
         capability = self.data["capabilities"][0]
         self.data["research"][-1]["contract_bindings"] = [checker.contract_binding(c) for c in self.data["contracts"]]
+        for row in self.data["evidence"]:
+            if row.get("kind") == "unknown_resolution":
+                row["contract_bindings"] = [checker.contract_binding(c) for c in self.data["contracts"]]
         capability["decision_receipt"] = self.approve([("decide_capability", capability["id"])])
         self.assertEqual(self.data["proposals"][:len(old_packets)], old_packets)
         self.assertEqual(self.errors(), [])
@@ -1421,6 +1439,100 @@ class ProgramControlTests(unittest.TestCase):
         self.setUp()
         self.promote("release_qualified")
         self.assertEqual(self.errors(), [])
+
+
+    def test_resolution_reference_cannot_be_truthy_placeholder(self):
+        for value in (True, 1, {"proof": "yes"}, ["proof"], " ", "missing", None):
+            with self.subTest(value=value):
+                self.setUp()
+                self.promote()
+                self.data["unknowns"][0]["resolution_evidence"] = value
+                self.assert_rejected("without resolution evidence")
+                self.assert_rejected("blocked by unresolved")
+
+    def test_resolution_proof_requires_current_scope_and_inspectable_artifact(self):
+        mutations = {"kind": "provider_free", "unknown_id": "unknown.other", "unknown_digest": "0" * 64,
+                     "resolution_issue": "CSL-999", "result": "fail", "status": "superseded",
+                     "source_commit": "0" * 40, "artifact": True, "artifact_sha256": True,
+                     "contract_bindings": []}
+        for field, value in mutations.items():
+            with self.subTest(field=field):
+                self.setUp()
+                self.promote()
+                unknown = self.data["unknowns"][0]
+                row = next(r for r in self.data["evidence"] if r["id"] == unknown["resolution_evidence"])
+                row[field] = value
+                self.assert_rejected("without resolution evidence")
+                self.assert_rejected("blocked by unresolved")
+
+    def test_resolution_proof_missing_fields_fail_closed(self):
+        for field in ("kind", "unknown_id", "unknown_digest", "resolution_issue", "result", "status",
+                      "source_commit", "artifact", "artifact_sha256", "contract_bindings"):
+            with self.subTest(field=field):
+                self.setUp()
+                row = self.resolve_unknown(self.data["unknowns"][0])
+                del row[field]
+                self.assert_rejected("without resolution evidence")
+
+    def test_resolution_definition_and_source_changes_invalidate_proof(self):
+        for field in ("exposure", "resolution_issue", "blocks", "source_commit", "contract"):
+            with self.subTest(field=field):
+                self.setUp()
+                unknown = self.data["unknowns"][0]
+                self.resolve_unknown(unknown)
+                if field == "source_commit":
+                    self.data[field] = "0" * 40
+                elif field == "contract":
+                    self.data["contracts"][0]["revision"] += 1
+                else:
+                    unknown[field] = {"exposure": "Changed exposure", "resolution_issue": "CSL-999",
+                                      "blocks": "researched"}[field]
+                self.assert_rejected("without resolution evidence")
+
+    def test_resolution_cannot_borrow_another_unknowns_proof(self):
+        self.promote()
+        self.data["unknowns"][0]["resolution_evidence"] = self.data["unknowns"][1]["resolution_evidence"]
+        self.assert_rejected("without resolution evidence")
+        self.assert_rejected("blocked by unresolved")
+
+    def test_semantic_text_fields_reject_truthy_json_and_blank_text(self):
+        paths = [("work_items", 0, "recovery"), ("work_items", 0, "rollback"),
+                 ("unknowns", 0, "exposure"), ("risks", 0, "mitigation"), ("risks", 0, "trigger")]
+        for promoted in (False, True):
+            for path in paths:
+                for value in (True, 1, {"text": "yes"}, ["text"], " ", "", None):
+                    with self.subTest(promoted=promoted, path=path, value=value):
+                        self.setUp()
+                        if promoted:
+                            self.promote()
+                        self.data[path[0]][path[1]][path[2]] = value
+                        self.assertTrue(self.errors())
+
+    def test_semantic_text_lists_require_nonempty_text_elements(self):
+        for collection, field in (("work_items", "stop_conditions"), ("admission", "allowed_agent_actions"),
+                                  ("admission", "human_decision_triggers")):
+            for value in (True, 1, "text", {"text": "yes"}, [], [True], [1], [{}], [" "], ["ok", None]):
+                with self.subTest(collection=collection, field=field, value=value):
+                    self.setUp()
+                    target = self.data[collection][0] if collection == "work_items" else self.data[collection]
+                    target[field] = value
+                    self.assert_rejected(field)
+
+    def test_registry_ids_contract_paths_and_scope_require_text(self):
+        for collection in ("contracts", "decisions", "work_items", "evidence", "unknowns", "capabilities",
+                           "proposals", "integration_checkpoints", "research", "risks"):
+            self.setUp()
+            if self.data[collection]:
+                self.data[collection][0]["id"] = " "
+                self.assertTrue(self.errors(), collection)
+        for value in (True, 1, {}, [], " "):
+            self.setUp()
+            self.data["contracts"][0]["path"] = value
+            self.assert_rejected("path must be a nonempty string")
+        self.setUp()
+        self.promote()
+        self.data["proposals"][-1]["scope"].append(" ")
+        self.assert_rejected("requires explicit scope")
 
 
 if __name__ == "__main__":

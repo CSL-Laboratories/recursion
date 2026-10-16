@@ -133,7 +133,7 @@ def _ids(rows: list[dict[str, Any]], name: str, errors: list[str]) -> dict[str, 
     result: dict[str, dict[str, Any]] = {}
     for row in rows:
         value = row.get("id")
-        if not isinstance(value, str) or not value:
+        if not text_present(value):
             errors.append(f"{name} row missing id")
         elif value in result:
             errors.append(f"duplicate {name} id: {value}")
@@ -332,7 +332,10 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
         errors.append("implementation work parent must match parent_issue")
 
     for contract_id, contract in contracts.items():
-        path = root / str(contract.get("path", ""))
+        if not text_present(contract.get("path")):
+            errors.append(f"{contract_id} path must be a nonempty string")
+            continue
+        path = root / contract["path"]
         if not path.is_file() or not path.resolve().is_relative_to(root.resolve()):
             errors.append(f"{contract_id} path is missing or outside the repository")
             continue
@@ -355,6 +358,26 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
 
     def exact_bindings(actual: Any, expected: list[dict[str, Any]]) -> bool:
         return isinstance(actual, list) and len(actual) == len(expected) and all(row in actual for row in expected)
+
+    resolved_unknowns = set()
+    for unknown_id, unknown in unknowns.items():
+        if unknown.get("status") != "resolved":
+            continue
+        reference = unknown.get("resolution_evidence")
+        row = evidence.get(reference, {}) if text_present(reference) else {}
+        linked_contracts = sorted({cid for capability in capabilities.values()
+                                   if unknown_id in capability["unknown_ids"]
+                                   for cid in capability["contract_ids"]})
+        if (row.get("kind") == "unknown_resolution" and row.get("unknown_id") == unknown_id
+                and row.get("unknown_digest") == digest(unknown_binding(unknown))
+                and row.get("resolution_issue") == unknown["resolution_issue"]
+                and row.get("status") == "current" and row.get("result") == "pass"
+                and commit_hash(row.get("source_commit")) and row["source_commit"] == data["source_commit"]
+                and text_present(row.get("artifact")) and sha256(row.get("artifact_sha256"))
+                and bindings_match(row.get("contract_bindings"), linked_contracts)):
+            resolved_unknowns.add(unknown_id)
+        else:
+            errors.append(f"{unknown_id} resolved without resolution evidence bound to its current definition, source and contracts")
 
     def successful_proof(row: dict[str, Any], candidate: Any) -> bool:
         return (commit_hash(candidate)
@@ -398,7 +421,7 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
                 errors.append(f"{proposal_id} requires explicit {field} as a list")
         grants = proposal.get("authorizations")
         scope = proposal.get("scope")
-        if not isinstance(scope, list) or not scope or not all(isinstance(s, str) for s in scope):
+        if not isinstance(scope, list) or not scope or not all(text_present(s) for s in scope):
             errors.append(f"{proposal_id} requires explicit scope")
             continue
         if not isinstance(grants, list) or not grants:
@@ -541,7 +564,8 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
         if admission.get("human_gate_default") != "block_affected_lineage_only":
             errors.append("bounded autonomy must narrow human-gate blocking")
         for field in ("allowed_agent_actions", "human_decision_triggers"):
-            if not isinstance(admission.get(field), list) or not admission[field]:
+            if (not isinstance(admission.get(field), list) or not admission[field]
+                    or not all(text_present(value) for value in admission[field])):
                 errors.append(f"bounded autonomy requires non-empty {field}")
     elif mode not in {"open", "closed_pending_human_limits"}:
         errors.append("admission mode must be open, bounded_autonomy, or closed_pending_human_limits")
@@ -656,9 +680,12 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
                 errors.append(f"{item_id} research continuation blocked pending owner-defined receipt mapping")
         if not text_present(item.get("acceptance_command")):
             errors.append(f"{item_id} missing acceptance command")
-        for field in ("recovery", "rollback", "stop_conditions"):
-            if not item.get(field):
-                errors.append(f"{item_id} missing {field}")
+        for field in ("recovery", "rollback"):
+            if not text_present(item.get(field)):
+                errors.append(f"{item_id} missing {field} as nonempty text")
+        stops = item.get("stop_conditions")
+        if not isinstance(stops, list) or not stops or not all(text_present(value) for value in stops):
+            errors.append(f"{item_id} missing stop_conditions as a nonempty list of text")
 
     def visit(item_id: str, visiting: set[str], visited: set[str]) -> None:
         if item_id in visiting:
@@ -798,23 +825,21 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
                 errors.append(f"{capability_id} references unknown unknown {unknown_id}")
             else:
                 unknown = unknowns[unknown_id]
-                if unknown.get("status") != "resolved" and unknown.get("blocks") in rank and rank[current] >= rank[unknown["blocks"]]:
+                if unknown_id not in resolved_unknowns and unknown.get("blocks") in rank and rank[current] >= rank[unknown["blocks"]]:
                     errors.append(f"{capability_id} maturity blocked by unresolved {unknown_id}")
 
     for unknown_id, unknown in unknowns.items():
         if unknown.get("status") not in {"open", "resolved"}:
             errors.append(f"{unknown_id} requires open or resolved status")
-        if unknown.get("status") == "resolved" and not unknown.get("resolution_evidence"):
-            errors.append(f"{unknown_id} resolved without resolution evidence")
         if unknown.get("blocks") not in rank:
             errors.append(f"{unknown_id} blocks an unknown maturity tier")
-        if not unknown.get("exposure"):
+        if not text_present(unknown.get("exposure")):
             errors.append(f"{unknown_id} lacks exposure")
 
     for risk in data["risks"]:
         if risk.get("severity") not in {"low", "medium", "high", "critical"}:
             errors.append(f"{risk.get('id')} has invalid severity")
-        if not risk.get("mitigation") or not risk.get("trigger"):
+        if not text_present(risk.get("mitigation")) or not text_present(risk.get("trigger")):
             errors.append(f"{risk.get('id')} lacks mitigation or trigger")
 
     for checkpoint in data["integration_checkpoints"]:

@@ -51,7 +51,10 @@ than the implementer.
 ## Non-negotiable invariants
 
 1. **No force pushes. No autonomous merge. No autonomous deployment.** Agents commit to
-   `loop/work/<task-id>` and open review branches; Lucas merges and ships.
+   a review branch named `csl-<N>-<slug>`, optionally prefixed with a GitHub username,
+   and open that branch for review; Lucas merges and ships. pr-lint matches `CSL-[0-9]+`
+   case-sensitively, so a lowercase branch name alone does not pass. The `CSL-N` key in
+   the PR title satisfies the check.
 2. Every task has a parent goal and a machine-checkable gate. No gate, no work — it escalates.
 3. Generated output without independent verification is not progress.
 4. No secrets in tracked files, logs or notifications.

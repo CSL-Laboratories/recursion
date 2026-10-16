@@ -200,11 +200,39 @@ These five were not qualified. No adapter was added, and none was run.
   ([changelog](https://developers.openai.com/codex/changelog)). That is a
   desktop app version, not a headless contract.
 
+## Admission and permission flags
+
+`--allow-live` is this slice's human admission. `HeadlessCLI.execute` starts
+no credentialed CLI without it. [ANCHOR](../../../ANCHOR.md) and
+[CONTROL_PLANE](../../../CONTROL_PLANE.md) require a fresh reviewed
+admission for live provider, host, or spend work; the operator passing
+`--allow-live` on this CLI is that admission. A second reviewed-admission
+profile, blast-radius acknowledgement UI, or Recursion permission-mode
+switch is out of CSL-81. Candidate profiles live in
+[SECURITY](../SECURITY.md). [CSL-27](CSL-27.md) already records that the
+private workspace is not a sandbox.
+
+`--dangerously-skip-permissions` and `--always-approve` stay on the
+qualified argv. Anthropic `dontAsk` auto-denies every call that would
+otherwise prompt; file reads in the working directory still run
+([permissions](https://code.claude.com/docs/en/permissions),
+[headless](https://code.claude.com/docs/en/headless)). That is not a safer
+alias of the bypass flag. Swapping it in would un-pin the headless worker
+contract this note records. `bypassPermissions` (the skip-permissions
+mode) is documented for isolated containers or VMs; this adapter does not
+claim that isolation. Grok `--always-approve` is source-documented on the
+headless page cited below. Replacing either flag with a Recursion
+permission profile is later product work, not this pin.
+
+Recorded 2026-10-16. No live CLI was started for this paragraph.
+
 ## What this does not prove
 
 - No live Claude, Codex, or Grok process ran.
 - Documentation versions are not `cli --version` output.
 - A passing gate is not v3 release acceptance.
+- `--allow-live` is not a Recursion permission profile. It does not display
+  or record a blast-radius acknowledgement.
 
 Gate, from the repository root. It does not start a provider:
 
@@ -217,6 +245,7 @@ python -X utf8 -B tools/ci_gate.py --force
 - [Claude Code changelog](https://code.claude.com/docs/en/changelog) (2.1.300, 2026-10-14)
 - [@anthropic-ai/claude-code](https://www.npmjs.com/package/@anthropic-ai/claude-code) (2.1.296, page date 2026-10-13)
 - [Run Claude Code programmatically](https://code.claude.com/docs/en/headless)
+- [Claude Code permissions](https://code.claude.com/docs/en/permissions) (`dontAsk` vs `bypassPermissions`, retrieved 2026-10-16)
 - [Claude Code CLI reference](https://code.claude.com/docs/en/cli-reference)
 - [Track cost and usage](https://code.claude.com/docs/en/agent-sdk/cost-tracking)
 - [anthropics/claude-code#52506](https://github.com/anthropics/claude-code/issues/52506) (2026-04-23)

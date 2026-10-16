@@ -259,9 +259,11 @@ class HarnessTests(unittest.TestCase):
             {"type": "turn.completed", "usage": {"input_tokens": 1200, "output_tokens": 4}}
         )
         self.assertEqual(codex_session_meter(recovered)["input_tokens"], 1200)
-        # CSL-117 Option B. This assertion changed from 4 to 10: the later
-        # output reading is smaller, and the meter keeps the higher value.
-        # Named reviewer: Lucas (@NotSkittlz).
+        # CSL-117 Option B. The later output reading is smaller; the meter
+        # keeps 10 as the budget lower bound. Expecting 4 would undercount
+        # known spend while cumulative-versus-per-turn stays unverified.
+        # Lucas left this conservative max-value rule in place (keep the
+        # CSL-81 author scope). Named reviewer: Lucas (@NotSkittlz).
         self.assertEqual(codex_session_meter(recovered)["output_tokens"], 10)
 
     def test_codex_meter_keeps_an_omitted_field_from_the_earlier_total(self) -> None:
@@ -498,6 +500,19 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertIn("--allow-live", stderr.getvalue())
             self.assertNotIn(SECRET, stderr.getvalue())
+
+    def test_qualified_headless_argv_keeps_the_csl_81_flags(self) -> None:
+        request = ProviderRequest(task="Say hello", packet_id="run-aabbccddeeff")
+        claude = ClaudeHeadlessProvider().argv(request)
+        self.assertEqual(claude, ClaudeHeadlessProvider.STATIC_ARGV)
+        self.assertIn("--dangerously-skip-permissions", claude)
+        self.assertNotIn("--permission-mode", claude)
+        grok = GrokHeadlessProvider().argv(request)
+        self.assertIn("--always-approve", grok)
+        self.assertNotIn("--permission-mode", grok)
+        codex = CodexExecProvider().argv(request)
+        self.assertEqual(codex[:4], CodexExecProvider.STATIC_ARGV)
+        self.assertIn("--approve-for-me", codex)
 
     def test_grok_reviewer_stub_approves_and_old_ceiling_stops_codex(self) -> None:
         config = starter_config({"codex", "grok"})

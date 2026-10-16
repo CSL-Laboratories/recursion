@@ -141,7 +141,7 @@ not decide.
 - Branch from up-to-date `master` as `csl-<N>-<slug>` (example: `csl-26-short-slug`).
   A GitHub username prefix is optional (`chaandansaini101/csl-26-short-slug`).
 - Open the PR as a **draft**. Batch commits into as few pushes as possible.
-  Mark ready for review **once**, when the work is actually ready.
+  Mark ready for review **once**, when the work is ready and the owner clears any hold.
 - PR title includes `CSL-N` so Linear auto-links. pr-lint matches `CSL-[0-9]+`
   case-sensitively, so a lowercase branch name alone does not pass. The `CSL-N`
   key in the PR title satisfies the check. Put `Fixes CSL-N` in the PR body —
@@ -209,16 +209,20 @@ label, not by editing config.
 
 Blacksmith minutes are paid. Agents and bots keep CI cheap:
 
-- Open every PR as a **draft**. Batch pushes. Mark the PR ready **once**.
-- Never merge a PR. Never rebase or merge `master` into a review branch unless
-  there is a real conflict with `master`.
+- Open every PR as a **draft**. Batch pushes. Mark the PR ready **once**, only after the owner clears any hold.
+- Never merge a PR, rebase, or force-push. Avoid gratuitous base churn.
+  Owner-approved normal merges of a base or dependency into your own review
+  branch are allowed for required integration, even without a real conflict.
+  Preserve the stricter autonomous-fixer single-push/no-fetch recovery policy;
+  this interactive integration exception does not expand fixer permissions.
 - Never edit `.github/workflows/**` or other CI/runner configuration. A
   human-assigned Linear issue is the only exception, and it must name the
   workflow files.
-- Bots that mark a PR ready must use their own GitHub identity (GitHub App
-  or PAT). Do not mark ready with `GITHUB_TOKEN`: GitHub does not run
-  `ready_for_review` workflows for that token, so Devin Review and CI never
-  start.
+- Use an existing authorized identity for an owner-approved ready transition.
+  A `GITHUB_TOKEN`-generated `ready_for_review` event does not trigger another
+  Actions run; this does not mean CI never runs on drafts. Opened, synchronize,
+  manual, label and other configured events can still run. Do not create a
+  credential or expand permissions to work around this event behavior.
 
 ## Review roles
 

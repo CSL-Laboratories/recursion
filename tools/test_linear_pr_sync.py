@@ -655,7 +655,10 @@ class WorkflowAndDocsTests(unittest.TestCase):
         self.assertIn("## Agent CI etiquette", text)
         self.assertIn("Mark the PR ready **once**", text)
         self.assertIn("GITHUB_TOKEN", text)
-        self.assertIn("real conflict", text)
+        self.assertIn("even without a real conflict", text)
+        self.assertIn("single-push/no-fetch", text)
+        self.assertIn("owner clears any hold", text)
+        self.assertNotIn("so Devin Review and CI never", text)
 
     def test_workflow_is_light_and_not_a_required_check(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")

@@ -667,7 +667,7 @@ class NoticeAndIoTests(unittest.TestCase):
             def gh(args, token, input_text=None):
                 calls.append((args, input_text))
                 if "/comments?" in gh_blob(args):
-                    return json.dumps([{"body": gate.acted_comment_body(SHA, "FIX")}])
+                    return json.dumps([{"id": 1, "body": gate.acted_comment_body(SHA, "FIX")}])
                 return ready_api_reply(args)
             with mock.patch.object(gate, "emit"):
                 got = gate.run_verdict(review_event(login=gate.CODEX_REVIEW_LOGIN, body=f"CODEX-GATE: {verdict}"), REPO, "pat", "token", "master", gh=gh)

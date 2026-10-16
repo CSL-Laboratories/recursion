@@ -16,7 +16,7 @@ A, B, C = "a" * 40, "b" * 40, "c" * 40
 
 
 def thread(body='<!-- devin-review-comment {"kind":"bug"} -->\nBug', root=1):
-    return {"id": "thread1", "isResolved": False, "isOutdated": False,
+    return {"id": f"thread{root}", "isResolved": False, "isOutdated": False,
             "comments": {"nodes": [{"databaseId": root, "body": body,
                 "author": {"login": "devin-ai-integration", "__typename": "Bot"}}]}}
 
@@ -36,7 +36,7 @@ def actor(login="claude[bot]", identity=m.CLAUDE_ID):
 
 
 def reply(data, user=None):
-    return {"in_reply_to_id": 1, "created_at": "2026-10-16T01:00:00Z",
+    return {"id": 900, "in_reply_to_id": 1, "created_at": "2026-10-16T01:00:00Z",
             "user": user or actor(), "body": m.marker("result", data)}
 
 
@@ -71,7 +71,7 @@ class ReceiptTests(unittest.TestCase):
             self.assertIsNone(m.known_label_rejection(subprocess.CalledProcessError(1, "gh", stderr=f"(HTTP {status})")))
         self.assertIsNone(m.known_label_rejection(OSError("HTTP 403")))
         removal = {"id": 9, "event": "unlabeled", "label": {"name": "ci:full"}}
-        observed = {"body": m.marker("ci-removal", {"head": A, "event": 9}),
+        observed = {"id": 100, "body": m.marker("ci-removal", {"head": A, "event": 9}),
                     "user": actor("github-actions[bot]", m.ACTIONS_ID)}
         self.assertEqual(m.ci_label_decision([removal], [observed], A), "preserve-human-removal")
         self.assertEqual(m.ci_label_decision([removal], [observed], B), "allow")
@@ -81,13 +81,13 @@ class ReceiptTests(unittest.TestCase):
     def test_durable_intent_uncertainty_restart_and_manual_reconciliation(self):
         comments = []
         def post(repo, number, body):
-            comments.append({"body": body, "created_at": "2026-10-16T06:00:00Z", "user": actor("github-actions[bot]", m.ACTIONS_ID)})
+            comments.append({"id": len(comments) + 1, "body": body, "created_at": "2026-10-16T06:00:00Z", "user": actor("github-actions[bot]", m.ACTIONS_ID)})
         intent = m.begin_ci_intent("a/b", 1, A, [], post)
         self.assertEqual(m.pending_ci_intent([], comments), intent["nonce"])
         late = {"id": 2, "event": "labeled", "label": {"name": "ci:full"}, "actor": {"login": "writer"}}
         # Delayed visibility on a later invocation cannot adopt ambiguous PAT ownership.
         self.assertEqual(m.pending_ci_intent([late], comments), intent["nonce"])
-        forged = {"body": m.marker("ci-owned", {"head": A, "event": 2, "nonce": intent["nonce"]}), "user": actor("other", 9)}
+        forged = {"id": 100, "body": m.marker("ci-owned", {"head": A, "event": 2, "nonce": intent["nonce"]}), "user": actor("other", 9)}
         self.assertEqual(m.pending_ci_intent([late], comments + [forged]), intent["nonce"])
         removed = late | {"id": 3, "event": "unlabeled", "created_at": "2026-10-16T06:00:01Z"}
         self.assertEqual(m.pending_ci_intent([late, removed | {"created_at": "2026-10-16T05:59:59Z"}], comments), intent["nonce"])
@@ -249,6 +249,109 @@ class ReceiptTests(unittest.TestCase):
         inactive = thread("not a bug")
         self.assertEqual(m.observation_roots([inactive], root_comments([inactive]), [], []), [])
 
+    def test_duplicate_identity_validation_precedes_all_filters(self):
+        root = thread()
+        rest = root_comments([root])
+        variants = [
+            [root, root | {"id": "different-thread"}],
+            [root, root | {"id": "different-thread", "isResolved": True}],
+            [root, root | {"isOutdated": True}],
+            [root, thread(root=2) | {"id": root["id"]}],
+            [root, root | {"comments": {"nodes": []}}],
+        ]
+        for threads in variants:
+            with self.subTest(threads=threads), self.assertRaises(ValueError):
+                m.review_snapshot(threads, rest)
+        # Identical pagination overlap is safe only for the same thread identity.
+        self.assertEqual(m.review_snapshot([root, root], rest + rest), ([root], rest))
+        self.assertEqual(m.findings([root, root], rest + rest), findings([root]))
+        for changed in (rest[0] | {"body": "edited"}, rest[0] | {"in_reply_to_id": 2},
+                        rest[0] | {"user": actor("impostor", 123)},
+                        rest[0] | {"user": {**rest[0]["user"], "id": float(m.DEVIN_ID)}}, rest[0] | {"id": True}):
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                m.review_snapshot([root], rest + [changed])
+        with self.assertRaises(ValueError):
+            m.observation_roots([root], rest, [], findings([root]) + [findings([root])[0] | {"thread": "other"}])
+
+    def test_conflicting_event_ids_never_claim_or_remove_label(self):
+        event = {"id": 10, "event": "labeled", "label": {"name": "ci:full"}, "actor": {"login": "writer"}}
+        self.assertEqual(m.label_event_id([event, event]), 10)
+        for alternate in (event | {"event": "unlabeled"}, event | {"actor": {"login": "other"}},
+                          event | {"label": {"name": "other"}}):
+            events = [event, alternate]
+            for decision in (lambda: m.label_event_id(events), lambda: m.ci_label_decision(events, []),
+                             lambda: m.pending_ci_intent(events, [])):
+                with self.assertRaises(ValueError):
+                    decision()
+            with patch.object(m, "post") as post, patch.object(m, "delete_label") as delete:
+                with self.assertRaises(ValueError):
+                    m.begin_ci_intent("o/r", "1", A, events, post)
+                with self.assertRaises(ValueError):
+                    m.record_ci_ownership("o/r", "1", A, 0, "writer", lambda _: events, post)
+                with self.assertRaises(ValueError):
+                    m.rollback_ci_event("o/r", "1", 10, lambda _: events, delete)
+                post.assert_not_called()
+                delete.assert_not_called()
+
+    def test_conflicting_issue_comment_ids_do_not_settle_or_revoke(self):
+        entry = {"id": 10, "user": actor("github-actions[bot]", m.ACTIONS_ID),
+                 "body": m.marker("ci-owned", {"head": A, "event": 7})}
+        event = {"id": 7, "event": "labeled", "label": {"name": "ci:full"}}
+        for changed in (entry | {"body": "removed receipt"}, entry | {"user": actor("other", 1)}):
+            comments = [entry, changed]
+            with self.assertRaises(ValueError):
+                m.pending_ci_intent([], comments)
+            with self.assertRaises(ValueError):
+                m.ci_label_decision([], comments)
+            with patch.object(m, "post") as post, patch.object(m, "delete_label") as delete:
+                with self.assertRaises(ValueError):
+                    m.revoke_owned_ci("o/r", "1", A,
+                        lambda path: comments if path.endswith("comments") else [event])
+                post.assert_not_called()
+                delete.assert_not_called()
+        self.assertEqual(m.ci_label_decision([], [entry, entry]), "allow")
+
+    def test_live_duplicate_snapshots_abort_before_persistence_or_permissions(self):
+        root = thread()
+        rest = root_comments([root])
+        followup = {"id": 50, "in_reply_to_id": 1, "body": "Correction", "user": {"id": 10, "login": "writer", "type": "User"}}
+        cases = [
+            ([root, root | {"id": "other"}], rest, []),
+            ([root, root | {"id": "other", "isResolved": True}], rest, []),
+            ([root], rest + [followup, followup | {"body": ">"}], []),
+            ([root], rest + [followup, followup | {"user": actor("other", 12)}], []),
+            ([root], rest, [self.history[0], self.history[0] | {"body": "conflicting history"}]),
+        ]
+        for threads, comments, history in cases:
+            payload = {"data": {"repository": {"pullRequest": {"reviewThreads": {
+                "nodes": threads, "pageInfo": {"hasNextPage": False}}}}}}
+            with self.subTest(threads=threads, comments=comments), \
+                    patch.object(m.subprocess, "check_output", return_value=json.dumps(payload)), \
+                    patch.object(m, "pages", return_value=comments), patch.object(m, "api") as api, \
+                    patch.object(m, "post") as post:
+                with self.assertRaises(ValueError):
+                    m.live_state("o/r", "1", C, history=history)
+                api.assert_not_called()
+                post.assert_not_called()
+        # Simulate overlap across GraphQL pages and REST pages: one journal only,
+        # unchanged generation on replay, not a fresh attempt fingerprint.
+        history = []
+        first = {"data": {"repository": {"pullRequest": {"reviewThreads": {
+            "nodes": [root], "pageInfo": {"hasNextPage": True, "endCursor": "next"}}}}}}
+        last = {"data": {"repository": {"pullRequest": {"reviewThreads": {
+            "nodes": [root], "pageInfo": {"hasNextPage": False}}}}}}
+        def record(body):
+            history.append({"id": len(history) + 1, "body": body,
+                "user": actor("github-actions[bot]", m.ACTIONS_ID)})
+        results = []
+        for _ in range(2):
+            with patch.object(m.subprocess, "check_output", side_effect=[json.dumps(first), json.dumps(last)]), \
+                    patch.object(m, "pages", return_value=rest + rest):
+                results.append(m.live_state("o/r", "1", C, history=history + history, record=record))
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(len(history), 1)
+        self.assertEqual(m.attempt_key(C, results[0][0]), m.attempt_key(C, results[1][0]))
+
     def test_inactive_state_tracks_body_and_flags_without_authorizing_work(self):
         history = []
         prepare(findings([thread()]), history=history)
@@ -263,9 +366,9 @@ class ReceiptTests(unittest.TestCase):
 
     def test_exact_human_confirmation_only_settles_specific_live_intent(self):
         intent = {"nonce": "a" * 32, "head": A, "after": 0}
-        comments = [{"body": m.marker("ci-intent", intent), "user": actor("github-actions[bot]", m.ACTIONS_ID)}]
+        comments = [{"id": 1, "body": m.marker("ci-intent", intent), "user": actor("github-actions[bot]", m.ACTIONS_ID)}]
         command = "/claude-fixer reconcile-label " + intent["nonce"] + " " + B
-        human = {"body": command, "user": {"login": "writer", "type": "User", "id": 12}}
+        human = {"id": 2, "body": command, "user": {"login": "writer", "type": "User", "id": 12}}
         self.assertIsNone(m.pending_ci_intent([], comments + [human], head=B, permission=lambda _: "write"))
         self.assertEqual(m.ci_label_decision([], comments + [human], head=B), "allow")
         self.assertIsNone(m.pending_ci_intent([], comments + [human | {"body": command.replace(B, "b" * 64)}], head="b" * 64, permission=lambda _: "write"))
@@ -503,7 +606,7 @@ class ReadinessTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             m.record_ci_ownership("o/r", "1", A, 0, "writer", lambda p: [], lambda *args: self.fail("must not post"))
         event = {"id": 7, "event": "labeled", "label": {"name": "ci:full"}}
-        owned = {"user": actor("github-actions[bot]", m.ACTIONS_ID), "body": m.marker("ci-owned", {"head": A, "event": 7})}
+        owned = {"id": 100, "user": actor("github-actions[bot]", m.ACTIONS_ID), "body": m.marker("ci-owned", {"head": A, "event": 7})}
         deleted = []
         self.assertTrue(m.revoke_owned_ci("o/r", "1", B,
             lambda p: [owned] if p.endswith("comments") else [event], lambda *args: deleted.append(True), lambda *args: None))
@@ -513,7 +616,7 @@ class ReadinessTests(unittest.TestCase):
         labeled = {"id": 7, "event": "labeled", "label": {"name": "ci:full"}}
         removed = {"id": 8, "event": "unlabeled", "label": {"name": "ci:full"},
                    "actor": actor("github-actions[bot]", m.ACTIONS_ID)}
-        invalidated = {"user": actor("github-actions[bot]", m.ACTIONS_ID), "body": m.marker("ci-invalidated", {"head": A, "event": 7})}
+        invalidated = {"id": 100, "user": actor("github-actions[bot]", m.ACTIONS_ID), "body": m.marker("ci-invalidated", {"head": A, "event": 7})}
         self.assertEqual(m.ci_label_decision([], []), "allow")
         self.assertEqual(m.ci_label_decision([labeled], []), "present")
         self.assertEqual(m.ci_label_decision([labeled, removed], [invalidated]), "allow")

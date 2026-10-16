@@ -381,7 +381,10 @@ roots are reconciled before eligibility filtering, including malformed/removed
 or non-bug metadata, resolved/outdated flags and absence from both complete API
 views. Those inactive states advance history but never become fixer work.
 Contradictory GraphQL/REST presence or identity fails closed; restoring a root
-to eligible state cannot reuse its pre-inactivation generation.
+to eligible state cannot reuse its pre-inactivation generation. Before filtering,
+thread IDs, root-to-thread identity and REST comment IDs are validated. Exact
+identical pagination overlaps deduplicate; conflicting duplicates abort before
+journal writes or eligibility decisions, including inactive and untrusted variants.
 
 The snapshot binds meaningful trusted follow-up comment IDs, author IDs and
 body digests. Exact unchanged content retains its previously authenticated

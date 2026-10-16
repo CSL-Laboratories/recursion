@@ -54,7 +54,44 @@ def bot(user: dict, login: str, identity: int) -> bool:
     return user.get("login") == login and user.get("type") == "Bot" and user.get("id") == identity
 
 
+def unique_snapshot(records, field="id", numeric=True):
+    """Only type-sensitive equivalent objects may overlap paginated snapshots."""
+    unique, signatures = {}, {}
+    for record in records:
+        identity = record.get(field)
+        valid = (type(identity) is int and identity > 0) if numeric else (isinstance(identity, str) and bool(identity))
+        if not valid:
+            raise ValueError("snapshot lacks stable identity")
+        signature = json.dumps(record, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        if identity in unique and signatures[identity] != signature:
+            raise ValueError("conflicting duplicate snapshot identity")
+        unique[identity] = record
+        signatures[identity] = signature
+    return list(unique.values())
+
+
+def review_snapshot(threads, comments):
+    """Validate identities before any eligibility filter or root-keyed map."""
+    threads = unique_snapshot(threads, numeric=False)
+    comments = unique_snapshot(comments)
+    owners = {}
+    for thread in threads:
+        nodes = (thread.get("comments") or {}).get("nodes") or []
+        if len(nodes) > 1:
+            raise ValueError("unexpected multiple root nodes")
+        if not nodes:
+            continue
+        root_id = nodes[0].get("databaseId")
+        if type(root_id) is not int or root_id <= 0:
+            raise ValueError("thread root lacks stable identity")
+        if root_id in owners:
+            raise ValueError("root belongs to multiple review threads")
+        owners[root_id] = thread["id"]
+    return threads, comments
+
+
 def findings(threads: list[dict], comments: list[dict], strict_snapshot: bool = False) -> list[dict]:
+    threads, comments = review_snapshot(threads, comments)
     found = []
     for thread in threads:
         if thread.get("isResolved") is not False or thread.get("isOutdated") is not False:
@@ -93,6 +130,8 @@ def findings(threads: list[dict], comments: list[dict], strict_snapshot: bool = 
 
 def observation_roots(threads, comments, history, eligible):
     """Track inactive previously observed roots without making them actionable."""
+    threads, comments = review_snapshot(threads, comments)
+    eligible = unique_snapshot(eligible, "root")
     tracked = {entry["root"] for comment in history
                if bot(comment.get("user") or {}, "github-actions[bot]", ACTIONS_ID)
                for entry in records(str(comment.get("body") or ""), "observation")
@@ -155,6 +194,7 @@ def substantive_followup(comment: dict, permission) -> bool:
 
 def observed_replies(replies, permission, prior=()):
     """Preserve exact previously authenticated content; authenticate changes."""
+    replies = unique_snapshot(replies)
     known = {(r["id"], r["author"], r["body"]) for r in prior}
     observed = {}
     for comment in replies:
@@ -362,9 +402,10 @@ def live_state(repo: str, number: str, head: str, history=None, record=None) -> 
             permissions[login] = api(f"repos/{repo}/collaborators/{login}/permission")["permission"]
         return permissions[login]
 
-    review_comments = pages(f"repos/{repo}/pulls/{number}/comments")
+    threads, review_comments = review_snapshot(threads, pages(f"repos/{repo}/pulls/{number}/comments"))
     eligible = findings(threads, review_comments, strict_snapshot=True)
     history = pages(f"repos/{repo}/issues/{number}/comments") if history is None else history
+    history = unique_snapshot(history)
     states = observation_roots(threads, review_comments, history, eligible)
     observed = prepare_observations(states, review_comments, history, permission,
         record or (lambda body: post(repo, number, body)))
@@ -375,6 +416,7 @@ def live_state(repo: str, number: str, head: str, history=None, record=None) -> 
 
 
 def label_event_id(events: list[dict]) -> int:
+    events = unique_snapshot(events)
     relevant = [e for e in events if e.get("event") in {"labeled", "unlabeled"}
                 and (e.get("label") or {}).get("name") == "ci:full"
                 and type(e.get("id")) is int]
@@ -383,6 +425,8 @@ def label_event_id(events: list[dict]) -> int:
 
 
 def ci_label_decision(events, comments, head=None):
+    comments = unique_snapshot(comments)
+    events = unique_snapshot(events)
     relevant = sorted((e for e in events if e.get("event") in {"labeled", "unlabeled"}
         and (e.get("label") or {}).get("name") == "ci:full" and type(e.get("id")) is int), key=lambda e: e["id"])
     if not relevant:
@@ -413,6 +457,7 @@ def known_label_rejection(error):
 
 def begin_ci_intent(repo, number, head, events, post_comment):
     """Persist uncertainty before mutation; intent alone is never ownership."""
+    events = unique_snapshot(events)
     after = max((e["id"] for e in events if type(e.get("id")) is int
                  and e.get("event") in {"labeled", "unlabeled"}
                  and (e.get("label") or {}).get("name") == "ci:full"), default=0)
@@ -422,6 +467,8 @@ def begin_ci_intent(repo, number, head, events, post_comment):
 
 
 def pending_ci_intent(events, comments, head=None, permission=None):
+    comments = unique_snapshot(comments)
+    events = unique_snapshot(events)
     # This command acknowledges uncertainty only. It never proves label ownership.
     confirmations = set()
     if SHA_RE.fullmatch(str(head or "")) and permission is not None:
@@ -498,7 +545,7 @@ def delete_label(repo, number):
 
 def revoke_owned_ci(repo, number, head, get_pages=None, delete=None, post_comment=None):
     get_pages, delete = get_pages or pages, delete or delete_label
-    comments = get_pages(f"repos/{repo}/issues/{number}/comments")
+    comments = unique_snapshot(get_pages(f"repos/{repo}/issues/{number}/comments"))
     current = label_event_id(get_pages(f"repos/{repo}/issues/{number}/events"))
     if not current:
         return False

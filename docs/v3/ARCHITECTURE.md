@@ -256,10 +256,10 @@ These model-level mappings preserve immutable M1 contracts and the blocked OR-01
 A failed mapping requires a separately scoped repair proposal, not a silent schema change. FND-002/FND-003.
 
 > **Ratified target, not operative authority.** `OR-018` and `OR-019` select the hierarchy and
-> Recursion-owned Option 2 boundary below. The
-> current `CONTROL_PLANE.md` still names Hermes as the automation-chain executive and remains
-> controlling. The docs-only [amendment proposal](CONSTITUTIONAL-AMENDMENT-PROPOSAL.md) does not
-> activate a replacement Head or transfer authority.
+> Recursion-owned Option 2 boundary below. `CONTROL_PLANE.md` records that the earlier
+> Hermes-led repository control plane was retired on 2026-09-28; it remains the controlling
+> authority document. The docs-only [amendment proposal](CONSTITUTIONAL-AMENDMENT-PROPOSAL.md)
+> does not activate a replacement Head or transfer authority.
 
 ## Correct hierarchy
 

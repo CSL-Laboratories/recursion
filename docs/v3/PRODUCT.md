@@ -142,7 +142,7 @@ already prefer, including by reducing unnecessary quota/usage burn:
 
 ## Initial user and deployment
 
-The first user is Lucas. The first deployment is a lightweight coordinator on the existing coordinator host, with heavier work placed on subscriptions, cloud execution, or authenticated registered nodes. The interactive CLI is the canonical local configuration and operation surface; an agent is never required to edit settings. Multiple detachable terminal windows can observe and converse with Head, ARMs and executors without owning their processes. Telegram is an optional interactive surface for Head and ARM conversations. No web, desktop or mobile graphical client is required for v3.
+The first user is Lucas. The first deployment is a lightweight coordinator on the existing coordinator host, with heavier work placed on subscriptions, cloud execution, or authenticated registered nodes. The interactive CLI is the canonical local configuration and operation surface; an agent is never required to edit settings. Multiple detachable terminal windows can observe and converse with Head, ARMs and executors without owning their processes. Telegram is an optional interactive surface for Head and ARM conversations. D-038 in `state/DECISIONS.md` requires GUI and mobile clients to be built as opt-in clients and confirms that D-034 and D-019 supersede older first-release exclusions.
 
 Public usability remains an explicit design requirement. Users should be able to install a useful minimal edition, bring their own official subscriptions or API credentials, select more capable bundles, and retain complete access to human-readable configuration.
 

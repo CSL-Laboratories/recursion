@@ -817,11 +817,19 @@ def existing_author_notes(description: str, marker: str) -> str:
 
 
 def is_approved_on_head_with_green_checks(pull: Pull) -> bool:
+    """Skip only when the first query and the later head/checks snapshot agree."""
     if (pull.review_decision or "").upper() != "APPROVED":
         return False
     if (pull.checks_state or "").upper() != "SUCCESS":
         return False
     if not pull.head_oid or pull.head_oid not in pull.approved_head_oids:
+        return False
+    # load_pr reads review_decision/checks_state/head_oid first, then
+    # _load_head_state. A push or check restart between those calls must
+    # not skip stuck threads on the newer head.
+    if not pull.head_sha or pull.head_sha != pull.head_oid:
+        return False
+    if not pull.required_checks_green:
         return False
     return True
 

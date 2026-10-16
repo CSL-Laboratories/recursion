@@ -309,6 +309,7 @@ class CapAndBodyTests(unittest.TestCase):
                     review_decision="APPROVED",
                     checks_state="SUCCESS",
                     head_oid="abc",
+                    head_sha="abc",
                     approved_head_oids=("abc",),
                 )
             ),
@@ -346,6 +347,35 @@ class CapAndBodyTests(unittest.TestCase):
                     checks_state="SUCCESS",
                     head_oid="abc",
                     approved_head_oids=(),
+                )
+            ),
+            "",
+        )
+        # First query still says approved+green on A; later head/checks do not.
+        self.assertEqual(
+            mod.skip_pr_reason(
+                pull(
+                    threads=[t],
+                    review_decision="APPROVED",
+                    checks_state="SUCCESS",
+                    head_oid=STALE,
+                    approved_head_oids=(STALE,),
+                    head_sha=HEAD,
+                    checks_green=True,
+                )
+            ),
+            "",
+        )
+        self.assertEqual(
+            mod.skip_pr_reason(
+                pull(
+                    threads=[t],
+                    review_decision="APPROVED",
+                    checks_state="SUCCESS",
+                    head_oid=HEAD,
+                    approved_head_oids=(HEAD,),
+                    head_sha=HEAD,
+                    checks_green=False,
                 )
             ),
             "",
@@ -667,6 +697,7 @@ class ScanTests(unittest.TestCase):
             review_decision="APPROVED",
             checks_state="SUCCESS",
             head_oid="abc",
+            head_sha="abc",
             approved_head_oids=("abc",),
         )
         gh = FakeGitHub([p])
@@ -675,6 +706,26 @@ class ScanTests(unittest.TestCase):
         self.assertEqual(counters.mediated, 0)
         self.assertEqual(lin.created, [])
         self.assertEqual(gh.comments, [])
+
+    def test_stale_approval_snapshot_still_mediates_stuck_threads(self) -> None:
+        t = thread(tid="PRRT_stale", comments=stuck_pair())
+        p = pull(
+            threads=[t],
+            review_decision="APPROVED",
+            checks_state="SUCCESS",
+            head_oid=STALE,
+            approved_head_oids=(STALE,),
+            head_sha=HEAD,
+            checks_green=True,
+        )
+        gh = FakeGitHub([p])
+        lin = FakeLinear()
+        counters = mod.scan(cfg(), gh, lin)  # type: ignore[arg-type]
+        self.assertEqual(mod.skip_pr_reason(p), "")
+        self.assertEqual(counters.mediated, 1)
+        self.assertEqual(len(gh.comments), 1)
+        self.assertIn("@codex review", gh.comments[0][1])
+        self.assertEqual(len(lin.created), 1)
 
     def test_cancels_rollup_when_all_threads_resolve(self) -> None:
         t = thread(comments=stuck_pair(), resolved=True)

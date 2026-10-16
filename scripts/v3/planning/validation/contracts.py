@@ -159,12 +159,18 @@ def validate_dag(plan: dict, tasks: list[dict]) -> tuple[str | None, dict | None
         if visit(node, [node]):
             return "E-DAG-CYCLE", _witness("E-DAG-CYCLE", object_ids=cycle_nodes, edges=edges)
 
-    reach = {(a, b) for a in node_ids for b in graph[a]}
-    for pivot in node_ids:
-        for left in node_ids:
-            for right in node_ids:
-                if (left, pivot) in reach and (pivot, right) in reach:
-                    reach.add((left, right))
+    # Transitive closure: (source, node) for every node reachable from source.
+    reach: set[tuple[str, str]] = set()
+    for source in node_ids:
+        seen: set[str] = set()
+        stack = list(graph[source])
+        while stack:
+            node = stack.pop()
+            if node in seen:
+                continue
+            seen.add(node)
+            reach.add((source, node))
+            stack.extend(graph[node])
     ordered = lambda a, b: (a, b) in reach or (b, a) in reach
     for index, left in enumerate(sorted(tasks, key=lambda t: t["id"])):
         for right in sorted(tasks, key=lambda t: t["id"])[index + 1:]:

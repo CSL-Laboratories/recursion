@@ -1,5 +1,6 @@
-"""Minimal upstream CLI harness (CSL-27).
+"""Upstream CLI harness.
 
-This package is the first executable slice. It is not a language, store, or
-framework selection.
+CSL-27 routes one task. CSL-82 adds land, clean, logs, and the remaining
+launch-critical adapters. This package is not a language, store, or framework
+selection, and it is not the native model loop.
 """

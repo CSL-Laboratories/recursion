@@ -791,6 +791,8 @@ class RealHelperLifecycleTests(unittest.TestCase):
                 if state.pop("fail_next_comments", False):
                     raise OSError("transient postcheck")
                 return json.dumps(state["comments"])
+            if "/collaborators/" in path and path.endswith("/permission"):
+                return json.dumps({"permission": state.get("permission", "write")})
             if path == f"repos/{REPO}/pulls/7":
                 return json.dumps({"state": "open", "draft": False, "head": {"sha": state["head"], "repo": {"full_name": REPO}}, "labels": [{"name": "ci:full"}] if state["label"] else []})
             if "/labels/ci:full" in path and "DELETE" in args:
@@ -888,6 +890,20 @@ class RealHelperLifecycleTests(unittest.TestCase):
                 before_owned = sum("claude-fixer-ci-owned:" in c["body"] for c in state["comments"])
                 self.assertEqual(ready()["action"], "unverified-ci-label")
                 self.assertEqual(before_owned, sum("claude-fixer-ci-owned:" in c["body"] for c in state["comments"]))
+                if failure == "lag_after_label":
+                    nonce = helper.pending_ci_intent(state["events"], state["comments"])
+                    command = f"/claude-fixer reconcile-label {nonce} {state['head']}"
+                    state["comments"].append({"id": len(state["comments"]) + 1, "body": command,
+                        "user": {"login": "human", "type": "User", "id": 123}})
+                    state["permission"] = "read"
+                    self.assertEqual(ready()["action"], "unverified-ci-label")
+                    state["permission"] = "write"
+                    state["pending"] = [item]
+                    self.assertEqual(ready()["action"], "paused-findings")
+                    state["pending"] = []
+                    self.assertEqual(ready()["action"], "ready-present")
+                    # Confirmation did not adopt the ambiguous existing label.
+                    self.assertEqual(before_owned, sum("claude-fixer-ci-owned:" in c["body"] for c in state["comments"]))
                 # Explicit human remove/readd settles the uncertainty. If POST
                 # never took effect, the human first adds then removes it.
                 human = {"login": "human", "id": 123, "type": "User"}

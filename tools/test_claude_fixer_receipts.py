@@ -46,7 +46,7 @@ class ReceiptTests(unittest.TestCase):
         self.sleep = sleeper.start()
         self.addCleanup(sleeper.stop)
         self.items = findings([thread()])
-        self.receipt = {"root": 1, "fingerprint": self.items[0]["fingerprint"],
+        self.receipt = {"v": 2, "observation": m.observation_token([], lambda _: "write"), "root": 1, "fingerprint": self.items[0]["fingerprint"],
                         "status": "addressed", "base": A, "commit": B}
 
     def pending(self, comments, compare=lambda base, tip: "ahead", manual=False):
@@ -93,23 +93,48 @@ class ReceiptTests(unittest.TestCase):
         self.assertEqual([c.args[0] for c in self.sleep.call_args_list], [1, 2])
         self.assertIsNone(m.pending_ci_intent([late], comments))
 
-    def test_same_second_correction_uses_monotonic_comment_id(self):
-        receipt = reply(self.receipt | {"status": "needs-human"}) | {"id": 100}
-        follow = {"id": 101, "in_reply_to_id": 1, "created_at": receipt["created_at"],
+    def test_observation_proves_both_equal_second_orderings_and_replay(self):
+        follow = {"id": 99, "in_reply_to_id": 1, "created_at": "2026-10-15T01:00:00Z",
+                  "updated_at": "2026-10-16T01:00:00Z",
                   "user": actor("devin-ai-integration[bot]", m.DEVIN_ID), "body": "Still fails"}
-        self.assertTrue(self.pending([receipt, follow]))
-        self.assertEqual(self.pending([receipt, follow | {"id": 99}]), [])
-        self.assertEqual(self.pending([receipt, follow | {"id": 100}]), [])
-        edited = follow | {"id": 99, "created_at": "2026-10-15T01:00:00Z", "updated_at": receipt["created_at"]}
-        self.assertTrue(self.pending([receipt, edited]))
-        first = m.attempt_key(C, self.pending([receipt, edited]))
-        self.assertEqual(first, m.attempt_key(C, self.pending([receipt, edited, edited | {"id": 98}])))
+        preflight = self.pending([follow])[0]
+        receipt = reply(self.receipt | {"observation": preflight["observation"]}) | {"id": 100}
+        # Edit was observed before preflight: equal-second receipt suppresses it.
+        self.assertEqual(self.pending([receipt, follow]), [])
+        # Same timestamp, changed body after preflight: retry regardless of ID.
+        changed = follow | {"body": "Still fails differently"}
+        pending = self.pending([receipt, changed])
+        self.assertTrue(pending)
+        self.assertEqual(m.attempt_key(C, pending), m.attempt_key(C, self.pending([receipt, changed, changed])))
+        self.assertTrue(self.pending([receipt]))  # Deletion changes snapshot.
+        self.assertTrue(self.pending([receipt, follow, changed | {"id": 101}]))
+        for bad in ({}, {"v": 1}, {"v": True}, {"observation": "bad"}):
+            data = self.receipt | {"observation": preflight["observation"]} | bad
+            if not bad:
+                data.pop("v")
+            self.assertTrue(self.pending([reply(data), follow]))
+        # An unchanged observation remains valid on later descendant heads.
+        self.assertEqual(m.pending_findings(self.items, [receipt, follow], C, lambda b,t: "ahead", lambda _: "write"), [])
+
+    def test_exact_human_confirmation_only_settles_specific_live_intent(self):
+        intent = {"nonce": "a" * 32, "head": A, "after": 0}
+        comments = [{"body": m.marker("ci-intent", intent), "user": actor("github-actions[bot]", m.ACTIONS_ID)}]
+        command = "/claude-fixer reconcile-label " + intent["nonce"] + " " + B
+        human = {"body": command, "user": {"login": "writer", "type": "User", "id": 12}}
+        self.assertIsNone(m.pending_ci_intent([], comments + [human], head=B, permission=lambda _: "write"))
+        self.assertEqual(m.ci_label_decision([], comments + [human], head=B), "allow")
+        self.assertIsNone(m.pending_ci_intent([], comments + [human | {"body": command.replace(B, "b" * 64)}], head="b" * 64, permission=lambda _: "write"))
+        for body in ("> " + command, command + "\n", command + "\nconfirmed", command.replace(B, A), command.replace("a" * 32, "b" * 32)):
+            self.assertEqual(m.pending_ci_intent([], comments + [human | {"body": body}], head=B, permission=lambda _: "write"), intent["nonce"])
+        for user, permission in ((actor("github-actions[bot]", m.ACTIONS_ID), "write"), (human["user"], "read")):
+            self.assertEqual(m.pending_ci_intent([], comments + [human | {"user": user}], head=B, permission=lambda _: permission), intent["nonce"])
+        self.assertEqual(m.pending_ci_intent([], comments + [human], head=C, permission=lambda _: "write"), intent["nonce"])
 
     def test_inline_indented_receipts_and_quoted_writer_correction(self):
         for body in ("Fixed. " + m.marker("result", self.receipt), "  " + m.marker("result", self.receipt)):
             self.assertEqual(self.pending([reply(self.receipt) | {"body": body}]), [])
         terminal = reply(self.receipt | {"status": "needs-human"})
-        correction = {"in_reply_to_id": 1, "created_at": "2026-10-16T02:00:00Z",
+        correction = {"id": 201, "in_reply_to_id": 1, "created_at": "2026-10-16T02:00:00Z",
                       "user": {"login": "writer", "type": "User", "id": 12},
                       "body": "> " + terminal["body"] + "\nThis still fails with empty input."}
         self.assertTrue(self.pending([terminal, correction]))
@@ -172,11 +197,11 @@ class ReceiptTests(unittest.TestCase):
         receipt = reply(self.receipt | {"status": "needs-human"})
         self.assertEqual(self.pending([receipt]), [])
         self.assertTrue(self.pending([receipt], manual=True))
-        follow = {"in_reply_to_id": 1, "created_at": "2026-10-16T02:00:00Z",
+        follow = {"id": 202, "in_reply_to_id": 1, "created_at": "2026-10-16T02:00:00Z",
                   "user": actor("devin-ai-integration[bot]", m.DEVIN_ID), "body": "This still fails for empty input"}
         pending = self.pending([receipt, follow])
         self.assertTrue(pending)
-        self.assertIn("generation", pending[0])
+        self.assertIn("observation", pending[0])
         structured = follow | {"body": '<!-- devin-review-comment {"kind":"bug"} -->\nStill broken'}
         self.assertTrue(self.pending([receipt, structured]))
         analysis = follow | {"body": '<!-- devin-review-comment {"kind":"analysis"} -->\nStill reviewing'}
@@ -190,7 +215,7 @@ class AttemptTests(unittest.TestCase):
         sleeper = patch.object(m.time, "sleep")
         self.sleep = sleeper.start()
         self.addCleanup(sleeper.stop)
-        self.items = findings([thread()])
+        self.items = m.pending_findings(findings([thread()]), [], A, lambda b,t: "ahead", lambda _: "write")
         self.key = m.attempt_key(A, self.items)
 
     def attempts(self, count=3, user=None):
@@ -217,7 +242,7 @@ class AttemptTests(unittest.TestCase):
             "LOOP_COMMIT_COUNT": loop_count, "MANUAL_RETRY": "true" if manual else "false", "GITHUB_OUTPUT": str(Path(d) / "out"),
             "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1"}), \
                 patch.object(m.subprocess, "check_output", return_value=json.dumps(threads)), \
-                patch.object(m, "pages", side_effect=[root_comments([thread()]) + ([reply({"root": 1, "fingerprint": self.items[0]["fingerprint"], "base": A, "commit": B, "status": "addressed"})] if compare_error else []), self.attempts(count)]), \
+                patch.object(m, "pages", side_effect=[root_comments([thread()]) + ([reply({"v": 2, "observation": m.observation_token([], lambda _: "write"), "root": 1, "fingerprint": self.items[0]["fingerprint"], "base": A, "commit": B, "status": "addressed"})] if compare_error else []), self.attempts(count)]), \
                 patch.object(m, "api", side_effect=api_response), \
                 patch.object(m, "revoke_owned_ci"), \
                 patch.object(m, "post", side_effect=OSError("write failed") if post_error else None) as post:

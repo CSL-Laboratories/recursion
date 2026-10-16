@@ -874,35 +874,38 @@ jobs:
               return permission(login) in {"write", "maintain", "admin"}
 
 
-          def newer_comment(comment, receipt):
-              stamp = str(comment.get("updated_at") or comment.get("created_at") or "")
-              previous = str(receipt.get("created_at") or "")
-              if stamp != previous:
-                  return stamp > previous
-              cid, rid = comment.get("id"), receipt.get("id")
-              edited = str(comment.get("updated_at") or "") > str(comment.get("created_at") or "")
-              # An edit to an older reply can share the receipt's second. IDs order
-              # creations only, so conservatively rearm a demonstrably edited reply.
-              return edited or (type(cid) is int and type(rid) is int and cid > rid)
+          def observation_token(replies, permission):
+              """Order-independent proof of the exact meaningful trusted reply snapshot."""
+              observed = {}
+              for comment in replies:
+                  if not substantive_followup(comment, permission):
+                      continue
+                  cid, uid = comment.get("id"), (comment.get("user") or {}).get("id")
+                  if type(cid) is not int or cid <= 0 or type(uid) is not int or uid <= 0:
+                      raise ValueError("meaningful follow-up lacks stable identity")
+                  entry = {"id": cid, "author": uid, "body": digest(str(comment.get("body") or ""))}
+                  if cid in observed and observed[cid] != entry:
+                      raise ValueError("inconsistent duplicate follow-up snapshot")
+                  observed[cid] = entry
+              return digest(json.dumps(sorted(observed.values(), key=lambda c: (c["id"], c["author"], c["body"])), sort_keys=True, separators=(",", ":")))
 
 
           def pending_findings(items: list[dict], comments: list[dict], head: str, compare, permission, manual: bool = False) -> list[dict]:
               pending = []
               for item in items:
                   replies = [c for c in comments if c.get("in_reply_to_id") == item["root"]]
+                  observation = observation_token(replies, permission)
                   terminal = False
-                  generations = set()
                   for reply in replies:
                       if not bot(reply.get("user") or {}, "claude[bot]", CLAUDE_ID):
                           continue
                       for receipt in records(str(reply.get("body") or ""), "result"):
+                          if type(receipt.get("v")) is not int or receipt["v"] != 2 or receipt.get("observation") != observation:
+                              continue
                           if type(receipt.get("root")) is not int or receipt.get("root") != item["root"] or receipt.get("fingerprint") != item["fingerprint"]:
                               continue
                           base = str(receipt.get("base") or "")
                           if not SHA_RE.fullmatch(base):
-                              continue
-                          stamp = str(reply.get("created_at") or "")
-                          if not stamp:
                               continue
                           status = receipt.get("status")
                           valid = False
@@ -911,16 +914,10 @@ jobs:
                               valid = bool(SHA_RE.fullmatch(commit)) and compare(base, commit) == "ahead" and compare(commit, head) in {"ahead", "identical"}
                           elif status == "needs-human":
                               valid = compare(base, head) in {"ahead", "identical"}
-                          if not valid:
-                              continue
-                          followups = [c for c in replies if newer_comment(c, reply) and substantive_followup(c, permission)]
-                          if followups:
-                              generations.update(digest(str((c.get("user") or {}).get("login")) + "\n" + str(c.get("body") or "")) for c in followups)
-                              continue
-                          if status == "addressed" or not manual:
+                          if valid and (status == "addressed" or not manual):
                               terminal = True
                   if not terminal:
-                      pending.append({**item, **({"generation": digest(json.dumps(sorted(generations)))} if generations else {})})
+                      pending.append({**item, "v": 2, "observation": observation})
               return pending
 
 
@@ -1063,7 +1060,19 @@ jobs:
               return intent
 
 
-          def pending_ci_intent(events, comments):
+          def pending_ci_intent(events, comments, head=None, permission=None):
+              # This command acknowledges uncertainty only. It never proves label ownership.
+              confirmations = set()
+              if SHA_RE.fullmatch(str(head or "")) and permission is not None:
+                  for comment in comments:
+                      user = comment.get("user") or {}
+                      body = comment.get("body")
+                      if user.get("type") != "User" or not isinstance(body, str):
+                          continue
+                      match = re.fullmatch(r"/claude-fixer reconcile-label ([0-9a-f]{32}) ([0-9a-f]{40}(?:[0-9a-f]{24})?)", body)
+                      login = str(user.get("login") or "")
+                      if match and match[2] == head and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", login) and permission(login) in {"write", "maintain", "admin"}:
+                          confirmations.add(match[1])
               trusted = [c for c in comments if bot(c.get("user") or {}, "github-actions[bot]", ACTIONS_ID)]
               rejected = {r.get("nonce") for c in trusted for r in records(str(c.get("body") or ""), "ci-rejected")
                           if r.get("status") in {400, 401, 403, 404, 409, 422, 429}}
@@ -1085,7 +1094,7 @@ jobs:
                                         and (e.get("label") or {}).get("name") == "ci:full"
                                         and bot(e.get("actor") or {}, "github-actions[bot]", ACTIONS_ID)
                                         and any(e["id"] > event_id for event_id in rollback_events) for e in events)
-                      if nonce not in owned and nonce not in rejected and not superseded and not rolled_back:
+                      if nonce not in owned and nonce not in rejected and nonce not in confirmations and not superseded and not rolled_back:
                           return nonce
               return None
 
@@ -1324,8 +1333,9 @@ jobs:
             5. If you disagree, do NOT resolve the thread; reply explaining why and leave it unresolved for mediation.
                Do not resolve a thread you have not answered. Disagreements and needs-human handoffs must remain unresolved for mediation.
                Do not use graphql for any other mutation.
-            6. Post a structured receipt on each handled root using its exact root ID, fingerprint and base from RECEIPT CONTEXT:
-               <!-- claude-fixer-result:{"root":123,"fingerprint":"<exact fingerprint>","status":"addressed","base":"<base SHA>","commit":"<pushed fix SHA>"} -->
+            6. Post a structured receipt on each handled root using its exact v, observation token, root ID, fingerprint and base from RECEIPT CONTEXT:
+               <!-- claude-fixer-result:{"v":2,"observation":"<exact observation token>","root":123,"fingerprint":"<exact fingerprint>","status":"addressed","base":"<base SHA>","commit":"<pushed fix SHA>"} -->
+               Copy the observation token exactly; never recompute it or infer reply order from timestamps.
                Only mark addressed after the gate passes and the actual fix commit is pushed; the commit must descend from base.
                For a genuine decision requiring human intervention, use status needs-human and omit commit. Explain the decision in the same reply.
                Never post a terminal receipt for a failed gate, denied command, transient failure or an unpushed fix. Such failures remain retryable.

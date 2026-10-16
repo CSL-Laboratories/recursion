@@ -468,6 +468,11 @@ def run_verdict(
         notice("skipping Codex verdict on a fork or draft PR")
         emit({"action": "skip-fork", "pr_number": number, "head_sha": sha})
         return {"action": "skip-fork", "verdict": ""}
+    def confirmation_permission(actor):
+        if not current_ready_head(repo, number, sha, read_token, gh=gh):
+            return "none"
+        value = json.loads(gh(["api", f"repos/{repo}/collaborators/{actor}/permission"], read_token))
+        return value.get("permission")
     records: list[dict[str, Any]] = []
     comments: list[str] = []
     if number and read_token:
@@ -477,13 +482,13 @@ def run_verdict(
             )
             gate_writer = json.loads(gh(["api", "user"], pat)) if pat and is_codex_login(login) and parse_verdict(review.get("body")) in {"READY", "MEDIATE"} else None
             if is_codex_login(login) and parse_verdict(review.get("body")) == "READY":
+                if not current_ready_head(repo, number, sha, read_token, gh=gh):
+                    return {"action": "skip-stale-head", "verdict": "READY"}
                 label_events = _parse_json_list(gh(["api", "--paginate", f"repos/{repo}/issues/{number}/events?per_page=100"], read_token))
-                if fixer_helpers().pending_ci_intent(label_events, records):
-                    notice("Unverified prior ci:full write: inspect the label and explicitly remove/re-add it to restore human control")
+                if pending_nonce := fixer_helpers().pending_ci_intent(label_events, records, head=sha, permission=confirmation_permission):
+                    notice(f"Unverified prior ci:full write: inspect the label, then a current writer may post exactly /claude-fixer reconcile-label {pending_nonce} {sha}; this acknowledges uncertainty only")
                     return {"action": "unverified-ci-label", "verdict": "READY"}
             comments = comments_after_pause(sha, records, gate_writer)
-            if is_codex_login(login) and parse_verdict(review.get("body")) == "READY" and not current_ready_head(repo, number, sha, read_token, gh=gh):
-                return {"action": "skip-stale-head", "verdict": "READY"}
             if is_codex_login(login) and parse_verdict(review.get("body")) == "READY" and readiness_blocked(repo, number, sha, records, read_token, gh=gh):
                 if not current_ready_head(repo, number, sha, read_token, gh=gh):
                     return {"action": "skip-stale-head", "verdict": "READY"}
@@ -522,8 +527,8 @@ def run_verdict(
             events = get_pages(f"repos/{repo}/issues/{number}/events")
             before = helper.label_event_id(events)
             ownership_comments = get_pages(f"repos/{repo}/issues/{number}/comments")
-            if helper.pending_ci_intent(events, ownership_comments):
-                notice("Unverified prior ci:full write: inspect the label and explicitly remove/re-add it to restore human control")
+            if pending_nonce := helper.pending_ci_intent(events, ownership_comments, head=sha, permission=confirmation_permission):
+                notice(f"Unverified prior ci:full write: inspect the label, then a current writer may post exactly /claude-fixer reconcile-label {pending_nonce} {sha}; this acknowledges uncertainty only")
                 return {"action": "unverified-ci-label", "verdict": "READY"}
             if helper.ci_label_decision(events, ownership_comments, head=sha) == "preserve-human-removal":
                 removal = max(e["id"] for e in events if e.get("event") == "unlabeled"

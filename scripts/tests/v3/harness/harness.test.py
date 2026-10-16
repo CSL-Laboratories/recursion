@@ -43,18 +43,36 @@ from scripts.v3.harness.usage import (  # noqa: E402
 
 
 SECRET = "SECRET-TOKEN-VALUE"
-CODEX_SESSION = (
-    '{"type":"turn.completed","usage":{"input_tokens":1000,"output_tokens":10}}\n'
-    '{"type":"turn.completed","usage":{"input_tokens":6900000,"output_tokens":4000}}\n'
-)
-GROK_APPROVE = "\n".join(
-    (
-        json.dumps({"type": "thought", "data": "Checking the diff"}),
-        json.dumps({"type": "text", "data": "The change matches the task.\n"}),
-        json.dumps({"type": "text", "data": "VERDICT approve\n"}),
-        json.dumps({"type": "usage", "usage": {"input_tokens": 12, "output_tokens": 4}}),
-    )
-)
+FIXTURE_DIR = Path(__file__).with_name("fixtures")
+_EVIDENCE = {"source-documented", "locally observed", "synthetic"}
+_PROVIDERS = {"grok", "codex", "claude"}
+
+
+def _load_fixture(name: str) -> tuple[dict[str, str], str]:
+    """Return the header map and the stream body. Header lines are not events."""
+
+    raw = (FIXTURE_DIR / name).read_text(encoding="utf-8")
+    header: dict[str, str] = {}
+    body: list[str] = []
+    in_header = True
+    for line in raw.splitlines():
+        if in_header and line.startswith("# "):
+            key, separator, value = line[2:].partition(":")
+            if separator:
+                header[key.strip()] = value.strip()
+            continue
+        if in_header and not line.strip():
+            continue
+        in_header = False
+        body.append(line)
+    text = "\n".join(body)
+    if raw.endswith("\n"):
+        text += "\n"
+    return header, text
+
+
+CODEX_SESSION = _load_fixture("codex-cumulative.txt")[1]
+GROK_APPROVE = _load_fixture("grok-review.txt")[1]
 
 
 def _completed(argv, code: int, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess[str]:
@@ -77,15 +95,11 @@ class HarnessTests(unittest.TestCase):
     def test_codex_jsonl_agent_message_is_the_assistant_text(self) -> None:
         from scripts.v3.harness.streams import assistant_text
 
-        stream = "\n".join(
-            [
-                json.dumps({"type": "thread.started"}),
-                json.dumps({"type": "item.completed", "item": {"type": "command_execution", "text": "ls"}}),
-                json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "Done"}}),
-                json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}}),
-            ]
+        raw = (FIXTURE_DIR / "codex-exec-jsonl.txt").read_text(encoding="utf-8")
+        self.assertEqual(
+            assistant_text(raw),
+            "Repo contains docs, sdk, and examples directories.",
         )
-        self.assertEqual(assistant_text(stream), "Done")
 
     def test_shipped_config_enables_fixtures_and_raises_the_codex_ceiling(self) -> None:
         config = load_config()
@@ -422,14 +436,20 @@ class HarnessTests(unittest.TestCase):
             bindir.mkdir()
             home.mkdir()
             (bindir / "claude").write_text("", encoding="utf-8")
-            body = json.dumps({"authMethod": "claude.ai", "loggedIn": True, "token": SECRET})
+            header, body = _load_fixture("claude-auth-status-redaction.txt")
+            self.assertIn(SECRET, body)
 
             def run(argv, timeout):
                 del timeout
                 if argv[1:] == ["--version"]:
                     return _completed(argv, 0, stdout=f"claude 2.1.0 {SECRET}\n")
                 if argv[1:] == ["auth", "status"]:
-                    return _completed(argv, 1, stdout=body + "\n", stderr=f"refresh notice {SECRET}\n")
+                    return _completed(
+                        argv,
+                        int(header["exit-code"]),
+                        stdout=body,
+                        stderr=f"refresh notice {SECRET}\n",
+                    )
                 raise AssertionError(argv)
 
             report = diagnose(
@@ -539,7 +559,9 @@ class HarnessTests(unittest.TestCase):
             enabled = {item["name"] for item in written["providers"] if item["enabled"]}
             self.assertEqual(enabled, {"fixture", "fixture-b"})
             self.assertEqual(written["budgets"]["max_input_tokens"], DEFAULT_MAX_INPUT_TOKENS)
-            self.assertEqual(json.loads(stdout.getvalue())["path"], str(target))
+            emitted = json.loads(stdout.getvalue())
+            self.assertEqual(set(emitted["enabled"]), {"fixture", "fixture-b"})
+            self.assertEqual(Path(emitted["path"]), target)
 
     def test_windows_shim_resolves_and_posix_does_not(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -553,6 +575,241 @@ class HarnessTests(unittest.TestCase):
             posix = resolve_executable("claude", path=str(root), platform="linux")
             self.assertIsNotNone(posix)
             self.assertEqual(posix.name, "claude")
+
+    @unittest.skipUnless(sys.platform == "win32", "runs on the ci:full Windows job")
+    def test_doctor_windows_path_shim_does_not_start_a_provider_cli(self) -> None:
+        """Resolve a Windows shim through doctor. The stub probe never execs it."""
+
+        raw = (FIXTURE_DIR / "claude-auth-status-exit-1.txt").read_text(encoding="utf-8")
+        header, _body = _load_fixture("claude-auth-status-exit-1.txt")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home"
+            home.mkdir()
+            shim = root / "claude.cmd"
+            shim.write_bytes(b"@echo off\r\nexit /b 1\r\n")
+
+            def run(argv, timeout):
+                del timeout
+                self.assertEqual(Path(argv[0]).name.casefold(), "claude.cmd")
+                if argv[1:] == ["--version"]:
+                    return _completed(argv, 0, stdout="claude 2.1.300\n")
+                if argv[1:] == ["auth", "status"]:
+                    return _completed(argv, int(header["exit-code"]), stdout=raw)
+                raise AssertionError(argv)
+
+            real_run = subprocess.run
+
+            def guarded_run(argv, *args, **kwargs):
+                text = " ".join(str(part) for part in argv)
+                if any(name in text.casefold() for name in ("claude", "codex", "grok")):
+                    raise AssertionError(text)
+                return real_run(argv, *args, **kwargs)
+
+            with patch("subprocess.run", guarded_run):
+                report = diagnose(
+                    starter_config({"claude"}),
+                    environ={},
+                    home=home,
+                    path=str(root),
+                    run=run,
+                    git_run=lambda argv, timeout: _completed(argv, 0, stdout="git version 2.45.0\n"),
+                )
+            row = {item["name"]: item for item in report["providers"]}["claude"]
+            self.assertTrue(row["installed"])
+            self.assertTrue(str(row["resolved"]).casefold().endswith("claude.cmd"))
+            self.assertEqual(row["signed_in"], "signed-in")
+            self.assertEqual(row["auth_method"], "claude.ai")
+            self.assertEqual(shim.read_bytes(), b"@echo off\r\nexit /b 1\r\n")
+
+    def test_checked_in_stream_fixtures_match_the_parsers(self) -> None:
+        from scripts.v3.harness.streams import assistant_text, claude_last_message
+
+        names = sorted(path.name for path in FIXTURE_DIR.glob("*.txt"))
+        self.assertEqual(
+            names,
+            [
+                "claude-auth-status-exit-1.txt",
+                "claude-auth-status-redaction.txt",
+                "claude-auth-status.txt",
+                "claude-stream-json.txt",
+                "codex-cumulative.txt",
+                "codex-exec-jsonl.txt",
+                "grok-review.txt",
+                "grok-streaming-json.txt",
+            ],
+        )
+        for name in names:
+            header, body = _load_fixture(name)
+            self.assertIn(header["provider"], _PROVIDERS)
+            self.assertIn(header["evidence"], _EVIDENCE)
+            self.assertTrue(header["cli-version"])
+            self.assertTrue(body.strip())
+            if header["evidence"] == "synthetic":
+                self.assertIn("synthetic", header["note"].casefold())
+
+        grok_review = (FIXTURE_DIR / "grok-review.txt").read_text(encoding="utf-8")
+        verdict, notes = parse_verdict(grok_review)
+        self.assertEqual(verdict, "approve")
+        self.assertIn("matches the task", notes)
+        self.assertEqual(parse_usage(grok_review)["input_tokens"], 12)
+
+        grok_doc = (FIXTURE_DIR / "grok-streaming-json.txt").read_text(encoding="utf-8")
+        self.assertEqual(parse_verdict(grok_doc)[0], "revise")
+        self.assertEqual(assistant_text(grok_doc), "Here's a summary")
+        documented = parse_usage(grok_doc)
+        self.assertEqual(documented["input_tokens"], 812)
+        self.assertEqual(documented["output_tokens"], 45)
+
+        codex_doc = (FIXTURE_DIR / "codex-exec-jsonl.txt").read_text(encoding="utf-8")
+        published = parse_usage(codex_doc)
+        self.assertEqual(published["input_tokens"], 24763)
+        self.assertEqual(published["output_tokens"], 122)
+        self.assertEqual(
+            assistant_text(codex_doc),
+            "Repo contains docs, sdk, and examples directories.",
+        )
+        cumulative = parse_usage((FIXTURE_DIR / "codex-cumulative.txt").read_text(encoding="utf-8"))
+        self.assertEqual(cumulative["input_tokens"], 6_900_000)
+        self.assertEqual(cumulative["output_tokens"], 4000)
+
+        claude_stream = (FIXTURE_DIR / "claude-stream-json.txt").read_text(encoding="utf-8")
+        claude_events = [
+            json.loads(line) for line in claude_stream.splitlines() if line.startswith("{")
+        ]
+        claude_content = claude_events[0]["message"]["content"][0]["text"]
+        claude_result = claude_events[1]["result"]
+        self.assertNotEqual(claude_content.strip(), claude_result.strip())
+        self.assertNotIn("VERDICT", claude_result)
+        self.assertEqual(assistant_text(claude_stream), claude_content)
+        self.assertEqual(parse_verdict(claude_stream)[0], "approve")
+        two_messages = "\n".join(
+            json.dumps(
+                {"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}
+            )
+            for text in ("Review complete.", "VERDICT approve\n")
+        )
+        self.assertEqual(parse_verdict(two_messages)[0], "approve")
+        feedback_first = "\n".join(
+            json.dumps(
+                {"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}
+            )
+            for text in ("Restore the missing error branch.", "VERDICT revise\n")
+        )
+        self.assertEqual(
+            parse_verdict(feedback_first),
+            ("revise", "Restore the missing error branch."),
+        )
+        crowded = "\n".join(
+            json.dumps(
+                {"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}
+            )
+            for text in ("x" * 1100, "Change the error branch.\nVERDICT revise")
+        )
+        verdict, notes = parse_verdict(crowded)
+        self.assertEqual(verdict, "revise")
+        self.assertTrue(notes.startswith("Change the error branch."))
+        flipped = json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Fix X.\nVERDICT approve\nActually no.\nVERDICT revise",
+                        }
+                    ]
+                },
+            }
+        )
+        flipped_verdict, flipped_notes = parse_verdict(flipped)
+        self.assertEqual(flipped_verdict, "revise")
+        self.assertEqual(flipped_notes, "Fix X.\nActually no.")
+        self.assertNotIn("VERDICT", flipped_notes)
+        stale_verdict = "\n".join(
+            json.dumps(
+                {"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}
+            )
+            for text in ("VERDICT approve\n", "Need another pass.\n")
+        )
+        self.assertIn("VERDICT approve", stale_verdict)
+        self.assertEqual(claude_last_message(stale_verdict), "Need another pass.\n")
+        self.assertEqual(parse_verdict(stale_verdict)[0], "revise")
+        trailing_empty = "\n".join(
+            (
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {"content": [{"type": "text", "text": "VERDICT approve\n"}]},
+                    }
+                ),
+                json.dumps(
+                    {"type": "assistant", "message": {"content": [{"type": "text", "text": ""}]}},
+                ),
+            )
+        )
+        self.assertEqual(claude_last_message(trailing_empty), "VERDICT approve\n")
+        self.assertEqual(parse_verdict(trailing_empty)[0], "approve")
+        tool_then_empty = json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "Review complete."},
+                        {"type": "tool_use", "name": "Bash", "input": {}},
+                        {"type": "text", "text": ""},
+                        {"type": "text", "text": "VERDICT approve\n"},
+                    ]
+                },
+            }
+        )
+        self.assertEqual(
+            assistant_text(tool_then_empty),
+            "Review complete.\nVERDICT approve\n",
+        )
+        self.assertEqual(parse_verdict(tool_then_empty)[0], "approve")
+        result_only = json.dumps({"type": "result", "result": "fallback text"})
+        self.assertEqual(assistant_text(result_only), "fallback text")
+        claude_usage = parse_usage(claude_stream)
+        self.assertEqual(claude_usage["input_tokens"], 150)
+        self.assertEqual(claude_usage["output_tokens"], 70)
+        self.assertEqual(claude_usage["cost"], 0.0123)
+
+        self._doctor_reads_auth_fixture("claude-auth-status.txt")
+        self._doctor_reads_auth_fixture("claude-auth-status-exit-1.txt", raw=True)
+        self._doctor_reads_auth_fixture("claude-auth-status-redaction.txt")
+
+    def _doctor_reads_auth_fixture(self, name: str, *, raw: bool = False) -> None:
+        header, body = _load_fixture(name)
+        stdout = (FIXTURE_DIR / name).read_text(encoding="utf-8") if raw else body
+        with tempfile.TemporaryDirectory() as directory:
+            bindir = Path(directory) / "bin"
+            home = Path(directory) / "home"
+            bindir.mkdir()
+            home.mkdir()
+            (bindir / "claude").write_text("", encoding="utf-8")
+
+            def run(argv, timeout):
+                del timeout
+                if argv[1:] == ["--version"]:
+                    return _completed(argv, 0, stdout="claude 2.1.300\n")
+                if argv[1:] == ["auth", "status"]:
+                    return _completed(argv, int(header["exit-code"]), stdout=stdout)
+                raise AssertionError(argv)
+
+            report = diagnose(
+                starter_config({"claude"}),
+                environ={},
+                platform="linux",
+                home=home,
+                path=str(bindir),
+                run=run,
+                git_run=lambda argv, timeout: _completed(argv, 0, stdout="git version 2.45.0\n"),
+            )
+        row = {item["name"]: item for item in report["providers"]}["claude"]
+        self.assertEqual(row["signed_in"], "signed-in")
+        self.assertEqual(row["auth_method"], "claude.ai")
+        self.assertTrue(row["usable"])
 
     def test_capability_route_skips_disabled_providers(self) -> None:
         config = starter_config({"fixture", "claude", "codex", "grok"})
@@ -636,10 +893,12 @@ class HarnessTests(unittest.TestCase):
                 open_adapter=lambda name: Watch("fixture", "hello"),
             )
             cwd = Path(str(seen["cwd"]))
+            expected = (state / record["run_id"] / "workspace").resolve()
             self.assertTrue(seen["allow_live"])
-            self.assertEqual(cwd.resolve(), (state / record["run_id"] / "workspace").resolve())
-            self.assertEqual(cwd, (state / record["run_id"] / "workspace").resolve())
+            self.assertEqual(cwd.resolve(), expected)
+            self.assertEqual(cwd, expected)
             self.assertTrue(cwd.is_dir())
+            self.assertEqual(Path(str(record["workspace"])).resolve(), expected)
             self.assertEqual(record["workspace"], str(cwd))
             if os.name == "posix":
                 self.assertEqual(cwd.stat().st_mode & 0o777, 0o700)

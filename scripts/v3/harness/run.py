@@ -74,8 +74,19 @@ def run_task(
     def snapshot() -> dict:
         return store.active(clock())
 
-    def save_failure(status: str, exc: HarnessError) -> None:
-        _finish(
+    def notify_replacement(provider_name: str) -> None:
+        if holder.get("notified") == provider_name or provider is None or not provider_name or provider_name == provider:
+            return
+        holder["notified"] = provider_name
+        print(
+            f"notice: requested provider {provider} was replaced by {provider_name}",
+            file=sys.stderr,
+        )
+
+    def finish(status: str, error: str | None = None) -> dict:
+        # The record names whoever actually ran. Fallback updates holder first.
+        notify_replacement(holder["provider"])
+        return _finish(
             config,
             state_dir,
             run_id=run_id,
@@ -86,11 +97,14 @@ def run_task(
             reviews=reviews,
             usage=usage,
             status=status,
-            error=str(exc),
+            error=error,
             workspace=workspace,
             attempts=attempts,
             cooldowns=snapshot(),
         )
+
+    def save_failure(status: str, exc: HarnessError) -> None:
+        finish(status, error=str(exc))
 
     def dispatch(names: list[str], request: ProviderRequest, *, on_exhaust: str) -> tuple[str, object]:
         """Try each provider. Availability failures cool down and move on."""
@@ -163,42 +177,15 @@ def run_task(
         save_failure("failed", exc)
         raise exc
 
-    def notify_replacement(provider_name: str) -> None:
-        if holder.get("notified") == provider_name or provider is None or not provider_name or provider_name == provider:
-            return
-        holder["notified"] = provider_name
-        print(
-            f"notice: requested provider {provider} was replaced by {provider_name}",
-            file=sys.stderr,
-        )
-
-    def finish(status: str, provider_name: str):
-        notify_replacement(provider_name)
-        return _finish(
-            config,
-            state_dir,
-            run_id=run_id,
-            task=task,
-            provider=provider_name,
-            reviewers=[name for name in candidates if name != provider_name],
-            text=shown,
-            reviews=reviews,
-            usage=usage,
-            status=status,
-            workspace=workspace,
-            attempts=attempts,
-            cooldowns=snapshot(),
-        )
-
     kind, result = dispatch(worker_candidates, _request(worker_task, run_id, "execute", workspace), on_exhaust="fail")
     if kind == "budget":
-        return finish("budget-exceeded", holder["provider"])
+        return finish("budget-exceeded")
     holder["provider"] = result.provider
     notify_replacement(result.provider)
     add_usage(usage, parse_usage(result.text))
     shown = assistant_text(result.text)
     if exceeded(usage, budgets):
-        return finish("budget-exceeded", result.provider)
+        return finish("budget-exceeded")
 
     max_rounds = config["review"]["max_rounds"]
     review_candidates = [name for name in candidates if name != result.provider]
@@ -213,7 +200,7 @@ def run_task(
                     "verdict": "skipped",
                 }
             )
-        return finish(status, result.provider)
+        return finish(status)
 
     status = "review-rejected"
     for round_index in range(1, max_rounds + 1):
@@ -282,7 +269,7 @@ def run_task(
             status = "budget-exceeded"
             break
 
-    return finish(status, result.provider)
+    return finish(status)
 
 
 def _provider_offline(name: str) -> bool:

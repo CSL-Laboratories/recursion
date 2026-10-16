@@ -1,0 +1,9 @@
+# provider: claude
+# evidence: synthetic
+# cli-version: 2.1.300
+# exit-code: 1
+# source: https://code.claude.com/docs/en/cli-reference
+# retrieved: 2026-10-15
+# note: Synthetic. One JSON line so the doctor parser can read loggedIn from the file, header included. Exit 1 with loggedIn true is the reported doctor failure, not a pasted capture. CLI version is the CSL-81 changelog pin, Claude Code 2.1.300 dated 2026-10-14 (https://code.claude.com/docs/en/changelog). That version did not produce this file. authMethod values are from the CLI reference.
+
+{"loggedIn": true, "authMethod": "claude.ai"}

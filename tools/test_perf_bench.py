@@ -239,10 +239,14 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("types: [labeled]", on_block)
         self.assertNotIn("unlabeled", on_block)
         self.assertNotRegex(label_wf, r"(?m)^  linux:")
+        self.assertNotRegex(label_wf, r"(?m)^  windows:")
+        self.assertNotRegex(label_wf, r"(?m)^  macos:")
         self.assertNotIn("name: linux", label_wf)
+        self.assertNotIn("name: windows", label_wf)
+        self.assertNotIn("name: macos", label_wf)
+        self.assertIn("name: ci-full-extra-os", label_wf)
         self.assertIn("github.event.label.name == 'ci:full'", label_wf)
-        self.assertIn("name: windows", label_wf)
-        self.assertIn("name: macos", label_wf)
+        self.assertIn("uses: ./.github/workflows/ci-full-matrix.yml", label_wf)
         self.assertNotIn("needs: linux", label_wf)
         for line in label_wf.splitlines():
             if line.lstrip().startswith("run:"):
@@ -251,6 +255,15 @@ class WorkflowTests(unittest.TestCase):
                     line,
                     "label name must not enter a shell step",
                 )
+        matrix_wf = (ROOT / ".github" / "workflows" / "ci-full-matrix.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("workflow_call:", matrix_wf)
+        self.assertNotRegex(matrix_wf, r"(?m)^  linux:")
+        self.assertNotIn("name: linux", matrix_wf)
+        self.assertIn("name: windows", matrix_wf)
+        self.assertIn("name: macos", matrix_wf)
+        self.assertNotIn("needs: linux", matrix_wf)
         pr_lint = (ROOT / ".github" / "workflows" / "pr-lint.yml").read_text(encoding="utf-8")
         self.assertIn("runs-on: ubuntu-latest", pr_lint)
         self.assertNotIn("blacksmith", pr_lint)

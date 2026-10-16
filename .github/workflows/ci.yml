@@ -20,11 +20,11 @@
 # `timeout 55` lets the shell emit ::warning:: on hang; timeout-minutes is a
 # backstop, and a follow-up step warns if that backstop kills the shell.
 #
-# Label add/remove would otherwise re-run this whole workflow. linux still
-# runs for `ci:full` (Windows/macOS need it) and `enhancement` (manual
-# re-trigger). Other label events report the required `linux` check from a
-# GitHub-hosted no-op so branch protection stays green without Blacksmith minutes.
-# Draft PRs skip the Blacksmith linux suite; marking ready_for_review re-runs it.
+# Label add/remove would otherwise re-run this whole workflow (and, with
+# cancel-in-progress, abort an in-flight linux run). The workflow-level `if`
+# starts CI only for `ci:full` / `enhancement` label events. Other labels do
+# not start a run, so they cannot post a new `linux` check over a real
+# failure. Draft PRs are the same: no `linux` status until ready_for_review.
 name: CI
 
 on:
@@ -34,9 +34,36 @@ on:
     branches: [master]
   workflow_dispatch:
 
+# Unrelated labeled/unlabeled events must not share the PR concurrency group:
+# cancel-in-progress would abort a real synchronize linux run. ci:full and
+# enhancement keep the main group so they retrigger as intended.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: >-
+    ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{
+      github.event_name == 'pull_request' &&
+      (github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
+      github.event.label.name != 'ci:full' &&
+      github.event.label.name != 'enhancement' &&
+      'label-churn' || 'run'
+    }}
   cancel-in-progress: true
+
+# Skip the whole workflow (no linux check run) for drafts and for label
+# events other than ci:full / enhancement. A skipped job named `linux` that
+# exits 0 would satisfy branch protection over a failed suite on the same SHA.
+if: >
+  github.event_name != 'pull_request' ||
+  (
+    github.event.pull_request.draft == false &&
+    (
+      (
+        github.event.action != 'labeled' &&
+        github.event.action != 'unlabeled'
+      ) ||
+      github.event.label.name == 'ci:full' ||
+      github.event.label.name == 'enhancement'
+    )
+  )
 
 permissions:
   contents: read
@@ -49,19 +76,6 @@ env:
 jobs:
   linux:
     name: linux
-    if: >
-      github.event_name != 'pull_request' ||
-      (
-        github.event.pull_request.draft == false &&
-        (
-          (
-            github.event.action != 'labeled' &&
-            github.event.action != 'unlabeled'
-          ) ||
-          github.event.label.name == 'ci:full' ||
-          github.event.label.name == 'enhancement'
-        )
-      )
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 15
     outputs:
@@ -119,24 +133,6 @@ jobs:
         env:
           CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: python3 -X utf8 -B tools/ci_gate.py
-
-  # Same check name as `linux` so the required status stays green when a
-  # label event should not pay for the Blacksmith suite. Mutually exclusive
-  # with the job above. windows/macos need: linux (job id), so they stay
-  # skipped here.
-  linux-label-skip:
-    name: linux
-    if: >
-      github.event_name == 'pull_request' &&
-      github.event.pull_request.draft == false &&
-      (github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
-      github.event.label.name != 'ci:full' &&
-      github.event.label.name != 'enhancement'
-    runs-on: ubuntu-latest
-    timeout-minutes: 2
-    steps:
-      - name: Skip full Linux CI for unrelated label events
-        run: echo "Skipping full Linux suite for label '${{ github.event.label.name }}' (not ci:full or enhancement)."
 
   windows:
     name: windows

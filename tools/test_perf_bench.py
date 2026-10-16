@@ -213,22 +213,20 @@ class WorkflowTests(unittest.TestCase):
         # The required linux job stays green when the script warns and returns 0.
         self.assertEqual(perf_compare.job_exit_code(bench_ok=True), 0)
 
-    def test_unrelated_label_events_skip_blacksmith_linux(self) -> None:
+    def test_unrelated_label_events_do_not_post_linux(self) -> None:
         text = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-        self.assertIn("linux-label-skip:", text)
-        self.assertIn("github.event.label.name == 'ci:full'", text)
-        self.assertIn("github.event.label.name == 'enhancement'", text)
-        self.assertIn("ready_for_review", text.split("jobs:", 1)[0])
-        linux = text[text.index("  linux:\n") : text.index("  linux-label-skip:")]
+        preamble = text.split("jobs:", 1)[0]
+        self.assertNotIn("linux-label-skip:", text)
+        self.assertIn("github.event.label.name == 'ci:full'", preamble)
+        self.assertIn("github.event.label.name == 'enhancement'", preamble)
+        self.assertIn("github.event.pull_request.draft == false", preamble)
+        self.assertIn("ready_for_review", preamble)
+        self.assertIn("label-churn", preamble)
+        self.assertIn("cancel-in-progress: true", preamble)
+        self.assertEqual(text.count("name: linux"), 1)
+        linux = text[text.index("  linux:\n") : text.index("  windows:")]
         self.assertIn("runs-on: blacksmith-2vcpu-ubuntu-2404", linux)
-        self.assertIn("github.event.action != 'labeled'", linux)
-        self.assertIn("github.event.pull_request.draft == false", linux)
-        skip = text[text.index("  linux-label-skip:") : text.index("  windows:")]
-        self.assertIn("name: linux", skip)
-        self.assertIn("runs-on: ubuntu-latest", skip)
-        self.assertIn("github.event.label.name != 'ci:full'", skip)
-        self.assertIn("github.event.label.name != 'enhancement'", skip)
-        self.assertIn("github.event.pull_request.draft == false", skip)
+        self.assertNotIn("github.event.action != 'labeled'", linux)
         windows = text[text.index("  windows:") : text.index("  macos:")]
         self.assertIn("needs: linux", windows)
         pr_lint = (ROOT / ".github" / "workflows" / "pr-lint.yml").read_text(encoding="utf-8")

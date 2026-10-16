@@ -1122,7 +1122,7 @@ class FixerLoopCapTests(unittest.TestCase):
     def test_seven_claude_commits_runs(self) -> None:
         out, posted = self._run([("alice", "Alice")] + [("claude[bot]", "claude[bot]")] * 7, [])
         self.assertIn("skip=false", out)
-        self.assertEqual(posted, "")
+        self.assertEqual(posted.count("posted"), 1)
 
     def test_daily_fixer_markers_do_not_skip(self) -> None:
         from datetime import datetime, timezone
@@ -1132,6 +1132,15 @@ class FixerLoopCapTests(unittest.TestCase):
         out, posted = self._run(
             [("alice", "Alice")],
             [marker] * 3,
+        )
+        self.assertIn("skip=false", out)
+        self.assertEqual(posted.count("posted"), 1)
+
+    def test_bypass_cap_skips_daily_marker(self) -> None:
+        out, posted = self._run(
+            [("alice", "Alice")],
+            [],
+            bypass_cap="true",
         )
         self.assertIn("skip=false", out)
         self.assertEqual(posted, "")

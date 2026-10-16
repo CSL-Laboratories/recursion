@@ -634,11 +634,13 @@ jobs:
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ needs.resolve-pr.outputs.pr_number }}
           HEAD_SHA: ${{ needs.resolve-pr.outputs.head_sha }}
+          BYPASS_CAP: ${{ github.event.inputs.bypass_cap || github.event.client_payload.bypass_cap || 'false' }}
         run: |
           set -euo pipefail
           # Loop cap (CSL-202): pause after 8 consecutive claude[bot] commits
-          # since the last human commit. The 3-per-UTC-day dispatch cap is not
-          # enforced here (Codex-gate may still apply its own until CSL-201).
+          # since the last human commit. This job does not stop at 3 runs/day;
+          # it still posts <!-- codex-fixer-run:YYYY-MM-DD --> so Codex-gate
+          # (CSL-201) can keep counting dispatches until that cap is retired.
           commits="$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/commits?per_page=100" \
             --jq '.[] | [(.author.login // "-"), (.commit.author.name // "-")] | @tsv')"
           count=0
@@ -664,6 +666,11 @@ jobs:
             fi
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
+            day="$(date -u +%F)"
+            day_marker="<!-- codex-fixer-run:$day -->"
+            if [ "${BYPASS_CAP:-false}" != "true" ]; then
+              gh api "repos/$REPO/issues/$PR_NUMBER/comments" -f body="$day_marker"$'\n'"Codex gate: counting this batched fixer run for $day." >/dev/null
+            fi
           fi
       - uses: actions/checkout@v4
         if: steps.cap.outputs.skip != 'true'

@@ -152,6 +152,15 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(assistant_text(stream), "Fix the error path.\nVERDICT revise")
         self.assertEqual(parse_verdict(stream), ("revise", "Fix the error path."))
 
+    def test_codex_earlier_approval_withdrawn_by_last_message_is_revise(self) -> None:
+        def message(text: str) -> str:
+            return json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": text}})
+
+        stream = "\n".join([message("VERDICT approve"), message("Wait, the error path is broken.")])
+        self.assertEqual(parse_verdict(stream)[0], "revise")
+        started = json.dumps({"type": "turn.started"})
+        self.assertEqual(parse_verdict("\n".join([started, stream]))[0], "revise")
+
     def test_later_codex_verdict_wins(self) -> None:
         stream = "\n".join(
             [

@@ -99,6 +99,24 @@ def claude_last_message(raw: str) -> str | None:
     return messages[-1]
 
 
+def codex_last_message(raw: str) -> str | None:
+    """Return the last Codex agent message in the latest turn, or ``None``.
+
+    Same scope as ``assistant_text``: after the last ``turn.started`` when
+    present, otherwise the whole stream. A verdict is read from this message
+    only, so an earlier approval that a later message withdraws is not used.
+    """
+
+    events = _events(raw)
+    starts = [i for i, event in enumerate(events) if event.get("type") == "turn.started"]
+    if starts:
+        events = events[starts[-1] + 1 :]
+    messages = [text for text in (_agent_message(event) for event in events) if text]
+    if not messages:
+        return None
+    return messages[-1]
+
+
 def _events(raw: str) -> list[dict]:
     events: list[dict] = []
     for line in raw.splitlines():

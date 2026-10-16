@@ -13,15 +13,18 @@ acceptance, live-provider qualification, or scientific admission.
 Test discovery: files matching TEST_GLOBS run unless listed in TEST_EXCLUDE.
 assert_tests_accounted fails if a test-like file is neither run nor excluded.
 
-Path filter: when CI_BASE_SHA is set (PR base or push-before), a docs-only
-diff skips the contract-test suite but still runs whitespace_check and
-check_public_scope. --force always runs the suite.
+Path filter: when CI_BASE_SHA is set (PR base, merge_group.base_sha, or
+push-before), a docs-only diff skips the contract-test suite but still runs
+whitespace_check and check_public_scope. CI_HEAD_SHA (merge_group.head_sha,
+PR head, or github.sha) is the right side of that diff; it defaults to HEAD.
+--force always runs the suite.
 """
 from __future__ import annotations
 
 import argparse
 import ast
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -157,13 +160,27 @@ def comparison_sha() -> str | None:
     raw = os.environ.get("CI_BASE_SHA", "").strip()
     if not raw or raw == ZERO_SHA:
         return None
+    if not re.fullmatch(r'[0-9a-fA-F]{40}', raw):
+        raise ValueError('CI_BASE_SHA must be a full commit SHA')
+    return raw
+
+
+def head_ref() -> str:
+    """Right-hand side of the path-filter diff (merge_group.head_sha or HEAD)."""
+    raw = os.environ.get("CI_HEAD_SHA", "").strip()
+    if not raw:
+        return "HEAD"
+    if not re.fullmatch(r'[0-9a-fA-F]{40}', raw) or raw == ZERO_SHA:
+        raise ValueError('CI_HEAD_SHA must be a nonzero full commit SHA')
+    if git('rev-parse', f'{raw}^{{commit}}').lower() != git('rev-parse', 'HEAD').lower():
+        raise ValueError('CI_HEAD_SHA does not match the checked-out test tree')
     return raw
 
 
 def changed_paths(base: str) -> list[str]:
     # --no-renames: a source file moved into docs still counts the source path.
     # -z + core.quotePath=false: non-ASCII names are unquoted NUL-terminated paths.
-    return git_nul("diff", "-z", "--name-only", "--no-renames", base, "HEAD")
+    return git_nul("diff", "-z", "--name-only", "--no-renames", base, head_ref())
 
 
 def docs_only(base: str) -> bool:
@@ -174,9 +191,10 @@ def docs_only(base: str) -> bool:
 
 
 def decide_run_full(force: bool) -> bool:
+    head_ref()  # Validate supplied identity even when forcing the full suite.
+    base = comparison_sha()
     if force:
         return True
-    base = comparison_sha()
     if base is None:
         return True
     try:
@@ -391,9 +409,10 @@ def whitespace_check() -> None:
     if base is None:
         print("SKIP git diff --check (no CI_BASE_SHA)", flush=True)
         return
-    print(f"RUN git diff --check {base[:12]} HEAD", flush=True)
+    head = head_ref()
+    print(f"RUN git diff --check {base[:12]} {head[:12]}", flush=True)
     result = subprocess.run(
-        [*GIT, "diff", "--check", base, "HEAD"],
+        [*GIT, "diff", "--check", base, head],
         cwd=ROOT,
         check=False,
     )
@@ -464,6 +483,7 @@ def main() -> int:
         raise SystemExit(f"run from the repository root ({ROOT})")
     run_full = decide_run_full(force=args.force)
     emit_output("run_full", "true" if run_full else "false")
+    emit_output("classification", "full" if run_full else "docs-only")
     if args.paths_only:
         print(f"run_full={str(run_full).lower()}", flush=True)
         return 0

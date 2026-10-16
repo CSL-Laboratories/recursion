@@ -28,8 +28,9 @@
 #
 # Non-draft pull_request synchronize waits 120s on free GitHub-hosted Ubuntu
 # before Blacksmith jobs start. A newer push cancels this run (same concurrency
-# group) during that wait, so superseded heads never bill. Other events do not
-# wait: settle is skipped and linux/windows still run via always() && !cancelled().
+# group) during that wait. Cancellation after a paid job starts cannot undo billing.
+# Other events deliberately skip settle; explicit guards allow selected OS jobs.
+# Queue coverage is staged; master-push fallback remains until owner-approved activation.
 name: CI
 
 on:
@@ -37,6 +38,8 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [master]
+  merge_group:
+    types: [checks_requested]
   workflow_dispatch:
 
 concurrency:
@@ -78,6 +81,7 @@ jobs:
     timeout-minutes: 15
     outputs:
       run_full: ${{ steps.paths.outputs.run_full }}
+      classification: ${{ steps.paths.outputs.classification }}
     steps:
       # Full history: delegated-Q test_contract.py resolves TASK_BASE (0c908f6)^{tree}.
       # Packed repo is ~19MB, so this is cheaper than a second fetch of that commit.
@@ -88,7 +92,8 @@ jobs:
       - name: Path filter
         id: paths
         env:
-          CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          CI_HEAD_SHA: ${{ github.event.merge_group.head_sha || github.sha }}
         run: python3 -X utf8 -B tools/ci_gate.py --paths-only
 
       - name: Set up Python
@@ -106,7 +111,8 @@ jobs:
       - name: Provider-free gate
         if: steps.paths.outputs.run_full == 'true'
         env:
-          CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          CI_HEAD_SHA: ${{ github.event.merge_group.head_sha || github.sha }}
         run: python -X utf8 -B tools/ci_gate.py --force
 
       # Same job and runner as the gate. Slowdowns warn; a crash, timeout, or
@@ -129,7 +135,8 @@ jobs:
       - name: Docs-only lightweight checks
         if: steps.paths.outputs.run_full != 'true'
         env:
-          CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          CI_HEAD_SHA: ${{ github.event.merge_group.head_sha || github.sha }}
         run: python3 -X utf8 -B tools/ci_gate.py
 
   windows:
@@ -143,6 +150,7 @@ jobs:
       needs.linux.result == 'success' &&
       needs.linux.outputs.run_full == 'true' &&
       (github.event_name == 'push' ||
+       github.event_name == 'merge_group' ||
        github.event_name == 'workflow_dispatch' ||
        (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:full')))
     runs-on: blacksmith-2vcpu-windows-2025
@@ -180,7 +188,8 @@ jobs:
         !(github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.draft == false))) &&
       needs.linux.result == 'success' &&
       needs.linux.outputs.run_full == 'true' &&
-      (github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'merge_group' ||
+       github.event_name == 'workflow_dispatch' ||
        (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:full')))
     runs-on: macos-latest
     timeout-minutes: 15
@@ -201,3 +210,25 @@ jobs:
 
       - name: Provider-free gate
         run: python -X utf8 -B tools/ci_gate.py --force
+
+  platform-gates:
+    name: platform-gates
+    needs: [settle, linux, windows, macos]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: tools/ci_results.py
+          sparse-checkout-cone-mode: false
+      - name: Require every selected platform result
+        env:
+          CI_NEEDS: ${{ toJSON(needs) }}
+          CI_EVENT: ${{ github.event_name }}
+          CI_ACTION: ${{ github.event.action }}
+          CI_DRAFT: ${{ github.event.pull_request.draft || false }}
+          CI_FULL: ${{ contains(github.event.pull_request.labels.*.name, 'ci:full') }}
+          CI_CANCELLED: ${{ cancelled() }}
+        run: python3 -X utf8 -B tools/ci_results.py

@@ -736,12 +736,12 @@ class FixerGateAndPromptTests(unittest.TestCase):
             self.assertIn("use Edit/Write for files", body, job)
             self.assertIn("the gate result", body, job)
             self.assertIn("Linear-first (CSL-88)", body, job)
-            self.assertIn("PR-sync comment", body, job)
+            self.assertIn("has no Linear, Context7 or Parallel tools", body, job)
             self.assertIn("Context7", body, job)
             self.assertIn("Parallel", body, job)
-            self.assertIn("Triage", body, job)
-            self.assertIn("when those tools are available", body, job)
-            self.assertIn("not a denied command that blocks the push", body, job)
+            self.assertIn("PR author relays status and blockers to Linear", body, job)
+            self.assertIn("exact GitHub/gate commands below", body, job)
+            self.assertIn("Do not install tools, request access", body, job)
 
     def test_denials_are_reported_after_each_fixer(self) -> None:
         for job in ("claude-mention", "devin-review-fix"):

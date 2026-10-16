@@ -973,6 +973,7 @@ class ConflictJobStructureTests(unittest.TestCase):
 
     def test_resolver_keeps_protections(self) -> None:
         job = self._job("conflict-resolve")
+        self.assertIn("github.event_name != 'push'", job.split("steps:", 1)[0])
         self.assertIn("group: claude-${{ matrix.pr.number }}", job)
         self.assertIn("cancel-in-progress: false", job)
         self.assertIn("max-parallel: 1", job)

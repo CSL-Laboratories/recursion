@@ -231,7 +231,7 @@ def _gh(args: list[str], token: str, input_text: str | None = None) -> str:
         input=input_text,
     )
     if result.returncode != 0:
-        raise subprocess.CalledProcessError(result.returncode, ["gh", *args])
+        raise subprocess.CalledProcessError(result.returncode, ["gh", *args], stderr=result.stderr)
     return result.stdout
 
 
@@ -514,6 +514,7 @@ def run_verdict(
     if action == "ready" and number:
         owned_event = 0
         label_attempted = False
+        rejection_recorded = False
         intent = None
         try:
             helper = fixer_helpers()
@@ -524,7 +525,16 @@ def run_verdict(
             if helper.pending_ci_intent(events, ownership_comments):
                 notice("Unverified prior ci:full write: inspect the label and explicitly remove/re-add it to restore human control")
                 return {"action": "unverified-ci-label", "verdict": "READY"}
-            if helper.ci_label_decision(events, ownership_comments) == "preserve-human-removal":
+            if helper.ci_label_decision(events, ownership_comments, head=sha) == "preserve-human-removal":
+                removal = max(e["id"] for e in events if e.get("event") == "unlabeled"
+                    and (e.get("label") or {}).get("name") == CI_FULL_LABEL and type(e.get("id")) is int)
+                observed = any(helper.bot(c.get("user") or {}, "github-actions[bot]", helper.ACTIONS_ID)
+                    and any(r.get("head") == sha and r.get("event") == removal
+                        for r in helper.records(str(c.get("body") or ""), "ci-removal")) for c in ownership_comments)
+                if not observed:
+                    if not current_ready_head(repo, number, sha, read_token, gh=gh):
+                        return {"action": "skip-stale-head", "verdict": "READY"}
+                    post_comment(repo, number, helper.marker("ci-removal", {"head": sha, "event": removal}), read_token, gh=gh)
                 notice("ci:full was removed by a human or ownership is ambiguous; preserving manual control")
                 return {"action": "preserve-human-removal", "verdict": "READY"}
             if before:
@@ -533,7 +543,14 @@ def run_verdict(
             intent = helper.begin_ci_intent(repo, number, sha, events,
                 lambda r, n, body: post_comment(r, n, body, read_token, gh=gh)) if not before else None
             label_attempted = True
-            add_label(repo, number, CI_FULL_LABEL, pat, gh=gh)
+            try:
+                add_label(repo, number, CI_FULL_LABEL, pat, gh=gh)
+            except (OSError, subprocess.CalledProcessError) as error:
+                status = helper.known_label_rejection(error)
+                if intent and status:
+                    post_comment(repo, number, helper.marker("ci-rejected", {"nonce": intent["nonce"], "status": status}), read_token, gh=gh)
+                    rejection_recorded = True
+                raise
             def post_owned(r, n, body):
                 nonlocal owned_event
                 # The trusted helper calls this only after proving the exact new
@@ -563,6 +580,8 @@ def run_verdict(
                         gh(["api", "-X", "DELETE", f"repos/{repo}/issues/{number}/labels/ci:full"], read_token)
                 except (OSError, subprocess.CalledProcessError, ValueError):
                     notice("READY cleanup could not be verified; inspect ci:full manually")
+            elif rejection_recorded:
+                notice("READY label POST was rejected; a later READY can safely retry")
             elif label_attempted:
                 notice("READY label ownership could not be established; inspect ci:full manually")
             return {"action": "skip-readiness", "verdict": "READY"}

@@ -363,7 +363,28 @@ verified readiness check; a READY comment alone cannot override a pause.
 READY is reconciled from current unresolved findings and live label state, not
 from old READY comments. An already-present label causes no repeat label or
 audit writes. Authenticated MEDIATE deduplication remains separate. A verified
-human label removal is preserved. If a label write cannot be attributed after
+human label removal is preserved on the head where it is observed. A fresh
+READY on a subsequent head can authorize CI again. If a label write cannot be attributed after
 bounded event visibility retries, its pre-write intent blocks automatic READY
 until an explicit human remove/re-add resolves the uncertainty; later runs never
 claim ownership of that ambiguous label.
+
+GitHub timestamps have one-second precision. A substantive edit to an older
+reply in the same second as a handling receipt conservatively reopens the
+finding because edit order cannot be proved. Replayed unchanged content keeps
+the same attempt fingerprint: at most three automatic attempts on that head
+and finding set; the eight-commit guard still applies. A new commit or substantive
+finding change resets the attempt budget. This may retry an already handled
+finding, but does not silently discard a possible correction.
+
+For an uncertain label write, inspect the current PR label. Wait until a later
+timestamp second than the recorded intent, then explicitly remove and re-add
+`ci:full` (add it first if absent). A removal in the same second remains
+ambiguous and may require repeating that manual sequence later. Comment IDs
+and label-event IDs cannot establish cross-resource ordering; the gate never
+claims ownership of an ambiguous delayed label event.
+
+Ownership event visibility is retried after one and two seconds. A confirmed
+HTTP rejection of the label POST can close its intent; a timeout, transport
+error, server failure, or missing rejection receipt remains uncertain and
+requires the manual sequence above.

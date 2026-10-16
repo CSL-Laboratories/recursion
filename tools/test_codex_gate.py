@@ -755,6 +755,14 @@ class NoticeAndIoTests(unittest.TestCase):
 
 
 class RealHelperLifecycleTests(unittest.TestCase):
+    def test_gh_retains_rejection_for_classifier_without_printing_stderr(self):
+        result = subprocess.CompletedProcess(["gh"], 1, "", "Forbidden (HTTP 403)")
+        with mock.patch.object(gate.subprocess, "run", return_value=result), mock.patch("builtins.print") as printed:
+            with self.assertRaises(subprocess.CalledProcessError) as raised:
+                gate._gh(["api", "example"], "token")
+        self.assertEqual(gate.fixer_helpers().known_label_rejection(raised.exception), 403)
+        printed.assert_not_called()
+
     def test_real_helper_lifecycle_race_recovery_and_human_override(self):
         helper = gate.fixer_helpers()
         state = {"head": SHA, "pending": [], "comments": [], "events": [], "label": False, "race": False}
@@ -792,6 +800,8 @@ class RealHelperLifecycleTests(unittest.TestCase):
             if args[:2] == ["workflow", "run"]:
                 return "{}"
             if path.endswith("/labels"):
+                if state.pop("reject_label_post", False) or state.get("fail_rejected_receipt"):
+                    raise subprocess.CalledProcessError(1, ["gh", "api"], stderr="Forbidden (HTTP 403)")
                 if state.pop("fail_label_post", False):
                     raise OSError("POST failed before mutation")
                 if not state["label"]:
@@ -802,6 +812,8 @@ class RealHelperLifecycleTests(unittest.TestCase):
                 return "{}"
             if path.endswith("/comments") and input_text:
                 body = json.loads(input_text)["body"]
+                if "claude-fixer-ci-rejected:" in body and state.pop("fail_rejected_receipt", False):
+                    raise OSError("rejection receipt POST unavailable")
                 if "claude-fixer-ci-owned:" in body:
                     if state.pop("fail_owned_post", False):
                         raise OSError("transient receipt POST")
@@ -854,7 +866,17 @@ class RealHelperLifecycleTests(unittest.TestCase):
                 self.assertEqual(ready()["action"], "ready")
                 self.assertTrue(state["label"])
                 state["same_stamp"] = False
-            for failure in ("fail_label_post", "lag_after_label"):
+            state["pending"] = [item]
+            self.assertEqual(ready()["action"], "paused-findings")
+            state["pending"] = []
+            state["reject_label_post"] = True
+            with mock.patch.object(gate, "notice") as notices:
+                self.assertEqual(ready()["action"], "skip-readiness")
+            self.assertTrue(any("safely retry" in str(call) for call in notices.call_args_list))
+            self.assertFalse(any("inspect ci:full manually" in str(call) for call in notices.call_args_list))
+            self.assertFalse(state["label"])
+            self.assertEqual(ready()["action"], "ready")
+            for failure in ("fail_label_post", "lag_after_label", "fail_rejected_receipt"):
                 state["pending"] = [item]
                 self.assertEqual(ready()["action"], "paused-findings")
                 state["pending"] = []
@@ -890,12 +912,20 @@ class RealHelperLifecycleTests(unittest.TestCase):
             self.assertFalse(state["label"])
             state["pending"] = []
             self.assertEqual(ready()["action"], "ready")
-            # A verified human removal remains authoritative, including on a new head.
+            # A verified human removal remains authoritative on its observed head.
             state["label"] = False
             event("unlabeled", {"login": "human", "id": 123, "type": "User"})
             state["head"] = "c" * 40
             self.assertEqual(ready()["action"], "preserve-human-removal")
             self.assertFalse(state["label"])
+            # Repeated same-head READY preserves the removal without comment spam.
+            count = len(state["comments"])
+            self.assertEqual(ready()["action"], "preserve-human-removal")
+            self.assertEqual(len(state["comments"]), count)
+            # A fresh READY for a subsequent head has a new authorization scope.
+            state["head"] = "d" * 40
+            self.assertEqual(ready()["action"], "ready")
+            self.assertTrue(state["label"])
 
     def test_terminal_dedup_requires_authenticated_gate_writer(self):
         helper = gate.fixer_helpers()

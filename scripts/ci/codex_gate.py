@@ -150,11 +150,11 @@ def acted_comment_body(sha: str, verdict: str, extra: str = "") -> str:
 
 
 def has_terminal_action(sha: str, comments: list[str]) -> bool:
-    """Legacy FIX/timeout markers are nonterminal; only READY/MEDIATE deduplicate."""
+    """Only MEDIATE is terminal; READY is reconciled against live state."""
     return any(
         body.startswith(acted_comment_body(sha, verdict).rstrip("\n"))
         for body in comments
-        for verdict in ("READY", "MEDIATE")
+        for verdict in ("MEDIATE",)
     )
 
 
@@ -208,7 +208,7 @@ def decide_verdict(
     verdict = parse_verdict(body)
     if verdict == "FIX":
         return {"action": "ignored-fix", "verdict": "FIX"}
-    if has_terminal_action(sha, comments):
+    if verdict == "MEDIATE" and has_terminal_action(sha, comments):
         return {"action": "already-acted", "verdict": verdict or ""}
     if verdict is None:
         return {"action": "no-verdict", "verdict": ""}
@@ -314,13 +314,20 @@ def readiness_blocked(repo: str, number: str, sha: str, comments: list[dict[str,
     return fixer_helpers().readiness_blocked(repo, number, sha, comments, read_api=lambda path: json.loads(gh(["api", path], token)))
 
 
-def comments_after_pause(sha: str, comments: list[dict[str, Any]]) -> list[str]:
-    helper = fixer_helpers()
-    last_pause = helper.latest_pause_id(comments, sha)
-    checked = helper.latest_ready_check(comments, sha, last_pause) if last_pause else 0
-    return [str(comment.get("body") or "") for comment in comments
-            if not (last_pause and (not checked or int(comment.get("id") or 0) <= checked)
-                    and str(comment.get("body") or "").startswith(acted_comment_body(sha, "READY").rstrip("\n")))]
+def comments_after_pause(sha: str, comments: list[dict[str, Any]], writer: dict[str, Any] | None = None) -> list[str]:
+    """READY is live state; only authenticated MEDIATE comments deduplicate."""
+    trusted = []
+    for comment in comments:
+        body = str(comment.get("body") or "")
+        if body.startswith(acted_comment_body(sha, "READY").rstrip("\n")):
+            continue
+        terminal = body.startswith(acted_comment_body(sha, "MEDIATE").rstrip("\n"))
+        author = comment.get("user") or {}
+        authenticated = (writer is not None and type(writer.get("id")) is int
+                         and writer["id"] > 0 and all(author.get(key) == writer.get(key) for key in ("id", "login", "type")))
+        if not terminal or authenticated:
+            trusted.append(body)
+    return trusted
 
 
 def list_reviews(repo: str, number: str, token: str, gh: GhCall = _gh) -> list[dict[str, Any]]:
@@ -468,8 +475,18 @@ def run_verdict(
             records = _retry_listing(
                 lambda: list_comment_records(repo, number, read_token, gh=gh)
             )
-            comments = comments_after_pause(sha, records)
-            if is_codex_login(login) and parse_verdict(review.get("body")) == "READY" and (not current_ready_head(repo, number, sha, read_token, gh=gh) or readiness_blocked(repo, number, sha, records, read_token, gh=gh)):
+            gate_writer = json.loads(gh(["api", "user"], pat)) if pat and is_codex_login(login) and parse_verdict(review.get("body")) in {"READY", "MEDIATE"} else None
+            if is_codex_login(login) and parse_verdict(review.get("body")) == "READY":
+                label_events = _parse_json_list(gh(["api", "--paginate", f"repos/{repo}/issues/{number}/events?per_page=100"], read_token))
+                if fixer_helpers().pending_ci_intent(label_events, records):
+                    notice("Unverified prior ci:full write: inspect the label and explicitly remove/re-add it to restore human control")
+                    return {"action": "unverified-ci-label", "verdict": "READY"}
+            comments = comments_after_pause(sha, records, gate_writer)
+            if is_codex_login(login) and parse_verdict(review.get("body")) == "READY" and not current_ready_head(repo, number, sha, read_token, gh=gh):
+                return {"action": "skip-stale-head", "verdict": "READY"}
+            if is_codex_login(login) and parse_verdict(review.get("body")) == "READY" and readiness_blocked(repo, number, sha, records, read_token, gh=gh):
+                if not current_ready_head(repo, number, sha, read_token, gh=gh):
+                    return {"action": "skip-stale-head", "verdict": "READY"}
                 fixer_helpers().revoke_owned_ci(repo, number, sha,
                     get_pages=lambda path: _parse_json_list(gh(["api", "--paginate", path + "?per_page=100"], read_token)),
                     delete=lambda r, n: gh(["api", "-X", "DELETE", f"repos/{r}/issues/{n}/labels/ci:full"], read_token),
@@ -497,12 +514,24 @@ def run_verdict(
     if action == "ready" and number:
         owned_event = 0
         label_attempted = False
+        intent = None
         try:
             helper = fixer_helpers()
             get_pages = lambda path: _parse_json_list(gh(["api", "--paginate", path + "?per_page=100"], read_token))
             events = get_pages(f"repos/{repo}/issues/{number}/events")
             before = helper.label_event_id(events)
-            writer = json.loads(gh(["api", "user"], pat))["login"]
+            ownership_comments = get_pages(f"repos/{repo}/issues/{number}/comments")
+            if helper.pending_ci_intent(events, ownership_comments):
+                notice("Unverified prior ci:full write: inspect the label and explicitly remove/re-add it to restore human control")
+                return {"action": "unverified-ci-label", "verdict": "READY"}
+            if helper.ci_label_decision(events, ownership_comments) == "preserve-human-removal":
+                notice("ci:full was removed by a human or ownership is ambiguous; preserving manual control")
+                return {"action": "preserve-human-removal", "verdict": "READY"}
+            if before:
+                return {"action": "ready-present", "verdict": "READY"}
+            writer = gate_writer["login"]
+            intent = helper.begin_ci_intent(repo, number, sha, events,
+                lambda r, n, body: post_comment(r, n, body, read_token, gh=gh)) if not before else None
             label_attempted = True
             add_label(repo, number, CI_FULL_LABEL, pat, gh=gh)
             def post_owned(r, n, body):
@@ -511,15 +540,15 @@ def run_verdict(
                 # label event belongs to this gate writer. Keep proof if POST fails.
                 owned_event = helper.records(body, "ci-owned")[0]["event"]
                 post_comment(r, n, body, read_token, gh=gh)
-            helper.record_ci_ownership(repo, number, sha, before, writer, get_pages, post_owned)
+            helper.record_ci_ownership(repo, number, sha, before, writer, get_pages, post_owned, intent=intent)
             fresh = list_comment_records(repo, number, read_token, gh=gh)
             if not current_ready_head(repo, number, sha, read_token, gh=gh) or readiness_blocked(repo, number, sha, fresh, read_token, gh=gh):
-                helper.revoke_owned_ci(repo, number, sha, get_pages=get_pages,
-                    delete=lambda r, n: gh(["api", "-X", "DELETE", f"repos/{r}/issues/{n}/labels/ci:full"], read_token),
-                    post_comment=lambda r, n, body: post_comment(r, n, body, read_token, gh=gh))
+                if owned_event:
+                    post_comment(repo, number, helper.marker("ci-invalidated", {"head": sha, "event": owned_event, **({"nonce": intent["nonce"]} if intent else {})}), read_token, gh=gh)
+                    helper.rollback_ci_event(repo, number, owned_event, get_pages,
+                        lambda r, n: gh(["api", "-X", "DELETE", f"repos/{r}/issues/{n}/labels/ci:full"], read_token))
                 emit({"action": "paused-findings", "pr_number": number, "head_sha": sha})
                 return {"action": "paused-findings", "verdict": "READY"}
-            post_comment(repo, number, helper.marker("ci-checked", {"head": sha, "pause": helper.latest_pause_id(fresh, sha)}), read_token, gh=gh)
             post_comment(repo, number, acted_comment_body(sha, "READY"), pat, gh=gh)
             log(f"labeled PR #{number} {CI_FULL_LABEL}")
         except (OSError, subprocess.CalledProcessError, ValueError, KeyError):
@@ -527,6 +556,10 @@ def run_verdict(
             if owned_event:
                 try:
                     if helper.label_event_id(get_pages(f"repos/{repo}/issues/{number}/events")) == owned_event:
+                        try:
+                            post_comment(repo, number, helper.marker("ci-invalidated", {"head": sha, "event": owned_event, **({"nonce": intent["nonce"]} if intent else {})}), read_token, gh=gh)
+                        except (OSError, subprocess.CalledProcessError, ValueError):
+                            notice("READY recovery receipt failed; a later retry may need explicit human approval")
                         gh(["api", "-X", "DELETE", f"repos/{repo}/issues/{number}/labels/ci:full"], read_token)
                 except (OSError, subprocess.CalledProcessError, ValueError):
                     notice("READY cleanup could not be verified; inspect ci:full manually")

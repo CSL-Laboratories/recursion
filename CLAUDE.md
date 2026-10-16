@@ -359,3 +359,11 @@ label write; MEDIATE remains available. The gate records ownership of its exact
 `ci:full` label event. A later pause revokes only that owned label event, leaving
 a subsequent human label override intact. Same-head recovery requires a fresh
 verified readiness check; a READY comment alone cannot override a pause.
+
+READY is reconciled from current unresolved findings and live label state, not
+from old READY comments. An already-present label causes no repeat label or
+audit writes. Authenticated MEDIATE deduplication remains separate. A verified
+human label removal is preserved. If a label write cannot be attributed after
+bounded event visibility retries, its pre-write intent blocks automatic READY
+until an explicit human remove/re-add resolves the uncertainty; later runs never
+claim ownership of that ambiguous label.

@@ -43,11 +43,17 @@ def gh_blob(args: list) -> str:
     return " ".join(str(a) for a in args)
 
 
+READY_EVENT_READS = 0
+
 def ready_api_reply(args):
+    global READY_EVENT_READS
     if args[-1] == "user":
-        return json.dumps({"login": "gate-writer"})
+        return json.dumps({"login": "gate-writer", "id": 99, "type": "User"})
     if "/events?" in gh_blob(args):
-        return "[]"
+        READY_EVENT_READS += 1
+        if READY_EVENT_READS <= 2:
+            return "[]"
+        return json.dumps([{"id": 5, "event": "labeled", "label": {"name": "ci:full"}, "actor": {"login": "gate-writer"}}])
     if args[-1] == f"repos/{REPO}/pulls/7":
         return json.dumps({"state": "open", "draft": False, "head": {"sha": SHA, "repo": {"full_name": REPO}}})
     return "{}"
@@ -114,7 +120,7 @@ class MarkerAndVerdictTests(unittest.TestCase):
         for body in (gate.acted_marker(SHA), gate.acted_comment_body(SHA, "FIX"), f"{gate.acted_marker(SHA)}\nCodex gate: dispatching batched Devin review fixer (timeout) on 2026-10-15."):
             self.assertFalse(gate.has_terminal_action(SHA, [body]))
         for verdict in ("READY", "MEDIATE"):
-            self.assertTrue(gate.has_terminal_action(SHA, [gate.acted_comment_body(SHA, verdict)]))
+            self.assertEqual(gate.has_terminal_action(SHA, [gate.acted_comment_body(SHA, verdict)]), verdict == "MEDIATE")
 
 
 class AdmitResolvePrTests(unittest.TestCase):
@@ -285,13 +291,13 @@ class DecisionTests(unittest.TestCase):
 
     def test_verdict_deduplicates_only_the_acted_head(self) -> None:
         for verdict in ("READY", "MEDIATE"):
-            for head, expected in ((SHA, "already-acted"), ("b" * 40, verdict.lower())):
+            for head, expected in ((SHA, "already-acted" if verdict == "MEDIATE" else "ready"), ("b" * 40, verdict.lower())):
                 with self.subTest(verdict=verdict, head=head):
                     got = gate.decide_verdict(
                         login=gate.CODEX_REVIEW_LOGIN,
                         body=f"CODEX-GATE: {verdict}",
                         sha=head,
-                        comments=[gate.acted_comment_body(SHA, "READY")],
+                        comments=[gate.acted_comment_body(SHA, verdict)],
                     )
                     self.assertEqual(got["action"], expected)
 
@@ -425,11 +431,16 @@ class ReadyHeadTests(unittest.TestCase):
 
 class NoticeAndIoTests(unittest.TestCase):
     def setUp(self):
+        global READY_EVENT_READS
+        READY_EVENT_READS = 0
         # Existing I/O fixtures isolate routing; current-head validation has its
         # own behavioral controls below and can be overridden per scenario.
         patcher = mock.patch.object(gate, "current_ready_head", return_value=True)
         patcher.start()
         self.addCleanup(patcher.stop)
+        ready = mock.patch.object(gate, "readiness_blocked", return_value=False)
+        ready.start()
+        self.addCleanup(ready.stop)
 
     def test_run_request_missing_pat_emits_notice_and_does_not_post(self) -> None:
         calls: list[list[str]] = []
@@ -500,14 +511,16 @@ class NoticeAndIoTests(unittest.TestCase):
             calls.append((args, input_text))
             return json.dumps(comments) if "/comments?" in gh_blob(args) else ready_api_reply(args)
         helper = mock.Mock()
+        helper.pending_ci_intent.return_value = ""
+        helper.label_event_id.return_value = 0
         helper.latest_pause_id.return_value = 2
         helper.latest_ready_check.return_value = 0
         helper.marker.return_value = "checked"
         helper.readiness_blocked.return_value = True
-        with mock.patch.object(gate, "fixer_helpers", return_value=helper), mock.patch.object(gate, "emit"):
+        with mock.patch.object(gate, "fixer_helpers", return_value=helper), mock.patch.object(gate, "readiness_blocked", return_value=True), mock.patch.object(gate, "emit"):
             result = gate.run_verdict(review_event(login=gate.CODEX_REVIEW_LOGIN, body="CODEX-GATE: READY"), REPO, "pat", "read", "master", gh=gh)
         self.assertEqual(result["action"], "paused-findings")
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls), 3)
 
     def test_pause_invalidates_old_ready_for_mediate_and_recovered_ready(self) -> None:
         comments = [{"id": 1, "body": gate.acted_comment_body(SHA, "READY")},
@@ -518,8 +531,11 @@ class NoticeAndIoTests(unittest.TestCase):
                 calls.append((args, input_text))
                 return json.dumps(comments) if "/comments?" in gh_blob(args) else ready_api_reply(args)
             helper = mock.Mock()
+            helper.pending_ci_intent.return_value = ""
+            helper.label_event_id.return_value = 0
             helper.latest_pause_id.return_value = 2
             helper.latest_ready_check.return_value = 0
+            helper.bot.return_value = False
             helper.marker.return_value = "checked"
             helper.readiness_blocked.return_value = False
             with mock.patch.object(gate, "fixer_helpers", return_value=helper), mock.patch.object(gate, "emit"):
@@ -536,21 +552,27 @@ class NoticeAndIoTests(unittest.TestCase):
                 calls.append((args, input_text or ""))
                 return "[]" if "/comments?" in gh_blob(args) else ready_api_reply(args)
             helper = mock.Mock()
+            helper.pending_ci_intent.return_value = ""
+            helper.label_event_id.return_value = 0
             helper.latest_pause_id.return_value = 0
             helper.readiness_blocked.side_effect = [False, True]
             helper.marker.return_value = "checked"
+            helper.records.return_value = [{"event": 5}]
+            helper.begin_ci_intent.return_value = {"nonce": "a" * 32}
+            helper.record_ci_ownership.side_effect = lambda *args, **kwargs: args[-1](REPO, "7", "owned")
             head_checks = [True, False] if changed_head else [True, True]
             with mock.patch.object(gate, "fixer_helpers", return_value=helper), \
                  mock.patch.object(gate, "current_ready_head", side_effect=head_checks), \
+                 mock.patch.object(gate, "readiness_blocked", side_effect=[False, True]), \
                  mock.patch.object(gate, "emit"):
                 result = gate.run_verdict(review_event(login=gate.CODEX_REVIEW_LOGIN, body="CODEX-GATE: READY"), REPO, "pat", "read", "master", gh=gh)
             self.assertEqual(result["action"], "paused-findings")
             self.assertTrue(any("labels" in gh_blob(args) for args, _ in calls))
-            helper.revoke_owned_ci.assert_called_once()
+            helper.rollback_ci_event.assert_called_once()
             self.assertFalse(any("Codex gate acted: READY" in body for _, body in calls))
 
     def test_ready_failure_rolls_back_only_proven_event_and_reports_unknown_cleanup(self) -> None:
-        for failure in ("ownership", "postcheck", "checked", "terminal", "cleanup", "human-override"):
+        for failure in ("ownership", "postcheck", "terminal", "cleanup", "human-override"):
             calls, event_reads, comment_reads = [], 0, 0
             def gh(args, token, input_text=None):
                 nonlocal event_reads, comment_reads
@@ -558,15 +580,15 @@ class NoticeAndIoTests(unittest.TestCase):
                 blob = gh_blob(args)
                 if "/events?" in blob:
                     event_reads += 1
-                    if event_reads == 1:
+                    if event_reads <= 2:
                         return "[]"
-                    if failure == "cleanup" and event_reads >= 3:
+                    if failure == "cleanup" and event_reads >= 4:
                         raise OSError("unavailable during cleanup")
-                    identity = 6 if failure == "human-override" and event_reads >= 3 else 5
+                    identity = 6 if failure == "human-override" and event_reads >= 4 else 5
                     return json.dumps([{"id": identity, "event": "labeled", "label": {"name": "ci:full"}, "actor": {"login": "gate-writer" if identity == 5 else "human"}}])
                 if "/comments?" in blob:
                     comment_reads += 1
-                    if failure == "postcheck" and comment_reads > 1:
+                    if failure == "postcheck" and comment_reads > 2:
                         raise OSError("postcheck failed")
                     return "[]"
                 if input_text:
@@ -730,6 +752,159 @@ class NoticeAndIoTests(unittest.TestCase):
                 gate.run_request(event, REPO, secret, secret, gh=gh)
             finally:
                 os.environ.pop("GITHUB_OUTPUT", None)
+
+
+class RealHelperLifecycleTests(unittest.TestCase):
+    def test_real_helper_lifecycle_race_recovery_and_human_override(self):
+        helper = gate.fixer_helpers()
+        state = {"head": SHA, "pending": [], "comments": [], "events": [], "label": False, "race": False}
+        writer = {"login": "gate-writer", "id": 99, "type": "User"}
+        actions = {"login": "github-actions[bot]", "id": helper.ACTIONS_ID, "type": "Bot"}
+        item = {"root": 1, "thread": "PRRT_1", "fingerprint": "f" * 64}
+        clock = 0
+        def stamp():
+            nonlocal clock
+            clock += 1
+            if state.get("same_stamp"):
+                return "2026-10-16T00:00:00Z"
+            return f"2026-10-16T00:00:00.{clock:06d}Z"
+        def event(kind, actor):
+            state["events"].append({"id": len(state["events"]) + 1, "event": kind, "created_at": stamp(), "label": {"name": "ci:full"}, "actor": actor})
+        def gh(args, token, input_text=None):
+            path = next((a for a in args if str(a).startswith("repos/")), "")
+            if args[-1] == "user":
+                return json.dumps(writer)
+            if "/events?" in path:
+                if state.get("lag_reads", 0):
+                    state["lag_reads"] -= 1
+                    return "[]"
+                return json.dumps(state["events"])
+            if "/comments?" in path:
+                if state.pop("fail_next_comments", False):
+                    raise OSError("transient postcheck")
+                return json.dumps(state["comments"])
+            if path == f"repos/{REPO}/pulls/7":
+                return json.dumps({"state": "open", "draft": False, "head": {"sha": state["head"], "repo": {"full_name": REPO}}, "labels": [{"name": "ci:full"}] if state["label"] else []})
+            if "/labels/ci:full" in path and "DELETE" in args:
+                state["label"] = False
+                event("unlabeled", actions)
+                return "{}"
+            if args[:2] == ["workflow", "run"]:
+                return "{}"
+            if path.endswith("/labels"):
+                if state.pop("fail_label_post", False):
+                    raise OSError("POST failed before mutation")
+                if not state["label"]:
+                    state["label"] = True
+                    event("labeled", writer)
+                    if state.pop("lag_after_label", False):
+                        state["lag_reads"] = 3
+                return "{}"
+            if path.endswith("/comments") and input_text:
+                body = json.loads(input_text)["body"]
+                if "claude-fixer-ci-owned:" in body:
+                    if state.pop("fail_owned_post", False):
+                        raise OSError("transient receipt POST")
+                    if state.pop("fail_after_owned", False):
+                        state["fail_next_comments"] = True
+                # Pause after final live check, before terminal comment is written.
+                if state["race"] and "Codex gate acted: READY" in body:
+                    state["race"] = False
+                    state["pending"] = [item]
+                    helper.revoke_owned_ci(REPO, "7", state["head"], get_pages=pages, delete=delete, post_comment=post)
+                state["comments"].append({"id": len(state["comments"]) + 1, "body": body, "created_at": stamp(), "user": writer if token == "pat" else actions})
+                return "{}"
+            raise AssertionError(args)
+        def pages(path):
+            return gate._parse_json_list(gh(["api", "--paginate", path + "?per_page=100"], "read"))
+        def delete(repo, number):
+            gh(["api", "-X", "DELETE", f"repos/{repo}/issues/{number}/labels/ci:full"], "read")
+        def post(repo, number, body):
+            gate.post_comment(repo, number, body, "read", gh=gh)
+        def ready():
+            return gate.run_verdict(review_event(login=gate.CODEX_REVIEW_LOGIN, body="CODEX-GATE: READY", sha=state["head"]), REPO, "pat", "read", "master", gh=gh)
+        with mock.patch.object(gate, "fixer_helpers", return_value=helper), mock.patch.object(helper, "live_state", side_effect=lambda *args: (state["pending"], state["pending"])), mock.patch.object(gate, "emit"):
+            self.assertEqual(ready()["action"], "ready")
+            self.assertTrue(state["label"])
+            before = (len(state["comments"]), len(state["events"]))
+            self.assertEqual(ready()["action"], "ready-present")
+            self.assertEqual(before, (len(state["comments"]), len(state["events"])))
+            state["pending"] = [item]
+            self.assertEqual(ready()["action"], "paused-findings")
+            self.assertFalse(state["label"])
+            mediate = gate.run_verdict(review_event(login=gate.CODEX_REVIEW_LOGIN, body="CODEX-GATE: MEDIATE", sha=state["head"]), REPO, "pat", "read", "master", gh=gh)
+            self.assertEqual(mediate["action"], "mediate")
+            # A human can resolve the handoff without changing the commit.
+            # Authenticated MEDIATE history must not prevent fresh READY.
+            state["pending"] = []
+            state["race"] = True
+            self.assertEqual(ready()["action"], "ready")
+            self.assertFalse(state["label"])
+            state["pending"] = []
+            self.assertEqual(ready()["action"], "ready")
+            self.assertTrue(state["label"])
+            for failure in ("fail_after_owned", "fail_owned_post"):
+                state["pending"] = [item]
+                self.assertEqual(ready()["action"], "paused-findings")
+                state["pending"] = []
+                state[failure] = True
+                state["same_stamp"] = True
+                self.assertEqual(ready()["action"], "skip-readiness")
+                self.assertFalse(state["label"])
+                self.assertEqual(ready()["action"], "ready")
+                self.assertTrue(state["label"])
+                state["same_stamp"] = False
+            for failure in ("fail_label_post", "lag_after_label"):
+                state["pending"] = [item]
+                self.assertEqual(ready()["action"], "paused-findings")
+                state["pending"] = []
+                state[failure] = True
+                self.assertEqual(ready()["action"], "skip-readiness")
+                # Visibility can recover, but an uncertain old transaction is
+                # never silently adopted as a new owned label on the next run.
+                state["lag_reads"] = 0
+                before_owned = sum("claude-fixer-ci-owned:" in c["body"] for c in state["comments"])
+                self.assertEqual(ready()["action"], "unverified-ci-label")
+                self.assertEqual(before_owned, sum("claude-fixer-ci-owned:" in c["body"] for c in state["comments"]))
+                # Explicit human remove/readd settles the uncertainty. If POST
+                # never took effect, the human first adds then removes it.
+                human = {"login": "human", "id": 123, "type": "User"}
+                if not state["label"]:
+                    event("labeled", human)
+                event("unlabeled", human)
+                event("labeled", human)
+                state["label"] = True
+                self.assertEqual(ready()["action"], "ready-present")
+                self.assertEqual(before_owned, sum("claude-fixer-ci-owned:" in c["body"] for c in state["comments"]))
+                # Restore a fresh, unowned starting state for the next scenario.
+                state["events"] = []
+                state["comments"] = []
+                state["label"] = False
+                self.assertEqual(ready()["action"], "ready")
+            state["head"] = "b" * 40
+            stale = gate.run_verdict(review_event(login=gate.CODEX_REVIEW_LOGIN, body="CODEX-GATE: READY", sha=SHA), REPO, "pat", "read", "master", gh=gh)
+            self.assertEqual(stale["action"], "skip-stale-head")
+            self.assertTrue(state["label"])
+            state["pending"] = [item]
+            self.assertEqual(ready()["action"], "paused-findings")
+            self.assertFalse(state["label"])
+            state["pending"] = []
+            self.assertEqual(ready()["action"], "ready")
+            # A verified human removal remains authoritative, including on a new head.
+            state["label"] = False
+            event("unlabeled", {"login": "human", "id": 123, "type": "User"})
+            state["head"] = "c" * 40
+            self.assertEqual(ready()["action"], "preserve-human-removal")
+            self.assertFalse(state["label"])
+
+    def test_terminal_dedup_requires_authenticated_gate_writer(self):
+        helper = gate.fixer_helpers()
+        writer = {"login": "gate-writer", "id": 99, "type": "User"}
+        for verdict in ("READY", "MEDIATE"):
+            body = gate.acted_comment_body(SHA, verdict)
+            forged = {"id": 1, "body": body, "user": {"login": "gate-writer", "id": 1, "type": "User"}}
+            self.assertEqual(gate.comments_after_pause(SHA, [forged], writer), [])
+            self.assertEqual(gate.comments_after_pause(SHA, [forged | {"user": writer}], writer), [] if verdict == "READY" else [body])
 
 
 class WorkflowStructureTests(unittest.TestCase):

@@ -295,6 +295,42 @@ class DevinMatrixTests(unittest.TestCase):
         event["review"]["user"]["login"] = "alice"
         self.assertEqual(decide("pull_request_review", event)["devin"], "false")
 
+    def test_dispatch_on_member_same_repo_pr_sets_devin(self) -> None:
+        event = {"inputs": {"pr_number": "42"}}
+        got = decide("workflow_dispatch", event, pr=pr_payload())
+        self.assertEqual(got["devin"], "true")
+        self.assertEqual(got["mention"], "false")
+        self.assertEqual(got["head_ref"], "feature/fix")
+
+    def test_repository_dispatch_sets_devin(self) -> None:
+        event = {"client_payload": {"pr_number": 42}}
+        got = decide("repository_dispatch", event, pr=pr_payload())
+        self.assertEqual(got["devin"], "true")
+
+    def test_dispatch_on_fork_is_skipped(self) -> None:
+        event = {"inputs": {"pr_number": "42"}}
+        got = decide("workflow_dispatch", event, pr=pr_payload(head_repo="evil/fork"))
+        self.assertEqual(got["devin"], "false")
+        self.assertEqual(got["same_repo"], "false")
+
+    def test_dispatch_pr_number_rejects_junk(self) -> None:
+        self.assertEqual(
+            gate.dispatch_pr_number("workflow_dispatch", {"inputs": {"pr_number": "42"}}),
+            "42",
+        )
+        self.assertEqual(
+            gate.dispatch_pr_number("repository_dispatch", {"client_payload": {"pr_number": 9}}),
+            "9",
+        )
+        self.assertEqual(
+            gate.dispatch_pr_number("workflow_dispatch", {"inputs": {"pr_number": "0"}}),
+            "",
+        )
+        self.assertEqual(
+            gate.dispatch_pr_number("workflow_dispatch", {"inputs": {"pr_number": "../7"}}),
+            "",
+        )
+
     def test_unsafe_ref_is_rejected(self) -> None:
         got = decide("pull_request_review", self._review(head_ref="feat/../master"))
         self.assertEqual(got["head_ref"], "")
@@ -350,6 +386,24 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn("needs.resolve-pr.outputs.same_repo == 'true'", mention)
         self.assertIn("needs.resolve-pr.outputs.devin == 'true'", devin)
         self.assertIn("needs.resolve-pr.outputs.same_repo == 'true'", devin)
+        self.assertIn("github.event_name == 'workflow_dispatch'", devin)
+        self.assertIn("github.event_name == 'repository_dispatch'", devin)
+
+    def test_resolve_pr_job_if_skips_bots(self) -> None:
+        resolve = self._job("resolve-pr")
+        header = resolve.split("runs-on:", 1)[0]
+        self.assertIn("github.event.sender.type != 'Bot'", header)
+        self.assertIn("github.event.comment.user.type != 'Bot'", header)
+        self.assertIn("contains(github.event.comment.body, '@claude')", header)
+        self.assertNotIn("devin-ai-integration[bot]", header)
+        self.assertNotIn("chatgpt-codex-connector[bot]", header)
+        self.assertNotIn("github.event_name == 'pull_request_review' &&", header)
+        self.assertIn("workflow_dispatch", header)
+        self.assertIn("repository_dispatch", header)
+        self.assertNotIn(
+            "github.event_name == 'pull_request_review_comment' ||",
+            header,
+        )
 
     def test_every_privileged_checkout_uses_pr_head_sha(self) -> None:
         mention = self._job("claude-mention")
@@ -392,6 +446,7 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn("collaborators/{login}/permission", source)
         self.assertNotIn("MEMBER_ASSOC", source)
         self.assertIn("GH_TOKEN: ${{ github.token }}", self._job("resolve-pr"))
+        self.assertIn("DISPATCH_EVENTS", source)
 
     def test_acceptance_gates_before_push(self) -> None:
         devin = self._job("devin-review-fix")
@@ -843,10 +898,14 @@ class ConflictScanTests(unittest.TestCase):
 
         self.assertTrue(self.mod.fixer_busy(REPO, "1", make([{"id": 2, "event": "issue_comment"}])))
         self.assertTrue(self.mod.fixer_busy(REPO, "1", make([{"id": 2, "event": "pull_request_review"}])))
+        self.assertTrue(self.mod.fixer_busy(REPO, "1", make([{"id": 2, "event": "workflow_dispatch"}])))
+        self.assertTrue(self.mod.fixer_busy(REPO, "1", make([{"id": 2, "event": "repository_dispatch"}])))
         self.assertFalse(self.mod.fixer_busy(REPO, "1", make([{"id": 1, "event": "issue_comment"}])))
         self.assertFalse(self.mod.fixer_busy(REPO, "1", make([{"id": 2, "event": "schedule"}])))
         self.assertFalse(self.mod.fixer_busy(REPO, "1", make([{"id": 2, "event": "pull_request"}])))
         self.assertTrue(self.mod.fixer_busy(REPO, "1", lambda path: {"message": "error"}))
+        self.assertIn("workflow_dispatch", self.mod.FIXER_EVENTS)
+        self.assertIn("repository_dispatch", self.mod.FIXER_EVENTS)
 
     def test_fixer_busy_follows_run_pages(self) -> None:
         def get(path):
@@ -898,7 +957,9 @@ class ConflictJobStructureTests(unittest.TestCase):
         fixer_on = self.fixer.split("jobs:", 1)[0]
         scan_on = self.text.split("jobs:", 1)[0]
         self.assertNotIn("schedule:", fixer_on)
-        self.assertNotIn("workflow_dispatch:", fixer_on)
+        self.assertIn("workflow_dispatch:", fixer_on)
+        self.assertIn("repository_dispatch:", fixer_on)
+        self.assertIn("devin-review-fix", fixer_on)
         self.assertNotIn("\n  conflict-scan:\n", self.fixer)
         self.assertNotIn("\n  conflict-resolve:\n", self.fixer)
         self.assertIn(SCAN_CRON, scan_on)
@@ -919,6 +980,7 @@ class ConflictJobStructureTests(unittest.TestCase):
 
     def test_resolver_keeps_protections(self) -> None:
         job = self._job("conflict-resolve")
+        self.assertIn("github.event_name != 'push'", job.split("steps:", 1)[0])
         self.assertIn("group: claude-${{ matrix.pr.number }}", job)
         self.assertIn("cancel-in-progress: false", job)
         self.assertIn("max-parallel: 1", job)
@@ -978,7 +1040,13 @@ class ActionlintTests(unittest.TestCase):
         if not exe:
             self.skipTest("actionlint not on PATH")
         result = subprocess.run(
-            [exe, "-color", str(WORKFLOW_PATH), str(SCAN_WORKFLOW_PATH)],
+            [
+                exe,
+                "-color",
+                str(WORKFLOW_PATH),
+                str(SCAN_WORKFLOW_PATH),
+                str(ROOT / ".github" / "workflows" / "codex-gate.yml"),
+            ],
             cwd=ROOT,
             check=False,
             capture_output=True,
@@ -1001,7 +1069,13 @@ class FixerLoopCapTests(unittest.TestCase):
         end = text.index("\n      - ", run)
         cls.script = textwrap.dedent(text[run:end])
 
-    def _run(self, commits: list[tuple[str, str]], comments: list[str]) -> tuple[str, str]:
+    def _run(
+        self,
+        commits: list[tuple[str, str]],
+        comments: list[str],
+        *,
+        bypass_cap: str | None = None,
+    ) -> tuple[str, str]:
         import os
         import shutil
         import subprocess
@@ -1028,6 +1102,8 @@ class FixerLoopCapTests(unittest.TestCase):
             out.write_text("", encoding="utf-8")
             env = dict(os.environ, PATH=f"{d}{os.pathsep}{os.environ.get('PATH', '')}", GITHUB_OUTPUT=str(out),
                        REPO="o/r", PR_NUMBER="1", HEAD_SHA="abc123", GH_TOKEN="x")
+            if bypass_cap is not None:
+                env["BYPASS_CAP"] = bypass_cap
             subprocess.run(["bash", "-c", self.script], env=env, check=True, capture_output=True)
             posted = (d / "posted").read_text(encoding="utf-8") if (d / "posted").exists() else ""
             return out.read_text(encoding="utf-8"), posted
@@ -1039,6 +1115,31 @@ class FixerLoopCapTests(unittest.TestCase):
 
     def test_two_claude_commits_runs(self) -> None:
         out, posted = self._run([("alice", "Alice")] + [("claude[bot]", "claude[bot]")] * 2, [])
+        self.assertIn("skip=false", out)
+        self.assertEqual(posted.count("posted"), 1)
+
+    def test_daily_fixer_cap_skips_after_three_markers(self) -> None:
+        from datetime import datetime, timezone
+
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        marker = f"<!-- codex-fixer-run:{day} -->"
+        out, posted = self._run(
+            [("alice", "Alice")],
+            [marker] * 3,
+        )
+        self.assertIn("skip=true", out)
+        self.assertEqual(posted, "")
+
+    def test_bypass_cap_ignores_daily_markers(self) -> None:
+        from datetime import datetime, timezone
+
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        marker = f"<!-- codex-fixer-run:{day} -->"
+        out, posted = self._run(
+            [("alice", "Alice")],
+            [marker] * 3,
+            bypass_cap="true",
+        )
         self.assertIn("skip=false", out)
         self.assertEqual(posted, "")
 

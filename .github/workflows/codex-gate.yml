@@ -1,0 +1,152 @@
+# Codex CI/fixer gate (CSL-102). GitHub-hosted: skipped events here are cheap,
+# and the 20-minute wait must not run on Blacksmith.
+#
+# Posts one `@codex review` per head SHA. Codex ends with
+# `CODEX-GATE: FIX|READY|MEDIATE`. FIX / 20-minute silence → one batched
+# `devin-review-fix` dispatch. READY → `ci:full`. MEDIATE → stuck-thread-watch.
+# Cap: 3 fixer runs per PR per UTC day. Human `@claude` (claude-mention) bypasses it.
+#
+# Writes go through CODEX_TRIGGER_PAT so they can trigger other workflows.
+# Missing PAT: ::notice:: and skip (no failure). Never print secret values.
+name: Codex CI/fixer gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  pull_request_review:
+    types: [submitted]
+
+concurrency:
+  # Isolate review handling from the 20-minute wait. A verdictless Codex
+  # review must not cancel fallback. New pushes still cancel the prior wait.
+  # Each review.id gets its own group so Devin/human reviews cannot cancel a
+  # running Codex verdict. Review runs never cancel-in-progress.
+  group: codex-gate-${{ github.event.pull_request.number }}-${{ github.event_name == 'pull_request_review' && format('verdict-{0}', github.event.review.id) || 'request' }}
+  cancel-in-progress: ${{ github.event_name != 'pull_request_review' }}
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+
+env:
+  WAIT_SECONDS: "1200"
+
+jobs:
+  request:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      proceed: ${{ steps.gate.outputs.proceed }}
+      pr_number: ${{ steps.gate.outputs.pr_number }}
+      head_sha: ${{ steps.gate.outputs.head_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Default branch only: a pull_request checkout would run PR-head code
+          # with CODEX_TRIGGER_PAT (same class of leak as CSL-87).
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/ci/codex_gate.py
+          sparse-checkout-cone-mode: false
+      - name: Post @codex review once per head SHA
+        id: gate
+        env:
+          CODEX_GATE_MODE: request
+          CODEX_TRIGGER_PAT: ${{ secrets.CODEX_TRIGGER_PAT }}
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          script=scripts/ci/codex_gate.py
+          if [ ! -f "$script" ]; then
+            echo "::notice::$script is not on the default branch yet; skip"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          python3 -X utf8 -B "$script" request
+
+  wait:
+    needs: request
+    if: needs.request.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Wait for a Codex verdict
+        env:
+          WAIT_SECONDS: ${{ env.WAIT_SECONDS }}
+        run: sleep "$WAIT_SECONDS"
+
+  fallback:
+    needs: [request, wait]
+    if: always() && needs.request.outputs.proceed == 'true' && needs.wait.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/ci/codex_gate.py
+          sparse-checkout-cone-mode: false
+      - name: Dispatch fixer if Codex did not answer
+        env:
+          CODEX_GATE_MODE: fallback
+          CODEX_TRIGGER_PAT: ${{ secrets.CODEX_TRIGGER_PAT }}
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PR_NUMBER: ${{ needs.request.outputs.pr_number }}
+          HEAD_SHA: ${{ needs.request.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          script=scripts/ci/codex_gate.py
+          if [ ! -f "$script" ]; then
+            echo "::notice::$script is not on the default branch yet; skip"
+            exit 0
+          fi
+          python3 -X utf8 -B "$script" fallback
+
+  verdict:
+    if: >-
+      github.event_name == 'pull_request_review' &&
+      (
+        github.event.review.user.login == 'chatgpt-codex-connector[bot]' ||
+        github.event.review.user.login == 'chatgpt-codex-connector'
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/ci/codex_gate.py
+          sparse-checkout-cone-mode: false
+      - name: Act on CODEX-GATE verdict
+        env:
+          CODEX_GATE_MODE: verdict
+          CODEX_TRIGGER_PAT: ${{ secrets.CODEX_TRIGGER_PAT }}
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          script=scripts/ci/codex_gate.py
+          if [ ! -f "$script" ]; then
+            echo "::notice::$script is not on the default branch yet; skip"
+            exit 0
+          fi
+          python3 -X utf8 -B "$script" verdict

@@ -194,6 +194,20 @@ class Pull:
     state: str
     threads: tuple[Thread, ...]
     issue_comments: tuple[Comment, ...]
+    head_oid: str = ""
+    review_decision: str = ""
+    checks_state: str = ""
+    approved_head_oids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class LinearIssue:
+    id: str
+    url: str
+    identifier: str = ""
+    title: str = ""
+    state_type: str = ""
+    description: str = ""
 
 
 @dataclass(frozen=True)
@@ -292,13 +306,23 @@ def mediations_today(issue_comments: Iterable[Comment], cfg: Config) -> int:
     return count
 
 
-def classify_thread(thread: Thread, issue_comments: Iterable[Comment], cfg: Config) -> str:
-    """Return a stable reason code. 'stuck-human' and 'stuck-timeout' are actionable."""
+def classify_thread(
+    thread: Thread,
+    issue_comments: Iterable[Comment],
+    cfg: Config,
+    *,
+    for_rollup: bool = False,
+) -> str:
+    """Return a stable reason code. 'stuck-human' and 'stuck-timeout' are actionable.
+
+    ``for_rollup=True`` keeps already-mediated threads on the Linear checklist until
+    they resolve or leave the stuck window. Mediation itself still skips them.
+    """
     if thread.is_resolved:
         return "resolved"
     if not opened_by_devin(thread, cfg):
         return "not-devin"
-    if already_mediated(thread, issue_comments, cfg):
+    if not for_rollup and already_mediated(thread, issue_comments, cfg):
         return "mediated"
     claude = claude_comments(thread, cfg)
     if not claude:
@@ -372,44 +396,170 @@ def mediation_body(
     )
 
 
-def linear_title(pull: Pull, thread: Thread) -> str:
-    loc = location(thread.path, thread.line)
-    repo_short = "repo"
+def repo_short_name(pull: Pull) -> str:
     parts = [p for p in pull.url.split("/") if p]
     if "github.com" in parts:
         idx = parts.index("github.com")
         if idx + 2 < len(parts):
-            repo_short = parts[idx + 2]
-    title = f"Stuck PR thread: {repo_short}#{pull.number} – {loc}"
-    if len(title) > 120:
-        title = title[:117] + "..."
-    return title
+            return parts[idx + 2]
+    return "repo"
+
+
+def rollup_marker(pull: Pull) -> str:
+    return f"<!-- stuck-pr-threads:{repo_short_name(pull)}#{pull.number} -->"
+
+
+def linear_title(pull: Pull) -> str:
+    return f"Stuck PR threads: {repo_short_name(pull)}#{pull.number}"
+
+
+ROLLUP_TITLE_RE = re.compile(r"Stuck PR threads:\s*([\w.-]+)#(\d+)", re.IGNORECASE)
+THREAD_ITEM_RE = re.compile(
+    r"^- \[([ xX])\] .*<!-- thread:([^\s>]+) -->\s*$",
+    re.MULTILINE,
+)
+HUMAN_DECISION_RE = re.compile(
+    r"## Human decision\n\n(.*?)(?=\n\*Auto-updated|\Z)",
+    re.DOTALL,
+)
+DEFAULT_HUMAN_DECISION = (
+    "_(Record the merge decision here. The watcher preserves this section.)_"
+)
+NOTES_HEADING = "## Author notes"
+NOTES_RE = re.compile(
+    r"## Author notes\n\n(.*?)(?=\n## Stuck threads|\Z)",
+    re.DOTALL,
+)
+TERMINAL_STATES = frozenset({"canceled", "completed"})
+
+
+def is_active_issue(issue: LinearIssue | None) -> bool:
+    if issue is None or not issue.id:
+        return False
+    return (issue.state_type or "").lower() not in TERMINAL_STATES
+
+
+def parse_rollup_title(title: str) -> tuple[str, int] | None:
+    match = ROLLUP_TITLE_RE.search(title or "")
+    if not match:
+        return None
+    return match.group(1), int(match.group(2))
+
+
+def parse_rollup_pr_number(title: str) -> int | None:
+    parsed = parse_rollup_title(title)
+    return None if parsed is None else parsed[1]
+
+
+def parse_checked_thread_ids(description: str) -> set[str]:
+    return {
+        match.group(2)
+        for match in THREAD_ITEM_RE.finditer(description or "")
+        if match.group(1).lower() == "x"
+    }
+
+
+def existing_human_decision(description: str) -> str:
+    match = HUMAN_DECISION_RE.search(description or "")
+    if not match:
+        return ""
+    return match.group(1).strip()
+
+
+def existing_author_notes(description: str, marker: str) -> str:
+    """Free-form text to carry forward when rebuilding a roll-up description."""
+    text = description or ""
+    if "## Stuck threads" in text:  # watcher-built: only the notes section carries
+        match = NOTES_RE.search(text)
+        return match.group(1).strip() if match else ""
+    return text.replace(marker, "").strip()
+
+
+def is_approved_on_head_with_green_checks(pull: Pull) -> bool:
+    if (pull.review_decision or "").upper() != "APPROVED":
+        return False
+    if (pull.checks_state or "").upper() != "SUCCESS":
+        return False
+    if not pull.head_oid or pull.head_oid not in pull.approved_head_oids:
+        return False
+    return True
+
+
+def skip_pr_reason(pull: Pull) -> str:
+    if pull.is_draft:
+        return "draft"
+    state = (pull.state or "").upper()
+    if state in {"MERGED", "CLOSED"}:
+        return "closed"
+    if state and state != "OPEN":
+        return "not-open"
+    if is_approved_on_head_with_green_checks(pull):
+        return "approved-green"
+    return ""
+
+
+def stuck_threads(
+    pull: Pull,
+    cfg: Config,
+    *,
+    for_rollup: bool = False,
+) -> list[tuple[Thread, str]]:
+    found: list[tuple[Thread, str]] = []
+    for thread in pull.threads:
+        reason = classify_thread(
+            thread, pull.issue_comments, cfg, for_rollup=for_rollup
+        )
+        if reason.startswith("stuck-"):
+            found.append((thread, reason))
+    return found
+
+
+def thread_url(thread: Thread, cfg: Config) -> str:
+    claude = last_claude(thread, cfg)
+    devin = first_devin(thread, cfg)
+    if claude and claude.url:
+        return claude.url
+    if devin and devin.url:
+        return devin.url
+    return ""
 
 
 def linear_description(
     pull: Pull,
-    thread: Thread,
+    stuck: Iterable[tuple[Thread, str]],
     cfg: Config,
     *,
-    reason: str,
+    previous: str = "",
 ) -> str:
-    loc = location(thread.path, thread.line)
-    devin = first_devin(thread, cfg)
-    claude = last_claude(thread, cfg)
-    thread_url = (claude and claude.url) or (devin and devin.url) or ""
-    marker = mediation_marker(thread.id)
+    marker = rollup_marker(pull)
+    checked = parse_checked_thread_ids(previous)
+    human = existing_human_decision(previous) or DEFAULT_HUMAN_DECISION
+    notes = existing_author_notes(previous, marker)
+    notes_block = f"{NOTES_HEADING}\n\n{notes}\n\n" if notes else ""
+    items = []
+    for thread, reason in stuck:
+        loc = location(thread.path, thread.line)
+        url = thread_url(thread, cfg)
+        label = f"`{loc}`"
+        if url:
+            label = f"[`{loc}`]({url})"
+        box = "x" if thread.id in checked else " "
+        items.append(f"- [{box}] {label} — `{reason}` <!-- thread:{thread.id} -->")
+    checklist = "\n".join(items) if items else "- (none)"
     return (
         f"{marker}\n"
-        f"**PR:** {pull.url}\n"
-        f"**Thread:** {thread_url or loc} on `{loc}`\n\n"
-        "## What Devin flagged\n\n"
-        f"{quote_block(devin.body if devin else '')}\n\n"
-        "## What Claude said\n\n"
-        f"{quote_block(claude.body if claude else '')}\n\n"
-        f"Reason: `{reason}`.\n\n"
-        "*Auto-filed by the in-repo stuck-thread watch "
-        "`.github/workflows/stuck-thread-watch.yml`. Codex is asked to mediate; "
-        "a human decides. Before merging the PR, resolve this or record the "
+        f"**PR:** {pull.url}\n\n"
+        "One roll-up for stuck Devin/Claude threads on this PR. Codex mediates "
+        "(MEDIATE updates this checklist). Do **not** file a Linear issue per "
+        "thread. A human decides.\n\n"
+        f"{notes_block}"
+        "## Stuck threads\n\n"
+        f"{checklist}\n\n"
+        "## Human decision\n\n"
+        f"{human}\n\n"
+        "*Auto-updated by `.github/workflows/stuck-thread-watch.yml`. This "
+        "issue is canceled when the PR merges or every stuck thread is "
+        "resolved. Before merging, resolve the checklist or record the "
         "decision here.*\n"
     )
 
@@ -504,6 +654,21 @@ class GitHubClient:
               url
               isDraft
               state
+              reviewDecision
+              commits(last: 1) {
+                nodes {
+                  commit {
+                    oid
+                    statusCheckRollup { state }
+                  }
+                }
+              }
+              latestReviews(last: 30) {
+                nodes {
+                  state
+                  commit { oid }
+                }
+              }
               reviewThreads(first: 50, after: $tCursor) {
                 pageInfo { hasNextPage endCursor }
                 nodes {
@@ -577,6 +742,14 @@ class GitHubClient:
                     c_done = True
         assert pr_meta is not None
         threads = tuple(self._parse_thread_with_all_comments(node) for node in raw_threads)
+        commit_nodes = ((pr_meta.get("commits") or {}).get("nodes")) or []
+        commit = ((commit_nodes[0] if commit_nodes else {}) or {}).get("commit") or {}
+        rollup = commit.get("statusCheckRollup") or {}
+        approved_oids = tuple(
+            str((node.get("commit") or {}).get("oid") or "")
+            for node in ((pr_meta.get("latestReviews") or {}).get("nodes") or [])
+            if (node or {}).get("state") == "APPROVED" and (node.get("commit") or {}).get("oid")
+        )
         return Pull(
             number=int(pr_meta["number"]),
             url=str(pr_meta.get("url") or ""),
@@ -584,6 +757,10 @@ class GitHubClient:
             state=str(pr_meta.get("state") or ""),
             threads=threads,
             issue_comments=tuple(issue_comments),
+            head_oid=str(commit.get("oid") or ""),
+            review_decision=str(pr_meta.get("reviewDecision") or ""),
+            checks_state=str(rollup.get("state") or ""),
+            approved_head_oids=approved_oids,
         )
 
     def _thread_comment_page(self, thread_id: str, cursor: str) -> dict[str, Any]:
@@ -720,10 +897,14 @@ class LinearClient:
             raise RuntimeError(f"Linear team {self.cfg.linear_team_key!r} not found")
         team = teams[0]
         triage_id = ""
+        canceled_id = ""
         for state in ((team.get("states") or {}).get("nodes")) or []:
-            if (state.get("type") == "triage") or (state.get("name") == "Triage"):
+            name = state.get("name") or ""
+            stype = state.get("type") or ""
+            if stype == "triage" or name == "Triage":
                 triage_id = state.get("id") or ""
-                break
+            if stype == "canceled" or name in {"Canceled", "Cancelled"}:
+                canceled_id = state.get("id") or ""
         labels_data = self.graphql(
             """
             query($names: [String!]) {
@@ -758,31 +939,93 @@ class LinearClient:
         self._meta = {
             "team_id": team["id"],
             "triage_id": triage_id,
+            "canceled_id": canceled_id,
             "label_ids": label_ids,
             "project_id": project_id,
         }
         return self._meta
 
-    def find_by_marker(self, marker: str) -> str:
-        data = self.graphql(
-            """
-            query($term: String!) {
-              searchIssues(term: $term, first: 5) {
-                nodes { identifier url description }
-              }
-            }
-            """,
-            {"term": marker},
+    def _parse_linear_issue(self, node: dict[str, Any] | None) -> LinearIssue:
+        node = node or {}
+        state = node.get("state") or {}
+        return LinearIssue(
+            id=str(node.get("id") or ""),
+            url=str(node.get("url") or ""),
+            identifier=str(node.get("identifier") or ""),
+            title=str(node.get("title") or ""),
+            state_type=str(state.get("type") or ""),
+            description=str(node.get("description") or ""),
         )
-        for node in ((data.get("searchIssues") or {}).get("nodes")) or []:
-            if marker in (node.get("description") or ""):
-                return str(node.get("url") or "")
-        return ""
 
-    def create_triage_issue(self, *, title: str, description: str) -> str:
+    def _search_issues(self, term: str, *, page_limit: int = 20) -> list[LinearIssue]:
+        query = """
+        query($term: String!, $after: String) {
+          searchIssues(term: $term, first: 50, after: $after) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              id
+              identifier
+              url
+              title
+              description
+              state { type name }
+            }
+          }
+        }
+        """
+        found: list[LinearIssue] = []
+        after = None
+        seen = 0
+        while seen < page_limit:
+            data = self.graphql(query, {"term": term, "after": after})
+            conn = data.get("searchIssues") or {}
+            for node in conn.get("nodes") or []:
+                found.append(self._parse_linear_issue(node))
+            page = conn.get("pageInfo") or {}
+            if not page.get("hasNextPage") or not page.get("endCursor"):
+                break
+            after = page.get("endCursor")
+            seen += 1
+        return found
+
+    def _matches_rollup(self, issue: LinearIssue, marker: str, title: str) -> bool:
+        desc = issue.description or ""
+        issue_title = (issue.title or "").strip()
+        if marker and (marker in desc or marker in issue_title):
+            return True
+        if title and issue_title == title.strip():
+            parsed = parse_rollup_title(issue_title)
+            return bool(parsed) and parsed[0].casefold() == self.cfg.name.casefold()
+        return False
+
+    def find_by_marker(self, marker: str, *, title: str = "") -> LinearIssue | None:
+        matches: list[LinearIssue] = []
+        seen: set[str] = set()
+        terms = [part for part in (marker, title) if part]
+        for term in terms:
+            for issue in self._search_issues(term):
+                if issue.id in seen:
+                    continue
+                if not self._matches_rollup(issue, marker, title):
+                    continue
+                seen.add(issue.id)
+                matches.append(issue)
+        if not matches:
+            return None
+        active = [issue for issue in matches if is_active_issue(issue)]
+        return active[0] if active else matches[0]
+
+    def search_rollups(self) -> list[LinearIssue]:
+        found: list[LinearIssue] = []
+        for issue in self._search_issues("Stuck PR threads:"):
+            if ROLLUP_TITLE_RE.search(issue.title):
+                found.append(issue)
+        return found
+
+    def create_triage_issue(self, *, title: str, description: str) -> LinearIssue | None:
         if self.cfg.dry_run:
             log(f"dry-run: would file Linear issue {title!r}")
-            return ""
+            return None
         meta = self._meta_bundle()
         payload: dict[str, Any] = {
             "teamId": meta["team_id"],
@@ -800,7 +1043,7 @@ class LinearClient:
             mutation($input: IssueCreateInput!) {
               issueCreate(input: $input) {
                 success
-                issue { identifier url }
+                issue { id identifier url }
               }
             }
             """,
@@ -810,7 +1053,51 @@ class LinearClient:
         url = str(issue.get("url") or "")
         if not url:
             raise RuntimeError("Linear issueCreate returned no URL")
-        return url
+        return LinearIssue(
+            id=str(issue.get("id") or ""),
+            url=url,
+            identifier=str(issue.get("identifier") or ""),
+            title=title,
+            state_type="triage",
+        )
+
+    def update_issue(self, issue_id: str, *, description: str) -> None:
+        if self.cfg.dry_run:
+            log("dry-run: would update Linear roll-up")
+            return
+        data = self.graphql(
+            """
+            mutation($id: String!, $input: IssueUpdateInput!) {
+              issueUpdate(id: $id, input: $input) {
+                success
+              }
+            }
+            """,
+            {"id": issue_id, "input": {"description": description}},
+        )
+        if not (data.get("issueUpdate") or {}).get("success"):
+            raise RuntimeError("Linear issueUpdate failed")
+
+    def cancel_issue(self, issue_id: str) -> None:
+        if self.cfg.dry_run:
+            log("dry-run: would cancel Linear roll-up")
+            return
+        meta = self._meta_bundle()
+        canceled_id = meta.get("canceled_id") or ""
+        if not canceled_id:
+            raise RuntimeError("Linear Canceled state not found")
+        data = self.graphql(
+            """
+            mutation($id: String!, $input: IssueUpdateInput!) {
+              issueUpdate(id: $id, input: $input) {
+                success
+              }
+            }
+            """,
+            {"id": issue_id, "input": {"stateId": canceled_id}},
+        )
+        if not (data.get("issueUpdate") or {}).get("success"):
+            raise RuntimeError("Linear issue cancel failed")
 
 
 @dataclass
@@ -826,34 +1113,55 @@ class Counters:
     labeled: int = 0
 
 
+def upsert_linear_rollup(
+    pull: Pull,
+    stuck: list[tuple[Thread, str]],
+    cfg: Config,
+    linear: LinearClient,
+    counters: Counters,
+) -> str:
+    marker = rollup_marker(pull)
+    title = linear_title(pull)
+    existing = linear.find_by_marker(marker, title=title)
+    previous = existing.description if is_active_issue(existing) else ""
+    description = linear_description(pull, stuck, cfg, previous=previous)
+    if existing and existing.id:
+        if not is_active_issue(existing):
+            created = linear.create_triage_issue(title=title, description=description)
+            if created:
+                counters.linear += 1
+                log(f"refiled Linear roll-up for PR #{pull.number}: {created.url}")
+                return created.url
+            return existing.url
+        linear.update_issue(existing.id, description=description)
+        log(f"updated Linear roll-up for PR #{pull.number}: {existing.url}")
+        return existing.url
+    created = linear.create_triage_issue(title=title, description=description)
+    if created:
+        counters.linear += 1
+        log(f"filed Linear roll-up for PR #{pull.number}: {created.url}")
+        return created.url
+    return ""
+
+
+def cancel_linear_rollup(issue: LinearIssue, linear: LinearClient, counters: Counters) -> None:
+    if not is_active_issue(issue):
+        return
+    linear.cancel_issue(issue.id)
+    counters.linear += 1
+    log(f"canceled Linear roll-up {issue.identifier or issue.url}")
+
+
 def mediate_thread(
     pull: Pull,
     thread: Thread,
     cfg: Config,
     github: GitHubClient,
-    linear: LinearClient | None,
     reason: str,
     counters: Counters,
+    *,
+    linear_url: str = "",
 ) -> bool:
-    marker = mediation_marker(thread.id)
-    linear_url = ""
-    if cfg.linear_enabled:
-        if not cfg.linear_api_key:
-            notice("LINEAR_API_KEY missing; skipping Linear issue for this mediation")
-        elif linear is not None:
-            try:
-                linear_url = linear.find_by_marker(marker)
-                if not linear_url:
-                    linear_url = linear.create_triage_issue(
-                        title=linear_title(pull, thread),
-                        description=linear_description(pull, thread, cfg, reason=reason),
-                    )
-                    counters.linear += 1
-                    log(f"filed Linear issue for {thread.id}: {linear_url}")
-                else:
-                    log(f"reusing Linear issue for {thread.id}: {linear_url}")
-            except Exception as exc:  # noqa: BLE001 — mediation still proceeds
-                notice(f"Linear filing skipped: {exc}")
     if not linear_url:
         try:
             github.add_labels(pull.number, [NEEDS_DECISION_LABEL])
@@ -902,23 +1210,64 @@ def scan(
             )
             counters.skipped_login = 1
     numbers = github.list_open_pr_numbers()
+    seen_prs: set[int] = set()
     for number in numbers:
         pull = github.load_pr(number)
         if pull is None:
             notice(f"PR #{number} not found")
             continue
-        if pull.state and pull.state.upper() != "OPEN":
+        seen_prs.add(pull.number)
+        skip = skip_pr_reason(pull)
+        rollup = stuck_threads(pull, cfg, for_rollup=True)
+        if skip in {"draft", "closed", "not-open"}:
+            if skip == "closed" and linear is not None:
+                try:
+                    existing = linear.find_by_marker(
+                        rollup_marker(pull), title=linear_title(pull)
+                    )
+                    if existing:
+                        cancel_linear_rollup(existing, linear, counters)
+                except Exception as extra_exc:  # noqa: BLE001
+                    notice(f"Linear cancel skipped: {extra_exc}")
             continue
-        if pull.is_draft:
+        if skip == "approved-green":
+            log(f"skip (approved on head with green checks): PR #{pull.number}")
+            if linear is not None and not rollup:
+                try:
+                    existing = linear.find_by_marker(
+                        rollup_marker(pull), title=linear_title(pull)
+                    )
+                    if existing:
+                        cancel_linear_rollup(existing, linear, counters)
+                except Exception as extra_exc:  # noqa: BLE001
+                    notice(f"Linear cancel skipped: {extra_exc}")
             continue
+        linear_url = ""
+        if cfg.linear_enabled and linear is not None:
+            try:
+                if rollup:
+                    if not cfg.linear_api_key:
+                        notice("LINEAR_API_KEY missing; skipping Linear roll-up")
+                    else:
+                        linear_url = upsert_linear_rollup(
+                            pull, rollup, cfg, linear, counters
+                        )
+                else:
+                    existing = linear.find_by_marker(
+                        rollup_marker(pull), title=linear_title(pull)
+                    )
+                    if existing:
+                        cancel_linear_rollup(existing, linear, counters)
+            except Exception as exc:  # noqa: BLE001 — mediation still proceeds
+                notice(f"Linear roll-up skipped: {exc}")
         used_today = mediations_today(pull.issue_comments, cfg)
         remaining = max(0, cfg.max_per_pr_per_day - used_today)
+        counters.stuck += len(rollup)
         for thread in pull.threads:
             counters.scanned += 1
             reason = classify_thread(thread, pull.issue_comments, cfg)
             if not reason.startswith("stuck-"):
                 continue
-            counters.stuck += 1
             if not cfg.codex_pat:
                 log(f"skip (no PAT): PR #{pull.number} {thread.id} {reason}")
                 continue
@@ -932,7 +1281,9 @@ def scan(
                     f"PR #{pull.number} {thread.id}"
                 )
                 continue
-            posted = mediate_thread(pull, thread, cfg, github, linear, reason, counters)
+            posted = mediate_thread(
+                pull, thread, cfg, github, reason, counters, linear_url=linear_url
+            )
             if not posted:
                 continue
             remaining -= 1
@@ -951,7 +1302,32 @@ def scan(
                         created_at=cfg.now,
                     ),
                 ),
+                head_oid=pull.head_oid,
+                review_decision=pull.review_decision,
+                checks_state=pull.checks_state,
+                approved_head_oids=pull.approved_head_oids,
             )
+    if linear is not None:
+        try:
+            for issue in linear.search_rollups():
+                parsed = parse_rollup_title(issue.title)
+                if parsed is None:
+                    continue
+                repo_name, pr_number = parsed
+                if repo_name.casefold() != cfg.name.casefold():
+                    continue
+                if pr_number in seen_prs:
+                    continue
+                if (issue.state_type or "").lower() in {"canceled", "completed"}:
+                    continue
+                extra = github.load_pr(pr_number)
+                if extra is None or skip_pr_reason(extra) in {"closed", "not-open", "draft"}:
+                    cancel_linear_rollup(issue, linear, counters)
+                    continue
+                if not stuck_threads(extra, cfg, for_rollup=True):
+                    cancel_linear_rollup(issue, linear, counters)
+        except Exception as extra_exc:  # noqa: BLE001
+            notice(f"Linear roll-up sweep skipped: {extra_exc}")
     log(
         "stuck-thread-watch: "
         f"scanned={counters.scanned} stuck={counters.stuck} "

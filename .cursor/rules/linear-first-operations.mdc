@@ -28,3 +28,9 @@ issues and PRs.
 - Autonomously file research findings, ideas and bugs to Triage, deduped.
 - Ground every implementation in the best available research: Parallel search for web
   research and Context7 for current library docs.
+- Follow Agent CI etiquette: open PRs as drafts, batch pushes, mark ready once,
+  honor owner holds; never merge PRs, rebase or force-push. Owner-approved normal
+  base/dependency integration is allowed without conflicts, but the autonomous
+  fixer single-push/no-fetch recovery restriction stays unchanged.
+  Never edit workflows unless a human-assigned Linear issue names them, and
+  never mark a PR ready with `GITHUB_TOKEN`.

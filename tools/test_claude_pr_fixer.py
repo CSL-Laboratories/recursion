@@ -463,6 +463,13 @@ class SharedQueuePolicyTests(unittest.TestCase):
 
 
 class WorkflowStructureTests(unittest.TestCase):
+    def test_event_tests_select_supported_python_and_lint_all_workflows(self):
+        paths = self._job('event-paths')
+        self.assertIn('uses: actions/setup-python@v5', paths)
+        self.assertIn('python-version: "3.12"', paths)
+        self.assertLess(paths.index('actions/setup-python@v5'), paths.index('name: Event-matrix gate'))
+        self.assertIn('./actionlint -color .github/workflows/*.yml', paths)
+
     def test_light_jobs_use_github_hosted_runners(self) -> None:
         resolve = self._job("resolve-pr")
         mention = self._job("claude-mention")

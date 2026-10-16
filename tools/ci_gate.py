@@ -16,7 +16,8 @@ assert_tests_accounted fails if a test-like file is neither run nor excluded.
 Path filter: when CI_BASE_SHA is set (PR base, merge_group.base_sha, or
 push-before), a docs-only diff skips the contract-test suite but still runs
 whitespace_check and check_public_scope. CI_HEAD_SHA (merge_group.head_sha,
-PR head, or github.sha) is the right side of that diff; it defaults to HEAD.
+or pull_request github.sha synthetic merge) is the right side of that diff;
+it defaults to HEAD and must match the checked-out test tree.
 --force always runs the suite.
 """
 from __future__ import annotations

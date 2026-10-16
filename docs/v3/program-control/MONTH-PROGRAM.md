@@ -238,6 +238,10 @@ and maturity selectors fail validation before lookup or traversal.
   Packets explicitly include `research_bindings`, empty when no capability research
   is authorized by the packet. Freshness applies to packets referenced by approved decisions. Superseded/pending
   decisions and historical packets remain stored without granting authority.
+  Approved receipt scalar fields are nonempty strings; `scope`, `conditions` and
+  `rejected_options` are nonempty arrays of nonempty strings. `decided_on` is a
+  real `YYYY-MM-DD` calendar date. Boolean/object values cannot identify a human
+  or an inspectable approval comment. Actual human authorship remains a review check.
 - `target_digest` pins the target's current fields, excluding only lifecycle fields:
   contract status/receipt; work status/stage/receipts/candidate/verification links;
   capability maturity/target, evidence links, receipts and candidate commit;
@@ -329,6 +333,13 @@ and maturity selectors fail validation before lookup or traversal.
   approval; changing both the command and evidence cannot inherit an old receipt.
   The seed leaves this map null pending selection of actual per-tier gates. Work,
   checkpoint and recovery/rollback proofs likewise match their declared commands.
+  SHA-256 values and full commit identities are lowercase hexadecimal strings,
+  never JSON numbers coerced to text. An execution environment is a nonempty
+  description string or an object with nonempty `id`/`execution_class` and a
+  string `configuration_sha256`; qualified tiers still require the exact structured
+  approved profile. Booleans, arrays and arbitrary objects are not environments.
+  Contract-binding revisions are positive JSON integers, excluding booleans and
+  floating-point values; binding IDs and digests retain their declared string types.
 - Qualified claims also require capability-approval-bound `qualification_requirements`
   keyed by tier. Each profile contains `evidence_class` and a structured `environment`
   with nonempty `id`, `execution_class`, and full `configuration_sha256`.
@@ -370,6 +381,11 @@ and maturity selectors fail validation before lookup or traversal.
   approve research. A human must define/accept the exact pass, scope, quota, matching
   Linear comment and next-stop receipt mapping before continuation can be represented
   as authorized. The checker cannot infer undeclared continuation from free prose.
+  Schema 1 requires `research_control.continuation_packet_fields` to contain exactly
+  `evidence_obtained`, `remaining_uncertainty`, `expected_quota_class`, `options`,
+  `recommendation`, and `next_stop_condition`, once each, in any order. Missing names,
+  duplicates, aliases and added fields are invalid; editing the registry cannot
+  define new semantics that the fixed continuation detector would silently ignore.
 
 The seed stays candidate/unresearched: its historical research-run URL is retained
 as unverified provenance because no linked result or content digest is retained here.

@@ -1055,6 +1055,58 @@ class ProgramControlTests(unittest.TestCase):
                     item["decision_receipt"] = self.approve([("develop_work", item["id"])])
                     self.assert_rejected("research continuation blocked")
 
+    def test_declared_extra_continuation_field_rejects_work_plan_and_research(self):
+        for location in ("work", "plan", "research"):
+            for alias in ("expanded_scope", "next_pass", "continuation_scope", "Next_Stop_Condition"):
+                with self.subTest(location=location, alias=alias):
+                    self.setUp()
+                    self.data["research_control"]["continuation_packet_fields"].append(alias)
+                    if location == "research":
+                        _, target = self.research_fixture()
+                    else:
+                        item = self.data["work_items"][0]
+                        item.update(stage="research", research_plan={**{f: "Fixture" for f in checker.PLAN_FIELDS},
+                                                                     "continuation": False})
+                        target = item if location == "work" else item["research_plan"]
+                    target[alias] = "second pass"
+                    self.assert_rejected("continuation_packet_fields must equal the supported field set")
+
+    def test_continuation_registry_rejects_removals_aliases_and_duplicates(self):
+        original = self.data["research_control"]["continuation_packet_fields"]
+        variants = [[], ["expanded_scope"], original + ["expanded_scope"]]
+        for field in original:
+            variants.extend([[name for name in original if name != field], original + [field],
+                             [name if name != field else field.upper() for name in original],
+                             [name if name != field else field + " " for name in original],
+                             [name if name != field else "alias_" + field for name in original]])
+        # Same cardinality with a duplicated known name and an omitted one.
+        variants.append([original[0]] * len(original))
+        for fields in variants:
+            with self.subTest(fields=fields):
+                self.setUp()
+                self.data["research_control"]["continuation_packet_fields"] = fields
+                self.assertTrue(self.errors())
+
+    def test_supported_continuation_registry_order_does_not_change_detection(self):
+        self.data["research_control"]["continuation_packet_fields"].reverse()
+        self.assertEqual(self.errors(), [])
+        for field in self.data["research_control"]["continuation_packet_fields"]:
+            with self.subTest(field=field):
+                item = self.data["work_items"][0]
+                item[field] = None
+                self.assert_rejected("research continuation blocked")
+                del item[field]
+
+    def test_continuation_registry_shape_errors_remain_validation_errors(self):
+        for value in (None, {}, "expanded_scope", [None], [[]], [{}], [" "]):
+            with self.subTest(value=value):
+                self.setUp()
+                self.data["research_control"]["continuation_packet_fields"] = value
+                self.assert_rejected("continuation_packet_fields")
+        self.setUp()
+        del self.data["research_control"]["continuation_packet_fields"]
+        self.assert_rejected("continuation_packet_fields")
+
     def test_research_plan_requires_explicit_initial_pass_and_typed_fields(self):
         item = self.data["work_items"][0]
         item["research_plan"] = {f: "Fixture" for f in checker.PLAN_FIELDS}
@@ -1117,6 +1169,140 @@ class ProgramControlTests(unittest.TestCase):
         self.setUp()
         del self.data["admission"]["mode"]
         self.assert_rejected("admission mode must be")
+
+    def test_authoritative_receipt_scalars_reject_truthy_nonstrings_and_blanks(self):
+        fields = ("approval_comment_id", "human_decider", "authority_basis", "selected_option",
+                  "rationale", "decided_on", "approval_evidence", "revisit_trigger", "proposal_digest")
+        for field in fields:
+            for value in (True, 1, ["truthy"], {"truthy": True}, " "):
+                with self.subTest(field=field, value=value):
+                    self.setUp()
+                    self.promote()
+                    self.data["decisions"][-1][field] = value
+                    self.assert_rejected(f"receipt {field} must be a nonempty string")
+
+    def test_authoritative_receipt_arrays_require_nonempty_text_items(self):
+        for field in ("scope", "conditions", "rejected_options"):
+            for value in (True, "truthy", {"truthy": True}, [True], [1], [{}], [" "], []):
+                with self.subTest(field=field, value=value):
+                    self.setUp()
+                    self.promote()
+                    self.data["decisions"][-1][field] = value
+                    self.assert_rejected(f"receipt {field} must be a nonempty list of strings")
+
+    def test_receipt_date_requires_a_real_iso_calendar_date(self):
+        for value in ("2026-02-30", "2026-13-01", "2026-1-01", "20261016", "yesterday", "2026-10-16T00:00:00Z"):
+            with self.subTest(value=value):
+                self.setUp()
+                self.promote()
+                self.data["decisions"][-1]["decided_on"] = value
+                self.assert_rejected("valid YYYY-MM-DD date")
+
+    def test_receipt_types_guard_each_authorization_lane(self):
+        for lane in ("contract", "capability", "work", "admission", "no_rollback"):
+            with self.subTest(lane=lane):
+                self.setUp()
+                if lane == "admission":
+                    target = self.admit()
+                elif lane == "no_rollback":
+                    target, _ = self.no_rollback_fixture()
+                    rid = self.approve([("accept_no_rollback", target["id"])])
+                    target["no_rollback_receipt"] = rid
+                else:
+                    self.promote()
+                    if lane == "contract":
+                        target = self.data["contracts"][0]
+                    elif lane == "capability":
+                        target = self.data["capabilities"][0]
+                    else:
+                        target = self.data["work_items"][0]
+                        target["discretion_class"] = "human_gated"
+                        target["decision_receipt"] = self.approve([("develop_work", target["id"])])
+                rid = target["no_rollback_receipt"] if lane == "no_rollback" else target["decision_receipt"]
+                next(d for d in self.data["decisions"] if d["id"] == rid)["approval_comment_id"] = True
+                self.assert_rejected("receipt approval_comment_id must be a nonempty string")
+                self.assertTrue(any("receipt" in e or "authority" in e for e in self.errors()))
+
+    def test_all_executable_proof_lanes_reject_malformed_environment_and_digest(self):
+        variants = [("environment", v) for v in (True, 1, ["host"], " ", {"host": "unknown"})]
+        variants += [("artifact_sha256", int("1" * 64)), ("artifact_sha256", True)]
+        for kind in ("provider_free", "work_verification", "composed_checkpoint", "recovery", "rollback"):
+            for field, value in variants:
+                with self.subTest(kind=kind, field=field, value=value):
+                    self.setUp()
+                    self.promote("release_qualified" if kind != "provider_free" else "provider_free_verified")
+                    row = next(r for r in self.data["evidence"] if r["kind"] == kind)
+                    row[field] = value
+                    self.assertTrue(self.errors())
+
+    def test_low_tier_environment_representations_are_defined(self):
+        cap, row = self.promote()
+        row["environment"] = {"id": "fixture-host", "execution_class": "fixture",
+                              "configuration_sha256": "a" * 64}
+        self.assertEqual(self.errors(), [])
+        for field, value in (("id", True), ("execution_class", []), ("configuration_sha256", int("1" * 64))):
+            with self.subTest(field=field):
+                saved = copy.deepcopy(row["environment"])
+                row["environment"][field] = value
+                self.assert_rejected("without independent verification")
+                row["environment"] = saved
+
+    def test_research_and_qualification_digests_cannot_be_json_numbers(self):
+        for field, value in (("artifact_sha256", int("1" * 64)), ("source_commit", int("1" * 40))):
+            self.setUp()
+            _, row = self.research_fixture()
+            row[field] = value
+            self.assert_rejected("researched maturity requires")
+        self.setUp()
+        cap, _ = self.promote("locally_qualified")
+        cap["qualification_requirements"]["locally_qualified"]["environment"]["configuration_sha256"] = int("1" * 64)
+        cap["decision_receipt"] = self.approve([("decide_capability", cap["id"])])
+        self.assert_rejected("qualification requires")
+
+    def test_commit_identity_must_be_a_string_even_when_number_matches_proof(self):
+        cap, row = self.promote()
+        cap["candidate_commit"] = row["candidate_commit"] = int("1" * 40)
+        self.assert_rejected("without independent verification")
+        self.setUp()
+        self.data["source_commit"] = int("1" * 40)
+        self.assert_rejected("source_commit must be")
+
+    def test_contract_binding_types_cannot_use_python_scalar_coercion(self):
+        for source in ("evidence", "research", "proposal"):
+            for field, value in (("revision", True), ("revision", 1.0), ("revision", "1"),
+                                 ("id", True), ("sha256", int("1" * 64))):
+                with self.subTest(source=source, field=field, value=value):
+                    self.setUp()
+                    self.promote()
+                    self.assertEqual(self.errors(), [])
+                    if source == "evidence":
+                        row = self.data["evidence"][0]
+                    elif source == "research":
+                        row = self.data["research"][-1]
+                    else:
+                        row = self.data["proposals"][-1]
+                    row["contract_bindings"][0][field] = value
+                    if source == "proposal":
+                        self.data["decisions"][-1]["proposal_digest"] = checker.digest(row)
+                    self.assertTrue(self.errors())
+
+    def test_work_and_composed_contract_bindings_require_integer_revisions(self):
+        for kind in ("work_verification", "composed_checkpoint", "recovery", "rollback"):
+            with self.subTest(kind=kind):
+                self.setUp()
+                self.promote("release_qualified")
+                item = self.data["work_items"][0]
+                if kind == "work_verification":
+                    item["consumes_contracts"] = [self.data["contracts"][0]["id"]]
+                    item["contract_receipts"] = {self.data["contracts"][0]["id"]:
+                                                self.data["contracts"][0]["decision_receipt"]}
+                    self.close_checkpoint(self.data["capabilities"][0])
+                self.assertEqual(self.errors(), [])
+                rows = [r for r in self.data["evidence"] if r["kind"] == kind and r.get("contract_bindings")]
+                self.assertTrue(rows)
+                for row in rows:
+                    row["contract_bindings"][0]["revision"] = True
+                self.assertTrue(self.errors())
 
     def test_program_status_is_candidate_only_even_with_other_approvals(self):
         for status in ("accepted", "approved", "ratified", "arbitrary", "", None, False, [], {}):

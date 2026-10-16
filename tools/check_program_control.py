@@ -14,6 +14,7 @@ import hashlib
 import json
 import re
 import sys
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +42,30 @@ def digest(value: Any) -> str:
 
 def text_present(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
+
+
+def sha256(value: Any) -> bool:
+    return isinstance(value, str) and bool(HEX64.fullmatch(value))
+
+
+def commit_hash(value: Any) -> bool:
+    return isinstance(value, str) and bool(re.fullmatch(r"[0-9a-f]{40}", value))
+
+
+def proof_environment(value: Any) -> bool:
+    return text_present(value) or (isinstance(value, dict)
+            and text_present(value.get("id")) and text_present(value.get("execution_class"))
+            and sha256(value.get("configuration_sha256")))
+
+
+def calendar_date(value: Any) -> bool:
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        return False
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
 
 
 def continuation_declared(value: dict[str, Any]) -> bool:
@@ -259,7 +284,7 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
         return errors + ["program_id must be a nonempty string"]
     if data["status"] != "candidate":
         errors.append("program status must be candidate; program ratification is not supported by this schema")
-    if not re.fullmatch(r"[0-9a-f]{40}", str(data["source_commit"])):
+    if not commit_hash(data["source_commit"]):
         errors.append("source_commit must be a full lowercase commit hash")
 
     order = data["maturity_order"]
@@ -282,6 +307,9 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
     plan_fields = research_control.get("required_plan_fields", [])
     if not isinstance(plan_fields, list) or not PLAN_FIELDS.issubset(plan_fields):
         errors.append("research required_plan_fields must include question, source_class, quota_class, stop_condition, evidence_artifact")
+    packet_fields = research_control["continuation_packet_fields"]
+    if len(packet_fields) != len(CONTINUATION_FIELDS) or set(packet_fields) != CONTINUATION_FIELDS:
+        errors.append("research continuation_packet_fields must equal the supported field set without duplicates")
     contracts = _ids(data["contracts"], "contract", errors)
     decisions = _ids(data["decisions"], "decision", errors)
     work = _ids(data["work_items"], "work item", errors)
@@ -318,6 +346,9 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
 
     def bindings_match(bindings: Any, contract_ids: list[str]) -> bool:
         return (isinstance(bindings, list) and len(bindings) == len(contract_ids)
+                and all(isinstance(row, dict) and text_present(row.get("id"))
+                        and type(row.get("revision")) is int and row["revision"] >= 1
+                        and sha256(row.get("sha256")) for row in bindings)
                 and all(cid in contracts and contract_binding(contracts[cid]) in bindings
                         for cid in contract_ids)
                 and len(set(contract_ids)) == len(contract_ids))
@@ -326,12 +357,12 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
         return isinstance(actual, list) and len(actual) == len(expected) and all(row in actual for row in expected)
 
     def successful_proof(row: dict[str, Any], candidate: Any) -> bool:
-        return (bool(re.fullmatch(r"[0-9a-f]{40}", str(candidate)))
+        return (commit_hash(candidate)
                 and row.get("candidate_commit") == candidate and row.get("result") == "pass"
                 and row.get("status") == "current" and row.get("independent") is True
                 and text_present(row.get("acceptance_command"))
-                and text_present(row.get("artifact")) and bool(row.get("environment"))
-                and bool(HEX64.fullmatch(str(row.get("artifact_sha256", "")))))
+                and text_present(row.get("artifact")) and proof_environment(row.get("environment"))
+                and sha256(row.get("artifact_sha256")))
 
     def qualification_matches(row: dict[str, Any], capability: dict[str, Any], tier: str) -> bool:
         classes = {"locally_qualified": ("local_observation", "local_runtime"),
@@ -348,7 +379,7 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
                 and isinstance(environment, dict)
                 and isinstance(environment.get("id"), str) and bool(environment["id"].strip())
                 and environment.get("execution_class") == execution_class
-                and bool(HEX64.fullmatch(str(environment.get("configuration_sha256", ""))))
+                and sha256(environment.get("configuration_sha256"))
                 and row.get("evidence_class") == evidence_class
                 and row.get("environment") == environment)
 
@@ -426,6 +457,7 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
         "rejected_options", "rationale", "conditions", "scope", "decided_on",
         "approval_evidence", "revisit_trigger", "proposal_id",
     }
+    receipt_arrays = {"rejected_options", "conditions", "scope"}
     valid_decisions = set()
     for decision_id, decision in decisions.items():
         if decision.get("status") == "approved":
@@ -433,7 +465,16 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
             absent = sorted(field for field in receipt_fields if not decision.get(field))
             if absent:
                 errors.append(f"{decision_id} incomplete human receipt: {', '.join(absent)}")
-            if not HEX64.fullmatch(str(decision.get("proposal_digest", ""))):
+            for field in receipt_fields - receipt_arrays:
+                if not text_present(decision.get(field)):
+                    errors.append(f"{decision_id} receipt {field} must be a nonempty string")
+            for field in receipt_arrays:
+                value = decision.get(field)
+                if not isinstance(value, list) or not value or not all(text_present(v) for v in value):
+                    errors.append(f"{decision_id} receipt {field} must be a nonempty list of strings")
+            if not calendar_date(decision.get("decided_on")):
+                errors.append(f"{decision_id} receipt decided_on must be a valid YYYY-MM-DD date")
+            if not sha256(decision.get("proposal_digest")):
                 errors.append(f"{decision_id} proposal_digest must be SHA-256")
             proposal = proposals.get(decision.get("proposal_id"))
             if proposal is None or decision.get("proposal_id") not in valid_proposals:
@@ -654,8 +695,8 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
                     and row.get("status") == "current" and row.get("result") == "pass"
                     and row.get("continuation") is False and not continuation_declared(row)
                     and all(text_present(row.get(field)) for field in ("source_class", "artifact", "limitations"))
-                    and bool(HEX64.fullmatch(str(row.get("artifact_sha256", ""))))
-                    and bool(re.fullmatch(r"[0-9a-f]{40}", str(row.get("source_commit", ""))))
+                    and sha256(row.get("artifact_sha256"))
+                    and commit_hash(row.get("source_commit"))
                     and bindings_match(row.get("contract_bindings"), capability["contract_ids"])
                     for rid in capability["research_ids"] if rid in research for row in [research[rid]]):
                 errors.append(f"{capability_id} researched maturity requires current linked structured research")
@@ -722,7 +763,7 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
                      "provider_free_verified": "provider_free", "locally_qualified": "local_qualification",
                      "release_qualified": "release_qualification"}
             candidate = capability.get("candidate_commit")
-            valid_candidate = bool(re.fullmatch(r"[0-9a-f]{40}", str(candidate)))
+            valid_candidate = commit_hash(candidate)
             commands = capability.get("acceptance_commands")
             command = commands.get(current) if isinstance(commands, dict) else None
             def supports(row: dict[str, Any]) -> bool:
@@ -732,8 +773,8 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
                         and row.get("tier") == current and row.get("kind") == kinds[current]
                         and (not independent or row.get("independent") is True)
                         and text_present(command) and row.get("acceptance_command") == command
-                        and text_present(row.get("artifact")) and bool(row.get("environment"))
-                        and bool(HEX64.fullmatch(str(row.get("artifact_sha256", ""))))
+                        and text_present(row.get("artifact")) and proof_environment(row.get("environment"))
+                        and sha256(row.get("artifact_sha256"))
                         and qualification_matches(row, capability, current)
                         and bindings_match(row.get("contract_bindings"), capability.get("contract_ids", [])))
             matching = [evidence[eid] for eid in evidence_ids if eid in evidence and supports(evidence[eid])]

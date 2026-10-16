@@ -18,7 +18,10 @@
       "fixture-b",
       "claude",
       "codex",
-      "grok"
+      "grok",
+      "gemini",
+      "cursor",
+      "opencode"
     ]
   },
   "providers": [
@@ -98,6 +101,59 @@
         "streaming-json",
         "--always-approve",
         "--no-auto-update"
+      ],
+      "timeout_seconds": 120
+    },
+    {
+      "name": "gemini",
+      "enabled": false,
+      "capabilities": [
+        "execute",
+        "stream-json",
+        "subscription"
+      ],
+      "argv": [
+        "gemini",
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--approval-mode",
+        "yolo",
+        "--skip-trust"
+      ],
+      "timeout_seconds": 120
+    },
+    {
+      "name": "cursor",
+      "enabled": false,
+      "capabilities": [
+        "execute",
+        "stream-json",
+        "subscription"
+      ],
+      "argv": [
+        "agent",
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--force",
+        "--trust"
+      ],
+      "timeout_seconds": 120
+    },
+    {
+      "name": "opencode",
+      "enabled": false,
+      "capabilities": [
+        "execute",
+        "json"
+      ],
+      "argv": [
+        "opencode",
+        "run",
+        "--format",
+        "json",
+        "--auto"
       ],
       "timeout_seconds": 120
     }

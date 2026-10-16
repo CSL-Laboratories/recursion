@@ -20,33 +20,21 @@
 # `timeout 55` lets the shell emit ::warning:: on hang; timeout-minutes is a
 # backstop, and a follow-up step warns if that backstop kills the shell.
 #
-# Label add/remove would otherwise re-run this whole workflow (and, with
-# cancel-in-progress, abort an in-flight linux run). GitHub has no workflow-level
-# `if`, so the linux job itself is skipped for drafts and for label events
-# other than `ci:full` / `enhancement`. A skipped job is not success, so it
-# cannot turn a failed required check green. Those label events also use a
-# separate concurrency group so they cannot cancel a real suite.
+# Do not listen for labeled/unlabeled. A skipped or no-op job named `linux` is
+# treated as success and would overlay a failed required check on the same SHA.
+# `ci:full` still gates windows/macos on the next real run (synchronize,
+# ready_for_review, dispatch, or master push). Discord `/ci full` retriggers.
 name: CI
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [master]
   workflow_dispatch:
 
-# Unrelated labeled/unlabeled events must not share the PR concurrency group:
-# cancel-in-progress would abort a real synchronize linux run. ci:full and
-# enhancement keep the main group so they retrigger as intended.
 concurrency:
-  group: >-
-    ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{
-      github.event_name == 'pull_request' &&
-      (github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
-      github.event.label.name != 'ci:full' &&
-      github.event.label.name != 'enhancement' &&
-      'label-churn' || 'run'
-    }}
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -60,19 +48,6 @@ env:
 jobs:
   linux:
     name: linux
-    if: >
-      github.event_name != 'pull_request' ||
-      (
-        github.event.pull_request.draft == false &&
-        (
-          (
-            github.event.action != 'labeled' &&
-            github.event.action != 'unlabeled'
-          ) ||
-          github.event.label.name == 'ci:full' ||
-          github.event.label.name == 'enhancement'
-        )
-      )
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 15
     outputs:

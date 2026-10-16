@@ -1,21 +1,36 @@
-"""Run one task on a routed provider and, when another provider exists, review it."""
+"""Run one task on a routed provider and, when another provider exists, review it.
+
+A rate limit, exhausted quota, or expired auth records a cooldown in the run
+state and the next capable provider of the same class is tried: offline falls
+back to offline, and live falls back to live. Other failures stop the run.
+The budget is checked before each call.
+"""
 
 from __future__ import annotations
 
 import os
 import re
 import subprocess
+import sys
+import time
 from pathlib import Path
 
+from scripts.v3.harness.cooldowns import CooldownStore, resolve_until
+from scripts.v3.harness.context import task_prompt
 from scripts.v3.harness.doctor import _scrub, _secret_values
-from scripts.v3.harness.errors import HarnessError, ProviderTimeout
+from scripts.v3.harness.errors import (
+    HarnessError,
+    LiveProviderDisabled,
+    ProviderAvailability,
+    ProviderTimeout,
+)
 from scripts.v3.harness.log import append_event
-from scripts.v3.harness.providers import ProviderRequest, open_provider
+from scripts.v3.harness.providers import ProviderRequest, adapters, open_provider
 from scripts.v3.harness.review import parse_verdict, review_prompt
 from scripts.v3.harness.routing import select_route
 from scripts.v3.harness.state import new_run_id, save_run
 from scripts.v3.harness.streams import assistant_text
-from scripts.v3.harness.usage import add_usage, empty_usage, exceeded, parse_usage
+from scripts.v3.harness.usage import add_usage, call_fits, empty_usage, exceeded, parse_usage
 
 
 RECORD_LIMIT = 8000
@@ -31,6 +46,9 @@ def run_task(
     allow_live: bool = False,
     open_adapter=None,
     run_id: str | None = None,
+    diff: str | None = None,
+    dependencies: list | None = None,
+    now=None,
     run_branch: str | None = None,
     repo: Path | None = None,
 ) -> dict:
@@ -39,30 +57,57 @@ def run_task(
     if not isinstance(task, str) or task.strip() == "":
         raise HarnessError("task must not be empty")
     worker, reviewers = select_route(config, provider)
+    candidates = [worker, *reviewers]
+    # A requested worker goes first. Fallback only stays inside its own class,
+    # so --allow-live cannot turn an offline failure into a paid CLI call.
+    worker_candidates = _same_class(candidates, worker)
     opener = open_provider if open_adapter is None else open_adapter
     run_id = new_run_id() if run_id is None else run_id
     run_branch = _branch_name(run_branch, repo)
     budgets = config["budgets"]
+    cooldown_seconds = config["routing"]["cooldown_seconds"]
     usage = empty_usage()
     reviews: list[dict] = []
+    attempts: list[dict] = []
     shown = ""
     workspace = _live_workspace(state_dir, run_id) if allow_live else None
-    current_task = task
+    worker_task = task_prompt(task, dependencies)
+    current_task = worker_task
+    review_diff = diff or ""
+    store = CooldownStore(Path(state_dir) / "cooldowns.json")
+    clock = time.time if now is None else now
+    holder = {"provider": worker}
+
+    def snapshot() -> dict:
+        return store.active(clock())
+
+    def notify_replacement(provider_name: str) -> None:
+        if holder.get("notified") == provider_name or provider is None or not provider_name or provider_name == provider:
+            return
+        holder["notified"] = provider_name
+        print(
+            f"notice: requested provider {provider} was replaced by {provider_name}",
+            file=sys.stderr,
+        )
 
     def finish(status: str, error: str | None = None) -> dict:
+        # The record names whoever actually ran. Fallback updates holder first.
+        notify_replacement(holder["provider"])
         return _finish(
             config,
             state_dir,
             run_id=run_id,
             task=task,
-            provider=worker,
-            reviewers=reviewers,
+            provider=holder["provider"],
+            reviewers=[name for name in candidates if name != holder["provider"]],
             text=shown,
             reviews=reviews,
             usage=usage,
             status=status,
             error=error,
             workspace=workspace,
+            attempts=attempts,
+            cooldowns=snapshot(),
             run_branch=run_branch,
             repo=repo,
         )
@@ -70,31 +115,91 @@ def run_task(
     def save_failure(status: str, exc: HarnessError) -> None:
         finish(status, error=str(exc))
 
-    def call(name: str, request: ProviderRequest):
-        try:
-            return _execute(
-                opener,
-                name,
-                request,
-                allow_live=allow_live,
-                timeout_seconds=_timeout(config, name),
-            )
-        except ProviderTimeout as exc:
-            save_failure("timed-out", exc)
-            raise
-        except HarnessError as exc:
-            save_failure("failed", exc)
-            raise
+    def dispatch(names: list[str], request: ProviderRequest, *, on_exhaust: str) -> tuple[str, object]:
+        """Try each provider. Availability failures cool down and move on."""
+
+        disabled: LiveProviderDisabled | None = None
+        for name in names:
+            active = snapshot()
+            if name in active:
+                attempts.append(
+                    {
+                        "error": "cooldown",
+                        "ok": False,
+                        "provider": name,
+                        "reason": active[name].get("reason"),
+                    }
+                )
+                continue
+            if not call_fits(usage, budgets, request.task):
+                attempts.append({"ok": False, "provider": name, "reason": "budget"})
+                return "budget", None
+            try:
+                result = _execute(
+                    opener,
+                    name,
+                    request,
+                    allow_live=allow_live,
+                    timeout_seconds=_timeout(config, name),
+                )
+            except ProviderTimeout as exc:
+                save_failure("timed-out", exc)
+                raise
+            except LiveProviderDisabled as exc:
+                if on_exhaust == "fail":
+                    # A worker must not fall through to an offline adapter and
+                    # be recorded as a real completion.
+                    attempts.append(
+                        {"error": "LiveProviderDisabled", "ok": False, "provider": name}
+                    )
+                    save_failure("failed", exc)
+                    raise
+                disabled = disabled or exc
+                attempts.append(
+                    {"error": "LiveProviderDisabled", "ok": False, "provider": name}
+                )
+                continue
+            except ProviderAvailability as exc:
+                moment = clock()
+                store.record(
+                    name,
+                    exc.reason,
+                    resolve_until(exc.until, exc.retry_after, moment, float(cooldown_seconds)),
+                )
+                attempts.append(
+                    {
+                        "error": type(exc).__name__,
+                        "ok": False,
+                        "provider": name,
+                        "reason": exc.reason,
+                    }
+                )
+                continue
+            except HarnessError as exc:
+                save_failure("failed", exc)
+                raise
+            attempts.append({"ok": True, "provider": name})
+            return "ok", result
+        if on_exhaust == "skip":
+            return "skipped", None
+        exc = disabled or HarnessError("no capable provider completed the task")
+        save_failure("failed", exc)
+        raise exc
 
     append_event(state_dir, run_id, "run.started", provider=worker)
-    result = call(worker, _request(current_task, run_id, "execute", workspace))
+    kind, result = dispatch(worker_candidates, _request(worker_task, run_id, "execute", workspace), on_exhaust="fail")
+    if kind == "budget":
+        return finish("budget-exceeded")
+    holder["provider"] = result.provider
+    notify_replacement(result.provider)
     add_usage(usage, parse_usage(result.text))
     shown = assistant_text(result.text)
     if exceeded(usage, budgets):
         return finish("budget-exceeded")
 
     max_rounds = config["review"]["max_rounds"]
-    if max_rounds <= 0 or not reviewers:
+    review_candidates = [name for name in candidates if name != result.provider]
+    if max_rounds <= 0 or not review_candidates:
         status = "completed" if config["review"]["accept_unreviewed"] else "unreviewed"
         if status == "unreviewed":
             reviews.append(
@@ -109,17 +214,31 @@ def run_task(
 
     status = "review-rejected"
     for round_index in range(1, max_rounds + 1):
-        reviewer = reviewers[0]
-        review_result = call(
-            reviewer,
-            _request(review_prompt(current_task, shown), run_id, "review", workspace),
+        review_kind, review_result = dispatch(
+            [name for name in candidates if name != result.provider],
+            _request(review_prompt(current_task, shown, review_diff), run_id, "review", workspace),
+            on_exhaust="skip",
         )
+        if review_kind == "budget":
+            status = "budget-exceeded"
+            break
+        if review_kind == "skipped":
+            reviews.append(
+                {
+                    "notes": "no distinct reviewer",
+                    "provider": None,
+                    "round": round_index,
+                    "verdict": "skipped",
+                }
+            )
+            status = "completed" if config["review"]["accept_unreviewed"] else "unreviewed"
+            break
         add_usage(usage, parse_usage(review_result.text))
         verdict, notes = parse_verdict(review_result.text)
         reviews.append(
             {
                 "notes": notes,
-                "provider": reviewer,
+                "provider": review_result.provider,
                 "round": round_index,
                 "verdict": verdict,
             }
@@ -128,7 +247,7 @@ def run_task(
             state_dir,
             run_id,
             "review.verdict",
-            provider=reviewer,
+            provider=review_result.provider,
             verdict=verdict,
         )
         if exceeded(usage, budgets):
@@ -141,9 +260,26 @@ def run_task(
             status = "review-rejected"
             break
         current_task = (
-            task + "\n\nPrevious answer:\n" + shown[:RECORD_LIMIT] + "\n\nReview notes:\n" + notes
+            worker_task
+            + "\n\nPrevious answer:\n"
+            + shown[:RECORD_LIMIT]
+            + "\n\nReview notes:\n"
+            + notes
         )
-        result = call(worker, _request(current_task, run_id, "execute", workspace))
+        revise_kind, revised = dispatch(
+            _same_class(
+                [result.provider, *[name for name in candidates if name != result.provider]],
+                result.provider,
+            ),
+            _request(current_task, run_id, "execute", workspace),
+            on_exhaust="fail",
+        )
+        if revise_kind == "budget":
+            status = "budget-exceeded"
+            break
+        result = revised
+        holder["provider"] = result.provider
+        notify_replacement(result.provider)
         add_usage(usage, parse_usage(result.text))
         shown = assistant_text(result.text)
         if exceeded(usage, budgets):
@@ -151,6 +287,18 @@ def run_task(
             break
 
     return finish(status)
+
+
+def _provider_offline(name: str) -> bool:
+    cls = adapters().get(name)
+    return cls is not None and bool(getattr(cls, "OFFLINE", False))
+
+
+def _same_class(names: list[str], anchor: str) -> list[str]:
+    """Keep names that match the anchor: offline with offline, live with live."""
+
+    offline = _provider_offline(anchor)
+    return [name for name in names if _provider_offline(name) is offline]
 
 
 def _request(task: str, run_id: str, kind: str, workspace: str | None) -> ProviderRequest:
@@ -189,6 +337,8 @@ def _finish(config, state_dir, **fields) -> dict:
         text = text[:RECORD_LIMIT] + "\n[truncated]"
     record = {
         "accepted": fields["status"] == "completed",
+        "attempts": list(fields.get("attempts") or []),
+        "cooldowns": fields.get("cooldowns") or {},
         "provider": fields["provider"],
         "reviewers": list(fields["reviewers"]),
         "reviews": _scrub(fields["reviews"], secrets),

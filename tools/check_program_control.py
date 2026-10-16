@@ -39,7 +39,7 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
     errors: list[str] = []
     required = {
         "schema_version", "program_id", "status", "parent_issue", "implementation_issue",
-        "source_commit", "research", "maturity_order", "contracts", "decisions", "admission",
+        "source_commit", "research", "research_control", "maturity_order", "contracts", "decisions", "admission",
         "work_items", "capabilities", "evidence", "unknowns", "risks", "integration_checkpoints",
     }
     missing = sorted(required - data.keys())
@@ -58,6 +58,18 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
         errors.append("maturity_order must contain unique tiers including unresearched")
         return errors
     rank = {value: index for index, value in enumerate(order)}
+    research_control = data["research_control"]
+    if research_control.get("default") != "approved_issue_pass_only":
+        errors.append("research must default to the approved issue pass")
+    if research_control.get("continuation_requires_human") is not True:
+        errors.append("research continuation must require human approval")
+    if research_control.get("approval_channel") != "human_comment_on_matching_linear_issue":
+        errors.append("research approval must use a human comment on the matching Linear issue")
+    if research_control.get("status_is_authority") is not False:
+        errors.append("Linear status must not grant research authority")
+    for field in ("required_plan_fields", "continuation_triggers", "continuation_packet_fields", "required_receipt_fields"):
+        if not isinstance(research_control.get(field), list) or not research_control[field]:
+            errors.append(f"research control requires non-empty {field}")
     contracts = _ids(data["contracts"], "contract", errors)
     decisions = _ids(data["decisions"], "decision", errors)
     work = _ids(data["work_items"], "work item", errors)
@@ -79,7 +91,7 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
             errors.append(f"{contract_id} has invalid status")
 
     receipt_fields = {
-        "human_decider", "authority_basis", "proposal_digest", "selected_option",
+        "linear_issue", "approval_comment_id", "human_decider", "authority_basis", "proposal_digest", "selected_option",
         "rejected_options", "rationale", "conditions", "scope", "decided_on",
         "approval_evidence", "revisit_trigger",
     }

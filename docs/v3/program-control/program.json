@@ -13,6 +13,43 @@
       "url": "https://platform.parallel.ai/view/task-run/trun_db705696fec649d8b15f52853c399530"
     }
   ],
+  "research_control": {
+    "default": "approved_issue_pass_only",
+    "required_plan_fields": [
+      "question",
+      "quota_class",
+      "stop_condition",
+      "evidence_artifact"
+    ],
+    "continuation_requires_human": true,
+    "approval_channel": "human_comment_on_matching_linear_issue",
+    "status_is_authority": false,
+    "required_receipt_fields": [
+      "linear_issue",
+      "approval_comment_id",
+      "human_decider",
+      "proposal_digest",
+      "approved_scope",
+      "quota_class",
+      "approved_on",
+      "conditions",
+      "next_stop_trigger"
+    ],
+    "continuation_triggers": [
+      "the approved stop condition is reached",
+      "a new Deep Research run is proposed",
+      "a materially broader search would consume additional Parallel quota",
+      "the next question changes the product direction under investigation"
+    ],
+    "continuation_packet_fields": [
+      "evidence_obtained",
+      "remaining_uncertainty",
+      "expected_quota_class",
+      "options",
+      "recommendation",
+      "next_stop_condition"
+    ]
+  },
   "maturity_order": [
     "unresearched",
     "researched",
@@ -30,20 +67,20 @@
       "revision": 1,
       "status": "candidate",
       "path": "docs/v3/program-control/ISSUE-CONTRACT.md",
-      "sha256": "5cf1bc7354bfa7d3e4adbd4fdabe4d77269eacfc7564648b2856a8a27db11703"
+      "sha256": "eae8fa9d2c11cd01ec40284d763b0aac0855ca84efd6a5ac60641f0ced48e5fe"
     },
     {
       "id": "contract.month-program",
       "revision": 1,
       "status": "candidate",
       "path": "docs/v3/program-control/MONTH-PROGRAM.md",
-      "sha256": "bf430290d230f8aa5ce7661790ccb2fef383ee85a6cfb48624bb1cbaa2b0a4ed"
+      "sha256": "24a9eb4e1a62097ad44a0b84e72bf24d6146093a94754fb9720d7f373a12c0d2"
     }
   ],
   "decisions": [
     {
       "id": "decision.program-control-candidate",
-      "status": "approved",
+      "status": "pending",
       "human_decider": "Lucas Guerra",
       "authority_basis": "direct owner instruction",
       "proposal_digest": "4c12391901e75c75d43066f79f515d0cb6cba6adc19449b244b9a4d1752e8906",
@@ -62,7 +99,7 @@
         "CSL-204"
       ],
       "decided_on": "2026-10-16",
-      "approval_evidence": "CSL-204 owner authorization quotation",
+      "approval_evidence": "Session authorization is quoted on CSL-204, but no human-authored Linear approval comment is pinned under the candidate policy.",
       "revisit_trigger": "The candidate changes product authority, public semantics, or the accepted program boundary."
     }
   ],
@@ -87,7 +124,9 @@
       "spending or external quota",
       "compatibility or release commitment",
       "destructive external state",
-      "architecture costly to reverse"
+      "architecture costly to reverse",
+      "research continuation beyond the accepted issue budget",
+      "recommendation acceptance into a product contract"
     ],
     "active_contract_consumers": []
   },

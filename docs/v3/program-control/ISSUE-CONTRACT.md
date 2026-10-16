@@ -24,6 +24,14 @@ Every issue performs a research check. Not every issue commissions a new Deep Re
 
 Research must preserve source-documented facts, locally observed evidence, inference and unknowns as separate classes. Model agreement is not verification.
 
+### Research authorization and continuation
+
+An issue's accepted research plan authorizes its initial bounded evidence pass. It must state the question, source class, expected quota/cost class, stop condition, and artifact to produce. Agents may execute and synthesize that approved pass without step-by-step permission.
+
+A human developer must approve continuing or expanding the lane when the initial pass reaches its stop condition, when a new Deep Research run or materially broader search would consume additional Parallel quota, or when the proposed next question changes the product direction being investigated. The continuation packet includes evidence already obtained, remaining uncertainty, expected quota class, options, recommendation, and the smallest next pass. Repeated queries, model curiosity, or an unfinished recommendation are not implicit authorization.
+
+The authoritative approval receipt is a comment by the approving human on the matching Linear issue. It identifies the approver, exact research pass or recommendation digest, approved scope and quota class, date, conditions, and next stop trigger. Agents may draft the comment for review, but may not post it on the human's behalf. Labels and issue status are routing signals only; moving an issue from `needs-decision` or changing its status does not grant approval.
+
 ## Human decision sovereignty
 
 Consequential decisions are made by an identified human, never inferred from agent output, model consensus, a merged prototype or an issue status change.
@@ -39,11 +47,11 @@ Human sovereignty is a boundary, not a requirement for humans to direct every st
 
 - **Bounded autonomy:** agents and developers may independently choose reversible implementation details, local refactors, test strategy, research tactics, prototype structure, failure repair, and linked follow-up issues when the parent outcome, accepted contracts, allowed effects, budgets, and acceptance gate remain unchanged.
 - **Collaborative judgment:** when several reversible choices could materially affect maintainability or integration, the agent produces evidence and a recommendation for the active claimant. Work may continue on non-conflicting experiments while that choice is discussed.
-- **Human gate:** explicit human confirmation is required only when a choice changes product intent, public semantics, authority, privacy, credentials, spending, compatibility commitments, release scope, destructive external state, or an architecture that is costly to reverse.
+- **Human gate:** explicit human confirmation is required for product decisions, approval of recommendations into the product contract, research continuation beyond the accepted issue budget, or choices that change public semantics, authority, privacy, credentials, spending, compatibility commitments, release scope, destructive external state, or an architecture that is costly to reverse.
 - **Narrow blocking:** a pending human decision blocks only the affected claim and dependants. Unrelated research, tests, prototypes, and work under already accepted contracts continue.
 - **Escalation packet:** agents do not merely stop. They reduce the question to exact options, evidence, recommendation, falsifiers, affected scope, and the smallest decision needed.
 
-Routine engineering choices are recorded in the issue or PR with their evidence and remain reviewable; they do not require a human decision receipt. If a routine choice crosses a listed threshold, its discretion class changes before the consequential effect occurs.
+Routine engineering choices are recorded in the issue or PR with their evidence and remain reviewable; they do not require a human decision receipt. Research execution within an approved pass is routine, but research continuation is not. If a routine choice crosses a listed threshold, its discretion class changes before the consequential effect occurs.
 
 ### Required decision receipt
 
@@ -59,7 +67,7 @@ Every accepted consequential decision must have a durable human-authored or huma
 8. expiry, revisit trigger or explicit statement that none is set;
 9. explicit approval language and approval date.
 
-An agent may draft this packet, but only the human's explicit confirmation converts it into a decision. Reactions, silence, meeting attendance, prototype success, branch creation, PR approval and merge do not substitute for the receipt unless the governing contract explicitly defines that exact action as approval.
+An agent may draft this packet, but only the human's explicit comment on the matching Linear issue converts it into a decision. The receipt pins the comment identity so a status change cannot be mistaken for approval. Reactions, silence, meeting attendance, prototype success, branch creation, PR approval and merge do not substitute for the receipt unless the governing contract explicitly defines that exact action as approval.
 
 ### Decision gate behavior
 
@@ -77,14 +85,15 @@ An agent may draft this packet, but only the human's explicit confirmation conve
 4. **Non-goals:** adjacent work and claims explicitly excluded.
 5. **Inherited decisions:** owner decisions and contracts that may not be reopened silently.
 6. **Research basis:** pinned repository evidence, Parallel/Context7 sources and unresolved unknowns.
-7. **Dependencies:** issues, artifacts and decisions required before start or freeze.
-8. **Authority boundary:** permitted changes/effects and actions requiring owner approval.
-9. **Discretion class and decision triggers:** bounded-autonomy, collaborative-judgment, or human-gated work, plus findings that change the class.
-10. **Falsifiers:** observable results that reject the proposed approach or invalidate the task.
-11. **Acceptance gate:** deterministic or machine-checkable checks on the exact candidate.
-12. **Independent verification:** who or what reruns the candidate, preferably with a different model family.
-13. **Evidence output:** artifacts, raw results, limitations and provenance retained for dependants.
-14. **Follow-up rule:** new discoveries become deduplicated linked issues, not drive-by scope expansion.
+7. **Research budget:** approved question, quota/cost class, stop condition, and continuation trigger.
+8. **Dependencies:** issues, artifacts and decisions required before start or freeze.
+9. **Authority boundary:** permitted changes/effects and actions requiring owner approval.
+10. **Discretion class and decision triggers:** bounded-autonomy, collaborative-judgment, or human-gated work, plus findings that change the class.
+11. **Falsifiers:** observable results that reject the proposed approach or invalidate the task.
+12. **Acceptance gate:** deterministic or machine-checkable checks on the exact candidate.
+13. **Independent verification:** who or what reruns the candidate, preferably with a different model family.
+14. **Evidence output:** artifacts, raw results, limitations and provenance retained for dependants.
+15. **Follow-up rule:** new discoveries become deduplicated linked issues, not drive-by scope expansion.
 
 ## Definition of Ready
 

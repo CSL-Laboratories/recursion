@@ -48,6 +48,8 @@ Keep a short queue of consequential decisions with the exact packet digest, opti
 
 The queue is an exception path, not the default work queue. Agents proceed under bounded autonomy for reversible engineering choices, collaborate with the active claimant on material but reversible tradeoffs, and escalate only the smallest consequential decision. A pending decision blocks its affected contract lineage, not the entire program.
 
+Product decisions, recommendation acceptance into a normative product contract, and continuation of a research lane beyond its approved budget always enter this queue. For research continuation, record the completed pass, remaining uncertainty, expected additional Parallel quota class, stop condition, and developer approval before another pass begins. Approval is a human-authored comment on the matching Linear issue, pinned by comment identity and proposal digest; labels and status changes only route the queue.
+
 ### 4. Shared contract registry
 
 Index accepted identities, lifecycle states, commands/events, refusals, wire schemas, capability rules, configuration precedence, engine boundary, adapter boundary and compatibility policy. Record owner, digest, consumers and supersession history.

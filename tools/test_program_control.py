@@ -35,6 +35,7 @@ class ProgramControlTests(unittest.TestCase):
 
     def test_incomplete_human_decision_receipt_is_rejected(self) -> None:
         data = copy.deepcopy(self.data)
+        data["decisions"][0]["status"] = "approved"
         del data["decisions"][0]["human_decider"]
         self.assertTrue(any("incomplete human receipt" in error for error in self.errors(data)))
 
@@ -75,6 +76,16 @@ class ProgramControlTests(unittest.TestCase):
         data = copy.deepcopy(self.data)
         data["admission"]["human_decision_triggers"] = []
         self.assertTrue(any("non-empty human_decision_triggers" in error for error in self.errors(data)))
+
+    def test_research_continuation_requires_human_approval(self) -> None:
+        data = copy.deepcopy(self.data)
+        data["research_control"]["continuation_requires_human"] = False
+        self.assertTrue(any("research continuation must require human approval" in error for error in self.errors(data)))
+
+    def test_linear_status_cannot_substitute_for_approval_comment(self) -> None:
+        data = copy.deepcopy(self.data)
+        data["research_control"]["status_is_authority"] = True
+        self.assertTrue(any("status must not grant" in error for error in self.errors(data)))
 
 
 if __name__ == "__main__":

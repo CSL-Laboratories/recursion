@@ -213,6 +213,37 @@ class WorkflowTests(unittest.TestCase):
         # The required linux job stays green when the script warns and returns 0.
         self.assertEqual(perf_compare.job_exit_code(bench_ok=True), 0)
 
+    def test_unrelated_label_events_skip_blacksmith_linux(self) -> None:
+        text = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        self.assertIn("linux-label-skip:", text)
+        self.assertIn("github.event.label.name == 'ci:full'", text)
+        self.assertIn("github.event.label.name == 'enhancement'", text)
+        self.assertIn("ready_for_review", text.split("jobs:", 1)[0])
+        linux = text[text.index("  linux:\n") : text.index("  linux-label-skip:")]
+        self.assertIn("runs-on: blacksmith-2vcpu-ubuntu-2404", linux)
+        self.assertIn("github.event.action != 'labeled'", linux)
+        self.assertIn("github.event.pull_request.draft == false", linux)
+        skip = text[text.index("  linux-label-skip:") : text.index("  windows:")]
+        self.assertIn("name: linux", skip)
+        self.assertIn("runs-on: ubuntu-latest", skip)
+        self.assertIn("github.event.label.name != 'ci:full'", skip)
+        self.assertIn("github.event.label.name != 'enhancement'", skip)
+        self.assertIn("github.event.pull_request.draft == false", skip)
+        windows = text[text.index("  windows:") : text.index("  macos:")]
+        self.assertIn("needs: linux", windows)
+        pr_lint = (ROOT / ".github" / "workflows" / "pr-lint.yml").read_text(encoding="utf-8")
+        self.assertIn("runs-on: ubuntu-latest", pr_lint)
+        self.assertNotIn("blacksmith", pr_lint)
+        self.assertIn("ready_for_review", pr_lint)
+        self.assertIn("github.event.pull_request.draft == false", pr_lint)
+        nightly = (ROOT / ".github" / "workflows" / "ci-macos-nightly.yml").read_text(
+            encoding="utf-8"
+        )
+        recent = nightly[nightly.index("  recent:") : nightly.index("  macos:")]
+        self.assertIn("name: recent-commits", recent)
+        self.assertIn("runs-on: ubuntu-latest", recent)
+        self.assertNotIn("blacksmith", recent)
+
 
 if __name__ == "__main__":
     unittest.main()

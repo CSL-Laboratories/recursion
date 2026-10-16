@@ -51,7 +51,7 @@ def codex_session_meter(text: str) -> dict:
 
     The reading is a cumulative session total (``CODEX_SESSION_METER``).
     Events in this stream are not summed. A stream with no such usage stays
-    unknown.     A later ``turn.completed`` that omits usage keeps the earlier
+    unknown. A later ``turn.completed`` that omits usage keeps the earlier
     total as a lower bound on spend. A later turn that reports only some
     fields replaces those fields and keeps the earlier value for the rest.
     Callers may add totals from separate exec processes that do not

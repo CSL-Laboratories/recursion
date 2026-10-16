@@ -68,3 +68,36 @@ referenced by digest**, not vendored source.
 Any actual split requires Lucas's explicit approval recorded via an authoring session. This file is
 a proposal and confers no authorization. Because the repository is still in R&D and is still
 growing, the default is to **stay monorepo** until the prerequisites above hold.
+
+---
+
+## P-002 — Replace the legacy branch name in `CONTROL_PLANE.md`
+
+- Date: 2026-10-15
+- Status: **adopted** 2026-10-15. Lucas's owner decision on PR #189 authorizes the
+  protected-policy change, retires `loop/work/<task-id>`, and keeps the force-push,
+  merge, and deployment limits. Applied as D-040.
+- Owner: Lucas.
+- Issue: [CSL-76](https://linear.app/csl-laboratories/issue/CSL-76).
+
+### Motivation
+
+Historical, as of the proposal on 2026-10-15. The operating docs already named review
+branches `csl-<N>-<slug>`, with an optional GitHub username prefix, while invariant 1
+of `CONTROL_PLANE.md` still told agents to commit to `loop/work/<task-id>`. That file
+outranked the operating docs, so the change needed an Owner authoring session recorded
+in `state/DECISIONS.md`. D-040 applied that session. Invariant 1 no longer names
+`loop/work/<task-id>`.
+
+### Proposed replacement
+
+Keep invariant 1's force-push, merge, and deployment limits. Name the review branch
+`csl-<N>-<slug>`, optionally prefixed with a GitHub username. pr-lint matches
+`CSL-[0-9]+` case-sensitively, so a lowercase branch name alone does not pass. The
+`CSL-N` key in the PR title satisfies the check.
+
+### Non-goals
+
+- No edit to `ANCHOR.md`.
+- No edit to `.github/workflows/**`. Workflow, pr-lint, script, and Claude/Devin
+  findings stay listed on the CSL-76 PR.

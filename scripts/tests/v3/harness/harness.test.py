@@ -130,6 +130,28 @@ class HarnessTests(unittest.TestCase):
         stale = "\n".join([started, message("VERDICT approve"), started])
         self.assertEqual(assistant_text(stale), "")
 
+    def test_codex_without_turn_started_joins_every_agent_message(self) -> None:
+        from scripts.v3.harness.streams import assistant_text
+
+        stream = "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {"type": "agent_message", "text": "Fix the error path."},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {"type": "agent_message", "text": "VERDICT revise"},
+                    }
+                ),
+            ]
+        )
+        self.assertEqual(assistant_text(stream), "Fix the error path.\nVERDICT revise")
+        self.assertEqual(parse_verdict(stream), ("revise", "Fix the error path."))
+
     def test_later_codex_verdict_wins(self) -> None:
         stream = "\n".join(
             [

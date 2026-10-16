@@ -31,7 +31,9 @@ def assistant_text(raw: str) -> str:
     grok = _grok_text(events)
     if grok:
         return grok
-    scoped = events
+    # A turn.started event scopes Codex text to that turn. Without one, every
+    # agent message is the reply, so notes before a later VERDICT stay.
+    # Other providers run only when this stream has no Codex agent message.
     starts = [i for i, event in enumerate(events) if event.get("type") == "turn.started"]
     if starts:
         scoped = events[starts[-1] + 1 :]
@@ -39,16 +41,9 @@ def assistant_text(raw: str) -> str:
         if messages:
             return "\n".join(messages)
         return ""
-    for event in reversed(events):
-        item = event.get("item")
-        if (
-            event.get("type") == "item.completed"
-            and isinstance(item, dict)
-            and item.get("type") == "agent_message"
-            and isinstance(item.get("text"), str)
-            and item["text"].strip()
-        ):
-            return item["text"]
+    messages = [text for text in (_agent_message(event) for event in events) if text]
+    if messages:
+        return "\n".join(messages)
     claude = _claude_text(events)
     if claude:
         return claude

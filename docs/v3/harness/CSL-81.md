@@ -16,7 +16,7 @@ and live stream below is **locally unmeasured**.
 | CLI | Version checked | Class |
 |---|---|---|
 | Claude Code | Changelog label **2.1.300**, dated 2026-10-14 ([changelog](https://code.claude.com/docs/en/changelog)). The npm page for `@anthropic-ai/claude-code` showed **2.1.296** (page date 2026-10-13) ([npm](https://www.npmjs.com/package/@anthropic-ai/claude-code)). The headless and CLI pages are unversioned living docs. | Source-documented. The two version numbers are different publications, not one install. |
-| Codex | npm `@openai/codex` **0.162.1** (page date 2026-10-14) ([npm](https://www.npmjs.com/package/@openai/codex)). Usage reports name earlier builds: [openai/codex#17539](https://github.com/openai/codex/issues/17539) (2026-04-12; no build in the excerpt) and [openai/codex#50586](https://github.com/openai/codex/issues/50586) (2026-10-03, source `rust-v0.158.0`). | Source-documented. Behavior of 0.162.1 was not re-measured. |
+| Codex | npm `@openai/codex` **0.162.1** checked (page date 2026-10-14) ([npm](https://www.npmjs.com/package/@openai/codex)). Adapter minimum **>= 0.147.0**, the release that added `--approve-for-me`. Usage reports name earlier builds: [openai/codex#17539](https://github.com/openai/codex/issues/17539) (2026-04-12; no build in the excerpt) and [openai/codex#50586](https://github.com/openai/codex/issues/50586) (2026-10-03, source `rust-v0.158.0`). | Source-documented. Behavior of 0.162.1 was not re-measured. The 0.147.0 floor is the cited release note, not a local install. |
 | Grok | No build number on the pages checked. Headless page date 2026-06-10, reference page date 2026-07-21 ([headless](https://docs.x.ai/build/cli/headless-scripting), [reference](https://docs.x.ai/build/cli/reference)). `grok version` is the documented command. | Version **unmeasured**. |
 
 ## Claude Code
@@ -72,19 +72,33 @@ Event names: `thread.started`, `turn.started`, `turn.completed`,
 `--cd` appears in `docs/getting-started.md` at commit `88abbf58` as the
 working-root flag
 ([getting started](https://github.com/openai/codex/blob/88abbf58cec9843a7cebe250d71146314ebbcf1a/docs/getting-started.md)).
-It was not in the non-interactive excerpt. `--approve-for-me` is on the
-adapter argv and was not in the extracted text of the pages above.
-Unverified on 0.162.1. The adapter argv is `codex exec --json --approve-for-me`,
-plus `--cd` when a workspace is set, and `-` for the stdin prompt.
+`--approve-for-me` is in the official CLI reference. It is the alias of
+`--not-so-yolo`: auto-review with on-request approvals and the workspace-write
+sandbox, and it conflicts with `--sandbox` and `--yolo`
+([CLI reference](https://developers.openai.com/codex/cli/reference)).
+The non-interactive docs recommend it in place of the removed `--full-auto`
+([non-interactive](https://developers.openai.com/codex/noninteractive)).
+A Codex KB dates the flag to v0.147.0
+([v0.147.0](https://codex.danielvaughan.com/2026/08/07/codex-cli-v0147-release-approve-for-me-mcp-2026-07-28-project-trust-plugin-search-secrets-redaction/)).
+That page is not OpenAI's changelog. The adapter requires Codex >= 0.147.0.
+The argv is `codex exec --json --approve-for-me`, plus `--cd` when a workspace
+is set, and `-` for the stdin prompt. That argv passes no `--sandbox`.
+The 0.162.1 binary was not run here.
 
 ## Codex meter
 
-Recommend the **cumulative session total**: the last `turn.completed` usage
-in one `codex exec` stream. `codex_session_meter` in
-`scripts/v3/harness/usage.py` implements that. The label is
+`codex_session_meter` in `scripts/v3/harness/usage.py` keeps the last
+`turn.completed` usage in one `codex exec` stream. The label is
 `cumulative-session-total`.
 
-Evidence class: **source-documented**, not a measurement from this repo.
+Whether those figures are a cumulative session total or one turn is
+**unverified**. The official sample and `exec.md` name the fields and do not
+say which
+([non-interactive](https://developers.openai.com/codex/noninteractive),
+[exec.md](https://github.com/openai/codex/blob/main/docs/exec.md)).
+A single `exec` run has one turn, so the last completed usage is the reading
+this adapter keeps. The issue reports below claim a session total. They are
+not the official docs, and this repo did not measure a multi-turn exec stream.
 
 - [openai/codex#17539](https://github.com/openai/codex/issues/17539) (2026-04-12)
   says `turn.completed` reports cumulative session totals. The interactive
@@ -97,8 +111,11 @@ Evidence class: **source-documented**, not a measurement from this repo.
   to document cumulative versus increment. That request is not evidence the
   field became per-turn.
 - The non-interactive sample names `input_tokens`, `cached_input_tokens`,
-  `output_tokens`, and `reasoning_output_tokens` on `turn.completed`. One
-  sample line cannot show whether the numbers grow across turns.
+  `output_tokens`, and `reasoning_output_tokens` on `turn.completed`.
+  `reasoning_output_tokens` is optional: the sample includes it, and a
+  usage object may omit it. The meter does not require it and does not add
+  it into `output_tokens`. One sample line cannot show whether the numbers
+  grow across turns.
 
 The meter does not use per-turn `last` usage. That field is not in the JSONL.
 It does not sum `turn.completed` events inside one stream: they are snapshots
@@ -137,9 +154,10 @@ Headless argv. Source-documented: `-p` / `--single`, `--output-format` of
 Scripts are told to pass `--no-auto-update`
 ([headless](https://docs.x.ai/build/cli/headless-scripting.md)). The adapter
 uses `--output-format streaming-json`, `--always-approve`, `--no-auto-update`,
-`--cwd`, and `--prompt-file`. `--prompt-file` was not on those official
-pages. A third-party wiki lists it
-([grok-wiki](https://grok-wiki.com/public/docs/xai-org-grok-build-90205de50458)).
+`--cwd`, and `--prompt-file`. The docs.x.ai headless page does not name
+`--prompt-file`. xAI's grok-build headless guide lists `--prompt-file <PATH>`
+as "Prompt from a file"
+([headless mode](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/14-headless-mode.md)).
 The adapter argv was not changed.
 
 Stream events. The official page says streaming-json is newline-delimited

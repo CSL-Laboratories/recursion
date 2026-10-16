@@ -19,10 +19,19 @@ ROOT = Path(__file__).resolve().parents[4]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from scripts.v3.harness.availability import classify_failure  # noqa: E402
 from scripts.v3.harness.cli import main  # noqa: E402
 from scripts.v3.harness.config import load_config, starter_config, validate_config, write_starter  # noqa: E402
+from scripts.v3.harness.cooldowns import CooldownStore, format_until  # noqa: E402
 from scripts.v3.harness.doctor import diagnose, discover_installed, resolve_executable  # noqa: E402
-from scripts.v3.harness.errors import HarnessError, LiveProviderDisabled, ProviderTimeout  # noqa: E402
+from scripts.v3.harness.errors import (  # noqa: E402
+    HarnessError,
+    LiveProviderDisabled,
+    ProviderAuthExpired,
+    ProviderQuotaExhausted,
+    ProviderRateLimited,
+    ProviderTimeout,
+)
 from scripts.v3.harness.providers import (  # noqa: E402
     ClaudeHeadlessProvider,
     CodexExecProvider,
@@ -46,6 +55,7 @@ SECRET = "SECRET-TOKEN-VALUE"
 FIXTURE_DIR = Path(__file__).with_name("fixtures")
 _EVIDENCE = {"source-documented", "locally observed", "synthetic"}
 _PROVIDERS = {"grok", "codex", "claude"}
+NOW = 1_700_000_000
 
 
 def _load_fixture(name: str) -> tuple[dict[str, str], str]:
@@ -1126,3 +1136,348 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(row["signed_in"], "signed-in")
             self.assertEqual(row["auth_method"], "env")
             self.assertTrue(row["usable"])
+
+    def test_weights_prefer_the_higher_weight_and_reject_a_bad_weight(self) -> None:
+        config = load_config()
+        self.assertEqual(config["routing"]["cooldown_seconds"], 60)
+        self.assertEqual(config["routing"]["weights"]["fixture"], 1)
+        self.assertEqual(config["budgets"]["max_input_tokens"], DEFAULT_MAX_INPUT_TOKENS)
+        self.assertEqual(config["budgets"]["max_output_tokens"], DEFAULT_MAX_OUTPUT_TOKENS)
+        ranked = starter_config({"fixture", "fixture-b", "grok"})
+        ranked["routing"]["weights"]["grok"] = 5
+        self.assertEqual(select_route(ranked)[0], "grok")
+        self.assertEqual(select_route(ranked, "fixture")[0], "fixture")
+        payload = starter_config({"fixture"})
+        payload["routing"]["weights"]["fixture"] = True
+        with self.assertRaises(HarnessError) as caught:
+            validate_config(payload)
+        self.assertIn("weights", str(caught.exception))
+
+    def test_rate_limit_cooldown_persists_and_falls_back(self) -> None:
+        calls: list[str] = []
+
+        class Adapter:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def execute(self, request, *, allow_live=False, timeout_seconds=None, runner=None):
+                del allow_live, timeout_seconds, runner
+                calls.append(f"{self.name}:{request.kind}")
+                if self.name == "fixture" and request.kind == "execute":
+                    raise ProviderRateLimited(
+                        "fixture was rate-limited",
+                        until="2026-10-14T08:35:00Z",
+                    )
+                if request.kind == "review":
+                    return ProviderResult(self.name, ("stub",), "VERDICT approve\nok", False)
+                return ProviderResult(self.name, ("stub",), "hello from " + self.name, False)
+
+        config = starter_config({"fixture", "fixture-b", "grok"})
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            record = run_task(
+                "Say hello",
+                config=config,
+                state_dir=state,
+                open_adapter=lambda name: Adapter(name),
+                now=lambda: NOW,
+            )
+            self.assertEqual(record["status"], "completed")
+            self.assertEqual(record["provider"], "fixture-b")
+            self.assertEqual(record["reviews"][0]["provider"], "grok")
+            self.assertEqual(record["reviews"][0]["verdict"], "approve")
+            self.assertEqual(record["cooldowns"]["fixture"]["reason"], "rate-limited")
+            self.assertEqual(record["cooldowns"]["fixture"]["until"], "2026-10-14T08:35:00Z")
+            body = (state / "cooldowns.json").read_text(encoding="utf-8")
+            self.assertNotIn("SECRET", body)
+            self.assertEqual(json.loads(body)["providers"]["fixture"]["until"], "2026-10-14T08:35:00Z")
+            self.assertEqual(calls, ["fixture:execute", "fixture-b:execute", "grok:review"])
+            calls.clear()
+            again = run_task(
+                "Say hello",
+                config=config,
+                state_dir=state,
+                open_adapter=lambda name: Adapter(name),
+                now=lambda: NOW,
+            )
+            self.assertEqual(again["provider"], "fixture-b")
+            self.assertNotIn("fixture:execute", calls)
+            self.assertIn("fixture-b:execute", calls)
+            reset = 1_791_966_900  # 2026-10-14T08:35:00Z
+            store = CooldownStore(state / "cooldowns.json")
+            self.assertIn("fixture", store.active(reset - 1))
+            self.assertNotIn("fixture", store.active(reset + 1))
+            self.assertNotIn("fixture", store.active(NOW + 10**9))
+
+    def test_quota_and_auth_fall_back_without_a_live_provider(self) -> None:
+        calls: list[str] = []
+
+        class Adapter:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def execute(self, request, *, allow_live=False, timeout_seconds=None, runner=None):
+                del request, allow_live, timeout_seconds, runner
+                calls.append(self.name)
+                if self.name == "fixture":
+                    raise ProviderQuotaExhausted("fixture quota is exhausted")
+                if self.name == "fixture-b":
+                    raise ProviderAuthExpired("fixture-b authentication expired", retry_after=30)
+                return ProviderResult(self.name, ("stub",), "done", False)
+
+        config = starter_config({"fixture", "fixture-b", "grok"})
+        config["review"]["accept_unreviewed"] = True
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            with self.assertRaises(HarnessError) as caught:
+                run_task(
+                    "Say hello",
+                    config=config,
+                    state_dir=state,
+                    open_adapter=lambda name: Adapter(name),
+                    now=lambda: NOW,
+                )
+            record = load_run(state, list_runs(state)[0])
+        self.assertIn("no capable provider", str(caught.exception))
+        self.assertEqual(calls, ["fixture", "fixture-b"])
+        self.assertNotIn("grok", calls)
+        self.assertEqual(record["status"], "failed")
+        self.assertFalse(record["accepted"])
+        self.assertEqual(record["cooldowns"]["fixture"]["reason"], "quota-exhausted")
+        self.assertEqual(record["cooldowns"]["fixture"]["until"], format_until(NOW + 60))
+        self.assertEqual(record["cooldowns"]["fixture-b"]["reason"], "auth-expired")
+        self.assertEqual(record["cooldowns"]["fixture-b"]["until"], format_until(NOW + 30))
+
+    def test_offline_failure_with_allow_live_does_not_pick_a_live_provider(self) -> None:
+        calls: list[str] = []
+
+        class Adapter:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def execute(self, request, *, allow_live=False, timeout_seconds=None, runner=None):
+                del timeout_seconds, runner
+                calls.append(f"{self.name}:{request.kind}")
+                if not allow_live:
+                    raise AssertionError("allow_live was not set")
+                if self.name in {"claude", "codex", "grok"}:
+                    raise AssertionError(f"{self.name} was called")
+                if self.name == "fixture":
+                    raise ProviderRateLimited("fixture was rate-limited")
+                return ProviderResult(self.name, ("stub",), "hello from fixture-b", False)
+
+        config = starter_config({"fixture", "fixture-b", "claude", "codex", "grok"})
+        config["review"]["max_rounds"] = 0
+        config["review"]["accept_unreviewed"] = True
+        with tempfile.TemporaryDirectory() as directory:
+            record = run_task(
+                "Say hello",
+                config=config,
+                state_dir=Path(directory),
+                allow_live=True,
+                open_adapter=lambda name: Adapter(name),
+                now=lambda: NOW,
+            )
+        self.assertEqual(calls, ["fixture:execute", "fixture-b:execute"])
+        self.assertEqual(record["provider"], "fixture-b")
+        self.assertEqual(record["status"], "completed")
+        self.assertTrue(record["accepted"])
+
+    def test_pinned_fixture_rate_limit_falls_back_to_fixture_b(self) -> None:
+        calls: list[str] = []
+
+        class Adapter:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def execute(self, request, *, allow_live=False, timeout_seconds=None, runner=None):
+                del timeout_seconds, runner
+                calls.append(f"{self.name}:{request.kind}")
+                if not allow_live:
+                    raise AssertionError("allow_live was not set")
+                if self.name in {"claude", "codex", "grok"}:
+                    raise AssertionError(f"{self.name} was called")
+                if self.name == "fixture":
+                    raise ProviderRateLimited("fixture was rate-limited")
+                return ProviderResult(self.name, ("stub",), "hello from fixture-b", False)
+
+        config = starter_config({"fixture", "fixture-b", "claude", "codex", "grok"})
+        config["review"]["max_rounds"] = 0
+        config["review"]["accept_unreviewed"] = True
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            with redirect_stderr(stderr):
+                record = run_task(
+                    "Say hello",
+                    config=config,
+                    state_dir=Path(directory),
+                    provider="fixture",
+                    allow_live=True,
+                    open_adapter=lambda name: Adapter(name),
+                    now=lambda: NOW,
+                )
+        self.assertEqual(calls, ["fixture:execute", "fixture-b:execute"])
+        self.assertEqual(record["provider"], "fixture-b")
+        self.assertEqual(record["status"], "completed")
+        failed = [item for item in record["attempts"] if item["provider"] == "fixture"]
+        self.assertEqual(len(failed), 1)
+        self.assertFalse(failed[0]["ok"])
+        self.assertEqual(failed[0]["error"], "ProviderRateLimited")
+        self.assertEqual(failed[0]["reason"], "rate-limited")
+        notice = stderr.getvalue()
+        self.assertIn("notice: requested provider fixture was replaced by fixture-b", notice)
+        for name in ("claude", "codex", "grok"):
+            self.assertFalse(any(call.startswith(f"{name}:") for call in calls))
+            self.assertNotIn(name, notice)
+
+    def test_live_failure_falls_back_to_another_live_provider(self) -> None:
+        calls: list[str] = []
+
+        class Adapter:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def execute(self, request, *, allow_live=False, timeout_seconds=None, runner=None):
+                del timeout_seconds, runner
+                calls.append(f"{self.name}:{request.kind}")
+                if self.name in {"fixture", "fixture-b"}:
+                    raise AssertionError(f"{self.name} was called")
+                if self.name == "grok" and request.kind == "execute":
+                    raise ProviderRateLimited("grok was rate-limited")
+                return ProviderResult(self.name, ("stub",), "hello from claude", True)
+
+        config = starter_config({"fixture", "fixture-b", "claude", "grok"})
+        config["routing"]["weights"]["grok"] = 3
+        config["routing"]["weights"]["claude"] = 2
+        config["review"]["max_rounds"] = 0
+        config["review"]["accept_unreviewed"] = True
+        with tempfile.TemporaryDirectory() as directory:
+            record = run_task(
+                "Say hello",
+                config=config,
+                state_dir=Path(directory),
+                allow_live=True,
+                open_adapter=lambda name: Adapter(name),
+                now=lambda: NOW,
+            )
+        self.assertEqual(calls, ["grok:execute", "claude:execute"])
+        self.assertEqual(record["provider"], "claude")
+        self.assertEqual(record["status"], "completed")
+
+    def test_large_diff_is_clipped_before_the_adapter(self) -> None:
+        token = "LARGE-DIFF-TOKEN"
+        huge = token * 4000
+        seen: list[str] = []
+
+        class Capture:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def execute(self, request, *, allow_live=False, timeout_seconds=None, runner=None):
+                del allow_live, timeout_seconds, runner
+                seen.append(request.task)
+                if request.kind == "review":
+                    return ProviderResult(self.name, ("stub",), "VERDICT approve\nok", False)
+                return ProviderResult(self.name, ("stub",), "done", False)
+
+        with tempfile.TemporaryDirectory() as directory:
+            record = run_task(
+                "Say hello",
+                config=starter_config({"fixture", "fixture-b"}),
+                state_dir=Path(directory),
+                diff=huge,
+                dependencies=[{"id": "build", "text": "built", "diff": huge}],
+                open_adapter=lambda name: Capture(name),
+            )
+        self.assertEqual(record["status"], "completed")
+        self.assertGreaterEqual(len(seen), 2)
+        self.assertTrue(any(prompt.startswith("Say hello") for prompt in seen))
+        self.assertTrue(any(prompt.startswith("Review this completed task.") for prompt in seen))
+        for prompt in seen:
+            self.assertNotIn(huge, prompt)
+            self.assertLess(prompt.count(token), huge.count(token))
+            self.assertIn("[truncated]", prompt)
+
+    def test_pre_call_budget_refuses_before_the_adapter(self) -> None:
+        calls: list[str] = []
+
+        class Worker:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def execute(self, request, *, allow_live=False, timeout_seconds=None, runner=None):
+                del request, allow_live, timeout_seconds, runner
+                calls.append(self.name)
+                return ProviderResult(
+                    self.name,
+                    ("stub",),
+                    '{"usage":{"input_tokens":100,"output_tokens":1}}\nhello',
+                    False,
+                )
+
+        low = starter_config({"fixture", "fixture-b"})
+        low["budgets"]["max_input_tokens"] = 100
+        with tempfile.TemporaryDirectory() as directory:
+            stopped = run_task(
+                "Say hello",
+                config=low,
+                state_dir=Path(directory),
+                open_adapter=lambda name: Worker(name),
+            )
+        self.assertEqual(calls, ["fixture"])
+        self.assertEqual(stopped["status"], "budget-exceeded")
+        self.assertEqual(stopped["reviews"], [])
+        self.assertEqual(stopped["usage"]["input_tokens"], 100)
+        self.assertEqual(stopped["attempts"][-1]["reason"], "budget")
+        self.assertEqual(stopped["attempts"][-1]["provider"], "fixture-b")
+
+    def test_stubbed_rate_limit_is_classified_without_a_live_process(self) -> None:
+        def limited(argv, stdin_text, timeout, cwd):
+            del stdin_text, timeout
+            return _completed(argv, 429, stderr="SECRET too many requests retry-after: 15")
+
+        def exhausted(argv, stdin_text, timeout, cwd):
+            del stdin_text, timeout
+            return _completed(argv, 402, stderr="SECRET quota exceeded")
+
+        def expired(argv, stdin_text, timeout, cwd):
+            del stdin_text, timeout, cwd
+            stdout = '{"type":"result","is_error":true,"result":"Not logged in SECRET"}'
+            return _completed(argv, 1, stdout=stdout, stderr="SECRET")
+
+        with tempfile.TemporaryDirectory() as directory:
+            request = ProviderRequest(
+                task="Say hello",
+                packet_id="run-aabbccddeeff",
+                cwd=directory,
+            )
+            with self.assertRaises(ProviderRateLimited) as limited_error:
+                CodexExecProvider().execute(request, allow_live=True, runner=limited)
+            self.assertEqual(limited_error.exception.reason, "rate-limited")
+            self.assertEqual(limited_error.exception.retry_after, 15)
+            self.assertNotIn("SECRET", str(limited_error.exception))
+            with self.assertRaises(ProviderQuotaExhausted) as quota_error:
+                CodexExecProvider().execute(request, allow_live=True, runner=exhausted)
+            self.assertEqual(quota_error.exception.reason, "quota-exhausted")
+            self.assertNotIn("SECRET", str(quota_error.exception))
+            with self.assertRaises(ProviderAuthExpired) as auth_error:
+                ClaudeHeadlessProvider().execute(request, allow_live=True, runner=expired)
+            self.assertEqual(auth_error.exception.reason, "auth-expired")
+            self.assertNotIn("SECRET", str(auth_error.exception))
+            self.assertNotIn("logged in", str(auth_error.exception))
+
+        bare_auth = classify_failure("codex", 401, "")
+        self.assertIsInstance(bare_auth, HarnessError)
+        self.assertNotIsInstance(bare_auth, ProviderAuthExpired)
+        self.assertIn("exited 401", str(bare_auth))
+        bare_quota = classify_failure("codex", 402, "")
+        self.assertNotIsInstance(bare_quota, ProviderQuotaExhausted)
+        self.assertIn("exited 402", str(bare_quota))
+        self.assertIsInstance(
+            classify_failure("codex", 1, "unexpected status 401 Unauthorized"),
+            ProviderAuthExpired,
+        )
+        self.assertIsInstance(
+            classify_failure("codex", 1, "HTTP 402 quota exceeded"),
+            ProviderQuotaExhausted,
+        )

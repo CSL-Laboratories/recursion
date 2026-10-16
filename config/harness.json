@@ -22,7 +22,18 @@
       "gemini",
       "cursor",
       "opencode"
-    ]
+    ],
+    "cooldown_seconds": 60,
+    "weights": {
+      "fixture": 1,
+      "fixture-b": 1,
+      "claude": 1,
+      "codex": 1,
+      "grok": 1,
+      "gemini": 1,
+      "cursor": 1,
+      "opencode": 1
+    }
   },
   "providers": [
     {

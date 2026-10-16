@@ -13,6 +13,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from scripts.v3.harness.availability import classify_failure
 from scripts.v3.harness.errors import HarnessError, LiveProviderDisabled, ProviderTimeout
 
 
@@ -148,8 +149,14 @@ class HeadlessCLI(ProviderAdapter):
             prepared.cleanup()
         if not isinstance(completed, subprocess.CompletedProcess):
             raise HarnessError(f"{self.name} runner returned no result")
-        if completed.returncode != 0:
-            raise HarnessError(f"{self.name} exited {completed.returncode}")
+        failure = classify_failure(
+            self.name,
+            completed.returncode,
+            completed.stderr or "",
+            completed.stdout or "",
+        )
+        if failure is not None:
+            raise failure
         return ProviderResult(
             provider=self.name,
             argv=prepared.argv,

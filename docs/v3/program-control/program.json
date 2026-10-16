@@ -9,8 +9,10 @@
     {
       "kind": "parallel_deep_research",
       "run_id": "trun_db705696fec649d8b15f52853c399530",
-      "status": "completed",
-      "url": "https://platform.parallel.ai/view/task-run/trun_db705696fec649d8b15f52853c399530"
+      "status": "unverified",
+      "url": "https://platform.parallel.ai/view/task-run/trun_db705696fec649d8b15f52853c399530",
+      "id": "research.program-control-source",
+      "limitations": "Historical run link retained as provenance only; no capability-linked result or content digest is retained in this ledger."
     }
   ],
   "research_control": {
@@ -76,7 +78,7 @@
       "revision": 1,
       "status": "candidate",
       "path": "docs/v3/program-control/MONTH-PROGRAM.md",
-      "sha256": "afcea0e6b9b70c2f50a1bb9b23b52f6226298fdff930be92eff8ea7387a479e5",
+      "sha256": "3df18d42bb918d312a9d611f6025e749b330442b6a4335b0b04c882f82e4fbfd",
       "decision_issue": "CSL-204"
     }
   ],
@@ -159,7 +161,7 @@
   "capabilities": [
     {
       "id": "capability.program-control",
-      "current_maturity": "researched",
+      "current_maturity": "unresearched",
       "month_target": "provider_free_verified",
       "contract_ids": [
         "contract.issue-anti-drift",
@@ -184,7 +186,10 @@
         "release_qualified": null
       },
       "release_requirements": null,
-      "no_rollback_receipt": null
+      "no_rollback_receipt": null,
+      "research_ids": [],
+      "research_question": null,
+      "acceptance_commands": null
     }
   ],
   "evidence": [

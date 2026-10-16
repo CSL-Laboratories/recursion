@@ -204,6 +204,22 @@ Linear comment or independently establish that an external artifact passed. Revi
 must inspect the pinned human comment and rerun the candidate. A passing ledger is
 never a substitute for those actions.
 
+All top-level record collections, including `research` and `risks`, must be arrays
+of objects. `research_control` and `admission` must be objects. Malformed containers
+and maturity selectors fail validation before lookup or traversal.
+
+- Every capability explicitly declares `research_ids`. At `researched` and every
+  higher tier it must link a current, successful structured research record for its
+  exact capability ID and declared nonempty `research_question`. The record retains
+  `source_class`, `source_commit`, `artifact`, `artifact_sha256`, `limitations`,
+  current `contract_bindings`, and `continuation: false`. A run URL alone or a
+  completed label is not sufficient. Research records have unique IDs and status
+  `unverified`, `current`, or `superseded`; unverified provenance is retained but
+  cannot support maturity. Capability approval packets pin `research_bindings`
+  (`id`, `record_digest` of the complete research record), so changing the retained
+  basis requires renewed review. These are declarations for corroboration, not
+  proof that an external research service or source was inspected by the checker.
+
 - `proposals` retains named approval packets. Each packet has `id`, `linear_issue`, `scope`,
   `contract_bindings` (`id`, `revision`, `sha256`) and `authorizations` (`action`,
   `target`, `target_digest`). The supported actions are `accept_contract`,
@@ -219,7 +235,8 @@ never a substitute for those actions.
   (the linked unknown definitions excluding status/resolution evidence) and
   `checkpoint_bindings` (`id`, `definition_digest`, hashing all checkpoint fields
   except status/evidence links).
-  Freshness applies to packets referenced by approved decisions. Superseded/pending
+  Packets explicitly include `research_bindings`, empty when no capability research
+  is authorized by the packet. Freshness applies to packets referenced by approved decisions. Superseded/pending
   decisions and historical packets remain stored without granting authority.
 - `target_digest` pins the target's current fields, excluding only lifecycle fields:
   contract status/receipt; work status/stage/receipts/candidate/verification links;
@@ -238,7 +255,7 @@ never a substitute for those actions.
   Candidate routing fields and proposal `linear_issue` are required; pending or
   historical receipts may omit an undecided `linear_issue`, but present values must
   be valid. Approved receipts always require the matching issue.
-- Capability `contract_ids`, `unknown_ids` and `evidence_ids` are required arrays
+- Capability `contract_ids`, `unknown_ids`, `evidence_ids` and `research_ids` are required arrays
   of nonempty string IDs. The same array shape applies to recorded consumed-contract,
   verification/recovery/rollback evidence, and checkpoint contract/evidence references.
   Objects keyed by IDs, strings and null are not arrays; their implicit iteration
@@ -307,6 +324,11 @@ never a substitute for those actions.
   At `provider_free_verified` and above, `independent` must be boolean true.
   These records attest the claimed tier's cumulative checks; they do not authorize
   live runs. Historical/candidate evidence may stay linked but cannot promote.
+  Every such proof also records a nonempty `acceptance_command` matching the claimed
+  tier in the capability's `acceptance_commands` map. That map is bound by capability
+  approval; changing both the command and evidence cannot inherit an old receipt.
+  The seed leaves this map null pending selection of actual per-tier gates. Work,
+  checkpoint and recovery/rollback proofs likewise match their declared commands.
 - Qualified claims also require capability-approval-bound `qualification_requirements`
   keyed by tier. Each profile contains `evidence_class` and a structured `environment`
   with nonempty `id`, `execution_class`, and full `configuration_sha256`.
@@ -336,10 +358,21 @@ never a substitute for those actions.
   explicit owner policy and is not inferred here. No exception is present in the seed.
 - Research requirements always include `question`, `source_class`, `quota_class`,
   `stop_condition`, and `evidence_artifact`. Any recorded `research_plan` must
-  supply them, and active/completed research work cannot omit its plan. Issue authors
+  supply them as nonempty strings plus an explicit boolean `continuation`, and
+  active/completed research work cannot omit its plan. Issue authors
   must use the budget and discretion prompts in the
   issue template. The checker does not read or authorize external research jobs.
+- This candidate schema has no accepted research-continuation authorization action
+  or mapping from its separate research receipt to an executable grant. Therefore
+  `continuation: true`, a continuation packet/receipt, or any continuation-packet
+  field on a work item or its plan blocks validation even with a generic work
+  receipt. `continuation: false` declares only an initial pass; it does not itself
+  approve research. A human must define/accept the exact pass, scope, quota, matching
+  Linear comment and next-stop receipt mapping before continuation can be represented
+  as authorized. The checker cannot infer undeclared continuation from free prose.
 
-The seed stays candidate/researched, with open unknowns, pending checkpoint/qualification/release requirements, pending acceptance and
+The seed stays candidate/unresearched: its historical research-run URL is retained
+as unverified provenance because no linked result or content digest is retained here.
+It has open unknowns, pending research/command/checkpoint/qualification/release requirements, pending acceptance and
 empty admission occupancy. No accepted receipt or successful verification is
 invented to make the example pass.

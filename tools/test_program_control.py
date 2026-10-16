@@ -41,6 +41,7 @@ class ProgramControlTests(unittest.TestCase):
         contract_ids = set()
         unknown_ids = set()
         checkpoint_ids = set()
+        research_ids = set()
         authorizations = []
         for action, target_id in grants:
             target = targets[action][target_id]
@@ -52,6 +53,7 @@ class ProgramControlTests(unittest.TestCase):
                 contract_ids.update(target.get("contract_ids", target.get("consumes_contracts", [])))
             if action == "decide_capability":
                 unknown_ids.update(target.get("unknown_ids", []))
+                research_ids.update(target["research_ids"])
                 checkpoint_ids.update(req["checkpoint_id"] for req in target.get("checkpoint_requirements", []))
         for checkpoint in self.data["integration_checkpoints"]:
             if checkpoint["id"] in checkpoint_ids:
@@ -65,6 +67,8 @@ class ProgramControlTests(unittest.TestCase):
                                          if u["id"] in unknown_ids],
                     "checkpoint_bindings": [checker.checkpoint_binding(c) for c in self.data["integration_checkpoints"]
                                             if c["id"] in checkpoint_ids],
+                    "research_bindings": [{"id": r["id"], "record_digest": checker.digest(r)}
+                                          for r in self.data["research"] if r["id"] in research_ids],
                     "authorizations": authorizations}
         self.data["proposals"].append(proposal)
         receipt = {"id": f"decision.fixture-{len(self.data['decisions'])}",
@@ -78,8 +82,22 @@ class ProgramControlTests(unittest.TestCase):
         self.data["decisions"].append(receipt)
         return receipt["id"]
 
+    def research_fixture(self):
+        capability = self.data["capabilities"][0]
+        row = {"id": "research.synthetic", "capability_id": capability["id"],
+               "question": "Synthetic fixture research question", "source_class": "fixture_only",
+               "status": "current", "result": "pass", "continuation": False,
+               "artifact": "Synthetic retained result", "artifact_sha256": "d" * 64,
+               "source_commit": "a" * 40, "limitations": "Synthetic only, never persisted",
+               "contract_bindings": [checker.contract_binding(c) for c in self.data["contracts"]]}
+        self.data["research"].append(row)
+        capability.update(research_ids=[row["id"]], research_question=row["question"], current_maturity="researched")
+        return capability, row
+
     def promote(self, tier="provider_free_verified"):
         capability = self.data["capabilities"][0]
+        self.research_fixture()
+        capability["acceptance_commands"] = {t: f"fixture verify {t}" for t in checker.MATURITY_ORDER[4:]}
         # Fixture-only policy; the checked-in seed deliberately leaves this unset.
         capability["checkpoint_requirements"][0]["required_from_tier"] = "release_qualified"
         # These declared runtime profiles and receipts are synthetic test data,
@@ -107,6 +125,7 @@ class ProgramControlTests(unittest.TestCase):
         row = self.data["evidence"][0]
         row.update(capability_id=capability["id"], candidate_commit="a" * 40, result="pass",
                    status="current", tier=tier, kind=kinds.get(tier, "candidate"), independent=True,
+                   acceptance_command=capability["acceptance_commands"].get(tier),
                    artifact_sha256="b" * 64,
                    contract_bindings=[checker.contract_binding(c) for c in self.data["contracts"]])
         if tier in capability["qualification_requirements"]:
@@ -341,7 +360,8 @@ class ProgramControlTests(unittest.TestCase):
                     self.setUp()
                     _, row = self.promote()
                     row[key] = value
-                    self.assert_rejected("without independent verification")
+                    self.assert_rejected("status must be a string" if key == "status" and value is None
+                                         else "without independent verification")
 
     def test_candidate_change_needs_fresh_evidence(self):
         cap, _ = self.promote()
@@ -468,7 +488,7 @@ class ProgramControlTests(unittest.TestCase):
 
     def test_recorded_research_plan_cannot_omit_source_class(self):
         item = self.data["work_items"][0]
-        item["research_plan"] = {field: "Fixture" for field in checker.PLAN_FIELDS}
+        item["research_plan"] = {**{field: "Fixture" for field in checker.PLAN_FIELDS}, "continuation": False}
         self.assertEqual(self.errors(), [])
         del item["research_plan"]["source_class"]
         self.assert_rejected("research plan is missing mandatory fields")
@@ -479,8 +499,8 @@ class ProgramControlTests(unittest.TestCase):
         prerequisite.update(id="CSL-998", stage="research", status="todo")
         research = copy.deepcopy(item)
         research.update(id="CSL-999", stage="research", status="done", hard_dependencies=["CSL-998"])
-        research["research_plan"] = {field: "Fixture" for field in checker.PLAN_FIELDS}
-        prerequisite["research_plan"] = {field: "Fixture" for field in checker.PLAN_FIELDS}
+        research["research_plan"] = {**{field: "Fixture" for field in checker.PLAN_FIELDS}, "continuation": False}
+        prerequisite["research_plan"] = {**{field: "Fixture" for field in checker.PLAN_FIELDS}, "continuation": False}
         self.verify_work(research)
         self.data["work_items"].extend([research, prerequisite])
         item["hard_dependencies"] = ["CSL-999"]
@@ -522,6 +542,7 @@ class ProgramControlTests(unittest.TestCase):
             contract["revision"] += 1
             contract["decision_receipt"] = self.approve([("accept_contract", contract["id"])])
         capability = self.data["capabilities"][0]
+        self.data["research"][-1]["contract_bindings"] = [checker.contract_binding(c) for c in self.data["contracts"]]
         capability["decision_receipt"] = self.approve([("decide_capability", capability["id"])])
         self.assertEqual(self.data["proposals"][:len(old_packets)], old_packets)
         self.assertEqual(self.errors(), [])
@@ -563,7 +584,8 @@ class ProgramControlTests(unittest.TestCase):
                 self.setUp()
                 cap, _ = self.promote("release_qualified")
                 cap["checkpoint_requirements"] = requirements
-                self.assert_rejected("stale authorization target")
+                self.assert_rejected("checkpoint_requirements must be a list" if requirements is None
+                                     else "stale authorization target")
 
     def test_open_checkpoint_blocks_at_configured_tier_but_not_below(self):
         self.promote("locally_qualified")
@@ -625,7 +647,7 @@ class ProgramControlTests(unittest.TestCase):
     def completed_prerequisite(self, status="verified"):
         prerequisite = copy.deepcopy(self.data["work_items"][0])
         prerequisite.update(id="CSL-999", status=status, stage="research",
-                            research_plan={field: "Fixture" for field in checker.PLAN_FIELDS})
+                            research_plan={**{field: "Fixture" for field in checker.PLAN_FIELDS}, "continuation": False})
         self.data["work_items"].append(prerequisite)
         self.data["work_items"][0]["hard_dependencies"] = [prerequisite["id"]]
         return prerequisite
@@ -956,13 +978,154 @@ class ProgramControlTests(unittest.TestCase):
                 target[path[-1]] = ["CSL-999"]
                 self.assert_rejected(fragment)
 
+    def test_seed_does_not_claim_unretained_research(self):
+        self.assertEqual(self.data["capabilities"][0]["current_maturity"], "unresearched")
+        self.assertEqual(self.data["capabilities"][0]["research_ids"], [])
+        self.assertEqual(self.data["research"][0]["status"], "unverified")
+        self.assertEqual(self.errors(), [])
+
+    def test_every_top_level_collection_rejects_wrong_shapes(self):
+        arrays = ("research", "contracts", "decisions", "work_items", "capabilities", "evidence",
+                  "unknowns", "risks", "integration_checkpoints", "proposals", "maturity_order")
+        for field in arrays:
+            for value in (None, "arbitrary", {}, 1, False, [None], ["row"], [[]]):
+                with self.subTest(field=field, value=value):
+                    self.setUp()
+                    self.data[field] = value
+                    self.assertTrue(self.errors())
+        for field in ("research_control", "admission"):
+            for value in (None, "arbitrary", [], 1):
+                with self.subTest(field=field, value=value):
+                    self.setUp()
+                    self.data[field] = value
+                    self.assertTrue(self.errors())
+        for value in (None, [], "program", 1, {}):
+            self.assertTrue(checker.validate_program(value))
+
+    def test_researched_and_all_higher_tiers_require_linked_research(self):
+        for tier in checker.MATURITY_ORDER[1:]:
+            for mutation in ("empty", "unlinked", "unknown"):
+                with self.subTest(tier=tier, mutation=mutation):
+                    self.setUp()
+                    cap, _ = self.promote(tier)
+                    if mutation == "empty":
+                        self.data["research"] = []
+                    else:
+                        cap["research_ids"] = [] if mutation == "unlinked" else ["research.missing"]
+                    self.assert_rejected("researched maturity requires")
+
+    def test_research_support_must_be_current_bound_and_retained(self):
+        variants = {"status": "superseded", "result": "fail", "capability_id": "capability.other",
+                    "question": "other", "source_class": "", "artifact": "", "artifact_sha256": "bad",
+                    "source_commit": "branch", "contract_bindings": [], "limitations": "",
+                    "continuation": True, "continuation_packet": {"proposal": "not authority"}}
+        for field, value in variants.items():
+            with self.subTest(field=field):
+                self.setUp()
+                _, row = self.research_fixture()
+                row[field] = value
+                self.assert_rejected("researched maturity requires")
+        for field in ("research_question", "research_ids"):
+            self.setUp()
+            cap, _ = self.research_fixture()
+            del cap[field]
+            self.assertTrue(self.errors())
+
+    def test_research_proof_changes_invalidate_capability_approval(self):
+        self.promote("contract_frozen")
+        self.data["research"][-1]["artifact_sha256"] = "f" * 64
+        self.assert_rejected("stale or incomplete research bindings")
+
+    def test_structured_initial_research_supports_researched_maturity(self):
+        self.research_fixture()
+        self.assertEqual(self.errors(), [])
+
+    def test_continuation_and_packet_cannot_infer_research_authority(self):
+        for location in ("work", "plan"):
+            for field, value in (("continuation", True), ("continuation", "false"),
+                                 ("continuation_receipt", "decision.fixture"), ("continuation_packet", {}),
+                                 *((field, "Fixture") for field in checker.CONTINUATION_FIELDS)):
+                with self.subTest(location=location, field=field):
+                    self.setUp()
+                    item = self.data["work_items"][0]
+                    item.update(stage="research", research_plan={**{f: "Fixture" for f in checker.PLAN_FIELDS},
+                                                                 "continuation": False})
+                    target = item if location == "work" else item["research_plan"]
+                    target[field] = value
+                    item["decision_receipt"] = self.approve([("develop_work", item["id"])])
+                    self.assert_rejected("research continuation blocked")
+
+    def test_research_plan_requires_explicit_initial_pass_and_typed_fields(self):
+        item = self.data["work_items"][0]
+        item["research_plan"] = {f: "Fixture" for f in checker.PLAN_FIELDS}
+        self.assert_rejected("explicit boolean continuation")
+        item["research_plan"]["continuation"] = False
+        self.assertEqual(self.errors(), [])
+        for field in checker.PLAN_FIELDS:
+            for value in (None, [], {}, 1, " "):
+                with self.subTest(field=field, value=value):
+                    plan = copy.deepcopy(item["research_plan"])
+                    item["research_plan"][field] = value
+                    self.assert_rejected("research plan is missing mandatory fields")
+                    item["research_plan"] = plan
+
+    def test_each_promoted_tier_needs_exact_nonempty_acceptance_command(self):
+        for tier in checker.MATURITY_ORDER[4:]:
+            for value in (None, "", " ", "different command", [], {}):
+                with self.subTest(tier=tier, value=value):
+                    self.setUp()
+                    _, row = self.promote(tier)
+                    row["acceptance_command"] = value
+                    self.assert_rejected("without")
+            self.setUp()
+            _, row = self.promote(tier)
+            del row["acceptance_command"]
+            self.assert_rejected("without")
+
+    def test_command_gate_is_approved_and_cannot_change_with_the_proof(self):
+        cap, row = self.promote()
+        cap["acceptance_commands"][cap["current_maturity"]] = "new command"
+        row["acceptance_command"] = "new command"
+        self.assert_rejected("stale authorization target")
+        for commands in (None, {}, {"provider_free_verified": " "}):
+            self.setUp()
+            cap, _ = self.promote()
+            cap["acceptance_commands"] = commands
+            cap["decision_receipt"] = self.approve([("decide_capability", cap["id"])])
+            self.assert_rejected("without independent verification")
+
+    def test_maturity_predicates_reject_malformed_objects_without_crashing(self):
+        paths = [("capabilities", 0, "current_maturity"), ("capabilities", 0, "month_target"),
+                 ("capabilities", 0, "decision_receipt"), ("unknowns", 0, "blocks"),
+                 ("integration_checkpoints", 0, "status"), ("risks", 0, "severity")]
+        for path in paths:
+            for value in ([], {}, 1):
+                with self.subTest(path=path, value=value):
+                    self.setUp()
+                    target = self.data
+                    for key in path[:-1]:
+                        target = target[key]
+                    target[path[-1]] = value
+                    self.assertTrue(self.errors())
+
+    def test_admission_selector_rejects_malformed_or_absent_modes(self):
+        for value in (None, [], {}, 0, False, "", "unknown"):
+            with self.subTest(value=value):
+                self.setUp()
+                self.data["admission"]["mode"] = value
+                self.assertTrue(self.errors())
+        self.setUp()
+        del self.data["admission"]["mode"]
+        self.assert_rejected("admission mode must be")
+
     def test_program_status_is_candidate_only_even_with_other_approvals(self):
         for status in ("accepted", "approved", "ratified", "arbitrary", "", None, False, [], {}):
             with self.subTest(status=status):
                 self.setUp()
                 self.promote()
                 self.data["status"] = status
-                self.assert_rejected("program status must be candidate")
+                self.assert_rejected("program status must be candidate" if isinstance(status, str)
+                                     else "program.status must be a string")
 
     def test_work_reference_declarations_cannot_be_omitted_at_any_stage(self):
         for stage in checker.STAGES:

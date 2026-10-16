@@ -26,6 +26,8 @@ MATURITY_ORDER = [
     "implemented", "provider_free_verified", "locally_qualified", "release_qualified",
 ]
 PLAN_FIELDS = {"question", "source_class", "quota_class", "stop_condition", "evidence_artifact"}
+CONTINUATION_FIELDS = {"evidence_obtained", "remaining_uncertainty", "expected_quota_class",
+                       "options", "recommendation", "next_stop_condition"}
 DONE = {"done", "accepted", "verified"}
 STAGES = {"intake": 0, "research": 1, "decision": 2, "development": 3,
           "verification": 4, "integration": 5, "release": 6}
@@ -35,6 +37,15 @@ def digest(value: Any) -> str:
     """Digest the complete JSON proposal, including identity, scope and bindings."""
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
                                      ensure_ascii=True, allow_nan=False).encode("utf-8")).hexdigest()
+
+
+def text_present(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def continuation_declared(value: dict[str, Any]) -> bool:
+    return ("continuation" in value and value["continuation"] is not False
+            or any(field in value for field in CONTINUATION_FIELDS | {"continuation_packet", "continuation_receipt"}))
 
 
 def contract_binding(contract: dict[str, Any]) -> dict[str, Any]:
@@ -121,10 +132,10 @@ def reference_errors(data: dict[str, Any]) -> list[str]:
     scalar_fields = {"parent_issue", "implementation_issue", "decision_issue",
                      "linear_issue", "resolution_issue", "issue", "work_item_id"}
     list_fields = {"hard_dependencies", "work_item_ids", "active_contract_consumers", "active_reviews"}
-    resource_lists = {"contract_ids", "unknown_ids", "evidence_ids", "consumes_contracts",
+    resource_lists = {"contract_ids", "unknown_ids", "evidence_ids", "research_ids", "consumes_contracts",
                       "verification_evidence_ids", "recovery_evidence_ids", "rollback_evidence_ids", "requires"}
     required_lists = {
-        "capabilities": ("contract_ids", "unknown_ids", "evidence_ids"),
+        "capabilities": ("contract_ids", "unknown_ids", "evidence_ids", "research_ids"),
         "work_items": ("hard_dependencies", "consumes_contracts"),
         "integration_checkpoints": ("requires",),
     }
@@ -134,6 +145,34 @@ def reference_errors(data: dict[str, Any]) -> list[str]:
             for index, row in enumerate(value):
                 walk(row, f"{path}[{index}]")
         elif isinstance(value, dict):
+            for field in ("status", "kind", "stage", "mode", "discretion_class", "current_maturity", "month_target", "blocks", "severity"):
+                if field in value and not isinstance(value[field], str):
+                    errors.append(f"{path}.{field} must be a string")
+            for field in ("decision_receipt", "proposal_id", "no_rollback_receipt", "capability_id", "checkpoint_id"):
+                if field in value and value[field] is not None and not text_present(value[field]):
+                    errors.append(f"{path}.{field} must be a nonempty reference ID or null")
+            for field in ("qualification_requirements", "release_requirements", "acceptance_commands"):
+                if field in value and value[field] is not None and not isinstance(value[field], dict):
+                    errors.append(f"{path}.{field} must be an object or null")
+            for field in ("research_plan", "contract_receipts"):
+                if field in value and not isinstance(value[field], dict):
+                    errors.append(f"{path}.{field} must be an object")
+            if "checkpoint_requirements" in value:
+                requirements = value["checkpoint_requirements"]
+                if (not isinstance(requirements, list) or not all(isinstance(r, dict) for r in requirements)):
+                    errors.append(f"{path}.checkpoint_requirements must be a list of objects")
+                else:
+                    for requirement in requirements:
+                        if not text_present(requirement.get("checkpoint_id")):
+                            errors.append(f"{path} checkpoint requires an ID")
+                        threshold = requirement.get("required_from_tier")
+                        if threshold is not None and not isinstance(threshold, str):
+                            errors.append(f"{path} checkpoint threshold must be a string or null")
+            if "authorizations" in value:
+                grants = value["authorizations"]
+                if (not isinstance(grants, list) or not all(isinstance(g, dict)
+                        and text_present(g.get("action")) and text_present(g.get("target")) for g in grants)):
+                    errors.append(f"{path}.authorizations must be a list of named grants")
             if value.get("action") == "develop_work":
                 issue(value.get("target"), f"{path}.target")
             if value.get("kind") == "work_verification" and "work_item_id" not in value:
@@ -165,7 +204,7 @@ def reference_errors(data: dict[str, Any]) -> list[str]:
     for collection, fields in (("contracts", ("decision_issue",)), ("capabilities", ("decision_issue",)),
                                ("unknowns", ("resolution_issue",)), ("integration_checkpoints", ("issue",)),
                                ("proposals", ("linear_issue",)), ("work_items", ("parent",)),
-                               ("decisions", ()), ("evidence", ())):
+                               ("decisions", ()), ("evidence", ()), ("research", ()), ("risks", ())):
         rows = data.get(collection)
         if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
             errors.append(f"{collection} must be a list of objects")
@@ -184,6 +223,14 @@ def reference_errors(data: dict[str, Any]) -> list[str]:
         errors.append("admission must be an object")
     elif "decision_issue" not in admission:
         issue(None, "admission.decision_issue")
+    control = data.get("research_control")
+    if not isinstance(control, dict):
+        errors.append("research_control must be an object")
+    else:
+        for field in ("required_plan_fields", "continuation_triggers", "continuation_packet_fields", "required_receipt_fields"):
+            values = control.get(field)
+            if not isinstance(values, list) or not values or not all(text_present(v) for v in values):
+                errors.append(f"research control requires non-empty {field} as strings")
     # Pending/historical receipts may omit linear_issue; present values must be
     # valid. Approved receipts additionally require it in receipt_fields below.
     walk(data, "program")
@@ -192,6 +239,8 @@ def reference_errors(data: dict[str, Any]) -> list[str]:
 
 def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
     errors: list[str] = []
+    if not isinstance(data, dict):
+        return ["program must be an object"]
     required = {
         "schema_version", "program_id", "status", "parent_issue", "implementation_issue",
         "source_commit", "research", "research_control", "maturity_order", "contracts", "decisions", "admission",
@@ -204,8 +253,10 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
     errors.extend(reference_errors(data))
     if errors:
         return errors
-    if data["schema_version"] != 1:
+    if type(data["schema_version"]) is not int or data["schema_version"] != 1:
         errors.append("schema_version must be 1")
+    if not text_present(data["program_id"]):
+        return errors + ["program_id must be a nonempty string"]
     if data["status"] != "candidate":
         errors.append("program status must be candidate; program ratification is not supported by this schema")
     if not re.fullmatch(r"[0-9a-f]{40}", str(data["source_commit"])):
@@ -239,7 +290,13 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
     capabilities = _ids(data["capabilities"], "capability", errors)
     proposals = _ids(data["proposals"], "proposal", errors)
     checkpoints = _ids(data["integration_checkpoints"], "checkpoint", errors)
+    research = _ids(data["research"], "research", errors)
     _ids(data["risks"], "risk", errors)
+    if errors:
+        return errors
+    for rid, row in research.items():
+        if row.get("status") not in {"unverified", "current", "superseded"}:
+            errors.append(f"{rid} research status must be unverified, current or superseded")
     implementation = work.get(data["implementation_issue"]) if isinstance(data["implementation_issue"], str) else None
     if implementation is None:
         errors.append("implementation_issue must reference a work item")
@@ -272,7 +329,8 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
         return (bool(re.fullmatch(r"[0-9a-f]{40}", str(candidate)))
                 and row.get("candidate_commit") == candidate and row.get("result") == "pass"
                 and row.get("status") == "current" and row.get("independent") is True
-                and bool(row.get("artifact")) and bool(row.get("environment"))
+                and text_present(row.get("acceptance_command"))
+                and text_present(row.get("artifact")) and bool(row.get("environment"))
                 and bool(HEX64.fullmatch(str(row.get("artifact_sha256", "")))))
 
     def qualification_matches(row: dict[str, Any], capability: dict[str, Any], tier: str) -> bool:
@@ -304,19 +362,21 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
         if proposal_id not in active_proposals:
             continue
         before = len(errors)
-        for field in ("contract_bindings", "unknown_bindings", "checkpoint_bindings"):
+        for field in ("contract_bindings", "unknown_bindings", "checkpoint_bindings", "research_bindings"):
             if not isinstance(proposal.get(field), list):
                 errors.append(f"{proposal_id} requires explicit {field} as a list")
         grants = proposal.get("authorizations")
         scope = proposal.get("scope")
         if not isinstance(scope, list) or not scope or not all(isinstance(s, str) for s in scope):
             errors.append(f"{proposal_id} requires explicit scope")
+            continue
         if not isinstance(grants, list) or not grants:
             errors.append(f"{proposal_id} requires explicit authorizations")
             continue
         needed_contracts = set()
         needed_unknowns = set()
         needed_checkpoints = set()
+        needed_research = set()
         for grant in grants:
             action, target_id = grant.get("action"), grant.get("target")
             target = targets.get(action, {}).get(target_id)
@@ -336,6 +396,7 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
                 needed_contracts.update(target.get("contract_ids", target.get("consumes_contracts", [])))
             if action == "decide_capability":
                 needed_unknowns.update(target.get("unknown_ids", []))
+                needed_research.update(target["research_ids"])
                 requirements = target.get("checkpoint_requirements")
                 if isinstance(requirements, list):
                     needed_checkpoints.update(req.get("checkpoint_id") for req in requirements
@@ -353,6 +414,10 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
                 proposal.get("checkpoint_bindings", []),
                 [checkpoint_binding(checkpoints[cid]) for cid in needed_checkpoints if cid in checkpoints])):
             errors.append(f"{proposal_id} stale or incomplete checkpoint bindings")
+        if (not needed_research.issubset(research) or not exact_bindings(
+                proposal.get("research_bindings"),
+                [{"id": rid, "record_digest": digest(research[rid])} for rid in sorted(needed_research) if rid in research])):
+            errors.append(f"{proposal_id} stale or incomplete research bindings")
         if len(errors) == before:
             valid_proposals.add(proposal_id)
 
@@ -538,9 +603,17 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
                 errors.append(f"{item_id} lacks an applicable approved human decision receipt")
         if "research_plan" in item or (stage == "research" and item.get("status") in {"in_progress", *DONE}):
             plan = item.get("research_plan")
-            if not isinstance(plan, dict) or any(not plan.get(field) for field in PLAN_FIELDS):
+            if not isinstance(plan, dict) or any(not text_present(plan.get(field)) for field in PLAN_FIELDS):
                 errors.append(f"{item_id} research plan is missing mandatory fields")
-        if not item.get("acceptance_command"):
+            if isinstance(plan, dict) and type(plan.get("continuation")) is not bool:
+                errors.append(f"{item_id} research plan requires explicit boolean continuation")
+        # No accepted research-continuation grant exists in this candidate schema.
+        # Refuse every recorded continuation/packet rather than reinterpret a
+        # generic work receipt as quota or direction-changing authority.
+        for declaration in (item, item.get("research_plan", {})):
+            if continuation_declared(declaration):
+                errors.append(f"{item_id} research continuation blocked pending owner-defined receipt mapping")
+        if not text_present(item.get("acceptance_command")):
             errors.append(f"{item_id} missing acceptance command")
         for field in ("recovery", "rollback", "stop_conditions"):
             if not item.get(field):
@@ -571,6 +644,21 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
             errors.append(f"{capability_id} has unknown maturity tier")
             continue
         # month_target is an aspiration; evidence and authority govern actual maturity.
+        for rid in capability["research_ids"]:
+            if rid not in research:
+                errors.append(f"{capability_id} references unknown research {rid}")
+        if rank[current] >= rank["researched"]:
+            question = capability.get("research_question")
+            if not text_present(question) or not any(
+                    row.get("capability_id") == capability_id and row.get("question") == question
+                    and row.get("status") == "current" and row.get("result") == "pass"
+                    and row.get("continuation") is False and not continuation_declared(row)
+                    and all(text_present(row.get(field)) for field in ("source_class", "artifact", "limitations"))
+                    and bool(HEX64.fullmatch(str(row.get("artifact_sha256", ""))))
+                    and bool(re.fullmatch(r"[0-9a-f]{40}", str(row.get("source_commit", ""))))
+                    and bindings_match(row.get("contract_bindings"), capability["contract_ids"])
+                    for rid in capability["research_ids"] if rid in research for row in [research[rid]]):
+                errors.append(f"{capability_id} researched maturity requires current linked structured research")
         if rank[current] >= rank["human_decided"] and not authorized(
                 capability.get("decision_receipt"), "decide_capability", capability_id):
             errors.append(f"{capability_id} lacks applicable human decision authority")
@@ -635,13 +723,16 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
                      "release_qualified": "release_qualification"}
             candidate = capability.get("candidate_commit")
             valid_candidate = bool(re.fullmatch(r"[0-9a-f]{40}", str(candidate)))
+            commands = capability.get("acceptance_commands")
+            command = commands.get(current) if isinstance(commands, dict) else None
             def supports(row: dict[str, Any]) -> bool:
                 return (valid_candidate and row.get("candidate_commit") == candidate
                         and row.get("capability_id") == capability_id
                         and row.get("result") == "pass" and row.get("status") == "current"
                         and row.get("tier") == current and row.get("kind") == kinds[current]
                         and (not independent or row.get("independent") is True)
-                        and bool(row.get("artifact")) and bool(row.get("environment"))
+                        and text_present(command) and row.get("acceptance_command") == command
+                        and text_present(row.get("artifact")) and bool(row.get("environment"))
                         and bool(HEX64.fullmatch(str(row.get("artifact_sha256", ""))))
                         and qualification_matches(row, capability, current)
                         and bindings_match(row.get("contract_bindings"), capability.get("contract_ids", [])))
@@ -702,7 +793,7 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
         for contract_id in checkpoint.get("requires", []):
             if contract_id not in contracts:
                 errors.append(f"{checkpoint.get('id')} references unknown contract {contract_id}")
-        if not checkpoint.get("acceptance_command"):
+        if not text_present(checkpoint.get("acceptance_command")):
             errors.append(f"{checkpoint.get('id')} missing acceptance command")
     return errors
 

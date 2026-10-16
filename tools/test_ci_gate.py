@@ -112,6 +112,17 @@ class TempRepoTests(unittest.TestCase):
         self.assertTrue(ci_gate.is_gate_path(paths[0]))
         self.assertFalse(ci_gate.docs_only(self.seed))
 
+    def test_changed_paths_diffs_ci_head_sha_not_workspace_head(self) -> None:
+        write(self.repo / "docs" / "note.md", "one\n")
+        mid = commit(self.repo, "mid")
+        write(self.repo / "tools" / "later.py", "x = 1\n")
+        commit(self.repo, "later")
+        with mock.patch.dict(os.environ, {"CI_HEAD_SHA": mid}):
+            paths = ci_gate.changed_paths(self.seed)
+            self.assertEqual(paths, ["docs/note.md"])
+            self.assertTrue(ci_gate.docs_only(self.seed))
+        self.assertFalse(ci_gate.docs_only(self.seed))
+
 
 class LightweightControlTests(unittest.TestCase):
     def test_run_lightweight_invokes_public_scope(self) -> None:

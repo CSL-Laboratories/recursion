@@ -221,17 +221,23 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("types: [opened, synchronize, reopened, ready_for_review, labeled", preamble)
         self.assertNotRegex(preamble, r"(?m)^if:")
         self.assertIn("ready_for_review", preamble)
+        self.assertIn("merge_group:", preamble)
+        self.assertIn("types: [checks_requested]", preamble)
+        self.assertIn("github.event.merge_group.head_ref", preamble)
         self.assertIn("cancel-in-progress: true", preamble)
         self.assertNotIn("label-churn", text)
         self.assertEqual(text.count("name: linux"), 1)
         linux = text[text.index("  linux:\n") : text.index("  windows:")]
         self.assertIn("runs-on: blacksmith-2vcpu-ubuntu-2404", linux)
+        self.assertIn("github.event_name != 'push'", linux)
         self.assertNotIn("github.event.pull_request.draft", linux)
         self.assertNotIn("github.event.action != 'labeled'", linux)
         windows = text[text.index("  windows:") : text.index("  macos:")]
         self.assertIn("needs: linux", windows)
         self.assertIn("needs.linux.result == 'success'", windows)
         self.assertIn("'ci:full'", windows)
+        self.assertIn("github.event_name == 'merge_group'", windows)
+        self.assertNotIn("github.event_name == 'push'", windows)
         label_wf = (ROOT / ".github" / "workflows" / "ci-full-label.yml").read_text(
             encoding="utf-8"
         )

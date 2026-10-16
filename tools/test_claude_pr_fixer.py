@@ -1223,14 +1223,16 @@ class FixerLoopCapTests(unittest.TestCase):
             posted = (d / "posted").read_text(encoding="utf-8") if (d / "posted").exists() else ""
             return out.read_text(encoding="utf-8"), posted
 
-    def test_eight_claude_commits_after_human_skips_and_comments(self) -> None:
+    def test_eight_claude_commits_are_passed_to_pending_finding_guard(self) -> None:
         out, posted = self._run([("alice", "Alice")] + [("claude[bot]", "claude[bot]")] * 8, [])
-        self.assertIn("skip=true", out)
-        self.assertEqual(posted.count("posted"), 1)
+        self.assertIn("loop_commit_count=8", out)
+        self.assertIn("skip=false", out)
+        self.assertEqual(posted, "")
 
     def test_seven_claude_commits_runs(self) -> None:
         out, posted = self._run([("alice", "Alice")] + [("claude[bot]", "claude[bot]")] * 7, [])
         self.assertIn("skip=false", out)
+        self.assertIn("loop_commit_count=7", out)
         self.assertEqual(posted, "")
 
     def test_daily_fixer_markers_do_not_cap_runs(self) -> None:
@@ -1262,16 +1264,12 @@ class FixerLoopCapTests(unittest.TestCase):
         c = [("claude[bot]", "claude[bot]")] * 8 + [("bob", "Bob")] + [("claude[bot]", "claude[bot]")] * 7
         out, _ = self._run(c, [])
         self.assertIn("skip=false", out)
+        self.assertIn("loop_commit_count=7", out)
 
     def test_other_bot_does_not_reset_streak(self) -> None:
         c = [("alice", "Alice")] + [("claude[bot]", "claude[bot]")] * 4 + [("github-actions[bot]", "github-actions[bot]")] + [("claude[bot]", "claude[bot]")] * 4
         out, _ = self._run(c, [])
-        self.assertIn("skip=true", out)
-
-    def test_existing_marker_suppresses_duplicate_comment(self) -> None:
-        out, posted = self._run([("claude[bot]", "claude[bot]")] * 8, ["<!-- claude-fixer-loop-cap:" + "a" * 40 + " -->"])
-        self.assertIn("skip=true", out)
-        self.assertEqual(posted, "")
+        self.assertIn("loop_commit_count=8", out)
 
     def test_queued_job_refreshes_head_after_prior_fix_push(self) -> None:
         # The previous run checked its threads, then another finding arrived,
@@ -1296,7 +1294,7 @@ class FixerLoopCapTests(unittest.TestCase):
 
     def test_legacy_bypass_does_not_disable_eight_commit_guard(self) -> None:
         out, _ = self._run([("claude[bot]", "claude[bot]")] * 8, [], bypass_cap="true")
-        self.assertIn("skip=true", out)
+        self.assertIn("loop_commit_count=8", out)
 
     def test_historical_event_markers_do_not_block_new_or_failed_findings(self) -> None:
         out, _ = self._run([], ["<!-- claude-fixer-event:123:abc123 -->"])
@@ -1317,6 +1315,7 @@ class FixerLoopCapTests(unittest.TestCase):
         self.assertLess(job.index("id: eligibility"), job.index("uses: actions/checkout"))
         self.assertIn("MANUAL_RETRY: ${{ github.event_name == 'workflow_dispatch' }}", job)
         self.assertIn("steps.eligibility.outputs.receipt_context", job)
+        self.assertIn("LOOP_COMMIT_COUNT: ${{ steps.cap.outputs.loop_commit_count }}", job)
         self.assertIn("needs-human handoffs must remain unresolved", job)
         for step in job.split("      - uses: actions/checkout@v4", 1)[1].split("\n      - "):
             self.assertIn("steps.eligibility.outputs.skip != 'true'", step)

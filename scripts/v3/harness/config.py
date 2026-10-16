@@ -9,6 +9,7 @@ from pathlib import Path
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 
+from scripts.v3.harness.cooldowns import DEFAULT_COOLDOWN_SECONDS
 from scripts.v3.harness.errors import HarnessError
 from scripts.v3.harness.providers import adapters
 from scripts.v3.harness.usage import default_budgets
@@ -67,6 +68,11 @@ def validate_config(payload: object) -> dict:
     preference = list(payload["routing"]["preference"])
     if sorted(preference) != sorted(names):
         raise HarnessError("routing.preference must list each provider once")
+    weights = payload["routing"].get("weights")
+    if weights is None:
+        weights = {name: 1 for name in names}
+    if set(weights) != set(names):
+        raise HarnessError("routing.weights must list each provider once")
     budgets = payload["budgets"]
     return {
         "budgets": {
@@ -80,8 +86,12 @@ def validate_config(payload: object) -> dict:
             "max_rounds": payload["review"]["max_rounds"],
         },
         "routing": {
+            "cooldown_seconds": payload["routing"].get(
+                "cooldown_seconds", DEFAULT_COOLDOWN_SECONDS
+            ),
             "preference": preference,
             "required_capabilities": list(payload["routing"]["required_capabilities"]),
+            "weights": {name: int(weights[name]) for name in names},
         },
         "version": 1,
     }
@@ -112,6 +122,8 @@ def starter_config(enabled: set[str]) -> dict:
         "routing": {
             "required_capabilities": ["execute"],
             "preference": list(known),
+            "cooldown_seconds": DEFAULT_COOLDOWN_SECONDS,
+            "weights": {name: 1 for name in known},
         },
         "providers": [
             {

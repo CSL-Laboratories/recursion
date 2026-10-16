@@ -52,8 +52,9 @@ An upstream CLI broker:
 
 1. Load `config/harness.json` (version 1). It names providers, capabilities,
    and session budgets. It refuses credential-shaped keys.
-2. Choose the worker deterministically: the first enabled provider in
-   `routing.preference` that has every required capability. No model call.
+2. Choose the worker deterministically: the highest-weight enabled provider
+   (`routing.weights`, CSL-83; ties keep `routing.preference` order) that has every
+   required capability. No model call.
 3. Run that adapter. `fixture` and `fixture-b` never start a process. `claude`,
    `codex`, and `grok` start only with `--allow-live`.
 4. When another capable provider is enabled, ask it to review. The verdict is
@@ -142,9 +143,9 @@ includes the code they sit in, and the tests are stubs.
   --approve-for-me` and grok `--always-approve`, `--prompt-file`, and
   `--cwd` stay on [CSL-81](https://linear.app/csl-laboratories/issue/CSL-81).
   The tests stub the process runner.
-- Budgets are applied after a call returns, so one live call can pass a
-  ceiling. A pre-check is [CSL-83](https://linear.app/csl-laboratories/issue/CSL-83),
-  not this slice.
+- Budgets were applied after a call returned, so one live call could pass
+  a ceiling. The pre-call check is
+  [CSL-83](https://linear.app/csl-laboratories/issue/CSL-83).
 - Checked-in stream fixtures, and the doctor PATH shim on the existing
   `ci:full` Windows job, are [CSL-84](CSL-84.md).
 

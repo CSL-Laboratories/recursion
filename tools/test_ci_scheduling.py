@@ -22,18 +22,25 @@ def condition(job: str) -> str:
     return ' '.join(line.strip() for line in expression[1].splitlines())
 
 
-def evaluate(expression, *, event, action='', draft=False, full=False,
-             settle='skipped', linux='success', run_full='true', cancelled=False):
+def value(expression, *, event, action='', draft=False, full=False, label='', number=217,
+          settle='skipped', linux='success', run_full='true', cancelled=False):
     expression = expression.replace('github.event.pull_request.labels.*.name', 'labels')
     expression = expression.replace('&&', ' and ').replace('||', ' or ')
     expression = re.sub(r'!(?!=)', ' not ', expression)
-    return bool(eval(expression, {'__builtins__': {}}, {
-        'github': NS(event_name=event, event=NS(action=action, pull_request=NS(draft=draft))),
+    return eval(expression, {'__builtins__': {}}, {
+        'github': NS(event_name=event, ref='refs/heads/master', workflow='CI',
+                     event=NS(action=action, label=NS(name=label),
+                              pull_request=NS(draft=draft, number=number))),
         'needs': NS(settle=NS(result=settle), linux=NS(result=linux, outputs=NS(run_full=run_full))),
         'labels': ['ci:full'] if full else [], 'false': False, 'true': True,
         'always': lambda: True, 'cancelled': lambda: cancelled,
         'contains': lambda values, item: item in values,
-    }))
+        'format': lambda pattern, *args: pattern.format(*args),
+    })
+
+
+def evaluate(expression, **kwargs):
+    return bool(value(expression, **kwargs))
 
 
 class SchedulingTests(unittest.TestCase):
@@ -46,36 +53,70 @@ class SchedulingTests(unittest.TestCase):
 
     def test_actual_conditions_event_result_matrix(self):
         outcomes = ['success', 'failure', 'cancelled', 'skipped', '', 'pending']
-        events = [('pull_request', action, draft) for action in
+        events = [('pull_request', action, draft, '') for action in
                   ['opened', 'reopened', 'ready_for_review', 'synchronize'] for draft in [True, False]]
-        events += [(e, '', False) for e in ['push', 'workflow_dispatch', 'merge_group']]
+        events += [('pull_request', 'labeled', draft, label)
+                   for draft, label in itertools.product([True, False], ['ci:full', 'bug', ''])]
+        events += [(e, '', False, '') for e in ['push', 'workflow_dispatch', 'merge_group']]
         queue_enabled = 'merge_group:' in (ROOT / '.github/workflows/ci.yml').read_text()
         for job in ['linux-tests', 'windows', 'macos']:
             expression = condition(job)
             self.assertIn('always()', expression)
             self.assertIn('!cancelled()', expression)
-            for (event, action, draft), settle, linux, full, cancelled in itertools.product(
+            for (event, action, draft, label), settle, linux, full, cancelled in itertools.product(
                     events, outcomes, outcomes, [False, True], [False, True]):
                 expected_settle = event == 'pull_request' and action == 'synchronize' and not draft
                 expected = not cancelled and (settle == 'success' or
                            (settle == 'skipped' and not expected_settle))
+                expected &= action != 'labeled' or (label == 'ci:full' and not draft)
                 if job != 'linux-tests':
-                    selected = event == 'workflow_dispatch' or (event == 'pull_request' and full)
+                    selected = event == 'workflow_dispatch' or (event == 'pull_request' and (full or (action == 'labeled' and label == 'ci:full')))
                     selected |= event == 'merge_group' and queue_enabled
                     selected |= job == 'windows' and event == 'push'
                     expected &= linux == 'success' and selected
-                args = dict(event=event, action=action, draft=draft, full=full,
+                args = dict(event=event, action=action, draft=draft, full=full, label=label,
                             settle=settle, linux=linux, cancelled=cancelled)
                 self.assertEqual(evaluate(expression, **args), expected, (job, args))
             if job != 'linux-tests':
                 self.assertFalse(evaluate(expression, event='workflow_dispatch', run_full='false'))
+
+    def test_label_routing_names_concurrency_and_required_jobs(self):
+        text = (ROOT / '.github/workflows/ci.yml').read_text()
+        self.assertIn('ready_for_review, labeled]', text)
+        self.assertFalse((ROOT / '.github/workflows/ci-full-label.yml').exists())
+        self.assertFalse((ROOT / '.github/workflows/ci-full-matrix.yml').exists())
+        group_line = next(line for line in text.splitlines() if line.strip().startswith('group:'))
+        group_expr = re.findall(r'\$\{\{ (.*?) \}\}', group_line)[-1]
+        base = dict(event='pull_request', action='synchronize')
+        ordinary_group = value(group_expr, **base)
+        full_group = value(group_expr, event='pull_request', action='labeled', label='ci:full')
+        self.assertEqual(ordinary_group, full_group)
+        for label, draft in itertools.product(['ci:full', 'bug', ''], [False, True]):
+            args = dict(event='pull_request', action='labeled', label=label, draft=draft)
+            eligible = label == 'ci:full' and not draft
+            self.assertEqual(value(group_expr, **args) == ordinary_group, eligible)
+            for job in ['settle', 'linux-tests', 'linux', 'windows', 'macos', 'platform-gates']:
+                body = re.search(rf'^  {job}:\n(.*?)(?=^  [\w-]+:|\Z)', text, re.M | re.S)[1]
+                name_expr = re.search(r'^    name: \$\{\{ (.*?) \}\}', body, re.M)[1]
+                self.assertEqual(value(name_expr, **args), job if eligible else 'ignored-label-' + job)
+            for job in ['linux', 'platform-gates']:
+                # Required aggregators still run on failed dependencies and cancellation;
+                # ignored labels instantiate only distinct skipped checks.
+                for result, cancelled in itertools.product(['failure', 'skipped', 'pending'], [False, True]):
+                    self.assertEqual(evaluate(condition(job), linux=result, cancelled=cancelled, **args), eligible)
+        # Manual and other-PR lanes remain independent; label text never enters a shell.
+        self.assertNotEqual(value(group_expr, event='workflow_dispatch', number=0), ordinary_group)
+        self.assertNotEqual(value(group_expr, event='pull_request', number=218), ordinary_group)
+        for line in text.splitlines():
+            if line.lstrip().startswith('run:'):
+                self.assertNotIn('github.event.label', line)
 
     @unittest.skipIf(os.name == 'nt' or shutil.which('bash') is None, 'POSIX shell runner')
     def test_required_linux_runs_actual_shell_for_every_dependency_result(self):
         text = (ROOT / '.github/workflows/ci.yml').read_text()
         job = text.split('  linux:\n', 1)[1].split('  windows:\n', 1)[0]
         self.assertIn('needs: [settle, linux-tests]', job)
-        self.assertIn('if: always()', job)
+        self.assertIn('always()', condition('linux'))
         self.assertIn('runs-on: ubuntu-latest', job)
         self.assertIn('if: cancelled()\n        run: exit 1', job)
         import textwrap

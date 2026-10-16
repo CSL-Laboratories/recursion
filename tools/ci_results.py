@@ -19,10 +19,10 @@ def validate(needs, *, event, action='', draft=False, full=False, cancelled=Fals
     if (run, outputs.get('classification')) not in {
             ('true', 'full'), ('false', 'docs-only')}:
         return False
-    selected = {'windows': event in {'push', 'workflow_dispatch', 'merge_group'} or
-                (event == 'pull_request' and full),
-                'macos': event in {'workflow_dispatch', 'merge_group'} or
-                (event == 'pull_request' and full)}
+    # No weaker PR success: a delayed unlabeled run cannot overwrite failed
+    # full coverage with skipped OS jobs. The linux check stays independent.
+    selected = {'windows': True,
+                'macos': event != 'push'}
     return all(needs[job].get('result') ==
                ('success' if run == 'true' and selected[job] else 'skipped')
                for job in selected)

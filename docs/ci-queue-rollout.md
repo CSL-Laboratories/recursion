@@ -17,8 +17,10 @@ clearance. Do not replace those branches or import unrelated policy/planning wor
   skipped/failed Linux tests, and forwards verified path outputs. No protection
   setting change is needed to keep failed settle from satisfying `linux`.
 - `platform-gates` waits for settle, Linux, Windows and macOS. Queue and manual full
-  runs require all three platforms. Ordinary PRs require Linux and any selected
-  extra OS jobs. Master push retains Linux/Windows fallback; nightly macOS remains.
+  runs and every non-docs PR success require all three platforms. A Linux-only
+  PR run can pass required `linux`, but its staged `platform-gates` fails until
+  `ci:full` runs complete coverage. Master push retains Linux/Windows fallback;
+  nightly macOS remains. This is deliberate until separately approved activation.
 - A docs-only no-op requires Linux success plus the exact `docs-only` classification
   from a nonempty verified diff. Linux still runs public-scope and whitespace checks.
   Missing outputs, pending/failing/cancelled jobs and unexplained skips fail closed.
@@ -64,8 +66,13 @@ Ordinary PR runs already share concurrency across heads. A non-draft synchronize
 waits 120 seconds on hosted Ubuntu; cancelled/failed/unexpectedly skipped settle
 cannot admit paid Linux or dependent OS jobs. Opened/ready/manual/queue runs
 deliberately skip settle and can run their selected jobs. Draft event runs can
-still execute CI. A push does not cancel independent label/manual lanes; after a
-paid job starts, cancellation cannot recover elapsed cost. Coverage and correctness
+still execute CI. Adding `ci:full` runs Linux and both extra OS jobs in this same
+DAG and shares PR concurrency; the independent label workflows are retired. Ignored
+labels and draft label events have separate concurrency groups and check names,
+so their skips cannot overlay required checks. GitHub concurrency queue order is
+not dispatch order: even a delayed Linux-only run must fail the non-docs aggregate.
+Manual dispatch remains independent. After a paid job starts, cancellation cannot
+recover elapsed cost. Coverage and correctness
 precede the $100/month target. No savings or invoice reduction is established here.
 
 No queue canary, protection change, merge, rebase, force push, credential creation

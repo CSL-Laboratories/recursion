@@ -76,7 +76,7 @@
       "revision": 1,
       "status": "candidate",
       "path": "docs/v3/program-control/MONTH-PROGRAM.md",
-      "sha256": "0a76ef12b7e928ee30e0c01c6aa4e41b23e072c9ff83e67c8272dd2b64820b51",
+      "sha256": "59d3c5ded246cf6994138e0467c7458015e82ffffb90c4508e3db17d3a86a402",
       "decision_issue": "CSL-204"
     }
   ],

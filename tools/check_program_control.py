@@ -20,6 +20,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 LEDGER = ROOT / "docs/v3/program-control/program.json"
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+CSL_ISSUE = re.compile(r"^CSL-[0-9]+$")
 MATURITY_ORDER = [
     "unresearched", "researched", "human_decided", "contract_frozen", "prototyped",
     "implemented", "provider_free_verified", "locally_qualified", "release_qualified",
@@ -105,6 +106,76 @@ def _ids(rows: list[dict[str, Any]], name: str, errors: list[str]) -> dict[str, 
     return result
 
 
+def issue_reference_errors(data: dict[str, Any]) -> list[str]:
+    """Check issue syntax everywhere, including retained historical bindings.
+
+    External routing/parent references need not be work rows in this ledger.
+    Current work cross-links and approval freshness are checked by their consumers.
+    """
+    errors: list[str] = []
+
+    def issue(value: Any, path: str) -> None:
+        if not isinstance(value, str) or not CSL_ISSUE.fullmatch(value):
+            errors.append(f"{path} must be a CSL issue")
+
+    scalar_fields = {"parent_issue", "implementation_issue", "decision_issue",
+                     "linear_issue", "resolution_issue", "issue", "work_item_id"}
+    list_fields = {"hard_dependencies", "work_item_ids", "active_contract_consumers", "active_reviews"}
+
+    def walk(value: Any, path: str) -> None:
+        if isinstance(value, list):
+            for index, row in enumerate(value):
+                walk(row, f"{path}[{index}]")
+        elif isinstance(value, dict):
+            if value.get("action") == "develop_work":
+                issue(value.get("target"), f"{path}.target")
+            if value.get("kind") == "work_verification" and "work_item_id" not in value:
+                issue(None, f"{path}.work_item_id")
+            for key, child in value.items():
+                child_path = f"{path}.{key}"
+                if key in scalar_fields:
+                    issue(child, child_path)
+                elif key in list_fields:
+                    if not isinstance(child, list):
+                        errors.append(f"{child_path} must be a list of CSL issues")
+                    else:
+                        for index, item in enumerate(child):
+                            issue(item, f"{child_path}[{index}]")
+                elif key in {"work_bindings", "unknown_bindings"}:
+                    if not isinstance(child, list) or not all(isinstance(row, dict) for row in child):
+                        errors.append(f"{child_path} must be a list of binding objects")
+                    else:
+                        for index, row in enumerate(child):
+                            field = "id" if key == "work_bindings" else "resolution_issue"
+                            issue(row.get(field), f"{child_path}[{index}].{field}")
+                walk(child, child_path)
+
+    # Required routing fields are checked even before a candidate is approved.
+    for collection, fields in (("contracts", ("decision_issue",)), ("capabilities", ("decision_issue",)),
+                               ("unknowns", ("resolution_issue",)), ("integration_checkpoints", ("issue",)),
+                               ("proposals", ("linear_issue",)), ("work_items", ("parent",)),
+                               ("decisions", ()), ("evidence", ())):
+        rows = data.get(collection)
+        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+            errors.append(f"{collection} must be a list of objects")
+            continue
+        for index, row in enumerate(rows):
+            if collection == "work_items":
+                issue(row.get("id"), f"work item {row.get('id')}")
+            for field in fields:
+                if field not in row or field == "parent":
+                    issue(row.get(field), f"{collection}[{index}].{field}")
+    admission = data.get("admission")
+    if not isinstance(admission, dict):
+        errors.append("admission must be an object")
+    elif "decision_issue" not in admission:
+        issue(None, "admission.decision_issue")
+    # Pending/historical receipts may omit linear_issue; present values must be
+    # valid. Approved receipts additionally require it in receipt_fields below.
+    walk(data, "program")
+    return errors
+
+
 def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
     errors: list[str] = []
     required = {
@@ -116,12 +187,11 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
     if missing:
         errors.append(f"missing top-level fields: {', '.join(missing)}")
         return errors
+    errors.extend(issue_reference_errors(data))
+    if errors:
+        return errors
     if data["schema_version"] != 1:
         errors.append("schema_version must be 1")
-    if not re.fullmatch(r"CSL-[0-9]+", str(data["parent_issue"])):
-        errors.append("parent_issue must be a CSL issue")
-    if not isinstance(data["implementation_issue"], str) or not re.fullmatch(r"CSL-[0-9]+", data["implementation_issue"]):
-        errors.append("implementation_issue must be a CSL issue")
     if not re.fullmatch(r"[0-9a-f]{40}", str(data["source_commit"])):
         errors.append("source_commit must be a full lowercase commit hash")
 
@@ -159,9 +229,6 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
         errors.append("implementation_issue must reference a work item")
     elif implementation.get("parent") != data["parent_issue"]:
         errors.append("implementation work parent must match parent_issue")
-    for item_id in work:
-        if not re.fullmatch(r"CSL-[0-9]+", item_id):
-            errors.append(f"work item {item_id} must be a CSL issue")
 
     for contract_id, contract in contracts.items():
         path = root / str(contract.get("path", ""))
@@ -240,7 +307,7 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
             if target_id not in (scope or []):
                 errors.append(f"{proposal_id} authorization is outside proposal scope")
             issue = target_id if action == "develop_work" else target.get("decision_issue")
-            if not re.fullmatch(r"CSL-[0-9]+", str(issue)) or proposal.get("linear_issue") != issue:
+            if proposal.get("linear_issue") != issue:
                 errors.append(f"{proposal_id} authorization requires the matching Linear issue")
             if grant.get("target_digest") != target_digest(action, target):
                 errors.append(f"{proposal_id} stale authorization target {target_id}")
@@ -416,8 +483,6 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
             elif item.get("independent_verification_required") is True:
                 verified_work.add(item_id)
     for item_id, item in work.items():
-        if not re.fullmatch(r"CSL-[0-9]+", str(item.get("parent", ""))):
-            errors.append(f"{item_id} missing parent lineage")
         stage = item.get("stage")
         if stage not in stage_rank:
             errors.append(f"{item_id} has invalid stage")
@@ -590,8 +655,8 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
             errors.append(f"{unknown_id} resolved without resolution evidence")
         if unknown.get("blocks") not in rank:
             errors.append(f"{unknown_id} blocks an unknown maturity tier")
-        if not unknown.get("resolution_issue") or not unknown.get("exposure"):
-            errors.append(f"{unknown_id} lacks resolution issue or exposure")
+        if not unknown.get("exposure"):
+            errors.append(f"{unknown_id} lacks exposure")
 
     for risk in data["risks"]:
         if risk.get("severity") not in {"low", "medium", "high", "critical"}:

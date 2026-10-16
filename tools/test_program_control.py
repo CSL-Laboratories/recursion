@@ -188,7 +188,7 @@ class ProgramControlTests(unittest.TestCase):
     def test_missing_parent_lineage_is_rejected(self) -> None:
         data = copy.deepcopy(self.data)
         data["work_items"][0]["parent"] = None
-        self.assertTrue(any("missing parent lineage" in error for error in self.errors(data)))
+        self.assertTrue(any("parent must be a CSL issue" in error for error in self.errors(data)))
 
     def test_incomplete_human_decision_receipt_is_rejected(self) -> None:
         data = copy.deepcopy(self.data)
@@ -591,6 +591,8 @@ class ProgramControlTests(unittest.TestCase):
                     self.setUp()
                     self.promote("release_qualified")
                     self.data["evidence"][-1][key] = value
+                    if key == "kind":
+                        self.data["evidence"][-1]["work_item_id"] = "CSL-204"
                     self.assert_rejected("requires closed checkpoint")
 
     def test_checkpoint_definition_change_invalidates_approval_and_composed_proof(self):
@@ -618,7 +620,7 @@ class ProgramControlTests(unittest.TestCase):
                 self.setUp()
                 self.promote("release_qualified")
                 self.data["integration_checkpoints"][0]["work_item_ids"] = inputs
-                self.assert_rejected("requires unique known work inputs")
+                self.assert_rejected("work_item_ids" if inputs is None else "requires unique known work inputs")
 
     def completed_prerequisite(self, status="verified"):
         prerequisite = copy.deepcopy(self.data["work_items"][0])
@@ -845,6 +847,114 @@ class ProgramControlTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.data["implementation_issue"] = value
                 self.assert_rejected("implementation_issue must be a CSL issue")
+
+    def test_all_scalar_issue_references_reject_malformed_values(self):
+        paths = [("parent_issue",), ("implementation_issue",), ("work_items", 0, "id"),
+                 ("work_items", 0, "parent"), ("contracts", 0, "decision_issue"),
+                 ("capabilities", 0, "decision_issue"), ("admission", "decision_issue"),
+                 ("decisions", 0, "linear_issue"), ("proposals", 0, "linear_issue"),
+                 ("unknowns", 0, "resolution_issue"), ("integration_checkpoints", 0, "issue")]
+        for path in paths:
+            for value in ("not-linear", "csl-204", "CSL-204\n", " CSL-204", None, 204, [], {}):
+                with self.subTest(path=path, value=value):
+                    self.setUp()
+                    self.promote("release_qualified")
+                    target = self.data
+                    for key in path[:-1]:
+                        target = target[key]
+                    target[path[-1]] = value
+                    self.assert_rejected("must be a CSL issue")
+
+    def test_unknown_and_checkpoint_issues_invalid_before_approval_cannot_promote(self):
+        for collection, field in (("unknowns", "resolution_issue"), ("integration_checkpoints", "issue")):
+            with self.subTest(collection=collection):
+                self.setUp()
+                self.data[collection][0][field] = "not-linear"
+                self.promote("release_qualified")
+                self.assert_rejected(f"{field} must be a CSL issue")
+
+    def test_candidate_routing_references_cannot_be_missing(self):
+        paths = [("contracts", 0, "decision_issue"), ("capabilities", 0, "decision_issue"),
+                 ("admission", "decision_issue"), ("unknowns", 0, "resolution_issue"),
+                 ("integration_checkpoints", 0, "issue")]
+        for path in paths:
+            with self.subTest(path=path):
+                self.setUp()
+                target = self.data
+                for key in path[:-1]:
+                    target = target[key]
+                del target[path[-1]]
+                self.assert_rejected(f"{path[-1]} must be a CSL issue")
+
+    def test_issue_lists_reject_bad_ids_and_malformed_containers(self):
+        paths = [("work_items", 0, "hard_dependencies"), ("integration_checkpoints", 0, "work_item_ids"),
+                 ("admission", "active_contract_consumers"), ("admission", "active_reviews")]
+        for path in paths:
+            for value in (["not-linear"], [None], [[]], [{}], None, "CSL-204", {}):
+                with self.subTest(path=path, value=value):
+                    self.setUp()
+                    target = self.data
+                    for key in path[:-1]:
+                        target = target[key]
+                    target[path[-1]] = value
+                    self.assert_rejected(path[-1])
+
+    def historical_issue_references(self):
+        self.data["evidence"].append({"id": "evidence.history", "kind": "work_verification",
+                                      "work_item_id": "CSL-998", "work_bindings": [{"id": "CSL-997"}]})
+        self.data["proposals"].append({"id": "proposal.history", "linear_issue": "CSL-998",
+                                      "authorizations": [{"action": "develop_work", "target": "CSL-997"}],
+                                      "unknown_bindings": [{"id": "unknown.old", "resolution_issue": "CSL-996"}]})
+        self.data["decisions"].append({"id": "decision.history", "status": "superseded", "linear_issue": "CSL-998"})
+
+    def test_historical_issue_syntax_is_checked_without_requiring_current_work(self):
+        self.historical_issue_references()
+        self.assertEqual(self.errors(), [])
+        paths = [("evidence", -1, "work_item_id"), ("evidence", -1, "work_bindings", 0, "id"),
+                 ("proposals", -1, "linear_issue"), ("proposals", -1, "authorizations", 0, "target"),
+                 ("proposals", -1, "unknown_bindings", 0, "resolution_issue"),
+                 ("decisions", -1, "linear_issue")]
+        for path in paths:
+            with self.subTest(path=path):
+                self.setUp()
+                self.historical_issue_references()
+                target = self.data
+                for key in path[:-1]:
+                    target = target[key]
+                target[path[-1]] = "not-linear"
+                self.assert_rejected("must be a CSL issue")
+
+    def test_issue_binding_containers_and_missing_binding_fields_are_rejected(self):
+        for field, collection in (("work_bindings", "evidence"), ("unknown_bindings", "proposals")):
+            for value in (None, "CSL-204", ["CSL-204"], [None], [{}]):
+                with self.subTest(field=field, value=value):
+                    self.setUp()
+                    self.historical_issue_references()
+                    self.data[collection][-1][field] = value
+                    self.assert_rejected(field)
+
+    def test_external_routing_issues_need_not_be_local_work_rows(self):
+        for contract in self.data["contracts"]:
+            contract["decision_issue"] = "CSL-991"
+        self.data["capabilities"][0]["decision_issue"] = "CSL-992"
+        self.data["admission"]["decision_issue"] = "CSL-993"
+        self.data["unknowns"][0]["resolution_issue"] = "CSL-994"
+        self.data["integration_checkpoints"][0]["issue"] = "CSL-995"
+        self.data["decisions"][0]["linear_issue"] = "CSL-996"
+        self.assertEqual(self.errors(), [])
+
+    def test_valid_syntax_does_not_bypass_current_local_work_crosslinks(self):
+        for path, fragment in ((("work_items", 0, "hard_dependencies"), "unknown hard dependency"),
+                               (("integration_checkpoints", 0, "work_item_ids"), "unique known work inputs"),
+                               (("admission", "active_contract_consumers"), "unknown work item IDs"),
+                               (("admission", "active_reviews"), "unknown work item IDs")):
+            with self.subTest(path=path):
+                self.setUp()
+                target = self.data
+                for key in path[:-1]:
+                    target = target[key]
+                target[path[-1]] = ["CSL-999"]
+                self.assert_rejected(fragment)
 
 
 if __name__ == "__main__":

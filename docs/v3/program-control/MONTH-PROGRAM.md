@@ -214,10 +214,24 @@ never a substitute for those actions.
   All other fields remain bound. Candidate changes require fresh verification;
   contract or scope changes require a new human receipt. Updating a receipt digest
   without a new human approval comment is forbidden, even if structurally valid.
-- `implementation_issue` and every work ID must have the `CSL-N` form. The
-  implementation issue must identify an existing work item whose parent matches
-  the program's `parent_issue`. This checks declared lineage offline, not whether
-  the issue actually exists in Linear; reviewers must corroborate the issue links.
+- All issue references use exact `CSL-N` strings, including candidate routing and
+  retained history. The syntax pass covers program `parent_issue`/`implementation_issue`,
+  work IDs/parents/dependencies, contract/capability/admission `decision_issue`,
+  proposal/receipt `linear_issue`, unknown `resolution_issue`, checkpoint `issue`
+  and work inputs, admission occupancy, evidence `work_item_id`/`work_bindings`,
+  proposal unknown bindings, and `develop_work` authorization targets. Malformed
+  reference lists and binding objects fail validation before reference traversal.
+  Candidate routing fields and proposal `linear_issue` are required; pending or
+  historical receipts may omit an undecided `linear_issue`, but present values must
+  be valid. Approved receipts always require the matching issue.
+- The implementation issue identifies an existing work row with the program's
+  `parent_issue`. Hard dependencies, occupancy and checkpoint work inputs refer to
+  local work rows; active proofs and grants must match their current work targets.
+  External parent, decision, resolution and checkpoint-coordinator issues need not
+  be work rows in this ledger. Valid historical references may retain obsolete
+  targets/digests; they grant no current authority. Mixed proposal scopes and other
+  resource IDs retain their own namespaces. Syntax and local cross-links do not
+  prove that an issue exists in Linear; reviewers must corroborate the issue links.
 - Accepted contracts reference their `decision_receipt`. Developing consumers pin
   the same receipt in `contract_receipts`, keyed by contract ID. Human-gated work
   also requires its own applicable `develop_work` receipt, regardless of the legacy

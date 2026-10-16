@@ -1,6 +1,7 @@
 """Executable adversarial provider identity, retry and recovery regressions."""
 import copy
 import os
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -119,6 +120,8 @@ class TargetAndPollingTests(unittest.TestCase):
         for event in ['status', 'workflow_dispatch', 'check_run', '']:
             with self.assertRaises(ValueError):
                 gate.verify_target(event, SHA, '42')
+        with self.assertRaises(ValueError):
+            gate.verify_target('pull_request', SHA, '')
 
     def test_queue_checks_native_sha_and_never_blindly_passes(self):
         gate.verify_target('merge_group', SHA, '')
@@ -157,6 +160,22 @@ class TargetAndPollingTests(unittest.TestCase):
         self.assertIn('github.event.pull_request.base.sha', text)
         self.assertIn('persist-credentials: false', text)
         self.assertIn('timeout-minutes: 8', text)
+        self.assertIn('HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}', text)
+        self.assertIn('EVENT_NAME: ${{ github.event_name }}', text)
+        self.assertIn('PR_NUMBER: ${{ github.event.pull_request.number }}', text)
+
+    def test_main_success_timeout_and_exception_exit(self):
+        with patch.dict(os.environ, {'EVENT_NAME': 'pull_request', 'HEAD_SHA': SHA,
+                                      'PR_NUMBER': '42', 'REVIEW_GATE_POLL_SECONDS': '0'}), \
+                patch.object(gate, 'verify_target'), patch.object(gate, 'devin_review_succeeded', return_value=True):
+            self.assertEqual(gate.main(), 0)
+        with patch.dict(os.environ, {'REVIEW_GATE_POLL_SECONDS': '0'}), \
+                patch.object(gate, 'verify_target'), patch.object(gate, 'devin_review_succeeded', return_value=False):
+            self.assertEqual(gate.main(), 1)
+        env = {**os.environ, 'EVENT_NAME': 'status', 'HEAD_SHA': SHA, 'PR_NUMBER': '42'}
+        proc = subprocess.run([sys.executable, gate.__file__], env=env, capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn('Only original PR', proc.stdout)
 
 
 if __name__ == '__main__':

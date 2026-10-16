@@ -32,6 +32,8 @@ clearance. Do not replace those branches or import unrelated policy/planning wor
   complete bounded pagination, latest numeric status ID, and the live PR head
   before/after evidence. A pending retry never falls back to older success.
   API failures, inconsistent snapshots and changed provider identity fail closed.
+  A foreign same-name status blocks diagnostics on that SHA rather than being
+  ignored; investigate it with the owner. Transient errors require manual rerun.
 - Queue diagnostics require a genuine status on the queue SHA; they never pass
   merely because the event is `merge_group`. Such provider coverage is unproven.
   The initial base may lack this new script, so diagnostics fail during bootstrap.
@@ -40,6 +42,7 @@ clearance. Do not replace those branches or import unrelated policy/planning wor
 
 The diagnostic polls for up to 180 seconds (15-second HTTP timeout per read;
 8-minute workflow timeout is the hard wall). Drafts and stale PR heads fail.
+This is intentional diagnostics behavior, not an automatic fixer request.
 No `status` event job is used: its native check would report on default-branch
 `GITHUB_SHA`, not the late PR SHA. No status/check write grant is added.
 

@@ -34,6 +34,13 @@ def evaluate(expression, *, event, action='', draft=False, full=False,
 
 
 class SchedulingTests(unittest.TestCase):
+    def test_settle_runs_only_for_ready_synchronize(self):
+        for event, action, draft in itertools.product(
+                ['pull_request', 'push', 'workflow_dispatch', 'merge_group'],
+                ['opened', 'reopened', 'ready_for_review', 'synchronize', ''], [True, False]):
+            self.assertEqual(evaluate(condition('settle'), event=event, action=action, draft=draft),
+                             event == 'pull_request' and action == 'synchronize' and not draft)
+
     def test_actual_conditions_event_result_matrix(self):
         outcomes = ['success', 'failure', 'cancelled', 'skipped', '', 'pending']
         events = [('pull_request', action, draft) for action in

@@ -1,10 +1,19 @@
-# Stuck Devin/Claude review threads → Codex mediator.
+# Stuck Devin/Claude review threads → Codex mediator, then optional auto-resolve.
 #
 # Own file on purpose: a cron inside claude.yml never fired because of event
 # noise. Lightweight GitHub-hosted runner, no test jobs.
 #
-# Caps: one mediation per thread, max 3 per PR per UTC day.
-# Never resolve threads, never push, never merge.
+# Caps: one mediation per thread, max 3 per PR per UTC day;
+# one auto-resolve per thread, max 3 per PR per UTC day.
+# Never push or merge.
+#
+# Tokens
+# - GH_TOKEN (github.token): read PRs and write issue labels. This workflow
+#   keeps pull-requests: read, so the Actions token cannot resolve threads.
+# - CODEX_TRIGGER_PAT: post @codex review (Codex only triggers on this user),
+#   reply on the review thread, and call resolveReviewThread. Same user token
+#   on purpose so the citation and resolve are not attributed to
+#   github-actions[bot]. Missing PAT skips writes with a notice.
 name: Stuck-thread watch
 
 on:
@@ -16,19 +25,24 @@ on:
         description: "Only scan this PR number (optional)"
         required: false
         default: ""
-  # Cheap paths only: Claude replies are the moment a thread may become stuck.
+  # Cheap paths: Claude replies may mark a thread stuck; Codex rulings may
+  # make a mediated thread eligible to auto-resolve.
   issue_comment:
     types: [created]
   pull_request_review_comment:
     types: [created]
+  pull_request_review:
+    types: [submitted, edited]
 
 # Tunables. Edit here; the script reads them from the environment.
 env:
   STUCK_AFTER_HOURS: "6"
   MAX_MEDIATIONS_PER_PR_PER_DAY: "3"
+  MAX_RESOLVES_PER_PR_PER_DAY: "3"
   LINEAR_REPOS: "CSL-Laboratories/recursion"
   DEVIN_LOGIN: "devin-ai-integration[bot]"
   CLAUDE_LOGIN: "claude[bot]"
+  CODEX_REVIEW_LOGIN: "chatgpt-codex-connector[bot]"
   LINEAR_TEAM_KEY: "CSL"
 
 concurrency:
@@ -48,11 +62,21 @@ jobs:
       (
         github.event_name == 'issue_comment' &&
         github.event.issue.pull_request &&
-        github.event.comment.user.login == 'claude[bot]'
+        (
+          github.event.comment.user.login == 'claude[bot]' ||
+          github.event.comment.user.login == 'chatgpt-codex-connector[bot]'
+        )
       ) ||
       (
         github.event_name == 'pull_request_review_comment' &&
-        github.event.comment.user.login == 'claude[bot]'
+        (
+          github.event.comment.user.login == 'claude[bot]' ||
+          github.event.comment.user.login == 'chatgpt-codex-connector[bot]'
+        )
+      ) ||
+      (
+        github.event_name == 'pull_request_review' &&
+        github.event.review.user.login == 'chatgpt-codex-connector[bot]'
       )
     runs-on: ubuntu-latest
     timeout-minutes: 10

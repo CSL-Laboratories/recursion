@@ -242,7 +242,9 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
     for field, inferred in (("active_contract_consumers", consumers), ("active_reviews", reviews)):
         if not inferred.issubset(occupancy[field]):
             errors.append(f"admission {field} omits active work")
-        occupancy[field].update(inferred)
+        if occupancy[field] - inferred:
+            errors.append(f"admission {field} contains stale or wrong-lane work")
+        occupancy[field] = inferred
     occupied = any(occupancy.values())
     if mode == "closed_pending_human_limits" and occupied:
         errors.append("closed admission has active work")

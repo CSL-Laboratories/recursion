@@ -217,6 +217,7 @@ never a substitute for those actions.
   contracts must all be accepted. These checks accumulate at higher tiers.
 - `active_contract_consumers` and `active_reviews` list unique existing work IDs.
   In-progress development-or-later consumers and verification work cannot be omitted.
+  Completed, inactive or wrong-lane list entries are rejected, not counted as capacity.
   Open admission, and occupied bounded admission, require positive consumer/review
   caps plus an `admit_work` receipt binding the actual mode, limits and policy.
   Each list must fit its cap. Empty bounded admission may retain null limits and a

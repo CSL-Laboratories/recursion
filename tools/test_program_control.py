@@ -287,6 +287,9 @@ class ProgramControlTests(unittest.TestCase):
                     other = copy.deepcopy(self.data["work_items"][0])
                     other["id"] = "CSL-999"
                     self.data["work_items"].append(other)
+                    if field == "active_reviews":
+                        self.data["work_items"][0]["stage"] = "verification"
+                        other["stage"] = "verification"
                     admission[field] = ["CSL-204", "CSL-999"]
                     self.assert_rejected("admission exceeds max_")
 
@@ -326,6 +329,33 @@ class ProgramControlTests(unittest.TestCase):
         self.data["work_items"][0]["stage"] = "verification"
         self.assert_rejected("active_reviews omits active work")
         self.assert_rejected("bounded_autonomy admission lacks")
+
+    def test_completed_or_wrong_lane_work_is_rejected_not_counted(self):
+        for field in ("active_contract_consumers", "active_reviews"):
+            for status in ("done", "accepted", "verified", "todo"):
+                with self.subTest(field=field, status=status):
+                    self.setUp()
+                    admission = self.admit()
+                    old = self.data["work_items"][0]
+                    current = copy.deepcopy(old)
+                    current["id"] = "CSL-999"
+                    self.data["work_items"].append(current)
+                    old["status"] = status
+                    if field == "active_reviews":
+                        old["stage"] = current["stage"] = "verification"
+                    admission["active_contract_consumers"] = [current["id"]]
+                    admission[field] = [old["id"], current["id"]]
+                    self.assert_rejected("stale or wrong-lane work")
+                    self.assertFalse(any("exceeds max_" in error for error in self.errors()))
+                    admission[field] = [current["id"]]
+                    self.assertEqual(self.errors(), [])
+        self.setUp()
+        admission = self.admit()
+        admission["active_reviews"] = ["CSL-204"]
+        self.assert_rejected("active_reviews contains stale or wrong-lane work")
+        admission["active_reviews"] = []
+        self.data["work_items"][0]["consumes_contracts"] = []
+        self.assert_rejected("active_contract_consumers contains stale or wrong-lane work")
 
     def test_closed_admission_rejects_active_consumers(self):
         self.admit()["mode"] = "closed_pending_human_limits"

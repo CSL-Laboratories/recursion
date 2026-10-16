@@ -71,26 +71,50 @@ def unique_snapshot(records, field="id", numeric=True):
 
 
 def review_snapshot(threads, comments):
-    """Validate identities before any eligibility filter or root-keyed map."""
+    """Corroborate the complete review snapshot before any eligibility filter."""
     threads = unique_snapshot(threads, numeric=False)
     comments = unique_snapshot(comments)
-    owners = {}
+    roots = {}
     for thread in threads:
         nodes = (thread.get("comments") or {}).get("nodes") or []
-        if len(nodes) > 1:
-            raise ValueError("unexpected multiple root nodes")
-        if not nodes:
-            continue
-        root_id = nodes[0].get("databaseId")
+        if len(nodes) != 1:
+            raise ValueError("thread must expose exactly one root")
+        root = nodes[0]
+        root_id = root.get("databaseId")
         if type(root_id) is not int or root_id <= 0:
             raise ValueError("thread root lacks stable identity")
-        if root_id in owners:
+        if root_id in roots:
             raise ValueError("root belongs to multiple review threads")
-        owners[root_id] = thread["id"]
+        if type(thread.get("isResolved")) is not bool or type(thread.get("isOutdated")) is not bool:
+            raise ValueError("invalid review thread state")
+        roots[root_id] = root
+    rest_roots = {}
+    for comment in comments:
+        parent = comment.get("in_reply_to_id")
+        if parent is None:
+            rest_roots[comment["id"]] = comment
+        elif type(parent) is not int or parent <= 0 or parent not in roots or parent == comment["id"]:
+            raise ValueError("reply lacks corroborated root parent")
+    if set(roots) != set(rest_roots):
+        raise ValueError("inconsistent GraphQL/REST root presence")
+    for root_id, root in roots.items():
+        rest = rest_roots[root_id]
+        author, user = root.get("author") or {}, rest.get("user") or {}
+        kind, login = author.get("__typename"), author.get("login")
+        rest_login = user.get("login")
+        if kind == "Bot" and isinstance(login, str) and isinstance(rest_login, str):
+            login, rest_login = login.removesuffix("[bot]"), rest_login.removesuffix("[bot]")
+        if (kind not in {"Bot", "User"} or user.get("type") != kind
+                or not isinstance(login, str) or not login or login != rest_login
+                or type(user.get("id")) is not int or user["id"] <= 0
+                or not isinstance(root.get("body"), str) or root["body"] != rest.get("body")):
+            raise ValueError("inconsistent GraphQL/REST root identity or body")
+        if kind == "Bot" and login == "devin-ai-integration" and not bot(user, "devin-ai-integration[bot]", DEVIN_ID):
+            raise ValueError("unverified Devin root identity")
     return threads, comments
 
 
-def findings(threads: list[dict], comments: list[dict], strict_snapshot: bool = False) -> list[dict]:
+def findings(threads: list[dict], comments: list[dict]) -> list[dict]:
     threads, comments = review_snapshot(threads, comments)
     found = []
     for thread in threads:
@@ -112,15 +136,6 @@ def findings(threads: list[dict], comments: list[dict], strict_snapshot: bool = 
         except ValueError:
             continue
         if not isinstance(metadata, dict) or metadata.get("kind") != "bug":
-            continue
-        # REST supplies immutable numeric bot identity, absent from Actor above.
-        corroborated = [c for c in comments if c.get("id") == root.get("databaseId")
-                        and not c.get("in_reply_to_id")
-                        and bot(c.get("user") or {}, "devin-ai-integration[bot]", DEVIN_ID)
-                        and c.get("body") == body]
-        if len(corroborated) != 1:
-            if strict_snapshot:
-                raise ValueError("inconsistent GraphQL/REST finding snapshot")
             continue
         root_id = root.get("databaseId")
         if type(root_id) is int and root_id > 0:
@@ -151,15 +166,6 @@ def observation_roots(threads, comments, history, eligible):
             if len(matches) != 1 or len(rest) != 1:
                 raise ValueError("inconsistent tracked-root presence")
             thread, root = matches[0]
-            author = root.get("author") or {}
-            if (author.get("__typename") != "Bot"
-                    or author.get("login") not in {"devin-ai-integration", "devin-ai-integration[bot]"}
-                    or rest[0].get("in_reply_to_id")
-                    or not bot(rest[0].get("user") or {}, "devin-ai-integration[bot]", DEVIN_ID)
-                    or root.get("body") != rest[0].get("body")
-                    or type(thread.get("isResolved")) is not bool
-                    or type(thread.get("isOutdated")) is not bool):
-                raise ValueError("inconsistent tracked-root identity or state")
             state = ["inactive", root["body"], thread["isResolved"], thread["isOutdated"]]
             thread_id = str(thread.get("id") or "")
         states[root_id] = {"root": root_id, "fingerprint": digest(json.dumps(state, separators=(",", ":"))),
@@ -403,7 +409,7 @@ def live_state(repo: str, number: str, head: str, history=None, record=None) -> 
         return permissions[login]
 
     threads, review_comments = review_snapshot(threads, pages(f"repos/{repo}/pulls/{number}/comments"))
-    eligible = findings(threads, review_comments, strict_snapshot=True)
+    eligible = findings(threads, review_comments)
     history = pages(f"repos/{repo}/issues/{number}/comments") if history is None else history
     history = unique_snapshot(history)
     states = observation_roots(threads, review_comments, history, eligible)

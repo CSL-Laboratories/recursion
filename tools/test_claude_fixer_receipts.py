@@ -220,7 +220,7 @@ class ReceiptTests(unittest.TestCase):
                         threads = [] if current is None else [current]
                         data = {"data": {"repository": {"pullRequest": {"reviewThreads": {
                             "nodes": threads, "pageInfo": {"hasNextPage": False}}}}}}
-                        rest = root_comments(threads) + [receipt] if rest_override is None else rest_override
+                        rest = root_comments(threads) + ([receipt] if current is not None else []) if rest_override is None else rest_override
                         def record(body):
                             history.append({"id": len(history) + 1, "body": body,
                                 "user": actor("github-actions[bot]", m.ACTIONS_ID)})
@@ -248,6 +248,53 @@ class ReceiptTests(unittest.TestCase):
         # Untracked inactive roots are not enrolled or authorized by this repair.
         inactive = thread("not a bug")
         self.assertEqual(m.observation_roots([inactive], root_comments([inactive]), [], []), [])
+
+    def test_cross_view_consistency_before_all_eligibility_filters(self):
+        valid = thread()
+        rest = root_comments([valid])
+        other_author = {"login": "someone", "__typename": "User"}
+        variants = [
+            thread("metadata removed"), thread('<!-- devin-review-comment {broken} -->'),
+            thread('<!-- devin-review-comment {"kind":"analysis"} -->'),
+            valid | {"comments": {"nodes": [valid["comments"]["nodes"][0] | {"author": other_author}]}},
+            valid | {"comments": {"nodes": [valid["comments"]["nodes"][0] | {"author": None}]}},
+        ]
+        for changed in variants:
+            for flags in ({}, {"isResolved": True}, {"isOutdated": True}):
+                for history in ([], self.history):
+                    payload = {"data": {"repository": {"pullRequest": {"reviewThreads": {
+                        "nodes": [changed | flags], "pageInfo": {"hasNextPage": False}}}}}}
+                    with self.subTest(changed=changed, flags=flags, tracked=bool(history)), \
+                            patch.object(m.subprocess, "check_output", return_value=json.dumps(payload)), \
+                            patch.object(m, "pages", return_value=rest), patch.object(m, "api") as api, \
+                            patch.object(m, "post") as post:
+                        with self.assertRaises(ValueError):
+                            m.live_state("o/r", "1", C, history=history)
+                        api.assert_not_called()
+                        post.assert_not_called()
+        for threads, comments in (([], rest), ([valid], []),
+                ([valid], [rest[0] | {"in_reply_to_id": 2}]),
+                ([valid], rest + [{"id": 2, "in_reply_to_id": 99}]),
+                ([valid], rest + [{"id": 2, "in_reply_to_id": True}]),
+                ([valid], rest + [{"id": 2, "in_reply_to_id": 0}]),
+                ([valid], rest + [{"id": 2, "in_reply_to_id": 2}]),
+                ([valid | {"comments": {"nodes": []}}], []),
+                ([valid | {"isResolved": None}], rest),
+                ([valid | {"isOutdated": 0}], rest)):
+            with self.subTest(threads=threads, comments=comments), self.assertRaises(ValueError):
+                m.review_snapshot(threads, comments)
+        # Matching non-Devin and inactive roots are consistent, but never work.
+        untrusted = valid | {"comments": {"nodes": [valid["comments"]["nodes"][0] | {"author": other_author}]}}
+        user_rest = [rest[0] | {"user": {"login": "someone", "type": "User", "id": 15}}]
+        self.assertEqual(m.findings([untrusted], user_rest), [])
+        for inactive in (thread("malformed"), valid | {"isResolved": True}, valid | {"isOutdated": True}):
+            self.assertEqual(m.findings([inactive], root_comments([inactive])), [])
+        # Suffix normalization applies only to Bot identities.
+        suffixed = valid | {"comments": {"nodes": [valid["comments"]["nodes"][0] | {
+            "author": {"login": "devin-ai-integration[bot]", "__typename": "Bot"}}]}}
+        self.assertTrue(m.findings([suffixed], rest))
+        with self.assertRaises(ValueError):
+            m.review_snapshot([untrusted], [user_rest[0] | {"user": user_rest[0]["user"] | {"login": "someone[bot]"}}])
 
     def test_duplicate_identity_validation_precedes_all_filters(self):
         root = thread()
@@ -395,14 +442,17 @@ class ReceiptTests(unittest.TestCase):
     def test_root_requires_rest_numeric_bot_identity(self):
         roots = root_comments([thread()])
         self.assertTrue(m.findings([thread()], roots))
-        self.assertEqual(m.findings([thread()], []), [])
+        with self.assertRaises(ValueError):
+            m.findings([thread()], [])
         for change in ({"id": 9}, {"type": "User"}, {"login": "fake[bot]"}):
             fake = [{**roots[0], "user": roots[0]["user"] | change}]
-            self.assertEqual(m.findings([thread()], fake), [])
-        self.assertEqual(m.findings([thread()], [roots[0] | {"body": "changed"}]), [])
+            with self.assertRaises(ValueError):
+                m.findings([thread()], fake)
+        with self.assertRaises(ValueError):
+            m.findings([thread()], [roots[0] | {"body": "changed"}])
         for snapshot in ([], [roots[0] | {"body": "changed"}]):
             with self.assertRaises(ValueError):
-                m.findings([thread()], snapshot, strict_snapshot=True)
+                m.findings([thread()], snapshot)
 
     def test_late_older_root_survives_prior_push(self):
         old = thread(root=1)

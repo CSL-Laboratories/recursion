@@ -385,6 +385,12 @@ to eligible state cannot reuse its pre-inactivation generation. Before filtering
 thread IDs, root-to-thread identity and REST comment IDs are validated. Exact
 identical pagination overlaps deduplicate; conflicting duplicates abort before
 journal writes or eligibility decisions, including inactive and untrusted variants.
+Every GraphQL root must corroborate a REST top-level root with matching body and
+actor identity before filtering; the root sets must match in both directions.
+Empty threads, missing/deleted authors, invalid flags, and dangling reply parents
+fail closed as inconsistent snapshots. API lag is retried by a later invocation,
+never interpreted as a clean finding set. Matching inactive/non-Devin roots stay
+ineligible. A tracked tombstone requires absence from both complete views.
 
 The snapshot binds meaningful trusted follow-up comment IDs, author IDs and
 body digests. Exact unchanged content retains its previously authenticated

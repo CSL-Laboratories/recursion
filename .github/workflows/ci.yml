@@ -27,9 +27,10 @@
 # / dispatch / master push. Discord `/ci full` retriggers.
 #
 # Non-draft pull_request synchronize waits 120s on free GitHub-hosted Ubuntu
-# before Blacksmith jobs start. A newer push cancels this run (same concurrency
-# group) during that wait, so superseded heads never bill. Other events do not
-# wait: settle is skipped and linux/windows still run via always() && !cancelled().
+# before Blacksmith jobs start. A newer push can cancel this run in that wait.
+# Cancellation after a paid job starts cannot recover elapsed cost. Label and
+# manual lanes are independent. Other events deliberately skip settle; explicit
+# status/dependency guards allow the selected platform jobs.
 name: CI
 
 on:

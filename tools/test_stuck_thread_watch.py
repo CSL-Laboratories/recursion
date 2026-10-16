@@ -1031,19 +1031,23 @@ class WorkflowAndDocsTests(unittest.TestCase):
             self.assertIn("one watcher cycle", text)
             self.assertIn("the PR author files it", text)
             self.assertIn("<!-- stuck-pr-threads:recursion#<PR> -->", text)
-            self.assertIn("Branch naming is deferred to", text)
-            self.assertIn("pull/189", text)
             self.assertIn("csl-<N>-<slug>", text)
+            self.assertIn("Fixes CSL-N", text)
             self.assertNotIn("Commit to `loop/work/<task-id>`", text)
+            self.assertNotIn("Branch naming is deferred to", text)
         self.assertIn(".github/workflows/stuck-thread-watch.yml", self.agents)
         self.assertIn(
             "AGENTS.md#when-claude-cant-fix-a-review-thread", self.contributing
         )
-        self.assertIn("Branch naming is deferred to", self.contributing)
-        self.assertIn("pull/189", self.contributing)
+        self.assertIn("csl-<N>-<slug>", self.contributing)
+        self.assertIn("Fixes CSL-N", self.contributing)
         self.assertNotIn("keep this convention", self.contributing)
+        self.assertNotIn("Branch naming is deferred to", self.contributing)
         template = (ROOT / ".github" / "pull_request_template.md").read_text(encoding="utf-8")
         self.assertIn("Stuck PR threads: recursion#<PR>", template)
+        self.assertIn("## Branch", template)
+        self.assertIn("## Test plan", template)
+        self.assertIn("Touches other repos?", template)
 
     def test_workflow_is_lightweight_and_configurable(self) -> None:
         text = self.workflow

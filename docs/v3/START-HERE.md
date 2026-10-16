@@ -69,9 +69,15 @@ renews merely because an agent opens a handoff.
 
 ## Starting a bounded development task
 
-Use a fresh fetched, clean review worktree and record its full commit. On Windows,
-this repository has paths exceeding 260 characters; use `git -c core.longpaths=true`
-for checkout and status/diff operations when needed. This is a per-command option.
+Use a fresh fetched, clean review worktree and record its full commit. Name the review
+branch `csl-<N>-<slug>`, optionally prefixed with a GitHub username
+(`chaandansaini101/csl-<N>-<slug>`). Put `CSL-N` in the PR title. pr-lint matches
+`CSL-[0-9]+` case-sensitively, so a lowercase branch name alone does not pass. The
+`CSL-N` key in the PR title satisfies the check.
+
+On Windows, this repository has paths exceeding 260 characters; use
+`git -c core.longpaths=true` for checkout and status/diff operations when needed.
+This is a per-command option.
 
 Before inference or writes, bind the task to:
 

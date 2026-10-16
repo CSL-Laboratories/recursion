@@ -74,6 +74,11 @@ Stop and write to `state/INBOX.md` when a task is ambiguous, needs a decision no
 language, store, framework or sandbox from a research recommendation. Keep evidence classes
 distinct: source-documented, locally observed, inferred and unmeasured are different things.
 
+## Recorded decisions
+
+Before proposing architecture or direction, read `docs/adr/` and the linked
+decision issues; do not re-argue a recorded decision without new evidence.
+
 ## Style
 
 Plain markdown. Dates as `YYYY-MM-DD`. Keep files skimmable — anything not reread is dead
@@ -133,10 +138,12 @@ not decide.
 
 **Filing and shipping.**
 
-- Branch naming is deferred to [#189](https://github.com/CSL-Laboratories/recursion/pull/189)
-  (CSL-76).
-- PR title includes `CSL-N` so Linear auto-links (example: `CSL-26: ...`). Put `Fixes CSL-N`
-  in the PR body — that links the PR, and merging moves the issue to **Done** automatically.
+- Branch from up-to-date `master` as `csl-<N>-<slug>` (example: `csl-26-short-slug`).
+  A GitHub username prefix is optional (`chaandansaini101/csl-26-short-slug`).
+- PR title includes `CSL-N` so Linear auto-links. pr-lint matches `CSL-[0-9]+`
+  case-sensitively, so a lowercase branch name alone does not pass. The `CSL-N`
+  key in the PR title satisfies the check. Put `Fixes CSL-N` in the PR body —
+  that links the PR, and merging moves the issue to **Done** automatically.
 - One issue per PR; keep PRs small and stackable.
 - Comment progress on the issue. If the PR does not move the issue to **In Review**, move
   it yourself.

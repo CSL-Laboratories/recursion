@@ -62,8 +62,7 @@ For a research or evidence task:
 ## Linear workflow
 
 Work starts in Linear (team **CSL**, project **recursion**), not as a GitHub issue. When you
-start, assign yourself and move the issue to **In Progress**. Branch naming is deferred to
-[#189](https://github.com/CSL-Laboratories/recursion/pull/189) (CSL-76). Title the PR
+start, assign yourself and move the issue to **In Progress**. Title the PR
 `CSL-N: ...` and include `Fixes CSL-N` in the body — that links the PR, and merging moves
 the issue to **Done** automatically. If the PR does not move the issue to **In Review**,
 move it yourself.
@@ -77,7 +76,11 @@ See [AGENTS.md#when-claude-cant-fix-a-review-thread](AGENTS.md#when-claude-cant-
 
 ## Branch and review flow
 
-- Branch from up-to-date `master`: `loop/work/<task-id>` for build output.
+- Branch from up-to-date `master` as `csl-<N>-<slug>` (example `csl-26-short-slug`).
+  A GitHub username prefix is optional (`chaandansaini101/csl-26-short-slug`).
+- Put `CSL-N` in the PR title. pr-lint matches `CSL-[0-9]+` case-sensitively, so a
+  lowercase branch name alone does not pass. The `CSL-N` key in the PR title
+  satisfies the check.
 - Never commit to `master` directly and never force-push.
 - Open a PR for review. **Lucas merges every review branch himself**; an automated run only
   ever produces a review branch.

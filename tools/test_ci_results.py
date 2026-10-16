@@ -29,8 +29,8 @@ class AggregateTests(unittest.TestCase):
     def test_event_and_docs_selection(self):
         for event, full, run in itertools.product(['pull_request', 'push', 'workflow_dispatch', 'merge_group'],
                                                  [True, False], ['true', 'false']):
-            win = run == 'true' and (event != 'pull_request' or full)
-            mac = run == 'true' and (event in {'workflow_dispatch', 'merge_group'} or (event == 'pull_request' and full))
+            win = run == 'true'
+            mac = run == 'true' and event != 'push'
             args = needs(windows='success' if win else 'skipped', macos='success' if mac else 'skipped',
                          run=run, classification='full' if run == 'true' else 'docs-only')
             self.assertTrue(validate(args, event=event, full=full), (event, full, run))
@@ -40,6 +40,18 @@ class AggregateTests(unittest.TestCase):
                     mutated = json.loads(json.dumps(args))
                     mutated[job]['result'] = result
                     self.assertFalse(validate(mutated, event=event, full=full))
+
+    def test_no_delayed_linux_only_run_can_weaken_full_coverage(self):
+        # A label arriving after an ordinary run must feed this same aggregate.
+        # Neither absent label snapshots nor reruns may approve skipped OS jobs.
+        for action, full in itertools.product(['opened', 'ready_for_review', 'labeled', 'synchronize'], [False, True]):
+            settle = 'success' if action == 'synchronize' else 'skipped'
+            for windows, macos in itertools.product(['success', 'failure', 'pending', 'cancelled', 'skipped', ''], repeat=2):
+                args = needs(settle=settle, windows=windows, macos=macos)
+                self.assertEqual(validate(args, event='pull_request', action=action, full=full),
+                                 windows == macos == 'success', (action, full, windows, macos))
+        self.assertTrue(validate(needs(windows='skipped', macos='skipped', run='false', classification='docs-only'),
+                                 event='pull_request', action='labeled', full=True))
 
     def test_docs_requires_explicit_verified_classification(self):
         for run, classification in itertools.product(['false', '', 'true'], ['', 'docs-only', 'full']):
@@ -56,7 +68,7 @@ class AggregateTests(unittest.TestCase):
         text = (ROOT / '.github/workflows/ci.yml').read_text()
         aggregate = text.split('  platform-gates:\n')[1]
         self.assertIn('needs: [settle, linux, windows, macos]', aggregate)
-        self.assertIn('if: always()', aggregate)
+        self.assertIn('always()', aggregate)
         self.assertIn('if: cancelled()\n        run: exit 1', aggregate)
         self.assertIn('CI_NEEDS: ${{ toJSON(needs) }}', aggregate)
         required_linux = text.split('  linux:\n', 1)[1].split('  windows:\n', 1)[0]

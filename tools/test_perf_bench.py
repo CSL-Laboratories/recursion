@@ -217,19 +217,18 @@ class WorkflowTests(unittest.TestCase):
         text = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
         preamble = text.split("jobs:", 1)[0]
         self.assertNotIn("linux-label-skip:", text)
-        self.assertIn("types: [opened, synchronize, reopened, ready_for_review]", preamble)
-        self.assertNotIn("types: [opened, synchronize, reopened, ready_for_review, labeled", preamble)
+        self.assertIn("types: [opened, synchronize, reopened, ready_for_review, labeled]", preamble)
         self.assertNotRegex(preamble, r"(?m)^if:")
         self.assertIn("ready_for_review", preamble)
         self.assertIn(
-            "ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}",
+            "github.event.pull_request.number || github.ref }}",
             preamble,
         )
         self.assertIn("cancel-in-progress: true", preamble)
         self.assertNotIn("label-churn", text)
-        self.assertEqual(text.count("name: linux\n"), 1)
+        self.assertIn("\'ignored-label-linux\' || \'linux\'", text)
         settle = text[text.index("  settle:\n") : text.index("  linux-tests:\n")]
-        self.assertIn("name: settle", settle)
+        self.assertIn("\'ignored-label-settle\' || \'settle\'", settle)
         self.assertIn("runs-on: ubuntu-latest", settle)
         self.assertIn("sleep 120", settle)
         self.assertIn("github.event.action == 'synchronize'", settle)
@@ -240,44 +239,14 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("needs: settle", linux)
         self.assertIn("always() && !cancelled()", linux)
         self.assertIn("needs.settle.result == 'success'", linux)
-        self.assertNotIn("github.event.action != 'labeled'", linux)
+        self.assertIn("github.event.action != 'labeled'", linux)
         windows = text[text.index("  windows:") : text.index("  macos:")]
         self.assertIn("needs: [settle, linux]", windows)
         self.assertIn("always() && !cancelled()", windows)
         self.assertIn("needs.linux.result == 'success'", windows)
         self.assertIn("'ci:full'", windows)
-        label_wf = (ROOT / ".github" / "workflows" / "ci-full-label.yml").read_text(
-            encoding="utf-8"
-        )
-        on_block = label_wf[label_wf.index("on:") : label_wf.index("concurrency:")]
-        self.assertIn("types: [labeled]", on_block)
-        self.assertNotIn("unlabeled", on_block)
-        self.assertNotRegex(label_wf, r"(?m)^  linux:")
-        self.assertNotRegex(label_wf, r"(?m)^  windows:")
-        self.assertNotRegex(label_wf, r"(?m)^  macos:")
-        self.assertNotIn("name: linux", label_wf)
-        self.assertNotIn("name: windows", label_wf)
-        self.assertNotIn("name: macos", label_wf)
-        self.assertIn("name: ci-full-extra-os", label_wf)
-        self.assertIn("github.event.label.name == 'ci:full'", label_wf)
-        self.assertIn("uses: ./.github/workflows/ci-full-matrix.yml", label_wf)
-        self.assertNotIn("needs: linux", label_wf)
-        for line in label_wf.splitlines():
-            if line.lstrip().startswith("run:"):
-                self.assertNotIn(
-                    "github.event.label.name",
-                    line,
-                    "label name must not enter a shell step",
-                )
-        matrix_wf = (ROOT / ".github" / "workflows" / "ci-full-matrix.yml").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn("workflow_call:", matrix_wf)
-        self.assertNotRegex(matrix_wf, r"(?m)^  linux:")
-        self.assertNotIn("name: linux", matrix_wf)
-        self.assertIn("name: windows", matrix_wf)
-        self.assertIn("name: macos", matrix_wf)
-        self.assertNotIn("needs: linux", matrix_wf)
+        self.assertFalse((ROOT / '.github/workflows/ci-full-label.yml').exists())
+        self.assertFalse((ROOT / '.github/workflows/ci-full-matrix.yml').exists())
         pr_lint = (ROOT / ".github" / "workflows" / "pr-lint.yml").read_text(encoding="utf-8")
         self.assertIn("runs-on: ubuntu-latest", pr_lint)
         self.assertNotIn("blacksmith", pr_lint)

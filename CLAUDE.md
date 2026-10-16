@@ -214,7 +214,8 @@ label, not by editing config.
   to mediate Devin threads Claude could not settle. A **MEDIATE** verdict
   updates one Linear roll-up per PR (`Stuck PR threads: recursion#<PR>`), not
   one issue per thread. Codex is a mediator, not a reviewer of record and not
-  a fixer: it must not push code.
+  a fixer: it must not push code. The workflow may auto-resolve a thread after
+  a trusted `CODEX-THREAD: RESOLVE` ruling (see [Review loop](#review-loop)).
 - **Blacksmith** is the only CI.
 - Cursor, Codex, Grok, and interactive Claude Code develop features from Linear
   issues. They must not post review verdicts or run review-fix loops on other
@@ -243,9 +244,20 @@ Linear Triage roll-up per PR titled `Stuck PR threads: recursion#<PR>`, labeled
 `needs-decision`, with a checklist of stuck threads (update that issue; do not
 file one issue per thread). The watcher skips drafts, merged/closed PRs, and
 PRs that are approved on the current head with green checks. It cancels the
-roll-up when the PR merges or every stuck thread is resolved. Humans decide.
-Caps: one mediation per thread, three per PR per UTC day. The watcher never
-resolves threads, pushes, or merges.
+roll-up when the PR merges or every stuck thread is resolved. Codex is asked
+to emit a per-thread `CODEX-THREAD: RESOLVE|DECIDE|MISSING|AMBIGUOUS` block
+plus the inspected `HEAD` SHA. If the ruling is `RESOLVE`, that SHA is the
+PR's current head, and required checks on that head are green, the watcher
+replies on the thread citing the ruling and SHA, then resolves it
+(`resolveReviewThread` via `CODEX_TRIGGER_PAT` — the same user token that
+posted `@codex review`. `github.token` stays `pull-requests: read` and
+would otherwise attribute the resolve to `github-actions[bot]`).
+`DECIDE`, `MISSING`, `AMBIGUOUS`, a stale HEAD, or pending/failing
+required checks stay on the needs-decision path. Human-authored threads
+are never resolved unless Codex was explicitly asked about them (trusted
+mediation marker or a human `@codex review` that names the thread id).
+Caps: one mediation per thread and one auto-resolve per thread; three of
+each per PR per UTC day. The watcher never pushes or merges.
 
 Before merging any PR, check Linear for an open `Stuck PR threads: recursion#<PR>`
 issue tied to it, and resolve the checklist or record the decision first. If no

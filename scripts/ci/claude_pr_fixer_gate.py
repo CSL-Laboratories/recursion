@@ -161,7 +161,7 @@ def evaluate(
         and open_same_writer
         and (review.get("user") or {}).get("login") == DEVIN_BOT
         and (review.get("user") or {}).get("type") == "Bot"
-        and safe_head_sha(review.get("commit_id")) == head_sha
+        and safe_head_sha(review.get("commit_id"))
         and str(review.get("state") or "").lower() in DEVIN_STATES
     ):
         devin = "true"

@@ -130,7 +130,7 @@ def request_comment_body(sha: str) -> str:
     return (
         f"{gate_marker(sha)}\n"
         "@codex review\n\n"
-        "Follow **Code Review Rules** in AGENTS.md. End this review with exactly "
+        "Follow **Code Review Rules** in AGENTS.md. When ready or needing human mediation, end with exactly "
         "one of these lines as the last line of the review body (not in a code fence):\n\n"
         "CODEX-GATE: READY\n"
         "CODEX-GATE: MEDIATE\n\n"

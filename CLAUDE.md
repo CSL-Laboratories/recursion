@@ -211,7 +211,9 @@ label, not by editing config.
   author has write, maintain or admin repository permission. `@claude` also
   requires a human commenter with that permission. Association is audit-only:
   private org members may appear as CONTRIBUTOR. Forks and nonwriters are skipped.
-  Submitted Devin bot reviews on the current head start the fixer directly;
+  Submitted Devin bot reviews wake the fixer directly; under the PR lock it
+  refreshes the live head and reconciles unresolved, non-outdated findings,
+  including roots on older commits.
   Codex never dispatches fixes. Every fixer shares the per-PR
   concurrency group, without cancelling an active run. Native `queue: max`
   retains up to 100 pending writers in queue-entry order; further arrivals are
@@ -275,7 +277,7 @@ as the first line of the description.
 
 Codex GitHub reviews route CI readiness and human mediation (CSL-102/CSL-201),
 not fixes. Devin remains reviewer of record; Devin and human requests trigger
-Claude. When ready or needing human mediation, end the Codex review with one
+Claude. When ready or needing human mediation, end the Codex review with exactly one
 of these lines (not in a code fence or only an inline comment):
 
 CODEX-GATE: READY

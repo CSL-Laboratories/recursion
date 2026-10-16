@@ -94,6 +94,12 @@ class MarkerAndVerdictTests(unittest.TestCase):
         for verdict in ("READY", "MEDIATE"):
             self.assertIn(f"CODEX-GATE: {verdict}", body)
 
+    def test_request_verdict_instruction_is_conditional(self) -> None:
+        body = gate.request_comment_body(SHA)
+        self.assertIn("When ready or needing human mediation, end with exactly one", body)
+        self.assertIn("report pending without a verdict", body)
+        self.assertNotIn("End this review with exactly", body)
+
     def test_only_terminal_actions_deduplicate(self) -> None:
         for body in (gate.acted_marker(SHA), gate.acted_comment_body(SHA, "FIX"), f"{gate.acted_marker(SHA)}\nCodex gate: dispatching batched Devin review fixer (timeout) on 2026-10-15."):
             self.assertFalse(gate.has_terminal_action(SHA, [body]))

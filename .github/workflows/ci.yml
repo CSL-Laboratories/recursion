@@ -40,6 +40,8 @@ on:
   workflow_dispatch:
 
 concurrency:
+  # Ordinary PR runs share a group across heads. Label and manual dispatch
+  # lanes are separate; a PR push does not cancel those independently requested runs.
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
@@ -67,7 +69,11 @@ jobs:
   linux:
     name: linux
     needs: settle
-    if: always() && !cancelled()
+    if: >
+      always() && !cancelled() &&
+      (needs.settle.result == 'success' ||
+       (needs.settle.result == 'skipped' &&
+        !(github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.draft == false)))
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 15
     outputs:
@@ -131,6 +137,9 @@ jobs:
     needs: [settle, linux]
     if: >
       always() && !cancelled() &&
+      (needs.settle.result == 'success' ||
+       (needs.settle.result == 'skipped' &&
+        !(github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.draft == false))) &&
       needs.linux.result == 'success' &&
       needs.linux.outputs.run_full == 'true' &&
       (github.event_name == 'push' ||
@@ -163,8 +172,12 @@ jobs:
   # lives in ci-macos-nightly.yml (07:17 UTC, skipped if no commits in 24h).
   macos:
     name: macos
-    needs: linux
+    needs: [settle, linux]
     if: >
+      always() && !cancelled() &&
+      (needs.settle.result == 'success' ||
+       (needs.settle.result == 'skipped' &&
+        !(github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.draft == false))) &&
       needs.linux.result == 'success' &&
       needs.linux.outputs.run_full == 'true' &&
       (github.event_name == 'workflow_dispatch' ||

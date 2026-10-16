@@ -239,7 +239,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("runs-on: blacksmith-2vcpu-ubuntu-2404", linux)
         self.assertIn("needs: settle", linux)
         self.assertIn("always() && !cancelled()", linux)
-        self.assertNotIn("github.event.pull_request.draft", linux)
+        self.assertIn("needs.settle.result == 'success'", linux)
         self.assertNotIn("github.event.action != 'labeled'", linux)
         windows = text[text.index("  windows:") : text.index("  macos:")]
         self.assertIn("needs: [settle, linux]", windows)

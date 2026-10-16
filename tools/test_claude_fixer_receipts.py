@@ -202,6 +202,65 @@ class ReceiptTests(unittest.TestCase):
         replaced = follow | {"user": {"id": 13, "login": "other", "type": "User"}}
         self.assertNotEqual(current["observation"], prepare(findings([thread()]), [replaced], history, lambda _: "read")[0]["observation"])
 
+    def test_live_state_journals_ineligible_and_missing_roots_before_filtering(self):
+        original_thread = thread()
+        variants = [
+            thread("metadata removed"), thread('<!-- devin-review-comment {broken} -->'),
+            thread('<!-- devin-review-comment {"kind":"analysis"} -->'),
+            original_thread | {"isResolved": True}, original_thread | {"isOutdated": True},
+            None,
+        ]
+        for status in ("addressed", "needs-human"):
+            for inactive in variants:
+                with self.subTest(status=status, inactive=inactive):
+                    history = []
+                    original = prepare(findings([original_thread]), history=history)[0]
+                    receipt = reply({**self.receipt, **original, "status": status})
+                    def observe(current, rest_override=None):
+                        threads = [] if current is None else [current]
+                        data = {"data": {"repository": {"pullRequest": {"reviewThreads": {
+                            "nodes": threads, "pageInfo": {"hasNextPage": False}}}}}}
+                        rest = root_comments(threads) + [receipt] if rest_override is None else rest_override
+                        def record(body):
+                            history.append({"id": len(history) + 1, "body": body,
+                                "user": actor("github-actions[bot]", m.ACTIONS_ID)})
+                        with patch.object(m.subprocess, "check_output", return_value=json.dumps(data)),                                 patch.object(m, "pages", return_value=rest),                                 patch.object(m, "api", return_value={"status": "ahead", "permission": "write"}):
+                            return m.live_state("o/r", "1", C, history=history, record=record)
+                    self.assertEqual(observe(inactive), ([], []))
+                    self.assertEqual(len(history), 2)
+                    active, unresolved = observe(original_thread)
+                    self.assertTrue(active)
+                    self.assertTrue(unresolved)
+                    self.assertNotEqual(active[0]["generation"], original["generation"])
+                    self.assertEqual(len(history), 3)
+                    # Unchanged active replay does not keep consuming generations.
+                    self.assertEqual(observe(original_thread), (active, unresolved))
+                    self.assertEqual(len(history), 3)
+                    # Contradictory views must not invent clean absence.
+                    with self.assertRaises(ValueError):
+                        observe(None, root_comments([original_thread]) + [receipt])
+                    with self.assertRaises(ValueError):
+                        observe(original_thread, [receipt])
+                    wrong = root_comments([original_thread])
+                    wrong[0]["body"] = "inconsistent"
+                    with self.assertRaises(ValueError):
+                        observe(original_thread, wrong + [receipt])
+        # Untracked inactive roots are not enrolled or authorized by this repair.
+        inactive = thread("not a bug")
+        self.assertEqual(m.observation_roots([inactive], root_comments([inactive]), [], []), [])
+
+    def test_inactive_state_tracks_body_and_flags_without_authorizing_work(self):
+        history = []
+        prepare(findings([thread()]), history=history)
+        generations = []
+        for inactive in (thread() | {"isResolved": True},
+                         thread("different inactive body") | {"isResolved": True},
+                         thread("different inactive body") | {"isOutdated": True}):
+            self.assertEqual(findings([inactive]), [])
+            states = m.observation_roots([inactive], root_comments([inactive]), history, [])
+            generations.append(prepare(states, history=history)[0]["generation"])
+        self.assertEqual(len(set(generations)), 3)
+
     def test_exact_human_confirmation_only_settles_specific_live_intent(self):
         intent = {"nonce": "a" * 32, "head": A, "after": 0}
         comments = [{"body": m.marker("ci-intent", intent), "user": actor("github-actions[bot]", m.ACTIONS_ID)}]
@@ -321,7 +380,7 @@ class AttemptTests(unittest.TestCase):
 
     def runtime(self, count, manual=False, post_error=False, loop_count="0", clean=False, compare_error=None):
         threads = {"data": {"repository": {"pullRequest": {"reviewThreads": {
-            "nodes": [] if clean else [thread()], "pageInfo": {"hasNextPage": False}}}}}}
+            "nodes": [thread() | {"isResolved": True}] if clean else [thread()], "pageInfo": {"hasNextPage": False}}}}}}
         def api_response(path):
             if "/compare/" in path and compare_error:
                 raise compare_error
@@ -341,12 +400,14 @@ class AttemptTests(unittest.TestCase):
                 self.assertFalse((Path(d) / "out").exists())
                 return "", post.call_count
             m.main()
+            if clean:
+                self.assertTrue(all("claude-fixer-observation:" in call.args[2] for call in post.call_args_list))
             return (Path(d) / "out").read_text(), post.call_count
 
     def test_clean_findings_before_commit_cap_and_manual_cannot_bypass(self):
         output, posts = self.runtime(0, loop_count="8", clean=True)
         self.assertIn("no-pending-findings", output)
-        self.assertEqual(posts, 0)
+        self.assertEqual(posts, 1)  # Persist inactive transition, never a cap or attempt.
         for manual in (False, True):
             output, posts = self.runtime(0, loop_count="8", manual=manual)
             self.assertIn("loop-commit-limit", output)

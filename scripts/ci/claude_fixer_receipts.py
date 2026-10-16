@@ -91,6 +91,43 @@ def findings(threads: list[dict], comments: list[dict], strict_snapshot: bool = 
     return sorted(found, key=lambda item: item["root"])
 
 
+def observation_roots(threads, comments, history, eligible):
+    """Track inactive previously observed roots without making them actionable."""
+    tracked = {entry["root"] for comment in history
+               if bot(comment.get("user") or {}, "github-actions[bot]", ACTIONS_ID)
+               for entry in records(str(comment.get("body") or ""), "observation")
+               if type(entry.get("root")) is int and entry["root"] > 0}
+    states = {item["root"]: item for item in eligible}
+    for root_id in sorted(tracked - set(states)):
+        matches = []
+        for thread in threads:
+            nodes = (thread.get("comments") or {}).get("nodes") or []
+            if nodes and nodes[0].get("databaseId") == root_id:
+                matches.append((thread, nodes[0]))
+        rest = [c for c in comments if c.get("id") == root_id]
+        if not matches and not rest:
+            state = ["missing", root_id]
+            thread_id = ""
+        else:
+            if len(matches) != 1 or len(rest) != 1:
+                raise ValueError("inconsistent tracked-root presence")
+            thread, root = matches[0]
+            author = root.get("author") or {}
+            if (author.get("__typename") != "Bot"
+                    or author.get("login") not in {"devin-ai-integration", "devin-ai-integration[bot]"}
+                    or rest[0].get("in_reply_to_id")
+                    or not bot(rest[0].get("user") or {}, "devin-ai-integration[bot]", DEVIN_ID)
+                    or root.get("body") != rest[0].get("body")
+                    or type(thread.get("isResolved")) is not bool
+                    or type(thread.get("isOutdated")) is not bool):
+                raise ValueError("inconsistent tracked-root identity or state")
+            state = ["inactive", root["body"], thread["isResolved"], thread["isOutdated"]]
+            thread_id = str(thread.get("id") or "")
+        states[root_id] = {"root": root_id, "fingerprint": digest(json.dumps(state, separators=(",", ":"))),
+                           "thread": thread_id}
+    return sorted(states.values(), key=lambda item: item["root"])
+
+
 def substantive_followup(comment: dict, permission) -> bool:
     body = str(comment.get("body") or "").strip()
     # Quoting a prior receipt must not hide a new substantive correction.
@@ -326,11 +363,13 @@ def live_state(repo: str, number: str, head: str, history=None, record=None) -> 
         return permissions[login]
 
     review_comments = pages(f"repos/{repo}/pulls/{number}/comments")
-    roots = findings(threads, review_comments, strict_snapshot=True)
-    if roots:
-        history = pages(f"repos/{repo}/issues/{number}/comments") if history is None else history
-        roots = prepare_observations(roots, review_comments, history, permission,
-            record or (lambda body: post(repo, number, body)))
+    eligible = findings(threads, review_comments, strict_snapshot=True)
+    history = pages(f"repos/{repo}/issues/{number}/comments") if history is None else history
+    states = observation_roots(threads, review_comments, history, eligible)
+    observed = prepare_observations(states, review_comments, history, permission,
+        record or (lambda body: post(repo, number, body)))
+    eligible_ids = {item["root"] for item in eligible}
+    roots = [item for item in observed if item["root"] in eligible_ids]
     return (pending_findings(roots, review_comments, head, compare, permission, False),
             pending_findings(roots, review_comments, head, compare, permission, True))
 

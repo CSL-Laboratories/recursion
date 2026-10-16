@@ -376,7 +376,12 @@ the predecessor and current snapshot, so an observed added/deleted or
 changed/reverted reply or root body cannot revive an older receipt. Duplicate identical
 transitions reuse one generation; conflicting or incomplete histories fail closed
 for human investigation. READY and all fixer/manual writers share the same
-per-PR queue. Journal writes must succeed before a decision relies on them.
+per-PR queue. Journal writes must succeed before a decision relies on them. Previously tracked
+roots are reconciled before eligibility filtering, including malformed/removed
+or non-bug metadata, resolved/outdated flags and absence from both complete API
+views. Those inactive states advance history but never become fixer work.
+Contradictory GraphQL/REST presence or identity fails closed; restoring a root
+to eligible state cannot reuse its pre-inactivation generation.
 
 The snapshot binds meaningful trusted follow-up comment IDs, author IDs and
 body digests. Exact unchanged content retains its previously authenticated

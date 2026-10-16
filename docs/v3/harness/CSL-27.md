@@ -72,12 +72,13 @@ flowchart LR
 ```
 
 M1B route admission is unchanged and is not called here. Binding this broker
-to a schema-valid route decision is later work. Landing, worktrees, logs,
-and the other launch-critical adapters are later work.
+to a schema-valid route decision is later work. Worktrees and cooldowns stay
+later work. Land, clean, logs, and the remaining launch-critical adapters are
+[CSL-82](CSL-82.md).
 
 The behavior is ported from the standalone fork `CDanTheMan/recursion` at
-`5897a94` (v0.1.0) and cut down to this path. Fork-only landing, worktrees,
-cooldowns, and the extra adapters are not in this slice.
+`5897a94` (v0.1.0) and cut down to this path. This first slice did not land
+work. CSL-82 adds that, on top of this path, and it is still not the native loop.
 
 ## Fixes from the live fork run
 

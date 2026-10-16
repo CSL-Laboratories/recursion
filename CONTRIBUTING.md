@@ -26,9 +26,9 @@ issues and PRs.
 - Ground every implementation in the best available research: Parallel search for web
   research and Context7 for current library docs.
 
-Recursion is the supervision and execution control plane for a portfolio of projects. The
-current development target is **Recursion v3** — a provider-neutral agent platform. This
-page is the short path from "I want to help" to "my work can be reviewed and merged".
+Recursion is a **single product**: the v3 agent harness. This repository builds that
+provider-neutral agent platform; it does not supervise other repositories. This page is
+the short path from "I want to help" to "my work can be reviewed and merged".
 
 ## Start here
 

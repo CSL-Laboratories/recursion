@@ -1,8 +1,8 @@
 # Extra OS coverage when someone (or Codex READY) adds `ci:full`.
 # Must not define a job named `linux`, `windows`, or `macos`: a skipped
 # check is treated as success and would overlay a failed check of the
-# same name (CSL-202 / cockpit #149). Unrelated labels skip this caller
-# only; the reusable matrix is not instantiated.
+# same name (CSL-202). Unrelated labels skip this caller only; the
+# reusable matrix is not instantiated.
 # Main CI in ci.yml does not listen for labeled/unlabeled.
 name: CI full label
 

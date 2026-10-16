@@ -40,31 +40,20 @@ The new tests retain these distinctions, alongside the existing permission,
 same-repository, queue and readiness controls. CSL-89 owns resolution policy;
 this change does not enable new thread-resolution authority.
 
-Read-only #116 diagnosis (2026-10-16): run 38944245119 was a Codex event and
-returned `mention=false`, `devin=false`; author NotSkittlz had admin permission.
-Devin runs 38939609601 and 38936042436 reached preflight and skipped before
-reservation/model execution. Their findings 4297383409 and 4297144162 have
-`kind: analysis`, which the current automatic policy excludes. This establishes
-intake scope, not evidence that mediation displaced or starved Claude.
-
 ## Operational evidence and landing
 
-Historical cockpit #119/#142 pushes lost races to external writers; #142 run
-38884600543 also exceeded its configured turn limit. On 2026-10-16, cockpit
-#147 run 38944702649/job117120821057 successfully pushed
-`d5194ed085712b884a58938d8877926abeed8f75`, parent
-`ab7f04fc051800fb0200fbc9ce2d78447d3660b9`. Authenticated Claude reply
-4297849933 nevertheless used `commit: d5194ed`, which the strict parser rejects.
-That proves a genuine cockpit automatic push, not an accepted machine receipt
-or qualification of this new guard, recursion, or contested-writer recovery.
+The local regression suite proves controlled stale-head and post-check races,
+actual hook invocation, strict receipt parsing, and terminal audit fallback.
+It does not qualify this guard against a live provider or demonstrate a genuine
+autonomous remote fix, push and accepted receipt. That requires an existing
+eligible unresolved finding and a coordinated single writer. Do not manufacture
+events or reopen resolved findings for qualification.
 
-This work uses isolated branches. Cockpit landing is held until #116, #141 and
-#147 settle and merge (#153/#151 already merged). Refresh only this branch via
-ordinary base merges and repeat checks then; no rebase or force-push. Recursion
-has its own verified default base. Also reconcile any overlapping CSL-89 draft
-(cockpit #126 / recursion #197) before landing. Never modify another owner's lane.
+This work uses an isolated branch and verified default base. Landing remains
+held by the owner sequence recorded in CSL-201 and the PR. Refresh only this
+branch via ordinary base merges and repeat checks then; no rebase or force-push.
+Reconcile overlapping CSL-89 draft #197 before landing. Never modify another
+owner's lane. Cross-project operational evidence belongs in Linear and the PR.
 
 Sources: [Git pre-push contract](https://git-scm.com/docs/githooks#_pre_push),
-[Actions timeout syntax](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#jobsjob_idstepstimeout-minutes),
-[#116 Codex event](https://github.com/CSL-Laboratories/ai-investment-cockpit/actions/runs/38944245119),
-[#147 receipt](https://github.com/CSL-Laboratories/ai-investment-cockpit/pull/147#discussion_r4297849933).
+[Actions timeout syntax](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#jobsjob_idstepstimeout-minutes).

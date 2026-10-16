@@ -414,7 +414,7 @@ class HarnessTests(unittest.TestCase):
             enabled = {item["name"] for item in written["providers"] if item["enabled"]}
             self.assertEqual(enabled, {"fixture", "fixture-b"})
             self.assertEqual(written["budgets"]["max_input_tokens"], DEFAULT_MAX_INPUT_TOKENS)
-            self.assertIn(str(target), stdout.getvalue())
+            self.assertEqual(json.loads(stdout.getvalue())["path"], str(target))
 
     def test_windows_shim_resolves_and_posix_does_not(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -512,7 +512,7 @@ class HarnessTests(unittest.TestCase):
             )
             cwd = Path(str(seen["cwd"]))
             self.assertTrue(seen["allow_live"])
-            self.assertEqual(cwd, state / record["run_id"] / "workspace")
+            self.assertEqual(cwd, (state / record["run_id"] / "workspace").resolve())
             self.assertTrue(cwd.is_dir())
             self.assertEqual(record["workspace"], str(cwd))
             if os.name == "posix":

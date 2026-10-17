@@ -35,6 +35,9 @@ DONE = {"done", "accepted", "verified"}
 STAGES = {"intake": 0, "research": 1, "decision": 2, "development": 3,
           "verification": 4, "integration": 5, "release": 6}
 SUM_LINE = re.compile(r"^([0-9a-fA-F]{64})\s+\*?(.+)$")
+# A pinned-manifest entry naming an absolute path (POSIX, Windows-drive, or
+# UNC); such an entry is rejected as out-of-repository rather than joined.
+ABSOLUTE_ENTRY = re.compile(r"^(?:/|[A-Za-z]:[\\/]|\\\\)")
 
 # sha256-pinned text paths that landed before this guard and still lack
 # `.gitattributes` `text eol=lf` coverage (`.gitattributes` is a protected
@@ -52,6 +55,30 @@ PINNED_EOL_KNOWN_GAPS = frozenset({
     "docs/v3/research-lane/shared-contracts-20261002/Recursion_Shared_Contract_Reconciliation.md",
     "docs/v3/research-lane/shared-contracts-20261002/synthetic_benchmark_corpus.json",
 })
+
+# Whole packets whose top-level MANIFEST.json pins ordinary tracked text
+# files (for example overnight-20261002/CHANGELOG.md) that still lack
+# `.gitattributes` `text eol=lf` coverage. Grandfathered at the folder level
+# -- not by listing every one of the ~250 pinned files -- because
+# `.gitattributes` is a protected path (CSL-226) and the real fix is one
+# rule per folder, flagged for Lucas. A dir drains out of this set once its
+# own MANIFEST.json no longer pins any uncovered path there (a rule landed);
+# pinned_eol_errors then reports it stale so it can be removed.
+PINNED_EOL_KNOWN_GAP_DIRS = frozenset({
+    "docs/v3/research-lane/dot-ra-rd-20261002",
+    "docs/v3/research-lane/followups-20261002",
+    "docs/v3/research-lane/overnight-20261002",
+    "docs/v3/research-lane/scope-reframe-20261002",
+})
+
+# Packet check_intake.py layouts: (base for nested paths, prefix rewrites).
+# Root entries stay local. Unlisted packets use manifest-local paths only.
+MANIFEST_PATH_MAPPINGS = {
+    "dot-ra-rd-20261002": ("raw", {}),
+    "scope-reframe-20261002": ("raw", {}),
+    "overnight-20261002": ("", {}),
+    "followups-20261002": ("", {"FU04-machine-specifications": "machine"}),
+}
 
 
 def digest(value: Any) -> str:
@@ -282,14 +309,96 @@ def reference_errors(data: dict[str, Any]) -> list[str]:
     return errors
 
 
-def sha256_pinned_paths(data: dict[str, Any], root: Path) -> list[str]:
-    """Repo-relative text paths whose delivered bytes are sha256-pinned.
+def _safe_join(parent: Path, name: str, root: Path,
+              errors: list[str], source: str) -> Path | None:
+    """Join `name` onto `parent`, or None if `name` is an absolute path
+    (POSIX, Windows-drive, or UNC), escapes `root`, or cannot be resolved.
+    Append a deterministic diagnostic to `errors` on every rejection.
+
+    `root` must already be resolved by the caller. Joining pathlib.Path with
+    an absolute `name` silently discards `parent` instead of raising, and a
+    `..`-laden `name` can lexically still look like it is under `root`; both
+    are checked here so a malicious or malformed manifest entry is reported
+    as a validation error rather than crashing or escaping the repository.
+    """
+    if ABSOLUTE_ENTRY.match(name):
+        errors.append(f"{source} is outside the repository")
+        return None
+    try:
+        candidate = (parent / name).resolve()
+    except (RuntimeError, OSError, ValueError):
+        errors.append(f"{source} cannot be resolved")
+        return None
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        errors.append(f"{source} is outside the repository")
+        return None
+    return candidate
+
+
+def _manifest_payload_paths(manifest: Path, root: Path, errors: list[str]) -> list[Path]:
+    """Resolved, existing, in-root file paths pinned by one MANIFEST.json's
+    files[].path + sha256 entries.
+
+    Each entry is resolved the way its own packet's check_intake.py resolves
+    it: dot/scope nested paths go unconditionally under raw/, followups'
+    FU04-machine-specifications/ prefix becomes machine/, and overnight
+    paths stay local. Other manifests default to manifest-local paths.
+    There is no existence-based guessing between locations. Existing
+    payloads are included regardless of extension. Absent mapped copies
+    are skipped: existence is owned by the packet's check_intake.py, not
+    this validator. Rejected containment and resolution failures are
+    deterministic validation errors, including for omitted .docx originals.
+    """
+    manifest_rel = manifest.relative_to(root).as_posix()
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        errors.append(f"{manifest_rel}: inventory cannot be read")
+        return []
+    files = payload.get("files") if isinstance(payload, dict) else None
+    if not isinstance(files, list):
+        errors.append(f"{manifest_rel}: inventory requires a files list")
+        return []
+    nested_dir, prefixes = MANIFEST_PATH_MAPPINGS.get(manifest.parent.name, ("", {}))
+    resolved_paths: list[Path] = []
+    for index, entry in enumerate(files):
+        if not (isinstance(entry, dict) and text_present(entry.get("path"))
+                and sha256(entry.get("sha256"))):
+            errors.append(f"{manifest_rel}: files[{index}] requires path and sha256")
+            continue
+        name = entry["path"]
+        parent, mapped_name = manifest.parent, name
+        if "/" in name:
+            prefix, tail = name.split("/", 1)
+            if prefix in prefixes:
+                parent, mapped_name = parent / prefixes[prefix], tail
+            elif nested_dir:
+                parent = parent / nested_dir
+        source = f"{manifest_rel}: entry '{name}'"
+        candidate = _safe_join(parent, mapped_name, root, errors, source)
+        if candidate is not None and candidate.is_file():
+            resolved_paths.append(candidate)
+    return resolved_paths
+
+
+def _pinned_path_details(data: dict[str, Any], root: Path) -> tuple[list[str], frozenset[str], list[str]]:
+    """Repo-relative paths whose delivered bytes are sha256-pinned, the
+    subset of those derived from MANIFEST.json inventories, and any
+    deterministic resolution errors.
 
     Sources: program contracts hashed by this validator, intake SHA256SUMS
-    manifest payloads, and sealed receipts (byte-level evidence under
-    docs/audits). Whole-packet MANIFEST.json inventories are excluded: they
-    pin binary payloads where end-of-line conversion does not apply.
+    manifest payloads, whole-packet MANIFEST.json inventories (files[].path
+    + files[].sha256), and sealed receipts (byte-level evidence under
+    docs/audits). MANIFEST.json entries pin ordinary tracked text files too
+    (for example overnight-20261002/CHANGELOG.md), not only binary payloads,
+    so this enumeration includes them -- see PINNED_EOL_KNOWN_GAP_DIRS for
+    how pinned_eol_errors tolerates the four packets that still lack
+    `.gitattributes` coverage for them.
     """
+    root = root.resolve()
+    errors: list[str] = []
     paths: list[str] = []
     for contract in data.get("contracts", []):
         if isinstance(contract, dict) and text_present(contract.get("path")):
@@ -297,26 +406,102 @@ def sha256_pinned_paths(data: dict[str, Any], root: Path) -> list[str]:
     for manifest in sorted(root.glob("**/SHA256SUMS.txt")):
         if ".git" in manifest.relative_to(root).parts:
             continue
+        manifest_rel = manifest.relative_to(root).as_posix()
         for line in manifest.read_text(encoding="utf-8", errors="replace").splitlines():
             match = SUM_LINE.fullmatch(line.strip())
-            if match:
-                name = match.group(2).strip()
-                entry = manifest.parent / name
-                # Manifests written from their parent directory carry the
-                # packet directory as a prefix on every entry; use that
-                # resolution only when the local one is absent (a packet may
-                # legitimately nest a same-named directory).
-                if (not entry.exists()
-                        and name.startswith(manifest.parent.name + "/")):
-                    fallback = manifest.parent.parent / name
-                    if fallback.exists():
-                        entry = fallback
-                paths.append(entry.relative_to(root).as_posix())
+            if not match:
+                continue
+            name = match.group(2).strip()
+            source = f"{manifest_rel}: entry '{name}'"
+            entry = _safe_join(manifest.parent, name, root, errors, source)
+            if entry is None:
+                continue
+            # Manifests written from their parent directory carry the
+            # packet directory as a prefix on every entry; use that
+            # resolution only when the local one is absent (a packet may
+            # legitimately nest a same-named directory).
+            if (not entry.exists()
+                    and name.startswith(manifest.parent.name + "/")):
+                fallback = _safe_join(manifest.parent.parent, name, root, errors, source)
+                if fallback is None:
+                    continue
+                if fallback.exists():
+                    entry = fallback
+            paths.append(entry.relative_to(root).as_posix())
+    manifest_paths: list[str] = []
+    for manifest in sorted(root.glob("**/MANIFEST.json")):
+        if ".git" in manifest.relative_to(root).parts:
+            continue
+        for resolved in _manifest_payload_paths(manifest, root, errors):
+            manifest_paths.append(resolved.relative_to(root).as_posix())
+    paths.extend(manifest_paths)
     audits = root / "docs/audits"
     if audits.is_dir():
         paths.extend(path.relative_to(root).as_posix()
                      for path in sorted(audits.rglob("*")) if path.is_file())
-    return sorted(set(paths))
+    return sorted(set(paths)), frozenset(manifest_paths), errors
+
+
+def sha256_pinned_paths(data: dict[str, Any], root: Path) -> list[str]:
+    """Repo-relative paths whose delivered bytes are sha256-pinned.
+
+    See _pinned_path_details for the full source list. An entry that is
+    absolute or escapes the repository via `..` is dropped here; call
+    pinned_path_errors for the matching deterministic errors.
+    """
+    paths, _manifest_paths, _errors = _pinned_path_details(data, root)
+    return paths
+
+
+def pinned_path_errors(data: dict[str, Any], root: Path) -> list[str]:
+    """Deterministic, git-free resolution errors for pinned-path entries:
+    a SHA256SUMS.txt or MANIFEST.json entry that is absolute (POSIX,
+    Windows-drive, or UNC), escapes the repository, or cannot be resolved
+    is reported here instead of raising out of sha256_pinned_paths.
+    Unreadable or malformed MANIFEST.json inventories also fail closed.
+    """
+    _paths, _manifest_paths, errors = _pinned_path_details(data, root)
+    return errors
+
+
+def _under_known_gap_dir(path: str) -> bool:
+    return any(path == gap_dir or path.startswith(gap_dir + "/")
+               for gap_dir in PINNED_EOL_KNOWN_GAP_DIRS)
+
+
+def _known_gap_dir_errors(root: Path, resolved_attrs: dict[str, dict[str, str]]) -> list[str]:
+    """Flag a PINNED_EOL_KNOWN_GAP_DIRS entry as stale once its own
+    MANIFEST.json no longer pins any uncovered path there (a `.gitattributes`
+    rule landed for that folder, or no payload entries remain).
+    A gap dir without its own MANIFEST.json
+    (for example a synthetic test root that does not model this packet) is
+    skipped rather than asserted stale -- mirroring the per-file
+    `(root / path).parent.is_dir()` gate below, which skips a known gap file
+    whose packet directory is not modeled in the given root either.
+
+    `resolved_attrs` is the batched `git check-attr` result already computed
+    by pinned_eol_errors for every pinned path, so this never issues its own
+    `git check-attr` call.
+    """
+    errors: list[str] = []
+    for gap_dir in sorted(PINNED_EOL_KNOWN_GAP_DIRS):
+        manifest = root / gap_dir / "MANIFEST.json"
+        if not manifest.is_file():
+            continue
+        local_errors: list[str] = []
+        entries = _manifest_payload_paths(manifest, root, local_errors)
+        if local_errors:
+            continue
+        rel_entries = [entry.relative_to(root).as_posix() for entry in entries]
+        uncovered = any(
+            resolved_attrs.get(rel, {}).get("eol") != "lf"
+            and resolved_attrs.get(rel, {}).get("text") != "unset"
+            for rel in rel_entries)
+        if not uncovered:
+            reason = "covered" if entries else "no payloads"
+            errors.append(f"{gap_dir} known eol gap dir is stale ({reason}): "
+                          "remove it from PINNED_EOL_KNOWN_GAP_DIRS")
+    return errors
 
 
 @functools.lru_cache(maxsize=None)
@@ -353,12 +538,18 @@ def pinned_eol_errors(data: dict[str, Any], root: Path) -> list[str]:
     binary via `-text`) so cross-platform checkouts cannot deliver CRLF bytes
     against the recorded digest. CSL-225's Windows-only digest break is the
     failure this guards against.
+
+    A MANIFEST.json-pinned path under one of PINNED_EOL_KNOWN_GAP_DIRS is
+    tolerated even while uncovered; see _known_gap_dir_errors for how that
+    folder-level grandfather itself drains once `.gitattributes` catches up.
+    An out-of-root pinned-path entry (see pinned_path_errors) is reported
+    here too, never raised.
     """
-    paths = sha256_pinned_paths(data, root)
+    root = root.resolve()
+    paths, manifest_paths, errors = _pinned_path_details(data, root)
     resolved, failure = _git_check_attr(str(root), tuple(paths))
     if failure:
-        return [failure]
-    errors: list[str] = []
+        return errors + [failure]
     for path in paths:
         attrs = resolved.get(path)
         if attrs is None:
@@ -372,12 +563,15 @@ def pinned_eol_errors(data: dict[str, Any], root: Path) -> list[str]:
             if covered:
                 errors.append(f"{path} known eol gap is covered: remove it from PINNED_EOL_KNOWN_GAPS")
         elif not covered:
+            if path in manifest_paths and _under_known_gap_dir(path):
+                continue
             errors.append(f"{path} sha256-pinned path lacks eol=lf "
                           f"(git check-attr eol: {attrs.get('eol')})")
     for path in sorted(PINNED_EOL_KNOWN_GAPS - set(paths)):
         if (root / path).parent.is_dir():
             errors.append(f"{path} known eol gap is stale (unpinned or removed): "
                           "remove it from PINNED_EOL_KNOWN_GAPS")
+    errors.extend(_known_gap_dir_errors(root, resolved))
     return errors
 
 

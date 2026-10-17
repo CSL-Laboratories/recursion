@@ -22,7 +22,7 @@ Acceptance of this draft into the product contract requires only a human-authore
 on CSL-238 (receipt rule H per CSL-206), binding:
 
 - the Linear comment ID and the human identity with scoped delegation;
-- the exact digest of this document and its fixture manifest;
+- the exact digest of this document, the draft schema and the fixture manifest;
 - the accepted scope, the selected and rejected options, rationale, conditions, date and
   a revisit trigger.
 
@@ -105,8 +105,8 @@ WireIdentityRef@1 = {
 - `id` is stable across storage moves and endpoint changes; `version` + `content_digest`
   pin the exact revision.
 - Command idempotency uses the same `PublicId` grammar under the `cmd:` namespace; a
-  byte-identical command replays its prior outcome, a conflicting reuse is refused
-  (`duplicate-command-conflict`), matching the M1B duplicate rule.
+  canonically identical command replays its prior outcome, a conflicting reuse is
+  refused (`duplicate-command-conflict`), matching the M1B duplicate rule.
 
 ### `WireEventEnvelope@1` — event vocabulary
 
@@ -131,7 +131,10 @@ WireEventEnvelope@1 = {
 - `sequence` is the only ordering primitive; gaps refuse as `replay-gap-continuation`
   (same rule as M1B's broker trace). `emitted_at` is wall-clock metadata for observers
   and is excluded from identity, ordering and dedup decisions — consistent with v3's
-  "never read semantics from a clock" rule.
+  "never read semantics from a clock" rule — but it must still be a real Gregorian
+  date, not merely digit-shaped.
+- `event_id` uniqueness is scoped to the emitting stream's current epoch; an explicit
+  epoch component is deferred to the O2 freeze (see open questions).
 - `event_type` names the domain alphabet entry; the alphabets themselves are frozen by
   the O3–O5 owning documents, not by this file.
 
@@ -161,7 +164,9 @@ Rules:
   authenticated, then not admitted. Decode failures (invalid UTF-8/I-JSON, schema
   mismatch, unknown `type`) never reach this record; they normalize to a closed
   decode/schema error per the M1 profiles' strict-decoder rule.
-- `duplicate` = byte-identical command already admitted (returns prior outcome);
+- `duplicate` = a command already admitted whose canonical digest equals the incoming
+  `command_digest` (returns the prior outcome). Because digests are computed over
+  canonical bytes, reordering object keys does not mint a new command — it replays.
   `conflict` = same `command_id`, different `command_digest`. `conflict` is permanent.
 - `accepted` carries no refusal block; a `refusal` on any other outcome is malformed.
 
@@ -204,7 +209,9 @@ Versioning rules:
 2. **Advertise before send.** A writer emits only record versions in the peer's
    `supported` set; anything else is refused `unsupported-version` (permanent).
 3. **Sunset is informational.** Entries in `sunset` remain valid; the flag schedules
-   removal at the next `vocabulary_version` bump, giving consumers one full version cycle.
+   removal at the next `vocabulary_version` bump, giving consumers one full version
+   cycle. `sunset` must be a subset of `supported` — a version cannot be scheduled for
+   removal the peer never accepted.
 4. **No downgrade inference.** `@N` and `@N+1` are distinct contracts; mechanical
    up/down-mapping, when it exists, is its own explicit adapter record — never implicit.
 
@@ -256,6 +263,9 @@ matters for O3–O5; `WireCommandOutcome@1` covers admission only — `accepted`
 - `PublicId` namespace registry ownership and collision rules.
 - Whether `emitted_at` remains optional at freeze or is dropped outright.
 - Whether `conflict` needs a separate reason code or stays outcome-level.
+- Whether event identity needs an explicit `stream_epoch` field so readers can
+  distinguish a restarted emitter's `event_id`/`sequence` space from a duplicate
+  without inspecting `stream_id` history.
 - Payload-embedding versus digest-reference for `WireEventEnvelope` in-band transports.
 - The `sunset`/`preferred` semantics if a third vocabulary family joins.
 

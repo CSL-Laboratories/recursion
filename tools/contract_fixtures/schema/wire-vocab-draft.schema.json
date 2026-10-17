@@ -43,7 +43,8 @@
     },
     "utc_timestamp": {
       "type": "string",
-      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+      "x-calendar-date": true
     },
     "seq": {
       "type": "integer",
@@ -178,7 +179,8 @@
         },
         "preferred": { "$ref": "#/$defs/type_version" }
       },
-      "x-preferred-in-supported": true
+      "x-preferred-in-supported": true,
+      "x-sunset-subset-of-supported": true
     }
   }
 }

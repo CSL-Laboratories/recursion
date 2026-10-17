@@ -8,8 +8,11 @@
     "reject": "document fails schema validation or a declared semantic rule"
   },
   "semantic_rules": {
+    "strict-decode": "I-JSON profile: no duplicate object keys, floats, lexical -0, or NaN/Infinity literals",
     "x-sorted-set": "array must equal its sorted-unique self (ascending Unicode code point)",
-    "x-preferred-in-supported": "preferred must be a member of supported"
+    "x-calendar-date": "timestamp must be a real Gregorian date and time",
+    "x-preferred-in-supported": "preferred must be a member of supported",
+    "x-sunset-subset-of-supported": "every sunset entry must occur in supported"
   },
   "fixtures": [
     { "id": "P-01", "path": "positive/P-01-identity-ref.json", "target": "wire_identity_ref", "kind": "positive", "expect": "accept" },
@@ -33,6 +36,10 @@
     { "id": "A-11", "path": "adverse/A-11-outcome-unknown-reason.json", "target": "wire_command_outcome", "kind": "adverse", "expect": "reject", "note": "reason_code outside closed registry" },
     { "id": "A-12", "path": "adverse/A-12-advert-unsorted-supported.json", "target": "wire_version_advertisement", "kind": "adverse", "expect": "reject", "note": "x-sorted-set semantic rule" },
     { "id": "A-13", "path": "adverse/A-13-advert-duplicate-supported.json", "target": "wire_version_advertisement", "kind": "adverse", "expect": "reject", "note": "duplicate set entry" },
-    { "id": "A-14", "path": "adverse/A-14-advert-preferred-not-supported.json", "target": "wire_version_advertisement", "kind": "adverse", "expect": "reject", "note": "x-preferred-in-supported semantic rule" }
+    { "id": "A-14", "path": "adverse/A-14-advert-preferred-not-supported.json", "target": "wire_version_advertisement", "kind": "adverse", "expect": "reject", "note": "x-preferred-in-supported semantic rule" },
+    { "id": "A-15", "path": "adverse/A-15-event-impossible-date.json", "target": "wire_event_envelope", "kind": "adverse", "expect": "reject", "note": "x-calendar-date: 2026-02-30 cannot exist" },
+    { "id": "A-16", "path": "adverse/A-16-advert-sunset-not-supported.json", "target": "wire_version_advertisement", "kind": "adverse", "expect": "reject", "note": "x-sunset-subset-of-supported semantic rule" },
+    { "id": "A-17", "path": "adverse/A-17-identity-duplicate-key.json", "target": "wire_identity_ref", "kind": "adverse", "expect": "reject", "note": "strict-decode: duplicate object key" },
+    { "id": "A-18", "path": "adverse/A-18-event-lexical-negzero.json", "target": "wire_event_envelope", "kind": "adverse", "expect": "reject", "note": "strict-decode: lexical -0" }
   ]
 }

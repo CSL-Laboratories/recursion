@@ -3,11 +3,14 @@
 
 Provider-free: loads tools/contract_fixtures/manifest.json, validates every
 positive fixture against its declared schema $def and every adverse fixture to
-rejection. Semantic rules beyond JSON Schema (x-sorted-set,
-x-preferred-in-supported) are declared in the manifest and enforced here.
+rejection. Checks beyond JSON Schema are declared in the manifest and enforced
+here: strict I-JSON decoding (duplicate keys, floats, lexical -0, non-I-JSON
+constants), x-sorted-set, x-calendar-date, x-preferred-in-supported and
+x-sunset-subset-of-supported.
 """
 from __future__ import annotations
 
+import datetime
 import json
 import unittest
 from pathlib import Path
@@ -27,19 +30,56 @@ RECORD_DEFS = {
 }
 
 
-def load_json(path: Path):
-    return json.loads(path.read_text(encoding="utf-8"))
+class StrictDecodeError(ValueError):
+    pass
+
+
+def _no_duplicate_keys(pairs: list) -> dict:
+    seen: set = set()
+    out: dict = {}
+    for key, value in pairs:
+        if key in seen:
+            raise StrictDecodeError(f"duplicate object key: {key!r}")
+        seen.add(key)
+        out[key] = value
+    return out
+
+
+def _strict_int(token: str) -> int:
+    if token == "-0":
+        raise StrictDecodeError("lexical -0 is not valid I-JSON")
+    return int(token)
+
+
+def _reject_non_ijson(token: str):
+    raise StrictDecodeError(f"non-I-JSON literal: {token}")
+
+
+def strict_load(path: Path):
+    """I-JSON profile decode: no duplicate keys, floats, -0 or NaN/Infinity."""
+    return json.loads(
+        path.read_text(encoding="utf-8"),
+        object_pairs_hook=_no_duplicate_keys,
+        parse_int=_strict_int,
+        parse_float=_reject_non_ijson,
+        parse_constant=_reject_non_ijson,
+    )
 
 
 class ContractFixtureTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.schema = load_json(SCHEMA_PATH)
+        cls.schema = strict_load(SCHEMA_PATH)
         cls.defs = cls.schema["$defs"]
-        cls.manifest = load_json(MANIFEST_PATH)
+        cls.manifest = strict_load(MANIFEST_PATH)
 
     def target_schema(self, target: str) -> dict:
         return {"$defs": self.defs, "$ref": f"#/$defs/{target}"}
+
+    def resolve(self, prop: dict) -> dict:
+        while "$ref" in prop:
+            prop = self.defs[prop["$ref"].rsplit("/", 1)[-1]]
+        return prop
 
     def schema_errors(self, fixture: dict, doc) -> list[str]:
         validator = jsonschema.Draft202012Validator(self.target_schema(fixture["target"]))
@@ -48,15 +88,31 @@ class ContractFixtureTests(unittest.TestCase):
     def semantic_errors(self, fixture: dict, doc) -> list[str]:
         errors: list[str] = []
         target = self.defs[fixture["target"]]
-        for name, prop in target.get("properties", {}).items():
+        for name, raw_prop in target.get("properties", {}).items():
+            prop = self.resolve(raw_prop)
             if prop.get("x-sorted-set") and name in doc:
                 value = doc[name]
                 if not isinstance(value, list) or value != sorted(set(value)):
                     errors.append(f"{name} violates x-sorted-set")
+            if prop.get("x-calendar-date") and name in doc:
+                try:
+                    datetime.datetime.strptime(doc[name], "%Y-%m-%dT%H:%M:%SZ")
+                except (TypeError, ValueError):
+                    errors.append(f"{name} violates x-calendar-date")
         if target.get("x-preferred-in-supported") and "preferred" in doc:
             if doc["preferred"] not in doc.get("supported", []):
                 errors.append("preferred must be a member of supported")
+        if target.get("x-sunset-subset-of-supported") and "sunset" in doc:
+            if not set(doc["sunset"]) <= set(doc.get("supported", [])):
+                errors.append("sunset must be a subset of supported")
         return errors
+
+    def check_fixture(self, fixture: dict) -> list[str]:
+        try:
+            doc = strict_load(FIXTURES / fixture["path"])
+        except (StrictDecodeError, json.JSONDecodeError) as exc:
+            return [f"strict decode failed: {exc}"]
+        return self.schema_errors(fixture, doc) + self.semantic_errors(fixture, doc)
 
     def test_manifest_integrity(self) -> None:
         ids = [f["id"] for f in self.manifest["fixtures"]]
@@ -78,17 +134,13 @@ class ContractFixtureTests(unittest.TestCase):
         for fixture in self.manifest["fixtures"]:
             if fixture["kind"] != "positive":
                 continue
-            doc = load_json(FIXTURES / fixture["path"])
-            errors = self.schema_errors(fixture, doc) + self.semantic_errors(fixture, doc)
-            self.assertEqual(errors, [], fixture["id"])
+            self.assertEqual(self.check_fixture(fixture), [], fixture["id"])
 
     def test_adverse_fixtures_reject(self) -> None:
         for fixture in self.manifest["fixtures"]:
             if fixture["kind"] != "adverse":
                 continue
-            doc = load_json(FIXTURES / fixture["path"])
-            errors = self.schema_errors(fixture, doc) + self.semantic_errors(fixture, doc)
-            self.assertTrue(errors, f"{fixture['id']} unexpectedly accepted")
+            self.assertTrue(self.check_fixture(fixture), f"{fixture['id']} unexpectedly accepted")
 
     def test_refusal_outcome_requires_block(self) -> None:
         refused = self.defs["wire_command_outcome"]["allOf"][0]

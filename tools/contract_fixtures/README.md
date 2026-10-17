@@ -25,10 +25,15 @@ transport, no host effects.
 - `accept` — validates against the target `$def` and all declared semantic rules.
 - `reject` — at least one schema error or one declared semantic-rule violation.
 
-Semantic rules beyond JSON Schema are declared in the manifest and annotated in the
-schema: `x-sorted-set` (array equals its sorted-unique self, ascending Unicode code
-point) and `x-preferred-in-supported` (`preferred` ∈ `supported`). They exist because
-`uniqueItems` alone cannot express the repo's sorted-set convention.
+Checks beyond JSON Schema are declared in the manifest and annotated in the schema:
+
+- `strict-decode` — I-JSON profile: no duplicate object keys, floats, lexical `-0`,
+  or `NaN`/`Infinity` literals.
+- `x-sorted-set` — array equals its sorted-unique self, ascending Unicode code point
+  (`uniqueItems` alone cannot express the repo's sorted-set convention).
+- `x-calendar-date` — timestamp is a real Gregorian date, not just digit-shaped.
+- `x-preferred-in-supported` — `preferred` ∈ `supported`.
+- `x-sunset-subset-of-supported` — every `sunset` entry ∈ `supported`.
 
 ## Adding fixtures
 

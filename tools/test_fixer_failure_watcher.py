@@ -1,0 +1,1171 @@
+#!/usr/bin/env python3
+"""Exercise failure intake through the existing mediation/cap/dedup paths."""
+import hashlib
+import importlib.util
+import sys
+import unittest
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
+
+ROOT = Path(__file__).resolve().parents[1]
+RECURSION = (ROOT / "tools/test_stuck_thread_watch.py").exists()
+if RECURSION:
+    spec = importlib.util.spec_from_file_location("watcher_fixtures", ROOT / "tools/test_stuck_thread_watch.py")
+    f = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(f)
+else:
+    spec = importlib.util.spec_from_file_location("failure_watcher", ROOT / ".github/scripts/stuck_thread_watch.py")
+    watcher = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = watcher
+    spec.loader.exec_module(watcher)
+    now = datetime(2026, 10, 15, 12, tzinfo=UTC)
+
+    def config(**changes):
+        from dataclasses import replace
+        value = watcher.load_config({"GITHUB_REPOSITORY": "CSL-Laboratories/recursion",
+                                     "CODEX_TRIGGER_PAT": "fixture", "GITHUB_EVENT_NAME": "schedule"})
+        return replace(value, **changes)
+
+    def comment(login, body, created=None):
+        return {"author": {"login": login}, "body": body,
+                "createdAt": (created or now).strftime("%Y-%m-%dT%H:%M:%SZ")}
+
+    class FakeGitHub:
+        def __init__(self):
+            self.posts, self.issue_comments = [], {}
+
+        def paginate_rest(self, path, **_kwargs):
+            return self.issue_comments[int(path.split("/issues/")[1].split("/")[0])]
+
+        def rest(self, path, *, method="GET", body=None, **_kwargs):
+            if method != "POST" or not path.endswith("/comments"):
+                raise AssertionError("unexpected write")
+            self.posts.append((path, body))
+            return {"id": 1}
+
+    f = SimpleNamespace(mod=watcher, NOW=now, DEVIN="devin-ai-integration[bot]", cfg=config,
+                        comment=comment, FakeGitHub=FakeGitHub,
+                        thread=lambda thread_id, comments: {"id": thread_id, "isResolved": False,
+                                                            "comments": {"nodes": comments}})
+m = f.mod
+BODY = '<!-- devin-review-comment {"kind":"bug"} -->\nUnresolved bug'
+PROOF = {"root": 1, "fingerprint": hashlib.sha256(BODY.encode()).hexdigest(),
+         "description": "Exhausted budget; independently verified failed fixer action. Evidence: https://github.com/acme/example/actions/runs/10"}
+
+
+class WatcherTests(unittest.TestCase):
+    def setup_scan(self, count=1, comments=()):
+        self.proofs = {}
+        threads = []
+        for index in range(count):
+            tid = f"PRRT_{index}"
+            self.proofs[tid] = PROOF | {"root": index + 1}
+            if RECURSION:
+                threads.append(f.thread(tid=tid, comments=[f.comment(f.DEVIN, BODY)]))
+            else:
+                opener = f.comment(f.DEVIN, BODY) | {"databaseId": index + 1}
+                threads.append(f.thread(thread_id=tid, comments=[opener]))
+        if RECURSION:
+            self.pull = f.pull(threads=threads, issue_comments=list(comments))
+            self.github = f.FakeGitHub([self.pull])
+            self.cfg = f.cfg(linear_repos=frozenset())
+        else:
+            self.pull = {"number": 11, "isDraft": False, "state": "OPEN", "url": "https://ex/11",
+                         "title": "t", "reviewThreads": {"nodes": threads}}
+            self.github = f.FakeGitHub()
+            self.github.issue_comments[11] = list(comments)
+            self.cfg = f.cfg(file_linear=False)
+        self.evidence = SimpleNamespace(fresh=lambda: True)
+
+    def scan(self, collector=None):
+        collector = collector or (lambda *_: (self.evidence, self.proofs))
+        if RECURSION:
+            m.scan(self.cfg, self.github, None, failure_collector=collector)
+            return [body for _, body in self.github.comments]
+        m.mediate_pr(self.pull, self.cfg, self.github, None, f.NOW, failure_collector=collector)
+        return [body["body"] for _, body in self.github.posts]
+
+    def test_no_claude_failure_uses_existing_cap_and_never_resolves_or_dispatches(self):
+        self.setup_scan(5)
+        bodies = self.scan()
+        self.assertEqual(len(bodies), 3)
+        for body in bodies:
+            self.assertIn("@codex review", body)
+            self.assertIn("independently verified failed fixer", body)
+            self.assertNotIn("@claude", body)
+            self.assertNotIn("claude-fixer-result:", body)
+        if RECURSION:
+            self.assertEqual(self.github.resolves, [])
+            self.assertEqual(self.github.replies, [])
+
+    def test_three_actual_posts_fit_the_real_evidence_reader_budget(self):
+        import json
+        from dataclasses import replace
+        from unittest.mock import patch
+        spec = importlib.util.spec_from_file_location("failure_evidence_fixtures", ROOT / "tools/test_fixer_failure_escalation.py")
+        core = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(core)
+        api = core.EvidenceTests()
+        api.setUp()
+        api.threads = [core.f.thread(BODY, root=index+1) | {"id": f"PRRT_{index}"} for index in range(3)]
+        api.comments = core.f.root_comments(api.threads)
+        api.history = []
+        api.items = core.f.findings(api.threads)
+        if hasattr(core.f, "prepare"):
+            api.items = core.f.prepare(api.items, history=api.history)
+        api.key = core.m.receipts.attempt_key(core.HEAD, api.items)
+        for run in (10, 11, 12):
+            api.history.append({"id": 100+run, "user": core.f.actor("github-actions[bot]", core.f.m.ACTIONS_ID),
+                                "body": core.f.m.marker("attempt", {**api.key, "run": str(run), "attempt": "1"})})
+        api.job["steps"][0]["name"] = core.m.CONTEXT_PREFIX + core.HEAD + ":" + api.key["fingerprint"]
+        self.setup_scan(3)
+        if RECURSION:
+            self.cfg = replace(self.cfg, repo=core.REPO)
+            self.pull = replace(self.pull, number=7)
+            self.github.pulls = {7: self.pull}
+        else:
+            self.cfg = replace(self.cfg, repository=core.REPO, owner="acme", name="example")
+            self.pull["number"] = 7
+            self.github.issue_comments = {7: []}
+        def transport(args, **kwargs):
+            body = json.loads(kwargs["input"]) if kwargs.get("input") else None
+            return SimpleNamespace(stdout=json.dumps(api.read(args[2], body)))
+        with patch.dict(core.m.os.environ, {"GH_TOKEN": "fixture"}), patch.object(core.m.subprocess, "run", side_effect=transport):
+            reader = core.m.Reader()
+            evidence = core.m.Evidence(core.REPO, 7, reader.read)
+            self.assertEqual(len(self.scan(lambda *_: (evidence, evidence.collect()))), 3)
+            self.assertLessEqual(reader.calls, 60)
+
+    def test_linear_dispatch_budget_defers_without_consuming_daily_slot(self):
+        import json
+        from dataclasses import replace
+        from unittest.mock import patch
+        spec = importlib.util.spec_from_file_location("failure_evidence_fixtures", ROOT / "tools/test_fixer_failure_escalation.py")
+        core = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(core)
+        api = core.EvidenceTests()
+        api.setUp()
+        api.threads = [core.f.thread(BODY, root=index+1) | {"id": f"PRRT_{index}"} for index in range(3)]
+        api.comments = core.f.root_comments(api.threads)
+        api.history = []
+        api.items = core.f.findings(api.threads)
+        if hasattr(core.f, "prepare"):
+            api.items = core.f.prepare(api.items, history=api.history)
+        api.key = core.m.receipts.attempt_key(core.HEAD, api.items)
+        for run in (10, 11, 12):
+            api.history.append({"id": 100+run, "user": core.f.actor("github-actions[bot]", core.f.m.ACTIONS_ID),
+                                "body": core.f.m.marker("attempt", {**api.key, "run": str(run), "attempt": "1"})})
+        api.job["steps"][0]["name"] = core.m.CONTEXT_PREFIX + core.HEAD + ":" + api.key["fingerprint"]
+        self.setup_scan(3)
+        if RECURSION:
+            self.cfg = replace(self.cfg, repo=core.REPO)
+            self.pull = replace(self.pull, number=7)
+            self.github.pulls = {7: self.pull}
+        else:
+            self.cfg = replace(self.cfg, repository=core.REPO, owner="acme", name="example")
+            self.pull["number"] = 7
+            self.github.issue_comments = {7: []}
+        def transport(args, **kwargs):
+            body = json.loads(kwargs["input"]) if kwargs.get("input") else None
+            return SimpleNamespace(stdout=json.dumps(api.read(args[2], body)))
+        from contextlib import ExitStack
+        api.run.update(event="repository_dispatch", head_sha="d" * 40, head_branch="main", pull_requests=[])
+        existing = [None]
+        if RECURSION:
+            self.cfg = replace(self.cfg, linear_repos=frozenset({core.REPO}))
+            linear = f.FakeLinear()
+        else:
+            self.cfg = replace(self.cfg, file_linear=True, linear_api_key="fixture")
+            def write(_query, variables):
+                existing[0] = {"id": "issue", "description": variables["input"]["description"]}
+                return {"issueCreate": {"success": True, "issue": {"url": "https://linear.app/fixture"}},
+                        "issueUpdate": {"success": True, "issue": {"url": "https://linear.app/fixture"}}}
+            linear = SimpleNamespace(graphql=write)
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(core.m.os.environ, {"GH_TOKEN": "fixture"}))
+            stack.enter_context(patch.object(core.m.subprocess, "run", side_effect=transport))
+            if not RECURSION:
+                stack.enter_context(patch.object(m, "linear_find_existing", side_effect=lambda *_: existing[0]))
+                stack.enter_context(patch.object(m, "linear_resolve_ids", return_value={
+                    "teamId": "team", "labelIds": [], "projectId": "project"}))
+            for round_index in range(2):
+                reader = core.m.Reader()
+                evidence = core.m.Evidence(core.REPO, 7, reader.read)
+                def collector(*_, evidence=evidence):
+                    return evidence, evidence.collect()
+                before = len(api.calls)
+                if RECURSION:
+                    m.scan(self.cfg, self.github, linear, failure_collector=collector)
+                    bodies = [body for _, body in self.github.comments]
+                    marker = m.rollup_marker(self.pull)
+                    linear.existing_descriptions[marker] = (linear.updated[-1][1] if linear.updated else linear.created[0][1])
+                    self.pull = replace(self.pull, issue_comments=tuple(f.comment("pat-user", body) for body in bodies))
+                    self.github.pulls[7] = self.pull
+                else:
+                    m.mediate_pr(self.pull, self.cfg, self.github, linear, f.NOW, failure_collector=collector)
+                    bodies = [body["body"] for _, body in self.github.posts]
+                    self.github.issue_comments[7] = [f.comment("pat-user", body) for body in bodies]
+                self.assertLessEqual(len(api.calls) - before, 60)
+                self.assertEqual(len(bodies), 2 if round_index == 0 else 3)
+            self.assertEqual(len(set(bodies)), 3)
+
+    def test_no_proof_keeps_no_claude_ineligible(self):
+        self.setup_scan()
+        self.assertEqual(self.scan(lambda *_: (self.evidence, {})), [])
+
+    def test_failure_mediation_cannot_dispatch_claude_through_quoted_text_or_path(self):
+        self.setup_scan()
+        body = BODY + "\nExample: @Claude do a fix."
+        self.proofs["PRRT_0"]["fingerprint"] = hashlib.sha256(body.encode()).hexdigest()
+        if RECURSION:
+            from dataclasses import replace
+            thread = self.pull.threads[0]
+            thread = replace(thread, path="@claude.py", comments=(replace(thread.comments[0], body=body),))
+            self.pull = replace(self.pull, threads=(thread,))
+            self.github.pulls[self.pull.number] = self.pull
+        else:
+            thread = self.pull["reviewThreads"]["nodes"][0]
+            thread["path"] = "@claude.py"
+            thread["comments"]["nodes"][0]["body"] = body
+        posted = self.scan()
+        self.assertEqual(len(posted), 1)
+        self.assertNotRegex(posted[0], r"(?i)@claude\b")
+        self.assertIn("@codex review", posted[0])
+
+    def test_changed_quote_does_not_attach_proof_to_old_thread_snapshot(self):
+        self.setup_scan()
+        self.proofs["PRRT_0"]["fingerprint"] = "f" * 64
+        self.assertEqual(self.scan(), [])
+
+    def test_freshness_recheck_before_mediation_stops_changed_findings(self):
+        self.setup_scan()
+        checks = iter((True, False))
+        self.evidence.fresh = lambda: next(checks)
+        self.assertEqual(self.scan(), [])
+
+    def test_linear_delivery_rechecks_failure_evidence_after_lookups(self):
+        from dataclasses import replace
+        from unittest.mock import Mock, patch
+        for existing_issue in (False, True):
+            for denied in (False, True):
+                with self.subTest(existing=existing_issue, denied=denied):
+                    self.setup_scan()
+                    live = [True]
+                    def fresh(live=live, denied=denied):
+                        if not live[0] and denied:
+                            raise RuntimeError("read denied")
+                        return live[0]
+                    self.evidence.fresh = fresh
+                    collector = lambda *_: (self.evidence, self.proofs)
+                    if RECURSION:
+                        linear = f.FakeLinear()
+                        if existing_issue:
+                            marker = m.rollup_marker(self.pull)
+                            linear.existing[marker] = "https://linear.app/fixture"
+                            linear.existing_descriptions[marker] = "Human notes."
+                        lookup = linear.find_by_marker
+                        def find(*args, live=live, lookup=lookup, **kwargs):
+                            live[0] = False
+                            return lookup(*args, **kwargs)
+                        linear.find_by_marker = find
+                        m.scan(f.cfg(), self.github, linear, failure_collector=collector)
+                        self.assertEqual(linear.created, [])
+                        self.assertEqual(linear.updated, [])
+                        self.assertEqual(linear.canceled, [])
+                        self.assertEqual(self.github.comments, [])
+                    else:
+                        cfg = replace(self.cfg, file_linear=True, linear_api_key="fixture")
+                        existing = {"id": "issue", "description": "Human notes."} if existing_issue else None
+                        def lookup(*_, live=live, existing=existing):
+                            live[0] = False
+                            return existing
+                        linear = SimpleNamespace(graphql=Mock())
+                        with patch.object(m, "linear_find_existing", side_effect=lookup), patch.object(
+                                m, "linear_resolve_ids", return_value={"teamId": "team", "labelIds": [], "projectId": "project"}):
+                            m.mediate_pr(self.pull, cfg, self.github, linear, f.NOW, failure_collector=collector)
+                        linear.graphql.assert_not_called()
+                        self.assertEqual(self.github.posts, [])
+
+    def test_stale_failure_does_not_suppress_ordinary_linear_delivery(self):
+        from dataclasses import replace
+        from unittest.mock import patch
+        self.setup_scan()
+        live = [True]
+        self.evidence.fresh = lambda: live[0]
+        if RECURSION:
+            ordinary = f.thread(tid="PRRT_ordinary", comments=f.stuck_pair())
+            self.pull = replace(self.pull, threads=self.pull.threads + (ordinary,))
+            self.github.pulls[self.pull.number] = self.pull
+            linear = f.FakeLinear()
+            lookup = linear.find_by_marker
+            def find(*args, **kwargs):
+                live[0] = False
+                return lookup(*args, **kwargs)
+            linear.find_by_marker = find
+            m.scan(f.cfg(), self.github, linear, failure_collector=lambda *_: (self.evidence, self.proofs))
+            self.assertEqual(len(linear.created), 1)
+            self.assertIn("PRRT_ordinary", linear.created[0][1])
+            self.assertNotIn("PRRT_0", linear.created[0][1])
+            self.assertEqual(len(self.github.comments), 1)
+            self.assertIn("https://linear.app/", self.github.comments[0][1])
+        else:
+            ordinary = f.thread(thread_id="PRRT_ordinary", comments=[
+                f.comment(f.DEVIN, "Other bug"), f.comment("claude[bot]", "needs a human")])
+            self.pull["reviewThreads"]["nodes"].append(ordinary)
+            cfg = replace(self.cfg, file_linear=True, linear_api_key="fixture")
+            mutations = []
+            def write(_query, args):
+                mutations.append(args)
+                return {"issueCreate": {"success": True, "issue": {"url": "https://linear.app/fixture"}}}
+            def find(*_):
+                live[0] = False
+            with patch.object(m, "linear_find_existing", side_effect=find), patch.object(
+                    m, "linear_resolve_ids", return_value={"teamId": "team", "labelIds": [], "projectId": "project"}):
+                m.mediate_pr(self.pull, cfg, self.github, SimpleNamespace(graphql=write), f.NOW,
+                             failure_collector=lambda *_: (self.evidence, self.proofs))
+            self.assertEqual(len(mutations), 1)
+            self.assertIn("Other bug", mutations[0]["input"]["description"])
+            self.assertNotIn("fixer-failure-handoff:PRRT_0", mutations[0]["input"]["description"])
+            self.assertEqual(len(self.github.posts), 1)
+
+    def test_new_run_after_first_delivery_defers_remaining_threads(self):
+        self.setup_scan(3)
+        self.evidence.fresh = lambda: not (self.github.comments if RECURSION else self.github.posts)
+        self.assertEqual(len(self.scan()), 1)
+
+    def test_same_thread_ordinary_eligibility_survives_stale_failure_evidence(self):
+        from dataclasses import replace
+        for ordinary_reason in ("stuck-human", "stuck-timeout"):
+            for existing_issue in (False, True):
+                for denied in (False, True):
+                    with self.subTest(reason=ordinary_reason, existing_issue=existing_issue, denied=denied):
+                        self.setup_scan()
+                        reply = f.comment("claude[bot]", "needs a human" if ordinary_reason == "stuck-human" else "Investigating", hours_ago=7)
+                        thread = replace(self.pull.threads[0], comments=self.pull.threads[0].comments + (reply,))
+                        other = f.thread(tid="PRRT_other", comments=f.stuck_pair())
+                        self.pull = replace(self.pull, threads=(thread, other))
+                        self.github.pulls[self.pull.number] = self.pull
+                        cfg = f.cfg()
+                        marker = m.rollup_marker(self.pull)
+                        linear = f.FakeLinear({marker: "https://linear.app/existing"} if existing_issue else None)
+                        if existing_issue:
+                            previous = m.linear_description(self.pull, [(thread, ordinary_reason), (other, "stuck-human")], cfg)
+                            linear.existing_descriptions[marker] = previous.replace("- [ ]", "- [x]", 1).replace(
+                                m.DEFAULT_HUMAN_DECISION, "Keep the operator decision.")
+                        live = [True]
+                        def fresh(live=live, denied=denied):
+                            if not live[0] and denied:
+                                raise RuntimeError("freshness read denied")
+                            return live[0]
+                        self.evidence.fresh = fresh
+                        lookup = linear.find_by_marker
+                        def find(*args, live=live, lookup=lookup, **kwargs):
+                            live[0] = False
+                            return lookup(*args, **kwargs)
+                        linear.find_by_marker = find
+                        m.scan(cfg, self.github, linear, failure_collector=lambda *_: (self.evidence, self.proofs))
+                        writes = linear.updated if existing_issue else linear.created
+                        self.assertEqual(len(writes), 1)
+                        rendered = writes[0][1]
+                        self.assertIn(f"`{ordinary_reason}` <!-- thread:PRRT_0 -->", rendered)
+                        self.assertNotIn("stuck-fixer-failed", rendered)
+                        if existing_issue:
+                            line = next(line for line in rendered.splitlines() if "<!-- thread:PRRT_0 -->" in line)
+                            self.assertTrue(line.startswith("- [x]"))
+                            self.assertIn("Keep the operator decision.", rendered)
+                        own = [body for _, body in self.github.comments if "Thread id: `PRRT_0`" in body]
+                        self.assertEqual(len(own), 1)
+                        self.assertNotIn(PROOF["description"], own[0])
+                        self.assertIn("https://linear.app/", own[0])
+                        self.assertEqual(linear.canceled, [])
+                        self.assertEqual(self.github.resolves, [])
+
+    def test_missing_adapter_import_does_not_crash_the_watcher(self):
+        from unittest.mock import patch
+        with patch("importlib.util.spec_from_file_location", side_effect=FileNotFoundError):
+            collector = m.load_failure_collector()
+        self.setup_scan()
+        self.assertEqual(self.scan(collector), [])
+
+    def test_unavailable_evidence_never_becomes_a_delivery(self):
+        self.setup_scan()
+        def denied(*_):
+            raise RuntimeError("denied")
+        self.assertEqual(self.scan(denied), [])
+
+    def test_unavailable_failure_intake_does_not_suppress_ordinary_mediation(self):
+        self.setup_scan()
+        reply = f.comment("claude[bot]", "I could not fix this; needs a human")
+        if RECURSION:
+            from dataclasses import replace
+            thread = self.pull.threads[0]
+            self.pull = replace(self.pull, threads=(replace(thread, comments=thread.comments + (reply,)),))
+            self.github.pulls[self.pull.number] = self.pull
+        else:
+            self.pull["reviewThreads"]["nodes"][0]["comments"]["nodes"].append(reply)
+        def denied(*_):
+            raise RuntimeError("public metadata unavailable")
+        self.assertEqual(len(self.scan(denied)), 1)
+        from dataclasses import replace
+        from unittest.mock import patch
+        if RECURSION:
+            linear = f.FakeLinear()
+            m.scan(f.cfg(), self.github, linear, failure_collector=denied)
+            self.assertEqual(len(linear.created), 1)
+        else:
+            config = replace(self.cfg, file_linear=True, linear_api_key="fixture")
+            with patch.object(m, "linear_find_existing", return_value=None), patch.object(m, "upsert_linear_issue", return_value="https://linear.app/fixture") as upsert:
+                m.mediate_pr(self.pull, config, self.github, object(), f.NOW, failure_collector=denied)
+                upsert.assert_called_once()
+
+    @unittest.skipUnless(RECURSION, "Recursion owns the existing citation resolver")
+    def test_unavailable_failure_intake_does_not_suppress_existing_resolver(self):
+        thread = f.thread(tid="PRRT_1", comments=f.stuck_pair())
+        asked = [f.comment("pat-user", m.mediation_marker("PRRT_1"), hours_ago=0.4)]
+        ruling = f.comment(f.CODEX, f.verdict_block("PRRT_1"), hours_ago=0.1, url="https://codex.example")
+        pull = f.pull(threads=[thread], issue_comments=asked, reviews=[ruling], checks_green=True)
+        gh = f.FakeGitHub([pull])
+        def denied(*_):
+            raise RuntimeError("unavailable")
+        result = m.scan(f.cfg(mediator_login="pat-user"), gh, f.FakeLinear(), failure_collector=denied)
+        self.assertEqual(result.resolved, 1)
+        self.assertEqual(gh.resolves, ["PRRT_1"])
+        self.assertEqual(len(gh.replies), 1)
+
+    def test_retained_failure_and_ordinary_linear_items_survive_two_rewrites(self):
+        from dataclasses import replace
+        from unittest.mock import patch
+        self.setup_scan()
+        def denied(*_):
+            raise RuntimeError("comment page limit")
+        if RECURSION:
+            linear = f.FakeLinear()
+            m.scan(f.cfg(), self.github, linear, failure_collector=lambda *_: (self.evidence, self.proofs))
+            marker = m.rollup_marker(self.pull)
+            linear.existing_descriptions[marker] = linear.created[0][1]
+            ordinary = f.thread(tid="PRRT_ordinary", comments=f.stuck_pair())
+            self.pull = replace(self.pull, threads=self.pull.threads + (ordinary,))
+            self.github.pulls[self.pull.number] = self.pull
+            for collector in (denied, lambda *_: (self.evidence, {})):
+                m.scan(f.cfg(), self.github, linear, failure_collector=collector)
+                rendered = linear.updated[-1][1]
+                self.assertIn("`stuck-fixer-handoff-open` <!-- thread:PRRT_0 -->", rendered)
+                self.assertIn("<!-- thread:PRRT_ordinary -->", rendered)
+                linear.existing_descriptions[marker] = rendered
+                self.assertEqual(linear.canceled, [])
+        else:
+            config = replace(self.cfg, file_linear=True, linear_api_key="fixture")
+            items, _ = m.select_stuck(self.pull, [], config, f.NOW, self.proofs)
+            existing = {"id": "issue", "description": m.build_linear_description(items, config) + "\nHuman notes remain."}
+            ordinary = f.thread(thread_id="PRRT_ordinary", comments=[
+                f.comment(f.DEVIN, "Other bug"), f.comment("claude[bot]", "needs a human")])
+            self.pull["reviewThreads"]["nodes"].append(ordinary)
+            def update(_query, variables):
+                existing["description"] = variables["input"]["description"]
+                return {"issueUpdate": {"success": True, "issue": {"url": "https://linear.app/fixture"}}}
+            linear = SimpleNamespace(graphql=update)
+            with patch.object(m, "linear_find_existing", return_value=existing):
+                for collector in (denied, lambda *_: (self.evidence, {})):
+                    m.mediate_pr(self.pull, config, self.github, linear, f.NOW, failure_collector=collector)
+                    self.assertEqual(existing["description"].count("<!-- fixer-failure-handoff:PRRT_0 -->"), 1)
+                    self.assertIn("Other bug", existing["description"])
+                    self.assertIn("Human notes remain.", existing["description"])
+                self.pull["reviewThreads"]["nodes"][0]["isResolved"] = True
+                m.mediate_pr(self.pull, config, self.github, linear, f.NOW, failure_collector=denied)
+                self.assertNotIn("<!-- fixer-failure-handoff:PRRT_0 -->", existing["description"])
+
+    @unittest.skipUnless(RECURSION, "Recursion owns cancellation and roll-up notes")
+    def test_active_writer_preserves_existing_rollup_and_human_notes(self):
+        self.setup_scan()
+        self.cfg = f.cfg(mediator_login="pat-user")
+        linear = f.FakeLinear()
+        collector = lambda *_: (self.evidence, self.proofs)
+        m.scan(self.cfg, self.github, linear, failure_collector=collector)
+        self.assertEqual(len(linear.created), 1)
+        marker = m.rollup_marker(self.pull)
+        original = linear.created[0][1].replace(m.DEFAULT_HUMAN_DECISION, "Keep the operator's decision.")
+        linear.existing_descriptions[marker] = original
+        from dataclasses import replace
+        self.pull = replace(self.pull, issue_comments=(f.comment("pat-user", m.mediation_marker("PRRT_0")),))
+        self.github.pulls[self.pull.number] = self.pull
+        self.evidence.fresh = lambda: False
+        m.scan(self.cfg, self.github, linear, failure_collector=collector)
+        self.assertEqual(linear.canceled, [])
+        self.evidence.fresh = lambda: True
+        m.scan(self.cfg, self.github, linear, failure_collector=collector)
+        self.assertEqual(len(linear.created), 1)
+        self.assertEqual(linear.canceled, [])
+        self.assertIn("Keep the operator's decision.", linear.updated[-1][1])
+        # A new head can rearm the fixer budget before this thread resolves.
+        # Absence of a new exhausted failure is not resolution of the handoff.
+        m.scan(self.cfg, self.github, linear, failure_collector=lambda *_: (self.evidence, {}))
+        self.assertEqual(linear.canceled, [])
+        self.pull = replace(self.pull, review_decision="APPROVED", head_oid=f.HEAD,
+                            approved_head_oids=(f.HEAD,), checks_state="SUCCESS", required_checks_green=True)
+        self.github.pulls[self.pull.number] = self.pull
+        m.scan(self.cfg, self.github, linear, failure_collector=lambda *_: (self.evidence, {}))
+        self.assertEqual(linear.canceled, [])
+        self.pull = replace(self.pull, threads=(replace(self.pull.threads[0], is_resolved=True),))
+        self.github.pulls[self.pull.number] = self.pull
+        m.scan(self.cfg, self.github, linear, failure_collector=lambda *_: (self.evidence, {}))
+        self.assertEqual(linear.canceled, ["iss_1"])
+
+
+    def test_unicode_and_substring_mentions_never_survive_mediation(self):
+        from dataclasses import replace
+        for mention in ("@claudeé", "@claude\u0430", "@claude2", "@claudette", "@ClAuDeé.py"):
+            for failure in (True, False):
+                with self.subTest(mention=mention, failure=failure):
+                    self.setup_scan()
+                    body = BODY + "\n" + mention
+                    if RECURSION:
+                        thread = self.pull.threads[0]
+                        thread = replace(thread, path="`" + mention + "`", failure_evidence=PROOF["description"] if failure else "",
+                                         comments=(replace(thread.comments[0], body=body),))
+                        rendered = m.mediation_body(self.pull, thread, self.cfg, reason="stuck-fixer-failed" if failure else "stuck-human")
+                    else:
+                        item = m.StuckThread(7, "https://github.com/acme/example/pull/7", "PR", "PRRT_0", "`" + mention + "`", "1", "url", body, mention, "needs-human",
+                                             failure_evidence=PROOF["description"] if failure else "")
+                        rendered = m.build_mediation_comment(item, self.cfg)
+                    self.assertNotIn("@claude", rendered.lower())
+                    self.assertNotRegex(rendered, r"(?i)(?<![A-Za-z0-9_])@claude(?![A-Za-z0-9_])")
+                    self.assertNotIn("``@", rendered)
+                    self.assertIn("@codex review", rendered)
+
+
+    def test_partial_resolution_rewrites_failure_only_rollup_without_new_evidence(self):
+        from dataclasses import replace
+        for route in ("ordinary", "approved", "sweep", "approved-mixed", "approved-mixed-all", "sweep-mixed-all"):
+            for unavailable in (False, True):
+                with self.subTest(route=route, unavailable=unavailable):
+                    self.setup_scan(2)
+                    linear = f.FakeLinear()
+                    m.scan(f.cfg(), self.github, linear, failure_collector=lambda *_: (self.evidence, self.proofs))
+                    marker = m.rollup_marker(self.pull)
+                    linear.existing_descriptions[marker] = linear.created[0][1].replace(m.DEFAULT_HUMAN_DECISION, "Human decision stays.")
+                    self.pull = replace(self.pull, threads=(replace(self.pull.threads[0], is_resolved=True), self.pull.threads[1]))
+                    if "mixed" in route:
+                        self.pull = replace(self.pull, threads=self.pull.threads + (
+                            f.thread(tid="PRRT_ordinary", comments=f.stuck_pair()),))
+                    if route.endswith("-all"):
+                        self.pull = replace(self.pull, threads=tuple(
+                            replace(thread, is_resolved=True) if thread.id in {"PRRT_0", "PRRT_1"} else thread
+                            for thread in self.pull.threads))
+                    if route.startswith("approved"):
+                        self.pull = replace(self.pull, review_decision="APPROVED", head_oid=f.HEAD,
+                                            approved_head_oids=(f.HEAD,), checks_state="SUCCESS", required_checks_green=True)
+                    self.github.pulls[self.pull.number] = self.pull
+                    if route.startswith("sweep"):
+                        self.github.list_open_pr_numbers = list
+                        linear.rollups = [linear.find_by_marker(marker, title=m.linear_title(self.pull))]
+                    def collector(*_, unavailable=unavailable):
+                        if unavailable:
+                            raise RuntimeError("unavailable")
+                        return self.evidence, {}
+                    before = len(self.github.comments)
+                    m.scan(f.cfg(), self.github, linear, failure_collector=collector)
+                    self.assertTrue(linear.updated)
+                    description = linear.updated[-1][1]
+                    self.assertNotIn("<!-- thread:PRRT_0 -->", description)
+                    if route.endswith("-all"):
+                        self.assertNotIn("<!-- thread:PRRT_1 -->", description)
+                    else:
+                        self.assertIn("<!-- thread:PRRT_1 -->", description)
+                    self.assertIn("Human decision stays.", description)
+                    if "mixed" in route:
+                        self.assertIn("<!-- thread:PRRT_ordinary -->", description)
+                    self.assertEqual(len(self.github.comments), before)
+                    self.assertEqual(linear.canceled, [])
+
+    def test_sweep_rechecks_new_failure_but_preserves_recorded_handoff(self):
+        self.setup_scan(2)
+        linear = f.FakeLinear()
+        marker = m.rollup_marker(self.pull)
+        linear.existing[marker] = "https://linear.app/fixture"
+        linear.existing_descriptions[marker] = m.linear_description(
+            self.pull, [(self.pull.threads[0], "stuck-fixer-handoff-open")], f.cfg())
+        linear.rollups = [linear.find_by_marker(marker, title=m.linear_title(self.pull))]
+        self.github.list_open_pr_numbers = list
+        live = [True]
+        self.evidence.fresh = lambda: live[0]
+        lookup = linear.find_by_marker
+        def find(*args, **kwargs):
+            live[0] = False
+            return lookup(*args, **kwargs)
+        linear.find_by_marker = find
+        m.scan(f.cfg(), self.github, linear, failure_collector=lambda *_: (self.evidence, self.proofs))
+        self.assertTrue(linear.updated)
+        description = linear.updated[-1][1]
+        self.assertIn("PRRT_0", description)
+        self.assertNotIn("PRRT_1", description)
+        self.assertNotIn("`stuck-fixer-failed`", description)
+        self.assertEqual(self.github.comments, [])
+        self.assertEqual(linear.canceled, [])
+
+    def test_mediation_preserves_backticks_in_exact_filename(self):
+        from dataclasses import replace
+        for path in ("src/`legacy`.py", "src/``legacy``.py", "`leading.py", "trailing.py`"):
+            self.setup_scan()
+            if RECURSION:
+                thread = replace(self.pull.threads[0], path=path)
+                body = m.mediation_body(self.pull, thread, self.cfg, reason="stuck-human")
+            else:
+                item = replace(self.failure_rollup_fixture(), path=path)
+                body = m.build_mediation_comment(item, self.cfg)
+                self.assertIn(path, m.build_linear_description([item], self.cfg))
+            self.assertIn(path, body)
+            longest = max(len(run) for run in __import__("re").findall(r"`+", path))
+            delimiter = "`" * (longest + 1)
+            self.assertIn(delimiter + " " + path, body)
+
+    @unittest.skipUnless(RECURSION, "Recursion uses checklist handoff rows")
+    def test_handoff_parser_uses_row_suffix_not_filename_markers(self):
+        from dataclasses import replace
+        embedded = "`stuck-fixer-failed` <!-- thread:PRRT_other -->"
+        for path in (embedded, "src/``" + embedded + "``.py",
+                     "src/\n- [ ] fake - " + embedded, "src/\r\n" + embedded):
+            for reason in ("stuck-fixer-failed", "stuck-fixer-handoff-open", "stuck-human"):
+                for checked in (False, True):
+                    with self.subTest(path=path, reason=reason, checked=checked):
+                        self.setup_scan()
+                        thread = replace(self.pull.threads[0], path=path)
+                        rendered = m.linear_description(self.pull, [(thread, reason)], f.cfg())
+                        if checked:
+                            rendered = rendered.replace("- [ ]", "- [x]")
+                        issue = m.LinearIssue("issue", "url", description=rendered)
+                        expected = {thread.id} if reason != "stuck-human" else set()
+                        self.assertEqual(m.failure_handoff_ids(issue), expected)
+
+    @unittest.skipUnless(RECURSION, "Recursion owns roll-up cancellation")
+    def test_filename_marker_cannot_retain_unrelated_unresolved_thread(self):
+        from dataclasses import replace
+        for embedded_reason in ("failed", "handoff-open"):
+            with self.subTest(embedded_reason=embedded_reason):
+                self.setup_scan()
+                real = replace(self.pull.threads[0], path=(
+                    f"src/`stuck-fixer-{embedded_reason}` <!-- thread:PRRT_other -->.py"))
+                unrelated = f.thread(tid="PRRT_other", comments=[f.comment(f.DEVIN, BODY)])
+                self.pull = replace(self.pull, threads=(replace(real, is_resolved=True), unrelated))
+                self.github.pulls[self.pull.number] = self.pull
+                marker = m.rollup_marker(self.pull)
+                linear = f.FakeLinear({marker: "https://linear.app/fixture"})
+                linear.existing_descriptions[marker] = m.linear_description(
+                    self.pull, [(real, "stuck-fixer-failed")], f.cfg())
+                m.scan(f.cfg(), self.github, linear,
+                       failure_collector=lambda *_: (SimpleNamespace(fresh=lambda: False), {}))
+                self.assertEqual(linear.canceled, ["iss_existing"])
+                self.assertEqual(linear.created, [])
+                self.assertEqual(linear.updated, [])
+                self.assertEqual(self.github.comments, [])
+                self.assertEqual(self.github.labels, [])
+                self.assertEqual(self.github.replies, [])
+                self.assertEqual(self.github.resolves, [])
+
+    @unittest.skipUnless(RECURSION, "Recursion preserves free-form roll-up notes")
+    def test_copied_handoff_rows_in_notes_or_fences_do_not_retain_threads(self):
+        from dataclasses import replace
+        fake = "- [x] `copied.py:1` \u2014 `stuck-fixer-failed` <!-- thread:PRRT_other -->"
+        for place in ("author", "human", "backtick", "tilde", "long-fence", "quoted-section", "quoted-complete-section", "blockquote", "indented"):
+            with self.subTest(place=place):
+                self.setup_scan()
+                real = self.pull.threads[0]
+                unrelated = f.thread(tid="PRRT_other", comments=[f.comment(f.DEVIN, BODY)])
+                rendered = m.linear_description(self.pull, [(real, "stuck-fixer-failed")], f.cfg())
+                if place == "author":
+                    # Author-filed roll-ups can carry pasted review examples forward.
+                    rendered = m.linear_description(self.pull, [(real, "stuck-fixer-failed")],
+                                                    f.cfg(), previous=fake)
+                elif place == "human":
+                    rendered = rendered.replace(m.DEFAULT_HUMAN_DECISION, fake)
+                else:
+                    quote = {"backtick": "```text\n" + fake + "\n```",
+                             "tilde": "~~~markdown\n" + fake + "\n~~~",
+                             "long-fence": "````text\n```\n" + fake + "\n````",
+                             "quoted-section": "```markdown\n## Stuck threads\n\n" + fake + "\n```",
+                             "quoted-complete-section": "```markdown\n## Stuck threads\n\n" + fake + "\n\n## Human decision\n\nCopied decision\n```",
+                             "blockquote": "> " + fake,
+                             "indented": "    " + fake}[place]
+                    rendered = rendered.replace("## Stuck threads\n\n", "## Stuck threads\n\n" + quote + "\n\n", 1)
+                issue = m.LinearIssue("issue", "url", description=rendered)
+                self.assertEqual(m.failure_handoff_ids(issue), {real.id})
+                self.pull = replace(self.pull, threads=(replace(real, is_resolved=True), unrelated))
+                self.github.pulls[self.pull.number] = self.pull
+                marker = m.rollup_marker(self.pull)
+                linear = f.FakeLinear({marker: "https://linear.app/fixture"})
+                linear.existing_descriptions[marker] = rendered
+                m.scan(f.cfg(), self.github, linear,
+                       failure_collector=lambda *_: (SimpleNamespace(fresh=lambda: False), {}))
+                self.assertEqual(linear.canceled, ["iss_existing"])
+                self.assertEqual(linear.updated, [])
+                self.assertEqual(self.github.comments, [])
+                self.assertEqual(self.github.resolves, [])
+
+    @unittest.skipUnless(RECURSION, "Recursion uses checklist handoff rows")
+    def test_trailing_horizontal_whitespace_preserves_unresolved_handoff(self):
+        from itertools import product
+        for suffix, checkbox, newline, reason in product(
+                ("", " ", "\t", " \t "), (" ", "x", "X"), ("\n", "\r\n"),
+                ("stuck-fixer-failed", "stuck-fixer-handoff-open")):
+            with self.subTest(suffix=suffix, checkbox=checkbox, newline=newline, reason=reason):
+                self.setup_scan()
+                real = self.pull.threads[0]
+                rendered = m.linear_description(self.pull, [(real, reason)], f.cfg(), previous="Keep author context.")
+                rendered = rendered.replace(m.DEFAULT_HUMAN_DECISION, "Keep the operator's decision.")
+                rendered = rendered.replace("- [ ]", f"- [{checkbox}]")
+                rendered = rendered.replace(f"<!-- thread:{real.id} -->\n", f"<!-- thread:{real.id} -->{suffix}\n")
+                rendered = rendered.replace("\n", newline)
+                self.assertEqual(m.failure_handoff_ids(m.LinearIssue("issue", "url", description=rendered)), {real.id})
+                marker = m.rollup_marker(self.pull)
+                linear = f.FakeLinear({marker: "https://linear.app/fixture"})
+                linear.existing_descriptions[marker] = rendered
+                m.scan(f.cfg(), self.github, linear,
+                       failure_collector=lambda *_: (SimpleNamespace(fresh=lambda: False), {}))
+                self.assertEqual(linear.canceled, [])
+                self.assertTrue(linear.updated)
+                self.assertIn(f"`stuck-fixer-handoff-open` <!-- thread:{real.id} -->", linear.updated[-1][1])
+                self.assertIn("Keep the operator's decision.", linear.updated[-1][1])
+                self.assertIn("Keep author context.", linear.updated[-1][1])
+                self.assertIn("- [x]" if checkbox.lower() == "x" else "- [ ]", linear.updated[-1][1])
+                self.assertEqual(m.failure_handoff_ids(m.LinearIssue("issue", "url", description=linear.updated[-1][1])), {real.id})
+                self.assertEqual(self.github.comments, [])
+                self.assertEqual(self.github.resolves, [])
+
+    @unittest.skipUnless(RECURSION, "Recursion preserves generated section boundaries")
+    def test_note_headings_and_fences_cannot_replace_or_hide_real_checklist(self):
+        from dataclasses import replace
+        fake = "- [x] `copied.py:1` \u2014 `stuck-fixer-failed` <!-- thread:PRRT_other -->"
+        # An unfenced complete pair in the notes is intrinsically ambiguous: the
+        # notes copy and the generated pair below it are the same shape, so no
+        # rule can tell which one the watcher rendered. Picking the last pair
+        # would be right here but retains a pasted id when the copy is in the
+        # decision; picking the first drops the genuine handoff and cancels the
+        # roll-up. The parser must fail closed and leave the issue unchanged.
+        ambiguous = "## Stuck threads\n\n" + fake + "\n\n## Human decision\n\nCopied decision"
+        for notes in (
+            "## Stuck threads\n\n" + fake + "\n\n## Other\nContext",
+            ambiguous,
+            "```pytest -k foo``` passes",
+            "```python\nUnclosed note fence",
+            "~~~text\nUnclosed note fence",
+            "````markdown\n## Stuck threads\n\n" + fake,
+        ):
+            for resolved in (False, True):
+                with self.subTest(notes=notes, resolved=resolved):
+                    self.setup_scan()
+                    real = self.pull.threads[0]
+                    unrelated = f.thread(tid="PRRT_other", comments=[f.comment(f.DEVIN, BODY)])
+                    rendered = m.linear_description(self.pull, [(real, "stuck-fixer-failed")], f.cfg())
+                    # Model an author editing notes on an existing real roll-up.
+                    rendered = rendered.replace("## Stuck threads\n", "## Author notes\n\n" + notes + "\n\n## Stuck threads\n", 1)
+                    rendered = rendered.replace(m.DEFAULT_HUMAN_DECISION, "Actual human decision.")
+                    issue = m.LinearIssue("issue", "url", description=rendered)
+                    if notes == ambiguous:
+                        with self.assertRaises(m.AmbiguousChecklist):
+                            m.failure_handoff_ids(issue)
+                    else:
+                        self.assertEqual(m.failure_handoff_ids(issue), {real.id})
+                    self.pull = replace(self.pull, threads=(replace(real, is_resolved=resolved), unrelated))
+                    self.github.pulls[self.pull.number] = self.pull
+                    marker = m.rollup_marker(self.pull)
+                    linear = f.FakeLinear({marker: "https://linear.app/fixture"})
+                    linear.existing_descriptions[marker] = rendered
+                    m.scan(f.cfg(), self.github, linear,
+                           failure_collector=lambda *_: (SimpleNamespace(fresh=lambda: False), {}))
+                    if notes == ambiguous:
+                        # Fail closed: no id is retained, nothing is rewritten
+                        # or canceled, whether or not the genuine thread resolved.
+                        self.assertEqual(linear.canceled, [])
+                        self.assertEqual(linear.updated, [])
+                        self.assertEqual(linear.created, [])
+                    else:
+                        self.assertEqual(linear.canceled, ["iss_existing"] if resolved else [])
+                        if not resolved:
+                            updated = linear.updated[-1][1]
+                            self.assertIn(notes, updated)
+                            self.assertIn("Actual human decision.", updated)
+                            self.assertEqual(m.failure_handoff_ids(m.LinearIssue("issue", "url", description=updated)), {real.id})
+                        else:
+                            self.assertEqual(linear.updated, [])
+                    self.assertEqual(self.github.comments, [])
+                    self.assertEqual(self.github.resolves, [])
+
+    @unittest.skipUnless(RECURSION, "Recursion preserves generated section boundaries")
+    def test_decision_examples_cannot_replace_or_hide_real_checklist(self):
+        from dataclasses import replace
+        fake = "- [x] `copied.py:1` — `stuck-fixer-failed` <!-- thread:PRRT_other -->"
+        copied = "## Stuck threads\n\n" + fake + "\n\n## Human decision\n\nCopied decision"
+        trailer = "*Auto-updated by `.github/workflows/stuck-thread-watch.yml`. Copied trailer.*"
+        decisions = {
+            "closed-backtick": "Snapshot before merge:\n```markdown\n" + copied + "\n```\nKeep as is.",
+            "closed-tilde": "~~~\n" + copied + "\n~~~",
+            "nested-long-fence": "````md\n```\n" + copied + "\n```\n````",
+            "copied-trailer": "```markdown\n" + copied + "\n\n" + trailer + "\n```",
+            "unclosed-backtick": "```markdown\n" + copied,
+            "unclosed-tilde": "~~~text\n" + copied + "\n\n" + trailer,
+            "blockquote": "> " + copied.replace("\n", "\n> "),
+            # Without a rendered notes heading nothing precedes the generated pair.
+            "unfenced-without-notes": copied,
+        }
+        for name, decision in decisions.items():
+            for notes in ("", "Keep author context."):
+                if notes and name == "unfenced-without-notes":
+                    continue
+                for resolved in (False, True):
+                    for newline in ("\n", "\r\n"):
+                        with self.subTest(decision=name, notes=bool(notes), resolved=resolved, newline=repr(newline)):
+                            self.setup_scan()
+                            real = replace(self.pull.threads[0], path="src/a b.py")
+                            unrelated = f.thread(tid="PRRT_other", comments=[f.comment(f.DEVIN, BODY)])
+                            rendered = m.linear_description(self.pull, [(real, "stuck-fixer-failed")], f.cfg(), previous=notes)
+                            rendered = rendered.replace(m.DEFAULT_HUMAN_DECISION, decision).replace("\n", newline)
+                            marker = m.rollup_marker(self.pull)
+                            if notes and name.startswith("unclosed-"):
+                                # Indistinguishable from a notes copy followed by
+                                # an unclosed fence hiding the genuine checklist.
+                                with self.assertRaises(m.AmbiguousChecklist):
+                                    m.failure_handoff_ids(m.LinearIssue("issue", "url", description=rendered))
+                                self.pull = replace(self.pull, threads=(replace(real, is_resolved=resolved), unrelated))
+                                self.github.pulls[self.pull.number] = self.pull
+                                linear = f.FakeLinear({marker: "https://linear.app/fixture"})
+                                linear.existing_descriptions[marker] = rendered
+                                m.scan(f.cfg(), self.github, linear,
+                                       failure_collector=lambda *_: (SimpleNamespace(fresh=lambda: False), {}))
+                                self.assertEqual(linear.canceled, [])
+                                self.assertEqual(linear.updated, [])
+                                self.assertEqual(linear.created, [])
+                                self.assertEqual(self.github.comments, [])
+                                self.assertEqual(self.github.resolves, [])
+                                continue
+                            self.assertEqual(m.failure_handoff_ids(m.LinearIssue("issue", "url", description=rendered)), {real.id})
+                            self.assertEqual(m.existing_human_decision(rendered), decision)
+                            self.assertEqual(m.existing_author_notes(rendered, marker), notes)
+                            self.pull = replace(self.pull, threads=(replace(real, is_resolved=resolved), unrelated))
+                            self.github.pulls[self.pull.number] = self.pull
+                            linear = f.FakeLinear({marker: "https://linear.app/fixture"})
+                            linear.existing_descriptions[marker] = rendered
+                            m.scan(f.cfg(), self.github, linear,
+                                   failure_collector=lambda *_: (SimpleNamespace(fresh=lambda: False), {}))
+                            self.assertEqual(linear.canceled, ["iss_existing"] if resolved else [])
+                            if resolved:
+                                self.assertEqual(linear.updated, [])
+                            else:
+                                updated = linear.updated[-1][1]
+                                self.assertIn(f"`stuck-fixer-handoff-open` <!-- thread:{real.id} -->", updated)
+                                self.assertNotIn("`stuck-fixer-handoff-open` <!-- thread:PRRT_other -->", updated)
+                                self.assertIn(decision, updated)
+                                self.assertEqual(m.existing_human_decision(updated), decision)
+                                self.assertEqual(m.existing_author_notes(updated, marker), notes)
+                                self.assertEqual(m.failure_handoff_ids(m.LinearIssue("issue", "url", description=updated)), {real.id})
+                            self.assertEqual(self.github.comments, [])
+                            self.assertEqual(self.github.resolves, [])
+
+    @unittest.skipUnless(RECURSION, "Recursion preserves generated section boundaries")
+    def test_complete_fenced_pair_in_notes_cannot_replace_real_checklist(self):
+        from dataclasses import replace
+        fake = "- [x] `copied.py:1` — `stuck-fixer-failed` <!-- thread:PRRT_other -->"
+        copied = "## Stuck threads\n\n" + fake + "\n\n## Human decision\n\nCopied decision"
+        for fence in ("```markdown\n" + copied + "\n```", "~~~\n" + copied + "\n~~~",
+                      "````md\n```\n" + copied + "\n```\n````"):
+            notes = "Snapshot:\n" + fence + "\nKeep for context."
+            for resolved in (False, True):
+                with self.subTest(fence=fence[:3], resolved=resolved):
+                    self.setup_scan()
+                    real = self.pull.threads[0]
+                    unrelated = f.thread(tid="PRRT_other", comments=[f.comment(f.DEVIN, BODY)])
+                    rendered = m.linear_description(self.pull, [(real, "stuck-fixer-failed")], f.cfg())
+                    rendered = rendered.replace("## Stuck threads\n", "## Author notes\n\n" + notes + "\n\n## Stuck threads\n", 1)
+                    rendered = rendered.replace(m.DEFAULT_HUMAN_DECISION, "Actual human decision.")
+                    marker = m.rollup_marker(self.pull)
+                    self.assertEqual(m.failure_handoff_ids(m.LinearIssue("issue", "url", description=rendered)), {real.id})
+                    self.assertEqual(m.existing_author_notes(rendered, marker), notes)
+                    self.assertEqual(m.existing_human_decision(rendered), "Actual human decision.")
+                    self.pull = replace(self.pull, threads=(replace(real, is_resolved=resolved), unrelated))
+                    self.github.pulls[self.pull.number] = self.pull
+                    linear = f.FakeLinear({marker: "https://linear.app/fixture"})
+                    linear.existing_descriptions[marker] = rendered
+                    m.scan(f.cfg(), self.github, linear,
+                           failure_collector=lambda *_: (SimpleNamespace(fresh=lambda: False), {}))
+                    self.assertEqual(linear.canceled, ["iss_existing"] if resolved else [])
+                    self.assertEqual(linear.created, [])
+                    if resolved:
+                        self.assertEqual(linear.updated, [])
+                    else:
+                        updated = linear.updated[-1][1]
+                        self.assertIn(f"`stuck-fixer-handoff-open` <!-- thread:{real.id} -->", updated)
+                        self.assertNotIn("`stuck-fixer-handoff-open` <!-- thread:PRRT_other -->", updated)
+                        self.assertIn(notes, updated)
+                        self.assertEqual(m.existing_author_notes(updated, marker), notes)
+                        self.assertEqual(m.existing_human_decision(updated), "Actual human decision.")
+                        self.assertEqual(m.failure_handoff_ids(m.LinearIssue("issue", "url", description=updated)), {real.id})
+                    self.assertEqual(self.github.comments, [])
+                    self.assertEqual(self.github.resolves, [])
+
+    @unittest.skipUnless(RECURSION, "Recursion owns roll-up cancellation")
+    def test_unclosed_fence_in_checklist_fails_closed_without_retaining_or_canceling(self):
+        from dataclasses import replace
+        fake = "- [x] `copied.py:1` — `stuck-fixer-failed` <!-- thread:PRRT_other -->"
+        for opener in ("```markdown", "~~~text"):
+            for resolved in (False, True):
+                with self.subTest(opener=opener, resolved=resolved):
+                    self.setup_scan()
+                    real = self.pull.threads[0]
+                    unrelated = f.thread(tid="PRRT_other", comments=[f.comment(f.DEVIN, BODY)])
+                    rendered = m.linear_description(self.pull, [(real, "stuck-fixer-failed")], f.cfg(), previous="Keep author context.")
+                    rendered = rendered.replace(m.DEFAULT_HUMAN_DECISION, "Actual human decision.")
+                    # An author pastes an example row behind an opener they never close,
+                    # so the genuine row below it is indistinguishable from the copy.
+                    rendered = rendered.replace("## Stuck threads\n\n", "## Stuck threads\n\n" + opener + "\n" + fake + "\n\n", 1)
+                    issue = m.LinearIssue("iss_existing", "url", description=rendered)
+                    with self.assertRaises(m.AmbiguousChecklist):
+                        m.failure_handoff_ids(issue)
+                    self.pull = replace(self.pull, threads=(replace(real, is_resolved=resolved), unrelated))
+                    with self.assertRaises(m.AmbiguousChecklist):
+                        m.open_failure_handoffs(self.pull, issue)
+                    self.github.pulls[self.pull.number] = self.pull
+                    marker = m.rollup_marker(self.pull)
+                    linear = f.FakeLinear({marker: "https://linear.app/fixture"})
+                    linear.existing_descriptions[marker] = rendered
+                    m.scan(f.cfg(), self.github, linear,
+                           failure_collector=lambda *_: (SimpleNamespace(fresh=lambda: False), {}))
+                    # Fail closed: the copied id is never admitted, and the genuine
+                    # unresolved handoff is neither rewritten away nor canceled.
+                    self.assertEqual(linear.canceled, [])
+                    self.assertEqual(linear.updated, [])
+                    self.assertEqual(linear.created, [])
+                    self.assertEqual(self.github.comments, [])
+                    self.assertEqual(self.github.labels, [])
+                    self.assertEqual(self.github.resolves, [])
+
+    @unittest.skipUnless(RECURSION, "Recursion owns roll-up cancellation")
+    def test_fence_spanning_notes_and_decision_preserves_unresolved_handoff(self):
+        for fence in ("```", "~~~"):
+            for newline in ("\n", "\r\n"):
+                with self.subTest(fence=fence, newline=repr(newline)):
+                    self.setup_scan()
+                    real = self.pull.threads[0]
+                    self.assertFalse(real.is_resolved)
+                    rendered = m.linear_description(self.pull, [(real, "stuck-fixer-failed")], f.cfg())
+                    rendered = rendered.replace(
+                        "## Stuck threads\n",
+                        "## Author notes\n\n" + fence + "markdown\nUnclosed note example\n\n## Stuck threads\n", 1,
+                    ).replace(m.DEFAULT_HUMAN_DECISION, fence + "\nActual human decision.")
+                    rendered = rendered.replace("\n", newline)
+                    issue = m.LinearIssue("iss_existing", "url", description=rendered)
+                    with self.assertRaises(m.AmbiguousChecklist):
+                        m.failure_handoff_ids(issue)
+                    marker = m.rollup_marker(self.pull)
+                    linear = f.FakeLinear({marker: "https://linear.app/fixture"})
+                    linear.existing_descriptions[marker] = rendered
+                    m.scan(f.cfg(), self.github, linear,
+                           failure_collector=lambda *_: (SimpleNamespace(fresh=lambda: False), {}))
+                    self.assertEqual(linear.canceled, [])
+                    self.assertEqual(linear.updated, [])
+                    self.assertEqual(linear.created, [])
+                    self.assertEqual(self.github.comments, [])
+                    self.assertEqual(self.github.labels, [])
+                    self.assertEqual(self.github.resolves, [])
+
+    @unittest.skipUnless(RECURSION, "Recursion preserves generated section boundaries")
+    def test_unfenced_complete_pair_with_notes_fails_closed_instead_of_guessing(self):
+        from dataclasses import replace
+        copied = ("## Stuck threads\n\n- [ ] `example.py:1` — `stuck-fixer-failed` "
+                  "<!-- thread:PRRT_example -->\n\n## Human decision\n\nCopied decision")
+        # With author notes rendered, a second unfenced complete pair can sit in
+        # the notes or in the decision, and the two pairs are indistinguishable.
+        # The decision case is the one the earlier tests skipped: guessing the
+        # last pair retained PRRT_example and canceled the genuine handoff.
+        placements = {
+            "decision": ("Real notes", "Actual decision with copied example:\n\n" + copied),
+            "notes": ("Real notes\n\n" + copied, "Actual human decision."),
+            "both": ("Real notes\n\n" + copied, "Actual decision with copied example:\n\n" + copied),
+        }
+        for place, (notes, decision) in placements.items():
+            for resolved in (False, True):
+                for newline in ("\n", "\r\n"):
+                    with self.subTest(place=place, resolved=resolved, newline=repr(newline)):
+                        self.setup_scan()
+                        real = self.pull.threads[0]
+                        rendered = m.linear_description(self.pull, [(real, "stuck-fixer-failed")], f.cfg())
+                        rendered = rendered.replace("## Stuck threads\n", "## Author notes\n\n" + notes + "\n\n## Stuck threads\n", 1)
+                        rendered = rendered.replace(m.DEFAULT_HUMAN_DECISION, decision).replace("\n", newline)
+                        self.assertIn("<!-- thread:PRRT_example -->", rendered)
+                        issue = m.LinearIssue("iss_existing", "url", description=rendered)
+                        with self.assertRaises(m.AmbiguousChecklist):
+                            m.failure_handoff_ids(issue)
+                        self.pull = replace(self.pull, threads=(replace(real, is_resolved=resolved),))
+                        with self.assertRaises(m.AmbiguousChecklist):
+                            m.open_failure_handoffs(self.pull, issue)
+                        self.github.pulls[self.pull.number] = self.pull
+                        marker = m.rollup_marker(self.pull)
+                        linear = f.FakeLinear({marker: "https://linear.app/fixture"})
+                        linear.existing_descriptions[marker] = rendered
+                        m.scan(f.cfg(), self.github, linear,
+                               failure_collector=lambda *_: (SimpleNamespace(fresh=lambda: False), {}))
+                        # Fail closed before any id is read: the copied id is never
+                        # retained and the genuine handoff is neither rewritten
+                        # away nor canceled, even once the genuine thread resolves.
+                        self.assertEqual(linear.canceled, [])
+                        self.assertEqual(linear.updated, [])
+                        self.assertEqual(linear.created, [])
+                        self.assertEqual(self.github.comments, [])
+                        self.assertEqual(self.github.labels, [])
+                        self.assertEqual(self.github.resolves, [])
+
+    @unittest.skipUnless(RECURSION, "Recursion preserves generated section boundaries")
+    def test_unclosed_fence_after_notes_copy_cannot_hide_genuine_handoff(self):
+        copied = ("## Stuck threads\n\n- [ ] `example.py:1` — `stuck-fixer-failed` "
+                  "<!-- thread:PRRT_example -->\n\n## Human decision\n\nCopied decision")
+        for fence in ("```markdown", "~~~text"):
+            for newline in ("\n", "\r\n"):
+                with self.subTest(fence=fence, newline=repr(newline)):
+                    self.setup_scan()
+                    real = self.pull.threads[0]
+                    self.assertFalse(real.is_resolved)
+                    rendered = m.linear_description(self.pull, [(real, "stuck-fixer-failed")], f.cfg())
+                    rendered = rendered.replace(
+                        "## Stuck threads\n", "## Author notes\n\nReal notes\n\n" + copied
+                        + "\n\n" + fence + "\n\n## Stuck threads\n", 1,
+                    ).replace("\n", newline)
+                    with self.assertRaises(m.AmbiguousChecklist):
+                        m.failure_handoff_ids(m.LinearIssue("existing", "url", description=rendered))
+                    marker = m.rollup_marker(self.pull)
+                    linear = f.FakeLinear({marker: "https://linear.app/fixture"})
+                    linear.existing_descriptions[marker] = rendered
+                    m.scan(f.cfg(), self.github, linear,
+                           failure_collector=lambda *_: (SimpleNamespace(fresh=lambda: False), {}))
+                    self.assertEqual(linear.canceled, [])
+                    self.assertEqual(linear.updated, [])
+                    self.assertEqual(linear.created, [])
+                    self.assertEqual(self.github.comments, [])
+                    self.assertEqual(self.github.labels, [])
+                    self.assertEqual(self.github.resolves, [])
+
+    @unittest.skipUnless(RECURSION, "Recursion preserves free-form roll-up notes")
+    def test_fenced_notes_heading_example_does_not_replace_genuine_notes(self):
+        for fence in ("```md", "~~~"):
+            example = fence + "\n## Author notes\n\nQuoted notes\n" + fence[:3]
+            for place in ("preamble", "inside"):
+                for newline in ("\n", "\r\n"):
+                    with self.subTest(fence=fence, place=place, newline=repr(newline)):
+                        self.setup_scan()
+                        real = self.pull.threads[0]
+                        if place == "preamble":
+                            # A fenced example above the rendered heading is quoted
+                            # text; a raw line scan used to take it as the notes.
+                            expected = "Real notes"
+                            rendered = m.linear_description(self.pull, [(real, "stuck-fixer-failed")], f.cfg(), previous=expected)
+                            rendered = rendered.replace("## Author notes\n", example + "\n\n## Author notes\n", 1)
+                        else:
+                            expected = "Real notes\n\n" + example
+                            rendered = m.linear_description(self.pull, [(real, "stuck-fixer-failed")], f.cfg(), previous=expected)
+                        rendered = rendered.replace(m.DEFAULT_HUMAN_DECISION, "Actual human decision.").replace("\n", newline)
+                        marker = m.rollup_marker(self.pull)
+                        self.assertEqual(m.existing_author_notes(rendered, marker), expected)
+                        self.assertEqual(m.failure_handoff_ids(m.LinearIssue("issue", "url", description=rendered)), {real.id})
+                        self.github.pulls[self.pull.number] = self.pull
+                        linear = f.FakeLinear({marker: "https://linear.app/fixture"})
+                        linear.existing_descriptions[marker] = rendered
+                        m.scan(f.cfg(), self.github, linear,
+                               failure_collector=lambda *_: (SimpleNamespace(fresh=lambda: False), {}))
+                        self.assertEqual(linear.canceled, [])
+                        self.assertEqual(len(linear.updated), 1)
+                        updated = linear.updated[-1][1]
+                        self.assertEqual(m.existing_author_notes(updated, marker), expected)
+                        self.assertIn("## Author notes\n\n" + expected + "\n\n## Stuck threads\n", updated)
+                        self.assertEqual(m.existing_human_decision(updated), "Actual human decision.")
+                        self.assertIn(f"`stuck-fixer-handoff-open` <!-- thread:{real.id} -->", updated)
+                        self.assertEqual(m.failure_handoff_ids(m.LinearIssue("issue", "url", description=updated)), {real.id})
+                        self.assertEqual(self.github.comments, [])
+                        self.assertEqual(self.github.resolves, [])
+
+    @unittest.skipUnless(RECURSION, "Recursion owns roll-up cancellation")
+    def test_sweep_isolates_ambiguous_rollup_and_still_processes_the_rest(self):
+        from dataclasses import replace
+        copied = ("## Stuck threads\n\n- [ ] `example.py:1` — `stuck-fixer-failed` "
+                  "<!-- thread:PRRT_example -->\n\n## Human decision\n\nCopied decision")
+        for shape in ("unclosed-fence-in-checklist", "unfenced-pair-with-notes"):
+            with self.subTest(shape=shape):
+                self.setup_scan()
+                real = self.pull.threads[0]
+                draft = f.pull(number=10, threads=[real], draft=True)
+                merged = f.pull(number=11, threads=[real], state="MERGED")
+                retained = f.pull(number=12, threads=[real])
+                done = f.pull(number=13, threads=[replace(real, is_resolved=True)])
+                ambiguous = m.linear_description(draft, [(real, "stuck-fixer-failed")], f.cfg(), previous="Real notes")
+                if shape == "unclosed-fence-in-checklist":
+                    ambiguous = ambiguous.replace("## Stuck threads\n\n", "## Stuck threads\n\n```md\n", 1)
+                else:
+                    ambiguous = ambiguous.replace(m.DEFAULT_HUMAN_DECISION, "Actual decision with copied example:\n\n" + copied)
+                with self.assertRaises(m.AmbiguousChecklist):
+                    m.failure_handoff_ids(m.LinearIssue("ambiguous", "url", description=ambiguous))
+                linear = f.FakeLinear()
+                for extra, issue_id in ((retained, "valid"), (done, "done")):
+                    marker = m.rollup_marker(extra)
+                    linear.existing[marker] = f"https://linear.app/{issue_id}"
+                    linear.existing_ids[marker] = issue_id
+                    linear.existing_descriptions[marker] = m.linear_description(extra, [(real, "stuck-fixer-failed")], f.cfg())
+                # The ambiguous roll-up comes first so a loop-level exit would
+                # silently leave every later roll-up untouched.
+                linear.rollups = [
+                    m.LinearIssue("ambiguous", "url", title=m.linear_title(draft), state_type="triage", description=ambiguous),
+                    m.LinearIssue("merged", "url", title=m.linear_title(merged), state_type="triage", description=""),
+                    m.LinearIssue("valid", "url", title=m.linear_title(retained), state_type="triage",
+                                  description=linear.existing_descriptions[m.rollup_marker(retained)]),
+                    m.LinearIssue("done", "url", title=m.linear_title(done), state_type="triage",
+                                  description=linear.existing_descriptions[m.rollup_marker(done)]),
+                ]
+                github = f.FakeGitHub([draft, merged, retained, done])
+                github.list_open_pr_numbers = list  # every roll-up is reached only by the sweep
+                m.scan(f.cfg(), github, linear,
+                       failure_collector=lambda *_: (SimpleNamespace(fresh=lambda: False), {}))
+                # The ambiguous draft roll-up stays unchanged; the merged PR's
+                # roll-up and the fully resolved one are canceled; the open PR
+                # with a retained unresolved handoff is rewritten.
+                self.assertEqual(linear.canceled, ["merged", "done"])
+                self.assertEqual([issue_id for issue_id, _ in linear.updated], ["valid"])
+                self.assertIn(f"`stuck-fixer-handoff-open` <!-- thread:{real.id} -->", linear.updated[0][1])
+                self.assertEqual(linear.created, [])
+                self.assertEqual(github.comments, [])
+                self.assertEqual(github.labels, [])
+                self.assertEqual(github.resolves, [])
+
+    @unittest.skipUnless(RECURSION, "Recursion retains exact Unicode filenames")
+    def test_non_newline_unicode_separators_preserve_handoffs(self):
+        from dataclasses import replace
+        for separator in ("\u2028", "\u2029", "\x85", "\v", "\f", "\x1c", "\x1d", "\x1e"):
+            with self.subTest(separator=repr(separator)):
+                self.setup_scan()
+                real = replace(self.pull.threads[0], path="src/a" + separator + "b.py")
+                self.pull = replace(self.pull, threads=(real,))
+                self.github.pulls[self.pull.number] = self.pull
+                rendered = m.linear_description(self.pull, [(real, "stuck-fixer-failed")], f.cfg())
+                self.assertEqual(m.failure_handoff_ids(m.LinearIssue("issue", "url", description=rendered)), {real.id})
+                marker = m.rollup_marker(self.pull)
+                linear = f.FakeLinear({marker: "https://linear.app/fixture"})
+                linear.existing_descriptions[marker] = rendered
+                m.scan(f.cfg(), self.github, linear,
+                       failure_collector=lambda *_: (SimpleNamespace(fresh=lambda: False), {}))
+                self.assertEqual(linear.canceled, [])
+                self.assertTrue(linear.updated)
+                self.assertEqual(m.failure_handoff_ids(m.LinearIssue("issue", "url", description=linear.updated[-1][1])), {real.id})
+                self.assertEqual(self.github.comments, [])
+                self.assertEqual(self.github.resolves, [])
+
+    def test_existing_marker_deduplicates_failure_delivery(self):
+        marker = m.mediation_marker("PRRT_0") if RECURSION else m.marker("PRRT_0")
+        self.setup_scan(comments=[f.comment("pat-user", marker)])
+        self.assertEqual(self.scan(), [])
+
+    def test_repository_specific_cap_window_is_preserved(self):
+        comments = []
+        for index in range(3):
+            marker = m.mediation_marker(f"old{index}") if RECURSION else m.marker(f"old{index}")
+            comments.append(f.comment("pat-user", marker, hours_ago=13) if RECURSION
+                            else f.comment("pat-user", marker, created=f.NOW - timedelta(hours=13)))
+        self.setup_scan(5, comments)
+        self.assertEqual(len(self.scan()), 3 if RECURSION else 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

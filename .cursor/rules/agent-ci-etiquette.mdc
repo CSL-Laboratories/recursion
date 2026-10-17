@@ -1,0 +1,19 @@
+---
+description: Agent CI etiquette — drafts, batched pushes, no workflow edits
+alwaysApply: true
+---
+
+## Agent CI etiquette
+
+Blacksmith minutes are paid. Agents and bots keep CI cheap:
+
+- Open every PR as a **draft**. Batch pushes. Mark the PR ready **once**.
+- Never merge a PR. Never rebase or merge `master` into a review branch unless
+  there is a real conflict with `master`.
+- Never edit `.github/workflows/**` or other CI/runner configuration. A
+  human-assigned Linear issue is the only exception, and it must name the
+  workflow files.
+- Bots that mark a PR ready must use their own GitHub identity (GitHub App
+  or PAT). Do not mark ready with `GITHUB_TOKEN`: GitHub does not run
+  `ready_for_review` workflows for that token, so Devin Review and CI never
+  start.

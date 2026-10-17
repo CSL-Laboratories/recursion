@@ -1558,6 +1558,31 @@ class VerdictAndResolveTests(unittest.TestCase):
         self._assert_resolves('Thread text:\n<pre title="/>"></pre>\n\n' + block)
         self._assert_resolves("Thread text:\n<pre title='/>'></pre>\n\n" + block)
 
+    def test_type1_pre_with_blank_line_before_gt_does_not_resolve(self) -> None:
+        # Devin r4304188481 at 5a50fb1f: <pre plus two line endings is not a
+        # CommonMark 6.6 tag (_skip_html_tag_space stops after one), so
+        # _html_tag_at returned None and a following triple authorized.
+        # Type 1 still starts at line-start <pre plus EOL; blank lines do
+        # not end it. Scan path is parse_thread_verdicts → classify_resolve
+        # → scan. Do not loosen 6.6 whitespace: type 6 (<div) ends at a
+        # blank line, so successive newlines are not tag space.
+        block = verdict_block("PRRT_1")
+        self._assert_no_resolve("Thread text:\n<pre\n\n>\n" + block)
+        self._assert_no_resolve("Thread text:\n<script\n\n>\n" + block)
+        self._assert_resolves("Thread text:\n<pre\n\n></pre>\n\n" + block)
+        self._assert_resolves("Thread text:\n<pre\n\n>\n</pre>\n\n" + block)
+
+    def test_type1_malformed_pre_attributes_do_not_resolve(self) -> None:
+        # Devin r4304188525 at 5a50fb1f: title=x"y and @x are not 6.6
+        # attributes, so _html_tag_at returned None and the <pre opener
+        # was ignored. CommonMark type 1 still opens on <pre plus space.
+        # Scan path is parse_thread_verdicts → classify_resolve → scan.
+        block = verdict_block("PRRT_1")
+        self._assert_no_resolve('Thread text:\n<pre title=x"y>\n' + block)
+        self._assert_no_resolve("Thread text:\n<pre @x>\n" + block)
+        self._assert_resolves('Thread text:\n<pre title=x"y></pre>\n\n' + block)
+        self._assert_resolves("Thread text:\n<pre @x></pre>\n\n" + block)
+
     def test_unclosed_html_raw_blocks_do_not_resolve(self) -> None:
         # CommonMark 4.6 types 3–5 continue through EOF without a closer, so
         # a following producer-shaped triple is an echo inside the raw block.

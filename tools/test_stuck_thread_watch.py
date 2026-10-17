@@ -1549,6 +1549,15 @@ class VerdictAndResolveTests(unittest.TestCase):
             "<details><summary>x</summary><pre>q</pre></details>\n\n" + verdict_block("PRRT_1")
         )
 
+    def test_quoted_slash_gt_in_pre_attribute_does_not_self_close(self) -> None:
+        # Codex P1 4302717106: a first-`>` regex treats title="/>" as self-close.
+        # Scan path is parse_thread_verdicts → classify_resolve → scan.
+        block = verdict_block("PRRT_1")
+        self._assert_no_resolve('Thread text:\n<pre title="/>">\n' + block)
+        self._assert_no_resolve("Thread text:\n<pre title='/>'>\n" + block)
+        self._assert_resolves('Thread text:\n<pre title="/>"></pre>\n\n' + block)
+        self._assert_resolves("Thread text:\n<pre title='/>'></pre>\n\n" + block)
+
     def test_unclosed_html_raw_blocks_do_not_resolve(self) -> None:
         # CommonMark 4.6 types 3–5 continue through EOF without a closer, so
         # a following producer-shaped triple is an echo inside the raw block.

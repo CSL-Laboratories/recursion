@@ -576,10 +576,10 @@ def _html_tag_at(
 ) -> tuple[int, str, bool, bool] | str | None:
     """Parse one CommonMark open/close tag at *lt*, or None / ``unclosed``.
 
-    Quoted attribute values may contain ``>`` and ``</pre>``. A first-``>``
-    scan would treat those as the tag end and leave an echoed RESOLVE
-    authorizing. An opener with no closer, or a quote that never ends,
-    is ``unclosed`` so the rest of the prose fails closed.
+    Quoted attribute values may contain ``>``, ``/>``, and ``</pre>``. A
+    first-``>`` scan would treat those as the tag end and leave an echoed
+    RESOLVE authorizing. An opener with no closer, or a quote that never
+    ends, is ``unclosed`` so the rest of the prose fails closed.
     """
     length = len(visible)
     index = lt + 1
@@ -646,8 +646,8 @@ def _html_constructs_open(visible: str) -> bool:
     CommonMark 4.6 types 2–5: ``<!--`` / ``-->``, ``<?`` / ``?>``, ``<!`` +
     ASCII letter / ``>``, ``<![CDATA[`` / ``]]>``. Tags keep the ordered
     stack already used for unmatched and mis-nested closes. Quoted
-    attribute values are scanned as CommonMark 6.6, so ``>`` or
-    ``</pre>`` inside quotes cannot close the opener.
+    attribute values are scanned as CommonMark 6.6, so ``>``, ``/>``, or
+    ``</pre>`` inside quotes cannot close or self-close the opener.
     """
     stack: list[str] = []
     index = 0

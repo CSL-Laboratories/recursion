@@ -50,6 +50,8 @@ If a task could be read two materially different ways, stop and record a blocker
 1. **Never `git push --force`.** Under any circumstance, in any script, for any reason.
 2. **Never commit to or merge into `master`.** Commit on a review branch and open a
    PR for founder review and merge after required reviews and checks. Agents never merge.
+   Until rulesets enforce it, no founder merges their own PR without another founder's
+   approval.
    Name the branch `csl-<N>-<slug>` (for example `csl-26-short-slug`), optionally prefixed with a GitHub username (for example
    `chaandansaini101/csl-26-short-slug`). Put `CSL-N` in the PR title so Linear links
    the issue. pr-lint matches `CSL-[0-9]+` case-sensitively, so a lowercase branch
@@ -71,6 +73,8 @@ If a task could be read two materially different ways, stop and record a blocker
    the R2a permission-profile fix has landed. Lucas's company-resource and spending
    approvals still apply; quota resets require separate human approval. No live action,
    accepted contract, live capital or agent merge permission is authorized by these docs.
+   Destructive or irreversible live actions, even on your own accounts, need explicit
+   approval for each action. "R2a landed" means a merged, reviewed PR.
 
 ## Escalate, don't guess
 

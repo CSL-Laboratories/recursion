@@ -86,6 +86,8 @@ See [AGENTS.md#when-claude-cant-fix-a-review-thread](AGENTS.md#when-claude-cant-
   under `CONTROL_PLANE.md`; agents never merge. All three founders make the final release
   decision, and Lucas retains the reserved decisions and final tie-break. This workflow
   does not accept a pending contract or bypass an owner hold.
+  Until rulesets enforce it, no founder merges their own PR without another founder's
+  approval.
 - Keep changes inside your declared allowed paths. `CONTROL_PLANE.md`, `ANCHOR.md`,
   `state/DECISIONS.md`, `scripts/`, `schemas/` and `.env` are protected paths — a change
   there needs a separately recorded founder-approved authoring session under
@@ -123,5 +125,7 @@ On Windows, paths can exceed 260 characters; pass `-c core.longpaths=true` per G
   require separate human approval. Outside that explicit scope, propose actions in
   `state/PROPOSALS.md`; do not perform them. Agents never merge, and these docs grant no
   specific live action, accepted contract or live-capital permission.
+  Destructive or irreversible live actions, even on your own accounts, need explicit
+  approval for each action. "R2a landed" means a merged, reviewed PR.
 
 When in doubt, prefer a small, verified change with a named gate over a large, plausible one.

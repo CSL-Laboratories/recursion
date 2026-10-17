@@ -44,6 +44,18 @@ VERDICT_MARKER_LINE_RE = re.compile(
     r" {0,3}<!--\s*" + VERDICT_PREFIX + r":(?P<tid>[^\s>]+)\s*-->[ \t]*",
     re.IGNORECASE,
 )
+VERDICT_MARKER_RE = re.compile(
+    r"<!--\s*" + VERDICT_PREFIX + r":(?P<tid>[^\s>]+)\s*-->",
+    re.IGNORECASE,
+)
+INLINE_CODE_RE = re.compile(r"(`+)[^`]*?\1")
+HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+HTML_TAG_RE = re.compile(
+    r"<(?P<close>/?)(?P<name>[A-Za-z][A-Za-z0-9-]*)(?=[\s/>])[^>]*?(?P<self>/?)>"
+)
+HTML_VOID_TAGS = frozenset(
+    "area base br col embed hr img input link meta param source track wbr".split()
+)
 VERDICT_ACTION_RE = re.compile(
     r"^CODEX-THREAD:\s*(RESOLVE|DECIDE|MISSING|AMBIGUOUS)\s*$",
     re.IGNORECASE | re.MULTILINE,
@@ -404,89 +416,117 @@ def is_known_bot_login(login: str | None, cfg: Config) -> bool:
     )
 
 
-def verdict_text_runs(text: str) -> list[list[str]]:
-    """Split a comment into runs of lines that render as ordinary text.
+def _open_markup_before(lines: list[str]) -> bool:
+    """True if free prose leaves a fence, HTML comment, or HTML element open.
 
-    Fenced code (backtick or tilde; the closer uses the same character and is
-    at least as long as the opener) and blockquote lines are dropped so an
-    echoed verdict cannot authorize. Every dropped region also ends the current
-    run, so text on either side of a quote or fence is never read as one
-    verdict. An opener without a closer hides everything after it, as it
-    renders. This recognizes the generated protocol shape only; it is not a
-    Markdown parser. Fence helpers are shared with the roll-up checklist code.
+    Anything after such an opener renders inside it, so a verdict section that
+    follows is an echo, not a ruling. This is deliberately coarse: inline code
+    spans are ignored, and any other unbalanced non-void tag fails closed.
     """
-    lines = (text or "").replace("\r\n", "\n").split("\n")
-    runs: list[list[str]] = []
-    current: list[str] = []
-    expected = 0
-    for index, line in _visible_lines(lines, 0, len(lines), unclosed_hides=True):
-        if index != expected and current:
-            runs.append(current)
-            current = []
-        expected = index + 1
-        if line.lstrip().startswith(">"):
-            if current:
-                runs.append(current)
-                current = []
+    text: list[str] = []
+    index = 0
+    while index < len(lines):
+        fence = _fence_opener(lines[index])
+        if fence:
+            closer = _fence_closer_index(lines, index, fence)
+            if closer is None:
+                return True
+            index = closer + 1
             continue
-        current.append(line)
-    if current:
-        runs.append(current)
-    return runs
+        text.append(INLINE_CODE_RE.sub("", lines[index]))
+        index += 1
+    visible = HTML_COMMENT_RE.sub("", "\n".join(text))
+    if "<!--" in visible:
+        return True
+    depth: dict[str, int] = {}
+    for tag in HTML_TAG_RE.finditer(visible):
+        name = tag.group("name").lower()
+        if tag.group("self") or name in HTML_VOID_TAGS:
+            continue
+        depth[name] = depth.get(name, 0) + (-1 if tag.group("close") else 1)
+    return any(count > 0 for count in depth.values())
 
 
-def _verdict_from_block(
-    thread_id: str, lines: list[str], comment: Comment
-) -> ThreadVerdict | None:
-    """One block's ruling, with conflicts retained as a non-resolving barrier."""
-    actions: set[str] = set()
-    heads: set[str] = set()
-    for line in lines:
-        action = VERDICT_ACTION_RE.fullmatch(line)
-        if action:
-            actions.add(action.group(1).upper())
+def _verdict_section(lines: list[str]) -> list[tuple[str, str, str]] | None:
+    """Parse the canonical verdict section, or None if any line breaks it.
+
+    The section is one or more contiguous marker / action / HEAD triples,
+    separated by blank lines only, running to the end of the message.
+    """
+    blocks: list[tuple[str, str, str]] = []
+    index = 0
+    while index < len(lines):
+        if not lines[index].strip():
+            index += 1
             continue
-        head = VERDICT_HEAD_RE.fullmatch(line)
-        if head:
-            heads.add(normalize_sha(head.group(1)))
-    if not actions:
-        return None
-    # Dropping a conflicting later block would revive an earlier RESOLVE.
-    # AMBIGUOUS is an internal non-authorizing result, never permission to act.
-    ambiguous = len(actions) != 1 or len(heads) > 1
-    return ThreadVerdict(
-        thread_id=thread_id,
-        action="AMBIGUOUS" if ambiguous else next(iter(actions)),
-        head_sha=next(iter(heads)) if heads and not ambiguous else "",
-        created_at=comment.created_at,
-        login=comment.login,
-        source_commit=normalize_sha(comment.commit_sha),
-        body="\n".join(lines),
-    )
+        triple = [line.rstrip() for line in lines[index:index + 3]]
+        if len(triple) < 3:
+            return None
+        marker = VERDICT_MARKER_LINE_RE.fullmatch(triple[0])
+        action = VERDICT_ACTION_RE.fullmatch(triple[1])
+        head = VERDICT_HEAD_RE.fullmatch(triple[2])
+        if not (marker and action and head):
+            return None
+        blocks.append((
+            str(marker.group("tid") or "").strip(),
+            action.group(1).upper(),
+            normalize_sha(head.group(1)),
+        ))
+        index += 3
+    return blocks
 
 
 def parse_thread_verdicts(comment: Comment) -> tuple[ThreadVerdict, ...]:
-    """Parse zero or more per-thread blocks from one Codex comment/review.
+    """Parse per-thread rulings from one Codex comment/review.
 
-    A block starts at a standalone marker line and runs to the next marker
-    line or to the end of its visible text run (see ``verdict_text_runs``).
-    Marker, action, or head text that is quoted, fenced, indented as code, or
-    embedded in a prose line is an example, not a ruling.
+    Authorization is a whole-message property. Prose may precede the first
+    standalone marker line (unless it leaves a fence or HTML block open); from
+    that line to the end the message must be exactly the canonical verdict
+    section (see ``_verdict_section``). Any other line there -- prose, HTML,
+    quotes, fences, bullets, a split or repeated block -- makes the whole
+    message non-authorizing: every thread id it mentions gets an AMBIGUOUS
+    barrier so it cannot leave an earlier RESOLVE standing. A message with no
+    standalone marker line carries no verdict section and yields nothing.
     """
-    found: list[ThreadVerdict] = []
-    for run in verdict_text_runs(comment.body or ""):
-        blocks: list[tuple[str, list[str]]] = []
-        for line in run:
-            marker = VERDICT_MARKER_LINE_RE.fullmatch(line)
-            if marker:
-                blocks.append((str(marker.group("tid") or "").strip(), []))
-            elif blocks:
-                blocks[-1][1].append(line)
-        for thread_id, body_lines in blocks:
-            verdict = _verdict_from_block(thread_id, body_lines, comment)
-            if verdict is not None:
-                found.append(verdict)
-    return tuple(found)
+    body = (comment.body or "").replace("\r\n", "\n")
+    lines = body.split("\n")
+    while lines and not lines[-1].strip():
+        lines.pop()
+    first = next(
+        (i for i, line in enumerate(lines) if VERDICT_MARKER_LINE_RE.fullmatch(line)),
+        None,
+    )
+    if first is None:
+        return ()
+
+    def verdict(thread_id: str, action: str, head_sha: str, text: str) -> ThreadVerdict:
+        return ThreadVerdict(
+            thread_id=thread_id,
+            action=action,
+            head_sha=head_sha,
+            created_at=comment.created_at,
+            login=comment.login,
+            source_commit=normalize_sha(comment.commit_sha),
+            body=text,
+        )
+
+    blocks = None if _open_markup_before(lines[:first]) else _verdict_section(lines[first:])
+    if blocks is None:
+        # AMBIGUOUS is an internal non-authorizing result, never permission to act.
+        mentioned = dict.fromkeys(
+            str(m.group("tid") or "").strip() for m in VERDICT_MARKER_RE.finditer(body)
+        )
+        return tuple(verdict(tid, "AMBIGUOUS", "", body) for tid in mentioned if tid)
+    rulings: dict[str, tuple[str, str]] = {}
+    for thread_id, action, head_sha in blocks:
+        previous = rulings.setdefault(thread_id, (action, head_sha))
+        if previous != (action, head_sha):
+            # Dropping a conflicting duplicate would revive an earlier RESOLVE.
+            rulings[thread_id] = ("AMBIGUOUS", "")
+    return tuple(
+        verdict(tid, action, head_sha, f"CODEX-THREAD: {action}\nHEAD: {head_sha}")
+        for tid, (action, head_sha) in rulings.items()
+    )
 
 
 def latest_thread_verdict(
@@ -758,8 +798,12 @@ def mediation_body(
         f"Thread: {code_location(loc)}{(' — ' + thread_url) if thread_url else ''}\n"
         f"{reason_line}\n"
         f"{linear_bit}"
-        "End this review with one machine-readable block per thread you were "
-        "asked about (not in a code fence). Copy the thread id exactly:\n\n"
+        "Finish your review with the verdict section and nothing after it: for "
+        "each thread you were asked about, exactly three plain lines — the marker "
+        "line, `CODEX-THREAD: RESOLVE|DECIDE|MISSING|AMBIGUOUS`, `HEAD: <full "
+        "40-character SHA>` — separated by blank lines only. No code fences, HTML, "
+        "quotes, bullets or commentary in or after that section; anything else "
+        "makes the whole verdict non-authorizing. Copy the thread id exactly:\n\n"
         f"{verdict_marker(thread.id)}\n"
         "CODEX-THREAD: RESOLVE|DECIDE|MISSING|AMBIGUOUS\n"
         "HEAD: <full 40-character commit SHA of the PR head you inspected>\n\n"

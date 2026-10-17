@@ -398,6 +398,7 @@ def _stream_parse(raw: str) -> dict:
         "usage": usage,
         "verdict": verdict,
         "notes_len": len(notes),
+        "token": _expected_verdict_token(text, last),
     }
 
 
@@ -408,10 +409,9 @@ def _clean_verdict_line(line: str) -> str:
     return text
 
 
-def _expected_verdict_token(raw: str) -> str | None:
+def _expected_verdict_token(text: str, last: str | None) -> str | None:
     """Last approve/revise token in the text parse_verdict judges, or None."""
-    last = claude_last_message(raw)
-    body = assistant_text(raw) if last is None else last
+    body = text if last is None else last
     found = None
     for line in body.splitlines():
         match = _VERDICT_LINE.fullmatch(_clean_verdict_line(line))
@@ -420,12 +420,12 @@ def _expected_verdict_token(raw: str) -> str | None:
     return found
 
 
-def _validate(parsed: dict, prompt: str, raw: str) -> dict:
+def _validate(parsed: dict, prompt: str) -> dict:
     try:
         budgets = default_budgets()
         fits = call_fits(parsed["usage"], budgets, prompt)
         over = exceeded(parsed["usage"], budgets)
-        token = _expected_verdict_token(raw)
+        token = parsed["token"]
         if parsed["verdict"] not in {"approve", "revise"}:
             raise PerfE2EError(f"verdict {parsed['verdict']!r} is not approve or revise")
         if token is None:
@@ -473,7 +473,7 @@ def _complete_sample(t0: int, child: dict, state_dir: Path, *, name: str, provid
     parse_0 = time.perf_counter_ns()
     parsed = _stream_parse(child["stdout"])
     parse_1 = time.perf_counter_ns()
-    checked = _validate(parsed, PROMPT, child["stdout"])
+    checked = _validate(parsed, PROMPT)
     validate_1 = time.perf_counter_ns()
     _persist(state_dir, name=name, provider=provider, parsed=parsed, checked=checked)
     persist_1 = time.perf_counter_ns()

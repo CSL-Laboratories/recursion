@@ -129,7 +129,8 @@ class FixtureTests(unittest.TestCase):
         result = case.evaluate()
         expected = FIXTURE['expected']
         self.assertTrue(result['diagnostic_valid'])
-        for key in ('chain', 'semantic_state', 'operator_reconciliation_required'):
+        for key in ('chain', 'semantic_state', 'candidate_state', 'operator_reconciliation_required',
+                    'pr_unresolved_operations'):
             self.assertEqual(result[key], expected[key], key)
         self.assertIs(result['admitted'], False)
         self.assertIs(result['dispatch_allowed'], False)
@@ -159,7 +160,9 @@ class FixtureTests(unittest.TestCase):
             with self.subTest(name=name):
                 status = aj.journal_status(FIXTURE['journal_document'], expected['candidate'])
                 self.assertEqual(status['semantic_state'], expected['semantic_state'])
+                self.assertEqual(status['candidate_state'], expected['semantic_state'])
                 self.assertFalse(status['operator_reconciliation_required'])
+                self.assertEqual(status['pr_unresolved_operations'], [])
         # A candidate from another repository never reaches semantic evaluation.
         case = Case()
         case.candidate = {**case.candidate, 'repo': 'example-org/fork'}
@@ -260,7 +263,8 @@ class ArchiveIntegrityTests(unittest.TestCase):
             'bom': b'\xef\xbb\xbf' + base,
             'two documents': base + base,
             'invalid utf8': base[:-1] + b',"x":"\xff"}',
-            'deep nesting': b'[' * 5000 + b']' * 5000,
+            # Object nesting, so the root-object check is not the only rejection path.
+            'deep nesting': b'{"a":' * 5000 + b'1' + b'}' * 5000,
             'truncated': base[:-5],
         }
         for name, payload in bad.items():
@@ -271,6 +275,62 @@ class ArchiveIntegrityTests(unittest.TestCase):
                 case.set_archive(build_archive(ENTRY, payload))
                 with self.assertRaises(aj.IntegrityError):
                     case.evaluate()
+
+    def test_json_nesting_bound(self):
+        # Convention: the root object is depth 1; every nested object or array adds 1.
+        limit = aj.MAX_JSON_DEPTH
+        self.assertEqual(limit, 64)
+
+        def objects(depth):
+            return b'{"a":' * depth + b'1' + b'}' * depth
+
+        def mixed(depth):
+            body = b'1'
+            for level in range(depth, 0, -1):
+                body = (b'{"a":' + body + b'}') if level % 2 else (b'[' + body + b']')
+            return body
+
+        def lists_under_root(depth):
+            return b'{"a":' + b'[' * (depth - 1) + b'1' + b']' * (depth - 1) + b'}'
+
+        def empty_leaf(depth):
+            return b'{"a":' * (depth - 1) + b'{}' + b'}' * (depth - 1)
+
+        def wide_shallow():
+            # Many siblings at depth 2 must not accumulate into depth.
+            return b'{' + b','.join(b'"k%d":[1]' % i for i in range(limit * 4)) + b'}'
+
+        accepted = {
+            'objects at limit': objects(limit),
+            'mixed at limit': mixed(limit),
+            'lists under root at limit': lists_under_root(limit),
+            'empty container at limit': empty_leaf(limit),
+            'one below limit': objects(limit - 1),
+            'wide but shallow': wide_shallow(),
+        }
+        for name, payload in accepted.items():
+            with self.subTest(name=name):
+                self.assertIsInstance(aj.parse_strict_json(payload, 1 << 20), dict)
+
+        rejected = {
+            'objects one over limit': objects(limit + 1),
+            'mixed one over limit': mixed(limit + 1),
+            'lists under root one over limit': lists_under_root(limit + 1),
+            'empty container one over limit': empty_leaf(limit + 1),
+            'deep sibling after shallow siblings': b'{"a":1,"b":' + mixed(limit) + b'}',
+        }
+        for name, payload in rejected.items():
+            with self.subTest(name=name):
+                with self.assertRaises(aj.IntegrityError) as ctx:
+                    aj.parse_strict_json(payload, 1 << 20)
+                self.assertIn('nesting exceeds bound', str(ctx.exception))
+                case = Case()
+                case.set_archive(build_archive(ENTRY, payload))
+                with self.assertRaises(aj.IntegrityError):
+                    case.evaluate()
+
+        # The shipped fixture is well inside the bound.
+        aj.parse_strict_json(aj.canonical_bytes(FIXTURE['journal_document']), 1 << 20)
 
 
 class JournalEnvelopeTests(unittest.TestCase):
@@ -338,10 +398,16 @@ class JournalEnvelopeTests(unittest.TestCase):
         def swap(d):
             d['records'][0], d['records'][1] = d['records'][1], d['records'][0]
 
+        def first_state_attempted(d):
+            # Resequenced so contiguity holds and only the transition check can reject.
+            d['records'].pop(0)
+            for i, r in enumerate(d['records'], start=1):
+                r['sequence'] = i
+
         for name, mutate in {
             'sequence gap': lambda d: d['records'][1].update(sequence=3),
             'reordered records': swap,
-            'first state attempted': lambda d: d['records'].pop(0),
+            'first state attempted': first_state_attempted,
             'skip attempted': lambda d: d['records'].__setitem__(1, {**d['records'][1], 'state': 'confirmed'}),
             'record after unknown': lambda d: d['records'].append(record(7, A, X, 'confirmed')),
             'record after confirmed': lambda d: d['records'].append(record(7, d['records'][5]['operation_id'], Y, 'attempted')),
@@ -421,6 +487,9 @@ class ProvenanceTests(unittest.TestCase):
             'records bound above ceiling': {'bounds': {**POLICY['bounds'], 'max_records': aj.MAX_RECORDS_CEILING + 1}},
             'unknown key': {'trusted': True},
             'bool repository id': {'repository_id': True},
+            'repository traversal': {'repository': '../..'},
+            'repository dot owner': {'repository': './example-repo'},
+            'repository dotdot name': {'repository': 'example-org/..'},
             'short policy commit': {'policy_commit': 'a0' * 19},
             'branch traversal': {'default_branch': 'refs/heads/..'},
             'branch lock': {'default_branch': 'main.lock'},
@@ -437,6 +506,33 @@ class ProvenanceTests(unittest.TestCase):
         policy = copy.deepcopy(POLICY)
         self.assertIs(aj.validate_policy(policy), policy)
         self.assertEqual(policy, POLICY)
+
+    def test_repository_identity_rejects_dot_segments_at_every_layer(self):
+        X = FIXTURE['candidate']
+        for bad in ('../..', './.', '../example-repo', './example-repo', 'example-org/..', 'example-org/.',
+                    'a/b/c', 'example-repo', '/example-repo', 'example-org/', 'example org/repo'):
+            with self.subTest(bad=bad):
+                with self.assertRaises(aj.ProvenanceError):  # trusted policy layer
+                    aj.validate_policy({**copy.deepcopy(POLICY), 'repository': bad})
+                with self.assertRaises(aj.JournalError):  # candidate layer
+                    aj.validate_candidate({**X, 'repo': bad})
+                with self.assertRaises(aj.JournalError):
+                    aj.journal_status(FIXTURE['journal_document'], {**X, 'repo': bad})
+                case = Case()  # envelope layer: cannot bind a valid policy
+                case.document['repository'] = bad
+                case.set_document(case.document)
+                with self.assertRaises(aj.JournalError):
+                    case.evaluate()
+                case = Case()  # record candidate layer inside a valid envelope
+                case.document['records'][0]['candidate'] = {**X, 'repo': bad}
+                case.set_document(case.document)
+                with self.assertRaises(aj.JournalError):
+                    case.evaluate()
+        # Ordinary names keep validating, including dots that are not a whole segment.
+        for ok in ('example-org/example-repo', 'example.org/example.repo', 'ex_org-1/repo..v2', '.github/..dots'):
+            with self.subTest(ok=ok):
+                aj.validate_policy({**copy.deepcopy(POLICY), 'repository': ok})
+                aj.validate_candidate({**X, 'repo': ok})
 
     def test_run_identity_event_attempt_and_status(self):
         rid = POLICY['repository_id']
@@ -736,6 +832,87 @@ class ReconciliationTests(unittest.TestCase):
         self.assertIs(result['dispatch_allowed'], False)
         self.assertIs(result['admitted'], False)
 
+    def test_moved_head_does_not_bypass_pr_level_unresolved_hold(self):
+        X, A, B = self.X, self.A, 'ef' * 16
+        moved = {
+            'head moved': {**X, 'head': 'c9' * 20, 'merge': 'da' * 20, 'tree': 'eb' * 20},
+            'base moved': {**X, 'base': 'c9' * 20, 'merge': 'da' * 20, 'tree': 'eb' * 20},
+            'merge moved': {**X, 'merge': 'da' * 20},
+            'tree moved': {**X, 'tree': 'eb' * 20},
+        }
+
+        def journal(*states, candidate=X):
+            doc = copy.deepcopy(self.doc)
+            doc['records'] = [record(i + 1, A, candidate, s) for i, s in enumerate(states)]
+            aj.validate_records(doc['records'], X['repo'], 10, 300000001)
+            return doc
+
+        unresolved = {'reserved': journal('reserved'), 'attempted': journal('reserved', 'attempted'),
+                      'unknown': journal('reserved', 'attempted', 'unknown')}
+        for old_state, doc in unresolved.items():
+            for name, candidate in moved.items():
+                with self.subTest(old_state=old_state, moved=name):
+                    status = aj.journal_status(doc, candidate)
+                    self.assertEqual(status['semantic_state'], 'pr-unresolved')
+                    self.assertNotEqual(status['semantic_state'], 'not-dispatched')
+                    self.assertEqual(status['candidate_state'], 'not-dispatched')
+                    self.assertTrue(status['operator_reconciliation_required'])
+                    self.assertFalse(status['in_flight'])
+                    self.assertEqual(status['operations'], [])
+                    self.assertEqual(status['pr_unresolved_operations'], [A])
+            # Another PR in the same repository is isolated from this PR's ledger.
+            other = aj.journal_status(doc, self.Z)
+            self.assertEqual(other['semantic_state'], 'not-dispatched')
+            self.assertFalse(other['operator_reconciliation_required'])
+            self.assertEqual(other['pr_unresolved_operations'], [])
+        # Resolved terminal operations do not falsely hold a moved head.
+        for terminal in ('confirmed', 'rejected'):
+            doc = journal('reserved', 'attempted', terminal)
+            for name, candidate in moved.items():
+                with self.subTest(terminal=terminal, moved=name):
+                    status = aj.journal_status(doc, candidate)
+                    self.assertEqual(status['semantic_state'], 'not-dispatched')
+                    self.assertFalse(status['operator_reconciliation_required'])
+                    self.assertEqual(status['pr_unresolved_operations'], [])
+        # Per-candidate detail is preserved: the moved head's own reservation reads
+        # 'reserved' while the old head's unknown outcome still forces PR reconciliation.
+        head = moved['head moved']
+        current = successor(self.doc, record(7, B, head, 'reserved'))
+        status = aj.journal_status(current, head)
+        self.assertEqual(status['semantic_state'], 'reserved')
+        self.assertEqual(status['candidate_state'], 'reserved')
+        self.assertTrue(status['in_flight'])
+        self.assertTrue(status['operator_reconciliation_required'])
+        self.assertEqual(status['pr_unresolved_operations'], sorted([A, B]))
+        # A confirmed HTTP rejection for the moved head is still held by the old unknown.
+        rejected = successor(self.doc, record(7, B, head, 'reserved'), record(8, B, head, 'attempted'),
+                             record(9, B, head, 'rejected'))
+        aj.validate_records(rejected['records'], X['repo'], 10, 300000001)
+        status = aj.journal_status(rejected, head)
+        self.assertEqual(status['candidate_state'], 'rejected')
+        self.assertEqual(status['semantic_state'], 'pr-unresolved')
+        self.assertTrue(status['operator_reconciliation_required'])
+        self.assertEqual(status['pr_unresolved_operations'], [A])
+        # Neither policy movement nor candidate movement resets the unresolved ledger.
+        older_policy = copy.deepcopy(self.doc)
+        older_policy['policy_commit'] = OTHER_SHA
+        older_policy['producer']['runtime_sha'] = OTHER_SHA
+        after_policy = successor(older_policy, record(7, B, head, 'reserved'),
+                                 policy_commit=self.doc['policy_commit'], producer=self.doc['producer'])
+        self.assertEqual(aj.reconcile({'kind': 'journal', 'document': older_policy}, after_policy), 'extended')
+        self.assertEqual(aj.journal_status(after_policy, head)['pr_unresolved_operations'], sorted([A, B]))
+        self.assertEqual(aj.journal_status(after_policy, X)['semantic_state'], 'unknown-outcome')
+        # End to end: the moved head is explicitly held and carries no authority.
+        case = Case()
+        case.candidate = head
+        result = case.evaluate()
+        self.assertEqual(result['semantic_state'], 'pr-unresolved')
+        self.assertEqual(result['candidate_state'], 'not-dispatched')
+        self.assertTrue(result['operator_reconciliation_required'])
+        self.assertEqual(result['pr_unresolved_operations'], [A])
+        self.assertIs(result['dispatch_allowed'], False)
+        self.assertIs(result['admitted'], False)
+
     def test_resolving_an_open_operation_appends_rather_than_rewrites(self):
         prev = copy.deepcopy(self.doc)
         prev['records'] = [record(1, self.A, self.X, 'reserved'), record(2, self.A, self.X, 'attempted')]
@@ -804,11 +981,16 @@ class DisabledEntryTests(unittest.TestCase):
         self.assertLessEqual(imported, self.ALLOWED_IMPORTS, imported - self.ALLOWED_IMPORTS)
 
     def test_stage_authority_fields_cannot_be_overridden(self):
-        result = aj.stage(admitted=True, dispatch_allowed=True, side_effects='allowed', diagnostic_valid=True)
+        malicious = {'stage': 'production-dispatch', 'admitted': True, 'dispatch_allowed': True,
+                     'side_effects': 'allowed', 'diagnostic_valid': True}
+        result = aj.stage(**malicious)
         self.assertIs(result['admitted'], False)
         self.assertIs(result['dispatch_allowed'], False)
         self.assertEqual(result['side_effects'], 'rejected')
         self.assertEqual(result['stage'], aj.STAGE)
+        self.assertEqual(aj.stage(stage='x')['stage'], aj.STAGE)
+        self.assertEqual(aj.stage(**{'stage': 'x', 'admitted': 'true', 'dispatch_allowed': 'true'}),
+                         {'stage': aj.STAGE, 'admitted': False, 'dispatch_allowed': False, 'side_effects': 'rejected'})
         for text in (json.dumps(Case().evaluate()), json.dumps(aj.disabled_entry())):
             self.assertNotIn('"dispatch_allowed": true', text)
             self.assertNotIn('"admitted": true', text)

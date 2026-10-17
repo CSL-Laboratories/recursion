@@ -62,10 +62,18 @@ TRANSITIONS = {None: ('reserved',), 'reserved': ('attempted',),
 # Most severe first. 'unknown' is a terminal-uncertain POST outcome.
 SEMANTIC = (('unknown', 'unknown-outcome'), ('attempted', 'attempted'), ('reserved', 'reserved'),
             ('confirmed', 'confirmed'), ('rejected', 'rejected'))
+# Latest states that leave an operation unresolved for its PR, whatever the candidate identity.
+UNRESOLVED = ('reserved', 'attempted', 'unknown')
+BLOCKING = ('unknown-outcome', 'attempted', 'reserved')
 MAX_RUN_ATTEMPT = 1
 MAX_COMPRESSION_RATIO = 32
 MAX_ARCHIVE_CEILING = 8 * 1024 * 1024
 MAX_RECORDS_CEILING = 10000
+# Fixed container-nesting bound for journal JSON. The root object counts as depth 1 and
+# every nested object or array adds 1; a document with more than MAX_JSON_DEPTH nested
+# containers on any path rejects. Enforced by an iterative walk so the bound does not
+# depend on the interpreter's recursion limit.
+MAX_JSON_DEPTH = 64
 ENCRYPTION_FLAGS = 0x1 | 0x40
 SYMLINK_MODE = 0o120000
 
@@ -131,6 +139,11 @@ def _match(pattern, value):
     return isinstance(value, str) and pattern.fullmatch(value) is not None
 
 
+def _repository(value):
+    # owner/name; neither segment may be exactly '.' or '..' (the pattern alone permits '../..').
+    return _match(REPOSITORY, value) and not any(seg in ('.', '..') for seg in value.split('/'))
+
+
 def _keys(value, keys, error, what):
     _require(isinstance(value, dict) and sorted(value) == sorted(keys), error,
              what + ': exact field set required')
@@ -160,7 +173,7 @@ def canonical_digest(document):
 
 def validate_candidate(value):
     _keys(value, CANDIDATE_KEYS, JournalError, 'candidate')
-    _require(_match(REPOSITORY, value['repo']) and _positive_int(value['pr']), JournalError,
+    _require(_repository(value['repo']) and _positive_int(value['pr']), JournalError,
              'candidate: malformed repository/PR')
     _require(all(_sha(value[k]) for k in ('head', 'base', 'merge', 'tree')), JournalError,
              'candidate: full lowercase 40-hex SHAs required')
@@ -178,7 +191,7 @@ def validate_policy(policy):
     P = ProvenanceError
     _keys(policy, POLICY_KEYS, P, 'trusted policy')
     _require(policy['schema'] == POLICY_SCHEMA, P, 'trusted policy: unsupported schema')
-    _require(_positive_int(policy['repository_id']) and _match(REPOSITORY, policy['repository']), P,
+    _require(_positive_int(policy['repository_id']) and _repository(policy['repository']), P,
              'trusted policy: repository identity')
     branch = policy['default_branch']
     _require(_match(BRANCH, branch) and '..' not in branch and '//' not in branch
@@ -356,7 +369,25 @@ def parse_strict_json(data, max_bytes):
             raise
         raise IntegrityError('malformed journal JSON') from exc
     _require(isinstance(value, dict), IntegrityError, 'journal entry is not a JSON object')
+    _check_json_depth(value)
     return value
+
+
+def _check_json_depth(root):
+    """Reject container nesting deeper than MAX_JSON_DEPTH (root object is depth 1).
+
+    Iterative, so the check itself never recurses; json.loads may or may not have
+    raised RecursionError first, depending on the interpreter, and this makes the
+    outcome identical either way.
+    """
+    stack = [(root, 1)]
+    while stack:
+        node, depth = stack.pop()
+        _require(depth <= MAX_JSON_DEPTH, IntegrityError, 'journal JSON nesting exceeds bound')
+        children = node.values() if isinstance(node, dict) else node
+        for child in children:
+            if isinstance(child, (dict, list)):
+                stack.append((child, depth + 1))
 
 
 def verify_archive(archive, artifact, policy):
@@ -466,10 +497,14 @@ def reconcile(previous, current):
     validated current journal. Returns 'genesis', 'unchanged' or 'extended'.
 
     ``previous`` is one of
-      {'kind': 'genesis'}                       owner-held explicit bootstrap (fixture-only in v1)
+      {'kind': 'genesis'}                       caller-supplied offline bootstrap context
       {'kind': 'journal', 'document': {...}}    the last validated journal
       {'kind': 'unavailable', 'reason': ...}    lost/expired/deleted/uncertain evidence
     Lost evidence never becomes a fresh genesis; it is operator reconciliation.
+
+    Genesis is context the caller asserts; this code cannot authenticate a bootstrap.
+    In v1 only the offline test harness supplies it. Real bootstrap and operator
+    acceptance of a genesis remain owner-held activation prerequisites.
     """
     J = JournalError
     _require(isinstance(previous, dict) and isinstance(previous.get('kind'), str), J,
@@ -504,37 +539,62 @@ def reconcile(previous, current):
 
 
 def journal_status(evidence, candidate):
-    """Semantic state for one candidate. Not an authorization.
+    """Semantic state for one candidate plus a PR-level unresolved scan. Not an authorization.
 
     ``evidence`` is a validated journal document, or None / {'unavailable': ...}.
     Missing or uncertain evidence is 'evidence-unavailable' and never 'not-dispatched'.
+
+    ``candidate_state`` reduces only records bound to the exact candidate identity
+    (repo, pr, head, base, merge, tree). ``pr_unresolved_operations`` lists every
+    operation for the same repo/PR, under any candidate identity, whose latest state
+    is reserved, attempted or unknown. A PR-level label/comment POST with an unknown
+    outcome is not undone by a head, base, merge or tree movement, so when such
+    operations exist under another identity and the candidate's own state is not
+    already blocking, ``semantic_state`` is the explicit 'pr-unresolved' and operator
+    reconciliation is required. A moved head never reduces to 'not-dispatched' while
+    its PR has unresolved operations.
     """
     validate_candidate(candidate)
     if evidence is None or (isinstance(evidence, dict) and 'unavailable' in evidence):
-        return {'semantic_state': 'evidence-unavailable', 'operator_reconciliation_required': True,
-                'in_flight': False, 'operations': []}
+        return {'semantic_state': 'evidence-unavailable', 'candidate_state': 'evidence-unavailable',
+                'operator_reconciliation_required': True, 'in_flight': False, 'operations': [],
+                'pr_unresolved_operations': []}
     _require(isinstance(evidence, dict) and isinstance(evidence.get('records'), list), JournalError,
              'journal status: validated journal document required')
-    last = {}
+    last, pr_last = {}, {}
     for record in evidence['records']:
         _require(isinstance(record, dict) and all(k in record for k in ('candidate', 'operation_id', 'state')),
                  JournalError, 'journal status: malformed record')
-        if record['candidate'] == candidate:
+        recorded = record['candidate']
+        if recorded == candidate:
             last[record['operation_id']] = record['state']
+        if (isinstance(recorded, dict) and recorded.get('repo') == candidate['repo']
+                and _is(recorded.get('pr'), candidate['pr'])):
+            pr_last[record['operation_id']] = record['state']
     states = set(last.values())
-    semantic = next((name for state, name in SEMANTIC if state in states), 'not-dispatched')
+    candidate_state = next((name for state, name in SEMANTIC if state in states), 'not-dispatched')
+    pr_unresolved = sorted(op for op, state in pr_last.items() if state in UNRESOLVED)
+    # Operation IDs bind one candidate, so an unresolved op absent from ``last`` belongs
+    # to another identity of the same PR (moved head/base/merge/tree).
+    other_identity_unresolved = any(op not in last for op in pr_unresolved)
+    semantic = candidate_state
+    if other_identity_unresolved and candidate_state not in BLOCKING:
+        semantic = 'pr-unresolved'
     return {'semantic_state': semantic,
-            'operator_reconciliation_required': semantic == 'unknown-outcome',
-            'in_flight': semantic in ('reserved', 'attempted'),
-            'operations': sorted(last)}
+            'candidate_state': candidate_state,
+            'operator_reconciliation_required': candidate_state == 'unknown-outcome' or other_identity_unresolved,
+            'in_flight': candidate_state in ('reserved', 'attempted'),
+            'operations': sorted(last),
+            'pr_unresolved_operations': pr_unresolved}
 
 
 # --- layer 4: side-effect authority (always rejected in v1) ----------------
 
 def stage(**diagnostic):
-    """Result envelope. Authority fields are set last and cannot be overridden."""
-    result = {'stage': STAGE}
-    result.update(diagnostic)
+    """Result envelope. The stage label and authority fields are set last and cannot
+    be overridden by any diagnostic key (including ``stage=...``)."""
+    result = dict(diagnostic)
+    result['stage'] = STAGE
     result['admitted'] = False
     result['dispatch_allowed'] = False
     result['side_effects'] = 'rejected'

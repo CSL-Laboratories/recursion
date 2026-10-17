@@ -198,12 +198,15 @@
     ]
   },
   "previous_evidence": {"kind": "genesis"},
+  "previous_evidence_note": "Caller-supplied offline bootstrap context for the test harness only. The validator cannot authenticate a genesis; real bootstrap and operator acceptance remain owner-held.",
   "candidate": {"repo": "example-org/example-repo", "pr": 42, "head": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1", "base": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2", "merge": "d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3", "tree": "e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4"},
   "expected": {
     "diagnostic_valid": true,
     "chain": "genesis",
     "semantic_state": "unknown-outcome",
+    "candidate_state": "unknown-outcome",
     "operator_reconciliation_required": true,
+    "pr_unresolved_operations": ["abababababababababababababababab"],
     "admitted": false,
     "dispatch_allowed": false,
     "side_effects": "rejected"

@@ -9,7 +9,9 @@ unchanged and remains explicitly unqualified for protected authority, exactly as
 recorded in [rollout limits](ci-queue-rollout.md). No workflow, trigger, permission,
 setting, secret, label or consumer wiring changes with this document.
 
-This is the shared v1 contract text. Cockpit implements its own repository from
+Contract status: **DRAFT, proposed for peer review.** This is the shared v1 contract
+text as proposed; it is not accepted implementation authority for any repository until
+each owner has reviewed and accepted it. The peer repository implements its own repository from
 this text and the neutral fixture
 [`tools/fixtures/candidate-artifact-journal-v1.json`](../tools/fixtures/candidate-artifact-journal-v1.json).
 Recursion owns the contract wording; each repository owns its implementation.
@@ -29,7 +31,9 @@ Non-goals, all of which stay as recorded activation holds:
 - No activation switch, environment knob or configuration flag. Activation is a
   separate owner decision delivered as reviewed source.
 - No new transport, credential, permission or grant. Artifact metadata and downloads
-  need Actions read access, which the existing tokens already have; nothing is expanded.
+  need Actions read access. **Access prerequisite:** at activation the owner verifies,
+  using existing access only, that this read access is actually available. Insufficient
+  access blocks activation; no grant expansion is assumed or requested here.
 - No change to human holds, receipt ownership, observation-journal history,
   fingerprints, READY/MEDIATE roles, Devin review-of-record, `linux` protection,
   personal sign-off, candidate acceptance, native qualification or landing.
@@ -88,7 +92,7 @@ Exact field set; unknown or missing fields reject.
 | --- | --- |
 | `schema` | `"candidate-artifact-journal-policy/v1"` |
 | `repository_id` | positive int (REST numeric repository ID; `true` is not an int) |
-| `repository` | `owner/name` |
+| `repository` | `owner/name`; neither segment may be exactly `.` or `..` (same rule for every candidate `repo`) |
 | `default_branch` | branch name; no `..`, `//`, trailing `/` or `.lock` |
 | `policy_commit` | full lowercase 40-hex SHA; the current immutable default-branch head when the snapshots were taken |
 | `workflow_id` | positive int (REST numeric workflow ID) |
@@ -123,6 +127,17 @@ Instead of a snapshot, the transport may report `{"unavailable": "<reason>"}` or
 `null`. HTTP 403/404/410, rate limits, timeouts and any transport uncertainty are
 reported this way and are a `ProvenanceError`. There is **no fallback** to bot
 comments, an older successful run or a permissive empty state.
+
+Conservative availability limits, which must never be loosened to keep progressing:
+
+- A complete bounded listing may fail at the bound (too many runs or artifacts to list
+  within `bounds`, or pagination that does not finish). That is `complete: false` and
+  rejects; a partial listing is never treated as complete.
+- Movement of the current policy commit or the default ref invalidates the prior
+  artifact as evidence. Nothing is admitted on the old artifact until new trusted
+  evidence (a new policy pin and a new run-bound snapshot) exists.
+- Expired, deleted or uncertain evidence stays `evidence-unavailable`; waiting for the
+  operator is the only progress path.
 
 ### Run projection (REST workflow run, exact field set)
 
@@ -181,7 +196,14 @@ Applied to the downloaded bytes against the authenticated artifact metadata:
   the archive; decompression ratio ≤ 32:1; CRC/structure check passes;
 - read bounded in memory; **never extracted to the filesystem**;
 - strict JSON: UTF-8, no BOM, a single object, duplicate keys reject, `NaN`/`Infinity`
-  reject, depth/size bounded.
+  reject, size bounded by `max_entry_bytes`;
+- nesting bounded by a fixed `MAX_JSON_DEPTH = 64`: the root object is depth 1 and every
+  nested object or array (including an empty one) adds 1 along its path; any path deeper
+  than 64 containers rejects. The bound is checked by an iterative walk of the parsed
+  value after `json.loads`, so the outcome does not depend on the interpreter's
+  recursion limit (a parser `RecursionError` rejects as malformed JSON; a document the
+  parser accepts but which exceeds the bound rejects as excessive nesting). Sibling
+  count does not affect depth; node count is bounded indirectly by `max_entry_bytes`.
 
 The CRC check is independent of the server digest: honest metadata for corrupted
 bytes still rejects.
@@ -231,28 +253,48 @@ ordering; list order is.
 
 ### Semantic state (`journal_status`)
 
-For one candidate, the latest state of each of its operations is reduced, most severe
-first: `unknown-outcome`, `attempted`, `reserved`, `confirmed`, `rejected`, else
-`not-dispatched`. `evidence-unavailable` is returned when the journal is missing or
-uncertain. Fields: `semantic_state`, `operator_reconciliation_required` (true for
-`unknown-outcome` and `evidence-unavailable`), `in_flight` (reserved/attempted),
-`operations`.
+Two scopes are reported and must not be confused:
+
+- **Candidate state** (`candidate_state`): for the exact candidate identity
+  (`repo, pr, head, base, merge, tree`), the latest state of each of its operations is
+  reduced, most severe first: `unknown-outcome`, `attempted`, `reserved`, `confirmed`,
+  `rejected`, else `not-dispatched`.
+- **PR-level reconciliation** (`pr_unresolved_operations`): every operation for the
+  same `repo`/`pr`, under **any** candidate identity, whose latest state is `reserved`,
+  `attempted` or `unknown`, as a sorted list of operation IDs. Label and comment POSTs
+  act on the PR, so a head, base, merge or tree movement does not undo an unresolved
+  POST against the old identity.
+
+`semantic_state` is the candidate state, except when the PR has unresolved operations
+under another identity and the candidate's own state is not already blocking
+(`not-dispatched`, `confirmed` or `rejected`): then it is the explicit `pr-unresolved`.
+A moved head therefore never reads `not-dispatched` while its PR has an unresolved
+ledger. `evidence-unavailable` is returned for both scopes when the journal is missing
+or uncertain. Other fields: `operator_reconciliation_required` (true for
+`unknown-outcome`, `evidence-unavailable` and whenever another identity of the same PR
+has unresolved operations), `in_flight` (own reserved/attempted), `operations` (own
+operation IDs).
 
 Loss semantics:
 
 - A missing, expired, deleted or uncertain artifact **never** means not-dispatched.
-- `reserved`, `attempted` and `unknown-outcome` cannot be redispatched.
+- `reserved`, `attempted`, `unknown-outcome` and `pr-unresolved` cannot be redispatched.
 - An expired, deleted or lost reservation is operator reconciliation, not a reset.
+- Candidate movement (new head/base/merge/tree) and policy movement do not reset the
+  unresolved ledger of a PR; only appended terminal records resolve it.
 - No field in any result asserts that redispatch is permitted. A future consumer may
-  consider only `not-dispatched` and `rejected`, under its own owner-approved rules.
+  consider only `not-dispatched` and `rejected`, under its own owner-approved rules,
+  and only when `operator_reconciliation_required` is false.
 
 ### Reconciliation (`reconcile(previous, current)`)
 
 `previous` is one of:
 
-- `{"kind": "genesis"}`: explicit owner-held bootstrap. The current journal must be
-  sequence 1 with `predecessor_digest: null`. In v1 this is **fixture-only**; real
-  bootstrap is an activation hold.
+- `{"kind": "genesis"}`: caller-supplied offline bootstrap context. The current journal
+  must be sequence 1 with `predecessor_digest: null`. The validator **cannot
+  authenticate a bootstrap**; it only checks the shape. In v1 only the test harness
+  supplies this value. Real bootstrap and operator acceptance of a genesis remain
+  owner-held activation prerequisites.
 - `{"kind": "journal", "document": {...}}`: the last validated journal. Current must
   be identical (`unchanged`) or sequence +1 with `predecessor_digest` equal to the
   canonical digest of the previous document and the previous `records` as an exact
@@ -274,13 +316,14 @@ previous_evidence)` returns:
 {"stage": "artifact-journal-v1-offline-diagnostic", "diagnostic_valid": true,
  "candidate_key": ..., "run_id": ..., "artifact_id": ..., "artifact_digest": ...,
  "journal_digest": ..., "journal_sequence": ..., "chain": "genesis|unchanged|extended",
- "semantic_state": ..., "operator_reconciliation_required": ..., "in_flight": ...,
- "operations": [...],
+ "semantic_state": ..., "candidate_state": ..., "operator_reconciliation_required": ...,
+ "in_flight": ..., "operations": [...], "pr_unresolved_operations": [...],
  "admitted": false, "dispatch_allowed": false, "side_effects": "rejected"}
 ```
 
-The last three are set after every diagnostic field and cannot be overridden by any
-input. `disabled_entry(...)` ignores all arguments and returns string outputs
+`stage` and the last three authority fields are assigned after every diagnostic field
+and cannot be overridden by any input, including a diagnostic key named `stage`.
+`disabled_entry(...)` ignores all arguments and returns string outputs
 `admitted: "false"`, `dispatch_allowed: "false"`, `side_effects: "rejected"`;
 `main()` prints a notice and returns 1 so an accidental wiring fails the job.
 
@@ -296,7 +339,9 @@ building a deterministic single-entry stored ZIP in memory from the canonical by
 `journal_document`. No binary blob is checked in; placeholders can never validate.
 `snapshot_after_observed_at` gives the second observation time. `expected` states the
 diagnostic result and `other_candidates` gives a confirmed and an unrecorded candidate
-for the same journal. Cockpit can copy the file and keep the same materialization rule.
+for the same journal. `previous_evidence` is the harness-supplied genesis context and
+proves nothing about a real bootstrap. The peer repository can copy the file and keep
+the same materialization rule.
 
 ## 10. What is not established, and activation prerequisites
 
@@ -311,7 +356,7 @@ Activation prerequisites, all owner-held and outside this slice: trusted produce
 workflow authoring and review; bootstrap/genesis; policy pinning procedure; consumer
 wiring and the decision on which semantic states a consumer may act on; protected
 check and permission review (no expansion assumed); native attestation route;
-cross-repository acceptance by Cockpit; and the existing holds in
+cross-repository acceptance by The peer repository; and the existing holds in
 [rollout limits](ci-queue-rollout.md), which stay in force. Local tests passing do
 not approve the candidate contract or any artifact trust.
 
@@ -328,8 +373,13 @@ bytes, digest, size and CRC; duplicate JSON keys, non-finite numbers, unknown an
 trust-flag fields; missing/deleted/expired/duplicate artifacts; newer pending/failed/
 cancelled/successful runs versus older success; reruns; before/after movement; default
 branch and policy movement; unknown outcome and lost evidence never authorize
-redispatch; dropped/rewritten/resequenced records; manufactured genesis; disabled entry
-under valid inputs and activation knobs; record bound exercised apart from the entry
+redispatch; moved head/base/merge/tree against old-identity reserved/attempted/unknown
+operations reads `pr-unresolved` with reconciliation required, other PRs isolated,
+terminal operations not blocking, no reset across policy or candidate movement;
+dropped/rewritten/resequenced records; manufactured genesis; repository segments `.`
+and `..` rejected at policy, candidate and envelope layers; disabled entry under valid
+inputs and activation knobs; `stage` label and authority fields immune to diagnostic
+keys; record bound exercised apart from the entry
 bound; no activation symbol, transport, environment or extraction call in the module
 (checked structurally over the parsed source and the runtime namespace, not by text
 search); existing gate and workflows not wired to the module.

@@ -173,15 +173,15 @@ pinned-checkout and one-attempt guards because its candidate input is empty.
 Passing product tests on all OSes is separate evidence from genuine review-event
 admission/reusable-workflow qualification; the latter remains an activation hold.
 
-## Cross-repository design notes (Cockpit168 findings, assessed 2026-10-17)
+## Cross-repository design notes (peer-repository findings, assessed 2026-10-17)
 
-- **Queue starvation (Cockpit 4300898366): absent.** The gate holds no
+- **Queue starvation (The peer repository 4300898366): absent.** The gate holds no
   repository-wide concurrency group. Its workflow group is per PR and per review
   event; the `request` and `verdict` jobs wait only in the per-PR `claude-<pr>`
   writer queue. A long fixer run delays that one PR's request/verdict;
   `queue: max` bounds the backlog, not the wait time. This nested queue does not
   hold a repository-wide gate lock or displace other PRs or scheduled scans.
-- **Self-qualifying candidate (Cockpit 4300898369): applicable, held.** The
+- **Self-qualifying candidate (The peer repository 4300898369): applicable, held.** The
   default-branch sparse checkout protects only the script bytes. On `pull_request`
   and `pull_request_review` events the gate workflow and the same-commit local
   `ci.yml` definitions come from the PR merge ref, so a same-repository writer PR
@@ -192,7 +192,7 @@ admission/reusable-workflow qualification; the latter remains an activation hold
   same-repository case. `candidate-readiness` therefore remains staged diagnostics, never a
   protected replacement authority; a trusted default-branch verifier would be a new
   contract and needs an owner decision.
-- **Shared Actions identity (Cockpit 4300898370): partially applicable.**
+- **Shared Actions identity (The peer repository 4300898370): partially applicable.**
   Request markers are bound to the PAT writer identity and the three-per-head
   daily budget counts only that writer, so `GITHUB_TOKEN` writers cannot forge
   or exhaust requests. Claim markers are authenticated only as `github-actions[bot]`,

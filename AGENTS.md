@@ -105,8 +105,9 @@ Current tools. Do not add paid services or raise spend limits.
   on open same-repo PRs by verified repository writers (`.github/workflows/claude.yml`).
 - **Blacksmith CI** — only CI. See [CI](#ci).
 - **Google Workspace** (`csl-laboratories.com`) — meetings and notes.
-- **Discord bot** (`csl-bot-operations`) — Liaison. Commands and MCP; see below. Trigger CI
-  and reviews through these (or the `ci:full` label), not by editing config.
+- **Discord bot** (`csl-bot-operations`) - Liaison. Commands and MCP; see below. Use these
+  for authorized review requests or diagnostic CI. Full candidate CI requires exact-candidate
+  independent READY; the `ci:full` ownership label alone does not trigger it. See [CI](#ci).
   - Commands: `/issue`, `/plan`, `/debug`, `/feature`, `/standup`; `/ci full|run`;
     `/devin review pr:<url>|run|status`; `/telemetry`, `/help`, `/connect`. There is no
     top-level `/review` and no `/ci` without an argument.
@@ -197,18 +198,23 @@ Linear is the team's primary async channel, alongside Google Meet and Discord.
 ## CI
 
 - Required check: `linux` (hosted aggregate for Blacksmith `linux-tests`).
-- Windows and macOS run on the `ci:full` label, on manual dispatch, and on `master` (macOS
-  nightly at 07:17 UTC).
-- Ordinary PR runs and `ci:full` label runs share cancellation across heads.
-  Manual dispatch remains separate; cancellation cannot recover paid time already elapsed.
-- The staged `platform-gates` aggregate requires Linux, Windows and macOS success
-  for non-docs PRs. Linux-only runs pass `linux` but cannot pass this aggregate;
-  use `ci:full` for complete coverage. Verified docs-only no-ops remain allowed.
-  Unrelated labels use distinct check names and cannot overwrite required results.
+- Full ordinary PR candidate coverage starts only after authenticated independent
+  READY for the exact head/base/merge/tree. Linux, Windows and macOS must all pass,
+  including docs-only candidates. `ci:full` is ownership state, not a CI trigger.
+- Ordinary PR runs share cancellation across heads. Admitted candidate runs use
+  a separate per-PR lane so neither can cancel the other's checks. Pushes do not
+  automatically cancel candidate work; final audit rejects stale candidate evidence.
+  Manual diagnostics remain separate. Cancellation cannot recover elapsed paid time.
+- The staged `platform-gates` aggregate cannot pass an ordinary Linux-only PR run.
+  All label events have distinct check names and do not start paid CI. Keep the
+  existing direct Devin and `linux` requirements until separately approved activation.
+- Master push retains Linux/Windows coverage and nightly macOS at 07:17 UTC.
+  Manual full CI is diagnostic coverage, not independent candidate readiness.
 
-Trigger CI and reviews through the Discord bot (`/ci full|run`, `/devin review
-pr:<url>|run|status`, or MCP `ci_full` / `ci_run` / `devin_review`) or the `ci:full`
-label, not by editing config.
+Use the gate's owner-authorized `workflow_dispatch` with `pr_number` to request
+review after a base advance. Revalidate the live candidate before human approval;
+a base-only change has no guaranteed automatic rearm. Do not edit settings or
+expand credentials to bypass a hold. See [rollout limits](docs/ci-queue-rollout.md).
 
 ## Agent CI etiquette
 
@@ -309,7 +315,14 @@ of these lines (not in a code fence or only an inline comment):
 CODEX-GATE: READY
 CODEX-GATE: MEDIATE
 
-- **READY** — no fixer; apply the `ci:full` label so the full CI matrix runs.
+- **READY** - no fixer. For the staged exact-candidate gate, independently inspect
+  the requested head/base/merge/tree. An affirmative review body must contain only
+  `CODEX-CANDIDATE: <requested digest>` followed by `CODEX-GATE: READY`, as two
+  plain unquoted lines. Put findings in a non-READY review or inline comments. The gate preserves label ownership/hold policy,
+  reserves the exact candidate and runs Linux, Windows and macOS (including docs).
+  Label presence alone cannot start or prove full CI. Human approval follows the
+  current candidate's successful full matrix and final audit. See
+  [rollout and recovery limits](docs/ci-queue-rollout.md).
 - **MEDIATE** — Devin and Claude are stuck; hand off to
   `.github/workflows/stuck-thread-watch.yml` for this PR. The watcher still
   applies its own stuck rules (Claude said it needs a human, or the thread

@@ -6,6 +6,8 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -23,16 +25,17 @@ def condition(job: str) -> str:
 
 
 def value(expression, *, event, action='', draft=False, full=False, label='', number=217,
-          settle='skipped', linux='success', run_full='true', cancelled=False):
+          settle='skipped', linux='success', run_full='true', cancelled=False, attempt=1):
     expression = expression.replace('github.event.pull_request.labels.*.name', 'labels')
     expression = expression.replace('&&', ' and ').replace('||', ' or ')
     expression = re.sub(r'!(?!=)', ' not ', expression)
     return eval(expression, {'__builtins__': {}}, {
-        'github': NS(event_name=event, ref='refs/heads/master', workflow='CI',
+        'github': NS(run_attempt=attempt, event_name=event, ref='refs/heads/master', workflow='CI',
                      event=NS(action=action, label=NS(name=label),
                               pull_request=NS(draft=draft, number=number))),
         'needs': NS(settle=NS(result=settle), linux=NS(result=linux, outputs=NS(run_full=run_full))),
         'labels': ['ci:full'] if full else [], 'false': False, 'true': True,
+        'inputs': NS(candidate='bound-candidate' if full else ''),
         'always': lambda: True, 'cancelled': lambda: cancelled,
         'contains': lambda values, item: item in values,
         'format': lambda pattern, *args: pattern.format(*args),
@@ -57,7 +60,7 @@ class SchedulingTests(unittest.TestCase):
                   ['opened', 'reopened', 'ready_for_review', 'synchronize'] for draft in [True, False]]
         events += [('pull_request', 'labeled', draft, label)
                    for draft, label in itertools.product([True, False], ['ci:full', 'bug', ''])]
-        events += [(e, '', False, '') for e in ['push', 'workflow_dispatch', 'merge_group']]
+        events += [(e, '', False, '') for e in ['push', 'workflow_dispatch', 'merge_group', 'pull_request_review']]
         queue_enabled = 'merge_group:' in (ROOT / '.github/workflows/ci.yml').read_text()
         for job in ['linux-tests', 'windows', 'macos']:
             expression = condition(job)
@@ -68,9 +71,9 @@ class SchedulingTests(unittest.TestCase):
                 expected_settle = event == 'pull_request' and action == 'synchronize' and not draft
                 expected = not cancelled and (settle == 'success' or
                            (settle == 'skipped' and not expected_settle))
-                expected &= action != 'labeled' or (label == 'ci:full' and not draft)
+                expected &= action != 'labeled'
                 if job != 'linux-tests':
-                    selected = event == 'workflow_dispatch' or (event == 'pull_request' and (full or (action == 'labeled' and label == 'ci:full')))
+                    selected = event == 'workflow_dispatch' or (event == 'pull_request_review' and full)
                     selected |= event == 'merge_group' and queue_enabled
                     selected |= job == 'windows' and event == 'push'
                     expected &= linux == 'success' and selected
@@ -79,6 +82,31 @@ class SchedulingTests(unittest.TestCase):
                 self.assertEqual(evaluate(expression, **args), expected, (job, args))
             if job != 'linux-tests':
                 self.assertFalse(evaluate(expression, event='workflow_dispatch', run_full='false'))
+
+    def test_candidate_partial_reruns_never_allocate_paid_jobs(self):
+        for job, attempt in itertools.product(['linux-tests', 'windows', 'macos'], [2, 3, 99]):
+            self.assertFalse(evaluate(condition(job), event='pull_request_review', full=True,
+                                      attempt=attempt))
+
+    def test_candidate_and_required_pr_linux_survive_either_arrival_order(self):
+        text = (ROOT / '.github/workflows/ci.yml').read_text()
+        line = next(line for line in text.splitlines() if line.strip().startswith('group:'))
+        expression = re.findall(r'\$\{\{ (.*?) \}\}', line)[-1]
+        events = {'ordinary': dict(event='pull_request', action='synchronize'),
+                  'candidate': dict(event='pull_request_review', action='submitted', full=True)}
+        for order in itertools.permutations(events):
+            active = {}
+            for run in order:
+                # cancel-in-progress replaces only a matching concurrency group.
+                active[value(expression, **events[run])] = run
+            self.assertEqual(set(active.values()), set(events), order)
+        ordinary = value(expression, **events['ordinary'])
+        self.assertEqual(value(expression, event='pull_request', action='opened'), ordinary)
+        self.assertNotEqual(value(expression, event='pull_request_review', full=True, number=218),
+                            value(expression, **events['candidate']))
+        linux = text.split('  linux:\n', 1)[1].split('  windows:\n', 1)[0]
+        name = re.search(r'^    name: \$\{\{ (.*?) \}\}', linux, re.M)[1]
+        self.assertEqual(value(name, **events['ordinary']), 'linux')
 
     def test_label_routing_names_concurrency_and_required_jobs(self):
         text = (ROOT / '.github/workflows/ci.yml').read_text()
@@ -90,10 +118,10 @@ class SchedulingTests(unittest.TestCase):
         base = dict(event='pull_request', action='synchronize')
         ordinary_group = value(group_expr, **base)
         full_group = value(group_expr, event='pull_request', action='labeled', label='ci:full')
-        self.assertEqual(ordinary_group, full_group)
+        self.assertNotEqual(ordinary_group, full_group)
         for label, draft in itertools.product(['ci:full', 'bug', ''], [False, True]):
             args = dict(event='pull_request', action='labeled', label=label, draft=draft)
-            eligible = label == 'ci:full' and not draft
+            eligible = False  # Label presence/events no longer authorize paid CI.
             self.assertEqual(value(group_expr, **args) == ordinary_group, eligible)
             for job in ['settle', 'linux-tests', 'linux', 'windows', 'macos', 'platform-gates']:
                 body = re.search(rf'^  {job}:\n(.*?)(?=^  [\w-]+:|\Z)', text, re.M | re.S)[1]
@@ -110,6 +138,29 @@ class SchedulingTests(unittest.TestCase):
         for line in text.splitlines():
             if line.lstrip().startswith('run:'):
                 self.assertNotIn('github.event.label', line)
+
+    @unittest.skipIf(os.name == 'nt' or shutil.which('bash') is None, 'POSIX shell runner')
+    def test_actual_pinned_candidate_shell_rejects_wrong_merge_tree_and_rerun(self):
+        text = (ROOT / '.github/workflows/ci.yml').read_text()
+        with tempfile.TemporaryDirectory() as tmp:
+            def git(*args):
+                return subprocess.check_output(['git', '-C', tmp, *args], text=True).strip()
+            git('init', '-q')
+            git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+                '-c', 'commit.gpgsign=false', 'commit', '-q', '--allow-empty', '-m', 'fixture')
+            merge, tree = git('rev-parse', 'HEAD'), git('rev-parse', 'HEAD^{tree}')
+            for job in ('linux-tests', 'windows', 'macos'):
+                section = re.search(rf'^  {job}:\n(.*?)(?=^  [\w-]+:|\Z)', text, re.M | re.S)[1]
+                script = re.search(r'      - name: Verify pinned candidate[^\n]*\n[\s\S]*?        run: \|\n((?:          [^\n]*\n)+)', section)[1]
+                script = textwrap.dedent(script)
+                for expected_merge, expected_tree, attempt, passed in (
+                    (merge, tree, '1', True), ('e'*40, tree, '1', False),
+                    (merge, 'e'*40, '1', False), (merge, tree, '2', False)):
+                    env = dict(os.environ, EXPECTED_MERGE=expected_merge,
+                               EXPECTED_TREE=expected_tree, GITHUB_RUN_ATTEMPT=attempt)
+                    result = subprocess.run(['bash', '-e', '-c', script], cwd=tmp,
+                                            env=env, capture_output=True)
+                    self.assertEqual(result.returncode == 0, passed, (job, attempt, expected_merge, expected_tree))
 
     @unittest.skipIf(os.name == 'nt' or shutil.which('bash') is None, 'POSIX shell runner')
     def test_required_linux_runs_actual_shell_for_every_dependency_result(self):

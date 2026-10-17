@@ -1,4 +1,4 @@
-# Codex routes READY to ci:full and MEDIATE to stuck-thread-watch.
+# Codex admits exact-candidate READY to full CI and routes MEDIATE to the watcher.
 # Devin and human requests alone trigger fixes. Missing/FIX verdicts do nothing.
 # Writes use CODEX_TRIGGER_PAT; missing PAT skips without printing secrets.
 name: Codex CI/mediation gate
@@ -6,12 +6,18 @@ name: Codex CI/mediation gate
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Request exact-candidate review after a base change; never starts CI directly"
+        required: true
+        type: string
   pull_request_review:
-    types: [submitted]
+    types: [submitted, edited, dismissed]
 
 concurrency:
   # Each review.id isolates verdict handling; new pushes cancel superseded requests.
-  group: codex-gate-${{ github.event.pull_request.number }}-${{ github.event_name == 'pull_request_review' && format('verdict-{0}', github.event.review.id) || 'request' }}
+  group: codex-gate-${{ github.event.pull_request.number || inputs.pr_number }}-${{ github.event_name == 'pull_request_review' && format('verdict-{0}', github.event.review.id) || 'request' }}
   cancel-in-progress: ${{ github.event_name != 'pull_request_review' }}
 
 permissions:
@@ -21,10 +27,16 @@ permissions:
 
 jobs:
   request:
+    needs: verdict
+    concurrency:
+      group: claude-${{ github.event.pull_request.number || inputs.pr_number }}
+      cancel-in-progress: false
+      queue: max
     if: >-
-      github.event_name == 'pull_request' &&
-      github.event.pull_request.draft == false &&
-      github.event.pull_request.head.repo.full_name == github.repository
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.draft == false &&
+       github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -37,8 +49,13 @@ jobs:
           sparse-checkout: |
             scripts/ci/codex_gate.py
             scripts/ci/claude_fixer_receipts.py
+            scripts/ci/candidate_gate.py
+            scripts/ci/merge_candidate.py
           sparse-checkout-cone-mode: false
-      - name: Post @codex review once per head SHA
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Request independent review of the exact merge candidate
         id: gate
         env:
           CODEX_GATE_MODE: request
@@ -50,7 +67,7 @@ jobs:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
-          script=scripts/ci/codex_gate.py
+          script=scripts/ci/candidate_gate.py
           if [ ! -f "$script" ]; then
             echo "::notice::$script is not on the default branch yet; skip"
             echo "proceed=false" >> "$GITHUB_OUTPUT"
@@ -59,18 +76,30 @@ jobs:
           python3 -X utf8 -B "$script" request
 
   verdict:
+    outputs:
+      admitted: ${{ steps.verdict.outputs.admitted }}
+      duplicate: ${{ steps.verdict.outputs.duplicate }}
+      candidate: ${{ steps.verdict.outputs.candidate }}
+      head: ${{ steps.verdict.outputs.head }}
+      base: ${{ steps.verdict.outputs.base }}
+      merge: ${{ steps.verdict.outputs.merge }}
+      tree: ${{ steps.verdict.outputs.tree }}
+      review: ${{ steps.verdict.outputs.review }}
+      writer: ${{ steps.verdict.outputs.writer }}
     # Serialize every observation-journal writer with the fixer/human PR writers.
     # Dispatches are fire-and-forget; this job never waits for another writer.
     concurrency:
-      group: claude-${{ github.event.pull_request.number }}
+      group: claude-${{ github.event.pull_request.number || inputs.pr_number }}
       cancel-in-progress: false
       queue: max
     if: >-
-      github.event_name == 'pull_request_review' &&
-      (
-        github.event.review.user.login == 'chatgpt-codex-connector[bot]' ||
-        github.event.review.user.login == 'chatgpt-codex-connector'
-      )
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.draft == false &&
+       github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'pull_request_review' &&
+       (github.event.review.user.login == 'chatgpt-codex-connector[bot]' ||
+        github.event.review.user.login == 'chatgpt-codex-connector'))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -86,8 +115,14 @@ jobs:
           sparse-checkout: |
             scripts/ci/codex_gate.py
             scripts/ci/claude_fixer_receipts.py
+            scripts/ci/candidate_gate.py
+            scripts/ci/merge_candidate.py
           sparse-checkout-cone-mode: false
-      - name: Act on CODEX-GATE verdict
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Invalidate stale ownership or admit exact independent READY candidate
+        id: verdict
         env:
           CODEX_GATE_MODE: verdict
           CODEX_TRIGGER_PAT: ${{ secrets.CODEX_TRIGGER_PAT }}
@@ -98,9 +133,68 @@ jobs:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
-          script=scripts/ci/codex_gate.py
+          script=scripts/ci/candidate_gate.py
           if [ ! -f "$script" ]; then
             echo "::notice::$script is not on the default branch yet; skip"
             exit 0
           fi
-          python3 -X utf8 -B "$script" verdict
+          if [ "$GITHUB_EVENT_NAME" = pull_request_review ]; then
+            python3 -X utf8 -B "$script" admit
+          else
+            python3 -X utf8 -B "$script" invalidate
+          fi
+
+  matrix:
+    needs: verdict
+    if: needs.verdict.outputs.admitted == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+    with:
+      candidate: ${{ needs.verdict.outputs.candidate }}
+      merge_sha: ${{ needs.verdict.outputs.merge }}
+      base_sha: ${{ needs.verdict.outputs.base }}
+      tree_sha: ${{ needs.verdict.outputs.tree }}
+
+  candidate-readiness:
+    name: ${{ (github.event_name == 'pull_request_review' && needs.verdict.outputs.duplicate != 'true' && (github.event.review.user.login == 'chatgpt-codex-connector[bot]' || github.event.review.user.login == 'chatgpt-codex-connector')) && 'candidate-readiness' || 'ignored-event-candidate-readiness' }}
+    # Staged only. Activation needs separate owner approval of protection.
+    # Native pull_request_review check identity is its event merge SHA.
+    needs: [verdict, matrix]
+    if: >-
+      always() && github.event_name == 'pull_request_review' &&
+      needs.verdict.outputs.duplicate != 'true' &&
+      (github.event.review.user.login == 'chatgpt-codex-connector[bot]' ||
+       github.event.review.user.login == 'chatgpt-codex-connector')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Reject cancellation
+        if: cancelled()
+        run: exit 1
+      - name: Require admitted complete matrix and reject cancellation
+        env:
+          ADMITTED: ${{ needs.verdict.outputs.admitted }}
+          MATRIX: ${{ needs.matrix.result }}
+        run: test "$ADMITTED" = true && test "$MATRIX" = success
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/ci/codex_gate.py
+            scripts/ci/claude_fixer_receipts.py
+            scripts/ci/candidate_gate.py
+            scripts/ci/merge_candidate.py
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Recheck candidate, latest review, holds and label generation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE: ${{ needs.verdict.outputs.candidate }}
+          REVIEW_ID: ${{ needs.verdict.outputs.review }}
+          GATE_WRITER: ${{ needs.verdict.outputs.writer }}
+          MATRIX_RESULT: ${{ needs.matrix.result }}
+        run: python3 -X utf8 -B scripts/ci/candidate_gate.py finish

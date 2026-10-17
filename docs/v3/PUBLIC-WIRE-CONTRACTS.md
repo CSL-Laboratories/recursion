@@ -199,7 +199,8 @@ Rules:
   refusal clears on schedule. `permanent` refusals must not be resubmitted
   expecting success — a changed verdict requires changed state (e.g. an
   `unknown-record` target appearing before the resubmission).
-- `accepted` carries no refusal block; a `refusal` on any other outcome is malformed.
+- A `refusal` block is required on `refused` and forbidden on every other outcome
+  (`accepted`, `duplicate`, `conflict`).
 
 Closed `ReasonCode` registry (draft — extensions require a vocabulary revision):
 

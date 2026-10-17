@@ -1608,6 +1608,49 @@ class VerdictAndResolveTests(unittest.TestCase):
         self._assert_resolves("Thread text:\n``<pre>``\n\n" + block)
         self._assert_resolves("The literal is `<pre>\n` in the sample.\n" + block)
 
+    def test_codespan_newlines_cannot_end_raw_type6_block(self) -> None:
+        # r4304425514: stripping a span can manufacture a blank line in
+        # the middle or at the end of prose. Neither is a source blank.
+        block = verdict_block("PRRT_1")
+        for prefix in (
+            "<hr>\n`b\n`\nc\n",
+            "<hr>\na\n`b\n`\n",
+            "<hr>\n``b\n``\nc\n",
+            "<div></div>\n`b\n`\nc\n",
+            "   <HR>\n`b\n`\nc\n",
+            "The literal is `<!--`.\n<hr>\n`b\n`\nc\n",
+        ):
+            with self.subTest(prefix=prefix):
+                self._assert_no_resolve(prefix + block)
+                self._assert_no_resolve((prefix + block).replace("\n", "\r\n"))
+
+    def test_raw_type6_blank_check_preserves_authorizing_controls(self) -> None:
+        block = verdict_block("PRRT_1")
+        for prefix in (
+            "",
+            "<hr>\n\nSummary.\n",
+            "<div></div>\n\n",
+            "The literal is `<hr>` in the sample.\n",
+            "```text\n<hr>\n```\n\n",
+            "<!--\n<hr>\n-->\n",
+            "<?example\n<hr>\n?>\n",
+            "<![CDATA[\n<hr>\n]]>\n",
+            "<pre>\n<hr>\n</pre>\n\n",
+        ):
+            with self.subTest(prefix=prefix):
+                self._assert_resolves(prefix + block)
+
+    def test_deferred_html_liveness_cases_stay_non_authorizing(self) -> None:
+        # CSL-308 remains deferred; this repair must not loosen barriers.
+        for prefix in (
+            "The parser recognizes <? as a prefix.\n\n",
+            "<div>example</div>\n",
+            '<div title="first\n<pre>\nlast"></div>\n\n',
+            "<pre @x></pre>\n\n",
+        ):
+            with self.subTest(prefix=prefix):
+                self._assert_no_resolve(prefix + verdict_block("PRRT_1"))
+
     def test_html_inline_scan_matrix(self) -> None:
         # Adversarial CommonMark 4.6 / 6.1 / 6.6 matrix. Ambiguous input
         # must fail closed (no resolve). Scan path is parse_thread_verdicts

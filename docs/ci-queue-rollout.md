@@ -107,7 +107,10 @@ The existing verdict writer authenticates the current receipt/hold state under
 the shared PR lock and records an immutable Actions reservation before exporting
 admission. That review event calls the existing provider-free CI workflow with
 pinned merge/base/tree identities and **forces all three platforms, including docs**.
-The matrix receives contents-read only and no PAT. A read-only final audit checks
+The matrix receives contents-read only and no PAT. Each platform job verifies the
+pinned merge/tree checkout with shell builtins and git before installing the
+interpreter; Windows and macOS cells then invoke `python`, never a runner-provided
+`python3`. A read-only final audit checks
 the current candidate, authoritative review, reservation, label generation and
 receipt state after all platforms succeed. New findings requiring a journal write
 fail back to the locked writer. `candidate-readiness` is staged and is not yet a
@@ -142,7 +145,10 @@ Sources: [review event identity](https://docs.github.com/en/actions/reference/wo
 
 Authenticated MEDIATE events route through the existing non-admitting mediation
 path after checking the live head and authoritative latest review, before any
-candidate lookup. Superseded events use the ignored check lane and cannot replace
+candidate lookup. A `CODEX-GATE:` line counts only as the final nonblank plain
+line of the review body outside any code fence; indented, quoted or fenced copies
+and trailing content leave no verdict, and the candidate path then treats the
+review as non-READY. Superseded events use the ignored check lane and cannot replace
 newer candidate readiness. A current MEDIATE revokes only proven owned readiness,
 even when its legacy dispatch receipt already exists. Conflicts, stale synthetic merge refs and an
 advanced base do not prevent mediation. The existing missing-PAT, fork/draft and

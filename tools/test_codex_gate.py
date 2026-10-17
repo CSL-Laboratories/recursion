@@ -102,6 +102,56 @@ class MarkerAndVerdictTests(unittest.TestCase):
         self.assertIsNone(gate.parse_verdict(""))
         self.assertIsNone(gate.parse_verdict(None))
 
+    def test_parse_verdict_requires_a_plain_terminal_line_outside_fences(self) -> None:
+        # An earlier plain verdict cannot lend status to a final copy that is
+        # indented code, quoted, a fence delimiter, inside an open or closed
+        # fence, or followed by trailing content. Each tail leaves no verdict.
+        marker = "CODEX-GATE: MEDIATE"
+        tails = ["\n    " + marker, "\n\t" + marker, "\n   \t" + marker, "\n " + marker,
+                 "\n```\n" + marker, "\n~~~\n" + marker, "\n````\n```\n" + marker,
+                 "\n~~~~\n~~~\n" + marker, "\n~~~\n" + marker + "\n```",
+                 "\n```\n" + marker + "\n```", "\n```\n```", "\n```", "\n   ```",
+                 "\n```\n" + marker + "\n```\n    " + marker,
+                 "\n```\n" + marker + "\n    ```",
+                 "\n~~~ info`with`ticks\n" + marker,
+                 "\n> " + marker, '\n"' + marker + '"', "\n`" + marker + "`",
+                 "\n" + marker + " now", "\nstill pending", "\n<!-- note -->",
+                 "\n```\nCODEX-GATE: READY", "\n```\nCODEX-GATE: READY\n```",
+                 "\n```\nCODEX-GATE: FIX\n```", "\n    CODEX-GATE: READY"]
+        for tail in tails:
+            with self.subTest(tail=tail):
+                self.assertIsNone(gate.parse_verdict("Needs a human.\n" + marker + tail))
+                self.assertIsNone(gate.parse_verdict(marker + tail))
+        for body in ["```\n" + marker + "\n```", "~~~\nCODEX-GATE: READY\n~~~",
+                     "```text\nCODEX-GATE: READY\n```\n", "    " + marker, "> " + marker,
+                     "```\n" + marker, "````\n" + marker + "\n```\n" + marker]:
+            with self.subTest(body=body):
+                self.assertIsNone(gate.parse_verdict(body))
+                got = gate.decide_verdict(login=gate.CODEX_REVIEW_LOGIN, body=body, sha=SHA, comments=[])
+                self.assertEqual(got["action"], "no-verdict")
+                review = {"user": {"login": gate.CODEX_REVIEW_LOGIN}, "commit_id": SHA, "body": body}
+                self.assertFalse(gate.sha_has_verdict([review], SHA))
+
+    def test_parse_verdict_accepts_plain_terminal_line_after_copies_and_blanks(self) -> None:
+        marker = "CODEX-GATE: MEDIATE"
+        for body in ["```\nCODEX-GATE: READY\n```\n" + marker,
+                     "~~~~\n```\nCODEX-GATE: READY\n~~~~\n" + marker,
+                     "````text\nCODEX-GATE: READY\n    CODEX-GATE: READY\n````\nNeeds a human.\n" + marker,
+                     "```\n    " + marker + "\n\t" + marker + "\n```\n" + marker,
+                     "``` a`b\n" + marker,  # not a fence: backtick in the info string
+                     "    ```\n" + marker,  # indented code, not a fence
+                     "> CODEX-GATE: READY\n" + marker,
+                     "<!-- hidden -->\n" + marker,
+                     "notes\nCODEX-GATE: FIX\nmore\n" + marker,
+                     marker + "\n\n  \n\t\n", marker + "   ", marker + "\r\n", "CODEX-GATE:MEDIATE",
+                     "Needs a human.\r\n" + marker + "\r\n"]:
+            with self.subTest(body=body):
+                self.assertEqual(gate.parse_verdict(body), "MEDIATE")
+                got = gate.decide_verdict(login=gate.CODEX_REVIEW_LOGIN, body=body, sha=SHA, comments=[])
+                self.assertEqual(got["action"], "mediate")
+        self.assertEqual(gate.parse_verdict("```\n" + marker + "\n```\nCODEX-GATE: READY"), "READY")
+        self.assertEqual(gate.parse_verdict("CODEX-GATE: READY\nCODEX-GATE: FIX"), "FIX")
+
     def test_request_comment_contains_mention_and_marker(self) -> None:
         body = gate.request_comment_body(SHA)
         self.assertIn("@codex review", body)

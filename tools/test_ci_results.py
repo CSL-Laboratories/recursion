@@ -2,6 +2,7 @@
 import itertools
 import json
 import os
+import re
 import subprocess
 import sys
 import unittest
@@ -87,6 +88,42 @@ class AggregateTests(unittest.TestCase):
             proc = subprocess.run([sys.executable, str(ROOT / 'tools/ci_results.py')], env=env,
                                   capture_output=True, text=True)
             self.assertEqual(proc.returncode, code, proc.stdout + proc.stderr)
+
+    def test_candidate_pinned_checkout_verification_needs_no_interpreter_before_setup_python(self):
+        # Windows runner images expose `python`, not a dependable `python3`. The
+        # candidate verification that precedes setup-python must stay shell and
+        # git only, and every later Windows/macOS invocation must use `python`.
+        text = (ROOT / '.github/workflows/ci.yml').read_text()
+        jobs = {}
+        for name in ('linux-tests', 'windows', 'macos'):
+            start = text.index(f'\n  {name}:\n') + 1
+            nxt = re.search(r'\n  [a-z-]+:\n', text[start:])
+            jobs[name] = text[start:start + nxt.start()] if nxt else text[start:]
+        for name, job in jobs.items():
+            with self.subTest(job=name):
+                steps = job.split('\n      - ')[1:]
+                checkout = next(i for i, s in enumerate(steps) if s.startswith('uses: actions/checkout@v4'))
+                verify = next(i for i, s in enumerate(steps)
+                              if s.startswith('name: Verify pinned candidate checkout and bounded rerun'))
+                setup = next(i for i, s in enumerate(steps) if s.startswith('name: Set up Python'))
+                self.assertLess(checkout, verify)
+                self.assertLess(verify, setup)
+                self.assertIn('ref: ${{ inputs.merge_sha || github.sha }}', steps[checkout])
+                self.assertIn("if: inputs.candidate != ''", steps[verify])
+                self.assertIn('shell: bash', steps[verify])
+                self.assertNotIn('python', steps[verify])
+                for check in ('test "$GITHUB_RUN_ATTEMPT" -eq 1',
+                              'test "$(git rev-parse HEAD)" = "$EXPECTED_MERGE"',
+                              'test "$(git rev-parse \'HEAD^{tree}\')" = "$EXPECTED_TREE"'):
+                    self.assertIn(check, steps[verify])
+                self.assertIn('uses: actions/setup-python@v5', steps[setup])
+                for step in steps[:setup]:
+                    self.assertNotIn('uses: actions/setup-python', step)
+                if name != 'linux-tests':
+                    self.assertNotIn('python3', job)
+                    for step in steps[setup + 1:]:
+                        if 'run:' in step:
+                            self.assertRegex(step, r'run: python -X utf8 -B |run: python -m pip ')
 
 
 if __name__ == '__main__':

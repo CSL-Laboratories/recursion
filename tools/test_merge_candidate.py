@@ -140,6 +140,21 @@ class IdentityTests(unittest.TestCase):
                 p.verified_review([{**ready, 'body': text}], request(), VALUE)
         self.assertEqual(p.verified_review([{**ready, 'body': body + '\n'}], request(), VALUE)['id'], ready['id'])
 
+    def test_ready_with_fenced_indented_or_trailing_copies_never_qualifies(self):
+        # The exact two-line READY body stays strict. A trailing copy that is
+        # code, quoted, fenced or prose refuses, and such a body can never be
+        # read as a MEDIATE handoff either.
+        ready = review()
+        body, verdict = ready['body'], 'CODEX-GATE: READY'
+        for tail in ['\n    ' + verdict, '\n\t' + verdict, '\n```\n' + verdict, '\n```\n' + verdict + '\n```',
+                     '\n~~~\n' + verdict, '\n```', '\n> ' + verdict, '\n"' + verdict + '"',
+                     '\n`' + verdict + '`', '\n' + verdict + ' now', '\n```\nCODEX-GATE: MEDIATE\n```',
+                     '\n    CODEX-GATE: MEDIATE', '\n\n' + verdict]:
+            with self.subTest(tail=tail):
+                with self.assertRaises(ValueError):
+                    p.verified_review([{**ready, 'body': body + tail}], request(), VALUE)
+                self.assertNotEqual(router.gate.parse_verdict(body + tail), 'MEDIATE')
+
     def test_base_advance_cannot_reuse_same_head_review(self):
         newer = {**VALUE, 'base': 'e'*40, 'merge': 'f'*40, 'tree': '1'*40}
         new_request = comment('request', {'candidate': newer, 'key': p.key(newer)})
@@ -392,6 +407,53 @@ class SnapshotTests(unittest.TestCase):
                 client.candidate.assert_not_called()
                 client.gh.assert_not_called()
                 client.post.assert_not_called()
+
+    def test_fenced_indented_or_trailing_mediate_copies_never_route_mediation(self):
+        # codex_gate.parse_verdict admits only the final nonblank plain line. A
+        # fenced, indented, quoted or trailed copy neither dispatches the watcher
+        # nor qualifies as READY; proven owned readiness is still revoked.
+        marker = 'CODEX-GATE: MEDIATE'
+        for body in ['```\n' + marker + '\n```', '~~~\n' + marker + '\n~~~', '```\n' + marker,
+                     '    ' + marker, '\t' + marker, '> ' + marker,
+                     marker + '\n    ' + marker, marker + '\n```\n' + marker + '\n```',
+                     marker + '\n```\n' + marker, marker + '\n```\nCODEX-GATE: READY\n```',
+                     marker + '\n```\nCODEX-GATE: FIX\n```', marker + '\nActually pending.',
+                     marker + ' now', '```\n' + marker + '\n```\n    ' + marker]:
+            with self.subTest(body=body):
+                client = self.client()
+                event = {'review': {**review(), 'body': body}, 'pull_request': {'number': 7}}
+                client.reviews.return_value = [event['review']]
+                with mock.patch.dict(os.environ, {'GITHUB_SHA': VALUE['merge']}), \
+                        mock.patch.object(router.gate, 'run_verdict') as route, \
+                        mock.patch.object(router.gate, 'fixer_helpers') as helpers:
+                    result = router.admit(client, event, 'pat', '51', 1)
+                    self.assertEqual(result['action'], 'independent-review-invalid')
+                    self.assertEqual(result['admitted'], 'false')
+                    helpers.return_value.revoke_owned_ci.assert_called_once()
+                    route.assert_not_called()
+                client.post.assert_not_called()
+                self.assertFalse(any('workflow' in str(call) for call in client.gh.call_args_list))
+
+    def test_plain_terminal_mediate_after_fenced_copies_routes_mediation(self):
+        marker = 'CODEX-GATE: MEDIATE'
+        for body in ['```\nCODEX-GATE: READY\n```\n' + marker,
+                     '~~~~\n```\n' + marker + '\n~~~~\n' + marker,
+                     '````\n' + marker + '\n\t' + marker + '\n````\nNeeds a human.\n' + marker,
+                     '> CODEX-GATE: READY\n' + marker,
+                     marker + '\n\n  \n\t\n', '    ```\n' + marker]:
+            with self.subTest(body=body):
+                client = self.client()
+                client.candidate.side_effect = ValueError('conflict')
+                event = {'review': {**review(), 'body': body}, 'pull_request': {'number': 7}}
+                client.reviews.return_value = [event['review']]
+                with mock.patch.object(router.gate, 'run_verdict', return_value={'action': 'mediate'}) as route:
+                    result = router.admit(client, event, 'pat', '51', 1)
+                    self.assertEqual(result['action'], 'mediate')
+                    self.assertEqual(result['admitted'], 'false')
+                    route.assert_called_once()
+                client.candidate.assert_not_called()
+                with self.assertRaises(ValueError):
+                    p.verified_review([event['review']], request(), VALUE)
 
     def test_untrusted_mediate_never_reaches_legacy_router(self):
         client = self.client()

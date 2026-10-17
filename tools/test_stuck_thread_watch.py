@@ -1586,6 +1586,14 @@ class VerdictAndResolveTests(unittest.TestCase):
         # this is a literal `<pre>`, not an HTML opener.
         self._assert_resolves("The literal is `<pre>\n` in the sample.\n" + verdict_block("PRRT_1"))
 
+    def test_unequal_backticks_do_not_strip_live_pre_opener(self) -> None:
+        # A one-backtick opener is not closed by a two-backtick run, so the
+        # `<pre>` stays an HTML opener and an echoed RESOLVE cannot authorize.
+        block = verdict_block("PRRT_1")
+        self._assert_no_resolve("note `\n<pre>\n``\n" + block)
+        self._assert_no_resolve("`\n<pre>\n``\n" + block)
+        self._assert_no_resolve("`foo\n<pre>\n``\n" + block)
+
     def test_escaped_fence_copy_does_not_resolve(self) -> None:
         self._assert_no_resolve("\\```\n" + verdict_block("PRRT_1") + "\\```\n")
 

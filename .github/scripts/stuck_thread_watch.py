@@ -48,7 +48,6 @@ VERDICT_MARKER_RE = re.compile(
     r"<!--\s*" + VERDICT_PREFIX + r":(?P<tid>[^\s>]+)\s*-->",
     re.IGNORECASE,
 )
-INLINE_CODE_RE = re.compile(r"(`+)[^`]*?\1")
 HTML_TAG_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9-]*")
 HTML_ATTR_NAME_RE = re.compile(r"[A-Za-z_:][A-Za-z0-9_.:-]*")
 HTML_UNQUOTED_ATTR_RE = re.compile(r"""[^\s"'=<>`]+""")
@@ -451,9 +450,50 @@ def _open_markup_before(lines: list[str]) -> bool:
             continue
         text.append(lines[index])
         index += 1
-    # CommonMark 6.1 code spans may cross a line ending; strip them on the
-    # joined prose so a literal `<pre>` inside a multiline span is not HTML.
-    return _html_constructs_open(INLINE_CODE_RE.sub("", "\n".join(text)))
+    # CommonMark 6.1 code spans may cross a line ending; strip only
+    # equal-length backtick strings so a literal `<pre>` inside a real
+    # span is not HTML, and an unmatched opener cannot erase a live tag.
+    return _html_constructs_open(_strip_inline_code_spans("\n".join(text)))
+
+
+def _strip_inline_code_spans(text: str) -> str:
+    """Remove CommonMark 6.1 code spans; leave unmatched backtick runs.
+
+    A closer must be the same length as its opener and not part of a
+    longer run. ``(`+)[^`]*?\\1`` would let one backtick close against
+    the first character of `` ``, stripping a following ``<pre>``.
+    """
+    out: list[str] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        if text[index] != "`":
+            out.append(text[index])
+            index += 1
+            continue
+        end = index
+        while end < length and text[end] == "`":
+            end += 1
+        span = end - index
+        cursor = end
+        closer: int | None = None
+        while cursor < length:
+            if text[cursor] != "`":
+                cursor += 1
+                continue
+            run = cursor
+            while run < length and text[run] == "`":
+                run += 1
+            if run - cursor == span:
+                closer = run
+                break
+            cursor = run
+        if closer is None:
+            out.append(text[index:end])
+            index = end
+            continue
+        index = closer
+    return "".join(out)
 
 
 def _skip_html_tag_space(visible: str, index: int) -> int:

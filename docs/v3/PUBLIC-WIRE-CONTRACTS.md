@@ -104,11 +104,12 @@ WireIdentityRef@1 = {
 
 - `id` is stable across storage moves and endpoint changes; `version` + `content_digest`
   pin the exact revision.
-- Command idempotency uses the same `PublicId` grammar under the `cmd:` namespace; a
-  canonically identical admitted command replays its prior outcome (`duplicate`); a
-  conflicting reuse is answered `conflict` — the collision M1B reports as
-  `duplicate-command-conflict`, surfaced here outcome-level rather than as a
-  refusal reason.
+- Command idempotency uses the same `PublicId` grammar under the `cmd:` namespace; the
+  command journal binds `command_id` → `command_digest` on first receipt. A
+  canonically identical retry replays the journaled receipt (`duplicate` for an
+  admitted command); reuse of a journaled id with different bytes is `conflict` —
+  the collision M1B reports as `duplicate-command-conflict`, surfaced here
+  outcome-level rather than as a refusal reason.
 
 ### `WireEventEnvelope@1` — event vocabulary
 
@@ -169,32 +170,34 @@ Rules:
 - `duplicate` = a command already admitted whose canonical digest equals the incoming
   `command_digest` (returns the prior outcome). Because digests are computed over
   canonical bytes, reordering object keys does not mint a new command — it replays.
-  `conflict` = same `command_id` as an admitted command, different `command_digest`.
+  `conflict` = `command_id` already journaled to a different `command_digest`.
   `conflict` is permanent.
-- Only `accepted` commands mint a dedup entry. A `refused` or `conflicted` command
-  leaves no replay record, so an identical retry is evaluated against current
-  admission state. `refusal_class` is caller guidance, not a receipt guarantee.
-  `retryable` splits per the reason: refusals that clear with time alone
-  (`paused`, `budget-exceeded`) may be resent unchanged, while refusals that
-  need caller repair (`stale-epoch`, `precondition-failed`) must be resubmitted
-  with corrected command bytes; because refused commands leave no replay record,
-  the caller may reuse the same `command_id` without tripping `conflict`.
-  `permanent` refusals must not be auto-retried expecting
-  success — a changed verdict requires changed state (e.g. an `unknown-record`
-  target appearing before the retry).
+- Every received command journals `command_id` → `command_digest` on first
+  receipt — accepted, refused and conflicted receipts are all retained (the M1A
+  receipt-journal rule), so the id is burned whatever the verdict. An identical
+  retry replays the journaled receipt — `duplicate` for an admitted command,
+  verbatim `refused`/`conflict` otherwise; a journaled pair is never
+  re-evaluated. Operation-level retries use a NEW `command_id`. `refusal_class`
+  is caller guidance about that resubmission, not a receipt guarantee:
+  `retryable` refusals invite resubmission — unchanged payload for reasons that
+  clear with time alone (`paused`, `budget-exceeded`), corrected payload for
+  reasons that need caller repair (`stale-epoch`, `precondition-failed`).
+  `permanent` refusals must not be resubmitted expecting success — a changed
+  verdict requires changed state (e.g. an `unknown-record` target appearing
+  before the resubmission).
 - `accepted` carries no refusal block; a `refusal` on any other outcome is malformed.
 
 Closed `ReasonCode` registry (draft — extensions require a vocabulary revision):
 
 | Code | Meaning | Default class |
 |---|---|---|
-| `stale-epoch` | epoch precondition no longer current; resync and resubmit | retryable after resync |
+| `stale-epoch` | epoch precondition no longer current; resync and resubmit under a new `command_id` | retryable after resync |
 | `replay-gap-continuation` | sequence gap in an event stream | permanent |
 | `authority-mismatch` | grant/authority digest does not match active | permanent |
 | `capability-denied` | requested capability not granted | permanent |
 | `policy-denied` | admitted shape violates active policy | permanent |
 | `fence-violation` | fenced-writer boundary crossed | permanent |
-| `precondition-failed` | stated compare-and-swap precondition unmet; revise and resubmit | retryable |
+| `precondition-failed` | stated compare-and-swap precondition unmet; revise and resubmit under a new `command_id` | retryable |
 | `budget-exceeded` | declared budget/quota floor crossed | retryable |
 | `paused` | an admitted PAUSE profile is operative | retryable |
 | `unsupported-version` | `type`/`@N` not in the advertised `supported` set | permanent |

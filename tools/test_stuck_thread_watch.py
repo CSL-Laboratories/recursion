@@ -1549,6 +1549,29 @@ class VerdictAndResolveTests(unittest.TestCase):
             "<details><summary>x</summary><pre>q</pre></details>\n\n" + verdict_block("PRRT_1")
         )
 
+    def test_unclosed_html_raw_blocks_do_not_resolve(self) -> None:
+        # CommonMark 4.6 types 3–5 continue through EOF without a closer, so
+        # a following producer-shaped triple is an echo inside the raw block.
+        # Scan path is parse_thread_verdicts → classify_resolve → scan.
+        block = verdict_block("PRRT_1")
+        openers = (
+            "<![CDATA[\n",
+            "<?\n",
+            '<?xml version="1.0"\n',
+            "<!DOCTYPE html\n",
+            "<!ELEMENT foo bar\n",
+        )
+        for opener in openers:
+            with self.subTest(opener=opener):
+                self._assert_no_resolve("Thread text:\n" + opener + block)
+                self._assert_no_resolve("Echo " + opener.rstrip() + "\n" + block)
+
+    def test_closed_html_raw_blocks_in_prose_still_resolve(self) -> None:
+        block = verdict_block("PRRT_1")
+        self._assert_resolves("Thread text:\n<![CDATA[ example ]]>\n\n" + block)
+        self._assert_resolves('Thread text:\n<?xml version="1.0"?>\n\n' + block)
+        self._assert_resolves("Thread text:\n<!DOCTYPE html>\n\n" + block)
+
     def test_escaped_fence_copy_does_not_resolve(self) -> None:
         self._assert_no_resolve("\\```\n" + verdict_block("PRRT_1") + "\\```\n")
 

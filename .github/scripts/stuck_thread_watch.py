@@ -49,10 +49,17 @@ VERDICT_MARKER_RE = re.compile(
     re.IGNORECASE,
 )
 INLINE_CODE_RE = re.compile(r"(`+)[^`]*?\1")
-HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 HTML_TAG_RE = re.compile(
     r"<(?P<close>/?)(?P<name>[A-Za-z][A-Za-z0-9-]*)(?=[\s/>])[^>]*?(?P<self>/?)>"
 )
+# CommonMark HTML-block raw constructs that continue to a closer or EOF
+# (spec 4.6 types 2–5): comment, processing instruction, declaration, CDATA.
+HTML_COMMENT_OPEN = "<!--"
+HTML_COMMENT_CLOSE = "-->"
+HTML_PI_OPEN = "<?"
+HTML_PI_CLOSE = "?>"
+HTML_CDATA_OPEN = "<![CDATA["
+HTML_CDATA_CLOSE = "]]>"
 HTML_VOID_TAGS = frozenset(
     "area base br col embed hr img input link meta param source track wbr".split()
 )
@@ -420,13 +427,17 @@ def is_known_bot_login(login: str | None, cfg: Config) -> bool:
 
 
 def _open_markup_before(lines: list[str]) -> bool:
-    """True if free prose leaves a fence, HTML comment, or HTML element open.
+    """True if free prose leaves a fence or HTML construct open.
 
-    Anything after such an opener renders inside it, so a verdict section that
-    follows is an echo, not a ruling. This is deliberately coarse: inline code
-    spans are ignored, and non-void tags must nest in order. An unclosed open,
-    an unmatched close, or a mis-nested close all fail closed, so a stray
-    ``</pre>`` can never cancel a later ``<pre>``.
+    A verdict marker authorizes only as the trusted producer's well-formed
+    standalone line. Anything after an unclosed fence or HTML construct
+    renders inside it, so a following verdict section is an echo, not a
+    ruling. HTML is scanned as CommonMark's raw-block family (comments,
+    processing instructions, declarations, CDATA, and tags), not as a list
+    of tag-name exceptions. Inline code spans are ignored. Non-void tags
+    must nest in order. An unclosed opener, unmatched close, or mis-nested
+    close all fail closed, so a stray ``</pre>`` or ``<![CDATA[`` can never
+    make an echoed ``RESOLVE`` authorizing.
     """
     text: list[str] = []
     index = 0
@@ -440,20 +451,65 @@ def _open_markup_before(lines: list[str]) -> bool:
             continue
         text.append(INLINE_CODE_RE.sub("", lines[index]))
         index += 1
-    visible = HTML_COMMENT_RE.sub("", "\n".join(text))
-    if "<!--" in visible:
-        return True
+    return _html_constructs_open("\n".join(text))
+
+
+def _html_constructs_open(visible: str) -> bool:
+    """True if *visible* leaves a CommonMark raw HTML construct unclosed.
+
+    Walks left to right. Closed, well-nested constructs are skipped; an
+    unrecognized ``<`` (for example ``a < b``) is not an opener. Matching
+    CommonMark 4.6 types 2–5: ``<!--`` / ``-->``, ``<?`` / ``?>``, ``<!`` +
+    ASCII letter / ``>``, ``<![CDATA[`` / ``]]>``. Tags keep the ordered
+    stack already used for unmatched and mis-nested closes.
+    """
     stack: list[str] = []
-    for tag in HTML_TAG_RE.finditer(visible):
-        name = tag.group("name").lower()
-        if tag.group("self") or name in HTML_VOID_TAGS:
+    index = 0
+    length = len(visible)
+    while index < length:
+        lt = visible.find("<", index)
+        if lt < 0:
+            break
+        rest = visible[lt:]
+        if rest.startswith(HTML_COMMENT_OPEN):
+            end = visible.find(HTML_COMMENT_CLOSE, lt + len(HTML_COMMENT_OPEN))
+            if end < 0:
+                return True
+            index = end + len(HTML_COMMENT_CLOSE)
             continue
-        if not tag.group("close"):
-            stack.append(name)
-        elif not stack or stack[-1] != name:
-            return True
-        else:
-            stack.pop()
+        if rest[: len(HTML_CDATA_OPEN)].upper() == HTML_CDATA_OPEN:
+            end = visible.find(HTML_CDATA_CLOSE, lt + len(HTML_CDATA_OPEN))
+            if end < 0:
+                return True
+            index = end + len(HTML_CDATA_CLOSE)
+            continue
+        if rest.startswith(HTML_PI_OPEN):
+            end = visible.find(HTML_PI_CLOSE, lt + len(HTML_PI_OPEN))
+            if end < 0:
+                return True
+            index = end + len(HTML_PI_CLOSE)
+            continue
+        if len(rest) >= 3 and rest.startswith("<!") and rest[2].isascii() and rest[2].isalpha():
+            end = visible.find(">", lt + 2)
+            if end < 0:
+                return True
+            index = end + 1
+            continue
+        tag = HTML_TAG_RE.match(visible, lt)
+        if tag:
+            name = tag.group("name").lower()
+            if tag.group("self") or name in HTML_VOID_TAGS:
+                index = tag.end()
+                continue
+            if not tag.group("close"):
+                stack.append(name)
+            elif not stack or stack[-1] != name:
+                return True
+            else:
+                stack.pop()
+            index = tag.end()
+            continue
+        index = lt + 1
     return bool(stack)
 
 
@@ -494,9 +550,10 @@ def _verdict_section(lines: list[str]) -> list[tuple[str, str, str]] | None:
 def parse_thread_verdicts(comment: Comment) -> tuple[ThreadVerdict, ...]:
     """Parse per-thread rulings from one Codex comment/review.
 
-    Authorization is a whole-message property. Prose may precede the first
-    standalone marker line (unless it leaves a fence or HTML block open, or
-    holds a ``CODEX-GATE:`` line, which belongs after the section); from
+    Authorization is a whole-message property. A standalone marker
+    authorizes only as the trusted producer's well-formed line: prose may
+    precede it unless that prose leaves a fence or HTML construct open, or
+    holds a ``CODEX-GATE:`` line, which belongs after the section. From
     that line to the end the message must be exactly the canonical verdict
     section (see ``_verdict_section``). Any other line there -- prose, HTML,
     quotes, fences, bullets, a split or repeated block -- makes the whole

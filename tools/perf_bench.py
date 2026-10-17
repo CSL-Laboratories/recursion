@@ -225,6 +225,7 @@ def _calibrate_iterations(fn, round_s: float) -> int:
 
 
 def _timed_call(fn, iterations: int) -> float:
+    was_enabled = gc.isenabled()
     gc.disable()
     try:
         start = time.perf_counter()
@@ -232,7 +233,8 @@ def _timed_call(fn, iterations: int) -> float:
             fn()
         elapsed = time.perf_counter() - start
     finally:
-        gc.enable()
+        if was_enabled:
+            gc.enable()
     return elapsed / iterations
 
 

@@ -140,3 +140,11 @@ Removing raw GraphQL access also removes the model's direct thread-resolution
 command. It leaves an addressed receipt after a verified fix; the existing
 trusted watcher or a human owns resolution. Watcher predicates and citation,
 head/check, authentication and READY/MEDIATE boundaries are unchanged.
+
+The URL check accepts the action's existing `x-access-token` HTTPS userinfo
+after parsing and binding the actual GitHub host and repository, without logging
+credentials. Other hosts/users, queries/fragments and ports remain rejected.
+Malformed helper invocations fail without reading stdin or consuming a push.
+Reply input opens nonblocking, verifies a regular descriptor and bounds its read;
+named pipes and symlinks cannot stall the helper. These cases have offline tests,
+including simulated action URL metadata through the real local Git hook fixture.

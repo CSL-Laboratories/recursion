@@ -91,11 +91,19 @@ See [AGENTS.md#when-claude-cant-fix-a-review-thread](AGENTS.md#when-claude-cant-
 - Keep changes inside your declared allowed paths. `CONTROL_PLANE.md`, `ANCHOR.md`,
   `state/DECISIONS.md`, `schemas/` and `.env` are protected paths — a change
   there needs a separately recorded founder-approved authoring session under
-  `CONTROL_PLANE.md`, not a product PR. Option B, recorded in `CONTROL_PLANE.md`
-  and D-042: `scripts/ci/`, the test config and fixtures stay protected. New tests
-  can be added freely, within the existing admitted scope. Changing an existing
-  assertion needs a named human reviewer. Implementation and activation stay
-  separate.
+  `CONTROL_PLANE.md`, not a product PR. Option B (D-042). The core rule is CSL-117
+  ruling `e59021c7-3a77-445f-a04c-832cf1e5fe46`. Fixtures are from the CSL-117 brief
+  (`f2506e97-51a7-42ee-a82b-39e089f7e7de`). The admitted scope, and keeping
+  implementation and activation separate, are from approval
+  `58641114-aa3c-4f8f-8630-a089b19f8ea3`. Protected paths from that record are
+  `scripts/ci/**`, `scripts/tests/**/fixtures/**` and `tools/ci_gate.py`. Paths
+  under `scripts/` outside those globs, for example `scripts/v3/` and non-fixture
+  `scripts/tests/`, are no longer protected paths. Changing an existing assertion
+  anywhere still needs a named human reviewer: named in the PR, submitting their
+  own GitHub review from their own account. An approval a bot posts from a
+  founder's account does not count. New tests can be added freely, within the
+  existing admitted scope. Whether fixtures under `experiments/` are covered is
+  open and is not decided here.
 
 ## Review loop
 

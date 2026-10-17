@@ -135,8 +135,12 @@ def verified_review(reviews, request, value, expected_id=None):
             or timestamp(latest.get('submitted_at')) <= timestamp(request.get('created_at'))):
         raise ValueError('missing, stale, pending or dismissed latest independent review')
     body = latest.get('body', '')
-    if (re.findall(r'^CODEX-CANDIDATE: ([0-9a-f]{64})\s*$', body, re.M) != [key(value)]
-            or re.findall(r'^CODEX-GATE:\s*(READY|MEDIATE|FIX)\s*$', body, re.M) != ['READY']):
+    # Treat READY as a small machine-readable affirmative review, not a marker
+    # search through prose/Markdown. An exact two-line body excludes fenced,
+    # quoted, hidden, duplicated and contradictory assertions on either side.
+    # Findings/explanations belong in a non-READY review or inline comments.
+    expected = ['CODEX-CANDIDATE: ' + key(value), 'CODEX-GATE: READY']
+    if not isinstance(body, str) or body.rstrip('\r\n').splitlines() != expected:
         raise ValueError('latest review is not READY for this exact candidate')
     return latest
 

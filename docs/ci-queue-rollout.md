@@ -68,7 +68,8 @@ cannot admit paid Linux or dependent OS jobs. Opened/ready/manual/queue runs
 deliberately skip settle and can run their selected jobs. Draft event runs can
 still execute CI. All label events now have separate concurrency groups and check
 names and never admit paid CI. The exact-candidate READY caller reuses this CI DAG
-with the same PR concurrency group. GitHub concurrency queue order is not dispatch
+in a separate per-PR candidate concurrency group. Neither lane cancels the other;
+a new push does not cancel candidate work, and the final audit rejects stale results. GitHub concurrency queue order is not dispatch
 order: even a delayed Linux-only run must fail the ordinary PR aggregate.
 Manual dispatch remains independent. After a paid job starts, cancellation cannot
 recover elapsed cost. Coverage and correctness
@@ -94,8 +95,10 @@ A candidate binds repository, PR, full head SHA, live base SHA, synthetic merge
 SHA and tree SHA. The merge parents must be exactly base then head. The existing
 PAT authors one immutable request per candidate, at most three per head per UTC
 day. The authoritative latest review must come from the exact verified Codex bot
-identity, follow that request, name its `CODEX-CANDIDATE: <digest>`, and conclude
-`CODEX-GATE: READY`. Submission timestamps order terminal reviews; creation IDs cannot prove attempt order.
+identity, follow that request, contain exactly two plain lines: `CODEX-CANDIDATE: <digest>` followed by
+`CODEX-GATE: READY`. Prose, quotation, fences, hidden HTML, duplicate markers and
+contradictory text anywhere in an affirmative body fail closed. A reviewer with
+findings submits a non-READY review or inline comments. Submission timestamps order terminal reviews; creation IDs cannot prove attempt order.
 Tied latest submissions and unbound/pending trusted evidence fail closed.
 Old head-only READY, pending/dismissed reviews, wrong identities,
 new negative attempts and stale base/tree evidence do not qualify.
@@ -136,3 +139,20 @@ PR status is written from a default-branch event.
 
 Sources: [review event identity](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request_review),
 [reusable workflow context and reruns](https://docs.github.com/en/actions/reference/workflows-and-actions/reusing-workflow-configurations).
+
+Authenticated MEDIATE events route through the existing non-admitting mediation
+path before any candidate lookup. Conflicts, stale synthetic merge refs and an
+advanced base do not prevent mediation. The existing missing-PAT, fork/draft and
+authenticated deduplication rules still apply; mediation never reserves a matrix.
+
+Request/review timestamps have second precision. Equal-second request and review
+observations cannot establish causal ordering and remain rejected, as do tied
+latest review submissions. This is an explicit liveness limit: an owner must
+obtain a fresh independent review in a later second for the same still-current
+candidate, without deleting the request/claim history. No automatic request replay
+or assumed ordering across unrelated comment/review IDs is used.
+
+A workflow_dispatch full-platform diagnostic does not exercise the candidate-only
+pinned-checkout and one-attempt guards because its candidate input is empty.
+Passing product tests on all OSes is separate evidence from genuine review-event
+admission/reusable-workflow qualification; the latter remains an activation hold.

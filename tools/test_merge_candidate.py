@@ -121,6 +121,23 @@ class IdentityTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 p.verified_review([good, other], request(), VALUE)
 
+    def test_ready_requires_an_unquoted_unambiguous_terminal_affirmation(self):
+        ready = review()
+        body = ready['body']
+        for text in ('```text\n' + body + '\n```\nDo not approve.',
+                     '~~~\n' + body + '\n~~~',
+                     '<!--\n' + body + '\n-->',
+                     '<pre>\n' + body + '\n</pre>',
+                     '> ' + body.replace('\n', '\n> '),
+                     '    ' + body.replace('\n', '\n    '),
+                     body + '\nDo not approve.',
+                     'Do not approve.\n' + body,
+                     body + '\nCODEX-GATE: MEDIATE',
+                     body + '\n' + body):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                p.verified_review([{**ready, 'body': text}], request(), VALUE)
+        self.assertEqual(p.verified_review([{**ready, 'body': body + '\n'}], request(), VALUE)['id'], ready['id'])
+
     def test_base_advance_cannot_reuse_same_head_review(self):
         newer = {**VALUE, 'base': 'e'*40, 'merge': 'f'*40, 'tree': '1'*40}
         new_request = comment('request', {'candidate': newer, 'key': p.key(newer)})
@@ -163,6 +180,53 @@ class SnapshotTests(unittest.TestCase):
         client.reviews.return_value = [review()]
         client.events.return_value = []
         return client
+
+    def test_mediate_routes_without_merge_candidate_or_ready_credentials(self):
+        for reason, pat in itertools.product(['conflict', 'base advanced', 'merge unavailable'], ['pat', '']):
+            client = self.client()
+            client.candidate.side_effect = ValueError(reason)
+            event = {'review': {**review(), 'body': 'CODEX-GATE: MEDIATE'},
+                     'pull_request': {'number': 7}}
+            with mock.patch.dict(os.environ, {'GITHUB_SHA': 'e'*40}), \
+                    mock.patch.object(router.gate, 'run_verdict', return_value={'action': 'mediate'}) as route:
+                result = router.admit(client, event, pat, '50', 1)
+                self.assertEqual(result['admitted'], 'false')
+                route.assert_called_once_with(event, REPO, pat, 'token', 'master', gh=client.gh)
+                client.candidate.assert_not_called()
+                client.gh.assert_not_called()
+                client.post.assert_not_called()
+
+    def test_untrusted_mediate_never_reaches_legacy_router(self):
+        client = self.client()
+        for user in (WRITER, {**p.CODEX, 'id': 1}, {**p.CODEX, 'type': 'User'}):
+            event = {'review': {**review(), 'user': user, 'body': 'CODEX-GATE: MEDIATE'},
+                     'pull_request': {'number': 7}}
+            with mock.patch.object(router.gate, 'run_verdict') as route, self.assertRaises(ValueError):
+                router.admit(client, event, 'pat', '50', 1)
+            route.assert_not_called()
+
+    def test_conflicted_mediate_reaches_real_legacy_dispatch_adapter(self):
+        calls = []
+        def gh(args, token, input_text=None):
+            calls.append(args)
+            if args == ['api', 'user']:
+                return json.dumps(WRITER)
+            if any('/comments?' in arg for arg in args):
+                return '[]'
+            return '{}'
+        client = router.Client(REPO, 'token', gh)
+        event = {'review': {**review(), 'body': 'CODEX-GATE: MEDIATE'},
+                 'pull_request': {'number': 7, 'draft': False, 'mergeable': False,
+                                  'head': {'sha': VALUE['head'], 'repo': {'full_name': REPO}}}}
+        with mock.patch.object(client, 'candidate', side_effect=AssertionError('no merge lookup')), \
+                mock.patch.object(router.gate, 'emit'):
+            result = router.admit(client, event, 'pat', '50', 1)
+        self.assertEqual(result['action'], 'mediate')
+        self.assertEqual(result['admitted'], 'false')
+        dispatches = [args for args in calls if args[:2] == ['workflow', 'run']]
+        self.assertEqual(len(dispatches), 1)
+        self.assertIn('stuck-thread-watch.yml', dispatches[0])
+        self.assertFalse(any('ci.yml' in arg for args in calls for arg in args))
 
     def test_admit_reserves_before_export_and_duplicate_events_do_not_mutate(self):
         client = self.client()

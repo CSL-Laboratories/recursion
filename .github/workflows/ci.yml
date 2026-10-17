@@ -57,10 +57,10 @@ on:
         type: string
 
 concurrency:
-  # Admitted candidate CI shares PR concurrency across heads; labels cannot cancel it.
-  # Manual dispatch remains a separate lane. Queue arrival order is not freshness
+  # Candidate CI has its own per-PR lane; it cannot cancel required ordinary linux.
+  # Pushes cancel ordinary PR runs, not the candidate lane. Arrival order is not freshness
   # proof, so a Linux-only PR run can never report platform-gates success.
-  group: ci-CI-${{ (github.event.action == 'labeled') && format('ignored-label-{0}-{1}', github.event.pull_request.number, github.event.label.name) || github.event.pull_request.number || github.ref }}
+  group: ci-CI-${{ inputs.candidate != '' && format('candidate-{0}', github.event.pull_request.number) || (github.event.action == 'labeled') && format('ignored-label-{0}-{1}', github.event.pull_request.number, github.event.label.name) || github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:

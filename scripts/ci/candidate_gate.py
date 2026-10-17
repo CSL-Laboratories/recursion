@@ -88,7 +88,8 @@ def request(client, number, pat):
             + 'Verify head, base and synthetic merge tree; a stale head-only review does not count.\n'
             + json.dumps(value, sort_keys=True) + '\n\n'
             + 'Preserve Devin/fixer roles and all manual holds. Do not push, merge or resolve threads. '
-            + 'If independently READY, include exactly these two lines (READY last):\n'
+            + 'If independently READY, the entire review body must be exactly these two plain lines '
+            + '(no prose, quotation, indentation or code fence; READY last):\n'
             + 'CODEX-CANDIDATE: ' + protocol.key(value) + '\nCODEX-GATE: READY\n'
             + 'Otherwise report findings without READY, or CODEX-GATE: MEDIATE under the existing rules.\n')
     if client.candidate(number) != value:
@@ -133,6 +134,12 @@ def admit(client, event, pat, run, attempt):
     number = (event.get('pull_request') or {}).get('number')
     if type(number) is not int or not protocol.identity(review.get('user') or {}, protocol.CODEX):
         raise ValueError('untrusted review event')
+    if gate.parse_verdict(review.get('body')) == 'MEDIATE':
+        # Mediation never admits paid CI and must remain available for conflicts,
+        # stale merge refs and unavailable candidate identities. Retain the legacy
+        # router's fork/draft, missing-PAT and authenticated deduplication policy.
+        result = gate.run_verdict(event, client.repo, pat, client.token, 'master', gh=client.gh)
+        return {**result, 'admitted': 'false'}
     value = client.candidate(number)
     # Native pull_request_review checks report on the event merge SHA. Never
     # attach a current-candidate result to a stale event's different merge SHA.
@@ -153,8 +160,6 @@ def admit(client, event, pat, run, attempt):
             get_pages=client.pages,
             delete=lambda r, n: client.gh(['api', '-X', 'DELETE', f'repos/{r}/issues/{n}/labels/ci:full'], client.token),
             post_comment=lambda r, n, body: client.post(n, body))
-        if gate.parse_verdict(review.get('body')) == 'MEDIATE':
-            gate.run_verdict(event, client.repo, pat, client.token, 'master', gh=client.gh)
         return {'action': 'independent-review-invalid', 'admitted': 'false'}
     if authoritative['id'] != review.get('id'):
         return {'action': 'superseded-event', 'admitted': 'false', 'duplicate': 'true'}

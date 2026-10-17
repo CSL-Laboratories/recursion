@@ -6,6 +6,8 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -86,6 +88,26 @@ class SchedulingTests(unittest.TestCase):
             self.assertFalse(evaluate(condition(job), event='pull_request_review', full=True,
                                       attempt=attempt))
 
+    def test_candidate_and_required_pr_linux_survive_either_arrival_order(self):
+        text = (ROOT / '.github/workflows/ci.yml').read_text()
+        line = next(line for line in text.splitlines() if line.strip().startswith('group:'))
+        expression = re.findall(r'\$\{\{ (.*?) \}\}', line)[-1]
+        events = {'ordinary': dict(event='pull_request', action='synchronize'),
+                  'candidate': dict(event='pull_request_review', action='submitted', full=True)}
+        for order in itertools.permutations(events):
+            active = {}
+            for run in order:
+                # cancel-in-progress replaces only a matching concurrency group.
+                active[value(expression, **events[run])] = run
+            self.assertEqual(set(active.values()), set(events), order)
+        ordinary = value(expression, **events['ordinary'])
+        self.assertEqual(value(expression, event='pull_request', action='opened'), ordinary)
+        self.assertNotEqual(value(expression, event='pull_request_review', full=True, number=218),
+                            value(expression, **events['candidate']))
+        linux = text.split('  linux:\n', 1)[1].split('  windows:\n', 1)[0]
+        name = re.search(r'^    name: \$\{\{ (.*?) \}\}', linux, re.M)[1]
+        self.assertEqual(value(name, **events['ordinary']), 'linux')
+
     def test_label_routing_names_concurrency_and_required_jobs(self):
         text = (ROOT / '.github/workflows/ci.yml').read_text()
         self.assertIn('ready_for_review, labeled]', text)
@@ -116,6 +138,29 @@ class SchedulingTests(unittest.TestCase):
         for line in text.splitlines():
             if line.lstrip().startswith('run:'):
                 self.assertNotIn('github.event.label', line)
+
+    @unittest.skipIf(os.name == 'nt' or shutil.which('bash') is None, 'POSIX shell runner')
+    def test_actual_pinned_candidate_shell_rejects_wrong_merge_tree_and_rerun(self):
+        text = (ROOT / '.github/workflows/ci.yml').read_text()
+        with tempfile.TemporaryDirectory() as tmp:
+            def git(*args):
+                return subprocess.check_output(['git', '-C', tmp, *args], text=True).strip()
+            git('init', '-q')
+            git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+                '-c', 'commit.gpgsign=false', 'commit', '-q', '--allow-empty', '-m', 'fixture')
+            merge, tree = git('rev-parse', 'HEAD'), git('rev-parse', 'HEAD^{tree}')
+            for job in ('linux-tests', 'windows', 'macos'):
+                section = re.search(rf'^  {job}:\n(.*?)(?=^  [\w-]+:|\Z)', text, re.M | re.S)[1]
+                script = re.search(r'      - name: Verify pinned candidate[^\n]*\n[\s\S]*?        run: \|\n((?:          [^\n]*\n)+)', section)[1]
+                script = textwrap.dedent(script)
+                for expected_merge, expected_tree, attempt, passed in (
+                    (merge, tree, '1', True), ('e'*40, tree, '1', False),
+                    (merge, 'e'*40, '1', False), (merge, tree, '2', False)):
+                    env = dict(os.environ, EXPECTED_MERGE=expected_merge,
+                               EXPECTED_TREE=expected_tree, GITHUB_RUN_ATTEMPT=attempt)
+                    result = subprocess.run(['bash', '-e', '-c', script], cwd=tmp,
+                                            env=env, capture_output=True)
+                    self.assertEqual(result.returncode == 0, passed, (job, attempt, expected_merge, expected_tree))
 
     @unittest.skipIf(os.name == 'nt' or shutil.which('bash') is None, 'POSIX shell runner')
     def test_required_linux_runs_actual_shell_for_every_dependency_result(self):

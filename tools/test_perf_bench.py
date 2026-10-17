@@ -161,6 +161,40 @@ class BenchTests(unittest.TestCase):
             else:
                 gc.disable()
 
+    def test_timed_call_keeps_gc_on_when_the_callback_enables_it(self) -> None:
+        # timeit parity: one-way restore. A callback that enables GC is not
+        # re-disabled, even when the caller entered with GC off.
+        gc_was_enabled = gc.isenabled()
+        try:
+            gc.disable()
+            perf_bench._timed_call(gc.enable, 1)
+            self.assertTrue(gc.isenabled())
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+            else:
+                gc.disable()
+
+    def test_timed_call_restores_gc_when_the_callback_raises(self) -> None:
+        def boom() -> None:
+            raise RuntimeError("boom")
+
+        gc_was_enabled = gc.isenabled()
+        try:
+            gc.enable()
+            with self.assertRaises(RuntimeError):
+                perf_bench._timed_call(boom, 1)
+            self.assertTrue(gc.isenabled())
+            gc.disable()
+            with self.assertRaises(RuntimeError):
+                perf_bench._timed_call(boom, 1)
+            self.assertFalse(gc.isenabled())
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+            else:
+                gc.disable()
+
     def test_short_suite_is_provider_free(self) -> None:
         report = perf_bench.run_suite(ROOT, rounds=2, round_s=0.005, warmup_s=0.005)
         self.assertEqual(report["provider_calls"], 0)

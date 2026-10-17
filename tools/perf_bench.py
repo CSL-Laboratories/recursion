@@ -225,6 +225,7 @@ def _calibrate_iterations(fn, round_s: float) -> int:
 
 
 def _timed_call(fn, iterations: int) -> float:
+    """Time ``iterations`` calls of ``fn``; re-enables GC afterward only if the caller had it on."""
     was_enabled = gc.isenabled()
     gc.disable()
     try:

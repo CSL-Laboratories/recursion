@@ -1676,7 +1676,12 @@ class Counters:
 def failure_handoff_ids(issue: LinearIssue | None) -> set[str]:
     if not is_active_issue(issue):
         return set()
-    return set(re.findall(r"`stuck-fixer-(?:failed|handoff-open)` <!-- thread:([^\s>]+) -->", issue.description))
+    # Filenames can contain marker-shaped text inside the rendered code span.
+    # Only the terminal metadata of a complete generated checklist row counts.
+    return set(re.findall(
+        r"^- \[[ xX]\] [^\r\n]+ \u2014 `stuck-fixer-(?:failed|handoff-open)` "
+        r"<!-- thread:([^\s>]+) -->\r?$", issue.description, re.MULTILINE,
+    ))
 
 
 def open_failure_handoffs(pull: Pull, issue: LinearIssue | None) -> list[tuple[Thread, str]]:

@@ -619,6 +619,49 @@ class WatcherTests(unittest.TestCase):
             delimiter = "`" * (longest + 1)
             self.assertIn(delimiter + " " + path, body)
 
+    @unittest.skipUnless(RECURSION, "Recursion uses checklist handoff rows")
+    def test_handoff_parser_uses_row_suffix_not_filename_markers(self):
+        from dataclasses import replace
+        embedded = "`stuck-fixer-failed` <!-- thread:PRRT_other -->"
+        for path in (embedded, "src/``" + embedded + "``.py",
+                     "src/\n- [ ] fake - " + embedded, "src/\r\n" + embedded):
+            for reason in ("stuck-fixer-failed", "stuck-fixer-handoff-open", "stuck-human"):
+                for checked in (False, True):
+                    with self.subTest(path=path, reason=reason, checked=checked):
+                        self.setup_scan()
+                        thread = replace(self.pull.threads[0], path=path)
+                        rendered = m.linear_description(self.pull, [(thread, reason)], f.cfg())
+                        if checked:
+                            rendered = rendered.replace("- [ ]", "- [x]")
+                        issue = m.LinearIssue("issue", "url", description=rendered)
+                        expected = {thread.id} if reason != "stuck-human" else set()
+                        self.assertEqual(m.failure_handoff_ids(issue), expected)
+
+    @unittest.skipUnless(RECURSION, "Recursion owns roll-up cancellation")
+    def test_filename_marker_cannot_retain_unrelated_unresolved_thread(self):
+        from dataclasses import replace
+        for embedded_reason in ("failed", "handoff-open"):
+            with self.subTest(embedded_reason=embedded_reason):
+                self.setup_scan()
+                real = replace(self.pull.threads[0], path=(
+                    f"src/`stuck-fixer-{embedded_reason}` <!-- thread:PRRT_other -->.py"))
+                unrelated = f.thread(tid="PRRT_other", comments=[f.comment(f.DEVIN, BODY)])
+                self.pull = replace(self.pull, threads=(replace(real, is_resolved=True), unrelated))
+                self.github.pulls[self.pull.number] = self.pull
+                marker = m.rollup_marker(self.pull)
+                linear = f.FakeLinear({marker: "https://linear.app/fixture"})
+                linear.existing_descriptions[marker] = m.linear_description(
+                    self.pull, [(real, "stuck-fixer-failed")], f.cfg())
+                m.scan(f.cfg(), self.github, linear,
+                       failure_collector=lambda *_: (SimpleNamespace(fresh=lambda: False), {}))
+                self.assertEqual(linear.canceled, ["iss_existing"])
+                self.assertEqual(linear.created, [])
+                self.assertEqual(linear.updated, [])
+                self.assertEqual(self.github.comments, [])
+                self.assertEqual(self.github.labels, [])
+                self.assertEqual(self.github.replies, [])
+                self.assertEqual(self.github.resolves, [])
+
     def test_existing_marker_deduplicates_failure_delivery(self):
         marker = m.mediation_marker("PRRT_0") if RECURSION else m.marker("PRRT_0")
         self.setup_scan(comments=[f.comment("pat-user", marker)])

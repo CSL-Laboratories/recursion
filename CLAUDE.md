@@ -48,8 +48,8 @@ If a task could be read two materially different ways, stop and record a blocker
 ## Hard rules
 
 1. **Never `git push --force`.** Under any circumstance, in any script, for any reason.
-2. **Never commit to or merge into `master`.** Commit on a review branch and open a
-   PR for founder review and merge after required reviews and checks. Agents never merge.
+2. **Never commit to or merge into `master`.** Commit on a review branch and open a PR;
+   founders merge after required reviews and checks. Agents never merge.
    Until rulesets enforce it, no founder merges their own PR without another founder's
    approval.
    Name the branch `csl-<N>-<slug>` (for example `csl-26-short-slug`), optionally prefixed with a GitHub username (for example

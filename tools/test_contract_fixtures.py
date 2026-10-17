@@ -6,7 +6,8 @@ positive fixture against its declared schema $def and every adverse fixture to
 rejection. Checks beyond JSON Schema are declared in the manifest and enforced
 here: strict I-JSON decoding (duplicate keys, floats, lexical -0, non-I-JSON
 constants), x-sorted-set, x-calendar-date, x-preferred-in-supported and
-x-sunset-subset-of-supported.
+x-sunset-subset-of-supported. Manifest "sequences" entries pin the command
+journal's replay/conflict semantics as ordered send/expect scenarios.
 """
 from __future__ import annotations
 
@@ -21,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tools" / "contract_fixtures"
 MANIFEST_PATH = FIXTURES / "manifest.json"
 SCHEMA_PATH = FIXTURES / "schema" / "wire-vocab-draft.schema.json"
+SEQUENCE_SCHEMA_PATH = FIXTURES / "schema" / "journal-sequence.schema.json"
 
 RECORD_DEFS = {
     "wire_identity_ref",
@@ -58,7 +60,7 @@ def _reject_non_ijson(token: str):
 def strict_load(path: Path):
     """I-JSON profile decode: no duplicate keys, floats, -0 or NaN/Infinity."""
     return json.loads(
-        path.read_text(encoding="utf-8"),
+        path.read_text(encoding="utf-8"),  # invalid UTF-8 raises UnicodeDecodeError
         object_pairs_hook=_no_duplicate_keys,
         parse_int=_strict_int,
         parse_float=_reject_non_ijson,
@@ -72,6 +74,7 @@ class ContractFixtureTests(unittest.TestCase):
         cls.schema = strict_load(SCHEMA_PATH)
         cls.defs = cls.schema["$defs"]
         cls.manifest = strict_load(MANIFEST_PATH)
+        cls.seq_schema = strict_load(SEQUENCE_SCHEMA_PATH)
 
     def target_schema(self, target: str) -> dict:
         return {"$defs": self.defs, "$ref": f"#/$defs/{target}"}
@@ -110,9 +113,13 @@ class ContractFixtureTests(unittest.TestCase):
     def check_fixture(self, fixture: dict) -> list[str]:
         try:
             doc = strict_load(FIXTURES / fixture["path"])
-        except (StrictDecodeError, json.JSONDecodeError) as exc:
+        except (StrictDecodeError, json.JSONDecodeError, UnicodeDecodeError) as exc:
             return [f"strict decode failed: {exc}"]
-        return self.schema_errors(fixture, doc) + self.semantic_errors(fixture, doc)
+        schema_errs = self.schema_errors(fixture, doc)
+        if schema_errs:
+            # semantic rules only apply to schema-valid documents
+            return schema_errs
+        return self.semantic_errors(fixture, doc)
 
     def test_manifest_integrity(self) -> None:
         ids = [f["id"] for f in self.manifest["fixtures"]]
@@ -152,6 +159,75 @@ class ContractFixtureTests(unittest.TestCase):
         self.assertEqual(len(registry), len(set(registry)))
         for code in registry:
             self.assertRegex(code, r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
+
+    def sequence_schema_errors(self, doc) -> list[str]:
+        validator = jsonschema.Draft202012Validator(self.seq_schema)
+        return [error.message for error in validator.iter_errors(doc)]
+
+    def run_journal_sequence(self, seq: dict) -> list[str]:
+        """Simulate the draft command journal over a sequence's steps.
+
+        First receipt for an unjournaled command_id must be accepted or refused;
+        an identical retry (same digest) answers duplicate for admitted commands
+        or replays the journaled receipt verbatim for refused/conflict; a
+        different digest under a journaled id answers conflict and never rebinds.
+        """
+        errors: list[str] = []
+        journal: dict = {}
+        outcome_target = {"target": "wire_command_outcome"}
+        for index, step in enumerate(seq["steps"]):
+            tag = f"step {index}"
+            send, expect = step["send"], step["expect"]
+            for message in self.schema_errors(outcome_target, expect) + self.semantic_errors(
+                outcome_target, expect
+            ):
+                errors.append(f"{tag} expected receipt invalid: {message}")
+            command_id, command_digest = send["command_id"], send["command_digest"]
+            entry = journal.get(command_id)
+            if entry is None:
+                if expect.get("outcome") not in ("accepted", "refused"):
+                    errors.append(
+                        f"{tag}: first receipt for unjournaled id claims "
+                        f"{expect.get('outcome')!r}"
+                    )
+                journal[command_id] = {"digest": command_digest, "attempts": {command_digest: expect}}
+                produced = expect
+            elif command_digest == entry["digest"]:
+                bound = entry["attempts"][entry["digest"]]
+                if bound["outcome"] == "accepted":
+                    produced = {
+                        "type": "WireCommandOutcome@1",
+                        "command_id": command_id,
+                        "command_digest": command_digest,
+                        "outcome": "duplicate",
+                    }
+                else:
+                    produced = bound
+            else:
+                produced = entry["attempts"].get(command_digest)
+                if produced is None:
+                    produced = {
+                        "type": "WireCommandOutcome@1",
+                        "command_id": command_id,
+                        "command_digest": command_digest,
+                        "outcome": "conflict",
+                    }
+                    entry["attempts"][command_digest] = produced
+            if produced != expect:
+                errors.append(f"{tag}: produced {produced} != expected {expect}")
+        return errors
+
+    def test_journal_sequences(self) -> None:
+        for entry in self.manifest.get("sequences", []):
+            with self.subTest(sequence=entry["id"]):
+                try:
+                    doc = strict_load(FIXTURES / entry["path"])
+                except (StrictDecodeError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    self.fail(f"{entry['id']} strict decode failed: {exc}")
+                schema_errs = self.sequence_schema_errors(doc)
+                if schema_errs:
+                    self.fail(f"{entry['id']} malformed sequence: {schema_errs}")
+                self.assertEqual(self.run_journal_sequence(doc), [], entry["id"])
 
 
 if __name__ == "__main__":

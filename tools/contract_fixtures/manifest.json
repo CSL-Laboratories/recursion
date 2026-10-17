@@ -42,6 +42,14 @@
     { "id": "A-16", "path": "adverse/A-16-advert-sunset-not-supported.json", "target": "wire_version_advertisement", "kind": "adverse", "expect": "reject", "note": "x-sunset-subset-of-supported semantic rule" },
     { "id": "A-17", "path": "adverse/A-17-identity-duplicate-key.json", "target": "wire_identity_ref", "kind": "adverse", "expect": "reject", "note": "strict-decode: duplicate object key" },
     { "id": "A-18", "path": "adverse/A-18-event-lexical-negzero.json", "target": "wire_event_envelope", "kind": "adverse", "expect": "reject", "note": "strict-decode: lexical -0" },
-    { "id": "A-19", "path": "adverse/A-19-outcome-conflict-with-refusal.json", "target": "wire_command_outcome", "kind": "adverse", "expect": "reject", "note": "conflict outcome carries a refusal block — journal-level outcome, never refused" }
-  ]
+    { "id": "A-19", "path": "adverse/A-19-outcome-conflict-with-refusal.json", "target": "wire_command_outcome", "kind": "adverse", "expect": "reject", "note": "conflict outcome carries a refusal block — journal-level outcome, never refused" },
+    { "id": "A-20", "path": "adverse/A-20-outcome-duplicate-with-refusal.json", "target": "wire_command_outcome", "kind": "adverse", "expect": "reject", "note": "duplicate outcome carries a refusal block — refusal only on refused" },
+    { "id": "A-21", "path": "adverse/A-21-identity-invalid-utf8.json", "target": "wire_identity_ref", "kind": "adverse", "expect": "reject", "note": "strict-decode: raw bytes are not valid UTF-8" }
+  ],
+  "sequences": [
+    { "id": "S-01", "path": "sequences/S-01-refused-retry-verbatim.json", "kind": "journal-replay", "note": "identical retry of a journaled refused command replays the recorded receipt verbatim — never re-evaluated" },
+    { "id": "S-02", "path": "sequences/S-02-admitted-retry-duplicate.json", "kind": "journal-replay", "note": "identical retry of an admitted command answers duplicate; the journaled accepted receipt stands" },
+    { "id": "S-03", "path": "sequences/S-03-conflict-preserves-binding.json", "kind": "journal-replay", "note": "a conflicting digest never rebinds the id — the original receipt still answers retries; the conflict receipt replays verbatim" }
+  ],
+  "sequence_schema": "schema/journal-sequence.schema.json"
 }

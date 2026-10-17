@@ -17,8 +17,16 @@ transport, no host effects.
 - `positive/` — documents that must validate (`accept`).
 - `adverse/` — documents that must fail schema validation or a declared semantic rule
   (`reject`).
+- `schema/journal-sequence.schema.json` — `WireJournalSequence@1`: ordered
+  `send`/`expect` steps for command journal scenarios.
+- `sequences/` — journal-replay scenarios (`S-NN`): each step names a sent
+  `command_id` + `command_digest` and the `WireCommandOutcome@1` the journal must
+  produce. They pin replay semantics a single record cannot: refused/conflicted
+  commands replay their journaled receipt verbatim, admitted commands answer
+  `duplicate`, and a `conflict` verdict never rebinds the id.
 - `manifest.json` — the corpus index and expected verdicts. Each entry pins the target
-  `$def`; `note` records the refusal surface under test.
+  `$def`; `note` records the refusal surface under test. `sequences[]` lists the
+  journal scenarios run by the test driver.
 
 ## Verdicts
 

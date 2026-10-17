@@ -61,8 +61,9 @@ This draft reuses the encoding discipline of
   before semantic evaluation.
 - Sets are serialized as **sorted unique arrays** (ascending Unicode code point). Schema
   `uniqueItems` alone is insufficient; readers apply the declared sorted-set rule.
-- Encoding profile is UTF-8 I-JSON: no floats, no lexical `-0`, no duplicate keys, no
-  unpaired surrogates. Bounds below are conservative and may tighten on freeze.
+- Encoding profile is UTF-8 I-JSON (RFC 7493): no floats, no lexical `-0`, no
+  duplicate keys, no unpaired surrogates. Bounds below are conservative and may
+  tighten on freeze.
 - `Digest` fields carry `sha256:` + 64 lowercase hex over the RFC 8785 canonical form of
   the documented object, self-digest field omitted — matching M1C's self-describing
   prefix rather than M1A's bare hex.
@@ -106,10 +107,11 @@ WireIdentityRef@1 = {
   pin the exact revision.
 - Command idempotency uses the same `PublicId` grammar under the `cmd:` namespace; the
   command journal binds `command_id` → `command_digest` on first receipt. A
-  canonically identical retry replays the journaled receipt (`duplicate` for an
-  admitted command); reuse of a journaled id with different bytes is `conflict` —
-  the collision M1B reports as `duplicate-command-conflict`, surfaced here
-  outcome-level rather than as a refusal reason.
+  canonically identical retry replays the journaled decision (`duplicate` for an
+  admitted command, the recorded receipt verbatim for `refused`/`conflict`);
+  reuse of a journaled id with different bytes is `conflict` — the collision M1B
+  reports as `duplicate-command-conflict`, surfaced here outcome-level rather
+  than as a refusal reason.
 
 ### `WireEventEnvelope@1` — event vocabulary
 
@@ -164,27 +166,39 @@ Refusal = {
 Rules:
 
 - **Refusal is not an error.** `refused` means the document was well-formed, decoded and
-  authenticated, then not admitted. Decode failures (invalid UTF-8/I-JSON, schema
-  mismatch, unknown `type`) never reach this record; they normalize to a closed
-  decode/schema error per the M1 profiles' strict-decoder rule.
-- `duplicate` = a command already admitted whose canonical digest equals the incoming
-  `command_digest` (returns the prior outcome). Because digests are computed over
-  canonical bytes, reordering object keys does not mint a new command — it replays.
-  `conflict` = `command_id` already journaled to a different `command_digest`.
-  `conflict` is permanent.
+  authenticated, then not admitted. Decode failures (invalid UTF-8, I-JSON
+  (RFC 7493) violations, schema mismatch, unknown `type`) never reach this
+  record; they normalize to a closed decode/schema error per the M1 profiles'
+  strict-decoder rule.
+- `duplicate` = the replay outcome for an admitted command: an identical retry
+  (same `command_id`, canonically equal `command_digest`) is answered `duplicate`
+  and the journaled `accepted` receipt remains the recorded verdict — `duplicate`
+  reports delivery status, it does not rewrite the stored receipt. Because
+  digests are computed over canonical bytes, reordering object keys does not
+  mint a new command — it replays.
+- `conflict` = `command_id` already journaled to a different `command_digest`.
+  `conflict` is permanent and never modifies or replaces the journaled binding —
+  the original receipt still answers later identical retries.
 - Every received command journals `command_id` → `command_digest` on first
   receipt — accepted, refused and conflicted receipts are all retained (the M1A
   receipt-journal rule), so the id is burned whatever the verdict. An identical
-  retry replays the journaled receipt — `duplicate` for an admitted command,
-  verbatim `refused`/`conflict` otherwise; a journaled pair is never
-  re-evaluated. Operation-level retries use a NEW `command_id`. `refusal_class`
-  is caller guidance about that resubmission, not a receipt guarantee:
-  `retryable` refusals invite resubmission — unchanged payload for reasons that
-  clear with time alone (`paused`, `budget-exceeded`), corrected payload for
-  reasons that need caller repair (`stale-epoch`, `precondition-failed`).
-  `permanent` refusals must not be resubmitted expecting success — a changed
-  verdict requires changed state (e.g. an `unknown-record` target appearing
-  before the resubmission).
+  retry replays the journaled decision: `duplicate` for an admitted command, the
+  recorded receipt verbatim for `refused` or `conflict` — a journaled pair is
+  never re-evaluated.
+- Only a new admission attempt needs a new `command_id`. An unanswered attempt
+  (timeout, lost response, transport failure) is not a journaled refusal:
+  resend the identical command under the same `command_id` until a journaled
+  decision returns — minting a fresh id after an unobserved result may execute
+  the intent twice. Retrying after a recorded refusal, or submitting repaired
+  intent, is a new admission attempt and uses a NEW `command_id`.
+- `refusal_class` is caller guidance about that resubmission, not a receipt
+  guarantee; the registry's meaning column names the required recovery action —
+  wait for the named condition to lift (`paused`, `budget-exceeded`) versus
+  repair and resubmit (`stale-epoch`, `precondition-failed`) — and
+  `retry_after_seconds` is an advisory hint for that response, not a promise the
+  refusal clears on schedule. `permanent` refusals must not be resubmitted
+  expecting success — a changed verdict requires changed state (e.g. an
+  `unknown-record` target appearing before the resubmission).
 - `accepted` carries no refusal block; a `refusal` on any other outcome is malformed.
 
 Closed `ReasonCode` registry (draft — extensions require a vocabulary revision):
@@ -278,11 +292,22 @@ matters for O3–O5; `WireCommandOutcome@1` covers admission only — `accepted`
 
 - `PublicId` namespace registry ownership and collision rules.
 - Whether `emitted_at` remains optional at freeze or is dropped outright.
-- Whether event identity needs an explicit `stream_epoch` field so readers can
-  distinguish a restarted emitter's `event_id`/`sequence` space from a duplicate
-  without inspecting `stream_id` history.
-- Payload-embedding versus digest-reference for `WireEventEnvelope` in-band transports.
-- The `sunset`/`preferred` semantics if a third vocabulary family joins.
+- How event generation is made observable at freeze — an explicit `stream_epoch`
+  field, or a `stream_id` that already names an immutable generation — so readers
+  can distinguish a restarted emitter's `event_id`/`sequence` space from a
+  duplicate without inspecting `stream_id` history. Whether an epoch is an opaque
+  incarnation marker or an ordered fencing token, and who authorizes transitions.
+- Payload-embedding versus digest-reference for `WireEventEnvelope` in-band
+  transports, and whether `payload_digest` should also authenticate the envelope's
+  metadata claims (`schema_ref`, stream, epoch, sequence) or payload bytes only.
+- The `sunset`/`preferred` semantics if a third vocabulary family joins; whether a
+  `sunset` version may still be `preferred`; whether `preferred` stays a single
+  member or becomes per-name; and the advertisement selection rules — who picks
+  the effective version, how intersection is computed and bound, and how a stale
+  advertisement or an unreadable `unsupported-version` refusal is handled.
+- Command journal durability boundaries: atomicity of the id claim, decision and
+  any resulting events; retention/expiry of journaled ids; and the tenant scope
+  of `command_id` (whether the id namespace is per-caller or global).
 
 ## Falsifiers
 

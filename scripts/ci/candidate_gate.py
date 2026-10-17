@@ -135,10 +135,35 @@ def admit(client, event, pat, run, attempt):
     if type(number) is not int or not protocol.identity(review.get('user') or {}, protocol.CODEX):
         raise ValueError('untrusted review event')
     if gate.parse_verdict(review.get('body')) == 'MEDIATE':
+        # Authenticate ordering before the merge-independent mediation route.
+        # An old event must not dispatch again or overwrite a newer READY check.
+        path = f'repos/{client.repo}/pulls/{number}'
+        current_pr = client.get(path)
+        if (current_pr.get('state') != 'open' or current_pr.get('draft') is not False
+                or ((current_pr.get('head') or {}).get('repo') or {}).get('full_name') != client.repo):
+            return {'action': 'skip-ineligible-pr', 'admitted': 'false', 'duplicate': 'true'}
+        head = protocol.sha((current_pr.get('head') or {}).get('sha'))
+        authoritative = protocol.latest_review(client.reviews(number), head)
+        if (authoritative['id'] != review.get('id')
+                or authoritative.get('body') != review.get('body')
+                or authoritative.get('commit_id') != review.get('commit_id')):
+            return {'action': 'superseded-event', 'admitted': 'false', 'duplicate': 'true'}
+        if client.get(path) != current_pr:
+            raise ValueError('PR changed before mediation')
+        # A genuine latest MEDIATE invalidates proven owned readiness, even if
+        # the legacy dispatch receipt says already-acted. Never equate that
+        # receipt with a duplicate candidate or preserve its old READY label.
+        gate.fixer_helpers().revoke_owned_ci(client.repo, str(number), head,
+            get_pages=client.pages,
+            delete=lambda r, n: client.gh(['api', '-X', 'DELETE', f'repos/{r}/issues/{n}/labels/ci:full'], client.token),
+            post_comment=lambda r, n, body: client.post(n, body))
+        if authoritative.get('state', '').upper() not in {'COMMENTED', 'APPROVED'}:
+            return {'action': 'independent-review-invalid', 'admitted': 'false'}
         # Mediation never admits paid CI and must remain available for conflicts,
         # stale merge refs and unavailable candidate identities. Retain the legacy
         # router's fork/draft, missing-PAT and authenticated deduplication policy.
-        result = gate.run_verdict(event, client.repo, pat, client.token, 'master', gh=client.gh)
+        result = gate.run_verdict({**event, 'review': authoritative, 'pull_request': current_pr},
+                                  client.repo, pat, client.token, 'master', gh=client.gh)
         return {**result, 'admitted': 'false'}
     value = client.candidate(number)
     # Native pull_request_review checks report on the event merge SHA. Never

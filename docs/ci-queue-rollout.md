@@ -141,7 +141,10 @@ Sources: [review event identity](https://docs.github.com/en/actions/reference/wo
 [reusable workflow context and reruns](https://docs.github.com/en/actions/reference/workflows-and-actions/reusing-workflow-configurations).
 
 Authenticated MEDIATE events route through the existing non-admitting mediation
-path before any candidate lookup. Conflicts, stale synthetic merge refs and an
+path after checking the live head and authoritative latest review, before any
+candidate lookup. Superseded events use the ignored check lane and cannot replace
+newer candidate readiness. A current MEDIATE revokes only proven owned readiness,
+even when its legacy dispatch receipt already exists. Conflicts, stale synthetic merge refs and an
 advanced base do not prevent mediation. The existing missing-PAT, fork/draft and
 authenticated deduplication rules still apply; mediation never reserves a matrix.
 

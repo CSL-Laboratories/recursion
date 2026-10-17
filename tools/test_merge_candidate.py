@@ -5,6 +5,8 @@ import copy
 import itertools
 import json
 import os
+import re
+from types import SimpleNamespace as NS
 from pathlib import Path
 import sys
 import unittest
@@ -179,7 +181,105 @@ class SnapshotTests(unittest.TestCase):
         client.comments.return_value = [request()]
         client.reviews.return_value = [review()]
         client.events.return_value = []
+        client.pages.return_value = []
+        client.get.return_value = {'number': 7, 'state': 'open', 'draft': False,
+                                   'head': {'sha': VALUE['head'], 'repo': {'full_name': REPO}}}
         return client
+
+    def test_old_mediate_cannot_poison_new_ready_even_if_legacy_already_acted(self):
+        for new_id in (9, 11):
+            client = self.client()
+            old = {**review(), 'body': 'CODEX-GATE: MEDIATE'}
+            newer = {**review(), 'id': new_id, 'submitted_at': '2026-10-16T01:00:02Z'}
+            client.reviews.return_value = [old, newer]
+            client.candidate.side_effect = AssertionError('no merge lookup')
+            with mock.patch.object(router.gate, 'run_verdict', return_value={'action': 'already-acted'}) as route, \
+                    mock.patch.object(router.gate, 'fixer_helpers') as helpers:
+                result = router.admit(client, {'review': old, 'pull_request': {'number': 7}}, '', '51', 1)
+                self.assertEqual(result.get('duplicate'), 'true')
+                self.assertEqual(result['admitted'], 'false')
+                self.assertFalse(self.readiness_scheduled(result))
+                route.assert_not_called()
+                helpers.assert_not_called()
+                client.reviews.assert_called()
+                client.candidate.assert_not_called()
+
+    def test_latest_mediate_revokes_owned_readiness_even_when_already_acted(self):
+        client = self.client()
+        old = review()
+        latest = {**old, 'id': 11, 'body': 'CODEX-GATE: MEDIATE',
+                  'submitted_at': '2026-10-16T01:00:02Z'}
+        client.reviews.return_value = [old, latest]
+        client.candidate.side_effect = AssertionError('no merge lookup')
+        with mock.patch.object(router.gate, 'run_verdict', return_value={'action': 'already-acted'}) as route, \
+                mock.patch.object(router.gate, 'fixer_helpers') as helpers:
+            result = router.admit(client, {'review': latest, 'pull_request': {'number': 7}}, '', '51', 1)
+            self.assertEqual(result['admitted'], 'false')
+            self.assertNotEqual(result.get('duplicate'), 'true')
+            self.assertTrue(self.readiness_scheduled(result))
+            helpers.return_value.revoke_owned_ci.assert_called_once()
+            route.assert_called_once()
+            client.candidate.assert_not_called()
+
+    @staticmethod
+    def readiness_scheduled(result):
+        text = (ROOT / '.github/workflows/codex-gate.yml').read_text()
+        section = text.split('  candidate-readiness:\n', 1)[1]
+        expression = re.search(r'    if: >-\n((?:      .*\n)+)', section)[1]
+        expression = ' '.join(expression.split()).replace('&&', ' and ').replace('||', ' or ')
+        return eval(expression, {'__builtins__': {}}, {
+            'always': lambda: True,
+            'github': NS(event_name='pull_request_review', event=NS(review=NS(user=NS(login=p.CODEX['login'])))),
+            'needs': NS(verdict=NS(outputs=NS(duplicate=result.get('duplicate', ''))))})
+
+    def test_mediate_ambiguous_or_missing_current_review_never_mutates(self):
+        mediate = {**review(), 'body': 'CODEX-GATE: MEDIATE'}
+        for records in ([], [mediate, {**mediate, 'id': 11}],
+                        [mediate, {**mediate, 'id': 11, 'state': 'PENDING'}],
+                        [{**mediate, 'user': WRITER}]):
+            client = self.client()
+            client.reviews.return_value = records
+            with mock.patch.object(router.gate, 'run_verdict') as route, \
+                    mock.patch.object(router.gate, 'fixer_helpers') as helpers, self.assertRaises(ValueError):
+                router.admit(client, {'review': mediate, 'pull_request': {'number': 7}}, '', '51', 1)
+            route.assert_not_called()
+            helpers.assert_not_called()
+            client.candidate.assert_not_called()
+
+    def test_mediate_uses_live_head_and_skips_ineligible_pr_without_mutations(self):
+        mediate = {**review(), 'body': 'CODEX-GATE: MEDIATE'}
+        client = self.client()
+        newer = {**review(), 'id': 11, 'commit_id': 'e'*40}
+        client.reviews.return_value = [mediate, newer]
+        client.get.return_value['head']['sha'] = newer['commit_id']
+        with mock.patch.object(router.gate, 'run_verdict') as route, \
+                mock.patch.object(router.gate, 'fixer_helpers') as helpers:
+            result = router.admit(client, {'review': mediate, 'pull_request': {'number': 7}}, '', '51', 1)
+            self.assertEqual(result['duplicate'], 'true')
+            route.assert_not_called()
+            helpers.assert_not_called()
+        for change in ({'draft': True}, {'state': 'closed'},
+                       {'head': {'sha': VALUE['head'], 'repo': {'full_name': 'fork/repo'}}}):
+            client = self.client()
+            client.get.return_value.update(change)
+            with mock.patch.object(router.gate, 'run_verdict') as route, \
+                    mock.patch.object(router.gate, 'fixer_helpers') as helpers:
+                result = router.admit(client, {'review': mediate, 'pull_request': {'number': 7}}, '', '51', 1)
+                self.assertEqual(result['action'], 'skip-ineligible-pr')
+                route.assert_not_called()
+                helpers.assert_not_called()
+
+    def test_dismissed_mediate_revokes_but_does_not_dispatch(self):
+        client = self.client()
+        mediate = {**review(), 'body': 'CODEX-GATE: MEDIATE', 'state': 'DISMISSED'}
+        client.reviews.return_value = [mediate]
+        with mock.patch.object(router.gate, 'run_verdict') as route, \
+                mock.patch.object(router.gate, 'fixer_helpers') as helpers:
+            result = router.admit(client, {'review': mediate, 'pull_request': {'number': 7}}, '', '51', 1)
+            self.assertEqual(result['action'], 'independent-review-invalid')
+            self.assertTrue(self.readiness_scheduled(result))
+            helpers.return_value.revoke_owned_ci.assert_called_once()
+            route.assert_not_called()
 
     def test_mediate_routes_without_merge_candidate_or_ready_credentials(self):
         for reason, pat in itertools.product(['conflict', 'base advanced', 'merge unavailable'], ['pat', '']):
@@ -187,11 +287,13 @@ class SnapshotTests(unittest.TestCase):
             client.candidate.side_effect = ValueError(reason)
             event = {'review': {**review(), 'body': 'CODEX-GATE: MEDIATE'},
                      'pull_request': {'number': 7}}
+            client.reviews.return_value = [event['review']]
             with mock.patch.dict(os.environ, {'GITHUB_SHA': 'e'*40}), \
                     mock.patch.object(router.gate, 'run_verdict', return_value={'action': 'mediate'}) as route:
                 result = router.admit(client, event, pat, '50', 1)
                 self.assertEqual(result['admitted'], 'false')
-                route.assert_called_once_with(event, REPO, pat, 'token', 'master', gh=client.gh)
+                route.assert_called_once_with({**event, 'pull_request': client.get.return_value},
+                                              REPO, pat, 'token', 'master', gh=client.gh)
                 client.candidate.assert_not_called()
                 client.gh.assert_not_called()
                 client.post.assert_not_called()
@@ -213,10 +315,16 @@ class SnapshotTests(unittest.TestCase):
                 return json.dumps(WRITER)
             if any('/comments?' in arg for arg in args):
                 return '[]'
+            if args == ['api', f'repos/{REPO}/pulls/7']:
+                return json.dumps(event['pull_request'])
+            if any('/reviews?' in arg for arg in args):
+                return json.dumps([event['review']])
+            if any('/events?' in arg for arg in args):
+                return '[]'
             return '{}'
         client = router.Client(REPO, 'token', gh)
         event = {'review': {**review(), 'body': 'CODEX-GATE: MEDIATE'},
-                 'pull_request': {'number': 7, 'draft': False, 'mergeable': False,
+                 'pull_request': {'number': 7, 'state': 'open', 'draft': False, 'mergeable': False,
                                   'head': {'sha': VALUE['head'], 'repo': {'full_name': REPO}}}}
         with mock.patch.object(client, 'candidate', side_effect=AssertionError('no merge lookup')), \
                 mock.patch.object(router.gate, 'emit'):

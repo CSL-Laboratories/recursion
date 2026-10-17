@@ -117,18 +117,26 @@ def request_for(comments, value, writer):
     return found[0] if found else None
 
 
-def verified_review(reviews, request, value, expected_id=None):
+def latest_review(reviews, head):
+    """Authoritative submitted attempt for a head, independent of mergeability."""
+    sha(head)
     trusted = [r for r in snapshot(reviews) if identity(r.get('user') or {}, CODEX)]
     # Review IDs are created before submission: an older pending draft can be
     # submitted after a newer READY. Never order terminal attempts by numeric ID.
     if any(r.get('state', '').upper() == 'PENDING' or not SHA.fullmatch(str(r.get('commit_id') or ''))
            for r in trusted):
         raise ValueError('pending or unbound independent review')
-    eligible = [r for r in trusted if r.get('commit_id') == value['head']]
+    eligible = [r for r in trusted if r.get('commit_id') == head]
     ordered = sorted(eligible, key=lambda r: timestamp(r.get('submitted_at')))
     if len(ordered) > 1 and timestamp(ordered[-1]['submitted_at']) == timestamp(ordered[-2]['submitted_at']):
         raise ValueError('ambiguous latest independent review submission')
-    latest = ordered[-1] if ordered else {}
+    if not ordered:
+        raise ValueError('missing independent review for current head')
+    return ordered[-1]
+
+
+def verified_review(reviews, request, value, expected_id=None):
+    latest = latest_review(reviews, value['head'])
     if ((expected_id is not None and (type(expected_id) is not int or latest.get('id') != expected_id))
             or not latest
             or latest.get('state', '').upper() not in {'COMMENTED', 'APPROVED'}

@@ -105,8 +105,9 @@ Current tools. Do not add paid services or raise spend limits.
   on open same-repo PRs by verified repository writers (`.github/workflows/claude.yml`).
 - **Blacksmith CI** — only CI. See [CI](#ci).
 - **Google Workspace** (`csl-laboratories.com`) — meetings and notes.
-- **Discord bot** (`csl-bot-operations`) — Liaison. Commands and MCP; see below. Trigger CI
-  and reviews through these (or the `ci:full` label), not by editing config.
+- **Discord bot** (`csl-bot-operations`) - Liaison. Commands and MCP; see below. Use these
+  for authorized review requests or diagnostic CI. Full candidate CI requires exact-candidate
+  independent READY; the `ci:full` ownership label alone does not trigger it. See [CI](#ci).
   - Commands: `/issue`, `/plan`, `/debug`, `/feature`, `/standup`; `/ci full|run`;
     `/devin review pr:<url>|run|status`; `/telemetry`, `/help`, `/connect`. There is no
     top-level `/review` and no `/ci` without an argument.

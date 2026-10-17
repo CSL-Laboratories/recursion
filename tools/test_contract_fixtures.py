@@ -183,6 +183,11 @@ class ContractFixtureTests(unittest.TestCase):
             ):
                 errors.append(f"{tag} expected receipt invalid: {message}")
             command_id, command_digest = send["command_id"], send["command_digest"]
+            if (
+                expect.get("command_id") != command_id
+                or expect.get("command_digest") != command_digest
+            ):
+                errors.append(f"{tag}: expected receipt does not echo the sent identity")
             entry = journal.get(command_id)
             if entry is None:
                 if expect.get("outcome") not in ("accepted", "refused"):

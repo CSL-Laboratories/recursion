@@ -111,3 +111,8 @@ Recursion refreshes the retained checklist from current unresolved thread IDs
 after partial resolution even when new failure evidence is absent/unavailable.
 This applies to ordinary, approved/green and existing-rollup sweep paths, keeps
 human notes, and neither posts mediation nor admits resolver actions.
+
+Filename backticks are preserved using a longer Markdown code-span delimiter;
+control characters are represented as a JSON string on one line. This avoids
+silently pointing mediation at a different filename while keeping quoted
+structure and writer-trigger sanitization intact.

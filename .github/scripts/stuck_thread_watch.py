@@ -663,6 +663,17 @@ def last_claude(thread: Thread, cfg: Config) -> Comment | None:
     return found[-1] if found else None
 
 
+def code_location(value: str) -> str:
+    """Preserve filename characters while keeping a single safe Markdown line."""
+    if re.search(r"[\x00-\x1f\x7f]", value):
+        value = json.dumps(value, ensure_ascii=False)
+    longest = max((len(run) for run in re.findall(r"`+", value)), default=0)
+    if not longest:
+        return f"`{value}`"
+    delimiter = "`" * (longest + 1)
+    return f"{delimiter} {value} {delimiter}"
+
+
 def mediation_body(
     pull: Pull,
     thread: Thread,
@@ -671,7 +682,7 @@ def mediation_body(
     reason: str,
     linear_url: str = "",
 ) -> str:
-    loc = location(thread.path, thread.line).replace("`", "").replace("\n", " ").replace("\r", " ")
+    loc = location(thread.path, thread.line)
     devin = first_devin(thread, cfg)
     claude = last_claude(thread, cfg)
     finding_body = devin.body if devin else ""
@@ -698,7 +709,7 @@ def mediation_body(
         "minimal fix as text only.\n\n"
         f"PR: {pull.url}\n"
         f"Thread id: `{thread.id}`\n"
-        f"Thread: `{loc}`{(' — ' + thread_url) if thread_url else ''}\n"
+        f"Thread: {code_location(loc)}{(' — ' + thread_url) if thread_url else ''}\n"
         f"{reason_line}\n"
         f"{linear_bit}"
         "End this review with one machine-readable block per thread you were "
@@ -895,9 +906,9 @@ def linear_description(
     for thread, reason in stuck:
         loc = location(thread.path, thread.line)
         url = thread_url(thread, cfg)
-        label = f"`{loc}`"
+        label = code_location(loc)
         if url:
-            label = f"[`{loc}`]({url})"
+            label = f"[{code_location(loc)}]({url})"
         box = "x" if thread.id in checked else " "
         items.append(f"- [{box}] {label} — `{reason}` <!-- thread:{thread.id} -->")
     checklist = "\n".join(items) if items else "- (none)"

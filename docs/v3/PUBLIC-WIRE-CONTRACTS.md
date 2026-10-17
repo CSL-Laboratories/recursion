@@ -105,7 +105,7 @@ WireIdentityRef@1 = {
 - `id` is stable across storage moves and endpoint changes; `version` + `content_digest`
   pin the exact revision.
 - Command idempotency uses the same `PublicId` grammar under the `cmd:` namespace; a
-  canonically identical command replays its prior outcome (`duplicate`); a
+  canonically identical admitted command replays its prior outcome (`duplicate`); a
   conflicting reuse is answered `conflict` — the collision M1B reports as
   `duplicate-command-conflict`, surfaced here outcome-level rather than as a
   refusal reason.
@@ -170,6 +170,10 @@ Rules:
   `command_digest` (returns the prior outcome). Because digests are computed over
   canonical bytes, reordering object keys does not mint a new command — it replays.
   `conflict` = same `command_id`, different `command_digest`. `conflict` is permanent.
+- Only `accepted` commands mint a dedup entry. A `refused` or `conflicted` command
+  leaves no replay record, so an identical retry is evaluated fresh: a permanent
+  refusal deterministically refuses again with the same reason, while a retryable
+  refusal may accept once conditions change.
 - `accepted` carries no refusal block; a `refusal` on any other outcome is malformed.
 
 Closed `ReasonCode` registry (draft — extensions require a vocabulary revision):

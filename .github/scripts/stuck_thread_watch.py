@@ -424,7 +424,9 @@ def _open_markup_before(lines: list[str]) -> bool:
 
     Anything after such an opener renders inside it, so a verdict section that
     follows is an echo, not a ruling. This is deliberately coarse: inline code
-    spans are ignored, and any other unbalanced non-void tag fails closed.
+    spans are ignored, and non-void tags must nest in order. An unclosed open,
+    an unmatched close, or a mis-nested close all fail closed, so a stray
+    ``</pre>`` can never cancel a later ``<pre>``.
     """
     text: list[str] = []
     index = 0
@@ -441,13 +443,18 @@ def _open_markup_before(lines: list[str]) -> bool:
     visible = HTML_COMMENT_RE.sub("", "\n".join(text))
     if "<!--" in visible:
         return True
-    depth: dict[str, int] = {}
+    stack: list[str] = []
     for tag in HTML_TAG_RE.finditer(visible):
         name = tag.group("name").lower()
         if tag.group("self") or name in HTML_VOID_TAGS:
             continue
-        depth[name] = depth.get(name, 0) + (-1 if tag.group("close") else 1)
-    return any(count > 0 for count in depth.values())
+        if not tag.group("close"):
+            stack.append(name)
+        elif not stack or stack[-1] != name:
+            return True
+        else:
+            stack.pop()
+    return bool(stack)
 
 
 def _verdict_section(lines: list[str]) -> list[tuple[str, str, str]] | None:

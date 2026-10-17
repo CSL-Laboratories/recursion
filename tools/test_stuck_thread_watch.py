@@ -1532,6 +1532,23 @@ class VerdictAndResolveTests(unittest.TestCase):
             f"- {mod.verdict_marker('PRRT_1')}\n  CODEX-THREAD: RESOLVE\n  HEAD: {HEAD}\n"
         )
 
+    def test_unmatched_close_then_open_is_barrier(self) -> None:
+        block = verdict_block("PRRT_1")
+        for prose in ("Note </pre><pre>\n", "Echo </details><details>\n", "Line </div><div>\n"):
+            with self.subTest(prose=prose):
+                self._assert_no_resolve(prose + "\n" + block)
+
+    def test_lone_unmatched_close_is_barrier(self) -> None:
+        self._assert_no_resolve("Thread text </pre>\n\n" + verdict_block("PRRT_1"))
+
+    def test_misnested_close_is_barrier(self) -> None:
+        self._assert_no_resolve("<details><pre></details>\n\n" + verdict_block("PRRT_1"))
+
+    def test_balanced_nesting_still_resolves(self) -> None:
+        self._assert_resolves(
+            "<details><summary>x</summary><pre>q</pre></details>\n\n" + verdict_block("PRRT_1")
+        )
+
     def test_escaped_fence_copy_does_not_resolve(self) -> None:
         self._assert_no_resolve("\\```\n" + verdict_block("PRRT_1") + "\\```\n")
 

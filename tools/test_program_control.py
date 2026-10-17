@@ -1626,6 +1626,23 @@ class ProgramControlTests(unittest.TestCase):
         self.assertTrue(checker.PINNED_EOL_KNOWN_GAPS)
         self.assertTrue(checker.PINNED_EOL_KNOWN_GAPS <= paths)
 
+    def test_known_gap_removed_file_is_reported_stale(self):
+        # A repo-shaped synthetic root: the gap file's directory exists but
+        # the file (and its pin) is gone — the gap entry must drain, not linger.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "docs/v3/research-lane/overnight-20261002/semantic-guard-research"
+             ).mkdir(parents=True)
+            errors = checker.pinned_eol_errors({"contracts": []}, root)
+            self.assertEqual(len(errors), 2, errors)
+            self.assertTrue(any("SEMANTIC-GUARD-COVERAGE.md" in error for error in errors), errors)
+            self.assertTrue(any("coverage-matrix.json" in error for error in errors), errors)
+            self.assertTrue(all("PINNED_EOL_KNOWN_GAPS" in error for error in errors), errors)
+        # A bare synthetic root (no packet dirs) emits no stale-gap errors.
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(
+                checker.pinned_eol_errors({"contracts": []}, Path(directory)), [])
+
 
 if __name__ == "__main__":
     unittest.main()

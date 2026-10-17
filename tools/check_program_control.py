@@ -375,8 +375,8 @@ def pinned_eol_errors(data: dict[str, Any], root: Path) -> list[str]:
             errors.append(f"{path} sha256-pinned path lacks eol=lf "
                           f"(git check-attr eol: {attrs.get('eol')})")
     for path in sorted(PINNED_EOL_KNOWN_GAPS - set(paths)):
-        if (root / path).exists():
-            errors.append(f"{path} known eol gap is no longer pinned: "
+        if (root / path).parent.is_dir():
+            errors.append(f"{path} known eol gap is stale (unpinned or removed): "
                           "remove it from PINNED_EOL_KNOWN_GAPS")
     return errors
 

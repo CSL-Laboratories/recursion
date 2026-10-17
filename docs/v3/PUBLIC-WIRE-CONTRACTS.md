@@ -171,9 +171,12 @@ Rules:
   canonical bytes, reordering object keys does not mint a new command — it replays.
   `conflict` = same `command_id`, different `command_digest`. `conflict` is permanent.
 - Only `accepted` commands mint a dedup entry. A `refused` or `conflicted` command
-  leaves no replay record, so an identical retry is evaluated fresh: a permanent
-  refusal deterministically refuses again with the same reason, while a retryable
-  refusal may accept once conditions change.
+  leaves no replay record, so an identical retry is evaluated against current
+  admission state. `refusal_class` is caller guidance, not a receipt guarantee:
+  `retryable` refusals are expected to clear with time alone (resync, pause
+  lifted, budget refilled); `permanent` refusals must not be auto-retried
+  expecting success — a changed verdict requires changed state (e.g. an
+  `unknown-record` target appearing before the retry).
 - `accepted` carries no refusal block; a `refusal` on any other outcome is malformed.
 
 Closed `ReasonCode` registry (draft — extensions require a vocabulary revision):

@@ -62,6 +62,13 @@ HTML_CDATA_CLOSE = "]]>"
 HTML_VOID_TAGS = frozenset(
     "area base br col embed hr img input link meta param source track wbr".split()
 )
+# CommonMark 4.6 type 1: line-start <pre/<script/<style/<textarea, until any
+# of those end tags. Attribute punctuation does not cancel the opener.
+HTML_TYPE1_START_RE = re.compile(
+    r"^ {0,3}<(pre|script|style|textarea)(?=[ \t>]|$)",
+    re.IGNORECASE,
+)
+HTML_TYPE1_NAMES = frozenset(("pre", "script", "style", "textarea"))
 # The Code Review Rules gate line, as scripts/ci/codex_gate.py parses it. The
 # verdict section may end with one; it never authorizes anything here.
 GATE_LINE_RE = re.compile(r" {0,3}CODEX-GATE:\s*(FIX|READY|MEDIATE)\s*")
@@ -450,10 +457,55 @@ def _open_markup_before(lines: list[str]) -> bool:
             continue
         text.append(lines[index])
         index += 1
+    # Type-1 HTML blocks beat inline code spans (CommonMark block > inline).
+    # Backticks inside `<pre title=`x`>` must not erase the opener.
+    if _unclosed_html_type1(text):
+        return True
     # CommonMark 6.1 code spans may cross a line ending; strip only
     # equal-length backtick strings so a literal `<pre>` inside a real
     # span is not HTML, and an unmatched opener cannot erase a live tag.
     return _html_constructs_open(_strip_inline_code_spans("\n".join(text)))
+
+
+def _unclosed_html_type1(lines: list[str]) -> bool:
+    """True if a type-1 HTML block has no tag-parsed closer before prose ends.
+
+    A ``</pre>`` inside a quoted attribute is not a closer; ``_html_tag_at``
+    has to see a real closing tag.
+    """
+    index = 0
+    while index < len(lines):
+        if not HTML_TYPE1_START_RE.match(lines[index]):
+            index += 1
+            continue
+        rest = "\n".join(lines[index:])
+        end = _html_type1_end(rest)
+        if end is None:
+            return True
+        eaten = rest[:end].count("\n")
+        index += eaten + 1
+    return False
+
+
+def _html_type1_end(text: str) -> int | None:
+    """Offset after a type-1 end tag, or None if the block never closes."""
+    index = 0
+    length = len(text)
+    while index < length:
+        lt = text.find("<", index)
+        if lt < 0:
+            return None
+        tag = _html_tag_at(text, lt)
+        if tag == "unclosed":
+            return None
+        if tag:
+            end, name, close, _empty = tag
+            if close and name in HTML_TYPE1_NAMES:
+                return end
+            index = end
+            continue
+        index = lt + 1
+    return None
 
 
 def _strip_inline_code_spans(text: str) -> str:

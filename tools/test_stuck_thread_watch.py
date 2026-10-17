@@ -1594,6 +1594,13 @@ class VerdictAndResolveTests(unittest.TestCase):
         self._assert_no_resolve("`\n<pre>\n``\n" + block)
         self._assert_no_resolve("`foo\n<pre>\n``\n" + block)
 
+    def test_backticks_inside_type1_opener_do_not_authorize(self) -> None:
+        # CommonMark 4.6 type 1 starts at line-start `<pre` + space, even when
+        # backticks in the tag would confuse inline-code stripping.
+        block = verdict_block("PRRT_1")
+        self._assert_no_resolve("<pre title=`x`>\n" + block)
+        self._assert_no_resolve("<PRE class=`echo`>\n" + block)
+
     def test_escaped_fence_copy_does_not_resolve(self) -> None:
         self._assert_no_resolve("\\```\n" + verdict_block("PRRT_1") + "\\```\n")
 

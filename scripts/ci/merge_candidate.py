@@ -177,6 +177,12 @@ def admission(comments, value, run, attempt, review):
     if not prior:
         return 'reserve'
     if prior[0]['run'] == str(run):
+        # The Actions identity is shared by every GITHUB_TOKEN writer, so a
+        # claim is not gate-exclusive evidence. Resume only a reservation naming
+        # this run and authoritative review; a same-run claim bound to a
+        # different review is inconsistent and stops rather than admits.
+        if prior[0]['review'] != review:
+            raise ValueError('reservation bound to a different independent review')
         return 'resume'
     return 'duplicate'
 

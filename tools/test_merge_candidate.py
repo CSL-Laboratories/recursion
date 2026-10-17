@@ -181,6 +181,16 @@ class ReservationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             p.admission([changed], VALUE, '50', 1, 10)
 
+    def test_same_run_claim_for_another_review_stops_instead_of_resuming(self):
+        # github-actions[bot] is shared by every GITHUB_TOKEN writer (fixer,
+        # conflict scan, watcher), so an Actions claim proves identity class,
+        # not gate origin. A same-run claim bound to a different review never
+        # resumes; a foreign-run claim still only suppresses (duplicate).
+        self.assertEqual(p.admission([claim(review_id=10)], VALUE, '50', 1, 10), 'resume')
+        with self.assertRaises(ValueError):
+            p.admission([claim(review_id=11)], VALUE, '50', 1, 10)
+        self.assertEqual(p.admission([claim(review_id=11)], VALUE, '51', 1, 10), 'duplicate')
+
     def test_all_full_platform_outcomes_no_docs_or_subset_success(self):
         for values in itertools.product(['success','failure','cancelled','pending','skipped',''], repeat=3):
             results = dict(zip(('linux','windows','macos'), values))
@@ -514,6 +524,60 @@ class SnapshotTests(unittest.TestCase):
             self.assertEqual(router.admit(client, event, 'pat', '51', 1)['duplicate'], 'true')
             verdict.assert_not_called()
             client.post.assert_called_once()
+
+    def test_foreign_actions_claim_suppresses_without_admission_or_mutation(self):
+        # Any issues/pull-requests write GITHUB_TOKEN can author an Actions
+        # claim for the current candidate. That forgery can only suppress a
+        # matrix on the ignored lane; it never admits, labels, posts or reaches
+        # the readiness writer. Requests stay bound to the PAT writer identity.
+        client = self.client()
+        client.comments.return_value = [request(), claim(run='999', review_id=10)]
+        event = {'review': review(), 'pull_request': {'number': 7}}
+        with mock.patch.dict(os.environ, {'GITHUB_SHA': VALUE['merge']}), \
+                mock.patch.object(router.gate, 'fixer_helpers') as helpers, \
+                mock.patch.object(router.gate, 'run_verdict') as verdict:
+            result = router.admit(client, event, 'pat', '50', 1)
+            self.assertEqual(result['admitted'], 'false')
+            self.assertEqual(result['duplicate'], 'true')
+            self.assertFalse(self.readiness_scheduled(result))
+            verdict.assert_not_called()
+            helpers.assert_not_called()
+            client.post.assert_not_called()
+        # A forged request under the Actions identity is not a request at all.
+        forged_request = {**request(), 'user': p.ACTIONS}
+        self.assertIsNone(p.request_for([forged_request], VALUE, WRITER))
+
+    def test_final_audit_rejects_same_run_claim_bound_to_other_review(self):
+        client = mock.Mock(repo=REPO, token='token')
+        client.candidate.return_value = VALUE
+        client.comments.return_value = [request(), claim(run='50', review_id=11)]
+        client.reviews.return_value = [review()]
+        helper = mock.Mock()
+        helper.label_event_id.return_value = 3
+        helper.readiness_blocked.return_value = False
+        with mock.patch.dict(os.environ, {'GITHUB_SHA': VALUE['merge']}), \
+                mock.patch.object(router.gate, 'fixer_helpers', return_value=helper), \
+                self.assertRaises(ValueError):
+            router.finish(client, VALUE, 10, WRITER, '50', 1, 'success')
+        client.post.assert_not_called()
+
+    def test_gate_workflow_groups_are_pr_scoped_and_trusted_checkouts_are_default_branch(self):
+        # No repository-wide concurrency group is held while a job waits in the
+        # per-PR writer queue, so other PRs and scheduled scans are not
+        # displaced. The matrix is the same-commit local reusable workflow;
+        # scripts come from the default branch, but the workflow definition
+        # itself is PR-controlled on PR events (recorded activation hold).
+        text = (ROOT / '.github/workflows/codex-gate.yml').read_text()
+        groups = re.findall(r'^\s*group: (.+)$', text, flags=re.M)
+        self.assertEqual(len(groups), 3)
+        for group in groups:
+            self.assertIn('github.event.pull_request.number || inputs.pr_number', group)
+        self.assertEqual(text.count('queue: max'), 2)
+        self.assertEqual(text.count('cancel-in-progress: false'), 2)
+        self.assertEqual(len(re.findall(r'^\s*ref: \$\{\{ github\.event\.repository\.default_branch \}\}$',
+                                        text, flags=re.M)), text.count('actions/checkout@'))
+        self.assertIn('uses: ./.github/workflows/ci.yml', text)
+        self.assertNotIn('secrets: inherit', text)
 
     def test_uncertain_reservation_stops_without_retry_or_matrix_output(self):
         client = self.client()

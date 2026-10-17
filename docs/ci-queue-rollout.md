@@ -172,3 +172,35 @@ A workflow_dispatch full-platform diagnostic does not exercise the candidate-onl
 pinned-checkout and one-attempt guards because its candidate input is empty.
 Passing product tests on all OSes is separate evidence from genuine review-event
 admission/reusable-workflow qualification; the latter remains an activation hold.
+
+## Cross-repository design notes (Cockpit168 findings, assessed 2026-10-17)
+
+- **Queue starvation (Cockpit 4300898366): absent.** The gate holds no
+  repository-wide concurrency group. Its workflow group is per PR and per review
+  event; the `request` and `verdict` jobs wait only in the per-PR `claude-<pr>`
+  writer queue. A long fixer run delays that one PR's request/verdict;
+  `queue: max` bounds the backlog, not the wait time. This nested queue does not
+  hold a repository-wide gate lock or displace other PRs or scheduled scans.
+- **Self-qualifying candidate (Cockpit 4300898369): applicable, held.** The
+  default-branch sparse checkout protects only the script bytes. On `pull_request`
+  and `pull_request_review` events the gate workflow and the same-commit local
+  `ci.yml` definitions come from the PR merge ref, so a same-repository writer PR
+  controls the job conditions, checkout verification, matrix inputs, the final
+  audit step and the `candidate-readiness` check name. It can request write
+  `GITHUB_TOKEN` scopes and reference available secrets, subject to repository
+  and environment controls. Ordinary fork PR restrictions do not protect this
+  same-repository case. `candidate-readiness` therefore remains staged diagnostics, never a
+  protected replacement authority; a trusted default-branch verifier would be a new
+  contract and needs an owner decision.
+- **Shared Actions identity (Cockpit 4300898370): partially applicable.**
+  Request markers are bound to the PAT writer identity and the three-per-head
+  daily budget counts only that writer, so `GITHUB_TOKEN` writers cannot forge
+  or exhaust requests. Claim markers are authenticated only as `github-actions[bot]`,
+  which every `issues`/`pull-requests` write workflow shares. A forged claim for the
+  current candidate with a foreign run ID can suppress admission (ignored lane,
+  no mutation), while duplicate claims fail closed. A same-run claim bound to
+  another review now stops. Matching public run/review fields still do not prove
+  gate origin; this fix does not authenticate claims or replace the independent
+  review, label and final-audit checks. Gate-exclusive proof needs an owner
+  decision. A new HMAC secret or dedicated app is outside this authorization;
+  Actions run attestation alone also cannot make PR-controlled YAML trusted.

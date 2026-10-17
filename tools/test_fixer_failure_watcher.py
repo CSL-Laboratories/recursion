@@ -345,7 +345,7 @@ class WatcherTests(unittest.TestCase):
                                             approved_head_oids=(f.HEAD,), checks_state="SUCCESS", required_checks_green=True)
                     self.github.pulls[self.pull.number] = self.pull
                     if route == "sweep":
-                        self.github.list_open_pr_numbers = lambda: []
+                        self.github.list_open_pr_numbers = list
                         linear.rollups = [linear.find_by_marker(marker, title=m.linear_title(self.pull))]
                     def collector(*_, unavailable=unavailable):
                         if unavailable:

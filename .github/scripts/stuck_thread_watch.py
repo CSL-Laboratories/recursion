@@ -473,9 +473,50 @@ def _open_markup_before(lines: list[str]) -> bool:
             continue
         text.append(lines[index])
         index += 1
-    if _unclosed_html_type1(text):
+    if _unclosed_html_type1(text) or _unclosed_html_type6(text):
         return True
     return _html_constructs_open(_strip_inline_code_spans("\n".join(text)))
+
+
+def _unclosed_html_type6(lines: list[str]) -> bool:
+    """Additional barrier for type-6 blocks using original prose blank lines.
+
+    Inline-code removal can manufacture a blank line, including at EOF.
+    Check before stripping spans: backticks inside raw HTML are content.
+    Keep the existing tag-stack and raw-construct barriers independently;
+    finding a real blank here does not itself authorize a verdict.
+    """
+    text = "\n".join(lines)
+    index = 0
+    while index < len(text):
+        lt = text.find("<", index)
+        if lt < 0:
+            break
+        # Only raw block openers own later lines here. In particular, a
+        # mid-line code literal `<!--` must not hide a later type-6 block.
+        skipped = _skip_raw_html_construct(text, lt) if _html_line_indent_ok(text, lt) else None
+        if skipped == "unclosed":
+            return False  # Existing raw-construct scan owns this barrier.
+        if skipped is not None:
+            index = skipped
+            continue
+        if _type1_start_at(text, lt):
+            end = _html_type1_end(text[lt:])
+            if end is None:
+                return False  # Existing type-1 scan owns this barrier.
+            index = lt + end
+            continue
+        tag = _html_tag_at(text, lt)
+        if isinstance(tag, tuple):
+            end, name, _close, _empty = tag
+            if name in HTML_TYPE6_NAMES and _html_line_indent_ok(text, lt):
+                start_line = text.count("\n", 0, lt)
+                if not any(not line.strip(" \t") for line in lines[start_line + 1:]):
+                    return True
+            index = end
+            continue
+        index = lt + 1
+    return False
 
 
 def _unclosed_html_type1(lines: list[str]) -> bool:

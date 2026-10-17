@@ -126,8 +126,17 @@ structure and writer-trigger sanitization intact.
 Retention reads complete rows only in the generated `Stuck threads` section,
 excluding backtick/tilde fenced examples and author/human notes. Horizontal
 whitespace after a terminal thread marker does not discard a real handoff.
+Section selection requires the generated checklist/decision heading pair and
+keeps fence state local to that section. Duplicate headings and unclosed fences
+in preceding notes cannot replace or hide the real checklist. Complete sections
+copied inside a checklist fence remain examples. Backtick fence information
+strings containing backticks are not treated as fence openers. Only LF/CRLF
+separate generated rows; Unicode filename separators remain part of the filename.
 CRLF input preserves checked state, author context and the human decision when
 the renderer rewrites the checklist with LF line endings.
+An unclosed fence inside the checklist, or a checklist heading whose section
+boundaries are hidden (including a fence spanning notes and decision), leaves
+the existing roll-up unchanged until repaired; it cannot prove resolution.
 Author-filed roll-ups may preserve pasted review examples as notes; those notes
 are not authenticated failure evidence. This bounded format parser is not general
 Markdown isolation or authentication of arbitrary manual edits to the checklist.

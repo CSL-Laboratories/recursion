@@ -788,6 +788,17 @@ NOTES_RE = re.compile(
     r"## Author notes\n\n(.*?)(?=\n## Stuck threads|\Z)",
     re.DOTALL,
 )
+CHECKLIST_HEADING = "## Stuck threads"
+DECISION_HEADING = "## Human decision"
+TRAILER_PREFIX = "\n*Auto-updated"
+# A backtick opener may not carry backticks in its info string (CommonMark), so a
+# one-line ```pytest -k foo``` example is ordinary text. Tilde openers may.
+FENCE_OPEN_RE = re.compile(r" {0,3}(?:(`{3,})[^`]*|(~{3,}).*)")
+ATX_HEADING_RE = re.compile(r"#{1,6} ")
+HANDOFF_ROW_RE = re.compile(
+    r"- \[[ xX]\] [^\r\n]+ — `stuck-fixer-(?:failed|handoff-open)` "
+    r"<!-- thread:([^\s>]+) -->[ \t]*"
+)
 TERMINAL_STATES = frozenset({"canceled", "completed"})
 
 
@@ -818,7 +829,16 @@ def parse_checked_thread_ids(description: str) -> set[str]:
 
 
 def existing_human_decision(description: str) -> str:
-    match = HUMAN_DECISION_RE.search((description or "").replace("\r\n", "\n"))
+    text = (description or "").replace("\r\n", "\n")
+    section = checklist_section(text)
+    if section:
+        lines, _, end = section
+        decision = "\n".join(lines[end + 1:])
+        # The renderer writes the trailer last. A copied trailer inside a quoted
+        # example stays part of the decision text instead of truncating it.
+        before, found, _ = decision.rpartition(TRAILER_PREFIX)
+        return (before if found else decision).strip()
+    match = HUMAN_DECISION_RE.search(text)
     if not match:
         return ""
     return match.group(1).strip()
@@ -827,7 +847,14 @@ def existing_human_decision(description: str) -> str:
 def existing_author_notes(description: str, marker: str) -> str:
     """Free-form text to carry forward when rebuilding a roll-up description."""
     text = (description or "").replace("\r\n", "\n")
-    if "## Stuck threads" in text:  # watcher-built: only the notes section carries
+    section = checklist_section(text)
+    if section:
+        lines, start, _ = section
+        for index in range(start):
+            if _generated_heading(lines[index], NOTES_HEADING):
+                return "\n".join(lines[index + 1:start]).strip()
+        return ""
+    if CHECKLIST_HEADING in text:  # watcher-built: only the notes section carries
         match = NOTES_RE.search(text)
         return match.group(1).strip() if match else ""
     return text.replace(marker, "").strip()
@@ -1673,36 +1700,167 @@ class Counters:
     labeled: int = 0
 
 
+def _generated_heading(line: str, heading: str) -> bool:
+    return line.rstrip(" \t") == heading
+
+
+def _fence_opener(line: str) -> str:
+    match = FENCE_OPEN_RE.fullmatch(line)
+    return (match.group(1) or match.group(2)) if match else ""
+
+
+def _fence_closer_index(lines: list[str], opener_index: int, fence: str) -> int | None:
+    closer = re.compile(r" {0,3}" + re.escape(fence[0]) + "{" + str(len(fence)) + r",}[ \t]*")
+    for index in range(opener_index + 1, len(lines)):
+        if closer.fullmatch(lines[index]):
+            return index
+    return None
+
+
+def _visible_lines(
+    lines: list[str], start: int, stop: int, *, unclosed_hides: bool = False
+) -> Iterable[tuple[int, str]]:
+    """Yield lines in [start, stop) that are not inside a fenced code block.
+
+    A closed fence hides its content. An opener without a closer is ordinary
+    text unless ``unclosed_hides``; then it hides everything after it, as it
+    would render.
+    """
+    index = start
+    while index < stop:
+        line = lines[index]
+        fence = _fence_opener(line)
+        if fence:
+            closer = _fence_closer_index(lines, index, fence)
+            if closer is not None:
+                index = closer + 1
+                continue
+            if unclosed_hides:
+                return
+        yield index, line
+        index += 1
+
+
+def _checklist_end(lines: list[str], start: int) -> int | None:
+    """Index of the decision heading that completes the checklist opened at ``start``."""
+    for index, line in _visible_lines(lines, start + 1, len(lines)):
+        if ATX_HEADING_RE.match(line):
+            return index if _generated_heading(line, DECISION_HEADING) else None
+    return None
+
+
+def _next_candidate_after_decision(lines: list[str], start: int) -> int:
+    """First checklist heading in a decision slot that is not inside a fence.
+
+    Only the trailer follows the decision slot, so an unclosed fence there hides
+    everything after it; a quoted example cannot become a candidate either way.
+    """
+    for index, line in _visible_lines(lines, start, len(lines), unclosed_hides=True):
+        if _generated_heading(line, CHECKLIST_HEADING):
+            return index
+    return len(lines)
+
+
+def checklist_section(description: str) -> tuple[list[str], int, int] | None:
+    """Find the generated checklist and the decision heading that closes it.
+
+    The renderer emits: preamble, optional ``## Author notes`` + notes,
+    ``## Stuck threads`` + rows, ``## Human decision`` + decision, trailer.
+    Notes and decision are opaque human text and may copy the generated
+    headings, so this walks the description once:
+
+    * A closed fence in the preamble or notes hides its content, so a complete
+      pair pasted inside it is an example, not a candidate.
+    * A candidate is complete when the first heading after it, outside closed
+      fences, is the decision heading. Unclosed openers in notes or under the
+      checklist are ordinary text and cannot hide the generated headings.
+    * After a complete pair, its decision slot is scanned with its own fence
+      state. Copied pairs inside a fence there (closed or not) are examples.
+    * Without a rendered notes heading nothing precedes the generated pair, so
+      the first complete pair is it. With notes, a pasted pair can precede the
+      generated one, so the last complete top-level pair is taken.
+
+    This recognizes the generated format, not arbitrary manual structure: two
+    unfenced complete pairs on a roll-up with author notes are indistinguishable.
+    """
+    lines = (description or "").replace("\r\n", "\n").split("\n")
+    selected = None
+    notes_slot = False
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        fence = _fence_opener(line)
+        if fence:
+            closer = _fence_closer_index(lines, index, fence)
+            if closer is not None:
+                index = closer + 1
+                continue
+        if selected is None and _generated_heading(line, NOTES_HEADING):
+            notes_slot = True
+        if not _generated_heading(line, CHECKLIST_HEADING):
+            index += 1
+            continue
+        end = _checklist_end(lines, index)
+        if end is None:
+            index = index + 1 if selected is None else _next_candidate_after_decision(lines, index + 1)
+            continue
+        if selected is not None and not notes_slot:
+            break
+        selected = (lines, index, end)
+        index = _next_candidate_after_decision(lines, end + 1)
+    return selected
+
+
+class AmbiguousChecklist(RuntimeError):
+    """Manual Markdown makes generated rows indistinguishable from copied ones.
+
+    Raised instead of guessing. Every roll-up consumer in ``scan`` already
+    treats a Linear exception as "leave this roll-up untouched", so the issue
+    is neither rewritten nor canceled until a human repairs the checklist.
+    """
+
+
 def failure_handoff_ids(issue: LinearIssue | None) -> set[str]:
     if not is_active_issue(issue):
         return set()
-    # Filenames can contain marker-shaped text inside the rendered code span.
-    # Notes and fenced examples are not checklist evidence. This is a bounded
-    # parser for the generated section, not authentication of manual Linear edits.
-    ids = set()
-    in_checklist = False
-    fence = ""
-    for line in issue.description.splitlines():
-        if fence:
-            if re.fullmatch(r" {0,3}" + re.escape(fence[0]) + "{" + str(len(fence)) + r",}[ \t]*", line):
-                fence = ""
-            continue
-        opening = re.match(r" {0,3}(`{3,}|~{3,})", line)
-        if opening:
-            fence = opening.group(1)
-            continue
-        if line == "## Stuck threads" and not in_checklist:
-            in_checklist = True
-            continue
-        if in_checklist and re.match(r"#{1,6} ", line):
-            break
-        if in_checklist:
-            match = re.fullmatch(
-                r"- \[[ xX]\] [^\r\n]+ \u2014 `stuck-fixer-(?:failed|handoff-open)` "
-                r"<!-- thread:([^\s>]+) -->[ \t]*", line,
+    section = checklist_section(issue.description)
+    if section is None:
+        # A fence spanning notes and decision can hide the entire generated
+        # section. Missing boundaries do not prove its handoffs were resolved.
+        if any(_generated_heading(line, CHECKLIST_HEADING)
+               for line in (issue.description or "").replace("\r\n", "\n").split("\n")):
+            raise AmbiguousChecklist(
+                f"{issue.identifier or issue.url}: {CHECKLIST_HEADING!r} has no "
+                "unambiguous section boundary; the roll-up is left unchanged "
+                "until the checklist is repaired"
             )
-            if match:
-                ids.add(match.group(1))
+        return set()
+    lines, start, end = section
+    # Only complete rows in the generated section count; filename marker-shaped
+    # text and copied examples are not independently retained handoffs.
+    ids = set()
+    index = start + 1
+    while index < end:
+        line = lines[index]
+        fence = _fence_opener(line)
+        if fence:
+            closer = _fence_closer_index(lines, index, fence)
+            if closer is None:
+                # The renderer never emits a fence here. An unclosed opener
+                # would swallow every later row as it renders, so rows after it
+                # could be a pasted example or the genuine checklist. Do not
+                # retain the copy and do not drop the genuine row: fail closed.
+                raise AmbiguousChecklist(
+                    f"{issue.identifier or issue.url}: unclosed code fence inside "
+                    f"{CHECKLIST_HEADING!r}; retained handoffs are ambiguous, so "
+                    "the roll-up is left unchanged until the checklist is repaired"
+                )
+            index = closer + 1
+            continue
+        match = HANDOFF_ROW_RE.fullmatch(line)
+        if match:
+            ids.add(match.group(1))
+        index += 1
     return ids
 
 

@@ -12,7 +12,7 @@ from ci_runner_cost import estimate
 
 
 def job(**changes):
-    value = {"repository": "CSL-Laboratories/ai-investment-cockpit", "run_id": 100,
+    value = {"repository": "CSL-Laboratories/recursion", "run_id": 100,
                  "run_attempt": 1, "job_id": 1, "event": "pull_request", "workflow": "ci.yml",
                  "name": "linux (3.12)", "head_sha": "a" * 40,
                  "labels": ["blacksmith-2vcpu-ubuntu-2404"],
@@ -63,7 +63,7 @@ class RunnerCostTests(unittest.TestCase):
         for labels in ([], ["self-hosted", "macos-latest"], ["ubuntu-8core"]):
             self.assertEqual(estimate([job(labels=labels)])["unknown_jobs"], 1)
 
-    def test_windows_and_other_repo(self):
+    def test_windows_rate(self):
         result = estimate([job(repository="CSL-Laboratories/recursion",
                                labels=["blacksmith-2vcpu-windows-2025"])])
         self.assertEqual(result["supplied_jobs_total_usd"], "0.016")

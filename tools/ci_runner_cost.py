@@ -17,7 +17,6 @@ RATES = {
 }
 PUBLIC_CORE = {"ubuntu-latest", "macos-latest"}
 REPOSITORIES = {
-    "CSL-Laboratories/ai-investment-cockpit",
     "CSL-Laboratories/recursion",
 }
 

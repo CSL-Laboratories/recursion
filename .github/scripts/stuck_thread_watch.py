@@ -1688,6 +1688,8 @@ def upsert_linear_rollup(
     cfg: Config,
     linear: LinearClient,
     counters: Counters,
+    *,
+    delivery_check=None,
 ) -> str:
     marker = rollup_marker(pull)
     title = linear_title(pull)
@@ -1696,6 +1698,8 @@ def upsert_linear_rollup(
     included = {thread.id for thread, _ in stuck}
     stuck = [*stuck, *(item for item in open_failure_handoffs(pull, existing) if item[0].id not in included)]
     description = linear_description(pull, stuck, cfg, previous=previous)
+    if delivery_check is not None:
+        delivery_check()
     if existing and existing.id:
         if not is_active_issue(existing):
             created = linear.create_triage_issue(title=title, description=description)
@@ -1935,8 +1939,11 @@ def scan(
                     if not cfg.linear_api_key:
                         notice("LINEAR_API_KEY missing; skipping Linear roll-up")
                     else:
+                        def delivery_check(rollup=rollup, failure_evidence=failure_evidence):
+                            if any(thread.failure_evidence for thread, _ in rollup) and not failure_evidence.fresh():
+                                raise RuntimeError("failure evidence changed before Linear delivery")
                         linear_url = upsert_linear_rollup(
-                            pull, rollup, cfg, linear, counters
+                            pull, rollup, cfg, linear, counters, delivery_check=delivery_check
                         )
                 else:
                     existing = linear.find_by_marker(

@@ -1572,6 +1572,20 @@ class VerdictAndResolveTests(unittest.TestCase):
         self._assert_resolves('Thread text:\n<?xml version="1.0"?>\n\n' + block)
         self._assert_resolves("Thread text:\n<!DOCTYPE html>\n\n" + block)
 
+    def test_quoted_attribute_closer_does_not_authorize_copied_verdict(self) -> None:
+        # Quoted `>` / `</pre>` is still inside the opener (CommonMark 6.6).
+        block = verdict_block("PRRT_1")
+        self._assert_no_resolve('<pre title="x></pre>y">\n' + block)
+        self._assert_no_resolve("<pre title='x></pre>y'>\n" + block)
+        self._assert_no_resolve('<pre title="x></pre>y">\n' + block + "</pre>\n")
+        self._assert_no_resolve('<pre title="unterminated>\n' + block)
+        self._assert_resolves('<pre title="x>y"></pre>\n\n' + block)
+
+    def test_multiline_inline_code_pre_literal_still_resolves(self) -> None:
+        # CommonMark 6.1 converts line endings in a code span to spaces, so
+        # this is a literal `<pre>`, not an HTML opener.
+        self._assert_resolves("The literal is `<pre>\n` in the sample.\n" + verdict_block("PRRT_1"))
+
     def test_escaped_fence_copy_does_not_resolve(self) -> None:
         self._assert_no_resolve("\\```\n" + verdict_block("PRRT_1") + "\\```\n")
 

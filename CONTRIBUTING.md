@@ -89,9 +89,13 @@ See [AGENTS.md#when-claude-cant-fix-a-review-thread](AGENTS.md#when-claude-cant-
   Until rulesets enforce it, no founder merges their own PR without another founder's
   approval.
 - Keep changes inside your declared allowed paths. `CONTROL_PLANE.md`, `ANCHOR.md`,
-  `state/DECISIONS.md`, `scripts/`, `schemas/` and `.env` are protected paths — a change
+  `state/DECISIONS.md`, `schemas/` and `.env` are protected paths — a change
   there needs a separately recorded founder-approved authoring session under
-  `CONTROL_PLANE.md`, not a product PR.
+  `CONTROL_PLANE.md`, not a product PR. Option B, recorded in `CONTROL_PLANE.md`
+  and D-042: `scripts/ci/`, the test config and fixtures stay protected. New tests
+  can be added freely, within the existing admitted scope. Changing an existing
+  assertion needs a named human reviewer. Implementation and activation stay
+  separate.
 
 ## Review loop
 

@@ -111,7 +111,13 @@ than the implementer.
 `CONTROL_PLANE.md`, `ANCHOR.md`, `state/DECISIONS.md`, `.env`, and any credential or
 authentication configuration. A task that touches them without the matching authoring-session
 approval fails its gate. Authoring approval does not itself authorize credential use or change
-Lucas's reserved authority over sensitive company credentials.
+Lucas's reserved authority over sensitive company credentials. Option B (D-042), Chaandan
+Saini's 2026-10-15 CSL-117 ruling (comment `e59021c7-3a77-445f-a04c-832cf1e5fe46`), recorded
+under the 2026-10-17 authoring approval (comment `58641114-aa3c-4f8f-8630-a089b19f8ea3`):
+`scripts/ci/`, the test config and fixtures stay protected. New tests can be added freely,
+within the existing admitted scope. Changing an existing assertion needs a named human
+reviewer. Implementation and activation stay separate. This records that ruling and does not
+decide other paths.
 
 ## Changing this document
 

@@ -610,3 +610,52 @@ in a week, or a spend, credential or deployment boundary is crossed without auth
 Record the event and seek a founder decision; no automatic policy expansion follows.
 
 **Review:** at the recorded revisit trigger or the next monthly decision-log review.
+
+---
+
+## D-042 - Record Option B for scripts/ci, test config and fixtures
+Date: 2026-10-15 - Status: ACCEPTED ruling; documentation record pending review and merge
+
+**Source record:** Chaandan Saini chose Option B on
+[CSL-117](https://linear.app/csl-laboratories/issue/CSL-117/recursion-reconcile-scripts-protection-between-contributingmd-and#comment-e59021c7)
+(comment `e59021c7-3a77-445f-a04c-832cf1e5fe46`, 2026-10-15): "`scripts/ci/` and the test
+config are protected. New tests can be added freely. Changing an existing assertion needs a
+named human to review it." He adopted the brief's Option B, which includes test config and
+fixtures. This entry records that ruling. It does not choose a new policy, and it is not a
+personally typed founder statement in this file.
+
+**Authoring-session approval:** Lucas approved this bounded documentation review. Codex
+relayed that approval on
+[CSL-117](https://linear.app/csl-laboratories/issue/CSL-117/recursion-reconcile-scripts-protection-between-contributingmd-and#comment-58641114)
+(comment `58641114-aa3c-4f8f-8630-a089b19f8ea3`, 2026-10-17). The relay is an attributed
+record of Lucas's direct approval, not a claim that Lucas personally authored the comment
+and not an agent-made policy decision. The approved recording text keeps `scripts/ci/`, the
+test config and fixtures protected, permits new tests within the existing admitted scope,
+requires a named human reviewer for changes to existing assertions, and keeps implementation
+and activation separate.
+
+**Options considered:** The 2026-10-15 CSL-117 brief set out A (`scripts/tests/`
+unprotected), B (tiered protection), C (all of `scripts/` protected) and D (leave the
+contradiction). Chaandan selected B. This entry does not reopen that choice.
+
+**Chose:** B. `scripts/ci/`, the test config and fixtures stay protected. New tests can be
+added freely, within the existing admitted scope. Changing an existing assertion needs a
+named human reviewer. Implementation and activation stay separate.
+
+**Because:** `CONTRIBUTING.md` listed `scripts/` wholesale as protected, and
+`CONTROL_PLANE.md` did not. The ruling removes that contradiction for this surface. The
+brief Chaandan adopted treats the CI harness, test config and fixtures as verifier assets:
+new tests may be added, and a change to an existing assertion needs a named human reviewer.
+
+**Consequence:** The protected-path paragraph in `CONTROL_PLANE.md` and the matching
+paragraph in `CONTRIBUTING.md` record B. Every earlier decision byte, including D-041, stays
+unchanged. Founder merge and live-action restrictions, the authority split, history and
+scope stay as recorded in D-041. This entry does not rule on other paths such as
+`schemas/`. Settings, CODEOWNERS, rulesets, access grants and activation are not changed
+and are not claimed effective. CSL-206 may scope against this record and receives no
+implementation grant.
+
+**Falsifier:** a founder reverses Option B, or a change to an existing assertion is accepted
+with no named human reviewer and that acceptance is treated as the rule.
+
+**Review:** at a founder revisit of Option B, or the next monthly decision-log review.

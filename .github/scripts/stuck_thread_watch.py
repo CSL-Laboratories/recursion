@@ -62,13 +62,26 @@ HTML_CDATA_CLOSE = "]]>"
 HTML_VOID_TAGS = frozenset(
     "area base br col embed hr img input link meta param source track wbr".split()
 )
-# CommonMark 4.6 type 1: line-start <pre/<script/<style/<textarea, until any
-# of those end tags. Attribute punctuation does not cancel the opener.
+# CommonMark 4.6 type 1: line-start <pre/<script/<style/<textarea (0–3 spaces)
+# followed by space, tab, '>', or end of line. Attribute punctuation does not
+# cancel the opener; the block ends at a later </pre|script|style|textarea>.
+# The lookahead includes EOL: `$` without MULTILINE is only end-of-string.
 HTML_TYPE1_START_RE = re.compile(
-    r"^ {0,3}<(pre|script|style|textarea)(?=[ \t>]|$)",
+    r"^ {0,3}<(pre|script|style|textarea)(?=[ \t>\r\n]|$)",
     re.IGNORECASE,
 )
 HTML_TYPE1_NAMES = frozenset(("pre", "script", "style", "textarea"))
+# CommonMark 4.6 type 6 block tags. Used only to fail closed on an unparsed
+# line-start opener; wrapping tags still use the ordered stack so a blank
+# line does not authorize a verdict inside <details>/<blockquote>.
+HTML_TYPE6_NAMES = frozenset(
+    "address article aside base basefont blockquote body caption center col "
+    "colgroup dd details dialog dir div dl dt fieldset figcaption figure "
+    "footer form frame frameset h1 h2 h3 h4 h5 h6 head header hr html iframe "
+    "legend li link main menu menuitem nav noframes ol optgroup option p "
+    "param search section summary table tbody td tfoot th thead title tr "
+    "track ul".split()
+)
 # The Code Review Rules gate line, as scripts/ci/codex_gate.py parses it. The
 # verdict section may end with one; it never authorizes anything here.
 GATE_LINE_RE = re.compile(r" {0,3}CODEX-GATE:\s*(FIX|READY|MEDIATE)\s*")
@@ -439,10 +452,13 @@ def _open_markup_before(lines: list[str]) -> bool:
     standalone line. Anything after an unclosed fence or HTML construct
     renders inside it, so a following verdict section is an echo, not a
     ruling. HTML is scanned as CommonMark's raw-block family (comments,
-    processing instructions, declarations, CDATA, and tags), not as a list
-    of tag-name exceptions. Inline code spans are ignored. Non-void tags
-    must nest in order. An unclosed opener, unmatched close, or mis-nested
-    close all fail closed, so a stray ``</pre>`` or ``<![CDATA[`` can never
+    processing instructions, declarations, CDATA, type-1 literal blocks,
+    and tags), not as a list of tag-name exceptions. Type-1 blocks beat
+    inline code spans (CommonMark block > inline). Equal-length backtick
+    runs are stripped afterwards so a shorter closer cannot eat a live
+    tag. Non-void tags must nest in order. An unclosed opener, unmatched
+    close, mis-nested close, or HTML-like ``<`` that is not a 6.6 tag
+    all fail closed, so a stray ``</pre>`` or ``<![CDATA[`` can never
     make an echoed ``RESOLVE`` authorizing.
     """
     text: list[str] = []
@@ -457,63 +473,74 @@ def _open_markup_before(lines: list[str]) -> bool:
             continue
         text.append(lines[index])
         index += 1
-    # Type-1 HTML blocks beat inline code spans (CommonMark block > inline).
-    # Backticks inside `<pre title=`x`>` must not erase the opener.
     if _unclosed_html_type1(text):
         return True
-    # CommonMark 6.1 code spans may cross a line ending; strip only
-    # equal-length backtick strings so a literal `<pre>` inside a real
-    # span is not HTML, and an unmatched opener cannot erase a live tag.
     return _html_constructs_open(_strip_inline_code_spans("\n".join(text)))
 
 
 def _unclosed_html_type1(lines: list[str]) -> bool:
     """True if a type-1 HTML block has no tag-parsed closer before prose ends.
 
-    Closed HTML comments are skipped the same way ``_html_constructs_open``
-    skips them, so a ``<pre`` line inside ``<!-- ... -->`` is not an opener.
-    A ``</pre>`` inside a quoted attribute is not a closer; ``_html_tag_at``
-    has to see a real closing tag.
+    Closed comments / CDATA / PIs / declarations are skipped the same way
+    ``_html_constructs_open`` skips them, so a ``<pre`` line inside
+    ``<!-- ... -->`` is not an opener. Those type 2–5 skips are recognized
+    only at a CommonMark HTML-block column (line start, 0–3 spaces), so a
+    code-span `` `<!--` `` cannot hide a later type-1 ``<pre``. An unclosed
+    construct at that column fails closed. A ``</pre>`` inside a quoted
+    attribute is not a closer; ``_html_tag_at`` has to see a real tag
+    after the opener.
     """
     text = "\n".join(lines)
     index = 0
     length = len(text)
     while index < length:
-        if text.startswith(HTML_COMMENT_OPEN, index):
-            end = text.find(HTML_COMMENT_CLOSE, index + len(HTML_COMMENT_OPEN))
-            if end < 0:
-                return False
-            index = end + len(HTML_COMMENT_CLOSE)
-            continue
+        if _html_line_indent_ok(text, index):
+            skipped = _skip_raw_html_construct(text, index)
+            if skipped == "unclosed":
+                return True
+            if skipped is not None:
+                index = skipped
+                continue
         if index == 0 or text[index - 1] == "\n":
-            if HTML_TYPE1_START_RE.match(text[index:]):
-                end = _html_type1_end(text[index:])
+            start = HTML_TYPE1_START_RE.match(text[index:])
+            if start:
+                opener_at = index + start.group(0).index("<")
+                end = _html_type1_end(text[opener_at:])
                 if end is None:
                     return True
-                index += end
+                index = opener_at + end
                 continue
         index += 1
     return False
 
 
-def _html_type1_end(text: str) -> int | None:
-    """Offset after a type-1 end tag, or None if the block never closes."""
-    index = 0
-    length = len(text)
-    while index < length:
-        lt = text.find("<", index)
-        if lt < 0:
-            return None
-        tag = _html_tag_at(text, lt)
-        if tag == "unclosed":
-            return None
-        if tag:
-            end, name, close, _empty = tag
-            if close and name in HTML_TYPE1_NAMES:
-                return end
-            index = end
-            continue
-        index = lt + 1
+def _skip_raw_html_construct(text: str, index: int) -> int | str | None:
+    """End offset after a closed type 2–5 construct at *index*, or None.
+
+    ``unclosed`` means this construct opened and never closed; the type-1
+    scan defers to ``_html_constructs_open``.
+    """
+    rest = text[index:]
+    if rest.startswith(HTML_COMMENT_OPEN):
+        end = text.find(HTML_COMMENT_CLOSE, index + len(HTML_COMMENT_OPEN))
+        if end < 0:
+            return "unclosed"
+        return end + len(HTML_COMMENT_CLOSE)
+    if rest[: len(HTML_CDATA_OPEN)].upper() == HTML_CDATA_OPEN:
+        end = text.find(HTML_CDATA_CLOSE, index + len(HTML_CDATA_OPEN))
+        if end < 0:
+            return "unclosed"
+        return end + len(HTML_CDATA_CLOSE)
+    if rest.startswith(HTML_PI_OPEN):
+        end = text.find(HTML_PI_CLOSE, index + len(HTML_PI_OPEN))
+        if end < 0:
+            return "unclosed"
+        return end + len(HTML_PI_CLOSE)
+    if len(rest) >= 3 and rest.startswith("<!") and rest[2].isascii() and rest[2].isalpha():
+        end = _declaration_gt(text, index + 2)
+        if end is None or end == "unclosed":
+            return "unclosed"
+        return end + 1
     return None
 
 
@@ -555,6 +582,159 @@ def _strip_inline_code_spans(text: str) -> str:
             continue
         index = closer
     return "".join(out)
+
+
+def _html_constructs_open(visible: str) -> bool:
+    """True if *visible* leaves a CommonMark raw HTML construct unclosed.
+
+    Walks left to right. Closed, well-nested constructs are skipped; an
+    unrecognized ``<`` (for example ``a < b``) is not an opener. Matching
+    CommonMark 4.6 types 2–5: ``<!--`` / ``-->``, ``<?`` / ``?>``, ``<!`` +
+    ASCII letter / ``>`` (``>`` inside quotes does not end a declaration),
+    ``<![CDATA[`` / ``]]>``. Tags keep the ordered stack already used for
+    unmatched and mis-nested closes. Quoted attribute values are scanned as
+    CommonMark 6.6, so ``>``, ``/>``, or ``</pre>`` inside quotes cannot
+    close or self-close the opener. An HTML-like ``<`` that is not a 6.6
+    tag fails closed.
+    """
+    stack: list[str] = []
+    index = 0
+    length = len(visible)
+    while index < length:
+        lt = visible.find("<", index)
+        if lt < 0:
+            break
+        skipped = _skip_raw_html_construct(visible, lt)
+        if skipped == "unclosed":
+            return True
+        if skipped is not None:
+            index = skipped
+            continue
+        if _type1_start_at(visible, lt):
+            end = _html_type1_end(visible[lt:])
+            if end is None:
+                return True
+            index = lt + end
+            continue
+        tag = _html_tag_at(visible, lt)
+        if tag == "unclosed":
+            return True
+        if tag:
+            end, name, close, empty = tag
+            if (
+                name in HTML_TYPE6_NAMES
+                and _html_line_indent_ok(visible, lt)
+                and _type6_continues_to_eof(visible, lt)
+            ):
+                return True
+            if empty or name in HTML_VOID_TAGS:
+                index = end
+                continue
+            if not close:
+                stack.append(name)
+            elif not stack or stack[-1] != name:
+                return True
+            else:
+                stack.pop()
+            index = end
+            continue
+        nxt = visible[lt + 1] if lt + 1 < length else ""
+        if nxt in "!?/" or (nxt.isascii() and nxt.isalpha()):
+            return True
+        index = lt + 1
+    return bool(stack)
+
+
+def _html_line_indent_ok(visible: str, lt: int) -> bool:
+    """True if *lt* is at a CommonMark HTML-block line start (0–3 spaces)."""
+    line_start = visible.rfind("\n", 0, lt) + 1
+    indent = visible[line_start:lt]
+    return len(indent) <= 3 and all(char == " " for char in indent)
+
+
+def _type1_start_at(visible: str, lt: int) -> bool:
+    """True if *lt* is a CommonMark 4.6 type-1 start (line-start pre/script/...)."""
+    if not _html_line_indent_ok(visible, lt):
+        return False
+    line_start = visible.rfind("\n", 0, lt) + 1
+    return HTML_TYPE1_START_RE.match(visible[line_start:]) is not None
+
+
+def _type6_continues_to_eof(visible: str, lt: int) -> bool:
+    """True if a type-6 start has no later blank line (block runs to EOF).
+
+    A trailing empty prose line joins as a final newline; that is the blank
+    line that ends type 6. A last content line with no newline after it is
+    still open.
+    """
+    line_end = visible.find("\n", lt)
+    if line_end < 0:
+        return True
+    rest = visible[line_end + 1:]
+    if rest == "" or rest.startswith("\n") or "\n\n" in rest:
+        return False
+    return True
+
+
+def _declaration_gt(visible: str, start: int) -> int | str | None:
+    """Index of a declaration ``>`` not inside quotes, or ``unclosed``."""
+    index = start
+    length = len(visible)
+    quote = ""
+    while index < length:
+        char = visible[index]
+        if quote:
+            if char == quote:
+                quote = ""
+            index += 1
+            continue
+        if char in "\"'":
+            quote = char
+            index += 1
+            continue
+        if char == ">":
+            return index
+        index += 1
+    return "unclosed" if quote else None
+
+
+def _html_type1_end(text: str) -> int | None:
+    """Offset after a type-1 end tag, or None if the block never closes.
+
+    Parse the opener first so a quoted ``</pre>`` in its attributes is not
+    the closer. A malformed opener (``_html_tag_at`` returns None) skips
+    the rest of the start line for the same reason. Any of ``</pre>``,
+    ``</script>``, ``</style>``, ``</textarea>`` then ends the block.
+    """
+    tag = _html_tag_at(text, 0)
+    if tag == "unclosed":
+        return None
+    if tag:
+        end, name, close, _empty = tag
+        if close and name in HTML_TYPE1_NAMES:
+            return end
+        index = end
+    else:
+        newline = text.find("\n")
+        if newline < 0:
+            return None
+        index = newline + 1
+    length = len(text)
+    while index < length:
+        lt = text.find("<", index)
+        if lt < 0:
+            return None
+        tag = _html_tag_at(text, lt)
+        if tag == "unclosed":
+            return None
+        if tag:
+            end, name, close, _empty = tag
+            if close and name in HTML_TYPE1_NAMES:
+                return end
+            index = end
+            continue
+        index = lt + 1
+    return None
 
 
 def _skip_html_tag_space(visible: str, index: int) -> int:
@@ -645,69 +825,6 @@ def _html_tag_at(
                 if not value:
                     return None
                 index = value.end()
-
-
-def _html_constructs_open(visible: str) -> bool:
-    """True if *visible* leaves a CommonMark raw HTML construct unclosed.
-
-    Walks left to right. Closed, well-nested constructs are skipped; an
-    unrecognized ``<`` (for example ``a < b``) is not an opener. Matching
-    CommonMark 4.6 types 2–5: ``<!--`` / ``-->``, ``<?`` / ``?>``, ``<!`` +
-    ASCII letter / ``>``, ``<![CDATA[`` / ``]]>``. Tags keep the ordered
-    stack already used for unmatched and mis-nested closes. Quoted
-    attribute values are scanned as CommonMark 6.6, so ``>``, ``/>``, or
-    ``</pre>`` inside quotes cannot close or self-close the opener.
-    """
-    stack: list[str] = []
-    index = 0
-    length = len(visible)
-    while index < length:
-        lt = visible.find("<", index)
-        if lt < 0:
-            break
-        rest = visible[lt:]
-        if rest.startswith(HTML_COMMENT_OPEN):
-            end = visible.find(HTML_COMMENT_CLOSE, lt + len(HTML_COMMENT_OPEN))
-            if end < 0:
-                return True
-            index = end + len(HTML_COMMENT_CLOSE)
-            continue
-        if rest[: len(HTML_CDATA_OPEN)].upper() == HTML_CDATA_OPEN:
-            end = visible.find(HTML_CDATA_CLOSE, lt + len(HTML_CDATA_OPEN))
-            if end < 0:
-                return True
-            index = end + len(HTML_CDATA_CLOSE)
-            continue
-        if rest.startswith(HTML_PI_OPEN):
-            end = visible.find(HTML_PI_CLOSE, lt + len(HTML_PI_OPEN))
-            if end < 0:
-                return True
-            index = end + len(HTML_PI_CLOSE)
-            continue
-        if len(rest) >= 3 and rest.startswith("<!") and rest[2].isascii() and rest[2].isalpha():
-            end = visible.find(">", lt + 2)
-            if end < 0:
-                return True
-            index = end + 1
-            continue
-        tag = _html_tag_at(visible, lt)
-        if tag == "unclosed":
-            return True
-        if tag:
-            end, name, close, empty = tag
-            if empty or name in HTML_VOID_TAGS:
-                index = end
-                continue
-            if not close:
-                stack.append(name)
-            elif not stack or stack[-1] != name:
-                return True
-            else:
-                stack.pop()
-            index = end
-            continue
-        index = lt + 1
-    return bool(stack)
 
 
 def _verdict_section(lines: list[str]) -> list[tuple[str, str, str]] | None:

@@ -4,12 +4,14 @@
 Run from the repository root:
 
     python -X utf8 -B tools/check_program_control.py
+    python -X utf8 -B tools/check_program_control.py --pinned-eol-only
 
 A pass proves structural closure only. It is not Owner acceptance, independent
 verification, product qualification, or release approval.
 """
 from __future__ import annotations
 
+import argparse
 import functools
 import hashlib
 import json
@@ -353,8 +355,8 @@ def _manifest_payload_paths(manifest: Path, root: Path, errors: list[str]) -> li
     """
     manifest_rel = manifest.relative_to(root).as_posix()
     try:
-        payload = json.loads(manifest.read_text(encoding="utf-8", errors="replace"))
-    except (OSError, json.JSONDecodeError):
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
         errors.append(f"{manifest_rel}: inventory cannot be read")
         return []
     files = payload.get("files") if isinstance(payload, dict) else None
@@ -400,16 +402,31 @@ def _pinned_path_details(data: dict[str, Any], root: Path) -> tuple[list[str], f
     root = root.resolve()
     errors: list[str] = []
     paths: list[str] = []
-    for contract in data.get("contracts", []):
-        if isinstance(contract, dict) and text_present(contract.get("path")):
-            paths.append(contract["path"])
+    if not isinstance(data, dict) or not isinstance(data.get("contracts"), list):
+        return [], frozenset(), ["program contracts must be a list of objects"]
+    for index, contract in enumerate(data["contracts"]):
+        if not isinstance(contract, dict) or not text_present(contract.get("path")):
+            errors.append(f"contracts[{index}] requires a nonempty path")
+            continue
+        entry = _safe_join(root, contract["path"], root, errors,
+                           f"contracts[{index}] path")
+        if entry is not None:
+            paths.append(entry.relative_to(root).as_posix())
     for manifest in sorted(root.glob("**/SHA256SUMS.txt")):
-        if ".git" in manifest.relative_to(root).parts:
+        if manifest.name != "SHA256SUMS.txt" or ".git" in manifest.relative_to(root).parts:
             continue
         manifest_rel = manifest.relative_to(root).as_posix()
-        for line in manifest.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            lines = manifest.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError):
+            errors.append(f"{manifest_rel}: inventory cannot be read")
+            continue
+        for number, line in enumerate(lines, 1):
+            if not line.strip():
+                continue
             match = SUM_LINE.fullmatch(line.strip())
             if not match:
+                errors.append(f"{manifest_rel}:{number}: invalid sha256 entry")
                 continue
             name = match.group(2).strip()
             source = f"{manifest_rel}: entry '{name}'"
@@ -430,7 +447,9 @@ def _pinned_path_details(data: dict[str, Any], root: Path) -> tuple[list[str], f
             paths.append(entry.relative_to(root).as_posix())
     manifest_paths: list[str] = []
     for manifest in sorted(root.glob("**/MANIFEST.json")):
-        if ".git" in manifest.relative_to(root).parts:
+        # Windows globbing is case-insensitive; lowercase manifest.json files
+        # use unrelated schemas and are not this pinned packet inventory.
+        if manifest.name != "MANIFEST.json" or ".git" in manifest.relative_to(root).parts:
             continue
         for resolved in _manifest_payload_paths(manifest, root, errors):
             manifest_paths.append(resolved.relative_to(root).as_posix())
@@ -528,8 +547,12 @@ def _git_check_attr(root: str, paths: tuple[str, ...]) -> tuple[dict[str, dict[s
     resolved: dict[str, dict[str, str]] = {}
     for line in result.stdout.splitlines():
         parts = line.rsplit(": ", 2)
-        if len(parts) == 3 and parts[1] in {"text", "eol"}:
-            resolved.setdefault(parts[0], {})[parts[1]] = parts[2]
+        if (len(parts) != 3 or parts[0] not in paths or parts[1] not in {"text", "eol"}
+                or not parts[2] or parts[1] in resolved.get(parts[0], {})):
+            return {}, "git check-attr returned malformed or duplicate attributes"
+        resolved.setdefault(parts[0], {})[parts[1]] = parts[2]
+    if any(set(resolved.get(path, {})) != {"text", "eol"} for path in paths):
+        return {}, "git check-attr returned incomplete attributes"
     return resolved, ""
 
 
@@ -1180,16 +1203,25 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--pinned-eol-only", action="store_true",
+                        help="check pinned-path checkout policy without full program validation")
+    args = parser.parse_args()
+    label = "PINNED_EOL" if args.pinned_eol_only else "PROGRAM_CONTROL"
     try:
         data = json.loads(LEDGER.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        print(f"PROGRAM_CONTROL_FAIL: {exc}", file=sys.stderr)
+        errors = (pinned_eol_errors(data, ROOT) if args.pinned_eol_only
+                  else validate_program(data))
+    except (OSError, UnicodeError, ValueError, subprocess.SubprocessError) as exc:
+        print(f"{label}_FAIL: {exc}", file=sys.stderr)
         return 1
-    errors = validate_program(data)
     if errors:
         for error in errors:
-            print(f"PROGRAM_CONTROL_FAIL: {error}", file=sys.stderr)
+            print(f"{label}_FAIL: {error}", file=sys.stderr)
         return 1
+    if args.pinned_eol_only:
+        print("PINNED_EOL_PASS checkout_policy_only=true")
+        return 0
     print(
         "PROGRAM_CONTROL_PASS "
         f"contracts={len(data['contracts'])} decisions={len(data['decisions'])} "

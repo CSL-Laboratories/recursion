@@ -671,7 +671,7 @@ def mediation_body(
     reason: str,
     linear_url: str = "",
 ) -> str:
-    loc = location(thread.path, thread.line)
+    loc = location(thread.path, thread.line).replace("`", "").replace("\n", " ").replace("\r", " ")
     devin = first_devin(thread, cfg)
     claude = last_claude(thread, cfg)
     finding_body = devin.body if devin else ""
@@ -720,7 +720,7 @@ def mediation_body(
         f"**Claude's reply** (`{cfg.claude_login}`, untrusted):\n"
         f"{quote_block(claude.body if claude else '')}\n"
     )
-    return re.sub(r"@(?=claude\b)", "@ ", body, flags=re.IGNORECASE) if thread.failure_evidence else body
+    return re.sub(r"@claude", "@ claude", body, flags=re.IGNORECASE)
 
 
 def resolve_reply_body(thread: Thread, verdict: ThreadVerdict, head_sha: str) -> str:
@@ -1901,7 +1901,12 @@ def scan(
                     existing = linear.find_by_marker(
                         rollup_marker(pull), title=linear_title(pull)
                     )
-                    if existing and not open_failure_handoffs(pull, existing):
+                    if open_failure_handoffs(pull, existing):
+                        # Rebuild from current unresolved threads even if no new
+                        # failure evidence is available. This never admits actions.
+                        if cfg.linear_api_key:
+                            upsert_linear_rollup(pull, [], cfg, linear, counters)
+                    elif existing:
                         cancel_linear_rollup(existing, linear, counters)
                 except Exception as extra_exc:  # noqa: BLE001
                     notice(f"Linear cancel skipped: {extra_exc}")
@@ -1926,7 +1931,12 @@ def scan(
                     existing = linear.find_by_marker(
                         rollup_marker(pull), title=linear_title(pull)
                     )
-                    if existing and not open_failure_handoffs(pull, existing):
+                    if open_failure_handoffs(pull, existing):
+                        # Rebuild from current unresolved threads even if no new
+                        # failure evidence is available. This never admits actions.
+                        if cfg.linear_api_key:
+                            upsert_linear_rollup(pull, [], cfg, linear, counters)
+                    elif existing:
                         cancel_linear_rollup(existing, linear, counters)
             except Exception as exc:  # noqa: BLE001 — mediation still proceeds
                 notice(f"Linear roll-up skipped: {exc}")
@@ -2042,9 +2052,12 @@ def scan(
                 try:
                     extra, _ = with_failure_evidence(extra, cfg, failure_collector)
                 except Exception:  # noqa: BLE001 - preserve this roll-up and inspect the next PR
-                    notice(f"PR #{extra.number}: preserve roll-up; failure evidence unavailable")
-                    continue
-                if not stuck_threads(extra, cfg, for_rollup=True) and not open_failure_handoffs(extra, issue):
+                    notice(f"PR #{extra.number}: retain current handoffs; failure evidence unavailable")
+                remaining = stuck_threads(extra, cfg, for_rollup=True)
+                if open_failure_handoffs(extra, issue):
+                    if cfg.linear_api_key:
+                        upsert_linear_rollup(extra, remaining, cfg, linear, counters)
+                elif not remaining:
                     cancel_linear_rollup(issue, linear, counters)
         except Exception as extra_exc:  # noqa: BLE001
             notice(f"Linear roll-up sweep skipped: {extra_exc}")

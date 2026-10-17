@@ -728,19 +728,19 @@ class FixerGateAndPromptTests(unittest.TestCase):
             self.assertIn("prompt: |", body, job)
             self.assertIn("commit SHA", body, job)
             self.assertIn("do NOT resolve the thread", body, job)
-            self.assertIn("gh api repos/REPO/pulls/PR/comments/ID/replies", body, job)
+            self.assertIn("pre-push model-api -- reply ID BODY_FILE", body, job)
             self.assertIn(
-                "Bash(gh api repos/*/pulls/*/comments/*/replies:*)",
+                "Bash(python3 ${{ runner.temp }}/claude-fixer-guard/pre-push model-api --:*)",
                 body,
                 job,
             )
             self.assertIn(
-                "Bash(gh api --method POST repos/*/pulls/*/comments/*/replies:*)",
+                "Bash(python3 ${{ runner.temp }}/claude-fixer-guard/pre-push model-api --:*)",
                 body,
                 job,
             )
-            self.assertIn("Bash(gh api graphql:*resolveReviewThread*)", body, job)
-            self.assertIn("resolveReviewThread call only", body, job)
+            self.assertNotIn("Bash(gh api graphql:*resolveReviewThread*)", body, job)
+            self.assertIn("existing trusted watcher or human resolution", body, job)
             self.assertIn("Do not resolve a thread you have not answered", body, job)
             self.assertIn("Do not use graphql for any other mutation", body, job)
             self.assertIn("do NOT push", body, job)

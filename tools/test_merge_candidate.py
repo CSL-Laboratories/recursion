@@ -258,6 +258,15 @@ class SnapshotTests(unittest.TestCase):
             self.assertEqual(result['duplicate'], 'true')
             route.assert_not_called()
             helpers.assert_not_called()
+        client = self.client()
+        client.get.return_value['head']['sha'] = 'e'*40
+        client.reviews.return_value = [mediate]
+        with mock.patch.object(router.gate, 'run_verdict') as route:
+            result = router.admit(client, {'review': mediate, 'pull_request': {'number': 7}}, '', '51', 1)
+            self.assertEqual(result['duplicate'], 'true')
+            self.assertFalse(self.readiness_scheduled(result))
+            client.reviews.assert_not_called()
+            route.assert_not_called()
         for change in ({'draft': True}, {'state': 'closed'},
                        {'head': {'sha': VALUE['head'], 'repo': {'full_name': 'fork/repo'}}}):
             client = self.client()

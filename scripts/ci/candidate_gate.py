@@ -144,6 +144,8 @@ def admit(client, event, pat, run, attempt):
                 or ((current_pr.get('head') or {}).get('repo') or {}).get('full_name') != client.repo):
             return {'action': 'skip-ineligible-pr', 'admitted': 'false', 'duplicate': 'true'}
         head = protocol.sha((current_pr.get('head') or {}).get('sha'))
+        if protocol.sha(review.get('commit_id')) != head:
+            return {'action': 'superseded-event', 'admitted': 'false', 'duplicate': 'true'}
         authoritative = protocol.latest_review(client.reviews(number), head)
         if (authoritative['id'] != review.get('id')
                 or authoritative.get('body') != review.get('body')

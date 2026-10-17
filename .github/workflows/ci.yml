@@ -24,7 +24,11 @@
 # treated as success and would overlay a failed required check on the same SHA.
 # Adding `ci:full` starts windows/macos from ci-full-label.yml (no linux job).
 # `ci:full` also gates windows/macos on the next synchronize / ready_for_review
-# / dispatch / master push. Discord `/ci full` retriggers.
+# / dispatch / merge_group. Discord `/ci full` retriggers.
+#
+# linux/windows skip push-to-master: merge queue already tested the merged
+# result. Nightly macOS (ci-macos-nightly.yml) still covers master. Windows
+# and macOS extra coverage moved from master push onto merge_group.
 name: CI
 
 on:
@@ -32,10 +36,12 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [master]
+  merge_group:
+    types: [checks_requested]
   workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.event_name == 'merge_group' && format('ci-{0}-{1}', github.workflow, github.event.merge_group.head_ref) || format('ci-{0}-{1}', github.workflow, github.event.pull_request.number || github.ref) }}
   cancel-in-progress: true
 
 permissions:
@@ -45,10 +51,13 @@ env:
   PYTHONUTF8: "1"
   PYTHONIOENCODING: utf-8
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+  CI_HEAD_SHA: ${{ github.event.merge_group.head_sha || github.event.pull_request.head.sha || github.sha }}
 
 jobs:
   linux:
     name: linux
+    if: github.event_name != 'push'
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 15
     outputs:
@@ -62,8 +71,6 @@ jobs:
 
       - name: Path filter
         id: paths
-        env:
-          CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: python3 -X utf8 -B tools/ci_gate.py --paths-only
 
       - name: Set up Python
@@ -80,8 +87,6 @@ jobs:
 
       - name: Provider-free gate
         if: steps.paths.outputs.run_full == 'true'
-        env:
-          CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: python -X utf8 -B tools/ci_gate.py --force
 
       # Same job and runner as the gate. Slowdowns warn; a crash, timeout, or
@@ -103,8 +108,6 @@ jobs:
       # Public-scope (and whitespace) must still run when the suite is skipped.
       - name: Docs-only lightweight checks
         if: steps.paths.outputs.run_full != 'true'
-        env:
-          CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: python3 -X utf8 -B tools/ci_gate.py
 
   windows:
@@ -113,7 +116,7 @@ jobs:
     if: >
       needs.linux.result == 'success' &&
       needs.linux.outputs.run_full == 'true' &&
-      (github.event_name == 'push' ||
+      (github.event_name == 'merge_group' ||
        github.event_name == 'workflow_dispatch' ||
        (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:full')))
     runs-on: blacksmith-2vcpu-windows-2025
@@ -139,15 +142,17 @@ jobs:
       - name: Provider-free gate
         run: python -X utf8 -B tools/ci_gate.py --force
 
-  # GitHub-hosted macOS is not run on master pushes. Nightly master coverage
-  # lives in ci-macos-nightly.yml (07:17 UTC, skipped if no commits in 24h).
+  # GitHub-hosted macOS is not run on master pushes. Merge-queue coverage runs
+  # here; nightly master coverage lives in ci-macos-nightly.yml (07:17 UTC,
+  # skipped if no commits in 24h).
   macos:
     name: macos
     needs: linux
     if: >
       needs.linux.result == 'success' &&
       needs.linux.outputs.run_full == 'true' &&
-      (github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'merge_group' ||
+       github.event_name == 'workflow_dispatch' ||
        (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:full')))
     runs-on: macos-latest
     timeout-minutes: 15

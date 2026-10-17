@@ -13,9 +13,11 @@ acceptance, live-provider qualification, or scientific admission.
 Test discovery: files matching TEST_GLOBS run unless listed in TEST_EXCLUDE.
 assert_tests_accounted fails if a test-like file is neither run nor excluded.
 
-Path filter: when CI_BASE_SHA is set (PR base or push-before), a docs-only
-diff skips the contract-test suite but still runs whitespace_check and
-check_public_scope. --force always runs the suite.
+Path filter: when CI_BASE_SHA is set (PR base, merge_group.base_sha, or
+push-before), a docs-only diff skips the contract-test suite but still runs
+whitespace_check and check_public_scope. CI_HEAD_SHA (merge_group.head_sha,
+PR head, or github.sha) is the right side of that diff; it defaults to HEAD.
+--force always runs the suite.
 """
 from __future__ import annotations
 
@@ -160,10 +162,18 @@ def comparison_sha() -> str | None:
     return raw
 
 
+def head_ref() -> str:
+    """Right-hand side of the path-filter diff (merge_group.head_sha or HEAD)."""
+    raw = os.environ.get("CI_HEAD_SHA", "").strip()
+    if not raw or raw == ZERO_SHA:
+        return "HEAD"
+    return raw
+
+
 def changed_paths(base: str) -> list[str]:
     # --no-renames: a source file moved into docs still counts the source path.
     # -z + core.quotePath=false: non-ASCII names are unquoted NUL-terminated paths.
-    return git_nul("diff", "-z", "--name-only", "--no-renames", base, "HEAD")
+    return git_nul("diff", "-z", "--name-only", "--no-renames", base, head_ref())
 
 
 def docs_only(base: str) -> bool:
@@ -184,6 +194,13 @@ def decide_run_full(force: bool) -> bool:
     except subprocess.CalledProcessError:
         print(f"CI_BASE_SHA={base} is not present locally; running the suite", flush=True)
         return True
+    head = head_ref()
+    if head != "HEAD":
+        try:
+            git("cat-file", "-e", f"{head}^{{commit}}")
+        except subprocess.CalledProcessError:
+            print(f"CI_HEAD_SHA={head} is not present locally; running the suite", flush=True)
+            return True
     if docs_only(base):
         paths = changed_paths(base)
         print(
@@ -391,9 +408,10 @@ def whitespace_check() -> None:
     if base is None:
         print("SKIP git diff --check (no CI_BASE_SHA)", flush=True)
         return
-    print(f"RUN git diff --check {base[:12]} HEAD", flush=True)
+    head = head_ref()
+    print(f"RUN git diff --check {base[:12]} {head[:12]}", flush=True)
     result = subprocess.run(
-        [*GIT, "diff", "--check", base, "HEAD"],
+        [*GIT, "diff", "--check", base, head],
         cwd=ROOT,
         check=False,
     )

@@ -1,0 +1,59 @@
+# Required check that wraps Devin Review so merge queue is not blocked waiting
+# for a PR-only commit status. The job is never skipped: a skipped required
+# check is treated as success (or stays pending in the merge queue).
+#
+# pull_request: pass only if commit status/check "Devin Review" succeeded on
+# the head SHA. The job polls so the required conclusion is reported by an
+# eligible pull_request run. Drafts fail immediately (Devin skips them).
+# status: re-evaluate once when that (or any) commit status is posted.
+# merge_group: pass. Devin does not run on merge queue SHAs.
+#
+# Do not trigger on check-run events: this workflow's own job would retrigger itself.
+name: review-gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  status:
+  merge_group:
+    types: [checks_requested]
+
+# Isolate by event so a status re-eval cannot cancel the pull_request poll
+# that branch protection actually consumes.
+concurrency:
+  group: review-gate-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.merge_group.head_ref || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  checks: read
+  statuses: read
+  pull-requests: read
+
+jobs:
+  review-gate:
+    name: review-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Pass on merge queue
+        if: github.event_name == 'merge_group'
+        run: echo "merge_group: review-gate passes"
+
+      - name: Checkout gate
+        if: github.event_name != 'merge_group'
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            tools/review_gate.py
+          sparse-checkout-cone-mode: false
+
+      - name: Require Devin Review on the head SHA
+        if: github.event_name != 'merge_group'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.sha || github.sha }}
+          IS_DRAFT: ${{ github.event.pull_request.draft || false }}
+        run: python3 -X utf8 -B tools/review_gate.py

@@ -289,14 +289,30 @@ def _rss_unit() -> str | None:
     return "kilobytes"
 
 
-def _host_sample(before_times, after_times, rss_after: int | None) -> dict:
+def _child_cpu(before_times, after_times, platform_name: str) -> tuple[float | None, float | None, str | None]:
+    """Child CPU deltas, or null where os.times does not report them.
+
+    CPython documents that on Windows only user and system are known and the
+    other os.times attributes are zero. Those zeros are not a measurement.
+    """
     if before_times is None or after_times is None:
-        user = system = None
-        cpu_reason = "os.times children fields are not available on this interpreter"
-    else:
-        user = after_times.children_user - before_times.children_user
-        system = after_times.children_system - before_times.children_system
-        cpu_reason = None
+        return None, None, "os.times children fields are not available on this interpreter"
+    if platform_name == "win32":
+        return (
+            None,
+            None,
+            "os.times children_user and children_system are always 0 on Windows; "
+            "only user and system are known, so child CPU is not a measurement",
+        )
+    return (
+        after_times.children_user - before_times.children_user,
+        after_times.children_system - before_times.children_system,
+        None,
+    )
+
+
+def _host_sample(before_times, after_times, rss_after: int | None) -> dict:
+    user, system, cpu_reason = _child_cpu(before_times, after_times, sys.platform)
     if rss_after is None:
         rss_reason = (
             "resource.getrusage is not available on this platform; "

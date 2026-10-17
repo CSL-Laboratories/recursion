@@ -150,7 +150,8 @@
         "network": "The network guard refuses connections. Byte counts are not collected.",
         "wakeups": "Not measured.",
         "handles": "Not measured.",
-        "rss_on_windows": "resource.getrusage is not in the stdlib on Windows. RSS is null there unless a later change finds a stdlib-only counter."
+        "rss_on_windows": "resource.getrusage is not in the stdlib on Windows. RSS is null there unless a later change finds a stdlib-only counter.",
+        "child_cpu_on_windows": "os.times children_user and children_system are always 0 on Windows. Only user and system are known, so child CPU is null there."
       }
     },
     {

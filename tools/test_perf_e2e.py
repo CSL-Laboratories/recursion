@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -213,6 +214,22 @@ class VerdictTests(unittest.TestCase):
         self.assertIsNone(checked["verdict_token"])
         self.assertFalse(checked["verdict_token_exercised"])
         self.assertEqual(baseline["verdict"], "revise")
+
+    def test_windows_child_cpu_is_unavailable(self) -> None:
+        before = os.times()
+        after = os.times()
+        user, system, reason = perf_e2e._child_cpu(before, after, "win32")
+        self.assertIsNone(user)
+        self.assertIsNone(system)
+        self.assertIn("Windows", reason)
+        user, system, reason = perf_e2e._child_cpu(before, after, "linux")
+        self.assertIsNone(reason)
+        self.assertEqual(user, after.children_user - before.children_user)
+        self.assertEqual(system, after.children_system - before.children_system)
+        missing_user, missing_system, missing_reason = perf_e2e._child_cpu(None, after, "linux")
+        self.assertIsNone(missing_user)
+        self.assertIsNone(missing_system)
+        self.assertIn("not available", missing_reason)
 
 
 class FailureTests(unittest.TestCase):

@@ -1552,9 +1552,16 @@ class ProgramControlTests(unittest.TestCase):
             packet = root / "docs/v3/research-lane/fresh-packet"
             packet.mkdir(parents=True)
             (packet / "SHA256SUMS.txt").write_text(
-                "a" * 64 + "  payload.md\n"
-                "not a sum line\n"
+                "a" * 64 + "  payload.md\n" +
+                "not a sum line\n" +
                 "b" * 64 + " *blob.bin\n",
+                encoding="utf-8")
+            # Packet written from the parent dir: entries carry the dir prefix.
+            packet2 = root / "docs/v3/research-lane/parent-packet"
+            packet2.mkdir(parents=True)
+            (packet2 / "p.md").write_text("x\n", encoding="utf-8")
+            (packet2 / "SHA256SUMS.txt").write_text(
+                "c" * 64 + "  parent-packet/p.md\n",
                 encoding="utf-8")
             receipts = root / "docs/audits/receipts-1"
             receipts.mkdir(parents=True)
@@ -1563,6 +1570,7 @@ class ProgramControlTests(unittest.TestCase):
             self.assertIn("x/y.md", paths)
             self.assertIn("docs/v3/research-lane/fresh-packet/payload.md", paths)
             self.assertIn("docs/v3/research-lane/fresh-packet/blob.bin", paths)
+            self.assertIn("docs/v3/research-lane/parent-packet/p.md", paths)
             self.assertIn("docs/audits/receipts-1/r1.json", paths)
             self.assertNotIn("docs/v3/research-lane/fresh-packet/SHA256SUMS.txt", paths)
 
@@ -1600,7 +1608,7 @@ class ProgramControlTests(unittest.TestCase):
             (packet / "payload.md").write_text("x\n", encoding="utf-8")
             (packet / "blob.bin").write_bytes(b"\x00\x01")
             (packet / "SHA256SUMS.txt").write_text(
-                "a" * 64 + "  payload.md\n"
+                "a" * 64 + "  payload.md\n" +
                 "b" * 64 + "  blob.bin\n",
                 encoding="utf-8")
             (root / ".gitattributes").write_text(

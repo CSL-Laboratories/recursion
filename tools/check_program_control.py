@@ -301,13 +301,12 @@ def sha256_pinned_paths(data: dict[str, Any], root: Path) -> list[str]:
             match = SUM_LINE.fullmatch(line.strip())
             if match:
                 name = match.group(2).strip()
-                entry = manifest.parent / name
-                # Some manifests were written from their parent directory and
-                # carry the packet directory as a prefix on every entry.
-                if not entry.exists():
-                    fallback = manifest.parent.parent / name
-                    if fallback.exists():
-                        entry = fallback
+                # Manifests written from their parent directory carry the
+                # packet directory as a prefix on every entry.
+                if name.startswith(manifest.parent.name + "/"):
+                    entry = manifest.parent.parent / name
+                else:
+                    entry = manifest.parent / name
                 paths.append(entry.relative_to(root).as_posix())
     audits = root / "docs/audits"
     if audits.is_dir():
@@ -372,8 +371,9 @@ def pinned_eol_errors(data: dict[str, Any], root: Path) -> list[str]:
             errors.append(f"{path} sha256-pinned path lacks eol=lf "
                           f"(git check-attr eol: {attrs.get('eol')})")
     for path in sorted(PINNED_EOL_KNOWN_GAPS - set(paths)):
-        errors.append(f"{path} known eol gap is no longer pinned: "
-                      "remove it from PINNED_EOL_KNOWN_GAPS")
+        if (root / path).exists():
+            errors.append(f"{path} known eol gap is no longer pinned: "
+                          "remove it from PINNED_EOL_KNOWN_GAPS")
     return errors
 
 

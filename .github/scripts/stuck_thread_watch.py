@@ -37,10 +37,12 @@ QUOTE_LIMIT = 1500
 DEFAULT_CODEX_REVIEW_LOGIN = "chatgpt-codex-connector[bot]"
 VERDICT_ACTIONS = ("RESOLVE", "DECIDE", "MISSING", "AMBIGUOUS")
 SAFE_SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
-VERDICT_BLOCK_RE = re.compile(
-    r"<!--\s*" + VERDICT_PREFIX + r":(?P<tid>[^\s>]+)\s*-->"
-    r"(?P<body>.*?)(?=<!--\s*" + VERDICT_PREFIX + r":|\Z)",
-    re.IGNORECASE | re.DOTALL,
+# A verdict marker authorizes only as a standalone line: the HTML comment is
+# the whole line, indented less than four spaces (four is an indented code
+# block). A marker inside prose, inline code, a quote, or a fence is an example.
+VERDICT_MARKER_LINE_RE = re.compile(
+    r" {0,3}<!--\s*" + VERDICT_PREFIX + r":(?P<tid>[^\s>]+)\s*-->[ \t]*",
+    re.IGNORECASE,
 )
 VERDICT_ACTION_RE = re.compile(
     r"^CODEX-THREAD:\s*(RESOLVE|DECIDE|MISSING|AMBIGUOUS)\s*$",
@@ -402,44 +404,88 @@ def is_known_bot_login(login: str | None, cfg: Config) -> bool:
     )
 
 
-def strip_quoted_and_fenced(text: str) -> str:
-    """Drop quoted lines and fenced code so echoed verdicts cannot authorize."""
-    kept: list[str] = []
-    in_fence = False
-    for line in (text or "").replace("\r\n", "\n").split("\n"):
-        stripped = line.lstrip()
-        if stripped.startswith("```"):
-            in_fence = not in_fence
+def verdict_text_runs(text: str) -> list[list[str]]:
+    """Split a comment into runs of lines that render as ordinary text.
+
+    Fenced code (backtick or tilde; the closer uses the same character and is
+    at least as long as the opener) and blockquote lines are dropped so an
+    echoed verdict cannot authorize. Every dropped region also ends the current
+    run, so text on either side of a quote or fence is never read as one
+    verdict. An opener without a closer hides everything after it, as it
+    renders. This recognizes the generated protocol shape only; it is not a
+    Markdown parser. Fence helpers are shared with the roll-up checklist code.
+    """
+    lines = (text or "").replace("\r\n", "\n").split("\n")
+    runs: list[list[str]] = []
+    current: list[str] = []
+    expected = 0
+    for index, line in _visible_lines(lines, 0, len(lines), unclosed_hides=True):
+        if index != expected and current:
+            runs.append(current)
+            current = []
+        expected = index + 1
+        if line.lstrip().startswith(">"):
+            if current:
+                runs.append(current)
+                current = []
             continue
-        if in_fence or stripped.startswith(">"):
+        current.append(line)
+    if current:
+        runs.append(current)
+    return runs
+
+
+def _verdict_from_block(
+    thread_id: str, lines: list[str], comment: Comment
+) -> ThreadVerdict | None:
+    """One block's ruling, with conflicts retained as a non-resolving barrier."""
+    actions: set[str] = set()
+    heads: set[str] = set()
+    for line in lines:
+        action = VERDICT_ACTION_RE.fullmatch(line)
+        if action:
+            actions.add(action.group(1).upper())
             continue
-        kept.append(line)
-    return "\n".join(kept)
+        head = VERDICT_HEAD_RE.fullmatch(line)
+        if head:
+            heads.add(normalize_sha(head.group(1)))
+    if not actions:
+        return None
+    # Dropping a conflicting later block would revive an earlier RESOLVE.
+    # AMBIGUOUS is an internal non-authorizing result, never permission to act.
+    ambiguous = len(actions) != 1 or len(heads) > 1
+    return ThreadVerdict(
+        thread_id=thread_id,
+        action="AMBIGUOUS" if ambiguous else next(iter(actions)),
+        head_sha=next(iter(heads)) if heads and not ambiguous else "",
+        created_at=comment.created_at,
+        login=comment.login,
+        source_commit=normalize_sha(comment.commit_sha),
+        body="\n".join(lines),
+    )
 
 
 def parse_thread_verdicts(comment: Comment) -> tuple[ThreadVerdict, ...]:
-    """Parse zero or more per-thread blocks from one Codex comment/review."""
+    """Parse zero or more per-thread blocks from one Codex comment/review.
+
+    A block starts at a standalone marker line and runs to the next marker
+    line or to the end of its visible text run (see ``verdict_text_runs``).
+    Marker, action, or head text that is quoted, fenced, indented as code, or
+    embedded in a prose line is an example, not a ruling.
+    """
     found: list[ThreadVerdict] = []
-    source = strip_quoted_and_fenced(comment.body or "")
-    for match in VERDICT_BLOCK_RE.finditer(source):
-        block = match.group("body") or ""
-        actions = VERDICT_ACTION_RE.findall(block)
-        heads = VERDICT_HEAD_RE.findall(block)
-        if not actions:
-            continue
-        action = str(actions[-1]).upper()
-        head_sha = normalize_sha(heads[-1] if heads else "")
-        found.append(
-            ThreadVerdict(
-                thread_id=str(match.group("tid") or "").strip(),
-                action=action,
-                head_sha=head_sha,
-                created_at=comment.created_at,
-                login=comment.login,
-                source_commit=normalize_sha(comment.commit_sha),
-                body=block,
-            )
-        )
+    for run in verdict_text_runs(comment.body or ""):
+        blocks: list[tuple[str, list[str]]] = []
+        for line in run:
+            marker = VERDICT_MARKER_LINE_RE.fullmatch(line)
+            if marker:
+                blocks.append((str(marker.group("tid") or "").strip(), []))
+            elif blocks:
+                blocks[-1][1].append(line)
+        for thread_id, body_lines in blocks:
+            verdict = _verdict_from_block(thread_id, body_lines, comment)
+            if verdict is not None:
+                found.append(verdict)
     return tuple(found)
 
 

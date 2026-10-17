@@ -73,7 +73,8 @@ OR-026 through OR-035 extend the release direction: seven launch-critical compat
 OR-021â€“OR-025 clarify the release under `docs/v3`; earlier brainstorming "v2" means this
 milestone. Recursion is the common configurable agent platform across models, harnesses,
 subscriptions, tools, workflows and execution machines. The terminal exposes the initial
-platform; the dedicated graphical application follows later.
+platform. D-038 in `state/DECISIONS.md` supersedes the older GUI/mobile exclusions:
+GUI and mobile clients are to be built as opt-in clients for this release.
 
 Both a small native model-and-tool loop and supported upstream harness execution are release
 requirements. Either works independently when its configured route supports the workflow;
@@ -142,7 +143,7 @@ already prefer, including by reducing unnecessary quota/usage burn:
 
 ## Initial user and deployment
 
-The first user is Lucas. The first deployment is a lightweight coordinator on the existing coordinator host, with heavier work placed on subscriptions, cloud execution, or authenticated registered nodes. The interactive CLI is the canonical local configuration and operation surface; an agent is never required to edit settings. Multiple detachable terminal windows can observe and converse with Head, ARMs and executors without owning their processes. Telegram is an optional interactive surface for Head and ARM conversations. No web, desktop or mobile graphical client is required for v3.
+The first user is Lucas. The first deployment is a lightweight coordinator on the existing coordinator host, with heavier work placed on subscriptions, cloud execution, or authenticated registered nodes. The interactive CLI is the canonical local configuration and operation surface; an agent is never required to edit settings. Multiple detachable terminal windows can observe and converse with Head, ARMs and executors without owning their processes. Telegram is an optional interactive surface for Head and ARM conversations. D-038 in `state/DECISIONS.md` requires GUI and mobile clients to be built as opt-in clients and confirms that D-034 and D-019 supersede older first-release exclusions.
 
 Public usability remains an explicit design requirement. Users should be able to install a useful minimal edition, bring their own official subscriptions or API credentials, select more capable bundles, and retain complete access to human-readable configuration.
 
@@ -204,7 +205,7 @@ are in [PERFORMANCE-PLAN.md](PERFORMANCE-PLAN.md#canonical-optimization-decision
 
 - Reselling inference or becoming a mandatory hosted gateway.
 - Providing a mandatory central plugin marketplace or vendor-controlled authorization service.
-- Shipping a graphical frontend as part of the initial v3 contract.
+- Requiring use of the opt-in GUI or mobile clients.
 - Guaranteeing that unrelated providers share server-side prompt/KV caches.
 - Persisting hidden chain of thought or treating it as required recovery state.
 - Reimplementing Git, provider-native authentication, or every provider's optimized inner agent

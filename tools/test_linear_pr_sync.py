@@ -650,6 +650,16 @@ class WorkflowAndDocsTests(unittest.TestCase):
         self.assertIn("pr-sync", text)
         self.assertIn("shared files", text)
 
+    def test_docs_require_agent_ci_etiquette(self) -> None:
+        text = AGENTS.read_text(encoding="utf-8")
+        self.assertIn("## Agent CI etiquette", text)
+        self.assertIn("Mark the PR ready **once**", text)
+        self.assertIn("GITHUB_TOKEN", text)
+        self.assertIn("even without a real conflict", text)
+        self.assertIn("single-push/no-fetch", text)
+        self.assertIn("owner clears any hold", text)
+        self.assertNotIn("so Devin Review and CI never", text)
+
     def test_workflow_is_light_and_not_a_required_check(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("runs-on: ubuntu-latest", text)
@@ -673,7 +683,9 @@ class WorkflowAndDocsTests(unittest.TestCase):
         self.assertNotRegex(text, r"git push|--force|mergePullRequest")
         ci = CI.read_text(encoding="utf-8")
         self.assertNotIn("linear-pr-sync", ci)
-        self.assertIn("name: linux", ci)
+        # External ordinary/ignored names are executed in test_ci_scheduling.
+        self.assertRegex(ci, r"(?m)^  linux:$")
+        self.assertIn("'ignored-label-linux' || 'linux'", ci)
 
 
 if __name__ == "__main__":

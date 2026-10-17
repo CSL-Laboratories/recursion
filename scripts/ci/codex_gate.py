@@ -28,7 +28,10 @@ DEVIN_REVIEW_LOGIN = "devin-ai-integration[bot]"
 CODEX_REVIEW_LOGIN = "chatgpt-codex-connector[bot]"
 DISPATCH_EVENTS = frozenset({"workflow_dispatch", "repository_dispatch"})
 MENTION_EVENTS = frozenset({"issue_comment", "pull_request_review_comment"})
-VERDICT_RE = re.compile(r"^CODEX-GATE:\s*(FIX|READY|MEDIATE)\s*$", re.MULTILINE)
+# One plain verdict line: no indentation, quotation or trailing content.
+VERDICT_RE = re.compile(r"CODEX-GATE:\s*(FIX|READY|MEDIATE)\s*")
+# Markdown fence delimiter: at most three spaces, then 3+ backticks or tildes.
+FENCE_RE = re.compile(r" {0,3}(`{3,}|~{3,})(.*)")
 SAFE_SHA_RE = re.compile(r"^[0-9a-f]{40}$|^[0-9a-f]{64}$")
 SAFE_PR_RE = re.compile(r"^[1-9][0-9]{0,9}$")
 SAFE_REF_RE = re.compile(r"^(?!.*\.\.)[A-Za-z0-9._/-]+$")
@@ -87,10 +90,35 @@ def acted_marker(sha: str) -> str:
 
 
 def parse_verdict(text: str | None) -> str | None:
+    """Verdict on the final nonblank line, as a plain line outside any code fence.
+
+    AGENTS.md asks Codex to end the review with exactly one CODEX-GATE line, not
+    in a code fence. An indented, quoted or fenced copy is never a verdict, and
+    an earlier plain line cannot lend that status to a later copy: every later
+    nonblank line, fence delimiter or trailing content clears it. Among several
+    plain lines the last one still wins. Trailing blank lines are harmless.
+    """
     if not text:
         return None
-    matches = VERDICT_RE.findall(text)
-    return matches[-1] if matches else None
+    verdict: str | None = None
+    fence: tuple[str, int] | None = None
+    for raw in text.splitlines():
+        if not raw.strip():
+            continue
+        verdict = None
+        delimiter = FENCE_RE.fullmatch(raw)
+        if fence:
+            if (delimiter and delimiter[1][0] == fence[0] and len(delimiter[1]) >= fence[1]
+                    and not delimiter[2].strip()):
+                fence = None
+            continue
+        if delimiter and (delimiter[1][0] != "`" or "`" not in delimiter[2]):
+            fence = (delimiter[1][0], len(delimiter[1]))
+            continue
+        match = VERDICT_RE.fullmatch(raw)
+        if match:
+            verdict = match[1]
+    return verdict
 
 
 def bodies_have(marker: str, bodies: list[str]) -> bool:

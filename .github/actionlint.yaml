@@ -2,6 +2,7 @@
 self-hosted-runner:
   labels:
     - blacksmith-2vcpu-ubuntu-2404
+    - blacksmith-2vcpu-windows-2025
 
 # GitHub supports concurrency.queue; actionlint 1.7.7 does not yet parse it.
 # Remove this exact compatibility exception after upstream PR #654 ships:

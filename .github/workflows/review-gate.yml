@@ -1,0 +1,41 @@
+# Staged diagnostics only. Retain direct Devin Review enforcement.
+# PR-controlled YAML is not a protected replacement authority, even with base checkout.
+# A status event reports on the default branch, so recovery is a manual rerun
+# of the original pull_request run after confirming its head is still current.
+name: review-gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  merge_group:
+    types: [checks_requested]
+
+concurrency:
+  group: review-gate-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.merge_group.head_ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  statuses: read
+  pull-requests: read
+
+jobs:
+  review-gate:
+    name: review-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Checkout base diagnostics
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          persist-credentials: false
+          sparse-checkout: tools/review_gate.py
+          sparse-checkout-cone-mode: false
+      - name: Require authenticated Devin status on exact head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: python3 -X utf8 -B tools/review_gate.py

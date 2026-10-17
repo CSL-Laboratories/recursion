@@ -37,22 +37,27 @@ selecting a task.
 
 ## Your role
 
-Lucas is the final authority and assigns tasks. You are a bounded executor: one task, one
-repository/worktree, explicit allowed paths, explicit non-goals, and one machine-checkable
-acceptance gate. Work inside that boundary. If a task could be read two materially different
-ways, stop and record a blocker in `state/INBOX.md` — do not pick one.
+Founders decide within the authority defined in `CONTROL_PLANE.md`: any founder may decide
+product and implementation questions from research within that scope. Lucas retains the
+reserved decisions and final tie-break; all three founders make the final release decision.
+These instructions do not grant authority beyond that document or accept a pending contract.
+You are a bounded executor: one task, one repository/worktree, explicit allowed paths,
+explicit non-goals, and one machine-checkable acceptance gate. Work inside that boundary.
+If a task could be read two materially different ways, stop and record a blocker in `state/INBOX.md` — do not pick one.
 
 ## Hard rules
 
 1. **Never `git push --force`.** Under any circumstance, in any script, for any reason.
 2. **Never commit to or merge into `master`.** Commit on a review branch and open a
-   PR; Lucas reviews and merges. Name the branch `csl-<N>-<slug>` (for example
-   `csl-26-short-slug`), optionally prefixed with a GitHub username (for example
+   PR for founder review and merge after required reviews and checks. Agents never merge.
+   Name the branch `csl-<N>-<slug>` (for example `csl-26-short-slug`), optionally prefixed with a GitHub username (for example
    `chaandansaini101/csl-26-short-slug`). Put `CSL-N` in the PR title so Linear links
    the issue. pr-lint matches `CSL-[0-9]+` case-sensitively, so a lowercase branch
    name alone does not pass. The `CSL-N` key in the PR title satisfies the check.
-3. **Never modify a protected path** — `CONTROL_PLANE.md`, `ANCHOR.md`, `state/DECISIONS.md`,
-   `.env`, or auth/credential configuration. Propose changes in `state/PROPOSALS.md`.
+3. **Protected paths require a separately recorded founder-approved authoring session**
+   under `CONTROL_PLANE.md`: `CONTROL_PLANE.md`, `ANCHOR.md`, `state/DECISIONS.md`, `.env`,
+   and auth/credential configuration. Outside that explicit scope, propose changes in
+   `state/PROPOSALS.md`; a product task does not authorize them.
 4. **No secrets in tracked files, logs or notifications.**
 5. **Every task needs a parent goal and a machine-checkable gate.** No gate, no work — it
    escalates.
@@ -60,8 +65,12 @@ ways, stop and record a blocker in `state/INBOX.md` — do not pick one.
    candidate; prefer a different model family.
 7. **Generated output without verification is not progress.** If output outpaces review,
    generate less.
-8. **Live provider/game/host actions, spending and quota resets are human-gated.** Ask; never
-   perform them.
+8. **Live provider/game/host actions, spending and quota resets are human-gated.** Agent
+   execution is limited to the developer-approved own-account actions defined in
+   `CONTROL_PLANE.md`, with the route, account and spend ceiling recorded, and only after
+   the R2a permission-profile fix has landed. Lucas's company-resource and spending
+   approvals still apply; quota resets require separate human approval. No live action,
+   accepted contract, live capital or agent merge permission is authorized by these docs.
 
 ## Escalate, don't guess
 

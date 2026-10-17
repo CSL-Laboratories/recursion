@@ -150,7 +150,7 @@ The receipt a command gets back. The outcome alphabet is closed:
 ```text
 WireCommandOutcome@1 = {
   type:           const "WireCommandOutcome@1",
-  command_id:     PublicId,          // the idempotency key presented
+  command_id:     PublicId in cmd:,  // the idempotency key presented
   command_digest: Digest,            // canonical digest of the command received
   outcome:        "accepted" | "duplicate" | "conflict" | "refused",
   refusal:        Refusal            // required iff outcome = "refused", forbidden otherwise

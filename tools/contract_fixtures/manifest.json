@@ -44,7 +44,8 @@
     { "id": "A-18", "path": "adverse/A-18-event-lexical-negzero.json", "target": "wire_event_envelope", "kind": "adverse", "expect": "reject", "note": "strict-decode: lexical -0" },
     { "id": "A-19", "path": "adverse/A-19-outcome-conflict-with-refusal.json", "target": "wire_command_outcome", "kind": "adverse", "expect": "reject", "note": "conflict outcome carries a refusal block — journal-level outcome, never refused" },
     { "id": "A-20", "path": "adverse/A-20-outcome-duplicate-with-refusal.json", "target": "wire_command_outcome", "kind": "adverse", "expect": "reject", "note": "duplicate outcome carries a refusal block — refusal only on refused" },
-    { "id": "A-21", "path": "adverse/A-21-identity-invalid-utf8.json", "target": "wire_identity_ref", "kind": "adverse", "expect": "reject", "note": "strict-decode: raw bytes are not valid UTF-8" }
+    { "id": "A-21", "path": "adverse/A-21-identity-invalid-utf8.json", "target": "wire_identity_ref", "kind": "adverse", "expect": "reject", "note": "strict-decode: raw bytes are not valid UTF-8" },
+    { "id": "A-22", "path": "adverse/A-22-outcome-non-cmd-id.json", "target": "wire_command_outcome", "kind": "adverse", "expect": "reject", "note": "command_id outside the cmd: namespace" }
   ],
   "sequences": [
     { "id": "S-01", "path": "sequences/S-01-refused-retry-verbatim.json", "kind": "journal-replay", "note": "identical retry of a journaled refused command replays the recorded receipt verbatim — never re-evaluated" },

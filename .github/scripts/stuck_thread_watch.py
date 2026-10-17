@@ -56,6 +56,9 @@ HTML_TAG_RE = re.compile(
 HTML_VOID_TAGS = frozenset(
     "area base br col embed hr img input link meta param source track wbr".split()
 )
+# The Code Review Rules gate line, as scripts/ci/codex_gate.py parses it. The
+# verdict section may end with one; it never authorizes anything here.
+GATE_LINE_RE = re.compile(r" {0,3}CODEX-GATE:\s*(FIX|READY|MEDIATE)\s*")
 VERDICT_ACTION_RE = re.compile(
     r"^CODEX-THREAD:\s*(RESOLVE|DECIDE|MISSING|AMBIGUOUS)\s*$",
     re.IGNORECASE | re.MULTILINE,
@@ -451,7 +454,9 @@ def _verdict_section(lines: list[str]) -> list[tuple[str, str, str]] | None:
     """Parse the canonical verdict section, or None if any line breaks it.
 
     The section is one or more contiguous marker / action / HEAD triples,
-    separated by blank lines only, running to the end of the message.
+    separated by blank lines only, running to the end of the message. After
+    the last triple it may carry exactly one ``CODEX-GATE:`` line, followed by
+    blank lines only.
     """
     blocks: list[tuple[str, str, str]] = []
     index = 0
@@ -459,6 +464,9 @@ def _verdict_section(lines: list[str]) -> list[tuple[str, str, str]] | None:
         if not lines[index].strip():
             index += 1
             continue
+        if blocks and GATE_LINE_RE.fullmatch(lines[index].rstrip()):
+            rest = lines[index + 1:]
+            return blocks if all(not line.strip() for line in rest) else None
         triple = [line.rstrip() for line in lines[index:index + 3]]
         if len(triple) < 3:
             return None
@@ -480,7 +488,8 @@ def parse_thread_verdicts(comment: Comment) -> tuple[ThreadVerdict, ...]:
     """Parse per-thread rulings from one Codex comment/review.
 
     Authorization is a whole-message property. Prose may precede the first
-    standalone marker line (unless it leaves a fence or HTML block open); from
+    standalone marker line (unless it leaves a fence or HTML block open, or
+    holds a ``CODEX-GATE:`` line, which belongs after the section); from
     that line to the end the message must be exactly the canonical verdict
     section (see ``_verdict_section``). Any other line there -- prose, HTML,
     quotes, fences, bullets, a split or repeated block -- makes the whole
@@ -510,7 +519,11 @@ def parse_thread_verdicts(comment: Comment) -> tuple[ThreadVerdict, ...]:
             body=text,
         )
 
-    blocks = None if _open_markup_before(lines[:first]) else _verdict_section(lines[first:])
+    prose = lines[:first]
+    if _open_markup_before(prose) or any(GATE_LINE_RE.fullmatch(line.rstrip()) for line in prose):
+        blocks = None
+    else:
+        blocks = _verdict_section(lines[first:])
     if blocks is None:
         # AMBIGUOUS is an internal non-authorizing result, never permission to act.
         mentioned = dict.fromkeys(
@@ -798,12 +811,15 @@ def mediation_body(
         f"Thread: {code_location(loc)}{(' — ' + thread_url) if thread_url else ''}\n"
         f"{reason_line}\n"
         f"{linear_bit}"
-        "Finish your review with the verdict section and nothing after it: for "
-        "each thread you were asked about, exactly three plain lines — the marker "
-        "line, `CODEX-THREAD: RESOLVE|DECIDE|MISSING|AMBIGUOUS`, `HEAD: <full "
-        "40-character SHA>` — separated by blank lines only. No code fences, HTML, "
-        "quotes, bullets or commentary in or after that section; anything else "
-        "makes the whole verdict non-authorizing. Copy the thread id exactly:\n\n"
+        "Finish your review with the verdict section: for each thread you were "
+        "asked about, exactly three plain lines — the marker line, "
+        "`CODEX-THREAD: RESOLVE|DECIDE|MISSING|AMBIGUOUS`, `HEAD: <full "
+        "40-character SHA>` — separated by blank lines only. You may end with "
+        "exactly one `CODEX-GATE:` line after the last triple, as the Code Review "
+        "Rules require; nothing else may follow the verdict section. No code "
+        "fences, HTML, quotes, bullets or commentary in or after that section; "
+        "anything else makes the whole verdict non-authorizing. Copy the thread "
+        "id exactly:\n\n"
         f"{verdict_marker(thread.id)}\n"
         "CODEX-THREAD: RESOLVE|DECIDE|MISSING|AMBIGUOUS\n"
         "HEAD: <full 40-character commit SHA of the PR head you inspected>\n\n"

@@ -1584,10 +1584,12 @@ class VerdictAndResolveTests(unittest.TestCase):
         body = mod.mediation_body(pull(threads=[t]), t, cfg(), reason="stuck-human")
         flat = " ".join(body.split())
         self.assertIn(
-            "Finish your review with the verdict section and nothing after it: for each "
-            "thread you were asked about, exactly three plain lines — the marker line, "
+            "Finish your review with the verdict section: for each thread you were asked "
+            "about, exactly three plain lines — the marker line, "
             "`CODEX-THREAD: RESOLVE|DECIDE|MISSING|AMBIGUOUS`, `HEAD: <full 40-character SHA>` "
-            "— separated by blank lines only. No code fences, HTML, quotes, bullets or "
+            "— separated by blank lines only. You may end with exactly one `CODEX-GATE:` "
+            "line after the last triple, as the Code Review Rules require; nothing else may "
+            "follow the verdict section. No code fences, HTML, quotes, bullets or "
             "commentary in or after that section; anything else makes the whole verdict "
             "non-authorizing.",
             flat,
@@ -1600,10 +1602,74 @@ class VerdictAndResolveTests(unittest.TestCase):
         template = body[body.index(mod.verdict_marker("PRRT_abc")):].split("\n")[:3]
         self.assertEqual(template[1], "CODEX-THREAD: RESOLVE|DECIDE|MISSING|AMBIGUOUS")
         filled = "\n".join([template[0], "CODEX-THREAD: RESOLVE", f"HEAD: {HEAD}"])
-        self.assertEqual(
-            [(v.thread_id, v.action) for v in mod.parse_thread_verdicts(comment(CODEX, filled))],
-            [("PRRT_abc", "RESOLVE")],
+        for reply in (filled, filled + "\n\nCODEX-GATE: READY\n"):
+            self.assertEqual(
+                [(v.thread_id, v.action) for v in mod.parse_thread_verdicts(comment(CODEX, reply))],
+                [("PRRT_abc", "RESOLVE")],
+                reply,
+            )
+
+    def test_single_trailing_gate_line_after_verdict_section_still_resolves(self) -> None:
+        prose = "The fix is already on head.\n\n"
+        block = verdict_block("PRRT_1")
+        for gate in ("READY", "MEDIATE", "FIX"):
+            self._assert_resolves(prose + block + f"CODEX-GATE: {gate}\n")
+        self._assert_resolves((prose + block + "CODEX-GATE: READY\n").replace("\n", "\r\n"))
+        self._assert_resolves(prose + block + "\n\nCODEX-GATE: READY  \n\n\n")
+        self._assert_resolves(prose + block + "   CODEX-GATE: READY")
+        body = (
+            prose
+            + verdict_block("PRRT_1")
+            + "\n"
+            + verdict_block("PRRT_2")
+            + "\n"
+            + verdict_block("PRRT_3", "DECIDE")
+            + "\nCODEX-GATE: MEDIATE\n"
         )
+        reasons, gh, counters = self._multi_thread_scan(body)
+        self.assertEqual(reasons, ["resolve", "resolve", "decide"])
+        self.assertEqual(gh.resolves, ["PRRT_1", "PRRT_2"])
+        self.assertEqual(counters.resolved, 2)
+
+    def test_gate_line_does_not_authorize_or_alter_verdicts(self) -> None:
+        body = verdict_block("PRRT_1", "DECIDE") + "CODEX-GATE: READY\n"
+        parsed = mod.parse_thread_verdicts(comment(CODEX, body, hours_ago=0.1))
+        self.assertEqual([(v.thread_id, v.action, v.head_sha) for v in parsed], [("PRRT_1", "DECIDE", HEAD)])
+        reason, gh, counters = self._real_scan(body)
+        self.assertEqual(reason, "decide")
+        self.assertEqual(gh.resolves, [])
+        self.assertEqual(counters.resolved, 0)
+        stale = verdict_block("PRRT_1", "RESOLVE", STALE) + "CODEX-GATE: READY\n"
+        self.assertEqual(self._real_scan(stale)[0], "stale-sha")
+        for lone in ("CODEX-GATE: READY\n", "Summary.\n\nCODEX-GATE: READY\n"):
+            self.assertEqual(mod.parse_thread_verdicts(comment(CODEX, lone)), ())
+            self._assert_no_resolve(lone)
+        before = "CODEX-GATE: READY\n\n" + verdict_block("PRRT_1")
+        parsed = mod.parse_thread_verdicts(comment(CODEX, before, hours_ago=0.1))
+        self.assertEqual([(v.action, v.head_sha) for v in parsed], [("AMBIGUOUS", "")])
+        self._assert_no_resolve(before)
+
+    def test_second_or_malformed_trailing_gate_line_is_non_authorizing(self) -> None:
+        block = verdict_block("PRRT_1")
+        bodies = [
+            block + "CODEX-GATE: READY\nCODEX-GATE: READY\n",
+            block + "CODEX-GATE: READY\n\nCODEX-GATE: MEDIATE\n",
+            block + "CODEX-GATE: READY\n\n" + verdict_block("PRRT_2"),
+            block + "CODEX-GATE: READY!\n",
+            block + "CODEX-GATE: FIXED\n",
+            block + "CODEX-GATE: ready\n",
+            block + "    CODEX-GATE: READY\n",
+            block + "```\nCODEX-GATE: READY\n```\n",
+            block + "> CODEX-GATE: READY\n",
+            block + "<pre>CODEX-GATE: READY</pre>\n",
+            block + "CODEX-GATE: READY\nThanks!\n",
+            block + "Thanks!\nCODEX-GATE: READY\n",
+        ]
+        for body in bodies:
+            with self.subTest(body=body):
+                parsed = mod.parse_thread_verdicts(comment(CODEX, body, hours_ago=0.1))
+                self.assertTrue(parsed, body)
+                self._assert_no_resolve(body)
 
     def test_unread_check_page_is_not_green(self) -> None:
         self.assertFalse(

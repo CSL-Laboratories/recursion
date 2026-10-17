@@ -15,7 +15,7 @@ assert_tests_accounted fails if a test-like file is neither run nor excluded.
 
 Path filter: when CI_BASE_SHA is set (PR base or push-before), a docs-only
 diff skips the contract-test suite but still runs whitespace_check and
-check_public_scope. --force always runs the suite.
+check_public_scope plus pinned-path EOL policy. --force always runs the suite.
 """
 from __future__ import annotations
 
@@ -188,7 +188,7 @@ def decide_run_full(force: bool) -> bool:
         paths = changed_paths(base)
         print(
             f"docs-only diff against {base[:12]} ({len(paths)} paths); "
-            "skipping suite, running public-scope and whitespace",
+            "skipping suite, running public-scope, whitespace and pinned EOL",
             flush=True,
         )
         return False
@@ -437,6 +437,7 @@ def run_lightweight() -> None:
     """Repository-wide checks that must run even for docs-only diffs."""
     whitespace_check()
     run_program(["tools/check_public_scope.py"])
+    run_program(["tools/check_program_control.py", "--pinned-eol-only"])
 
 
 def run_suite() -> None:

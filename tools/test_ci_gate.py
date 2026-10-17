@@ -120,7 +120,10 @@ class LightweightControlTests(unittest.TestCase):
         ) as run_program:
             ci_gate.run_lightweight()
             whitespace.assert_called_once_with()
-            run_program.assert_called_once_with(["tools/check_public_scope.py"])
+            self.assertEqual(run_program.call_args_list, [
+                mock.call(["tools/check_public_scope.py"]),
+                mock.call(["tools/check_program_control.py", "--pinned-eol-only"]),
+            ])
 
     def test_docs_only_main_runs_public_scope_not_suite(self) -> None:
         with mock.patch.object(ci_gate, "decide_run_full", return_value=False), mock.patch.object(

@@ -105,8 +105,10 @@ WireIdentityRef@1 = {
 - `id` is stable across storage moves and endpoint changes; `version` + `content_digest`
   pin the exact revision.
 - Command idempotency uses the same `PublicId` grammar under the `cmd:` namespace; a
-  canonically identical command replays its prior outcome, a conflicting reuse is
-  refused (`duplicate-command-conflict`), matching the M1B duplicate rule.
+  canonically identical command replays its prior outcome (`duplicate`); a
+  conflicting reuse is answered `conflict` — the collision M1B reports as
+  `duplicate-command-conflict`, surfaced here outcome-level rather than as a
+  refusal reason.
 
 ### `WireEventEnvelope@1` — event vocabulary
 
@@ -175,7 +177,6 @@ Closed `ReasonCode` registry (draft — extensions require a vocabulary revision
 | Code | Meaning | Default class |
 |---|---|---|
 | `stale-epoch` | epoch precondition no longer current | retryable after resync |
-| `duplicate-command-conflict` | conflicting reuse of a command id | permanent |
 | `replay-gap-continuation` | sequence gap in an event stream | permanent |
 | `authority-mismatch` | grant/authority digest does not match active | permanent |
 | `capability-denied` | requested capability not granted | permanent |
@@ -262,7 +263,6 @@ matters for O3–O5; `WireCommandOutcome@1` covers admission only — `accepted`
 
 - `PublicId` namespace registry ownership and collision rules.
 - Whether `emitted_at` remains optional at freeze or is dropped outright.
-- Whether `conflict` needs a separate reason code or stays outcome-level.
 - Whether event identity needs an explicit `stream_epoch` field so readers can
   distinguish a restarted emitter's `event_id`/`sequence` space from a duplicate
   without inspecting `stream_id` history.

@@ -6,7 +6,7 @@ Issue: [CSL-238](https://linear.app/csl-laboratories/issue/CSL-238) · Parent:
 
 **Status: draft pending rule-H acceptance.** These fixtures exercise a proposed
 vocabulary; they are not admitted product contract until a rule-H human receipt
-accepts the exact spec + manifest digest on CSL-238. Provider-free data only — no
+accepts the exact spec + schema + manifest digest on CSL-238. Provider-free data only — no
 transport, no host effects.
 
 ## Layout

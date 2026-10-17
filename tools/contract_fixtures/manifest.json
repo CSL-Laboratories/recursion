@@ -23,6 +23,7 @@
     { "id": "P-06", "path": "positive/P-06-outcome-refused-retryable.json", "target": "wire_command_outcome", "kind": "positive", "expect": "accept" },
     { "id": "P-07", "path": "positive/P-07-outcome-duplicate.json", "target": "wire_command_outcome", "kind": "positive", "expect": "accept" },
     { "id": "P-08", "path": "positive/P-08-version-advertisement.json", "target": "wire_version_advertisement", "kind": "positive", "expect": "accept" },
+    { "id": "P-09", "path": "positive/P-09-outcome-conflict.json", "target": "wire_command_outcome", "kind": "positive", "expect": "accept", "note": "conflict outcome carries no refusal block" },
     { "id": "A-01", "path": "adverse/A-01-identity-extra-field.json", "target": "wire_identity_ref", "kind": "adverse", "expect": "reject", "note": "additionalProperties violation" },
     { "id": "A-02", "path": "adverse/A-02-identity-unknown-version.json", "target": "wire_identity_ref", "kind": "adverse", "expect": "reject", "note": "unknown @N record version" },
     { "id": "A-03", "path": "adverse/A-03-identity-bad-id.json", "target": "wire_identity_ref", "kind": "adverse", "expect": "reject", "note": "PublicId grammar violation" },

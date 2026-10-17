@@ -1,0 +1,11 @@
+{
+  "type": "WireEventEnvelope@1",
+  "event_id": "evt:2026-10-17-0002",
+  "stream_id": "stream:goal-7f3",
+  "sequence": 43,
+  "event_type": "ArmRun.PauseRequested",
+  "schema_ref": "PauseRequestedPayload@2",
+  "payload_digest": "sha256:7f4eb0c059e5c26dbb3c4ffdb73011c234e618d6b8f02e7f1c8908dbbc5be053",
+  "emitted_at": "2026-10-17T07:30:00Z",
+  "causation_id": "cmd:admit-0091"
+}

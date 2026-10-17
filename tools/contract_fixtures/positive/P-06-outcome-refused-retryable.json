@@ -1,0 +1,11 @@
+{
+  "type": "WireCommandOutcome@1",
+  "command_id": "cmd:admit-0092",
+  "command_digest": "sha256:26142e30e426ee350826d8b5efb7d39e6318692f8278580aff9794662039f70a",
+  "outcome": "refused",
+  "refusal": {
+    "reason_code": "paused",
+    "refusal_class": "retryable",
+    "retry_after_seconds": 30
+  }
+}

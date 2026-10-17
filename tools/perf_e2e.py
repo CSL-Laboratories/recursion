@@ -141,11 +141,11 @@ def _validate_workload(payload: dict) -> None:
         except ValueError as exc:
             raise PerfE2EError(f"{name} sha256_lf is not hex") from exc
     hosts = payload.get("hosts")
-    if not isinstance(hosts, list) or {row.get("id") for row in hosts} < {
+    if not isinstance(hosts, list) or not {
         "linux-x64",
         "windows-11-x64",
         "macos-arm",
-    }:
+    } <= {row.get("id") for row in hosts}:
         raise PerfE2EError("workload hosts must include linux-x64, windows-11-x64, and macos-arm")
     for host in hosts:
         if host.get("measured") is not False:
@@ -247,10 +247,27 @@ def _times() -> object | None:
         return None
 
 
-def _rss() -> int | None:
-    if resource is None:
+def _rss(usage) -> int | None:
+    # usage is the per-child rusage from os.wait4. RUSAGE_CHILDREN is a
+    # process-wide high-water mark and would leak earlier children's peaks.
+    if resource is None or usage is None:
         return None
-    return int(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss)
+    return int(usage.ru_maxrss)
+
+
+def _reap(proc, deadline: float):
+    """Wait for proc and return its own rusage, or None where wait4 is absent."""
+    if not hasattr(os, "wait4"):
+        proc.wait(timeout=max(deadline - time.monotonic(), 0.001))
+        return None
+    while True:
+        pid, status, usage = os.wait4(proc.pid, os.WNOHANG)
+        if pid:
+            proc.returncode = os.waitstatus_to_exitcode(status)
+            return usage
+        if time.monotonic() > deadline:
+            raise subprocess.TimeoutExpired(proc.args, 0)
+        time.sleep(0.001)
 
 
 def _rss_unit() -> str | None:
@@ -310,14 +327,15 @@ def _spawn_replay(payload: bytes, *, cwd: str, timeout: int):
             if line == b"":
                 break
             chunks.append(line)
-            if first_at is None and line.strip():
+            if first_at is None and line.strip() and not line.lstrip().startswith(b"#"):
                 first_at = time.perf_counter_ns()
         drain_at = time.perf_counter_ns()
         err = proc.stderr.read()
         try:
-            rc = proc.wait(timeout=timeout)
+            usage = _reap(proc, time.monotonic() + timeout)
         except subprocess.TimeoutExpired as exc:
             raise PerfE2EError("replay child timed out") from exc
+        rc = proc.returncode
     finally:
         if proc is not None and proc.poll() is None:
             proc.kill()
@@ -333,7 +351,7 @@ def _spawn_replay(payload: bytes, *, cwd: str, timeout: int):
         "first_event_ns": first_at - t_spawn1,
         "stream_drain_ns": drain_at - first_at,
         "stdout": text,
-        "host": _host_sample(times_before, _times(), _rss()),
+        "host": _host_sample(times_before, _times(), _rss(usage)),
     }
 
 

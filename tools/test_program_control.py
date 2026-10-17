@@ -6,6 +6,7 @@ import copy
 import importlib.util
 import json
 import hashlib
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -1533,6 +1534,83 @@ class ProgramControlTests(unittest.TestCase):
         self.promote()
         self.data["proposals"][-1]["scope"].append(" ")
         self.assert_rejected("requires explicit scope")
+
+    def test_pinned_enumeration_covers_contracts_and_manifest_payloads(self):
+        paths = checker.sha256_pinned_paths(self.data, ROOT)
+        for contract in self.data["contracts"]:
+            self.assertIn(contract["path"], paths)
+        # Intake payloads pinned by a SHA256SUMS manifest are included; the
+        # manifest and intake script themselves are not pinned payload paths.
+        self.assertIn("docs/v3/research-lane/packet-f-raudit-20261002/README.md", paths)
+        self.assertIn("docs/v3/research-lane/packet-f-raudit-20261002/corpus/report.md", paths)
+        self.assertNotIn("docs/v3/research-lane/packet-f-raudit-20261002/SHA256SUMS.txt", paths)
+        self.assertNotIn("docs/v3/research-lane/packet-f-raudit-20261002/check_intake.py", paths)
+
+    def test_pinned_enumeration_reads_manifest_entries_from_any_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            packet = root / "docs/v3/research-lane/fresh-packet"
+            packet.mkdir(parents=True)
+            (packet / "SHA256SUMS.txt").write_text(
+                "a" * 64 + "  payload.md\n"
+                "not a sum line\n"
+                "b" * 64 + " *blob.bin\n",
+                encoding="utf-8")
+            receipts = root / "docs/audits/receipts-1"
+            receipts.mkdir(parents=True)
+            (receipts / "r1.json").write_text("{}", encoding="utf-8")
+            paths = checker.sha256_pinned_paths({"contracts": [{"path": "x/y.md"}]}, root)
+            self.assertIn("x/y.md", paths)
+            self.assertIn("docs/v3/research-lane/fresh-packet/payload.md", paths)
+            self.assertIn("docs/v3/research-lane/fresh-packet/blob.bin", paths)
+            self.assertIn("docs/audits/receipts-1/r1.json", paths)
+            self.assertNotIn("docs/v3/research-lane/fresh-packet/SHA256SUMS.txt", paths)
+
+    def test_eol_guard_passes_on_the_checked_in_tree(self):
+        self.assertEqual(checker.pinned_eol_errors(self.data, ROOT), [])
+
+    def test_eol_guard_flags_a_pinned_path_outside_lf_coverage(self):
+        # tools/check_program_control.py resolves eol=unspecified on this tree.
+        data = copy.deepcopy(self.data)
+        data["contracts"][0]["path"] = "tools/check_program_control.py"
+        errors = checker.pinned_eol_errors(data, ROOT)
+        self.assertTrue(any("tools/check_program_control.py" in error and "eol" in error
+                            for error in errors), errors)
+
+    def test_eol_guard_flags_new_uncovered_pins_in_a_git_worktree(self):
+        # The CSL-225 scenario: a sha256-pinned path lands without eol=lf.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+            packet = root / "docs/v3/research-lane/fresh-packet"
+            packet.mkdir(parents=True)
+            (packet / "payload.md").write_text("x\n", encoding="utf-8")
+            (packet / "SHA256SUMS.txt").write_text(
+                "a" * 64 + "  payload.md\n", encoding="utf-8")
+            errors = checker.pinned_eol_errors({"contracts": []}, root)
+            self.assertTrue(any("payload.md" in error and "eol" in error
+                                for error in errors), errors)
+
+    def test_eol_guard_accepts_lf_and_binary_pins_in_a_git_worktree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+            packet = root / "docs/v3/research-lane/fresh-packet"
+            packet.mkdir(parents=True)
+            (packet / "payload.md").write_text("x\n", encoding="utf-8")
+            (packet / "blob.bin").write_bytes(b"\x00\x01")
+            (packet / "SHA256SUMS.txt").write_text(
+                "a" * 64 + "  payload.md\n"
+                "b" * 64 + "  blob.bin\n",
+                encoding="utf-8")
+            (root / ".gitattributes").write_text(
+                "docs/**/*.md text eol=lf\ndocs/**/*.bin binary\n", encoding="utf-8")
+            self.assertEqual(checker.pinned_eol_errors({"contracts": []}, root), [])
+
+    def test_known_gap_entries_are_still_pinned_and_uncovered(self):
+        paths = set(checker.sha256_pinned_paths(self.data, ROOT))
+        self.assertTrue(checker.PINNED_EOL_KNOWN_GAPS)
+        self.assertTrue(checker.PINNED_EOL_KNOWN_GAPS <= paths)
 
 
 if __name__ == "__main__":

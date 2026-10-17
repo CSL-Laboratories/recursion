@@ -10,9 +10,11 @@ verification, product qualification, or release approval.
 """
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import re
+import subprocess
 import sys
 from datetime import date
 from pathlib import Path
@@ -32,6 +34,24 @@ CONTINUATION_FIELDS = {"evidence_obtained", "remaining_uncertainty", "expected_q
 DONE = {"done", "accepted", "verified"}
 STAGES = {"intake": 0, "research": 1, "decision": 2, "development": 3,
           "verification": 4, "integration": 5, "release": 6}
+SUM_LINE = re.compile(r"^([0-9a-fA-F]{64})\s+\*?(.+)$")
+
+# sha256-pinned text paths that landed before this guard and still lack
+# `.gitattributes` `text eol=lf` coverage (`.gitattributes` is a protected
+# path, so the missing rules are flagged for the repo owner on CSL-226).
+# Entries must leave this set as the rules land: a covered or unpinned
+# entry is stale and fails the check.
+PINNED_EOL_KNOWN_GAPS = frozenset({
+    "docs/v3/research-lane/overnight-20261002/semantic-guard-research/SEMANTIC-GUARD-COVERAGE.md",
+    "docs/v3/research-lane/overnight-20261002/semantic-guard-research/coverage-matrix.json",
+    "docs/v3/research-lane/overnight-20261002/semantic-validation-hardening/SEMANTIC-VALIDATION-HARDENING.md",
+    "docs/v3/research-lane/overnight-20261002/semantic-validation-hardening/SOURCE-REPORT-PINS.md",
+    "docs/v3/research-lane/shared-contracts-20261002/README.md",
+    "docs/v3/research-lane/shared-contracts-20261002/Recursion_Harness_Orchestration_Performance.md",
+    "docs/v3/research-lane/shared-contracts-20261002/Recursion_Prompt_Plugin_Skill_Architecture.md",
+    "docs/v3/research-lane/shared-contracts-20261002/Recursion_Shared_Contract_Reconciliation.md",
+    "docs/v3/research-lane/shared-contracts-20261002/synthetic_benchmark_corpus.json",
+})
 
 
 def digest(value: Any) -> str:
@@ -262,6 +282,91 @@ def reference_errors(data: dict[str, Any]) -> list[str]:
     return errors
 
 
+def sha256_pinned_paths(data: dict[str, Any], root: Path) -> list[str]:
+    """Repo-relative text paths whose delivered bytes are sha256-pinned.
+
+    Sources: program contracts hashed by this validator, intake SHA256SUMS
+    manifest payloads, and sealed receipts (byte-level evidence under
+    docs/audits). Whole-packet MANIFEST.json inventories are excluded: they
+    pin binary payloads where end-of-line conversion does not apply.
+    """
+    paths: list[str] = []
+    for contract in data.get("contracts", []):
+        if isinstance(contract, dict) and text_present(contract.get("path")):
+            paths.append(contract["path"])
+    for manifest in sorted(root.glob("**/SHA256SUMS.txt")):
+        if ".git" in manifest.relative_to(root).parts:
+            continue
+        for line in manifest.read_text(encoding="utf-8", errors="replace").splitlines():
+            match = SUM_LINE.fullmatch(line.strip())
+            if match:
+                entry = manifest.parent / match.group(2).strip()
+                paths.append(entry.relative_to(root).as_posix())
+    audits = root / "docs/audits"
+    if audits.is_dir():
+        paths.extend(path.relative_to(root).as_posix()
+                     for path in sorted(audits.rglob("*")) if path.is_file())
+    return sorted(set(paths))
+
+
+@functools.lru_cache(maxsize=None)
+def _git_check_attr(root: str, paths: tuple[str, ...]) -> tuple[dict[str, dict[str, str]], str]:
+    """One batched `git check-attr` call over every pinned path.
+
+    Returns a per-path attribute map, or an error string when git cannot run
+    in the given root (fail closed: the attribute of a pinned path is then
+    unverifiable). Results are cached per root and path set because callers
+    invoke this many times over an unchanged tree.
+    """
+    if not paths:
+        return {}, ""
+    try:
+        result = subprocess.run(
+            ["git", "-C", root, "-c", "core.quotePath=false",
+             "check-attr", "text", "eol", "--", *paths],
+            capture_output=True, text=True, timeout=60, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {}, f"git check-attr failed: {exc}"
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        return {}, f"git check-attr failed: {detail}"
+    resolved: dict[str, dict[str, str]] = {}
+    for line in result.stdout.splitlines():
+        parts = line.rsplit(": ", 2)
+        if len(parts) == 3 and parts[1] in {"text", "eol"}:
+            resolved.setdefault(parts[0], {})[parts[1]] = parts[2]
+    return resolved, ""
+
+
+def pinned_eol_errors(data: dict[str, Any], root: Path) -> list[str]:
+    """Assert every sha256-pinned text path resolves `eol=lf` (or is explicitly
+    binary via `-text`) so cross-platform checkouts cannot deliver CRLF bytes
+    against the recorded digest. CSL-225's Windows-only digest break is the
+    failure this guards against.
+    """
+    paths = sha256_pinned_paths(data, root)
+    resolved, failure = _git_check_attr(str(root), tuple(paths))
+    if failure:
+        return [failure]
+    errors: list[str] = []
+    for path in paths:
+        attrs = resolved.get(path)
+        if attrs is None:
+            errors.append(f"{path} missing from git check-attr output")
+            continue
+        covered = attrs.get("eol") == "lf" or attrs.get("text") == "unset"
+        if path in PINNED_EOL_KNOWN_GAPS:
+            if covered:
+                errors.append(f"{path} known eol gap is covered: remove it from PINNED_EOL_KNOWN_GAPS")
+        elif not covered:
+            errors.append(f"{path} sha256-pinned path lacks eol=lf "
+                          f"(git check-attr eol: {attrs.get('eol')})")
+    for path in sorted(PINNED_EOL_KNOWN_GAPS - set(paths)):
+        errors.append(f"{path} known eol gap is no longer pinned: "
+                      "remove it from PINNED_EOL_KNOWN_GAPS")
+    return errors
+
+
 def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
     errors: list[str] = []
     if not isinstance(data, dict):
@@ -346,6 +451,8 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
             errors.append(f"{contract_id} has invalid status")
         if type(contract.get("revision")) is not int or contract["revision"] < 1:
             errors.append(f"{contract_id} revision must be a positive integer")
+
+    errors.extend(pinned_eol_errors(data, root))
 
     def bindings_match(bindings: Any, contract_ids: list[str]) -> bool:
         return (isinstance(bindings, list) and len(bindings) == len(contract_ids)

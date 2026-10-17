@@ -49,9 +49,9 @@ VERDICT_MARKER_RE = re.compile(
     re.IGNORECASE,
 )
 INLINE_CODE_RE = re.compile(r"(`+)[^`]*?\1")
-HTML_TAG_RE = re.compile(
-    r"<(?P<close>/?)(?P<name>[A-Za-z][A-Za-z0-9-]*)(?=[\s/>])[^>]*?(?P<self>/?)>"
-)
+HTML_TAG_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9-]*")
+HTML_ATTR_NAME_RE = re.compile(r"[A-Za-z_:][A-Za-z0-9_.:-]*")
+HTML_UNQUOTED_ATTR_RE = re.compile(r"""[^\s"'=<>`]+""")
 # CommonMark HTML-block raw constructs that continue to a closer or EOF
 # (spec 4.6 types 2–5): comment, processing instruction, declaration, CDATA.
 HTML_COMMENT_OPEN = "<!--"
@@ -461,7 +461,9 @@ def _html_constructs_open(visible: str) -> bool:
     unrecognized ``<`` (for example ``a < b``) is not an opener. Matching
     CommonMark 4.6 types 2–5: ``<!--`` / ``-->``, ``<?`` / ``?>``, ``<!`` +
     ASCII letter / ``>``, ``<![CDATA[`` / ``]]>``. Tags keep the ordered
-    stack already used for unmatched and mis-nested closes.
+    stack already used for unmatched and mis-nested closes. Quoted
+    attribute values are scanned as CommonMark 6.6, so ``>`` or ``/>``
+    inside quotes cannot self-close the opener.
     """
     stack: list[str] = []
     index = 0
@@ -495,22 +497,114 @@ def _html_constructs_open(visible: str) -> bool:
                 return True
             index = end + 1
             continue
-        tag = HTML_TAG_RE.match(visible, lt)
+        tag = _html_tag_at(visible, lt)
+        if tag == "unclosed":
+            return True
         if tag:
-            name = tag.group("name").lower()
-            if tag.group("self") or name in HTML_VOID_TAGS:
-                index = tag.end()
+            end, name, close, empty = tag
+            if empty or name in HTML_VOID_TAGS:
+                index = end
                 continue
-            if not tag.group("close"):
+            if not close:
                 stack.append(name)
             elif not stack or stack[-1] != name:
                 return True
             else:
                 stack.pop()
-            index = tag.end()
+            index = end
             continue
         index = lt + 1
     return bool(stack)
+
+
+def _skip_html_tag_space(visible: str, index: int) -> int:
+    """Skip spaces, tabs, and at most one line ending (CommonMark 6.6)."""
+    length = len(visible)
+    saw_break = False
+    while index < length:
+        char = visible[index]
+        if char in " \t":
+            index += 1
+            continue
+        if char == "\r" and not saw_break:
+            saw_break = True
+            index += 1
+            if index < length and visible[index] == "\n":
+                index += 1
+            continue
+        if char == "\n" and not saw_break:
+            saw_break = True
+            index += 1
+            continue
+        break
+    return index
+
+
+def _html_tag_at(
+    visible: str, lt: int
+) -> tuple[int, str, bool, bool] | str | None:
+    """Parse one CommonMark open/close tag at *lt*, or None / ``unclosed``.
+
+    Quoted attribute values may contain ``>`` and ``/>``. A first-``>``
+    scan would treat those as the tag end and leave an echoed RESOLVE
+    authorizing. An opener with no closer, or a quote that never ends,
+    is ``unclosed`` so the rest of the prose fails closed.
+    """
+    length = len(visible)
+    index = lt + 1
+    if index >= length:
+        return None
+    close = visible[index] == "/"
+    if close:
+        index += 1
+    name_match = HTML_TAG_NAME_RE.match(visible, index)
+    if not name_match:
+        return None
+    index = name_match.end()
+    empty = False
+    if close:
+        index = _skip_html_tag_space(visible, index)
+        if index >= length:
+            return "unclosed"
+        if visible[index] != ">":
+            return None
+        return (index + 1, name_match.group(0).lower(), True, False)
+    while True:
+        after_space = _skip_html_tag_space(visible, index)
+        if after_space >= length:
+            return "unclosed"
+        if visible[after_space] == ">":
+            return (after_space + 1, name_match.group(0).lower(), False, empty)
+        if visible[after_space] == "/":
+            slash = after_space + 1
+            if slash >= length:
+                return "unclosed"
+            if visible[slash] == ">":
+                return (slash + 1, name_match.group(0).lower(), False, True)
+            return None
+        if after_space == index:
+            return None
+        index = after_space
+        attr = HTML_ATTR_NAME_RE.match(visible, index)
+        if not attr:
+            return None
+        index = attr.end()
+        after_eq = _skip_html_tag_space(visible, index)
+        if after_eq < length and visible[after_eq] == "=":
+            index = _skip_html_tag_space(visible, after_eq + 1)
+            if index >= length:
+                return "unclosed"
+            quote = visible[index]
+            if quote in "\"'":
+                end = visible.find(quote, index + 1)
+                if end < 0:
+                    return "unclosed"
+                index = end + 1
+            else:
+                value = HTML_UNQUOTED_ATTR_RE.match(visible, index)
+                if not value:
+                    return None
+                index = value.end()
 
 
 def _verdict_section(lines: list[str]) -> list[tuple[str, str, str]] | None:

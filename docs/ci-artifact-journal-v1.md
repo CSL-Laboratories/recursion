@@ -193,7 +193,10 @@ Applied to the downloaded bytes against the authenticated artifact metadata:
   extra files reject); entry name equals `journal_entry` exactly (traversal, nested,
   absolute and directory names cannot match); not a symlink; no encryption flags;
   stored or deflate only; `0 < file_size ≤ max_entry_bytes`; compressed size within
-  the archive; decompression ratio ≤ 32:1; CRC/structure check passes;
+  the archive; a nonempty entry declaring zero compressed bytes rejects; decompression
+  ratio ≤ 32:1 measured against the actual declared compressed size with no minimum
+  floor, so small entries are bounded too; CRC/structure check passes; an invalid
+  raw deflate stream reported by the decompressor (`zlib.error`) rejects as integrity;
 - read bounded in memory; **never extracted to the filesystem**;
 - strict JSON: UTF-8, no BOM, a single object, duplicate keys reject, `NaN`/`Infinity`
   reject, size bounded by `max_entry_bytes`;

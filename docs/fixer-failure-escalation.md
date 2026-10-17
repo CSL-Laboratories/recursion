@@ -133,6 +133,11 @@ ordinary delivery and previously recorded handoffs. Recursion applies the same
 check to the existing-rollup sweep and refreshes retained entries alongside
 ordinary items on approved/green PRs.
 
+When a single Recursion thread also has an ordinary needs-human reply or timeout,
+stale or denied failure evidence is stripped and ordinary eligibility is checked
+again for both the Linear checklist and mediation. Its checked state and human
+notes remain intact; failure-only threads still defer.
+
 The 60-read ceiling is unchanged. A real-reader dispatch/Linear fixture posts
 two of three comments before budget exhaustion, then posts the remaining one on
 a later scan within the same daily cap. Only actual posts consume slots; bounded

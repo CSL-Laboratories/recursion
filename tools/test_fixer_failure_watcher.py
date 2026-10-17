@@ -334,6 +334,53 @@ class WatcherTests(unittest.TestCase):
         self.evidence.fresh = lambda: not (self.github.comments if RECURSION else self.github.posts)
         self.assertEqual(len(self.scan()), 1)
 
+    def test_same_thread_ordinary_eligibility_survives_stale_failure_evidence(self):
+        from dataclasses import replace
+        for ordinary_reason in ("stuck-human", "stuck-timeout"):
+            for existing_issue in (False, True):
+                for denied in (False, True):
+                    with self.subTest(reason=ordinary_reason, existing_issue=existing_issue, denied=denied):
+                        self.setup_scan()
+                        reply = f.comment("claude[bot]", "needs a human" if ordinary_reason == "stuck-human" else "Investigating", hours_ago=7)
+                        thread = replace(self.pull.threads[0], comments=self.pull.threads[0].comments + (reply,))
+                        other = f.thread(tid="PRRT_other", comments=f.stuck_pair())
+                        self.pull = replace(self.pull, threads=(thread, other))
+                        self.github.pulls[self.pull.number] = self.pull
+                        cfg = f.cfg()
+                        marker = m.rollup_marker(self.pull)
+                        linear = f.FakeLinear({marker: "https://linear.app/existing"} if existing_issue else None)
+                        if existing_issue:
+                            previous = m.linear_description(self.pull, [(thread, ordinary_reason), (other, "stuck-human")], cfg)
+                            linear.existing_descriptions[marker] = previous.replace("- [ ]", "- [x]", 1).replace(
+                                m.DEFAULT_HUMAN_DECISION, "Keep the operator decision.")
+                        live = [True]
+                        def fresh(live=live, denied=denied):
+                            if not live[0] and denied:
+                                raise RuntimeError("freshness read denied")
+                            return live[0]
+                        self.evidence.fresh = fresh
+                        lookup = linear.find_by_marker
+                        def find(*args, live=live, lookup=lookup, **kwargs):
+                            live[0] = False
+                            return lookup(*args, **kwargs)
+                        linear.find_by_marker = find
+                        m.scan(cfg, self.github, linear, failure_collector=lambda *_: (self.evidence, self.proofs))
+                        writes = linear.updated if existing_issue else linear.created
+                        self.assertEqual(len(writes), 1)
+                        rendered = writes[0][1]
+                        self.assertIn(f"`{ordinary_reason}` <!-- thread:PRRT_0 -->", rendered)
+                        self.assertNotIn("stuck-fixer-failed", rendered)
+                        if existing_issue:
+                            line = next(line for line in rendered.splitlines() if "<!-- thread:PRRT_0 -->" in line)
+                            self.assertTrue(line.startswith("- [x]"))
+                            self.assertIn("Keep the operator decision.", rendered)
+                        own = [body for _, body in self.github.comments if "Thread id: `PRRT_0`" in body]
+                        self.assertEqual(len(own), 1)
+                        self.assertNotIn(PROOF["description"], own[0])
+                        self.assertIn("https://linear.app/", own[0])
+                        self.assertEqual(linear.canceled, [])
+                        self.assertEqual(self.github.resolves, [])
+
     def test_missing_adapter_import_does_not_crash_the_watcher(self):
         from unittest.mock import patch
         with patch("importlib.util.spec_from_file_location", side_effect=FileNotFoundError):

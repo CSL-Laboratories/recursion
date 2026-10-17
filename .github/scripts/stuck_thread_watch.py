@@ -1707,8 +1707,14 @@ def upsert_linear_rollup(
         except Exception:  # noqa: BLE001 - preserve ordinary and recorded handoff items
             fresh = False
         if not fresh:
-            stuck = [(replace(thread, failure_evidence=""), reason) for thread, reason in stuck
-                     if reason != "stuck-fixer-failed"]
+            ordinary = []
+            for thread, reason in stuck:
+                thread = replace(thread, failure_evidence="")
+                if reason == "stuck-fixer-failed":
+                    reason = classify_thread(thread, pull.issue_comments, cfg, for_rollup=True)
+                if reason.startswith("stuck-"):
+                    ordinary.append((thread, reason))
+            stuck = ordinary
     included = {thread.id for thread, _ in stuck}
     stuck = [*stuck, *(item for item in open_failure_handoffs(pull, existing) if item[0].id not in included)]
     if not stuck:
@@ -1992,11 +1998,15 @@ def scan(
                 continue
             if thread.failure_evidence:
                 try:
-                    if not failure_evidence.fresh():
-                        continue
+                    fresh = failure_evidence is not None and failure_evidence.fresh()
                 except Exception:  # noqa: BLE001 - independently eligible ordinary threads continue
                     notice(f"PR #{pull.number}: failure evidence recheck unavailable")
-                    continue
+                    fresh = False
+                if not fresh:
+                    thread = replace(thread, failure_evidence="")
+                    reason = classify_thread(thread, pull.issue_comments, cfg)
+                    if not reason.startswith("stuck-"):
+                        continue
             posted = mediate_thread(
                 pull, thread, cfg, github, reason, counters, linear_url=linear_url
             )

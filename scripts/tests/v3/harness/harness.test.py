@@ -6,6 +6,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -42,10 +43,12 @@ from scripts.v3.harness.providers import (  # noqa: E402
 from scripts.v3.harness.review import parse_verdict  # noqa: E402
 from scripts.v3.harness.routing import capable_providers, select_route  # noqa: E402
 from scripts.v3.harness.run import run_task  # noqa: E402
-from scripts.v3.harness.state import list_runs, load_run  # noqa: E402
+from scripts.v3.harness.state import list_runs, load_run, save_run  # noqa: E402
 from scripts.v3.harness.usage import (  # noqa: E402
+    CODEX_SESSION_METER,
     DEFAULT_MAX_INPUT_TOKENS,
     DEFAULT_MAX_OUTPUT_TOKENS,
+    codex_session_meter,
     exceeded,
     parse_usage,
 )
@@ -85,6 +88,10 @@ CODEX_SESSION = _load_fixture("codex-cumulative.txt")[1]
 GROK_APPROVE = _load_fixture("grok-review.txt")[1]
 
 
+def empty_unknown() -> dict:
+    return {"cost": None, "input_tokens": None, "output_tokens": None}
+
+
 def _completed(argv, code: int, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess[str]:
     return subprocess.CompletedProcess(argv, code, stdout=stdout, stderr=stderr)
 
@@ -110,6 +117,84 @@ class HarnessTests(unittest.TestCase):
             assistant_text(raw),
             "Repo contains docs, sdk, and examples directories.",
         )
+
+    def test_codex_joins_messages_and_ignores_earlier_turns(self) -> None:
+        from scripts.v3.harness.streams import assistant_text
+
+        def message(text: str) -> str:
+            return json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": text}})
+
+        started = json.dumps({"type": "turn.started"})
+        joined = "\n".join([started, message("The answer is 42."), message("Because 6 x 7 = 42.")])
+        self.assertEqual(assistant_text(joined), "The answer is 42.\nBecause 6 x 7 = 42.")
+        stale = "\n".join([started, message("VERDICT approve"), started])
+        self.assertEqual(assistant_text(stale), "")
+
+    def test_codex_without_turn_started_joins_every_agent_message(self) -> None:
+        from scripts.v3.harness.streams import assistant_text
+
+        stream = "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {"type": "agent_message", "text": "Fix the error path."},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {"type": "agent_message", "text": "VERDICT revise"},
+                    }
+                ),
+            ]
+        )
+        self.assertEqual(assistant_text(stream), "Fix the error path.\nVERDICT revise")
+        self.assertEqual(parse_verdict(stream), ("revise", "Fix the error path."))
+
+    def test_codex_earlier_approval_withdrawn_by_last_message_is_revise(self) -> None:
+        def message(text: str) -> str:
+            return json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": text}})
+
+        stream = "\n".join([message("VERDICT approve"), message("Wait, the error path is broken.")])
+        self.assertEqual(parse_verdict(stream)[0], "revise")
+        started = json.dumps({"type": "turn.started"})
+        self.assertEqual(parse_verdict("\n".join([started, stream]))[0], "revise")
+
+    def test_later_codex_verdict_wins(self) -> None:
+        stream = "\n".join(
+            [
+                json.dumps({"type": "turn.started"}),
+                json.dumps(
+                    {"type": "item.completed", "item": {"type": "agent_message", "text": "VERDICT approve"}}
+                ),
+                json.dumps(
+                    {"type": "item.completed", "item": {"type": "agent_message", "text": "VERDICT revise"}}
+                ),
+                json.dumps({"type": "turn.completed", "usage": {"input_tokens": 3, "output_tokens": 1}}),
+            ]
+        )
+        self.assertEqual(parse_verdict(stream)[0], "revise")
+        self.assertEqual(parse_verdict("VERDICT approve\nVERDICT revise")[0], "revise")
+
+        config = starter_config({"fixture", "codex"})
+        codex = _Stub("codex", stream)
+
+        def open_adapter(name: str):
+            if name == "codex":
+                return codex
+            return _Stub(name, "hello")
+
+        with tempfile.TemporaryDirectory() as directory:
+            finished = run_task(
+                "Say hello",
+                config=config,
+                state_dir=Path(directory),
+                open_adapter=open_adapter,
+            )
+        self.assertEqual([item["verdict"] for item in finished["reviews"]], ["revise", "revise"])
+        self.assertEqual(finished["status"], "review-rejected")
+        self.assertFalse(finished["accepted"])
 
     def test_shipped_config_enables_fixtures_and_raises_the_codex_ceiling(self) -> None:
         config = load_config()
@@ -139,6 +224,81 @@ class HarnessTests(unittest.TestCase):
                 {"max_cost": None, "max_input_tokens": 1_000_000, "max_output_tokens": 1_000_000},
             )
         )
+
+    def test_codex_session_meter_keeps_the_last_turn_completed_total(self) -> None:
+        self.assertEqual(CODEX_SESSION_METER, "cumulative-session-total")
+        self.assertEqual(DEFAULT_MAX_INPUT_TOKENS, 50_000_000)
+        self.assertEqual(DEFAULT_MAX_OUTPUT_TOKENS, 8_000_000)
+        trailing = (
+            '{"type":"turn.completed","usage":{"input_tokens":24763,'
+            '"cached_input_tokens":24448,"output_tokens":122,"reasoning_output_tokens":0}}\n'
+            + CODEX_SESSION
+            + '{"type":"item.completed","usage":{"input_tokens":1,"output_tokens":1}}\n'
+        )
+        usage = codex_session_meter(trailing)
+        self.assertEqual(usage["input_tokens"], 6_900_000)
+        self.assertEqual(usage["output_tokens"], 4000)
+        self.assertIsNone(usage["cost"])
+        self.assertEqual(parse_usage(trailing)["input_tokens"], 1)
+        self.assertEqual(codex_session_meter("no usage here"), empty_unknown())
+        self.assertFalse(exceeded(usage, load_config()["budgets"]))
+
+    def test_codex_meter_keeps_the_earlier_total_when_the_last_turn_omits_usage(self) -> None:
+        stale = "\n".join(
+            (
+                json.dumps(
+                    {"type": "turn.completed", "usage": {"input_tokens": 900, "output_tokens": 10}}
+                ),
+                json.dumps({"type": "turn.completed"}),
+            )
+        )
+        self.assertEqual(codex_session_meter(stale)["input_tokens"], 900)
+        failed = stale.splitlines()[0] + "\n" + json.dumps({"type": "turn.failed"})
+        self.assertEqual(codex_session_meter(failed)["input_tokens"], 900)
+        recovered = stale + "\n" + json.dumps(
+            {"type": "turn.completed", "usage": {"input_tokens": 1200, "output_tokens": 4}}
+        )
+        self.assertEqual(codex_session_meter(recovered)["input_tokens"], 1200)
+        # CSL-117 Option B. The later output reading is smaller; the meter
+        # keeps 10 as the budget lower bound. Expecting 4 would undercount
+        # known spend while cumulative-versus-per-turn stays unverified.
+        # Lucas left this conservative max-value rule in place (keep the
+        # CSL-81 author scope). Named reviewer: Lucas (@NotSkittlz).
+        self.assertEqual(codex_session_meter(recovered)["output_tokens"], 10)
+
+    def test_codex_meter_keeps_an_omitted_field_from_the_earlier_total(self) -> None:
+        partial = "\n".join(
+            (
+                json.dumps(
+                    {"type": "turn.completed", "usage": {"input_tokens": 900, "output_tokens": 10}}
+                ),
+                json.dumps({"type": "turn.completed", "usage": {"output_tokens": 12}}),
+            )
+        )
+        usage = codex_session_meter(partial)
+        self.assertEqual(usage["input_tokens"], 900)
+        self.assertEqual(usage["output_tokens"], 12)
+        self.assertIsNone(usage["cost"])
+
+    def test_codex_meter_keeps_the_highest_value_of_each_field(self) -> None:
+        stream = "\n".join(
+            (
+                json.dumps(
+                    {
+                        "type": "turn.completed",
+                        "usage": {"input_tokens": 50, "output_tokens": 10, "cost": 2},
+                    }
+                ),
+                json.dumps(
+                    {"type": "turn.completed", "usage": {"input_tokens": 40, "output_tokens": 4}}
+                ),
+                json.dumps({"type": "turn.completed", "usage": {"output_tokens": 7, "cost": 1}}),
+            )
+        )
+        usage = codex_session_meter(stream)
+        self.assertEqual(usage["input_tokens"], 50)
+        self.assertEqual(usage["output_tokens"], 10)
+        self.assertEqual(usage["cost"], 2.0)
 
     def test_grok_stream_verdict_is_approve_when_the_first_line_is_json(self) -> None:
         self.assertTrue(GROK_APPROVE.splitlines()[0].startswith("{"))
@@ -341,6 +501,19 @@ class HarnessTests(unittest.TestCase):
             self.assertIn("--allow-live", stderr.getvalue())
             self.assertNotIn(SECRET, stderr.getvalue())
 
+    def test_qualified_headless_argv_keeps_the_csl_81_flags(self) -> None:
+        request = ProviderRequest(task="Say hello", packet_id="run-aabbccddeeff")
+        claude = ClaudeHeadlessProvider().argv(request)
+        self.assertEqual(claude, ClaudeHeadlessProvider.STATIC_ARGV)
+        self.assertIn("--dangerously-skip-permissions", claude)
+        self.assertNotIn("--permission-mode", claude)
+        grok = GrokHeadlessProvider().argv(request)
+        self.assertIn("--always-approve", grok)
+        self.assertNotIn("--permission-mode", grok)
+        codex = CodexExecProvider().argv(request)
+        self.assertEqual(codex[:4], CodexExecProvider.STATIC_ARGV)
+        self.assertIn("--approve-for-me", codex)
+
     def test_grok_reviewer_stub_approves_and_old_ceiling_stops_codex(self) -> None:
         config = starter_config({"codex", "grok"})
         codex = _Stub("codex", CODEX_SESSION)
@@ -376,6 +549,20 @@ class HarnessTests(unittest.TestCase):
             )
             self.assertEqual(stopped["status"], "budget-exceeded")
             self.assertFalse(stopped["accepted"])
+
+            trailing = (
+                CODEX_SESSION
+                + '{"type":"item.completed","usage":{"input_tokens":1,"output_tokens":1}}\n'
+            )
+            metered = run_task(
+                "Say hello",
+                config=low,
+                state_dir=Path(directory),
+                provider="codex",
+                open_adapter=lambda name: _Stub("codex", trailing),
+            )
+            self.assertEqual(metered["usage"]["input_tokens"], 6_900_000)
+            self.assertEqual(metered["status"], "budget-exceeded")
 
     def test_grok_adapter_writes_the_prompt_and_returns_stdout(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1018,6 +1205,56 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(record["reviews"], [])
             self.assertFalse(record["accepted"])
 
+    def test_save_run_refuses_a_hard_link(self) -> None:
+        run_id = "run-abc123def456"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            state.mkdir()
+            other = root / "other.txt"
+            other.write_text("keep-me", encoding="utf-8")
+            linked = state / f"{run_id}.json"
+            os.link(other, linked)
+            self.assertGreater(linked.stat().st_nlink, 1)
+            with self.assertRaises(HarnessError):
+                save_run(state, {"run_id": run_id, "task": "new task"})
+            self.assertEqual(other.read_text(encoding="utf-8"), "keep-me")
+            self.assertEqual(linked.read_text(encoding="utf-8"), "keep-me")
+            linked.unlink()
+            linked.symlink_to(other)
+            with self.assertRaises(HarnessError):
+                save_run(state, {"run_id": run_id, "task": "new task"})
+            self.assertEqual(other.read_text(encoding="utf-8"), "keep-me")
+
+    def test_save_run_publishes_task_text_at_mode_0600(self) -> None:
+        run_id = "run-abc123def456"
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            path = save_run(state, {"run_id": run_id, "task": "first"})
+            path.chmod(0o644)
+            path.write_text("old\n", encoding="utf-8")
+            seen: dict = {}
+            real_replace = os.replace
+
+            def replace(src, dst):
+                info = os.lstat(src)
+                seen["mode"] = stat.S_IMODE(info.st_mode)
+                seen["nlink"] = info.st_nlink
+                seen["src"] = Path(src).read_text(encoding="utf-8")
+                seen["dst"] = Path(dst).read_text(encoding="utf-8")
+                return real_replace(src, dst)
+
+            with patch("scripts.v3.harness.state.os.replace", replace):
+                save_run(state, {"run_id": run_id, "task": "private task"})
+            self.assertEqual(seen["nlink"], 1)
+            self.assertIn("private task", seen["src"])
+            self.assertEqual(seen["dst"], "old\n")
+            self.assertIn("private task", path.read_text(encoding="utf-8"))
+            self.assertNotIn("old", path.read_text(encoding="utf-8"))
+            if os.name == "posix":
+                self.assertEqual(seen["mode"], 0o600)
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
     def test_saved_run_scrubs_a_secret_from_the_environment(self) -> None:
         secret = "SECRET-TOKEN-VALUE"
 
@@ -1136,6 +1373,41 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(row["signed_in"], "signed-in")
             self.assertEqual(row["auth_method"], "env")
             self.assertTrue(row["usable"])
+
+    def test_grok_env_key_counts_when_the_auth_file_is_unreadable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bindir = Path(directory) / "bin"
+            home = Path(directory) / "home"
+            bindir.mkdir()
+            home.mkdir()
+            (bindir / "grok").write_text("", encoding="utf-8")
+            auth = home / ".grok" / "auth.json"
+            auth.parent.mkdir()
+            auth.write_text("cached", encoding="utf-8")
+            real_stat = Path.stat
+
+            def stat(self, *args, **kwargs):
+                if self.name == "auth.json":
+                    raise OSError("unreadable")
+                return real_stat(self, *args, **kwargs)
+
+            with patch.object(Path, "stat", stat):
+                report = diagnose(
+                    starter_config({"grok"}),
+                    environ={"XAI_API_KEY": SECRET},
+                    platform="linux",
+                    home=home,
+                    path=str(bindir),
+                    run=lambda argv, timeout: _completed(argv, 0, stdout="grok 1.0\n"),
+                    git_run=lambda argv, timeout: _completed(argv, 0, stdout="git version 2.45.0\n"),
+                )
+            rendered = json.dumps(report)
+            self.assertNotIn(SECRET, rendered)
+            row = {item["name"]: item for item in report["providers"]}["grok"]
+            self.assertEqual(row["signed_in"], "signed-in")
+            self.assertEqual(row["auth_method"], "env")
+            self.assertTrue(row["usable"])
+            self.assertTrue(report["ok"])
 
     def test_weights_prefer_the_higher_weight_and_reject_a_bad_weight(self) -> None:
         config = load_config()

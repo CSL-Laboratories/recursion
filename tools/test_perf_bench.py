@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import gc
 import importlib.util
 import json
 import socket
@@ -144,6 +145,55 @@ class BenchTests(unittest.TestCase):
         self.assertEqual(len(base["pass_medians_s"]), 3)
         self.assertEqual(base["median_s"], perf_bench._positive_median(base["pass_medians_s"]))
         self.assertEqual(head["median_s"], perf_bench._positive_median(head["pass_medians_s"]))
+
+    def test_timed_call_restores_the_callers_gc_state(self) -> None:
+        gc_was_enabled = gc.isenabled()
+        try:
+            gc.enable()
+            perf_bench._timed_call(lambda: None, 1)
+            self.assertTrue(gc.isenabled())
+            gc.disable()
+            perf_bench._timed_call(lambda: None, 1)
+            self.assertFalse(gc.isenabled())
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+            else:
+                gc.disable()
+
+    def test_timed_call_keeps_gc_on_when_the_callback_enables_it(self) -> None:
+        # timeit parity: one-way restore. A callback that enables GC is not
+        # re-disabled, even when the caller entered with GC off.
+        gc_was_enabled = gc.isenabled()
+        try:
+            gc.disable()
+            perf_bench._timed_call(gc.enable, 1)
+            self.assertTrue(gc.isenabled())
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+            else:
+                gc.disable()
+
+    def test_timed_call_restores_gc_when_the_callback_raises(self) -> None:
+        def boom() -> None:
+            raise RuntimeError("boom")
+
+        gc_was_enabled = gc.isenabled()
+        try:
+            gc.enable()
+            with self.assertRaises(RuntimeError):
+                perf_bench._timed_call(boom, 1)
+            self.assertTrue(gc.isenabled())
+            gc.disable()
+            with self.assertRaises(RuntimeError):
+                perf_bench._timed_call(boom, 1)
+            self.assertFalse(gc.isenabled())
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+            else:
+                gc.disable()
 
     def test_short_suite_is_provider_free(self) -> None:
         report = perf_bench.run_suite(ROOT, rounds=2, round_s=0.005, warmup_s=0.005)

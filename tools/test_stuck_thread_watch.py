@@ -1657,12 +1657,13 @@ class VerdictAndResolveTests(unittest.TestCase):
             ("pi_unclosed_xml", 'Thread text:\n<?xml version="1.0"\n', False),
             ("pi_closed", 'Thread text:\n<?xml version="1.0"?>\n\n', True),
             ("pi_midline_unclosed", "Echo <?\n", False),
-            # type 4 declarations (quoted '>' does not end them)
+            # type 4 declarations end at the first '>' (quotes do not hide it)
             ("decl_unclosed", "Thread text:\n<!DOCTYPE html\n", False),
             ("decl_unclosed_element", "Thread text:\n<!ELEMENT foo bar\n", False),
             ("decl_closed", "Thread text:\n<!DOCTYPE html>\n\n", True),
-            ("decl_quoted_gt", 'Thread text:\n<!DOCTYPE html ">\n', False),
+            ("decl_quoted_gt", 'Thread text:\n<!DOCTYPE html ">\n', True),
             ("decl_quoted_gt_closed", 'Thread text:\n<!DOCTYPE html "foo>bar">\n\n', True),
+            ("decl_quoted_gt_hides_pre", '<!DOCTYPE "x>\n<pre>\n">\n', False),
             # type 5 CDATA
             ("cdata_unclosed", "Thread text:\n<![CDATA[\n", False),
             ("cdata_closed", "Thread text:\n<![CDATA[ example ]]>\n\n", True),
@@ -1763,6 +1764,25 @@ class VerdictAndResolveTests(unittest.TestCase):
         self._assert_no_resolve("Use `<!--` here\n<PRE class=`echo`>\n" + block)
         self._assert_resolves("Use `<!--` here\n\n" + block)
         self._assert_resolves("Use `<!--` here\n<pre title=`x`>\n</pre>\n\n" + block)
+
+    def test_quoted_declaration_does_not_hide_type1_pre(self) -> None:
+        # Devin 4304406180: type 4 ends at the first `>`; quote tracking
+        # skipped a live `<pre>` between `"x>` and `">`. Scan path is
+        # parse_thread_verdicts → classify_resolve → scan.
+        block = verdict_block("PRRT_1")
+        self._assert_no_resolve('<!DOCTYPE "x>\n<pre>\n">\n' + block)
+        self._assert_no_resolve("<!DOCTYPE html>\n<pre>\n" + block)
+        self._assert_resolves('<!DOCTYPE "x>\n">\n\n' + block)
+
+    def test_closed_multiline_type6_still_resolves(self) -> None:
+        # Devin 4304406239: a trailing empty prose line is the blank that
+        # ends type 6, so a closed `<div>`/`<hr>` before the verdict must
+        # still authorize. Scan path is parse_thread_verdicts →
+        # classify_resolve → scan.
+        block = verdict_block("PRRT_1")
+        self._assert_resolves("<div>\nFixed.\n</div>\n\n" + block)
+        self._assert_resolves("<hr>\ntext\n\n" + block)
+        self._assert_no_resolve("<div>\nFixed.\n</div>\n" + block)
 
     def test_escaped_fence_copy_does_not_resolve(self) -> None:
         self._assert_no_resolve("\\```\n" + verdict_block("PRRT_1") + "\\```\n")

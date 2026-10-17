@@ -538,7 +538,7 @@ def _skip_raw_html_construct(text: str, index: int) -> int | str | None:
         return end + len(HTML_PI_CLOSE)
     if len(rest) >= 3 and rest.startswith("<!") and rest[2].isascii() and rest[2].isalpha():
         end = _declaration_gt(text, index + 2)
-        if end is None or end == "unclosed":
+        if end is None:
             return "unclosed"
         return end + 1
     return None
@@ -590,7 +590,7 @@ def _html_constructs_open(visible: str) -> bool:
     Walks left to right. Closed, well-nested constructs are skipped; an
     unrecognized ``<`` (for example ``a < b``) is not an opener. Matching
     CommonMark 4.6 types 2–5: ``<!--`` / ``-->``, ``<?`` / ``?>``, ``<!`` +
-    ASCII letter / ``>`` (``>`` inside quotes does not end a declaration),
+    ASCII letter / first ``>`` (quotes do not hide that closer),
     ``<![CDATA[`` / ``]]>``. Tags keep the ordered stack already used for
     unmatched and mis-nested closes. Quoted attribute values are scanned as
     CommonMark 6.6, so ``>``, ``/>``, or ``</pre>`` inside quotes cannot
@@ -671,31 +671,22 @@ def _type6_continues_to_eof(visible: str, lt: int) -> bool:
     if line_end < 0:
         return True
     rest = visible[line_end + 1:]
-    if rest == "" or rest.startswith("\n") or "\n\n" in rest:
+    # A trailing empty prose line joins as a final newline (``</div>\n``),
+    # which is the blank line that ends type 6. ``"\n\n" in rest`` only
+    # sees a blank *between* later content lines.
+    if rest == "" or rest.startswith("\n") or rest.endswith("\n") or "\n\n" in rest:
         return False
     return True
 
 
-def _declaration_gt(visible: str, start: int) -> int | str | None:
-    """Index of a declaration ``>`` not inside quotes, or ``unclosed``."""
-    index = start
-    length = len(visible)
-    quote = ""
-    while index < length:
-        char = visible[index]
-        if quote:
-            if char == quote:
-                quote = ""
-            index += 1
-            continue
-        if char in "\"'":
-            quote = char
-            index += 1
-            continue
-        if char == ">":
-            return index
-        index += 1
-    return "unclosed" if quote else None
+def _declaration_gt(visible: str, start: int) -> int | None:
+    """Index of the first ``>`` (CommonMark 4.6 type 4), or None if none.
+
+    Type 4 ends at the first ``>`` on a line; quotes do not hide it. A
+    quoted ``>`` that skipped a later ``<pre>`` would fail open.
+    """
+    end = visible.find(">", start)
+    return None if end < 0 else end
 
 
 def _html_type1_end(text: str) -> int | None:

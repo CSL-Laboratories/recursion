@@ -65,7 +65,8 @@ class Client:
         return self.pages(f'repos/{self.repo}/issues/{number}/events')
 
     def post(self, number, body):
-        gate.post_comment(self.repo, str(number), body, self.token, gh=self.gh)
+        return json.loads(self.gh(['api', f'repos/{self.repo}/issues/{number}/comments', '--input', '-'],
+                                  self.token, json.dumps({'body': body})))
 
 
 def request(client, number, pat):
@@ -150,20 +151,59 @@ def admit(client, event, pat, run, attempt):
             return {'action': 'superseded-event', 'admitted': 'false', 'duplicate': 'true'}
         if client.get(path) != current_pr:
             raise ValueError('PR changed before mediation')
+        helper = gate.fixer_helpers()
+        comments = client.comments(number)
+        pause = helper.latest_pause_id(comments, head)
+        if helper.ci_label_decision(client.events(number), comments, head=head) == 'preserve-human-removal':
+            return {'action': 'preserve-human-removal', 'admitted': 'false'}
+        own_invalidations = {}
+        def post_invalidation(repo, pr, body):
+            receipt = client.post(pr, body)
+            protocol.snapshot([receipt])
+            if receipt.get('body') != body or not protocol.identity(receipt.get('user') or {}, protocol.ACTIONS):
+                raise ValueError('invalidation write could not be authenticated')
+            own_invalidations[receipt['id']] = receipt
         # A genuine latest MEDIATE invalidates proven owned readiness, even if
         # the legacy dispatch receipt says already-acted. Never equate that
         # receipt with a duplicate candidate or preserve its old READY label.
-        gate.fixer_helpers().revoke_owned_ci(client.repo, str(number), head,
+        helper.revoke_owned_ci(client.repo, str(number), head,
             get_pages=client.pages,
             delete=lambda r, n: client.gh(['api', '-X', 'DELETE', f'repos/{r}/issues/{n}/labels/ci:full'], client.token),
-            post_comment=lambda r, n, body: client.post(n, body))
+            post_comment=post_invalidation)
+        def recheck_mediate():
+            if (client.get(path) != current_pr
+                    or protocol.latest_review(client.reviews(number), head) != authoritative):
+                raise ValueError('mediation identity or review changed')
+            refreshed = client.comments(number)
+            indexed = {c['id']: c for c in protocol.snapshot(refreshed)}
+            if any(indexed.get(cid) != record for cid, record in own_invalidations.items()):
+                raise ValueError('invalidation receipt changed or unavailable')
+            # Our receipt can have a larger ID than a concurrent external pause.
+            # Compare the external generation separately; max(all IDs) hides it.
+            external = [c for c in refreshed if c['id'] not in own_invalidations]
+            if helper.latest_pause_id(external, head) != pause:
+                raise ValueError('external pause changed during mediation')
+            if helper.ci_label_decision(client.events(number), refreshed, head=head) == 'preserve-human-removal':
+                raise ValueError('human removal during mediation')
+            if (client.get(path) != current_pr
+                    or protocol.latest_review(client.reviews(number), head) != authoritative):
+                raise ValueError('mediation changed during closing snapshot')
+        recheck_mediate()
         if authoritative.get('state', '').upper() not in {'COMMENTED', 'APPROVED'}:
             return {'action': 'independent-review-invalid', 'admitted': 'false'}
         # Mediation never admits paid CI and must remain available for conflicts,
         # stale merge refs and unavailable candidate identities. Retain the legacy
         # router's fork/draft, missing-PAT and authenticated deduplication policy.
+        def guarded_gh(args, token, input_text=None):
+            # Recheck before the legacy acted receipt and again after that write,
+            # immediately before dispatch. An uncertain/aborted delivery remains
+            # owner-inspected; do not retry the legacy mutation automatically.
+            if args[:2] == ['workflow', 'run'] or (args[:1] == ['api'] and '--input' in args):
+                recheck_mediate()
+            return (client.gh(args, token, input_text) if input_text is not None
+                    else client.gh(args, token))
         result = gate.run_verdict({**event, 'review': authoritative, 'pull_request': current_pr},
-                                  client.repo, pat, client.token, 'master', gh=client.gh)
+                                  client.repo, pat, client.token, 'master', gh=guarded_gh)
         return {**result, 'admitted': 'false'}
     value = client.candidate(number)
     # Native pull_request_review checks report on the event merge SHA. Never

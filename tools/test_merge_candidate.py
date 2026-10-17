@@ -281,6 +281,92 @@ class SnapshotTests(unittest.TestCase):
             helpers.return_value.revoke_owned_ci.assert_called_once()
             route.assert_not_called()
 
+    def test_own_invalidation_cannot_hide_intervening_external_pause(self):
+        client = self.client()
+        helper = router.gate.fixer_helpers()
+        mediate = {**review(), 'body': 'CODEX-GATE: MEDIATE'}
+        client.reviews.return_value = [mediate]
+        records = [{'id': 2, 'user': p.ACTIONS, 'body': helper.marker('ci-owned',
+                    {'head': VALUE['head'], 'event': 3})}]
+        events = [{'id': 3, 'event': 'labeled', 'label': {'name': 'ci:full'},
+                   'actor': WRITER}]
+        client.comments.side_effect = lambda n: copy.deepcopy(records)
+        client.events.side_effect = lambda n: copy.deepcopy(events)
+        client.pages.side_effect = lambda path: copy.deepcopy(records if path.endswith('/comments') else events)
+        def post(number, body):
+            records.append({'id': 4, 'user': p.ACTIONS,
+                            'body': '<!-- claude-fixer-loop-cap:' + VALUE['head'] + ' -->'})
+            own = {'id': 5, 'user': p.ACTIONS, 'body': body}
+            records.append(own)
+            return own
+        client.post.side_effect = post
+        with mock.patch.object(router.gate, 'run_verdict', return_value={'action': 'mediate'}) as route:
+            with self.assertRaises(ValueError):
+                router.admit(client, {'review': mediate, 'pull_request': {'number': 7}}, 'pat', '51', 1)
+            route.assert_not_called()
+
+    def test_only_authenticated_own_invalidation_can_be_excluded(self):
+        for trusted in (True, False):
+            client = self.client()
+            helper = router.gate.fixer_helpers()
+            mediate = {**review(), 'body': 'CODEX-GATE: MEDIATE'}
+            client.reviews.return_value = [mediate]
+            records = [{'id': 2, 'user': p.ACTIONS, 'body': helper.marker('ci-owned',
+                        {'head': VALUE['head'], 'event': 3})}]
+            events = [{'id': 3, 'event': 'labeled', 'label': {'name': 'ci:full'}, 'actor': WRITER}]
+            client.comments.side_effect = lambda n: copy.deepcopy(records)
+            client.events.side_effect = lambda n: copy.deepcopy(events)
+            client.pages.side_effect = lambda path: copy.deepcopy(records if path.endswith('/comments') else events)
+            def post(number, body):
+                own = {'id': 4, 'user': p.ACTIONS if trusted else WRITER, 'body': body}
+                records.append(own)
+                return copy.deepcopy(own)
+            client.post.side_effect = post
+            with mock.patch.object(router.gate, 'run_verdict', return_value={'action': 'mediate'}) as route:
+                if trusted:
+                    result = router.admit(client, {'review': mediate, 'pull_request': {'number': 7}}, 'pat', '51', 1)
+                    self.assertEqual(result['action'], 'mediate')
+                    route.assert_called_once()
+                else:
+                    with self.assertRaises(ValueError):
+                        router.admit(client, {'review': mediate, 'pull_request': {'number': 7}}, 'pat', '51', 1)
+                    route.assert_not_called()
+
+    def test_pause_after_legacy_acted_write_stops_real_dispatch(self):
+        client = self.client()
+        mediate = {**review(), 'body': 'CODEX-GATE: MEDIATE'}
+        client.reviews.return_value = [mediate]
+        records, calls = [], []
+        client.comments.side_effect = lambda n: copy.deepcopy(records)
+        def gh(args, token, input_text=None):
+            calls.append(args)
+            if args == ['api', 'user']:
+                return json.dumps(WRITER)
+            if '--input' in args:
+                records.append({'id': 4, 'user': p.ACTIONS,
+                                'body': '<!-- claude-fixer-loop-cap:' + VALUE['head'] + ' -->'})
+                return '{}'
+            if any('/comments?' in arg for arg in args):
+                return json.dumps(records)
+            return '{}'
+        client.gh.side_effect = gh
+        with mock.patch.object(router.gate, 'emit'), self.assertRaises(ValueError):
+            router.admit(client, {'review': mediate, 'pull_request': {'number': 7}}, 'pat', '51', 1)
+        self.assertTrue(any('--input' in args for args in calls))
+        self.assertFalse(any(args[:2] == ['workflow', 'run'] for args in calls))
+
+    def test_mediate_preserves_human_removal(self):
+        client = self.client()
+        mediate = {**review(), 'body': 'CODEX-GATE: MEDIATE'}
+        client.reviews.return_value = [mediate]
+        client.events.return_value = [{'id': 3, 'event': 'unlabeled',
+                                      'label': {'name': 'ci:full'}, 'actor': WRITER}]
+        with mock.patch.object(router.gate, 'run_verdict') as route:
+            result = router.admit(client, {'review': mediate, 'pull_request': {'number': 7}}, 'pat', '51', 1)
+            self.assertEqual(result['action'], 'preserve-human-removal')
+            client.post.assert_not_called()
+            route.assert_not_called()
+
     def test_mediate_routes_without_merge_candidate_or_ready_credentials(self):
         for reason, pat in itertools.product(['conflict', 'base advanced', 'merge unavailable'], ['pat', '']):
             client = self.client()
@@ -293,7 +379,7 @@ class SnapshotTests(unittest.TestCase):
                 result = router.admit(client, event, pat, '50', 1)
                 self.assertEqual(result['admitted'], 'false')
                 route.assert_called_once_with({**event, 'pull_request': client.get.return_value},
-                                              REPO, pat, 'token', 'master', gh=client.gh)
+                                              REPO, pat, 'token', 'master', gh=mock.ANY)
                 client.candidate.assert_not_called()
                 client.gh.assert_not_called()
                 client.post.assert_not_called()

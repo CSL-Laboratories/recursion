@@ -147,6 +147,13 @@ newer candidate readiness. A current MEDIATE revokes only proven owned readiness
 even when its legacy dispatch receipt already exists. Conflicts, stale synthetic merge refs and an
 advanced base do not prevent mediation. The existing missing-PAT, fork/draft and
 authenticated deduplication rules still apply; mediation never reserves a matrix.
+Mediation rechecks head, review, human removal and external pause generation around
+owned invalidation and immediately before the legacy receipt/dispatch writes. Only
+the exact authenticated POST response IDs from this invocation are excluded from
+the pause comparison; a newer own receipt cannot hide an intervening external pause.
+If evidence changes after the legacy acted receipt was posted, dispatch stops and
+the owner must inspect that receipt before recovery. This is bounded revalidation,
+not an atomic transaction or permission to retry uncertain delivery.
 
 Request/review timestamps have second precision. Equal-second request and review
 observations cannot establish causal ordering and remain rejected, as do tied

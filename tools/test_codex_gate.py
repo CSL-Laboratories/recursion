@@ -998,7 +998,7 @@ class WorkflowStructureTests(unittest.TestCase):
 
     def test_concurrency_isolates_verdict_from_request_wait(self) -> None:
         self.assertIn(
-            "codex-gate-${{ github.event.pull_request.number }}-${{ github.event_name == 'pull_request_review' && format('verdict-{0}', github.event.review.id) || 'request' }}",
+            "codex-gate-${{ github.event.pull_request.number || inputs.pr_number }}-${{ github.event_name == 'pull_request_review' && format('verdict-{0}', github.event.review.id) || 'request' }}",
             self.text,
         )
         self.assertIn(

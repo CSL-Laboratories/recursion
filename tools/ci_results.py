@@ -4,7 +4,7 @@ import os
 
 
 def validate(needs, *, event, action='', draft=False, full=False, cancelled=False):
-    if cancelled or event not in {'pull_request', 'push', 'workflow_dispatch', 'merge_group'}:
+    if cancelled or event not in {'pull_request', 'pull_request_review', 'push', 'workflow_dispatch', 'merge_group'}:
         return False
     if set(needs) != {'settle', 'linux', 'windows', 'macos'}:
         return False
@@ -19,6 +19,8 @@ def validate(needs, *, event, action='', draft=False, full=False, cancelled=Fals
     if (run, outputs.get('classification')) not in {
             ('true', 'full'), ('false', 'docs-only')}:
         return False
+    if event in {'pull_request', 'pull_request_review'} and run != 'true':
+        return False  # B1: every ordinary merge candidate needs the full matrix.
     # No weaker PR success: a delayed unlabeled run cannot overwrite failed
     # full coverage with skipped OS jobs. The linux check stays independent.
     selected = {'windows': True,

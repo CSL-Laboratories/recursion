@@ -17,11 +17,11 @@ clearance. Do not replace those branches or import unrelated policy/planning wor
   skipped/failed Linux tests, and forwards verified path outputs. No protection
   setting change is needed to keep failed settle from satisfying `linux`.
 - `platform-gates` waits for settle, Linux, Windows and macOS. Queue and manual full
-  runs and every non-docs PR success require all three platforms. A Linux-only
+  runs and every ordinary PR candidate (including docs) require all three platforms. A Linux-only
   PR run can pass required `linux`, but its staged `platform-gates` fails until
-  `ci:full` runs complete coverage. Master push retains Linux/Windows fallback;
+  a verified exact-candidate READY admits complete coverage. Master push retains Linux/Windows fallback;
   nightly macOS remains. This is deliberate until separately approved activation.
-- A docs-only no-op requires Linux success plus the exact `docs-only` classification
+- Outside ordinary PR candidate readiness, a docs-only no-op requires Linux success plus the exact `docs-only` classification
   from a nonempty verified diff. Linux still runs public-scope and whitespace checks.
   Missing outputs, pending/failing/cancelled jobs and unexplained skips fail closed.
 - PR diff selection uses the checked-out synthetic merge SHA (`github.sha`), not
@@ -66,11 +66,10 @@ Ordinary PR runs already share concurrency across heads. A non-draft synchronize
 waits 120 seconds on hosted Ubuntu; cancelled/failed/unexpectedly skipped settle
 cannot admit paid Linux or dependent OS jobs. Opened/ready/manual/queue runs
 deliberately skip settle and can run their selected jobs. Draft event runs can
-still execute CI. Adding `ci:full` runs Linux and both extra OS jobs in this same
-DAG and shares PR concurrency; the independent label workflows are retired. Ignored
-labels and draft label events have separate concurrency groups and check names,
-so their skips cannot overlay required checks. GitHub concurrency queue order is
-not dispatch order: even a delayed Linux-only run must fail the non-docs aggregate.
+still execute CI. All label events now have separate concurrency groups and check
+names and never admit paid CI. The exact-candidate READY caller reuses this CI DAG
+with the same PR concurrency group. GitHub concurrency queue order is not dispatch
+order: even a delayed Linux-only run must fail the ordinary PR aggregate.
 Manual dispatch remains independent. After a paid job starts, cancellation cannot
 recover elapsed cost. Coverage and correctness
 precede the $100/month target. No savings or invoice reduction is established here.
@@ -82,3 +81,58 @@ only after separately approved queue enforcement and validation.
 Sources: [required checks](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks),
 [workflow events](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows),
 [commit statuses API](https://docs.github.com/en/rest/commits/statuses).
+
+## Exact-candidate readiness follow-on (B1/B2)
+
+After bootstrap on the default branch, the existing locked gate invalidates only
+its proven owned stale `ci:full` label before requesting a review. Human labels,
+removals, ambiguous writes and fixer holds retain the receipt helper's policy.
+An unchanged candidate reservation keeps its label; the label itself is never
+review or CI evidence. No shared receipt-helper policy changes are included.
+
+A candidate binds repository, PR, full head SHA, live base SHA, synthetic merge
+SHA and tree SHA. The merge parents must be exactly base then head. The existing
+PAT authors one immutable request per candidate, at most three per head per UTC
+day. The authoritative latest review must come from the exact verified Codex bot
+identity, follow that request, name its `CODEX-CANDIDATE: <digest>`, and conclude
+`CODEX-GATE: READY`. Submission timestamps order terminal reviews; creation IDs cannot prove attempt order.
+Tied latest submissions and unbound/pending trusted evidence fail closed.
+Old head-only READY, pending/dismissed reviews, wrong identities,
+new negative attempts and stale base/tree evidence do not qualify.
+
+The existing verdict writer authenticates the current receipt/hold state under
+the shared PR lock and records an immutable Actions reservation before exporting
+admission. That review event calls the existing provider-free CI workflow with
+pinned merge/base/tree identities and **forces all three platforms, including docs**.
+The matrix receives contents-read only and no PAT. A read-only final audit checks
+the current candidate, authoritative review, reservation, label generation and
+receipt state after all platforms succeed. New findings requiring a journal write
+fail back to the locked writer. `candidate-readiness` is staged and is not yet a
+required protected check. Direct Devin enforcement remains unchanged.
+
+Each candidate has one workflow attempt. Duplicate review events cannot reserve
+another run. Candidate job conditions reject attempts greater than one before
+paid runners start: GitHub partial reruns may reuse old successful admission job
+outputs, so they cannot safely serve as recovery. A failed/cancelled candidate
+requires owner-led integration to a new candidate and a fresh independent review;
+manual full CI remains a diagnostic lane and cannot establish candidate readiness.
+No automated mutation retry is performed after an uncertain request/reservation.
+Investigate the existing receipt before any human recovery; do not delete history.
+
+Submitted, edited and dismissed review events recheck authoritative evidence and
+revoke only proven owned labels when it no longer qualifies.
+
+This source does not provide continuous revocation or atomic merge-time enforcement.
+A base advance alone does not guarantee a PR event. The owner must compare the
+live candidate immediately before approval/landing, and use the gate's existing
+`workflow_dispatch` with `pr_number` to request review after a base change. Dispatch
+requests a review; it never directly admits candidate CI. A stale/unavailable
+synthetic merge fails closed; retry the request after GitHub refreshes it. Results
+can become stale after the final read. These limitations, protected authority,
+bootstrap deployment and real review-event validation remain activation holds.
+REST Actions `head_sha` is not interchangeable with native event `GITHUB_SHA`;
+the latter identifies the review event's synthetic merge checkout. No arbitrary
+PR status is written from a default-branch event.
+
+Sources: [review event identity](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request_review),
+[reusable workflow context and reruns](https://docs.github.com/en/actions/reference/workflows-and-actions/reusing-workflow-configurations).

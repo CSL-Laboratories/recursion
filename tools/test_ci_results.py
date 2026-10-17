@@ -27,13 +27,14 @@ class AggregateTests(unittest.TestCase):
                              (settle, linux, windows, macos) == ('skipped', 'success', 'success', 'success'), args)
 
     def test_event_and_docs_selection(self):
-        for event, full, run in itertools.product(['pull_request', 'push', 'workflow_dispatch', 'merge_group'],
+        for event, full, run in itertools.product(['pull_request', 'pull_request_review', 'push', 'workflow_dispatch', 'merge_group'],
                                                  [True, False], ['true', 'false']):
             win = run == 'true'
             mac = run == 'true' and event != 'push'
             args = needs(windows='success' if win else 'skipped', macos='success' if mac else 'skipped',
                          run=run, classification='full' if run == 'true' else 'docs-only')
-            self.assertTrue(validate(args, event=event, full=full), (event, full, run))
+            expected = event not in {'pull_request', 'pull_request_review'} or run == 'true'
+            self.assertEqual(validate(args, event=event, full=full), expected, (event, full, run))
             self.assertFalse(validate(args, event=event, full=full, cancelled=True))
             for job in ['linux', 'windows', 'macos']:
                 for result in ['failure', 'pending', 'cancelled', '']:
@@ -50,7 +51,7 @@ class AggregateTests(unittest.TestCase):
                 args = needs(settle=settle, windows=windows, macos=macos)
                 self.assertEqual(validate(args, event='pull_request', action=action, full=full),
                                  windows == macos == 'success', (action, full, windows, macos))
-        self.assertTrue(validate(needs(windows='skipped', macos='skipped', run='false', classification='docs-only'),
+        self.assertFalse(validate(needs(windows='skipped', macos='skipped', run='false', classification='docs-only'),
                                  event='pull_request', action='labeled', full=True))
 
     def test_docs_requires_explicit_verified_classification(self):
@@ -76,7 +77,7 @@ class AggregateTests(unittest.TestCase):
         self.assertIn('run_full: ${{ needs.linux-tests.outputs.run_full }}', required_linux)
         self.assertIn('CI_ACTION: ${{ github.event.action }}', aggregate)
         self.assertIn('CI_DRAFT: ${{ github.event.pull_request.draft || false }}', aggregate)
-        self.assertIn("CI_FULL: ${{ contains(github.event.pull_request.labels.*.name, 'ci:full') }}", aggregate)
+        self.assertIn("CI_FULL: ${{ inputs.candidate != '' }}", aggregate)
         self.assertNotIn('CI_HEAD_SHA:', text.split('jobs:')[0])
         self.assertNotIn('CI_HEAD_SHA: ${{ github.event.pull_request.head.sha', text)
         self.assertIn('github.event.merge_group.head_sha || github.sha', text)

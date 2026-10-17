@@ -309,7 +309,13 @@ of these lines (not in a code fence or only an inline comment):
 CODEX-GATE: READY
 CODEX-GATE: MEDIATE
 
-- **READY** — no fixer; apply the `ci:full` label so the full CI matrix runs.
+- **READY** - no fixer. For the staged exact-candidate gate, independently inspect
+  the requested head/base/merge/tree and include `CODEX-CANDIDATE: <requested digest>`
+  before the final READY line. The gate preserves label ownership/hold policy,
+  reserves the exact candidate and runs Linux, Windows and macOS (including docs).
+  Label presence alone cannot start or prove full CI. Human approval follows the
+  current candidate's successful full matrix and final audit. See
+  [rollout and recovery limits](docs/ci-queue-rollout.md).
 - **MEDIATE** — Devin and Claude are stuck; hand off to
   `.github/workflows/stuck-thread-watch.yml` for this PR. The watcher still
   applies its own stuck rules (Claude said it needs a human, or the thread

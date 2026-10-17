@@ -1,7 +1,7 @@
 # Recursion v3 — tiered provider-free CI.
 #
 # Required status check (branch protection): linux (hosted aggregate)
-# Windows and macOS are extra OS coverage, not required on every PR.
+# Full candidate coverage is staged; protection activation remains owner-controlled.
 #
 # Excluded from this gate (not general CI / not runnable here):
 # - tools/check_v3_orientation.py — frozen 2026-09-13 allowed-path repair
@@ -20,11 +20,10 @@
 # `timeout 55` lets the shell emit ::warning:: on hang; timeout-minutes is a
 # backstop, and a follow-up step warns if that backstop kills the shell.
 #
-# ci:full joins this DAG so its OS results feed the same required aggregate.
-# Ignored label events use distinct check names and concurrency groups: skipped
-# jobs must never overlay a required check or cancel an active PR run.
-# Non-docs PR platform-gates requires all OS jobs, even on a Linux-only run;
-# that staged aggregate fails until ci:full supplies complete coverage.
+# An authenticated exact-candidate READY calls this workflow with pinned identities.
+# Every ordinary merge candidate requires Linux, Windows and macOS, including docs.
+# All label events use distinct check names and concurrency groups; labels alone
+# cannot launch paid coverage or overwrite required checks.
 #
 # Non-draft pull_request synchronize waits 120s on free GitHub-hosted Ubuntu
 # before Blacksmith jobs start. A newer push can cancel this run in that wait.
@@ -42,12 +41,26 @@ on:
   merge_group:
     types: [checks_requested]
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      candidate:
+        required: true
+        type: string
+      merge_sha:
+        required: true
+        type: string
+      base_sha:
+        required: true
+        type: string
+      tree_sha:
+        required: true
+        type: string
 
 concurrency:
-  # ci:full shares PR concurrency across heads; ignored labels cannot cancel it.
+  # Admitted candidate CI shares PR concurrency across heads; labels cannot cancel it.
   # Manual dispatch remains a separate lane. Queue arrival order is not freshness
-  # proof, so a Linux-only run can never report non-docs platform-gates success.
-  group: ci-${{ github.workflow }}-${{ (github.event.action == 'labeled' && (github.event.label.name != 'ci:full' || github.event.pull_request.draft)) && format('ignored-label-{0}-{1}', github.event.pull_request.number, github.event.label.name) || github.event.pull_request.number || github.ref }}
+  # proof, so a Linux-only PR run can never report platform-gates success.
+  group: ci-CI-${{ (github.event.action == 'labeled') && format('ignored-label-{0}-{1}', github.event.pull_request.number, github.event.label.name) || github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -60,7 +73,7 @@ env:
 
 jobs:
   settle:
-    name: ${{ (github.event.action == 'labeled' && (github.event.label.name != 'ci:full' || github.event.pull_request.draft)) && 'ignored-label-settle' || 'settle' }}
+    name: ${{ (github.event.action == 'labeled') && 'ignored-label-settle' || 'settle' }}
     if: >
       github.event_name == 'pull_request' &&
       github.event.action == 'synchronize' &&
@@ -72,11 +85,12 @@ jobs:
         run: sleep 120
 
   linux-tests:
-    name: ${{ (github.event.action == 'labeled' && (github.event.label.name != 'ci:full' || github.event.pull_request.draft)) && 'ignored-label-linux-tests' || 'linux-tests' }}
+    name: ${{ (github.event.action == 'labeled') && 'ignored-label-linux-tests' || 'linux-tests' }}
     needs: settle
     if: >
       always() && !cancelled() &&
-      (github.event.action != 'labeled' || (github.event.label.name == 'ci:full' && github.event.pull_request.draft == false)) &&
+      (inputs.candidate == '' || github.run_attempt == 1) &&
+      github.event.action != 'labeled' &&
       (needs.settle.result == 'success' ||
        (needs.settle.result == 'skipped' &&
         !(github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.draft == false)))
@@ -91,13 +105,32 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ inputs.merge_sha || github.sha }}
+          persist-credentials: false
 
       - name: Path filter
         id: paths
         env:
-          CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
-          CI_HEAD_SHA: ${{ github.event.merge_group.head_sha || github.sha }}
-        run: python3 -X utf8 -B tools/ci_gate.py --paths-only
+          CI_BASE_SHA: ${{ inputs.base_sha || github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          CI_HEAD_SHA: ${{ inputs.merge_sha || github.event.merge_group.head_sha || github.sha }}
+          CI_CANDIDATE: ${{ inputs.candidate }}
+        run: |
+          if [ -n "$CI_CANDIDATE" ]; then
+            python3 -X utf8 -B tools/ci_gate.py --paths-only --force
+          else
+            python3 -X utf8 -B tools/ci_gate.py --paths-only
+          fi
+
+      - name: Verify pinned candidate checkout and bounded rerun
+        if: inputs.candidate != ''
+        shell: bash
+        env:
+          EXPECTED_MERGE: ${{ inputs.merge_sha }}
+          EXPECTED_TREE: ${{ inputs.tree_sha }}
+        run: |
+          test "$GITHUB_RUN_ATTEMPT" -eq 1
+          test "$(git rev-parse HEAD)" = "$EXPECTED_MERGE"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_TREE"
 
       - name: Set up Python
         if: steps.paths.outputs.run_full == 'true'
@@ -114,8 +147,8 @@ jobs:
       - name: Provider-free gate
         if: steps.paths.outputs.run_full == 'true'
         env:
-          CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
-          CI_HEAD_SHA: ${{ github.event.merge_group.head_sha || github.sha }}
+          CI_BASE_SHA: ${{ inputs.base_sha || github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          CI_HEAD_SHA: ${{ inputs.merge_sha || github.event.merge_group.head_sha || github.sha }}
         run: python -X utf8 -B tools/ci_gate.py --force
 
       # Same job and runner as the gate. Slowdowns warn; a crash, timeout, or
@@ -138,17 +171,17 @@ jobs:
       - name: Docs-only lightweight checks
         if: steps.paths.outputs.run_full != 'true'
         env:
-          CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
-          CI_HEAD_SHA: ${{ github.event.merge_group.head_sha || github.sha }}
+          CI_BASE_SHA: ${{ inputs.base_sha || github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          CI_HEAD_SHA: ${{ inputs.merge_sha || github.event.merge_group.head_sha || github.sha }}
         run: python3 -X utf8 -B tools/ci_gate.py
 
   # Keep the existing required name fail-closed even when paid tests must skip.
   linux:
-    name: ${{ (github.event.action == 'labeled' && (github.event.label.name != 'ci:full' || github.event.pull_request.draft)) && 'ignored-label-linux' || 'linux' }}
+    name: ${{ (github.event.action == 'labeled') && 'ignored-label-linux' || 'linux' }}
     needs: [settle, linux-tests]
     if: >
       always() &&
-      (github.event.action != 'labeled' || (github.event.label.name == 'ci:full' && github.event.pull_request.draft == false))
+      github.event.action != 'labeled'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -172,11 +205,12 @@ jobs:
           fi
 
   windows:
-    name: ${{ (github.event.action == 'labeled' && (github.event.label.name != 'ci:full' || github.event.pull_request.draft)) && 'ignored-label-windows' || 'windows' }}
+    name: ${{ (github.event.action == 'labeled') && 'ignored-label-windows' || 'windows' }}
     needs: [settle, linux]
     if: >
       always() && !cancelled() &&
-      (github.event.action != 'labeled' || (github.event.label.name == 'ci:full' && github.event.pull_request.draft == false)) &&
+      (inputs.candidate == '' || github.run_attempt == 1) &&
+      github.event.action != 'labeled' &&
       (needs.settle.result == 'success' ||
        (needs.settle.result == 'skipped' &&
         !(github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.draft == false))) &&
@@ -185,9 +219,7 @@ jobs:
       (github.event_name == 'push' ||
        github.event_name == 'merge_group' ||
        github.event_name == 'workflow_dispatch' ||
-       (github.event_name == 'pull_request' &&
-        (contains(github.event.pull_request.labels.*.name, 'ci:full') ||
-         (github.event.action == 'labeled' && github.event.label.name == 'ci:full'))))
+       (github.event_name == 'pull_request_review' && inputs.candidate != ''))
     runs-on: blacksmith-2vcpu-windows-2025
     timeout-minutes: 20
     steps:
@@ -197,6 +229,19 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ inputs.merge_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Verify pinned candidate checkout and bounded rerun
+        if: inputs.candidate != ''
+        shell: bash
+        env:
+          EXPECTED_MERGE: ${{ inputs.merge_sha }}
+          EXPECTED_TREE: ${{ inputs.tree_sha }}
+        run: |
+          test "$GITHUB_RUN_ATTEMPT" -eq 1
+          test "$(git rev-parse HEAD)" = "$EXPECTED_MERGE"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_TREE"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -214,11 +259,12 @@ jobs:
   # GitHub-hosted macOS is not run on master pushes. Nightly master coverage
   # lives in ci-macos-nightly.yml (07:17 UTC, skipped if no commits in 24h).
   macos:
-    name: ${{ (github.event.action == 'labeled' && (github.event.label.name != 'ci:full' || github.event.pull_request.draft)) && 'ignored-label-macos' || 'macos' }}
+    name: ${{ (github.event.action == 'labeled') && 'ignored-label-macos' || 'macos' }}
     needs: [settle, linux]
     if: >
       always() && !cancelled() &&
-      (github.event.action != 'labeled' || (github.event.label.name == 'ci:full' && github.event.pull_request.draft == false)) &&
+      (inputs.candidate == '' || github.run_attempt == 1) &&
+      github.event.action != 'labeled' &&
       (needs.settle.result == 'success' ||
        (needs.settle.result == 'skipped' &&
         !(github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.pull_request.draft == false))) &&
@@ -226,15 +272,26 @@ jobs:
       needs.linux.outputs.run_full == 'true' &&
       (github.event_name == 'merge_group' ||
        github.event_name == 'workflow_dispatch' ||
-       (github.event_name == 'pull_request' &&
-        (contains(github.event.pull_request.labels.*.name, 'ci:full') ||
-         (github.event.action == 'labeled' && github.event.label.name == 'ci:full'))))
+       (github.event_name == 'pull_request_review' && inputs.candidate != ''))
     runs-on: macos-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ inputs.merge_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Verify pinned candidate checkout and bounded rerun
+        if: inputs.candidate != ''
+        shell: bash
+        env:
+          EXPECTED_MERGE: ${{ inputs.merge_sha }}
+          EXPECTED_TREE: ${{ inputs.tree_sha }}
+        run: |
+          test "$GITHUB_RUN_ATTEMPT" -eq 1
+          test "$(git rev-parse HEAD)" = "$EXPECTED_MERGE"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_TREE"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -250,11 +307,11 @@ jobs:
         run: python -X utf8 -B tools/ci_gate.py --force
 
   platform-gates:
-    name: ${{ (github.event.action == 'labeled' && (github.event.label.name != 'ci:full' || github.event.pull_request.draft)) && 'ignored-label-platform-gates' || 'platform-gates' }}
+    name: ${{ (github.event.action == 'labeled') && 'ignored-label-platform-gates' || 'platform-gates' }}
     needs: [settle, linux, windows, macos]
     if: >
       always() &&
-      (github.event.action != 'labeled' || (github.event.label.name == 'ci:full' && github.event.pull_request.draft == false))
+      github.event.action != 'labeled'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -264,6 +321,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          ref: ${{ inputs.merge_sha || github.sha }}
           sparse-checkout: tools/ci_results.py
           sparse-checkout-cone-mode: false
       - name: Require every selected platform result
@@ -272,5 +330,5 @@ jobs:
           CI_EVENT: ${{ github.event_name }}
           CI_ACTION: ${{ github.event.action }}
           CI_DRAFT: ${{ github.event.pull_request.draft || false }}
-          CI_FULL: ${{ contains(github.event.pull_request.labels.*.name, 'ci:full') }}
+          CI_FULL: ${{ inputs.candidate != '' }}
         run: python3 -X utf8 -B tools/ci_results.py

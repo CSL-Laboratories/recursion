@@ -4,7 +4,7 @@
   "title": "Recursion public wire contract vocabulary",
   "x-status": "draft-pending-rule-h-acceptance",
   "x-issue": "CSL-238",
-  "description": "DRAFT rendering of docs/v3/PUBLIC-WIRE-CONTRACTS.md. Non-normative until a rule-H human receipt accepts the exact digest on CSL-238. Language-neutral: the vocabulary describes documents, not transports.",
+  "description": "DRAFT rendering of docs/v3/PUBLIC-WIRE-CONTRACTS.md. Non-normative until a rule-H human receipt accepts the exact digest on CSL-238. Language-neutral: the vocabulary describes documents, not transports. Scalar patterns end with the lookahead (?![\\s\\S]) rather than $: ECMA-262 and Python treat $ differently before a trailing newline (Python's $ also matches before a final newline), while the lookahead is strict end-of-input in both.",
   "type": "object",
   "oneOf": [
     { "$ref": "#/$defs/wire_identity_ref" },
@@ -17,39 +17,39 @@
       "type": "string",
       "minLength": 3,
       "maxLength": 162,
-      "pattern": "^[a-z][a-z0-9-]{0,31}:[A-Za-z0-9._~-]{1,128}$"
+      "pattern": "^[a-z][a-z0-9-]{0,31}:[A-Za-z0-9._~-]{1,128}(?![\\s\\S])"
     },
     "command_id": {
       "type": "string",
       "minLength": 4,
       "maxLength": 132,
-      "pattern": "^cmd:[A-Za-z0-9._~-]{1,128}$"
+      "pattern": "^cmd:[A-Za-z0-9._~-]{1,128}(?![\\s\\S])"
     },
     "digest": {
       "type": "string",
-      "pattern": "^sha256:[0-9a-f]{64}$"
+      "pattern": "^sha256:[0-9a-f]{64}(?![\\s\\S])"
     },
     "token": {
       "type": "string",
       "minLength": 1,
       "maxLength": 96,
-      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,95}$"
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,95}(?![\\s\\S])"
     },
     "type_version": {
       "type": "string",
       "minLength": 3,
       "maxLength": 132,
-      "pattern": "^[A-Za-z][A-Za-z0-9._-]*@[1-9][0-9]{0,2}$"
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]*@[1-9][0-9]{0,2}(?![\\s\\S])"
     },
     "event_type": {
       "type": "string",
       "minLength": 3,
       "maxLength": 96,
-      "pattern": "^[A-Z][A-Za-z0-9]*(\\.[A-Z][A-Za-z0-9]*)+$"
+      "pattern": "^[A-Z][A-Za-z0-9]*(\\.[A-Z][A-Za-z0-9]*)+(?![\\s\\S])"
     },
     "utc_timestamp": {
       "type": "string",
-      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z(?![\\s\\S])",
       "x-calendar-date": true
     },
     "seq": {

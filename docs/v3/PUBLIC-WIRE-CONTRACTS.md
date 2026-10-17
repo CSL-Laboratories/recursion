@@ -83,6 +83,11 @@ This draft reuses the encoding discipline of
 | `PosInt` | JSON integer 1–2,147,483,647 | — |
 | `OpaqueRef` | printable non-whitespace ASCII, never a secret | 1–192 bytes |
 
+The grammar column uses `$` for readability; the normative schema terminates each pattern
+with `(?![\s\S])` instead. ECMA-262's `$` matches only at true end-of-input, while Python's
+`re` also lets `$` match before a trailing `\n` — the lookahead is strict end-of-input in
+both dialects, so `"cmd:x\n"` and newline-suffixed digests reject identically everywhere.
+
 The `namespace` of a `PublicId` names its record family (`arm`, `evt`, `cmd`, `stream`,
 `grant`, …); a namespace registry is an O2 freeze-time artifact, deferred here.
 

@@ -11,7 +11,7 @@
     "type": { "const": "WireJournalSequence@1" },
     "sequence_id": {
       "type": "string",
-      "pattern": "^seq:[a-z0-9][a-z0-9._~-]{0,127}$"
+      "pattern": "^seq:[a-z0-9][a-z0-9._~-]{0,127}(?![\\s\\S])"
     },
     "steps": {
       "type": "array",
@@ -29,11 +29,11 @@
             "properties": {
               "command_id": {
                 "type": "string",
-                "pattern": "^cmd:[A-Za-z0-9._~-]{1,128}$"
+                "pattern": "^cmd:[A-Za-z0-9._~-]{1,128}(?![\\s\\S])"
               },
               "command_digest": {
                 "type": "string",
-                "pattern": "^sha256:[0-9a-f]{64}$"
+                "pattern": "^sha256:[0-9a-f]{64}(?![\\s\\S])"
               }
             }
           },

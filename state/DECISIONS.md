@@ -523,3 +523,90 @@ already use `csl-<N>-<slug>`. Workflows were not edited in this decision.
 `csl-<N>-<slug>` branch plus a `CSL-N` title fails the Linear-key check.
 
 **Review:** 2026-12-01.
+
+---
+
+## D-041 - Founder authority split and bounded governance authoring
+Date: 2026-10-16 - Status: ACCEPTED authority direction; repository amendment pending review and merge
+
+**Source records:** Lucas's 2026-10-16 22:55 UTC confirmation is recorded as an attributed
+agent relay on [CSL-45](https://linear.app/csl-laboratories/issue/CSL-45/list-planned-features-and-research-items-for-recursion#comment-59f88559)
+(comment `59f88559-8967-46a6-9be5-d3e9f3499e0a`, 22:57:52 UTC) and
+[CSL-44](https://linear.app/csl-laboratories/issue/CSL-44#comment-bbe42521)
+(comment `bbe42521-10fa-4ef0-b799-1c56fec9ddad`, 22:58:08 UTC). These are agent-authored
+records of his confirmation, not personally typed founder comments. They bind month plan
+rev 3.4, SHA256 `3071ef2592dbef82e63b3173c030d975a55b093c7e95cff1b499d70319b744c8`.
+
+**Authoring-session approval:** In parent task `01a0fe67-c17a-7798-8cb4-a7c1a86710d7`, the
+assistant asked: "The next governance step needs the explicit authoring session required
+by your contract: may I use one writer on a new branch to amend CONTROL_PLANE.md to the
+authority split you approved and append the matching entry to state/DECISIONS.md? This
+would be a reviewable PR, with no repository permission/settings changes or merge."
+Lucas replied: "Yes absolutely? You have my complete authorization. Let’s get everything
+landed." The session is recorded on
+[CSL-45](https://linear.app/csl-laboratories/issue/CSL-45#comment-1aca1256)
+(comment `1aca1256-3e03-4eb2-848f-3a0b98f80d15`). The delegated scope explicitly retains
+no merge by this writer; the reply is not used as an agent-merge exception.
+
+**Options and choice:** Replace Lucas-only product/implementation approval with decisions
+by any founder within the approved split; retain Lucas's reserved decisions and final
+tie-break. Reject a blanket prohibition on agents executing individually approved live
+actions, but require the recorded authorization and landed R2a gate below. This records
+the confirmed choice, not an agent-selected alternative or a new implementation contract.
+
+**Prior rationale preserved:** D-017 records the 2026-09-28 single-product reset: the former
+Hermes-led portfolio control plane was retired because it supplied no v3 dependency and
+version coexistence caused contributor-blocking drift. Its consequence placed the repository
+under Lucas alone, with bounded coding agents and no standing executive. D-040 later changed
+only branch naming and explicitly retained the then-current merge/deployment limits. Those
+entries and their reasons remain unchanged. This amendment supersedes their Lucas-only
+governance consequence where it conflicts with the newly confirmed authority split; it
+does not reverse the single-product scope, retirement, or bounded-executor model.
+
+**Confirmed authority and conditions:**
+- Any founder (Lucas Guerra, Chaandan Saini, Samir) may decide product and
+  implementation questions from research, research-lane outcomes, feature admission within
+  a lane, or research continuation within its approved budget. A1b core language/runtime
+  choice belongs to the founders; no language is selected. All three make the final release
+  decision.
+- Founders merge after required review and checks. Agents recommend and propose; they do
+  not decide, merge, force-push, or fabricate founder decisions. Any founder may approve
+  protected-path or merge-rule amendments through a recorded authoring session.
+- Lucas reserves spending/new services, sensitive company credentials including company
+  API-key generation, company-server deployments including Railway, and the final tie-break.
+  Approved research continuation cannot raise its budget or delegate those reserved powers.
+- Developers own their individual live actions, accounts, keys and tests. Agent execution
+  requires the developer's recorded route/account/spend-ceiling approval, uses their own
+  accounts/keys, and is blocked until the R2a permission-profile fix has landed. Company
+  credentials/deployments still need Lucas's approval. Building is not operating permission;
+  this amendment grants no specific live run, spending, credential use, deployment, quota
+  reset or destructive action.
+- Decision packets retain options, evidence classes, tradeoffs, recommendation, strongest
+  countercase, reversibility, research cost and deadline. Consequential founder records retain
+  the chosen option, rationale, conditions and revisit trigger.
+- The companion project's paper-only restriction, nine invariants and pre-live gates remain
+  unchanged, as recorded on CSL-44. No person-level
+  approval unlocks live capital. Accepted CSL-212 bytes and receipts are untouched; a later
+  amendment requires its separate versioned candidate, exact acceptance and reviewed promotion.
+
+**Session boundary and consequence:** Codex Sentry is the sole writer on
+`csl-45-governance-authoring`, based on #221 head
+`41c50a6e09a3ceacbd9ba2cee6a16f0e9ffa4fa0`. Only `CONTROL_PLANE.md` and this appended entry
+change. Historical decision bytes are preserved. Cross-family review and independent
+exact-candidate verification precede draft publication. AGENTS/CLAUDE/CONTRIBUTING alignment
+remains a coordinated follow-on; no settings, CODEOWNERS, rulesets, grants, credentials,
+live actions, queue activation, other-owner branch writes, rebase, force push or merge occurs.
+This is not Phase 1 completion, an unknown contract-digest acceptance or a release decision.
+
+**Open items preserved:** A1b language selection, A2 CSL-42 policy, A4 economics, A5 GUI
+toolkit, D1 enterprise fabric/provider terms, D2b account import, D3 Kalshi path, E2
+co-developer Cursor capacity, P2 CI envelope/cadence, P3/P4 budget setters and claimants,
+B5 queue activation, the proposed Oct 27 admission cut, and bake-off fallback remain open.
+R2a/B6 still require their bounded contracts and applicable gates; this entry does not
+authorize their implementation or claim either has landed.
+
+**Falsifier / revisit trigger:** a founder decision is reversed or disputed more than once
+in a week, or a spend, credential or deployment boundary is crossed without authorization.
+Record the event and seek a founder decision; no automatic policy expansion follows.
+
+**Review:** at the recorded revisit trigger or the next monthly decision-log review.

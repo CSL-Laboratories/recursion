@@ -82,11 +82,16 @@ See [AGENTS.md#when-claude-cant-fix-a-review-thread](AGENTS.md#when-claude-cant-
   lowercase branch name alone does not pass. The `CSL-N` key in the PR title
   satisfies the check.
 - Never commit to `master` directly and never force-push.
-- Open a PR for review. **Lucas merges every review branch himself**; an automated run only
-  ever produces a review branch.
+- Open a PR for review. **Founders merge review branches after required reviews and checks**
+  under `CONTROL_PLANE.md`; agents never merge. All three founders make the final release
+  decision, and Lucas retains the reserved decisions and final tie-break. This workflow
+  does not accept a pending contract or bypass an owner hold.
+  Until rulesets enforce it, no founder merges their own PR without another founder's
+  approval.
 - Keep changes inside your declared allowed paths. `CONTROL_PLANE.md`, `ANCHOR.md`,
   `state/DECISIONS.md`, `scripts/`, `schemas/` and `.env` are protected paths — a change
-  there needs an explicitly approved control-plane authoring session, not a product PR.
+  there needs a separately recorded founder-approved authoring session under
+  `CONTROL_PLANE.md`, not a product PR.
 
 ## Review loop
 
@@ -114,6 +119,13 @@ On Windows, paths can exceed 260 characters; pass `-c core.longpaths=true` per G
 - The construction **foundry** (a WSL Devin/SWE-2 harness) was retired on 2026-09-28. Do not
   restart it; its code and records are in git history only.
 - Physical or live-provider execution, spending, deployment, publication and merging are
-  human-gated. Propose them in `state/PROPOSALS.md`; do not perform them.
+  human-gated. Only the developer-approved own-account agent execution defined in
+  `CONTROL_PLANE.md` is permitted after R2a lands, with route/account/spend-ceiling approval
+  recorded. Lucas's company-resource and spending approvals remain required; quota resets
+  require separate human approval. Outside that explicit scope, propose actions in
+  `state/PROPOSALS.md`; do not perform them. Agents never merge, and these docs grant no
+  specific live action, accepted contract or live-capital permission.
+  Destructive or irreversible live actions, even on your own accounts, need explicit
+  approval for each action. "R2a landed" means a merged, reviewed PR.
 
 When in doubt, prefer a small, verified change with a named gate over a large, plausible one.

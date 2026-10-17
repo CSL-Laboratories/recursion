@@ -41,6 +41,7 @@
     { "id": "A-15", "path": "adverse/A-15-event-impossible-date.json", "target": "wire_event_envelope", "kind": "adverse", "expect": "reject", "note": "x-calendar-date: 2026-02-30 cannot exist" },
     { "id": "A-16", "path": "adverse/A-16-advert-sunset-not-supported.json", "target": "wire_version_advertisement", "kind": "adverse", "expect": "reject", "note": "x-sunset-subset-of-supported semantic rule" },
     { "id": "A-17", "path": "adverse/A-17-identity-duplicate-key.json", "target": "wire_identity_ref", "kind": "adverse", "expect": "reject", "note": "strict-decode: duplicate object key" },
-    { "id": "A-18", "path": "adverse/A-18-event-lexical-negzero.json", "target": "wire_event_envelope", "kind": "adverse", "expect": "reject", "note": "strict-decode: lexical -0" }
+    { "id": "A-18", "path": "adverse/A-18-event-lexical-negzero.json", "target": "wire_event_envelope", "kind": "adverse", "expect": "reject", "note": "strict-decode: lexical -0" },
+    { "id": "A-19", "path": "adverse/A-19-outcome-conflict-with-refusal.json", "target": "wire_command_outcome", "kind": "adverse", "expect": "reject", "note": "conflict outcome carries a refusal block — journal-level outcome, never refused" }
   ]
 }

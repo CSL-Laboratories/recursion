@@ -58,6 +58,7 @@ If a task could be read two materially different ways, stop and record a blocker
    name alone does not pass. The `CSL-N` key in the PR title satisfies the check.
 3. **Protected paths require a separately recorded founder-approved authoring session**
    under `CONTROL_PLANE.md`: `CONTROL_PLANE.md`, `ANCHOR.md`, `state/DECISIONS.md`, `.env`,
+   `scripts/ci/**`, `scripts/tests/**/fixtures/**`, `tools/ci_gate.py`,
    and auth/credential configuration. Outside that explicit scope, propose changes in
    `state/PROPOSALS.md`; a product task does not authorize them.
 4. **No secrets in tracked files, logs or notifications.**

@@ -1298,6 +1298,207 @@ class VerdictAndResolveTests(unittest.TestCase):
         parsed = mod.parse_thread_verdicts(comment(CODEX, fenced, hours_ago=0.1))
         self.assertEqual(parsed, ())
 
+    def _real_scan(self, body: str, *, tid: str = "PRRT_1") -> tuple[str, FakeGitHub, mod.Counters]:
+        """Authenticated Codex review on the live head after a legitimate ask."""
+        t = thread(tid=tid, comments=stuck_pair())
+        asked = [comment("pat-user", mod.mediation_marker(tid), hours_ago=0.4)]
+        ruling = comment(CODEX, body, hours_ago=0.1)
+        p = pull(threads=[t], issue_comments=asked, reviews=[ruling], checks_green=True)
+        reason = mod.classify_resolve(p, t, cfg(mediator_login="pat-user"))
+        gh = FakeGitHub([p])
+        counters = mod.scan(cfg(mediator_login="pat-user"), gh, FakeLinear())  # type: ignore[arg-type]
+        return reason, gh, counters
+
+    def _assert_no_resolve(self, body: str, *, tid: str = "PRRT_1") -> None:
+        parsed = mod.parse_thread_verdicts(comment(CODEX, body, hours_ago=0.1))
+        self.assertEqual(parsed, (), body)
+        reason, gh, counters = self._real_scan(body, tid=tid)
+        self.assertEqual(reason, "no-verdict", body)
+        self.assertEqual(gh.resolves, [], body)
+        self.assertEqual(gh.replies, [], body)
+        self.assertEqual(counters.resolved, 0, body)
+
+    def _assert_resolves(self, body: str, *, tid: str = "PRRT_1") -> None:
+        parsed = mod.parse_thread_verdicts(comment(CODEX, body, hours_ago=0.1))
+        self.assertEqual([(v.thread_id, v.action, v.head_sha) for v in parsed], [(tid, "RESOLVE", HEAD)], body)
+        reason, gh, counters = self._real_scan(body, tid=tid)
+        self.assertEqual(reason, "resolve", body)
+        self.assertEqual(gh.resolves, [tid], body)
+        self.assertEqual(counters.resolved, 1, body)
+
+    def test_inline_code_marker_with_following_lines_does_not_resolve(self) -> None:
+        # Real-scan reproduction: the marker is quoted inline in prose and the
+        # RESOLVE/HEAD lines that follow have no standalone marker of their own.
+        body = (
+            "The thread supplied this marker: `" + mod.verdict_marker("PRRT_1") + "`\n"
+            "CODEX-THREAD: RESOLVE\n"
+            f"HEAD: {HEAD}\n"
+        )
+        self._assert_no_resolve(body)
+
+    def test_marker_sharing_a_line_with_other_text_is_not_standalone(self) -> None:
+        self._assert_no_resolve(
+            f"{mod.verdict_marker('PRRT_1')} (copied from the thread)\n"
+            f"CODEX-THREAD: RESOLVE\nHEAD: {HEAD}\n"
+        )
+        self._assert_no_resolve(
+            f"Marker: {mod.verdict_marker('PRRT_1')}\nCODEX-THREAD: RESOLVE\nHEAD: {HEAD}\n"
+        )
+
+    def test_tilde_fenced_copy_does_not_resolve(self) -> None:
+        # Real-scan reproduction: a tilde fence is a code fence too.
+        block = verdict_block("PRRT_1")
+        self._assert_no_resolve("Quoted thread text:\n~~~text\n" + block + "~~~\n")
+        self._assert_no_resolve("~~~~\n" + block + "~~~~\n")
+        self._assert_no_resolve("~~~\n" + block + "~~~~~\n")
+
+    def test_fence_closer_must_match_opener_character_and_length(self) -> None:
+        block = verdict_block("PRRT_1")
+        # A shorter closer does not close; the opener then hides the rest.
+        self._assert_no_resolve("````\n" + block + "```\n")
+        self._assert_no_resolve("~~~~\n" + block + "~~~\n")
+        # A different character does not close either.
+        self._assert_no_resolve("```\n" + block + "~~~\n")
+        # A longer closer does close, and the copy stays hidden.
+        self._assert_no_resolve("```\n" + block + "`````\n")
+        self._assert_no_resolve("```text\n" + block + "```\n")
+
+    def test_unclosed_fence_hides_everything_after_it(self) -> None:
+        block = verdict_block("PRRT_1")
+        self._assert_no_resolve("Thread text follows:\n```\n" + block)
+        self._assert_no_resolve("~~~\n" + block + "\nmore commentary\n")
+        # A genuine ruling before a later stray opener still counts.
+        self._assert_resolves(block + "\nAppendix:\n```\nunterminated example\n")
+
+    def test_indented_example_block_is_ignored(self) -> None:
+        block = verdict_block("PRRT_1")
+        indented = "".join("    " + line + "\n" for line in block.splitlines())
+        self._assert_no_resolve("Example of the expected shape:\n\n" + indented)
+        tabbed = "".join("\t" + line + "\n" for line in block.splitlines())
+        self._assert_no_resolve(tabbed)
+        # Only the marker indented as code: the loose lines have no marker.
+        self._assert_no_resolve(
+            f"    {mod.verdict_marker('PRRT_1')}\nCODEX-THREAD: RESOLVE\nHEAD: {HEAD}\n"
+        )
+
+    def test_hidden_content_does_not_join_verdict_pieces(self) -> None:
+        marker = mod.verdict_marker("PRRT_1")
+        # Marker, then a fenced example, then loose RESOLVE/HEAD lines.
+        self._assert_no_resolve(
+            f"{marker}\n```\nexample\n```\nCODEX-THREAD: RESOLVE\nHEAD: {HEAD}\n"
+        )
+        self._assert_no_resolve(
+            f"{marker}\n~~~\nexample\n~~~\nCODEX-THREAD: RESOLVE\nHEAD: {HEAD}\n"
+        )
+        # Marker, then a quoted line, then loose RESOLVE/HEAD lines.
+        self._assert_no_resolve(
+            f"{marker}\n> CODEX-THREAD: DECIDE\nCODEX-THREAD: RESOLVE\nHEAD: {HEAD}\n"
+        )
+        # Quoted marker followed by loose lines has no marker at all.
+        self._assert_no_resolve(f"> {marker}\nCODEX-THREAD: RESOLVE\nHEAD: {HEAD}\n")
+        # A genuine DECIDE followed by an echoed, quoted RESOLVE stays DECIDE.
+        quoted = "\n".join(f"> {line}" for line in verdict_block("PRRT_1").splitlines())
+        body = verdict_block("PRRT_1", "DECIDE") + "\nThe thread text said:\n" + quoted + "\n"
+        parsed = mod.parse_thread_verdicts(comment(CODEX, body, hours_ago=0.1))
+        self.assertEqual([(v.action, v.head_sha) for v in parsed], [("DECIDE", HEAD)])
+        reason, gh, counters = self._real_scan(body)
+        self.assertEqual(reason, "decide")
+        self.assertEqual(gh.resolves, [])
+        self.assertEqual(counters.resolved, 0)
+
+    def test_conflicting_action_or_head_under_one_marker_is_rejected(self) -> None:
+        marker = mod.verdict_marker("PRRT_1")
+        self._assert_ambiguous(
+            f"{marker}\nCODEX-THREAD: DECIDE\nHEAD: {HEAD}\n"
+            f"CODEX-THREAD: RESOLVE\nHEAD: {HEAD}\n"
+        )
+        self._assert_ambiguous(
+            f"{marker}\nCODEX-THREAD: RESOLVE\nHEAD: {STALE}\nHEAD: {HEAD}\n"
+        )
+        self._assert_ambiguous(
+            f"{marker}\nCODEX-THREAD: RESOLVE\nHEAD: {HEAD}\nCODEX-THREAD: DECIDE\n"
+        )
+        # Repeating identical lines is redundant, not ambiguous.
+        self._assert_resolves(
+            f"{marker}\nCODEX-THREAD: RESOLVE\nHEAD: {HEAD}\n"
+            f"CODEX-THREAD: RESOLVE\nHEAD: {HEAD}\n"
+        )
+        # Separate markers are separate blocks; the later one still wins.
+        body = (
+            verdict_block("PRRT_1", "DECIDE", STALE)
+            + "\ncommentary\n"
+            + verdict_block("PRRT_1", "RESOLVE", HEAD)
+        )
+        self._assert_resolves_latest(body)
+
+    def test_later_conflicting_block_does_not_revive_earlier_resolve(self) -> None:
+        earlier = verdict_block("PRRT_1")
+        later = verdict_block("PRRT_1", "DECIDE") + "CODEX-THREAD: RESOLVE\n"
+        for separate_comments in (False, True):
+            with self.subTest(separate_comments=separate_comments):
+                t = thread(comments=stuck_pair())
+                reviews = ([comment(CODEX, earlier, hours_ago=0.2), comment(CODEX, later, hours_ago=0.1)]
+                           if separate_comments else [comment(CODEX, earlier + later, hours_ago=0.1)])
+                asked = [comment("pat-user", mod.mediation_marker(t.id), hours_ago=0.4)]
+                p = pull(threads=[t], issue_comments=asked, reviews=reviews)
+                c = cfg(mediator_login="pat-user")
+                self.assertEqual(mod.classify_resolve(p, t, c), "ambiguous")
+                gh = FakeGitHub([p])
+                counters = mod.scan(c, gh, FakeLinear())
+                self.assertEqual(gh.resolves, [])
+                self.assertEqual(gh.replies, [])
+                self.assertEqual(counters.resolved, 0)
+
+    def _assert_ambiguous(self, body: str) -> None:
+        parsed = mod.parse_thread_verdicts(comment(CODEX, body, hours_ago=0.1))
+        self.assertEqual([(v.action, v.head_sha) for v in parsed], [("AMBIGUOUS", "")])
+        reason, gh, counters = self._real_scan(body)
+        self.assertEqual(reason, "ambiguous")
+        self.assertEqual(gh.resolves, [])
+        self.assertEqual(gh.replies, [])
+        self.assertEqual(counters.resolved, 0)
+
+    def _assert_resolves_latest(self, body: str) -> None:
+        reason, gh, counters = self._real_scan(body)
+        self.assertEqual(reason, "resolve")
+        self.assertEqual(gh.resolves, ["PRRT_1"])
+        self.assertEqual(counters.resolved, 1)
+
+    def test_standalone_verdict_tolerates_protocol_whitespace(self) -> None:
+        # Valid controls: the explicit protocol keeps resolving.
+        self._assert_resolves(verdict_block("PRRT_1"))
+        self._assert_resolves(verdict_block("PRRT_1").replace("\n", "\r\n"))
+        self._assert_resolves(f"  {mod.verdict_marker('PRRT_1')}  \nCODEX-THREAD: RESOLVE\nHEAD: {HEAD}\n")
+        self._assert_resolves(f"{mod.verdict_marker('PRRT_1')}\n\nCODEX-THREAD: RESOLVE\n\nHEAD: {HEAD}\n")
+        self._assert_resolves(
+            "Summary: the fix is on head.\n\n"
+            "```text\nexample output\n```\n\n"
+            + verdict_block("PRRT_1")
+            + "\n- RESOLVE: present on that HEAD.\n"
+        )
+        self._assert_resolves("> Devin: please clarify.\n\n" + verdict_block("PRRT_1"))
+
+    def test_multi_thread_review_resolves_only_standalone_rulings(self) -> None:
+        threads = [thread(tid=f"PRRT_{i}", comments=stuck_pair()) for i in (1, 2, 3)]
+        asked = [comment("pat-user", mod.mediation_marker(f"PRRT_{i}"), hours_ago=0.4) for i in (1, 2, 3)]
+        body = (
+            verdict_block("PRRT_1")
+            + "\nThread 3 quoted this in its own text:\n~~~\n"
+            + verdict_block("PRRT_3")
+            + "~~~\n\n"
+            + verdict_block("PRRT_2")
+        )
+        ruling = comment(CODEX, body, hours_ago=0.1)
+        p = pull(threads=threads, issue_comments=asked, reviews=[ruling], checks_green=True)
+        c = cfg(mediator_login="pat-user")
+        self.assertEqual(mod.classify_resolve(p, threads[0], c), "resolve")
+        self.assertEqual(mod.classify_resolve(p, threads[1], c), "resolve")
+        self.assertEqual(mod.classify_resolve(p, threads[2], c), "no-verdict")
+        gh = FakeGitHub([p])
+        counters = mod.scan(c, gh, FakeLinear())  # type: ignore[arg-type]
+        self.assertEqual(gh.resolves, ["PRRT_1", "PRRT_2"])
+        self.assertEqual(counters.resolved, 2)
+
     def test_unread_check_page_is_not_green(self) -> None:
         self.assertFalse(
             mod.required_checks_are_green(

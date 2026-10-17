@@ -170,6 +170,49 @@ class SmokeTests(unittest.TestCase):
                 overhead["trivial_spawn_median_ns"],
                 report["baseline"]["phases"]["spawn"]["median_ns"],
             )
+            self.assertEqual(
+                overhead["trivial_total_median_ns"],
+                report["baseline"]["phases"]["total"]["median_ns"],
+            )
+            self.assertIn("not adapter-only overhead", overhead["note"])
+        for row in rows:
+            for sample in row["samples"]:
+                token = sample["verdict_token"]
+                if row["name"] in {"claude-stream-json", "grok-review"}:
+                    self.assertEqual(token, "approve")
+                    self.assertTrue(sample["verdict_token_exercised"])
+                    self.assertEqual(sample["verdict"], "approve")
+                else:
+                    self.assertIsNone(token)
+                    self.assertFalse(sample["verdict_token_exercised"])
+                    self.assertEqual(sample["verdict"], "revise")
+
+
+class VerdictTests(unittest.TestCase):
+    def test_present_token_must_match_and_absent_token_is_revise(self) -> None:
+        expected = {
+            "claude-stream-json": "approve",
+            "grok-review": "approve",
+            "codex-exec-jsonl": None,
+            "codex-cumulative": None,
+            "grok-streaming-json": None,
+        }
+        workload = perf_e2e.load_workload(ROOT)
+        seen = set()
+        for spec in workload["fixtures"]:
+            raw = (ROOT / spec["path"]).read_text(encoding="utf-8")
+            parsed = perf_e2e._stream_parse(raw)
+            checked = perf_e2e._validate(parsed, perf_e2e.PROMPT, raw)
+            self.assertEqual(checked["verdict_token"], expected[spec["name"]])
+            self.assertEqual(parsed["verdict"], expected[spec["name"]] or "revise")
+            self.assertEqual(checked["verdict_token_exercised"], expected[spec["name"]] is not None)
+            seen.add(spec["name"])
+        self.assertEqual(seen, set(expected))
+        baseline = perf_e2e._stream_parse("ok\n")
+        checked = perf_e2e._validate(baseline, perf_e2e.PROMPT, "ok\n")
+        self.assertIsNone(checked["verdict_token"])
+        self.assertFalse(checked["verdict_token_exercised"])
+        self.assertEqual(baseline["verdict"], "revise")
 
 
 class FailureTests(unittest.TestCase):

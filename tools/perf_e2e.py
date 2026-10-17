@@ -17,6 +17,7 @@ import json
 import math
 import os
 import platform
+import re
 import statistics
 import subprocess
 import sys
@@ -57,6 +58,16 @@ PHASES = ("spawn", "first_event", "stream_parse", "validate", "persist", "total"
 P99_MIN_N = 100
 CHILD_TIMEOUT_S = 30
 PROMPT = "Replay the recorded stream. Do not call a provider."
+_VERDICT_LINE = re.compile(
+    r"^(?:[*_`]+)?\s*verdict\s*:?\s*(approve|revise)\b[.!]?\s*(?:[*_`]+)?\s*$",
+    re.IGNORECASE,
+)
+_OVERHEAD_NOTE = (
+    "harness_overhead_ns is fixture total median minus trivial spawn median only. "
+    "The fixture's first event, parse, validate, and persist stay in that result, "
+    "and the trivial child's non-spawn time is not removed. It is not adapter-only overhead. "
+    "trivial_total_median_ns is reported beside the two operands."
+)
 DIMENSION_NAMES = (
     "authority, safety, privacy, effects",
     "verified quality",
@@ -390,18 +401,48 @@ def _stream_parse(raw: str) -> dict:
     }
 
 
-def _validate(parsed: dict, prompt: str) -> dict:
+def _clean_verdict_line(line: str) -> str:
+    text = line.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'`":
+        text = text[1:-1].strip()
+    return text
+
+
+def _expected_verdict_token(raw: str) -> str | None:
+    """Last approve/revise token in the text parse_verdict judges, or None."""
+    last = claude_last_message(raw)
+    body = assistant_text(raw) if last is None else last
+    found = None
+    for line in body.splitlines():
+        match = _VERDICT_LINE.fullmatch(_clean_verdict_line(line))
+        if match is not None:
+            found = match.group(1).lower()
+    return found
+
+
+def _validate(parsed: dict, prompt: str, raw: str) -> dict:
     try:
         budgets = default_budgets()
         fits = call_fits(parsed["usage"], budgets, prompt)
         over = exceeded(parsed["usage"], budgets)
+        token = _expected_verdict_token(raw)
         if parsed["verdict"] not in {"approve", "revise"}:
             raise PerfE2EError(f"verdict {parsed['verdict']!r} is not approve or revise")
+        if token is None:
+            if parsed["verdict"] != "revise":
+                raise PerfE2EError("a stream with no verdict token did not fall back to revise")
+        elif parsed["verdict"] != token:
+            raise PerfE2EError(f"verdict token {token} was parsed as {parsed['verdict']}")
     except PerfE2EError:
         raise
     except Exception as exc:
         raise PerfE2EError(f"validate exception: {type(exc).__name__}: {exc}") from exc
-    return {"call_fits": bool(fits), "exceeded": bool(over)}
+    return {
+        "call_fits": bool(fits),
+        "exceeded": bool(over),
+        "verdict_token": token,
+        "verdict_token_exercised": token is not None,
+    }
 
 
 def _as_error(exc: Exception) -> PerfE2EError:
@@ -432,7 +473,7 @@ def _complete_sample(t0: int, child: dict, state_dir: Path, *, name: str, provid
     parse_0 = time.perf_counter_ns()
     parsed = _stream_parse(child["stdout"])
     parse_1 = time.perf_counter_ns()
-    checked = _validate(parsed, PROMPT)
+    checked = _validate(parsed, PROMPT, child["stdout"])
     validate_1 = time.perf_counter_ns()
     _persist(state_dir, name=name, provider=provider, parsed=parsed, checked=checked)
     persist_1 = time.perf_counter_ns()
@@ -445,6 +486,8 @@ def _complete_sample(t0: int, child: dict, state_dir: Path, *, name: str, provid
         "persist_ns": persist_1 - validate_1,
         "total_ns": persist_1 - t0,
         "verdict": parsed["verdict"],
+        "verdict_token": checked["verdict_token"],
+        "verdict_token_exercised": checked["verdict_token_exercised"],
         "call_fits": checked["call_fits"],
         "exceeded": checked["exceeded"],
         "host": child["host"],
@@ -656,12 +699,14 @@ def _row(name: str, samples: list[dict], pilot: dict, *, extra: dict | None = No
     return row
 
 
-def _overhead(fixture_total: int, trivial_spawn: int) -> dict:
+def _overhead(fixture_total: int, trivial_spawn: int, trivial_total: int) -> dict:
     return {
         "fixture_total_median_ns": fixture_total,
         "trivial_spawn_median_ns": trivial_spawn,
+        "trivial_total_median_ns": trivial_total,
         "harness_overhead_ns": fixture_total - trivial_spawn,
         "expression": "fixture_total_median_ns - trivial_spawn_median_ns",
+        "note": _OVERHEAD_NOTE,
     }
 
 
@@ -729,6 +774,7 @@ def run_profile(root: Path, *, smoke: bool, fixture_names: str) -> dict:
             **common,
         )
         trivial_spawn = summarize_phase([sample["spawn_ns"] for sample in baseline_samples])["median_ns"]
+        trivial_total = summarize_phase([sample["total_ns"] for sample in baseline_samples])["median_ns"]
         fixtures = []
         for spec, payload in loaded:
             adapter = open_provider(spec["provider"])
@@ -753,7 +799,7 @@ def run_profile(root: Path, *, smoke: bool, fixture_names: str) -> dict:
                         "provider": spec["provider"],
                         "evidence": spec["evidence"],
                         "sha256_lf": spec["sha256_lf"],
-                        "overhead": _overhead(total_median, trivial_spawn),
+                        "overhead": _overhead(total_median, trivial_spawn, trivial_total),
                     },
                 )
             )

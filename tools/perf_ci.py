@@ -34,27 +34,26 @@ class PerfCIError(RuntimeError):
     """The check could not measure both sides."""
 
 
-def _ratio_limit() -> float:
-    raw = os.environ.get("PERF_REGRESSION_RATIO", "").strip()
+def _env_float(name: str, default: float) -> float:
+    """Parse a float env override, or `default` when unset or blank."""
+    raw = os.environ.get(name, "").strip()
     if not raw:
-        return DEFAULT_RATIO
+        return default
     try:
-        value = float(raw)
+        return float(raw)
     except ValueError as exc:
-        raise PerfCIError(f"PERF_REGRESSION_RATIO={raw!r} is not a number") from exc
+        raise PerfCIError(f"{name}={raw!r} is not a number") from exc
+
+
+def _ratio_limit() -> float:
+    value = _env_float("PERF_REGRESSION_RATIO", DEFAULT_RATIO)
     if value <= 1:
         raise PerfCIError("PERF_REGRESSION_RATIO must be greater than 1")
     return value
 
 
 def _absolute_floor() -> float:
-    raw = os.environ.get("PERF_ABSOLUTE_FLOOR_S", "").strip()
-    if not raw:
-        return perf_compare.DEFAULT_ABSOLUTE_FLOOR_S
-    try:
-        value = float(raw)
-    except ValueError as exc:
-        raise PerfCIError(f"PERF_ABSOLUTE_FLOOR_S={raw!r} is not a number") from exc
+    value = _env_float("PERF_ABSOLUTE_FLOOR_S", perf_compare.DEFAULT_ABSOLUTE_FLOOR_S)
     if value < 0:
         raise PerfCIError("PERF_ABSOLUTE_FLOOR_S must be >= 0")
     return value

@@ -487,20 +487,21 @@ demonstrate a non-dominated improvement without a hard-floor regression before a
 ## Constitutional reconciliation required
 
 Lucas selected provider-neutral planning inside an explicit approved
-model/provider/account/capacity-pool envelope. The current constitution still names ChatGPT via
-Codex OAuth, so the product ruling requires a separately reviewed constitutional amendment
-before private deployment configuration changes. OR-016 establishes the product principle that
-the Recursion-owned `Head` remains the accountable logical actor, models and external harnesses
-are authorized replaceable compute, deterministic code actuates, and Lucas retains authority.
-Current Hermes-specific operative wording remains in force until the separate constitutional
-amendment is applied. The exact proposed clauses and migration seam are recorded in
+model/provider/account/capacity-pool envelope. The earlier constitution's ChatGPT/Codex OAuth
+and Hermes-specific wording belongs to the repository control plane retired on 2026-09-28,
+as recorded in `CONTROL_PLANE.md`; it is not operative authority for v3. OR-016 records the
+product principle of an accountable Recursion-owned `Head`, replaceable models and external
+harnesses, deterministic actuation, and Lucas's authority. That product target does not activate
+a replacement `Head` or transfer authority. `CONTROL_PLANE.md` remains controlling, including
+its human gates for live spending, credentials, and deployment. The historical amendment
+proposal is retained in
 [CONSTITUTIONAL-AMENDMENT-PROPOSAL.md](CONSTITUTIONAL-AMENDMENT-PROPOSAL.md).
 
 The proposed future `checkpoint` PAUSE default and a maximum `sovereign` profile capable of receiving
 control-plane, credential, spending, publication, deployment and `grant-admin` authority
-also differ from current constitutional defaults. V3 research must produce exact amendment
-choices and preserve explicit receipts/audit boundaries; these docs do not authorize a live
-policy or configuration change. See [DECISION-REGISTER.md](DECISION-REGISTER.md).
+were framed against the earlier constitutional defaults. These remain proposals, not authority
+for a live policy or configuration change. V3 research must preserve explicit receipts/audit
+boundaries. See [DECISION-REGISTER.md](DECISION-REGISTER.md).
 
 The first construction candidate is now the narrower planning-only
 [M1A](M1A-AUTONOMOUS-PLANNING.md). It excludes SQLite, providers, terminals, plugins, Git,

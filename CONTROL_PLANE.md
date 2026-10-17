@@ -111,7 +111,26 @@ than the implementer.
 `CONTROL_PLANE.md`, `ANCHOR.md`, `state/DECISIONS.md`, `.env`, and any credential or
 authentication configuration. A task that touches them without the matching authoring-session
 approval fails its gate. Authoring approval does not itself authorize credential use or change
-Lucas's reserved authority over sensitive company credentials.
+Lucas's reserved authority over sensitive company credentials. Option B (D-042).
+The core rule is Chaandan Saini's 2026-10-15 CSL-117 ruling (comment
+`e59021c7-3a77-445f-a04c-832cf1e5fe46`): `scripts/ci/` and the test config stay
+protected, new tests can be added freely, and changing an existing assertion needs
+a named human reviewer. Fixtures come from the CSL-117 brief's Option B (comment
+`f2506e97-51a7-42ee-a82b-39e089f7e7de`), which that ruling adopted; the word is not
+in the ruling sentence itself. Checked on this tree, those paths are the globs
+`scripts/ci/**` and `scripts/tests/**/fixtures/**`, plus `tools/ci_gate.py`, the
+file that sets `TEST_GLOBS`, `TEST_EXCLUDE` and `REQUIRED_SUITE_TESTS`. This tree
+has no `pytest.ini`, `pyproject.toml`, `setup.cfg`, `tox.ini` or `conftest.py`,
+so those names are not added. Whether fixtures under `experiments/` are covered
+is open and is not decided here. The existing admitted scope, and keeping
+implementation and activation separate, are limits from the 2026-10-17 authoring
+approval (comment `58641114-aa3c-4f8f-8630-a089b19f8ea3`), not from the ruling.
+Recording what the ruling implies: paths under `scripts/` outside those globs,
+for example `scripts/v3/` and non-fixture `scripts/tests/`, are no longer
+protected paths. Changing an existing assertion anywhere still needs the named
+human reviewer. That person is named in the PR and submits their own GitHub
+review from their own account. An approval a bot posts from a founder's account
+does not count.
 
 ## Changing this document
 

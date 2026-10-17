@@ -610,3 +610,70 @@ in a week, or a spend, credential or deployment boundary is crossed without auth
 Record the event and seek a founder decision; no automatic policy expansion follows.
 
 **Review:** at the recorded revisit trigger or the next monthly decision-log review.
+
+---
+
+## D-042 - Record Option B for scripts/ci, test config and fixtures
+Date: 2026-10-15 - Status: ACCEPTED ruling; documentation record pending review and merge
+
+**Source record:** Chaandan Saini chose Option B on
+[CSL-117](https://linear.app/csl-laboratories/issue/CSL-117/recursion-reconcile-scripts-protection-between-contributingmd-and#comment-e59021c7)
+(comment `e59021c7-3a77-445f-a04c-832cf1e5fe46`, 2026-10-15): "`scripts/ci/` and the test
+config are protected. New tests can be added freely. Changing an existing assertion needs a
+named human to review it." That sentence is the core rule. This entry records it. It does
+not choose a new policy, and it is not a personally typed founder statement in this file.
+
+**Fixtures:** The word "fixtures" is not in that ruling sentence. It is in the CSL-117
+brief's Option B (comment `f2506e97-51a7-42ee-a82b-39e089f7e7de`, 2026-10-15): "`scripts/ci/`
+and test config/fixtures protected". The ruling adopts that brief by choosing "Option B, as
+recommended in the brief."
+
+**Paths checked on this tree:** `scripts/ci/**` and `scripts/tests/**/fixtures/**` both
+contain files. The test config file that exists is `tools/ci_gate.py`: it sets
+`TEST_GLOBS`, `TEST_EXCLUDE` and `REQUIRED_SUITE_TESTS`. There is no `pytest.ini`,
+`pyproject.toml`, `setup.cfg`, `tox.ini` or `conftest.py`, so those names are not added.
+`requirements-ci.txt` pins a dependency and does not select tests, so it is not named.
+Whether fixtures under `experiments/` are covered is open and is not decided here.
+
+**Authoring-session approval:** Lucas approved this bounded documentation review. Codex
+relayed that approval on
+[CSL-117](https://linear.app/csl-laboratories/issue/CSL-117/recursion-reconcile-scripts-protection-between-contributingmd-and#comment-58641114)
+(comment `58641114-aa3c-4f8f-8630-a089b19f8ea3`, 2026-10-17). The relay is an attributed
+record of Lucas's direct approval, not a claim that Lucas personally authored the comment
+and not an agent-made policy decision. The existing admitted scope, and keeping
+implementation and activation separate, are limits from this approval. They are not part
+of ruling `e59021c7`.
+
+**Options considered:** The 2026-10-15 CSL-117 brief set out A (`scripts/tests/`
+unprotected), B (tiered protection), C (all of `scripts/` protected) and D (leave the
+contradiction). Chaandan selected B. This entry does not reopen that choice.
+
+**Chose:** B, with each part credited above. `scripts/ci/**`, `scripts/tests/**/fixtures/**`
+and `tools/ci_gate.py` stay protected. New tests can be added freely, within the admitted
+scope from approval `58641114`. Changing an existing assertion needs a named human reviewer.
+Implementation and activation stay separate, also from that approval.
+
+**Sign-off:** The ruling's "named human" is recorded this way: the reviewer is named in
+the PR, and that person submits their own GitHub review from their own account. An
+approval a bot posts from a founder's account does not count.
+
+**Because:** `CONTRIBUTING.md` listed `scripts/` wholesale as protected, and
+`CONTROL_PLANE.md` did not. The ruling removes that contradiction for this surface. The
+brief Chaandan adopted treats the CI harness, test config and fixtures as verifier assets:
+new tests may be added, and a change to an existing assertion needs a named human reviewer.
+
+**Consequence:** The protected-path paragraph in `CONTROL_PLANE.md` and the matching
+paragraph in `CONTRIBUTING.md` record B. Recording what the ruling implies: paths under
+`scripts/` outside the protected globs, for example `scripts/v3/` and non-fixture
+`scripts/tests/`, are no longer protected paths. Changing an existing assertion anywhere
+still needs the named human reviewer. Every earlier decision byte, including D-041, stays
+unchanged. Founder merge and live-action restrictions, the authority split, history and
+scope stay as recorded in D-041. This entry does not rule on other paths such as
+`schemas/`, and it does not decide `experiments/` fixtures. Settings, CODEOWNERS, rulesets,
+access grants and activation are not changed and are not claimed effective. CSL-206 may
+scope against this record and receives no implementation grant.
+
+**Falsifier:** a founder reverses Option B, or a change to an existing assertion is accepted
+with no named human reviewer and that acceptance is treated as the rule.
+
+**Review:** at a founder revisit of Option B, or the next monthly decision-log review.

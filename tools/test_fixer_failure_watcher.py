@@ -306,6 +306,61 @@ class WatcherTests(unittest.TestCase):
         m.scan(self.cfg, self.github, linear, failure_collector=lambda *_: (self.evidence, {}))
         self.assertEqual(linear.canceled, ["iss_1"])
 
+
+    def test_unicode_and_substring_mentions_never_survive_mediation(self):
+        from dataclasses import replace
+        for mention in ("@claudeé", "@claude\u0430", "@claude2", "@claudette", "@ClAuDeé.py"):
+            for failure in (True, False):
+                with self.subTest(mention=mention, failure=failure):
+                    self.setup_scan()
+                    body = BODY + "\n" + mention
+                    if RECURSION:
+                        thread = self.pull.threads[0]
+                        thread = replace(thread, path="`" + mention + "`", failure_evidence=PROOF["description"] if failure else "",
+                                         comments=(replace(thread.comments[0], body=body),))
+                        rendered = m.mediation_body(self.pull, thread, self.cfg, reason="stuck-fixer-failed" if failure else "stuck-human")
+                    else:
+                        item = m.StuckThread(7, "https://github.com/acme/example/pull/7", "PR", "PRRT_0", "`" + mention + "`", "1", "url", body, mention, "needs-human",
+                                             failure_evidence=PROOF["description"] if failure else "")
+                        rendered = m.build_mediation_comment(item, self.cfg)
+                    self.assertNotIn("@claude", rendered.lower())
+                    self.assertNotRegex(rendered, r"(?i)(?<![A-Za-z0-9_])@claude(?![A-Za-z0-9_])")
+                    self.assertNotIn("``@", rendered)
+                    self.assertIn("@codex review", rendered)
+
+
+    def test_partial_resolution_rewrites_failure_only_rollup_without_new_evidence(self):
+        from dataclasses import replace
+        for route in ("ordinary", "approved", "sweep"):
+            for unavailable in (False, True):
+                with self.subTest(route=route, unavailable=unavailable):
+                    self.setup_scan(2)
+                    linear = f.FakeLinear()
+                    m.scan(f.cfg(), self.github, linear, failure_collector=lambda *_: (self.evidence, self.proofs))
+                    marker = m.rollup_marker(self.pull)
+                    linear.existing_descriptions[marker] = linear.created[0][1].replace(m.DEFAULT_HUMAN_DECISION, "Human decision stays.")
+                    self.pull = replace(self.pull, threads=(replace(self.pull.threads[0], is_resolved=True), self.pull.threads[1]))
+                    if route == "approved":
+                        self.pull = replace(self.pull, review_decision="APPROVED", head_oid=f.HEAD,
+                                            approved_head_oids=(f.HEAD,), checks_state="SUCCESS", required_checks_green=True)
+                    self.github.pulls[self.pull.number] = self.pull
+                    if route == "sweep":
+                        self.github.list_open_pr_numbers = lambda: []
+                        linear.rollups = [linear.find_by_marker(marker, title=m.linear_title(self.pull))]
+                    def collector(*_, unavailable=unavailable):
+                        if unavailable:
+                            raise RuntimeError("unavailable")
+                        return self.evidence, {}
+                    before = len(self.github.comments)
+                    m.scan(f.cfg(), self.github, linear, failure_collector=collector)
+                    self.assertTrue(linear.updated)
+                    description = linear.updated[-1][1]
+                    self.assertNotIn("<!-- thread:PRRT_0 -->", description)
+                    self.assertIn("<!-- thread:PRRT_1 -->", description)
+                    self.assertIn("Human decision stays.", description)
+                    self.assertEqual(len(self.github.comments), before)
+                    self.assertEqual(linear.canceled, [])
+
     def test_existing_marker_deduplicates_failure_delivery(self):
         marker = m.mediation_marker("PRRT_0") if RECURSION else m.marker("PRRT_0")
         self.setup_scan(comments=[f.comment("pat-user", marker)])

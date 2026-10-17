@@ -99,3 +99,15 @@ Never manufacture findings/events or reopen resolved findings to qualify it.
 Historical #142 lacks the new context binding and intentionally cannot be
 replayed as new evidence. Existing workflow validation blocks pre-merge live
 qualification of a changed workflow. No bypass is authorized.
+
+## Review repair qualification
+
+Mediation bodies neutralize every case-insensitive Claude mention substring,
+including Unicode suffixes and longer names, on ordinary and failure routes.
+Quoted data never grants a writer trigger. Local fixtures exercise these inputs;
+no hostile trigger is posted to GitHub for testing.
+
+Recursion refreshes the retained checklist from current unresolved thread IDs
+after partial resolution even when new failure evidence is absent/unavailable.
+This applies to ordinary, approved/green and existing-rollup sweep paths, keeps
+human notes, and neither posts mediation nor admits resolver actions.

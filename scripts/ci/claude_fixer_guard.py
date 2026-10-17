@@ -15,7 +15,6 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from urllib.parse import urlsplit
 
 SHA = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 REF = re.compile(r"(?!.*\.\.)[A-Za-z0-9._/-]+\Z")
@@ -128,23 +127,16 @@ def current_pr(config, read=api):
 
 
 def expected_remote(config, remote_url):
-    """Accept the action's existing tokenized URL without logging userinfo."""
-    if not isinstance(remote_url, str) or any(c.isspace() for c in remote_url) or "\\" in remote_url:
+    """Accept only canonical GitHub transports; never interpret/log credentials."""
+    if not isinstance(remote_url, str):
         return False
-    repo = config["repo"].casefold()
-    if remote_url.casefold() == f"git@github.com:{repo}.git":
-        return True
-    try:
-        parts = urlsplit(remote_url)
-        if (parts.hostname != "github.com" or parts.port is not None or parts.query or parts.fragment
-                or parts.path.casefold() not in {"/" + repo, "/" + repo + ".git"}):
-            return False
-        if parts.scheme == "https":
-            return (parts.username is None and parts.password is None) or (
-                parts.username == "x-access-token" and bool(parts.password))
-        return parts.scheme == "ssh" and parts.username == "git" and parts.password is None
-    except ValueError:
-        return False
+    # Limit userinfo to URL-unreserved token characters. A second @, encoded
+    # delimiter, empty port or control byte must not reach a different parser.
+    repo = re.escape(config["repo"])
+    return bool(re.fullmatch(
+        rf"(?:https://(?:x-access-token:[A-Za-z0-9._~-]+@)?(?i:github\.com)/(?i:{repo})(?:\.git)?"
+        rf"|ssh://git@(?i:github\.com)/(?i:{repo})(?:\.git)?"
+        rf"|git@(?i:github\.com):(?i:{repo})\.git)", remote_url, flags=re.ASCII))
 
 
 def guard(config, updates, remote, state_path, read=api, git=command, remote_url=""):
@@ -271,8 +263,14 @@ def model_api(config, args, run=command):
         body = handle.read(65001)
     if not body.strip() or len(body) > 65000:
         raise ValueError("invalid comment body")
-    return run(["gh", "api", "--method", "POST", endpoint, "--input", "-"],
-               input=json.dumps({"body": body}))
+    if args[0] == "reply":
+        # Do not rely on server routing to bind a repository-wide comment ID.
+        target = json.loads(run(["gh", "api", "--method", "GET", f"{root}/pulls/comments/{args[1]}"]))
+        if (not isinstance(target, dict) or type(target.get("id")) is not int
+                or target["id"] != int(args[1]) or target.get("in_reply_to_id") is not None
+                or str(target.get("pull_request_url") or "").casefold() != ("https://api.github.com/" + pull).casefold()):
+            raise ValueError("reply target is not a root on this PR")
+    return run(["gh", "api", "--method", "POST", endpoint, "--input", "-"], input=json.dumps({"body": body}))
 
 
 def main():

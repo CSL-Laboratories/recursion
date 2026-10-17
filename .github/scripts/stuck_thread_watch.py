@@ -1673,11 +1673,15 @@ class Counters:
     labeled: int = 0
 
 
+def failure_handoff_ids(issue: LinearIssue | None) -> set[str]:
+    if not is_active_issue(issue):
+        return set()
+    return set(re.findall(r"`stuck-fixer-(?:failed|handoff-open)` <!-- thread:([^\s>]+) -->", issue.description))
+
+
 def open_failure_handoffs(pull: Pull, issue: LinearIssue | None) -> list[tuple[Thread, str]]:
     """Preserve an existing checklist, never use it to admit mediation/resolution."""
-    if not is_active_issue(issue):
-        return []
-    ids = set(re.findall(r"`stuck-fixer-(?:failed|handoff-open)` <!-- thread:([^\s>]+) -->", issue.description))
+    ids = failure_handoff_ids(issue)
     return [(thread, "stuck-fixer-handoff-open") for thread in pull.threads
             if thread.id in ids and not thread.is_resolved]
 
@@ -1688,13 +1692,33 @@ def upsert_linear_rollup(
     cfg: Config,
     linear: LinearClient,
     counters: Counters,
+    *,
+    failure_evidence=None,
 ) -> str:
     marker = rollup_marker(pull)
     title = linear_title(pull)
     existing = linear.find_by_marker(marker, title=title)
     previous = existing.description if is_active_issue(existing) else ""
+    # Centralize admission after the lookup so the main scan and roll-up sweep
+    # cannot accidentally write new failures without the final evidence check.
+    if any(thread.failure_evidence for thread, _ in stuck):
+        try:
+            fresh = failure_evidence is not None and failure_evidence.fresh()
+        except Exception:  # noqa: BLE001 - preserve ordinary and recorded handoff items
+            fresh = False
+        if not fresh:
+            ordinary = []
+            for thread, reason in stuck:
+                thread = replace(thread, failure_evidence="")
+                if reason == "stuck-fixer-failed":
+                    reason = classify_thread(thread, pull.issue_comments, cfg, for_rollup=True)
+                if reason.startswith("stuck-"):
+                    ordinary.append((thread, reason))
+            stuck = ordinary
     included = {thread.id for thread, _ in stuck}
     stuck = [*stuck, *(item for item in open_failure_handoffs(pull, existing) if item[0].id not in included)]
+    if not stuck:
+        return ""
     description = linear_description(pull, stuck, cfg, previous=previous)
     if existing and existing.id:
         if not is_active_issue(existing):
@@ -1907,17 +1931,17 @@ def scan(
             continue
         if skip == "approved-green":
             log(f"skip (approved on head with green checks): PR #{pull.number}")
-            if linear is not None and not rollup:
+            if linear is not None:
                 try:
                     existing = linear.find_by_marker(
                         rollup_marker(pull), title=linear_title(pull)
                     )
-                    if open_failure_handoffs(pull, existing):
+                    if open_failure_handoffs(pull, existing) or (rollup and failure_handoff_ids(existing)):
                         # Rebuild from current unresolved threads even if no new
                         # failure evidence is available. This never admits actions.
                         if cfg.linear_api_key:
-                            upsert_linear_rollup(pull, [], cfg, linear, counters)
-                    elif existing:
+                            upsert_linear_rollup(pull, rollup, cfg, linear, counters)
+                    elif existing and not rollup:
                         cancel_linear_rollup(existing, linear, counters)
                 except Exception as extra_exc:  # noqa: BLE001
                     notice(f"Linear cancel skipped: {extra_exc}")
@@ -1936,13 +1960,13 @@ def scan(
                         notice("LINEAR_API_KEY missing; skipping Linear roll-up")
                     else:
                         linear_url = upsert_linear_rollup(
-                            pull, rollup, cfg, linear, counters
+                            pull, rollup, cfg, linear, counters, failure_evidence=failure_evidence
                         )
                 else:
                     existing = linear.find_by_marker(
                         rollup_marker(pull), title=linear_title(pull)
                     )
-                    if open_failure_handoffs(pull, existing):
+                    if open_failure_handoffs(pull, existing) or (rollup and failure_handoff_ids(existing)):
                         # Rebuild from current unresolved threads even if no new
                         # failure evidence is available. This never admits actions.
                         if cfg.linear_api_key:
@@ -1974,11 +1998,15 @@ def scan(
                 continue
             if thread.failure_evidence:
                 try:
-                    if not failure_evidence.fresh():
-                        continue
+                    fresh = failure_evidence is not None and failure_evidence.fresh()
                 except Exception:  # noqa: BLE001 - independently eligible ordinary threads continue
                     notice(f"PR #{pull.number}: failure evidence recheck unavailable")
-                    continue
+                    fresh = False
+                if not fresh:
+                    thread = replace(thread, failure_evidence="")
+                    reason = classify_thread(thread, pull.issue_comments, cfg)
+                    if not reason.startswith("stuck-"):
+                        continue
             posted = mediate_thread(
                 pull, thread, cfg, github, reason, counters, linear_url=linear_url
             )
@@ -2060,14 +2088,15 @@ def scan(
                 if extra is None or skip_pr_reason(extra) in {"closed", "not-open", "draft"}:
                     cancel_linear_rollup(issue, linear, counters)
                     continue
+                extra_evidence = None
                 try:
-                    extra, _ = with_failure_evidence(extra, cfg, failure_collector)
+                    extra, extra_evidence = with_failure_evidence(extra, cfg, failure_collector)
                 except Exception:  # noqa: BLE001 - preserve this roll-up and inspect the next PR
                     notice(f"PR #{extra.number}: retain current handoffs; failure evidence unavailable")
                 remaining = stuck_threads(extra, cfg, for_rollup=True)
-                if open_failure_handoffs(extra, issue):
+                if open_failure_handoffs(extra, issue) or (remaining and failure_handoff_ids(issue)):
                     if cfg.linear_api_key:
-                        upsert_linear_rollup(extra, remaining, cfg, linear, counters)
+                        upsert_linear_rollup(extra, remaining, cfg, linear, counters, failure_evidence=extra_evidence)
                 elif not remaining:
                     cancel_linear_rollup(issue, linear, counters)
         except Exception as extra_exc:  # noqa: BLE001

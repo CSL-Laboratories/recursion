@@ -1561,8 +1561,13 @@ class ProgramControlTests(unittest.TestCase):
             packet2.mkdir(parents=True)
             (packet2 / "p.md").write_text("x\n", encoding="utf-8")
             (packet2 / "SHA256SUMS.txt").write_text(
-                "c" * 64 + "  parent-packet/p.md\n",
+                "c" * 64 + "  parent-packet/p.md\n" +
+                "d" * 64 + "  parent-packet/n.md\n",
                 encoding="utf-8")
+            # A same-named nested directory wins over the parent fallback.
+            nested = packet2 / "parent-packet"
+            nested.mkdir()
+            (nested / "n.md").write_text("x\n", encoding="utf-8")
             receipts = root / "docs/audits/receipts-1"
             receipts.mkdir(parents=True)
             (receipts / "r1.json").write_text("{}", encoding="utf-8")
@@ -1571,6 +1576,7 @@ class ProgramControlTests(unittest.TestCase):
             self.assertIn("docs/v3/research-lane/fresh-packet/payload.md", paths)
             self.assertIn("docs/v3/research-lane/fresh-packet/blob.bin", paths)
             self.assertIn("docs/v3/research-lane/parent-packet/p.md", paths)
+            self.assertIn("docs/v3/research-lane/parent-packet/parent-packet/n.md", paths)
             self.assertIn("docs/audits/receipts-1/r1.json", paths)
             self.assertNotIn("docs/v3/research-lane/fresh-packet/SHA256SUMS.txt", paths)
 

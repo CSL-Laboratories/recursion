@@ -301,12 +301,16 @@ def sha256_pinned_paths(data: dict[str, Any], root: Path) -> list[str]:
             match = SUM_LINE.fullmatch(line.strip())
             if match:
                 name = match.group(2).strip()
+                entry = manifest.parent / name
                 # Manifests written from their parent directory carry the
-                # packet directory as a prefix on every entry.
-                if name.startswith(manifest.parent.name + "/"):
-                    entry = manifest.parent.parent / name
-                else:
-                    entry = manifest.parent / name
+                # packet directory as a prefix on every entry; use that
+                # resolution only when the local one is absent (a packet may
+                # legitimately nest a same-named directory).
+                if (not entry.exists()
+                        and name.startswith(manifest.parent.name + "/")):
+                    fallback = manifest.parent.parent / name
+                    if fallback.exists():
+                        entry = fallback
                 paths.append(entry.relative_to(root).as_posix())
     audits = root / "docs/audits"
     if audits.is_dir():

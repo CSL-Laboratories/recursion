@@ -818,7 +818,7 @@ def parse_checked_thread_ids(description: str) -> set[str]:
 
 
 def existing_human_decision(description: str) -> str:
-    match = HUMAN_DECISION_RE.search(description or "")
+    match = HUMAN_DECISION_RE.search((description or "").replace("\r\n", "\n"))
     if not match:
         return ""
     return match.group(1).strip()
@@ -826,7 +826,7 @@ def existing_human_decision(description: str) -> str:
 
 def existing_author_notes(description: str, marker: str) -> str:
     """Free-form text to carry forward when rebuilding a roll-up description."""
-    text = description or ""
+    text = (description or "").replace("\r\n", "\n")
     if "## Stuck threads" in text:  # watcher-built: only the notes section carries
         match = NOTES_RE.search(text)
         return match.group(1).strip() if match else ""
@@ -1677,11 +1677,33 @@ def failure_handoff_ids(issue: LinearIssue | None) -> set[str]:
     if not is_active_issue(issue):
         return set()
     # Filenames can contain marker-shaped text inside the rendered code span.
-    # Only the terminal metadata of a complete generated checklist row counts.
-    return set(re.findall(
-        r"^- \[[ xX]\] [^\r\n]+ \u2014 `stuck-fixer-(?:failed|handoff-open)` "
-        r"<!-- thread:([^\s>]+) -->\r?$", issue.description, re.MULTILINE,
-    ))
+    # Notes and fenced examples are not checklist evidence. This is a bounded
+    # parser for the generated section, not authentication of manual Linear edits.
+    ids = set()
+    in_checklist = False
+    fence = ""
+    for line in issue.description.splitlines():
+        if fence:
+            if re.fullmatch(r" {0,3}" + re.escape(fence[0]) + "{" + str(len(fence)) + r",}[ \t]*", line):
+                fence = ""
+            continue
+        opening = re.match(r" {0,3}(`{3,}|~{3,})", line)
+        if opening:
+            fence = opening.group(1)
+            continue
+        if line == "## Stuck threads" and not in_checklist:
+            in_checklist = True
+            continue
+        if in_checklist and re.match(r"#{1,6} ", line):
+            break
+        if in_checklist:
+            match = re.fullmatch(
+                r"- \[[ xX]\] [^\r\n]+ \u2014 `stuck-fixer-(?:failed|handoff-open)` "
+                r"<!-- thread:([^\s>]+) -->[ \t]*", line,
+            )
+            if match:
+                ids.add(match.group(1))
+    return ids
 
 
 def open_failure_handoffs(pull: Pull, issue: LinearIssue | None) -> list[tuple[Thread, str]]:

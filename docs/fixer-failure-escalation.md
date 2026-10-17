@@ -123,6 +123,17 @@ control characters are represented as a JSON string on one line. This avoids
 silently pointing mediation at a different filename while keeping quoted
 structure and writer-trigger sanitization intact.
 
+Retention reads complete rows only in the generated `Stuck threads` section,
+excluding backtick/tilde fenced examples and author/human notes. Horizontal
+whitespace after a terminal thread marker does not discard a real handoff.
+CRLF input preserves checked state, author context and the human decision when
+the renderer rewrites the checklist with LF line endings.
+Author-filed roll-ups may preserve pasted review examples as notes; those notes
+are not authenticated failure evidence. This bounded format parser is not general
+Markdown isolation or authentication of arbitrary manual edits to the checklist.
+Retained IDs still require current unresolved threads and never admit mediation
+or resolution by themselves.
+
 Dispatch event semantics follow [GitHub’s workflow event reference](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#repository_dispatch).
 No genuine repository-dispatch failure was available during this review; its
 provenance regressions are offline fixtures, not live qualification.

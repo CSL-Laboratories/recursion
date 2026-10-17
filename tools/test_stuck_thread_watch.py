@@ -1610,6 +1610,16 @@ class VerdictAndResolveTests(unittest.TestCase):
         self._assert_no_resolve("<pre title=`x`>\n" + block)
         self._assert_no_resolve("<PRE class=`echo`>\n" + block)
 
+    def test_closed_html_comment_with_pre_line_still_resolves(self) -> None:
+        # Devin 4303959815: `_html_constructs_open` skips a closed comment, but
+        # the type-1 scan treated a `<pre` line inside it as an opener and
+        # made a later genuine RESOLVE AMBIGUOUS.
+        block = verdict_block("PRRT_1")
+        self._assert_resolves("<!--\n<pre title=`x`>\n-->\n" + block)
+        self._assert_resolves("<!--\n<pre title=`x`>\n-->\n\n" + block)
+        self._assert_no_resolve("<!--\n<pre title=`x`>\n" + block)
+        self._assert_no_resolve("<!-- note -->\n<pre title=`x`>\n" + block)
+
     def test_escaped_fence_copy_does_not_resolve(self) -> None:
         self._assert_no_resolve("\\```\n" + verdict_block("PRRT_1") + "\\```\n")
 

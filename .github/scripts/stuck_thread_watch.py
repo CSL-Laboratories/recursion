@@ -470,20 +470,29 @@ def _open_markup_before(lines: list[str]) -> bool:
 def _unclosed_html_type1(lines: list[str]) -> bool:
     """True if a type-1 HTML block has no tag-parsed closer before prose ends.
 
+    Closed HTML comments are skipped the same way ``_html_constructs_open``
+    skips them, so a ``<pre`` line inside ``<!-- ... -->`` is not an opener.
     A ``</pre>`` inside a quoted attribute is not a closer; ``_html_tag_at``
     has to see a real closing tag.
     """
+    text = "\n".join(lines)
     index = 0
-    while index < len(lines):
-        if not HTML_TYPE1_START_RE.match(lines[index]):
-            index += 1
+    length = len(text)
+    while index < length:
+        if text.startswith(HTML_COMMENT_OPEN, index):
+            end = text.find(HTML_COMMENT_CLOSE, index + len(HTML_COMMENT_OPEN))
+            if end < 0:
+                return False
+            index = end + len(HTML_COMMENT_CLOSE)
             continue
-        rest = "\n".join(lines[index:])
-        end = _html_type1_end(rest)
-        if end is None:
-            return True
-        eaten = rest[:end].count("\n")
-        index += eaten + 1
+        if index == 0 or text[index - 1] == "\n":
+            if HTML_TYPE1_START_RE.match(text[index:]):
+                end = _html_type1_end(text[index:])
+                if end is None:
+                    return True
+                index += end
+                continue
+        index += 1
     return False
 
 

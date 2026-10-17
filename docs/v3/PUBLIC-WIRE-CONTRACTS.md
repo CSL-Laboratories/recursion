@@ -172,24 +172,27 @@ Rules:
   `conflict` = same `command_id`, different `command_digest`. `conflict` is permanent.
 - Only `accepted` commands mint a dedup entry. A `refused` or `conflicted` command
   leaves no replay record, so an identical retry is evaluated against current
-  admission state. `refusal_class` is caller guidance, not a receipt guarantee:
-  `retryable` refusals are expected to clear with time alone (resync, pause
-  lifted, budget refilled); `permanent` refusals must not be auto-retried
-  expecting success — a changed verdict requires changed state (e.g. an
-  `unknown-record` target appearing before the retry).
+  admission state. `refusal_class` is caller guidance, not a receipt guarantee.
+  `retryable` splits per the reason: refusals that clear with time alone
+  (`paused`, `budget-exceeded`) may be resent unchanged, while refusals that
+  need caller repair (`stale-epoch`, `precondition-failed`) must be resubmitted
+  as a new command with a new `command_id` — reusing the id with changed bytes
+  is `conflict`. `permanent` refusals must not be auto-retried expecting
+  success — a changed verdict requires changed state (e.g. an `unknown-record`
+  target appearing before the retry).
 - `accepted` carries no refusal block; a `refusal` on any other outcome is malformed.
 
 Closed `ReasonCode` registry (draft — extensions require a vocabulary revision):
 
 | Code | Meaning | Default class |
 |---|---|---|
-| `stale-epoch` | epoch precondition no longer current | retryable after resync |
+| `stale-epoch` | epoch precondition no longer current; resync and resubmit as a new command | retryable after resync |
 | `replay-gap-continuation` | sequence gap in an event stream | permanent |
 | `authority-mismatch` | grant/authority digest does not match active | permanent |
 | `capability-denied` | requested capability not granted | permanent |
 | `policy-denied` | admitted shape violates active policy | permanent |
 | `fence-violation` | fenced-writer boundary crossed | permanent |
-| `precondition-failed` | stated compare-and-swap precondition unmet | retryable |
+| `precondition-failed` | stated compare-and-swap precondition unmet; revise and resubmit as a new command | retryable |
 | `budget-exceeded` | declared budget/quota floor crossed | retryable |
 | `paused` | an admitted PAUSE profile is operative | retryable |
 | `unsupported-version` | `type`/`@N` not in the advertised `supported` set | permanent |

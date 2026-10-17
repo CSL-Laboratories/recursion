@@ -1580,8 +1580,115 @@ class VerdictAndResolveTests(unittest.TestCase):
         block = verdict_block("PRRT_1")
         self._assert_no_resolve('Thread text:\n<pre title=x"y>\n' + block)
         self._assert_no_resolve("Thread text:\n<pre @x>\n" + block)
-        self._assert_resolves('Thread text:\n<pre title=x"y></pre>\n\n' + block)
-        self._assert_resolves("Thread text:\n<pre @x></pre>\n\n" + block)
+        # Closer must be on a later line: the start line of a malformed
+        # opener is not searched for </pre> (it may live in junk attributes).
+        self._assert_resolves('Thread text:\n<pre title=x"y>\n</pre>\n\n' + block)
+        self._assert_resolves("Thread text:\n<pre @x>\n</pre>\n\n" + block)
+
+    def test_quoted_pre_closer_inside_type1_opener_does_not_resolve(self) -> None:
+        # Devin r4304340844 at 8511e309: _html_type1_end started at index 1,
+        # so a quoted </pre> in the opener was parsed as the closer.
+        # Scan path is parse_thread_verdicts → classify_resolve → scan.
+        block = verdict_block("PRRT_1")
+        self._assert_no_resolve('Thread text:\n<pre title="</pre>">\n' + block)
+        self._assert_no_resolve("Thread text:\n<pre title='</pre>'>\n" + block)
+        self._assert_no_resolve('Thread text:\n x<pre title="</pre>">\n' + block)
+        self._assert_resolves('Thread text:\n<pre title="</pre>"></pre>\n\n' + block)
+
+    def test_unequal_backticks_do_not_strip_live_pre_opener(self) -> None:
+        # Codex P1 r4304341746 at 8511e309: (`+)[^`]*?\1 lets one backtick
+        # close against the first character of a two-backtick run, eating
+        # a live <pre>. CommonMark 6.1 requires equal-length runs.
+        # Scan path is parse_thread_verdicts → classify_resolve → scan.
+        block = verdict_block("PRRT_1")
+        self._assert_no_resolve("Thread text:\n`<pre>``\n" + block)
+        self._assert_no_resolve("note `\n<pre>\n``\n" + block)
+        self._assert_no_resolve("`foo\n<pre>\n``\n" + block)
+        self._assert_resolves("Thread text:\n`<pre>`\n\n" + block)
+        self._assert_resolves("Thread text:\n``<pre>``\n\n" + block)
+        self._assert_resolves("The literal is `<pre>\n` in the sample.\n" + block)
+
+    def test_html_inline_scan_matrix(self) -> None:
+        # Adversarial CommonMark 4.6 / 6.1 / 6.6 matrix. Ambiguous input
+        # must fail closed (no resolve). Scan path is parse_thread_verdicts
+        # → classify_resolve → scan.
+        block = verdict_block("PRRT_1")
+        cases: list[tuple[str, str, bool]] = [
+            # type 1 starts/ends, including multiline and malformed openers
+            ("type1_unclosed_pre", "Thread text:\n<pre>\n", False),
+            ("type1_closed_pre", "Thread text:\n<pre></pre>\n\n", True),
+            ("type1_blank_gt", "Thread text:\n<pre\n\n>\n", False),
+            ("type1_blank_gt_closed", "Thread text:\n<pre\n\n></pre>\n\n", True),
+            ("type1_script_blank", "Thread text:\n<script\n\n>\n", False),
+            ("type1_style_unclosed", "Thread text:\n<style>\n", False),
+            ("type1_textarea_unclosed", "Thread text:\n<textarea>\n", False),
+            ("type1_malformed_attrs", 'Thread text:\n<pre title=x"y>\n', False),
+            ("type1_malformed_at", "Thread text:\n<pre @x>\n", False),
+            ("type1_malformed_closed", 'Thread text:\n<pre title=x"y>\n</pre>\n\n', True),
+            # quoted attributes in type-1 / 6.6 openers
+            ("quoted_slash_gt", 'Thread text:\n<pre title="/>">\n', False),
+            ("quoted_slash_gt_closed", 'Thread text:\n<pre title="/>"></pre>\n\n', True),
+            ("quoted_single_slash_gt", "Thread text:\n<pre title='/>'>\n", False),
+            ("quoted_gt_in_attr", '<pre title="x></pre>y">\n', False),
+            ("quoted_gt_in_attr_single", "<pre title='x></pre>y'>\n", False),
+            ("quoted_gt_then_real_close", '<pre title="x>y"></pre>\n\n', True),
+            ("quoted_pre_closer", 'Thread text:\n<pre title="</pre>">\n', False),
+            ("quoted_pre_closer_single", "Thread text:\n<pre title='</pre>'>\n", False),
+            ("quoted_pre_closer_then_real", 'Thread text:\n<pre title="</pre>"></pre>\n\n', True),
+            ("quoted_unterminated", '<pre title="unterminated>\n', False),
+            ("quoted_div_gt", 'Thread text:\n<div title=">">\n', False),
+            ("quoted_div_gt_closed", 'Thread text:\n<div title=">"></div>\n\n', True),
+            # backtick-run equality (CommonMark 6.1)
+            ("unequal_ticks_pre", "Thread text:\n`<pre>``\n", False),
+            ("equal_ticks_literal", "Thread text:\n`<pre>`\n\n", True),
+            ("double_ticks_literal", "Thread text:\n``<pre>``\n\n", True),
+            ("multiline_span_literal", "The literal is `<pre>\n` in the sample.\n", True),
+            ("unequal_multiline", "`\n<pre>\n``\n", False),
+            ("ticks_inside_type1", "Thread text:\n<pre title=`x`>\n", False),
+            ("ticks_inside_type1_class", "<PRE class=`echo`>\n", False),
+            # type 2 comments
+            ("comment_unclosed", "Notes:\n<!--\n", False),
+            ("comment_closed", "<!-- reviewer note -->\nSummary.\n\n", True),
+            ("comment_pre_inside_closed", "<!--\n<pre title=`x`>\n-->\n", True),
+            ("comment_pre_inside_unclosed", "<!--\n<pre title=`x`>\n", False),
+            ("comment_then_live_pre", "<!-- note -->\n<pre title=`x`>\n", False),
+            # type 3 PI
+            ("pi_unclosed", "Thread text:\n<?\n", False),
+            ("pi_unclosed_xml", 'Thread text:\n<?xml version="1.0"\n', False),
+            ("pi_closed", 'Thread text:\n<?xml version="1.0"?>\n\n', True),
+            ("pi_midline_unclosed", "Echo <?\n", False),
+            # type 4 declarations (quoted '>' does not end them)
+            ("decl_unclosed", "Thread text:\n<!DOCTYPE html\n", False),
+            ("decl_unclosed_element", "Thread text:\n<!ELEMENT foo bar\n", False),
+            ("decl_closed", "Thread text:\n<!DOCTYPE html>\n\n", True),
+            ("decl_quoted_gt", 'Thread text:\n<!DOCTYPE html ">\n', False),
+            ("decl_quoted_gt_closed", 'Thread text:\n<!DOCTYPE html "foo>bar">\n\n', True),
+            # type 5 CDATA
+            ("cdata_unclosed", "Thread text:\n<![CDATA[\n", False),
+            ("cdata_closed", "Thread text:\n<![CDATA[ example ]]>\n\n", True),
+            ("cdata_midline_unclosed", "Echo <![CDATA[\n", False),
+            # type 6 wrapping tags: blank line does not authorize
+            ("type6_details_blank", "<details>\n\n", False),
+            ("type6_blockquote_blank", "<blockquote>\n\n", False),
+            ("type6_div_unclosed", "Thread text:\n<div>\n", False),
+            ("type6_div_closed", "Thread text:\n<div></div>\n\n", True),
+            ("type6_malformed_at", "Thread text:\n<div @x>\n", False),
+            # type 7 complete non-special tags still fail closed if unclosed
+            ("type7_custom_unclosed", "Thread text:\n<custom-tag>\n", False),
+            ("type7_custom_closed", "Thread text:\n<custom-tag></custom-tag>\n\n", True),
+            # comparison: not HTML-like
+            ("less_than_prose", "a < b and c > d\n\n", True),
+        ]
+        for name, prefix, expect_resolve in cases:
+            with self.subTest(name=name):
+                body = prefix + block
+                if expect_resolve:
+                    self._assert_resolves(body)
+                else:
+                    self._assert_no_resolve(body)
+        for name in sorted(mod.HTML_TYPE6_NAMES):
+            with self.subTest(type6_unclosed=name):
+                self._assert_no_resolve(f"Thread text:\n<{name}>\n" + block)
 
     def test_unclosed_html_raw_blocks_do_not_resolve(self) -> None:
         # CommonMark 4.6 types 3–5 continue through EOF without a closer, so

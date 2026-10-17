@@ -735,9 +735,16 @@ class WatcherTests(unittest.TestCase):
     def test_note_headings_and_fences_cannot_replace_or_hide_real_checklist(self):
         from dataclasses import replace
         fake = "- [x] `copied.py:1` \u2014 `stuck-fixer-failed` <!-- thread:PRRT_other -->"
+        # An unfenced complete pair in the notes is intrinsically ambiguous: the
+        # notes copy and the generated pair below it are the same shape, so no
+        # rule can tell which one the watcher rendered. Picking the last pair
+        # would be right here but retains a pasted id when the copy is in the
+        # decision; picking the first drops the genuine handoff and cancels the
+        # roll-up. The parser must fail closed and leave the issue unchanged.
+        ambiguous = "## Stuck threads\n\n" + fake + "\n\n## Human decision\n\nCopied decision"
         for notes in (
             "## Stuck threads\n\n" + fake + "\n\n## Other\nContext",
-            "## Stuck threads\n\n" + fake + "\n\n## Human decision\n\nCopied decision",
+            ambiguous,
             "```pytest -k foo``` passes",
             "```python\nUnclosed note fence",
             "~~~text\nUnclosed note fence",
@@ -752,7 +759,12 @@ class WatcherTests(unittest.TestCase):
                     # Model an author editing notes on an existing real roll-up.
                     rendered = rendered.replace("## Stuck threads\n", "## Author notes\n\n" + notes + "\n\n## Stuck threads\n", 1)
                     rendered = rendered.replace(m.DEFAULT_HUMAN_DECISION, "Actual human decision.")
-                    self.assertEqual(m.failure_handoff_ids(m.LinearIssue("issue", "url", description=rendered)), {real.id})
+                    issue = m.LinearIssue("issue", "url", description=rendered)
+                    if notes == ambiguous:
+                        with self.assertRaises(m.AmbiguousChecklist):
+                            m.failure_handoff_ids(issue)
+                    else:
+                        self.assertEqual(m.failure_handoff_ids(issue), {real.id})
                     self.pull = replace(self.pull, threads=(replace(real, is_resolved=resolved), unrelated))
                     self.github.pulls[self.pull.number] = self.pull
                     marker = m.rollup_marker(self.pull)
@@ -760,14 +772,21 @@ class WatcherTests(unittest.TestCase):
                     linear.existing_descriptions[marker] = rendered
                     m.scan(f.cfg(), self.github, linear,
                            failure_collector=lambda *_: (SimpleNamespace(fresh=lambda: False), {}))
-                    self.assertEqual(linear.canceled, ["iss_existing"] if resolved else [])
-                    if not resolved:
-                        updated = linear.updated[-1][1]
-                        self.assertIn(notes, updated)
-                        self.assertIn("Actual human decision.", updated)
-                        self.assertEqual(m.failure_handoff_ids(m.LinearIssue("issue", "url", description=updated)), {real.id})
-                    else:
+                    if notes == ambiguous:
+                        # Fail closed: no id is retained, nothing is rewritten
+                        # or canceled, whether or not the genuine thread resolved.
+                        self.assertEqual(linear.canceled, [])
                         self.assertEqual(linear.updated, [])
+                        self.assertEqual(linear.created, [])
+                    else:
+                        self.assertEqual(linear.canceled, ["iss_existing"] if resolved else [])
+                        if not resolved:
+                            updated = linear.updated[-1][1]
+                            self.assertIn(notes, updated)
+                            self.assertIn("Actual human decision.", updated)
+                            self.assertEqual(m.failure_handoff_ids(m.LinearIssue("issue", "url", description=updated)), {real.id})
+                        else:
+                            self.assertEqual(linear.updated, [])
                     self.assertEqual(self.github.comments, [])
                     self.assertEqual(self.github.resolves, [])
 
@@ -801,6 +820,23 @@ class WatcherTests(unittest.TestCase):
                             rendered = m.linear_description(self.pull, [(real, "stuck-fixer-failed")], f.cfg(), previous=notes)
                             rendered = rendered.replace(m.DEFAULT_HUMAN_DECISION, decision).replace("\n", newline)
                             marker = m.rollup_marker(self.pull)
+                            if notes and name.startswith("unclosed-"):
+                                # Indistinguishable from a notes copy followed by
+                                # an unclosed fence hiding the genuine checklist.
+                                with self.assertRaises(m.AmbiguousChecklist):
+                                    m.failure_handoff_ids(m.LinearIssue("issue", "url", description=rendered))
+                                self.pull = replace(self.pull, threads=(replace(real, is_resolved=resolved), unrelated))
+                                self.github.pulls[self.pull.number] = self.pull
+                                linear = f.FakeLinear({marker: "https://linear.app/fixture"})
+                                linear.existing_descriptions[marker] = rendered
+                                m.scan(f.cfg(), self.github, linear,
+                                       failure_collector=lambda *_: (SimpleNamespace(fresh=lambda: False), {}))
+                                self.assertEqual(linear.canceled, [])
+                                self.assertEqual(linear.updated, [])
+                                self.assertEqual(linear.created, [])
+                                self.assertEqual(self.github.comments, [])
+                                self.assertEqual(self.github.resolves, [])
+                                continue
                             self.assertEqual(m.failure_handoff_ids(m.LinearIssue("issue", "url", description=rendered)), {real.id})
                             self.assertEqual(m.existing_human_decision(rendered), decision)
                             self.assertEqual(m.existing_author_notes(rendered, marker), notes)
@@ -929,6 +965,170 @@ class WatcherTests(unittest.TestCase):
                     self.assertEqual(self.github.comments, [])
                     self.assertEqual(self.github.labels, [])
                     self.assertEqual(self.github.resolves, [])
+
+    @unittest.skipUnless(RECURSION, "Recursion preserves generated section boundaries")
+    def test_unfenced_complete_pair_with_notes_fails_closed_instead_of_guessing(self):
+        from dataclasses import replace
+        copied = ("## Stuck threads\n\n- [ ] `example.py:1` — `stuck-fixer-failed` "
+                  "<!-- thread:PRRT_example -->\n\n## Human decision\n\nCopied decision")
+        # With author notes rendered, a second unfenced complete pair can sit in
+        # the notes or in the decision, and the two pairs are indistinguishable.
+        # The decision case is the one the earlier tests skipped: guessing the
+        # last pair retained PRRT_example and canceled the genuine handoff.
+        placements = {
+            "decision": ("Real notes", "Actual decision with copied example:\n\n" + copied),
+            "notes": ("Real notes\n\n" + copied, "Actual human decision."),
+            "both": ("Real notes\n\n" + copied, "Actual decision with copied example:\n\n" + copied),
+        }
+        for place, (notes, decision) in placements.items():
+            for resolved in (False, True):
+                for newline in ("\n", "\r\n"):
+                    with self.subTest(place=place, resolved=resolved, newline=repr(newline)):
+                        self.setup_scan()
+                        real = self.pull.threads[0]
+                        rendered = m.linear_description(self.pull, [(real, "stuck-fixer-failed")], f.cfg())
+                        rendered = rendered.replace("## Stuck threads\n", "## Author notes\n\n" + notes + "\n\n## Stuck threads\n", 1)
+                        rendered = rendered.replace(m.DEFAULT_HUMAN_DECISION, decision).replace("\n", newline)
+                        self.assertIn("<!-- thread:PRRT_example -->", rendered)
+                        issue = m.LinearIssue("iss_existing", "url", description=rendered)
+                        with self.assertRaises(m.AmbiguousChecklist):
+                            m.failure_handoff_ids(issue)
+                        self.pull = replace(self.pull, threads=(replace(real, is_resolved=resolved),))
+                        with self.assertRaises(m.AmbiguousChecklist):
+                            m.open_failure_handoffs(self.pull, issue)
+                        self.github.pulls[self.pull.number] = self.pull
+                        marker = m.rollup_marker(self.pull)
+                        linear = f.FakeLinear({marker: "https://linear.app/fixture"})
+                        linear.existing_descriptions[marker] = rendered
+                        m.scan(f.cfg(), self.github, linear,
+                               failure_collector=lambda *_: (SimpleNamespace(fresh=lambda: False), {}))
+                        # Fail closed before any id is read: the copied id is never
+                        # retained and the genuine handoff is neither rewritten
+                        # away nor canceled, even once the genuine thread resolves.
+                        self.assertEqual(linear.canceled, [])
+                        self.assertEqual(linear.updated, [])
+                        self.assertEqual(linear.created, [])
+                        self.assertEqual(self.github.comments, [])
+                        self.assertEqual(self.github.labels, [])
+                        self.assertEqual(self.github.resolves, [])
+
+    @unittest.skipUnless(RECURSION, "Recursion preserves generated section boundaries")
+    def test_unclosed_fence_after_notes_copy_cannot_hide_genuine_handoff(self):
+        copied = ("## Stuck threads\n\n- [ ] `example.py:1` — `stuck-fixer-failed` "
+                  "<!-- thread:PRRT_example -->\n\n## Human decision\n\nCopied decision")
+        for fence in ("```markdown", "~~~text"):
+            for newline in ("\n", "\r\n"):
+                with self.subTest(fence=fence, newline=repr(newline)):
+                    self.setup_scan()
+                    real = self.pull.threads[0]
+                    self.assertFalse(real.is_resolved)
+                    rendered = m.linear_description(self.pull, [(real, "stuck-fixer-failed")], f.cfg())
+                    rendered = rendered.replace(
+                        "## Stuck threads\n", "## Author notes\n\nReal notes\n\n" + copied
+                        + "\n\n" + fence + "\n\n## Stuck threads\n", 1,
+                    ).replace("\n", newline)
+                    with self.assertRaises(m.AmbiguousChecklist):
+                        m.failure_handoff_ids(m.LinearIssue("existing", "url", description=rendered))
+                    marker = m.rollup_marker(self.pull)
+                    linear = f.FakeLinear({marker: "https://linear.app/fixture"})
+                    linear.existing_descriptions[marker] = rendered
+                    m.scan(f.cfg(), self.github, linear,
+                           failure_collector=lambda *_: (SimpleNamespace(fresh=lambda: False), {}))
+                    self.assertEqual(linear.canceled, [])
+                    self.assertEqual(linear.updated, [])
+                    self.assertEqual(linear.created, [])
+                    self.assertEqual(self.github.comments, [])
+                    self.assertEqual(self.github.labels, [])
+                    self.assertEqual(self.github.resolves, [])
+
+    @unittest.skipUnless(RECURSION, "Recursion preserves free-form roll-up notes")
+    def test_fenced_notes_heading_example_does_not_replace_genuine_notes(self):
+        for fence in ("```md", "~~~"):
+            example = fence + "\n## Author notes\n\nQuoted notes\n" + fence[:3]
+            for place in ("preamble", "inside"):
+                for newline in ("\n", "\r\n"):
+                    with self.subTest(fence=fence, place=place, newline=repr(newline)):
+                        self.setup_scan()
+                        real = self.pull.threads[0]
+                        if place == "preamble":
+                            # A fenced example above the rendered heading is quoted
+                            # text; a raw line scan used to take it as the notes.
+                            expected = "Real notes"
+                            rendered = m.linear_description(self.pull, [(real, "stuck-fixer-failed")], f.cfg(), previous=expected)
+                            rendered = rendered.replace("## Author notes\n", example + "\n\n## Author notes\n", 1)
+                        else:
+                            expected = "Real notes\n\n" + example
+                            rendered = m.linear_description(self.pull, [(real, "stuck-fixer-failed")], f.cfg(), previous=expected)
+                        rendered = rendered.replace(m.DEFAULT_HUMAN_DECISION, "Actual human decision.").replace("\n", newline)
+                        marker = m.rollup_marker(self.pull)
+                        self.assertEqual(m.existing_author_notes(rendered, marker), expected)
+                        self.assertEqual(m.failure_handoff_ids(m.LinearIssue("issue", "url", description=rendered)), {real.id})
+                        self.github.pulls[self.pull.number] = self.pull
+                        linear = f.FakeLinear({marker: "https://linear.app/fixture"})
+                        linear.existing_descriptions[marker] = rendered
+                        m.scan(f.cfg(), self.github, linear,
+                               failure_collector=lambda *_: (SimpleNamespace(fresh=lambda: False), {}))
+                        self.assertEqual(linear.canceled, [])
+                        self.assertEqual(len(linear.updated), 1)
+                        updated = linear.updated[-1][1]
+                        self.assertEqual(m.existing_author_notes(updated, marker), expected)
+                        self.assertIn("## Author notes\n\n" + expected + "\n\n## Stuck threads\n", updated)
+                        self.assertEqual(m.existing_human_decision(updated), "Actual human decision.")
+                        self.assertIn(f"`stuck-fixer-handoff-open` <!-- thread:{real.id} -->", updated)
+                        self.assertEqual(m.failure_handoff_ids(m.LinearIssue("issue", "url", description=updated)), {real.id})
+                        self.assertEqual(self.github.comments, [])
+                        self.assertEqual(self.github.resolves, [])
+
+    @unittest.skipUnless(RECURSION, "Recursion owns roll-up cancellation")
+    def test_sweep_isolates_ambiguous_rollup_and_still_processes_the_rest(self):
+        from dataclasses import replace
+        copied = ("## Stuck threads\n\n- [ ] `example.py:1` — `stuck-fixer-failed` "
+                  "<!-- thread:PRRT_example -->\n\n## Human decision\n\nCopied decision")
+        for shape in ("unclosed-fence-in-checklist", "unfenced-pair-with-notes"):
+            with self.subTest(shape=shape):
+                self.setup_scan()
+                real = self.pull.threads[0]
+                draft = f.pull(number=10, threads=[real], draft=True)
+                merged = f.pull(number=11, threads=[real], state="MERGED")
+                retained = f.pull(number=12, threads=[real])
+                done = f.pull(number=13, threads=[replace(real, is_resolved=True)])
+                ambiguous = m.linear_description(draft, [(real, "stuck-fixer-failed")], f.cfg(), previous="Real notes")
+                if shape == "unclosed-fence-in-checklist":
+                    ambiguous = ambiguous.replace("## Stuck threads\n\n", "## Stuck threads\n\n```md\n", 1)
+                else:
+                    ambiguous = ambiguous.replace(m.DEFAULT_HUMAN_DECISION, "Actual decision with copied example:\n\n" + copied)
+                with self.assertRaises(m.AmbiguousChecklist):
+                    m.failure_handoff_ids(m.LinearIssue("ambiguous", "url", description=ambiguous))
+                linear = f.FakeLinear()
+                for extra, issue_id in ((retained, "valid"), (done, "done")):
+                    marker = m.rollup_marker(extra)
+                    linear.existing[marker] = f"https://linear.app/{issue_id}"
+                    linear.existing_ids[marker] = issue_id
+                    linear.existing_descriptions[marker] = m.linear_description(extra, [(real, "stuck-fixer-failed")], f.cfg())
+                # The ambiguous roll-up comes first so a loop-level exit would
+                # silently leave every later roll-up untouched.
+                linear.rollups = [
+                    m.LinearIssue("ambiguous", "url", title=m.linear_title(draft), state_type="triage", description=ambiguous),
+                    m.LinearIssue("merged", "url", title=m.linear_title(merged), state_type="triage", description=""),
+                    m.LinearIssue("valid", "url", title=m.linear_title(retained), state_type="triage",
+                                  description=linear.existing_descriptions[m.rollup_marker(retained)]),
+                    m.LinearIssue("done", "url", title=m.linear_title(done), state_type="triage",
+                                  description=linear.existing_descriptions[m.rollup_marker(done)]),
+                ]
+                github = f.FakeGitHub([draft, merged, retained, done])
+                github.list_open_pr_numbers = list  # every roll-up is reached only by the sweep
+                m.scan(f.cfg(), github, linear,
+                       failure_collector=lambda *_: (SimpleNamespace(fresh=lambda: False), {}))
+                # The ambiguous draft roll-up stays unchanged; the merged PR's
+                # roll-up and the fully resolved one are canceled; the open PR
+                # with a retained unresolved handoff is rewritten.
+                self.assertEqual(linear.canceled, ["merged", "done"])
+                self.assertEqual([issue_id for issue_id, _ in linear.updated], ["valid"])
+                self.assertIn(f"`stuck-fixer-handoff-open` <!-- thread:{real.id} -->", linear.updated[0][1])
+                self.assertEqual(linear.created, [])
+                self.assertEqual(github.comments, [])
+                self.assertEqual(github.labels, [])
+                self.assertEqual(github.resolves, [])
 
     @unittest.skipUnless(RECURSION, "Recursion retains exact Unicode filenames")
     def test_non_newline_unicode_separators_preserve_handoffs(self):

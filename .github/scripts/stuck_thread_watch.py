@@ -850,8 +850,12 @@ def existing_author_notes(description: str, marker: str) -> str:
     section = checklist_section(text)
     if section:
         lines, start, _ = section
-        for index in range(start):
-            if _generated_heading(lines[index], NOTES_HEADING):
+        # The rendered notes heading is the first one visible outside closed
+        # fences before the chosen checklist, the same visibility rule that
+        # ``checklist_section`` applies. A fenced ``## Author notes`` example
+        # pasted above the genuine notes is quoted text, not the heading.
+        for index, line in _visible_lines(lines, 0, start):
+            if _generated_heading(line, NOTES_HEADING):
                 return "\n".join(lines[index + 1:start]).strip()
         return ""
     if CHECKLIST_HEADING in text:  # watcher-built: only the notes section carries
@@ -1749,16 +1753,27 @@ def _checklist_end(lines: list[str], start: int) -> int | None:
     return None
 
 
-def _next_candidate_after_decision(lines: list[str], start: int) -> int:
+def _next_candidate_after_decision(lines: list[str], start: int, *, notes_slot: bool = False) -> int:
     """First checklist heading in a decision slot that is not inside a fence.
 
-    Only the trailer follows the decision slot, so an unclosed fence there hides
-    everything after it; a quoted example cannot become a candidate either way.
+    Without notes, the first pair is generated and unclosed decision fences hide
+    examples. With notes, that first pair may itself be a pasted example: an
+    unclosed fence cannot hide a second pair from the ambiguity check.
     """
-    for index, line in _visible_lines(lines, start, len(lines), unclosed_hides=True):
+    for index, line in _visible_lines(lines, start, len(lines), unclosed_hides=not notes_slot):
         if _generated_heading(line, CHECKLIST_HEADING):
             return index
     return len(lines)
+
+
+class AmbiguousChecklist(RuntimeError):
+    """Manual Markdown makes generated rows indistinguishable from copied ones.
+
+    Raised instead of guessing, before any row is read. Every roll-up consumer
+    in ``scan`` treats it like any other Linear exception for that one roll-up:
+    the issue is neither rewritten nor canceled until a human repairs the
+    checklist, and the remaining roll-ups are still processed.
+    """
 
 
 def checklist_section(description: str) -> tuple[list[str], int, int] | None:
@@ -1775,13 +1790,16 @@ def checklist_section(description: str) -> tuple[list[str], int, int] | None:
       fences, is the decision heading. Unclosed openers in notes or under the
       checklist are ordinary text and cannot hide the generated headings.
     * After a complete pair, its decision slot is scanned with its own fence
-      state. Copied pairs inside a fence there (closed or not) are examples.
+      state. Closed fences hide copied pairs; unclosed fences also hide them
+      only when no notes slot makes the first pair's identity ambiguous.
     * Without a rendered notes heading nothing precedes the generated pair, so
       the first complete pair is it. With notes, a pasted pair can precede the
-      generated one, so the last complete top-level pair is taken.
+      generated one, so a second unfenced complete pair cannot be told from
+      it: ``AmbiguousChecklist`` is raised instead of guessing. Picking the
+      last pair would retain a pasted id; picking the first would drop the
+      genuine handoff and cancel the roll-up.
 
-    This recognizes the generated format, not arbitrary manual structure: two
-    unfenced complete pairs on a roll-up with author notes are indistinguishable.
+    This recognizes the generated format, not arbitrary manual structure.
     """
     lines = (description or "").replace("\r\n", "\n").split("\n")
     selected = None
@@ -1802,28 +1820,29 @@ def checklist_section(description: str) -> tuple[list[str], int, int] | None:
             continue
         end = _checklist_end(lines, index)
         if end is None:
-            index = index + 1 if selected is None else _next_candidate_after_decision(lines, index + 1)
+            index = index + 1 if selected is None else _next_candidate_after_decision(lines, index + 1, notes_slot=notes_slot)
             continue
-        if selected is not None and not notes_slot:
-            break
+        if selected is not None:
+            if not notes_slot:
+                break
+            raise AmbiguousChecklist(
+                f"two unfenced {CHECKLIST_HEADING!r} / {DECISION_HEADING!r} pairs "
+                "with author notes; the generated checklist cannot be told from "
+                "a copied one, so the roll-up is left unchanged until the copy "
+                "is fenced or removed"
+            )
         selected = (lines, index, end)
-        index = _next_candidate_after_decision(lines, end + 1)
+        index = _next_candidate_after_decision(lines, end + 1, notes_slot=notes_slot)
     return selected
-
-
-class AmbiguousChecklist(RuntimeError):
-    """Manual Markdown makes generated rows indistinguishable from copied ones.
-
-    Raised instead of guessing. Every roll-up consumer in ``scan`` already
-    treats a Linear exception as "leave this roll-up untouched", so the issue
-    is neither rewritten nor canceled until a human repairs the checklist.
-    """
 
 
 def failure_handoff_ids(issue: LinearIssue | None) -> set[str]:
     if not is_active_issue(issue):
         return set()
-    section = checklist_section(issue.description)
+    try:
+        section = checklist_section(issue.description)
+    except AmbiguousChecklist as exc:
+        raise AmbiguousChecklist(f"{issue.identifier or issue.url}: {exc}") from None
     if section is None:
         # A fence spanning notes and decision can hide the entire generated
         # section. Missing boundaries do not prove its handoffs were resolved.
@@ -2257,33 +2276,39 @@ def scan(
     if linear is not None:
         try:
             for issue in linear.search_rollups():
-                parsed = parse_rollup_title(issue.title)
-                if parsed is None:
-                    continue
-                repo_name, pr_number = parsed
-                if repo_name.casefold() != cfg.name.casefold():
-                    continue
-                if pr_number in seen_prs:
-                    continue
-                if (issue.state_type or "").lower() in {"canceled", "completed"}:
-                    continue
-                extra = github.load_pr(pr_number)
-                if extra and skip_pr_reason(extra) == "draft" and open_failure_handoffs(extra, issue):
-                    continue
-                if extra is None or skip_pr_reason(extra) in {"closed", "not-open", "draft"}:
-                    cancel_linear_rollup(issue, linear, counters)
-                    continue
-                extra_evidence = None
+                # One roll-up's failure (an ambiguous checklist, a PR read, a
+                # cancel) leaves that issue unchanged and must not end the sweep
+                # for the independent roll-ups after it.
                 try:
-                    extra, extra_evidence = with_failure_evidence(extra, cfg, failure_collector)
-                except Exception:  # noqa: BLE001 - preserve this roll-up and inspect the next PR
-                    notice(f"PR #{extra.number}: retain current handoffs; failure evidence unavailable")
-                remaining = stuck_threads(extra, cfg, for_rollup=True)
-                if open_failure_handoffs(extra, issue) or (remaining and failure_handoff_ids(issue)):
-                    if cfg.linear_api_key:
-                        upsert_linear_rollup(extra, remaining, cfg, linear, counters, failure_evidence=extra_evidence)
-                elif not remaining:
-                    cancel_linear_rollup(issue, linear, counters)
+                    parsed = parse_rollup_title(issue.title)
+                    if parsed is None:
+                        continue
+                    repo_name, pr_number = parsed
+                    if repo_name.casefold() != cfg.name.casefold():
+                        continue
+                    if pr_number in seen_prs:
+                        continue
+                    if (issue.state_type or "").lower() in {"canceled", "completed"}:
+                        continue
+                    extra = github.load_pr(pr_number)
+                    if extra and skip_pr_reason(extra) == "draft" and open_failure_handoffs(extra, issue):
+                        continue
+                    if extra is None or skip_pr_reason(extra) in {"closed", "not-open", "draft"}:
+                        cancel_linear_rollup(issue, linear, counters)
+                        continue
+                    extra_evidence = None
+                    try:
+                        extra, extra_evidence = with_failure_evidence(extra, cfg, failure_collector)
+                    except Exception:  # noqa: BLE001 - preserve this roll-up and inspect the next PR
+                        notice(f"PR #{extra.number}: retain current handoffs; failure evidence unavailable")
+                    remaining = stuck_threads(extra, cfg, for_rollup=True)
+                    if open_failure_handoffs(extra, issue) or (remaining and failure_handoff_ids(issue)):
+                        if cfg.linear_api_key:
+                            upsert_linear_rollup(extra, remaining, cfg, linear, counters, failure_evidence=extra_evidence)
+                    elif not remaining:
+                        cancel_linear_rollup(issue, linear, counters)
+                except Exception as issue_exc:  # noqa: BLE001 - this roll-up stays unchanged
+                    notice(f"Linear roll-up {issue.identifier or issue.url} skipped: {issue_exc}")
         except Exception as extra_exc:  # noqa: BLE001
             notice(f"Linear roll-up sweep skipped: {extra_exc}")
     log(

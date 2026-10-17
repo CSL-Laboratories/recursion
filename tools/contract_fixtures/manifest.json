@@ -1,0 +1,38 @@
+{
+  "manifest_type": "ContractFixtureManifest@1",
+  "issue": "CSL-238",
+  "status": "draft-pending-rule-h-acceptance",
+  "schema": "schema/wire-vocab-draft.schema.json",
+  "verdict_vocabulary": {
+    "accept": "document validates against its target $def and declared semantic rules",
+    "reject": "document fails schema validation or a declared semantic rule"
+  },
+  "semantic_rules": {
+    "x-sorted-set": "array must equal its sorted-unique self (ascending Unicode code point)",
+    "x-preferred-in-supported": "preferred must be a member of supported"
+  },
+  "fixtures": [
+    { "id": "P-01", "path": "positive/P-01-identity-ref.json", "target": "wire_identity_ref", "kind": "positive", "expect": "accept" },
+    { "id": "P-02", "path": "positive/P-02-identity-ref-min-id.json", "target": "wire_identity_ref", "kind": "positive", "expect": "accept" },
+    { "id": "P-03", "path": "positive/P-03-event-envelope.json", "target": "wire_event_envelope", "kind": "positive", "expect": "accept" },
+    { "id": "P-04", "path": "positive/P-04-event-envelope-optional.json", "target": "wire_event_envelope", "kind": "positive", "expect": "accept" },
+    { "id": "P-05", "path": "positive/P-05-outcome-accepted.json", "target": "wire_command_outcome", "kind": "positive", "expect": "accept" },
+    { "id": "P-06", "path": "positive/P-06-outcome-refused-retryable.json", "target": "wire_command_outcome", "kind": "positive", "expect": "accept" },
+    { "id": "P-07", "path": "positive/P-07-outcome-duplicate.json", "target": "wire_command_outcome", "kind": "positive", "expect": "accept" },
+    { "id": "P-08", "path": "positive/P-08-version-advertisement.json", "target": "wire_version_advertisement", "kind": "positive", "expect": "accept" },
+    { "id": "A-01", "path": "adverse/A-01-identity-extra-field.json", "target": "wire_identity_ref", "kind": "adverse", "expect": "reject", "note": "additionalProperties violation" },
+    { "id": "A-02", "path": "adverse/A-02-identity-unknown-version.json", "target": "wire_identity_ref", "kind": "adverse", "expect": "reject", "note": "unknown @N record version" },
+    { "id": "A-03", "path": "adverse/A-03-identity-bad-id.json", "target": "wire_identity_ref", "kind": "adverse", "expect": "reject", "note": "PublicId grammar violation" },
+    { "id": "A-04", "path": "adverse/A-04-identity-bad-digest.json", "target": "wire_identity_ref", "kind": "adverse", "expect": "reject", "note": "uppercase digest hex" },
+    { "id": "A-05", "path": "adverse/A-05-event-missing-sequence.json", "target": "wire_event_envelope", "kind": "adverse", "expect": "reject", "note": "missing required sequence" },
+    { "id": "A-06", "path": "adverse/A-06-event-negative-sequence.json", "target": "wire_event_envelope", "kind": "adverse", "expect": "reject", "note": "negative sequence" },
+    { "id": "A-07", "path": "adverse/A-07-event-float-sequence.json", "target": "wire_event_envelope", "kind": "adverse", "expect": "reject", "note": "non-integer sequence" },
+    { "id": "A-08", "path": "adverse/A-08-outcome-refused-missing-block.json", "target": "wire_command_outcome", "kind": "adverse", "expect": "reject", "note": "refused outcome without refusal block" },
+    { "id": "A-09", "path": "adverse/A-09-outcome-accepted-with-refusal.json", "target": "wire_command_outcome", "kind": "adverse", "expect": "reject", "note": "accepted outcome carrying refusal block" },
+    { "id": "A-10", "path": "adverse/A-10-outcome-permanent-with-retry.json", "target": "wire_command_outcome", "kind": "adverse", "expect": "reject", "note": "permanent refusal with retry_after_seconds" },
+    { "id": "A-11", "path": "adverse/A-11-outcome-unknown-reason.json", "target": "wire_command_outcome", "kind": "adverse", "expect": "reject", "note": "reason_code outside closed registry" },
+    { "id": "A-12", "path": "adverse/A-12-advert-unsorted-supported.json", "target": "wire_version_advertisement", "kind": "adverse", "expect": "reject", "note": "x-sorted-set semantic rule" },
+    { "id": "A-13", "path": "adverse/A-13-advert-duplicate-supported.json", "target": "wire_version_advertisement", "kind": "adverse", "expect": "reject", "note": "duplicate set entry" },
+    { "id": "A-14", "path": "adverse/A-14-advert-preferred-not-supported.json", "target": "wire_version_advertisement", "kind": "adverse", "expect": "reject", "note": "x-preferred-in-supported semantic rule" }
+  ]
+}

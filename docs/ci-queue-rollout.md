@@ -173,6 +173,13 @@ pinned-checkout and one-attempt guards because its candidate input is empty.
 Passing product tests on all OSes is separate evidence from genuine review-event
 admission/reusable-workflow qualification; the latter remains an activation hold.
 
+## Runner cost planning
+
+Lucas approved a shared $100/month target with $60–75 planned core compute.
+See [the budget and all-start accounting procedure](ci-cost-budget.md). It adds
+no scheduler or enforcement, preserves required qualification and master fallback,
+and treats timestamp-derived costs as estimates rather than invoices or credits.
+
 ## Cross-repository design notes (peer-repository findings, assessed 2026-10-17)
 
 - **Queue starvation (The peer repository 4300898366): absent.** The gate holds no

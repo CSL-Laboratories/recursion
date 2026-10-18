@@ -68,10 +68,11 @@
     {
       "id": "contract.issue-anti-drift",
       "revision": 2,
-      "status": "candidate",
+      "status": "accepted",
       "path": "docs/v3/program-control/ISSUE-CONTRACT-v2.md",
       "sha256": "a7146b0ca0647aae00a2a8ab5640663a83fb629ce603ab5eb1447325ff6c8969",
-      "decision_issue": "CSL-204"
+      "decision_issue": "CSL-204",
+      "decision_receipt": "decision.csl-258.issue-contract-v2-acceptance.2026-10-18"
     },
     {
       "id": "contract.month-program",
@@ -106,6 +107,35 @@
       "decided_on": "2026-10-16",
       "approval_evidence": "Session authorization is quoted on CSL-204, but no human-authored Linear approval comment is pinned under the candidate policy.",
       "revisit_trigger": "The candidate changes product authority, public semantics, or the accepted program boundary."
+    },
+    {
+      "id": "decision.csl-258.issue-contract-v2-acceptance.2026-10-18",
+      "status": "approved",
+      "parent_issue": "CSL-45",
+      "human_decider": "Lucas Guerra",
+      "authority_basis": "founder authority",
+      "proposal_id": "proposal.csl-258.issue-contract-v2-acceptance.2026-10-17",
+      "proposal_digest": "6f8d36d1a07c75f833a509dc862a666148bb38b6a994a200aa6d0cc4d8ab3bc9",
+      "linear_issue": "CSL-204",
+      "approval_comment_id": "af98ee2f-fb3d-4346-b8ec-5a4176f235a5",
+      "selected_option": "acceptance of the existing reviewed revision",
+      "rejected_options": [
+        "deferring acceptance pending another revision"
+      ],
+      "rationale": "This reviewed revision clarifies decision-maker authority while preserving existing receipt and lifecycle boundaries.",
+      "conditions": [
+        "Preserve prior bytes and decision history.",
+        "Independent proposal/receipt verification, representative-issue validation and independent review remain required before applying this workflow to the backlog.",
+        "This excludes admission limits, the month-program contract, R2a, operational permissions and release qualification."
+      ],
+      "scope": [
+        "contract.issue-anti-drift"
+      ],
+      "decided_on": "2026-10-18",
+      "submitted_at": "2026-10-18T02:11:13.825Z",
+      "submission_timezone": "UTC",
+      "approval_evidence": "Direct human comment by Lucas Guerra: https://linear.app/csl-laboratories/issue/CSL-204#comment-af98ee2f-fb3d-4346-b8ec-5a4176f235a5. Submitted 2026-10-18 02:11:13.825 UTC (2026-10-17 19:11:13.825 PDT, UTC-07:00). Supplements preceding direct B6 confirmation https://linear.app/csl-laboratories/issue/CSL-204#comment-d59f7b62-0244-4b8e-be9b-738922b70f87.",
+      "revisit_trigger": "The contract bytes, approved scope or authority boundary change."
     }
   ],
   "admission": {
@@ -251,5 +281,30 @@
       "evidence_ids": []
     }
   ],
-  "proposals": []
+  "proposals": [
+    {
+      "id": "proposal.csl-258.issue-contract-v2-acceptance.2026-10-17",
+      "linear_issue": "CSL-204",
+      "scope": [
+        "contract.issue-anti-drift"
+      ],
+      "contract_bindings": [
+        {
+          "id": "contract.issue-anti-drift",
+          "revision": 2,
+          "sha256": "a7146b0ca0647aae00a2a8ab5640663a83fb629ce603ab5eb1447325ff6c8969"
+        }
+      ],
+      "unknown_bindings": [],
+      "checkpoint_bindings": [],
+      "research_bindings": [],
+      "authorizations": [
+        {
+          "action": "accept_contract",
+          "target": "contract.issue-anti-drift",
+          "target_digest": "2f2e07ffa4ba823ca53cbc7325345afd84a5a2b74cdf51002ad995482a80383b"
+        }
+      ]
+    }
+  ]
 }

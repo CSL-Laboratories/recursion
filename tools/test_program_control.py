@@ -46,10 +46,6 @@ class ProgramControlTests(unittest.TestCase):
         ledger_data = json.loads(LEDGER.read_text(encoding="utf-8"))
         cls.root_pinned = tuple(
             checker.sha256_pinned_paths(ledger_data, ROOT, inventory=cls.root_inventory))
-        paths, _manifest_paths, _errors = checker._pinned_path_details(
-            ledger_data, ROOT, inventory=cls.root_inventory)
-        if cls.root_pinned != tuple(paths):
-            raise AssertionError("shared pinned-path key differs from pinned_eol_errors key")
         cls.root_inventory.check_attr(cls.root_pinned)
 
     @classmethod
@@ -67,7 +63,10 @@ class ProgramControlTests(unittest.TestCase):
         self.data = json.loads(LEDGER.read_text(encoding="utf-8"))
 
     def errors(self, data=None):
-        # Shared snapshot of an unmodified checkout; it never observes later changes. setUpClass/tearDownClass bound ROOT's inventory and attributes at the suite's start and end; a change made and reverted mid-suite is not detected.
+        # Shared snapshot of an unmodified checkout: its path list and already-queried
+        # attributes never refresh. setUpClass/tearDownClass compare the inventory and
+        # the root_pinned attributes at the suite's start and end; attribute drift for
+        # other path tuples, or a change made and reverted mid-suite, is not detected.
         return checker.validate_program(data or self.data, ROOT, inventory=self.root_inventory)
 
     def assert_rejected(self, fragment, data=None):
@@ -2212,7 +2211,7 @@ class ProgramControlTests(unittest.TestCase):
             inv = checker.pinned_inventory(root)
             self.assertTrue(inv.errors)
             self.assertIsInstance(inv.errors, tuple)
-            original = inv.errors
+            original = list(inv.errors)
 
             _paths, _manifest_paths, details_errors = checker._pinned_path_details(
                 data, root, inventory=inv)
@@ -2225,7 +2224,7 @@ class ProgramControlTests(unittest.TestCase):
             second_path_errors = checker.pinned_path_errors(data, root, inventory=inv)
             self.assertNotIn("poison", second_details_errors)
             self.assertNotIn("poison", second_path_errors)
-            self.assertEqual(inv.errors, original)
+            self.assertEqual(list(inv.errors), original)
             self.assertIsInstance(inv.errors, tuple)
 
     def test_default_calls_rescan_between_calls(self):

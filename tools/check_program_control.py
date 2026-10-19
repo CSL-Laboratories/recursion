@@ -795,13 +795,16 @@ def _filesystem_pinned_path_inventory(root: str) -> tuple[tuple[str, ...], tuple
 
 @dataclasses.dataclass(frozen=True)
 class PinnedInventory:
-    """One filesystem scan of sha256-pinned paths under a resolved root, owned by the caller that built it.
+    """One filesystem scan of sha256-pinned paths under a resolved root,
+    owned by the caller that built it.
 
-    git check-attr results are queried lazily on the first check_attr() per
-    path tuple and then fixed for this object; callers receive copies. A reused
-    inventory never observes later filesystem or attribute changes: passing
-    inventory= is a caller trust boundary for a tree the caller guarantees
-    unchanged. Validations without inventory= (including main()) scan afresh.
+    Its path list and the attributes of each path tuple already passed to
+    check_attr() never refresh; check_attr() memoizes per tuple on first use and
+    returns copies. Path existence, known-gap parent directories and contract
+    bytes are still read live, and a tuple first queried after a change observes
+    it. Passing inventory= is a caller trust boundary for a tree the caller
+    guarantees unchanged; validations without inventory= (including main())
+    scan afresh.
     """
     root: str
     paths: tuple[str, ...]

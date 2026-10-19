@@ -35,6 +35,30 @@ This repository builds Recursion v3, a provider-neutral agent harness. Read
 it says what is in scope. Then read [docs/v3/START-HERE.md](docs/v3/START-HERE.md) before
 selecting a task.
 
+## Bounded issue execution and shared evidence
+
+`CONTROL_PLANE.md` wins over this section, and `ANCHOR.md` limits its scope. Nothing here creates a supervisor, a standing executive, autonomous reprioritisation or cross-repository orchestration.
+
+The loop starts from an objective, feature admission or direction decision approved by a founder acting within `CONTROL_PLANE.md` authority. Within one admitted task (one repository/worktree, explicit allowed paths, explicit non-goals and one machine-checkable gate), an agent runs bounded research, development and tests. It then closes out with independent evidence on the exact candidate. Closeout records the full 40-hex commit tested, the commands and results, unresolved criteria, review evidence and linked follow-ups. An implementer's PASS, a GitHub merge and a Linear **Done** status are never empirical or product acceptance.
+
+When blocked, an agent preserves its work and records the blocker. Blockers go in `state/INBOX.md`. Flag required decision-log entries; `state/DECISIONS.md` remains protected and may be changed only through its separately founder-approved authoring process. A product task grants no permission to write that log. The agent comments on the Linear issue with @mentions, then releases its execution claim by unassigning itself under existing conventions. Releasing the claim does not release the hold. A human-decision hold needs an explicit human decision receipt. A technical or dependency blocker needs evidence that its condition has cleared. Either way, the agent rechecks the gate and readiness and takes a fresh claim before resuming. Product decisions are never inferred from silence, elapsed time, CI results or issue status. A founder merge records its merge decision; it does not itself accept a product fragment or release an unrelated decision hold. Agents do not invent receipts or present their own records as founder statements.
+
+Moving to other work means taking only a separately admitted, already-authorised task. That task must be next under an explicit human-approved priority or order. If no such order exists, or it is ambiguous, propose the next choice to the founders on Linear and wait. Do not choose for them.
+
+Ownership is currently manual and human-coordinated through Linear assignment. It is separate from any CI candidate or merge coordination. Record scope, writer, branch/head and handoff evidence on the issue. Before publishing, read the remote head. Preserve uncertain in-flight work and stop on ambiguity. Transactional claims or locks, leases, fencing, WIP enforcement and a shared execution-cost ledger are proposed and unimplemented. Do not treat them as current guarantees. This guide sets no numeric WIP cap; any cap is a separate founder decision.
+
+Shared research may be stored in the private [CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research) repository. Storing records there requires a separately admitted task and existing granted access; this guide grants no write route, access or cross-repository scope. The vault is evidence storage, not a supervisor or decision authority. Do not assume published records, a schema or a validator exist there until they are actually present. An exact evidence reference names the repository, full 40-hex commit, record path, claim and limitations. A research record should carry:
+
+- sanitised prompt and result hashes
+- provider, model or processor and run ID, or the reason no paid run was made
+- estimated and actual cost with unknowns; reserved amounts only when supported by an independently verified existing reservation
+- a mapping from sources to claims, with retrieval dates
+- limitations, supersession references and artifact manifests
+
+Consuming a fragment that requires acceptance needs the applicable exact, authenticated human receipt. A receipt identifier alone is not verification: manually check the source, human identity and authority, exact digest, conditions and revocation. An attributed relay is not a personal human receipt where personal posting is required; no new authentication tool is implied. Candidate-only research is labelled as such and grants no implementation scope. Keep evidence classes distinct.
+
+Never commit secrets, private account details, raw chats, signed URLs, bulk copyrighted material or datasets to Git. Manifests for approved external storage retain hash, size, access, retention and license notes. An access denial stops the affected transfer; do not look for an alternative path. Existing approved routes keep their actual authority. This section adds no API, new spend, fallback or overage. Lucas's spending and company-resource authority, own-account limits, the R2a prerequisite, the review roles and the rule that agents never merge are unchanged.
+
 ## Your role
 
 Founders decide within the authority defined in `CONTROL_PLANE.md`: any founder may decide

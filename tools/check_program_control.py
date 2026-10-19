@@ -795,11 +795,13 @@ def _filesystem_pinned_path_inventory(root: str) -> tuple[tuple[str, ...], tuple
 
 @dataclasses.dataclass(frozen=True)
 class PinnedInventory:
-    """One filesystem scan of sha256-pinned paths under a resolved root.
+    """One filesystem scan of sha256-pinned paths under a resolved root, owned by the caller that built it.
 
-    Scoped to the caller that built it: every validation that is not handed
-    an inventory scans afresh. git check-attr results are memoized per path
-    set on this object only.
+    git check-attr results are queried lazily on the first check_attr() per
+    path tuple and then fixed for this object; callers receive copies. A reused
+    inventory never observes later filesystem or attribute changes: passing
+    inventory= is a caller trust boundary for a tree the caller guarantees
+    unchanged. Validations without inventory= (including main()) scan afresh.
     """
     root: str
     paths: tuple[str, ...]
@@ -811,7 +813,8 @@ class PinnedInventory:
     def check_attr(self, paths: tuple[str, ...]) -> tuple[dict[str, dict[str, str]], str]:
         if paths not in self._attrs:
             self._attrs[paths] = _git_check_attr(self.root, paths)
-        return self._attrs[paths]
+        resolved, failure = self._attrs[paths]
+        return {path: dict(attrs) for path, attrs in resolved.items()}, failure
 
 
 def pinned_inventory(root: Path) -> PinnedInventory:
@@ -949,7 +952,6 @@ def pinned_eol_errors(data: dict[str, Any], root: Path, *,
 
 def validate_program(data: dict[str, Any], root: Path = ROOT, *,
                      inventory: PinnedInventory | None = None) -> list[str]:
-    inventory = _inventory_for_root(root, inventory)
     errors: list[str] = []
     if not isinstance(data, dict):
         return ["program must be an object"]
@@ -1034,6 +1036,7 @@ def validate_program(data: dict[str, Any], root: Path = ROOT, *,
         if type(contract.get("revision")) is not int or contract["revision"] < 1:
             errors.append(f"{contract_id} revision must be a positive integer")
 
+    inventory = _inventory_for_root(root, inventory)
     errors.extend(pinned_eol_errors(data, root, inventory=inventory))
 
     def bindings_match(bindings: Any, contract_ids: list[str]) -> bool:

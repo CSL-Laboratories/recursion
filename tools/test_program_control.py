@@ -43,12 +43,31 @@ class ProgramControlTests(unittest.TestCase):
     def setUpClass(cls):
         super().setUpClass()
         cls.root_inventory = checker.pinned_inventory(ROOT)
+        ledger_data = json.loads(LEDGER.read_text(encoding="utf-8"))
+        cls.root_pinned = tuple(
+            checker.sha256_pinned_paths(ledger_data, ROOT, inventory=cls.root_inventory))
+        paths, _manifest_paths, _errors = checker._pinned_path_details(
+            ledger_data, ROOT, inventory=cls.root_inventory)
+        if cls.root_pinned != tuple(paths):
+            raise AssertionError("shared pinned-path key differs from pinned_eol_errors key")
+        cls.root_inventory.check_attr(cls.root_pinned)
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            fresh = checker.pinned_inventory(ROOT)
+            if fresh != cls.root_inventory:
+                raise AssertionError("ROOT pinned inventory changed during the test suite")
+            if cls.root_inventory.check_attr(cls.root_pinned) != fresh.check_attr(cls.root_pinned):
+                raise AssertionError("ROOT git check-attr results changed during the test suite")
+        finally:
+            super().tearDownClass()
 
     def setUp(self) -> None:
         self.data = json.loads(LEDGER.read_text(encoding="utf-8"))
 
     def errors(self, data=None):
-        # The suite never mutates ROOT, so it shares one caller-held scan.
+        # Shared snapshot of an unmodified checkout; it never observes later changes. setUpClass/tearDownClass bound ROOT's inventory and attributes at the suite's start and end; a change made and reverted mid-suite is not detected.
         return checker.validate_program(data or self.data, ROOT, inventory=self.root_inventory)
 
     def assert_rejected(self, fragment, data=None):
@@ -2135,6 +2154,133 @@ class ProgramControlTests(unittest.TestCase):
 
     def test_shared_root_inventory_matches_fresh_scan(self):
         self.assertEqual(self.root_inventory, checker.pinned_inventory(ROOT))
+        self.assertEqual(
+            self.root_inventory.check_attr(self.root_pinned),
+            checker.pinned_inventory(ROOT).check_attr(self.root_pinned))
+
+    def test_check_attr_results_cannot_be_poisoned_by_caller_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+            notes = root / "notes.md"
+            notes.write_text("notes\n", encoding="utf-8")
+            digest = hashlib.sha256(notes.read_bytes()).hexdigest()
+            (root / "SHA256SUMS.txt").write_text(
+                f"{digest}  notes.md\n", encoding="utf-8")
+
+            inv = checker.pinned_inventory(root)
+            data = {"contracts": []}
+            key = tuple(checker.sha256_pinned_paths(data, root, inventory=inv))
+            self.assertEqual(key, ("notes.md",))
+            baseline = checker.pinned_eol_errors(data, root, inventory=inv)
+            self.assertTrue(any("notes.md sha256-pinned path lacks eol=lf" in error
+                                for error in baseline), baseline)
+
+            first_attrs, _ = inv.check_attr(key)
+            second_attrs, _ = inv.check_attr(key)
+            self.assertIsNot(first_attrs, second_attrs)
+            self.assertIsNot(first_attrs["notes.md"], second_attrs["notes.md"])
+
+            mutations = (
+                ("cover path", lambda attrs: (
+                    attrs["notes.md"].update({"eol": "lf", "text": "unset"}))),
+                ("delete path", lambda attrs: attrs.__delitem__("notes.md")),
+                ("clear result", lambda attrs: attrs.clear()),
+            )
+            for label, mutate in mutations:
+                with self.subTest(mutation=label):
+                    attrs, _ = inv.check_attr(key)
+                    mutate(attrs)
+                    errors = checker.pinned_eol_errors(data, root, inventory=inv)
+                    self.assertTrue(any("notes.md sha256-pinned path lacks eol=lf" in error
+                                        for error in errors), errors)
+                    self.assertFalse(any("missing from git check-attr output" in error
+                                         for error in errors), errors)
+
+            self.assertEqual(inv.check_attr(key), checker.pinned_inventory(root).check_attr(key))
+
+    def test_pinned_path_detail_errors_are_caller_copies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            packet = root / "docs/v3/research-lane/unsafe-packet"
+            packet.mkdir(parents=True)
+            (packet / "SHA256SUMS.txt").write_text(
+                "a" * 64 + "  /etc/passwd\n" +
+                "b" * 64 + "  " + "../" * 5 + "outside.md\n",
+                encoding="utf-8")
+            data = {"contracts": []}
+            inv = checker.pinned_inventory(root)
+            self.assertTrue(inv.errors)
+            self.assertIsInstance(inv.errors, tuple)
+            original = inv.errors
+
+            _paths, _manifest_paths, details_errors = checker._pinned_path_details(
+                data, root, inventory=inv)
+            details_errors.append("poison")
+            path_errors = checker.pinned_path_errors(data, root, inventory=inv)
+            path_errors.append("poison")
+
+            _paths, _manifest_paths, second_details_errors = checker._pinned_path_details(
+                data, root, inventory=inv)
+            second_path_errors = checker.pinned_path_errors(data, root, inventory=inv)
+            self.assertNotIn("poison", second_details_errors)
+            self.assertNotIn("poison", second_path_errors)
+            self.assertEqual(inv.errors, original)
+            self.assertIsInstance(inv.errors, tuple)
+
+    def test_default_calls_rescan_between_calls(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+            data = {"contracts": []}
+            self.assertEqual(checker.sha256_pinned_paths(data, root), [])
+            self.assertEqual(checker.pinned_path_errors(data, root), [])
+            self.assertEqual(checker.pinned_eol_errors(data, root), [])
+
+            notes = root / "notes.md"
+            notes.write_text("notes\n", encoding="utf-8")
+            digest = hashlib.sha256(notes.read_bytes()).hexdigest()
+            (root / "SHA256SUMS.txt").write_text(
+                f"{digest}  notes.md\n", encoding="utf-8")
+            self.assertIn("notes.md", checker.sha256_pinned_paths(data, root))
+            errors = checker.pinned_eol_errors(data, root)
+            self.assertTrue(any("notes.md sha256-pinned path lacks eol=lf" in error
+                                for error in errors), errors)
+            self.assertEqual(checker.pinned_path_errors(data, root), [])
+
+            (root / ".gitattributes").write_text("notes.md eol=lf\n", encoding="utf-8")
+            self.assertEqual(checker.pinned_eol_errors(data, root), [])
+
+        real = checker._filesystem_pinned_path_inventory(str(ROOT.resolve()))
+        probe = "tools/check_program_control.py"
+        self.assertNotIn(probe, real[0])
+        self.assertNotIn(probe, checker.PINNED_EOL_KNOWN_GAPS)
+        probe_attrs, failure = checker._git_check_attr(str(ROOT.resolve()), (probe,))
+        self.assertEqual(failure, "")
+        self.assertNotEqual(probe_attrs.get(probe, {}).get("eol"), "lf")
+        self.assertNotEqual(probe_attrs.get(probe, {}).get("text"), "unset")
+
+        fake_paths = tuple(sorted(real[0] + (probe,)))
+        with patch.object(
+                checker, "_filesystem_pinned_path_inventory",
+                side_effect=[real, (fake_paths, real[1], real[2])]):
+            first = checker.validate_program(self.data, ROOT)
+            second = checker.validate_program(self.data, ROOT)
+        self.assertFalse(any(probe in error for error in first), first)
+        self.assertTrue(any(f"{probe} sha256-pinned path lacks eol=lf" in error
+                            for error in second), second)
+
+    def test_malformed_program_returns_before_scanning(self):
+        from unittest.mock import patch
+
+        with patch.object(checker, "pinned_inventory") as scan:
+            self.assertEqual(checker.validate_program([], ROOT), ["program must be an object"])
+            missing = checker.validate_program({}, ROOT)
+            self.assertEqual(len(missing), 1, missing)
+            self.assertTrue(missing[0].startswith("missing top-level fields:"), missing)
+            scan.assert_not_called()
 
 
 if __name__ == "__main__":

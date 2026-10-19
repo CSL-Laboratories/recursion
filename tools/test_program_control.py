@@ -1954,6 +1954,46 @@ class ProgramControlTests(unittest.TestCase):
                 self.assertEqual(checker.sha256_pinned_paths({"contracts": []}, root), [])
                 self.assertEqual(checker.pinned_path_errors({"contracts": []}, root), [])
 
+    def test_pinned_path_inventory_cached_per_resolved_root(self):
+        checker._filesystem_pinned_path_inventory.cache_clear()
+        initial_info = checker._filesystem_pinned_path_inventory.cache_info()
+        self.assertEqual(initial_info.hits, 0)
+        self.assertEqual(initial_info.currsize, 0)
+
+        # Inventory helper returns immutable tuples for resolved root string.
+        res1 = checker._filesystem_pinned_path_inventory(str(ROOT.resolve()))
+        self.assertIsInstance(res1, tuple)
+        self.assertEqual(len(res1), 3)
+        self.assertIsInstance(res1[0], tuple)
+        self.assertIsInstance(res1[1], tuple)
+        self.assertIsInstance(res1[2], tuple)
+
+        # Alias check.
+        self.assertIs(checker._pinned_path_inventory, checker._filesystem_pinned_path_inventory)
+
+        # Repeated calls reuse cached tuples without re-walking.
+        res2 = checker._filesystem_pinned_path_inventory(str(ROOT.resolve()))
+        self.assertIs(res1, res2)
+        self.assertEqual(checker._filesystem_pinned_path_inventory.cache_info().hits, 1)
+
+        # High-level validators hit the cache for ROOT.
+        _ = checker.pinned_eol_errors(self.data, ROOT)
+        self.assertGreater(checker._filesystem_pinned_path_inventory.cache_info().hits, 1)
+
+        # Mutating error list returned by _pinned_path_details does not affect cached tuples.
+        _paths, _manifest_paths, errors = checker._pinned_path_details(self.data, ROOT)
+        errors.append("synthetic_error_marker")
+        self.assertNotIn("synthetic_error_marker",
+                         checker._filesystem_pinned_path_inventory(str(ROOT.resolve()))[2])
+
+        # Independent temp roots resolve without collision.
+        with tempfile.TemporaryDirectory() as directory:
+            temp_root = Path(directory).resolve()
+            temp_res = checker._filesystem_pinned_path_inventory(str(temp_root))
+            self.assertIsInstance(temp_res, tuple)
+            self.assertEqual(temp_res, ((), (), ()))
+            self.assertNotEqual(str(temp_root), str(ROOT.resolve()))
+
 
 if __name__ == "__main__":
     unittest.main()

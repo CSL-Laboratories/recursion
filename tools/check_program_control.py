@@ -727,6 +727,76 @@ def _manifest_payload_paths(manifest: Path, root: Path, errors: list[str],
     return resolved_paths
 
 
+def _files_named_exactly(root: Path, filename: str) -> list[Path]:
+    """Find files by their actual on-disk names in deterministic order.
+
+    Path.glob can return a pattern-cased basename for a case-insensitive
+    match on Windows. os.walk preserves the spelling returned by the
+    filesystem, so comparing each filename here is reliable on every OS.
+    """
+    matches: list[Path] = []
+    for directory, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        matches.extend(Path(directory) / name for name in filenames if name == filename)
+    return sorted(matches, key=lambda path: path.relative_to(root).as_posix())
+
+
+@functools.lru_cache(maxsize=None)
+def _filesystem_pinned_path_inventory(root: str) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Filesystem-derived inventory of sha256-pinned paths, manifest paths,
+    and deterministic resolution errors for a resolved root string.
+    """
+    root_path = Path(root)
+    errors: list[str] = []
+    paths: list[str] = []
+    for manifest in _files_named_exactly(root_path, "SHA256SUMS.txt"):
+        if ".git" in manifest.relative_to(root_path).parts:
+            continue
+        manifest_rel = manifest.relative_to(root_path).as_posix()
+        for line in manifest.read_text(encoding="utf-8", errors="replace").splitlines():
+            match = SUM_LINE.fullmatch(line.strip())
+            if not match:
+                continue
+            name = match.group(2).strip()
+            source = f"{manifest_rel}: entry '{name}'"
+            entry = _safe_join(manifest.parent, name, root_path, errors, source)
+            if entry is None:
+                continue
+            # Manifests written from their parent directory carry the
+            # packet directory as a prefix on every entry; use that
+            # resolution only when the local one is absent (a packet may
+            # legitimately nest a same-named directory).
+            if (not entry.exists()
+                    and name.startswith(manifest.parent.name + "/")):
+                fallback = _safe_join(manifest.parent.parent, name, root_path, errors, source)
+                if fallback is None:
+                    continue
+                if fallback.exists():
+                    entry = fallback
+            paths.append(entry.relative_to(root_path).as_posix())
+    manifest_paths: list[str] = []
+    known_missing_seen: set[str] = set()
+    for manifest in _files_named_exactly(root_path, "MANIFEST.json"):
+        if ".git" in manifest.relative_to(root_path).parts:
+            continue
+        for resolved in _manifest_payload_paths(manifest, root_path, errors, known_missing_seen):
+            manifest_paths.append(resolved.relative_to(root_path).as_posix())
+    for path in sorted(MANIFEST_KNOWN_MISSING_SOURCE_ORIGINALS - known_missing_seen):
+        packet = "/".join(path.split("/")[:4])
+        if (root_path / packet).is_dir():
+            errors.append(f"{path} known missing manifest source original is stale: "
+                          "remove it from MANIFEST_KNOWN_MISSING_SOURCE_ORIGINALS")
+    paths.extend(manifest_paths)
+    audits = root_path / "docs/audits"
+    if audits.is_dir():
+        paths.extend(path.relative_to(root_path).as_posix()
+                     for path in sorted(audits.rglob("*")) if path.is_file())
+    return tuple(paths), tuple(manifest_paths), tuple(errors)
+
+
+_pinned_path_inventory = _filesystem_pinned_path_inventory
+
+
 def _pinned_path_details(data: dict[str, Any], root: Path) -> tuple[list[str], frozenset[str], list[str]]:
     """Repo-relative paths whose delivered bytes are sha256-pinned, the
     subset of those derived from MANIFEST.json inventories, and any
@@ -741,68 +811,13 @@ def _pinned_path_details(data: dict[str, Any], root: Path) -> tuple[list[str], f
     path-by-path snapshot of currently uncovered pins.
     """
     root = root.resolve()
-    errors: list[str] = []
     paths: list[str] = []
     for contract in data.get("contracts", []):
         if isinstance(contract, dict) and text_present(contract.get("path")):
             paths.append(contract["path"])
-    for manifest in _files_named_exactly(root, "SHA256SUMS.txt"):
-        if ".git" in manifest.relative_to(root).parts:
-            continue
-        manifest_rel = manifest.relative_to(root).as_posix()
-        for line in manifest.read_text(encoding="utf-8", errors="replace").splitlines():
-            match = SUM_LINE.fullmatch(line.strip())
-            if not match:
-                continue
-            name = match.group(2).strip()
-            source = f"{manifest_rel}: entry '{name}'"
-            entry = _safe_join(manifest.parent, name, root, errors, source)
-            if entry is None:
-                continue
-            # Manifests written from their parent directory carry the
-            # packet directory as a prefix on every entry; use that
-            # resolution only when the local one is absent (a packet may
-            # legitimately nest a same-named directory).
-            if (not entry.exists()
-                    and name.startswith(manifest.parent.name + "/")):
-                fallback = _safe_join(manifest.parent.parent, name, root, errors, source)
-                if fallback is None:
-                    continue
-                if fallback.exists():
-                    entry = fallback
-            paths.append(entry.relative_to(root).as_posix())
-    manifest_paths: list[str] = []
-    known_missing_seen: set[str] = set()
-    for manifest in _files_named_exactly(root, "MANIFEST.json"):
-        if ".git" in manifest.relative_to(root).parts:
-            continue
-        for resolved in _manifest_payload_paths(manifest, root, errors, known_missing_seen):
-            manifest_paths.append(resolved.relative_to(root).as_posix())
-    for path in sorted(MANIFEST_KNOWN_MISSING_SOURCE_ORIGINALS - known_missing_seen):
-        packet = "/".join(path.split("/")[:4])
-        if (root / packet).is_dir():
-            errors.append(f"{path} known missing manifest source original is stale: "
-                          "remove it from MANIFEST_KNOWN_MISSING_SOURCE_ORIGINALS")
-    paths.extend(manifest_paths)
-    audits = root / "docs/audits"
-    if audits.is_dir():
-        paths.extend(path.relative_to(root).as_posix()
-                     for path in sorted(audits.rglob("*")) if path.is_file())
-    return sorted(set(paths)), frozenset(manifest_paths), errors
-
-
-def _files_named_exactly(root: Path, filename: str) -> list[Path]:
-    """Find files by their actual on-disk names in deterministic order.
-
-    Path.glob can return a pattern-cased basename for a case-insensitive
-    match on Windows. os.walk preserves the spelling returned by the
-    filesystem, so comparing each filename here is reliable on every OS.
-    """
-    matches: list[Path] = []
-    for directory, dirnames, filenames in os.walk(root):
-        dirnames.sort()
-        matches.extend(Path(directory) / name for name in filenames if name == filename)
-    return sorted(matches, key=lambda path: path.relative_to(root).as_posix())
+    fs_paths, manifest_paths, errors = _filesystem_pinned_path_inventory(str(root))
+    paths.extend(fs_paths)
+    return sorted(set(paths)), frozenset(manifest_paths), list(errors)
 
 
 def sha256_pinned_paths(data: dict[str, Any], root: Path) -> list[str]:
@@ -854,6 +869,17 @@ def _git_check_attr(root: str, paths: tuple[str, ...]) -> tuple[dict[str, dict[s
         if len(parts) == 3 and parts[1] in {"text", "eol"}:
             resolved.setdefault(parts[0], {})[parts[1]] = parts[2]
     return resolved, ""
+
+
+_orig_git_check_attr_cache_clear = _git_check_attr.cache_clear
+
+
+def _git_check_attr_cache_clear() -> None:
+    _orig_git_check_attr_cache_clear()
+    _filesystem_pinned_path_inventory.cache_clear()
+
+
+_git_check_attr.cache_clear = _git_check_attr_cache_clear  # type: ignore[method-assign]
 
 
 def pinned_eol_errors(data: dict[str, Any], root: Path) -> list[str]:

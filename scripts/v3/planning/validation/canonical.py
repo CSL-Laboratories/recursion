@@ -1608,9 +1608,11 @@ def canonical_bytes(value) -> bytes:
 
 
 def digest(value, *, omit_content_digest: bool = False) -> str:
-    operand = copy.deepcopy(value)
-    if omit_content_digest and isinstance(operand, dict):
+    if omit_content_digest and isinstance(value, dict) and dict.__contains__(value, "content_digest"):
+        operand = copy.deepcopy(value)
         operand.pop("content_digest", None)
+    else:
+        operand = value
     return hashlib.sha256(canonical_bytes(operand)).hexdigest()
 
 

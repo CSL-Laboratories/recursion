@@ -1627,17 +1627,21 @@ class ProgramControlTests(unittest.TestCase):
         self.assertTrue(checker.PINNED_EOL_KNOWN_GAPS <= paths)
 
     def test_known_gap_removed_file_is_reported_stale(self):
-        # A repo-shaped synthetic root: the gap file's directory exists but
-        # the file (and its pin) is gone — the gap entry must drain, not linger.
+        # The frozen path snapshot can grow; only entries whose parent dirs
+        # exist in this synthetic root are stale, so assert that exact set.
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "docs/v3/research-lane/overnight-20261002/semantic-guard-research"
              ).mkdir(parents=True)
             errors = checker.pinned_eol_errors({"contracts": []}, root)
-            self.assertEqual(len(errors), 2, errors)
-            self.assertTrue(any("SEMANTIC-GUARD-COVERAGE.md" in error for error in errors), errors)
-            self.assertTrue(any("coverage-matrix.json" in error for error in errors), errors)
-            self.assertTrue(all("PINNED_EOL_KNOWN_GAPS" in error for error in errors), errors)
+            stale_paths = sorted(
+                path for path in checker.PINNED_EOL_KNOWN_GAPS
+                if (root / path).parent.is_dir())
+            self.assertEqual(errors, [
+                f"{path} known eol gap is stale (unpinned or removed): "
+                "remove it from PINNED_EOL_KNOWN_GAPS"
+                for path in stale_paths
+            ])
         # A bare synthetic root (no packet dirs) emits no stale-gap errors.
         with tempfile.TemporaryDirectory() as directory:
             self.assertEqual(
@@ -1712,29 +1716,20 @@ class ProgramControlTests(unittest.TestCase):
             self.assertTrue(any("raw/R-A/report.md" in error and "eol" in error
                                 for error in errors), errors)
 
-    def test_known_gap_dir_tolerates_uncovered_entries_and_drains_when_covered(self):
-        original_gap_dirs = checker.PINNED_EOL_KNOWN_GAP_DIRS
-        self.addCleanup(setattr, checker, "PINNED_EOL_KNOWN_GAP_DIRS", original_gap_dirs)
+    def test_new_uncovered_pin_in_a_known_gap_packet_fails(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
-            packet = root / "docs/v3/research-lane/synthetic-gap-packet"
+            packet = root / "docs/v3/research-lane/overnight-20261002"
             packet.mkdir(parents=True)
-            (packet / "GAP.md").write_text("x\n", encoding="utf-8")
-            gap_sha = hashlib.sha256((packet / "GAP.md").read_bytes()).hexdigest()
+            (packet / "NEW.md").write_text("x\n", encoding="utf-8")
+            new_sha = hashlib.sha256((packet / "NEW.md").read_bytes()).hexdigest()
             (packet / "MANIFEST.json").write_text(
-                json.dumps({"files": [{"path": "GAP.md", "sha256": gap_sha}]}),
+                json.dumps({"files": [{"path": "NEW.md", "sha256": new_sha}]}),
                 encoding="utf-8")
-            checker.PINNED_EOL_KNOWN_GAP_DIRS = frozenset(
-                {"docs/v3/research-lane/synthetic-gap-packet"})
-            # Uncovered but grandfathered at the folder level: no per-path error.
-            self.assertEqual(checker.pinned_eol_errors({"contracts": []}, root), [])
-
-            (root / ".gitattributes").write_text("docs/**/*.md text eol=lf\n", encoding="utf-8")
-            checker._git_check_attr.cache_clear()
             errors = checker.pinned_eol_errors({"contracts": []}, root)
-            self.assertTrue(any("synthetic-gap-packet" in error
-                                and "PINNED_EOL_KNOWN_GAP_DIRS" in error for error in errors), errors)
+            self.assertTrue(any("NEW.md" in error and "lacks eol=lf" in error
+                                for error in errors), errors)
 
     def test_pinned_enumeration_includes_overnight_manifest_changelog(self):
         paths = checker.sha256_pinned_paths(self.data, ROOT)
@@ -1778,7 +1773,9 @@ class ProgramControlTests(unittest.TestCase):
                 (packet / expected).unlink()
                 self.assertEqual(checker._manifest_payload_paths(manifest, root, errors),
                                  [packet / "ROOT.md"])
-                self.assertEqual(errors, [])
+                self.assertEqual(errors, [
+                    f"{packet.name}/MANIFEST.json: entry '{original}' payload is missing",
+                ])
 
     def test_pinned_symlink_loops_are_validation_errors(self):
         import os
@@ -1879,7 +1876,8 @@ class ProgramControlTests(unittest.TestCase):
                 for name in [*unsafe, "payload.docx", "omitted.docx"]
             ]}), encoding="utf-8")
             self.assertEqual(checker.pinned_path_errors({"contracts": []}, root), [
-                f"packet/MANIFEST.json: entry '{name}' is outside the repository" for name in unsafe
+                *(f"packet/MANIFEST.json: entry '{name}' is outside the repository" for name in unsafe),
+                "packet/MANIFEST.json: entry 'omitted.docx' payload is missing",
             ])
             self.assertEqual(checker.sha256_pinned_paths({"contracts": []}, root),
                              ["packet/payload.docx"])
@@ -1891,20 +1889,27 @@ class ProgramControlTests(unittest.TestCase):
             ]}), encoding="utf-8")
             (root / ".gitattributes").write_text("*.docx binary\n", encoding="utf-8")
             checker._git_check_attr.cache_clear()
-            self.assertEqual(checker.pinned_eol_errors({"contracts": []}, root), [])
+            self.assertEqual(checker.pinned_eol_errors({"contracts": []}, root), [
+                "packet/MANIFEST.json: entry 'omitted.docx' payload is missing",
+            ])
 
-    def test_known_gap_dir_with_empty_inventory_is_stale(self):
-        for gap_dir in sorted(checker.PINNED_EOL_KNOWN_GAP_DIRS):
-            with self.subTest(gap_dir=gap_dir), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                packet = root / gap_dir
-                packet.mkdir(parents=True)
-                self.assertEqual(checker.pinned_eol_errors({"contracts": []}, root), [])
-                (packet / "MANIFEST.json").write_text('{"files": []}', encoding="utf-8")
-                self.assertEqual(checker.pinned_eol_errors({"contracts": []}, root), [
-                    f"{gap_dir} known eol gap dir is stale (no payloads): "
-                    "remove it from PINNED_EOL_KNOWN_GAP_DIRS",
-                ])
+    def test_manifest_known_missing_source_original_allowlist_drains(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            packet = root / "docs/v3/research-lane/dot-ra-rd-20261002"
+            raw = packet / "raw/R-A"
+            raw.mkdir(parents=True)
+            payload = raw / "R-A-plugin-portability.docx"
+            payload.write_bytes(b"restored source original")
+            manifest = packet / "MANIFEST.json"
+            manifest.write_text(json.dumps({"files": [{
+                "path": "R-A/R-A-plugin-portability.docx",
+                "sha256": hashlib.sha256(payload.read_bytes()).hexdigest(),
+            }]}), encoding="utf-8")
+            errors = checker.pinned_path_errors({"contracts": []}, root)
+            self.assertTrue(any("R-A-plugin-portability.docx" in error
+                                and "known missing manifest source original is stale" in error
+                                for error in errors), errors)
 
     def test_manifest_invalid_inventory_is_validation_error(self):
         for payload in ('{', '{"files": {}}', '{"files": [{}]}'):
@@ -1914,6 +1919,40 @@ class ProgramControlTests(unittest.TestCase):
                 errors = checker.pinned_path_errors({"contracts": []}, root)
                 self.assertEqual(len(errors), 1, errors)
                 self.assertIn("MANIFEST.json:", errors[0])
+
+    def test_manifest_missing_payload_is_validation_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            packet = root / "fresh-packet"
+            packet.mkdir()
+            (packet / "MANIFEST.json").write_text(json.dumps({"files": [{
+                "path": "NEW.md", "sha256": "a" * 64,
+            }]}), encoding="utf-8")
+            self.assertEqual(checker.pinned_path_errors({"contracts": []}, root), [
+                "fresh-packet/MANIFEST.json: entry 'NEW.md' payload is missing",
+            ])
+
+    def test_pinned_enumeration_ignores_case_mismatched_names(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            packet = root / "packet"
+            packet.mkdir()
+            lower_manifest = packet / "manifest.json"
+            lower_manifest.write_text("{", encoding="utf-8")
+            lower_sums = packet / "sha256sums.txt"
+            lower_sums.write_text("a" * 64 + "  payload.md\n", encoding="utf-8")
+            (packet / "payload.md").write_text("ignored\n", encoding="utf-8")
+
+            def simulated_walk(path, *args, **kwargs):
+                self.assertEqual(Path(path), root)
+                yield str(root), ["packet"], []
+                yield str(packet), [], ["manifest.json", "payload.md", "sha256sums.txt"]
+
+            with patch.object(checker.os, "walk", new=simulated_walk):
+                self.assertEqual(checker.sha256_pinned_paths({"contracts": []}, root), [])
+                self.assertEqual(checker.pinned_path_errors({"contracts": []}, root), [])
 
 
 if __name__ == "__main__":

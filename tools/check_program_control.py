@@ -13,6 +13,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -56,19 +57,340 @@ PINNED_EOL_KNOWN_GAPS = frozenset({
     "docs/v3/research-lane/shared-contracts-20261002/synthetic_benchmark_corpus.json",
 })
 
-# Whole packets whose top-level MANIFEST.json pins ordinary tracked text
-# files (for example overnight-20261002/CHANGELOG.md) that still lack
-# `.gitattributes` `text eol=lf` coverage. Grandfathered at the folder level
-# -- not by listing every one of the ~250 pinned files -- because
-# `.gitattributes` is a protected path (CSL-226) and the real fix is one
-# rule per folder, flagged for Lucas. A dir drains out of this set once its
-# own MANIFEST.json no longer pins any uncovered path there (a rule landed);
-# pinned_eol_errors then reports it stale so it can be removed.
-PINNED_EOL_KNOWN_GAP_DIRS = frozenset({
-    "docs/v3/research-lane/dot-ra-rd-20261002",
-    "docs/v3/research-lane/followups-20261002",
-    "docs/v3/research-lane/overnight-20261002",
-    "docs/v3/research-lane/scope-reframe-20261002",
+# These exact MANIFEST.json payloads were uncovered on the CSL-226 baseline.
+# Keep the snapshot path-specific: a new pin in one of these packets must
+# satisfy eol=lf or -text before it can pass.
+PINNED_EOL_KNOWN_GAPS = PINNED_EOL_KNOWN_GAPS | frozenset("""
+    docs/v3/research-lane/dot-ra-rd-20261002/RETURN-STATE.txt
+    docs/v3/research-lane/dot-ra-rd-20261002/START-HERE.txt
+    docs/v3/research-lane/dot-ra-rd-20261002/raw/00-assessment/report.md
+    docs/v3/research-lane/dot-ra-rd-20261002/raw/R-A/example-manifest.json
+    docs/v3/research-lane/dot-ra-rd-20261002/raw/R-A/plugin-manifest.schema.json
+    docs/v3/research-lane/dot-ra-rd-20261002/raw/R-A/proposed-contract.json
+    docs/v3/research-lane/dot-ra-rd-20261002/raw/R-A/report.md
+    docs/v3/research-lane/dot-ra-rd-20261002/raw/R-A/source-ledger.json
+    docs/v3/research-lane/dot-ra-rd-20261002/raw/R-B/report.md
+    docs/v3/research-lane/dot-ra-rd-20261002/raw/R-B/sources-delivery.json
+    docs/v3/research-lane/dot-ra-rd-20261002/raw/R-C/rc-counsel-question-checklist.csv
+    docs/v3/research-lane/dot-ra-rd-20261002/raw/R-C/rc-public-evidence.csv
+    docs/v3/research-lane/dot-ra-rd-20261002/raw/R-C/rc-source-license-manifest.json
+    docs/v3/research-lane/dot-ra-rd-20261002/raw/R-C/report.md
+    docs/v3/research-lane/dot-ra-rd-20261002/raw/R-D/report.md
+    docs/v3/research-lane/dot-ra-rd-20261002/raw/input-as-received/R-A-plugin-portability.md
+    docs/v3/research-lane/dot-ra-rd-20261002/raw/input-as-received/R-B-cross-harness-delegation.md
+    docs/v3/research-lane/dot-ra-rd-20261002/raw/input-as-received/R-C-route-legal-and-licensing.md
+    docs/v3/research-lane/dot-ra-rd-20261002/raw/input-as-received/R-D-quota-efficiency-measurement.md
+    docs/v3/research-lane/dot-ra-rd-20261002/raw/input-as-received/README.md
+    docs/v3/research-lane/dot-ra-rd-20261002/raw/input-as-received/check_research_stack.py
+    docs/v3/research-lane/followups-20261002/START-HERE.txt
+    docs/v3/research-lane/followups-20261002/machine/negative-traces.json
+    docs/v3/research-lane/followups-20261002/machine/negative-traces.schema.json
+    docs/v3/research-lane/followups-20261002/machine/platform-manifest.json
+    docs/v3/research-lane/followups-20261002/machine/platform-manifest.schema.json
+    docs/v3/research-lane/followups-20261002/machine/profile-fields.json
+    docs/v3/research-lane/followups-20261002/machine/source-register.json
+    docs/v3/research-lane/overnight-20261002/CHANGELOG.md
+    docs/v3/research-lane/overnight-20261002/COVERAGE.json
+    docs/v3/research-lane/overnight-20261002/DECISION-READOUT.md
+    docs/v3/research-lane/overnight-20261002/FIXTURE-INDEX.json
+    docs/v3/research-lane/overnight-20261002/LOCAL-SESSION-HANDOFF.md
+    docs/v3/research-lane/overnight-20261002/QUALITY-NOTES.md
+    docs/v3/research-lane/overnight-20261002/READ_FIRST.md
+    docs/v3/research-lane/overnight-20261002/additional-kernel-research/SOURCE-MANIFEST.json
+    docs/v3/research-lane/overnight-20261002/additional-kernel-research/SUPPLEMENTAL-KERNEL-AUDIT.md
+    docs/v3/research-lane/overnight-20261002/gaps/architecture-coverage-source-rows.json
+    docs/v3/research-lane/overnight-20261002/gaps/architecture-ledger.csv
+    docs/v3/research-lane/overnight-20261002/gaps/architecture-ledger.json
+    docs/v3/research-lane/overnight-20261002/gaps/comparison-source-manifest.json
+    docs/v3/research-lane/overnight-20261002/gaps/complete-ledger.md
+    docs/v3/research-lane/overnight-20261002/gaps/fu03-candidate-witness.json
+    docs/v3/research-lane/overnight-20261002/gaps/fu03-static-evidence.json
+    docs/v3/research-lane/overnight-20261002/gaps/fu04-static-evidence.json
+    docs/v3/research-lane/overnight-20261002/gaps/gap-ledger.csv
+    docs/v3/research-lane/overnight-20261002/gaps/gap-ledger.json
+    docs/v3/research-lane/overnight-20261002/gaps/gaps-source-rows.json
+    docs/v3/research-lane/overnight-20261002/gaps/harness-coverage-source-rows.json
+    docs/v3/research-lane/overnight-20261002/gaps/harness-ledger.csv
+    docs/v3/research-lane/overnight-20261002/gaps/harness-ledger.json
+    docs/v3/research-lane/overnight-20261002/gaps/historical-interface-evidence.json
+    docs/v3/research-lane/overnight-20261002/gaps/packet-mapping.csv
+    docs/v3/research-lane/overnight-20261002/gaps/packet-mapping.json
+    docs/v3/research-lane/overnight-20261002/gaps/report.md
+    docs/v3/research-lane/overnight-20261002/gaps/source-manifest.json
+    docs/v3/research-lane/overnight-20261002/kernel-local-handoff/LOCAL-KERNEL-REPRODUCTION-HANDOFF.md
+    docs/v3/research-lane/overnight-20261002/kernel-local-handoff/cases.json
+    docs/v3/research-lane/overnight-20261002/m1b-semantic-research/M1B-SEMANTIC-COVERAGE.md
+    docs/v3/research-lane/overnight-20261002/m1b-semantic-research/coverage-matrix.json
+    docs/v3/research-lane/overnight-20261002/m1b-semantic-research/source-pins.json
+    docs/v3/research-lane/overnight-20261002/m1b-semantic-research/synthetic-inputs.json
+    docs/v3/research-lane/overnight-20261002/m1c-classifier-research/M1C-CLASSIFIER-REVIEW.md
+    docs/v3/research-lane/overnight-20261002/m1c-classifier-research/future-synthetic-vectors.json
+    docs/v3/research-lane/overnight-20261002/m1c-classifier-research/semantic-matrix.json
+    docs/v3/research-lane/overnight-20261002/m1c-classifier-research/source-pins.json
+    docs/v3/research-lane/overnight-20261002/model-architecture/report.md
+    docs/v3/research-lane/overnight-20261002/model-architecture/source-register.json
+    docs/v3/research-lane/overnight-20261002/model-architecture/test-handovers.md
+    docs/v3/research-lane/overnight-20261002/protocol-edges/local-test-handoff.json
+    docs/v3/research-lane/overnight-20261002/protocol-edges/report.md
+    docs/v3/research-lane/overnight-20261002/protocol-edges/sources.json
+    docs/v3/research-lane/overnight-20261002/re/local-input-register.md
+    docs/v3/research-lane/overnight-20261002/re/question-coverage.json
+    docs/v3/research-lane/overnight-20261002/re/report.md
+    docs/v3/research-lane/overnight-20261002/re/source-register.json
+    docs/v3/research-lane/overnight-20261002/re/source-register.md
+    docs/v3/research-lane/overnight-20261002/rf/question-coverage.json
+    docs/v3/research-lane/overnight-20261002/rf/question-coverage.md
+    docs/v3/research-lane/overnight-20261002/rf/report.md
+    docs/v3/research-lane/overnight-20261002/rf/source-register.md
+    docs/v3/research-lane/overnight-20261002/rf/sources.json
+    docs/v3/research-lane/overnight-20261002/rf/unexecuted-local-test-handoff.md
+    docs/v3/research-lane/overnight-20261002/rg/UNEXECUTED-local-test-handoffs.md
+    docs/v3/research-lane/overnight-20261002/rg/proposed-import-contract.json
+    docs/v3/research-lane/overnight-20261002/rg/question-coverage.json
+    docs/v3/research-lane/overnight-20261002/rg/report.md
+    docs/v3/research-lane/overnight-20261002/rg/source-register.json
+    docs/v3/research-lane/overnight-20261002/rg/source-register.md
+    docs/v3/research-lane/overnight-20261002/rh/coverage.json
+    docs/v3/research-lane/overnight-20261002/rh/report.md
+    docs/v3/research-lane/overnight-20261002/rh/source-register.json
+    docs/v3/research-lane/overnight-20261002/ri/UNEXECUTED-local-test-handoffs.md
+    docs/v3/research-lane/overnight-20261002/ri/adoption-ledger.json
+    docs/v3/research-lane/overnight-20261002/ri/architecture-map.json
+    docs/v3/research-lane/overnight-20261002/ri/coverage.json
+    docs/v3/research-lane/overnight-20261002/ri/dependency-lock-ledger.json
+    docs/v3/research-lane/overnight-20261002/ri/extension-mapping.json
+    docs/v3/research-lane/overnight-20261002/ri/extension-surface-ledger.json
+    docs/v3/research-lane/overnight-20261002/ri/gaps-ledger.json
+    docs/v3/research-lane/overnight-20261002/ri/input-disposition-ledger.json
+    docs/v3/research-lane/overnight-20261002/ri/licensing-provenance-ledger.json
+    docs/v3/research-lane/overnight-20261002/ri/local-test-handoffs.json
+    docs/v3/research-lane/overnight-20261002/ri/report.md
+    docs/v3/research-lane/overnight-20261002/ri/source-drift-ledger.json
+    docs/v3/research-lane/overnight-20261002/ri/source-register.json
+    docs/v3/research-lane/overnight-20261002/ri/source-register.md
+    docs/v3/research-lane/overnight-20261002/ri/static-provenance-checks.json
+    docs/v3/research-lane/overnight-20261002/ri/ui-comparison.json
+    docs/v3/research-lane/overnight-20261002/ri/workspace-inventory.json
+    docs/v3/research-lane/overnight-20261002/rj/local-test-handoff.json
+    docs/v3/research-lane/overnight-20261002/rj/question-coverage.json
+    docs/v3/research-lane/overnight-20261002/rj/recommendations.json
+    docs/v3/research-lane/overnight-20261002/rj/report.md
+    docs/v3/research-lane/overnight-20261002/rj/source-register.json
+    docs/v3/research-lane/overnight-20261002/rj/source-register.md
+    docs/v3/research-lane/overnight-20261002/rj/unexecuted-local-test-handoff.md
+    docs/v3/research-lane/overnight-20261002/rk/question-coverage.json
+    docs/v3/research-lane/overnight-20261002/rk/report.md
+    docs/v3/research-lane/overnight-20261002/rk/source-register.json
+    docs/v3/research-lane/overnight-20261002/rk/source-register.md
+    docs/v3/research-lane/overnight-20261002/rk/unexecuted-local-handoffs.json
+    docs/v3/research-lane/overnight-20261002/rk/unexecuted-local-handoffs.md
+    docs/v3/research-lane/overnight-20261002/rl/interface-contract.schema.json
+    docs/v3/research-lane/overnight-20261002/rl/performance-profile.json
+    docs/v3/research-lane/overnight-20261002/rl/proposed-contracts.json
+    docs/v3/research-lane/overnight-20261002/rl/question-coverage.json
+    docs/v3/research-lane/overnight-20261002/rl/recommendation-register.json
+    docs/v3/research-lane/overnight-20261002/rl/report.md
+    docs/v3/research-lane/overnight-20261002/rl/source-register.json
+    docs/v3/research-lane/overnight-20261002/rl/source-register.md
+    docs/v3/research-lane/overnight-20261002/rl/unexecuted-local-handoffs.json
+    docs/v3/research-lane/overnight-20261002/rl/unexecuted-local-handoffs.md
+    docs/v3/research-lane/overnight-20261002/rm/UNEXECUTED-acceptance-handoffs.md
+    docs/v3/research-lane/overnight-20261002/rm/acceptance-handoffs.json
+    docs/v3/research-lane/overnight-20261002/rm/coverage.json
+    docs/v3/research-lane/overnight-20261002/rm/disposition-ledger.json
+    docs/v3/research-lane/overnight-20261002/rm/disposition-ledger.md
+    docs/v3/research-lane/overnight-20261002/rm/license-terms-ledger.json
+    docs/v3/research-lane/overnight-20261002/rm/local-input-register.json
+    docs/v3/research-lane/overnight-20261002/rm/port-candidates.json
+    docs/v3/research-lane/overnight-20261002/rm/relationship-ledger.json
+    docs/v3/research-lane/overnight-20261002/rm/report.md
+    docs/v3/research-lane/overnight-20261002/rm/security-ledger.json
+    docs/v3/research-lane/overnight-20261002/rm/source-file-pins.json
+    docs/v3/research-lane/overnight-20261002/rm/source-register.json
+    docs/v3/research-lane/overnight-20261002/rm/source-register.md
+    docs/v3/research-lane/overnight-20261002/rm/surface-map.json
+    docs/v3/research-lane/overnight-20261002/rm/version-drift-ledger.json
+    docs/v3/research-lane/overnight-20261002/rn/UNEXECUTED-local-test-handoffs.md
+    docs/v3/research-lane/overnight-20261002/rn/accessibility-ledger.json
+    docs/v3/research-lane/overnight-20261002/rn/accessibility-ledger.md
+    docs/v3/research-lane/overnight-20261002/rn/candidate-comparison.json
+    docs/v3/research-lane/overnight-20261002/rn/coverage.json
+    docs/v3/research-lane/overnight-20261002/rn/local-test-handoffs.json
+    docs/v3/research-lane/overnight-20261002/rn/performance-budget-template.json
+    docs/v3/research-lane/overnight-20261002/rn/recommendations.json
+    docs/v3/research-lane/overnight-20261002/rn/report.md
+    docs/v3/research-lane/overnight-20261002/rn/requirements.json
+    docs/v3/research-lane/overnight-20261002/rn/source-register.json
+    docs/v3/research-lane/overnight-20261002/rn/source-register.md
+    docs/v3/research-lane/overnight-20261002/ro/budget-register.json
+    docs/v3/research-lane/overnight-20261002/ro/coverage.json
+    docs/v3/research-lane/overnight-20261002/ro/fixtures.json
+    docs/v3/research-lane/overnight-20261002/ro/report.md
+    docs/v3/research-lane/overnight-20261002/ro/repository-source-manifest.json
+    docs/v3/research-lane/overnight-20261002/ro/source-register.json
+    docs/v3/research-lane/overnight-20261002/ro/source-register.md
+    docs/v3/research-lane/overnight-20261002/ro/workload-manifest-template.json
+    docs/v3/research-lane/overnight-20261002/rp/UNEXECUTED-local-test-handoffs.md
+    docs/v3/research-lane/overnight-20261002/rp/coverage.json
+    docs/v3/research-lane/overnight-20261002/rp/local-test-handoffs.json
+    docs/v3/research-lane/overnight-20261002/rp/proposed-contracts.json
+    docs/v3/research-lane/overnight-20261002/rp/recommendations.json
+    docs/v3/research-lane/overnight-20261002/rp/report.md
+    docs/v3/research-lane/overnight-20261002/rp/source-register.json
+    docs/v3/research-lane/overnight-20261002/rp/source-register.md
+    docs/v3/research-lane/overnight-20261002/rq/UNEXECUTED-local-test-handoffs.md
+    docs/v3/research-lane/overnight-20261002/rq/candidate-contracts.json
+    docs/v3/research-lane/overnight-20261002/rq/coverage.json
+    docs/v3/research-lane/overnight-20261002/rq/input-pins.json
+    docs/v3/research-lane/overnight-20261002/rq/local-test-handoffs.json
+    docs/v3/research-lane/overnight-20261002/rq/recommendations.json
+    docs/v3/research-lane/overnight-20261002/rq/report.md
+    docs/v3/research-lane/overnight-20261002/rq/source-register.json
+    docs/v3/research-lane/overnight-20261002/rq/source-register.md
+    docs/v3/research-lane/overnight-20261002/rq/synthetic-fixtures.json
+    docs/v3/research-lane/overnight-20261002/rr/UNEXECUTED-local-test-handoffs.md
+    docs/v3/research-lane/overnight-20261002/rr/coverage.json
+    docs/v3/research-lane/overnight-20261002/rr/local-input-register.json
+    docs/v3/research-lane/overnight-20261002/rr/local-test-handoffs.json
+    docs/v3/research-lane/overnight-20261002/rr/proposed-contracts.json
+    docs/v3/research-lane/overnight-20261002/rr/recommendations.json
+    docs/v3/research-lane/overnight-20261002/rr/report.md
+    docs/v3/research-lane/overnight-20261002/rr/source-register.json
+    docs/v3/research-lane/overnight-20261002/rr/source-register.md
+    docs/v3/research-lane/overnight-20261002/rs/coverage.json
+    docs/v3/research-lane/overnight-20261002/rs/decision-contract.json
+    docs/v3/research-lane/overnight-20261002/rs/fixtures.json
+    docs/v3/research-lane/overnight-20261002/rs/pinned-inputs.json
+    docs/v3/research-lane/overnight-20261002/rs/report.md
+    docs/v3/research-lane/overnight-20261002/rs/source-register.json
+    docs/v3/research-lane/overnight-20261002/rt/UNEXECUTED-local-test-handoffs.md
+    docs/v3/research-lane/overnight-20261002/rt/artifact-contract.json
+    docs/v3/research-lane/overnight-20261002/rt/coverage.json
+    docs/v3/research-lane/overnight-20261002/rt/field-map.json
+    docs/v3/research-lane/overnight-20261002/rt/input-pins.json
+    docs/v3/research-lane/overnight-20261002/rt/local-test-handoffs.json
+    docs/v3/research-lane/overnight-20261002/rt/recommendations.json
+    docs/v3/research-lane/overnight-20261002/rt/report.md
+    docs/v3/research-lane/overnight-20261002/rt/source-register.json
+    docs/v3/research-lane/overnight-20261002/rt/source-register.md
+    docs/v3/research-lane/overnight-20261002/ru/UNEXECUTED-local-test-handoffs.md
+    docs/v3/research-lane/overnight-20261002/ru/candidate-contracts.json
+    docs/v3/research-lane/overnight-20261002/ru/coverage.json
+    docs/v3/research-lane/overnight-20261002/ru/input-pins.json
+    docs/v3/research-lane/overnight-20261002/ru/local-test-handoffs.json
+    docs/v3/research-lane/overnight-20261002/ru/recommendations.json
+    docs/v3/research-lane/overnight-20261002/ru/recommendations.md
+    docs/v3/research-lane/overnight-20261002/ru/report.md
+    docs/v3/research-lane/overnight-20261002/ru/source-register.json
+    docs/v3/research-lane/overnight-20261002/ru/source-register.md
+    docs/v3/research-lane/overnight-20261002/rv/UNEXECUTED-local-test-handoffs.md
+    docs/v3/research-lane/overnight-20261002/rv/candidate-contracts.json
+    docs/v3/research-lane/overnight-20261002/rv/coverage.json
+    docs/v3/research-lane/overnight-20261002/rv/input-pins.json
+    docs/v3/research-lane/overnight-20261002/rv/local-test-handoffs.json
+    docs/v3/research-lane/overnight-20261002/rv/recommendations.json
+    docs/v3/research-lane/overnight-20261002/rv/report.md
+    docs/v3/research-lane/overnight-20261002/rv/source-register.json
+    docs/v3/research-lane/overnight-20261002/rv/source-register.md
+    docs/v3/research-lane/overnight-20261002/rv/synthetic-fixtures.json
+    docs/v3/research-lane/overnight-20261002/rw/budget-register.json
+    docs/v3/research-lane/overnight-20261002/rw/coverage.json
+    docs/v3/research-lane/overnight-20261002/rw/endpoint-contract.json
+    docs/v3/research-lane/overnight-20261002/rw/local-handoffs.json
+    docs/v3/research-lane/overnight-20261002/rw/preregistration-template.json
+    docs/v3/research-lane/overnight-20261002/rw/report.md
+    docs/v3/research-lane/overnight-20261002/rw/repository-source-manifest.json
+    docs/v3/research-lane/overnight-20261002/rw/source-register.json
+    docs/v3/research-lane/overnight-20261002/rw/source-register.md
+    docs/v3/research-lane/overnight-20261002/rx/UNEXECUTED-local-test-handoffs.md
+    docs/v3/research-lane/overnight-20261002/rx/candidate-contracts.json
+    docs/v3/research-lane/overnight-20261002/rx/companion-contract-pins.json
+    docs/v3/research-lane/overnight-20261002/rx/coverage.json
+    docs/v3/research-lane/overnight-20261002/rx/input-pins.json
+    docs/v3/research-lane/overnight-20261002/rx/local-test-handoffs.json
+    docs/v3/research-lane/overnight-20261002/rx/recommendations.json
+    docs/v3/research-lane/overnight-20261002/rx/report.md
+    docs/v3/research-lane/overnight-20261002/rx/source-register.json
+    docs/v3/research-lane/overnight-20261002/rx/source-register.md
+    docs/v3/research-lane/overnight-20261002/rx/synthetic-fixtures.json
+    docs/v3/research-lane/overnight-20261002/ry/UNEXECUTED-local-test-handoffs.md
+    docs/v3/research-lane/overnight-20261002/ry/candidate-contracts.json
+    docs/v3/research-lane/overnight-20261002/ry/coverage.json
+    docs/v3/research-lane/overnight-20261002/ry/input-pins.json
+    docs/v3/research-lane/overnight-20261002/ry/local-test-handoffs.json
+    docs/v3/research-lane/overnight-20261002/ry/recommendations.json
+    docs/v3/research-lane/overnight-20261002/ry/report.md
+    docs/v3/research-lane/overnight-20261002/ry/source-register.json
+    docs/v3/research-lane/overnight-20261002/ry/source-register.md
+    docs/v3/research-lane/overnight-20261002/ry/synthetic-fixtures.json
+    docs/v3/research-lane/overnight-20261002/semantic-guard-research/SEMANTIC-GUARD-COVERAGE.md
+    docs/v3/research-lane/overnight-20261002/semantic-guard-research/SHA256SUMS.txt
+    docs/v3/research-lane/overnight-20261002/semantic-guard-research/coverage-matrix.json
+    docs/v3/research-lane/overnight-20261002/semantic-validation-hardening/SEMANTIC-VALIDATION-HARDENING.md
+    docs/v3/research-lane/overnight-20261002/semantic-validation-hardening/SHA256SUMS.txt
+    docs/v3/research-lane/overnight-20261002/semantic-validation-hardening/SOURCE-REPORT-PINS.md
+    docs/v3/research-lane/overnight-20261002/shared-evidence/source-facts.md
+    docs/v3/research-lane/overnight-20261002/synthesis/INTEGRATION-STATUS.md
+    docs/v3/research-lane/overnight-20261002/synthesis/INTEGRATION-TEST-HANDOFF.md
+    docs/v3/research-lane/overnight-20261002/synthesis/MODEL-ARCHITECTURE.md
+    docs/v3/research-lane/overnight-20261002/synthesis/OWNERSHIP-AND-FIELD-MAP.md
+    docs/v3/research-lane/overnight-20261002/synthesis/field-compatibility.json
+    docs/v3/research-lane/overnight-20261002/synthesis/input-register.json
+    docs/v3/research-lane/scope-reframe-20261002/RETURN-STATE.txt
+    docs/v3/research-lane/scope-reframe-20261002/START-HERE.txt
+    docs/v3/research-lane/scope-reframe-20261002/raw/01-current-strategy/Recursion_Interface_and_Product_Strategy.md
+    docs/v3/research-lane/scope-reframe-20261002/raw/01-current-strategy/figures/focused-task.png
+    docs/v3/research-lane/scope-reframe-20261002/raw/01-current-strategy/figures/handoff-inspector.png
+    docs/v3/research-lane/scope-reframe-20261002/raw/02-comparison-evidence/Recursion_Harness_Path_Evidence_20261002.json
+    docs/v3/research-lane/scope-reframe-20261002/raw/03-prior-baseline/Architecture_Audit.md
+    docs/v3/research-lane/scope-reframe-20261002/raw/03-prior-baseline/Research_Directions.md
+    docs/v3/research-lane/scope-reframe-20261002/raw/04-foundation-research/FU01-report.md
+    docs/v3/research-lane/scope-reframe-20261002/raw/04-foundation-research/FU02-report.md
+    docs/v3/research-lane/scope-reframe-20261002/raw/04-foundation-research/FU03-report.md
+    docs/v3/research-lane/scope-reframe-20261002/raw/04-foundation-research/FU04-machine-specifications/negative-traces.json
+    docs/v3/research-lane/scope-reframe-20261002/raw/04-foundation-research/FU04-machine-specifications/negative-traces.schema.json
+    docs/v3/research-lane/scope-reframe-20261002/raw/04-foundation-research/FU04-machine-specifications/platform-manifest.json
+    docs/v3/research-lane/scope-reframe-20261002/raw/04-foundation-research/FU04-machine-specifications/platform-manifest.schema.json
+    docs/v3/research-lane/scope-reframe-20261002/raw/04-foundation-research/FU04-machine-specifications/profile-fields.json
+    docs/v3/research-lane/scope-reframe-20261002/raw/04-foundation-research/FU04-machine-specifications/source-register.json
+    docs/v3/research-lane/scope-reframe-20261002/raw/04-foundation-research/FU04-report.md
+    docs/v3/research-lane/scope-reframe-20261002/raw/04-foundation-research/FU05-report.md
+    docs/v3/research-lane/scope-reframe-20261002/raw/04-foundation-research/Supporting_Review_and_Local_Handoff.md
+""".split())
+
+# Source originals listed by the existing intake manifests but intentionally
+# absent from this checkout. These exact mapped paths are tolerated only while
+# they remain absent and listed; adding a file or removing an inventory entry
+# makes the allowlist stale.
+MANIFEST_KNOWN_MISSING_SOURCE_ORIGINALS = frozenset({
+    "docs/v3/research-lane/dot-ra-rd-20261002/raw/R-A/R-A-plugin-portability.docx",
+    "docs/v3/research-lane/dot-ra-rd-20261002/raw/R-B/R-B-cross-harness-delegation.docx",
+    "docs/v3/research-lane/dot-ra-rd-20261002/raw/R-C/recursion-route-terms-counsel-packet.docx",
+    "docs/v3/research-lane/dot-ra-rd-20261002/raw/R-D/rd-quota-efficiency-measurement.docx",
+    "docs/v3/research-lane/dot-ra-rd-20261002/raw/00-assessment/Recursion_Packet_Assessment_and_Handoff.docx",
+    "docs/v3/research-lane/scope-reframe-20261002/raw/01-current-strategy/Recursion_Interface_and_Product_Strategy.docx",
+    "docs/v3/research-lane/scope-reframe-20261002/raw/03-prior-baseline/Architecture_Audit.docx",
+    "docs/v3/research-lane/scope-reframe-20261002/raw/03-prior-baseline/Research_Directions.docx",
+    "docs/v3/research-lane/scope-reframe-20261002/raw/04-foundation-research/FU01-runtime-evidence-and-experiment.docx",
+    "docs/v3/research-lane/scope-reframe-20261002/raw/04-foundation-research/FU02_Canonical_State_Store_Crash_Replay.docx",
+    "docs/v3/research-lane/scope-reframe-20261002/raw/04-foundation-research/FU03-formal-model-and-byte-conformance.docx",
+    "docs/v3/research-lane/scope-reframe-20261002/raw/04-foundation-research/FU04-operating-system-platform-conformance.docx",
+    "docs/v3/research-lane/scope-reframe-20261002/raw/04-foundation-research/FU05_Broker_Protocol_and_Native_Chaos.docx",
+    "docs/v3/research-lane/scope-reframe-20261002/raw/04-foundation-research/Supporting_Review_and_Local_Handoff.docx",
+    "docs/v3/research-lane/followups-20261002/reports/FU01-runtime-evidence-and-experiment.docx",
+    "docs/v3/research-lane/followups-20261002/editable-text/FU01-report.md",
+    "docs/v3/research-lane/followups-20261002/reports/FU02_Canonical_State_Store_Crash_Replay.docx",
+    "docs/v3/research-lane/followups-20261002/editable-text/FU02-report.md",
+    "docs/v3/research-lane/followups-20261002/reports/FU03-formal-model-and-byte-conformance.docx",
+    "docs/v3/research-lane/followups-20261002/editable-text/FU03-report.md",
+    "docs/v3/research-lane/followups-20261002/reports/FU04-operating-system-platform-conformance.docx",
+    "docs/v3/research-lane/followups-20261002/editable-text/FU04-report.md",
+    "docs/v3/research-lane/followups-20261002/reports/FU05_Broker_Protocol_and_Native_Chaos.docx",
+    "docs/v3/research-lane/followups-20261002/editable-text/FU05-report.md",
+    "docs/v3/research-lane/followups-20261002/reports/Followup_Batch_Supporting_Review_and_Local_Handoff.docx",
+    "docs/v3/research-lane/followups-20261002/editable-text/Batch-supporting-review.md",
+    "docs/v3/research-lane/followups-20261002/reports/Recursion_v3_Architecture_Audit.docx",
+    "docs/v3/research-lane/followups-20261002/editable-text/Recursion-architecture-audit.md",
 })
 
 # Packet check_intake.py layouts: (base for nested paths, prefix rewrites).
@@ -324,9 +646,21 @@ def _safe_join(parent: Path, name: str, root: Path,
     if ABSOLUTE_ENTRY.match(name):
         errors.append(f"{source} is outside the repository")
         return None
+    joined = parent / name
     try:
-        candidate = (parent / name).resolve()
+        candidate = joined.resolve(strict=True)
+    except FileNotFoundError:
+        # Keep absent paths representable so callers can issue a specific
+        # missing-payload diagnostic. Non-strict resolution still follows
+        # existing symlinks, so a missing target cannot hide an escape.
+        try:
+            candidate = joined.resolve(strict=False)
+        except (RuntimeError, OSError, ValueError):
+            errors.append(f"{source} cannot be resolved")
+            return None
     except (RuntimeError, OSError, ValueError):
+        # Strict resolution detects symlink loops on Python versions where
+        # non-strict resolution may otherwise accept them.
         errors.append(f"{source} cannot be resolved")
         return None
     try:
@@ -337,7 +671,8 @@ def _safe_join(parent: Path, name: str, root: Path,
     return candidate
 
 
-def _manifest_payload_paths(manifest: Path, root: Path, errors: list[str]) -> list[Path]:
+def _manifest_payload_paths(manifest: Path, root: Path, errors: list[str],
+                            known_missing_seen: set[str] | None = None) -> list[Path]:
     """Resolved, existing, in-root file paths pinned by one MANIFEST.json's
     files[].path + sha256 entries.
 
@@ -346,10 +681,10 @@ def _manifest_payload_paths(manifest: Path, root: Path, errors: list[str]) -> li
     FU04-machine-specifications/ prefix becomes machine/, and overnight
     paths stay local. Other manifests default to manifest-local paths.
     There is no existence-based guessing between locations. Existing
-    payloads are included regardless of extension. Absent mapped copies
-    are skipped: existence is owned by the packet's check_intake.py, not
-    this validator. Rejected containment and resolution failures are
-    deterministic validation errors, including for omitted .docx originals.
+    payloads are included regardless of extension. Absent mapped source
+    originals must be in MANIFEST_KNOWN_MISSING_SOURCE_ORIGINALS; other
+    absent payloads are validation errors. Rejected containment and
+    resolution failures are deterministic validation errors.
     """
     manifest_rel = manifest.relative_to(root).as_posix()
     try:
@@ -378,8 +713,17 @@ def _manifest_payload_paths(manifest: Path, root: Path, errors: list[str]) -> li
                 parent = parent / nested_dir
         source = f"{manifest_rel}: entry '{name}'"
         candidate = _safe_join(parent, mapped_name, root, errors, source)
-        if candidate is not None and candidate.is_file():
+        if candidate is None:
+            continue
+        if candidate.is_file():
             resolved_paths.append(candidate)
+            continue
+        candidate_rel = candidate.relative_to(root).as_posix()
+        if candidate_rel in MANIFEST_KNOWN_MISSING_SOURCE_ORIGINALS:
+            if known_missing_seen is not None:
+                known_missing_seen.add(candidate_rel)
+        else:
+            errors.append(f"{source} payload is missing")
     return resolved_paths
 
 
@@ -393,9 +737,8 @@ def _pinned_path_details(data: dict[str, Any], root: Path) -> tuple[list[str], f
     + files[].sha256), and sealed receipts (byte-level evidence under
     docs/audits). MANIFEST.json entries pin ordinary tracked text files too
     (for example overnight-20261002/CHANGELOG.md), not only binary payloads,
-    so this enumeration includes them -- see PINNED_EOL_KNOWN_GAP_DIRS for
-    how pinned_eol_errors tolerates the four packets that still lack
-    `.gitattributes` coverage for them.
+    so this enumeration includes them. PINNED_EOL_KNOWN_GAPS is a frozen
+    path-by-path snapshot of currently uncovered pins.
     """
     root = root.resolve()
     errors: list[str] = []
@@ -403,7 +746,7 @@ def _pinned_path_details(data: dict[str, Any], root: Path) -> tuple[list[str], f
     for contract in data.get("contracts", []):
         if isinstance(contract, dict) and text_present(contract.get("path")):
             paths.append(contract["path"])
-    for manifest in sorted(root.glob("**/SHA256SUMS.txt")):
+    for manifest in _files_named_exactly(root, "SHA256SUMS.txt"):
         if ".git" in manifest.relative_to(root).parts:
             continue
         manifest_rel = manifest.relative_to(root).as_posix()
@@ -429,17 +772,37 @@ def _pinned_path_details(data: dict[str, Any], root: Path) -> tuple[list[str], f
                     entry = fallback
             paths.append(entry.relative_to(root).as_posix())
     manifest_paths: list[str] = []
-    for manifest in sorted(root.glob("**/MANIFEST.json")):
+    known_missing_seen: set[str] = set()
+    for manifest in _files_named_exactly(root, "MANIFEST.json"):
         if ".git" in manifest.relative_to(root).parts:
             continue
-        for resolved in _manifest_payload_paths(manifest, root, errors):
+        for resolved in _manifest_payload_paths(manifest, root, errors, known_missing_seen):
             manifest_paths.append(resolved.relative_to(root).as_posix())
+    for path in sorted(MANIFEST_KNOWN_MISSING_SOURCE_ORIGINALS - known_missing_seen):
+        packet = "/".join(path.split("/")[:4])
+        if (root / packet).is_dir():
+            errors.append(f"{path} known missing manifest source original is stale: "
+                          "remove it from MANIFEST_KNOWN_MISSING_SOURCE_ORIGINALS")
     paths.extend(manifest_paths)
     audits = root / "docs/audits"
     if audits.is_dir():
         paths.extend(path.relative_to(root).as_posix()
                      for path in sorted(audits.rglob("*")) if path.is_file())
     return sorted(set(paths)), frozenset(manifest_paths), errors
+
+
+def _files_named_exactly(root: Path, filename: str) -> list[Path]:
+    """Find files by their actual on-disk names in deterministic order.
+
+    Path.glob can return a pattern-cased basename for a case-insensitive
+    match on Windows. os.walk preserves the spelling returned by the
+    filesystem, so comparing each filename here is reliable on every OS.
+    """
+    matches: list[Path] = []
+    for directory, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        matches.extend(Path(directory) / name for name in filenames if name == filename)
+    return sorted(matches, key=lambda path: path.relative_to(root).as_posix())
 
 
 def sha256_pinned_paths(data: dict[str, Any], root: Path) -> list[str]:
@@ -461,46 +824,6 @@ def pinned_path_errors(data: dict[str, Any], root: Path) -> list[str]:
     Unreadable or malformed MANIFEST.json inventories also fail closed.
     """
     _paths, _manifest_paths, errors = _pinned_path_details(data, root)
-    return errors
-
-
-def _under_known_gap_dir(path: str) -> bool:
-    return any(path == gap_dir or path.startswith(gap_dir + "/")
-               for gap_dir in PINNED_EOL_KNOWN_GAP_DIRS)
-
-
-def _known_gap_dir_errors(root: Path, resolved_attrs: dict[str, dict[str, str]]) -> list[str]:
-    """Flag a PINNED_EOL_KNOWN_GAP_DIRS entry as stale once its own
-    MANIFEST.json no longer pins any uncovered path there (a `.gitattributes`
-    rule landed for that folder, or no payload entries remain).
-    A gap dir without its own MANIFEST.json
-    (for example a synthetic test root that does not model this packet) is
-    skipped rather than asserted stale -- mirroring the per-file
-    `(root / path).parent.is_dir()` gate below, which skips a known gap file
-    whose packet directory is not modeled in the given root either.
-
-    `resolved_attrs` is the batched `git check-attr` result already computed
-    by pinned_eol_errors for every pinned path, so this never issues its own
-    `git check-attr` call.
-    """
-    errors: list[str] = []
-    for gap_dir in sorted(PINNED_EOL_KNOWN_GAP_DIRS):
-        manifest = root / gap_dir / "MANIFEST.json"
-        if not manifest.is_file():
-            continue
-        local_errors: list[str] = []
-        entries = _manifest_payload_paths(manifest, root, local_errors)
-        if local_errors:
-            continue
-        rel_entries = [entry.relative_to(root).as_posix() for entry in entries]
-        uncovered = any(
-            resolved_attrs.get(rel, {}).get("eol") != "lf"
-            and resolved_attrs.get(rel, {}).get("text") != "unset"
-            for rel in rel_entries)
-        if not uncovered:
-            reason = "covered" if entries else "no payloads"
-            errors.append(f"{gap_dir} known eol gap dir is stale ({reason}): "
-                          "remove it from PINNED_EOL_KNOWN_GAP_DIRS")
     return errors
 
 
@@ -539,9 +862,9 @@ def pinned_eol_errors(data: dict[str, Any], root: Path) -> list[str]:
     against the recorded digest. CSL-225's Windows-only digest break is the
     failure this guards against.
 
-    A MANIFEST.json-pinned path under one of PINNED_EOL_KNOWN_GAP_DIRS is
-    tolerated even while uncovered; see _known_gap_dir_errors for how that
-    folder-level grandfather itself drains once `.gitattributes` catches up.
+    Paths listed in the frozen PINNED_EOL_KNOWN_GAPS snapshot are tolerated
+    while uncovered; newly uncovered paths fail immediately. Snapshot entries
+    become stale when they are covered or no longer pinned.
     An out-of-root pinned-path entry (see pinned_path_errors) is reported
     here too, never raised.
     """
@@ -563,15 +886,12 @@ def pinned_eol_errors(data: dict[str, Any], root: Path) -> list[str]:
             if covered:
                 errors.append(f"{path} known eol gap is covered: remove it from PINNED_EOL_KNOWN_GAPS")
         elif not covered:
-            if path in manifest_paths and _under_known_gap_dir(path):
-                continue
             errors.append(f"{path} sha256-pinned path lacks eol=lf "
                           f"(git check-attr eol: {attrs.get('eol')})")
     for path in sorted(PINNED_EOL_KNOWN_GAPS - set(paths)):
         if (root / path).parent.is_dir():
             errors.append(f"{path} known eol gap is stale (unpinned or removed): "
                           "remove it from PINNED_EOL_KNOWN_GAPS")
-    errors.extend(_known_gap_dir_errors(root, resolved))
     return errors
 
 

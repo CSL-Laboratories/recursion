@@ -119,8 +119,9 @@ Current tools. Do not add paid services or raise spend limits.
   on open same-repo PRs by verified repository writers (`.github/workflows/claude.yml`).
 - **Blacksmith CI** — only CI. See [CI](#ci).
 - **Google Workspace** (`csl-laboratories.com`) — meetings and notes.
-- **Discord bot** (`csl-bot-operations`) — Liaison. Commands and MCP; see below. Trigger CI
-  and reviews through these (or the `ci:full` label), not by editing config.
+- **Discord bot** (`csl-bot-operations`) - Liaison. Commands and MCP; see below. Use these
+  for authorized review requests or diagnostic CI. Full candidate CI requires exact-candidate
+  independent READY; the `ci:full` ownership label alone does not trigger it. See [CI](#ci).
   - Commands: `/issue`, `/plan`, `/debug`, `/feature`, `/standup`; `/ci full|run`;
     `/devin review pr:<url>|run|status`; `/telemetry`, `/help`, `/connect`. There is no
     top-level `/review` and no `/ci` without an argument.
@@ -154,6 +155,8 @@ not decide.
 
 - Branch from up-to-date `master` as `csl-<N>-<slug>` (example: `csl-26-short-slug`).
   A GitHub username prefix is optional (`chaandansaini101/csl-26-short-slug`).
+- Open the PR as a **draft**. Batch commits into as few pushes as possible.
+  Mark ready for review **once**, when the work is ready and the owner clears any hold.
 - PR title includes `CSL-N` so Linear auto-links. pr-lint matches `CSL-[0-9]+`
   case-sensitively, so a lowercase branch name alone does not pass. The `CSL-N`
   key in the PR title satisfies the check. Put `Fixes CSL-N` in the PR body —
@@ -208,14 +211,43 @@ Linear is the team's primary async channel, alongside Google Meet and Discord.
 
 ## CI
 
-- Required check: `linux` (Blacksmith).
-- Windows and macOS run on the `ci:full` label, on manual dispatch, and on `master` (macOS
-  nightly at 07:17 UTC).
-- Superseded runs are cancelled.
+- Required check: `linux` (hosted aggregate for Blacksmith `linux-tests`).
+- Full ordinary PR candidate coverage starts only after authenticated independent
+  READY for the exact head/base/merge/tree. Linux, Windows and macOS must all pass,
+  including docs-only candidates. `ci:full` is ownership state, not a CI trigger.
+- Ordinary PR runs share cancellation across heads. Admitted candidate runs use
+  a separate per-PR lane so neither can cancel the other's checks. Pushes do not
+  automatically cancel candidate work; final audit rejects stale candidate evidence.
+  Manual diagnostics remain separate. Cancellation cannot recover elapsed paid time.
+- The staged `platform-gates` aggregate cannot pass an ordinary Linux-only PR run.
+  All label events have distinct check names and do not start paid CI. Keep the
+  existing direct Devin and `linux` requirements until separately approved activation.
+- Master push retains Linux/Windows coverage and nightly macOS at 07:17 UTC.
+  Manual full CI is diagnostic coverage, not independent candidate readiness.
 
-Trigger CI and reviews through the Discord bot (`/ci full|run`, `/devin review
-pr:<url>|run|status`, or MCP `ci_full` / `ci_run` / `devin_review`) or the `ci:full`
-label, not by editing config.
+Use the gate's owner-authorized `workflow_dispatch` with `pr_number` to request
+review after a base advance. Revalidate the live candidate before human approval;
+a base-only change has no guaranteed automatic rearm. Do not edit settings or
+expand credentials to bypass a hold. See [rollout limits](docs/ci-queue-rollout.md).
+
+## Agent CI etiquette
+
+Blacksmith minutes are paid. Agents and bots keep CI cheap:
+
+- Open every PR as a **draft**. Batch pushes. Mark the PR ready **once**, only after the owner clears any hold.
+- Never merge a PR, rebase, or force-push. Avoid gratuitous base churn.
+  Owner-approved normal merges of a base or dependency into your own review
+  branch are allowed for required integration, even without a real conflict.
+  Preserve the stricter autonomous-fixer single-push/no-fetch recovery policy;
+  this interactive integration exception does not expand fixer permissions.
+- Never edit `.github/workflows/**` or other CI/runner configuration. A
+  human-assigned Linear issue is the only exception, and it must name the
+  workflow files.
+- Use an existing authorized identity for an owner-approved ready transition.
+  A `GITHUB_TOKEN`-generated `ready_for_review` event does not trigger another
+  Actions run; this does not mean CI never runs on drafts. Opened, synchronize,
+  manual, label and other configured events can still run. Do not create a
+  credential or expand permissions to work around this event behavior.
 
 ## Review roles
 
@@ -297,7 +329,14 @@ of these lines (not in a code fence or only an inline comment):
 CODEX-GATE: READY
 CODEX-GATE: MEDIATE
 
-- **READY** — no fixer; apply the `ci:full` label so the full CI matrix runs.
+- **READY** - no fixer. For the staged exact-candidate gate, independently inspect
+  the requested head/base/merge/tree. An affirmative review body must contain only
+  `CODEX-CANDIDATE: <requested digest>` followed by `CODEX-GATE: READY`, as two
+  plain unquoted lines. Put findings in a non-READY review or inline comments. The gate preserves label ownership/hold policy,
+  reserves the exact candidate and runs Linux, Windows and macOS (including docs).
+  Label presence alone cannot start or prove full CI. Human approval follows the
+  current candidate's successful full matrix and final audit. See
+  [rollout and recovery limits](docs/ci-queue-rollout.md).
 - **MEDIATE** — Devin and Claude are stuck; hand off to
   `.github/workflows/stuck-thread-watch.yml` for this PR. The watcher still
   applies its own stuck rules (Claude said it needs a human, or the thread

@@ -1,0 +1,23 @@
+---
+description: Agent CI etiquette — drafts, batched pushes, no workflow edits
+alwaysApply: true
+---
+
+## Agent CI etiquette
+
+Blacksmith minutes are paid. Agents and bots keep CI cheap:
+
+- Open every PR as a **draft**. Batch pushes. Mark the PR ready **once**, only after the owner clears any hold.
+- Never merge a PR, rebase, or force-push. Avoid gratuitous base churn.
+  Owner-approved normal merges of a base or dependency into your own review
+  branch are allowed for required integration, even without a real conflict.
+  Preserve the stricter autonomous-fixer single-push/no-fetch recovery policy;
+  this interactive integration exception does not expand fixer permissions.
+- Never edit `.github/workflows/**` or other CI/runner configuration. A
+  human-assigned Linear issue is the only exception, and it must name the
+  workflow files.
+- Use an existing authorized identity for an owner-approved ready transition.
+  A `GITHUB_TOKEN`-generated `ready_for_review` event does not trigger another
+  Actions run; this does not mean CI never runs on drafts. Opened, synchronize,
+  manual, label and other configured events can still run. Do not create a
+  credential or expand permissions to work around this event behavior.

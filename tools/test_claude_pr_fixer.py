@@ -421,10 +421,10 @@ def validate_shared_writer_queues(text: str, expected_groups: list[str]) -> None
 
 
 class SharedQueuePolicyTests(unittest.TestCase):
-    def test_all_four_shared_writers_use_bounded_fifo_queue(self) -> None:
+    def test_all_shared_writers_use_bounded_fifo_queue(self) -> None:
         validate_shared_writer_queues(WORKFLOW_PATH.read_text(), ["claude-${{ needs.resolve-pr.outputs.pr_number }}"] * 2)
         validate_shared_writer_queues(SCAN_WORKFLOW_PATH.read_text(), ["claude-${{ matrix.pr.number }}"])
-        validate_shared_writer_queues((ROOT / ".github/workflows/codex-gate.yml").read_text(), ["claude-${{ github.event.pull_request.number }}"])
+        validate_shared_writer_queues((ROOT / ".github/workflows/codex-gate.yml").read_text(), ["claude-${{ github.event.pull_request.number || inputs.pr_number }}"] * 2)
 
     def test_mutations_cannot_hide_behind_actionlint_compatibility_exception(self) -> None:
         original = WORKFLOW_PATH.read_text()
@@ -440,12 +440,12 @@ class SharedQueuePolicyTests(unittest.TestCase):
 
     def test_codex_journal_writer_lock_rejects_queue_and_group_drift(self):
         workflow = (ROOT / ".github/workflows/codex-gate.yml").read_text()
-        group = "claude-${{ github.event.pull_request.number }}"
+        group = "claude-${{ github.event.pull_request.number || inputs.pr_number }}"
         for bad in (workflow.replace("queue: max", "queue: min"),
                     workflow.replace("cancel-in-progress: false", "cancel-in-progress: true"),
                     workflow.replace(group, "codex-independent")):
             with self.assertRaises(ValueError):
-                validate_shared_writer_queues(bad, [group])
+                validate_shared_writer_queues(bad, [group] * 2)
         verdict = workflow.split("  verdict:", 1)[1]
         self.assertIn("github.event_name == 'pull_request_review'", verdict)
         self.assertNotIn("gh run watch", verdict)
@@ -463,6 +463,13 @@ class SharedQueuePolicyTests(unittest.TestCase):
 
 
 class WorkflowStructureTests(unittest.TestCase):
+    def test_event_tests_select_supported_python_and_lint_all_workflows(self):
+        paths = self._job('event-paths')
+        self.assertIn('uses: actions/setup-python@v5', paths)
+        self.assertIn('python-version: "3.12"', paths)
+        self.assertLess(paths.index('actions/setup-python@v5'), paths.index('name: Event-matrix gate'))
+        self.assertIn('./actionlint -color .github/workflows/*.yml', paths)
+
     def test_light_jobs_use_github_hosted_runners(self) -> None:
         resolve = self._job("resolve-pr")
         mention = self._job("claude-mention")
@@ -613,20 +620,17 @@ class GateCliTests(unittest.TestCase):
             event_path.write_text(json.dumps(event), encoding="utf-8")
             fake_bin = Path(tmp) / "bin"
             fake_bin.mkdir()
-            fake_gh = fake_bin / "gh"
+            fake_gh = fake_bin / "gh.py"
             fake_gh.write_text(
-                "#!/bin/sh\n"
-                '[ "$GH_TOKEN" = "stub-token" ] || exit 2\n'
-                'case "$*" in\n'
-                f'  "api repos/{REPO}/collaborators/lucas/permission") '
-                "echo '{\"permission\": \"admin\"}' ;;\n"
-                f'  "api repos/{REPO}/collaborators/alice/permission") '
-                "echo '{\"permission\": \"write\"}' ;;\n"
-                "  *) exit 1 ;;\n"
-                "esac\n",
+                "import json, os, sys\n"
+                "if os.environ.get('GH_TOKEN') != 'stub-token': raise SystemExit(2)\n"
+                f"permissions = {{'api repos/{REPO}/collaborators/lucas/permission': 'admin', "
+                f"'api repos/{REPO}/collaborators/alice/permission': 'write'}}\n"
+                "permission = permissions.get(' '.join(sys.argv[1:]))\n"
+                "if permission is None: raise SystemExit(1)\n"
+                "print(json.dumps({'permission': permission}))\n",
                 encoding="utf-8",
             )
-            fake_gh.chmod(0o755)
             env = {
                 k: v for k, v in os.environ.items() if k not in ("GH_TOKEN", "GITHUB_TOKEN")
             }
@@ -641,8 +645,20 @@ class GateCliTests(unittest.TestCase):
             )
             if token is not None:
                 env["GH_TOKEN"] = token
+            # Route only the external gh executable to a real portable child
+            # process. This prevents accidental live gh calls on Windows, where
+            # an extensionless POSIX shell fixture cannot shadow gh.exe.
+            launcher = (
+                "import runpy, subprocess, sys\n"
+                "original = subprocess.check_output\n"
+                "def stub(args, **kwargs):\n"
+                "    assert args[0] == 'gh', args\n"
+                "    return original([sys.executable, sys.argv[1], *args[1:]], **kwargs)\n"
+                "subprocess.check_output = stub\n"
+                "runpy.run_path(sys.argv[2], run_name='__main__')\n"
+            )
             result = subprocess.run(
-                [sys.executable, "-X", "utf8", "-B", str(GATE_PATH)],
+                [sys.executable, "-X", "utf8", "-B", "-c", launcher, str(fake_gh), str(GATE_PATH)],
                 cwd=ROOT,
                 env=env,
                 check=False,
@@ -712,19 +728,19 @@ class FixerGateAndPromptTests(unittest.TestCase):
             self.assertIn("prompt: |", body, job)
             self.assertIn("commit SHA", body, job)
             self.assertIn("do NOT resolve the thread", body, job)
-            self.assertIn("gh api repos/REPO/pulls/PR/comments/ID/replies", body, job)
+            self.assertIn("pre-push model-api -- reply ID BODY_FILE", body, job)
             self.assertIn(
-                "Bash(gh api repos/*/pulls/*/comments/*/replies:*)",
+                "Bash(python3 ${{ runner.temp }}/claude-fixer-guard/pre-push model-api --:*)",
                 body,
                 job,
             )
             self.assertIn(
-                "Bash(gh api --method POST repos/*/pulls/*/comments/*/replies:*)",
+                "Bash(python3 ${{ runner.temp }}/claude-fixer-guard/pre-push model-api --:*)",
                 body,
                 job,
             )
-            self.assertIn("Bash(gh api graphql:*resolveReviewThread*)", body, job)
-            self.assertIn("resolveReviewThread call only", body, job)
+            self.assertNotIn("Bash(gh api graphql:*resolveReviewThread*)", body, job)
+            self.assertIn("existing trusted watcher or human resolution", body, job)
             self.assertIn("Do not resolve a thread you have not answered", body, job)
             self.assertIn("Do not use graphql for any other mutation", body, job)
             self.assertIn("do NOT push", body, job)
@@ -736,12 +752,12 @@ class FixerGateAndPromptTests(unittest.TestCase):
             self.assertIn("use Edit/Write for files", body, job)
             self.assertIn("the gate result", body, job)
             self.assertIn("Linear-first (CSL-88)", body, job)
-            self.assertIn("PR-sync comment", body, job)
+            self.assertIn("has no Linear, Context7 or Parallel tools", body, job)
             self.assertIn("Context7", body, job)
             self.assertIn("Parallel", body, job)
-            self.assertIn("Triage", body, job)
-            self.assertIn("when those tools are available", body, job)
-            self.assertIn("not a denied command that blocks the push", body, job)
+            self.assertIn("PR author relays status and blockers to Linear", body, job)
+            self.assertIn("exact GitHub/gate commands below", body, job)
+            self.assertIn("Do not install tools, request access", body, job)
 
     def test_denials_are_reported_after_each_fixer(self) -> None:
         for job in ("claude-mention", "devin-review-fix"):

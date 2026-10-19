@@ -58,6 +58,9 @@ def commit(repo: Path, message: str) -> str:
 
 class TempRepoTests(unittest.TestCase):
     def setUp(self) -> None:
+        self._ci_env = mock.patch.dict(os.environ, {'CI_BASE_SHA': '', 'CI_HEAD_SHA': ''})
+        self._ci_env.start()
+        self.addCleanup(self._ci_env.stop)
         self._orig_root = ci_gate.ROOT
         self.repo = Path(tempfile.mkdtemp(prefix="ci-gate-"))
         ci_gate.ROOT = self.repo
@@ -111,6 +114,61 @@ class TempRepoTests(unittest.TestCase):
         self.assertFalse(any(path.startswith('"') or "\\" in path for path in paths))
         self.assertTrue(ci_gate.is_gate_path(paths[0]))
         self.assertFalse(ci_gate.docs_only(self.seed))
+
+    def test_head_identity_must_match_test_tree(self) -> None:
+        write(self.repo / "docs" / "note.md", "one\n")
+        mid = commit(self.repo, "mid")
+        write(self.repo / "tools" / "later.py", "x = 1\n")
+        commit(self.repo, "later")
+        with mock.patch.dict(os.environ, {"CI_HEAD_SHA": mid}):
+            with self.assertRaisesRegex(ValueError, 'checked-out'):
+                ci_gate.changed_paths(self.seed)
+        self.assertFalse(ci_gate.docs_only(self.seed))
+
+    def test_stale_base_pr_uses_synthetic_merge_tree(self):
+        git(self.repo, 'checkout', '-b', 'pr')
+        write(self.repo / 'docs/note.md', 'PR docs\n')
+        pr_head = commit(self.repo, 'PR docs')
+        git(self.repo, 'checkout', 'master')
+        write(self.repo / 'tools/base_change.py', 'x = 1\n')
+        current_base = commit(self.repo, 'base advanced')
+        # A two-tree diff against the stale PR head falsely sees deleted source.
+        self.assertIn('tools/base_change.py', git(self.repo, 'diff', '--name-only', current_base, pr_head))
+        git(self.repo, 'merge', '--no-ff', 'pr', '-m', 'synthetic merge')
+        merged = git(self.repo, 'rev-parse', 'HEAD')
+        with mock.patch.dict(os.environ, {'CI_BASE_SHA': current_base, 'CI_HEAD_SHA': merged}):
+            self.assertEqual(ci_gate.changed_paths(current_base), ['docs/note.md'])
+            self.assertFalse(ci_gate.decide_run_full(False))
+        with mock.patch.dict(os.environ, {'CI_HEAD_SHA': pr_head}):
+            with self.assertRaises(ValueError):
+                ci_gate.decide_run_full(False)
+
+    def test_merge_group_exact_base_head(self):
+        write(self.repo / 'tools/queue.py', 'x = 1\n')
+        head = commit(self.repo, 'queue')
+        with mock.patch.dict(os.environ, {'CI_BASE_SHA': self.seed, 'CI_HEAD_SHA': head}):
+            self.assertTrue(ci_gate.decide_run_full(False))
+            self.assertEqual(ci_gate.changed_paths(self.seed), ['tools/queue.py'])
+
+    def test_invalid_head_identity_fails_even_when_forced(self):
+        for value in ['HEAD', '--help', '0' * 40, 'bad-sha', 'f' * 40]:
+            with self.subTest(value=value), mock.patch.dict(os.environ, {'CI_HEAD_SHA': value}):
+                with self.assertRaises((ValueError, subprocess.CalledProcessError)):
+                    ci_gate.decide_run_full(True)
+
+    def test_invalid_base_identity(self):
+        with mock.patch.dict(os.environ, {'CI_BASE_SHA': '--help'}):
+            with self.assertRaises(ValueError):
+                ci_gate.decide_run_full(False)
+
+
+class AmbientCITests(unittest.TestCase):
+    def test_temp_repos_isolate_real_ambient_ci_values(self):
+        env = {**os.environ, 'CI_BASE_SHA': '772fc0fed5b596abfbda6c59b207a4143e437cdd',
+               'CI_HEAD_SHA': '99063df7acf3d76b2ad82876a6270b72a71a22b9'}
+        result = subprocess.run([sys.executable, '-X', 'utf8', '-B', __file__, 'TempRepoTests'],
+                                env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 class LightweightControlTests(unittest.TestCase):

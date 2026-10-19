@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1662,10 +1663,172 @@ class ProgramControlTests(unittest.TestCase):
                 "docs/**/*.md text eol=lf\ndocs/**/*.bin binary\n", encoding="utf-8")
             self.assertEqual(checker.pinned_eol_errors({"contracts": []}, root), [])
 
+    def test_git_check_attr_handles_inventory_larger_than_windows_argv_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+            (root / ".gitattributes").write_text("*.md text eol=lf\n", encoding="utf-8")
+            paths = tuple(
+                f"bulk/{index:04d}-{'x' * 56}.md" for index in range(2000))
+            old_argv = [
+                "git", "-C", str(root), "-c", "core.quotePath=false",
+                "check-attr", "text", "eol", "--", *paths,
+            ]
+            self.assertGreater(len(subprocess.list2cmdline(old_argv)), 32767)
+            real_run = subprocess.run
+            with mock.patch.object(checker.subprocess, "run", wraps=real_run) as run_spy:
+                resolved, failure = checker._git_check_attr(str(root), paths)
+
+            self.assertEqual(failure, "")
+            self.assertEqual(set(resolved), set(paths))
+            self.assertTrue(all(attrs == {"text": "set", "eol": "lf"}
+                                for attrs in resolved.values()))
+            self.assertEqual(run_spy.call_count, 1)
+            argv = run_spy.call_args.args[0]
+            self.assertFalse(set(paths).intersection(argv))
+            self.assertLess(len(subprocess.list2cmdline(argv)), 32767)
+            self.assertEqual(
+                run_spy.call_args.kwargs["input"],
+                b"".join(os.fsencode(path) + b"\0" for path in paths))
+            self.assertNotIn("text", run_spy.call_args.kwargs)
+
+    def test_git_check_attr_round_trips_unusual_portable_paths(self):
+        paths = (
+            "space name.md", "a: b.md", "-dash.md", "naïve.md",
+            "#hash.md", "[br].md", "quote'.md",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+            (root / ".gitattributes").write_text("*.md text eol=lf\n", encoding="utf-8")
+
+            resolved, failure = checker._git_check_attr(str(root), paths)
+            self.assertEqual(failure, "")
+            self.assertEqual(resolved, {
+                path: {"text": "set", "eol": "lf"} for path in paths
+            })
+
+            disk_paths = tuple(path for path in paths if path != "a: b.md")
+            sums = []
+            for path in disk_paths:
+                payload = b"unusual path\n"
+                (root / path).write_bytes(payload)
+                sums.append(f"{hashlib.sha256(payload).hexdigest()}  {path}\n")
+            (root / "SHA256SUMS.txt").write_text("".join(sums), encoding="utf-8")
+            self.assertEqual(checker.pinned_eol_errors({"contracts": []}, root), [])
+
+    def test_git_check_attr_round_trips_posix_only_paths(self):
+        if os.name == "nt":
+            self.skipTest("Windows filenames cannot contain newline, *, ?, or backslash")
+        paths = ("line\nbreak.md", "star*.md", "question?.md", "back\\slash.md")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+            (root / ".gitattributes").write_text("*.md text eol=lf\n", encoding="utf-8")
+            for path in paths:
+                (root / path).write_text("unusual path\n", encoding="utf-8")
+
+            resolved, failure = checker._git_check_attr(str(root), paths)
+            self.assertEqual(failure, "")
+            self.assertEqual(resolved, {
+                path: {"text": "set", "eol": "lf"} for path in paths
+            })
+
+    def test_git_check_attr_rejects_malformed_and_newline_output(self):
+        cases = (
+            ("missing trailing NUL", b"notes.md\0text\0set", "missing trailing NUL"),
+            ("incomplete triple", b"notes.md\0text\0set\0notes.md\0",
+             "field count is not a multiple of 3"),
+            ("unknown attribute", b"notes.md\0binary\0set\0", "unknown attribute"),
+            ("unrequested path", b"other.md\0text\0set\0", "unrequested path"),
+            ("duplicate pair",
+             b"notes.md\0text\0set\0notes.md\0text\0set\0",
+             "duplicate path/attribute pair"),
+            ("newline format",
+             b"notes.md: text: set\nnotes.md: eol: unspecified\n",
+             "missing trailing NUL"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+            (root / "notes.md").write_text("notes\n", encoding="utf-8")
+            digest = hashlib.sha256((root / "notes.md").read_bytes()).hexdigest()
+            (root / "SHA256SUMS.txt").write_text(
+                f"{digest}  notes.md\n", encoding="utf-8")
+            for label, stdout, reason in cases:
+                completed = subprocess.CompletedProcess(
+                    ["git", "check-attr"], 0, stdout=stdout, stderr=b"")
+                with self.subTest(output=label):
+                    with mock.patch.object(
+                            checker.subprocess, "run", return_value=completed):
+                        try:
+                            resolved, failure = checker._git_check_attr(
+                                str(root), ("notes.md",))
+                        except Exception as exc:
+                            self.fail(f"malformed output raised instead of failing closed: {exc}")
+                    self.assertEqual(resolved, {})
+                    self.assertIn("git check-attr failed: malformed output", failure)
+                    self.assertIn(reason, failure)
+
+                    with mock.patch.object(
+                            checker.subprocess, "run", return_value=completed):
+                        errors = checker.pinned_eol_errors({"contracts": []}, root)
+                    self.assertIn(failure, errors)
+                    self.assertFalse(any("lacks eol=lf" in error for error in errors))
+
+    def test_git_check_attr_subprocess_failures_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+            (root / "notes.md").write_text("notes\n", encoding="utf-8")
+            digest = hashlib.sha256((root / "notes.md").read_bytes()).hexdigest()
+            (root / "SHA256SUMS.txt").write_text(
+                f"{digest}  notes.md\n", encoding="utf-8")
+            cases = (
+                ("missing git", FileNotFoundError("git executable missing"),
+                 "git executable missing"),
+                ("timeout", subprocess.TimeoutExpired("git", 60), "timed out"),
+                ("nonzero exit", subprocess.CompletedProcess(
+                    ["git", "check-attr"], 2, stdout=b"", stderr=b"fatal: rejected"),
+                 "fatal: rejected"),
+            )
+            for label, failure, expected in cases:
+                with self.subTest(failure=label):
+                    patch_args = ({"side_effect": failure}
+                                  if isinstance(failure, BaseException)
+                                  else {"return_value": failure})
+                    with mock.patch.object(checker.subprocess, "run", **patch_args):
+                        errors = checker.pinned_eol_errors({"contracts": []}, root)
+                    self.assertEqual(len(errors), 1, errors)
+                    self.assertTrue(errors[0].startswith("git check-attr failed: "), errors)
+                    self.assertIn(expected, errors[0])
+
     def test_known_gap_entries_are_still_pinned_and_uncovered(self):
         paths = set(checker.sha256_pinned_paths(self.data, ROOT))
         self.assertTrue(checker.PINNED_EOL_KNOWN_GAPS)
         self.assertTrue(checker.PINNED_EOL_KNOWN_GAPS <= paths)
+
+    def test_known_gap_covered_entry_is_reported_stale(self):
+        gap_path = sorted(checker.PINNED_EOL_KNOWN_GAPS)[0]
+        payload = b"now covered\n"
+        gap_name = gap_path.rsplit("/", 1)[-1]
+        expected = f"{gap_path} known eol gap is covered: remove it from PINNED_EOL_KNOWN_GAPS"
+        for attributes in ("text eol=lf", "-text"):
+            with self.subTest(attributes=attributes), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+                target = root / gap_path
+                target.parent.mkdir(parents=True)
+                target.write_bytes(payload)
+                digest = hashlib.sha256(payload).hexdigest()
+                (target.parent / "SHA256SUMS.txt").write_text(
+                    f"{digest}  {gap_name}\n", encoding="utf-8")
+                (root / ".gitattributes").write_text(
+                    f"/{gap_path} {attributes}\n", encoding="utf-8")
+
+                errors = checker.pinned_eol_errors({"contracts": []}, root)
+                path_errors = [error for error in errors if gap_path in error]
+                self.assertEqual(path_errors, [expected], errors)
 
     def test_known_gap_removed_file_is_reported_stale(self):
         # The frozen path snapshot can grow; only entries whose parent dirs

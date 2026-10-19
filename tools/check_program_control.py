@@ -886,7 +886,7 @@ def pinned_path_errors(data: dict[str, Any], root: Path, *,
 
 
 def _git_check_attr(root: str, paths: tuple[str, ...]) -> tuple[dict[str, dict[str, str]], str]:
-    """One batched `git check-attr` call over every pinned path.
+    """One batched `git check-attr` call via --stdin -z (no argv length limit).
 
     Returns a per-path attribute map, or an error string when git cannot run
     in the given root (fail closed: the attribute of a pinned path is then
@@ -894,21 +894,37 @@ def _git_check_attr(root: str, paths: tuple[str, ...]) -> tuple[dict[str, dict[s
     """
     if not paths:
         return {}, ""
+    argv = ["git", "-C", root, "-c", "core.quotePath=false",
+            "check-attr", "--stdin", "-z", "text", "eol"]
+    path_input = b"".join(os.fsencode(path) + b"\0" for path in paths)
     try:
         result = subprocess.run(
-            ["git", "-C", root, "-c", "core.quotePath=false",
-             "check-attr", "text", "eol", "--", *paths],
-            capture_output=True, text=True, timeout=60, check=False)
+            argv, input=path_input, capture_output=True, timeout=60, check=False)
     except (OSError, subprocess.SubprocessError) as exc:
         return {}, f"git check-attr failed: {exc}"
     if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip()
+        detail = (result.stderr or result.stdout or b"").decode(errors="replace").strip()
         return {}, f"git check-attr failed: {detail}"
+    stdout = result.stdout
+    if stdout and not stdout.endswith(b"\0"):
+        return {}, "git check-attr failed: malformed output (missing trailing NUL)"
+    fields = stdout.split(b"\0")[:-1] if stdout else []
+    if len(fields) % 3:
+        return {}, "git check-attr failed: malformed output (field count is not a multiple of 3)"
+    requested = set(paths)
     resolved: dict[str, dict[str, str]] = {}
-    for line in result.stdout.splitlines():
-        parts = line.rsplit(": ", 2)
-        if len(parts) == 3 and parts[1] in {"text", "eol"}:
-            resolved.setdefault(parts[0], {})[parts[1]] = parts[2]
+    seen: set[tuple[str, str]] = set()
+    for index in range(0, len(fields), 3):
+        path, attr, value = (os.fsdecode(field) for field in fields[index:index + 3])
+        if attr not in {"text", "eol"}:
+            return {}, "git check-attr failed: malformed output (unknown attribute)"
+        if path not in requested:
+            return {}, "git check-attr failed: malformed output (unrequested path)"
+        key = (path, attr)
+        if key in seen:
+            return {}, "git check-attr failed: malformed output (duplicate path/attribute pair)"
+        seen.add(key)
+        resolved.setdefault(path, {})[attr] = value
     return resolved, ""
 
 

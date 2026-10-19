@@ -10,7 +10,7 @@ verification, product qualification, or release approval.
 """
 from __future__ import annotations
 
-import functools
+import dataclasses
 import hashlib
 import json
 import os
@@ -741,7 +741,6 @@ def _files_named_exactly(root: Path, filename: str) -> list[Path]:
     return sorted(matches, key=lambda path: path.relative_to(root).as_posix())
 
 
-@functools.lru_cache(maxsize=None)
 def _filesystem_pinned_path_inventory(root: str) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
     """Filesystem-derived inventory of sha256-pinned paths, manifest paths,
     and deterministic resolution errors for a resolved root string.
@@ -794,10 +793,46 @@ def _filesystem_pinned_path_inventory(root: str) -> tuple[tuple[str, ...], tuple
     return tuple(paths), tuple(manifest_paths), tuple(errors)
 
 
-_pinned_path_inventory = _filesystem_pinned_path_inventory
+@dataclasses.dataclass(frozen=True)
+class PinnedInventory:
+    """One filesystem scan of sha256-pinned paths under a resolved root.
+
+    Scoped to the caller that built it: every validation that is not handed
+    an inventory scans afresh. git check-attr results are memoized per path
+    set on this object only.
+    """
+    root: str
+    paths: tuple[str, ...]
+    manifest_paths: frozenset[str]
+    errors: tuple[str, ...]
+    _attrs: dict[tuple[str, ...], tuple[dict[str, dict[str, str]], str]] = dataclasses.field(
+        default_factory=dict, compare=False, repr=False)
+
+    def check_attr(self, paths: tuple[str, ...]) -> tuple[dict[str, dict[str, str]], str]:
+        if paths not in self._attrs:
+            self._attrs[paths] = _git_check_attr(self.root, paths)
+        return self._attrs[paths]
 
 
-def _pinned_path_details(data: dict[str, Any], root: Path) -> tuple[list[str], frozenset[str], list[str]]:
+def pinned_inventory(root: Path) -> PinnedInventory:
+    """Scan root now; never reuses an earlier scan."""
+    resolved = str(root.resolve())
+    paths, manifest_paths, errors = _filesystem_pinned_path_inventory(resolved)
+    return PinnedInventory(resolved, paths, frozenset(manifest_paths), errors)
+
+
+def _inventory_for_root(root: Path, inventory: PinnedInventory | None) -> PinnedInventory:
+    resolved = str(root.resolve())
+    if inventory is None:
+        return pinned_inventory(root)
+    if inventory.root != resolved:
+        raise ValueError(f"pinned inventory root {inventory.root!r} does not match {resolved!r}")
+    return inventory
+
+
+def _pinned_path_details(data: dict[str, Any], root: Path, *,
+                         inventory: PinnedInventory | None = None
+                         ) -> tuple[list[str], frozenset[str], list[str]]:
     """Repo-relative paths whose delivered bytes are sha256-pinned, the
     subset of those derived from MANIFEST.json inventories, and any
     deterministic resolution errors.
@@ -811,45 +846,45 @@ def _pinned_path_details(data: dict[str, Any], root: Path) -> tuple[list[str], f
     path-by-path snapshot of currently uncovered pins.
     """
     root = root.resolve()
+    inventory = _inventory_for_root(root, inventory)
     paths: list[str] = []
     for contract in data.get("contracts", []):
         if isinstance(contract, dict) and text_present(contract.get("path")):
             paths.append(contract["path"])
-    fs_paths, manifest_paths, errors = _filesystem_pinned_path_inventory(str(root))
-    paths.extend(fs_paths)
-    return sorted(set(paths)), frozenset(manifest_paths), list(errors)
+    paths.extend(inventory.paths)
+    return sorted(set(paths)), inventory.manifest_paths, list(inventory.errors)
 
 
-def sha256_pinned_paths(data: dict[str, Any], root: Path) -> list[str]:
+def sha256_pinned_paths(data: dict[str, Any], root: Path, *,
+                        inventory: PinnedInventory | None = None) -> list[str]:
     """Repo-relative paths whose delivered bytes are sha256-pinned.
 
     See _pinned_path_details for the full source list. An entry that is
     absolute or escapes the repository via `..` is dropped here; call
     pinned_path_errors for the matching deterministic errors.
     """
-    paths, _manifest_paths, _errors = _pinned_path_details(data, root)
+    paths, _manifest_paths, _errors = _pinned_path_details(data, root, inventory=inventory)
     return paths
 
 
-def pinned_path_errors(data: dict[str, Any], root: Path) -> list[str]:
+def pinned_path_errors(data: dict[str, Any], root: Path, *,
+                       inventory: PinnedInventory | None = None) -> list[str]:
     """Deterministic, git-free resolution errors for pinned-path entries:
     a SHA256SUMS.txt or MANIFEST.json entry that is absolute (POSIX,
     Windows-drive, or UNC), escapes the repository, or cannot be resolved
     is reported here instead of raising out of sha256_pinned_paths.
     Unreadable or malformed MANIFEST.json inventories also fail closed.
     """
-    _paths, _manifest_paths, errors = _pinned_path_details(data, root)
+    _paths, _manifest_paths, errors = _pinned_path_details(data, root, inventory=inventory)
     return errors
 
 
-@functools.lru_cache(maxsize=None)
 def _git_check_attr(root: str, paths: tuple[str, ...]) -> tuple[dict[str, dict[str, str]], str]:
     """One batched `git check-attr` call over every pinned path.
 
     Returns a per-path attribute map, or an error string when git cannot run
     in the given root (fail closed: the attribute of a pinned path is then
-    unverifiable). Results are cached per root and path set because callers
-    invoke this many times over an unchanged tree.
+    unverifiable).
     """
     if not paths:
         return {}, ""
@@ -871,18 +906,8 @@ def _git_check_attr(root: str, paths: tuple[str, ...]) -> tuple[dict[str, dict[s
     return resolved, ""
 
 
-_orig_git_check_attr_cache_clear = _git_check_attr.cache_clear
-
-
-def _git_check_attr_cache_clear() -> None:
-    _orig_git_check_attr_cache_clear()
-    _filesystem_pinned_path_inventory.cache_clear()
-
-
-_git_check_attr.cache_clear = _git_check_attr_cache_clear  # type: ignore[method-assign]
-
-
-def pinned_eol_errors(data: dict[str, Any], root: Path) -> list[str]:
+def pinned_eol_errors(data: dict[str, Any], root: Path, *,
+                      inventory: PinnedInventory | None = None) -> list[str]:
     """Assert every sha256-pinned text path resolves `eol=lf` (or is explicitly
     binary via `-text`) so cross-platform checkouts cannot deliver CRLF bytes
     against the recorded digest. CSL-225's Windows-only digest break is the
@@ -895,8 +920,9 @@ def pinned_eol_errors(data: dict[str, Any], root: Path) -> list[str]:
     here too, never raised.
     """
     root = root.resolve()
-    paths, manifest_paths, errors = _pinned_path_details(data, root)
-    resolved, failure = _git_check_attr(str(root), tuple(paths))
+    inventory = _inventory_for_root(root, inventory)
+    paths, manifest_paths, errors = _pinned_path_details(data, root, inventory=inventory)
+    resolved, failure = inventory.check_attr(tuple(paths))
     if failure:
         return errors + [failure]
     for path in paths:
@@ -921,7 +947,9 @@ def pinned_eol_errors(data: dict[str, Any], root: Path) -> list[str]:
     return errors
 
 
-def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
+def validate_program(data: dict[str, Any], root: Path = ROOT, *,
+                     inventory: PinnedInventory | None = None) -> list[str]:
+    inventory = _inventory_for_root(root, inventory)
     errors: list[str] = []
     if not isinstance(data, dict):
         return ["program must be an object"]
@@ -1006,7 +1034,7 @@ def validate_program(data: dict[str, Any], root: Path = ROOT) -> list[str]:
         if type(contract.get("revision")) is not int or contract["revision"] < 1:
             errors.append(f"{contract_id} revision must be a positive integer")
 
-    errors.extend(pinned_eol_errors(data, root))
+    errors.extend(pinned_eol_errors(data, root, inventory=inventory))
 
     def bindings_match(bindings: Any, contract_ids: list[str]) -> bool:
         return (isinstance(bindings, list) and len(bindings) == len(contract_ids)

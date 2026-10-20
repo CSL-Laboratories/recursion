@@ -176,7 +176,9 @@ class Comment:
 
     @property
     def prefix_changed(self) -> bool:
-        return len({agent_header(r.body) is None for r in self.revisions}) > 1
+        # Any change to the (session, developer) identity counts, not only
+        # adding or removing the prefix.
+        return len({agent_header(r.body) for r in self.revisions}) > 1
 
     def last_update(self, at: datetime) -> datetime:
         return max(r.at for r in self.revisions if r.at <= at)
@@ -271,6 +273,20 @@ def present_at(comment: Comment, line: str, at: datetime) -> bool:
     """Whether `line` is in the revision of the comment in effect at `at`."""
     effective = [r for r in comment.revisions if r.at <= at]
     return bool(effective) and line in (part.strip() for part in effective[-1].body.split("\n"))
+
+
+def present_since(comment: Comment, line: str, at: datetime) -> datetime | None:
+    """When `line` last became present without a break up to `at`, or None
+    if the revision in effect at `at` does not contain it."""
+    since = None
+    for revision in comment.revisions:
+        if revision.at > at:
+            break
+        if line in (part.strip() for part in revision.body.split("\n")):
+            since = revision.at if since is None else since
+        else:
+            since = None
+    return since
 
 
 class Evaluation:
@@ -613,9 +629,10 @@ class Evaluation:
             # The acknowledgement must still be in the comment, and the comment
             # not deleted, at the time being judged.
             acked = any(
-                (m := ACK_TAKEOVER.match(line)) and m.group(1) == old.uuid and posted <= seen <= at
-                and present_at(c, line, at) and not (c.deleted_at is not None and c.deleted_at <= at)
-                for c, line, seen in self.directive_lines(claim.issue)
+                (m := ACK_TAKEOVER.match(line)) and m.group(1) == old.uuid
+                and (since := present_since(c, line, at)) is not None and posted <= since
+                and not (c.deleted_at is not None and c.deleted_at <= at)
+                for c, line, _ in self.directive_lines(claim.issue)
             )
             if not acked:
                 return {"of": old.uuid, "allowed": False, "reason": "coordinator acknowledgement missing"}
@@ -632,7 +649,15 @@ class Evaluation:
             status = self.takeover_status(claim, at)
             if status is None:
                 continue
-            if status["allowed"]:
+            if status["allowed"] and any(
+                other.uuid != claim.uuid and other.uuid != claim.takeover_of
+                and other.issue == claim.issue and other.repo == claim.repo
+                and other.created_at < claim.created_at and self.bypassed_expired(claim, other)
+                for other in self.claims.values()
+            ):
+                # Bypasses another expired claim, as check_implicit_takeover reports.
+                refused.add(claim.uuid)
+            elif status["allowed"]:
                 superseded.add(status["of"])
             else:
                 refused.add(claim.uuid)
@@ -938,8 +963,7 @@ class Evaluation:
                     self.violation("loser_confirmed", claim.issue, claim.uuid, f"winner {settled.uuid}")
                 if claim.withdrawn_at() is None:
                     self.violation("loser_not_withdrawn", claim.issue, claim.uuid, f"winner {settled.uuid}")
-            if claim.takeover_of is None:
-                self.check_implicit_takeover(claim)
+            self.check_implicit_takeover(claim)
             others = [
                 other for other in self.claims.values()
                 if other.uuid != claim.uuid and other.session == claim.session and other.repo == claim.repo
@@ -967,21 +991,29 @@ class Evaluation:
         for other in self.claims.values():
             if other.uuid == claim.uuid or other.issue != claim.issue or other.repo != claim.repo:
                 continue
+            # The claim an explicit takeover names is judged by takeover_status;
+            # every other earlier claim still needs its own takeover.
+            if other.uuid == claim.takeover_of:
+                continue
             if other.created_at >= at:
                 continue
             if other.takeover_of is not None and at < other.created_at + self.takeover_wait:
                 if self.ended(other, at) is None:
                     self.violation("claim_during_takeover_wait", claim.issue, claim.uuid, f"takeover {other.uuid}")
                     continue
-            if self.ended(other, at) != "expired":
-                continue
-            superseded = any(
-                t.takeover_of == other.uuid and t.created_at <= at
-                and (status := self.takeover_status(t, at)) is not None and status["allowed"]
-                for t in self.claims.values()
-            )
-            if not superseded:
+            if self.bypassed_expired(claim, other):
                 self.violation("claim_without_takeover", claim.issue, claim.uuid, f"expired {other.uuid}")
+
+    def bypassed_expired(self, claim: Claim, other: Claim) -> bool:
+        """True if `claim` landed over `other`, which had expired without a valid takeover."""
+        at = claim.created_at
+        if self.ended(other, at) != "expired":
+            return False
+        return not any(
+            t.takeover_of == other.uuid and t.created_at <= at
+            and (status := self.takeover_status(t, at)) is not None and status["allowed"]
+            for t in self.claims.values()
+        )
 
     def check_writes(self) -> None:
         for write in self.writes:

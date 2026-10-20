@@ -259,6 +259,22 @@ class LeaseTests(unittest.TestCase):
                 self.assertFalse(result["issues"]["CSL-1"]["takeovers"][U2]["allowed"])
                 self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], None)
 
+    def test_explicit_takeover_still_needs_one_for_an_older_expired_claim(self):
+        u3 = "33333333-3333-4333-8333-333333333333"
+        withdrawn = claim("c2", "CSL-1", U2, at=1, session="cursor/s2", confirm_after=None,
+                          more_edits=[{"at": ts(1.5), "body": claim_body(U2, "cursor/s2", extra=(f"withdrawn: superseded by {U1}",))}])
+        third = claim("c3", "CSL-1", u3, at=152, session="grok/s3", extra=(f"takeover of {U2}",))
+        result = sim.evaluate(snapshot(170, [issue("CSL-1")], [claim("c1", "CSL-1", U1), withdrawn, third]))
+        self.assertEqual(codes(result), ["claim_without_takeover"])
+        self.assertEqual(result["violations"][0]["claim"], u3)
+
+    def test_acknowledgement_re_added_after_the_takeover_counts(self):
+        ack = comment("h1", "CSL-1", 140, f"ACK TAKEOVER {U1}")
+        ack["edits"] = [{"at": ts(145), "body": "hold on"}, {"at": ts(155), "body": f"ACK TAKEOVER {U1}"}]
+        comments = [claim("c1", "CSL-1", U1), self.takeover(), ack]
+        result = sim.evaluate(snapshot(170, [issue("CSL-1")], comments, config={"coordinator_ack_required": True}))
+        self.assertTrue(result["issues"]["CSL-1"]["takeovers"][U2]["allowed"])
+
     def test_acknowledgement_before_the_takeover_does_not_count(self):
         comments = [claim("c1", "CSL-1", U1), comment("h1", "CSL-1", 140, f"ACK TAKEOVER {U1}"), self.takeover()]
         result = sim.evaluate(snapshot(170, [issue("CSL-1")], comments, config={"coordinator_ack_required": True}))
@@ -968,6 +984,12 @@ class MalformedSnapshotTests(unittest.TestCase):
                     holder["body"] = holder["body"].replace("Agent (claude/s1, for Lucas):", prefix)
             with self.subTest(prefix=prefix):
                 self.assert_rejected(mutate)
+
+    def test_claim_edit_that_swaps_the_agent_identity(self):
+        swapped = claim("c2", "CSL-2", U2, session="cursor/s2")
+        swapped["edits"][0]["body"] = swapped["edits"][0]["body"].replace("cursor/s2", "claude/s1")
+        result = sim.evaluate(snapshot(10, [issue("CSL-2")], [swapped]))
+        self.assertEqual(codes(result), ["comment_prefix_changed"])
 
     def test_edit_after_deletion(self):
         def mutate(s):

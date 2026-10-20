@@ -1640,6 +1640,69 @@ class VerdictAndResolveTests(unittest.TestCase):
             with self.subTest(prefix=prefix):
                 self._assert_resolves(prefix + block)
 
+    def test_type1_blocks_only_accept_the_matching_closer(self) -> None:
+        block = verdict_block("PRRT_1")
+        names = ("pre", "script", "style", "textarea")
+        for name in names:
+            for closer in names:
+                if closer == name:
+                    continue
+                for newline in ("\n", "\r\n"):
+                    with self.subTest(name=name, closer=closer, newline=repr(newline)):
+                        prose = f"<{name}>\nFixed.\n</{closer}>\n\n".replace(
+                            "\n", newline
+                        )
+                        self._assert_no_resolve(prose + block.replace("\n", newline))
+            for newline in ("\n", "\r\n"):
+                with self.subTest(name=name, closer=f"/{name}", newline=repr(newline)):
+                    matched = f"<{name}>\nFixed.\n</{name}>\n\n".replace("\n", newline)
+                    self._assert_resolves(matched + block.replace("\n", newline))
+
+    def test_escaped_backticks_do_not_open_code_spans(self) -> None:
+        block = verdict_block("PRRT_1")
+        self._assert_no_resolve("\\`<details>`\n\n" + block)
+        # The first backtick is escaped. The later tick is unmatched, so
+        # CommonMark leaves the live tag visible to the raw HTML scanner.
+        for prose in (
+            "Use \\` before <custom-tag> `\n",
+            "Use \\\\\\` before <custom-tag> `\r\n",
+        ):
+            with self.subTest(prose=prose):
+                self._assert_no_resolve(prose + block)
+        # A valid code span still hides its tag, and even backslash parity is
+        # respected: odd escapes are literal; even escapes permit a span.
+        self._assert_resolves("Use `<custom-tag>` as a literal.\n\n" + block)
+        self._assert_no_resolve("Use \\`<custom-tag>\n" + block)
+        self._assert_resolves("Use \\\\` before <custom-tag> `\n\n" + block)
+        # If a slash escapes the first tick of a run, the remaining suffix
+        # tick may open a span; inside that span an escaped closer is still a
+        # delimiter because backslashes have no special meaning there.
+        self._assert_resolves("Use \\``<custom-tag>\\`\n\n" + block)
+
+    def test_malformed_type6_start_cannot_be_hidden_by_span_stripping(self) -> None:
+        block = verdict_block("PRRT_1")
+        self.assertFalse(mod._unclosed_html_type6(["<hr/x>", "continued"]))
+        for newline in ("\n", "\r\n"):
+            for indent in ("", " ", "  ", "   "):
+                for opener in ("<hr `x`>", "<HR `x`>", "<hr `x`"):
+                    prose = f"{indent}{opener}\n`snippet`\n".replace("\n", newline)
+                    with self.subTest(newline=repr(newline), indent=len(indent), opener=opener):
+                        self.assertTrue(
+                            mod._unclosed_html_type6(prose.splitlines()),
+                            "raw type-6 prefix must be detected before spans are stripped",
+                        )
+                        self._assert_no_resolve(prose + block.replace("\n", newline))
+            for opener in ("<div @x>", "<hr", "</div @x>"):
+                with self.subTest(newline=repr(newline), opener=opener):
+                    # Inline-span removal would otherwise consume the
+                    # malformed type-6 opener; its later blank must be
+                    # measured on the original prose lines.
+                    prose = f"\\` note\n{opener}\n`\nStill inside block".replace("\n", newline)
+                    self._assert_no_resolve(prose + newline + block.replace("\n", newline))
+            # A real blank line ends a type-6 block and must remain a
+            # resolving control when followed by ordinary prose.
+            self._assert_resolves(("<hr>\n\nSummary.\n\n" + block).replace("\n", newline))
+
     def test_deferred_html_liveness_cases_stay_non_authorizing(self) -> None:
         # CSL-308 remains deferred; this repair must not loosen barriers.
         for prefix in (
@@ -1700,12 +1763,13 @@ class VerdictAndResolveTests(unittest.TestCase):
             ("pi_unclosed_xml", 'Thread text:\n<?xml version="1.0"\n', False),
             ("pi_closed", 'Thread text:\n<?xml version="1.0"?>\n\n', True),
             ("pi_midline_unclosed", "Echo <?\n", False),
-            # type 4 declarations (quoted '>' does not end them)
+            # type 4 declarations end at the first '>' (quotes do not hide it)
             ("decl_unclosed", "Thread text:\n<!DOCTYPE html\n", False),
             ("decl_unclosed_element", "Thread text:\n<!ELEMENT foo bar\n", False),
             ("decl_closed", "Thread text:\n<!DOCTYPE html>\n\n", True),
-            ("decl_quoted_gt", 'Thread text:\n<!DOCTYPE html ">\n', False),
+            ("decl_quoted_gt", 'Thread text:\n<!DOCTYPE html ">\n', True),
             ("decl_quoted_gt_closed", 'Thread text:\n<!DOCTYPE html "foo>bar">\n\n', True),
+            ("decl_quoted_gt_hides_pre", '<!DOCTYPE "x>\n<pre>\n">\n', False),
             # type 5 CDATA
             ("cdata_unclosed", "Thread text:\n<![CDATA[\n", False),
             ("cdata_closed", "Thread text:\n<![CDATA[ example ]]>\n\n", True),
@@ -1755,6 +1819,76 @@ class VerdictAndResolveTests(unittest.TestCase):
         self._assert_resolves("Thread text:\n<![CDATA[ example ]]>\n\n" + block)
         self._assert_resolves('Thread text:\n<?xml version="1.0"?>\n\n' + block)
         self._assert_resolves("Thread text:\n<!DOCTYPE html>\n\n" + block)
+
+    def test_quoted_attribute_closer_does_not_authorize_copied_verdict(self) -> None:
+        # Quoted `>` / `</pre>` is still inside the opener (CommonMark 6.6).
+        block = verdict_block("PRRT_1")
+        self._assert_no_resolve('<pre title="x></pre>y">\n' + block)
+        self._assert_no_resolve("<pre title='x></pre>y'>\n" + block)
+        self._assert_no_resolve('<pre title="x></pre>y">\n' + block + "</pre>\n")
+        self._assert_no_resolve('<pre title="unterminated>\n' + block)
+        self._assert_resolves('<pre title="x>y"></pre>\n\n' + block)
+
+    def test_multiline_inline_code_pre_literal_still_resolves(self) -> None:
+        # CommonMark 6.1 converts line endings in a code span to spaces, so
+        # this is a literal `<pre>`, not an HTML opener.
+        self._assert_resolves("The literal is `<pre>\n` in the sample.\n" + verdict_block("PRRT_1"))
+
+    def test_unequal_backticks_do_not_strip_live_pre_opener(self) -> None:
+        # A one-backtick opener is not closed by a two-backtick run, so the
+        # `<pre>` stays an HTML opener and an echoed RESOLVE cannot authorize.
+        block = verdict_block("PRRT_1")
+        self._assert_no_resolve("note `\n<pre>\n``\n" + block)
+        self._assert_no_resolve("`\n<pre>\n``\n" + block)
+        self._assert_no_resolve("`foo\n<pre>\n``\n" + block)
+
+    def test_backticks_inside_type1_opener_do_not_authorize(self) -> None:
+        # CommonMark 4.6 type 1 starts at line-start `<pre` + space, even when
+        # backticks in the tag would confuse inline-code stripping.
+        block = verdict_block("PRRT_1")
+        self._assert_no_resolve("<pre title=`x`>\n" + block)
+        self._assert_no_resolve("<PRE class=`echo`>\n" + block)
+
+    def test_closed_html_comment_with_pre_line_still_resolves(self) -> None:
+        # Devin 4303959815: `_html_constructs_open` skips a closed comment, but
+        # the type-1 scan treated a `<pre` line inside it as an opener and
+        # made a later genuine RESOLVE AMBIGUOUS.
+        block = verdict_block("PRRT_1")
+        self._assert_resolves("<!--\n<pre title=`x`>\n-->\n" + block)
+        self._assert_resolves("<!--\n<pre title=`x`>\n-->\n\n" + block)
+        self._assert_no_resolve("<!--\n<pre title=`x`>\n" + block)
+        self._assert_no_resolve("<!-- note -->\n<pre title=`x`>\n" + block)
+
+    def test_codespan_comment_does_not_hide_type1_pre(self) -> None:
+        # Devin 4304211393: a code-span `<!--` is not a type-2 opener. Skipping
+        # it as a comment jumped to a later `-->` or returned False (unclosed)
+        # and hid a live type-1 `<pre title=`x`>`. Type 2–5 skips in the
+        # type-1 scan are line-start only. Scan path is parse_thread_verdicts
+        # → classify_resolve → scan.
+        block = verdict_block("PRRT_1")
+        self._assert_no_resolve("Use `<!--` here\n<pre title=`x`>\n" + block)
+        self._assert_no_resolve("Use `<!--` here\n<PRE class=`echo`>\n" + block)
+        self._assert_resolves("Use `<!--` here\n\n" + block)
+        self._assert_resolves("Use `<!--` here\n<pre title=`x`>\n</pre>\n\n" + block)
+
+    def test_quoted_declaration_does_not_hide_type1_pre(self) -> None:
+        # Devin 4304406180: type 4 ends at the first `>`; quote tracking
+        # skipped a live `<pre>` between `"x>` and `">`. Scan path is
+        # parse_thread_verdicts → classify_resolve → scan.
+        block = verdict_block("PRRT_1")
+        self._assert_no_resolve('<!DOCTYPE "x>\n<pre>\n">\n' + block)
+        self._assert_no_resolve("<!DOCTYPE html>\n<pre>\n" + block)
+        self._assert_resolves('<!DOCTYPE "x>\n">\n\n' + block)
+
+    def test_closed_multiline_type6_still_resolves(self) -> None:
+        # Devin 4304406239: a trailing empty prose line is the blank that
+        # ends type 6, so a closed `<div>`/`<hr>` before the verdict must
+        # still authorize. Scan path is parse_thread_verdicts →
+        # classify_resolve → scan.
+        block = verdict_block("PRRT_1")
+        self._assert_resolves("<div>\nFixed.\n</div>\n\n" + block)
+        self._assert_resolves("<hr>\ntext\n\n" + block)
+        self._assert_no_resolve("<div>\nFixed.\n</div>\n" + block)
 
     def test_escaped_fence_copy_does_not_resolve(self) -> None:
         self._assert_no_resolve("\\```\n" + verdict_block("PRRT_1") + "\\```\n")

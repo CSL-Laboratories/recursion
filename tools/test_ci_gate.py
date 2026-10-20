@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for tools/ci_gate.py path filtering and docs-only public-scope."""
+"""Unit tests for tools/ci_gate.py path classification, run_full and the lightweight checks."""
 from __future__ import annotations
 
 import importlib.util
@@ -204,6 +204,8 @@ class LightweightControlTests(unittest.TestCase):
             whitespace.assert_called_once_with()
             run_program.assert_called_once_with(["tools/check_public_scope.py"])
 
+    # decide_run_full no longer returns False (CSL-376); this pins main()'s
+    # handling of run_full=false, which ci.yml still treats fail-closed.
     def test_docs_only_main_runs_public_scope_not_suite(self) -> None:
         with mock.patch.object(ci_gate, "decide_run_full", return_value=False), mock.patch.object(
             ci_gate, "run_lightweight"

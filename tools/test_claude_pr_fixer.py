@@ -1224,6 +1224,23 @@ class ConflictJobStructureTests(unittest.TestCase):
         self.assertIn("CLAUDE_FIXER_PAUSE: ${{ vars.CLAUDE_FIXER_PAUSE }}", prep)
         self.assertLess(prep.index("CLAUDE_FIXER_PAUSE:-"), prep.index("git merge --no-ff --no-commit"))
 
+    def test_resolver_uses_fixed_helper_not_raw_gh_api(self) -> None:
+        job = self._job("conflict-resolve")
+        allow = job.split("--allowedTools", 1)[1].split("--disallowedTools", 1)[0]
+        self.assertNotIn("gh api", allow)
+        self.assertIn("Bash(python3 ${{ runner.temp }}/claude-fixer-guard/pre-push model-api --:*)", allow)
+        self.assertIn("Bash(gh api:*)", job.split("--disallowedTools", 1)[1].split('"', 2)[1])
+        prompt = job.split("prompt: |", 1)[1].split("claude_args:", 1)[0]
+        self.assertNotIn("gh api repos/", prompt)
+        self.assertNotIn("labels[]=", prompt)
+        self.assertIn("model-api -- comment BODY_FILE", prompt)
+        self.assertIn("model-api -- label", prompt)
+        self.assertIn(".claude-fixer-replies/NAME.txt", prompt)
+        guard = job.split("id: push_guard", 1)[1].split("      - id: claude", 1)[0]
+        self.assertIn("MODEL_API_LABEL: needs-decision", guard)
+        self.assertLess(job.index("id: prep"), job.index("id: push_guard"))
+        self.assertLess(job.index("id: push_guard"), job.index("      - id: claude"))
+
     def test_resolver_comments_or_labels(self) -> None:
         job = self._job("conflict-resolve")
         self.assertIn("merge commit SHA", job)

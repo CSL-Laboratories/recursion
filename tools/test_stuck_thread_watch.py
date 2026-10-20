@@ -2457,6 +2457,18 @@ class VerdictAndResolveTests(unittest.TestCase):
         self.assertEqual(mod.exit_code(counters), 1)
         self.assertEqual(gh.resolves, ["PRRT_2"])
 
+# Real Codex review comments captured from this repo with GitHub's REST
+# body_html (the same renderer as GraphQL bodyHTML), unedited:
+# https://github.com/CSL-Laboratories/recursion/pull/212#discussion_r4298169520
+REAL_CODEX_MISSING_BODY = '**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Propagate dependency-install failures**\n\nDevin is right: in a fresh cloud session where `jsonschema` is absent and `pip install` fails, `|| true` suppresses the failure, the script reaches `exit 0`, and the provider-free gate remains unrunnable. The minimal fix is `python3 -m pip install --quiet -r requirements-ci.txt || exit 1`; under the documented [SessionStart exit semantics](https://code.claude.com/docs/en/hooks#other-exit-codes), this reports a hook error while allowing the session itself to continue.\n\n<!-- codex-thread-verdict:PRRT_kwDOTuH3ps6tVW2j -->\nCODEX-THREAD: MISSING\nHEAD: 3bd77482e8b770d8d9546c9a8c8cd40c64c1b28f\n\nUseful? React with 👍\xa0/ 👎.\n\n<!-- codex-code-review-finding:v1 -->'
+REAL_CODEX_MISSING_HTML = '<p dir="auto"><strong><sub><sub><a target="_blank" rel="noopener noreferrer nofollow" href="https://camo.githubusercontent.com/f2c1aacb361ddd3a0e9f9cacdb84fab050de434017f6747bb916e31e29bdf03d/68747470733a2f2f696d672e736869656c64732e696f2f62616467652f50322d79656c6c6f773f7374796c653d666c6174"><img src="https://camo.githubusercontent.com/f2c1aacb361ddd3a0e9f9cacdb84fab050de434017f6747bb916e31e29bdf03d/68747470733a2f2f696d672e736869656c64732e696f2f62616467652f50322d79656c6c6f773f7374796c653d666c6174" alt="P2 Badge" data-canonical-src="https://img.shields.io/badge/P2-yellow?style=flat" style="max-width: 100%;"></a></sub></sub>  Propagate dependency-install failures</strong></p>\n<p dir="auto">Devin is right: in a fresh cloud session where <code class="notranslate">jsonschema</code> is absent and <code class="notranslate">pip install</code> fails, <code class="notranslate">|| true</code> suppresses the failure, the script reaches <code class="notranslate">exit 0</code>, and the provider-free gate remains unrunnable. The minimal fix is <code class="notranslate">python3 -m pip install --quiet -r requirements-ci.txt || exit 1</code>; under the documented <a href="https://code.claude.com/docs/en/hooks#other-exit-codes" rel="nofollow">SessionStart exit semantics</a>, this reports a hook error while allowing the session itself to continue.</p>\n\n<p dir="auto">CODEX-THREAD: MISSING<br>\nHEAD: 3bd77482e8b770d8d9546c9a8c8cd40c64c1b28f</p>\n<p dir="auto">Useful? React with 👍\xa0/ 👎.</p>\n'
+# https://github.com/CSL-Laboratories/recursion/pull/190#discussion_r4290997746 (ends with a CODEX-GATE line and the connector trailer)
+REAL_CODEX_DECIDE_BODY = '**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Gate permission bypass behind an explicit full-access profile**\n\nIf Claude is enabled and a user passes `--allow-live`, Devin is right that the documented argv unconditionally bypasses tool permission prompts; Anthropic’s [permission documentation](https://code.claude.com/docs/en/permissions) says this mode permits protected-path writes and should be used only in an isolated container or VM, while this harness explicitly says its private workspace is not a sandbox. The generic `--allow-live` switch neither selects a permission profile nor displays and records the required blast-radius acknowledgement. Claude is right only that the final profile design requires an owner decision: the minimal safe interim fix is to replace the bypass flag with fail-closed `--permission-mode dontAsk --permission-prompts none` (or disable live Claude execution), then expose bypass only through an explicitly acknowledged full-access profile. \n\n<!-- codex-thread-verdict:PRRT_kwDOTuH3ps6sojN- -->\nCODEX-THREAD: DECIDE\nHEAD: 16246a4021ae6feab99795451db484dc6594c273\n\nCODEX-GATE: MEDIATE\n\nAGENTS.md reference: [AGENTS.md:L164-L165](https://github.com/CSL-Laboratories/recursion/blob/76e57ce1efc0672661837b369b6e8e6e7331c5c4/AGENTS.md#L164-L165)\n\nUseful? React with 👍\xa0/ 👎.\n\n<!-- codex-code-review-finding:v1 -->'
+REAL_CODEX_DECIDE_HTML = '<p dir="auto"><strong><sub><sub><a target="_blank" rel="noopener noreferrer nofollow" href="https://camo.githubusercontent.com/c595229c0ecb6ee85b9c7804144d495f131a495ec87091fea2b262d954c9a92d/68747470733a2f2f696d672e736869656c64732e696f2f62616467652f50312d6f72616e67653f7374796c653d666c6174"><img src="https://camo.githubusercontent.com/c595229c0ecb6ee85b9c7804144d495f131a495ec87091fea2b262d954c9a92d/68747470733a2f2f696d672e736869656c64732e696f2f62616467652f50312d6f72616e67653f7374796c653d666c6174" alt="P1 Badge" data-canonical-src="https://img.shields.io/badge/P1-orange?style=flat" style="max-width: 100%;"></a></sub></sub>  Gate permission bypass behind an explicit full-access profile</strong></p>\n<p dir="auto">If Claude is enabled and a user passes <code class="notranslate">--allow-live</code>, Devin is right that the documented argv unconditionally bypasses tool permission prompts; Anthropic’s <a href="https://code.claude.com/docs/en/permissions" rel="nofollow">permission documentation</a> says this mode permits protected-path writes and should be used only in an isolated container or VM, while this harness explicitly says its private workspace is not a sandbox. The generic <code class="notranslate">--allow-live</code> switch neither selects a permission profile nor displays and records the required blast-radius acknowledgement. Claude is right only that the final profile design requires an owner decision: the minimal safe interim fix is to replace the bypass flag with fail-closed <code class="notranslate">--permission-mode dontAsk --permission-prompts none</code> (or disable live Claude execution), then expose bypass only through an explicitly acknowledged full-access profile.</p>\n\n<p dir="auto">CODEX-THREAD: DECIDE<br>\nHEAD: 16246a4021ae6feab99795451db484dc6594c273</p>\n<p dir="auto">CODEX-GATE: MEDIATE</p>\n<p dir="auto">AGENTS.md reference: <a href="https://github.com/CSL-Laboratories/recursion/blob/76e57ce1efc0672661837b369b6e8e6e7331c5c4/AGENTS.md#L164-L165">AGENTS.md:L164-L165</a></p>\n<p dir="auto">Useful? React with 👍\xa0/ 👎.</p>\n'
+REAL_MISSING_SHA = "3bd77482e8b770d8d9546c9a8c8cd40c64c1b28f"
+REAL_DECIDE_SHA = "16246a4021ae6feab99795451db484dc6594c273"
+
+
 class RenderedGateTests(unittest.TestCase):
     """Auto-resolve needs GitHub's rendering to show the ruling top-level."""
 
@@ -2588,6 +2600,115 @@ class RenderedGateTests(unittest.TestCase):
             with self.subTest(html_text=html_text):
                 parsed = mod.parse_thread_verdicts(self._ruling(body, html_text))
                 self.assertFalse(any(v.rendered for v in parsed), html_text)
+
+    def test_real_codex_rulings_parse_and_pass_the_render_gate(self) -> None:
+        # Real connector output: verdict section followed by its own trailer.
+        for body, html_text, tid, action, sha in (
+            (REAL_CODEX_MISSING_BODY, REAL_CODEX_MISSING_HTML, "PRRT_kwDOTuH3ps6tVW2j", "MISSING", REAL_MISSING_SHA),
+            (REAL_CODEX_DECIDE_BODY, REAL_CODEX_DECIDE_HTML, "PRRT_kwDOTuH3ps6sojN-", "DECIDE", REAL_DECIDE_SHA),
+        ):
+            with self.subTest(action=action):
+                parsed = mod.parse_thread_verdicts(self._ruling(body, html_text))
+                self.assertEqual([(v.thread_id, v.action, v.head_sha) for v in parsed], [(tid, action, sha)])
+                self.assertTrue(parsed[0].rendered, parsed[0].render_problem)
+
+    def test_real_codex_shape_with_resolve_auto_resolves(self) -> None:
+        # Same real bytes with the ruling switched to RESOLVE on the live head.
+        body = REAL_CODEX_MISSING_BODY.replace("MISSING", "RESOLVE").replace(REAL_MISSING_SHA, HEAD)
+        html_text = REAL_CODEX_MISSING_HTML.replace("MISSING", "RESOLVE").replace(REAL_MISSING_SHA, HEAD)
+        tid = "PRRT_kwDOTuH3ps6tVW2j"
+        t = thread(tid=tid, comments=stuck_pair())
+        asked = [comment("pat-user", mod.mediation_marker(tid), hours_ago=0.4)]
+        ruling = mod.Comment(login=CODEX, body=body, created_at=ts(0.1), body_html=html_text)
+        p = pull(threads=[t], issue_comments=asked, reviews=[ruling], checks_green=True)
+        self.assertEqual(mod.classify_resolve(p, t, cfg(mediator_login="pat-user")), "resolve")
+        gh = FakeGitHub([p])
+        counters = mod.scan(cfg(mediator_login="pat-user"), gh, FakeLinear())  # type: ignore[arg-type]
+        self.assertEqual(gh.resolves, [tid])
+        self.assertEqual(counters.resolved, 1)
+
+    def test_only_the_exact_connector_trailer_may_follow_the_section(self) -> None:
+        base = verdict_block("PRRT_1") + "\n"
+        ok_trailers = (
+            "Useful? React with 👍 / 👎.\n\n<!-- codex-code-review-finding:v1 -->\n",
+            "Useful? React with 👍\u00a0/ 👎.\n\n<!-- codex-code-review-finding:v1 -->",
+            "CODEX-GATE: MEDIATE\n\nAGENTS.md reference: [AGENTS.md:L164-L165]"
+            f"(https://github.com/CSL-Laboratories/recursion/blob/{HEAD}/AGENTS.md#L164-L165)\n\n"
+            "Useful? React with 👍 / 👎.\n",
+        )
+        for trailer in ok_trailers:
+            with self.subTest(trailer=trailer):
+                parsed = mod.parse_thread_verdicts(comment(CODEX, base + trailer, hours_ago=0.1))
+                self.assertEqual([(v.action, v.head_sha) for v in parsed], [("RESOLVE", HEAD)])
+        for trailer in (
+            "Useful? React with 👍 / 👎. Also fixed.\n",
+            "Thanks!\n",
+            "<!-- codex-code-review-finding:v1 -->\n<pre>\n",
+            "Useful? React with 👍 / 👎.\n\n" + verdict_block("PRRT_2"),
+            "AGENTS.md reference: [AGENTS.md:L1](https://example.com/AGENTS.md#L1)\n",
+            "CODEX-GATE: READY\nCODEX-GATE: READY\n",
+        ):
+            with self.subTest(trailer=trailer):
+                self._assert_trailer_blocks(base + trailer)
+        # Trailer lines never split the section.
+        split = verdict_block("PRRT_1") + "\nUseful? React with 👍 / 👎.\n\n" + verdict_block("PRRT_2")
+        self._assert_trailer_blocks(split)
+
+    def _assert_trailer_blocks(self, body: str) -> None:
+        parsed = mod.parse_thread_verdicts(comment(CODEX, body, hours_ago=0.1))
+        self.assertTrue(parsed, body)
+        self.assertNotIn("RESOLVE", {v.action for v in parsed if v.thread_id == "PRRT_1" and v.rendered}, body)
+        self.assertTrue(all(not (v.action == "RESOLVE" and v.rendered) for v in parsed), body)
+
+    def test_non_void_self_closing_tags_stay_open_on_the_scan_path(self) -> None:
+        block = verdict_block("PRRT_1")
+        hostile = (
+            ("<pre/>\n", f"<pre>CODEX-THREAD: RESOLVE\nHEAD: {HEAD}</pre>\n"),
+            ("<details/>\n", f"<details>\nCODEX-THREAD: RESOLVE\nHEAD: {HEAD}</details>\n"),
+            ("<pre/>\n\n", f"<pre>\n" + self.RULING + "</pre>\n"),
+            ("<details/>\n\n", "<details>\n" + self.RULING + "</details>\n"),
+        )
+        for prose, html_text in hostile:
+            # Source parser alone (no render), then with a realistic render.
+            for render in (None, html_text):
+                with self.subTest(prose=prose, render=render is not None):
+                    body = prose + block
+                    parsed = mod.parse_thread_verdicts(self._ruling(body, render))
+                    self.assertEqual([(v.action, v.head_sha) for v in parsed], [("AMBIGUOUS", "")], body)
+                    reason, gh = self._classify(self._ruling(body, render))
+                    self.assertEqual(reason, "ambiguous", body)
+                    self.assertEqual(gh.resolves, [], body)
+                    self.assertEqual(gh.replies, [], body)
+        controls = (
+            ("<pre></pre>\n\n", "<pre></pre>\n" + self.RULING),
+            ("<details></details>\n\n", "<details></details>\n" + self.RULING),
+            ("Line one<br/>\n\n", '<p dir="auto">Line one<br></p>\n' + self.RULING),
+        )
+        for prose, html_text in controls:
+            with self.subTest(control=prose):
+                body = prose + block
+                self.assertEqual(
+                    [(v.action, v.head_sha) for v in mod.parse_thread_verdicts(self._ruling(body, None))],
+                    [("RESOLVE", HEAD)],
+                )
+                reason, gh = self._classify(self._ruling(body, html_text))
+                self.assertEqual(reason, "resolve", body)
+                self.assertEqual(gh.resolves, ["PRRT_1"], body)
+
+    def test_render_unverified_is_counted_and_announced(self) -> None:
+        t = thread(tid="PRRT_1", comments=stuck_pair())
+        asked = [comment("pat-user", mod.mediation_marker("PRRT_1"), hours_ago=0.4)]
+        ruling = self._ruling(verdict_block("PRRT_1"), None)
+        p = pull(threads=[t], issue_comments=asked, reviews=[ruling], checks_green=True)
+        gh = FakeGitHub([p])
+        with mock.patch.object(mod, "notice") as notice:
+            counters = mod.scan(cfg(mediator_login="pat-user"), gh, FakeLinear())  # type: ignore[arg-type]
+        self.assertEqual(counters.skipped_render, 1)
+        self.assertEqual(gh.resolves, [])
+        self.assertTrue(
+            any("rendered verdict unverified: missing-render" in str(c) for c in notice.call_args_list),
+            notice.call_args_list,
+        )
 
     def test_graphql_fetches_and_parses_body_html(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")

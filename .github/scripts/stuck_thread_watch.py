@@ -97,6 +97,17 @@ HTML_TYPE6_START_RE = re.compile(
 # The Code Review Rules gate line, as scripts/ci/codex_gate.py parses it. The
 # verdict section may end with one; it never authorizes anything here.
 GATE_LINE_RE = re.compile(r" {0,3}CODEX-GATE:\s*(FIX|READY|MEDIATE)\s*")
+# Lines the Codex GitHub connector appends after the model's text. The model
+# cannot suppress them, so they may follow the verdict section (exact forms
+# only, observed on real Codex review comments in this repo).
+CODEX_TRAILER_RES = (
+    re.compile("Useful\\? React with 👍[ \u00a0]/ 👎\\."),  # the connector uses U+00A0
+    re.compile(r"<!-- codex-code-review-finding:v\d+ -->"),
+    re.compile(
+        r"(?P<doc>[\w.-]+\.md) reference: \[(?P=doc):L\d+(?:-L\d+)?\]"
+        r"\(https://github\.com/[\w.-]+/[\w.-]+/blob/[0-9a-f]{40}/(?P=doc)#L\d+(?:-L\d+)?\)"
+    ),
+)
 VERDICT_ACTION_RE = re.compile(
     r"^CODEX-THREAD:\s*(RESOLVE|DECIDE|MISSING|AMBIGUOUS)\s*$",
     re.IGNORECASE | re.MULTILINE,
@@ -331,6 +342,8 @@ class ThreadVerdict:
     # True only if GitHub's rendered HTML shows this section as top-level
     # paragraphs (see rendered_verdicts_ok). Required before auto-resolve.
     rendered: bool = False
+    # Why the render check failed, for the run log ("" when it passed).
+    render_problem: str = ""
 
 
 @dataclass(frozen=True)
@@ -710,10 +723,12 @@ def _html_constructs_open(visible: str) -> bool:
                 and _type6_continues_to_eof(visible, lt)
             ):
                 return True
-            if empty or name in HTML_VOID_TAGS:
+            if name in HTML_VOID_TAGS:
                 index = end
                 continue
             if not close:
+                # HTML ignores ``/>`` on a non-void element (``<pre/>``,
+                # ``<details/>``): it stays open around what follows.
                 stack.append(name)
             elif not stack or stack[-1] != name:
                 return True
@@ -922,9 +937,17 @@ def _verdict_section(lines: list[str]) -> list[tuple[str, str, str]] | None:
 
     The section is one or more contiguous marker / action / HEAD triples,
     separated by blank lines only, running to the end of the message. After
-    the last triple it may carry exactly one ``CODEX-GATE:`` line, followed by
-    blank lines only.
+    the last triple it may carry exactly one ``CODEX-GATE:`` line. Only blank
+    lines and the Codex connector's own trailer lines (``CODEX_TRAILER_RES``)
+    may follow.
     """
+
+    def trailer_only(rest: list[str]) -> bool:
+        return all(
+            not line.strip() or any(r.fullmatch(line.rstrip()) for r in CODEX_TRAILER_RES)
+            for line in rest
+        )
+
     blocks: list[tuple[str, str, str]] = []
     index = 0
     while index < len(lines):
@@ -932,8 +955,9 @@ def _verdict_section(lines: list[str]) -> list[tuple[str, str, str]] | None:
             index += 1
             continue
         if blocks and GATE_LINE_RE.fullmatch(lines[index].rstrip()):
-            rest = lines[index + 1:]
-            return blocks if all(not line.strip() for line in rest) else None
+            return blocks if trailer_only(lines[index + 1:]) else None
+        if blocks and trailer_only(lines[index:]):
+            return blocks
         triple = [line.rstrip() for line in lines[index:index + 3]]
         if len(triple) < 3:
             return None
@@ -1011,7 +1035,12 @@ class _RenderedVerdictScan(HTMLParser):
 
 
 def rendered_verdicts_ok(comment: Comment, blocks: list[tuple[str, str, str]]) -> bool:
-    """True if GitHub rendered exactly this verdict section as top-level text.
+    """True if GitHub rendered exactly this verdict section as top-level text."""
+    return not rendered_verdict_problem(comment, blocks)
+
+
+def rendered_verdict_problem(comment: Comment, blocks: list[tuple[str, str, str]]) -> str:
+    """Empty if GitHub rendered exactly this verdict section as top-level text.
 
     The source parser approximates CommonMark plus HTML5; GitHub's renderer is
     the authority on what a reader sees. Require every ``CODEX-THREAD:`` in the
@@ -1021,26 +1050,37 @@ def rendered_verdicts_ok(comment: Comment, blocks: list[tuple[str, str, str]]) -
     the last one may also carry the ``CODEX-GATE:`` line when no blank line
     separates it. A ruling swallowed by an open element, comment or raw-text
     block, or an extra rendered ruling, fails closed. A missing render fails
-    closed.
+    closed. The thread id is not checked here: it lives in the marker comment,
+    which GitHub strips, and the source section binds it. The count is
+    case-insensitive, so a lowercase ``codex-thread:`` in prose only costs
+    liveness. Returns a short reason for the run log.
     """
     html = comment.body_html
-    if not isinstance(html, str) or not blocks:
-        return False
+    if not blocks:
+        return "no-section"
+    if not isinstance(html, str) or not html.strip():
+        return "missing-render"
     scan = _RenderedVerdictScan()
     try:
         scan.feed(html)
         scan.close()
     except Exception:  # noqa: BLE001 — unparseable render is not proof
-        return False
+        return "unparseable-render"
     if scan.broken or scan.stack:
-        return False
+        return "malformed-render"
     if len(VERDICT_LINE_TEXT_RE.findall(comment.body or "")) != len(blocks):
-        return False
-    if len(scan.hits) != len(blocks) or None in scan.hits or len(set(scan.hits)) != len(blocks):
-        return False
+        return "source-count"
+    if len(scan.hits) != len(blocks):
+        return "rendered-count"
+    if None in scan.hits:
+        return "not-top-level"
+    if len(set(scan.hits)) != len(blocks):
+        return "shared-paragraph"
     for position, ((_tid, action, head_sha), index) in enumerate(zip(blocks, scan.hits)):
-        if index is None or index in scan.decorated:
-            return False
+        if index is None:
+            return "not-top-level"
+        if index in scan.decorated:
+            return "decorated"
         lines = [line.strip() for line in "".join(scan.paragraphs[index]).split("\n")]
         lines = [line for line in lines if line]
         if (
@@ -1050,14 +1090,14 @@ def rendered_verdicts_ok(comment: Comment, blocks: list[tuple[str, str, str]]) -
         ):
             lines = lines[:2]
         if len(lines) != 2:
-            return False
+            return "paragraph-shape"
         rendered_action = VERDICT_ACTION_RE.fullmatch(lines[0])
         rendered_head = RENDERED_HEAD_RE.fullmatch(lines[1])
         if not rendered_action or rendered_action.group(1).upper() != action:
-            return False
+            return "action-mismatch"
         if not rendered_head or not head_sha.startswith(rendered_head.group(1).lower()):
-            return False
-    return True
+            return "head-mismatch"
+    return ""
 
 
 def parse_thread_verdicts(comment: Comment) -> tuple[ThreadVerdict, ...]:
@@ -1068,7 +1108,7 @@ def parse_thread_verdicts(comment: Comment) -> tuple[ThreadVerdict, ...]:
     precede it unless that prose leaves a fence or HTML construct open, or
     holds a ``CODEX-GATE:`` line, which belongs after the section. From
     that line to the end the message must be exactly the canonical verdict
-    section (see ``_verdict_section``). Any other line there -- prose, HTML,
+    section plus, at most, the Codex connector trailer (see ``_verdict_section``). Any other line there -- prose, HTML,
     quotes, fences, bullets, a split or repeated block -- makes the whole
     message non-authorizing: every thread id it mentions gets an AMBIGUOUS
     barrier so it cannot leave an earlier RESOLVE standing. A message with no
@@ -1086,7 +1126,7 @@ def parse_thread_verdicts(comment: Comment) -> tuple[ThreadVerdict, ...]:
         return ()
 
     def verdict(
-        thread_id: str, action: str, head_sha: str, text: str, rendered: bool = False
+        thread_id: str, action: str, head_sha: str, text: str, problem: str = "no-section"
     ) -> ThreadVerdict:
         return ThreadVerdict(
             thread_id=thread_id,
@@ -1096,7 +1136,8 @@ def parse_thread_verdicts(comment: Comment) -> tuple[ThreadVerdict, ...]:
             login=comment.login,
             source_commit=normalize_sha(comment.commit_sha),
             body=text,
-            rendered=rendered,
+            rendered=not problem,
+            render_problem=problem,
         )
 
     prose = lines[:first]
@@ -1110,7 +1151,7 @@ def parse_thread_verdicts(comment: Comment) -> tuple[ThreadVerdict, ...]:
             str(m.group("tid") or "").strip() for m in VERDICT_MARKER_RE.finditer(body)
         )
         return tuple(verdict(tid, "AMBIGUOUS", "", body) for tid in mentioned if tid)
-    rendered = rendered_verdicts_ok(comment, blocks)
+    problem = rendered_verdict_problem(comment, blocks)
     rulings: dict[str, tuple[str, str]] = {}
     for thread_id, action, head_sha in blocks:
         previous = rulings.setdefault(thread_id, (action, head_sha))
@@ -1118,7 +1159,7 @@ def parse_thread_verdicts(comment: Comment) -> tuple[ThreadVerdict, ...]:
             # Dropping a conflicting duplicate would revive an earlier RESOLVE.
             rulings[thread_id] = ("AMBIGUOUS", "")
     return tuple(
-        verdict(tid, action, head_sha, f"CODEX-THREAD: {action}\nHEAD: {head_sha}", rendered)
+        verdict(tid, action, head_sha, f"CODEX-THREAD: {action}\nHEAD: {head_sha}", problem)
         for tid, (action, head_sha) in rulings.items()
     )
 
@@ -2391,6 +2432,7 @@ class Counters:
     skipped_resolve_cap: int = 0
     skipped_stale: int = 0
     skipped_checks: int = 0
+    skipped_render: int = 0
     skipped_pat: int = 0
     skipped_login: int = 0
     comment_failed: int = 0
@@ -2937,7 +2979,15 @@ def scan(
                 log(f"skip (required checks): PR #{pull.number} {thread.id}")
                 continue
             if reason == "render-unverified":
-                log(f"skip (rendered verdict unverified): PR #{pull.number} {thread.id}")
+                # Visible in the run annotations: a GitHub markup change would
+                # otherwise silently stop every auto-resolve.
+                counters.skipped_render += 1
+                verdict = latest_thread_verdict(thread.id, pull_verdict_comments(pull), cfg)
+                problem = verdict.render_problem if verdict else "no-verdict"
+                notice(
+                    f"auto-resolve skipped (rendered verdict unverified: {problem}): "
+                    f"PR #{pull.number} {thread.id}"
+                )
                 continue
             if reason not in {"resolve", "retry-resolve"}:
                 continue
@@ -3015,6 +3065,7 @@ def scan(
         f"mediated={counters.mediated} resolved={counters.resolved} "
         f"cap={counters.skipped_cap} resolve_cap={counters.skipped_resolve_cap} "
         f"stale={counters.skipped_stale} checks={counters.skipped_checks} "
+        f"render={counters.skipped_render} "
         f"failed={counters.comment_failed} resolve_failed={counters.resolve_failed} "
         f"login_skip={counters.skipped_login} "
         f"linear={counters.linear} labeled={counters.labeled}"

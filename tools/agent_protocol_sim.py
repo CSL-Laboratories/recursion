@@ -1219,8 +1219,9 @@ class Evaluation:
                 k: {key: value for key, value in v.items() if key not in {"answered_at", "held_from", "answers"}}
                 for k, v in decisions.items()
             },
-            # Sorted so the same snapshot in any comment order gives the same output.
-            "violations": sorted(self.violations, key=lambda v: (v["code"], v["issue"] or "", v["claim"] or "", v["detail"])),
+            # Sorted so the list itself does not depend on comment order; ids are
+            # compared as text because snapshot ids are not all type-checked.
+            "violations": sorted(self.violations, key=lambda v: tuple(str(v[k] or "") for k in ("code", "issue", "claim", "detail"))),
             "void_lines": self.void_lines,
         }
 

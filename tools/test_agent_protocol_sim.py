@@ -298,6 +298,12 @@ class LeaseTests(unittest.TestCase):
         backward = sim.evaluate(snapshot(170, [issue("CSL-1")], comments[::-1]))["violations"]
         self.assertEqual(forward, backward)
 
+    def test_sorting_tolerates_mixed_id_types(self):
+        writes = [{"kind": "push", "issue": "CSL-1", "claim": 5, "at": ts(5)},
+                  {"kind": "push", "issue": "CSL-1", "claim": "zz", "at": ts(5)}]
+        result = sim.evaluate(snapshot(10, [issue("CSL-1")], [], writes=writes))
+        self.assertEqual(codes(result), ["write_without_claim", "write_without_claim"])
+
     def test_withdrawn_refused_takeover_is_not_reported(self):
         early = self.takeover(at=125)
         early["edits"].append({"at": ts(127), "body": early["edits"][0]["body"] + "\nwithdrawn: lease not over"})

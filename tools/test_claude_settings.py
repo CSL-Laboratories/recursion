@@ -46,6 +46,8 @@ SUBSTITUTIONS = (
     "gh pr view `id`",
     "python3 -m unittest $(cat targets)",
     "python3 -X utf8 -B tools/test_x.py <(echo x)",
+    "python3 -m unittest >(id)",
+    "gh pr view 1 >(id)",
     "actionlint $((1+1))",
 )
 PLAIN = (
@@ -115,7 +117,8 @@ class GuardTests(unittest.TestCase):
 
     def test_escaped_json_forms_also_force_a_prompt(self):
         for raw in ('{"tool_input":{"command":"gh pr view \\u0060id\\u0060"}}',
-                    '{"tool_input":{"command":"actionlint \\u003c(echo x)"}}'):
+                    '{"tool_input":{"command":"actionlint \\u003c(echo x)"}}',
+                    '{"tool_input":{"command":"actionlint \\u003e(id)"}}'):
             with self.subTest(raw=raw):
                 self.assert_asks(raw)
 

@@ -161,7 +161,21 @@ class Comment:
 
     @property
     def agent(self) -> tuple[str, str] | None:
-        return agent_header(self.body)
+        """The agent header, if any revision carried one.
+
+        A comment that ever had the agent prefix stays an agent comment, so an
+        edit that removes the prefix cannot turn its lines into human
+        directives. `prefix_changed` reports the edit.
+        """
+        for revision in self.revisions:
+            header = agent_header(revision.body)
+            if header is not None:
+                return header
+        return None
+
+    @property
+    def prefix_changed(self) -> bool:
+        return len({agent_header(r.body) is None for r in self.revisions}) > 1
 
     def last_update(self, at: datetime) -> datetime:
         return max(r.at for r in self.revisions if r.at <= at)
@@ -188,7 +202,14 @@ class Claim:
         return None
 
     def confirmed_at(self) -> datetime | None:
-        return self._first_revision(lambda f: bool(TIMESTAMP_VALUE.match(f.get("confirmed-at", ""))))
+        """When the claim counts as confirmed: the later of the edit that set
+        `confirmed-at` and the time it declares. An edit cannot backdate a
+        confirmation, and a declared future time is not reached early."""
+        for revision in self.comment.revisions:
+            value = claim_fields(revision.body).get("confirmed-at", "")
+            if TIMESTAMP_VALUE.match(value):
+                return max(revision.at, parse_ts(value, f"claim {self.uuid}: confirmed-at"))
+        return None
 
     def released_at(self) -> datetime | None:
         return self._first_revision(lambda f: f.get("_released", False))
@@ -588,6 +609,8 @@ class Evaluation:
             match = DECISION.match(line)
             if match:
                 pairs.append((comment.issue, match.group(1), line))
+        # A batched answer is the comment's first line. In an agent comment the
+        # first line is the agent prefix, so the batch (to be voided) is line 1.
         first = lines[1] if comment.agent is not None and len(lines) > 1 else lines[0]
         if BATCH.fullmatch(first):
             named = [m.groups() for clause in first.split(";") if (m := BATCH_PAIR.match(clause.strip()))]
@@ -604,7 +627,7 @@ class Evaluation:
     def decisions(self) -> dict[str, dict[str, Any]]:
         stated: list[tuple[Comment, list[tuple[str, str, str]]]] = []
         for comment in sorted(self.comments, key=lambda c: (c.created_at, c.id)):
-            if comment.deleted:
+            if comment.deleted and comment.deleted_at is None:
                 continue
             original = self.answer_pairs(comment, comment.revisions[0].body)
             if comment.agent is not None:
@@ -619,7 +642,7 @@ class Evaluation:
             spec = issue["decision"]
             if spec is None:
                 continue
-            answer = None
+            answers = []
             needs_followup = False
             for comment, pairs in stated:
                 for named, value, _ in pairs:
@@ -627,8 +650,11 @@ class Evaluation:
                         continue
                     if value not in spec["options"]:
                         needs_followup = True
-                    elif answer is None:
-                        answer = {"option": value, "comment": comment.id, "at": comment.created_at}
+                    else:
+                        answers.append(
+                            {"option": value, "comment": comment.id, "at": comment.created_at, "until": comment.deleted_at}
+                        )
+            answer = self.answer_at({"answers": answers}, self.now)
             first_ping = spec["pings"][0] if spec["pings"] else None
             if first_ping is not None and any(t > first_ping for t in spec["options_changed_at"]):
                 self.violation("options_changed_after_ping", issue_id)
@@ -645,12 +671,19 @@ class Evaluation:
                 "answer": answer["option"] if answer else None,
                 "answer_comment": answer["comment"] if answer else None,
                 "answered_at": answer["at"] if answer else None,
+                "answers": answers,
                 "held_from": first_ping,
                 "needs_followup": needs_followup and answer is None,
                 "deadline_passed": deadline_passed,
                 "reping_allowed": deadline_passed and not repings,
             }
         return results
+
+    @staticmethod
+    def answer_at(state: dict[str, Any], at: datetime) -> dict[str, Any] | None:
+        """The earliest answer in effect at `at` (posted, and not yet deleted)."""
+        live = [a for a in state["answers"] if a["at"] <= at and (a["until"] is None or at < a["until"])]
+        return min(live, key=lambda a: (a["at"], a["comment"])) if live else None
 
     def held_at(self, issue_id: str, at: datetime) -> list[str]:
         """Reasons the issue is held at `at`.
@@ -667,7 +700,7 @@ class Evaluation:
                     reasons.append(f"blocked by {blocker}")
                 continue
             started = state["held_from"] is None or state["held_from"] <= at
-            cleared = state["answered_at"] is not None and state["answered_at"] <= at
+            cleared = self.answer_at(state, at) is not None
             if started and not cleared:
                 reasons.append(f"awaiting decision {blocker}")
         for comment in self.comments:
@@ -730,6 +763,7 @@ class Evaluation:
         used, so text edited in later does not authorise earlier actions.
         """
         homes: dict[str, list[Comment]] = {}
+        starts: dict[tuple[str, str], datetime] = {}
         revoked: dict[str, datetime] = {}
         home = self.config["standing_approvals_issue"]
         for comment in self.comments:
@@ -757,12 +791,19 @@ class Evaluation:
                     continue
                 known = homes.setdefault(approval.sa, [])
                 if comment not in known:
-                    if any(not c.deleted for c in known):
-                        raise SnapshotError(f"standing approval {approval.sa}: defined in two comments")
                     known.append(comment)
+                    starts[(approval.sa, comment.id)] = revision.at
                 limit = (comment.created_at + timedelta(days=self.config["sa_max_days"])).date()
                 if approval.expires.date() > limit:
                     self.violation("sa_too_long", detail=f"{approval.sa} at {revision.at.isoformat()}")
+        for sa_id, comments in homes.items():
+            # Definitions may follow each other (an old one deleted, a new one
+            # posted later) but may not overlap; compare their live intervals
+            # so the result does not depend on snapshot order.
+            spans = sorted((starts[(sa_id, c.id)], c.id, c.deleted_at) for c in comments)
+            for (_, _, end), (next_start, _, _) in zip(spans, spans[1:]):
+                if end is None or next_start < end:
+                    raise SnapshotError(f"standing approval {sa_id}: defined in two comments at once")
         for _, line, seen in self.directive_lines(home):
             match = REVOKE_SA.match(line)
             if match:
@@ -774,7 +815,14 @@ class Evaluation:
         if comment.deleted and (comment.deleted_at is None or comment.deleted_at <= at):
             return None
         effective = [r for r in comment.revisions if r.at <= at]
-        return self.parse_approval(comment, effective[-1]) if effective else None
+        if not effective:
+            return None
+        try:
+            return self.parse_approval(comment, effective[-1])
+        except SnapshotError:
+            # A malformed draft that was later corrected authorises nothing;
+            # a malformed final revision already failed in standing_approvals.
+            return None
 
     def check_sa_actions(self) -> None:
         homes, revoked = self.standing_approvals()
@@ -936,15 +984,19 @@ class Evaluation:
         for issue_id, issue in self.issues.items():
             for blocker in issue["blocked_by"]:
                 state = decisions.get(blocker)
-                if not state or not state["answered"]:
+                if not state:
                     continue
                 for claim in self.claims.values():
                     confirmed = claim.confirmed_at()
-                    if claim.issue != issue_id or confirmed is None or confirmed < state["answered_at"]:
+                    if claim.issue != issue_id or confirmed is None:
                         continue
-                    expected = (state["answer_comment"], state["answer"])
+                    answer = self.answer_at(state, confirmed)
+                    if answer is None:
+                        continue
+                    expected = (answer["comment"], answer["option"])
                     recorded = any(
-                        c.issue == blocker and c.agent is not None and not c.deleted
+                        c.issue == blocker and c.agent is not None
+                        and not (c.deleted and (c.deleted_at is None or c.deleted_at <= confirmed))
                         and any(
                             (m := DECISION_RECORD.match(line.strip())) and m.groups() == expected
                             for line in next((r.body for r in reversed(c.revisions) if r.at <= confirmed), "").split("\n")
@@ -969,6 +1021,9 @@ class Evaluation:
         decisions = self._decisions = self.decisions()
         held = {issue_id: self.held_at(issue_id, self.now) for issue_id in self.issues}
         self.collect_void_lines()
+        for comment in self.comments:
+            if comment.prefix_changed:
+                self.violation("comment_prefix_changed", comment.issue, detail=comment.id)
         self.check_claims()
         self.check_writes()
         self.check_commits()
@@ -1004,7 +1059,7 @@ class Evaluation:
         return {
             "issues": issues,
             "decisions": {
-                k: {key: value for key, value in v.items() if key not in {"answered_at", "held_from"}}
+                k: {key: value for key, value in v.items() if key not in {"answered_at", "held_from", "answers"}}
                 for k, v in decisions.items()
             },
             "violations": self.violations,

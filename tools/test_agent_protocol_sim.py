@@ -147,6 +147,20 @@ class ClaimingTests(unittest.TestCase):
                                        writes=[{"kind": "push", "issue": "CSL-1", "claim": U1, "at": ts(0, 30)}]))
         self.assertEqual(codes(result), ["write_before_confirm"])
 
+    def test_declared_future_confirmation_is_not_reached_early(self):
+        early = claim("c1", "CSL-1", U1, confirm_after=None,
+                      more_edits=[{"at": ts(2), "body": claim_body(U1, confirmed=ts(9))}])
+        writes = [{"kind": "push", "issue": "CSL-1", "claim": U1, "at": ts(3)}]
+        result = sim.evaluate(snapshot(10, [issue("CSL-1")], [early], writes=writes))
+        self.assertEqual(codes(result), ["write_before_confirm"])
+
+    def test_backdated_confirmation_counts_from_the_edit(self):
+        backdated = claim("c1", "CSL-1", U1, confirm_after=None,
+                          more_edits=[{"at": ts(5), "body": claim_body(U1, confirmed=ts(0, 1))}])
+        writes = [{"kind": "push", "issue": "CSL-1", "claim": U1, "at": ts(3)}]
+        result = sim.evaluate(snapshot(10, [issue("CSL-1")], [backdated], writes=writes))
+        self.assertEqual(codes(result), ["write_before_confirm"])
+
     def test_confirm_before_read_back_window(self):
         result = sim.evaluate(snapshot(10, [issue("CSL-1")], [claim("c1", "CSL-1", U1, confirm_after=20)]))
         self.assertEqual(codes(result), ["confirmed_too_early"])
@@ -520,6 +534,32 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(codes(result), [])
         self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["live_claims"], [])
 
+    def test_deleted_decision_keeps_effect_until_deletion(self):
+        issues = [issue("CSL-1", blocked_by=["CSL-2"]), issue("CSL-2", decision=decision())]
+        answer = comment("h1", "CSL-2", 5, "DECISION: B", deleted=True)
+        answer["deleted_at"] = ts(30)
+        record = comment("r1", "CSL-2", 9, "Agent (claude/s1, for Lucas): noted\ndecision-record: h1 B")
+        writes = [{"kind": "push", "issue": "CSL-1", "claim": U1, "at": ts(20)}]
+        result = sim.evaluate(snapshot(40, issues, [answer, record, claim("c1", "CSL-1", U1, at=10)], writes=writes))
+        self.assertEqual(codes(result), [])
+        self.assertTrue(result["issues"]["CSL-1"]["held"])
+        self.assertFalse(result["decisions"]["CSL-2"]["answered"])
+
+    def test_decision_record_deleted_after_confirm_still_counts(self):
+        issues = [issue("CSL-1", blocked_by=["CSL-2"]), issue("CSL-2", decision=decision())]
+        record = comment("r1", "CSL-2", 9, "Agent (claude/s1, for Lucas): noted\ndecision-record: h1 B", deleted=True)
+        record["deleted_at"] = ts(30)
+        comments = [comment("h1", "CSL-2", 5, "DECISION: B"), record, claim("c1", "CSL-1", U1, at=10)]
+        self.assertEqual(codes(sim.evaluate(snapshot(40, issues, comments))), [])
+
+    def test_removing_the_agent_prefix_does_not_make_lines_human(self):
+        forged = comment("a1", "CSL-1", 5, "Agent (grok/s9, for Lucas): note")
+        forged["edits"] = [{"at": ts(6), "body": f"note\nREVOKE CLAIM {U1}\nHOLD CSL-1"}]
+        result = sim.evaluate(snapshot(10, [issue("CSL-1")], [claim("c1", "CSL-1", U1), forged]))
+        self.assertEqual(codes(result), ["comment_prefix_changed"])
+        self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], U1)
+        self.assertFalse(result["issues"]["CSL-1"]["held"])
+
     def test_human_hold_widens_the_hold(self):
         result = sim.evaluate(snapshot(10, [issue("CSL-1"), issue("CSL-5")], [comment("h1", "CSL-5", 1, "HOLD CSL-1")]))
         self.assertTrue(result["issues"]["CSL-1"]["held"])
@@ -624,6 +664,22 @@ class StandingApprovalTests(unittest.TestCase):
         result = sim.evaluate(snapshot(600, [issue("CSL-90")], [narrow], config=self.CONFIG,
                                        sa_actions=[self.action(10, action="label"), self.action(60, action="label")]))
         self.assertEqual(codes(result), ["sa_out_of_scope"])
+
+    def test_replacement_approval_is_order_independent(self):
+        old = self.approval("h1", at=0, limits="per_day=5")
+        old.update(deleted=True, deleted_at=ts(20))
+        replacement = self.approval("h2", at=30, limits="per_day=5")
+        for comments in ([old, replacement], [replacement, old]):
+            with self.subTest(order=[c["id"] for c in comments]):
+                result = sim.evaluate(snapshot(600, [issue("CSL-90")], comments, config=self.CONFIG,
+                                               sa_actions=[self.action(10), self.action(25), self.action(60 * 6)]))
+                self.assertEqual(codes(result), ["sa_unknown"])
+
+    def test_overlapping_approval_definitions_fail_closed(self):
+        for comments in ([self.approval("h1", at=0), self.approval("h2", at=30)],
+                         [self.approval("h2", at=30), self.approval("h1", at=0)]):
+            with self.assertRaises(sim.SnapshotError):
+                sim.evaluate(snapshot(600, [issue("CSL-90")], comments, config=self.CONFIG))
 
     def test_earliest_revocation_counts_regardless_of_order(self):
         comments = [comment("h3", "CSL-90", 30, "REVOKE SA-1"), self.approval(), comment("h2", "CSL-90", 5, "REVOKE SA-1")]

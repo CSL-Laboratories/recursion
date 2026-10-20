@@ -247,6 +247,8 @@ class Evaluation:
             raise SnapshotError("snapshot must be an object")
         self.now = parse_ts(require(snapshot, "now", "snapshot"), "now")
         self.repo = snapshot.get("repo", "default")
+        if not isinstance(self.repo, str) or not self.repo:
+            raise SnapshotError("repo must be a non-empty string")
         config = snapshot.get("config", {})
         unknown = set(config) - set(DEFAULT_CONFIG)
         if unknown:
@@ -254,8 +256,8 @@ class Evaluation:
         self.config = {**DEFAULT_CONFIG, **config}
         for key in ("lease_minutes", "grace_minutes", "readback_seconds", "takeover_wait_minutes", "sa_max_days"):
             value = self.config[key]
-            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-                raise SnapshotError(f"config: {key} must be a non-negative integer")
+            if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 10**6:
+                raise SnapshotError(f"config: {key} must be an integer from 0 to 1000000")
         if not isinstance(self.config["coordinator_ack_required"], bool):
             raise SnapshotError("config: coordinator_ack_required must be a boolean")
         if self.config["standing_approvals_issue"] is not None and not isinstance(self.config["standing_approvals_issue"], str):
@@ -371,6 +373,8 @@ class Evaluation:
                 if not deleted:
                     raise SnapshotError(f"comment {comment_id}: deleted_at without deleted")
                 deleted_at = parse_ts(deleted_at, comment_id)
+                if deleted_at > self.now or deleted_at < created:
+                    raise SnapshotError(f"comment {comment_id}: deleted_at outside the comment's life")
             comments.append(Comment(comment_id, issue, created, revisions, deleted, deleted_at))
         return comments
 
@@ -552,8 +556,7 @@ class Evaluation:
 
     # Decisions -------------------------------------------------------------
 
-    @staticmethod
-    def answer_pairs(comment: Comment, body: str) -> list[tuple[str, str, str]]:
+    def answer_pairs(self, comment: Comment, body: str) -> list[tuple[str, str, str]]:
         """(decision issue, option, line) pairs a comment body states."""
         lines = [line.strip() for line in body.split("\n")]
         pairs = []
@@ -564,7 +567,8 @@ class Evaluation:
         first = lines[1] if comment.agent is not None and len(lines) > 1 else lines[0]
         if BATCH.fullmatch(first):
             named = [m.groups() for clause in first.split(";") if (m := BATCH_PAIR.match(clause.strip()))]
-            if comment.issue in {issue for issue, _ in named}:
+            on_decision_issue = self.issues[comment.issue]["decision"] is not None
+            if on_decision_issue and comment.issue in {issue for issue, _ in named}:
                 pairs.extend((issue, value, first) for issue, value in named)
         return pairs
 
@@ -768,6 +772,8 @@ class Evaluation:
                     self.violation("loser_confirmed", claim.issue, claim.uuid, f"winner {settled.uuid}")
                 if claim.withdrawn_at() is None:
                     self.violation("loser_not_withdrawn", claim.issue, claim.uuid, f"winner {settled.uuid}")
+            if claim.takeover_of is None:
+                self.check_implicit_takeover(claim)
             others = [
                 other for other in self.claims.values()
                 if other.uuid != claim.uuid and other.session == claim.session and other.repo == claim.repo
@@ -782,6 +788,33 @@ class Evaluation:
                         run.get("ended_at") is None or run["ended_at"] > released
                     ):
                         self.violation("release_before_writers_stopped", claim.issue, claim.uuid, run["id"])
+
+    def check_implicit_takeover(self, claim: Claim) -> None:
+        """A fresh claim must not bypass the takeover rules (spec section 7).
+
+        It may not land while another claim's takeover wait is running, or on
+        an issue whose earlier claim expired without being released,
+        withdrawn, revoked, deleted or taken over: that needs a `takeover of`
+        line and the takeover conditions.
+        """
+        at = claim.created_at
+        for other in self.claims.values():
+            if other.uuid == claim.uuid or other.issue != claim.issue or other.repo != claim.repo:
+                continue
+            if other.created_at >= at:
+                continue
+            if other.takeover_of is not None and at < other.created_at + self.takeover_wait:
+                self.violation("claim_during_takeover_wait", claim.issue, claim.uuid, f"takeover {other.uuid}")
+                continue
+            if self.ended(other, at) != "expired":
+                continue
+            superseded = any(
+                t.takeover_of == other.uuid and t.created_at <= at
+                and (status := self.takeover_status(t, at)) is not None and status["allowed"]
+                for t in self.claims.values()
+            )
+            if not superseded:
+                self.violation("claim_without_takeover", claim.issue, claim.uuid, f"expired {other.uuid}")
 
     def check_writes(self) -> None:
         for write in self.writes:
@@ -933,7 +966,7 @@ def evaluate(snapshot: dict[str, Any]) -> dict[str, Any]:
         return Evaluation(snapshot).run()
     except SnapshotError:
         raise
-    except (TypeError, ValueError, AttributeError, KeyError, IndexError) as exc:
+    except (TypeError, ValueError, AttributeError, KeyError, IndexError, ArithmeticError) as exc:
         raise SnapshotError(f"unreadable snapshot: {type(exc).__name__}: {exc}") from exc
 
 

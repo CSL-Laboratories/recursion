@@ -162,6 +162,11 @@ class ClaimingTests(unittest.TestCase):
         result = sim.evaluate(snapshot(10, [issue("CSL-1")], [claim("c1", "CSL-1", U1), claim("c2", "CSL-1", U2, at=1)]))
         self.assertIn("multiple_claims_per_session", codes(result))
 
+    def test_loser_is_not_judged_before_the_read_back_window_ends(self):
+        fresh = claim("c1", "CSL-1", U1, at=9.5, confirm_after=None, session="cursor/s2")
+        result = sim.evaluate(snapshot(10, [issue("CSL-1")], [claim("c2", "CSL-1", U2), fresh]))
+        self.assertEqual(codes(result), [])
+
     def test_s22_second_claim_in_same_repository_is_flagged(self):
         result = sim.evaluate(snapshot(10, [issue("CSL-1"), issue("CSL-4")], [
             claim("c1", "CSL-1", U1), claim("c2", "CSL-4", U2, at=1, branch="csl-4-work"),
@@ -273,6 +278,40 @@ class LeaseTests(unittest.TestCase):
         result = sim.evaluate(snapshot(190, [issue("CSL-1")], [claim("c1", "CSL-1", U1), self.takeover(), ack],
                                        writes=writes, config={"coordinator_ack_required": True}))
         self.assertEqual(codes(result), ["write_by_non_winner"])
+        self.assertTrue(result["issues"]["CSL-1"]["takeovers"][U2]["allowed"])
+
+    def test_fresh_claim_on_an_expired_claim_needs_a_takeover(self):
+        runs = [{"id": "run-1", "claim": U1, "started_at": ts(100), "ended_at": None}]
+        fresh = claim("c2", "CSL-1", U2, at=160, session="cursor/s2")
+        result = sim.evaluate(snapshot(170, [issue("CSL-1")], [claim("c1", "CSL-1", U1), fresh], runs=runs))
+        self.assertEqual(codes(result), ["claim_without_takeover"])
+        inside_grace = claim("c2", "CSL-1", U2, at=125, session="cursor/s2")
+        result = sim.evaluate(snapshot(130, [issue("CSL-1")], [claim("c1", "CSL-1", U1), inside_grace]))
+        self.assertEqual(codes(result), ["claim_without_takeover"])
+
+    def test_fresh_claim_after_a_released_claim_is_fine(self):
+        released = claim("c1", "CSL-1", U1, more_edits=[edit(30, U1, "released")])
+        fresh = claim("c2", "CSL-1", U2, at=160, session="cursor/s2")
+        self.assertEqual(codes(sim.evaluate(snapshot(170, [issue("CSL-1")], [released, fresh]))), [])
+
+    def test_claim_during_another_takeover_wait(self):
+        third = claim("c3", "CSL-1", U3, at=155, session="grok/s3")
+        result = sim.evaluate(snapshot(170, [issue("CSL-1")], [claim("c1", "CSL-1", U1), self.takeover(), third]))
+        self.assertIn("claim_during_takeover_wait", codes(result))
+
+    def test_renewal_after_the_wait_is_not_an_objection(self):
+        original = claim("c1", "CSL-1", U1, more_edits=[edit(172, U1, "heartbeat-at: late")])
+        result = sim.evaluate(snapshot(175, [issue("CSL-1")], [original, self.takeover()]))
+        self.assertTrue(result["issues"]["CSL-1"]["takeovers"][U2]["allowed"])
+
+    def test_takeover_of_a_claim_in_another_repository_is_refused(self):
+        other_repo = claim("c1", "CSL-1", U1, extra=("repo: other-repo",))
+        result = sim.evaluate(snapshot(170, [issue("CSL-1")], [other_repo, self.takeover()]))
+        self.assertEqual(result["issues"]["CSL-1"]["takeovers"][U2]["reason"], "unknown claim")
+
+    def test_run_started_after_the_takeover_does_not_refuse_it(self):
+        runs = [{"id": "run-1", "claim": U1, "started_at": ts(153), "ended_at": None}]
+        result = sim.evaluate(snapshot(170, [issue("CSL-1")], [claim("c1", "CSL-1", U1), self.takeover()], runs=runs))
         self.assertTrue(result["issues"]["CSL-1"]["takeovers"][U2]["allowed"])
 
     def test_takeover_that_writes_during_the_wait(self):
@@ -391,6 +430,17 @@ class DecisionTests(unittest.TestCase):
         result = sim.evaluate(snapshot(20, issues, [answer, record, claim("c1", "CSL-1", U1, at=10)]))
         self.assertEqual(codes(result), ["decision_not_recorded"])
 
+    def test_condition_in_a_batched_answer_is_not_an_answer(self):
+        issues = [issue("CSL-11", decision=decision()), issue("CSL-12", decision=decision())]
+        result = sim.evaluate(snapshot(10, issues, [comment("h1", "CSL-11", 5, "CSL-11: B if CSL-12: A")]))
+        self.assertEqual(result["decisions"]["CSL-11"]["answer"], "B")
+        self.assertFalse(result["decisions"]["CSL-12"]["answered"])
+
+    def test_batched_answer_on_a_work_issue_is_ignored(self):
+        issues = [issue("CSL-1"), issue("CSL-2", decision=decision())]
+        result = sim.evaluate(snapshot(10, issues, [comment("h1", "CSL-1", 5, "CSL-1: B; CSL-2: A")]))
+        self.assertFalse(result["decisions"]["CSL-2"]["answered"])
+
     def test_batched_answer_on_an_unrelated_issue_is_ignored(self):
         issues = [issue("CSL-2", decision=decision()), issue("CSL-5")]
         result = sim.evaluate(snapshot(10, issues, [comment("h1", "CSL-5", 5, "CSL-2: B")]))
@@ -429,6 +479,14 @@ class DecisionTests(unittest.TestCase):
         writes = [{"kind": "push", "issue": "CSL-1", "claim": U1, "at": ts(6)}]
         result = sim.evaluate(snapshot(10, [issue("CSL-1")], [claim("c1", "CSL-1", U1), hold], writes=writes))
         self.assertEqual(codes(result), ["write_while_held"])
+
+    def test_deleted_hold_holds_until_its_deletion(self):
+        hold = comment("h1", "CSL-1", 5, "HOLD CSL-1", deleted=True)
+        hold["deleted_at"] = ts(8)
+        writes = [{"kind": "push", "issue": "CSL-1", "claim": U1, "at": ts(6)}]
+        result = sim.evaluate(snapshot(10, [issue("CSL-1")], [claim("c1", "CSL-1", U1), hold], writes=writes))
+        self.assertEqual(codes(result), ["write_while_held"])
+        self.assertFalse(result["issues"]["CSL-1"]["held"])
 
     def test_hold_removed_by_edit_no_longer_holds(self):
         hold = comment("h1", "CSL-1", 5, "HOLD CSL-1")
@@ -617,6 +675,22 @@ class MalformedSnapshotTests(unittest.TestCase):
 
     def test_triage_issue_cannot_be_admitted(self):
         self.assert_rejected(lambda s: s["issues"][0].update(status="Triage"))
+
+    def test_arithmetic_overflow_fails_closed(self):
+        self.assert_rejected(lambda s: s.update(config={"lease_minutes": 10**15}))
+        snap = snapshot(10, [issue("CSL-1")], [])
+        snap["now"] = "9999-12-31T23:00:00Z"
+        snap["comments"] = [dict(claim("c1", "CSL-1", U1), created_at="9999-12-31T22:00:00Z", edits=[])]
+        with self.assertRaises(sim.SnapshotError):
+            sim.evaluate(snap)
+
+    def test_deleted_at_after_the_snapshot_time(self):
+        def mutate(s):
+            s["comments"][0].update(deleted=True, deleted_at=ts(30))
+        self.assert_rejected(mutate)
+
+    def test_repo_must_be_text(self):
+        self.assert_rejected(lambda s: s.update(repo=5))
 
     def test_events_after_the_snapshot_time(self):
         self.assert_rejected(lambda s: s["comments"].append(comment("c2", "CSL-1", 20, "later")))

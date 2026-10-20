@@ -45,6 +45,7 @@ on:
       - "scripts/ci/codex_gate.py"
       - "tools/test_claude_pr_fixer.py"
       - "tools/test_codex_gate.py"
+      - "tools/test_codex_gate_identity.py"
 
 # Job-level concurrency only. Workflow-level concurrency would admit skipped
 # comments and cancel a queued fixer run.
@@ -418,7 +419,9 @@ jobs:
           python3 -X utf8 -B tools/test_fixer_failure_escalation.py
           python3 -X utf8 -B tools/test_fixer_failure_watcher.py
       - name: Codex gate tests
-        run: python3 -X utf8 -B tools/test_codex_gate.py
+        run: |
+          python3 -X utf8 -B tools/test_codex_gate.py
+          python3 -X utf8 -B tools/test_codex_gate_identity.py
       - name: actionlint
         env:
           ACTIONLINT_VERSION: "1.7.7"

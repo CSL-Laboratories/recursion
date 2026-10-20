@@ -26,6 +26,8 @@ GATE_MARKER_PREFIX = "codex-gate"
 ACTED_PREFIX = "codex-gate-acted"
 DEVIN_REVIEW_LOGIN = "devin-ai-integration[bot]"
 CODEX_REVIEW_LOGIN = "chatgpt-codex-connector[bot]"
+# Codex GitHub App bot user id, verified from genuine Codex reviews.
+CODEX_REVIEW_ID = 199175422
 DISPATCH_EVENTS = frozenset({"workflow_dispatch", "repository_dispatch"})
 MENTION_EVENTS = frozenset({"issue_comment", "pull_request_review_comment"})
 VERDICT_RE = re.compile(r"^CODEX-GATE:\s*(FIX|READY|MEDIATE)\s*$", re.MULTILINE)
@@ -49,14 +51,24 @@ def login_of(value: str | None) -> str:
     return (value or "").strip()
 
 
-def _norm_login(value: str | None) -> str:
-    text = login_of(value).casefold()
-    suffix = "[bot]"
-    return text[: -len(suffix)] if text.endswith(suffix) else text
+def is_codex_reviewer(user: Any) -> bool:
+    """Only the Codex App may author an actionable gate verdict (CSL-365).
+
+    The exact ``[bot]`` login is reserved to that App; the bare alias is an
+    ordinary user login. REST type/id, when present, must also match, so a
+    look-alike account can never authorize ci:full or MEDIATE.
+    """
+    user = user if isinstance(user, dict) else {}
+    if user.get("login") != CODEX_REVIEW_LOGIN:
+        return False
+    if "type" in user and user.get("type") != "Bot":
+        return False
+    return "id" not in user or (type(user.get("id")) is int and user["id"] == CODEX_REVIEW_ID)
 
 
 def is_codex_login(login: str | None) -> bool:
-    return _norm_login(login) == _norm_login(CODEX_REVIEW_LOGIN)
+    """Exact App login only: no case folding, whitespace or bare-alias match."""
+    return is_codex_reviewer({"login": login})
 
 
 def is_bot_type(user_type: str | None) -> bool:
@@ -165,7 +177,7 @@ def sha_has_verdict(reviews: list[dict[str, Any]], sha: str) -> bool:
     for review in reviews:
         if not isinstance(review, dict):
             continue
-        if not is_codex_login(((review.get("user") or {}).get("login"))):
+        if not is_codex_reviewer(review.get("user")):
             continue
         if safe_head_sha(review.get("commit_id")) != want:
             continue
@@ -200,8 +212,10 @@ def decide_verdict(
     body: str | None,
     sha: str,
     comments: list[str],
+    user: dict[str, Any] | None = None,
 ) -> dict[str, str]:
-    if not is_codex_login(login):
+    # The REST/webhook user object (type/id) is authoritative when supplied.
+    if not is_codex_reviewer(user if user is not None else {"login": login}):
         return {"action": "skip", "verdict": ""}
     if not safe_head_sha(sha):
         return {"action": "skip", "verdict": ""}
@@ -464,7 +478,9 @@ def run_verdict(
     pr = event.get("pull_request") or {}
     number = safe_pr_number(pr.get("number"))
     sha = safe_head_sha(review.get("commit_id") or (pr.get("head") or {}).get("sha"))
-    login = ((review.get("user") or {}).get("login"))
+    reviewer = review.get("user") if isinstance(review.get("user"), dict) else {}
+    login = reviewer.get("login")
+    codex = is_codex_reviewer(reviewer)
     if _head_repo(pr) != repo or bool(pr.get("draft")):
         notice("skipping Codex verdict on a fork or draft PR")
         emit({"action": "skip-fork", "pr_number": number, "head_sha": sha})
@@ -481,8 +497,8 @@ def run_verdict(
             records = _retry_listing(
                 lambda: list_comment_records(repo, number, read_token, gh=gh)
             )
-            gate_writer = json.loads(gh(["api", "user"], pat)) if pat and is_codex_login(login) and parse_verdict(review.get("body")) in {"READY", "MEDIATE"} else None
-            if is_codex_login(login) and parse_verdict(review.get("body")) == "READY":
+            gate_writer = json.loads(gh(["api", "user"], pat)) if pat and codex and parse_verdict(review.get("body")) in {"READY", "MEDIATE"} else None
+            if codex and parse_verdict(review.get("body")) == "READY":
                 if not current_ready_head(repo, number, sha, read_token, gh=gh):
                     return {"action": "skip-stale-head", "verdict": "READY"}
                 label_events = _parse_json_list(gh(["api", "--paginate", f"repos/{repo}/issues/{number}/events?per_page=100"], read_token))
@@ -490,7 +506,7 @@ def run_verdict(
                     notice(f"Unverified prior ci:full write: inspect the label, then a current writer may post exactly /claude-fixer reconcile-label {pending_nonce} {sha}; this acknowledges uncertainty only")
                     return {"action": "unverified-ci-label", "verdict": "READY"}
             comments = comments_after_pause(sha, records, gate_writer)
-            if is_codex_login(login) and parse_verdict(review.get("body")) == "READY" and readiness_blocked(repo, number, sha, records, read_token, gh=gh):
+            if codex and parse_verdict(review.get("body")) == "READY" and readiness_blocked(repo, number, sha, records, read_token, gh=gh):
                 if not current_ready_head(repo, number, sha, read_token, gh=gh):
                     return {"action": "skip-stale-head", "verdict": "READY"}
                 fixer_helpers().revoke_owned_ci(repo, number, sha,
@@ -508,6 +524,7 @@ def run_verdict(
         body=review.get("body"),
         sha=sha,
         comments=comments,
+        user=reviewer,
     )
     action = decision["action"]
     if action in {"skip", "already-acted", "no-verdict", "ignored-fix"}:

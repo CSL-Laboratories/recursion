@@ -406,8 +406,8 @@ class DecisionTests(unittest.TestCase):
         ]
         answer = comment("h1", "CSL-11", 5, "CSL-11: B; CSL-12: A if the budget holds; CSL-13: hold")
         records = [
-            comment("r1", "CSL-11", 9, "Agent (claude/s1, for Lucas): recorded answer h1"),
-            comment("r2", "CSL-12", 9, "Agent (claude/s1, for Lucas): recorded answer h1"),
+            comment("r1", "CSL-11", 9, "Agent (claude/s1, for Lucas): recorded\ndecision-record: h1 B"),
+            comment("r2", "CSL-12", 9, "Agent (claude/s1, for Lucas): recorded\ndecision-record: h1 A"),
         ]
         work = claim("c1", "CSL-1", U1, at=10)
         result = sim.evaluate(snapshot(20, issues, [answer, *records, work]))
@@ -418,7 +418,7 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(codes(result), [])
         result = sim.evaluate(snapshot(20, issues, [answer, records[0], work]))
         self.assertEqual(codes(result), ["decision_not_recorded"])
-        late = comment("r2", "CSL-12", 15, "Agent (claude/s1, for Lucas): recorded answer h1")
+        late = comment("r2", "CSL-12", 15, "Agent (claude/s1, for Lucas): recorded\ndecision-record: h1 A")
         result = sim.evaluate(snapshot(20, issues, [answer, records[0], late, work]))
         self.assertEqual(codes(result), ["decision_not_recorded"])
 
@@ -426,7 +426,7 @@ class DecisionTests(unittest.TestCase):
         issues = [issue("CSL-1", blocked_by=["CSL-11"]), issue("CSL-11", decision=decision())]
         answer = comment("h1", "CSL-11", 5, "DECISION: B")
         record = comment("r1", "CSL-11", 9, "Agent (claude/s1, for Lucas): noted")
-        record["edits"] = [{"at": ts(15), "body": "Agent (claude/s1, for Lucas): recorded answer h1"}]
+        record["edits"] = [{"at": ts(15), "body": "Agent (claude/s1, for Lucas): noted\ndecision-record: h1 B"}]
         result = sim.evaluate(snapshot(20, issues, [answer, record, claim("c1", "CSL-1", U1, at=10)]))
         self.assertEqual(codes(result), ["decision_not_recorded"])
 
@@ -440,6 +440,16 @@ class DecisionTests(unittest.TestCase):
         issues = [issue("CSL-1"), issue("CSL-2", decision=decision())]
         result = sim.evaluate(snapshot(10, issues, [comment("h1", "CSL-1", 5, "CSL-1: B; CSL-2: A")]))
         self.assertFalse(result["decisions"]["CSL-2"]["answered"])
+
+    def test_decision_record_must_name_the_answer_and_option_exactly(self):
+        issues = [issue("CSL-1", blocked_by=["CSL-11"]), issue("CSL-11", decision=decision())]
+        answer = comment("h1", "CSL-11", 5, "DECISION: B")
+        work = claim("c1", "CSL-1", U1, at=10)
+        for body in ("not recording h1", "decision-record: h10 B", "decision-record: h1 A"):
+            with self.subTest(body=body):
+                record = comment("r1", "CSL-11", 9, f"Agent (claude/s1, for Lucas): note\n{body}")
+                result = sim.evaluate(snapshot(20, issues, [answer, record, work]))
+                self.assertEqual(codes(result), ["decision_not_recorded"])
 
     def test_batched_answer_on_an_unrelated_issue_is_ignored(self):
         issues = [issue("CSL-2", decision=decision()), issue("CSL-5")]
@@ -493,6 +503,14 @@ class DecisionTests(unittest.TestCase):
         hold["edits"] = [{"at": ts(8), "body": "never mind"}]
         result = sim.evaluate(snapshot(10, [issue("CSL-1")], [hold]))
         self.assertFalse(result["issues"]["CSL-1"]["held"])
+
+    def test_revocation_survives_a_later_deletion(self):
+        revoke = comment("h1", "CSL-1", 5, f"REVOKE CLAIM {U1}", deleted=True)
+        revoke["deleted_at"] = ts(20)
+        writes = [{"kind": "push", "issue": "CSL-1", "claim": U1, "at": ts(10)}]
+        result = sim.evaluate(snapshot(30, [issue("CSL-1")], [claim("c1", "CSL-1", U1), revoke], writes=writes))
+        self.assertEqual(codes(result), ["write_after_revoke"])
+        self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["live_claims"], [])
 
     def test_revoke_edited_in_later_is_not_backdated(self):
         note = comment("h1", "CSL-1", 1, "looks good")
@@ -591,6 +609,21 @@ class StandingApprovalTests(unittest.TestCase):
     def test_total_limit(self):
         result = self.run_actions([self.action(10), self.action(500)], self.approval(limits="total=1"))
         self.assertEqual(codes(result), ["sa_over_limit"])
+
+    def test_approval_edited_in_later_does_not_authorise_earlier_actions(self):
+        draft = comment("h1", "CSL-90", 0, "draft, not yet")
+        draft["edits"] = [{"at": ts(50), "body": self.approval()["body"]}]
+        result = sim.evaluate(snapshot(600, [issue("CSL-90")], [draft], config=self.CONFIG,
+                                       sa_actions=[self.action(10), self.action(60)]))
+        self.assertEqual(codes(result), ["sa_unknown"])
+        self.assertIn(ts(10).replace("Z", "+00:00"), result["violations"][0]["detail"])
+
+    def test_widened_approval_applies_only_after_the_edit(self):
+        narrow = self.approval()
+        narrow["edits"] = [{"at": ts(50), "body": narrow["body"].replace("actions: mark_ready", "actions: mark_ready, label")}]
+        result = sim.evaluate(snapshot(600, [issue("CSL-90")], [narrow], config=self.CONFIG,
+                                       sa_actions=[self.action(10, action="label"), self.action(60, action="label")]))
+        self.assertEqual(codes(result), ["sa_out_of_scope"])
 
     def test_earliest_revocation_counts_regardless_of_order(self):
         comments = [comment("h3", "CSL-90", 30, "REVOKE SA-1"), self.approval(), comment("h2", "CSL-90", 5, "REVOKE SA-1")]
@@ -691,6 +724,12 @@ class MalformedSnapshotTests(unittest.TestCase):
 
     def test_repo_must_be_text(self):
         self.assert_rejected(lambda s: s.update(repo=5))
+
+    def test_malformed_confirmation_timestamp(self):
+        def mutate(s):
+            body = s["comments"][0]["edits"][0]["body"]
+            s["comments"][0]["edits"][0]["body"] = body.replace(ts(0, 70), "2026-99-99Tnonsense")
+        self.assert_rejected(mutate)
 
     def test_events_after_the_snapshot_time(self):
         self.assert_rejected(lambda s: s["comments"].append(comment("c2", "CSL-1", 20, "later")))

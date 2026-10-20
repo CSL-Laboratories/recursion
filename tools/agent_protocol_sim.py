@@ -40,9 +40,13 @@ Comment conventions follow the spec. An agent comment starts with
 comment whose first line ends with `claim v1`. Human lines (`REVOKE CLAIM`,
 `HOLD`, `DECISION:`, batched `CSL-N: X; ...`, `ACK TAKEOVER`, `Standing
 approval SA-n`, `REVOKE SA-n`) count only in comments without the agent
-prefix. Standing approvals use machine fields: `actions:` and `scope:` are
-comma-separated tokens, `limits:` holds `per_day=N` and/or `total=N`, and
-`expires:` is a date.
+prefix, and keep the effect they had before a known deletion time. Standing
+approvals use machine fields: `actions:` and `scope:` are comma-separated
+tokens, `limits:` holds `per_day=N` and/or `total=N`, and `expires:` is a date;
+each action is checked against the comment revision in effect at its time. An
+agent records a decision answer on the decision issue with the line
+`decision-record: <answer comment id> <option>`. `confirmed-at:` holds a
+timestamp or a placeholder in parentheses.
 """
 from __future__ import annotations
 
@@ -79,6 +83,7 @@ SA_HEADER = re.compile(r"^Standing approval (SA-[0-9]+)\s*$")
 REVOKE_SA = re.compile(r"^REVOKE (SA-[0-9]+)\s*$")
 TAKEOVER = re.compile(r"^takeover of (\S+)\s*$")
 TIMESTAMP_VALUE = re.compile(r"^\d{4}-\d{2}-\d{2}T")
+DECISION_RECORD = re.compile(r"^decision-record:\s*(\S+)\s+([A-Za-z0-9_-]+)\s*$")
 AFTER_END = {
     "expired": "after_expiry",
     "revoked": "after_revoke",
@@ -213,6 +218,7 @@ def claim_fields(body: str) -> dict[str, Any]:
 class StandingApproval:
     sa: str
     comment: Comment
+    since: datetime
     actions: set[str]
     scope: set[str]
     who: set[str] | None
@@ -425,6 +431,10 @@ class Evaluation:
             for key in ("claim", "scope", "branch"):
                 if not fields.get(key):
                     raise SnapshotError(f"claim comment {comment.id}: missing {key!r}")
+            for revision in comment.revisions:
+                value = claim_fields(revision.body).get("confirmed-at", "")
+                if value and not value.startswith("("):
+                    parse_ts(value, f"claim comment {comment.id}: confirmed-at")
             uuid = fields["claim"]
             if not UUID.match(uuid):
                 raise SnapshotError(f"claim comment {comment.id}: bad uuid {uuid!r}")
@@ -452,16 +462,32 @@ class Evaluation:
     def human_comments(self) -> list[Comment]:
         return [c for c in self.comments if not c.deleted and c.agent is None]
 
+    def directive_lines(self, issue: str | None = None) -> list[tuple[Comment, str, datetime]]:
+        """(comment, line, first seen) for every line ever in a human comment.
+
+        A comment deleted at a known time keeps the lines it had before the
+        deletion; one deleted at an unknown time keeps none.
+        """
+        found = []
+        for comment in self.comments:
+            if comment.agent is not None or (issue is not None and comment.issue != issue):
+                continue
+            if comment.deleted and comment.deleted_at is None:
+                continue
+            lines = {part.strip() for revision in comment.revisions for part in revision.body.split("\n")}
+            for line in sorted(lines):
+                seen = first_seen(comment, line)
+                if seen is not None and (comment.deleted_at is None or seen < comment.deleted_at):
+                    found.append((comment, line, seen))
+        return found
+
     def revoked_at(self, claim: Claim) -> datetime | None:
         """When a revoke line naming the claim first appeared (edits are not backdated)."""
         if claim.uuid in self._revoked:
             return self._revoked[claim.uuid]
         times = [
-            seen
-            for c in self.human_comments() if c.issue == claim.issue
-            for line in human_lines(c)
+            seen for _, line, seen in self.directive_lines(claim.issue)
             if (m := REVOKE_CLAIM.match(line)) and m.group(1) == claim.uuid
-            and (seen := first_seen(c, line)) is not None
         ]
         self._revoked[claim.uuid] = min(times) if times else None
         return self._revoked[claim.uuid]
@@ -522,10 +548,8 @@ class Evaluation:
             return {"of": old.uuid, "allowed": False, "reason": "claimant run in progress"}
         if self.config["coordinator_ack_required"]:
             acked = any(
-                (m := ACK_TAKEOVER.match(line)) and m.group(1) == old.uuid
-                and (seen := first_seen(c, line)) is not None and posted <= seen <= at
-                for c in self.human_comments() if c.issue == claim.issue
-                for line in human_lines(c)
+                (m := ACK_TAKEOVER.match(line)) and m.group(1) == old.uuid and posted <= seen <= at
+                for _, line, seen in self.directive_lines(claim.issue)
             )
             if not acked:
                 return {"of": old.uuid, "allowed": False, "reason": "coordinator acknowledgement missing"}
@@ -669,67 +693,84 @@ class Evaluation:
 
     # Standing approvals ----------------------------------------------------
 
-    def standing_approvals(self) -> tuple[dict[str, StandingApproval], dict[str, datetime]]:
-        approvals: dict[str, StandingApproval] = {}
+    def parse_approval(self, comment: Comment, revision: Revision) -> StandingApproval | None:
+        lines = [line.strip() for line in revision.body.split("\n")]
+        header = SA_HEADER.match(lines[0]) if lines else None
+        if not header:
+            return None
+        sa_id = header.group(1)
+        fields = {m.group(1): m.group(2) for line in lines[1:] if (m := FIELD.match(line))}
+        for key in ("actions", "scope", "expires"):
+            if key not in fields:
+                raise SnapshotError(f"standing approval {sa_id}: missing {key!r}")
+        limits = {}
+        for part in fields.get("limits", "").replace(",", " ").split():
+            key, _, value = part.partition("=")
+            if key not in {"per_day", "total"} or not value.isdigit():
+                raise SnapshotError(f"standing approval {sa_id}: limits must be per_day=N and/or total=N")
+            limits[key] = int(value)
+        raw_expires = fields["expires"]
+        date_only = len(raw_expires) == 10
+        return StandingApproval(
+            sa=sa_id,
+            comment=comment,
+            since=revision.at,
+            actions={t.strip() for t in fields["actions"].split(",") if t.strip()},
+            scope={t.strip() for t in fields["scope"].split(",") if t.strip()},
+            who={t.strip() for t in fields["who"].split(",") if t.strip()} if "who" in fields else None,
+            per_day=limits.get("per_day"),
+            total=limits.get("total"),
+            expires=parse_ts(raw_expires + "T23:59:59Z" if date_only else raw_expires, sa_id),
+        )
+
+    def standing_approvals(self) -> tuple[dict[str, Comment], dict[str, datetime]]:
+        """Comments that define each standing approval, and revocation times.
+
+        An approval is read from the comment revision in effect when it is
+        used, so text edited in later does not authorise earlier actions.
+        """
+        homes: dict[str, Comment] = {}
         revoked: dict[str, datetime] = {}
         home = self.config["standing_approvals_issue"]
         for comment in self.comments:
-            if comment.deleted or comment.issue != home:
+            if comment.issue != home:
                 continue
-            lines = human_lines(comment)
-            header = SA_HEADER.match(lines[0]) if lines else None
             if comment.agent is not None:
-                for line in lines:
-                    if SA_HEADER.match(line) or REVOKE_SA.match(line):
-                        self.void(comment, line)
+                if not comment.deleted:
+                    for line in human_lines(comment):
+                        if SA_HEADER.match(line) or REVOKE_SA.match(line):
+                            self.void(comment, line)
                 continue
-            for line in lines:
-                match = REVOKE_SA.match(line)
-                seen = first_seen(comment, line) if match else None
-                if match and seen is not None:
-                    previous = revoked.get(match.group(1))
-                    revoked[match.group(1)] = seen if previous is None else min(previous, seen)
-            if not header:
-                continue
-            fields = {m.group(1): m.group(2) for line in lines[1:] if (m := FIELD.match(line))}
-            for key in ("actions", "scope", "expires"):
-                if key not in fields:
-                    raise SnapshotError(f"standing approval {header.group(1)}: missing {key!r}")
-            sa_id = header.group(1)
-            limits = {}
-            for part in fields.get("limits", "").replace(",", " ").split():
-                key, _, value = part.partition("=")
-                if key not in {"per_day", "total"} or not value.isdigit():
-                    raise SnapshotError(f"standing approval {sa_id}: limits must be per_day=N and/or total=N")
-                limits[key] = int(value)
-            raw_expires = fields["expires"]
-            date_only = len(raw_expires) == 10
-            expires = parse_ts(raw_expires + "T23:59:59Z" if date_only else raw_expires, sa_id)
-            approval = StandingApproval(
-                sa=header.group(1),
-                comment=comment,
-                actions={t.strip() for t in fields["actions"].split(",") if t.strip()},
-                scope={t.strip() for t in fields["scope"].split(",") if t.strip()},
-                who={t.strip() for t in fields["who"].split(",") if t.strip()} if "who" in fields else None,
-                per_day=limits.get("per_day"),
-                total=limits.get("total"),
-                expires=expires,
-            )
-            if approval.sa in approvals:
-                raise SnapshotError(f"standing approval {approval.sa}: duplicate")
-            if expires.date() > (comment.created_at + timedelta(days=self.config["sa_max_days"])).date():
-                self.violation("sa_too_long", detail=approval.sa)
-            approvals[approval.sa] = approval
-        return approvals, revoked
+            for revision in comment.revisions:
+                approval = self.parse_approval(comment, revision)
+                if approval is None:
+                    continue
+                if homes.setdefault(approval.sa, comment) is not comment:
+                    raise SnapshotError(f"standing approval {approval.sa}: defined in two comments")
+                limit = (revision.at + timedelta(days=self.config["sa_max_days"])).date()
+                if approval.expires.date() > limit:
+                    self.violation("sa_too_long", detail=f"{approval.sa} at {revision.at.isoformat()}")
+        for _, line, seen in self.directive_lines(home):
+            match = REVOKE_SA.match(line)
+            if match:
+                previous = revoked.get(match.group(1))
+                revoked[match.group(1)] = seen if previous is None else min(previous, seen)
+        return homes, revoked
+
+    def approval_at(self, comment: Comment, at: datetime) -> StandingApproval | None:
+        if comment.deleted and (comment.deleted_at is None or comment.deleted_at <= at):
+            return None
+        effective = [r for r in comment.revisions if r.at <= at]
+        return self.parse_approval(comment, effective[-1]) if effective else None
 
     def check_sa_actions(self) -> None:
-        approvals, revoked = self.standing_approvals()
+        homes, revoked = self.standing_approvals()
         used: dict[str, list[datetime]] = {}
         for action in sorted(self.sa_actions, key=lambda a: a["at"]):
-            sa = approvals.get(action["sa"])
             at = action["at"]
             label = f"{action['sa']} {action['action']} at {at.isoformat()}"
-            if sa is None or sa.comment.created_at > at:
+            sa = self.approval_at(homes[action["sa"]], at) if action["sa"] in homes else None
+            if sa is None or sa.sa != action["sa"]:
                 self.violation("sa_unknown", detail=label)
                 continue
             if action["sa"] in revoked and revoked[action["sa"]] <= at:
@@ -888,10 +929,12 @@ class Evaluation:
                     confirmed = claim.confirmed_at()
                     if claim.issue != issue_id or confirmed is None or confirmed < state["answered_at"]:
                         continue
+                    expected = (state["answer_comment"], state["answer"])
                     recorded = any(
                         c.issue == blocker and c.agent is not None and not c.deleted
-                        and state["answer_comment"] in next(
-                            (r.body for r in reversed(c.revisions) if r.at <= confirmed), ""
+                        and any(
+                            (m := DECISION_RECORD.match(line.strip())) and m.groups() == expected
+                            for line in next((r.body for r in reversed(c.revisions) if r.at <= confirmed), "").split("\n")
                         )
                         for c in self.comments
                     )

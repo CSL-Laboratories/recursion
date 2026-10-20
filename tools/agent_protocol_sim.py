@@ -649,7 +649,15 @@ class Evaluation:
             status = self.takeover_status(claim, at)
             if status is None:
                 continue
-            if status["allowed"]:
+            if status["allowed"] and any(
+                other.uuid != claim.uuid and other.uuid != claim.takeover_of
+                and other.issue == claim.issue and other.repo == claim.repo
+                and other.created_at < claim.created_at and self.bypassed_expired(claim, other)
+                for other in self.claims.values()
+            ):
+                # Bypasses another expired claim, as check_implicit_takeover reports.
+                refused.add(claim.uuid)
+            elif status["allowed"]:
                 superseded.add(status["of"])
             else:
                 refused.add(claim.uuid)
@@ -993,15 +1001,19 @@ class Evaluation:
                 if self.ended(other, at) is None:
                     self.violation("claim_during_takeover_wait", claim.issue, claim.uuid, f"takeover {other.uuid}")
                     continue
-            if self.ended(other, at) != "expired":
-                continue
-            superseded = any(
-                t.takeover_of == other.uuid and t.created_at <= at
-                and (status := self.takeover_status(t, at)) is not None and status["allowed"]
-                for t in self.claims.values()
-            )
-            if not superseded:
+            if self.bypassed_expired(claim, other):
                 self.violation("claim_without_takeover", claim.issue, claim.uuid, f"expired {other.uuid}")
+
+    def bypassed_expired(self, claim: Claim, other: Claim) -> bool:
+        """True if `claim` landed over `other`, which had expired without a valid takeover."""
+        at = claim.created_at
+        if self.ended(other, at) != "expired":
+            return False
+        return not any(
+            t.takeover_of == other.uuid and t.created_at <= at
+            and (status := self.takeover_status(t, at)) is not None and status["allowed"]
+            for t in self.claims.values()
+        )
 
     def check_writes(self) -> None:
         for write in self.writes:

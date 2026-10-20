@@ -59,6 +59,46 @@ Consuming a fragment that requires acceptance needs the applicable exact, authen
 
 Never commit secrets, private account details, raw chats, signed URLs, bulk copyrighted material or datasets to Git. Manifests for approved external storage retain hash, size, access, retention and license notes. An access denial stops the affected transfer; do not look for an alternative path. Existing approved routes keep their actual authority. This section adds no API, new spend, fallback or overage. Lucas's spending and company-resource authority, own-account limits, the R2a prerequisite, the review roles and the rule that agents never merge are unchanged.
 
+## Proceed or escalate
+
+`CONTROL_PLANE.md` still decides who decides. This section is the short test for
+when an agent acts on its own and when it asks. Claude Code loads the same rules as
+the `proceed-or-escalate` skill (`.claude/skills/proceed-or-escalate/SKILL.md`);
+Cursor, Codex and Grok follow this section.
+
+**Proceed** only when all hold: a clear defect or failing check with an evident
+cause; inside the issue's scope and allowed paths; no change to product behavior,
+UX, public API, contract or data meaning; reversible and covered by a test; no new
+spend, credentials, permissions, settings or protected-path edits; no other claim
+on the branch or files; no paid CI started. Marking ready, pushing to a non-draft PR,
+adding a label a workflow listens for (`ci:full`, `enhancement`), and any dispatch,
+re-run or `/ci` command all start paid Blacksmith runs. Pushes to drafts or to
+branches without a PR, and read-only API queries, are fine.
+
+**Escalate** when any holds: a product detail, UX choice, scope or priority change
+is needed; the request has more than one reasonable reading; it is an architecture,
+language, dependency or data-source choice; it touches governance files, decision
+records, contracts or another owner's work; a tool or platform refused the action;
+or you would state a decision you cannot link to a human's own comment.
+
+**How:** one Linear comment @mentioning the issue owner with the question, two or
+three options, your recommendation and what you will do meanwhile. Also record the
+blocker in `state/INBOX.md` as "Escalate, don't guess" requires. Then release your
+claim and take other admitted work.
+
+**Comment labels.** Agents usually post through a developer's account, so start
+every agent comment with `Agent (<tool/session>, for <developer>):`. A comment
+counts as the developer's own only when they approved its exact text before it was
+posted; mark it `Drafted by agent, approved by <developer> before posting:`. Never
+post decision language as an agent comment; link the human's comment instead. A
+decision that only agents repeat is unverified.
+
+**Unattended runs** (scheduled loops, automations nobody is watching) may only do
+"proceed" work. They do not resolve human-authored threads, change scope, close
+issues as decided or post developer-approved comments. They never mark ready,
+label, dispatch, re-run or cancel, and they label every comment
+`Agent (unattended run, for <developer>):`.
+
 ## Your role
 
 Founders decide within the authority defined in `CONTROL_PLANE.md`: any founder may decide

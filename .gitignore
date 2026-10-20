@@ -12,12 +12,13 @@ __pycache__/
 loop/logs/
 .DS_Store
 # Claude Code: keep worktrees, local settings and local hooks untracked; track
-# only the shared cloud-session hook.
+# only the shared settings, cloud-session hook and shared skills.
 .claude/*
 !.claude/settings.json
 !.claude/hooks/
 .claude/hooks/*
 !.claude/hooks/session-start.sh
+!.claude/skills/
 .tmp/
 
 # Local tool binaries (downloaded, not committed): TLA+ tools for FU-03

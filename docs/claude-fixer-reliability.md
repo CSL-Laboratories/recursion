@@ -95,12 +95,14 @@ and honor the same pause. Label names match case-insensitively.
   follow the newest human commit, the same rule as the Devin path. Other bots
   neither count nor reset the streak; a human commit resets it.
 - **Long PRs:** GitHub lists at most 250 PR commits, oldest first. Both
-  counters treat a listing of 250 or more as at the cap, with a notice.
+  counters treat a listing of 250 or more as at the cap, with a notice. A human
+  commit cannot reset that, so a human has to take over the PR.
 
 The conflict resolver no longer has raw `gh api`. Like the fixers, it uses the
 fixed `model-api` helper. That job alone enables one extra operation, `label`,
 which adds exactly `needs-decision`. Its deny list also covers `.git/**` and
-the guard directory.
+the guard directory. Every Claude writer also disallows `git difftool`, which
+the `git diff:*` allow prefix could otherwise admit.
 
 A `CODEX-GATE` verdict counts only from the Codex App:
 login `chatgpt-codex-connector[bot]`, type `Bot` and user ID `199175422`

@@ -587,6 +587,22 @@ class GuardedWriterJobTests(unittest.TestCase):
                 with self.subTest(job=name, rule=rule):
                     self.assertIn(rule, deny)
 
+    def test_writer_jobs_keep_workflow_denies_and_raw_api_disallows(self):
+        workflow_deny = {"claude-mention": ('"Edit(.github/workflows/**)"', '"Write(.github/workflows/**)"'),
+                         "devin-review-fix": ('"Edit(.github/workflows/**)"', '"Write(.github/workflows/**)"'),
+                         "conflict-resolve": ('"Edit(.github/**)"', '"Write(.github/**)"')}
+        jobs = self.jobs()
+        self.assertEqual(sorted(jobs), sorted(workflow_deny))
+        for name, job in jobs.items():
+            deny = job.split('"deny": [', 1)[1].split("]", 1)[0]
+            disallow = job.split("--disallowedTools", 1)[1].split('"', 2)[1].split(",")
+            for rule in workflow_deny[name] + self.DENY:
+                with self.subTest(job=name, rule=rule):
+                    self.assertIn(rule, deny)
+            for rule in ("Bash(gh api:*)", "Bash(git difftool:*)", "Bash(curl:*)", "Bash(env:*)", "Bash(printenv:*)"):
+                with self.subTest(job=name, disallow=rule):
+                    self.assertIn(rule, disallow)
+
     def test_every_guarded_writer_embeds_the_source_and_only_pushes_through_it(self):
         source = SOURCE.read_text(encoding="utf-8").rstrip()
         for name, job in self.jobs().items():

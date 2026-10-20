@@ -1474,6 +1474,18 @@ class FixerLoopCapTests(unittest.TestCase):
                 self.assertIn("loop_commit_count=" + expected, out)
                 self.assertEqual(posted, "")
 
+    def test_live_fixer_attribution_counts_as_claude(self) -> None:
+        # Real fixer pushes are authored by github-actions[bot] with git author name claude[bot].
+        live = ("github-actions[bot]", "claude[bot]")
+        for commits, expected in (([("alice", "Alice")] + [live] * 8, "8"), ([("alice", "Alice")] + [live] * 7, "7"),
+                                  ([live] * 3 + [("bob", "Bob")] + [live] * 2, "2")):
+            with self.subTest(commits=commits):
+                out, _ = self._run(commits, [])
+                self.assertIn("loop_commit_count=" + expected, out)
+
+    def test_truncated_listing_notice_says_a_human_must_take_over(self) -> None:
+        self.assertIn("A human commit cannot reset this, so a human has to take over this PR.", self.script)
+
     def test_human_pause_skips_before_reservation(self) -> None:
         for kwargs in ({"labels": ("claude:pause",)}, {"labels": ("bug", "hold")}, {"labels": ("Claude:Pause",)},
                        {"labels": ("HOLD",)}, {"labels": None}, {"labels": {"name": "hold"}},
@@ -1551,6 +1563,15 @@ class MentionLiveHeadTests(unittest.TestCase):
                 self.assertIn("skip=" + skip, out)
                 self.assertEqual("head_sha=" in out, skip == "false")
                 self.assertEqual(posts, "")
+
+    def test_mention_counts_live_fixer_attribution_as_claude(self):
+        # Real fixer pushes are authored by github-actions[bot] with git author name claude[bot].
+        live = ("github-actions[bot]", "claude[bot]")
+        for n, skip in ((7, "false"), (8, "true")):
+            with self.subTest(n=n):
+                out, _ = self._run([("alice", "Alice")] + [live] * n, [])
+                self.assertIn("skip=" + skip, out)
+        self.assertIn("A human commit cannot reset this, so a human has to take over this PR.", self.script)
 
     def test_mention_cap_fails_closed_on_truncated_commit_list(self):
         # GitHub's PR commits endpoint lists at most 250 commits, oldest first.

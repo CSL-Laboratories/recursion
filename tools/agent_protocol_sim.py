@@ -415,6 +415,8 @@ class Evaluation:
                 deleted_at = parse_ts(deleted_at, comment_id)
                 if deleted_at > self.now or deleted_at < created:
                     raise SnapshotError(f"comment {comment_id}: deleted_at outside the comment's life")
+                if revisions[-1].at > deleted_at:
+                    raise SnapshotError(f"comment {comment_id}: edited after deleted_at")
             comments.append(Comment(comment_id, issue, created, revisions, deleted, deleted_at))
         return comments
 
@@ -463,6 +465,9 @@ class Evaluation:
             first = comment.revisions[0].body.split("\n", 1)[0]
             if not header or not CLAIM_HEADER.search(first):
                 continue
+            tool, slash, session = header[0].partition("/")
+            if not (tool.strip() and slash and session.strip() and header[1]):
+                raise SnapshotError(f"claim comment {comment.id}: incomplete agent prefix")
             fields = claim_fields(comment.revisions[0].body)
             for key in ("claim", "scope", "branch"):
                 if not fields.get(key):
@@ -484,9 +489,8 @@ class Evaluation:
                 if value and not PLACEHOLDER.match(value):
                     parse_ts(value, f"claim comment {comment.id}: confirmed-at")
                 # A claim's identity is fixed when it is posted; an edit may
-                # confirm, renew or release it but not turn it into another claim.
-                changed = sorted(k for k, v in identity(revised).items()
-                                 if (k in revised or v is not None) and v != original[k])
+                # confirm, renew or release it but not change or drop a field.
+                changed = sorted(k for k, v in identity(revised).items() if v != original[k])
                 if changed:
                     raise SnapshotError(f"claim comment {comment.id}: edit changes {', '.join(changed)}")
             uuid = fields["claim"]

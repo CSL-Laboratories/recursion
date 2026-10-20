@@ -946,6 +946,37 @@ class MalformedSnapshotTests(unittest.TestCase):
             with self.subTest(field=field):
                 self.assert_rejected(mutate)
 
+    def test_edit_cannot_drop_claim_identity(self):
+        drops = {"claim": f"claim: {U1}\n", "scope": "scope: whole issue\n", "branch": "branch: csl-1-work @ abc123, base def456\n"}
+        for field, line in drops.items():
+            def mutate(s, line=line):
+                confirm = s["comments"][0]["edits"][0]
+                confirm["body"] = confirm["body"].replace(line, "")
+            with self.subTest(field=field):
+                self.assert_rejected(mutate)
+        takeover = claim("c2", "CSL-1", U2, at=152, session="cursor/s2", extra=(f"takeover of {U1}",))
+        takeover["edits"][0]["body"] = takeover["edits"][0]["body"].replace(f"\ntakeover of {U1}", "")
+        with self.assertRaises(sim.SnapshotError):
+            sim.evaluate(snapshot(170, [issue("CSL-1")], [claim("c1", "CSL-1", U1), takeover]))
+
+    def test_claim_with_an_incomplete_agent_prefix(self):
+        for prefix in ("Agent (claude/s1):", "Agent (claude/s1, for ):", "Agent (claude, for Lucas):",
+                       "Agent (/s1, for Lucas):", "Agent (claude/, for Lucas):"):
+            def mutate(s, prefix=prefix):
+                c = s["comments"][0]
+                for holder in (c, *c["edits"]):
+                    holder["body"] = holder["body"].replace("Agent (claude/s1, for Lucas):", prefix)
+            with self.subTest(prefix=prefix):
+                self.assert_rejected(mutate)
+
+    def test_edit_after_deletion(self):
+        def mutate(s):
+            note = comment("h1", "CSL-1", 1, "a note", deleted=True)
+            note["deleted_at"] = ts(5)
+            note["edits"] = [{"at": ts(6), "body": "edited later"}]
+            s["comments"].append(note)
+        self.assert_rejected(mutate)
+
     def test_edit_may_move_the_branch_head(self):
         renewed = claim("c1", "CSL-1", U1)
         renewed["edits"].append({"at": ts(30), "body": renewed["edits"][0]["body"].replace("@ abc123", "@ fedcba9")})

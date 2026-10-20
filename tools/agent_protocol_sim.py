@@ -981,23 +981,44 @@ class Evaluation:
                     ):
                         self.violation("release_before_writers_stopped", claim.issue, claim.uuid, run["id"])
 
-    # Refusals that wait on time or a human acknowledgement, or that come from
-    # the original claimant objecting afterwards, are not the taker's fault;
-    # every other refusal means the takeover was posted when the rules did
-    # not allow it.
-    PENDING_TAKEOVER = {
-        "takeover wait not over",
-        "coordinator acknowledgement missing",
-        "original claimant renewed within the wait",
-    }
+    def posting_fault(self, claim: Claim) -> str | None:
+        """Why a takeover was not allowed at the moment it was posted, or None.
+
+        Only faults fixed at posting time count: what happens later (the wait,
+        a coordinator acknowledgement, the original claimant objecting or
+        releasing) is not the taker's doing and does not hide or excuse them.
+        """
+        posted = claim.created_at
+        old = self.claims.get(claim.takeover_of)
+        if old is None or old.issue != claim.issue or old.repo != claim.repo:
+            return f"unknown claim {claim.takeover_of}"
+        if old.created_at >= posted:
+            return "original posted after the takeover"
+        if self.ended(old, posted) in {"withdrawn", "released", "revoked", "deleted"}:
+            return None
+        last = old.comment.last_update(posted)
+        if posted <= last + self.lease + self.grace:
+            return "lease plus grace not passed"
+        if any(
+            c.get("repo", self.repo) == old.repo and c["branch"] == old.branch and last < c["at"] <= posted
+            for c in self.commits
+        ):
+            return "commit newer than the last heartbeat"
+        if any(
+            r["claim"] == old.uuid and r["started_at"] <= posted and (r.get("ended_at") is None or r["ended_at"] > posted)
+            for r in self.runs
+        ):
+            return "claimant run in progress"
+        return None
 
     def check_takeover_refused(self, claim: Claim) -> None:
-        status = self.takeover_status(claim)
-        if status is None or status["allowed"] or status["reason"] in self.PENDING_TAKEOVER:
+        if claim.takeover_of is None:
             return
         if self.ended(claim, self.now) in {"withdrawn", "released", "revoked", "deleted"}:
             return
-        self.violation("takeover_refused", claim.issue, claim.uuid, status["reason"])
+        fault = self.posting_fault(claim)
+        if fault is not None:
+            self.violation("takeover_refused", claim.issue, claim.uuid, fault)
 
     def check_implicit_takeover(self, claim: Claim) -> None:
         """A fresh claim must not bypass the takeover rules (spec section 7).

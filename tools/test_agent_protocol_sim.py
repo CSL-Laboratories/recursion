@@ -231,6 +231,27 @@ class LeaseTests(unittest.TestCase):
         refused = [v for v in result["violations"] if v["code"] == "takeover_refused"]
         self.assertEqual([(v["claim"], v["detail"]) for v in refused], [(U2, "lease plus grace not passed")])
 
+    def test_premature_takeover_is_reported_whatever_happens_later(self):
+        renewing = [edit(100, U1, "heartbeat-at: 100"), edit(130, U1, "heartbeat-at: 130")]
+        cases = {
+            "during the wait": (130, renewing),
+            "original renewed": (300, renewing),
+            "original released later": (300, renewing + [edit(135, U1, "released")]),
+        }
+        for name, (now, edits) in cases.items():
+            with self.subTest(case=name):
+                comments = [claim("c1", "CSL-1", U1, more_edits=edits), self.takeover(at=125)]
+                result = sim.evaluate(snapshot(now, [issue("CSL-1")], comments))
+                refused = [v["detail"] for v in result["violations"] if v["code"] == "takeover_refused"]
+                self.assertEqual(refused, ["lease plus grace not passed"])
+
+    def test_takeover_of_an_unknown_claim_names_it(self):
+        ghost = "99999999-9999-4999-8999-999999999999"
+        stray = claim("c2", "CSL-1", U2, at=152, session="cursor/s2", extra=(f"takeover of {ghost}",))
+        result = sim.evaluate(snapshot(170, [issue("CSL-1")], [stray]))
+        refused = [v["detail"] for v in result["violations"] if v["code"] == "takeover_refused"]
+        self.assertEqual(refused, [f"unknown claim {ghost}"])
+
     def test_withdrawn_refused_takeover_is_not_reported(self):
         early = self.takeover(at=125)
         early["edits"].append({"at": ts(127), "body": early["edits"][0]["body"] + "\nwithdrawn: lease not over"})

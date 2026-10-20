@@ -495,6 +495,34 @@ jobs:
               *) echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0 ;;
             esac
           done
+          # Mentions honor the Devin-path eight-commit guard with the same rule:
+          # claude[bot] commits after the newest human commit; other bots neither
+          # count nor reset the streak (CSL-365).
+          commits="$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/commits?per_page=100" \
+            --jq '.[] | [(.author.login // "-"), (.commit.author.name // "-")] | @tsv')"
+          count=0
+          while IFS=$'\t' read -r login name; do
+            [ -z "$login$name" ] && continue
+            if [ "$login" = "claude[bot]" ] || [ "$name" = "claude[bot]" ] || [ "$name" = "claude" ]; then
+              count=$((count + 1))
+            elif [[ "$login" == *"[bot]" || "$name" == *"[bot]" ]]; then
+              continue
+            else
+              break
+            fi
+          done < <(printf '%s\n' "$commits" | tac)
+          # GitHub lists at most 250 PR commits, oldest first, so the newest may
+          # be missing. A possibly truncated list counts as at the cap.
+          total="$(printf '%s\n' "$commits" | grep -c . || true)"
+          if [ "$total" -ge 250 ] && [ "$count" -lt 8 ]; then
+            echo "::notice::$total PR commits listed (GitHub's limit is 250); treating the loop cap as reached."
+            count=8
+          fi
+          if [ "$count" -ge 8 ]; then
+            echo "::notice::@claude skipped: $count Claude commits since the last human commit (cap 8). A human commit resets the streak."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           HEAD_SHA="$(jq -r '.head.sha' <<< "$current_pr")"
           printf '%s\n' "head_ref=$HEAD_REF" "head_sha=$HEAD_SHA" "skip=false" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
@@ -1191,6 +1219,13 @@ jobs:
               break
             fi
           done < <(printf '%s\n' "$commits" | tac)
+          # GitHub lists at most 250 PR commits, oldest first, so the newest may
+          # be missing. A possibly truncated list counts as at the cap.
+          total="$(printf '%s\n' "$commits" | grep -c . || true)"
+          if [ "$total" -ge 250 ] && [ "$count" -lt 8 ]; then
+            echo "::notice::$total PR commits listed (GitHub's limit is 250); treating the loop cap as reached."
+            count=8
+          fi
           echo "claude[bot] commits since last human commit: $count"
           # Eligibility decides whether a pending finding needs the loop-cap notice.
           # It enforces this count before any attempt reservation or model work.

@@ -1447,6 +1447,16 @@ class FixerLoopCapTests(unittest.TestCase):
         for step in steps:
             self.assertIn("steps.cap.outputs.skip != 'true'", step)
 
+    def test_truncated_commit_list_counts_as_at_cap(self) -> None:
+        # GitHub lists at most 250 PR commits, oldest first; the newest may be missing.
+        human = [("alice", "Alice")]
+        for commits, expected in ((human * 249, "0"), (human * 250, "8"), (human * 300, "8"),
+                                  (human * 240 + [("claude[bot]", "claude[bot]")] * 12, "12")):
+            with self.subTest(n=len(commits)):
+                out, posted = self._run(commits, [])
+                self.assertIn("loop_commit_count=" + expected, out)
+                self.assertEqual(posted, "")
+
     def test_human_pause_skips_before_reservation(self) -> None:
         for kwargs in ({"labels": ("claude:pause",)}, {"labels": ("bug", "hold")}, {"labels": ("Claude:Pause",)},
                        {"labels": ("HOLD",)}, {"labels": None}, {"labels": {"name": "hold"}},
@@ -1506,6 +1516,36 @@ class MentionLiveHeadTests(unittest.TestCase):
                        {"current_ref": "renamed"}, {"current_sha": "invalid"}):
             out, _ = self._run([], [], **kwargs)
             self.assertIn("skip=true", out)
+
+    def test_mention_honors_eight_commit_streak(self):
+        claude, human, other = ("claude[bot]", "claude[bot]"), ("alice", "Alice"), ("github-actions[bot]", "github-actions[bot]")
+        cases = (
+            ([human] + [claude] * 7, "false"),
+            ([human] + [claude] * 8, "true"),
+            ([human] + [claude] * 4 + [other] + [claude] * 4, "true"),
+            ([human] + [claude] * 4 + [other] * 5 + [claude] * 3, "false"),
+            ([claude] * 8 + [("bob", "Bob")] + [claude] * 7, "false"),
+            ([human] + [("x", "claude")] * 8, "true"),
+            ([], "false"),
+        )
+        for commits, skip in cases:
+            with self.subTest(commits=commits):
+                out, posts = self._run(commits, [])
+                self.assertIn("skip=" + skip, out)
+                self.assertEqual("head_sha=" in out, skip == "false")
+                self.assertEqual(posts, "")
+
+    def test_mention_cap_fails_closed_on_truncated_commit_list(self):
+        # GitHub's PR commits endpoint lists at most 250 commits, oldest first.
+        human = ("alice", "Alice")
+        for n, skip in ((249, "false"), (250, "true"), (300, "true")):
+            with self.subTest(n=n):
+                out, _ = self._run([human] * n, [])
+                self.assertIn("skip=" + skip, out)
+
+    def test_mention_commit_listing_error_fails_closed(self):
+        with self.assertRaises(subprocess.CalledProcessError):
+            self._run([], [], listing_error=True)
 
     def test_mention_human_pause_skips(self):
         for kwargs in ({"labels": ("claude:pause",)}, {"labels": ("Hold",)}, {"labels": None},

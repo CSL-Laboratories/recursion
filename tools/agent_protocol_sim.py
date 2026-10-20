@@ -86,6 +86,7 @@ TIMESTAMP_VALUE = re.compile(r"^\d{4}-\d{2}-\d{2}T")
 PLACEHOLDER = re.compile(r"^\([^()\n]*[^()\s][^()\n]*\)$")
 DECISION_RECORD = re.compile(r"^decision-record:\s*(\S+)\s+([A-Za-z0-9_-]+)\s*$")
 AFTER_END = {
+    "deleted": "after_deletion",
     "expired": "after_expiry",
     "revoked": "after_revoke",
     "released": "after_release",
@@ -610,6 +611,25 @@ class Evaluation:
         ended = self.ended(old, posted)
         if ended in {"withdrawn", "released", "revoked", "deleted"}:
             return {"of": old.uuid, "allowed": True, "reason": f"original {ended}"}
+        refusal = self.posting_refusal(claim, old)
+        if refusal is not None:
+            return refusal
+        if self.config["coordinator_ack_required"]:
+            # The acknowledgement must still be in the comment, and the comment
+            # not deleted, at the time being judged.
+            acked = any(
+                (m := ACK_TAKEOVER.match(line)) and m.group(1) == old.uuid
+                and (since := present_since(c, line, at)) is not None and posted <= since
+                and not (c.deleted_at is not None and c.deleted_at <= at)
+                for c, line, _ in self.directive_lines(claim.issue)
+            )
+            if not acked:
+                return {"of": old.uuid, "allowed": False, "reason": "coordinator acknowledgement missing"}
+        return {"of": old.uuid, "allowed": True, "reason": "conditions met"}
+
+    def posting_refusal(self, claim: Claim, old: Claim) -> dict[str, Any] | None:
+        """Why a takeover of a still-held `old` was not allowed when posted, or None."""
+        posted = claim.created_at
         last = old.comment.last_update(posted)
         if posted <= last + self.lease + self.grace:
             return {"of": old.uuid, "allowed": False, "reason": "lease plus grace not passed"}
@@ -625,18 +645,7 @@ class Evaluation:
         ]
         if running:
             return {"of": old.uuid, "allowed": False, "reason": "claimant run in progress"}
-        if self.config["coordinator_ack_required"]:
-            # The acknowledgement must still be in the comment, and the comment
-            # not deleted, at the time being judged.
-            acked = any(
-                (m := ACK_TAKEOVER.match(line)) and m.group(1) == old.uuid
-                and (since := present_since(c, line, at)) is not None and posted <= since
-                and not (c.deleted_at is not None and c.deleted_at <= at)
-                for c, line, _ in self.directive_lines(claim.issue)
-            )
-            if not acked:
-                return {"of": old.uuid, "allowed": False, "reason": "coordinator acknowledgement missing"}
-        return {"of": old.uuid, "allowed": True, "reason": "conditions met"}
+        return None
 
     def live_claims(self, issue: str, repo: str, at: datetime) -> list[Claim]:
         candidates = [
@@ -964,6 +973,7 @@ class Evaluation:
                 if claim.withdrawn_at() is None:
                     self.violation("loser_not_withdrawn", claim.issue, claim.uuid, f"winner {settled.uuid}")
             self.check_implicit_takeover(claim)
+            self.check_takeover_refused(claim)
             others = [
                 other for other in self.claims.values()
                 if other.uuid != claim.uuid and other.session == claim.session and other.repo == claim.repo
@@ -978,6 +988,33 @@ class Evaluation:
                         run.get("ended_at") is None or run["ended_at"] > released
                     ):
                         self.violation("release_before_writers_stopped", claim.issue, claim.uuid, run["id"])
+
+    def posting_fault(self, claim: Claim) -> str | None:
+        """Why a takeover was not allowed at the moment it was posted, or None.
+
+        Only faults fixed at posting time count: what happens later (the wait,
+        a coordinator acknowledgement, the original claimant objecting or
+        releasing) is not the taker's doing and does not hide or excuse them.
+        """
+        posted = claim.created_at
+        old = self.claims.get(claim.takeover_of)
+        if old is None or old.issue != claim.issue or old.repo != claim.repo:
+            return f"unknown claim {claim.takeover_of}"
+        if old.created_at >= posted:
+            return "original posted after the takeover"
+        if self.ended(old, posted) in {"withdrawn", "released", "revoked", "deleted"}:
+            return None
+        refusal = self.posting_refusal(claim, old)
+        return None if refusal is None else refusal["reason"]
+
+    def check_takeover_refused(self, claim: Claim) -> None:
+        if claim.takeover_of is None:
+            return
+        if self.ended(claim, self.now) in {"withdrawn", "released", "revoked", "deleted"}:
+            return
+        fault = self.posting_fault(claim)
+        if fault is not None:
+            self.violation("takeover_refused", claim.issue, claim.uuid, fault)
 
     def check_implicit_takeover(self, claim: Claim) -> None:
         """A fresh claim must not bypass the takeover rules (spec section 7).

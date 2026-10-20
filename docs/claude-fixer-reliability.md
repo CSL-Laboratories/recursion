@@ -86,9 +86,11 @@ and honor the same pause. Label names match case-insensitively.
 - **Every PR:** set the repository variable `CLAUDE_FIXER_PAUSE` to exactly
   `true`. Unset it, or set any other value, to resume.
 - **A run already past that check:** the guard rereads the live PR at push
-  time and refuses the push on a pause label or unreadable labels. The attempt
-  stays consumed and nothing is retried. Terminal audits still read a paused
-  PR. A run that already pushed is not undone.
+  time and refuses the push on a pause label or unreadable labels. The model's
+  `model-api` comment, reply and label writes recheck the same way; its reads
+  stay available. The attempt stays consumed and nothing is retried. The
+  workflow's own terminal audit still reads and comments on a paused PR. A run
+  that already pushed is not undone.
 - **Mentions are bounded:** `@claude` skips once eight or more Claude commits
   follow the newest human commit, the same rule as the Devin path. Other bots
   neither count nor reset the streak; a human commit resets it.

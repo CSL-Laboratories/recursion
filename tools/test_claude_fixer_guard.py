@@ -35,6 +35,10 @@ class GuardTests(unittest.TestCase):
         self.state = self.path / "attempt.json"
         self.execution = self.path / "execution.json"
         self.execution.write_text(json.dumps([{"type": "result", "subtype": "success", "num_turns": 12}]))
+        # model-api writes re-read the live PR; default to an unpaused one.
+        live = patch.object(m, "api", return_value=pr())
+        live.start()
+        self.addCleanup(live.stop)
 
     def push(self, read=lambda _: pr(), updates=None, config=CONFIG, remote="origin"):
         return m.guard(config, f"HEAD {B} refs/heads/fix {A}\n" if updates is None else updates, remote, self.state, remote_url=URL,
@@ -198,6 +202,55 @@ class GuardTests(unittest.TestCase):
         m.model_api(CONFIG | {"label": "needs-decision"}, ["label"], run=run)
         run.assert_called_once_with(["gh", "api", "--method", "POST", "repos/acme/example/issues/7/labels",
                                      "--input", "-"], input=json.dumps({"labels": ["needs-decision"]}))
+
+    def test_pause_refuses_model_api_writes_but_not_reads(self):
+        from unittest.mock import Mock
+        (self.path / ".claude-fixer-replies").mkdir()
+        (self.path / ".claude-fixer-replies/body.txt").write_text("Status", encoding="utf-8")
+        target = json.dumps({"id": 123, "pull_request_url": "https://api.github.com/repos/acme/example/pulls/7"})
+        writes = ((CONFIG, ["comment", ".claude-fixer-replies/body.txt"]),
+                  (CONFIG, ["reply", "123", ".claude-fixer-replies/body.txt"]),
+                  (CONFIG | {"label": "needs-decision"}, ["label"]))
+        for live in (pr(labels=["claude:pause"]), pr(labels=["HOLD"]), pr(labels=["bug", "hold"]),
+                     pr() | {"labels": None}, pr() | {"labels": ["hold"]},
+                     {k: v for k, v in pr().items() if k != "labels"}):
+            for config, args in writes:
+                with self.subTest(live=live.get("labels"), op=args[0]), patch.object(m.Path, "cwd", return_value=self.path):
+                    run = Mock(return_value=target)
+                    with self.assertRaises(m.PauseRefused):
+                        m.model_api(config, args, run=run, read=lambda _path, live=live: live)
+                    self.assertFalse(any("POST" in call.args[0] for call in run.call_args_list))
+                    # The default live reader is the same check (main() passes no reader).
+                    with patch.object(m, "api", return_value=live), self.assertRaises(m.PauseRefused):
+                        m.model_api(config, args, run=run)
+                    self.assertFalse(any("POST" in call.args[0] for call in run.call_args_list))
+            for op in ("read", "comments", "review-comments", "reviews", "threads"):
+                with self.subTest(live=live.get("labels"), read=op):
+                    run = Mock(return_value="[]")
+                    m.model_api(CONFIG, [op], run=run, read=lambda _path, live=live: live)
+                    run.assert_called_once()
+        # Unpaused writes still post exactly once.
+        for config, args in writes:
+            with self.subTest(unpaused=args[0]), patch.object(m.Path, "cwd", return_value=self.path):
+                run = Mock(return_value=target)
+                m.model_api(config, args, run=run, read=lambda _path: pr(labels=["bug", "needs-decision"]))
+                self.assertEqual(sum("POST" in call.args[0] for call in run.call_args_list), 1)
+
+    def test_pause_never_blocks_the_workflow_terminal_handback(self):
+        (self.path / "context.json").write_text(json.dumps(CONFIG))
+        (self.path / "attempt.json").write_text(json.dumps({"candidate": B}))
+        def live(path, timeout=30):
+            return pr(B, labels=["claude:pause"]) if path.endswith("/pulls/7") else {"status": "ahead"}
+        with patch.object(m, "__file__", str(self.path / "pre-push")), \
+                patch.object(sys, "argv", ["pre-push", "terminal"]), \
+                patch.object(m, "api", side_effect=live), patch.object(m, "command", return_value="") as post, \
+                patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(self.path / "summary"), "MODEL_OUTCOME": "success",
+                                        "EXECUTION_FILE": str(self.execution)}), \
+                patch("builtins.print"):
+            self.assertEqual(m.main(), 0)
+        self.assertEqual(post.call_args.args[0][:4], ["gh", "api", "--method", "POST"])
+        self.assertEqual(post.call_args.args[0][4], "repos/acme/example/issues/7/comments")
+        self.assertIn(f"Guarded candidate reachable on the live PR: `{B}`", json.loads(post.call_args.kwargs["input"])["body"])
 
     def test_install_accepts_only_the_handoff_label(self):
         env = {"REPO": CONFIG["repo"], "PR_NUMBER": "7", "HEAD_SHA": A, "HEAD_REF": "fix"}

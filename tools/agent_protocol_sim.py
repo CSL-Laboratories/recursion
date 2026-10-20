@@ -650,6 +650,14 @@ class Evaluation:
         """
         ended = self.ended(old, posted)
         if ended == "deleted" and old.comment.deleted_at is None:
+            # A release, withdrawal or revoke with a known time still counts.
+            for label, when in (
+                ("withdrawn", old.withdrawn_at()),
+                ("released", old.released_at()),
+                ("revoked", self.revoked_at(old)),
+            ):
+                if when is not None and when <= posted:
+                    return label
             return None
         return ended if ended in {"withdrawn", "released", "revoked", "deleted"} else None
 
@@ -772,9 +780,9 @@ class Evaluation:
 
         A claim that lost and never withdrew cannot win when the winner
         expires; it must take that claim over (decision 3, CSL-389 comment
-        425b223c). The race is settled at the end of the read-back window.
+        425b223c). The race is settled when the claim could first be live.
         """
-        settled_at = claim.created_at + self.readback
+        settled_at = self.settles_at(claim)
         if settled_at >= at:
             return False
         settled = self.winner(claim.issue, claim.repo, settled_at)
@@ -782,6 +790,13 @@ class Evaluation:
             settled is not None and settled.uuid != claim.uuid and settled.uuid not in claim.takeovers
             and self.ended(settled, at) == "expired"
         )
+
+    def settles_at(self, claim: Claim) -> datetime:
+        """When the claim's race is decided: the end of the read-back window,
+        or for a takeover, the end of its wait, before which it cannot win."""
+        if claim.takeovers:
+            return claim.created_at + max(self.readback, self.takeover_wait)
+        return claim.created_at + self.readback
 
     def winner(self, issue: str, repo: str, at: datetime) -> Claim | None:
         key = (issue, repo, at)
@@ -1200,7 +1215,7 @@ class Evaluation:
             winner = self.winner(claim.issue, claim.repo, at)
             if winner is None or winner.uuid != claim.uuid:
                 self.violation("write_by_non_winner", claim.issue, claim.uuid, what)
-            elif self.held_at(claim.issue, at) or self.held_at(write["issue"], at):
+            elif any(self.held_at(scoped, at) for scoped in claim.scope_issues(self.issues)):
                 self.violation("write_while_held", claim.issue, claim.uuid, what)
 
     def check_commits(self) -> None:
@@ -1252,7 +1267,7 @@ class Evaluation:
                     continue
                 for claim in self.claims.values():
                     confirmed = claim.confirmed_at()
-                    if claim.issue != issue_id or confirmed is None:
+                    if issue_id not in claim.scope_issues(self.issues) or confirmed is None:
                         continue
                     answer = self.answer_at(state, confirmed)
                     if answer is None:

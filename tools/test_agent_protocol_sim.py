@@ -1177,6 +1177,24 @@ class SubIssueScopeTests(unittest.TestCase):
         result = sim.evaluate(snapshot(10, family, [scoped("c1", "CSL-1", U1, "CSL-2")], writes=writes))
         self.assertEqual(codes(result), ["claim_on_held_scope", "write_while_held"])
 
+    def test_child_held_after_the_claim_stops_parent_writes_too(self):
+        # Devin and Fable reviews of recursion#260: a hold on the scoped child
+        # covers the whole claim.
+        family = self.family(blocked_by=["CSL-3"]) + [issue("CSL-3", decision=decision(pings=(3,)))]
+        writes = [{"kind": "push", "issue": "CSL-1", "claim": U1, "at": ts(5)},
+                  {"kind": "push", "issue": "CSL-2", "claim": U1, "at": ts(6)}]
+        result = sim.evaluate(snapshot(10, family, [scoped("c1", "CSL-1", U1, "CSL-2")], writes=writes))
+        self.assertEqual(codes(result), ["write_while_held", "write_while_held"])
+
+    def test_answered_child_blocker_needs_a_decision_record(self):
+        family = self.family(blocked_by=["CSL-3"]) + [issue("CSL-3", decision=decision(pings=(0.1,)))]
+        answer = comment("h1", "CSL-3", 0.5, "DECISION: A")
+        late = scoped("c1", "CSL-1", U1, "CSL-2", at=1)
+        result = sim.evaluate(snapshot(10, family, [answer, late]))
+        self.assertEqual([(v["code"], v["issue"]) for v in result["violations"]], [("decision_not_recorded", "CSL-3")])
+        record = comment("r1", "CSL-3", 1.5, "Agent (claude/s1, for Lucas): noted\ndecision-record: h1 A")
+        self.assertEqual(codes(sim.evaluate(snapshot(10, family, [answer, record, late]))), [])
+
     def test_parent_not_done_while_a_child_is_open_or_held(self):
         issues = [issue("CSL-1", status="Done"), issue("CSL-2", parent="CSL-1")]
         result = sim.evaluate(snapshot(10, issues, []))
@@ -1256,6 +1274,18 @@ class StandingLoserTests(unittest.TestCase):
         self.assertEqual(codes(result), ["loser_confirmed", "loser_not_withdrawn", "write_by_non_winner",
                                          "write_by_non_winner"])
 
+    def test_losing_taker_does_not_inherit_when_the_winning_taker_expires(self):
+        # Fable review of recursion#260 F1: two takeovers of one expired claim
+        # race at the end of their wait, not at read-back.
+        first = claim("c2", "CSL-1", U2, at=152, session="cursor/s2", extra=(f"takeover of {U1}",))
+        renew = [{"at": ts(m), "body": claim_body(U3, "grok/s3", confirmed=ts(152, 70),
+                                                   extra=(f"takeover of {U1}", f"heartbeat-at: {m}"))} for m in (250, 265)]
+        second = claim("c3", "CSL-1", U3, at=152, session="grok/s3", extra=(f"takeover of {U1}",), more_edits=renew)
+        writes = [{"kind": "push", "issue": "CSL-1", "claim": U3, "at": ts(278)}]
+        result = sim.evaluate(snapshot(280, [issue("CSL-1")], [claim("c1", "CSL-1", U1), first, second], writes=writes))
+        self.assertIsNone(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"])
+        self.assertEqual([(v["code"], v["claim"]) for v in result["violations"]], [("write_by_non_winner", U3)])
+
     def test_loser_wins_through_its_own_takeover(self):
         loser = claim("c3", "CSL-1", U3, at=100, session="grok/s3", confirm_after=None,
                       more_edits=[{"at": ts(101.5), "body": claim_body(U3, "grok/s3", extra=("withdrawn: lost",))}])
@@ -1309,6 +1339,15 @@ class TakeoverEffectTests(unittest.TestCase):
                             comment("h1", "CSL-1", ack_at, f"ACK TAKEOVER {U1}"), fresh]
                 result = sim.evaluate(snapshot(185, [issue("CSL-1")], comments, config=config))
                 self.assertEqual(codes(result), expected)
+
+    def test_release_before_an_undated_deletion_still_counts(self):
+        # Devin review of recursion#260: an undated deletion must not hide a
+        # known earlier release of the original.
+        original = claim("c1", "CSL-1", U1, deleted=True, more_edits=[edit(30, U1, "released")])
+        early = claim("c2", "CSL-1", U2, at=40, session="cursor/s2", extra=(f"takeover of {U1}",))
+        result = sim.evaluate(snapshot(60, [issue("CSL-1")], [original, early]))
+        self.assertEqual(result["issues"]["CSL-1"]["takeovers"][U2]["reason"], "original released")
+        self.assertNotIn("takeover_refused", codes(result))
 
     def test_deletion_after_withdrawal_keeps_the_fault_answered(self):
         for how in ("withdrawn: premature", "released"):

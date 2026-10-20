@@ -228,6 +228,28 @@ class LeaseTests(unittest.TestCase):
     def test_takeover_before_grace_is_refused(self):
         result = sim.evaluate(snapshot(140, [issue("CSL-1")], [claim("c1", "CSL-1", U1), self.takeover(at=125)]))
         self.assertEqual(result["issues"]["CSL-1"]["takeovers"][U2]["reason"], "lease plus grace not passed")
+        refused = [v for v in result["violations"] if v["code"] == "takeover_refused"]
+        self.assertEqual([(v["claim"], v["detail"]) for v in refused], [(U2, "lease plus grace not passed")])
+
+    def test_withdrawn_refused_takeover_is_not_reported(self):
+        early = self.takeover(at=125)
+        early["edits"].append({"at": ts(127), "body": early["edits"][0]["body"] + "\nwithdrawn: lease not over"})
+        result = sim.evaluate(snapshot(140, [issue("CSL-1")], [claim("c1", "CSL-1", U1), early]))
+        self.assertNotIn("takeover_refused", codes(result))
+
+    def test_takeover_waiting_on_time_or_an_ack_is_not_refused(self):
+        waiting = sim.evaluate(snapshot(155, [issue("CSL-1")], [claim("c1", "CSL-1", U1), self.takeover()]))
+        self.assertNotIn("takeover_refused", codes(waiting))
+        no_ack = sim.evaluate(snapshot(170, [issue("CSL-1")], [claim("c1", "CSL-1", U1), self.takeover()],
+                                       config={"coordinator_ack_required": True}))
+        self.assertNotIn("takeover_refused", codes(no_ack))
+
+    def test_competing_takeover_during_the_wait(self):
+        u3 = "33333333-3333-4333-8333-333333333333"
+        rival = claim("c3", "CSL-1", u3, at=160, session="grok/s3", extra=(f"takeover of {U1}",))
+        result = sim.evaluate(snapshot(165, [issue("CSL-1")], [claim("c1", "CSL-1", U1), self.takeover(), rival]))
+        during = [v for v in result["violations"] if v["code"] == "claim_during_takeover_wait"]
+        self.assertEqual([(v["claim"], v["detail"]) for v in during], [(u3, f"takeover {U2}")])
 
     def test_s7_takeover_refused_when_commit_is_newer_than_heartbeat(self):
         commits = [{"sha": "c0ffee", "branch": "csl-1-work", "at": ts(60), "author_kind": "agent", "claim": U1}]
@@ -267,6 +289,10 @@ class LeaseTests(unittest.TestCase):
         result = sim.evaluate(snapshot(170, [issue("CSL-1")], [claim("c1", "CSL-1", U1), withdrawn, third]))
         self.assertEqual(codes(result), ["claim_without_takeover"])
         self.assertEqual(result["violations"][0]["claim"], u3)
+        writes = [{"kind": "push", "issue": "CSL-1", "claim": u3, "at": ts(200)}]
+        result = sim.evaluate(snapshot(210, [issue("CSL-1")], [claim("c1", "CSL-1", U1), withdrawn, third], writes=writes))
+        self.assertIsNone(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"])
+        self.assertEqual(codes(result), ["claim_without_takeover", "write_by_non_winner"])
 
     def test_acknowledgement_re_added_after_the_takeover_counts(self):
         ack = comment("h1", "CSL-1", 140, f"ACK TAKEOVER {U1}")
@@ -416,6 +442,13 @@ class CommitTests(unittest.TestCase):
         writes = [{"kind": "push", "issue": "CSL-1", "claim": U1, "at": ts(0, s)} for s in (10, 20)]
         result = sim.evaluate(snapshot(10, [issue("CSL-1")], [claim("c1", "CSL-1", U1)], writes=writes))
         self.assertEqual(codes(result), ["write_before_confirm", "write_before_confirm"])
+
+    def test_write_after_deletion_has_its_own_code(self):
+        deleted = claim("c1", "CSL-1", U1, deleted=True)
+        deleted["deleted_at"] = ts(30)
+        writes = [{"kind": "push", "issue": "CSL-1", "claim": U1, "at": ts(40)}]
+        result = sim.evaluate(snapshot(50, [issue("CSL-1")], [deleted], writes=writes))
+        self.assertEqual(codes(result), ["write_after_deletion"])
 
     def test_deletion_time_bounds_the_claim(self):
         deleted = claim("c1", "CSL-1", U1, deleted=True)

@@ -86,6 +86,7 @@ TIMESTAMP_VALUE = re.compile(r"^\d{4}-\d{2}-\d{2}T")
 PLACEHOLDER = re.compile(r"^\([^()\n]*[^()\s][^()\n]*\)$")
 DECISION_RECORD = re.compile(r"^decision-record:\s*(\S+)\s+([A-Za-z0-9_-]+)\s*$")
 AFTER_END = {
+    "deleted": "after_deletion",
     "expired": "after_expiry",
     "revoked": "after_revoke",
     "released": "after_release",
@@ -964,6 +965,7 @@ class Evaluation:
                 if claim.withdrawn_at() is None:
                     self.violation("loser_not_withdrawn", claim.issue, claim.uuid, f"winner {settled.uuid}")
             self.check_implicit_takeover(claim)
+            self.check_takeover_refused(claim)
             others = [
                 other for other in self.claims.values()
                 if other.uuid != claim.uuid and other.session == claim.session and other.repo == claim.repo
@@ -978,6 +980,24 @@ class Evaluation:
                         run.get("ended_at") is None or run["ended_at"] > released
                     ):
                         self.violation("release_before_writers_stopped", claim.issue, claim.uuid, run["id"])
+
+    # Refusals that wait on time or a human acknowledgement, or that come from
+    # the original claimant objecting afterwards, are not the taker's fault;
+    # every other refusal means the takeover was posted when the rules did
+    # not allow it.
+    PENDING_TAKEOVER = {
+        "takeover wait not over",
+        "coordinator acknowledgement missing",
+        "original claimant renewed within the wait",
+    }
+
+    def check_takeover_refused(self, claim: Claim) -> None:
+        status = self.takeover_status(claim)
+        if status is None or status["allowed"] or status["reason"] in self.PENDING_TAKEOVER:
+            return
+        if self.ended(claim, self.now) in {"withdrawn", "released", "revoked", "deleted"}:
+            return
+        self.violation("takeover_refused", claim.issue, claim.uuid, status["reason"])
 
     def check_implicit_takeover(self, claim: Claim) -> None:
         """A fresh claim must not bypass the takeover rules (spec section 7).

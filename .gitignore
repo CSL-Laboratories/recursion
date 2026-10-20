@@ -19,6 +19,8 @@ loop/logs/
 .claude/hooks/*
 !.claude/hooks/session-start.sh
 !.claude/skills/
+.claude/skills/*
+!.claude/skills/proceed-or-escalate/
 .tmp/
 
 # Local tool binaries (downloaded, not committed): TLA+ tools for FU-03

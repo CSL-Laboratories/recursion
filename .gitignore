@@ -18,6 +18,7 @@ loop/logs/
 !.claude/hooks/
 .claude/hooks/*
 !.claude/hooks/session-start.sh
+!.claude/hooks/guard-substitution.sh
 !.claude/skills/
 .claude/skills/*
 !.claude/skills/proceed-or-escalate/

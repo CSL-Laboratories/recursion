@@ -2720,6 +2720,59 @@ class RenderedGateTests(unittest.TestCase):
         self.assertIsNone(mod._parse_comment({"body": "x"}).body_html)
 
 
+class CodexAuthorIdentityTests(unittest.TestCase):
+    """A ruling counts only from the Codex App's bot account (CSL-365)."""
+
+    def _ruling(self, login: str, author_type: str) -> mod.Comment:
+        body = verdict_block("PRRT_1")
+        return mod.Comment(
+            login=login, body=body, created_at=ts(0.1),
+            body_html=github_render(body), author_type=author_type,
+        )
+
+    def _reason(self, ruling: mod.Comment) -> tuple[str, FakeGitHub]:
+        t = thread(tid="PRRT_1", comments=stuck_pair())
+        asked = [comment("pat-user", mod.mediation_marker("PRRT_1"), hours_ago=0.4)]
+        p = pull(threads=[t], issue_comments=asked, reviews=[ruling], checks_green=True)
+        reason = mod.classify_resolve(p, t, cfg(mediator_login="pat-user"))
+        gh = FakeGitHub([p])
+        mod.scan(cfg(mediator_login="pat-user"), gh, FakeLinear())  # type: ignore[arg-type]
+        return reason, gh
+
+    def test_graphql_bot_and_rest_bot_logins_are_trusted(self) -> None:
+        for login, author_type in (
+            ("chatgpt-codex-connector", "Bot"),  # GraphQL shape
+            ("chatgpt-codex-connector[bot]", ""),  # REST shape
+            ("chatgpt-codex-connector[bot]", "Bot"),
+        ):
+            with self.subTest(login=login, author_type=author_type):
+                reason, gh = self._reason(self._ruling(login, author_type))
+                self.assertEqual(reason, "resolve")
+                self.assertEqual(gh.resolves, ["PRRT_1"])
+
+    def test_look_alike_user_accounts_are_not_codex(self) -> None:
+        for login, author_type in (
+            ("chatgpt-codex-connector", "User"),
+            ("chatgpt-codex-connector", ""),
+            ("ChatGPT-Codex-Connector", "User"),
+            ("chatgpt-codex-connector", "Organization"),
+            ("chatgpt-codex-connector[bot]", "User"),
+        ):
+            with self.subTest(login=login, author_type=author_type):
+                reason, gh = self._reason(self._ruling(login, author_type))
+                self.assertEqual(reason, "no-verdict")
+                self.assertEqual(gh.resolves, [])
+                self.assertEqual(gh.replies, [])
+
+    def test_graphql_queries_request_the_author_type(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertNotIn("author { login }", source)
+        self.assertEqual(source.count("author { login __typename }"), 4)
+        node = {"author": {"login": "chatgpt-codex-connector", "__typename": "Bot"}, "body": "x"}
+        self.assertEqual(mod._parse_comment(node).author_type, "Bot")
+        self.assertEqual(mod._parse_comment({"author": {"login": "x"}, "body": "y"}).author_type, "")
+
+
 class WorkflowAndDocsTests(unittest.TestCase):
     def setUp(self) -> None:
         self.workflow = WORKFLOW.read_text(encoding="utf-8")

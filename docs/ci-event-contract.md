@@ -153,7 +153,7 @@ GitHub `==` is case-insensitive. Exactness comes from the preflight shell (`ci.y
 
 | Workflow | Group | Cancel / queue | Lines |
 |---|---|---|---|
-| `ci.yml` | `ci-CI-<PR number>`; push `ci-CI-refs/heads/master`; dispatch `ci-CI-refs/heads/<branch>` | `cancel-in-progress: true` | `ci.yml:67-69` |
+| `ci.yml` | `ci-CI-<PR number>`; push `ci-CI-refs/heads/master`; dispatch `ci-CI-<github.ref>` (`refs/heads/<branch>` or `refs/tags/<tag>`) | `cancel-in-progress: true` | `ci.yml:67-69` |
 | `ci-full-label.yml` | `ci-full-label-<PR>-<label>` | `cancel-in-progress: true` | `ci-full-label.yml:13-15` |
 | `ci-full-matrix.yml` | none (reusable; runs in the caller's run) | n/a | `ci-full-matrix.yml:6-7` |
 | `ci-macos-nightly.yml` | `ci-macos-nightly` | `cancel-in-progress: true` | `ci-macos-nightly.yml:14-16` |

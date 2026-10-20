@@ -227,6 +227,20 @@ def human_lines(comment: Comment) -> list[str]:
     return [line.strip() for line in comment.body.split("\n")]
 
 
+def first_seen(comment: Comment, line: str) -> datetime | None:
+    """When `line` first appeared in the comment, from its revision history."""
+    for revision in comment.revisions:
+        if line in (part.strip() for part in revision.body.split("\n")):
+            return revision.at
+    return None
+
+
+def present_at(comment: Comment, line: str, at: datetime) -> bool:
+    """Whether `line` is in the revision of the comment in effect at `at`."""
+    effective = [r for r in comment.revisions if r.at <= at]
+    return bool(effective) and line in (part.strip() for part in effective[-1].body.split("\n"))
+
+
 class Evaluation:
     def __init__(self, snapshot: dict[str, Any]):
         if not isinstance(snapshot, dict):
@@ -250,6 +264,7 @@ class Evaluation:
         self.grace = timedelta(minutes=self.config["grace_minutes"])
         self.readback = timedelta(seconds=self.config["readback_seconds"])
         self.takeover_wait = timedelta(minutes=self.config["takeover_wait_minutes"])
+        self._revoked: dict[str, datetime | None] = {}
         self.violations: list[dict[str, Any]] = []
         self.void_lines: list[dict[str, str]] = []
         self.issues = self._load_issues(require(snapshot, "issues", "snapshot"))
@@ -334,6 +349,8 @@ class Evaluation:
             issue = require(item, "issue", comment_id)
             self._known_issue(issue, f"comment {comment_id}")
             created = parse_ts(require(item, "created_at", comment_id), comment_id)
+            if created > self.now:
+                raise SnapshotError(f"comment {comment_id}: created after the snapshot time")
             body = require(item, "body", comment_id)
             if not isinstance(body, str):
                 raise SnapshotError(f"comment {comment_id}: body must be a string")
@@ -342,6 +359,8 @@ class Evaluation:
                 at = parse_ts(require(edit, "at", comment_id), comment_id)
                 if at < revisions[-1].at:
                     raise SnapshotError(f"comment {comment_id}: edits out of order")
+                if at > self.now:
+                    raise SnapshotError(f"comment {comment_id}: edited after the snapshot time")
                 edited = require(edit, "body", comment_id)
                 if not isinstance(edited, str):
                     raise SnapshotError(f"comment {comment_id}: edit body must be a string")
@@ -370,6 +389,8 @@ class Evaluation:
                 if entry[field] is None and field == "ended_at":
                     continue
                 entry[field] = parse_ts(entry[field], key)
+                if entry[field] > self.now:
+                    raise SnapshotError(f"{key}: {field} after the snapshot time")
             items.append(entry)
         return items
 
@@ -428,13 +449,18 @@ class Evaluation:
         return [c for c in self.comments if not c.deleted and c.agent is None]
 
     def revoked_at(self, claim: Claim) -> datetime | None:
+        """When a revoke line naming the claim first appeared (edits are not backdated)."""
+        if claim.uuid in self._revoked:
+            return self._revoked[claim.uuid]
         times = [
-            c.created_at
-            for c in self.human_comments()
-            if c.issue == claim.issue
-            and any((m := REVOKE_CLAIM.match(line)) and m.group(1) == claim.uuid for line in human_lines(c))
+            seen
+            for c in self.human_comments() if c.issue == claim.issue
+            for line in human_lines(c)
+            if (m := REVOKE_CLAIM.match(line)) and m.group(1) == claim.uuid
+            and (seen := first_seen(c, line)) is not None
         ]
-        return min(times) if times else None
+        self._revoked[claim.uuid] = min(times) if times else None
+        return self._revoked[claim.uuid]
 
     def ended(self, claim: Claim, at: datetime) -> str | None:
         """Why the claim is not live at `at`, or None if it is live."""
@@ -461,6 +487,10 @@ class Evaluation:
         posted = claim.created_at
         if old is None or old.issue != claim.issue or old.repo != claim.repo:
             return {"of": claim.takeover_of, "allowed": False, "reason": "unknown claim"}
+        if old.created_at >= posted:
+            return {"of": old.uuid, "allowed": False, "reason": "original posted after the takeover"}
+        if at < posted + self.takeover_wait:
+            return {"of": old.uuid, "allowed": False, "reason": "takeover wait not over"}
         objection = [
             r.at for r in old.comment.revisions
             if posted <= r.at <= posted + self.takeover_wait
@@ -489,7 +519,8 @@ class Evaluation:
         if self.config["coordinator_ack_required"]:
             acked = any(
                 (m := ACK_TAKEOVER.match(line)) and m.group(1) == old.uuid
-                for c in self.human_comments() if c.issue == claim.issue and posted <= c.created_at <= at
+                and (seen := first_seen(c, line)) is not None and posted <= seen <= at
+                for c in self.human_comments() if c.issue == claim.issue
                 for line in human_lines(c)
             )
             if not acked:
@@ -612,12 +643,13 @@ class Evaluation:
             if started and not cleared:
                 reasons.append(f"awaiting decision {blocker}")
         for comment in self.human_comments():
-            if comment.created_at > at:
-                continue
-            for line in human_lines(comment):
-                match = HOLD.match(line)
-                if match and match.group(1) == issue_id:
-                    reasons.append(f"HOLD by comment {comment.id}")
+            for revision in comment.revisions:
+                for line in (part.strip() for part in revision.body.split("\n")):
+                    match = HOLD.match(line)
+                    if match and match.group(1) == issue_id and present_at(comment, line, at):
+                        reason = f"HOLD by comment {comment.id}"
+                        if reason not in reasons:
+                            reasons.append(reason)
         return reasons
 
     def collect_void_lines(self) -> None:
@@ -645,8 +677,10 @@ class Evaluation:
                 continue
             for line in lines:
                 match = REVOKE_SA.match(line)
-                if match:
-                    revoked.setdefault(match.group(1), comment.created_at)
+                seen = first_seen(comment, line) if match else None
+                if match and seen is not None:
+                    previous = revoked.get(match.group(1))
+                    revoked[match.group(1)] = seen if previous is None else min(previous, seen)
             if not header:
                 continue
             fields = {m.group(1): m.group(2) for line in lines[1:] if (m := FIELD.match(line))}
@@ -770,6 +804,8 @@ class Evaluation:
             winner = self.winner(claim.issue, claim.repo, at)
             if winner is None or winner.uuid != claim.uuid:
                 self.violation("write_by_non_winner", claim.issue, claim.uuid, what)
+            elif self.held_at(claim.issue, at):
+                self.violation("write_while_held", claim.issue, claim.uuid, what)
 
     def check_commits(self) -> None:
         for commit in self.commits:
@@ -815,7 +851,7 @@ class Evaluation:
                         continue
                     recorded = any(
                         c.issue == blocker and c.agent is not None and not c.deleted
-                        and c.created_at <= confirmed and state["answer_comment"] in c.body
+                        and any(r.at <= confirmed and state["answer_comment"] in r.body for r in c.revisions)
                         for c in self.comments
                     )
                     if not recorded:
@@ -825,11 +861,7 @@ class Evaluation:
         confirmed = claim.confirmed_at()
         if confirmed is None:
             return False
-        own = [
-            c["at"] for c in self.commits
-            if c.get("claim") == claim.uuid and c.get("repo", self.repo) == claim.repo and c["branch"] == claim.branch
-        ]
-        seen = max([confirmed, *own])
+        seen = confirmed  # a snapshot records no reads, so only confirmation counts as one
         return any(
             c.get("repo", self.repo) == claim.repo and c["branch"] == claim.branch
             and c.get("claim") != claim.uuid and c["at"] > seen and c["at"] <= self.now

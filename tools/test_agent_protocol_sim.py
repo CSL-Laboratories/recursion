@@ -256,6 +256,25 @@ class LeaseTests(unittest.TestCase):
         self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], U1)
         self.assertEqual(codes(result), ["write_by_non_winner"])
 
+    def test_no_winner_until_the_takeover_wait_ends(self):
+        result = sim.evaluate(snapshot(160, [issue("CSL-1")], [claim("c1", "CSL-1", U1), self.takeover()]))
+        self.assertEqual(result["issues"]["CSL-1"]["takeovers"][U2]["reason"], "takeover wait not over")
+        self.assertIsNone(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"])
+
+    def test_takeover_of_a_later_claim_is_refused(self):
+        later = claim("c1", "CSL-1", U1, at=160)
+        result = sim.evaluate(snapshot(200, [issue("CSL-1")], [later, self.takeover()]))
+        self.assertEqual(result["issues"]["CSL-1"]["takeovers"][U2]["reason"], "original posted after the takeover")
+
+    def test_acknowledgement_edited_in_later_does_not_validate_earlier_writes(self):
+        ack = comment("h1", "CSL-1", 153, "noted")
+        ack["edits"] = [{"at": ts(180), "body": f"noted\nACK TAKEOVER {U1}"}]
+        writes = [{"kind": "push", "issue": "CSL-1", "claim": U2, "at": ts(170)}]
+        result = sim.evaluate(snapshot(190, [issue("CSL-1")], [claim("c1", "CSL-1", U1), self.takeover(), ack],
+                                       writes=writes, config={"coordinator_ack_required": True}))
+        self.assertEqual(codes(result), ["write_by_non_winner"])
+        self.assertTrue(result["issues"]["CSL-1"]["takeovers"][U2]["allowed"])
+
     def test_takeover_that_writes_during_the_wait(self):
         writes = [{"kind": "push", "issue": "CSL-1", "claim": U2, "at": ts(160)}]
         result = sim.evaluate(snapshot(170, [issue("CSL-1")], [claim("c1", "CSL-1", U1), self.takeover()], writes=writes))
@@ -364,6 +383,14 @@ class DecisionTests(unittest.TestCase):
         result = sim.evaluate(snapshot(20, issues, [answer, records[0], late, work]))
         self.assertEqual(codes(result), ["decision_not_recorded"])
 
+    def test_decision_record_edited_in_after_confirm_does_not_count(self):
+        issues = [issue("CSL-1", blocked_by=["CSL-11"]), issue("CSL-11", decision=decision())]
+        answer = comment("h1", "CSL-11", 5, "DECISION: B")
+        record = comment("r1", "CSL-11", 9, "Agent (claude/s1, for Lucas): noted")
+        record["edits"] = [{"at": ts(15), "body": "Agent (claude/s1, for Lucas): recorded answer h1"}]
+        result = sim.evaluate(snapshot(20, issues, [answer, record, claim("c1", "CSL-1", U1, at=10)]))
+        self.assertEqual(codes(result), ["decision_not_recorded"])
+
     def test_batched_answer_on_an_unrelated_issue_is_ignored(self):
         issues = [issue("CSL-2", decision=decision()), issue("CSL-5")]
         result = sim.evaluate(snapshot(10, issues, [comment("h1", "CSL-5", 5, "CSL-2: B")]))
@@ -396,6 +423,26 @@ class DecisionTests(unittest.TestCase):
         self.assertFalse(result["decisions"]["CSL-2"]["answered"])
         self.assertTrue(result["issues"]["CSL-1"]["held"])
         self.assertEqual(result["void_lines"][0]["comment"], "a1")
+
+    def test_write_while_held_is_flagged(self):
+        hold = comment("h1", "CSL-1", 5, "HOLD CSL-1")
+        writes = [{"kind": "push", "issue": "CSL-1", "claim": U1, "at": ts(6)}]
+        result = sim.evaluate(snapshot(10, [issue("CSL-1")], [claim("c1", "CSL-1", U1), hold], writes=writes))
+        self.assertEqual(codes(result), ["write_while_held"])
+
+    def test_hold_removed_by_edit_no_longer_holds(self):
+        hold = comment("h1", "CSL-1", 5, "HOLD CSL-1")
+        hold["edits"] = [{"at": ts(8), "body": "never mind"}]
+        result = sim.evaluate(snapshot(10, [issue("CSL-1")], [hold]))
+        self.assertFalse(result["issues"]["CSL-1"]["held"])
+
+    def test_revoke_edited_in_later_is_not_backdated(self):
+        note = comment("h1", "CSL-1", 1, "looks good")
+        note["edits"] = [{"at": ts(20), "body": f"looks good\nREVOKE CLAIM {U1}"}]
+        writes = [{"kind": "push", "issue": "CSL-1", "claim": U1, "at": ts(10)}]
+        result = sim.evaluate(snapshot(30, [issue("CSL-1")], [claim("c1", "CSL-1", U1), note], writes=writes))
+        self.assertEqual(codes(result), [])
+        self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["live_claims"], [])
 
     def test_human_hold_widens_the_hold(self):
         result = sim.evaluate(snapshot(10, [issue("CSL-1"), issue("CSL-5")], [comment("h1", "CSL-5", 1, "HOLD CSL-1")]))
@@ -484,8 +531,14 @@ class StandingApprovalTests(unittest.TestCase):
         self.assertEqual(codes(self.run_actions([], self.approval(expires="2027-01-18"))), [])
 
     def test_total_limit(self):
-        result = self.run_actions([self.action(10), self.action(60 * 30)], self.approval(limits="total=1"))
+        result = self.run_actions([self.action(10), self.action(500)], self.approval(limits="total=1"))
         self.assertEqual(codes(result), ["sa_over_limit"])
+
+    def test_earliest_revocation_counts_regardless_of_order(self):
+        comments = [comment("h3", "CSL-90", 30, "REVOKE SA-1"), self.approval(), comment("h2", "CSL-90", 5, "REVOKE SA-1")]
+        result = sim.evaluate(snapshot(600, [issue("CSL-90")], comments, config=self.CONFIG,
+                                       sa_actions=[self.action(10)]))
+        self.assertEqual(codes(result), ["sa_revoked"])
 
     def test_unparseable_limits_fail_closed(self):
         with self.assertRaises(sim.SnapshotError):
@@ -564,6 +617,10 @@ class MalformedSnapshotTests(unittest.TestCase):
 
     def test_triage_issue_cannot_be_admitted(self):
         self.assert_rejected(lambda s: s["issues"][0].update(status="Triage"))
+
+    def test_events_after_the_snapshot_time(self):
+        self.assert_rejected(lambda s: s["comments"].append(comment("c2", "CSL-1", 20, "later")))
+        self.assert_rejected(lambda s: s.update(writes=[{"kind": "push", "issue": "CSL-1", "claim": U1, "at": ts(20)}]))
 
     def test_unknown_status(self):
         self.assert_rejected(lambda s: s["issues"][0].update(status="Blocked"))

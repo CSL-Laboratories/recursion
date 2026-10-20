@@ -62,6 +62,22 @@ class ProgramControlTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.data = json.loads(LEDGER.read_text(encoding="utf-8"))
+        # Mutation tests construct their own hypothetical admission envelopes.
+        # Retire the production admission receipt in this disposable fixture,
+        # otherwise those mutations correctly invalidate its bound target.
+        admission_receipt = self.data["admission"]["decision_receipt"]
+        for decision in self.data["decisions"]:
+            if admission_receipt is not None and decision["id"] == admission_receipt:
+                decision["status"] = "superseded"
+        self.data["admission"].update(
+            max_active_contract_consumers=None,
+            max_concurrent_reviews=None,
+            decision_receipt=None,
+        )
+
+    def test_checked_in_ledger_with_current_admission_receipt(self) -> None:
+        production = json.loads(LEDGER.read_text(encoding="utf-8"))
+        self.assertEqual(self.errors(production), [])
 
     def errors(self, data=None):
         # Shared snapshot of an unmodified checkout: its path list and already-queried

@@ -136,13 +136,41 @@
       "submission_timezone": "UTC",
       "approval_evidence": "Direct human comment by Lucas Guerra: https://linear.app/csl-laboratories/issue/CSL-204#comment-af98ee2f-fb3d-4346-b8ec-5a4176f235a5. Submitted 2026-10-18 02:11:13.825 UTC (2026-10-17 19:11:13.825 PDT, UTC-07:00). Supplements preceding direct B6 confirmation https://linear.app/csl-laboratories/issue/CSL-204#comment-d59f7b62-0244-4b8e-be9b-738922b70f87.",
       "revisit_trigger": "The contract bytes, approved scope or authority boundary change."
+    },
+    {
+      "id": "decision.csl-298.admission-4-2.two-review-revisit.2026-10-20",
+      "status": "approved",
+      "proposal_id": "proposal.csl-298.admission-4-2.two-review-revisit.2026-10-20",
+      "proposal_digest": "1055e786eff10644646f2b2024a6b5b7fba3e37b7153e3c1f94b6743758b9b13",
+      "scope": [
+        "recursion.month-program.2026-10"
+      ],
+      "linear_issue": "CSL-204",
+      "approval_comment_id": "b4fad421-6a42-48d9-83b1-26e2f2cbc585",
+      "human_decider": "Lucas Guerra",
+      "authority_basis": "Lucas Guerra acting under his founder authority",
+      "selected_option": "Four active contract consumers and two concurrent reviews",
+      "rejected_options": [
+        "Uncapped admission"
+      ],
+      "rationale": "Bound this program’s throughput to independent-review capacity.",
+      "conditions": [
+        "Use the second review slot only when a second independent reviewer is actually available.",
+        "Pause new admissions when both review slots are occupied and completed work is waiting; existing admitted work continues.",
+        "Reassess after the first two completed independent reviews using review wait and rework.",
+        "These limits cover only this program’s contract-consuming work and review lanes, not unrelated research or organization-wide PRs.",
+        "These conditions remain manual and digest-bound. Reconcile actual occupancy and reviewer availability before admission; preserve each item’s contract, dependency and independent-review gates. Keep program.status=candidate and prior history. This grants no live-action, spending, credential, deployment or merge authority, and no mandatory 2/1 fallback. Revisit after those two reviews or any material packet, scope or capacity change."
+      ],
+      "decided_on": "2026-10-20",
+      "approval_evidence": "https://linear.app/csl-laboratories/issue/CSL-204#comment-b4fad421-6a42-48d9-83b1-26e2f2cbc585; author Lucas Guerra; submitted 2026-10-20T03:51:55.625Z (UTC). Direct human submission confirmed by Lucas through the parent task and corroborated against the authenticated Linear response.",
+      "revisit_trigger": "After the first two completed independent reviews or any material packet, scope or capacity change."
     }
   ],
   "admission": {
     "mode": "bounded_autonomy",
-    "max_active_contract_consumers": null,
-    "max_concurrent_reviews": null,
-    "decision_receipt": null,
+    "max_active_contract_consumers": 4,
+    "max_concurrent_reviews": 2,
+    "decision_receipt": "decision.csl-298.admission-4-2.two-review-revisit.2026-10-20",
     "routine_work_default": "proceed",
     "human_gate_default": "block_affected_lineage_only",
     "allowed_agent_actions": [
@@ -165,7 +193,13 @@
     ],
     "active_contract_consumers": [],
     "active_reviews": [],
-    "decision_issue": "CSL-204"
+    "decision_issue": "CSL-204",
+    "capacity_conditions": [
+      "Use the second review slot only when a second independent reviewer is actually available.",
+      "Pause new admissions when both review slots are occupied and completed work is waiting; existing admitted work continues.",
+      "Reassess after the first two completed independent reviews using review wait and rework.",
+      "These limits apply only to this program's contract-consuming work and review lanes; they do not cap unrelated research."
+    ]
   },
   "work_items": [
     {
@@ -303,6 +337,24 @@
           "action": "accept_contract",
           "target": "contract.issue-anti-drift",
           "target_digest": "2f2e07ffa4ba823ca53cbc7325345afd84a5a2b74cdf51002ad995482a80383b"
+        }
+      ]
+    },
+    {
+      "id": "proposal.csl-298.admission-4-2.two-review-revisit.2026-10-20",
+      "linear_issue": "CSL-204",
+      "scope": [
+        "recursion.month-program.2026-10"
+      ],
+      "contract_bindings": [],
+      "unknown_bindings": [],
+      "checkpoint_bindings": [],
+      "research_bindings": [],
+      "authorizations": [
+        {
+          "action": "admit_work",
+          "target": "recursion.month-program.2026-10",
+          "target_digest": "268a9e3d7cd44b436a29976e76deff369a57ea43c583c33e90524f7d458b3a7e"
         }
       ]
     }

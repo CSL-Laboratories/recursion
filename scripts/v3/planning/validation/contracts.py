@@ -32,11 +32,167 @@ BUDGET_FIELDS = (
     "attempts", "cpu_ms", "memory_bytes", "model_turns", "money_minor", "output_bytes", "tokens",
 )
 LEASE_COMMAND_REPORTING_EXEMPT = {"raise-blocker", "raise-escalation"}
+_LEASE_TYPES = frozenset({"executive-lease", "work-lease"})
+_OBJECT_REF_FIELDS = ("object_type", "id", "version", "content_digest")
+_OBJECT_REF_FIELD_SET = set(_OBJECT_REF_FIELDS)
+# Sentinel: the index cannot answer this lookup, so the linear scan must run.
+_FALLBACK = object()
 
 
-def _find_record(state: dict, ref: dict | None, object_type: str | None = None) -> dict | None:
+class _RecordIndex:
+    """Records grouped once, in encounter order, for first-match lookups."""
+
+    __slots__ = (
+        "by_type", "by_id", "by_type_id", "by_type_id_version", "by_id_version", "leases",
+    )
+
+    def __init__(self, records: list) -> None:
+        by_type: dict = {}
+        by_id: dict = {}
+        by_type_id: dict = {}
+        by_type_id_version: dict = {}
+        by_id_version: dict = {}
+        leases = []
+        for record in records:
+            object_type = record["object_type"]
+            record_id = record["id"]
+            version = record["version"]
+            by_type.setdefault(object_type, []).append(record)
+            by_id.setdefault(record_id, []).append(record)
+            by_type_id.setdefault((object_type, record_id), []).append(record)
+            by_type_id_version.setdefault((object_type, record_id, version), []).append(record)
+            by_id_version.setdefault((record_id, version), []).append(record)
+            if object_type in _LEASE_TYPES:
+                leases.append(record)
+        self.by_type = by_type
+        self.by_id = by_id
+        self.by_type_id = by_type_id
+        self.by_type_id_version = by_type_id_version
+        self.by_id_version = by_id_version
+        self.leases = leases
+
+    def find(self, ref: dict, object_type: str | None):
+        expected_id = ref.get("id", ref.get("lease_id"))
+        versioned = "version" in ref
+        try:
+            if object_type:
+                if versioned:
+                    candidates = self.by_type_id_version.get(
+                        (object_type, expected_id, ref["version"]), ()
+                    )
+                    versioned = False
+                else:
+                    candidates = self.by_type_id.get((object_type, expected_id), ())
+            elif versioned:
+                candidates = self.by_id_version.get((expected_id, ref["version"]), ())
+                versioned = False
+            else:
+                candidates = self.by_id.get(expected_id, ())
+        except TypeError:
+            return _FALLBACK
+        check_digest = "content_digest" in ref
+        digest_value = ref["content_digest"] if check_digest else None
+        for record in candidates:
+            if versioned and record["version"] != ref["version"]:
+                continue
+            if not check_digest or record["content_digest"] == digest_value:
+                return record
+        return None
+
+
+class _AdmissionView:
+    """Indexes and digest memo built once per validate_admission call."""
+
+    __slots__ = (
+        "state", "policy_fixtures", "_records", "_records_ready", "_policies",
+        "_policies_ready", "_states", "_states_ready", "_digests",
+    )
+
+    def __init__(self, state: dict, policy_fixtures: list) -> None:
+        self.state = state
+        self.policy_fixtures = policy_fixtures
+        self._records = None
+        self._records_ready = False
+        self._policies = None
+        self._policies_ready = False
+        self._states = None
+        self._states_ready = False
+        self._digests = {}
+
+    def record_index(self):
+        if not self._records_ready:
+            self._records_ready = True
+            try:
+                records = self.state["records"]
+            except (TypeError, KeyError):
+                records = None
+            if isinstance(records, (list, tuple)):
+                try:
+                    self._records = _RecordIndex(records)
+                except (TypeError, KeyError):
+                    self._records = None
+        return self._records
+
+    def policy_index(self):
+        if not self._policies_ready:
+            self._policies_ready = True
+            policies = self.policy_fixtures
+            if isinstance(policies, (list, tuple)):
+                try:
+                    buckets: dict = {}
+                    for policy in policies:
+                        key = (
+                            policy["policy_id"], policy["policy_version"],
+                            policy["content_digest"],
+                        )
+                        buckets.setdefault(key, []).append(policy)
+                    self._policies = buckets
+                except (TypeError, KeyError):
+                    self._policies = None
+        return self._policies
+
+    def state_index(self):
+        if not self._states_ready:
+            self._states_ready = True
+            try:
+                items = self.state["object_states"]
+            except (TypeError, KeyError):
+                items = None
+            if isinstance(items, (list, tuple)):
+                try:
+                    found: dict = {}
+                    for item in items:
+                        ref = item["object_ref"]
+                        if set(ref) != _OBJECT_REF_FIELD_SET:
+                            raise TypeError
+                        key = tuple(ref[field] for field in _OBJECT_REF_FIELDS)
+                        if key not in found:
+                            found[key] = item["state"]
+                    self._states = found
+                except (TypeError, KeyError):
+                    self._states = None
+        return self._states
+
+    def policy_digest(self, policy: dict) -> str:
+        key = id(policy)
+        try:
+            return self._digests[key]
+        except KeyError:
+            value = digest(policy, omit_content_digest=True)
+            self._digests[key] = value
+            return value
+
+
+def _find_record(state: dict, ref: dict | None, object_type: str | None = None,
+                 view: _AdmissionView | None = None) -> dict | None:
     if ref is None:
         return None
+    if view is not None:
+        index = view.record_index()
+        if index is not None:
+            found = index.find(ref, object_type)
+            if found is not _FALLBACK:
+                return found
     expected_id = ref.get("id", ref.get("lease_id"))
     for record in state["records"]:
         if object_type and record["object_type"] != object_type:
@@ -50,23 +206,60 @@ def _find_record(state: dict, ref: dict | None, object_type: str | None = None) 
     return None
 
 
-def _object_state(state: dict, record: dict) -> str | None:
+def _object_state(state: dict, record: dict, view: _AdmissionView | None = None) -> str | None:
     target = {
         "object_type": record["object_type"], "id": record["id"], "version": record["version"],
         "content_digest": record["content_digest"],
     }
+    if view is not None:
+        index = view.state_index()
+        if index is not None:
+            try:
+                return index.get(tuple(target[field] for field in _OBJECT_REF_FIELDS))
+            except TypeError:
+                pass
     return next((item["state"] for item in state["object_states"] if item["object_ref"] == target), None)
 
 
-def _policy(policy_fixtures: list[dict], ref: dict | None, kind: str | None = None) -> dict | None:
+def _policy_digest(policy: dict, view: _AdmissionView | None) -> str:
+    if view is None:
+        return digest(policy, omit_content_digest=True)
+    return view.policy_digest(policy)
+
+
+def _match_policy(candidates, ref: dict | None, kind: str | None, view: _AdmissionView | None,
+                  filtered: bool) -> dict | None:
+    for policy in candidates:
+        if not filtered and (
+            policy["policy_id"] != ref.get("policy_id")
+            or policy["policy_version"] != ref.get("policy_version")
+            or policy["content_digest"] != ref.get("content_digest")
+        ):
+            continue
+        if _policy_digest(policy, view) != policy["content_digest"]:
+            continue
+        if kind is not None and policy["policy_kind"] != kind:
+            continue
+        return policy
+    return None
+
+
+def _policy(policy_fixtures: list[dict], ref: dict | None, kind: str | None = None,
+            view: _AdmissionView | None = None) -> dict | None:
     if ref is None:
         return None
-    return next((p for p in policy_fixtures
-                 if p["policy_id"] == ref.get("policy_id")
-                 and p["policy_version"] == ref.get("policy_version")
-                 and p["content_digest"] == ref.get("content_digest")
-                 and digest(p, omit_content_digest=True) == p["content_digest"]
-                 and (kind is None or p["policy_kind"] == kind)), None)
+    candidates = None
+    if view is not None:
+        index = view.policy_index()
+        if index is not None:
+            try:
+                key = (ref.get("policy_id"), ref.get("policy_version"), ref.get("content_digest"))
+                candidates = index.get(key, ())
+            except TypeError:
+                candidates = None
+    if candidates is None:
+        return _match_policy(policy_fixtures, ref, kind, view, False)
+    return _match_policy(candidates, ref, kind, view, True)
 
 
 def _candidate_plan(command: dict) -> tuple[dict, list[dict]] | tuple[None, list]:
@@ -172,8 +365,12 @@ def validate_dag(plan: dict, tasks: list[dict]) -> tuple[str | None, dict | None
             reach.add((source, node))
             stack.extend(graph[node])
     ordered = lambda a, b: (a, b) in reach or (b, a) in reach
-    for index, left in enumerate(sorted(tasks, key=lambda t: t["id"])):
-        for right in sorted(tasks, key=lambda t: t["id"])[index + 1:]:
+    ordered_tasks = sorted(tasks, key=lambda t: t["id"])
+    task_count = len(ordered_tasks)
+    for index in range(task_count):
+        left = ordered_tasks[index]
+        for right_index in range(index + 1, task_count):
+            right = ordered_tasks[right_index]
             if ordered(left["id"], right["id"]):
                 continue
             lp, rp = left["payload"], right["payload"]
@@ -218,15 +415,26 @@ def _lease_ref(record: dict) -> dict:
     }
 
 
-def _checkpoint_payload(state: dict) -> dict:
-    refs = lambda kind: sorted(
-        [_object_ref(record) for record in state["records"] if record["object_type"] == kind],
-        key=lambda ref: ref["id"],
-    )
+def _checkpoint_payload(state: dict, view: _AdmissionView | None = None) -> dict:
+    index = view.record_index() if view is not None else None
+    if index is None:
+        def refs(kind):
+            return sorted(
+                [_object_ref(record) for record in state["records"] if record["object_type"] == kind],
+                key=lambda ref: ref["id"],
+            )
+        lease_records = [
+            record for record in state["records"] if record["object_type"] in _LEASE_TYPES
+        ]
+    else:
+        def refs(kind):
+            return sorted(
+                (_object_ref(record) for record in index.by_type.get(kind, ())),
+                key=lambda ref: ref["id"],
+            )
+        lease_records = index.leases
     leases = sorted(
-        [_lease_ref(record) for record in state["records"]
-         if record["object_type"] in {"executive-lease", "work-lease"}],
-        key=lambda ref: ref["lease_id"],
+        (_lease_ref(record) for record in lease_records), key=lambda ref: ref["lease_id"],
     )
     return {
         "state_version": state["state_version"], "state_digest": state["content_digest"],
@@ -241,17 +449,30 @@ def _checkpoint_payload(state: dict) -> dict:
     }
 
 
-def _dependencies_satisfied(state: dict, task: dict) -> bool:
+def _dependencies_satisfied(state: dict, task: dict, view: _AdmissionView | None = None) -> bool:
     plan = task["payload"]["plan_ref"]
+    index = view.record_index() if view is not None else None
     for dependency_id in task["payload"]["dependency_node_ids"]:
-        dependency = next(
-            (record for record in state["records"]
-             if record["object_type"] == "task-node"
-             and record["id"] == dependency_id
-             and record["payload"]["plan_ref"] == plan),
-            None,
-        )
-        if dependency is None or _object_state(state, dependency) not in {"verified", "complete"}:
+        candidates = None
+        if index is not None:
+            try:
+                candidates = index.by_type_id.get(("task-node", dependency_id), ())
+            except TypeError:
+                candidates = None
+        if candidates is None:
+            dependency = next(
+                (record for record in state["records"]
+                 if record["object_type"] == "task-node"
+                 and record["id"] == dependency_id
+                 and record["payload"]["plan_ref"] == plan),
+                None,
+            )
+        else:
+            dependency = next(
+                (record for record in candidates if record["payload"]["plan_ref"] == plan),
+                None,
+            )
+        if dependency is None or _object_state(state, dependency, view) not in {"verified", "complete"}:
             return False
     return True
 
@@ -288,7 +509,8 @@ def _validate_scope(goal: dict, plan: dict, tasks: list[dict]) -> str | None:
 
 
 def _validate_policy_bindings(goal: dict, plan: dict, tasks: list[dict],
-                              policy_fixtures: list[dict]) -> bool:
+                              policy_fixtures: list[dict],
+                              view: _AdmissionView | None = None) -> bool:
     gp = goal["payload"]
     required_goal = {
         "authority_policy_ref": "authority", "privacy_policy_ref": "privacy-egress",
@@ -297,7 +519,7 @@ def _validate_policy_bindings(goal: dict, plan: dict, tasks: list[dict],
         "verifier_policy_ref": "verifier", "constitution_policy_ref": "constitution",
         "pause_policy_ref": "pause",
     }
-    if any(_policy(policy_fixtures, gp[field], kind) is None
+    if any(_policy(policy_fixtures, gp[field], kind, view) is None
            for field, kind in required_goal.items()):
         return False
     if (plan["payload"]["verifier_policy_ref"] != gp["verifier_policy_ref"]
@@ -309,7 +531,7 @@ def _validate_policy_bindings(goal: dict, plan: dict, tasks: list[dict],
     )
     return all(
         task["payload"][field] == gp[field]
-        and _policy(policy_fixtures, task["payload"][field]) is not None
+        and _policy(policy_fixtures, task["payload"][field], view=view) is not None
         for task in tasks for field in task_fields
     )
 
@@ -325,14 +547,22 @@ def _required_amendment_targets(state: dict) -> set[tuple[str, str, int]]:
     return targets
 
 
-def _validate_verifier(state: dict, command: dict) -> str | None:
+def _validate_verifier(state: dict, command: dict, view: _AdmissionView | None = None) -> str | None:
     decision = command["payload"]
-    plan = _find_record(state, decision["payload"]["plan_ref"], "plan-revision")
+    plan = _find_record(state, decision["payload"]["plan_ref"], "plan-revision", view)
     if plan is None:
         return "E-STALE-PLAN"
     task_refs = plan["payload"]["task_node_refs"]
-    passing = [r for r in state["records"] if r["object_type"] == "gate-result"
-               and r["payload"]["plan_ref"] == decision["payload"]["plan_ref"]
+    plan_ref = decision["payload"]["plan_ref"]
+    index = view.record_index() if view is not None else None
+    if index is not None:
+        gate_records = index.by_type.get("gate-result", ())
+    else:
+        gate_records = (
+            record for record in state["records"] if record["object_type"] == "gate-result"
+        )
+    passing = [r for r in gate_records
+               if r["payload"]["plan_ref"] == plan_ref
                and r["payload"]["disposition"] == "pass"]
     passed_tasks = {r["payload"]["task_ref"]["id"] for r in passing}
     if any(ref["id"] not in passed_tasks for ref in task_refs):
@@ -347,6 +577,7 @@ def validate_admission(state: dict, command: dict, authority_fixtures: list[dict
                        policy_fixtures: list[dict]) -> tuple[str | None, dict | None]:
     """Return the single deterministic primary error and optional canonical witness."""
 
+    view = _AdmissionView(state, policy_fixtures)
     try:
         validate_command_envelope(command)
     except M1AError as error:
@@ -388,8 +619,8 @@ def validate_admission(state: dict, command: dict, authority_fixtures: list[dict
     if command["plan_ref"] is not None and command["plan_ref"] != state["active_plan_ref"]:
         return "E-STALE-PLAN", None
     if command["lease_ref"] is not None:
-        lease = _find_record(state, command["lease_ref"])
-        if (lease is None or _object_state(state, lease) != "active"
+        lease = _find_record(state, command["lease_ref"], view=view)
+        if (lease is None or _object_state(state, lease, view) != "active"
                 or lease["payload"]["lease_epoch"] != command["lease_ref"]["lease_epoch"]
                 or lease["payload"]["subject_actor_id"] != command["actor_id"]
                 or (command["command_type"] not in LEASE_COMMAND_REPORTING_EXEMPT
@@ -403,12 +634,12 @@ def validate_admission(state: dict, command: dict, authority_fixtures: list[dict
             return "E-STALE-LEASE", None
 
     if state["current_pause_epoch"] > 0 and command["command_type"] in PAUSE_SENSITIVE:
-        pause_policy = _policy(policy_fixtures, state["current_pause_policy_ref"], "pause")
+        pause_policy = _policy(policy_fixtures, state["current_pause_policy_ref"], "pause", view)
         if pause_policy is None or pause_policy["operative_pause_mode"] == "current-immediate":
             return "E-PAUSED", None
     if command["command_type"] == "apply-pause":
         directive = command["payload"]["payload"]
-        pause_policy = _policy(policy_fixtures, directive["pause_policy_ref"], "pause")
+        pause_policy = _policy(policy_fixtures, directive["pause_policy_ref"], "pause", view)
         if pause_policy is None or directive["mode"] != pause_policy["operative_pause_mode"]:
             return "E-POLICY-UNKNOWN", None
 
@@ -416,13 +647,13 @@ def validate_admission(state: dict, command: dict, authority_fixtures: list[dict
     if plan is not None:
         goal = (command["payload"]["new_goal_spec"]
                 if command["command_type"] == "amend-goal-spec"
-                else _find_record(state, command["goal_ref"] or plan["payload"]["goal_ref"], "goal-spec"))
+                else _find_record(state, command["goal_ref"] or plan["payload"]["goal_ref"], "goal-spec", view))
         if goal is None or plan["payload"]["goal_ref"] != {
             "object_type": goal["object_type"], "id": goal["id"],
             "version": goal["version"], "content_digest": goal["content_digest"],
         }:
             return "E-STALE-GOAL", None
-        if not _validate_policy_bindings(goal, plan, tasks, policy_fixtures):
+        if not _validate_policy_bindings(goal, plan, tasks, policy_fixtures, view):
             return "E-POLICY-UNKNOWN", None
         error = _validate_scope(goal, plan, tasks)
         if error:
@@ -438,25 +669,25 @@ def validate_admission(state: dict, command: dict, authority_fixtures: list[dict
             return error, witness
 
     if command["command_type"] == "derive-work-packet":
-        task = _find_record(state, command["payload"]["task_ref"], "task-node")
+        task = _find_record(state, command["payload"]["task_ref"], "task-node", view)
         if (task is None or command["plan_ref"] is None
                 or task["payload"]["plan_ref"]["id"] != command["plan_ref"]["id"]
                 or task["payload"]["plan_ref"]["version"] != command["plan_ref"]["version"]
-                or not _dependencies_satisfied(state, task)):
+                or not _dependencies_satisfied(state, task, view)):
             return "E-DAG-DEPENDENCY", None
 
     if (command["command_type"] == "record-checkpoint"
-            and command["payload"]["payload"] != _checkpoint_payload(state)):
+            and command["payload"]["payload"] != _checkpoint_payload(state, view)):
         return "E-DIGEST-MISMATCH", None
 
     if command["command_type"] == "propose-retry":
         retry = command["payload"]["payload"]
-        prior_packet = _find_record(state, retry["prior_work_packet_ref"], "work-packet")
+        prior_packet = _find_record(state, retry["prior_work_packet_ref"], "work-packet", view)
         if prior_packet is None or retry["next_attempt"] != prior_packet["payload"]["attempt"] + 1:
             return "E-RETRY-EXHAUSTED", None
-        goal = _find_record(state, retry["goal_ref"], "goal-spec")
-        task = _find_record(state, retry["task_ref"], "task-node")
-        retry_policy = (_policy(policy_fixtures, task["payload"]["retry_policy_ref"], "retry")
+        goal = _find_record(state, retry["goal_ref"], "goal-spec", view)
+        task = _find_record(state, retry["task_ref"], "task-node", view)
+        retry_policy = (_policy(policy_fixtures, task["payload"]["retry_policy_ref"], "retry", view)
                         if task is not None else None)
         if (goal is None or task is None or retry_policy is None
                 or task["payload"]["retry_policy_ref"] != goal["payload"]["retry_policy_ref"]):
@@ -469,7 +700,7 @@ def validate_admission(state: dict, command: dict, authority_fixtures: list[dict
         if retry["retry_maximum"] != ceiling:
             return "E-RETRY-EXHAUSTED", None
         if (retry["next_attempt"] > retry["retry_maximum"] and prior_packet is not None
-                and _object_state(state, prior_packet) == "failed"):
+                and _object_state(state, prior_packet, view) == "failed"):
             return "E-RETRY-EXHAUSTED", None
         if retry["novelty_delta_digest"] in state["consumed_novelty_delta_digests"]:
             return "E-RETRY-NONNOVEL", None
@@ -477,7 +708,7 @@ def validate_admission(state: dict, command: dict, authority_fixtures: list[dict
             return "E-RETRY-EXHAUSTED", None
         if state["ambiguous_effect_refs"]:
             return "E-EFFECT-AMBIGUOUS", None
-        gate = _find_record(state, retry["failed_gate_result_ref"], "gate-result")
+        gate = _find_record(state, retry["failed_gate_result_ref"], "gate-result", view)
         novelty = copy.deepcopy(retry["novelty_delta"])
         novelty_digest = novelty.pop("delta_digest", None)
         canonical_diff_digest = digest(novelty.get("canonical_diff", []))
@@ -496,7 +727,7 @@ def validate_admission(state: dict, command: dict, authority_fixtures: list[dict
                 or gate["payload"]["disposition"] != "fail"):
             return "E-DIGEST-MISMATCH", None
         reservation = _find_record(
-            state, prior_packet["payload"]["budget_reservation_ref"], "budget-reservation"
+            state, prior_packet["payload"]["budget_reservation_ref"], "budget-reservation", view
         )
         if reservation is None:
             return "E-DIGEST-MISMATCH", None
@@ -506,12 +737,12 @@ def validate_admission(state: dict, command: dict, authority_fixtures: list[dict
             return "E-DIGEST-MISMATCH", None
     if command["command_type"] == "replace-route":
         route = command["payload"]["new_route"]["payload"]
-        goal = _find_record(state, command["goal_ref"], "goal-spec")
+        goal = _find_record(state, command["goal_ref"], "goal-spec", view)
         if (route["metered_spend_allowed"] or goal is None
                 or route["route_id"] not in goal["payload"]["allowed_route_ids"]):
             return "E-ROUTE-SPEND", None
     if command["command_type"] == "submit-plan-verifier-decision":
-        error = _validate_verifier(state, command)
+        error = _validate_verifier(state, command, view)
         if error:
             return error, None
     if command["command_type"] == "amend-goal-spec":

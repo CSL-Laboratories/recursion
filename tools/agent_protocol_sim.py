@@ -208,6 +208,14 @@ def human_lines(comment: Comment) -> list[str]:
     return [line.strip() for line in comment.body.split("\n")]
 
 
+def first_seen(comment: Comment, line: str) -> datetime | None:
+    """When `line` first appeared in the comment, from its revision history."""
+    for revision in comment.revisions:
+        if line in (part.strip() for part in revision.body.split("\n")):
+            return revision.at
+    return None
+
+
 class Evaluation:
     def __init__(self, snapshot: dict[str, Any]):
         if not isinstance(snapshot, dict):
@@ -369,11 +377,13 @@ class Evaluation:
 
     def revoked_at(self, claim: Claim) -> datetime | None:
         times = [
-            c.created_at
+            first_seen(c, line)
             for c in self.human_comments()
             if c.issue == claim.issue
-            and any((m := REVOKE_CLAIM.match(line)) and m.group(1) == claim.uuid for line in human_lines(c))
+            for line in human_lines(c)
+            if (m := REVOKE_CLAIM.match(line)) and m.group(1) == claim.uuid
         ]
+        times = [t for t in times if t is not None]
         return min(times) if times else None
 
     def ended(self, claim: Claim, at: datetime) -> str | None:
@@ -393,17 +403,21 @@ class Evaluation:
             return "expired"
         return None
 
-    def takeover_status(self, claim: Claim) -> dict[str, Any] | None:
+    def takeover_status(self, claim: Claim, at: datetime) -> dict[str, Any] | None:
         if claim.takeover_of is None:
             return None
         old = self.claims.get(claim.takeover_of)
         posted = claim.created_at
         if old is None or old.issue != claim.issue or old.repo != claim.repo:
             return {"of": claim.takeover_of, "allowed": False, "reason": "unknown claim"}
+        if at < posted + self.takeover_wait:
+            return {"of": old.uuid, "allowed": False, "reason": "takeover wait not over"}
         objection = [r.at for r in old.comment.revisions if posted <= r.at <= posted + self.takeover_wait]
         if objection:
             return {"of": old.uuid, "allowed": False, "reason": "original claimant renewed within the wait"}
         ended = self.ended(old, posted)
+        if ended == "not yet posted":
+            return {"of": old.uuid, "allowed": False, "reason": "original posted after the takeover"}
         if ended in {"withdrawn", "released", "revoked", "deleted"}:
             return {"of": old.uuid, "allowed": True, "reason": f"original {ended}"}
         last = old.comment.last_update(posted)
@@ -424,6 +438,7 @@ class Evaluation:
         if self.config["coordinator_ack_required"]:
             acked = any(
                 (m := ACK_TAKEOVER.match(line)) and m.group(1) == old.uuid
+                and (seen := first_seen(c, line)) is not None and seen <= at
                 for c in self.human_comments() if c.issue == claim.issue
                 for line in human_lines(c)
             )
@@ -439,7 +454,7 @@ class Evaluation:
         superseded = set()
         refused = set()
         for claim in candidates:
-            status = self.takeover_status(claim)
+            status = self.takeover_status(claim, at)
             if status is None:
                 continue
             if status["allowed"]:
@@ -478,6 +493,7 @@ class Evaluation:
                                 value = picked
                     if value is None:
                         continue
+                    seen = first_seen(comment, line)
                     if comment.agent is not None:
                         self.void_lines.append({"comment": comment.id, "line": line, "reason": "agent-prefixed"})
                         continue
@@ -486,8 +502,10 @@ class Evaluation:
                     if value not in spec["options"]:
                         needs_followup = True
                         continue
-                    if answer is None:
-                        answer = {"option": value, "comment": comment.id, "at": comment.created_at}
+                    if seen is None or seen > self.now:
+                        continue
+                    if answer is None or seen < answer["at"]:
+                        answer = {"option": value, "comment": comment.id, "at": seen}
             first_ping = spec["pings"][0] if spec["pings"] else None
             if first_ping is not None and any(t > first_ping for t in spec["options_changed_at"]):
                 self.violation("options_changed_after_ping", issue_id)
@@ -510,7 +528,8 @@ class Evaluation:
             }
         return results
 
-    def holds(self, decisions: dict[str, dict[str, Any]]) -> dict[str, list[str]]:
+    def holds(self, decisions: dict[str, dict[str, Any]], at: datetime) -> dict[str, list[str]]:
+        """Holds in force at `at`."""
         held: dict[str, list[str]] = {issue_id: [] for issue_id in self.issues}
         for issue_id, issue in self.issues.items():
             for blocker in issue["blocked_by"]:
@@ -518,19 +537,22 @@ class Evaluation:
                 if state is None:
                     if self.issues[blocker]["status"] not in {"Done", "Canceled", "Duplicate"}:
                         held[issue_id].append(f"blocked by {blocker}")
-                elif not state["answered"]:
+                elif not state["answered"] or state["answered_at"] > at:
                     held[issue_id].append(f"awaiting decision {blocker}")
         for comment in self.human_comments():
             for line in human_lines(comment):
                 match = HOLD.match(line)
-                if match and match.group(1) in held:
+                seen = first_seen(comment, line) if match else None
+                if match and match.group(1) in held and seen is not None and seen <= at:
                     held[match.group(1)].append(f"HOLD by comment {comment.id}")
+        return held
+
+    def void_agent_directives(self) -> None:
         for comment in self.comments:
             if comment.agent is not None and not comment.deleted:
                 for line in human_lines(comment):
                     if HOLD.match(line) or REVOKE_CLAIM.match(line) or ACK_TAKEOVER.match(line):
                         self.void_lines.append({"comment": comment.id, "line": line, "reason": "agent-prefixed"})
-        return held
 
     # Standing approvals ----------------------------------------------------
 
@@ -607,14 +629,14 @@ class Evaluation:
 
     # Rules -----------------------------------------------------------------
 
-    def check_claims(self, held: dict[str, list[str]]) -> None:
+    def check_claims(self, decisions: dict[str, dict[str, Any]]) -> None:
         for claim in self.claims.values():
             issue = self.issues[claim.issue]
             if not issue["admitted"]:
                 self.violation("claim_not_admitted", claim.issue, claim.uuid)
             elif not issue["next_in_order"]:
                 self.violation("claim_out_of_order", claim.issue, claim.uuid)
-            if held[claim.issue]:
+            if self.holds(decisions, claim.created_at)[claim.issue]:
                 self.violation("claim_on_held_scope", claim.issue, claim.uuid)
             confirmed = claim.confirmed_at()
             if confirmed is not None and confirmed - claim.created_at < self.readback:
@@ -635,7 +657,7 @@ class Evaluation:
                     ):
                         self.violation("release_before_writers_stopped", claim.issue, claim.uuid, run["id"])
 
-    def check_writes(self) -> None:
+    def check_writes(self, decisions: dict[str, dict[str, Any]]) -> None:
         for write in self.writes:
             at = write["at"]
             claim = self.claims.get(write["claim"]) if write["claim"] else None
@@ -660,6 +682,8 @@ class Evaluation:
             winner = self.winner(claim.issue, claim.repo, at)
             if winner is None or winner.uuid != claim.uuid:
                 self.violation("write_by_non_winner", claim.issue, claim.uuid, write["kind"])
+            elif self.holds(decisions, at)[claim.issue]:
+                self.violation("write_while_held", claim.issue, claim.uuid, write["kind"])
 
     def check_commits(self) -> None:
         for commit in self.commits:
@@ -709,8 +733,7 @@ class Evaluation:
         confirmed = claim.confirmed_at()
         if confirmed is None:
             return False
-        own = [c["at"] for c in self.commits if c.get("claim") == claim.uuid]
-        seen = max([confirmed, *own])
+        seen = confirmed  # no read events in a snapshot, so only confirmation counts as a read
         return any(
             c.get("repo", self.repo) == claim.repo and c["branch"] == claim.branch
             and c.get("claim") != claim.uuid and c["at"] > seen and c["at"] <= self.now
@@ -719,9 +742,10 @@ class Evaluation:
 
     def run(self) -> dict[str, Any]:
         decisions = self.decisions()
-        held = self.holds(decisions)
-        self.check_claims(held)
-        self.check_writes()
+        held = self.holds(decisions, self.now)
+        self.void_agent_directives()
+        self.check_claims(decisions)
+        self.check_writes(decisions)
         self.check_commits()
         self.check_done_and_admissions(held)
         self.check_decision_records(decisions)
@@ -741,14 +765,15 @@ class Evaluation:
                     "must_reread": self.must_reread(winner) if winner else False,
                 }
             takeovers = {
-                c.uuid: self.takeover_status(c)
+                c.uuid: self.takeover_status(c, self.now)
                 for c in self.claims.values() if c.issue == issue_id and c.takeover_of
             }
             issues[issue_id] = {
                 "claims": per_repo,
                 "held": bool(held[issue_id]),
                 "hold_reasons": held[issue_id],
-                "claimable": bool(self.issues[issue_id]["admitted"]) and not held[issue_id]
+                "claimable": bool(self.issues[issue_id]["admitted"]) and bool(self.issues[issue_id]["next_in_order"])
+                and not held[issue_id]
                 and not any(v["live_claims"] for v in per_repo.values()),
                 "takeovers": takeovers,
             }

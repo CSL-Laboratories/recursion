@@ -83,7 +83,7 @@ SA_HEADER = re.compile(r"^Standing approval (SA-[0-9]+)\s*$")
 REVOKE_SA = re.compile(r"^REVOKE (SA-[0-9]+)\s*$")
 TAKEOVER = re.compile(r"^takeover of (\S+)\s*$")
 TIMESTAMP_VALUE = re.compile(r"^\d{4}-\d{2}-\d{2}T")
-PLACEHOLDER = re.compile(r"^\([^()\n]*\S[^()\n]*\)$")
+PLACEHOLDER = re.compile(r"^\([^()\n]*[^()\s][^()\n]*\)$")
 DECISION_RECORD = re.compile(r"^decision-record:\s*(\S+)\s+([A-Za-z0-9_-]+)\s*$")
 AFTER_END = {
     "expired": "after_expiry",

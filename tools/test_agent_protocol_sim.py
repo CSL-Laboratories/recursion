@@ -921,7 +921,7 @@ class MalformedSnapshotTests(unittest.TestCase):
         self.assert_rejected(mutate)
 
     def test_malformed_confirmation_placeholder(self):
-        for value in ("(", "(pending read-back", "pending read-back)", "()", "( )", "(a)(b)"):
+        for value in ("(", "(pending read-back", "pending read-back)", "()", "( )", "(a)(b)", "(()", "())"):
             def mutate(s, value=value):
                 body = s["comments"][0]["edits"][0]["body"]
                 s["comments"][0]["edits"][0]["body"] = body.replace(ts(0, 70), value)

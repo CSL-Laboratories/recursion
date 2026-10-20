@@ -13,9 +13,11 @@ acceptance, live-provider qualification, or scientific admission.
 Test discovery: files matching TEST_GLOBS run unless listed in TEST_EXCLUDE.
 assert_tests_accounted fails if a test-like file is neither run nor excluded.
 
-Path filter: when CI_BASE_SHA is set (PR base or push-before), a docs-only
-diff skips the contract-test suite but still runs whitespace_check and
-check_public_scope. --force always runs the suite.
+Path filter: every diff runs the contract-test suite (CSL-376). Suite tests
+read files the path filter classes as docs (AGENTS.md, CLAUDE.md,
+.claude/settings.json, config/*.json, docs/v3/program-control), so skipping
+the suite for a docs-only diff could pass a check whose tests never ran.
+The docs-only classification is still logged. --force is kept for callers.
 """
 from __future__ import annotations
 
@@ -33,7 +35,7 @@ RUN_TIMEOUT = 180
 # delegated-Q fake controls resolve this TASK_BASE tree; shallow clones omit it.
 DQ_TASK_BASE = "0c908f6833e715af0eaa01b6f6788120eb577efd"
 
-# Paths that can break the provider-free gate. Markdown/docs-only diffs skip.
+# Paths that can break the provider-free gate. Only logged since CSL-376.
 GATE_PREFIXES = (
     ".github/",
     "tools/",
@@ -188,10 +190,10 @@ def decide_run_full(force: bool) -> bool:
         paths = changed_paths(base)
         print(
             f"docs-only diff against {base[:12]} ({len(paths)} paths); "
-            "skipping suite, running public-scope and whitespace",
+            "running suite (CSL-376: no docs-only skip)",
             flush=True,
         )
-        return False
+        return True
     print(f"gate paths changed against {base[:12]}; running suite", flush=True)
     return True
 
@@ -458,7 +460,7 @@ def run_suite() -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--paths-only", action="store_true", help="emit run_full and exit")
-    parser.add_argument("--force", action="store_true", help="run the suite even if docs-only")
+    parser.add_argument("--force", action="store_true", help="run the suite (every diff does since CSL-376)")
     args = parser.parse_args()
     if Path.cwd().resolve() != ROOT.resolve():
         raise SystemExit(f"run from the repository root ({ROOT})")

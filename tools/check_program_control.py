@@ -886,7 +886,7 @@ def pinned_path_errors(data: dict[str, Any], root: Path, *,
 
 
 def _git_check_attr(root: str, paths: tuple[str, ...]) -> tuple[dict[str, dict[str, str]], str]:
-    """One batched `git check-attr` call over every pinned path.
+    """One batched `git check-attr` call via --stdin -z (no argv length limit).
 
     Returns a per-path attribute map, or an error string when git cannot run
     in the given root (fail closed: the attribute of a pinned path is then
@@ -894,21 +894,48 @@ def _git_check_attr(root: str, paths: tuple[str, ...]) -> tuple[dict[str, dict[s
     """
     if not paths:
         return {}, ""
+    if any("\0" in path for path in paths):
+        return {}, "git check-attr failed: path contains NUL"
+    argv = ["git", "-C", root, "-c", "core.quotePath=false",
+            "check-attr", "--stdin", "-z", "text", "eol"]
     try:
+        path_input = b"".join(os.fsencode(path) + b"\0" for path in paths)
         result = subprocess.run(
-            ["git", "-C", root, "-c", "core.quotePath=false",
-             "check-attr", "text", "eol", "--", *paths],
-            capture_output=True, text=True, timeout=60, check=False)
-    except (OSError, subprocess.SubprocessError) as exc:
+            argv, input=path_input, capture_output=True, timeout=60, check=False)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
         return {}, f"git check-attr failed: {exc}"
     if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip()
+        detail_output = result.stderr or result.stdout
+        detail = (detail_output.decode(errors="replace").strip()
+                  if detail_output else f"exit code {result.returncode}")
         return {}, f"git check-attr failed: {detail}"
+    stdout = result.stdout
+    if stdout and not stdout.endswith(b"\0"):
+        return {}, "git check-attr failed: malformed output (missing trailing NUL)"
+    fields = stdout.split(b"\0")[:-1] if stdout else []
+    if len(fields) % 3:
+        return {}, "git check-attr failed: malformed output (field count is not a multiple of 3)"
+    requested = set(paths)
     resolved: dict[str, dict[str, str]] = {}
-    for line in result.stdout.splitlines():
-        parts = line.rsplit(": ", 2)
-        if len(parts) == 3 and parts[1] in {"text", "eol"}:
-            resolved.setdefault(parts[0], {})[parts[1]] = parts[2]
+    seen: set[tuple[str, str]] = set()
+    for index in range(0, len(fields), 3):
+        try:
+            path = os.fsdecode(fields[index])
+            attr = fields[index + 1].decode("utf-8")
+            value = fields[index + 2].decode("utf-8")
+        except UnicodeDecodeError:
+            return {}, "git check-attr failed: malformed output (undecodable field)"
+        if attr not in {"text", "eol"}:
+            return {}, "git check-attr failed: malformed output (unknown attribute)"
+        if path not in requested:
+            return {}, "git check-attr failed: malformed output (unrequested path)"
+        key = (path, attr)
+        if key in seen:
+            return {}, "git check-attr failed: malformed output (duplicate path/attribute pair)"
+        seen.add(key)
+        resolved.setdefault(path, {})[attr] = value
+    if any(set(attrs) != {"text", "eol"} for attrs in resolved.values()):
+        return {}, "git check-attr failed: malformed output (incomplete attributes)"
     return resolved, ""
 
 

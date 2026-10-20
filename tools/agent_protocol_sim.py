@@ -723,13 +723,13 @@ class Evaluation:
             expires=parse_ts(raw_expires + "T23:59:59Z" if date_only else raw_expires, sa_id),
         )
 
-    def standing_approvals(self) -> tuple[dict[str, Comment], dict[str, datetime]]:
+    def standing_approvals(self) -> tuple[dict[str, list[Comment]], dict[str, datetime]]:
         """Comments that define each standing approval, and revocation times.
 
         An approval is read from the comment revision in effect when it is
         used, so text edited in later does not authorise earlier actions.
         """
-        homes: dict[str, Comment] = {}
+        homes: dict[str, list[Comment]] = {}
         revoked: dict[str, datetime] = {}
         home = self.config["standing_approvals_issue"]
         for comment in self.comments:
@@ -741,13 +741,26 @@ class Evaluation:
                         if SA_HEADER.match(line) or REVOKE_SA.match(line):
                             self.void(comment, line)
                 continue
-            for revision in comment.revisions:
-                approval = self.parse_approval(comment, revision)
+            if comment.deleted and comment.deleted_at is None:
+                continue
+            last = len(comment.revisions) - 1
+            for index, revision in enumerate(comment.revisions):
+                if comment.deleted and revision.at >= comment.deleted_at:
+                    break
+                try:
+                    approval = self.parse_approval(comment, revision)
+                except SnapshotError:
+                    if index == last:
+                        raise
+                    continue
                 if approval is None:
                     continue
-                if homes.setdefault(approval.sa, comment) is not comment:
-                    raise SnapshotError(f"standing approval {approval.sa}: defined in two comments")
-                limit = (revision.at + timedelta(days=self.config["sa_max_days"])).date()
+                known = homes.setdefault(approval.sa, [])
+                if comment not in known:
+                    if any(not c.deleted for c in known):
+                        raise SnapshotError(f"standing approval {approval.sa}: defined in two comments")
+                    known.append(comment)
+                limit = (comment.created_at + timedelta(days=self.config["sa_max_days"])).date()
                 if approval.expires.date() > limit:
                     self.violation("sa_too_long", detail=f"{approval.sa} at {revision.at.isoformat()}")
         for _, line, seen in self.directive_lines(home):
@@ -769,7 +782,7 @@ class Evaluation:
         for action in sorted(self.sa_actions, key=lambda a: a["at"]):
             at = action["at"]
             label = f"{action['sa']} {action['action']} at {at.isoformat()}"
-            sa = self.approval_at(homes[action["sa"]], at) if action["sa"] in homes else None
+            sa = next((a for c in homes.get(action["sa"], []) if (a := self.approval_at(c, at)) is not None), None)
             if sa is None or sa.sa != action["sa"]:
                 self.violation("sa_unknown", detail=label)
                 continue

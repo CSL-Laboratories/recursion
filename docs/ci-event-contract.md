@@ -151,6 +151,8 @@ GitHub `==` is case-insensitive. Exactness comes from the preflight shell (`ci.y
 
 ## 5. Duplicate and cancellation policy
 
+Without `queue: max`, a concurrency group keeps at most one pending run, and a newer trigger cancels and replaces the older pending run (GitHub docs, controlling workflow concurrency). `cancel-in-progress: false` only protects the run that is already in progress. With `queue: max`, up to 100 pending runs wait in order.
+
 | Workflow | Group | Cancel / queue | Lines |
 |---|---|---|---|
 | `ci.yml` | `ci-CI-<PR number>`; push `ci-CI-refs/heads/master`; dispatch `ci-CI-<github.ref>` (`refs/heads/<branch>` or `refs/tags/<tag>`) | `cancel-in-progress: true` | `ci.yml:67-69` |
@@ -159,11 +161,11 @@ GitHub `==` is case-insensitive. Exactness comes from the preflight shell (`ci.y
 | `ci-macos-nightly.yml` | `ci-macos-nightly` | `cancel-in-progress: true` | `ci-macos-nightly.yml:14-16` |
 | `pr-lint.yml` | `pr-lint-<PR>` | `cancel-in-progress: true` | `pr-lint.yml:10-12` |
 | `linear-pr-sync.yml` | `linear-pr-sync-<PR or ref>` | `cancel-in-progress: true` | `linear-pr-sync.yml:18-20` |
-| `codex-gate.yml` | `codex-gate-<PR>-request` or `-verdict-<review id>` | cancel only for non-review events | `codex-gate.yml:12-15` |
+| `codex-gate.yml` | `codex-gate-<PR>-request` or `-verdict-<review id>` | cancel in progress only for non-review events; no `queue`, so one pending run per group (each review has its own verdict group) | `codex-gate.yml:12-15` |
 | `codex-gate.yml` `verdict` job | `claude-<PR>` | `queue: max`, no cancel | `codex-gate.yml:64-67` |
 | `claude.yml` `claude-mention`, `devin-review-fix` | `claude-<PR>` | `queue: max`, no cancel | `claude.yml:438-442`, `1175-1179` |
-| `conflict-scan.yml` | `claude-conflict-scan`; resolver `claude-<PR>` | no cancel; resolver `queue: max` | `conflict-scan.yml:30-32`, `364-369` |
-| `stuck-thread-watch.yml` | `stuck-thread-watch` | no cancel | `stuck-thread-watch.yml:48-50` |
+| `conflict-scan.yml` | `claude-conflict-scan`; resolver `claude-<PR>` | scan: does not cancel the running scan, but a newer trigger replaces a pending one (no `queue`), so a pending event-scoped scan can be dropped; resolver: `queue: max`, no cancel | `conflict-scan.yml:30-32`, `364-369` |
+| `stuck-thread-watch.yml` | `stuck-thread-watch` | does not cancel the running watch; a newer trigger replaces a pending one (no `queue`) | `stuck-thread-watch.yml:48-50` |
 
 **Settle (120 s).**
 

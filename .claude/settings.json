@@ -2,15 +2,41 @@
   "permissions": {
     "allow": [
       "Bash(python -X utf8 -B tools/ci_gate.py)",
-      "Bash(python -X utf8 -B tools/ci_gate.py *)",
+      "Bash(python -X utf8 -B tools/ci_gate.py --force)",
+      "Bash(python -X utf8 -B tools/ci_gate.py --paths-only)",
       "Bash(python3 -X utf8 -B tools/ci_gate.py)",
-      "Bash(python3 -X utf8 -B tools/ci_gate.py *)",
-      "Bash(python -X utf8 -B tools/test_*.py)",
-      "Bash(python3 -X utf8 -B tools/test_*.py)",
+      "Bash(python3 -X utf8 -B tools/ci_gate.py --force)",
+      "Bash(python3 -X utf8 -B tools/ci_gate.py --paths-only)",
+      "Bash(python -X utf8 -B tools/test_ci_gate.py)",
+      "Bash(python3 -X utf8 -B tools/test_ci_gate.py)",
+      "Bash(python -X utf8 -B tools/test_ci_runner_cost.py)",
+      "Bash(python3 -X utf8 -B tools/test_ci_runner_cost.py)",
+      "Bash(python -X utf8 -B tools/test_ci_scheduling.py)",
+      "Bash(python3 -X utf8 -B tools/test_ci_scheduling.py)",
+      "Bash(python -X utf8 -B tools/test_claude_fixer_receipts.py)",
+      "Bash(python3 -X utf8 -B tools/test_claude_fixer_receipts.py)",
+      "Bash(python -X utf8 -B tools/test_claude_pr_fixer.py)",
+      "Bash(python3 -X utf8 -B tools/test_claude_pr_fixer.py)",
+      "Bash(python -X utf8 -B tools/test_claude_settings.py)",
+      "Bash(python3 -X utf8 -B tools/test_claude_settings.py)",
+      "Bash(python -X utf8 -B tools/test_codex_gate.py)",
+      "Bash(python3 -X utf8 -B tools/test_codex_gate.py)",
+      "Bash(python -X utf8 -B tools/test_linear_pr_sync.py)",
+      "Bash(python3 -X utf8 -B tools/test_linear_pr_sync.py)",
+      "Bash(python -X utf8 -B tools/test_perf_bench.py)",
+      "Bash(python3 -X utf8 -B tools/test_perf_bench.py)",
+      "Bash(python -X utf8 -B tools/test_program_control.py)",
+      "Bash(python3 -X utf8 -B tools/test_program_control.py)",
+      "Bash(python -X utf8 -B tools/test_stuck_thread_watch.py)",
+      "Bash(python3 -X utf8 -B tools/test_stuck_thread_watch.py)",
+      "Bash(python -X utf8 -B tools/test_claude_fixer_guard.py)",
+      "Bash(python3 -X utf8 -B tools/test_claude_fixer_guard.py)",
+      "Bash(python -X utf8 -B tools/test_fixer_failure_escalation.py)",
+      "Bash(python3 -X utf8 -B tools/test_fixer_failure_escalation.py)",
+      "Bash(python -X utf8 -B tools/test_fixer_failure_watcher.py)",
+      "Bash(python3 -X utf8 -B tools/test_fixer_failure_watcher.py)",
       "Bash(python -m unittest)",
-      "Bash(python -m unittest *)",
       "Bash(python3 -m unittest)",
-      "Bash(python3 -m unittest *)",
       "Bash(actionlint)",
       "Bash(gh pr view)",
       "Bash(gh pr view *)",
@@ -46,6 +72,18 @@
             "type": "command",
             "command": "bash -c 'exec bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/session-start.sh\"'",
             "timeout": 600
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard-substitution.sh\"",
+            "timeout": 10
           }
         ]
       }

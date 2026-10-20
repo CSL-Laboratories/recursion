@@ -19,6 +19,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1051,6 +1052,42 @@ class ConflictScanTests(unittest.TestCase):
         self.assertEqual(chosen, [])
         self.assertIn("skip=protected-head", audit[0])
 
+    def test_paused_or_unreadable_labels_are_never_selected(self) -> None:
+        for labels in (["claude:pause"], ["hold"], ["bug", "Claude:Pause"], ["HOLD"]):
+            with self.subTest(labels=labels):
+                chosen, audit = self._select([conflicted_pr(labels=labels)])
+                self.assertEqual(chosen, [])
+                self.assertIn("skip=paused", audit[0])
+        for raw in (None, "hold", {"name": "hold"}, ["hold"], [None]):
+            with self.subTest(raw=raw):
+                pr = conflicted_pr()
+                pr["labels"] = raw
+                chosen, audit = self._select([pr])
+                self.assertEqual(chosen, [])
+                self.assertIn("skip=paused", audit[0])
+        pr = conflicted_pr()
+        del pr["labels"]
+        self.assertIn("skip=paused", self._select([pr])[1][0])
+        self.assertIn("skip=needs-decision", self._select([conflicted_pr(labels=["Needs-Decision"])])[1][0])
+        chosen, _ = self._select([conflicted_pr(labels=["bug", "holding", "do-not-merge"])])
+        self.assertEqual(len(chosen), 1)
+
+    def test_repo_pause_variable_selects_nothing_without_reads(self) -> None:
+        env = {"GITHUB_REPOSITORY": REPO, "PR_NUMBER": "", "CLAUDE_FIXER_PAUSE": "true", "GITHUB_OUTPUT": ""}
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(self.mod, "_gh_json", side_effect=AssertionError("no reads")), \
+                mock.patch("builtins.print") as printed:
+            self.assertEqual(self.mod.main(), 0)
+        lines = [call.args[0] for call in printed.call_args_list]
+        self.assertIn("conflict-scan: skip=paused (repo variable CLAUDE_FIXER_PAUSE)", lines)
+        self.assertIn("count=0", lines)
+        for value in ("false", "TRUE", ""):
+            with mock.patch.dict(os.environ, env | {"CLAUDE_FIXER_PAUSE": value}), \
+                    mock.patch.object(self.mod, "fixer_busy", return_value=True), \
+                    mock.patch("builtins.print") as printed:
+                self.mod.main()
+            self.assertTrue(any("fixer-busy" in call.args[0] for call in printed.call_args_list), value)
+
     def test_embedded_scan_matches_source(self) -> None:
         text = SCAN_WORKFLOW_PATH.read_text(encoding="utf-8")
         start = f"python3 - <<'{SCAN_HEREDOC}'\n"
@@ -1131,6 +1168,62 @@ class ConflictJobStructureTests(unittest.TestCase):
         self.assertIn("when those tools are available", job)
         self.assertIn("not a denied command that blocks the push", job)
 
+    def _prep(self, live: object, pause_var: str | None = None) -> tuple[str, str]:
+        if shutil.which("bash") is None or shutil.which("jq") is None:
+            self.skipTest("bash/jq not available")
+        job = self._job("conflict-resolve")
+        start = job.index("        id: prep\n")
+        run = job.index("        run: |\n", start) + len("        run: |\n")
+        script = textwrap.dedent(job[run:job.index("\n      - ", run)])
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / "pr.json").write_text(json.dumps(live), encoding="utf-8")
+            gh = d / "gh"
+            gh.write_text(
+                "#!/usr/bin/env bash\n"
+                'expr=""; prev=""\n'
+                'for a in "$@"; do if [ "$prev" = "--jq" ]; then expr="$a"; fi; prev="$a"; done\n'
+                f'jq -r "$expr" "{d}/pr.json"\n',
+                encoding="utf-8",
+            )
+            gh.chmod(0o755)
+            out = d / "out"
+            out.write_text("", encoding="utf-8")
+            env = dict(os.environ, PATH=f"{d}{os.pathsep}{os.environ.get('PATH', '')}", GITHUB_OUTPUT=str(out),
+                       REPO="o/r", PR_NUMBER="1", HEAD_SHA="a" * 40, HEAD_REF="feature/x", BASE_REF="main", GH_TOKEN="x")
+            env.pop("CLAUDE_FIXER_PAUSE", None)
+            if pause_var is not None:
+                env["CLAUDE_FIXER_PAUSE"] = pause_var
+            result = subprocess.run(["bash", "-c", script], env=env, check=True, capture_output=True, text=True, cwd=tmp)
+            return out.read_text(encoding="utf-8"), result.stdout
+
+    def test_resolver_rechecks_pause_under_lock_before_merge(self) -> None:
+        moved = {"state": "open", "head": {"sha": "b" * 40, "repo": {"full_name": "o/r"}}, "mergeable_state": "dirty"}
+        for live, pause_var, message in (
+            (moved | {"labels": [{"name": "claude:pause"}]}, None, "paused by PR label (claude:pause)"),
+            (moved | {"labels": [{"name": "HOLD"}]}, None, "paused by PR label (hold)"),
+            (moved | {"labels": None}, None, "paused by PR label (unreadable)"),
+            (moved | {"labels": ["hold"]}, None, "paused by PR label (unreadable)"),
+            (moved, None, "paused by PR label (unreadable)"),
+            (moved | {"labels": []}, "true", "paused by repo variable CLAUDE_FIXER_PAUSE"),
+        ):
+            with self.subTest(message=message, live=live):
+                out, stdout = self._prep(live, pause_var)
+                self.assertEqual(out, "proceed=false\n")
+                self.assertIn("::notice::conflict-resolve: " + message, stdout)
+        # Not paused: falls through to the existing stale-head recheck (head moved to b...).
+        out, stdout = self._prep(moved | {"labels": [{"name": "needs-review"}]}, "false")
+        self.assertEqual(out, "proceed=false\n")
+        self.assertIn("stale scan result", stdout)
+        self.assertNotIn("paused", stdout)
+
+    def test_pause_variable_wired_into_scan_and_resolve(self) -> None:
+        scan = self._job("conflict-scan")
+        self.assertIn("CLAUDE_FIXER_PAUSE: ${{ vars.CLAUDE_FIXER_PAUSE }}", scan)
+        prep = self._job("conflict-resolve").split("        id: prep\n", 1)[1].split("\n      - ", 1)[0]
+        self.assertIn("CLAUDE_FIXER_PAUSE: ${{ vars.CLAUDE_FIXER_PAUSE }}", prep)
+        self.assertLess(prep.index("CLAUDE_FIXER_PAUSE:-"), prep.index("git merge --no-ff --no-commit"))
+
     def test_resolver_comments_or_labels(self) -> None:
         job = self._job("conflict-resolve")
         self.assertIn("merge commit SHA", job)
@@ -1200,6 +1293,8 @@ class FixerLoopCapTests(unittest.TestCase):
         findings: str = "PRRT_1",
         listing_error: bool = False,
         threads: list[dict] | None = None,
+        labels: object = (),
+        pause_var: str | None = None,
     ) -> tuple[str, str]:
         import os
         import shutil
@@ -1212,7 +1307,11 @@ class FixerLoopCapTests(unittest.TestCase):
             d = Path(tmp)
             (d / "commits.tsv").write_text("".join(f"{a}\t{b}\n" for a, b in commits), encoding="utf-8")
             (d / "comments.txt").write_text("".join(c + "\n" for c in comments), encoding="utf-8")
-            (d / "pr.json").write_text(json.dumps({"state": current_state, "head": {"sha": current_sha, "ref": current_ref, "repo": {"full_name": current_repo}}, "user": {"login": "alice"}}))
+            live = {"state": current_state, "head": {"sha": current_sha, "ref": current_ref, "repo": {"full_name": current_repo}}, "user": {"login": "alice"}}
+            if labels is not None:
+                # GitHub always returns a labels array; raw non-list values model unreadable labels.
+                live["labels"] = [{"name": n} for n in labels] if isinstance(labels, tuple) else labels
+            (d / "pr.json").write_text(json.dumps(live))
             (d / "threads.json").write_text(json.dumps({"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": threads or []}}}}}))
             graphql_reply = ('jq -r "${!#}" "' + str(d / "threads.json") + '"') if threads is not None else ('printf "%s\\n" "' + findings + '"')
             gh = d / "gh"
@@ -1236,6 +1335,9 @@ class FixerLoopCapTests(unittest.TestCase):
                        REPO="o/r", PR_NUMBER="1", HEAD_SHA="a" * 40, HEAD_REF="feature/fix", GH_TOKEN="x", COMMENTER="bob")
             if bypass_cap is not None:
                 env["BYPASS_CAP"] = bypass_cap
+            env.pop("CLAUDE_FIXER_PAUSE", None)
+            if pause_var is not None:
+                env["CLAUDE_FIXER_PAUSE"] = pause_var
             subprocess.run(["bash", "-c", self.script], env=env, check=True, capture_output=True)
             posted = (d / "posted").read_text(encoding="utf-8") if (d / "posted").exists() else ""
             return out.read_text(encoding="utf-8"), posted
@@ -1345,6 +1447,32 @@ class FixerLoopCapTests(unittest.TestCase):
         for step in steps:
             self.assertIn("steps.cap.outputs.skip != 'true'", step)
 
+    def test_human_pause_skips_before_reservation(self) -> None:
+        for kwargs in ({"labels": ("claude:pause",)}, {"labels": ("bug", "hold")}, {"labels": ("Claude:Pause",)},
+                       {"labels": ("HOLD",)}, {"labels": None}, {"labels": {"name": "hold"}},
+                       {"labels": ["hold"]}, {"pause_var": "true"}):
+            with self.subTest(**{k: str(v) for k, v in kwargs.items()}):
+                out, posted = self._run([("alice", "Alice")], [], **kwargs)
+                self.assertIn("skip=true", out)
+                self.assertNotIn("loop_commit_count", out)
+                self.assertNotIn("head_sha", out)
+                self.assertEqual(posted, "")
+        for kwargs in ({"labels": ("bug", "needs-decision", "do-not-merge", "holding")},
+                       {"pause_var": "false"}, {"pause_var": "TRUE"}, {"pause_var": ""}):
+            with self.subTest(**{k: str(v) for k, v in kwargs.items()}):
+                out, _ = self._run([("alice", "Alice")], [], **kwargs)
+                self.assertIn("skip=false", out)
+
+    def test_pause_variable_and_notice_wired_into_writer_jobs(self) -> None:
+        for name in ("claude-mention", "devin-review-fix"):
+            job = WorkflowStructureTests._job(self, name)
+            first = job.split("\n      - ", 2)[1]
+            self.assertIn("CLAUDE_FIXER_PAUSE: ${{ vars.CLAUDE_FIXER_PAUSE }}", first, name)
+            self.assertIn('[ "${CLAUDE_FIXER_PAUSE:-}" = "true" ]', first, name)
+            self.assertIn("::notice::Claude PR writer paused by", first, name)
+            self.assertIn('select(. == "claude:pause" or . == "hold")', first, name)
+            self.assertLess(job.index("CLAUDE_FIXER_PAUSE"), job.index("uses: actions/checkout"), name)
+
     def test_conflict_resolve_waits_for_devin_on_claude_head(self) -> None:
         text = SCAN_WORKFLOW_PATH.read_text(encoding="utf-8")
         job = text[text.index("  conflict-resolve:\n"):]
@@ -1378,6 +1506,17 @@ class MentionLiveHeadTests(unittest.TestCase):
                        {"current_ref": "renamed"}, {"current_sha": "invalid"}):
             out, _ = self._run([], [], **kwargs)
             self.assertIn("skip=true", out)
+
+    def test_mention_human_pause_skips(self):
+        for kwargs in ({"labels": ("claude:pause",)}, {"labels": ("Hold",)}, {"labels": None},
+                       {"labels": "hold"}, {"pause_var": "true"}):
+            with self.subTest(**{k: str(v) for k, v in kwargs.items()}):
+                out, posts = self._run([], [], **kwargs)
+                self.assertIn("skip=true", out)
+                self.assertNotIn("head_sha", out)
+                self.assertEqual(posts, "")
+        out, _ = self._run([], [], labels=("needs-decision",), pause_var="false")
+        self.assertIn("skip=false", out)
 
     def test_original_comment_and_fresh_branch_remain_bound(self):
         job = self.text.split("  claude-mention:", 1)[1].split("  devin-review-fix:", 1)[0]

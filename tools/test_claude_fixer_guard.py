@@ -22,8 +22,9 @@ URL = "https://github.com/acme/example.git"
 CONFIG = {"repo": "acme/example", "number": "7", "base": A, "ref": "fix"}
 
 
-def pr(sha=A):
-    return {"state": "open", "head": {"sha": sha, "ref": "fix", "repo": {"full_name": "acme/example"}}}
+def pr(sha=A, labels=()):
+    return {"state": "open", "labels": [{"name": name} for name in labels],
+            "head": {"sha": sha, "ref": "fix", "repo": {"full_name": "acme/example"}}}
 
 
 class GuardTests(unittest.TestCase):
@@ -45,6 +46,42 @@ class GuardTests(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             self.push()
         self.assertEqual(json.loads(self.state.read_text()), {})
+
+    def test_pause_label_added_after_preflight_stops_the_push(self):
+        for live in (pr(labels=["claude:pause"]), pr(labels=["bug", "hold"]), pr(labels=["Claude:Pause"]),
+                     pr(labels=["HOLD"]), pr() | {"labels": None}, pr() | {"labels": ["hold"]},
+                     pr() | {"labels": {"name": "x"}}, {k: v for k, v in pr().items() if k != "labels"}):
+            with self.subTest(live=live):
+                self.state.unlink(missing_ok=True)
+                with self.assertRaises(m.PauseRefused):
+                    self.push(lambda _, live=live: live)
+                self.assertEqual(json.loads(self.state.read_text()), {})  # Attempt consumed, no candidate.
+                with self.assertRaises(FileExistsError):
+                    self.push()
+        self.state.unlink()
+        self.push(lambda _: pr(labels=["bug", "do-not-merge", "needs-decision", "holding"]))
+        self.assertEqual(json.loads(self.state.read_text()), {"candidate": B})
+
+    def test_pause_never_blocks_audit_reads(self):
+        self.assertEqual(m.current_pr(CONFIG, lambda _: pr(labels=["hold"])), A)
+        self.assertEqual(m.current_pr(CONFIG, lambda _: pr() | {"labels": None}), A)
+        state = self.path / "pushed.json"
+        state.write_text(json.dumps({"candidate": B}))
+        def read(path):
+            return pr(B, labels=["claude:pause"]) if "/pulls/" in path else {"status": "ahead"}
+        body = m.terminal(CONFIG, state, self.execution, "success", read=read)
+        self.assertIn(f"Guarded candidate reachable on the live PR: `{B}`", body)
+
+    def test_hook_reports_pause_refusal_distinctly(self):
+        script = self.path / "pre-push"
+        script.write_text("fixture")
+        (self.path / "context.json").write_text(json.dumps(CONFIG))
+        for error, text in ((m.PauseRefused("hold"), "paused for humans"), (ValueError("x"), "stale/invalid head")):
+            with self.subTest(error=error), patch.object(m, "__file__", str(script)), \
+                    patch.object(sys, "argv", ["pre-push", "origin", URL]), patch.object(m, "guard", side_effect=error), \
+                    patch.object(sys, "stdin"), patch("sys.stderr") as stderr:
+                self.assertEqual(m.main(), 1)
+                self.assertIn(text, "".join(call.args[0] for call in stderr.write.call_args_list))
 
     def test_api_denial_stops_without_retry(self):
         def denied(_):

@@ -611,6 +611,25 @@ class Evaluation:
         ended = self.ended(old, posted)
         if ended in {"withdrawn", "released", "revoked", "deleted"}:
             return {"of": old.uuid, "allowed": True, "reason": f"original {ended}"}
+        refusal = self.posting_refusal(claim, old)
+        if refusal is not None:
+            return refusal
+        if self.config["coordinator_ack_required"]:
+            # The acknowledgement must still be in the comment, and the comment
+            # not deleted, at the time being judged.
+            acked = any(
+                (m := ACK_TAKEOVER.match(line)) and m.group(1) == old.uuid
+                and (since := present_since(c, line, at)) is not None and posted <= since
+                and not (c.deleted_at is not None and c.deleted_at <= at)
+                for c, line, _ in self.directive_lines(claim.issue)
+            )
+            if not acked:
+                return {"of": old.uuid, "allowed": False, "reason": "coordinator acknowledgement missing"}
+        return {"of": old.uuid, "allowed": True, "reason": "conditions met"}
+
+    def posting_refusal(self, claim: Claim, old: Claim) -> dict[str, Any] | None:
+        """Why a takeover of a still-held `old` was not allowed when posted, or None."""
+        posted = claim.created_at
         last = old.comment.last_update(posted)
         if posted <= last + self.lease + self.grace:
             return {"of": old.uuid, "allowed": False, "reason": "lease plus grace not passed"}
@@ -626,18 +645,7 @@ class Evaluation:
         ]
         if running:
             return {"of": old.uuid, "allowed": False, "reason": "claimant run in progress"}
-        if self.config["coordinator_ack_required"]:
-            # The acknowledgement must still be in the comment, and the comment
-            # not deleted, at the time being judged.
-            acked = any(
-                (m := ACK_TAKEOVER.match(line)) and m.group(1) == old.uuid
-                and (since := present_since(c, line, at)) is not None and posted <= since
-                and not (c.deleted_at is not None and c.deleted_at <= at)
-                for c, line, _ in self.directive_lines(claim.issue)
-            )
-            if not acked:
-                return {"of": old.uuid, "allowed": False, "reason": "coordinator acknowledgement missing"}
-        return {"of": old.uuid, "allowed": True, "reason": "conditions met"}
+        return None
 
     def live_claims(self, issue: str, repo: str, at: datetime) -> list[Claim]:
         candidates = [
@@ -993,7 +1001,18 @@ class Evaluation:
 
     def check_takeover_refused(self, claim: Claim) -> None:
         status = self.takeover_status(claim)
-        if status is None or status["allowed"] or status["reason"] in self.PENDING_TAKEOVER:
+        if status is None or status["allowed"]:
+            return
+        if status["reason"] == "original claimant renewed within the wait":
+            # The renewal hides the posting-time checks; a takeover that was
+            # already too early when posted is still refused.
+            old = self.claims[status["of"]]
+            if self.ended(old, claim.created_at) in {"withdrawn", "released", "revoked", "deleted"}:
+                return
+            status = self.posting_refusal(claim, old)
+            if status is None:
+                return
+        elif status["reason"] in self.PENDING_TAKEOVER:
             return
         if self.ended(claim, self.now) in {"withdrawn", "released", "revoked", "deleted"}:
             return

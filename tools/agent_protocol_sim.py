@@ -307,7 +307,7 @@ class Evaluation:
         self.writes = self._load_list(snapshot, "writes", ("kind", "issue", "claim", "at"))
         self.runs = self._load_list(snapshot, "runs", ("id", "claim", "started_at"))
         self.admissions = self._load_list(snapshot, "admissions", ("issue", "at"))
-        self.sa_actions = self._load_list(snapshot, "sa_actions", ("sa", "action", "repo", "at"))
+        self.sa_actions = self._load_list(snapshot, "sa_actions", ("sa", "action", "repo", "agent", "at"))
         self.program = self._load_program(snapshot.get("program"))
         for commit in self.commits:
             if not isinstance(commit["author_kind"], str) or commit["author_kind"] not in AUTHOR_KINDS:
@@ -316,6 +316,9 @@ class Evaluation:
             if not isinstance(write["kind"], str) or write["kind"] not in WRITE_KINDS:
                 raise SnapshotError(f"write: unknown kind {write['kind']!r}")
             self._known_issue(write["issue"], "write")
+        for action in self.sa_actions:
+            if not isinstance(action["agent"], str) or not action["agent"].strip():
+                raise SnapshotError("sa_actions: agent must be a non-empty string")
 
     # Loading ---------------------------------------------------------------
 
@@ -772,8 +775,7 @@ class Evaluation:
         used, so text edited in later does not authorise earlier actions.
         """
         homes: dict[str, list[Comment]] = {}
-        starts: dict[tuple[str, str], datetime] = {}
-        ends: dict[tuple[str, str], datetime | None] = {}
+        spans: dict[str, list[tuple[datetime, str, datetime | None]]] = {}
         revoked: dict[str, datetime] = {}
         home = self.config["standing_approvals_issue"]
         for comment in self.comments:
@@ -788,6 +790,11 @@ class Evaluation:
             if comment.deleted and comment.deleted_at is None:
                 continue
             last = len(comment.revisions) - 1
+            # Each run of consecutive revisions defining the same approval is
+            # one span; a revision that stops defining it ends the span, and a
+            # later re-definition in the same comment starts a new one.
+            current: tuple[str, datetime] | None = None
+            first: dict[str, datetime] = {}
             for index, revision in enumerate(comment.revisions):
                 if comment.deleted and revision.at >= comment.deleted_at:
                     break
@@ -796,23 +803,34 @@ class Evaluation:
                 except SnapshotError:
                     if index == last:
                         raise
-                    continue
+                    approval = None
+                if current is not None and (approval is None or approval.sa != current[0]):
+                    spans.setdefault(current[0], []).append((current[1], comment.id, revision.at))
+                    current = None
                 if approval is None:
                     continue
-                known = homes.setdefault(approval.sa, [])
-                if comment not in known:
-                    known.append(comment)
-                    starts[(approval.sa, comment.id)] = revision.at
-                    ends[(approval.sa, comment.id)] = self.definition_end(comment, approval.sa, index)
-                limit = (comment.created_at + timedelta(days=self.config["sa_max_days"])).date()
+                if current is None:
+                    current = (approval.sa, revision.at)
+                    first.setdefault(approval.sa, revision.at)
+                    known = homes.setdefault(approval.sa, [])
+                    if comment not in known:
+                        known.append(comment)
+                # The lifetime runs from the first revision of this comment that
+                # defined the approval, so editing it out and back in does not
+                # restart the clock.
+                limit = (first[approval.sa] + timedelta(days=self.config["sa_max_days"])).date()
                 if approval.expires.date() > limit:
                     self.violation("sa_too_long", detail=f"{approval.sa} at {revision.at.isoformat()}")
-        for sa_id, comments in homes.items():
-            # Definitions may follow each other (an old one deleted, a new one
-            # posted later) but may not overlap; compare their live intervals
-            # so the result does not depend on snapshot order.
-            spans = sorted((starts[(sa_id, c.id)], c.id, ends[(sa_id, c.id)]) for c in comments)
-            for (_, _, end), (next_start, _, _) in zip(spans, spans[1:]):
+            if current is not None:
+                spans.setdefault(current[0], []).append((current[1], comment.id, comment.deleted_at))
+        for sa_id, intervals in spans.items():
+            # Definitions may follow each other (an old one deleted or edited
+            # out, a new one posted later) but may not overlap; compare their
+            # live intervals so the result does not depend on snapshot order.
+            # A span that ends when it starts authorises nothing.
+            ordered = sorted((span for span in intervals if span[2] is None or span[2] > span[0]),
+                             key=lambda span: (span[0], span[1]))
+            for (_, _, end), (next_start, _, _) in zip(ordered, ordered[1:]):
                 if end is None or next_start < end:
                     raise SnapshotError(f"standing approval {sa_id}: defined in two comments at once")
         for _, line, seen in self.directive_lines(home):
@@ -821,18 +839,6 @@ class Evaluation:
                 previous = revoked.get(match.group(1))
                 revoked[match.group(1)] = seen if previous is None else min(previous, seen)
         return homes, revoked
-
-    def definition_end(self, comment: Comment, sa_id: str, start: int) -> datetime | None:
-        """When a comment stops defining `sa_id`: a later revision that no longer
-        parses as that approval, or the comment's known deletion time."""
-        for revision in comment.revisions[start + 1:]:
-            try:
-                approval = self.parse_approval(comment, revision)
-            except SnapshotError:
-                approval = None
-            if approval is None or approval.sa != sa_id:
-                return revision.at
-        return comment.deleted_at
 
     def approval_at(self, comment: Comment, at: datetime) -> StandingApproval | None:
         if comment.deleted and (comment.deleted_at is None or comment.deleted_at <= at):
@@ -853,7 +859,8 @@ class Evaluation:
         for action in sorted(self.sa_actions, key=lambda a: a["at"]):
             at = action["at"]
             label = f"{action['sa']} {action['action']} at {at.isoformat()}"
-            sa = next((a for c in homes.get(action["sa"], []) if (a := self.approval_at(c, at)) is not None), None)
+            sa = next((a for c in homes.get(action["sa"], [])
+                       if (a := self.approval_at(c, at)) is not None and a.sa == action["sa"]), None)
             if sa is None or sa.sa != action["sa"]:
                 self.violation("sa_unknown", detail=label)
                 continue
@@ -990,6 +997,8 @@ class Evaluation:
             ended = self.ended(claim, commit["at"])
             if ended == "deleted":
                 self.violation("commit_names_deleted_claim", claim.issue, uuid, sha)
+            elif ended == "not yet posted":
+                self.violation("commit_before_claim", claim.issue, uuid, sha)
             elif ended in AFTER_END:
                 self.violation(f"commit_{AFTER_END[ended]}", claim.issue, uuid, sha)
 

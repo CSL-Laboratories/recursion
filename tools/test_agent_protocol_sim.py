@@ -395,6 +395,11 @@ class CommitTests(unittest.TestCase):
         result = sim.evaluate(snapshot(40, [issue("CSL-1")], [deleted], writes=writes))
         self.assertEqual(codes(result), [])
 
+    def test_commit_before_its_named_claim(self):
+        commits = [{"sha": "e1", "branch": "csl-1-work", "at": ts(2), "author_kind": "agent", "claim": U1}]
+        result = sim.evaluate(snapshot(10, [issue("CSL-1")], [claim("c1", "CSL-1", U1, at=5)], commits=commits))
+        self.assertEqual(codes(result), ["commit_before_claim"])
+
     def test_s20_commit_names_deleted_claim(self):
         commits = [{"sha": "a9e", "branch": "csl-1-work", "at": ts(5), "author_kind": "agent", "claim": U1}]
         result = sim.evaluate(snapshot(10, [issue("CSL-1")], [claim("c1", "CSL-1", U1, deleted=True)], commits=commits))
@@ -665,6 +670,46 @@ class StandingApprovalTests(unittest.TestCase):
         self.assertEqual(codes(result), ["sa_too_long"])
         self.assertEqual(codes(self.run_actions([], self.approval(expires="2027-01-18"))), [])
 
+    def test_lifetime_counts_from_the_defining_revision(self):
+        draft = comment("h1", "CSL-90", -200 * 24 * 60, "draft")
+        draft["edits"] = [{"at": ts(0), "body": self.approval()["body"]}]
+        self.assertEqual(codes(self.run_actions([self.action(10)], draft)), [])
+        extended = self.approval()
+        extended["edits"] = [{"at": ts(60), "body": self.approval(expires="2027-03-01")["body"]}]
+        self.assertEqual(codes(self.run_actions([], extended)), ["sa_too_long"])
+
+    def test_lifetime_survives_editing_the_approval_out_and_back(self):
+        day = 24 * 60
+        posted = self.approval(expires="2027-01-18")
+        extended = self.approval(expires="2027-04-01")["body"]
+        interruptions = ("withdrawn", extended.replace("SA-1", "SA-2", 1), extended.replace("scope: recursion\n", ""))
+        for interruption in interruptions:
+            posted["edits"] = [{"at": ts(80 * day), "body": interruption}, {"at": ts(80 * day), "body": extended}]
+            with self.subTest(interruption=interruption.splitlines()[0]):
+                result = sim.evaluate(snapshot(81 * day, [issue("CSL-90")], [posted], config=self.CONFIG))
+                self.assertIn("sa_too_long", codes(result))
+
+    def test_lookup_skips_a_comment_now_defining_another_approval(self):
+        moved = self.approval("h1", at=0)
+        moved["edits"] = [{"at": ts(20), "body": moved["body"].replace("SA-1", "SA-2", 1)}]
+        comments = [moved, self.approval("h2", at=30)]
+        for order in (comments, comments[::-1]):
+            with self.subTest(order=[c["id"] for c in order]):
+                result = sim.evaluate(snapshot(600, [issue("CSL-90")], order, config=self.CONFIG,
+                                               sa_actions=[self.action(40)]))
+                self.assertEqual(codes(result), [])
+
+    def test_action_without_an_agent_is_malformed(self):
+        open_approval = comment("h1", "CSL-90", 0, self.approval()["body"].replace("who: claude\n", ""))
+        for agent in (None, "", "  ", 7):
+            action = self.action(10)
+            if agent is None:
+                del action["agent"]
+            else:
+                action["agent"] = agent
+            with self.subTest(agent=agent), self.assertRaises(sim.SnapshotError):
+                self.run_actions([action], open_approval)
+
     def test_total_limit(self):
         result = self.run_actions([self.action(10), self.action(500)], self.approval(limits="total=1"))
         self.assertEqual(codes(result), ["sa_over_limit"])
@@ -703,6 +748,25 @@ class StandingApprovalTests(unittest.TestCase):
                 result = sim.evaluate(snapshot(600, [issue("CSL-90")], order, config=self.CONFIG,
                                                sa_actions=[self.action(10), self.action(25), self.action(60)]))
                 self.assertEqual(codes(result), ["sa_unknown"])
+
+    def test_approval_re_added_in_the_same_comment_overlaps(self):
+        old = self.approval("h1", at=0, limits="per_day=5")
+        old["edits"] = [{"at": ts(20), "body": "withdrawn"}, {"at": ts(40), "body": old["body"]}]
+        comments = [old, self.approval("h2", at=30, limits="per_day=5")]
+        for order in (comments, comments[::-1]):
+            with self.subTest(order=[c["id"] for c in order]):
+                with self.assertRaises(sim.SnapshotError):
+                    sim.evaluate(snapshot(600, [issue("CSL-90")], order, config=self.CONFIG))
+
+    def test_approval_re_added_after_the_replacement_ends(self):
+        old = self.approval("h1", at=0, limits="per_day=5")
+        old["edits"] = [{"at": ts(20), "body": "withdrawn"}, {"at": ts(60), "body": old["body"]}]
+        new = self.approval("h2", at=30, limits="per_day=5")
+        new["edits"] = [{"at": ts(50), "body": "withdrawn"}]
+        result = sim.evaluate(snapshot(600, [issue("CSL-90")], [old, new], config=self.CONFIG,
+                                       sa_actions=[self.action(10), self.action(25), self.action(40),
+                                                   self.action(55), self.action(70)]))
+        self.assertEqual(codes(result), ["sa_unknown", "sa_unknown"])
 
     def test_overlapping_approval_definitions_fail_closed(self):
         for comments in ([self.approval("h1", at=0), self.approval("h2", at=30)],

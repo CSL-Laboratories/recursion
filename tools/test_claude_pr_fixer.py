@@ -19,6 +19,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1051,6 +1052,42 @@ class ConflictScanTests(unittest.TestCase):
         self.assertEqual(chosen, [])
         self.assertIn("skip=protected-head", audit[0])
 
+    def test_paused_or_unreadable_labels_are_never_selected(self) -> None:
+        for labels in (["claude:pause"], ["hold"], ["bug", "Claude:Pause"], ["HOLD"]):
+            with self.subTest(labels=labels):
+                chosen, audit = self._select([conflicted_pr(labels=labels)])
+                self.assertEqual(chosen, [])
+                self.assertIn("skip=paused", audit[0])
+        for raw in (None, "hold", {"name": "hold"}, ["hold"], [None]):
+            with self.subTest(raw=raw):
+                pr = conflicted_pr()
+                pr["labels"] = raw
+                chosen, audit = self._select([pr])
+                self.assertEqual(chosen, [])
+                self.assertIn("skip=paused", audit[0])
+        pr = conflicted_pr()
+        del pr["labels"]
+        self.assertIn("skip=paused", self._select([pr])[1][0])
+        self.assertIn("skip=needs-decision", self._select([conflicted_pr(labels=["Needs-Decision"])])[1][0])
+        chosen, _ = self._select([conflicted_pr(labels=["bug", "holding", "do-not-merge"])])
+        self.assertEqual(len(chosen), 1)
+
+    def test_repo_pause_variable_selects_nothing_without_reads(self) -> None:
+        env = {"GITHUB_REPOSITORY": REPO, "PR_NUMBER": "", "CLAUDE_FIXER_PAUSE": "true", "GITHUB_OUTPUT": ""}
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(self.mod, "_gh_json", side_effect=AssertionError("no reads")), \
+                mock.patch("builtins.print") as printed:
+            self.assertEqual(self.mod.main(), 0)
+        lines = [call.args[0] for call in printed.call_args_list]
+        self.assertIn("conflict-scan: skip=paused (repo variable CLAUDE_FIXER_PAUSE)", lines)
+        self.assertIn("count=0", lines)
+        for value in ("false", "TRUE", ""):
+            with mock.patch.dict(os.environ, env | {"CLAUDE_FIXER_PAUSE": value}), \
+                    mock.patch.object(self.mod, "fixer_busy", return_value=True), \
+                    mock.patch("builtins.print") as printed:
+                self.mod.main()
+            self.assertTrue(any("fixer-busy" in call.args[0] for call in printed.call_args_list), value)
+
     def test_embedded_scan_matches_source(self) -> None:
         text = SCAN_WORKFLOW_PATH.read_text(encoding="utf-8")
         start = f"python3 - <<'{SCAN_HEREDOC}'\n"
@@ -1131,6 +1168,79 @@ class ConflictJobStructureTests(unittest.TestCase):
         self.assertIn("when those tools are available", job)
         self.assertIn("not a denied command that blocks the push", job)
 
+    def _prep(self, live: object, pause_var: str | None = None) -> tuple[str, str]:
+        if shutil.which("bash") is None or shutil.which("jq") is None:
+            self.skipTest("bash/jq not available")
+        job = self._job("conflict-resolve")
+        start = job.index("        id: prep\n")
+        run = job.index("        run: |\n", start) + len("        run: |\n")
+        script = textwrap.dedent(job[run:job.index("\n      - ", run)])
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / "pr.json").write_text(json.dumps(live), encoding="utf-8")
+            gh = d / "gh"
+            gh.write_text(
+                "#!/usr/bin/env bash\n"
+                'expr=""; prev=""\n'
+                'for a in "$@"; do if [ "$prev" = "--jq" ]; then expr="$a"; fi; prev="$a"; done\n'
+                f'jq -r "$expr" "{d}/pr.json"\n',
+                encoding="utf-8",
+            )
+            gh.chmod(0o755)
+            out = d / "out"
+            out.write_text("", encoding="utf-8")
+            env = dict(os.environ, PATH=f"{d}{os.pathsep}{os.environ.get('PATH', '')}", GITHUB_OUTPUT=str(out),
+                       REPO="o/r", PR_NUMBER="1", HEAD_SHA="a" * 40, HEAD_REF="feature/x", BASE_REF="main", GH_TOKEN="x")
+            env.pop("CLAUDE_FIXER_PAUSE", None)
+            if pause_var is not None:
+                env["CLAUDE_FIXER_PAUSE"] = pause_var
+            result = subprocess.run(["bash", "-c", script], env=env, check=True, capture_output=True, text=True, cwd=tmp)
+            return out.read_text(encoding="utf-8"), result.stdout
+
+    def test_resolver_rechecks_pause_under_lock_before_merge(self) -> None:
+        moved = {"state": "open", "head": {"sha": "b" * 40, "repo": {"full_name": "o/r"}}, "mergeable_state": "dirty"}
+        for live, pause_var, message in (
+            (moved | {"labels": [{"name": "claude:pause"}]}, None, "paused by PR label (claude:pause)"),
+            (moved | {"labels": [{"name": "HOLD"}]}, None, "paused by PR label (hold)"),
+            (moved | {"labels": None}, None, "paused by PR label (unreadable)"),
+            (moved | {"labels": ["hold"]}, None, "paused by PR label (unreadable)"),
+            (moved, None, "paused by PR label (unreadable)"),
+            (moved | {"labels": []}, "true", "paused by repo variable CLAUDE_FIXER_PAUSE"),
+        ):
+            with self.subTest(message=message, live=live):
+                out, stdout = self._prep(live, pause_var)
+                self.assertEqual(out, "proceed=false\n")
+                self.assertIn("::notice::conflict-resolve: " + message, stdout)
+        # Not paused: falls through to the existing stale-head recheck (head moved to b...).
+        out, stdout = self._prep(moved | {"labels": [{"name": "needs-review"}]}, "false")
+        self.assertEqual(out, "proceed=false\n")
+        self.assertIn("stale scan result", stdout)
+        self.assertNotIn("paused", stdout)
+
+    def test_pause_variable_wired_into_scan_and_resolve(self) -> None:
+        scan = self._job("conflict-scan")
+        self.assertIn("CLAUDE_FIXER_PAUSE: ${{ vars.CLAUDE_FIXER_PAUSE }}", scan)
+        prep = self._job("conflict-resolve").split("        id: prep\n", 1)[1].split("\n      - ", 1)[0]
+        self.assertIn("CLAUDE_FIXER_PAUSE: ${{ vars.CLAUDE_FIXER_PAUSE }}", prep)
+        self.assertLess(prep.index("CLAUDE_FIXER_PAUSE:-"), prep.index("git merge --no-ff --no-commit"))
+
+    def test_resolver_uses_fixed_helper_not_raw_gh_api(self) -> None:
+        job = self._job("conflict-resolve")
+        allow = job.split("--allowedTools", 1)[1].split("--disallowedTools", 1)[0]
+        self.assertNotIn("gh api", allow)
+        self.assertIn("Bash(python3 ${{ runner.temp }}/claude-fixer-guard/pre-push model-api --:*)", allow)
+        self.assertIn("Bash(gh api:*)", job.split("--disallowedTools", 1)[1].split('"', 2)[1])
+        prompt = job.split("prompt: |", 1)[1].split("claude_args:", 1)[0]
+        self.assertNotIn("gh api repos/", prompt)
+        self.assertNotIn("labels[]=", prompt)
+        self.assertIn("model-api -- comment BODY_FILE", prompt)
+        self.assertIn("model-api -- label", prompt)
+        self.assertIn(".claude-fixer-replies/NAME.txt", prompt)
+        guard = job.split("id: push_guard", 1)[1].split("      - id: claude", 1)[0]
+        self.assertIn("MODEL_API_LABEL: needs-decision", guard)
+        self.assertLess(job.index("id: prep"), job.index("id: push_guard"))
+        self.assertLess(job.index("id: push_guard"), job.index("      - id: claude"))
+
     def test_resolver_comments_or_labels(self) -> None:
         job = self._job("conflict-resolve")
         self.assertIn("merge commit SHA", job)
@@ -1200,6 +1310,8 @@ class FixerLoopCapTests(unittest.TestCase):
         findings: str = "PRRT_1",
         listing_error: bool = False,
         threads: list[dict] | None = None,
+        labels: object = (),
+        pause_var: str | None = None,
     ) -> tuple[str, str]:
         import os
         import shutil
@@ -1210,9 +1322,15 @@ class FixerLoopCapTests(unittest.TestCase):
             self.skipTest("bash/tac not available")
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
-            (d / "commits.tsv").write_text("".join(f"{a}\t{b}\n" for a, b in commits), encoding="utf-8")
+            # Rows are (author login, author name[, committer login, committer name]);
+            # 2-column rows leave the committer columns empty, as before.
+            (d / "commits.tsv").write_text("".join("\t".join(row) + "\n" for row in commits), encoding="utf-8")
             (d / "comments.txt").write_text("".join(c + "\n" for c in comments), encoding="utf-8")
-            (d / "pr.json").write_text(json.dumps({"state": current_state, "head": {"sha": current_sha, "ref": current_ref, "repo": {"full_name": current_repo}}, "user": {"login": "alice"}}))
+            live = {"state": current_state, "head": {"sha": current_sha, "ref": current_ref, "repo": {"full_name": current_repo}}, "user": {"login": "alice"}}
+            if labels is not None:
+                # GitHub always returns a labels array; raw non-list values model unreadable labels.
+                live["labels"] = [{"name": n} for n in labels] if isinstance(labels, tuple) else labels
+            (d / "pr.json").write_text(json.dumps(live))
             (d / "threads.json").write_text(json.dumps({"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": threads or []}}}}}))
             graphql_reply = ('jq -r "${!#}" "' + str(d / "threads.json") + '"') if threads is not None else ('printf "%s\\n" "' + findings + '"')
             gh = d / "gh"
@@ -1236,6 +1354,9 @@ class FixerLoopCapTests(unittest.TestCase):
                        REPO="o/r", PR_NUMBER="1", HEAD_SHA="a" * 40, HEAD_REF="feature/fix", GH_TOKEN="x", COMMENTER="bob")
             if bypass_cap is not None:
                 env["BYPASS_CAP"] = bypass_cap
+            env.pop("CLAUDE_FIXER_PAUSE", None)
+            if pause_var is not None:
+                env["CLAUDE_FIXER_PAUSE"] = pause_var
             subprocess.run(["bash", "-c", self.script], env=env, check=True, capture_output=True)
             posted = (d / "posted").read_text(encoding="utf-8") if (d / "posted").exists() else ""
             return out.read_text(encoding="utf-8"), posted
@@ -1345,6 +1466,72 @@ class FixerLoopCapTests(unittest.TestCase):
         for step in steps:
             self.assertIn("steps.cap.outputs.skip != 'true'", step)
 
+    def test_truncated_commit_list_counts_as_at_cap(self) -> None:
+        # GitHub lists at most 250 PR commits, oldest first; the newest may be missing.
+        human = [("alice", "Alice")]
+        for commits, expected in ((human * 249, "0"), (human * 250, "8"), (human * 300, "8"),
+                                  (human * 240 + [("claude[bot]", "claude[bot]")] * 12, "12")):
+            with self.subTest(n=len(commits)):
+                out, posted = self._run(commits, [])
+                self.assertIn("loop_commit_count=" + expected, out)
+                self.assertEqual(posted, "")
+
+    def test_live_fixer_attribution_counts_as_claude(self) -> None:
+        # Real fixer pushes are authored by github-actions[bot] with git author name claude[bot].
+        live = ("github-actions[bot]", "claude[bot]")
+        for commits, expected in (([("alice", "Alice")] + [live] * 8, "8"), ([("alice", "Alice")] + [live] * 7, "7"),
+                                  ([live] * 3 + [("bob", "Bob")] + [live] * 2, "2")):
+            with self.subTest(commits=commits):
+                out, _ = self._run(commits, [])
+                self.assertIn("loop_commit_count=" + expected, out)
+
+    def test_forged_author_does_not_reset_and_committer_is_checked(self) -> None:
+        # The model can pass `git commit --author`, but its committer comes from the job's git config.
+        claude, human = ("claude[bot]", "claude[bot]"), ("alice", "Alice")
+        cases = (
+            ([human] + [("alice", "Alice", "-", "claude[bot]")] * 8, "8"),
+            ([human] + [("alice", "Alice", "claude[bot]", "claude[bot]")] * 8, "8"),
+            ([human] + [("-", "Alice", "-", "claude")] * 8, "8"),
+            ([claude] * 8 + [("bob", "Bob", "bob", "Bob")] + [claude] * 7, "7"),
+            ([claude] * 8 + [("bob", "Bob", "web-flow", "GitHub")] + [claude] * 2, "2"),
+            ([human] + [claude] * 4 + [("bob", "Bob", "github-actions[bot]", "github-actions[bot]")] + [claude] * 4, "8"),
+            ([human] + [claude] * 4 + [("bob", "Bob", "-", "renovate[bot]")] + [claude] * 4, "8"),
+        )
+        for commits, expected in cases:
+            with self.subTest(commits=commits[-9:]):
+                out, _ = self._run(commits, [])
+                self.assertIn("loop_commit_count=" + expected + "\n", out)
+        self.assertIn('(.committer.login // "-"), (.commit.committer.name // "-")', self.script)
+
+    def test_truncated_listing_notice_says_a_human_must_take_over(self) -> None:
+        self.assertIn("A human commit cannot reset this, so a human has to take over this PR.", self.script)
+
+    def test_human_pause_skips_before_reservation(self) -> None:
+        for kwargs in ({"labels": ("claude:pause",)}, {"labels": ("bug", "hold")}, {"labels": ("Claude:Pause",)},
+                       {"labels": ("HOLD",)}, {"labels": None}, {"labels": {"name": "hold"}},
+                       {"labels": ["hold"]}, {"pause_var": "true"}):
+            with self.subTest(**{k: str(v) for k, v in kwargs.items()}):
+                out, posted = self._run([("alice", "Alice")], [], **kwargs)
+                self.assertIn("skip=true", out)
+                self.assertNotIn("loop_commit_count", out)
+                self.assertNotIn("head_sha", out)
+                self.assertEqual(posted, "")
+        for kwargs in ({"labels": ("bug", "needs-decision", "do-not-merge", "holding")},
+                       {"pause_var": "false"}, {"pause_var": "TRUE"}, {"pause_var": ""}):
+            with self.subTest(**{k: str(v) for k, v in kwargs.items()}):
+                out, _ = self._run([("alice", "Alice")], [], **kwargs)
+                self.assertIn("skip=false", out)
+
+    def test_pause_variable_and_notice_wired_into_writer_jobs(self) -> None:
+        for name in ("claude-mention", "devin-review-fix"):
+            job = WorkflowStructureTests._job(self, name)
+            first = job.split("\n      - ", 2)[1]
+            self.assertIn("CLAUDE_FIXER_PAUSE: ${{ vars.CLAUDE_FIXER_PAUSE }}", first, name)
+            self.assertIn('[ "${CLAUDE_FIXER_PAUSE:-}" = "true" ]', first, name)
+            self.assertIn("::notice::Claude PR writer paused by", first, name)
+            self.assertIn('select(. == "claude:pause" or . == "hold")', first, name)
+            self.assertLess(job.index("CLAUDE_FIXER_PAUSE"), job.index("uses: actions/checkout"), name)
+
     def test_conflict_resolve_waits_for_devin_on_claude_head(self) -> None:
         text = SCAN_WORKFLOW_PATH.read_text(encoding="utf-8")
         job = text[text.index("  conflict-resolve:\n"):]
@@ -1379,6 +1566,74 @@ class MentionLiveHeadTests(unittest.TestCase):
             out, _ = self._run([], [], **kwargs)
             self.assertIn("skip=true", out)
 
+    def test_mention_honors_eight_commit_streak(self):
+        claude, human, other = ("claude[bot]", "claude[bot]"), ("alice", "Alice"), ("github-actions[bot]", "github-actions[bot]")
+        cases = (
+            ([human] + [claude] * 7, "false"),
+            ([human] + [claude] * 8, "true"),
+            ([human] + [claude] * 4 + [other] + [claude] * 4, "true"),
+            ([human] + [claude] * 4 + [other] * 5 + [claude] * 3, "false"),
+            ([claude] * 8 + [("bob", "Bob")] + [claude] * 7, "false"),
+            ([human] + [("x", "claude")] * 8, "true"),
+            ([], "false"),
+        )
+        for commits, skip in cases:
+            with self.subTest(commits=commits):
+                out, posts = self._run(commits, [])
+                self.assertIn("skip=" + skip, out)
+                self.assertEqual("head_sha=" in out, skip == "false")
+                self.assertEqual(posts, "")
+
+    def test_mention_counts_live_fixer_attribution_as_claude(self):
+        # Real fixer pushes are authored by github-actions[bot] with git author name claude[bot].
+        live = ("github-actions[bot]", "claude[bot]")
+        for n, skip in ((7, "false"), (8, "true")):
+            with self.subTest(n=n):
+                out, _ = self._run([("alice", "Alice")] + [live] * n, [])
+                self.assertIn("skip=" + skip, out)
+        self.assertIn("A human commit cannot reset this, so a human has to take over this PR.", self.script)
+
+    def test_mention_forged_author_does_not_reset_and_committer_is_checked(self):
+        claude, human = ("claude[bot]", "claude[bot]"), ("alice", "Alice")
+        cases = (
+            ([human] + [("alice", "Alice", "-", "claude[bot]")] * 8, "true"),
+            ([human] + [("alice", "Alice", "claude[bot]", "claude[bot]")] * 8, "true"),
+            ([human] + [("alice", "Alice", "claude[bot]", "claude[bot]")] * 7, "false"),
+            ([claude] * 8 + [("bob", "Bob", "bob", "Bob")] + [claude] * 7, "false"),
+            ([claude] * 8 + [("bob", "Bob", "web-flow", "GitHub")] + [claude] * 2, "false"),
+            ([human] + [claude] * 4 + [("bob", "Bob", "github-actions[bot]", "github-actions[bot]")] + [claude] * 4, "true"),
+        )
+        for commits, skip in cases:
+            with self.subTest(commits=commits[-9:]):
+                out, _ = self._run(commits, [])
+                self.assertIn("skip=" + skip, out)
+        self.assertIn('(.committer.login // "-"), (.commit.committer.name // "-")', self.script)
+        self.assertIn("A human commit resets the streak, except on a PR listing 250+ commits, where a human has to take over.",
+                      self.script)
+
+    def test_mention_cap_fails_closed_on_truncated_commit_list(self):
+        # GitHub's PR commits endpoint lists at most 250 commits, oldest first.
+        human = ("alice", "Alice")
+        for n, skip in ((249, "false"), (250, "true"), (300, "true")):
+            with self.subTest(n=n):
+                out, _ = self._run([human] * n, [])
+                self.assertIn("skip=" + skip, out)
+
+    def test_mention_commit_listing_error_fails_closed(self):
+        with self.assertRaises(subprocess.CalledProcessError):
+            self._run([], [], listing_error=True)
+
+    def test_mention_human_pause_skips(self):
+        for kwargs in ({"labels": ("claude:pause",)}, {"labels": ("Hold",)}, {"labels": None},
+                       {"labels": "hold"}, {"pause_var": "true"}):
+            with self.subTest(**{k: str(v) for k, v in kwargs.items()}):
+                out, posts = self._run([], [], **kwargs)
+                self.assertIn("skip=true", out)
+                self.assertNotIn("head_sha", out)
+                self.assertEqual(posts, "")
+        out, _ = self._run([], [], labels=("needs-decision",), pause_var="false")
+        self.assertIn("skip=false", out)
+
     def test_original_comment_and_fresh_branch_remain_bound(self):
         job = self.text.split("  claude-mention:", 1)[1].split("  devin-review-fix:", 1)[0]
         self.assertIn("COMMENTER: ${{ github.event.comment.user.login }}", job)
@@ -1387,6 +1642,22 @@ class MentionLiveHeadTests(unittest.TestCase):
         self.assertLess(job.index("id: live"), job.index("actions/checkout"))
         for step in job.split("      - uses: actions/checkout@v4", 1)[1].split("\n      - "):
             self.assertIn("steps.live.outputs.skip != 'true'", step)
+
+
+class ClaudeActionInlineCommentTests(unittest.TestCase):
+    """CSL-383: no claude-code-action step publishes the model-writable comment buffer."""
+
+    def test_every_claude_action_step_disables_buffered_inline_comments(self) -> None:
+        import re
+
+        steps = []
+        for path in sorted(WORKFLOW_PATH.parent.glob("*.y*ml")):
+            for step in path.read_text(encoding="utf-8").split("uses: anthropics/claude-code-action@")[1:]:
+                steps.append((path.name, re.split(r"\n      - ", step, maxsplit=1)[0]))
+        self.assertGreaterEqual(len(steps), 3)
+        for index, (name, inputs) in enumerate(steps):
+            with self.subTest(workflow=name, step=index):
+                self.assertIn('\n          classify_inline_comments: "false"\n', inputs)
 
 
 if __name__ == "__main__":

@@ -22,8 +22,9 @@ URL = "https://github.com/acme/example.git"
 CONFIG = {"repo": "acme/example", "number": "7", "base": A, "ref": "fix"}
 
 
-def pr(sha=A):
-    return {"state": "open", "head": {"sha": sha, "ref": "fix", "repo": {"full_name": "acme/example"}}}
+def pr(sha=A, labels=()):
+    return {"state": "open", "labels": [{"name": name} for name in labels],
+            "head": {"sha": sha, "ref": "fix", "repo": {"full_name": "acme/example"}}}
 
 
 class GuardTests(unittest.TestCase):
@@ -34,6 +35,10 @@ class GuardTests(unittest.TestCase):
         self.state = self.path / "attempt.json"
         self.execution = self.path / "execution.json"
         self.execution.write_text(json.dumps([{"type": "result", "subtype": "success", "num_turns": 12}]))
+        # model-api writes re-read the live PR; default to an unpaused one.
+        live = patch.object(m, "api", return_value=pr())
+        live.start()
+        self.addCleanup(live.stop)
 
     def push(self, read=lambda _: pr(), updates=None, config=CONFIG, remote="origin"):
         return m.guard(config, f"HEAD {B} refs/heads/fix {A}\n" if updates is None else updates, remote, self.state, remote_url=URL,
@@ -45,6 +50,42 @@ class GuardTests(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             self.push()
         self.assertEqual(json.loads(self.state.read_text()), {})
+
+    def test_pause_label_added_after_preflight_stops_the_push(self):
+        for live in (pr(labels=["claude:pause"]), pr(labels=["bug", "hold"]), pr(labels=["Claude:Pause"]),
+                     pr(labels=["HOLD"]), pr() | {"labels": None}, pr() | {"labels": ["hold"]},
+                     pr() | {"labels": {"name": "x"}}, {k: v for k, v in pr().items() if k != "labels"}):
+            with self.subTest(live=live):
+                self.state.unlink(missing_ok=True)
+                with self.assertRaises(m.PauseRefused):
+                    self.push(lambda _, live=live: live)
+                self.assertEqual(json.loads(self.state.read_text()), {})  # Attempt consumed, no candidate.
+                with self.assertRaises(FileExistsError):
+                    self.push()
+        self.state.unlink()
+        self.push(lambda _: pr(labels=["bug", "do-not-merge", "needs-decision", "holding"]))
+        self.assertEqual(json.loads(self.state.read_text()), {"candidate": B})
+
+    def test_pause_never_blocks_audit_reads(self):
+        self.assertEqual(m.current_pr(CONFIG, lambda _: pr(labels=["hold"])), A)
+        self.assertEqual(m.current_pr(CONFIG, lambda _: pr() | {"labels": None}), A)
+        state = self.path / "pushed.json"
+        state.write_text(json.dumps({"candidate": B}))
+        def read(path):
+            return pr(B, labels=["claude:pause"]) if "/pulls/" in path else {"status": "ahead"}
+        body = m.terminal(CONFIG, state, self.execution, "success", read=read)
+        self.assertIn(f"Guarded candidate reachable on the live PR: `{B}`", body)
+
+    def test_hook_reports_pause_refusal_distinctly(self):
+        script = self.path / "pre-push"
+        script.write_text("fixture")
+        (self.path / "context.json").write_text(json.dumps(CONFIG))
+        for error, text in ((m.PauseRefused("hold"), "paused for humans"), (ValueError("x"), "stale/invalid head")):
+            with self.subTest(error=error), patch.object(m, "__file__", str(script)), \
+                    patch.object(sys, "argv", ["pre-push", "origin", URL]), patch.object(m, "guard", side_effect=error), \
+                    patch.object(sys, "stdin"), patch("sys.stderr") as stderr:
+                self.assertEqual(m.main(), 1)
+                self.assertIn(text, "".join(call.args[0] for call in stderr.write.call_args_list))
 
     def test_api_denial_stops_without_retry(self):
         def denied(_):
@@ -145,6 +186,92 @@ class GuardTests(unittest.TestCase):
                 m.model_api(CONFIG, args, run=run)
             self.assertEqual(run.call_args.args[0], ["gh", "api", "--method", "POST", "repos/acme/example/" + endpoint, "--input", "-"])
             self.assertEqual(json.loads(run.call_args.kwargs["input"]), {"body": body.read_text()})
+
+    def test_handoff_label_is_opt_in_fixed_and_same_pr_only(self):
+        from unittest.mock import Mock
+        run = Mock(return_value="{}")
+        for config, args in ((CONFIG, ["label"]), (CONFIG | {"label": ""}, ["label"]),
+                             (CONFIG | {"label": "ci:full"}, ["label"]),
+                             (CONFIG | {"label": "needs-decision"}, ["label", "ci:full"]),
+                             (CONFIG | {"label": "needs-decision"}, ["label", "needs-decision"]),
+                             (CONFIG | {"label": "needs-decision"}, ["labels"]),
+                             (CONFIG | {"label": "needs-decision"}, ["label", "--method", "DELETE"])):
+            with self.subTest(config=config.get("label"), args=args), self.assertRaises(ValueError):
+                m.model_api(config, args, run=run)
+        run.assert_not_called()
+        m.model_api(CONFIG | {"label": "needs-decision"}, ["label"], run=run)
+        run.assert_called_once_with(["gh", "api", "--method", "POST", "repos/acme/example/issues/7/labels",
+                                     "--input", "-"], input=json.dumps({"labels": ["needs-decision"]}))
+
+    def test_pause_refuses_model_api_writes_but_not_reads(self):
+        from unittest.mock import Mock
+        (self.path / ".claude-fixer-replies").mkdir()
+        (self.path / ".claude-fixer-replies/body.txt").write_text("Status", encoding="utf-8")
+        target = json.dumps({"id": 123, "pull_request_url": "https://api.github.com/repos/acme/example/pulls/7"})
+        writes = ((CONFIG, ["comment", ".claude-fixer-replies/body.txt"]),
+                  (CONFIG, ["reply", "123", ".claude-fixer-replies/body.txt"]),
+                  (CONFIG | {"label": "needs-decision"}, ["label"]))
+        for live in (pr(labels=["claude:pause"]), pr(labels=["HOLD"]), pr(labels=["bug", "hold"]),
+                     pr() | {"labels": None}, pr() | {"labels": ["hold"]},
+                     {k: v for k, v in pr().items() if k != "labels"}):
+            for config, args in writes:
+                with self.subTest(live=live.get("labels"), op=args[0]), patch.object(m.Path, "cwd", return_value=self.path):
+                    run = Mock(return_value=target)
+                    with self.assertRaises(m.PauseRefused):
+                        m.model_api(config, args, run=run, read=lambda _path, live=live: live)
+                    self.assertFalse(any("POST" in call.args[0] for call in run.call_args_list))
+                    # The default live reader is the same check (main() passes no reader).
+                    with patch.object(m, "api", return_value=live), self.assertRaises(m.PauseRefused):
+                        m.model_api(config, args, run=run)
+                    self.assertFalse(any("POST" in call.args[0] for call in run.call_args_list))
+            for op in ("read", "comments", "review-comments", "reviews", "threads"):
+                with self.subTest(live=live.get("labels"), read=op):
+                    run = Mock(return_value="[]")
+                    m.model_api(CONFIG, [op], run=run, read=lambda _path, live=live: live)
+                    run.assert_called_once()
+        # Unpaused writes still post exactly once.
+        for config, args in writes:
+            with self.subTest(unpaused=args[0]), patch.object(m.Path, "cwd", return_value=self.path):
+                run = Mock(return_value=target)
+                m.model_api(config, args, run=run, read=lambda _path: pr(labels=["bug", "needs-decision"]))
+                self.assertEqual(sum("POST" in call.args[0] for call in run.call_args_list), 1)
+
+    def test_pause_never_blocks_the_workflow_terminal_handback(self):
+        (self.path / "context.json").write_text(json.dumps(CONFIG))
+        (self.path / "attempt.json").write_text(json.dumps({"candidate": B}))
+        def live(path, timeout=30):
+            return pr(B, labels=["claude:pause"]) if path.endswith("/pulls/7") else {"status": "ahead"}
+        with patch.object(m, "__file__", str(self.path / "pre-push")), \
+                patch.object(sys, "argv", ["pre-push", "terminal"]), \
+                patch.object(m, "api", side_effect=live), patch.object(m, "command", return_value="") as post, \
+                patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(self.path / "summary"), "MODEL_OUTCOME": "success",
+                                        "EXECUTION_FILE": str(self.execution)}), \
+                patch("builtins.print"):
+            self.assertEqual(m.main(), 0)
+        self.assertEqual(post.call_args.args[0][:4], ["gh", "api", "--method", "POST"])
+        self.assertEqual(post.call_args.args[0][4], "repos/acme/example/issues/7/comments")
+        self.assertIn(f"Guarded candidate reachable on the live PR: `{B}`", json.loads(post.call_args.kwargs["input"])["body"])
+
+    def test_install_accepts_only_the_handoff_label(self):
+        env = {"REPO": CONFIG["repo"], "PR_NUMBER": "7", "HEAD_SHA": A, "HEAD_REF": "fix"}
+        for label, ok in (("", True), ("needs-decision", True), (None, True), ("ci:full", False),
+                          ("needs-decision ", False), ("Needs-Decision", False), ("claude:pause", False)):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                script = Path(tmp) / "pre-push"
+                script.write_text("fixture")
+                extra = {} if label is None else {"MODEL_API_LABEL": label}
+                with patch.object(m, "__file__", str(script)), patch.object(sys, "argv", ["pre-push", "install"]), \
+                        patch.object(m, "command") as command, patch.dict(os.environ, env | extra):
+                    os.environ.pop("MODEL_API_LABEL", None) if label is None else None
+                    if ok:
+                        self.assertEqual(m.main(), 0)
+                        self.assertEqual(json.loads((Path(tmp) / "context.json").read_text())["label"], label or "")
+                        command.assert_called_once()
+                    else:
+                        with self.assertRaises(ValueError):
+                            m.main()
+                        self.assertFalse((Path(tmp) / "context.json").exists())
+                        command.assert_not_called()
 
     def test_reply_refuses_foreign_missing_malformed_or_non_root_targets(self):
         from unittest.mock import Mock
@@ -432,6 +559,82 @@ class WorkflowTests(unittest.TestCase):
             self.assertIn("If push is rejected or uncertain, STOP", body)
             self.assertIn("before emitting any addressed receipt", body)
             self.assertIn("has no Linear, Context7 or Parallel tools", body)
+
+
+class GuardedWriterJobTests(unittest.TestCase):
+    """Every Claude writer that installs the guard must keep it out of the model's reach."""
+
+    DENY = ('"Edit(.git/**)"', '"Write(.git/**)"',
+            '"Edit(/${{ runner.temp }}/claude-fixer-guard/**)"', '"Write(/${{ runner.temp }}/claude-fixer-guard/**)"')
+
+    @staticmethod
+    def jobs():
+        found = {}
+        for name in ("claude.yml", "conflict-scan.yml"):
+            text = (ROOT / ".github/workflows" / name).read_text(encoding="utf-8")
+            for chunk in re.split(r"\n  (?=[a-z][a-z-]*:\n)", text.split("\njobs:\n", 1)[1]):
+                job = chunk.split(":\n", 1)[0].strip()
+                if "<<'CLAUDE_FIXER_GUARD'" in chunk:
+                    found[job] = chunk
+        return found
+
+    def test_every_guarded_writer_denies_git_and_guard_edits(self):
+        jobs = self.jobs()
+        self.assertEqual(sorted(jobs), ["claude-mention", "conflict-resolve", "devin-review-fix"])
+        for name, job in jobs.items():
+            deny = job.split('"deny": [', 1)[1].split("]", 1)[0]
+            for rule in self.DENY:
+                with self.subTest(job=name, rule=rule):
+                    self.assertIn(rule, deny)
+
+    def test_writer_jobs_keep_workflow_denies_and_raw_api_disallows(self):
+        workflow_deny = {"claude-mention": ('"Edit(.github/workflows/**)"', '"Write(.github/workflows/**)"'),
+                         "devin-review-fix": ('"Edit(.github/workflows/**)"', '"Write(.github/workflows/**)"'),
+                         "conflict-resolve": ('"Edit(.github/**)"', '"Write(.github/**)"')}
+        jobs = self.jobs()
+        self.assertEqual(sorted(jobs), sorted(workflow_deny))
+        for name, job in jobs.items():
+            deny = job.split('"deny": [', 1)[1].split("]", 1)[0]
+            disallow = job.split("--disallowedTools", 1)[1].split('"', 2)[1].split(",")
+            for rule in workflow_deny[name] + self.DENY:
+                with self.subTest(job=name, rule=rule):
+                    self.assertIn(rule, deny)
+            for rule in ("Bash(gh api:*)", "Bash(git difftool:*)", "Bash(curl:*)", "Bash(env:*)", "Bash(printenv:*)"):
+                with self.subTest(job=name, disallow=rule):
+                    self.assertIn(rule, disallow)
+
+    def test_every_guarded_writer_embeds_the_source_and_only_pushes_through_it(self):
+        source = SOURCE.read_text(encoding="utf-8").rstrip()
+        for name, job in self.jobs().items():
+            with self.subTest(job=name):
+                chunk = job.split("<<'CLAUDE_FIXER_GUARD'\n", 1)[1].split("          CLAUDE_FIXER_GUARD", 1)[0]
+                self.assertEqual(textwrap.dedent(chunk).rstrip(), source)
+                self.assertIn('python3 "$RUNNER_TEMP/claude-fixer-guard/pre-push" install', job)
+                body = job.split("      - id: claude\n", 1)[1]
+                allow = body.split("--allowedTools", 1)[1].split("--disallowedTools", 1)[0]
+                disallow = body.split("--disallowedTools", 1)[1].split('"', 2)[1]
+                self.assertNotIn("Bash(gh api", allow)
+                self.assertIn("Bash(gh api:*)", disallow)
+                self.assertIn("Bash(python3 ${{ runner.temp }}/claude-fixer-guard/pre-push model-api --:*)", allow)
+                pushes = re.findall(r"Bash\(git push[^)]*\)", allow)
+                self.assertEqual(len(pushes), 1)
+                self.assertRegex(pushes[0], r"^Bash\(git push origin HEAD:refs/heads/\$\{\{ [a-z_.]+ \}\}\)$")
+                git_rules = "\n".join(re.findall(r"Bash\(git [^)]*\)", allow))
+                for bypass in ("Bash(git -", "Bash(git remote", "Bash(git config", "Bash(git fetch", "Bash(git pull",
+                               "Bash(git rebase", "--no-verify", "--force", "--dry-run", "HEAD:refs/heads/*"):
+                    self.assertNotIn(bypass, git_rules)
+
+    def test_only_the_conflict_job_enables_the_handoff_label(self):
+        for name, job in self.jobs().items():
+            with self.subTest(job=name):
+                install = job.split("id: push_guard", 1)[1].split("<<'CLAUDE_FIXER_GUARD'", 1)[0]
+                if name == "conflict-resolve":
+                    self.assertIn("MODEL_API_LABEL: needs-decision\n", install)
+                    self.assertIn("if: steps.prep.outputs.proceed == 'true'\n", install)
+                    self.assertIn("if: steps.prep.outputs.proceed == 'true' && steps.push_guard.outcome == 'success'\n",
+                                  job.split("      - id: claude\n", 1)[1].split("uses:", 1)[0])
+                else:
+                    self.assertNotIn("MODEL_API_LABEL", install)
 
 
 class TerminalReceiptIntegrationTests(unittest.TestCase):

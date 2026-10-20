@@ -70,6 +70,44 @@ failures remain eligible for a fresh bounded retry rather than a needs-human
 receipt. One audit is intentional even after model success, which alone cannot
 prove every per-root receipt was valid.
 
+## Human pause, bounded mentions and Codex identity (CSL-365)
+
+Three jobs let Claude push to a PR branch: `devin-review-fix` and
+`claude-mention` in `claude.yml`, and `conflict-resolve` in `conflict-scan.yml`.
+All three share the per-PR `claude-<PR>` lock, install the same pre-push guard
+and honor the same pause. Label names match case-insensitively.
+
+- **One PR:** add the label `claude:pause` (or the existing hold label `hold`).
+  The fixer and mention jobs skip with a notice in their first locked step,
+  before checkout, model work or attempt reservation, so the three-attempt
+  budget is untouched. The conflict scan never selects a paused PR, and
+  `conflict-resolve` rechecks the label under the lock before it merges.
+  Remove the label to resume. Missing or unreadable labels count as paused.
+- **Every PR:** set the repository variable `CLAUDE_FIXER_PAUSE` to exactly
+  `true`. Unset it, or set any other value, to resume.
+- **A run already past that check:** the guard rereads the live PR at push
+  time and refuses the push on a pause label or unreadable labels. The attempt
+  stays consumed and nothing is retried. Terminal audits still read a paused
+  PR. A run that already pushed is not undone.
+- **Mentions are bounded:** `@claude` skips once eight or more Claude commits
+  follow the newest human commit, the same rule as the Devin path. Other bots
+  neither count nor reset the streak; a human commit resets it.
+- **Long PRs:** GitHub lists at most 250 PR commits, oldest first. Both
+  counters treat a listing of 250 or more as at the cap, with a notice.
+
+The conflict resolver no longer has raw `gh api`. Like the fixers, it uses the
+fixed `model-api` helper. That job alone enables one extra operation, `label`,
+which adds exactly `needs-decision`. Its deny list also covers `.git/**` and
+the guard directory.
+
+A `CODEX-GATE` verdict counts only from the Codex App:
+login `chatgpt-codex-connector[bot]`, type `Bot` and user ID `199175422`
+when those fields are present. The bare `chatgpt-codex-connector` login is an
+ordinary user name and never adds `ci:full` or dispatches mediation.
+
+A pause never resets budgets, receipts or the commit cap, and never resolves
+threads. `needs-decision` stops only the conflict scan, not the fixers.
+
 ## Mediation and implementation remain separate
 
 Devin submitted reviews and authorized human requests drive Claude. Codex

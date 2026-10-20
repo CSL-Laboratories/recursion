@@ -71,6 +71,11 @@ HTML_TYPE1_START_RE = re.compile(
     re.IGNORECASE,
 )
 HTML_TYPE1_NAMES = frozenset(("pre", "script", "style", "textarea"))
+# A raw type-1 opener prefix anywhere inside a block. HTML still opens the
+# element even when CommonMark 6.6 rejects the tag (``<pre @x>``, ``<pre``).
+HTML_TYPE1_RAW_OPENER_RE = re.compile(
+    r"<(?:pre|script|style|textarea)(?=[ \t>\r\n/]|$)", re.IGNORECASE
+)
 # CommonMark 4.6 type 6 block tags. Used only to fail closed on an unparsed
 # line-start opener; wrapping tags still use the ordered stack so a blank
 # line does not authorize a verdict inside <details>/<blockquote>.
@@ -810,6 +815,8 @@ def _html_type1_end(text: str) -> int | None:
                 return None  # A nested raw-text/pre element keeps wrapping the ruling.
             index = end
             continue
+        if HTML_TYPE1_RAW_OPENER_RE.match(text, lt):
+            return None  # A malformed nested opener still opens the element.
         index = lt + 1
     return None
 

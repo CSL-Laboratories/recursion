@@ -1665,7 +1665,9 @@ class VerdictAndResolveTests(unittest.TestCase):
                           "<pre>x</pre >\n\n", "<script>\nx\n</script >\n\n",
                           "<pre>\n<pre>\n</pre>\n\n", "<pre><pre></pre>\n\n",
                           "<pre>\n<script>\n</pre>\n\n", "<pre>\n<textarea>\n</pre>\n\n",
-                          "<textarea>\n<pre>\n</textarea>\n\n"):
+                          "<textarea>\n<pre>\n</textarea>\n\n",
+                          "<pre>\n<pre @x>\n</pre>\n\n", "<pre><pre @x></pre>\n\n",
+                          "<pre>\n<pre\n</pre>\n\n", "<pre>\n<SCRIPT @x>\n</pre>\n\n"):
                 with self.subTest(prose=prose, newline=repr(newline)):
                     self._assert_no_resolve((prose + block).replace("\n", newline))
             for prose in ("<pre>\nx\n</pre>\n\n", "<PRE>\nx\n</pre>\n\n", "<Pre>\nx\n</pRe>\n\n",

@@ -25,7 +25,7 @@ Snapshot format (all timestamps ISO 8601 with a UTC offset):
          decision: {options: [..], pings: [ts..], options_changed_at: [ts..],
                     deadline: ts | null} | null}
     comments            required; list of
-        {id, issue, created_at, body, edits: [{at, body}], deleted}
+        {id, issue, created_at, body, edits: [{at, body}], deleted, deleted_at}
     commits             list of {sha, repo, branch, at, author_kind, claim}
                         author_kind: agent | human | bot; claim: uuid | null
     writes              agent writes: list of {kind, issue, claim, at}
@@ -72,13 +72,19 @@ UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
 REVOKE_CLAIM = re.compile(r"^REVOKE CLAIM (\S+)\s*$")
 HOLD = re.compile(r"^HOLD (CSL-[0-9]+)\s*$")
 DECISION = re.compile(r"^DECISION:\s*([A-Za-z0-9_-]+)")
-BATCH = re.compile(r"^CSL-[0-9]+:\s*\S+(\s*;\s*CSL-[0-9]+:\s*\S+[^;]*)*")
+BATCH = re.compile(r"CSL-[0-9]+:\s*[A-Za-z0-9_-]+[^;]*(?:;\s*CSL-[0-9]+:\s*[A-Za-z0-9_-]+[^;]*)*;?\s*")
 BATCH_PAIR = re.compile(r"(CSL-[0-9]+):\s*([A-Za-z0-9_-]+)")
 ACK_TAKEOVER = re.compile(r"^ACK TAKEOVER (\S+)\s*$")
 SA_HEADER = re.compile(r"^Standing approval (SA-[0-9]+)\s*$")
 REVOKE_SA = re.compile(r"^REVOKE (SA-[0-9]+)\s*$")
 TAKEOVER = re.compile(r"^takeover of (\S+)\s*$")
 TIMESTAMP_VALUE = re.compile(r"^\d{4}-\d{2}-\d{2}T")
+AFTER_END = {
+    "expired": "after_expiry",
+    "revoked": "after_revoke",
+    "released": "after_release",
+    "withdrawn": "after_withdrawal",
+}
 WRITE_KINDS = {"push", "pr", "label", "resolve", "status"}
 AUTHOR_KINDS = {"agent", "human", "bot"}
 STATUSES = {"Triage", "Backlog", "Todo", "In Progress", "In Review", "Done", "Canceled", "Duplicate"}
@@ -106,6 +112,18 @@ def require(mapping: Any, key: str, where: str) -> Any:
     return mapping[key]
 
 
+def expect_bool(value: Any, where: str) -> bool:
+    if not isinstance(value, bool):
+        raise SnapshotError(f"{where} must be true or false")
+    return value
+
+
+def expect_list(value: Any, where: str) -> list[Any]:
+    if not isinstance(value, list):
+        raise SnapshotError(f"{where}: expected a list")
+    return value
+
+
 def agent_header(body: str) -> tuple[str, str] | None:
     """Return (session, developer) for an agent-prefixed body, else None."""
     first = body.split("\n", 1)[0]
@@ -130,6 +148,7 @@ class Comment:
     created_at: datetime
     revisions: list[Revision]
     deleted: bool
+    deleted_at: datetime | None = None
 
     @property
     def body(self) -> str:
@@ -219,6 +238,14 @@ class Evaluation:
         if unknown:
             raise SnapshotError(f"config: unknown keys {sorted(unknown)}")
         self.config = {**DEFAULT_CONFIG, **config}
+        for key in ("lease_minutes", "grace_minutes", "readback_seconds", "takeover_wait_minutes", "sa_max_days"):
+            value = self.config[key]
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise SnapshotError(f"config: {key} must be a non-negative integer")
+        if not isinstance(self.config["coordinator_ack_required"], bool):
+            raise SnapshotError("config: coordinator_ack_required must be a boolean")
+        if self.config["standing_approvals_issue"] is not None and not isinstance(self.config["standing_approvals_issue"], str):
+            raise SnapshotError("config: standing_approvals_issue must be an issue id or null")
         self.lease = timedelta(minutes=self.config["lease_minutes"])
         self.grace = timedelta(minutes=self.config["grace_minutes"])
         self.readback = timedelta(seconds=self.config["readback_seconds"])
@@ -233,12 +260,12 @@ class Evaluation:
         self.runs = self._load_list(snapshot, "runs", ("id", "claim", "started_at"))
         self.admissions = self._load_list(snapshot, "admissions", ("issue", "at"))
         self.sa_actions = self._load_list(snapshot, "sa_actions", ("sa", "action", "repo", "at"))
-        self.program = snapshot.get("program")
+        self.program = self._load_program(snapshot.get("program"))
         for commit in self.commits:
-            if commit["author_kind"] not in AUTHOR_KINDS:
+            if not isinstance(commit["author_kind"], str) or commit["author_kind"] not in AUTHOR_KINDS:
                 raise SnapshotError(f"commit {commit['sha']}: unknown author_kind")
         for write in self.writes:
-            if write["kind"] not in WRITE_KINDS:
+            if not isinstance(write["kind"], str) or write["kind"] not in WRITE_KINDS:
                 raise SnapshotError(f"write: unknown kind {write['kind']!r}")
             self._known_issue(write["issue"], "write")
 
@@ -268,15 +295,20 @@ class Evaluation:
                     raise SnapshotError(f"issue {issue_id}: decision needs options")
                 decision = {
                     "options": [str(option) for option in options],
-                    "pings": [parse_ts(t, issue_id) for t in decision.get("pings", [])],
-                    "options_changed_at": [parse_ts(t, issue_id) for t in decision.get("options_changed_at", [])],
+                    "pings": [parse_ts(t, issue_id) for t in expect_list(decision.get("pings", []), issue_id)],
+                    "options_changed_at": [
+                        parse_ts(t, issue_id) for t in expect_list(decision.get("options_changed_at", []), issue_id)
+                    ],
                     "deadline": parse_ts(decision["deadline"], issue_id) if decision.get("deadline") else None,
                 }
+            admitted = expect_bool(item.get("admitted", False), f"issue {issue_id}: admitted")
+            if status == "Triage" and admitted:
+                raise SnapshotError(f"issue {issue_id}: a Triage issue cannot be admitted")
             issues[issue_id] = {
                 "status": status,
-                "admitted": bool(item.get("admitted", False)),
-                "next_in_order": bool(item.get("next_in_order", False)),
-                "blocked_by": list(item.get("blocked_by", [])),
+                "admitted": admitted,
+                "next_in_order": expect_bool(item.get("next_in_order", False), f"issue {issue_id}: next_in_order"),
+                "blocked_by": [str(b) for b in expect_list(item.get("blocked_by", []), issue_id)],
                 "decision": decision,
             }
         for issue_id, issue in issues.items():
@@ -306,12 +338,21 @@ class Evaluation:
             if not isinstance(body, str):
                 raise SnapshotError(f"comment {comment_id}: body must be a string")
             revisions = [Revision(created, body)]
-            for edit in item.get("edits", []):
+            for edit in expect_list(item.get("edits", []), comment_id):
                 at = parse_ts(require(edit, "at", comment_id), comment_id)
                 if at < revisions[-1].at:
                     raise SnapshotError(f"comment {comment_id}: edits out of order")
-                revisions.append(Revision(at, require(edit, "body", comment_id)))
-            comments.append(Comment(comment_id, issue, created, revisions, bool(item.get("deleted", False))))
+                edited = require(edit, "body", comment_id)
+                if not isinstance(edited, str):
+                    raise SnapshotError(f"comment {comment_id}: edit body must be a string")
+                revisions.append(Revision(at, edited))
+            deleted = expect_bool(item.get("deleted", False), f"comment {comment_id}: deleted")
+            deleted_at = item.get("deleted_at")
+            if deleted_at is not None:
+                if not deleted:
+                    raise SnapshotError(f"comment {comment_id}: deleted_at without deleted")
+                deleted_at = parse_ts(deleted_at, comment_id)
+            comments.append(Comment(comment_id, issue, created, revisions, deleted, deleted_at))
         return comments
 
     def _load_list(self, snapshot: dict[str, Any], key: str, required: tuple[str, ...]) -> list[dict[str, Any]]:
@@ -324,10 +365,29 @@ class Evaluation:
             for field in required:
                 require(entry, field, key)
             for field in ("at", "started_at", "ended_at"):
-                if field in entry and entry[field] is not None:
-                    entry[field] = parse_ts(entry[field], key)
+                if field not in entry:
+                    continue
+                if entry[field] is None and field == "ended_at":
+                    continue
+                entry[field] = parse_ts(entry[field], key)
             items.append(entry)
         return items
+
+    @staticmethod
+    def _load_program(raw: Any) -> dict[str, int] | None:
+        if raw is None:
+            return None
+        if not isinstance(raw, dict):
+            raise SnapshotError("program must be an object")
+        program = {}
+        for key in ("review_slots", "occupied_reviews", "completed_waiting"):
+            value = raw.get(key, 0)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise SnapshotError(f"program: {key} must be a non-negative integer")
+            program[key] = value
+        if program["review_slots"] == 0:
+            raise SnapshotError("program: review_slots must be positive")
+        return program
 
     def _load_claims(self) -> dict[str, Claim]:
         claims: dict[str, Claim] = {}
@@ -380,7 +440,7 @@ class Evaluation:
         """Why the claim is not live at `at`, or None if it is live."""
         if claim.created_at > at:
             return "not yet posted"
-        if claim.comment.deleted:
+        if claim.comment.deleted and (claim.comment.deleted_at is None or claim.comment.deleted_at <= at):
             return "deleted"
         for label, when in (
             ("withdrawn", claim.withdrawn_at()),
@@ -393,14 +453,19 @@ class Evaluation:
             return "expired"
         return None
 
-    def takeover_status(self, claim: Claim) -> dict[str, Any] | None:
+    def takeover_status(self, claim: Claim, at: datetime | None = None) -> dict[str, Any] | None:
         if claim.takeover_of is None:
             return None
+        at = self.now if at is None else at
         old = self.claims.get(claim.takeover_of)
         posted = claim.created_at
         if old is None or old.issue != claim.issue or old.repo != claim.repo:
             return {"of": claim.takeover_of, "allowed": False, "reason": "unknown claim"}
-        objection = [r.at for r in old.comment.revisions if posted <= r.at <= posted + self.takeover_wait]
+        objection = [
+            r.at for r in old.comment.revisions
+            if posted <= r.at <= posted + self.takeover_wait
+            and not claim_fields(r.body).get("_released") and "withdrawn" not in claim_fields(r.body)
+        ]
         if objection:
             return {"of": old.uuid, "allowed": False, "reason": "original claimant renewed within the wait"}
         ended = self.ended(old, posted)
@@ -424,7 +489,7 @@ class Evaluation:
         if self.config["coordinator_ack_required"]:
             acked = any(
                 (m := ACK_TAKEOVER.match(line)) and m.group(1) == old.uuid
-                for c in self.human_comments() if c.issue == claim.issue
+                for c in self.human_comments() if c.issue == claim.issue and posted <= c.created_at <= at
                 for line in human_lines(c)
             )
             if not acked:
@@ -439,7 +504,7 @@ class Evaluation:
         superseded = set()
         refused = set()
         for claim in candidates:
-            status = self.takeover_status(claim)
+            status = self.takeover_status(claim, at)
             if status is None:
                 continue
             if status["allowed"]:
@@ -456,7 +521,40 @@ class Evaluation:
 
     # Decisions -------------------------------------------------------------
 
+    @staticmethod
+    def answer_pairs(comment: Comment, body: str) -> list[tuple[str, str, str]]:
+        """(decision issue, option, line) pairs a comment body states."""
+        lines = [line.strip() for line in body.split("\n")]
+        pairs = []
+        for line in lines:
+            match = DECISION.match(line)
+            if match:
+                pairs.append((comment.issue, match.group(1), line))
+        first = lines[1] if comment.agent is not None and len(lines) > 1 else lines[0]
+        if BATCH.fullmatch(first):
+            named = BATCH_PAIR.findall(first)
+            if comment.issue in {issue for issue, _ in named}:
+                pairs.extend((issue, value, first) for issue, value in named)
+        return pairs
+
+    def void(self, comment: Comment, line: str) -> None:
+        entry = {"comment": comment.id, "line": line, "reason": "agent-prefixed"}
+        if entry not in self.void_lines:
+            self.void_lines.append(entry)
+
     def decisions(self) -> dict[str, dict[str, Any]]:
+        stated: list[tuple[Comment, list[tuple[str, str, str]]]] = []
+        for comment in sorted(self.comments, key=lambda c: (c.created_at, c.id)):
+            if comment.deleted:
+                continue
+            original = self.answer_pairs(comment, comment.revisions[0].body)
+            if comment.agent is not None:
+                for _, _, line in original + self.answer_pairs(comment, comment.body):
+                    self.void(comment, line)
+                continue
+            if any(self.answer_pairs(comment, r.body) != original for r in comment.revisions[1:]):
+                self.violation("decision_edited", comment.issue, detail=comment.id)
+            stated.append((comment, original))
         results: dict[str, dict[str, Any]] = {}
         for issue_id, issue in self.issues.items():
             spec = issue["decision"]
@@ -464,29 +562,13 @@ class Evaluation:
                 continue
             answer = None
             needs_followup = False
-            for comment in sorted(self.comments, key=lambda c: c.created_at):
-                if comment.deleted:
-                    continue
-                for line in human_lines(comment):
-                    value = None
-                    decision = DECISION.match(line)
-                    if decision and comment.issue == issue_id:
-                        value = decision.group(1)
-                    elif BATCH.match(line):
-                        for named, picked in BATCH_PAIR.findall(line):
-                            if named == issue_id:
-                                value = picked
-                    if value is None:
-                        continue
-                    if comment.agent is not None:
-                        self.void_lines.append({"comment": comment.id, "line": line, "reason": "agent-prefixed"})
-                        continue
-                    if value.lower() == "hold":
+            for comment, pairs in stated:
+                for named, value, _ in pairs:
+                    if named != issue_id or value.lower() == "hold":
                         continue
                     if value not in spec["options"]:
                         needs_followup = True
-                        continue
-                    if answer is None:
+                    elif answer is None:
                         answer = {"option": value, "comment": comment.id, "at": comment.created_at}
             first_ping = spec["pings"][0] if spec["pings"] else None
             if first_ping is not None and any(t > first_ping for t in spec["options_changed_at"]):
@@ -504,33 +586,46 @@ class Evaluation:
                 "answer": answer["option"] if answer else None,
                 "answer_comment": answer["comment"] if answer else None,
                 "answered_at": answer["at"] if answer else None,
+                "held_from": first_ping,
                 "needs_followup": needs_followup and answer is None,
                 "deadline_passed": deadline_passed,
                 "reping_allowed": deadline_passed and not repings,
             }
         return results
 
-    def holds(self, decisions: dict[str, dict[str, Any]]) -> dict[str, list[str]]:
-        held: dict[str, list[str]] = {issue_id: [] for issue_id in self.issues}
-        for issue_id, issue in self.issues.items():
-            for blocker in issue["blocked_by"]:
-                state = decisions.get(blocker)
-                if state is None:
-                    if self.issues[blocker]["status"] not in {"Done", "Canceled", "Duplicate"}:
-                        held[issue_id].append(f"blocked by {blocker}")
-                elif not state["answered"]:
-                    held[issue_id].append(f"awaiting decision {blocker}")
+    def held_at(self, issue_id: str, at: datetime) -> list[str]:
+        """Reasons the issue is held at `at`.
+
+        A decision holds its blocked work from its first ping until it is
+        answered; a decision issue with no recorded ping, or a non-decision
+        blocker, has no start time and holds throughout.
+        """
+        reasons = []
+        for blocker in self.issues[issue_id]["blocked_by"]:
+            state = self._decisions.get(blocker)
+            if state is None:
+                if self.issues[blocker]["status"] not in {"Done", "Canceled", "Duplicate"}:
+                    reasons.append(f"blocked by {blocker}")
+                continue
+            started = state["held_from"] is None or state["held_from"] <= at
+            cleared = state["answered_at"] is not None and state["answered_at"] <= at
+            if started and not cleared:
+                reasons.append(f"awaiting decision {blocker}")
         for comment in self.human_comments():
+            if comment.created_at > at:
+                continue
             for line in human_lines(comment):
                 match = HOLD.match(line)
-                if match and match.group(1) in held:
-                    held[match.group(1)].append(f"HOLD by comment {comment.id}")
+                if match and match.group(1) == issue_id:
+                    reasons.append(f"HOLD by comment {comment.id}")
+        return reasons
+
+    def collect_void_lines(self) -> None:
         for comment in self.comments:
             if comment.agent is not None and not comment.deleted:
                 for line in human_lines(comment):
                     if HOLD.match(line) or REVOKE_CLAIM.match(line) or ACK_TAKEOVER.match(line):
-                        self.void_lines.append({"comment": comment.id, "line": line, "reason": "agent-prefixed"})
-        return held
+                        self.void(comment, line)
 
     # Standing approvals ----------------------------------------------------
 
@@ -544,8 +639,9 @@ class Evaluation:
             lines = human_lines(comment)
             header = SA_HEADER.match(lines[0]) if lines else None
             if comment.agent is not None:
-                if any(SA_HEADER.match(line) or REVOKE_SA.match(line) for line in lines):
-                    self.void_lines.append({"comment": comment.id, "line": lines[0], "reason": "agent-prefixed"})
+                for line in lines:
+                    if SA_HEADER.match(line) or REVOKE_SA.match(line):
+                        self.void(comment, line)
                 continue
             for line in lines:
                 match = REVOKE_SA.match(line)
@@ -557,21 +653,29 @@ class Evaluation:
             for key in ("actions", "scope", "expires"):
                 if key not in fields:
                     raise SnapshotError(f"standing approval {header.group(1)}: missing {key!r}")
-            limits = dict(part.split("=", 1) for part in fields.get("limits", "").replace(",", " ").split() if "=" in part)
-            expires = parse_ts(fields["expires"] + "T23:59:59Z", header.group(1)) if len(fields["expires"]) == 10 else parse_ts(fields["expires"], header.group(1))
+            sa_id = header.group(1)
+            limits = {}
+            for part in fields.get("limits", "").replace(",", " ").split():
+                key, _, value = part.partition("=")
+                if key not in {"per_day", "total"} or not value.isdigit():
+                    raise SnapshotError(f"standing approval {sa_id}: limits must be per_day=N and/or total=N")
+                limits[key] = int(value)
+            raw_expires = fields["expires"]
+            date_only = len(raw_expires) == 10
+            expires = parse_ts(raw_expires + "T23:59:59Z" if date_only else raw_expires, sa_id)
             approval = StandingApproval(
                 sa=header.group(1),
                 comment=comment,
                 actions={t.strip() for t in fields["actions"].split(",") if t.strip()},
                 scope={t.strip() for t in fields["scope"].split(",") if t.strip()},
                 who={t.strip() for t in fields["who"].split(",") if t.strip()} if "who" in fields else None,
-                per_day=int(limits["per_day"]) if "per_day" in limits else None,
-                total=int(limits["total"]) if "total" in limits else None,
+                per_day=limits.get("per_day"),
+                total=limits.get("total"),
                 expires=expires,
             )
             if approval.sa in approvals:
                 raise SnapshotError(f"standing approval {approval.sa}: duplicate")
-            if expires > comment.created_at + timedelta(days=self.config["sa_max_days"]):
+            if expires.date() > (comment.created_at + timedelta(days=self.config["sa_max_days"])).date():
                 self.violation("sa_too_long", detail=approval.sa)
             approvals[approval.sa] = approval
         return approvals, revoked
@@ -607,23 +711,28 @@ class Evaluation:
 
     # Rules -----------------------------------------------------------------
 
-    def check_claims(self, held: dict[str, list[str]]) -> None:
+    def check_claims(self) -> None:
         for claim in self.claims.values():
             issue = self.issues[claim.issue]
             if not issue["admitted"]:
                 self.violation("claim_not_admitted", claim.issue, claim.uuid)
             elif not issue["next_in_order"]:
                 self.violation("claim_out_of_order", claim.issue, claim.uuid)
-            if held[claim.issue]:
+            if self.held_at(claim.issue, claim.created_at):
                 self.violation("claim_on_held_scope", claim.issue, claim.uuid)
             confirmed = claim.confirmed_at()
             if confirmed is not None and confirmed - claim.created_at < self.readback:
                 self.violation("confirmed_too_early", claim.issue, claim.uuid)
+            settled = self.winner(claim.issue, claim.repo, claim.created_at + self.readback)
+            if settled is not None and settled.uuid != claim.uuid:
+                if confirmed is not None:
+                    self.violation("loser_confirmed", claim.issue, claim.uuid, f"winner {settled.uuid}")
+                if claim.withdrawn_at() is None:
+                    self.violation("loser_not_withdrawn", claim.issue, claim.uuid, f"winner {settled.uuid}")
             others = [
                 other for other in self.claims.values()
                 if other.uuid != claim.uuid and other.session == claim.session and other.repo == claim.repo
-                and other.issue != claim.issue and self.ended(other, claim.created_at) is None
-                and other.created_at <= claim.created_at
+                and other.created_at <= claim.created_at and self.ended(other, claim.created_at) is None
             ]
             if others:
                 self.violation("multiple_claims_per_session", claim.issue, claim.uuid, f"also holds {others[0].uuid}")
@@ -638,42 +747,50 @@ class Evaluation:
     def check_writes(self) -> None:
         for write in self.writes:
             at = write["at"]
+            what = f"{write['kind']} at {at.isoformat()}"
             claim = self.claims.get(write["claim"]) if write["claim"] else None
             if claim is None:
-                self.violation("write_without_claim", write["issue"], write["claim"], write["kind"])
+                self.violation("write_without_claim", write["issue"], write["claim"], what)
                 continue
             if claim.issue != write["issue"]:
-                self.violation("write_outside_claim", write["issue"], claim.uuid, write["kind"])
+                self.violation("write_outside_claim", write["issue"], claim.uuid, what)
                 continue
             confirmed = claim.confirmed_at()
             if confirmed is None or confirmed > at:
-                self.violation("write_before_confirm", claim.issue, claim.uuid, write["kind"])
+                self.violation("write_before_confirm", claim.issue, claim.uuid, what)
                 continue
             ended = self.ended(claim, at)
             if ended is not None:
-                code = {"expired": "write_after_expiry", "revoked": "write_after_revoke"}.get(ended, "write_after_release")
-                self.violation(code, claim.issue, claim.uuid, write["kind"])
+                code = f"write_{AFTER_END.get(ended, 'after_release')}"
+                self.violation(code, claim.issue, claim.uuid, what)
                 continue
             if claim.takeover_of is not None and at < claim.created_at + self.takeover_wait:
-                self.violation("takeover_wrote_too_early", claim.issue, claim.uuid, write["kind"])
+                self.violation("takeover_wrote_too_early", claim.issue, claim.uuid, what)
                 continue
             winner = self.winner(claim.issue, claim.repo, at)
             if winner is None or winner.uuid != claim.uuid:
-                self.violation("write_by_non_winner", claim.issue, claim.uuid, write["kind"])
+                self.violation("write_by_non_winner", claim.issue, claim.uuid, what)
 
     def check_commits(self) -> None:
         for commit in self.commits:
             uuid = commit.get("claim")
             if commit["author_kind"] != "agent":
                 continue
+            sha = commit["sha"]
             if not uuid:
-                self.violation("agent_commit_without_claim", detail=commit["sha"])
+                self.violation("agent_commit_without_claim", detail=sha)
                 continue
             claim = self.claims.get(uuid)
             if claim is None:
-                self.violation("commit_names_unknown_claim", claim=uuid, detail=commit["sha"])
-            elif claim.comment.deleted:
-                self.violation("commit_names_deleted_claim", claim.issue, uuid, commit["sha"])
+                self.violation("commit_names_unknown_claim", claim=uuid, detail=sha)
+                continue
+            if commit.get("repo", self.repo) != claim.repo or commit["branch"] != claim.branch:
+                self.violation("commit_outside_claim_branch", claim.issue, uuid, sha)
+            ended = self.ended(claim, commit["at"])
+            if ended == "deleted" or claim.comment.deleted:
+                self.violation("commit_names_deleted_claim", claim.issue, uuid, sha)
+            elif ended in AFTER_END:
+                self.violation(f"commit_{AFTER_END[ended]}", claim.issue, uuid, sha)
 
     def check_done_and_admissions(self, held: dict[str, list[str]]) -> None:
         for issue_id, issue in self.issues.items():
@@ -681,8 +798,7 @@ class Evaluation:
                 self.violation("done_while_held", issue_id, detail="; ".join(held[issue_id]))
         program = self.program
         if program and self.admissions:
-            slots = require(program, "review_slots", "program")
-            paused = program.get("occupied_reviews", 0) >= slots and program.get("completed_waiting", 0) > 0
+            paused = program["occupied_reviews"] >= program["review_slots"] and program["completed_waiting"] > 0
             if paused:
                 for admission in self.admissions:
                     self.violation("admission_while_paused", admission["issue"])
@@ -709,7 +825,10 @@ class Evaluation:
         confirmed = claim.confirmed_at()
         if confirmed is None:
             return False
-        own = [c["at"] for c in self.commits if c.get("claim") == claim.uuid]
+        own = [
+            c["at"] for c in self.commits
+            if c.get("claim") == claim.uuid and c.get("repo", self.repo) == claim.repo and c["branch"] == claim.branch
+        ]
         seen = max([confirmed, *own])
         return any(
             c.get("repo", self.repo) == claim.repo and c["branch"] == claim.branch
@@ -718,9 +837,10 @@ class Evaluation:
         )
 
     def run(self) -> dict[str, Any]:
-        decisions = self.decisions()
-        held = self.holds(decisions)
-        self.check_claims(held)
+        decisions = self._decisions = self.decisions()
+        held = {issue_id: self.held_at(issue_id, self.now) for issue_id in self.issues}
+        self.collect_void_lines()
+        self.check_claims()
         self.check_writes()
         self.check_commits()
         self.check_done_and_admissions(held)
@@ -748,14 +868,15 @@ class Evaluation:
                 "claims": per_repo,
                 "held": bool(held[issue_id]),
                 "hold_reasons": held[issue_id],
-                "claimable": bool(self.issues[issue_id]["admitted"]) and not held[issue_id]
-                and not any(v["live_claims"] for v in per_repo.values()),
+                "claimable": self.issues[issue_id]["admitted"] and self.issues[issue_id]["next_in_order"]
+                and not held[issue_id] and not any(v["live_claims"] for v in per_repo.values()),
                 "takeovers": takeovers,
             }
         return {
             "issues": issues,
             "decisions": {
-                k: {key: value for key, value in v.items() if key != "answered_at"} for k, v in decisions.items()
+                k: {key: value for key, value in v.items() if key not in {"answered_at", "held_from"}}
+                for k, v in decisions.items()
             },
             "violations": self.violations,
             "void_lines": self.void_lines,
@@ -763,8 +884,18 @@ class Evaluation:
 
 
 def evaluate(snapshot: dict[str, Any]) -> dict[str, Any]:
-    """Evaluate a snapshot. Raises SnapshotError if it is malformed."""
-    return Evaluation(snapshot).run()
+    """Evaluate a snapshot. Raises SnapshotError if it is malformed.
+
+    Any other exception raised while reading the snapshot is also reported as
+    SnapshotError, so an unexpected shape fails closed instead of producing a
+    partial result.
+    """
+    try:
+        return Evaluation(snapshot).run()
+    except SnapshotError:
+        raise
+    except (TypeError, ValueError, AttributeError, KeyError, IndexError) as exc:
+        raise SnapshotError(f"unreadable snapshot: {type(exc).__name__}: {exc}") from exc
 
 
 def main(argv: list[str]) -> int:

@@ -60,7 +60,8 @@ def claim(cid, issue, uuid, at=0, confirm_after=70, session="claude/s1", branch=
     }
 
 
-def edit(at_minutes, uuid, *extra, session="claude/s1", branch="csl-1-work", confirmed=ts(0, 70)):
+def edit(at_minutes, uuid, *extra, session="claude/s1", branch="csl-1-work", confirmed=None):
+    confirmed = confirmed or ts(0, 70)
     return {"at": ts(at_minutes), "body": claim_body(uuid, session, branch, confirmed, extra)}
 
 
@@ -111,6 +112,7 @@ class ClaimingTests(unittest.TestCase):
                       session="cursor/s2")
         result = sim.evaluate(snapshot(10, [issue("CSL-1")], [claim("c2", "CSL-1", U2), loser]))
         self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], U2)
+        self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["live_claims"], [U2])
         self.assertEqual(codes(result), [])
 
     def test_s2_loser_that_writes_is_flagged(self):
@@ -118,13 +120,19 @@ class ClaimingTests(unittest.TestCase):
         result = sim.evaluate(snapshot(10, [issue("CSL-1")], [claim("c2", "CSL-1", U2), loser],
                                        writes=[{"kind": "push", "issue": "CSL-1", "claim": U1, "at": ts(3)}]))
         self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], U2)
-        self.assertEqual(codes(result), ["write_by_non_winner"])
+        self.assertEqual(codes(result), ["loser_confirmed", "loser_not_withdrawn", "write_by_non_winner"])
+
+    def test_s2_loser_that_never_withdraws_is_flagged(self):
+        loser = claim("c1", "CSL-1", U1, at=0.3, confirm_after=None, session="cursor/s2")
+        result = sim.evaluate(snapshot(10, [issue("CSL-1")], [claim("c2", "CSL-1", U2), loser]))
+        self.assertEqual(codes(result), ["loser_not_withdrawn"])
 
     def test_s3_exact_tie_goes_to_lower_uuid(self):
         result = sim.evaluate(snapshot(10, [issue("CSL-1")], [
             claim("c2", "CSL-1", U2, session="cursor/s2"), claim("c1", "CSL-1", U1),
         ]))
         self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], U1)
+        self.assertEqual(codes(result), ["loser_confirmed", "loser_not_withdrawn"])
 
     def test_s4_claim_on_unadmitted_or_out_of_order_issue(self):
         result = sim.evaluate(snapshot(10, [
@@ -149,6 +157,10 @@ class ClaimingTests(unittest.TestCase):
         self.assertEqual(codes(result), [])
         self.assertEqual(result["issues"]["CSL-1"]["claims"]["other-repo"]["winner"], U2)
         self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], U1)
+
+    def test_s22_second_claim_by_same_session_on_same_issue_and_repository(self):
+        result = sim.evaluate(snapshot(10, [issue("CSL-1")], [claim("c1", "CSL-1", U1), claim("c2", "CSL-1", U2, at=1)]))
+        self.assertIn("multiple_claims_per_session", codes(result))
 
     def test_s22_second_claim_in_same_repository_is_flagged(self):
         result = sim.evaluate(snapshot(10, [issue("CSL-1"), issue("CSL-4")], [
@@ -198,6 +210,26 @@ class LeaseTests(unittest.TestCase):
         status = result["issues"]["CSL-1"]["takeovers"][U2]
         self.assertFalse(status["allowed"])
         self.assertEqual(status["reason"], "commit newer than the last heartbeat")
+
+    def test_commit_before_the_last_heartbeat_does_not_refuse_takeover(self):
+        commits = [{"sha": "c0ffee", "branch": "csl-1-work", "at": ts(0, 30), "author_kind": "human", "claim": None}]
+        result = sim.evaluate(snapshot(170, [issue("CSL-1")], [claim("c1", "CSL-1", U1), self.takeover()], commits=commits))
+        self.assertTrue(result["issues"]["CSL-1"]["takeovers"][U2]["allowed"])
+
+    def test_finished_run_does_not_refuse_takeover(self):
+        runs = [{"id": "run-1", "claim": U1, "started_at": ts(10), "ended_at": ts(20)}]
+        result = sim.evaluate(snapshot(170, [issue("CSL-1")], [claim("c1", "CSL-1", U1), self.takeover()], runs=runs))
+        self.assertTrue(result["issues"]["CSL-1"]["takeovers"][U2]["allowed"])
+
+    def test_acknowledgement_before_the_takeover_does_not_count(self):
+        comments = [claim("c1", "CSL-1", U1), comment("h1", "CSL-1", 140, f"ACK TAKEOVER {U1}"), self.takeover()]
+        result = sim.evaluate(snapshot(170, [issue("CSL-1")], comments, config={"coordinator_ack_required": True}))
+        self.assertFalse(result["issues"]["CSL-1"]["takeovers"][U2]["allowed"])
+
+    def test_release_inside_the_wait_is_not_an_objection(self):
+        original = claim("c1", "CSL-1", U1, more_edits=[edit(160, U1, "released")])
+        result = sim.evaluate(snapshot(175, [issue("CSL-1")], [original, self.takeover()]))
+        self.assertTrue(result["issues"]["CSL-1"]["takeovers"][U2]["allowed"])
 
     def test_takeover_refused_while_claimant_run_is_in_progress(self):
         runs = [{"id": "run-1", "claim": U1, "started_at": ts(100), "ended_at": None}]
@@ -252,6 +284,26 @@ class CommitTests(unittest.TestCase):
         result = sim.evaluate(snapshot(10, [issue("CSL-1")], [claim("c1", "CSL-1", U1)], commits=commits))
         self.assertEqual(codes(result), ["agent_commit_without_claim"])
 
+    def test_commit_on_another_branch_or_after_expiry(self):
+        commits = [
+            {"sha": "m1", "branch": "master", "at": ts(5), "author_kind": "agent", "claim": U1},
+            {"sha": "x1", "branch": "csl-1-work", "at": ts(125), "author_kind": "agent", "claim": U1},
+        ]
+        result = sim.evaluate(snapshot(130, [issue("CSL-1")], [claim("c1", "CSL-1", U1)], commits=commits))
+        self.assertEqual(codes(result), ["commit_after_expiry", "commit_outside_claim_branch"])
+
+    def test_repeated_writes_are_reported_separately(self):
+        writes = [{"kind": "push", "issue": "CSL-1", "claim": U1, "at": ts(0, s)} for s in (10, 20)]
+        result = sim.evaluate(snapshot(10, [issue("CSL-1")], [claim("c1", "CSL-1", U1)], writes=writes))
+        self.assertEqual(codes(result), ["write_before_confirm", "write_before_confirm"])
+
+    def test_deletion_time_bounds_the_claim(self):
+        deleted = claim("c1", "CSL-1", U1, deleted=True)
+        deleted["deleted_at"] = ts(30)
+        writes = [{"kind": "push", "issue": "CSL-1", "claim": U1, "at": ts(10)}]
+        result = sim.evaluate(snapshot(40, [issue("CSL-1")], [deleted], writes=writes))
+        self.assertEqual(codes(result), [])
+
     def test_s20_commit_names_deleted_claim(self):
         commits = [{"sha": "a9e", "branch": "csl-1-work", "at": ts(5), "author_kind": "agent", "claim": U1}]
         result = sim.evaluate(snapshot(10, [issue("CSL-1")], [claim("c1", "CSL-1", U1, deleted=True)], commits=commits))
@@ -272,11 +324,22 @@ class CommitTests(unittest.TestCase):
 class DecisionTests(unittest.TestCase):
     def test_s11_only_affected_lineage_is_held(self):
         issues = [issue("CSL-1", blocked_by=["CSL-2"]), issue("CSL-2", decision=decision()), issue("CSL-3")]
-        result = sim.evaluate(snapshot(10, issues, [claim("c1", "CSL-1", U1)]))
+        result = sim.evaluate(snapshot(10, issues, [claim("c1", "CSL-1", U1, at=5)]))
         self.assertTrue(result["issues"]["CSL-1"]["held"])
         self.assertFalse(result["issues"]["CSL-1"]["claimable"])
         self.assertTrue(result["issues"]["CSL-3"]["claimable"])
         self.assertEqual(codes(result), ["claim_on_held_scope"])
+
+    def test_s11_split_after_claiming_is_not_a_violation(self):
+        issues = [issue("CSL-1", blocked_by=["CSL-2"]), issue("CSL-2", decision=decision(pings=(30,)))]
+        work = claim("c1", "CSL-1", U1, more_edits=[edit(35, U1, "released")])
+        result = sim.evaluate(snapshot(60, issues, [work]))
+        self.assertEqual(codes(result), [])
+        self.assertTrue(result["issues"]["CSL-1"]["held"])
+        late_hold = comment("h1", "CSL-1", 20, "HOLD CSL-1")
+        result = sim.evaluate(snapshot(60, [issue("CSL-1")], [claim("c1", "CSL-1", U1), late_hold]))
+        self.assertEqual(codes(result), [])
+        self.assertTrue(result["issues"]["CSL-1"]["held"])
 
     def test_s12_batched_answer_clears_named_decisions(self):
         issues = [
@@ -297,6 +360,28 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(codes(result), [])
         result = sim.evaluate(snapshot(20, issues, [answer, records[0], work]))
         self.assertEqual(codes(result), ["decision_not_recorded"])
+        late = comment("r2", "CSL-12", 15, "Agent (claude/s1, for Lucas): recorded answer h1")
+        result = sim.evaluate(snapshot(20, issues, [answer, records[0], late, work]))
+        self.assertEqual(codes(result), ["decision_not_recorded"])
+
+    def test_batched_answer_on_an_unrelated_issue_is_ignored(self):
+        issues = [issue("CSL-2", decision=decision()), issue("CSL-5")]
+        result = sim.evaluate(snapshot(10, issues, [comment("h1", "CSL-5", 5, "CSL-2: B")]))
+        self.assertFalse(result["decisions"]["CSL-2"]["answered"])
+
+    def test_agent_batched_line_is_voided_once(self):
+        issues = [issue("CSL-2", decision=decision()), issue("CSL-3", decision=decision())]
+        forged = comment("a1", "CSL-2", 5, "Agent (claude/s1, for Lucas): relaying\nCSL-2: B; CSL-3: A")
+        result = sim.evaluate(snapshot(10, issues, [forged]))
+        self.assertEqual(len(result["void_lines"]), 1)
+        self.assertFalse(result["decisions"]["CSL-3"]["answered"])
+
+    def test_edited_decision_is_flagged_and_original_counts(self):
+        answer = comment("h1", "CSL-2", 5, "DECISION: A")
+        answer["edits"] = [{"at": ts(8), "body": "DECISION: B"}]
+        result = sim.evaluate(snapshot(10, [issue("CSL-2", decision=decision())], [answer]))
+        self.assertEqual(result["decisions"]["CSL-2"]["answer"], "A")
+        self.assertEqual(codes(result), ["decision_edited"])
 
     def test_answer_outside_the_options_needs_follow_up(self):
         issues = [issue("CSL-2", decision=decision())]
@@ -320,6 +405,8 @@ class DecisionTests(unittest.TestCase):
         issues = [issue("CSL-2", decision=decision(pings=(1,), options_changed_at=(3,)))]
         result = sim.evaluate(snapshot(10, issues, []))
         self.assertEqual(codes(result), ["options_changed_after_ping"])
+        issues = [issue("CSL-2", decision=decision(pings=(5,), options_changed_at=(3,)))]
+        self.assertEqual(codes(sim.evaluate(snapshot(10, issues, []))), [])
 
     def test_s17_done_while_held(self):
         issues = [issue("CSL-1", status="Done", blocked_by=["CSL-2"]), issue("CSL-2", decision=decision())]
@@ -394,6 +481,15 @@ class StandingApprovalTests(unittest.TestCase):
     def test_standing_approval_longer_than_ninety_days(self):
         result = self.run_actions([], self.approval(expires="2027-03-01"))
         self.assertEqual(codes(result), ["sa_too_long"])
+        self.assertEqual(codes(self.run_actions([], self.approval(expires="2027-01-18"))), [])
+
+    def test_total_limit(self):
+        result = self.run_actions([self.action(10), self.action(60 * 30)], self.approval(limits="total=1"))
+        self.assertEqual(codes(result), ["sa_over_limit"])
+
+    def test_unparseable_limits_fail_closed(self):
+        with self.assertRaises(sim.SnapshotError):
+            self.run_actions([], self.approval(limits="3 per day"))
 
     def test_agent_posted_standing_approval_is_void(self):
         forged = self.approval(body_prefix="Agent (claude/s1, for Lucas): posting\n")
@@ -443,6 +539,31 @@ class MalformedSnapshotTests(unittest.TestCase):
 
     def test_blocked_by_unknown_issue(self):
         self.assert_rejected(lambda s: s["issues"][0].update(blocked_by=["CSL-404"]))
+
+    def test_config_value_of_wrong_type(self):
+        self.assert_rejected(lambda s: s.update(config={"lease_minutes": "120"}))
+        self.assert_rejected(lambda s: s.update(config={"readback_seconds": None}))
+
+    def test_null_event_timestamp(self):
+        self.assert_rejected(lambda s: s.update(writes=[{"kind": "push", "issue": "CSL-1", "claim": U1, "at": None}]))
+
+    def test_edit_body_must_be_text(self):
+        self.assert_rejected(lambda s: s["comments"][0]["edits"].append({"at": ts(5), "body": 5}))
+
+    def test_null_lists(self):
+        self.assert_rejected(lambda s: s["comments"][0].update(edits=None))
+        self.assert_rejected(lambda s: s["issues"][0].update(blocked_by=None))
+
+    def test_program_and_write_kind_types(self):
+        self.assert_rejected(lambda s: s.update(program={"review_slots": "2"}))
+        self.assert_rejected(lambda s: s.update(writes=[{"kind": ["push"], "issue": "CSL-1", "claim": U1, "at": ts(1)}]))
+
+    def test_flags_must_be_booleans(self):
+        self.assert_rejected(lambda s: s["issues"][0].update(admitted="false"))
+        self.assert_rejected(lambda s: s["issues"][0].update(next_in_order="no"))
+
+    def test_triage_issue_cannot_be_admitted(self):
+        self.assert_rejected(lambda s: s["issues"][0].update(status="Triage"))
 
     def test_unknown_status(self):
         self.assert_rejected(lambda s: s["issues"][0].update(status="Blocked"))

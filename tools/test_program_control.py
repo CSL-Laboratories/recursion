@@ -285,6 +285,8 @@ class ProgramControlTests(unittest.TestCase):
 
     def test_unaccepted_contract_blocks_consumer(self) -> None:
         data = copy.deepcopy(self.data)
+        # This negative case must remain unaccepted as the checked-in ledger evolves.
+        data["contracts"][0]["status"] = "candidate"
         data["work_items"][0]["consumes_contracts"] = ["contract.issue-anti-drift"]
         self.assertTrue(any("consumes unaccepted contract" in error for error in self.errors(data)))
 
@@ -1016,7 +1018,12 @@ class ProgramControlTests(unittest.TestCase):
                     self.assert_rejected(field)
 
     def test_external_routing_issues_need_not_be_local_work_rows(self):
+        # Test candidate routing, without inheriting a real approval for the old route.
+        for decision in self.data["decisions"]:
+            if decision.get("status") == "approved":
+                decision["status"] = "superseded"
         for contract in self.data["contracts"]:
+            contract["status"] = "candidate"
             contract["decision_issue"] = "CSL-991"
         self.data["capabilities"][0]["decision_issue"] = "CSL-992"
         self.data["admission"]["decision_issue"] = "CSL-993"

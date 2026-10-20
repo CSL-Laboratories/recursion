@@ -200,7 +200,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("tools/perf_ci.py", text)
         self.assertIn("Performance regression check", text)
         start = text.index("Performance regression check")
-        step = text[start:text.index("Docs-only lightweight checks", start)]
+        # CSL-255: the perf step now lives in linux-tests, directly before the required linux job.
+        step = text[start:text.index("\n  linux:\n", start)]
         self.assertIn("pull_request", step)
         self.assertIn("timeout 55 ", step)
         self.assertIn("timeout-minutes: 1\n", step)
@@ -225,11 +226,15 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("label-churn", text)
         self.assertEqual(text.count("name: linux"), 1)
         linux = text[text.index("  linux:\n") : text.index("  windows:")]
-        self.assertIn("runs-on: blacksmith-2vcpu-ubuntu-2404", linux)
-        self.assertNotIn("github.event.pull_request.draft", linux)
+        # CSL-255: the required linux job is a free aggregate; the paid suite is linux-tests.
+        self.assertIn("runs-on: ubuntu-latest", linux)
+        tests = text[text.index("  linux-tests:\n") : text.index("  linux:\n")]
+        self.assertIn("runs-on: blacksmith-2vcpu-ubuntu-2404", tests)
+        self.assertIn("if: always()\n", linux)
+        self.assertNotRegex(linux, r"(?m)^    if: .*draft")
         self.assertNotIn("github.event.action != 'labeled'", linux)
         windows = text[text.index("  windows:") : text.index("  macos:")]
-        self.assertIn("needs: linux", windows)
+        self.assertIn("needs: [preflight, settle, linux]", windows)
         self.assertIn("needs.linux.result == 'success'", windows)
         self.assertIn("'ci:full'", windows)
         label_wf = (ROOT / ".github" / "workflows" / "ci-full-label.yml").read_text(

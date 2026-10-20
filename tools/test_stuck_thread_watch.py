@@ -1658,6 +1658,22 @@ class VerdictAndResolveTests(unittest.TestCase):
                     matched = f"<{name}>\nFixed.\n</{name}>\n\n".replace("\n", newline)
                     self._assert_resolves(matched + block.replace("\n", newline))
 
+    def test_type1_closer_must_be_literal_and_unnested(self) -> None:
+        block = verdict_block("PRRT_1")
+        for newline in ("\n", "\r\n"):
+            for prose in ("<pre>\n</pre >\n\n", "<pre>\n</PRE\t>\n\n", "<pre>\n</pre\n>\n\n",
+                          "<pre>x</pre >\n\n", "<script>\nx\n</script >\n\n",
+                          "<pre>\n<pre>\n</pre>\n\n", "<pre><pre></pre>\n\n",
+                          "<pre>\n<script>\n</pre>\n\n", "<pre>\n<textarea>\n</pre>\n\n",
+                          "<textarea>\n<pre>\n</textarea>\n\n"):
+                with self.subTest(prose=prose, newline=repr(newline)):
+                    self._assert_no_resolve((prose + block).replace("\n", newline))
+            for prose in ("<pre>\nx\n</pre>\n\n", "<PRE>\nx\n</pre>\n\n", "<Pre>\nx\n</pRe>\n\n",
+                          "<pre>x</pre>\n\n", "<pre>\n<b>x</b>\n</pre>\n\n",
+                          "<script>\nx\n</script>\n\n"):
+                with self.subTest(prose=prose, newline=repr(newline)):
+                    self._assert_resolves((prose + block).replace("\n", newline))
+
     def test_escaped_backticks_do_not_open_code_spans(self) -> None:
         block = verdict_block("PRRT_1")
         self._assert_no_resolve("\\`<details>`\n\n" + block)

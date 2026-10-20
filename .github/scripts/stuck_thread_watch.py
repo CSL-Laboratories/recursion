@@ -769,14 +769,17 @@ def _html_type1_end(text: str) -> int | None:
     the rest of the start line for the same reason. CommonMark's type-1 block
     grammar ends at any type-1 end tag; this resolver applies a stricter
     authorization policy and requires the same tag name, because a mismatched
-    end tag does not close the HTML element around a quoted ruling.
+    end tag does not close the HTML element around a quoted ruling. The closer
+    must also be the literal ``</name>`` (CommonMark 4.6 end condition), so
+    ``</pre >`` leaves the block open, and a nested type-1 opener before the
+    closer fails closed because the element would still wrap the ruling.
     """
     tag = _html_tag_at(text, 0)
     if tag == "unclosed":
         return None
     if tag:
         end, name, close, _empty = tag
-        if close and name in HTML_TYPE1_NAMES:
+        if close and name in HTML_TYPE1_NAMES and text[:end].lower() == f"</{name}>":
             return end
         if close:
             return None
@@ -801,8 +804,10 @@ def _html_type1_end(text: str) -> int | None:
             return None
         if tag:
             end, name, close, _empty = tag
-            if close and name == opener_name:
+            if close and name == opener_name and text[lt:end].lower() == f"</{name}>":
                 return end
+            if not close and name in HTML_TYPE1_NAMES:
+                return None  # A nested raw-text/pre element keeps wrapping the ruling.
             index = end
             continue
         index = lt + 1

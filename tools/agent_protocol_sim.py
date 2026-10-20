@@ -590,12 +590,23 @@ class Evaluation:
         at = self.now if at is None else at
         old = self.claims.get(claim.takeover_of)
         posted = claim.created_at
-        if old is None or old.issue != claim.issue or old.repo != claim.repo:
+        if old is None:
             return {"of": claim.takeover_of, "allowed": False, "reason": "unknown claim"}
+        if old.issue != claim.issue or old.repo != claim.repo:
+            return {"of": old.uuid, "allowed": False, "reason": "claim on another issue or repository"}
         if old.created_at >= posted:
             return {"of": old.uuid, "allowed": False, "reason": "original posted after the takeover"}
         if at < posted + self.takeover_wait:
             return {"of": old.uuid, "allowed": False, "reason": "takeover wait not over"}
+        ended = self.ended(old, posted)
+        if ended in {"withdrawn", "released", "revoked", "deleted"}:
+            return {"of": old.uuid, "allowed": True, "reason": f"original {ended}"}
+        # Faults fixed at posting come first, so nothing the original claimant
+        # does later (objecting, then releasing) can make a premature takeover
+        # allowed.
+        refusal = self.posting_refusal(claim, old)
+        if refusal is not None:
+            return refusal
         objection = [
             r.at for r in old.comment.revisions
             if posted <= r.at <= posted + self.takeover_wait
@@ -606,14 +617,6 @@ class Evaluation:
             # A renewal objects to the takeover, but a later release, withdrawal,
             # revoke or deletion of the original ends that objection.
             return {"of": old.uuid, "allowed": False, "reason": "original claimant renewed within the wait"}
-        if objection:
-            return {"of": old.uuid, "allowed": True, "reason": f"original {finished} after objecting"}
-        ended = self.ended(old, posted)
-        if ended in {"withdrawn", "released", "revoked", "deleted"}:
-            return {"of": old.uuid, "allowed": True, "reason": f"original {ended}"}
-        refusal = self.posting_refusal(claim, old)
-        if refusal is not None:
-            return refusal
         if self.config["coordinator_ack_required"]:
             # The acknowledgement must still be in the comment, and the comment
             # not deleted, at the time being judged.
@@ -625,6 +628,8 @@ class Evaluation:
             )
             if not acked:
                 return {"of": old.uuid, "allowed": False, "reason": "coordinator acknowledgement missing"}
+        if objection:
+            return {"of": old.uuid, "allowed": True, "reason": f"original {finished} after objecting"}
         return {"of": old.uuid, "allowed": True, "reason": "conditions met"}
 
     def posting_refusal(self, claim: Claim, old: Claim) -> dict[str, Any] | None:
@@ -655,21 +660,20 @@ class Evaluation:
         superseded = set()
         refused = set()
         for claim in candidates:
-            status = self.takeover_status(claim, at)
-            if status is None:
-                continue
-            if status["allowed"] and any(
+            # A claim that lands on another expired, never-superseded claim
+            # without taking it over cannot win, whether it names no takeover
+            # or a different one (as check_implicit_takeover reports).
+            bypasses = any(
                 other.uuid != claim.uuid and other.uuid != claim.takeover_of
                 and other.issue == claim.issue and other.repo == claim.repo
                 and other.created_at < claim.created_at and self.bypassed_expired(claim, other)
                 for other in self.claims.values()
-            ):
-                # Bypasses another expired claim, as check_implicit_takeover reports.
+            )
+            status = self.takeover_status(claim, at)
+            if bypasses or (status is not None and not status["allowed"]):
                 refused.add(claim.uuid)
-            elif status["allowed"]:
+            elif status is not None:
                 superseded.add(status["of"])
-            else:
-                refused.add(claim.uuid)
         return [c for c in candidates if c.uuid not in superseded and c.uuid not in refused]
 
     def winner(self, issue: str, repo: str, at: datetime) -> Claim | None:
@@ -998,8 +1002,10 @@ class Evaluation:
         """
         posted = claim.created_at
         old = self.claims.get(claim.takeover_of)
-        if old is None or old.issue != claim.issue or old.repo != claim.repo:
+        if old is None:
             return f"unknown claim {claim.takeover_of}"
+        if old.issue != claim.issue or old.repo != claim.repo:
+            return f"claim on another issue or repository {old.uuid}"
         if old.created_at >= posted:
             return "original posted after the takeover"
         if self.ended(old, posted) in {"withdrawn", "released", "revoked", "deleted"}:
@@ -1010,7 +1016,9 @@ class Evaluation:
     def check_takeover_refused(self, claim: Claim) -> None:
         if claim.takeover_of is None:
             return
-        if self.ended(claim, self.now) in {"withdrawn", "released", "revoked", "deleted"}:
+        # The taker withdrawing or releasing answers the fault; a human revoke
+        # or deletion does not erase the report of it.
+        if self.ended(claim, self.now) in {"withdrawn", "released"}:
             return
         fault = self.posting_fault(claim)
         if fault is not None:
@@ -1211,7 +1219,8 @@ class Evaluation:
                 k: {key: value for key, value in v.items() if key not in {"answered_at", "held_from", "answers"}}
                 for k, v in decisions.items()
             },
-            "violations": self.violations,
+            # Sorted so the same snapshot in any comment order gives the same output.
+            "violations": sorted(self.violations, key=lambda v: (v["code"], v["issue"] or "", v["claim"] or "", v["detail"])),
             "void_lines": self.void_lines,
         }
 

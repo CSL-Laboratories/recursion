@@ -252,6 +252,52 @@ class LeaseTests(unittest.TestCase):
         refused = [v["detail"] for v in result["violations"] if v["code"] == "takeover_refused"]
         self.assertEqual(refused, [f"unknown claim {ghost}"])
 
+    def test_objecting_then_releasing_does_not_let_a_premature_takeover_win(self):
+        objected = [edit(130, U1, "heartbeat-at: 130"), edit(135, U1, "released")]
+        writes = [{"kind": "push", "issue": "CSL-1", "claim": U2, "at": ts(150)},
+                  {"kind": "pr", "issue": "CSL-1", "claim": U2, "at": ts(190)}]
+        released_taker = {"at": ts(195), "body": claim_body(U2, "cursor/s2", confirmed=ts(125, 70),
+                                                            extra=(f"takeover of {U1}", "released"))}
+        released = self.takeover(at=125)
+        released["edits"].append(released_taker)
+        for name, taker in (("taker live", self.takeover(at=125)), ("taker released later", released)):
+            with self.subTest(case=name):
+                comments = [claim("c1", "CSL-1", U1, more_edits=objected), taker]
+                result = sim.evaluate(snapshot(200, [issue("CSL-1")], comments, writes=writes))
+                state = result["issues"]["CSL-1"]
+                self.assertFalse(state["takeovers"][U2]["allowed"])
+                self.assertIsNone(state["claims"]["recursion"]["winner"])
+                self.assertEqual([c for c in codes(result) if c == "write_by_non_winner"], ["write_by_non_winner"] * 2)
+
+    def test_objection_then_release_still_needs_the_acknowledgement(self):
+        original = claim("c1", "CSL-1", U1, more_edits=[edit(155, U1, "heartbeat-at: 155"), edit(160, U1, "released")])
+        result = sim.evaluate(snapshot(200, [issue("CSL-1")], [original, self.takeover()],
+                                       config={"coordinator_ack_required": True}))
+        self.assertEqual(result["issues"]["CSL-1"]["takeovers"][U2]["reason"], "coordinator acknowledgement missing")
+        self.assertIsNone(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"])
+        acked = [original, self.takeover(), comment("h1", "CSL-1", 156, f"ACK TAKEOVER {U1}")]
+        result = sim.evaluate(snapshot(200, [issue("CSL-1")], acked, config={"coordinator_ack_required": True}))
+        self.assertTrue(result["issues"]["CSL-1"]["takeovers"][U2]["allowed"])
+
+    def test_fresh_claim_over_an_expired_claim_does_not_win(self):
+        fresh = claim("c3", "CSL-1", U3, at=160, session="grok/s3")
+        writes = [{"kind": "push", "issue": "CSL-1", "claim": U3, "at": ts(165)}]
+        result = sim.evaluate(snapshot(170, [issue("CSL-1")], [claim("c1", "CSL-1", U1), fresh], writes=writes))
+        self.assertIsNone(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"])
+        self.assertEqual(codes(result), ["claim_without_takeover", "write_by_non_winner"])
+
+    def test_human_revoke_keeps_the_premature_takeover_report(self):
+        comments = [claim("c1", "CSL-1", U1), self.takeover(at=125), comment("h1", "CSL-1", 130, f"REVOKE CLAIM {U2}")]
+        result = sim.evaluate(snapshot(170, [issue("CSL-1")], comments))
+        refused = [v["detail"] for v in result["violations"] if v["code"] == "takeover_refused"]
+        self.assertEqual(refused, ["lease plus grace not passed"])
+
+    def test_violations_do_not_depend_on_comment_order(self):
+        comments = [claim("c1", "CSL-1", U1), self.takeover(at=125), claim("c3", "CSL-1", U3, at=160, session="grok/s3")]
+        forward = sim.evaluate(snapshot(170, [issue("CSL-1")], comments))["violations"]
+        backward = sim.evaluate(snapshot(170, [issue("CSL-1")], comments[::-1]))["violations"]
+        self.assertEqual(forward, backward)
+
     def test_withdrawn_refused_takeover_is_not_reported(self):
         early = self.takeover(at=125)
         early["edits"].append({"at": ts(127), "body": early["edits"][0]["body"] + "\nwithdrawn: lease not over"})
@@ -416,7 +462,9 @@ class LeaseTests(unittest.TestCase):
     def test_takeover_of_a_claim_in_another_repository_is_refused(self):
         other_repo = claim("c1", "CSL-1", U1, extra=("repo: other-repo",))
         result = sim.evaluate(snapshot(170, [issue("CSL-1")], [other_repo, self.takeover()]))
-        self.assertEqual(result["issues"]["CSL-1"]["takeovers"][U2]["reason"], "unknown claim")
+        self.assertEqual(result["issues"]["CSL-1"]["takeovers"][U2]["reason"], "claim on another issue or repository")
+        refused = [v["detail"] for v in result["violations"] if v["code"] == "takeover_refused"]
+        self.assertEqual(refused, [f"claim on another issue or repository {U1}"])
 
     def test_run_started_after_the_takeover_does_not_refuse_it(self):
         runs = [{"id": "run-1", "claim": U1, "started_at": ts(153), "ended_at": None}]

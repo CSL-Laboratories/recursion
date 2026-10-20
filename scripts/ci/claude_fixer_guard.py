@@ -116,13 +116,28 @@ def validate(config):
         raise ValueError("invalid guard context")
 
 
-def current_pr(config, read=api):
+PAUSE_LABELS = frozenset({"claude:pause", "hold"})
+HANDOFF_LABEL = "needs-decision"
+
+
+class PauseRefused(ValueError):
+    """A human pause (or unreadable labels) stops the push."""
+
+
+def current_pr(config, read=api, refuse_pause=False):
     pr = read(f"repos/{config['repo']}/pulls/{config['number']}")
     head = pr.get("head") or {}
     if (pr.get("state") != "open" or head.get("ref") != config["ref"]
             or (head.get("repo") or {}).get("full_name") != config["repo"]
             or not SHA.fullmatch(str(head.get("sha") or ""))):
         raise ValueError("PR identity changed")
+    if refuse_pause:
+        # A human pause added after preflight stops the push; audits still read.
+        labels = pr.get("labels")
+        if not isinstance(labels, list) or not all(isinstance(label, dict) for label in labels):
+            raise PauseRefused("PR labels unreadable")
+        if PAUSE_LABELS & {str(label.get("name") or "").lower() for label in labels}:
+            raise PauseRefused("human pause label present")
     return head["sha"]
 
 
@@ -162,7 +177,7 @@ def guard(config, updates, remote, state_path, read=api, git=command, remote_url
         raise ValueError("fix does not descend from checkout")
     # The API check is deliberately last. Git's ordinary server-side rejection
     # remains authoritative if an external writer wins the race after this read.
-    if current_pr(config, read) != config["base"]:
+    if current_pr(config, read, refuse_pause=True) != config["base"]:
         raise ValueError("remote moved")
     state_path.write_text(json.dumps({"candidate": candidate}), encoding="utf-8")
     print(f"Guard checked candidate {candidate}; push is not yet confirmed. "
@@ -220,9 +235,17 @@ def terminal(config, state_path, execution, outcome, read=api, consumer=None):
             "The PR author should relay any remaining blocker to its Linear issue.")
 
 
-def model_api(config, args, run=command):
-    """Fixed same-PR API operations. No model-supplied endpoint, method or flags."""
+def model_api(config, args, run=command, read=None):
+    """Fixed same-PR API operations. No model-supplied endpoint, method or flags.
+
+    Writes (comment, reply, label) re-read the live PR first and refuse on a
+    human pause, like the push. Reads stay available to a paused run.
+    """
     validate(config)
+
+    def refuse_if_paused():
+        current_pr(config, read or api, refuse_pause=True)
+
     root = f"repos/{config['repo']}"
     pull = f"{root}/pulls/{config['number']}"
     reads = {"read": pull, "comments": f"{root}/issues/{config['number']}/comments",
@@ -240,6 +263,11 @@ def model_api(config, args, run=command):
     if len(args) == 1 and args[0] in reads:
         paging = [] if args[0] == "read" else ["--paginate"]
         return run(["gh", "api", "--method", "GET", reads[args[0]], *paging])
+    if args == ["label"] and config.get("label") == HANDOFF_LABEL:
+        # Only the conflict job installs this: the one human-handoff label.
+        refuse_if_paused()
+        return run(["gh", "api", "--method", "POST", f"{root}/issues/{config['number']}/labels",
+                    "--input", "-"], input=json.dumps({"labels": [HANDOFF_LABEL]}))
     if len(args) == 2 and args[0] == "comment":
         endpoint, body_path = f"{root}/issues/{config['number']}/comments", args[1]
     elif len(args) == 3 and args[0] == "reply" and re.fullmatch(r"[1-9][0-9]*", args[1]):
@@ -270,6 +298,7 @@ def model_api(config, args, run=command):
                 or target["id"] != int(args[1]) or target.get("in_reply_to_id") is not None
                 or str(target.get("pull_request_url") or "").casefold() != ("https://api.github.com/" + pull).casefold()):
             raise ValueError("reply target is not a root on this PR")
+    refuse_if_paused()
     return run(["gh", "api", "--method", "POST", endpoint, "--input", "-"], input=json.dumps({"body": body}))
 
 
@@ -283,6 +312,10 @@ def main():
             ("base", "HEAD_SHA"), ("ref", "HEAD_REF"))}
         validate(config)
         config["receipts"] = json.loads(os.environ.get("RECEIPT_CONTEXT") or "[]")
+        label = os.environ.get("MODEL_API_LABEL", "")
+        if label not in {"", HANDOFF_LABEL}:
+            raise ValueError("unsupported model-api label")
+        config["label"] = label
         config_path.write_text(json.dumps(config), encoding="utf-8")
         Path(__file__).chmod(0o700)
         command(["git", "config", "--local", "core.hooksPath", str(directory)])
@@ -326,6 +359,10 @@ def main():
         if len(sys.argv) != 3:
             raise ValueError("invalid hook invocation")
         guard(config, sys.stdin.read(), mode, state_path, remote_url=sys.argv[2])
+    except PauseRefused:
+        print("Claude fixer push stopped: the PR is paused for humans (claude:pause or hold label). "
+              "Stop this run; do not push, retry or remove the label.", file=sys.stderr)
+        return 1
     except (OSError, ValueError, subprocess.SubprocessError):
         print("Claude fixer push stopped: stale/invalid head, unavailable read, or attempt already used. "
               "Stop this run; no fetch, rebase, merge or second push.", file=sys.stderr)

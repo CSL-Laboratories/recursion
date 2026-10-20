@@ -301,6 +301,8 @@ class Comment:
     commit_sha: str = ""
     # GitHub's own rendering (GraphQL bodyHTML). None when not fetched.
     body_html: str | None = None
+    # GraphQL Actor __typename ("Bot", "User", ...); "" when not supplied.
+    author_type: str = ""
 
 
 @dataclass(frozen=True)
@@ -461,6 +463,21 @@ def mediations_today(issue_comments: Iterable[Comment], cfg: Config) -> int:
 
 def is_codex_login(login: str | None, cfg: Config) -> bool:
     return bool(login_of(login)) and same_login(login, cfg.codex_review_login)
+
+
+def is_codex_author(comment: Comment, cfg: Config) -> bool:
+    """True only for the Codex App's own bot account.
+
+    GraphQL reports a bot's login without ``[bot]``, so a login match alone
+    would also admit a user account registered as ``chatgpt-codex-connector``.
+    Require the GraphQL ``Bot`` type, or a REST-style ``[bot]`` login (user
+    accounts cannot contain brackets) when no type was supplied.
+    """
+    if not is_codex_login(comment.login, cfg):
+        return False
+    if comment.author_type:
+        return comment.author_type == "Bot"
+    return login_of(comment.login).casefold().endswith("[bot]")
 
 
 def is_known_bot_login(login: str | None, cfg: Config) -> bool:
@@ -1171,7 +1188,7 @@ def latest_thread_verdict(
 ) -> ThreadVerdict | None:
     latest: ThreadVerdict | None = None
     for comment in comments:
-        if not is_codex_login(comment.login, cfg):
+        if not is_codex_author(comment, cfg):
             continue
         for verdict in parse_thread_verdicts(comment):
             if verdict.thread_id != thread_id:
@@ -1825,7 +1842,7 @@ class GitHubClient:
                   comments(first: 50) {
                     pageInfo { hasNextPage endCursor }
                     nodes {
-                      author { login }
+                      author { login __typename }
                       body
                       bodyHTML
                       createdAt
@@ -1837,7 +1854,7 @@ class GitHubClient:
               comments(first: 50, after: $cCursor) {
                 pageInfo { hasNextPage endCursor }
                 nodes {
-                  author { login }
+                  author { login __typename }
                   body
                   bodyHTML
                   createdAt
@@ -1932,7 +1949,7 @@ class GitHubClient:
               comments(first: 50, after: $cursor) {
                 pageInfo { hasNextPage endCursor }
                 nodes {
-                  author { login }
+                  author { login __typename }
                   body
                   bodyHTML
                   createdAt
@@ -1990,7 +2007,7 @@ class GitHubClient:
               reviews(first: 50, after: $cursor) {
                 pageInfo { hasNextPage endCursor }
                 nodes {
-                  author { login }
+                  author { login __typename }
                   body
                   bodyHTML
                   createdAt
@@ -2151,6 +2168,7 @@ def _parse_comment(node: dict[str, Any] | None) -> Comment:
         url=str(node.get("url") or ""),
         commit_sha=normalize_sha(str(commit.get("oid") or node.get("commit_sha") or "")),
         body_html=node["bodyHTML"] if isinstance(node.get("bodyHTML"), str) else None,
+        author_type=str(author.get("__typename") or ""),
     )
 
 

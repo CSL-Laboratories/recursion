@@ -63,13 +63,13 @@ Never commit secrets, private account details, raw chats, signed URLs, bulk copy
 
 `CONTROL_PLANE.md` still decides who decides. This section is the short test for
 when an agent acts on its own and when it asks. Claude Code can invoke the
-`proceed-or-escalate` skill (`.claude/skills/proceed-or-escalate/SKILL.md`), whose
-text matches this section; Cursor, Codex and Grok follow this section.
+`proceed-or-escalate` skill (`.claude/skills/proceed-or-escalate/SKILL.md`), which
+expands on this section; Cursor, Codex and Grok follow this section.
 
 **Scope.** This governs agents acting through a developer's account or session:
 interactive sessions, scheduled loops and Grok Bots. Repository workflows
 (`claude.yml` fixer, Codex gate, stuck-thread-watch, conflict-scan,
-linear-pr-sync) and Devin automations keep the roles in
+linear-pr-sync and other repository workflows) and Devin automations keep the roles in
 [Review roles](#review-roles) and [Automations](#automations); their documented
 markers, receipts and audit comments are unchanged.
 
@@ -91,16 +91,16 @@ records, contracts or another owner's work; a tool or platform refused the actio
 you would state a decision you cannot link to its record; the CI cost is unclear;
 or an automation signal needs a human (fixer paused or at its loop cap, a pause
 label, an unverifiable fix receipt, a rebased branch with fixer receipts, uncertain
-`ci:full` ownership). Never remove a pause label, dispatch the fixer around its
+`ci:full` ownership). Never remove a pause, dispatch the fixer around its
 budget, or report an unverified fix as fixed.
 
 **How:** if the PR has a `Stuck PR threads: recursion#<PR>` roll-up, add to it.
-Otherwise post one Linear comment @mentioning the issue owner with the question,
-two or three options, your recommendation, and what you will do meanwhile
-("paused" or other proceed-list work, never the option you are asking about).
-Record the blocker in `state/INBOX.md` as "Escalate, don't guess" requires, release
-your claim, and take only other admitted work that is next under the human-approved
-order.
+Otherwise post one Linear comment @mentioning the issue owner with the question, two
+or three options, your recommendation, and what you will do meanwhile ("paused" or
+other proceed-list work, never the option you are asking about or work that
+presupposes one). Record the blocker in `state/INBOX.md` as "Escalate, don't guess"
+requires, release your claim, and take only other admitted work that is next under
+the human-approved order.
 
 **Comment labels.** Agents usually post through a developer's account, so start
 every agent comment with `Agent (<tool/session>, for <developer>):`. A comment the
@@ -109,15 +109,16 @@ approved by <developer> before posting:` and carries their direction, but it is
 still an attributed relay: where personal posting is required (decision receipts,
 contract acceptance, the named reviewer's GitHub review), the human posts it. Never
 post decision language as an agent comment; link the record instead. A decision
-exists only if a human posted it, approved its exact text, or it is in
-`state/DECISIONS.md` or `docs/adr/`. Agent repetition, silence, a merge or an issue
-auto-closing to Done is not a decision.
+exists only if a human posted it from their own account, or it is in
+`state/DECISIONS.md` or `docs/adr/`; a developer-approved comment never releases a
+hold on its own. Agent repetition, silence, a merge or an issue auto-closing to Done
+is not a decision.
 
 **Unattended runs** (loops acting through a developer's account while nobody
 watches) may only do "proceed" work. They do not resolve human-authored threads,
 change scope, close issues as decided or post developer-approved comments. They
-never mark ready, label, dispatch, re-run or cancel, and they label every comment
-`Agent (unattended run, for <developer>):`.
+never mark ready, add or remove GitHub labels, dispatch, re-run or cancel, and they
+label every comment `Agent (unattended run, for <developer>):`.
 
 ## Your role
 

@@ -55,6 +55,10 @@ SUBSTITUTIONS = (
     "gh pr view 1 $" + CONTINUE + "(id)",
     "python3 -m unittest <" + CONTINUE + "(echo x)",
     "gh pr view 1 >" + CONTINUE + CONTINUE + "(id)",
+    "gh pr view ${x:='$''(touch /tmp/pwn)'} ${x@P}",  # prompt expansion runs it
+    "gh pr view ${a:='y[$''(id)]'} $[a]",  # arithmetic subscript runs it
+    "gh pr view $[1+1]",
+    "gh pr view ${HOME}",
     "gh pr view 1 ${ id; }",  # bash 5.3 command substitution forms
     "gh pr view 1 ${|id;}",
     "python3 -m unittest ${" + chr(9) + "id; }",
@@ -64,7 +68,7 @@ PLAIN = (
     "gh pr view 246",
     "python3 -X utf8 -B tools/ci_gate.py --force",
     "python3 -m unittest discover tools",
-    "echo $HOME && ls ${HOME}",
+    "echo $HOME && ls $HOME/x",
     "python3 -m unittest" + CONTINUE + "discover tools",
 )
 

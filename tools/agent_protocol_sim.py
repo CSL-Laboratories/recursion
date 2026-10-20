@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline checker for the CSL-357 agent work protocol (spec draft v3).
+"""Offline checker for the CSL-357 agent work protocol (spec draft v4).
 
 Run from the repository root:
 
@@ -22,6 +22,7 @@ Snapshot format (all timestamps ISO 8601 with a UTC offset):
     config              optional overrides of DEFAULT_CONFIG
     issues              required; list of
         {id, status, admitted, next_in_order, blocked_by: [ids],
+         parent: id | null,
          decision: {options: [..], pings: [ts..], options_changed_at: [ts..],
                     deadline: ts | null} | null}
     comments            required; list of
@@ -37,10 +38,14 @@ Snapshot format (all timestamps ISO 8601 with a UTC offset):
 
 Comment conventions follow the spec. An agent comment starts with
 `Agent (<tool>/<session>, for <developer>):`; a claim record is an agent
-comment whose first line ends with `claim v1`. Human lines (`REVOKE CLAIM`,
-`HOLD`, `DECISION:`, batched `CSL-N: X; ...`, `ACK TAKEOVER`, `Standing
-approval SA-n`, `REVOKE SA-n`) count only in comments without the agent
-prefix, and keep the effect they had before a known deletion time. Standing
+comment whose first line ends with `claim v1`. Its `scope:` is `whole issue`
+or `sub-issue CSL-N`, which also covers that sub-issue of the claimed issue;
+it may name several claims to take over, one `takeover of <uuid>` line each,
+and `takeovers` in the result gives each one's outcome under `targets`.
+Human lines (`REVOKE CLAIM`, `HOLD`, `DECISION:`, batched `CSL-N: X; ...`,
+`ACK TAKEOVER`, `Standing approval SA-n`, `REVOKE SA-n`) count only in
+comments without the agent prefix, and keep the effect they had before a known
+deletion time. Standing
 approvals use machine fields: `actions:` and `scope:` are comma-separated
 tokens, `limits:` holds `per_day=N` and/or `total=N`, and `expires:` is a date;
 each action is checked against the comment revision in effect at its time. An
@@ -82,6 +87,7 @@ ACK_TAKEOVER = re.compile(r"^ACK TAKEOVER (\S+)\s*$")
 SA_HEADER = re.compile(r"^Standing approval (SA-[0-9]+)\s*$")
 REVOKE_SA = re.compile(r"^REVOKE (SA-[0-9]+)\s*$")
 TAKEOVER = re.compile(r"^takeover of (\S+)\s*$")
+SUB_ISSUE_SCOPE = re.compile(r"^sub-issue (CSL-[0-9]+)$")
 TIMESTAMP_VALUE = re.compile(r"^\d{4}-\d{2}-\d{2}T")
 PLACEHOLDER = re.compile(r"^\([^()\n]*[^()\s][^()\n]*\)$")
 DECISION_RECORD = re.compile(r"^decision-record:\s*(\S+)\s+([A-Za-z0-9_-]+)\s*$")
@@ -193,7 +199,8 @@ class Claim:
     session: str
     branch: str
     comment: Comment
-    takeover_of: str | None
+    takeovers: tuple[str, ...]
+    child: str | None = None
 
     @property
     def created_at(self) -> datetime:
@@ -222,6 +229,13 @@ class Claim:
     def released_at(self) -> datetime | None:
         return self._first_revision(lambda f: f.get("_released", False))
 
+    def scope_issues(self, issues: dict[str, dict[str, Any]]) -> list[str]:
+        """The issues the claim covers: its own and, with `scope: sub-issue
+        CSL-N`, that child if it is a sub-issue of the claimed issue."""
+        if self.child is not None and issues[self.child]["parent"] == self.issue:
+            return [self.issue, self.child]
+        return [self.issue]
+
     def withdrawn_at(self) -> datetime | None:
         return self._first_revision(lambda f: "withdrawn" in f)
 
@@ -235,7 +249,7 @@ def claim_fields(body: str) -> dict[str, Any]:
             continue
         takeover = TAKEOVER.match(line)
         if takeover:
-            fields["takeover"] = takeover.group(1)
+            fields.setdefault("takeover", []).append(takeover.group(1))
             continue
         match = FIELD.match(line)
         if match and match.group(1) not in fields:
@@ -316,6 +330,7 @@ class Evaluation:
         self.readback = timedelta(seconds=self.config["readback_seconds"])
         self.takeover_wait = timedelta(minutes=self.config["takeover_wait_minutes"])
         self._revoked: dict[str, datetime | None] = {}
+        self._winners: dict[tuple[str, str, datetime], Claim | None] = {}
         self.violations: list[dict[str, Any]] = []
         self.void_lines: list[dict[str, str]] = []
         self.issues = self._load_issues(require(snapshot, "issues", "snapshot"))
@@ -384,10 +399,22 @@ class Evaluation:
                 "next_in_order": expect_bool(item.get("next_in_order", False), f"issue {issue_id}: next_in_order"),
                 "blocked_by": [str(b) for b in expect_list(item.get("blocked_by", []), issue_id)],
                 "decision": decision,
+                "parent": item.get("parent"),
             }
         for issue_id, issue in issues.items():
             for blocker in issue["blocked_by"]:
                 self._check_issue_ref(issues, blocker, issue_id)
+            parent = issue["parent"]
+            if parent is not None and (not isinstance(parent, str) or parent not in issues):
+                raise SnapshotError(f"issue {issue_id}: unknown parent {parent!r}")
+        for issue_id in issues:
+            # Follow parents up; a chain that returns to an issue is a cycle.
+            seen, current = {issue_id}, issues[issue_id]["parent"]
+            while current is not None:
+                if current in seen:
+                    raise SnapshotError(f"issue {issue_id}: parent chain loops")
+                seen.add(current)
+                current = issues[current]["parent"]
         return issues
 
     @staticmethod
@@ -496,7 +523,7 @@ class Evaluation:
                     "scope": found.get("scope"),
                     "branch": branch.split(" @", 1)[0].strip() if isinstance(branch, str) else branch,
                     "repo": found.get("repo"),
-                    "takeover": found.get("takeover"),
+                    "takeover": tuple(found.get("takeover", ())),
                 }
 
             original = identity(fields)
@@ -513,6 +540,16 @@ class Evaluation:
             uuid = fields["claim"]
             if not UUID.match(uuid):
                 raise SnapshotError(f"claim comment {comment.id}: bad uuid {uuid!r}")
+            takeovers = tuple(fields.get("takeover", ()))
+            if len(set(takeovers)) != len(takeovers):
+                raise SnapshotError(f"claim comment {comment.id}: the same claim is taken over twice")
+            child = None
+            if fields["scope"] != "whole issue":
+                scoped = SUB_ISSUE_SCOPE.match(fields["scope"])
+                if not scoped:
+                    raise SnapshotError(f"claim comment {comment.id}: unknown scope {fields['scope']!r}")
+                child = scoped.group(1)
+                self._known_issue(child, f"claim comment {comment.id}: scope")
             if uuid in claims:
                 raise SnapshotError(f"claim {uuid}: duplicate")
             branch = fields["branch"].split(" @", 1)[0].strip()
@@ -523,7 +560,8 @@ class Evaluation:
                 session=header[0],
                 branch=branch,
                 comment=comment,
-                takeover_of=fields.get("takeover"),
+                takeovers=takeovers,
+                child=child,
             )
         return claims
 
@@ -585,22 +623,51 @@ class Evaluation:
         return None
 
     def takeover_status(self, claim: Claim, at: datetime | None = None) -> dict[str, Any] | None:
-        if claim.takeover_of is None:
+        """The takeover's outcome at `at`, or None if the claim names none.
+
+        A claim may take over several expired claims, one `takeover of` line
+        each (decision 2, CSL-389 comment 425b223c). It is allowed only if
+        every named claim meets the conditions; `targets` has each outcome.
+        """
+        if not claim.takeovers:
             return None
         at = self.now if at is None else at
-        old = self.claims.get(claim.takeover_of)
+        targets = {uuid: self.target_status(claim, uuid, at) for uuid in claim.takeovers}
+        refused = [uuid for uuid in claim.takeovers if not targets[uuid]["allowed"]]
+        if len(claim.takeovers) == 1:
+            reason = targets[claim.takeovers[0]]["reason"]
+        elif refused:
+            reason = f"{refused[0]}: {targets[refused[0]]['reason']}"
+        else:
+            reason = "conditions met for every claim"
+        return {"of": list(claim.takeovers), "allowed": not refused, "reason": reason, "targets": targets}
+
+    def ended_before_takeover(self, old: Claim, posted: datetime) -> str | None:
+        """How `old` had ended when a takeover of it was posted, if it had.
+
+        A deletion with no recorded time could have come after the takeover,
+        so it does not count as having ended before it.
+        """
+        ended = self.ended(old, posted)
+        if ended == "deleted" and old.comment.deleted_at is None:
+            return None
+        return ended if ended in {"withdrawn", "released", "revoked", "deleted"} else None
+
+    def target_status(self, claim: Claim, target: str, at: datetime) -> dict[str, Any]:
+        """Whether `claim` may take over the claim `target` at `at`."""
+        old = self.claims.get(target)
         posted = claim.created_at
         if old is None:
-            return {"of": claim.takeover_of, "allowed": False, "reason": "unknown claim"}
+            return {"allowed": False, "reason": "unknown claim"}
         if old.issue != claim.issue or old.repo != claim.repo:
-            return {"of": old.uuid, "allowed": False, "reason": "claim on another issue or repository"}
+            return {"allowed": False, "reason": "claim on another issue or repository"}
         if old.created_at >= posted:
-            return {"of": old.uuid, "allowed": False, "reason": "original posted after the takeover"}
+            return {"allowed": False, "reason": "original posted after the takeover"}
         if at < posted + self.takeover_wait:
-            return {"of": old.uuid, "allowed": False, "reason": "takeover wait not over"}
-        ended = self.ended(old, posted)
-        if ended in {"withdrawn", "released", "revoked", "deleted"}:
-            return {"of": old.uuid, "allowed": True, "reason": f"original {ended}"}
+            return {"allowed": False, "reason": "takeover wait not over"}
+        ended = self.ended_before_takeover(old, posted)
+        if ended is not None:
+            return {"allowed": True, "reason": f"original {ended}"}
         # Faults fixed at posting come first, so nothing the original claimant
         # does later (objecting, then releasing) can make a premature takeover
         # allowed.
@@ -616,7 +683,7 @@ class Evaluation:
         if objection and finished not in {"withdrawn", "released", "revoked", "deleted"}:
             # A renewal objects to the takeover, but a later release, withdrawal,
             # revoke or deletion of the original ends that objection.
-            return {"of": old.uuid, "allowed": False, "reason": "original claimant renewed within the wait"}
+            return {"allowed": False, "reason": "original claimant renewed within the wait"}
         if self.config["coordinator_ack_required"]:
             # The acknowledgement must still be in the comment, and the comment
             # not deleted, at the time being judged.
@@ -627,29 +694,53 @@ class Evaluation:
                 for c, line, _ in self.directive_lines(claim.issue)
             )
             if not acked:
-                return {"of": old.uuid, "allowed": False, "reason": "coordinator acknowledgement missing"}
+                return {"allowed": False, "reason": "coordinator acknowledgement missing"}
         if objection:
-            return {"of": old.uuid, "allowed": True, "reason": f"original {finished} after objecting"}
-        return {"of": old.uuid, "allowed": True, "reason": "conditions met"}
+            return {"allowed": True, "reason": f"original {finished} after objecting"}
+        return {"allowed": True, "reason": "conditions met"}
+
+    def took_effect(self, taker: Claim, at: datetime) -> bool:
+        """Whether `taker`'s takeover took effect by `at`.
+
+        It did if, at some moment from the end of its wait up to `at`, the
+        taker was still live and the takeover was allowed. A taker that
+        withdrew, released, was revoked or was deleted before then never held
+        the claims it named, so they still need a takeover.
+        """
+        start = taker.created_at + self.takeover_wait
+        if start > at:
+            return False
+        # The outcome changes only when a comment on the issue changes.
+        moments = {start}
+        for comment in self.comments:
+            if comment.issue != taker.issue:
+                continue
+            moments.update(r.at for r in comment.revisions if start < r.at <= at)
+            if comment.deleted_at is not None and start < comment.deleted_at <= at:
+                moments.add(comment.deleted_at)
+        return any(
+            self.ended(taker, moment) is None and self.takeover_status(taker, moment)["allowed"]
+            for moment in sorted(moments)
+        )
 
     def posting_refusal(self, claim: Claim, old: Claim) -> dict[str, Any] | None:
         """Why a takeover of a still-held `old` was not allowed when posted, or None."""
         posted = claim.created_at
         last = old.comment.last_update(posted)
         if posted <= last + self.lease + self.grace:
-            return {"of": old.uuid, "allowed": False, "reason": "lease plus grace not passed"}
+            return {"allowed": False, "reason": "lease plus grace not passed"}
         newer = [
             c for c in self.commits
             if c.get("repo", self.repo) == old.repo and c["branch"] == old.branch and last < c["at"] <= posted
         ]
         if newer:
-            return {"of": old.uuid, "allowed": False, "reason": "commit newer than the last heartbeat"}
+            return {"allowed": False, "reason": "commit newer than the last heartbeat"}
         running = [
             r for r in self.runs
             if r["claim"] == old.uuid and r["started_at"] <= posted and (r.get("ended_at") is None or r["ended_at"] > posted)
         ]
         if running:
-            return {"of": old.uuid, "allowed": False, "reason": "claimant run in progress"}
+            return {"allowed": False, "reason": "claimant run in progress"}
         return None
 
     def live_claims(self, issue: str, repo: str, at: datetime) -> list[Claim]:
@@ -664,23 +755,40 @@ class Evaluation:
             # without taking it over cannot win, whether it names no takeover
             # or a different one (as check_implicit_takeover reports).
             bypasses = any(
-                other.uuid != claim.uuid and other.uuid != claim.takeover_of
+                other.uuid != claim.uuid and other.uuid not in claim.takeovers
                 and other.issue == claim.issue and other.repo == claim.repo
                 and other.created_at < claim.created_at and self.bypassed_expired(claim, other)
                 for other in self.claims.values()
             )
             status = self.takeover_status(claim, at)
-            if bypasses or (status is not None and not status["allowed"]):
+            if bypasses or self.lost_to_expired(claim, at) or (status is not None and not status["allowed"]):
                 refused.add(claim.uuid)
             elif status is not None:
-                superseded.add(status["of"])
+                superseded.update(status["of"])
         return [c for c in candidates if c.uuid not in superseded and c.uuid not in refused]
 
+    def lost_to_expired(self, claim: Claim, at: datetime) -> bool:
+        """True if `claim` lost the race to a claim that has since expired.
+
+        A claim that lost and never withdrew cannot win when the winner
+        expires; it must take that claim over (decision 3, CSL-389 comment
+        425b223c). The race is settled at the end of the read-back window.
+        """
+        settled_at = claim.created_at + self.readback
+        if settled_at >= at:
+            return False
+        settled = self.winner(claim.issue, claim.repo, settled_at)
+        return (
+            settled is not None and settled.uuid != claim.uuid and settled.uuid not in claim.takeovers
+            and self.ended(settled, at) == "expired"
+        )
+
     def winner(self, issue: str, repo: str, at: datetime) -> Claim | None:
-        live = self.live_claims(issue, repo, at)
-        if not live:
-            return None
-        return min(live, key=lambda c: (c.created_at, c.uuid))
+        key = (issue, repo, at)
+        if key not in self._winners:
+            live = self.live_claims(issue, repo, at)
+            self._winners[key] = min(live, key=lambda c: (c.created_at, c.uuid)) if live else None
+        return self._winners[key]
 
     # Decisions -------------------------------------------------------------
 
@@ -963,7 +1071,9 @@ class Evaluation:
                 self.violation("claim_not_admitted", claim.issue, claim.uuid)
             elif not issue["next_in_order"]:
                 self.violation("claim_out_of_order", claim.issue, claim.uuid)
-            if self.held_at(claim.issue, claim.created_at):
+            if claim.child is not None and self.issues[claim.child]["parent"] != claim.issue:
+                self.violation("scope_not_a_child", claim.issue, claim.uuid, claim.child)
+            if any(self.held_at(scoped, claim.created_at) for scoped in claim.scope_issues(self.issues)):
                 self.violation("claim_on_held_scope", claim.issue, claim.uuid)
             confirmed = claim.confirmed_at()
             edited = claim.confirm_edit_at()
@@ -993,36 +1103,40 @@ class Evaluation:
                     ):
                         self.violation("release_before_writers_stopped", claim.issue, claim.uuid, run["id"])
 
-    def posting_fault(self, claim: Claim) -> str | None:
-        """Why a takeover was not allowed at the moment it was posted, or None.
+    def posting_fault(self, claim: Claim, target: str) -> str | None:
+        """Why taking over `target` was not allowed when the claim was posted, or None.
 
         Only faults fixed at posting time count: what happens later (the wait,
         a coordinator acknowledgement, the original claimant objecting or
         releasing) is not the taker's doing and does not hide or excuse them.
         """
         posted = claim.created_at
-        old = self.claims.get(claim.takeover_of)
+        old = self.claims.get(target)
         if old is None:
-            return f"unknown claim {claim.takeover_of}"
+            return f"unknown claim {target}"
         if old.issue != claim.issue or old.repo != claim.repo:
             return f"claim on another issue or repository {old.uuid}"
         if old.created_at >= posted:
             return "original posted after the takeover"
-        if self.ended(old, posted) in {"withdrawn", "released", "revoked", "deleted"}:
+        if self.ended_before_takeover(old, posted) is not None:
             return None
         refusal = self.posting_refusal(claim, old)
         return None if refusal is None else refusal["reason"]
 
     def check_takeover_refused(self, claim: Claim) -> None:
-        if claim.takeover_of is None:
+        if not claim.takeovers:
             return
-        # The taker withdrawing or releasing answers the fault; a human revoke
-        # or deletion does not erase the report of it.
-        if self.ended(claim, self.now) in {"withdrawn", "released"}:
+        # The taker withdrawing or releasing answers the fault, even if the
+        # comment is deleted afterwards; a human revoke or a deletion alone
+        # does not erase the report of it.
+        if any(when is not None and when <= self.now for when in (claim.withdrawn_at(), claim.released_at())):
             return
-        fault = self.posting_fault(claim)
-        if fault is not None:
-            self.violation("takeover_refused", claim.issue, claim.uuid, fault)
+        for target in claim.takeovers:
+            fault = self.posting_fault(claim, target)
+            if fault is not None:
+                # With several targets, name the one the fault is about.
+                detail = fault if len(claim.takeovers) == 1 or target in fault else f"{fault} ({target})"
+                self.violation("takeover_refused", claim.issue, claim.uuid, detail)
 
     def check_implicit_takeover(self, claim: Claim) -> None:
         """A fresh claim must not bypass the takeover rules (spec section 7).
@@ -1036,13 +1150,13 @@ class Evaluation:
         for other in self.claims.values():
             if other.uuid == claim.uuid or other.issue != claim.issue or other.repo != claim.repo:
                 continue
-            # The claim an explicit takeover names is judged by takeover_status;
-            # every other earlier claim still needs its own takeover.
-            if other.uuid == claim.takeover_of:
+            # The claims an explicit takeover names are judged by
+            # takeover_status; every other earlier claim still needs its own.
+            if other.uuid in claim.takeovers:
                 continue
             if other.created_at >= at:
                 continue
-            if other.takeover_of is not None and at < other.created_at + self.takeover_wait:
+            if other.takeovers and at < other.created_at + self.takeover_wait:
                 if self.ended(other, at) is None:
                     self.violation("claim_during_takeover_wait", claim.issue, claim.uuid, f"takeover {other.uuid}")
                     continue
@@ -1050,13 +1164,13 @@ class Evaluation:
                 self.violation("claim_without_takeover", claim.issue, claim.uuid, f"expired {other.uuid}")
 
     def bypassed_expired(self, claim: Claim, other: Claim) -> bool:
-        """True if `claim` landed over `other`, which had expired without a valid takeover."""
+        """True if `claim` landed over `other`, which had expired and was not
+        taken over by a takeover that took effect before `claim` was posted."""
         at = claim.created_at
         if self.ended(other, at) != "expired":
             return False
         return not any(
-            t.takeover_of == other.uuid and t.created_at <= at
-            and (status := self.takeover_status(t, at)) is not None and status["allowed"]
+            other.uuid in t.takeovers and t.uuid != claim.uuid and t.created_at <= at and self.took_effect(t, at)
             for t in self.claims.values()
         )
 
@@ -1068,7 +1182,7 @@ class Evaluation:
             if claim is None:
                 self.violation("write_without_claim", write["issue"], write["claim"], what)
                 continue
-            if claim.issue != write["issue"]:
+            if write["issue"] not in claim.scope_issues(self.issues):
                 self.violation("write_outside_claim", write["issue"], claim.uuid, what)
                 continue
             confirmed = claim.confirmed_at()
@@ -1080,13 +1194,13 @@ class Evaluation:
                 code = f"write_{AFTER_END.get(ended, 'after_release')}"
                 self.violation(code, claim.issue, claim.uuid, what)
                 continue
-            if claim.takeover_of is not None and at < claim.created_at + self.takeover_wait:
+            if claim.takeovers and at < claim.created_at + self.takeover_wait:
                 self.violation("takeover_wrote_too_early", claim.issue, claim.uuid, what)
                 continue
             winner = self.winner(claim.issue, claim.repo, at)
             if winner is None or winner.uuid != claim.uuid:
                 self.violation("write_by_non_winner", claim.issue, claim.uuid, what)
-            elif self.held_at(claim.issue, at):
+            elif self.held_at(claim.issue, at) or self.held_at(write["issue"], at):
                 self.violation("write_while_held", claim.issue, claim.uuid, what)
 
     def check_commits(self) -> None:
@@ -1116,6 +1230,13 @@ class Evaluation:
         for issue_id, issue in self.issues.items():
             if issue["status"] == "Done" and held[issue_id]:
                 self.violation("done_while_held", issue_id, detail="; ".join(held[issue_id]))
+            if issue["status"] == "Done":
+                # A parent cannot be Done while a sub-issue is open or held.
+                for child_id in sorted(c for c, child in self.issues.items() if child["parent"] == issue_id):
+                    if self.issues[child_id]["status"] not in {"Done", "Canceled", "Duplicate"}:
+                        self.violation("done_with_open_child", issue_id, detail=f"{child_id} open")
+                    elif held[child_id]:
+                        self.violation("done_with_open_child", issue_id, detail=f"{child_id} held")
         program = self.program
         if program and self.admissions:
             paused = program["occupied_reviews"] >= program["review_slots"] and program["completed_waiting"] > 0
@@ -1203,7 +1324,7 @@ class Evaluation:
                 }
             takeovers = {
                 c.uuid: self.takeover_status(c)
-                for c in self.claims.values() if c.issue == issue_id and c.takeover_of
+                for c in self.claims.values() if c.issue == issue_id and c.takeovers
             }
             issues[issue_id] = {
                 "claims": per_repo,

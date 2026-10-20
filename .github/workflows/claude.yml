@@ -497,15 +497,19 @@ jobs:
           done
           # Mentions honor the Devin-path eight-commit guard with the same rule:
           # claude[bot] commits after the newest human commit; other bots neither
-          # count nor reset the streak (CSL-365).
+          # count nor reset the streak (CSL-365). Author and committer both: the
+          # model can pass `git commit --author`, but its committer comes from the
+          # job's git config, so a commit is human only when neither side is
+          # Claude or a bot.
           commits="$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/commits?per_page=100" \
-            --jq '.[] | [(.author.login // "-"), (.commit.author.name // "-")] | @tsv')"
+            --jq '.[] | [(.author.login // "-"), (.commit.author.name // "-"), (.committer.login // "-"), (.commit.committer.name // "-")] | @tsv')"
           count=0
-          while IFS=$'\t' read -r login name; do
-            [ -z "$login$name" ] && continue
-            if [ "$login" = "claude[bot]" ] || [ "$name" = "claude[bot]" ] || [ "$name" = "claude" ]; then
+          while IFS=$'\t' read -r login name clogin cname; do
+            [ -z "$login$name$clogin$cname" ] && continue
+            if [ "$login" = "claude[bot]" ] || [ "$name" = "claude[bot]" ] || [ "$name" = "claude" ] \
+                || [ "$clogin" = "claude[bot]" ] || [ "$cname" = "claude[bot]" ] || [ "$cname" = "claude" ]; then
               count=$((count + 1))
-            elif [[ "$login" == *"[bot]" || "$name" == *"[bot]" ]]; then
+            elif [[ "$login" == *"[bot]" || "$name" == *"[bot]" || "$clogin" == *"[bot]" || "$cname" == *"[bot]" ]]; then
               continue
             else
               break
@@ -519,7 +523,7 @@ jobs:
             count=8
           fi
           if [ "$count" -ge 8 ]; then
-            echo "::notice::@claude skipped: $count Claude commits since the last human commit (cap 8). A human commit resets the streak."
+            echo "::notice::@claude skipped: $count Claude commits since the last human commit (cap 8). A human commit resets the streak, except on a PR listing 250+ commits, where a human has to take over."
             echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -1224,15 +1228,19 @@ jobs:
           esac
           printf '%s\n' "head_ref=$HEAD_REF" "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
           # Count claude[bot] commits after the newest human commit. Other bots
-          # (e.g. merge/dependabot) neither count nor reset the streak.
+          # (e.g. merge/dependabot) neither count nor reset the streak. Author
+          # and committer both: the model can pass `git commit --author`, but its
+          # committer comes from the job's git config, so a commit is human only
+          # when neither side is Claude or a bot.
           commits="$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/commits?per_page=100" \
-            --jq '.[] | [(.author.login // "-"), (.commit.author.name // "-")] | @tsv')"
+            --jq '.[] | [(.author.login // "-"), (.commit.author.name // "-"), (.committer.login // "-"), (.commit.committer.name // "-")] | @tsv')"
           count=0
-          while IFS=$'\t' read -r login name; do
-            [ -z "$login$name" ] && continue
-            if [ "$login" = "claude[bot]" ] || [ "$name" = "claude[bot]" ] || [ "$name" = "claude" ]; then
+          while IFS=$'\t' read -r login name clogin cname; do
+            [ -z "$login$name$clogin$cname" ] && continue
+            if [ "$login" = "claude[bot]" ] || [ "$name" = "claude[bot]" ] || [ "$name" = "claude" ] \
+                || [ "$clogin" = "claude[bot]" ] || [ "$cname" = "claude[bot]" ] || [ "$cname" = "claude" ]; then
               count=$((count + 1))
-            elif [[ "$login" == *"[bot]" || "$name" == *"[bot]" ]]; then
+            elif [[ "$login" == *"[bot]" || "$name" == *"[bot]" || "$clogin" == *"[bot]" || "$cname" == *"[bot]" ]]; then
               continue
             else
               break
@@ -1959,7 +1967,7 @@ jobs:
               if int(count) >= 8:
                   pause = f"<!-- claude-fixer-loop-cap:{head} -->"
                   if not any(bot(c.get("user") or {}, "github-actions[bot]", ACTIONS_ID) and pause in str(c.get("body") or "") for c in comments):
-                      post(repo, number, pause + "\nClaude PR Fixer paused: eight consecutive Claude commits and pending Devin findings. A human needs to inspect them; a human commit resets this guard. Manual retry does not bypass it.")
+                      post(repo, number, pause + "\nClaude PR Fixer paused: eight or more Claude commits since the last human commit (or a PR commit listing at GitHub's 250-commit limit) and pending Devin findings. A human needs to inspect them; a human commit resets this guard, except on a PR with 250+ commits. Manual retry does not bypass it.")
                   emit([], head, "loop-commit-limit")
                   return
               key = attempt_key(head, items)

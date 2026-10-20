@@ -93,7 +93,10 @@ and honor the same pause. Label names match case-insensitively.
   that already pushed is not undone.
 - **Mentions are bounded:** `@claude` skips once eight or more Claude commits
   follow the newest human commit, the same rule as the Devin path. Other bots
-  neither count nor reset the streak; a human commit resets it.
+  neither count nor reset the streak; a human commit resets it. In both
+  counters a commit is human only when neither its author nor its committer
+  is Claude or another bot, so a model commit made with `git commit --author`
+  cannot reset the count. A web-flow merge with a human author is human.
 - **Long PRs:** GitHub lists at most 250 PR commits, oldest first. Both
   counters treat a listing of 250 or more as at the cap, with a notice. A human
   commit cannot reset that, so a human has to take over the PR.

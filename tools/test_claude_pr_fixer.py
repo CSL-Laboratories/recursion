@@ -1322,7 +1322,9 @@ class FixerLoopCapTests(unittest.TestCase):
             self.skipTest("bash/tac not available")
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
-            (d / "commits.tsv").write_text("".join(f"{a}\t{b}\n" for a, b in commits), encoding="utf-8")
+            # Rows are (author login, author name[, committer login, committer name]);
+            # 2-column rows leave the committer columns empty, as before.
+            (d / "commits.tsv").write_text("".join("\t".join(row) + "\n" for row in commits), encoding="utf-8")
             (d / "comments.txt").write_text("".join(c + "\n" for c in comments), encoding="utf-8")
             live = {"state": current_state, "head": {"sha": current_sha, "ref": current_ref, "repo": {"full_name": current_repo}}, "user": {"login": "alice"}}
             if labels is not None:
@@ -1483,6 +1485,24 @@ class FixerLoopCapTests(unittest.TestCase):
                 out, _ = self._run(commits, [])
                 self.assertIn("loop_commit_count=" + expected, out)
 
+    def test_forged_author_does_not_reset_and_committer_is_checked(self) -> None:
+        # The model can pass `git commit --author`, but its committer comes from the job's git config.
+        claude, human = ("claude[bot]", "claude[bot]"), ("alice", "Alice")
+        cases = (
+            ([human] + [("alice", "Alice", "-", "claude[bot]")] * 8, "8"),
+            ([human] + [("alice", "Alice", "claude[bot]", "claude[bot]")] * 8, "8"),
+            ([human] + [("-", "Alice", "-", "claude")] * 8, "8"),
+            ([claude] * 8 + [("bob", "Bob", "bob", "Bob")] + [claude] * 7, "7"),
+            ([claude] * 8 + [("bob", "Bob", "web-flow", "GitHub")] + [claude] * 2, "2"),
+            ([human] + [claude] * 4 + [("bob", "Bob", "github-actions[bot]", "github-actions[bot]")] + [claude] * 4, "8"),
+            ([human] + [claude] * 4 + [("bob", "Bob", "-", "renovate[bot]")] + [claude] * 4, "8"),
+        )
+        for commits, expected in cases:
+            with self.subTest(commits=commits[-9:]):
+                out, _ = self._run(commits, [])
+                self.assertIn("loop_commit_count=" + expected + "\n", out)
+        self.assertIn('(.committer.login // "-"), (.commit.committer.name // "-")', self.script)
+
     def test_truncated_listing_notice_says_a_human_must_take_over(self) -> None:
         self.assertIn("A human commit cannot reset this, so a human has to take over this PR.", self.script)
 
@@ -1572,6 +1592,24 @@ class MentionLiveHeadTests(unittest.TestCase):
                 out, _ = self._run([("alice", "Alice")] + [live] * n, [])
                 self.assertIn("skip=" + skip, out)
         self.assertIn("A human commit cannot reset this, so a human has to take over this PR.", self.script)
+
+    def test_mention_forged_author_does_not_reset_and_committer_is_checked(self):
+        claude, human = ("claude[bot]", "claude[bot]"), ("alice", "Alice")
+        cases = (
+            ([human] + [("alice", "Alice", "-", "claude[bot]")] * 8, "true"),
+            ([human] + [("alice", "Alice", "claude[bot]", "claude[bot]")] * 8, "true"),
+            ([human] + [("alice", "Alice", "claude[bot]", "claude[bot]")] * 7, "false"),
+            ([claude] * 8 + [("bob", "Bob", "bob", "Bob")] + [claude] * 7, "false"),
+            ([claude] * 8 + [("bob", "Bob", "web-flow", "GitHub")] + [claude] * 2, "false"),
+            ([human] + [claude] * 4 + [("bob", "Bob", "github-actions[bot]", "github-actions[bot]")] + [claude] * 4, "true"),
+        )
+        for commits, skip in cases:
+            with self.subTest(commits=commits[-9:]):
+                out, _ = self._run(commits, [])
+                self.assertIn("skip=" + skip, out)
+        self.assertIn('(.committer.login // "-"), (.commit.committer.name // "-")', self.script)
+        self.assertIn("A human commit resets the streak, except on a PR listing 250+ commits, where a human has to take over.",
+                      self.script)
 
     def test_mention_cap_fails_closed_on_truncated_commit_list(self):
         # GitHub's PR commits endpoint lists at most 250 commits, oldest first.

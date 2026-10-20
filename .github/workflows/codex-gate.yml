@@ -65,12 +65,12 @@ jobs:
       group: claude-${{ github.event.pull_request.number }}
       cancel-in-progress: false
       queue: max
+    # Only the Codex App's exact [bot] identity; the bare alias is an ordinary
+    # user login. codex_gate.py also checks the App's numeric user id (CSL-365).
     if: >-
       github.event_name == 'pull_request_review' &&
-      (
-        github.event.review.user.login == 'chatgpt-codex-connector[bot]' ||
-        github.event.review.user.login == 'chatgpt-codex-connector'
-      )
+      github.event.review.user.login == 'chatgpt-codex-connector[bot]' &&
+      github.event.review.user.type == 'Bot'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

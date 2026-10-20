@@ -246,6 +246,19 @@ class LeaseTests(unittest.TestCase):
         result = sim.evaluate(snapshot(170, [issue("CSL-1")], [claim("c1", "CSL-1", U1), self.takeover()], runs=runs))
         self.assertTrue(result["issues"]["CSL-1"]["takeovers"][U2]["allowed"])
 
+    def test_deleted_or_edited_out_acknowledgement_does_not_count(self):
+        config = {"coordinator_ack_required": True}
+        deleted = comment("h1", "CSL-1", 152, f"ACK TAKEOVER {U1}", deleted=True)
+        deleted["deleted_at"] = ts(160)
+        edited = comment("h1", "CSL-1", 152, f"ACK TAKEOVER {U1}")
+        edited["edits"] = [{"at": ts(160), "body": "never mind"}]
+        for ack in (deleted, edited):
+            with self.subTest(ack="deleted" if ack["deleted"] else "edited"):
+                comments = [claim("c1", "CSL-1", U1), self.takeover(), ack]
+                result = sim.evaluate(snapshot(170, [issue("CSL-1")], comments, config=config))
+                self.assertFalse(result["issues"]["CSL-1"]["takeovers"][U2]["allowed"])
+                self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], None)
+
     def test_acknowledgement_before_the_takeover_does_not_count(self):
         comments = [claim("c1", "CSL-1", U1), comment("h1", "CSL-1", 140, f"ACK TAKEOVER {U1}"), self.takeover()]
         result = sim.evaluate(snapshot(170, [issue("CSL-1")], comments, config={"coordinator_ack_required": True}))
@@ -726,6 +739,17 @@ class StandingApprovalTests(unittest.TestCase):
             with self.subTest(agent=agent), self.assertRaises(sim.SnapshotError):
                 self.run_actions([action], open_approval)
 
+    def test_date_only_expiry_covers_the_whole_day(self):
+        last_day = self.approval(expires="2026-10-20")
+        late = dict(self.action(0), at="2026-10-20T23:59:59.500000Z")
+        result = sim.evaluate(snapshot(0, [issue("CSL-90")], [last_day], config=self.CONFIG, sa_actions=[late])
+                              | {"now": "2026-10-21T00:00:01Z"})
+        self.assertEqual(codes(result), [])
+        after = dict(late, at="2026-10-21T00:00:00Z")
+        result = sim.evaluate(snapshot(0, [issue("CSL-90")], [last_day], config=self.CONFIG, sa_actions=[after])
+                              | {"now": "2026-10-21T00:00:01Z"})
+        self.assertEqual(codes(result), ["sa_expired"])
+
     def test_total_limit(self):
         result = self.run_actions([self.action(10), self.action(500)], self.approval(limits="total=1"))
         self.assertEqual(codes(result), ["sa_over_limit"])
@@ -906,6 +930,12 @@ class MalformedSnapshotTests(unittest.TestCase):
 
     def test_run_ending_before_it_starts(self):
         self.assert_rejected(lambda s: s.update(runs=[{"id": "r", "claim": U1, "started_at": ts(5), "ended_at": ts(4)}]))
+
+    def test_run_naming_an_unknown_claim(self):
+        unknown = "99999999-9999-4999-8999-999999999999"
+        for claim_id in (unknown, None, 7):
+            with self.subTest(claim=claim_id):
+                self.assert_rejected(lambda s, c=claim_id: s.update(runs=[{"id": "r", "claim": c, "started_at": ts(5)}]))
 
     def test_events_after_the_snapshot_time(self):
         self.assert_rejected(lambda s: s["comments"].append(comment("c2", "CSL-1", 20, "later")))

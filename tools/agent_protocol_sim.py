@@ -317,6 +317,9 @@ class Evaluation:
             if not isinstance(write["kind"], str) or write["kind"] not in WRITE_KINDS:
                 raise SnapshotError(f"write: unknown kind {write['kind']!r}")
             self._known_issue(write["issue"], "write")
+        for run in self.runs:
+            if not isinstance(run["claim"], str) or run["claim"] not in self.claims:
+                raise SnapshotError(f"run {run['id']}: unknown claim {run['claim']!r}")
         for action in self.sa_actions:
             if not isinstance(action["agent"], str) or not action["agent"].strip():
                 raise SnapshotError("sa_actions: agent must be a non-empty string")
@@ -583,9 +586,12 @@ class Evaluation:
         if running:
             return {"of": old.uuid, "allowed": False, "reason": "claimant run in progress"}
         if self.config["coordinator_ack_required"]:
+            # The acknowledgement must still be in the comment, and the comment
+            # not deleted, at the time being judged.
             acked = any(
                 (m := ACK_TAKEOVER.match(line)) and m.group(1) == old.uuid and posted <= seen <= at
-                for _, line, seen in self.directive_lines(claim.issue)
+                and present_at(c, line, at) and not (c.deleted_at is not None and c.deleted_at <= at)
+                for c, line, seen in self.directive_lines(claim.issue)
             )
             if not acked:
                 return {"of": old.uuid, "allowed": False, "reason": "coordinator acknowledgement missing"}
@@ -768,7 +774,7 @@ class Evaluation:
             who={t.strip() for t in fields["who"].split(",") if t.strip()} if "who" in fields else None,
             per_day=limits.get("per_day"),
             total=limits.get("total"),
-            expires=parse_ts(raw_expires + "T23:59:59Z" if date_only else raw_expires, sa_id),
+            expires=parse_ts(raw_expires + "T23:59:59.999999Z" if date_only else raw_expires, sa_id),
         )
 
     def standing_approvals(self) -> tuple[dict[str, list[Comment]], dict[str, datetime]]:

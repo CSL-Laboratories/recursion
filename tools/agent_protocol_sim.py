@@ -317,6 +317,8 @@ class Evaluation:
             if not isinstance(write["kind"], str) or write["kind"] not in WRITE_KINDS:
                 raise SnapshotError(f"write: unknown kind {write['kind']!r}")
             self._known_issue(write["issue"], "write")
+        for admission in self.admissions:
+            self._known_issue(admission["issue"], "admission")
         for run in self.runs:
             if not isinstance(run["claim"], str) or run["claim"] not in self.claims:
                 raise SnapshotError(f"run {run['id']}: unknown claim {run['claim']!r}")
@@ -465,10 +467,28 @@ class Evaluation:
             for key in ("claim", "scope", "branch"):
                 if not fields.get(key):
                     raise SnapshotError(f"claim comment {comment.id}: missing {key!r}")
+            def identity(found: dict[str, Any]) -> dict[str, Any]:
+                branch = found.get("branch")
+                return {
+                    "claim": found.get("claim"),
+                    "scope": found.get("scope"),
+                    "branch": branch.split(" @", 1)[0].strip() if isinstance(branch, str) else branch,
+                    "repo": found.get("repo"),
+                    "takeover": found.get("takeover"),
+                }
+
+            original = identity(fields)
             for revision in comment.revisions:
-                value = claim_fields(revision.body).get("confirmed-at", "")
+                revised = claim_fields(revision.body)
+                value = revised.get("confirmed-at", "")
                 if value and not PLACEHOLDER.match(value):
                     parse_ts(value, f"claim comment {comment.id}: confirmed-at")
+                # A claim's identity is fixed when it is posted; an edit may
+                # confirm, renew or release it but not turn it into another claim.
+                changed = sorted(k for k, v in identity(revised).items()
+                                 if (k in revised or v is not None) and v != original[k])
+                if changed:
+                    raise SnapshotError(f"claim comment {comment.id}: edit changes {', '.join(changed)}")
             uuid = fields["claim"]
             if not UUID.match(uuid):
                 raise SnapshotError(f"claim comment {comment.id}: bad uuid {uuid!r}")

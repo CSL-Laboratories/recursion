@@ -931,6 +931,29 @@ class MalformedSnapshotTests(unittest.TestCase):
     def test_run_ending_before_it_starts(self):
         self.assert_rejected(lambda s: s.update(runs=[{"id": "r", "claim": U1, "started_at": ts(5), "ended_at": ts(4)}]))
 
+    def test_edit_cannot_change_claim_identity(self):
+        changes = {
+            "claim": lambda b: b.replace(f"claim: {U1}", f"claim: {U2}"),
+            "scope": lambda b: b.replace("scope: whole issue", "scope: part of it"),
+            "branch": lambda b: b.replace("branch: csl-1-work @", "branch: csl-1-other @"),
+            "repo": lambda b: b + "\nrepo: elsewhere",
+            "takeover": lambda b: b + f"\ntakeover of {U2}",
+        }
+        for field, change in changes.items():
+            def mutate(s, change=change):
+                confirm = s["comments"][0]["edits"][0]
+                confirm["body"] = change(confirm["body"])
+            with self.subTest(field=field):
+                self.assert_rejected(mutate)
+
+    def test_edit_may_move_the_branch_head(self):
+        renewed = claim("c1", "CSL-1", U1)
+        renewed["edits"].append({"at": ts(30), "body": renewed["edits"][0]["body"].replace("@ abc123", "@ fedcba9")})
+        self.assertEqual(codes(sim.evaluate(snapshot(40, [issue("CSL-1")], [renewed]))), [])
+
+    def test_admission_naming_an_unknown_issue(self):
+        self.assert_rejected(lambda s: s.update(admissions=[{"issue": "CSL-404", "at": ts(5)}]))
+
     def test_run_naming_an_unknown_claim(self):
         unknown = "99999999-9999-4999-8999-999999999999"
         for claim_id in (unknown, None, 7):

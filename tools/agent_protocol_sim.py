@@ -273,6 +273,20 @@ def present_at(comment: Comment, line: str, at: datetime) -> bool:
     return bool(effective) and line in (part.strip() for part in effective[-1].body.split("\n"))
 
 
+def present_since(comment: Comment, line: str, at: datetime) -> datetime | None:
+    """When `line` last became present without a break up to `at`, or None
+    if the revision in effect at `at` does not contain it."""
+    since = None
+    for revision in comment.revisions:
+        if revision.at > at:
+            break
+        if line in (part.strip() for part in revision.body.split("\n")):
+            since = revision.at if since is None else since
+        else:
+            since = None
+    return since
+
+
 class Evaluation:
     def __init__(self, snapshot: dict[str, Any]):
         if not isinstance(snapshot, dict):
@@ -613,9 +627,10 @@ class Evaluation:
             # The acknowledgement must still be in the comment, and the comment
             # not deleted, at the time being judged.
             acked = any(
-                (m := ACK_TAKEOVER.match(line)) and m.group(1) == old.uuid and posted <= seen <= at
-                and present_at(c, line, at) and not (c.deleted_at is not None and c.deleted_at <= at)
-                for c, line, seen in self.directive_lines(claim.issue)
+                (m := ACK_TAKEOVER.match(line)) and m.group(1) == old.uuid
+                and (since := present_since(c, line, at)) is not None and posted <= since
+                and not (c.deleted_at is not None and c.deleted_at <= at)
+                for c, line, _ in self.directive_lines(claim.issue)
             )
             if not acked:
                 return {"of": old.uuid, "allowed": False, "reason": "coordinator acknowledgement missing"}

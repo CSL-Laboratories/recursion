@@ -259,6 +259,13 @@ class LeaseTests(unittest.TestCase):
                 self.assertFalse(result["issues"]["CSL-1"]["takeovers"][U2]["allowed"])
                 self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], None)
 
+    def test_acknowledgement_re_added_after_the_takeover_counts(self):
+        ack = comment("h1", "CSL-1", 140, f"ACK TAKEOVER {U1}")
+        ack["edits"] = [{"at": ts(145), "body": "hold on"}, {"at": ts(155), "body": f"ACK TAKEOVER {U1}"}]
+        comments = [claim("c1", "CSL-1", U1), self.takeover(), ack]
+        result = sim.evaluate(snapshot(170, [issue("CSL-1")], comments, config={"coordinator_ack_required": True}))
+        self.assertTrue(result["issues"]["CSL-1"]["takeovers"][U2]["allowed"])
+
     def test_acknowledgement_before_the_takeover_does_not_count(self):
         comments = [claim("c1", "CSL-1", U1), comment("h1", "CSL-1", 140, f"ACK TAKEOVER {U1}"), self.takeover()]
         result = sim.evaluate(snapshot(170, [issue("CSL-1")], comments, config={"coordinator_ack_required": True}))

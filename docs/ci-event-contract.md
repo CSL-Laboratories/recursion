@@ -1,7 +1,7 @@
 # CI event-to-check contract
 
 - **Contract version:** v1 (2026-10-20)
-- **Base commit:** `095ec267b1cd275058bf8d317d84a9a9e3c451e6` (master, merge of #255). The rows were traced at `c4cf7d8d` (#252, CSL-376). The only CI-file change since then is #255 (CSL-383), which adds three lines in two places in `claude.yml` and once in `conflict-scan.yml`. All `file:line` citations below are for this base.
+- **Base commit:** `2e369a6c747a4cc10ff6fd4da98f1272697bdc2e` (master, merge of #253). The event rows were traced at `c4cf7d8d` (#252, CSL-376); `ci.yml`, `tools/ci_gate.py` and the CI tests are unchanged since. #255 (CSL-383) and #253 (CSL-365) changed `claude.yml`, `conflict-scan.yml`, `codex-gate.yml` and `scripts/ci/`, which sections 5 and 7 cite. All `file:line` citations below are for this base.
 - **Which workflow version runs:** a pull-request run uses the workflow file from the PR merge ref. `workflow_dispatch` and `push` use the file at the event's commit. A row applies only where that file matches this base; otherwise the behaviour depends on that version.
 - **Scope:** describes current behaviour of the GitHub Actions workflows and repository rules. It is not a policy change and grants no authority. Where behaviour looks wrong, it is listed under [Known gaps](#8-known-gaps-and-follow-ups) for a separately admitted issue.
 - **Evidence classes** (kept distinct throughout):
@@ -161,8 +161,8 @@ GitHub `==` is case-insensitive. Exactness comes from the preflight shell (`ci.y
 | `linear-pr-sync.yml` | `linear-pr-sync-<PR or ref>` | `cancel-in-progress: true` | `linear-pr-sync.yml:18-20` |
 | `codex-gate.yml` | `codex-gate-<PR>-request` or `-verdict-<review id>` | cancel only for non-review events | `codex-gate.yml:12-15` |
 | `codex-gate.yml` `verdict` job | `claude-<PR>` | `queue: max`, no cancel | `codex-gate.yml:64-67` |
-| `claude.yml` `claude-mention`, `devin-review-fix` | `claude-<PR>` | `queue: max`, no cancel | `claude.yml:435-439`, `1086-1090` |
-| `conflict-scan.yml` | `claude-conflict-scan`; resolver `claude-<PR>` | no cancel; resolver `queue: max` | `conflict-scan.yml:30-32`, `351-356` |
+| `claude.yml` `claude-mention`, `devin-review-fix` | `claude-<PR>` | `queue: max`, no cancel | `claude.yml:438-442`, `1175-1179` |
+| `conflict-scan.yml` | `claude-conflict-scan`; resolver `claude-<PR>` | no cancel; resolver `queue: max` | `conflict-scan.yml:30-32`, `364-369` |
 | `stuck-thread-watch.yml` | `stuck-thread-watch` | no cancel | `stuck-thread-watch.yml:48-50` |
 
 **Settle (120 s).**
@@ -235,17 +235,17 @@ None of these start Blacksmith runners. They spend model or tool usage through s
 Their side effects do start paid CI:
 
 - Every fixer or conflict-resolver push to a **non-draft** PR branch is a `synchronize` (E3): one paid Linux run after settle, plus windows if `ci:full` is on the PR. A push to a draft PR is E4 and starts no paid runner (the conflict resolver has no draft exclusion).
-- The eight-commit guard (`cap` step, `claude.yml:1099-1100`) bounds only the batched `devin-review-fix` job. `claude-mention` pushes are not capped by it.
+- The eight-commit guard bounds both fixer paths: `devin-review-fix` (`cap` step, `claude.yml:1188-1189`) and, since CSL-365, `claude-mention` (step `live`, `claude.yml:498-529`). An `@claude` request on a PR at the cap is skipped instead of pushing.
 - Codex READY adds `ci:full`. That starts one windows run from `ci-full-label.yml`, plus windows on every later non-draft PR event until the label is removed.
-  - The gate removes its own label only when a fixer pause or unresolved findings block readiness on the current head (`scripts/ci/codex_gate.py:491-500`, `scripts/ci/claude_fixer_receipts.py:686`). It does not remove it on every push.
+  - The gate removes its own label only when a fixer pause or unresolved findings block readiness on the current head (`scripts/ci/codex_gate.py:507-515`, `scripts/ci/claude_fixer_receipts.py:686`). It does not remove it on every push.
   - A `ci:full` added by a person is never removed automatically.
 
 | Workflow / app | Trigger | Runner | Paid component | Lines |
 |---|---|---|---|---|
-| `claude.yml` `claude-mention` | `issue_comment` or `pull_request_review_comment` containing `@claude` from a non-bot | ubuntu-latest | `anthropics/claude-code-action@v1` via `CLAUDE_CODE_OAUTH_TOKEN`, `--max-turns 30`, 20 min step timeout | `claude.yml:3-7`, `57-83`, `430-441`, `856-862`, `936` |
-| `claude.yml` `devin-review-fix` | Devin review submitted (`commented` or `changes_requested`), `workflow_dispatch`, `repository_dispatch devin-review-fix` | ubuntu-latest | same action | `claude.yml:8-27`, `61-69`, `1080-1092`, `2257-2263`, `2347` |
-| `claude.yml` `event-paths` | `pull_request` touching fixer files | ubuntu-latest | none (tests + actionlint) | `claude.yml:28-47`, `405-428` |
-| `conflict-scan.yml` `conflict-resolve` | schedule `11 */2 * * *`, `workflow_dispatch` (not push) | ubuntu-latest | claude-code-action via `CLAUDE_CODE_OAUTH_TOKEN` | `conflict-scan.yml:7-12`, `343-357`, `414-419` |
+| `claude.yml` `claude-mention` | `issue_comment` or `pull_request_review_comment` containing `@claude` from a non-bot | ubuntu-latest | `anthropics/claude-code-action@v1` via `CLAUDE_CODE_OAUTH_TOKEN`, `--max-turns 30`, 20 min step timeout | `claude.yml:3-7`, `58-85`, `433-443`, `945-951`, `1025` |
+| `claude.yml` `devin-review-fix` | Devin review submitted (`commented` or `changes_requested`), `workflow_dispatch`, `repository_dispatch devin-review-fix` | ubuntu-latest | same action | `claude.yml:8-27`, `58-85`, `1169-1180`, `2411-2417`, `2501` |
+| `claude.yml` `event-paths` | `pull_request` touching fixer files | ubuntu-latest | none (tests + actionlint) | `claude.yml:28-48`, `406-432` |
+| `conflict-scan.yml` `conflict-resolve` | schedule `11 */2 * * *` or `workflow_dispatch`. A push to master runs only the free scan; the resolver's `if` excludes push (`conflict-scan.yml:358`). | ubuntu-latest | claude-code-action via `CLAUDE_CODE_OAUTH_TOKEN` | `conflict-scan.yml:7-12`, `356-369`, `832-837` |
 | `codex-gate.yml` `request` | non-draft same-repo PR opened, synchronize, reopened or ready_for_review | ubuntu-latest | posts `@codex review` once per head SHA (Codex usage) | `codex-gate.yml:6-8`, `23-59` |
 | `stuck-thread-watch.yml` | schedule `23 */2 * * *`, dispatch, Claude or Codex comments and reviews | ubuntu-latest | may post `@codex review` | `stuck-thread-watch.yml:19-35`, `58-81` |
 | Devin Review (external app) | PR creation and on demand; observed on draft heads too | Devin | Devin review; posts the required `Devin Review` status | [OBS] statuses on `11d2f700`, `39c1e70e` |

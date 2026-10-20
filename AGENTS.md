@@ -293,13 +293,16 @@ PRs that are approved on the current head with green checks. It cancels the
 roll-up when the PR merges or every stuck thread is resolved. Codex is asked
 to emit a per-thread `CODEX-THREAD: RESOLVE|DECIDE|MISSING|AMBIGUOUS` block
 plus the inspected `HEAD` SHA. If the ruling is `RESOLVE`, that SHA is the
-PR's current head, and required checks on that head are green, the watcher
+PR's current head, required checks on that head are green, and GitHub's own
+rendering of the comment (GraphQL `bodyHTML`) shows each `CODEX-THREAD:` line
+as plain text in its own top-level paragraph, the watcher
 replies on the thread citing the ruling and SHA, then resolves it
 (`resolveReviewThread` via `CODEX_TRIGGER_PAT` — the same user token that
 posted `@codex review`. `github.token` stays `pull-requests: read` and
 would otherwise attribute the resolve to `github-actions[bot]`).
-`DECIDE`, `MISSING`, `AMBIGUOUS`, a stale HEAD, or pending/failing
-required checks stay on the needs-decision path. Human-authored threads
+`DECIDE`, `MISSING`, `AMBIGUOUS`, a stale HEAD, pending/failing
+required checks, or a ruling GitHub renders inside any other element (or
+does not render) stay on the needs-decision path. Human-authored threads
 are never resolved unless Codex was explicitly asked about them (trusted
 mediation marker or a human `@codex review` that names the thread id).
 Caps: one mediation per thread and one auto-resolve per thread; three of

@@ -22,6 +22,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
+from html.parser import HTMLParser
 from typing import Any, Callable, Iterable
 from urllib.parse import urlparse
 
@@ -74,7 +75,7 @@ HTML_TYPE1_NAMES = frozenset(("pre", "script", "style", "textarea"))
 # A raw type-1 opener prefix anywhere inside a block. HTML still opens the
 # element even when CommonMark 6.6 rejects the tag (``<pre @x>``, ``<pre``).
 HTML_TYPE1_RAW_OPENER_RE = re.compile(
-    r"<(?:pre|script|style|textarea)(?=[ \t>\r\n/]|$)", re.IGNORECASE
+    r"<(?:pre|script|style|textarea)(?=[ \t>\r\n/<]|$)", re.IGNORECASE
 )
 # CommonMark 4.6 type 6 block tags. Used only to fail closed on an unparsed
 # line-start opener; wrapping tags still use the ordered stack so a blank
@@ -287,6 +288,8 @@ class Comment:
     created_at: datetime
     url: str = ""
     commit_sha: str = ""
+    # GitHub's own rendering (GraphQL bodyHTML). None when not fetched.
+    body_html: str | None = None
 
 
 @dataclass(frozen=True)
@@ -325,6 +328,9 @@ class ThreadVerdict:
     login: str = ""
     source_commit: str = ""
     body: str = ""
+    # True only if GitHub's rendered HTML shows this section as top-level
+    # paragraphs (see rendered_verdicts_ok). Required before auto-resolve.
+    rendered: bool = False
 
 
 @dataclass(frozen=True)
@@ -945,6 +951,94 @@ def _verdict_section(lines: list[str]) -> list[tuple[str, str, str]] | None:
     return blocks
 
 
+VERDICT_LINE_TEXT_RE = re.compile(r"CODEX-THREAD:", re.IGNORECASE)
+RENDERED_HEAD_RE = re.compile(r"HEAD:\s*(?:[\w.-]+/[\w.-]+@)?([0-9a-f]{7,40})", re.IGNORECASE)
+
+
+class _RenderedVerdictScan(HTMLParser):
+    """Text of each top-level ``<p>`` and where each ``CODEX-THREAD:`` renders.
+
+    GitHub's bodyHTML is sanitized and re-serialized, so it is well formed.
+    Anything else (a mismatched end tag, a non-void self-closing tag, an
+    element left open) marks the render as broken.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.stack: list[str] = []
+        self.paragraphs: list[list[str]] = []
+        self.hits: list[int | None] = []
+        self.broken = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in HTML_VOID_TAGS:
+            if tag == "br" and self.stack == ["p"]:
+                self.paragraphs[-1].append("\n")
+            return
+        self.stack.append(tag)
+        if self.stack == ["p"]:
+            self.paragraphs.append([])
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag not in HTML_VOID_TAGS:
+            self.broken = True  # HTML ignores the slash; the element would stay open.
+        self.handle_starttag(tag, attrs)
+
+    def handle_endtag(self, tag: str) -> None:
+        if not self.stack or self.stack[-1] != tag:
+            self.broken = True
+            return
+        self.stack.pop()
+
+    def handle_data(self, data: str) -> None:
+        top_level = self.stack == ["p"]
+        for _ in VERDICT_LINE_TEXT_RE.finditer(data):
+            self.hits.append(len(self.paragraphs) - 1 if top_level else None)
+        if self.stack and self.stack[0] == "p" and self.paragraphs:
+            self.paragraphs[-1].append(data)
+
+
+def rendered_verdicts_ok(comment: Comment, blocks: list[tuple[str, str, str]]) -> bool:
+    """True if GitHub rendered exactly this verdict section as top-level text.
+
+    The source parser approximates CommonMark plus HTML5; GitHub's renderer is
+    the authority on what a reader sees. Require every ``CODEX-THREAD:`` in the
+    source to render, each as plain text directly in its own top-level
+    paragraph, and those paragraphs to carry the parsed actions and HEADs in
+    order. A ruling swallowed by an open element, comment or raw-text block,
+    or an extra rendered ruling, fails closed. A missing render fails closed.
+    """
+    html = comment.body_html
+    if not isinstance(html, str) or not blocks:
+        return False
+    scan = _RenderedVerdictScan()
+    try:
+        scan.feed(html)
+        scan.close()
+    except Exception:  # noqa: BLE001 — unparseable render is not proof
+        return False
+    if scan.broken or scan.stack:
+        return False
+    if len(VERDICT_LINE_TEXT_RE.findall(comment.body or "")) != len(blocks):
+        return False
+    if len(scan.hits) != len(blocks) or None in scan.hits or len(set(scan.hits)) != len(blocks):
+        return False
+    for (_tid, action, head_sha), index in zip(blocks, scan.hits):
+        if index is None:
+            return False
+        lines = [line.strip() for line in "".join(scan.paragraphs[index]).split("\n")]
+        lines = [line for line in lines if line]
+        if len(lines) != 2:
+            return False
+        rendered_action = VERDICT_ACTION_RE.fullmatch(lines[0])
+        rendered_head = RENDERED_HEAD_RE.fullmatch(lines[1])
+        if not rendered_action or rendered_action.group(1).upper() != action:
+            return False
+        if not rendered_head or not head_sha.startswith(rendered_head.group(1).lower()):
+            return False
+    return True
+
+
 def parse_thread_verdicts(comment: Comment) -> tuple[ThreadVerdict, ...]:
     """Parse per-thread rulings from one Codex comment/review.
 
@@ -970,7 +1064,9 @@ def parse_thread_verdicts(comment: Comment) -> tuple[ThreadVerdict, ...]:
     if first is None:
         return ()
 
-    def verdict(thread_id: str, action: str, head_sha: str, text: str) -> ThreadVerdict:
+    def verdict(
+        thread_id: str, action: str, head_sha: str, text: str, rendered: bool = False
+    ) -> ThreadVerdict:
         return ThreadVerdict(
             thread_id=thread_id,
             action=action,
@@ -979,6 +1075,7 @@ def parse_thread_verdicts(comment: Comment) -> tuple[ThreadVerdict, ...]:
             login=comment.login,
             source_commit=normalize_sha(comment.commit_sha),
             body=text,
+            rendered=rendered,
         )
 
     prose = lines[:first]
@@ -992,6 +1089,7 @@ def parse_thread_verdicts(comment: Comment) -> tuple[ThreadVerdict, ...]:
             str(m.group("tid") or "").strip() for m in VERDICT_MARKER_RE.finditer(body)
         )
         return tuple(verdict(tid, "AMBIGUOUS", "", body) for tid in mentioned if tid)
+    rendered = rendered_verdicts_ok(comment, blocks)
     rulings: dict[str, tuple[str, str]] = {}
     for thread_id, action, head_sha in blocks:
         previous = rulings.setdefault(thread_id, (action, head_sha))
@@ -999,7 +1097,7 @@ def parse_thread_verdicts(comment: Comment) -> tuple[ThreadVerdict, ...]:
             # Dropping a conflicting duplicate would revive an earlier RESOLVE.
             rulings[thread_id] = ("AMBIGUOUS", "")
     return tuple(
-        verdict(tid, action, head_sha, f"CODEX-THREAD: {action}\nHEAD: {head_sha}")
+        verdict(tid, action, head_sha, f"CODEX-THREAD: {action}\nHEAD: {head_sha}", rendered)
         for tid, (action, head_sha) in rulings.items()
     )
 
@@ -1172,6 +1270,9 @@ def classify_resolve(
         return "stale-sha"
     if not pull.required_checks_green:
         return "checks"
+    if not verdict.rendered:
+        # GitHub's rendering is the authority; the source parse only nominates.
+        return "render-unverified"
     if already_cited(thread, pull.issue_comments, cfg, head_sha=live_sha):
         return "retry-resolve"
     return "resolve"
@@ -1664,6 +1765,7 @@ class GitHubClient:
                     nodes {
                       author { login }
                       body
+                      bodyHTML
                       createdAt
                       url
                     }
@@ -1675,6 +1777,7 @@ class GitHubClient:
                 nodes {
                   author { login }
                   body
+                  bodyHTML
                   createdAt
                   url
                 }
@@ -1769,6 +1872,7 @@ class GitHubClient:
                 nodes {
                   author { login }
                   body
+                  bodyHTML
                   createdAt
                   url
                 }
@@ -1826,6 +1930,7 @@ class GitHubClient:
                 nodes {
                   author { login }
                   body
+                  bodyHTML
                   createdAt
                   url
                   commit { oid }
@@ -1983,6 +2088,7 @@ def _parse_comment(node: dict[str, Any] | None) -> Comment:
         created_at=parse_iso(str(node.get("createdAt") or "1970-01-01T00:00:00Z")),
         url=str(node.get("url") or ""),
         commit_sha=normalize_sha(str(commit.get("oid") or node.get("commit_sha") or "")),
+        body_html=node["bodyHTML"] if isinstance(node.get("bodyHTML"), str) else None,
     )
 
 
@@ -2808,6 +2914,9 @@ def scan(
             if reason == "checks":
                 counters.skipped_checks += 1
                 log(f"skip (required checks): PR #{pull.number} {thread.id}")
+                continue
+            if reason == "render-unverified":
+                log(f"skip (rendered verdict unverified): PR #{pull.number} {thread.id}")
                 continue
             if reason not in {"resolve", "retry-resolve"}:
                 continue

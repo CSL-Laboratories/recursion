@@ -7,9 +7,11 @@ Acceptance gate:
 """
 from __future__ import annotations
 
+import html
 import importlib.util
 import json
 import os
+import re
 import sys
 import unittest
 from dataclasses import replace
@@ -52,8 +54,45 @@ def ts(hours_ago: float) -> datetime:
     return NOW - timedelta(hours=hours_ago)
 
 
+def github_render(body: str) -> str | None:
+    """GitHub-shaped bodyHTML for a fixture whose verdict section renders top-level.
+
+    Mirrors real Codex comment renders (``<p dir="auto">``, ``<br>`` soft
+    breaks, HTML comments stripped, SHAs linked as short ``<tt>``). Prose is
+    one opaque escaped paragraph: these fixtures model the case the DOM oracle
+    reports as a plain paragraph. RenderedGateTests cover hostile renders.
+    """
+    lines = body.replace("\r\n", "\n").split("\n")
+    first = next((i for i, line in enumerate(lines) if mod.VERDICT_MARKER_LINE_RE.fullmatch(line)), None)
+    if first is None:
+        return None
+    out = []
+    prose = "\n".join(lines[:first]).strip()
+    if prose:
+        out.append(f'<p dir="auto">{html.escape(prose)}</p>')
+    section = [line.strip() for line in lines[first:]]
+    index = 0
+    while index < len(section):
+        line = section[index]
+        if mod.VERDICT_MARKER_LINE_RE.fullmatch(line) and index + 2 < len(section):
+            sha = section[index + 2].split(":", 1)[-1].strip()
+            out.append(
+                f'<p dir="auto">{html.escape(section[index + 1])}<br>\n'
+                f'HEAD: <a class="commit-link" href="https://github.com/o/r/commit/{sha}">'
+                f"<tt>{sha[:7]}</tt></a></p>"
+            )
+            index += 3
+            continue
+        if line:
+            out.append(f'<p dir="auto">{html.escape(line)}</p>')
+        index += 1
+    return "\n".join(out) + "\n"
+
+
 def comment(login: str, body: str, hours_ago: float = 1, url: str = "") -> mod.Comment:
-    return mod.Comment(login=login, body=body, created_at=ts(hours_ago), url=url)
+    return mod.Comment(
+        login=login, body=body, created_at=ts(hours_ago), url=url, body_html=github_render(body)
+    )
 
 
 def thread(
@@ -2417,6 +2456,117 @@ class VerdictAndResolveTests(unittest.TestCase):
         self.assertEqual(counters.resolve_failed, 1)
         self.assertEqual(mod.exit_code(counters), 1)
         self.assertEqual(gh.resolves, ["PRRT_2"])
+
+class RenderedGateTests(unittest.TestCase):
+    """Auto-resolve needs GitHub's rendering to show the ruling top-level."""
+
+    SHA_LINK = f'<a class="commit-link" href="https://github.com/o/r/commit/{HEAD}"><tt>{HEAD[:7]}</tt></a>'
+    RULING = f'<p dir="auto">CODEX-THREAD: RESOLVE<br>\nHEAD: {SHA_LINK}</p>\n'
+
+    def _ruling(self, body: str, body_html: str | None) -> mod.Comment:
+        return mod.Comment(login=CODEX, body=body, created_at=ts(0.1), body_html=body_html)
+
+    def _classify(self, ruling: mod.Comment) -> tuple[str, FakeGitHub]:
+        t = thread(tid="PRRT_1", comments=stuck_pair())
+        asked = [comment("pat-user", mod.mediation_marker("PRRT_1"), hours_ago=0.4)]
+        p = pull(threads=[t], issue_comments=asked, reviews=[ruling], checks_green=True)
+        reason = mod.classify_resolve(p, t, cfg(mediator_login="pat-user"))
+        gh = FakeGitHub([p])
+        mod.scan(cfg(mediator_login="pat-user"), gh, FakeLinear())  # type: ignore[arg-type]
+        return reason, gh
+
+    def _assert_render_blocks(self, body: str, body_html: str | None) -> None:
+        parsed = mod.parse_thread_verdicts(self._ruling(body, body_html))
+        self.assertEqual([(v.action, v.head_sha) for v in parsed], [("RESOLVE", HEAD)], body)
+        self.assertFalse(parsed[0].rendered, body_html)
+        reason, gh = self._classify(self._ruling(body, body_html))
+        self.assertEqual(reason, "render-unverified", body_html)
+        self.assertEqual(gh.resolves, [], body_html)
+        self.assertEqual(gh.replies, [], body_html)
+
+    def test_real_codex_shape_resolves(self) -> None:
+        body = "Fixed in the latest push.\n\n" + verdict_block("PRRT_1")
+        rendered = '<p dir="auto">Fixed in the latest push.</p>\n' + self.RULING
+        for html_text in (rendered, rendered.replace("<tt>" + HEAD[:7], "<tt>" + HEAD)):
+            with self.subTest(html_text=html_text):
+                parsed = mod.parse_thread_verdicts(self._ruling(body, html_text))
+                self.assertTrue(parsed[0].rendered)
+                reason, gh = self._classify(self._ruling(body, html_text))
+                self.assertEqual(reason, "resolve")
+                self.assertEqual(gh.resolves, ["PRRT_1"])
+
+    def test_missing_render_fails_closed(self) -> None:
+        self._assert_render_blocks(verdict_block("PRRT_1"), None)
+        self._assert_render_blocks(verdict_block("PRRT_1"), "")
+
+    def test_ruling_inside_any_element_fails_closed(self) -> None:
+        body = "Fixed.\n\n" + verdict_block("PRRT_1")
+        inner = self.RULING.strip()
+        for wrapper in ("pre", "details", "blockquote", "div", "li", "td", "b", "em", "code", "sub"):
+            with self.subTest(wrapper=wrapper):
+                self._assert_render_blocks(body, f'<p dir="auto">Fixed.</p>\n<{wrapper}>{inner}</{wrapper}>\n')
+        # Inline formatting inside the top-level paragraph also fails closed.
+        self._assert_render_blocks(
+            body,
+            f'<p dir="auto"><strong>CODEX-THREAD: RESOLVE</strong><br>\nHEAD: {self.SHA_LINK}</p>\n',
+        )
+
+    def test_swallowed_or_extra_rulings_fail_closed(self) -> None:
+        body = "Fixed.\n\n" + verdict_block("PRRT_1")
+        # Swallowed by an HTML comment, attribute or stripped raw-text element.
+        self._assert_render_blocks(body, '<p dir="auto">Fixed.</p>\n')
+        # Prose echo plus the real section: source and render counts disagree.
+        echo = "Earlier: CODEX-THREAD: RESOLVE\n\n" + verdict_block("PRRT_1")
+        self._assert_render_blocks(echo, '<p dir="auto">Earlier: CODEX-THREAD: RESOLVE</p>\n' + self.RULING)
+        # A rendered ruling with no source line (entity-built) is extra.
+        self._assert_render_blocks(body, self.RULING + self.RULING)
+
+    def test_rendered_action_and_head_must_match(self) -> None:
+        body = verdict_block("PRRT_1")
+        for html_text in (
+            self.RULING.replace("RESOLVE", "DECIDE"),
+            self.RULING.replace(f"<tt>{HEAD[:7]}</tt>", f"<tt>{STALE[:7]}</tt>"),
+            self.RULING.replace(f"<tt>{HEAD[:7]}</tt>", "<tt>aaaa</tt>"),
+            self.RULING.replace("<br>\nHEAD:", "<br>\nNote<br>\nHEAD:"),
+            self.RULING.replace("</p>", " Extra.</p>"),
+        ):
+            with self.subTest(html_text=html_text):
+                self._assert_render_blocks(body, html_text)
+
+    def test_malformed_render_fails_closed(self) -> None:
+        body = verdict_block("PRRT_1")
+        for html_text in (
+            "<div>" + self.RULING,  # element left open
+            self.RULING + "</div>",  # stray end tag
+            "<div/>" + self.RULING,  # non-void self-closing opens in HTML
+            "<p>" + self.RULING,  # nested paragraph left open
+        ):
+            with self.subTest(html_text=html_text):
+                self._assert_render_blocks(body, html_text)
+
+    def test_two_sections_need_two_top_level_paragraphs_in_order(self) -> None:
+        body = verdict_block("PRRT_1") + "\n" + verdict_block("PRRT_2", action="DECIDE")
+        decide = self.RULING.replace("RESOLVE", "DECIDE")
+        ruling = self._ruling(body, self.RULING + decide)
+        self.assertTrue(all(v.rendered for v in mod.parse_thread_verdicts(ruling)))
+        one_paragraph = (
+            f'<p dir="auto">CODEX-THREAD: RESOLVE<br>\nHEAD: {self.SHA_LINK}<br>\n'
+            f"CODEX-THREAD: DECIDE<br>\nHEAD: {self.SHA_LINK}</p>\n"
+        )
+        for html_text in (decide + self.RULING, one_paragraph):
+            with self.subTest(html_text=html_text):
+                parsed = mod.parse_thread_verdicts(self._ruling(body, html_text))
+                self.assertFalse(any(v.rendered for v in parsed), html_text)
+
+    def test_graphql_fetches_and_parses_body_html(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        bodies = re.findall(r"\n( +)body\n\1bodyHTML\n", source)
+        self.assertEqual(len(bodies), 4)
+        self.assertEqual(len(re.findall(r"\n +body\n", source)), len(bodies))
+        self.assertEqual(mod._parse_comment({"body": "x", "bodyHTML": "<p>x</p>"}).body_html, "<p>x</p>")
+        self.assertIsNone(mod._parse_comment({"body": "x", "bodyHTML": None}).body_html)
+        self.assertIsNone(mod._parse_comment({"body": "x"}).body_html)
+
 
 class WorkflowAndDocsTests(unittest.TestCase):
     def setUp(self) -> None:

@@ -176,7 +176,9 @@ class Comment:
 
     @property
     def prefix_changed(self) -> bool:
-        return len({agent_header(r.body) is None for r in self.revisions}) > 1
+        # Any change to the (session, developer) identity counts, not only
+        # adding or removing the prefix.
+        return len({agent_header(r.body) for r in self.revisions}) > 1
 
     def last_update(self, at: datetime) -> datetime:
         return max(r.at for r in self.revisions if r.at <= at)
@@ -953,8 +955,7 @@ class Evaluation:
                     self.violation("loser_confirmed", claim.issue, claim.uuid, f"winner {settled.uuid}")
                 if claim.withdrawn_at() is None:
                     self.violation("loser_not_withdrawn", claim.issue, claim.uuid, f"winner {settled.uuid}")
-            if claim.takeover_of is None:
-                self.check_implicit_takeover(claim)
+            self.check_implicit_takeover(claim)
             others = [
                 other for other in self.claims.values()
                 if other.uuid != claim.uuid and other.session == claim.session and other.repo == claim.repo
@@ -981,6 +982,10 @@ class Evaluation:
         at = claim.created_at
         for other in self.claims.values():
             if other.uuid == claim.uuid or other.issue != claim.issue or other.repo != claim.repo:
+                continue
+            # The claim an explicit takeover names is judged by takeover_status;
+            # every other earlier claim still needs its own takeover.
+            if other.uuid == claim.takeover_of:
                 continue
             if other.created_at >= at:
                 continue

@@ -280,14 +280,16 @@ def find_bash() -> str:
 
 
 def bash_cases(script: str, cases: list[dict[str, str]]) -> list[tuple[int, str]]:
-    """Run ``script`` once per case in a single bash process; subshells isolate exit."""
-    if "CI_SHELL_EOF" in script:
-        raise AssertionError("heredoc terminator collision")
-    lines = ["set -u", "SCRIPT=$(cat <<'CI_SHELL_EOF'", script.rstrip("\n"), "CI_SHELL_EOF", ")", "out=$(mktemp)"]
+    """Run ``script`` once per case in a single bash process; subshells isolate exit.
+
+    The script arrives through the environment, not a heredoc inside ``$(...)``:
+    macOS /bin/bash 3.2 misparses ``case`` arms and expands that heredoc body.
+    """
+    lines = ["set -u", "out=$(mktemp)"]
     for index, env in enumerate(cases):
         exports = " ".join(f"{key}={shlex.quote(value)}" for key, value in env.items())
         lines.append(
-            f': > "$out"; ( export {exports} GITHUB_OUTPUT="$out"; eval "$SCRIPT" ) >/dev/null 2>&1; '
+            f': > "$out"; ( export {exports} GITHUB_OUTPUT="$out"; eval "$CI_SHELL_SCRIPT" ) >/dev/null 2>&1; '
             f"printf 'CASE {index} %s ' \"$?\"; "
             'while IFS= read -r output_line; do printf \'%s \' "$output_line"; done < "$out"; printf \'\\n\''
         )
@@ -295,6 +297,7 @@ def bash_cases(script: str, cases: list[dict[str, str]]) -> list[tuple[int, str]
     proc = subprocess.run(
         [find_bash(), "--noprofile", "--norc", "-s"],
         input=("\n".join(lines) + "\n").encode("utf-8"),  # bytes: keep LF for Git Bash
+        env={**os.environ, "CI_SHELL_SCRIPT": script},
         capture_output=True, check=False, timeout=180,
     )
     found = {

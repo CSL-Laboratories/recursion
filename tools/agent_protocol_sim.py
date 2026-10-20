@@ -211,6 +211,10 @@ class Claim:
                 return max(revision.at, parse_ts(value, f"claim {self.uuid}: confirmed-at"))
         return None
 
+    def confirm_edit_at(self) -> datetime | None:
+        """When the edit that set `confirmed-at` was made (for the read-back check)."""
+        return self._first_revision(lambda f: bool(TIMESTAMP_VALUE.match(f.get("confirmed-at", ""))))
+
     def released_at(self) -> datetime | None:
         return self._first_revision(lambda f: f.get("_released", False))
 
@@ -547,8 +551,13 @@ class Evaluation:
             if posted <= r.at <= posted + self.takeover_wait
             and not claim_fields(r.body).get("_released") and "withdrawn" not in claim_fields(r.body)
         ]
-        if objection:
+        finished = self.ended(old, at)
+        if objection and finished not in {"withdrawn", "released", "revoked", "deleted"}:
+            # A renewal objects to the takeover, but a later release, withdrawal,
+            # revoke or deletion of the original ends that objection.
             return {"of": old.uuid, "allowed": False, "reason": "original claimant renewed within the wait"}
+        if objection:
+            return {"of": old.uuid, "allowed": True, "reason": f"original {finished} after objecting"}
         ended = self.ended(old, posted)
         if ended in {"withdrawn", "released", "revoked", "deleted"}:
             return {"of": old.uuid, "allowed": True, "reason": f"original {ended}"}
@@ -764,6 +773,7 @@ class Evaluation:
         """
         homes: dict[str, list[Comment]] = {}
         starts: dict[tuple[str, str], datetime] = {}
+        ends: dict[tuple[str, str], datetime | None] = {}
         revoked: dict[str, datetime] = {}
         home = self.config["standing_approvals_issue"]
         for comment in self.comments:
@@ -793,6 +803,7 @@ class Evaluation:
                 if comment not in known:
                     known.append(comment)
                     starts[(approval.sa, comment.id)] = revision.at
+                    ends[(approval.sa, comment.id)] = self.definition_end(comment, approval.sa, index)
                 limit = (comment.created_at + timedelta(days=self.config["sa_max_days"])).date()
                 if approval.expires.date() > limit:
                     self.violation("sa_too_long", detail=f"{approval.sa} at {revision.at.isoformat()}")
@@ -800,7 +811,7 @@ class Evaluation:
             # Definitions may follow each other (an old one deleted, a new one
             # posted later) but may not overlap; compare their live intervals
             # so the result does not depend on snapshot order.
-            spans = sorted((starts[(sa_id, c.id)], c.id, c.deleted_at) for c in comments)
+            spans = sorted((starts[(sa_id, c.id)], c.id, ends[(sa_id, c.id)]) for c in comments)
             for (_, _, end), (next_start, _, _) in zip(spans, spans[1:]):
                 if end is None or next_start < end:
                     raise SnapshotError(f"standing approval {sa_id}: defined in two comments at once")
@@ -810,6 +821,18 @@ class Evaluation:
                 previous = revoked.get(match.group(1))
                 revoked[match.group(1)] = seen if previous is None else min(previous, seen)
         return homes, revoked
+
+    def definition_end(self, comment: Comment, sa_id: str, start: int) -> datetime | None:
+        """When a comment stops defining `sa_id`: a later revision that no longer
+        parses as that approval, or the comment's known deletion time."""
+        for revision in comment.revisions[start + 1:]:
+            try:
+                approval = self.parse_approval(comment, revision)
+            except SnapshotError:
+                approval = None
+            if approval is None or approval.sa != sa_id:
+                return revision.at
+        return comment.deleted_at
 
     def approval_at(self, comment: Comment, at: datetime) -> StandingApproval | None:
         if comment.deleted and (comment.deleted_at is None or comment.deleted_at <= at):
@@ -865,7 +888,8 @@ class Evaluation:
             if self.held_at(claim.issue, claim.created_at):
                 self.violation("claim_on_held_scope", claim.issue, claim.uuid)
             confirmed = claim.confirmed_at()
-            if confirmed is not None and confirmed - claim.created_at < self.readback:
+            edited = claim.confirm_edit_at()
+            if edited is not None and edited - claim.created_at < self.readback:
                 self.violation("confirmed_too_early", claim.issue, claim.uuid)
             deadline = claim.created_at + self.readback
             settled = self.winner(claim.issue, claim.repo, deadline) if deadline <= self.now else None

@@ -161,6 +161,12 @@ class ClaimingTests(unittest.TestCase):
         result = sim.evaluate(snapshot(10, [issue("CSL-1")], [backdated], writes=writes))
         self.assertEqual(codes(result), ["write_before_confirm"])
 
+    def test_early_edit_declaring_a_later_time_is_too_early(self):
+        early = claim("c1", "CSL-1", U1, confirm_after=None,
+                      more_edits=[{"at": ts(0, 20), "body": claim_body(U1, confirmed=ts(5))}])
+        result = sim.evaluate(snapshot(10, [issue("CSL-1")], [early]))
+        self.assertEqual(codes(result), ["confirmed_too_early"])
+
     def test_confirm_before_read_back_window(self):
         result = sim.evaluate(snapshot(10, [issue("CSL-1")], [claim("c1", "CSL-1", U1, confirm_after=20)]))
         self.assertEqual(codes(result), ["confirmed_too_early"])
@@ -243,6 +249,19 @@ class LeaseTests(unittest.TestCase):
     def test_acknowledgement_before_the_takeover_does_not_count(self):
         comments = [claim("c1", "CSL-1", U1), comment("h1", "CSL-1", 140, f"ACK TAKEOVER {U1}"), self.takeover()]
         result = sim.evaluate(snapshot(170, [issue("CSL-1")], comments, config={"coordinator_ack_required": True}))
+        self.assertFalse(result["issues"]["CSL-1"]["takeovers"][U2]["allowed"])
+
+    def test_release_after_an_objection_clears_it(self):
+        original = claim("c1", "CSL-1", U1, more_edits=[edit(155, U1, "heartbeat-at: back"), edit(160, U1, "released")])
+        writes = [{"kind": "push", "issue": "CSL-1", "claim": U2, "at": ts(170)}]
+        result = sim.evaluate(snapshot(175, [issue("CSL-1")], [original, self.takeover()], writes=writes))
+        self.assertTrue(result["issues"]["CSL-1"]["takeovers"][U2]["allowed"])
+        self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], U2)
+        self.assertEqual(codes(result), [])
+
+    def test_objection_without_release_still_refuses(self):
+        original = claim("c1", "CSL-1", U1, more_edits=[edit(155, U1, "heartbeat-at: back")])
+        result = sim.evaluate(snapshot(175, [issue("CSL-1")], [original, self.takeover()]))
         self.assertFalse(result["issues"]["CSL-1"]["takeovers"][U2]["allowed"])
 
     def test_release_inside_the_wait_is_not_an_objection(self):
@@ -673,6 +692,16 @@ class StandingApprovalTests(unittest.TestCase):
             with self.subTest(order=[c["id"] for c in comments]):
                 result = sim.evaluate(snapshot(600, [issue("CSL-90")], comments, config=self.CONFIG,
                                                sa_actions=[self.action(10), self.action(25), self.action(60 * 6)]))
+                self.assertEqual(codes(result), ["sa_unknown"])
+
+    def test_approval_edited_out_can_be_replaced(self):
+        old = self.approval("h1", at=0, limits="per_day=5")
+        old["edits"] = [{"at": ts(20), "body": "withdrawn"}]
+        comments = [old, self.approval("h2", at=30, limits="per_day=5")]
+        for order in (comments, comments[::-1]):
+            with self.subTest(order=[c["id"] for c in order]):
+                result = sim.evaluate(snapshot(600, [issue("CSL-90")], order, config=self.CONFIG,
+                                               sa_actions=[self.action(10), self.action(25), self.action(60)]))
                 self.assertEqual(codes(result), ["sa_unknown"])
 
     def test_overlapping_approval_definitions_fail_closed(self):

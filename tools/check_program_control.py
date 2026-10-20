@@ -894,16 +894,20 @@ def _git_check_attr(root: str, paths: tuple[str, ...]) -> tuple[dict[str, dict[s
     """
     if not paths:
         return {}, ""
+    if any("\0" in path for path in paths):
+        return {}, "git check-attr failed: path contains NUL"
     argv = ["git", "-C", root, "-c", "core.quotePath=false",
             "check-attr", "--stdin", "-z", "text", "eol"]
-    path_input = b"".join(os.fsencode(path) + b"\0" for path in paths)
     try:
+        path_input = b"".join(os.fsencode(path) + b"\0" for path in paths)
         result = subprocess.run(
             argv, input=path_input, capture_output=True, timeout=60, check=False)
-    except (OSError, subprocess.SubprocessError) as exc:
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
         return {}, f"git check-attr failed: {exc}"
     if result.returncode != 0:
-        detail = (result.stderr or result.stdout or b"").decode(errors="replace").strip()
+        detail_output = result.stderr or result.stdout
+        detail = (detail_output.decode(errors="replace").strip()
+                  if detail_output else f"exit code {result.returncode}")
         return {}, f"git check-attr failed: {detail}"
     stdout = result.stdout
     if stdout and not stdout.endswith(b"\0"):
@@ -915,7 +919,12 @@ def _git_check_attr(root: str, paths: tuple[str, ...]) -> tuple[dict[str, dict[s
     resolved: dict[str, dict[str, str]] = {}
     seen: set[tuple[str, str]] = set()
     for index in range(0, len(fields), 3):
-        path, attr, value = (os.fsdecode(field) for field in fields[index:index + 3])
+        try:
+            path = os.fsdecode(fields[index])
+            attr = fields[index + 1].decode("utf-8")
+            value = fields[index + 2].decode("utf-8")
+        except UnicodeDecodeError:
+            return {}, "git check-attr failed: malformed output (undecodable field)"
         if attr not in {"text", "eol"}:
             return {}, "git check-attr failed: malformed output (unknown attribute)"
         if path not in requested:
@@ -925,6 +934,8 @@ def _git_check_attr(root: str, paths: tuple[str, ...]) -> tuple[dict[str, dict[s
             return {}, "git check-attr failed: malformed output (duplicate path/attribute pair)"
         seen.add(key)
         resolved.setdefault(path, {})[attr] = value
+    if any(set(attrs) != {"text", "eol"} for attrs in resolved.values()):
+        return {}, "git check-attr failed: malformed output (incomplete attributes)"
     return resolved, ""
 
 

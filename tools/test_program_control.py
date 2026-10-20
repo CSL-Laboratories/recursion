@@ -1694,7 +1694,7 @@ class ProgramControlTests(unittest.TestCase):
 
     def test_git_check_attr_round_trips_unusual_portable_paths(self):
         paths = (
-            "space name.md", "a: b.md", "-dash.md", "naïve.md",
+            "space name.md", "ab: c.md", "-dash.md", "naïve.md",
             "#hash.md", "[br].md", "quote'.md",
         )
         with tempfile.TemporaryDirectory() as directory:
@@ -1708,7 +1708,7 @@ class ProgramControlTests(unittest.TestCase):
                 path: {"text": "set", "eol": "lf"} for path in paths
             })
 
-            disk_paths = tuple(path for path in paths if path != "a: b.md")
+            disk_paths = tuple(path for path in paths if path != "ab: c.md")
             sums = []
             for path in disk_paths:
                 payload = b"unusual path\n"
@@ -1719,8 +1719,11 @@ class ProgramControlTests(unittest.TestCase):
 
     def test_git_check_attr_round_trips_posix_only_paths(self):
         if os.name == "nt":
-            self.skipTest("Windows filenames cannot contain newline, *, ?, or backslash")
-        paths = ("line\nbreak.md", "star*.md", "question?.md", "back\\slash.md")
+            self.skipTest(
+                "Windows filenames cannot contain newline, *, ?, backslash, or colon")
+        paths = (
+            "line\nbreak.md", "star*.md", "question?.md", "back\\slash.md", "a: b.md",
+        )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
@@ -1739,11 +1742,17 @@ class ProgramControlTests(unittest.TestCase):
             ("missing trailing NUL", b"notes.md\0text\0set", "missing trailing NUL"),
             ("incomplete triple", b"notes.md\0text\0set\0notes.md\0",
              "field count is not a multiple of 3"),
+            ("eol only", b"notes.md\0eol\0lf\0", "incomplete attributes"),
+            ("text unset only", b"notes.md\0text\0unset\0", "incomplete attributes"),
+            ("text set only", b"notes.md\0text\0set\0", "incomplete attributes"),
             ("unknown attribute", b"notes.md\0binary\0set\0", "unknown attribute"),
             ("unrequested path", b"other.md\0text\0set\0", "unrequested path"),
             ("duplicate pair",
              b"notes.md\0text\0set\0notes.md\0text\0set\0",
              "duplicate path/attribute pair"),
+            ("undecodable value",
+             b"notes.md\0text\0s\xffet\0notes.md\0eol\0lf\0",
+             "undecodable field"),
             ("newline format",
              b"notes.md: text: set\nnotes.md: eol: unspecified\n",
              "missing trailing NUL"),
@@ -1776,6 +1785,79 @@ class ProgramControlTests(unittest.TestCase):
                     self.assertIn(failure, errors)
                     self.assertFalse(any("lacks eol=lf" in error for error in errors))
 
+    def test_git_check_attr_missing_requested_path_stays_absent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+            (root / "notes.md").write_text("notes\n", encoding="utf-8")
+            digest = hashlib.sha256((root / "notes.md").read_bytes()).hexdigest()
+            (root / "SHA256SUMS.txt").write_text(
+                f"{digest}  notes.md\n", encoding="utf-8")
+            completed = subprocess.CompletedProcess(
+                ["git", "check-attr"], 0, stdout=b"", stderr=b"")
+
+            with mock.patch.object(
+                    checker.subprocess, "run", return_value=completed):
+                self.assertEqual(
+                    checker._git_check_attr(str(root), ("notes.md",)), ({}, ""))
+            with mock.patch.object(
+                    checker.subprocess, "run", return_value=completed):
+                errors = checker.pinned_eol_errors({"contracts": []}, root)
+            self.assertIn("notes.md missing from git check-attr output", errors)
+
+    def test_git_check_attr_rejects_strict_path_decode_errors(self):
+        completed = subprocess.CompletedProcess(
+            ["git", "check-attr"], 0,
+            stdout=b"n\xffotes.md\0text\0set\0n\xffotes.md\0eol\0lf\0", stderr=b"")
+        with mock.patch.object(
+                checker.subprocess, "run", return_value=completed):
+            with mock.patch.object(
+                    checker.os, "fsdecode", side_effect=lambda field: field.decode("utf-8")):
+                resolved, failure = checker._git_check_attr("unused", ("notes.md",))
+        self.assertEqual(resolved, {})
+        self.assertEqual(
+            failure, "git check-attr failed: malformed output (undecodable field)")
+
+    def test_git_check_attr_rejects_nul_path_before_subprocess(self):
+        with mock.patch.object(checker.subprocess, "run") as run:
+            resolved, failure = checker._git_check_attr("unused", ("bad\0path.md",))
+        self.assertEqual(resolved, {})
+        self.assertEqual(failure, "git check-attr failed: path contains NUL")
+        run.assert_not_called()
+
+    def test_git_check_attr_path_encoding_failures_fail_closed(self):
+        encoding_error = UnicodeEncodeError("utf-8", "x", 0, 1, "surrogate")
+        with mock.patch.object(
+                checker.os, "fsencode", side_effect=encoding_error):
+            with mock.patch.object(checker.subprocess, "run") as run:
+                resolved, failure = checker._git_check_attr("unused", ("notes.md",))
+        self.assertEqual(resolved, {})
+        self.assertTrue(failure.startswith("git check-attr failed: "), failure)
+        run.assert_not_called()
+
+    def test_git_check_attr_incomplete_known_gap_fails_closed(self):
+        gap_path = sorted(checker.PINNED_EOL_KNOWN_GAPS)[0]
+        payload = b"incomplete attributes\n"
+        gap_name = gap_path.rsplit("/", 1)[-1]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+            target = root / gap_path
+            target.parent.mkdir(parents=True)
+            target.write_bytes(payload)
+            digest = hashlib.sha256(payload).hexdigest()
+            (target.parent / "SHA256SUMS.txt").write_text(
+                f"{digest}  {gap_name}\n", encoding="utf-8")
+            completed = subprocess.CompletedProcess(
+                ["git", "check-attr"], 0,
+                stdout=f"{gap_path}\0eol\0lf\0".encode("utf-8"), stderr=b"")
+            with mock.patch.object(
+                    checker.subprocess, "run", return_value=completed):
+                errors = checker.pinned_eol_errors({"contracts": []}, root)
+        self.assertIn(
+            "git check-attr failed: malformed output (incomplete attributes)", errors)
+        self.assertFalse(any("known eol gap is covered" in error for error in errors), errors)
+
     def test_git_check_attr_subprocess_failures_fail_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1791,6 +1873,12 @@ class ProgramControlTests(unittest.TestCase):
                 ("nonzero exit", subprocess.CompletedProcess(
                     ["git", "check-attr"], 2, stdout=b"", stderr=b"fatal: rejected"),
                  "fatal: rejected"),
+                ("nonzero exit without detail", subprocess.CompletedProcess(
+                    ["git", "check-attr"], 3, stdout=b"", stderr=b""),
+                 "exit code 3"),
+                ("undecodable stderr", subprocess.CompletedProcess(
+                    ["git", "check-attr"], 2, stdout=b"", stderr=b"fatal: \xff"),
+                 "fatal: "),
             )
             for label, failure, expected in cases:
                 with self.subTest(failure=label):
@@ -1802,6 +1890,9 @@ class ProgramControlTests(unittest.TestCase):
                     self.assertEqual(len(errors), 1, errors)
                     self.assertTrue(errors[0].startswith("git check-attr failed: "), errors)
                     self.assertIn(expected, errors[0])
+                    if label == "undecodable stderr":
+                        self.assertTrue(
+                            errors[0].startswith("git check-attr failed: fatal: "), errors)
 
     def test_known_gap_entries_are_still_pinned_and_uncovered(self):
         paths = set(checker.sha256_pinned_paths(self.data, ROOT))

@@ -216,6 +216,15 @@ def first_seen(comment: Comment, line: str) -> datetime | None:
     return None
 
 
+def present_at(comment: Comment, line: str, at: datetime) -> bool:
+    """Whether `line` was in the comment revision in effect at `at`."""
+    effective = None
+    for revision in comment.revisions:
+        if revision.at <= at and (effective is None or revision.at >= effective.at):
+            effective = revision
+    return effective is not None and line in (part.strip() for part in effective.body.split("\n"))
+
+
 class Evaluation:
     def __init__(self, snapshot: dict[str, Any]):
         if not isinstance(snapshot, dict):
@@ -231,6 +240,8 @@ class Evaluation:
         self.grace = timedelta(minutes=self.config["grace_minutes"])
         self.readback = timedelta(seconds=self.config["readback_seconds"])
         self.takeover_wait = timedelta(minutes=self.config["takeover_wait_minutes"])
+        self._holds_cache: dict[tuple[int, datetime], dict[str, list[str]]] = {}
+        self._hold_directives: list[tuple[Comment, str, str]] | None = None
         self.violations: list[dict[str, Any]] = []
         self.void_lines: list[dict[str, str]] = []
         self.issues = self._load_issues(require(snapshot, "issues", "snapshot"))
@@ -530,6 +541,9 @@ class Evaluation:
 
     def holds(self, decisions: dict[str, dict[str, Any]], at: datetime) -> dict[str, list[str]]:
         """Holds in force at `at`."""
+        key = (id(decisions), at)
+        if key in self._holds_cache:
+            return self._holds_cache[key]
         held: dict[str, list[str]] = {issue_id: [] for issue_id in self.issues}
         for issue_id, issue in self.issues.items():
             for blocker in issue["blocked_by"]:
@@ -539,13 +553,21 @@ class Evaluation:
                         held[issue_id].append(f"blocked by {blocker}")
                 elif not state["answered"] or state["answered_at"] > at:
                     held[issue_id].append(f"awaiting decision {blocker}")
-        for comment in self.human_comments():
-            for line in human_lines(comment):
-                match = HOLD.match(line)
-                seen = first_seen(comment, line) if match else None
-                if match and match.group(1) in held and seen is not None and seen <= at:
-                    held[match.group(1)].append(f"HOLD by comment {comment.id}")
+        for comment, issue_id, line in self.hold_directives():
+            if issue_id in held and present_at(comment, line, at):
+                held[issue_id].append(f"HOLD by comment {comment.id}")
+        self._holds_cache[key] = held
         return held
+
+    def hold_directives(self) -> list[tuple[Comment, str, str]]:
+        if self._hold_directives is None:
+            self._hold_directives = [
+                (comment, match.group(1), line)
+                for comment in self.human_comments()
+                for line in human_lines(comment)
+                if (match := HOLD.match(line))
+            ]
+        return self._hold_directives
 
     def void_agent_directives(self) -> None:
         for comment in self.comments:

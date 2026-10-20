@@ -953,6 +953,9 @@ def _verdict_section(lines: list[str]) -> list[tuple[str, str, str]] | None:
 
 VERDICT_LINE_TEXT_RE = re.compile(r"CODEX-THREAD:", re.IGNORECASE)
 RENDERED_HEAD_RE = re.compile(r"HEAD:\s*(?:[\w.-]+/[\w.-]+@)?([0-9a-f]{7,40})", re.IGNORECASE)
+# The only markup GitHub adds inside a ruling paragraph: the HEAD commit link.
+RENDERED_SHA_LINK_TAGS = frozenset(("a", "tt", "code"))
+RENDERED_SHA_TEXT_RE = re.compile(r"\s*(?:[\w.-]+/[\w.-]+@)?[0-9a-f]{7,40}\s*", re.IGNORECASE)
 
 
 class _RenderedVerdictScan(HTMLParser):
@@ -967,6 +970,8 @@ class _RenderedVerdictScan(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.stack: list[str] = []
         self.paragraphs: list[list[str]] = []
+        # Paragraphs with text nested in anything but a commit-SHA link.
+        self.decorated: set[int] = set()
         self.hits: list[int | None] = []
         self.broken = False
 
@@ -996,6 +1001,13 @@ class _RenderedVerdictScan(HTMLParser):
             self.hits.append(len(self.paragraphs) - 1 if top_level else None)
         if self.stack and self.stack[0] == "p" and self.paragraphs:
             self.paragraphs[-1].append(data)
+            nested = self.stack[1:]
+            if nested and not (
+                set(nested) <= RENDERED_SHA_LINK_TAGS
+                and nested[0] == "a"
+                and RENDERED_SHA_TEXT_RE.fullmatch(data)
+            ):
+                self.decorated.add(len(self.paragraphs) - 1)
 
 
 def rendered_verdicts_ok(comment: Comment, blocks: list[tuple[str, str, str]]) -> bool:
@@ -1005,8 +1017,11 @@ def rendered_verdicts_ok(comment: Comment, blocks: list[tuple[str, str, str]]) -
     the authority on what a reader sees. Require every ``CODEX-THREAD:`` in the
     source to render, each as plain text directly in its own top-level
     paragraph, and those paragraphs to carry the parsed actions and HEADs in
-    order. A ruling swallowed by an open element, comment or raw-text block,
-    or an extra rendered ruling, fails closed. A missing render fails closed.
+    order. Only the HEAD commit link may add markup inside a ruling paragraph;
+    the last one may also carry the ``CODEX-GATE:`` line when no blank line
+    separates it. A ruling swallowed by an open element, comment or raw-text
+    block, or an extra rendered ruling, fails closed. A missing render fails
+    closed.
     """
     html = comment.body_html
     if not isinstance(html, str) or not blocks:
@@ -1023,11 +1038,17 @@ def rendered_verdicts_ok(comment: Comment, blocks: list[tuple[str, str, str]]) -
         return False
     if len(scan.hits) != len(blocks) or None in scan.hits or len(set(scan.hits)) != len(blocks):
         return False
-    for (_tid, action, head_sha), index in zip(blocks, scan.hits):
-        if index is None:
+    for position, ((_tid, action, head_sha), index) in enumerate(zip(blocks, scan.hits)):
+        if index is None or index in scan.decorated:
             return False
         lines = [line.strip() for line in "".join(scan.paragraphs[index]).split("\n")]
         lines = [line for line in lines if line]
+        if (
+            len(lines) == 3
+            and position == len(blocks) - 1
+            and GATE_LINE_RE.fullmatch(lines[2])
+        ):
+            lines = lines[:2]
         if len(lines) != 2:
             return False
         rendered_action = VERDICT_ACTION_RE.fullmatch(lines[0])

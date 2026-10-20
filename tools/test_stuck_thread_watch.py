@@ -2533,6 +2533,37 @@ class RenderedGateTests(unittest.TestCase):
             with self.subTest(html_text=html_text):
                 self._assert_render_blocks(body, html_text)
 
+    def test_gate_line_may_share_the_last_ruling_paragraph(self) -> None:
+        body = verdict_block("PRRT_1") + "CODEX-GATE: READY\n"
+        shared = self.RULING.replace("</p>", "<br>\nCODEX-GATE: READY</p>")
+        self.assertTrue(mod.parse_thread_verdicts(self._ruling(body, shared))[0].rendered)
+        reason, gh = self._classify(self._ruling(body, shared))
+        self.assertEqual(reason, "resolve")
+        self.assertEqual(gh.resolves, ["PRRT_1"])
+        # Only a gate line, and only in the last ruling paragraph.
+        self._assert_render_blocks(body, self.RULING.replace("</p>", "<br>\nNote.</p>"))
+        two = verdict_block("PRRT_1") + "CODEX-GATE: READY\n" + verdict_block("PRRT_2", action="DECIDE")
+        first_shared = shared + self.RULING.replace("RESOLVE", "DECIDE")
+        self.assertFalse(any(v.rendered for v in mod.parse_thread_verdicts(self._ruling(two, first_shared))))
+
+    def test_markup_inside_ruling_paragraph_fails_closed(self) -> None:
+        body = verdict_block("PRRT_1")
+        for html_text in (
+            f'<p dir="auto">CODEX-THREAD: <del>RESOLVE</del><br>\nHEAD: {self.SHA_LINK}</p>\n',
+            f'<p dir="auto">CODEX-THREAD: RESOLVE<br>\n<del>HEAD: {self.SHA_LINK}</del></p>\n',
+            f'<p dir="auto">CODEX-THREAD: RESOLVE<br>\n<a href="x">HEAD:</a> {self.SHA_LINK}</p>\n',
+            f'<p dir="auto">CODEX-THREAD: RESOLVE<br>\nHEAD: <em><tt>{HEAD[:7]}</tt></em></p>\n',
+        ):
+            with self.subTest(html_text=html_text):
+                self._assert_render_blocks(body, html_text)
+        # A plain, unlinked SHA and a full-length linked SHA stay live.
+        for html_text in (
+            f'<p dir="auto">CODEX-THREAD: RESOLVE<br>\nHEAD: {HEAD}</p>\n',
+            self.RULING.replace(f"<tt>{HEAD[:7]}</tt>", f"<code>{HEAD}</code>"),
+        ):
+            with self.subTest(html_text=html_text):
+                self.assertTrue(mod.parse_thread_verdicts(self._ruling(body, html_text))[0].rendered)
+
     def test_malformed_render_fails_closed(self) -> None:
         body = verdict_block("PRRT_1")
         for html_text in (

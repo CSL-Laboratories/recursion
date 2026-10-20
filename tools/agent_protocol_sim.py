@@ -240,7 +240,7 @@ class Evaluation:
         self.grace = timedelta(minutes=self.config["grace_minutes"])
         self.readback = timedelta(seconds=self.config["readback_seconds"])
         self.takeover_wait = timedelta(minutes=self.config["takeover_wait_minutes"])
-        self._holds_cache: dict[tuple[int, datetime], dict[str, list[str]]] = {}
+        self._hold_by_issue: dict[str, list[tuple[Comment, str]]] | None = None
         self._hold_directives: list[tuple[Comment, str, str]] | None = None
         self.violations: list[dict[str, Any]] = []
         self.void_lines: list[dict[str, str]] = []
@@ -541,23 +541,30 @@ class Evaluation:
 
     def holds(self, decisions: dict[str, dict[str, Any]], at: datetime) -> dict[str, list[str]]:
         """Holds in force at `at`."""
-        key = (id(decisions), at)
-        if key in self._holds_cache:
-            return self._holds_cache[key]
-        held: dict[str, list[str]] = {issue_id: [] for issue_id in self.issues}
-        for issue_id, issue in self.issues.items():
-            for blocker in issue["blocked_by"]:
-                state = decisions.get(blocker)
-                if state is None:
-                    if self.issues[blocker]["status"] not in {"Done", "Canceled", "Duplicate"}:
-                        held[issue_id].append(f"blocked by {blocker}")
-                elif not state["answered"] or state["answered_at"] > at:
-                    held[issue_id].append(f"awaiting decision {blocker}")
-        for comment, issue_id, line in self.hold_directives():
-            if issue_id in held and present_at(comment, line, at):
-                held[issue_id].append(f"HOLD by comment {comment.id}")
-        self._holds_cache[key] = held
+        return {issue_id: self.holds_for(decisions, issue_id, at) for issue_id in self.issues}
+
+    def holds_for(self, decisions: dict[str, dict[str, Any]], issue_id: str, at: datetime) -> list[str]:
+        """Holds in force on one issue at `at`; nothing is retained per timestamp."""
+        held: list[str] = []
+        for blocker in self.issues[issue_id]["blocked_by"]:
+            state = decisions.get(blocker)
+            if state is None:
+                if self.issues[blocker]["status"] not in {"Done", "Canceled", "Duplicate"}:
+                    held.append(f"blocked by {blocker}")
+            elif not state["answered"] or state["answered_at"] > at:
+                held.append(f"awaiting decision {blocker}")
+        for comment, line in self.hold_directives_by_issue().get(issue_id, []):
+            if present_at(comment, line, at):
+                held.append(f"HOLD by comment {comment.id}")
         return held
+
+    def hold_directives_by_issue(self) -> dict[str, list[tuple[Comment, str]]]:
+        if self._hold_by_issue is None:
+            grouped: dict[str, list[tuple[Comment, str]]] = {}
+            for comment, issue_id, line in self.hold_directives():
+                grouped.setdefault(issue_id, []).append((comment, line))
+            self._hold_by_issue = grouped
+        return self._hold_by_issue
 
     def hold_directives(self) -> list[tuple[Comment, str, str]]:
         if self._hold_directives is None:
@@ -658,7 +665,7 @@ class Evaluation:
                 self.violation("claim_not_admitted", claim.issue, claim.uuid)
             elif not issue["next_in_order"]:
                 self.violation("claim_out_of_order", claim.issue, claim.uuid)
-            if self.holds(decisions, claim.created_at)[claim.issue]:
+            if self.holds_for(decisions, claim.issue, claim.created_at):
                 self.violation("claim_on_held_scope", claim.issue, claim.uuid)
             confirmed = claim.confirmed_at()
             if confirmed is not None and confirmed - claim.created_at < self.readback:
@@ -704,7 +711,7 @@ class Evaluation:
             winner = self.winner(claim.issue, claim.repo, at)
             if winner is None or winner.uuid != claim.uuid:
                 self.violation("write_by_non_winner", claim.issue, claim.uuid, write["kind"])
-            elif self.holds(decisions, at)[claim.issue]:
+            elif self.holds_for(decisions, claim.issue, at):
                 self.violation("write_while_held", claim.issue, claim.uuid, write["kind"])
 
     def check_commits(self) -> None:

@@ -162,7 +162,7 @@
         "These conditions remain manual and digest-bound. Reconcile actual occupancy and reviewer availability before admission; preserve each item’s contract, dependency and independent-review gates. Keep program.status=candidate and prior history. This grants no live-action, spending, credential, deployment or merge authority, and no mandatory 2/1 fallback. Revisit after those two reviews or any material packet, scope or capacity change."
       ],
       "decided_on": "2026-10-20",
-      "approval_evidence": "https://linear.app/csl-laboratories/issue/CSL-204#comment-b4fad421-6a42-48d9-83b1-26e2f2cbc585; author Lucas Guerra (Linear user 8709c8bb-e7d2-429e-89f9-89a48b7187fa); submitted 2026-10-20T03:51:55.625Z (UTC). Direct human submission confirmed by Lucas through the parent task and corroborated against the authenticated Linear response.",
+      "approval_evidence": "https://linear.app/csl-laboratories/issue/CSL-204#comment-b4fad421-6a42-48d9-83b1-26e2f2cbc585; author Lucas Guerra; submitted 2026-10-20T03:51:55.625Z (UTC). Direct human submission confirmed by Lucas through the parent task and corroborated against the authenticated Linear response.",
       "revisit_trigger": "After the first two completed independent reviews or any material packet, scope or capacity change."
     }
   ],

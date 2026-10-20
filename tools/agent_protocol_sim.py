@@ -563,7 +563,7 @@ class Evaluation:
                 pairs.append((comment.issue, match.group(1), line))
         first = lines[1] if comment.agent is not None and len(lines) > 1 else lines[0]
         if BATCH.fullmatch(first):
-            named = BATCH_PAIR.findall(first)
+            named = [m.groups() for clause in first.split(";") if (m := BATCH_PAIR.match(clause.strip()))]
             if comment.issue in {issue for issue, _ in named}:
                 pairs.extend((issue, value, first) for issue, value in named)
         return pairs
@@ -642,7 +642,11 @@ class Evaluation:
             cleared = state["answered_at"] is not None and state["answered_at"] <= at
             if started and not cleared:
                 reasons.append(f"awaiting decision {blocker}")
-        for comment in self.human_comments():
+        for comment in self.comments:
+            if comment.agent is not None or (
+                comment.deleted and (comment.deleted_at is None or comment.deleted_at <= at)
+            ):
+                continue
             for revision in comment.revisions:
                 for line in (part.strip() for part in revision.body.split("\n")):
                     match = HOLD.match(line)
@@ -757,7 +761,8 @@ class Evaluation:
             confirmed = claim.confirmed_at()
             if confirmed is not None and confirmed - claim.created_at < self.readback:
                 self.violation("confirmed_too_early", claim.issue, claim.uuid)
-            settled = self.winner(claim.issue, claim.repo, claim.created_at + self.readback)
+            deadline = claim.created_at + self.readback
+            settled = self.winner(claim.issue, claim.repo, deadline) if deadline <= self.now else None
             if settled is not None and settled.uuid != claim.uuid:
                 if confirmed is not None:
                     self.violation("loser_confirmed", claim.issue, claim.uuid, f"winner {settled.uuid}")
@@ -766,7 +771,7 @@ class Evaluation:
             others = [
                 other for other in self.claims.values()
                 if other.uuid != claim.uuid and other.session == claim.session and other.repo == claim.repo
-                and other.created_at <= claim.created_at and self.ended(other, claim.created_at) is None
+                and (other.created_at, other.uuid) < (claim.created_at, claim.uuid) and self.ended(other, claim.created_at) is None
             ]
             if others:
                 self.violation("multiple_claims_per_session", claim.issue, claim.uuid, f"also holds {others[0].uuid}")
@@ -823,7 +828,7 @@ class Evaluation:
             if commit.get("repo", self.repo) != claim.repo or commit["branch"] != claim.branch:
                 self.violation("commit_outside_claim_branch", claim.issue, uuid, sha)
             ended = self.ended(claim, commit["at"])
-            if ended == "deleted" or claim.comment.deleted:
+            if ended == "deleted":
                 self.violation("commit_names_deleted_claim", claim.issue, uuid, sha)
             elif ended in AFTER_END:
                 self.violation(f"commit_{AFTER_END[ended]}", claim.issue, uuid, sha)
@@ -851,7 +856,9 @@ class Evaluation:
                         continue
                     recorded = any(
                         c.issue == blocker and c.agent is not None and not c.deleted
-                        and any(r.at <= confirmed and state["answer_comment"] in r.body for r in c.revisions)
+                        and state["answer_comment"] in next(
+                            (r.body for r in reversed(c.revisions) if r.at <= confirmed), ""
+                        )
                         for c in self.comments
                     )
                     if not recorded:

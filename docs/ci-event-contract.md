@@ -233,6 +233,8 @@ Their side effects do start paid CI:
 
 - Every fixer or conflict-resolver push to a PR branch is a `synchronize` (E3): one paid Linux run after settle, plus windows if `ci:full` is on the PR. The eight-commit guard in `claude.yml` bounds fixer pushes.
 - Codex READY adds `ci:full`. That starts one windows run from `ci-full-label.yml`, plus windows on every later non-draft PR event until the label is removed.
+  - The gate removes its own label only when a fixer pause or unresolved findings block readiness on the current head (`scripts/ci/codex_gate.py:491-500`, `scripts/ci/claude_fixer_receipts.py:686`). It does not remove it on every push.
+  - A `ci:full` added by a person is never removed automatically.
 
 | Workflow / app | Trigger | Runner | Paid component | Lines |
 |---|---|---|---|---|

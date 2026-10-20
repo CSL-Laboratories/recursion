@@ -86,7 +86,7 @@ The SHA then carries a failed `linux` and a later result from the survivor. On `
 
 | Event | Jobs run | Paid | Required `linux` | Citation | Observed |
 |---|---|---|---|---|---|
-| `labeled` `ci:full`, non-draft | `ci-full-extra-os / windows`, `ci-full-extra-os / macos` | yes: windows-2025 (macOS free) | not produced: no job named `linux` | `ci-full-label.yml:9-11`, `23-26`; `ci-full-matrix.yml:6-7`, `18-20`, `43-45` | 39018368417 (2026-10-17) |
+| `labeled` `ci:full`, non-draft | `ci-full-extra-os / windows`, `ci-full-extra-os / macos`. No fork guard (`ci-full-label.yml:23-26`): on a fork PR whose author or event actor needs workflow approval, the run is held and starts nothing until a maintainer approves ([INF]; G14 setting, as E17). | yes: windows-2025 (macOS free), once the run is allowed | not produced: no job named `linux` | `ci-full-label.yml:9-11`, `23-26`; `ci-full-matrix.yml:6-7`, `18-20`, `43-45` | 39018368417 (2026-10-17) |
 | `labeled` `ci:full`, draft | `extra-os` skipped; the matrix is not instantiated | no | not produced | `ci-full-label.yml:24` | none identified |
 | `labeled`, other label | `extra-os` skipped | no | not produced | `ci-full-label.yml:25` | 38982719598 (`skipped`; label not recorded) |
 | `unlabeled` | not a trigger | no | not produced | `ci-full-label.yml:11` | n/a |
@@ -236,7 +236,7 @@ None of these start Blacksmith runners. They spend model or tool usage through s
 
 Their side effects do start paid CI:
 
-- Every fixer or conflict-resolver push to a **non-draft** PR branch is a `synchronize` (E3): one paid Linux run after settle, plus windows if `ci:full` is on the PR. A push to a draft PR is E4 and starts no paid runner (the conflict resolver has no draft exclusion).
+- Every fixer or conflict-resolver push to a **non-draft** PR branch is a `synchronize` (E3): one paid Linux run after settle, plus windows if `ci:full` is on the PR. [OBS] The pushes start `CI` as `claude[bot]` about 8-16 s after the commit, so they authenticate as the Claude app rather than the checkout's `GITHUB_TOKEN` (whose events would not start runs normally): 39499885497 (#254 `8087e7f6`), 39386432470 (#249 `919f52e7`), 39352829266 (#241 `b1eb6ac8`), 39016885558 (#229 `0e1888fa`). Earlier commits in a multi-commit push get no run of their own; only the pushed head does. A push to a draft PR is E4 and starts no paid runner (the conflict resolver has no draft exclusion).
 - The eight-commit guard bounds both fixer paths: `devin-review-fix` (`cap` step, `claude.yml:1188-1189`) and, since CSL-365, `claude-mention` (step `live`, `claude.yml:498-529`). An `@claude` request on a PR at the cap is skipped instead of pushing.
 - Codex READY adds `ci:full`. That starts one windows run from `ci-full-label.yml`, plus windows on every later non-draft PR event until the label is removed.
   - The gate removes its own label only when a fixer pause or unresolved findings block readiness on the current head (`scripts/ci/codex_gate.py:507-515`, `scripts/ci/claude_fixer_receipts.py:686`). It does not remove it on every push.

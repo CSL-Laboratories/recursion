@@ -245,7 +245,7 @@
       "id": "unknown.owner-contract-acceptance",
       "blocks": "contract_frozen",
       "resolution_issue": "CSL-204",
-      "exposure": "Dependent issues cannot inherit the candidate as an accepted contract.",
+      "exposure": "The month-program contract remains candidate and cannot be inherited as accepted. Applying accepted issue contract revision 2 to the backlog still requires its recorded independent verification and representative-issue validation/review.",
       "status": "open"
     }
   ],
@@ -254,7 +254,7 @@
       "id": "risk.false-authority",
       "severity": "high",
       "status": "open",
-      "mitigation": "Keep contracts candidate, require exact-digest human receipts, and fail closed on missing references.",
+      "mitigation": "Keep unaccepted contracts candidate, require exact-digest human receipts for acceptance, preserve the conditions on accepted issue contract revision 2, and fail closed on missing references.",
       "trigger": "A dependent issue treats this PR, an agent recommendation, or a merge as product approval."
     },
     {

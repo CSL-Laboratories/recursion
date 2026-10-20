@@ -804,9 +804,7 @@ class Evaluation:
             if other.created_at >= at:
                 continue
             if other.takeover_of is not None and at < other.created_at + self.takeover_wait:
-                old = self.claims.get(other.takeover_of)
-                old_ended = self.ended(old, at) if old is not None else None
-                if self.ended(other, at) is None and old_ended not in {"withdrawn", "released", "revoked", "deleted"}:
+                if self.ended(other, at) is None:
                     self.violation("claim_during_takeover_wait", claim.issue, claim.uuid, f"takeover {other.uuid}")
                     continue
             if self.ended(other, at) != "expired":

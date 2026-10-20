@@ -1,7 +1,8 @@
 # CI event-to-check contract
 
 - **Contract version:** v1 (2026-10-20)
-- **Base commit:** `c4cf7d8d1402a09652d61772886f7ff59d710e45` (master, merge of #252, CSL-376). `.github/` and `tools/ci_gate.py` are unchanged through `b767aa5d` (#254).
+- **Base commit:** `095ec267b1cd275058bf8d317d84a9a9e3c451e6` (master, merge of #255). The rows were traced at `c4cf7d8d` (#252, CSL-376). The only CI-file change since then is #255 (CSL-383), which adds three lines in two places in `claude.yml` and once in `conflict-scan.yml`. All `file:line` citations below are for this base.
+- **Which workflow version runs:** a pull-request run uses the workflow file from the PR merge ref. `workflow_dispatch` and `push` use the file at the event's commit. A row applies only where that file matches this base; otherwise the behaviour depends on that version.
 - **Scope:** describes current behaviour of the GitHub Actions workflows and repository rules. It is not a policy change and grants no authority. Where behaviour looks wrong, it is listed under [Known gaps](#8-known-gaps-and-follow-ups) for a separately admitted issue.
 - **Evidence classes** (kept distinct throughout):
   - **[SRC]** source-documented: read from a file at the base commit; cited as `path:line`.
@@ -63,7 +64,7 @@ Columns:
 | E10 | `edited` (title/body/base retarget) | `ci.yml` does not run; `pr-lint.yml` does (`pr-lint.yml:5`) | no | not re-produced. [INF] The `linux` already on the head stays and was computed against the old base (`CI_BASE_SHA`, `ci.yml:97`, `103`, `187`, `199`). The strict policy still requires the branch to be up to date, and updating it is a synchronize (E3). | `ci.yml:62`, `pr-lint.yml:5` | none |
 | E11 | push to master | preflight, Linux tests, linux, windows (macos never runs on push) | yes: ubuntu-2404 and windows-2025 | pass as E1 (settle `skipped`); `CI_BASE_SHA = github.event.before` | `ci.yml:63-64`, `97`, `302`, `328-329`, `341-342` | 39496738713 (c4cf7d8d), 39364410014 |
 | E12 | merge_group | **not a trigger** | no | not produced. [INF] The shell would also reject the event (`ci.yml:246`), so enabling a merge queue without a workflow change leaves `linux` missing. | `ci.yml:60-65` | n/a |
-| E13 | workflow_dispatch (any ref) | preflight, Linux tests, linux, windows, macos | yes: ubuntu-2404 and windows-2025 | pass as E1; posted on the dispatched ref's head SHA. `github.event.before` is empty, so the whitespace check is skipped (`tools/ci_gate.py:391-395`) and perf is skipped (`ci.yml:195`). The PR draft check (`ci.yml:235-241`) does not apply; `:242-245` only rejects a stray draft flag. A dispatch on a draft PR's branch can therefore post a passing `linux` on the draft head (gap 5). | `ci.yml:65`, `302-303`, `341` | no dispatch since 4c4fb763; the latest, 39073627392 (2026-10-17), ran a branch's different `ci.yml` |
+| E13 | workflow_dispatch on a ref whose `ci.yml` matches this base (other refs: version-dependent) | preflight, Linux tests, linux, windows, macos | yes: ubuntu-2404 and windows-2025 | pass as E1; posted on the dispatched ref's head SHA. `github.event.before` is empty, so the whitespace check is skipped (`tools/ci_gate.py:391-395`) and perf is skipped (`ci.yml:195`). The PR draft check (`ci.yml:235-241`) does not apply; `:242-245` only rejects a stray draft flag. A dispatch on a draft PR's branch can therefore post a passing `linux` on the draft head (gap 5). | `ci.yml:65`, `302-303`, `341` | no dispatch since 4c4fb763; the latest, 39073627392 (2026-10-17), ran a branch's different `ci.yml` |
 | E14 | schedule | `ci.yml` has none (see 3.3) | n/a | n/a | `ci.yml:60-65` | n/a |
 | E15 | rerun of a failed or cancelled run | [INF] reruns the selected jobs with the **original** event payload: a draft run reruns as a draft and fails again. A rerun joins the same concurrency group, so it can cancel the live run for that PR. Rerunning Linux tests starts Blacksmith again. | yes, if Linux tests or windows reruns | [INF] a rerun of an older run on the current head posts a **newer** `linux` result on that SHA | `ci.yml:67-69`, `112`, `221` | none: all 300 recent runs are `run_attempt` 1 |
 | E16 | run cancelled by concurrency | `linux` still runs (`if: always()`); unstarted jobs are marked cancelled without a runner | none, if cancelled before Linux tests started | **fails** on that run's head SHA | `ci.yml:210`, `217`, `285-289` | 39495025672, 39391683862, 39383451090, 39389995068: all `linux` failure, paid jobs with no runner |
@@ -158,7 +159,7 @@ GitHub `==` is case-insensitive. Exactness comes from the preflight shell (`ci.y
 | `linear-pr-sync.yml` | `linear-pr-sync-<PR or ref>` | `cancel-in-progress: true` | `linear-pr-sync.yml:18-20` |
 | `codex-gate.yml` | `codex-gate-<PR>-request` or `-verdict-<review id>` | cancel only for non-review events | `codex-gate.yml:12-15` |
 | `codex-gate.yml` `verdict` job | `claude-<PR>` | `queue: max`, no cancel | `codex-gate.yml:64-67` |
-| `claude.yml` `claude-mention`, `devin-review-fix` | `claude-<PR>` | `queue: max`, no cancel | `claude.yml:435-439`, `1083-1087` |
+| `claude.yml` `claude-mention`, `devin-review-fix` | `claude-<PR>` | `queue: max`, no cancel | `claude.yml:435-439`, `1086-1090` |
 | `conflict-scan.yml` | `claude-conflict-scan`; resolver `claude-<PR>` | no cancel; resolver `queue: max` | `conflict-scan.yml:30-32`, `351-356` |
 | `stuck-thread-watch.yml` | `stuck-thread-watch` | no cancel | `stuck-thread-watch.yml:48-50` |
 
@@ -235,10 +236,10 @@ Their side effects do start paid CI:
 
 | Workflow / app | Trigger | Runner | Paid component | Lines |
 |---|---|---|---|---|
-| `claude.yml` `claude-mention` | `issue_comment` or `pull_request_review_comment` containing `@claude` from a non-bot | ubuntu-latest | `anthropics/claude-code-action@v1` via `CLAUDE_CODE_OAUTH_TOKEN`, `--max-turns 30`, 20 min step timeout | `claude.yml:3-7`, `57-83`, `430-441`, `856-859`, `933` |
-| `claude.yml` `devin-review-fix` | Devin review submitted (`commented` or `changes_requested`), `workflow_dispatch`, `repository_dispatch devin-review-fix` | ubuntu-latest | same action | `claude.yml:8-27`, `61-69`, `1077-1089`, `2254-2257`, `2341` |
+| `claude.yml` `claude-mention` | `issue_comment` or `pull_request_review_comment` containing `@claude` from a non-bot | ubuntu-latest | `anthropics/claude-code-action@v1` via `CLAUDE_CODE_OAUTH_TOKEN`, `--max-turns 30`, 20 min step timeout | `claude.yml:3-7`, `57-83`, `430-441`, `856-862`, `936` |
+| `claude.yml` `devin-review-fix` | Devin review submitted (`commented` or `changes_requested`), `workflow_dispatch`, `repository_dispatch devin-review-fix` | ubuntu-latest | same action | `claude.yml:8-27`, `61-69`, `1080-1092`, `2257-2263`, `2347` |
 | `claude.yml` `event-paths` | `pull_request` touching fixer files | ubuntu-latest | none (tests + actionlint) | `claude.yml:28-47`, `405-428` |
-| `conflict-scan.yml` `conflict-resolve` | schedule `11 */2 * * *`, `workflow_dispatch` (not push) | ubuntu-latest | claude-code-action via `CLAUDE_CODE_OAUTH_TOKEN` | `conflict-scan.yml:7-12`, `343-357`, `414-416` |
+| `conflict-scan.yml` `conflict-resolve` | schedule `11 */2 * * *`, `workflow_dispatch` (not push) | ubuntu-latest | claude-code-action via `CLAUDE_CODE_OAUTH_TOKEN` | `conflict-scan.yml:7-12`, `343-357`, `414-419` |
 | `codex-gate.yml` `request` | non-draft same-repo PR opened, synchronize, reopened or ready_for_review | ubuntu-latest | posts `@codex review` once per head SHA (Codex usage) | `codex-gate.yml:6-8`, `23-59` |
 | `stuck-thread-watch.yml` | schedule `23 */2 * * *`, dispatch, Claude or Codex comments and reviews | ubuntu-latest | may post `@codex review` | `stuck-thread-watch.yml:19-35`, `58-81` |
 | Devin Review (external app) | PR creation and on demand; observed on draft heads too | Devin | Devin review; posts the required `Devin Review` status | [OBS] statuses on `11d2f700`, `39c1e70e` |

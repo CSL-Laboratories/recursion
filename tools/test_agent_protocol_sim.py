@@ -460,6 +460,22 @@ class DecisionTests(unittest.TestCase):
         result = sim.evaluate(snapshot(20, issues, [answer, records[0], late, work]))
         self.assertEqual(codes(result), ["decision_not_recorded"])
 
+    def test_decision_record_written_before_the_answer_does_not_count(self):
+        issues = [issue("CSL-1", blocked_by=["CSL-11"]), issue("CSL-11", decision=decision())]
+        answer = comment("h1", "CSL-11", 5, "DECISION: B")
+        work = claim("c1", "CSL-1", U1, at=10)
+        early = comment("r1", "CSL-11", 3, "Agent (claude/s1, for Lucas): noted\ndecision-record: h1 B")
+        result = sim.evaluate(snapshot(20, issues, [answer, early, work]))
+        self.assertEqual(codes(result), ["decision_not_recorded"])
+        early["edits"] = [{"at": ts(7), "body": "Agent (claude/s1, for Lucas): noted again\ndecision-record: h1 B"}]
+        result = sim.evaluate(snapshot(20, issues, [answer, early, work]))
+        self.assertEqual(codes(result), ["decision_not_recorded"])
+        rewritten = comment("r1", "CSL-11", 3, "Agent (claude/s1, for Lucas): noted\ndecision-record: h1 B")
+        rewritten["edits"] = [{"at": ts(4), "body": "Agent (claude/s1, for Lucas): noted"},
+                              {"at": ts(7), "body": "Agent (claude/s1, for Lucas): noted\ndecision-record: h1 B"}]
+        result = sim.evaluate(snapshot(20, issues, [answer, rewritten, work]))
+        self.assertEqual(codes(result), [])
+
     def test_decision_record_edited_in_after_confirm_does_not_count(self):
         issues = [issue("CSL-1", blocked_by=["CSL-11"]), issue("CSL-11", decision=decision())]
         answer = comment("h1", "CSL-11", 5, "DECISION: B")
@@ -879,6 +895,17 @@ class MalformedSnapshotTests(unittest.TestCase):
             body = s["comments"][0]["edits"][0]["body"]
             s["comments"][0]["edits"][0]["body"] = body.replace(ts(0, 70), "2026-99-99Tnonsense")
         self.assert_rejected(mutate)
+
+    def test_malformed_confirmation_placeholder(self):
+        for value in ("(", "(pending read-back", "pending read-back)", "()", "( )", "(a)(b)"):
+            def mutate(s, value=value):
+                body = s["comments"][0]["edits"][0]["body"]
+                s["comments"][0]["edits"][0]["body"] = body.replace(ts(0, 70), value)
+            with self.subTest(value=value):
+                self.assert_rejected(mutate)
+
+    def test_run_ending_before_it_starts(self):
+        self.assert_rejected(lambda s: s.update(runs=[{"id": "r", "claim": U1, "started_at": ts(5), "ended_at": ts(4)}]))
 
     def test_events_after_the_snapshot_time(self):
         self.assert_rejected(lambda s: s["comments"].append(comment("c2", "CSL-1", 20, "later")))

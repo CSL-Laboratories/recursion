@@ -83,6 +83,7 @@ SA_HEADER = re.compile(r"^Standing approval (SA-[0-9]+)\s*$")
 REVOKE_SA = re.compile(r"^REVOKE (SA-[0-9]+)\s*$")
 TAKEOVER = re.compile(r"^takeover of (\S+)\s*$")
 TIMESTAMP_VALUE = re.compile(r"^\d{4}-\d{2}-\d{2}T")
+PLACEHOLDER = re.compile(r"^\([^()\n]*\S[^()\n]*\)$")
 DECISION_RECORD = re.compile(r"^decision-record:\s*(\S+)\s+([A-Za-z0-9_-]+)\s*$")
 AFTER_END = {
     "expired": "after_expiry",
@@ -429,6 +430,8 @@ class Evaluation:
                 entry[field] = parse_ts(entry[field], key)
                 if entry[field] > self.now:
                     raise SnapshotError(f"{key}: {field} after the snapshot time")
+            if entry.get("ended_at") is not None and "started_at" in entry and entry["ended_at"] < entry["started_at"]:
+                raise SnapshotError(f"{key}: ended_at before started_at")
             items.append(entry)
         return items
 
@@ -461,7 +464,7 @@ class Evaluation:
                     raise SnapshotError(f"claim comment {comment.id}: missing {key!r}")
             for revision in comment.revisions:
                 value = claim_fields(revision.body).get("confirmed-at", "")
-                if value and not value.startswith("("):
+                if value and not PLACEHOLDER.match(value):
                     parse_ts(value, f"claim comment {comment.id}: confirmed-at")
             uuid = fields["claim"]
             if not UUID.match(uuid):
@@ -1030,14 +1033,28 @@ class Evaluation:
                     recorded = any(
                         c.issue == blocker and c.agent is not None
                         and not (c.deleted and (c.deleted_at is None or c.deleted_at <= confirmed))
-                        and any(
-                            (m := DECISION_RECORD.match(line.strip())) and m.groups() == expected
-                            for line in next((r.body for r in reversed(c.revisions) if r.at <= confirmed), "").split("\n")
-                        )
+                        and self.recorded_since(c, expected, answer["at"], confirmed)
                         for c in self.comments
                     )
                     if not recorded:
                         self.violation("decision_not_recorded", blocker, claim.uuid)
+
+    @staticmethod
+    def recorded_since(comment: Comment, expected: tuple[str, str], answered: datetime, at: datetime) -> bool:
+        """Whether the revision in effect at `at` records `expected`, and the
+        record has been present without a break since the answer or later, so
+        a record written before the answer does not count."""
+        start = None
+        for revision in comment.revisions:
+            if revision.at > at:
+                break
+            has = any((m := DECISION_RECORD.match(line.strip())) and m.groups() == expected
+                      for line in revision.body.split("\n"))
+            if not has:
+                start = None
+            elif start is None:
+                start = revision.at
+        return start is not None and start >= answered
 
     def must_reread(self, claim: Claim) -> bool:
         confirmed = claim.confirmed_at()

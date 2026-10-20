@@ -98,6 +98,7 @@ class SessionStartHookTests(unittest.TestCase):
             f"printf '%s\\n' invoked >> {marker}\n"
             f"exit {int(exit_code)}\n",
             encoding="utf-8",
+            newline="\n",
         )
         stub.chmod(0o755)
 

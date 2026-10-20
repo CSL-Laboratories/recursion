@@ -18,6 +18,7 @@ loop/logs/
 !.claude/hooks/
 .claude/hooks/*
 !.claude/hooks/session-start.sh
+!.claude/hooks/guard-substitution.sh
 .tmp/
 
 # Local tool binaries (downloaded, not committed): TLA+ tools for FU-03

@@ -54,6 +54,10 @@ SUBSTITUTIONS = (
     "gh pr view 1 $" + CONTINUE + "(id)",
     "python3 -m unittest <" + CONTINUE + "(echo x)",
     "gh pr view 1 >" + CONTINUE + CONTINUE + "(id)",
+    "gh pr view 1 ${ id; }",  # bash 5.3 command substitution forms
+    "gh pr view 1 ${|id;}",
+    "python3 -m unittest ${" + chr(9) + "id; }",
+    "python3 -m unittest ${" + chr(10) + "id; }",
 )
 PLAIN = (
     "gh pr view 246",

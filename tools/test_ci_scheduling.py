@@ -569,7 +569,8 @@ class ClassifierTests(unittest.TestCase):
 
     def test_docs_only_and_gate_paths(self) -> None:
         sha = "a" * 40
-        self.assertFalse(self.decide(sha, ["docs/v3/README.md", "notes.txt"]))
+        # CSL-376: docs-only diffs run the suite too.
+        self.assertTrue(self.decide(sha, ["docs/v3/README.md", "notes.txt"]))
         self.assertTrue(self.decide(sha, ["docs/v3/README.md", "tools/ci_gate.py"]))
         self.assertTrue(self.decide(sha, ["requirements-ci.txt"]))
         self.assertTrue(self.decide(sha, []))

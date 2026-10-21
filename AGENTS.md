@@ -317,6 +317,11 @@ Linear is the team's primary async channel, alongside Google Meet and Discord.
   skips READY on the head where it first sees the removal, and READY on a later head can
   add the label again. Re-add it yourself if a change needs the full matrix sooner. The
   Codex gate clears its own READY label only on a fixer pause or unresolved findings.
+- A red `watch` (stuck-thread watch) check is not a CI failure when its log shows
+  `login_skip=1` and "API rate limit exceeded": the watcher's `CODEX_TRIGGER_PAT`
+  shares its owner's GitHub API budget, and the job fails closed when that budget runs
+  out. The required checks decide. No token or workflow change for now (Lucas's
+  decision, CSL-390 comment 242120cc).
 
 Trigger CI and reviews through the Discord bot (`/ci full|run`, `/devin review
 pr:<url>|run|status`, or MCP `ci_full` / `ci_run` / `devin_review`) or the `ci:full`

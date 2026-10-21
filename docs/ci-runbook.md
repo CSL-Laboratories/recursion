@@ -58,11 +58,16 @@ Linear issue with an @mention; a GitHub mention alone is not enough.
 
 | Lever | Effect | Who |
 |---|---|---|
-| Label `claude:pause` or `hold` on a PR (any case) | The fixer and `@claude` jobs stop before checkout or reservation, and a pause added later stops the push (claude.yml:463-475, 1200-1210, 685-706); the conflict scan never selects a paused PR (conflict-scan.yml:79, 170) | Any writer; agents must never remove a pause |
-| Repository variable `CLAUDE_FIXER_PAUSE=true` | Same, for every PR (claude.yml:467, 1204; conflict-scan.yml:336-337, 396-397) | Admin |
+| Label `claude:pause` or `hold` on a PR (any case) | Checked under the `claude-<PR>` lock before checkout or reservation (claude.yml:463-475, 1200-1210; conflict-scan.yml:401-406), and rechecked by the pre-push hook, so a label added during a run still stops its push (`PauseRefused`, claude.yml:685-706; conflict-scan.yml:591-593). The scan never selects a paused PR (conflict-scan.yml:79, 170). Unreadable labels count as paused | Anyone who can label PRs; agents must never remove a pause |
+| Repository variable `CLAUDE_FIXER_PAUSE` set to exactly `true` | Every writer job checks it **at job start only** (claude.yml:467, 1204; conflict-scan.yml:336-337, 396-397). To stop a push already in flight, add the label or cancel the run | Admin |
 | Remove `ci:full` | Stops repeat Windows/macOS on later events | Human |
-| Actions → workflow → **Disable workflow** | Stops new runs of that workflow | Admin; record it on Linear |
-| Revert the PR that changed a workflow | Restores the previous behaviour | Founder merge |
+| (automatic) A fixer pause while a gate-owned `ci:full` is on the PR | `devin-review-fix` revokes only the label event the gate itself recorded; a human-added `ci:full` is never removed (`revoke_owned_ci`, claude.yml:1869-1873) | Automatic |
+| Actions → workflow → **Disable workflow** | Stops new runs of that workflow; runs already in progress continue (cancel them separately) | Admin; record it on Linear |
+| Revert the PR that changed a workflow | Restores the previous code in a normal PR that a founder merges; never force-push. Writer state kept in PR comments (attempt reservations, receipts, loop-cap and `ci:full` ownership markers) is not reverted, so set `CLAUDE_FIXER_PAUSE=true` first and check those markers after the revert | Founder merge |
+
+Writers outside this guard: `codex-gate.yml` (adds the gate-owned `ci:full` on READY) and
+`stuck-thread-watch.yml` (resolves review threads with `CODEX_TRIGGER_PAT`). Contract §7 describes
+them; `CrossLaneAdmissionTests` does not cover them.
 
 ## 6. Cost and capacity check
 
@@ -87,15 +92,20 @@ Linear issue with an @mention; a GitHub mention alone is not enough.
 - The Claude writers (`claude.yml`, `conflict-scan.yml`) must keep the properties that
   `CrossLaneAdmissionTests` (`tools/test_ci_scheduling.py`) check statically: no CI dispatch, re-run,
   ready-for-review or CI-label add (the only CI-label write is the fixer revoking a gate-owned
-  `ci:full`, `revoke_owned_ci`, claude.yml:1869-1873); a reviewed set of shell grants with exactly
-  one non-force `git push origin HEAD:refs/heads/<branch>` per writer job; one shared `claude-<PR>`
+  `ci:full`, `revoke_owned_ci`, claude.yml:1869-1873); an allow-list ceiling of shell grants with
+  exactly one non-force `git push origin HEAD:refs/heads/<branch>` per writer job; one shared `claude-<PR>`
   lock without cancellation; the eight-commit guard on the fixer and `@claude` jobs, the Devin
   path's three-attempt reservation, and the pause. A new Claude workflow, job or shell grant fails
   the test until it is reviewed there. Retry behaviour itself is tested in
-  `tools/test_claude_pr_fixer.py`.
-- **The conflict resolver has no eight-commit guard.** It pushes at most once per run (single-attempt
-  push guard, conflict-scan.yml:440) on conflicted PRs that the scan selects, on the two-hourly
-  schedule and on manual dispatch; a `master` push runs only the scan (conflict-scan.yml:10-12, 358).
+  `tools/test_claude_pr_fixer.py`. **Limit:** the push check covers the tool allow-list only. Until
+  CSL-414 moves these writers to a model-free publisher, the model jobs hold a `contents: write`
+  token and may edit and run repository code (for example `tools/ci_gate.py`), so the allow-list is
+  not a guarantee about every push the job could make.
+- **The conflict resolver has no eight-commit guard.** Its single-attempt push guard
+  (conflict-scan.yml:440) is meant to allow one push per run; until CSL-414 that is not enforced
+  against repository code the model edits and runs. The resolver runs on conflicted PRs that the
+  scan selects, on the two-hourly schedule and on manual dispatch; a `master` push runs only the
+  scan (conflict-scan.yml:10-12, 358).
   A PR that stays conflicted can get a Claude merge attempt on every scheduled scan; pause it if
   that is unwanted.
 

@@ -1,7 +1,7 @@
 # CI event-to-check contract
 
 - **Contract version:** v1 (2026-10-20)
-- **Base commit:** `17ee166e97e69af1303bb66cd742d3107ddb379a` (master, merge of #259). The CI files cited below are unchanged since `2e369a6c747a4cc10ff6fd4da98f1272697bdc2e` (merge of #253); #259 changed only `AGENTS.md` and `CLAUDE.md`. The event rows were traced at `c4cf7d8d` (#252, CSL-376); `ci.yml`, `tools/ci_gate.py` and the CI tests are unchanged since. #255 (CSL-383) and #253 (CSL-365) changed `claude.yml`, `conflict-scan.yml`, `codex-gate.yml` and `scripts/ci/`, which sections 5 and 7 cite. All `file:line` citations below are for this base.
+- **Base commit:** `adbbabbf186adb89198aa42e907d38436732f197` (master, merge of #261). The CI files cited below are unchanged since `2e369a6c747a4cc10ff6fd4da98f1272697bdc2e` (merge of #253); #259 and #261 changed only `AGENTS.md` and `CLAUDE.md`. The event rows were traced at `c4cf7d8d` (#252, CSL-376); `ci.yml`, `tools/ci_gate.py` and the CI tests are unchanged since. #255 (CSL-383) and #253 (CSL-365) changed `claude.yml`, `conflict-scan.yml`, `codex-gate.yml` and `scripts/ci/`, which sections 5 and 7 cite. All `file:line` citations below are for this base.
 - **Which workflow version runs:** a pull-request run uses the workflow file from the PR merge ref. `workflow_dispatch` and `push` use the file at the event's commit. A row applies only where that file matches this base; otherwise the behaviour depends on that version.
 - **Scope:** describes current behaviour of the GitHub Actions workflows and repository rules. It is not a policy change and grants no authority. Where behaviour looks wrong, it is listed under [Known gaps](#8-known-gaps-and-follow-ups) for a separately admitted issue.
 - **Evidence classes** (kept distinct throughout):
@@ -240,7 +240,7 @@ Their side effects do start paid CI:
 - The eight-commit guard bounds both fixer paths: `devin-review-fix` (`cap` step, `claude.yml:1188-1189`) and, since CSL-365, `claude-mention` (step `live`, `claude.yml:498-529`). An `@claude` request on a PR at the cap is skipped instead of pushing.
 - When Codex READY newly applies `ci:full`, the `labeled` event starts one windows run from `ci-full-label.yml`, plus windows on every later non-draft PR event until the label is removed. If the label is already on the PR, the gate returns `ready-present` without writing it (`scripts/ci/codex_gate.py:563-564`), so there is no `labeled` event and no extra windows run.
   - The gate removes its own label only when a fixer pause or unresolved findings block readiness on the current head (`scripts/ci/codex_gate.py:507-515`, `scripts/ci/claude_fixer_receipts.py:686`). It does not remove it on every push.
-  - A `ci:full` added by a person is never removed automatically. `AGENTS.md:239-242` (mirrored in `CLAUDE.md`) asks to remove it once its full run has passed on the current head (CSL-395, #259).
+  - A `ci:full` added by a person is never removed automatically. `AGENTS.md:239-244` (mirrored in `CLAUDE.md`) asks to remove it once its full run has passed on the current head (CSL-395, #259), and says a manual removal is a human hold: the Codex gate skips READY on the head where it first sees the removal, and READY on a later head can add the label again (CSL-403, #261).
 
 | Workflow / app | Trigger | Runner | Paid component | Lines |
 |---|---|---|---|---|

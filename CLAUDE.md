@@ -327,7 +327,7 @@ Linear is the team's primary async channel, alongside Google Meet and Discord.
   out. The required checks decide. No token or workflow change for now (Lucas's
   decision, CSL-390 comment 242120cc).
 - A new `tools/test_*.py` file also needs its two `.claude/settings.json` allow rules,
-  which a founder approves in the PR; the Claude fixer cannot add them.
+  which a founder approves in the PR; the Claude fixer must not add them.
 
 Trigger CI and reviews through the Discord bot (`/ci full|run`, `/devin review
 pr:<url>|run|status`, or MCP `ci_full` / `ci_run` / `devin_review`) or the `ci:full`

@@ -22,7 +22,7 @@ LINEAR = {f"mcp__{server}__{tool}" for server in ("linear", "Linear")
 
 
 def tool_test_rules(paths):
-    """The exact allow rules for these tools/test_*.py files, in settings.json order."""
+    """The exact allow rules for these tools/test_*.py files, sorted by file name, python then python3."""
     return [f"Bash({py} -X utf8 -B tools/{name})"
             for name in sorted(path.name for path in paths) for py in PYTHONS]
 
@@ -32,11 +32,11 @@ def missing_rules_message(missing):
     lines = "\n".join(f"      {json.dumps(rule)}," for rule in missing)
     return ("Add these allow rules to .claude/settings.json for the new tools/test_*.py "
             "files:\n" + lines + "\n.claude/settings.json is the agent permission policy, "
-            "so a founder approves these lines in the PR; the Claude fixer cannot add them.")
+            "so a founder approves these lines in the PR; the Claude fixer must not add them.")
 
 
-# Script tests are allowed one exact rule each; a new tools/test_*.py fails this
-# guard until its rule is added on purpose.
+# Script tests are allowed two exact rules each (python and python3); a new
+# tools/test_*.py fails this guard until its rules are added on purpose.
 TOOL_TEST_PATHS = tuple((ROOT / "tools").glob("test_*.py"))
 TOOL_TESTS = set(tool_test_rules(TOOL_TEST_PATHS))
 ALLOW = (
@@ -120,9 +120,8 @@ class PolicyTests(unittest.TestCase):
         self.assertNotIn("defaultMode", permissions)
 
     def test_missing_tool_test_rules_are_named_for_a_founder(self):
-        allow = settings()["permissions"]["allow"]
-        paths = TOOL_TEST_PATHS + (ROOT / "tools" / "test_example.py",)
-        missing = [rule for rule in tool_test_rules(paths) if rule not in allow]
+        # Only the synthetic file, so a real new tools test fails only the policy test above.
+        missing = tool_test_rules([ROOT / "tools" / "test_example.py"])
         expected = ['      "Bash(python -X utf8 -B tools/test_example.py)",',
                     '      "Bash(python3 -X utf8 -B tools/test_example.py)",']
         self.assertEqual(len(missing), 2)

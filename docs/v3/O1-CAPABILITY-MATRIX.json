@@ -1,0 +1,1318 @@
+{
+  "schema": "o1-capability-matrix/v0.1-draft",
+  "status": "draft",
+  "version": "0.1.0-draft",
+  "target_checkpoint": "2026-11-12",
+  "receipt_rule": "H",
+  "pillars": [
+    "native_harness",
+    "upstream_byok_local_intelligence",
+    "configuration",
+    "plugins",
+    "nodes",
+    "clients_cli_tui_gui_mobile",
+    "context_compaction",
+    "persistent_assistants",
+    "performance",
+    "privacy_security_authority",
+    "verification",
+    "update_rollback_release_operations"
+  ],
+  "tiers_proposed": [
+    "researched",
+    "human_decided",
+    "contract_frozen",
+    "prototyped",
+    "implemented",
+    "provider_free_verified",
+    "locally_qualified",
+    "release_qualified"
+  ],
+  "evidence_classes_proposed": [
+    "source_documented",
+    "locally_observed",
+    "inferred",
+    "unmeasured"
+  ],
+  "dispositions_proposed": [
+    "unmet",
+    "blocked",
+    "no-release-claim"
+  ],
+  "rows": [
+    {
+      "id": "CAP-001",
+      "pillar": "native_harness",
+      "capability": "Deterministic Execution Kernel & Monotonic Fencing",
+      "journeys": [
+        "J1",
+        "J3",
+        "J5"
+      ],
+      "modes": {
+        "native_only": true,
+        "upstream_only": false,
+        "combined": true
+      },
+      "actor_start_state": "Initialized task node with assigned task ID and goal authority envelope",
+      "useful_endpoint": "Single-writer canonical event log with monotonic fence tokens rejecting stale or partitioned writers",
+      "source_config_route_platform": "Core kernel, local ext4/NTFS storage engine per D-028 (store unselected; SQLite is unrun challenger per PRODUCT.md), Linux LTS and Windows 11",
+      "allowed_effects": "State store mutations, event log append, local file lock acquisition",
+      "fault_recovery_case": "Partitioned or crashed worker attempts write with stale token; kernel detects fence breach, aborts write, logs security alert",
+      "current_maturity": "contract_frozen",
+      "target": null,
+      "disposition": null,
+      "disposition_status": "pending-H",
+      "packaging_default_activation": "core-default",
+      "claim_permission": "none",
+      "dependencies": [
+        "D-020",
+        "D-028",
+        "OR-018"
+      ],
+      "evidence": [
+        {
+          "evidence_class": "source_documented",
+          "ref": "docs/v3/M1B-CONSTRUCTION-CAMPAIGN.md",
+          "notes": "Frozen contract specification for kernel and monotonic fencing"
+        }
+      ],
+      "unknowns": [
+        "Recovery latency on NTFS under high-concurrency lock contention"
+      ],
+      "withdrawn": false
+    },
+    {
+      "id": "CAP-002",
+      "pillar": "native_harness",
+      "capability": "Native Model-and-Tool Loop",
+      "journeys": [
+        "J1",
+        "J4",
+        "J6"
+      ],
+      "modes": {
+        "native_only": true,
+        "upstream_only": false,
+        "combined": true
+      },
+      "actor_start_state": "ARM executive dispatched with bounded WorkPacket and tool permission grant",
+      "useful_endpoint": "Locally reasoned diff generation and tool execution without external CLI invocation",
+      "source_config_route_platform": "Native reasoning loop, direct BYOK / local model endpoints",
+      "allowed_effects": "Local filesystem reads/writes within assigned worktree, local test execution",
+      "fault_recovery_case": "Local model generates malformed tool call; native loop parses syntax error, adds error context to prompt, retries within novel turn budget",
+      "current_maturity": "researched",
+      "target": null,
+      "disposition": null,
+      "disposition_status": "pending-H",
+      "packaging_default_activation": "core-default",
+      "claim_permission": "none",
+      "dependencies": [
+        "D-018",
+        "OR-022"
+      ],
+      "evidence": [],
+      "unknowns": [
+        "Local small-model adherence to strict tool-calling schemas without fine-tuning"
+      ],
+      "withdrawn": false
+    },
+    {
+      "id": "CAP-003",
+      "pillar": "native_harness",
+      "capability": "Process Runner & Subprocess Supervisor",
+      "journeys": [
+        "J1",
+        "J3",
+        "J4"
+      ],
+      "modes": {
+        "native_only": true,
+        "upstream_only": true,
+        "combined": true
+      },
+      "actor_start_state": "Runner initialized with execution environment and temporary working directory",
+      "useful_endpoint": "Subprocess execution with stdio pipe capture and exit code handling; process group supervision and strict cwd sandboxing remain unmet guarantees on Windows/Linux",
+      "source_config_route_platform": "scripts/v3/harness/run.py, Linux/Windows subprocess",
+      "allowed_effects": "Process spawn, stdio pipe capture, signal delivery (SIGTERM/SIGKILL)",
+      "fault_recovery_case": "Child process hangs or times out; run_task terminates subprocess and records failure; full process tree kill remains an unmet OS guarantee",
+      "current_maturity": "implemented",
+      "target": null,
+      "disposition": null,
+      "disposition_status": "pending-H",
+      "packaging_default_activation": "core-default",
+      "claim_permission": "none",
+      "dependencies": [
+        "D-022",
+        "CSL-27",
+        "CSL-82"
+      ],
+      "evidence": [
+        {
+          "evidence_class": "source_documented",
+          "ref": "scripts/tests/v3/harness/ops.test.py",
+          "notes": "Tests basic CLI lifecycle (land, clean, logs); does not establish strict sandboxing or OS process group hierarchies"
+        }
+      ],
+      "unknowns": [
+        "Windows process tree termination reliability across complex CLI shims; strict sandboxing implementation"
+      ],
+      "withdrawn": false
+    },
+    {
+      "id": "CAP-004",
+      "pillar": "upstream_byok_local_intelligence",
+      "capability": "Codex App Server Upstream Adapter",
+      "journeys": [
+        "J1",
+        "J2",
+        "J6"
+      ],
+      "modes": {
+        "native_only": false,
+        "upstream_only": true,
+        "combined": true
+      },
+      "actor_start_state": "Authenticated codex binary available on PATH; user subscription active",
+      "useful_endpoint": "JSON-RPC stdio protocol session enabling structured steering, resume, and review",
+      "source_config_route_platform": "codex app-server --listen stdio://, Windows 11 / Linux",
+      "allowed_effects": "External process execution, stdio streaming, cumulative token tracking",
+      "fault_recovery_case": "Codex reports turn cumulative tokens exceeding window; adapter detects non-window counter and prevents double-counting per CSL-27",
+      "current_maturity": "researched",
+      "target": null,
+      "disposition": null,
+      "disposition_status": "pending-H",
+      "packaging_default_activation": "opt-in-plugin",
+      "claim_permission": "none",
+      "dependencies": [
+        "D-023",
+        "CSL-82"
+      ],
+      "evidence": [
+        {
+          "evidence_class": "source_documented",
+          "ref": "docs/v3/harness/CSL-82.md",
+          "notes": "Specification for Codex App Server protocol binding and stdio transport"
+        }
+      ],
+      "unknowns": [
+        "Protocol stability between Codex app-server versions"
+      ],
+      "withdrawn": false
+    },
+    {
+      "id": "CAP-005",
+      "pillar": "upstream_byok_local_intelligence",
+      "capability": "Headless CLI Upstream Adapters (Claude, Grok, Gemini, Cursor, OpenCode)",
+      "journeys": [
+        "J1",
+        "J4",
+        "J6"
+      ],
+      "modes": {
+        "native_only": false,
+        "upstream_only": true,
+        "combined": true
+      },
+      "actor_start_state": "User-authenticated CLI tools installed locally; credentials held exclusively in user domain",
+      "useful_endpoint": "Headless stream-json turn execution without credential capture or token intermediation",
+      "source_config_route_platform": "scripts/v3/harness/providers.py, Linux / Windows",
+      "allowed_effects": "Subprocess execution with isolated --cwd and output token redaction",
+      "fault_recovery_case": "CLI returns exit 1 while loggedIn: true (CSL-27); adapter inspects parsed JSON status instead of raw process exit code",
+      "current_maturity": "implemented",
+      "target": null,
+      "disposition": null,
+      "disposition_status": "pending-H",
+      "packaging_default_activation": "opt-in-plugin",
+      "claim_permission": "none",
+      "dependencies": [
+        "D-021",
+        "D-030",
+        "OR-026",
+        "CSL-27",
+        "CSL-82"
+      ],
+      "evidence": [
+        {
+          "evidence_class": "source_documented",
+          "ref": "scripts/tests/v3/harness/harness.test.py",
+          "notes": "Verifies ClaudeHeadlessProvider, CodexExecProvider, and GrokHeadlessProvider headless driving"
+        }
+      ],
+      "unknowns": [
+        "Unannounced upstream CLI flag syntax changes"
+      ],
+      "withdrawn": false
+    },
+    {
+      "id": "CAP-005b",
+      "pillar": "upstream_byok_local_intelligence",
+      "capability": "Nous Research Hermes Agent Upstream Adapter (OR-026 launch-critical route)",
+      "journeys": [
+        "J1",
+        "J4",
+        "J6"
+      ],
+      "modes": {
+        "native_only": false,
+        "upstream_only": true,
+        "combined": true
+      },
+      "actor_start_state": "User-authenticated Hermes environment configured locally",
+      "useful_endpoint": "Hermes agent turn delegation without credential custody",
+      "source_config_route_platform": "scripts/v3/harness/providers.py (route unbuilt)",
+      "allowed_effects": "Subprocess dispatch, stdout capture",
+      "fault_recovery_case": "Route unavailable; governor logs missing adapter and offers class-consistent alternative",
+      "current_maturity": "researched",
+      "target": null,
+      "disposition": null,
+      "disposition_status": "pending-H",
+      "packaging_default_activation": "opt-in-plugin",
+      "claim_permission": "none",
+      "dependencies": [
+        "OR-026",
+        "D-021"
+      ],
+      "evidence": [],
+      "unknowns": [
+        "Hermes headless CLI flags and protocol stability"
+      ],
+      "withdrawn": false
+    },
+    {
+      "id": "CAP-006",
+      "pillar": "upstream_byok_local_intelligence",
+      "capability": "BYOK & Local Model Direct Transport",
+      "journeys": [
+        "J1",
+        "J6"
+      ],
+      "modes": {
+        "native_only": true,
+        "upstream_only": false,
+        "combined": true
+      },
+      "actor_start_state": "Developer configures private API key or local endpoint (Ollama/vLLM)",
+      "useful_endpoint": "Direct model execution without vendor CLI wrappers or subscription reliance",
+      "source_config_route_platform": "config/harness.json, local HTTP / OpenAI-compatible API",
+      "allowed_effects": "Outbound HTTP requests to declared endpoint, local inference streaming",
+      "fault_recovery_case": "Local inference server runs out of VRAM; transport catches HTTP 500/OOM and routes to CPU or pauses cleanly",
+      "current_maturity": "researched",
+      "target": null,
+      "disposition": null,
+      "disposition_status": "pending-H",
+      "packaging_default_activation": "core-default",
+      "claim_permission": "none",
+      "dependencies": [
+        "D-018",
+        "OR-022"
+      ],
+      "evidence": [],
+      "unknowns": [
+        "Token output latency variance under quantized local weights"
+      ],
+      "withdrawn": false
+    },
+    {
+      "id": "CAP-007",
+      "pillar": "configuration",
+      "capability": "Hierarchical Configuration Engine",
+      "journeys": [
+        "J1",
+        "J6"
+      ],
+      "modes": {
+        "native_only": true,
+        "upstream_only": true,
+        "combined": true
+      },
+      "actor_start_state": "Repository or user config files present on filesystem",
+      "useful_endpoint": "Flat configuration loading and schema validation from a single file (scripts/v3/harness/config.py); hierarchical parent/project configuration resolution and non-widening limit enforcement remain unbuilt/unmet requirements",
+      "source_config_route_platform": "scripts/v3/harness/config.py (reads single file, copies declared budgets without parent comparison), config/harness.json, schema version 1",
+      "allowed_effects": "In-memory configuration object compilation",
+      "fault_recovery_case": "Flat configuration fails JSON schema or contains secret keys/unknown adapters; validator raises HarnessError before admission. Hierarchical rejection of widened project spending limits is currently unmet.",
+      "current_maturity": "implemented",
+      "target": null,
+      "disposition": null,
+      "disposition_status": "pending-H",
+      "packaging_default_activation": "core-default",
+      "claim_permission": "none",
+      "dependencies": [
+        "CSL-83",
+        "OR-023",
+        "OR-039"
+      ],
+      "evidence": [
+        {
+          "evidence_class": "source_documented",
+          "ref": "scripts/tests/v3/harness/harness.test.py",
+          "notes": "Validates flat load_config, validate_config, and starter_config against single schema; hierarchical resolution across parent/project configs and non-widening limit enforcement are not implemented or tested"
+        }
+      ],
+      "unknowns": [
+        "Hierarchical configuration inheritance semantics across workspace boundaries",
+        "Hot-reload propagation semantics across long-lived daemon sessions"
+      ],
+      "withdrawn": false
+    },
+    {
+      "id": "CAP-008",
+      "pillar": "configuration",
+      "capability": "Safe CLI Configuration Editor",
+      "journeys": [
+        "J1",
+        "J5"
+      ],
+      "modes": {
+        "native_only": true,
+        "upstream_only": true,
+        "combined": true
+      },
+      "actor_start_state": "Operator invokes CLI to inspect or modify route parameters",
+      "useful_endpoint": "Zero-model, human-readable configuration inspection and atomic file updates",
+      "source_config_route_platform": "Recursion CLI config subcommand, local JSON",
+      "allowed_effects": "Atomic write of configuration files with backup",
+      "fault_recovery_case": "Malformed JSON entered during edit; editor detects schema violation, refuses write, preserves backup",
+      "current_maturity": "researched",
+      "target": null,
+      "disposition": null,
+      "disposition_status": "pending-H",
+      "packaging_default_activation": "core-default",
+      "claim_permission": "none",
+      "dependencies": [
+        "OR-023",
+        "docs/v3/CLI.md"
+      ],
+      "evidence": [],
+      "unknowns": [
+        "Concurrent CLI edit conflict resolution"
+      ],
+      "withdrawn": false
+    },
+    {
+      "id": "CAP-009",
+      "pillar": "plugins",
+      "capability": "External Plugin Isolation & Capability Compiler",
+      "journeys": [
+        "J1",
+        "J3"
+      ],
+      "modes": {
+        "native_only": true,
+        "upstream_only": true,
+        "combined": true
+      },
+      "actor_start_state": "Plugin manifest declared in configuration with SHA-256 digest lockfile",
+      "useful_endpoint": "Sandboxed plugin execution with explicit permission graphs and failure containment",
+      "source_config_route_platform": "Plugin engine, external plugin repositories per D-035",
+      "allowed_effects": "Scoped plugin execution within declared capabilities",
+      "fault_recovery_case": "Plugin crashes or violates memory bounds; kernel quarantines plugin while parent workflow continues",
+      "current_maturity": "researched",
+      "target": null,
+      "disposition": null,
+      "disposition_status": "pending-H",
+      "packaging_default_activation": "opt-in-plugin",
+      "claim_permission": "none",
+      "dependencies": [
+        "D-035",
+        "OR-029"
+      ],
+      "evidence": [],
+      "unknowns": [
+        "Cross-platform sandboxing performance overhead on Windows"
+      ],
+      "withdrawn": false
+    },
+    {
+      "id": "CAP-010",
+      "pillar": "plugins",
+      "capability": "Autonomous Research Plugin",
+      "journeys": [
+        "J1"
+      ],
+      "modes": {
+        "native_only": true,
+        "upstream_only": true,
+        "combined": true
+      },
+      "actor_start_state": "Operator explicitly enables research plugin with finite budget envelope",
+      "useful_endpoint": "Evidence-grounded research synthesis without standing executive or unmetered inference",
+      "source_config_route_platform": "Plugin system, Parallel Search / Context7 MCP APIs",
+      "allowed_effects": "Web queries, citation synthesis, decision packet generation",
+      "fault_recovery_case": "Research quota reaches approved budget cap; plugin immediately halts and records blocker without overrun",
+      "current_maturity": "researched",
+      "target": null,
+      "disposition": null,
+      "disposition_status": "pending-H",
+      "packaging_default_activation": "opt-in-plugin",
+      "claim_permission": "none",
+      "dependencies": [
+        "D-025",
+        "OR-013"
+      ],
+      "evidence": [],
+      "unknowns": [
+        "Automated source contradiction reconciliation fidelity"
+      ],
+      "withdrawn": false
+    },
+    {
+      "id": "CAP-011",
+      "pillar": "nodes",
+      "capability": "Single-Node Canonical Writer",
+      "journeys": [
+        "J3",
+        "J5"
+      ],
+      "modes": {
+        "native_only": true,
+        "upstream_only": true,
+        "combined": true
+      },
+      "actor_start_state": "Single coordinator daemon running on local host",
+      "useful_endpoint": "Zero-consensus core execution preserving strict one-writer correctness",
+      "source_config_route_platform": "Local coordinator daemon, Linux/Windows, local filesystem storage per D-028 (store unselected)",
+      "allowed_effects": "Local filesystem state persistence",
+      "fault_recovery_case": "Coordinator process killed; local storage engine recovers canonical state on restart without split-brain risk",
+      "current_maturity": "contract_frozen",
+      "target": null,
+      "disposition": null,
+      "disposition_status": "pending-H",
+      "packaging_default_activation": "core-default",
+      "claim_permission": "none",
+      "dependencies": [
+        "D-020",
+        "OR-018"
+      ],
+      "evidence": [
+        {
+          "evidence_class": "source_documented",
+          "ref": "docs/v3/M1B-CONSTRUCTION-CAMPAIGN.md",
+          "notes": "Single-writer architecture and monotonic epoch contract specification"
+        }
+      ],
+      "unknowns": [
+        "Maximum concurrent active ARM leases supported on low-spec VPS"
+      ],
+      "withdrawn": false
+    },
+    {
+      "id": "CAP-012",
+      "pillar": "nodes",
+      "capability": "Multi-Node Execution Fabric & Worker Leases",
+      "journeys": [
+        "J3",
+        "J5"
+      ],
+      "modes": {
+        "native_only": true,
+        "upstream_only": false,
+        "combined": true
+      },
+      "actor_start_state": "Remote execution nodes enrolled with zero-token preflight authentication",
+      "useful_endpoint": "Distributed task stage execution across Windows and Linux worker nodes",
+      "source_config_route_platform": "Hub-and-spoke authenticated network protocol",
+      "allowed_effects": "Remote command dispatch, artifact streaming, lease renewal",
+      "fault_recovery_case": "Remote worker disconnects during compilation; coordinator reassigns task stage to local node",
+      "current_maturity": "researched",
+      "target": null,
+      "disposition": null,
+      "disposition_status": "pending-H",
+      "packaging_default_activation": "opt-in-plugin",
+      "claim_permission": "none",
+      "dependencies": [
+        "OR-025",
+        "D-020"
+      ],
+      "evidence": [],
+      "unknowns": [
+        "Cross-platform path translation edge cases between Windows and Linux nodes"
+      ],
+      "withdrawn": false
+    },
+    {
+      "id": "CAP-013",
+      "pillar": "nodes",
+      "capability": "Automatic Node Takeover Plugin",
+      "journeys": [
+        "J5"
+      ],
+      "modes": {
+        "native_only": true,
+        "upstream_only": false,
+        "combined": true
+      },
+      "actor_start_state": "High-availability edition configured with multiple standby nodes",
+      "useful_endpoint": "Automatic coordinator election and state takeover upon primary node loss",
+      "source_config_route_platform": "Replicated state plugin; coordinator election / consensus mechanism unselected (Raft is an unselected proposal)",
+      "allowed_effects": "Coordinator promotion, epoch increment, lease invalidation",
+      "fault_recovery_case": "Primary node network partitioned; secondary node increments epoch, acquires fence, resumes writing safely",
+      "current_maturity": "researched",
+      "target": null,
+      "disposition": null,
+      "disposition_status": "pending-H",
+      "packaging_default_activation": "opt-in-plugin",
+      "claim_permission": "none",
+      "dependencies": [
+        "D-020"
+      ],
+      "evidence": [],
+      "unknowns": [
+        "Heartbeat timeout calibration under intermittent public cloud latency"
+      ],
+      "withdrawn": false
+    },
+    {
+      "id": "CAP-014",
+      "pillar": "clients_cli_tui_gui_mobile",
+      "capability": "Interactive Detachable Terminal CLI/TUI",
+      "journeys": [
+        "J1",
+        "J3",
+        "J5"
+      ],
+      "modes": {
+        "native_only": true,
+        "upstream_only": true,
+        "combined": true
+      },
+      "actor_start_state": "User launches terminal on Linux or Windows console",
+      "useful_endpoint": "Full 10-control interactive operations with detachable multi-window sessions",
+      "source_config_route_platform": "Terminal runtime, ANSI / Windows console subsystem",
+      "allowed_effects": "Terminal display rendering, user keyboard input ingestion",
+      "fault_recovery_case": "Terminal emulator crashes; background task continues running; user re-attaches via fresh terminal",
+      "current_maturity": "researched",
+      "target": null,
+      "disposition": null,
+      "disposition_status": "pending-H",
+      "packaging_default_activation": "core-default",
+      "claim_permission": "none",
+      "dependencies": [
+        "OR-012",
+        "OR-023"
+      ],
+      "evidence": [],
+      "unknowns": [
+        "Neovim and tmux nested terminal multiplexer escape sequence handling"
+      ],
+      "withdrawn": false
+    },
+    {
+      "id": "CAP-015",
+      "pillar": "clients_cli_tui_gui_mobile",
+      "capability": "Desktop GUI Client",
+      "journeys": [
+        "J1",
+        "J4",
+        "J5"
+      ],
+      "modes": {
+        "native_only": true,
+        "upstream_only": true,
+        "combined": true
+      },
+      "actor_start_state": "User launches desktop GUI application on Windows, Linux, or macOS",
+      "useful_endpoint": "Visual management of goals, ARM executives, and diff reviews over core daemon",
+      "source_config_route_platform": "Desktop client, toolkit unselected (A5 decision open per D-038)",
+      "allowed_effects": "IPC connection to local daemon, GUI window rendering",
+      "fault_recovery_case": "GUI window killed; daemon state unaffected; user can immediately continue from CLI",
+      "current_maturity": "researched",
+      "target": null,
+      "disposition": null,
+      "disposition_status": "pending-H",
+      "packaging_default_activation": "built-opt-in",
+      "claim_permission": "none",
+      "dependencies": [
+        "D-038",
+        "D-019",
+        "OR-021"
+      ],
+      "evidence": [],
+      "unknowns": [
+        "Toolkit selection (architecture decision A5 pending founder ruling per D-038/D-041; not DQ-01 which governs maturity vocabulary)"
+      ],
+      "withdrawn": false
+    },
+    {
+      "id": "CAP-016",
+      "pillar": "clients_cli_tui_gui_mobile",
+      "capability": "Mobile Client & Online-Only Private View",
+      "journeys": [
+        "J1",
+        "J2",
+        "J3",
+        "J4",
+        "J5",
+        "J6"
+      ],
+      "modes": {
+        "native_only": true,
+        "upstream_only": true,
+        "combined": true
+      },
+      "actor_start_state": "User connects mobile device via authenticated tunnel",
+      "useful_endpoint": "Remote monitoring, steering, and approval without offline data leaks",
+      "source_config_route_platform": "Mobile client, iOS / Android advisory stack per D-039",
+      "allowed_effects": "Authenticated read-only event streaming, steering command submission",
+      "fault_recovery_case": "Mobile device disconnects; client purges cached private views immediately; re-authentication required on reconnect",
+      "current_maturity": "researched",
+      "target": null,
+      "disposition": null,
+      "disposition_status": "pending-H",
+      "packaging_default_activation": "built-opt-in",
+      "claim_permission": "none",
+      "dependencies": [
+        "D-036",
+        "D-038",
+        "D-039"
+      ],
+      "evidence": [],
+      "unknowns": [
+        "Push notification latency and security boundaries"
+      ],
+      "withdrawn": false
+    },
+    {
+      "id": "CAP-017",
+      "pillar": "clients_cli_tui_gui_mobile",
+      "capability": "Surface Control-Point Broker (approve/stop/steer/resume)",
+      "journeys": [
+        "J1",
+        "J2",
+        "J3",
+        "J4",
+        "J5",
+        "J6"
+      ],
+      "modes": {
+        "native_only": true,
+        "upstream_only": true,
+        "combined": true
+      },
+      "actor_start_state": "Control command dispatched from any client surface",
+      "useful_endpoint": "Uniform routing of control points with explicit not-offered or unknown status on unsupported/unverified surfaces",
+      "source_config_route_platform": "Process broker control API",
+      "allowed_effects": "Halt, resume, directive injection across active executors",
+      "fault_recovery_case": "Mobile client requests Full Stop; broker returns structured status indicating mobile full stop command supervision is unresolved pending empirical evidence/decision",
+      "current_maturity": "researched",
+      "target": null,
+      "disposition": null,
+      "disposition_status": "pending-H",
+      "packaging_default_activation": "core-default",
+      "claim_permission": "none",
+      "dependencies": [
+        "D-022",
+        "OR-028"
+      ],
+      "evidence": [],
+      "unknowns": [
+        "Race condition between simultaneous Stop signals from CLI and GUI"
+      ],
+      "withdrawn": false
+    },
+    {
+      "id": "CAP-018",
+      "pillar": "context_compaction",
+      "capability": "Model-Independent Context Capsules",
+      "journeys": [
+        "J1",
+        "J2"
+      ],
+      "modes": {
+        "native_only": true,
+        "upstream_only": true,
+        "combined": true
+      },
+      "actor_start_state": "Active execution turn completing or approaching token thresholds",
+      "useful_endpoint": "Content-addressed Context Capsule preserving OwnerIntent, GoalSpec, constraints, and verified diffs",
+      "source_config_route_platform": "Context engine, local storage engine (storage technology unselected; SQLite/CAS is an unselected candidate proposal)",
+      "allowed_effects": "Capsule artifact creation, metadata indexing",
+      "fault_recovery_case": "Capsule integrity check fails hash verification; system rejects corrupt capsule and re-synthesizes from raw log",
+      "current_maturity": "researched",
+      "target": null,
+      "disposition": null,
+      "disposition_status": "pending-H",
+      "packaging_default_activation": "core-default",
+      "claim_permission": "none",
+      "dependencies": [
+        "OR-030",
+        "OR-034"
+      ],
+      "evidence": [],
+      "unknowns": [
+        "Context Capsule serialization latency on large codebases"
+      ],
+      "withdrawn": false
+    },
+    {
+      "id": "CAP-019",
+      "pillar": "context_compaction",
+      "capability": "Hybrid Adaptive Compactor",
+      "journeys": [
+        "J2"
+      ],
+      "modes": {
+        "native_only": true,
+        "upstream_only": true,
+        "combined": true
+      },
+      "actor_start_state": "Conversation history exceeds context window or upstream session is lost",
+      "useful_endpoint": "Distilled context payload reducing token overhead while preserving exact task constraints",
+      "source_config_route_platform": "Compaction service, deterministic filtering rules",
+      "allowed_effects": "In-memory message buffer compression",
+      "fault_recovery_case": "Compactor discards a user negative constraint; invariant checker halts rehydration before turn dispatch",
+      "current_maturity": "researched",
+      "target": null,
+      "disposition": null,
+      "disposition_status": "pending-H",
+      "packaging_default_activation": "opt-in-plugin",
+      "claim_permission": "none",
+      "dependencies": [
+        "OR-030",
+        "OR-034",
+        "D-019"
+      ],
+      "evidence": [],
+      "unknowns": [
+        "Optimal compaction ratio balancing prompt token savings against semantic fidelity"
+      ],
+      "withdrawn": false
+    },
+    {
+      "id": "CAP-020",
+      "pillar": "persistent_assistants",
+      "capability": "Recursion Head Executive",
+      "journeys": [
+        "J1",
+        "J5"
+      ],
+      "modes": {
+        "native_only": true,
+        "upstream_only": true,
+        "combined": true
+      },
+      "actor_start_state": "System startup; primary user channel initiated",
+      "useful_endpoint": "Strategic continuity, high-level goal framing, and ARM executive lifecycle management",
+      "source_config_route_platform": "Recursion Head runtime, #general conversation topic",
+      "allowed_effects": "GoalSpec compilation, ARM spawning, budget allocation",
+      "fault_recovery_case": "Head process restarts; restores active ARM registry and goal tree from canonical store without token burn",
+      "current_maturity": "researched",
+      "target": null,
+      "disposition": null,
+      "disposition_status": "pending-H",
+      "packaging_default_activation": "core-default",
+      "claim_permission": "none",
+      "dependencies": [
+        "OR-016",
+        "OR-027",
+        "OR-038"
+      ],
+      "evidence": [],
+      "unknowns": [
+        "Multi-topic synchronization complexity when user directs multiple ARMs concurrently"
+      ],
+      "withdrawn": false
+    },
+    {
+      "id": "CAP-021",
+      "pillar": "persistent_assistants",
+      "capability": "Goal-Scoped ARM Executives",
+      "journeys": [
+        "J1",
+        "J4",
+        "J6"
+      ],
+      "modes": {
+        "native_only": true,
+        "upstream_only": true,
+        "combined": true
+      },
+      "actor_start_state": "Assigned GoalSpec and exclusive worktree workspace",
+      "useful_endpoint": "Tactical implementation planning, bounded delegation, and review branch creation",
+      "source_config_route_platform": "ARM executive runtime, dedicated addressable topic",
+      "allowed_effects": "Task DAG generation, subagent delegation, worktree branch git commits",
+      "fault_recovery_case": "ARM implementation plan fails test gate repeatedly; ARM replans within novel turn limit or escalates to Head",
+      "current_maturity": "researched",
+      "target": null,
+      "disposition": null,
+      "disposition_status": "pending-H",
+      "packaging_default_activation": "core-default",
+      "claim_permission": "none",
+      "dependencies": [
+        "OR-002",
+        "OR-027"
+      ],
+      "evidence": [],
+      "unknowns": [
+        "Heuristic replanning bounds preventing cycling on stubborn test failures"
+      ],
+      "withdrawn": false
+    },
+    {
+      "id": "CAP-022",
+      "pillar": "persistent_assistants",
+      "capability": "Questionnaire-Assistant Collaboration",
+      "journeys": [
+        "J1",
+        "J5"
+      ],
+      "modes": {
+        "native_only": true,
+        "upstream_only": true,
+        "combined": true
+      },
+      "actor_start_state": "Vague user intent submitted via interactive channel",
+      "useful_endpoint": "Grill-me requirement refinement consulting Head across sessions to produce accepted GoalSpec",
+      "source_config_route_platform": "Questionnaire assistant runtime, interactive CLI/TUI",
+      "allowed_effects": "Clarification prompt generation, GoalSpec proposal drafting",
+      "fault_recovery_case": "User abandons questionnaire midway; draft state saved as unadmitted proposal without consuming quota",
+      "current_maturity": "researched",
+      "target": null,
+      "disposition": null,
+      "disposition_status": "pending-H",
+      "packaging_default_activation": "core-default",
+      "claim_permission": "none",
+      "dependencies": [
+        "OR-038",
+        "docs/v3/PRODUCT.md"
+      ],
+      "evidence": [],
+      "unknowns": [
+        "Threshold for automated intent clarification versus immediate execution"
+      ],
+      "withdrawn": false
+    },
+    {
+      "id": "CAP-023",
+      "pillar": "performance",
+      "capability": "Responsiveness & Subscription Efficiency Governor",
+      "journeys": [
+        "J1",
+        "J6"
+      ],
+      "modes": {
+        "native_only": true,
+        "upstream_only": true,
+        "combined": true
+      },
+      "actor_start_state": "Turn execution request submitted to routing layer",
+      "useful_endpoint": "Deterministic capability filtering, user weights and preference ordering (scripts/v3/harness/routing.py), provider cooldown tracking (scripts/v3/harness/cooldowns.py), and pre-call/post-call token ceiling and known-budget checks (scripts/v3/harness/usage.py); OR-024 Pareto ranking and full-vector optimization across responsiveness, subscription efficiency, and completion measurements remain unmet requirements",
+      "source_config_route_platform": "scripts/v3/harness/routing.py (capability filtering, user weight/preference ordering), scripts/v3/harness/cooldowns.py (cooldown tracking), scripts/v3/harness/usage.py (token ceiling and known-budget checks)",
+      "allowed_effects": "Turn admission, route reordering by user weights/preference, call refusal on known budget breach, cooldown reset recording",
+      "fault_recovery_case": "Provider in cooldown or unavailable: dispatch skips it, records the attempt, and tries the next capable provider in weight/preference order. A call that would exceed a known budget or token ceiling stops dispatch with a budget result, without falling back (scripts/v3/harness/run.py). Full-vector Pareto ranking under OR-024 is unmet.",
+      "current_maturity": "implemented",
+      "target": null,
+      "disposition": null,
+      "disposition_status": "pending-H",
+      "packaging_default_activation": "core-default",
+      "claim_permission": "none",
+      "dependencies": [
+        "OR-024",
+        "CSL-83"
+      ],
+      "evidence": [
+        {
+          "evidence_class": "source_documented",
+          "ref": "scripts/tests/v3/harness/harness.test.py",
+          "notes": "Verifies capable_providers, select_route, provider cooldowns, and usage limit enforcement; OR-024 Pareto ranking and full-vector optimization across responsiveness, subscription efficiency, and completion are not implemented or tested"
+        }
+      ],
+      "unknowns": [
+        "Token estimation accuracy across varied provider tokenizers",
+        "Empirical responsiveness and completion metrics needed for OR-024 Pareto optimization"
+      ],
+      "withdrawn": false
+    },
+    {
+      "id": "CAP-024",
+      "pillar": "performance",
+      "capability": "Resource Discipline & Host Floor Enforcement",
+      "journeys": [
+        "J1",
+        "J6"
+      ],
+      "modes": {
+        "native_only": true,
+        "upstream_only": true,
+        "combined": true
+      },
+      "actor_start_state": "Daemon running on host workstation or VPS",
+      "useful_endpoint": "Continuous monitoring of CPU, RAM, disk space, and open handles against platform floors",
+      "source_config_route_platform": "Resource governor, Linux cgroups v2 / Windows job objects",
+      "allowed_effects": "Task concurrency throttle, worker memory capping",
+      "fault_recovery_case": "Available disk space drops below 2GB; governor pauses new work admissions and alerts operator",
+      "current_maturity": "researched",
+      "target": null,
+      "disposition": null,
+      "disposition_status": "pending-H",
+      "packaging_default_activation": "core-default",
+      "claim_permission": "none",
+      "dependencies": [
+        "D-028",
+        "OR-035"
+      ],
+      "evidence": [],
+      "unknowns": [
+        "cgroup v2 enforcement portability on non-systemd Linux environments"
+      ],
+      "withdrawn": false
+    },
+    {
+      "id": "CAP-025",
+      "pillar": "privacy_security_authority",
+      "capability": "Credential Non-Intermediation & Delegation Boundary (D-021; D-029 Unmet Seam)",
+      "journeys": [
+        "J1",
+        "J4"
+      ],
+      "modes": {
+        "native_only": true,
+        "upstream_only": true,
+        "combined": true
+      },
+      "actor_start_state": "Upstream route invoked requiring authentication",
+      "useful_endpoint": "Execution through user-authenticated CLIs with output token redaction and zero credential relay (policy non-intermediation per D-021); environment isolation and operator-provisioned trusted launch boundary outside Recursion's domain (D-029) remain unmet design requirements (subprocess runner inherits environment without env filtering)",
+      "source_config_route_platform": "Output token redaction filter, subprocess runner (inherits environment; environment isolation unbuilt), operator launch boundary",
+      "allowed_effects": "Sanitized command execution, stdout/stderr token redaction filter",
+      "fault_recovery_case": "CLI output emits raw authorization token; redaction filter intercepts token before log persistence; same-user process isolation remains unproved without D-029 boundary",
+      "current_maturity": "implemented",
+      "target": null,
+      "disposition": null,
+      "disposition_status": "pending-H",
+      "packaging_default_activation": "core-default",
+      "claim_permission": "none",
+      "dependencies": [
+        "D-021",
+        "D-029",
+        "CSL-84"
+      ],
+      "evidence": [
+        {
+          "evidence_class": "source_documented",
+          "ref": "scripts/tests/v3/harness/harness.test.py",
+          "notes": "Demonstrates D-021 policy non-intermediation and output token redaction; subprocess runner inherits environment without env filtering; D-029 trusted launch boundary remains unverified / researched"
+        }
+      ],
+      "unknowns": [
+        "Operator-provisioned launch boundary implementation across diverse OS distributions (D-029)"
+      ],
+      "withdrawn": false
+    },
+    {
+      "id": "CAP-026",
+      "pillar": "privacy_security_authority",
+      "capability": "Egress Broker & Local Telemetry Isolation",
+      "journeys": [
+        "J1",
+        "J6"
+      ],
+      "modes": {
+        "native_only": true,
+        "upstream_only": true,
+        "combined": true
+      },
+      "actor_start_state": "Execution generating logs, traces, and metrics",
+      "useful_endpoint": "Strict local-only telemetry retention with zero unapproved public or external egress",
+      "source_config_route_platform": "Telemetry service, local append log / telemetry store (store unselected)",
+      "allowed_effects": "Local log writing, secret redaction",
+      "fault_recovery_case": "Outbound network request attempted by unauthorized telemetry component; egress broker denies socket connection",
+      "current_maturity": "researched",
+      "target": null,
+      "disposition": null,
+      "disposition_status": "pending-H",
+      "packaging_default_activation": "core-default",
+      "claim_permission": "none",
+      "dependencies": [
+        "OR-009",
+        "OR-019"
+      ],
+      "evidence": [],
+      "unknowns": [
+        "Cryptographic shredding verification across flash storage media"
+      ],
+      "withdrawn": false
+    },
+    {
+      "id": "CAP-027",
+      "pillar": "verification",
+      "capability": "Risk-Scaled Independent Verifiers",
+      "journeys": [
+        "J1",
+        "J4"
+      ],
+      "modes": {
+        "native_only": true,
+        "upstream_only": true,
+        "combined": true
+      },
+      "actor_start_state": "Candidate implementation diff generated and ready for evaluation",
+      "useful_endpoint": "Cross-family independent verification report verifying diff correctness and gate execution",
+      "source_config_route_platform": "Verifier service, independent model review harness",
+      "allowed_effects": "Test execution, review report emission",
+      "fault_recovery_case": "Implementer claims PASS but independent verifier detects regression; diff is rejected and returned for rework",
+      "current_maturity": "researched",
+      "target": null,
+      "disposition": null,
+      "disposition_status": "pending-H",
+      "packaging_default_activation": "core-default",
+      "claim_permission": "none",
+      "dependencies": [
+        "OR-006",
+        "OR-031",
+        "CONTROL_PLANE.md"
+      ],
+      "evidence": [],
+      "unknowns": [
+        "Inter-model verifier agreement rates on subjective architectural diffs"
+      ],
+      "withdrawn": false
+    },
+    {
+      "id": "CAP-028",
+      "pillar": "verification",
+      "capability": "Disposable Conformance Test Harness",
+      "journeys": [
+        "J1",
+        "J4"
+      ],
+      "modes": {
+        "native_only": true,
+        "upstream_only": true,
+        "combined": true
+      },
+      "actor_start_state": "Clean checkout of repository running on CI or local machine",
+      "useful_endpoint": "Provider-free, deterministic verification of harness operations and gate compliance",
+      "source_config_route_platform": "tools/ci_gate.py, Python 3 unittest runner",
+      "allowed_effects": "Deterministic test execution in temporary directories",
+      "fault_recovery_case": "Test attempts live provider call without --allow-live; stub runner asserts violation and fails gate",
+      "current_maturity": "implemented",
+      "target": null,
+      "disposition": null,
+      "disposition_status": "pending-H",
+      "packaging_default_activation": "core-default",
+      "claim_permission": "none",
+      "dependencies": [
+        "D-037",
+        "tools/ci_gate.py"
+      ],
+      "evidence": [
+        {
+          "evidence_class": "source_documented",
+          "ref": "tools/ci_gate.py",
+          "notes": "Provider-free CI gate discovering and executing contract tests"
+        }
+      ],
+      "unknowns": [
+        "Execution duration scaling as conformance test count grows"
+      ],
+      "withdrawn": false
+    },
+    {
+      "id": "CAP-029",
+      "pillar": "update_rollback_release_operations",
+      "capability": "Six-Mode Release Manager & State Migration",
+      "journeys": [
+        "J3",
+        "J5"
+      ],
+      "modes": {
+        "native_only": true,
+        "upstream_only": true,
+        "combined": true
+      },
+      "actor_start_state": "System upgrade initiated on existing installation",
+      "useful_endpoint": "Deterministic execution of declared update mode with schema migration validation",
+      "source_config_route_platform": "Release manager, version migration registry",
+      "allowed_effects": "Binary replacement, database schema migration",
+      "fault_recovery_case": "Migration encounters corrupt record; update immediately halts and holds state; verifies compatibility before attempting rollback or resume per OR-033, preserving an explicit hold when compatibility is unknown, and offering configured repair-forward or separate-instance alternatives without promising automatic rollback",
+      "current_maturity": "researched",
+      "target": null,
+      "disposition": null,
+      "disposition_status": "pending-H",
+      "packaging_default_activation": "opt-in-plugin",
+      "claim_permission": "none",
+      "dependencies": [
+        "OR-033",
+        "docs/v3/program-control/MONTH-PROGRAM.md",
+        "D-019"
+      ],
+      "evidence": [],
+      "unknowns": [
+        "Cross-version state compatibility across major kernel schema updates"
+      ],
+      "withdrawn": false
+    },
+    {
+      "id": "CAP-030",
+      "pillar": "update_rollback_release_operations",
+      "capability": "Compatible Rollback & History Preservation",
+      "journeys": [
+        "J4",
+        "J5"
+      ],
+      "modes": {
+        "native_only": true,
+        "upstream_only": true,
+        "combined": true
+      },
+      "actor_start_state": "Installed version encounters critical runtime failure or test regression",
+      "useful_endpoint": "Compatibility verification before rollback or resume per OR-033, preserving newest work and logs, maintaining an explicit hold when compatibility is unknown, and supporting configured repair-forward or separate-instance recovery alternatives without promising automatic rollback",
+      "source_config_route_platform": "Update coordinator, local backup snapshots (rollback mechanism unselected proposal)",
+      "allowed_effects": "Rollback trigger execution, history preservation",
+      "fault_recovery_case": "Update regression or failure encountered; system verifies cross-version state compatibility before attempting rollback or resume; if compatibility is unknown or schema migration is non-reversible, execution preserves an explicit hold with preserved dirty work/logs and offers repair-forward or separate-instance recovery",
+      "current_maturity": "researched",
+      "target": null,
+      "disposition": null,
+      "disposition_status": "pending-H",
+      "packaging_default_activation": "opt-in-plugin",
+      "claim_permission": "none",
+      "dependencies": [
+        "OR-033",
+        "D-019"
+      ],
+      "evidence": [],
+      "unknowns": [
+        "Compatibility verification tooling for non-reversible schema migrations",
+        "Rollback behavior when database schema migration is non-reversible"
+      ],
+      "withdrawn": false
+    },
+    {
+      "id": "CAP-031",
+      "pillar": "update_rollback_release_operations",
+      "capability": "Power-Loss & VM Reset Replay Recovery",
+      "journeys": [
+        "J3",
+        "J5"
+      ],
+      "modes": {
+        "native_only": true,
+        "upstream_only": true,
+        "combined": true
+      },
+      "actor_start_state": "Host experiences abrupt ungraceful power loss or VM reset at commit boundary",
+      "useful_endpoint": "Application-consistent canonical state restored via replay without corruption",
+      "source_config_route_platform": "Local NTFS/ext4 storage engine per D-028 (store unselected)",
+      "allowed_effects": "Replay verification, uncommitted transaction discard, lock clearing",
+      "fault_recovery_case": "Torn write detected during recovery; recovery coordinator truncates torn tail to last valid commit checksum and recovers cleanly",
+      "current_maturity": "researched",
+      "target": null,
+      "disposition": null,
+      "disposition_status": "pending-H",
+      "packaging_default_activation": "core-default",
+      "claim_permission": "none",
+      "dependencies": [
+        "D-028"
+      ],
+      "evidence": [],
+      "unknowns": [
+        "NTFS flush-to-disk guarantees under varied virtualization hypervisors"
+      ],
+      "withdrawn": false
+    },
+    {
+      "id": "CAP-032",
+      "pillar": "update_rollback_release_operations",
+      "capability": "Recovery Coordinator & Cumulative Recovery Accounting (OR-032)",
+      "journeys": [
+        "J3",
+        "J5",
+        "J6"
+      ],
+      "modes": {
+        "native_only": true,
+        "upstream_only": true,
+        "combined": true
+      },
+      "actor_start_state": "Task recovery initiated after crash, timeout, or partition",
+      "useful_endpoint": "Preservation of uncertainty and enforcement of relative additional allowance as exact fraction/unit of pre-shutdown usage, with cumulative reservations across repeated failures",
+      "source_config_route_platform": "Recovery coordinator, accounting ledger",
+      "allowed_effects": "Recovery allowance reservation, state replay, uncertainty flag persistence",
+      "fault_recovery_case": "Recovery attempts repeatedly fail; cumulative allowance ceiling reached; coordinator halts automated retry and requires human steering",
+      "current_maturity": "researched",
+      "target": null,
+      "disposition": null,
+      "disposition_status": "pending-H",
+      "packaging_default_activation": "opt-in-plugin",
+      "claim_permission": "none",
+      "dependencies": [
+        "OR-032",
+        "OR-030",
+        "MKR-016"
+      ],
+      "evidence": [],
+      "unknowns": [
+        "Calibration of default recovery allowance fraction under cascade failures"
+      ],
+      "withdrawn": false
+    },
+    {
+      "id": "CAP-033",
+      "pillar": "verification",
+      "capability": "Bounded Broker Proof Refinement & Observable Substrate (OR-036)",
+      "journeys": [
+        "J1",
+        "J3"
+      ],
+      "modes": {
+        "native_only": true,
+        "upstream_only": true,
+        "combined": true
+      },
+      "actor_start_state": "Broker state and process interactions ready for formal verification",
+      "useful_endpoint": "Smallest aggregate plus explicit independently checkable bounded broker refinement, including necessary broker state if separate checking fails",
+      "source_config_route_platform": "Process supervisor interface, verification harness",
+      "allowed_effects": "Process state inspection, trace recording",
+      "fault_recovery_case": "Broker state cannot be independently checked in isolation; verification expands to aggregate runtime state without false positive pass",
+      "current_maturity": "researched",
+      "target": null,
+      "disposition": null,
+      "disposition_status": "pending-H",
+      "packaging_default_activation": "core-default",
+      "claim_permission": "none",
+      "dependencies": [
+        "OR-036",
+        "OR-028"
+      ],
+      "evidence": [],
+      "unknowns": [
+        "State boundary separation between broker runtime and test assertions"
+      ],
+      "withdrawn": false
+    },
+    {
+      "id": "CAP-034",
+      "pillar": "privacy_security_authority",
+      "capability": "GoalSpec Amendment Authority & Bounded Routine Delegation (OR-037)",
+      "journeys": [
+        "J1",
+        "J5"
+      ],
+      "modes": {
+        "native_only": true,
+        "upstream_only": true,
+        "combined": true
+      },
+      "actor_start_state": "Active task encountering scope ambiguity or proposed goal change",
+      "useful_endpoint": "Strict Owner-only authority for actual GoalSpec amendments; substantial routine tactical delegation permitted without avoidable human interruption",
+      "source_config_route_platform": "Authority governor, GoalSpec ledger",
+      "allowed_effects": "GoalSpec amendment proposal emission, routine turn dispatch",
+      "fault_recovery_case": "Agent attempts autonomous amendment of parent GoalSpec; authority engine rejects amendment and halts for Owner confirmation",
+      "current_maturity": "researched",
+      "target": null,
+      "disposition": null,
+      "disposition_status": "pending-H",
+      "packaging_default_activation": "core-default",
+      "claim_permission": "none",
+      "dependencies": [
+        "OR-037",
+        "CONTROL_PLANE.md"
+      ],
+      "evidence": [],
+      "unknowns": [
+        "Distinction threshold between substantial routine delegation and consequential amendment"
+      ],
+      "withdrawn": false
+    }
+  ]
+}

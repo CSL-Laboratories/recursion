@@ -85,11 +85,17 @@ RECORD_KEYS = {"comment": {"op", "body"}, "reply": {"op", "comment_id", "body"},
 # .github/) or .env, and the agent-instruction and MCP-config basenames, match at any depth;
 # .claude/ holds Claude Code session settings. The source design's tools/required_ci_gate.py
 # entry is dropped (no such file here). experiments/**/fixtures is left out: CONTROL_PLANE.md leaves it open.
+# Founder decisions on CSL-414 (Lucas, 2026-10-21): the fixer's own test suites are protected so a
+# writer cannot weaken the checks on its own loop, and package-manager and netrc credential files
+# are protected pre-emptively although none exist here (.git-credentials is covered by .git*).
 # Exact paths from the repository root.
 PROTECTED_FILES = frozenset({"tools/ci_gate.py", "tools/test_claude_pr_fixer.py",
+                             "tools/test_claude_fixer_guard.py", "tools/test_claude_fixer_receipts.py",
+                             "tools/test_claude_fixer_publish.py",
                              "control_plane.md", "anchor.md", "state/decisions.md"})
 # Basenames anywhere in the tree.
-PROTECTED_NAMES = frozenset({"codeowners", "agents.md", "claude.md", ".mcp.json"})
+PROTECTED_NAMES = frozenset({"codeowners", "agents.md", "claude.md", ".mcp.json",
+                             ".netrc", "_netrc", ".npmrc", ".pypirc"})
 # Directory names anywhere in the tree.
 PROTECTED_DIRS = frozenset({".claude", ".claude-fixer-out", ".claude-fixer-replies", ".cursor"})
 # A `fixtures` component anywhere below scripts/tests/ (the scripts/tests/**/fixtures/** glob).

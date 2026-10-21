@@ -204,6 +204,19 @@ class ProtectedPathTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertFalse(p.is_protected(path))
 
+    def test_founder_protected_fixer_tests_and_credential_files(self):
+        # Founder decisions on CSL-414: the fixer's own test suites and credential files are protected.
+        for path in ("tools/test_claude_fixer_guard.py", "tools/test_claude_fixer_receipts.py",
+                     "tools/test_claude_fixer_publish.py", "TOOLS/Test_Claude_Fixer_Publish.py",
+                     ".netrc", "_netrc", "home/.netrc", ".npmrc", "web/.npmrc", ".pypirc", ".NPMRC",
+                     ".git-credentials"):
+            with self.subTest(path=path):
+                self.assertTrue(p.is_protected(path))
+        for path in ("tools/test_claude_fixer_guard.py.bak", "docs/tools/test_claude_fixer_publish.py",
+                     "tools/test_claude_settings.py", "netrc", "docs/npmrc.md", "pypirc.example"):
+            with self.subTest(path=path):
+                self.assertFalse(p.is_protected(path))
+
     def test_every_control_plane_protected_path_is_protected(self):
         text = (ROOT / "CONTROL_PLANE.md").read_text(encoding="utf-8")
         section = text.split("\n## Protected paths\n", 1)[1].split("\n## ", 1)[0]

@@ -51,7 +51,8 @@ deletion time. The one exception is a developer-approved comment
 naming the developer and session of its prefix, confirmed no later than it was
 posted and never edited, speaks as that developer. Its prefix and marker lines
 are dropped and the rest is read like a human comment; an invalid marker is
-reported as `developer_approval_invalid` and the comment stays void. Standing
+reported as `developer_approval_invalid` and the comment stays void. A
+developer-approved comment cannot define or revoke a standing approval. Standing
 approvals use machine fields: `actions:` and `scope:` are comma-separated
 tokens, `limits:` holds `per_day=N` and/or `total=N`, and `expires:` is a date;
 each action is checked against the comment revision in effect at its time. An
@@ -508,6 +509,8 @@ class Evaluation:
             return None, "a claim record cannot be developer-approved"
         if len(marks) > 1:
             return None, "more than one developer-approved line"
+        if any(AGENT_PREFIX.match(line) for line in lines[1:]):
+            return None, "agent prefix inside the approved text"
         match = DEVELOPER_APPROVED.match(marks[0])
         if not match:
             return None, "malformed developer-approved line"
@@ -520,7 +523,7 @@ class Evaluation:
             return None, "session does not match the agent prefix"
         try:
             confirmed = parse_ts(match["at"], f"comment {comment.id}: developer-approved")
-        except SnapshotError:
+        except (SnapshotError, OverflowError):
             return None, "bad confirmation time"
         if confirmed > comment.created_at:
             return None, "approval confirmed after posting"
@@ -1037,7 +1040,9 @@ class Evaluation:
         for comment in self.comments:
             if comment.issue != home:
                 continue
-            if comment.agent is not None:
+            # Standing approvals stay unprefixed founder comments (spec section
+            # 12, D7): a developer-approved comment cannot define or revoke one.
+            if comment.agent is not None or comment.approved_by is not None:
                 if not comment.deleted:
                     for line in human_lines(comment):
                         if SA_HEADER.match(line) or REVOKE_SA.match(line):
@@ -1089,8 +1094,10 @@ class Evaluation:
             for (_, _, end), (next_start, _, _) in zip(ordered, ordered[1:]):
                 if end is None or next_start < end:
                     raise SnapshotError(f"standing approval {sa_id}: defined in two comments at once")
-        for _, line, seen in self.directive_lines(home):
+        for source, line, seen in self.directive_lines(home):
             match = REVOKE_SA.match(line)
+            if source.approved_by is not None:
+                continue
             if match:
                 previous = revoked.get(match.group(1))
                 revoked[match.group(1)] = seen if previous is None else min(previous, seen)
@@ -1336,7 +1343,7 @@ class Evaluation:
                         continue
                     expected = (answer["comment"], answer["option"])
                     recorded = any(
-                        c.issue == blocker and c.agent is not None
+                        c.issue == blocker and (c.agent is not None or c.approved_by is not None)
                         and not (c.deleted and (c.deleted_at is None or c.deleted_at <= confirmed))
                         and self.recorded_since(c, expected, answer["at"], confirmed)
                         for c in self.comments
@@ -1422,7 +1429,8 @@ class Evaluation:
             "violations": sorted(self.violations, key=lambda v: tuple(str(v[k] or "") for k in ("code", "issue", "claim", "detail"))),
             "void_lines": self.void_lines,
             "developer_approved": sorted(
-                ({"comment": c.id, "developer": c.approved_by} for c in self.comments if c.approved_by),
+                ({"comment": c.id, "developer": c.approved_by, "deleted": c.deleted}
+                 for c in self.comments if c.approved_by),
                 key=lambda entry: entry["comment"],
             ),
         }

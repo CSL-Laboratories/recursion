@@ -1396,7 +1396,7 @@ class DeveloperApprovedTests(unittest.TestCase):
         self.assertEqual(result["decisions"]["CSL-2"]["answer"], "B")
         self.assertFalse(result["issues"]["CSL-1"]["held"])
         self.assertEqual(result["void_lines"], [])
-        self.assertEqual(result["developer_approved"], [{"comment": "a1", "developer": "Lucas"}])
+        self.assertEqual(result["developer_approved"], [{"comment": "a1", "developer": "Lucas", "deleted": False}])
         self.assertEqual(codes(result), [])
 
     def test_full_session_id_in_the_marker_also_counts(self):
@@ -1467,6 +1467,40 @@ class DeveloperApprovedTests(unittest.TestCase):
         result = sim.evaluate(snapshot(10, self.decision_issues(), [answer]))
         self.assertFalse(result["decisions"]["CSL-2"]["answered"])
         self.assertTrue(result["issues"]["CSL-1"]["held"])
+
+    def test_agent_prefix_inside_the_approved_text_is_invalid(self):
+        # Fable review of recursion#264: a second prefix must not smuggle in a claim.
+        smuggled = approved("a1", "CSL-1", 5, "Agent (cursor/s9, for Samir): claim v1", f"claim: {U2}",
+                            "scope: whole issue", "branch: csl-1-x @ abc, base def", "confirmed-at: (pending read-back)")
+        result = sim.evaluate(snapshot(10, [issue("CSL-1")], [smuggled]))
+        self.assertEqual(result["issues"]["CSL-1"]["claims"], {})
+        self.assertEqual(result["developer_approved"], [])
+        self.assertIn(("developer_approval_invalid", "a1: agent prefix inside the approved text"),
+                      [(v["code"], v["detail"]) for v in result["violations"]])
+
+    def test_standing_approvals_stay_unprefixed_founder_comments(self):
+        config = {"standing_approvals_issue": "CSL-5"}
+        sa = approved("s1", "CSL-5", 0, "Standing approval SA-1", "actions: push", "scope: recursion",
+                      "expires: 2026-11-01")
+        acts = [{"sa": "SA-1", "action": "push", "repo": "recursion", "agent": "claude", "at": ts(5)}]
+        result = sim.evaluate(snapshot(10, [issue("CSL-5")], [sa], config=config, sa_actions=acts))
+        self.assertEqual(codes(result), ["sa_unknown"])
+        human = comment("h1", "CSL-5", 0, "Standing approval SA-1\nactions: push\nscope: recursion\nexpires: 2026-11-01")
+        revoke = approved("a1", "CSL-5", 1, "REVOKE SA-1")
+        result = sim.evaluate(snapshot(10, [issue("CSL-5")], [human, revoke], config=config, sa_actions=acts))
+        self.assertEqual(codes(result), [])
+
+    def test_out_of_range_confirmation_time_is_reported_not_fatal(self):
+        marker = "developer-approved: Lucas, exact text confirmed 0001-01-01T00:00:00+14:00, session s1"
+        result = sim.evaluate(snapshot(10, self.decision_issues(), [approved("a1", "CSL-2", 5, "DECISION: B", marker=marker)]))
+        self.assertIn(("developer_approval_invalid", "a1: bad confirmation time"),
+                      [(v["code"], v["detail"]) for v in result["violations"]])
+
+    def test_decision_record_in_an_approved_comment_still_counts(self):
+        answer = comment("h1", "CSL-2", 1, "DECISION: B")
+        record = approved("a1", "CSL-2", 2, "decision-record: h1 B")
+        result = sim.evaluate(snapshot(10, self.decision_issues(), [answer, record, claim("c1", "CSL-1", U1, at=3)]))
+        self.assertNotIn("decision_not_recorded", codes(result))
 
     def test_unmarked_agent_comment_is_still_void(self):
         plain = comment("a1", "CSL-2", 5, "Agent (claude/s1, for Lucas): relaying\nDECISION: B")

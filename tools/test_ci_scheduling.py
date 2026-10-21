@@ -601,10 +601,25 @@ CROSSLANE_SAFE_BASH = {
     "Bash(python -X utf8 -B tools/test_claude_pr_fixer.py)", "Bash(python3 -X utf8 -B tools/test_claude_pr_fixer.py)",
 }
 CROSSLANE_PUSH = re.compile(r"^Bash\(git push origin HEAD:refs/heads/\$\{\{ (steps\.(live|cap)\.outputs\.head_ref|matrix\.pr\.head_ref) \}\}\)$")
+# A shell push: `git`, any global options (`-C dir`, `-c k=v`, `--opt[=v]`), then `push`, across
+# backslash continuations.
+CROSSLANE_SHELL_PUSH = re.compile(r"\bgit(?:(?:\s|\\\n)+(?:-[Cc](?:\s|\\\n)+\S+|--?[A-Za-z][\w-]*(?:=\S+)?))*(?:\s|\\\n)+push\b")
+# An argv push: a quoted `push` element opening a list or tuple or following a comma, so
+# `["git", "-C", repo, "push"]`, `run_git(["-C", repo, "push"])`, `[*prefix, "push"]` and
+# `prefix + ["push"]` all count. Escaped quotes (YAML-embedded Python in a shell string) match too.
+CROSSLANE_ARGV_PUSH = re.compile(r"""[\[(,]\s*\\?["']push\\?["']""")
 # Any push command or git argv in a job once the model's `prompt` and `claude_args` (its prose and
 # tool grants, which execute nothing themselves) are removed.
-CROSSLANE_STEP_PUSH = re.compile(r"\bgit(\s+-[Cc]\s+\S+)*\s+push\b"
-                                 r"|run_git\(\[\s*\\?[\"']push\\?[\"']|\\?[\"']git\\?[\"'],\s*\\?[\"']push\\?[\"']")
+CROSSLANE_STEP_PUSH = re.compile(f"{CROSSLANE_SHELL_PUSH.pattern}|{CROSSLANE_ARGV_PUSH.pattern}")
+# The mention fixer's command-word allowlist is data, not argv: only this exact all-string set literal is skipped.
+CROSSLANE_WORD_LIST = re.compile(r"""KNOWN_WORDS = frozenset\(\s*\{(?:\s*"[^"\\\n]*",?)*\s*\}\s*\)""")
+# Force, mirror or delete anywhere in a push command, including argv elements (`"-f"`, `"+HEAD:x"`)
+# and short-flag clusters (`-uf`).
+CROSSLANE_FORCE = re.compile(r"""--force|--mirror|--delete|:\+|(?:^|[\s"'\\,\[(])(?:-[A-Za-z]*f[A-Za-z]*\b|\+)""")
+# A label write: an explicit POST/PUT/PATCH, or a `gh api` body flag (which defaults to POST).
+CROSSLANE_LABEL_WRITE = re.compile(r"""["'](POST|PUT|PATCH)["']|-X\s*["']?(POST|PUT|PATCH)\b"""
+                                   r"""|--method[\s=]+["']?(POST|PUT|PATCH)\b|method\s*=\s*["'](POST|PUT|PATCH)""")
+CROSSLANE_LABEL_BODY = re.compile(r"""(?:^|[\s"'])(?:--input|-f|-F|--field|--raw-field)\b""")
 CROSSLANE_WRITER_SCOPES = {"contents", "pull-requests", "issues", "id-token"}
 
 
@@ -669,8 +684,80 @@ def _crosslane_permissions(text: str, indent: int) -> dict[str, str] | str | Non
 
 
 def _crosslane_granted(block: str) -> str:
-    # `--disallowedTools` denials (e.g. `git push --force:*`) are not grants.
-    return re.sub(r'--disallowedTools "[^"]*"', "", block)
+    # `--disallowedTools` denials (e.g. `git push --force:*`) are not grants. Each `--allowedTools`
+    # entry goes on its own line, so one grant's command never runs into the next grant.
+    block = re.sub(r'--disallowedTools "[^"]*"', "", block)
+    return re.sub(r'--allowedTools "([^"]*)"', lambda m: "\n".join(m.group(1).split(",")), block)
+
+
+def _crosslane_shell_command(text: str, start: int, end: int) -> tuple[int, int]:
+    # Widen [start, end) to whole lines plus backslash continuations before and after.
+    start = text.rfind("\n", 0, start) + 1
+    while start > 1 and text[:start - 1].rstrip(" \t").endswith("\\"):
+        start = text.rfind("\n", 0, start - 1) + 1
+    end = text.find("\n", end)
+    while end != -1 and text[:end].rstrip(" \t").endswith("\\"):
+        end = text.find("\n", end + 1)
+    return start, len(text) if end == -1 else end
+
+
+def _crosslane_bracket(text: str, pos: int, opens: str) -> tuple[int, int] | None:
+    # The innermost bracket group (opened by one of `opens`) around pos, to its matching close; None if
+    # there is none before a blank line. An unclosed group runs to the next blank line (fail closed).
+    pairs, depth, i = {")": "(", "]": "[", "}": "{"}, 0, pos - 1
+    while i >= 0:
+        char = text[i]
+        if char == "\n" and not text[text.rfind("\n", 0, i) + 1:i].strip():
+            return None
+        if char in pairs:
+            depth += 1
+        elif char in "([{":
+            if depth == 0 and char in opens:
+                break
+            depth = max(depth - 1, 0)
+        i -= 1
+    else:
+        return None
+    depth, j = 0, i
+    while j < len(text):
+        char = text[j]
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+            if depth == 0:
+                return i, j + 1
+        elif char == "\n" and not text[text.rfind("\n", 0, j) + 1:j].strip():
+            break
+        j += 1
+    return i, j
+
+
+def _crosslane_push_commands(text: str) -> list[str]:
+    # Each push as a whole command: a shell line plus its continuations, or an argv list from `[`/`(`
+    # to the matching close.
+    text = CROSSLANE_WORD_LIST.sub("", text)
+    commands = [text[slice(*_crosslane_shell_command(text, m.start(), m.end()))] for m in CROSSLANE_SHELL_PUSH.finditer(text)]
+    for match in CROSSLANE_ARGV_PUSH.finditer(text):
+        if text[match.start()] in "[(":
+            span = _crosslane_bracket(text, match.start() + 1, "[(")
+        else:
+            span = _crosslane_bracket(text, match.start(), "[(")
+        commands.append(text[slice(*span)] if span else text[slice(*_crosslane_shell_command(text, match.start(), match.end()))])
+    return commands
+
+
+def _crosslane_label_commands(text: str) -> list[str]:
+    # Each command or call naming `/labels`: its shell line plus continuations, joined with the
+    # enclosing call expression when there is one.
+    out = []
+    for match in re.finditer(r"/labels\b", text):
+        start, end = _crosslane_shell_command(text, match.start(), match.end())
+        call = _crosslane_bracket(text, match.start(), "(")
+        if call:
+            start, end = min(start, call[0]), max(end, call[1])
+        out.append(text[start:end])
+    return out
 
 
 class CrossLaneAdmissionTests(unittest.TestCase):
@@ -703,11 +790,15 @@ class CrossLaneAdmissionTests(unittest.TestCase):
             with self.subTest(workflow=name):
                 self.assertNotRegex(body, r"--add-label|gh pr edit|labels\[\]=")
                 self.assertNotRegex(body, r'"labels":\s*\[\s*"(ci:full|enhancement)"')
-                # Every label write (URL line plus the next line) is the handoff label; ci:full is
-                # only ever removed (DELETE of a gate-owned label event).
-                for match in re.finditer(r"[^\n]*/labels[^\n]*\n[^\n]*", body):
-                    if re.search(r'"(POST|PUT|PATCH)"|-X (POST|PUT|PATCH)|--method (POST|PUT|PATCH)', match.group(0)):
-                        self.assertIn("HANDOFF_LABEL", match.group(0))
+                # Every label write (the whole call or shell command naming `/labels`) is the handoff
+                # label; ci:full is only ever removed (DELETE of a gate-owned label event).
+                commands = _crosslane_label_commands(body)
+                self.assertTrue(commands)
+                for command in commands:
+                    if CROSSLANE_LABEL_WRITE.search(command) or (
+                            CROSSLANE_LABEL_BODY.search(command) and "DELETE" not in command):
+                        self.assertIn("HANDOFF_LABEL", command)
+                        self.assertNotIn("ci:full", command)
                 self.assertTrue(set(re.findall(r'HANDOFF_LABEL = "([^"]+)"', body)) <= {"needs-decision"})
 
     def test_writer_workflows_use_github_hosted_runners_only(self) -> None:
@@ -760,7 +851,7 @@ class CrossLaneAdmissionTests(unittest.TestCase):
             for job, block in _crosslane_jobs(name).items():
                 with self.subTest(workflow=name, job=job, check="no push outside the model grant"):
                     # The only push path is the model's single granted command; no step pushes as a shell command or git argv.
-                    self.assertNotRegex(_crosslane_without_model_text(block), CROSSLANE_STEP_PUSH)
+                    self.assertNotRegex(CROSSLANE_WORD_LIST.sub("", _crosslane_without_model_text(block)), CROSSLANE_STEP_PUSH)
                 with self.subTest(workflow=name, job=job, check="permissions"):
                     perms = _crosslane_permissions(block, 4)
                     if job in CROSSLANE_WRITER_JOBS.get(name, ()):
@@ -773,8 +864,11 @@ class CrossLaneAdmissionTests(unittest.TestCase):
                         else:
                             self.assertIn(perms, (None, "read-all", "{}"))
                 with self.subTest(workflow=name, job=job, check="no force push"):
-                    for command in re.findall(r"git push[^,)\"\n]*", _crosslane_granted(block)):
-                        self.assertNotRegex(command, r"--force|\s-f\b|\s\+|:\+|--mirror|--delete")
+                    commands = _crosslane_push_commands(_crosslane_granted(block))
+                    if job in CROSSLANE_WRITER_JOBS.get(name, ()):
+                        self.assertTrue(commands)
+                    for command in commands:
+                        self.assertNotRegex(command, CROSSLANE_FORCE)
 
     def test_retries_are_bounded_and_pausable(self) -> None:
         blocks = _crosslane_jobs("claude.yml")

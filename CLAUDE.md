@@ -236,10 +236,12 @@ Linear is the team's primary async channel, alongside Google Meet and Discord.
 - Windows and macOS run on the `ci:full` label, on manual dispatch, and on `master` (macOS
   nightly at 07:17 UTC).
 - Superseded runs are cancelled.
-- Remove a `ci:full` added by a person once its full run has passed on the current head,
-  and add it again if a later change needs the full matrix. The label persists, so every
-  later non-draft PR event otherwise reruns Windows (Blacksmith) and macOS. The Codex gate
-  clears its own READY label only on a fixer pause or unresolved findings.
+- A `ci:full` added by a person persists, so every later non-draft PR event reruns Windows
+  (Blacksmith) and macOS. Remove it once its full run has passed on the current head and
+  the PR needs no further automatic READY. A manual removal is a human hold: the Codex gate
+  skips READY on the head where it first sees the removal, and READY on a later head can
+  add the label again. Re-add it yourself if a change needs the full matrix sooner. The
+  Codex gate clears its own READY label only on a fixer pause or unresolved findings.
 
 Trigger CI and reviews through the Discord bot (`/ci full|run`, `/devin review
 pr:<url>|run|status`, or MCP `ci_full` / `ci_run` / `devin_review`) or the `ci:full`

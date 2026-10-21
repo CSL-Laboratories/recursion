@@ -1677,6 +1677,82 @@ class PrePrefixDecisionTests(unittest.TestCase):
         self.assertFalse(result["decisions"]["CSL-3"]["answered"])
 
 
+class CrossSessionOverlapTests(unittest.TestCase):
+    """Codex P1 on #276: claims from different sessions in one repository may
+    not overlap by issue scope or branch (Lucas, 18:54Z 2026-10-21, relayed)."""
+
+    def family(self):
+        return [issue("CSL-1"), issue("CSL-2", status="In Progress", parent="CSL-1"), issue("CSL-4")]
+
+    def evaluate(self, now, comments, writes=()):
+        return sim.evaluate(snapshot(now, self.family(), comments, writes=list(writes)))
+
+    def test_child_claim_after_a_parent_scoped_claim_overlaps(self):
+        child = claim("c2", "CSL-2", U2, at=1, session="cursor/s2", branch="csl-2-work")
+        result = self.evaluate(10, [scoped("c1", "CSL-1", U1, "CSL-2"), child])
+        self.assertEqual(codes(result), ["overlapping_claim"])
+
+    def test_parent_scoped_claim_after_a_child_claim_overlaps(self):
+        parent = scoped("c2", "CSL-1", U2, "CSL-2", at=1, session="cursor/s2", branch="csl-1-parent")
+        result = self.evaluate(10, [claim("c1", "CSL-2", U1, branch="csl-2-work"), parent])
+        self.assertEqual(codes(result), ["overlapping_claim"])
+
+    def test_two_issues_on_one_branch_across_sessions_overlap(self):
+        result = self.evaluate(10, [claim("c1", "CSL-1", U1), claim("c2", "CSL-4", U2, at=1, session="cursor/s2")])
+        self.assertEqual(codes(result), ["overlapping_claim"])
+
+    def test_writes_by_the_later_overlapping_claim_are_flagged(self):
+        writes = [{"kind": "push", "issue": "CSL-4", "claim": U2, "at": ts(5)},
+                  {"kind": "push", "issue": "CSL-1", "claim": U1, "at": ts(6)}]
+        result = self.evaluate(10, [claim("c1", "CSL-1", U1), claim("c2", "CSL-4", U2, at=1, session="cursor/s2")], writes)
+        self.assertEqual(codes(result), ["overlapping_claim", "write_while_overlapping"])
+
+    def test_withdrawing_at_read_back_is_clean(self):
+        withdrawn = claim("c2", "CSL-4", U2, at=1, session="cursor/s2", confirm_after=None,
+                          more_edits=[{"at": ts(2.5), "body": claim_body(U2, "cursor/s2",
+                                                                          extra=(f"withdrawn: superseded by {U1}",))}])
+        result = self.evaluate(10, [claim("c1", "CSL-1", U1), withdrawn])
+        self.assertEqual(codes(result), [])
+
+    def test_not_judged_before_the_read_back_window_ends(self):
+        fresh = claim("c2", "CSL-4", U2, at=9.5, session="cursor/s2", confirm_after=None)
+        result = self.evaluate(10, [claim("c1", "CSL-1", U1), fresh])
+        self.assertEqual(codes(result), [])
+
+    def test_other_repositories_are_independent(self):
+        elsewhere = claim("c2", "CSL-4", U2, at=1, session="cursor/s2", extra=("repo: other-repo",))
+        result = self.evaluate(10, [claim("c1", "CSL-1", U1), elsewhere])
+        self.assertEqual(codes(result), [])
+
+    def test_different_issues_and_branches_do_not_overlap(self):
+        result = self.evaluate(10, [claim("c1", "CSL-1", U1),
+                                    claim("c2", "CSL-4", U2, at=1, session="cursor/s2", branch="csl-4-work")])
+        self.assertEqual(codes(result), [])
+
+    def test_a_claim_released_before_the_overlap_does_not_block(self):
+        released = claim("c1", "CSL-1", U1, more_edits=[edit(3, U1, "released")])
+        later = claim("c2", "CSL-4", U2, at=5, session="cursor/s2")
+        writes = [{"kind": "push", "issue": "CSL-4", "claim": U2, "at": ts(8)}]
+        self.assertEqual(codes(self.evaluate(10, [released, later], writes)), [])
+
+    def test_an_expired_unreleased_claim_still_blocks(self):
+        # As on one issue, an expired claim is not bypassed without a release,
+        # revoke or takeover.
+        later = claim("c2", "CSL-4", U2, at=200, session="cursor/s2")
+        result = self.evaluate(210, [claim("c1", "CSL-1", U1), later])
+        self.assertEqual(codes(result), ["overlapping_claim"])
+
+    def test_an_expired_claim_released_later_stops_blocking(self):
+        lapsed = claim("c1", "CSL-1", U1, more_edits=[edit(190, U1, "released")])
+        later = claim("c2", "CSL-4", U2, at=200, session="cursor/s2")
+        result = self.evaluate(210, [lapsed, later])
+        self.assertEqual(codes(result), [])
+
+    def test_same_issue_races_keep_their_own_codes(self):
+        result = self.evaluate(10, [claim("c1", "CSL-1", U1), claim("c2", "CSL-1", U2, at=1, session="cursor/s2")])
+        self.assertEqual(codes(result), ["loser_confirmed", "loser_not_withdrawn"])
+
+
 class LapsedClaimResumeTests(unittest.TestCase):
     """S31: session resumes after its claim lapsed (CSL-379). A renewal edit after lease plus grace is reported
     and does not revive the claim; the session releases it on lease expiry and takes a fresh claim."""

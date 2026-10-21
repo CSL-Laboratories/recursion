@@ -944,6 +944,45 @@ class Evaluation:
             self._winners[key] = min(live, key=lambda c: (c.created_at, c.uuid)) if live else None
         return self._winners[key]
 
+    def overlap(self, claim: Claim, other: Claim) -> str | None:
+        """How two claims in one repository on different issues overlap:
+        `scope` when their covered issues intersect (a `scope: sub-issue`
+        child counts, in either order), `branch` when they name the same
+        branch, or None. Claims on the same issue race instead (`winner`)."""
+        if other.uuid == claim.uuid or other.repo != claim.repo or other.issue == claim.issue:
+            return None
+        if set(claim.scope_issues(self.issues)) & set(other.scope_issues(self.issues)):
+            return "scope"
+        if other.branch == claim.branch:
+            return "branch"
+        return None
+
+    def blocks_overlap(self, other: Claim, at: datetime) -> bool:
+        """True if `other` still blocks an overlapping claim at `at`: it is
+        live, or it expired without a release, withdrawal, revoke, deletion
+        or a takeover that took effect, as on a single issue."""
+        state = self.ended(other, at)
+        if state == "expired":
+            return not any(
+                other.uuid in t.takeovers and t.created_at <= at and self.took_effect(t, at)
+                for t in self.claims.values()
+            )
+        return state is None
+
+    def earlier_overlap(self, claim: Claim, at: datetime, other_sessions: bool = False) -> tuple[Claim, str] | None:
+        """The earliest claim posted before `claim` that still blocks it at
+        `at` and overlaps it, with how. A claim `claim` takes over does not
+        count."""
+        found = sorted(
+            (other for other in self.claims.values()
+             if (other.created_at, other.uuid) < (claim.created_at, claim.uuid)
+             and (not other_sessions or other.session != claim.session)
+             and other.uuid not in claim.takeovers
+             and self.overlap(claim, other) is not None and self.blocks_overlap(other, at)),
+            key=lambda c: (c.created_at, c.uuid),
+        )
+        return (found[0], self.overlap(claim, found[0])) if found else None
+
     # Decisions -------------------------------------------------------------
 
     def answer_pairs(self, comment: Comment, body: str) -> list[tuple[str, str, str]]:
@@ -1275,6 +1314,17 @@ class Evaluation:
             ]
             if others:
                 self.violation("multiple_claims_per_session", claim.issue, claim.uuid, f"also holds {others[0].uuid}")
+            # Across sessions, a claim that overlaps an earlier live claim in
+            # the repository by scope or branch loses as in a race: it must
+            # withdraw at read-back instead of confirming.
+            if confirmed is not None:
+                blocker = self.earlier_overlap(claim, confirmed, other_sessions=True)
+            elif claim.withdrawn_at() is None and deadline <= self.now:
+                blocker = self.earlier_overlap(claim, deadline, other_sessions=True)
+            else:
+                blocker = None
+            if blocker is not None:
+                self.violation("overlapping_claim", claim.issue, claim.uuid, f"{blocker[1]} overlaps {blocker[0].uuid}")
             released = claim.released_at()
             if released is not None:
                 for run in self.runs:
@@ -1398,6 +1448,9 @@ class Evaluation:
             winner = self.winner(claim.issue, claim.repo, at)
             if winner is None or winner.uuid != claim.uuid:
                 self.violation("write_by_non_winner", claim.issue, claim.uuid, what)
+            elif (blocker := self.earlier_overlap(claim, at)) is not None:
+                self.violation("write_while_overlapping", claim.issue, claim.uuid,
+                               f"{what}: {blocker[1]} overlaps {blocker[0].uuid}")
             elif any(self.held_at(scoped, at) for scoped in claim.scope_issues(self.issues)):
                 self.violation("write_while_held", claim.issue, claim.uuid, what)
 

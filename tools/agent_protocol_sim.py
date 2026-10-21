@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline checker for the CSL-357 agent work protocol (spec draft v4).
+"""Offline checker for the CSL-357 agent work protocol (spec draft v5).
 
 Run from the repository root:
 
@@ -45,7 +45,14 @@ and `takeovers` in the result gives each one's outcome under `targets`.
 Human lines (`REVOKE CLAIM`, `HOLD`, `DECISION:`, batched `CSL-N: X; ...`,
 `ACK TAKEOVER`, `Standing approval SA-n`, `REVOKE SA-n`) count only in
 comments without the agent prefix, and keep the effect they had before a known
-deletion time. Standing
+deletion time. The one exception is a developer-approved comment
+(`CONTROL_PLANE.md`, D-043): an agent comment with exactly one line
+`developer-approved: <developer>, exact text confirmed <UTC time>, session <id>`
+naming the developer and session of its prefix, confirmed no later than it was
+posted and never edited, speaks as that developer. Its prefix and marker lines
+are dropped and the rest is read like a human comment; an invalid marker is
+reported as `developer_approval_invalid` and the comment stays void. A
+developer-approved comment cannot define or revoke a standing approval. Standing
 approvals use machine fields: `actions:` and `scope:` are comma-separated
 tokens, `limits:` holds `per_day=N` and/or `total=N`, and `expires:` is a date;
 each action is checked against the comment revision in effect at its time. An
@@ -91,6 +98,10 @@ SUB_ISSUE_SCOPE = re.compile(r"^sub-issue (CSL-[0-9]+)$")
 TIMESTAMP_VALUE = re.compile(r"^\d{4}-\d{2}-\d{2}T")
 PLACEHOLDER = re.compile(r"^\([^()\n]*[^()\s][^()\n]*\)$")
 DECISION_RECORD = re.compile(r"^decision-record:\s*(\S+)\s+([A-Za-z0-9_-]+)\s*$")
+DEVELOPER_APPROVED = re.compile(
+    r"^developer-approved:\s*(?P<developer>[^,]+?)\s*,\s*exact text confirmed\s+(?P<at>\S+)\s*,"
+    r"\s*session\s+(?P<session>\S+)\s*$"
+)
 AFTER_END = {
     "deleted": "after_deletion",
     "expired": "after_expiry",
@@ -162,6 +173,7 @@ class Comment:
     revisions: list[Revision]
     deleted: bool
     deleted_at: datetime | None = None
+    approved_by: str | None = None
 
     @property
     def body(self) -> str:
@@ -175,6 +187,10 @@ class Comment:
         edit that removes the prefix cannot turn its lines into human
         directives. `prefix_changed` reports the edit.
         """
+        if self.approved_by:
+            # Rewritten as the developer's own comment; payload text that looks
+            # like an agent prefix must not reclassify it.
+            return None
         for revision in self.revisions:
             header = agent_header(revision.body)
             if header is not None:
@@ -461,8 +477,67 @@ class Evaluation:
                     raise SnapshotError(f"comment {comment_id}: deleted_at outside the comment's life")
                 if revisions[-1].at > deleted_at:
                     raise SnapshotError(f"comment {comment_id}: edited after deleted_at")
-            comments.append(Comment(comment_id, issue, created, revisions, deleted, deleted_at))
+            comment = Comment(comment_id, issue, created, revisions, deleted, deleted_at)
+            developer, problem = self.developer_approval(comment)
+            if developer is not None:
+                # A valid developer-approved comment speaks as that developer
+                # (CONTROL_PLANE.md, D-043): its lines count as if the developer
+                # had posted them, without the prefix and marker lines.
+                lines = body.split("\n")[1:]
+                kept = [line for line in lines if not line.strip().startswith("developer-approved:")]
+                comment = Comment(comment_id, issue, created, [Revision(created, "\n".join(kept))],
+                                  deleted, deleted_at, approved_by=developer)
+            elif problem is not None:
+                self.violation("developer_approval_invalid", issue, detail=f"{comment_id}: {problem}")
+            comments.append(comment)
         return comments
+
+    @staticmethod
+    def developer_approval(comment: Comment) -> tuple[str | None, str | None]:
+        """(developer, None) if the comment is a valid developer-approved comment,
+        (None, reason) if it carries a marker that does not count, else (None, None).
+
+        D-043 conditions checked here: the agent-prefixed comment carries one
+        `developer-approved:` line naming the developer the prefix acts for and
+        its session, the approval was confirmed no later than the posting time,
+        and the comment was never edited. Authority (condition 4) and accepted
+        contracts (condition 5) are not in the snapshot and are not checked.
+        """
+        first = comment.revisions[0].body
+        header = agent_header(first)
+        lines = [line.strip() for line in first.split("\n")]
+        marks = [line for line in lines[1:] if line.startswith("developer-approved:")]
+        if header is not None and not marks and any(
+            line.strip().startswith("developer-approved:")
+            for revision in comment.revisions[1:]
+            for line in revision.body.split("\n")[1:]
+        ):
+            return None, "edited after posting"
+        if header is None or not marks:
+            return None, None
+        if CLAIM_HEADER.search(lines[0]):
+            return None, "a claim record cannot be developer-approved"
+        if len(marks) > 1:
+            return None, "more than one developer-approved line"
+        if any(AGENT_PREFIX.match(line) for line in lines[1:]):
+            return None, "agent prefix inside the approved text"
+        match = DEVELOPER_APPROVED.match(marks[0])
+        if not match:
+            return None, "malformed developer-approved line"
+        if len(comment.revisions) > 1:
+            return None, "edited after posting"
+        session, developer = header
+        if match["developer"] != developer:
+            return None, f"approved by {match['developer']!r} but posted for {developer!r}"
+        if match["session"] not in {session, session.partition("/")[2]}:
+            return None, "session does not match the agent prefix"
+        try:
+            confirmed = parse_ts(match["at"], f"comment {comment.id}: developer-approved")
+        except (SnapshotError, OverflowError):
+            return None, "bad confirmation time"
+        if confirmed > comment.created_at:
+            return None, "approval confirmed after posting"
+        return developer, None
 
     def _load_list(self, snapshot: dict[str, Any], key: str, required: tuple[str, ...]) -> list[dict[str, Any]]:
         raw = snapshot.get(key, [])
@@ -975,7 +1050,9 @@ class Evaluation:
         for comment in self.comments:
             if comment.issue != home:
                 continue
-            if comment.agent is not None:
+            # Standing approvals stay unprefixed founder comments (spec section
+            # 12, D7): a developer-approved comment cannot define or revoke one.
+            if comment.agent is not None or comment.approved_by is not None:
                 if not comment.deleted:
                     for line in human_lines(comment):
                         if SA_HEADER.match(line) or REVOKE_SA.match(line):
@@ -1027,8 +1104,10 @@ class Evaluation:
             for (_, _, end), (next_start, _, _) in zip(ordered, ordered[1:]):
                 if end is None or next_start < end:
                     raise SnapshotError(f"standing approval {sa_id}: defined in two comments at once")
-        for _, line, seen in self.directive_lines(home):
+        for source, line, seen in self.directive_lines(home):
             match = REVOKE_SA.match(line)
+            if source.approved_by is not None:
+                continue
             if match:
                 previous = revoked.get(match.group(1))
                 revoked[match.group(1)] = seen if previous is None else min(previous, seen)
@@ -1274,7 +1353,7 @@ class Evaluation:
                         continue
                     expected = (answer["comment"], answer["option"])
                     recorded = any(
-                        c.issue == blocker and c.agent is not None
+                        c.issue == blocker and (c.agent is not None or c.approved_by is not None)
                         and not (c.deleted and (c.deleted_at is None or c.deleted_at <= confirmed))
                         and self.recorded_since(c, expected, answer["at"], confirmed)
                         for c in self.comments
@@ -1359,6 +1438,11 @@ class Evaluation:
             # compared as text because snapshot ids are not all type-checked.
             "violations": sorted(self.violations, key=lambda v: tuple(str(v[k] or "") for k in ("code", "issue", "claim", "detail"))),
             "void_lines": self.void_lines,
+            "developer_approved": sorted(
+                ({"comment": c.id, "developer": c.approved_by, "deleted": c.deleted}
+                 for c in self.comments if c.approved_by),
+                key=lambda entry: str(entry["comment"]),
+            ),
         }
 
 

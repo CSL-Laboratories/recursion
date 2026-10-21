@@ -1376,6 +1376,139 @@ class TakeoverEffectTests(unittest.TestCase):
         self.assertEqual(result["issues"]["CSL-1"]["takeovers"][U2]["reason"], "original deleted")
 
 
+def approved(cid, issue_id, at, *lines, developer="Lucas", session="claude/s1", confirmed=None, marker=None):
+    """An agent comment carrying a developer-approved line (CONTROL_PLANE.md, D-043)."""
+    confirmed = confirmed if confirmed is not None else ts(at, -30)
+    marker = marker if marker is not None else (
+        f"developer-approved: {developer}, exact text confirmed {confirmed}, session {session.partition('/')[2]}")
+    return comment(cid, issue_id, at, "\n".join([f"Agent ({session}, for {developer}): approved text", marker, *lines]))
+
+
+class DeveloperApprovedTests(unittest.TestCase):
+    """CSL-402: a valid developer-approved comment speaks as that developer (D-043)."""
+
+    def decision_issues(self):
+        return [issue("CSL-1", blocked_by=["CSL-2"]), issue("CSL-2", decision=decision())]
+
+    def test_approved_decision_counts(self):
+        result = sim.evaluate(snapshot(10, self.decision_issues(), [approved("a1", "CSL-2", 5, "DECISION: B")]))
+        self.assertTrue(result["decisions"]["CSL-2"]["answered"])
+        self.assertEqual(result["decisions"]["CSL-2"]["answer"], "B")
+        self.assertFalse(result["issues"]["CSL-1"]["held"])
+        self.assertEqual(result["void_lines"], [])
+        self.assertEqual(result["developer_approved"], [{"comment": "a1", "developer": "Lucas", "deleted": False}])
+        self.assertEqual(codes(result), [])
+
+    def test_full_session_id_in_the_marker_also_counts(self):
+        marker = f"developer-approved: Lucas, exact text confirmed {ts(4)}, session claude/s1"
+        result = sim.evaluate(snapshot(10, self.decision_issues(), [approved("a1", "CSL-2", 5, "DECISION: B", marker=marker)]))
+        self.assertTrue(result["decisions"]["CSL-2"]["answered"])
+
+    def test_approved_batched_answer_counts(self):
+        issues = [issue("CSL-11", decision=decision()), issue("CSL-12", decision=decision())]
+        result = sim.evaluate(snapshot(10, issues, [approved("a1", "CSL-11", 5, "CSL-11: B; CSL-12: A")]))
+        self.assertEqual(result["decisions"]["CSL-11"]["answer"], "B")
+        self.assertEqual(result["decisions"]["CSL-12"]["answer"], "A")
+
+    def test_approved_hold_and_revoke_count(self):
+        held = sim.evaluate(snapshot(10, [issue("CSL-1")], [approved("a1", "CSL-1", 5, "HOLD CSL-1")]))
+        self.assertTrue(held["issues"]["CSL-1"]["held"])
+        revoke = approved("a1", "CSL-1", 5, f"REVOKE CLAIM {U1}")
+        writes = [{"kind": "push", "issue": "CSL-1", "claim": U1, "at": ts(6)}]
+        result = sim.evaluate(snapshot(10, [issue("CSL-1")], [claim("c1", "CSL-1", U1), revoke], writes=writes))
+        self.assertEqual(codes(result), ["write_after_revoke"])
+
+    def test_invalid_markers_stay_void_and_are_reported(self):
+        cases = {
+            "approved by 'Samir' but posted for 'Lucas'": dict(
+                marker=f"developer-approved: Samir, exact text confirmed {ts(4)}, session s1"),
+            "session does not match the agent prefix": dict(
+                marker=f"developer-approved: Lucas, exact text confirmed {ts(4)}, session s9"),
+            "approval confirmed after posting": dict(confirmed=ts(6)),
+            "malformed developer-approved line": dict(marker="developer-approved: Lucas"),
+            "bad confirmation time": dict(marker="developer-approved: Lucas, exact text confirmed soon, session s1"),
+        }
+        for reason, kwargs in cases.items():
+            with self.subTest(reason=reason):
+                result = sim.evaluate(snapshot(10, self.decision_issues(), [approved("a1", "CSL-2", 5, "DECISION: B", **kwargs)]))
+                self.assertFalse(result["decisions"]["CSL-2"]["answered"])
+                self.assertEqual([(v["code"], v["detail"]) for v in result["violations"]],
+                                 [("developer_approval_invalid", f"a1: {reason}")])
+                self.assertEqual([v["comment"] for v in result["void_lines"]], ["a1"])
+                self.assertEqual(result["developer_approved"], [])
+
+    def test_two_markers_are_invalid(self):
+        extra = f"developer-approved: Lucas, exact text confirmed {ts(4)}, session s1"
+        result = sim.evaluate(snapshot(10, self.decision_issues(), [approved("a1", "CSL-2", 5, extra, "DECISION: B")]))
+        self.assertFalse(result["decisions"]["CSL-2"]["answered"])
+        self.assertIn(("developer_approval_invalid", "a1: more than one developer-approved line"),
+                      [(v["code"], v["detail"]) for v in result["violations"]])
+
+    def test_an_edit_voids_the_approval(self):
+        edited = approved("a1", "CSL-2", 5, "DECISION: B")
+        edited["edits"] = [{"at": ts(7), "body": edited["body"] + "\n(typo fixed)"}]
+        result = sim.evaluate(snapshot(10, self.decision_issues(), [edited]))
+        self.assertFalse(result["decisions"]["CSL-2"]["answered"])
+        self.assertIn(("developer_approval_invalid", "a1: edited after posting"),
+                      [(v["code"], v["detail"]) for v in result["violations"]])
+
+    def test_a_claim_record_cannot_be_developer_approved(self):
+        made = claim("c1", "CSL-1", U1)
+        made["body"] += f"\ndeveloper-approved: Lucas, exact text confirmed {ts(0)}, session s1"
+        made["edits"] = []
+        result = sim.evaluate(snapshot(10, [issue("CSL-1")], [made]))
+        self.assertIn(("developer_approval_invalid", "c1: a claim record cannot be developer-approved"),
+                      [(v["code"], v["detail"]) for v in result["violations"]])
+        self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["live_claims"], [U1])
+
+    def test_deleted_approved_answer_counts_until_its_deletion(self):
+        answer = approved("a1", "CSL-2", 5, "DECISION: B")
+        answer.update(deleted=True, deleted_at=ts(8))
+        result = sim.evaluate(snapshot(10, self.decision_issues(), [answer]))
+        self.assertFalse(result["decisions"]["CSL-2"]["answered"])
+        self.assertTrue(result["issues"]["CSL-1"]["held"])
+
+    def test_agent_prefix_inside_the_approved_text_is_invalid(self):
+        # Fable review of recursion#264: a second prefix must not smuggle in a claim.
+        smuggled = approved("a1", "CSL-1", 5, "Agent (cursor/s9, for Samir): claim v1", f"claim: {U2}",
+                            "scope: whole issue", "branch: csl-1-x @ abc, base def", "confirmed-at: (pending read-back)")
+        result = sim.evaluate(snapshot(10, [issue("CSL-1")], [smuggled]))
+        self.assertEqual(result["issues"]["CSL-1"]["claims"], {})
+        self.assertEqual(result["developer_approved"], [])
+        self.assertIn(("developer_approval_invalid", "a1: agent prefix inside the approved text"),
+                      [(v["code"], v["detail"]) for v in result["violations"]])
+
+    def test_standing_approvals_stay_unprefixed_founder_comments(self):
+        config = {"standing_approvals_issue": "CSL-5"}
+        sa = approved("s1", "CSL-5", 0, "Standing approval SA-1", "actions: push", "scope: recursion",
+                      "expires: 2026-11-01")
+        acts = [{"sa": "SA-1", "action": "push", "repo": "recursion", "agent": "claude", "at": ts(5)}]
+        result = sim.evaluate(snapshot(10, [issue("CSL-5")], [sa], config=config, sa_actions=acts))
+        self.assertEqual(codes(result), ["sa_unknown"])
+        human = comment("h1", "CSL-5", 0, "Standing approval SA-1\nactions: push\nscope: recursion\nexpires: 2026-11-01")
+        revoke = approved("a1", "CSL-5", 1, "REVOKE SA-1")
+        result = sim.evaluate(snapshot(10, [issue("CSL-5")], [human, revoke], config=config, sa_actions=acts))
+        self.assertEqual(codes(result), [])
+
+    def test_out_of_range_confirmation_time_is_reported_not_fatal(self):
+        marker = "developer-approved: Lucas, exact text confirmed 0001-01-01T00:00:00+14:00, session s1"
+        result = sim.evaluate(snapshot(10, self.decision_issues(), [approved("a1", "CSL-2", 5, "DECISION: B", marker=marker)]))
+        self.assertIn(("developer_approval_invalid", "a1: bad confirmation time"),
+                      [(v["code"], v["detail"]) for v in result["violations"]])
+
+    def test_decision_record_in_an_approved_comment_still_counts(self):
+        answer = comment("h1", "CSL-2", 1, "DECISION: B")
+        record = approved("a1", "CSL-2", 2, "decision-record: h1 B")
+        result = sim.evaluate(snapshot(10, self.decision_issues(), [answer, record, claim("c1", "CSL-1", U1, at=3)]))
+        self.assertNotIn("decision_not_recorded", codes(result))
+
+    def test_unmarked_agent_comment_is_still_void(self):
+        plain = comment("a1", "CSL-2", 5, "Agent (claude/s1, for Lucas): relaying\nDECISION: B")
+        result = sim.evaluate(snapshot(10, self.decision_issues(), [plain]))
+        self.assertFalse(result["decisions"]["CSL-2"]["answered"])
+        self.assertEqual(codes(result), [])
+
+
 class CommandLineTests(unittest.TestCase):
     def run_cli(self, payload):
         with tempfile.TemporaryDirectory() as directory:

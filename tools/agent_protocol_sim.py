@@ -504,7 +504,7 @@ class Evaluation:
         `developer-approved:` line naming the developer the prefix acts for and
         its complete `tool/session` prefix, the approval was confirmed no later
         than the posting time and within `approval_window_minutes` before it
-        (default 15), and the comment was never edited. Authority (condition 4) and accepted
+        (default 15, at most 15), and the comment was never edited. Authority (condition 4) and accepted
         contracts (condition 5) are not in the snapshot and are not checked.
         """
         first = comment.revisions[0].body

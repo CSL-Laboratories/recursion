@@ -88,9 +88,36 @@ Meanwhile: paused (or: <other work from the proceed list>)
 "Meanwhile" is never the option you are asking about, nor work that presupposes
 any option. In recursion, also record
 the blocker in `state/INBOX.md`. Then stop that line of work, release your claim
-under the repo's existing convention, and take only other admitted work that is
-next under the human-approved order. If there is no such order, propose one and
-wait. Do not ask again until something changes.
+(see Claims), and take only other admitted work that is next under the
+human-approved order. If there is no such order, propose one and wait. Do not ask
+again until something changes.
+
+## Claims
+
+Where the repo's AGENTS.md adopts the CSL-357 agent work protocol (spec draft v7),
+as recursion's does, claim with a claim record, not by assigning yourself. AGENTS.md
+holds the record format and wins on any conflict.
+
+- The Linear assignee stays the human owner. Post one agent-prefixed `claim v1`
+  comment (uuid, scope `whole issue` or `sub-issue CSL-M`, branch @ head, base,
+  `confirmed-at`, `heartbeat-at`, `release-on`). One claim per agent session per
+  repository.
+- Read back after at least 60 seconds: the earliest Linear `createdAt` wins; on a
+  tie, the lower uuid. Confirm or withdraw. No write before `confirmed-at`; then
+  move the issue to In Progress.
+- Renew `heartbeat-at` at least hourly with the real edit time. The lease is 2 hours
+  from the comment's last Linear `updatedAt`, plus 30 minutes grace. Never renew an
+  expired claim; take one over only under the AGENTS.md takeover conditions.
+- On session start or resume, before any write, check each claim you hold. If its
+  lease plus grace has passed, release it as lease expiry and never renew it; then
+  re-read the issue and take a fresh claim. Set `heartbeat-at` to the actual edit
+  time from a fresh clock read.
+- Release with a `release v1` record (done, evidence, open, next, files) once your
+  writers have stopped. Releasing never releases a hold.
+- Agent commits under a claim carry the trailer `Agent-Claim: <uuid>`; fixer,
+  bot and human commits are exempt.
+- Link a PR with `Fixes CSL-N` only when it completes the issue's acceptance
+  criteria; use `Related to CSL-N` when scope or decisions remain.
 
 ## Speaking for a developer
 

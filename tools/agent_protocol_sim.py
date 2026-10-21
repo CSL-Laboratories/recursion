@@ -944,8 +944,9 @@ class Evaluation:
                     and comment.created_at < self.agent_prefix_since):
                 # Lucas's DECISION on CSL-417 (comment e6d37489), option A: an unprefixed answer from
                 # before the agent-prefix rule is unverified and does not count. Confirmation is not modelled.
-                self.violation("decision_unverified", comment.issue, detail=comment.id)
-                for _, _, line in original:
+                for named in dict.fromkeys(named for named, _, _ in answering):
+                    self.violation("decision_unverified", named, detail=comment.id)
+                for _, _, line in answering:
                     self.void(comment, line, "before the agent-prefix rule")
                 continue
             stated.append((comment, original))

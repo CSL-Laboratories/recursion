@@ -1648,8 +1648,16 @@ class PrePrefixDecisionTests(unittest.TestCase):
 
     def test_bad_cutoff_is_rejected(self):
         for value in ("yesterday", 5, "2026-10-21T00:39:04"):
-            with self.subTest(value=value), self.assertRaises(sim.SnapshotError):
+            with self.subTest(value=value), self.assertRaisesRegex(sim.SnapshotError, "agent_prefix_since"):
                 sim.evaluate(snapshot(10, self.decision_issues(), [], config={"agent_prefix_since": value}))
+
+    def test_pre_cutoff_batch_is_reported_on_every_named_issue(self):
+        issues = self.decision_issues() + [issue("CSL-3", decision=decision())]
+        result = sim.evaluate(snapshot(10, issues, [comment("h1", "CSL-2", 3, "CSL-2: B; CSL-3: A")],
+                                       config=self.CUTOFF))
+        self.assertEqual(sorted(v["issue"] for v in result["violations"] if v["code"] == "decision_unverified"),
+                         ["CSL-2", "CSL-3"])
+        self.assertFalse(result["decisions"]["CSL-3"]["answered"])
 
 
 if __name__ == "__main__":

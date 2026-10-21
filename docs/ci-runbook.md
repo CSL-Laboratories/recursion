@@ -22,7 +22,7 @@ Linear issue with an @mention; a GitHub mention alone is not enough.
 | `linux` red on an older head after a push | Normal: the newer push cancelled that run, which still posts `linux` on its own superseded head (E5, E16) | Nothing; the current head decides. |
 | No `linux` on the head | No run started for that head: a pending run replaced before it started (E5, E16), a skip annotation (E18), an unresolved conflict (E19), or a run waiting for approval (E17; contract gap 16) | §4 below. |
 | `Devin Review` missing or pending | External app; not produced by this repository's workflows (contract §2) | Ask for a review through the Discord bot (`/devin review pr:<url>`); do not push to retrigger it. |
-| Red `watch` (stuck-thread watch) with `login_skip=1` and "API rate limit exceeded" | Not a CI failure (AGENTS.md:324-328) | Nothing; the required checks decide. |
+| Red `watch` (stuck-thread watch) with `login_skip=1` and "API rate limit exceeded" | Not a CI failure (AGENTS.md:333-337) | Nothing; the required checks decide. |
 
 ## 2. Re-running
 
@@ -31,7 +31,7 @@ Linear issue with an @mention; a GitHub mention alone is not enough.
 - **Flaky test:** re-run once. If it fails again on the same head, treat it as real and file a Bug.
   Re-run semantics are an accepted untested gap (contract §6, E15).
 - **`ci:full`:** add it when Windows and macOS evidence is needed; remove it once that full run
-  has passed on the current head (AGENTS.md:318-323). It persists otherwise and repeats Windows and
+  has passed on the current head (AGENTS.md:327-332). It persists otherwise and repeats Windows and
   macOS on every later non-draft PR event.
 
 ## 3. Cancellation

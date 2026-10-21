@@ -41,7 +41,7 @@ selecting a task.
 
 The loop starts from an objective, feature admission or direction decision approved by a founder acting within `CONTROL_PLANE.md` authority. Within one admitted task (one repository/worktree, explicit allowed paths, explicit non-goals and one machine-checkable gate), an agent runs bounded research, development and tests. It then closes out with independent evidence on the exact candidate. Closeout records the full 40-hex commit tested, the commands and results, unresolved criteria, review evidence and linked follow-ups. An implementer's PASS, a GitHub merge and a Linear **Done** status are never empirical or product acceptance.
 
-When blocked, an agent preserves its work and records the blocker. Blockers go in `state/INBOX.md`. Flag required decision-log entries; `state/DECISIONS.md` remains protected and may be changed only through its separately founder-approved authoring process. A product task grants no permission to write that log. The agent comments on the Linear issue with @mentions, then releases its execution claim by unassigning itself under existing conventions. Releasing the claim does not release the hold. A human-decision hold needs an explicit human decision receipt. A technical or dependency blocker needs evidence that its condition has cleared. Either way, the agent rechecks the gate and readiness and takes a fresh claim before resuming. Product decisions are never inferred from silence, elapsed time, CI results or issue status. A founder merge records its merge decision; it does not itself accept a product fragment or release an unrelated decision hold. Agents do not invent receipts or present their own records as founder statements.
+When blocked, an agent preserves its work and records the blocker. Blockers go in `state/INBOX.md`. Flag required decision-log entries; `state/DECISIONS.md` remains protected and may be changed only through its separately founder-approved authoring process. A product task grants no permission to write that log. The agent comments on the Linear issue with @mentions, then releases its execution claim by unassigning itself under existing conventions. Releasing the claim does not release the hold. A human-decision hold needs an explicit human decision receipt. A technical or dependency blocker needs evidence that its condition has cleared. Either way, the agent rechecks the gate and readiness and takes a fresh claim before resuming. Product decisions are never inferred from silence, elapsed time, CI results or issue status. A founder merge records its merge decision; it does not itself accept a product fragment or release an unrelated decision hold. Agents do not invent receipts or present their own records as founder statements; the one exception is a developer-approved comment that counts under `CONTROL_PLANE.md` (D-043).
 
 Moving to other work means taking only a separately admitted, already-authorised task. That task must be next under an explicit human-approved priority or order. If no such order exists, or it is ambiguous, propose the next choice to the founders on Linear and wait. Do not choose for them.
 
@@ -55,7 +55,7 @@ Shared research may be stored in the private [CSL-Laboratories/csl-research](htt
 - a mapping from sources to claims, with retrieval dates
 - limitations, supersession references and artifact manifests
 
-Consuming a fragment that requires acceptance needs the applicable exact, authenticated human receipt. A receipt identifier alone is not verification: manually check the source, human identity and authority, exact digest, conditions and revocation. An attributed relay is not a personal human receipt where personal posting is required; no new authentication tool is implied. Candidate-only research is labelled as such and grants no implementation scope. Keep evidence classes distinct.
+Consuming a fragment that requires acceptance needs the applicable exact, authenticated human receipt. A receipt identifier alone is not verification: manually check the source, human identity and authority, exact digest, conditions and revocation. An attributed relay is not a personal human receipt where personal posting is required; the one exception is a developer-approved comment that meets the conditions in `CONTROL_PLANE.md` (D-043), and it never counts where an accepted contract requires an exact authenticated human receipt. No new authentication tool is implied. Candidate-only research is labelled as such and grants no implementation scope. Keep evidence classes distinct.
 
 Never commit secrets, private account details, raw chats, signed URLs, bulk copyrighted material or datasets to Git. Manifests for approved external storage retain hash, size, access, retention and license notes. An access denial stops the affected transfer; do not look for an alternative path. Existing approved routes keep their actual authority. This section adds no API, new spend, fallback or overage. Lucas's spending and company-resource authority, own-account limits, the R2a prerequisite, the review roles and the rule that agents never merge are unchanged.
 
@@ -115,18 +115,17 @@ carries the line
 it is unedited since posting; it stays within that developer's authority and grants
 none; and no accepted contract (recursion program receipts, R2a, or another
 repository's) requires an exact authenticated human receipt, unless that contract
-is amended. In recursion this takes effect only when the `CONTROL_PLANE.md`
-amendment (CSL-401) merges. Until then a developer-approved comment carries the
-developer's direction but stays an attributed relay where personal posting is
-required (decision receipts, contract acceptance), and the human posts it. A named
-reviewer's GitHub review is always submitted by that person from their own account
-(`CONTROL_PLANE.md`), and a developer-approved comment is never a review verdict
-([Review roles](#review-roles)); CSL-401 changes neither. Never post decision
-language as an agent comment otherwise; link the record instead. A decision exists
-only if a human posted it from their own account, a developer-approved comment that
-counts under this rule carries it (in recursion none does until CSL-401 merges, and
-until then it releases no hold), or it is in `state/DECISIONS.md` or
-`docs/adr/`. Agent repetition, silence, a merge or an issue auto-closing to Done
+is amended (`CONTROL_PLANE.md`, D-043). A comment missing any of these stays an
+attributed relay where personal posting is required (decision receipts, contract
+acceptance), and the human posts it. A named reviewer's GitHub review is always
+submitted by that person from their own account (`CONTROL_PLANE.md`), and a
+developer-approved comment is never a review verdict ([Review roles](#review-roles)).
+Never post decision language as an agent comment otherwise; link the record instead.
+A decision exists only if a human posted it from their own account, a
+developer-approved comment that counts under this rule carries it, or it is in
+`state/DECISIONS.md` or `docs/adr/`. When relying on a developer-approved comment,
+check that the marker is present, the comment is unedited and the named developer
+has not disputed it; if any of that is unclear, ask that developer before acting. Agent repetition, silence, a merge or an issue auto-closing to Done
 is not a decision.
 
 **Unattended runs** (loops acting through a developer's account while nobody

@@ -114,15 +114,15 @@ wrote a comment from the author field. Make it visible in the text.
      (recursion program receipts, R2a, or another repository's accepted
      contract, unless that contract is amended).
 
-  **Where it applies:** in another repository once its own rules say so. In
-  recursion only once the `CONTROL_PLANE.md` amendment (CSL-401) merges;
-  until then a developer-approved comment carries the developer's direction but
-  stays an attributed relay where personal posting is required, and the human
-  posts decision receipts and contract acceptance from their own account.
+  **Where it applies:** in recursion, `CONTROL_PLANE.md` (D-043) carries these
+  conditions; in another repository, once its own rules say so. A comment
+  missing any condition stays an attributed relay where personal posting is
+  required, and the human posts decision receipts and contract acceptance from
+  their own account.
 
   **Never a review.** A named reviewer's GitHub review or verdict is always that
-  person's own post from their own account, before and after CSL-401; a
-  developer-approved comment never stands in for it.
+  person's own post from their own account; a developer-approved
+  comment never stands in for it.
 - **Never** post decision language ("approved", "accepted", "restricted",
   "decided") as an agent comment unless it is a developer-approved comment that
   counts under the rule above. Otherwise quote and link the human's comment.

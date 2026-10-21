@@ -664,7 +664,8 @@ def _crosslane_permissions(text: str, indent: int) -> dict[str, str] | str | Non
         return None
     if match.group(1):
         return match.group(1).strip()
-    body = re.match(rf"((?:{pad}  .*\n?)+)", text[match.end() + 1:])
+    # YAML allows blank and comment lines inside a mapping; they must not end the scan early.
+    body = re.match(rf"((?:{pad}  .*\n?|[ \t]*#.*\n?|[ \t]*\n)+)", text[match.end() + 1:])
     return dict(re.findall(rf"^{pad}  ([a-z-]+): *(\S+)", body.group(1), re.MULTILINE)) if body else {}
 
 
@@ -766,6 +767,8 @@ class CrossLaneAdmissionTests(unittest.TestCase):
                     if job in CROSSLANE_WRITER_JOBS.get(name, ()):
                         self.assertIsInstance(perms, dict)
                         self.assertLessEqual(set(perms), CROSSLANE_WRITER_SCOPES)
+                        # The authorized push needs a writable contents token.
+                        self.assertEqual(perms.get("contents"), "write")
                     else:
                         # Read-only: every scope read or none; an absent block inherits the workflow default.
                         if isinstance(perms, dict):

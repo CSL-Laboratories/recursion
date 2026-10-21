@@ -1313,7 +1313,12 @@ class Evaluation:
                 other for other in self.claims.values()
                 if other.uuid != claim.uuid and other.session == claim.session and other.repo == claim.repo
                 and (covered & set(other.scope_issues(self.issues)) or other.branch == claim.branch)
-                and (other.created_at, other.uuid) < (claim.created_at, claim.uuid) and self.ended(other, claim.created_at) is None
+                and (other.created_at, other.uuid) < (claim.created_at, claim.uuid)
+                # An expired claim the session never released still counts on
+                # another issue, as across sessions; on the same issue the
+                # implicit-takeover check reports it instead.
+                and (self.ended(other, claim.created_at) is None if other.issue == claim.issue
+                     else self.blocks_overlap(other, claim.created_at))
             ]
             if others:
                 self.violation("multiple_claims_per_session", claim.issue, claim.uuid, f"also holds {others[0].uuid}")

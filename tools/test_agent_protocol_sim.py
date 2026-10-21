@@ -199,6 +199,21 @@ class ClaimingTests(unittest.TestCase):
         self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], U1)
         self.assertEqual(result["issues"]["CSL-4"]["claims"]["recursion"]["winner"], U2)
 
+    def test_s22_own_expired_unreleased_claim_still_counts_on_another_issue(self):
+        # Codex P2 on #276: release before re-claiming (CSL-379); the same
+        # session's lapsed claim on CSL-1 still blocks a claim on CSL-4 that
+        # shares its branch.
+        result = sim.evaluate(snapshot(210, [issue("CSL-1"), issue("CSL-4")], [
+            claim("c1", "CSL-1", U1), claim("c2", "CSL-4", U2, at=200),
+        ]))
+        self.assertEqual(codes(result), ["multiple_claims_per_session"])
+
+    def test_s22_own_expired_claim_released_first_is_clean(self):
+        result = sim.evaluate(snapshot(210, [issue("CSL-1"), issue("CSL-4")], [
+            claim("c1", "CSL-1", U1, more_edits=[edit(190, U1, "released")]), claim("c2", "CSL-4", U2, at=200),
+        ]))
+        self.assertEqual(codes(result), [])
+
     def test_s22_parent_scope_and_direct_child_claim_overlap(self):
         # The parent claim's `scope: sub-issue CSL-2` already covers CSL-2.
         family = [issue("CSL-1"), issue("CSL-2", status="In Progress", parent="CSL-1")]

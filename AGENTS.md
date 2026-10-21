@@ -404,6 +404,26 @@ such issue appears within one watcher cycle, the PR author files it titled
 `Stuck PR threads: recursion#<PR>` with `<!-- stuck-pr-threads:recursion#<PR> -->`
 as the first line of the description.
 
+### Review convergence (CSL-381)
+
+Lucas's decision ([CSL-381 comment 81c9a1f7](https://linear.app/csl-laboratories/issue/CSL-381#comment-81c9a1f7-695b-4149-bd78-fc360175fafb)) bounds review rounds:
+
+- **Round 1** is the first full review round on a ready PR (Devin, Codex and
+  human reviews of that head) plus the fixes for it. Any finding can block in
+  round 1.
+- **After round 1**, only P0/P1 findings block merge or justify a fix push.
+  Record P2/P3 findings on the PR's Linear issue (one follow-up roll-up per PR, as in CSL-364) instead of pushing;
+  they do not hold the merge.
+- **Severity floor:** a finding on an order/risk path, a security finding or a secrets finding counts as at least P1, whatever badge the reviewer
+  gave it ([CSL-381 comment 68f4a769](https://linear.app/csl-laboratories/issue/CSL-381#comment-68f4a769-249f-488b-9158-750afee16b36)).
+- **After three rounds**, a founder decides whether to merge. Agents do not
+  start a fourth round on their own.
+
+This changes no merge authority, founder approval rule, Devin review or
+required check on the final head. It changes no workflow: the `claude.yml`
+fixer and the Codex gate keep the behavior described above until a separate
+`.github` change.
+
 ## Code Review Rules
 
 Codex GitHub reviews route CI readiness and human mediation (CSL-102/CSL-201),

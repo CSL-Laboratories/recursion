@@ -44,12 +44,14 @@ Linear issue with an @mention; a GitHub mention alone is not enough.
 
 ## 4. A required check is stuck or missing
 
-1. Is the PR a draft, conflicted (E19), or is its head commit skip-annotated (E18)? Fix that; no
-   run is created until then.
+1. Is the PR conflicted (E19), or is its head commit skip-annotated (E18)? GitHub creates no run
+   until that is fixed. (A draft is different: it does get a run, and `linux` fails on purpose until
+   `ready_for_review`, E2 and E4; see §1.)
 2. Actions tab shows **"Approve workflows to run"**: usually a fork PR under the external-contributor
    approval setting (E17); a writer reviews the fork diff, then approves. A `pull_request` opened,
    synchronized or reopened by a `GITHUB_TOKEN` automation also waits for approval (contract §7,
-   gap 16; GitHub docs, triggering a workflow).
+   gap 16). Any other event caused by `GITHUB_TOKEN` (a label, `ready_for_review`) creates no run at
+   all, so recover with a human action or an App or PAT identity (GitHub docs, triggering a workflow).
 3. A run is queued for minutes: check the organization's runner capacity (Team plan: 60 concurrent
    jobs, 5 macOS, shared by every repository and bot workflow in the organization; GitHub docs,
    Actions limits).

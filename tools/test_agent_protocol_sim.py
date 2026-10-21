@@ -190,11 +190,14 @@ class ClaimingTests(unittest.TestCase):
         result = sim.evaluate(snapshot(10, [issue("CSL-1")], [claim("c2", "CSL-1", U2), fresh]))
         self.assertEqual(codes(result), [])
 
-    def test_s22_second_claim_in_same_repository_is_flagged(self):
+    def test_s22_claims_on_two_issues_in_same_repository_are_allowed(self):
+        # Several claims per session are allowed (CSL-357 comment 0cdfd465).
         result = sim.evaluate(snapshot(10, [issue("CSL-1"), issue("CSL-4")], [
             claim("c1", "CSL-1", U1), claim("c2", "CSL-4", U2, at=1, branch="csl-4-work"),
         ]))
-        self.assertEqual(codes(result), ["multiple_claims_per_session"])
+        self.assertEqual(codes(result), [])
+        self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], U1)
+        self.assertEqual(result["issues"]["CSL-4"]["claims"]["recursion"]["winner"], U2)
 
     def test_human_revoke_ends_claim_and_agent_revoke_is_void(self):
         human = comment("h1", "CSL-1", 5, f"REVOKE CLAIM {U1}")

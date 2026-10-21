@@ -1214,9 +1214,12 @@ class Evaluation:
                     self.violation("loser_not_withdrawn", claim.issue, claim.uuid, f"winner {settled.uuid}")
             self.check_implicit_takeover(claim)
             self.check_takeover_refused(claim)
+            # A session may hold several claims, but only one per issue and
+            # repository (Lucas's decision, CSL-357 comment 0cdfd465).
             others = [
                 other for other in self.claims.values()
                 if other.uuid != claim.uuid and other.session == claim.session and other.repo == claim.repo
+                and other.issue == claim.issue
                 and (other.created_at, other.uuid) < (claim.created_at, claim.uuid) and self.ended(other, claim.created_at) is None
             ]
             if others:

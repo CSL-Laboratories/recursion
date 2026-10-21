@@ -326,7 +326,7 @@ class WorkflowShapeTests(unittest.TestCase):
         self.assertEqual(step_run(step_block(settle, "Let the pushed series settle")), "sleep 120")
         tests = job_block("linux-tests")
         self.assertIn("name: Linux tests\n", tests)
-        self.assertIn("runs-on: blacksmith-2vcpu-ubuntu-2404", tests)
+        self.assertIn("runs-on: ubuntu-24.04", tests)
         self.assertIn("timeout-minutes: 15\n", tests)
         self.assertEqual(job_needs(tests), ["preflight", "settle"])
         for needle in ("fetch-depth: 0", "cache: pip", "tools/ci_gate.py --force", "tools/perf_ci.py", "::warning::"):
@@ -335,7 +335,7 @@ class WorkflowShapeTests(unittest.TestCase):
         windows, macos = job_block("windows"), job_block("macos")
         self.assertEqual(job_needs(windows), ["preflight", "settle", "linux"])
         self.assertEqual(job_needs(macos), ["preflight", "settle", "linux"])
-        self.assertIn("runs-on: blacksmith-2vcpu-windows-2025", windows)
+        self.assertIn("runs-on: windows-2025", windows)
         self.assertIn("timeout-minutes: 20\n", windows)
         self.assertIn("core.longpaths true", windows)
         self.assertIn("runs-on: macos-latest", macos)

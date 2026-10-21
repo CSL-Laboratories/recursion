@@ -1,5 +1,5 @@
-# Recursion v3 — tiered provider-free CI (CSL-255: free preflight, paid tests).
-#
+# Recursion v3 — tiered provider-free CI (CSL-255: light preflight, full tests).
+# All jobs use free GitHub-hosted runners (CSL-408); `paid` names the test runner.
 # Required status check (branch protection): linux
 # Windows and macOS are extra OS coverage, not required on every PR.
 #
@@ -11,7 +11,7 @@
 #   true/false strings. paid is true only for full scope on a non-draft event.
 # - settle (ubuntu-latest, free): 120 s pause on every non-draft PR synchronize
 #   so a pushed series settles before the paid runner starts. Skipped otherwise.
-# - linux-tests (Blacksmith, paid): dependency install, provider-free gate and
+# - linux-tests (ubuntu-24.04, free): dependency install, provider-free gate and
 #   the perf check. Starts only after preflight succeeded with paid and run_full
 #   exactly true, the PR is not a draft, and settle has its expected result.
 #   always() && !cancelled() keeps a deliberately skipped settle from blocking
@@ -163,7 +163,7 @@ jobs:
       (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
       ((github.event_name == 'pull_request' && github.event.action == 'synchronize' && needs.settle.result == 'success') ||
        (!(github.event_name == 'pull_request' && github.event.action == 'synchronize') && needs.settle.result == 'skipped'))
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       # Full history: delegated-Q test_contract.py resolves TASK_BASE (0c908f6)^{tree}.
@@ -302,7 +302,7 @@ jobs:
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
        (github.event_name == 'pull_request' && github.event.pull_request.draft == false && contains(github.event.pull_request.labels.*.name, 'ci:full')))
-    runs-on: blacksmith-2vcpu-windows-2025
+    runs-on: windows-2025
     timeout-minutes: 20
     steps:
       - name: Enable Git long paths

@@ -229,7 +229,7 @@ class WorkflowTests(unittest.TestCase):
         # CSL-255: the required linux job is a free aggregate; the paid suite is linux-tests.
         self.assertIn("runs-on: ubuntu-latest", linux)
         tests = text[text.index("  linux-tests:\n") : text.index("  linux:\n")]
-        self.assertIn("runs-on: blacksmith-2vcpu-ubuntu-2404", tests)
+        self.assertIn("runs-on: ubuntu-24.04", tests)
         self.assertIn("if: always()\n", linux)
         self.assertNotRegex(linux, r"(?m)^    if: .*draft")
         self.assertNotIn("github.event.action != 'labeled'", linux)
@@ -269,6 +269,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("name: windows", matrix_wf)
         self.assertIn("name: macos", matrix_wf)
         self.assertNotIn("needs: linux", matrix_wf)
+        # CSL-408: the ci:full Windows job runs on the free GitHub-hosted image.
+        self.assertIn("runs-on: windows-2025", matrix_wf)
         pr_lint = (ROOT / ".github" / "workflows" / "pr-lint.yml").read_text(encoding="utf-8")
         self.assertIn("runs-on: ubuntu-latest", pr_lint)
         self.assertNotIn("blacksmith", pr_lint)

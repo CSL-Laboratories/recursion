@@ -81,7 +81,7 @@ and code changes are covered by a test; it needs no new spend, credentials,
 permissions, settings or protected-path edits; no other claim or writer's run is
 active on the branch or files; and it starts no paid CI. Marking ready, pushing to
 a non-draft PR, adding `ci:full`, and any dispatch, re-run or `/ci` command start
-paid Blacksmith runs. Pushes to drafts or to branches without a PR, and read-only
+CI runs (free since CSL-408). Pushes to drafts or to branches without a PR, and read-only
 API queries, are fine.
 
 **Escalate** when any holds: a product detail, UX choice, scope or priority change
@@ -216,7 +216,7 @@ Current tools. Do not add paid services or raise spend limits.
   [Review roles](#review-roles).
 - **Claude Code Action** — PR fixer for Devin findings and `@claude` mentions
   on open same-repo PRs by verified repository writers (`.github/workflows/claude.yml`).
-- **Blacksmith CI** — only CI. See [CI](#ci).
+- **GitHub Actions** — only CI, on free GitHub-hosted runners (CSL-408). See [CI](#ci).
 - **Google Workspace** (`csl-laboratories.com`) — meetings and notes.
 - **Discord bot** (`csl-bot-operations`) — Liaison. Commands and MCP; see below. Trigger CI
   and reviews through these (or the `ci:full` label), not by editing config.
@@ -307,12 +307,12 @@ Linear is the team's primary async channel, alongside Google Meet and Discord.
 
 ## CI
 
-- Required check: `linux` (Blacksmith).
+- Required check: `linux` (GitHub-hosted).
 - Windows and macOS run on the `ci:full` label, on manual dispatch, and on `master` (macOS
   nightly at 07:17 UTC).
 - Superseded runs are cancelled.
 - A `ci:full` added by a person persists, so every later non-draft PR event reruns Windows
-  (Blacksmith) and macOS. Remove it once its full run has passed on the current head and
+  (GitHub-hosted) and macOS. Remove it once its full run has passed on the current head and
   the PR needs no further automatic READY. A manual removal is a human hold: the Codex gate
   skips READY on the head where it first sees the removal, and READY on a later head can
   add the label again. Re-add it yourself if a change needs the full matrix sooner. The
@@ -348,7 +348,7 @@ label, not by editing config.
   one issue per thread. Codex is a mediator, not a reviewer of record and not
   a fixer: it must not push code. The workflow may auto-resolve a thread after
   a trusted `CODEX-THREAD: RESOLVE` ruling (see [Review loop](#review-loop)).
-- **Blacksmith** is the only CI.
+- **GitHub Actions** (GitHub-hosted runners) is the only CI.
 - Cursor, Codex, Grok, and interactive Claude Code develop features from Linear
   issues. They must not post review verdicts or run review-fix loops on other
   agents' PRs, except the Codex `CODEX-GATE:` line in [Code Review Rules](#code-review-rules).
@@ -454,7 +454,7 @@ lands, note perf impact in the PR description for performance-sensitive changes.
 
 ## Guardrails (MUST)
 
-Do **not** edit CI/runner configuration (`.github/workflows/**`, Blacksmith runner labels,
+Do **not** edit CI/runner configuration (`.github/workflows/**`, runner labels,
 caching, concurrency), Devin configuration or settings, Devin automations, repo rulesets,
 or the MCP server list, unless a Linear issue explicitly assigned by a human asks for it.
 

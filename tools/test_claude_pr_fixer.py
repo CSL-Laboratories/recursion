@@ -460,7 +460,9 @@ class SharedQueuePolicyTests(unittest.TestCase):
         self.assertIn("  .github/workflows/claude.yml:", config)
         self.assertIn("  .github/workflows/conflict-scan.yml:", config)
         self.assertIn("  .github/workflows/codex-gate.yml:", config)
-        self.assertIn("blacksmith-2vcpu-ubuntu-2404", config)
+        # CSL-408: every job is GitHub-hosted, so no custom runner labels are declared.
+        self.assertNotIn("self-hosted-runner", config)
+        self.assertNotIn("blacksmith", config)
 
 
 class WorkflowStructureTests(unittest.TestCase):

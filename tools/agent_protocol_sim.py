@@ -936,7 +936,11 @@ class Evaluation:
                 continue
             if any(self.answer_pairs(comment, r.body) != original for r in comment.revisions[1:]):
                 self.violation("decision_edited", comment.issue, detail=comment.id)
-            if (original and comment.approved_by is None and self.agent_prefix_since is not None
+            answering = [
+                p for p in original
+                if p[1].lower() != "hold" and self.issues.get(p[0], {}).get("decision") is not None
+            ]
+            if (answering and comment.approved_by is None and self.agent_prefix_since is not None
                     and comment.created_at < self.agent_prefix_since):
                 # Lucas's DECISION on CSL-417 (comment e6d37489), option A: an unprefixed answer from
                 # before the agent-prefix rule is unverified and does not count. Confirmation is not modelled.

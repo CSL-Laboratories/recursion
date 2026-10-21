@@ -1615,6 +1615,17 @@ class PrePrefixDecisionTests(unittest.TestCase):
         self.assertEqual(result["decisions"]["CSL-2"]["answer"], "B")
         self.assertIn("decision_unverified", codes(result))
 
+    def test_pre_cutoff_hold_is_not_flagged(self):
+        result = sim.evaluate(snapshot(10, self.decision_issues(), [comment("h1", "CSL-2", 3, "DECISION: HOLD")],
+                                       config=self.CUTOFF))
+        self.assertNotIn("decision_unverified", codes(result))
+        self.assertEqual(result["void_lines"], [])
+
+    def test_pre_cutoff_decision_line_on_non_decision_issue_is_not_flagged(self):
+        result = sim.evaluate(snapshot(10, self.decision_issues(), [comment("h1", "CSL-1", 3, "DECISION: B")],
+                                       config=self.CUTOFF))
+        self.assertNotIn("decision_unverified", codes(result))
+
     def test_developer_approved_comment_is_not_affected(self):
         result = sim.evaluate(snapshot(10, self.decision_issues(), [approved("a1", "CSL-2", 3, "DECISION: B")],
                                        config=self.CUTOFF))

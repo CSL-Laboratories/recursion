@@ -601,6 +601,10 @@ CROSSLANE_SAFE_BASH = {
     "Bash(python -X utf8 -B tools/test_claude_pr_fixer.py)", "Bash(python3 -X utf8 -B tools/test_claude_pr_fixer.py)",
 }
 CROSSLANE_PUSH = re.compile(r"^Bash\(git push origin HEAD:refs/heads/\$\{\{ (steps\.(live|cap)\.outputs\.head_ref|matrix\.pr\.head_ref) \}\}\)$")
+# A push written as a shell command or argv anywhere outside the model's tool grants (prompt prose
+# such as "push with git push origin ..." is not a command and does not match).
+CROSSLANE_STEP_PUSH = re.compile(r"(?m)(^\s*(-\s+)?(run:\s*)?|(&&|\|\||;|\$\()\s*)git(\s+-[Cc]\s+\S+)*\s+push\b"
+                                 r"|run_git\(\[\s*\\?[\"']push\\?[\"']|\\?[\"']git\\?[\"'],\s*\\?[\"']push\\?[\"']")
 
 
 def _crosslane_text(name: str) -> str:
@@ -626,6 +630,10 @@ def _crosslane_jobs(name: str) -> dict[str, str]:
     return {key: "\n".join(value) for key, value in out.items()}
 
 
+def _crosslane_callees(name: str) -> set[str]:
+    return set(re.findall(r"^\s*uses: *\./\.github/workflows/([A-Za-z0-9_.-]+)\s*$", _crosslane_text(name), re.MULTILINE))
+
+
 def _crosslane_value(block: str, key: str) -> str | None:
     match = re.search(rf"^    {re.escape(key)}: *(.*)$", block, re.MULTILINE)
     return match.group(1).strip() if match else None
@@ -642,7 +650,11 @@ class CrossLaneAdmissionTests(unittest.TestCase):
         found = {p.name for p in CROSSLANE_WORKFLOWS.glob("*.y*ml")
                  if re.search(r"anthropics/claude-code|ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN",
                               p.read_text(encoding="utf-8"))}
+        # A local reusable workflow a writer calls is a writer file too, with or without the markers.
+        while callees := {c for name in found for c in _crosslane_callees(name)} - found:
+            found |= callees
         self.assertEqual(found, set(CROSSLANE_WRITER_FILES))
+        self.assertEqual(set(CROSSLANE_ALL_JOBS), set(CROSSLANE_WRITER_FILES))
         for name, expected in CROSSLANE_ALL_JOBS.items():
             self.assertEqual(set(_crosslane_jobs(name)), expected)
 
@@ -675,8 +687,9 @@ class CrossLaneAdmissionTests(unittest.TestCase):
                 with self.subTest(workflow=name, job=job):
                     caller = _crosslane_value(block, "uses")
                     if caller is not None:
-                        # A reusable-workflow caller runs nothing itself; its callee is checked as a writer file.
+                        # A reusable-workflow caller runs nothing itself; its callee must be a checked writer file.
                         self.assertRegex(caller, r"^\./\.github/workflows/[a-z0-9-]+\.yml$")
+                        self.assertIn(caller.rsplit("/", 1)[1], CROSSLANE_WRITER_FILES)
                     else:
                         self.assertIn(_crosslane_value(block, "runs-on"), CROSSLANE_HOSTED)
 
@@ -707,9 +720,9 @@ class CrossLaneAdmissionTests(unittest.TestCase):
         for name in CROSSLANE_WRITER_FILES:
             for job, block in _crosslane_jobs(name).items():
                 with self.subTest(workflow=name, job=job, check="no push outside the model grant"):
-                    # The only push path is the model's single granted command; no `run:` step pushes.
+                    # The only push path is the model's single granted command; no step pushes as a shell command or git argv.
                     steps = re.sub(r'--(dis)?allowedTools "[^"]*"', "", block)
-                    self.assertNotRegex(steps, r'(?m)^\s*(- run: )?git push\b|run_git\(\[\s*"push"')
+                    self.assertNotRegex(steps, CROSSLANE_STEP_PUSH)
                     if job not in CROSSLANE_WRITER_JOBS.get(name, ()):
                         self.assertEqual(_crosslane_value(block, "permissions") or "", "")
                         self.assertNotRegex(block, r"(?m)^      (contents|id-token|actions): write$")

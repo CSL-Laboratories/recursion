@@ -678,8 +678,10 @@ with no named human reviewer and that acceptance is treated as the rule.
 
 **Review:** at a founder revisit of Option B, or the next monthly decision-log review.
 
+---
+
 ## D-043 - A developer-approved comment counts as a personal receipt
-Date: 2026-10-20 - Status: ACCEPTED founder decision; documentation record pending review and merge
+Date: 2026-10-20 (decision) - Status: ACCEPTED founder decision; `CONTROL_PLANE.md` amendment pending review and merge
 
 **Source record:** Lucas Guerra posted this decision from his own account, unprefixed, on
 [CSL-353](https://linear.app/csl-laboratories/issue/CSL-353/recursion-add-the-proceed-or-escalate-skill-and-agentsmd-section#comment-6e602e3a)
@@ -707,8 +709,10 @@ typed founder statement in this file.
 as [CSL-401](https://linear.app/csl-laboratories/issue/CSL-401). Lucas is a founder, and
 `CONTROL_PLANE.md` lets any founder approve a protected-path amendment through this process.
 
-**Options considered:** relayed by the authoring agent from the Playground session chat
-(the receipt is comment `6e602e3a` above, not this relay). Lucas chose among these before posting:
+**Options considered:** the question was put on CSL-353 in comment
+`1cff7f9f-b0c1-4104-bede-f881a812b525` (2026-10-20). The contract-exclusion choice is relayed by
+the authoring agent from the Playground session chat (the receipt is comment `6e602e3a` above,
+not this relay). Lucas chose among these before posting:
 A) keep a developer-approved comment as an attributed relay that never counts as a personal
 receipt (the text before this entry); B) count it as a receipt, with fresh approval of the
 exact text and a marker line. For accepted contracts, he chose to exclude them over including
@@ -724,7 +728,10 @@ tool. Accepted contracts keep their own exact receipt rules.
 **Consequence:** `CONTROL_PLANE.md` ("Coding agents") lists the five conditions as the one
 exception to the rule that agents do not present agent-authored records as personal founder
 statements. It also restates the existing rule that a named reviewer's GitHub review is that
-person's own (Protected paths); a developer-approved comment never replaces it.
+person's own (Protected paths); a developer-approved comment never replaces it. Within
+condition 4, a developer-approved comment can carry whatever its named developer could post
+personally: a founder's protected-path authoring approval, and Lucas's reserved decisions only
+when the named developer is Lucas.
 `AGENTS.md`/`CLAUDE.md` and the `proceed-or-escalate` skill drop their "until CSL-401 merges"
 wording.
 

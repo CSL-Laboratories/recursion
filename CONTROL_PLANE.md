@@ -78,9 +78,9 @@ recommend and propose; founders decide. On ambiguity an agent records a blocker 
 Decision packets give options, classified evidence, tradeoffs, a recommendation, the
 strongest countercase, reversibility, further research cost and a deadline. Consequential
 founder decisions record the chosen option, rationale, conditions and revisit trigger.
-Agents must not invent founder decisions or present agent-authored records as personal
-founder statements, with one exception (D-043). A developer-approved comment counts as
-that developer's personal receipt only when all of these hold:
+Agents must not invent founder decisions. They must not present agent-authored records as
+personal founder statements, with one exception (D-043): a developer-approved comment
+counts as that developer's personal receipt only when all of these hold:
 
 1. Immediately before posting, the agent showed the developer the final exact text and the
    developer approved it in the same session. Approval from an earlier turn or another
@@ -93,8 +93,9 @@ that developer's personal receipt only when all of these hold:
    program receipts, R2a, or another repository's accepted contract), unless that
    contract is amended.
 
-It is never a named reviewer's GitHub review (Protected paths). Any other agent-authored
-record stays an attributed relay.
+It never stands in for a named reviewer's GitHub review, which that person submits from
+their own account (Protected paths). Any other agent-authored record stays an attributed
+relay.
 
 ### Independent verifiers
 

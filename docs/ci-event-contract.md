@@ -172,13 +172,13 @@ Without `queue: max`, a concurrency group keeps at most one pending run, and a n
 - Settle is a fixed `sleep 120` on every non-draft PR `synchronize`, whatever the scope (`ci.yml:140-152`). It is not a timer that resets on each push.
 - The debounce effect comes from the concurrency group: a newer push cancels the older run while it is still in preflight or settle, before Linux tests allocates a Blacksmith runner. [SRC]
 - Observed timings: preflight about 9 to 10 s, then settle. So a run is exposed to paid allocation from about 130 s after it starts (39389995068: preflight 07:57:33 to 07:57:42Z, settle from 07:57:44Z). [OBS]
-- opened, reopened, ready_for_review, push and dispatch skip settle and allocate immediately (`ci.yml:164-165`). [SRC]
+- Non-draft opened and reopened, ready_for_review, push and dispatch skip settle and allocate immediately (`ci.yml:164-165`). A draft opened or reopened event skips `linux-tests` and allocates nothing (E2, E6). [SRC]
 
-**Rapid pushes.** N pushes, each arriving before the previous run has allocated Linux tests (about 130 s after that run started), produce N-1 cancelled runs with no paid start and one paid run. Each cancelled run that had started posts a failed `linux` on its superseded head; a pending run replaced before starting posts nothing (E5, E16). A push after the window cancels a paid Linux tests job mid-run. [SRC] [OBS]; the mid-run case is [INF]: none was observed.
+**Rapid pushes.** On a non-draft PR, N pushes, each arriving before the previous run has allocated Linux tests (about 130 s after that run started), produce N-1 cancelled runs with no paid start and one paid run. Each cancelled run that had started posts a failed `linux` on its superseded head; a pending run replaced before starting posts nothing (E5, E16). A push after the window cancels a paid Linux tests job mid-run. Pushes to a draft PR start no paid run at all (E4). [SRC] [OBS]; the mid-run case is [INF]: none was observed.
 
 **Identical-head duplicates.**
 
-- [DEC] Founder decision **B2 = NO**: do not cancel an identical-head pending twin. Source: Linear CSL-356 comment 15995b76, 2026-10-20, "Relayed by the CI-lane session from Lucas in chat". It is an attributed relay, not a personal receipt, and it is scoped to the the sibling repository cancel controller.
+- [DEC] Founder decision **B2 = NO**: do not cancel an identical-head pending twin. Source: Linear CSL-356 comment 15995b76, 2026-10-20, "Relayed by the CI-lane session from Lucas in chat". It is an attributed relay, not a personal receipt, and it is scoped to the sibling repository's cancel controller.
 - Recursion has no cancel controller. Its native `ci.yml` concurrency cancels **any** older run in the PR group, including identical-head twins, and keeps the newest (section 3.1, observed three times). [SRC] [OBS]
 - Native concurrency never cancels the newest run in a group, so the head always gets a `linux` from a surviving run unless a later event supersedes it. B2's liveness concern (a cancelled twin leaving a head with no completing run) therefore does not arise in the same form. [INF]
 - Whether B2 should constrain recursion is an open question for the founders; nothing here changes it.

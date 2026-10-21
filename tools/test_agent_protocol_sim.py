@@ -1709,6 +1709,8 @@ class LapsedClaimResumeTests(unittest.TestCase):
         cases = {
             "stale value": (ts(40), ["heartbeat_time_mismatch"]),
             "within tolerance": (ts(100, -30), []),
+            "not a timestamp": ("soon", []),
+            "malformed timestamp": ("2026-10-20Tsoon", []),
         }
         for name, (value, expected) in cases.items():
             with self.subTest(case=name):

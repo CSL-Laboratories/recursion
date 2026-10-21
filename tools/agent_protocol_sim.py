@@ -1282,7 +1282,11 @@ class Evaluation:
         for revision in claim.comment.revisions:
             value = claim_fields(revision.body).get("heartbeat-at")
             if value and value != previous and TIMESTAMP_VALUE.match(value):
-                declared = parse_ts(value, f"claim {claim.uuid}: heartbeat-at")
+                try:
+                    declared = parse_ts(value, f"claim {claim.uuid}: heartbeat-at")
+                except SnapshotError:
+                    previous = value
+                    continue  # not a complete timestamp, so not checked
                 if abs(declared - revision.at) > self.heartbeat_tolerance:
                     self.violation("heartbeat_time_mismatch", claim.issue, claim.uuid,
                                    f"{value} on the edit at {revision.at.isoformat()}")

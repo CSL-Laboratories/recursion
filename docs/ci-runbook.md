@@ -44,10 +44,13 @@ Linear issue with an @mention; a GitHub mention alone is not enough.
 
 1. Is the PR a draft, conflicted (E19), or is its head commit skip-annotated (E18)? Fix that; no
    run is created until then.
-2. Actions tab shows **"Approve workflows to run"**: the push came from `GITHUB_TOKEN` automation or
-   a fork (contract §7, gap 16; E17). A writer approves it there.
+2. Actions tab shows **"Approve workflows to run"**: usually a fork PR under the external-contributor
+   approval setting (E17); a writer reviews the fork diff, then approves. A `pull_request` opened,
+   synchronized or reopened by a `GITHUB_TOKEN` automation also waits for approval (contract §7,
+   gap 16; GitHub docs, triggering a workflow).
 3. A run is queued for minutes: check the organization's runner capacity (Team plan: 60 concurrent
-   jobs, 5 macOS, shared by every repository and bot workflow in the organization).
+   jobs, 5 macOS, shared by every repository and bot workflow in the organization; GitHub docs,
+   Actions limits).
 4. Otherwise push nothing yet; comment on the Linear issue with the run IDs and @mention the CI
    owner.
 
@@ -65,7 +68,7 @@ Linear issue with an @mention; a GitHub mention alone is not enough.
 
 - Every job must use a standard GitHub-hosted label (`ubuntu-latest`, `ubuntu-24.04`,
   `windows-2025`, `macos-latest`; contract §1). Since CSL-408 these are free **because the
-  repository is public**. Making it private would meter minutes (Team includes 3,000 per month);
+  repository is public**. Making it private would meter minutes (Team includes 3,000 per month; GitHub docs, Actions billing);
   re-plan before that.
 - `tools/test_ci_runner_cost.py` prices runner labels; `CrossLaneAdmissionTests` in `tools/test_ci_scheduling.py` fail
   if a Claude writer workflow leaves GitHub-hosted runners.
@@ -82,11 +85,19 @@ Linear issue with an @mention; a GitHub mention alone is not enough.
   or the rulesets also updates [ci-event-contract.md](ci-event-contract.md) in the same PR, including
   re-pinned `file:line` citations when lines move, or says "no contract row changes" and why.
 - The Claude writers (`claude.yml`, `conflict-scan.yml`) must keep the properties that
-  `CrossLaneAdmissionTests` (`tools/test_ci_scheduling.py`) check: no CI dispatch, re-run or CI label write; one exact
-  non-force `git push origin HEAD:refs/heads/<branch>` permission per writer job; one shared
-  `claude-<PR>` lock without cancellation; the eight-commit guard on the fixer and `@claude` jobs,
-  three attempts, and the pause. The conflict resolver has no eight-commit guard; it runs on
-  conflicted PRs that the scan selects, every two hours and on `master` pushes (conflict-scan.yml:8-11).
+  `CrossLaneAdmissionTests` (`tools/test_ci_scheduling.py`) check statically: no CI dispatch, re-run,
+  ready-for-review or CI-label add (the only CI-label write is the fixer revoking a gate-owned
+  `ci:full`, `revoke_owned_ci`, claude.yml:1869-1873); a reviewed set of shell grants with exactly
+  one non-force `git push origin HEAD:refs/heads/<branch>` per writer job; one shared `claude-<PR>`
+  lock without cancellation; the eight-commit guard on the fixer and `@claude` jobs, the Devin
+  path's three-attempt reservation, and the pause. A new Claude workflow, job or shell grant fails
+  the test until it is reviewed there. Retry behaviour itself is tested in
+  `tools/test_claude_pr_fixer.py`.
+- **The conflict resolver has no eight-commit guard.** It pushes at most once per run (single-attempt
+  push guard, conflict-scan.yml:440) on conflicted PRs that the scan selects, on the two-hourly
+  schedule and on manual dispatch; a `master` push runs only the scan (conflict-scan.yml:10-12, 358).
+  A PR that stays conflicted can get a Claude merge attempt on every scheduled scan; pause it if
+  that is unwanted.
 
 ## 8. Owners
 

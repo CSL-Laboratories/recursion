@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline checker for the CSL-357 agent work protocol (spec draft v5).
+"""Offline checker for the CSL-357 agent work protocol (spec draft v6).
 
 Run from the repository root:
 
@@ -48,8 +48,9 @@ comments without the agent prefix, and keep the effect they had before a known
 deletion time. The one exception is a developer-approved comment
 (`CONTROL_PLANE.md`, D-043): an agent comment with exactly one line
 `developer-approved: <developer>, exact text confirmed <UTC time>, session <id>`
-naming the developer and session of its prefix, confirmed no later than it was
-posted and never edited, speaks as that developer. Its prefix and marker lines
+naming the developer and session of its complete `tool/session` prefix,
+confirmed no later than it was posted and at most `approval_window_minutes`
+(default 15) before, and never edited, speaks as that developer. Its prefix and marker lines
 are dropped and the rest is read like a human comment; an invalid marker is
 reported as `developer_approval_invalid` and the comment stays void. A
 developer-approved comment cannot define or revoke a standing approval. Standing
@@ -78,6 +79,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "coordinator_ack_required": False,
     "standing_approvals_issue": None,
     "sa_max_days": 90,
+    "approval_window_minutes": 15,
 }
 
 AGENT_PREFIX = re.compile(r"^Agent \(([^)]*)\):")
@@ -333,7 +335,8 @@ class Evaluation:
         if unknown:
             raise SnapshotError(f"config: unknown keys {sorted(unknown)}")
         self.config = {**DEFAULT_CONFIG, **config}
-        for key in ("lease_minutes", "grace_minutes", "readback_seconds", "takeover_wait_minutes", "sa_max_days"):
+        for key in ("lease_minutes", "grace_minutes", "readback_seconds", "takeover_wait_minutes", "sa_max_days",
+                    "approval_window_minutes"):
             value = self.config[key]
             if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 10**6:
                 raise SnapshotError(f"config: {key} must be an integer from 0 to 1000000")
@@ -492,15 +495,15 @@ class Evaluation:
             comments.append(comment)
         return comments
 
-    @staticmethod
-    def developer_approval(comment: Comment) -> tuple[str | None, str | None]:
+    def developer_approval(self, comment: Comment) -> tuple[str | None, str | None]:
         """(developer, None) if the comment is a valid developer-approved comment,
         (None, reason) if it carries a marker that does not count, else (None, None).
 
         D-043 conditions checked here: the agent-prefixed comment carries one
         `developer-approved:` line naming the developer the prefix acts for and
-        its session, the approval was confirmed no later than the posting time,
-        and the comment was never edited. Authority (condition 4) and accepted
+        its complete `tool/session` prefix, the approval was confirmed no later
+        than the posting time and within `approval_window_minutes` before it
+        (default 15), and the comment was never edited. Authority (condition 4) and accepted
         contracts (condition 5) are not in the snapshot and are not checked.
         """
         first = comment.revisions[0].body
@@ -527,6 +530,9 @@ class Evaluation:
         if len(comment.revisions) > 1:
             return None, "edited after posting"
         session, developer = header
+        tool, slash, session_id = session.partition("/")
+        if not (tool.strip() and slash and session_id.strip() and developer):
+            return None, "incomplete agent prefix"
         if match["developer"] != developer:
             return None, f"approved by {match['developer']!r} but posted for {developer!r}"
         if match["session"] not in {session, session.partition("/")[2]}:
@@ -537,6 +543,10 @@ class Evaluation:
             return None, "bad confirmation time"
         if confirmed > comment.created_at:
             return None, "approval confirmed after posting"
+        window = self.config["approval_window_minutes"]
+        if comment.created_at - confirmed > timedelta(minutes=window):
+            # Lucas's DECISION on CSL-402 (comment b3c5c1b8): at most 15 minutes.
+            return None, f"approval confirmed more than {window} minutes before posting"
         return developer, None
 
     def _load_list(self, snapshot: dict[str, Any], key: str, required: tuple[str, ...]) -> list[dict[str, Any]]:

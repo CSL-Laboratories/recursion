@@ -19,10 +19,26 @@ PYTHONS = ("python", "python3")
 GH_READ = ("gh pr view", "gh pr diff", "gh pr checks", "gh pr list", "gh run list", "gh run view")
 LINEAR = {f"mcp__{server}__{tool}" for server in ("linear", "Linear")
           for tool in ("get_issue", "list_issues", "list_comments")}
+
+
+def tool_test_rules(paths):
+    """The exact allow rules for these tools/test_*.py files, in settings.json order."""
+    return [f"Bash({py} -X utf8 -B tools/{name})"
+            for name in sorted(path.name for path in paths) for py in PYTHONS]
+
+
+def missing_rules_message(missing):
+    """Name the allow lines to add, as they appear in .claude/settings.json (CSL-380)."""
+    lines = "\n".join(f"      {json.dumps(rule)}," for rule in missing)
+    return ("Add these allow rules to .claude/settings.json for the new tools/test_*.py "
+            "files:\n" + lines + "\n.claude/settings.json is the agent permission policy, "
+            "so a founder approves these lines in the PR; the Claude fixer cannot add them.")
+
+
 # Script tests are allowed one exact rule each; a new tools/test_*.py fails this
 # guard until its rule is added on purpose.
-TOOL_TESTS = {f"Bash({py} -X utf8 -B tools/{path.name})"
-              for path in (ROOT / "tools").glob("test_*.py") for py in PYTHONS}
+TOOL_TEST_PATHS = tuple((ROOT / "tools").glob("test_*.py"))
+TOOL_TESTS = set(tool_test_rules(TOOL_TEST_PATHS))
 ALLOW = (
     {f"Bash({py} -X utf8 -B tools/ci_gate.py{arg})"
      for py in PYTHONS for arg in ("", " --force", " --paths-only")}
@@ -96,10 +112,24 @@ class PolicyTests(unittest.TestCase):
         allow, ask = permissions["allow"], permissions["ask"]
         self.assertEqual(len(allow), len(set(allow)))
         self.assertEqual(len(ask), len(set(ask)))
+        missing = [rule for rule in tool_test_rules(TOOL_TEST_PATHS) if rule not in allow]
+        self.assertFalse(missing, missing_rules_message(missing))
         self.assertEqual(set(allow), ALLOW)
         self.assertEqual(set(ask), ASK)
         self.assertNotIn("deny", permissions)
         self.assertNotIn("defaultMode", permissions)
+
+    def test_missing_tool_test_rules_are_named_for_a_founder(self):
+        allow = settings()["permissions"]["allow"]
+        paths = TOOL_TEST_PATHS + (ROOT / "tools" / "test_example.py",)
+        missing = [rule for rule in tool_test_rules(paths) if rule not in allow]
+        expected = ['      "Bash(python -X utf8 -B tools/test_example.py)",',
+                    '      "Bash(python3 -X utf8 -B tools/test_example.py)",']
+        self.assertEqual(len(missing), 2)
+        message = missing_rules_message(missing)
+        for line in expected:
+            self.assertIn(line, message)
+        self.assertIn("founder", message)
 
     def test_only_read_only_gh_rules_take_arguments(self):
         # Code-running commands are exact: a wildcard would also admit options

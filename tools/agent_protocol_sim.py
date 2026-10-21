@@ -940,7 +940,10 @@ class Evaluation:
     def winner(self, issue: str, repo: str, at: datetime) -> Claim | None:
         key = (issue, repo, at)
         if key not in self._winners:
-            live = self.live_claims(issue, repo, at)
+            # A claim that an earlier claim from another session blocks by
+            # scope or branch cannot win its own issue meanwhile, as with a race.
+            live = [c for c in self.live_claims(issue, repo, at)
+                    if self.earlier_overlap(c, at, other_sessions=True) is None]
             self._winners[key] = min(live, key=lambda c: (c.created_at, c.uuid)) if live else None
         return self._winners[key]
 
@@ -1316,13 +1319,16 @@ class Evaluation:
                 self.violation("multiple_claims_per_session", claim.issue, claim.uuid, f"also holds {others[0].uuid}")
             # Across sessions, a claim that overlaps an earlier live claim in
             # the repository by scope or branch loses as in a race: it must
-            # withdraw at read-back instead of confirming.
-            if confirmed is not None:
+            # withdraw at read-back instead of confirming. As with a race, the
+            # loss is settled at the read-back deadline, so a later release by
+            # the blocker does not erase it; a confirmation is also checked at
+            # its own time.
+            settled_overlap = self.earlier_overlap(claim, deadline, other_sessions=True) if deadline <= self.now else None
+            blocker = None
+            if settled_overlap is not None and (confirmed is not None or claim.withdrawn_at() is None):
+                blocker = settled_overlap
+            elif confirmed is not None:
                 blocker = self.earlier_overlap(claim, confirmed, other_sessions=True)
-            elif claim.withdrawn_at() is None and deadline <= self.now:
-                blocker = self.earlier_overlap(claim, deadline, other_sessions=True)
-            else:
-                blocker = None
             if blocker is not None:
                 self.violation("overlapping_claim", claim.issue, claim.uuid, f"{blocker[1]} overlaps {blocker[0].uuid}")
             released = claim.released_at()
@@ -1445,12 +1451,13 @@ class Evaluation:
             if claim.takeovers and at < claim.created_at + self.takeover_wait:
                 self.violation("takeover_wrote_too_early", claim.issue, claim.uuid, what)
                 continue
+            if (blocker := self.earlier_overlap(claim, at)) is not None:
+                self.violation("write_while_overlapping", claim.issue, claim.uuid,
+                               f"{what}: {blocker[1]} overlaps {blocker[0].uuid}")
+                continue
             winner = self.winner(claim.issue, claim.repo, at)
             if winner is None or winner.uuid != claim.uuid:
                 self.violation("write_by_non_winner", claim.issue, claim.uuid, what)
-            elif (blocker := self.earlier_overlap(claim, at)) is not None:
-                self.violation("write_while_overlapping", claim.issue, claim.uuid,
-                               f"{what}: {blocker[1]} overlaps {blocker[0].uuid}")
             elif any(self.held_at(scoped, at) for scoped in claim.scope_issues(self.issues)):
                 self.violation("write_while_held", claim.issue, claim.uuid, what)
 

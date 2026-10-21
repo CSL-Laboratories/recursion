@@ -1748,6 +1748,36 @@ class CrossSessionOverlapTests(unittest.TestCase):
         result = self.evaluate(210, [lapsed, later])
         self.assertEqual(codes(result), [])
 
+    def test_an_overlapping_claim_is_not_published_as_winner(self):
+        # Devin 4341055198: the loser stays live (it has not withdrawn) but
+        # cannot win its own issue while the earlier claim blocks it.
+        result = self.evaluate(10, [claim("c1", "CSL-1", U1), claim("c2", "CSL-4", U2, at=1, session="cursor/s2")])
+        self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], U1)
+        self.assertEqual(result["issues"]["CSL-4"]["claims"]["recursion"]["winner"], None)
+        self.assertEqual(result["issues"]["CSL-4"]["claims"]["recursion"]["live_claims"], [U2])
+        self.assertFalse(result["issues"]["CSL-4"]["claimable"])
+
+    def test_a_late_confirmation_after_the_blocker_releases_is_still_a_loss(self):
+        # Devin 4341055382: the loss is settled at the read-back deadline, as
+        # in a race on one issue; the blocker releasing afterwards does not
+        # erase it. Once released, the standing loser can win, as on one issue.
+        released = claim("c1", "CSL-1", U1, more_edits=[edit(3, U1, "released")])
+        late = claim("c2", "CSL-4", U2, at=1, session="cursor/s2", confirm_after=180)
+        result = self.evaluate(10, [released, late])
+        self.assertEqual(codes(result), ["overlapping_claim"])
+        self.assertEqual(result["issues"]["CSL-4"]["claims"]["recursion"]["winner"], U2)
+
+    def test_a_blocker_released_within_the_read_back_window_is_no_loss(self):
+        released = claim("c1", "CSL-1", U1, more_edits=[edit(1.5, U1, "released")])
+        later = claim("c2", "CSL-4", U2, at=1, session="cursor/s2", confirm_after=180)
+        writes = [{"kind": "push", "issue": "CSL-4", "claim": U2, "at": ts(5)}]
+        self.assertEqual(codes(self.evaluate(10, [released, later], writes)), [])
+
+    def test_a_confirmation_before_the_deadline_is_checked_at_its_own_time(self):
+        early = claim("c2", "CSL-4", U2, at=1, session="cursor/s2", confirm_after=30)
+        result = self.evaluate(10, [claim("c1", "CSL-1", U1), early])
+        self.assertEqual(codes(result), ["confirmed_too_early", "overlapping_claim"])
+
     def test_same_issue_races_keep_their_own_codes(self):
         result = self.evaluate(10, [claim("c1", "CSL-1", U1), claim("c2", "CSL-1", U2, at=1, session="cursor/s2")])
         self.assertEqual(codes(result), ["loser_confirmed", "loser_not_withdrawn"])

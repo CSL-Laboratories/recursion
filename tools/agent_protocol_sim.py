@@ -64,6 +64,14 @@ the recursion#247 merge; null turns the check off) does not count: it is
 reported as `decision_unverified` and its lines as void, because nothing shows
 a human rather than an agent wrote it (CSL-417, option A; confirmation is not
 modelled). `confirmed-at:` holds a timestamp or a placeholder in parentheses.
+
+A claim's lease runs from its comment's last edit. An expired claim is never
+renewed (CSL-379): an edit made after lease plus grace, other than a release, a
+withdrawal or an objection inside a takeover's wait, is reported as
+`renewed_after_expiry` and leaves the claim expired. A timestamp `heartbeat-at`
+more than `heartbeat_tolerance_seconds` (default 120, which allows for the delay
+between reading the clock and the edit landing) from the time of the edit that
+set it is reported as `heartbeat_time_mismatch`; other values are not checked.
 """
 from __future__ import annotations
 
@@ -84,6 +92,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "standing_approvals_issue": None,
     "sa_max_days": 90,
     "approval_window_minutes": 15,
+    "heartbeat_tolerance_seconds": 120,
     # Lucas's DECISION on CSL-417 (comment e6d37489): the recursion#247 merge, when the agent-prefix rule took effect.
     "agent_prefix_since": "2026-10-21T00:39:04Z",
 }
@@ -135,7 +144,10 @@ def parse_ts(value: Any, where: str) -> datetime:
         raise SnapshotError(f"{where}: bad timestamp {value!r}") from exc
     if parsed.tzinfo is None:
         raise SnapshotError(f"{where}: timestamp {value!r} has no UTC offset")
-    return parsed.astimezone(timezone.utc)
+    try:
+        return parsed.astimezone(timezone.utc)
+    except OverflowError as exc:
+        raise SnapshotError(f"{where}: timestamp {value!r} is out of range in UTC") from exc
 
 
 def require(mapping: Any, key: str, where: str) -> Any:
@@ -210,9 +222,6 @@ class Comment:
         # Any change to the (session, developer) identity counts, not only
         # adding or removing the prefix.
         return len({agent_header(r.body) for r in self.revisions}) > 1
-
-    def last_update(self, at: datetime) -> datetime:
-        return max(r.at for r in self.revisions if r.at <= at)
 
 
 @dataclasses.dataclass
@@ -343,7 +352,8 @@ class Evaluation:
         self.config = {**DEFAULT_CONFIG, **config}
         # Lucas's DECISION on CSL-411 (comment 8cda521b): the approval window never exceeds 15 minutes.
         for key, limit in (("lease_minutes", 10**6), ("grace_minutes", 10**6), ("readback_seconds", 10**6),
-                           ("takeover_wait_minutes", 10**6), ("sa_max_days", 10**6), ("approval_window_minutes", 15)):
+                           ("takeover_wait_minutes", 10**6), ("sa_max_days", 10**6), ("approval_window_minutes", 15),
+                           ("heartbeat_tolerance_seconds", 10**6)):
             value = self.config[key]
             if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= limit:
                 raise SnapshotError(f"config: {key} must be an integer from 0 to {limit}")
@@ -357,6 +367,7 @@ class Evaluation:
         self.grace = timedelta(minutes=self.config["grace_minutes"])
         self.readback = timedelta(seconds=self.config["readback_seconds"])
         self.takeover_wait = timedelta(minutes=self.config["takeover_wait_minutes"])
+        self.heartbeat_tolerance = timedelta(seconds=self.config["heartbeat_tolerance_seconds"])
         self._revoked: dict[str, datetime | None] = {}
         self._winners: dict[tuple[str, str, datetime], Claim | None] = {}
         self.violations: list[dict[str, Any]] = []
@@ -364,6 +375,7 @@ class Evaluation:
         self.issues = self._load_issues(require(snapshot, "issues", "snapshot"))
         self.comments = self._load_comments(require(snapshot, "comments", "snapshot"))
         self.claims = self._load_claims()
+        self.late_renewals = {uuid: self._late_renewals(claim) for uuid, claim in self.claims.items()}
         self.commits = self._load_list(snapshot, "commits", ("sha", "branch", "at", "author_kind"))
         self.writes = self._load_list(snapshot, "writes", ("kind", "issue", "claim", "at"))
         self.runs = self._load_list(snapshot, "runs", ("id", "claim", "started_at"))
@@ -659,6 +671,39 @@ class Evaluation:
             )
         return claims
 
+    def _late_renewals(self, claim: Claim) -> list[Revision]:
+        """Edits that tried to renew `claim` after its lease plus grace had passed.
+
+        An expired claim is never renewed (CSL-379): such an edit does not
+        count as a heartbeat, so the claim stays expired and a fresh claim or
+        takeover is still needed. A release or withdrawal is the right answer
+        to expiry and ends the scan. An edit inside a takeover's wait is the
+        original claimant's objection to that takeover, which the takeover
+        rules handle, so it still counts; this includes a premature takeover,
+        which is refused and reported as such.
+        """
+        takers = [
+            other.created_at for other in self.claims.values()
+            if claim.uuid in other.takeovers and other.issue == claim.issue and other.repo == claim.repo
+        ]
+        last = claim.comment.revisions[0].at
+        late = []
+        for revision in claim.comment.revisions[1:]:
+            fields = claim_fields(revision.body)
+            if fields.get("_released") or "withdrawn" in fields:
+                break
+            objection = any(posted <= revision.at <= posted + self.takeover_wait for posted in takers)
+            if revision.at > last + self.lease + self.grace and not objection:
+                late.append(revision)
+            else:
+                last = revision.at
+        return late
+
+    def last_renewal(self, claim: Claim, at: datetime) -> datetime:
+        """The claim comment's last update at `at` that counts as a heartbeat."""
+        late = self.late_renewals.get(claim.uuid, [])
+        return max(r.at for r in claim.comment.revisions if r.at <= at and not any(r is x for x in late))
+
     # Helpers ---------------------------------------------------------------
 
     def violation(self, code: str, issue: str | None = None, claim: str | None = None, detail: str = "") -> None:
@@ -712,7 +757,7 @@ class Evaluation:
         ):
             if when is not None and when <= at:
                 return label
-        if at > claim.comment.last_update(at) + self.lease:
+        if at > self.last_renewal(claim, at) + self.lease:
             return "expired"
         return None
 
@@ -828,7 +873,7 @@ class Evaluation:
     def posting_refusal(self, claim: Claim, old: Claim) -> dict[str, Any] | None:
         """Why a takeover of a still-held `old` was not allowed when posted, or None."""
         posted = claim.created_at
-        last = old.comment.last_update(posted)
+        last = self.last_renewal(old, posted)
         if posted <= last + self.lease + self.grace:
             return {"allowed": False, "reason": "lease plus grace not passed"}
         newer = [
@@ -1201,6 +1246,9 @@ class Evaluation:
                 self.violation("scope_not_a_child", claim.issue, claim.uuid, claim.child)
             if any(self.held_at(scoped, claim.created_at) for scoped in claim.scope_issues(self.issues)):
                 self.violation("claim_on_held_scope", claim.issue, claim.uuid)
+            for late in self.late_renewals[claim.uuid]:
+                self.violation("renewed_after_expiry", claim.issue, claim.uuid, late.at.isoformat())
+            self.check_heartbeat_times(claim)
             confirmed = claim.confirmed_at()
             edited = claim.confirm_edit_at()
             if edited is not None and edited - claim.created_at < self.readback:
@@ -1228,6 +1276,24 @@ class Evaluation:
                         run.get("ended_at") is None or run["ended_at"] > released
                     ):
                         self.violation("release_before_writers_stopped", claim.issue, claim.uuid, run["id"])
+
+    def check_heartbeat_times(self, claim: Claim) -> None:
+        """Report a timestamp `heartbeat-at` that is not the time of the edit
+        that set it. Only a changed value is checked, since later edits carry
+        the old line along; a value that is not a timestamp is not checked."""
+        previous = None
+        for revision in claim.comment.revisions:
+            value = claim_fields(revision.body).get("heartbeat-at")
+            if value and value != previous and TIMESTAMP_VALUE.match(value):
+                try:
+                    declared = parse_ts(value, f"claim {claim.uuid}: heartbeat-at")
+                except SnapshotError:
+                    previous = value
+                    continue  # not a complete timestamp, so not checked
+                if abs(declared - revision.at) > self.heartbeat_tolerance:
+                    self.violation("heartbeat_time_mismatch", claim.issue, claim.uuid,
+                                   f"{value} on the edit at {revision.at.isoformat()}")
+            previous = value
 
     def posting_fault(self, claim: Claim, target: str) -> str | None:
         """Why taking over `target` was not allowed when the claim was posted, or None.

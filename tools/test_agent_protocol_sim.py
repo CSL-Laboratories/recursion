@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scenario tests S1-S23 for the CSL-357 agent work protocol simulator (CSL-360)."""
+"""Scenario tests S1-S31 for the CSL-357 agent work protocol simulator (CSL-360)."""
 from __future__ import annotations
 
 import importlib.util
@@ -1658,6 +1658,71 @@ class PrePrefixDecisionTests(unittest.TestCase):
         self.assertEqual(sorted(v["issue"] for v in result["violations"] if v["code"] == "decision_unverified"),
                          ["CSL-2", "CSL-3"])
         self.assertFalse(result["decisions"]["CSL-3"]["answered"])
+
+
+class LapsedClaimResumeTests(unittest.TestCase):
+    """S31: session resumes after its claim lapsed (CSL-379). A renewal edit after lease plus grace is reported
+    and does not revive the claim; the session releases it on lease expiry and takes a fresh claim."""
+
+    def push(self, uuid, at):
+        return {"kind": "push", "issue": "CSL-1", "claim": uuid, "at": ts(at)}
+
+    def test_renewal_after_expiry_is_reported_and_does_not_revive(self):
+        lapsed = claim("c1", "CSL-1", U1, more_edits=[edit(600, U1, f"heartbeat-at: {ts(600)}")])
+        result = sim.evaluate(snapshot(610, [issue("CSL-1")], [lapsed], writes=[self.push(U1, 605)]))
+        state = result["issues"]["CSL-1"]
+        self.assertEqual(state["claims"]["recursion"]["live_claims"], [])
+        self.assertIsNone(state["claims"]["recursion"]["winner"])
+        self.assertTrue(state["claimable"])
+        self.assertEqual(codes(result), ["renewed_after_expiry", "write_after_expiry"])
+        renewed = [v for v in result["violations"] if v["code"] == "renewed_after_expiry"]
+        self.assertEqual([(v["claim"], v["detail"]) for v in renewed], [(U1, "2026-10-20T20:00:00+00:00")])
+
+    def test_lapsed_claim_still_needs_a_fresh_claim_or_takeover(self):
+        lapsed = claim("c1", "CSL-1", U1, more_edits=[edit(600, U1, f"heartbeat-at: {ts(600)}")])
+        fresh = claim("c2", "CSL-1", U2, at=605, session="cursor/s2")
+        result = sim.evaluate(snapshot(610, [issue("CSL-1")], [lapsed, fresh]))
+        self.assertEqual(codes(result), ["claim_without_takeover", "renewed_after_expiry"])
+        taker = claim("c2", "CSL-1", U2, at=605, session="cursor/s2", extra=(f"takeover of {U1}",))
+        result = sim.evaluate(snapshot(625, [issue("CSL-1")], [lapsed, taker]))
+        self.assertTrue(result["issues"]["CSL-1"]["takeovers"][U2]["allowed"])
+        self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], U2)
+        self.assertEqual(codes(result), ["renewed_after_expiry"])
+
+    def test_renewal_before_expiry_is_fine(self):
+        for at in (100, 140):  # inside the lease, and late but inside the grace
+            with self.subTest(at=at):
+                renewed = claim("c1", "CSL-1", U1, more_edits=[edit(at, U1, f"heartbeat-at: {ts(at)}")])
+                result = sim.evaluate(snapshot(at + 100, [issue("CSL-1")], [renewed],
+                                               writes=[self.push(U1, at + 90)]))
+                self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], U1)
+                self.assertEqual(codes(result), [])
+
+    def test_release_on_lease_expiry_then_fresh_claim_is_clean(self):
+        released = claim("c1", "CSL-1", U1, more_edits=[edit(600, U1, "released")])
+        fresh = claim("c2", "CSL-1", U2, at=601)
+        result = sim.evaluate(snapshot(610, [issue("CSL-1")], [released, fresh], writes=[self.push(U2, 605)]))
+        self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], U2)
+        self.assertEqual(codes(result), [])
+
+    def test_heartbeat_at_must_be_the_edit_time(self):
+        cases = {
+            "stale value": (ts(40), ["heartbeat_time_mismatch"]),
+            "within tolerance": (ts(100, -30), []),
+            "not a timestamp": ("soon", []),
+            "malformed timestamp": ("2026-10-20Tsoon", []),
+            "out of range in UTC": ("0001-01-01T00:00:00+01:00", []),
+        }
+        for name, (value, expected) in cases.items():
+            with self.subTest(case=name):
+                renewed = claim("c1", "CSL-1", U1, more_edits=[edit(100, U1, f"heartbeat-at: {value}"),
+                                                               edit(110, U1, f"heartbeat-at: {value}", "released")])
+                self.assertEqual(codes(sim.evaluate(snapshot(120, [issue("CSL-1")], [renewed]))), expected)
+
+    def test_late_renewal_with_a_stale_heartbeat_reports_both(self):
+        lapsed = claim("c1", "CSL-1", U1, more_edits=[edit(600, U1, f"heartbeat-at: {ts(60)}")])
+        result = sim.evaluate(snapshot(610, [issue("CSL-1")], [lapsed]))
+        self.assertEqual(codes(result), ["heartbeat_time_mismatch", "renewed_after_expiry"])
 
 
 if __name__ == "__main__":

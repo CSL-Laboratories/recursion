@@ -940,12 +940,19 @@ class Evaluation:
     def winner(self, issue: str, repo: str, at: datetime) -> Claim | None:
         key = (issue, repo, at)
         if key not in self._winners:
-            # A claim that an earlier claim from another session blocks by
-            # scope or branch cannot win its own issue meanwhile, as with a race.
-            live = [c for c in self.live_claims(issue, repo, at)
-                    if self.earlier_overlap(c, at, other_sessions=True) is None]
+            live = self.live_claims(issue, repo, at)
             self._winners[key] = min(live, key=lambda c: (c.created_at, c.uuid)) if live else None
         return self._winners[key]
+
+    def holder(self, issue: str, repo: str, at: datetime) -> Claim | None:
+        """The race winner, unless an earlier claim from another session
+        blocks it by scope or branch; then nobody holds the issue. The race
+        itself stays on the unfiltered live claims, so a later claim on the
+        issue still loses to the blocked one."""
+        winner = self.winner(issue, repo, at)
+        if winner is not None and self.earlier_overlap(winner, at, other_sessions=True) is not None:
+            return None
+        return winner
 
     def overlap(self, claim: Claim, other: Claim) -> str | None:
         """How two claims in one repository on different issues overlap:
@@ -1577,7 +1584,7 @@ class Evaluation:
             per_repo = {}
             for repo in repos:
                 live = self.live_claims(issue_id, repo, self.now)
-                winner = self.winner(issue_id, repo, self.now)
+                winner = self.holder(issue_id, repo, self.now)
                 if not live and not any(c.issue == issue_id and c.repo == repo for c in self.claims.values()):
                     continue
                 per_repo[repo] = {

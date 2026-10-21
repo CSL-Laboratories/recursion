@@ -1793,6 +1793,22 @@ class CrossSessionOverlapTests(unittest.TestCase):
         result = self.evaluate(10, [claim("c1", "CSL-1", U1), early])
         self.assertEqual(codes(result), ["confirmed_too_early", "overlapping_claim"])
 
+    def test_a_blocked_earliest_claim_still_wins_its_issue_race(self):
+        # Devin 4341276529 / Samir 5605467453: C blocks A by branch; B is a
+        # later claim on A's issue. B loses the race to A and must withdraw,
+        # and nobody holds CSL-4 while C blocks A.
+        c = claim("c1", "CSL-1", U1)
+        a = claim("c2", "CSL-4", U2, at=1, session="cursor/s2")
+        b = claim("c3", "CSL-4", U3, at=1.5, session="grok/s3", branch="csl-4-other")
+        writes = [{"kind": "push", "issue": "CSL-4", "claim": U3, "at": ts(5)}]
+        result = self.evaluate(10, [c, a, b], writes)
+        self.assertEqual(codes(result), ["loser_confirmed", "loser_not_withdrawn", "overlapping_claim",
+                                         "write_by_non_winner"])
+        found = {(v["code"], v["claim"]) for v in result["violations"]}
+        self.assertIn(("loser_confirmed", U3), found)
+        self.assertIn(("overlapping_claim", U2), found)
+        self.assertEqual(result["issues"]["CSL-4"]["claims"]["recursion"]["winner"], None)
+
     def test_same_issue_races_keep_their_own_codes(self):
         result = self.evaluate(10, [claim("c1", "CSL-1", U1), claim("c2", "CSL-1", U2, at=1, session="cursor/s2")])
         self.assertEqual(codes(result), ["loser_confirmed", "loser_not_withdrawn"])

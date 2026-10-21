@@ -59,6 +59,82 @@ Consuming a fragment that requires acceptance needs the applicable exact, authen
 
 Never commit secrets, private account details, raw chats, signed URLs, bulk copyrighted material or datasets to Git. Manifests for approved external storage retain hash, size, access, retention and license notes. An access denial stops the affected transfer; do not look for an alternative path. Existing approved routes keep their actual authority. This section adds no API, new spend, fallback or overage. Lucas's spending and company-resource authority, own-account limits, the R2a prerequisite, the review roles and the rule that agents never merge are unchanged.
 
+## Proceed or escalate
+
+`CONTROL_PLANE.md` still decides who decides. This section is the short test for
+when an agent acts on its own and when it asks. Claude Code can invoke the
+`proceed-or-escalate` skill (`.claude/skills/proceed-or-escalate/SKILL.md`), which
+expands on this section; Cursor, Codex and Grok follow this section.
+
+**Scope.** This governs agents acting through a developer's account or session:
+interactive sessions, scheduled loops and Grok Bots. Repository workflows
+(`claude.yml` fixer, Codex gate, stuck-thread-watch, conflict-scan,
+linear-pr-sync and other repository workflows) and Devin automations keep the roles in
+[Review roles](#review-roles) and [Automations](#automations); their documented
+markers, receipts and audit comments are unchanged.
+
+**Proceed** only when all hold: the work is within an admitted issue's acceptance
+criteria, or is a clear defect or failing check with an evident cause; it stays
+inside the issue's scope and allowed paths; no product behavior, UX, public API,
+contract or data meaning changes beyond what the issue specifies; it is reversible
+and code changes are covered by a test; it needs no new spend, credentials,
+permissions, settings or protected-path edits; no other claim or writer's run is
+active on the branch or files; and it starts no paid CI. Marking ready, pushing to
+a non-draft PR, adding `ci:full`, and any dispatch, re-run or `/ci` command start
+paid Blacksmith runs. Pushes to drafts or to branches without a PR, and read-only
+API queries, are fine.
+
+**Escalate** when any holds: a product detail, UX choice, scope or priority change
+is needed; the request has more than one reasonable reading; it is an architecture,
+language, dependency or data-source choice; it touches governance files, decision
+records, contracts or another owner's work; a tool or platform refused the action;
+you would state a decision you cannot link to its record; the CI cost is unclear;
+or an automation signal needs a human (fixer paused or at its loop cap, a pause
+label, an unverifiable fix receipt, a rebased branch with fixer receipts, uncertain
+`ci:full` ownership). Never remove a pause, dispatch the fixer around its
+budget, or report an unverified fix as fixed. If any escalate trigger holds,
+escalate; the proceed list never overrides it.
+
+**How:** a stuck review thread goes in the PR's `Stuck PR threads:` roll-up, found
+only by its `<!-- stuck-pr-threads:recursion#<PR> -->` marker, never by title.
+Otherwise post one Linear comment @mentioning the issue owner with the question, two
+or three options, your recommendation, and what you will do meanwhile ("paused" or
+other proceed-list work, never the option you are asking about or work that
+presupposes one). Record the blocker in `state/INBOX.md` as "Escalate, don't guess"
+requires, release your claim, and take only other admitted work that is next under
+the human-approved order.
+
+**Comment labels.** Agents usually post through a developer's account, so start
+every agent comment with `Agent (<tool/session>, for <developer>):`. Lucas decided
+(CSL-353 comment `6e602e3a-5c27-46f3-b191-2e7f4e86425f`) that a
+**developer-approved comment** counts as that developer's personal receipt when:
+the developer approved the final exact text in the same session immediately before
+posting (approval from an earlier turn or another context does not carry over); it
+carries the line
+`developer-approved: <developer>, exact text confirmed <UTC time>, session <id>`;
+it is unedited since posting; it stays within that developer's authority and grants
+none; and no accepted contract (recursion program receipts, R2a, or another
+repository's) requires an exact authenticated human receipt, unless that contract
+is amended. In recursion this takes effect only when the `CONTROL_PLANE.md`
+amendment (CSL-401) merges. Until then a developer-approved comment carries the
+developer's direction but stays an attributed relay where personal posting is
+required (decision receipts, contract acceptance), and the human posts it. A named
+reviewer's GitHub review is always submitted by that person from their own account
+(`CONTROL_PLANE.md`), and a developer-approved comment is never a review verdict
+([Review roles](#review-roles)); CSL-401 changes neither. Never post decision
+language as an agent comment otherwise; link the record instead. A decision exists
+only if a human posted it from their own account, a developer-approved comment that
+counts under this rule carries it (in recursion none does until CSL-401 merges, and
+until then it releases no hold), or it is in `state/DECISIONS.md` or
+`docs/adr/`. Agent repetition, silence, a merge or an issue auto-closing to Done
+is not a decision.
+
+**Unattended runs** (loops acting through a developer's account while nobody
+watches) may only do "proceed" work. They do not resolve human-authored threads,
+change scope, close issues as decided or post developer-approved comments. They
+never mark ready, add or remove GitHub labels, dispatch, re-run or cancel, and they
+label every comment `Agent (unattended run, for <developer>):`.
+
 ## Your role
 
 Founders decide within the authority defined in `CONTROL_PLANE.md`: any founder may decide

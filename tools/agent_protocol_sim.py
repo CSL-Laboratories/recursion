@@ -50,7 +50,7 @@ deletion time. The one exception is a developer-approved comment
 `developer-approved: <developer>, exact text confirmed <UTC time>, session <id>`
 naming the developer and session of its complete `tool/session` prefix,
 confirmed no later than it was posted and at most `approval_window_minutes`
-(default 15) before, and never edited, speaks as that developer. Its prefix and marker lines
+(default 15, at most 15) before, and never edited, speaks as that developer. Its prefix and marker lines
 are dropped and the rest is read like a human comment; an invalid marker is
 reported as `developer_approval_invalid` and the comment stays void. A
 developer-approved comment cannot define or revoke a standing approval. Standing
@@ -335,11 +335,12 @@ class Evaluation:
         if unknown:
             raise SnapshotError(f"config: unknown keys {sorted(unknown)}")
         self.config = {**DEFAULT_CONFIG, **config}
-        for key in ("lease_minutes", "grace_minutes", "readback_seconds", "takeover_wait_minutes", "sa_max_days",
-                    "approval_window_minutes"):
+        # Lucas's DECISION on CSL-411 (comment 8cda521b): the approval window never exceeds 15 minutes.
+        for key, limit in (("lease_minutes", 10**6), ("grace_minutes", 10**6), ("readback_seconds", 10**6),
+                           ("takeover_wait_minutes", 10**6), ("sa_max_days", 10**6), ("approval_window_minutes", 15)):
             value = self.config[key]
-            if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 10**6:
-                raise SnapshotError(f"config: {key} must be an integer from 0 to 1000000")
+            if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= limit:
+                raise SnapshotError(f"config: {key} must be an integer from 0 to {limit}")
         if not isinstance(self.config["coordinator_ack_required"], bool):
             raise SnapshotError("config: coordinator_ack_required must be a boolean")
         if self.config["standing_approvals_issue"] is not None and not isinstance(self.config["standing_approvals_issue"], str):
@@ -503,7 +504,7 @@ class Evaluation:
         `developer-approved:` line naming the developer the prefix acts for and
         its complete `tool/session` prefix, the approval was confirmed no later
         than the posting time and within `approval_window_minutes` before it
-        (default 15), and the comment was never edited. Authority (condition 4) and accepted
+        (default 15, at most 15), and the comment was never edited. Authority (condition 4) and accepted
         contracts (condition 5) are not in the snapshot and are not checked.
         """
         first = comment.revisions[0].body

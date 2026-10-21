@@ -125,8 +125,12 @@ A decision exists only if a human posted it from their own account, a
 developer-approved comment that counts under this rule carries it, or it is in
 `state/DECISIONS.md` or `docs/adr/`. When relying on a developer-approved comment,
 check that the marker is present, the comment is unedited and the named developer
-has not disputed it; if any of that is unclear, ask that developer before acting. Agent repetition, silence, a merge or an issue auto-closing to Done
-is not a decision.
+has not disputed it; if any of that is unclear, ask that developer before acting.
+A comment from a founder or developer account that has no agent prefix and was
+posted before this rule took effect (the merge of #247, 2026-10-21T00:39:04Z)
+counts as that person's decision only if they confirm it when asked (Lucas's
+decision, CSL-354 comment 0a86b61c). Agent repetition, silence, a merge or an
+issue auto-closing to Done is not a decision.
 
 **Unattended runs** (loops acting through a developer's account while nobody
 watches) may only do "proceed" work. They do not resolve human-authored threads,

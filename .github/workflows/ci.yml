@@ -1,9 +1,5 @@
 # Recursion v3 — tiered provider-free CI (CSL-255: light preflight, full tests).
-#
-# Every job runs on a GitHub-hosted runner, which is free for this public
-# repository (CSL-408 moved the test jobs off Blacksmith). The `paid` output and
-# "paid runner" wording below are historical names for the full-test runner.
-#
+# All jobs use free GitHub-hosted runners (CSL-408); `paid` names the test runner.
 # Required status check (branch protection): linux
 # Windows and macOS are extra OS coverage, not required on every PR.
 #

@@ -88,7 +88,9 @@ excludes ordinary pushes, post-merge fallback, storage and other workloads; do
 not multiply it by final PR count and call that total cost. The combined
 cross-repository forecast and other diagnostic receipts remain in CSL-255.
 
-For a prospective month use:
+For a prospective month use the formula below. It applies only to Blacksmith runs before
+CSL-408. Runs after CSL-408 use standard GitHub-hosted runners, so their runner compute is
+$0 for this public repository, and the forecast for them is $0 plus any other paid workload.
 
 `repository core = 0.024 * Recursion full runs + other paid starts`
 

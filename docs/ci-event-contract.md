@@ -1,7 +1,7 @@
 # CI event-to-check contract
 
-- **Contract version:** v1 (2026-10-20)
-- **Base commit:** `b78b27b045f827849b88f3edf806200a8c591ba4` (master, merge of #247). The CI files cited below are unchanged since `2e369a6c747a4cc10ff6fd4da98f1272697bdc2e` (merge of #253). Since then, #259, #261 and #247 changed `AGENTS.md` and `CLAUDE.md` (#247 also added a skill and a `.gitignore` entry), and #260 changed only `tools/agent_protocol_sim*.py`. The event rows were traced at `c4cf7d8d` (#252, CSL-376); `ci.yml`, `tools/ci_gate.py` and the CI tests are unchanged since. #255 (CSL-383) and #253 (CSL-365) changed `claude.yml`, `conflict-scan.yml`, `codex-gate.yml` and `scripts/ci/`, which sections 5 and 7 cite. All `file:line` citations below are for this base.
+- **Contract version:** v2 (2026-10-21). v2 records CSL-408 (#263): every job now runs on a free GitHub-hosted runner. `linux-tests` moved to `ubuntu-24.04` and windows to `windows-2025`. Event rows, conditions and the required check are unchanged from v1.
+- **Base commit:** master `bf015e37` (merge of #256) plus the CSL-408 runner change in #263. That change keeps every cited line number in `ci.yml`, `ci-full-matrix.yml`, `tools/ci_runner_cost.py`, `AGENTS.md` and `CLAUDE.md`, so the v1 citations still hold. v1 base: `b78b27b045f827849b88f3edf806200a8c591ba4` (master, merge of #247). The CI files cited below are unchanged since `2e369a6c747a4cc10ff6fd4da98f1272697bdc2e` (merge of #253). Since then, #259, #261 and #247 changed `AGENTS.md` and `CLAUDE.md` (#247 also added a skill and a `.gitignore` entry), and #260 changed only `tools/agent_protocol_sim*.py`. The event rows were traced at `c4cf7d8d` (#252, CSL-376); `ci.yml`, `tools/ci_gate.py` and the CI tests are unchanged since. #255 (CSL-383) and #253 (CSL-365) changed `claude.yml`, `conflict-scan.yml`, `codex-gate.yml` and `scripts/ci/`, which sections 5 and 7 cite. All `file:line` citations below are for this base.
 - **Which workflow version runs:** a pull-request run uses the workflow file from the PR merge ref. `workflow_dispatch` and `push` use the file at the event's commit. A row applies only where that file matches this base; otherwise the behaviour depends on that version.
 - **Scope:** describes current behaviour of the GitHub Actions workflows and repository rules. It is not a policy change and grants no authority. Where behaviour looks wrong, it is listed under [Known gaps](#8-known-gaps-and-follow-ups) for a separately admitted issue.
 - **Evidence classes** (kept distinct throughout):
@@ -14,11 +14,11 @@
 
 Observation window for [OBS]: the 64 `ci.yml` runs created 2026-10-20T03:27Z to 21:04Z, after `ci.yml` last changed (4c4fb763, #244). Each run's event action was read from the `linux` job log env (`EVENT_ACTION`, `PR_DRAFT`). Pull-request runs use the workflow file from the PR merge ref. Runs before c4cf7d8d used the pre-CSL-376 `tools/ci_gate.py`, which could still emit `run_full=false`.
 
-## 1. Paid runners
+## 1. Runners
 
-- **Paid:** Blacksmith labels only. `blacksmith-2vcpu-ubuntu-2404` costs $0.004/min and `blacksmith-2vcpu-windows-2025` $0.008/min (`tools/ci_runner_cost.py:13-17`, planning assumptions, "never billing proof" at line 1). [SRC]
-- **Free:** `ubuntu-latest` and `macos-latest` are treated as $0 public-repo core runners (`tools/ci_runner_cost.py:18`). The repository is public (`visibility: public`). [SRC] [OBS]
-- Blacksmith labels appear only in `.github/workflows/ci.yml` (lines 166, 305) and `.github/workflows/ci-full-matrix.yml:20` (plus the actionlint label list `.github/actionlint.yaml:4`). [SRC]
+- **Since CSL-408 (v2) every job is free.** `linux-tests` runs on `ubuntu-24.04` (`ci.yml:166`). windows runs on `windows-2025` (`ci.yml:305`, `ci-full-matrix.yml:20`). The remaining jobs run on `ubuntu-latest` or `macos-latest`. All are standard GitHub-hosted runners, and `tools/ci_runner_cost.py:18` prices them at $0 for this public repository (`visibility: public`). [SRC] [OBS]
+- **"Paid" in this contract** now means that the full-test runner (`linux-tests`) or windows was allocated. That is a cost in runner capacity and queue time, not money. The `paid` preflight output keeps its historical name (`ci.yml:2`). [SRC]
+- **Before CSL-408 (v1):** those jobs ran on Blacksmith `blacksmith-2vcpu-ubuntu-2404` ($0.004/min) and `blacksmith-2vcpu-windows-2025` ($0.008/min). The rates stay in `tools/ci_runner_cost.py:13-17` for accounting of earlier runs, which are planning assumptions, "never billing proof" (line 1). Blacksmith billed each job that got a runner, per started minute (CSL-255 calibration). [SRC] [OBS]
 
 ## 2. Required checks
 
@@ -35,7 +35,7 @@ From `GET repos/CSL-Laboratories/recursion/rulesets`, `.../rulesets/25019234`, `
 
 **Who produces each required check**
 
-- `linux`: job `linux` (`name: linux`) in `.github/workflows/ci.yml:207-289`, on `ubuntu-latest` (`ci.yml:211`). It is a free aggregate with no checkout. The paid suite is job `linux-tests` (`name: Linux tests`, `ci.yml:155-204`, `blacksmith-2vcpu-ubuntu-2404` at `ci.yml:166`). No other workflow defines a job named `linux` (`ci-full-label.yml:2-4`; asserted by `tools/test_perf_bench.py:217`). [SRC]
+- `linux`: job `linux` (`name: linux`) in `.github/workflows/ci.yml:207-289`, on `ubuntu-latest` (`ci.yml:211`). It is an aggregate with no checkout. The full suite is job `linux-tests` (`name: Linux tests`, `ci.yml:155-204`, `ubuntu-24.04` at `ci.yml:166`). No other workflow defines a job named `linux` (`ci-full-label.yml:2-4`; asserted by `tools/test_perf_bench.py:217`). [SRC]
 - `Devin Review`: a **commit status**, not a check run, posted by `devin-ai-integration[bot]` as `pending` then `success`. On `11d2f700` it was posted at 20:44:20Z and 20:45:03Z; on `39c1e70e` at 21:04:14Z and 21:04:41Z. It is produced outside this repository's workflows, so this contract does not cover it further. [OBS]
 
 ## 3. Event matrix
@@ -43,7 +43,7 @@ From `GET repos/CSL-Laboratories/recursion/rulesets`, `.../rulesets/25019234`, `
 Columns:
 
 - **Jobs run:** jobs that start, other than skipped ones.
-- **Paid:** Blacksmith runner labels started.
+- **Paid:** the full-test runner (`linux-tests`, `ubuntu-24.04`) or windows (`windows-2025`) started. These runners are free since CSL-408, so the column tracks runner allocation, not spend.
 - **Required `linux`:** what the run posts for that check on its head SHA.
 
 `ci.yml` triggers: `pull_request` types `[opened, synchronize, reopened, ready_for_review]`, `push` to `master` and `workflow_dispatch` (`ci.yml:60-65`). The concurrency group is `ci-${{ github.workflow }}-${{ PR number || github.ref }}` with `cancel-in-progress: true` (`ci.yml:67-69`).
@@ -52,7 +52,7 @@ Columns:
 
 | # | Event | Jobs run | Paid | Required `linux` | Citation | Observed |
 |---|---|---|---|---|---|---|
-| E1 | `pull_request` opened, non-draft | preflight, Linux tests, linux; plus windows and macos if the PR already has `ci:full` | yes: ubuntu-2404; windows-2025 only with `ci:full` | pass requires preflight success, `run_full=true`, `paid=true`, settle `skipped`, Linux tests `success` | `ci.yml:129-132`, `143-147`, `158-165`, `259-274`, `294-304` | 39399635090 (opened, settle skipped, tests success, linux success) |
+| E1 | `pull_request` opened, non-draft | preflight, Linux tests, linux; plus windows and macos if the PR already has `ci:full` | yes: ubuntu-24.04; windows-2025 only with `ci:full` | pass requires preflight success, `run_full=true`, `paid=true`, settle `skipped`, Linux tests `success` | `ci.yml:129-132`, `143-147`, `158-165`, `259-274`, `294-304` | 39399635090 (opened, settle skipped, tests success, linux success) |
 | E2 | opened, draft | preflight, linux | no | **fails** ("draft pull request: linux qualification is deferred until ready_for_review") | `ci.yml:119-135`, `163`, `235-239` | 39376583206 |
 | E3 | synchronize, non-draft | preflight, settle (`sleep 120`), Linux tests, linux; windows and macos with `ci:full` | yes, after settle | pass requires settle `success` and the rest as E1 | `ci.yml:140-152`, `164`, `259-260` | 39390206908; with `ci:full`: 39392986879 (windows on Blacksmith, macos on macos-latest) |
 | E4 | synchronize, draft | preflight, linux | no; settle is skipped (`draft == false` clause) | **fails** (draft) | `ci.yml:147`, `163`, `235-239` | 39370999816 |
@@ -62,11 +62,11 @@ Columns:
 | E8 | converted_to_draft | **no CI run** (not a trigger) | no | no new check; earlier `linux` results on the head stay. [INF] The PR cannot merge while a draft. | `ci.yml:62` | none |
 | E9 | labeled / unlabeled (any label) | `ci.yml` does not run | no (see 3.2 for `ci:full`) | not produced | `ci.yml:53-57`, `62` | n/a |
 | E10 | `edited` (title/body/base retarget) | `ci.yml` does not run; `pr-lint.yml` does (`pr-lint.yml:5`) | no | not re-produced. [INF] The `linux` already on the head stays and was computed against the old base (`CI_BASE_SHA`, `ci.yml:97`, `103`, `187`, `199`). The strict policy still requires the branch to be up to date, and updating it is a synchronize (E3). | `ci.yml:62`, `pr-lint.yml:5` | none |
-| E11 | push to master | preflight, Linux tests, linux, windows (macos never runs on push) | yes: ubuntu-2404 and windows-2025 | pass as E1 (settle `skipped`); `CI_BASE_SHA = github.event.before` | `ci.yml:63-64`, `97`, `302`, `328-329`, `341-342` | 39496738713 (c4cf7d8d), 39364410014 |
+| E11 | push to master | preflight, Linux tests, linux, windows (macos never runs on push) | yes: ubuntu-24.04 and windows-2025 | pass as E1 (settle `skipped`); `CI_BASE_SHA = github.event.before` | `ci.yml:63-64`, `97`, `302`, `328-329`, `341-342` | 39496738713 (c4cf7d8d), 39364410014 |
 | E12 | merge_group | **not a trigger** | no | not produced. [INF] The shell would also reject the event (`ci.yml:246`), so enabling a merge queue without a workflow change leaves `linux` missing. | `ci.yml:60-65` | n/a |
-| E13 | workflow_dispatch on a ref whose `ci.yml` matches this base (other refs: version-dependent) | preflight, Linux tests, linux, windows, macos | yes: ubuntu-2404 and windows-2025 | a `linux` check run (pass as E1) on the dispatched ref's head SHA. Effect on the PR's required `linux`: not observed. GitHub's required-check troubleshooting doc says `workflow_dispatch` checks do not satisfy a pull request's required checks; only an eligible event such as `pull_request` does. `github.event.before` is empty, so the whitespace check is skipped (`tools/ci_gate.py:391-395`) and perf is skipped (`ci.yml:195`). The PR draft check (`ci.yml:235-241`) does not apply; `:242-245` only rejects a stray draft flag. A dispatch on a draft PR's branch can therefore create a passing `linux` check run on the draft head (gap 5). | `ci.yml:65`, `302-303`, `341` | no dispatch since 4c4fb763; the latest, 39073627392 (2026-10-17), ran a branch's different `ci.yml` |
+| E13 | workflow_dispatch on a ref whose `ci.yml` matches this base (other refs: version-dependent) | preflight, Linux tests, linux, windows, macos | yes: ubuntu-24.04 and windows-2025 | a `linux` check run (pass as E1) on the dispatched ref's head SHA. Effect on the PR's required `linux`: not observed. GitHub's required-check troubleshooting doc says `workflow_dispatch` checks do not satisfy a pull request's required checks; only an eligible event such as `pull_request` does. `github.event.before` is empty, so the whitespace check is skipped (`tools/ci_gate.py:391-395`) and perf is skipped (`ci.yml:195`). The PR draft check (`ci.yml:235-241`) does not apply; `:242-245` only rejects a stray draft flag. A dispatch on a draft PR's branch can therefore create a passing `linux` check run on the draft head (gap 5). | `ci.yml:65`, `302-303`, `341` | no dispatch since 4c4fb763; the latest, 39073627392 (2026-10-17), ran a branch's different `ci.yml` |
 | E14 | schedule | `ci.yml` has none (see 3.3) | n/a | n/a | `ci.yml:60-65` | n/a |
-| E15 | rerun of a failed or cancelled run | [INF] reruns the selected jobs with the **original** event payload: a draft run reruns as a draft and fails again. A rerun joins the same concurrency group, so it can cancel the live run for that PR. Rerunning Linux tests starts Blacksmith again. | yes, if Linux tests or windows reruns | [INF] a rerun of an older run on the current head posts a **newer** `linux` result on that SHA | `ci.yml:67-69`, `112`, `221` | none: all 300 recent runs are `run_attempt` 1 |
+| E15 | rerun of a failed or cancelled run | [INF] reruns the selected jobs with the **original** event payload: a draft run reruns as a draft and fails again. A rerun joins the same concurrency group, so it can cancel the live run for that PR. Rerunning Linux tests starts its runner again. | yes, if Linux tests or windows reruns | [INF] a rerun of an older run on the current head posts a **newer** `linux` result on that SHA | `ci.yml:67-69`, `112`, `221` | none: all 300 recent runs are `run_attempt` 1 |
 | E16 | run cancelled by concurrency | for a run that had started: `linux` still runs (`if: always()`), and unstarted jobs are marked cancelled without a runner. A pending run cancelled before starting runs no job (E5). | none, if cancelled before Linux tests started | **fails** on that run's head SHA if it had started; no check from a pending run cancelled before starting | `ci.yml:210`, `217`, `285-289` | 39495025672, 39391683862, 39383451090, 39389995068: all `linux` failure, paid jobs with no runner |
 | E17 | `pull_request` from a fork (any of E1-E7) | as the matching same-repo row **once the run is allowed**. If the fork-approval setting applies (GitHub's default for public repos covers first-time contributors), the run waits for maintainer approval and no job starts until then. | once allowed, the same as the matching same-repo row: yes for E1, E3, E5 and E7 and for a non-draft E6; no for a draft fork (E2, E4 or a draft E6), because `linux-tests` also requires `draft == false` (`ci.yml:163`). [INF] `ci.yml` has no fork guard (no `head.repo.full_name` condition in `ci.yml:158-165` or `294-342`), so for non-draft forks, paid starts depend on the repository's fork-approval setting. Lucas reports setting it to require approval for all external contributors (2026-10-20); this session cannot read it. `codex-gate.yml:27` and `linear-pr-sync.yml:31` do guard. | as the matching same-repo row once allowed; pending (no `linux`) while awaiting approval | `ci.yml:158-165` | none |
 | E18 | push or `pull_request` whose head commit carries a skip annotation (`[skip ci]`, `[ci skip]`, `[no ci]`, `[skip actions]`, `[actions skip]`, or a `skip-checks: true` trailer) | none: GitHub creates no workflow run | no | not produced: the required check stays missing, which blocks merge (fail-closed) | GitHub docs, skipping workflow runs | none |
@@ -93,7 +93,7 @@ The SHA then carries a failed `linux` and a later result from the survivor. On `
 
 - Concurrency is `ci-full-label-<PR>-<label>` with `cancel-in-progress: true` (`ci-full-label.yml:13-15`). This is a separate group from `ci.yml`. [SRC]
 - `ci:full` also adds windows and macos to later `ci.yml` events that carry the label in the payload: non-draft PR events (`ci.yml:304`, `342`; E1/E3/E7 above). [SRC]
-- [INF] Adding `ci:full`, for example through Codex READY (`ci-full-label.yml:1`), and then pushing runs windows on Blacksmith twice on nearby heads: once from each workflow, in different groups.
+- [INF] Adding `ci:full`, for example through Codex READY (`ci-full-label.yml:1`), and then pushing runs windows twice on nearby heads: once from each workflow, in different groups.
 
 ### 3.3 `ci-macos-nightly.yml`
 
@@ -146,7 +146,7 @@ GitHub `==` is case-insensitive. Exactness comes from the preflight shell (`ci.y
 - `tools/ci_gate.py` `decide_run_full` returns `True` on every path (`tools/ci_gate.py:178-198`), and `main` emits `run_full=true` (`tools/ci_gate.py:467-468`). [SRC]
 - So `paid=true` on every non-draft event, row 8b is unreachable, and the docs-only comment at `ci.yml:22` and the `else` branch at `ci.yml:275-283` are stale. [SRC]
 - Pruning is tracked in **CSL-382** (Triage, "prune ci.yml's docs-only branch and comments after CSL-376"). The test shell matrix still drives `run_full=false`, which stays valid as a test of the shell. [DEC: Linear CSL-382 description]
-- Docs-only PRs and pushes now start a Blacksmith runner. Before c4cf7d8d they did not: [OBS] 39383463299, 39384243800 and 39384747104 show "docs-only scope" with Linux tests skipped.
+- Docs-only PRs and pushes now start the full-test runner. Before c4cf7d8d they did not: [OBS] 39383463299, 39384243800 and 39384747104 show "docs-only scope" with Linux tests skipped.
 - [INF] A git failure inside `docs_only()` is not caught in `decide_run_full`. It reaches `main`'s `except (... SubprocessError)` and exits 1 (`tools/ci_gate.py:479-484`), so preflight fails and `linux` fails closed.
 
 ## 5. Duplicate and cancellation policy
@@ -170,7 +170,7 @@ Without `queue: max`, a concurrency group keeps at most one pending run, and a n
 **Settle (120 s).**
 
 - Settle is a fixed `sleep 120` on every non-draft PR `synchronize`, whatever the scope (`ci.yml:140-152`). It is not a timer that resets on each push.
-- The debounce effect comes from the concurrency group: a newer push cancels the older run while it is still in preflight or settle, before Linux tests allocates a Blacksmith runner. [SRC]
+- The debounce effect comes from the concurrency group: a newer push cancels the older run while it is still in preflight or settle, before Linux tests allocates its runner. [SRC]
 - Observed timings: preflight about 9 to 10 s, then settle. So a run is exposed to paid allocation from about 130 s after it starts (39389995068: preflight 07:57:33 to 07:57:42Z, settle from 07:57:44Z). [OBS]
 - Non-draft opened and reopened, ready_for_review, push and dispatch skip settle and allocate immediately (`ci.yml:164-165`). A draft opened or reopened event skips `linux-tests` and allocates nothing (E2, E6). [SRC]
 
@@ -194,7 +194,7 @@ Tests are discovered by the gate glob `tools/test_*.py` (`tools/ci_gate.py:53-54
 - `tools/test_ci_scheduling.py`: 12 OK
 - `tools/test_ci_gate.py`: 25 OK
 - `tools/test_perf_bench.py`: 17 OK
-- `tools/test_ci_runner_cost.py`: 10 OK
+- `tools/test_ci_runner_cost.py`: 11 OK (v2 adds `test_github_hosted_test_runners_are_free`)
 
 **How `tools/test_ci_scheduling.py` works.**
 
@@ -232,11 +232,11 @@ Tests are discovered by the gate glob `tools/test_*.py` (`tools/ci_gate.py:53-54
 
 ## 7. Paid workloads outside CI admission
 
-None of these start Blacksmith runners. They spend model or tool usage through secrets or external apps. [SRC]
+None of these start CI test runners themselves. They spend model or tool usage through secrets or external apps. [SRC]
 
-Their side effects do start paid CI:
+Their side effects do start CI (free runners since CSL-408):
 
-- A fixer or conflict-resolver push to a **non-draft** PR branch is a `synchronize` (E3): one paid Linux run after settle, plus windows if `ci:full` is on the PR. The exceptions are pushes GitHub suppresses: a head commit with a skip annotation (E18) or a head that is still conflicted (E19) gets no run, so no paid runner starts and the required check stays missing on that head. [OBS] Observed fixer pushes started `CI` with actor `claude[bot]` about 8-16 s after the commit: 39499885497 (#254 `8087e7f6`), 39386432470 (#249 `919f52e7`), 39352829266 (#241 `b1eb6ac8`), 39016885558 (#229 `0e1888fa`). [INF] Since events from the checkout's `GITHUB_TOKEN` would not normally start runs, the pushes most likely used the Claude app credential; the credential itself was not inspected. Earlier commits in a multi-commit push get no run of their own; only the pushed head does. A push to a draft PR is E4 and starts no paid runner (the conflict resolver has no draft exclusion).
+- A fixer or conflict-resolver push to a **non-draft** PR branch is a `synchronize` (E3): one full Linux test run after settle, plus windows if `ci:full` is on the PR. The exceptions are pushes GitHub suppresses: a head commit with a skip annotation (E18) or a head that is still conflicted (E19) gets no run, so no test runner starts and the required check stays missing on that head. [OBS] Observed fixer pushes started `CI` with actor `claude[bot]` about 8-16 s after the commit: 39499885497 (#254 `8087e7f6`), 39386432470 (#249 `919f52e7`), 39352829266 (#241 `b1eb6ac8`), 39016885558 (#229 `0e1888fa`). [INF] Since events from the checkout's `GITHUB_TOKEN` would not normally start runs, the pushes most likely used the Claude app credential; the credential itself was not inspected. Earlier commits in a multi-commit push get no run of their own; only the pushed head does. A push to a draft PR is E4 and starts no paid runner (the conflict resolver has no draft exclusion).
 - The eight-commit guard bounds both fixer paths: `devin-review-fix` (`cap` step, `claude.yml:1188-1189`) and, since CSL-365, `claude-mention` (step `live`, `claude.yml:498-529`). An `@claude` request on a PR at the cap is skipped instead of pushing.
 - When Codex READY newly applies `ci:full`, the `labeled` event starts one windows run from `ci-full-label.yml`, plus windows on every later non-draft PR event until the label is removed. If the label is already on the PR, the gate returns `ready-present` without writing it (`scripts/ci/codex_gate.py:563-564`), so there is no `labeled` event and no extra windows run.
   - The gate removes its own label only when a fixer pause or unresolved findings block readiness on the current head (`scripts/ci/codex_gate.py:507-515`, `scripts/ci/claude_fixer_receipts.py:686`). It does not remove it on every push.
@@ -257,7 +257,7 @@ The Reliability lane owns `claude.yml` (and the fixer family). This contract onl
 ## 8. Known gaps and follow-ups
 
 1. **CSL-382 (open, Triage):** remove the unreachable docs-only branch `ci.yml:275-283` and the stale comment at `ci.yml:22`. Also stale: `tools/ci_gate.py:10` says the `linux` job runs the gate; `linux-tests` does.
-2. **Required-check docs drift:** `CLAUDE.md:311` and `AGENTS.md:311` say "Required check: `linux` (Blacksmith)", and `ci.yml:3` names only `linux`. In fact `linux` runs on ubuntu-latest, Blacksmith runs `Linux tests`, and `Devin Review` (a commit status) is also required.
+2. **Required-check docs drift:** `CLAUDE.md:311` and `AGENTS.md:311` say "Required check: `linux` (GitHub-hosted)" (v2 wording), and `ci.yml:3` names only `linux`. `Devin Review` (a commit status) is also required, and neither file says so.
 3. **Rerun semantics untested (E15):** a rerun replays the original payload (a draft run fails again). [INF] Rerunning an older run on the current head posts a newer failing `linux` on that SHA, and a rerun can cancel the live run in `ci-CI-<PR>`. No test, no observation.
 4. **Base retarget (E10):** `edited` is not a `ci.yml` trigger. The `linux` on the head was computed against the old base. Behaviour under the strict policy is not tested.
 5. **Dispatch path (E13):** no draft guard, the whitespace check is skipped (no `CI_BASE_SHA`), and it runs in a different concurrency group from PR runs (duplicate paid). It can create a `linux` check run on any branch head; per GitHub's docs that check does not satisfy a PR's required check (unverified here). No dispatch on the current `ci.yml` has been observed.
@@ -266,9 +266,9 @@ The Reliability lane owns `claude.yml` (and the fixer family). This contract onl
 8. **merge_group:** absent everywhere (E12). If a merge queue is enabled, `linux` is never produced, which fails closed by blocking merge. Needs a workflow change first.
 9. **Untested admission logic:** the `ci-full-label.yml:23-25` `if:` and the `ci-macos-nightly.yml:46-58` 24 h gate are checked only as strings.
 10. **Cost comment drift:** `ci-macos-nightly.yml:1` says macOS is about $0.08/min, while `tools/ci_runner_cost.py:18` treats `macos-latest` as free on this public repository. Nightly runs also start 4.5 to 7.5 h after the cron time.
-11. **Mid-run cancellation cost:** a push more than about 130 s after the previous run started cancels a running Blacksmith job. Not observed in the window; not measured.
+11. **Mid-run cancellation cost:** a push more than about 130 s after the previous run started cancels a running `linux-tests` job, losing its runner time. That was billed before CSL-408 and is free since. Not observed in the window; not measured.
 12. **Cancelled-run path:** in observed cancellations, `linux` failed through "Required status" (`cancelled()` false), not through "Reject workflow cancellation". Both fail closed. The test models only the `cancelled()=true` branch for the reject step.
 13. **Error path:** a git failure in `docs_only()` makes preflight fail through `tools/ci_gate.py:479-484` (inferred, untested).
 14. **Org ruleset listing:** `orgs/CSL-Laboratories/rulesets` is not readable from this session. Only rulesets that apply to recursion were read.
-15. **Fork PRs (E17):** non-draft fork PRs can start Blacksmith runners once a maintainer approves the run. Lucas reports setting fork approval to "Require approval for all external contributors" (2026-10-20). An admin should confirm it, since this session cannot read it. A workflow guard would need a human-assigned workflow issue.
+15. **Fork PRs (E17):** non-draft fork PRs can start the test runners once a maintainer approves the run. They're free since CSL-408, but they still use capacity. Lucas reports setting fork approval to "Require approval for all external contributors" (2026-10-20). An admin should confirm it, since this session cannot read it. A workflow guard would need a human-assigned workflow issue.
 16. **Fixer push credential (section 7):** the fixer jobs check out with `actions/checkout@v4` and no `token:` (`claude.yml:532`, `1997`), so a plain `git push` would use `GITHUB_TOKEN`, whose events normally start no runs. The jobs also hold `id-token: write` (`claude.yml:449`, `1186`), which the Claude action can exchange for an app token. Observed fixer pushes did start `CI` as `claude[bot]` (section 7 [OBS]), so the app credential is the [INF] explanation. The push credential has not been read from a job log. If a future fixer push uses `GITHUB_TOKEN`, it would start no paid run and leave the required check missing on that head until a human push.

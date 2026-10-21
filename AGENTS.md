@@ -81,8 +81,7 @@ and code changes are covered by a test; it needs no new spend, credentials,
 permissions, settings or protected-path edits; no other claim or writer's run is
 active on the branch or files; and it starts no paid CI. Marking ready, pushing to
 a non-draft PR, adding `ci:full`, and any dispatch, re-run or `/ci` command start
-CI runs. Since CSL-408 these run on free GitHub-hosted runners, but they still use
-shared runner capacity. Pushes to drafts or to branches without a PR, and read-only
+CI runs (free since CSL-408). Pushes to drafts or to branches without a PR, and read-only
 API queries, are fine.
 
 **Escalate** when any holds: a product detail, UX choice, scope or priority change
@@ -218,8 +217,7 @@ Current tools. Do not add paid services or raise spend limits.
   [Review roles](#review-roles).
 - **Claude Code Action** — PR fixer for Devin findings and `@claude` mentions
   on open same-repo PRs by verified repository writers (`.github/workflows/claude.yml`).
-- **GitHub Actions** — only CI, on GitHub-hosted runners (free for this public
-  repository; CSL-408 moved the test jobs off Blacksmith). See [CI](#ci).
+- **GitHub Actions** — only CI, on free GitHub-hosted runners (CSL-408). See [CI](#ci).
 - **Google Workspace** (`csl-laboratories.com`) — meetings and notes.
 - **Discord bot** (`csl-bot-operations`) — Liaison. Commands and MCP; see below. Trigger CI
   and reviews through these (or the `ci:full` label), not by editing config.

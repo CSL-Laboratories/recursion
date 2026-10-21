@@ -1,8 +1,12 @@
---- name: proceed-or-escalate description: Decide whether to act on your own or
-  raise a question to a human, and how to write comments that speak for a developer.
-  Use before starting or continuing work on an issue or PR, before posting a Linear
-  or GitHub comment, before resolving a review thread, before citing or recording a
-  decision, and on every run of a scheduled or unattended loop. ---
+---
+name: proceed-or-escalate
+description: >-
+  Decide whether to act on your own or raise a question to a human, and how to
+  write comments that speak for a developer. Use before starting or continuing
+  work on an issue or PR, before posting a Linear or GitHub comment, before
+  resolving a review thread, before citing or recording a decision, and on
+  every run of a scheduled or unattended loop.
+---
 
 # Proceed or escalate
 
@@ -50,6 +54,7 @@ and audit comments are unchanged.
   uncertain. Never remove a pause yourself, never dispatch the fixer to get
   around its budget, and never report an unverified fix as fixed.
 
+If anything on this list holds, escalate; the proceed list never overrides it.
 When unsure, escalate, in the short form below.
 
 ## Actions that start paid CI
@@ -68,8 +73,9 @@ issue under each repo's guardrails.
 
 ## How to escalate
 
-If the PR already has a `Stuck PR threads: <repo>#<PR>` roll-up, add to that
-instead of writing a new comment. Otherwise post one comment on the Linear issue,
+If the question is a stuck review thread and the PR already has a `Stuck PR
+threads:` roll-up, found by its `<!-- stuck-pr-threads:<repo>#<PR> -->` marker
+(never by title), add to that. Otherwise post one comment on the Linear issue,
 @mentioning the issue owner:
 
 ```
@@ -93,20 +99,43 @@ wrote a comment from the author field. Make it visible in the text.
 
 - **Agent comment** (status, evidence, proposals): start with
   `Agent (<tool/session>, for <developer>):`. It carries no authority.
-- **Developer-approved comment**: the developer read the exact text and said to
-  post it. Start with `Drafted by agent, approved by <developer> before posting:`.
-  It counts as the developer's direction, but it is still a relay: where repo
-  rules require the human to post personally (decision receipts, contract
-  acceptance, a named reviewer's GitHub review), the human posts it from their
-  own account.
+- **Developer-approved comment**: Lucas decided (CSL-353 comment
+  `6e602e3a-5c27-46f3-b191-2e7f4e86425f`) that it
+  counts as that developer's personal receipt when all of these hold:
+  1. Immediately before posting, you showed the developer the final exact text
+     and they approved it in this same session. Approval from an earlier turn or
+     another context does not carry over; ask again.
+  2. The comment carries the line
+     `developer-approved: <developer>, exact text confirmed <UTC time>, session <id>`,
+     with the time read just before posting.
+  3. It is never edited after posting. Any edit voids it; post a new one instead.
+  4. It stays within that developer's own authority and grants none.
+  5. No accepted contract requires an exact authenticated human receipt for it
+     (recursion program receipts, R2a, or another repository's accepted
+     contract, unless that contract is amended).
+
+  **Where it applies:** in another repository once its own rules say so. In
+  recursion only once the `CONTROL_PLANE.md` amendment (CSL-401) merges;
+  until then a developer-approved comment carries the developer's direction but
+  stays an attributed relay where personal posting is required, and the human
+  posts decision receipts and contract acceptance from their own account.
+
+  **Never a review.** A named reviewer's GitHub review or verdict is always that
+  person's own post from their own account, before and after CSL-401; a
+  developer-approved comment never stands in for it.
 - **Never** post decision language ("approved", "accepted", "restricted",
-  "decided") as an agent comment. Quote and link the human's comment instead.
+  "decided") as an agent comment unless it is a developer-approved comment that
+  counts under the rule above. Otherwise quote and link the human's comment.
 
 ## Decisions
 
-A decision exists only if a human posted it from their own account, or it is recorded in
-`state/DECISIONS.md` or `docs/adr/`. A developer-approved comment carries direction but
-never releases a hold or counts as a decision on its own. When you rely on one, link it.
+A decision exists only if a human posted it from their own account, a
+developer-approved comment that counts under the rule above carries it, or it is
+recorded in the repo's decision records (`state/DECISIONS.md` or `docs/adr/` in
+recursion; elsewhere, the records that repository's rules name).
+When you rely on one, link it. When relying on a developer-approved comment, check
+that the marker is present, the comment is unedited and the named developer has not
+disputed it; if any of that is unclear, ask that developer before acting.
 If you can only find agents repeating it, treat it as unverified and ask.
 Silence, elapsed time, a green check, a merge, an issue moving to Done (Linear
 auto-closes issues on merge) or any other status is never a decision.
@@ -115,7 +144,8 @@ auto-closes issues on merge) or any other status is never a decision.
 
 A loop that acts through a developer's account while nobody watches may only do work
 from the "proceed" list. It must not resolve human-authored threads, change scope,
-close issues as decided, or post developer-approved comments. It never marks a PR
+close issues as decided, or post developer-approved comments (nobody is there to
+approve the text). It never marks a PR
 ready, adds or removes GitHub labels, dispatches, re-runs or cancels. Label every
 comment `Agent (unattended run, for <developer>):`. If a run finds nothing on the
 proceed list, it posts nothing.

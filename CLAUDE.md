@@ -92,9 +92,11 @@ you would state a decision you cannot link to its record; the CI cost is unclear
 or an automation signal needs a human (fixer paused or at its loop cap, a pause
 label, an unverifiable fix receipt, a rebased branch with fixer receipts, uncertain
 `ci:full` ownership). Never remove a pause, dispatch the fixer around its
-budget, or report an unverified fix as fixed.
+budget, or report an unverified fix as fixed. If any escalate trigger holds,
+escalate; the proceed list never overrides it.
 
-**How:** if the PR has a `Stuck PR threads: recursion#<PR>` roll-up, add to it.
+**How:** a stuck review thread goes in the PR's `Stuck PR threads:` roll-up, found
+only by its `<!-- stuck-pr-threads:recursion#<PR> -->` marker, never by title.
 Otherwise post one Linear comment @mentioning the issue owner with the question, two
 or three options, your recommendation, and what you will do meanwhile ("paused" or
 other proceed-list work, never the option you are asking about or work that
@@ -103,15 +105,28 @@ requires, release your claim, and take only other admitted work that is next und
 the human-approved order.
 
 **Comment labels.** Agents usually post through a developer's account, so start
-every agent comment with `Agent (<tool/session>, for <developer>):`. A comment the
-developer approved word for word before it was posted starts `Drafted by agent,
-approved by <developer> before posting:` and carries their direction, but it is
-still an attributed relay: where personal posting is required (decision receipts,
-contract acceptance, the named reviewer's GitHub review), the human posts it. Never
-post decision language as an agent comment; link the record instead. A decision
-exists only if a human posted it from their own account, or it is in
-`state/DECISIONS.md` or `docs/adr/`; a developer-approved comment never releases a
-hold on its own. Agent repetition, silence, a merge or an issue auto-closing to Done
+every agent comment with `Agent (<tool/session>, for <developer>):`. Lucas decided
+(CSL-353 comment `6e602e3a-5c27-46f3-b191-2e7f4e86425f`) that a
+**developer-approved comment** counts as that developer's personal receipt when:
+the developer approved the final exact text in the same session immediately before
+posting (approval from an earlier turn or another context does not carry over); it
+carries the line
+`developer-approved: <developer>, exact text confirmed <UTC time>, session <id>`;
+it is unedited since posting; it stays within that developer's authority and grants
+none; and no accepted contract (recursion program receipts, R2a, or another
+repository's) requires an exact authenticated human receipt, unless that contract
+is amended. In recursion this takes effect only when the `CONTROL_PLANE.md`
+amendment (CSL-401) merges. Until then a developer-approved comment carries the
+developer's direction but stays an attributed relay where personal posting is
+required (decision receipts, contract acceptance), and the human posts it. A named
+reviewer's GitHub review is always submitted by that person from their own account
+(`CONTROL_PLANE.md`), and a developer-approved comment is never a review verdict
+([Review roles](#review-roles)); CSL-401 changes neither. Never post decision
+language as an agent comment otherwise; link the record instead. A decision exists
+only if a human posted it from their own account, a developer-approved comment that
+counts under this rule carries it (in recursion none does until CSL-401 merges, and
+until then it releases no hold), or it is in `state/DECISIONS.md` or
+`docs/adr/`. Agent repetition, silence, a merge or an issue auto-closing to Done
 is not a decision.
 
 **Unattended runs** (loops acting through a developer's account while nobody

@@ -204,18 +204,38 @@ class ProtectedPathTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertFalse(p.is_protected(path))
 
-    def test_founder_protected_fixer_tests_and_credential_files(self):
-        # Founder decisions on CSL-414: the fixer's own test suites and credential files are protected.
+    def test_founder_protected_loop_tests_and_credential_files(self):
+        # Founder decisions on CSL-414: the review loop's own test suites and credential files are protected.
         for path in ("tools/test_claude_fixer_guard.py", "tools/test_claude_fixer_receipts.py",
                      "tools/test_claude_fixer_publish.py", "TOOLS/Test_Claude_Fixer_Publish.py",
-                     ".netrc", "_netrc", "home/.netrc", ".npmrc", "web/.npmrc", ".pypirc", ".NPMRC",
-                     ".git-credentials"):
+                     "tools/test_claude_settings.py", "tools/test_claude_new.py", "tools/test_codex_gate.py",
+                     "tools/test_codex_gate_identity.py", "tools/test_fixer_failure_escalation.py",
+                     "tools/test_fixer_failure_watcher.py", "tools/test_stuck_thread_watch.py", "tools/test_ci_gate.py",
+                     "tools/test_claude_fixer_guard.py.bak", "tools/test_codex_cases/x.json",
+                     ".netrc", "_netrc", "home/.netrc", ".npmrc", "web/.npmrc", ".pypirc", ".NPMRC", ".pgpass",
+                     "pip.conf", "app/pip.ini", ".yarnrc", "web/.yarnrc.yml", ".git-credentials",
+                     ".aws/credentials", "home/.docker/config.json", ".kube/config", ".ssh/id_ed25519",
+                     "x/.gnupg/pubring.kbx", ".AWS/config"):
             with self.subTest(path=path):
                 self.assertTrue(p.is_protected(path))
-        for path in ("tools/test_claude_fixer_guard.py.bak", "docs/tools/test_claude_fixer_publish.py",
-                     "tools/test_claude_settings.py", "netrc", "docs/npmrc.md", "pypirc.example"):
+        for path in ("docs/tools/test_claude_fixer_publish.py", "tools/sub/test_claude_x.py", "tools/test_other.py",
+                     "tools/test_linear_pr_sync.py", "tools/test_perf_ci.py", "tools/test_ci_scheduling.py",
+                     "tools/claude_test.py", "netrc", "docs/npmrc.md", "pypirc.example", "pip.conf.example",
+                     "docs/aws.md", "docker/compose.yml", "ssh/x", "app/kube.py"):
             with self.subTest(path=path):
                 self.assertFalse(p.is_protected(path))
+
+    def test_bounded_comments_fails_closed_at_the_page_limit(self):
+        # Fable review of PR A: a truncated journal must not read as complete.
+        def pages(full):
+            def read(path):
+                page = int(path.rsplit("=", 1)[1])
+                size = 100 if page < 5 or full else 7
+                return [{"id": page * 1000 + i} for i in range(1, size + 1)]
+            return read
+        with self.assertRaisesRegex(ValueError, "page limit"):
+            p.bounded_comments("repos/acme/example/issues/7/comments", pages(True))
+        self.assertEqual(len(p.bounded_comments("repos/acme/example/issues/7/comments", pages(False))), 407)
 
     def test_every_control_plane_protected_path_is_protected(self):
         text = (ROOT / "CONTROL_PLANE.md").read_text(encoding="utf-8")

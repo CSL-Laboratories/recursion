@@ -229,7 +229,7 @@ class WorkflowTests(unittest.TestCase):
         # CSL-255: the required linux job is a free aggregate; the paid suite is linux-tests.
         self.assertIn("runs-on: ubuntu-latest", linux)
         tests = text[text.index("  linux-tests:\n") : text.index("  linux:\n")]
-        self.assertIn("runs-on: blacksmith-2vcpu-ubuntu-2404", tests)
+        self.assertIn("runs-on: ubuntu-24.04", tests)
         self.assertIn("if: always()\n", linux)
         self.assertNotRegex(linux, r"(?m)^    if: .*draft")
         self.assertNotIn("github.event.action != 'labeled'", linux)

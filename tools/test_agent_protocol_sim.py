@@ -1711,6 +1711,7 @@ class LapsedClaimResumeTests(unittest.TestCase):
             "within tolerance": (ts(100, -30), []),
             "not a timestamp": ("soon", []),
             "malformed timestamp": ("2026-10-20Tsoon", []),
+            "out of range in UTC": ("0001-01-01T00:00:00+01:00", []),
         }
         for name, (value, expected) in cases.items():
             with self.subTest(case=name):

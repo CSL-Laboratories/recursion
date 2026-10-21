@@ -144,7 +144,10 @@ def parse_ts(value: Any, where: str) -> datetime:
         raise SnapshotError(f"{where}: bad timestamp {value!r}") from exc
     if parsed.tzinfo is None:
         raise SnapshotError(f"{where}: timestamp {value!r} has no UTC offset")
-    return parsed.astimezone(timezone.utc)
+    try:
+        return parsed.astimezone(timezone.utc)
+    except OverflowError as exc:
+        raise SnapshotError(f"{where}: timestamp {value!r} is out of range in UTC") from exc
 
 
 def require(mapping: Any, key: str, where: str) -> Any:

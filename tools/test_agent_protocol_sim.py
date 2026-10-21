@@ -1502,6 +1502,37 @@ class DeveloperApprovedTests(unittest.TestCase):
         result = sim.evaluate(snapshot(10, self.decision_issues(), [answer, record, claim("c1", "CSL-1", U1, at=3)]))
         self.assertNotIn("decision_not_recorded", codes(result))
 
+    def test_approval_must_be_confirmed_within_fifteen_minutes(self):
+        # Lucas's DECISION on CSL-402 (comment b3c5c1b8); CSL-411.
+        stale = approved("a1", "CSL-2", 30, "DECISION: B", confirmed=ts(14, 59))
+        result = sim.evaluate(snapshot(40, self.decision_issues(), [stale]))
+        self.assertFalse(result["decisions"]["CSL-2"]["answered"])
+        self.assertIn(("developer_approval_invalid", "a1: approval confirmed more than 15 minutes before posting"),
+                      [(v["code"], v["detail"]) for v in result["violations"]])
+        edge = approved("a1", "CSL-2", 30, "DECISION: B", confirmed=ts(15))
+        self.assertTrue(sim.evaluate(snapshot(40, self.decision_issues(), [edge]))["decisions"]["CSL-2"]["answered"])
+        wider = sim.evaluate(snapshot(40, self.decision_issues(), [stale], config={"approval_window_minutes": 20}))
+        self.assertTrue(wider["decisions"]["CSL-2"]["answered"])
+
+    def test_incomplete_agent_prefix_is_invalid(self):
+        for session, marker_session in (("/s1", "s1"), ("claude/", "claude/"), ("claude", "claude"), (" /s1", "s1")):
+            with self.subTest(session=session):
+                marker = f"developer-approved: Lucas, exact text confirmed {ts(4)}, session {marker_session}"
+                made = comment("a1", "CSL-2", 5, "\n".join([f"Agent ({session}, for Lucas): t", marker, "DECISION: B"]))
+                result = sim.evaluate(snapshot(10, self.decision_issues(), [made]))
+                self.assertFalse(result["decisions"]["CSL-2"]["answered"])
+                self.assertIn(("developer_approval_invalid", "a1: incomplete agent prefix"),
+                              [(v["code"], v["detail"]) for v in result["violations"]])
+
+    def test_marker_added_by_a_later_edit_is_reported(self):
+        plain = comment("a1", "CSL-2", 5, "Agent (claude/s1, for Lucas): relaying\nDECISION: B")
+        plain["edits"] = [{"at": ts(7), "body": "Agent (claude/s1, for Lucas): relaying\n"
+                           f"developer-approved: Lucas, exact text confirmed {ts(6)}, session s1\nDECISION: B"}]
+        result = sim.evaluate(snapshot(10, self.decision_issues(), [plain]))
+        self.assertFalse(result["decisions"]["CSL-2"]["answered"])
+        self.assertIn(("developer_approval_invalid", "a1: edited after posting"),
+                      [(v["code"], v["detail"]) for v in result["violations"]])
+
     def test_unmarked_agent_comment_is_still_void(self):
         plain = comment("a1", "CSL-2", 5, "Agent (claude/s1, for Lucas): relaying\nDECISION: B")
         result = sim.evaluate(snapshot(10, self.decision_issues(), [plain]))

@@ -1214,12 +1214,15 @@ class Evaluation:
                     self.violation("loser_not_withdrawn", claim.issue, claim.uuid, f"winner {settled.uuid}")
             self.check_implicit_takeover(claim)
             self.check_takeover_refused(claim)
-            # A session may hold several claims, but only one per issue and
-            # repository (Lucas's decision, CSL-357 comment 0cdfd465).
+            # A session may hold several claims in a repository (Lucas's
+            # decision, CSL-357 comment 0cdfd465), but no two of them may cover
+            # the same issue, counting `scope: sub-issue` children, or name the
+            # same branch.
+            covered = set(claim.scope_issues(self.issues))
             others = [
                 other for other in self.claims.values()
                 if other.uuid != claim.uuid and other.session == claim.session and other.repo == claim.repo
-                and other.issue == claim.issue
+                and (covered & set(other.scope_issues(self.issues)) or other.branch == claim.branch)
                 and (other.created_at, other.uuid) < (claim.created_at, claim.uuid) and self.ended(other, claim.created_at) is None
             ]
             if others:

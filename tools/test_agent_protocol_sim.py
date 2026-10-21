@@ -199,6 +199,20 @@ class ClaimingTests(unittest.TestCase):
         self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], U1)
         self.assertEqual(result["issues"]["CSL-4"]["claims"]["recursion"]["winner"], U2)
 
+    def test_s22_parent_scope_and_direct_child_claim_overlap(self):
+        # The parent claim's `scope: sub-issue CSL-2` already covers CSL-2.
+        family = [issue("CSL-1"), issue("CSL-2", status="In Progress", parent="CSL-1")]
+        result = sim.evaluate(snapshot(10, family, [
+            scoped("c1", "CSL-1", U1, "CSL-2"), claim("c2", "CSL-2", U2, at=1, branch="csl-2-work"),
+        ]))
+        self.assertEqual(codes(result), ["multiple_claims_per_session"])
+
+    def test_s22_claims_on_two_issues_sharing_a_branch_are_flagged(self):
+        result = sim.evaluate(snapshot(10, [issue("CSL-1"), issue("CSL-4")], [
+            claim("c1", "CSL-1", U1), claim("c2", "CSL-4", U2, at=1, branch="csl-1-work"),
+        ]))
+        self.assertEqual(codes(result), ["multiple_claims_per_session"])
+
     def test_human_revoke_ends_claim_and_agent_revoke_is_void(self):
         human = comment("h1", "CSL-1", 5, f"REVOKE CLAIM {U1}")
         result = sim.evaluate(snapshot(10, [issue("CSL-1")], [claim("c1", "CSL-1", U1), human],

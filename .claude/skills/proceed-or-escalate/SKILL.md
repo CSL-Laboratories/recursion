@@ -100,8 +100,8 @@ holds the record format and wins on any conflict.
 
 - The Linear assignee stays the human owner. Post one agent-prefixed `claim v1`
   comment (uuid, scope `whole issue` or `sub-issue CSL-M`, branch @ head, base,
-  `confirmed-at`, `heartbeat-at`, `release-on`). One claim per agent session per
-  repository.
+  `confirmed-at`, `heartbeat-at`, `release-on`). Each claim covers one issue in one
+  repository; a session may hold several claims at once.
 - Read back after at least 60 seconds: the earliest Linear `createdAt` wins; on a
   tie, the lower uuid. Confirm or withdraw. No write before `confirmed-at`; then
   move the issue to In Progress.

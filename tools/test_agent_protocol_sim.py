@@ -91,6 +91,8 @@ def decision(options=("A", "B"), pings=(1,), options_changed_at=(), deadline=Non
 
 
 def snapshot(now, issues, comments, **rest):
+    # BASE is before the real agent-prefix cutoff, so tests turn that check off unless they set it (CSL-417).
+    rest["config"] = {"agent_prefix_since": None, **rest.get("config", {})}
     return {"now": ts(now), "repo": "recursion", "issues": issues, "comments": comments, **rest}
 
 
@@ -1572,6 +1574,71 @@ class CommandLineTests(unittest.TestCase):
         done = self.run_cli("{\"issues\": []}")
         self.assertEqual(done.returncode, 2)
         self.assertIn("AGENT_PROTOCOL_SIM_ERROR", done.stderr)
+
+
+class PrePrefixDecisionTests(unittest.TestCase):
+    """S30 / D17. CSL-417, Lucas's DECISION e6d37489 (option A): an unprefixed answer from before the agent-prefix rule
+    is unverified and does not count. Confirmation is not modelled."""
+
+    CUTOFF = {"agent_prefix_since": ts(5)}
+
+    def decision_issues(self):
+        return [issue("CSL-1", blocked_by=["CSL-2"]), issue("CSL-2", decision=decision())]
+
+    def test_pre_cutoff_decision_is_unverified(self):
+        result = sim.evaluate(snapshot(10, self.decision_issues(), [comment("h1", "CSL-2", 3, "DECISION: B")],
+                                       config=self.CUTOFF))
+        self.assertFalse(result["decisions"]["CSL-2"]["answered"])
+        self.assertTrue(result["issues"]["CSL-1"]["held"])
+        self.assertIn(("decision_unverified", "CSL-2", "h1"),
+                      [(v["code"], v["issue"], v["detail"]) for v in result["violations"]])
+        self.assertEqual(result["void_lines"],
+                         [{"comment": "h1", "line": "DECISION: B", "reason": "before the agent-prefix rule"}])
+
+    def test_post_cutoff_decision_counts(self):
+        for at in (5, 7):
+            with self.subTest(at=at):
+                result = sim.evaluate(snapshot(10, self.decision_issues(), [comment("h1", "CSL-2", at, "DECISION: B")],
+                                               config=self.CUTOFF))
+                self.assertEqual(result["decisions"]["CSL-2"]["answer"], "B")
+                self.assertNotIn("decision_unverified", codes(result))
+
+    def test_pre_cutoff_batched_answer_is_unverified(self):
+        result = sim.evaluate(snapshot(10, self.decision_issues(), [comment("h1", "CSL-2", 3, "CSL-2: B")],
+                                       config=self.CUTOFF))
+        self.assertFalse(result["decisions"]["CSL-2"]["answered"])
+        self.assertIn("decision_unverified", codes(result))
+
+    def test_later_answer_still_counts_after_an_unverified_one(self):
+        comments = [comment("h1", "CSL-2", 3, "DECISION: A"), comment("h2", "CSL-2", 7, "DECISION: B")]
+        result = sim.evaluate(snapshot(10, self.decision_issues(), comments, config=self.CUTOFF))
+        self.assertEqual(result["decisions"]["CSL-2"]["answer"], "B")
+        self.assertIn("decision_unverified", codes(result))
+
+    def test_developer_approved_comment_is_not_affected(self):
+        result = sim.evaluate(snapshot(10, self.decision_issues(), [approved("a1", "CSL-2", 3, "DECISION: B")],
+                                       config=self.CUTOFF))
+        self.assertEqual(result["decisions"]["CSL-2"]["answer"], "B")
+        self.assertNotIn("decision_unverified", codes(result))
+
+    def test_null_cutoff_turns_the_check_off(self):
+        result = sim.evaluate(snapshot(10, self.decision_issues(), [comment("h1", "CSL-2", 3, "DECISION: B")],
+                                       config={"agent_prefix_since": None}))
+        self.assertEqual(result["decisions"]["CSL-2"]["answer"], "B")
+
+    def test_default_cutoff_is_the_recursion_247_merge(self):
+        self.assertEqual(sim.DEFAULT_CONFIG["agent_prefix_since"], "2026-10-21T00:39:04Z")
+        snap = {"now": "2026-10-21T01:00:00Z", "repo": "recursion", "issues": self.decision_issues(),
+                "comments": [comment("h1", "CSL-2", 0, "DECISION: B") | {"created_at": "2026-10-21T00:39:03Z"},
+                             comment("h2", "CSL-2", 0, "DECISION: A") | {"created_at": "2026-10-21T00:39:04Z"}]}
+        result = sim.evaluate(snap)
+        self.assertEqual(result["decisions"]["CSL-2"]["answer"], "A")
+        self.assertIn(("decision_unverified", "h1"), [(v["code"], v["detail"]) for v in result["violations"]])
+
+    def test_bad_cutoff_is_rejected(self):
+        for value in ("yesterday", 5, "2026-10-21T00:39:04"):
+            with self.subTest(value=value), self.assertRaises(sim.SnapshotError):
+                sim.evaluate(snapshot(10, self.decision_issues(), [], config={"agent_prefix_since": value}))
 
 
 if __name__ == "__main__":

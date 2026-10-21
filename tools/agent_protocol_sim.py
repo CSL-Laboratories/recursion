@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline checker for the CSL-357 agent work protocol (spec draft v6).
+"""Offline checker for the CSL-357 agent work protocol (spec draft v7).
 
 Run from the repository root:
 
@@ -58,8 +58,12 @@ approvals use machine fields: `actions:` and `scope:` are comma-separated
 tokens, `limits:` holds `per_day=N` and/or `total=N`, and `expires:` is a date;
 each action is checked against the comment revision in effect at its time. An
 agent records a decision answer on the decision issue with the line
-`decision-record: <answer comment id> <option>`. `confirmed-at:` holds a
-timestamp or a placeholder in parentheses.
+`decision-record: <answer comment id> <option>`. An unprefixed `DECISION:` or
+batched answer posted before `agent_prefix_since` (default 2026-10-21T00:39:04Z,
+the recursion#247 merge; null turns the check off) does not count: it is
+reported as `decision_unverified` and its lines as void, because nothing shows
+a human rather than an agent wrote it (CSL-417, option A; confirmation is not
+modelled). `confirmed-at:` holds a timestamp or a placeholder in parentheses.
 """
 from __future__ import annotations
 
@@ -80,6 +84,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "standing_approvals_issue": None,
     "sa_max_days": 90,
     "approval_window_minutes": 15,
+    # Lucas's DECISION on CSL-417 (comment e6d37489): the recursion#247 merge, when the agent-prefix rule took effect.
+    "agent_prefix_since": "2026-10-21T00:39:04Z",
 }
 
 AGENT_PREFIX = re.compile(r"^Agent \(([^)]*)\):")
@@ -345,6 +351,8 @@ class Evaluation:
             raise SnapshotError("config: coordinator_ack_required must be a boolean")
         if self.config["standing_approvals_issue"] is not None and not isinstance(self.config["standing_approvals_issue"], str):
             raise SnapshotError("config: standing_approvals_issue must be an issue id or null")
+        since = self.config["agent_prefix_since"]
+        self.agent_prefix_since = None if since is None else parse_ts(since, "config: agent_prefix_since")
         self.lease = timedelta(minutes=self.config["lease_minutes"])
         self.grace = timedelta(minutes=self.config["grace_minutes"])
         self.readback = timedelta(seconds=self.config["readback_seconds"])
@@ -911,8 +919,8 @@ class Evaluation:
                 pairs.extend((issue, value, first) for issue, value in named)
         return pairs
 
-    def void(self, comment: Comment, line: str) -> None:
-        entry = {"comment": comment.id, "line": line, "reason": "agent-prefixed"}
+    def void(self, comment: Comment, line: str, reason: str = "agent-prefixed") -> None:
+        entry = {"comment": comment.id, "line": line, "reason": reason}
         if entry not in self.void_lines:
             self.void_lines.append(entry)
 
@@ -928,6 +936,14 @@ class Evaluation:
                 continue
             if any(self.answer_pairs(comment, r.body) != original for r in comment.revisions[1:]):
                 self.violation("decision_edited", comment.issue, detail=comment.id)
+            if (original and comment.approved_by is None and self.agent_prefix_since is not None
+                    and comment.created_at < self.agent_prefix_since):
+                # Lucas's DECISION on CSL-417 (comment e6d37489), option A: an unprefixed answer from
+                # before the agent-prefix rule is unverified and does not count. Confirmation is not modelled.
+                self.violation("decision_unverified", comment.issue, detail=comment.id)
+                for _, _, line in original:
+                    self.void(comment, line, "before the agent-prefix rule")
+                continue
             stated.append((comment, original))
         results: dict[str, dict[str, Any]] = {}
         for issue_id, issue in self.issues.items():

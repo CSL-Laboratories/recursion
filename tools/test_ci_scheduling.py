@@ -576,6 +576,324 @@ class ClassifierTests(unittest.TestCase):
         self.assertTrue(self.decide(sha, []))
         self.assertTrue(self.decide(sha, ["docs/x.md"], missing=True))
 
+# CSL-416 (CSL-255 exit criterion 5): a static guard on the admission surface of the Claude
+# writers. The fixer and `@claude` jobs (`claude.yml`) and the conflict resolver
+# (`conflict-scan.yml`) reach CI only through the `synchronize` of their own push: no CI dispatch,
+# re-run, ready-for-review or CI-label add (the only CI-label write is revoking a gate-owned
+# `ci:full`); GitHub-hosted runners only; one shared per-PR lock without cancellation; a reviewed
+# ceiling of shell grants with one exact, non-force push; the eight-commit guard, bounded attempts and
+# the human pause. Limit: the push checks read the workflow text only; until CSL-414 the model
+# jobs hold a write token and may edit and run repository code, so it is not a push guarantee. Jobs are split by layout (two-space job keys under `jobs:`), so an unsupported
+# layout fails instead of passing. Retry behaviour itself is tested in
+# tools/test_claude_pr_fixer.py, which the fixer workflow runs.
+CROSSLANE_WORKFLOWS = ROOT / ".github" / "workflows"
+CROSSLANE_WRITER_FILES = ("claude.yml", "conflict-scan.yml")
+CROSSLANE_ALL_JOBS = {"claude.yml": {"resolve-pr", "event-paths", "claude-mention", "devin-review-fix"},
+                      "conflict-scan.yml": {"conflict-scan", "conflict-resolve"}}
+CROSSLANE_WRITER_JOBS = {"claude.yml": ("claude-mention", "devin-review-fix"), "conflict-scan.yml": ("conflict-resolve",)}
+CROSSLANE_HOSTED = {"ubuntu-latest", "ubuntu-24.04", "ubuntu-22.04", "windows-2025", "windows-latest", "macos-latest"}
+# Every shell grant a writer model may hold, apart from its one push. A new grant fails until reviewed here.
+CROSSLANE_SAFE_BASH = {
+    "Bash(git add:*)", "Bash(git commit:*)", "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)",
+    "Bash(git rev-parse:*)", "Bash(git merge --abort)", "Bash(gh pr view:*)", "Bash(gh pr diff:*)",
+    "Bash(python3 ${{ runner.temp }}/claude-fixer-guard/pre-push model-api --:*)",
+    "Bash(python -X utf8 -B tools/ci_gate.py --force)", "Bash(python3 -X utf8 -B tools/ci_gate.py --force)",
+    "Bash(python -X utf8 -B tools/test_claude_pr_fixer.py)", "Bash(python3 -X utf8 -B tools/test_claude_pr_fixer.py)",
+}
+CROSSLANE_PUSH = re.compile(r"^Bash\(git push origin HEAD:refs/heads/\$\{\{ (steps\.(live|cap)\.outputs\.head_ref|matrix\.pr\.head_ref) \}\}\)$")
+# A shell push: `git`, any global options (`-C dir`, `-c k=v`, `--opt[=v]`), then `push`, across
+# backslash continuations.
+CROSSLANE_SHELL_PUSH = re.compile(r"\bgit(?:(?:\s|\\\n)+(?:-[Cc](?:\s|\\\n)+\S+|--?[A-Za-z][\w-]*(?:=\S+)?))*(?:\s|\\\n)+push\b")
+# An argv push: a quoted `push` element opening a list or tuple or following a comma, so
+# `["git", "-C", repo, "push"]`, `run_git(["-C", repo, "push"])`, `[*prefix, "push"]` and
+# `prefix + ["push"]` all count. Escaped quotes (YAML-embedded Python in a shell string) match too.
+CROSSLANE_ARGV_PUSH = re.compile(r"""[\[(,]\s*\\?["']push\\?["']""")
+# Any push command or git argv in a job once the model's `prompt` and `claude_args` (its prose and
+# tool grants, which execute nothing themselves) are removed.
+CROSSLANE_STEP_PUSH = re.compile(f"{CROSSLANE_SHELL_PUSH.pattern}|{CROSSLANE_ARGV_PUSH.pattern}")
+# The mention fixer's command-word allowlist is data, not argv: only this exact all-string set literal is skipped.
+CROSSLANE_WORD_LIST = re.compile(r"""KNOWN_WORDS = frozenset\(\s*\{(?:\s*"[^"\\\n]*",?)*\s*\}\s*\)""")
+# Force, mirror or delete anywhere in a push command, including argv elements (`"-f"`, `"+HEAD:x"`)
+# and short-flag clusters (`-uf`).
+CROSSLANE_FORCE = re.compile(r"""--force|--mirror|--delete|:\+|(?:^|[\s"'\\,\[(])(?:-[A-Za-z]*f[A-Za-z]*\b|\+)""")
+# A label write: an explicit POST/PUT/PATCH, or a `gh api` body flag (which defaults to POST).
+CROSSLANE_LABEL_WRITE = re.compile(r"""["'](POST|PUT|PATCH)["']|-X\s*["']?(POST|PUT|PATCH)\b"""
+                                   r"""|--method[\s=]+["']?(POST|PUT|PATCH)\b|method\s*=\s*["'](POST|PUT|PATCH)""")
+CROSSLANE_LABEL_BODY = re.compile(r"""(?:^|[\s"'])(?:--input|-f|-F|--field|--raw-field)\b""")
+CROSSLANE_WRITER_SCOPES = {"contents", "pull-requests", "issues", "id-token"}
+
+
+def _crosslane_text(name: str) -> str:
+    return (CROSSLANE_WORKFLOWS / name).read_text(encoding="utf-8")
+
+
+def _crosslane_jobs(name: str) -> dict[str, str]:
+    lines = _crosslane_text(name).splitlines()
+    start = lines.index("jobs:")
+    out: dict[str, list[str]] = {}
+    current = None
+    for line in lines[start + 1:]:
+        match = re.fullmatch(r"  ([A-Za-z0-9_-]+):", line)
+        if match:
+            current = match.group(1)
+            out[current] = []
+        elif current is not None:
+            out[current].append(line)
+        elif line.strip() and not line.lstrip().startswith("#"):
+            raise AssertionError(f"{name}: unexpected line before the first job: {line!r}")
+    if not out:
+        raise AssertionError(f"{name}: no jobs found")
+    return {key: "\n".join(value) for key, value in out.items()}
+
+
+def _crosslane_callees(name: str) -> set[str]:
+    return set(re.findall(r"^\s*uses: *\./\.github/workflows/([A-Za-z0-9_.-]+)\s*$", _crosslane_text(name), re.MULTILINE))
+
+
+def _crosslane_value(block: str, key: str) -> str | None:
+    match = re.search(rf"^    {re.escape(key)}: *(.*)$", block, re.MULTILINE)
+    return match.group(1).strip() if match else None
+
+
+def _crosslane_without_model_text(block: str) -> str:
+    # Drop each `prompt:` / `claude_args:` block scalar: the key line and every more-indented line after it.
+    out: list[str] = []
+    indent = None
+    for line in block.splitlines():
+        if indent is not None and (not line.strip() or len(line) - len(line.lstrip()) > indent):
+            continue
+        indent = None
+        match = re.match(r"^( *)(prompt|claude_args): *[|>]", line)
+        if match:
+            indent = len(match.group(1))
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def _crosslane_permissions(text: str, indent: int) -> dict[str, str] | str | None:
+    # `permissions:` at this indent: an inline value (`read-all`, `{}`, ...), a scope mapping, or None if absent.
+    pad = " " * indent
+    match = re.search(rf"^{pad}permissions:[ \t]*(\S.*)?$", text, re.MULTILINE)
+    if match is None:
+        return None
+    if match.group(1):
+        return match.group(1).strip()
+    # YAML allows blank and comment lines inside a mapping; they must not end the scan early.
+    body = re.match(rf"((?:{pad}  .*\n?|[ \t]*#.*\n?|[ \t]*\n)+)", text[match.end() + 1:])
+    return dict(re.findall(rf"^{pad}  ([a-z-]+): *(\S+)", body.group(1), re.MULTILINE)) if body else {}
+
+
+def _crosslane_granted(block: str) -> str:
+    # `--disallowedTools` denials (e.g. `git push --force:*`) are not grants. Each `--allowedTools`
+    # entry goes on its own line, so one grant's command never runs into the next grant.
+    block = re.sub(r'--disallowedTools "[^"]*"', "", block)
+    return re.sub(r'--allowedTools "([^"]*)"', lambda m: "\n".join(m.group(1).split(",")), block)
+
+
+def _crosslane_shell_command(text: str, start: int, end: int) -> tuple[int, int]:
+    # Widen [start, end) to whole lines plus backslash continuations before and after.
+    start = text.rfind("\n", 0, start) + 1
+    while start > 1 and text[:start - 1].rstrip(" \t").endswith("\\"):
+        start = text.rfind("\n", 0, start - 1) + 1
+    end = text.find("\n", end)
+    while end != -1 and text[:end].rstrip(" \t").endswith("\\"):
+        end = text.find("\n", end + 1)
+    return start, len(text) if end == -1 else end
+
+
+def _crosslane_bracket(text: str, pos: int, opens: str) -> tuple[int, int] | None:
+    # The innermost bracket group (opened by one of `opens`) around pos, to its matching close; None if
+    # there is none before a blank line. An unclosed group runs to the next blank line (fail closed).
+    pairs, depth, i = {")": "(", "]": "[", "}": "{"}, 0, pos - 1
+    while i >= 0:
+        char = text[i]
+        if char == "\n" and not text[text.rfind("\n", 0, i) + 1:i].strip():
+            return None
+        if char in pairs:
+            depth += 1
+        elif char in "([{":
+            if depth == 0 and char in opens:
+                break
+            depth = max(depth - 1, 0)
+        i -= 1
+    else:
+        return None
+    depth, j = 0, i
+    while j < len(text):
+        char = text[j]
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+            if depth == 0:
+                return i, j + 1
+        elif char == "\n" and not text[text.rfind("\n", 0, j) + 1:j].strip():
+            break
+        j += 1
+    return i, j
+
+
+def _crosslane_push_commands(text: str) -> list[str]:
+    # Each push as a whole command: a shell line plus its continuations, or an argv list from `[`/`(`
+    # to the matching close.
+    text = CROSSLANE_WORD_LIST.sub("", text)
+    commands = [text[slice(*_crosslane_shell_command(text, m.start(), m.end()))] for m in CROSSLANE_SHELL_PUSH.finditer(text)]
+    for match in CROSSLANE_ARGV_PUSH.finditer(text):
+        if text[match.start()] in "[(":
+            span = _crosslane_bracket(text, match.start() + 1, "[(")
+        else:
+            span = _crosslane_bracket(text, match.start(), "[(")
+        commands.append(text[slice(*span)] if span else text[slice(*_crosslane_shell_command(text, match.start(), match.end()))])
+    return commands
+
+
+def _crosslane_label_commands(text: str) -> list[str]:
+    # Each command or call naming `/labels`: its shell line plus continuations, joined with the
+    # enclosing call expression when there is one.
+    out = []
+    for match in re.finditer(r"/labels\b", text):
+        start, end = _crosslane_shell_command(text, match.start(), match.end())
+        call = _crosslane_bracket(text, match.start(), "(")
+        if call:
+            start, end = min(start, call[0]), max(end, call[1])
+        out.append(text[start:end])
+    return out
+
+
+class CrossLaneAdmissionTests(unittest.TestCase):
+    def test_writer_workflow_and_job_sets_are_complete(self) -> None:
+        # A new Claude workflow or job must be added here (and to the contract) before it can merge.
+        found = {p.name for p in CROSSLANE_WORKFLOWS.glob("*.y*ml")
+                 if re.search(r"anthropics/claude-code|ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN",
+                              p.read_text(encoding="utf-8"))}
+        # A local reusable workflow a writer calls is a writer file too, with or without the markers.
+        while callees := {c for name in found for c in _crosslane_callees(name)} - found:
+            found |= callees
+        self.assertEqual(found, set(CROSSLANE_WRITER_FILES))
+        self.assertEqual(set(CROSSLANE_ALL_JOBS), set(CROSSLANE_WRITER_FILES))
+        for name, expected in CROSSLANE_ALL_JOBS.items():
+            self.assertEqual(set(_crosslane_jobs(name)), expected)
+
+    def test_writers_never_dispatch_rerun_or_ready_ci(self) -> None:
+        for name in CROSSLANE_WRITER_FILES:
+            body = _crosslane_text(name)
+            with self.subTest(workflow=name):
+                self.assertNotRegex(body, r"gh workflow run|/dispatches\b|createWorkflowDispatch|reRunWorkflow|actions/github-script")
+                self.assertNotRegex(body, r"/rerun|rerun-failed-jobs|gh run rerun|gh pr ready"
+                                          r"|markPullRequestReadyForReview|ReadyForReview\(")
+                # A ref update through the API must never force (a publisher may fast-forward one).
+                self.assertNotRegex(body, r"/git/refs/[^\n]*force|force[^\n]*/git/refs/")
+
+    def test_writers_never_add_ci_labels(self) -> None:
+        for name in CROSSLANE_WRITER_FILES:
+            body = _crosslane_text(name)
+            with self.subTest(workflow=name):
+                self.assertNotRegex(body, r"--add-label|gh pr edit|labels\[\]=")
+                self.assertNotRegex(body, r'"labels":\s*\[\s*"(ci:full|enhancement)"')
+                # Every label write (the whole call or shell command naming `/labels`) is the handoff
+                # label; ci:full is only ever removed (DELETE of a gate-owned label event).
+                commands = _crosslane_label_commands(body)
+                self.assertTrue(commands)
+                for command in commands:
+                    if CROSSLANE_LABEL_WRITE.search(command) or (
+                            CROSSLANE_LABEL_BODY.search(command) and "DELETE" not in command):
+                        self.assertIn("HANDOFF_LABEL", command)
+                        self.assertNotIn("ci:full", command)
+                self.assertTrue(set(re.findall(r'HANDOFF_LABEL = "([^"]+)"', body)) <= {"needs-decision"})
+
+    def test_writer_workflows_use_github_hosted_runners_only(self) -> None:
+        for name in CROSSLANE_WRITER_FILES:
+            for job, block in _crosslane_jobs(name).items():
+                with self.subTest(workflow=name, job=job):
+                    caller = _crosslane_value(block, "uses")
+                    if caller is not None:
+                        # A reusable-workflow caller runs nothing itself; its callee must be a checked writer file.
+                        self.assertRegex(caller, r"^\./\.github/workflows/[a-z0-9-]+\.yml$")
+                        self.assertIn(caller.rsplit("/", 1)[1], CROSSLANE_WRITER_FILES)
+                    else:
+                        self.assertIn(_crosslane_value(block, "runs-on"), CROSSLANE_HOSTED)
+
+    def test_writer_workflow_default_token_is_read_only(self) -> None:
+        # Jobs without their own `permissions:` inherit this default (GitHub workflow syntax).
+        for name in CROSSLANE_WRITER_FILES:
+            with self.subTest(workflow=name):
+                head = _crosslane_text(name).split("\njobs:\n", 1)[0]
+                perms = _crosslane_permissions(head, 0)
+                self.assertIsInstance(perms, dict)
+                self.assertTrue(perms)
+                self.assertLessEqual(set(perms.values()), {"read", "none"})
+
+    def test_writers_share_one_per_pr_lock_without_cancellation(self) -> None:
+        for name, writer_jobs in CROSSLANE_WRITER_JOBS.items():
+            blocks = _crosslane_jobs(name)
+            for job in writer_jobs:
+                with self.subTest(workflow=name, job=job):
+                    conc = re.search(r"^    concurrency:\n((?:      .*\n?)+)", blocks[job], re.MULTILINE)
+                    self.assertIsNotNone(conc)
+                    settings = dict(re.findall(r"^      ([a-z-]+): *(.*)$", conc.group(1), re.MULTILINE))
+                    self.assertRegex(settings["group"], r"^claude-\$\{\{ (needs\.resolve-pr\.outputs\.pr_number|matrix\.pr\.number|inputs\.pr_number) \}\}$")
+                    self.assertEqual(settings["cancel-in-progress"], "false")
+                    self.assertEqual(settings["queue"], "max")
+
+    def test_shell_grants_are_reviewed_and_the_one_push_is_exact(self) -> None:
+        for name, writer_jobs in CROSSLANE_WRITER_JOBS.items():
+            blocks = _crosslane_jobs(name)
+            for job in writer_jobs:
+                with self.subTest(workflow=name, job=job):
+                    allowed = re.findall(r'--allowedTools "([^"]*)"', blocks[job])
+                    self.assertEqual(len(allowed), 1)
+                    bash = [tool for tool in allowed[0].split(",") if tool.startswith("Bash")]
+                    pushes = [tool for tool in bash if tool.startswith("Bash(git push")]
+                    self.assertEqual(len(pushes), 1)
+                    self.assertRegex(pushes[0], CROSSLANE_PUSH)
+                    self.assertEqual(set(bash) - set(pushes) - CROSSLANE_SAFE_BASH, set())
+        for name in CROSSLANE_WRITER_FILES:
+            for job, block in _crosslane_jobs(name).items():
+                with self.subTest(workflow=name, job=job, check="no push outside the model grant"):
+                    # The only push path is the model's single granted command; no step pushes as a shell command or git argv.
+                    self.assertNotRegex(CROSSLANE_WORD_LIST.sub("", _crosslane_without_model_text(block)), CROSSLANE_STEP_PUSH)
+                with self.subTest(workflow=name, job=job, check="permissions"):
+                    perms = _crosslane_permissions(block, 4)
+                    if job in CROSSLANE_WRITER_JOBS.get(name, ()):
+                        self.assertIsInstance(perms, dict)
+                        self.assertLessEqual(set(perms), CROSSLANE_WRITER_SCOPES)
+                        # The authorized push needs a writable contents token.
+                        self.assertEqual(perms.get("contents"), "write")
+                    else:
+                        # Read-only: every scope read or none; an absent block inherits the workflow default.
+                        if isinstance(perms, dict):
+                            self.assertLessEqual(set(perms.values()), {"read", "none"})
+                        else:
+                            self.assertIn(perms, (None, "read-all", "{}"))
+                with self.subTest(workflow=name, job=job, check="no force push"):
+                    commands = _crosslane_push_commands(_crosslane_granted(block))
+                    if job in CROSSLANE_WRITER_JOBS.get(name, ()):
+                        self.assertTrue(commands)
+                    for command in commands:
+                        self.assertNotRegex(command, CROSSLANE_FORCE)
+
+    def test_retries_are_bounded_and_pausable(self) -> None:
+        blocks = _crosslane_jobs("claude.yml")
+        scan = _crosslane_jobs("conflict-scan.yml")
+        for job in CROSSLANE_WRITER_JOBS["claude.yml"]:
+            with self.subTest(job=job):
+                # A possibly truncated commit list counts as at the cap.
+                self.assertIn('if [ "$total" -ge 250 ] && [ "$count" -lt 8 ]; then', blocks[job])
+                self.assertIn("CLAUDE_FIXER_PAUSE: ${{ vars.CLAUDE_FIXER_PAUSE }}", blocks[job])
+                self.assertIn('select(. == "claude:pause" or . == "hold")', blocks[job])
+        # The eight-commit guard: shell skip in the @claude path, eligibility check in the Devin path.
+        self.assertIn('if [ "$count" -ge 8 ]; then', blocks["claude-mention"])
+        self.assertIn("LOOP_COMMIT_COUNT: ${{ steps.cap.outputs.loop_commit_count }}", blocks["devin-review-fix"])
+        self.assertIn("if int(count) >= 8:", blocks["devin-review-fix"])
+        # The Devin path reserves at most three automatic attempts per head and finding set.
+        self.assertEqual(re.findall(r"^\s*MAX_ATTEMPTS = (\d+)$", blocks["devin-review-fix"], re.MULTILINE), ["3"])
+        self.assertNotRegex(_crosslane_text("claude.yml"), r"MAX_ATTEMPTS = (?!3\b)")
+        # The conflict resolver: one push per run, started by scheduled or manual scans only, paused like the rest.
+        self.assertIn("Install single-attempt push guard", scan["conflict-resolve"])
+        self.assertIn("github.event_name != 'push'", _crosslane_value(scan["conflict-resolve"], "if") or "")
+        self.assertIn("CLAUDE_FIXER_PAUSE: ${{ vars.CLAUDE_FIXER_PAUSE }}", scan["conflict-resolve"])
+        self.assertIn('PAUSE_LABELS = frozenset({"claude:pause", "hold"})', _crosslane_text("conflict-scan.yml"))
 
 if __name__ == "__main__":
     unittest.main()

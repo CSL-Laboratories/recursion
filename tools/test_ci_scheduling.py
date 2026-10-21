@@ -582,7 +582,7 @@ class ClassifierTests(unittest.TestCase):
 # re-run, ready-for-review or CI-label add (the only CI-label write is revoking a gate-owned
 # `ci:full`); GitHub-hosted runners only; one shared per-PR lock without cancellation; a reviewed
 # ceiling of shell grants with one exact, non-force push; the eight-commit guard, bounded attempts and
-# the human pause. Limit: the push check covers the tool allow-list only; until CSL-414 the model
+# the human pause. Limit: the push checks read the workflow text only; until CSL-414 the model
 # jobs hold a write token and may edit and run repository code, so it is not a push guarantee. Jobs are split by layout (two-space job keys under `jobs:`), so an unsupported
 # layout fails instead of passing. Retry behaviour itself is tested in
 # tools/test_claude_pr_fixer.py, which the fixer workflow runs.
@@ -601,10 +601,11 @@ CROSSLANE_SAFE_BASH = {
     "Bash(python -X utf8 -B tools/test_claude_pr_fixer.py)", "Bash(python3 -X utf8 -B tools/test_claude_pr_fixer.py)",
 }
 CROSSLANE_PUSH = re.compile(r"^Bash\(git push origin HEAD:refs/heads/\$\{\{ (steps\.(live|cap)\.outputs\.head_ref|matrix\.pr\.head_ref) \}\}\)$")
-# A push written as a shell command or argv anywhere outside the model's tool grants (prompt prose
-# such as "push with git push origin ..." is not a command and does not match).
-CROSSLANE_STEP_PUSH = re.compile(r"(?m)(^\s*(-\s+)?(run:\s*)?|(&&|\|\||;|\$\()\s*)git(\s+-[Cc]\s+\S+)*\s+push\b"
+# Any push command or git argv in a job once the model's `prompt` and `claude_args` (its prose and
+# tool grants, which execute nothing themselves) are removed.
+CROSSLANE_STEP_PUSH = re.compile(r"\bgit(\s+-[Cc]\s+\S+)*\s+push\b"
                                  r"|run_git\(\[\s*\\?[\"']push\\?[\"']|\\?[\"']git\\?[\"'],\s*\\?[\"']push\\?[\"']")
+CROSSLANE_WRITER_SCOPES = {"contents", "pull-requests", "issues", "id-token"}
 
 
 def _crosslane_text(name: str) -> str:
@@ -637,6 +638,34 @@ def _crosslane_callees(name: str) -> set[str]:
 def _crosslane_value(block: str, key: str) -> str | None:
     match = re.search(rf"^    {re.escape(key)}: *(.*)$", block, re.MULTILINE)
     return match.group(1).strip() if match else None
+
+
+def _crosslane_without_model_text(block: str) -> str:
+    # Drop each `prompt:` / `claude_args:` block scalar: the key line and every more-indented line after it.
+    out: list[str] = []
+    indent = None
+    for line in block.splitlines():
+        if indent is not None and (not line.strip() or len(line) - len(line.lstrip()) > indent):
+            continue
+        indent = None
+        match = re.match(r"^( *)(prompt|claude_args): *[|>]", line)
+        if match:
+            indent = len(match.group(1))
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def _crosslane_permissions(text: str, indent: int) -> dict[str, str] | str | None:
+    # `permissions:` at this indent: an inline value (`read-all`, `{}`, ...), a scope mapping, or None if absent.
+    pad = " " * indent
+    match = re.search(rf"^{pad}permissions:[ \t]*(\S.*)?$", text, re.MULTILINE)
+    if match is None:
+        return None
+    if match.group(1):
+        return match.group(1).strip()
+    body = re.match(rf"((?:{pad}  .*\n?)+)", text[match.end() + 1:])
+    return dict(re.findall(rf"^{pad}  ([a-z-]+): *(\S+)", body.group(1), re.MULTILINE)) if body else {}
 
 
 def _crosslane_granted(block: str) -> str:
@@ -693,6 +722,16 @@ class CrossLaneAdmissionTests(unittest.TestCase):
                     else:
                         self.assertIn(_crosslane_value(block, "runs-on"), CROSSLANE_HOSTED)
 
+    def test_writer_workflow_default_token_is_read_only(self) -> None:
+        # Jobs without their own `permissions:` inherit this default (GitHub workflow syntax).
+        for name in CROSSLANE_WRITER_FILES:
+            with self.subTest(workflow=name):
+                head = _crosslane_text(name).split("\njobs:\n", 1)[0]
+                perms = _crosslane_permissions(head, 0)
+                self.assertIsInstance(perms, dict)
+                self.assertTrue(perms)
+                self.assertLessEqual(set(perms.values()), {"read", "none"})
+
     def test_writers_share_one_per_pr_lock_without_cancellation(self) -> None:
         for name, writer_jobs in CROSSLANE_WRITER_JOBS.items():
             blocks = _crosslane_jobs(name)
@@ -721,11 +760,18 @@ class CrossLaneAdmissionTests(unittest.TestCase):
             for job, block in _crosslane_jobs(name).items():
                 with self.subTest(workflow=name, job=job, check="no push outside the model grant"):
                     # The only push path is the model's single granted command; no step pushes as a shell command or git argv.
-                    steps = re.sub(r'--(dis)?allowedTools "[^"]*"', "", block)
-                    self.assertNotRegex(steps, CROSSLANE_STEP_PUSH)
-                    if job not in CROSSLANE_WRITER_JOBS.get(name, ()):
-                        self.assertEqual(_crosslane_value(block, "permissions") or "", "")
-                        self.assertNotRegex(block, r"(?m)^      (contents|id-token|actions): write$")
+                    self.assertNotRegex(_crosslane_without_model_text(block), CROSSLANE_STEP_PUSH)
+                with self.subTest(workflow=name, job=job, check="permissions"):
+                    perms = _crosslane_permissions(block, 4)
+                    if job in CROSSLANE_WRITER_JOBS.get(name, ()):
+                        self.assertIsInstance(perms, dict)
+                        self.assertLessEqual(set(perms), CROSSLANE_WRITER_SCOPES)
+                    else:
+                        # Read-only: every scope read or none; an absent block inherits the workflow default.
+                        if isinstance(perms, dict):
+                            self.assertLessEqual(set(perms.values()), {"read", "none"})
+                        else:
+                            self.assertIn(perms, (None, "read-all", "{}"))
                 with self.subTest(workflow=name, job=job, check="no force push"):
                     for command in re.findall(r"git push[^,)\"\n]*", _crosslane_granted(block)):
                         self.assertNotRegex(command, r"--force|\s-f\b|\s\+|:\+|--mirror|--delete")

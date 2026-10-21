@@ -38,7 +38,9 @@ Linear issue with an @mention; a GitHub mention alone is not enough.
 
 - Native `ci.yml` concurrency cancels any older run in the PR's group, including an identical-head
   twin, and keeps the newest (contract §5). There is no cancel controller in this repository.
-- Never cancel the current head's run by hand; that leaves `linux` red or missing until a new push.
+- Never cancel the current head's run by hand; that leaves `linux` red or missing. If it happens,
+  re-run the cancelled workflow on the same head (§2; GitHub docs, re-running workflows and jobs)
+  rather than pushing an empty commit, which dismisses approvals and waits in `settle`.
 
 ## 4. A required check is stuck or missing
 
@@ -93,11 +95,12 @@ them; `CrossLaneAdmissionTests` does not cover them.
   `CrossLaneAdmissionTests` (`tools/test_ci_scheduling.py`) check statically: no CI dispatch, re-run,
   ready-for-review or CI-label add (the only CI-label write is the fixer revoking a gate-owned
   `ci:full`, `revoke_owned_ci`, claude.yml:1869-1873); an allow-list ceiling of shell grants with
-  exactly one non-force `git push origin HEAD:refs/heads/<branch>` per writer job; one shared `claude-<PR>`
+  exactly one non-force `git push origin HEAD:refs/heads/<branch>` per writer job and no push in any
+  other step; a read-only default token and read-only non-writer jobs; one shared `claude-<PR>`
   lock without cancellation; the eight-commit guard on the fixer and `@claude` jobs, the Devin
   path's three-attempt reservation, and the pause. A new Claude workflow, job or shell grant fails
   the test until it is reviewed there. Retry behaviour itself is tested in
-  `tools/test_claude_pr_fixer.py`. **Limit:** the push check covers the tool allow-list only. Until
+  `tools/test_claude_pr_fixer.py`. **Limit:** the push checks read the workflow text only. Until
   CSL-414 moves these writers to a model-free publisher, the model jobs hold a `contents: write`
   token and may edit and run repository code (for example `tools/ci_gate.py`), so the allow-list is
   not a guarantee about every push the job could make.

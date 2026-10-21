@@ -998,6 +998,17 @@ class MalformedSnapshotTests(unittest.TestCase):
     def test_blocked_by_unknown_issue(self):
         self.assert_rejected(lambda s: s["issues"][0].update(blocked_by=["CSL-404"]))
 
+    def test_approval_window_is_capped_at_fifteen(self):
+        # Lucas's DECISION on CSL-411 (comment 8cda521b); CSL-418.
+        for value in (16, 10**6, -1):
+            with self.subTest(value=value):
+                self.assert_rejected(lambda s, v=value: s.update(config={"approval_window_minutes": v}))
+        for value in (0, 15):
+            with self.subTest(value=value):
+                snap = self.base()
+                snap["config"] = {"approval_window_minutes": value}
+                sim.evaluate(snap)
+
     def test_config_value_of_wrong_type(self):
         self.assert_rejected(lambda s: s.update(config={"lease_minutes": "120"}))
         self.assert_rejected(lambda s: s.update(config={"readback_seconds": None}))
@@ -1511,8 +1522,8 @@ class DeveloperApprovedTests(unittest.TestCase):
                       [(v["code"], v["detail"]) for v in result["violations"]])
         edge = approved("a1", "CSL-2", 30, "DECISION: B", confirmed=ts(15))
         self.assertTrue(sim.evaluate(snapshot(40, self.decision_issues(), [edge]))["decisions"]["CSL-2"]["answered"])
-        wider = sim.evaluate(snapshot(40, self.decision_issues(), [stale], config={"approval_window_minutes": 20}))
-        self.assertTrue(wider["decisions"]["CSL-2"]["answered"])
+        narrower = sim.evaluate(snapshot(40, self.decision_issues(), [edge], config={"approval_window_minutes": 10}))
+        self.assertFalse(narrower["decisions"]["CSL-2"]["answered"])
 
     def test_incomplete_agent_prefix_is_invalid(self):
         for session, marker_session in (("/s1", "s1"), ("claude/", "claude/"), ("claude", "claude"), (" /s1", "s1")):

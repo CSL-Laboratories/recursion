@@ -33,6 +33,8 @@
       "Bash(python3 -X utf8 -B tools/test_stuck_thread_watch.py)",
       "Bash(python -X utf8 -B tools/test_claude_fixer_guard.py)",
       "Bash(python3 -X utf8 -B tools/test_claude_fixer_guard.py)",
+      "Bash(python -X utf8 -B tools/test_claude_fixer_publish.py)",
+      "Bash(python3 -X utf8 -B tools/test_claude_fixer_publish.py)",
       "Bash(python -X utf8 -B tools/test_fixer_failure_escalation.py)",
       "Bash(python3 -X utf8 -B tools/test_fixer_failure_escalation.py)",
       "Bash(python -X utf8 -B tools/test_fixer_failure_watcher.py)",

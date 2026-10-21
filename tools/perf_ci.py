@@ -16,6 +16,7 @@ report exits 1.
 """
 from __future__ import annotations
 
+import math
 import os
 import subprocess
 import sys
@@ -35,14 +36,21 @@ class PerfCIError(RuntimeError):
 
 
 def _env_float(name: str, default: float) -> float:
-    """Parse a float env override, or `default` when unset or blank."""
+    """Parse a finite float env override, or `default` when unset or blank.
+
+    NaN and infinities parse as floats but slip past the callers' bound checks
+    (every NaN comparison is false), so they are rejected here.
+    """
     raw = os.environ.get(name, "").strip()
     if not raw:
         return default
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError as exc:
         raise PerfCIError(f"{name}={raw!r} is not a number") from exc
+    if not math.isfinite(value):
+        raise PerfCIError(f"{name}={raw!r} must be a finite number")
+    return value
 
 
 def _ratio_limit() -> float:

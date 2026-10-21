@@ -232,6 +232,15 @@ Current tools. Do not add paid services or raise spend limits.
   sensitive needs human approval first.
 - **Context7 MCP** — up-to-date library docs (https://mcp.context7.com/mcp). Works without a
   key. Same two config files, alongside Parallel.
+- **Exa MCP** — substantial deep research: multi-source investigations and `agent_run`
+  research tasks. Parallel stays the default for quick lookups and current web facts.
+  Declared in `.cursor/mcp.json` and `.mcp.json` (https://mcp.exa.ai/mcp). The key goes in
+  the `x-api-key` header from env var `EXA_API_KEY` (Cursor `${env:EXA_API_KEY}`, Claude
+  Code `${EXA_API_KEY:-}`; with no key, Exa runs in its free rate-limited mode) and lives
+  only in each environment's secret settings, never in tracked files, prompts, chat or
+  logs. Capped at $50 per person per month (Lucas's decision, CSL-378 comment ff7227ac).
+  Start a billable run only when it keeps you under the cap, and record each run's cost in
+  its research record. Same query rules as Parallel.
 - **Linear** — source of truth for work. Workspace **CSL laboratories**, team key **CSL**,
   project **recursion**. Use the Linear MCP (`https://mcp.linear.app/mcp`) or the Devin
   Linear integration. Declared in `.cursor/mcp.json` and `.mcp.json`.

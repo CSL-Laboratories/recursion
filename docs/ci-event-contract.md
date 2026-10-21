@@ -240,7 +240,7 @@ Their side effects do start CI (free runners since CSL-408):
 - The eight-commit guard bounds both fixer paths: `devin-review-fix` (`cap` step, `claude.yml:1188-1189`) and, since CSL-365, `claude-mention` (step `live`, `claude.yml:498-529`). An `@claude` request on a PR at the cap is skipped instead of pushing.
 - When Codex READY newly applies `ci:full`, the `labeled` event starts one windows run from `ci-full-label.yml`, plus windows on every later non-draft PR event until the label is removed. If the label is already on the PR, the gate returns `ready-present` without writing it (`scripts/ci/codex_gate.py:563-564`), so there is no `labeled` event and no extra windows run.
   - The gate removes its own label only when a fixer pause or unresolved findings block readiness on the current head (`scripts/ci/codex_gate.py:507-515`, `scripts/ci/claude_fixer_receipts.py:686`). It does not remove it on every push.
-  - A `ci:full` added by a person is never removed automatically. `AGENTS.md:314-319` (mirrored in `CLAUDE.md`) asks to remove it once its full run has passed on the current head (CSL-395, #259), and says a manual removal is a human hold: the Codex gate skips READY on the head where it first sees the removal, and READY on a later head can add the label again (CSL-403, #261).
+  - A `ci:full` added by a person is never removed automatically. `AGENTS.md:327-332` (mirrored in `CLAUDE.md`) asks to remove it once its full run has passed on the current head (CSL-395, #259), and says a manual removal is a human hold: the Codex gate skips READY on the head where it first sees the removal, and READY on a later head can add the label again (CSL-403, #261).
 
 | Workflow / app | Trigger | Runner | Paid component | Lines |
 |---|---|---|---|---|
@@ -257,7 +257,7 @@ The Reliability lane owns `claude.yml` (and the fixer family). This contract onl
 ## 8. Known gaps and follow-ups
 
 1. **CSL-382 (open, Triage):** remove the unreachable docs-only branch `ci.yml:275-283` and the stale comment at `ci.yml:22`. Also stale: `tools/ci_gate.py:10` says the `linux` job runs the gate; `linux-tests` does.
-2. **Required-check docs drift:** `CLAUDE.md:310` and `AGENTS.md:310` say "Required check: `linux` (GitHub-hosted)" (v2 wording), and `ci.yml:3` names only `linux`. `Devin Review` (a commit status) is also required, and neither file says so.
+2. **Required-check docs drift:** `CLAUDE.md:323` and `AGENTS.md:323` say "Required check: `linux` (GitHub-hosted)" (v2 wording), and `ci.yml:3` names only `linux`. `Devin Review` (a commit status) is also required, and neither file says so.
 3. **Rerun semantics untested (E15):** a rerun replays the original payload (a draft run fails again). [INF] Rerunning an older run on the current head posts a newer failing `linux` on that SHA, and a rerun can cancel the live run in `ci-CI-<PR>`. No test, no observation.
 4. **Base retarget (E10):** `edited` is not a `ci.yml` trigger. The `linux` on the head was computed against the old base. Behaviour under the strict policy is not tested.
 5. **Dispatch path (E13):** no draft guard, the whitespace check is skipped (no `CI_BASE_SHA`), and it runs in a different concurrency group from PR runs (duplicate paid). It can create a `linux` check run on any branch head; per GitHub's docs that check does not satisfy a PR's required check (unverified here). No dispatch on the current `ci.yml` has been observed.

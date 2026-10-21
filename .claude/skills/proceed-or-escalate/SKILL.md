@@ -114,8 +114,10 @@ holds the record format and wins on any conflict.
   lease plus grace has passed, release it as lease expiry and never renew it; then
   re-read the issue and take a fresh claim. Set `heartbeat-at` to the actual edit
   time from a fresh clock read.
-- Release with a `release v1` record (done, evidence, open, next, files) once your
-  writers have stopped. Releasing never releases a hold.
+- Release a claim with a `release v1` record (done, evidence, open, next, files)
+  once its writers have stopped; work under your other non-overlapping claims
+  does not block it.
+  Releasing never releases a hold.
 - Agent commits under a claim carry the trailer `Agent-Claim: <uuid>`; fixer,
   bot and human commits are exempt.
 - Link a PR with `Fixes CSL-N` only when it completes the issue's acceptance

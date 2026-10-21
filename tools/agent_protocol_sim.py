@@ -187,6 +187,10 @@ class Comment:
         edit that removes the prefix cannot turn its lines into human
         directives. `prefix_changed` reports the edit.
         """
+        if self.approved_by:
+            # Rewritten as the developer's own comment; payload text that looks
+            # like an agent prefix must not reclassify it.
+            return None
         for revision in self.revisions:
             header = agent_header(revision.body)
             if header is not None:
@@ -503,6 +507,12 @@ class Evaluation:
         header = agent_header(first)
         lines = [line.strip() for line in first.split("\n")]
         marks = [line for line in lines[1:] if line.startswith("developer-approved:")]
+        if header is not None and not marks and any(
+            line.strip().startswith("developer-approved:")
+            for revision in comment.revisions[1:]
+            for line in revision.body.split("\n")[1:]
+        ):
+            return None, "edited after posting"
         if header is None or not marks:
             return None, None
         if CLAIM_HEADER.search(lines[0]):
@@ -1431,7 +1441,7 @@ class Evaluation:
             "developer_approved": sorted(
                 ({"comment": c.id, "developer": c.approved_by, "deleted": c.deleted}
                  for c in self.comments if c.approved_by),
-                key=lambda entry: entry["comment"],
+                key=lambda entry: str(entry["comment"]),
             ),
         }
 

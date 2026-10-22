@@ -17,6 +17,8 @@ This catalog formalizes the six primary demonstration journeys (J1 through J6) a
 - **Upstream-Only Mode:** Driven through an external installed harness CLI (e.g., Claude Code, Codex, Grok, OpenCode) utilizing the user's existing authenticated subscription, without intermediating credentials or requiring hidden API keys.
 - **Combined Mode:** Orchestrated by Recursion Head and ARM executives, delegating bounded implementation turns to upstream harnesses while retaining canonical state, context compaction, and verification in Recursion.
 
+[D-024](../../state/DECISIONS.md#d-024--frontier-claim-productive-continuity) adopts these six journeys as release-acceptance scenarios, including each journey's comparison baseline, measurements, and falsification from strategy §7. A workflow description without those three clauses does not satisfy the gate (`O1E-019` in [O1-CONTRACT.md](O1-CONTRACT.md)). D-024's falsifier applies to every journey: a strong baseline that preserves the semantics with equal or less effort defeats the claim.
+
 ---
 
 ## 2. Catalog of the Six Demonstration Journeys (D-024)
@@ -38,6 +40,10 @@ This catalog formalizes the six primary demonstration journeys (J1 through J6) a
   - *Upstream-Only:* The entire task from goal prompt to diff generation executes inside the upstream harness binary. **Dependency:** Requires an installed, authenticated CLI on `$PATH` (`claude`, `codex`, `grok`, etc.) with an active user login. No separate API keys or secret intermediation permitted. Planning and verification in this mode use that CLI and local checks. They do not depend on a provider API or a model.
   - *Combined:* Native Head owns GoalSpec, budgets, and verification; upstream executes code turns; native verifies output.
 
+- **Baseline:** Compare direct use of the same engines with their best supported session continuation and import tools and manual artifact handoff, and an integrated competitor that supports the route combination. Codex structured steering and interrupt alone are not the baseline.
+- **Measurement:** Measure human reconstruction, route-switch latency, and verified downstream outcome. The run must show no lost accepted directive, no authority or egress expansion, no duplicated effect, all-role upstream-only closure with API credentials absent, and no misleading control translation.
+- **Falsification:** The advantage fails if the direct or integrated baseline preserves these semantics with equal or less effort.
+
 ---
 
 ### Journey J2: Compaction After Upstream-Session Loss
@@ -57,6 +63,10 @@ This catalog formalizes the six primary demonstration journeys (J1 through J6) a
   - *Native-Only:* Native context governor compacts local conversation buffers directly into local storage engine (technology unselected; SQLite is an unrun challenger per D-028/PRODUCT.md) and resumes the native loop.
   - *Upstream-Only:* Compacted state is synthesized into a single structured prompt file (`--prompt-file`) for the newly spawned CLI session. **Dependency:** Upstream CLI must support non-interactive file-based prompt ingestion. Compaction does not depend on a provider API or a model.
   - *Combined:* Native governor distills upstream history into a capsule and injects it into a fresh upstream or native instance.
+
+- **Baseline:** Compare the same harness's native compaction and session recovery and its strongest supported extension, Pi's documented experimental durable and session mechanisms, Muse's documented durable protocol where eligible, and simple reversible observation masking with exact hydration references. Use the exact pins and maturity limitations from the companion reference matrix. Those are component baselines, not locally certified guarantees.
+- **Measurement:** Seed an instruction revision, a stale source result, and missing evidence. Count correct next authorized action, unsafe continuation, repeated user explanations, recovery time, downstream defects, and total transform, hydration, and review cost.
+- **Falsification:** Disconfirm the proposed mechanism if simpler retention/restart performs as well or better. Preserve the promised recovery capability for the chosen workflow even if a sophisticated compactor loses. A strong baseline that preserves these semantics with equal or less effort also falsifies the claim.
 
 ---
 
@@ -78,6 +88,10 @@ This catalog formalizes the six primary demonstration journeys (J1 through J6) a
   - *Upstream-Only:* Terminates the parent upstream CLI process group (`kill -TERM -PGRP`); inspects OS process table to verify spawned child compilers/linters are dead. **Dependency:** OS process group supervision tools.
   - *Combined:* Terminates local upstream wrappers and issues network fence commands to remote worker nodes.
 
+- **Baseline:** Compare native cancellation plus qualified OS and recipient tooling and the strongest integrated stop behavior, including Pi's documented owner-linked cancellation and Muse's durable command and replay behavior at their evidenced maturity. Use the companion matrix's exact versions. A familiar durable inbox or abort control is not a Recursion invention.
+- **Measurement:** Test stopped and busy renderers, full data queues, lost acknowledgment, an escaping or restarted child, stale reconnect, and delayed remote success. Measure offered input to accepted command, accepted command to installed fence, and known-scope termination independently.
+- **Falsification:** Any false "fully stopped" assertion, hidden relaunch, or blind duplicate retry falsifies the promise. A strong baseline that preserves these semantics with equal or less effort also falsifies the claim.
+
 ---
 
 ### Journey J4: Dirty-Work Fork
@@ -97,6 +111,10 @@ This catalog formalizes the six primary demonstration journeys (J1 through J6) a
   - *Native-Only:* Native harness manages Git worktrees directly via local filesystem operations.
   - *Upstream-Only:* Invokes upstream CLI with its working directory explicitly pinned to the isolated worktree directory (`--cwd <worktree_path>`). **Dependency:** Upstream CLI must respect working directory isolation without reading parent directory uncommitted state.
   - *Combined:* Native harness creates worktree; upstream executes turns inside it; native manages git merge review.
+
+- **Baseline:** Compare the strongest native session forks and worktree workflows and a careful Git-plus-snapshot manual procedure. OpenCode message-point session forks and diffs alone are not the baseline.
+- **Measurement:** Seed concurrent edits, binary and untracked content, duplicate commands, and stale grants. Measure time to explore and review both alternatives and recovery from a bad fork, not only branch-creation time.
+- **Falsification:** The proof fails if original bytes are not preserved, derived writes alter the original, shared budget is not conserved, or the user cannot tell what was copied. A strong baseline that preserves these semantics with equal or less effort also falsifies the claim.
 
 ---
 
@@ -118,6 +136,10 @@ This catalog formalizes the six primary demonstration journeys (J1 through J6) a
   - *Upstream-Only:* Native broker retains process stdout/stderr streams from the background upstream harness; reconnecting client reads live log stream. **Dependency:** Coordinator host daemon must wrap upstream process stdio.
   - *Combined:* Full native state and upstream process telemetry served to multi-platform clients.
 
+- **Baseline:** Compare qualified upstream remote-control and recovery products plus direct native host management. Use genuine endpoint semantics, not merely a dropped socket.
+- **Measurement:** Seed stale returning workers, changed grants, duplicate spool events, held questions, and incompatible environment manifests. Measure preserved work, correct hold or continuation, human repair time, cumulative recovery cost, and latency to a trustworthy status.
+- **Falsification:** A pretty reconnect animation with stale authority or lost newest work fails. A strong baseline that preserves these semantics with equal or less effort also falsifies the claim.
+
 ---
 
 ### Journey J6: Honest Subscription / Quality Tradeoff
@@ -137,6 +159,10 @@ This catalog formalizes the six primary demonstration journeys (J1 through J6) a
   - *Native-Only:* Defined by Recursion's internal ownership of the model-and-tool loop without delegating orchestration to external CLIs; routes through eligible direct BYOK provider endpoints (e.g. OpenAI/Anthropic APIs) or local model endpoints without selecting or requiring a specific model server; tracks RAM/VRAM and truthful token usage.
   - *Upstream-Only:* Dispatches turns through installed subscription CLIs; respects CLI rate limits without falling back to raw API keys. **Dependency:** CLI must report honest exit codes or token usage metadata.
   - *Combined:* Balances native reasoning with upstream tool executions, consolidating accounting into a single lineage ledger.
+
+- **Baseline:** Compare fixed direct-engine, Recursion native-only, upstream-only, and combined deployments, separating matched-engine attribution from whole-product utility.
+- **Measurement:** Count all assigned tasks and attempts, failed and blocked work, setup, planning, compaction, reviews, waiting, and human repair. At a declared cutoff, unresolved tasks remain non-completions. If no tasks close, cost per closure is undefined.
+- **Falsification:** The advantage fails if a strong baseline preserves these semantics with equal or less effort. Proposed interface value is better decisions with fewer billing and quality misconceptions, not invented savings. A frontier economics claim needs qualified meters and independently checked downstream outcomes, not a conceptual screen.
 
 ---
 

@@ -1,4 +1,5 @@
 {
+  "$schema": "docs/v3/O1-CAPABILITY-MATRIX.schema.json",
   "schema": "o1-capability-matrix/v0.1-draft",
   "status": "draft",
   "version": "v0.1-draft",

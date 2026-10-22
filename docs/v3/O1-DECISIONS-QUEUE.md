@@ -17,10 +17,13 @@ Under [CONTROL_PLANE.md](../../CONTROL_PLANE.md) and [AGENTS.md](../../AGENTS.md
 This document collects the open questions flagged in Chaandan's owner plan (Linear comment `99cd914d`, 2026-10-17) and status update (comment `d9068e29`, 2026-10-21) into structured, numbered decision packets (`DQ-01` through `DQ-11`).
 
 ### Rule H Receipt Protocol
-No proposed option is accepted into the normative product contract until Lucas Guerra (`@lucassalvador987`), or a human he explicitly delegates under Rule H ([CONTROL_PLANE.md](../../CONTROL_PLANE.md) D-041), posts an authenticated human receipt on [CSL-205](https://linear.app/csl-laboratories/issue/CSL-205). Per [O1-CONTRACT.md](O1-CONTRACT.md) §6.3, the receipt binds one unified manifest covering all four artifacts, pinned sources, and test fixtures, with strict rejection of stale or modified inputs:
+No proposed option is accepted into the normative product contract until Lucas Guerra (`@lucassalvador987`), or a human he explicitly delegates under Rule H ([CONTROL_PLANE.md](../../CONTROL_PLANE.md) D-041), posts an authenticated human receipt on [CSL-205](https://linear.app/csl-laboratories/issue/CSL-205). Per [O1-CONTRACT.md](O1-CONTRACT.md) §6.3 and §9, the receipt binds the candidate commit, one unified manifest, every pin, and every artifact and fixture digest. Matching only the four artifact digests is not a receipt. Stale or modified inputs are rejected:
 - Linear comment ID and author identity. The author is Lucas Guerra (`@lucassalvador987`), or a human he explicitly delegates under Rule H.
-- Exact candidate SHA-256 digests of `O1-CONTRACT.md`, `O1-JOURNEYS.md`, `O1-CAPABILITY-MATRIX.json`, and this queue (`O1-DECISIONS-QUEUE.md`).
-- SHA-256 digests of pinned governance/specification sources and conformance test fixtures.
+- `candidate_commit`: the full 40-hex SHA of the candidate.
+- `manifest_sha256`: the SHA-256 of the canonical unified manifest. The manifest carries the candidate, the artifact digests, the pin digests, and the fixture digests.
+- Exact SHA-256 digests of `O1-CONTRACT.md`, `O1-JOURNEYS.md`, `O1-CAPABILITY-MATRIX.json`, and this queue (`O1-DECISIONS-QUEUE.md`).
+- `pinned_source_sha256` for every §6.3 source, including `docs/v3/harness/CSL-27.md`, `CSL-82.md`, `CSL-83.md`, `CSL-84.md`, and `docs/v3/O1-CAPABILITY-MATRIX.schema.json`.
+- `fixture_sha256` for every manifest fixture payload.
 - Selected options and rejected alternatives with explicit rationale.
 - Revisit triggers and calendar date (`YYYY-MM-DD`).
 
@@ -240,8 +243,10 @@ Every repository source below is pinned to the commit that last changed it and t
 | `docs/v3/harness/CSL-82.md` | `46dd8326fc9d22953d28bd215db6ffbd5dd0fb75` | `514dee5226705678f9530eb0c040459eb7ca1c754ff9e41096165c822ae5b43a` |
 | `docs/v3/harness/CSL-83.md` | `65a9c236b3c3f08ba74fb5d88b28b2b33024a5eb` | `e54536dd3d01906dc3d6296a63bb92d21b937103f9385bfd67453742c97ed8a7` |
 | `docs/v3/harness/CSL-84.md` | `05e8657aecec5b85f1b9b66ee8b0fad5c2c73309` | `4657f483fb119f6b6e57a226fba65c7e0643241b35c41d5f5fb4c87bb92211ad` |
+| `docs/v3/O1-CAPABILITY-MATRIX.schema.json` | `24da263d49ee167d6d1849f90de46e89af612451` | `bc55d6e7009fbc4cdfc3d1d03f1e583cf08b794c5a208eb173b506fe6ef9ee7e` |
 | `docs/v3/research-lane/scope-reframe-20261002/raw/01-current-strategy/Recursion_Interface_and_Product_Strategy.md` | `0f89d356f6170164287211c746923a7b5824ccc1` | `ecbe910dd4070a4c59d85315bb42f67e7e405fb5ab12f6306a95de2b197b5b2b` |
 
+The four harness rows and `docs/v3/O1-CAPABILITY-MATRIX.schema.json` are §6.3 real-mode manifest pins. The schema revision is `24da263d49ee167d6d1849f90de46e89af612451`, the commit that added that file. The gate hashes the candidate bytes. A later edit of the schema must move this revision and recompute the sha256.
 
 ### 3.1 Linear Issues and Owner Plan Records
 - **CSL-205 Body:** Issue `75033598-1cec-475f-9cf3-0baecd75f9fc`, "Define month-end journeys and the capability/release evidence contract" (2026-10-16).

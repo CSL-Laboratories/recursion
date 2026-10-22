@@ -6,7 +6,7 @@
 **Parent Issue:** [CSL-205](https://linear.app/csl-laboratories/issue/CSL-205) (Outcome O1)  
 **Author / Proposer:** Chaandan Saini (@chaandansaini101)  
 **Target Decider:** Lucas Guerra (@lucassalvador987) under Rule H  
-**Checkpoint Freeze Date:** October 23, 2026 (W2) · Month Checkpoint: November 12, 2026
+**Checkpoint Freeze Date:** 2026-10-23 (W2) · Month Checkpoint: 2026-11-12
 
 ---
 
@@ -14,7 +14,7 @@
 
 Under [CONTROL_PLANE.md](../../CONTROL_PLANE.md) and [AGENTS.md](../../AGENTS.md), agents and interactive sessions are bounded executors. They recommend and propose; founders decide. 
 
-This document collects the open questions flagged in Chaandan's owner plan (Linear comment `99cd914d`, Oct 17) and status update (comment `d9068e29`, Oct 21) into structured, numbered decision packets (`DQ-01` through `DQ-11`). 
+This document collects the open questions flagged in Chaandan's owner plan (Linear comment `99cd914d`, 2026-10-17) and status update (comment `d9068e29`, 2026-10-21) into structured, numbered decision packets (`DQ-01` through `DQ-11`). 
 
 ### Rule H Receipt Protocol
 No proposed option is accepted into the normative product contract until Lucas Guerra (or an explicitly delegated human acting within recorded authority under [CONTROL_PLANE.md](../../CONTROL_PLANE.md) D-041) posts an authenticated human receipt on [CSL-205](https://linear.app/csl-laboratories/issue/CSL-205). Per [O1-CONTRACT.md](O1-CONTRACT.md) §6.3, the receipt binds one unified manifest covering all four artifacts, pinned sources, and test fixtures, with strict rejection of stale or modified inputs:
@@ -43,12 +43,15 @@ All other decision packets carry **no default** and remain open, pending founder
 - **Current Default:** **None / Pending founder decision under Rule H.** (Status comment `d9068e29` left vocabulary unanswered; Option B is a proposal under review, not an established default).
 - **Who Decides:** Lucas Guerra (Tier-1 architecture/contract foundation).
 - **What It Blocks:** Freezing the schema for `docs/v3/O1-CAPABILITY-MATRIX.json` and the checker script validation rules (`tools/check_release_journey_contract.py`).
+- **Reversibility:** Reversible before the Rule-H receipt. After it, a change needs a new receipt and a new digest binding.
+- **Further Research Cost:** Unknown; no further paid research is proposed for this packet.
+- **Decision Deadline:** 2026-10-23 (W2 freeze) to be included in the frozen candidate. A later ruling moves the freeze. The 2026-11-12 checkpoint is the program window, not this deadline.
 - **Exact-Digest Binding:** `sha256: TBD at freeze under Rule H`
 
 ---
 
-### Decision Packet DQ-02: Target Tiers per Row for November 12 Checkpoint
-- **Question:** What are the accepted target maturity tiers for each capability row for the Thursday, November 12, 2026 checkpoint?
+### Decision Packet DQ-02: Target Tiers per Row for 2026-11-12 Checkpoint
+- **Question:** What are the accepted target maturity tiers for each capability row for the 2026-11-12 checkpoint?
 - **Options Considered:**
   - **Option A (Comprehensive Ambition):** Target `release_qualified` for all 12 pillars. *(Countercase: high risk of unearned claims given zero-research budget and fixed month timeline).*
   - **Option B (Samir's Integrated Slice / CSL-237 Proposal):** Set `release_qualified` targets exclusively for the core integrated coding journey (J1 on native plus one upstream route, e.g. Claude Code/Codex), targeting `provider_free_verified` or `locally_qualified` for plugins/nodes/clients, and marking advanced distributed features `no-release-claim` for Nov 12.
@@ -56,6 +59,9 @@ All other decision packets carry **no default** and remain open, pending founder
 - **Current Default (d9068e29):** All row `target` values remain `null` pending Lucas's Rule-H receipt. (Undecided rows with `target: null` and missing disposition fail acceptance gate `O1E-003`).
 - **Who Decides:** Lucas Guerra (release scope and quality targets).
 - **What It Blocks:** R1 release qualification planning ([CSL-237](https://linear.app/csl-laboratories/issue/CSL-237)) and W3/W4 execution prioritization.
+- **Reversibility:** Reversible before the Rule-H receipt. After it, a change needs a new receipt and a new digest binding.
+- **Further Research Cost:** Unknown; no further paid research is proposed for this packet.
+- **Decision Deadline:** 2026-10-23 (W2 freeze) to be included in the frozen candidate. A later ruling moves the freeze. The 2026-11-12 checkpoint is the program window, not this deadline.
 - **Exact-Digest Binding:** `sha256: TBD at freeze under Rule H`
 
 ---
@@ -69,6 +75,9 @@ All other decision packets carry **no default** and remain open, pending founder
 - **Current Default:** **None / Pending founder decision under Rule H.** (Status comment `d9068e29` did not select a disposition policy; Option A proposed under Envelope G).
 - **Who Decides:** Lucas Guerra (release boundary authority).
 - **What It Blocks:** CSL-237 R1 release boundary ratification.
+- **Reversibility:** Reversible before the Rule-H receipt. After it, a change needs a new receipt and a new digest binding.
+- **Further Research Cost:** Unknown; no further paid research is proposed for this packet.
+- **Decision Deadline:** 2026-10-23 (W2 freeze) to be included in the frozen candidate. A later ruling moves the freeze. The 2026-11-12 checkpoint is the program window, not this deadline.
 - **Exact-Digest Binding:** `sha256: TBD at freeze under Rule H`
 
 ---
@@ -81,6 +90,9 @@ All other decision packets carry **no default** and remain open, pending founder
 - **Current Default:** **None / Pending founder decision under Rule H.** (Draft proposals set `"claim_permission": "none"` across all rows until founder sign-off).
 - **Who Decides:** Lucas Guerra (company public posture and release approval).
 - **What It Blocks:** Launch page copy and external communication in [CSL-242](https://linear.app/csl-laboratories/issue/CSL-242).
+- **Reversibility:** Reversible before the Rule-H receipt. After it, a change needs a new receipt and a new digest binding.
+- **Further Research Cost:** Unknown; no further paid research is proposed for this packet.
+- **Decision Deadline:** 2026-10-23 (W2 freeze) to be included in the frozen candidate. A later ruling moves the freeze. The 2026-11-12 checkpoint is the program window, not this deadline.
 - **Exact-Digest Binding:** `sha256: TBD at freeze under Rule H`
 
 ---
@@ -95,6 +107,9 @@ All other decision packets carry **no default** and remain open, pending founder
 - **Current Default (d9068e29):** Option A — fixtures beside docs (`docs/v3/fixtures/O1/`).
 - **Who Decides:** Lucas Guerra (protected paths and CI configuration).
 - **What It Blocks:** Placement of physical fixture files for `tools/check_release_journey_contract.py`.
+- **Reversibility:** Reversible before the Rule-H receipt. After it, a change needs a new receipt and a new digest binding.
+- **Further Research Cost:** Unknown; no further paid research is proposed for this packet.
+- **Decision Deadline:** 2026-10-23 (W2 freeze) to be included in the frozen candidate. A later ruling moves the freeze. The 2026-11-12 checkpoint is the program window, not this deadline.
 - **Exact-Digest Binding:** `sha256: TBD at freeze under Rule H`
 
 ---
@@ -108,6 +123,9 @@ All other decision packets carry **no default** and remain open, pending founder
 - **Current Default:** **None / Pending founder decision under Rule H.** (Status comment `d9068e29` did not rule on CI dispatch; Option A proposed).
 - **Who Decides:** Lucas Guerra (company resource reservation under D-041).
 - **What It Blocks:** CI dispatch policy on CSL-205 and downstream qualification PRs.
+- **Reversibility:** Reversible before the Rule-H receipt. After it, a change needs a new receipt and a new digest binding.
+- **Further Research Cost:** Unknown; no further paid research is proposed for this packet.
+- **Decision Deadline:** 2026-10-23 (W2 freeze) to be included in the frozen candidate. A later ruling moves the freeze. The 2026-11-12 checkpoint is the program window, not this deadline.
 - **Exact-Digest Binding:** `sha256: TBD at freeze under Rule H`
 
 ---
@@ -125,6 +143,9 @@ All other decision packets carry **no default** and remain open, pending founder
 - **Current Default:** None. Pending a human decision under Rule H. The drafts call these runs citation support, but that is a proposal, not an accepted classification.
 - **Who Decides:** Lucas Guerra (spend and research budget), or a delegated human.
 - **What It Blocks:** Whether the Run B sources can stay in the frozen contract, and CSL-205 research accounting.
+- **Reversibility:** Reversible before the Rule-H receipt. After it, a change needs a new receipt and a new digest binding.
+- **Further Research Cost:** Unknown; no further paid research is proposed for this packet.
+- **Decision Deadline:** 2026-10-23 (W2 freeze) to be included in the frozen candidate. A later ruling moves the freeze. The 2026-11-12 checkpoint is the program window, not this deadline.
 - **Exact-Digest Binding:** `sha256: TBD at freeze under Rule H`
 
 ---
@@ -137,6 +158,9 @@ All other decision packets carry **no default** and remain open, pending founder
 - **Current Default (d9068e29):** Option A — files reside at `docs/v3/O1-*`.
 - **Who Decides:** Lucas Guerra (program-control architecture).
 - **What It Blocks:** Downstream file path stability for automated links.
+- **Reversibility:** Reversible before the Rule-H receipt. After it, a change needs a new receipt and a new digest binding.
+- **Further Research Cost:** Unknown; no further paid research is proposed for this packet.
+- **Decision Deadline:** 2026-10-23 (W2 freeze) to be included in the frozen candidate. A later ruling moves the freeze. The 2026-11-12 checkpoint is the program window, not this deadline.
 - **Exact-Digest Binding:** `sha256: TBD at freeze under Rule H`
 
 ---
@@ -149,6 +173,9 @@ All other decision packets carry **no default** and remain open, pending founder
 - **Current Default:** **None / Pending founder decision under Rule H.** (Status comment `d9068e29` did not settle sequencing; Option A proposed).
 - **Who Decides:** Any founder (Chaandan, Samir, or Lucas under D-041).
 - **What It Blocks:** Downstream milestone alignment for CSL-206 and CSL-210.
+- **Reversibility:** Reversible before the Rule-H receipt. After it, a change needs a new receipt and a new digest binding.
+- **Further Research Cost:** Unknown; no further paid research is proposed for this packet.
+- **Decision Deadline:** 2026-10-23 (W2 freeze) to be included in the frozen candidate. A later ruling moves the freeze. The 2026-11-12 checkpoint is the program window, not this deadline.
 - **Exact-Digest Binding:** `sha256: TBD at freeze under Rule H`
 
 ---
@@ -161,6 +188,9 @@ All other decision packets carry **no default** and remain open, pending founder
 - **Current Default:** **None / Pending founder decision under Rule H.** (Draft proposals set `"claim_permission": "none"` across all rows).
 - **Who Decides:** Lucas Guerra.
 - **What It Blocks:** Public launch copywriting in CSL-242.
+- **Reversibility:** Reversible before the Rule-H receipt. After it, a change needs a new receipt and a new digest binding.
+- **Further Research Cost:** Unknown; no further paid research is proposed for this packet.
+- **Decision Deadline:** 2026-10-23 (W2 freeze) to be included in the frozen candidate. A later ruling moves the freeze. The 2026-11-12 checkpoint is the program window, not this deadline.
 - **Exact-Digest Binding:** `sha256: TBD at freeze under Rule H`
 
 ---
@@ -179,6 +209,9 @@ All other decision packets carry **no default** and remain open, pending founder
 - **Current Default:** **None / Pending founder decision under Rule H (undecided).** Samir's recommendation is an open proposal; no default has been selected or approved.
 - **Who Decides:** Lucas Guerra (Tier-1 release boundary decision).
 - **What It Blocks:** Freezing the scope cut for R1 qualification in CSL-237.
+- **Reversibility:** Reversible before the Rule-H receipt. After it, a change needs a new receipt and a new digest binding.
+- **Further Research Cost:** Unknown; no further paid research is proposed for this packet.
+- **Decision Deadline:** 2026-10-23 (W2 freeze) to be included in the frozen candidate. A later ruling moves the freeze. The 2026-11-12 checkpoint is the program window, not this deadline.
 - **Exact-Digest Binding:** `sha256: TBD at freeze under Rule H`
 
 ---

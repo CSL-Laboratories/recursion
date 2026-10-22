@@ -3,8 +3,8 @@
 **Version:** `o1-contract v0.1-draft`  
 **Status:** DRAFT proposal under envelope G; nothing accepted until a rule-H receipt  
 **Parent Issue:** [CSL-205](https://linear.app/csl-laboratories/issue/CSL-205) (Outcome O1, child of [CSL-45](https://linear.app/csl-laboratories/issue/CSL-45))  
-**Milestone:** W1 Research (Oct 16–22, 2026) · Target Freeze: Oct 23, 2026 (W2)  
-**Month Window Checkpoint:** Thursday, November 12, 2026 (decided by Lucas Guerra, Oct 16, 2026, 09:42 PT, when the team's X subscriptions expire)  
+**Milestone:** W1 Research (2026-10-16 to 2026-10-22) · Target Freeze: 2026-10-23 (W2)  
+**Month Window Checkpoint:** 2026-11-12 (decided by Lucas Guerra, 2026-10-16, 09:42 PT, when the team's X subscriptions expire)  
 **Governing Documents:** [CONTROL_PLANE.md](../../CONTROL_PLANE.md), [ANCHOR.md](../../ANCHOR.md), [AGENTS.md](../../AGENTS.md)
 
 ---
@@ -23,7 +23,7 @@ This contract refines existing scope without duplicating or preempting the progr
 ### 1.2 Boundary Conditions
 - **Draft Status:** Everything in this document, the companion catalog, matrix, and queue is a draft proposal under Gate Envelope G.
 - **Rule H Requirement:** No capability row, target tier, release scope, or architecture choice is accepted into the normative product contract until an authenticated human receipt under Rule H is recorded on Linear.
-- **Checkpoint Date:** The month-end window ends on Thursday, November 12, 2026. Target tiers for this checkpoint remain undecided pending Lucas's Rule H receipt.
+- **Checkpoint Date:** The month-end window ends on 2026-11-12. Target tiers for this checkpoint remain undecided pending Lucas's Rule H receipt.
 
 ---
 
@@ -31,7 +31,7 @@ This contract refines existing scope without duplicating or preempting the progr
 
 As specified in the [CSL-205](https://linear.app/csl-laboratories/issue/CSL-205) contract:
 - **No narrower first-release cut:** This contract does not define an unofficial subset or narrower scope cut. Downstream issue [CSL-237](https://linear.app/csl-laboratories/issue/CSL-237) proposes the R1 release boundary for founder decision; agents do not accept it.
-- **No inferred deadline:** No deadlines beyond the stated November 12, 2026 subscription expiration checkpoint and intermediate freeze milestones are inferred or imposed.
+- **No inferred deadline:** No deadlines beyond the stated 2026-11-12 subscription expiration checkpoint and intermediate freeze milestones are inferred or imposed.
 - **No launch declaration:** Nothing in this contract authorizes public marketing claims, launch announcements, or documentation publication as a released product. Public launch page claims remain dependent on [CSL-242](https://linear.app/csl-laboratories/issue/CSL-242).
 - **No universal savings claim:** Savings in quota, tokens, or cost are hypotheses to be measured per workload under [D-018](../../state/DECISIONS.md#d-018--thesis-recursion-is-a-native-harness-and-a-unifying-wrapper-no-ecosystem-lock-in) and [D-031](../../state/DECISIONS.md#d-031--product-positioning-no-vendor-sabotage-claim), never asserted as universal marketing facts.
 - **No technology selection:** This contract selects no implementation language (A1b bake-off remains open), database/store (SQLite remains an unrun challenger), web framework, container sandbox, or transport.
@@ -241,7 +241,7 @@ Under this rebinding rule, manifest digest mismatch error `O1E-010` fires **only
 The checker script's evaluation output for each fixture is tested against an exact set of reported error IDs:
 - **Positive Fixtures (`O1F-P01`–`O1F-P04`):** Expect exit code `0` and an empty error set (`PASS (exit 0, set())`).
 - **Adverse Fixtures (`O1F-N01a`–`O1F-N14b`):** Expect exit code `1` and an **exact set** of reported error IDs. Each adverse fixture in this suite expects **precisely its one declared error ID as a singleton set** (e.g., `FAIL {'O1E-001'}`).
-- **Exact Expected Sets:** Deterministic rebinding and fully dispositioned baseline seams isolate every adverse condition, so each adverse fixture expects exactly one error ID. The one exception is `O1F-N01b`: deleting journey J6 also removes it from `CAP-016`, so it expects `{O1E-001, O1E-016}`. No error suppression or precedence is applied, and the checker reports the full set.
+- **Exact Expected Sets:** Deterministic rebinding and fully dispositioned baseline seams isolate every adverse condition, so each adverse fixture expects exactly one error ID. The two exceptions are `O1F-N01a`, which deletes three rows along with the pillar and expects `{O1E-001, O1E-006}`, and `O1F-N01b`: deleting journey J6 also removes it from `CAP-016`, so it expects `{O1E-001, O1E-016}`. No error suppression or precedence is applied, and the checker reports the full set.
 
 #### Manifest Canonical Serialization Specification
 The manifest is serialized to canonical JSON before computing its SHA-256 digest:
@@ -373,6 +373,16 @@ All cryptographic digests binding artifacts, pinned sources, and test payloads a
     "rationale": {
       "type": "string"
     },
+    "conditions": {
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 1
+    },
+    "revisit_triggers": {
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 1
+    },
     "decided_on": {
       "type": "string",
       "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
@@ -391,6 +401,8 @@ All cryptographic digests binding artifacts, pinned sources, and test payloads a
     "selected_options",
     "rejected_options",
     "rationale",
+    "conditions",
+    "revisit_triggers",
     "decided_on"
   ]
 }
@@ -442,10 +454,26 @@ All cryptographic digests binding artifacts, pinned sources, and test payloads a
           "type": "array",
           "items": { "type": "string" }
         },
+        "artifact_digests": {
+          "type": "object",
+          "description": "sha256 of each of the four O1 artifacts, keyed by path; compared against the candidate manifest",
+          "minProperties": 4,
+          "additionalProperties": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        },
+        "pinned_source_digests": {
+          "type": "object",
+          "description": "sha256 of each pinned governance/specification source, keyed by path; empty only in fixture baseline",
+          "additionalProperties": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        },
+        "fixture_digests": {
+          "type": "object",
+          "description": "sha256 of each conformance test fixture, keyed by fixture ID",
+          "additionalProperties": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        },
         "digests_matched": { "type": "boolean" },
         "stale_entries": { "type": "integer", "maximum": 0 }
       },
-      "required": ["artifacts_verified", "digests_matched", "stale_entries"]
+      "required": ["artifacts_verified", "artifact_digests", "pinned_source_digests", "fixture_digests", "digests_matched", "stale_entries"]
     },
     "coverage_diff": {
       "type": "object",
@@ -517,6 +545,12 @@ All cryptographic digests binding artifacts, pinned sources, and test payloads a
     },
     "rejected_options": [],
     "rationale": "Freezes candidate contract and nominal baseline for downstream verification under Gate Envelope G with all baseline seams dispositioned.",
+    "conditions": [
+      "Fixture-only record; valid under the fixture trust list and never in acceptance mode."
+    ],
+    "revisit_triggers": [
+      "Any change to a bound artifact digest or to the pinned-source set."
+    ],
     "decided_on": "2026-10-23"
   },
   "verifier_report_baseline": {
@@ -540,6 +574,16 @@ All cryptographic digests binding artifacts, pinned sources, and test payloads a
         "docs/v3/O1-CAPABILITY-MATRIX.json",
         "docs/v3/O1-DECISIONS-QUEUE.md"
       ],
+      "artifact_digests": {
+        "docs/v3/O1-CONTRACT.md": "<computed:sha256(docs/v3/O1-CONTRACT.md)>",
+        "docs/v3/O1-JOURNEYS.md": "<computed:sha256(docs/v3/O1-JOURNEYS.md)>",
+        "docs/v3/O1-CAPABILITY-MATRIX.json": "<computed:sha256(docs/v3/O1-CAPABILITY-MATRIX.json)>",
+        "docs/v3/O1-DECISIONS-QUEUE.md": "<computed:sha256(docs/v3/O1-DECISIONS-QUEUE.md)>"
+      },
+      "pinned_source_digests": {},
+      "fixture_digests": {
+        "O1F-P01": "<computed:sha256(fixture O1F-P01)>"
+      },
       "digests_matched": true,
       "stale_entries": 0
     },
@@ -702,7 +746,7 @@ All cryptographic digests binding artifacts, pinned sources, and test payloads a
 | **O1F-P02** | Positive | Explicit non-offered / unknown cell | Nominal baseline setting offline redisplay to `"not-offered"` per D-036, and mobile Full Stop to `"unknown"`. | **PASS** (exit 0, set()) |
 | **O1F-P03** | Positive | Transparent state transfer | Row specifies fixture-local payload `transfer-capsule-j1-nominal`, schema URI `urn:recursion:schema:v3:context-capsule-transfer-v1`, canonical JSON serialization, expected returned payload, and round-trip record `EV-ROUNDTRIP-SYNTH-01` (labeled 'expected synthetic result, not executed'). | **PASS** (exit 0, set()) |
 | **O1F-P04** | Positive | Multi-stage composed journey | Journey J1 composed trace from native initiation to Claude execution to native resumption (trace `composed_journey_trace_p04`). | **PASS** (exit 0, set()) |
-| **O1F-N01a** | Adverse | Missing required pillar | Delete the `"nodes"` pillar and all its associated rows (`CAP-011`, `CAP-012`, `CAP-013`) from constructed baseline matrix. | **FAIL** `{'O1E-001'}` |
+| **O1F-N01a** | Adverse | Missing required pillar | Delete the `"nodes"` pillar and all its associated rows (`CAP-011`, `CAP-012`, `CAP-013`) from constructed baseline matrix. | **FAIL** `{'O1E-001', 'O1E-006'}` (deleting CAP-011..CAP-013 also removes three rows without a `no-release-claim` disposition; both are expected, no suppression) |
 | **O1F-N01b** | Adverse | Missing required journey | Delete journey `"J6"` from Journey Catalog and matrix row references. | **FAIL** `{'O1E-001', 'O1E-016'}` (removing J6 from CAP-016's `journeys` necessarily also triggers mobile-row coverage; both are expected, no suppression) |
 | **O1F-N02a** | Adverse | Missing surface control cell | Omit mobile column or leave control cell blank in Journey × Surface × Control matrix for J1. | **FAIL** `{'O1E-002'}` |
 | **O1F-N02b** | Adverse | Missing journey in mobile capability row | Remove journey `"J2"` from `CAP-016`'s journeys array in baseline matrix while retaining J2's cells in Journey × Surface × Control matrix. | **FAIL** `{'O1E-016'}` |
@@ -717,7 +761,7 @@ All cryptographic digests binding artifacts, pinned sources, and test payloads a
 | **O1F-N09a** | Adverse | Stale proposal digest in receipt | Bind a receipt containing SHA-256 digest of literal `stale_draft` fixture content (`<computed:sha256(stale_draft)>`) instead of candidate contract content. | **FAIL** `{'O1E-009'}` |
 | **O1F-N09b** | Adverse | Unauthorized receipt author | Bind a receipt authored by non-founder account or non-trusted identity (e.g. `"unauthorized-user"`) failing the fixture trust list. | **FAIL** `{'O1E-009'}` |
 | **O1F-N09c** | Adverse | Wrong-scope receipt issue key | Bind a receipt comment from Linear issue `"CSL-117"` to the CSL-205 contract. | **FAIL** `{'O1E-009'}` |
-| **O1F-N10** | Adverse | Stale or mismatched input binding | Mutate matrix JSON, journeys catalog, decisions queue, or pinned source content WITHOUT rebinding manifest SHA-256 digests (violates deterministic rebinding rule). | **FAIL** `{'O1E-010'}` |
+| **O1F-N10** | Adverse | Stale or mismatched input binding | Mutate matrix JSON, journeys catalog, or decisions queue WITHOUT rebinding manifest SHA-256 digests (violates deterministic rebinding rule). | **FAIL** `{'O1E-010'}` |
 | **O1F-N11** | Adverse | Undeclared enum value or syntax error | Inject undeclared maturity tier `"candidate-contract"` into row CAP-001 or a JSON trailing comma syntax error. | **FAIL** `{'O1E-011'}` |
 | **O1F-N12** | Adverse | Dangling identity reference | Add dependency reference pointing to nonexistent ID `CAP-999` or nonexistent decision `D-999`. | **FAIL** `{'O1E-012'}` |
 | **O1F-N13** | Adverse | Unresolved freeze-blocking seam | Mutate decision packet DQ-01 in fixture queue record to remove `'dispositioned (fixture)'`, asserting contract freeze while seam remains open without disposition. | **FAIL** `{'O1E-013'}` |
@@ -745,7 +789,7 @@ Under Gate Envelope G and [CONTROL_PLANE.md](../../CONTROL_PLANE.md) § "Indepen
    - The exact command executed.
    - The expected exit code and error ID.
    - The observed exit code and error ID.
-6. **Coverage Diff:** The verifier must independently reconstruct requirement coverage from the pinned inventory (OR-021–OR-039, D-018–D-039) and perform a set diff against `O1-CAPABILITY-MATRIX.json`.
+6. **Coverage Diff:** The verifier must independently reconstruct requirement coverage from the pinned inventory and perform a set diff against `O1-CAPABILITY-MATRIX.json`. The row-level inventory is OR-021–OR-039 plus the decisions in D-018–D-039 that bind capabilities. D-024, D-026, D-027, D-031, D-032, D-033 and D-034 bind no single matrix row (journey set, licence, counsel, positioning and similar scope-level decisions). They are excluded from the row-level diff and listed in the verifier report as `out_of_row_scope`, so they neither appear in `unmapped_decisions` nor block an empty diff.
 7. **Pass Condition:** Verification passes **only** when:
    - All manifest fixtures match expected results exactly.
    - The coverage diff is completely empty.

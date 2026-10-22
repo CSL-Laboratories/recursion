@@ -14,16 +14,10 @@ Fixtures that need POSIX git, chmod, symlinks, FIFOs, shell shims or bubblewrap
 skip on Windows (tools/ci_gate.py runs this file on every platform; the
 publisher and the model helper only run on Linux runners).
 
-Deferred to the workflow-wiring PR (CSL-414 PR B/C), because nothing here is
-wired into a workflow yet and those tests parse workflow YAML:
-- WorkflowWiringTests: model-job credentials and permissions, package status,
-  credential scrub and no repository code, helper root-ownership install,
-  publish/prepare job shape, shared writer lock, fresh-prepare conditions,
-  conflict bundle wiring, committer pinning in the attach step and the
-  conflict writer's Devin race check;
-- embedded-source equality for CLAUDE_FIXER_PUBLISH / CLAUDE_FIXER_OUTBOX /
-  CLAUDE_FIXER_RECEIPTS;
-- the < 60,000-byte run-script limit (actionlint pipe hang).
+Port B wires the publisher and outbox into claude.yml. WorkflowWiringTests read
+the workflows with a small standard-library loader (WorkflowYaml), checked against
+every workflow here. Deferred to Port C (the conflict writer): conflict bundle
+wiring and the conflict writer's Devin race check.
 """
 from __future__ import annotations
 
@@ -38,6 +32,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import unittest
 from pathlib import Path
@@ -990,6 +985,51 @@ class PublishFlowTests(unittest.TestCase):
         # CSL-405: the token is minted after the recheck, so none exists to revoke.
         self.assertEqual((h.minted, h.revoked), (0, []))
         self.assertIn("queued writes dropped", h.audits[0])
+
+    def test_identity_change_refuses_before_minting_and_never_pushes(self):
+        # GitHub releases the per-PR lock between prepare and publish: publish must fail closed if
+        # the PR closed, was renamed, moved to another repository or reports an invalid head.
+        changes = ({"state": "closed"}, {"ref": "renamed"}, {"repo": "evil/fork"}, {"sha": "not-a-sha"})
+        for change in changes:
+            for at in (0, 1):  # the first live check, or the recheck right before the push
+                with self.subTest(change=change, at=at):
+                    h = Harness(self, bundle=True, records=[{"op": "comment", "body": "x"}])
+                    calls = {"n": 0}
+                    original = h.read
+
+                    def read(path, h=h, calls=calls, change=change, at=at, original=original):
+                        if not path.endswith("/pulls/7"):
+                            return original(path)
+                        calls["n"] += 1
+                        if calls["n"] - 1 < at:
+                            return original(path)
+                        args = {"sha": A, "state": "open", "ref": "fix", "repo": REPO, **change}
+                        return pr(args.pop("sha"), **args)
+                    h.read = read
+                    h.run()
+                    self.assertEqual((h.pushed, h.writes, h.minted, h.revoked), ([], [], 0, []))
+                    self.assertIn("refused: PR identity changed; " + ("nothing published", "queued writes dropped")[at],
+                                  h.audits[0])
+
+    def test_pause_appearing_right_before_the_push_blocks_it_without_minting(self):
+        for labels in (["hold"], ["Claude:Pause"], None):
+            with self.subTest(labels=labels):
+                h = Harness(self, bundle=True, records=[{"op": "comment", "body": "x"}])
+                calls = {"n": 0}
+                original = h.read
+
+                def read(path, h=h, calls=calls, labels=labels, original=original):
+                    if path.endswith("/pulls/7"):
+                        calls["n"] += 1
+                        if calls["n"] >= 2:  # the first check passes; the pre-push recheck sees the pause
+                            return {**pr(A), "labels": None} if labels is None else pr(A, labels)
+                    return original(path)
+                h.read = read
+                h.run()
+                self.assertGreaterEqual(calls["n"], 2)
+                self.assertEqual((h.pushed, h.writes, h.minted, h.revoked), ([], [], 0, []))
+                self.assertIn("refused: " + ("PR labels unreadable" if labels is None else "paused by a claude:pause or hold label")
+                              + "; queued writes dropped", h.audits[0])
 
     def test_pause_between_records_stops_the_rest(self):
         h = Harness(self, records=[{"op": "comment", "body": "1"}, {"op": "comment", "body": "2"},
@@ -2189,6 +2229,529 @@ class ReceiptAuditHistoryTests(ReceiptV3Tests):
             self.assertNotIn(name, source)
         self.assertEqual(source.count("terminal_receipts("), 1)
         self.assertIn("terminal_receipts(items, comments, head, compare, permission, history=history)", source)
+
+
+# ---------------------------------------------------------------------------
+# Workflow wiring (CSL-414 port B). Recursion's event-path job is standard-library only,
+# so the workflows are read with this small loader instead of PyYAML.
+
+def _yaml_scalar(raw):
+    raw = raw.strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] == '"':
+        return json.loads(raw)
+    if len(raw) >= 2 and raw[0] == raw[-1] == "'":
+        return raw[1:-1].replace("''", "'")
+    if raw.startswith("[") and raw.endswith("]"):
+        return [_yaml_scalar(item) for item in raw[1:-1].split(",") if item.strip()]
+    if raw == "{}":
+        return {}
+    if raw.startswith(("{", "&", "*", "!", "%", "@", "`")):
+        raise ValueError(f"unsupported YAML scalar: {raw!r}")
+    return re.split(r"\s+#", raw, maxsplit=1)[0]
+
+
+class WorkflowYaml:
+    """The YAML subset GitHub workflows here use, every scalar a string (like PyYAML's BaseLoader).
+
+    Block mappings and sequences, `|`/`|-`/`>`/`>-` block scalars, quoted scalars and one-line
+    flow sequences. Anything else (anchors, tags, multi-line plain or flow scalars) raises, so an
+    unsupported layout fails instead of passing.
+    """
+
+    def __init__(self, text):
+        self.lines = text.split("\n")
+        self.i = 0
+
+    @classmethod
+    def load(cls, text):
+        parser = cls(text)
+        value = parser.block(0)
+        parser.skip()
+        if parser.i != len(parser.lines):
+            raise ValueError(f"unparsed YAML at line {parser.i + 1}")
+        return value
+
+    @staticmethod
+    def indent(line):
+        return len(line) - len(line.lstrip(" "))
+
+    def skip(self):
+        while self.i < len(self.lines) and (not self.lines[self.i].strip() or self.lines[self.i].lstrip().startswith("#")):
+            self.i += 1
+
+    def block(self, minimum):
+        self.skip()
+        if self.i >= len(self.lines) or self.indent(self.lines[self.i]) < minimum:
+            return None
+        indent = self.indent(self.lines[self.i])
+        if self.lines[self.i][indent:].startswith("- "):
+            return self.sequence(indent)
+        return self.mapping(indent)
+
+    def sequence(self, indent):
+        out = []
+        while True:
+            self.skip()
+            if self.i >= len(self.lines) or self.indent(self.lines[self.i]) != indent \
+                    or not self.lines[self.i][indent:].startswith("- "):
+                break
+            rest = self.lines[self.i][indent + 2:]
+            if re.match(r'("[^"]*"|\'[^\']*\'|[^\s"\'#][^:]*?):(?: |$)', rest):
+                # A mapping item: re-read its first line as a key at the item's indent.
+                self.lines[self.i] = " " * (indent + 2) + rest
+                out.append(self.mapping(indent + 2))
+            else:
+                out.append(_yaml_scalar(rest))
+                self.i += 1
+        return out
+
+    def mapping(self, indent):
+        out = {}
+        while True:
+            self.skip()
+            if self.i >= len(self.lines):
+                break
+            line = self.lines[self.i]
+            current = self.indent(line)
+            if current < indent or (current == indent and line[indent:].startswith("- ")):
+                break
+            if current > indent:
+                raise ValueError(f"unexpected indentation at line {self.i + 1}")
+            match = re.fullmatch(r'("[^"]*"|\'[^\']*\'|[^\s"\'#][^:]*?):(?: +(.*))?', line[indent:])
+            if match is None:
+                raise ValueError(f"unsupported YAML at line {self.i + 1}: {line!r}")
+            key = _yaml_scalar(match.group(1))
+            if key in out:
+                raise ValueError(f"duplicate key {key!r} at line {self.i + 1}")
+            rest = (match.group(2) or "").strip()
+            self.i += 1
+            if rest in ("|", "|-", ">", ">-"):
+                out[key] = self.block_scalar(rest, indent)
+            elif rest and not rest.startswith("#"):
+                out[key] = _yaml_scalar(rest)
+            else:
+                value = self.block(indent + 1)
+                if value is None and self.i < len(self.lines) and self.indent(self.lines[self.i]) == indent \
+                        and self.lines[self.i][indent:].startswith("- "):
+                    value = self.sequence(indent)  # a sequence may sit at its key's indent
+                out[key] = "" if value is None else value
+        return out
+
+    def block_scalar(self, style, parent):
+        lines, inner = [], None
+        while self.i < len(self.lines):
+            line = self.lines[self.i]
+            if not line.strip():
+                lines.append("")
+                self.i += 1
+                continue
+            if self.indent(line) <= parent:
+                break
+            inner = self.indent(line) if inner is None else inner
+            if self.indent(line) < inner:
+                raise ValueError(f"under-indented block scalar line {self.i + 1}")
+            lines.append(line[inner:])
+            self.i += 1
+        while lines and not lines[-1]:
+            lines.pop()
+        if style.startswith("|"):
+            return "\n".join(lines) + ("" if style.endswith("-") else "\n")
+        # Folding joins normal lines with a space; a break next to a more-indented line stays.
+        parts, blanks, previous = lines[:1], 0, lines[0] if lines else ""
+        for line in lines[1:]:
+            if not line:
+                blanks += 1
+                continue
+            kept = previous.startswith(" ") or line.startswith(" ")
+            parts.append("\n" * (blanks + kept) if blanks or kept else " ")
+            parts.append(line)
+            previous, blanks = line, 0
+        return "".join(parts) + ("" if style.endswith("-") else "\n")
+
+WORKFLOWS = {path.name: path for path in sorted((ROOT / ".github" / "workflows").glob("*.y*ml"))}
+PUBLISH_STEP = "Publish validated candidate, queued writes and terminal audit"
+HELPER_RULE = "Bash(python3 ${{ runner.temp }}/claude-fixer-guard/model-api --:*)"
+GUARD = '"$RUNNER_TEMP/claude-fixer-guard'
+ROOT_OWN = [f"python3 {GUARD}/model-api\" install",
+            f"sudo chown -R root:root {GUARD}\"",
+            f"sudo chmod 0755 {GUARD}\" {GUARD}/model-api\"",
+            f"sudo chmod 0644 {GUARD}/context.json\"",
+            f"if [ -e {GUARD}/read-token\" ]; then sudo chmod 0644 {GUARD}/read-token\"; fi",
+            f"test \"$(stat -c %U {GUARD}/model-api\")\" = root"]
+RECEIPTS_STEP = "Install trusted receipt helper"
+# The conflict writer keeps its pre-push guard until Port C; only claude.yml is split here.
+PIPELINES = {
+    "claude.yml": [("mention-prepare", "claude-mention", "mention-publish", "claude-${{ needs.resolve-pr.outputs.pr_number }}"),
+                   ("fixer-prepare", "devin-review-fix", "fixer-publish", "claude-${{ needs.resolve-pr.outputs.pr_number }}")],
+}
+
+
+def step(job, name):
+    return [s for s in job["steps"] if s.get("name") == name][0]
+
+
+def jobs(name):
+    return WorkflowYaml.load(WORKFLOWS[name].read_text(encoding="utf-8"))["jobs"]
+
+
+# Samir's review of #231 at 7f06a3b: each alternative of the package step's credential grep has a
+# case that it alone matches, so removing any one alternative fails the test.
+ISOLATED_CREDENTIALS = {
+    "userinfo": ("remote.origin.url", "https://someone:notatoken@github.com/acme/example.git"),
+    "access-token-user": ("credential.https://github.com.username", "x-access-token"),
+    # The actions/checkout layout, with a value that is not token-shaped.
+    "extraheader": ("http.https://github.com/.extraheader", "AUTHORIZATION: basic bm90YXRva2Vu"),
+    "pat": ("credential.https://github.com.password", "github_pat_NotARealToken"),
+    "token-shape": ("credential.https://github.com.password", TOKEN),
+}
+
+
+class WorkflowYamlTests(unittest.TestCase):
+    def test_loader_reads_the_supported_subset_and_refuses_the_rest(self):
+        text = ("a:\n  b: [x, 'y']\n  c: |\n    one\n\n    two\n  d: >-\n    p\n    q\n      r\n"
+                "  e:\n  - k: \"v\\u0021\"\n    m: n # note\n  - plain\n")
+        self.assertEqual(WorkflowYaml.load(text), {"a": {"b": ["x", "y"], "c": "one\n\ntwo\n", "d": "p q\n  r",
+                                                         "e": [{"k": "v!", "m": "n"}, "plain"]}})
+        for bad in ("a: &x 1\n", "a: 1\na: 2\n", "a:\n   b: 1\n  c: 2\n", "a: {b: 1}\n"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                WorkflowYaml.load(bad)
+
+    def test_every_workflow_loads(self):
+        for name in WORKFLOWS:
+            with self.subTest(workflow=name):
+                self.assertIsInstance(jobs(name), dict)
+
+
+class WorkflowWiringTests(unittest.TestCase):
+    def test_mention_trigger_responses_use_comments_and_finding_replies_use_roots(self):
+        action = next(s for s in jobs("claude.yml")["claude-mention"]["steps"]
+                      if s.get("uses", "").startswith("anthropics/claude-code-action@"))
+        prompt = action["with"]["prompt"]
+        self.assertIn("For every response to the triggering comment, including failures and no-change results, "
+                      "use comment BODY_FILE.", prompt)
+        self.assertIn("Respond to the triggering comment with a top-level PR comment", prompt)
+        self.assertIn("If there is nothing to change, queue a top-level PR comment", prompt)
+        self.assertNotIn("queue a reply to the triggering comment", prompt)
+        self.assertIn("-- reply ROOT_COMMENT_ID BODY_FILE", prompt)
+        self.assertIn("A reply accepts only a root review-comment ID on this PR", prompt)
+
+    def pipelines(self):
+        for name, triples in PIPELINES.items():
+            all_jobs = jobs(name)
+            for prepare, model, publish, group in triples:
+                yield name, all_jobs[prepare], all_jobs[model], all_jobs[publish], group, (prepare, model, publish)
+
+    def test_model_jobs_are_read_only_without_credentials_or_push(self):
+        for name, _prep, model, _pub, _group, ids in self.pipelines():
+            with self.subTest(workflow=name, job=ids[1]):
+                self.assertEqual(model["permissions"], {"contents": "read", "pull-requests": "read", "issues": "read"})
+                checkout = [s for s in model["steps"] if s.get("uses", "").startswith("actions/checkout@")]
+                self.assertEqual(len(checkout), 1)
+                self.assertEqual(checkout[0]["with"]["persist-credentials"], "false")
+                self.assertEqual(checkout[0]["with"]["ref"], f"${{{{ needs.{ids[0]}.outputs.head_sha }}}}")
+                action = [s for s in model["steps"] if s.get("uses", "").startswith("anthropics/claude-code-action@")]
+                self.assertEqual(len(action), 1)
+                inputs = action[0]["with"]
+                self.assertEqual(inputs["github_token"], "${{ github.token }}")
+                self.assertEqual(inputs["classify_inline_comments"], "false")  # CSL-383
+                self.assertEqual((inputs["bot_id"], inputs["bot_name"]), ("209825114", "claude[bot]"))
+                allow = inputs["claude_args"].split("--allowedTools", 1)[1].split("--disallowedTools", 1)[0]
+                self.assertNotIn("git push", allow)
+                self.assertNotIn("Bash(gh api", allow)
+                self.assertIn(HELPER_RULE, allow)
+                for rule in ("Bash(git push:*)", "Bash(git config:*)", "Bash(gh api:*)"):
+                    self.assertIn(rule, inputs["claude_args"].split("--disallowedTools", 1)[1])
+                deny = json.loads(inputs["settings"])["permissions"]["deny"]
+                # Recursion keeps the broad .git deny of its pre-split writers (CSL-414 port B).
+                for rule in ("Edit(.git/**)", "Write(.git/**)", "Edit(/${{ runner.temp }}/claude-fixer-guard/**)",
+                             "Write(/${{ runner.temp }}/claude-fixer-guard/**)"):
+                    self.assertIn(rule, deny)
+                # The helper must still read its own files, and the outbox stays writable.
+                self.assertFalse([r for r in deny if r.startswith("Read(") and "claude-fixer-guard" in r], deny)
+                self.assertFalse([r for r in deny if ".claude-fixer-out" in r])
+                text = json.dumps(model)
+                self.assertNotIn("id-token", text)
+                self.assertNotIn("secrets.GITHUB", text)
+                upload = [s for s in model["steps"] if s.get("uses", "").startswith("actions/upload-artifact@")]
+                self.assertEqual(len(upload), 1)
+                self.assertEqual(upload[0]["if"], "always()")
+                self.assertEqual(upload[0]["with"]["retention-days"], "1")
+                package = [s for s in model["steps"] if s.get("name") == "Package untrusted model output"][0]
+                self.assertEqual(package["if"], "always()")
+                self.assertIn('bundle create "$out/candidate.bundle" HEAD "^$HEAD_SHA"', package["run"])
+                self.assertNotIn('cp "$EXECUTION_FILE"', package["run"])  # never upload the transcript
+                self.assertEqual(package["id"], "package")
+                self.assertIn('echo "package_status=$status" >> "$GITHUB_OUTPUT"', package["run"])
+                self.assertEqual(model["outputs"], {"claude_outcome": "${{ steps.claude.outcome }}",
+                                                    "package_status": "${{ steps.package.outputs.package_status }}"})
+
+    @POSIX
+    def test_package_status_reports_unchanged_bundled_and_a_failed_bundle(self):
+        # Runs each model job's real package script against a repo, with a git wrapper that can fail `bundle`.
+        for name, _prep, model, _pub, _group, ids in self.pipelines():
+            script = [s for s in model["steps"] if s.get("name") == "Package untrusted model output"][0]["run"]
+            for case in ("unchanged", "bundled", "failed", "credential", "helper", "big", "unreadable",
+                         *ISOLATED_CREDENTIALS):
+                with self.subTest(workflow=name, job=ids[1], case=case), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    work = Work(root / "repo")
+                    subprocess.run(["git", "init", "-q", "-b", "main", str(work.path)], env=git_env(), check=True)
+                    head = work.commit({"a.txt": "a\n"}, message="head")
+                    # CSL-412: the action's credential-helper layout is clean; a token in the URL is not.
+                    url = ("https://x-access-token:" + TOKEN + "@github.com/acme/example.git" if case == "credential"
+                           else "https://github.com/acme/example.git")
+                    work.git("remote", "add", "origin", url)
+                    if case == "helper":
+                        work.git("config", "credential.helper", str(root / ".git-credential-gh-token"))
+                    if case in ISOLATED_CREDENTIALS:
+                        work.git("config", *ISOLATED_CREDENTIALS[case])
+                    if case == "big":  # a hit before >64 KiB of config still fails
+                        work.git("config", "remote.origin.url", "https://x-access-token:" + TOKEN + "@github.com/a/b.git")
+                        for index in range(1500):
+                            work.git("config", "--add", "filler.value", f"{index:04d}" + "x" * 60)
+                    if case != "unchanged":
+                        work.commit({"a.txt": "b\n"}, message="model fix")
+                    shim = root / "bin"
+                    shim.mkdir()
+                    real_git = shutil.which("git")
+                    (shim / "git").write_text("#!/bin/sh\n"
+                                              + ('for a in "$@"; do [ "$a" = bundle ] && exit 1; done\n' if case == "failed" else "")
+                                              # git config fails (only the listing): fail closed, not clean
+                                              + ('[ "$1" = config ] && exit 1\n' if case == "unreadable" else "")
+                                              + f'exec "{real_git}" "$@"\n')
+                    (shim / "git").chmod(0o755)
+                    output = root / "output"
+                    env = dict(git_env(), PATH=f"{shim}{os.pathsep}{os.environ['PATH']}", RUNNER_TEMP=str(root),
+                               GITHUB_OUTPUT=str(output), HEAD_SHA=head, BASE_SHA=head, EXECUTION_FILE="")
+                    subprocess.run(["bash", "-c", script], cwd=work.path, env=env, check=True, capture_output=True)
+                    expected = ("failed" if case in ISOLATED_CREDENTIALS else
+                                {"credential": "failed", "helper": "bundled", "big": "failed",
+                                 "unreadable": "failed"}.get(case, case))
+                    self.assertEqual(output.read_text(), f"package_status={expected}\n")
+                    bundle = root / "claude-writer-out" / "candidate.bundle"
+                    self.assertEqual(bundle.exists(), expected == "bundled")
+
+    def test_model_jobs_scrub_credentials_and_run_no_repository_code(self):
+        # Chaandan's review at 5f904c3: PR code must not run next to the OAuth token.
+        for name, _prep, model, _pub, _group, ids in self.pipelines():
+            with self.subTest(workflow=name, job=ids[1]):
+                names = [s.get("name") or s.get("id") for s in model["steps"]]
+                sandbox = step(model, "Install the subprocess sandbox for Claude's commands")
+                self.assertEqual(names.index("claude") - 1, names.index(sandbox["name"]))
+                self.assertIn("apt-get install -y --no-install-recommends bubblewrap socat", sandbox["run"])
+                self.assertIn("\ncommand -v bwrap\n", sandbox["run"])
+                self.assertNotIn("continue-on-error", sandbox)
+                action = [s for s in model["steps"] if s.get("id") == "claude"][0]
+                self.assertEqual(action["env"], {"CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1"})
+                # Chaandan's review at 95de346: any value keeps the job token out of the origin URL
+                # in .git/config; one no GitHub login can match keeps every actor's write check.
+                self.assertEqual(action["with"]["github_token"], "${{ github.token }}")
+                sentinel = action["with"]["allowed_non_write_users"]
+                self.assertEqual(sentinel, "-no-such-user-")
+                for login in sentinel.split(","):
+                    self.assertIsNone(re.fullmatch(r"[A-Za-z0-9](?:-?[A-Za-z0-9])*(?:\[bot\])?", login.strip()))
+                args = action["with"]["claude_args"]
+                self.assertIn("--setting-sources user", args)
+                self.assertIn("Bash(git diff --no-index:*)", args.split("--disallowedTools", 1)[1])
+                self.assertIn("they are not preloaded, so Read them", action["with"]["prompt"])
+                allow = args.split("--allowedTools", 1)[1].split("--disallowedTools", 1)[0]
+                for gone in ("pytest", "tools/test_", "tools/ci_gate", "gh pr", "python -m", "python -X", "python3 -X"):
+                    self.assertNotIn(gone, allow)
+                # Samir's review at acecb2b: a `prefix:*` rule accepts any options (git log --output=,
+                # git diff --no-index, --pathspec-from-file=), so model Bash is the fixed helper only.
+                self.assertEqual(re.findall(r"Bash\([^)]*\)", allow), [HELPER_RULE])
+                self.assertNotIn("git ", allow)
+                self.assertEqual(allow.strip(), f'"Edit,Write,Read,Glob,Grep,{HELPER_RULE}"')
+                prompt = action["with"]["prompt"]
+                self.assertNotIn("python -m pytest", prompt)
+                self.assertNotIn("ci_gate.py --force", prompt)
+                self.assertIn("Do not run tests, linters or any repository code", prompt)
+                self.assertIn("linux CI job runs the acceptance gate on the pushed commit", " ".join(prompt.split()))
+                settings = json.loads(action["with"]["settings"])["permissions"]
+                self.assertEqual(set(settings), {"deny"})  # no settings-level allow rules either
+                deny = settings["deny"]
+                for rule in ("Edit(.claude/**)", "Write(.claude/**)", "Edit(~/.claude/**)", "Write(~/.claude/**)",
+                             "Read(~/.claude/**)", "Edit(~/.gitconfig)", "Write(~/.gitconfig)",
+                             "Edit(~/.config/git/**)", "Write(~/.config/git/**)"):
+                    self.assertIn(rule, deny)
+                outbox = [s for s in model["steps"] if s.get("id") == "outbox"][0]
+                self.assertEqual(outbox["env"]["GH_TOKEN"], "${{ github.token }}")
+                # The helper is root-owned and read-only before Claude runs; any failure fails the step.
+                self.assertTrue(outbox["run"].startswith("set -euo pipefail\n"))
+                tail = outbox["run"].split("\nCLAUDE_FIXER_OUTBOX\n", 1)[1]
+                self.assertEqual([line for line in tail.splitlines() if line and not line.startswith("#")], ROOT_OWN)
+                # No setup-python or dependency install: the model job runs no repository code.
+                for forbidden in ("actions/setup-python", "pip install", "requirements-ci.txt"):
+                    self.assertNotIn(forbidden, json.dumps(model))
+
+    @POSIX
+    def test_helper_install_fails_closed_when_it_cannot_root_own_the_helper(self):
+        for name, _prep, model, _pub, _group, ids in self.pipelines():
+            outbox = [s for s in model["steps"] if s.get("id") == "outbox"][0]
+            with self.subTest(workflow=name, job=ids[1]), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                shim = root / "bin"
+                shim.mkdir()
+                (shim / "python3").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+                (shim / "sudo").write_text("#!/bin/sh\nexit 1\n")
+                for tool in ("python3", "sudo"):
+                    (shim / tool).chmod(0o755)
+                env = {k: v for k, v in os.environ.items() if k != "GH_TOKEN"}
+                env.update({k: v for k, v in outbox["env"].items() if "${{" not in v},
+                           PATH=f"{shim}{os.pathsep}{os.environ['PATH']}", RUNNER_TEMP=str(root), REPO=REPO,
+                           PR_NUMBER="7", HEAD_REF="fix", HEAD_SHA=A, RECEIPT_CONTEXT="")
+                result = subprocess.run(["bash", "-c", outbox["run"]], cwd=root, env=env, capture_output=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertTrue((root / "claude-fixer-guard" / "context.json").is_file())  # failed after install
+
+    def test_publish_jobs_mint_and_never_run_repository_code(self):
+        for name, _prep, _model, publish, _group, ids in self.pipelines():
+            with self.subTest(workflow=name, job=ids[2]):
+                # The publish job keeps the Claude App credential (OIDC exchange) so its push triggers CI.
+                self.assertEqual(publish["permissions"], {"contents": "read", "pull-requests": "write",
+                                                          "issues": "write", "id-token": "write"})
+                self.assertEqual(set(publish["needs"]) - {"resolve-pr"}, {ids[0], ids[1]})
+                condition = " ".join(publish["if"].split())
+                self.assertTrue(condition.startswith("!cancelled() &&"), condition)
+                self.assertIn(f"needs.{ids[0]}.result == 'success'", condition)
+                self.assertIn(f"needs.{ids[0]}.outputs.skip == 'false'", condition)
+                self.assertIn(f"needs.{ids[0]}.outputs.run_attempt == github.run_attempt", condition)
+                self.assertNotIn(f"needs.{ids[1]}.result == 'success'", condition)
+                uses = [s.get("uses", "") for s in publish["steps"]]
+                self.assertEqual(uses, ["actions/download-artifact@v4", "", ""])
+                self.assertEqual(publish["steps"][0]["continue-on-error"], "true")
+                self.assertEqual([s.get("name") for s in publish["steps"][1:]], [RECEIPTS_STEP, PUBLISH_STEP])
+                self.assertEqual(set(step(publish, RECEIPTS_STEP)) - {"name", "run"}, set())  # no env, no token
+                run = step(publish, RECEIPTS_STEP)["run"] + step(publish, PUBLISH_STEP)["run"]
+                # Outside the embedded, parity-checked sources: no repository code.
+                outside = re.sub(r"<<'([A-Z_]+)'\n.*?\n\1(?:\n|$)", "<<heredoc\n", run, flags=re.DOTALL)
+                self.assertEqual(outside.count("<<heredoc"), 2)
+                rest = {**publish, "steps": [publish["steps"][0], {"name": "runs", "run": outside}]}
+                for forbidden in ("pip install", "pytest", "python tools/", "python3 tools/", "uses: ./",
+                                  "actions/checkout", "scripts/ci/", "git clone", "-e .", "GITHUB_WORKSPACE",
+                                  "git push", "secrets.GITHUB_TOKEN"):
+                    self.assertNotIn(forbidden, json.dumps(rest))
+                commands = [line.strip() for line in run.split("\n")
+                            if line.strip().startswith(("python", "cat >", "mkdir"))]
+                self.assertEqual(commands, ['mkdir -p "$RUNNER_TEMP/claude-fixer-publish"',
+                                            "cat > \"$RUNNER_TEMP/claude-fixer-publish/receipts.py\" <<'CLAUDE_FIXER_RECEIPTS'",
+                                            "cat > \"$RUNNER_TEMP/claude-fixer-publish/publish.py\" <<'CLAUDE_FIXER_PUBLISH'",
+                                            'python3 -I "$RUNNER_TEMP/claude-fixer-publish/publish.py"'])
+                env = step(publish, PUBLISH_STEP)["env"]
+                self.assertEqual(env["GH_TOKEN"], "${{ github.token }}")
+                self.assertEqual(env["CLAUDE_FIXER_PAUSE"], "${{ vars.CLAUDE_FIXER_PAUSE }}")
+                self.assertEqual(env["HEAD_SHA"], f"${{{{ needs.{ids[0]}.outputs.head_sha }}}}")
+                self.assertEqual(env["HEAD_REF"], f"${{{{ needs.{ids[0]}.outputs.head_ref }}}}")
+                self.assertEqual(env["PREPARED_RUN_ATTEMPT"], f"${{{{ needs.{ids[0]}.outputs.run_attempt }}}}")
+                self.assertEqual(env["WRITER_MODE"], {"mention-publish": "mention", "fixer-publish": "fixer"}[ids[2]])
+                self.assertEqual(env["MODEL_OUTCOME"],
+                                 f"${{{{ needs.{ids[1]}.outputs.claude_outcome || needs.{ids[1]}.result }}}}")
+                self.assertEqual(env["PACKAGE_STATUS"], f"${{{{ needs.{ids[1]}.outputs.package_status }}}}")
+                self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", json.dumps(publish))
+
+    def test_prepare_jobs_are_model_free_and_hold_no_id_token(self):
+        for name, prepare, _model, _pub, _group, ids in self.pipelines():
+            with self.subTest(workflow=name, job=ids[0]):
+                text = json.dumps(prepare)
+                for forbidden in ("id-token", "actions/checkout", "claude-code-action", "pip install", "pytest",
+                                  "CLAUDE_CODE_OAUTH_TOKEN", "--allowedTools"):
+                    self.assertNotIn(forbidden, text)
+                self.assertEqual(prepare["permissions"].get("contents"), "read")
+                self.assertIn("run_attempt", prepare["outputs"])
+                self.assertIn("|| 'true'", prepare["outputs"]["skip"])
+
+    def test_all_three_jobs_share_the_writer_lock(self):
+        for name, prepare, model, publish, group, ids in self.pipelines():
+            for job_id, job in zip(ids, (prepare, model, publish)):
+                with self.subTest(workflow=name, job=job_id):
+                    self.assertEqual(job["concurrency"], {"group": group, "queue": "max", "cancel-in-progress": "false"})
+
+    def test_model_jobs_wait_for_a_fresh_prepare(self):
+        for name, _prep, model, _pub, _group, ids in self.pipelines():
+            condition = " ".join(model["if"].split())
+            self.assertIn(f"needs.{ids[0]}.result == 'success'", condition)
+            self.assertIn(f"needs.{ids[0]}.outputs.skip == 'false'", condition)
+            self.assertIn(f"needs.{ids[0]}.outputs.run_attempt == github.run_attempt", condition)
+            self.assertEqual(set(model["needs"]), {"resolve-pr", ids[0]})
+
+    def test_every_embedded_script_matches_its_source(self):
+        sources = {"CLAUDE_FIXER_PUBLISH": "claude_fixer_publish.py", "CLAUDE_FIXER_OUTBOX": "claude_fixer_outbox.py",
+                   "CLAUDE_FIXER_RECEIPTS": "claude_fixer_receipts.py", "CLAUDE_FIXER_GUARD": "claude_fixer_guard.py",
+                   "CLAUDE_DENIALS_REPORT": "claude_denials.py", "CLAUDE_PR_FIXER_GATE": "claude_pr_fixer_gate.py",
+                   "CLAUDE_CONFLICT_SCAN": "claude_conflict_scan.py"}
+        # Receipts: mention-publish, fixer-prepare's eligibility and fixer-publish. conflict-scan.yml
+        # keeps the pre-push guard until Port C.
+        expected = {("claude.yml", "CLAUDE_FIXER_PUBLISH"): 2, ("claude.yml", "CLAUDE_FIXER_OUTBOX"): 2,
+                    ("claude.yml", "CLAUDE_FIXER_RECEIPTS"): 3,
+                    ("claude.yml", "CLAUDE_DENIALS_REPORT"): 2, ("claude.yml", "CLAUDE_PR_FIXER_GATE"): 1,
+                    ("conflict-scan.yml", "CLAUDE_FIXER_GUARD"): 1,
+                    ("conflict-scan.yml", "CLAUDE_DENIALS_REPORT"): 1,
+                    ("conflict-scan.yml", "CLAUDE_CONFLICT_SCAN"): 1}
+        for name, path in WORKFLOWS.items():
+            text = path.read_text(encoding="utf-8")
+            for tag, source in sources.items():
+                chunks = text.split(f"<<'{tag}'\n")[1:]
+                with self.subTest(workflow=name, tag=tag):
+                    self.assertEqual(len(chunks), expected.get((name, tag), 0))
+                    want = (ROOT / "scripts/ci" / source).read_text(encoding="utf-8").rstrip()
+                    for chunk in chunks:
+                        self.assertEqual(textwrap.dedent(chunk.split(f"          {tag}\n", 1)[0]).rstrip(), want)
+        text = WORKFLOWS["claude.yml"].read_text(encoding="utf-8")
+        self.assertNotIn("CLAUDE_FIXER_GUARD", text)
+        self.assertNotIn("claude-fixer-guard/pre-push", text)
+
+    def test_receipt_context_flows_from_prepare_to_model_and_publish_only(self):
+        all_jobs = jobs("claude.yml")
+        prepare = all_jobs["fixer-prepare"]
+        self.assertEqual(prepare["outputs"]["receipt_context"], "${{ steps.eligibility.outputs.receipt_context }}")
+        self.assertEqual(prepare["outputs"]["attempt_key"], "${{ steps.eligibility.outputs.attempt_key }}")
+        outbox = [s for s in all_jobs["devin-review-fix"]["steps"] if s.get("id") == "outbox"][0]
+        self.assertEqual(outbox["name"], "Fixer attempt ${{ needs.fixer-prepare.outputs.attempt_key }}")
+        self.assertEqual(outbox["env"]["RECEIPT_CONTEXT"], "${{ needs.fixer-prepare.outputs.receipt_context }}")
+        self.assertEqual(outbox["env"]["WRITER_MODE"], "fixer")
+        self.assertEqual(step(all_jobs["fixer-publish"], PUBLISH_STEP)["env"]["RECEIPT_CONTEXT"],
+                         "${{ needs.fixer-prepare.outputs.receipt_context }}")
+        self.assertNotIn("RECEIPT_CONTEXT", step(all_jobs["mention-publish"], PUBLISH_STEP)["env"])
+        mention_outbox = [s for s in all_jobs["claude-mention"]["steps"] if s.get("id") == "outbox"][0]
+        self.assertNotIn("RECEIPT_CONTEXT", mention_outbox["env"])
+        self.assertEqual(mention_outbox["env"]["WRITER_MODE"], "mention")
+
+    def test_devin_prepare_skips_drafts_before_any_reservation(self):
+        cap = [s for s in jobs("claude.yml")["fixer-prepare"]["steps"] if s.get("id") == "cap"][0]["run"]
+        draft = cap.index("if ! jq -e '.draft == false' <<< \"$current_pr\" >/dev/null; then")
+        self.assertLess(cap.index("pause=\"\""), draft)
+        self.assertLess(draft, cap.index("commits=\"$(gh api --paginate"))
+        live = [s for s in jobs("claude.yml")["mention-prepare"]["steps"] if s.get("id") == "live"][0]["run"]
+        self.assertNotIn(".draft", live)  # a human @claude mention may act on a draft
+
+    def test_every_claude_yml_action_use_is_pinned_and_equals_the_escalation_binding(self):
+        # CSL-414: the exhausted-fixer escalation names the action step "Run <uses>", so both
+        # claude.yml model jobs must use exactly its pinned ACTION_USES (v1.0.256, as CSL-412).
+        escalation = load("fixer_failure_escalation", "scripts/ci/fixer_failure_escalation.py")
+        self.assertRegex(escalation.ACTION_USES, r"^anthropics/claude-code-action@[0-9a-f]{40}$")
+        text = WORKFLOWS["claude.yml"].read_text(encoding="utf-8")
+        uses = re.findall(r"(?m)^\s*(?:-\s+)?uses:\s*(anthropics/claude-code-action@\S*)\s*$", text)
+        self.assertEqual(uses, [escalation.ACTION_USES] * 2)
+        self.assertEqual(text.count("anthropics/claude-code-action@"), 2)
+        for name in ("claude-mention", "devin-review-fix"):
+            action = [s for s in jobs("claude.yml")[name]["steps"] if s.get("id") == "claude"]
+            self.assertEqual([s["uses"] for s in action], [escalation.ACTION_USES], name)
+
+    def test_every_run_script_stays_below_actionlints_pipe_limit(self):
+        # actionlint 1.7.7 hangs (and event-paths times out) on a run script of 64 KiB or more.
+        for name in WORKFLOWS:
+            for job_name, job in jobs(name).items():
+                for index, item in enumerate(job.get("steps") or []):
+                    with self.subTest(workflow=name, job=job_name, step=index):
+                        self.assertLess(len(item.get("run", "").encode("utf-8")), 60_000)
+
+    def test_committer_identity_is_pinned_where_the_publisher_expects_it(self):
+        for name, _prep, model, _pub, _group, ids in self.pipelines():
+            attach = [s for s in model["steps"] if s.get("name") == "Attach verified PR branch at event SHA"][0]["run"]
+            self.assertIn(f'git config user.name "{CLAUDE[0]}"', attach)
+            self.assertIn(f'git config user.email "{CLAUDE[1]}"', attach)
+            self.assertIn(".claude-fixer-out/", attach)
+            self.assertEqual(CLAUDE, ("claude[bot]", "209825114+claude[bot]@users.noreply.github.com"))
 
 
 if __name__ == "__main__":

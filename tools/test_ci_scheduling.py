@@ -582,21 +582,42 @@ class ClassifierTests(unittest.TestCase):
 # re-run, ready-for-review or CI-label add (the only CI-label write is revoking a gate-owned
 # `ci:full`); GitHub-hosted runners only; one shared per-PR lock without cancellation; a reviewed
 # ceiling of shell grants with one exact, non-force push; the eight-commit guard, bounded attempts and
-# the human pause. Limit: the push checks read the workflow text only; until CSL-414 the model
-# jobs hold a write token and may edit and run repository code, so it is not a push guarantee. Jobs are split by layout (two-space job keys under `jobs:`), so an unsupported
+# the human pause. CSL-414 splits each claude.yml writer into a trusted prepare (pause, cap and
+# attempt checks), an untrusted model job with no push grant, write scope or id-token, and a trusted
+# publish job whose only push is the embedded publisher's single ordinary fast-forward. Limit: the
+# push checks read the workflow text only; until Port C conflict-resolve's model holds a write token
+# and may edit and run repository code, so it is not a push guarantee. Jobs are split by layout (two-space job keys under `jobs:`), so an unsupported
 # layout fails instead of passing. Retry behaviour itself is tested in
 # tools/test_claude_pr_fixer.py, which the fixer workflow runs.
 CROSSLANE_WORKFLOWS = ROOT / ".github" / "workflows"
 CROSSLANE_WRITER_FILES = ("claude.yml", "conflict-scan.yml")
-CROSSLANE_ALL_JOBS = {"claude.yml": {"resolve-pr", "event-paths", "claude-mention", "devin-review-fix"},
+CROSSLANE_ALL_JOBS = {"claude.yml": {"resolve-pr", "event-paths", "mention-prepare", "claude-mention", "mention-publish",
+                                     "fixer-prepare", "devin-review-fix", "fixer-publish"},
                       "conflict-scan.yml": {"conflict-scan", "conflict-resolve"}}
-CROSSLANE_WRITER_JOBS = {"claude.yml": ("claude-mention", "devin-review-fix"), "conflict-scan.yml": ("conflict-resolve",)}
+# Every writer stage takes the shared per-PR lock: GitHub releases it between jobs.
+CROSSLANE_WRITER_JOBS = {"claude.yml": ("mention-prepare", "claude-mention", "mention-publish",
+                                        "fixer-prepare", "devin-review-fix", "fixer-publish"),
+                         "conflict-scan.yml": ("conflict-resolve",)}
+# Model jobs that hold the one granted push (until Port C).
+CROSSLANE_PUSH_MODEL_JOBS = {"conflict-scan.yml": ("conflict-resolve",)}
+# CSL-414 split stages of claude.yml: (trusted prepare, untrusted model, trusted publish).
+CROSSLANE_SPLIT = {"claude.yml": (("mention-prepare", "claude-mention", "mention-publish"),
+                                  ("fixer-prepare", "devin-review-fix", "fixer-publish"))}
+CROSSLANE_PREPARE_JOBS = {name: tuple(s[0] for s in stages) for name, stages in CROSSLANE_SPLIT.items()}
+CROSSLANE_MODEL_JOBS = {name: tuple(s[1] for s in stages) for name, stages in CROSSLANE_SPLIT.items()}
+CROSSLANE_PUBLISH_JOBS = {name: tuple(s[2] for s in stages) for name, stages in CROSSLANE_SPLIT.items()}
+# The split model's one shell grant: the fixed root-owned outbox helper.
+CROSSLANE_MODEL_HELPER = "Bash(python3 ${{ runner.temp }}/claude-fixer-guard/model-api --:*)"
+CROSSLANE_PUBLISHER = ROOT / "scripts" / "ci" / "claude_fixer_publish.py"
+# The publisher's one push: an ordinary fast-forward of the validated candidate to the prepared branch.
+CROSSLANE_PUBLISH_PUSH = """["push", "-q", "--no-verify", url, f"{candidate}:refs/heads/{config['ref']}"]"""
 CROSSLANE_HOSTED = {"ubuntu-latest", "ubuntu-24.04", "ubuntu-22.04", "windows-2025", "windows-latest", "macos-latest"}
 # Every shell grant a writer model may hold, apart from its one push. A new grant fails until reviewed here.
 CROSSLANE_SAFE_BASH = {
     "Bash(git add:*)", "Bash(git commit:*)", "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)",
     "Bash(git rev-parse:*)", "Bash(git merge --abort)", "Bash(gh pr view:*)", "Bash(gh pr diff:*)",
     "Bash(python3 ${{ runner.temp }}/claude-fixer-guard/pre-push model-api --:*)",
+    "Bash(python3 ${{ runner.temp }}/claude-fixer-guard/model-api --:*)",
     "Bash(python -X utf8 -B tools/ci_gate.py --force)", "Bash(python3 -X utf8 -B tools/ci_gate.py --force)",
     "Bash(python -X utf8 -B tools/test_claude_pr_fixer.py)", "Bash(python3 -X utf8 -B tools/test_claude_pr_fixer.py)",
 }
@@ -734,6 +755,16 @@ def _crosslane_bracket(text: str, pos: int, opens: str) -> tuple[int, int] | Non
     return i, j
 
 
+def _crosslane_publisher_embed(block: str) -> tuple[str, str]:
+    # The raw CLAUDE_FIXER_PUBLISH heredoc body in a job and its dedented source.
+    chunks = block.split("<<'CLAUDE_FIXER_PUBLISH'\n")
+    if len(chunks) != 2:
+        raise AssertionError("a publish job must embed the publisher exactly once")
+    raw = chunks[1].split("\n          CLAUDE_FIXER_PUBLISH\n", 1)[0]
+    import textwrap
+    return raw, textwrap.dedent(raw)
+
+
 def _crosslane_push_commands(text: str) -> list[str]:
     # Each push as a whole command: a shell line plus its continuations, or an argv list from `[`/`(`
     # to the matching close.
@@ -837,7 +868,7 @@ class CrossLaneAdmissionTests(unittest.TestCase):
                     self.assertEqual(settings["queue"], "max")
 
     def test_shell_grants_are_reviewed_and_the_one_push_is_exact(self) -> None:
-        for name, writer_jobs in CROSSLANE_WRITER_JOBS.items():
+        for name, writer_jobs in CROSSLANE_PUSH_MODEL_JOBS.items():
             blocks = _crosslane_jobs(name)
             for job in writer_jobs:
                 with self.subTest(workflow=name, job=job):
@@ -848,46 +879,126 @@ class CrossLaneAdmissionTests(unittest.TestCase):
                     self.assertEqual(len(pushes), 1)
                     self.assertRegex(pushes[0], CROSSLANE_PUSH)
                     self.assertEqual(set(bash) - set(pushes) - CROSSLANE_SAFE_BASH, set())
+        # CSL-414: the split model jobs hold no push grant and no git rule; their one shell grant is
+        # the fixed outbox helper, and git push is explicitly disallowed.
+        for name, model_jobs in CROSSLANE_MODEL_JOBS.items():
+            blocks = _crosslane_jobs(name)
+            for job in model_jobs:
+                with self.subTest(workflow=name, job=job, check="model grants"):
+                    allowed = re.findall(r'--allowedTools "([^"]*)"', blocks[job])
+                    self.assertEqual(len(allowed), 1)
+                    bash = [tool for tool in allowed[0].split(",") if tool.startswith("Bash")]
+                    self.assertEqual(bash, [CROSSLANE_MODEL_HELPER])
+                    self.assertLessEqual(set(bash), CROSSLANE_SAFE_BASH)
+                    self.assertNotIn("git push", allowed[0])
+                    self.assertNotRegex(allowed[0], r"Bash\(git ")
+                    disallowed = re.findall(r'--disallowedTools "([^"]*)"', blocks[job])
+                    self.assertEqual(len(disallowed), 1)
+                    self.assertIn("Bash(git push:*)", disallowed[0].split(","))
+                    # No other step of the model job holds a push either.
+                    self.assertFalse(_crosslane_push_commands(_crosslane_granted(blocks[job])))
+        # Prepare and publish run no model at all.
+        for name in CROSSLANE_SPLIT:
+            blocks = _crosslane_jobs(name)
+            for job in CROSSLANE_PREPARE_JOBS[name] + CROSSLANE_PUBLISH_JOBS[name]:
+                with self.subTest(workflow=name, job=job, check="model-free"):
+                    self.assertNotIn("anthropics/claude-code", blocks[job])
+                    self.assertNotIn("--allowedTools", blocks[job])
+                    self.assertNotIn("actions/checkout", blocks[job])
+        publisher = CROSSLANE_PUBLISHER.read_text(encoding="utf-8")
         for name in CROSSLANE_WRITER_FILES:
+            push_models = CROSSLANE_PUSH_MODEL_JOBS.get(name, ())
+            publishers = CROSSLANE_PUBLISH_JOBS.get(name, ())
+            prepares = CROSSLANE_PREPARE_JOBS.get(name, ())
+            models = CROSSLANE_MODEL_JOBS.get(name, ())
             for job, block in _crosslane_jobs(name).items():
                 with self.subTest(workflow=name, job=job, check="no push outside the model grant"):
-                    # The only push path is the model's single granted command; no step pushes as a shell command or git argv.
-                    self.assertNotRegex(CROSSLANE_WORD_LIST.sub("", _crosslane_without_model_text(block)), CROSSLANE_STEP_PUSH)
+                    # The only push paths are a push model's single granted command and the trusted
+                    # publisher embedded byte-for-byte; no other step pushes as a shell command or git argv.
+                    steps = CROSSLANE_WORD_LIST.sub("", _crosslane_without_model_text(block))
+                    if job in publishers:
+                        raw, embedded = _crosslane_publisher_embed(steps)
+                        self.assertEqual(embedded.rstrip("\n"), publisher.rstrip("\n"))
+                        steps = steps.replace(raw, "")
+                    self.assertNotRegex(steps, CROSSLANE_STEP_PUSH)
                 with self.subTest(workflow=name, job=job, check="permissions"):
                     perms = _crosslane_permissions(block, 4)
-                    if job in CROSSLANE_WRITER_JOBS.get(name, ()):
+                    if job in push_models:
                         self.assertIsInstance(perms, dict)
                         self.assertLessEqual(set(perms), CROSSLANE_WRITER_SCOPES)
                         # The authorized push needs a writable contents token.
                         self.assertEqual(perms.get("contents"), "write")
+                    elif job in publishers:
+                        # The publisher pushes with the Claude App token it mints through OIDC (so the
+                        # push triggers CI); the job token itself cannot push.
+                        self.assertIsInstance(perms, dict)
+                        self.assertLessEqual(set(perms), CROSSLANE_WRITER_SCOPES)
+                        self.assertEqual(perms.get("contents"), "read")
+                        self.assertEqual(perms.get("id-token"), "write")
+                    elif job in prepares:
+                        # Prepare may write its reservation and audit comments, never contents, and mints nothing.
+                        self.assertIsInstance(perms, dict)
+                        self.assertLessEqual(set(perms), CROSSLANE_WRITER_SCOPES - {"id-token"})
+                        self.assertEqual(perms.get("contents"), "read")
                     else:
-                        # Read-only: every scope read or none; an absent block inherits the workflow default.
+                        # Read-only (the split model jobs included): every scope read or none; an absent
+                        # block inherits the workflow default.
+                        if job in models:
+                            self.assertIsInstance(perms, dict)
+                            self.assertNotIn("id-token", perms)
                         if isinstance(perms, dict):
                             self.assertLessEqual(set(perms.values()), {"read", "none"})
                         else:
                             self.assertIn(perms, (None, "read-all", "{}"))
                 with self.subTest(workflow=name, job=job, check="no force push"):
                     commands = _crosslane_push_commands(_crosslane_granted(block))
-                    if job in CROSSLANE_WRITER_JOBS.get(name, ()):
+                    if job in push_models:
                         self.assertTrue(commands)
+                    elif job in publishers:
+                        # Exactly the publisher's one ordinary push.
+                        self.assertEqual([" ".join(c.split()) for c in commands], [CROSSLANE_PUBLISH_PUSH])
+                    else:
+                        self.assertEqual(commands, [])
                     for command in commands:
                         self.assertNotRegex(command, CROSSLANE_FORCE)
+        # The publisher pushes only the prepared branch, rechecking pause and head right before it.
+        for name, stages in CROSSLANE_SPLIT.items():
+            blocks = _crosslane_jobs(name)
+            for prepare, _model, publish in stages:
+                with self.subTest(workflow=name, job=publish, check="prepared branch"):
+                    self.assertIn(f"HEAD_REF: ${{{{ needs.{prepare}.outputs.head_ref }}}}", blocks[publish])
+                    self.assertIn(f"HEAD_SHA: ${{{{ needs.{prepare}.outputs.head_sha }}}}", blocks[publish])
+        # One call site of the one push (the other occurrence is its definition).
+        self.assertEqual(publisher.count("push_candidate(repo, config, candidate, token)\n"), 1)
+        before_push = publisher.split("def publish(", 1)[1].split("push_candidate(repo, config, candidate, token)\n", 1)[0]
+        self.assertGreaterEqual(before_push.count("live_head(config, env, read, {config[\"base\"]})"), 2)
+        self.assertLess(before_push.rindex("live_head("), before_push.rindex("token = deps[\"mint\"](env)"))
 
     def test_retries_are_bounded_and_pausable(self) -> None:
         blocks = _crosslane_jobs("claude.yml")
         scan = _crosslane_jobs("conflict-scan.yml")
-        for job in CROSSLANE_WRITER_JOBS["claude.yml"]:
-            with self.subTest(job=job):
+        # CSL-414: the trusted prepare jobs hold the pause, loop-cap and attempt checks; the
+        # model and publish stages run only after an unskipped prepare from the same attempt.
+        for prepare, model, publish in CROSSLANE_SPLIT["claude.yml"]:
+            with self.subTest(job=prepare):
                 # A possibly truncated commit list counts as at the cap.
-                self.assertIn('if [ "$total" -ge 250 ] && [ "$count" -lt 8 ]; then', blocks[job])
-                self.assertIn("CLAUDE_FIXER_PAUSE: ${{ vars.CLAUDE_FIXER_PAUSE }}", blocks[job])
-                self.assertIn('select(. == "claude:pause" or . == "hold")', blocks[job])
+                self.assertIn('if [ "$total" -ge 250 ] && [ "$count" -lt 8 ]; then', blocks[prepare])
+                self.assertIn("CLAUDE_FIXER_PAUSE: ${{ vars.CLAUDE_FIXER_PAUSE }}", blocks[prepare])
+                self.assertIn('select(. == "claude:pause" or . == "hold")', blocks[prepare])
+                for later in (model, publish):
+                    condition = blocks[later].split("\n    steps:", 1)[0]
+                    self.assertIn(f"needs.{prepare}.outputs.skip == 'false'", condition, later)
+                    self.assertIn(f"needs.{prepare}.outputs.run_attempt == github.run_attempt", condition, later)
+            with self.subTest(job=publish):
+                # Publish rechecks the pause variable and live labels right before its push.
+                self.assertIn("CLAUDE_FIXER_PAUSE: ${{ vars.CLAUDE_FIXER_PAUSE }}", blocks[publish])
+                self.assertIn('PAUSE_LABELS = frozenset({"claude:pause", "hold"})', blocks[publish])
         # The eight-commit guard: shell skip in the @claude path, eligibility check in the Devin path.
-        self.assertIn('if [ "$count" -ge 8 ]; then', blocks["claude-mention"])
-        self.assertIn("LOOP_COMMIT_COUNT: ${{ steps.cap.outputs.loop_commit_count }}", blocks["devin-review-fix"])
-        self.assertIn("if int(count) >= 8:", blocks["devin-review-fix"])
+        self.assertIn('if [ "$count" -ge 8 ]; then', blocks["mention-prepare"])
+        self.assertIn("LOOP_COMMIT_COUNT: ${{ steps.cap.outputs.loop_commit_count }}", blocks["fixer-prepare"])
+        self.assertIn("if int(count) >= 8:", blocks["fixer-prepare"])
         # The Devin path reserves at most three automatic attempts per head and finding set.
-        self.assertEqual(re.findall(r"^\s*MAX_ATTEMPTS = (\d+)$", blocks["devin-review-fix"], re.MULTILINE), ["3"])
+        self.assertEqual(re.findall(r"^\s*MAX_ATTEMPTS = (\d+)$", blocks["fixer-prepare"], re.MULTILINE), ["3"])
         self.assertNotRegex(_crosslane_text("claude.yml"), r"MAX_ATTEMPTS = (?!3\b)")
         # The conflict resolver: one push per run, started by scheduled or manual scans only, paused like the rest.
         self.assertIn("Install single-attempt push guard", scan["conflict-resolve"])

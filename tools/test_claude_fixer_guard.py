@@ -533,32 +533,77 @@ class RealGitRaceTests(unittest.TestCase):
             self.assertEqual(git("rev-parse", "refs/heads/fix", cwd=remote).stdout.strip(), candidate)
 
 
+def workflow_job(text, name):
+    """One top-level job of a workflow, from its key to the next job."""
+    body = text.split(f"\n  {name}:\n", 1)[1]
+    return re.split(r"\n  (?=\S)", body, maxsplit=1)[0]
+
+
+# CSL-414 (the CSL-377 split): claude.yml's writers are a trusted prepare, an untrusted
+# model job with no push credential, and a trusted publish job that pushes.
+SPLIT_WRITERS = (("mention-prepare", "claude-mention", "mention-publish"),
+                 ("fixer-prepare", "devin-review-fix", "fixer-publish"))
+
+
 class WorkflowTests(unittest.TestCase):
     def test_workflow_embeds_trusted_guard_and_terminal_after_model_failure(self):
+        # CSL-414: claude.yml installs no pre-push guard because its model jobs cannot push.
+        # The trusted publisher validates, pushes and audits; the guard remains in
+        # conflict-resolve until Port C.
         text = (ROOT / ".github/workflows/claude.yml").read_text(encoding="utf-8")
-        chunks = text.split("<<'CLAUDE_FIXER_GUARD'\n")[1:]
+        self.assertNotIn("CLAUDE_FIXER_GUARD", text)
+        self.assertNotIn("claude-fixer-guard/pre-push", text)
+        publisher = (ROOT / "scripts/ci/claude_fixer_publish.py").read_text(encoding="utf-8").rstrip()
+        chunks = text.split("<<'CLAUDE_FIXER_PUBLISH'\n")[1:]
         self.assertEqual(len(chunks), 2)
         for chunk in chunks:
-            embedded = textwrap.dedent(chunk.split("          CLAUDE_FIXER_GUARD", 1)[0]).rstrip()
-            self.assertEqual(embedded, SOURCE.read_text(encoding="utf-8").rstrip())
-        self.assertEqual(text.count("if: ${{ !cancelled() && steps.push_guard.outcome == 'success'"), 2)
+            embedded = textwrap.dedent(chunk.split("          CLAUDE_FIXER_PUBLISH", 1)[0]).rstrip()
+            self.assertEqual(embedded, publisher)
+        # The terminal audit also runs after a failed model job.
+        for _prepare, model, publish in SPLIT_WRITERS:
+            job = workflow_job(text, publish)
+            header = job.split("    steps:", 1)[0]
+            self.assertIn("!cancelled() &&", header, publish)
+            self.assertIn(f"needs.{model}.result != 'skipped'", header, publish)
+            self.assertIn(f"MODEL_OUTCOME: ${{{{ needs.{model}.outputs.claude_outcome || needs.{model}.result }}}}",
+                          job, publish)
+            self.assertIn('python3 -I "$RUNNER_TEMP/claude-fixer-publish/publish.py"', job, publish)
         self.assertEqual(text.count("timeout-minutes: 20"), 2)
         self.assertEqual(text.count("--max-turns 30"), 2)
-        for index, body in enumerate(text.split("      - id: claude\n")[1:]):
+        bodies = text.split("      - id: claude\n")[1:]
+        self.assertEqual(len(bodies), 2)
+        for index, body in enumerate(bodies):
             allow = body.split("--allowedTools", 1)[1].split("--disallowedTools", 1)[0]
+            disallow = body.split("--disallowedTools", 1)[1].split("\n", 1)[0]
             self.assertNotIn("Bash(gh api", allow)
-            self.assertIn("Bash(python3 ${{ runner.temp }}/claude-fixer-guard/pre-push model-api --:*)", allow)
-            self.assertIn("Bash(gh api:*)", body.split("--disallowedTools", 1)[1])
+            self.assertIn("Bash(python3 ${{ runner.temp }}/claude-fixer-guard/model-api --:*)", allow)
+            self.assertIn("Bash(gh api:*)", disallow)
             for command in ("fetch", "pull", "rebase", "merge", "config"):
                 self.assertNotIn(f"Bash(git {command}", allow)
-            pushes = re.findall(r"Bash\(git push[^)]*\)", allow)
-            step = ("live", "cap")[index]
-            self.assertEqual(pushes, ["Bash(git push origin HEAD:refs/heads/${{ steps." + step + ".outputs.head_ref }})"])
-            for bypass in ("Bash(git -", "Bash(git remote", "--no-verify", "--force", "--dry-run"):
-                self.assertNotIn(bypass, "\n".join(re.findall(r"Bash\(git [^)]*\)", allow)))
-            self.assertIn("If push is rejected or uncertain, STOP", body)
-            self.assertIn("before emitting any addressed receipt", body)
+            # No git rule at all, so no push and no push bypass.
+            self.assertEqual(re.findall(r"Bash\(git [^)]*\)", allow), [])
+            for rule in ("Bash(git push:*)", "Bash(git config:*)", "Bash(git diff --no-index:*)"):
+                self.assertIn(rule, disallow)
+            flat = " ".join(body.split("claude_args:", 1)[0].split())
+            self.assertIn("PUBLISHING: you have no push access and must not try.", flat)
+            self.assertIn(("The workflow posts them only after it has pushed your commits.",
+                           "only after it has pushed your commits and verified the live PR head.")[index], flat)
             self.assertIn("has no Linear, Context7 or Parallel tools", body)
+
+    def test_only_trusted_publish_holds_the_push_credential(self):
+        text = (ROOT / ".github/workflows/claude.yml").read_text(encoding="utf-8")
+        for prepare, model, publish in SPLIT_WRITERS:
+            permissions = {name: workflow_job(text, name).split("    permissions:\n", 1)[1].split("\n    steps:", 1)[0]
+                           .split("\n    outputs:", 1)[0] for name in (prepare, model, publish)}
+            for name, block in permissions.items():
+                self.assertIn("contents: read", block, name)
+                self.assertNotIn("contents: write", block, name)
+            self.assertNotIn("id-token", permissions[prepare], prepare)
+            self.assertNotIn("id-token", permissions[model], model)
+            self.assertNotIn("write", permissions[model], model)
+            # Publish mints the Claude App token through OIDC so its push triggers CI.
+            self.assertIn("id-token: write", permissions[publish], publish)
+            self.assertNotIn("secrets.GITHUB_TOKEN", workflow_job(text, publish), publish)
 
 
 class GuardedWriterJobTests(unittest.TestCase):
@@ -568,20 +613,27 @@ class GuardedWriterJobTests(unittest.TestCase):
             '"Edit(/${{ runner.temp }}/claude-fixer-guard/**)"', '"Write(/${{ runner.temp }}/claude-fixer-guard/**)"')
 
     @staticmethod
-    def jobs():
+    def jobs(marker="<<'CLAUDE_FIXER_GUARD'"):
         found = {}
         for name in ("claude.yml", "conflict-scan.yml"):
             text = (ROOT / ".github/workflows" / name).read_text(encoding="utf-8")
             for chunk in re.split(r"\n  (?=[a-z][a-z-]*:\n)", text.split("\njobs:\n", 1)[1]):
                 job = chunk.split(":\n", 1)[0].strip()
-                if "<<'CLAUDE_FIXER_GUARD'" in chunk:
+                if marker in chunk:
                     found[job] = chunk
         return found
 
+    @classmethod
+    def model_jobs(cls):
+        return cls.jobs("<<'CLAUDE_FIXER_OUTBOX'")
+
     def test_every_guarded_writer_denies_git_and_guard_edits(self):
         jobs = self.jobs()
-        self.assertEqual(sorted(jobs), ["claude-mention", "conflict-resolve", "devin-review-fix"])
-        for name, job in jobs.items():
+        self.assertEqual(sorted(jobs), ["conflict-resolve"])
+        models = self.model_jobs()
+        self.assertEqual(sorted(models), ["claude-mention", "devin-review-fix"])
+        # CSL-414: the claude.yml model jobs keep the same broad .git and guard denies.
+        for name, job in list(jobs.items()) + list(models.items()):
             deny = job.split('"deny": [', 1)[1].split("]", 1)[0]
             for rule in self.DENY:
                 with self.subTest(job=name, rule=rule):
@@ -591,7 +643,7 @@ class GuardedWriterJobTests(unittest.TestCase):
         workflow_deny = {"claude-mention": ('"Edit(.github/workflows/**)"', '"Write(.github/workflows/**)"'),
                          "devin-review-fix": ('"Edit(.github/workflows/**)"', '"Write(.github/workflows/**)"'),
                          "conflict-resolve": ('"Edit(.github/**)"', '"Write(.github/**)"')}
-        jobs = self.jobs()
+        jobs = {**self.jobs(), **self.model_jobs()}
         self.assertEqual(sorted(jobs), sorted(workflow_deny))
         for name, job in jobs.items():
             deny = job.split('"deny": [', 1)[1].split("]", 1)[0]
@@ -635,6 +687,12 @@ class GuardedWriterJobTests(unittest.TestCase):
                                   job.split("      - id: claude\n", 1)[1].split("uses:", 1)[0])
                 else:
                     self.assertNotIn("MODEL_API_LABEL", install)
+        # The claude.yml model jobs queue no label: their writer modes refuse label records.
+        for name, job in self.model_jobs().items():
+            with self.subTest(job=name):
+                self.assertNotIn("MODEL_API_LABEL", job)
+                self.assertNotIn("WRITER_MODE: conflict", job)
+                self.assertIn("WRITER_MODE: " + {"claude-mention": "mention", "devin-review-fix": "fixer"}[name], job)
 
 
 class TerminalReceiptIntegrationTests(unittest.TestCase):
@@ -863,9 +921,16 @@ class TerminalReceiptIntegrationTests(unittest.TestCase):
 
     def test_install_captures_context_and_workflow_uses_trusted_consumer(self):
         text = (ROOT / ".github/workflows/claude.yml").read_text(encoding="utf-8")
-        self.assertIn('cat > "$RUNNER_TEMP/claude-fixer-guard/receipts.py"', text)
-        self.assertIn('python3 "$RUNNER_TEMP/claude-fixer-guard/receipts.py"', text)
-        self.assertEqual(text.count("RECEIPT_CONTEXT: ${{ steps.eligibility.outputs.receipt_context }}"), 1)
+        # CSL-414: fixer-prepare runs the trusted consumer; its eligibility context reaches the
+        # model's outbox helper and the publisher only through the prepare job's output.
+        prepare = workflow_job(text, "fixer-prepare")
+        self.assertIn('cat > "$RUNNER_TEMP/claude-fixer-guard/receipts.py"', prepare)
+        self.assertIn('python3 "$RUNNER_TEMP/claude-fixer-guard/receipts.py"', prepare)
+        self.assertEqual(text.count("receipt_context: ${{ steps.eligibility.outputs.receipt_context }}"), 1)
+        self.assertEqual(text.count("RECEIPT_CONTEXT: ${{ needs.fixer-prepare.outputs.receipt_context }}"), 2)
+        for name in ("devin-review-fix", "fixer-publish"):
+            self.assertIn("RECEIPT_CONTEXT: ${{ needs.fixer-prepare.outputs.receipt_context }}", workflow_job(text, name))
+        self.assertEqual(text.count('cat > "$RUNNER_TEMP/claude-fixer-publish/receipts.py"'), 2)
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp)
             script = path / "pre-push"

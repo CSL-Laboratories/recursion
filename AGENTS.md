@@ -41,11 +41,31 @@ selecting a task.
 
 The loop starts from an objective, feature admission or direction decision approved by a founder acting within `CONTROL_PLANE.md` authority. Within one admitted task (one repository/worktree, explicit allowed paths, explicit non-goals and one machine-checkable gate), an agent runs bounded research, development and tests. It then closes out with independent evidence on the exact candidate. Closeout records the full 40-hex commit tested, the commands and results, unresolved criteria, review evidence and linked follow-ups. An implementer's PASS, a GitHub merge and a Linear **Done** status are never empirical or product acceptance.
 
-When blocked, an agent preserves its work and records the blocker. Blockers go in `state/INBOX.md`. Flag required decision-log entries; `state/DECISIONS.md` remains protected and may be changed only through its separately founder-approved authoring process. A product task grants no permission to write that log. The agent comments on the Linear issue with @mentions, then releases its execution claim by unassigning itself under existing conventions. Releasing the claim does not release the hold. A human-decision hold needs an explicit human decision receipt. A technical or dependency blocker needs evidence that its condition has cleared. Either way, the agent rechecks the gate and readiness and takes a fresh claim before resuming. Product decisions are never inferred from silence, elapsed time, CI results or issue status. A founder merge records its merge decision; it does not itself accept a product fragment or release an unrelated decision hold. Agents do not invent receipts or present their own records as founder statements; the one exception is a developer-approved comment that counts under `CONTROL_PLANE.md` (D-043).
+When blocked, an agent preserves its work and records the blocker. Blockers go in `state/INBOX.md`. Flag required decision-log entries; `state/DECISIONS.md` remains protected and may be changed only through its separately founder-approved authoring process. A product task grants no permission to write that log. The agent comments on the Linear issue with @mentions, then releases its claim with a release record (below). Releasing the claim does not release the hold. A human-decision hold needs an explicit human decision receipt. A technical or dependency blocker needs evidence that its condition has cleared. Either way, the agent rechecks the gate and readiness and takes a fresh claim before resuming. Product decisions are never inferred from silence, elapsed time, CI results or issue status. A founder merge records its merge decision; it does not itself accept a product fragment or release an unrelated decision hold. Agents do not invent receipts or present their own records as founder statements; the one exception is a developer-approved comment that counts under `CONTROL_PLANE.md` (D-043).
 
 Moving to other work means taking only a separately admitted, already-authorised task. That task must be next under an explicit human-approved priority or order. If no such order exists, or it is ambiguous, propose the next choice to the founders on Linear and wait. Do not choose for them.
 
-Ownership is currently manual and human-coordinated through Linear assignment. It is separate from any CI candidate or merge coordination. Record scope, writer, branch/head and handoff evidence on the issue. Before publishing, read the remote head. Preserve uncertain in-flight work and stop on ambiguity. Transactional claims or locks, leases, fencing, WIP enforcement and a shared execution-cost ledger are proposed and unimplemented. Do not treat them as current guarantees. This guide sets no numeric WIP cap; any cap is a separate founder decision.
+Ownership is manual and human-coordinated. The Linear assignee stays the human owner; agents do not assign or unassign themselves. An agent claims execution with a claim record from the CSL-357 agent work protocol (spec draft v7). Claims are separate from any CI candidate or merge coordination. Record scope, writer, branch/head and handoff evidence on the issue. The claim is one agent-prefixed comment on the issue, edited in place afterwards:
+
+```
+Agent (<tool>/<session id>, for <developer>): claim v1
+claim: <random uuid>
+scope: whole issue | sub-issue CSL-M
+branch: <name> @ <head sha>, base <sha>
+confirmed-at: <filled in after read-back>
+heartbeat-at: <filled in on each renewal>
+release-on: done | decision needed | handoff | lease expiry
+```
+
+- **Claim** only admitted work that is next under the human-approved order, has no live claim and is not held. Each claim covers one issue in one repository; a session may hold several claims at once, but no two in a repository may cover the same issue (counting a `sub-issue CSL-M` scope) or name the same branch, and each follows these rules (Lucas's decisions, CSL-357 comments 0cdfd465 and 6749bdcb).
+- **Confirm.** After at least 60 seconds, re-read all comments on the issue, on its parent issue and on any sub-issue your scope covers, then search Linear for your exact branch name in quotes, including archived issues, and read every claim comment the results show. Your claim loses to an earlier live claim on the same issue, and to an earlier claim on another issue in this repository that overlaps it by scope or branch and has not been released, withdrawn, revoked or taken over. The earliest Linear `createdAt` wins; on an exact tie, the lower uuid. The winner sets `confirmed-at`, then moves the issue to **In Progress**. A loser edits its claim to `withdrawn: superseded by <uuid>` and stops. If any of these sources can't be read, don't confirm: read back again later or withdraw. Linear search can lag behind new comments and shows only issues your account can see, so a claim posted moments earlier can still be missed; the read-back reduces overlap but does not prevent it. Make no write (push, PR, label, thread resolve, status change) before `confirmed-at`. Before every write, repeat these reads and read the remote head.
+- **Lease.** Renew `heartbeat-at` at least hourly while working, with the real edit time. The lease runs 2 hours from the claim comment's last Linear `updatedAt`; Linear's timestamps decide, not agent-written times. Once more than 2 hours have passed, make no write until you renew. A renewal up to 2 hours 30 minutes after that `updatedAt` (the lease plus 30 minutes grace) restores the lease; after that, never renew the claim.
+- **Session start or resume.** Before any write, check each claim you hold. If its lease plus grace has passed, release it as lease expiry and never renew it; then re-read the issue and take a fresh claim. `heartbeat-at` is always the actual edit time from a fresh clock read.
+- **Takeover** of an expired claim only when all hold: lease plus grace has passed by `updatedAt`; no commit on the branch is newer than the last heartbeat; and no Actions/CI run started under that claim is in progress. Post `takeover of <uuid>` in your own claim and wait 15 minutes before your first write. Otherwise the owner decides. The owner can revoke a claim with an unprefixed `REVOKE CLAIM <uuid>`.
+- **Release** a claim only after its writers have stopped: nothing left to push under that claim and no job you started for it still running. Work under your other non-overlapping claims does not block the release. Edit the claim to `released`, then post an agent-prefixed `release v1` record with `claim`, `reason` (done, decision needed (CSL-M), handoff, lease expiry or abandoned), `done`, `evidence`, `open`, `next` and `files`.
+- **Commits** an agent makes under a claim carry the trailer `Agent-Claim: <uuid>`; fixer, bot and human commits are exempt (Lucas's decision, CSL-357 comment 1c643648).
+
+These records are conventions, not enforced locks. A comment is not an atomic lock, and authorship is not verifiable while agents post through developer accounts, so a misbehaving agent is made auditable, not prevented. Before publishing, read the remote head. Preserve uncertain in-flight work and stop on ambiguity. Transactional claims or locks, enforced leases, fencing, WIP enforcement and a shared execution-cost ledger are proposed and unimplemented. Do not treat them as current guarantees. This guide sets no numeric WIP cap; any cap is a separate founder decision.
 
 Shared research may be stored in the private [CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research) repository. Storing records there requires a separately admitted task and existing granted access; this guide grants no write route, access or cross-repository scope. The vault is evidence storage, not a supervisor or decision authority. Do not assume published records, a schema or a validator exist there until they are actually present. An exact evidence reference names the repository, full 40-hex commit, record path, claim and limitations. A research record should carry:
 
@@ -101,7 +121,7 @@ Otherwise post one Linear comment @mentioning the issue owner with the question,
 or three options, your recommendation, and what you will do meanwhile ("paused" or
 other proceed-list work, never the option you are asking about or work that
 presupposes one). Record the blocker in `state/INBOX.md` as "Escalate, don't guess"
-requires, release your claim, and take only other admitted work that is next under
+requires, release your claim with a release record, and take only other admitted work that is next under
 the human-approved order.
 
 **Comment labels.** Agents usually post through a developer's account, so start
@@ -127,9 +147,9 @@ developer-approved comment that counts under this rule carries it, or it is in
 check that the marker is present, the comment is unedited and the named developer
 has not disputed it; if any of that is unclear, ask that developer before acting.
 A comment from a founder or developer account that has no agent prefix and was
-posted before this rule took effect (the merge of #247, 2026-10-21T00:39:04Z)
-counts as that person's decision only if they confirm it when asked (Lucas's
-decision, CSL-354 comment 0a86b61c). Agent repetition, silence, a merge or an
+posted before the agent-prefix rule took effect (the merge of #247,
+2026-10-21T00:39:04Z) counts as that person's decision only if they confirm it
+when asked (Lucas's decision, CSL-354 comment 0a86b61c). Agent repetition, silence, a merge or an
 issue auto-closing to Done is not a decision.
 
 **Unattended runs** (loops acting through a developer's account while nobody
@@ -212,6 +232,15 @@ Current tools. Do not add paid services or raise spend limits.
   sensitive needs human approval first.
 - **Context7 MCP** — up-to-date library docs (https://mcp.context7.com/mcp). Works without a
   key. Same two config files, alongside Parallel.
+- **Exa MCP** — substantial deep research: multi-source investigations and `agent_run`
+  research tasks. Parallel stays the default for quick lookups and current web facts.
+  Declared in `.cursor/mcp.json` and `.mcp.json` (https://mcp.exa.ai/mcp). The key goes in
+  the `x-api-key` header from env var `EXA_API_KEY` (Cursor `${env:EXA_API_KEY}`, Claude
+  Code `${EXA_API_KEY:-}`; with no key, Exa runs in its free rate-limited mode) and lives
+  only in each environment's secret settings, never in tracked files, prompts, chat or
+  logs. Capped at $50 per person per month (Lucas's decision, CSL-378 comment ff7227ac).
+  Start a billable run only when it keeps you under the cap, and record each run's cost in
+  its research record. Same query rules as Parallel.
 - **Linear** — source of truth for work. Workspace **CSL laboratories**, team key **CSL**,
   project **recursion**. Use the Linear MCP (`https://mcp.linear.app/mcp`) or the Devin
   Linear integration. Declared in `.cursor/mcp.json` and `.mcp.json`.
@@ -243,10 +272,12 @@ protected paths, and merge still follow `CONTROL_PLANE.md`.
 
 **Before starting.** Find or create the issue (team **CSL**, project **recursion**) via the
 Linear MCP or the Devin Linear integration. Do not start code without `CSL-N`. When you
-start, assign yourself and move the issue to **In Progress**; unassign if you stop.
+start, post a claim record ([Bounded issue execution](#bounded-issue-execution-and-shared-evidence));
+the owner stays the assignee. Move the issue to **In Progress** once your claim is
+confirmed. If you stop, release with a release record.
 
-**Direction and architecture.** When you are the assignee (developer or their
-coding agent working in the repo) of an issue that needs a decision or sets
+**Direction and architecture.** When you are the assignee or claimant (developer or
+their coding agent working in the repo) of an issue that needs a decision or sets
 direction, run Parallel Task API deep research before proposing, in
 addition to Search/Extract. Post the cited brief (options, tradeoffs,
 recommendation, target metrics) on the Linear issue. The developer decides,
@@ -259,8 +290,10 @@ not decide.
   A GitHub username prefix is optional (`chaandansaini101/csl-26-short-slug`).
 - PR title includes `CSL-N` so Linear auto-links. pr-lint matches `CSL-[0-9]+`
   case-sensitively, so a lowercase branch name alone does not pass. The `CSL-N`
-  key in the PR title satisfies the check. Put `Fixes CSL-N` in the PR body —
-  that links the PR, and merging moves the issue to **Done** automatically.
+  key in the PR title satisfies the check. Put `Fixes CSL-N` in the PR body when
+  the PR completes the issue's acceptance criteria — that links the PR, and
+  merging moves the issue to **Done** automatically. When scope or decisions
+  remain, put `Related to CSL-N` instead, so the PR links without closing the issue.
 - One issue per PR; keep PRs small and stackable.
 - Comment progress on the issue. If the PR does not move the issue to **In Review**, move
   it yourself.
@@ -326,6 +359,8 @@ Linear is the team's primary async channel, alongside Google Meet and Discord.
   shares its owner's GitHub API budget, and the job fails closed when that budget runs
   out. The required checks decide. No token or workflow change for now (Lucas's
   decision, CSL-390 comment 242120cc).
+- A new `tools/test_*.py` file also needs its two `.claude/settings.json` allow rules,
+  which a founder approves in the PR; the Claude fixer must not add them.
 
 Trigger CI and reviews through the Discord bot (`/ci full|run`, `/devin review
 pr:<url>|run|status`, or MCP `ci_full` / `ci_run` / `devin_review`) or the `ci:full`

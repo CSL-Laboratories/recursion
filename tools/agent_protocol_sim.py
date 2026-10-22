@@ -42,6 +42,22 @@ comment whose first line ends with `claim v1`. Its `scope:` is `whole issue`
 or `sub-issue CSL-N`, which also covers that sub-issue of the claimed issue;
 it may name several claims to take over, one `takeover of <uuid>` line each,
 and `takeovers` in the result gives each one's outcome under `targets`.
+A claim that lost its issue race, or lost at read-back to an earlier claim
+from any session that overlaps it, is a settled loser (D15 as amended,
+CSL-446): it never becomes winner or holder, even after the claim that beat it
+ends, its writes are reported, and it blocks no other claim.
+A release is recorded by a `release v1` record: an agent comment with a
+complete prefix on the claim's issue, whose first line ends with `release v1`
+when posted, made at or after the `released` edit, and not deleted. Its latest
+revision has `claim: <uuid>`, a `reason` of done, handoff, lease expiry,
+abandoned or `decision needed (CSL-N)`, and non-empty `done`, `evidence`,
+`open`, `next` and `files`. A key line starts at the line's beginning and is the
+exact key, optionally followed by one ` (note)`, then `:`; its value runs to the
+next key line, and the first occurrence of a key counts. A reason may also end
+with one ` (note)` (Lucas's decisions, CSL-445 comments 0d05a0b0 and 12051696).
+A released claim without a valid record is reported as `release_without_record`.
+A claim withdrawn, revoked or deleted by the time of its release, or deleted at
+no known time, needs none.
 Human lines (`REVOKE CLAIM`, `HOLD`, `DECISION:`, batched `CSL-N: X; ...`,
 `ACK TAKEOVER`, `Standing approval SA-n`, `REVOKE SA-n`) count only in
 comments without the agent prefix, and keep the effect they had before a known
@@ -64,6 +80,14 @@ the recursion#247 merge; null turns the check off) does not count: it is
 reported as `decision_unverified` and its lines as void, because nothing shows
 a human rather than an agent wrote it (CSL-417, option A; confirmation is not
 modelled). `confirmed-at:` holds a timestamp or a placeholder in parentheses.
+
+A claim's lease runs from its comment's last edit. An expired claim is never
+renewed (CSL-379): an edit made after lease plus grace, other than a release, a
+withdrawal or an objection inside a takeover's wait, is reported as
+`renewed_after_expiry` and leaves the claim expired. A timestamp `heartbeat-at`
+more than `heartbeat_tolerance_seconds` (default 120, which allows for the delay
+between reading the clock and the edit landing) from the time of the edit that
+set it is reported as `heartbeat_time_mismatch`; other values are not checked.
 """
 from __future__ import annotations
 
@@ -84,12 +108,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "standing_approvals_issue": None,
     "sa_max_days": 90,
     "approval_window_minutes": 15,
+    "heartbeat_tolerance_seconds": 120,
     # Lucas's DECISION on CSL-417 (comment e6d37489): the recursion#247 merge, when the agent-prefix rule took effect.
     "agent_prefix_since": "2026-10-21T00:39:04Z",
 }
 
 AGENT_PREFIX = re.compile(r"^Agent \(([^)]*)\):")
 CLAIM_HEADER = re.compile(r"claim v1\s*$")
+RELEASE_HEADER = re.compile(r"release v1\s*$")
+RECORD_KEYS = ("claim", "reason", "done", "evidence", "open", "next", "files")
+# The lookahead keeps an unclosed "(" from backtracking over the rest of the line.
+NOTE = r"(?: \((?=[^()\n]*[^()\s])[^()\n]*\))?"
+RECORD_KEY = re.compile(rf"^({'|'.join(RECORD_KEYS)}){NOTE}:(.*)$")
+RELEASE_REASON = re.compile(rf"^(?:done|handoff|lease expiry|abandoned|decision needed \(CSL-[0-9]+\)){NOTE}$")
 FIELD = re.compile(r"^([a-z-]+):\s*(.*)$")
 ISSUE_ID = re.compile(r"^CSL-[0-9]+$")
 UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
@@ -135,7 +166,10 @@ def parse_ts(value: Any, where: str) -> datetime:
         raise SnapshotError(f"{where}: bad timestamp {value!r}") from exc
     if parsed.tzinfo is None:
         raise SnapshotError(f"{where}: timestamp {value!r} has no UTC offset")
-    return parsed.astimezone(timezone.utc)
+    try:
+        return parsed.astimezone(timezone.utc)
+    except OverflowError as exc:
+        raise SnapshotError(f"{where}: timestamp {value!r} is out of range in UTC") from exc
 
 
 def require(mapping: Any, key: str, where: str) -> Any:
@@ -211,9 +245,6 @@ class Comment:
         # adding or removing the prefix.
         return len({agent_header(r.body) for r in self.revisions}) > 1
 
-    def last_update(self, at: datetime) -> datetime:
-        return max(r.at for r in self.revisions if r.at <= at)
-
 
 @dataclasses.dataclass
 class Claim:
@@ -281,6 +312,25 @@ def claim_fields(body: str) -> dict[str, Any]:
     return fields
 
 
+def release_record_fields(body: str) -> dict[str, str]:
+    """Field values of a `release v1` record body, after its first line.
+
+    A value is the rest of its key line plus every line up to the next key
+    line, so bullets under `evidence:` belong to it. Only the first occurrence
+    of a key counts; a later one still ends the field before it.
+    """
+    fields: dict[str, list[str]] = {}
+    current: list[str] = []  # text before the first key line is not kept
+    for line in body.split("\n")[1:]:
+        match = RECORD_KEY.match(line)
+        if match is None:
+            current.append(line)
+            continue
+        current = [match.group(2)]
+        fields.setdefault(match.group(1), current)
+    return {key: "\n".join(lines).strip() for key, lines in fields.items()}
+
+
 @dataclasses.dataclass
 class StandingApproval:
     sa: str
@@ -343,7 +393,8 @@ class Evaluation:
         self.config = {**DEFAULT_CONFIG, **config}
         # Lucas's DECISION on CSL-411 (comment 8cda521b): the approval window never exceeds 15 minutes.
         for key, limit in (("lease_minutes", 10**6), ("grace_minutes", 10**6), ("readback_seconds", 10**6),
-                           ("takeover_wait_minutes", 10**6), ("sa_max_days", 10**6), ("approval_window_minutes", 15)):
+                           ("takeover_wait_minutes", 10**6), ("sa_max_days", 10**6), ("approval_window_minutes", 15),
+                           ("heartbeat_tolerance_seconds", 10**6)):
             value = self.config[key]
             if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= limit:
                 raise SnapshotError(f"config: {key} must be an integer from 0 to {limit}")
@@ -357,13 +408,20 @@ class Evaluation:
         self.grace = timedelta(minutes=self.config["grace_minutes"])
         self.readback = timedelta(seconds=self.config["readback_seconds"])
         self.takeover_wait = timedelta(minutes=self.config["takeover_wait_minutes"])
+        self.heartbeat_tolerance = timedelta(seconds=self.config["heartbeat_tolerance_seconds"])
         self._revoked: dict[str, datetime | None] = {}
-        self._winners: dict[tuple[str, str, datetime], Claim | None] = {}
+        # Race winners are cached per settlement horizon (`horizon_at`), so a
+        # winner found under one horizon is never reused under another.
+        self._winners: dict[tuple[str, str, datetime, datetime | None], Claim | None] = {}
+        self._losses: dict[tuple[str, str], Claim | None] = {}
+        self._horizon: datetime | None = None
         self.violations: list[dict[str, Any]] = []
         self.void_lines: list[dict[str, str]] = []
         self.issues = self._load_issues(require(snapshot, "issues", "snapshot"))
         self.comments = self._load_comments(require(snapshot, "comments", "snapshot"))
         self.claims = self._load_claims()
+        self.release_records = self._load_release_records()
+        self.late_renewals = {uuid: self._late_renewals(claim) for uuid, claim in self.claims.items()}
         self.commits = self._load_list(snapshot, "commits", ("sha", "branch", "at", "author_kind"))
         self.writes = self._load_list(snapshot, "writes", ("kind", "issue", "claim", "at"))
         self.runs = self._load_list(snapshot, "runs", ("id", "claim", "started_at"))
@@ -659,6 +717,63 @@ class Evaluation:
             )
         return claims
 
+    def _load_release_records(self) -> dict[str, list[tuple[Comment, dict[str, str]]]]:
+        """Release records by the claim they name, with their fields.
+
+        As with claim records, only the first line of the comment as posted
+        makes it a record, so a record quoted inside another comment is not
+        one, and a developer-approved comment, which loses its prefix at load,
+        is not one either. A malformed record is not a snapshot error: it counts
+        for no claim.
+        """
+        records: dict[str, list[tuple[Comment, dict[str, str]]]] = {}
+        for comment in self.comments:
+            if comment.deleted:
+                continue
+            first = comment.revisions[0].body.split("\n", 1)[0]
+            header = agent_header(first)
+            if header is None or not RELEASE_HEADER.search(first):
+                continue
+            tool, slash, session = header[0].partition("/")
+            if not (tool.strip() and slash and session.strip() and header[1]):
+                continue
+            fields = release_record_fields(comment.body)
+            records.setdefault(fields.get("claim", ""), []).append((comment, fields))
+        return records
+
+    def _late_renewals(self, claim: Claim) -> list[Revision]:
+        """Edits that tried to renew `claim` after its lease plus grace had passed.
+
+        An expired claim is never renewed (CSL-379): such an edit does not
+        count as a heartbeat, so the claim stays expired and a fresh claim or
+        takeover is still needed. A release or withdrawal is the right answer
+        to expiry and ends the scan. An edit inside a takeover's wait is the
+        original claimant's objection to that takeover, which the takeover
+        rules handle, so it still counts; this includes a premature takeover,
+        which is refused and reported as such.
+        """
+        takers = [
+            other.created_at for other in self.claims.values()
+            if claim.uuid in other.takeovers and other.issue == claim.issue and other.repo == claim.repo
+        ]
+        last = claim.comment.revisions[0].at
+        late = []
+        for revision in claim.comment.revisions[1:]:
+            fields = claim_fields(revision.body)
+            if fields.get("_released") or "withdrawn" in fields:
+                break
+            objection = any(posted <= revision.at <= posted + self.takeover_wait for posted in takers)
+            if revision.at > last + self.lease + self.grace and not objection:
+                late.append(revision)
+            else:
+                last = revision.at
+        return late
+
+    def last_renewal(self, claim: Claim, at: datetime) -> datetime:
+        """The claim comment's last update at `at` that counts as a heartbeat."""
+        late = self.late_renewals.get(claim.uuid, [])
+        return max(r.at for r in claim.comment.revisions if r.at <= at and not any(r is x for x in late))
+
     # Helpers ---------------------------------------------------------------
 
     def violation(self, code: str, issue: str | None = None, claim: str | None = None, detail: str = "") -> None:
@@ -712,7 +827,7 @@ class Evaluation:
         ):
             if when is not None and when <= at:
                 return label
-        if at > claim.comment.last_update(at) + self.lease:
+        if at > self.last_renewal(claim, at) + self.lease:
             return "expired"
         return None
 
@@ -820,15 +935,34 @@ class Evaluation:
             moments.update(r.at for r in comment.revisions if start < r.at <= at)
             if comment.deleted_at is not None and start < comment.deleted_at <= at:
                 moments.add(comment.deleted_at)
+        # A taker that lost its own overlap or race never held its issue, so
+        # its takeover cannot clear the claims it named.
         return any(
             self.ended(taker, moment) is None and self.takeover_status(taker, moment)["allowed"]
+            and not self.lost_by(taker, moment)
             for moment in sorted(moments)
+        )
+
+    def lost_by(self, taker: Claim, moment: datetime) -> bool:
+        """Whether `taker` had lost by `moment`, for `took_effect`.
+
+        A race lost at the instant the takeover wait ends counts against the
+        taker, so the race counts from its own settle instant; the overlap, as
+        in `settled_loss`, only once settled before the moment (Samir, PR #282
+        comment 4347949974). While a part is being settled, only parts settled
+        strictly before it count, so a part never asks for itself.
+        """
+        return any(
+            self._settled(taker, kind, when) is not None
+            for kind, when in self.settle_times(taker)
+            if (when <= moment if kind == "race" else when < moment)
+            and (self._horizon is None or when < self._horizon)
         )
 
     def posting_refusal(self, claim: Claim, old: Claim) -> dict[str, Any] | None:
         """Why a takeover of a still-held `old` was not allowed when posted, or None."""
         posted = claim.created_at
-        last = old.comment.last_update(posted)
+        last = self.last_renewal(old, posted)
         if posted <= last + self.lease + self.grace:
             return {"allowed": False, "reason": "lease plus grace not passed"}
         newer = [
@@ -845,10 +979,25 @@ class Evaluation:
             return {"allowed": False, "reason": "claimant run in progress"}
         return None
 
+    def horizon_at(self, at: datetime) -> datetime:
+        """The settlement horizon for a race or live set evaluated at `at`:
+        only loss parts settled strictly before it count (Samir, PR #282
+        comment 4347949974). Inside a part's settlement it never moves later."""
+        return at if self._horizon is None else min(self._horizon, at)
+
     def live_claims(self, issue: str, repo: str, at: datetime) -> list[Claim]:
+        """The claims live on the issue at `at` that may win its race. Like
+        the race, this counts only loss parts settled strictly before `at`."""
+        outer, self._horizon = self._horizon, self.horizon_at(at)
+        try:
+            return self._live_claims(issue, repo, at)
+        finally:
+            self._horizon = outer
+
+    def _live_claims(self, issue: str, repo: str, at: datetime) -> list[Claim]:
         candidates = [
             c for c in self.claims.values()
-            if c.issue == issue and c.repo == repo and self.ended(c, at) is None
+            if c.issue == issue and c.repo == repo and self.ended(c, at) is None and self.settled_loss(c, at) is None
         ]
         superseded = set()
         refused = set()
@@ -863,27 +1012,54 @@ class Evaluation:
                 for other in self.claims.values()
             )
             status = self.takeover_status(claim, at)
-            if bypasses or self.lost_to_expired(claim, at) or (status is not None and not status["allowed"]):
+            if bypasses or (status is not None and not status["allowed"]):
                 refused.add(claim.uuid)
             elif status is not None:
                 superseded.update(status["of"])
         return [c for c in candidates if c.uuid not in superseded and c.uuid not in refused]
 
-    def lost_to_expired(self, claim: Claim, at: datetime) -> bool:
-        """True if `claim` lost the race to a claim that has since expired.
+    def settled_loss(self, claim: Claim, at: datetime) -> Claim | None:
+        """The claim that `claim` lost to, if that loss was settled before `at`.
 
-        A claim that lost and never withdrew cannot win when the winner
-        expires; it must take that claim over (decision 3, CSL-389 comment
-        425b223c). The race is settled when the claim could first be live.
+        A claim that lost its issue race, or lost at read-back to an earlier
+        overlapping claim from any session, stays a settled loser. It never
+        becomes winner or holder, even after the claim that beat it ends, and
+        it blocks no one; it must withdraw and post a fresh claim (D15 as
+        amended by Lucas's decision, CSL-446 comment 2b10e162). The overlap is
+        settled at the end of the read-back window, the race when the claim
+        could first be live.
         """
-        settled_at = self.settles_at(claim)
-        if settled_at >= at:
-            return False
-        settled = self.winner(claim.issue, claim.repo, settled_at)
-        return (
-            settled is not None and settled.uuid != claim.uuid and settled.uuid not in claim.takeovers
-            and self.ended(settled, at) == "expired"
-        )
+        lost = None
+        for kind, when in self.settle_times(claim):
+            if when < at and (self._horizon is None or when < self._horizon):
+                lost = lost or self._settled(claim, kind, when)
+        return lost
+
+    def settle_times(self, claim: Claim) -> tuple[tuple[str, datetime], ...]:
+        """When each part of a possible loss is settled: an overlap at the
+        end of the read-back window, the race when the claim could first be
+        live."""
+        return (("overlap", claim.created_at + self.readback), ("race", self.settles_at(claim)))
+
+    def _settled(self, claim: Claim, kind: str, when: datetime) -> Claim | None:
+        """One part of `settled_loss`, decided at `when` and cached. While it
+        is decided, `when` is the settlement horizon: only parts settled
+        strictly before it count, in `settled_loss` and `took_effect` alike, so
+        the part never reads itself and its value does not depend on who asks."""
+        key = (claim.uuid, kind)
+        if key not in self._losses:
+            outer, self._horizon = self._horizon, when
+            try:
+                if kind == "race":
+                    won = self.winner(claim.issue, claim.repo, when)
+                    beaten = won is not None and won.uuid != claim.uuid and won.uuid not in claim.takeovers
+                    self._losses[key] = won if beaten else None
+                else:
+                    blocker = self.earlier_overlap(claim, when)
+                    self._losses[key] = blocker[0] if blocker else None
+            finally:
+                self._horizon = outer
+        return self._losses[key]
 
     def settles_at(self, claim: Claim) -> datetime:
         """When the claim's race is decided: the end of the read-back window,
@@ -893,11 +1069,78 @@ class Evaluation:
         return claim.created_at + self.readback
 
     def winner(self, issue: str, repo: str, at: datetime) -> Claim | None:
-        key = (issue, repo, at)
+        key = (issue, repo, at, self.horizon_at(at))
         if key not in self._winners:
             live = self.live_claims(issue, repo, at)
             self._winners[key] = min(live, key=lambda c: (c.created_at, c.uuid)) if live else None
         return self._winners[key]
+
+    def holder(self, issue: str, repo: str, at: datetime) -> Claim | None:
+        """The race winner, unless an earlier claim, from this or another
+        session, blocks it by scope or branch. The race itself stays on the
+        unfiltered live claims, so a later claim on the issue loses to the
+        blocked one until that claim's loss is settled at its read-back
+        deadline (`settled_loss`). With no unblocked winner, a parent claim whose
+        `scope: sub-issue` covers the issue holds it if that parent claim
+        holds its own issue; otherwise nobody holds the issue."""
+        winner = self.winner(issue, repo, at)
+        if winner is not None and self.earlier_overlap(winner, at) is None:
+            return winner
+        for parent in self.covering_claims(issue, repo, at):
+            if self.winner(parent.issue, repo, at) is parent and self.earlier_overlap(parent, at) is None:
+                return parent
+        return None
+
+    def covering_claims(self, issue: str, repo: str, at: datetime) -> list[Claim]:
+        """Live claims on other issues whose `scope: sub-issue` covers `issue`."""
+        return sorted(
+            (c for c in self.claims.values()
+             if c.repo == repo and c.issue != issue and issue in c.scope_issues(self.issues)
+             and c in self.live_claims(c.issue, repo, at)),
+            key=lambda c: (c.created_at, c.uuid),
+        )
+
+    def overlap(self, claim: Claim, other: Claim) -> str | None:
+        """How two claims in one repository on different issues overlap:
+        `scope` when their covered issues intersect (a `scope: sub-issue`
+        child counts, in either order), `branch` when they name the same
+        branch, or None. Claims on the same issue race instead (`winner`)."""
+        if other.uuid == claim.uuid or other.repo != claim.repo or other.issue == claim.issue:
+            return None
+        if set(claim.scope_issues(self.issues)) & set(other.scope_issues(self.issues)):
+            return "scope"
+        if other.branch == claim.branch:
+            return "branch"
+        return None
+
+    def blocks_overlap(self, other: Claim, at: datetime, settled_losers: bool = False) -> bool:
+        """True if `other` still blocks an overlapping claim at `at`: it is
+        live, or it expired without a release, withdrawal, revoke, deletion
+        or a takeover that took effect, as on a single issue. A settled loser
+        blocks no one, unless `settled_losers` asks for the session check."""
+        if not settled_losers and self.settled_loss(other, at) is not None:
+            return False
+        state = self.ended(other, at)
+        if state == "expired":
+            return not any(
+                other.uuid in t.takeovers and t.created_at <= at and self.took_effect(t, at)
+                for t in self.claims.values()
+            )
+        return state is None
+
+    def earlier_overlap(self, claim: Claim, at: datetime, other_sessions: bool = False) -> tuple[Claim, str] | None:
+        """The earliest claim posted before `claim` that still blocks it at
+        `at` and overlaps it, with how. A claim `claim` takes over does not
+        count."""
+        found = sorted(
+            (other for other in self.claims.values()
+             if (other.created_at, other.uuid) < (claim.created_at, claim.uuid)
+             and (not other_sessions or other.session != claim.session)
+             and other.uuid not in claim.takeovers
+             and self.overlap(claim, other) is not None and self.blocks_overlap(other, at)),
+            key=lambda c: (c.created_at, c.uuid),
+        )
+        return (found[0], self.overlap(claim, found[0])) if found else None
 
     # Decisions -------------------------------------------------------------
 
@@ -1201,6 +1444,9 @@ class Evaluation:
                 self.violation("scope_not_a_child", claim.issue, claim.uuid, claim.child)
             if any(self.held_at(scoped, claim.created_at) for scoped in claim.scope_issues(self.issues)):
                 self.violation("claim_on_held_scope", claim.issue, claim.uuid)
+            for late in self.late_renewals[claim.uuid]:
+                self.violation("renewed_after_expiry", claim.issue, claim.uuid, late.at.isoformat())
+            self.check_heartbeat_times(claim)
             confirmed = claim.confirmed_at()
             edited = claim.confirm_edit_at()
             if edited is not None and edited - claim.created_at < self.readback:
@@ -1214,13 +1460,38 @@ class Evaluation:
                     self.violation("loser_not_withdrawn", claim.issue, claim.uuid, f"winner {settled.uuid}")
             self.check_implicit_takeover(claim)
             self.check_takeover_refused(claim)
+            # A session may hold several claims in a repository (Lucas's
+            # decision, CSL-357 comment 0cdfd465), but no two of them may cover
+            # the same issue, counting `scope: sub-issue` children, or name the
+            # same branch.
+            covered = set(claim.scope_issues(self.issues))
             others = [
                 other for other in self.claims.values()
                 if other.uuid != claim.uuid and other.session == claim.session and other.repo == claim.repo
-                and (other.created_at, other.uuid) < (claim.created_at, claim.uuid) and self.ended(other, claim.created_at) is None
+                and (covered & set(other.scope_issues(self.issues)) or other.branch == claim.branch)
+                and (other.created_at, other.uuid) < (claim.created_at, claim.uuid)
+                # An expired claim the session never released still counts on
+                # another issue, as across sessions; on the same issue the
+                # implicit-takeover check reports it instead.
+                and (self.ended(other, claim.created_at) is None if other.issue == claim.issue
+                     else self.blocks_overlap(other, claim.created_at, settled_losers=True))
             ]
             if others:
                 self.violation("multiple_claims_per_session", claim.issue, claim.uuid, f"also holds {others[0].uuid}")
+            # Across sessions, a claim that overlaps an earlier live claim in
+            # the repository by scope or branch loses as in a race: it must
+            # withdraw at read-back instead of confirming. As with a race, the
+            # loss is settled at the read-back deadline, so a later release by
+            # the blocker does not erase it; a confirmation is also checked at
+            # its own time.
+            settled_overlap = self.earlier_overlap(claim, deadline, other_sessions=True) if deadline <= self.now else None
+            blocker = None
+            if settled_overlap is not None and (confirmed is not None or claim.withdrawn_at() is None):
+                blocker = settled_overlap
+            elif confirmed is not None:
+                blocker = self.earlier_overlap(claim, confirmed, other_sessions=True)
+            if blocker is not None:
+                self.violation("overlapping_claim", claim.issue, claim.uuid, f"{blocker[1]} overlaps {blocker[0].uuid}")
             released = claim.released_at()
             if released is not None:
                 for run in self.runs:
@@ -1228,6 +1499,56 @@ class Evaluation:
                         run.get("ended_at") is None or run["ended_at"] > released
                     ):
                         self.violation("release_before_writers_stopped", claim.issue, claim.uuid, run["id"])
+                self.check_release_record(claim, released)
+
+    def check_release_record(self, claim: Claim, released: datetime) -> None:
+        """Report a release without a valid `release v1` record (CSL-445).
+
+        Only a claim that ended by its release needs one: a withdrawal, revoke
+        or deletion by the time of the release, or a deletion at an unknown
+        time, means it does not. With several records one valid one is enough;
+        otherwise the detail describes the most complete, the earliest on a tie.
+        """
+        if self.ended(claim, released) != "released":
+            return
+        revoked = self.revoked_at(claim)
+        if revoked is not None and revoked <= released:
+            return
+        best = None
+        for comment, fields in self.release_records.get(claim.uuid, []):
+            if comment.issue != claim.issue or comment.created_at < released:
+                continue
+            missing = sorted(key for key in RECORD_KEYS[2:] if not fields.get(key))
+            bad_reason = not RELEASE_REASON.match(fields.get("reason", ""))
+            rank = (len(missing) + bad_reason, comment.created_at, comment.id)
+            if best is None or rank < best[0]:
+                best = (rank, missing, bad_reason)
+        if best is None:
+            detail = "no record"
+        elif best[0][0] == 0:
+            return
+        else:
+            parts = [f"missing: {', '.join(best[1])}"] if best[1] else []
+            detail = "; ".join(parts + (["invalid reason"] if best[2] else []))
+        self.violation("release_without_record", claim.issue, claim.uuid, detail)
+
+    def check_heartbeat_times(self, claim: Claim) -> None:
+        """Report a timestamp `heartbeat-at` that is not the time of the edit
+        that set it. Only a changed value is checked, since later edits carry
+        the old line along; a value that is not a timestamp is not checked."""
+        previous = None
+        for revision in claim.comment.revisions:
+            value = claim_fields(revision.body).get("heartbeat-at")
+            if value and value != previous and TIMESTAMP_VALUE.match(value):
+                try:
+                    declared = parse_ts(value, f"claim {claim.uuid}: heartbeat-at")
+                except SnapshotError:
+                    previous = value
+                    continue  # not a complete timestamp, so not checked
+                if abs(declared - revision.at) > self.heartbeat_tolerance:
+                    self.violation("heartbeat_time_mismatch", claim.issue, claim.uuid,
+                                   f"{value} on the edit at {revision.at.isoformat()}")
+            previous = value
 
     def posting_fault(self, claim: Claim, target: str) -> str | None:
         """Why taking over `target` was not allowed when the claim was posted, or None.
@@ -1322,6 +1643,10 @@ class Evaluation:
                 continue
             if claim.takeovers and at < claim.created_at + self.takeover_wait:
                 self.violation("takeover_wrote_too_early", claim.issue, claim.uuid, what)
+                continue
+            if (blocker := self.earlier_overlap(claim, at)) is not None:
+                self.violation("write_while_overlapping", claim.issue, claim.uuid,
+                               f"{what}: {blocker[1]} overlaps {blocker[0].uuid}")
                 continue
             winner = self.winner(claim.issue, claim.repo, at)
             if winner is None or winner.uuid != claim.uuid:
@@ -1422,6 +1747,15 @@ class Evaluation:
         )
 
     def run(self) -> dict[str, Any]:
+        # Settle every part of every loss in order of its settle time. A part
+        # reads only parts settled strictly earlier, so each one finds them
+        # cached instead of recursing down a long chain.
+        parts = sorted(
+            (when, kind, claim.created_at, claim.uuid, claim)
+            for claim in self.claims.values() for kind, when in self.settle_times(claim) if when < self.now
+        )
+        for when, kind, _, _, claim in parts:
+            self._settled(claim, kind, when)
         decisions = self._decisions = self.decisions()
         held = {issue_id: self.held_at(issue_id, self.now) for issue_id in self.issues}
         self.collect_void_lines()
@@ -1439,8 +1773,10 @@ class Evaluation:
         for issue_id in sorted(self.issues):
             per_repo = {}
             for repo in repos:
-                live = self.live_claims(issue_id, repo, self.now)
-                winner = self.winner(issue_id, repo, self.now)
+                # A live parent claim scoped to this issue covers it too, so the
+                # issue is not reported as claimable (Codex 4343468463).
+                live = self.live_claims(issue_id, repo, self.now) + self.covering_claims(issue_id, repo, self.now)
+                winner = self.holder(issue_id, repo, self.now)
                 if not live and not any(c.issue == issue_id and c.repo == repo for c in self.claims.values()):
                     continue
                 per_repo[repo] = {
@@ -1452,12 +1788,19 @@ class Evaluation:
                 c.uuid: self.takeover_status(c)
                 for c in self.claims.values() if c.issue == issue_id and c.takeovers
             }
+            # A parent claim scoped to this issue that still blocks it (for
+            # example, expired but never released) leaves it unclaimable, as
+            # the overlap check would flag a new claim (Codex 4343611603).
+            covered = any(
+                c.issue != issue_id and issue_id in c.scope_issues(self.issues) and self.blocks_overlap(c, self.now)
+                for c in self.claims.values()
+            )
             issues[issue_id] = {
                 "claims": per_repo,
                 "held": bool(held[issue_id]),
                 "hold_reasons": held[issue_id],
                 "claimable": self.issues[issue_id]["admitted"] and self.issues[issue_id]["next_in_order"]
-                and not held[issue_id] and not any(v["live_claims"] for v in per_repo.values()),
+                and not held[issue_id] and not any(v["live_claims"] for v in per_repo.values()) and not covered,
                 "takeovers": takeovers,
             }
         return {

@@ -410,8 +410,11 @@ class Evaluation:
         self.takeover_wait = timedelta(minutes=self.config["takeover_wait_minutes"])
         self.heartbeat_tolerance = timedelta(seconds=self.config["heartbeat_tolerance_seconds"])
         self._revoked: dict[str, datetime | None] = {}
-        self._winners: dict[tuple[str, str, datetime], Claim | None] = {}
+        # Race winners are cached per settlement horizon (`horizon_at`), so a
+        # winner found under one horizon is never reused under another.
+        self._winners: dict[tuple[str, str, datetime, datetime | None], Claim | None] = {}
         self._losses: dict[tuple[str, str], Claim | None] = {}
+        self._horizon: datetime | None = None
         self.violations: list[dict[str, Any]] = []
         self.void_lines: list[dict[str, str]] = []
         self.issues = self._load_issues(require(snapshot, "issues", "snapshot"))
@@ -933,13 +936,27 @@ class Evaluation:
             if comment.deleted_at is not None and start < comment.deleted_at <= at:
                 moments.add(comment.deleted_at)
         # A taker that lost its own overlap or race never held its issue, so
-        # its takeover cannot clear the claims it named. As in `settled_loss`,
-        # a loss counts only once settled strictly before the moment, so this
-        # never asks for a part at the instant it is being settled.
+        # its takeover cannot clear the claims it named.
         return any(
             self.ended(taker, moment) is None and self.takeover_status(taker, moment)["allowed"]
-            and self.settled_loss(taker, moment) is None
+            and not self.lost_by(taker, moment)
             for moment in sorted(moments)
+        )
+
+    def lost_by(self, taker: Claim, moment: datetime) -> bool:
+        """Whether `taker` had lost by `moment`, for `took_effect`.
+
+        A race lost at the instant the takeover wait ends counts against the
+        taker, so the race counts from its own settle instant; the overlap, as
+        in `settled_loss`, only once settled before the moment (Samir, PR #282
+        comment 4347949974). While a part is being settled, only parts settled
+        strictly before it count, so a part never asks for itself.
+        """
+        return any(
+            self._settled(taker, kind, when) is not None
+            for kind, when in self.settle_times(taker)
+            if (when <= moment if kind == "race" else when < moment)
+            and (self._horizon is None or when < self._horizon)
         )
 
     def posting_refusal(self, claim: Claim, old: Claim) -> dict[str, Any] | None:
@@ -962,7 +979,22 @@ class Evaluation:
             return {"allowed": False, "reason": "claimant run in progress"}
         return None
 
+    def horizon_at(self, at: datetime) -> datetime:
+        """The settlement horizon for a race or live set evaluated at `at`:
+        only loss parts settled strictly before it count (Samir, PR #282
+        comment 4347949974). Inside a part's settlement it never moves later."""
+        return at if self._horizon is None else min(self._horizon, at)
+
     def live_claims(self, issue: str, repo: str, at: datetime) -> list[Claim]:
+        """The claims live on the issue at `at` that may win its race. Like
+        the race, this counts only loss parts settled strictly before `at`."""
+        outer, self._horizon = self._horizon, self.horizon_at(at)
+        try:
+            return self._live_claims(issue, repo, at)
+        finally:
+            self._horizon = outer
+
+    def _live_claims(self, issue: str, repo: str, at: datetime) -> list[Claim]:
         candidates = [
             c for c in self.claims.values()
             if c.issue == issue and c.repo == repo and self.ended(c, at) is None and self.settled_loss(c, at) is None
@@ -999,7 +1031,7 @@ class Evaluation:
         """
         lost = None
         for kind, when in self.settle_times(claim):
-            if when < at:
+            if when < at and (self._horizon is None or when < self._horizon):
                 lost = lost or self._settled(claim, kind, when)
         return lost
 
@@ -1010,17 +1042,23 @@ class Evaluation:
         return (("overlap", claim.created_at + self.readback), ("race", self.settles_at(claim)))
 
     def _settled(self, claim: Claim, kind: str, when: datetime) -> Claim | None:
-        """One part of `settled_loss`, decided at `when` and cached. It reads
-        only parts settled strictly before `when`."""
+        """One part of `settled_loss`, decided at `when` and cached. While it
+        is decided, `when` is the settlement horizon: only parts settled
+        strictly before it count, in `settled_loss` and `took_effect` alike, so
+        the part never reads itself and its value does not depend on who asks."""
         key = (claim.uuid, kind)
         if key not in self._losses:
-            if kind == "race":
-                won = self.winner(claim.issue, claim.repo, when)
-                beaten = won is not None and won.uuid != claim.uuid and won.uuid not in claim.takeovers
-                self._losses[key] = won if beaten else None
-            else:
-                blocker = self.earlier_overlap(claim, when)
-                self._losses[key] = blocker[0] if blocker else None
+            outer, self._horizon = self._horizon, when
+            try:
+                if kind == "race":
+                    won = self.winner(claim.issue, claim.repo, when)
+                    beaten = won is not None and won.uuid != claim.uuid and won.uuid not in claim.takeovers
+                    self._losses[key] = won if beaten else None
+                else:
+                    blocker = self.earlier_overlap(claim, when)
+                    self._losses[key] = blocker[0] if blocker else None
+            finally:
+                self._horizon = outer
         return self._losses[key]
 
     def settles_at(self, claim: Claim) -> datetime:
@@ -1031,7 +1069,7 @@ class Evaluation:
         return claim.created_at + self.readback
 
     def winner(self, issue: str, repo: str, at: datetime) -> Claim | None:
-        key = (issue, repo, at)
+        key = (issue, repo, at, self.horizon_at(at))
         if key not in self._winners:
             live = self.live_claims(issue, repo, at)
             self._winners[key] = min(live, key=lambda c: (c.created_at, c.uuid)) if live else None

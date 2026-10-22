@@ -42,6 +42,18 @@ comment whose first line ends with `claim v1`. Its `scope:` is `whole issue`
 or `sub-issue CSL-N`, which also covers that sub-issue of the claimed issue;
 it may name several claims to take over, one `takeover of <uuid>` line each,
 and `takeovers` in the result gives each one's outcome under `targets`.
+A release is recorded by a `release v1` record: an agent comment with a
+complete prefix on the claim's issue, whose first line ends with `release v1`
+when posted, made at or after the `released` edit, and not deleted. Its latest
+revision has `claim: <uuid>`, a `reason` of done, handoff, lease expiry,
+abandoned or `decision needed (CSL-N)`, and non-empty `done`, `evidence`,
+`open`, `next` and `files`. A key line starts at the line's beginning and is the
+exact key, optionally followed by one ` (note)`, then `:`; its value runs to the
+next key line, and the first occurrence of a key counts. A reason may also end
+with one ` (note)` (Lucas's decisions, CSL-445 comments 0d05a0b0 and 12051696).
+A released claim without a valid record is reported as `release_without_record`.
+A claim withdrawn, revoked or deleted by the time of its release, or deleted at
+no known time, needs none.
 Human lines (`REVOKE CLAIM`, `HOLD`, `DECISION:`, batched `CSL-N: X; ...`,
 `ACK TAKEOVER`, `Standing approval SA-n`, `REVOKE SA-n`) count only in
 comments without the agent prefix, and keep the effect they had before a known
@@ -99,6 +111,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 AGENT_PREFIX = re.compile(r"^Agent \(([^)]*)\):")
 CLAIM_HEADER = re.compile(r"claim v1\s*$")
+RELEASE_HEADER = re.compile(r"release v1\s*$")
+RECORD_KEYS = ("claim", "reason", "done", "evidence", "open", "next", "files")
+NOTE = r"(?: \([^()\n]*[^()\s][^()\n]*\))?"
+RECORD_KEY = re.compile(rf"^({'|'.join(RECORD_KEYS)}){NOTE}:(.*)$")
+RELEASE_REASON = re.compile(rf"^(?:done|handoff|lease expiry|abandoned|decision needed \(CSL-[0-9]+\)){NOTE}$")
 FIELD = re.compile(r"^([a-z-]+):\s*(.*)$")
 ISSUE_ID = re.compile(r"^CSL-[0-9]+$")
 UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
@@ -290,6 +307,25 @@ def claim_fields(body: str) -> dict[str, Any]:
     return fields
 
 
+def release_record_fields(body: str) -> dict[str, str]:
+    """Field values of a `release v1` record body, after its first line.
+
+    A value is the rest of its key line plus every line up to the next key
+    line, so bullets under `evidence:` belong to it. Only the first occurrence
+    of a key counts; a later one still ends the field before it.
+    """
+    fields: dict[str, list[str]] = {}
+    current: list[str] = []  # text before the first key line is not kept
+    for line in body.split("\n")[1:]:
+        match = RECORD_KEY.match(line)
+        if match is None:
+            current.append(line)
+            continue
+        current = [match.group(2)]
+        fields.setdefault(match.group(1), current)
+    return {key: "\n".join(lines).strip() for key, lines in fields.items()}
+
+
 @dataclasses.dataclass
 class StandingApproval:
     sa: str
@@ -375,6 +411,7 @@ class Evaluation:
         self.issues = self._load_issues(require(snapshot, "issues", "snapshot"))
         self.comments = self._load_comments(require(snapshot, "comments", "snapshot"))
         self.claims = self._load_claims()
+        self.release_records = self._load_release_records()
         self.late_renewals = {uuid: self._late_renewals(claim) for uuid, claim in self.claims.items()}
         self.commits = self._load_list(snapshot, "commits", ("sha", "branch", "at", "author_kind"))
         self.writes = self._load_list(snapshot, "writes", ("kind", "issue", "claim", "at"))
@@ -670,6 +707,30 @@ class Evaluation:
                 child=child,
             )
         return claims
+
+    def _load_release_records(self) -> dict[str, list[tuple[Comment, dict[str, str]]]]:
+        """Release records by the claim they name, with their fields.
+
+        As with claim records, only the first line of the comment as posted
+        makes it a record, so a record quoted inside another comment is not
+        one, and a developer-approved comment, which loses its prefix at load,
+        is not one either. A malformed record is not a snapshot error: it counts
+        for no claim.
+        """
+        records: dict[str, list[tuple[Comment, dict[str, str]]]] = {}
+        for comment in self.comments:
+            if comment.deleted:
+                continue
+            first = comment.revisions[0].body.split("\n", 1)[0]
+            header = agent_header(first)
+            if header is None or not RELEASE_HEADER.search(first):
+                continue
+            tool, slash, session = header[0].partition("/")
+            if not (tool.strip() and slash and session.strip() and header[1]):
+                continue
+            fields = release_record_fields(comment.body)
+            records.setdefault(fields.get("claim", ""), []).append((comment, fields))
+        return records
 
     def _late_renewals(self, claim: Claim) -> list[Revision]:
         """Edits that tried to renew `claim` after its lease plus grace had passed.
@@ -1364,6 +1425,38 @@ class Evaluation:
                         run.get("ended_at") is None or run["ended_at"] > released
                     ):
                         self.violation("release_before_writers_stopped", claim.issue, claim.uuid, run["id"])
+                self.check_release_record(claim, released)
+
+    def check_release_record(self, claim: Claim, released: datetime) -> None:
+        """Report a release without a valid `release v1` record (CSL-445).
+
+        Only a claim that ended by its release needs one: a withdrawal, revoke
+        or deletion by the time of the release, or a deletion at an unknown
+        time, means it does not. With several records one valid one is enough;
+        otherwise the detail describes the most complete, the earliest on a tie.
+        """
+        if self.ended(claim, released) != "released":
+            return
+        revoked = self.revoked_at(claim)
+        if revoked is not None and revoked <= released:
+            return
+        best = None
+        for comment, fields in self.release_records.get(claim.uuid, []):
+            if comment.issue != claim.issue or comment.created_at < released:
+                continue
+            missing = sorted(key for key in RECORD_KEYS[2:] if not fields.get(key))
+            bad_reason = not RELEASE_REASON.match(fields.get("reason", ""))
+            rank = (len(missing) + bad_reason, missing, bad_reason, comment.created_at, comment.id)
+            if best is None or rank < best:
+                best = rank
+        if best is None:
+            detail = "no record"
+        elif best[0] == 0:
+            return
+        else:
+            parts = [f"missing: {', '.join(best[1])}"] if best[1] else []
+            detail = "; ".join(parts + (["invalid reason"] if best[2] else []))
+        self.violation("release_without_record", claim.issue, claim.uuid, detail)
 
     def check_heartbeat_times(self, claim: Claim) -> None:
         """Report a timestamp `heartbeat-at` that is not the time of the edit

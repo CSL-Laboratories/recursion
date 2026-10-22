@@ -449,6 +449,29 @@ class LeaseTests(unittest.TestCase):
         result = sim.evaluate(snapshot(130, [issue("CSL-1")], [claim("c1", "CSL-1", U1)], writes=writes))
         self.assertEqual(codes(result), ["write_after_expiry"])
 
+    def test_lease_and_grace_boundaries_are_measured_from_the_last_update(self):
+        # Codex 4343803111: the lease runs 2 hours from the last counted update
+        # (here the confirmation edit at 1m10s); a write at exactly that edge is
+        # allowed, one second later it is not. A renewal up to exactly 2h30
+        # restores the lease; one second later it does not.
+        last, second = 70 / 60, 1 / 60
+
+        def push(at):
+            return {"kind": "push", "issue": "CSL-1", "claim": U1, "at": ts(at)}
+
+        cases = {
+            "write at the lease edge": ([], [push(last + 120)], []),
+            "write just after the lease": ([], [push(last + 120 + second)], ["write_after_expiry"]),
+            "renewal at the grace edge": ([edit(last + 150, U1, "heartbeat-at: x")], [push(last + 155)], []),
+            "renewal just after grace": ([edit(last + 150 + second, U1, "heartbeat-at: x")], [push(last + 155)],
+                                         ["renewed_after_expiry", "write_after_expiry"]),
+        }
+        for name, (edits, writes, expected) in cases.items():
+            with self.subTest(case=name):
+                comment_ = claim("c1", "CSL-1", U1, more_edits=edits)
+                result = sim.evaluate(snapshot(160, [issue("CSL-1")], [comment_], writes=writes))
+                self.assertEqual(codes(result), expected)
+
     def test_heartbeat_extends_the_lease(self):
         claim_comment = claim("c1", "CSL-1", U1, more_edits=[edit(100, U1, "heartbeat-at: x")])
         writes = [{"kind": "push", "issue": "CSL-1", "claim": U1, "at": ts(180)}]

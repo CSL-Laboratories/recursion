@@ -104,12 +104,19 @@ holds the record format and wins on any conflict.
   repository; a session may hold several claims at once, but no two in a
   repository may cover the same issue (counting a sub-issue scope) or name the
   same branch (CSL-357 comment 6749bdcb).
-- Read back after at least 60 seconds: the earliest Linear `createdAt` wins; on a
-  tie, the lower uuid. Confirm or withdraw. No write before `confirmed-at`; then
-  move the issue to In Progress.
-- Renew `heartbeat-at` at least hourly with the real edit time. The lease is 2 hours
-  from the comment's last Linear `updatedAt`, plus 30 minutes grace. Never renew an
-  expired claim; take one over only under the AGENTS.md takeover conditions.
+- Read back after at least 60 seconds: re-read the issue, its parent and any
+  sub-issue your scope covers, and search Linear for your exact branch name in
+  quotes (archived issues included). The earliest Linear `createdAt` among
+  overlapping claims wins; on a tie, the lower uuid. Confirm or withdraw. If a
+  source can't be read, don't confirm. Search can lag and shows only issues you
+  can see, so this reduces overlap but does not prevent it. No write before
+  `confirmed-at`; then move the issue to In Progress. Repeat these reads before
+  every write.
+- Renew `heartbeat-at` at least hourly with the real edit time. The lease runs 2
+  hours from the comment's last Linear `updatedAt`; past that, make no write until
+  you renew. A renewal up to 2 hours 30 minutes after that `updatedAt` restores the
+  lease; after that, never renew it. Take a claim over only under the AGENTS.md
+  takeover conditions.
 - On session start or resume, before any write, check each claim you hold. If its
   lease plus grace has passed, release it as lease expiry and never renew it; then
   re-read the issue and take a fresh claim. Set `heartbeat-at` to the actual edit

@@ -12,7 +12,7 @@ Touches other repos? (link the cross-repo Linear issue)
 <!-- Commands, checks, or review steps that prove this change. -->
 
 ## Checklist
-- [ ] Confirmed claim record on the Linear issue (link it); the human assignee stays unchanged (AGENTS.md, "Bounded issue execution and shared evidence")
+- [ ] Agent PRs: confirmed claim record on the Linear issue (link it); the human assignee stays unchanged (AGENTS.md, "Bounded issue execution and shared evidence"). Human authors: N/A
 - [ ] CSL key in branch name and PR title
 - [ ] Linear issue updated, and any follow-ups filed to Triage
 - [ ] No secrets in tracked files, logs, or notifications

@@ -2107,6 +2107,14 @@ class ReleaseRecordTests(unittest.TestCase):
         tie = release_record("r3", "CSL-1", U1, 35, omit=("done",))
         self.assertEqual(self.violations(better, tie), self.missing("missing: done"))
         self.assertEqual(self.violations(tie, better), self.missing("missing: done"))
+        # Time decides a tie, not the names of the missing fields (Codex audit of 7e02948).
+        early = release_record("r3", "CSL-1", U1, 31, omit=("next",))
+        late = release_record("r4", "CSL-1", U1, 40, omit=("done",))
+        self.assertEqual(self.violations(early, late), self.missing("missing: next"))
+        self.assertEqual(self.violations(late, early), self.missing("missing: next"))
+        bad_reason = release_record("r4", "CSL-1", U1, 40, reason="finished")
+        self.assertEqual(self.violations(early, bad_reason), self.missing("missing: next"))
+        self.assertEqual(self.violations(bad_reason, early), self.missing("missing: next"))
 
     def test_record_on_another_issue(self):
         self.assertEqual(self.violations(release_record("r1", "CSL-4", U1, 30)), self.missing("no record"))

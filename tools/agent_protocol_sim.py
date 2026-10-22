@@ -1446,12 +1446,12 @@ class Evaluation:
                 continue
             missing = sorted(key for key in RECORD_KEYS[2:] if not fields.get(key))
             bad_reason = not RELEASE_REASON.match(fields.get("reason", ""))
-            rank = (len(missing) + bad_reason, missing, bad_reason, comment.created_at, comment.id)
-            if best is None or rank < best:
-                best = rank
+            rank = (len(missing) + bad_reason, comment.created_at, comment.id)
+            if best is None or rank < best[0]:
+                best = (rank, missing, bad_reason)
         if best is None:
             detail = "no record"
-        elif best[0] == 0:
+        elif best[0][0] == 0:
             return
         else:
             parts = [f"missing: {', '.join(best[1])}"] if best[1] else []

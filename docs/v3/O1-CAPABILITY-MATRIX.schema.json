@@ -1,0 +1,315 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:recursion:o1:capability-matrix:v0.1-draft",
+  "title": "O1CapabilityMatrix",
+  "description": "Normative JSON Schema for docs/v3/O1-CAPABILITY-MATRIX.json. O1E-011 validates that file against this document. Draft 2020-12. additionalProperties is false. This schema checks structure, types, and enums. Upstream-only closure is O1E-017. Journey proof gates are O1E-019.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema",
+    "status",
+    "version",
+    "out_of_row_scope",
+    "target_checkpoint",
+    "receipt_rule",
+    "pillars",
+    "tiers_proposed",
+    "evidence_classes_proposed",
+    "dispositions_proposed",
+    "rows"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "const": "docs/v3/O1-CAPABILITY-MATRIX.schema.json"
+    },
+    "schema": {
+      "type": "string",
+      "const": "o1-capability-matrix/v0.1-draft",
+      "description": "Version identifier of this matrix document. Validation uses O1-CAPABILITY-MATRIX.schema.json, not this string."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["draft"]
+    },
+    "version": {
+      "type": "string",
+      "const": "v0.1-draft"
+    },
+    "out_of_row_scope": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["decision_id", "reason", "retained_obligations", "obligation_rows"],
+        "properties": {
+          "decision_id": { "type": "string", "minLength": 1 },
+          "reason": { "type": "string", "minLength": 1 },
+          "retained_obligations": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1 },
+            "uniqueItems": true
+          },
+          "obligation_rows": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "pattern": "^CAP-[0-9]{3}[a-z]?$" },
+            "uniqueItems": true
+          }
+        }
+      }
+    },
+    "target_checkpoint": {
+      "type": "string",
+      "const": "2026-11-12"
+    },
+    "receipt_rule": {
+      "type": "string",
+      "const": "H"
+    },
+    "pillars": {
+      "type": "array",
+      "minItems": 12,
+      "maxItems": 12,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": [
+          "native_harness",
+          "upstream_byok_local_intelligence",
+          "configuration",
+          "plugins",
+          "nodes",
+          "clients_cli_tui_gui_mobile",
+          "context_compaction",
+          "persistent_assistants",
+          "performance",
+          "privacy_security_authority",
+          "verification",
+          "update_rollback_release_operations"
+        ]
+      }
+    },
+    "tiers_proposed": {
+      "type": "array",
+      "minItems": 8,
+      "maxItems": 8,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": [
+          "researched",
+          "human_decided",
+          "contract_frozen",
+          "prototyped",
+          "implemented",
+          "provider_free_verified",
+          "locally_qualified",
+          "release_qualified"
+        ]
+      }
+    },
+    "evidence_classes_proposed": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": ["source_documented", "locally_observed", "inferred", "unmeasured"]
+      }
+    },
+    "dispositions_proposed": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": ["unmet", "blocked", "no-release-claim"]
+      }
+    },
+    "rows": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/row" }
+    }
+  },
+  "$defs": {
+    "row": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "pillar",
+        "capability",
+        "journeys",
+        "modes",
+        "actor_start_state",
+        "useful_endpoint",
+        "source_config_route_platform",
+        "allowed_effects",
+        "fault_recovery_case",
+        "current_maturity",
+        "target",
+        "disposition",
+        "disposition_status",
+        "packaging_default_activation",
+        "claim_permission",
+        "dependencies",
+        "evidence",
+        "unknowns",
+        "withdrawn"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^CAP-[0-9]{3}[a-z]?$"
+        },
+        "pillar": {
+          "type": "string",
+          "enum": [
+            "native_harness",
+            "upstream_byok_local_intelligence",
+            "configuration",
+            "plugins",
+            "nodes",
+            "clients_cli_tui_gui_mobile",
+            "context_compaction",
+            "persistent_assistants",
+            "performance",
+            "privacy_security_authority",
+            "verification",
+            "update_rollback_release_operations"
+          ]
+        },
+        "capability": { "type": "string", "minLength": 1 },
+        "journeys": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": ["J1", "J2", "J3", "J4", "J5", "J6"]
+          }
+        },
+        "modes": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["native_only", "upstream_only", "combined"],
+          "properties": {
+            "native_only": { "type": "boolean" },
+            "upstream_only": { "type": "boolean" },
+            "combined": { "type": "boolean" }
+          }
+        },
+        "actor_start_state": { "type": "string", "minLength": 1 },
+        "useful_endpoint": { "type": "string", "minLength": 1 },
+        "source_config_route_platform": { "type": "string", "minLength": 1 },
+        "allowed_effects": { "type": "string", "minLength": 1 },
+        "fault_recovery_case": { "type": "string", "minLength": 1 },
+        "current_maturity": {
+          "type": "string",
+          "enum": [
+            "researched",
+            "human_decided",
+            "contract_frozen",
+            "prototyped",
+            "implemented",
+            "provider_free_verified",
+            "locally_qualified",
+            "release_qualified"
+          ]
+        },
+        "target": {
+          "enum": [
+            null,
+            "researched",
+            "human_decided",
+            "contract_frozen",
+            "prototyped",
+            "implemented",
+            "provider_free_verified",
+            "locally_qualified",
+            "release_qualified"
+          ]
+        },
+        "disposition": {
+          "enum": [null, "unmet", "blocked", "no-release-claim"]
+        },
+        "disposition_status": {
+          "type": "string",
+          "enum": ["pending-H", "accepted-H"]
+        },
+        "packaging_default_activation": {
+          "type": "string",
+          "enum": ["core-default", "opt-in-plugin", "built-opt-in"]
+        },
+        "claim_permission": {
+          "type": "string",
+          "enum": ["none", "authorized"]
+        },
+        "dependencies": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "upstream_only_requires": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Required by the if/then below on every row with modes.upstream_only true. O1E-017 closes the tokens. This schema does not enum them, so an API token remains representable for an adverse fixture."
+        },
+        "composition_obligations": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["evidence_class", "ref", "notes"],
+            "properties": {
+              "evidence_class": {
+                "type": "string",
+                "enum": ["source_documented", "locally_observed", "inferred", "unmeasured"]
+              },
+              "ref": { "type": "string", "minLength": 1 },
+              "notes": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        "unknowns": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "withdrawn": { "type": "boolean" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "modes": {
+                "properties": {
+                  "upstream_only": { "const": true }
+                },
+                "required": ["upstream_only"]
+              }
+            },
+            "required": ["modes"]
+          },
+          "then": {
+            "required": ["upstream_only_requires"]
+          }
+        }
+      ]
+    }
+  }
+}

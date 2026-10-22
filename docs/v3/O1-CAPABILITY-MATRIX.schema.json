@@ -262,7 +262,7 @@
           "minItems": 1,
           "uniqueItems": true,
           "items": { "type": "string", "minLength": 1 },
-          "description": "Present when the row declares an upstream-only closure. Tokens are closed by O1E-017, not by this schema, so an API token remains representable for the adverse fixture."
+          "description": "Required by the if/then below on every row with modes.upstream_only true. O1E-017 closes the tokens. This schema does not enum them, so an API token remains representable for an adverse fixture."
         },
         "composition_obligations": {
           "type": "array",
@@ -291,7 +291,25 @@
           "items": { "type": "string", "minLength": 1 }
         },
         "withdrawn": { "type": "boolean" }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "modes": {
+                "properties": {
+                  "upstream_only": { "const": true }
+                },
+                "required": ["upstream_only"]
+              }
+            },
+            "required": ["modes"]
+          },
+          "then": {
+            "required": ["upstream_only_requires"]
+          }
+        }
+      ]
     }
   }
 }

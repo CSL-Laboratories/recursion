@@ -945,12 +945,12 @@ class Evaluation:
         return self._winners[key]
 
     def holder(self, issue: str, repo: str, at: datetime) -> Claim | None:
-        """The race winner, unless an earlier claim from another session
-        blocks it by scope or branch; then nobody holds the issue. The race
-        itself stays on the unfiltered live claims, so a later claim on the
-        issue still loses to the blocked one."""
+        """The race winner, unless an earlier claim, from this or another
+        session, blocks it by scope or branch; then nobody holds the issue.
+        The race itself stays on the unfiltered live claims, so a later claim
+        on the issue still loses to the blocked one."""
         winner = self.winner(issue, repo, at)
-        if winner is not None and self.earlier_overlap(winner, at, other_sessions=True) is not None:
+        if winner is not None and self.earlier_overlap(winner, at) is not None:
             return None
         return winner
 

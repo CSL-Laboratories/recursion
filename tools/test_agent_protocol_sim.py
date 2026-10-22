@@ -661,13 +661,23 @@ class SettlementHorizonTests(unittest.TestCase):
                 ])
 
     def test_zero_read_back_and_wait_settle_each_race_from_earlier_parts(self):
-        # U2's race is settled from parts settled strictly before 12:32, where
-        # U4's takeover still stands, so U2 wins and U4 loses. U4's takeover
-        # therefore never took effect, so U2 landed on the expired U5 without
-        # a takeover and nobody holds the issue (r4348171485).
+        # Zero read-back and zero wait, an accepted non-default config. U2's
+        # race is settled from parts settled strictly before 12:32, where U4's
+        # takeover still stands, so U2 wins and U4 loses. U4's takeover
+        # therefore never took effect, so U2 landed on the expired U5 without a
+        # takeover and nobody holds the issue. Samir accepted this outcome
+        # (PR #282 r4348328466). It arises only because the expired, unwithdrawn
+        # settled loser U5 still needs a takeover, which is F2 (Lucas): if F2
+        # changes, this outcome should change with it, deliberately.
         for order in ("posted", "reversed"):
             with self.subTest(order=order):
-                result = self.evaluate(self.zero_read_back_and_wait(), order)
+                comments, issues, now, config = self.zero_read_back_and_wait()
+                listed = comments if order == "posted" else comments[::-1]
+                snap = snapshot(now, issues, listed, config=config)
+                ev = sim.Evaluation(snap)
+                result = ev.run()
+                self.assertIsNone(ev.settled_loss(ev.claims[U2], ev.now))
+                self.assertEqual(ev.settled_loss(ev.claims[self.U4], ev.now).uuid, U2)
                 self.assertIsNone(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"])
                 self.assertEqual(sorted((v["code"], v["claim"], v["detail"]) for v in result["violations"]), [
                     ("claim_without_takeover", U2, f"expired {self.U5}"),

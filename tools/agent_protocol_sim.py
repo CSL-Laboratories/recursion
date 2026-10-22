@@ -933,13 +933,12 @@ class Evaluation:
             if comment.deleted_at is not None and start < comment.deleted_at <= at:
                 moments.add(comment.deleted_at)
         # A taker that lost its own overlap or race never held its issue, so
-        # its takeover cannot clear the claims it named.
+        # its takeover cannot clear the claims it named. As in `settled_loss`,
+        # a loss counts only once settled strictly before the moment, so this
+        # never asks for a part at the instant it is being settled.
         return any(
             self.ended(taker, moment) is None and self.takeover_status(taker, moment)["allowed"]
-            and not any(
-                self._settled(taker, kind, when) is not None
-                for kind, when in self.settle_times(taker) if when <= moment
-            )
+            and self.settled_loss(taker, moment) is None
             for moment in sorted(moments)
         )
 

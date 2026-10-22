@@ -373,6 +373,20 @@ class LeaseTests(unittest.TestCase):
         result = sim.evaluate(snapshot(180, [issue("CSL-1"), issue("CSL-4")], comments, writes=writes))
         self.assertIn("claim_without_takeover", codes(result))
 
+    def test_a_claim_posted_as_a_takeover_wait_ends_is_evaluated(self):
+        # A fresh claim posted at the exact instant the takeover's race
+        # settles once made settling that race recurse into itself.
+        u4 = "00000000-0000-4000-8000-000000000004"
+        comments = [claim("c1", "CSL-1", U1), self.takeover(at=152),
+                    claim("c4", "CSL-1", u4, at=167, session="codex/s4", branch="other")]
+        for order in ("posted", "reversed"):
+            with self.subTest(order=order):
+                listed = comments if order == "posted" else comments[::-1]
+                result = sim.evaluate(snapshot(180, [issue("CSL-1")], listed))
+                self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], U2)
+                self.assertEqual([(v["code"], v["claim"]) for v in result["violations"]],
+                                 [("loser_confirmed", u4), ("loser_not_withdrawn", u4)])
+
     def test_violations_do_not_depend_on_comment_order(self):
         comments = [claim("c1", "CSL-1", U1), self.takeover(at=125), claim("c3", "CSL-1", U3, at=160, session="grok/s3")]
         forward = sim.evaluate(snapshot(170, [issue("CSL-1")], comments))["violations"]

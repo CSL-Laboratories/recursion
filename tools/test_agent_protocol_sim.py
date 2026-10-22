@@ -7,6 +7,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -2055,6 +2056,17 @@ class ReleaseRecordTests(unittest.TestCase):
                      "**open**: x", "open : x", " open: x", "opened: x"):
             with self.subTest(line=line):
                 self.assertEqual(self.violations(self.record_with(*rest, line)), self.missing("missing: open"))
+
+    def test_an_unclosed_note_is_rejected_quickly(self):
+        # Fable 5.1 review of 7e02948: the note pattern was quadratic on an unclosed "(".
+        long = "x" * 20000
+        rest = ["done: x", "evidence: x", "next: x", "files: x"]
+        started = time.perf_counter()
+        self.assertEqual(self.violations(self.record_with(f"reason: done ({long}", *rest, "open: x")),
+                         self.missing("invalid reason"))
+        self.assertEqual(self.violations(self.record_with("reason: done", *rest, f"open ({long}: x")),
+                         self.missing("missing: open"))
+        self.assertLess(time.perf_counter() - started, 1.0)
 
     def test_values_continue_to_the_next_key_line(self):
         cases = {

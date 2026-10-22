@@ -113,7 +113,8 @@ AGENT_PREFIX = re.compile(r"^Agent \(([^)]*)\):")
 CLAIM_HEADER = re.compile(r"claim v1\s*$")
 RELEASE_HEADER = re.compile(r"release v1\s*$")
 RECORD_KEYS = ("claim", "reason", "done", "evidence", "open", "next", "files")
-NOTE = r"(?: \([^()\n]*[^()\s][^()\n]*\))?"
+# The lookahead keeps an unclosed "(" from backtracking over the rest of the line.
+NOTE = r"(?: \((?=[^()\n]*[^()\s])[^()\n]*\))?"
 RECORD_KEY = re.compile(rf"^({'|'.join(RECORD_KEYS)}){NOTE}:(.*)$")
 RELEASE_REASON = re.compile(rf"^(?:done|handoff|lease expiry|abandoned|decision needed \(CSL-[0-9]+\)){NOTE}$")
 FIELD = re.compile(r"^([a-z-]+):\s*(.*)$")

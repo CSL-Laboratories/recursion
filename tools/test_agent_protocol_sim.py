@@ -1399,13 +1399,121 @@ class StandingLoserTests(unittest.TestCase):
         self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], u4)
         self.assertEqual(codes(result), [])
 
-    def test_loser_may_still_win_after_the_original_releases(self):
+    def test_loser_does_not_win_after_the_original_releases(self):
+        # D15 as amended (CSL-446, 2b10e162): a settled loser never becomes
+        # winner, even once the claim that beat it is released.
         original = claim("c1", "CSL-1", U1, more_edits=[edit(50, U1, "released")])
         loser = claim("c3", "CSL-1", U3, at=10, session="grok/s3")
         record = release_record("r1", "CSL-1", U1, 50)
         result = sim.evaluate(snapshot(60, [issue("CSL-1")], [original, record, loser]))
-        self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], U3)
+        self.assertIsNone(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"])
+        self.assertEqual(codes(result), ["loser_confirmed", "loser_not_withdrawn"])
+        self.assertTrue(result["issues"]["CSL-1"]["claimable"])
 
+
+
+class SettledLoserTests(unittest.TestCase):
+    """D15 as amended by Lucas's decision on CSL-446 (comment 2b10e162): a claim that lost its issue race or an
+    overlap at read-back stays a settled loser. It never becomes winner or holder, its writes are reported, and it
+    blocks no one; it must withdraw and post a fresh claim."""
+
+    def push(self, uuid, issue_id, at):
+        return {"kind": "push", "issue": issue_id, "claim": uuid, "at": ts(at)}
+
+    def released_winner(self, at=50):
+        return [claim("c1", "CSL-1", U1, more_edits=[edit(at, U1, "released")]), release_record("r1", "CSL-1", U1, at)]
+
+    def test_a_race_loser_pushing_after_the_winner_releases_is_reported(self):
+        loser = claim("c3", "CSL-1", U3, at=10, session="grok/s3")
+        result = sim.evaluate(snapshot(60, [issue("CSL-1")], [*self.released_winner(), loser],
+                                       writes=[self.push(U3, "CSL-1", 55)]))
+        self.assertIsNone(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"])
+        self.assertEqual([(v["code"], v["claim"]) for v in result["violations"]],
+                         [("loser_confirmed", U3), ("loser_not_withdrawn", U3), ("write_by_non_winner", U3)])
+
+    def test_an_overlap_loser_pushing_after_the_blocker_releases_is_reported(self):
+        blocker = [claim("c1", "CSL-1", U1, more_edits=[edit(3, U1, "released")]), release_record("r1", "CSL-1", U1, 3)]
+        loser = claim("c2", "CSL-4", U2, at=1, session="cursor/s2")
+        result = sim.evaluate(snapshot(10, [issue("CSL-1"), issue("CSL-4")], [*blocker, loser],
+                                       writes=[self.push(U2, "CSL-4", 8)]))
+        self.assertIsNone(result["issues"]["CSL-4"]["claims"]["recursion"]["winner"])
+        self.assertEqual([(v["code"], v["claim"]) for v in result["violations"]],
+                         [("overlapping_claim", U2), ("write_by_non_winner", U2)])
+
+    def test_a_same_session_overlap_loss_stands_after_the_earlier_claim_releases(self):
+        earlier = [claim("c1", "CSL-1", U1, more_edits=[edit(3, U1, "released")]), release_record("r1", "CSL-1", U1, 3)]
+        later = claim("c2", "CSL-4", U2, at=1)
+        result = sim.evaluate(snapshot(10, [issue("CSL-1"), issue("CSL-4")], [*earlier, later],
+                                       writes=[self.push(U2, "CSL-4", 8)]))
+        self.assertIsNone(result["issues"]["CSL-4"]["claims"]["recursion"]["winner"])
+        self.assertEqual([(v["code"], v["claim"]) for v in result["violations"]],
+                         [("multiple_claims_per_session", U2), ("write_by_non_winner", U2)])
+
+    def test_a_fresh_claim_wins_over_a_settled_loser(self):
+        loser = claim("c3", "CSL-1", U3, at=10, session="grok/s3")
+        fresh = claim("c2", "CSL-1", U2, at=55, session="cursor/s2")
+        comments = [*self.released_winner(), loser, fresh]
+        for order in ("posted", "reversed"):
+            with self.subTest(order=order):
+                listed = comments if order == "posted" else comments[::-1]
+                result = sim.evaluate(snapshot(60, [issue("CSL-1")], listed, writes=[self.push(U2, "CSL-1", 58)]))
+                self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], U2)
+                self.assertEqual([(v["code"], v["claim"]) for v in result["violations"]],
+                                 [("loser_confirmed", U3), ("loser_not_withdrawn", U3)])
+
+    def test_a_loser_that_withdraws_may_claim_again(self):
+        withdrawn = {"at": ts(10.5), "body": claim_body(U3, "grok/s3", extra=(f"withdrawn: superseded by {U1}",))}
+        loser = claim("c3", "CSL-1", U3, at=10, session="grok/s3", confirm_after=None, more_edits=[withdrawn])
+        retry = claim("c4", "CSL-1", U2, at=55, session="grok/s3")
+        result = sim.evaluate(snapshot(60, [issue("CSL-1")], [*self.released_winner(), loser, retry],
+                                       writes=[self.push(U2, "CSL-1", 58)]))
+        self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], U2)
+        self.assertEqual(codes(result), [])
+
+    def test_a_settled_loser_does_not_block_an_overlapping_claim(self):
+        # A loses to C by branch; its sub-issue scope covers CSL-5, but as a
+        # settled loser it neither keeps CSL-5 unclaimable nor blocks B there.
+        issues = [issue("CSL-1"), issue("CSL-4"), issue("CSL-5", parent="CSL-4")]
+        c = claim("c1", "CSL-1", U1)
+        a = scoped("c2", "CSL-4", U2, "CSL-5", at=1, session="cursor/s2")
+        result = sim.evaluate(snapshot(10, issues, [c, a]))
+        self.assertTrue(result["issues"]["CSL-5"]["claimable"])
+        b = claim("c3", "CSL-5", U3, at=5, session="grok/s3", branch="csl-5-work")
+        for order in ("posted", "reversed"):
+            with self.subTest(order=order):
+                listed = [c, a, b] if order == "posted" else [b, a, c]
+                result = sim.evaluate(snapshot(10, issues, listed, writes=[self.push(U3, "CSL-5", 8)]))
+                self.assertEqual(result["issues"]["CSL-5"]["claims"]["recursion"]["winner"], U3)
+                self.assertEqual([(v["code"], v["claim"]) for v in result["violations"]], [("overlapping_claim", U2)])
+
+    def test_the_session_rule_still_counts_a_settled_loser(self):
+        # Unchanged by CSL-446: a session's unwithdrawn claim still counts
+        # against a second claim of that session on the same branch, though
+        # it no longer blocks that claim from winning.
+        winner = claim("c1", "CSL-1", U3, session="cursor/s2", branch="csl-1-other")
+        loser = claim("c2", "CSL-1", U1, at=1)
+        second = claim("c3", "CSL-4", U2, at=5)
+        result = sim.evaluate(snapshot(10, [issue("CSL-1"), issue("CSL-4")], [winner, loser, second]))
+        self.assertEqual(result["issues"]["CSL-4"]["claims"]["recursion"]["winner"], U2)
+        self.assertEqual([(v["code"], v["claim"]) for v in result["violations"]],
+                         [("loser_confirmed", U1), ("loser_not_withdrawn", U1), ("multiple_claims_per_session", U2)])
+
+    def test_a_takeover_still_wins_after_its_target_objects_and_releases_late(self):
+        # Unchanged by CSL-446: the claim a takeover names is not a race it
+        # can lose. Its target objects inside the wait and releases after it.
+        original = claim("c1", "CSL-1", U1, more_edits=[edit(155, U1, "heartbeat-at: back"), edit(170, U1, "released")])
+        taker = claim("c2", "CSL-1", U2, at=152, session="cursor/s2", extra=(f"takeover of {U1}",))
+        result = sim.evaluate(snapshot(180, [issue("CSL-1")], [original, release_record("r1", "CSL-1", U1, 170), taker],
+                                       writes=[self.push(U2, "CSL-1", 175)]))
+        self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], U2)
+        self.assertEqual(codes(result), [])
+
+    def test_the_loss_is_not_settled_inside_the_read_back_window(self):
+        # Before the loser's read-back deadline it is still a live claim.
+        loser = claim("c2", "CSL-1", U2, at=9.5, session="cursor/s2", confirm_after=None)
+        result = sim.evaluate(snapshot(10, [issue("CSL-1")], [claim("c1", "CSL-1", U1), loser]))
+        self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["live_claims"], [U1, U2])
+        self.assertEqual(codes(result), [])
 
 class TakeoverEffectTests(unittest.TestCase):
     """Devin's private review of recursion#258 (CSL-389 comment 928ee10b)."""
@@ -1831,23 +1939,25 @@ class CrossSessionOverlapTests(unittest.TestCase):
         self.assertEqual(codes(result), [])
 
     def test_an_overlapping_claim_is_not_published_as_winner(self):
-        # Devin 4341055198: the loser stays live (it has not withdrawn) but
-        # cannot win its own issue while the earlier claim blocks it.
+        # Devin 4341055198: the loser cannot win its own issue. Once its loss
+        # is settled at read-back it is no longer live and does not keep its
+        # issue unclaimable (CSL-446, 2b10e162); it is still reported.
         result = self.evaluate(10, [claim("c1", "CSL-1", U1), claim("c2", "CSL-4", U2, at=1, session="cursor/s2")])
         self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], U1)
         self.assertEqual(result["issues"]["CSL-4"]["claims"]["recursion"]["winner"], None)
-        self.assertEqual(result["issues"]["CSL-4"]["claims"]["recursion"]["live_claims"], [U2])
-        self.assertFalse(result["issues"]["CSL-4"]["claimable"])
+        self.assertEqual(result["issues"]["CSL-4"]["claims"]["recursion"]["live_claims"], [])
+        self.assertTrue(result["issues"]["CSL-4"]["claimable"])
+        self.assertEqual(codes(result), ["overlapping_claim"])
 
     def test_a_late_confirmation_after_the_blocker_releases_is_still_a_loss(self):
         # Devin 4341055382: the loss is settled at the read-back deadline, as
         # in a race on one issue; the blocker releasing afterwards does not
-        # erase it. Once released, the standing loser can win, as on one issue.
+        # erase it, and the settled loser does not win (CSL-446, 2b10e162).
         released = claim("c1", "CSL-1", U1, more_edits=[edit(3, U1, "released")])
         late = claim("c2", "CSL-4", U2, at=1, session="cursor/s2", confirm_after=180)
         result = self.evaluate(10, [released, release_record("r1", "CSL-1", U1, 3), late])
         self.assertEqual(codes(result), ["overlapping_claim"])
-        self.assertEqual(result["issues"]["CSL-4"]["claims"]["recursion"]["winner"], U2)
+        self.assertIsNone(result["issues"]["CSL-4"]["claims"]["recursion"]["winner"])
 
     def test_a_blocker_released_within_the_read_back_window_is_no_loss(self):
         released = claim("c1", "CSL-1", U1, more_edits=[edit(1.5, U1, "released")])
@@ -1860,21 +1970,18 @@ class CrossSessionOverlapTests(unittest.TestCase):
         result = self.evaluate(10, [claim("c1", "CSL-1", U1), early])
         self.assertEqual(codes(result), ["confirmed_too_early", "overlapping_claim"])
 
-    def test_a_blocked_earliest_claim_still_wins_its_issue_race(self):
+    def test_a_settled_overlap_loser_does_not_win_its_issue_race(self):
         # Devin 4341276529 / Samir 5605467453: C blocks A by branch; B is a
-        # later claim on A's issue. B loses the race to A and must withdraw,
-        # and nobody holds CSL-4 while C blocks A.
+        # later claim on A's issue. A's loss is settled at its read-back
+        # deadline, before B's race is decided, so A no longer blocks B and B
+        # wins and holds CSL-4 (CSL-446, 2b10e162).
         c = claim("c1", "CSL-1", U1)
         a = claim("c2", "CSL-4", U2, at=1, session="cursor/s2")
         b = claim("c3", "CSL-4", U3, at=1.5, session="grok/s3", branch="csl-4-other")
         writes = [{"kind": "push", "issue": "CSL-4", "claim": U3, "at": ts(5)}]
         result = self.evaluate(10, [c, a, b], writes)
-        self.assertEqual(codes(result), ["loser_confirmed", "loser_not_withdrawn", "overlapping_claim",
-                                         "write_by_non_winner"])
-        found = {(v["code"], v["claim"]) for v in result["violations"]}
-        self.assertIn(("loser_confirmed", U3), found)
-        self.assertIn(("overlapping_claim", U2), found)
-        self.assertEqual(result["issues"]["CSL-4"]["claims"]["recursion"]["winner"], None)
+        self.assertEqual([(v["code"], v["claim"]) for v in result["violations"]], [("overlapping_claim", U2)])
+        self.assertEqual(result["issues"]["CSL-4"]["claims"]["recursion"]["winner"], U3)
 
     def test_a_parent_scoped_claim_alone_holds_the_child(self):
         # Codex 4343468463 / Samir 5608007390: with only the parent claim live,
@@ -1910,7 +2017,8 @@ class CrossSessionOverlapTests(unittest.TestCase):
         result = self.evaluate(10, [scoped("c1", "CSL-1", U1, "CSL-2"), child])
         self.assertEqual(codes(result), ["overlapping_claim"])
         self.assertEqual(result["issues"]["CSL-2"]["claims"]["recursion"]["winner"], U1)
-        self.assertEqual(result["issues"]["CSL-2"]["claims"]["recursion"]["live_claims"], [U1, U2])
+        # The child claim's loss is settled at read-back, so it is not live (CSL-446, 2b10e162).
+        self.assertEqual(result["issues"]["CSL-2"]["claims"]["recursion"]["live_claims"], [U1])
 
     def test_same_issue_races_keep_their_own_codes(self):
         result = self.evaluate(10, [claim("c1", "CSL-1", U1), claim("c2", "CSL-1", U2, at=1, session="cursor/s2")])

@@ -42,6 +42,10 @@ comment whose first line ends with `claim v1`. Its `scope:` is `whole issue`
 or `sub-issue CSL-N`, which also covers that sub-issue of the claimed issue;
 it may name several claims to take over, one `takeover of <uuid>` line each,
 and `takeovers` in the result gives each one's outcome under `targets`.
+A claim that lost its issue race, or lost at read-back to an earlier claim
+from any session that overlaps it, is a settled loser (D15 as amended,
+CSL-446): it never becomes winner or holder, even after the claim that beat it
+ends, its writes are reported, and it blocks no other claim.
 A release is recorded by a `release v1` record: an agent comment with a
 complete prefix on the claim's issue, whose first line ends with `release v1`
 when posted, made at or after the `released` edit, and not deleted. Its latest
@@ -407,6 +411,7 @@ class Evaluation:
         self.heartbeat_tolerance = timedelta(seconds=self.config["heartbeat_tolerance_seconds"])
         self._revoked: dict[str, datetime | None] = {}
         self._winners: dict[tuple[str, str, datetime], Claim | None] = {}
+        self._losses: dict[tuple[str, str], Claim | None] = {}
         self.violations: list[dict[str, Any]] = []
         self.void_lines: list[dict[str, str]] = []
         self.issues = self._load_issues(require(snapshot, "issues", "snapshot"))
@@ -955,7 +960,7 @@ class Evaluation:
     def live_claims(self, issue: str, repo: str, at: datetime) -> list[Claim]:
         candidates = [
             c for c in self.claims.values()
-            if c.issue == issue and c.repo == repo and self.ended(c, at) is None
+            if c.issue == issue and c.repo == repo and self.ended(c, at) is None and self.settled_loss(c, at) is None
         ]
         superseded = set()
         refused = set()
@@ -970,27 +975,38 @@ class Evaluation:
                 for other in self.claims.values()
             )
             status = self.takeover_status(claim, at)
-            if bypasses or self.lost_to_expired(claim, at) or (status is not None and not status["allowed"]):
+            if bypasses or (status is not None and not status["allowed"]):
                 refused.add(claim.uuid)
             elif status is not None:
                 superseded.update(status["of"])
         return [c for c in candidates if c.uuid not in superseded and c.uuid not in refused]
 
-    def lost_to_expired(self, claim: Claim, at: datetime) -> bool:
-        """True if `claim` lost the race to a claim that has since expired.
+    def settled_loss(self, claim: Claim, at: datetime) -> Claim | None:
+        """The claim that `claim` lost to, if that loss was settled before `at`.
 
-        A claim that lost and never withdrew cannot win when the winner
-        expires; it must take that claim over (decision 3, CSL-389 comment
-        425b223c). The race is settled when the claim could first be live.
+        A claim that lost its issue race, or lost at read-back to an earlier
+        overlapping claim from any session, stays a settled loser. It never
+        becomes winner or holder, even after the claim that beat it ends, and
+        it blocks no one; it must withdraw and post a fresh claim (D15 as
+        amended by Lucas's decision, CSL-446 comment 2b10e162). The overlap is
+        settled at the end of the read-back window, the race when the claim
+        could first be live.
         """
-        settled_at = self.settles_at(claim)
-        if settled_at >= at:
-            return False
-        settled = self.winner(claim.issue, claim.repo, settled_at)
-        return (
-            settled is not None and settled.uuid != claim.uuid and settled.uuid not in claim.takeovers
-            and self.ended(settled, at) == "expired"
-        )
+        for kind, when in (("overlap", claim.created_at + self.readback), ("race", self.settles_at(claim))):
+            if when >= at:
+                continue
+            key = (claim.uuid, kind)
+            if key not in self._losses:
+                if kind == "race":
+                    won = self.winner(claim.issue, claim.repo, when)
+                    lost = won is not None and won.uuid != claim.uuid and won.uuid not in claim.takeovers
+                    self._losses[key] = won if lost else None
+                else:
+                    blocker = self.earlier_overlap(claim, when)
+                    self._losses[key] = blocker[0] if blocker else None
+            if self._losses[key] is not None:
+                return self._losses[key]
+        return None
 
     def settles_at(self, claim: Claim) -> datetime:
         """When the claim's race is decided: the end of the read-back window,
@@ -1009,8 +1025,9 @@ class Evaluation:
     def holder(self, issue: str, repo: str, at: datetime) -> Claim | None:
         """The race winner, unless an earlier claim, from this or another
         session, blocks it by scope or branch. The race itself stays on the
-        unfiltered live claims, so a later claim on the issue still loses to
-        the blocked one. With no unblocked winner, a parent claim whose
+        unfiltered live claims, so a later claim on the issue loses to the
+        blocked one until that claim's loss is settled at its read-back
+        deadline (`settled_loss`). With no unblocked winner, a parent claim whose
         `scope: sub-issue` covers the issue holds it if that parent claim
         holds its own issue; otherwise nobody holds the issue."""
         winner = self.winner(issue, repo, at)
@@ -1043,10 +1060,13 @@ class Evaluation:
             return "branch"
         return None
 
-    def blocks_overlap(self, other: Claim, at: datetime) -> bool:
+    def blocks_overlap(self, other: Claim, at: datetime, settled_losers: bool = False) -> bool:
         """True if `other` still blocks an overlapping claim at `at`: it is
         live, or it expired without a release, withdrawal, revoke, deletion
-        or a takeover that took effect, as on a single issue."""
+        or a takeover that took effect, as on a single issue. A settled loser
+        blocks no one, unless `settled_losers` asks for the session check."""
+        if not settled_losers and self.settled_loss(other, at) is not None:
+            return False
         state = self.ended(other, at)
         if state == "expired":
             return not any(
@@ -1401,7 +1421,7 @@ class Evaluation:
                 # another issue, as across sessions; on the same issue the
                 # implicit-takeover check reports it instead.
                 and (self.ended(other, claim.created_at) is None if other.issue == claim.issue
-                     else self.blocks_overlap(other, claim.created_at))
+                     else self.blocks_overlap(other, claim.created_at, settled_losers=True))
             ]
             if others:
                 self.violation("multiple_claims_per_session", claim.issue, claim.uuid, f"also holds {others[0].uuid}")

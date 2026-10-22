@@ -993,20 +993,30 @@ class Evaluation:
         could first be live.
         """
         lost = None
-        for kind, when in (("overlap", claim.created_at + self.readback), ("race", self.settles_at(claim))):
-            if when >= at:
-                continue
-            key = (claim.uuid, kind)
-            if key not in self._losses:
-                if kind == "race":
-                    won = self.winner(claim.issue, claim.repo, when)
-                    beaten = won is not None and won.uuid != claim.uuid and won.uuid not in claim.takeovers
-                    self._losses[key] = won if beaten else None
-                else:
-                    blocker = self.earlier_overlap(claim, when)
-                    self._losses[key] = blocker[0] if blocker else None
-            lost = lost or self._losses[key]
+        for kind, when in self.settle_times(claim):
+            if when < at:
+                lost = lost or self._settled(claim, kind, when)
         return lost
+
+    def settle_times(self, claim: Claim) -> tuple[tuple[str, datetime], ...]:
+        """When each part of a possible loss is settled: an overlap at the
+        end of the read-back window, the race when the claim could first be
+        live."""
+        return (("overlap", claim.created_at + self.readback), ("race", self.settles_at(claim)))
+
+    def _settled(self, claim: Claim, kind: str, when: datetime) -> Claim | None:
+        """One part of `settled_loss`, decided at `when` and cached. It reads
+        only parts settled strictly before `when`."""
+        key = (claim.uuid, kind)
+        if key not in self._losses:
+            if kind == "race":
+                won = self.winner(claim.issue, claim.repo, when)
+                beaten = won is not None and won.uuid != claim.uuid and won.uuid not in claim.takeovers
+                self._losses[key] = won if beaten else None
+            else:
+                blocker = self.earlier_overlap(claim, when)
+                self._losses[key] = blocker[0] if blocker else None
+        return self._losses[key]
 
     def settles_at(self, claim: Claim) -> datetime:
         """When the claim's race is decided: the end of the read-back window,
@@ -1694,10 +1704,15 @@ class Evaluation:
         )
 
     def run(self) -> dict[str, Any]:
-        # Settle losses oldest claim first, so each check finds the earlier
-        # claims already settled instead of recursing down a long chain.
-        for claim in sorted(self.claims.values(), key=lambda c: (c.created_at, c.uuid)):
-            self.settled_loss(claim, self.now)
+        # Settle every part of every loss in order of its settle time. A part
+        # reads only parts settled strictly earlier, so each one finds them
+        # cached instead of recursing down a long chain.
+        parts = sorted(
+            (when, kind, claim.created_at, claim.uuid, claim)
+            for claim in self.claims.values() for kind, when in self.settle_times(claim) if when < self.now
+        )
+        for when, kind, _, _, claim in parts:
+            self._settled(claim, kind, when)
         decisions = self._decisions = self.decisions()
         held = {issue_id: self.held_at(issue_id, self.now) for issue_id in self.issues}
         self.collect_void_lines()

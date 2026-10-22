@@ -1521,6 +1521,24 @@ class SettledLoserTests(unittest.TestCase):
         self.assertEqual(sorted((v["code"], v["detail"]) for v in result["violations"]),
                          sorted(("overlapping_claim", f"branch overlaps {uuids[0]}") for _ in range(n - 1)))
 
+    def test_a_long_chain_inside_a_takeover_wait_is_evaluated(self):
+        # Fable 5.1 review of f950bf0a: a takeover's race settles at the end
+        # of its 15-minute wait, after 300 claims on one branch posted inside
+        # the wait; listed newest first, settling claim by claim recursed too
+        # deep. The result must not depend on the comment order.
+        n = 300
+        uuid = "00000000-0000-4000-8000-{:012d}".format
+        issues = [issue(f"CSL-{i}") for i in range(n + 1)]
+        comments = [claim("x", "CSL-0", uuid(n + 1), at=-200, session="old/s", confirm_after=None),
+                    claim("t", "CSL-0", uuid(n + 2), at=0, session="taker/s", confirm_after=None,
+                          extra=(f"takeover of {uuid(n + 1)}",))]
+        comments += [claim(f"c{i}", f"CSL-{i}", uuid(i), at=0.01 * i, session=f"agent{i}/s", confirm_after=None)
+                     for i in range(1, n + 1)]
+        comments.append(claim("late", "CSL-0", uuid(n + 3), at=0.01 * (n + 2), session="late/s", confirm_after=None))
+        newest_first = sim.evaluate(snapshot(30, issues, comments[::-1]))
+        self.assertEqual(newest_first, sim.evaluate(snapshot(30, issues, comments)))
+        self.assertEqual(newest_first["issues"]["CSL-0"]["claims"]["recursion"]["winner"], uuid(n + 2))
+
     def test_the_loss_is_not_settled_inside_the_read_back_window(self):
         # Before the loser's read-back deadline it is still a live claim.
         loser = claim("c2", "CSL-1", U2, at=9.5, session="cursor/s2", confirm_after=None)

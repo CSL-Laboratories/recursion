@@ -205,28 +205,30 @@ The checker script must exit nonzero if any of the following conditions occur:
 | **O1E-014** | Absent Independent Verification Evidence | Candidate presented in acceptance mode without an authentic candidate-level independent verification report from a different model family (fails unconditionally in acceptance mode regardless of whether any capability rows are promoted), or capability claim promoted without authentic independent evidence, or receipt exports are not compared against actual Linear comments. |
 | **O1E-015** | Unauthorized Populated Target | Row declares a populated target tier (`target != null`) while an authentic Rule-H founder receipt is absent. |
 | **O1E-016** | Missing Mobile Capability-Row Coverage | A journey (J1–J6) is not mapped in the `journeys` array of mobile client capability row `CAP-016` in `docs/v3/O1-CAPABILITY-MATRIX.json`. |
-| **O1E-017** | Upstream-Only API or Model Dependency | The upstream-only closure of §6.5 reaches an unknown token, an unknown row, an API token, or an API-backed row. `CAP-006` is API-backed. `CAP-018`, `CAP-019`, `CAP-020`, and `CAP-027` must each carry `upstream_only_requires`. A direct forbidden token and a transitive dependency on `CAP-006` both fail. |
+| **O1E-017** | Upstream-Only API or Model Dependency | Every row with `modes.upstream_only: true` must carry a non-empty `upstream_only_requires` list, and that list's closure must stay inside the allowed terminals. A missing or empty list, an unknown token, an unknown row, an API token, or an API-backed row (`CAP-006` included) fails. This is every such row, not only four named ones. |
 | **O1E-018** | Dropped Composition Obligation | `out_of_row_scope` lists D-034 without `reproducible`, `cache-aware`, and `injection-safe` in `retained_obligations`, or `CAP-009` `composition_obligations` does not contain that same set. The row exemption does not drop the obligations. |
 | **O1E-019** | Missing Journey Proof Gate | A journey J1–J6 omits `**Baseline:**`, `**Measurement:**`, or `**Falsification:**`, or omits an obligatory §7 substring from §6.6. Existence of the journey heading is `O1E-001` and does not satisfy this gate. |
 
 ### 6.5 Upstream-only closure (O1E-017)
 
-A blacklist of known API tokens on four rows is not closure. For every matrix row with `modes.upstream_only: true`, the checker walks a dependency closure and rejects it unless every reached node is allowed.
+A blacklist of known API tokens on four rows is not closure. For every matrix row with `modes.upstream_only: true`, the checker requires an explicit non-empty `upstream_only_requires` list and walks that closure. A missing list, an empty list, or a list that does not close is `O1E-017`.
 
-Edges:
+Edges, once the list is present:
 
-- Every string in that row's `upstream_only_requires`, when the field is present.
+- Every string in that row's `upstream_only_requires`.
 - Every `dependencies` entry, on that row and on each reached row, whose id matches `CAP-`. Decision ids, requirement ids, and document paths are not capability edges.
-- From each reached capability row, the same two edge kinds, including that row's `upstream_only_requires`.
+- From each reached capability row, the same two edge kinds, including that row's `upstream_only_requires`. A reached row with `modes.upstream_only: true` and no list is unclosed.
 
 Allowed terminals are `installed-cli`, `local-capsule-file`, `local-test-command`, `local-files`, and `os-process-supervision`.
 
-`O1E-017` fires when the closure contains any of the following:
+`O1E-017` fires when any of the following is true:
 
-- A missing `upstream_only_requires` on `CAP-018`, `CAP-019`, `CAP-020`, or `CAP-027`.
+- Any row with `modes.upstream_only: true` omits `upstream_only_requires` or gives an empty list. `CAP-004` and `CAP-005` carry closed lists in the matrix; deleting either list fails this gate. The obligation is not limited to `CAP-018`, `CAP-019`, `CAP-020`, and `CAP-027`.
 - An unknown token: not an allowed terminal and not the id of a row in the matrix. `CAP-999` and `not-a-closed-requirement` are unknown.
 - An API token: `api`, `api-key`, `provider-api`, `model`, or `byok`.
 - An API-backed row. `CAP-006` (BYOK and local HTTP / OpenAI-compatible transport) is API-backed even if its `upstream_only` flag is edited to true. Any other row with `modes.upstream_only: false` is API-backed for this gate. A row whose own closure contains an API token is API-backed.
+
+`CAP-010` does not claim `upstream_only`. Its named source is an MCP API, which is not a closed local dependency. The schema `if`/`then` in §6.7 also requires the field when `upstream_only` is true, so deleting it is `O1E-011` as well as `O1E-017`. An empty list fails the schema `minItems` of 1 (`O1E-011`) and the closure rule (`O1E-017`). `O1F-N17g` expects both errors for a deleted list. The checker does not suppress either.
 
 The walk keeps a seen-set. A cycle of allowed rows is not itself a failure. Reaching `CAP-006` through `upstream_only_requires` or through a `CAP-*` dependency fails. `CAP-020` requiring `CAP-019` while `CAP-019` requires `provider-api` fails. `O1E-012` does not scan `upstream_only_requires`. An unknown token there is only `O1E-017`.
 
@@ -249,7 +251,7 @@ The catalog text carries the adopted §7 clause. A shorter paraphrase that drops
 
 `docs/v3/O1-CAPABILITY-MATRIX.json` is validated against [O1-CAPABILITY-MATRIX.schema.json](O1-CAPABILITY-MATRIX.schema.json) (JSON Schema draft 2020-12). The checker loads that repository path. It does not fetch a schema over the network. `additionalProperties` is false on the document and on each row. A syntax error, a schema violation, an extra property, a value outside an enum, a duplicate row `id`, or a missing schema file is `O1E-011`. A digest mismatch of the schema file against the manifest is `O1E-010`.
 
-The matrix property `schema` stays the version identifier `o1-capability-matrix/v0.1-draft`. The instance property `$schema` is the repository-relative path of the schema file. This draft adds that schema and requires validation against it.
+The matrix property `schema` stays the version identifier `o1-capability-matrix/v0.1-draft`. The instance property `$schema` is the repository-relative path of the schema file. This draft adds that schema and requires validation against it. The row schema uses `if`/`then`: when `modes.upstream_only` is true, `upstream_only_requires` is required. Token closure stays `O1E-017`. The schema does not enum the tokens, so an adverse API token still parses.
 
 ---
 
@@ -268,7 +270,7 @@ Specifically, under this deterministic construction:
 1. Every row from `docs/v3/O1-CAPABILITY-MATRIX.json` has its disposition replaced with `disposition: "no-release-claim"`, `disposition_status: "accepted-H"`, and `target: null`, ensuring zero undecided rows and zero unapproved claims in the nominal baseline.
 2. The exact declaration of all 12 pillars and 35 capability rows (`CAP-001` through `CAP-034`, including `CAP-005b`) is preserved directly from the real matrix.
 3. The complete Journey × Surface × Control matrix covering all 6 journeys (J1–J6) across CLI, TUI, GUI, and Mobile surfaces is preserved directly from `docs/v3/O1-JOURNEYS.md`.
-4. All mutation fixtures (`O1F-N01a` through `O1F-N19`, including `O1F-N09d`, `O1F-N10b`, and `O1F-N17a` through `O1F-N17f`) operate deterministically against this constructed baseline, naming rows and journeys that exist in the real matrix (e.g., `O1F-N06` deletes `CAP-015`, which exists in the real matrix; `O1F-N02b` removes `J2` from `CAP-016`).
+4. All mutation fixtures (`O1F-N01a` through `O1F-N19`, including `O1F-N09d`, `O1F-N10b`, and `O1F-N17a` through `O1F-N17g`) operate deterministically against this constructed baseline, naming rows and journeys that exist in the real matrix (e.g., `O1F-N06` deletes `CAP-015`, which exists in the real matrix; `O1F-N02b` removes `J2` from `CAP-016`).
 
 #### Baseline Seam Dispositions
 In the nominal valid baseline, every decision packet `DQ-01` through `DQ-11` in the decisions queue record (`docs/v3/O1-DECISIONS-QUEUE.md`) is recorded with status `'dispositioned (fixture)'` in the fixture queue record:
@@ -294,7 +296,7 @@ When evaluating adverse mutation fixtures, the fixture harness runs three phases
 2. **Digest Rebinding:** Recompute the SHA-256 of every covered artifact, pinned source, and test payload. Write those digests, in the same phase, into:
    - the manifest maps `artifacts`, `pinned_sources`, and `fixtures`
    - the receipt fields `candidate_commit`, `contract_sha256`, `journeys_sha256`, `matrix_sha256`, `decisions_queue_sha256`, `manifest_sha256`, `pinned_source_sha256`, and `fixture_sha256`
-   - the verifier maps `artifact_digests`, `pinned_source_digests`, and `fixture_digests`
+   - the verifier field `manifest_check.manifest_sha256` and the verifier maps `artifact_digests`, `pinned_source_digests`, and `fixture_digests`
    A rebind that updates only the manifest is invalid. Receipt digests are part of the rebind, so a re-hashed fixture does not leave a stale receipt.
 3. **Receipt-only mutations:** `O1F-N09a`, `O1F-N09b`, `O1F-N09c`, and `O1F-N09d` apply their receipt mutation after phase 2. Phase 2 must not overwrite that mutation.
 
@@ -306,7 +308,8 @@ The checker reports an exact set of error IDs. It does not suppress or rank them
 - **Adverse Fixtures:** Exit code `1` and the set derived from the rules below.
 - **Derived sets:** Phase 2 leaves only the error the mutation itself introduces, except:
   - `O1F-N01a` deletes the `nodes` pillar and rows `CAP-011`, `CAP-012`, and `CAP-013`. The `pillars` array drops to 11 entries and violates the schema `minItems` of 12, so the set is `{O1E-001, O1E-006, O1E-011}`.
-  - `O1F-N01b` deletes journey `J6`, which also removes it from `CAP-016`, so the set is `{O1E-001, O1E-016}`.
+  - `O1F-N01b` deletes journey `J6`, which also removes it from `CAP-016` and removes J6's baseline, measurement, and falsification clauses, so the set is `{O1E-001, O1E-016, O1E-019}`.
+  - `O1F-N17g` deletes `upstream_only_requires` from `CAP-004`. The schema `if`/`then` fails and the closure list is missing, so the set is `{O1E-011, O1E-017}`.
   - `O1F-N10` skips phase 2. Each target, including the pinned scope-reframe source, leaves both the receipt and the manifest on the pre-mutation digests, so the set is `{O1E-009, O1E-010}`.
   - `O1F-N10b` builds the real-mode `pinned_sources` set from §6.3, then deletes `docs/v3/harness/CSL-27.md` and does not rebind. The manifest digest changes while the receipt still binds the old manifest and that pin, so the set is `{O1E-009, O1E-010}`.
 - Every other adverse fixture expects a singleton set containing only its own error ID.
@@ -558,10 +561,15 @@ All cryptographic digests binding artifacts, pinned sources, and test payloads a
           "description": "sha256 of each conformance test fixture, keyed by payload name exactly as in the manifest `fixtures` map (goal_prompt, goal_spec, j1_patch, state_transfer_inbound, state_transfer_outbound)",
           "additionalProperties": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
         },
+        "manifest_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "sha256 of the canonical unified manifest. Same digest as the receipt manifest_sha256. Required by §8."
+        },
         "digests_matched": { "type": "boolean" },
         "stale_entries": { "type": "integer", "maximum": 0 }
       },
-      "required": ["artifacts_verified", "artifact_digests", "pinned_source_digests", "fixture_digests", "digests_matched", "stale_entries"]
+      "required": ["artifacts_verified", "artifact_digests", "pinned_source_digests", "fixture_digests", "manifest_sha256", "digests_matched", "stale_entries"]
     },
     "coverage_diff": {
       "type": "object",
@@ -707,6 +715,7 @@ All cryptographic digests binding artifacts, pinned sources, and test payloads a
         "state_transfer_inbound": "<computed:sha256(state_transfer_inbound)>",
         "state_transfer_outbound": "<computed:sha256(state_transfer_outbound)>"
       },
+      "manifest_sha256": "<computed:sha256(manifest)>",
       "digests_matched": true,
       "stale_entries": 0
     },
@@ -880,7 +889,7 @@ All cryptographic digests binding artifacts, pinned sources, and test payloads a
 | **O1F-P03** | Positive | Transparent state transfer | Row specifies fixture-local payload `transfer-capsule-j1-nominal`, schema URI `urn:recursion:schema:v3:context-capsule-transfer-v1`, canonical JSON serialization, expected returned payload, and round-trip record `EV-ROUNDTRIP-SYNTH-01` (labeled 'expected synthetic result, not executed'). | **PASS** (exit 0, set()) |
 | **O1F-P04** | Positive | Multi-stage composed journey | Journey J1 composed trace from native initiation to Claude execution to native resumption (trace `composed_journey_trace_p04`). | **PASS** (exit 0, set()) |
 | **O1F-N01a** | Adverse | Missing required pillar | Delete the `"nodes"` pillar and all its associated rows (`CAP-011`, `CAP-012`, `CAP-013`) from constructed baseline matrix. | **FAIL** `{'O1E-001', 'O1E-006', 'O1E-011'}` (deleting CAP-011..CAP-013 also removes three rows without a `no-release-claim` disposition, and 11 pillars violate the schema `minItems` of 12; all are expected, no suppression) |
-| **O1F-N01b** | Adverse | Missing required journey | Delete journey `"J6"` from Journey Catalog and matrix row references. | **FAIL** `{'O1E-001', 'O1E-016'}` (removing J6 from CAP-016's `journeys` necessarily also triggers mobile-row coverage; both are expected, no suppression) |
+| **O1F-N01b** | Adverse | Missing required journey | Delete journey `"J6"` from Journey Catalog and matrix row references. | **FAIL** `{'O1E-001', 'O1E-016', 'O1E-019'}` (removing J6 from CAP-016's `journeys` also removes J6's baseline, measurement, and falsification clauses; all three are expected, no suppression) |
 | **O1F-N02a** | Adverse | Missing surface control cell | Omit mobile column or leave control cell blank in Journey × Surface × Control matrix for J1. | **FAIL** `{'O1E-002'}` |
 | **O1F-N02b** | Adverse | Missing journey in mobile capability row | Remove journey `"J2"` from `CAP-016`'s journeys array in baseline matrix while retaining J2's cells in Journey × Surface × Control matrix. | **FAIL** `{'O1E-016'}` |
 | **O1F-N03a** | Adverse | Undecided row (missing target & disposition) | Mutate row CAP-001 to `target: null` and `disposition: null` with `disposition_status: "pending-H"`. | **FAIL** `{'O1E-003'}` |
@@ -908,6 +917,7 @@ All cryptographic digests binding artifacts, pinned sources, and test payloads a
 | **O1F-N17d** | Adverse | Upstream-only planning depends on API-backed CAP-006 | Set `CAP-020` `upstream_only_requires` to `["CAP-006"]`. `CAP-006` stays the BYOK / HTTP transport row. The closure reaches that row and fails. The string `CAP-006` is not on the old token blacklist. | **FAIL** `{'O1E-017'}` |
 | **O1F-N17e** | Adverse | Transitive API dependency | Set `CAP-020` `upstream_only_requires` to `["CAP-019"]` and `CAP-019` `upstream_only_requires` to `["provider-api"]`. `CAP-020`'s own list names only another row. | **FAIL** `{'O1E-017'}` |
 | **O1F-N17f** | Adverse | Unknown upstream-only dependency | Set `CAP-020` `upstream_only_requires` to `["not-a-closed-requirement"]`. The token is not an allowed terminal and not a row id. | **FAIL** `{'O1E-017'}` |
+| **O1F-N17g** | Adverse | Upstream-only row omits its dependency list | Delete `upstream_only_requires` from `CAP-004` (an `upstream_only: true` row that is not one of the old four). The schema `if`/`then` fails and the closure list is missing. | **FAIL** `{'O1E-011', 'O1E-017'}` |
 | **O1F-N18** | Adverse | D-034 exemption drops a composition obligation | Remove `injection-safe` from D-034 `retained_obligations` and from `CAP-009` `composition_obligations`. | **FAIL** `{'O1E-018'}` |
 | **O1F-N19** | Adverse | Journey missing its falsification gate | Delete the obligatory substring `equal or less effort` from journey J1's `**Falsification:**` clause. J1's heading remains. | **FAIL** `{'O1E-019'}` |
 
@@ -929,7 +939,7 @@ Under Gate Envelope G and [CONTROL_PLANE.md](../../CONTROL_PLANE.md) § "Indepen
    - Zero unresolved freeze-blocking seams without recorded disposition.
    - Presence of authentic candidate-level independent verifier report unconditionally in acceptance mode.
    - Presence of authentic independent evidence for every promoted claim.
-5. **Execution Ledger:** The report must list every manifest fixture (`O1F-P01`–`P04`, `O1F-N01a`–`N19`, including `O1F-N09d`, `O1F-N10b`, `O1F-N17a` through `O1F-N17f`), recording:
+5. **Execution Ledger:** The report must list every manifest fixture (`O1F-P01`–`P04`, `O1F-N01a`–`N19`, including `O1F-N09d`, `O1F-N10b`, `O1F-N17a` through `O1F-N17g`), recording:
    - The exact command executed.
    - The expected exit code and error ID.
    - The observed exit code and error ID.

@@ -243,10 +243,10 @@ Every repository source below is pinned to the commit that last changed it and t
 | `docs/v3/harness/CSL-82.md` | `46dd8326fc9d22953d28bd215db6ffbd5dd0fb75` | `514dee5226705678f9530eb0c040459eb7ca1c754ff9e41096165c822ae5b43a` |
 | `docs/v3/harness/CSL-83.md` | `65a9c236b3c3f08ba74fb5d88b28b2b33024a5eb` | `e54536dd3d01906dc3d6296a63bb92d21b937103f9385bfd67453742c97ed8a7` |
 | `docs/v3/harness/CSL-84.md` | `05e8657aecec5b85f1b9b66ee8b0fad5c2c73309` | `4657f483fb119f6b6e57a226fba65c7e0643241b35c41d5f5fb4c87bb92211ad` |
-| `docs/v3/O1-CAPABILITY-MATRIX.schema.json` | `24da263d49ee167d6d1849f90de46e89af612451` | `bc55d6e7009fbc4cdfc3d1d03f1e583cf08b794c5a208eb173b506fe6ef9ee7e` |
+| `docs/v3/O1-CAPABILITY-MATRIX.schema.json` | `c28557c07f785d01b82d32db75add0df583c29a1` | `7ac3226e8235cf942565cd6eb2944cd2387e9fb6d1290ec96f6134e0bb69251d` |
 | `docs/v3/research-lane/scope-reframe-20261002/raw/01-current-strategy/Recursion_Interface_and_Product_Strategy.md` | `0f89d356f6170164287211c746923a7b5824ccc1` | `ecbe910dd4070a4c59d85315bb42f67e7e405fb5ab12f6306a95de2b197b5b2b` |
 
-The four harness rows and `docs/v3/O1-CAPABILITY-MATRIX.schema.json` are §6.3 real-mode manifest pins. The schema revision is `24da263d49ee167d6d1849f90de46e89af612451`, the commit that added that file. The gate hashes the candidate bytes. A later edit of the schema must move this revision and recompute the sha256.
+The four harness rows and `docs/v3/O1-CAPABILITY-MATRIX.schema.json` are §6.3 real-mode manifest pins. The schema revision is `c28557c07f785d01b82d32db75add0df583c29a1`, the commit that required `upstream_only_requires` on every upstream-only row. The gate hashes the candidate bytes. A later edit of the schema must move this revision and recompute the sha256.
 
 ### 3.1 Linear Issues and Owner Plan Records
 - **CSL-205 Body:** Issue `75033598-1cec-475f-9cf3-0baecd75f9fc`, "Define month-end journeys and the capability/release evidence contract" (2026-10-16).

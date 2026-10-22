@@ -146,6 +146,9 @@
         "upstream_only": true,
         "combined": true
       },
+      "upstream_only_requires": [
+        "os-process-supervision"
+      ],
       "actor_start_state": "Runner initialized with execution environment and temporary working directory",
       "useful_endpoint": "Subprocess execution with stdio pipe capture and exit code handling; process group supervision and strict cwd sandboxing remain unmet guarantees on Windows/Linux",
       "source_config_route_platform": "scripts/v3/harness/run.py, Linux/Windows subprocess",
@@ -188,6 +191,9 @@
         "upstream_only": true,
         "combined": true
       },
+      "upstream_only_requires": [
+        "installed-cli"
+      ],
       "actor_start_state": "Authenticated codex binary available on PATH; user subscription active",
       "useful_endpoint": "JSON-RPC stdio protocol session enabling structured steering, resume, and review",
       "source_config_route_platform": "codex app-server --listen stdio://, Windows 11 / Linux",
@@ -229,6 +235,9 @@
         "upstream_only": true,
         "combined": true
       },
+      "upstream_only_requires": [
+        "installed-cli"
+      ],
       "actor_start_state": "User-authenticated CLI tools installed locally; credentials held exclusively in user domain",
       "useful_endpoint": "Headless stream-json turn execution without credential capture or token intermediation",
       "source_config_route_platform": "scripts/v3/harness/providers.py, Linux / Windows",
@@ -273,6 +282,9 @@
         "upstream_only": true,
         "combined": true
       },
+      "upstream_only_requires": [
+        "installed-cli"
+      ],
       "actor_start_state": "User-authenticated Hermes environment configured locally",
       "useful_endpoint": "Hermes agent turn delegation without credential custody",
       "source_config_route_platform": "scripts/v3/harness/providers.py (route unbuilt)",
@@ -341,6 +353,9 @@
         "upstream_only": true,
         "combined": true
       },
+      "upstream_only_requires": [
+        "local-files"
+      ],
       "actor_start_state": "Repository or user config files present on filesystem",
       "useful_endpoint": "Flat configuration loading and schema validation from a single file (scripts/v3/harness/config.py); hierarchical parent/project configuration resolution and non-widening limit enforcement remain unbuilt/unmet requirements",
       "source_config_route_platform": "scripts/v3/harness/config.py (reads single file, copies declared budgets without parent comparison), config/harness.json, schema version 1",
@@ -383,6 +398,9 @@
         "upstream_only": true,
         "combined": true
       },
+      "upstream_only_requires": [
+        "local-files"
+      ],
       "actor_start_state": "Operator invokes CLI to inspect or modify route parameters",
       "useful_endpoint": "Zero-model, human-readable configuration inspection and atomic file updates",
       "source_config_route_platform": "Recursion CLI config subcommand, local JSON",
@@ -417,6 +435,9 @@
         "upstream_only": true,
         "combined": true
       },
+      "upstream_only_requires": [
+        "local-files"
+      ],
       "actor_start_state": "Plugin manifest declared in configuration with SHA-256 digest lockfile",
       "useful_endpoint": "Sandboxed plugin execution with explicit permission graphs and failure containment",
       "source_config_route_platform": "Plugin engine, external plugin repositories per D-035",
@@ -453,12 +474,12 @@
       ],
       "modes": {
         "native_only": true,
-        "upstream_only": true,
+        "upstream_only": false,
         "combined": true
       },
       "actor_start_state": "Operator explicitly enables research plugin with finite budget envelope",
       "useful_endpoint": "Evidence-grounded research synthesis without standing executive or unmetered inference",
-      "source_config_route_platform": "Plugin system, Parallel Search / Context7 MCP APIs",
+      "source_config_route_platform": "Plugin system, Parallel Search / Context7 MCP APIs. Upstream-only is not claimed: the named source is an MCP API, which is not a closed local dependency.",
       "allowed_effects": "Web queries, citation synthesis, decision packet generation",
       "fault_recovery_case": "Research quota reaches approved budget cap; plugin immediately halts and records blocker without overrun",
       "current_maturity": "researched",
@@ -490,6 +511,9 @@
         "upstream_only": true,
         "combined": true
       },
+      "upstream_only_requires": [
+        "local-files"
+      ],
       "actor_start_state": "Single coordinator daemon running on local host",
       "useful_endpoint": "Zero-consensus core execution preserving strict one-writer correctness",
       "source_config_route_platform": "Local coordinator daemon, Linux/Windows, local filesystem storage per D-028 (store unselected)",
@@ -597,6 +621,9 @@
         "upstream_only": true,
         "combined": true
       },
+      "upstream_only_requires": [
+        "installed-cli"
+      ],
       "actor_start_state": "User launches terminal on Linux or Windows console",
       "useful_endpoint": "Full 10-control interactive operations with detachable multi-window sessions",
       "source_config_route_platform": "Terminal runtime, ANSI / Windows console subsystem",
@@ -632,6 +659,9 @@
         "upstream_only": true,
         "combined": true
       },
+      "upstream_only_requires": [
+        "installed-cli"
+      ],
       "actor_start_state": "User launches desktop GUI application on Windows, Linux, or macOS",
       "useful_endpoint": "Visual management of goals, ARM executives, and diff reviews over core daemon",
       "source_config_route_platform": "Desktop client, toolkit unselected (A5 decision open per D-038)",
@@ -671,6 +701,9 @@
         "upstream_only": true,
         "combined": true
       },
+      "upstream_only_requires": [
+        "installed-cli"
+      ],
       "actor_start_state": "User connects mobile device via authenticated tunnel",
       "useful_endpoint": "Remote monitoring, steering, and approval without offline data leaks",
       "source_config_route_platform": "Mobile client, iOS / Android advisory stack per D-039",
@@ -710,6 +743,9 @@
         "upstream_only": true,
         "combined": true
       },
+      "upstream_only_requires": [
+        "os-process-supervision"
+      ],
       "actor_start_state": "Control command dispatched from any client surface",
       "useful_endpoint": "Uniform routing of control points with explicit not-offered or unknown status on unsupported/unverified surfaces",
       "source_config_route_platform": "Process broker control API",
@@ -860,6 +896,9 @@
         "upstream_only": true,
         "combined": true
       },
+      "upstream_only_requires": [
+        "installed-cli"
+      ],
       "actor_start_state": "Assigned GoalSpec and exclusive worktree workspace",
       "useful_endpoint": "Tactical implementation planning, bounded delegation, and review branch creation",
       "source_config_route_platform": "ARM executive runtime, dedicated addressable topic",
@@ -894,6 +933,9 @@
         "upstream_only": true,
         "combined": true
       },
+      "upstream_only_requires": [
+        "installed-cli"
+      ],
       "actor_start_state": "Vague user intent submitted via interactive channel",
       "useful_endpoint": "Grill-me requirement refinement consulting Head across sessions to produce accepted GoalSpec",
       "source_config_route_platform": "Questionnaire assistant runtime, interactive CLI/TUI",
@@ -928,6 +970,9 @@
         "upstream_only": true,
         "combined": true
       },
+      "upstream_only_requires": [
+        "local-files"
+      ],
       "actor_start_state": "Turn execution request submitted to routing layer",
       "useful_endpoint": "Deterministic capability filtering, user weights and preference ordering (scripts/v3/harness/routing.py), provider cooldown tracking (scripts/v3/harness/cooldowns.py), and pre-call/post-call token ceiling and known-budget checks (scripts/v3/harness/usage.py); OR-024 Pareto ranking and full-vector optimization across responsiveness, subscription efficiency, and completion measurements remain unmet requirements",
       "source_config_route_platform": "scripts/v3/harness/routing.py (capability filtering, user weight/preference ordering), scripts/v3/harness/cooldowns.py (cooldown tracking), scripts/v3/harness/usage.py (token ceiling and known-budget checks)",
@@ -970,6 +1015,9 @@
         "upstream_only": true,
         "combined": true
       },
+      "upstream_only_requires": [
+        "os-process-supervision"
+      ],
       "actor_start_state": "Daemon running on host workstation or VPS",
       "useful_endpoint": "Continuous monitoring of CPU, RAM, disk space, and open handles against platform floors",
       "source_config_route_platform": "Resource governor, Linux cgroups v2 / Windows job objects",
@@ -1004,6 +1052,9 @@
         "upstream_only": true,
         "combined": true
       },
+      "upstream_only_requires": [
+        "installed-cli"
+      ],
       "actor_start_state": "Upstream route invoked requiring authentication",
       "useful_endpoint": "Execution through user-authenticated CLIs with output token redaction and zero credential relay (policy non-intermediation per D-021); environment isolation and operator-provisioned trusted launch boundary outside Recursion's domain (D-029) remain unmet design requirements (subprocess runner inherits environment without env filtering)",
       "source_config_route_platform": "Output token redaction filter, subprocess runner (inherits environment; environment isolation unbuilt), operator launch boundary",
@@ -1045,6 +1096,9 @@
         "upstream_only": true,
         "combined": true
       },
+      "upstream_only_requires": [
+        "local-files"
+      ],
       "actor_start_state": "Execution generating logs, traces, and metrics",
       "useful_endpoint": "Strict local-only telemetry retention with zero unapproved public or external egress",
       "source_config_route_platform": "Telemetry service, local append log / telemetry store (store unselected)",
@@ -1118,6 +1172,9 @@
         "upstream_only": true,
         "combined": true
       },
+      "upstream_only_requires": [
+        "local-test-command"
+      ],
       "actor_start_state": "Clean checkout of repository running on CI or local machine",
       "useful_endpoint": "Provider-free, deterministic verification of harness operations and gate compliance",
       "source_config_route_platform": "tools/ci_gate.py, Python 3 unittest runner",
@@ -1158,6 +1215,9 @@
         "upstream_only": true,
         "combined": true
       },
+      "upstream_only_requires": [
+        "local-files"
+      ],
       "actor_start_state": "System upgrade initiated on existing installation",
       "useful_endpoint": "Deterministic execution of declared update mode with schema migration validation",
       "source_config_route_platform": "Release manager, version migration registry",
@@ -1195,6 +1255,9 @@
         "upstream_only": true,
         "combined": true
       },
+      "upstream_only_requires": [
+        "local-files"
+      ],
       "actor_start_state": "Installed version encounters critical runtime failure or test regression",
       "useful_endpoint": "Compatibility verification before rollback or resume per OR-033, preserving newest work and logs, maintaining an explicit hold when compatibility is unknown, and supporting configured repair-forward or separate-instance recovery alternatives without promising automatic rollback",
       "source_config_route_platform": "Update coordinator, local backup snapshots (rollback mechanism unselected proposal)",
@@ -1230,6 +1293,9 @@
         "upstream_only": true,
         "combined": true
       },
+      "upstream_only_requires": [
+        "local-files"
+      ],
       "actor_start_state": "Host experiences abrupt ungraceful power loss or VM reset at commit boundary",
       "useful_endpoint": "Application-consistent canonical state restored via replay without corruption",
       "source_config_route_platform": "Local NTFS/ext4 storage engine per D-028 (store unselected)",
@@ -1265,6 +1331,9 @@
         "upstream_only": true,
         "combined": true
       },
+      "upstream_only_requires": [
+        "local-files"
+      ],
       "actor_start_state": "Task recovery initiated after crash, timeout, or partition",
       "useful_endpoint": "Preservation of uncertainty and enforcement of relative additional allowance as exact fraction/unit of pre-shutdown usage, with cumulative reservations across repeated failures",
       "source_config_route_platform": "Recovery coordinator, accounting ledger",
@@ -1300,6 +1369,9 @@
         "upstream_only": true,
         "combined": true
       },
+      "upstream_only_requires": [
+        "local-test-command"
+      ],
       "actor_start_state": "Broker state and process interactions ready for formal verification",
       "useful_endpoint": "Smallest aggregate plus explicit independently checkable bounded broker refinement, including necessary broker state if separate checking fails",
       "source_config_route_platform": "Process supervisor interface, verification harness",
@@ -1334,6 +1406,9 @@
         "upstream_only": true,
         "combined": true
       },
+      "upstream_only_requires": [
+        "local-files"
+      ],
       "actor_start_state": "Active task encountering scope ambiguity or proposed goal change",
       "useful_endpoint": "Strict Owner-only authority for actual GoalSpec amendments; substantial routine tactical delegation permitted without avoidable human interruption",
       "source_config_route_platform": "Authority governor, GoalSpec ledger",

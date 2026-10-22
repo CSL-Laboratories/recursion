@@ -1833,6 +1833,16 @@ class CrossSessionOverlapTests(unittest.TestCase):
         self.assertNotIn("recursion", result["issues"]["CSL-2"]["claims"])
         self.assertTrue(result["issues"]["CSL-2"]["claimable"])
 
+    def test_an_expired_unreleased_parent_claim_keeps_the_child_unclaimable(self):
+        # Codex 4343611603: the expired parent still blocks a child claim, so
+        # the child is not claimable; it is not listed as live or as holder.
+        result = self.evaluate(210, [scoped("c1", "CSL-1", U1, "CSL-2")])
+        self.assertEqual(codes(result), [])
+        self.assertNotIn("recursion", result["issues"]["CSL-2"]["claims"])
+        self.assertFalse(result["issues"]["CSL-2"]["claimable"])
+        released = scoped("c1", "CSL-1", U1, "CSL-2", more_edits=[edit(190, U1, "released")])
+        self.assertTrue(self.evaluate(210, [released])["issues"]["CSL-2"]["claimable"])
+
     def test_a_later_child_claim_does_not_displace_the_covering_parent(self):
         child = claim("c2", "CSL-2", U2, at=1, session="cursor/s2", branch="csl-2-work")
         result = self.evaluate(10, [scoped("c1", "CSL-1", U1, "CSL-2"), child])

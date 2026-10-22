@@ -1612,12 +1612,19 @@ class Evaluation:
                 c.uuid: self.takeover_status(c)
                 for c in self.claims.values() if c.issue == issue_id and c.takeovers
             }
+            # A parent claim scoped to this issue that still blocks it (for
+            # example, expired but never released) leaves it unclaimable, as
+            # the overlap check would flag a new claim (Codex 4343611603).
+            covered = any(
+                c.issue != issue_id and issue_id in c.scope_issues(self.issues) and self.blocks_overlap(c, self.now)
+                for c in self.claims.values()
+            )
             issues[issue_id] = {
                 "claims": per_repo,
                 "held": bool(held[issue_id]),
                 "hold_reasons": held[issue_id],
                 "claimable": self.issues[issue_id]["admitted"] and self.issues[issue_id]["next_in_order"]
-                and not held[issue_id] and not any(v["live_claims"] for v in per_repo.values()),
+                and not held[issue_id] and not any(v["live_claims"] for v in per_repo.values()) and not covered,
                 "takeovers": takeovers,
             }
         return {

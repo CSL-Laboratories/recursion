@@ -39,6 +39,12 @@ TOOLS = [
 ]
 
 
+def git(*args: str) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=ROOT, capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+
 def find_tool(name: str) -> str | None:
     """Locate a tool on PATH or in the usual Windows install locations."""
     found = shutil.which(name)
@@ -84,12 +90,9 @@ def main() -> int:
             gaps.append(rel)
 
     try:
-        branch = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=ROOT,
-                                capture_output=True, text=True, check=True).stdout.strip()
-        sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT,
-                             capture_output=True, text=True, check=True).stdout.strip()
-        dirty = subprocess.run(["git", "status", "--porcelain"], cwd=ROOT,
-                               capture_output=True, text=True, check=True).stdout.strip()
+        branch = git("rev-parse", "--abbrev-ref", "HEAD")
+        sha = git("rev-parse", "HEAD")
+        dirty = git("status", "--porcelain")
         print(f"git: branch={branch} head={sha[:12]} {'DIRTY' if dirty else 'clean'}")
         if dirty:
             notes.append("working tree is dirty; commit or stash before experiments")

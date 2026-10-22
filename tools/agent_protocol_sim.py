@@ -1,0 +1,1854 @@
+#!/usr/bin/env python3
+"""Offline checker for the CSL-357 agent work protocol (spec draft v7).
+
+Run from the repository root:
+
+    python -X utf8 -B tools/agent_protocol_sim.py snapshot.json
+
+`evaluate(snapshot)` reads a recorded snapshot of Linear issues and comments,
+commits, agent writes, CI runs and standing-approval actions, and reports live
+claims, winners, holds, takeovers, decisions and protocol violations. It makes
+no network calls and writes nothing.
+
+A clean result shows the snapshot is consistent with the rules. It does not
+show that agents follow them, that a comment's author is who it claims to be,
+or that a founder set the work order: authorship is not verifiable while
+agents post through developer accounts (spec section 2).
+
+Snapshot format (all timestamps ISO 8601 with a UTC offset):
+
+    now                 required; the evaluation time
+    repo                default repository for claims without a `repo:` line
+    config              optional overrides of DEFAULT_CONFIG
+    issues              required; list of
+        {id, status, admitted, next_in_order, blocked_by: [ids],
+         parent: id | null,
+         decision: {options: [..], pings: [ts..], options_changed_at: [ts..],
+                    deadline: ts | null} | null}
+    comments            required; list of
+        {id, issue, created_at, body, edits: [{at, body}], deleted, deleted_at}
+    commits             list of {sha, repo, branch, at, author_kind, claim}
+                        author_kind: agent | human | bot; claim: uuid | null
+    writes              agent writes: list of {kind, issue, claim, at}
+                        kind: push | pr | label | resolve | status
+    runs                list of {id, claim, started_at, ended_at | null}
+    program             {review_slots, occupied_reviews, completed_waiting}
+    admissions          list of {issue, at}
+    sa_actions          list of {sa, action, repo, agent, at}
+
+Comment conventions follow the spec. An agent comment starts with
+`Agent (<tool>/<session>, for <developer>):`; a claim record is an agent
+comment whose first line ends with `claim v1`. Its `scope:` is `whole issue`
+or `sub-issue CSL-N`, which also covers that sub-issue of the claimed issue;
+it may name several claims to take over, one `takeover of <uuid>` line each,
+and `takeovers` in the result gives each one's outcome under `targets`.
+A claim that lost its issue race, or lost at read-back to an earlier claim
+from any session that overlaps it, is a settled loser (D15 as amended,
+CSL-446): it never becomes winner or holder, even after the claim that beat it
+ends, its writes are reported, and it blocks no other claim.
+A release is recorded by a `release v1` record: an agent comment with a
+complete prefix on the claim's issue, whose first line ends with `release v1`
+when posted, made at or after the `released` edit, and not deleted. Its latest
+revision has `claim: <uuid>`, a `reason` of done, handoff, lease expiry,
+abandoned or `decision needed (CSL-N)`, and non-empty `done`, `evidence`,
+`open`, `next` and `files`. A key line starts at the line's beginning and is the
+exact key, optionally followed by one ` (note)`, then `:`; its value runs to the
+next key line, and the first occurrence of a key counts. A reason may also end
+with one ` (note)` (Lucas's decisions, CSL-445 comments 0d05a0b0 and 12051696).
+A released claim without a valid record is reported as `release_without_record`.
+A claim withdrawn, revoked or deleted by the time of its release, or deleted at
+no known time, needs none.
+Human lines (`REVOKE CLAIM`, `HOLD`, `DECISION:`, batched `CSL-N: X; ...`,
+`ACK TAKEOVER`, `Standing approval SA-n`, `REVOKE SA-n`) count only in
+comments without the agent prefix, and keep the effect they had before a known
+deletion time. The one exception is a developer-approved comment
+(`CONTROL_PLANE.md`, D-043): an agent comment with exactly one line
+`developer-approved: <developer>, exact text confirmed <UTC time>, session <id>`
+naming the developer and session of its complete `tool/session` prefix,
+confirmed no later than it was posted and at most `approval_window_minutes`
+(default 15, at most 15) before, and never edited, speaks as that developer. Its prefix and marker lines
+are dropped and the rest is read like a human comment; an invalid marker is
+reported as `developer_approval_invalid` and the comment stays void. A
+developer-approved comment cannot define or revoke a standing approval. Standing
+approvals use machine fields: `actions:` and `scope:` are comma-separated
+tokens, `limits:` holds `per_day=N` and/or `total=N`, and `expires:` is a date;
+each action is checked against the comment revision in effect at its time. An
+agent records a decision answer on the decision issue with the line
+`decision-record: <answer comment id> <option>`. An unprefixed `DECISION:` or
+batched answer posted before `agent_prefix_since` (default 2026-10-21T00:39:04Z,
+the recursion#247 merge; null turns the check off) does not count: it is
+reported as `decision_unverified` and its lines as void, because nothing shows
+a human rather than an agent wrote it (CSL-417, option A; confirmation is not
+modelled). `confirmed-at:` holds a timestamp or a placeholder in parentheses.
+
+A claim's lease runs from its comment's last edit. An expired claim is never
+renewed (CSL-379): an edit made after lease plus grace, other than a release, a
+withdrawal or an objection inside a takeover's wait, is reported as
+`renewed_after_expiry` and leaves the claim expired. A timestamp `heartbeat-at`
+more than `heartbeat_tolerance_seconds` (default 120, which allows for the delay
+between reading the clock and the edit landing) from the time of the edit that
+set it is reported as `heartbeat_time_mismatch`; other values are not checked.
+"""
+from __future__ import annotations
+
+import dataclasses
+import json
+import re
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+DEFAULT_CONFIG: dict[str, Any] = {
+    "lease_minutes": 120,
+    "grace_minutes": 30,
+    "readback_seconds": 60,
+    "takeover_wait_minutes": 15,
+    "coordinator_ack_required": False,
+    "standing_approvals_issue": None,
+    "sa_max_days": 90,
+    "approval_window_minutes": 15,
+    "heartbeat_tolerance_seconds": 120,
+    # Lucas's DECISION on CSL-417 (comment e6d37489): the recursion#247 merge, when the agent-prefix rule took effect.
+    "agent_prefix_since": "2026-10-21T00:39:04Z",
+}
+
+AGENT_PREFIX = re.compile(r"^Agent \(([^)]*)\):")
+CLAIM_HEADER = re.compile(r"claim v1\s*$")
+RELEASE_HEADER = re.compile(r"release v1\s*$")
+RECORD_KEYS = ("claim", "reason", "done", "evidence", "open", "next", "files")
+# The lookahead keeps an unclosed "(" from backtracking over the rest of the line.
+NOTE = r"(?: \((?=[^()\n]*[^()\s])[^()\n]*\))?"
+RECORD_KEY = re.compile(rf"^({'|'.join(RECORD_KEYS)}){NOTE}:(.*)$")
+RELEASE_REASON = re.compile(rf"^(?:done|handoff|lease expiry|abandoned|decision needed \(CSL-[0-9]+\)){NOTE}$")
+FIELD = re.compile(r"^([a-z-]+):\s*(.*)$")
+ISSUE_ID = re.compile(r"^CSL-[0-9]+$")
+UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+REVOKE_CLAIM = re.compile(r"^REVOKE CLAIM (\S+)\s*$")
+HOLD = re.compile(r"^HOLD (CSL-[0-9]+)\s*$")
+DECISION = re.compile(r"^DECISION:\s*([A-Za-z0-9_-]+)")
+BATCH = re.compile(r"CSL-[0-9]+:\s*[A-Za-z0-9_-]+[^;]*(?:;\s*CSL-[0-9]+:\s*[A-Za-z0-9_-]+[^;]*)*;?\s*")
+BATCH_PAIR = re.compile(r"(CSL-[0-9]+):\s*([A-Za-z0-9_-]+)")
+ACK_TAKEOVER = re.compile(r"^ACK TAKEOVER (\S+)\s*$")
+SA_HEADER = re.compile(r"^Standing approval (SA-[0-9]+)\s*$")
+REVOKE_SA = re.compile(r"^REVOKE (SA-[0-9]+)\s*$")
+TAKEOVER = re.compile(r"^takeover of (\S+)\s*$")
+SUB_ISSUE_SCOPE = re.compile(r"^sub-issue (CSL-[0-9]+)$")
+TIMESTAMP_VALUE = re.compile(r"^\d{4}-\d{2}-\d{2}T")
+PLACEHOLDER = re.compile(r"^\([^()\n]*[^()\s][^()\n]*\)$")
+DECISION_RECORD = re.compile(r"^decision-record:\s*(\S+)\s+([A-Za-z0-9_-]+)\s*$")
+DEVELOPER_APPROVED = re.compile(
+    r"^developer-approved:\s*(?P<developer>[^,]+?)\s*,\s*exact text confirmed\s+(?P<at>\S+)\s*,"
+    r"\s*session\s+(?P<session>\S+)\s*$"
+)
+AFTER_END = {
+    "deleted": "after_deletion",
+    "expired": "after_expiry",
+    "revoked": "after_revoke",
+    "released": "after_release",
+    "withdrawn": "after_withdrawal",
+}
+WRITE_KINDS = {"push", "pr", "label", "resolve", "status"}
+AUTHOR_KINDS = {"agent", "human", "bot"}
+STATUSES = {"Triage", "Backlog", "Todo", "In Progress", "In Review", "Done", "Canceled", "Duplicate"}
+
+
+class SnapshotError(ValueError):
+    """The snapshot is malformed; evaluation fails closed."""
+
+
+def parse_ts(value: Any, where: str) -> datetime:
+    if not isinstance(value, str):
+        raise SnapshotError(f"{where}: timestamp must be a string")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise SnapshotError(f"{where}: bad timestamp {value!r}") from exc
+    if parsed.tzinfo is None:
+        raise SnapshotError(f"{where}: timestamp {value!r} has no UTC offset")
+    try:
+        return parsed.astimezone(timezone.utc)
+    except OverflowError as exc:
+        raise SnapshotError(f"{where}: timestamp {value!r} is out of range in UTC") from exc
+
+
+def require(mapping: Any, key: str, where: str) -> Any:
+    if not isinstance(mapping, dict) or key not in mapping:
+        raise SnapshotError(f"{where}: missing {key!r}")
+    return mapping[key]
+
+
+def expect_bool(value: Any, where: str) -> bool:
+    if not isinstance(value, bool):
+        raise SnapshotError(f"{where} must be true or false")
+    return value
+
+
+def expect_list(value: Any, where: str) -> list[Any]:
+    if not isinstance(value, list):
+        raise SnapshotError(f"{where}: expected a list")
+    return value
+
+
+def agent_header(body: str) -> tuple[str, str] | None:
+    """Return (session, developer) for an agent-prefixed body, else None."""
+    first = body.split("\n", 1)[0]
+    match = AGENT_PREFIX.match(first)
+    if not match:
+        return None
+    inner = match.group(1)
+    session, _, developer = inner.partition(", for ")
+    return session.strip(), developer.strip()
+
+
+@dataclasses.dataclass
+class Revision:
+    at: datetime
+    body: str
+
+
+@dataclasses.dataclass
+class Comment:
+    id: str
+    issue: str
+    created_at: datetime
+    revisions: list[Revision]
+    deleted: bool
+    deleted_at: datetime | None = None
+    approved_by: str | None = None
+
+    @property
+    def body(self) -> str:
+        return self.revisions[-1].body
+
+    @property
+    def agent(self) -> tuple[str, str] | None:
+        """The agent header, if any revision carried one.
+
+        A comment that ever had the agent prefix stays an agent comment, so an
+        edit that removes the prefix cannot turn its lines into human
+        directives. `prefix_changed` reports the edit.
+        """
+        if self.approved_by:
+            # Rewritten as the developer's own comment; payload text that looks
+            # like an agent prefix must not reclassify it.
+            return None
+        for revision in self.revisions:
+            header = agent_header(revision.body)
+            if header is not None:
+                return header
+        return None
+
+    @property
+    def prefix_changed(self) -> bool:
+        # Any change to the (session, developer) identity counts, not only
+        # adding or removing the prefix.
+        return len({agent_header(r.body) for r in self.revisions}) > 1
+
+
+@dataclasses.dataclass
+class Claim:
+    uuid: str
+    issue: str
+    repo: str
+    session: str
+    branch: str
+    comment: Comment
+    takeovers: tuple[str, ...]
+    child: str | None = None
+
+    @property
+    def created_at(self) -> datetime:
+        return self.comment.created_at
+
+    def _first_revision(self, predicate) -> datetime | None:
+        for revision in self.comment.revisions:
+            if predicate(claim_fields(revision.body)):
+                return revision.at
+        return None
+
+    def confirmed_at(self) -> datetime | None:
+        """When the claim counts as confirmed: the later of the edit that set
+        `confirmed-at` and the time it declares. An edit cannot backdate a
+        confirmation, and a declared future time is not reached early."""
+        for revision in self.comment.revisions:
+            value = claim_fields(revision.body).get("confirmed-at", "")
+            if TIMESTAMP_VALUE.match(value):
+                return max(revision.at, parse_ts(value, f"claim {self.uuid}: confirmed-at"))
+        return None
+
+    def confirm_edit_at(self) -> datetime | None:
+        """When the edit that set `confirmed-at` was made (for the read-back check)."""
+        return self._first_revision(lambda f: bool(TIMESTAMP_VALUE.match(f.get("confirmed-at", ""))))
+
+    def released_at(self) -> datetime | None:
+        return self._first_revision(lambda f: f.get("_released", False))
+
+    def scope_issues(self, issues: dict[str, dict[str, Any]]) -> list[str]:
+        """The issues the claim covers: its own and, with `scope: sub-issue
+        CSL-N`, that child if it is a sub-issue of the claimed issue."""
+        if self.child is not None and issues[self.child]["parent"] == self.issue:
+            return [self.issue, self.child]
+        return [self.issue]
+
+    def withdrawn_at(self) -> datetime | None:
+        return self._first_revision(lambda f: "withdrawn" in f)
+
+
+def claim_fields(body: str) -> dict[str, Any]:
+    fields: dict[str, Any] = {}
+    for line in body.split("\n")[1:]:
+        line = line.strip()
+        if line == "released" or line == "state: released":
+            fields["_released"] = True
+            continue
+        takeover = TAKEOVER.match(line)
+        if takeover:
+            fields.setdefault("takeover", []).append(takeover.group(1))
+            continue
+        match = FIELD.match(line)
+        if match and match.group(1) not in fields:
+            fields[match.group(1)] = match.group(2).strip()
+    return fields
+
+
+def release_record_fields(body: str) -> dict[str, str]:
+    """Field values of a `release v1` record body, after its first line.
+
+    A value is the rest of its key line plus every line up to the next key
+    line, so bullets under `evidence:` belong to it. Only the first occurrence
+    of a key counts; a later one still ends the field before it.
+    """
+    fields: dict[str, list[str]] = {}
+    current: list[str] = []  # text before the first key line is not kept
+    for line in body.split("\n")[1:]:
+        match = RECORD_KEY.match(line)
+        if match is None:
+            current.append(line)
+            continue
+        current = [match.group(2)]
+        fields.setdefault(match.group(1), current)
+    return {key: "\n".join(lines).strip() for key, lines in fields.items()}
+
+
+@dataclasses.dataclass
+class StandingApproval:
+    sa: str
+    comment: Comment
+    since: datetime
+    actions: set[str]
+    scope: set[str]
+    who: set[str] | None
+    per_day: int | None
+    total: int | None
+    expires: datetime
+
+
+def human_lines(comment: Comment) -> list[str]:
+    if comment.deleted:
+        return []
+    return [line.strip() for line in comment.body.split("\n")]
+
+
+def first_seen(comment: Comment, line: str) -> datetime | None:
+    """When `line` first appeared in the comment, from its revision history."""
+    for revision in comment.revisions:
+        if line in (part.strip() for part in revision.body.split("\n")):
+            return revision.at
+    return None
+
+
+def present_at(comment: Comment, line: str, at: datetime) -> bool:
+    """Whether `line` is in the revision of the comment in effect at `at`."""
+    effective = [r for r in comment.revisions if r.at <= at]
+    return bool(effective) and line in (part.strip() for part in effective[-1].body.split("\n"))
+
+
+def present_since(comment: Comment, line: str, at: datetime) -> datetime | None:
+    """When `line` last became present without a break up to `at`, or None
+    if the revision in effect at `at` does not contain it."""
+    since = None
+    for revision in comment.revisions:
+        if revision.at > at:
+            break
+        if line in (part.strip() for part in revision.body.split("\n")):
+            since = revision.at if since is None else since
+        else:
+            since = None
+    return since
+
+
+class Evaluation:
+    def __init__(self, snapshot: dict[str, Any]):
+        if not isinstance(snapshot, dict):
+            raise SnapshotError("snapshot must be an object")
+        self.now = parse_ts(require(snapshot, "now", "snapshot"), "now")
+        self.repo = snapshot.get("repo", "default")
+        if not isinstance(self.repo, str) or not self.repo:
+            raise SnapshotError("repo must be a non-empty string")
+        config = snapshot.get("config", {})
+        unknown = set(config) - set(DEFAULT_CONFIG)
+        if unknown:
+            raise SnapshotError(f"config: unknown keys {sorted(unknown)}")
+        self.config = {**DEFAULT_CONFIG, **config}
+        # Lucas's DECISION on CSL-411 (comment 8cda521b): the approval window never exceeds 15 minutes.
+        for key, limit in (("lease_minutes", 10**6), ("grace_minutes", 10**6), ("readback_seconds", 10**6),
+                           ("takeover_wait_minutes", 10**6), ("sa_max_days", 10**6), ("approval_window_minutes", 15),
+                           ("heartbeat_tolerance_seconds", 10**6)):
+            value = self.config[key]
+            if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= limit:
+                raise SnapshotError(f"config: {key} must be an integer from 0 to {limit}")
+        if not isinstance(self.config["coordinator_ack_required"], bool):
+            raise SnapshotError("config: coordinator_ack_required must be a boolean")
+        if self.config["standing_approvals_issue"] is not None and not isinstance(self.config["standing_approvals_issue"], str):
+            raise SnapshotError("config: standing_approvals_issue must be an issue id or null")
+        since = self.config["agent_prefix_since"]
+        self.agent_prefix_since = None if since is None else parse_ts(since, "config: agent_prefix_since")
+        self.lease = timedelta(minutes=self.config["lease_minutes"])
+        self.grace = timedelta(minutes=self.config["grace_minutes"])
+        self.readback = timedelta(seconds=self.config["readback_seconds"])
+        self.takeover_wait = timedelta(minutes=self.config["takeover_wait_minutes"])
+        self.heartbeat_tolerance = timedelta(seconds=self.config["heartbeat_tolerance_seconds"])
+        self._revoked: dict[str, datetime | None] = {}
+        # Race winners are cached per settlement horizon (`horizon_at`), so a
+        # winner found under one horizon is never reused under another.
+        self._winners: dict[tuple[str, str, datetime, datetime | None], Claim | None] = {}
+        self._losses: dict[tuple[str, str], Claim | None] = {}
+        self._horizon: datetime | None = None
+        self.violations: list[dict[str, Any]] = []
+        self.void_lines: list[dict[str, str]] = []
+        self.issues = self._load_issues(require(snapshot, "issues", "snapshot"))
+        self.comments = self._load_comments(require(snapshot, "comments", "snapshot"))
+        self.claims = self._load_claims()
+        self.release_records = self._load_release_records()
+        self.late_renewals = {uuid: self._late_renewals(claim) for uuid, claim in self.claims.items()}
+        self.commits = self._load_list(snapshot, "commits", ("sha", "branch", "at", "author_kind"))
+        self.writes = self._load_list(snapshot, "writes", ("kind", "issue", "claim", "at"))
+        self.runs = self._load_list(snapshot, "runs", ("id", "claim", "started_at"))
+        self.admissions = self._load_list(snapshot, "admissions", ("issue", "at"))
+        self.sa_actions = self._load_list(snapshot, "sa_actions", ("sa", "action", "repo", "agent", "at"))
+        self.program = self._load_program(snapshot.get("program"))
+        for commit in self.commits:
+            if not isinstance(commit["author_kind"], str) or commit["author_kind"] not in AUTHOR_KINDS:
+                raise SnapshotError(f"commit {commit['sha']}: unknown author_kind")
+        for write in self.writes:
+            if not isinstance(write["kind"], str) or write["kind"] not in WRITE_KINDS:
+                raise SnapshotError(f"write: unknown kind {write['kind']!r}")
+            self._known_issue(write["issue"], "write")
+        for admission in self.admissions:
+            self._known_issue(admission["issue"], "admission")
+        for run in self.runs:
+            if not isinstance(run["claim"], str) or run["claim"] not in self.claims:
+                raise SnapshotError(f"run {run['id']}: unknown claim {run['claim']!r}")
+        for action in self.sa_actions:
+            if not isinstance(action["agent"], str) or not action["agent"].strip():
+                raise SnapshotError("sa_actions: agent must be a non-empty string")
+
+    # Loading ---------------------------------------------------------------
+
+    def _known_issue(self, issue: str, where: str) -> None:
+        if issue not in self.issues:
+            raise SnapshotError(f"{where}: unknown issue {issue!r}")
+
+    def _load_issues(self, raw: Any) -> dict[str, dict[str, Any]]:
+        if not isinstance(raw, list):
+            raise SnapshotError("issues must be a list")
+        issues: dict[str, dict[str, Any]] = {}
+        for item in raw:
+            issue_id = require(item, "id", "issue")
+            if not isinstance(issue_id, str) or not ISSUE_ID.match(issue_id):
+                raise SnapshotError(f"issue: bad id {issue_id!r}")
+            if issue_id in issues:
+                raise SnapshotError(f"issue {issue_id}: duplicate")
+            status = require(item, "status", issue_id)
+            if status not in STATUSES:
+                raise SnapshotError(f"issue {issue_id}: unknown status {status!r}")
+            decision = item.get("decision")
+            if decision is not None:
+                options = require(decision, "options", issue_id)
+                if not isinstance(options, list) or not options:
+                    raise SnapshotError(f"issue {issue_id}: decision needs options")
+                decision = {
+                    "options": [str(option) for option in options],
+                    "pings": [parse_ts(t, issue_id) for t in expect_list(decision.get("pings", []), issue_id)],
+                    "options_changed_at": [
+                        parse_ts(t, issue_id) for t in expect_list(decision.get("options_changed_at", []), issue_id)
+                    ],
+                    "deadline": parse_ts(decision["deadline"], issue_id) if decision.get("deadline") else None,
+                }
+            admitted = expect_bool(item.get("admitted", False), f"issue {issue_id}: admitted")
+            if status == "Triage" and admitted:
+                raise SnapshotError(f"issue {issue_id}: a Triage issue cannot be admitted")
+            issues[issue_id] = {
+                "status": status,
+                "admitted": admitted,
+                "next_in_order": expect_bool(item.get("next_in_order", False), f"issue {issue_id}: next_in_order"),
+                "blocked_by": [str(b) for b in expect_list(item.get("blocked_by", []), issue_id)],
+                "decision": decision,
+                "parent": item.get("parent"),
+            }
+        for issue_id, issue in issues.items():
+            for blocker in issue["blocked_by"]:
+                self._check_issue_ref(issues, blocker, issue_id)
+            parent = issue["parent"]
+            if parent is not None and (not isinstance(parent, str) or parent not in issues):
+                raise SnapshotError(f"issue {issue_id}: unknown parent {parent!r}")
+        for issue_id in issues:
+            # Follow parents up; a chain that returns to an issue is a cycle.
+            seen, current = {issue_id}, issues[issue_id]["parent"]
+            while current is not None:
+                if current in seen:
+                    raise SnapshotError(f"issue {issue_id}: parent chain loops")
+                seen.add(current)
+                current = issues[current]["parent"]
+        return issues
+
+    @staticmethod
+    def _check_issue_ref(issues: dict[str, Any], ref: str, where: str) -> None:
+        if ref not in issues:
+            raise SnapshotError(f"issue {where}: blocked_by unknown issue {ref!r}")
+
+    def _load_comments(self, raw: Any) -> list[Comment]:
+        if not isinstance(raw, list):
+            raise SnapshotError("comments must be a list")
+        seen: set[str] = set()
+        comments = []
+        for item in raw:
+            comment_id = require(item, "id", "comment")
+            if comment_id in seen:
+                raise SnapshotError(f"comment {comment_id}: duplicate id")
+            seen.add(comment_id)
+            issue = require(item, "issue", comment_id)
+            self._known_issue(issue, f"comment {comment_id}")
+            created = parse_ts(require(item, "created_at", comment_id), comment_id)
+            if created > self.now:
+                raise SnapshotError(f"comment {comment_id}: created after the snapshot time")
+            body = require(item, "body", comment_id)
+            if not isinstance(body, str):
+                raise SnapshotError(f"comment {comment_id}: body must be a string")
+            revisions = [Revision(created, body)]
+            for edit in expect_list(item.get("edits", []), comment_id):
+                at = parse_ts(require(edit, "at", comment_id), comment_id)
+                if at < revisions[-1].at:
+                    raise SnapshotError(f"comment {comment_id}: edits out of order")
+                if at > self.now:
+                    raise SnapshotError(f"comment {comment_id}: edited after the snapshot time")
+                edited = require(edit, "body", comment_id)
+                if not isinstance(edited, str):
+                    raise SnapshotError(f"comment {comment_id}: edit body must be a string")
+                revisions.append(Revision(at, edited))
+            deleted = expect_bool(item.get("deleted", False), f"comment {comment_id}: deleted")
+            deleted_at = item.get("deleted_at")
+            if deleted_at is not None:
+                if not deleted:
+                    raise SnapshotError(f"comment {comment_id}: deleted_at without deleted")
+                deleted_at = parse_ts(deleted_at, comment_id)
+                if deleted_at > self.now or deleted_at < created:
+                    raise SnapshotError(f"comment {comment_id}: deleted_at outside the comment's life")
+                if revisions[-1].at > deleted_at:
+                    raise SnapshotError(f"comment {comment_id}: edited after deleted_at")
+            comment = Comment(comment_id, issue, created, revisions, deleted, deleted_at)
+            developer, problem = self.developer_approval(comment)
+            if developer is not None:
+                # A valid developer-approved comment speaks as that developer
+                # (CONTROL_PLANE.md, D-043): its lines count as if the developer
+                # had posted them, without the prefix and marker lines.
+                lines = body.split("\n")[1:]
+                kept = [line for line in lines if not line.strip().startswith("developer-approved:")]
+                comment = Comment(comment_id, issue, created, [Revision(created, "\n".join(kept))],
+                                  deleted, deleted_at, approved_by=developer)
+            elif problem is not None:
+                self.violation("developer_approval_invalid", issue, detail=f"{comment_id}: {problem}")
+            comments.append(comment)
+        return comments
+
+    def developer_approval(self, comment: Comment) -> tuple[str | None, str | None]:
+        """(developer, None) if the comment is a valid developer-approved comment,
+        (None, reason) if it carries a marker that does not count, else (None, None).
+
+        D-043 conditions checked here: the agent-prefixed comment carries one
+        `developer-approved:` line naming the developer the prefix acts for and
+        its complete `tool/session` prefix, the approval was confirmed no later
+        than the posting time and within `approval_window_minutes` before it
+        (default 15, at most 15), and the comment was never edited. Authority (condition 4) and accepted
+        contracts (condition 5) are not in the snapshot and are not checked.
+        """
+        first = comment.revisions[0].body
+        header = agent_header(first)
+        lines = [line.strip() for line in first.split("\n")]
+        marks = [line for line in lines[1:] if line.startswith("developer-approved:")]
+        if header is not None and not marks and any(
+            line.strip().startswith("developer-approved:")
+            for revision in comment.revisions[1:]
+            for line in revision.body.split("\n")[1:]
+        ):
+            return None, "edited after posting"
+        if header is None or not marks:
+            return None, None
+        if CLAIM_HEADER.search(lines[0]):
+            return None, "a claim record cannot be developer-approved"
+        if len(marks) > 1:
+            return None, "more than one developer-approved line"
+        if any(AGENT_PREFIX.match(line) for line in lines[1:]):
+            return None, "agent prefix inside the approved text"
+        match = DEVELOPER_APPROVED.match(marks[0])
+        if not match:
+            return None, "malformed developer-approved line"
+        if len(comment.revisions) > 1:
+            return None, "edited after posting"
+        session, developer = header
+        tool, slash, session_id = session.partition("/")
+        if not (tool.strip() and slash and session_id.strip() and developer):
+            return None, "incomplete agent prefix"
+        if match["developer"] != developer:
+            return None, f"approved by {match['developer']!r} but posted for {developer!r}"
+        if match["session"] not in {session, session.partition("/")[2]}:
+            return None, "session does not match the agent prefix"
+        try:
+            confirmed = parse_ts(match["at"], f"comment {comment.id}: developer-approved")
+        except (SnapshotError, OverflowError):
+            return None, "bad confirmation time"
+        if confirmed > comment.created_at:
+            return None, "approval confirmed after posting"
+        window = self.config["approval_window_minutes"]
+        if comment.created_at - confirmed > timedelta(minutes=window):
+            # Lucas's DECISION on CSL-402 (comment b3c5c1b8): at most 15 minutes.
+            return None, f"approval confirmed more than {window} minutes before posting"
+        return developer, None
+
+    def _load_list(self, snapshot: dict[str, Any], key: str, required: tuple[str, ...]) -> list[dict[str, Any]]:
+        raw = snapshot.get(key, [])
+        if not isinstance(raw, list):
+            raise SnapshotError(f"{key} must be a list")
+        items = []
+        for item in raw:
+            entry = dict(item) if isinstance(item, dict) else None
+            for field in required:
+                require(entry, field, key)
+            for field in ("at", "started_at", "ended_at"):
+                if field not in entry:
+                    continue
+                if entry[field] is None and field == "ended_at":
+                    continue
+                entry[field] = parse_ts(entry[field], key)
+                if entry[field] > self.now:
+                    raise SnapshotError(f"{key}: {field} after the snapshot time")
+            if entry.get("ended_at") is not None and "started_at" in entry and entry["ended_at"] < entry["started_at"]:
+                raise SnapshotError(f"{key}: ended_at before started_at")
+            items.append(entry)
+        return items
+
+    @staticmethod
+    def _load_program(raw: Any) -> dict[str, int] | None:
+        if raw is None:
+            return None
+        if not isinstance(raw, dict):
+            raise SnapshotError("program must be an object")
+        program = {}
+        for key in ("review_slots", "occupied_reviews", "completed_waiting"):
+            value = raw.get(key, 0)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise SnapshotError(f"program: {key} must be a non-negative integer")
+            program[key] = value
+        if program["review_slots"] == 0:
+            raise SnapshotError("program: review_slots must be positive")
+        return program
+
+    def _load_claims(self) -> dict[str, Claim]:
+        claims: dict[str, Claim] = {}
+        for comment in self.comments:
+            header = comment.agent
+            first = comment.revisions[0].body.split("\n", 1)[0]
+            if not header or not CLAIM_HEADER.search(first):
+                continue
+            tool, slash, session = header[0].partition("/")
+            if not (tool.strip() and slash and session.strip() and header[1]):
+                raise SnapshotError(f"claim comment {comment.id}: incomplete agent prefix")
+            fields = claim_fields(comment.revisions[0].body)
+            for key in ("claim", "scope", "branch"):
+                if not fields.get(key):
+                    raise SnapshotError(f"claim comment {comment.id}: missing {key!r}")
+            def identity(found: dict[str, Any]) -> dict[str, Any]:
+                branch = found.get("branch")
+                return {
+                    "claim": found.get("claim"),
+                    "scope": found.get("scope"),
+                    "branch": branch.split(" @", 1)[0].strip() if isinstance(branch, str) else branch,
+                    "repo": found.get("repo"),
+                    "takeover": tuple(found.get("takeover", ())),
+                }
+
+            original = identity(fields)
+            for revision in comment.revisions:
+                revised = claim_fields(revision.body)
+                value = revised.get("confirmed-at", "")
+                if value and not PLACEHOLDER.match(value):
+                    parse_ts(value, f"claim comment {comment.id}: confirmed-at")
+                # A claim's identity is fixed when it is posted; an edit may
+                # confirm, renew or release it but not change or drop a field.
+                changed = sorted(k for k, v in identity(revised).items() if v != original[k])
+                if changed:
+                    raise SnapshotError(f"claim comment {comment.id}: edit changes {', '.join(changed)}")
+            uuid = fields["claim"]
+            if not UUID.match(uuid):
+                raise SnapshotError(f"claim comment {comment.id}: bad uuid {uuid!r}")
+            takeovers = tuple(fields.get("takeover", ()))
+            if len(set(takeovers)) != len(takeovers):
+                raise SnapshotError(f"claim comment {comment.id}: the same claim is taken over twice")
+            child = None
+            if fields["scope"] != "whole issue":
+                scoped = SUB_ISSUE_SCOPE.match(fields["scope"])
+                if not scoped:
+                    raise SnapshotError(f"claim comment {comment.id}: unknown scope {fields['scope']!r}")
+                child = scoped.group(1)
+                self._known_issue(child, f"claim comment {comment.id}: scope")
+            if uuid in claims:
+                raise SnapshotError(f"claim {uuid}: duplicate")
+            branch = fields["branch"].split(" @", 1)[0].strip()
+            claims[uuid] = Claim(
+                uuid=uuid,
+                issue=comment.issue,
+                repo=fields.get("repo", self.repo),
+                session=header[0],
+                branch=branch,
+                comment=comment,
+                takeovers=takeovers,
+                child=child,
+            )
+        return claims
+
+    def _load_release_records(self) -> dict[str, list[tuple[Comment, dict[str, str]]]]:
+        """Release records by the claim they name, with their fields.
+
+        As with claim records, only the first line of the comment as posted
+        makes it a record, so a record quoted inside another comment is not
+        one, and a developer-approved comment, which loses its prefix at load,
+        is not one either. A malformed record is not a snapshot error: it counts
+        for no claim.
+        """
+        records: dict[str, list[tuple[Comment, dict[str, str]]]] = {}
+        for comment in self.comments:
+            if comment.deleted:
+                continue
+            first = comment.revisions[0].body.split("\n", 1)[0]
+            header = agent_header(first)
+            if header is None or not RELEASE_HEADER.search(first):
+                continue
+            tool, slash, session = header[0].partition("/")
+            if not (tool.strip() and slash and session.strip() and header[1]):
+                continue
+            fields = release_record_fields(comment.body)
+            records.setdefault(fields.get("claim", ""), []).append((comment, fields))
+        return records
+
+    def _late_renewals(self, claim: Claim) -> list[Revision]:
+        """Edits that tried to renew `claim` after its lease plus grace had passed.
+
+        An expired claim is never renewed (CSL-379): such an edit does not
+        count as a heartbeat, so the claim stays expired and a fresh claim or
+        takeover is still needed. A release or withdrawal is the right answer
+        to expiry and ends the scan. An edit inside a takeover's wait is the
+        original claimant's objection to that takeover, which the takeover
+        rules handle, so it still counts; this includes a premature takeover,
+        which is refused and reported as such.
+        """
+        takers = [
+            other.created_at for other in self.claims.values()
+            if claim.uuid in other.takeovers and other.issue == claim.issue and other.repo == claim.repo
+        ]
+        last = claim.comment.revisions[0].at
+        late = []
+        for revision in claim.comment.revisions[1:]:
+            fields = claim_fields(revision.body)
+            if fields.get("_released") or "withdrawn" in fields:
+                break
+            objection = any(posted <= revision.at <= posted + self.takeover_wait for posted in takers)
+            if revision.at > last + self.lease + self.grace and not objection:
+                late.append(revision)
+            else:
+                last = revision.at
+        return late
+
+    def last_renewal(self, claim: Claim, at: datetime) -> datetime:
+        """The claim comment's last update at `at` that counts as a heartbeat."""
+        late = self.late_renewals.get(claim.uuid, [])
+        return max(r.at for r in claim.comment.revisions if r.at <= at and not any(r is x for x in late))
+
+    # Helpers ---------------------------------------------------------------
+
+    def violation(self, code: str, issue: str | None = None, claim: str | None = None, detail: str = "") -> None:
+        entry = {"code": code, "issue": issue, "claim": claim, "detail": detail}
+        if entry not in self.violations:
+            self.violations.append(entry)
+
+    def human_comments(self) -> list[Comment]:
+        return [c for c in self.comments if not c.deleted and c.agent is None]
+
+    def directive_lines(self, issue: str | None = None) -> list[tuple[Comment, str, datetime]]:
+        """(comment, line, first seen) for every line ever in a human comment.
+
+        A comment deleted at a known time keeps the lines it had before the
+        deletion; one deleted at an unknown time keeps none.
+        """
+        found = []
+        for comment in self.comments:
+            if comment.agent is not None or (issue is not None and comment.issue != issue):
+                continue
+            if comment.deleted and comment.deleted_at is None:
+                continue
+            lines = {part.strip() for revision in comment.revisions for part in revision.body.split("\n")}
+            for line in sorted(lines):
+                seen = first_seen(comment, line)
+                if seen is not None and (comment.deleted_at is None or seen < comment.deleted_at):
+                    found.append((comment, line, seen))
+        return found
+
+    def revoked_at(self, claim: Claim) -> datetime | None:
+        """When a revoke line naming the claim first appeared (edits are not backdated)."""
+        if claim.uuid in self._revoked:
+            return self._revoked[claim.uuid]
+        times = [
+            seen for _, line, seen in self.directive_lines(claim.issue)
+            if (m := REVOKE_CLAIM.match(line)) and m.group(1) == claim.uuid
+        ]
+        self._revoked[claim.uuid] = min(times) if times else None
+        return self._revoked[claim.uuid]
+
+    def ended(self, claim: Claim, at: datetime) -> str | None:
+        """Why the claim is not live at `at`, or None if it is live."""
+        if claim.created_at > at:
+            return "not yet posted"
+        if claim.comment.deleted and (claim.comment.deleted_at is None or claim.comment.deleted_at <= at):
+            return "deleted"
+        for label, when in (
+            ("withdrawn", claim.withdrawn_at()),
+            ("released", claim.released_at()),
+            ("revoked", self.revoked_at(claim)),
+        ):
+            if when is not None and when <= at:
+                return label
+        if at > self.last_renewal(claim, at) + self.lease:
+            return "expired"
+        return None
+
+    def takeover_status(self, claim: Claim, at: datetime | None = None) -> dict[str, Any] | None:
+        """The takeover's outcome at `at`, or None if the claim names none.
+
+        A claim may take over several expired claims, one `takeover of` line
+        each (decision 2, CSL-389 comment 425b223c). It is allowed only if
+        every named claim meets the conditions; `targets` has each outcome.
+        """
+        if not claim.takeovers:
+            return None
+        at = self.now if at is None else at
+        targets = {uuid: self.target_status(claim, uuid, at) for uuid in claim.takeovers}
+        refused = [uuid for uuid in claim.takeovers if not targets[uuid]["allowed"]]
+        if len(claim.takeovers) == 1:
+            reason = targets[claim.takeovers[0]]["reason"]
+        elif refused:
+            reason = f"{refused[0]}: {targets[refused[0]]['reason']}"
+        else:
+            reason = "conditions met for every claim"
+        return {"of": list(claim.takeovers), "allowed": not refused, "reason": reason, "targets": targets}
+
+    def ended_before_takeover(self, old: Claim, posted: datetime) -> str | None:
+        """How `old` had ended when a takeover of it was posted, if it had.
+
+        A deletion with no recorded time could have come after the takeover,
+        so it does not count as having ended before it.
+        """
+        ended = self.ended(old, posted)
+        if ended == "deleted" and old.comment.deleted_at is None:
+            # A release, withdrawal or revoke with a known time still counts.
+            for label, when in (
+                ("withdrawn", old.withdrawn_at()),
+                ("released", old.released_at()),
+                ("revoked", self.revoked_at(old)),
+            ):
+                if when is not None and when <= posted:
+                    return label
+            return None
+        return ended if ended in {"withdrawn", "released", "revoked", "deleted"} else None
+
+    def target_status(self, claim: Claim, target: str, at: datetime) -> dict[str, Any]:
+        """Whether `claim` may take over the claim `target` at `at`."""
+        old = self.claims.get(target)
+        posted = claim.created_at
+        if old is None:
+            return {"allowed": False, "reason": "unknown claim"}
+        if old.issue != claim.issue or old.repo != claim.repo:
+            return {"allowed": False, "reason": "claim on another issue or repository"}
+        if old.created_at >= posted:
+            return {"allowed": False, "reason": "original posted after the takeover"}
+        if at < posted + self.takeover_wait:
+            return {"allowed": False, "reason": "takeover wait not over"}
+        ended = self.ended_before_takeover(old, posted)
+        if ended is not None:
+            return {"allowed": True, "reason": f"original {ended}"}
+        # Faults fixed at posting come first, so nothing the original claimant
+        # does later (objecting, then releasing) can make a premature takeover
+        # allowed.
+        refusal = self.posting_refusal(claim, old)
+        if refusal is not None:
+            return refusal
+        objection = [
+            r.at for r in old.comment.revisions
+            if posted <= r.at <= posted + self.takeover_wait
+            and not claim_fields(r.body).get("_released") and "withdrawn" not in claim_fields(r.body)
+        ]
+        finished = self.ended(old, at)
+        if objection and finished not in {"withdrawn", "released", "revoked", "deleted"}:
+            # A renewal objects to the takeover, but a later release, withdrawal,
+            # revoke or deletion of the original ends that objection.
+            return {"allowed": False, "reason": "original claimant renewed within the wait"}
+        if self.config["coordinator_ack_required"]:
+            # The acknowledgement must still be in the comment, and the comment
+            # not deleted, at the time being judged.
+            acked = any(
+                (m := ACK_TAKEOVER.match(line)) and m.group(1) == old.uuid
+                and (since := present_since(c, line, at)) is not None and posted <= since
+                and not (c.deleted_at is not None and c.deleted_at <= at)
+                for c, line, _ in self.directive_lines(claim.issue)
+            )
+            if not acked:
+                return {"allowed": False, "reason": "coordinator acknowledgement missing"}
+        if objection:
+            return {"allowed": True, "reason": f"original {finished} after objecting"}
+        return {"allowed": True, "reason": "conditions met"}
+
+    def took_effect(self, taker: Claim, at: datetime) -> bool:
+        """Whether `taker`'s takeover took effect by `at`.
+
+        It did if, at some moment from the end of its wait up to `at`, the
+        taker was still live and the takeover was allowed. A taker that
+        withdrew, released, was revoked or was deleted before then never held
+        the claims it named, so they still need a takeover.
+        """
+        start = taker.created_at + self.takeover_wait
+        if start > at:
+            return False
+        # The outcome changes only when a comment on the issue changes.
+        moments = {start}
+        for comment in self.comments:
+            if comment.issue != taker.issue:
+                continue
+            moments.update(r.at for r in comment.revisions if start < r.at <= at)
+            if comment.deleted_at is not None and start < comment.deleted_at <= at:
+                moments.add(comment.deleted_at)
+        # A taker that lost its own overlap or race never held its issue, so
+        # its takeover cannot clear the claims it named.
+        return any(
+            self.ended(taker, moment) is None and self.takeover_status(taker, moment)["allowed"]
+            and not self.lost_by(taker, moment)
+            for moment in sorted(moments)
+        )
+
+    def lost_by(self, taker: Claim, moment: datetime) -> bool:
+        """Whether `taker` had lost by `moment`, for `took_effect`.
+
+        A race lost at the instant the takeover wait ends counts against the
+        taker, so the race counts from its own settle instant; the overlap, as
+        in `settled_loss`, only once settled before the moment (Samir, PR #282
+        comment 4347949974). While a part is being settled, only parts settled
+        strictly before it count, so a part never asks for itself.
+        """
+        return any(
+            self._settled(taker, kind, when) is not None
+            for kind, when in self.settle_times(taker)
+            if (when <= moment if kind == "race" else when < moment)
+            and (self._horizon is None or when < self._horizon)
+        )
+
+    def posting_refusal(self, claim: Claim, old: Claim) -> dict[str, Any] | None:
+        """Why a takeover of a still-held `old` was not allowed when posted, or None."""
+        posted = claim.created_at
+        last = self.last_renewal(old, posted)
+        if posted <= last + self.lease + self.grace:
+            return {"allowed": False, "reason": "lease plus grace not passed"}
+        newer = [
+            c for c in self.commits
+            if c.get("repo", self.repo) == old.repo and c["branch"] == old.branch and last < c["at"] <= posted
+        ]
+        if newer:
+            return {"allowed": False, "reason": "commit newer than the last heartbeat"}
+        running = [
+            r for r in self.runs
+            if r["claim"] == old.uuid and r["started_at"] <= posted and (r.get("ended_at") is None or r["ended_at"] > posted)
+        ]
+        if running:
+            return {"allowed": False, "reason": "claimant run in progress"}
+        return None
+
+    def horizon_at(self, at: datetime) -> datetime:
+        """The settlement horizon for a race or live set evaluated at `at`:
+        only loss parts settled strictly before it count (Samir, PR #282
+        comment 4347949974). Inside a part's settlement it never moves later."""
+        return at if self._horizon is None else min(self._horizon, at)
+
+    def live_claims(self, issue: str, repo: str, at: datetime) -> list[Claim]:
+        """The claims live on the issue at `at` that may win its race. Like
+        the race, this counts only loss parts settled strictly before `at`."""
+        outer, self._horizon = self._horizon, self.horizon_at(at)
+        try:
+            return self._live_claims(issue, repo, at)
+        finally:
+            self._horizon = outer
+
+    def _live_claims(self, issue: str, repo: str, at: datetime) -> list[Claim]:
+        candidates = [
+            c for c in self.claims.values()
+            if c.issue == issue and c.repo == repo and self.ended(c, at) is None and self.settled_loss(c, at) is None
+        ]
+        superseded = set()
+        refused = set()
+        for claim in candidates:
+            # A claim that lands on another expired, never-superseded claim
+            # without taking it over cannot win, whether it names no takeover
+            # or a different one (as check_implicit_takeover reports).
+            bypasses = any(
+                other.uuid != claim.uuid and other.uuid not in claim.takeovers
+                and other.issue == claim.issue and other.repo == claim.repo
+                and other.created_at < claim.created_at and self.bypassed_expired(claim, other)
+                for other in self.claims.values()
+            )
+            status = self.takeover_status(claim, at)
+            if bypasses or (status is not None and not status["allowed"]):
+                refused.add(claim.uuid)
+            elif status is not None:
+                superseded.update(status["of"])
+        return [c for c in candidates if c.uuid not in superseded and c.uuid not in refused]
+
+    def settled_loss(self, claim: Claim, at: datetime) -> Claim | None:
+        """The claim that `claim` lost to, if that loss was settled before `at`.
+
+        A claim that lost its issue race, or lost at read-back to an earlier
+        overlapping claim from any session, stays a settled loser. It never
+        becomes winner or holder, even after the claim that beat it ends, and
+        it blocks no one; it must withdraw and post a fresh claim (D15 as
+        amended by Lucas's decision, CSL-446 comment 2b10e162). The overlap is
+        settled at the end of the read-back window, the race when the claim
+        could first be live.
+        """
+        lost = None
+        for kind, when in self.settle_times(claim):
+            if when < at and (self._horizon is None or when < self._horizon):
+                lost = lost or self._settled(claim, kind, when)
+        return lost
+
+    def settle_times(self, claim: Claim) -> tuple[tuple[str, datetime], ...]:
+        """When each part of a possible loss is settled: an overlap at the
+        end of the read-back window, the race when the claim could first be
+        live."""
+        return (("overlap", claim.created_at + self.readback), ("race", self.settles_at(claim)))
+
+    def _settled(self, claim: Claim, kind: str, when: datetime) -> Claim | None:
+        """One part of `settled_loss`, decided at `when` and cached. While it
+        is decided, `when` is the settlement horizon: only parts settled
+        strictly before it count, in `settled_loss` and `took_effect` alike, so
+        the part never reads itself and its value does not depend on who asks."""
+        key = (claim.uuid, kind)
+        if key not in self._losses:
+            outer, self._horizon = self._horizon, when
+            try:
+                if kind == "race":
+                    won = self.winner(claim.issue, claim.repo, when)
+                    beaten = won is not None and won.uuid != claim.uuid and won.uuid not in claim.takeovers
+                    self._losses[key] = won if beaten else None
+                else:
+                    blocker = self.earlier_overlap(claim, when)
+                    self._losses[key] = blocker[0] if blocker else None
+            finally:
+                self._horizon = outer
+        return self._losses[key]
+
+    def settles_at(self, claim: Claim) -> datetime:
+        """When the claim's race is decided: the end of the read-back window,
+        or for a takeover, the end of its wait, before which it cannot win."""
+        if claim.takeovers:
+            return claim.created_at + max(self.readback, self.takeover_wait)
+        return claim.created_at + self.readback
+
+    def winner(self, issue: str, repo: str, at: datetime) -> Claim | None:
+        key = (issue, repo, at, self.horizon_at(at))
+        if key not in self._winners:
+            live = self.live_claims(issue, repo, at)
+            self._winners[key] = min(live, key=lambda c: (c.created_at, c.uuid)) if live else None
+        return self._winners[key]
+
+    def holder(self, issue: str, repo: str, at: datetime) -> Claim | None:
+        """The race winner, unless an earlier claim, from this or another
+        session, blocks it by scope or branch. The race itself stays on the
+        unfiltered live claims, so a later claim on the issue loses to the
+        blocked one until that claim's loss is settled at its read-back
+        deadline (`settled_loss`). With no unblocked winner, a parent claim whose
+        `scope: sub-issue` covers the issue holds it if that parent claim
+        holds its own issue; otherwise nobody holds the issue."""
+        winner = self.winner(issue, repo, at)
+        if winner is not None and self.earlier_overlap(winner, at) is None:
+            return winner
+        for parent in self.covering_claims(issue, repo, at):
+            if self.winner(parent.issue, repo, at) is parent and self.earlier_overlap(parent, at) is None:
+                return parent
+        return None
+
+    def covering_claims(self, issue: str, repo: str, at: datetime) -> list[Claim]:
+        """Live claims on other issues whose `scope: sub-issue` covers `issue`."""
+        return sorted(
+            (c for c in self.claims.values()
+             if c.repo == repo and c.issue != issue and issue in c.scope_issues(self.issues)
+             and c in self.live_claims(c.issue, repo, at)),
+            key=lambda c: (c.created_at, c.uuid),
+        )
+
+    def overlap(self, claim: Claim, other: Claim) -> str | None:
+        """How two claims in one repository on different issues overlap:
+        `scope` when their covered issues intersect (a `scope: sub-issue`
+        child counts, in either order), `branch` when they name the same
+        branch, or None. Claims on the same issue race instead (`winner`)."""
+        if other.uuid == claim.uuid or other.repo != claim.repo or other.issue == claim.issue:
+            return None
+        if set(claim.scope_issues(self.issues)) & set(other.scope_issues(self.issues)):
+            return "scope"
+        if other.branch == claim.branch:
+            return "branch"
+        return None
+
+    def blocks_overlap(self, other: Claim, at: datetime, settled_losers: bool = False) -> bool:
+        """True if `other` still blocks an overlapping claim at `at`: it is
+        live, or it expired without a release, withdrawal, revoke, deletion
+        or a takeover that took effect, as on a single issue. A settled loser
+        blocks no one, unless `settled_losers` asks for the session check."""
+        if not settled_losers and self.settled_loss(other, at) is not None:
+            return False
+        state = self.ended(other, at)
+        if state == "expired":
+            return not any(
+                other.uuid in t.takeovers and t.created_at <= at and self.took_effect(t, at)
+                for t in self.claims.values()
+            )
+        return state is None
+
+    def earlier_overlap(self, claim: Claim, at: datetime, other_sessions: bool = False) -> tuple[Claim, str] | None:
+        """The earliest claim posted before `claim` that still blocks it at
+        `at` and overlaps it, with how. A claim `claim` takes over does not
+        count."""
+        found = sorted(
+            (other for other in self.claims.values()
+             if (other.created_at, other.uuid) < (claim.created_at, claim.uuid)
+             and (not other_sessions or other.session != claim.session)
+             and other.uuid not in claim.takeovers
+             and self.overlap(claim, other) is not None and self.blocks_overlap(other, at)),
+            key=lambda c: (c.created_at, c.uuid),
+        )
+        return (found[0], self.overlap(claim, found[0])) if found else None
+
+    # Decisions -------------------------------------------------------------
+
+    def answer_pairs(self, comment: Comment, body: str) -> list[tuple[str, str, str]]:
+        """(decision issue, option, line) pairs a comment body states."""
+        lines = [line.strip() for line in body.split("\n")]
+        pairs = []
+        for line in lines:
+            match = DECISION.match(line)
+            if match:
+                pairs.append((comment.issue, match.group(1), line))
+        # A batched answer is the comment's first line. In an agent comment the
+        # first line is the agent prefix, so the batch (to be voided) is line 1.
+        first = lines[1] if comment.agent is not None and len(lines) > 1 else lines[0]
+        if BATCH.fullmatch(first):
+            named = [m.groups() for clause in first.split(";") if (m := BATCH_PAIR.match(clause.strip()))]
+            on_decision_issue = self.issues[comment.issue]["decision"] is not None
+            if on_decision_issue and comment.issue in {issue for issue, _ in named}:
+                pairs.extend((issue, value, first) for issue, value in named)
+        return pairs
+
+    def void(self, comment: Comment, line: str, reason: str = "agent-prefixed") -> None:
+        entry = {"comment": comment.id, "line": line, "reason": reason}
+        if entry not in self.void_lines:
+            self.void_lines.append(entry)
+
+    def decisions(self) -> dict[str, dict[str, Any]]:
+        stated: list[tuple[Comment, list[tuple[str, str, str]]]] = []
+        for comment in sorted(self.comments, key=lambda c: (c.created_at, c.id)):
+            if comment.deleted and comment.deleted_at is None:
+                continue
+            original = self.answer_pairs(comment, comment.revisions[0].body)
+            if comment.agent is not None:
+                for _, _, line in original + self.answer_pairs(comment, comment.body):
+                    self.void(comment, line)
+                continue
+            if any(self.answer_pairs(comment, r.body) != original for r in comment.revisions[1:]):
+                self.violation("decision_edited", comment.issue, detail=comment.id)
+            answering = [
+                p for p in original
+                if p[1].lower() != "hold" and self.issues.get(p[0], {}).get("decision") is not None
+            ]
+            if (answering and comment.approved_by is None and self.agent_prefix_since is not None
+                    and comment.created_at < self.agent_prefix_since):
+                # Lucas's DECISION on CSL-417 (comment e6d37489), option A: an unprefixed answer from
+                # before the agent-prefix rule is unverified and does not count. Confirmation is not modelled.
+                for named in dict.fromkeys(named for named, _, _ in answering):
+                    self.violation("decision_unverified", named, detail=comment.id)
+                for _, _, line in answering:
+                    self.void(comment, line, "before the agent-prefix rule")
+                continue
+            stated.append((comment, original))
+        results: dict[str, dict[str, Any]] = {}
+        for issue_id, issue in self.issues.items():
+            spec = issue["decision"]
+            if spec is None:
+                continue
+            answers = []
+            needs_followup = False
+            for comment, pairs in stated:
+                for named, value, _ in pairs:
+                    if named != issue_id or value.lower() == "hold":
+                        continue
+                    if value not in spec["options"]:
+                        needs_followup = True
+                    else:
+                        answers.append(
+                            {"option": value, "comment": comment.id, "at": comment.created_at, "until": comment.deleted_at}
+                        )
+            answer = self.answer_at({"answers": answers}, self.now)
+            first_ping = spec["pings"][0] if spec["pings"] else None
+            if first_ping is not None and any(t > first_ping for t in spec["options_changed_at"]):
+                self.violation("options_changed_after_ping", issue_id)
+            if issue["status"] == "Done" and answer is None:
+                self.violation("decision_closed_without_answer", issue_id)
+            deadline = spec["deadline"]
+            deadline_passed = deadline is not None and self.now > deadline and answer is None
+            repings = spec["pings"][1:]
+            allowed_repings = [t for t in repings if deadline is not None and t > deadline]
+            if len(repings) > 1 or len(allowed_repings) != len(repings):
+                self.violation("repeat_ping", issue_id)
+            results[issue_id] = {
+                "answered": answer is not None,
+                "answer": answer["option"] if answer else None,
+                "answer_comment": answer["comment"] if answer else None,
+                "answered_at": answer["at"] if answer else None,
+                "answers": answers,
+                "held_from": first_ping,
+                "needs_followup": needs_followup and answer is None,
+                "deadline_passed": deadline_passed,
+                "reping_allowed": deadline_passed and not repings,
+            }
+        return results
+
+    @staticmethod
+    def answer_at(state: dict[str, Any], at: datetime) -> dict[str, Any] | None:
+        """The earliest answer in effect at `at` (posted, and not yet deleted)."""
+        live = [a for a in state["answers"] if a["at"] <= at and (a["until"] is None or at < a["until"])]
+        return min(live, key=lambda a: (a["at"], a["comment"])) if live else None
+
+    def held_at(self, issue_id: str, at: datetime) -> list[str]:
+        """Reasons the issue is held at `at`.
+
+        A decision holds its blocked work from its first ping until it is
+        answered; a decision issue with no recorded ping, or a non-decision
+        blocker, has no start time and holds throughout.
+        """
+        reasons = []
+        for blocker in self.issues[issue_id]["blocked_by"]:
+            state = self._decisions.get(blocker)
+            if state is None:
+                if self.issues[blocker]["status"] not in {"Done", "Canceled", "Duplicate"}:
+                    reasons.append(f"blocked by {blocker}")
+                continue
+            started = state["held_from"] is None or state["held_from"] <= at
+            cleared = self.answer_at(state, at) is not None
+            if started and not cleared:
+                reasons.append(f"awaiting decision {blocker}")
+        for comment in self.comments:
+            if comment.agent is not None or (
+                comment.deleted and (comment.deleted_at is None or comment.deleted_at <= at)
+            ):
+                continue
+            for revision in comment.revisions:
+                for line in (part.strip() for part in revision.body.split("\n")):
+                    match = HOLD.match(line)
+                    if match and match.group(1) == issue_id and present_at(comment, line, at):
+                        reason = f"HOLD by comment {comment.id}"
+                        if reason not in reasons:
+                            reasons.append(reason)
+        return reasons
+
+    def collect_void_lines(self) -> None:
+        for comment in self.comments:
+            if comment.agent is not None and not comment.deleted:
+                for line in human_lines(comment):
+                    if HOLD.match(line) or REVOKE_CLAIM.match(line) or ACK_TAKEOVER.match(line):
+                        self.void(comment, line)
+
+    # Standing approvals ----------------------------------------------------
+
+    def parse_approval(self, comment: Comment, revision: Revision) -> StandingApproval | None:
+        lines = [line.strip() for line in revision.body.split("\n")]
+        header = SA_HEADER.match(lines[0]) if lines else None
+        if not header:
+            return None
+        sa_id = header.group(1)
+        fields = {m.group(1): m.group(2) for line in lines[1:] if (m := FIELD.match(line))}
+        for key in ("actions", "scope", "expires"):
+            if key not in fields:
+                raise SnapshotError(f"standing approval {sa_id}: missing {key!r}")
+        limits = {}
+        for part in fields.get("limits", "").replace(",", " ").split():
+            key, _, value = part.partition("=")
+            if key not in {"per_day", "total"} or not value.isdigit():
+                raise SnapshotError(f"standing approval {sa_id}: limits must be per_day=N and/or total=N")
+            limits[key] = int(value)
+        raw_expires = fields["expires"]
+        date_only = len(raw_expires) == 10
+        return StandingApproval(
+            sa=sa_id,
+            comment=comment,
+            since=revision.at,
+            actions={t.strip() for t in fields["actions"].split(",") if t.strip()},
+            scope={t.strip() for t in fields["scope"].split(",") if t.strip()},
+            who={t.strip() for t in fields["who"].split(",") if t.strip()} if "who" in fields else None,
+            per_day=limits.get("per_day"),
+            total=limits.get("total"),
+            expires=parse_ts(raw_expires + "T23:59:59.999999Z" if date_only else raw_expires, sa_id),
+        )
+
+    def standing_approvals(self) -> tuple[dict[str, list[Comment]], dict[str, datetime]]:
+        """Comments that define each standing approval, and revocation times.
+
+        An approval is read from the comment revision in effect when it is
+        used, so text edited in later does not authorise earlier actions.
+        """
+        homes: dict[str, list[Comment]] = {}
+        spans: dict[str, list[tuple[datetime, str, datetime | None]]] = {}
+        revoked: dict[str, datetime] = {}
+        home = self.config["standing_approvals_issue"]
+        for comment in self.comments:
+            if comment.issue != home:
+                continue
+            # Standing approvals stay unprefixed founder comments (spec section
+            # 12, D7): a developer-approved comment cannot define or revoke one.
+            if comment.agent is not None or comment.approved_by is not None:
+                if not comment.deleted:
+                    for line in human_lines(comment):
+                        if SA_HEADER.match(line) or REVOKE_SA.match(line):
+                            self.void(comment, line)
+                continue
+            if comment.deleted and comment.deleted_at is None:
+                continue
+            last = len(comment.revisions) - 1
+            # Each run of consecutive revisions defining the same approval is
+            # one span; a revision that stops defining it ends the span, and a
+            # later re-definition in the same comment starts a new one.
+            current: tuple[str, datetime] | None = None
+            first: dict[str, datetime] = {}
+            for index, revision in enumerate(comment.revisions):
+                if comment.deleted and revision.at >= comment.deleted_at:
+                    break
+                try:
+                    approval = self.parse_approval(comment, revision)
+                except SnapshotError:
+                    if index == last:
+                        raise
+                    approval = None
+                if current is not None and (approval is None or approval.sa != current[0]):
+                    spans.setdefault(current[0], []).append((current[1], comment.id, revision.at))
+                    current = None
+                if approval is None:
+                    continue
+                if current is None:
+                    current = (approval.sa, revision.at)
+                    first.setdefault(approval.sa, revision.at)
+                    known = homes.setdefault(approval.sa, [])
+                    if comment not in known:
+                        known.append(comment)
+                # The lifetime runs from the first revision of this comment that
+                # defined the approval, so editing it out and back in does not
+                # restart the clock.
+                limit = (first[approval.sa] + timedelta(days=self.config["sa_max_days"])).date()
+                if approval.expires.date() > limit:
+                    self.violation("sa_too_long", detail=f"{approval.sa} at {revision.at.isoformat()}")
+            if current is not None:
+                spans.setdefault(current[0], []).append((current[1], comment.id, comment.deleted_at))
+        for sa_id, intervals in spans.items():
+            # Definitions may follow each other (an old one deleted or edited
+            # out, a new one posted later) but may not overlap; compare their
+            # live intervals so the result does not depend on snapshot order.
+            # A span that ends when it starts authorises nothing.
+            ordered = sorted((span for span in intervals if span[2] is None or span[2] > span[0]),
+                             key=lambda span: (span[0], span[1]))
+            for (_, _, end), (next_start, _, _) in zip(ordered, ordered[1:]):
+                if end is None or next_start < end:
+                    raise SnapshotError(f"standing approval {sa_id}: defined in two comments at once")
+        for source, line, seen in self.directive_lines(home):
+            match = REVOKE_SA.match(line)
+            if source.approved_by is not None:
+                continue
+            if match:
+                previous = revoked.get(match.group(1))
+                revoked[match.group(1)] = seen if previous is None else min(previous, seen)
+        return homes, revoked
+
+    def approval_at(self, comment: Comment, at: datetime) -> StandingApproval | None:
+        if comment.deleted and (comment.deleted_at is None or comment.deleted_at <= at):
+            return None
+        effective = [r for r in comment.revisions if r.at <= at]
+        if not effective:
+            return None
+        try:
+            return self.parse_approval(comment, effective[-1])
+        except SnapshotError:
+            # A malformed draft that was later corrected authorises nothing;
+            # a malformed final revision already failed in standing_approvals.
+            return None
+
+    def check_sa_actions(self) -> None:
+        homes, revoked = self.standing_approvals()
+        used: dict[str, list[datetime]] = {}
+        for action in sorted(self.sa_actions, key=lambda a: a["at"]):
+            at = action["at"]
+            label = f"{action['sa']} {action['action']} at {at.isoformat()}"
+            sa = next((a for c in homes.get(action["sa"], [])
+                       if (a := self.approval_at(c, at)) is not None and a.sa == action["sa"]), None)
+            if sa is None or sa.sa != action["sa"]:
+                self.violation("sa_unknown", detail=label)
+                continue
+            if action["sa"] in revoked and revoked[action["sa"]] <= at:
+                self.violation("sa_revoked", detail=label)
+                continue
+            if at > sa.expires:
+                self.violation("sa_expired", detail=label)
+                continue
+            if action["action"] not in sa.actions or action["repo"] not in sa.scope:
+                self.violation("sa_out_of_scope", detail=label)
+                continue
+            if sa.who is not None and action.get("agent") not in sa.who:
+                self.violation("sa_out_of_scope", detail=label)
+                continue
+            history = used.setdefault(sa.sa, [])
+            same_day = [t for t in history if t.date() == at.date()]
+            if (sa.per_day is not None and len(same_day) >= sa.per_day) or (sa.total is not None and len(history) >= sa.total):
+                self.violation("sa_over_limit", detail=label)
+                continue
+            history.append(at)
+
+    # Rules -----------------------------------------------------------------
+
+    def check_claims(self) -> None:
+        for claim in self.claims.values():
+            issue = self.issues[claim.issue]
+            if not issue["admitted"]:
+                self.violation("claim_not_admitted", claim.issue, claim.uuid)
+            elif not issue["next_in_order"]:
+                self.violation("claim_out_of_order", claim.issue, claim.uuid)
+            if claim.child is not None and self.issues[claim.child]["parent"] != claim.issue:
+                self.violation("scope_not_a_child", claim.issue, claim.uuid, claim.child)
+            if any(self.held_at(scoped, claim.created_at) for scoped in claim.scope_issues(self.issues)):
+                self.violation("claim_on_held_scope", claim.issue, claim.uuid)
+            for late in self.late_renewals[claim.uuid]:
+                self.violation("renewed_after_expiry", claim.issue, claim.uuid, late.at.isoformat())
+            self.check_heartbeat_times(claim)
+            confirmed = claim.confirmed_at()
+            edited = claim.confirm_edit_at()
+            if edited is not None and edited - claim.created_at < self.readback:
+                self.violation("confirmed_too_early", claim.issue, claim.uuid)
+            deadline = claim.created_at + self.readback
+            settled = self.winner(claim.issue, claim.repo, deadline) if deadline <= self.now else None
+            if settled is not None and settled.uuid != claim.uuid:
+                if confirmed is not None:
+                    self.violation("loser_confirmed", claim.issue, claim.uuid, f"winner {settled.uuid}")
+                if claim.withdrawn_at() is None:
+                    self.violation("loser_not_withdrawn", claim.issue, claim.uuid, f"winner {settled.uuid}")
+            self.check_implicit_takeover(claim)
+            self.check_takeover_refused(claim)
+            # A session may hold several claims in a repository (Lucas's
+            # decision, CSL-357 comment 0cdfd465), but no two of them may cover
+            # the same issue, counting `scope: sub-issue` children, or name the
+            # same branch.
+            covered = set(claim.scope_issues(self.issues))
+            others = [
+                other for other in self.claims.values()
+                if other.uuid != claim.uuid and other.session == claim.session and other.repo == claim.repo
+                and (covered & set(other.scope_issues(self.issues)) or other.branch == claim.branch)
+                and (other.created_at, other.uuid) < (claim.created_at, claim.uuid)
+                # An expired claim the session never released still counts on
+                # another issue, as across sessions; on the same issue the
+                # implicit-takeover check reports it instead.
+                and (self.ended(other, claim.created_at) is None if other.issue == claim.issue
+                     else self.blocks_overlap(other, claim.created_at, settled_losers=True))
+            ]
+            if others:
+                self.violation("multiple_claims_per_session", claim.issue, claim.uuid, f"also holds {others[0].uuid}")
+            # Across sessions, a claim that overlaps an earlier live claim in
+            # the repository by scope or branch loses as in a race: it must
+            # withdraw at read-back instead of confirming. As with a race, the
+            # loss is settled at the read-back deadline, so a later release by
+            # the blocker does not erase it; a confirmation is also checked at
+            # its own time.
+            settled_overlap = self.earlier_overlap(claim, deadline, other_sessions=True) if deadline <= self.now else None
+            blocker = None
+            if settled_overlap is not None and (confirmed is not None or claim.withdrawn_at() is None):
+                blocker = settled_overlap
+            elif confirmed is not None:
+                blocker = self.earlier_overlap(claim, confirmed, other_sessions=True)
+            if blocker is not None:
+                self.violation("overlapping_claim", claim.issue, claim.uuid, f"{blocker[1]} overlaps {blocker[0].uuid}")
+            released = claim.released_at()
+            if released is not None:
+                for run in self.runs:
+                    if run["claim"] == claim.uuid and run["started_at"] <= released and (
+                        run.get("ended_at") is None or run["ended_at"] > released
+                    ):
+                        self.violation("release_before_writers_stopped", claim.issue, claim.uuid, run["id"])
+                self.check_release_record(claim, released)
+
+    def check_release_record(self, claim: Claim, released: datetime) -> None:
+        """Report a release without a valid `release v1` record (CSL-445).
+
+        Only a claim that ended by its release needs one: a withdrawal, revoke
+        or deletion by the time of the release, or a deletion at an unknown
+        time, means it does not. With several records one valid one is enough;
+        otherwise the detail describes the most complete, the earliest on a tie.
+        """
+        if self.ended(claim, released) != "released":
+            return
+        revoked = self.revoked_at(claim)
+        if revoked is not None and revoked <= released:
+            return
+        best = None
+        for comment, fields in self.release_records.get(claim.uuid, []):
+            if comment.issue != claim.issue or comment.created_at < released:
+                continue
+            missing = sorted(key for key in RECORD_KEYS[2:] if not fields.get(key))
+            bad_reason = not RELEASE_REASON.match(fields.get("reason", ""))
+            rank = (len(missing) + bad_reason, comment.created_at, comment.id)
+            if best is None or rank < best[0]:
+                best = (rank, missing, bad_reason)
+        if best is None:
+            detail = "no record"
+        elif best[0][0] == 0:
+            return
+        else:
+            parts = [f"missing: {', '.join(best[1])}"] if best[1] else []
+            detail = "; ".join(parts + (["invalid reason"] if best[2] else []))
+        self.violation("release_without_record", claim.issue, claim.uuid, detail)
+
+    def check_heartbeat_times(self, claim: Claim) -> None:
+        """Report a timestamp `heartbeat-at` that is not the time of the edit
+        that set it. Only a changed value is checked, since later edits carry
+        the old line along; a value that is not a timestamp is not checked."""
+        previous = None
+        for revision in claim.comment.revisions:
+            value = claim_fields(revision.body).get("heartbeat-at")
+            if value and value != previous and TIMESTAMP_VALUE.match(value):
+                try:
+                    declared = parse_ts(value, f"claim {claim.uuid}: heartbeat-at")
+                except SnapshotError:
+                    previous = value
+                    continue  # not a complete timestamp, so not checked
+                if abs(declared - revision.at) > self.heartbeat_tolerance:
+                    self.violation("heartbeat_time_mismatch", claim.issue, claim.uuid,
+                                   f"{value} on the edit at {revision.at.isoformat()}")
+            previous = value
+
+    def posting_fault(self, claim: Claim, target: str) -> str | None:
+        """Why taking over `target` was not allowed when the claim was posted, or None.
+
+        Only faults fixed at posting time count: what happens later (the wait,
+        a coordinator acknowledgement, the original claimant objecting or
+        releasing) is not the taker's doing and does not hide or excuse them.
+        """
+        posted = claim.created_at
+        old = self.claims.get(target)
+        if old is None:
+            return f"unknown claim {target}"
+        if old.issue != claim.issue or old.repo != claim.repo:
+            return f"claim on another issue or repository {old.uuid}"
+        if old.created_at >= posted:
+            return "original posted after the takeover"
+        if self.ended_before_takeover(old, posted) is not None:
+            return None
+        refusal = self.posting_refusal(claim, old)
+        return None if refusal is None else refusal["reason"]
+
+    def check_takeover_refused(self, claim: Claim) -> None:
+        if not claim.takeovers:
+            return
+        # The taker withdrawing or releasing answers the fault, even if the
+        # comment is deleted afterwards; a human revoke or a deletion alone
+        # does not erase the report of it.
+        if any(when is not None and when <= self.now for when in (claim.withdrawn_at(), claim.released_at())):
+            return
+        for target in claim.takeovers:
+            fault = self.posting_fault(claim, target)
+            if fault is not None:
+                # With several targets, name the one the fault is about.
+                detail = fault if len(claim.takeovers) == 1 or target in fault else f"{fault} ({target})"
+                self.violation("takeover_refused", claim.issue, claim.uuid, detail)
+
+    def check_implicit_takeover(self, claim: Claim) -> None:
+        """A fresh claim must not bypass the takeover rules (spec section 7).
+
+        It may not land while another claim's takeover wait is running, or on
+        an issue whose earlier claim expired without being released,
+        withdrawn, revoked, deleted or taken over: that needs a `takeover of`
+        line and the takeover conditions.
+        """
+        at = claim.created_at
+        for other in self.claims.values():
+            if other.uuid == claim.uuid or other.issue != claim.issue or other.repo != claim.repo:
+                continue
+            # The claims an explicit takeover names are judged by
+            # takeover_status; every other earlier claim still needs its own.
+            if other.uuid in claim.takeovers:
+                continue
+            if other.created_at >= at:
+                continue
+            if other.takeovers and at < other.created_at + self.takeover_wait:
+                if self.ended(other, at) is None:
+                    self.violation("claim_during_takeover_wait", claim.issue, claim.uuid, f"takeover {other.uuid}")
+                    continue
+            if self.bypassed_expired(claim, other):
+                self.violation("claim_without_takeover", claim.issue, claim.uuid, f"expired {other.uuid}")
+
+    def bypassed_expired(self, claim: Claim, other: Claim) -> bool:
+        """True if `claim` landed over `other`, which had expired and was not
+        taken over by a takeover that took effect before `claim` was posted."""
+        at = claim.created_at
+        if self.ended(other, at) != "expired":
+            return False
+        return not any(
+            other.uuid in t.takeovers and t.uuid != claim.uuid and t.created_at <= at and self.took_effect(t, at)
+            for t in self.claims.values()
+        )
+
+    def check_writes(self) -> None:
+        for write in self.writes:
+            at = write["at"]
+            what = f"{write['kind']} at {at.isoformat()}"
+            claim = self.claims.get(write["claim"]) if write["claim"] else None
+            if claim is None:
+                self.violation("write_without_claim", write["issue"], write["claim"], what)
+                continue
+            if write["issue"] not in claim.scope_issues(self.issues):
+                self.violation("write_outside_claim", write["issue"], claim.uuid, what)
+                continue
+            confirmed = claim.confirmed_at()
+            if confirmed is None or confirmed > at:
+                self.violation("write_before_confirm", claim.issue, claim.uuid, what)
+                continue
+            ended = self.ended(claim, at)
+            if ended is not None:
+                code = f"write_{AFTER_END.get(ended, 'after_release')}"
+                self.violation(code, claim.issue, claim.uuid, what)
+                continue
+            if claim.takeovers and at < claim.created_at + self.takeover_wait:
+                self.violation("takeover_wrote_too_early", claim.issue, claim.uuid, what)
+                continue
+            if (blocker := self.earlier_overlap(claim, at)) is not None:
+                self.violation("write_while_overlapping", claim.issue, claim.uuid,
+                               f"{what}: {blocker[1]} overlaps {blocker[0].uuid}")
+                continue
+            winner = self.winner(claim.issue, claim.repo, at)
+            if winner is None or winner.uuid != claim.uuid:
+                self.violation("write_by_non_winner", claim.issue, claim.uuid, what)
+            elif any(self.held_at(scoped, at) for scoped in claim.scope_issues(self.issues)):
+                self.violation("write_while_held", claim.issue, claim.uuid, what)
+
+    def check_commits(self) -> None:
+        for commit in self.commits:
+            uuid = commit.get("claim")
+            if commit["author_kind"] != "agent":
+                continue
+            sha = commit["sha"]
+            if not uuid:
+                self.violation("agent_commit_without_claim", detail=sha)
+                continue
+            claim = self.claims.get(uuid)
+            if claim is None:
+                self.violation("commit_names_unknown_claim", claim=uuid, detail=sha)
+                continue
+            if commit.get("repo", self.repo) != claim.repo or commit["branch"] != claim.branch:
+                self.violation("commit_outside_claim_branch", claim.issue, uuid, sha)
+            ended = self.ended(claim, commit["at"])
+            if ended == "deleted":
+                self.violation("commit_names_deleted_claim", claim.issue, uuid, sha)
+            elif ended == "not yet posted":
+                self.violation("commit_before_claim", claim.issue, uuid, sha)
+            elif ended in AFTER_END:
+                self.violation(f"commit_{AFTER_END[ended]}", claim.issue, uuid, sha)
+
+    def check_done_and_admissions(self, held: dict[str, list[str]]) -> None:
+        for issue_id, issue in self.issues.items():
+            if issue["status"] == "Done" and held[issue_id]:
+                self.violation("done_while_held", issue_id, detail="; ".join(held[issue_id]))
+            if issue["status"] == "Done":
+                # A parent cannot be Done while a sub-issue is open or held.
+                for child_id in sorted(c for c, child in self.issues.items() if child["parent"] == issue_id):
+                    if self.issues[child_id]["status"] not in {"Done", "Canceled", "Duplicate"}:
+                        self.violation("done_with_open_child", issue_id, detail=f"{child_id} open")
+                    elif held[child_id]:
+                        self.violation("done_with_open_child", issue_id, detail=f"{child_id} held")
+        program = self.program
+        if program and self.admissions:
+            paused = program["occupied_reviews"] >= program["review_slots"] and program["completed_waiting"] > 0
+            if paused:
+                for admission in self.admissions:
+                    self.violation("admission_while_paused", admission["issue"])
+
+    def check_decision_records(self, decisions: dict[str, dict[str, Any]]) -> None:
+        for issue_id, issue in self.issues.items():
+            for blocker in issue["blocked_by"]:
+                state = decisions.get(blocker)
+                if not state:
+                    continue
+                for claim in self.claims.values():
+                    confirmed = claim.confirmed_at()
+                    if issue_id not in claim.scope_issues(self.issues) or confirmed is None:
+                        continue
+                    answer = self.answer_at(state, confirmed)
+                    if answer is None:
+                        continue
+                    expected = (answer["comment"], answer["option"])
+                    recorded = any(
+                        c.issue == blocker and (c.agent is not None or c.approved_by is not None)
+                        and not (c.deleted and (c.deleted_at is None or c.deleted_at <= confirmed))
+                        and self.recorded_since(c, expected, answer["at"], confirmed)
+                        for c in self.comments
+                    )
+                    if not recorded:
+                        self.violation("decision_not_recorded", blocker, claim.uuid)
+
+    @staticmethod
+    def recorded_since(comment: Comment, expected: tuple[str, str], answered: datetime, at: datetime) -> bool:
+        """Whether the revision in effect at `at` records `expected`, and the
+        record has been present without a break since the answer or later, so
+        a record written before the answer does not count."""
+        start = None
+        for revision in comment.revisions:
+            if revision.at > at:
+                break
+            has = any((m := DECISION_RECORD.match(line.strip())) and m.groups() == expected
+                      for line in revision.body.split("\n"))
+            if not has:
+                start = None
+            elif start is None:
+                start = revision.at
+        return start is not None and start >= answered
+
+    def must_reread(self, claim: Claim) -> bool:
+        confirmed = claim.confirmed_at()
+        if confirmed is None:
+            return False
+        seen = confirmed  # a snapshot records no reads, so only confirmation counts as one
+        return any(
+            c.get("repo", self.repo) == claim.repo and c["branch"] == claim.branch
+            and c.get("claim") != claim.uuid and c["at"] > seen and c["at"] <= self.now
+            for c in self.commits
+        )
+
+    def run(self) -> dict[str, Any]:
+        # Settle every part of every loss in order of its settle time. A part
+        # reads only parts settled strictly earlier, so each one finds them
+        # cached instead of recursing down a long chain.
+        parts = sorted(
+            (when, kind, claim.created_at, claim.uuid, claim)
+            for claim in self.claims.values() for kind, when in self.settle_times(claim) if when < self.now
+        )
+        for when, kind, _, _, claim in parts:
+            self._settled(claim, kind, when)
+        decisions = self._decisions = self.decisions()
+        held = {issue_id: self.held_at(issue_id, self.now) for issue_id in self.issues}
+        self.collect_void_lines()
+        for comment in self.comments:
+            if comment.prefix_changed:
+                self.violation("comment_prefix_changed", comment.issue, detail=comment.id)
+        self.check_claims()
+        self.check_writes()
+        self.check_commits()
+        self.check_done_and_admissions(held)
+        self.check_decision_records(decisions)
+        self.check_sa_actions()
+        issues: dict[str, Any] = {}
+        repos = sorted({c.repo for c in self.claims.values()} | {self.repo})
+        for issue_id in sorted(self.issues):
+            per_repo = {}
+            for repo in repos:
+                # A live parent claim scoped to this issue covers it too, so the
+                # issue is not reported as claimable (Codex 4343468463).
+                live = self.live_claims(issue_id, repo, self.now) + self.covering_claims(issue_id, repo, self.now)
+                winner = self.holder(issue_id, repo, self.now)
+                if not live and not any(c.issue == issue_id and c.repo == repo for c in self.claims.values()):
+                    continue
+                per_repo[repo] = {
+                    "live_claims": sorted(c.uuid for c in live),
+                    "winner": winner.uuid if winner else None,
+                    "must_reread": self.must_reread(winner) if winner else False,
+                }
+            takeovers = {
+                c.uuid: self.takeover_status(c)
+                for c in self.claims.values() if c.issue == issue_id and c.takeovers
+            }
+            # A parent claim scoped to this issue that still blocks it (for
+            # example, expired but never released) leaves it unclaimable, as
+            # the overlap check would flag a new claim (Codex 4343611603).
+            covered = any(
+                c.issue != issue_id and issue_id in c.scope_issues(self.issues) and self.blocks_overlap(c, self.now)
+                for c in self.claims.values()
+            )
+            issues[issue_id] = {
+                "claims": per_repo,
+                "held": bool(held[issue_id]),
+                "hold_reasons": held[issue_id],
+                "claimable": self.issues[issue_id]["admitted"] and self.issues[issue_id]["next_in_order"]
+                and not held[issue_id] and not any(v["live_claims"] for v in per_repo.values()) and not covered,
+                "takeovers": takeovers,
+            }
+        return {
+            "issues": issues,
+            "decisions": {
+                k: {key: value for key, value in v.items() if key not in {"answered_at", "held_from", "answers"}}
+                for k, v in decisions.items()
+            },
+            # Sorted so the list itself does not depend on comment order; ids are
+            # compared as text because snapshot ids are not all type-checked.
+            "violations": sorted(self.violations, key=lambda v: tuple(str(v[k] or "") for k in ("code", "issue", "claim", "detail"))),
+            "void_lines": self.void_lines,
+            "developer_approved": sorted(
+                ({"comment": c.id, "developer": c.approved_by, "deleted": c.deleted}
+                 for c in self.comments if c.approved_by),
+                key=lambda entry: str(entry["comment"]),
+            ),
+        }
+
+
+def evaluate(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Evaluate a snapshot. Raises SnapshotError if it is malformed.
+
+    Any other exception raised while reading the snapshot is also reported as
+    SnapshotError, so an unexpected shape fails closed instead of producing a
+    partial result.
+    """
+    try:
+        return Evaluation(snapshot).run()
+    except SnapshotError:
+        raise
+    except (TypeError, ValueError, AttributeError, KeyError, IndexError, ArithmeticError) as exc:
+        raise SnapshotError(f"unreadable snapshot: {type(exc).__name__}: {exc}") from exc
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 2:
+        print("usage: agent_protocol_sim.py snapshot.json", file=sys.stderr)
+        return 2
+    try:
+        snapshot = json.loads(Path(argv[1]).read_text(encoding="utf-8"))
+        result = evaluate(snapshot)
+    except (OSError, json.JSONDecodeError, SnapshotError) as exc:
+        print(f"AGENT_PROTOCOL_SIM_ERROR {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2, sort_keys=True, default=str))
+    return 1 if result["violations"] else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

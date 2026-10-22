@@ -74,11 +74,11 @@ def main() -> int:
             if heading not in text:
                 fail(f"{rel} missing required heading: {heading}")
 
+    markdown_docs = [rel for rel in REQUIRED_FILES if rel.endswith(".md")]
+
     # Link integrity across the new docs.
     links = 0
-    for rel in REQUIRED_FILES:
-        if not rel.endswith(".md"):
-            continue
+    for rel in markdown_docs:
         path = ROOT / rel
         for raw in re.findall(r"\]\(([^)]+)\)", prose(path.read_text(encoding="utf-8"))):
             target = raw.split(' "', 1)[0].strip().strip("<>")
@@ -93,9 +93,7 @@ def main() -> int:
             links += 1
 
     # No foreign identifier in the new docs.
-    for rel in REQUIRED_FILES:
-        if not rel.endswith(".md"):
-            continue
+    for rel in markdown_docs:
         for number, line in enumerate(read(rel).splitlines(), 1):
             match = PATTERN.search(line)
             if match:

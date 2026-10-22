@@ -1,0 +1,193 @@
+---
+name: proceed-or-escalate
+description: >-
+  Decide whether to act on your own or raise a question to a human, and how to
+  write comments that speak for a developer. Use before starting or continuing
+  work on an issue or PR, before posting a Linear or GitHub comment, before
+  resolving a review thread, before citing or recording a decision, and on
+  every run of a scheduled or unattended loop.
+---
+
+# Proceed or escalate
+
+Human attention is the scarce resource. Spend it only on calls a human must make,
+and make each one quick to answer. Everything else, do yourself.
+
+**Scope.** These rules govern agents acting through a developer's account or
+session: interactive sessions, scheduled loops and Grok Bots. Repository workflows
+(the `claude.yml` fixer, the Codex gate, stuck-thread-watch, conflict-scan,
+linear-pr-sync and other repository workflows) and Devin automations keep the roles
+in AGENTS.md "Review roles" and "Automations". Their documented markers, receipts
+and audit comments are unchanged.
+
+## Proceed on your own when ALL of these hold
+
+- The work is within an admitted issue's acceptance criteria, or it is a clear
+  defect or failing check with an evident cause.
+- It stays inside the issue's stated scope and allowed paths.
+- No product behavior, UX, public API, contract or data meaning changes beyond
+  what the issue already specifies.
+- It is reversible, and code changes are covered by a test.
+- It needs no new spend, credentials, permissions, settings or protected-path edits.
+- Nobody else holds a claim on the branch or files, and no other writer's run
+  (such as the fixer's `claude-<PR>` lock) is in flight.
+- It starts no paid CI (see below). Pushing to a draft PR or a branch with no PR,
+  and read-only Actions/API queries, are fine.
+
+## Raise it to a human when ANY of these hold
+
+- It needs a product detail, a UX choice, or a change in scope or priority.
+- There is more than one reasonable reading of what is wanted.
+- It is an architecture, language, dependency or data-source choice.
+- It touches governance files, decision records, contracts, or another owner's work.
+- A tool or platform refused the action. Report it; do not route around it, and
+  do not turn one refusal into a standing rule.
+- You are about to write "X decided Y" or "Y is the rule" and cannot link to
+  where that decision is recorded (see Decisions).
+- It would start paid CI without a human asking for that run, or its CI cost is
+  unclear.
+- An automation signal says a human must act: the fixer is paused
+  (`claude-fixer-paused`, its 8-commit loop cap, or a pause label or marker the
+  repo documents); a fix receipt cannot be verified (short SHA, commit
+  not reachable from the PR head, fingerprint mismatch, no push); a branch with
+  fixer receipts was rebased or force-pushed; or `ci:full` label ownership is
+  uncertain. Never remove a pause yourself, never dispatch the fixer to get
+  around its budget, and never report an unverified fix as fixed.
+
+If anything on this list holds, escalate; the proceed list never overrides it.
+When unsure, escalate, in the short form below.
+
+## Actions that start paid CI
+
+Each of these starts paid runs, even when it doesn't look like spending:
+- Marking a PR ready for review.
+- Pushing to a non-draft PR branch (every push restarts CI; batch pushes, or
+  convert to draft first).
+- Adding or re-adding a label a workflow listens for: `ci:full`, and in some
+  repos `enhancement` (check the repo's label-triggered workflows).
+- Any `workflow_dispatch`, re-run, `/ci full|run`, or MCP `ci_full` / `ci_run`.
+
+Cancelling or not cancelling someone else's runs, and changing concurrency,
+triggers, runner labels, rulesets or required checks, also need a human-assigned
+issue under each repo's guardrails.
+
+## How to escalate
+
+If the question is a stuck review thread and the PR already has a `Stuck PR
+threads:` roll-up, found by its `<!-- stuck-pr-threads:<repo>#<PR> -->` marker
+(never by title), add to that. Otherwise post one comment on the Linear issue,
+@mentioning the issue owner:
+
+```
+Question: <one sentence>
+Options: A) ... B) ... (C) ...)
+Recommendation: <letter>, because <one line>
+Meanwhile: paused (or: <other work from the proceed list>)
+```
+
+"Meanwhile" is never the option you are asking about, nor work that presupposes
+any option. In recursion, also record
+the blocker in `state/INBOX.md`. Then stop that line of work, release your claim
+(see Claims), and take only other admitted work that is next under the
+human-approved order. If there is no such order, propose one and wait. Do not ask
+again until something changes.
+
+## Claims
+
+Where the repo's AGENTS.md adopts the CSL-357 agent work protocol (spec draft v7),
+as recursion's does, claim with a claim record, not by assigning yourself. AGENTS.md
+holds the record format and wins on any conflict.
+
+- The Linear assignee stays the human owner. Post one agent-prefixed `claim v1`
+  comment (uuid, scope `whole issue` or `sub-issue CSL-M`, branch @ head, base,
+  `confirmed-at`, `heartbeat-at`, `release-on`). Each claim covers one issue in one
+  repository; a session may hold several claims at once, but no two in a
+  repository may cover the same issue (counting a sub-issue scope) or name the
+  same branch (CSL-357 comment 6749bdcb).
+- Read back after at least 60 seconds: re-read the issue, its parent and any
+  sub-issue your scope covers, and search Linear for your exact branch name in
+  quotes (archived issues included). The earliest Linear `createdAt` among
+  overlapping claims wins; on a tie, the lower uuid. Confirm or withdraw. If a
+  source can't be read, don't confirm. Search can lag and shows only issues you
+  can see, so this reduces overlap but does not prevent it. No write before
+  `confirmed-at`; then move the issue to In Progress. Repeat these reads before
+  every write.
+- Renew `heartbeat-at` at least hourly with the real edit time. The lease runs 2
+  hours from the comment's last Linear `updatedAt`; past that, make no write until
+  you renew. A renewal up to 2 hours 30 minutes after that `updatedAt` restores the
+  lease; after that, never renew it. Take a claim over only under the AGENTS.md
+  takeover conditions.
+- On session start or resume, before any write, check each claim you hold. If its
+  lease plus grace has passed, release it as lease expiry and never renew it; then
+  re-read the issue and take a fresh claim. Set `heartbeat-at` to the actual edit
+  time from a fresh clock read.
+- Release a claim with a `release v1` record (done, evidence, open, next, files)
+  once its writers have stopped; work under your other non-overlapping claims
+  does not block it.
+  Releasing never releases a hold.
+- Agent commits under a claim carry the trailer `Agent-Claim: <uuid>`; fixer,
+  bot and human commits are exempt.
+- Link a PR with `Fixes CSL-N` only when it completes the issue's acceptance
+  criteria; use `Related to CSL-N` when scope or decisions remain.
+
+## Speaking for a developer
+
+Agents usually post through a developer's account, so readers cannot tell who
+wrote a comment from the author field. Make it visible in the text.
+
+- **Agent comment** (status, evidence, proposals): start with
+  `Agent (<tool/session>, for <developer>):`. It carries no authority.
+- **Developer-approved comment**: Lucas decided (CSL-353 comment
+  `6e602e3a-5c27-46f3-b191-2e7f4e86425f`) that it
+  counts as that developer's personal receipt when all of these hold:
+  1. Immediately before posting, you showed the developer the final exact text
+     and they approved it in this same session. Approval from an earlier turn or
+     another context does not carry over; ask again.
+  2. The comment carries the line
+     `developer-approved: <developer>, exact text confirmed <UTC time>, session <id>`,
+     with the time read just before posting.
+  3. It is never edited after posting. Any edit voids it; post a new one instead.
+  4. It stays within that developer's own authority and grants none.
+  5. No accepted contract requires an exact authenticated human receipt for it
+     (recursion program receipts, R2a, or another repository's accepted
+     contract, unless that contract is amended).
+
+  **Where it applies:** in recursion, `CONTROL_PLANE.md` (D-043) carries these
+  conditions; in another repository, once its own rules say so. A comment
+  missing any condition stays an attributed relay where personal posting is
+  required, and the human posts decision receipts and contract acceptance from
+  their own account.
+
+  **Never a review.** A named reviewer's GitHub review or verdict is always that
+  person's own post from their own account; a developer-approved
+  comment never stands in for it.
+- **Never** post decision language ("approved", "accepted", "restricted",
+  "decided") as an agent comment unless it is a developer-approved comment that
+  counts under the rule above. Otherwise quote and link the human's comment.
+
+## Decisions
+
+A decision exists only if a human posted it from their own account, a
+developer-approved comment that counts under the rule above carries it, or it is
+recorded in the repo's decision records (`state/DECISIONS.md` or `docs/adr/` in
+recursion; elsewhere, the records that repository's rules name).
+When you rely on one, link it. When relying on a developer-approved comment, check
+that the marker is present, the comment is unedited and the named developer has not
+disputed it; if any of that is unclear, ask that developer before acting.
+In recursion, a comment from a founder or developer account that has no agent
+prefix and was posted before the agent-prefix rule took effect (the merge of #247,
+2026-10-21T00:39:04Z) counts as that person's decision only if they confirm it
+when asked (Lucas's decision, CSL-354 comment 0a86b61c).
+If you can only find agents repeating it, treat it as unverified and ask.
+Silence, elapsed time, a green check, a merge, an issue moving to Done (Linear
+auto-closes issues on merge) or any other status is never a decision.
+
+## Scheduled and unattended runs
+
+A loop that acts through a developer's account while nobody watches may only do work
+from the "proceed" list. It must not resolve human-authored threads, change scope,
+close issues as decided, or post developer-approved comments (nobody is there to
+approve the text). It never marks a PR
+ready, adds or removes GitHub labels, dispatches, re-runs or cancels. Label every
+comment `Agent (unattended run, for <developer>):`. If a run finds nothing on the
+proceed list, it posts nothing.

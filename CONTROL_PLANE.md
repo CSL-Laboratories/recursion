@@ -1,6 +1,7 @@
 # Governance — Recursion
 
-Adopted 2026-09-28; authority split amended 2026-10-16 under D-041. The highest-priority
+Adopted 2026-09-28; authority split amended 2026-10-16 under D-041; developer-approved
+receipts added 2026-10-21 under D-043. The highest-priority
 authority document in this repository, beneath current explicit founder decisions within
 the authority defined below. If another file contradicts it, this file wins and that file
 is stale.
@@ -77,8 +78,24 @@ recommend and propose; founders decide. On ambiguity an agent records a blocker 
 Decision packets give options, classified evidence, tradeoffs, a recommendation, the
 strongest countercase, reversibility, further research cost and a deadline. Consequential
 founder decisions record the chosen option, rationale, conditions and revisit trigger.
-Agents must not invent founder decisions or present agent-authored records as personal
-founder statements.
+Agents must not invent founder decisions. They must not present agent-authored records as
+personal founder statements, with one exception (D-043): a developer-approved comment
+counts as that developer's personal receipt only when all of these hold:
+
+1. Immediately before posting, the agent showed the developer the final exact text and the
+   developer approved it in the same session. Approval from an earlier turn or another
+   context does not carry over.
+2. The comment carries the line
+   `developer-approved: <developer>, exact text confirmed <UTC time>, session <id>`.
+3. It has not been edited since it was posted. Any later edit voids it as a receipt.
+4. It counts only within that developer's own authority and grants none.
+5. No accepted contract requires an exact authenticated human receipt for it (recursion
+   program receipts, R2a, or another repository's accepted contract), unless that
+   contract is amended.
+
+It never stands in for a named reviewer's GitHub review, which that person submits from
+their own account (Protected paths). Any other agent-authored record stays an attributed
+relay.
 
 ### Independent verifiers
 
@@ -138,7 +155,8 @@ Only in a reviewed authoring session a founder explicitly approves, on a review 
 `state/DECISIONS.md`. Superseding an entry preserves the reason it was believed — a ruled-out
 approach without its reason is a dead-end waiting to be rediscovered.
 
-D-041 records the source decisions and approval for this amendment. It changes governance
+D-041 records the source decisions and approval for this amendment, and D-043 records the
+developer-approved receipt exception. Each changes governance
 text only: settings, CODEOWNERS, rulesets, access grants and merge-queue activation require
 their own authorization and are not changed or claimed effective here. Independent review
 must cover the exact candidate; an implementer's PASS is not acceptance or merge permission.

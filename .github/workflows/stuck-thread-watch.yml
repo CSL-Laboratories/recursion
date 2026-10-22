@@ -89,6 +89,8 @@ jobs:
           persist-credentials: false
           sparse-checkout: |
             .github/scripts/stuck_thread_watch.py
+            scripts/ci/fixer_failure_escalation.py
+            scripts/ci/claude_fixer_receipts.py
           sparse-checkout-cone-mode: false
 
       - name: Scan stuck threads

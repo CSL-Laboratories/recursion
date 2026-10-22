@@ -1,0 +1,6 @@
+{
+  "type": "WireCommandOutcome@1",
+  "command_id": "cmd:admit-0091",
+  "command_digest": "sha256:de9c2c541b3f7992504aa2ab49730cc73c3e9bd6787a68bf07613dea1594c305",
+  "outcome": "accepted"
+}

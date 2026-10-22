@@ -1,0 +1,7 @@
+{
+  "type": "WireIdentityRef@1",
+  "object_type": "GoalSpec",
+  "id": "a:b",
+  "version": 1,
+  "content_digest": "sha256:660dd7d57bdff4dd5a1ef531877dbef16ffb497d372e901e3ba8f81308defcf3"
+}

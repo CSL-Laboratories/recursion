@@ -1,9 +1,9 @@
 # O1 Journey Catalog and Crosswalk Specification
 
-**Version:** `o1-journeys v0.1-draft`  
-**Status:** DRAFT proposal under envelope G; nothing accepted until a rule-H receipt  
-**Parent Contract:** [O1-CONTRACT.md](O1-CONTRACT.md)  
-**Parent Issue:** [CSL-205](https://linear.app/csl-laboratories/issue/CSL-205) (Outcome O1)  
+**Version:** `o1-journeys v0.1-draft`<br>
+**Status:** DRAFT proposal under envelope G; nothing accepted until a rule-H receipt<br>
+**Parent Contract:** [O1-CONTRACT.md](O1-CONTRACT.md)<br>
+**Parent Issue:** [CSL-205](https://linear.app/csl-laboratories/issue/CSL-205) (Outcome O1)<br>
 **Inherited Decisions:** [D-024](../../state/DECISIONS.md#d-024--frontier-claim-productive-continuity), [D-022](../../state/DECISIONS.md#d-022--one-pausestop-vocabulary-across-config-formal-model-and-broker-g-07), [D-036](../../state/DECISIONS.md#d-036--mobile-offline-retention-online-only-private-view-o-01), [D-038](../../state/DECISIONS.md#d-038--d-034d-019-supersede-older-first-release-guimobile-exclusions-o-03), [OR-021–OR-039](PRODUCT.md#mark-2-capability-map-â-research-synthesis-2026-09-07)
 
 ---
@@ -35,7 +35,7 @@ This catalog formalizes the six primary demonstration journeys (J1 through J6) a
 - **Fault & Recovery Case:** Upstream harness process abruptly crashes, times out, or encounters a 429 rate limit mid-turn. The native broker catches the error, records the event in `cooldowns.json`, preserves dirty in-progress work intact without destructive rollback, and checkpoints task state for developer steering or class-consistent failover (CSL-83).
 - **Execution Modes:**
   - *Native-Only:* All planning, code editing, and test runs execute via local models or direct BYOK provider endpoints without invoking external CLIs.
-  - *Upstream-Only:* The entire task from goal prompt to diff generation executes inside the upstream harness binary. **Dependency:** Requires an installed, authenticated CLI on `$PATH` (`claude`, `codex`, `grok`, etc.) with an active user login. No separate API keys or secret intermediation permitted.
+  - *Upstream-Only:* The entire task from goal prompt to diff generation executes inside the upstream harness binary. **Dependency:** Requires an installed, authenticated CLI on `$PATH` (`claude`, `codex`, `grok`, etc.) with an active user login. No separate API keys or secret intermediation permitted. Planning and verification in this mode use that CLI and local checks. They do not depend on a provider API or a model.
   - *Combined:* Native Head owns GoalSpec, budgets, and verification; upstream executes code turns; native verifies output.
 
 ---
@@ -55,7 +55,7 @@ This catalog formalizes the six primary demonstration journeys (J1 through J6) a
 - **Fault & Recovery Case:** Compactor accidentally omits an essential negative constraint from the original prompt during distillation. The contract falsifier compares the capsule constraint manifest against the root GoalSpec hash; finding a discrepancy, it halts execution and requests human confirmation before allowing code mutations.
 - **Execution Modes:**
   - *Native-Only:* Native context governor compacts local conversation buffers directly into local storage engine (technology unselected; SQLite is an unrun challenger per D-028/PRODUCT.md) and resumes the native loop.
-  - *Upstream-Only:* Compacted state is synthesized into a single structured prompt file (`--prompt-file`) for the newly spawned CLI session. **Dependency:** Upstream CLI must support non-interactive file-based prompt ingestion.
+  - *Upstream-Only:* Compacted state is synthesized into a single structured prompt file (`--prompt-file`) for the newly spawned CLI session. **Dependency:** Upstream CLI must support non-interactive file-based prompt ingestion. Compaction does not depend on a provider API or a model.
   - *Combined:* Native governor distills upstream history into a capsule and injects it into a fresh upstream or native instance.
 
 ---
@@ -145,9 +145,9 @@ This catalog formalizes the six primary demonstration journeys (J1 through J6) a
 Per [OR-028](PRODUCT.md#mark-2-capability-map-â-research-synthesis-2026-09-07), [D-022](../../state/DECISIONS.md#d-022--one-pausestop-vocabulary-across-config-formal-model-and-broker-g-07), [D-036](../../state/DECISIONS.md#d-036--mobile-offline-retention-online-only-private-view-o-01), and [D-038](../../state/DECISIONS.md#d-038--d-034d-019-supersede-older-first-release-guimobile-exclusions-o-03), the four foundational control actions (`approve`, `stop`, `steer`, `resume`) and offline retention must be explicitly evaluated across all client surfaces for every journey (J1 through J6).
 
 > [!IMPORTANT]
-> **Mobile Client Coverage Requirements (Two Distinct Gates):**  
-> Per the owner plan, mobile coverage is enforced at two distinct structural layers:  
-> 1. **Surface Control Matrix Cells (`O1E-002`):** Every journey must have explicit control-point cells for the Mobile column using the controlled vocabulary below.  
+> **Mobile Client Coverage Requirements (Two Distinct Gates):**<br>
+> Per the owner plan, mobile coverage is enforced at two distinct structural layers:<br>
+> 1. **Surface Control Matrix Cells (`O1E-002`):** Every journey must have explicit control-point cells for the Mobile column using the controlled vocabulary below.<br>
 > 2. **Mobile Capability-Row Mapping (`O1E-016`):** Every journey J1 through J6 must also be explicitly mapped in the `"journeys"` array of mobile client capability row `CAP-016` in `docs/v3/O1-CAPABILITY-MATRIX.json`. Omitting any journey from `CAP-016` violates journey-to-mobile-row coverage even if the surface control cells below are populated.
 
 > [!IMPORTANT]
@@ -220,10 +220,10 @@ The five foundational scenarios specified across [ACCEPTANCE.md](ACCEPTANCE.md#f
 ## 5. Specification Reconciliation: GUI & Mobile Packaging
 
 > [!NOTE]
-> **Governance Reconciliation Note:**  
-> Early product documents (e.g., September 6–7 drafts of [PRODUCT.md](PRODUCT.md#accepted-first-usable-platform-release-â-2026-09-06) and [DECISION-REGISTER.md](DECISION-REGISTER.md#owner-platform-clarification--2026-09-06) under OR-021) contained legacy phrasing stating `"terminal first, dedicated GUI later"`.  
+> **Governance Reconciliation Note:**<br>
+> Early product documents (e.g., 2026-09-06 and 2026-09-07 drafts of [PRODUCT.md](PRODUCT.md#accepted-first-usable-platform-release-â-2026-09-06) and [DECISION-REGISTER.md](DECISION-REGISTER.md#owner-platform-clarification--2026-09-06) under OR-021) contained legacy phrasing stating `"terminal first, dedicated GUI later"`.<br>
 > On 2026-10-02, founder decision [D-038](../../state/DECISIONS.md#d-038--d-034d-019-supersede-older-first-release-guimobile-exclusions-o-03) formally ruled that [D-034](../../state/DECISIONS.md#d-034--product-thesis-the-harness-that-scales-with-your-workflow) and [D-019](../../state/DECISIONS.md#d-019--release-model-build-comprehensively-ship-lean-install-opt-in-dot-option-b-rejected) **supersede** all older first-release GUI and mobile exclusions:
 > - GUI and mobile clients are **in scope and built** as part of the comprehensive product surface.
 > - They are packaged as **built-but-opt-in** clients over the core daemon, preserving a lean default terminal installation without deleting accepted capability.
-> 
+>
 > This document records this supersession as an architectural alignment without modifying protected governance records or deleting client specifications.

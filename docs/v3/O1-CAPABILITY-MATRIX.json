@@ -1,7 +1,21 @@
 {
   "schema": "o1-capability-matrix/v0.1-draft",
   "status": "draft",
-  "version": "0.1.0-draft",
+  "version": "v0.1-draft",
+  "out_of_row_scope": [
+    {
+      "decision_id": "D-034",
+      "reason": "Product thesis and tagline do not map to one capability row.",
+      "retained_obligations": [
+        "reproducible",
+        "cache-aware",
+        "injection-safe"
+      ],
+      "obligation_rows": [
+        "CAP-009"
+      ]
+    }
+  ],
   "target_checkpoint": "2026-11-12",
   "receipt_rule": "H",
   "pillars": [
@@ -414,8 +428,14 @@
       "packaging_default_activation": "opt-in-plugin",
       "claim_permission": "none",
       "dependencies": [
+        "D-033",
         "D-035",
         "OR-029"
+      ],
+      "composition_obligations": [
+        "reproducible",
+        "cache-aware",
+        "injection-safe"
       ],
       "evidence": [],
       "unknowns": [
@@ -513,7 +533,7 @@
       "useful_endpoint": "Distributed task stage execution across Windows and Linux worker nodes",
       "source_config_route_platform": "Hub-and-spoke authenticated network protocol",
       "allowed_effects": "Remote command dispatch, artifact streaming, lease renewal",
-      "fault_recovery_case": "Remote worker disconnects during compilation; coordinator reassigns task stage to local node",
+      "fault_recovery_case": "Remote worker disconnects during compilation. The coordinator reconciles uncertain in-flight effects (external tool calls, remote commits, and partial execution) before reassigning that lost worker's stage.",
       "current_maturity": "researched",
       "target": null,
       "disposition": null,
@@ -723,9 +743,12 @@
         "upstream_only": true,
         "combined": true
       },
+      "upstream_only_requires": [
+        "local-capsule-file"
+      ],
       "actor_start_state": "Active execution turn completing or approaching token thresholds",
       "useful_endpoint": "Content-addressed Context Capsule preserving OwnerIntent, GoalSpec, constraints, and verified diffs",
-      "source_config_route_platform": "Context engine, local storage engine (storage technology unselected; SQLite/CAS is an unselected candidate proposal)",
+      "source_config_route_platform": "Context engine, local storage engine (storage technology unselected; SQLite/CAS is an unselected candidate proposal) Upstream-only compaction uses a local capsule file and does not add a provider API or a model.",
       "allowed_effects": "Capsule artifact creation, metadata indexing",
       "fault_recovery_case": "Capsule integrity check fails hash verification; system rejects corrupt capsule and re-synthesizes from raw log",
       "current_maturity": "researched",
@@ -735,6 +758,7 @@
       "packaging_default_activation": "core-default",
       "claim_permission": "none",
       "dependencies": [
+        "D-024",
         "OR-030",
         "OR-034"
       ],
@@ -756,9 +780,13 @@
         "upstream_only": true,
         "combined": true
       },
+      "upstream_only_requires": [
+        "local-capsule-file",
+        "installed-cli"
+      ],
       "actor_start_state": "Conversation history exceeds context window or upstream session is lost",
       "useful_endpoint": "Distilled context payload reducing token overhead while preserving exact task constraints",
-      "source_config_route_platform": "Compaction service, deterministic filtering rules",
+      "source_config_route_platform": "Compaction service, deterministic filtering rules Upstream-only compaction uses a local capsule file and the installed CLI. It does not add a provider API or a model.",
       "allowed_effects": "In-memory message buffer compression",
       "fault_recovery_case": "Compactor discards a user negative constraint; invariant checker halts rehydration before turn dispatch",
       "current_maturity": "researched",
@@ -768,6 +796,7 @@
       "packaging_default_activation": "opt-in-plugin",
       "claim_permission": "none",
       "dependencies": [
+        "D-024",
         "OR-030",
         "OR-034",
         "D-019"
@@ -791,9 +820,12 @@
         "upstream_only": true,
         "combined": true
       },
+      "upstream_only_requires": [
+        "installed-cli"
+      ],
       "actor_start_state": "System startup; primary user channel initiated",
       "useful_endpoint": "Strategic continuity, high-level goal framing, and ARM executive lifecycle management",
-      "source_config_route_platform": "Recursion Head runtime, #general conversation topic",
+      "source_config_route_platform": "Recursion Head runtime, #general conversation topic Upstream-only planning uses the installed CLI and does not add a provider API or a model.",
       "allowed_effects": "GoalSpec compilation, ARM spawning, budget allocation",
       "fault_recovery_case": "Head process restarts; restores active ARM registry and goal tree from canonical store without token burn",
       "current_maturity": "researched",
@@ -907,6 +939,7 @@
       "packaging_default_activation": "core-default",
       "claim_permission": "none",
       "dependencies": [
+        "D-031",
         "OR-024",
         "CSL-83"
       ],
@@ -1045,9 +1078,13 @@
         "upstream_only": true,
         "combined": true
       },
+      "upstream_only_requires": [
+        "installed-cli",
+        "local-test-command"
+      ],
       "actor_start_state": "Candidate implementation diff generated and ready for evaluation",
       "useful_endpoint": "Cross-family independent verification report verifying diff correctness and gate execution",
-      "source_config_route_platform": "Verifier service, independent model review harness",
+      "source_config_route_platform": "Verifier service, independent model review harness Upstream-only verification uses the installed CLI and local test commands. It does not add a provider API or a model.",
       "allowed_effects": "Test execution, review report emission",
       "fault_recovery_case": "Implementer claims PASS but independent verifier detects regression; diff is rejected and returned for rework",
       "current_maturity": "researched",
@@ -1132,6 +1169,8 @@
       "packaging_default_activation": "opt-in-plugin",
       "claim_permission": "none",
       "dependencies": [
+        "D-026",
+        "D-027",
         "OR-033",
         "docs/v3/program-control/MONTH-PROGRAM.md",
         "D-019"
@@ -1202,6 +1241,7 @@
       "packaging_default_activation": "core-default",
       "claim_permission": "none",
       "dependencies": [
+        "D-024",
         "D-028"
       ],
       "evidence": [],
@@ -1305,6 +1345,7 @@
       "packaging_default_activation": "core-default",
       "claim_permission": "none",
       "dependencies": [
+        "D-032",
         "OR-037",
         "CONTROL_PLANE.md"
       ],

@@ -223,9 +223,10 @@ class ClaimingTests(unittest.TestCase):
         ]))
         self.assertEqual(codes(result), ["multiple_claims_per_session"])
         # Codex 4343345426: the session's later child claim is not published
-        # as CSL-2's holder; the parent claim still holds CSL-1.
+        # as CSL-2's holder; the parent claim, whose scope covers CSL-2, holds
+        # both (Codex 4343468463).
         self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], U1)
-        self.assertEqual(result["issues"]["CSL-2"]["claims"]["recursion"]["winner"], None)
+        self.assertEqual(result["issues"]["CSL-2"]["claims"]["recursion"]["winner"], U1)
 
     def test_s22_claims_on_two_issues_sharing_a_branch_are_flagged(self):
         result = sim.evaluate(snapshot(10, [issue("CSL-1"), issue("CSL-4")], [
@@ -1814,6 +1815,30 @@ class CrossSessionOverlapTests(unittest.TestCase):
         self.assertIn(("loser_confirmed", U3), found)
         self.assertIn(("overlapping_claim", U2), found)
         self.assertEqual(result["issues"]["CSL-4"]["claims"]["recursion"]["winner"], None)
+
+    def test_a_parent_scoped_claim_alone_holds_the_child(self):
+        # Codex 4343468463 / Samir 5608007390: with only the parent claim live,
+        # its scoped child is held by it and is not claimable.
+        result = self.evaluate(10, [scoped("c1", "CSL-1", U1, "CSL-2")])
+        self.assertEqual(codes(result), [])
+        child = result["issues"]["CSL-2"]
+        self.assertEqual(child["claims"]["recursion"], {"live_claims": [U1], "winner": U1, "must_reread": False})
+        self.assertFalse(child["claimable"])
+        self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], U1)
+
+    def test_a_released_parent_claim_no_longer_covers_the_child(self):
+        released = scoped("c1", "CSL-1", U1, "CSL-2", more_edits=[edit(5, U1, "released")])
+        result = self.evaluate(10, [released])
+        self.assertEqual(codes(result), [])
+        self.assertNotIn("recursion", result["issues"]["CSL-2"]["claims"])
+        self.assertTrue(result["issues"]["CSL-2"]["claimable"])
+
+    def test_a_later_child_claim_does_not_displace_the_covering_parent(self):
+        child = claim("c2", "CSL-2", U2, at=1, session="cursor/s2", branch="csl-2-work")
+        result = self.evaluate(10, [scoped("c1", "CSL-1", U1, "CSL-2"), child])
+        self.assertEqual(codes(result), ["overlapping_claim"])
+        self.assertEqual(result["issues"]["CSL-2"]["claims"]["recursion"]["winner"], U1)
+        self.assertEqual(result["issues"]["CSL-2"]["claims"]["recursion"]["live_claims"], [U1, U2])
 
     def test_same_issue_races_keep_their_own_codes(self):
         result = self.evaluate(10, [claim("c1", "CSL-1", U1), claim("c2", "CSL-1", U2, at=1, session="cursor/s2")])

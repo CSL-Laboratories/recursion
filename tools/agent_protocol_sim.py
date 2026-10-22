@@ -946,13 +946,27 @@ class Evaluation:
 
     def holder(self, issue: str, repo: str, at: datetime) -> Claim | None:
         """The race winner, unless an earlier claim, from this or another
-        session, blocks it by scope or branch; then nobody holds the issue.
-        The race itself stays on the unfiltered live claims, so a later claim
-        on the issue still loses to the blocked one."""
+        session, blocks it by scope or branch. The race itself stays on the
+        unfiltered live claims, so a later claim on the issue still loses to
+        the blocked one. With no unblocked winner, a parent claim whose
+        `scope: sub-issue` covers the issue holds it if that parent claim
+        holds its own issue; otherwise nobody holds the issue."""
         winner = self.winner(issue, repo, at)
-        if winner is not None and self.earlier_overlap(winner, at) is not None:
-            return None
-        return winner
+        if winner is not None and self.earlier_overlap(winner, at) is None:
+            return winner
+        for parent in self.covering_claims(issue, repo, at):
+            if self.winner(parent.issue, repo, at) is parent and self.earlier_overlap(parent, at) is None:
+                return parent
+        return None
+
+    def covering_claims(self, issue: str, repo: str, at: datetime) -> list[Claim]:
+        """Live claims on other issues whose `scope: sub-issue` covers `issue`."""
+        return sorted(
+            (c for c in self.claims.values()
+             if c.repo == repo and c.issue != issue and issue in c.scope_issues(self.issues)
+             and c in self.live_claims(c.issue, repo, at)),
+            key=lambda c: (c.created_at, c.uuid),
+        )
 
     def overlap(self, claim: Claim, other: Claim) -> str | None:
         """How two claims in one repository on different issues overlap:
@@ -1583,7 +1597,9 @@ class Evaluation:
         for issue_id in sorted(self.issues):
             per_repo = {}
             for repo in repos:
-                live = self.live_claims(issue_id, repo, self.now)
+                # A live parent claim scoped to this issue covers it too, so the
+                # issue is not reported as claimable (Codex 4343468463).
+                live = self.live_claims(issue_id, repo, self.now) + self.covering_claims(issue_id, repo, self.now)
                 winner = self.holder(issue_id, repo, self.now)
                 if not live and not any(c.issue == issue_id and c.repo == repo for c in self.claims.values()):
                     continue

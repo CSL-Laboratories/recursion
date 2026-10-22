@@ -1284,7 +1284,7 @@ class OutboxHelperTests(unittest.TestCase):
         o.model_api(self.CONFIG, ["commit", ".claude-fixer-replies/msg.txt"], run=run)
         self.assertEqual(calls[2], self.GIT + ["add", "-A", "--", ".", ":(exclude,literal)mask",
                                                ":(exclude,literal).zshrc"])
-        self.assertEqual(calls[3], self.GIT + list(o.UNSTAGE))
+        self.assertEqual(calls[3], self.GIT + list(o.UNSTAGE))  # a dispatch run: nothing was restored
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "POSIX special files")
     def test_masked_paths_stay_out_of_a_real_commit(self):
@@ -1292,12 +1292,12 @@ class OutboxHelperTests(unittest.TestCase):
         # plain checkout never lists a device or FIFO as untracked the way bwrap's mount points are.
         with patch.dict(os.environ, git_env(), clear=True):
             o.command(["git", "init", "-q", "-b", "fix"])
-            for name in ("a.txt", ".mcp.json", "b.txt"):
+            for name in ("a.txt", ".bashrc", "b.txt"):
                 Path(name).write_text(name + "\n")
             o.command(["git", "add", "-A"])
             o.command(["git", "commit", "-q", "-m", "base"])
             Path("a.txt").write_text("b\n")
-            Path(".mcp.json").write_text("")  # a tracked file emptied by the model is a real change
+            Path(".bashrc").write_text("")  # a tracked file emptied by the model is a real change
             os.mkfifo("*mask")
             Path(".zshrc").write_text("")  # a leftover empty mount point
             Path("docs").mkdir()
@@ -1310,7 +1310,7 @@ class OutboxHelperTests(unittest.TestCase):
                 return o.command(argv)
             head = o.model_api(self.CONFIG, ["commit", ".claude-fixer-replies/msg.txt"], run=run)
             files = o.command(["git", "show", "--name-only", "--format=", head]).split("\n")
-            self.assertEqual(sorted(files), [".mcp.json", "a.txt", "docs/.profile"])
+            self.assertEqual(sorted(files), [".bashrc", "a.txt", "docs/.profile"])
             # A tracked path the sandbox later masked (a deletion) refuses the commit, unstubbed.
             Path("b.txt").unlink()
             os.mkfifo("b.txt")
@@ -1437,7 +1437,8 @@ class OutboxHelperTests(unittest.TestCase):
             calls = []
             run = lambda a, calls=calls: calls.append(a) or ("f" * 40 if a[-2:] == ["rev-parse", "HEAD"] else "")
             with self.subTest(mode=mode):
-                out = o.model_api(self.CONFIG | {"mode": mode}, ["commit", ".claude-fixer-replies/msg.txt"], run=run)
+                out = o.model_api(self.CONFIG | {"mode": mode, "restored": mode != "conflict"},
+                                  ["commit", ".claude-fixer-replies/msg.txt"], run=run)
                 self.assertEqual(out, "f" * 40)
                 if mode == "conflict":  # unmerged paths are checked for leftover markers first
                     self.assertEqual(calls.pop(0), self.GIT + ["diff", "--name-only", "-z", "--diff-filter=U"])
@@ -1445,7 +1446,8 @@ class OutboxHelperTests(unittest.TestCase):
                     self.GIT + ["ls-files", "-z", "--modified"],
                     self.GIT + ["ls-files", "-z", "--others", "--exclude-standard"],
                     self.GIT + ["add", "-A", "--", "."],
-                    self.GIT + ["reset", "-q", "--", ".claude-fixer-out", ".claude-fixer-replies"],
+                    self.GIT + ["reset", "-q", "--", ".claude-fixer-out", ".claude-fixer-replies"]
+                    + ([] if mode == "conflict" else list(o.ACTION_RESTORED)),
                     self.GIT + ["commit", "--no-verify", "-q", "-m", "-fix: a message\nwith a second line\n"],
                     self.GIT + ["rev-parse", "HEAD"]])
         for body in ("", "<!-- claude-fixer-result:{} -->"):
@@ -1534,6 +1536,238 @@ class OutboxHelperTests(unittest.TestCase):
             head = o.model_api(self.CONFIG, ["commit", ".claude-fixer-replies/msg.txt"])
             self.assertEqual(o.command(["git", "show", "--name-only", "--format=", head]).split(), ["a.txt"])
             self.assertEqual(o.command(["git", "show", f"{head}:.claude-fixer-out/tracked.txt"]), "old")
+
+    def test_install_records_whether_the_action_restored_config(self):
+        # Codex 4335300680 / Chaandan at cac2a13: the action restores only for a PR entity event
+        # (run.ts: isEntityContext && isPR), never for workflow/repository dispatch or the conflict job.
+        helper = Path("helper")
+        helper.mkdir()
+        script = helper / "model-api"
+        script.write_text((ROOT / "scripts/ci/claude_fixer_outbox.py").read_text(encoding="utf-8"))
+        env = {k: v for k, v in os.environ.items() if k not in {"GH_TOKEN", "GITHUB_EVENT_NAME"}}
+        cases = [("mention", "issue_comment", True), ("fixer", "pull_request_review", True),
+                 ("fixer", "pull_request_review_comment", True), ("fixer", "workflow_dispatch", False),
+                 ("fixer", "repository_dispatch", False), ("fixer", None, False), ("mention", "issues", False),
+                 ("conflict", "issue_comment", False), ("conflict", "schedule", False)]
+        for mode, event, expected in cases:
+            with self.subTest(mode=mode, event=event):
+                for leftover in helper.glob("context.json"):
+                    leftover.unlink()
+                install = dict(env, REPO=REPO, PR_NUMBER="7", HEAD_SHA=A, HEAD_REF="fix", WRITER_MODE=mode)
+                if event:
+                    install["GITHUB_EVENT_NAME"] = event
+                subprocess.run([sys.executable, "-I", str(script), "install"], env=install, check=True)
+                self.assertIs(json.loads((helper / "context.json").read_text())["restored"], expected)
+        for bad in ({"restored": 1}, {"restored": "true"}, {"restored": True, "mode": "conflict"}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                o.validate(self.CONFIG | bad)
+
+    def install_trigger(self, mode, event, payload):
+        # The install step's trigger recording, run as the real helper with a runner-style event file.
+        helper = Path("helper")
+        helper.mkdir(exist_ok=True)
+        script = helper / "model-api"
+        script.write_text((ROOT / "scripts/ci/claude_fixer_outbox.py").read_text(encoding="utf-8"))
+        for leftover in helper.glob("context.json"):
+            leftover.unlink()
+        env = {k: v for k, v in os.environ.items()
+               if k not in {"GH_TOKEN", "GITHUB_EVENT_NAME", "GITHUB_EVENT_PATH"}}
+        install = dict(env, REPO=REPO, PR_NUMBER="7", HEAD_SHA=A, HEAD_REF="fix", WRITER_MODE=mode)
+        if event:
+            install["GITHUB_EVENT_NAME"] = event
+        if payload is not None:
+            Path("event.json").write_text(json.dumps(payload))
+            install["GITHUB_EVENT_PATH"] = str(Path("event.json").resolve())
+        subprocess.run([sys.executable, "-I", str(script), "install"], env=install, check=True)
+        return json.loads((helper / "context.json").read_text())
+
+    def test_install_records_the_mention_trigger_from_the_event_file(self):
+        # CSL-377 canary run 39649522054: the mention reads its own comment by the event's ID, never the model's.
+        for event in ("issue_comment", "pull_request_review_comment"):
+            with self.subTest(event=event):
+                self.assertEqual(self.install_trigger("mention", event, {"comment": {"id": 123}})["trigger"],
+                                 {"event": event, "id": 123})
+        refused = [("fixer", "issue_comment", {"comment": {"id": 123}}),
+                   ("conflict", "issue_comment", {"comment": {"id": 123}}),
+                   ("mention", "pull_request_review", {"comment": {"id": 123}}),
+                   ("mention", "workflow_dispatch", {"comment": {"id": 123}}),
+                   ("mention", "issues", {"comment": {"id": 123}}),
+                   ("mention", "issue_comment", None), ("mention", None, {"comment": {"id": 123}}),
+                   ("mention", "issue_comment", {"comment": {"id": 0}}),
+                   ("mention", "issue_comment", {"comment": {"id": -1}}),
+                   ("mention", "issue_comment", {"comment": {"id": "123"}}),
+                   ("mention", "issue_comment", {"comment": {"id": True}}),
+                   ("mention", "issue_comment", {"comment": None}), ("mention", "issue_comment", [])]
+        for mode, event, payload in refused:
+            with self.subTest(mode=mode, event=event, payload=payload):
+                self.assertNotIn("trigger", self.install_trigger(mode, event, payload))
+
+    def test_validate_refuses_a_malformed_or_misplaced_trigger(self):
+        mention = self.CONFIG | {"mode": "mention", "roots": []}
+        o.validate(mention | {"trigger": {"event": "issue_comment", "id": 5}})
+        for config in (self.CONFIG | {"trigger": {"event": "issue_comment", "id": 5}},
+                       self.CONFIG | {"mode": "conflict", "trigger": {"event": "issue_comment", "id": 5}},
+                       mention | {"trigger": {"event": "pull_request_review", "id": 5}},
+                       mention | {"trigger": {"event": "issue_comment", "id": 5, "path": "x"}},
+                       mention | {"trigger": {"event": "issue_comment", "id": "5"}},
+                       mention | {"trigger": {"event": "issue_comment", "id": 0}},
+                       mention | {"trigger": {"event": "issue_comment", "id": -1}},
+                       mention | {"trigger": {"event": "issue_comment", "id": True}},
+                       mention | {"trigger": ["issue_comment", 5]}):
+            with self.subTest(config=config), self.assertRaises(ValueError):
+                o.validate(config)
+
+    def trigger_config(self, event="issue_comment", cid=5):
+        return self.CONFIG | {"mode": "mention", "roots": [], "trigger": {"event": event, "id": cid}}
+
+    @staticmethod
+    def comment(cid=5, body="please fix the typo", login="NotSkittlz"):
+        return json.dumps({"id": cid, "body": body, "user": {"login": login}})
+
+    def test_trigger_reads_only_the_triggering_comment_at_a_fixed_endpoint(self):
+        for event, path in (("issue_comment", f"repos/{REPO}/issues/comments/5"),
+                            ("pull_request_review_comment", f"repos/{REPO}/pulls/comments/5")):
+            calls = []
+            run = lambda args, calls=calls: calls.append(args) or self.comment()
+            with self.subTest(event=event):
+                out = o.model_api(self.trigger_config(event), ["trigger"], run=run)
+                self.assertEqual(calls, [["gh", "api", "--method", "GET", path]])
+                self.assertEqual(out, "Triggering comment 5 by NotSkittlz (untrusted data):\nplease fix the typo")
+        # No model-chosen ID, endpoint or option, and only the mention job has a trigger to read.
+        never = lambda args: self.fail(f"gh ran: {args}")
+        for config, args in ((self.trigger_config(), ["trigger", "6"]), (self.trigger_config(), ["trigger", "--paginate"]),
+                             (self.trigger_config(), ["trigger", "repos/x/y"]),
+                             (self.CONFIG | {"mode": "mention", "roots": []}, ["trigger"]),
+                             (self.CONFIG, ["trigger"]), (self.CONFIG | {"mode": "conflict"}, ["trigger"])):
+            with self.subTest(config=config, args=args), self.assertRaises(ValueError):
+                o.model_api(config, args, run=never)
+
+    def test_read_trigger_rechecks_the_mode_itself(self):
+        # Defence in depth behind validate(): a trigger in another mode's context is never read.
+        never = lambda args: self.fail(f"gh ran: {args}")
+        for mode in ("fixer", "conflict"):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                o.read_trigger(self.trigger_config() | {"mode": mode}, never)
+
+    def test_trigger_refuses_an_unexpected_response(self):
+        for response in (self.comment(cid=6), json.dumps({"id": 5, "body": None}), json.dumps({"id": 5}),
+                         json.dumps([{"id": 5, "body": "x"}]), json.dumps("x")):
+            with self.subTest(response=response), self.assertRaises(ValueError):
+                o.model_api(self.trigger_config(), ["trigger"], run=lambda args, r=response: r)
+        # True == 1 in Python: the response must have an integer ID as well as match the trusted ID.
+        with self.assertRaises(ValueError):
+            o.model_api(self.trigger_config(cid=1), ["trigger"], run=lambda args: self.comment(cid=True))
+        # A missing or odd author is labelled, not trusted.
+        out = o.model_api(self.trigger_config(), ["trigger"], run=lambda args: json.dumps({"id": 5, "body": "b"}))
+        self.assertEqual(out, "Triggering comment 5 by unknown (untrusted data):\nb")
+
+    def test_trigger_output_is_bounded_in_utf16_units_and_fails_closed(self):
+        # Claude Code shows at most 30000 characters inline; one long comment can exceed that by itself.
+        self.assertEqual(o.MAX_TRIGGER_UNITS, 24000)
+        for body, ok in (("a" * 24000, True), ("a" * 24001, False),
+                         ("\U0001F600" * 12000, True), ("\U0001F600" * 12000 + "a", False),
+                         ("\U0001F600" * 12001, False)):
+            with self.subTest(units=len(body.encode("utf-16-le")) // 2):
+                run = lambda args, b=body: self.comment(body=b)
+                if ok:
+                    self.assertEqual(o.model_api(self.trigger_config(), ["trigger"], run=run),
+                                     "Triggering comment 5 by NotSkittlz (untrusted data):\n" + body)
+                else:
+                    with self.assertRaises(o.TriggerTooLong):
+                        o.model_api(self.trigger_config(), ["trigger"], run=run)
+
+    @POSIX
+    def test_oversized_trigger_names_its_own_failure_and_prints_no_body(self):
+        context = self.install_trigger("mention", "issue_comment", {"comment": {"id": 5}})
+        self.assertEqual(context["trigger"], {"event": "issue_comment", "id": 5})
+        bin_dir = Path("bin")
+        bin_dir.mkdir()
+        body = "Z" * 24001
+        (bin_dir / "gh").write_text("#!/bin/sh\ncat \"$GH_FIXTURE\"\n")
+        (bin_dir / "gh").chmod(0o755)
+        Path("fixture.json").write_text(self.comment(body=body))
+        env = {k: v for k, v in os.environ.items() if k != "GH_TOKEN"}
+        env.update(PATH=f"{bin_dir.resolve()}{os.pathsep}{env['PATH']}", GH_FIXTURE=str(Path("fixture.json").resolve()))
+        result = subprocess.run([sys.executable, "-I", "helper/model-api", "--", "trigger"], env=env,
+                                capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr.strip(), "Helper operation failed: the triggering comment is longer than "
+                                                "24000 characters; ask for a shorter request.")
+        self.assertNotIn("ZZZ", result.stderr)
+        # Any other failure keeps the generic message, so the two cases stay distinguishable.
+        Path("fixture.json").write_text(self.comment(cid=6))
+        other = subprocess.run([sys.executable, "-I", "helper/model-api", "--", "trigger"], env=env,
+                               capture_output=True, text=True, check=False)
+        self.assertEqual((other.returncode, other.stderr.strip()), (1, "Helper operation failed or is not permitted."))
+
+    def test_oversized_trigger_notice_is_published_as_a_pr_comment(self):
+        # Devin 4341582246: the oversized-trigger notice goes through the real outbox/publisher as a
+        # top-level comment. Port A wires no workflow, so the mention prompt's check moves to PR B.
+        for event, parent in (("issue_comment", None), ("pull_request_review_comment", None),
+                              ("pull_request_review_comment", 4)):
+            with self.subTest(event=event, parent=parent):
+                config = self.trigger_config(event)
+                with self.assertRaises(o.TriggerTooLong) as refused:
+                    o.model_api(config, ["trigger"], run=lambda args: self.comment(body="Z" * 24001))
+                notice = f"{refused.exception}. Please post a shorter request."
+                body_file = ".claude-fixer-replies/shorter.txt"
+                Path(body_file).write_text(notice, encoding="utf-8")
+                o.OUTBOX.unlink(missing_ok=True)
+                o.model_api(config, ["comment", body_file], run=lambda args: self.fail("unexpected API call"))
+                h = Harness(self, mode="mention")
+                targets = {} if event == "issue_comment" else {
+                    5: {"id": 5, "in_reply_to_id": parent,
+                        "pull_request_url": f"https://api.github.com/repos/{REPO}/pulls/7"}}
+                h.targets = targets
+                (h.artifact / "outbox.jsonl").write_bytes(o.OUTBOX.read_bytes())
+                self.assertEqual(h.run(), 0)
+                self.assertEqual(h.writes, [("POST", f"{p.GITHUB_API}/repos/{REPO}/issues/7/comments",
+                                             TOKEN, {"body": notice})])
+                self.assertEqual(h.pushed, [])
+                self.assertIn("1 queued write(s) posted, 0 refused", h.audits[0])
+                self.assertNotIn("ZZZ", json.dumps(h.writes))
+                if event == "issue_comment" or parent is not None:
+                    # Negative control: the old reply instruction loses this same notice.
+                    old = Harness(self, mode="mention", records=[{"op": "reply", "comment_id": 5, "body": notice}])
+                    old.targets = targets
+                    self.assertEqual(old.run(), 0)
+                    self.assertEqual(old.writes, [])
+                    self.assertIn("0 queued write(s) posted, 1 refused", old.audits[0])
+
+    @POSIX
+    def test_pr_event_commit_leaves_the_actions_base_branch_restores_out(self):
+        # Fable rehearsal of a5fd6b7: for PR events claude-code-action's restoreConfigFromBase leaves the
+        # base branch's .claude/, CLAUDE.md, .ripgreprc, ... unstaged in the worktree. Staging them would
+        # revert the PR's versions (and the publisher refuses protected paths, dropping the whole run).
+        # A dispatch run gets no restore, so its edits to those paths are real and are committed.
+        self.assertEqual(o.ACTION_RESTORED, (".claude", ".mcp.json", ".claude.json", ".gitmodules", ".ripgreprc",
+                                             "CLAUDE.md", "CLAUDE.local.md", ".husky"))
+        for mode, restored in (("mention", True), ("fixer", True), ("fixer", False)):
+            with self.subTest(mode=mode, restored=restored), tempfile.TemporaryDirectory() as tmp, \
+                    patch.dict(os.environ, git_env(), clear=True):
+                os.chdir(tmp)
+                o.command(["git", "init", "-q", "-b", "main"])
+                for name, text in (("a.txt", "a\n"), ("CLAUDE.md", "pr\n"), (".claude/settings.json", "{}\n"),
+                                   (".husky/pre-commit", "pr\n")):
+                    Path(name).parent.mkdir(exist_ok=True)
+                    Path(name).write_text(text)
+                o.command(["git", "add", "-A"])
+                o.command(["git", "commit", "-q", "-m", "base"])
+                # What the restore leaves behind: base-branch content, unstaged, plus base-only files.
+                Path("CLAUDE.md").write_text("main\n")
+                Path(".claude/settings.json").write_text('{"main": 1}\n')
+                Path(".husky/pre-commit").unlink()
+                Path(".ripgreprc").write_text("--hidden\n")
+                Path("a.txt").write_text("b\n")
+                Path(".claude-fixer-replies").mkdir()
+                Path(".claude-fixer-replies/msg.txt").write_text("fix: change a\n")
+                head = o.model_api(self.CONFIG | {"mode": mode, "restored": restored},
+                                   ["commit", ".claude-fixer-replies/msg.txt"])
+                files = o.command(["git", "show", "--name-only", "--format=", head]).split()
+                self.assertEqual(sorted(files), ["a.txt"] if restored else
+                                 [".claude/settings.json", ".husky/pre-commit", ".ripgreprc", "CLAUDE.md", "a.txt"])
+                os.chdir(self.tmp.name)
 
     @POSIX
     def test_user_level_git_config_cannot_run_drivers_filters_or_signing(self):

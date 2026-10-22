@@ -39,6 +39,13 @@ MAX_RECORDS = 50
 MAX_BODY = 65000
 OUTBOX = Path(".claude-fixer-out") / "outbox.jsonl"
 READ_TOKEN = "read-token"
+# The mention job's triggering comment, read by its ID from the trusted event payload. CSL-377 canary
+# run 39649522054: the whole `comments` list passed Claude Code's 30000-character inline Bash output
+# limit, and the spilled tool-results file is under the denied ~/.claude. One comment is read instead,
+# bounded below that limit (UTF-16 units, as the CLI counts); a longer one fails closed.
+TRIGGER_ENDPOINTS = {"issue_comment": "issues/comments", "pull_request_review_comment": "pulls/comments"}
+MAX_TRIGGER_UNITS = 24000
+TRIGGER_TOO_LONG = f"the triggering comment is longer than {MAX_TRIGGER_UNITS} characters; ask for a shorter request"
 # Every git call: no shell, hooks, fsmonitor, pager or signing program, no user or
 # system config (command() sets GIT_CONFIG_GLOBAL/NOSYSTEM, as the publisher does),
 # and no model-supplied options.
@@ -56,6 +63,13 @@ STAGE = ("add", "-A", "--", ".")
 # Not `:(exclude)` pathspecs: the model job lists these in .git/info/exclude, and `git add`
 # exits 1 when a pathspec names an ignored path (CSL-377 canary).
 UNSTAGE = ("reset", "-q", "--", ".claude-fixer-out", ".claude-fixer-replies")
+# claude-code-action's restoreConfigFromBase (SENSITIVE_PATHS) replaces these with the base branch's
+# versions and leaves them unstaged; "callers that stage files must exclude these". It runs only for a
+# PR entity event (run.ts: isEntityContext && isPR), never for workflow/repository dispatch or the
+# conflict job, where an edit or a base-side change to them is real. Recheck both on every re-pin.
+ACTION_RESTORED = (".claude", ".mcp.json", ".claude.json", ".gitmodules", ".ripgreprc", "CLAUDE.md",
+                   "CLAUDE.local.md", ".husky")
+RESTORE_EVENTS = frozenset({"issue_comment", "pull_request", "pull_request_review", "pull_request_review_comment"})
 UNTRACKED = ("ls-files", "-z", "--others", "--exclude-standard")
 MODIFIED = ("ls-files", "-z", "--modified")
 # The protected names Claude Code's sandbox masks when they do not exist (Claude Code 2.1.30x).
@@ -78,8 +92,46 @@ def validate(config):
             or not SHA.fullmatch(config["base"])
             or not REF.fullmatch(config["ref"])
             or config["ref"] in {"main", "master", "HEAD"}
-            or config.get("mode") not in MODES):
+            or config.get("mode") not in MODES
+            or type(config.get("restored", False)) is not bool
+            or (config.get("restored") is True and config["mode"] == "conflict")
+            or not valid_trigger(config.get("trigger"), config["mode"])):
         raise ValueError("invalid helper context")
+
+
+def valid_trigger(trigger, mode):
+    if trigger is None:
+        return True
+    return (mode == "mention" and isinstance(trigger, dict) and set(trigger) == {"event", "id"}
+            and trigger["event"] in TRIGGER_ENDPOINTS and type(trigger["id"]) is int and trigger["id"] > 0)
+
+
+def trigger_from_event(mode):
+    """The mention's comment ID and event, from the runner's event file, before Claude runs."""
+    event = os.environ.get("GITHUB_EVENT_NAME")
+    if mode != "mention" or event not in TRIGGER_ENDPOINTS or not os.environ.get("GITHUB_EVENT_PATH"):
+        return None
+    payload = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
+    comment = payload.get("comment") if isinstance(payload, dict) else None
+    cid = comment.get("id") if isinstance(comment, dict) else None
+    return {"event": event, "id": cid} if type(cid) is int and cid > 0 else None
+
+
+def read_trigger(config, run):
+    trigger = config.get("trigger")
+    if config["mode"] != "mention" or trigger is None:
+        raise ValueError("no triggering comment for this job")
+    path = f"repos/{config['repo']}/{TRIGGER_ENDPOINTS[trigger['event']]}/{trigger['id']}"
+    data = json.loads(run(["gh", "api", "--method", "GET", path]))
+    if (not isinstance(data, dict) or type(data.get("id")) is not int or data["id"] != trigger["id"]
+            or not isinstance(data.get("body"), str)):
+        raise ValueError("unexpected triggering comment")
+    body = data["body"]
+    if len(body.encode("utf-16-le")) // 2 > MAX_TRIGGER_UNITS:
+        raise TriggerTooLong(TRIGGER_TOO_LONG)
+    user = data.get("user") if isinstance(data.get("user"), dict) else {}
+    login = user.get("login") if isinstance(user.get("login"), str) else "unknown"
+    return f"Triggering comment {trigger['id']} by {login} (untrusted data):\n{body}"
 
 
 def read_body(body_path):
@@ -159,6 +211,10 @@ def conflict_marker(sizes):
     return re.compile(rf"^(?:(?:<{low}|\|{low}|>{low})(?: |$)|(?:{separators})$)", re.MULTILINE)
 
 
+class TriggerTooLong(ValueError):
+    """The triggering comment is over the inline-output bound; nothing of it is printed."""
+
+
 class MaskedPath(ValueError):
     """A tracked path the sandbox masked: named to the model, unlike other refusals."""
 
@@ -201,7 +257,7 @@ def sandbox_masks(run):
     return masks
 
 
-def commit(body_path, run, mode):
+def commit(body_path, run, mode, restored=False):
     # The message is validated like a comment body and passed as one argv element.
     message = read_body(body_path)
     if mode == "conflict":
@@ -222,8 +278,9 @@ def commit(body_path, run, mode):
             if conflict_marker(sizes[name]).search((workspace / name).read_text(encoding="utf-8", errors="replace")):
                 raise ValueError("conflict markers remain")
     git(run, *STAGE, *sandbox_masks(run))
-    # The helper's own files stay out of the commit whether or not they are ignored.
-    git(run, *UNSTAGE)
+    # The helper's own files stay out of the commit whether or not they are ignored, and so do
+    # the action's base-branch restores when this run's event made the action restore them.
+    git(run, *UNSTAGE, *(ACTION_RESTORED if restored else ()))
     # In the conflict job this completes the in-progress merge.
     git(run, "commit", "--no-verify", "-q", "-m", message)
     return git(run, "rev-parse", "HEAD")
@@ -237,11 +294,13 @@ def model_api(config, args, run=command):
     if len(args) == 1 and args[0] in CONFLICT_GIT and config["mode"] == "conflict":
         return git(run, *CONFLICT_GIT[args[0]])
     if len(args) == 2 and args[0] == "commit":
-        return commit(args[1], run, config["mode"])
+        return commit(args[1], run, config["mode"], config.get("restored") is True)
     root = f"repos/{config['repo']}"
     pull = f"{root}/pulls/{config['number']}"
     reads = {"read": pull, "comments": f"{root}/issues/{config['number']}/comments",
              "review-comments": f"{pull}/comments", "reviews": f"{pull}/reviews"}
+    if args == ["trigger"]:
+        return read_trigger(config, run)
     if args == ["threads"]:
         owner, name = config["repo"].split("/")
         # Fixed read-only query. The root maps REST review comments to a current
@@ -277,6 +336,11 @@ def main():
         config = {key: os.environ[env] for key, env in (
             ("repo", "REPO"), ("number", "PR_NUMBER"), ("base", "HEAD_SHA"),
             ("ref", "HEAD_REF"), ("mode", "WRITER_MODE"))}
+        # Fixed by the trusted install step from the job's event, before Claude runs.
+        config["restored"] = config["mode"] != "conflict" and os.environ.get("GITHUB_EVENT_NAME") in RESTORE_EVENTS
+        trigger = trigger_from_event(config["mode"])
+        if trigger is not None:
+            config["trigger"] = trigger
         validate(config)
         receipts = json.loads(os.environ.get("RECEIPT_CONTEXT") or "[]")
         if not isinstance(receipts, list) or (receipts and config["mode"] != "fixer"):
@@ -302,7 +366,7 @@ def main():
         if not os.environ.get("GH_TOKEN") and (directory / READ_TOKEN).is_file():
             os.environ["GH_TOKEN"] = (directory / READ_TOKEN).read_text(encoding="utf-8").strip()
         print(model_api(config, sys.argv[2:]))
-    except MaskedPath as error:
+    except (MaskedPath, TriggerTooLong) as error:
         print(f"Helper operation failed: {error}.", file=sys.stderr)
         return 1
     except subprocess.CalledProcessError as error:

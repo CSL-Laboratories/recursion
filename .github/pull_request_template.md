@@ -1,5 +1,5 @@
 Related to CSL-___
-<!-- Use `Fixes CSL-___` instead only when this PR completes the issue's acceptance criteria (AGENTS.md, "Filing and shipping"). -->
+<!-- Use `Fixes` instead of `Related to` only when this PR completes the issue's acceptance criteria (AGENTS.md, "Filing and shipping"). -->
 Touches other repos? (link the cross-repo Linear issue)
 
 ## Summary

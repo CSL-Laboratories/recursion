@@ -456,7 +456,7 @@ All cryptographic digests binding artifacts, pinned sources, and test payloads a
         },
         "artifact_digests": {
           "type": "object",
-          "description": "sha256 of each of the four O1 artifacts, keyed by path; compared against the candidate manifest",
+          "description": "sha256 of each of the four O1 artifacts, keyed by basename exactly as in the manifest `artifacts` map; compared against the candidate manifest",
           "minProperties": 4,
           "additionalProperties": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
         },
@@ -467,7 +467,7 @@ All cryptographic digests binding artifacts, pinned sources, and test payloads a
         },
         "fixture_digests": {
           "type": "object",
-          "description": "sha256 of each conformance test fixture, keyed by fixture ID",
+          "description": "sha256 of each conformance test fixture, keyed by payload name exactly as in the manifest `fixtures` map (goal_prompt, goal_spec, j1_patch, state_transfer_inbound, state_transfer_outbound)",
           "additionalProperties": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
         },
         "digests_matched": { "type": "boolean" },
@@ -575,14 +575,18 @@ All cryptographic digests binding artifacts, pinned sources, and test payloads a
         "docs/v3/O1-DECISIONS-QUEUE.md"
       ],
       "artifact_digests": {
-        "docs/v3/O1-CONTRACT.md": "<computed:sha256(docs/v3/O1-CONTRACT.md)>",
-        "docs/v3/O1-JOURNEYS.md": "<computed:sha256(docs/v3/O1-JOURNEYS.md)>",
-        "docs/v3/O1-CAPABILITY-MATRIX.json": "<computed:sha256(docs/v3/O1-CAPABILITY-MATRIX.json)>",
-        "docs/v3/O1-DECISIONS-QUEUE.md": "<computed:sha256(docs/v3/O1-DECISIONS-QUEUE.md)>"
+        "O1-CONTRACT.md": "<computed:sha256(contract)>",
+        "O1-JOURNEYS.md": "<computed:sha256(journeys)>",
+        "O1-CAPABILITY-MATRIX.json": "<computed:sha256(matrix)>",
+        "O1-DECISIONS-QUEUE.md": "<computed:sha256(queue)>"
       },
       "pinned_source_digests": {},
       "fixture_digests": {
-        "O1F-P01": "<computed:sha256(fixture O1F-P01)>"
+        "goal_prompt": "<computed:sha256(goal_prompt)>",
+        "goal_spec": "<computed:sha256(goal_spec)>",
+        "j1_patch": "<computed:sha256(j1_patch)>",
+        "state_transfer_inbound": "<computed:sha256(state_transfer_inbound)>",
+        "state_transfer_outbound": "<computed:sha256(state_transfer_outbound)>"
       },
       "digests_matched": true,
       "stale_entries": 0

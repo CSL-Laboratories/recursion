@@ -42,6 +42,10 @@ comment whose first line ends with `claim v1`. Its `scope:` is `whole issue`
 or `sub-issue CSL-N`, which also covers that sub-issue of the claimed issue;
 it may name several claims to take over, one `takeover of <uuid>` line each,
 and `takeovers` in the result gives each one's outcome under `targets`.
+A claim that lost its issue race, or lost at read-back to an earlier claim
+from any session that overlaps it, is a settled loser (D15 as amended,
+CSL-446): it never becomes winner or holder, even after the claim that beat it
+ends, its writes are reported, and it blocks no other claim.
 A release is recorded by a `release v1` record: an agent comment with a
 complete prefix on the claim's issue, whose first line ends with `release v1`
 when posted, made at or after the `released` edit, and not deleted. Its latest
@@ -406,7 +410,11 @@ class Evaluation:
         self.takeover_wait = timedelta(minutes=self.config["takeover_wait_minutes"])
         self.heartbeat_tolerance = timedelta(seconds=self.config["heartbeat_tolerance_seconds"])
         self._revoked: dict[str, datetime | None] = {}
-        self._winners: dict[tuple[str, str, datetime], Claim | None] = {}
+        # Race winners are cached per settlement horizon (`horizon_at`), so a
+        # winner found under one horizon is never reused under another.
+        self._winners: dict[tuple[str, str, datetime, datetime | None], Claim | None] = {}
+        self._losses: dict[tuple[str, str], Claim | None] = {}
+        self._horizon: datetime | None = None
         self.violations: list[dict[str, Any]] = []
         self.void_lines: list[dict[str, str]] = []
         self.issues = self._load_issues(require(snapshot, "issues", "snapshot"))
@@ -927,9 +935,28 @@ class Evaluation:
             moments.update(r.at for r in comment.revisions if start < r.at <= at)
             if comment.deleted_at is not None and start < comment.deleted_at <= at:
                 moments.add(comment.deleted_at)
+        # A taker that lost its own overlap or race never held its issue, so
+        # its takeover cannot clear the claims it named.
         return any(
             self.ended(taker, moment) is None and self.takeover_status(taker, moment)["allowed"]
+            and not self.lost_by(taker, moment)
             for moment in sorted(moments)
+        )
+
+    def lost_by(self, taker: Claim, moment: datetime) -> bool:
+        """Whether `taker` had lost by `moment`, for `took_effect`.
+
+        A race lost at the instant the takeover wait ends counts against the
+        taker, so the race counts from its own settle instant; the overlap, as
+        in `settled_loss`, only once settled before the moment (Samir, PR #282
+        comment 4347949974). While a part is being settled, only parts settled
+        strictly before it count, so a part never asks for itself.
+        """
+        return any(
+            self._settled(taker, kind, when) is not None
+            for kind, when in self.settle_times(taker)
+            if (when <= moment if kind == "race" else when < moment)
+            and (self._horizon is None or when < self._horizon)
         )
 
     def posting_refusal(self, claim: Claim, old: Claim) -> dict[str, Any] | None:
@@ -952,10 +979,25 @@ class Evaluation:
             return {"allowed": False, "reason": "claimant run in progress"}
         return None
 
+    def horizon_at(self, at: datetime) -> datetime:
+        """The settlement horizon for a race or live set evaluated at `at`:
+        only loss parts settled strictly before it count (Samir, PR #282
+        comment 4347949974). Inside a part's settlement it never moves later."""
+        return at if self._horizon is None else min(self._horizon, at)
+
     def live_claims(self, issue: str, repo: str, at: datetime) -> list[Claim]:
+        """The claims live on the issue at `at` that may win its race. Like
+        the race, this counts only loss parts settled strictly before `at`."""
+        outer, self._horizon = self._horizon, self.horizon_at(at)
+        try:
+            return self._live_claims(issue, repo, at)
+        finally:
+            self._horizon = outer
+
+    def _live_claims(self, issue: str, repo: str, at: datetime) -> list[Claim]:
         candidates = [
             c for c in self.claims.values()
-            if c.issue == issue and c.repo == repo and self.ended(c, at) is None
+            if c.issue == issue and c.repo == repo and self.ended(c, at) is None and self.settled_loss(c, at) is None
         ]
         superseded = set()
         refused = set()
@@ -970,27 +1012,54 @@ class Evaluation:
                 for other in self.claims.values()
             )
             status = self.takeover_status(claim, at)
-            if bypasses or self.lost_to_expired(claim, at) or (status is not None and not status["allowed"]):
+            if bypasses or (status is not None and not status["allowed"]):
                 refused.add(claim.uuid)
             elif status is not None:
                 superseded.update(status["of"])
         return [c for c in candidates if c.uuid not in superseded and c.uuid not in refused]
 
-    def lost_to_expired(self, claim: Claim, at: datetime) -> bool:
-        """True if `claim` lost the race to a claim that has since expired.
+    def settled_loss(self, claim: Claim, at: datetime) -> Claim | None:
+        """The claim that `claim` lost to, if that loss was settled before `at`.
 
-        A claim that lost and never withdrew cannot win when the winner
-        expires; it must take that claim over (decision 3, CSL-389 comment
-        425b223c). The race is settled when the claim could first be live.
+        A claim that lost its issue race, or lost at read-back to an earlier
+        overlapping claim from any session, stays a settled loser. It never
+        becomes winner or holder, even after the claim that beat it ends, and
+        it blocks no one; it must withdraw and post a fresh claim (D15 as
+        amended by Lucas's decision, CSL-446 comment 2b10e162). The overlap is
+        settled at the end of the read-back window, the race when the claim
+        could first be live.
         """
-        settled_at = self.settles_at(claim)
-        if settled_at >= at:
-            return False
-        settled = self.winner(claim.issue, claim.repo, settled_at)
-        return (
-            settled is not None and settled.uuid != claim.uuid and settled.uuid not in claim.takeovers
-            and self.ended(settled, at) == "expired"
-        )
+        lost = None
+        for kind, when in self.settle_times(claim):
+            if when < at and (self._horizon is None or when < self._horizon):
+                lost = lost or self._settled(claim, kind, when)
+        return lost
+
+    def settle_times(self, claim: Claim) -> tuple[tuple[str, datetime], ...]:
+        """When each part of a possible loss is settled: an overlap at the
+        end of the read-back window, the race when the claim could first be
+        live."""
+        return (("overlap", claim.created_at + self.readback), ("race", self.settles_at(claim)))
+
+    def _settled(self, claim: Claim, kind: str, when: datetime) -> Claim | None:
+        """One part of `settled_loss`, decided at `when` and cached. While it
+        is decided, `when` is the settlement horizon: only parts settled
+        strictly before it count, in `settled_loss` and `took_effect` alike, so
+        the part never reads itself and its value does not depend on who asks."""
+        key = (claim.uuid, kind)
+        if key not in self._losses:
+            outer, self._horizon = self._horizon, when
+            try:
+                if kind == "race":
+                    won = self.winner(claim.issue, claim.repo, when)
+                    beaten = won is not None and won.uuid != claim.uuid and won.uuid not in claim.takeovers
+                    self._losses[key] = won if beaten else None
+                else:
+                    blocker = self.earlier_overlap(claim, when)
+                    self._losses[key] = blocker[0] if blocker else None
+            finally:
+                self._horizon = outer
+        return self._losses[key]
 
     def settles_at(self, claim: Claim) -> datetime:
         """When the claim's race is decided: the end of the read-back window,
@@ -1000,7 +1069,7 @@ class Evaluation:
         return claim.created_at + self.readback
 
     def winner(self, issue: str, repo: str, at: datetime) -> Claim | None:
-        key = (issue, repo, at)
+        key = (issue, repo, at, self.horizon_at(at))
         if key not in self._winners:
             live = self.live_claims(issue, repo, at)
             self._winners[key] = min(live, key=lambda c: (c.created_at, c.uuid)) if live else None
@@ -1009,8 +1078,9 @@ class Evaluation:
     def holder(self, issue: str, repo: str, at: datetime) -> Claim | None:
         """The race winner, unless an earlier claim, from this or another
         session, blocks it by scope or branch. The race itself stays on the
-        unfiltered live claims, so a later claim on the issue still loses to
-        the blocked one. With no unblocked winner, a parent claim whose
+        unfiltered live claims, so a later claim on the issue loses to the
+        blocked one until that claim's loss is settled at its read-back
+        deadline (`settled_loss`). With no unblocked winner, a parent claim whose
         `scope: sub-issue` covers the issue holds it if that parent claim
         holds its own issue; otherwise nobody holds the issue."""
         winner = self.winner(issue, repo, at)
@@ -1043,10 +1113,13 @@ class Evaluation:
             return "branch"
         return None
 
-    def blocks_overlap(self, other: Claim, at: datetime) -> bool:
+    def blocks_overlap(self, other: Claim, at: datetime, settled_losers: bool = False) -> bool:
         """True if `other` still blocks an overlapping claim at `at`: it is
         live, or it expired without a release, withdrawal, revoke, deletion
-        or a takeover that took effect, as on a single issue."""
+        or a takeover that took effect, as on a single issue. A settled loser
+        blocks no one, unless `settled_losers` asks for the session check."""
+        if not settled_losers and self.settled_loss(other, at) is not None:
+            return False
         state = self.ended(other, at)
         if state == "expired":
             return not any(
@@ -1401,7 +1474,7 @@ class Evaluation:
                 # another issue, as across sessions; on the same issue the
                 # implicit-takeover check reports it instead.
                 and (self.ended(other, claim.created_at) is None if other.issue == claim.issue
-                     else self.blocks_overlap(other, claim.created_at))
+                     else self.blocks_overlap(other, claim.created_at, settled_losers=True))
             ]
             if others:
                 self.violation("multiple_claims_per_session", claim.issue, claim.uuid, f"also holds {others[0].uuid}")
@@ -1674,6 +1747,15 @@ class Evaluation:
         )
 
     def run(self) -> dict[str, Any]:
+        # Settle every part of every loss in order of its settle time. A part
+        # reads only parts settled strictly earlier, so each one finds them
+        # cached instead of recursing down a long chain.
+        parts = sorted(
+            (when, kind, claim.created_at, claim.uuid, claim)
+            for claim in self.claims.values() for kind, when in self.settle_times(claim) if when < self.now
+        )
+        for when, kind, _, _, claim in parts:
+            self._settled(claim, kind, when)
         decisions = self._decisions = self.decisions()
         held = {issue_id: self.held_at(issue_id, self.now) for issue_id in self.issues}
         self.collect_void_lines()

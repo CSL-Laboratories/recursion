@@ -5,12 +5,14 @@ from __future__ import annotations
 import ast
 import importlib.util
 import json
+import os
 import socket
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -26,6 +28,10 @@ def load(name: str, path: Path):
 
 perf_compare = load("perf_compare", HERE / "perf_compare.py")
 perf_bench = load("perf_bench", HERE / "perf_bench.py")
+# perf_ci imports its siblings by name, so register them before loading it.
+sys.modules.setdefault("perf_compare", perf_compare)
+sys.modules.setdefault("perf_bench", perf_bench)
+perf_ci = load("perf_ci", HERE / "perf_ci.py")
 
 
 def _report(pairs: dict[str, float]) -> dict:
@@ -192,6 +198,54 @@ class BenchTests(unittest.TestCase):
                 else:
                     continue
                 self.assertFalse(banned.intersection(modules), f"{name} imports {modules}")
+
+
+class EnvOverrideTests(unittest.TestCase):
+    NON_FINITE = ("nan", "NaN", "-nan", "inf", "+inf", "-inf", "Infinity", "1e999")
+
+    def _with_env(self, name: str, raw: str, fn):
+        with mock.patch.dict(os.environ, {name: raw}):
+            return fn()
+
+    def test_unset_or_blank_uses_defaults(self) -> None:
+        for raw in ("", "   "):
+            self.assertEqual(
+                self._with_env("PERF_REGRESSION_RATIO", raw, perf_ci._ratio_limit),
+                perf_ci.DEFAULT_RATIO,
+            )
+            self.assertEqual(
+                self._with_env("PERF_ABSOLUTE_FLOOR_S", raw, perf_ci._absolute_floor),
+                perf_compare.DEFAULT_ABSOLUTE_FLOOR_S,
+            )
+
+    def test_finite_values_are_accepted(self) -> None:
+        self.assertEqual(self._with_env("PERF_REGRESSION_RATIO", " 1.25 ", perf_ci._ratio_limit), 1.25)
+        self.assertEqual(self._with_env("PERF_ABSOLUTE_FLOOR_S", "0", perf_ci._absolute_floor), 0.0)
+        self.assertEqual(self._with_env("PERF_ABSOLUTE_FLOOR_S", "5e-5", perf_ci._absolute_floor), 5e-5)
+
+    def test_non_numbers_and_bounds_still_raise(self) -> None:
+        with self.assertRaisesRegex(perf_ci.PerfCIError, "is not a number"):
+            self._with_env("PERF_REGRESSION_RATIO", "fast", perf_ci._ratio_limit)
+        with self.assertRaisesRegex(perf_ci.PerfCIError, "greater than 1"):
+            self._with_env("PERF_REGRESSION_RATIO", "1", perf_ci._ratio_limit)
+        with self.assertRaisesRegex(perf_ci.PerfCIError, ">= 0"):
+            self._with_env("PERF_ABSOLUTE_FLOOR_S", "-0.001", perf_ci._absolute_floor)
+
+    def test_ratio_rejects_non_finite(self) -> None:
+        for raw in self.NON_FINITE:
+            with self.subTest(raw=raw):
+                with self.assertRaisesRegex(
+                    perf_ci.PerfCIError, r"^PERF_REGRESSION_RATIO=.* must be a finite number$",
+                ):
+                    self._with_env("PERF_REGRESSION_RATIO", raw, perf_ci._ratio_limit)
+
+    def test_floor_rejects_non_finite(self) -> None:
+        for raw in self.NON_FINITE:
+            with self.subTest(raw=raw):
+                with self.assertRaisesRegex(
+                    perf_ci.PerfCIError, r"^PERF_ABSOLUTE_FLOOR_S=.* must be a finite number$",
+                ):
+                    self._with_env("PERF_ABSOLUTE_FLOOR_S", raw, perf_ci._absolute_floor)
 
 
 class WorkflowTests(unittest.TestCase):

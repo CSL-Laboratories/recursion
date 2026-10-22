@@ -932,8 +932,14 @@ class Evaluation:
             moments.update(r.at for r in comment.revisions if start < r.at <= at)
             if comment.deleted_at is not None and start < comment.deleted_at <= at:
                 moments.add(comment.deleted_at)
+        # A taker that lost its own overlap or race never held its issue, so
+        # its takeover cannot clear the claims it named.
         return any(
             self.ended(taker, moment) is None and self.takeover_status(taker, moment)["allowed"]
+            and not any(
+                self._settled(taker, kind, when) is not None
+                for kind, when in self.settle_times(taker) if when <= moment
+            )
             for moment in sorted(moments)
         )
 

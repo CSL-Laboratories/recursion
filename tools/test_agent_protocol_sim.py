@@ -359,6 +359,20 @@ class LeaseTests(unittest.TestCase):
         refused = [v["detail"] for v in result["violations"] if v["code"] == "takeover_refused"]
         self.assertEqual(refused, ["lease plus grace not passed"])
 
+    def test_takeover_that_lost_its_overlap_does_not_clear_the_expired_claim(self):
+        U4 = "00000000-0000-4000-8000-000000000004"
+        comments = [
+            claim("c1", "CSL-1", U1),
+            claim("c3", "CSL-4", U3, at=140, session="grok/s3", branch="shared"),
+            self.takeover(at=152, extra=()) | {"body": claim_body(U2, "cursor/s2", "shared", None, (f"takeover of {U1}",))},
+            claim("c4", "CSL-1", U4, at=170, session="codex/s4", branch="other"),
+        ]
+        for c in comments[2:3]:
+            c["edits"] = [{"at": ts(152, 70), "body": claim_body(U2, "cursor/s2", "shared", ts(152, 70), (f"takeover of {U1}",))}]
+        writes = [{"kind": "push", "issue": "CSL-1", "claim": U4, "at": ts(172)}]
+        result = sim.evaluate(snapshot(180, [issue("CSL-1"), issue("CSL-4")], comments, writes=writes))
+        self.assertIn("claim_without_takeover", codes(result))
+
     def test_violations_do_not_depend_on_comment_order(self):
         comments = [claim("c1", "CSL-1", U1), self.takeover(at=125), claim("c3", "CSL-1", U3, at=160, session="grok/s3")]
         forward = sim.evaluate(snapshot(170, [issue("CSL-1")], comments))["violations"]

@@ -992,6 +992,7 @@ class Evaluation:
         settled at the end of the read-back window, the race when the claim
         could first be live.
         """
+        lost = None
         for kind, when in (("overlap", claim.created_at + self.readback), ("race", self.settles_at(claim))):
             if when >= at:
                 continue
@@ -999,14 +1000,13 @@ class Evaluation:
             if key not in self._losses:
                 if kind == "race":
                     won = self.winner(claim.issue, claim.repo, when)
-                    lost = won is not None and won.uuid != claim.uuid and won.uuid not in claim.takeovers
-                    self._losses[key] = won if lost else None
+                    beaten = won is not None and won.uuid != claim.uuid and won.uuid not in claim.takeovers
+                    self._losses[key] = won if beaten else None
                 else:
                     blocker = self.earlier_overlap(claim, when)
                     self._losses[key] = blocker[0] if blocker else None
-            if self._losses[key] is not None:
-                return self._losses[key]
-        return None
+            lost = lost or self._losses[key]
+        return lost
 
     def settles_at(self, claim: Claim) -> datetime:
         """When the claim's race is decided: the end of the read-back window,
@@ -1694,6 +1694,10 @@ class Evaluation:
         )
 
     def run(self) -> dict[str, Any]:
+        # Settle losses oldest claim first, so each check finds the earlier
+        # claims already settled instead of recursing down a long chain.
+        for claim in sorted(self.claims.values(), key=lambda c: (c.created_at, c.uuid)):
+            self.settled_loss(claim, self.now)
         decisions = self._decisions = self.decisions()
         held = {issue_id: self.held_at(issue_id, self.now) for issue_id in self.issues}
         self.collect_void_lines()

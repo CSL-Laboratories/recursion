@@ -195,7 +195,7 @@ The checker script must exit nonzero if any of the following conditions occur:
 | **O1E-010** | Stale or Mismatched Input Binding | Any of the four contract artifacts (contract, journeys, matrix, decisions queue), pinned sources, or fixtures has a mismatched, stale, or missing cross-referencing SHA-256 digest against the manifest. |
 | **O1E-011** | Schema or JSON Syntax Violation | `docs/v3/O1-CAPABILITY-MATRIX.json` fails JSON validation or uses undeclared values outside the schema enums. |
 | **O1E-012** | Dangling Identity Reference | Matrix row, journey, or fixture references an entity ID (e.g. dependency, test ref, requirement) that does not exist in the repository or baseline. |
-| **O1E-013** | Unresolved Freeze-Blocking Seam | Contract claims freeze or acceptance while an admitted freeze-blocking open decision or architecture seam has no recorded disposition. |
+| **O1E-013** | Unresolved Freeze-Blocking Seam | Contract claims freeze or acceptance while an admitted freeze-blocking open decision or architecture seam has no recorded disposition. Freeze-blocking packets are DQ-01–DQ-06 and DQ-08–DQ-11; DQ-07 is accounting-only and excluded. |
 | **O1E-014** | Absent Independent Verification Evidence | Candidate presented in acceptance mode without an authentic candidate-level independent verification report from a different model family (fails unconditionally in acceptance mode regardless of whether any capability rows are promoted), or capability claim promoted without authentic independent evidence, or receipt exports are not compared against actual Linear comments. |
 | **O1E-015** | Unauthorized Populated Target | Row declares a populated target tier (`target != null`) while an authentic Rule-H founder receipt is absent. |
 | **O1E-016** | Missing Mobile Capability-Row Coverage | A journey (J1–J6) is not mapped in the `journeys` array of mobile client capability row `CAP-016` in `docs/v3/O1-CAPABILITY-MATRIX.json`. |
@@ -234,6 +234,8 @@ In the nominal valid baseline, every decision packet `DQ-01` through `DQ-11` in 
 - `DQ-09`: `dispositioned (fixture)`
 - `DQ-10`: `dispositioned (fixture)`
 - `DQ-11`: `dispositioned (fixture)`
+
+The freeze-blocking set is explicit: `DQ-01` through `DQ-06` and `DQ-08` through `DQ-11`. `DQ-07` (recorded research deviation) is accounting-only. It blocks no row, journey, fixture or freeze, so `O1E-013` ignores it even when it is open or unsigned. The baseline still records it as `'dispositioned (fixture)'` so the queue record stays complete; the real queue keeps its unsigned deviation.
 
 Recording all 11 decision packets as `'dispositioned (fixture)'` in the baseline fixture queue record guarantees that all freeze-blocking seams are deterministically closed in the nominal baseline. Consequently, `O1E-013` (Unresolved Freeze-Blocking Seam) does not fire in the nominal baseline or during unrelated adverse mutations, and fires exclusively in adverse fixture `O1F-N13`.
 

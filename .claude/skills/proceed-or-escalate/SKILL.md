@@ -88,9 +88,47 @@ Meanwhile: paused (or: <other work from the proceed list>)
 "Meanwhile" is never the option you are asking about, nor work that presupposes
 any option. In recursion, also record
 the blocker in `state/INBOX.md`. Then stop that line of work, release your claim
-under the repo's existing convention, and take only other admitted work that is
-next under the human-approved order. If there is no such order, propose one and
-wait. Do not ask again until something changes.
+(see Claims), and take only other admitted work that is next under the
+human-approved order. If there is no such order, propose one and wait. Do not ask
+again until something changes.
+
+## Claims
+
+Where the repo's AGENTS.md adopts the CSL-357 agent work protocol (spec draft v7),
+as recursion's does, claim with a claim record, not by assigning yourself. AGENTS.md
+holds the record format and wins on any conflict.
+
+- The Linear assignee stays the human owner. Post one agent-prefixed `claim v1`
+  comment (uuid, scope `whole issue` or `sub-issue CSL-M`, branch @ head, base,
+  `confirmed-at`, `heartbeat-at`, `release-on`). Each claim covers one issue in one
+  repository; a session may hold several claims at once, but no two in a
+  repository may cover the same issue (counting a sub-issue scope) or name the
+  same branch (CSL-357 comment 6749bdcb).
+- Read back after at least 60 seconds: re-read the issue, its parent and any
+  sub-issue your scope covers, and search Linear for your exact branch name in
+  quotes (archived issues included). The earliest Linear `createdAt` among
+  overlapping claims wins; on a tie, the lower uuid. Confirm or withdraw. If a
+  source can't be read, don't confirm. Search can lag and shows only issues you
+  can see, so this reduces overlap but does not prevent it. No write before
+  `confirmed-at`; then move the issue to In Progress. Repeat these reads before
+  every write.
+- Renew `heartbeat-at` at least hourly with the real edit time. The lease runs 2
+  hours from the comment's last Linear `updatedAt`; past that, make no write until
+  you renew. A renewal up to 2 hours 30 minutes after that `updatedAt` restores the
+  lease; after that, never renew it. Take a claim over only under the AGENTS.md
+  takeover conditions.
+- On session start or resume, before any write, check each claim you hold. If its
+  lease plus grace has passed, release it as lease expiry and never renew it; then
+  re-read the issue and take a fresh claim. Set `heartbeat-at` to the actual edit
+  time from a fresh clock read.
+- Release a claim with a `release v1` record (done, evidence, open, next, files)
+  once its writers have stopped; work under your other non-overlapping claims
+  does not block it.
+  Releasing never releases a hold.
+- Agent commits under a claim carry the trailer `Agent-Claim: <uuid>`; fixer,
+  bot and human commits are exempt.
+- Link a PR with `Fixes CSL-N` only when it completes the issue's acceptance
+  criteria; use `Related to CSL-N` when scope or decisions remain.
 
 ## Speaking for a developer
 

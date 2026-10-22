@@ -62,9 +62,12 @@ For a research or evidence task:
 ## Linear workflow
 
 Work starts in Linear (team **CSL**, project **recursion**), not as a GitHub issue. When you
-start, assign yourself and move the issue to **In Progress**. Title the PR
-`CSL-N: ...` and include `Fixes CSL-N` in the body — that links the PR, and merging moves
-the issue to **Done** automatically. If the PR does not move the issue to **In Review**,
+start, post a claim record ([AGENTS.md](AGENTS.md#bounded-issue-execution-and-shared-evidence));
+the owner stays the assignee. Move the issue to **In Progress** once your claim is
+confirmed. Title the PR `CSL-N: ...`. Include `Fixes CSL-N` in the body when the PR
+completes the issue's acceptance criteria — that links the PR, and merging moves the
+issue to **Done** automatically. When scope or decisions remain, use `Related to CSL-N`
+instead, so the PR links without closing the issue. If the PR does not move the issue to **In Review**,
 move it yourself.
 File follow-ups to **Triage**. Keep the Linear issue current as work progresses, and file
 anything that comes up in a session to **Triage** instead of dropping it; Linear is the

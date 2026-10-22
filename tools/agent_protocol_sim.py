@@ -944,6 +944,69 @@ class Evaluation:
             self._winners[key] = min(live, key=lambda c: (c.created_at, c.uuid)) if live else None
         return self._winners[key]
 
+    def holder(self, issue: str, repo: str, at: datetime) -> Claim | None:
+        """The race winner, unless an earlier claim, from this or another
+        session, blocks it by scope or branch. The race itself stays on the
+        unfiltered live claims, so a later claim on the issue still loses to
+        the blocked one. With no unblocked winner, a parent claim whose
+        `scope: sub-issue` covers the issue holds it if that parent claim
+        holds its own issue; otherwise nobody holds the issue."""
+        winner = self.winner(issue, repo, at)
+        if winner is not None and self.earlier_overlap(winner, at) is None:
+            return winner
+        for parent in self.covering_claims(issue, repo, at):
+            if self.winner(parent.issue, repo, at) is parent and self.earlier_overlap(parent, at) is None:
+                return parent
+        return None
+
+    def covering_claims(self, issue: str, repo: str, at: datetime) -> list[Claim]:
+        """Live claims on other issues whose `scope: sub-issue` covers `issue`."""
+        return sorted(
+            (c for c in self.claims.values()
+             if c.repo == repo and c.issue != issue and issue in c.scope_issues(self.issues)
+             and c in self.live_claims(c.issue, repo, at)),
+            key=lambda c: (c.created_at, c.uuid),
+        )
+
+    def overlap(self, claim: Claim, other: Claim) -> str | None:
+        """How two claims in one repository on different issues overlap:
+        `scope` when their covered issues intersect (a `scope: sub-issue`
+        child counts, in either order), `branch` when they name the same
+        branch, or None. Claims on the same issue race instead (`winner`)."""
+        if other.uuid == claim.uuid or other.repo != claim.repo or other.issue == claim.issue:
+            return None
+        if set(claim.scope_issues(self.issues)) & set(other.scope_issues(self.issues)):
+            return "scope"
+        if other.branch == claim.branch:
+            return "branch"
+        return None
+
+    def blocks_overlap(self, other: Claim, at: datetime) -> bool:
+        """True if `other` still blocks an overlapping claim at `at`: it is
+        live, or it expired without a release, withdrawal, revoke, deletion
+        or a takeover that took effect, as on a single issue."""
+        state = self.ended(other, at)
+        if state == "expired":
+            return not any(
+                other.uuid in t.takeovers and t.created_at <= at and self.took_effect(t, at)
+                for t in self.claims.values()
+            )
+        return state is None
+
+    def earlier_overlap(self, claim: Claim, at: datetime, other_sessions: bool = False) -> tuple[Claim, str] | None:
+        """The earliest claim posted before `claim` that still blocks it at
+        `at` and overlaps it, with how. A claim `claim` takes over does not
+        count."""
+        found = sorted(
+            (other for other in self.claims.values()
+             if (other.created_at, other.uuid) < (claim.created_at, claim.uuid)
+             and (not other_sessions or other.session != claim.session)
+             and other.uuid not in claim.takeovers
+             and self.overlap(claim, other) is not None and self.blocks_overlap(other, at)),
+            key=lambda c: (c.created_at, c.uuid),
+        )
+        return (found[0], self.overlap(claim, found[0])) if found else None
+
     # Decisions -------------------------------------------------------------
 
     def answer_pairs(self, comment: Comment, body: str) -> list[tuple[str, str, str]]:
@@ -1262,13 +1325,38 @@ class Evaluation:
                     self.violation("loser_not_withdrawn", claim.issue, claim.uuid, f"winner {settled.uuid}")
             self.check_implicit_takeover(claim)
             self.check_takeover_refused(claim)
+            # A session may hold several claims in a repository (Lucas's
+            # decision, CSL-357 comment 0cdfd465), but no two of them may cover
+            # the same issue, counting `scope: sub-issue` children, or name the
+            # same branch.
+            covered = set(claim.scope_issues(self.issues))
             others = [
                 other for other in self.claims.values()
                 if other.uuid != claim.uuid and other.session == claim.session and other.repo == claim.repo
-                and (other.created_at, other.uuid) < (claim.created_at, claim.uuid) and self.ended(other, claim.created_at) is None
+                and (covered & set(other.scope_issues(self.issues)) or other.branch == claim.branch)
+                and (other.created_at, other.uuid) < (claim.created_at, claim.uuid)
+                # An expired claim the session never released still counts on
+                # another issue, as across sessions; on the same issue the
+                # implicit-takeover check reports it instead.
+                and (self.ended(other, claim.created_at) is None if other.issue == claim.issue
+                     else self.blocks_overlap(other, claim.created_at))
             ]
             if others:
                 self.violation("multiple_claims_per_session", claim.issue, claim.uuid, f"also holds {others[0].uuid}")
+            # Across sessions, a claim that overlaps an earlier live claim in
+            # the repository by scope or branch loses as in a race: it must
+            # withdraw at read-back instead of confirming. As with a race, the
+            # loss is settled at the read-back deadline, so a later release by
+            # the blocker does not erase it; a confirmation is also checked at
+            # its own time.
+            settled_overlap = self.earlier_overlap(claim, deadline, other_sessions=True) if deadline <= self.now else None
+            blocker = None
+            if settled_overlap is not None and (confirmed is not None or claim.withdrawn_at() is None):
+                blocker = settled_overlap
+            elif confirmed is not None:
+                blocker = self.earlier_overlap(claim, confirmed, other_sessions=True)
+            if blocker is not None:
+                self.violation("overlapping_claim", claim.issue, claim.uuid, f"{blocker[1]} overlaps {blocker[0].uuid}")
             released = claim.released_at()
             if released is not None:
                 for run in self.runs:
@@ -1389,6 +1477,10 @@ class Evaluation:
             if claim.takeovers and at < claim.created_at + self.takeover_wait:
                 self.violation("takeover_wrote_too_early", claim.issue, claim.uuid, what)
                 continue
+            if (blocker := self.earlier_overlap(claim, at)) is not None:
+                self.violation("write_while_overlapping", claim.issue, claim.uuid,
+                               f"{what}: {blocker[1]} overlaps {blocker[0].uuid}")
+                continue
             winner = self.winner(claim.issue, claim.repo, at)
             if winner is None or winner.uuid != claim.uuid:
                 self.violation("write_by_non_winner", claim.issue, claim.uuid, what)
@@ -1505,8 +1597,10 @@ class Evaluation:
         for issue_id in sorted(self.issues):
             per_repo = {}
             for repo in repos:
-                live = self.live_claims(issue_id, repo, self.now)
-                winner = self.winner(issue_id, repo, self.now)
+                # A live parent claim scoped to this issue covers it too, so the
+                # issue is not reported as claimable (Codex 4343468463).
+                live = self.live_claims(issue_id, repo, self.now) + self.covering_claims(issue_id, repo, self.now)
+                winner = self.holder(issue_id, repo, self.now)
                 if not live and not any(c.issue == issue_id and c.repo == repo for c in self.claims.values()):
                     continue
                 per_repo[repo] = {
@@ -1518,12 +1612,19 @@ class Evaluation:
                 c.uuid: self.takeover_status(c)
                 for c in self.claims.values() if c.issue == issue_id and c.takeovers
             }
+            # A parent claim scoped to this issue that still blocks it (for
+            # example, expired but never released) leaves it unclaimable, as
+            # the overlap check would flag a new claim (Codex 4343611603).
+            covered = any(
+                c.issue != issue_id and issue_id in c.scope_issues(self.issues) and self.blocks_overlap(c, self.now)
+                for c in self.claims.values()
+            )
             issues[issue_id] = {
                 "claims": per_repo,
                 "held": bool(held[issue_id]),
                 "hold_reasons": held[issue_id],
                 "claimable": self.issues[issue_id]["admitted"] and self.issues[issue_id]["next_in_order"]
-                and not held[issue_id] and not any(v["live_claims"] for v in per_repo.values()),
+                and not held[issue_id] and not any(v["live_claims"] for v in per_repo.values()) and not covered,
                 "takeovers": takeovers,
             }
         return {

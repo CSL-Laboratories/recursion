@@ -1,0 +1,182 @@
+{
+  "schema": "recursion-perf-e2e-workload/1",
+  "workload": "W1",
+  "description": "Provider-free end-to-end turn profile: spawn, first event, stream parse, validate, persist. Baselines only. No numeric pass/fail budget.",
+  "digest_note": "sha256_lf is the SHA-256 of the fixture after LF normalisation (CRLF rewritten to LF). scripts/tests/v3/harness/fixtures have eol unspecified in .gitattributes, so a Windows autocrlf checkout stores CRLF. The digest is of the LF-normalised bytes so the same file matches on those checkouts. .gitattributes was not changed.",
+  "fixtures": [
+    {
+      "name": "claude-stream-json",
+      "path": "scripts/tests/v3/harness/fixtures/claude-stream-json.txt",
+      "provider": "claude",
+      "evidence": "synthetic",
+      "sha256_lf": "065b0e20460bc36557d30854fa41e801746e396001c349f0715597a50f111999"
+    },
+    {
+      "name": "codex-exec-jsonl",
+      "path": "scripts/tests/v3/harness/fixtures/codex-exec-jsonl.txt",
+      "provider": "codex",
+      "evidence": "source-documented",
+      "sha256_lf": "ec76f0cb8d1870a58a7eb05ad33c804d6ec98aada03c4c35c63290f8a96f6e1c"
+    },
+    {
+      "name": "codex-cumulative",
+      "path": "scripts/tests/v3/harness/fixtures/codex-cumulative.txt",
+      "provider": "codex",
+      "evidence": "synthetic",
+      "sha256_lf": "442945bf5f88551a02a32d07e0fca8b236a80e42ad5150fd7b3614ee49d8354c"
+    },
+    {
+      "name": "grok-streaming-json",
+      "path": "scripts/tests/v3/harness/fixtures/grok-streaming-json.txt",
+      "provider": "grok",
+      "evidence": "source-documented",
+      "sha256_lf": "bf404683eeeef7fcbd8edb30ed45e3b84ec27cb1e5afaf8ee95df8c86871d90c"
+    },
+    {
+      "name": "grok-review",
+      "path": "scripts/tests/v3/harness/fixtures/grok-review.txt",
+      "provider": "grok",
+      "evidence": "synthetic",
+      "sha256_lf": "d93f61973ebe328c79149ba71751c4b0354857cd700214e9e21897b7e755c4f0"
+    }
+  ],
+  "hosts": [
+    {
+      "id": "linux-x64",
+      "os": "Linux",
+      "arch": "x64",
+      "floor": "D-028: kernel 6.12 LTS primary and 6.6 LTS compatibility minimum; cgroup v2 required; local ext4. WSL2 is development/test only and is not this profile.",
+      "support_commitment": true,
+      "measured": false
+    },
+    {
+      "id": "windows-11-x64",
+      "os": "Windows 11",
+      "arch": "x64",
+      "floor": "D-028: Windows 11 25H2 build 26200 Home/Pro minimum; also qualify 24H2 build 26100 Enterprise. x64 primary. Canonical state on local NTFS.",
+      "support_commitment": true,
+      "measured": false
+    },
+    {
+      "id": "macos-arm",
+      "os": "macOS",
+      "arch": "ARM",
+      "floor": "not a D-028 floor",
+      "note": "not a support commitment",
+      "support_commitment": false,
+      "measured": false
+    }
+  ],
+  "stability": {
+    "metric": "relative_iqr",
+    "definition": "relative IQR = IQR / median, with IQR = p75 - p25. MAD/median is reported beside it. MAD is the median of absolute deviations from the median.",
+    "percentile_method": "Hyndman-Fan type 7 (linear interpolation between closest ranks)."
+  },
+  "pilot": {
+    "rounds": 5,
+    "formula": "ceil(4 * Z^2 * sigma^2 / W^2)",
+    "sigma": "sample standard deviation of the five pilot total_ns values, divided by their mean",
+    "Z": 1.96,
+    "W": 0.05,
+    "formula_note": "Same shape as pyperf 2.10.0 pyperf/_bench.py (n = ceil(4 * Z^2 * sigma^2 / W^2), sigma = stdev/mean, Z = 1.96). That source uses W = 0.01 for a 1% target. This preregistration uses W = 0.05 as specified for W1. Required N is frozen from the pilot of 5 and is not recomputed as more turns are added."
+  },
+  "proposed_by_agent": {
+    "proposed_by_agent": true,
+    "pilot_cap": {
+      "max_measured_turns": 30,
+      "max_seconds_per_fixture": 20
+    },
+    "stability_bound": {
+      "relative_iqr_max": 0.25
+    },
+    "note": "Lucas can amend these. They are not approved budgets. A series is marked unstable only when the cap stops collection before required N and relative IQR of total_ns still exceeds relative_iqr_max. That mark does not fail the process."
+  },
+  "dimensions": [
+    {
+      "name": "authority, safety, privacy, effects",
+      "required_observation": "violations, ambiguous outcomes, stale actions, isolation and policy-conformance results",
+      "observable_provider_free": false,
+      "null_reason": "Provider-free fixture replay does not issue an effect, check isolation, or record a policy decision."
+    },
+    {
+      "name": "verified quality",
+      "required_observation": "accepted gate quality, escaped defects, verifier disagreement and falsifier outcomes",
+      "observable_provider_free": false,
+      "null_reason": "No accepted-gate result, escaped defect, or verifier disagreement is produced."
+    },
+    {
+      "name": "recovery and replay",
+      "required_observation": "restart/reconciliation success, replay parity, bounded data loss and failure containment",
+      "observable_provider_free": false,
+      "null_reason": "The frozen stream is parsed once. This is not a restart, a reconciliation, or a replay-parity check against a live session."
+    },
+    {
+      "name": "owner/operator cost",
+      "required_observation": "review minutes, intervention count, comprehension/error probes and backlog age",
+      "observable_provider_free": false,
+      "null_reason": "No review minutes, intervention count, or comprehension probe is collected."
+    },
+    {
+      "name": "quota, tokens and money",
+      "required_observation": "provider-reported counters where exposed, account-window change and metered receipts; unavailable is not zero",
+      "observable_provider_free": false,
+      "null_reason": "Fixture usage fields are not a provider-reported account window or a metered receipt. Unavailable is not zero."
+    },
+    {
+      "name": "context/cache efficiency",
+      "required_observation": "directly observed reads/writes, reusable bytes/tokens, fidelity misses and invalidations",
+      "observable_provider_free": false,
+      "null_reason": "No cache read, write, invalidation, or fidelity miss is observed. A cached_input_tokens field in a fixture is not a measurement."
+    },
+    {
+      "name": "latency and throughput",
+      "required_observation": "p50/p95/p99 control, input, append, task and recovery latency plus accepted throughput",
+      "observable_provider_free": true,
+      "null_reason": null,
+      "unavailable": {
+        "input_append_recovery_latency": "W1 times spawn, first event, parse, validate, and persist only.",
+        "accepted_throughput": "Provider-free replay has no accepted-task throughput.",
+        "p99": "Reported per phase as null until n >= 100."
+      }
+    },
+    {
+      "name": "host resources",
+      "required_observation": "CPU, RSS, disk, I/O, network, wakeups, processes and handles",
+      "observable_provider_free": true,
+      "null_reason": null,
+      "unavailable": {
+        "disk": "Not measured. No stdlib counter is read for disk bytes.",
+        "io": "Not measured. No stdlib counter is read for I/O bytes.",
+        "network": "The network guard refuses connections. Byte counts are not collected.",
+        "wakeups": "Not measured.",
+        "handles": "Not measured.",
+        "rss_on_windows": "resource.getrusage is not in the stdlib on Windows. RSS is null there unless a later change finds a stdlib-only counter.",
+        "child_cpu_on_windows": "os.times children_user and children_system are always 0 on Windows. Only user and system are known, so child CPU is null there."
+      }
+    },
+    {
+      "name": "terminal interaction",
+      "required_observation": "frame/input latency, flicker/gap count, Unicode/input correctness and accessibility results",
+      "observable_provider_free": false,
+      "null_reason": "No frame, input, flicker, Unicode, or accessibility observation is taken."
+    },
+    {
+      "name": "portability/configurability",
+      "required_observation": "supported platform/route matrices, fail-closed unknowns and owner-change cost",
+      "observable_provider_free": false,
+      "null_reason": "Host floors are listed with measured false. One runner does not establish a platform matrix or a fail-closed unknown."
+    },
+    {
+      "name": "code and maintenance surface",
+      "required_observation": "privileged/total code, dependencies, binary/install size, upgrade work and defect density",
+      "observable_provider_free": false,
+      "null_reason": "Privileged code, dependency set, binary size, and defect density are not measured."
+    },
+    {
+      "name": "extensibility/idle cost",
+      "required_observation": "plugin/frontend compatibility and disabled-path imports, reads, work, processes and calls",
+      "observable_provider_free": false,
+      "null_reason": "No plugin or disabled-path import, read, process, or call is measured."
+    }
+  ]
+}

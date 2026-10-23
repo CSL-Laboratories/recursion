@@ -29,6 +29,7 @@ on:
     paths:
       - ".github/workflows/claude.yml"
       - ".github/workflows/conflict-scan.yml"
+      - ".github/workflows/claude-conflict-writer.yml"
       - ".github/workflows/codex-gate.yml"
       - ".github/actionlint.yaml"
       - "scripts/ci/claude_pr_fixer_gate.py"
@@ -432,7 +433,7 @@ jobs:
         run: |
           set -euo pipefail
           bash <(curl -fsSL "https://raw.githubusercontent.com/rhysd/actionlint/v${ACTIONLINT_VERSION}/scripts/download-actionlint.bash") "$ACTIONLINT_VERSION"
-          ./actionlint -color .github/workflows/claude.yml .github/workflows/conflict-scan.yml .github/workflows/codex-gate.yml
+          ./actionlint -color .github/workflows/claude.yml .github/workflows/conflict-scan.yml .github/workflows/claude-conflict-writer.yml .github/workflows/codex-gate.yml
 
   mention-prepare:
     needs: resolve-pr

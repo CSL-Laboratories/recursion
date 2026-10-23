@@ -14,10 +14,10 @@ Fixtures that need POSIX git, chmod, symlinks, FIFOs, shell shims or bubblewrap
 skip on Windows (tools/ci_gate.py runs this file on every platform; the
 publisher and the model helper only run on Linux runners).
 
-Port B wires the publisher and outbox into claude.yml. WorkflowWiringTests read
-the workflows with a small standard-library loader (WorkflowYaml), checked against
-every workflow here. Deferred to Port C (the conflict writer): conflict bundle
-wiring and the conflict writer's Devin race check.
+Port B wires the publisher and outbox into claude.yml; Port C wires them into the
+conflict writer (claude-conflict-writer.yml), called by conflict-scan.yml.
+WorkflowWiringTests read the workflows with a small standard-library loader
+(WorkflowYaml), checked against every workflow here.
 """
 from __future__ import annotations
 
@@ -2379,11 +2379,13 @@ ROOT_OWN = [f"python3 {GUARD}/model-api\" install",
             f"if [ -e {GUARD}/read-token\" ]; then sudo chmod 0644 {GUARD}/read-token\"; fi",
             f"test \"$(stat -c %U {GUARD}/model-api\")\" = root"]
 RECEIPTS_STEP = "Install trusted receipt helper"
-# The conflict writer keeps its pre-push guard until Port C; only claude.yml is split here.
+# CSL-414: every Claude writer is split (Port B: claude.yml; Port C: the conflict writer).
 PIPELINES = {
     "claude.yml": [("mention-prepare", "claude-mention", "mention-publish", "claude-${{ needs.resolve-pr.outputs.pr_number }}"),
                    ("fixer-prepare", "devin-review-fix", "fixer-publish", "claude-${{ needs.resolve-pr.outputs.pr_number }}")],
+    "claude-conflict-writer.yml": [("prepare", "model", "publish", "claude-${{ inputs.pr_number }}")],
 }
+WRITER_MODES = {"mention-publish": "mention", "fixer-publish": "fixer", "publish": "conflict"}
 
 
 def step(job, name):
@@ -2435,6 +2437,13 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertIn("-- reply ROOT_COMMENT_ID BODY_FILE", prompt)
         self.assertIn("A reply accepts only a root review-comment ID on this PR", prompt)
 
+    def test_conflict_writer_devin_race_check_reads_author_and_committer(self):
+        text = (ROOT / ".github/workflows/claude-conflict-writer.yml").read_text(encoding="utf-8")
+        lines = [l for l in text.splitlines() if l.strip().startswith('head_author="$(gh api')]
+        self.assertEqual(len(lines), 1)
+        for field in ("(.author.login", "(.commit.author.name", "(.committer.login", "(.commit.committer.name"):
+            self.assertIn(field, lines[0])
+
     def pipelines(self):
         for name, triples in PIPELINES.items():
             all_jobs = jobs(name)
@@ -2479,6 +2488,8 @@ class WorkflowWiringTests(unittest.TestCase):
                 package = [s for s in model["steps"] if s.get("name") == "Package untrusted model output"][0]
                 self.assertEqual(package["if"], "always()")
                 self.assertIn('bundle create "$out/candidate.bundle" HEAD "^$HEAD_SHA"', package["run"])
+                # Conflict mode excludes the recorded base too, so the bundle carries only the merge commit.
+                self.assertEqual('HEAD "^$HEAD_SHA" "^$BASE_SHA"' in package["run"], name == "claude-conflict-writer.yml")
                 self.assertNotIn('cp "$EXECUTION_FILE"', package["run"])  # never upload the transcript
                 self.assertEqual(package["id"], "package")
                 self.assertIn('echo "package_status=$status" >> "$GITHUB_OUTPUT"', package["run"])
@@ -2643,7 +2654,16 @@ class WorkflowWiringTests(unittest.TestCase):
                 self.assertEqual(env["HEAD_SHA"], f"${{{{ needs.{ids[0]}.outputs.head_sha }}}}")
                 self.assertEqual(env["HEAD_REF"], f"${{{{ needs.{ids[0]}.outputs.head_ref }}}}")
                 self.assertEqual(env["PREPARED_RUN_ATTEMPT"], f"${{{{ needs.{ids[0]}.outputs.run_attempt }}}}")
-                self.assertEqual(env["WRITER_MODE"], {"mention-publish": "mention", "fixer-publish": "fixer"}[ids[2]])
+                self.assertEqual(env["WRITER_MODE"], WRITER_MODES[ids[2]])
+                outbox = [s for s in _model["steps"] if s.get("id") == "outbox"][0]
+                self.assertEqual(outbox["env"]["WRITER_MODE"], WRITER_MODES[ids[2]])
+                # Only conflict mode carries the recorded base; the publisher refuses it elsewhere.
+                if env["WRITER_MODE"] == "conflict":
+                    self.assertEqual(env["BASE_SHA"], f"${{{{ needs.{ids[0]}.outputs.base_sha }}}}")
+                    self.assertEqual(env["BASE_REF"], "${{ inputs.base_ref }}")
+                else:
+                    self.assertNotIn("BASE_SHA", env)
+                    self.assertNotIn("BASE_REF", env)
                 self.assertEqual(env["MODEL_OUTCOME"],
                                  f"${{{{ needs.{ids[1]}.outputs.claude_outcome || needs.{ids[1]}.result }}}}")
                 self.assertEqual(env["PACKAGE_STATUS"], f"${{{{ needs.{ids[1]}.outputs.package_status }}}}")
@@ -2665,6 +2685,14 @@ class WorkflowWiringTests(unittest.TestCase):
             for job_id, job in zip(ids, (prepare, model, publish)):
                 with self.subTest(workflow=name, job=job_id):
                     self.assertEqual(job["concurrency"], {"group": group, "queue": "max", "cancel-in-progress": "false"})
+        caller = jobs("conflict-scan.yml")["conflict-resolve"]
+        self.assertNotIn("concurrency", caller)  # a caller lock would deadlock its inner jobs
+        self.assertEqual(caller["uses"], "./.github/workflows/claude-conflict-writer.yml")
+        self.assertEqual(caller["strategy"]["max-parallel"], "1")
+        self.assertEqual(caller["secrets"], {"CLAUDE_CODE_OAUTH_TOKEN": "${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}"})
+        self.assertEqual(caller["with"], {key: f"${{{{ matrix.pr.{field} }}}}" for key, field in (
+            ("pr_number", "number"), ("head_ref", "head_ref"), ("head_sha", "head_sha"), ("base_ref", "base_ref"))})
+        self.assertNotIn("steps", caller)
 
     def test_model_jobs_wait_for_a_fresh_prepare(self):
         for name, _prep, model, _pub, _group, ids in self.pipelines():
@@ -2672,20 +2700,24 @@ class WorkflowWiringTests(unittest.TestCase):
             self.assertIn(f"needs.{ids[0]}.result == 'success'", condition)
             self.assertIn(f"needs.{ids[0]}.outputs.skip == 'false'", condition)
             self.assertIn(f"needs.{ids[0]}.outputs.run_attempt == github.run_attempt", condition)
-            self.assertEqual(set(model["needs"]), {"resolve-pr", ids[0]})
+            expected = {ids[0]} | ({"resolve-pr"} if name == "claude.yml" else set())
+            self.assertEqual(set([model["needs"]] if isinstance(model["needs"], str) else model["needs"]), expected)
 
     def test_every_embedded_script_matches_its_source(self):
         sources = {"CLAUDE_FIXER_PUBLISH": "claude_fixer_publish.py", "CLAUDE_FIXER_OUTBOX": "claude_fixer_outbox.py",
                    "CLAUDE_FIXER_RECEIPTS": "claude_fixer_receipts.py", "CLAUDE_FIXER_GUARD": "claude_fixer_guard.py",
                    "CLAUDE_DENIALS_REPORT": "claude_denials.py", "CLAUDE_PR_FIXER_GATE": "claude_pr_fixer_gate.py",
                    "CLAUDE_CONFLICT_SCAN": "claude_conflict_scan.py"}
-        # Receipts: mention-publish, fixer-prepare's eligibility and fixer-publish. conflict-scan.yml
-        # keeps the pre-push guard until Port C.
+        # Receipts: mention-publish, fixer-prepare's eligibility and fixer-publish, plus the conflict
+        # writer's publish (its publisher loads the consumer; conflict mode writes no receipts). Port C
+        # removes the pre-push guard from every workflow; its source and unit tests stay until Port D.
         expected = {("claude.yml", "CLAUDE_FIXER_PUBLISH"): 2, ("claude.yml", "CLAUDE_FIXER_OUTBOX"): 2,
                     ("claude.yml", "CLAUDE_FIXER_RECEIPTS"): 3,
                     ("claude.yml", "CLAUDE_DENIALS_REPORT"): 2, ("claude.yml", "CLAUDE_PR_FIXER_GATE"): 1,
-                    ("conflict-scan.yml", "CLAUDE_FIXER_GUARD"): 1,
-                    ("conflict-scan.yml", "CLAUDE_DENIALS_REPORT"): 1,
+                    ("claude-conflict-writer.yml", "CLAUDE_FIXER_PUBLISH"): 1,
+                    ("claude-conflict-writer.yml", "CLAUDE_FIXER_OUTBOX"): 1,
+                    ("claude-conflict-writer.yml", "CLAUDE_FIXER_RECEIPTS"): 1,
+                    ("claude-conflict-writer.yml", "CLAUDE_DENIALS_REPORT"): 1,
                     ("conflict-scan.yml", "CLAUDE_CONFLICT_SCAN"): 1}
         for name, path in WORKFLOWS.items():
             text = path.read_text(encoding="utf-8")
@@ -2696,9 +2728,36 @@ class WorkflowWiringTests(unittest.TestCase):
                     want = (ROOT / "scripts/ci" / source).read_text(encoding="utf-8").rstrip()
                     for chunk in chunks:
                         self.assertEqual(textwrap.dedent(chunk.split(f"          {tag}\n", 1)[0]).rstrip(), want)
-        text = WORKFLOWS["claude.yml"].read_text(encoding="utf-8")
-        self.assertNotIn("CLAUDE_FIXER_GUARD", text)
-        self.assertNotIn("claude-fixer-guard/pre-push", text)
+            with self.subTest(workflow=name, check="no pre-push guard"):
+                self.assertNotIn("CLAUDE_FIXER_GUARD", text)
+                self.assertNotIn("claude-fixer-guard/pre-push", text)
+        self.assertLessEqual({name for name, _tag in expected}, set(WORKFLOWS))  # every expected workflow exists
+
+    def test_conflict_merge_is_bundled_against_head_and_base(self):
+        model = jobs("claude-conflict-writer.yml")["model"]
+        package = [s for s in model["steps"] if s.get("name") == "Package untrusted model output"][0]
+        self.assertIn('HEAD "^$HEAD_SHA" "^$BASE_SHA"', package["run"])
+        self.assertEqual(package["env"]["BASE_SHA"], "${{ needs.prepare.outputs.base_sha }}")
+        merge = [s for s in model["steps"] if s.get("name", "").startswith("Start merge")]
+        self.assertEqual(len(merge), 1)
+        self.assertIn('git merge --no-ff --no-commit "$BASE_SHA"', merge[0]["run"])
+        self.assertIn('git cat-file -e "$BASE_SHA^{commit}"', merge[0]["run"])
+        self.assertEqual(merge[0]["env"], {"BASE_SHA": "${{ needs.prepare.outputs.base_sha }}"})
+        self.assertNotIn("origin/", merge[0]["run"])  # never the moving remote base
+        names = [s.get("name") or s.get("id") or s.get("uses") for s in model["steps"]]
+        self.assertLess(names.index("Attach verified PR branch at event SHA"), names.index(merge[0]["name"]))
+        self.assertLess(names.index(merge[0]["name"]), names.index("claude"))
+        prepare = jobs("claude-conflict-writer.yml")["prepare"]
+        self.assertEqual(prepare["outputs"]["base_sha"], "${{ steps.prep.outputs.base_sha }}")
+        prep = [s for s in prepare["steps"] if s.get("id") == "prep"][0]["run"]
+        self.assertIn('base_sha="$(gh api "repos/$REPO/git/ref/heads/$BASE_REF" --jq \'.object.sha\')"', prep)
+        publish = step(jobs("claude-conflict-writer.yml")["publish"], PUBLISH_STEP)["env"]
+        self.assertEqual(publish["BASE_SHA"], "${{ needs.prepare.outputs.base_sha }}")
+        self.assertEqual(publish["WRITER_MODE"], "conflict")
+        self.assertNotIn("RECEIPT_CONTEXT", publish)  # conflict mode has no receipts
+        self.assertEqual(step(jobs("claude.yml")["fixer-publish"], PUBLISH_STEP)["env"]["RECEIPT_CONTEXT"],
+                         "${{ needs.fixer-prepare.outputs.receipt_context }}")
+        self.assertNotIn("RECEIPT_CONTEXT", step(jobs("claude.yml")["mention-publish"], PUBLISH_STEP)["env"])
 
     def test_receipt_context_flows_from_prepare_to_model_and_publish_only(self):
         all_jobs = jobs("claude.yml")
@@ -2715,6 +2774,13 @@ class WorkflowWiringTests(unittest.TestCase):
         mention_outbox = [s for s in all_jobs["claude-mention"]["steps"] if s.get("id") == "outbox"][0]
         self.assertNotIn("RECEIPT_CONTEXT", mention_outbox["env"])
         self.assertEqual(mention_outbox["env"]["WRITER_MODE"], "mention")
+        writer = jobs("claude-conflict-writer.yml")
+        conflict_outbox = [s for s in writer["model"]["steps"] if s.get("id") == "outbox"][0]
+        self.assertNotIn("RECEIPT_CONTEXT", conflict_outbox["env"])
+        self.assertEqual(conflict_outbox["env"]["WRITER_MODE"], "conflict")
+        for job_name, job in writer.items():  # no writer step is handed a receipt context
+            for item in job["steps"]:
+                self.assertNotIn("RECEIPT_CONTEXT", item.get("env") or {}, (job_name, item.get("name")))
 
     def test_devin_prepare_skips_drafts_before_any_reservation(self):
         cap = [s for s in jobs("claude.yml")["fixer-prepare"]["steps"] if s.get("id") == "cap"][0]["run"]
@@ -2736,6 +2802,20 @@ class WorkflowWiringTests(unittest.TestCase):
         for name in ("claude-mention", "devin-review-fix"):
             action = [s for s in jobs("claude.yml")[name]["steps"] if s.get("id") == "claude"]
             self.assertEqual([s["uses"] for s in action], [escalation.ACTION_USES], name)
+
+    def test_conflict_writer_action_use_is_pinned_and_equals_the_escalation_binding(self):
+        # Port C: the conflict writer's model step uses the same pinned action as claude.yml, and no
+        # other workflow (the conflict-scan caller included) uses the action at all.
+        escalation = load("fixer_failure_escalation", "scripts/ci/fixer_failure_escalation.py")
+        counts = {name: path.read_text(encoding="utf-8").count("anthropics/claude-code-action@")
+                  for name, path in WORKFLOWS.items()}
+        self.assertEqual({name: n for name, n in counts.items() if n},
+                         {"claude.yml": 2, "claude-conflict-writer.yml": 1})
+        text = WORKFLOWS["claude-conflict-writer.yml"].read_text(encoding="utf-8")
+        uses = re.findall(r"(?m)^\s*(?:-\s+)?uses:\s*(anthropics/claude-code-action@\S*)\s*$", text)
+        self.assertEqual(uses, [escalation.ACTION_USES])
+        action = [s for s in jobs("claude-conflict-writer.yml")["model"]["steps"] if s.get("id") == "claude"]
+        self.assertEqual([s["uses"] for s in action], [escalation.ACTION_USES])
 
     def test_every_run_script_stays_below_actionlints_pipe_limit(self):
         # actionlint 1.7.7 hangs (and event-paths times out) on a run script of 64 KiB or more.

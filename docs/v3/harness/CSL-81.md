@@ -2,8 +2,9 @@
 
 Date: 2026-10-15. Parent: CSL-81, follow-up to [CSL-27](CSL-27.md).
 This research note pins the contracts that were checked and names the Codex
-meter. It records research only; no harness code changes ship with it, and
-it is a candidate to move to the CSL Research repository. It does not select
+meter. It records research only; no harness code changes ship with it.
+Moving it to the CSL Research repository is **pending**; until that move,
+the note lives here. It does not select
 a language, store, framework, or sandbox. It does not change the product
 ceilings: 50,000,000 input tokens and 8,000,000 output tokens.
 

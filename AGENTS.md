@@ -439,6 +439,35 @@ such issue appears within one watcher cycle, the PR author files it titled
 `Stuck PR threads: recursion#<PR>` with `<!-- stuck-pr-threads:recursion#<PR> -->`
 as the first line of the description.
 
+### Review convergence (CSL-381)
+
+Lucas's decision ([CSL-381 comment 81c9a1f7](https://linear.app/csl-laboratories/issue/CSL-381#comment-81c9a1f7-695b-4149-bd78-fc360175fafb)) bounds review rounds:
+
+- **Round 1** is the first full review round on a ready PR (Devin, Codex and
+  human reviews) plus the fixes for it. Any finding can block in round 1.
+- **Round boundary** (Lucas's decision, [CSL-381 comment 19e84f21](https://linear.app/csl-laboratories/issue/CSL-381#comment-19e84f21-68fa-49e8-9571-b300f485c3c0)):
+  the first full human review in a round freezes that round's findings
+  batch. Fixes for findings raised through that review, retries of
+  incomplete fixes, and their required checks and verification stay in the
+  same round. A finding first raised during a post-fix bot or human
+  re-review belongs to the next round and is judged under that round's
+  rules; it does not extend or reopen the original findings batch.
+  Rechecking an existing finding alone does not advance the round.
+- **After round 1**, only P0/P1 findings block merge or justify a fix push.
+  Record P2/P3 findings on the PR's Linear issue (one follow-up roll-up per PR, as in CSL-364) instead of pushing;
+  they do not hold the merge.
+- **After three rounds**, a founder decides whether to merge. Agents do not
+  start a fourth round on their own.
+
+This changes no merge authority, founder approval rule, Devin review or
+required check on the final head. Count automated pushes using the round
+boundary above. It changes no workflow: the `claude.yml`
+fixer and the Codex gate keep the behavior described above until a separate
+`.github` change. Until that change lands, the round limits above are not
+enforced by automation: if the fixer pushes a P2/P3 fix after round 1, keep it
+when CI is green on the new head (do not revert or skip it); count that push
+using the round boundary above.
+
 ## Code Review Rules
 
 Codex GitHub reviews route CI readiness and human mediation (CSL-102/CSL-201),

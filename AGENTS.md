@@ -413,7 +413,8 @@ Lucas's decision ([CSL-381 comment 81c9a1f7](https://linear.app/csl-laboratories
 - **Round boundary** (Samir's working definition, pending Lucas's
   confirmation): a round ends when a human reviews a head on which Devin,
   Codex, the fixer and CI have all finished. Fixer pushes made before that
-  human review stay in the same round; any push after it starts the next
+  human review stay in the same round, and so do the fixes for findings
+  that human review itself raises. Any other push after it starts the next
   round.
 - **After round 1**, only P0/P1 findings block merge or justify a fix push.
   Record P2/P3 findings on the PR's Linear issue (one follow-up roll-up per PR, as in CSL-364) instead of pushing;

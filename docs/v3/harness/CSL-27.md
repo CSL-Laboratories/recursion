@@ -91,12 +91,14 @@ includes the code they sit in, and the tests are stubs.
    `VERDICT approve` or `VERDICT revise`, so a real review was `revise`.
    The slice joins `type: text` chunks, ignores thoughts and tool calls, and
    accepts a verdict line anywhere in that text.
-2. **Codex budget.** Codex `turn.completed.usage` is a cumulative session
-   total, not the current context window. A documented session reported 6.9M
-   input tokens against a 272k window
-   ([openai/codex#17539](https://github.com/openai/codex/issues/17539),
-   source-documented, not re-measured here). The last event is kept and
-   events are not summed. The default ceiling is 50,000,000 input tokens and
+2. **Codex budget.** Whether Codex `turn.completed.usage` is a cumulative
+   session total or one turn is **unverified**. An issue report says it is a
+   cumulative session total, not the current context window, with a session
+   that reported 6.9M input tokens against a 272k window
+   ([openai/codex#17539](https://github.com/openai/codex/issues/17539);
+   an issue report, not the official docs, and not re-measured here). The
+   last event is kept and events are not summed. See [CSL-81](CSL-81.md)
+   for the open question. The default ceiling is 50,000,000 input tokens and
    8,000,000 output tokens, above that 6.9M example. The old 1,000,000
    ceiling still stops that example when it is configured.
 3. **Claude Code doctor.** `claude auth status` can exit 1 while printing
@@ -153,7 +155,8 @@ includes the code they sit in, and the tests are stubs.
 
 - No live Claude, Codex, or Grok process was started here.
 - The 6.9M Codex figure is a public report, not a measurement from this repo.
-- A raised ceiling is not a qualified subscription meter.
+- A raised ceiling is not a qualified subscription meter. Research on
+  the contracts and a proposed Codex meter is in [CSL-81](CSL-81.md).
 - Passing the gate is not v3 release acceptance.
 - The private working folder does not stop a permissive CLI from writing
   outside that folder.

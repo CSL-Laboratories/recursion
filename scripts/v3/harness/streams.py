@@ -31,19 +31,16 @@ def assistant_text(raw: str) -> str:
     grok = _grok_text(events)
     if grok:
         return grok
-    # A turn.started event scopes Codex text to that turn. Without one, every
-    # agent message is the reply, so notes before a later VERDICT stay.
-    # Other providers run only when this stream has no Codex agent message.
-    starts = [i for i, event in enumerate(events) if event.get("type") == "turn.started"]
-    if starts:
-        scoped = events[starts[-1] + 1 :]
-        messages = [text for text in (_agent_message(event) for event in scoped) if text]
-        if messages:
-            return "\n".join(messages)
-        return ""
-    messages = [text for text in (_agent_message(event) for event in events) if text]
-    if messages:
-        return "\n".join(messages)
+    for event in reversed(events):
+        item = event.get("item")
+        if (
+            event.get("type") == "item.completed"
+            and isinstance(item, dict)
+            and item.get("type") == "agent_message"
+            and isinstance(item.get("text"), str)
+            and item["text"].strip()
+        ):
+            return item["text"]
     claude = _claude_text(events)
     if claude:
         return claude
@@ -57,19 +54,6 @@ def assistant_text(raw: str) -> str:
         return nested
     if plain:
         return "\n".join(plain)
-    return ""
-
-
-def _agent_message(event: dict) -> str:
-    item = event.get("item")
-    if (
-        event.get("type") == "item.completed"
-        and isinstance(item, dict)
-        and item.get("type") == "agent_message"
-        and isinstance(item.get("text"), str)
-        and item["text"].strip()
-    ):
-        return item["text"]
     return ""
 
 
@@ -94,24 +78,6 @@ def claude_last_message(raw: str) -> str | None:
     """
 
     messages = _claude_messages(_events(raw))
-    if not messages:
-        return None
-    return messages[-1]
-
-
-def codex_last_message(raw: str) -> str | None:
-    """Return the last Codex agent message in the latest turn, or ``None``.
-
-    Same scope as ``assistant_text``: after the last ``turn.started`` when
-    present, otherwise the whole stream. A verdict is read from this message
-    only, so an earlier approval that a later message withdraws is not used.
-    """
-
-    events = _events(raw)
-    starts = [i for i, event in enumerate(events) if event.get("type") == "turn.started"]
-    if starts:
-        events = events[starts[-1] + 1 :]
-    messages = [text for text in (_agent_message(event) for event in events) if text]
     if not messages:
         return None
     return messages[-1]

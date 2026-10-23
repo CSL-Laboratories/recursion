@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 
-from scripts.v3.harness.streams import assistant_text, claude_last_message, codex_last_message
+from scripts.v3.harness.streams import assistant_text, claude_last_message
 
 
 NOTE_LIMIT = 1000
@@ -26,14 +26,12 @@ _VERDICT = re.compile(
 def parse_verdict(text: str) -> tuple[str, str]:
     """Return ``(approve|revise, notes)`` from plain text or a JSON stream.
 
-    A Claude or Codex stream is judged only by its last assistant message
-    that has text. No verdict line in that message is revise, even when an
-    earlier message said approve.
+    A Claude stream is judged only by its last assistant message that has
+    text. No verdict line in that message is revise, even when an earlier
+    message said approve.
     """
 
     last = claude_last_message(text)
-    if last is None:
-        last = codex_last_message(text)
     full = _lines(assistant_text(text))
     lines = full if last is None else _lines(last)
     if not lines:

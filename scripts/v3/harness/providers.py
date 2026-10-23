@@ -230,10 +230,6 @@ class GrokHeadlessProvider(HeadlessCLI):
     CAPABILITIES = ("execute", "streaming-json", "subscription")
 
     def argv(self, request: ProviderRequest) -> tuple[str, ...]:
-        """Display-only command: ``<prompt-file>`` is a placeholder.
-
-        ``prepare`` writes the real temp file and builds the runnable argv.
-        """
         return _grok_argv(request, "<prompt-file>")
 
     def prepare(self, request: ProviderRequest) -> _Prepared:

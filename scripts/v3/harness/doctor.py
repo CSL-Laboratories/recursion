@@ -177,7 +177,7 @@ def _signed_in(
 ) -> tuple[str, str | None]:
     if name == "grok":
         state, method = _file_auth(home / ".grok" / "auth.json")
-        if state != "signed-in" and str(environ.get("XAI_API_KEY", "")).strip():
+        if state == "signed-out" and str(environ.get("XAI_API_KEY", "")).strip():
             return "signed-in", "env"
         return state, method
     if resolved is None:

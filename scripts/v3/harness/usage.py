@@ -1,9 +1,8 @@
 """Token and cost figures from provider streams.
 
-Missing figures stay unknown. They are not stored as zero. Whether a Codex
-``turn.completed`` reading is a session total or one turn is unverified.
-``codex_session_meter`` keeps the highest value seen for each field and does
-not sum the stream. The product ceilings below are unchanged by that meter.
+Missing figures stay unknown. They are not stored as zero. Codex
+``turn.completed`` usage is a cumulative session total, so the last event
+wins and events are not summed.
 """
 
 from __future__ import annotations
@@ -17,10 +16,6 @@ import json
 # those runs. These defaults are session ceilings, not window sizes.
 DEFAULT_MAX_INPUT_TOKENS = 50_000_000
 DEFAULT_MAX_OUTPUT_TOKENS = 8_000_000
-
-# Highest ``turn.completed`` field values in one ``codex exec`` stream.
-# Whether those readings are a session total is unverified. See CSL-81.md.
-CODEX_SESSION_METER = "cumulative-session-total"
 
 
 def empty_usage() -> dict:
@@ -39,38 +34,6 @@ def parse_usage(text: str) -> dict:
     """Return the last usage object a stream actually reported."""
 
     found = empty_usage()
-    for payload in _objects(text):
-        parsed = _from_event(payload)
-        if parsed is not None:
-            found = parsed
-    return found
-
-
-def codex_session_meter(text: str) -> dict:
-    """Return a budget lower bound from ``turn.completed`` usage in one stream.
-
-    Events in this stream are not summed. Whether each reading is a session
-    total or one turn is unverified (``CODEX_SESSION_METER``). Each field
-    keeps the highest value seen, which is the safer lower bound on spend.
-    A stream with no such usage stays unknown. A later ``turn.completed``
-    that omits usage keeps the earlier value. A later turn that reports only
-    some fields updates those fields only. Callers may add totals from
-    separate exec processes that do not resume or fork the same session.
-    """
-
-    found = empty_usage()
-    for payload in _objects(text):
-        if payload.get("type") != "turn.completed":
-            continue
-        parsed = _from_event(payload)
-        # An omitted usage object must not erase a known lower bound. A later
-        # reading updates a field only when that field is present and higher.
-        if parsed is not None:
-            found = _keep_reported(found, parsed)
-    return found
-
-
-def _objects(text: str):
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped.startswith("{"):
@@ -79,26 +42,10 @@ def _objects(text: str):
             payload = json.loads(stripped)
         except json.JSONDecodeError:
             continue
-        if isinstance(payload, dict):
-            yield payload
-
-
-def _keep_reported(previous: dict, parsed: dict) -> dict:
-    """Keep the highest reported value for each field.
-
-    An omitted field keeps the earlier value. A smaller later reading does
-    not replace a larger one.
-    """
-
-    merged = dict(previous)
-    for key in ("input_tokens", "output_tokens", "cost"):
-        incoming = parsed.get(key)
-        if incoming is None:
-            continue
-        current = merged.get(key)
-        if current is None or incoming > current:
-            merged[key] = incoming
-    return merged
+        parsed = _from_event(payload)
+        if parsed is not None:
+            found = parsed
+    return found
 
 
 def add_usage(total: dict, extra: dict) -> dict:

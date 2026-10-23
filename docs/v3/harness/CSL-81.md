@@ -205,27 +205,26 @@ These five were not qualified. No adapter was added, and none was run.
 
 ## Admission and permission flags
 
-`--allow-live` is this slice's human admission. `HeadlessCLI.execute` starts
-no credentialed CLI without it. [ANCHOR](../../../ANCHOR.md) and
-[CONTROL_PLANE](../../../CONTROL_PLANE.md) require a fresh reviewed
-admission for live provider, host, or spend work; the operator passing
-`--allow-live` on this CLI is that admission. A second reviewed-admission
-profile, blast-radius acknowledgement UI, or Recursion permission-mode
-switch is out of CSL-81. Candidate profiles live in
-[SECURITY](../SECURITY.md). [CSL-27](CSL-27.md) already records that the
-private workspace is not a sandbox.
+**Unresolved.** Whether `--allow-live` counts as the human admission for live
+provider work, and whether `--dangerously-skip-permissions` and
+`--always-approve` stay on the argv, are open decisions. They are tracked in
+[r4290997746](https://github.com/CSL-Laboratories/recursion/pull/190#discussion_r4290997746).
+This note does not settle them and makes no claim about harness behavior.
+The live-action requirements are in
+[CONTROL_PLANE](../../../CONTROL_PLANE.md) (individual developers' live
+actions), which asks for more than a CLI switch: developer approval, a
+recorded route, account and spend ceiling, and the R2a permission-profile
+fix. Candidate permission profiles are in [SECURITY](../SECURITY.md).
+[CSL-27](CSL-27.md) already records that the private workspace is not a
+sandbox.
 
-`--dangerously-skip-permissions` and `--always-approve` stay on the
-qualified argv. Anthropic `dontAsk` auto-denies every call that would
-otherwise prompt; file reads in the working directory still run
-([permissions](https://code.claude.com/docs/en/permissions),
-[headless](https://code.claude.com/docs/en/headless)). That is not a safer
-alias of the bypass flag. Swapping it in would un-pin the headless worker
-contract this note records. `bypassPermissions` (the skip-permissions
-mode) is documented for isolated containers or VMs; this adapter does not
-claim that isolation. Grok `--always-approve` is source-documented on the
-headless page cited below. Replacing either flag with a Recursion
-permission profile is later product work, not this pin.
+Background from the sources checked: Anthropic `dontAsk` auto-denies every
+call that would otherwise prompt; file reads in the working directory still
+run ([permissions](https://code.claude.com/docs/en/permissions),
+[headless](https://code.claude.com/docs/en/headless)). `bypassPermissions`
+(the skip-permissions mode) is documented for isolated containers or VMs.
+Grok `--always-approve` is source-documented on the headless page cited
+below.
 
 Recorded 2026-10-16. No live CLI was started for this paragraph.
 

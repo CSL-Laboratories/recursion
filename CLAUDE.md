@@ -410,14 +410,14 @@ Lucas's decision ([CSL-381 comment 81c9a1f7](https://linear.app/csl-laboratories
 
 - **Round 1** is the first full review round on a ready PR (Devin, Codex and
   human reviews) plus the fixes for it. Any finding can block in round 1.
-- **Round boundary** (Samir's working definition, pending Lucas's
-  confirmation): a round ends when a human reviews a head on which Devin,
-  Codex, the fixer and CI have all finished. Fixer pushes made before that
-  human review stay in the same round, and so does one batch of fixes for
-  the findings that closing human review raises. The mandatory human
-  re-review of that batch closes it: findings first raised in that
-  re-review, their fixes, and any other push count toward the next round,
-  so a round can never be extended more than once.
+- **Round boundary** (Lucas's decision, [CSL-381 comment 19e84f21](https://linear.app/csl-laboratories/issue/CSL-381#comment-19e84f21-68fa-49e8-9571-b300f485c3c0)):
+  the first full human review in a round freezes that round's findings
+  batch. Fixes for findings raised through that review, retries of
+  incomplete fixes, and their required checks and verification stay in the
+  same round. A finding first raised during a post-fix bot or human
+  re-review belongs to the next round and is judged under that round's
+  rules; it does not extend or reopen the original findings batch.
+  Rechecking an existing finding alone does not advance the round.
 - **After round 1**, only P0/P1 findings block merge or justify a fix push.
   Record P2/P3 findings on the PR's Linear issue (one follow-up roll-up per PR, as in CSL-364) instead of pushing;
   they do not hold the merge.
@@ -425,12 +425,13 @@ Lucas's decision ([CSL-381 comment 81c9a1f7](https://linear.app/csl-laboratories
   start a fourth round on their own.
 
 This changes no merge authority, founder approval rule, Devin review or
-required check on the final head. It changes no workflow: the `claude.yml`
+required check on the final head. Count automated pushes using the round
+boundary above. It changes no workflow: the `claude.yml`
 fixer and the Codex gate keep the behavior described above until a separate
 `.github` change. Until that change lands, the round limits above are not
 enforced by automation: if the fixer pushes a P2/P3 fix after round 1, keep it
-when CI is green on the new head (do not revert or skip it); that push counts
-toward the next round like any other.
+when CI is green on the new head (do not revert or skip it); count that push
+using the round boundary above.
 
 ## Code Review Rules
 

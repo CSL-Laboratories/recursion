@@ -409,8 +409,12 @@ as the first line of the description.
 Lucas's decision ([CSL-381 comment 81c9a1f7](https://linear.app/csl-laboratories/issue/CSL-381#comment-81c9a1f7-695b-4149-bd78-fc360175fafb)) bounds review rounds:
 
 - **Round 1** is the first full review round on a ready PR (Devin, Codex and
-  human reviews of that head) plus the fixes for it. Any finding can block in
-  round 1.
+  human reviews) plus the fixes for it. Any finding can block in round 1.
+- **Round boundary** (Samir's working definition, pending Lucas's
+  confirmation): a round ends when a human reviews a head on which Devin,
+  Codex, the fixer and CI have all finished. Fixer pushes made before that
+  human review stay in the same round; any push after it starts the next
+  round.
 - **After round 1**, only P0/P1 findings block merge or justify a fix push.
   Record P2/P3 findings on the PR's Linear issue (one follow-up roll-up per PR, as in CSL-364) instead of pushing;
   they do not hold the merge.
@@ -420,7 +424,10 @@ Lucas's decision ([CSL-381 comment 81c9a1f7](https://linear.app/csl-laboratories
 This changes no merge authority, founder approval rule, Devin review or
 required check on the final head. It changes no workflow: the `claude.yml`
 fixer and the Codex gate keep the behavior described above until a separate
-`.github` change.
+`.github` change. Until that change lands, the round limits above are not
+enforced by automation: if the fixer pushes a P2/P3 fix after round 1, keep it
+when CI is green on the new head (do not revert or skip it); that push counts
+toward the next round like any other.
 
 ## Code Review Rules
 

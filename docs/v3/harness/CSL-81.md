@@ -205,16 +205,25 @@ These five were not qualified. No adapter was added, and none was run.
 
 ## Admission and permission flags
 
-**Unresolved.** Whether `--allow-live` counts as the human admission for live
-provider work, and whether `--dangerously-skip-permissions` and
-`--always-approve` stay on the argv, are open decisions. They are tracked in
+`--allow-live` is only a local opt-in: without it, `HeadlessCLI.execute`
+starts no credentialed CLI. It is not an admission or approval for a live
+action. Under [CONTROL_PLANE](../../../CONTROL_PLANE.md) (individual
+developers' live actions), an agent may run a live action only when all of
+these hold, and none of them can be shown by a CLI switch:
+
+- the developer approved that live action;
+- the route, account and spend ceiling are recorded;
+- it runs only on that developer's own accounts and keys;
+- the R2a permission-profile fix has landed.
+
+Company credentials and company-server deployments also need Lucas's
+approval.
+
+**Unresolved.** Whether `--dangerously-skip-permissions` and
+`--always-approve` stay on the argv is an open decision, tracked in
 [r4290997746](https://github.com/CSL-Laboratories/recursion/pull/190#discussion_r4290997746).
-This note does not settle them and makes no claim about harness behavior.
-The live-action requirements are in
-[CONTROL_PLANE](../../../CONTROL_PLANE.md) (individual developers' live
-actions), which asks for more than a CLI switch: developer approval, a
-recorded route, account and spend ceiling, and the R2a permission-profile
-fix. Candidate permission profiles are in [SECURITY](../SECURITY.md).
+This note does not settle it and makes no claim about harness behavior.
+Candidate permission profiles are in [SECURITY](../SECURITY.md).
 [CSL-27](CSL-27.md) already records that the private workspace is not a
 sandbox.
 

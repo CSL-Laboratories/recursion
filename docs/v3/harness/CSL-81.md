@@ -1,10 +1,11 @@
-# CSL-81 — upstream CLI contracts and the Codex usage meter
+# CSL-81 — research note: upstream CLI contracts and the Codex usage meter
 
 Date: 2026-10-15. Parent: CSL-81, follow-up to [CSL-27](CSL-27.md).
-This note pins the contracts that were checked and names the Codex meter.
-It does not select a language, store, framework, or sandbox. It does not
-change the product ceilings: 50,000,000 input tokens and 8,000,000 output
-tokens.
+This research note pins the contracts that were checked and names the Codex
+meter. It records research only; no harness code changes ship with it, and
+it is a candidate to move to the CSL Research repository. It does not select
+a language, store, framework, or sandbox. It does not change the product
+ceilings: 50,000,000 input tokens and 8,000,000 output tokens.
 
 Checked on 2026-10-15 with the Parallel Search MCP against public docs.
 No `claude`, `codex`, `grok`, `agent`, `gemini`, `opencode`, or `hermes`
@@ -89,9 +90,9 @@ The 0.162.1 binary was not run here.
 
 ## Codex meter
 
-`codex_session_meter` in `scripts/v3/harness/usage.py` keeps the highest
-value seen for each field on `turn.completed` in one `codex exec` stream.
-Events in that stream are not summed. The label is `cumulative-session-total`.
+The proposed rule for a future Codex adapter keeps the highest value seen for
+each field on `turn.completed` in one `codex exec` stream. Events in that stream
+are not summed. The proposed label is `cumulative-session-total`.
 
 Whether those figures are a cumulative session total or one turn is
 **unverified**. The official sample and `exec.md` name the fields and do not
@@ -99,9 +100,9 @@ say which
 ([non-interactive](https://developers.openai.com/codex/noninteractive),
 [exec.md](https://github.com/openai/codex/blob/main/docs/exec.md)).
 Because that question is unverified, a later smaller reading does not replace
-a larger one. The highest value of each field is the budget lower bound.
-The issue reports below claim a session total. They are not the official
-docs, and this repo did not measure a multi-turn exec stream.
+a larger one under the proposed rule. The highest value of each field is the
+budget lower bound. The issue reports below claim a session total. They are not
+the official docs, and this repo did not measure a multi-turn exec stream.
 
 - [openai/codex#17539](https://github.com/openai/codex/issues/17539) (2026-04-12)
   says `turn.completed` reports cumulative session totals. The interactive
@@ -116,26 +117,27 @@ docs, and this repo did not measure a multi-turn exec stream.
 - The non-interactive sample names `input_tokens`, `cached_input_tokens`,
   `output_tokens`, and `reasoning_output_tokens` on `turn.completed`.
   `reasoning_output_tokens` is optional: the sample includes it, and a
-  usage object may omit it. The meter does not require it and does not add
-  it into `output_tokens`. One sample line cannot show whether the numbers
+  usage object may omit it. The proposed rule does not require it and does not
+  add it into `output_tokens`. One sample line cannot show whether the numbers
   grow across turns.
 
-The meter does not use per-turn `last` usage. That field is not in the JSONL.
-It does not sum `turn.completed` events inside one stream. Not summing, and
-keeping the highest value of each field, is the conservative rule this
-adapter chose while cumulative-versus-per-turn stays unverified. It is not
-a claim that the readings are snapshots of one session. A missing usage
-stays unknown, including a `turn.failed` with no usage object. A later `turn.completed` that omits usage keeps the
-earlier value as a lower bound on spend, so the budget check still sees it.
-A later turn that reports only some fields updates those fields only, and
-only when the new number is higher. `turn.failed` does not clear a completed total. `cached_input_tokens` and `reasoning_output_tokens` are
-not added into `input_tokens` or `output_tokens`. Whether `input_tokens`
-already includes the cached count is **unmeasured**.
+The proposed rule does not use per-turn `last` usage. That field is not in the
+JSONL. It does not sum `turn.completed` events inside one stream. Not summing,
+and keeping the highest value of each field, is the conservative rule proposed
+for a future adapter while cumulative-versus-per-turn stays unverified. It is not
+a claim that the readings are snapshots of one session. A missing usage stays
+unknown, including a `turn.failed` with no usage object. A later
+`turn.completed` that omits usage keeps the earlier value as a lower bound on
+spend, so the budget check still sees it. A later turn that reports only some
+fields updates those fields only, and only when the new number is higher.
+`turn.failed` does not clear a completed total. `cached_input_tokens` and
+`reasoning_output_tokens` are not added into `input_tokens` or `output_tokens`.
+Whether `input_tokens` already includes the cached count is **unmeasured**.
 
-Separate `codex exec` processes in this adapter do not pass `resume` or
-`fork`. Their invocation totals are added. That addition is **inferred**
-from this adapter's argv. It is not a Codex measurement. A later resume or
-fork of the same session must not be added as if it were a new session
+Separate `codex exec` processes in a future adapter would not pass `resume` or
+`fork`. Their invocation totals would be added. That addition is **inferred**
+from the proposed argv. It is not a Codex measurement. A later resume or fork of
+the same session must not be added as if it were a new session
 ([EXECUTION-FABRIC](../EXECUTION-FABRIC.md) IPR-003).
 
 The product ceilings stay 50,000,000 input tokens and 8,000,000 output
@@ -234,7 +236,8 @@ Recorded 2026-10-16. No live CLI was started for this paragraph.
 - `--allow-live` is not a Recursion permission profile. It does not display
   or record a blast-radius acknowledgement.
 
-Gate, from the repository root. It does not start a provider:
+The gate is unaffected because no code changes. Gate, from the repository
+root. It does not start a provider:
 
 ```text
 python -X utf8 -B tools/ci_gate.py --force

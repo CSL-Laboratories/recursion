@@ -26,9 +26,9 @@ issues and PRs.
 - Ground every implementation in the best available research: Parallel search for web
   research and Context7 for current library docs.
 
-Recursion is the supervision and execution control plane for a portfolio of projects. The
-current development target is **Recursion v3** — a provider-neutral agent platform. This
-page is the short path from "I want to help" to "my work can be reviewed and merged".
+Recursion is a **single product**: the v3 agent harness. This repository builds that
+provider-neutral agent platform; it does not supervise other repositories. This page is
+the short path from "I want to help" to "my work can be reviewed and merged".
 
 ## Start here
 
@@ -62,9 +62,12 @@ For a research or evidence task:
 ## Linear workflow
 
 Work starts in Linear (team **CSL**, project **recursion**), not as a GitHub issue. When you
-start, assign yourself and move the issue to **In Progress**. Title the PR
-`CSL-N: ...` and include `Fixes CSL-N` in the body — that links the PR, and merging moves
-the issue to **Done** automatically. If the PR does not move the issue to **In Review**,
+start, post a claim record ([AGENTS.md](AGENTS.md#bounded-issue-execution-and-shared-evidence));
+the owner stays the assignee. Move the issue to **In Progress** once your claim is
+confirmed. Title the PR `CSL-N: ...`. Include `Fixes CSL-N` in the body when the PR
+completes the issue's acceptance criteria — that links the PR, and merging moves the
+issue to **Done** automatically. When scope or decisions remain, use `Related to CSL-N`
+instead, so the PR links without closing the issue. If the PR does not move the issue to **In Review**,
 move it yourself.
 File follow-ups to **Triage**. Keep the Linear issue current as work progresses, and file
 anything that comes up in a session to **Triage** instead of dropping it; Linear is the
@@ -82,11 +85,28 @@ See [AGENTS.md#when-claude-cant-fix-a-review-thread](AGENTS.md#when-claude-cant-
   lowercase branch name alone does not pass. The `CSL-N` key in the PR title
   satisfies the check.
 - Never commit to `master` directly and never force-push.
-- Open a PR for review. **Lucas merges every review branch himself**; an automated run only
-  ever produces a review branch.
+- Open a PR for review. **Founders merge review branches after required reviews and checks**
+  under `CONTROL_PLANE.md`; agents never merge. All three founders make the final release
+  decision, and Lucas retains the reserved decisions and final tie-break. This workflow
+  does not accept a pending contract or bypass an owner hold.
+  Until rulesets enforce it, no founder merges their own PR without another founder's
+  approval.
 - Keep changes inside your declared allowed paths. `CONTROL_PLANE.md`, `ANCHOR.md`,
-  `state/DECISIONS.md`, `scripts/`, `schemas/` and `.env` are protected paths — a change
-  there needs an explicitly approved control-plane authoring session, not a product PR.
+  `state/DECISIONS.md`, `schemas/` and `.env` are protected paths — a change
+  there needs a separately recorded founder-approved authoring session under
+  `CONTROL_PLANE.md`, not a product PR. Option B (D-042). The core rule is CSL-117
+  ruling `e59021c7-3a77-445f-a04c-832cf1e5fe46`. Fixtures are from the CSL-117 brief
+  (`f2506e97-51a7-42ee-a82b-39e089f7e7de`). The admitted scope, and keeping
+  implementation and activation separate, are from approval
+  `58641114-aa3c-4f8f-8630-a089b19f8ea3`. Protected paths from that record are
+  `scripts/ci/**`, `scripts/tests/**/fixtures/**` and `tools/ci_gate.py`. Paths
+  under `scripts/` outside those globs, for example `scripts/v3/` and non-fixture
+  `scripts/tests/`, are no longer protected paths. Changing an existing assertion
+  anywhere still needs a named human reviewer: named in the PR, submitting their
+  own GitHub review from their own account. An approval a bot posts from a
+  founder's account does not count. New tests can be added freely, within the
+  existing admitted scope. Whether fixtures under `experiments/` are covered is
+  open and is not decided here.
 
 ## Review loop
 
@@ -114,6 +134,13 @@ On Windows, paths can exceed 260 characters; pass `-c core.longpaths=true` per G
 - The construction **foundry** (a WSL Devin/SWE-2 harness) was retired on 2026-09-28. Do not
   restart it; its code and records are in git history only.
 - Physical or live-provider execution, spending, deployment, publication and merging are
-  human-gated. Propose them in `state/PROPOSALS.md`; do not perform them.
+  human-gated. Only the developer-approved own-account agent execution defined in
+  `CONTROL_PLANE.md` is permitted after R2a lands, with route/account/spend-ceiling approval
+  recorded. Lucas's company-resource and spending approvals remain required; quota resets
+  require separate human approval. Outside that explicit scope, propose actions in
+  `state/PROPOSALS.md`; do not perform them. Agents never merge, and these docs grant no
+  specific live action, accepted contract or live-capital permission.
+  Destructive or irreversible live actions, even on your own accounts, need explicit
+  approval for each action. "R2a landed" means a merged, reviewed PR.
 
 When in doubt, prefer a small, verified change with a named gate over a large, plausible one.

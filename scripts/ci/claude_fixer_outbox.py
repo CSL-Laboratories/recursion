@@ -1,28 +1,32 @@
 #!/usr/bin/env python3
 """Model-side helper for the untrusted Claude model job (CSL-377; ported for CSL-414).
 
-Ported unchanged in behaviour from the reviewed CSL-377 split-writer design. Not
-yet wired into any Recursion workflow; the writer jobs that install it land
-separately.
+Ported from the reviewed CSL-377 split-writer design; CSL-414 B' defers the commit to the
+trusted publish job.
 
 Installed outside the PR tree from the workflow's embedded, tested source, then
 made root-owned and read-only by the install step, and the only Bash command the
-model may run. Git operations are fixed argv lists with no model-supplied
-options: `status`, `diff`, `diff-stat`, `log`, `head`, `commit MSGFILE` (stages
-every change except the helper directories, commits the validated message
-without hooks and prints the full new HEAD) and, in the conflict job only,
-`conflicts` and `merge-abort`. Git runs without a shell, hooks, fsmonitor or
-pager. GitHub reads call fixed same-PR endpoints with the job's read-only token.
-Claude Code's subprocess scrub removes GH_TOKEN from the commands Claude runs, so
-the trusted install step also stores that read-only token next to this helper.
-Writes are never sent from this job: `comment`, `reply`, `label` and `receipt`
-append a validated record to `.claude-fixer-out/outbox.jsonl`, which the trusted
-publish job revalidates and posts only after it has checked the live PR (and,
-for receipts, its own verified push). Nothing here is a security boundary for
-publishing: the publisher treats the bundle and outbox as untrusted.
+model may run. Git operations are fixed read-only argv lists with no model-supplied
+options: `status`, `diff`, `diff-stat`, `log`, `head` and, in the conflict job only,
+`conflicts`. Git runs without a shell, hooks, fsmonitor, pager or optional locks.
+No code here writes `.git`: `commit MSGFILE` validates the message and records one
+commit intent, and `merge-abort` (conflict job only) records an abort intent, in
+`.claude-fixer-out/intent.jsonl`. The helper refuses a second commit and lets an
+abort override a commit in either order; those are helper-API guarantees only, since
+the model can rewrite that file. GitHub reads call fixed same-PR endpoints with the
+job's read-only token. Claude Code's subprocess scrub removes GH_TOKEN from the
+commands Claude runs, so the trusted install step also stores that read-only token
+next to this helper. Writes are never sent from this job: `comment`, `reply`, `label`
+and `receipt` append a validated record to `.claude-fixer-out/outbox.jsonl`. After the
+model exits, the Package step runs `snapshot OUTDIR GIT` under `env -i`: a data-only
+snapshot of the final tree (unchanged index paths as references, other content as raw
+bytes) plus a copy of the intent file. Nothing here is a security boundary for
+publishing: the publish job revalidates the snapshot, intents and outbox, builds the
+one commit itself and posts only after its own live-PR checks.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -38,6 +42,8 @@ HANDOFF_LABEL = "needs-decision"
 MAX_RECORDS = 50
 MAX_BODY = 65000
 OUTBOX = Path(".claude-fixer-out") / "outbox.jsonl"
+INTENT = Path(".claude-fixer-out") / "intent.jsonl"
+MAX_INTENT_BYTES = MAX_BODY * 12 + 1024
 READ_TOKEN = "read-token"
 # The mention job's triggering comment, read by its ID from the trusted event payload. CSL-377 canary
 # run 39649522054: the whole `comments` list passed Claude Code's 30000-character inline Bash output
@@ -58,13 +64,12 @@ GIT_READS = {"status": ("status", "--short"), "diff": ("diff", *NO_DRIVERS), "di
 MARKER_SIZE = 7
 MAX_MARKER_SIZE = 1000
 UNMERGED = ("diff", "--name-only", "-z", "--diff-filter=U")
-CONFLICT_GIT = {"conflicts": ("diff", "--name-only", "--diff-filter=U"), "merge-abort": ("merge", "--abort")}
-STAGE = ("add", "-A", "--", ".")
-# Not `:(exclude)` pathspecs: the model job lists these in .git/info/exclude, and `git add`
-# exits 1 when a pathspec names an ignored path (CSL-377 canary).
-UNSTAGE = ("reset", "-q", "--", ".claude-fixer-out", ".claude-fixer-replies")
+CONFLICT_GIT = {"conflicts": ("diff", "--name-only", "--diff-filter=U")}
+# Never in a commit: the model job lists both in .git/info/exclude; a tracked copy keeps HEAD's entry.
+HELPER_DIRS = (".claude-fixer-out", ".claude-fixer-replies")
 # claude-code-action's restoreConfigFromBase (SENSITIVE_PATHS) replaces these with the base branch's
-# versions and leaves them unstaged; "callers that stage files must exclude these". It runs only for a
+# versions and leaves them unstaged; "callers that stage files must exclude these" (the snapshot keeps
+# HEAD's entry; the publisher enforces that independently). It runs only for a
 # PR entity event (run.ts: isEntityContext && isPR), never for workflow/repository dispatch or the
 # conflict job, where an edit or a base-side change to them is real. Recheck both on every re-pin.
 ACTION_RESTORED = (".claude", ".mcp.json", ".claude.json", ".gitmodules", ".ripgreprc", "CLAUDE.md",
@@ -72,6 +77,12 @@ ACTION_RESTORED = (".claude", ".mcp.json", ".claude.json", ".gitmodules", ".ripg
 RESTORE_EVENTS = frozenset({"issue_comment", "pull_request", "pull_request_review", "pull_request_review_comment"})
 UNTRACKED = ("ls-files", "-z", "--others", "--exclude-standard")
 MODIFIED = ("ls-files", "-z", "--modified")
+INDEX = ("ls-files", "-s", "-z")
+MODES_OK = ("100644", "100755", "120000")
+COMMIT_RECORDED = ("Commit intent recorded; .git is unchanged. After this job the workflow builds one commit from the "
+                   "final working tree and pushes it. Write {{CLAUDE_COMMIT_SHA}} where a reply or comment names the "
+                   "commit; the workflow replaces it with the pushed SHA, or drops that record if nothing is pushed.")
+ABORT_RECORDED = "Merge abort recorded: the workflow builds and pushes no commit for this run."
 # The protected names Claude Code's sandbox masks when they do not exist (Claude Code 2.1.30x).
 SANDBOX_MASKED = frozenset({".gitconfig", ".gitmodules", ".bashrc", ".bash_profile", ".zshrc", ".zprofile",
                             ".profile", ".ripgreprc", ".mcp.json", ".vscode", ".idea"})
@@ -81,7 +92,9 @@ def command(args, **kwargs):
     kwargs.setdefault("timeout", 30)
     if args[0] == "git":
         # A user-level config could name diff drivers, clean filters or gpg.program.
-        kwargs.setdefault("env", {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
+        # No optional locks: `status` must not refresh (write) the index.
+        kwargs.setdefault("env", {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+                                  "GIT_OPTIONAL_LOCKS": "0"})
     # rstrip only: leading spaces are meaningful in `git status --short`.
     return subprocess.check_output(args, text=True, stderr=subprocess.PIPE, **kwargs).rstrip()
 
@@ -156,21 +169,37 @@ def read_body(body_path):
     return body
 
 
-def append(record):
+def append(record, path=OUTBOX, limit=MAX_RECORDS):
     workspace = Path.cwd().resolve()
-    directory = workspace / OUTBOX.parent
+    directory = workspace / path.parent
     if directory.is_symlink():
         raise ValueError("outbox directory is a symlink")
     directory.mkdir(exist_ok=True)
     flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-    with os.fdopen(os.open(workspace / OUTBOX, flags, 0o600), "r+", encoding="utf-8") as handle:
+    with os.fdopen(os.open(workspace / path, flags, 0o600), "r+", encoding="utf-8") as handle:
         if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
             raise ValueError("outbox is not regular")
         existing = [line for line in handle.read().split("\n") if line.strip()]
-        if len(existing) >= MAX_RECORDS:
+        if len(existing) >= limit:
             raise ValueError("outbox is full")
         handle.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
     return "Queued for the workflow publisher; it posts only after its own live-PR checks."
+
+
+def intents():
+    """The ops already recorded in the intent file (helper-API state; the publisher rereads it)."""
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(Path.cwd().resolve() / INTENT, flags)
+    except FileNotFoundError:
+        return []
+    with os.fdopen(fd, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise ValueError("intent file is not regular")
+        raw = handle.read(MAX_INTENT_BYTES + 1)
+    if len(raw) > MAX_INTENT_BYTES:
+        raise ValueError("intent file is too large")
+    return [json.loads(line)["op"] for line in raw.decode("utf-8").split("\n") if line.strip()]
 
 
 def git(run, *args):
@@ -219,56 +248,44 @@ class MaskedPath(ValueError):
     """A tracked path the sandbox masked: named to the model, unlike other refusals."""
 
 
-def sandbox_masks(run):
-    """Exclude pathspecs for the sandbox's masks among untracked paths.
+class IntentRefused(ValueError):
+    """A second commit, or a commit after an abort: named to the model, unlike other refusals."""
+
+
+def check_masked(run):
+    """Advisory: refuse the intent when a tracked path is masked by the sandbox.
 
     Claude Code's sandbox read-only binds /dev/null over protected paths that do not exist
-    (.bashrc, .gitconfig, .idea, ...). Git lists them as untracked, then `git add` refuses the
-    device and stages nothing, so they are left out. While another sandbox is still active,
-    the CLI leaves those mount points behind as empty regular files; they are left out too.
-    Only missing paths are masked, so a tracked path never is: one that became a device was
-    deleted, and that deletion cannot be staged, so the commit is refused instead.
+    (.bashrc, .gitconfig, .idea, ...). Only missing paths are masked, so a tracked path that
+    became a device was deleted, and that deletion cannot be published from this view.
     """
-    workspace = Path.cwd()
-
-    def status(name):
-        try:
-            return os.lstat(workspace / name)
-        except FileNotFoundError:
-            return None  # a deletion: `add -A` stages it
-        # Any other OSError propagates and the commit fails closed.
-
-    def regular(info):
-        return stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)
-
     for name in filter(None, git(run, *MODIFIED).split("\0")):
-        info = status(name)
+        try:
+            info = os.lstat(Path.cwd() / name)
+        except (FileNotFoundError, NotADirectoryError):
+            continue  # a deletion (or a parent replaced by a file): the snapshot records it
         # A directory here is a real change (a file replaced by a directory, a moved gitlink).
-        if info is not None and not (regular(info) or stat.S_ISDIR(info.st_mode)):
+        if not (stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or stat.S_ISDIR(info.st_mode)):
             raise MaskedPath("a tracked path is masked by the sandbox (deleted?), so it cannot be committed")
-    masks = []
-    for name in filter(None, git(run, *UNTRACKED).split("\0")):
-        info = status(name)
-        if info is None:
-            continue
-        leftover = name in SANDBOX_MASKED and stat.S_ISREG(info.st_mode) and not info.st_size
-        if leftover or not regular(info):
-            masks.append(":(exclude,literal)" + name)
-    return masks
 
 
-def commit(body_path, run, mode, restored=False):
-    # The message is validated like a comment body and passed as one argv element.
+def commit(body_path, run, mode):
+    """Record the one commit intent. Nothing here writes .git; the publish job builds the commit."""
     message = read_body(body_path)
+    recorded = intents()
+    if "abort" in recorded:
+        raise IntentRefused("a merge-abort is recorded, so nothing will be committed")
+    if "commit" in recorded:
+        raise IntentRefused("a commit is already recorded; the first one is kept")
     if mode == "conflict":
-        # `git add` would mark a still-conflicted file resolved, markers and all.
+        # Advisory only (the publisher rechecks): a still-conflicted file must not be committed with its markers.
         workspace = Path.cwd().resolve()
         # NUL-separated, so unusual names are not C-quoted.
         present = []
         for name in filter(None, git(run, *UNMERGED).split("\0")):
             file = workspace / name
             if not file.exists() and not file.is_symlink():
-                continue  # resolved by deleting the file; `add -A` stages the removal
+                continue  # resolved by deleting the file; the snapshot records the removal
             if file.is_symlink() or not file.is_file():
                 raise ValueError("unmerged path is not a regular file")
             present.append(name)
@@ -277,13 +294,125 @@ def commit(body_path, run, mode, restored=False):
         for name in present:
             if conflict_marker(sizes[name]).search((workspace / name).read_text(encoding="utf-8", errors="replace")):
                 raise ValueError("conflict markers remain")
-    git(run, *STAGE, *sandbox_masks(run))
-    # The helper's own files stay out of the commit whether or not they are ignored, and so do
-    # the action's base-branch restores when this run's event made the action restore them.
-    git(run, *UNSTAGE, *(ACTION_RESTORED if restored else ()))
-    # In the conflict job this completes the in-progress merge.
-    git(run, "commit", "--no-verify", "-q", "-m", message)
-    return git(run, "rev-parse", "HEAD")
+    check_masked(run)
+    append({"op": "commit", "message": message}, INTENT, 2)
+    return COMMIT_RECORDED
+
+
+def merge_abort():
+    """Record the abort intent (conflict job only). It overrides a commit recorded before or after it."""
+    if "abort" not in intents():
+        append({"op": "abort"}, INTENT, 2)
+    return ABORT_RECORDED
+
+
+def selection(index_entry, oid):
+    """A1: `ref` when the raw worktree bytes equal the stage-0 index blob; the record keeps the worktree mode."""
+    return "ref" if index_entry is not None and index_entry[1] == oid else "blob"
+
+
+def snapshot(out, gitbin, config):
+    """Package step, after the model exits: write the data-only snapshot and copy the intent file.
+
+    Untrusted and unprivileged, like everything in the model job; the publisher relies on it for
+    efficiency only. Every index path is one record: `ref` (the index oid and mode) when the
+    worktree bytes are unmodified, `blob` (raw bytes under blobs/<oid>) when modified, added or
+    unmerged, and `delete` when gone; the mode is always the worktree's (amendment A1). Helper directories, and for a restored PR event the action's
+    restores, keep HEAD's entry or are left out; so are untracked non-regular paths and zero-size
+    sandbox mount-point leftovers. Returns "unchanged" when no intent was recorded.
+    """
+    env = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"}
+
+    def run(*args):
+        return subprocess.run([gitbin, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", *args],
+                              env=env, capture_output=True, check=True, timeout=300).stdout
+
+    if run("rev-parse", "--verify", "HEAD").decode().strip() != config["base"]:
+        raise ValueError("HEAD moved during the model step")
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(INTENT, flags)
+    except FileNotFoundError:
+        return "unchanged"
+    with os.fdopen(fd, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise ValueError("intent file is not regular")
+        intent = handle.read(MAX_INTENT_BYTES + 1)
+    digest = hashlib.sha256 if run("rev-parse", "--show-object-format").strip() == b"sha256" else hashlib.sha1
+    restored = config.get("restored") is True and config["mode"] != "conflict"
+
+    def kept(path):
+        top = path.split(b"/", 1)[0].decode("utf-8", "replace")
+        return top in HELPER_DIRS or (restored and top in ACTION_RESTORED)
+
+    def entries(raw, sep):
+        for item in filter(None, raw.split(b"\0")):
+            meta, _, path = item.partition(b"\t")
+            yield path, meta.decode().split(sep)
+
+    head = {path: (meta[0], meta[2]) for path, meta in entries(run("ls-tree", "-r", "-z", "HEAD"), " ")}
+    index, unmerged = {}, set()
+    for path, (mode, oid, stage) in entries(run(*INDEX), " "):
+        if stage == "0":
+            index[path] = (mode, oid)
+        else:
+            unmerged.add(path)
+    records, blobs = {}, {}
+
+    def worktree(path, untracked):
+        try:
+            info = os.lstat(path)
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+        if stat.S_ISLNK(info.st_mode):
+            return "120000", os.readlink(path)
+        if stat.S_ISREG(info.st_mode):
+            if untracked and not info.st_size and path.decode("utf-8", "replace") in SANDBOX_MASKED:
+                return ()  # an empty sandbox mount-point leftover
+            with open(path, "rb") as handle:
+                return ("100755" if info.st_mode & stat.S_IXUSR else "100644"), handle.read()
+        if stat.S_ISDIR(info.st_mode):
+            return None  # a tracked file replaced by a directory; its files are untracked
+        if untracked:
+            return ()  # a sandbox device mask or another special file: never content
+        raise MaskedPath("a tracked path is not a regular file")
+
+    for path in sorted(set(index) | unmerged):
+        if not kept(path):
+            found = worktree(path, False)
+            if found is None:
+                records[path] = ("delete", "000000", "0" * len(config["base"]), 0)
+                continue
+            mode, data = found
+            oid = digest(b"blob %d\0" % len(data) + data).hexdigest()
+            records[path] = (selection(index.get(path), oid), mode, oid, len(data))
+            if records[path][0] == "blob":
+                blobs[oid] = data
+    for path in filter(None, run(*UNTRACKED).split(b"\0")):
+        found = worktree(path, True)
+        if not kept(path) and found:
+            mode, data = found
+            oid = digest(b"blob %d\0" % len(data) + data).hexdigest()
+            records[path], blobs[oid] = ("blob", mode, oid, len(data)), data
+    for path, (mode, oid) in head.items():
+        if kept(path):
+            size = int(run("cat-file", "-s", oid)) if mode in MODES_OK else 0
+            records[path] = ("ref", mode, oid, size)
+    out = Path(out)
+    os.mkdir(out / "blobs", 0o755)  # fresh: an existing snapshot fails closed
+
+    def create(path, data):
+        with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644),
+                       "wb") as handle:
+            handle.write(data)
+
+    for oid, data in blobs.items():
+        create(out / "blobs" / oid, data)
+    create(out / "snapshot.manifest", b"".join(
+        b"\0".join((op.encode(), mode.encode(), oid.encode(), str(size).encode(), path)) + b"\0"
+        for path, (op, mode, oid, size) in sorted(records.items())))
+    create(out / "intent.jsonl", intent)
+    return "snapshot"
 
 
 def model_api(config, args, run=command):
@@ -293,8 +422,10 @@ def model_api(config, args, run=command):
         return git(run, *GIT_READS[args[0]])
     if len(args) == 1 and args[0] in CONFLICT_GIT and config["mode"] == "conflict":
         return git(run, *CONFLICT_GIT[args[0]])
+    if args == ["merge-abort"] and config["mode"] == "conflict":
+        return merge_abort()
     if len(args) == 2 and args[0] == "commit":
-        return commit(args[1], run, config["mode"], config.get("restored") is True)
+        return commit(args[1], run, config["mode"])
     root = f"repos/{config['repo']}"
     pull = f"{root}/pulls/{config['number']}"
     reads = {"read": pull, "comments": f"{root}/issues/{config['number']}/comments",
@@ -359,6 +490,16 @@ def main():
         # but cannot change them.
         Path(__file__).chmod(0o700)
         return 0
+    if len(sys.argv) == 4 and sys.argv[1] == "snapshot":
+        # The Package step, under env -i: no model-phase environment. Prints the package status.
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            validate(config)
+            print(snapshot(sys.argv[2], sys.argv[3], config))
+            return 0
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+            print("Snapshot failed; nothing from this run is published.", file=sys.stderr)
+            return 1
     try:
         if len(sys.argv) < 3 or sys.argv[1] != "--":
             raise ValueError("invalid model-api invocation")
@@ -366,7 +507,7 @@ def main():
         if not os.environ.get("GH_TOKEN") and (directory / READ_TOKEN).is_file():
             os.environ["GH_TOKEN"] = (directory / READ_TOKEN).read_text(encoding="utf-8").strip()
         print(model_api(config, sys.argv[2:]))
-    except (MaskedPath, TriggerTooLong) as error:
+    except (MaskedPath, TriggerTooLong, IntentRefused) as error:
         print(f"Helper operation failed: {error}.", file=sys.stderr)
         return 1
     except subprocess.CalledProcessError as error:

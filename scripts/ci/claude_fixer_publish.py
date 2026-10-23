@@ -1,38 +1,18 @@
 #!/usr/bin/env python3
-"""Trusted, model-free publisher for the Claude PR writers (CSL-377; ported for CSL-414).
+"""Trusted, model-free publisher for the Claude PR writers (CSL-377; CSL-414 and its B').
 
-Ported from the reviewed CSL-377 split-writer design and adapted to Recursion:
-receipts use the v3 shape that scripts/ci/claude_fixer_receipts.py consumes, the
-terminal audit passes the observation journal as history, and the protected
-paths follow CONTROL_PLANE.md. Not yet wired into any Recursion workflow.
-
-Runs in the workflow's publish job, never in the model job, and never runs
-repository code. Its input is the model job's artifact, which is UNTRUSTED:
-a Git bundle of new local commits, a JSONL outbox of queued GitHub writes and
-a coarse model result. This one process:
-
-1. re-reads the live PR (open, same repository, recorded branch and head, no
-   human pause) and enforces one publish attempt;
-2. mints the Claude GitHub App token exactly like claude-code-action (GitHub
-   OIDC, audience claude-code-github-action, Anthropic token exchange), masks
-   it, never prints it and revokes it in a finally block;
-3. fetches the recorded head into a fresh bare repository, verifies the bundle
-   and validates every new commit: ancestry, linear history (or the one
-   conflict merge), commit/size bounds, committer identity, file modes and
-   protected paths; then pushes one ordinary fast-forward (no force);
-4. posts the validated outbox as claude[bot] and builds per-root v3 receipts
-   itself from the trusted prepare job's receipt context (observation and
-   generation included), so model text can never author a machine marker;
-5. records the workflow-owned terminal audit with the job's GitHub token. It
-   reads the observation journal but never writes it: journal records and
-   attempt reservations belong to the prepare job.
-
-The live-head checks are not an atomic lock. Git's ordinary non-fast-forward
-rejection stays the final race protection against external writers.
+Runs only in the publish job; never runs repository code. Its input (a data-only snapshot,
+the final intent file, a JSONL outbox, a coarse result) is UNTRUSTED. Order: live-PR and
+one-attempt checks; phased intake (P1-P3); construction and every check; only then the
+Claude App token (OIDC exchange, masked, revoked in finally) and one ordinary fast-forward;
+the outbox as claude[bot] with v3 receipts from trusted context; the terminal audit, which
+never writes the observation journal. The live-head checks are not a lock: Git's
+non-fast-forward rejection is the last guard.
 """
 from __future__ import annotations
 
 import base64
+import hashlib
 import importlib.util
 import json
 import os
@@ -55,19 +35,31 @@ NUMBER_RE = re.compile(r"[1-9][0-9]{0,9}\Z")
 MODES = frozenset({"mention", "fixer", "conflict"})
 PAUSE_LABELS = frozenset({"claude:pause", "hold"})
 HANDOFF_LABEL = "needs-decision"
-# The model job pins this identity (claude-code-action bot_id/bot_name and the
-# job's git config). Any other committer, e.g. GIT_COMMITTER_NAME=Alice from a
-# prefixed command, is refused: it would forge a human commit and reset the
-# eight-commit streak.
+# The publisher commits as this identity; any other committer (a forged human commit
+# would reset the eight-commit streak) is refused.
 CLAUDE_COMMITTER = ("claude[bot]", "209825114+claude[bot]@users.noreply.github.com")
 MAX_COMMITS = 20
 MAX_PATHS = 300
 MAX_DIFF_BYTES = 5_000_000
-MAX_BUNDLE_BYTES = 25_000_000
 MAX_RECORDS = 50
 MAX_BODY = 65000
 MAX_OUTBOX_BYTES = MAX_RECORDS * (MAX_BODY * 4 + 512)
 MAX_RESULT_BYTES = 1_000_000
+# CSL-414 B': snapshot records `op NUL mode NUL oid NUL size NUL path NUL`, blobs/<oid>, intents.
+MANIFEST_FILE, INTENT_FILE, BLOBS_DIR = "snapshot.manifest", "intent.jsonl", "blobs"
+MAX_MANIFEST_BYTES = 32_000_000
+MAX_INTENT_BYTES = MAX_BODY * 12 + 1024
+FILE_MODES = ("100644", "100755", "120000")
+SHA_TOKEN = "{{CLAUDE_COMMIT_SHA}}"
+ABORTED = "aborted"
+# The publisher owns the git executable: a PATH entry never chooses it.
+GIT_BIN = "/usr/bin/git"
+# As claude_fixer_outbox.py: the action's restores (PR entity events only) and the helper directories.
+ACTION_RESTORED = (".claude", ".mcp.json", ".claude.json", ".gitmodules", ".ripgreprc", "CLAUDE.md",
+                   "CLAUDE.local.md", ".husky")
+RESTORE_EVENTS = frozenset({"issue_comment", "pull_request", "pull_request_review", "pull_request_review_comment"})
+HELPER_DIRS = (".claude-fixer-out", ".claude-fixer-replies")
+MARKER_SIZE, MAX_MARKER_SIZE = 7, 1000
 OIDC_AUDIENCE = "claude-code-github-action"
 EXCHANGE_URL = "https://api.anthropic.com/api/github/github-app-token-exchange"
 GITHUB_API = "https://api.github.com"
@@ -249,6 +241,8 @@ def load_config(env):
             raise ValueError("invalid conflict base")
     else:
         config["merge_base"] = config["base_ref"] = ""
+    # From this job's own event, never the artifact.
+    config["restored"] = config["mode"] != "conflict" and env.get("GITHUB_EVENT_NAME") in RESTORE_EVENTS
     # The trusted prepare job's eligibility output (claude_fixer_receipts.emit), never the
     # model artifact: each item carries the v3 observation token and journal generation
     # that the receipt consumer requires a receipt to repeat exactly.
@@ -429,24 +423,18 @@ class FreshRepo:
                 "SSL_CERT_FILE", "SSL_CERT_DIR", "GIT_SSL_CAINFO", "SYSTEMROOT", "TMPDIR")
         self.env = {key: os.environ[key] for key in keep if key in os.environ}
         self.env.update(HOME=str(self.home), LANG="C", LC_ALL="C", GIT_CONFIG_NOSYSTEM="1",
-                        GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT="0")
+                        GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT="0", GIT_ATTR_NOSYSTEM="1")
         self.run_git(["init", "-q", "--bare", str(self.dir)], bare=False)
 
-    def run_git(self, args, token=None, input=None, ok=(0,), bare=True, timeout=180, fsck=False, local=False):
-        env = dict(self.env)
+    def run_git(self, args, token=None, input=None, ok=(0,), bare=True, timeout=180, env=None):
+        env = {**self.env, **(env or {})}
         if token is not None:
             # Header via environment-scoped config: not argv, not on disk.
             basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
             env.update(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0=f"http.{GITHUB_HOST}/.extraheader",
                        GIT_CONFIG_VALUE_0=f"AUTHORIZATION: basic {basic}")
-        prefix = ["git", "-c", "core.hooksPath=" + os.devnull, "-c", "core.fsmonitor=false",
-                  "-c", "credential.helper="]
-        if fsck:
-            # Before Git 2.46 a bundle fetch ignores these, so check_objects() also runs a full fsck.
-            prefix += ["-c", "fetch.fsckObjects=true", "-c", "transfer.fsckObjects=true"]
-        if local:
-            # The bundle is a local file; no other transport (https, ssh, ext) may run.
-            prefix += ["-c", "protocol.allow=never", "-c", "protocol.file.allow=always"]
+        prefix = [GIT_BIN, "-c", "core.hooksPath=" + os.devnull, "-c", "core.fsmonitor=false",
+                  "-c", "credential.helper=", "-c", "core.attributesFile=" + os.devnull]
         if bare:
             prefix += ["--git-dir", str(self.dir)]
         result = self.runner(prefix + list(args), env=env, input=input, capture_output=True, timeout=timeout)
@@ -544,7 +532,7 @@ def check_credentials(repo, entries, commits):
 
 
 def check_objects(repo):
-    """fsck every object, including the bundle's, whatever the runner's Git version.
+    """fsck every object, including the ones built from the snapshot, whatever the runner's Git version.
 
     `.`, `..` and `.git` tree entries, slash-containing (fullPathname) or empty names, bad file modes
     and null object IDs are errors here, not warnings; duplicate entries already are.
@@ -565,23 +553,27 @@ def check_committers(repo, commits):
             raise Refused("candidate commit has a non-Claude committer")
 
 
-def validate_candidate(repo, config, bundle):
-    """Return the validated candidate SHA, or raise Refused. No push here."""
+def auto_merge(repo, head, merge_base):
+    """The trusted merge-tree result: (auto_tree, conflicted paths)."""
+    tree_out, code = repo.run_git(["merge-tree", "--write-tree", "--name-only", "-z", head, merge_base], ok=(0, 1))
+    fields = tree_out.split(b"\0")
+    auto_tree = fields[0].decode("ascii", "strict")
+    conflicted = []
+    for field in fields[1:]:
+        if not field:
+            break
+        conflicted.append(field.decode("utf-8", "replace"))
+    if not SHA.fullmatch(auto_tree) or (code == 1 and not conflicted):
+        raise Refused("merge-tree result unavailable")
+    return auto_tree, conflicted
+
+
+def validate_candidate(repo, config, candidate):
+    """Return the validated candidate SHA, or raise Refused. No push here. Strict fsck first."""
     head, merge_base = config["base"], config["merge_base"]
-    repo.run_git(["bundle", "verify", str(bundle)])
-    heads = repo.text("bundle", "list-heads", str(bundle)).splitlines()
-    if len(heads) != 1 or not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})? HEAD", heads[0]):
-        raise Refused("bundle must carry exactly one HEAD")
-    try:
-        # Git 2.46+ fscks bundle objects here; older Git leaves that to check_objects().
-        repo.run_git(["fetch", "-q", "--no-tags", "--recurse-submodules=no", str(bundle), "HEAD:refs/claude/candidate"],
-                     fsck=True, local=True)
-    except Refused:
-        raise Refused("candidate bundle refused at fetch (fsck or corrupt pack)") from None
     check_objects(repo)
-    candidate = repo.text("rev-parse", "--verify", "refs/claude/candidate^{commit}")
     if not SHA.fullmatch(candidate) or candidate in {head, merge_base}:
-        raise Refused("bundle adds no new commit")
+        raise Refused("candidate adds no new commit")
     excludes = ["^" + head] + (["^" + merge_base] if merge_base else [])
     rows = [line.split() for line in repo.text("rev-list", "--parents", candidate, *excludes).splitlines()]
     if not rows or len(rows) > MAX_COMMITS:
@@ -592,16 +584,7 @@ def validate_candidate(repo, config, bundle):
         if rows != [[candidate, head, merge_base]]:
             raise Refused("conflict candidate must be one merge of the recorded head and base")
         check_committers(repo, commits)
-        tree_out, code = repo.run_git(["merge-tree", "--write-tree", "--name-only", "-z", head, merge_base], ok=(0, 1))
-        fields = tree_out.split(b"\0")
-        auto_tree = fields[0].decode("ascii", "strict")
-        conflicted = []
-        for field in fields[1:]:
-            if not field:
-                break
-            conflicted.append(field.decode("utf-8", "replace"))
-        if not SHA.fullmatch(auto_tree) or (code == 1 and not conflicted):
-            raise Refused("merge-tree result unavailable")
+        auto_tree, conflicted = auto_merge(repo, head, merge_base)
         if any(is_protected(path) for path in conflicted):
             raise Refused("merge conflicts in a protected path need a human")
         entries = diff_entries(repo.run_git(["diff-tree", "-r", "-z", "--raw", "--no-renames", auto_tree, candidate + "^{tree}"]))
@@ -645,6 +628,229 @@ def push_candidate(repo, config, candidate, token):
     repo.run_git(["push", "-q", "--no-verify", url, f"{candidate}:refs/heads/{config['ref']}"], token=token)
 
 
+def load_intent(raw, mode):
+    """("commit", message), ("abort", None) or None. Only the final file is enforced (not its history):
+    at most one record per kind; an abort is valid only in conflict mode, and there it dominates."""
+    if raw is None:
+        return None
+    if len(raw) > MAX_INTENT_BYTES:
+        raise Refused("intent file too large")
+    found = {}
+    try:
+        for line in filter(str.strip, raw.decode("utf-8").split("\n")):
+            record = json.loads(line, object_pairs_hook=no_duplicate_keys)
+            op = record.get("op") if isinstance(record, dict) else None
+            if not ((op == "commit" and set(record) == {"op", "message"} and valid_body(record["message"]))
+                    or (op == "abort" and set(record) == {"op"})) or op in found:
+                raise ValueError("invalid intent record")
+            found[op] = record
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        raise Refused("intent file is malformed or repeats a record") from None
+    if "abort" in found and mode != "conflict":
+        raise Refused("abort intent outside conflict mode")
+    if not found:
+        raise Refused("intent file is empty")
+    return ("abort", None) if "abort" in found else ("commit", found["commit"]["message"])
+
+
+def tree_entries(repo, tree):
+    """{path: (mode, oid)} for every blob and gitlink of a tree."""
+    entries = {}
+    for item in repo.run_git(["ls-tree", "-r", "-z", tree]).split(b"\0"):
+        if item:
+            meta, _, path = item.partition(b"\t")
+            mode, _kind, oid = meta.decode("ascii").split(" ")
+            entries[path.decode("utf-8", "surrogateescape")] = (mode, oid)
+    return entries
+
+
+def parse_manifest(raw, hexlen):
+    """P1 grammar, paths, canonical deletes and collisions: {path: (op, mode, oid, size)}."""
+    fields = raw.split(b"\0")
+    if fields.pop() != b"" or len(fields) % 5:
+        raise Refused("snapshot manifest is malformed")
+    records = {}
+    for index in range(0, len(fields), 5):
+        try:
+            op, mode, oid, size = (field.decode("ascii") for field in fields[index:index + 4])
+            path = fields[index + 4].decode("utf-8")
+        except UnicodeDecodeError:
+            raise Refused("snapshot record is malformed") from None
+        if op == "delete":
+            valid = mode == "000000" and oid == "0" * hexlen and size == "0"
+        else:
+            valid = (op in ("ref", "blob") and mode in FILE_MODES and re.fullmatch(f"[0-9a-f]{{{hexlen}}}", oid)
+                     and re.fullmatch(r"0|[1-9][0-9]{0,11}", size))
+        if not valid:
+            raise Refused("snapshot record is malformed")
+        parts = path.split("/")
+        if (len(fields[index + 4]) > 4096 or "\\" in path or any(part in ("", ".", "..") for part in parts)
+                or any(part.casefold() == ".git" for part in parts)):
+            raise Refused("snapshot path is not permitted")
+        if path in records:
+            raise Refused("snapshot path is duplicated")
+        records[path] = (op, mode, oid, int(size))
+    # A1: case-fold and file/dir collisions over the live tree (ref and blob paths) only.
+    files = [path.casefold() for path, record in records.items() if record[0] != "delete"]
+    folded = set(files)
+    if len(folded) != len(files) or any(path.rsplit("/", n)[0] in folded for path in folded
+                                        for n in range(1, path.count("/") + 1)):
+        raise Refused("snapshot paths collide")
+    return records
+
+
+def read_snapshot(repo, config, artifact):
+    """P1-P3 before construction: (records, {oid: verified bytes}) or Refused."""
+    head, conflict = config["base"], config["mode"] == "conflict"
+    head_entries = tree_entries(repo, head)
+    trees = [head]
+    if conflict:
+        trees += [config["merge_base"], auto_merge(repo, head, config["merge_base"])[0]]
+    trusted = tree_entries(repo, trees[-1])
+    # Trusted: the recorded head's, base's and auto-merge's blobs only.
+    objects = {oid for tree in trees for mode, oid in tree_entries(repo, tree).values() if mode != "160000"}
+    # P1: only the manifest is read (the intent file already was).
+    records = parse_manifest(read_regular(Path(artifact) / MANIFEST_FILE, MAX_MANIFEST_BYTES), len(head))
+    if len(records) > len(trusted) + MAX_PATHS:
+        raise Refused("snapshot has too many records")
+    if set(trusted) - set(records):
+        raise Refused("snapshot misses a trusted path")
+    if any(record[0] == "delete" and path not in trusted for path, record in records.items()):
+        raise Refused("snapshot deletes an untrusted path")
+    for path in set(records) | set(head_entries):
+        top = path.split("/", 1)[0]
+        if top in HELPER_DIRS or (config["restored"] and top in ACTION_RESTORED):
+            op, mode, oid, _size = records.get(path, ("delete", "", "", 0))
+            if (None if op == "delete" else (mode, oid)) != head_entries.get(path):
+                raise Refused("snapshot changes a restored or helper path")
+    named = "".join(sorted({record[2] + "\n" for record in records.values() if record[2] in objects}))
+    out = repo.run_git(["cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"], input=named.encode())
+    found = {line[0]: tuple(line[1:]) for line in (item.split(" ") for item in out.decode().splitlines())}
+    remaining = {}
+    for op, mode, oid, size in records.values():
+        if op == "delete":
+            continue
+        if oid in objects:
+            # A `ref`, or a `blob` normalized to one: built from the trusted object.
+            if found.get(oid) != ("blob", str(size)):
+                raise Refused("snapshot names a trusted object with the wrong type or size")
+        elif op == "ref":
+            raise Refused("snapshot reference is not a trusted blob")
+        elif remaining.setdefault(oid, size) != size:
+            raise Refused("snapshot blob sizes disagree")
+    # New bytes only, each distinct oid once (as bounded_size counts).
+    if len(remaining) > MAX_PATHS or sum(remaining.values()) > MAX_DIFF_BYTES:
+        raise Refused("snapshot blobs too large")
+    normalized = {record[2] for record in records.values() if record[0] == "blob" and record[2] in objects}
+    data, fds, root = {}, {}, None
+    try:
+        # P2: file types through descriptors before any content read.
+        root = os.open(artifact, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            fds["."] = os.open(BLOBS_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root)
+        except FileNotFoundError:
+            if remaining:
+                raise Refused("snapshot blobs directory is missing") from None
+        if "." in fds:
+            if not stat.S_ISDIR(os.fstat(fds["."]).st_mode):
+                raise Refused("snapshot blobs is not a directory")
+            if set(os.listdir(fds["."])) - set(remaining) - normalized:
+                raise Refused("snapshot has an unexpected blob file")
+        for oid, size in sorted(remaining.items()):
+            fds[oid] = os.open(oid, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fds["."])
+            info = os.fstat(fds[oid])
+            if not stat.S_ISREG(info.st_mode) or info.st_size != size:
+                raise Refused("snapshot blob is not a regular file of its size")
+        # P3: at most size + 1 bytes each, then the raw blob id.
+        for oid, size in sorted(remaining.items()):
+            with open(fds[oid], "rb", closefd=False) as handle:
+                data[oid] = handle.read(size + 1)
+            raw = b"blob %d\0" % len(data[oid]) + data[oid]
+            if len(data[oid]) != size or hashlib.new("sha256" if len(oid) == 64 else "sha1", raw).hexdigest() != oid:
+                raise Refused("snapshot blob does not match its id")
+    except OSError:
+        raise Refused("snapshot blob is not a regular file of its size") from None
+    finally:
+        for fd in [*fds.values(), *([root] if root is not None else [])]:
+            os.close(fd)
+    return records, data
+
+
+def construct(repo, config, records, data, message):
+    """Raw blobs, a temporary index and tree, then one commit with trusted parents; "" (none built)
+    when a mention/fixer tree equals the head tree."""
+    for oid in sorted(data):
+        if repo.text("hash-object", "-w", "--no-filters", "--stdin", input=data[oid]) != oid:
+            raise Refused("snapshot blob does not match its id")
+    index = {"GIT_INDEX_FILE": str(repo.dir.parent / "candidate.index")}
+    final = {path: (mode, oid) for path, (op, mode, oid, _size) in records.items() if op != "delete"}
+    repo.run_git(["update-index", "-z", "--index-info"], env=index,
+                 input=b"".join(f"{mode} {oid}\t{path}".encode() + b"\0" for path, (mode, oid) in sorted(final.items())))
+    tree = repo.text("write-tree", env=index)
+    if tree_entries(repo, tree) != final:
+        raise Refused("constructed tree differs from the snapshot")
+    conflict = config["mode"] == "conflict"
+    if not conflict and tree == repo.text("rev-parse", "--verify", config["base"] + "^{tree}"):
+        return ""
+    identity = {f"GIT_{who}_{key}": value for who in ("AUTHOR", "COMMITTER")
+                for key, value in zip(("NAME", "EMAIL"), CLAUDE_COMMITTER)}
+    parents = ["-p", config["base"]] + (["-p", config["merge_base"]] if conflict else [])
+    return repo.text("commit-tree", "--no-gpg-sign", tree, *parents, "-F", "-", input=message.encode(), env=identity)
+
+
+def conflict_marker(sizes):
+    # As claude_fixer_outbox.py.
+    low = f"{{{min(sizes)},}}"
+    separators = "|".join(f"={{{size}}}" for size in sorted(sizes))
+    return re.compile(rf"^(?:(?:<{low}|\|{low}|>{low})(?: |$)|(?:{separators})$)", re.MULTILINE)
+
+
+def check_markers(repo, config, candidate):
+    """No conflict markers in the merge-tree's conflicted paths, at git's default size or any
+    conflict-marker-size of the candidate, head or base, so no side's attributes hide them."""
+    if config["mode"] != "conflict":
+        return
+    entries = tree_entries(repo, candidate + "^{tree}")
+    present = [path for path in auto_merge(repo, config["base"], config["merge_base"])[1] if path in entries]
+    if not present:
+        return
+    sizes = {path: {MARKER_SIZE} for path in present}
+    for source in (candidate, config["base"], config["merge_base"]):
+        fields = repo.run_git(["check-attr", "-z", "--source=" + source, "conflict-marker-size",
+                               "working-tree-encoding", "--", *present]).decode("utf-8", "replace").split("\0")
+        for path, attr, value in zip(fields[0::3], fields[1::3], fields[2::3]):
+            if attr == "working-tree-encoding":
+                if value not in {"unspecified", "unset"}:
+                    raise Refused("conflicted path has a working-tree-encoding")
+                continue
+            match = re.match(r"\s*([+-]?[0-9]+)", value)  # git's atoi()
+            size = int(match.group(1)) if match else 0
+            if size > MAX_MARKER_SIZE:
+                raise Refused("unsupported conflict-marker-size")
+            if size > 0:
+                sizes[path].add(size)
+    for path in present:
+        text = repo.run_git(["cat-file", "blob", entries[path][1]]).decode("utf-8", "replace")
+        if conflict_marker(sizes[path]).search(text):
+            raise Refused("conflict markers remain in the candidate")
+
+
+def build_candidate(repo, config, artifact, intent):
+    """Every check before any credential: ABORTED, "" (no change) or the candidate SHA."""
+    version = re.match(r"git version (\d+)\.(\d+)", repo.text("version"))
+    if not version or (int(version.group(1)), int(version.group(2))) < (2, 40):  # check-attr --source
+        raise Refused("git 2.40 or later is required")
+    records, data = read_snapshot(repo, config, artifact)
+    if intent[0] == "abort":
+        return ABORTED
+    candidate = construct(repo, config, records, data, intent[1])
+    if not candidate:
+        return ""
+    validate_candidate(repo, config, candidate)
+    check_markers(repo, config, candidate)
+    return candidate
+
+
 # ---------------------------------------------------------------------------
 # Outbox publication
 
@@ -670,7 +876,7 @@ def receipt_body(consumer, config, item, status, commit):
     return consumer.marker("result", data) + "\n" + text
 
 
-def publish_records(config, env, records, pushed, write, read, consumer):
+def publish_records(config, env, records, pushed, write, read, consumer, aborted=False):
     """Post validated records in order as claude[bot]. Returns (posted, refused)."""
     roots = {item["root"]: item for item in config["receipts"]}
     allowed = {pushed} if pushed else {config["base"]}
@@ -680,17 +886,24 @@ def publish_records(config, env, records, pushed, write, read, consumer):
         try:
             live_head(config, env, read, allowed)
             op = record["op"]
+            if aborted and op not in ("comment", "label"):  # no reply or receipt after an abort
+                raise Refused("only comments and the label post after a merge abort")
+            body = record.get("body")
+            if body is not None and SHA_TOKEN in body:  # only ever the verified pushed SHA
+                if not pushed:
+                    raise Refused("the commit SHA token needs a verified push")
+                body = body.replace(SHA_TOKEN, pushed)
+                if not valid_body(body):
+                    raise Refused("rendered body out of bounds")
             if op == "comment":
-                write("POST", f"{root}/issues/{config['number']}/comments", {"body": record["body"]})
+                write("POST", f"{root}/issues/{config['number']}/comments", {"body": body})
             elif op == "label":
                 write("POST", f"{root}/issues/{config['number']}/labels", {"labels": [HANDOFF_LABEL]})
             else:
                 target = record["comment_id"] if op == "reply" else record["root"]
                 if not reply_target_ok(config, target, read):
                     raise Refused("reply target is not a root on this PR")
-                if op == "reply":
-                    body = record["body"]
-                else:
+                if op != "reply":
                     if consumer is None or (record["status"] == "addressed" and not pushed):
                         raise Refused("addressed receipt needs a verified push")
                     body = receipt_body(consumer, config, roots[target], record["status"], pushed)
@@ -870,11 +1083,15 @@ def publish(config, env, state_path, artifact, deps):
     outcome = env.get("MODEL_OUTCOME", "")
     if outcome != "success":
         raise Refused(f"model step did not succeed ({outcome if outcome in MODEL_FAILURES else 'unknown'})")
-    bundle = artifact_file(artifact, "candidate.bundle")
-    # A failed `git bundle create` must not look like a run with no commits.
-    package = env.get("PACKAGE_STATUS", "")
-    if package not in {"bundled", "unchanged"} or (package == "bundled") != (bundle is not None):
+    manifest, intent_file = artifact_file(artifact, MANIFEST_FILE), artifact_file(artifact, INTENT_FILE)
+    # A failed snapshot must not look like a run without an intent.
+    expected = {"snapshot": (True, True), "unchanged": (False, False)}.get(env.get("PACKAGE_STATUS", ""))
+    if expected != (manifest is not None, intent_file is not None):
         raise Refused("model output packaging failed or is inconsistent")
+    try:
+        intent = load_intent(read_regular(intent_file, MAX_INTENT_BYTES) if intent_file else None, config["mode"])
+    except OSError:
+        raise Refused("intent file unreadable") from None
     outbox = artifact_file(artifact, "outbox.jsonl")
     try:
         roots = {item["root"] for item in config["receipts"]}
@@ -882,43 +1099,49 @@ def publish(config, env, state_path, artifact, deps):
     except (Refused, OSError) as error:
         records = []
         notes.append("outbox rejected (" + (str(error) if isinstance(error, Refused) else "unreadable") + ")")
-    if bundle is None and not records:
-        notes.append("no candidate commits and no queued writes")
+    if intent is None and not records:
+        notes.append("no commit intent and no queued writes")
         return "", notes
     read, out = deps["read"], deps["out"]
     live_head(config, env, read, {config["base"]})
     token = None
-    pushed = ""
+    pushed = candidate = ""
     try:
-        if bundle is not None:
-            if bundle.stat().st_size > MAX_BUNDLE_BYTES:
-                raise Refused("bundle too large")
+        if intent is not None:
             with tempfile.TemporaryDirectory(dir=env.get("RUNNER_TEMP") or None) as tmp:
                 repo = deps["repo"](tmp)
                 fetch_recorded(repo, config, env.get("GH_TOKEN") or None)
-                candidate = validate_candidate(repo, config, bundle)
-                state_path.write_text(json.dumps({"candidate": candidate}), encoding="utf-8")
-                live_head(config, env, read, {config["base"]})
-                # CSL-405: no App token exists while untrusted objects are parsed.
+                candidate = build_candidate(repo, config, artifact, intent)
+                if candidate and candidate != ABORTED:
+                    state_path.write_text(json.dumps({"candidate": candidate}), encoding="utf-8")
+                    live_head(config, env, read, {config["base"]})
+                    # CSL-405: no App token exists while untrusted input is parsed.
+                    token = deps["mint"](env)
+                    push_candidate(repo, config, candidate, token)
+            if candidate == ABORTED:
+                notes.append("merge abort requested; no candidate")
+            elif not candidate:
+                notes.append("commit intent changed nothing; no candidate")
+            else:
+                for attempt in range(3):
+                    try:
+                        if live_head(config, env, read, {candidate}) == candidate:
+                            pushed = candidate
+                            break
+                    except Refused:
+                        if attempt == 2:
+                            raise
+                        deps["sleep"](2)
+                notes.append(f"pushed candidate `{pushed}` as one ordinary fast-forward")
+        if records:
+            if token is None:
                 token = deps["mint"](env)
-                push_candidate(repo, config, candidate, token)
-            for attempt in range(3):
-                try:
-                    if live_head(config, env, read, {candidate}) == candidate:
-                        pushed = candidate
-                        break
-                except Refused:
-                    if attempt == 2:
-                        raise
-                    deps["sleep"](2)
-            notes.append(f"pushed candidate `{pushed}` as one ordinary fast-forward")
-        if token is None:
-            token = deps["mint"](env)
 
-        def write(method, path, body):
-            return deps["http"](method, f"{GITHUB_API}/{path}", token=token, body=body)
-        posted, refused = publish_records(config, env, records, pushed, write, read, deps["consumer"])
-        notes.append(f"{posted} queued write(s) posted, {refused} refused")
+            def write(method, path, body):
+                return deps["http"](method, f"{GITHUB_API}/{path}", token=token, body=body)
+            posted, refused = publish_records(config, env, records, pushed, write, read, deps["consumer"],
+                                              aborted=candidate == ABORTED)
+            notes.append(f"{posted} queued write(s) posted, {refused} refused")
     except WorkflowValidationSkip:
         out("::notice::Claude App token exchange reported workflow validation; nothing published. "
             "This is expected until this workflow version is on the default branch.")

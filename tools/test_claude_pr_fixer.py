@@ -822,7 +822,12 @@ class FixerGateAndPromptTests(unittest.TestCase):
             self.assertIn("no heredocs, loops, or &&", body, job)
             self.assertNotIn("git commit -m", body, job)
             self.assertIn("model-api -- commit .claude-fixer-replies/NAME.txt", body, job)
-            self.assertIn("prints the full 40/64-character commit SHA; use that SHA", body, job)
+            # CSL-414 B': the commit is built after the job, so the SHA is a token the publisher fills in
+            # only from its verified push; the model never writes a SHA of its own.
+            self.assertIn("It records your one commit intent and never changes .git; a second commit is refused.", body, job)
+            self.assertIn("write {{CLAUDE_COMMIT_SHA}}: the workflow replaces it with the full pushed SHA, or drops that record",
+                          " ".join(body.split()), job)
+            self.assertNotIn("prints the full 40/64-character commit SHA", body, job)
             self.assertIn("use Edit/Write for files", body, job)
             self.assertIn("linux CI job checks the pushed commit", body, job)
             self.assertIn("Linear-first (CSL-88)", body, job)

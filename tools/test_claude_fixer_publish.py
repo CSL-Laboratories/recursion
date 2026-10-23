@@ -128,23 +128,24 @@ class GitCase(unittest.TestCase):
                 "merge_base": self.base if mode == "conflict" else "", "base_ref": "main" if mode == "conflict" else "",
                 "receipts": []}
 
-    def bundle(self, *extra_excludes, name="candidate.bundle"):
-        path = self.root / name
-        self.model.git("bundle", "create", str(path), "HEAD", "^" + self.head, *[f"^{e}" for e in extra_excludes])
-        return path
-
-    def validate(self, mode="fixer", bundle=None):
+    def fresh(self):
         repo = p.FreshRepo(tempfile.mkdtemp(dir=self.root))
         refs = [self.head] + ([self.base] if self.base else [])
         repo.run_git(["fetch", "-q", str(self.src.path), *refs])
         if self.base:
             repo.run_git(["fetch", "-q", str(self.src.path), "+refs/heads/main:refs/claude/base"])
-        config = self.config(mode)
-        return p.validate_candidate(repo, config, bundle or self.bundle(*( [self.base] if mode == "conflict" else [])))
+        return repo
 
-    def refused(self, pattern, mode="fixer", bundle=None):
+    def validate(self, mode="fixer"):
+        # CSL-414 B': the publisher builds the candidate itself; these post-construction checks are
+        # unchanged and still refuse any commit shape a construction bug (or a test) could produce.
+        repo = self.fresh()
+        repo.run_git(["fetch", "-q", str(self.model.path), "+HEAD:refs/test/candidate"])
+        return p.validate_candidate(repo, self.config(mode), repo.text("rev-parse", "refs/test/candidate"))
+
+    def refused(self, pattern, mode="fixer"):
         with self.assertRaisesRegex(p.Refused, pattern):
-            self.validate(mode, bundle)
+            self.validate(mode)
 
 
 def glob_sample(pattern):
@@ -379,10 +380,12 @@ class LinearValidationTests(GitCase):
         self.model.git("checkout", "-q", "-B", "fix", self.head + "~1")
         self.model.commit({"app/f.py": "f\n"})
         self.refused("descend from the recorded head")
-        # A bundle without a new commit is not a candidate.
+        # An empty new commit is still a new commit; the head itself is not a candidate.
         self.model.git("reset", "-q", "--hard", self.head)
         self.model.git("commit", "-q", "--allow-empty", "-m", "noop")
         self.assertTrue(self.validate())
+        self.model.git("reset", "-q", "--hard", self.head)
+        self.refused("^candidate adds no new commit$")
 
     def test_commit_count_size_and_path_bounds(self):
         for i in range(p.MAX_COMMITS + 1):
@@ -412,30 +415,17 @@ class LinearValidationTests(GitCase):
         last = self.model.commit({"app/a.py": "a = 4\n"}, author=("Alice", "alice@example.com"))
         self.assertEqual(self.validate(), last)
 
-    def test_bundle_shape_is_checked(self):
-        self.model.commit({"app/a.py": "a = 2\n"})
-        two = self.root / "two.bundle"
-        self.model.git("bundle", "create", str(two), "HEAD", "fix", "^" + self.head)
-        self.refused("exactly one HEAD", bundle=two)
-        corrupt = self.root / "corrupt.bundle"
-        corrupt.write_bytes(b"# v2 git bundle\nnot a bundle")
-        self.refused("git operation failed|exactly one HEAD", bundle=corrupt)
-        # Prerequisites the validator does not have fail verification.
-        self.model.commit({"app/b.py": "b = 2\n"})
-        middle = self.model.git("rev-parse", "HEAD~1")
-        late = self.root / "late.bundle"
-        self.model.git("bundle", "create", str(late), "HEAD", "^" + middle)
-        repo = p.FreshRepo(tempfile.mkdtemp(dir=self.root))
-        repo.run_git(["fetch", "-q", str(self.src.path), self.head])
-        with self.assertRaisesRegex(p.Refused, "git operation failed"):
-            p.validate_candidate(repo, self.config(), late)
+    def test_a_head_or_base_candidate_is_no_new_commit(self):
+        # Replaces the bundle-shape test: the candidate is the publisher's own commit, and the head or
+        # the conflict base is never one. Snapshot-shape refusals are IntakeP1/P2/P3 tests.
+        repo = self.fresh()
+        for candidate in (self.head, "not-a-sha", self.head[:39]):
+            with self.subTest(candidate=candidate), self.assertRaisesRegex(p.Refused, "^candidate adds no new commit$"):
+                p.validate_candidate(repo, self.config(), candidate)
 
 
 class TreeEntryTests(GitCase):
-    """Hand-built trees that `git mktree` would not write.
-
-    Git 2.46+ refuses them at the bundle fetch, older Git in check_objects(); the reason is the same.
-    """
+    """Hand-built trees that `git mktree` would not write: check_objects() refuses them on every Git version."""
 
     def raw_tree(self, entries):
         body = b"".join(mode + b" " + name + b"\0" + bytes.fromhex(sha) for mode, name, sha in entries)
@@ -458,8 +448,8 @@ class TreeEntryTests(GitCase):
             with self.subTest(entries=entries):
                 self.model.git("update-ref", "HEAD", self.head)
                 self.commit_tree(entries)
-                # Older Git refuses in check_objects(), Git 2.46+ at the fsck-enabled fetch.
-                self.refused(r"^(candidate objects fail git fsck|candidate bundle refused at fetch \(fsck or corrupt pack\))$")
+                # Stronger than the bundle era's either-or: validate_candidate's own fsck refuses it.
+                self.refused(r"^candidate objects fail git fsck$")
 
     def test_check_objects_refuses_crafted_trees_without_a_fetch(self):
         # Objects written straight into the validator repo, so check_objects() runs on every Git version.
@@ -477,20 +467,26 @@ class TreeEntryTests(GitCase):
                 with self.assertRaisesRegex(p.Refused, "^candidate objects fail git fsck$"):
                     p.check_objects(repo)
 
-    def test_fsck_refusal_at_the_bundle_fetch_keeps_the_fsck_reason(self):
-        # Git 2.46+ rejects a bad tree at the fsck-enabled bundle fetch, before check_objects().
+    def test_check_objects_runs_on_the_constructed_repository_before_any_other_check(self):
+        # v4.3 section 4: check_objects runs after construction, first in validate_candidate.
         self.model.commit({"app/a.py": "a = 2\n"})
-        bundle = self.bundle()
-        repo = p.FreshRepo(tempfile.mkdtemp(dir=self.root))
-        repo.run_git(["fetch", "-q", str(self.src.path), self.head])
+        repo = self.fresh()
+        repo.run_git(["fetch", "-q", str(self.model.path), "+HEAD:refs/test/candidate"])
+        calls = []
         real = repo.run_git
-        def run_git(args, **kwargs):
-            if args[0] == "fetch" and kwargs.get("fsck"):
-                raise p.Refused("git operation failed: fetch")
-            return real(args, **kwargs)
-        repo.run_git = run_git
-        with self.assertRaisesRegex(p.Refused, r"^candidate bundle refused at fetch \(fsck or corrupt pack\)$"):
-            p.validate_candidate(repo, self.config(), bundle)
+        repo.run_git = lambda args, **kwargs: calls.append(list(args)) or real(args, **kwargs)
+        candidate = repo.text("rev-parse", "refs/test/candidate")
+        calls.clear()
+        self.assertEqual(p.validate_candidate(repo, self.config(), candidate), candidate)
+        fsck = [i for i, call in enumerate(calls) if "fsck" in call]
+        self.assertEqual(fsck, [0])
+        self.assertEqual([a for a in calls[0] if a.startswith("fsck.")],
+                         [f"fsck.{m}=error" for m in ("hasDot", "hasDotdot", "hasDotgit", "fullPathname", "emptyName",
+                                                       "badFilemode", "nullSha1")])
+        with patch.object(p, "check_objects", side_effect=p.Refused("candidate objects fail git fsck")) as check:
+            with self.assertRaisesRegex(p.Refused, "^candidate objects fail git fsck$"):
+                p.validate_candidate(repo, self.config(), candidate)
+        check.assert_called_once_with(repo)
 
     def test_check_objects_accepts_ordinary_history(self):
         repo = p.FreshRepo(tempfile.mkdtemp(dir=self.root))
@@ -522,43 +518,6 @@ class TreeEntryTests(GitCase):
                 self.assertEqual(plain.returncode, 0, plain.stderr)
                 with self.assertRaisesRegex(p.Refused, "^candidate objects fail git fsck$"):
                     p.check_objects(repo)
-
-    def test_the_bundle_fetch_allows_no_network_transport(self):
-        repo = p.FreshRepo(tempfile.mkdtemp(dir=self.root))
-        marker = self.root / "ext-ran"
-        for url in ("https://example.invalid/x.git", f"ext::sh -c touch% {marker}", "ssh://example.invalid/x"):
-            with self.subTest(url=url[:8]):
-                started = time.monotonic()
-                with self.assertRaises(p.Refused):
-                    repo.run_git(["fetch", "-q", "--no-tags", url, "HEAD:refs/x"], local=True, timeout=20)
-                self.assertLess(time.monotonic() - started, 10)  # refused locally, no connection attempt
-        self.assertFalse(marker.exists())
-        repo = p.FreshRepo(tempfile.mkdtemp(dir=self.root))
-        repo.run_git(["fetch", "-q", str(self.src.path), self.head])
-        # git itself names the refused transport; the publisher's own Refused hides stderr.
-        argv = []
-        results = []
-
-        def runner(cmd, **kwargs):
-            argv.append(cmd)
-            result = subprocess.run(cmd, check=False, **kwargs)
-            results.append(result)
-            return result
-        probe = p.FreshRepo(tempfile.mkdtemp(dir=self.root), runner=runner)
-        with self.assertRaises(p.Refused):
-            probe.run_git(["fetch", "-q", "https://example.invalid/x.git", "HEAD:refs/x"], local=True)
-        self.assertIn(b"transport 'https' not allowed", results[-1].stderr)
-        self.assertEqual(argv[-1][argv[-1].index("protocol.allow=never") - 1:][:4],
-                         ["-c", "protocol.allow=never", "-c", "protocol.file.allow=always"])
-        calls = []
-        real = repo.run_git
-        repo.run_git = lambda args, **kwargs: calls.append((args, kwargs)) or real(args, **kwargs)
-        self.model.commit({"app/a.py": "a = 2\n"})
-        with contextlib.suppress(p.Refused):
-            p.validate_candidate(repo, self.config(), self.bundle())
-        fetch = next(c for c in calls if c[0][0] == "fetch")
-        self.assertEqual((fetch[1].get("fsck"), fetch[1].get("local")), (True, True))
-        self.assertIn("--recurse-submodules=no", fetch[0])
 
     def test_diff_paths_with_dot_or_empty_components_are_refused(self):
         for path in (b"../x", b"./x", b"a/../x", b"a//x", b"a/.", b"a/"):
@@ -593,7 +552,8 @@ class RecordedFetchAndPushTests(GitCase):
     def candidate(self, config):
         repo = p.FreshRepo(tempfile.mkdtemp(dir=self.root))
         p.fetch_recorded(repo, config, TOKEN)
-        return repo, p.validate_candidate(repo, config, self.bundle())
+        repo.run_git(["fetch", "-q", str(self.model.path), "+HEAD:refs/test/candidate"])
+        return repo, p.validate_candidate(repo, config, repo.text("rev-parse", "refs/test/candidate"))
 
     def test_recorded_fetches_never_recurse_into_submodules(self):
         self.base = self.head
@@ -822,7 +782,7 @@ def v3_item(root, fingerprint=FP, base=A):
 class Harness:
     """Fake GitHub/exchange around publish.main()."""
 
-    def __init__(self, test, *, mode="fixer", records=(), bundle=False, roots=(11,), context=None):
+    def __init__(self, test, *, mode="fixer", records=(), commit=False, roots=(11,), context=None, intent=None):
         self.test = test
         self.tmp = tempfile.TemporaryDirectory()
         test.addCleanup(self.tmp.cleanup)
@@ -831,8 +791,11 @@ class Harness:
         self.artifact.mkdir()
         if records:
             (self.artifact / "outbox.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
-        if bundle:
-            (self.artifact / "candidate.bundle").write_bytes(b"bundle")
+        # CSL-414 B': a commit (or abort) intent with its snapshot; build_candidate is faked below.
+        intent = intent if intent is not None else ('{"message":"fix: x","op":"commit"}\n' if commit else None)
+        if intent is not None:
+            (self.artifact / "intent.jsonl").write_text(intent)
+            (self.artifact / "snapshot.manifest").write_bytes(b"")
         (self.artifact / "result.json").write_text(json.dumps([{"type": "result", "subtype": "success", "num_turns": 3}]))
         self.state = self.dir / "state"
         self.state.mkdir()
@@ -842,7 +805,7 @@ class Harness:
                     "BASE_SHA": C if mode == "conflict" else "", "BASE_REF": "main" if mode == "conflict" else "",
                     "RECEIPT_CONTEXT": json.dumps(context), "ARTIFACT_DIR": str(self.artifact),
                     "PUBLISH_STATE_DIR": str(self.state), "MODEL_OUTCOME": "success",
-                    "PACKAGE_STATUS": "bundled" if bundle else "unchanged",
+                    "PACKAGE_STATUS": "snapshot" if intent is not None else "unchanged",
                     "PREPARED_RUN_ATTEMPT": "1", "GITHUB_RUN_ATTEMPT": "1", "GH_TOKEN": "gh-job-token"}
         self.heads = [A]
         self.labels = []
@@ -856,6 +819,7 @@ class Harness:
         self.validate_error = None
         self.push_error = None
         self.minted_at_validation = None
+        self.intents = []
 
     def read(self, path):
         if "/pulls/comments/" in path:
@@ -889,12 +853,13 @@ class Harness:
                 "revoke": self.revoke, "repo": lambda tmp: object(), "sleep": lambda _s: None,
                 "consumer": receipts, "post": lambda config, body: self.audits.append(body)}
 
-        def validate(repo, config, bundle):
+        def build(repo, config, artifact, intent):
+            self.intents.append(intent)
             if self.minted_at_validation is not None:
                 self.minted_at_validation.append(self.minted)
             if self.validate_error:
                 raise self.validate_error
-            return self.candidate
+            return p.ABORTED if intent[0] == "abort" else self.candidate
 
         def push(repo, config, candidate, token):
             if self.push_error:
@@ -902,14 +867,14 @@ class Harness:
             self.pushed.append((candidate, token))
             self.heads = [self.candidate]
 
-        with patch.object(p, "fetch_recorded", lambda *a: None), patch.object(p, "validate_candidate", validate), \
+        with patch.object(p, "fetch_recorded", lambda *a: None), patch.object(p, "build_candidate", build), \
                 patch.object(p, "push_candidate", push):
             return p.main(self.env, deps)
 
 
 class PublishFlowTests(unittest.TestCase):
     def test_comment_reply_and_addressed_receipt_after_verified_push(self):
-        h = Harness(self, bundle=True, records=[{"op": "reply", "comment_id": 11, "body": "fixed in sha"},
+        h = Harness(self, commit=True, records=[{"op": "reply", "comment_id": 11, "body": "fixed in sha"},
                                                 {"op": "receipt", "root": 11, "status": "addressed"},
                                                 {"op": "comment", "body": "summary"}])
         self.assertEqual(h.run(), 0)
@@ -947,7 +912,7 @@ class PublishFlowTests(unittest.TestCase):
         self.assertIn("1 queued write(s) posted, 1 refused", h.audits[0])
 
     def test_receipt_for_a_non_selected_root_rejects_the_outbox(self):
-        h = Harness(self, bundle=True, records=[{"op": "receipt", "root": 99, "status": "addressed"},
+        h = Harness(self, commit=True, records=[{"op": "receipt", "root": 99, "status": "addressed"},
                                                 {"op": "comment", "body": "x"}])
         h.run()
         self.assertEqual(h.writes, [])
@@ -965,7 +930,7 @@ class PublishFlowTests(unittest.TestCase):
         for labels, var, heads in ((["Claude:Pause"], "", [A]), (["HOLD"], "", [A]), ([], "true", [A]),
                                    ([], "", [C]), (None, "", [A])):
             with self.subTest(labels=labels, var=var, heads=heads):
-                h = Harness(self, bundle=True, records=[{"op": "comment", "body": "x"}])
+                h = Harness(self, commit=True, records=[{"op": "comment", "body": "x"}])
                 h.env["CLAUDE_FIXER_PAUSE"] = var
                 h.heads = heads
                 if labels is None:
@@ -977,7 +942,7 @@ class PublishFlowTests(unittest.TestCase):
                 self.assertIn("nothing published", h.audits[0])
 
     def test_head_moving_before_push_blocks_it_without_minting(self):
-        h = Harness(self, bundle=True, records=[{"op": "comment", "body": "x"}])
+        h = Harness(self, commit=True, records=[{"op": "comment", "body": "x"}])
         h.heads = [A, C, C]  # first check passes, the pre-push recheck sees a moved head
         h.run()
         self.assertEqual(h.pushed, [])
@@ -993,7 +958,7 @@ class PublishFlowTests(unittest.TestCase):
         for change in changes:
             for at in (0, 1):  # the first live check, or the recheck right before the push
                 with self.subTest(change=change, at=at):
-                    h = Harness(self, bundle=True, records=[{"op": "comment", "body": "x"}])
+                    h = Harness(self, commit=True, records=[{"op": "comment", "body": "x"}])
                     calls = {"n": 0}
                     original = h.read
 
@@ -1014,7 +979,7 @@ class PublishFlowTests(unittest.TestCase):
     def test_pause_appearing_right_before_the_push_blocks_it_without_minting(self):
         for labels in (["hold"], ["Claude:Pause"], None):
             with self.subTest(labels=labels):
-                h = Harness(self, bundle=True, records=[{"op": "comment", "body": "x"}])
+                h = Harness(self, commit=True, records=[{"op": "comment", "body": "x"}])
                 calls = {"n": 0}
                 original = h.read
 
@@ -1062,7 +1027,7 @@ class PublishFlowTests(unittest.TestCase):
             self.assertEqual(h.writes, [])
 
     def test_refused_candidate_drops_queued_writes(self):
-        h = Harness(self, bundle=True, records=[{"op": "comment", "body": "pushed!"}])
+        h = Harness(self, commit=True, records=[{"op": "comment", "body": "pushed!"}])
         h.validate_error = p.Refused("candidate changes a protected path")
         h.run()
         self.assertEqual((h.pushed, h.writes, h.minted, h.revoked), ([], [], 0, []))
@@ -1087,13 +1052,13 @@ class PublishFlowTests(unittest.TestCase):
         self.assertIn("run attempt differs", h.audits[0])
 
     def test_unexpected_error_audits_and_revokes_any_minted_token(self):
-        h = Harness(self, bundle=True, records=[{"op": "comment", "body": "x"}])
+        h = Harness(self, commit=True, records=[{"op": "comment", "body": "x"}])
         h.validate_error = RuntimeError(TOKEN)  # Even a token-bearing message is never echoed.
         self.assertEqual(h.run(), 1)
         self.assertEqual((h.minted, h.revoked), (0, []))  # CSL-405: failed before any mint
         self.assertIn("publisher error (RuntimeError)", h.audits[0])
         self.assertNotIn(TOKEN, "\n".join(h.audits + h.lines))
-        h = Harness(self, bundle=True, records=[{"op": "comment", "body": "x"}])
+        h = Harness(self, commit=True, records=[{"op": "comment", "body": "x"}])
         h.push_error = RuntimeError(TOKEN)
         self.assertEqual(h.run(), 1)
         self.assertEqual((h.minted, h.revoked), (1, [TOKEN]))
@@ -1102,7 +1067,7 @@ class PublishFlowTests(unittest.TestCase):
 
     def test_the_app_token_is_minted_only_after_validation(self):
         # CSL-405: no token exists while the untrusted bundle is fetched, fsck'd and parsed.
-        h = Harness(self, bundle=True, records=[{"op": "comment", "body": "x"}])
+        h = Harness(self, commit=True, records=[{"op": "comment", "body": "x"}])
         h.minted_at_validation = []
         h.run()
         self.assertEqual(h.minted_at_validation, [0])
@@ -1113,7 +1078,7 @@ class PublishFlowTests(unittest.TestCase):
         self.assertEqual((h.minted, len(h.writes), h.revoked), (1, 1, [TOKEN]))
 
     def test_workflow_validation_skip_publishes_nothing_but_audits(self):
-        h = Harness(self, bundle=True, records=[{"op": "comment", "body": "x"}])
+        h = Harness(self, commit=True, records=[{"op": "comment", "body": "x"}])
         h.mint_error = p.WorkflowValidationSkip()
         self.assertEqual(h.run(), 0)
         self.assertEqual((h.pushed, h.writes), ([], []))
@@ -1134,7 +1099,7 @@ class PublishFlowTests(unittest.TestCase):
         h.env["ARTIFACT_DIR"] = str(h.dir / "missing")
         self.assertEqual(h.run(), 0)
         self.assertEqual(h.minted, 0)
-        self.assertIn("no candidate commits and no queued writes", h.audits[0])
+        self.assertIn("no commit intent and no queued writes", h.audits[0])
 
     def test_unsuccessful_model_publishes_no_commits_and_no_queued_writes(self):
         records = [{"op": "reply", "comment_id": 11, "body": "fixed in this run"},
@@ -1142,22 +1107,92 @@ class PublishFlowTests(unittest.TestCase):
         for outcome, named in (("failure", "failure"), ("cancelled", "cancelled"), ("skipped", "skipped"),
                                ("", "unknown"), ("neutral", "unknown")):
             with self.subTest(outcome=outcome):
-                h = Harness(self, bundle=True, records=records)
+                h = Harness(self, commit=True, records=records)
                 h.env["MODEL_OUTCOME"] = outcome
                 self.assertEqual(h.run(), 0)
                 self.assertEqual((h.minted, h.pushed, h.writes), (0, [], []))
                 self.assertIn(f"model step did not succeed ({named}); nothing published", h.audits[0])
 
     def test_failed_or_inconsistent_packaging_publishes_no_queued_writes(self):
+        # Section 6: a failed or inconsistent package is a hard failure, never a run without an intent.
         records = [{"op": "reply", "comment_id": 11, "body": "fixed in this run"}, {"op": "comment", "body": "summary"}]
-        for status, bundle in (("failed", False), ("", False), ("bundled", False), ("unchanged", True),
-                               ("failed", True), ("BUNDLED", True)):
-            with self.subTest(status=status, bundle=bundle):
-                h = Harness(self, bundle=bundle, records=records)
+        for status, files in (("failed", ()), ("", ()), ("snapshot", ()), ("unchanged", ("intent", "manifest")),
+                              ("failed", ("intent", "manifest")), ("SNAPSHOT", ("intent", "manifest")),
+                              ("bundled", ("intent", "manifest")), ("snapshot", ("manifest",)), ("snapshot", ("intent",)),
+                              ("unchanged", ("intent",)), ("unchanged", ("manifest",))):
+            with self.subTest(status=status, files=files):
+                h = Harness(self, commit=True, records=records)
+                for name, path in (("intent", "intent.jsonl"), ("manifest", "snapshot.manifest")):
+                    if name not in files:
+                        (h.artifact / path).unlink()
                 h.env["PACKAGE_STATUS"] = status
                 self.assertEqual(h.run(), 0)
-                self.assertEqual((h.minted, h.pushed, h.writes), (0, [], []))
+                self.assertEqual((h.minted, h.pushed, h.writes, h.intents), (0, [], [], []))
                 self.assertIn("model output packaging failed or is inconsistent; nothing published", h.audits[0])
+
+    def test_sha_token_is_only_ever_the_verified_pushed_sha(self):
+        token = p.SHA_TOKEN
+        h = Harness(self, commit=True, records=[{"op": "comment", "body": f"fixed in {token}"},
+                                               {"op": "reply", "comment_id": 11, "body": f"see {token} and {token}"}])
+        h.run()
+        self.assertEqual([w[3]["body"] for w in h.writes], [f"fixed in {B}", f"see {B} and {B}"])
+        # No push: every token record is refused, others post; a rendered body over MAX_BODY is refused.
+        h = Harness(self, commit=True, records=[{"op": "comment", "body": f"fixed in {token}"}, {"op": "comment", "body": "ok"}])
+        h.candidate = ""
+        h.run()
+        self.assertEqual([w[3]["body"] for w in h.writes], ["ok"])
+        long = "x" * (p.MAX_BODY - len(token)) + token
+        h = Harness(self, commit=True, records=[{"op": "comment", "body": long}])
+        h.run()
+        self.assertEqual(h.writes, [])
+        self.assertIn("0 queued write(s) posted, 1 refused", h.audits[0])
+
+    def test_failure_matrix_never_posts_the_token(self):
+        records = [{"op": "comment", "body": "pushed " + p.SHA_TOKEN}, {"op": "reply", "comment_id": 11, "body": p.SHA_TOKEN}]
+        cases = {"model failure": lambda h: h.env.update(MODEL_OUTCOME="failure"),
+                 "package failure": lambda h: h.env.update(PACKAGE_STATUS="failed"),
+                 "push refused": lambda h: setattr(h, "push_error", p.Refused("git operation failed: push")),
+                 "stale head": lambda h: setattr(h, "heads", [C]),
+                 "pause": lambda h: setattr(h, "labels", ["hold"]),
+                 "identity": lambda h: setattr(h, "read", lambda path: pr(A, state="closed")),
+                 "candidate refused": lambda h: setattr(h, "validate_error", p.Refused("candidate changes a protected path"))}
+        for name, setup in cases.items():
+            with self.subTest(case=name):
+                h = Harness(self, commit=True, records=records)
+                setup(h)
+                h.run()
+                self.assertEqual(h.pushed, [])
+                self.assertNotIn(p.SHA_TOKEN, json.dumps(h.writes))
+                self.assertEqual(h.writes, [])
+
+    def test_abort_posts_only_comments_and_labels_and_abort_outside_conflict_fails(self):
+        records = [{"op": "comment", "body": "needs a human"}, {"op": "label", "label": "needs-decision"},
+                   {"op": "reply", "comment_id": 11, "body": "x"}]
+        h = Harness(self, mode="conflict", roots=(), records=records, intent='{"op":"abort"}\n')
+        h.run()
+        self.assertEqual((h.pushed, [w[1].rsplit("/7/", 1)[1] for w in h.writes]), ([], ["comments", "labels"]))
+        self.assertIn("merge abort requested; no candidate", h.audits[0])
+        self.assertEqual(h.intents, [("abort", None)])
+        for mode in ("mention", "fixer"):
+            h = Harness(self, mode=mode, records=records[:1], intent='{"op":"abort"}\n')
+            h.run()
+            self.assertEqual((h.writes, h.minted, h.intents), ([], 0, []))
+            self.assertIn("refused: abort intent outside conflict mode; nothing published", h.audits[0])
+
+    def test_intent_grammar(self):
+        for raw, mode in (('{"op":"commit","message":"a"}\n{"op":"commit","message":"b"}\n', "fixer"),
+                          ('{"op":"abort"}\n{"op":"abort"}\n', "conflict"), ('{"op":"commit"}\n', "fixer"),
+                          ('{"op":"commit","message":""}\n', "fixer"), ('{"op":"commit","message":"<!-- x"}\n', "fixer"),
+                          ('{"op":"commit","message":"a","x":1}\n', "fixer"), ('{"op":"abort","why":"x"}\n', "conflict"),
+                          ('{"op":"push"}\n', "fixer"), ("[1]\n", "fixer"), ("{bad\n", "fixer"), ("\n", "fixer"),
+                          ('{"op":"commit","message":"a","message":"b"}\n', "fixer"), ("\xff", "fixer")):
+            with self.subTest(raw=raw), self.assertRaises(p.Refused):
+                p.load_intent(raw.encode("latin-1"), mode)
+        with self.assertRaises(p.Refused):
+            p.load_intent(b"x" * (p.MAX_INTENT_BYTES + 1), "fixer")
+        self.assertIsNone(p.load_intent(None, "fixer"))
+        self.assertEqual(p.load_intent(b'{"op":"commit","message":"m"}\n{"op":"abort"}\n', "conflict"), ("abort", None))
+        self.assertEqual(p.load_intent(b'{"op":"abort"}\n{"message":"m","op":"commit"}\n', "conflict"), ("abort", None))
 
     def test_unchanged_package_still_posts_queued_writes(self):
         h = Harness(self, records=[{"op": "comment", "body": "no change was needed"}])
@@ -1227,7 +1262,7 @@ class TokenTests(unittest.TestCase):
             p.mint_app_token({}, FakeHttp([]), lambda _l: None, lambda _s: None)
 
     def test_token_is_only_ever_printed_inside_mask_commands(self):
-        h = Harness(self, records=[{"op": "comment", "body": "x"}], bundle=True)
+        h = Harness(self, records=[{"op": "comment", "body": "x"}], commit=True)
         h.mint = lambda env: p.mint_app_token(self.ENV, FakeHttp([{"token": TOKEN}]), h.lines.append, lambda _s: None)
         stdout, stderr = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
@@ -1272,6 +1307,58 @@ class TokenTests(unittest.TestCase):
         self.assertFalse(p.revoke_app_token(TOKEN, fail))
 
 
+def dir_state(root):
+    """Every path under root with its mode, size, mtime and bytes: a .git write shows up here."""
+    state = {}
+    for path in sorted(Path(root).rglob("*")):
+        info = path.lstat()
+        data = path.read_bytes() if path.is_file() and not path.is_symlink() else None
+        state[str(path.relative_to(root))] = (info.st_mode, info.st_size, info.st_mtime_ns, data)
+    return state
+
+
+def git_repo(files, branch="fix", exclude=True):
+    """A repository in the current directory with one commit of `files`; returns its SHA."""
+    o.command(["git", "init", "-q", "-b", branch])
+    if exclude:  # the model job's layout
+        with open(".git/info/exclude", "a", encoding="utf-8") as handle:
+            handle.write(".claude-fixer-out/\n.claude-fixer-replies/\n")
+    for name, text in files.items():
+        Path(name).parent.mkdir(parents=True, exist_ok=True)
+        Path(name).write_text(text)
+    o.command(["git", "add", "-A"])
+    o.command(["git", "commit", "-q", "-m", "base"])
+    return o.command(["git", "rev-parse", "HEAD"])
+
+
+def parse_records(raw):
+    fields = raw.split(b"\0")[:-1]
+    return {fields[i + 4].decode(): (fields[i].decode(), fields[i + 1].decode(), fields[i + 2].decode(),
+                                     int(fields[i + 3])) for i in range(0, len(fields), 5)}
+
+
+def snapshot_records(head, config=None):
+    """Run the Package step's snapshot routine on the current directory; return its records."""
+    config = config or {"repo": REPO, "number": "7", "base": head, "ref": "fix", "mode": "fixer"}
+    config = dict(config, base=head)
+    out = Path(tempfile.mkdtemp())
+    try:
+        if o.snapshot(out, shutil.which("git"), config) != "snapshot":
+            return {}
+        return parse_records((out / "snapshot.manifest").read_bytes())
+    finally:
+        shutil.rmtree(out)
+
+
+def restore_like_the_action():
+    """What restoreConfigFromBase leaves behind: base-branch content, unstaged, plus base-only files."""
+    Path("CLAUDE.md").write_text("main\n")
+    Path(".claude/settings.json").write_text('{"main": 1}\n')
+    Path(".husky/pre-commit").unlink()
+    Path(".ripgreprc").write_text("--hidden\n")
+    Path("a.txt").write_text("b\n")
+
+
 class OutboxHelperTests(unittest.TestCase):
     CONFIG = {"repo": REPO, "number": "7", "base": A, "ref": "fix", "mode": "fixer", "roots": [11]}
 
@@ -1304,72 +1391,63 @@ class OutboxHelperTests(unittest.TestCase):
             p.load_outbox(raw, "fixer", {11})
         self.assertEqual(len(p.load_outbox(raw.rsplit(b"\n", 2)[0] + b"\n", "fixer", {11})), 3)
 
-    @unittest.skipUnless(hasattr(os, "mkfifo"), "POSIX special files")
-    def test_commit_leaves_non_regular_paths_unstaged(self):
-        # CSL-377 canary: the sandbox's /dev/null masks made `git add -A` refuse the commit.
-        os.mkfifo("mask")
-        Path("real.txt").write_text("x\n")
-        Path(".claude-fixer-replies/msg.txt").write_text("fix: x\n")
-        calls = []
-
-        def run(argv):
-            calls.append(argv)
-            if argv[len(self.GIT):] == list(o.UNTRACKED):
-                return "mask\0real.txt\0gone.txt\0*glob\0sub/.zshrc\0.zshrc\0"
-            return "f" * 40 if argv[-2:] == ["rev-parse", "HEAD"] else ""
-        Path("*glob").write_text("x\n")
-        Path("sub").mkdir()
-        Path("sub/.zshrc").write_text("")  # only top-level names are masked
-        Path(".zshrc").write_text("")  # an empty leftover mount point
-        o.model_api(self.CONFIG, ["commit", ".claude-fixer-replies/msg.txt"], run=run)
-        self.assertEqual(calls[2], self.GIT + ["add", "-A", "--", ".", ":(exclude,literal)mask",
-                                               ":(exclude,literal).zshrc"])
-        self.assertEqual(calls[3], self.GIT + list(o.UNSTAGE))  # a dispatch run: nothing was restored
-
-    @unittest.skipUnless(hasattr(os, "mkfifo"), "POSIX special files")
-    def test_masked_paths_stay_out_of_a_real_commit(self):
-        # Runs without bubblewrap (CI) with real git for every call but the untracked listing: a
-        # plain checkout never lists a device or FIFO as untracked the way bwrap's mount points are.
+    @POSIX
+    def test_snapshot_leaves_non_regular_untracked_paths_and_mount_leftovers_out(self):
+        # CSL-377 canary: the sandbox's /dev/null masks list as untracked; B' snapshots after the model exits.
         with patch.dict(os.environ, git_env(), clear=True):
-            o.command(["git", "init", "-q", "-b", "fix"])
-            for name in ("a.txt", ".bashrc", "b.txt"):
-                Path(name).write_text(name + "\n")
-            o.command(["git", "add", "-A"])
-            o.command(["git", "commit", "-q", "-m", "base"])
+            head = git_repo({"a.txt": "a\n"})
+            os.mkfifo("mask")
+            Path("real.txt").write_text("x\n")
+            Path("*glob").write_text("x\n")
+            Path("sub").mkdir()
+            Path("sub/.zshrc").write_text("")  # only top-level names are masked
+            Path(".zshrc").write_text("")  # an empty leftover mount point
+            Path(".claude-fixer-out").mkdir()
+            Path(".claude-fixer-out/intent.jsonl").write_text('{"message":"m","op":"commit"}\n')
+            records = snapshot_records(head)
+        self.assertEqual({path: r[0] for path, r in records.items()},
+                         {"a.txt": "ref", "real.txt": "blob", "*glob": "blob", "sub/.zshrc": "blob"})
+
+    @POSIX
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "POSIX special files")
+    def test_masked_paths_stay_out_of_the_snapshot_and_a_masked_tracked_path_fails_closed(self):
+        with patch.dict(os.environ, git_env(), clear=True):
+            head = git_repo({"a.txt": "a\n", ".bashrc": ".bashrc\n", "b.txt": "b\n"})
             Path("a.txt").write_text("b\n")
             Path(".bashrc").write_text("")  # a tracked file emptied by the model is a real change
             os.mkfifo("*mask")
             Path(".zshrc").write_text("")  # a leftover empty mount point
             Path("docs").mkdir()
-            Path("docs/.profile").write_text("")  # not a mount point: staged
-            Path(".claude-fixer-replies/msg.txt").write_text("fix: a\n")
-
-            def run(argv):
-                if argv[len(self.GIT):] == list(o.UNTRACKED):
-                    return "*mask\0.zshrc\0docs/.profile\0"
-                return o.command(argv)
-            head = o.model_api(self.CONFIG, ["commit", ".claude-fixer-replies/msg.txt"], run=run)
-            files = o.command(["git", "show", "--name-only", "--format=", head]).split("\n")
-            self.assertEqual(sorted(files), [".bashrc", "a.txt", "docs/.profile"])
-            # A tracked path the sandbox later masked (a deletion) refuses the commit, unstubbed.
+            Path("docs/.profile").write_text("")  # not a mount point: kept
+            Path(".claude-fixer-out").mkdir()
+            Path(".claude-fixer-out/intent.jsonl").write_text('{"message":"m","op":"commit"}\n')
+            records = snapshot_records(head)
+            self.assertEqual({path: r[0] for path, r in records.items()},
+                             {"a.txt": "blob", ".bashrc": "blob", "b.txt": "ref", "docs/.profile": "blob"})
+            # A tracked path the sandbox masked (a deletion) refuses the intent and the snapshot.
             Path("b.txt").unlink()
             os.mkfifo("b.txt")
+            Path(".claude-fixer-replies/msg.txt").write_text("fix: a\n")
+            Path(".claude-fixer-out/intent.jsonl").unlink()
             with self.assertRaisesRegex(o.MaskedPath, "tracked path is masked"):
                 o.model_api(self.CONFIG, ["commit", ".claude-fixer-replies/msg.txt"])
-            self.assertEqual(o.command(["git", "rev-parse", "HEAD"]), head)
+            self.assertEqual(o.intents(), [])
+            Path(".claude-fixer-out/intent.jsonl").write_text('{"message":"m","op":"commit"}\n')
+            with self.assertRaises(o.MaskedPath):
+                snapshot_records(head)
             # A tracked file replaced by a directory is a real change, not a mask.
             Path("b.txt").unlink()
             Path("b.txt").mkdir()
             Path("b.txt/c.txt").write_text("c\n")
-            head = o.model_api(self.CONFIG, ["commit", ".claude-fixer-replies/msg.txt"])
-            self.assertEqual(sorted(o.command(["git", "show", "--name-status", "--format=", head]).split("\n")),
-                             ["A\tb.txt/c.txt", "D\tb.txt"])
+            records = snapshot_records(head)
+            self.assertEqual((records["b.txt"][0], records["b.txt/c.txt"][0]), ("delete", "blob"))
 
     @unittest.skipUnless(shutil.which("bwrap") and subprocess.run(
         ["bwrap", "--dev-bind", "/", "/", "true"], capture_output=True, check=False).returncode == 0,
         "needs a working bubblewrap")
-    def test_commit_works_under_bubblewrap_device_masks(self):
-        # The real failure: bwrap's mount points list as untracked files but stat as /dev/null.
+    def test_commit_intent_works_under_bubblewrap_device_masks(self):
+        # The real failure was `git add` on bwrap's mount points. B': the helper records an intent and
+        # writes no .git at all; the snapshot after the sandbox leaves the empty leftovers out.
         helper = Path("helper").resolve()
         helper.mkdir()
         script = helper / "model-api"
@@ -1398,19 +1476,31 @@ class OutboxHelperTests(unittest.TestCase):
         control = subprocess.run([*sandbox, "git", "add", "-A"], env=env, capture_output=True, text=True, check=False)
         self.assertNotEqual(control.returncode, 0, control.stderr)
         self.assertIn("can only add regular files", control.stderr)
+        subprocess.run(["git", "-C", str(repo), "reset", "-q"], env=env, check=True)
+        before = dir_state(repo / ".git")
         result = subprocess.run([*sandbox, sys.executable, "-I", str(script), "--", "commit", ".claude-fixer-replies/m.txt"],
                                 env=env, capture_output=True, text=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
-        new = result.stdout.strip()
-        self.assertRegex(new, r"\A[0-9a-f]{40}\Z")
-        files = subprocess.run(["git", "-C", str(repo), "show", "--name-only", "--format=", new], env=env,
-                               capture_output=True, text=True, check=True).stdout.split()
-        self.assertEqual(files, ["a.txt"])
-        # Nothing left to commit: the helper names the failed step, not its output.
+        self.assertEqual(result.stdout.strip(), o.COMMIT_RECORDED)
+        self.assertEqual(dir_state(repo / ".git"), before)
+        # A second commit is refused by name; the first intent is kept.
         again = subprocess.run([*sandbox, sys.executable, "-I", str(script), "--", "commit", ".claude-fixer-replies/m.txt"],
                                env=env, capture_output=True, text=True, check=False)
         self.assertEqual(again.returncode, 1)
-        self.assertEqual(again.stderr.strip(), "Helper operation failed: git commit exited 1.")
+        self.assertEqual(again.stderr.strip(), "Helper operation failed: a commit is already recorded; the first one is kept.")
+        self.assertEqual(dir_state(repo / ".git"), before)
+        # The Package step's real entry point, outside the sandbox, under env -i.
+        out = Path("out").resolve()
+        out.mkdir()
+        package = subprocess.run(["env", "-i", sys.executable, "-I", str(script), "snapshot", str(out), shutil.which("git")],
+                                 cwd=repo, capture_output=True, text=True, check=False)
+        self.assertEqual((package.returncode, package.stdout.strip()), (0, "snapshot"), package.stderr)
+        records = parse_records((out / "snapshot.manifest").read_bytes())
+        self.assertEqual({path: r[0] for path, r in records.items()}, {"a.txt": "blob"})
+        self.assertEqual(len((out / "intent.jsonl").read_text().splitlines()), 1)
+        # A snapshot that already exists fails closed.
+        self.assertNotEqual(subprocess.run(["env", "-i", sys.executable, "-I", str(script), "snapshot", str(out),
+                                            shutil.which("git")], cwd=repo, capture_output=True).returncode, 0)
 
     @POSIX
     def test_install_stores_the_read_token_for_scrubbed_reads(self):
@@ -1458,7 +1548,7 @@ class OutboxHelperTests(unittest.TestCase):
         expected = {"status": ["status", "--short"], "diff": ["diff", "--no-ext-diff", "--no-textconv"],
                     "diff-stat": ["diff", "--stat", "--no-ext-diff", "--no-textconv"],
                     "log": ["log", "--oneline", "-20"], "head": ["log", "-1", "--stat"]}
-        conflict_only = {"conflicts": ["diff", "--name-only", "--diff-filter=U"], "merge-abort": ["merge", "--abort"]}
+        conflict_only = {"conflicts": ["diff", "--name-only", "--diff-filter=U"]}
         for mode in ("mention", "fixer", "conflict"):
             config = self.CONFIG | {"mode": mode}
             ops = expected | (conflict_only if mode == "conflict" else {})
@@ -1467,33 +1557,63 @@ class OutboxHelperTests(unittest.TestCase):
                 with self.subTest(mode=mode, op=op):
                     self.assertEqual(o.model_api(config, [op], run=lambda a, calls=calls: calls.append(a) or "out"), "out")
                     self.assertEqual(calls, [self.GIT + argv])
-            for op in conflict_only if mode != "conflict" else ():
+            for op in [*conflict_only, "merge-abort"] if mode != "conflict" else ():
                 with self.subTest(mode=mode, op=op), self.assertRaises(ValueError):
                     o.model_api(config, [op], run=lambda a: self.fail("conflict-only op ran"))
+        # B': merge-abort runs no git at all; it records the abort intent.
+        self.assertEqual(o.model_api(self.CONFIG | {"mode": "conflict"}, ["merge-abort"],
+                                     run=lambda a: self.fail(f"git ran: {a}")), o.ABORT_RECORDED)
+        self.assertEqual(o.intents(), ["abort"])
 
-    def test_commit_stages_all_but_the_helper_dirs_and_returns_the_new_head(self):
+    def test_commit_records_one_intent_and_runs_only_read_only_git(self):
         Path(".claude-fixer-replies/msg.txt").write_text("-fix: a message\nwith a second line\n")
         for mode in ("mention", "fixer", "conflict"):
             calls = []
-            run = lambda a, calls=calls: calls.append(a) or ("f" * 40 if a[-2:] == ["rev-parse", "HEAD"] else "")
+            run = lambda a, calls=calls: calls.append(a) or ""
             with self.subTest(mode=mode):
+                o.INTENT.unlink(missing_ok=True)
                 out = o.model_api(self.CONFIG | {"mode": mode, "restored": mode != "conflict"},
                                   ["commit", ".claude-fixer-replies/msg.txt"], run=run)
-                self.assertEqual(out, "f" * 40)
-                if mode == "conflict":  # unmerged paths are checked for leftover markers first
+                self.assertEqual(out, o.COMMIT_RECORDED)
+                self.assertIn("{{CLAUDE_COMMIT_SHA}}", out)
+                if mode == "conflict":  # unmerged paths are checked for leftover markers first (advisory)
                     self.assertEqual(calls.pop(0), self.GIT + ["diff", "--name-only", "-z", "--diff-filter=U"])
-                self.assertEqual(calls, [
-                    self.GIT + ["ls-files", "-z", "--modified"],
-                    self.GIT + ["ls-files", "-z", "--others", "--exclude-standard"],
-                    self.GIT + ["add", "-A", "--", "."],
-                    self.GIT + ["reset", "-q", "--", ".claude-fixer-out", ".claude-fixer-replies"]
-                    + ([] if mode == "conflict" else list(o.ACTION_RESTORED)),
-                    self.GIT + ["commit", "--no-verify", "-q", "-m", "-fix: a message\nwith a second line\n"],
-                    self.GIT + ["rev-parse", "HEAD"]])
+                self.assertEqual(calls, [self.GIT + ["ls-files", "-z", "--modified"]])
+                self.assertEqual([json.loads(line) for line in o.INTENT.read_text().splitlines()],
+                                 [{"op": "commit", "message": "-fix: a message\nwith a second line\n"}])
+                self.assertEqual(p.load_intent(o.INTENT.read_bytes(), mode),
+                                 ("commit", "-fix: a message\nwith a second line\n"))
         for body in ("", "<!-- claude-fixer-result:{} -->"):
             Path(".claude-fixer-replies/bad.txt").write_text(body)
             with self.subTest(body=body), self.assertRaises(ValueError):
                 o.model_api(self.CONFIG, ["commit", ".claude-fixer-replies/bad.txt"], run=lambda a: self.fail("git ran"))
+
+    def test_helper_refuses_a_second_commit_and_lets_abort_dominate(self):
+        # v4.3 section 8.2 (helper-API guarantees only).
+        conflict = self.CONFIG | {"mode": "conflict"}
+        Path(".claude-fixer-replies/one.txt").write_text("first\n")
+        Path(".claude-fixer-replies/two.txt").write_text("second\n")
+        quiet = lambda a: ""
+        o.model_api(self.CONFIG, ["commit", ".claude-fixer-replies/one.txt"], run=quiet)
+        with self.assertRaisesRegex(o.IntentRefused, "already recorded; the first one is kept"):
+            o.model_api(self.CONFIG, ["commit", ".claude-fixer-replies/two.txt"], run=quiet)
+        self.assertEqual(p.load_intent(o.INTENT.read_bytes(), "fixer"), ("commit", "first\n"))
+        # Commit then abort, and abort then commit: both end as an abort.
+        o.model_api(conflict, ["merge-abort"], run=quiet)
+        o.model_api(conflict, ["merge-abort"], run=quiet)  # idempotent: one abort record
+        self.assertEqual(o.intents(), ["commit", "abort"])
+        self.assertEqual(p.load_intent(o.INTENT.read_bytes(), "conflict"), ("abort", None))
+        o.INTENT.unlink()
+        o.model_api(conflict, ["merge-abort"], run=quiet)
+        with self.assertRaisesRegex(o.IntentRefused, "merge-abort is recorded"):
+            o.model_api(conflict, ["commit", ".claude-fixer-replies/one.txt"], run=quiet)
+        self.assertEqual(o.intents(), ["abort"])
+        # Abort outside conflict mode is refused by the helper.
+        o.INTENT.unlink()
+        for mode in ("mention", "fixer"):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                o.model_api(self.CONFIG | {"mode": mode}, ["merge-abort"], run=quiet)
+        self.assertFalse(o.INTENT.exists())
 
     def test_git_operations_refuse_any_extra_or_unknown_argument(self):
         run = lambda a: self.fail(f"git ran: {a}")
@@ -1504,78 +1624,71 @@ class OutboxHelperTests(unittest.TestCase):
                      ["commit", ".claude-fixer-replies/r.txt", "--amend"], ["commit", "--pathspec-from-file=/etc/hostname"],
                      ["commit", ".env"], ["commit", "../r.txt"], ["commit"], ["rev-parse", "HEAD"], ["add", "-A"],
                      ["git", "log"], ["log", "-20"], ["conflicts", "--name-status"], ["merge-abort", "--quit"],
+                     ["snapshot", "out"], ["install"],
                      ["merge", "--abort"], ["--output=x"]):
             with self.subTest(args=args), self.assertRaises(ValueError):
                 o.model_api(conflict, args, run=run)
 
     @POSIX
-    def test_commit_in_a_real_repository(self):
+    def test_model_phase_writes_nothing_under_git_and_the_reads_work(self):
+        # v4.3 section 8.1: intents are recorded without writing .git; the read operations still work.
         env = git_env()
         with patch.dict(os.environ, env, clear=True):
-            o.command(["git", "init", "-q", "-b", "main"])
-            Path("a.txt").write_text("a\n")
-            o.command(["git", "add", "a.txt"])
-            o.command(["git", "commit", "-q", "-m", "base"])
-            base = o.command(["git", "rev-parse", "HEAD"])
+            base = git_repo({"a.txt": "a\n"})
             hook = Path(".git/hooks/post-commit")
             hook.write_text("#!/bin/sh\ntouch hook-ran\n")
             hook.chmod(0o755)
             Path("a.txt").write_text("b\n")
             Path("b.txt").write_text("new\n")
+            before = dir_state(Path(".git"))
             o.model_api(self.CONFIG, ["comment", ".claude-fixer-replies/r.txt"])  # creates .claude-fixer-out/
             self.assertTrue(o.model_api(self.CONFIG, ["status"]).startswith(" M a.txt\n"))  # leading space kept
+            for op in ("diff", "diff-stat", "log", "head"):
+                self.assertTrue(o.model_api(self.CONFIG, [op]), op)
             Path(".claude-fixer-replies/msg.txt").write_text("fix: change a\n")
-            head = o.model_api(self.CONFIG, ["commit", ".claude-fixer-replies/msg.txt"])
-            self.assertRegex(head, r"\A[0-9a-f]{40}\Z")
-            self.assertEqual(head, o.command(["git", "rev-parse", "HEAD"]))
-            self.assertEqual(o.command(["git", "rev-parse", "HEAD^"]), base)
-            self.assertEqual(o.command(["git", "log", "-1", "--format=%B"]), "fix: change a")
-            self.assertEqual(o.command(["git", "ls-files"]).splitlines(), ["a.txt", "b.txt"])
+            self.assertEqual(o.model_api(self.CONFIG, ["commit", ".claude-fixer-replies/msg.txt"]), o.COMMIT_RECORDED)
+            self.assertEqual(dir_state(Path(".git")), before)  # not one byte, mode or timestamp under .git
+            self.assertEqual(o.command(["git", "rev-parse", "HEAD"]), base)
             self.assertFalse(Path("hook-ran").exists())
-            self.assertIn(".claude-fixer-out", o.command(["git", "status", "--short"]))  # left untracked
+            records = snapshot_records(base)
+            self.assertEqual({path: r[0] for path, r in records.items()}, {"a.txt": "blob", "b.txt": "blob"})
+            self.assertEqual(dir_state(Path(".git")), before)
 
     @POSIX
-    def test_commit_with_the_model_jobs_ignored_helper_dirs(self):
-        # CSL-377 canary: the model job lists both helper dirs in .git/info/exclude, and `git add`
-        # exits 1 when a pathspec, even an exclude, names an ignored path ("git add exited 1").
-        with patch.dict(os.environ, git_env(), clear=True):
-            o.command(["git", "init", "-q", "-b", "main"])
-            Path("a.txt").write_text("a\n")
-            o.command(["git", "add", "a.txt"])
-            o.command(["git", "commit", "-q", "-m", "base"])
-            base = o.command(["git", "rev-parse", "HEAD"])
-            Path(".git/info").mkdir(exist_ok=True)
-            with open(".git/info/exclude", "a", encoding="utf-8") as handle:
-                handle.write(".claude-fixer-out/\n.claude-fixer-replies/\n")  # as the model job's install step does
-            o.model_api(self.CONFIG, ["comment", ".claude-fixer-replies/r.txt"])  # creates .claude-fixer-out/
-            Path("a.txt").write_text("b\n")
-            Path(".claude-fixer-replies/msg.txt").write_text("fix: change a\n")
-            # Control: the old exclude pathspecs fail on this layout after staging the change.
-            control = subprocess.run(["git", "add", "-A", "--", ".", ":(exclude).claude-fixer-out",
-                                      ":(exclude).claude-fixer-replies"], capture_output=True, text=True, check=False)
-            self.assertEqual(control.returncode, 1, control.stderr)
-            self.assertIn("ignored", control.stderr)
-            o.command(["git", "reset", "-q"])
-            head = o.model_api(self.CONFIG, ["commit", ".claude-fixer-replies/msg.txt"])
-            self.assertEqual(o.command(["git", "rev-parse", "HEAD^"]), base)
-            self.assertEqual(o.command(["git", "show", "--name-only", "--format=", head]).split(), ["a.txt"])
+    def test_snapshot_leaves_the_helper_dirs_out_whether_or_not_they_are_ignored(self):
+        for ignored in (True, False):
+            with self.subTest(ignored=ignored), tempfile.TemporaryDirectory() as tmp, \
+                    patch.dict(os.environ, git_env(), clear=True):
+                os.chdir(tmp)
+                head = git_repo({"a.txt": "a\n"}, exclude=False)
+                if ignored:
+                    with open(".git/info/exclude", "a", encoding="utf-8") as handle:
+                        handle.write(".claude-fixer-out/\n.claude-fixer-replies/\n")  # the model job's layout
+                Path(".claude-fixer-replies").mkdir()
+                Path(".claude-fixer-replies/r.txt").write_text("reply\n")
+                o.model_api(self.CONFIG, ["comment", ".claude-fixer-replies/r.txt"])
+                Path("a.txt").write_text("b\n")
+                Path(".claude-fixer-replies/msg.txt").write_text("fix: change a\n")
+                o.model_api(self.CONFIG, ["commit", ".claude-fixer-replies/msg.txt"])
+                records = snapshot_records(head)
+                self.assertEqual({path: r[0] for path, r in records.items()}, {"a.txt": "blob"})
+                os.chdir(self.tmp.name)
 
     @POSIX
-    def test_commit_keeps_tracked_helper_dir_changes_out(self):
-        # The unstage covers tracked paths too, as the exclude pathspecs did.
+    def test_snapshot_keeps_heads_entry_for_tracked_helper_dir_paths(self):
         with patch.dict(os.environ, git_env(), clear=True):
-            o.command(["git", "init", "-q", "-b", "main"])
-            Path("a.txt").write_text("a\n")
-            Path(".claude-fixer-out").mkdir()
-            Path(".claude-fixer-out/tracked.txt").write_text("old\n")
-            o.command(["git", "add", "-A"])
-            o.command(["git", "commit", "-q", "-m", "base"])
+            head = git_repo({"a.txt": "a\n", ".claude-fixer-out/tracked.txt": "old\n"}, exclude=False)
+            old = o.command(["git", "rev-parse", "HEAD:.claude-fixer-out/tracked.txt"])
             Path("a.txt").write_text("b\n")
             Path(".claude-fixer-out/tracked.txt").write_text("new\n")
+            Path(".claude-fixer-out/untracked.txt").write_text("x\n")
             Path(".claude-fixer-replies/msg.txt").write_text("fix: change a\n")
-            head = o.model_api(self.CONFIG, ["commit", ".claude-fixer-replies/msg.txt"])
-            self.assertEqual(o.command(["git", "show", "--name-only", "--format=", head]).split(), ["a.txt"])
-            self.assertEqual(o.command(["git", "show", f"{head}:.claude-fixer-out/tracked.txt"]), "old")
+            o.model_api(self.CONFIG, ["commit", ".claude-fixer-replies/msg.txt"])
+            records = snapshot_records(head)
+        self.assertEqual(records[".claude-fixer-out/tracked.txt"][:3], ("ref", "100644", old))
+        # Both helper dirs are tracked here (setUp's reply file too): HEAD refs; the untracked file is left out.
+        self.assertEqual({path: r[0] for path, r in records.items()},
+                         {".claude-fixer-out/tracked.txt": "ref", ".claude-fixer-replies/r.txt": "ref", "a.txt": "blob"})
 
     def test_install_records_whether_the_action_restored_config(self):
         # Codex 4335300680 / Chaandan at cac2a13: the action restores only for a PR entity event
@@ -1776,37 +1889,37 @@ class OutboxHelperTests(unittest.TestCase):
                     self.assertIn("0 queued write(s) posted, 1 refused", old.audits[0])
 
     @POSIX
-    def test_pr_event_commit_leaves_the_actions_base_branch_restores_out(self):
-        # Fable rehearsal of a5fd6b7: for PR events claude-code-action's restoreConfigFromBase leaves the
-        # base branch's .claude/, CLAUDE.md, .ripgreprc, ... unstaged in the worktree. Staging them would
-        # revert the PR's versions (and the publisher refuses protected paths, dropping the whole run).
-        # A dispatch run gets no restore, so its edits to those paths are real and are committed.
+    def test_pr_event_snapshot_keeps_heads_entries_for_the_actions_base_branch_restores(self):
+        # Fable rehearsal of a5fd6b7, ported to B' at the snapshot-record level (section 8.4): for PR events
+        # claude-code-action's restoreConfigFromBase leaves the base branch's .claude/, CLAUDE.md,
+        # .ripgreprc, ... unstaged in the worktree. The snapshot keeps HEAD's entries for them (or leaves an
+        # untracked restore out); a dispatch run gets no restore, so all five are model-change records.
         self.assertEqual(o.ACTION_RESTORED, (".claude", ".mcp.json", ".claude.json", ".gitmodules", ".ripgreprc",
                                              "CLAUDE.md", "CLAUDE.local.md", ".husky"))
+        self.assertEqual(p.ACTION_RESTORED, o.ACTION_RESTORED)
+        self.assertEqual(p.RESTORE_EVENTS, o.RESTORE_EVENTS)
         for mode, restored in (("mention", True), ("fixer", True), ("fixer", False)):
             with self.subTest(mode=mode, restored=restored), tempfile.TemporaryDirectory() as tmp, \
                     patch.dict(os.environ, git_env(), clear=True):
                 os.chdir(tmp)
-                o.command(["git", "init", "-q", "-b", "main"])
-                for name, text in (("a.txt", "a\n"), ("CLAUDE.md", "pr\n"), (".claude/settings.json", "{}\n"),
-                                   (".husky/pre-commit", "pr\n")):
-                    Path(name).parent.mkdir(exist_ok=True)
-                    Path(name).write_text(text)
-                o.command(["git", "add", "-A"])
-                o.command(["git", "commit", "-q", "-m", "base"])
-                # What the restore leaves behind: base-branch content, unstaged, plus base-only files.
-                Path("CLAUDE.md").write_text("main\n")
-                Path(".claude/settings.json").write_text('{"main": 1}\n')
-                Path(".husky/pre-commit").unlink()
-                Path(".ripgreprc").write_text("--hidden\n")
-                Path("a.txt").write_text("b\n")
+                head = git_repo({"a.txt": "a\n", "CLAUDE.md": "pr\n", ".claude/settings.json": "{}\n",
+                                 ".husky/pre-commit": "pr\n"})
+                heads = {path: o.command(["git", "rev-parse", f"HEAD:{path}"])
+                         for path in ("a.txt", "CLAUDE.md", ".claude/settings.json", ".husky/pre-commit")}
+                restore_like_the_action()
                 Path(".claude-fixer-replies").mkdir()
                 Path(".claude-fixer-replies/msg.txt").write_text("fix: change a\n")
-                head = o.model_api(self.CONFIG | {"mode": mode, "restored": restored},
-                                   ["commit", ".claude-fixer-replies/msg.txt"])
-                files = o.command(["git", "show", "--name-only", "--format=", head]).split()
-                self.assertEqual(sorted(files), ["a.txt"] if restored else
-                                 [".claude/settings.json", ".husky/pre-commit", ".ripgreprc", "CLAUDE.md", "a.txt"])
+                config = self.CONFIG | {"mode": mode, "restored": restored}
+                o.model_api(config, ["commit", ".claude-fixer-replies/msg.txt"])
+                records = snapshot_records(head, config)
+                if restored:
+                    self.assertEqual({path: r[:3] for path, r in records.items() if path != "a.txt"},
+                                     {path: ("ref", "100644", heads[path]) for path in heads if path != "a.txt"})
+                    self.assertEqual(records["a.txt"][0], "blob")
+                else:
+                    self.assertEqual({path: r[0] for path, r in records.items()},
+                                     {"a.txt": "blob", "CLAUDE.md": "blob", ".claude/settings.json": "blob",
+                                      ".husky/pre-commit": "delete", ".ripgreprc": "blob"})
                 os.chdir(self.tmp.name)
 
     @POSIX
@@ -1840,8 +1953,11 @@ class OutboxHelperTests(unittest.TestCase):
             Path("a.txt").write_text("c\n")
             o.model_api(self.CONFIG, ["diff"])
             Path(".claude-fixer-replies/msg.txt").write_text("fix: b\n")
-            head = o.model_api(self.CONFIG, ["commit", ".claude-fixer-replies/msg.txt"])
-            self.assertRegex(head, r"\A[0-9a-f]{40}\Z")
+            self.assertEqual(o.model_api(self.CONFIG, ["commit", ".claude-fixer-replies/msg.txt"]), o.COMMIT_RECORDED)
+            # The snapshot hashes raw bytes in Python: no filter runs, and the record is the raw content.
+            head = o.command(["git", "rev-parse", "HEAD"])
+            records = snapshot_records(head)
+            self.assertEqual(records["a.txt"][0], "blob")
             for marker in ("diff-ran", "filter-ran", "gpg-ran"):
                 self.assertFalse((home / marker).exists(), marker)
 
@@ -1887,11 +2003,10 @@ class OutboxHelperTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "conflict markers remain"):  # diff3 base marker
                 o.model_api(conflict, ["commit", ".claude-fixer-replies/msg.txt"])
             Path(names[0]).write_text("head\nside\n")
-            head = o.model_api(conflict, ["commit", ".claude-fixer-replies/msg.txt"])
-            self.assertEqual(len(o.command(["git", "rev-list", "--parents", "-n", "1", head]).split()), 3)
-            tracked = o.command(["git", "ls-files", "-z"]).split("\0")
-            self.assertIn(names[0], tracked)
-            self.assertNotIn("gone.txt", tracked)  # the deletion resolution was committed
+            self.assertEqual(o.model_api(conflict, ["commit", ".claude-fixer-replies/msg.txt"]), o.COMMIT_RECORDED)
+            records = snapshot_records(o.command(["git", "rev-parse", "HEAD"]), conflict)
+            self.assertEqual(records[names[0]][0], "blob")
+            self.assertEqual(records["gone.txt"][0], "delete")  # the deletion resolution is recorded
 
     @POSIX
     def test_conflict_commit_uses_the_conflict_marker_size_attribute(self):
@@ -1922,8 +2037,7 @@ class OutboxHelperTests(unittest.TestCase):
                     o.model_api(conflict, ["commit", ".claude-fixer-replies/msg.txt"])
             Path("a.txt").write_text("head\n" + "=" * 9 + "\nside\n")  # not a size-7 or size-10 separator
             Path("b.md").write_text("head\nside\n")
-            head = o.model_api(conflict, ["commit", ".claude-fixer-replies/msg.txt"])
-            self.assertEqual(len(o.command(["git", "rev-list", "--parents", "-n", "1", head]).split()), 3)
+            self.assertEqual(o.model_api(conflict, ["commit", ".claude-fixer-replies/msg.txt"]), o.COMMIT_RECORDED)
 
     @POSIX
     def test_conflict_commit_refuses_a_re_encoded_unmerged_path(self):
@@ -1946,9 +2060,9 @@ class OutboxHelperTests(unittest.TestCase):
                 o.model_api(conflict, ["commit", ".claude-fixer-replies/msg.txt"])
             # Resolving it by deleting the file still commits.
             Path("u16.txt").unlink()
-            head = o.model_api(conflict, ["commit", ".claude-fixer-replies/msg.txt"])
-            self.assertEqual(len(o.command(["git", "rev-list", "--parents", "-n", "1", head]).split()), 3)
-            self.assertNotIn("u16.txt", o.command(["git", "ls-files"]).split("\n"))
+            self.assertEqual(o.model_api(conflict, ["commit", ".claude-fixer-replies/msg.txt"]), o.COMMIT_RECORDED)
+            records = snapshot_records(o.command(["git", "rev-parse", "HEAD"]), conflict)
+            self.assertEqual(records["u16.txt"][0], "delete")
 
     def test_marker_sizes_read_every_source_and_parse_like_git(self):
         calls, values = [], iter(["12abc", "unspecified", "-3", "set", "0", " 4"])
@@ -1973,7 +2087,8 @@ class OutboxHelperTests(unittest.TestCase):
             self.assertFalse(marker.search("x\n" + line + "\ny"), line)
 
     @POSIX
-    def test_commit_completes_and_merge_abort_ends_the_conflict_merge(self):
+    def test_merge_abort_and_commit_record_intents_and_leave_the_merge_in_place(self):
+        # B': neither intent touches .git; the publisher builds the merge (or nothing, after an abort).
         conflict = self.CONFIG | {"mode": "conflict"}
         with patch.dict(os.environ, git_env(), clear=True):
             o.command(["git", "init", "-q", "-b", "main"])
@@ -1983,21 +2098,22 @@ class OutboxHelperTests(unittest.TestCase):
                 Path("a.txt").write_text(text)
                 o.command(["git", "add", "a.txt"])
                 o.command(["git", "commit", "-q", "-m", branch])
-            for finish in ("merge-abort", "commit"):
-                with self.subTest(finish=finish):
-                    before = o.command(["git", "rev-parse", "HEAD"])
-                    subprocess.run(["git", "merge", "--no-ff", "--no-commit", "side"], capture_output=True)
-                    self.assertEqual(o.model_api(conflict, ["conflicts"]), "a.txt")
-                    if finish == "merge-abort":
-                        o.model_api(conflict, ["merge-abort"])
-                        self.assertEqual(o.command(["git", "rev-parse", "HEAD"]), before)
-                        self.assertFalse(Path(".git/MERGE_HEAD").exists())
-                        continue
-                    Path("a.txt").write_text("head\nside\n")
-                    Path(".claude-fixer-replies/msg.txt").write_text("Merge side\n")
-                    head = o.model_api(conflict, ["commit", ".claude-fixer-replies/msg.txt"])
-                    self.assertEqual(o.command(["git", "rev-list", "--parents", "-n", "1", head]).split()[1:],
-                                     [before, o.command(["git", "rev-parse", "side"])])
+            before = o.command(["git", "rev-parse", "HEAD"])
+            subprocess.run(["git", "merge", "--no-ff", "--no-commit", "side"], capture_output=True)
+            self.assertEqual(o.model_api(conflict, ["conflicts"]), "a.txt")
+            state = dir_state(Path(".git"))
+            self.assertEqual(o.model_api(conflict, ["merge-abort"]), o.ABORT_RECORDED)
+            self.assertEqual(dir_state(Path(".git")), state)
+            self.assertTrue(Path(".git/MERGE_HEAD").exists())
+            self.assertEqual(o.command(["git", "rev-parse", "HEAD"]), before)
+            Path("a.txt").write_text("head\nside\n")
+            Path(".claude-fixer-replies/msg.txt").write_text("Merge side\n")
+            with self.assertRaises(o.IntentRefused):
+                o.model_api(conflict, ["commit", ".claude-fixer-replies/msg.txt"])
+            o.INTENT.unlink()
+            self.assertEqual(o.model_api(conflict, ["commit", ".claude-fixer-replies/msg.txt"]), o.COMMIT_RECORDED)
+            self.assertEqual(dir_state(Path(".git")), state)
+            self.assertEqual(p.load_intent(o.INTENT.read_bytes(), "conflict"), ("commit", "Merge side\n"))
 
     @POSIX
     def test_refusals(self):
@@ -2032,6 +2148,1090 @@ class OutboxHelperTests(unittest.TestCase):
 
 
 
+# ---------------------------------------------------------------------------
+# CSL-414 B' (design v4.3): the deferred commit, end to end and by intake phase.
+
+
+def manifest(records):
+    """Serialize {path: (op, mode, oid, size)} as the snapshot manifest."""
+    return b"".join(b"\0".join((op.encode(), mode.encode(), oid.encode(), str(size).encode(), path.encode())) + b"\0"
+                    for path, (op, mode, oid, size) in records.items())
+
+
+def blob_id(data):
+    return __import__("hashlib").sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+class Opens:
+    """Record every os.open and every buffered read of a blob descriptor in the publisher."""
+
+    def __init__(self, test):
+        self.opened, self.read = [], []
+        real_open = os.open
+        builtin_open = open
+
+        def os_open(path, flags, *args, **kwargs):
+            self.opened.append((os.fsdecode(path), kwargs.get("dir_fd") is not None, flags))
+            return real_open(path, flags, *args, **kwargs)
+
+        def py_open(file, *args, **kwargs):
+            if isinstance(file, int):
+                self.read.append(file)
+            return builtin_open(file, *args, **kwargs)
+        for patcher in (patch.object(p.os, "open", os_open), patch.object(p, "open", py_open, create=True)):
+            patcher.start()
+            test.addCleanup(patcher.stop)
+
+    def blob_opens(self):
+        """Blob files opened through the blobs descriptor (not other dir_fd users such as rmtree)."""
+        return [path for path, at, _flags in self.opened if at and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", path)]
+
+    def blobs_dir_opened(self):
+        return any(at and path == p.BLOBS_DIR for path, at, _flags in self.opened)
+
+
+@POSIX
+class FlowCase(unittest.TestCase):
+    """Fixtures: the helper's intent, the real Package snapshot routine, then the publisher's main() against a
+    file:// remote. No tests here."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.cwd = os.getcwd()
+        self.addCleanup(os.chdir, self.cwd)
+        self.src = Work(self.root / "src")
+        subprocess.run(["git", "init", "-q", "-b", "main", str(self.src.path)], env=git_env(), check=True)
+        self.files = {"app/a.py": "a = 1\n", "app/b.py": "b = 1\n", "scripts/run.sh": "#!/bin/sh\n",
+                      "AGENTS.md": "rules\n", "CLAUDE.md": "pr\n", ".claude/settings.json": "{}\n",
+                      ".husky/pre-commit": "pr\n"}
+        self.src.write("scripts/run.sh", "#!/bin/sh\n", mode=0o755)
+        self.base = self.src.commit({k: v for k, v in self.files.items() if k != "scripts/run.sh"},
+                                    message="initial", committer=("Alice", "alice@example.com"))
+        self.src.git("checkout", "-q", "-b", "fix")
+        self.head = self.base
+        self.host = self.root / "host"
+        self.remote = self.host / f"{REPO}.git"
+        self.argv, self.envs = [], []
+        # The harness's own git: resolved and isolated now, so a planted PATH or config never reaches it.
+        self.git_bin, self.clean_env = shutil.which("git"), git_env()
+        patcher = patch.object(p, "GITHUB_HOST", "file://" + str(self.host))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    # -- fixtures -------------------------------------------------------------
+
+    def push_src(self):
+        if self.remote.exists():
+            shutil.rmtree(self.remote)
+        subprocess.run(["git", "clone", "-q", "--bare", str(self.src.path), str(self.remote)], env=git_env(), check=True)
+
+    def model(self, mode="mention", head_files=None, base_files=None, merge=False):
+        """Commit head (and base) changes in src, publish them to the remote, clone the model checkout."""
+        if base_files:
+            self.src.git("checkout", "-q", "main")
+            self.base = self.src.commit(base_files, message="base side")
+            self.src.git("checkout", "-q", "fix")
+        if head_files:
+            self.head = self.src.commit(head_files, message="head side")
+        self.push_src()
+        self.work = Work(self.root / "model")
+        subprocess.run(["git", "clone", "-q", str(self.src.path), str(self.work.path)], env=git_env(), check=True)
+        self.work.git("checkout", "-q", "-B", "fix", self.head)
+        with open(self.work.path / ".git/info/exclude", "a", encoding="utf-8") as handle:
+            handle.write(".claude-fixer-out/\n.claude-fixer-replies/\n")
+        if merge:
+            self.work.git("merge", "--no-ff", "--no-commit", self.base, check=False)
+        self.mode = mode
+        return self.work
+
+    def helper_config(self, restored=False):
+        return {"repo": REPO, "number": "7", "base": self.head, "ref": "fix", "mode": self.mode, "restored": restored}
+
+    def intent(self, message="fix: change\n", op="commit", restored=False):
+        os.chdir(self.work.path)
+        try:
+            with patch.dict(os.environ, git_env(), clear=True):
+                Path(".claude-fixer-replies").mkdir(exist_ok=True)
+                Path(".claude-fixer-replies/m.txt").write_text(message)
+                args = ["commit", ".claude-fixer-replies/m.txt"] if op == "commit" else ["merge-abort"]
+                return o.model_api(self.helper_config(restored), args)
+        finally:
+            os.chdir(self.cwd)
+
+    def package(self, restored=False):
+        self.artifact = self.root / "artifact"
+        shutil.rmtree(self.artifact, ignore_errors=True)
+        self.artifact.mkdir()
+        os.chdir(self.work.path)
+        try:
+            with patch.dict(os.environ, git_env(), clear=True):
+                self.status = o.snapshot(self.artifact, shutil.which("git"), self.helper_config(restored))
+        finally:
+            os.chdir(self.cwd)
+        return self.status
+
+    def records(self):
+        return parse_records((self.artifact / "snapshot.manifest").read_bytes())
+
+    def write_records(self, records, blobs=()):
+        (self.artifact / "snapshot.manifest").write_bytes(manifest(records))
+        for oid, data in dict(blobs).items():
+            (self.artifact / "blobs").mkdir(exist_ok=True)
+            (self.artifact / "blobs" / oid).write_bytes(data)
+
+    def runner(self, args, env=None, **kwargs):
+        self.argv.append(list(args))
+        self.envs.append(dict(env or {}))
+        return subprocess.run(args, env=env, check=False, **kwargs)
+
+    def remote_head(self):
+        return self.remote_git("rev-parse", "refs/heads/fix").decode().strip()
+
+    def remote_git(self, *args):
+        return subprocess.run([self.git_bin, "--git-dir", str(self.remote), *args], env=self.clean_env,
+                              capture_output=True, check=True).stdout
+
+    def publish(self, records=(), event="workflow_dispatch", status=None, labels=(), **extra):
+        state = Path(tempfile.mkdtemp(dir=self.root))
+        artifact = getattr(self, "artifact", self.root / "none")
+        (artifact / "outbox.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records)) if records else None
+        env = {"REPO": REPO, "PR_NUMBER": "7", "HEAD_REF": "fix", "HEAD_SHA": self.head, "WRITER_MODE": self.mode,
+               "BASE_SHA": self.base if self.mode == "conflict" else "", "BASE_REF": "main" if self.mode == "conflict" else "",
+               "RECEIPT_CONTEXT": json.dumps(extra.pop("context", [])), "ARTIFACT_DIR": str(artifact),
+               "PUBLISH_STATE_DIR": str(state), "MODEL_OUTCOME": "success",
+               "PACKAGE_STATUS": status or getattr(self, "status", "unchanged"), "PREPARED_RUN_ATTEMPT": "1",
+               "GITHUB_RUN_ATTEMPT": "1", "GH_TOKEN": "gh-job-token", "GITHUB_EVENT_NAME": event,
+               "RUNNER_TEMP": str(self.root), **extra}
+        result = type("Result", (), {})()
+        result.writes, result.audits, result.lines, result.minted, result.revoked = [], [], [], 0, []
+        targets = {11: {"id": 11, "in_reply_to_id": None, "pull_request_url": f"https://api.github.com/repos/{REPO}/pulls/7"}}
+
+        def read(path):
+            if "/pulls/comments/" in path:
+                return targets[int(path.rsplit("/", 1)[1])]
+            if "/compare/" in path:
+                return {"status": "ahead"}
+            if "comments?" in path:
+                return []
+            return pr(self.remote_head(), labels)
+
+        def mint(_env):
+            result.minted += 1
+            return TOKEN
+
+        def http(method, url, token=None, body=None, timeout=20):
+            result.writes.append((method, url, token, body))
+            return 201, {}
+        deps = {"read": read, "out": result.lines.append, "mint": mint, "http": http,
+                "revoke": lambda token: result.revoked.append(token) or True,
+                "repo": lambda tmp: p.FreshRepo(tmp, runner=self.runner), "sleep": lambda _s: None,
+                "consumer": receipts, "post": lambda config, body: result.audits.append(body)}
+        before = self.remote_head()
+        self.argv.clear()
+        self.envs.clear()
+        result.code = p.main(env, deps)
+        result.pushed = self.remote_head() if self.remote_head() != before else ""
+        result.audit = result.audits[0]
+        return result
+
+    def git_calls(self, *names):
+        return [a for a in self.argv if any(n in a for n in names)]
+
+    def assert_nothing_built_or_published(self, result):
+        self.assertEqual((result.pushed, result.writes, result.minted), ("", [], 0))
+        self.assertEqual(self.git_calls("hash-object", "update-index", "write-tree", "commit-tree", "push"), [])
+        self.assertEqual([a for a in self.argv if a[-2:-1] == ["blob"] and "cat-file" in a], [])  # no credential scan
+
+
+
+@POSIX
+class DeferredCommitFlow(FlowCase):
+    """B' end to end (design v4.3 section 8)."""
+
+    # -- 8.11 / 8.4 / 8.9: the happy path yields exactly the snapshot tree ---------
+
+    def test_commit_intent_builds_exactly_the_snapshot_tree_with_pinned_identity_and_trusted_parent(self):
+        work = self.model("mention")
+        work.write("app/a.py", "a = 2\n")
+        work.write("app/c.py", "c = 1\n")
+        (work.path / "app/b.py").unlink()
+        self.assertEqual(self.intent("fix: a, c and b\n\nbody line\n"), o.COMMIT_RECORDED)
+        self.assertEqual(self.package(), "snapshot")
+        result = self.publish(records=[{"op": "comment", "body": "done in {{CLAUDE_COMMIT_SHA}}"}], event="issue_comment")
+        candidate = result.pushed
+        self.assertRegex(candidate, r"\A[0-9a-f]{40}\Z", result.audit)
+        show = lambda fmt: self.remote_git("show", "-s", f"--format={fmt}", candidate).decode()
+        self.assertEqual(show("%P").strip(), self.head)
+        self.assertEqual(show("%an%x00%ae%x00%cn%x00%ce").strip(), "\0".join(CLAUDE * 2))
+        self.assertEqual(show("%B"), "fix: a, c and b\n\nbody line\n\n")
+        tree = self.remote_git("ls-tree", "-r", candidate).decode()
+        expected = subprocess.run(["git", "-C", str(work.path), "add", "-A", "--dry-run"], capture_output=True)  # noqa
+        self.assertIn("app/c.py", tree)
+        self.assertNotIn("app/b.py", tree)
+        self.assertNotIn(".claude-fixer", tree)
+        self.assertEqual(self.remote_git("show", f"{candidate}:app/a.py"), b"a = 2\n")
+        self.assertIn("100755 blob", [line for line in tree.splitlines() if line.endswith("scripts/run.sh")][0])
+        # 8.11: the token became the verified pushed SHA, after the push.
+        self.assertEqual([w[3]["body"] for w in result.writes], [f"done in {candidate}"])
+        self.assertIn(f"pushed candidate `{candidate}`", result.audit)
+        # 8.9 argv oracle: raw bytes only, never a filtering route; absolute git; no worktree.
+        hashes = self.git_calls("hash-object")
+        self.assertEqual([a[a.index("hash-object"):] for a in hashes], [["hash-object", "-w", "--no-filters", "--stdin"]] * 2)
+        self.assertEqual({a[0] for a in self.argv}, {p.GIT_BIN})
+        for args in self.argv:
+            self.assertFalse([x for x in args if x.startswith(("--path", "--work-tree")) or x in ("add", "checkout")], args)
+            self.assertNotIn(str(self.artifact), " ".join(args))  # no git call is ever pointed at the artifact
+        # Replaces the bundle-era transport test: the only fetches and the push name the recorded remote.
+        url = f"{p.GITHUB_HOST}/{REPO}.git"
+        for args in self.git_calls("fetch", "push"):
+            self.assertEqual([x for x in args if "://" in x], [url], args)
+        self.assertIn("core.attributesFile=" + os.devnull, self.argv[1])
+        for env in self.envs:
+            self.assertEqual(env.get("GIT_ATTR_NOSYSTEM"), "1")
+            self.assertEqual(env.get("GIT_CONFIG_NOSYSTEM"), "1")
+            self.assertEqual(env.get("GIT_CONFIG_GLOBAL"), os.devnull)
+        self.assertEqual(len(self.git_calls("commit-tree")), 1)
+        self.assertIn("--no-gpg-sign", self.git_calls("commit-tree")[0])
+
+    def test_mention_or_fixer_tree_equal_to_head_is_unchanged_without_a_commit(self):
+        for mode in ("mention", "fixer"):
+            with self.subTest(mode=mode):
+                self.model(mode)
+                self.intent()
+                self.assertEqual(self.package(), "snapshot")
+                result = self.publish(records=[{"op": "comment", "body": "no change needed"},
+                                               {"op": "comment", "body": "fixed in {{CLAUDE_COMMIT_SHA}}"}])
+                self.assertEqual(result.pushed, "")
+                self.assertEqual(self.git_calls("commit-tree"), [])
+                self.assertIn("commit intent changed nothing; no candidate", result.audit)
+                # The token record needs a push; the plain one still posts.
+                self.assertEqual([w[3]["body"] for w in result.writes], ["no change needed"])
+                self.assertIn("1 queued write(s) posted, 1 refused", result.audit)
+                shutil.rmtree(self.work.path)
+
+    # -- 8.4: completeness and the restore regression through the publisher ---------
+
+    def test_restored_pr_event_keeps_heads_versions_and_publishes_only_the_model_change(self):
+        work = self.model("mention", head_files={"a.txt": "a\n"})
+        os.chdir(work.path)
+        restore_like_the_action()
+        os.chdir(self.cwd)
+        self.intent(restored=True)
+        self.package(restored=True)
+        result = self.publish(event="issue_comment")
+        self.assertTrue(result.pushed, result.audit)
+        changed = self.remote_git("diff-tree", "-r", "--name-only", "--no-commit-id", self.head, result.pushed).decode().split()
+        self.assertEqual(changed, ["a.txt"])
+        self.assertFalse(self.remote_git("ls-tree", result.pushed, ".ripgreprc").strip())
+
+    def test_non_restored_run_publishes_unprotected_changes_and_refuses_protected_ones(self):
+        # Positive control: .husky/pre-commit and .ripgreprc are real model changes in a dispatch run.
+        work = self.model("fixer", head_files={"a.txt": "a\n"})
+        work.write(".husky/pre-commit", "new\n")
+        work.write(".ripgreprc", "--hidden\n")
+        self.intent()
+        self.package()
+        result = self.publish(event="workflow_dispatch")
+        changed = self.remote_git("diff-tree", "-r", "--name-only", "--no-commit-id", self.head, result.pushed).decode().split()
+        self.assertEqual(changed, [".husky/pre-commit", ".ripgreprc"])
+        for path, text in (("CLAUDE.md", "main\n"), (".claude/settings.json", '{"main": 1}\n')):
+            with self.subTest(path=path):
+                shutil.rmtree(self.work.path)
+                work = self.model("fixer")
+                work.write(path, text)
+                self.intent()
+                self.package()
+                result = self.publish(event="workflow_dispatch")
+                self.assertEqual(result.pushed, "")
+                self.assertIn("refused: candidate changes a protected path; queued writes dropped", result.audit)
+
+    def test_a_forged_restored_entry_or_helper_entry_is_refused_by_the_publisher(self):
+        self.model("mention", head_files={"a.txt": "a\n"})
+        self.intent()
+        self.package(restored=True)
+        good = self.records()
+        forged_blob = b"forged\n"
+        for path, record in (("CLAUDE.md", ("blob", "100644", blob_id(forged_blob), len(forged_blob))),
+                             (".claude/settings.json", ("delete", "000000", "0" * 40, 0)),
+                             (".ripgreprc", ("blob", "100644", blob_id(forged_blob), len(forged_blob))),
+                             (".claude-fixer-out/x", ("blob", "100644", blob_id(forged_blob), len(forged_blob)))):
+            with self.subTest(path=path):
+                shutil.rmtree(self.artifact / "blobs", ignore_errors=True)
+                self.write_records({**good, path: record}, {blob_id(forged_blob): forged_blob})
+                result = self.publish(event="issue_comment")
+                self.assertIn("refused: snapshot changes a restored or helper path; queued writes dropped", result.audit)
+                self.assert_nothing_built_or_published(result)
+        # The same forged CLAUDE.md in a dispatch run (no restore) is a protected model change instead.
+        self.write_records({**good, "CLAUDE.md": ("blob", "100644", blob_id(forged_blob), len(forged_blob))},
+                           {blob_id(forged_blob): forged_blob})
+        self.mode = "fixer"
+        self.assertIn("candidate changes a protected path", self.publish(event="workflow_dispatch").audit)
+
+    def test_a_missing_trusted_path_is_refused_never_a_silent_deletion(self):
+        self.model("fixer")
+        self.work.write("app/a.py", "a = 2\n")
+        self.intent()
+        self.package()
+        records = self.records()
+        del records["app/b.py"]
+        self.write_records(records)
+        result = self.publish()
+        self.assertIn("refused: snapshot misses a trusted path", result.audit)
+        self.assert_nothing_built_or_published(result)
+
+    # -- 8.3: hostile final intents (publisher level) --------------------------------
+
+    def conflict_model(self, resolve=True):
+        work = self.model("conflict", head_files={"app/a.py": "a = 'head'\n"},
+                          base_files={"app/a.py": "a = 'base'\n", "app/base_only.py": "x\n",
+                                      ".github/workflows/ci.yml": "on: [push]\n", "tools/run.sh": "#!/bin/sh\n"},
+                          merge=True)
+        if resolve:
+            work.write("app/a.py", "a = 'both'\n")
+        return work
+
+    def test_hostile_final_intents(self):
+        # Two commit records: failed, before any fetch or build.
+        self.model("fixer")
+        self.work.write("app/a.py", "a = 2\n")
+        self.intent()
+        self.package()
+        (self.artifact / "intent.jsonl").write_text('{"message":"a","op":"commit"}\n{"message":"b","op":"commit"}\n')
+        result = self.publish(records=[{"op": "comment", "body": "x"}])
+        self.assertIn("refused: intent file is malformed or repeats a record; nothing published", result.audit)
+        self.assertEqual((self.argv, result.writes, result.minted), ([], [], 0))
+        # An abort in fixer or mention mode: failed, never aborted.
+        for mode in ("fixer", "mention"):
+            self.mode = mode
+            (self.artifact / "intent.jsonl").write_text('{"op":"abort"}\n')
+            result = self.publish(records=[{"op": "comment", "body": "x"}])
+            self.assertIn("refused: abort intent outside conflict mode; nothing published", result.audit)
+            self.assertEqual((self.argv, result.writes), ([], []))
+        # Conflict: abort plus an invalid manifest fails; abort plus a valid snapshot aborts.
+        shutil.rmtree(self.work.path)
+        self.conflict_model()
+        self.intent()
+        self.intent(op="abort")
+        self.package()
+        good = (self.artifact / "snapshot.manifest").read_bytes()
+        (self.artifact / "snapshot.manifest").write_bytes(good + b"ref\0100644\0zz\0")
+        records = [{"op": "comment", "body": "needs a human"}, {"op": "label", "label": "needs-decision"},
+                   {"op": "reply", "comment_id": 11, "body": "x"}, {"op": "comment", "body": "{{CLAUDE_COMMIT_SHA}}"}]
+        result = self.publish(records=records)
+        self.assertIn("refused: snapshot manifest is malformed; queued writes dropped", result.audit)
+        self.assert_nothing_built_or_published(result)
+        (self.artifact / "snapshot.manifest").write_bytes(good)
+        result = self.publish(records=records)
+        self.assertIn("merge abort requested; no candidate", result.audit)
+        self.assertEqual(result.pushed, "")
+        self.assertEqual([(w[1].rsplit("/7/", 1)[1], w[3]) for w in result.writes],
+                         [("comments", {"body": "needs a human"}), ("labels", {"labels": ["needs-decision"]})])
+        self.assertIn("2 queued write(s) posted, 2 refused", result.audit)
+        self.assertEqual(self.git_calls("hash-object", "commit-tree", "push"), [])
+
+    # -- 8.10: conflict mode ----------------------------------------------------------
+
+    def test_conflict_commit_builds_the_ordered_merge_and_keeps_inherited_base_changes(self):
+        self.conflict_model()
+        self.intent("Merge main\n")
+        self.package()
+        result = self.publish(records=[{"op": "comment", "body": "merged as {{CLAUDE_COMMIT_SHA}}"}])
+        self.assertTrue(result.pushed, result.audit)
+        parents = self.remote_git("show", "-s", "--format=%P", result.pushed).decode().split()
+        self.assertEqual(parents, [self.head, self.base])
+        # Inherited protected and executable base changes are kept and are not model changes.
+        self.assertEqual(self.remote_git("show", f"{result.pushed}:.github/workflows/ci.yml"), b"on: [push]\n")
+        self.assertEqual(self.remote_git("show", f"{result.pushed}:app/a.py"), b"a = 'both'\n")
+        self.assertEqual([w[3]["body"] for w in result.writes], [f"merged as {result.pushed}"])
+
+    def test_conflict_commit_equal_to_a_clean_auto_merge_still_builds_the_merge(self):
+        self.model("conflict", base_files={"app/base_only.py": "x\n"}, head_files={"app/head_only.py": "y\n"}, merge=True)
+        self.intent("Merge main\n")
+        self.package()
+        result = self.publish()
+        self.assertTrue(result.pushed, result.audit)
+        self.assertEqual(self.remote_git("show", "-s", "--format=%P", result.pushed).decode().split(), [self.head, self.base])
+        auto = self.remote_git("merge-tree", "--write-tree", self.head, self.base).decode().split()[0]
+        self.assertEqual(self.remote_git("rev-parse", result.pushed + "^{tree}").decode().strip(), auto)
+        # No intent: unchanged, nothing built, nothing minted.
+        shutil.rmtree(self.work.path)
+        self.model("conflict", merge=True)
+        self.assertEqual(self.package(), "unchanged")
+        result = self.publish(records=[{"op": "comment", "body": "x"}])
+        self.assertEqual((result.pushed, self.git_calls("fetch")), ("", []))
+        self.assertIn("1 queued write(s) posted", result.audit)
+
+    def test_conflict_candidate_equal_to_a_conflicted_auto_merge_is_refused_by_the_marker_check(self):
+        work = self.conflict_model(resolve=False)
+        # A hostile model skips the helper's advisory marker check and writes the intent itself.
+        (work.path / ".claude-fixer-out").mkdir(exist_ok=True)
+        (work.path / ".claude-fixer-out/intent.jsonl").write_text('{"message":"Merge main","op":"commit"}\n')
+        self.package()
+        repo = p.FreshRepo(tempfile.mkdtemp(dir=self.root))
+        repo.run_git(["fetch", "-q", str(self.remote), self.head, self.base])
+        auto = p.auto_merge(repo, self.head, self.base)[0]
+        sizes = {oid: size for oid, size in (line.split() for line in repo.run_git(
+            ["cat-file", "--batch-check=%(objectname) %(objectsize)"],
+            input="".join(v[1] + "\n" for v in p.tree_entries(repo, auto).values()).encode()).decode().splitlines())}
+        self.write_records({path: ("ref", mode, oid, int(sizes[oid])) for path, (mode, oid) in p.tree_entries(repo, auto).items()})
+        shutil.rmtree(self.artifact / "blobs")
+        result = self.publish()
+        self.assertIn("refused: conflict markers remain in the candidate; queued writes dropped", result.audit)
+        self.assertEqual((result.pushed, result.minted), ("", 0))
+
+    def test_conflict_model_change_to_a_protected_path_and_parents_from_trusted_context_only(self):
+        work = self.conflict_model()
+        work.write("AGENTS.md", "model edit\n")
+        self.intent()
+        self.package()
+        self.assertIn("candidate changes a protected path", self.publish().audit)
+        # The artifact cannot choose parents: nothing in it names one, and a swapped BASE env is refused.
+        self.assertFalse([r for r in self.records().values() if r[2] in (self.head, self.base)])
+
+    # -- 8.5 (a)-(g): normalization and the new-byte budget -----------------------------
+
+    def big_base(self):
+        big = {"data/one.bin": "1" * 3_000_000, "data/two.bin": "2" * 3_000_000}
+        work = self.model("conflict", base_files=big, head_files={"app/head_only.py": "y\n"}, merge=True)
+        return work, {path: blob_id(text.encode()) for path, text in big.items()}
+
+    def test_5a_5f_inherited_large_base_content_passes_as_ref_or_as_normalized_blob(self):
+        self.big_base()
+        self.intent("Merge main\n")
+        self.package()
+        records = self.records()
+        self.assertEqual(sum(r[3] for path, r in records.items() if path.startswith("data/")), 6_000_000)
+        self.assertGreater(6_000_000, p.MAX_DIFF_BYTES)
+        as_ref = self.publish()
+        self.assertTrue(as_ref.pushed, as_ref.audit)
+        ref_tree = self.remote_git("rev-parse", as_ref.pushed + "^{tree}")
+        # Ship the same inherited content as `blob` records whose files hold DIFFERENT bytes: never read.
+        self.push_src()
+        shipped = {path: ("blob",) + r[1:] if path.startswith("data/") else r for path, r in records.items()}
+        self.write_records(shipped, {r[2]: b"tampered" for path, r in records.items() if path.startswith("data/")})
+        opens = Opens(self)
+        as_blob = self.publish()
+        self.assertTrue(as_blob.pushed, as_blob.audit)
+        self.assertEqual(self.remote_git("rev-parse", as_blob.pushed + "^{tree}"), ref_tree)
+        self.assertEqual(opens.blob_opens(), [])
+        self.assertEqual(opens.read, [])
+        self.assertEqual([a for a in self.git_calls("hash-object")], [])
+
+    def test_5b_5c_5g_new_bytes_are_budgeted_once_per_oid_before_any_blob_open(self):
+        self.model("conflict", base_files={"data/inherited.txt": "i" * 1500}, merge=True)
+        self.work.write("app/new1.py", "1" * 600)
+        self.work.write("app/same1.py", "s" * 300)
+        self.work.write("app/same2.py", "s" * 300)  # the same oid at two paths counts once
+        self.intent()
+        self.package()
+        with patch.object(p, "MAX_DIFF_BYTES", 1000):
+            # (c) inherited content above the bound plus new bytes under it passes.
+            result = self.publish()
+            self.assertTrue(result.pushed, result.audit)
+            # (b)/(c) one more new blob pushes the new total over: failed at P1, before any blob open.
+            self.push_src()
+            extra = b"9" * 200
+            records = self.records()
+            records["app/new2.py"] = ("blob", "100644", blob_id(extra), len(extra))
+            self.write_records(records, {blob_id(extra): extra})
+            opens = Opens(self)
+            result = self.publish()
+            self.assertIn("refused: snapshot blobs too large; queued writes dropped", result.audit)
+            self.assertEqual(opens.blob_opens(), [])
+            self.assert_nothing_built_or_published(result)
+            # (g) a repeated oid with a different declared size fails.
+            records = self.records()
+            records["app/new2.py"] = ("blob", "100644", records["app/same1.py"][2], 301)
+            self.write_records(records)
+            self.assertIn("refused: snapshot blob sizes disagree", self.publish().audit)
+
+    def test_5d_5e_trusted_ids_need_their_true_size_and_untrusted_ids_are_never_normalized(self):
+        self.model("fixer", head_files={"app/a.py": "a = 'second'\n"})
+        old = blob_id(b"a = 1\n")  # in fetched history only (the first commit), not the recorded head
+        self.work.write("app/z.py", "z\n")
+        self.intent()
+        self.package()
+        records = self.records()
+        trusted = records["app/b.py"]
+        for record, reason in ((("blob",) + trusted[1:3] + (trusted[3] + 1,), "wrong type or size"),
+                               (("ref",) + trusted[1:3] + (trusted[3] + 1,), "wrong type or size"),
+                               (("ref", "100644", old, 6), "not a trusted blob"),
+                               (("ref", "100644", blob_id(b"planted by the model\n"), 21), "not a trusted blob"),
+                               (("ref", "100644", self.head, 1), "not a trusted blob")):
+            with self.subTest(record=record):
+                self.write_records({**records, "app/b.py": record})
+                opens = Opens(self)
+                result = self.publish()
+                self.assertIn(reason, result.audit)
+                self.assertEqual(opens.blob_opens(), [])
+                self.assert_nothing_built_or_published(result)
+        # (e) A `blob` naming a history-only id is not normalized: it needs verified bytes and counts.
+        self.write_records({**records, "app/c.py": ("blob", "100644", old, 6)})
+        self.assertIn("refused: snapshot blob is not a regular file of its size", self.publish().audit)
+        self.write_records({**records, "app/c.py": ("blob", "100644", old, 6)}, {old: b"a = 1\n"})
+        with patch.object(p, "MAX_DIFF_BYTES", 7):
+            self.assertIn("snapshot blobs too large", self.publish().audit)
+        result = self.publish()
+        self.assertTrue(result.pushed, result.audit)
+        self.assertEqual(self.remote_git("show", f"{result.pushed}:app/c.py"), b"a = 1\n")
+
+    # -- 8.5 P3 through main(): a hash mismatch builds and publishes nothing ---------------
+
+    def test_p3_hash_mismatch_fails_before_construction_credentials_mint_push_or_writes(self):
+        self.model("fixer")
+        self.work.write("app/a.py", "a = 2\n")
+        self.intent()
+        self.package()
+        oid = self.records()["app/a.py"][2]
+        (self.artifact / "blobs" / oid).write_bytes(b"a = 3\n")  # same size, other bytes
+        result = self.publish(records=[{"op": "comment", "body": "x"}])
+        self.assertIn("refused: snapshot blob does not match its id; queued writes dropped", result.audit)
+        self.assert_nothing_built_or_published(result)
+
+    # -- 8.8: filter, driver and hook negatives through main(), each with a positive control ----
+
+    def test_planted_filters_drivers_and_hooks_never_run_and_raw_bytes_are_kept(self):
+        marker = self.root / "planted-ran"
+        evil = str(self.root / "evil")  # git config treats `;` as a comment, so the planted program is a script
+        Path(evil).write_text(f"#!/bin/sh\ntouch {marker}\ncat\n")
+        Path(evil).chmod(0o755)
+        config = (f'[filter "evil"]\n\tclean = {evil}\n\tsmudge = {evil}\n'
+                  f'[diff "evil"]\n\ttextconv = {evil}\n\tcommand = {evil}\n[merge "evil"]\n\tdriver = {evil}\n'
+                  f'[core]\n\tfsmonitor = {evil}\n\tsshCommand = {evil}\n\thooksPath = {self.root}/hooks\n')
+        hooks = self.root / "hooks"
+        hooks.mkdir()
+        for hook in ("pre-commit", "post-commit", "pre-push", "post-checkout", "reference-transaction"):
+            (hooks / hook).write_text(f"#!/bin/sh\ntouch {marker}\n")
+            (hooks / hook).chmod(0o755)
+        system = self.root / "system.gitconfig"
+        system.write_text(config)
+        home = self.root / "home"
+        (home / ".config/git").mkdir(parents=True)
+        (home / ".gitconfig").write_text(config)
+        (home / ".config/git/attributes").write_text("* filter=evil diff=evil merge=evil\n")
+        shadow = self.root / "shadow"
+        shadow.mkdir()
+        (shadow / "git").write_text(f"#!/bin/sh\ntouch {marker}\nexec {shutil.which('git')} \"$@\"\n")
+        (shadow / "git").chmod(0o755)
+        # The inherited (unchanged) .gitattributes in HEAD names the planted drivers for every path.
+        work = self.model("fixer", head_files={".gitattributes": "* filter=evil diff=evil merge=evil ident eol=crlf\n"})
+        # The checkout applied eol/ident to the worktree; put HEAD's raw bytes back, so only app/raw.txt is a change
+        # (the snapshot hashes raw bytes: an attribute-converted checkout would read as model edits).
+        for path in work.git("ls-files", "-z").split("\0"):
+            if path:
+                (work.path / path).write_bytes(subprocess.run(["git", "-C", str(work.path), "cat-file", "blob",
+                                                                f"HEAD:{path}"], capture_output=True, check=True).stdout)
+        raw = b"x\r\n$Id: deadbeef $\nlf only\n"
+        (work.path / "app/raw.txt").write_bytes(raw)
+        self.intent()
+        self.package()
+        planted = {"GIT_CONFIG_SYSTEM": str(system), "GIT_CONFIG_NOSYSTEM": "", "HOME": str(home),
+                   "XDG_CONFIG_HOME": str(home / ".config"), "GIT_CONFIG_GLOBAL": str(home / ".gitconfig"),
+                   "GIT_CONFIG_PARAMETERS": f"'filter.evil.clean'='{evil}'", "GIT_CONFIG_COUNT": "1",
+                   "GIT_CONFIG_KEY_0": "core.hooksPath", "GIT_CONFIG_VALUE_0": str(hooks),
+                   "GIT_EXEC_PATH": str(shadow), "GIT_ATTR_SOURCE": "HEAD",
+                   "PATH": f"{shadow}{os.pathsep}{os.environ['PATH']}"}
+        # Positive controls: each planted source runs through a route that runs it.
+        controls = {"system": {"GIT_CONFIG_SYSTEM": str(system)}, "global": {"HOME": str(home)},
+                    "parameters": {"GIT_CONFIG_PARAMETERS": f"'filter.evil.clean'='{evil}'"},
+                    "count": {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "filter.evil.clean", "GIT_CONFIG_VALUE_0": evil}}
+        for name, extra in controls.items():
+            with self.subTest(control=name):
+                marker.unlink(missing_ok=True)
+                env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+                subprocess.run([shutil.which("git"), "-C", str(work.path), "hash-object", "--path=app/raw.txt", "--stdin"],
+                               input=raw, env={**env, **extra}, capture_output=True, check=False)
+                self.assertTrue(marker.exists(), name)
+        marker.unlink(missing_ok=True)
+        subprocess.run(["git", "--version"], env={**os.environ, "PATH": planted["PATH"]}, capture_output=True, check=True)
+        self.assertTrue(marker.exists(), "shadow git")
+        marker.unlink()
+        with patch.dict(os.environ, planted):
+            result = self.publish()
+        self.assertTrue(result.pushed, result.audit)
+        self.assertFalse(marker.exists())
+        self.assertEqual(self.remote_git("show", f"{result.pushed}:app/raw.txt"), raw)
+        for env in self.envs:
+            for key in ("GIT_CONFIG_SYSTEM", "GIT_CONFIG_PARAMETERS", "GIT_EXEC_PATH", "GIT_ATTR_SOURCE", "XDG_CONFIG_HOME"):
+                self.assertNotIn(key, env)
+            self.assertNotEqual(env.get("HOME"), str(home))
+            if "GIT_CONFIG_COUNT" in env:  # only the publisher's own extraheader, and only with a token
+                self.assertEqual(env["GIT_CONFIG_KEY_0"], f"http.{p.GITHUB_HOST}/.extraheader")
+
+    def test_a_newly_model_edited_gitattributes_is_refused_as_protected(self):
+        work = self.model("fixer")
+        work.write(".gitattributes", "* filter=evil\n")
+        self.intent()
+        self.package()
+        result = self.publish()
+        self.assertIn("refused: candidate changes a protected path", result.audit)
+        self.assertEqual(result.pushed, "")
+
+    # -- 8.11: the receipt bytes and the rendered bound --------------------------------------
+
+    def test_addressed_receipt_bytes_are_unchanged_and_the_rendered_bound_is_rechecked(self):
+        self.model("fixer")
+        self.work.write("app/a.py", "a = 2\n")
+        self.intent()
+        self.package()
+        item = v3_item(11, base=self.head)
+        long = "x" * (p.MAX_BODY - len(p.SHA_TOKEN)) + p.SHA_TOKEN
+        result = self.publish(context=[item], records=[{"op": "receipt", "root": 11, "status": "addressed"},
+                                                       {"op": "comment", "body": long}])
+        sha = result.pushed
+        self.assertTrue(sha, result.audit)
+        data = {"v": 3, "generation": GEN, "observation": OBS, "root": 11, "fingerprint": FP, "status": "addressed",
+                "base": self.head, "commit": sha}
+        self.assertEqual(result.writes[0][3]["body"], receipts.marker("result", data)
+                         + f"\nWorkflow-verified result: addressed by pushed commit `{sha}`.")
+        self.assertEqual(len(result.writes), 1)  # the over-bound rendered comment is refused
+        self.assertIn("1 queued write(s) posted, 1 refused", result.audit)
+
+    def test_git_older_than_2_40_fails_closed(self):
+        self.model("fixer")
+        self.work.write("app/a.py", "a = 2\n")
+        self.intent()
+        self.package()
+        real = p.FreshRepo.text
+        with patch.object(p.FreshRepo, "text", lambda repo, *a, **k: "git version 2.39.5" if a == ("version",)
+                          else real(repo, *a, **k)):
+            result = self.publish()
+        self.assertIn("refused: git 2.40 or later is required", result.audit)
+        self.assert_nothing_built_or_published(result)
+
+
+@POSIX
+class IntakePhaseTests(FlowCase):
+    """P1 and P2 refusals, each before any blob open (P1) or any content read (P2)."""
+
+    def setUp(self):
+        super().setUp()
+        self.model("fixer")
+        self.work.write("app/a.py", "a = 2\n")
+        self.work.write("app/new.py", "new\n")
+        self.intent()
+        self.package()
+        self.good = self.records()
+        self.new = self.good["app/new.py"]
+        self.data = {self.new[2]: b"new\n", self.good["app/a.py"][2]: b"a = 2\n"}
+
+    def refused_before_open(self, records, reason, raw=None):
+        if raw is not None:
+            (self.artifact / "snapshot.manifest").write_bytes(raw)
+        else:
+            self.write_records(records)
+        opens = Opens(self)
+        result = self.publish()
+        self.assertRegex(result.audit, f"refused: {reason}; queued writes dropped")
+        self.assertEqual(opens.blob_opens(), [])
+        self.assertFalse(opens.blobs_dir_opened())
+        self.assertEqual(opens.read, [])
+        self.assert_nothing_built_or_published(result)
+
+    def test_p1_grammar_paths_and_canonical_deletes(self):
+        zero = "0" * 40
+        bad = {"op": ("copy", "100644", self.new[2], 4), "gitlink": ("ref", "160000", self.head, 0),
+               "mode": ("blob", "100664", self.new[2], 4), "short oid": ("blob", "100644", self.new[2][:39], 4),
+               "upper oid": ("blob", "100644", self.new[2].upper(), 4), "size": ("blob", "100644", self.new[2], "04"),
+               "delete mode": ("delete", "100644", zero, 0), "delete oid": ("delete", "000000", self.new[2], 0),
+               "delete size": ("delete", "000000", zero, 4), "delete 64": ("delete", "000000", "0" * 64, 0)}
+        for name, record in bad.items():
+            with self.subTest(case=name):
+                self.refused_before_open({**self.good, "app/x.py": record}, "snapshot record is malformed")
+        for path in ("../x", "a/../x", "./x", "a//x", "/abs", "a\\b", ".git/config", "a/.GIT/x", "a/", "x" * 4097):
+            with self.subTest(path=path):
+                self.refused_before_open({**self.good, path: self.new}, "snapshot path is not permitted")
+        raw = manifest(self.good)
+        for name, broken in (("trailing", raw[:-1]), ("fields", raw + b"blob\0"), ("utf8", raw.replace(b"app/new.py", b"app/\xffnew"))):
+            with self.subTest(raw=name):
+                self.refused_before_open(None, "snapshot (manifest|record) is malformed", raw=broken)
+
+    def test_p1_duplicates_collisions_and_counts(self):
+        raw = manifest(self.good) + manifest({"app/new.py": self.new})
+        self.refused_before_open(None, "snapshot path is duplicated", raw=raw)
+        for extra in ({"App/New.py": self.new}, {"app/new.py/x": self.new}, {"APP/new.py/x": self.new}):
+            with self.subTest(extra=extra):
+                self.refused_before_open({**self.good, **extra}, "snapshot paths collide")
+        with patch.object(p, "MAX_PATHS", 1):
+            self.refused_before_open({**self.good, "app/x1.py": self.new, "app/x2.py": self.new},
+                                     "snapshot has too many records")
+
+    def test_a1_live_tree_collisions_duplicates_and_untrusted_deletes_are_refused(self):
+        delete = ("delete", "000000", "0" * 40, 0)
+        self.refused_before_open({**self.good, "app/zzz.py": delete}, "snapshot deletes an untrusted path")
+        # A delete plus a live record for one path is an exact duplicate across all records.
+        raw = manifest(self.good) + manifest({"app/b.py": delete})
+        self.refused_before_open(None, "snapshot path is duplicated", raw=raw)
+        # Live-tree prefix and case-fold collisions (both live) stay refused.
+        self.refused_before_open({**self.good, "app/new.py/x": self.new}, "snapshot paths collide")
+        self.refused_before_open({**self.good, "APP/NEW.PY": self.new}, "snapshot paths collide")
+
+    def test_p2_file_types_before_any_content_read(self):
+        def refused(setup, reason="snapshot blob is not a regular file of its size"):
+            shutil.rmtree(self.artifact / "blobs", ignore_errors=True)
+            (self.artifact / "blobs").unlink(missing_ok=True)
+            self.write_records(self.good)
+            setup(self.artifact / "blobs")
+            opens = Opens(self)
+            result = self.publish()
+            self.assertIn(f"refused: {reason}", result.audit)
+            self.assertEqual(opens.read, [])
+            self.assert_nothing_built_or_published(result)
+        new, a = self.new[2], self.good["app/a.py"][2]
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        for oid, data in self.data.items():
+            (elsewhere / oid).write_bytes(data)
+
+        def write(blobs, **files):
+            blobs.mkdir(exist_ok=True)
+            for oid, data in self.data.items():
+                (blobs / oid).write_bytes(data)
+            for name, kind in files.items():
+                target = blobs / name
+                target.unlink(missing_ok=True)
+                {"symlink": lambda: target.symlink_to(elsewhere / name), "fifo": lambda: os.mkfifo(target),
+                 "dir": lambda: target.mkdir(), "short": lambda: target.write_bytes(b"ne"),
+                 "extra": lambda: target.write_bytes(b"x")}[kind]()
+        for name, setup, reason in (
+                ("blobs symlink", lambda b: b.symlink_to(elsewhere), None),
+                ("blobs file", lambda b: b.write_bytes(b"x"), None),
+                ("blobs missing", lambda b: None, "snapshot blobs directory is missing"),
+                ("blob symlink", lambda b: write(b, **{new: "symlink"}), None),
+                ("blob fifo", lambda b: write(b, **{new: "fifo"}), None),
+                ("blob dir", lambda b: write(b, **{new: "dir"}), None),
+                ("blob size", lambda b: write(b, **{new: "short"}), None),
+                ("unexpected entry", lambda b: write(b, **{"f" * 40: "extra"}), "snapshot has an unexpected blob file"),
+                ("unexpected name", lambda b: write(b, **{"notes.txt": "extra"}), "snapshot has an unexpected blob file")):
+            with self.subTest(case=name):
+                refused(setup, reason or "snapshot blob is not a regular file of its size")
+        self.assertIn(a, self.data)
+
+    def test_p2_uses_nofollow_directory_descriptors(self):
+        opens = Opens(self)
+        self.assertTrue(self.publish().pushed)
+        flags = {path: flags for path, _at, flags in opens.opened}
+        directory = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        self.assertEqual(flags[str(self.artifact)] & directory, directory)
+        self.assertEqual(flags[p.BLOBS_DIR] & directory, directory)
+        for oid in (self.new[2], self.good["app/a.py"][2]):
+            self.assertEqual(flags[oid] & (os.O_NOFOLLOW | os.O_NONBLOCK), os.O_NOFOLLOW | os.O_NONBLOCK)
+
+
+class LateMarkerTests(unittest.TestCase):
+    """Section 5 ported from the helper: every source, git's atoi(), the bound and encodings."""
+
+    class Repo:
+        def __init__(self, attrs, content="x\n<<<<<<< HEAD\n"):
+            self.attrs, self.content, self.calls = attrs, content, []
+
+        def run_git(self, args, **kwargs):
+            self.calls.append(args)
+            if args[0] == "merge-tree":
+                return (b"e" * 40 + b"\0a\0b\0\0", 1)
+            if args[0] == "ls-tree":
+                return b"100644 blob " + b"1" * 40 + b"\ta\x00100644 blob " + b"2" * 40 + b"\tb\x00"
+            if args[0] == "check-attr":
+                source = args[2].split("=", 1)[1]
+                return "".join(f"{n}\0conflict-marker-size\0{self.attrs[source][n]}\0{n}\0working-tree-encoding\0"
+                               f"{self.attrs.get('enc', {}).get(source, 'unspecified')}\0" for n in ("a", "b")).encode()
+            if args[0] == "cat-file":  # path a carries the content under test; b is clean
+                return self.content.encode() if args[-1] == "1" * 40 else b"ok\n"
+            raise AssertionError(args)
+
+    CONFIG = {"mode": "conflict", "base": "h" * 40, "merge_base": "m" * 40}
+
+    def check(self, attrs, content="ok\n"):
+        repo = self.Repo(attrs, content)
+        p.check_markers(repo, self.CONFIG, "c" * 40)
+        return repo
+
+    def test_sizes_come_from_candidate_head_and_base_and_parse_like_git(self):
+        attrs = {"c" * 40: {"a": "12abc", "b": "unspecified"}, "h" * 40: {"a": "-3", "b": "set"},
+                 "m" * 40: {"a": "0", "b": " 4"}}
+        repo = self.check(attrs)
+        self.assertEqual([c[:3] for c in repo.calls if c[0] == "check-attr"],
+                         [["check-attr", "-z", f"--source={s}"] for s in ("c" * 40, "h" * 40, "m" * 40)])
+        for content, refused in (("<" * 12 + " x\n", True), ("<" * 7 + " x\n", True), ("<" * 6 + " x\n", False),
+                                 ("=" * 12 + "\n", True), ("=" * 4 + "\n", False), ("=" * 8 + "\n", False)):
+            with self.subTest(content=content):
+                if refused:
+                    with self.assertRaisesRegex(p.Refused, "^conflict markers remain in the candidate$"):
+                        self.check(attrs, content)
+                else:
+                    self.check(attrs, content)
+        # Each source alone sets a size the others do not.
+        for source in ("c" * 40, "h" * 40, "m" * 40):
+            with self.subTest(source=source):
+                one = {s: {"a": "20" if s == source else "unspecified", "b": "unspecified"} for s in attrs}
+                with self.assertRaises(p.Refused):
+                    self.check(one, "=" * 20 + "\n")
+
+    def test_bound_encoding_and_mode(self):
+        base = {s: {"a": "unspecified", "b": "unspecified"} for s in ("c" * 40, "h" * 40, "m" * 40)}
+        self.check(base)  # the default
+        with self.assertRaisesRegex(p.Refused, "unsupported conflict-marker-size"):
+            self.check({**base, "h" * 40: {"a": "1001", "b": "1"}})
+        self.check({**base, "h" * 40: {"a": "1000", "b": "1"}})
+        for source in base:
+            with self.subTest(source=source), self.assertRaisesRegex(p.Refused, "working-tree-encoding"):
+                self.check({**base, "enc": {source: "UTF-16"}})
+        repo = self.Repo(base)
+        p.check_markers(repo, dict(self.CONFIG, mode="fixer"), "c" * 40)
+        self.assertEqual(repo.calls, [])
+
+
+@POSIX
+class LateMarkerGitTests(FlowCase):
+    def write_intent(self):
+        (self.work.path / ".claude-fixer-out").mkdir(exist_ok=True)
+        (self.work.path / ".claude-fixer-out/intent.jsonl").write_text('{"message":"m","op":"commit"}\n')
+
+    def test_conflict_marker_size_attributes_from_base_still_find_leftover_markers(self):
+        # Ported from the helper: size-10 and size-3 markers from the attributes git merged with. A raised size in
+        # the candidate's own .gitattributes is a protected model change (refused first); LateMarkerTests covers
+        # each source alone.
+        attrs = "*.txt conflict-marker-size=10\nb.md conflict-marker-size=3\n"
+        self.src.git("checkout", "-q", "main")
+        ancestor = self.src.commit({".gitattributes": attrs, "a.txt": "main\n", "b.md": "main\n"})
+        self.src.git("checkout", "-q", "-B", "fix", ancestor)
+        work = self.model("conflict", base_files={"a.txt": "base\n", "b.md": "base\n"},
+                          head_files={"a.txt": "head\n", "b.md": "head\n"}, merge=True)
+        conflicted = {name: (work.path / name).read_text() for name in ("a.txt", "b.md")}
+        self.assertTrue(conflicted["a.txt"].startswith("<" * 10 + " HEAD\n"))
+        self.assertTrue(conflicted["b.md"].startswith("<<< HEAD\n"))
+        for leftover in ("a.txt", "b.md", None):
+            with self.subTest(leftover=leftover):
+                for name in ("a.txt", "b.md"):
+                    work.write(name, conflicted[name] if name == leftover else "head\n" + "=" * 9 + "\nside\n")
+                self.write_intent()
+                self.package()
+                result = self.publish()
+                if leftover:
+                    self.assertIn("refused: conflict markers remain in the candidate", result.audit)
+                else:  # a 9-long `=` run is no size-7, -10 or -3 separator
+                    self.assertTrue(result.pushed, result.audit.split("Publisher: ")[-1][:200])
+
+    def test_a_utf16_conflicted_path_is_refused(self):
+        self.src.git("checkout", "-q", "main")
+        Path(self.src.path / ".gitattributes").write_text("u16.txt working-tree-encoding=UTF-16\n")
+        Path(self.src.path / "u16.txt").write_text("base\n", encoding="utf-16")
+        self.base = self.src.commit(message="base u16")
+        self.src.git("checkout", "-q", "fix")
+        Path(self.src.path / "u16.txt").write_text("head\n")
+        self.head = self.src.commit(message="head u16")
+        work = self.model("conflict", merge=True)
+        work.write("u16.txt", "head\nside\n")
+        self.write_intent()
+        self.package()
+        self.assertIn("refused: conflicted path has a working-tree-encoding", self.publish().audit)
+
+@POSIX
+class AmendmentA1Tests(FlowCase):
+    """Founder-approved amendment A1 (receipt e4437522): worktree modes and live-tree collisions."""
+
+    def run_fixer(self, change, event="workflow_dispatch", restored=False, head_files=None):
+        if hasattr(self, "work"):
+            shutil.rmtree(self.work.path)
+        work = self.model("mention" if restored else "fixer", head_files=head_files)
+        change(work)
+        self.intent(restored=restored)
+        self.package(restored=restored)
+        return self.publish(event=event)
+
+    def entries(self, commit):
+        return {line.split("\t")[1]: line.split(" ")[0]
+                for line in self.remote_git("ls-tree", "-r", commit).decode().splitlines()}
+
+    def test_mode_only_changes_follow_the_worktree_mode_into_check_entries(self):
+        # 755 -> 644 with identical bytes: a `ref` with the worktree mode, committed.
+        result = self.run_fixer(lambda w: (w.path / "scripts/run.sh").chmod(0o644))
+        self.assertEqual(self.records()["scripts/run.sh"][:2], ("ref", "100644"))
+        self.assertTrue(result.pushed, result.audit)
+        self.assertEqual(self.entries(result.pushed)["scripts/run.sh"], "100644")
+        # 644 -> 755 with identical bytes: refused, not dropped.
+        result = self.run_fixer(lambda w: (w.path / "app/a.py").chmod(0o755))
+        self.assertEqual(self.records()["app/a.py"][:2], ("ref", "100755"))
+        self.assertIn("refused: candidate adds a symlink, submodule or executable mode", result.audit)
+        # A mode-only change on a protected path is refused.
+        self.src.write("scripts/ci/gate.sh", "#!/bin/sh\n", mode=0o755)
+        result = self.run_fixer(lambda w: (w.path / "scripts/ci/gate.sh").chmod(0o644), head_files={"x.txt": "x\n"})
+        self.assertIn("refused: candidate changes a protected path", result.audit)
+
+    def test_restored_paths_keep_heads_oid_and_mode_even_after_a_worktree_mode_change(self):
+        def change(work):
+            (work.path / "CLAUDE.md").chmod(0o755)
+            work.write("a.txt", "b\n")
+        result = self.run_fixer(change, event="issue_comment", restored=True, head_files={"a.txt": "a\n"})
+        self.assertEqual(self.records()["CLAUDE.md"][:2], ("ref", "100644"))
+        self.assertTrue(result.pushed, result.audit)
+        self.assertEqual(self.remote_git("diff-tree", "-r", "--name-only", "--no-commit-id", self.head,
+                                         result.pushed).decode().split(), ["a.txt"])
+
+    def test_file_directory_replacements_and_case_only_renames_are_accepted_and_exact(self):
+        def to_directory(work):
+            (work.path / "app/b.py").unlink()
+            work.write("app/b.py/inner.py", "inner\n")
+        result = self.run_fixer(to_directory)
+        expected = {k: v for k, v in self.entries(self.head).items() if k != "app/b.py"}
+        self.assertEqual(self.entries(result.pushed), {**expected, "app/b.py/inner.py": "100644"})
+
+        def to_file(work):
+            shutil.rmtree(work.path / "lib/one")
+            work.write("lib/one", "now a file\n")
+        result = self.run_fixer(to_file, head_files={"lib/one/x.py": "x\n", "lib/one/y.py": "y\n"})
+        self.assertTrue(result.pushed, result.audit)
+        tree = self.entries(result.pushed)
+        self.assertEqual((tree.get("lib/one"), "lib/one/x.py" in tree), ("100644", False))
+        self.assertEqual(self.remote_git("show", f"{result.pushed}:lib/one"), b"now a file\n")
+
+        def rename(work):
+            os.rename(work.path / "app/a.py", work.path / "app/A.py")
+        result = self.run_fixer(rename)
+        self.assertTrue(result.pushed, result.audit)
+        tree = self.entries(result.pushed)
+        self.assertEqual(("app/A.py" in tree, "app/a.py" in tree), (True, False))
+
+    def test_protected_file_directory_replacements_are_refused(self):
+        def protected_file(work):
+            (work.path / "AGENTS.md").unlink()
+            work.write("AGENTS.md/x.md", "x\n")
+        self.assertIn("candidate changes a protected path", self.run_fixer(protected_file).audit)
+
+        def protected_dir(work):
+            shutil.rmtree(work.path / ".claude")
+            work.write(".claude", "file\n")
+        self.assertIn("candidate changes a protected path", self.run_fixer(protected_dir).audit)
+
+
+@POSIX
+class PrecisionTests(FlowCase):
+    """Coordinator test-precision items 1-6 (within v4.3 semantics)."""
+
+    def test_symlinks_are_hashed_by_target_bytes_never_dereferenced(self):
+        outside = self.root / "outside-secret.txt"
+        outside.write_text("SECRET-OUTSIDE\n")
+        os.symlink(str(outside), self.src.path / "app/link")
+        self.head = self.src.commit(message="a symlink to a path outside the repository")
+        work = self.model("fixer")
+        work.write("app/a.py", "a = 2\n")
+        self.intent()
+        self.package()
+        record = self.records()["app/link"]
+        self.assertEqual(record, ("ref", "120000", blob_id(str(outside).encode()), len(str(outside))))
+        for path in self.artifact.rglob("*"):
+            if path.is_file():
+                self.assertNotIn(b"SECRET-OUTSIDE", path.read_bytes())
+        result = self.publish()
+        self.assertTrue(result.pushed, result.audit)  # an inherited, unchanged symlink passes
+        self.assertEqual(self.entries_mode(result.pushed, "app/link"), "120000")
+        for change in (lambda w: os.symlink("a.py", w.path / "app/new-link"),
+                       lambda w: ((w.path / "app/link").unlink(), os.symlink("/etc/hostname", w.path / "app/link"))):
+            with self.subTest(change=change):
+                shutil.rmtree(self.work.path)
+                work = self.model("fixer")
+                self.push_src()
+                change(work)
+                self.intent()
+                self.package()
+                self.assertIn("refused: candidate adds a symlink, submodule or executable mode", self.publish().audit)
+
+    def entries_mode(self, commit, path):
+        return self.remote_git("ls-tree", commit, path).decode().split(" ")[0]
+
+    def test_hash_mismatch_reads_boundedly_then_has_no_later_effect(self):
+        work = self.model("fixer")
+        work.write("app/a.py", "a = 2\n")
+        self.intent()
+        self.package()
+        oid = self.records()["app/a.py"][2]
+        (self.artifact / "blobs" / oid).write_bytes(b"a = 3\n")
+        opens = Opens(self)
+        result = self.publish(records=[{"op": "comment", "body": "x"}])
+        self.assertIn("refused: snapshot blob does not match its id", result.audit)
+        self.assertEqual(opens.blob_opens(), [oid])
+        self.assertEqual(len(opens.read), 1)  # the bounded read happened
+        self.assertEqual((result.pushed, result.writes, result.minted), ("", [], 0))
+        self.assertEqual(self.git_calls("hash-object", "update-index", "write-tree", "commit-tree", "fsck", "push"), [])
+        self.assertEqual([a for a in self.argv if "cat-file" in a and "blob" in a], [])
+
+    def test_check_objects_after_construction_refuses_through_main(self):
+        # SYNTHETIC object corruption: a hand-made tree with a `.GIT` entry, hidden in the recorded head's history.
+        # Only the post-construction check_objects() sees it; nothing else fscks the repository.
+        blob = self.src.git("hash-object", "-w", "--stdin", input="x\n")
+        raw = self.root / "raw-tree"
+        raw.write_bytes(b"100644 .GIT\0" + bytes.fromhex(blob))
+        bad_tree = self.src.git("hash-object", "-t", "tree", "-w", "--literally", str(raw))
+        bad = self.src.git("commit-tree", bad_tree, "-p", self.head, "-m", "synthetic corrupt tree")
+        good_tree = self.src.git("rev-parse", self.head + "^{tree}")
+        self.head = self.src.git("commit-tree", good_tree, "-p", bad, "-m", "clean tip")
+        self.src.git("update-ref", "refs/heads/fix", self.head)
+        work = self.model("fixer")
+        work.write("app/a.py", "a = 2\n")
+        self.intent()
+        self.package()
+        result = self.publish()
+        self.assertIn("refused: candidate objects fail git fsck; queued writes dropped", result.audit)
+        self.assertEqual((result.pushed, result.minted), ("", 0))
+        order = [("commit-tree" in a, "fsck" in a) for a in self.argv]
+        self.assertLess(order.index((True, False)), order.index((False, True)))  # after construction
+
+    def test_unsafe_filtering_route_transforms_bytes_so_the_raw_byte_oracle_is_meaningful(self):
+        # The --no-filters drop alone on a pathless stdin call is equivalent; the non-equivalent control is the
+        # attribute-reading route (`--path` with attr.tree), which does rewrite these bytes.
+        self.src.commit({".gitattributes": "* text eol=crlf ident\n"})
+        self.head = self.src.git("rev-parse", "HEAD")
+        self.push_src()
+        repo = p.FreshRepo(tempfile.mkdtemp(dir=self.root))
+        repo.run_git(["fetch", "-q", str(self.remote), self.head])
+        raw = b"x\r\n$Id: deadbeef $\n"
+        safe = repo.text("hash-object", "-w", "--no-filters", "--stdin", input=raw)
+        unsafe = repo.text("-c", f"attr.tree={self.head}", "hash-object", "-w", "--stdin", "--path=f.txt", input=raw)
+        self.assertEqual(safe, blob_id(raw))
+        self.assertNotEqual(unsafe, safe)
+
+    def test_moved_trusted_content_is_still_counted_by_bounded_size(self):
+        big = "B" * 1500
+        work = self.model("fixer", head_files={"data/big.txt": big})
+        work.write("data/copy.txt", big)  # trusted bytes re-homed to a new path
+        self.intent()
+        self.package()
+        self.assertEqual(self.records()["data/copy.txt"][2], blob_id(big.encode()))
+        with patch.object(p, "MAX_DIFF_BYTES", 1000):
+            opens = Opens(self)
+            result = self.publish()
+        self.assertEqual(opens.blob_opens(), [])  # normalized: the P1 budget passed without reading it
+        self.assertIn("refused: candidate diff too large; queued writes dropped", result.audit)
+        self.assertEqual(result.pushed, "")
+
+
+class FrozenDenyTests(unittest.TestCase):
+    """v4.3 section 0: every deny list stays byte-identical to Port C (365121d1)."""
+    CLAUDE_YML = ["Read(.env)", "Read(.env.*)", "Edit(.github/workflows/**)", "Write(.github/workflows/**)",
+                  "Edit(.git/**)", "Write(.git/**)", "Edit(/${{ runner.temp }}/claude-fixer-guard/**)",
+                  "Write(/${{ runner.temp }}/claude-fixer-guard/**)", "Edit(.claude/**)", "Write(.claude/**)",
+                  "Edit(~/.claude/**)", "Write(~/.claude/**)", "Edit(~/.gitconfig)", "Write(~/.gitconfig)",
+                  "Edit(~/.config/git/**)", "Write(~/.config/git/**)", "Read(~/.claude/**)"]
+    WRITER = ["Read(.env)", "Read(.env.*)", "Edit(.github/**)", "Write(.github/**)", "Edit(.env*)", "Write(.env*)",
+              "Edit(AGENTS.md)", "Write(AGENTS.md)", "Edit(CLAUDE.md)", "Write(CLAUDE.md)", "Edit(CODEOWNERS)",
+              "Write(CODEOWNERS)", "Edit(scripts/ci/**)", "Write(scripts/ci/**)", "Edit(tools/ci_gate.py)",
+              "Write(tools/ci_gate.py)", "Edit(tools/test_claude_pr_fixer.py)", "Write(tools/test_claude_pr_fixer.py)",
+              "Edit(.git/**)", "Write(.git/**)", "Edit(/${{ runner.temp }}/claude-fixer-guard/**)",
+              "Write(/${{ runner.temp }}/claude-fixer-guard/**)", "Edit(.claude/**)", "Write(.claude/**)",
+              "Edit(~/.claude/**)", "Write(~/.claude/**)", "Edit(~/.gitconfig)", "Write(~/.gitconfig)",
+              "Edit(~/.config/git/**)", "Write(~/.config/git/**)", "Read(~/.claude/**)"]
+
+    def test_deny_lists_are_unchanged(self):
+        for workflow, job, expected in (("claude.yml", "claude-mention", self.CLAUDE_YML),
+                                        ("claude.yml", "devin-review-fix", self.CLAUDE_YML),
+                                        ("claude-conflict-writer.yml", "model", self.WRITER)):
+            with self.subTest(job=job):
+                action = [s for s in jobs(workflow)[job]["steps"] if s.get("id") == "claude"][0]
+                self.assertEqual(json.loads(action["with"]["settings"])["permissions"]["deny"], expected)
+
+
 def compare_ok(base, tip):
     return "identical" if base == tip else "ahead"
 
@@ -2052,8 +3252,8 @@ class ReceiptV3Tests(unittest.TestCase):
         self.roots = fixtures.root_comments([fixtures.thread()])
         self.item = {**fixtures.prepare(fixtures.findings([fixtures.thread()]), history=self.history)[0], "base": A}
 
-    def publish(self, status, bundle):
-        h = Harness(self, bundle=bundle, context=[self.item], records=[{"op": "receipt", "root": 1, "status": status}])
+    def publish(self, status, commit):
+        h = Harness(self, commit=commit, context=[self.item], records=[{"op": "receipt", "root": 1, "status": status}])
         h.targets[1] = ROOT_TARGET
         self.assertEqual(h.run(), 0)
         bodies = [w[3]["body"] for w in h.writes if w[1].endswith("/pulls/7/comments/1/replies")]
@@ -2077,7 +3277,7 @@ class ReceiptV3Tests(unittest.TestCase):
         self.assertEqual(p.load_config(env)["receipts"], [self.item])
 
     def test_publisher_receipts_are_accepted_by_the_recursion_consumer(self):
-        body = self.publish("addressed", bundle=True)
+        body = self.publish("addressed", commit=True)
         expected = {"v": 3, "generation": self.item["generation"], "observation": self.item["observation"],
                     "root": 1, "fingerprint": self.item["fingerprint"], "status": "addressed", "base": A, "commit": B}
         self.assertEqual(receipts.records(body, "result"), [expected])
@@ -2085,7 +3285,7 @@ class ReceiptV3Tests(unittest.TestCase):
         manual, automatic, reports = self.consumer_view(body, B)
         self.assertEqual((manual, automatic), ([], []))
         self.assertEqual(reports, [{"root": 1, "status": "verified-addressed"}])
-        body = self.publish("needs-human", bundle=False)
+        body = self.publish("needs-human", commit=False)
         self.assertEqual(receipts.records(body, "result"),
                          [{k: v for k, v in expected.items() if k != "commit"} | {"status": "needs-human"}])
         manual, automatic, reports = self.consumer_view(body, A)
@@ -2093,7 +3293,7 @@ class ReceiptV3Tests(unittest.TestCase):
         self.assertEqual(reports, [{"root": 1, "status": "verified-needs-human"}])
 
     def test_a_receipt_without_the_exact_observation_or_generation_is_rejected(self):
-        good = receipts.records(self.publish("addressed", bundle=True), "result")[0]
+        good = receipts.records(self.publish("addressed", commit=True), "result")[0]
         other = "0" * 64
         changes = [{"observation": other}, {"generation": other}, {"observation": good["generation"]},
                    {"observation": good["observation"].upper()}, {"v": 2}, {"v": "3"}, {"v": True}, {"v": 3.0}]
@@ -2187,7 +3387,7 @@ class ReceiptAuditHistoryTests(ReceiptV3Tests):
                       p.receipt_audit(self.config(), self.reader(comments, self.history * 2), receipts))
 
     def test_publish_and_its_terminal_audit_never_write_the_journal_or_a_reservation(self):
-        h = Harness(self, bundle=True, context=[self.item],
+        h = Harness(self, commit=True, context=[self.item],
                     records=[{"op": "reply", "comment_id": 1, "body": "Fixed in the pushed commit."},
                              {"op": "receipt", "root": 1, "status": "addressed"}])
         h.targets[1] = ROOT_TARGET
@@ -2379,6 +3579,8 @@ ROOT_OWN = [f"python3 {GUARD}/model-api\" install",
             f"if [ -e {GUARD}/read-token\" ]; then sudo chmod 0644 {GUARD}/read-token\"; fi",
             f"test \"$(stat -c %U {GUARD}/model-api\")\" = root"]
 RECEIPTS_STEP = "Install trusted receipt helper"
+SNAPSHOT_LINE = ('          if result="$(env -i /usr/bin/python3 -I "$RUNNER_TEMP/claude-fixer-guard/model-api" snapshot '
+                 '"$out" /usr/bin/git)"; then').strip()
 # CSL-414: every Claude writer is split (Port B: claude.yml; Port C: the conflict writer).
 PIPELINES = {
     "claude.yml": [("mention-prepare", "claude-mention", "mention-publish", "claude-${{ needs.resolve-pr.outputs.pr_number }}"),
@@ -2487,9 +3689,12 @@ class WorkflowWiringTests(unittest.TestCase):
                 self.assertEqual(upload[0]["with"]["retention-days"], "1")
                 package = [s for s in model["steps"] if s.get("name") == "Package untrusted model output"][0]
                 self.assertEqual(package["if"], "always()")
-                self.assertIn('bundle create "$out/candidate.bundle" HEAD "^$HEAD_SHA"', package["run"])
-                # Conflict mode excludes the recorded base too, so the bundle carries only the merge commit.
-                self.assertEqual('HEAD "^$HEAD_SHA" "^$BASE_SHA"' in package["run"], name == "claude-conflict-writer.yml")
+                # CSL-414 B': no model-side commit or bundle; the root-owned helper snapshots the final tree
+                # by absolute paths under env -i, and nothing in the step writes a commit or a ref.
+                self.assertIn(SNAPSHOT_LINE, package["run"].splitlines())
+                self.assertEqual(package["env"], {"EXECUTION_FILE": "${{ steps.claude.outputs.execution_file }}"})
+                for gone in ("bundle", "git commit", "git add", "update-ref", "git merge", "commit-tree"):
+                    self.assertNotIn(gone, package["run"])
                 self.assertNotIn('cp "$EXECUTION_FILE"', package["run"])  # never upload the transcript
                 self.assertEqual(package["id"], "package")
                 self.assertIn('echo "package_status=$status" >> "$GITHUB_OUTPUT"', package["run"])
@@ -2497,17 +3702,26 @@ class WorkflowWiringTests(unittest.TestCase):
                                                     "package_status": "${{ steps.package.outputs.package_status }}"})
 
     @POSIX
-    def test_package_status_reports_unchanged_bundled_and_a_failed_bundle(self):
-        # Runs each model job's real package script against a repo, with a git wrapper that can fail `bundle`.
+    def test_package_status_reports_unchanged_snapshot_and_a_failed_snapshot(self):
+        # Runs each model job's real package script, with the real helper installed, against a repo. A git
+        # shim on PATH proves the snapshot ignores PATH (absolute git under env -i); it only fails `git config`.
+        if not (Path("/usr/bin/python3").exists() and Path(p.GIT_BIN).exists()):
+            self.skipTest("the package step's absolute python3 and git")
         for name, _prep, model, _pub, _group, ids in self.pipelines():
             script = [s for s in model["steps"] if s.get("name") == "Package untrusted model output"][0]["run"]
-            for case in ("unchanged", "bundled", "failed", "credential", "helper", "big", "unreadable",
+            for case in ("unchanged", "snapshot", "moved", "credential", "helper", "big", "unreadable",
                          *ISOLATED_CREDENTIALS):
                 with self.subTest(workflow=name, job=ids[1], case=case), tempfile.TemporaryDirectory() as tmp:
                     root = Path(tmp)
                     work = Work(root / "repo")
                     subprocess.run(["git", "init", "-q", "-b", "main", str(work.path)], env=git_env(), check=True)
                     head = work.commit({"a.txt": "a\n"}, message="head")
+                    guard = root / "claude-fixer-guard"
+                    guard.mkdir()
+                    (guard / "model-api").write_text((ROOT / "scripts/ci/claude_fixer_outbox.py").read_text(encoding="utf-8"))
+                    subprocess.run([sys.executable, "-I", str(guard / "model-api"), "install"], check=True,
+                                   env=dict(git_env(), REPO=REPO, PR_NUMBER="7", HEAD_SHA=head, HEAD_REF="fix",
+                                            WRITER_MODE=WRITER_MODES[ids[2]]))
                     # CSL-412: the action's credential-helper layout is clean; a token in the URL is not.
                     url = ("https://x-access-token:" + TOKEN + "@github.com/acme/example.git" if case == "credential"
                            else "https://github.com/acme/example.git")
@@ -2521,26 +3735,42 @@ class WorkflowWiringTests(unittest.TestCase):
                         for index in range(1500):
                             work.git("config", "--add", "filler.value", f"{index:04d}" + "x" * 60)
                     if case != "unchanged":
-                        work.commit({"a.txt": "b\n"}, message="model fix")
+                        work.write("a.txt", "b\n")
+                        work.write(".claude-fixer-out/intent.jsonl", '{"message":"fix: a","op":"commit"}\n')
+                    if case == "moved":
+                        work.commit({"b.txt": "moved\n"}, message="a model-side commit")
                     shim = root / "bin"
                     shim.mkdir()
                     real_git = shutil.which("git")
                     (shim / "git").write_text("#!/bin/sh\n"
-                                              + ('for a in "$@"; do [ "$a" = bundle ] && exit 1; done\n' if case == "failed" else "")
+                                              + f'touch "{root}/shim-ran"\n'
+                                              # any non-config use (the snapshot's) would fail the package
+                                              + f'[ "$1" != config ] && touch "{root}/shim-other" && exit 1\n'
                                               # git config fails (only the listing): fail closed, not clean
                                               + ('[ "$1" = config ] && exit 1\n' if case == "unreadable" else "")
                                               + f'exec "{real_git}" "$@"\n')
                     (shim / "git").chmod(0o755)
                     output = root / "output"
                     env = dict(git_env(), PATH=f"{shim}{os.pathsep}{os.environ['PATH']}", RUNNER_TEMP=str(root),
-                               GITHUB_OUTPUT=str(output), HEAD_SHA=head, BASE_SHA=head, EXECUTION_FILE="")
+                               GITHUB_OUTPUT=str(output), EXECUTION_FILE="")
+                    (root / "shim-ran").unlink(missing_ok=True)
                     subprocess.run(["bash", "-c", script], cwd=work.path, env=env, check=True, capture_output=True)
                     expected = ("failed" if case in ISOLATED_CREDENTIALS else
-                                {"credential": "failed", "helper": "bundled", "big": "failed",
+                                {"credential": "failed", "helper": "snapshot", "big": "failed", "moved": "failed",
                                  "unreadable": "failed"}.get(case, case))
                     self.assertEqual(output.read_text(), f"package_status={expected}\n")
-                    bundle = root / "claude-writer-out" / "candidate.bundle"
-                    self.assertEqual(bundle.exists(), expected == "bundled")
+                    out = root / "claude-writer-out"
+                    for item in ("snapshot.manifest", "intent.jsonl", "blobs"):
+                        self.assertEqual((out / item).exists(), expected == "snapshot", item)
+                    if expected == "snapshot":
+                        records = (out / "snapshot.manifest").read_bytes().split(b"\0")
+                        self.assertEqual(records[:5][0], b"blob")
+                        self.assertEqual(records[4], b"a.txt")
+                        self.assertEqual((out / "blobs" / records[2].decode()).read_bytes(), b"b\n")
+                    # Only the shell's own `git config` uses PATH; the snapshot (absolute git, env -i) never does.
+                    self.assertEqual((root / "shim-ran").exists(), True)
+                    self.assertFalse((root / "shim-other").exists())
+                    self.assertEqual(work.git("rev-parse", "HEAD") == head, case != "moved")
 
     def test_model_jobs_scrub_credentials_and_run_no_repository_code(self):
         # Chaandan's review at 5f904c3: PR code must not run next to the OAuth token.
@@ -2733,11 +3963,13 @@ class WorkflowWiringTests(unittest.TestCase):
                 self.assertNotIn("claude-fixer-guard/pre-push", text)
         self.assertLessEqual({name for name, _tag in expected}, set(WORKFLOWS))  # every expected workflow exists
 
-    def test_conflict_merge_is_bundled_against_head_and_base(self):
+    def test_conflict_merge_is_snapshotted_and_built_against_head_and_base(self):
+        # B': the snapshot carries the merged tree; the publisher builds the merge with the trusted
+        # parents [HEAD_SHA, BASE_SHA] from its own env, never from the artifact.
         model = jobs("claude-conflict-writer.yml")["model"]
         package = [s for s in model["steps"] if s.get("name") == "Package untrusted model output"][0]
-        self.assertIn('HEAD "^$HEAD_SHA" "^$BASE_SHA"', package["run"])
-        self.assertEqual(package["env"]["BASE_SHA"], "${{ needs.prepare.outputs.base_sha }}")
+        self.assertIn(SNAPSHOT_LINE, package["run"].splitlines())
+        self.assertNotIn("BASE_SHA", package["env"])
         merge = [s for s in model["steps"] if s.get("name", "").startswith("Start merge")]
         self.assertEqual(len(merge), 1)
         self.assertIn('git merge --no-ff --no-commit "$BASE_SHA"', merge[0]["run"])

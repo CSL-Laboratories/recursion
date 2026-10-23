@@ -602,8 +602,10 @@ class WorkflowTests(unittest.TestCase):
                 self.assertIn(rule, disallow)
             flat = " ".join(body.split("claude_args:", 1)[0].split())
             self.assertIn("PUBLISHING: you have no push access and must not try.", flat)
-            self.assertIn(("The workflow posts them only after it has pushed your commits.",
-                           "only after it has pushed your commits and verified the live PR head.")[index], flat)
+            # CSL-414 B': one commit, built by the workflow from the model's final tree.
+            self.assertIn(("The workflow posts them only after it has pushed your commit.",
+                           "only after it has pushed your commit and verified the live PR head.")[index], flat)
+            self.assertIn("Record a commit intent only.", flat)
             self.assertIn("has no Linear, Context7 or Parallel tools", body)
 
     def test_only_trusted_publish_holds_the_push_credential(self):

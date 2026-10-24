@@ -23,6 +23,7 @@ receipts = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(receipts)
 CONTEXT_PREFIX = "Fixer attempt "
 WORKFLOW = ".github/workflows/claude.yml"
+# Pinned (CSL-414 / CSL-473 a5a423f7 = v1.0.256); it also names the step ("Run <uses>") that escalation binds to.
 ACTION_USES = "anthropics/claude-code-action@a5a423f75c251dcbff8a74e99f83b2cb03c72bfa"
 FAILURES = {"failure", "timed_out"}
 

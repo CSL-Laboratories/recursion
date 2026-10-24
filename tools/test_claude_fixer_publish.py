@@ -3879,12 +3879,19 @@ class WorkflowWiringTests(unittest.TestCase):
             with self.subTest(workflow=name, job=ids[1]):
                 names = [s.get("name") or s.get("id") for s in model["steps"]]
                 sandbox = step(model, "Install the subprocess sandbox for Claude's commands")
-                self.assertEqual(names.index("claude") - 1, names.index(sandbox["name"]))
+                pinned = step(model, "Install hash-pinned Claude Code CLI")
+                self.assertEqual(names.index(pinned["name"]) - 1, names.index(sandbox["name"]))
+                self.assertEqual(names.index("claude") - 1, names.index(pinned["name"]))
+                self.assertIn("python3 -I -c", pinned["run"])
+                self.assertIn("/opt/csl-claude/", pinned["run"])
                 self.assertIn("apt-get install -y --no-install-recommends bubblewrap socat", sandbox["run"])
                 self.assertIn("\ncommand -v bwrap\n", sandbox["run"])
                 self.assertNotIn("continue-on-error", sandbox)
                 action = [s for s in model["steps"] if s.get("id") == "claude"][0]
-                self.assertEqual(action["env"], {"CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1"})
+                self.assertEqual(action["env"], {"CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
+                                                "DISABLE_UPDATES": "1"})
+                self.assertEqual(action["with"]["path_to_claude_code_executable"],
+                                 "/opt/csl-claude/2.1.306/claude")
                 # Chaandan's review at 95de346: any value keeps the job token out of the origin URL
                 # in .git/config; one no GitHub login can match keeps every actor's write check.
                 self.assertEqual(action["with"]["github_token"], "${{ github.token }}")

@@ -17,6 +17,16 @@ Read [CONTROL_PLANE](../../CONTROL_PLANE.md) first, then [ANCHOR](../../ANCHOR.m
 V1/v2 remain historical implementation and regression references. Do not infer a v2
 development task from a legacy filename, goal identifier, or acceptance command.
 
+For shared research, use the [CSL research index](https://github.com/CSL-Laboratories/csl-research/blob/main/INDEX.md),
+[Recursion context](https://github.com/CSL-Laboratories/csl-research/blob/main/knowledge/recursion/README.md)
+and [research-to-delivery guide](https://github.com/CSL-Laboratories/csl-research/blob/main/README.md#connecting-research-and-delivery).
+These views are dated explanatory navigation; linked submissions are candidate
+evidence. They do not imply that all research has migrated. Check cited revisions
+and current product instructions before dependent work. Linear remains the live
+source for ownership, status and admission. Product contracts and authenticated
+human decisions retain their authority; user-facing and revision-dependent
+operational docs and contracts stay in this repository.
+
 ## Specification and authority
 
 The product requirements and accepted Owner decisions remain intact. They describe a

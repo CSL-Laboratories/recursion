@@ -1704,6 +1704,8 @@ class ClaudeCodeInstallerPinTests(unittest.TestCase):
         self.assertIn("install path is a symlink", script)
         self.assertIn("install dir contains extra files", script)
         self.assertIn("installClaudeCode()", script)
+        self.assertIn("python3 -I -c", script)
+        self.assertNotIn("python3 -c '", script)
         self.assertIn("reference copy", script)
         self.assertNotIn("| bash", script)
 

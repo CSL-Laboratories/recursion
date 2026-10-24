@@ -1828,25 +1828,31 @@ jobs:
           set -euo pipefail
           # Load scripts/ci/claude_fixer_publish.py from the live PR base SHA only.
           # Never the PR head, the merge commit, the workspace, or a checkout.
-          trusted_sha="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.base.sha')"
-          if ! [[ "$trusted_sha" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]]; then
-            echo "::error::publish: trusted base SHA missing or malformed"
+          handback() {
+            echo "::error::publish: $1"
+            jq -n --arg m "$1" '{body: ("Claude publisher: refused: " + $m + "; queued writes dropped.")}' \
+              | gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" --input - >/dev/null || true
             exit 1
+          }
+          if ! trusted_sha="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.base.sha')"; then
+            handback "trusted base SHA could not be read"
+          fi
+          if ! [[ "$trusted_sha" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]]; then
+            handback "trusted base SHA missing or malformed"
           fi
           if [[ "$trusted_sha" == "$HEAD_SHA" ]]; then
-            echo "::error::publish: refusing to load the publisher from the PR head"
-            exit 1
+            handback "refusing to load the publisher from the PR head"
           fi
           mkdir -p "$RUNNER_TEMP/claude-fixer-publish"
-          content="$(gh api "repos/$REPO/contents/scripts/ci/claude_fixer_publish.py?ref=$trusted_sha" \
-            --jq 'select(.type == "file" and .encoding == "base64" and .path == "scripts/ci/claude_fixer_publish.py") | .content')"
+          if ! content="$(gh api "repos/$REPO/contents/scripts/ci/claude_fixer_publish.py?ref=$trusted_sha" \
+            --jq 'select(.type == "file" and .encoding == "base64" and .path == "scripts/ci/claude_fixer_publish.py") | .content')"; then
+            handback "trusted publisher blob missing or not a file"
+          fi
           if [ -z "$content" ]; then
-            echo "::error::publish: trusted publisher blob missing or not a file"
-            exit 1
+            handback "trusted publisher blob missing or not a file"
           fi
           base64 -d <<< "$content" > "$RUNNER_TEMP/claude-fixer-publish/publish.py"
           if ! [ -s "$RUNNER_TEMP/claude-fixer-publish/publish.py" ]; then
-            echo "::error::publish: trusted publisher blob is empty"
-            exit 1
+            handback "trusted publisher blob is empty"
           fi
           python3 -I "$RUNNER_TEMP/claude-fixer-publish/publish.py"

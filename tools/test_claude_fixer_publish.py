@@ -3975,9 +3975,12 @@ class WorkflowWiringTests(unittest.TestCase):
                                   "git push", "secrets.GITHUB_TOKEN"):
                     self.assertNotIn(forbidden, rest_text)
                 pub_run = step(publish, PUBLISH_STEP)["run"]
-                self.assertIn('trusted_sha="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq \'.base.sha\')"', pub_run)
+                self.assertIn('if ! trusted_sha="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq \'.base.sha\')"; then', pub_run)
                 self.assertIn("scripts/ci/claude_fixer_publish.py?ref=$trusted_sha", pub_run)
                 self.assertIn('"$trusted_sha" == "$HEAD_SHA"', pub_run)
+                self.assertIn("handback()", pub_run)
+                self.assertIn("trusted publisher blob missing or not a file", pub_run)
+                self.assertIn('gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments"', pub_run)
                 self.assertNotIn("github.sha", pub_run)
                 self.assertNotIn("GITHUB_WORKSPACE", pub_run)
                 self.assertNotIn("git clone", pub_run)

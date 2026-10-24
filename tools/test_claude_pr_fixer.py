@@ -563,8 +563,8 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn("GH_TOKEN: ${{ github.token }}", self._job("resolve-pr"))
         self.assertIn("DISPATCH_EVENTS", source)
 
-    ACTION_SHA = "16f9f71ab9c490faf367f94dd294897edc25be33"
-    ACTION_TAG = "v1.0.261"
+    ACTION_SHA = "a5a423f75c251dcbff8a74e99f83b2cb03c72bfa"
+    ACTION_TAG = "v1.0.256"
     ACTION_USES = f"anthropics/claude-code-action@{ACTION_SHA}"
 
     def test_dependencies_are_installed_before_model_invocation(self) -> None:

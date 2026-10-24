@@ -762,12 +762,15 @@ def _crosslane_bracket(text: str, pos: int, opens: str) -> tuple[int, int] | Non
 
 
 def _crosslane_publisher_thin_call(block: str) -> None:
-    # Publish jobs load scripts/ci/claude_fixer_publish.py from the live PR .base.sha, never an embed.
+    # Publish jobs load scripts/ci/claude_fixer_publish.py from the default-branch SHA
+    # prepare recorded, never an embed, live .base.sha, github.sha, or the workspace.
     if "<<'CLAUDE_FIXER_PUBLISH'" in block:
         raise AssertionError("a publish job must not embed the publisher")
-    if ".base.sha" not in block or "scripts/ci/claude_fixer_publish.py" not in block:
-        raise AssertionError("a publish job must load the publisher from the live PR base SHA")
-    if "github.sha" in block or "GITHUB_WORKSPACE" in block:
+    if "PUBLISHER_SHA" not in block or "scripts/ci/claude_fixer_publish.py" not in block:
+        raise AssertionError("a publish job must load the publisher from the recorded default-branch SHA")
+    if ".base.sha" in block:
+        raise AssertionError("a publish job must not load the publisher from live PR .base.sha")
+    if "github.sha" in block or "github.workflow_sha" in block or "GITHUB_WORKSPACE" in block:
         raise AssertionError("a publish job must not load the publisher from github.sha or the workspace")
 
 
@@ -991,7 +994,7 @@ class CrossLaneAdmissionTests(unittest.TestCase):
                     if job in push_models:
                         self.assertTrue(commands)
                     elif job in publishers:
-                        # The one ordinary push lives in the checked-in publisher, loaded from .base.sha.
+                        # The one ordinary push lives in the checked-in publisher, loaded from the recorded default-branch SHA.
                         self.assertEqual(commands, [])
                         self.assertIn(CROSSLANE_PUBLISH_PUSH, publisher)
                     else:

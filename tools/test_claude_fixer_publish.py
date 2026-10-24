@@ -3975,13 +3975,18 @@ class WorkflowWiringTests(unittest.TestCase):
                                   "git push", "secrets.GITHUB_TOKEN"):
                     self.assertNotIn(forbidden, rest_text)
                 pub_run = step(publish, PUBLISH_STEP)["run"]
-                self.assertIn('if ! trusted_sha="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq \'.base.sha\')"; then', pub_run)
+                self.assertIn('trusted_sha="$PUBLISHER_SHA"', pub_run)
                 self.assertIn("scripts/ci/claude_fixer_publish.py?ref=$trusted_sha", pub_run)
                 self.assertIn('"$trusted_sha" == "$HEAD_SHA"', pub_run)
+                self.assertIn('compare/${tip}...${trusted_sha}', pub_run)
+                self.assertIn('"$status" != "identical" && "$status" != "behind"', pub_run)
                 self.assertIn("handback()", pub_run)
                 self.assertIn("trusted publisher blob missing or not a file", pub_run)
+                self.assertIn("recorded publisher SHA is not on the default branch", pub_run)
                 self.assertIn('gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments"', pub_run)
+                self.assertNotIn(".base.sha", pub_run)
                 self.assertNotIn("github.sha", pub_run)
+                self.assertNotIn("github.workflow_sha", pub_run)
                 self.assertNotIn("GITHUB_WORKSPACE", pub_run)
                 self.assertNotIn("git clone", pub_run)
                 self.assertNotIn("<<'CLAUDE_FIXER_PUBLISH'", pub_run)
@@ -3997,6 +4002,7 @@ class WorkflowWiringTests(unittest.TestCase):
                 self.assertEqual(env["CLAUDE_FIXER_PAUSE"], "${{ vars.CLAUDE_FIXER_PAUSE }}")
                 self.assertEqual(env["HEAD_SHA"], f"${{{{ needs.{ids[0]}.outputs.head_sha }}}}")
                 self.assertEqual(env["HEAD_REF"], f"${{{{ needs.{ids[0]}.outputs.head_ref }}}}")
+                self.assertEqual(env["PUBLISHER_SHA"], f"${{{{ needs.{ids[0]}.outputs.publisher_sha }}}}")
                 self.assertEqual(env["PREPARED_RUN_ATTEMPT"], f"${{{{ needs.{ids[0]}.outputs.run_attempt }}}}")
                 self.assertEqual(env["WRITER_MODE"], WRITER_MODES[ids[2]])
                 outbox = [s for s in _model["steps"] if s.get("id") == "outbox"][0]
@@ -4022,6 +4028,7 @@ class WorkflowWiringTests(unittest.TestCase):
                     self.assertNotIn(forbidden, text)
                 self.assertEqual(prepare["permissions"].get("contents"), "read")
                 self.assertIn("run_attempt", prepare["outputs"])
+                self.assertIn("publisher_sha", prepare["outputs"])
                 self.assertIn("|| 'true'", prepare["outputs"]["skip"])
 
     def test_all_three_jobs_share_the_writer_lock(self):
@@ -4180,6 +4187,110 @@ class WorkflowWiringTests(unittest.TestCase):
             self.assertIn(f'git config user.email "{CLAUDE[1]}"', attach)
             self.assertIn(".claude-fixer-out/", attach)
             self.assertEqual(CLAUDE, ("claude[bot]", "209825114+claude[bot]@users.noreply.github.com"))
+
+
+@POSIX
+class TrustedPublisherLoadTests(unittest.TestCase):
+    """Thin-call loads the publisher from the recorded default-branch SHA (CSL-414)."""
+
+    HEAD = "a" * 40
+    RECORDED = "d" * 40
+    TIP = "e" * 40
+    BLOB = "cHJpbnQoIm9rIikK"  # print("ok")
+
+    def publish_run(self):
+        scripts = []
+        for name, triples in PIPELINES.items():
+            for _prep, _model, publish, _group in triples:
+                scripts.append(step(jobs(name)[publish], PUBLISH_STEP)["run"])
+        self.assertTrue(scripts)
+        self.assertTrue(all(item == scripts[0] for item in scripts))
+        return scripts[0]
+
+    def _load(self, *, publisher_sha=None, head_sha=None, default_branch="master", tip=None,
+              status="identical", blob=None, contents_fail=False, compare_fail=False):
+        publisher_sha = self.RECORDED if publisher_sha is None else publisher_sha
+        head_sha = self.HEAD if head_sha is None else head_sha
+        tip = self.RECORDED if tip is None else tip
+        blob = self.BLOB if blob is None else blob
+        script = self.publish_run()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log = root / "gh.log"
+            posted = root / "posted"
+            gh = root / "gh"
+            gh.write_text(
+                "#!/usr/bin/env bash\n"
+                f'echo "$*" >> "{log}"\n'
+                'case "$*" in\n'
+                f'  *" --method POST "*) echo posted >> "{posted}"; exit 0;;\n'
+                f'  *"repos/{REPO} --jq .default_branch"*) echo {default_branch};;\n'
+                f'  *"git/ref/heads/"*) echo {tip};;\n'
+                f'  *"compare/"*) {"exit 1" if compare_fail else "printf %s " + json.dumps(status)};;\n'
+                f'  *"contents/scripts/ci/claude_fixer_publish.py"*) '
+                f'{"exit 1" if contents_fail else "printf %s " + json.dumps(blob)};;\n'
+                "  *) exit 1;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            gh.chmod(0o755)
+            env = {k: v for k, v in os.environ.items() if k != "GH_TOKEN"}
+            env.update(PATH=f"{root}{os.pathsep}{os.environ['PATH']}", REPO=REPO, PR_NUMBER="7",
+                       HEAD_SHA=head_sha, PUBLISHER_SHA=publisher_sha, RUNNER_TEMP=str(root), GH_TOKEN="x")
+            result = subprocess.run(["bash", "-c", script], cwd=root, env=env, capture_output=True, text=True)
+            calls = log.read_text(encoding="utf-8") if log.is_file() else ""
+            comment = posted.read_text(encoding="utf-8") if posted.is_file() else ""
+            result.output = (result.stdout or "") + (result.stderr or "")
+            return result, calls, comment
+
+    def test_three_publish_steps_share_one_thin_call(self):
+        self.publish_run()
+
+    def test_stacked_base_still_loads_the_recorded_default_branch_sha(self):
+        result, calls, comment = self._load()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(comment, "")
+        self.assertIn(f"contents/scripts/ci/claude_fixer_publish.py?ref={self.RECORDED}", calls)
+        self.assertNotIn(".base.sha", calls)
+        self.assertNotIn("pulls/7", calls)
+        self.assertNotIn("workflow_sha", calls)
+
+    def test_master_moving_forward_keeps_the_recorded_sha(self):
+        result, calls, comment = self._load(tip=self.TIP, status="behind")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(comment, "")
+        self.assertIn(f"compare/{self.TIP}...{self.RECORDED}", calls)
+
+    def test_recorded_sha_rewritten_off_master_is_refused(self):
+        result, _calls, comment = self._load(tip=self.TIP, status="diverged")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(comment, "posted\n")
+        self.assertIn("recorded publisher SHA is not on the default branch", result.output)
+
+    def test_compare_failure_is_refused(self):
+        result, _calls, comment = self._load(compare_fail=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(comment, "posted\n")
+        self.assertIn("recorded publisher SHA is not on the default branch", result.output)
+
+    def test_missing_blob_is_refused(self):
+        result, _calls, comment = self._load(contents_fail=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(comment, "posted\n")
+        self.assertIn("trusted publisher blob missing or not a file", result.output)
+
+    def test_empty_blob_is_refused(self):
+        result, _calls, comment = self._load(blob="")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(comment, "posted\n")
+        self.assertIn("trusted publisher blob missing or not a file", result.output)
+
+    def test_recorded_sha_equal_to_the_pr_head_is_refused(self):
+        result, calls, comment = self._load(publisher_sha=self.HEAD, head_sha=self.HEAD)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(comment, "posted\n")
+        self.assertIn("refusing to load the publisher from the PR head", result.output)
+        self.assertNotIn("contents/", calls)
 
 
 if __name__ == "__main__":

@@ -577,9 +577,11 @@ class WorkflowTests(unittest.TestCase):
             self.assertIn(f"MODEL_OUTCOME: ${{{{ needs.{model}.outputs.claude_outcome || needs.{model}.result }}}}",
                           job, publish)
             self.assertIn('python3 -I "$RUNNER_TEMP/claude-fixer-publish/publish.py"', job, publish)
-            self.assertIn(".base.sha", job, publish)
+            self.assertIn("PUBLISHER_SHA", job, publish)
             self.assertIn("scripts/ci/claude_fixer_publish.py", job, publish)
+            self.assertNotIn(".base.sha", job, publish)
             self.assertNotIn("github.sha", job, publish)
+            self.assertNotIn("github.workflow_sha", job, publish)
         self.assertEqual(text.count("timeout-minutes: 20"), 2)
         self.assertEqual(text.count("--max-turns 30"), 2)
         bodies = text.split("      - id: claude\n")[1:]

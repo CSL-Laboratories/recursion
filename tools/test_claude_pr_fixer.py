@@ -1348,7 +1348,8 @@ class ConflictJobStructureTests(unittest.TestCase):
         self.assertIn("not a denied command that blocks the push", job)
 
     def _prep(self, live: object, pause_var: str | None = None, env_extra: dict | None = None,
-              commit: object = None, reviews: object = None, ref: object = None) -> tuple[str, str]:
+              commit: object = None, reviews: object = None, ref: object = None,
+              repo: object = None, publisher_ref: object = None) -> tuple[str, str]:
         if shutil.which("bash") is None or shutil.which("jq") is None:
             self.skipTest("bash/jq not available")
         job = self._writer("prepare")
@@ -1360,7 +1361,9 @@ class ConflictJobStructureTests(unittest.TestCase):
             # Each endpoint reads its own fixture; the PR view is the default.
             fixtures = {"pr": live, "commit": commit if commit is not None else {},
                         "reviews": reviews if reviews is not None else [],
-                        "ref": ref if ref is not None else {"object": {"sha": "c" * 40}}}
+                        "ref": ref if ref is not None else {"object": {"sha": "c" * 40}},
+                        "repo": repo if repo is not None else {"default_branch": "master"},
+                        "publisher_ref": publisher_ref if publisher_ref is not None else {"object": {"sha": "d" * 40}}}
             for key, value in fixtures.items():
                 (d / f"{key}.json").write_text(json.dumps(value), encoding="utf-8")
             gh = d / "gh"
@@ -1368,7 +1371,14 @@ class ConflictJobStructureTests(unittest.TestCase):
                 "#!/usr/bin/env bash\n"
                 'expr=""; prev=""; file=pr\n'
                 'for a in "$@"; do if [ "$prev" = "--jq" ]; then expr="$a"; fi; prev="$a";\n'
-                '  case "$a" in */commits/*) file=commit;; */reviews*) file=reviews;; */git/ref/heads/*) file=ref;; esac; done\n'
+                '  case "$a" in\n'
+                '    repos/o/r) file=repo;;\n'
+                '    */git/ref/heads/master) file=publisher_ref;;\n'
+                '    */git/ref/heads/*) file=ref;;\n'
+                '    */commits/*) file=commit;;\n'
+                '    */reviews*) file=reviews;;\n'
+                '    */pulls/*) file=pr;;\n'
+                '  esac; done\n'
                 f'jq -r "$expr" "{d}/$file.json"\n',
                 encoding="utf-8",
             )
@@ -1410,7 +1420,7 @@ class ConflictJobStructureTests(unittest.TestCase):
     def test_prepare_records_the_base_and_proceeds_only_when_live(self) -> None:
         out, _ = self._prep(self.LIVE, "false")
         self.assertEqual(out, "proceed=true\nskip=false\nhead_sha=" + "a" * 40 + "\nhead_ref=feature/x\n"
-                         "base_sha=" + "c" * 40 + "\n")
+                         "base_sha=" + "c" * 40 + "\npublisher_sha=" + "d" * 40 + "\n")
         for live in (self.LIVE | {"state": "closed"}, self.LIVE | {"mergeable_state": "clean"},
                      self.LIVE | {"head": {"sha": "a" * 40, "repo": {"full_name": "evil/r"}}},
                      self.LIVE | {"base": {"ref": "release/v2"}}):
@@ -1423,6 +1433,23 @@ class ConflictJobStructureTests(unittest.TestCase):
                 out, stdout = self._prep(self.LIVE, ref=ref)
                 self.assertEqual(out, "proceed=false\n")
                 self.assertIn("base branch unreadable", stdout)
+
+    def test_prepare_records_default_branch_sha_on_a_stacked_base(self) -> None:
+        # BASE_REF is another PR branch; the publisher still comes from master.
+        live = {**self.LIVE, "base": {"ref": "feature/lower"}}
+        out, _ = self._prep(live, "false", env_extra={"BASE_REF": "feature/lower"})
+        self.assertEqual(out, "proceed=true\nskip=false\nhead_sha=" + "a" * 40 + "\nhead_ref=feature/x\n"
+                         "base_sha=" + "c" * 40 + "\npublisher_sha=" + "d" * 40 + "\n")
+
+    def test_prepare_skips_when_the_default_branch_is_unreadable(self) -> None:
+        for repo, publisher_ref in (({"default_branch": ""}, None),
+                                    ({"default_branch": "master..x"}, None),
+                                    (None, {"object": {"sha": "short"}}),
+                                    (None, {"object": {}})):
+            with self.subTest(repo=repo, publisher_ref=publisher_ref):
+                out, stdout = self._prep(self.LIVE, "false", repo=repo, publisher_ref=publisher_ref)
+                self.assertEqual(out, "proceed=false\n")
+                self.assertIn("default branch unreadable", stdout)
 
     def test_prepare_stringifies_label_names_like_the_scan_and_publisher(self) -> None:
         # Master's `| tostring` keeps the label check total: the scan and the publisher compare
@@ -1491,8 +1518,9 @@ class ConflictJobStructureTests(unittest.TestCase):
         self.assertIn("CLAUDE_FIXER_PAUSE: ${{ vars.CLAUDE_FIXER_PAUSE }}", self._writer("publish"))
         self.assertIn('PAUSE_LABELS = frozenset({"claude:pause", "hold"})',
                       (ROOT / "scripts/ci/claude_fixer_publish.py").read_text(encoding="utf-8"))
-        self.assertIn(".base.sha", self._writer("publish"))
+        self.assertIn("PUBLISHER_SHA", self._writer("publish"))
         self.assertIn("scripts/ci/claude_fixer_publish.py", self._writer("publish"))
+        self.assertNotIn(".base.sha", self._writer("publish"))
 
     def test_resolver_uses_fixed_helper_not_raw_gh_api(self) -> None:
         job = self._writer("model")
@@ -1620,6 +1648,8 @@ class FixerLoopCapTests(unittest.TestCase):
                 f'  *"graphql"*) {"exit 1" if listing_error else graphql_reply};;\n'
                 f'  *"collaborators/bob/permission"*) echo {commenter_permission};;\n'
                 f'  *"collaborators"*) echo {permission};;\n'
+                f'  *"repos/o/r --jq .default_branch"*) echo master;;\n'
+                f'  *"git/ref/heads/"*) echo {"d" * 40};;\n'
                 f'  "api repos/o/r/pulls/1") cat "{d}/pr.json";;\n'
                 f'  */commits*) {"exit 1" if listing_error else "cat" + chr(32) + str(d / "commits.tsv")};;\n'
                 f'  */comments*) cat "{d}/comments.txt";;\n'
@@ -1694,6 +1724,7 @@ class FixerLoopCapTests(unittest.TestCase):
         out, posted = self._run([("claude[bot]", "claude[bot]")], [], current_sha="b" * 40, findings="PRRT_late")
         self.assertIn("skip=false", out)
         self.assertIn("head_sha=" + "b" * 40, out)
+        self.assertIn("publisher_sha=" + "d" * 40, out)
         self.assertEqual(posted, "")
 
     def test_invalid_live_sha_skips(self) -> None:
@@ -1864,6 +1895,7 @@ class MentionLiveHeadTests(unittest.TestCase):
         out, posts = self._run([], [], current_sha="b" * 40)
         self.assertIn("head_sha=" + "b" * 40, out)
         self.assertIn("head_ref=feature/fix", out)
+        self.assertIn("publisher_sha=" + "d" * 40, out)
         self.assertIn("skip=false", out)
         self.assertEqual(posts, "")
 

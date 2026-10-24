@@ -50,6 +50,7 @@ jobs:
       head_sha: ${{ steps.prep.outputs.head_sha }}
       head_ref: ${{ steps.prep.outputs.head_ref }}
       base_sha: ${{ steps.prep.outputs.base_sha }}
+      publisher_sha: ${{ steps.prep.outputs.publisher_sha }}
       run_attempt: ${{ github.run_attempt }}
     steps:
       - name: Recheck pause, branch and Devin review under the PR lock
@@ -115,12 +116,24 @@ jobs:
             echo "proceed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # Publisher trust root: the default-branch SHA at prepare, even when
+          # BASE_REF is a stacked PR branch. Never the PR head, the merge commit,
+          # github.sha, or the workspace (CSL-414).
+          if ! default_branch="$(gh api "repos/$REPO" --jq '.default_branch')" \
+             || ! [[ "$default_branch" =~ ^[A-Za-z0-9._/-]+$ ]] || [[ "$default_branch" == *..* ]] \
+             || ! publisher_sha="$(gh api "repos/$REPO/git/ref/heads/${default_branch}" --jq '.object.sha')" \
+             || ! [[ "$publisher_sha" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]]; then
+            echo "conflict-resolve: default branch unreadable, skipping"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           {
             echo "proceed=true"
             echo "skip=false"
             echo "head_sha=$HEAD_SHA"
             echo "head_ref=$HEAD_REF"
             echo "base_sha=$base_sha"
+            echo "publisher_sha=$publisher_sha"
           } >> "$GITHUB_OUTPUT"
 
   model:
@@ -1824,24 +1837,42 @@ jobs:
           ARTIFACT_DIR: ${{ runner.temp }}/claude-writer-in
           BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
           BASE_REF: ${{ inputs.base_ref }}
+          PUBLISHER_SHA: ${{ needs.prepare.outputs.publisher_sha }}
         run: |
           set -euo pipefail
-          # Load scripts/ci/claude_fixer_publish.py from the live PR base SHA only.
-          # Never the PR head, the merge commit, the workspace, or a checkout.
+          # Load scripts/ci/claude_fixer_publish.py from the default-branch SHA
+          # prepare recorded. Never the PR head, the merge commit, the live PR
+          # base SHA, the workflow SHA, the workspace, or a checkout.
           handback() {
             echo "::error::publish: $1"
             jq -n --arg m "$1" '{body: ("Claude publisher: refused: " + $m + "; queued writes dropped.")}' \
               | gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" --input - >/dev/null || true
             exit 1
           }
-          if ! trusted_sha="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.base.sha')"; then
-            handback "trusted base SHA could not be read"
-          fi
+          trusted_sha="$PUBLISHER_SHA"
           if ! [[ "$trusted_sha" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]]; then
-            handback "trusted base SHA missing or malformed"
+            handback "trusted publisher SHA missing or malformed"
           fi
           if [[ "$trusted_sha" == "$HEAD_SHA" ]]; then
             handback "refusing to load the publisher from the PR head"
+          fi
+          if ! default_branch="$(gh api "repos/$REPO" --jq '.default_branch')"; then
+            handback "default branch name could not be read"
+          fi
+          if ! [[ "$default_branch" =~ ^[A-Za-z0-9._/-]+$ ]] || [[ "$default_branch" == *..* ]]; then
+            handback "default branch name missing or malformed"
+          fi
+          if ! tip="$(gh api "repos/$REPO/git/ref/heads/${default_branch}" --jq '.object.sha')"; then
+            handback "default branch tip could not be read"
+          fi
+          if ! [[ "$tip" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]]; then
+            handback "default branch tip missing or malformed"
+          fi
+          if ! status="$(gh api "repos/$REPO/compare/${tip}...${trusted_sha}" --jq '.status')"; then
+            handback "recorded publisher SHA is not on the default branch"
+          fi
+          if [[ "$status" != "identical" && "$status" != "behind" ]]; then
+            handback "recorded publisher SHA is not on the default branch"
           fi
           mkdir -p "$RUNNER_TEMP/claude-fixer-publish"
           if ! content="$(gh api "repos/$REPO/contents/scripts/ci/claude_fixer_publish.py?ref=$trusted_sha" \

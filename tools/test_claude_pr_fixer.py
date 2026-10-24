@@ -593,6 +593,7 @@ class WorkflowStructureTests(unittest.TestCase):
                     job,
                 )
                 self.assertNotIn("python -m pip install", job)
+                self.assertNotIn("cache: pip", job)
 
     def test_claude_code_action_is_pinned_to_resolved_v1_commit(self) -> None:
         pin = f"uses: {self.ACTION_USES} # {self.ACTION_TAG}"
@@ -601,6 +602,9 @@ class WorkflowStructureTests(unittest.TestCase):
         scan = SCAN_WORKFLOW_PATH.read_text(encoding="utf-8")
         self.assertIn(pin, scan)
         self.assertNotIn("uses: anthropics/claude-code-action@v1\n", scan)
+        contract = (ROOT / "docs" / "ci-event-contract.md").read_text(encoding="utf-8")
+        self.assertIn(self.ACTION_USES, contract)
+        self.assertNotIn("anthropics/claude-code-action@v1", contract)
 
     def test_acceptance_gates_before_push(self) -> None:
         devin = self._job("devin-review-fix")

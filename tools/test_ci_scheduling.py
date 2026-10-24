@@ -329,7 +329,7 @@ class WorkflowShapeTests(unittest.TestCase):
         self.assertIn("runs-on: ubuntu-24.04", tests)
         self.assertIn("timeout-minutes: 15\n", tests)
         self.assertEqual(job_needs(tests), ["preflight", "settle"])
-        for needle in ("fetch-depth: 0", "cache: pip", "tools/ci_gate.py --force", "tools/perf_ci.py", "::warning::"):
+        for needle in ("fetch-depth: 0", "tools/ci_gate.py --force", "tools/perf_ci.py", "::warning::"):
             self.assertIn(needle, tests)
         self.assertNotIn("--paths-only", tests)
         windows, macos = job_block("windows"), job_block("macos")
@@ -347,9 +347,10 @@ class WorkflowShapeTests(unittest.TestCase):
             self.assertIn("shell: bash", block)
             self.assertIn(pip, block)
             self.assertNotIn("python -m pip install", block)
+            self.assertNotIn("cache: pip", block)
+            self.assertNotIn("cache-dependency-path:", block)
         for block in (windows, macos):
             self.assertIn("fetch-depth: 0", block)
-            self.assertIn("cache-dependency-path: requirements-ci.txt", block)
             self.assertIn("tools/ci_gate.py --force", block)
         for line in TEXT.splitlines():
             if line.lstrip().startswith("run:"):
@@ -363,9 +364,19 @@ class WorkflowShapeTests(unittest.TestCase):
         self.assertEqual(matrix.count("REQUIREMENTS_CI: ${{ github.workspace }}/requirements-ci.txt"), 2)
         self.assertEqual(matrix.count("shell: bash"), 2)
         self.assertNotIn("python -m pip install", matrix)
+        self.assertNotIn("cache: pip", matrix)
+        self.assertNotIn("cache-dependency-path:", matrix)
         for line in matrix.splitlines():
             if line.lstrip().startswith("run:"):
                 self.assertNotIn("${{", line, "expressions reach shells via env, not interpolation")
+
+    def test_pr_and_model_jobs_do_not_enable_setup_python_pip_cache(self) -> None:
+        leftover = []
+        for path in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
+            for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                if "cache: pip" in line:
+                    leftover.append(f"{path.name}:{number}")
+        self.assertEqual(leftover, ["ci-macos-nightly.yml:71"])
 
     def test_only_master_nightly_keeps_checkout_cwd_pip(self) -> None:
         leftover = []

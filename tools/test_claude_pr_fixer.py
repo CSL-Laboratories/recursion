@@ -1299,8 +1299,9 @@ class ConflictJobStructureTests(unittest.TestCase):
         self.assertIn("needs.prepare.outputs.skip == 'false'", job.split("steps:")[0])
         self.assertIn("needs.prepare.outputs.skip == 'false'", publish.split("steps:")[0])
         self.assertIn("proceed=true", prepare)
-        self.assertIn('"open $HEAD_SHA dirty $REPO"', prepare)
+        self.assertIn('"open $HEAD_SHA dirty $REPO $BASE_REF"', prepare)
         self.assertIn(".head.repo.full_name", prepare)
+        self.assertIn(".base.ref", prepare)
         for path in (".github/**", "AGENTS.md", "CLAUDE.md", "CODEOWNERS", "scripts/ci/**", "tools/ci_gate.py",
                      "tools/test_claude_pr_fixer.py", ".git/**", ".env*", ".claude/**"):
             self.assertIn(f'"Edit({path})"', job)
@@ -1404,14 +1405,15 @@ class ConflictJobStructureTests(unittest.TestCase):
         self.assertNotIn("paused", stdout)
 
     LIVE = {"state": "open", "head": {"sha": "a" * 40, "repo": {"full_name": "o/r"}}, "mergeable_state": "dirty",
-            "labels": [{"name": "needs-review"}]}
+            "base": {"ref": "main"}, "labels": [{"name": "needs-review"}]}
 
     def test_prepare_records_the_base_and_proceeds_only_when_live(self) -> None:
         out, _ = self._prep(self.LIVE, "false")
         self.assertEqual(out, "proceed=true\nskip=false\nhead_sha=" + "a" * 40 + "\nhead_ref=feature/x\n"
                          "base_sha=" + "c" * 40 + "\n")
         for live in (self.LIVE | {"state": "closed"}, self.LIVE | {"mergeable_state": "clean"},
-                     self.LIVE | {"head": {"sha": "a" * 40, "repo": {"full_name": "evil/r"}}}):
+                     self.LIVE | {"head": {"sha": "a" * 40, "repo": {"full_name": "evil/r"}}},
+                     self.LIVE | {"base": {"ref": "release/v2"}}):
             with self.subTest(live=live):
                 out, stdout = self._prep(live)
                 self.assertEqual(out, "proceed=false\n")

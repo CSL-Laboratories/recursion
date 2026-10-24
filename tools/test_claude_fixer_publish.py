@@ -763,9 +763,10 @@ class OutboxSchemaTests(unittest.TestCase):
             p.load_outbox(b"\xff\xfe", "fixer", set())
 
 
-def pr(sha, labels=(), state="open", ref="fix", repo=REPO):
+def pr(sha, labels=(), state="open", ref="fix", repo=REPO, base_ref="main"):
     return {"state": state, "labels": [{"name": n} for n in labels],
-            "head": {"sha": sha, "ref": ref, "repo": {"full_name": repo}}}
+            "head": {"sha": sha, "ref": ref, "repo": {"full_name": repo}},
+            "base": {"ref": base_ref}}
 
 
 A, B, C = "a" * 40, "b" * 40, "c" * 40
@@ -820,6 +821,7 @@ class Harness:
         self.push_error = None
         self.minted_at_validation = None
         self.intents = []
+        self.fetches = 0
 
     def read(self, path):
         if "/pulls/comments/" in path:
@@ -861,13 +863,16 @@ class Harness:
                 raise self.validate_error
             return p.ABORTED if intent[0] == "abort" else self.candidate
 
+        def fetch(*_a):
+            self.fetches += 1
+
         def push(repo, config, candidate, token):
             if self.push_error:
                 raise self.push_error
             self.pushed.append((candidate, token))
             self.heads = [self.candidate]
 
-        with patch.object(p, "fetch_recorded", lambda *a: None), patch.object(p, "build_candidate", build), \
+        with patch.object(p, "fetch_recorded", fetch), patch.object(p, "build_candidate", build), \
                 patch.object(p, "push_candidate", push):
             return p.main(self.env, deps)
 
@@ -950,6 +955,35 @@ class PublishFlowTests(unittest.TestCase):
         # CSL-405: the token is minted after the recheck, so none exists to revoke.
         self.assertEqual((h.minted, h.revoked), (0, []))
         self.assertIn("queued writes dropped", h.audits[0])
+
+    def test_conflict_retarget_refuses_even_when_the_head_is_unchanged(self):
+        # A later retarget must invalidate a prepared merge of the recorded BASE_REF.
+        for at in (0, 1):  # the first live check, or the recheck right before the push
+            with self.subTest(at=at):
+                h = Harness(self, mode="conflict", commit=True, roots=(),
+                            records=[{"op": "comment", "body": "x"}])
+                calls = {"n": 0}
+                original = h.read
+
+                def read(path, h=h, calls=calls, at=at, original=original):
+                    if not path.endswith("/pulls/7"):
+                        return original(path)
+                    calls["n"] += 1
+                    body = original(path)
+                    if calls["n"] - 1 >= at:
+                        return {**body, "base": {"ref": "release/v2"}}
+                    return body
+                h.read = read
+                h.run()
+                self.assertEqual((h.pushed, h.writes, h.minted, h.revoked), ([], [], 0, []))
+                self.assertIn("refused: PR identity changed; " + ("nothing published", "queued writes dropped")[at],
+                              h.audits[0])
+
+    def test_abort_skips_snapshot_intake(self):
+        called = []
+        with patch.object(p, "read_snapshot", lambda *a: called.append(a) or ([], {})):
+            self.assertEqual(p.build_candidate(object(), {"mode": "conflict"}, Path("."), ("abort", None)), p.ABORTED)
+        self.assertEqual(called, [])
 
     def test_identity_change_refuses_before_minting_and_never_pushes(self):
         # GitHub releases the per-PR lock between prepare and publish: publish must fail closed if
@@ -1172,7 +1206,7 @@ class PublishFlowTests(unittest.TestCase):
         h.run()
         self.assertEqual((h.pushed, [w[1].rsplit("/7/", 1)[1] for w in h.writes]), ([], ["comments", "labels"]))
         self.assertIn("merge abort requested; no candidate", h.audits[0])
-        self.assertEqual(h.intents, [("abort", None)])
+        self.assertEqual((h.fetches, h.intents), (0, []))  # abort never fetches or reads the snapshot
         for mode in ("mention", "fixer"):
             h = Harness(self, mode=mode, records=records[:1], intent='{"op":"abort"}\n')
             h.run()
@@ -2509,7 +2543,7 @@ class DeferredCommitFlow(FlowCase):
             result = self.publish(records=[{"op": "comment", "body": "x"}])
             self.assertIn("refused: abort intent outside conflict mode; nothing published", result.audit)
             self.assertEqual((self.argv, result.writes), ([], []))
-        # Conflict: abort plus an invalid manifest fails; abort plus a valid snapshot aborts.
+        # Conflict: abort never reads the snapshot, so a malformed manifest still posts the handoff.
         shutil.rmtree(self.work.path)
         self.conflict_model()
         self.intent()
@@ -2520,16 +2554,36 @@ class DeferredCommitFlow(FlowCase):
         records = [{"op": "comment", "body": "needs a human"}, {"op": "label", "label": "needs-decision"},
                    {"op": "reply", "comment_id": 11, "body": "x"}, {"op": "comment", "body": "{{CLAUDE_COMMIT_SHA}}"}]
         result = self.publish(records=records)
-        self.assertIn("refused: snapshot manifest is malformed; queued writes dropped", result.audit)
-        self.assert_nothing_built_or_published(result)
+        self.assertIn("merge abort requested; no candidate", result.audit)
+        self.assertEqual(result.pushed, "")
+        self.assertEqual(self.git_calls("fetch", "hash-object", "commit-tree", "push"), [])
+        self.assertEqual([(w[1].rsplit("/7/", 1)[1], w[3]) for w in result.writes],
+                         [("comments", {"body": "needs a human"}), ("labels", {"labels": ["needs-decision"]})])
+        self.assertIn("2 queued write(s) posted, 2 refused", result.audit)
         (self.artifact / "snapshot.manifest").write_bytes(good)
         result = self.publish(records=records)
         self.assertIn("merge abort requested; no candidate", result.audit)
         self.assertEqual(result.pushed, "")
+        self.assertEqual(self.git_calls("fetch", "hash-object", "commit-tree", "push"), [])
         self.assertEqual([(w[1].rsplit("/7/", 1)[1], w[3]) for w in result.writes],
                          [("comments", {"body": "needs a human"}), ("labels", {"labels": ["needs-decision"]})])
         self.assertIn("2 queued write(s) posted, 2 refused", result.audit)
-        self.assertEqual(self.git_calls("hash-object", "commit-tree", "push"), [])
+
+    def test_abort_posts_handoff_when_the_base_branch_moved(self):
+        # A base push during the model job must not drop the abort comment and needs-decision label.
+        self.conflict_model()
+        self.intent(op="abort")
+        self.package()
+        moved = self.remote_git("commit-tree", self.base + "^{tree}", "-p", self.base, "-m", "base moved").decode().strip()
+        self.remote_git("update-ref", "refs/heads/main", moved)
+        records = [{"op": "comment", "body": "needs a human"}, {"op": "label", "label": "needs-decision"}]
+        result = self.publish(records=records)
+        self.assertIn("merge abort requested; no candidate", result.audit)
+        self.assertEqual(result.pushed, "")
+        self.assertEqual(self.git_calls("fetch"), [])
+        self.assertEqual([(w[1].rsplit("/7/", 1)[1], w[3]) for w in result.writes],
+                         [("comments", {"body": "needs a human"}), ("labels", {"labels": ["needs-decision"]})])
+        self.assertIn("2 queued write(s) posted, 0 refused", result.audit)
 
     # -- 8.10: conflict mode ----------------------------------------------------------
 
@@ -3983,6 +4037,8 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertEqual(prepare["outputs"]["base_sha"], "${{ steps.prep.outputs.base_sha }}")
         prep = [s for s in prepare["steps"] if s.get("id") == "prep"][0]["run"]
         self.assertIn('base_sha="$(gh api "repos/$REPO/git/ref/heads/$BASE_REF" --jq \'.object.sha\')"', prep)
+        self.assertIn('(.base.ref // "")', prep)
+        self.assertIn('"open $HEAD_SHA dirty $REPO $BASE_REF"', prep)
         publish = step(jobs("claude-conflict-writer.yml")["publish"], PUBLISH_STEP)["env"]
         self.assertEqual(publish["BASE_SHA"], "${{ needs.prepare.outputs.base_sha }}")
         self.assertEqual(publish["WRITER_MODE"], "conflict")

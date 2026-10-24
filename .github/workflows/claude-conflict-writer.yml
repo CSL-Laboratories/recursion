@@ -86,9 +86,9 @@ jobs:
             echo "proceed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # Re-check right before acting: skip if the branch moved or is no longer conflicted.
-          current="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '[.state, .head.sha, (.mergeable_state // ""), (.head.repo.full_name // "")] | join(" ")')"
-          if [ "$current" != "open $HEAD_SHA dirty $REPO" ]; then
+          # Re-check right before acting: skip if the branch moved, was retargeted, or is no longer conflicted.
+          current="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '[.state, .head.sha, (.mergeable_state // ""), (.head.repo.full_name // ""), (.base.ref // "")] | join(" ")')"
+          if [ "$current" != "open $HEAD_SHA dirty $REPO $BASE_REF" ]; then
             echo "conflict-resolve: stale scan result, skipping (now: ${current%% *})"
             echo "proceed=false" >> "$GITHUB_OUTPUT"
             exit 0
@@ -1907,8 +1907,7 @@ jobs:
           # Exact paths from the repository root.
           PROTECTED_FILES = frozenset({"tools/ci_gate.py", "tools/test_ci_gate.py", "tools/test_claude_pr_fixer.py",
                                        "control_plane.md", "anchor.md", "state/decisions.md"})
-          # Loop test suites under tools/ (prefix match): Claude writers and settings, Codex gate, fixer escalation and
-          # watcher, stuck-thread watch.
+          # Loop test suites under tools/: Claude, Codex, fixer, stuck-thread (prefix match).
           PROTECTED_TEST_PREFIXES = ("tools/test_claude_", "tools/test_codex_", "tools/test_fixer_", "tools/test_stuck_")
           # Basenames anywhere in the tree.
           PROTECTED_NAMES = frozenset({"codeowners", "agents.md", "claude.md", ".mcp.json",
@@ -2116,7 +2115,8 @@ jobs:
               head = pr.get("head") or {}
               if (pr.get("state") != "open" or head.get("ref") != config["ref"]
                       or (head.get("repo") or {}).get("full_name") != config["repo"]
-                      or not SHA.fullmatch(str(head.get("sha") or ""))):
+                      or not SHA.fullmatch(str(head.get("sha") or ""))
+                      or (config["mode"] == "conflict" and (pr.get("base") or {}).get("ref") != config["base_ref"])):
                   raise LiveStateRefused("PR identity changed")
               reason = pause_refusal(pr, env)
               if reason:
@@ -2661,12 +2661,12 @@ jobs:
 
           def build_candidate(repo, config, artifact, intent):
               """Every check before any credential: ABORTED, "" (no change) or the candidate SHA."""
+              if intent[0] == "abort":
+                  return ABORTED
               version = re.match(r"git version (\d+)\.(\d+)", repo.text("version"))
               if not version or (int(version.group(1)), int(version.group(2))) < (2, 40):  # check-attr --source
                   raise Refused("git 2.40 or later is required")
               records, data = read_snapshot(repo, config, artifact)
-              if intent[0] == "abort":
-                  return ABORTED
               candidate = construct(repo, config, records, data, intent[1])
               if not candidate:
                   return ""
@@ -2931,32 +2931,34 @@ jobs:
               token = None
               pushed = candidate = ""
               try:
-                  if intent is not None:
+                  if intent is not None and intent[0] == "abort":
+                      candidate = ABORTED
+                  elif intent is not None:
                       with tempfile.TemporaryDirectory(dir=env.get("RUNNER_TEMP") or None) as tmp:
                           repo = deps["repo"](tmp)
                           fetch_recorded(repo, config, env.get("GH_TOKEN") or None)
                           candidate = build_candidate(repo, config, artifact, intent)
-                          if candidate and candidate != ABORTED:
+                          if candidate:
                               state_path.write_text(json.dumps({"candidate": candidate}), encoding="utf-8")
                               live_head(config, env, read, {config["base"]})
                               # CSL-405: no App token exists while untrusted input is parsed.
                               token = deps["mint"](env)
                               push_candidate(repo, config, candidate, token)
-                      if candidate == ABORTED:
-                          notes.append("merge abort requested; no candidate")
-                      elif not candidate:
-                          notes.append("commit intent changed nothing; no candidate")
-                      else:
-                          for attempt in range(3):
-                              try:
-                                  if live_head(config, env, read, {candidate}) == candidate:
-                                      pushed = candidate
-                                      break
-                              except Refused:
-                                  if attempt == 2:
-                                      raise
-                                  deps["sleep"](2)
-                          notes.append(f"pushed candidate `{pushed}` as one ordinary fast-forward")
+                  if candidate == ABORTED:
+                      notes.append("merge abort requested; no candidate")
+                  elif intent is not None and not candidate:
+                      notes.append("commit intent changed nothing; no candidate")
+                  elif intent is not None:
+                      for attempt in range(3):
+                          try:
+                              if live_head(config, env, read, {candidate}) == candidate:
+                                  pushed = candidate
+                                  break
+                          except Refused:
+                              if attempt == 2:
+                                  raise
+                              deps["sleep"](2)
+                      notes.append(f"pushed candidate `{pushed}` as one ordinary fast-forward")
                   if records:
                       if token is None:
                           token = deps["mint"](env)

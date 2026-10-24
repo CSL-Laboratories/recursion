@@ -1313,7 +1313,7 @@ jobs:
         timeout-minutes: 20
         # v1.0.256 (CSL-414 + CSL-473): SHA-pinned; installer skipped via path_to;
         # bumps recheck allowed_non_write_users and git-auth behaviour.
-        uses: anthropics/claude-code-action@a5a423f75c251dcbff8a74e99f83b2cb03c72bfa
+        uses: anthropics/claude-code-action@a5a423f75c251dcbff8a74e99f83b2cb03c72bfa # v1.0.256
         env:
           # Scrub credentials from the commands Claude runs (sandboxed by bubblewrap above).
           CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
@@ -1340,6 +1340,14 @@ jobs:
                   "Read(.env.*)",
                   "Edit(.github/workflows/**)",
                   "Write(.github/workflows/**)",
+                  "Edit(pip/**)",
+                  "Write(pip/**)",
+                  "Edit(*.pth)",
+                  "Write(*.pth)",
+                  "Edit(sitecustomize.py)",
+                  "Write(sitecustomize.py)",
+                  "Edit(usercustomize.py)",
+                  "Write(usercustomize.py)",
                   "Edit(.git/**)",
                   "Write(.git/**)",
                   "Edit(/${{ runner.temp }}/claude-fixer-guard/**)",
@@ -4062,7 +4070,7 @@ jobs:
         timeout-minutes: 20
         # v1.0.256 (CSL-414 + CSL-473): SHA-pinned; installer skipped via path_to;
         # bumps recheck allowed_non_write_users and git-auth behaviour.
-        uses: anthropics/claude-code-action@a5a423f75c251dcbff8a74e99f83b2cb03c72bfa
+        uses: anthropics/claude-code-action@a5a423f75c251dcbff8a74e99f83b2cb03c72bfa # v1.0.256
         env:
           # Scrub credentials from the commands Claude runs (sandboxed by bubblewrap above).
           CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
@@ -4091,6 +4099,14 @@ jobs:
                   "Read(.env.*)",
                   "Edit(.github/workflows/**)",
                   "Write(.github/workflows/**)",
+                  "Edit(pip/**)",
+                  "Write(pip/**)",
+                  "Edit(*.pth)",
+                  "Write(*.pth)",
+                  "Edit(sitecustomize.py)",
+                  "Write(sitecustomize.py)",
+                  "Edit(usercustomize.py)",
+                  "Write(usercustomize.py)",
                   "Edit(.git/**)",
                   "Write(.git/**)",
                   "Edit(/${{ runner.temp }}/claude-fixer-guard/**)",

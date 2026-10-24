@@ -644,6 +644,10 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn("GH_TOKEN: ${{ github.token }}", self._job("resolve-pr"))
         self.assertIn("DISPATCH_EVENTS", source)
 
+    ACTION_SHA = "a5a423f75c251dcbff8a74e99f83b2cb03c72bfa"
+    ACTION_TAG = "v1.0.256"
+    ACTION_USES = f"anthropics/claude-code-action@{ACTION_SHA}"
+
     def test_model_jobs_install_and_run_no_repository_code(self) -> None:
         # CSL-414: the model job holds the model credential, so it installs no PR-controlled
         # dependencies and runs no repository code; the required linux job tests the pushed commit.
@@ -662,6 +666,34 @@ class WorkflowStructureTests(unittest.TestCase):
             self.assertIn("anthropics/claude-code-action@a5a423f75c251dcbff8a74e99f83b2cb03c72bfa", job)
             self.assertIn("path_to_claude_code_executable: /opt/csl-claude/2.1.306/claude", job)
             self.assertIn("Install hash-pinned Claude Code CLI", job, name)
+
+    def test_privileged_pip_isolates_sys_path_and_reads_trusted_requirements(self) -> None:
+        # CSL-414: model jobs hold the model credential and must not pip.
+        # CSL-471: linux CI jobs that still run pip do it isolated (python -P).
+        for name in MODEL_JOBS:
+            job = self._job(name)
+            with self.subTest(job=name):
+                self.assertNotIn("pip install", job)
+                self.assertNotIn("actions/setup-python", job)
+                self.assertNotIn("requirements-ci.txt", job)
+                self.assertNotIn("cache: pip", job)
+        ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        self.assertIn('python -P -m pip install --only-binary=:all: -r "$REQUIREMENTS_CI"', ci)
+        self.assertNotIn("python -m pip install", ci)
+        self.assertNotIn("cache: pip", ci)
+
+    def test_claude_code_action_is_pinned_to_resolved_v1_commit(self) -> None:
+        pin = f"uses: {self.ACTION_USES} # {self.ACTION_TAG}"
+        self.assertGreaterEqual(self.text.count(pin), 2)
+        self.assertNotIn("uses: anthropics/claude-code-action@v1\n", self.text)
+        writer = WRITER_WORKFLOW_PATH.read_text(encoding="utf-8")
+        self.assertIn(pin, writer)
+        self.assertNotIn("uses: anthropics/claude-code-action@v1\n", writer)
+        scan = SCAN_WORKFLOW_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("anthropics/claude-code-action@", scan)
+        contract = (ROOT / "docs" / "ci-event-contract.md").read_text(encoding="utf-8")
+        self.assertIn(self.ACTION_USES, contract)
+        self.assertNotIn("anthropics/claude-code-action@v1", contract)
 
     def test_acceptance_gates_before_push(self) -> None:
         devin = self._job("devin-review-fix")

@@ -88,7 +88,7 @@ PROTECTED_TEST_PREFIXES = ("tools/test_claude_", "tools/test_codex_", "tools/tes
 # Basenames anywhere in the tree.
 PROTECTED_NAMES = frozenset({"codeowners", "agents.md", "claude.md", ".mcp.json",
                              ".netrc", "_netrc", ".npmrc", ".pypirc", ".pgpass", "pip.conf", "pip.ini",
-                             ".yarnrc", ".yarnrc.yml"})
+                             ".yarnrc", ".yarnrc.yml", "sitecustomize.py", "usercustomize.py"})
 # Directory names anywhere in the tree.
 PROTECTED_DIRS = frozenset({".claude", ".claude-fixer-out", ".claude-fixer-replies", ".cursor",
                             ".aws", ".docker", ".kube", ".ssh", ".gnupg"})
@@ -402,13 +402,14 @@ def is_protected(path):
     parts = folded.split("/")
     if any(part.startswith(".git") or part.startswith(".env") or part in PROTECTED_DIRS for part in parts):
         return True
-    if parts[-1] in PROTECTED_NAMES:
+    if parts[-1] in PROTECTED_NAMES or parts[-1].endswith(".pth"):
         return True
     if tuple(parts[:2]) == FIXTURES_ROOT and FIXTURES_DIR in parts[2:]:
         return True
     if folded.startswith(PROTECTED_TEST_PREFIXES):
         return True
-    return folded.startswith("scripts/ci/") or folded in PROTECTED_FILES
+    # CSL-471: pip-shadow paths the model is denied from editing (root pip/**).
+    return folded.startswith("scripts/ci/") or folded.startswith("pip/") or folded == "pip" or folded in PROTECTED_FILES
 
 
 class FreshRepo:

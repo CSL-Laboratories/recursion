@@ -643,7 +643,11 @@ class GuardedWriterJobTests(unittest.TestCase):
     """Every Claude writer that installs the guard must keep it out of the model's reach."""
 
     DENY = ('"Edit(.git/**)"', '"Write(.git/**)"',
-            '"Edit(/${{ runner.temp }}/claude-fixer-guard/**)"', '"Write(/${{ runner.temp }}/claude-fixer-guard/**)"')
+            '"Edit(/${{ runner.temp }}/claude-fixer-guard/**)"', '"Write(/${{ runner.temp }}/claude-fixer-guard/**)"',
+            '"Edit(pip/**)"', '"Write(pip/**)"',
+            '"Edit(*.pth)"', '"Write(*.pth)"',
+            '"Edit(sitecustomize.py)"', '"Write(sitecustomize.py)"',
+            '"Edit(usercustomize.py)"', '"Write(usercustomize.py)"')
 
     @staticmethod
     def jobs(marker="<<'CLAUDE_FIXER_GUARD'"):

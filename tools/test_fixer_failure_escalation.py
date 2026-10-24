@@ -330,7 +330,7 @@ class EvidenceTests(unittest.TestCase):
         header, steps_text = job.split("    steps:\n", 1)
         self.assertNotRegex(header, r"(?m)^    (name|strategy|uses):")
         steps = re.split(r"(?m)^      - ", steps_text)[1:]
-        action = [(i, s) for i, s in enumerate(steps) if f"        uses: {m.ACTION_USES}\n" in s]
+        action = [(i, s) for i, s in enumerate(steps) if f"        uses: {m.ACTION_USES}" in s]
         context = [(i, s) for i, s in enumerate(steps) if s.startswith('name: "Fixer attempt ${{ needs.fixer-prepare.outputs.attempt_key }}"\n')]
         # CSL-414: locked eligibility moved to the trusted fixer-prepare job; the model job
         # keeps the devin-review-fix name and its context step before the action step.

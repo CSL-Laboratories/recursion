@@ -171,6 +171,7 @@ class ProtectedPathTests(unittest.TestCase):
                      ".claude/settings.json", "app/.claude/commands/x.md", ".claude-fixer-out/outbox.jsonl",
                      ".claude-fixer-replies/a.txt", "scripts/ci/x.py", "SCRIPTS/CI/x.py", "scripts/ci/nested/y.py",
                      "tools/ci_gate.py", "tools/test_claude_pr_fixer.py",
+                     "pip/x.py", "sitecustomize.py", "usercustomize.py", "app/x.pth",
                      "CODEOWNERS", "docs/CODEOWNERS", "AGENTS.md", "app/AGENTS.md", "CLAUDE.md", "claude.md",
                      ".env", ".env.local", "app/.env", ".envrc", ".mcp.json", "app/.mcp.json"):
             with self.subTest(path=path):
@@ -273,7 +274,8 @@ class LinearValidationTests(GitCase):
                        {"docs/CODEOWNERS": "* @x\n"}, {".claude/settings.json": "{}\n"},
                        {"CONTROL_PLANE.md": "x\n"}, {"ANCHOR.md": "x\n"}, {"state/DECISIONS.md": "x\n"},
                        {"scripts/tests/v3/fixtures/F.json": "{}\n"}, {"tools/ci_gate.py": "x\n"},
-                       {".cursor/mcp.json": "{}\n"}):
+                       {".cursor/mcp.json": "{}\n"}, {"pip/sitecustomize.py": "x\n"},
+                       {"sitecustomize.py": "x\n"}, {"x.pth": "x\n"}):
             with self.subTest(change=change):
                 self.model.git("reset", "-q", "--hard", self.head)
                 self.model.commit(change)
@@ -3311,11 +3313,18 @@ class PrecisionTests(FlowCase):
 class FrozenDenyTests(unittest.TestCase):
     """v4.3 section 0: every deny list stays byte-identical to Port C (365121d1)."""
     CLAUDE_YML = ["Read(.env)", "Read(.env.*)", "Edit(.github/workflows/**)", "Write(.github/workflows/**)",
+                  "Edit(pip/**)", "Write(pip/**)", "Edit(*.pth)", "Write(*.pth)",
+                  "Edit(sitecustomize.py)", "Write(sitecustomize.py)",
+                  "Edit(usercustomize.py)", "Write(usercustomize.py)",
                   "Edit(.git/**)", "Write(.git/**)", "Edit(/${{ runner.temp }}/claude-fixer-guard/**)",
                   "Write(/${{ runner.temp }}/claude-fixer-guard/**)", "Edit(.claude/**)", "Write(.claude/**)",
                   "Edit(~/.claude/**)", "Write(~/.claude/**)", "Edit(~/.gitconfig)", "Write(~/.gitconfig)",
                   "Edit(~/.config/git/**)", "Write(~/.config/git/**)", "Read(~/.claude/**)"]
-    WRITER = ["Read(.env)", "Read(.env.*)", "Edit(.github/**)", "Write(.github/**)", "Edit(.env*)", "Write(.env*)",
+    WRITER = ["Read(.env)", "Read(.env.*)", "Edit(.github/**)", "Write(.github/**)",
+              "Edit(pip/**)", "Write(pip/**)", "Edit(*.pth)", "Write(*.pth)",
+              "Edit(sitecustomize.py)", "Write(sitecustomize.py)",
+              "Edit(usercustomize.py)", "Write(usercustomize.py)",
+              "Edit(.env*)", "Write(.env*)",
               "Edit(AGENTS.md)", "Write(AGENTS.md)", "Edit(CLAUDE.md)", "Write(CLAUDE.md)", "Edit(CODEOWNERS)",
               "Write(CODEOWNERS)", "Edit(scripts/ci/**)", "Write(scripts/ci/**)", "Edit(tools/ci_gate.py)",
               "Write(tools/ci_gate.py)", "Edit(tools/test_claude_pr_fixer.py)", "Write(tools/test_claude_pr_fixer.py)",
@@ -4158,7 +4167,7 @@ class WorkflowWiringTests(unittest.TestCase):
         escalation = load("fixer_failure_escalation", "scripts/ci/fixer_failure_escalation.py")
         self.assertRegex(escalation.ACTION_USES, r"^anthropics/claude-code-action@[0-9a-f]{40}$")
         text = WORKFLOWS["claude.yml"].read_text(encoding="utf-8")
-        uses = re.findall(r"(?m)^\s*(?:-\s+)?uses:\s*(anthropics/claude-code-action@\S*)\s*$", text)
+        uses = re.findall(r"(?m)^\s*(?:-\s+)?uses:\s*(anthropics/claude-code-action@[0-9a-f]{40})", text)
         self.assertEqual(uses, [escalation.ACTION_USES] * 2)
         self.assertEqual(text.count("anthropics/claude-code-action@"), 2)
         for name in ("claude-mention", "devin-review-fix"):
@@ -4174,7 +4183,7 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertEqual({name: n for name, n in counts.items() if n},
                          {"claude.yml": 2, "claude-conflict-writer.yml": 1})
         text = WORKFLOWS["claude-conflict-writer.yml"].read_text(encoding="utf-8")
-        uses = re.findall(r"(?m)^\s*(?:-\s+)?uses:\s*(anthropics/claude-code-action@\S*)\s*$", text)
+        uses = re.findall(r"(?m)^\s*(?:-\s+)?uses:\s*(anthropics/claude-code-action@[0-9a-f]{40})", text)
         self.assertEqual(uses, [escalation.ACTION_USES])
         action = [s for s in jobs("claude-conflict-writer.yml")["model"]["steps"] if s.get("id") == "claude"]
         self.assertEqual([s["uses"] for s in action], [escalation.ACTION_USES])

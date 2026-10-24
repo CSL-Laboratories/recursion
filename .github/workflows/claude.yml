@@ -551,7 +551,11 @@ jobs:
           python-version: "3.12"
       - name: Install acceptance-gate dependencies
         if: steps.live.outputs.skip != 'true'
-        run: python -m pip install --disable-pip-version-check -r requirements-ci.txt
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          git -C "$GITHUB_WORKSPACE" show origin/master:requirements-ci.txt > "$RUNNER_TEMP/requirements-ci.txt"
+          python -P -m pip install --disable-pip-version-check --only-binary=:all: -r "$RUNNER_TEMP/requirements-ci.txt"
       - name: Install single-attempt push guard
         id: push_guard
         if: steps.live.outputs.skip != 'true'
@@ -943,7 +947,7 @@ jobs:
       - id: claude
         if: steps.live.outputs.skip != 'true'
         timeout-minutes: 20
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@a5a423f75c251dcbff8a74e99f83b2cb03c72bfa # v1.0.256
         with:
           # CSL-383: no post-step that publishes the model-writable inline-comment
           # buffer (/tmp/inline-comments-buffer.jsonl) with a write token.
@@ -957,6 +961,14 @@ jobs:
                   "Read(.env.*)",
                   "Edit(.github/workflows/**)",
                   "Write(.github/workflows/**)",
+                  "Edit(pip/**)",
+                  "Write(pip/**)",
+                  "Edit(*.pth)",
+                  "Write(*.pth)",
+                  "Edit(sitecustomize.py)",
+                  "Write(sitecustomize.py)",
+                  "Edit(usercustomize.py)",
+                  "Write(usercustomize.py)",
                   "Edit(.git/**)",
                   "Write(.git/**)",
                   "Edit(/${{ runner.temp }}/claude-fixer-guard/**)",
@@ -2016,7 +2028,11 @@ jobs:
           python-version: "3.12"
       - name: Install acceptance-gate dependencies
         if: steps.cap.outputs.skip != 'true' && steps.eligibility.outputs.skip != 'true'
-        run: python -m pip install --disable-pip-version-check -r requirements-ci.txt
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          git -C "$GITHUB_WORKSPACE" show origin/master:requirements-ci.txt > "$RUNNER_TEMP/requirements-ci.txt"
+          python -P -m pip install --disable-pip-version-check --only-binary=:all: -r "$RUNNER_TEMP/requirements-ci.txt"
       - name: "Fixer attempt ${{ steps.eligibility.outputs.attempt_key }}"
         id: push_guard
         if: steps.cap.outputs.skip != 'true' && steps.eligibility.outputs.skip != 'true'
@@ -2409,7 +2425,7 @@ jobs:
       - id: claude
         if: steps.cap.outputs.skip != 'true' && steps.eligibility.outputs.skip != 'true'
         timeout-minutes: 20
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@a5a423f75c251dcbff8a74e99f83b2cb03c72bfa # v1.0.256
         with:
           # CSL-383: no post-step that publishes the model-writable inline-comment
           # buffer (/tmp/inline-comments-buffer.jsonl) with a write token.
@@ -2425,6 +2441,14 @@ jobs:
                   "Read(.env.*)",
                   "Edit(.github/workflows/**)",
                   "Write(.github/workflows/**)",
+                  "Edit(pip/**)",
+                  "Write(pip/**)",
+                  "Edit(*.pth)",
+                  "Write(*.pth)",
+                  "Edit(sitecustomize.py)",
+                  "Write(sitecustomize.py)",
+                  "Edit(usercustomize.py)",
+                  "Write(usercustomize.py)",
                   "Edit(.git/**)",
                   "Write(.git/**)",
                   "Edit(/${{ runner.temp }}/claude-fixer-guard/**)",

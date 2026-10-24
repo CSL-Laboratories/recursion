@@ -330,7 +330,7 @@ class EvidenceTests(unittest.TestCase):
         header, steps_text = job.split("    steps:\n", 1)
         self.assertNotRegex(header, r"(?m)^    (name|strategy|uses):")
         steps = re.split(r"(?m)^      - ", steps_text)[1:]
-        action = [(i, s) for i, s in enumerate(steps) if f"        uses: {m.ACTION_USES}\n" in s]
+        action = [(i, s) for i, s in enumerate(steps) if f"        uses: {m.ACTION_USES}" in s]
         context = [(i, s) for i, s in enumerate(steps) if s.startswith('name: "Fixer attempt ${{ steps.eligibility.outputs.attempt_key }}"\n')]
         eligibility = [s for s in steps if "        id: eligibility\n" in s or s.startswith("id: eligibility\n")]
         self.assertEqual(len(action), 1)

@@ -554,7 +554,6 @@ jobs:
         working-directory: ${{ runner.temp }}
         run: |
           set -euo pipefail
-          git -C "$GITHUB_WORKSPACE" fetch --no-tags --depth=1 origin master
           git -C "$GITHUB_WORKSPACE" show origin/master:requirements-ci.txt > "$RUNNER_TEMP/requirements-ci.txt"
           python -P -m pip install --disable-pip-version-check --only-binary=:all: -r "$RUNNER_TEMP/requirements-ci.txt"
       - name: Install single-attempt push guard
@@ -2032,7 +2031,6 @@ jobs:
         working-directory: ${{ runner.temp }}
         run: |
           set -euo pipefail
-          git -C "$GITHUB_WORKSPACE" fetch --no-tags --depth=1 origin master
           git -C "$GITHUB_WORKSPACE" show origin/master:requirements-ci.txt > "$RUNNER_TEMP/requirements-ci.txt"
           python -P -m pip install --disable-pip-version-check --only-binary=:all: -r "$RUNNER_TEMP/requirements-ci.txt"
       - name: "Fixer attempt ${{ steps.eligibility.outputs.attempt_key }}"

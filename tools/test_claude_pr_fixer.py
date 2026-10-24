@@ -583,7 +583,8 @@ class WorkflowStructureTests(unittest.TestCase):
             job = self._job(name)
             with self.subTest(job=name):
                 self.assertIn("working-directory: ${{ runner.temp }}", job)
-                self.assertIn('git -C "$GITHUB_WORKSPACE" fetch --no-tags --depth=1 origin master', job)
+                self.assertNotIn("fetch --no-tags --depth=1", job)
+                self.assertNotIn("--depth=1", job)
                 self.assertIn(
                     'git -C "$GITHUB_WORKSPACE" show origin/master:requirements-ci.txt > "$RUNNER_TEMP/requirements-ci.txt"',
                     job,

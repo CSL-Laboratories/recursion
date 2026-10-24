@@ -340,6 +340,13 @@ class WorkflowShapeTests(unittest.TestCase):
         self.assertIn("core.longpaths true", windows)
         self.assertIn("runs-on: macos-latest", macos)
         self.assertIn("timeout-minutes: 15\n", macos)
+        pip = 'python -P -m pip install --only-binary=:all: -r "$REQUIREMENTS_CI"'
+        for block in (tests, windows, macos):
+            self.assertIn("working-directory: ${{ runner.temp }}", block)
+            self.assertIn("REQUIREMENTS_CI: ${{ github.workspace }}/requirements-ci.txt", block)
+            self.assertIn("shell: bash", block)
+            self.assertIn(pip, block)
+            self.assertNotIn("python -m pip install", block)
         for block in (windows, macos):
             self.assertIn("fetch-depth: 0", block)
             self.assertIn("cache-dependency-path: requirements-ci.txt", block)
@@ -347,6 +354,27 @@ class WorkflowShapeTests(unittest.TestCase):
         for line in TEXT.splitlines():
             if line.lstrip().startswith("run:"):
                 self.assertNotIn("${{", line, "expressions reach shells via env, not interpolation")
+
+    def test_full_matrix_pip_matches_ci_isolation(self) -> None:
+        matrix = (ROOT / ".github" / "workflows" / "ci-full-matrix.yml").read_text(encoding="utf-8")
+        pip = 'python -P -m pip install --only-binary=:all: -r "$REQUIREMENTS_CI"'
+        self.assertEqual(matrix.count(pip), 2)
+        self.assertEqual(matrix.count("working-directory: ${{ runner.temp }}"), 2)
+        self.assertEqual(matrix.count("REQUIREMENTS_CI: ${{ github.workspace }}/requirements-ci.txt"), 2)
+        self.assertEqual(matrix.count("shell: bash"), 2)
+        self.assertNotIn("python -m pip install", matrix)
+        for line in matrix.splitlines():
+            if line.lstrip().startswith("run:"):
+                self.assertNotIn("${{", line, "expressions reach shells via env, not interpolation")
+
+    def test_only_master_nightly_keeps_checkout_cwd_pip(self) -> None:
+        leftover = []
+        for path in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
+            for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                stripped = line.strip()
+                if re.search(r"\bpython3? -m pip\b", stripped) and " -P " not in stripped:
+                    leftover.append(f"{path.name}:{number}")
+        self.assertEqual(leftover, ["ci-macos-nightly.yml:75"])
 
 
 class ExpressionTests(unittest.TestCase):

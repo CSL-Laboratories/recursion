@@ -563,13 +563,44 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn("GH_TOKEN: ${{ github.token }}", self._job("resolve-pr"))
         self.assertIn("DISPATCH_EVENTS", source)
 
+    ACTION_SHA = "16f9f71ab9c490faf367f94dd294897edc25be33"
+    ACTION_TAG = "v1.0.261"
+    ACTION_USES = f"anthropics/claude-code-action@{ACTION_SHA}"
+
     def test_dependencies_are_installed_before_model_invocation(self) -> None:
         for name in ("claude-mention", "devin-review-fix"):
             job = self._job(name)
-            self.assertLess(job.index("actions/setup-python@v5"), job.index("anthropics/claude-code-action@v1"))
-            self.assertLess(job.index("pip install --disable-pip-version-check -r requirements-ci.txt"), job.index("anthropics/claude-code-action@v1"))
+            self.assertLess(job.index("actions/setup-python@v5"), job.index(self.ACTION_USES))
+            self.assertLess(
+                job.index("python -P -m pip install --disable-pip-version-check --only-binary=:all:"),
+                job.index(self.ACTION_USES),
+            )
             self.assertIn('python-version: "3.12"', job)
             self.assertNotIn("continue-on-error", job)
+
+    def test_privileged_pip_isolates_sys_path_and_reads_trusted_requirements(self) -> None:
+        for name in ("claude-mention", "devin-review-fix"):
+            job = self._job(name)
+            with self.subTest(job=name):
+                self.assertIn("working-directory: ${{ runner.temp }}", job)
+                self.assertIn('git -C "$GITHUB_WORKSPACE" fetch --no-tags --depth=1 origin master', job)
+                self.assertIn(
+                    'git -C "$GITHUB_WORKSPACE" show origin/master:requirements-ci.txt > "$RUNNER_TEMP/requirements-ci.txt"',
+                    job,
+                )
+                self.assertIn(
+                    'python -P -m pip install --disable-pip-version-check --only-binary=:all: -r "$RUNNER_TEMP/requirements-ci.txt"',
+                    job,
+                )
+                self.assertNotIn("python -m pip install", job)
+
+    def test_claude_code_action_is_pinned_to_resolved_v1_commit(self) -> None:
+        pin = f"uses: {self.ACTION_USES} # {self.ACTION_TAG}"
+        self.assertGreaterEqual(self.text.count(pin), 2)
+        self.assertNotIn("uses: anthropics/claude-code-action@v1\n", self.text)
+        scan = SCAN_WORKFLOW_PATH.read_text(encoding="utf-8")
+        self.assertIn(pin, scan)
+        self.assertNotIn("uses: anthropics/claude-code-action@v1\n", scan)
 
     def test_acceptance_gates_before_push(self) -> None:
         devin = self._job("devin-review-fix")

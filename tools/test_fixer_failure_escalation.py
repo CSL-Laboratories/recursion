@@ -44,7 +44,7 @@ class EvidenceTests(unittest.TestCase):
                     "head_repository": {"full_name": REPO}, "pull_requests": [{"number": 7}]}
         self.job = {"id": 123, "run_id": 10, "run_attempt": 1, "name": "devin-review-fix", "status": "completed", "conclusion": "failure",
                     "steps": [{"number": 8, "name": m.CONTEXT_PREFIX + HEAD + ":" + self.key["fingerprint"], "conclusion": "success"},
-                              {"number": 9, "name": "Run anthropics/claude-code-action@v1", "conclusion": "failure"}]}
+                              {"number": 9, "name": f"Run {m.ACTION_USES}", "conclusion": "failure"}]}
         self.calls = []
         self.active = 0
         self.private = False
@@ -337,6 +337,9 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(len(context), 1)
         self.assertEqual(len(eligibility), 1)
         self.assertTrue(action[0][1].startswith("id: claude\n"))
+        self.assertIn("path_to_claude_code_executable: /opt/csl-claude/2.1.306/claude", action[0][1])
+        self.assertIn("DISABLE_UPDATES", action[0][1])
+        self.assertRegex(m.ACTION_USES, r"\Aanthropics/claude-code-action@[0-9a-f]{40}\Z")
         self.assertNotRegex(action[0][1], r"(?m)^        name:")
         self.assertIn("        id: push_guard\n", context[0][1])
         self.assertLess(context[0][0], action[0][0])

@@ -566,8 +566,11 @@ class WorkflowStructureTests(unittest.TestCase):
     def test_dependencies_are_installed_before_model_invocation(self) -> None:
         for name in ("claude-mention", "devin-review-fix"):
             job = self._job(name)
-            self.assertLess(job.index("actions/setup-python@v5"), job.index("anthropics/claude-code-action@v1"))
-            self.assertLess(job.index("pip install --disable-pip-version-check -r requirements-ci.txt"), job.index("anthropics/claude-code-action@v1"))
+            self.assertLess(job.index("actions/setup-python@v5"), job.index("anthropics/claude-code-action@"))
+            self.assertLess(job.index("pip install --disable-pip-version-check -r requirements-ci.txt"), job.index("anthropics/claude-code-action@"))
+            self.assertNotIn("anthropics/claude-code-action@v1", job)
+            self.assertIn("anthropics/claude-code-action@a5a423f75c251dcbff8a74e99f83b2cb03c72bfa", job)
+            self.assertIn("path_to_claude_code_executable: /opt/csl-claude/2.1.306/claude", job)
             self.assertIn('python-version: "3.12"', job)
             self.assertNotIn("continue-on-error", job)
 
@@ -1660,6 +1663,71 @@ class ClaudeActionInlineCommentTests(unittest.TestCase):
         for index, (name, inputs) in enumerate(steps):
             with self.subTest(workflow=name, step=index):
                 self.assertIn('\n          classify_inline_comments: "false"\n', inputs)
+
+
+class ClaudeCodeInstallerPinTests(unittest.TestCase):
+    """CSL-473 interim E3-1: SHA-pin the action and skip its unpinned installer."""
+
+    PIN = ROOT / "scripts/ci/claude-code-2.1.306-linux-x64.pin"
+    FINGERPRINT = ROOT / "scripts/ci/claude-code-release-signing.fingerprint"
+    SCRIPT = ROOT / "scripts/ci/install_pinned_claude_code.sh"
+    ACTION = "anthropics/claude-code-action@a5a423f75c251dcbff8a74e99f83b2cb03c72bfa"
+
+    def test_committed_pin_and_fingerprint_match_the_install_script(self) -> None:
+        pin = {}
+        for line in self.PIN.read_text(encoding="utf-8").splitlines():
+            if line and not line.startswith("#") and "=" in line:
+                key, _, value = line.partition("=")
+                pin[key] = value
+        fingerprint = next(line.strip() for line in self.FINGERPRINT.read_text(encoding="utf-8").splitlines()
+                           if line and not line.startswith("#"))
+        self.assertEqual(pin["sha256"], "520bc6c1f40af466bd03a278b5ae1af1a2938bc7de5b9e5cb15526da20d71cfe")
+        self.assertEqual(pin["bytes"], "290532720")
+        self.assertEqual(pin["version"], "2.1.306")
+        self.assertEqual(fingerprint, "31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE")
+        script = self.SCRIPT.read_text(encoding="utf-8")
+        for value in (pin["sha256"], pin["bytes"], pin["version"], fingerprint):
+            self.assertIn(value, script)
+        self.assertIn('DEST_DIR="/opt/csl-claude/${CLAUDE_VERSION}"', script)
+        self.assertIn("sha256sum -c", script)
+        self.assertIn('CURL=/usr/bin/curl', script)
+        self.assertIn('GPG=/usr/bin/gpg', script)
+        self.assertIn('SUDO=/usr/bin/sudo', script)
+        self.assertIn('"$GPG" --batch --status-fd 1 --verify', script)
+        self.assertIn("[GNUPG:] VALIDSIG ${EXPECTED_FPR}", script)
+        self.assertIn("[GNUPG:] GOODSIG", script)
+        self.assertIn("EXPKEYSIG", script)
+        self.assertIn("REVKEYSIG", script)
+        self.assertIn('mkdir -m 0700 "$STAGING"', script)
+        self.assertNotIn("mkdir -m 0700 -p", script)
+        self.assertNotIn('mkdir -p "$STAGING"', script)
+        self.assertIn("install path is a symlink", script)
+        self.assertIn("install dir contains extra files", script)
+        self.assertIn("installClaudeCode()", script)
+        self.assertIn("reference copy", script)
+        self.assertNotIn("| bash", script)
+
+    def test_every_claude_action_use_is_sha_pinned_and_skips_the_installer(self) -> None:
+        import re
+
+        steps = []
+        for path in sorted(WORKFLOW_PATH.parent.glob("*.y*ml")):
+            text = path.read_text(encoding="utf-8")
+            self.assertNotIn("claude.ai/install", text)
+            self.assertNotRegex(text, r"uses:\s*[\"']?anthropics/claude-code-action@v\d")
+            self.assertNotRegex(text, r"install\.sh\s*\|\s*bash")
+            self.assertNotIn("mkdir -m 0700 -p", text)
+            uses = re.findall(r"uses:\s*[\"']?(anthropics/claude-code-action@[^\s\"'#]*)", text)
+            if uses:
+                self.assertEqual(set(uses), {self.ACTION})
+                self.assertIn("Install hash-pinned Claude Code CLI", text)
+            for step in re.split(r"uses:\s*[\"']?anthropics/claude-code-action@", text)[1:]:
+                steps.append((path.name, re.split(r"\n      - ", step, maxsplit=1)[0]))
+        self.assertGreaterEqual(len(steps), 3)
+        for index, (name, inputs) in enumerate(steps):
+            with self.subTest(workflow=name, step=index):
+                self.assertIn("\n          path_to_claude_code_executable: /opt/csl-claude/2.1.306/claude\n", inputs)
+                self.assertIn("DISABLE_UPDATES", inputs)
 
 
 if __name__ == "__main__":

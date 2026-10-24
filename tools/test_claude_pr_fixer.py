@@ -1691,6 +1691,9 @@ class ClaudeCodeInstallerPinTests(unittest.TestCase):
         self.assertIn('DEST_DIR="/opt/csl-claude/${CLAUDE_VERSION}"', script)
         self.assertIn("sha256sum -c", script)
         self.assertIn("gpg --batch --verify", script)
+        self.assertIn('mkdir -p "$STAGING"', script)
+        self.assertIn('chmod 0700 "$STAGING"', script)
+        self.assertNotIn("mkdir -m", script)
         self.assertNotIn("| bash", script)
 
     def test_every_claude_action_use_is_sha_pinned_and_skips_the_installer(self) -> None:
@@ -1702,6 +1705,7 @@ class ClaudeCodeInstallerPinTests(unittest.TestCase):
             self.assertNotIn("claude.ai/install", text)
             self.assertNotRegex(text, r"uses:\s*[\"']?anthropics/claude-code-action@v\d")
             self.assertNotRegex(text, r"install\.sh\s*\|\s*bash")
+            self.assertNotIn("mkdir -m", text)
             uses = re.findall(r"uses:\s*[\"']?(anthropics/claude-code-action@[^\s\"'#]*)", text)
             if uses:
                 self.assertEqual(set(uses), {self.ACTION})

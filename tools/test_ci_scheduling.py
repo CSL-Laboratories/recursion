@@ -761,14 +761,14 @@ def _crosslane_bracket(text: str, pos: int, opens: str) -> tuple[int, int] | Non
     return i, j
 
 
-def _crosslane_publisher_embed(block: str) -> tuple[str, str]:
-    # The raw CLAUDE_FIXER_PUBLISH heredoc body in a job and its dedented source.
-    chunks = block.split("<<'CLAUDE_FIXER_PUBLISH'\n")
-    if len(chunks) != 2:
-        raise AssertionError("a publish job must embed the publisher exactly once")
-    raw = chunks[1].split("\n          CLAUDE_FIXER_PUBLISH\n", 1)[0]
-    import textwrap
-    return raw, textwrap.dedent(raw)
+def _crosslane_publisher_thin_call(block: str) -> None:
+    # Publish jobs load scripts/ci/claude_fixer_publish.py from the live PR .base.sha, never an embed.
+    if "<<'CLAUDE_FIXER_PUBLISH'" in block:
+        raise AssertionError("a publish job must not embed the publisher")
+    if ".base.sha" not in block or "scripts/ci/claude_fixer_publish.py" not in block:
+        raise AssertionError("a publish job must load the publisher from the live PR base SHA")
+    if "github.sha" in block or "GITHUB_WORKSPACE" in block:
+        raise AssertionError("a publish job must not load the publisher from github.sha or the workspace")
 
 
 def _crosslane_push_commands(text: str) -> list[str]:
@@ -831,9 +831,9 @@ class CrossLaneAdmissionTests(unittest.TestCase):
                 # Every label write (the whole call or shell command naming `/labels`) is the handoff
                 # label; ci:full is only ever removed (DELETE of a gate-owned label event).
                 commands = _crosslane_label_commands(body)
-                # The label paths live in the embedded publisher and receipts; a workflow without them
-                # (the scan caller since Port C) names no `/labels` endpoint at all.
-                if "<<'CLAUDE_FIXER_PUBLISH'" in body:
+                # The label paths live in the receipts embed and the checked-in publisher; a workflow
+                # without them (the scan caller since Port C) names no `/labels` endpoint at all.
+                if "<<'CLAUDE_FIXER_RECEIPTS'" in body:
                     self.assertTrue(commands)
                 else:
                     self.assertEqual(commands, [])
@@ -943,9 +943,7 @@ class CrossLaneAdmissionTests(unittest.TestCase):
                     # publisher embedded byte-for-byte; no other step pushes as a shell command or git argv.
                     steps = CROSSLANE_WORD_LIST.sub("", _crosslane_without_model_text(block))
                     if job in publishers:
-                        raw, embedded = _crosslane_publisher_embed(steps)
-                        self.assertEqual(embedded.rstrip("\n"), publisher.rstrip("\n"))
-                        steps = steps.replace(raw, "")
+                        _crosslane_publisher_thin_call(steps)
                     self.assertNotRegex(steps, CROSSLANE_STEP_PUSH)
                 with self.subTest(workflow=name, job=job, check="permissions"):
                     perms = _crosslane_permissions(block, 4)
@@ -993,8 +991,9 @@ class CrossLaneAdmissionTests(unittest.TestCase):
                     if job in push_models:
                         self.assertTrue(commands)
                     elif job in publishers:
-                        # Exactly the publisher's one ordinary push.
-                        self.assertEqual([" ".join(c.split()) for c in commands], [CROSSLANE_PUBLISH_PUSH])
+                        # The one ordinary push lives in the checked-in publisher, loaded from .base.sha.
+                        self.assertEqual(commands, [])
+                        self.assertIn(CROSSLANE_PUBLISH_PUSH, publisher)
                     else:
                         self.assertEqual(commands, [])
                     for command in commands:
@@ -1030,7 +1029,8 @@ class CrossLaneAdmissionTests(unittest.TestCase):
             with self.subTest(job=publish):
                 # Publish rechecks the pause variable and live labels right before its push.
                 self.assertIn("CLAUDE_FIXER_PAUSE: ${{ vars.CLAUDE_FIXER_PAUSE }}", blocks[publish])
-                self.assertIn('PAUSE_LABELS = frozenset({"claude:pause", "hold"})', blocks[publish])
+                self.assertIn('PAUSE_LABELS = frozenset({"claude:pause", "hold"})',
+                              CROSSLANE_PUBLISHER.read_text(encoding="utf-8"))
         # The eight-commit guard: shell skip in the @claude path, eligibility check in the Devin path.
         self.assertIn('if [ "$count" -ge 8 ]; then', blocks["mention-prepare"])
         self.assertIn("LOOP_COMMIT_COUNT: ${{ steps.cap.outputs.loop_commit_count }}", blocks["fixer-prepare"])
@@ -1052,8 +1052,10 @@ class CrossLaneAdmissionTests(unittest.TestCase):
             self.assertIn("needs.prepare.outputs.skip == 'false'", condition, later)
             self.assertIn("needs.prepare.outputs.run_attempt == github.run_attempt", condition, later)
         self.assertIn("CLAUDE_FIXER_PAUSE: ${{ vars.CLAUDE_FIXER_PAUSE }}", writer["publish"])
-        self.assertIn('PAUSE_LABELS = frozenset({"claude:pause", "hold"})', writer["publish"])
-        self.assertIn('with state_path.open("x", encoding="utf-8") as handle:', writer["publish"])
+        publisher = CROSSLANE_PUBLISHER.read_text(encoding="utf-8")
+        self.assertIn('PAUSE_LABELS = frozenset({"claude:pause", "hold"})', publisher)
+        self.assertIn('with state_path.open("x", encoding="utf-8") as handle:', publisher)
+        _crosslane_publisher_thin_call(writer["publish"])
         self.assertNotRegex(_crosslane_text("claude-conflict-writer.yml"), r"MAX_ATTEMPTS = (?!3\b)")
 
 if __name__ == "__main__":

@@ -353,10 +353,14 @@ def snapshot(out, gitbin, config):
     head = {path: (meta[0], meta[2]) for path, meta in entries(run("ls-tree", "-r", "-z", "HEAD"), " ")}
     index, unmerged = {}, set()
     for path, (mode, oid, stage) in entries(run(*INDEX), " "):
+        if mode == "160000":
+            raise ValueError("gitlink in HEAD or the index")
         if stage == "0":
             index[path] = (mode, oid)
         else:
             unmerged.add(path)
+    if any(mode == "160000" for mode, _oid in head.values()):
+        raise ValueError("gitlink in HEAD or the index")
     records, blobs = {}, {}
 
     def worktree(path, untracked):

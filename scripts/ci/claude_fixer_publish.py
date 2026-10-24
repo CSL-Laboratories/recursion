@@ -472,11 +472,19 @@ def diff_entries(raw):
     return entries
 
 
+def refuse_gitlink_tree(repo, tree):
+    """Any 160000 entry (submodule/gitlink) in HEAD, a merge parent or the candidate is Refused."""
+    if any(mode == "160000" for mode, _oid in tree_entries(repo, tree).values()):
+        raise Refused("gitlink in HEAD, the index or the candidate")
+
+
 def check_entries(entries):
     for entry in entries:
         if is_protected(entry["path"]):
             raise Refused("candidate changes a protected path")
         status, old, new = entry["status"], entry["old_mode"], entry["new_mode"]
+        if old == "160000" or new == "160000":
+            raise Refused("gitlink in HEAD, the index or the candidate")
         if status == "D":
             continue
         if status not in {"A", "M"}:
@@ -572,6 +580,9 @@ def validate_candidate(repo, config, candidate):
     """Return the validated candidate SHA, or raise Refused. No push here. Strict fsck first."""
     head, merge_base = config["base"], config["merge_base"]
     check_objects(repo)
+    refuse_gitlink_tree(repo, head)
+    if merge_base:
+        refuse_gitlink_tree(repo, merge_base)
     if not SHA.fullmatch(candidate) or candidate in {head, merge_base}:
         raise Refused("candidate adds no new commit")
     excludes = ["^" + head] + (["^" + merge_base] if merge_base else [])
@@ -591,6 +602,7 @@ def validate_candidate(repo, config, candidate):
         check_entries(entries)
         bounded_size(repo, entries)
         check_credentials(repo, entries, commits)
+        refuse_gitlink_tree(repo, candidate)
         return candidate
     entries = []
     for row in rows:
@@ -605,6 +617,7 @@ def validate_candidate(repo, config, candidate):
     check_entries(entries)
     bounded_size(repo, entries)
     check_credentials(repo, entries, commits)
+    refuse_gitlink_tree(repo, candidate)
     return candidate
 
 
@@ -706,6 +719,8 @@ def read_snapshot(repo, config, artifact):
     trees = [head]
     if conflict:
         trees += [config["merge_base"], auto_merge(repo, head, config["merge_base"])[0]]
+    for tree in trees:
+        refuse_gitlink_tree(repo, tree)
     trusted = tree_entries(repo, trees[-1])
     # Trusted: the recorded head's, base's and auto-merge's blobs only.
     objects = {oid for tree in trees for mode, oid in tree_entries(repo, tree).values() if mode != "160000"}

@@ -342,7 +342,7 @@ class LinearValidationTests(GitCase):
         self.model.git("reset", "-q", "--hard", self.head)
         self.model.git("update-index", "--add", "--cacheinfo", f"160000,{self.head},app/sub")
         self.model.git("commit", "-q", "-m", "submodule")
-        self.refused("symlink, submodule or executable")
+        self.refused("gitlink in HEAD, the index or the candidate")
         self.model.git("reset", "-q", "--hard", self.head)
         self.model.write("app/tool.sh", "#!/bin/sh\n", mode=0o755)
         self.model.commit()
@@ -351,6 +351,28 @@ class LinearValidationTests(GitCase):
         (self.model.path / "app/a.py").chmod(0o755)
         self.model.commit()
         self.refused("symlink, submodule or executable")
+
+    def test_gitlink_in_head_index_or_candidate_is_refused(self):
+        # Added: a new 160000 in the candidate.
+        self.model.git("reset", "-q", "--hard", self.head)
+        self.model.git("update-index", "--add", "--cacheinfo", f"160000,{self.head},app/sub")
+        self.model.git("commit", "-q", "-m", "submodule")
+        self.refused("^gitlink in HEAD, the index or the candidate$")
+        with self.assertRaisesRegex(p.Refused, "^gitlink in HEAD, the index or the candidate$"):
+            p.check_entries([{"path": "vendor/lib", "status": "D", "old_mode": "160000", "new_mode": "000000",
+                              "old": self.head, "new": "0" * 40}])
+        # Recorded HEAD contains a gitlink: refuse even when the candidate deletes it or leaves it.
+        self.src.git("update-index", "--add", "--cacheinfo", f"160000,{self.head},vendor/lib")
+        self.src.git("commit", "-q", "-m", "gitlink")
+        self.head = self.src.git("rev-parse", "HEAD")
+        self.model.git("fetch", "-q", "origin")
+        self.model.git("checkout", "-q", "-B", "fix", self.head)
+        self.model.git("rm", "-q", "--cached", "vendor/lib")
+        self.model.git("commit", "-q", "-m", "drop gitlink")
+        self.refused("^gitlink in HEAD, the index or the candidate$")
+        self.model.git("reset", "-q", "--hard", self.head)
+        self.model.commit({"app/a.py": "a = 2\n"})
+        self.refused("^gitlink in HEAD, the index or the candidate$")
 
     def test_existing_executable_may_change_or_lose_its_bit(self):
         self.model.write("scripts/run.sh", "#!/bin/sh\necho hi\n", mode=0o755)
@@ -1475,6 +1497,21 @@ class OutboxHelperTests(unittest.TestCase):
             Path("b.txt/c.txt").write_text("c\n")
             records = snapshot_records(head)
             self.assertEqual((records["b.txt"][0], records["b.txt/c.txt"][0]), ("delete", "blob"))
+
+    @POSIX
+    def test_snapshot_refuses_a_gitlink_in_head_or_the_index(self):
+        with patch.dict(os.environ, git_env(), clear=True):
+            head = git_repo({"a.txt": "a\n"})
+            Path(".claude-fixer-out").mkdir()
+            Path(".claude-fixer-out/intent.jsonl").write_text('{"message":"m","op":"commit"}\n')
+            o.command(["git", "update-index", "--add", "--cacheinfo", f"160000,{head},vendor/lib"])
+            with self.assertRaisesRegex(ValueError, "gitlink in HEAD or the index"):
+                snapshot_records(head)
+            o.command(["git", "commit", "-q", "-m", "gitlink"])
+            head = o.command(["git", "rev-parse", "HEAD"])
+            o.command(["git", "rm", "-q", "--cached", "vendor/lib"])
+            with self.assertRaisesRegex(ValueError, "gitlink in HEAD or the index"):
+                snapshot_records(head)
 
     @unittest.skipUnless(shutil.which("bwrap") and subprocess.run(
         ["bwrap", "--dev-bind", "/", "/", "true"], capture_output=True, check=False).returncode == 0,
@@ -3164,6 +3201,16 @@ class AmendmentA1Tests(FlowCase):
 class PrecisionTests(FlowCase):
     """Coordinator test-precision items 1-6 (within v4.3 semantics)."""
 
+    def test_package_refuses_a_gitlink_in_head(self):
+        self.src.git("update-index", "--add", "--cacheinfo", f"160000,{self.head},vendor/lib")
+        self.src.git("commit", "-q", "-m", "gitlink")
+        self.head = self.src.git("rev-parse", "HEAD")
+        work = self.model("fixer")
+        work.write("app/a.py", "a = 2\n")
+        self.intent()
+        with self.assertRaisesRegex(ValueError, "gitlink in HEAD or the index"):
+            self.package()
+
     def test_symlinks_are_hashed_by_target_bytes_never_dereferenced(self):
         outside = self.root / "outside-secret.txt"
         outside.write_text("SECRET-OUTSIDE\n")
@@ -3920,17 +3967,27 @@ class WorkflowWiringTests(unittest.TestCase):
                 run = step(publish, RECEIPTS_STEP)["run"] + step(publish, PUBLISH_STEP)["run"]
                 # Outside the embedded, parity-checked sources: no repository code.
                 outside = re.sub(r"<<'([A-Z_]+)'\n.*?\n\1(?:\n|$)", "<<heredoc\n", run, flags=re.DOTALL)
-                self.assertEqual(outside.count("<<heredoc"), 2)
+                self.assertEqual(outside.count("<<heredoc"), 1)  # receipts stay embedded; publisher is a thin call
                 rest = {**publish, "steps": [publish["steps"][0], {"name": "runs", "run": outside}]}
+                rest_text = json.dumps(rest).replace("scripts/ci/claude_fixer_publish.py", "")
                 for forbidden in ("pip install", "pytest", "python tools/", "python3 tools/", "uses: ./",
                                   "actions/checkout", "scripts/ci/", "git clone", "-e .", "GITHUB_WORKSPACE",
                                   "git push", "secrets.GITHUB_TOKEN"):
-                    self.assertNotIn(forbidden, json.dumps(rest))
+                    self.assertNotIn(forbidden, rest_text)
+                pub_run = step(publish, PUBLISH_STEP)["run"]
+                self.assertIn('trusted_sha="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq \'.base.sha\')"', pub_run)
+                self.assertIn("scripts/ci/claude_fixer_publish.py?ref=$trusted_sha", pub_run)
+                self.assertIn('"$trusted_sha" == "$HEAD_SHA"', pub_run)
+                self.assertNotIn("github.sha", pub_run)
+                self.assertNotIn("GITHUB_WORKSPACE", pub_run)
+                self.assertNotIn("git clone", pub_run)
+                self.assertNotIn("<<'CLAUDE_FIXER_PUBLISH'", pub_run)
+                self.assertLess(len(pub_run.encode()), 60_000)
                 commands = [line.strip() for line in run.split("\n")
                             if line.strip().startswith(("python", "cat >", "mkdir"))]
                 self.assertEqual(commands, ['mkdir -p "$RUNNER_TEMP/claude-fixer-publish"',
                                             "cat > \"$RUNNER_TEMP/claude-fixer-publish/receipts.py\" <<'CLAUDE_FIXER_RECEIPTS'",
-                                            "cat > \"$RUNNER_TEMP/claude-fixer-publish/publish.py\" <<'CLAUDE_FIXER_PUBLISH'",
+                                            'mkdir -p "$RUNNER_TEMP/claude-fixer-publish"',
                                             'python3 -I "$RUNNER_TEMP/claude-fixer-publish/publish.py"'])
                 env = step(publish, PUBLISH_STEP)["env"]
                 self.assertEqual(env["GH_TOKEN"], "${{ github.token }}")
@@ -3995,10 +4052,10 @@ class WorkflowWiringTests(unittest.TestCase):
         # Receipts: mention-publish, fixer-prepare's eligibility and fixer-publish, plus the conflict
         # writer's publish (its publisher loads the consumer; conflict mode writes no receipts). Port C
         # removes the pre-push guard from every workflow; its source and unit tests stay until Port D.
-        expected = {("claude.yml", "CLAUDE_FIXER_PUBLISH"): 2, ("claude.yml", "CLAUDE_FIXER_OUTBOX"): 2,
+        expected = {("claude.yml", "CLAUDE_FIXER_PUBLISH"): 0, ("claude.yml", "CLAUDE_FIXER_OUTBOX"): 2,
                     ("claude.yml", "CLAUDE_FIXER_RECEIPTS"): 3,
                     ("claude.yml", "CLAUDE_DENIALS_REPORT"): 2, ("claude.yml", "CLAUDE_PR_FIXER_GATE"): 1,
-                    ("claude-conflict-writer.yml", "CLAUDE_FIXER_PUBLISH"): 1,
+                    ("claude-conflict-writer.yml", "CLAUDE_FIXER_PUBLISH"): 0,
                     ("claude-conflict-writer.yml", "CLAUDE_FIXER_OUTBOX"): 1,
                     ("claude-conflict-writer.yml", "CLAUDE_FIXER_RECEIPTS"): 1,
                     ("claude-conflict-writer.yml", "CLAUDE_DENIALS_REPORT"): 1,

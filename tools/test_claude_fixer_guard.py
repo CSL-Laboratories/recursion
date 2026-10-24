@@ -7,7 +7,6 @@ import re
 import subprocess
 import sys
 import tempfile
-import textwrap
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -560,14 +559,8 @@ class WorkflowTests(unittest.TestCase):
             self.assertNotIn("claude-fixer-guard/pre-push", other, name)
         text = (ROOT / ".github/workflows/claude.yml").read_text(encoding="utf-8")
         writer = (ROOT / CONFLICT_WRITER).read_text(encoding="utf-8")
-        publisher = (ROOT / "scripts/ci/claude_fixer_publish.py").read_text(encoding="utf-8").rstrip()
-        chunks = text.split("<<'CLAUDE_FIXER_PUBLISH'\n")[1:]
-        self.assertEqual(len(chunks), 2)
-        writer_chunks = writer.split("<<'CLAUDE_FIXER_PUBLISH'\n")[1:]
-        self.assertEqual(len(writer_chunks), 1)
-        for chunk in chunks + writer_chunks:
-            embedded = textwrap.dedent(chunk.split("          CLAUDE_FIXER_PUBLISH", 1)[0]).rstrip()
-            self.assertEqual(embedded, publisher)
+        self.assertNotIn("<<'CLAUDE_FIXER_PUBLISH'", text)
+        self.assertNotIn("<<'CLAUDE_FIXER_PUBLISH'", writer)
         # The conflict writer's terminal audit also runs after a failed model job.
         header = workflow_job(writer, "publish").split("    steps:", 1)[0]
         self.assertIn("!cancelled() &&", header)
@@ -584,6 +577,9 @@ class WorkflowTests(unittest.TestCase):
             self.assertIn(f"MODEL_OUTCOME: ${{{{ needs.{model}.outputs.claude_outcome || needs.{model}.result }}}}",
                           job, publish)
             self.assertIn('python3 -I "$RUNNER_TEMP/claude-fixer-publish/publish.py"', job, publish)
+            self.assertIn(".base.sha", job, publish)
+            self.assertIn("scripts/ci/claude_fixer_publish.py", job, publish)
+            self.assertNotIn("github.sha", job, publish)
         self.assertEqual(text.count("timeout-minutes: 20"), 2)
         self.assertEqual(text.count("--max-turns 30"), 2)
         bodies = text.split("      - id: claude\n")[1:]

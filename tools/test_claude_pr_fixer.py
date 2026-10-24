@@ -1489,7 +1489,10 @@ class ConflictJobStructureTests(unittest.TestCase):
         self.assertNotIn("git merge", prep)
         self.assertIn("git merge --no-ff --no-commit", self._writer("model"))
         self.assertIn("CLAUDE_FIXER_PAUSE: ${{ vars.CLAUDE_FIXER_PAUSE }}", self._writer("publish"))
-        self.assertIn('PAUSE_LABELS = frozenset({"claude:pause", "hold"})', self._writer("publish"))
+        self.assertIn('PAUSE_LABELS = frozenset({"claude:pause", "hold"})',
+                      (ROOT / "scripts/ci/claude_fixer_publish.py").read_text(encoding="utf-8"))
+        self.assertIn(".base.sha", self._writer("publish"))
+        self.assertIn("scripts/ci/claude_fixer_publish.py", self._writer("publish"))
 
     def test_resolver_uses_fixed_helper_not_raw_gh_api(self) -> None:
         job = self._writer("model")

@@ -30,6 +30,15 @@ issues and PRs.
 - Autonomously file research findings, ideas and bugs to Triage, deduped.
 - Ground every issue and every execution in research before the work; size it to
   the task. No specific tool is required.
+- On a decision or direction issue, the assignee or claimant, including a Grok
+  Bot coordinator acting for its owner, may research and recommend. Attribute a
+  Grok Bot brief as `Grok Bot, preparing research for <owner>`; do not phrase
+  it as the owner personally authored or endorsed the recommendation.
+  Publishing a brief never marks the issue decided, never clears a hold and
+  never authorizes implementation. Only the designated human decision-maker,
+  or an explicitly authorized research team, decides. The developer decides,
+  or @mentions the approver; a coding agent @mentions its developer and does
+  not decide.
 
 > **How CSL works:** the Linear doc [How CSL works](https://linear.app/csl-laboratories/document/how-csl-works-922e0df6026f)
 > is background on the team and tooling. It does not change the reading order below;
@@ -293,10 +302,17 @@ subscriptions. Metered tools such as Exa and Parallel stay within their existing
 per-person ceilings. No new pay-per-token spend. Scheduled routines never start
 metered or paid research on their own. Record what was used — the tool or model,
 the date, and the key sources — in the issue or evidence, so the research can be
-checked. When the issue needs a decision or sets direction, post the cited brief
-(options, tradeoffs, recommendation, target metrics) on the Linear issue. The
-developer decides, or @mentions the approver; a coding agent @mentions its
-developer and does not decide.
+checked. When the issue needs a decision or sets direction, the assignee or
+claimant, including a Grok Bot coordinator acting for its owner, may research
+and write the brief (options, tradeoffs, recommendation, target metrics) on
+the Linear issue. The bot may research and recommend. Attribute a Grok Bot
+brief explicitly as `Grok Bot, preparing research for <owner>`; do not phrase
+it as the owner personally authored or endorsed the recommendation. Publishing
+a brief never marks the issue decided, never clears a hold and never
+authorizes implementation. Only the designated human decision-maker, or an
+explicitly authorized research team, decides. The developer decides, or
+@mentions the approver; a coding agent @mentions its developer and does not
+decide.
 
 **Filing and shipping.**
 

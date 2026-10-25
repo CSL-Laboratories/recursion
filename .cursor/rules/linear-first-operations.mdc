@@ -33,3 +33,12 @@ issues and PRs.
 - Autonomously file research findings, ideas and bugs to Triage, deduped.
 - Ground every issue and every execution in research before the work; size it to
   the task. No specific tool is required.
+- On a decision or direction issue, the assignee or claimant, including a Grok
+  Bot coordinator acting for its owner, may research and recommend. Attribute a
+  Grok Bot brief as `Grok Bot, preparing research for <owner>`; do not phrase
+  it as the owner personally authored or endorsed the recommendation.
+  Publishing a brief never marks the issue decided, never clears a hold and
+  never authorizes implementation. Only the designated human decision-maker,
+  or an explicitly authorized research team, decides. The developer decides,
+  or @mentions the approver; a coding agent @mentions its developer and does
+  not decide.

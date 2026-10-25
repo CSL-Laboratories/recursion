@@ -20,8 +20,12 @@ issues and PRs.
   `gh pr edit <n> --add-reviewer samir-shah-ahmed,CDanTheMan` (whichever
   reviewers apply). PRs that touch protected or CODEOWNED paths also request
   the code owner (`@NotSkittlz` / Lucas); do not copy the example above and
-  skip him. Both (a) the Linear @mention and (b) this GitHub request are
-  required. This is mandatory for agents too.
+  skip him. If the PR author is a required reviewer or code owner, skip
+  requesting them: GitHub rejects review requests to the author. Request the
+  other code owners (`samir-shah-ahmed`, `CDanTheMan`) instead, and record on
+  the PR or the Linear issue that the author cannot be requested. Both (a)
+  the Linear @mention and (b) this GitHub request are required. This is
+  mandatory for agents too.
 - **Wait for jobs before human sign-off.** Order: Devin Review runs first, then the
   Claude fixer job (`devin-review-fix`) acts on its findings, then required
   CI reruns on the fixer's push. No human approves or requests changes on a PR until all

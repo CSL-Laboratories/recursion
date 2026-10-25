@@ -714,8 +714,9 @@ CROSSLANE_ARGV_BENIGN_CALL = re.compile(
     r"(?:print|pprint|logging(?:\.\w+)+|logger(?:\.\w+)*|\blog)\s*\(?\s*$",
     re.IGNORECASE,
 )
+# Only the known data assignment, never a list unpacked into a git call.
 CROSSLANE_PUSH_PULL_LIST = re.compile(
-    r"""\[[ \t]*\\?["']push\\?["'][ \t]*,[ \t]*\\?["']pull\\?["'][ \t]*\]"""
+    r"""(?:words|allowed_commands)\s*=\s*\[[ \t]*\\?["']push\\?["'][ \t]*,[ \t]*\\?["']pull\\?["'][ \t]*\]"""
 )
 CROSSLANE_JOB_KEY = re.compile(
     r"""^  (?:"([A-Za-z_][\w-]*)"|'([A-Za-z_][\w-]*)'|([A-Za-z_][\w-]*)):(?:\s+#.*)?$"""
@@ -1457,6 +1458,8 @@ class CrossLaneMutationTests(unittest.TestCase):
             'self.git("push", "branch")',
             'cmd = ["push", "branch"]\n          run(["git", *cmd])',
             'git("push", remote, "pull")',
+            'subprocess.run(["git", *["push", "pull"]])',
+            'args = ["push", "pull"]\n          subprocess.run(["git", *args, "--force", "HEAD"])',
         ):
             with self.subTest(command=command):
                 with _mutated_workflow("claude.yml", lambda text, c=command: _append_job_step(text, "mention-prepare", c)):
@@ -1477,10 +1480,12 @@ class CrossLaneMutationTests(unittest.TestCase):
             'self.git("push", "branch")',
             'cmd = ["push", "branch"]\nrun(["git", *cmd])',
             'git("push", remote, "pull")',
+            'subprocess.run(["git", *["push", "pull"]])',
+            'args = ["push", "pull"]\nsubprocess.run(["git", *args, "--force", "HEAD"])',
         ):
             with self.subTest(push=push):
                 self.assertIsNotNone(_crosslane_step_push_search(push))
-        for other in ('print("push")', 'words = ["push", "pull"]'):
+        for other in ('print("push")', 'words = ["push", "pull"]', 'allowed_commands = ["push", "pull"]'):
             with self.subTest(other=other):
                 self.assertIsNone(_crosslane_step_push_search(other))
 

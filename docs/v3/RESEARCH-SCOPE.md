@@ -86,9 +86,12 @@ Every research task carries:
 - one machine-checkable gate with deterministic pass/fail and zero provider calls;
 - a named independent verifier (different session, different family where available) that reruns
   the exact candidate — an implementer's own PASS is never acceptance;
-- an external receipt directory under `research-attestations/<campaign>/<candidate>/`.
+- an independent-verifier receipt as a csl-research `submissions/<record_id>/`
+  record (repo, 40-hex commit, path, claim, limitations), not a directory in this
+  repository.
 
-If there is no gate or no verifier, stop and record a blocker in `state/INBOX.md`. If a task can
+If there is no gate or no verifier, stop and comment on the Linear issue. The Linear
+issue comment is the canonical escalation; `state/INBOX.md` is optional. If a task can
 be read two materially different ways, or needs a decision not in `state/DECISIONS.md`, escalate
 instead of choosing.
 

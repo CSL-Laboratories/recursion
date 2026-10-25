@@ -1387,7 +1387,10 @@ class ConflictJobStructureTests(unittest.TestCase):
         self.assertIn("when those tools are available", job)
         self.assertIn("not a denied command that blocks the push", job)
         self.assertIn("CSL-Laboratories/csl-research", job)
-        self.assertIn("submission record", job)
+        self.assertIn("Research bodies go", job)
+        self.assertIn("submissions/<record_id>/", job)
+        self.assertIn("through a PR there", job)
+        self.assertNotIn("submission record", job)
         self.assertIn("never to this repo", job)
         self.assertIn("digest on the Linear issue", job)
 

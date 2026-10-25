@@ -32,10 +32,11 @@ LINEAR_FIRST = (
     "new findings to Triage. Research may use any deep-research source the "
     "team has, such as Parallel, Exa, Claude Deep Research, Open Deep "
     "Research, ChatGPT Deep Research or the web. Current library docs "
-    "(for example Context7) also count. Research output goes to "
-    "CSL-Laboratories/csl-research as a submission record, never to this repo; "
-    "post a digest on the Linear issue. Each run records its tool, its run id "
-    "and its cost (or unknown + reason) in its csl-research record."
+    "(for example Context7) also count. Research bodies go to "
+    "CSL-Laboratories/csl-research as a submissions/<record_id>/ record "
+    "through a PR there, never to this repo; post a digest on the Linear "
+    "issue. Each run records its tool, its run id and its cost (or unknown "
+    "+ reason) in its csl-research record."
 )
 BEHIND_STATES = frozenset({"dirty", "behind"})
 PENDING_MERGEABLE = frozenset({"", "unknown"})

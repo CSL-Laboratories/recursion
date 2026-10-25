@@ -100,8 +100,9 @@ Linear issue; do not fall back to this repo.
 ## Pick up work
 
 Every task needs a **parent goal** and a **machine-checkable gate**. There is no gate, no
-work — if you cannot name the command that proves your change, stop and ask in
-[`state/INBOX.md`](state/INBOX.md).
+work — if you cannot name the command that proves your change, stop and comment
+on the Linear issue. The Linear issue comment is the canonical escalation;
+[`state/INBOX.md`](state/INBOX.md) is optional.
 
 For a research or evidence task:
 

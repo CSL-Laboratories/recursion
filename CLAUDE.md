@@ -87,7 +87,7 @@ selecting a task.
 
 The loop starts from an objective, feature admission or direction decision approved by a founder acting within `CONTROL_PLANE.md` authority. Within one admitted task (one repository/worktree, explicit allowed paths, explicit non-goals and one machine-checkable gate), an agent runs bounded research, development and tests. It then closes out with independent evidence on the exact candidate. Closeout records the full 40-hex commit tested, the commands and results, unresolved criteria, review evidence and linked follow-ups. An implementer's PASS, a GitHub merge and a Linear **Done** status are never empirical or product acceptance.
 
-When blocked, an agent preserves its work and records the blocker. Blockers go in `state/INBOX.md`. Flag required decision-log entries; `state/DECISIONS.md` remains protected and may be changed only through its separately founder-approved authoring process. A product task grants no permission to write that log. The agent comments on the Linear issue with @mentions, then releases its claim with a release record (below). Releasing the claim does not release the hold. A human-decision hold needs an explicit human decision receipt. A technical or dependency blocker needs evidence that its condition has cleared. Either way, the agent rechecks the gate and readiness and takes a fresh claim before resuming. Product decisions are never inferred from silence, elapsed time, CI results or issue status. A founder merge records its merge decision; it does not itself accept a product fragment or release an unrelated decision hold. Agents do not invent receipts or present their own records as founder statements; the one exception is a developer-approved comment that counts under `CONTROL_PLANE.md` (D-043).
+When blocked, an agent preserves its work and records the blocker. The Linear issue comment is the canonical escalation; `state/INBOX.md` is optional. Flag required decision-log entries; `state/DECISIONS.md` remains protected and may be changed only through its separately founder-approved authoring process. A product task grants no permission to write that log. The agent comments on the Linear issue with @mentions, then releases its claim with a release record (below). Releasing the claim does not release the hold. A human-decision hold needs an explicit human decision receipt. A technical or dependency blocker needs evidence that its condition has cleared. Either way, the agent rechecks the gate and readiness and takes a fresh claim before resuming. Product decisions are never inferred from silence, elapsed time, CI results or issue status. A founder merge records its merge decision; it does not itself accept a product fragment or release an unrelated decision hold. Agents do not invent receipts or present their own records as founder statements; the one exception is a developer-approved comment that counts under `CONTROL_PLANE.md` (D-043).
 
 Moving to other work means taking only a separately admitted, already-authorised task. That task must be next under an explicit human-approved priority or order. If no such order exists, or it is ambiguous, propose the next choice to the founders on Linear and wait. Do not choose for them.
 
@@ -107,7 +107,7 @@ release-on: done | decision needed | handoff | lease expiry
 - **Confirm.** After at least 60 seconds, re-read all comments on the issue, on its parent issue and on any sub-issue your scope covers, then search Linear for your exact branch name in quotes, including archived issues, and read every claim comment the results show. Your claim loses to an earlier live claim on the same issue, and to an earlier claim on another issue in this repository that overlaps it by scope or branch and has not been released, withdrawn, revoked or taken over. The earliest Linear `createdAt` wins; on an exact tie, the lower uuid. The winner sets `confirmed-at`, then moves the issue to **In Progress**. A loser edits its claim to `withdrawn: superseded by <uuid>` and stops. If any of these sources can't be read, don't confirm: read back again later or withdraw. Linear search can lag behind new comments and shows only issues your account can see, so a claim posted moments earlier can still be missed; the read-back reduces overlap but does not prevent it. Make no write (push, PR, label, thread resolve, status change) before `confirmed-at`. Before every write, repeat these reads and read the remote head.
 - **Lease.** Renew `heartbeat-at` at least hourly while working, with the real edit time. The lease runs 2 hours from the claim comment's last Linear `updatedAt`; Linear's timestamps decide, not agent-written times. Once more than 2 hours have passed, make no write until you renew. A renewal up to 2 hours 30 minutes after that `updatedAt` (the lease plus 30 minutes grace) restores the lease; after that, never renew the claim.
 - **Session start or resume.** Before any write, check each claim you hold. If its lease plus grace has passed, release it as lease expiry and never renew it; then re-read the issue and take a fresh claim. `heartbeat-at` is always the actual edit time from a fresh clock read.
-- **Takeover** of an expired claim only when all hold: lease plus grace has passed by `updatedAt`; no commit on the branch is newer than the last heartbeat; and no Actions/CI run started under that claim is in progress. Post `takeover of <uuid>` in your own claim and wait 15 minutes before your first write. Otherwise the owner decides. The owner can revoke a claim with an unprefixed `REVOKE CLAIM <uuid>`.
+- **Takeover** of an expired claim only when all hold: lease plus grace has passed by `updatedAt`; no commit on the branch is newer than the last heartbeat; and no Actions/CI run started under that claim is in progress. Post `takeover of <uuid>` in your own claim and wait 15 minutes before your first write. Otherwise the owner decides. The owner can revoke a claim with an unprefixed `REVOKE CLAIM <uuid>`. Cross-repo: cockpit forbids automatic takeover and needs `ACK TAKEOVER`; recursion allows takeover after lease plus grace; an agent working in both repos follows each repo's own rule.
 - **Release** a claim only after its writers have stopped: nothing left to push under that claim and no job you started for it still running. Work under your other non-overlapping claims does not block the release. Edit the claim to `released`, then post an agent-prefixed `release v1` record with `claim`, `reason` (done, decision needed (CSL-M), handoff, lease expiry or abandoned), `done`, `evidence`, `open`, `next` and `files`.
 - **Commits** an agent makes under a claim carry the trailer `Agent-Claim: <uuid>`; fixer, bot and human commits are exempt (Lucas's decision, CSL-357 comment 1c643648).
 
@@ -187,8 +187,7 @@ only by its `<!-- stuck-pr-threads:recursion#<PR> -->` marker, never by title.
 Otherwise post one Linear comment @mentioning the issue owner with the question, two
 or three options, your recommendation, and what you will do meanwhile ("paused" or
 other proceed-list work, never the option you are asking about or work that
-presupposes one). Record the blocker in `state/INBOX.md` as "Escalate, don't guess"
-requires, release your claim with a release record, and take only other admitted work that is next under
+presupposes one). The Linear issue comment is the canonical escalation; `state/INBOX.md` is optional. Release your claim with a release record, and take only other admitted work that is next under
 the human-approved order.
 
 **Comment labels.** Agents usually post through a developer's account, so start
@@ -233,7 +232,7 @@ reserved decisions and final tie-break; all three founders make the final releas
 These instructions do not grant authority beyond that document or accept a pending contract.
 You are a bounded executor: one task, one repository/worktree, explicit allowed paths,
 explicit non-goals, and one machine-checkable acceptance gate. Work inside that boundary.
-If a task could be read two materially different ways, stop and record a blocker in `state/INBOX.md` — do not pick one.
+If a task could be read two materially different ways, stop and comment on the Linear issue — do not pick one.
 
 ## Hard rules
 
@@ -269,8 +268,9 @@ If a task could be read two materially different ways, stop and record a blocker
 
 ## Escalate, don't guess
 
-Stop and write to `state/INBOX.md` when a task is ambiguous, needs a decision not recorded in
-`state/DECISIONS.md`, conflicts with the research, or makes a claim you cannot verify.
+Stop and comment on the Linear issue when a task is ambiguous, needs a decision not recorded in
+`state/DECISIONS.md`, conflicts with the research, or makes a claim you cannot verify. The Linear
+issue comment is the canonical escalation; `state/INBOX.md` is optional.
 
 ## Working with the v3 specifications
 
@@ -415,7 +415,7 @@ developer and does not decide.
 **Follow-ups.** When work reveals follow-ups, bugs, or next steps, create new **Triage**
 issues: one Type label, the repo label `recursion`, the `recursion` project, and a link back
 to the parent issue or PR. Not drive-by changes on an unrelated PR. Ambiguous tasks and
-unverifiable claims still stop in `state/INBOX.md`.
+unverifiable claims still stop on the Linear issue.
 
 **Assignees.** The three founders are Lucas (NotSkittlz), Chaandan (CDanTheMan), and Samir
 (samir-shah-ahmed). All are admins, and ownership changes over time, so never hardcode

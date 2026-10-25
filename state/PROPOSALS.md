@@ -101,3 +101,39 @@ Keep invariant 1's force-push, merge, and deployment limits. Name the review bra
 - No edit to `ANCHOR.md`.
 - No edit to `.github/workflows/**`. Workflow, pr-lint, script, and Claude/Devin
   findings stay listed on the CSL-76 PR.
+
+---
+
+## P-003 — Founder GitHub PR approval as Recursion spec acceptance
+
+- Date: 2026-10-25
+- Status: **proposed**; blocked on Lucas's unprefixed authoring-session comment on
+  [CSL-524](https://linear.app/csl-laboratories/issue/CSL-524). Not authorization.
+- Owner: Lucas.
+- Issue: [CSL-524](https://linear.app/csl-laboratories/issue/CSL-524) (child of CSL-494;
+  related CSL-493, CSL-523). Twin of CSL-523 in the companion repo.
+- Full proposed diffs: [docs/v3/proposals/ACCEPTANCE-RULE-2026-10-25.md](../docs/v3/proposals/ACCEPTANCE-RULE-2026-10-25.md).
+
+### Motivation
+
+Lucas (2026-10-24 11:58pm PT): Samir and Dan may change the product spec with their
+agents; spec changes by Samir or Dan are accepted once another founder approves the
+PR, bound to that head SHA and exact file digests. Lucas's path stays valid.
+
+`CONTROL_PLANE.md` rule 6 forbids editing protected paths without that authoring
+session. This proposal records the rule and the target diffs without applying them.
+
+### Proposed replacement
+
+See the proposal file. After Lucas posts the authoring sentence on CSL-524, apply
+those insertions to `CONTROL_PLANE.md`, `ANCHOR.md`, `state/DECISIONS.md` (append
+D-044 only), `AGENTS.md`, `CLAUDE.md`, `docs/v3/PLANNING.md`,
+`docs/v3/AUTONOMOUS-PLANNING.md`, `docs/v3/DECISION-REGISTER.md` item 9, and
+`docs/v3/ACCEPTANCE.md`.
+
+### Non-goals
+
+- No protected-path edit until the CSL-524 authoring comment exists.
+- No merge. No acceptance of recursion#295. No change to Lucas's reserved
+  decisions or to agent-never-merge.
+- No other-project identifiers in tracked files.

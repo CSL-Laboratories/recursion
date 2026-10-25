@@ -712,7 +712,7 @@ CROSSLANE_SHELL_PUSH = re.compile(
 # unpacked and never passed to a non-logging call.
 CROSSLANE_ARGV_PUSH = re.compile(r"""[\[(,]\s*\\?["']push\\?["']""")
 CROSSLANE_ARGV_BENIGN_CALL = re.compile(
-    r"(?:print|pprint|logging(?:\.\w+)+|logger(?:\.\w+)*|\blog)\s*\(?\s*$",
+    r"\b(?:print|pprint|logging(?:\.\w+)+|logger(?:\.\w+)*|log)\s*\(?\s*$",
     re.IGNORECASE,
 )
 # Known data assignment only. Keep the literal when that name is unpacked
@@ -1483,6 +1483,9 @@ class CrossLaneMutationTests(unittest.TestCase):
             'words = ["push", "pull"]\n          run_git(words)',
             'cmd_words = ["push", "pull"]\n          subprocess.run(["git", *cmd_words, "--force", "HEAD"])',
             'extra_words = ["push", "pull"]\n          subprocess.run(["git", *extra_words, "--force", "HEAD"])',
+            'run_logger(["push", "--force", url])',
+            'fingerprint(["push"])',
+            'words = ["push", "pull"]\n          run_git_logger(words)',
         ):
             with self.subTest(command=command):
                 with _mutated_workflow("claude.yml", lambda text, c=command: _append_job_step(text, "mention-prepare", c)):
@@ -1509,6 +1512,9 @@ class CrossLaneMutationTests(unittest.TestCase):
             'words = ["push", "pull"]\nrun_git(words)',
             'cmd_words = ["push", "pull"]\nsubprocess.run(["git", *cmd_words, "--force", "HEAD"])',
             'extra_words = ["push", "pull"]\nsubprocess.run(["git", *extra_words, "--force", "HEAD"])',
+            'run_logger(["push", "--force", url])',
+            'fingerprint(["push"])',
+            'words = ["push", "pull"]\nrun_git_logger(words)',
         ):
             with self.subTest(push=push):
                 self.assertIsNotNone(_crosslane_step_push_search(push))

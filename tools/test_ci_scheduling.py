@@ -714,9 +714,6 @@ CROSSLANE_ARGV_BENIGN_CALL = re.compile(
     r"(?:print|pprint|logging(?:\.\w+)+|logger(?:\.\w+)*|\blog)\s*\(?\s*$",
     re.IGNORECASE,
 )
-CROSSLANE_ARGV_NEXT_QUOTED = re.compile(
-    r"""\s*,\s*[rbfuRBFU]{0,2}\\?["']([A-Za-z][\w.-]*)\\?["']"""
-)
 CROSSLANE_GIT_SUBCOMMANDS = frozenset({
     "add", "am", "annotate", "apply", "archive", "bisect", "blame", "branch",
     "bundle", "checkout", "cherry-pick", "clean", "clone", "commit", "config",
@@ -966,11 +963,33 @@ def _crosslane_widen(text: str, pos: int) -> tuple[int, int]:
     return start, end
 
 
+def _crosslane_argv_fragment(text: str, match: re.Match[str]) -> str:
+    opener = match.start()
+    while opener < match.end() and text[opener] not in "[(,":
+        opener += 1
+    if opener < match.end() and text[opener] in "[(":
+        span = _crosslane_bracket(text, opener + 1, "[(")
+    else:
+        span = _crosslane_bracket(text, opener, "[(")
+    return text[slice(*span)] if span else text[slice(*_crosslane_shell_command(text, match.start(), match.end()))]
+
+
 def _crosslane_argv_push_is_benign(text: str, match: re.Match[str]) -> bool:
+    # print("push") / logging; or a quoted-only word list of git subcommands such as
+    # ["push", "pull"]. A real git argv (`["git", "push", "branch", "--force", "HEAD"]`)
+    # stays a push even when a remote name matches a subcommand.
     if CROSSLANE_ARGV_BENIGN_CALL.search(text[max(0, match.start() - 80):match.start()]):
         return True
-    nxt = CROSSLANE_ARGV_NEXT_QUOTED.match(text[match.end():])
-    return bool(nxt and nxt.group(1).lower() in CROSSLANE_GIT_SUBCOMMANDS)
+    fragment = _crosslane_argv_fragment(text, match)
+    if re.search(r"""["']git["']|\bgit\s*\(""", fragment):
+        return False
+    if re.search(r"""["']-[^"']*["']""", fragment):
+        return False
+    literals = re.findall(r"""[rbfuRBFU]{0,2}\\?["']([^"']*)\\?["']""", fragment)
+    if len(literals) < 2:
+        return False
+    names = CROSSLANE_GIT_SUBCOMMANDS | {"push"}
+    return all(word.lower() in names for word in literals)
 
 
 def _crosslane_step_push_search(text: str) -> re.Match[str] | None:
@@ -1000,15 +1019,7 @@ def _crosslane_push_commands(text: str) -> list[str]:
     for match in CROSSLANE_ARGV_PUSH.finditer(text):
         if _crosslane_argv_push_is_benign(text, match):
             continue
-        opener = match.start()
-        while opener < match.end() and text[opener] not in "[(,":
-            opener += 1
-        if text[opener] in "[(":
-            span = _crosslane_bracket(text, opener + 1, "[(")
-        else:
-            span = _crosslane_bracket(text, opener, "[(")
-        fragment = text[slice(*span)] if span else text[slice(*_crosslane_shell_command(text, match.start(), match.end()))]
-        commands.append(fragment)
+        commands.append(_crosslane_argv_fragment(text, match))
     return commands
 
 
@@ -1453,6 +1464,7 @@ class CrossLaneMutationTests(unittest.TestCase):
             'self.git("push")',
             'GIT(["push", remote])',
             'git_cmd = ["push", "--force"]',
+            'subprocess.run(["git", "push", "branch", "--force", "HEAD"])',
         ):
             with self.subTest(command=command):
                 with _mutated_workflow("claude.yml", lambda text, c=command: _append_job_step(text, "mention-prepare", c)):
@@ -1467,6 +1479,7 @@ class CrossLaneMutationTests(unittest.TestCase):
             'self.git("push")',
             'GIT(["push", remote])',
             'git_cmd = ["push", "--force"]',
+            'subprocess.run(["git", "push", "branch", "--force", "HEAD"])',
         ):
             with self.subTest(push=push):
                 self.assertIsNotNone(_crosslane_step_push_search(push))

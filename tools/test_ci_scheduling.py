@@ -712,11 +712,11 @@ CROSSLANE_SHELL_PUSH = re.compile(
 # unpacked and never passed to a non-logging call.
 CROSSLANE_ARGV_PUSH = re.compile(r"""[\[(,]\s*\\?["']push\\?["']""")
 CROSSLANE_ARGV_BENIGN_CALL = re.compile(
-    r"\b(?:print|pprint|logging(?:\.\w+)+|logger(?:\.\w+)*|log)\s*\(?\s*$",
+    r"(?:(?<![\w.])(?:print|pprint|log)|(?<![\w])(?:logging|logger)(?:\.\w+)*)\s*\(?\s*$",
     re.IGNORECASE,
 )
-# Known data assignment only. Keep the literal when that name is unpacked
-# (`*words`) or passed to a non-logging call, so argv-push still matches.
+# Known data assignment only. Keep the literal when that name is used later
+# in a non-logging way (unpack, concat, call), so argv-push still matches.
 CROSSLANE_PUSH_PULL_LIST = re.compile(
     r"""\b(words|allowed_commands)\s*=\s*\[[ \t]*\\?["']push\\?["'][ \t]*,[ \t]*\\?["']pull\\?["'][ \t]*\]"""
 )
@@ -977,10 +977,10 @@ def _crosslane_without_word_lists(text: str) -> str:
 
     def _drop_data_list(match: re.Match[str]) -> str:
         name = match.group(1)
-        if re.search(rf"\*\s*{re.escape(name)}\b", text):
-            return match.group(0)
-        for used in re.finditer(rf"\b{re.escape(name)}\s*[,)\]]", text):
-            if not _crosslane_argv_push_is_benign(text, used):
+        rest = text[match.end():]
+        for used in re.finditer(rf"\b{re.escape(name)}\b", rest):
+            prefix = text[max(0, match.end() + used.start() - 80):match.end() + used.start()]
+            if CROSSLANE_ARGV_BENIGN_CALL.search(prefix) is None:
                 return match.group(0)
         return ""
 
@@ -994,7 +994,7 @@ def _crosslane_argv_push_is_benign(text: str, match: re.Match[str]) -> bool:
 def _crosslane_step_push_search(text: str) -> re.Match[str] | None:
     # Shell matches always count; argv matches use the broad rule. print("push")
     # is dropped; a words=/allowed_commands= `["push", "pull"]` assignment is
-    # stripped unless that name is unpacked or passed to a non-logging call.
+    # stripped unless that name is used later in a non-logging way.
     text = _crosslane_without_word_lists(text)
     for match in CROSSLANE_SHELL_PUSH.finditer(text):
         return match
@@ -1486,6 +1486,9 @@ class CrossLaneMutationTests(unittest.TestCase):
             'run_logger(["push", "--force", url])',
             'fingerprint(["push"])',
             'words = ["push", "pull"]\n          run_git_logger(words)',
+            'words = ["push", "pull"]\n          args = ["git"] + words\n          subprocess.run(args)',
+            'allowed_commands = ["push", "pull"]\n          cmd = ["git"] + allowed_commands',
+            'self.log(["push", "-f"])',
         ):
             with self.subTest(command=command):
                 with _mutated_workflow("claude.yml", lambda text, c=command: _append_job_step(text, "mention-prepare", c)):
@@ -1515,6 +1518,9 @@ class CrossLaneMutationTests(unittest.TestCase):
             'run_logger(["push", "--force", url])',
             'fingerprint(["push"])',
             'words = ["push", "pull"]\nrun_git_logger(words)',
+            'words = ["push", "pull"]\nargs = ["git"] + words\nsubprocess.run(args)',
+            'allowed_commands = ["push", "pull"]\ncmd = ["git"] + allowed_commands',
+            'self.log(["push", "-f"])',
         ):
             with self.subTest(push=push):
                 self.assertIsNotNone(_crosslane_step_push_search(push))

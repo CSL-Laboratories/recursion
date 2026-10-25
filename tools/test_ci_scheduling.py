@@ -707,16 +707,18 @@ CROSSLANE_SHELL_PUSH = re.compile(
     r"))*(?:\s|\\\n)+push\b"
 )
 # An argv push: the broad `[\[(,]\s*"push"` rule (master). False positives are
-# excluded afterwards: a bare `"push"` passed to print/logging, and the one
-# known data literal `["push", "pull"]` (exact match, like KNOWN_WORDS).
+# excluded afterwards: a bare `"push"` passed to print/logging, and a
+# `words`/`allowed_commands` `["push", "pull"]` assignment that is never
+# unpacked or passed to a call.
 CROSSLANE_ARGV_PUSH = re.compile(r"""[\[(,]\s*\\?["']push\\?["']""")
 CROSSLANE_ARGV_BENIGN_CALL = re.compile(
     r"(?:print|pprint|logging(?:\.\w+)+|logger(?:\.\w+)*|\blog)\s*\(?\s*$",
     re.IGNORECASE,
 )
-# Only the known data assignment, never a list unpacked into a git call.
+# Known data assignment only. If that name is unpacked or passed to a call,
+# leave the literal in place so argv-push still matches.
 CROSSLANE_PUSH_PULL_LIST = re.compile(
-    r"""(?:words|allowed_commands)\s*=\s*\[[ \t]*\\?["']push\\?["'][ \t]*,[ \t]*\\?["']pull\\?["'][ \t]*\]"""
+    r"""\b(words|allowed_commands)\s*=\s*\[[ \t]*\\?["']push\\?["'][ \t]*,[ \t]*\\?["']pull\\?["'][ \t]*\]"""
 )
 CROSSLANE_JOB_KEY = re.compile(
     r"""^  (?:"([A-Za-z_][\w-]*)"|'([A-Za-z_][\w-]*)'|([A-Za-z_][\w-]*)):(?:\s+#.*)?$"""
@@ -972,7 +974,14 @@ def _crosslane_argv_fragment(text: str, match: re.Match[str]) -> str:
 
 def _crosslane_without_word_lists(text: str) -> str:
     text = CROSSLANE_WORD_LIST.sub("", text)
-    return CROSSLANE_PUSH_PULL_LIST.sub("", text)
+
+    def _drop_data_list(match: re.Match[str]) -> str:
+        name = match.group(1)
+        if re.search(rf"\*\s*{re.escape(name)}\b|\b{re.escape(name)}\s*[,)\]]", text):
+            return match.group(0)
+        return ""
+
+    return CROSSLANE_PUSH_PULL_LIST.sub(_drop_data_list, text)
 
 
 def _crosslane_argv_push_is_benign(text: str, match: re.Match[str]) -> bool:
@@ -981,7 +990,8 @@ def _crosslane_argv_push_is_benign(text: str, match: re.Match[str]) -> bool:
 
 def _crosslane_step_push_search(text: str) -> re.Match[str] | None:
     # Shell matches always count; argv matches use the broad rule. print("push")
-    # is dropped; the exact `["push", "pull"]` data literal is stripped first.
+    # is dropped; a words=/allowed_commands= `["push", "pull"]` assignment is
+    # stripped only when that name is never unpacked or passed to a call.
     text = _crosslane_without_word_lists(text)
     for match in CROSSLANE_SHELL_PUSH.finditer(text):
         return match
@@ -1460,6 +1470,9 @@ class CrossLaneMutationTests(unittest.TestCase):
             'git("push", remote, "pull")',
             'subprocess.run(["git", *["push", "pull"]])',
             'args = ["push", "pull"]\n          subprocess.run(["git", *args, "--force", "HEAD"])',
+            'words = ["push", "pull"]\n          subprocess.run(["git", *words, "--force", "HEAD"])',
+            'cmd_words = ["push", "pull"]\n          subprocess.run(["git", *cmd_words, "--force", "HEAD"])',
+            'extra_words = ["push", "pull"]\n          subprocess.run(["git", *extra_words, "--force", "HEAD"])',
         ):
             with self.subTest(command=command):
                 with _mutated_workflow("claude.yml", lambda text, c=command: _append_job_step(text, "mention-prepare", c)):
@@ -1482,6 +1495,9 @@ class CrossLaneMutationTests(unittest.TestCase):
             'git("push", remote, "pull")',
             'subprocess.run(["git", *["push", "pull"]])',
             'args = ["push", "pull"]\nsubprocess.run(["git", *args, "--force", "HEAD"])',
+            'words = ["push", "pull"]\nsubprocess.run(["git", *words, "--force", "HEAD"])',
+            'cmd_words = ["push", "pull"]\nsubprocess.run(["git", *cmd_words, "--force", "HEAD"])',
+            'extra_words = ["push", "pull"]\nsubprocess.run(["git", *extra_words, "--force", "HEAD"])',
         ):
             with self.subTest(push=push):
                 self.assertIsNotNone(_crosslane_step_push_search(push))

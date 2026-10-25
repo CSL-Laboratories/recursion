@@ -40,7 +40,9 @@ Lucas's 2026-10-24 direction and the graded competitive brief. Linear issue
 | [CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research) | **not readable this session** (GitHub API 404) | No vault record written or cited |
 
 No pay-per-token research run was made. Exa MCP returned HTTP 429 / free-tier limit this
-session. Public identification of operator names used a generic web lookup (2026-10-25).
+session. This amendment does **not** assert product names for Anthropic's or OpenAI's
+agent/bot operators (F-15). Lucas (2026-10-24 11:53pm PT): "Claude has their own bot, not
+sure what it's called."
 
 ## 1. North star (proposed)
 
@@ -69,7 +71,7 @@ A candidate that "will add the GUI later" **fails bar 4**.
 | 2 | High quality, practical for enterprise and developers | Review-branch publish, no credential custody, truthful Stop, audit receipts; SSO/SCIM are research (F-4), not fakes |
 | 3 | Hyper-optimized | OR-024 ranking visible; attach/open GUI launches zero inference; disabled-client idle |
 | 4 | A real graphical interface users interact with | Journeys completed in a GUI over the same command/query daemon as the CLI; closing the window does not kill work |
-| 5 | Directed and installed by agents | Machine-readable setup + Control MCP so Grok Bot / Claude Bard / Codex Dots can finish install without a human reading docs |
+| 5 | Directed and installed by agents | Machine-readable setup + Control MCP so Grok Bot and Anthropic's and OpenAI's own agent/bot products (working labels: Claude Bard, Codex Dots; exact products are F-15) can finish install without a human reading docs |
 | 6 | Config syncs with providers/preferences users already use | Import/observe Claude, Codex, Cursor, git, `AGENTS.md`; never copy tokens |
 | 7 | Loved features, optimized and done correctly | Plan, diffs, worktrees, Stop, fork, approvals, PR-as-publish, honest usage — under Recursion contracts (generated ≠ accepted, unknown ≠ 0, MCP ≠ grant, window-close ≠ Stop) |
 
@@ -143,13 +145,12 @@ skills, memory policy and provider descriptors — never secrets. Sync backend i
 
 ### P8 — Agent-installable and agent-operable
 
-Recursion must be operable by agent software via **MCP or a control API**, explicitly:
-
-| Lucas's name | Identification this session | Status |
-|---|---|---|
-| **Grok Bot** | xAI Grok Bot ([docs.x.ai/grok-bot](https://docs.x.ai/grok-bot/overview)); no public inbound driver API found in the 2026-10-24 brief (unverified inbound). Interim: Grok Bot is the *caller* of Recursion's Control MCP. | keep; inbound still unverified |
-| **Claude Bard** | Lucas's name. No public product titled "Claude Bard" was found (2026-10-25 lookup). Closest public operator surfaces are Claude Duet, Dispatch and Cowork — **not adopted as the name**. | keep; **unverified** |
-| **Codex Dots** | Lucas's name. Public OpenAI product is **Dots** ([Meet dots](https://learn.chatgpt.com/docs/dots), [Getting started with your dot](https://help.openai.com/en/articles/20001530-getting-started-with-your-dot)): always-on ChatGPT agents that can create/continue Codex tasks. The compound title "Codex Dots" was not found as a product name. | keep Lucas's name; identification **inferred** |
+Recursion must be operable by agent software via **MCP or a control API**, explicitly
+including Grok Bot (inbound driver API still unverified, F-7; interim: Grok Bot is the
+*caller* of Recursion's Control MCP) and Anthropic's and OpenAI's own agent/bot products
+(Lucas's working labels: Claude Bard, Codex Dots); exact products and their control
+surfaces are a RESEARCH question, decide from findings (F-15). This amendment does not
+assert product names for those labels.
 
 Installer (`curl \| sh` / `npx` / `pipx`) plus `llms.txt` and `AGENTS.md`. Control MCP and
 ACP-agent face expose `doctor`, `status`, `task`, `route explain`, `stop`, `approval` with
@@ -221,9 +222,10 @@ Lucas can decide any of these at any time; silence is not a decision.
 | F-12 | Native mobile vs PWA by Nov 11; D-036 online-only mobile view | RESEARCH |
 | F-13 | Preference sync backend (Git vs CRDT vs coordinator store) and offline conflict model | RESEARCH |
 | F-14 | Agent-operator step-up list and prevention of agent self-approval | RESEARCH |
+| F-15 | Anthropic's and OpenAI's own agent/bot products (Lucas's working labels: Claude Bard, Codex Dots); exact products and their control surfaces are a RESEARCH question, decide from findings. Lucas (2026-10-24 11:53pm PT): "Claude has their own bot, not sure what it's called." Do not assert product names. | RESEARCH |
 
 Also still research (not decided here): the product language (F-3), which Octopus (F-1),
-the default remote relay (F-9), durable execution vs replay (F-10).
+the default remote relay (F-9), durable execution vs replay (F-10), and F-15.
 
 ## 5. Files this proposal amends (additions only)
 
@@ -267,7 +269,6 @@ External identifications used in this amendment (retrieval 2026-10-24 or 2026-10
 
 - DeepSeek Harness: https://github.com/deepseek-ai/deepseek-harness
 - Octopus candidates: https://github.com/archeryue/Octopus · https://github.com/nyldn/claude-octopus
-- OpenAI Dots: https://learn.chatgpt.com/docs/dots · https://help.openai.com/en/articles/20001530-getting-started-with-your-dot
 - Grok Bot: https://docs.x.ai/grok-bot/overview
 - T3 Code: https://t3.codes/ · https://github.com/pingdotgg/t3code
 - OpenCode Go: https://opencode.ai/docs/go/

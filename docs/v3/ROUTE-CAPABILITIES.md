@@ -124,8 +124,7 @@ live eligibility. Full text: [AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md).
 | OpenCode Go / OpenCode Zen | Subscription/provider keys the user owns; connect as BYOK-first, not Recursion-custodied OAuth. |
 | Grok Bot | Separate identity from Grok Build (already required). No public inbound driver API found (unverified, F-7). Interim: Grok Bot is a **caller** of Recursion's Control MCP (P8). |
 | Devin | User-owned API key held by OS-keyring reference (F-6 vs D-021). Devin API v3 is a structured-tier adapter candidate. |
-| Claude Bard | Lucas's operator name; **unverified** as a public product title. Not a route row until identified. |
-| Codex Dots | Lucas's operator name. Public OpenAI **Dots** can create/continue Codex tasks; keep Lucas's name. Operator of Recursion via Control MCP, not a substitute for the Codex App Server row. |
+| Anthropic / OpenAI agent-bot operators (overlay) | Anthropic's and OpenAI's own agent/bot products (Lucas's working labels: Claude Bard, Codex Dots); exact products and their control surfaces are a RESEARCH question, decide from findings (F-15). Not route rows until identified. This overlay does not assert product names. |
 
 MKR-001 through MKR-007 and MKR-023/MKR-024 are registered research conclusions.
 The [source register](SOURCE-REGISTER.md) and [evidence records](foundation-research/mark2-research/evidence.json)

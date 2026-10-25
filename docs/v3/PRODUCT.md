@@ -93,21 +93,19 @@ orientation notes. The original sentences are kept; see each file's dated pointe
 
 ### Agent operators
 
-Recursion must be operable by agent software via **MCP or a control API**, explicitly:
-
-- **Grok Bot** (xAI; inbound driver API unverified — interim: Grok Bot calls Recursion).
-- **Claude Bard** — Lucas's name; **unverified** as a public product title this session
-  (closest public surfaces are Claude Duet / Dispatch / Cowork; those names are not adopted).
-- **Codex Dots** — Lucas's name. Public OpenAI product is **Dots**, always-on ChatGPT agents
-  that can create or continue Codex tasks
-  (https://learn.chatgpt.com/docs/dots, retrieved 2026-10-25). The compound title
-  "Codex Dots" was not found; keep Lucas's name.
+Recursion must be operable by agent software via **MCP or a control API**, explicitly
+including Grok Bot, and Anthropic's and OpenAI's own agent/bot products (Lucas's working
+labels: Claude Bard, Codex Dots); exact products and their control surfaces are a RESEARCH
+question, decide from findings (F-15). This amendment does not assert product names for
+those labels. Lucas (2026-10-24 11:53pm PT): "Claude has their own bot, not sure what
+it's called."
 
 ### Research questions, not decisions
 
 F-1 which Octopus; F-3 product language; F-4 what enterprise means by Nov 11; F-9 default
-remote relay; F-10 durable execution vs the replay kernel (PR #292); and F-5, F-6, F-7, F-8,
-F-11, F-12, F-13, F-14 as listed in [AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md).
+remote relay; F-10 durable execution vs the replay kernel (PR #292); F-15 Anthropic's and
+OpenAI's own agent/bot products (working labels: Claude Bard, Codex Dots); and F-5, F-6,
+F-7, F-8, F-11, F-12, F-13, F-14 as listed in [AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md).
 F-2 (GUI contradiction) is answered by the Surfaces paragraph above.
 
 ## Mark 2 capability map â€” research synthesis 2026-09-07
@@ -232,7 +230,9 @@ Public usability remains an explicit design requirement. Users should be able to
 Amendment proposed 2026-10-24 (acceptance is a human decision by Lucas; see
 [AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md)): the CLI remains a complete operator
 surface, so an agent is still never *required* to edit settings, and Recursion is also
-**agent-operable** via MCP or a control API (Grok Bot, Claude Bard, Codex Dots). The GUI
+**agent-operable** via MCP or a control API (Grok Bot, and Anthropic's and OpenAI's own
+agent/bot products — Lucas's working labels: Claude Bard, Codex Dots; exact products and
+their control surfaces are F-15). The GUI
 is a first-release client over the same daemon, not opt-in-later packaging.
 
 ## Product promises

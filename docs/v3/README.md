@@ -120,8 +120,7 @@ The main assistant directly creates and monitors ARM executives. There is no sep
 | Document | Question it answers |
 |---|---|
 | [PRODUCT.md](PRODUCT.md) | What is v3, who is it for, and what is outside it? |
-| [AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md) | Proposed 2026-10-24 north star, pillars and GUI supersession (unaccepted; Lucas decides) |
-| [RESEARCH-REGISTER.md](RESEARCH-REGISTER.md) | Living research and open-questions register (CSL-494…510, CSL-520…522); not accepted product text |
+| [AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md) | Proposed 2026-10-24 north star, pillars and GUI supersession (unaccepted; Lucas decides). Research: `CSL-Laboratories/csl-research` `250fdbbe2964e4889096a487e2dfb6d7794046a6` `submissions/20261025-recursion-csl494-rp0-amendment-research-01/` (candidate; vault PR pending) |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | How do the Recursion Head, ARMs, workers, and the kernel fit together? |
 | [ARCHITECTURE-PROOF.md](ARCHITECTURE-PROOF.md) | Which R1–R17 claims survived the focused campaign, what remains unproved, and is the contract skeleton ready? |
 | [ARCHITECTURE-OPTIONS.md](ARCHITECTURE-OPTIONS.md) | Which runtime foundations were compared, what is recommended, and what would falsify it? |

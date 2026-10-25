@@ -18,9 +18,8 @@ Agent (Cursor Cloud `bc-5c609d8d-1982-5753-a90d-8974cde61752`, for Lucas): draft
 Lucas's 2026-10-24 direction and the graded competitive brief. Linear issue
 [CSL-494](https://linear.app/csl-laboratories/issue/CSL-494) (RP0), umbrella
 [CSL-493](https://linear.app/csl-laboratories/issue/CSL-493). This RP0 amendment is
-Lucas-authored; **Lucas accepts it**. Subsequent spec changes by Samir or Dan follow
-[RESEARCH-REGISTER.md](RESEARCH-REGISTER.md) (another founder's PR approval counts as
-acceptance).
+Lucas-authored; **Lucas accepts it**. Subsequent spec changes by Samir or Dan (or their
+attributed agents) are accepted when a founder other than the author approves the PR.
 
 ## How to read this
 
@@ -34,20 +33,18 @@ acceptance).
 - **Research questions** (F-1…F-14 and the others named here) are questions, not decisions.
 - Evidence classes stay distinct: source-documented, locally observed, inferred, unmeasured.
 
-## Research grounding (this session)
+## Research evidence
 
-| Source | Grade | Use |
-|---|---|---|
-| `CSL-Laboratories/recursion` master `954ddc607f6b8736a09ebf5aed872fce8355ce3e` | locally observed | Spec baseline |
-| Graded brief *Recursion: competitive frontier and pillar design brief* (Grok Bot, preparing research for Lucas, 2026-10-24) | candidate research; citations [R#]/[S#] as in that brief | Pillars, competitor matrix, gaps, F-questions |
-| *Recursion Frontier Map* (Grok Bot, preparing research for Lucas, 2026-10-25) | candidate research | Seven-point bar, Nov 11 horizon, eval non-goals |
-| Lucas task text 2026-10-25 (this PR) | attributed direction for Lucas to accept | North star, surfaces, operators, spend, method |
-| [CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research) | **not readable this session** (GitHub API 404) | No vault record written or cited |
+Research for this amendment lives in `CSL-Laboratories/csl-research`.
 
-No pay-per-token research run was made. Exa MCP returned HTTP 429 / free-tier limit this
-session. This amendment does **not** assert product names for Anthropic's or OpenAI's
-agent/bot operators (F-15). Lucas (2026-10-24 11:53pm PT): "Claude has their own bot, not
-sure what it's called."
+- **Repository:** `CSL-Laboratories/csl-research`
+- **Commit:** `250fdbbe2964e4889096a487e2dfb6d7794046a6`
+- **Path:** `submissions/20261025-recursion-csl494-rp0-amendment-research-01/`
+- **Claim:** RP0 amendment research grounding, F-1…F-15, and the parent-keyed register for CSL-494.
+- **Limitation:** candidate evidence; vault PR https://github.com/CSL-Laboratories/csl-research/pull/41 is pending review. Not human product acceptance.
+
+Product files only link here. This amendment does **not** assert product names for
+Anthropic's or OpenAI's agent/bot operators (F-15).
 
 ## 1. North star (proposed)
 
@@ -213,36 +210,13 @@ acceptance.
 
 ## 4. Research questions, not decisions
 
-Copied from the attached Page (F-1…F-14). Status `RESEARCH` unless marked answered.
-Lucas can decide any of these at any time; silence is not a decision.
-
-The living parent-keyed index is [RESEARCH-REGISTER.md](RESEARCH-REGISTER.md) (Lucas
-2026-10-24 11:57pm PT: the spec must be dynamic). Publishing a csl-research record
-updates that register in a docs-only PR. PRODUCT.md accepted text changes only under
-that register's update rule: Lucas-authored dated amendments are accepted by Lucas;
-spec changes by Samir or Dan (or their attributed agents) are accepted when a founder
-other than the author approves the PR (Lucas 2026-10-24 11:58pm PT).
-
-| ID | Question | Status |
-|---|---|---|
-| F-1 | Which "Octopus" did Lucas mean? Beat both until named: `archeryue/Octopus` (personal agent platform) and `nyldn/claude-octopus` (12-provider consensus plugin). | RESEARCH |
-| F-2 | Spec GUI contradiction vs D-038 | **ANSWERED** by D-038 (2026-10-02). This amendment adds Tauri/daemon/standalone/"goat" beyond D-038; it does not reopen D-038 |
-| F-3 | Product language and runtime (OR-017) | RESEARCH |
-| F-4 | What "enterprise" means by Nov 11 (self-hosted team vs hosted multi-tenant) | RESEARCH |
-| F-5 | Anthropic "ordinary, individual usage" for unattended `claude -p` fan-out (D-027 counsel) | RESEARCH |
-| F-6 | Devin/Cursor API keys vs D-021 no-custody (keys by OS-keyring reference) | RESEARCH |
-| F-7 | Grok Bot inbound/driver API | RESEARCH (unverified) |
-| F-8 | Smallest Task Capsule that keeps fidelity across model families | RESEARCH |
-| F-9 | Default remote relay: self-hosted E2E vs Tailscale vs hosted (no mandatory hosted gateway) | RESEARCH |
-| F-10 | Temporal-style durable execution vs in-house replay kernel (PR #292 / CSL-336) | RESEARCH |
-| F-11 | Remote steering: vendor remotes vs always via Recursion | RESEARCH |
-| F-12 | Native mobile vs PWA by Nov 11; D-036 online-only mobile view | RESEARCH |
-| F-13 | Preference sync backend (Git vs CRDT vs coordinator store) and offline conflict model | RESEARCH |
-| F-14 | Agent-operator step-up list and prevention of agent self-approval | RESEARCH |
-| F-15 | Anthropic's and OpenAI's own agent/bot products (Lucas's working labels: Claude Bard, Codex Dots); exact products and their control surfaces are a RESEARCH question, decide from findings. Lucas (2026-10-24 11:53pm PT): "Claude has their own bot, not sure what it's called." Do not assert product names. | RESEARCH |
-
-Also still research (not decided here): the product language (F-3), which Octopus (F-1),
-the default remote relay (F-9), durable execution vs replay (F-10), and F-15.
+F-IDs used in this spec: F-1 Octopus; F-2 GUI (answered by D-038); F-3 language/runtime;
+F-4 enterprise; F-5 Anthropic unattended usage; F-6 Devin/Cursor keys; F-7 Grok Bot API;
+F-8 Task Capsule; F-9 default relay; F-10 durable execution vs replay; F-11 remote steering;
+F-12 native vs PWA; F-13 preference sync; F-14 agent step-up; F-15 Anthropic/OpenAI
+agent/bot products (working labels only). Full questions, sources and the parent-keyed
+register are in the research-evidence block above. Lucas can decide any of these at any
+time; silence is not a decision.
 
 ## 5. Files this proposal amends (additions only)
 
@@ -251,8 +225,7 @@ contradicts the direction gets a dated pointer and a local addition.
 
 | File | Direct contradiction | Change in this PR |
 |---|---|---|
-| [RESEARCH-REGISTER.md](RESEARCH-REGISTER.md) | Spec treated as static vs Linear parents and published research | **New** living register; docs-only updates; PRODUCT.md accepted text follows the register update rule (Lucas-authored vs Samir/Dan other-founder approval) |
-| [PRODUCT.md](PRODUCT.md) | Status; initial-user "agent never required to edit settings" as a ceiling | Front-matter + new section; OR-038 paragraph **untouched**; link to the living register. D-038 already in force; this section adds Tauri/daemon/standalone/"goat" |
+| [PRODUCT.md](PRODUCT.md) | Status; initial-user "agent never required to edit settings" as a ceiling | Front-matter + new section; OR-038 paragraph **untouched**; vault evidence link. D-038 already in force; this section adds Tauri/daemon/standalone/"goat" |
 | [INTERFACE-STRATEGY.md](INTERFACE-STRATEGY.md) | Historical non-goal "No graphical frontend in the initial release" (already superseded by D-038) | Dated pointer: D-038 in force; this amendment adds Tauri/daemon/standalone/"goat". Original line kept |
 | [ROUTE-CAPABILITIES.md](ROUTE-CAPABILITIES.md) | BYOK "native loop remains to be built"; missing Grok Bot / Devin / OpenCode Go/Zen rows | Add proposed overlay rows. Claude Bard / Codex Dots marked as Lucas's working labels, unverified, F-15 |
 | [INTERACTION-SURFACES.md](INTERACTION-SURFACES.md) | Historical "requires no web, desktop or mobile graphical client" (already superseded by D-038) | Dated pointer; adds Tauri/daemon/standalone beyond D-038 |
@@ -279,20 +252,5 @@ the GUI remains a non-goal.
 - Rewrite OR-038/OR-039 or any other exact Owner-approved paragraph.
 - Admit RP1–RP16 implementation work. Those remain separate issues under the Nov 11 umbrella.
 - Touch workflow files, CI, or Devin settings.
-
-## 7. Sources (abbreviated)
-
-Full graded source tables are in the competitive brief §8. Recursion pins at
-`954ddc607f6b8736a09ebf5aed872fce8355ce3e`.
-
-External identifications used in this amendment (retrieval 2026-10-24 or 2026-10-25):
-
-- DeepSeek Harness: https://github.com/deepseek-ai/deepseek-harness
-- Octopus candidates: https://github.com/archeryue/Octopus · https://github.com/nyldn/claude-octopus
-- Grok Bot: https://docs.x.ai/grok-bot/overview
-- T3 Code: https://t3.codes/ · https://github.com/pingdotgg/t3code
-- OpenCode Go: https://opencode.ai/docs/go/
-- Claude Code remote control / Projects / legal: https://code.claude.com/docs/en/remote-control · https://code.claude.com/docs/en/claude-projects · https://code.claude.com/docs/en/legal-and-compliance
-- Codex App Server: https://developers.openai.com/codex/app-server.md
-- Happy E2E relay: https://github.com/slopus/happy
-- Replay kernel: recursion PR #292 / CSL-336
+- Keep a living research register in this repository. Research lives in
+  `CSL-Laboratories/csl-research` (see Research evidence).

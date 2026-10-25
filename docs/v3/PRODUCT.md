@@ -105,22 +105,29 @@ it's called."
 F-1 which Octopus; F-3 product language; F-4 what enterprise means by Nov 11; F-9 default
 remote relay; F-10 durable execution vs the replay kernel (PR #292); F-15 Anthropic's and
 OpenAI's own agent/bot products (working labels: Claude Bard, Codex Dots); and F-5, F-6,
-F-7, F-8, F-11, F-12, F-13, F-14 as listed in [AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md).
-F-2 (GUI contradiction) is answered by D-038; this amendment adds the Surfaces paragraph
-above.
+F-7, F-8, F-11, F-12, F-13, F-14. F-2 (GUI contradiction) is answered by D-038; this
+amendment adds the Surfaces paragraph above. Full questions and sources:
+`CSL-Laboratories/csl-research` commit `250fdbbe2964e4889096a487e2dfb6d7794046a6`,
+path `submissions/20261025-recursion-csl494-rp0-amendment-research-01/` (candidate
+evidence; vault PR pending review).
 
-### Research and open questions (living)
+### Research and open questions
 
 Lucas (2026-10-24 11:57pm PT): the Recursion spec must be dynamic, changing with the
-issues and the research that is published. The living register is
-[RESEARCH-REGISTER.md](RESEARCH-REGISTER.md), keyed to CSL-494…CSL-510 and shared
-CSL-520…CSL-522 (umbrella CSL-493). Publishing a csl-research record
-(`CSL-Laboratories/csl-research` `submissions/<record_id>/`) updates that register in a
-docs-only PR. **Accepted text in this file changes only under that register's update
-rule.** Lucas-authored dated amendments (including this RP0 text) are accepted when
-Lucas accepts. Spec changes authored by Samir or Dan (or their agents, attributed)
-are accepted when a founder other than the author approves the PR; that approval
-counts as acceptance (Lucas 2026-10-24 11:58pm PT). A register update is not
+issues and the research that is published. Research lives in
+`CSL-Laboratories/csl-research`, not in this repository. This amendment's record:
+commit `250fdbbe2964e4889096a487e2dfb6d7794046a6`, path
+`submissions/20261025-recursion-csl494-rp0-amendment-research-01/`. Claim: RP0
+amendment research grounding, F-1…F-15, and the parent-keyed register for CSL-494.
+Limitation: candidate evidence; vault PR
+https://github.com/CSL-Laboratories/csl-research/pull/41 is pending review. Not human
+product acceptance.
+
+**Accepted text in this file changes only by a dated amendment that is accepted.**
+Lucas-authored dated amendments (including this RP0 text) are accepted when Lucas
+accepts. Spec changes authored by Samir or Dan (or their agents, attributed) are
+accepted when a founder other than the author approves the PR; that approval counts
+as acceptance (Lucas 2026-10-24 11:58pm PT). A research-record update is not
 acceptance.
 
 ## Mark 2 capability map â€” research synthesis 2026-09-07

@@ -22,9 +22,13 @@ Nov 11 parents). Rows are Recursion parents [CSL-494](https://linear.app/csl-lab
 ## Update rule
 
 1. **Publishing a csl-research record updates this register** in a **docs-only PR**.
-   Path: `CSL-Laboratories/csl-research` `submissions/<record_id>/` (full 40-hex commit
-   when known). Fill the `csl-research` cell and set status to `findings-published` unless
-   a dated amendment is already `proposed` or `accepted` for that parent.
+   An **exact evidence reference** is required before the `csl-research` cell is filled
+   or the row moves to `findings-published` (`AGENTS.md`): repository
+   `CSL-Laboratories/csl-research`, full 40-hex commit, record path
+   `submissions/<record_id>/`, claim, and limitations. If any of those is missing,
+   leave the cell `none` and keep status `open` or `proposed`. Do not fill a cell
+   from an unpinned path. A dated amendment already `proposed` or `accepted` for
+   that parent is not overwritten by a register update.
 2. **PRODUCT.md accepted text** changes only by a dated spec amendment that is accepted.
    Lucas (2026-10-24 11:58pm PT, his words): "Samir and Dan should be able to change and
    modify the product spec with their agents as recommended and as research is
@@ -48,7 +52,7 @@ Nov 11 parents). Rows are Recursion parents [CSL-494](https://linear.app/csl-lab
    | Status | Meaning |
    |---|---|
    | `open` | Parent is admitted; no published vault record and no dated amendment in flight |
-   | `findings-published` | A csl-research `submissions/<record_id>/` exists; product text not yet proposed |
+   | `findings-published` | Exact evidence reference recorded (repo, 40-hex commit, path, claim, limitations); product text not yet proposed |
    | `proposed` | A dated spec amendment PR is open |
    | `accepted` | Accepted under rule 2. Silence is not acceptance. Self-approval is not acceptance |
 
@@ -57,7 +61,7 @@ Nov 11 parents). Rows are Recursion parents [CSL-494](https://linear.app/csl-lab
    is answered in the 2026-10-24 proposal; it is `proposed` until this Lucas-authored
    amendment is accepted.
 
-**Vault this session:** [CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research) returned GitHub API 404 (2026-10-25). Every `csl-research` cell is `none` until a readable `submissions/<record_id>/` is cited. Do not invent record IDs.
+**Vault this session:** [CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research) returned GitHub API 404 (2026-10-25). Every `csl-research` cell is `none` until an exact evidence reference (repo, 40-hex commit, path, claim, limitations) can be cited. Do not invent record IDs or unpinned paths.
 
 ## Register
 

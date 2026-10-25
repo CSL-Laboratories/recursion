@@ -203,7 +203,7 @@ class CredentialCustodyTests(unittest.TestCase):
                 return InvocationHandle(ref=ref, accepted=True, delivery="runtime-visible-stub")
 
         resolver = RecordingResolver()
-        driver = FakeRouteDriver(resolver=resolver)
+        driver = FakeRouteDriver(owner=SessionOwner(), resolver=resolver)
         operation = driver.start(
             SessionKey("tenant-a", "grok-build", "s1"),
             _ref(),
@@ -217,7 +217,7 @@ class CredentialCustodyTests(unittest.TestCase):
         resolver = LocalCredentialResolver()
         ref = _ref()
         resolver.register(ref, CANARY)
-        driver = FakeRouteDriver(resolver=resolver)
+        driver = FakeRouteDriver(owner=SessionOwner(), resolver=resolver)
         before = dict(os.environ)
         operation = driver.start(
             SessionKey("tenant-a", "grok-build", "s1"),
@@ -277,7 +277,7 @@ class CredentialCustodyTests(unittest.TestCase):
         resolver = LocalCredentialResolver()
         ref = _ref()
         resolver.register(ref, CANARY)
-        driver = FakeRouteDriver(resolver=resolver)
+        driver = FakeRouteDriver(owner=SessionOwner(), resolver=resolver)
         key = SessionKey("tenant-a", "grok-build", "s1")
         with self.assertRaises(CustodyDenied):
             driver.start(key, ref, caller_tenant="tenant-b")
@@ -290,7 +290,7 @@ class FakeDriverTests(unittest.TestCase):
         resolver = LocalCredentialResolver()
         ref = _ref()
         resolver.register(ref, CANARY)
-        driver = FakeRouteDriver(resolver=resolver)
+        driver = FakeRouteDriver(owner=SessionOwner(), resolver=resolver)
         key = SessionKey("tenant-a", "grok-build", "s1")
         operation = driver.start(key, ref, caller_tenant="tenant-a")
         driver.send(operation, "ping")
@@ -309,6 +309,84 @@ class FakeDriverTests(unittest.TestCase):
         again = driver.start(key, ref, caller_tenant="tenant-a")
         self.assertEqual(again.generation, 2)
         self.assertNotIn(CANARY, _blob(driver.snapshot(), driver.observe(again)))
+
+
+MESSAGE_CANARY = "canary-message-AT1-bb91e0"
+
+
+class ReviewFixTests(unittest.TestCase):
+    def test_default_drivers_share_a_process_owner(self) -> None:
+        ref = _ref()
+        resolver = LocalCredentialResolver()
+        resolver.register(ref, CANARY)
+        first = FakeRouteDriver(resolver=resolver)
+        second = FakeRouteDriver(resolver=resolver)
+        key = SessionKey("tenant-a", "grok-build", "process-default")
+        operation = first.start(key, ref, caller_tenant="tenant-a")
+        self.assertIs(first.owner, second.owner)
+        with self.assertRaises(Busy):
+            second.start(key, ref, caller_tenant="tenant-a")
+        self.assertTrue(first.owner.is_busy(key))
+        self.assertTrue(first.cancel(operation))
+        self.assertFalse(first.owner.is_busy(key))
+
+    def test_distinct_owners_do_not_cross_cancel(self) -> None:
+        ref = _ref()
+        left_resolver = LocalCredentialResolver()
+        right_resolver = LocalCredentialResolver()
+        left_resolver.register(ref, CANARY)
+        right_resolver.register(ref, CANARY)
+        left = FakeRouteDriver(owner=SessionOwner(), resolver=left_resolver)
+        right = FakeRouteDriver(owner=SessionOwner(), resolver=right_resolver)
+        key = SessionKey("tenant-a", "grok-build", "split-owners")
+        left_op = left.start(key, ref, caller_tenant="tenant-a")
+        right_op = right.start(key, ref, caller_tenant="tenant-a")
+        self.assertEqual(left_op.op_id, "local-1")
+        self.assertEqual(right_op.op_id, "local-1")
+        self.assertNotEqual(left_op.owner_id, right_op.owner_id)
+        self.assertFalse(right.cancel(left_op))
+        self.assertFalse(left.cancel(right_op))
+        self.assertTrue(left.owner.is_busy(key))
+        self.assertTrue(right.owner.is_busy(key))
+        self.assertEqual(left.observe(right_op), ())
+        self.assertTrue(left.cancel(left_op))
+        self.assertFalse(left.owner.is_busy(key))
+        self.assertTrue(right.owner.is_busy(key))
+
+    def test_session_tenant_must_match_caller_and_ref(self) -> None:
+        class RecordingResolver:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def authorize(self, ref: CredentialRef, *, caller_tenant: str) -> InvocationHandle:
+                self.calls += 1
+                return InvocationHandle(ref=ref, accepted=True, delivery="runtime-visible-stub")
+
+        resolver = RecordingResolver()
+        owner = SessionOwner()
+        driver = FakeRouteDriver(owner=owner, resolver=resolver)
+        ref = _ref()
+        key = SessionKey("tenant-b", "grok-build", "crossed")
+        with self.assertRaises(CustodyDenied) as caught:
+            driver.start(key, ref, caller_tenant="tenant-a")
+        self.assertEqual(caught.exception.code, "tenant-mismatch")
+        self.assertNotIn(CANARY, str(caught.exception))
+        self.assertEqual(resolver.calls, 0)
+        self.assertFalse(owner.is_busy(key))
+        self.assertEqual(owner.generation_of(key), 0)
+
+    def test_message_body_is_absent_from_public_transcript(self) -> None:
+        owner = SessionOwner()
+        operation = owner.begin(SessionKey("tenant-a", "grok-build", "msg"))
+        owner.send(operation, MESSAGE_CANARY)
+        observed = owner.observe(operation)
+        public = _blob(observed, owner.snapshot())
+        self.assertNotIn(MESSAGE_CANARY, public)
+        self.assertEqual([event["kind"] for event in observed], ["started", "sent"])
+        for event in observed:
+            self.assertNotIn("message", event)
+            self.assertIn("op_id", event)
+            self.assertIn("generation", event)
 
 
 class DescriptorTests(unittest.TestCase):

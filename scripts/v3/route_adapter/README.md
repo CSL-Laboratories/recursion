@@ -6,23 +6,29 @@ calls. The frozen M1 `RouteCapabilityDescriptor@1` schema is unchanged.
 
 ## What this slice covers
 
-- **D-RP2-2.** One `SessionOwner` in this process. Independent
-  `(tenant, route, session)` triples run concurrently. The same triple
-  is serialized. The contention policy is `busy-reject`. A second
-  begin while the triple is held raises `Busy`. Generation numbers and
-  `local-N` operation ids are process-local. A stale `complete` is
-  discarded and does not release a newer owner. `cancel` reaches the
-  active owner directly. `DISTRIBUTED_FENCING` is false. Enqueue is not
-  implemented; it is not the AT1 default.
+- **D-RP2-2.** One `SessionOwner` in this process. Default
+  `FakeRouteDriver()` instances share `process_session_owner()`.
+  Independent `(tenant, route, session)` triples run concurrently. The
+  same triple is serialized. The contention policy is `busy-reject`. A
+  second begin while the triple is held raises `Busy`. Generation
+  numbers and `local-N` operation ids are process-local, and each
+  operation carries the issuing owner's id so a colliding `local-N`
+  from another owner cannot cancel or observe that hold. A stale
+  `complete` is discarded and does not release a newer owner. `cancel`
+  reaches the active owner directly. `DISTRIBUTED_FENCING` is false.
+  Enqueue is not implemented; it is not the AT1 default.
 - **D-RP2-3.** Public `CredentialRef` (tenant, provider, name).
   `LocalCredentialResolver.authorize` returns an `InvocationHandle`
   and does not return the secret. The stub is replaceable: `FakeRouteDriver`
   takes any resolver with `authorize`. Custody checks refuse another
   tenant. The stub does not read or write process-global environment
   variables. Adapter snapshots and errors carry the public reference
-  only. Delivery is `runtime-visible-stub` (material stays inside the
-  resolver object). Broker-owned egress is a later implementation of
-  the same `authorize` shape.
+  only. `start` rejects, before authorize or acquire, when the session
+  tenant, the caller tenant, and `CredentialRef.tenant_id` are not the
+  same. `send` accepts a message and does not write that body into the
+  public transcript or snapshot. Delivery is `runtime-visible-stub`
+  (material stays inside the resolver object). Broker-owned egress is a
+  later implementation of the same `authorize` shape.
 - **D-RP2-4.** `grok_rows()` is three rows: `grok-build`, `grok-bot`,
   `grok-api`. Bot inbound session control is `unsupported`.
   Control-MCP Bot-to-Recursion caller-only is **not** admitted

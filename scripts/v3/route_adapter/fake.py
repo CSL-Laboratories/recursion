@@ -12,7 +12,12 @@ from scripts.v3.route_adapter.credentials import (
     LocalCredentialResolver,
 )
 from scripts.v3.route_adapter.errors import CustodyDenied
-from scripts.v3.route_adapter.session import Operation, SessionKey, SessionOwner
+from scripts.v3.route_adapter.session import (
+    Operation,
+    SessionKey,
+    SessionOwner,
+    process_session_owner,
+)
 
 
 class FakeRouteDriver:
@@ -23,7 +28,7 @@ class FakeRouteDriver:
         owner: SessionOwner | None = None,
         resolver: CredentialResolver | None = None,
     ) -> None:
-        self.owner = owner or SessionOwner()
+        self.owner = process_session_owner() if owner is None else owner
         self.resolver = resolver or LocalCredentialResolver()
 
     def start(
@@ -33,6 +38,8 @@ class FakeRouteDriver:
         *,
         caller_tenant: str,
     ) -> Operation:
+        if key.tenant != caller_tenant or ref.tenant_id != caller_tenant:
+            raise CustodyDenied("tenant-mismatch")
         handle = self.resolver.authorize(ref, caller_tenant=caller_tenant)
         if not handle.accepted:
             raise CustodyDenied("not-accepted")

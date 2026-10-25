@@ -19,15 +19,31 @@ CONTENTION = "busy-reject"
 DISTRIBUTED_FENCING = False
 
 _PUBLIC_CREDENTIAL_FIELDS = ("tenant_id", "provider", "name")
+_OWNER_IDS = 0
+_OWNER_ID_GUARD = threading.Lock()
+_PROCESS_OWNER: SessionOwner | None = None
+_PROCESS_GUARD = threading.Lock()
+
+
+def _next_owner_id() -> str:
+    global _OWNER_IDS
+    with _OWNER_ID_GUARD:
+        _OWNER_IDS += 1
+        return f"owner-{_OWNER_IDS}"
 
 
 @dataclass(frozen=True)
 class Operation:
-    """A locally issued operation. ``generation`` is not a cluster fence."""
+    """A locally issued operation. ``generation`` is not a cluster fence.
+
+    ``owner_id`` binds the token to the ``SessionOwner`` that issued it.
+    A colliding ``local-N`` from another owner does not match.
+    """
 
     key: SessionKey
     generation: int
     op_id: str
+    owner_id: str
 
 
 @dataclass
@@ -49,6 +65,7 @@ class SessionOwner:
     """
 
     def __init__(self) -> None:
+        self._id = _next_owner_id()
         self._lock = threading.Lock()
         self._active: dict[SessionKey, _Hold] = {}
         self._generation: dict[SessionKey, int] = {}
@@ -73,6 +90,7 @@ class SessionOwner:
                 key=key,
                 generation=generation,
                 op_id=f"local-{self._op_seq}",
+                owner_id=self._id,
             )
             hold = _Hold(operation=operation, events=[])
             self._active[key] = hold
@@ -88,6 +106,8 @@ class SessionOwner:
             return operation
 
     def send(self, operation: Operation, message: str) -> None:
+        """Record a send. The message body is not stored or returned."""
+
         if not isinstance(message, str):
             raise RouteAdapterTypeError()
         with self._lock:
@@ -98,12 +118,13 @@ class SessionOwner:
                     "kind": "sent",
                     "op_id": operation.op_id,
                     "generation": operation.generation,
-                    "message": message,
                 },
             )
 
     def observe(self, operation: Operation) -> tuple[dict[str, object], ...]:
         with self._lock:
+            if operation.owner_id != self._id:
+                return ()
             events = [
                 _copy_event(event)
                 for event in self._transcript.get(operation.key, ())
@@ -206,6 +227,20 @@ class SessionOwner:
         hold.events.append(event)
         transcript = self._transcript.setdefault(hold.operation.key, [])
         transcript.append(dict(event))
+
+
+def process_session_owner() -> SessionOwner:
+    """The default owner for this process.
+
+    Drivers that do not inject an owner share this object, so a second
+    begin of the same triple is Busy. It is not a distributed fence.
+    """
+
+    global _PROCESS_OWNER
+    with _PROCESS_GUARD:
+        if _PROCESS_OWNER is None:
+            _PROCESS_OWNER = SessionOwner()
+        return _PROCESS_OWNER
 
 
 def _copy_event(event: dict[str, object]) -> dict[str, object]:

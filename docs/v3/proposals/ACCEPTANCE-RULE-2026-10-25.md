@@ -31,7 +31,7 @@ acceptance follow-up, matching CSL-523. Separate from recursion#295.
 | Approver | must be a founder **and** must not be the PR author |
 | Author | GitHub `user.login` of the PR; if an agent posted through a founder account, the attributed `Agent (…, for <developer>)` principal |
 | Head | full 40-hex SHA that is the PR head at the moment of acceptance |
-| Files | SHA-256 of each accepted path, recorded in the approving review or a receipt the review names |
+| Files | SHA-256 of each accepted path, named in the approving review body (inline, or a single digest-map receipt the review names for that same head SHA). A review that omits the map, names a map for a different SHA, or mismatches the files is not acceptance |
 | Lucas-authored spec PRs | Lucas's existing path stays valid (his own unprefixed Linear or GitHub statement on the exact candidate) |
 | Not a receipt | merge, labels, status, reactions, silence, agent comments, tests, CI, implementer's PASS, non-founder review, author self-approval, stale-head approval, digest mismatch |
 
@@ -107,10 +107,11 @@ when an agent authored through a founder account). The author's own approval
 does not count.
 
 The accepting GitHub review is `APPROVED` on the exact head SHA (40-hex) that
-is the PR head at the moment of acceptance, and it names a SHA-256 digest map
-of every accepted path. A review on a stale SHA, a digest mismatch, a
-non-founder review, merge, labels, CI, an implementer's PASS, silence, a
-reaction, or an agent comment is not acceptance.
+is the PR head at the moment of acceptance. The review body names a SHA-256
+digest map of every accepted path (inline, or a single receipt the review
+names for that same SHA). A review on a stale SHA, a digest mismatch, a
+missing map, a non-founder review, merge, labels, CI, an implementer's PASS,
+silence, a reaction, or an agent comment is not acceptance.
 
 Lucas-authored spec PRs keep Lucas's existing acceptance path (his own
 unprefixed Linear or GitHub statement on the exact candidate). Another
@@ -293,6 +294,7 @@ python -X utf8 -B tools/check_public_scope.py
 
 ## After Lucas posts the authoring sentence
 
-Apply the insertions above on this branch or a successor, re-hash the
+Apply the insertions above on this branch; for a successor branch, first
+obtain a matching authoring-session approval naming that branch. Re-hash the
 accepted paths, request `samir-shah-ahmed` and `CDanTheMan`, and wait for
 Devin then required CI. Do not merge.

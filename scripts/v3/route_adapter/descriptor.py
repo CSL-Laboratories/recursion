@@ -15,12 +15,12 @@ CODEX_APP_SERVER_PROOF = {
     "status": "skipped",
     "live_calls": False,
     "reason": (
-        "D-RP2-1: start, send, observe, and cancel are not proven here. "
-        "A live Codex App Server run waits on Lucas confirming existing "
-        "authorized access. This package does not buy entitlements, borrow "
-        "tokens, or place that call. If that proof is unavailable, the next "
-        "live driver to design is API-keyed Claude, using mocks or "
-        "owner-authorized API fixtures only. Grok Build is third."
+        "D-RP2-1: AT1 closes on the fake driver. Codex App Server "
+        "start, send, observe, and cancel are a separate follow-up cell, "
+        "gated on Lucas confirming existing authorized access with no new "
+        "spend and no borrowed tokens. This package places no live calls. "
+        "There is no API-keyed Claude path in AT1. Grok Build remains a "
+        "later ranking, not AT1 scope."
     ),
 }
 

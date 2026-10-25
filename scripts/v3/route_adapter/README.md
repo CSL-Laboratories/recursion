@@ -40,15 +40,14 @@ calls. The frozen M1 `RouteCapabilityDescriptor@1` schema is unchanged.
 
 ## Deferred
 
-- **D-RP2-1.** Codex App Server `start → send → observe → cancel` is
-  **skipped**. `CODEX_APP_SERVER_PROOF["status"]` is `skipped` and
-  `live_calls` is false. The proof is gated on Lucas confirming
-  existing authorized access. This package does not buy entitlements,
-  borrow tokens, or place that call. If the proof is unavailable, the
-  next live driver to design is API-keyed Claude (mocks or
-  owner-authorized API fixtures only). Grok Build is third. The fake
-  driver's start/send/observe/cancel sequence is fixture coverage, not
-  live-driver acceptance.
+- **D-RP2-1.** AT1 closes on the fake driver. Codex App Server
+  `start → send → observe → cancel` is a separate follow-up cell, not
+  this slice. `CODEX_APP_SERVER_PROOF["status"]` is `skipped` and
+  `live_calls` is false. That cell is gated on Lucas confirming
+  existing authorized access (no new spend, no borrowed tokens). There
+  is no API-keyed Claude path in AT1. Grok Build remains later ranking,
+  not AT1 scope. The fake driver's start/send/observe/cancel
+  sequence is fixture coverage, not live-driver acceptance.
 - **D-RP2-6 / F-5.** The counsel gate stays **closed**
   (`F5_COUNSEL_GATE`). Subscription-token collection and unattended
   subscription fan-out are out of AT1 (`SUBSCRIPTION_FANOUT_IN_AT1` is
@@ -56,5 +55,5 @@ calls. The frozen M1 `RouteCapabilityDescriptor@1` schema is unchanged.
   or prohibition.
 
 Also deferred: distributed fencing, broker-owned egress, Vault,
-service-account versus BYOK policy, production driver ranking, and any
-live Claude or Grok call.
+service-account versus BYOK policy, and production driver ranking.
+No live provider call is in AT1.

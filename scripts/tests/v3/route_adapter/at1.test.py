@@ -433,13 +433,20 @@ class DescriptorTests(unittest.TestCase):
         self.assertFalse(admitted.vendor_experimental_api)
 
     def test_codex_proof_is_skipped_and_f5_stays_closed(self) -> None:
+        reason = str(CODEX_APP_SERVER_PROOF["reason"])
         self.assertEqual(CODEX_APP_SERVER_PROOF["status"], "skipped")
         self.assertIs(CODEX_APP_SERVER_PROOF["live_calls"], False)
-        self.assertIn("Lucas", str(CODEX_APP_SERVER_PROOF["reason"]))
-        self.assertIn("D-RP2-1", str(CODEX_APP_SERVER_PROOF["reason"]))
+        self.assertIn("Lucas", reason)
+        self.assertIn("D-RP2-1", reason)
+        self.assertIn("AT1 closes on the fake driver", reason)
+        self.assertIn("no API-keyed Claude path in AT1", reason)
+        self.assertNotIn("next live driver to design is API-keyed Claude", reason)
         self.assertEqual(F5_COUNSEL_GATE, "closed")
         self.assertIs(SUBSCRIPTION_FANOUT_IN_AT1, False)
         text = README.read_text(encoding="utf-8")
+        self.assertIn("no API-keyed Claude path in AT1", text)
+        self.assertIn("later ranking", text)
+        self.assertNotIn("next live driver to design is API-keyed Claude", text)
         for phrase in (
             "D-RP2-1",
             "skipped",

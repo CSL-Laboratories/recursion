@@ -1,7 +1,8 @@
 ---
 title: Recursion v3 provider-route capability matrix
-status: reconstructed-current-observation
-last-updated: 2026-09-07
+status: amendment proposed (2026-10-24); acceptance is a human decision by Lucas
+last-updated: 2026-10-25
+prior-status: reconstructed-current-observation
 ---
 
 # Recursion v3 provider-route capability matrix
@@ -112,6 +113,19 @@ conformance and tested-build fields remain unproven/null; no live provider trial
 | Antigravity | Local Python SDK/harness versus managed API sandbox have different authentication, billing, host and lifecycle |
 | Codex | Current stdio App Server integration is distinct from experimental WebSocket/methods; exact build, sandbox-sensitive commands and helper accounting require probes |
 | OpenCode | Server/SDK/ACP with questions, fork/abort/summarize; pending question map is in memory, prompt_async is not proven active steering |
+
+Amendment proposed 2026-10-24 (acceptance is a human decision by Lucas). The 13-entry matrix
+above is **not rewritten**. These overlay rows are proposed additions; they do not certify
+live eligibility. Full text: [AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md).
+
+| Requested entry | Proposed 2026-10-24 overlay |
+|---|---|
+| BYOK (overlay) | Keys in the **OS keyring** by ID, never in repos, preference bundles or agent context. First providers: **OpenRouter, OpenCode Go, OpenCode Zen** (Lucas N-3). Native loop over OpenAI-/Anthropic-/Responses-compatible endpoints remains to be built. |
+| OpenCode Go / OpenCode Zen | Subscription/provider keys the user owns; connect as BYOK-first, not Recursion-custodied OAuth. |
+| Grok Bot | Separate identity from Grok Build (already required). No public inbound driver API found (unverified, F-7). Interim: Grok Bot is a **caller** of Recursion's Control MCP (P8). |
+| Devin | User-owned API key held by OS-keyring reference (F-6 vs D-021). Devin API v3 is a structured-tier adapter candidate. |
+| Claude Bard | Lucas's operator name; **unverified** as a public product title. Not a route row until identified. |
+| Codex Dots | Lucas's operator name. Public OpenAI **Dots** can create/continue Codex tasks; keep Lucas's name. Operator of Recursion via Control MCP, not a substitute for the Codex App Server row. |
 
 MKR-001 through MKR-007 and MKR-023/MKR-024 are registered research conclusions.
 The [source register](SOURCE-REGISTER.md) and [evidence records](foundation-research/mark2-research/evidence.json)

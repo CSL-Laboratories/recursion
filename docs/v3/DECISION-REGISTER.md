@@ -1,7 +1,8 @@
 ---
 title: Recursion v3 decision register and owner queue
-status: evidence-reconciled-draft
-last-updated: 2026-09-07
+status: amendment proposed (2026-10-24); acceptance is a human decision by Lucas
+last-updated: 2026-10-25
+prior-status: evidence-reconciled-draft
 source: archive/session-transcript-2026-09-02.md plus owner direction 2026-09-03
 ---
 
@@ -87,6 +88,15 @@ These are accepted product requirements; they do not enact runtime or constituti
 | OR-023 | All ten CLI controls are required; maximize useful feature coverage through shared runtime, adapters, supported upstream extensions, native loop and combinations. Configuration/plugins are foundational, including approachable presets, detailed provenance/composition/lifecycle and native/upstream implementations. | Supersedes treating a basic wrapper or command-only bridge as the release capability ceiling. Exact composition schema, compatibility tests and support window need evidence. |
 | OR-024 | Default ranking is responsiveness, subscription efficiency, then task completion, subject to correctness, authorization, resource limits and recoverability. Measure the complete workflow and expose meaningful tradeoffs. | Refines OR-017's equal-standing default and older time-secondary prose. Preserve privacy/quality floors, full-vector reporting, unavailable denominators and no hidden scalar weights. |
 | OR-025 | Windows/Linux remote control, compatible placement, distributed workflow stages and recorded-work recovery are first-release requirements; task identity, permissions, interactions, accounting, artifacts and verification stay coherent. | macOS is a test opportunity. GPU/approved-cloud resources need capability profiles; distributed inference, enterprise HA/tenancy and a dedicated GUI have separate later milestones. Does not authorize node access or runtime deployment. |
+
+Amendment proposed 2026-10-24 (acceptance is a human decision by Lucas). The OR-021 and
+OR-025 **rows above are not rewritten.** Proposed supersession of GUI *timing* only:
+OR-021's "terminal first, dedicated GUI later" and OR-025's "a dedicated GUI have separate
+later milestones" are proposed replaced by a first-release GUI client over the same daemon
+as the CLI (Lucas R-Q4 / F-2). Enterprise HA/tenancy remains research (F-4). Product
+language remains unselected (OR-017, F-3). See
+[AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md). `state/DECISIONS.md` is not edited;
+D-038 remains the last accepted GUI/mobile decision until Lucas accepts this amendment.
 
 The historical foundation decision JSON remains the September 5 snapshot. Resolved portions
 are superseded by these rulings; model/broker proof scope, exact engine certification,

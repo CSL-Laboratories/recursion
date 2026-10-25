@@ -1,7 +1,8 @@
 ---
 title: Recursion v3 interaction surfaces and collaborative ARM topology
-status: accepted-direction-with-open-research
-last-updated: 2026-09-07
+status: amendment proposed (2026-10-24); acceptance is a human decision by Lucas
+last-updated: 2026-10-25
+prior-status: accepted-direction-with-open-research
 ---
 
 # Recursion v3 interaction surfaces and collaborative ARM topology
@@ -118,6 +119,14 @@ are:
   surface, including detachable multi-window views;
 - Telegram as an optional interactive transport for conversation, commands and monitoring;
 - the versioned Observer Interface for read-only automation and future UIs.
+
+Amendment proposed 2026-10-24 (acceptance is a human decision by Lucas; F-2 answered by
+R-Q4): the sentence "requires no web, desktop or mobile graphical client" is **proposed
+superseded**. Owner-facing surfaces add a daemon-served web GUI in a thin Tauri shell
+(Linux, Windows, macOS), a standalone app, and phone/web remote clients on the same
+authenticated Control API as the CLI/TUI and Observer Interface. CLI-only use remains
+valid. Default remote relay is research question F-9. See
+[AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md).
 
 Telegram and CLI state are projections over the same actor/event model. Chat history, topic
 identity and provider sessions are never canonical task state.

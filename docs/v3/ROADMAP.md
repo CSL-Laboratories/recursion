@@ -1,7 +1,8 @@
 ---
 title: Recursion v3 research and construction roadmap
-status: evidence-reconciled-roadmap-proposal
-last-updated: 2026-10-02
+status: amendment proposed (2026-10-24); acceptance is a human decision by Lucas
+last-updated: 2026-10-25
+prior-status: evidence-reconciled-roadmap-proposal
 ---
 
 # Recursion v3 research and construction roadmap hypothesis
@@ -200,7 +201,12 @@ then compare JSONL/CAS and SQLite-WAL/CAS before canonical-state construction. F
 CLI capability extensions, native/upstream engine boundaries, setup and update support are
 compatible proposals. Compaction/cache/fleet/resource benefits require later experiments.
 Hosted tenancy, commercial tiers and graphical/media expansion remain deferred. OR-015 and
-constitutional activation are not unblocked. The [GRILLME queue](foundation-research/grillme.md)
+constitutional activation are not unblocked.
+
+Amendment proposed 2026-10-24 (acceptance is a human decision by Lucas): "graphical/media
+expansion remain deferred" is **proposed superseded for the GUI**. The GUI is a
+first-release client (P6). Hosted tenancy remains research (F-4); commercial tiers stay
+deferred. See [AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md). The [GRILLME queue](foundation-research/grillme.md)
 contains pending choices without changing accepted priorities.
 
 ## Delivery model
@@ -365,6 +371,10 @@ Gate: a fresh owner can configure the first deployment and run a bounded synthet
 agent-assisted config editing or a model-powered setup call; terminal close/reopen, daemon
 restart, process-tree termination, high-output rendering and simultaneous clients pass the
 fault/resource/accessibility suite.
+
+Amendment proposed 2026-10-24: M6 still delivers the operator CLI/TUI. The same daemon also
+serves the first-release GUI (thin Tauri shell) and agent-operable Control MCP. Agent-assisted
+setup is an additional path (bar 5), not a replacement of zero-model bootstrap.
 
 ## Milestone 7 — authenticated node fabric
 

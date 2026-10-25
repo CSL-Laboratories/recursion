@@ -35,11 +35,18 @@ combined workflows, persistent assistants, configurable communication and delega
 terminal controls, plugins, context/compaction, and Windows/Linux operation and recovery.
 The dedicated graphical application follows the initial terminal platform.
 
+Amendment proposed 2026-10-24 (acceptance is a human decision by Lucas): GUI timing in the
+sentence above is **proposed superseded**. Recursion ships a first-release GUI client over
+the same daemon as the CLI/TUI (thin Tauri shell). See
+[AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md) and [PRODUCT.md](PRODUCT.md). Historical
+research-lane snapshots that still say "GUI later" are not rewritten.
+
 Read only the specification slices needed for the assigned task:
 
 | Question | Authoritative product record |
 |---|---|
 | Product and first usable release | [PRODUCT](PRODUCT.md) |
+| 2026-10-24 proposed amendment (unaccepted) | [AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md) |
 | Accepted direction and resolved Owner questions | [DECISION-REGISTER](DECISION-REGISTER.md), especially OR-021 through OR-039 |
 | Kernel, Head, ARMs and recovery | [ARCHITECTURE](ARCHITECTURE.md), [STATE](STATE.md) |
 | Task planning, amendments and delegation | [AUTONOMOUS-PLANNING](AUTONOMOUS-PLANNING.md), [EXECUTIVES](EXECUTIVES.md) |

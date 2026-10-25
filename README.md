@@ -17,8 +17,11 @@ Start here:
 - [ANCHOR.md](ANCHOR.md) — why the work exists; [CONTROL_PLANE.md](CONTROL_PLANE.md) — who decides
 
 > Governance note: `CONTROL_PLANE.md` and `ANCHOR.md` are the operative authority and scope
-> records. They still describe the pre-v3 control plane and will be rewritten in an
-> Owner-authoring session, not edited as part of a cleanup.
+> records. They already describe Recursion v3 (D-017, 2026-09-28); the older claim that they
+> "still describe the pre-v3 control plane" was stale. `CONTROL_PLANE.md` is not edited in the
+> 2026-10-24 spec amendment. `ANCHOR.md` receives only a dated GUI-timing addition where it
+> contradicted Lucas's 2026-10-24 direction. Status: amendment proposed (2026-10-24);
+> acceptance is a human decision by Lucas. See `docs/v3/AMENDMENT-2026-10-24.md`.
 
 ## Layout
 

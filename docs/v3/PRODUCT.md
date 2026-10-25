@@ -1,7 +1,8 @@
 ---
 title: Recursion v3 product specification direction
-status: accepted-direction-with-open-research
-last-updated: 2026-09-07
+status: amendment proposed (2026-10-24); acceptance is a human decision by Lucas
+last-updated: 2026-10-25
+prior-status: accepted-direction-with-open-research
 ---
 
 # Recursion v3 product hypothesis
@@ -27,6 +28,87 @@ OR-039 makes configuration, compatibility and whole-system optimization central.
 cognitive/coordination burden, intent continuity, clarity, Owner control, quality and specialized
 assistance alongside OR-024's existing ranking and floors. Additional consumption can be a
 chosen tradeoff; no universal feature-cost or plugin-efficiency claim follows.
+
+## Amendment proposed 2026-10-24 — frontier-defining harness
+
+**Status: amendment proposed (2026-10-24); acceptance is a human decision by Lucas.**
+
+This section **adds** Lucas's 2026-10-24 direction. It does not rewrite the OR-038 paragraph
+above. Full pillar designs, competitor citations and the file-by-file inventory live in
+[AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md). Publishing this text does not admit
+implementation work, clear a hold, select a language, or authorize spend.
+
+### North star
+
+Recursion is **the frontier-defining harness** — "the goat": a first-class native harness
+and a first-class unifying wrapper meant to beat any harness in the way, including Octopus
+(which Octopus is research question F-1), the DeepSeek harness (`deepseek-ai/deepseek-harness`),
+Hermes Agent, T3 Code, OpenCode, Claude Code, Codex, and more.
+
+The accepted public thesis remains **"the harness that scales with your workflow"** (D-034).
+This amendment states the competitive bar that thesis must now earn. Nov 11, 2026 is
+everything that can fit, with no shrinking of ambition. A public demo is required. A private
+held-out eval is allowed. No SWE-bench chasing. Linux-first sprint for sandboxes and nodes;
+product surfaces target Linux, Windows and macOS.
+
+### Seven-point bar
+
+Every parent and demo is scored against Lucas's seven-point bar (frontier map, 2026-10-25).
+A plan that defers the GUI fails bar 4.
+
+1. Researched and developed, with evidence (unknown ≠ pass).
+2. Practical for enterprise and developers (no credential custody, truthful Stop, audit receipts).
+3. Hyper-optimized (OR-024 visible; GUI attach launches zero inference).
+4. A real graphical interface users interact with (same daemon as the CLI; window-close ≠ kill).
+5. Directed and installed by agents (Control MCP / control API).
+6. Config syncs with providers and preferences already in use (never copy tokens).
+7. Loved features done correctly (plan, diffs, worktrees, Stop, fork, approvals, PR-as-publish,
+   honest usage — generated ≠ accepted, unknown ≠ 0, MCP ≠ grant).
+
+### Pillars
+
+Core: calling and piloting other subscriptions (Claude Max, Codex, Cursor, Devin, Grok Bot,
+OpenCode Go/Zen); cross-chat; remote control; enterprise capabilities; node orchestration
+across machines. Also: verification, quota/cost ledger, memory and learning, plugin
+portability, automation, sandboxing, observability, research mode, evaluation.
+
+Method: **design as you research, develop only once grounded, then test** — three phases with
+gates. Live Codex and Claude Code runs go on **subscriptions**, with **no dollar spend limit**,
+usage tracked against quotas. **No pay-per-token for CSL.**
+
+BYOK keys go in the **OS keyring**. First providers: **OpenRouter, OpenCode Go, OpenCode Zen**.
+
+### Surfaces (resolves the no-GUI contradiction)
+
+One headless daemon. Clients: a daemon-served web GUI in a thin **Tauri** shell for Linux,
+Windows and macOS; a standalone app; a CLI/TUI; plus phone/web remote. The GUI is a
+**first-release client** and the most polished visual surface. Tauri is the GUI-shell
+direction (Lucas R-Q4); it is not a product-language selection (OR-017 / D-039). Requiring
+the GUI, to the exclusion of CLI-only use, remains a non-goal.
+
+This proposed supersession covers older "terminal first, GUI later" / "no graphical frontend
+in the initial release" wording in INTERFACE-STRATEGY, CLI, INTERACTION-SURFACES,
+TERMINAL-RUNTIME, START-HERE, DECISION-REGISTER OR-021/OR-025, ROADMAP, ANCHOR and related
+orientation notes. The original sentences are kept; see each file's dated pointer.
+
+### Agent operators
+
+Recursion must be operable by agent software via **MCP or a control API**, explicitly:
+
+- **Grok Bot** (xAI; inbound driver API unverified — interim: Grok Bot calls Recursion).
+- **Claude Bard** — Lucas's name; **unverified** as a public product title this session
+  (closest public surfaces are Claude Duet / Dispatch / Cowork; those names are not adopted).
+- **Codex Dots** — Lucas's name. Public OpenAI product is **Dots**, always-on ChatGPT agents
+  that can create or continue Codex tasks
+  (https://learn.chatgpt.com/docs/dots, retrieved 2026-10-25). The compound title
+  "Codex Dots" was not found; keep Lucas's name.
+
+### Research questions, not decisions
+
+F-1 which Octopus; F-3 product language; F-4 what enterprise means by Nov 11; F-9 default
+remote relay; F-10 durable execution vs the replay kernel (PR #292); and F-5, F-6, F-7, F-8,
+F-11, F-12, F-13, F-14 as listed in [AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md).
+F-2 (GUI contradiction) is answered by the Surfaces paragraph above.
 
 ## Mark 2 capability map â€” research synthesis 2026-09-07
 
@@ -147,6 +229,12 @@ The first user is Lucas. The first deployment is a lightweight coordinator on th
 
 Public usability remains an explicit design requirement. Users should be able to install a useful minimal edition, bring their own official subscriptions or API credentials, select more capable bundles, and retain complete access to human-readable configuration.
 
+Amendment proposed 2026-10-24 (acceptance is a human decision by Lucas; see
+[AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md)): the CLI remains a complete operator
+surface, so an agent is still never *required* to edit settings, and Recursion is also
+**agent-operable** via MCP or a control API (Grok Bot, Claude Bard, Codex Dots). The GUI
+is a first-release client over the same daemon, not opt-in-later packaging.
+
 ## Product promises
 
 1. **Owner sovereignty.** Local operation, self-hosting, provider choice, portable configuration,
@@ -215,6 +303,10 @@ are in [PERFORMANCE-PLAN.md](PERFORMANCE-PLAN.md#canonical-optimization-decision
   grant may include supported high-impact capabilities only after constitutional reconciliation.
 - Running every worker on the coordinator VPS.
 - Exporting private prompts, source, telemetry, or project evidence by default.
+
+Amendment proposed 2026-10-24: "Requiring use of the opt-in GUI or mobile clients" still
+means CLI-only use remains valid. It does **not** keep the GUI out of the first release.
+The GUI is a first-release client; see the 2026-10-24 section above.
 
 ## Release philosophy
 

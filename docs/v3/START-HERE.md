@@ -47,6 +47,7 @@ Read only the specification slices needed for the assigned task:
 |---|---|
 | Product and first usable release | [PRODUCT](PRODUCT.md) |
 | 2026-10-24 proposed amendment (unaccepted) | [AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md) |
+| Living research / open questions | [RESEARCH-REGISTER.md](RESEARCH-REGISTER.md) |
 | Accepted direction and resolved Owner questions | [DECISION-REGISTER](DECISION-REGISTER.md), especially OR-021 through OR-039 |
 | Kernel, Head, ARMs and recovery | [ARCHITECTURE](ARCHITECTURE.md), [STATE](STATE.md) |
 | Task planning, amendments and delegation | [AUTONOMOUS-PLANNING](AUTONOMOUS-PLANNING.md), [EXECUTIVES](EXECUTIVES.md) |

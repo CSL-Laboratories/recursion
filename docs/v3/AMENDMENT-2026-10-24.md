@@ -206,6 +206,11 @@ acceptance.
 Copied from the attached Page (F-1…F-14). Status `RESEARCH` unless marked answered.
 Lucas can decide any of these at any time; silence is not a decision.
 
+The living parent-keyed index is [RESEARCH-REGISTER.md](RESEARCH-REGISTER.md) (Lucas
+2026-10-24 11:57pm PT: the spec must be dynamic). Publishing a csl-research record
+updates that register in a docs-only PR. PRODUCT.md accepted text changes only by a
+dated amendment Lucas accepts.
+
 | ID | Question | Status |
 |---|---|---|
 | F-1 | Which "Octopus" did Lucas mean? Beat both until named: `archeryue/Octopus` (personal agent platform) and `nyldn/claude-octopus` (12-provider consensus plugin). | RESEARCH |
@@ -234,7 +239,8 @@ contradicts the direction gets a dated pointer and a local addition.
 
 | File | Direct contradiction | Change in this PR |
 |---|---|---|
-| [PRODUCT.md](PRODUCT.md) | Status; initial-user "agent never required to edit settings" as a ceiling; GUI treated as opt-in-later in places | Front-matter + new section; OR-038 paragraph **untouched** |
+| [RESEARCH-REGISTER.md](RESEARCH-REGISTER.md) | Spec treated as static vs Linear parents and published research | **New** living register; docs-only updates; PRODUCT.md accepted text unchanged until Lucas accepts a dated amendment |
+| [PRODUCT.md](PRODUCT.md) | Status; initial-user "agent never required to edit settings" as a ceiling; GUI treated as opt-in-later in places | Front-matter + new section; OR-038 paragraph **untouched**; link to the living register |
 | [INTERFACE-STRATEGY.md](INTERFACE-STRATEGY.md) | Non-goal "No graphical frontend in the initial release" | Add supersession note; keep original line |
 | [ROUTE-CAPABILITIES.md](ROUTE-CAPABILITIES.md) | BYOK "native loop remains to be built"; missing Grok Bot / Devin / OpenCode Go/Zen rows | Add proposed overlay rows |
 | [INTERACTION-SURFACES.md](INTERACTION-SURFACES.md) | "v3 release requires no web, desktop or mobile graphical client" | Add supersession note |

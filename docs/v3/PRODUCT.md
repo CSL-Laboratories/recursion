@@ -108,6 +108,16 @@ OpenAI's own agent/bot products (working labels: Claude Bard, Codex Dots); and F
 F-7, F-8, F-11, F-12, F-13, F-14 as listed in [AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md).
 F-2 (GUI contradiction) is answered by the Surfaces paragraph above.
 
+### Research and open questions (living)
+
+Lucas (2026-10-24 11:57pm PT): the Recursion spec must be dynamic, changing with the
+issues and the research that is published. The living register is
+[RESEARCH-REGISTER.md](RESEARCH-REGISTER.md), keyed to CSL-494…CSL-510 and shared
+CSL-520…CSL-522 (umbrella CSL-493). Publishing a csl-research record
+(`CSL-Laboratories/csl-research` `submissions/<record_id>/`) updates that register in a
+docs-only PR. **Accepted text in this file changes only by a dated amendment Lucas
+accepts.** A register update is not acceptance.
+
 ## Mark 2 capability map â€” research synthesis 2026-09-07
 
 The first usable release includes native, independently useful upstream-only and combined

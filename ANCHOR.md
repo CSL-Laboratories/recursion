@@ -20,12 +20,17 @@ the models and subscriptions they already prefer, including by reducing unnecess
 burn. It does not hold or relay provider credentials it was not explicitly granted; where
 possible it delegates to a user-authenticated tool. The comparison standard is tools like T3
 Code. "First usable release" is defined by the accepted platform release in `docs/v3/PRODUCT.md`
-(see `state/DECISIONS.md` D-018…D-034).
+(existing file; see frozen `state/DECISIONS.md` D-018…D-034). Existing `docs/v3/*` remains
+the specification until CSL-536 migrates it. New specifications and decisions are recorded in
+[CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research) and this
+repository only links.
 
 ## Success criteria (near term)
 
-1. **One trustworthy specification.** `docs/v3/*` is evidence-grounded, internally consistent,
-   and coherent enough that a new contributor can pick up a task and act on it.
+1. **One trustworthy specification.** Existing `docs/v3/*` remains the specification until
+   CSL-536 migrates it. It is evidence-grounded, internally consistent, and coherent enough
+   that a new contributor can pick up a task and act on it. New specifications are recorded
+   in csl-research; this repository only links.
 2. **A proven deterministic core.** The kernel and its contracts (planning, execution,
    integrity) pass their executable gates before live code is written (OR-018).
 3. **A first usable release** a person would choose for at least one real workflow, judged on

@@ -1,5 +1,9 @@
 # Decision log
 
+**Frozen 2026-10-25 (D-044).** Do not add new decision entries here. New decisions are recorded
+in [CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research) through a
+PR there; this repository only links. Existing entries stay until CSL-536 moves them.
+
 Every decision gets a falsifier — the specific thing that, if observed, means this was wrong.
 Without it, review is hindsight.
 
@@ -744,5 +748,50 @@ separately.
 **Falsifier:** a developer-approved comment is treated as a receipt when one of the five
 conditions does not hold, or when it stands in for an accepted contract's receipt or a named
 reviewer's GitHub review; or a developer disputes a comment marked as approved by them.
+
+**Review:** at a founder revisit of this decision, or the next monthly decision-log review.
+
+---
+
+## D-044 - New non-public docs go to csl-research; this log is frozen
+Date: 2026-10-25 - Status: ACCEPTED authoring direction; `CONTROL_PLANE.md` / `ANCHOR.md` /
+this file amendment pending review and merge
+
+**Source record:** Lucas Guerra, as repository owner, directed this protected-path authoring
+in a Cursor Cloud session on 2026-10-25 (run `bc-c4597426-a5df-51c9-95df-a674062db69c`,
+issue [CSL-535](https://linear.app/csl-laboratories/issue/CSL-535)). This entry is an
+agent-authored record of that direction, not a personally typed founder comment. The
+companion AGENTS.md rule is landing in recursion#297; this entry aligns only the three
+protected files that PR left out.
+
+**Authoring-session approval:** the same session authorizes edits only to `CONTROL_PLANE.md`,
+`ANCHOR.md` and this file. Lucas is a founder, and `CONTROL_PLANE.md` lets any founder
+approve a protected-path amendment through this process. Agents do not merge.
+
+**Options considered:** A) leave these three files pointing at in-repo `docs/v3/*`,
+`state/DECISIONS.md` and required `state/INBOX.md` until CSL-536 moves files /
+B) smallest alignment now: existing `docs/v3/*` stays authoritative until CSL-536;
+new specs and decisions go to csl-research and this repository only links; this log
+freezes through D-044; blockers go to a Linear issue comment, with `state/INBOX.md`
+optional.
+
+**Chose:** B.
+
+**Because:** #297 already states the vault rule for agent instructions. Leaving the
+control-plane order and decision log as in-repo sources would keep those files out of
+line with the rule Lucas directed.
+
+**Consequence:** `CONTROL_PLANE.md` precedence ranks existing `docs/v3/*` and this frozen
+log until CSL-536, and ranks new specs and decisions in csl-research at those same
+slots via links. Conflict and blockers are recorded as a Linear issue comment;
+`state/INBOX.md` is optional. `ANCHOR.md` keeps existing `docs/v3/*` as the specification
+until CSL-536 and points new specs and decisions at csl-research. This file takes no
+further entries. Historical decision bytes through D-043 stay unchanged. File moves
+remain CSL-536. Settings, CODEOWNERS, rulesets, access grants and merge-queue
+activation are unchanged and not claimed effective here.
+
+**Falsifier:** a new non-public spec, decision, research report, evidence/receipt, gate
+artifact or non-public runbook is added to this repository after this amendment merges,
+or an existing `docs/v3/*` file is treated as non-authoritative before CSL-536 migrates it.
 
 **Review:** at a founder revisit of this decision, or the next monthly decision-log review.

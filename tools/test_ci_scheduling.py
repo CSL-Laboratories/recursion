@@ -707,21 +707,16 @@ CROSSLANE_SHELL_PUSH = re.compile(
     r"))*(?:\s|\\\n)+push\b"
 )
 # An argv push: the broad `[\[(,]\s*"push"` rule (master). False positives are
-# excluded afterwards: a bare `"push"` passed to print/logging, or a list whose
-# next quoted token is another git subcommand (`["push", "pull"]`).
+# excluded afterwards: a bare `"push"` passed to print/logging, and the one
+# known data literal `["push", "pull"]` (exact match, like KNOWN_WORDS).
 CROSSLANE_ARGV_PUSH = re.compile(r"""[\[(,]\s*\\?["']push\\?["']""")
 CROSSLANE_ARGV_BENIGN_CALL = re.compile(
     r"(?:print|pprint|logging(?:\.\w+)+|logger(?:\.\w+)*|\blog)\s*\(?\s*$",
     re.IGNORECASE,
 )
-CROSSLANE_GIT_SUBCOMMANDS = frozenset({
-    "add", "am", "annotate", "apply", "archive", "bisect", "blame", "branch",
-    "bundle", "checkout", "cherry-pick", "clean", "clone", "commit", "config",
-    "describe", "diff", "fetch", "format-patch", "gc", "grep", "init", "log",
-    "ls-files", "merge", "mv", "notes", "pull", "rebase", "reflog", "remote",
-    "reset", "restore", "revert", "rm", "show", "stash", "status", "submodule",
-    "switch", "tag", "worktree",
-})
+CROSSLANE_PUSH_PULL_LIST = re.compile(
+    r"""\[[ \t]*\\?["']push\\?["'][ \t]*,[ \t]*\\?["']pull\\?["'][ \t]*\]"""
+)
 CROSSLANE_JOB_KEY = re.compile(
     r"""^  (?:"([A-Za-z_][\w-]*)"|'([A-Za-z_][\w-]*)'|([A-Za-z_][\w-]*)):(?:\s+#.*)?$"""
 )
@@ -974,27 +969,19 @@ def _crosslane_argv_fragment(text: str, match: re.Match[str]) -> str:
     return text[slice(*span)] if span else text[slice(*_crosslane_shell_command(text, match.start(), match.end()))]
 
 
+def _crosslane_without_word_lists(text: str) -> str:
+    text = CROSSLANE_WORD_LIST.sub("", text)
+    return CROSSLANE_PUSH_PULL_LIST.sub("", text)
+
+
 def _crosslane_argv_push_is_benign(text: str, match: re.Match[str]) -> bool:
-    # print("push") / logging; or a quoted-only word list of git subcommands such as
-    # ["push", "pull"]. A real git argv (`["git", "push", "branch", "--force", "HEAD"]`)
-    # stays a push even when a remote name matches a subcommand.
-    if CROSSLANE_ARGV_BENIGN_CALL.search(text[max(0, match.start() - 80):match.start()]):
-        return True
-    fragment = _crosslane_argv_fragment(text, match)
-    if re.search(r"""["']git["']|\bgit\s*\(""", fragment):
-        return False
-    if re.search(r"""["']-[^"']*["']""", fragment):
-        return False
-    literals = re.findall(r"""[rbfuRBFU]{0,2}\\?["']([^"']*)\\?["']""", fragment)
-    if len(literals) < 2:
-        return False
-    names = CROSSLANE_GIT_SUBCOMMANDS | {"push"}
-    return all(word.lower() in names for word in literals)
+    return CROSSLANE_ARGV_BENIGN_CALL.search(text[max(0, match.start() - 80):match.start()]) is not None
 
 
 def _crosslane_step_push_search(text: str) -> re.Match[str] | None:
-    # Shell matches always count; argv matches use the broad rule and drop only
-    # the benign print/word-list shapes.
+    # Shell matches always count; argv matches use the broad rule. print("push")
+    # is dropped; the exact `["push", "pull"]` data literal is stripped first.
+    text = _crosslane_without_word_lists(text)
     for match in CROSSLANE_SHELL_PUSH.finditer(text):
         return match
     for match in CROSSLANE_ARGV_PUSH.finditer(text):
@@ -1013,8 +1000,8 @@ CROSSLANE_STEP_PUSH = _CrosslaneStepPush()
 
 def _crosslane_push_commands(text: str) -> list[str]:
     # Each push as a whole command: a shell line plus its continuations, or an argv list from `[`/`(`
-    # to the matching close. Benign print/word-list argv matches are dropped; force flags stay.
-    text = CROSSLANE_WORD_LIST.sub("", text)
+    # to the matching close. print("push") is dropped; the exact `["push", "pull"]` literal is stripped.
+    text = _crosslane_without_word_lists(text)
     commands = [text[slice(*_crosslane_shell_command(text, m.start(), m.end()))] for m in CROSSLANE_SHELL_PUSH.finditer(text)]
     for match in CROSSLANE_ARGV_PUSH.finditer(text):
         if _crosslane_argv_push_is_benign(text, match):
@@ -1222,7 +1209,7 @@ class CrossLaneAdmissionTests(unittest.TestCase):
                 with self.subTest(workflow=name, job=job, check="no push outside the model grant"):
                     # The only push paths are a push model's single granted command and the trusted
                     # publisher embedded byte-for-byte; no other step pushes as a shell command or git argv.
-                    steps = CROSSLANE_WORD_LIST.sub("", _crosslane_without_model_text(block))
+                    steps = _crosslane_without_word_lists(_crosslane_without_model_text(block))
                     if job in publishers:
                         _crosslane_publisher_thin_call(steps)
                     self.assertIsNone(_crosslane_step_push_search(steps))
@@ -1465,6 +1452,11 @@ class CrossLaneMutationTests(unittest.TestCase):
             'GIT(["push", remote])',
             'git_cmd = ["push", "--force"]',
             'subprocess.run(["git", "push", "branch", "--force", "HEAD"])',
+            'run_git(["push", "branch"])',
+            'run_git(["push", "tag"])',
+            'self.git("push", "branch")',
+            'cmd = ["push", "branch"]\n          run(["git", *cmd])',
+            'git("push", remote, "pull")',
         ):
             with self.subTest(command=command):
                 with _mutated_workflow("claude.yml", lambda text, c=command: _append_job_step(text, "mention-prepare", c)):
@@ -1480,6 +1472,11 @@ class CrossLaneMutationTests(unittest.TestCase):
             'GIT(["push", remote])',
             'git_cmd = ["push", "--force"]',
             'subprocess.run(["git", "push", "branch", "--force", "HEAD"])',
+            'run_git(["push", "branch"])',
+            'run_git(["push", "tag"])',
+            'self.git("push", "branch")',
+            'cmd = ["push", "branch"]\nrun(["git", *cmd])',
+            'git("push", remote, "pull")',
         ):
             with self.subTest(push=push):
                 self.assertIsNotNone(_crosslane_step_push_search(push))

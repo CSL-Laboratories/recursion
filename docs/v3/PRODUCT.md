@@ -109,7 +109,7 @@ F-7, F-8, F-11, F-12, F-13, F-14. F-2 (GUI contradiction) is answered by D-038; 
 amendment adds the Surfaces paragraph above. Full questions and sources:
 `CSL-Laboratories/csl-research` commit `250fdbbe2964e4889096a487e2dfb6d7794046a6`,
 path `submissions/20261025-recursion-csl494-rp0-amendment-research-01/` (candidate
-evidence; vault PR pending review).
+evidence; vault PR merged).
 
 ### Research and open questions
 
@@ -120,7 +120,7 @@ commit `250fdbbe2964e4889096a487e2dfb6d7794046a6`, path
 `submissions/20261025-recursion-csl494-rp0-amendment-research-01/`. Claim: RP0
 amendment research grounding, F-1…F-15, and the parent-keyed register for CSL-494.
 Limitation: candidate evidence; vault PR
-https://github.com/CSL-Laboratories/csl-research/pull/41 is pending review. Not human
+https://github.com/CSL-Laboratories/csl-research/pull/41 merged. Not human
 product acceptance.
 
 **Accepted text in this file changes only by a dated amendment that is accepted.**

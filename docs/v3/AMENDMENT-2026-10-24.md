@@ -41,7 +41,7 @@ Research for this amendment lives in `CSL-Laboratories/csl-research`.
 - **Commit:** `250fdbbe2964e4889096a487e2dfb6d7794046a6`
 - **Path:** `submissions/20261025-recursion-csl494-rp0-amendment-research-01/`
 - **Claim:** RP0 amendment research grounding, F-1…F-15, and the parent-keyed register for CSL-494.
-- **Limitation:** candidate evidence; vault PR https://github.com/CSL-Laboratories/csl-research/pull/41 is pending review. Not human product acceptance.
+- **Limitation:** candidate evidence; vault PR https://github.com/CSL-Laboratories/csl-research/pull/41 merged. Not human product acceptance.
 
 Product files only link here. This amendment does **not** assert product names for
 Anthropic's or OpenAI's agent/bot operators (F-15).

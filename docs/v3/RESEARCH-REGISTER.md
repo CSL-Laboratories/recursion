@@ -16,7 +16,7 @@ Lucas accepts**. [AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md) is the curre
 proposal. `CONTROL_PLANE.md` and `state/DECISIONS.md` are not edited from this register.
 
 Umbrella: [CSL-493](https://linear.app/csl-laboratories/issue/CSL-493) (CSL frontier map:
-Nov 11 parents). Rows are Recursion parents [CSL-494](https://linear.app/csl-laboratories/issue/CSL-494)…[CSL-510](https://linear.app/csl-laboratories/issue/CSL-510) plus shared [CSL-520](https://linear.app/csl-laboratories/issue/CSL-520)…[CSL-522](https://linear.app/csl-laboratories/issue/CSL-522). Cockpit parents (CSL-511…) are out of this register.
+Nov 11 parents). Rows are Recursion parents [CSL-494](https://linear.app/csl-laboratories/issue/CSL-494)…[CSL-510](https://linear.app/csl-laboratories/issue/CSL-510) plus shared [CSL-520](https://linear.app/csl-laboratories/issue/CSL-520)…[CSL-522](https://linear.app/csl-laboratories/issue/CSL-522). Parents outside that Recursion set are out of this register.
 
 ## Update rule
 

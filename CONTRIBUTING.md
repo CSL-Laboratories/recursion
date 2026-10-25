@@ -36,7 +36,10 @@ issues and PRs.
   a PR is ready for review.
 - Autonomously file research findings, ideas and bugs to Triage, deduped.
 - Ground every issue and every execution in research before the work; size it to
-  the task. No specific tool is required.
+  the task. No specific tool is required. Research may use any deep-research
+  source the team has, such as Parallel, Exa, Claude Deep Research, Open Deep
+  Research, ChatGPT Deep Research or the web. Each run records its tool, its
+  run id and its cost (or `unknown + reason`) in its csl-research record.
 - All research output (notes, briefs, findings, source tables, competitor or
   frontier writeups, research registers or indexes) goes to
   [CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research)
@@ -54,7 +57,9 @@ issues and PRs.
   its SHA-256, the tool or processor, run id, retrieval time, cost or
   `unknown + reason`, a source-to-claim mapping, and `issue_urls`. A research
   body produced under an admitted issue is published there as part of that
-  issue; no separate admission is needed. This repository takes contracts,
+  issue; no separate admission is needed. A research pass on a Linear issue
+  is complete only when its record is in csl-research `submissions/` and the
+  PR link is on the issue. This repository takes contracts,
   specs, fixtures and runbooks only.
 - On a decision or direction issue, the assignee or claimant must post the
   cited brief (options, tradeoffs, recommendation, target metrics) on the

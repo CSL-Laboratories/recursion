@@ -119,10 +119,13 @@ VERDICT_HEAD_RE = re.compile(
 LINEAR_FIRST = (
     "Linear-first (CSL-88): Work from the CSL Linear issue. Check it and its "
     "PR-sync comment for overlap first. Post status and questions there. File "
-    "new findings to Triage. Use current docs (Context7) and web research "
-    "(Parallel) before implementing. Research output goes to "
+    "new findings to Triage. Research may use any deep-research source the "
+    "team has, such as Parallel, Exa, Claude Deep Research, Open Deep "
+    "Research, ChatGPT Deep Research or the web. Current library docs "
+    "(for example Context7) also count. Research output goes to "
     "CSL-Laboratories/csl-research as a submission record, never to this repo; "
-    "post a digest on the Linear issue."
+    "post a digest on the Linear issue. Each run records its tool, its run id "
+    "and its cost (or unknown + reason) in its csl-research record."
 )
 DEFAULT_LINEAR_REPOS = (
     "CSL-Laboratories/recursion",

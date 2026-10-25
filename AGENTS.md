@@ -36,7 +36,10 @@ issues and PRs.
   a PR is ready for review.
 - Autonomously file research findings, ideas and bugs to Triage, deduped.
 - Ground every issue and every execution in research before the work; size it to
-  the task. No specific tool is required.
+  the task. No specific tool is required. Research may use any deep-research
+  source the team has, such as Parallel, Exa, Claude Deep Research, Open Deep
+  Research, ChatGPT Deep Research or the web. Each run records its tool, its
+  run id and its cost (or `unknown + reason`) in its csl-research record.
 - All research output (notes, briefs, findings, source tables, competitor or
   frontier writeups, research registers or indexes) goes to
   [CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research)
@@ -54,7 +57,9 @@ issues and PRs.
   its SHA-256, the tool or processor, run id, retrieval time, cost or
   `unknown + reason`, a source-to-claim mapping, and `issue_urls`. A research
   body produced under an admitted issue is published there as part of that
-  issue; no separate admission is needed. This repository takes contracts,
+  issue; no separate admission is needed. A research pass on a Linear issue
+  is complete only when its record is in csl-research `submissions/` and the
+  PR link is on the issue. This repository takes contracts,
   specs, fixtures and runbooks only.
 - On a decision or direction issue, the assignee or claimant must post the
   cited brief (options, tradeoffs, recommendation, target metrics) on the
@@ -111,7 +116,9 @@ These records are conventions, not enforced locks. A comment is not an atomic lo
 [CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research)
 is the knowledge vault for ALL CSL research. A research body produced under an
 admitted issue is published there as `submissions/<record_id>/` as part of that
-issue; no separate admission is needed. Follow that repository's README,
+issue; no separate admission is needed. A research pass on a Linear issue is
+complete only when its record is in csl-research `submissions/` and the PR
+link is on the issue. Follow that repository's README,
 AGENTS.md, templates and `tools/check_submission.py`, and open a PR there
 before releasing the issue claim. Product repositories only link to the vault
 record (repo, 40-hex commit, path, claim, limitations). All research output
@@ -285,15 +292,16 @@ weight.
 
 Current tools. Do not add paid services or raise spend limits.
 
-- **Parallel Search MCP** — web search and fetch. Prefer `parallel-search` (`web_search` /
-  `web_fetch`) for web lookups. Declared in `.cursor/mcp.json` and `.mcp.json`
+- **Parallel Search MCP** — web search and fetch. One available source, not the
+  only research route. Prefer `parallel-search` (`web_search` /
+  `web_fetch`) for web lookups when using it. Declared in `.cursor/mcp.json` and `.mcp.json`
   (https://search.parallel.ai/mcp). No API key. Never put secrets, proprietary code,
   private data, or unreleased research details in queries — keep them generic. Anything
   sensitive needs human approval first.
 - **Context7 MCP** — up-to-date library docs (https://mcp.context7.com/mcp). Works without a
   key. Same two config files, alongside Parallel.
 - **Exa MCP** — substantial deep research: multi-source investigations and `agent_run`
-  research tasks. Parallel stays the default for quick lookups and current web facts.
+  research tasks. One available source, not the only research route.
   Declared in `.cursor/mcp.json` and `.mcp.json` (https://mcp.exa.ai/mcp). The key goes in
   the `x-api-key` header from env var `EXA_API_KEY` (Cursor `${env:EXA_API_KEY}`, Claude
   Code `${EXA_API_KEY:-}`; with no key, Exa runs in its free rate-limited mode) and lives
@@ -340,13 +348,15 @@ confirmed. If you stop, release with a release record.
 their coding agent working in the repo), ground every issue and every execution in
 research before the work. This applies to decision issues and implementation alike;
 size the research to the task. No specific tool is required, and there is no
-mandatory research pipeline. Any available source counts: already-paid
-subscriptions (for example ChatGPT Pro Deep Research or Claude Max research),
-Exa, Parallel, current library docs (for example Context7), the web, primary
-sources, and repo evidence. None of these is required. Prefer already-paid
-subscriptions. Metered tools such as Exa and Parallel stay within their existing
-per-person ceilings. No new pay-per-token spend. Scheduled routines never start
-metered or paid research on their own. All research output (notes, briefs,
+mandatory research pipeline. Research may use any deep-research source the
+team has, such as Parallel, Exa, Claude Deep Research, Open Deep Research,
+ChatGPT Deep Research or the web. Current library docs (for example Context7),
+primary sources, and repo evidence also count. None of these is required.
+Prefer already-paid subscriptions. Metered tools such as Exa stay within their
+existing per-person ceilings. No new pay-per-token spend. Scheduled routines
+never start metered or paid research on their own. Each run records its tool,
+its run id and its cost (or `unknown + reason`) in its csl-research record.
+All research output (notes, briefs,
 findings, source tables, competitor or frontier writeups, research registers or
 indexes) goes to [CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research)
 as `submissions/<record_id>/`, through a PR in that repo, with a digest on the
@@ -357,8 +367,10 @@ Linear issue; do not fall back to this repo. Follow that repo's README,
 AGENTS.md, templates and `tools/check_submission.py`, and open the vault PR
 before releasing the issue claim. The record carries the sanitized report, its
 SHA-256, the tool or processor, run id, retrieval time, cost or
-`unknown + reason`, a source-to-claim mapping, and `issue_urls`. A Linear
-comment alone is not the record. When the issue needs a decision or sets direction, the assignee or
+`unknown + reason`, a source-to-claim mapping, and `issue_urls`. A Linear comment
+alone is not the record. A research pass on a Linear issue is complete only
+when its record is in csl-research `submissions/` and the PR link is on the
+issue. When the issue needs a decision or sets direction, the assignee or
 claimant must post the cited brief (options, tradeoffs, recommendation, target
 metrics) on the Linear issue after the research that grounds the work. A Grok
 Bot coordinator acting for its owner may prepare it, attributed exactly as

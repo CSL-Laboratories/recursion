@@ -5,10 +5,6 @@ in scope.
 
 Last reviewed: 2026-10-02 · Next review: 2027-01-02
 
-Amendment proposed 2026-10-24; acceptance is a human decision by Lucas. See
-`docs/v3/AMENDMENT-2026-10-24.md`. This file is a protected path; the only proposed
-change is the GUI-timing sentence in Mission.
-
 ---
 
 ## Mission
@@ -25,13 +21,6 @@ burn. It does not hold or relay provider credentials it was not explicitly grant
 possible it delegates to a user-authenticated tool. The comparison standard is tools like T3
 Code. "First usable release" is defined by the accepted platform release in `docs/v3/PRODUCT.md`
 (see `state/DECISIONS.md` D-018…D-034).
-
-Amendment proposed 2026-10-24 (acceptance is a human decision by Lucas): the parenthetical
-"terminal first, GUI later" is **proposed superseded**. Recursion is the frontier-defining
-harness ("the goat") with a first-release GUI client (daemon-served web UI in a thin Tauri
-shell), standalone app and CLI/TUI, plus agent-operable MCP/control API. The thesis sentence
-and credential non-custody sentence above are **unchanged**. Comparison standard remains
-tools like T3 Code, now as a bar Recursion must beat on user effort.
 
 ## Success criteria (near term)
 

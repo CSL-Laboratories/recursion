@@ -78,18 +78,18 @@ usage tracked against quotas. **No pay-per-token for CSL.**
 
 BYOK keys go in the **OS keyring**. First providers: **OpenRouter, OpenCode Go, OpenCode Zen**.
 
-### Surfaces (resolves the no-GUI contradiction)
+### Surfaces (what this amendment adds beyond D-038)
 
-One headless daemon. Clients: a daemon-served web GUI in a thin **Tauri** shell for Linux,
-Windows and macOS; a standalone app; a CLI/TUI; plus phone/web remote. The GUI is a
-**first-release client** and the most polished visual surface. Tauri is the GUI-shell
-direction (Lucas R-Q4); it is not a product-language selection (OR-017 / D-039). Requiring
-the GUI, to the exclusion of CLI-only use, remains a non-goal.
+D-038 (accepted 2026-10-02) already made GUI and mobile **built but opt-in** in the first
+release; no capability is deferred by the old "GUI later" exclusion wording. This amendment
+does not reopen D-038.
 
-This proposed supersession covers older "terminal first, GUI later" / "no graphical frontend
-in the initial release" wording in INTERFACE-STRATEGY, CLI, INTERACTION-SURFACES,
-TERMINAL-RUNTIME, START-HERE, DECISION-REGISTER OR-021/OR-025, ROADMAP, ANCHOR and related
-orientation notes. The original sentences are kept; see each file's dated pointer.
+**Beyond D-038** it specifies: one headless daemon; a daemon-served web GUI in a thin
+**Tauri** shell for Linux, Windows and macOS; a standalone app; a CLI/TUI; plus phone/web
+remote; and the "goat" bar (seven-point bar). Tauri is the GUI-shell direction (Lucas
+R-Q4); it is not a product-language selection (OR-017 / D-039). Requiring the GUI, to the
+exclusion of CLI-only use, remains a non-goal. Historical "GUI later" sentences are kept;
+dated pointers send readers here. `ANCHOR.md` is not edited.
 
 ### Agent operators
 
@@ -106,7 +106,8 @@ F-1 which Octopus; F-3 product language; F-4 what enterprise means by Nov 11; F-
 remote relay; F-10 durable execution vs the replay kernel (PR #292); F-15 Anthropic's and
 OpenAI's own agent/bot products (working labels: Claude Bard, Codex Dots); and F-5, F-6,
 F-7, F-8, F-11, F-12, F-13, F-14 as listed in [AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md).
-F-2 (GUI contradiction) is answered by the Surfaces paragraph above.
+F-2 (GUI contradiction) is answered by D-038; this amendment adds the Surfaces paragraph
+above.
 
 ### Research and open questions (living)
 
@@ -246,8 +247,9 @@ Amendment proposed 2026-10-24 (acceptance is a human decision by Lucas; see
 surface, so an agent is still never *required* to edit settings, and Recursion is also
 **agent-operable** via MCP or a control API (Grok Bot, and Anthropic's and OpenAI's own
 agent/bot products — Lucas's working labels: Claude Bard, Codex Dots; exact products and
-their control surfaces are F-15). The GUI
-is a first-release client over the same daemon, not opt-in-later packaging.
+their control surfaces are F-15). D-038 already put GUI and mobile in the first release as
+built-but-opt-in clients; this amendment adds the daemon-served Tauri shell, standalone
+app and "goat" bar.
 
 ## Product promises
 
@@ -318,9 +320,9 @@ are in [PERFORMANCE-PLAN.md](PERFORMANCE-PLAN.md#canonical-optimization-decision
 - Running every worker on the coordinator VPS.
 - Exporting private prompts, source, telemetry, or project evidence by default.
 
-Amendment proposed 2026-10-24: "Requiring use of the opt-in GUI or mobile clients" still
-means CLI-only use remains valid. It does **not** keep the GUI out of the first release.
-The GUI is a first-release client; see the 2026-10-24 section above.
+Amendment proposed 2026-10-24: "Requiring use of the opt-in GUI or mobile clients" is
+already the D-038 floor (CLI-only use remains valid). This amendment does not change that.
+See Surfaces above for what it adds beyond D-038.
 
 ## Release philosophy
 

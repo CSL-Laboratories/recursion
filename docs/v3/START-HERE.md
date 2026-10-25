@@ -36,10 +36,11 @@ terminal controls, plugins, context/compaction, and Windows/Linux operation and 
 The dedicated graphical application follows the initial terminal platform.
 
 Amendment proposed 2026-10-24 (acceptance is a human decision by Lucas): GUI timing in the
-sentence above is **proposed superseded**. Recursion ships a first-release GUI client over
-the same daemon as the CLI/TUI (thin Tauri shell). See
-[AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md) and [PRODUCT.md](PRODUCT.md). Historical
-research-lane snapshots that still say "GUI later" are not rewritten.
+sentence above is already superseded by D-038 (built but opt-in; no capability deferred).
+This amendment does not reopen D-038. **Beyond D-038** see
+[AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md) (daemon-served Tauri shell, standalone
+app, "goat" bar) and [PRODUCT.md](PRODUCT.md). Historical research-lane snapshots that
+still say "GUI later" are not rewritten. `ANCHOR.md` is not edited.
 
 Read only the specification slices needed for the assigned task:
 

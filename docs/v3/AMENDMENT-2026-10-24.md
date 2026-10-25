@@ -26,9 +26,11 @@ acceptance).
 
 - **Accepted** text in `docs/v3/*`, OR-021…OR-039, and D-017…D-043 remains in force until
   Lucas accepts this amendment.
-- **Proposed** text below is the 2026-10-24 north star. Where it conflicts with older
-  first-release exclusions (GUI later, CLI-only surfaces, agent-never-edits-settings as a
-  ceiling), this proposal is the intended supersession.
+- **Proposed** text below is the 2026-10-24 north star. D-038 (accepted 2026-10-02) already
+  superseded older "GUI later" first-release exclusions. This proposal does not reopen
+  D-038. It adds the Tauri/daemon-served client, standalone app and "goat" bar. Other
+  older ceilings (agent-never-edits-settings as the only operator path) get dated
+  addenda.
 - **Research questions** (F-1…F-14 and the others named here) are questions, not decisions.
 - Evidence classes stay distinct: source-documented, locally observed, inferred, unmeasured.
 
@@ -134,10 +136,15 @@ One headless daemon. Clients:
 - a **CLI/TUI**;
 - phone/web remote clients (pairing; native vs PWA is F-12).
 
-The GUI is a **first-release client**, not a later milestone. It should be the most
-polished visual surface, refined daily. Requiring the GUI (forbidding CLI-only use) remains
-a non-goal. Extends [INTERFACE-STRATEGY.md](INTERFACE-STRATEGY.md); supersedes the
-"No graphical frontend in the initial release" non-goal (F-2, answered by R-Q4).
+D-038 (accepted 2026-10-02) already made GUI and mobile **built but opt-in** in the first
+release; no capability is deferred by the old "GUI later" exclusion wording. F-2 is
+answered by D-038. This amendment does not reopen that. **Beyond D-038** it adds: a
+daemon-served web GUI in a thin Tauri shell on Linux, Windows and macOS; a standalone
+app; and the "goat" bar (seven-point bar, bar 4). Requiring the GUI (forbidding CLI-only
+use) remains a non-goal. Historical "GUI later" sentences in live spec files are kept;
+dated pointers send readers here. `ANCHOR.md` still contains "terminal first, GUI later"
+and is **not edited** (protected path; no founder authoring session). That parenthetical
+is already superseded by D-038; the additions beyond D-038 live in this file.
 
 ### P7 — BYOK and preference sync
 
@@ -219,7 +226,7 @@ other than the author approves the PR (Lucas 2026-10-24 11:58pm PT).
 | ID | Question | Status |
 |---|---|---|
 | F-1 | Which "Octopus" did Lucas mean? Beat both until named: `archeryue/Octopus` (personal agent platform) and `nyldn/claude-octopus` (12-provider consensus plugin). | RESEARCH |
-| F-2 | Spec GUI contradiction vs D-038 | **ANSWERED** by R-Q4 (this amendment) |
+| F-2 | Spec GUI contradiction vs D-038 | **ANSWERED** by D-038 (2026-10-02). This amendment adds Tauri/daemon/standalone/"goat" beyond D-038; it does not reopen D-038 |
 | F-3 | Product language and runtime (OR-017) | RESEARCH |
 | F-4 | What "enterprise" means by Nov 11 (self-hosted team vs hosted multi-tenant) | RESEARCH |
 | F-5 | Anthropic "ordinary, individual usage" for unattended `claude -p` fan-out (D-027 counsel) | RESEARCH |
@@ -245,23 +252,25 @@ contradicts the direction gets a dated pointer and a local addition.
 | File | Direct contradiction | Change in this PR |
 |---|---|---|
 | [RESEARCH-REGISTER.md](RESEARCH-REGISTER.md) | Spec treated as static vs Linear parents and published research | **New** living register; docs-only updates; PRODUCT.md accepted text follows the register update rule (Lucas-authored vs Samir/Dan other-founder approval) |
-| [PRODUCT.md](PRODUCT.md) | Status; initial-user "agent never required to edit settings" as a ceiling; GUI treated as opt-in-later in places | Front-matter + new section; OR-038 paragraph **untouched**; link to the living register |
-| [INTERFACE-STRATEGY.md](INTERFACE-STRATEGY.md) | Non-goal "No graphical frontend in the initial release" | Add supersession note; keep original line |
-| [ROUTE-CAPABILITIES.md](ROUTE-CAPABILITIES.md) | BYOK "native loop remains to be built"; missing Grok Bot / Devin / OpenCode Go/Zen rows | Add proposed overlay rows |
-| [INTERACTION-SURFACES.md](INTERACTION-SURFACES.md) | "v3 release requires no web, desktop or mobile graphical client" | Add supersession note |
-| [CLI.md](CLI.md) | "No graphical frontend is required for the v3 release" | Add supersession note |
-| [TERMINAL-RUNTIME.md](TERMINAL-RUNTIME.md) | "A later graphical frontend" | Add that GUI is a same-protocol first-release client |
-| [START-HERE.md](START-HERE.md) | "The dedicated graphical application follows the initial terminal platform" | Add pointer; keep historical sentence |
-| [DECISION-REGISTER.md](DECISION-REGISTER.md) | OR-021 "terminal first, dedicated GUI later"; OR-025 "dedicated GUI have separate later milestones" | Add proposed-supersession note; **OR rows not rewritten** |
-| [ROADMAP.md](ROADMAP.md) | "graphical/media expansion remain deferred"; M6 CLI-only | Add pointer |
-| [docs/v3/README.md](README.md) | "The graphical application is later" | Add pointer |
-| [ANCHOR.md](../../ANCHOR.md) | "a client (terminal first, GUI later)" | Add dated amendment; mission paragraph otherwise kept |
-| [README.md](../../README.md) | Governance note claims CONTROL_PLANE/ANCHOR "still describe the pre-v3 control plane" | Correct the stale note |
+| [PRODUCT.md](PRODUCT.md) | Status; initial-user "agent never required to edit settings" as a ceiling | Front-matter + new section; OR-038 paragraph **untouched**; link to the living register. D-038 already in force; this section adds Tauri/daemon/standalone/"goat" |
+| [INTERFACE-STRATEGY.md](INTERFACE-STRATEGY.md) | Historical non-goal "No graphical frontend in the initial release" (already superseded by D-038) | Dated pointer: D-038 in force; this amendment adds Tauri/daemon/standalone/"goat". Original line kept |
+| [ROUTE-CAPABILITIES.md](ROUTE-CAPABILITIES.md) | BYOK "native loop remains to be built"; missing Grok Bot / Devin / OpenCode Go/Zen rows | Add proposed overlay rows. Claude Bard / Codex Dots marked as Lucas's working labels, unverified, F-15 |
+| [INTERACTION-SURFACES.md](INTERACTION-SURFACES.md) | Historical "requires no web, desktop or mobile graphical client" (already superseded by D-038) | Dated pointer; adds Tauri/daemon/standalone beyond D-038 |
+| [CLI.md](CLI.md) | Historical "No graphical frontend is required for the v3 release" (already superseded by D-038) | Dated pointer; adds Tauri/daemon client beyond D-038 |
+| [TERMINAL-RUNTIME.md](TERMINAL-RUNTIME.md) | Historical "A later graphical frontend" (already superseded by D-038) | Dated pointer: D-038 in force; this amendment adds the daemon-served Tauri client on the same protocols |
+| [START-HERE.md](START-HERE.md) | Historical "graphical application follows" (already superseded by D-038) | Dated pointer; keep historical sentence |
+| [DECISION-REGISTER.md](DECISION-REGISTER.md) | OR-021/OR-025 GUI-later wording (already superseded by D-038) | Dated pointer; **OR rows not rewritten** |
+| [ROADMAP.md](ROADMAP.md) | Historical "graphical/media expansion remain deferred" (GUI already in-scope under D-038) | Dated pointer; hosted tenancy stays research (F-4) |
+| [docs/v3/README.md](README.md) | Historical "The graphical application is later" (already superseded by D-038) | Dated pointer |
+| [ANCHOR.md](../../ANCHOR.md) | Historical "a client (terminal first, GUI later)" (already superseded by D-038) | **No edit.** Protected path; no founder authoring session. Supersession carried in this file only |
+| [README.md](../../README.md) | Governance note claims CONTROL_PLANE/ANCHOR "still describe the pre-v3 control plane" | Correct the stale note. Does not edit ANCHOR.md |
 | [CONTROL_PLANE.md](../../CONTROL_PLANE.md) | **No direct contradiction** (already v3-only, post D-017) | **No edit.** Listed so the PR inventory is complete. |
 
-`state/DECISIONS.md` is not edited. D-038 (GUI/mobile built but opt-in) remains the last
-accepted decision; this proposal asks Lucas to raise GUI from opt-in-later packaging to a
-**first-release client** while keeping "must use the GUI" a non-goal.
+`state/DECISIONS.md` is not edited. D-038 (accepted 2026-10-02) already made GUI and mobile
+**built but opt-in** in the first release; no capability is deferred by the old exclusion
+wording. This amendment does not reopen D-038. It adds a daemon-served client in a thin
+Tauri shell on Linux, Windows and macOS, a standalone app, and the "goat" bar. Requiring
+the GUI remains a non-goal.
 
 ## 6. What this does not do
 

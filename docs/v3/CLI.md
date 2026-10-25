@@ -153,10 +153,11 @@ Telegram is an optional interactive transport, not a replacement configuration a
 graphical frontend is required for the v3 release. The same design should remain teachable
 enough for later public users.
 
-Amendment proposed 2026-10-24 (acceptance is a human decision by Lucas): "No graphical
-frontend is required" is **proposed superseded** as a release-exclusion. The CLI remains
-the schema-driven editor and a complete operator surface; a daemon-served GUI in a thin
-Tauri shell is a first-release client of the same command schema. Agent-installable setup
+Amendment proposed 2026-10-24 (acceptance is a human decision by Lucas): D-038 already
+superseded "No graphical frontend is required" as a release-exclusion (built but opt-in;
+no capability deferred). This amendment does not reopen D-038. The CLI remains the
+schema-driven editor and a complete operator surface. **Beyond D-038** a daemon-served GUI
+in a thin Tauri shell is a client of the same command schema. Agent-installable setup
 (`doctor --json`, Control MCP) is added; an agent is still never the only way to configure.
 See [AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md).
 

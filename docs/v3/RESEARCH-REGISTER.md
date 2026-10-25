@@ -89,8 +89,9 @@ Fixed columns: parent, Linear, F-n, csl-research, status.
 `—` in F-n means no F-question from [AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md) §4 is owned by that parent yet. New F-n keys are appended there and referenced here on the next docs-only PR.
 
 CSL-494 is `proposed` because recursion#295 is the dated 2026-10-24 amendment
-(Lucas-authored, unaccepted). F-2 is answered in that proposal; it is not `accepted`
-until Lucas accepts (rule 2, Lucas-authored case).
+(Lucas-authored, unaccepted). F-2 is already answered by D-038; this amendment's
+Tauri/daemon/standalone/"goat" additions are not `accepted` until Lucas accepts
+(rule 2, Lucas-authored case).
 
 ## F-n index
 
@@ -99,7 +100,7 @@ Question text lives in [AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md) §4. T
 | F-n | Owner parent(s) | Notes |
 |---|---|---|
 | F-1 | CSL-494 | Which Octopus; beat both until named |
-| F-2 | CSL-494, CSL-495 | Answered in the 2026-10-24 proposal (R-Q4); proposed, not accepted |
+| F-2 | CSL-494, CSL-495 | Answered by D-038 (2026-10-02). This amendment adds Tauri/daemon/standalone/"goat" beyond D-038 |
 | F-3 | CSL-494 | Product language / runtime (OR-017) |
 | F-4 | CSL-499 | What "enterprise" means by Nov 11 |
 | F-5 | CSL-496, CSL-507 | Anthropic "ordinary, individual usage" for unattended `claude -p` |

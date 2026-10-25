@@ -90,13 +90,13 @@ These are accepted product requirements; they do not enact runtime or constituti
 | OR-025 | Windows/Linux remote control, compatible placement, distributed workflow stages and recorded-work recovery are first-release requirements; task identity, permissions, interactions, accounting, artifacts and verification stay coherent. | macOS is a test opportunity. GPU/approved-cloud resources need capability profiles; distributed inference, enterprise HA/tenancy and a dedicated GUI have separate later milestones. Does not authorize node access or runtime deployment. |
 
 Amendment proposed 2026-10-24 (acceptance is a human decision by Lucas). The OR-021 and
-OR-025 **rows above are not rewritten.** Proposed supersession of GUI *timing* only:
-OR-021's "terminal first, dedicated GUI later" and OR-025's "a dedicated GUI have separate
-later milestones" are proposed replaced by a first-release GUI client over the same daemon
-as the CLI (Lucas R-Q4 / F-2). Enterprise HA/tenancy remains research (F-4). Product
+OR-025 **rows above are not rewritten.** D-038 (accepted 2026-10-02) already superseded
+their GUI-later timing: GUI and mobile are built but opt-in in the first release; no
+capability is deferred. This amendment does not reopen D-038. **Beyond D-038** it adds a
+daemon-served GUI in a thin Tauri shell on Linux, Windows and macOS, a standalone app, and
+the "goat" bar (Lucas R-Q4). Enterprise HA/tenancy remains research (F-4). Product
 language remains unselected (OR-017, F-3). See
-[AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md). `state/DECISIONS.md` is not edited;
-D-038 remains the last accepted GUI/mobile decision until Lucas accepts this amendment.
+[AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md). `state/DECISIONS.md` is not edited.
 
 The historical foundation decision JSON remains the September 5 snapshot. Resolved portions
 are superseded by these rulings; model/broker proof scope, exact engine certification,

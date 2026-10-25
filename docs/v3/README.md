@@ -66,7 +66,8 @@ configuration/plugins and Windows/Linux recovery. Earlier brainstorming "v2" mea
 architecture. The graphical application is later.
 
 Amendment proposed 2026-10-24 (acceptance is a human decision by Lucas): GUI timing in the
-sentence above is **proposed superseded**. See
+sentence above is already superseded by D-038 (built but opt-in; no capability deferred).
+This amendment does not reopen D-038. **Beyond D-038** see
 [AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md). Historical Mark 2/platform snapshots
 below are not rewritten.
 

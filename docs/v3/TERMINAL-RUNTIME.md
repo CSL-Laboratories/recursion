@@ -184,11 +184,13 @@ This terminal experience is the v3 visual foundation. A later graphical frontend
 new client of the same versioned observer/control protocols, not a rewrite of runtime state or
 actor semantics.
 
-Amendment proposed 2026-10-24 (acceptance is a human decision by Lucas): "later graphical
-frontend" timing is **proposed superseded**. The GUI is a first-release client of those same
-observer/control protocols (daemon-served web UI, thin Tauri shell). The protocol rule
-stands: the GUI must not rewrite runtime state or actor semantics; window-close is detach,
-not Stop. See [AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md).
+Amendment proposed 2026-10-24 (acceptance is a human decision by Lucas): D-038 (accepted
+2026-10-02) already superseded the "later graphical frontend" exclusion — GUI and mobile
+are built but opt-in in the first release; no capability is deferred. This amendment does
+not reopen D-038. **Beyond D-038** the GUI client is a daemon-served web UI in a thin
+Tauri shell on Linux, Windows and macOS, on those same observer/control protocols. The
+protocol rule stands: the GUI must not rewrite runtime state or actor semantics;
+window-close is detach, not Stop. See [AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md).
 
 ## Process and view topology
 

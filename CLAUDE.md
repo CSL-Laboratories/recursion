@@ -18,8 +18,10 @@ issues and PRs.
 - **Formal GitHub review requests.** Every review ask also needs a formal GitHub
   review request, not only the Linear @mention above. Use
   `gh pr edit <n> --add-reviewer samir-shah-ahmed,CDanTheMan` (whichever
-  reviewers apply). Both (a) the Linear @mention and (b) this GitHub request
-  are required. This is mandatory for agents too.
+  reviewers apply). PRs that touch protected or CODEOWNED paths also request
+  the code owner (`@NotSkittlz` / Lucas); do not copy the example above and
+  skip him. Both (a) the Linear @mention and (b) this GitHub request are
+  required. This is mandatory for agents too.
 - **Wait for jobs before human sign-off.** Order: Devin Review runs first, then the
   Claude fixer job (`devin-review-fix`) acts on its findings, then required
   CI reruns on the fixer's push. No human approves or requests changes on a PR until all
@@ -30,10 +32,11 @@ issues and PRs.
 - Autonomously file research findings, ideas and bugs to Triage, deduped.
 - Ground every issue and every execution in research before the work; size it to
   the task. No specific tool is required.
-- On a decision or direction issue, the assignee or claimant, including a Grok
-  Bot coordinator acting for its owner, may research and recommend. Attribute a
-  Grok Bot brief as `Grok Bot, preparing research for <owner>`; do not phrase
-  it as the owner personally authored or endorsed the recommendation.
+- On a decision or direction issue, the assignee or claimant must post the
+  cited brief (options, tradeoffs, recommendation, target metrics) on the
+  Linear issue. A Grok Bot coordinator acting for its owner may prepare it,
+  attributed exactly as `Grok Bot, preparing research for <owner>`; do not
+  phrase it as the owner personally authored or endorsed the recommendation.
   Publishing a brief never marks the issue decided, never clears a hold and
   never authorizes implementation. Only the designated human decision-maker,
   or an explicitly authorized research team, decides. The developer decides,
@@ -303,16 +306,16 @@ per-person ceilings. No new pay-per-token spend. Scheduled routines never start
 metered or paid research on their own. Record what was used — the tool or model,
 the date, and the key sources — in the issue or evidence, so the research can be
 checked. When the issue needs a decision or sets direction, the assignee or
-claimant, including a Grok Bot coordinator acting for its owner, may research
-and write the brief (options, tradeoffs, recommendation, target metrics) on
-the Linear issue. The bot may research and recommend. Attribute a Grok Bot
-brief explicitly as `Grok Bot, preparing research for <owner>`; do not phrase
-it as the owner personally authored or endorsed the recommendation. Publishing
-a brief never marks the issue decided, never clears a hold and never
-authorizes implementation. Only the designated human decision-maker, or an
-explicitly authorized research team, decides. The developer decides, or
-@mentions the approver; a coding agent @mentions its developer and does not
-decide.
+claimant must post the cited brief (options, tradeoffs, recommendation, target
+metrics) on the Linear issue after the research that grounds the work. A Grok
+Bot coordinator acting for its owner may prepare it, attributed exactly as
+`Grok Bot, preparing research for <owner>`; do not phrase it as the owner
+personally authored or endorsed the recommendation. The bot may research and
+recommend. Publishing a brief never marks the issue decided, never clears a
+hold and never authorizes implementation. Only the designated human
+decision-maker, or an explicitly authorized research team, decides. The
+developer decides, or @mentions the approver; a coding agent @mentions its
+developer and does not decide.
 
 **Filing and shipping.**
 

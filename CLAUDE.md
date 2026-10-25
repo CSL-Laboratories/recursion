@@ -15,6 +15,18 @@ issues and PRs.
   @lucassalvador987. This applies to interactive agents and Grok Bot. The GitHub-only
   Claude Code Action fixer has no Linear tooling; it replies on the PR threads, and the
   PR author relays anything it cannot fix to the Linear issue.
+- **Formal GitHub review requests.** Every review ask also needs a formal GitHub
+  review request, not only the Linear @mention above. Use
+  `gh pr edit <n> --add-reviewer samir-shah-ahmed,CDanTheMan` (whichever
+  reviewers apply). PRs that touch protected or CODEOWNED paths also request
+  the code owner (`@NotSkittlz` / Lucas); do not copy the example above and
+  skip him. If the PR author is a requested code owner, skip requesting them:
+  GitHub rejects review requests to the author. Request the other founders
+  (`samir-shah-ahmed`, `CDanTheMan`) for independent review instead. For paths
+  where the author is the sole code owner, note on the Linear issue that no
+  eligible code owner can be requested and that the founders' reviews are
+  independent review, not code-owner review. Both (a) the Linear @mention
+  and (b) this GitHub request are required. This is mandatory for agents too.
 - **Wait for jobs before human sign-off.** Order: Devin Review runs first, then the
   Claude fixer job (`devin-review-fix`) acts on its findings, then required
   CI reruns on the fixer's push. No human approves or requests changes on a PR until all
@@ -23,8 +35,18 @@ issues and PRs.
   are posted as @mention comments on the CSL Linear issue, and a watcher posts there when
   a PR is ready for review.
 - Autonomously file research findings, ideas and bugs to Triage, deduped.
-- Ground every implementation in the best available research: Parallel search for web
-  research and Context7 for current library docs.
+- Ground every issue and every execution in research before the work; size it to
+  the task. No specific tool is required.
+- On a decision or direction issue, the assignee or claimant must post the
+  cited brief (options, tradeoffs, recommendation, target metrics) on the
+  Linear issue. A Grok Bot coordinator acting for its owner may prepare it,
+  attributed exactly as `Grok Bot, preparing research for <owner>`; do not
+  phrase it as the owner personally authored or endorsed the recommendation.
+  Publishing a brief never marks the issue decided, never clears a hold and
+  never authorizes implementation. Only the designated human decision-maker,
+  or an explicitly authorized research team, decides. The developer decides,
+  or @mentions the approver; a coding agent @mentions its developer and does
+  not decide.
 
 > **How CSL works:** the Linear doc [How CSL works](https://linear.app/csl-laboratories/document/how-csl-works-922e0df6026f)
 > is background on the team and tooling. It does not change the reading order below;
@@ -277,12 +299,28 @@ the owner stays the assignee. Move the issue to **In Progress** once your claim 
 confirmed. If you stop, release with a release record.
 
 **Direction and architecture.** When you are the assignee or claimant (developer or
-their coding agent working in the repo) of an issue that needs a decision or sets
-direction, run Parallel Task API deep research before proposing, in
-addition to Search/Extract. Post the cited brief (options, tradeoffs,
-recommendation, target metrics) on the Linear issue. The developer decides,
-or @mentions the approver; a coding agent @mentions its developer and does
-not decide.
+their coding agent working in the repo), ground every issue and every execution in
+research before the work. This applies to decision issues and implementation alike;
+size the research to the task. No specific tool is required, and there is no
+mandatory research pipeline. Any available source counts: already-paid
+subscriptions (for example ChatGPT Pro Deep Research or Claude Max research),
+Exa, Parallel, current library docs (for example Context7), the web, primary
+sources, and repo evidence. None of these is required. Prefer already-paid
+subscriptions. Metered tools such as Exa and Parallel stay within their existing
+per-person ceilings. No new pay-per-token spend. Scheduled routines never start
+metered or paid research on their own. Record what was used — the tool or model,
+the date, and the key sources — in the issue or evidence, so the research can be
+checked. When the issue needs a decision or sets direction, the assignee or
+claimant must post the cited brief (options, tradeoffs, recommendation, target
+metrics) on the Linear issue after the research that grounds the work. A Grok
+Bot coordinator acting for its owner may prepare it, attributed exactly as
+`Grok Bot, preparing research for <owner>`; do not phrase it as the owner
+personally authored or endorsed the recommendation. The bot may research and
+recommend. Publishing a brief never marks the issue decided, never clears a
+hold and never authorizes implementation. Only the designated human
+decision-maker, or an explicitly authorized research team, decides. The
+developer decides, or @mentions the approver; a coding agent @mentions its
+developer and does not decide.
 
 **Filing and shipping.**
 

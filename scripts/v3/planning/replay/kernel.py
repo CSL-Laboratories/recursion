@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 
 from scripts.v3.planning.validation.canonical import (
-    M1AError, decode, digest, seal, validate_command_envelope,
+    M1AError, canonical_bytes, decode, digest, seal, validate_command_envelope,
     validate_domain_record, validate_event_envelope, validate_genesis, validate_projection,
     validate_receipt,
 )
@@ -13,6 +14,15 @@ from scripts.v3.planning.validation.contracts import validate_admission
 
 
 GENESIS_DIGEST = "fb1168e6e4d1267c41ea3d7798ebb88963e6de7c05cc1500ed059ba4b2f75801"
+
+_LIST_FIELDS = (
+    "records", "object_states", "processed_command_receipts",
+    "consumed_novelty_delta_digests", "open_blocker_refs",
+    "open_escalation_refs", "ambiguous_effect_refs",
+)
+_RECORD_CANONICAL = {}
+_OBJECT_STATE_CANONICAL = {}
+_INDEX = None
 
 
 def object_ref(record: dict) -> dict:
@@ -30,13 +40,118 @@ def lease_ref(record: dict) -> dict:
     }
 
 
+def _record_key(record: dict) -> tuple:
+    return (record["object_type"], record["id"], record["version"])
+
+
+def _ref_state_key(ref: dict) -> tuple:
+    return (ref["object_type"], ref["id"], ref["version"], ref["content_digest"])
+
+
+def _working_copy(immutable_state: dict) -> dict:
+    state = dict(immutable_state)
+    for field in _LIST_FIELDS:
+        state[field] = list(immutable_state[field])
+    return state
+
+
+def _index_projection(state: dict) -> dict:
+    records = {}
+    by_id = {}
+    by_type_id = {}
+    for item in state["records"]:
+        records[_record_key(item)] = item
+        by_id.setdefault(item["id"], []).append(item)
+        by_type_id.setdefault((item["object_type"], item["id"]), []).append(item)
+    state_pos = {}
+    state_by_ref = {}
+    for index, item in enumerate(state["object_states"]):
+        key = _ref_state_key(item["object_ref"])
+        state_pos[key] = index
+        state_by_ref[key] = item
+    return {
+        "records": records, "by_id": by_id, "by_type_id": by_type_id,
+        "state_pos": state_pos, "state_by_ref": state_by_ref,
+    }
+
+
+def _bind_projection(state: dict) -> None:
+    if not isinstance(state, dict):
+        raise M1AError("E-SCHEMA-INVALID", "projection must be an object")
+    if state.get("projection_schema_version") != "m1a-projection-1":
+        raise M1AError("E-SCHEMA-UNKNOWN-VERSION", str(state.get("projection_schema_version")))
+    if not isinstance(state.get("records"), list) or not isinstance(state.get("object_states"), list):
+        raise M1AError("E-SCHEMA-INVALID", "projection collections")
+    if len(_projection_bytes(state, omit_content_digest=False)) > 262_144:
+        raise M1AError("E-SCHEMA-BOUND", "canonical byte bound exceeded")
+
+
+def _cached_canonical(value, cache: dict, key: tuple) -> bytes:
+    blob = cache.get(key)
+    if blob is None:
+        blob = canonical_bytes(value)
+        cache[key] = blob
+    return blob
+
+
+def _projection_bytes(state: dict, *, omit_content_digest: bool) -> bytes:
+    """RFC 8785 projection bytes, with untouched records taken from cache."""
+
+    keys = [key for key in state if not (omit_content_digest and key == "content_digest")]
+    keys.sort(key=lambda key: key.encode("utf-16be"))
+    parts = []
+    for key in keys:
+        value = state[key]
+        if key == "records":
+            encoded = b"[" + b",".join(
+                _cached_canonical(
+                    item, _RECORD_CANONICAL,
+                    (item["object_type"], item["id"], item["version"], item["content_digest"]),
+                )
+                for item in value
+            ) + b"]"
+        elif key == "object_states":
+            encoded = b"[" + b",".join(
+                _cached_canonical(
+                    item, _OBJECT_STATE_CANONICAL,
+                    (
+                        item["object_ref"]["object_type"], item["object_ref"]["id"],
+                        item["object_ref"]["version"], item["object_ref"]["content_digest"],
+                        item["state"],
+                    ),
+                )
+                for item in value
+            ) + b"]"
+        else:
+            encoded = canonical_bytes(value)
+        parts.append(canonical_bytes(key) + b":" + encoded)
+    return b"{" + b",".join(parts) + b"}"
+
+
+def _projection_digest(state: dict) -> str:
+    return hashlib.sha256(_projection_bytes(state, omit_content_digest=True)).hexdigest()
+
+
 def _record(state: dict, ref: dict | None, object_type: str | None = None) -> dict | None:
     if ref is None:
+        return None
+    rec_id = ref.get("id", ref.get("lease_id"))
+    index = _INDEX
+    if index is not None:
+        if object_type is not None:
+            candidates = index["by_type_id"].get((object_type, rec_id), ())
+        else:
+            candidates = index["by_id"].get(rec_id, ())
+        for item in candidates:
+            if "version" in ref and item["version"] != ref["version"]:
+                continue
+            if "content_digest" not in ref or item["content_digest"] == ref["content_digest"]:
+                return item
         return None
     for item in state["records"]:
         if object_type is not None and item["object_type"] != object_type:
             continue
-        if item["id"] != ref.get("id", ref.get("lease_id")):
+        if item["id"] != rec_id:
             continue
         if "version" in ref and item["version"] != ref["version"]:
             continue
@@ -46,6 +161,10 @@ def _record(state: dict, ref: dict | None, object_type: str | None = None) -> di
 
 
 def _state_for(state: dict, ref: dict) -> str | None:
+    index = _INDEX
+    if index is not None:
+        item = index["state_by_ref"].get(_ref_state_key(ref))
+        return None if item is None else item["state"]
     for item in state["object_states"]:
         if item["object_ref"] == ref:
             return item["state"]
@@ -53,7 +172,7 @@ def _state_for(state: dict, ref: dict) -> str | None:
 
 
 def _sealed_state(value: dict) -> dict:
-    result = copy.deepcopy(value)
+    result = dict(value)
     result.pop("content_digest", None)
     result["records"] = sorted(
         result["records"], key=lambda r: (r["object_type"], r["id"], r["version"])
@@ -74,7 +193,8 @@ def _sealed_state(value: dict) -> dict:
     result["consumed_novelty_delta_digests"] = sorted(
         result["consumed_novelty_delta_digests"]
     )
-    return seal(result)
+    result["content_digest"] = _projection_digest(result)
+    return result
 
 
 def genesis(genesis_record: dict) -> dict:
@@ -105,10 +225,22 @@ def genesis(genesis_record: dict) -> dict:
 
 def _set_object_state(state: dict, record: dict, disposition: str) -> None:
     target = object_ref(record)
+    item = {"object_ref": target, "state": disposition}
+    index = _INDEX
+    if index is not None:
+        key = _ref_state_key(target)
+        pos = index["state_pos"].get(key)
+        if pos is None:
+            index["state_pos"][key] = len(state["object_states"])
+            state["object_states"].append(item)
+        else:
+            state["object_states"][pos] = item
+        index["state_by_ref"][key] = item
+        return
     state["object_states"] = [
-        item for item in state["object_states"] if item["object_ref"] != target
+        existing for existing in state["object_states"] if existing["object_ref"] != target
     ]
-    state["object_states"].append({"object_ref": target, "state": disposition})
+    state["object_states"].append(item)
 
 
 def _set_ref_state(state: dict, target: dict | None, disposition: str) -> None:
@@ -118,13 +250,26 @@ def _set_ref_state(state: dict, target: dict | None, disposition: str) -> None:
 
 
 def _insert_record(state: dict, record: dict) -> None:
-    key = (record["object_type"], record["id"], record["version"])
-    for existing in state["records"]:
-        if (existing["object_type"], existing["id"], existing["version"]) == key:
+    key = _record_key(record)
+    index = _INDEX
+    if index is not None:
+        existing = index["records"].get(key)
+        if existing is not None:
             if existing != record:
                 raise M1AError("E-DIGEST-MISMATCH", "conflicting immutable record")
             return
-    state["records"].append(copy.deepcopy(record))
+    else:
+        for existing in state["records"]:
+            if _record_key(existing) == key:
+                if existing != record:
+                    raise M1AError("E-DIGEST-MISMATCH", "conflicting immutable record")
+                return
+    stored = copy.deepcopy(record)
+    state["records"].append(stored)
+    if index is not None:
+        index["records"][key] = stored
+        index["by_id"].setdefault(stored["id"], []).append(stored)
+        index["by_type_id"].setdefault((stored["object_type"], stored["id"]), []).append(stored)
     default_state = {
         "owner-intent": "recorded", "goal-spec": "accepted",
         "goal-spec-amendment": "applied", "arm-run": "active",
@@ -152,19 +297,19 @@ def _insert_record(state: dict, record: dict) -> None:
 def reduce(immutable_state: dict, ordered_event: dict) -> dict:
     """Apply one validated, contiguous event to an immutable projection."""
 
-    validate_projection(immutable_state)
+    global _INDEX
+    _bind_projection(immutable_state)
     validate_event_envelope(ordered_event)
-    state = copy.deepcopy(immutable_state)
-    event = copy.deepcopy(ordered_event)
+    event = ordered_event
     if event.get("event_schema_version") != "m1a-event-1":
         raise M1AError("E-SCHEMA-UNKNOWN-VERSION")
     if digest(event, omit_content_digest=True) != event.get("content_digest"):
         raise M1AError("E-DIGEST-MISMATCH", "event content digest")
-    if event["stream_id"] != state["stream_id"]:
+    if event["stream_id"] != immutable_state["stream_id"]:
         raise M1AError("E-DIGEST-MISMATCH", "stream mismatch")
-    if event["sequence"] != state["last_event_sequence"] + 1:
+    if event["sequence"] != immutable_state["last_event_sequence"] + 1:
         raise M1AError("E-DIGEST-MISMATCH", "event sequence gap")
-    if event["previous_event_digest"] != state["last_event_digest"]:
+    if event["previous_event_digest"] != immutable_state["last_event_digest"]:
         raise M1AError("E-DIGEST-MISMATCH", "event chain mismatch")
     delta = {
         "event_type": event["event_type"], "primary_record": event["primary_record"],
@@ -173,110 +318,113 @@ def reduce(immutable_state: dict, ordered_event: dict) -> dict:
     if digest(delta) != event["state_delta_digest"]:
         raise M1AError("E-DIGEST-MISMATCH", "state delta digest")
 
-    records = [event["primary_record"], *event["related_records"]]
-    for record in records:
-        validate_domain_record(record)
-        if digest(record, omit_content_digest=True) != record.get("content_digest"):
-            raise M1AError("E-DIGEST-MISMATCH", "record content digest")
-        _insert_record(state, record)
-        payload = record["payload"]
-        if record["object_type"] == "work-packet":
-            _set_ref_state(state, payload["supersedes_packet_ref"], "stale")
-        elif record["object_type"] in ("work-lease", "executive-lease"):
-            old = payload["supersedes_lease_ref"]
-            if old:
-                prior = _record(state, old, record["object_type"])
-                if prior is not None:
-                    _set_object_state(state, prior, "replaced")
-        elif record["object_type"] == "route-assignment":
-            _set_ref_state(state, payload["supersedes_route_ref"], "released")
+    state = _working_copy(immutable_state)
+    _INDEX = _index_projection(state)
+    try:
+        for record in [event["primary_record"], *event["related_records"]]:
+            if digest(record, omit_content_digest=True) != record.get("content_digest"):
+                raise M1AError("E-DIGEST-MISMATCH", "record content digest")
+            _insert_record(state, record)
+            payload = record["payload"]
+            if record["object_type"] == "work-packet":
+                _set_ref_state(state, payload["supersedes_packet_ref"], "stale")
+            elif record["object_type"] in ("work-lease", "executive-lease"):
+                old = payload["supersedes_lease_ref"]
+                if old:
+                    prior = _record(state, old, record["object_type"])
+                    if prior is not None:
+                        _set_object_state(state, prior, "replaced")
+            elif record["object_type"] == "route-assignment":
+                _set_ref_state(state, payload["supersedes_route_ref"], "released")
 
-    primary = event["primary_record"]
-    payload = primary["payload"]
-    event_type = event["event_type"]
-    if event_type == "GoalSpecAccepted":
-        state["operative_goal_ref"] = object_ref(primary)
-    elif event_type == "GoalSpecAmended":
-        _set_ref_state(state, payload["old_goal_ref"], "superseded")
-        state["operative_goal_ref"] = object_ref(event["related_records"][0])
-    elif event_type == "ArmRunStarted":
-        state["active_arm_run_ref"] = object_ref(primary)
-    elif event_type == "PlanRevisionAdmitted":
-        if payload["prior_plan_ref"]:
-            _set_ref_state(state, payload["prior_plan_ref"], "superseded")
-        state["active_plan_ref"] = object_ref(primary)
-        state["terminal_status"] = "nonterminal"
-    elif event_type == "WorkerResultRecorded":
-        packet_ref = payload["work_packet_ref"]
-        _set_ref_state(state, packet_ref, "result-submitted")
-        packet = _record(state, packet_ref, "work-packet")
-        if packet is not None:
-            _set_ref_state(state, packet["payload"]["task_ref"], "gate-pending")
-    elif event_type == "GateResultRecorded":
-        passed = payload["disposition"] == "pass"
-        _set_ref_state(state, payload["task_ref"], "verified" if passed else "failed")
-        _set_ref_state(state, payload["work_packet_ref"], "gate-passed" if passed else "failed")
-    elif event_type == "RetryAdmitted":
-        state["consumed_novelty_delta_digests"].append(payload["novelty_delta_digest"])
-        _set_ref_state(state, payload["task_ref"], "ready")
-    elif event_type == "BlockerRaised":
-        state["open_blocker_refs"].append(object_ref(primary))
-        _set_ref_state(state, payload["blocked_object_ref"], "blocked")
-    elif event_type == "EscalationRaised":
-        state["open_escalation_refs"].append(object_ref(primary))
-        _set_ref_state(state, payload["source_blocker_ref"], "escalated")
-    elif event_type == "PauseApplied":
-        state["current_pause_epoch"] = payload["new_pause_epoch"]
-    elif event_type == "EffectObservationRecorded" and payload["observation"] == "ambiguous":
-        state["ambiguous_effect_refs"].append(object_ref(primary))
-        _set_ref_state(state, payload["work_packet_ref"], "quarantined")
-        packet = _record(state, payload["work_packet_ref"], "work-packet")
-        if packet is not None:
-            _set_ref_state(state, packet["payload"]["task_ref"], "quarantined")
-    elif event_type == "PlanVerifierDecisionRecorded":
-        active = state["active_plan_ref"]
-        exact_active = active is not None and active == payload["plan_ref"]
-        plan_tasks = [
-            record for record in state["records"] if record["object_type"] == "task-node"
-            and record["payload"]["plan_ref"]["id"] == payload["plan_ref"]["id"]
-            and record["payload"]["plan_ref"]["version"] == payload["plan_ref"]["version"]
-        ]
-        verified = {
-            (item["object_ref"]["object_type"], item["object_ref"]["id"],
-             item["object_ref"]["version"])
-            for item in state["object_states"] if item["state"] == "verified"
-        }
-        all_verified = bool(plan_tasks) and all(
-            ("task-node", task["id"], task["version"]) in verified for task in plan_tasks
-        )
-        if payload["disposition"] in ("pass", "downgraded-pass") and exact_active and all_verified:
-            terminal = (
-                "terminal-verified" if payload["disposition"] == "pass"
-                else "terminal-verified-downgraded"
+        primary = event["primary_record"]
+        payload = primary["payload"]
+        event_type = event["event_type"]
+        if event_type == "GoalSpecAccepted":
+            state["operative_goal_ref"] = object_ref(primary)
+        elif event_type == "GoalSpecAmended":
+            _set_ref_state(state, payload["old_goal_ref"], "superseded")
+            state["operative_goal_ref"] = object_ref(event["related_records"][0])
+        elif event_type == "ArmRunStarted":
+            state["active_arm_run_ref"] = object_ref(primary)
+        elif event_type == "PlanRevisionAdmitted":
+            if payload["prior_plan_ref"]:
+                _set_ref_state(state, payload["prior_plan_ref"], "superseded")
+            state["active_plan_ref"] = object_ref(primary)
+            state["terminal_status"] = "nonterminal"
+        elif event_type == "WorkerResultRecorded":
+            packet_ref = payload["work_packet_ref"]
+            _set_ref_state(state, packet_ref, "result-submitted")
+            packet = _record(state, packet_ref, "work-packet")
+            if packet is not None:
+                _set_ref_state(state, packet["payload"]["task_ref"], "gate-pending")
+        elif event_type == "GateResultRecorded":
+            passed = payload["disposition"] == "pass"
+            _set_ref_state(state, payload["task_ref"], "verified" if passed else "failed")
+            _set_ref_state(state, payload["work_packet_ref"], "gate-passed" if passed else "failed")
+        elif event_type == "RetryAdmitted":
+            state["consumed_novelty_delta_digests"].append(payload["novelty_delta_digest"])
+            _set_ref_state(state, payload["task_ref"], "ready")
+        elif event_type == "BlockerRaised":
+            state["open_blocker_refs"].append(object_ref(primary))
+            _set_ref_state(state, payload["blocked_object_ref"], "blocked")
+        elif event_type == "EscalationRaised":
+            state["open_escalation_refs"].append(object_ref(primary))
+            _set_ref_state(state, payload["source_blocker_ref"], "escalated")
+        elif event_type == "PauseApplied":
+            state["current_pause_epoch"] = payload["new_pause_epoch"]
+        elif event_type == "EffectObservationRecorded" and payload["observation"] == "ambiguous":
+            state["ambiguous_effect_refs"].append(object_ref(primary))
+            _set_ref_state(state, payload["work_packet_ref"], "quarantined")
+            packet = _record(state, payload["work_packet_ref"], "work-packet")
+            if packet is not None:
+                _set_ref_state(state, packet["payload"]["task_ref"], "quarantined")
+        elif event_type == "PlanVerifierDecisionRecorded":
+            active = state["active_plan_ref"]
+            exact_active = active is not None and active == payload["plan_ref"]
+            plan_tasks = [
+                record for record in state["records"] if record["object_type"] == "task-node"
+                and record["payload"]["plan_ref"]["id"] == payload["plan_ref"]["id"]
+                and record["payload"]["plan_ref"]["version"] == payload["plan_ref"]["version"]
+            ]
+            verified = {
+                (item["object_ref"]["object_type"], item["object_ref"]["id"],
+                 item["object_ref"]["version"])
+                for item in state["object_states"] if item["state"] == "verified"
+            }
+            all_verified = bool(plan_tasks) and all(
+                ("task-node", task["id"], task["version"]) in verified for task in plan_tasks
             )
-            state["terminal_status"] = terminal
-            _set_ref_state(state, payload["plan_ref"], terminal)
-            for task in plan_tasks:
-                _set_object_state(state, task, "complete")
-                for packet in state["records"]:
-                    if (packet["object_type"] == "work-packet"
-                            and packet["payload"]["task_ref"] == object_ref(task)):
-                        _set_object_state(state, packet, "consumed")
-    elif event_type in (
-        "PlanItemDisposed", "PacketFenced", "LeaseFenced", "EffectDisposed",
-        "EvidenceDisposed",
-    ):
-        target = {
-            "fence": "stale", "invalidate": "stale", "quarantine": "quarantined",
-            "supersede": "superseded", "cancel": "canceled", "retain-definition": "admitted",
-        }.get(payload["disposition"])
-        if target is not None:
-            _set_ref_state(state, payload["object_ref"], target)
+            if payload["disposition"] in ("pass", "downgraded-pass") and exact_active and all_verified:
+                terminal = (
+                    "terminal-verified" if payload["disposition"] == "pass"
+                    else "terminal-verified-downgraded"
+                )
+                state["terminal_status"] = terminal
+                _set_ref_state(state, payload["plan_ref"], terminal)
+                for task in plan_tasks:
+                    _set_object_state(state, task, "complete")
+                    for packet in state["records"]:
+                        if (packet["object_type"] == "work-packet"
+                                and packet["payload"]["task_ref"] == object_ref(task)):
+                            _set_object_state(state, packet, "consumed")
+        elif event_type in (
+            "PlanItemDisposed", "PacketFenced", "LeaseFenced", "EffectDisposed",
+            "EvidenceDisposed",
+        ):
+            target = {
+                "fence": "stale", "invalidate": "stale", "quarantine": "quarantined",
+                "supersede": "superseded", "cancel": "canceled", "retain-definition": "admitted",
+            }.get(payload["disposition"])
+            if target is not None:
+                _set_ref_state(state, payload["object_ref"], target)
 
-    state["state_version"] += 1
-    state["last_event_sequence"] = event["sequence"]
-    state["last_event_digest"] = event["content_digest"]
-    return _sealed_state(state)
+        state["state_version"] += 1
+        state["last_event_sequence"] = event["sequence"]
+        state["last_event_digest"] = event["content_digest"]
+        return _sealed_state(state)
+    finally:
+        _INDEX = None
 
 
 def _domain_record(object_type: str, schema_version: str, record_id: str, payload: dict,

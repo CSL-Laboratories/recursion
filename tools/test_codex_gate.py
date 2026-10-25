@@ -1050,7 +1050,7 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn("CSL-Laboratories/csl-research", self.agents)
         self.assertIn("ACK TAKEOVER", self.agents)
         self.assertIn("follows each repo's own rule", agents_flat)
-        self.assertIn("cockpit forbids automatic takeover", agents_flat)
+        self.assertIn("the other product repository forbids automatic takeover", agents_flat)
         self.assertIn("recursion allows takeover after lease plus grace", agents_flat)
         self.assertIn("The Linear issue comment is the canonical escalation", agents_flat)
         self.assertIn("`state/INBOX.md` is optional", self.agents)

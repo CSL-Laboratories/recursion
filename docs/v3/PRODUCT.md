@@ -115,8 +115,12 @@ issues and the research that is published. The living register is
 [RESEARCH-REGISTER.md](RESEARCH-REGISTER.md), keyed to CSL-494…CSL-510 and shared
 CSL-520…CSL-522 (umbrella CSL-493). Publishing a csl-research record
 (`CSL-Laboratories/csl-research` `submissions/<record_id>/`) updates that register in a
-docs-only PR. **Accepted text in this file changes only by a dated amendment Lucas
-accepts.** A register update is not acceptance.
+docs-only PR. **Accepted text in this file changes only under that register's update
+rule.** Lucas-authored dated amendments (including this RP0 text) are accepted when
+Lucas accepts. Spec changes authored by Samir or Dan (or their agents, attributed)
+are accepted when a founder other than the author approves the PR; that approval
+counts as acceptance (Lucas 2026-10-24 11:58pm PT). A register update is not
+acceptance.
 
 ## Mark 2 capability map â€” research synthesis 2026-09-07
 

@@ -11,9 +11,10 @@ authority: living index; does not accept product text, admit work, clear a hold,
 changing with the issues and the research that is published.
 
 This file is the living index. It is **not** accepted product text. [PRODUCT.md](PRODUCT.md)
-accepted wording (including the OR-038 paragraph) changes only by a **dated amendment
-Lucas accepts**. [AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md) is the current dated
-proposal. `CONTROL_PLANE.md` and `state/DECISIONS.md` are not edited from this register.
+accepted wording (including the OR-038 paragraph) changes only under the update rule
+below. [AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md) is the current dated proposal
+(Lucas-authored; Lucas accepts). `CONTROL_PLANE.md`, `state/DECISIONS.md` and `AGENTS.md`
+are not edited from this register.
 
 Umbrella: [CSL-493](https://linear.app/csl-laboratories/issue/CSL-493) (CSL frontier map:
 Nov 11 parents). Rows are Recursion parents [CSL-494](https://linear.app/csl-laboratories/issue/CSL-494)…[CSL-510](https://linear.app/csl-laboratories/issue/CSL-510) plus shared [CSL-520](https://linear.app/csl-laboratories/issue/CSL-520)…[CSL-522](https://linear.app/csl-laboratories/issue/CSL-522). Parents outside that Recursion set are out of this register.
@@ -24,9 +25,21 @@ Nov 11 parents). Rows are Recursion parents [CSL-494](https://linear.app/csl-lab
    Path: `CSL-Laboratories/csl-research` `submissions/<record_id>/` (full 40-hex commit
    when known). Fill the `csl-research` cell and set status to `findings-published` unless
    a dated amendment is already `proposed` or `accepted` for that parent.
-2. **PRODUCT.md accepted text changes only by a dated amendment Lucas accepts.** A
-   register update, a Linear comment, a GitHub merge, CI, or an implementer's PASS does
-   not rewrite accepted product wording and does not accept this amendment.
+2. **PRODUCT.md accepted text** changes only by a dated spec amendment that is accepted.
+   Lucas (2026-10-24 11:58pm PT, his words): "Samir and Dan should be able to change and
+   modify the product spec with their agents as recommended and as research is
+   synthesized" and "Spec changes by Samir or Dan are accepted once another founder
+   approves the PR."
+   - Founders: Lucas, Samir (`samir-shah-ahmed`), Dan/Chaandan (`CDanTheMan`).
+   - Spec PRs authored by **Samir or Dan** (or their agents, attributed
+     `Agent (…, for Samir)` / `Agent (…, for Chaandan)` / `for Dan`) are **accepted
+     when a founder other than the author approves the PR**. That GitHub approval
+     counts as acceptance. The author's own approval does not count. Agents still
+     never merge.
+   - Spec PRs authored by **Lucas** (or his agents, attributed) are accepted when
+     **Lucas accepts** (this RP0 amendment, recursion#295, is that case).
+   - A register update, a Linear comment, CI, an implementer's PASS, or a merge
+     without the matching founder approval does not rewrite accepted product wording.
 3. **Linear parent progress** (new F-n, a named decision receipt, a superseded question)
    is reflected on the next docs-only register PR. Do not wait for a product-language or
    architecture decision to keep the index current.
@@ -36,12 +49,13 @@ Nov 11 parents). Rows are Recursion parents [CSL-494](https://linear.app/csl-lab
    |---|---|
    | `open` | Parent is admitted; no published vault record and no dated amendment in flight |
    | `findings-published` | A csl-research `submissions/<record_id>/` exists; product text not yet proposed |
-   | `proposed` | A dated spec amendment is open for Lucas to accept |
-   | `accepted` | Lucas accepted the dated amendment (human receipt). Silence is not acceptance |
+   | `proposed` | A dated spec amendment PR is open |
+   | `accepted` | Accepted under rule 2. Silence is not acceptance. Self-approval is not acceptance |
 
 5. This register does not select a language, store, framework, default relay, or spend
-   route. F-n rows remain research questions until Lucas decides. F-2 is answered in the
-   2026-10-24 proposal; it is `proposed` until Lucas accepts.
+   route. F-n rows remain research questions until a founder decides under rule 2. F-2
+   is answered in the 2026-10-24 proposal; it is `proposed` until this Lucas-authored
+   amendment is accepted.
 
 **Vault this session:** [CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research) returned GitHub API 404 (2026-10-25). Every `csl-research` cell is `none` until a readable `submissions/<record_id>/` is cited. Do not invent record IDs.
 
@@ -74,7 +88,9 @@ Fixed columns: parent, Linear, F-n, csl-research, status.
 
 `—` in F-n means no F-question from [AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md) §4 is owned by that parent yet. New F-n keys are appended there and referenced here on the next docs-only PR.
 
-CSL-494 is `proposed` because recursion#295 is the dated 2026-10-24 amendment (unaccepted). F-2 is answered in that proposal; it is not `accepted` until Lucas accepts.
+CSL-494 is `proposed` because recursion#295 is the dated 2026-10-24 amendment
+(Lucas-authored, unaccepted). F-2 is answered in that proposal; it is not `accepted`
+until Lucas accepts (rule 2, Lucas-authored case).
 
 ## F-n index
 

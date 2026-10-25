@@ -17,7 +17,10 @@ hold, and does not authorize implementation.
 Agent (Cursor Cloud `bc-5c609d8d-1982-5753-a90d-8974cde61752`, for Lucas): drafted from
 Lucas's 2026-10-24 direction and the graded competitive brief. Linear issue
 [CSL-494](https://linear.app/csl-laboratories/issue/CSL-494) (RP0), umbrella
-[CSL-493](https://linear.app/csl-laboratories/issue/CSL-493). Only Lucas accepts.
+[CSL-493](https://linear.app/csl-laboratories/issue/CSL-493). This RP0 amendment is
+Lucas-authored; **Lucas accepts it**. Subsequent spec changes by Samir or Dan follow
+[RESEARCH-REGISTER.md](RESEARCH-REGISTER.md) (another founder's PR approval counts as
+acceptance).
 
 ## How to read this
 
@@ -208,8 +211,10 @@ Lucas can decide any of these at any time; silence is not a decision.
 
 The living parent-keyed index is [RESEARCH-REGISTER.md](RESEARCH-REGISTER.md) (Lucas
 2026-10-24 11:57pm PT: the spec must be dynamic). Publishing a csl-research record
-updates that register in a docs-only PR. PRODUCT.md accepted text changes only by a
-dated amendment Lucas accepts.
+updates that register in a docs-only PR. PRODUCT.md accepted text changes only under
+that register's update rule: Lucas-authored dated amendments are accepted by Lucas;
+spec changes by Samir or Dan (or their attributed agents) are accepted when a founder
+other than the author approves the PR (Lucas 2026-10-24 11:58pm PT).
 
 | ID | Question | Status |
 |---|---|---|
@@ -239,7 +244,7 @@ contradicts the direction gets a dated pointer and a local addition.
 
 | File | Direct contradiction | Change in this PR |
 |---|---|---|
-| [RESEARCH-REGISTER.md](RESEARCH-REGISTER.md) | Spec treated as static vs Linear parents and published research | **New** living register; docs-only updates; PRODUCT.md accepted text unchanged until Lucas accepts a dated amendment |
+| [RESEARCH-REGISTER.md](RESEARCH-REGISTER.md) | Spec treated as static vs Linear parents and published research | **New** living register; docs-only updates; PRODUCT.md accepted text follows the register update rule (Lucas-authored vs Samir/Dan other-founder approval) |
 | [PRODUCT.md](PRODUCT.md) | Status; initial-user "agent never required to edit settings" as a ceiling; GUI treated as opt-in-later in places | Front-matter + new section; OR-038 paragraph **untouched**; link to the living register |
 | [INTERFACE-STRATEGY.md](INTERFACE-STRATEGY.md) | Non-goal "No graphical frontend in the initial release" | Add supersession note; keep original line |
 | [ROUTE-CAPABILITIES.md](ROUTE-CAPABILITIES.md) | BYOK "native loop remains to be built"; missing Grok Bot / Devin / OpenCode Go/Zen rows | Add proposed overlay rows |

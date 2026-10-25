@@ -40,9 +40,11 @@ CSL-27 adds a minimal upstream CLI harness. It routes one task through an
 adapter and can review it with a second adapter. The shipped config enables
 only the offline `fixture` and `fixture-b` providers. `claude`, `codex`, and
 `grok` start only with `--allow-live`. The architecture note is
-[docs/v3/harness/CSL-27.md](docs/v3/harness/CSL-27.md). CSL-81 records research
-on the upstream CLI contracts and a proposed Codex session meter in
-[docs/v3/harness/CSL-81.md](docs/v3/harness/CSL-81.md). CSL-83 adds preference
+[docs/v3/harness/CSL-27.md](docs/v3/harness/CSL-27.md). CSL-81 is research
+on the upstream CLI contracts and a proposed Codex session meter. The
+research body is in the private CSL research vault. This repository keeps
+a pointer only: [docs/v3/harness/CSL-81.md](docs/v3/harness/CSL-81.md).
+CSL-83 adds preference
 weights, a cooldown after rate-limit, quota, and auth failures, fallback to
 the next capable provider, and size caps on review prompts and dependency
 context. The note is [docs/v3/harness/CSL-83.md](docs/v3/harness/CSL-83.md).

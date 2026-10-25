@@ -97,8 +97,10 @@ includes the code they sit in, and the tests are stubs.
    that reported 6.9M input tokens against a 272k window
    ([openai/codex#17539](https://github.com/openai/codex/issues/17539);
    an issue report, not the official docs, and not re-measured here). The
-   last event is kept and events are not summed. See [CSL-81](CSL-81.md)
-   for the open question. The default ceiling is 50,000,000 input tokens and
+   last event is kept and events are not summed. The open question is
+   tracked on [CSL-81](https://linear.app/csl-laboratories/issue/CSL-81).
+   [CSL-81.md](CSL-81.md) is a pointer; the research body is in the private
+   CSL research vault. The default ceiling is 50,000,000 input tokens and
    8,000,000 output tokens, above that 6.9M example. The old 1,000,000
    ceiling still stops that example when it is configured.
 3. **Claude Code doctor.** `claude auth status` can exit 1 while printing
@@ -156,7 +158,9 @@ includes the code they sit in, and the tests are stubs.
 - No live Claude, Codex, or Grok process was started here.
 - The 6.9M Codex figure is a public report, not a measurement from this repo.
 - A raised ceiling is not a qualified subscription meter. Research on
-  the contracts and a proposed Codex meter is in [CSL-81](CSL-81.md).
+  the contracts and a proposed Codex meter is tracked on
+  [CSL-81](https://linear.app/csl-laboratories/issue/CSL-81).
+  [CSL-81.md](CSL-81.md) is a pointer only.
 - Passing the gate is not v3 release acceptance.
 - The private working folder does not stop a permissive CLI from writing
   outside that folder.

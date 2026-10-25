@@ -57,9 +57,13 @@ Nov 11 parents). Rows are Recursion parents [CSL-494](https://linear.app/csl-lab
    | `accepted` | Accepted under rule 2. Silence is not acceptance. Self-approval is not acceptance |
 
 5. This register does not select a language, store, framework, default relay, or spend
-   route. F-n rows remain research questions until a founder decides under rule 2. F-2
-   is answered in the 2026-10-24 proposal; it is `proposed` until this Lucas-authored
-   amendment is accepted.
+   route. An F-n row stays a research question until a named founder decision receipt is
+   recorded (rule 3) or product text covering that question is accepted (rule 2). A
+   Linear decision receipt does not rewrite `PRODUCT.md`; it is indexed here on the
+   next docs-only register PR. F-2 (GUI later vs first-release GUI) is already
+   answered by D-038 (2026-10-02); that answer does not depend on this amendment.
+   The Tauri/daemon/standalone/"goat" additions in the 2026-10-24 proposal stay
+   `proposed` until this Lucas-authored amendment is accepted (rule 2).
 
 **Vault this session:** [CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research) returned GitHub API 404 (2026-10-25). Every `csl-research` cell is `none` until an exact evidence reference (repo, 40-hex commit, path, claim, limitations) can be cited. Do not invent record IDs or unpinned paths.
 

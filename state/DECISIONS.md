@@ -770,10 +770,10 @@ approve a protected-path amendment through this process. Agents do not merge.
 
 **Options considered:** A) leave these three files pointing at in-repo `docs/v3/*`,
 `state/DECISIONS.md` and required `state/INBOX.md` until CSL-536 moves files /
-B) smallest alignment now: existing `docs/v3/*` stays authoritative until CSL-536;
-new specs and decisions go to csl-research and this repository only links; this log
-freezes through D-044; blockers go to a Linear issue comment, with `state/INBOX.md`
-optional.
+B) smallest alignment now: existing `docs/v3/*` stays in place with its current
+ratification status until CSL-536; new specs and decisions go to csl-research and this
+repository only links; this log freezes through D-044; blockers go to a Linear issue
+comment, with `state/INBOX.md` optional.
 
 **Chose:** B.
 
@@ -781,17 +781,18 @@ optional.
 control-plane order and decision log as in-repo sources would keep those files out of
 line with the rule Lucas directed.
 
-**Consequence:** `CONTROL_PLANE.md` precedence ranks existing `docs/v3/*` and this frozen
-log until CSL-536, and ranks new specs and decisions in csl-research at those same
-slots via links. Conflict and blockers are recorded as a Linear issue comment;
-`state/INBOX.md` is optional. `ANCHOR.md` keeps existing `docs/v3/*` as the specification
-until CSL-536 and points new specs and decisions at csl-research. This file takes no
-further entries. Historical decision bytes through D-043 stay unchanged. File moves
-remain CSL-536. Settings, CODEOWNERS, rulesets, access grants and merge-queue
-activation are unchanged and not claimed effective here.
+**Consequence:** `CONTROL_PLANE.md` precedence ranks existing `docs/v3/*` (in place, with
+its current ratification status) and this frozen log until CSL-536, and ranks new specs
+and decisions in csl-research at those same slots via links. Conflict and blockers are
+recorded as a Linear issue comment; `state/INBOX.md` is optional. `ANCHOR.md` keeps
+existing `docs/v3/*` in place with its current ratification status until CSL-536 and
+points new specs and decisions at csl-research. This file takes no further entries.
+Historical decision bytes through D-043 stay unchanged. File moves remain CSL-536.
+Settings, CODEOWNERS, rulesets, access grants and merge-queue activation are unchanged
+and not claimed effective here.
 
 **Falsifier:** a new non-public spec, decision, research report, evidence/receipt, gate
 artifact or non-public runbook is added to this repository after this amendment merges,
-or an existing `docs/v3/*` file is treated as non-authoritative before CSL-536 migrates it.
+or an existing `docs/v3/*` file is moved or deleted before CSL-536.
 
 **Review:** at a founder revisit of this decision, or the next monthly decision-log review.

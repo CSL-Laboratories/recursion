@@ -9,8 +9,9 @@ is stale.
 
 Read `ANCHOR.md` for WHY the work exists and what is in scope. Read
 [docs/v3/START-HERE.md](docs/v3/START-HERE.md) for how the product is organized.
-Existing `docs/v3/*` stays until CSL-536 migrates it. New non-public docs (research, specs,
-decisions, evidence and receipts, gate artifacts, and runbooks that aren't public) go to
+Existing `docs/v3/*` stays in place with its current ratification status until CSL-536.
+New non-public docs (research, specs, decisions, evidence and receipts, gate artifacts,
+and runbooks that aren't public) go to
 [CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research) through a PR
 there; this repository only links. The only new docs allowed here are public knowledge-base,
 README, setup and implementation instructions for outside readers, plus agent instruction files.
@@ -25,9 +26,10 @@ Conflicts resolve in this order, highest first:
 
 1. Current explicit founder decisions within the authority below; Lucas breaks disagreements
 2. `CONTROL_PLANE.md` (this file)
-3. The v3 product specifications: existing `docs/v3/*` until CSL-536 migrates them; new
-   specifications are recorded in [CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research)
-   and this repository only links. Existing `docs/v3/*` remains authoritative until that move.
+3. The v3 product specifications: existing `docs/v3/*` stays in place with its current
+   ratification status until CSL-536; new specifications are recorded in
+   [CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research)
+   and this repository only links.
 4. Decision records: existing entries in `state/DECISIONS.md` (frozen legacy log through D-044);
    new decisions are recorded in csl-research and this repository only links
 5. Implementation docs, experiments and evidence (new non-public docs go to csl-research)

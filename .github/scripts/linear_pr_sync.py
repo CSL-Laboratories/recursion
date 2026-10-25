@@ -30,7 +30,9 @@ LINEAR_FIRST = (
     "Linear-first (CSL-88): Work from the CSL Linear issue. Check it and its "
     "PR-sync comment for overlap first. Post status and questions there. File "
     "new findings to Triage. Use current docs (Context7) and web research "
-    "(Parallel) before implementing."
+    "(Parallel) before implementing. Research output goes to "
+    "CSL-Laboratories/csl-research as a submission record, never to this repo; "
+    "post a digest on the Linear issue."
 )
 BEHIND_STATES = frozenset({"dirty", "behind"})
 PENDING_MERGEABLE = frozenset({"", "unknown"})

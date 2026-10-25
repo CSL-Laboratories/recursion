@@ -24,8 +24,8 @@ Start here:
 
 | Path | What it is |
 |---|---|
-| `docs/v3/` | v3 product specifications, research and evidence |
-| `experiments/v3/` | v3 research experiments and provider-free evidence checks |
+| `docs/v3/` | v3 product specifications (contracts, specs, amendments). Research content lives in [csl-research](https://github.com/CSL-Laboratories/csl-research). |
+| `experiments/v3/` | runnable product checks only |
 | `schemas/control-plane/v3/` | v3 contract schemas (planning, execution, integrity) |
 | `scripts/v3/` | v3 planning replay and validation |
 | `scripts/v3/harness/` | CSL-27 upstream CLI harness slice; CSL-83 weights, cooldowns, and caps |

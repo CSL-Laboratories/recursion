@@ -1,14 +1,27 @@
 ---
 title: Recursion research and decision index (anti-drift map)
-status: maintained-index
-last-updated: 2026-10-02
+status: frozen-historical
+last-updated: 2026-10-25
 ---
 
 # Recursion research and decision index
 
-A single map of every research wave, intake, packet, experiment, decision and gate, so no
-knowledge is lost between sessions and stale artifacts are visible rather than silently reused.
-When adding an artifact, add a row here. When superseding one, mark it `superseded` and keep the
+**Frozen historical intake.** Do not add new waves here. All research output (notes,
+briefs, findings, source tables, competitor or frontier writeups, research registers
+or indexes) goes to
+[CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research) as
+`submissions/<record_id>/`, through a PR in that repo, with a digest on the Linear
+issue. Never commit research content to this repo; specs, amendments and code only
+link to the vault record (repo, 40-hex commit, path, claim, limitations). If
+csl-research is not accessible, stop and post a blocker on the Linear issue; do not
+fall back to this repo. `docs/v3/research-lane/`, `docs/v3/foundation-research/` and
+`docs/v3/prompts/` are legacy and frozen; `experiments/v3/` holds only runnable
+product checks.
+
+A single map of every research wave, intake, packet, experiment, decision and gate that
+landed in this tree through 2026-10-02, so no historical knowledge is lost between
+sessions and stale artifacts are visible rather than silently reused.
+When superseding a historical row, mark it `superseded` and keep the
 path (a ruled-out approach without its reason is a dead end waiting to be rediscovered).
 
 ## Authority and identity
@@ -115,4 +128,4 @@ path (a ruled-out approach without its reason is a dead end waiting to be redisc
 3. Prompts inherit **current** authority only — the retired Hermes-control wording was swept on
    2026-10-02 (D-032); do not reintroduce it.
 4. Research output is evidence, not decision; only `state/DECISIONS.md` records Owner choices.
-5. New waves are added to this index and to `NEXT-PHASE.md` the day they land.
+5. New waves are not added here. They land in csl-research `submissions/<record_id>/`.

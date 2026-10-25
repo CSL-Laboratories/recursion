@@ -1383,6 +1383,10 @@ class ConflictJobStructureTests(unittest.TestCase):
         self.assertIn("Parallel", job)
         self.assertIn("when those tools are available", job)
         self.assertIn("not a denied command that blocks the push", job)
+        self.assertIn("CSL-Laboratories/csl-research", job)
+        self.assertIn("submission record", job)
+        self.assertIn("never to this repo", job)
+        self.assertIn("digest on the Linear issue", job)
 
     def _prep(self, live: object, pause_var: str | None = None, env_extra: dict | None = None,
               commit: object = None, reviews: object = None, ref: object = None,

@@ -37,6 +37,25 @@ issues and PRs.
 - Autonomously file research findings, ideas and bugs to Triage, deduped.
 - Ground every issue and every execution in research before the work; size it to
   the task. No specific tool is required.
+- All research output (notes, briefs, findings, source tables, competitor or
+  frontier writeups, research registers or indexes) goes to
+  [CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research)
+  as `submissions/<record_id>/`, through a PR in that repo, with a digest on
+  the Linear issue. Never commit research content to this repo; specs,
+  amendments and code only link to the vault record (repo, 40-hex commit, path,
+  claim, limitations). If csl-research is not accessible, stop and post a
+  blocker on the Linear issue; do not fall back to this repo.
+  `docs/v3/research-lane/`, `docs/v3/foundation-research/` and
+  `docs/v3/prompts/` are legacy and frozen; `experiments/v3/` holds only
+  runnable product checks. Every research pass for an issue (a) posts that
+  digest and (b) appends the submission record following that repo's README,
+  AGENTS.md, templates and `tools/check_submission.py`, and opens the vault PR
+  before releasing the issue claim. The record carries the sanitized report,
+  its SHA-256, the tool or processor, run id, retrieval time, cost or
+  `unknown + reason`, a source-to-claim mapping, and `issue_urls`. A research
+  body produced under an admitted issue is published there as part of that
+  issue; no separate admission is needed. This repository takes contracts,
+  specs, fixtures and runbooks only.
 - On a decision or direction issue, the assignee or claimant must post the
   cited brief (options, tradeoffs, recommendation, target metrics) on the
   Linear issue. A Grok Bot coordinator acting for its owner may prepare it,
@@ -89,13 +108,32 @@ release-on: done | decision needed | handoff | lease expiry
 
 These records are conventions, not enforced locks. A comment is not an atomic lock, and authorship is not verifiable while agents post through developer accounts, so a misbehaving agent is made auditable, not prevented. Before publishing, read the remote head. Preserve uncertain in-flight work and stop on ambiguity. Transactional claims or locks, enforced leases, fencing, WIP enforcement and a shared execution-cost ledger are proposed and unimplemented. Do not treat them as current guarantees. This guide sets no numeric WIP cap; any cap is a separate founder decision.
 
-Shared research may be stored in the private [CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research) repository. Storing records there requires a separately admitted task and existing granted access; this guide grants no write route, access or cross-repository scope. The vault is evidence storage, not a supervisor or decision authority. Do not assume published records, a schema or a validator exist there until they are actually present. An exact evidence reference names the repository, full 40-hex commit, record path, claim and limitations. A research record should carry:
+[CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research)
+is the knowledge vault for ALL CSL research. A research body produced under an
+admitted issue is published there as `submissions/<record_id>/` as part of that
+issue; no separate admission is needed. Follow that repository's README,
+AGENTS.md, templates and `tools/check_submission.py`, and open a PR there
+before releasing the issue claim. Product repositories only link to the vault
+record (repo, 40-hex commit, path, claim, limitations). All research output
+(notes, briefs, findings, source tables, competitor or frontier writeups,
+research registers or indexes) goes there, through that PR, with a digest on
+the Linear issue. Never commit research content to this repo. If csl-research
+is not accessible, stop and post a blocker on the Linear issue; do not fall
+back to this repo. This repository takes contracts, specs, fixtures and
+runbooks only. `docs/v3/research-lane/`, `docs/v3/foundation-research/` and
+`docs/v3/prompts/` are legacy and frozen; `experiments/v3/` holds only
+runnable product checks. The vault is evidence storage, not a supervisor or
+decision authority. This section grants that submission write route only; it
+does not grant other access, orchestration, or any other write. The
+submission record carries:
 
-- sanitised prompt and result hashes
-- provider, model or processor and run ID, or the reason no paid run was made
-- estimated and actual cost with unknowns; reserved amounts only when supported by an independently verified existing reservation
-- a mapping from sources to claims, with retrieval dates
-- limitations, supersession references and artifact manifests
+- the sanitized report and its SHA-256
+- the tool or processor, run id, and retrieval time
+- cost, or `unknown + reason`
+- a mapping from sources to claims
+- `issue_urls`
+- plus any other fields that repository's templates and
+  `tools/check_submission.py` require
 
 Consuming a fragment that requires acceptance needs the applicable exact, authenticated human receipt. A receipt identifier alone is not verification: manually check the source, human identity and authority, exact digest, conditions and revocation. An attributed relay is not a personal human receipt where personal posting is required; the one exception is a developer-approved comment that meets the conditions in `CONTROL_PLANE.md` (D-043), and it never counts where an accepted contract requires an exact authenticated human receipt. No new authentication tool is implied. Candidate-only research is labelled as such and grants no implementation scope. Keep evidence classes distinct.
 
@@ -308,9 +346,19 @@ Exa, Parallel, current library docs (for example Context7), the web, primary
 sources, and repo evidence. None of these is required. Prefer already-paid
 subscriptions. Metered tools such as Exa and Parallel stay within their existing
 per-person ceilings. No new pay-per-token spend. Scheduled routines never start
-metered or paid research on their own. Record what was used — the tool or model,
-the date, and the key sources — in the issue or evidence, so the research can be
-checked. When the issue needs a decision or sets direction, the assignee or
+metered or paid research on their own. All research output (notes, briefs,
+findings, source tables, competitor or frontier writeups, research registers or
+indexes) goes to [CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research)
+as `submissions/<record_id>/`, through a PR in that repo, with a digest on the
+Linear issue. Never commit research content to this repo; specs, amendments and
+code only link to the vault record (repo, 40-hex commit, path, claim,
+limitations). If csl-research is not accessible, stop and post a blocker on the
+Linear issue; do not fall back to this repo. Follow that repo's README,
+AGENTS.md, templates and `tools/check_submission.py`, and open the vault PR
+before releasing the issue claim. The record carries the sanitized report, its
+SHA-256, the tool or processor, run id, retrieval time, cost or
+`unknown + reason`, a source-to-claim mapping, and `issue_urls`. A Linear
+comment alone is not the record. When the issue needs a decision or sets direction, the assignee or
 claimant must post the cited brief (options, tradeoffs, recommendation, target
 metrics) on the Linear issue after the research that grounds the work. A Grok
 Bot coordinator acting for its owner may prepare it, attributed exactly as

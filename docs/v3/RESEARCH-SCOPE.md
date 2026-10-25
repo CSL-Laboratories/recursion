@@ -1,6 +1,18 @@
 # Recursion v3 research scope
 
-Status: active scope, 2026-09-28. Supersedes the foundry-era work breakdown in
+Status: product research map, 2026-10-25. This page sequences product questions and
+gates; it is not the research archive. All research output (notes, briefs, findings,
+source tables, competitor or frontier writeups, research registers or indexes) goes
+to [CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research)
+as `submissions/<record_id>/`, through a PR in that repo, with a digest on the Linear
+issue. Never commit research content to this repo; specs, amendments and code only
+link to the vault record (repo, 40-hex commit, path, claim, limitations). If
+csl-research is not accessible, stop and post a blocker on the Linear issue; do not
+fall back to this repo. `docs/v3/research-lane/`, `docs/v3/foundation-research/` and
+`docs/v3/prompts/` are legacy and frozen; `experiments/v3/` holds only runnable
+product checks.
+
+Supersedes the foundry-era work breakdown in
 `docs/v3/research-lane/PLAN-20260927.md` for anything that depended on the construction foundry.
 Non-normative until ratified: this page sequences research, it does not change product authority.
 
@@ -52,8 +64,10 @@ check for new branches; use the per-task gate instead.
   `experiments/v3/dq-execution-controller-20260914/test_controller.py`.
 - **T-11 external-packet privacy scanner** — hard floor before any packet leaves the local trust
   domain. Gate to be created at `tools/check_v3_packet_privacy.py`.
-- **WS-8 R-lane SPECs** — one prospective SPEC + finite domain + falsifier per lane, under
-  `docs/v3/research-lane/<lane>/` with an inert checker under `experiments/v3/<lane>/`.
+- **WS-8 R-lane SPECs** — one prospective SPEC + finite domain + falsifier per lane.
+  Historical intakes remain under frozen `docs/v3/research-lane/<lane>/`. New research
+  bodies go to csl-research `submissions/<record_id>/`; an inert product checker, if
+  needed, stays under `experiments/v3/<lane>/`.
 
 ### Blocked, Owner-gated (do not start)
 

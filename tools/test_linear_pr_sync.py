@@ -154,6 +154,10 @@ class BodyTests(unittest.TestCase):
         self.assertIn("PR-sync comment", body)
         self.assertIn("Context7", body)
         self.assertIn("Parallel", body)
+        self.assertIn("CSL-Laboratories/csl-research", body)
+        self.assertIn("submission record", body)
+        self.assertIn("never to this repo", body)
+        self.assertIn("digest on the Linear issue", body)
         self.assertLess(body.index("<!-- pr-sync:recursion#191 -->"), body.index("Linear-first (CSL-88)"))
         self.assertNotIn("**Flag:**", body)
 

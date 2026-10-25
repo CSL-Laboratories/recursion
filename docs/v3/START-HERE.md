@@ -104,9 +104,18 @@ The current [orientation repair task](../../state/tasks/v3-orientation-20260913.
 separate, source-only gate. A product implementation packet must identify its own gate.
 
 Research and construction are driven from the goals and experiments directly, not through a
-standing swarm. Start at [RESEARCH-AGENDA](RESEARCH-AGENDA.md) for the open questions and
-[experiments/v3/](../../experiments/v3/) for the existing evidence checks. Any future worker
-fleet requires its own reviewed control-plane decision before use.
+standing swarm. Start at [RESEARCH-AGENDA](RESEARCH-AGENDA.md) for the open questions.
+All research output (notes, briefs, findings, source tables, competitor or frontier
+writeups, research registers or indexes) goes to
+[CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research) as
+`submissions/<record_id>/`, through a PR in that repo, with a digest on the Linear
+issue. Never commit research content to this repo; specs, amendments and code only
+link to the vault record (repo, 40-hex commit, path, claim, limitations). If
+csl-research is not accessible, stop and post a blocker on the Linear issue; do not
+fall back to this repo. `docs/v3/research-lane/`, `docs/v3/foundation-research/` and
+`docs/v3/prompts/` are legacy and frozen; [experiments/v3/](../../experiments/v3/)
+holds only runnable product checks. Any future worker fleet requires its own reviewed
+control-plane decision before use.
 
 Deterministic process, deadline, quota and receipt checks should provide continuous
 awareness. Model supervision is advisory and should respond to actionable events.

@@ -15,6 +15,11 @@ issues and PRs.
   @lucassalvador987. This applies to interactive agents and Grok Bot. The GitHub-only
   Claude Code Action fixer has no Linear tooling; it replies on the PR threads, and the
   PR author relays anything it cannot fix to the Linear issue.
+- **Formal GitHub review requests.** Every review ask also needs a formal GitHub
+  review request, not only the Linear @mention above. Use
+  `gh pr edit <n> --add-reviewer samir-shah-ahmed,CDanTheMan` (whichever
+  reviewers apply). Both (a) the Linear @mention and (b) this GitHub request
+  are required. This is mandatory for agents too.
 - **Wait for jobs before human sign-off.** Order: Devin Review runs first, then the
   Claude fixer job (`devin-review-fix`) acts on its findings, then required
   CI reruns on the fixer's push. No human approves or requests changes on a PR until all
@@ -23,8 +28,8 @@ issues and PRs.
   are posted as @mention comments on the CSL Linear issue, and a watcher posts there when
   a PR is ready for review.
 - Autonomously file research findings, ideas and bugs to Triage, deduped.
-- Ground every implementation in the best available research: Parallel search for web
-  research and Context7 for current library docs.
+- Ground every issue and every execution in research before the work; size it to
+  the task. No specific tool is required.
 
 Recursion is a **single product**: the v3 agent harness. This repository builds that
 provider-neutral agent platform; it does not supervise other repositories. This page is

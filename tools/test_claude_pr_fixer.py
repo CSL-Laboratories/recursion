@@ -1393,6 +1393,8 @@ class ConflictJobStructureTests(unittest.TestCase):
         self.assertNotIn("submission record", job)
         self.assertIn("never to this repo", job)
         self.assertIn("digest on the Linear issue", job)
+        self.assertIn("New non-public docs", job)
+        self.assertIn("Existing files stay (CSL-536)", job)
 
     def _prep(self, live: object, pause_var: str | None = None, env_extra: dict | None = None,
               commit: object = None, reviews: object = None, ref: object = None,

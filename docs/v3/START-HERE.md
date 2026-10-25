@@ -109,8 +109,13 @@ All research output (notes, briefs, findings, source tables, competitor or front
 writeups, research registers or indexes) goes to
 [CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research) as
 `submissions/<record_id>/`, through a PR in that repo, with a digest on the Linear
-issue. Never commit research content to this repo; specs, amendments and code only
-link to the vault record (repo, 40-hex commit, path, claim, limitations). If
+issue. Never commit research content to this repo; this repo only links to the
+vault record (repo, 40-hex commit, path, claim, limitations). New non-public docs
+(research, specs, decisions, evidence and receipts, gate artifacts, and runbooks
+that aren't public) go to that vault through a PR there. Existing files stay;
+CSL-536 will move them. The only new docs allowed here are public knowledge-base,
+README, setup and implementation instructions for outside readers, and agent
+instruction files. If
 csl-research is not accessible, stop and post a blocker on the Linear issue; do not
 fall back to this repo. `docs/v3/research-lane/`, `docs/v3/foundation-research/` and
 `docs/v3/prompts/` are legacy and frozen; [experiments/v3/](../../experiments/v3/)

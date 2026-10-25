@@ -44,9 +44,14 @@ issues and PRs.
   frontier writeups, research registers or indexes) goes to
   [CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research)
   as `submissions/<record_id>/`, through a PR in that repo, with a digest on
-  the Linear issue. Never commit research content to this repo; specs,
-  amendments and code only link to the vault record (repo, 40-hex commit, path,
-  claim, limitations). If csl-research is not accessible, stop and post a
+  the Linear issue. Never commit research content to this repo; this repo only
+  links to the vault record (repo, 40-hex commit, path, claim, limitations).
+  New non-public docs (research, specs, decisions, evidence and receipts, gate
+  artifacts, and runbooks that aren't public) go to that vault through a PR
+  there. Existing files stay; CSL-536 will move them. The only new docs
+  allowed here are public knowledge-base, README, setup and implementation
+  instructions for outside readers, and agent instruction files. If
+  csl-research is not accessible, stop and post a
   blocker on the Linear issue; do not fall back to this repo.
   `docs/v3/research-lane/`, `docs/v3/foundation-research/` and
   `docs/v3/prompts/` are legacy and frozen; `experiments/v3/` holds only
@@ -59,8 +64,7 @@ issues and PRs.
   body produced under an admitted issue is published there as part of that
   issue; no separate admission is needed. A research pass on a Linear issue
   is complete only when its record is in csl-research `submissions/` and the
-  PR link is on the issue. This repository takes contracts,
-  specs, fixtures and runbooks only.
+  PR link is on the issue.
 - On a decision or direction issue, the assignee or claimant must post the
   cited brief (options, tradeoffs, recommendation, target metrics) on the
   Linear issue. A Grok Bot coordinator acting for its owner may prepare it,
@@ -124,10 +128,14 @@ before releasing the issue claim. Product repositories only link to the vault
 record (repo, 40-hex commit, path, claim, limitations). All research output
 (notes, briefs, findings, source tables, competitor or frontier writeups,
 research registers or indexes) goes there, through that PR, with a digest on
-the Linear issue. Never commit research content to this repo. If csl-research
+the Linear issue. Never commit research content to this repo. New non-public
+docs (research, specs, decisions, evidence and receipts, gate artifacts, and
+runbooks that aren't public) go there through a PR; this repo only links.
+Existing files stay; CSL-536 will move them. The only new docs allowed here
+are public knowledge-base, README, setup and implementation instructions for
+outside readers, and agent instruction files. If csl-research
 is not accessible, stop and post a blocker on the Linear issue; do not fall
-back to this repo. This repository takes contracts, specs, fixtures and
-runbooks only. `docs/v3/research-lane/`, `docs/v3/foundation-research/` and
+back to this repo. `docs/v3/research-lane/`, `docs/v3/foundation-research/` and
 `docs/v3/prompts/` are legacy and frozen; `experiments/v3/` holds only
 runnable product checks. The vault is evidence storage, not a supervisor or
 decision authority. This section grants that submission write route only; it
@@ -360,9 +368,14 @@ All research output (notes, briefs,
 findings, source tables, competitor or frontier writeups, research registers or
 indexes) goes to [CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research)
 as `submissions/<record_id>/`, through a PR in that repo, with a digest on the
-Linear issue. Never commit research content to this repo; specs, amendments and
-code only link to the vault record (repo, 40-hex commit, path, claim,
-limitations). If csl-research is not accessible, stop and post a blocker on the
+Linear issue. Never commit research content to this repo; this repo only links
+to the vault record (repo, 40-hex commit, path, claim, limitations). New
+non-public docs (research, specs, decisions, evidence and receipts, gate
+artifacts, and runbooks that aren't public) go to that vault through a PR
+there. Existing files stay; CSL-536 will move them. The only new docs allowed
+here are public knowledge-base, README, setup and implementation instructions
+for outside readers, and agent instruction files. If csl-research is not
+accessible, stop and post a blocker on the
 Linear issue; do not fall back to this repo. Follow that repo's README,
 AGENTS.md, templates and `tools/check_submission.py`, and open the vault PR
 before releasing the issue claim. The record carries the sanitized report, its

@@ -125,8 +125,9 @@ LINEAR_FIRST = (
     "(for example Context7) also count. Research bodies go to "
     "CSL-Laboratories/csl-research as a submissions/<record_id>/ record "
     "through a PR there, never to this repo; post a digest on the Linear "
-    "issue. Each run records its tool, its run id and its cost (or unknown "
-    "+ reason) in its csl-research record."
+    "issue. New non-public docs go there through a PR; this repo only "
+    "links. Existing files stay (CSL-536). Each run records its tool, its "
+    "run id and its cost (or unknown + reason) in its csl-research record."
 )
 DEFAULT_LINEAR_REPOS = (
     "CSL-Laboratories/recursion",

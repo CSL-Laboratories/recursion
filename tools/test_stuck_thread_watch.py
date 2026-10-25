@@ -330,6 +330,8 @@ class CapAndBodyTests(unittest.TestCase):
         self.assertNotIn("submission record", body)
         self.assertIn("never to this repo", body)
         self.assertIn("digest on the Linear issue", body)
+        self.assertIn("New non-public docs", body)
+        self.assertIn("Existing files stay (CSL-536)", body)
         self.assertIn("<!-- codex-thread-verdict:PRRT_abc -->", body)
         self.assertIn("CODEX-THREAD: RESOLVE|DECIDE|MISSING|AMBIGUOUS", body)
         self.assertIn("Thread id: `PRRT_abc`", body)

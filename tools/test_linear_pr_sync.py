@@ -164,6 +164,8 @@ class BodyTests(unittest.TestCase):
         self.assertNotIn("submission record", body)
         self.assertIn("never to this repo", body)
         self.assertIn("digest on the Linear issue", body)
+        self.assertIn("New non-public docs", body)
+        self.assertIn("Existing files stay (CSL-536)", body)
         self.assertLess(body.index("<!-- pr-sync:recursion#191 -->"), body.index("Linear-first (CSL-88)"))
         self.assertNotIn("**Flag:**", body)
 

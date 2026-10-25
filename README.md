@@ -24,7 +24,7 @@ Start here:
 
 | Path | What it is |
 |---|---|
-| `docs/v3/` | v3 product specifications (contracts, specs, amendments). Research content lives in [csl-research](https://github.com/CSL-Laboratories/csl-research). |
+| `docs/v3/` | existing v3 product specifications. New non-public docs go to [csl-research](https://github.com/CSL-Laboratories/csl-research); existing files stay (CSL-536). |
 | `experiments/v3/` | runnable product checks only |
 | `schemas/control-plane/v3/` | v3 contract schemas (planning, execution, integrity) |
 | `scripts/v3/` | v3 planning replay and validation |

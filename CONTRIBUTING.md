@@ -15,6 +15,18 @@ issues and PRs.
   @lucassalvador987. This applies to interactive agents and Grok Bot. The GitHub-only
   Claude Code Action fixer has no Linear tooling; it replies on the PR threads, and the
   PR author relays anything it cannot fix to the Linear issue.
+- **Formal GitHub review requests.** Every review ask also needs a formal GitHub
+  review request, not only the Linear @mention above. Use
+  `gh pr edit <n> --add-reviewer samir-shah-ahmed,CDanTheMan` (whichever
+  reviewers apply). PRs that touch protected or CODEOWNED paths also request
+  the code owner (`@NotSkittlz` / Lucas); do not copy the example above and
+  skip him. If the PR author is a requested code owner, skip requesting them:
+  GitHub rejects review requests to the author. Request the other founders
+  (`samir-shah-ahmed`, `CDanTheMan`) for independent review instead. For paths
+  where the author is the sole code owner, note on the Linear issue that no
+  eligible code owner can be requested and that the founders' reviews are
+  independent review, not code-owner review. Both (a) the Linear @mention
+  and (b) this GitHub request are required. This is mandatory for agents too.
 - **Wait for jobs before human sign-off.** Order: Devin Review runs first, then the
   Claude fixer job (`devin-review-fix`) acts on its findings, then required
   CI reruns on the fixer's push. No human approves or requests changes on a PR until all
@@ -23,8 +35,18 @@ issues and PRs.
   are posted as @mention comments on the CSL Linear issue, and a watcher posts there when
   a PR is ready for review.
 - Autonomously file research findings, ideas and bugs to Triage, deduped.
-- Ground every implementation in the best available research: Parallel search for web
-  research and Context7 for current library docs.
+- Ground every issue and every execution in research before the work; size it to
+  the task. No specific tool is required.
+- On a decision or direction issue, the assignee or claimant must post the
+  cited brief (options, tradeoffs, recommendation, target metrics) on the
+  Linear issue. A Grok Bot coordinator acting for its owner may prepare it,
+  attributed exactly as `Grok Bot, preparing research for <owner>`; do not
+  phrase it as the owner personally authored or endorsed the recommendation.
+  Publishing a brief never marks the issue decided, never clears a hold and
+  never authorizes implementation. Only the designated human decision-maker,
+  or an explicitly authorized research team, decides. The developer decides,
+  or @mentions the approver; a coding agent @mentions its developer and does
+  not decide.
 
 Recursion is a **single product**: the v3 agent harness. This repository builds that
 provider-neutral agent platform; it does not supervise other repositories. This page is

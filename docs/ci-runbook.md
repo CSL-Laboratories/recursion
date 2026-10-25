@@ -55,6 +55,7 @@ Linear issue with an @mention; a GitHub mention alone is not enough.
    `claude.yml`'s `devin-review-fix` `repository_dispatch` and the `workflow_dispatch` triggers on
    `conflict-scan.yml` and `ci.yml`. Any other event caused by `GITHUB_TOKEN` (a label,
    `ready_for_review`) creates no run at all, so recover with a human action or an App or PAT identity.
+   Model jobs keep the job-scoped read-only `github_token: ${{ github.token }}` input to the Claude action (Lucas, [CSL-428](https://linear.app/csl-laboratories/issue/CSL-428/cross-lane-admission-tests-remaining-static-check-hardening-from-csl) comment [6a1c049a](https://linear.app/csl-laboratories/issue/CSL-428/cross-lane-admission-tests-remaining-static-check-hardening-from-csl#comment-6a1c049a)); admission tests require every model-job permission value to be `read` and reject any other `secrets.*`.
 3. A run is queued for minutes: check the organization's runner capacity (Team plan: 60 concurrent
    jobs, 5 macOS, shared by every repository and bot workflow in the organization; GitHub docs,
    Actions limits).

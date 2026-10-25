@@ -737,6 +737,16 @@ CROSSLANE_LABEL_WRITE = re.compile(r"""["'](POST|PUT|PATCH)["']|-X\s*["']?(POST|
                                    r"""|--method[\s=]+["']?(POST|PUT|PATCH)\b|method\s*=\s*["'](POST|PUT|PATCH)""")
 CROSSLANE_LABEL_BODY = re.compile(r"""(?:^|[\s"'])(?:--input|-f|-F|--field|--raw-field)\b""")
 CROSSLANE_WRITER_SCOPES = {"contents", "pull-requests", "issues", "id-token"}
+# Named allow-listed exception (Lucas, CSL-428 comment 6a1c049a): the Claude
+# action's job-scoped read-only github.token input. Allowed only while every
+# model-job permission value is `read`. Extra secrets.* are rejected; the
+# action's own CLAUDE_CODE_OAUTH_TOKEN remains the one permitted secrets.* input.
+CROSSLANE_MODEL_GITHUB_TOKEN = "github_token: ${{ github.token }}"
+CROSSLANE_MODEL_GITHUB_TOKEN_LINE = re.compile(r"^[ \t]*github_token:[ \t]*(.*)$", re.MULTILINE)
+CROSSLANE_MODEL_SECRETS = re.compile(
+    r"\$\{\{\s*secrets\.(?!CLAUDE_CODE_OAUTH_TOKEN\b)[A-Z0-9_]+\s*\}\}"
+)
+CROSSLANE_MODEL_PERMS = {"contents": "read", "pull-requests": "read", "issues": "read"}
 
 
 def _crosslane_text(name: str) -> str:
@@ -838,6 +848,28 @@ def _crosslane_without_model_text(block: str) -> str:
             continue
         out.append(line)
     return "\n".join(out)
+
+
+def _crosslane_assert_model_credentials(block: str) -> None:
+    # Values, not only scope names. The named github.token mapping is allowed
+    # only when every permission value is `read`; secrets.GITHUB_TOKEN, a PAT,
+    # or the same mapping on a write-permission job must fail.
+    perms = _crosslane_permissions(block, 4)
+    if not isinstance(perms, dict) or set(perms.values()) - {"read"}:
+        raise AssertionError("model-job permission values must all be read")
+    if perms != CROSSLANE_MODEL_PERMS:
+        raise AssertionError(f"model-job permissions {perms} != {CROSSLANE_MODEL_PERMS}")
+    if CROSSLANE_MODEL_GITHUB_TOKEN not in block:
+        raise AssertionError("model job missing named github.token exception")
+    for value in CROSSLANE_MODEL_GITHUB_TOKEN_LINE.findall(block):
+        if value.strip() != "${{ github.token }}":
+            raise AssertionError(
+                "model github_token is not the named exception "
+                f"{CROSSLANE_MODEL_GITHUB_TOKEN!r}: {value.strip()!r}"
+            )
+    leaked = CROSSLANE_MODEL_SECRETS.search(block)
+    if leaked:
+        raise AssertionError(f"model job maps extra secrets.*: {leaked.group(0)}")
 
 
 def _crosslane_permissions(text: str, indent: int) -> dict[str, str] | str | None:
@@ -1192,10 +1224,10 @@ class CrossLaneAdmissionTests(unittest.TestCase):
                         # Read-only (the split model jobs included): every scope read or none; an absent
                         # block inherits the workflow default.
                         if job in models:
+                            _crosslane_assert_model_credentials(block)
                             self.assertIsInstance(perms, dict)
+                            self.assertEqual(perms, CROSSLANE_MODEL_PERMS)
                             self.assertNotIn("id-token", perms)
-                            for scope in ("pull-requests", "issues"):
-                                self.assertEqual(perms.get(scope), "read")
                         if isinstance(perms, dict):
                             self.assertLessEqual(set(perms.values()), {"read", "none"})
                         else:
@@ -1230,6 +1262,22 @@ class CrossLaneAdmissionTests(unittest.TestCase):
         before_push = publisher.split("def publish(", 1)[1].split("push_candidate(repo, config, candidate, token)\n", 1)[0]
         self.assertGreaterEqual(before_push.count("live_head(config, env, read, {config[\"base\"]})"), 2)
         self.assertLess(before_push.rindex("live_head("), before_push.rindex("token = deps[\"mint\"](env)"))
+
+    def test_model_jobs_keep_named_github_token_exception(self) -> None:
+        # Positive: live model jobs keep the exact Claude-action input under all-read
+        # permissions and carry no extra secrets.* (Lucas, CSL-428 comment 6a1c049a).
+        for name, model_jobs in CROSSLANE_MODEL_JOBS.items():
+            blocks = _crosslane_jobs(name)
+            for job in model_jobs:
+                with self.subTest(workflow=name, job=job):
+                    block = blocks[job]
+                    _crosslane_assert_model_credentials(block)
+                    self.assertIn(CROSSLANE_MODEL_GITHUB_TOKEN, block)
+                    self.assertEqual(
+                        [value.strip() for value in CROSSLANE_MODEL_GITHUB_TOKEN_LINE.findall(block)],
+                        ["${{ github.token }}"] * block.count(CROSSLANE_MODEL_GITHUB_TOKEN),
+                    )
+                    self.assertIsNone(CROSSLANE_MODEL_SECRETS.search(block))
 
     def test_retries_are_bounded_and_pausable(self) -> None:
         blocks = _crosslane_jobs("claude.yml")
@@ -1378,6 +1426,36 @@ class CrossLaneMutationTests(unittest.TestCase):
         with _mutated_workflow("claude.yml", mutate):
             with self.assertRaises(AssertionError):
                 CrossLaneAdmissionTests().test_shell_grants_are_reviewed_and_the_one_push_is_exact()
+
+    def test_mutation_model_secrets_github_token_is_rejected(self) -> None:
+        mutate = lambda text: _replace_in_job(
+            text, "claude-mention",
+            "github_token: ${{ github.token }}",
+            "github_token: ${{ secrets.GITHUB_TOKEN }}",
+        )
+        with _mutated_workflow("claude.yml", mutate):
+            with self.assertRaises(AssertionError):
+                CrossLaneAdmissionTests().test_model_jobs_keep_named_github_token_exception()
+
+    def test_mutation_model_pat_secret_is_rejected(self) -> None:
+        mutate = lambda text: _replace_in_job(
+            text, "claude-mention",
+            "GH_TOKEN: ${{ github.token }}",
+            "GH_TOKEN: ${{ secrets.MY_PAT }}",
+        )
+        with _mutated_workflow("claude.yml", mutate):
+            with self.assertRaises(AssertionError):
+                CrossLaneAdmissionTests().test_model_jobs_keep_named_github_token_exception()
+
+    def test_mutation_model_github_token_on_write_job_is_rejected(self) -> None:
+        mutate = lambda text: _replace_in_job(
+            text, "claude-mention", "      pull-requests: read", "      pull-requests: write",
+        )
+        with _mutated_workflow("claude.yml", mutate):
+            block = _crosslane_jobs("claude.yml")["claude-mention"]
+            self.assertIn(CROSSLANE_MODEL_GITHUB_TOKEN, block)
+            with self.assertRaises(AssertionError):
+                _crosslane_assert_model_credentials(block)
 
     def test_mutation_unreviewed_action_is_rejected(self) -> None:
         step = "      - name: mutated-csl-428\n        uses: evil/publisher@v1\n"

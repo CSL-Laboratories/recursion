@@ -19,6 +19,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -667,13 +668,62 @@ CROSSLANE_SAFE_BASH = {
     "Bash(python -X utf8 -B tools/test_claude_pr_fixer.py)", "Bash(python3 -X utf8 -B tools/test_claude_pr_fixer.py)",
 }
 CROSSLANE_PUSH = re.compile(r"^Bash\(git push origin HEAD:refs/heads/\$\{\{ (steps\.(live|cap)\.outputs\.head_ref|matrix\.pr\.head_ref) \}\}\)$")
-# A shell push: `git`, any global options (`-C dir`, `-c k=v`, `--opt[=v]`), then `push`, across
-# backslash continuations.
-CROSSLANE_SHELL_PUSH = re.compile(r"\bgit(?:(?:\s|\\\n)+(?:-[Cc](?:\s|\\\n)+\S+|--?[A-Za-z][\w-]*(?:=\S+)?))*(?:\s|\\\n)+push\b")
-# An argv push: a quoted `push` element opening a list or tuple or following a comma, so
-# `["git", "-C", repo, "push"]`, `run_git(["-C", repo, "push"])`, `[*prefix, "push"]` and
-# `prefix + ["push"]` all count. Escaped quotes (YAML-embedded Python in a shell string) match too.
-CROSSLANE_ARGV_PUSH = re.compile(r"""[\[(,]\s*\\?["']push\\?["']""")
+# Per writer job: the exact concurrency.group expression. Comment events have no `inputs`, so
+# `claude-mention` must keep `needs.resolve-pr.outputs.pr_number` (GitHub workflow syntax,
+# jobs.<job_id>.concurrency).
+CROSSLANE_LOCK_GROUPS = {
+    **{( "claude.yml", job): "claude-${{ needs.resolve-pr.outputs.pr_number }}"
+       for job in ("mention-prepare", "claude-mention", "mention-publish",
+                   "fixer-prepare", "devin-review-fix", "fixer-publish")},
+    **{("claude-conflict-writer.yml", job): "claude-${{ inputs.pr_number }}"
+       for job in ("prepare", "model", "publish")},
+}
+CROSSLANE_HANDOFF_VALUE = "needs-decision"
+CROSSLANE_CI_LABELS = frozenset({"ci:full", "enhancement"})
+CROSSLANE_WRITER_MARKERS = r"anthropics/claude-code|ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN"
+# SHA-pinned Claude Code action currently used by the split model jobs.
+CROSSLANE_CLAUDE_ACTION = "anthropics/claude-code-action@a5a423f75c251dcbff8a74e99f83b2cb03c72bfa"
+# `uses:` allow-list per role. A new local or third-party action in a non-publish job could
+# push without appearing in `run:` text (CSL-428 / Codex 4334684816 analogue).
+CROSSLANE_ALLOWED_USES = {
+    "model": frozenset({
+        "actions/checkout@v4",
+        CROSSLANE_CLAUDE_ACTION,
+        "actions/upload-artifact@v4",
+    }),
+    "publish": frozenset({"actions/download-artifact@v4"}),
+    "prepare": frozenset(),
+    "caller": frozenset({"./.github/workflows/claude-conflict-writer.yml"}),
+    "other": frozenset({"actions/checkout@v4"}),
+}
+# A shell push: `git`, global options, then `push`, across backslash continuations.
+# Value-taking git(1) options (`-C`, `-c`, `--git-dir`, `--work-tree`, `--namespace`,
+# `--config-env`, `--exec-path`) consume the next token when written without `=`.
+CROSSLANE_SHELL_PUSH = re.compile(
+    r"\bgit(?:(?:\s|\\\n)+(?:"
+    r"-[Cc](?:\s|\\\n)+\S+"
+    r"|--(?:git-dir|work-tree|namespace|config-env|exec-path)(?:=\S+|(?:\s|\\\n)+\S+)"
+    r"|--?[A-Za-z][\w-]*(?:=\S+)?"
+    r"))*(?:\s|\\\n)+push\b"
+)
+# An argv push: a quoted `push` element opening a list or following a comma, or a tuple that
+# is not a function call (`print("push")` is excluded). Escaped quotes match too.
+CROSSLANE_ARGV_PUSH = re.compile(
+    r"""(?:\[|,|(?<![A-Za-z0-9_])\()\s*\\?["']push\\?["']"""
+    r"""(?=\s*(?:[\]\)]|,\s*\\?["'](?:-q|--no-verify|origin|HEAD|refs/)))"""
+)
+CROSSLANE_JOB_KEY = re.compile(
+    r"""^  (?:"([A-Za-z_][\w-]*)"|'([A-Za-z_][\w-]*)'|([A-Za-z_][\w-]*)):(?:\s+#.*)?$"""
+)
+CROSSLANE_GRAPHQL_LABEL = re.compile(
+    r"addLabelsToLabelable|removeLabelsFromLabelable|clearLabelsFromLabelable|"
+    r"updateLabelsForLabelable",
+    re.IGNORECASE,
+)
+CROSSLANE_HANDOFF_CONST = re.compile(
+    r"(?m)^[ \t]*(?:HANDOFF_LABEL|MODEL_API_LABEL)[ \t]*[=:][ \t]*(?:[\"']([^\"']*)[\"']|(\S+))"
+)
+CROSSLANE_LABEL_ARRAY = re.compile(r'"labels"\s*:\s*\[(.*?)\]', re.DOTALL)
 # Any push command or git argv in a job once the model's `prompt` and `claude_args` (its prose and
 # tool grants, which execute nothing themselves) are removed.
 CROSSLANE_STEP_PUSH = re.compile(f"{CROSSLANE_SHELL_PUSH.pattern}|{CROSSLANE_ARGV_PUSH.pattern}")
@@ -699,9 +749,14 @@ def _crosslane_jobs(name: str) -> dict[str, str]:
     out: dict[str, list[str]] = {}
     current = None
     for line in lines[start + 1:]:
-        match = re.fullmatch(r"  ([A-Za-z0-9_-]+):", line)
-        if match:
-            current = match.group(1)
+        at_job_indent = line.startswith("  ") and not line.startswith("    ")
+        if at_job_indent and line.strip() and not line.strip().startswith("#"):
+            match = CROSSLANE_JOB_KEY.fullmatch(line)
+            if not match:
+                raise AssertionError(f"{name}: unrecognized entry at job-key indentation: {line!r}")
+            current = next(group for group in match.groups() if group)
+            if current in out:
+                raise AssertionError(f"{name}: duplicate job id {current!r}")
             out[current] = []
         elif current is not None:
             out[current].append(line)
@@ -712,8 +767,56 @@ def _crosslane_jobs(name: str) -> dict[str, str]:
     return {key: "\n".join(value) for key, value in out.items()}
 
 
+def _crosslane_callees_of(text: str) -> set[str]:
+    return set(re.findall(r"^\s*uses: *\./\.github/workflows/([A-Za-z0-9_.-]+)\s*$", text, re.MULTILINE))
+
+
 def _crosslane_callees(name: str) -> set[str]:
-    return set(re.findall(r"^\s*uses: *\./\.github/workflows/([A-Za-z0-9_.-]+)\s*$", _crosslane_text(name), re.MULTILINE))
+    return _crosslane_callees_of(_crosslane_text(name))
+
+
+def _crosslane_workflow_texts() -> dict[str, str]:
+    return {path.name: path.read_text(encoding="utf-8") for path in CROSSLANE_WORKFLOWS.glob("*.y*ml")}
+
+
+def _crosslane_discovered_writers(texts: dict[str, str] | None = None) -> set[str]:
+    # Marker files, their reusable-workflow callees, and any caller of a discovered writer
+    # (even a caller with only `secrets: inherit` and no marker strings).
+    texts = _crosslane_workflow_texts() if texts is None else texts
+    found = {name for name, body in texts.items() if re.search(CROSSLANE_WRITER_MARKERS, body)}
+    while True:
+        extra: set[str] = set()
+        for name, body in texts.items():
+            callees = _crosslane_callees_of(body)
+            if name in found:
+                extra |= callees
+            elif callees & found:
+                extra.add(name)
+        extra -= found
+        if not extra:
+            return found
+        found |= extra
+
+
+def _crosslane_uses(block: str) -> list[str]:
+    out = []
+    for match in re.finditer(r"^[ \t]*uses:[ \t]*(\S.*?)$", block, re.MULTILINE):
+        value = match.group(1).split("#", 1)[0].strip().strip("'\"")
+        if value:
+            out.append(value)
+    return out
+
+
+def _crosslane_role(name: str, job: str) -> str:
+    if job in CROSSLANE_MODEL_JOBS.get(name, ()):
+        return "model"
+    if job in CROSSLANE_PUBLISH_JOBS.get(name, ()):
+        return "publish"
+    if job in CROSSLANE_PREPARE_JOBS.get(name, ()):
+        return "prepare"
+    if (name, job) in CROSSLANE_CALLERS:
+        return "caller"
+    return "other"
 
 
 def _crosslane_value(block: str, key: str) -> str | None:
@@ -813,42 +916,97 @@ def _crosslane_publisher_thin_call(block: str) -> None:
         raise AssertionError("a publish job must not load the publisher from github.sha or the workspace")
 
 
+def _crosslane_widen(text: str, pos: int) -> tuple[int, int]:
+    start, end = _crosslane_shell_command(text, pos, pos + 1)
+    call = _crosslane_bracket(text, pos, "(")
+    if call:
+        start, end = min(start, call[0]), max(end, call[1])
+    return start, end
+
+
+def _crosslane_argv_is_git_push(fragment: str) -> bool:
+    # Keep git argv (`["git", ..., "push"]`, `["push", "-q", ...]`) and drop word lists
+    # such as `["push", "pull"]`.
+    if re.search(r"""\bgit\b|["']git["']""", fragment):
+        return True
+    return re.search(
+        r"""["']push["']\s*,\s*\\?["'](?:-q|--no-verify|origin|HEAD|refs/)""",
+        fragment,
+    ) is not None
+
+
 def _crosslane_push_commands(text: str) -> list[str]:
     # Each push as a whole command: a shell line plus its continuations, or an argv list from `[`/`(`
     # to the matching close.
     text = CROSSLANE_WORD_LIST.sub("", text)
     commands = [text[slice(*_crosslane_shell_command(text, m.start(), m.end()))] for m in CROSSLANE_SHELL_PUSH.finditer(text)]
     for match in CROSSLANE_ARGV_PUSH.finditer(text):
-        if text[match.start()] in "[(":
-            span = _crosslane_bracket(text, match.start() + 1, "[(")
+        opener = match.start()
+        while opener < match.end() and text[opener] not in "[(,":
+            opener += 1
+        if text[opener] in "[(":
+            span = _crosslane_bracket(text, opener + 1, "[(")
         else:
-            span = _crosslane_bracket(text, match.start(), "[(")
-        commands.append(text[slice(*span)] if span else text[slice(*_crosslane_shell_command(text, match.start(), match.end()))])
+            span = _crosslane_bracket(text, opener, "[(")
+        fragment = text[slice(*span)] if span else text[slice(*_crosslane_shell_command(text, match.start(), match.end()))]
+        if _crosslane_argv_is_git_push(fragment):
+            commands.append(fragment)
     return commands
 
 
+def _crosslane_payload_labels(command: str) -> list[str]:
+    labels: list[str] = []
+    for inner in CROSSLANE_LABEL_ARRAY.findall(command):
+        labels.extend(re.findall(r'"([^"]+)"', inner))
+        if re.search(r"\bHANDOFF_LABEL\b", inner):
+            labels.append("HANDOFF_LABEL")
+    return labels
+
+
+def _crosslane_handoff_constants(text: str) -> list[str]:
+    values = []
+    for quoted, bare in CROSSLANE_HANDOFF_CONST.findall(text):
+        if quoted or not bare:
+            values.append(quoted)
+        else:
+            values.append(bare.split("#", 1)[0].strip().strip("'\""))
+    return values
+
+
 def _crosslane_label_commands(text: str) -> list[str]:
-    # Each command or call naming `/labels`: its shell line plus continuations, joined with the
-    # enclosing call expression when there is one.
-    out = []
+    # Label writes: `/labels` REST paths, GraphQL label mutations, and issue PATCH/PUT
+    # bodies that set `labels` (GitHub REST: PATCH /issues/{n} replaces the label set).
+    spans: list[tuple[int, int]] = []
     for match in re.finditer(r"/labels\b", text):
-        start, end = _crosslane_shell_command(text, match.start(), match.end())
-        call = _crosslane_bracket(text, match.start(), "(")
-        if call:
-            start, end = min(start, call[0]), max(end, call[1])
-        out.append(text[start:end])
+        spans.append(_crosslane_widen(text, match.start()))
+    for match in CROSSLANE_GRAPHQL_LABEL.finditer(text):
+        spans.append(_crosslane_widen(text, match.start()))
+    for match in CROSSLANE_LABEL_ARRAY.finditer(text):
+        spans.append(_crosslane_widen(text, match.start()))
+    for match in re.finditer(r"issues/([^/\s\"']+)", text):
+        if match.group(1) in {"comments", "events"}:
+            continue
+        rest = text[match.end(): match.end() + 16]
+        if rest.startswith("/comments") or rest.startswith("/events"):
+            continue
+        start, end = _crosslane_widen(text, match.start())
+        command = text[start:end]
+        if "/labels" in command or CROSSLANE_LABEL_ARRAY.search(command) or "labels[]=" in command:
+            spans.append((start, end))
+    seen: set[tuple[int, int]] = set()
+    out = []
+    for span in spans:
+        if span in seen:
+            continue
+        seen.add(span)
+        out.append(text[slice(*span)])
     return out
 
 
 class CrossLaneAdmissionTests(unittest.TestCase):
     def test_writer_workflow_and_job_sets_are_complete(self) -> None:
         # A new Claude workflow or job must be added here (and to the contract) before it can merge.
-        found = {p.name for p in CROSSLANE_WORKFLOWS.glob("*.y*ml")
-                 if re.search(r"anthropics/claude-code|ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN",
-                              p.read_text(encoding="utf-8"))}
-        # A local reusable workflow a writer calls is a writer file too, with or without the markers.
-        while callees := {c for name in found for c in _crosslane_callees(name)} - found:
-            found |= callees
+        found = _crosslane_discovered_writers()
         self.assertEqual(found, set(CROSSLANE_WRITER_FILES))
         self.assertEqual(set(CROSSLANE_ALL_JOBS), set(CROSSLANE_WRITER_FILES))
         for name, expected in CROSSLANE_ALL_JOBS.items():
@@ -870,8 +1028,9 @@ class CrossLaneAdmissionTests(unittest.TestCase):
             with self.subTest(workflow=name):
                 self.assertNotRegex(body, r"--add-label|gh pr edit|labels\[\]=")
                 self.assertNotRegex(body, r'"labels":\s*\[\s*"(ci:full|enhancement)"')
-                # Every label write (the whole call or shell command naming `/labels`) is the handoff
-                # label; ci:full is only ever removed (DELETE of a gate-owned label event).
+                # Every label write (REST `/labels`, issue PATCH with a `labels` body, or GraphQL
+                # addLabelsToLabelable) is the handoff label; ci:full is only ever removed
+                # (DELETE of a gate-owned label event). The complete label set is checked.
                 commands = _crosslane_label_commands(body)
                 # The label paths live in the receipts embed and the checked-in publisher; a workflow
                 # without them (the scan caller since Port C) names no `/labels` endpoint at all.
@@ -880,11 +1039,22 @@ class CrossLaneAdmissionTests(unittest.TestCase):
                 else:
                     self.assertEqual(commands, [])
                 for command in commands:
+                    if CROSSLANE_GRAPHQL_LABEL.search(command):
+                        raise AssertionError("GraphQL label mutations are not a permitted handoff")
+                    labels = _crosslane_payload_labels(command)
+                    if labels and "DELETE" not in command:
+                        self.assertLessEqual(set(labels), {CROSSLANE_HANDOFF_VALUE, "HANDOFF_LABEL"})
+                        self.assertTrue(labels)
+                    if any(label in CROSSLANE_CI_LABELS for label in labels) and "DELETE" not in command:
+                        raise AssertionError(f"CI label in write payload: {labels}")
                     if CROSSLANE_LABEL_WRITE.search(command) or (
                             CROSSLANE_LABEL_BODY.search(command) and "DELETE" not in command):
                         self.assertIn("HANDOFF_LABEL", command)
                         self.assertNotIn("ci:full", command)
-                self.assertTrue(set(re.findall(r'HANDOFF_LABEL = "([^"]+)"', body)) <= {"needs-decision"})
+                if re.search(r"HANDOFF_LABEL|MODEL_API_LABEL", body):
+                    values = _crosslane_handoff_constants(body)
+                    self.assertTrue(values, "handoff-label constant must exist")
+                    self.assertEqual(set(values), {CROSSLANE_HANDOFF_VALUE})
 
     def test_writer_workflows_use_github_hosted_runners_only(self) -> None:
         for name in CROSSLANE_WRITER_FILES:
@@ -923,7 +1093,7 @@ class CrossLaneAdmissionTests(unittest.TestCase):
                     conc = re.search(r"^    concurrency:\n((?:      .*\n?)+)", blocks[job], re.MULTILINE)
                     self.assertIsNotNone(conc)
                     settings = dict(re.findall(r"^      ([a-z-]+): *(.*)$", conc.group(1), re.MULTILINE))
-                    self.assertRegex(settings["group"], r"^claude-\$\{\{ (needs\.resolve-pr\.outputs\.pr_number|matrix\.pr\.number|inputs\.pr_number) \}\}$")
+                    self.assertEqual(settings["group"], CROSSLANE_LOCK_GROUPS[(name, job)])
                     self.assertEqual(settings["cancel-in-progress"], "false")
                     self.assertEqual(settings["queue"], "max")
 
@@ -1024,10 +1194,18 @@ class CrossLaneAdmissionTests(unittest.TestCase):
                         if job in models:
                             self.assertIsInstance(perms, dict)
                             self.assertNotIn("id-token", perms)
+                            for scope in ("pull-requests", "issues"):
+                                self.assertEqual(perms.get(scope), "read")
                         if isinstance(perms, dict):
                             self.assertLessEqual(set(perms.values()), {"read", "none"})
                         else:
                             self.assertIn(perms, (None, "read-all", "{}"))
+                with self.subTest(workflow=name, job=job, check="uses allow-list"):
+                    # Prep/model/other jobs must not publish through an unreviewed action.
+                    role = _crosslane_role(name, job)
+                    allowed = CROSSLANE_ALLOWED_USES[role]
+                    for used in _crosslane_uses(block):
+                        self.assertIn(used, allowed, f"{name}/{job} {role} uses {used}")
                 with self.subTest(workflow=name, job=job, check="no force push"):
                     commands = _crosslane_push_commands(_crosslane_granted(block))
                     if job in push_models:
@@ -1099,6 +1277,133 @@ class CrossLaneAdmissionTests(unittest.TestCase):
         self.assertIn('with state_path.open("x", encoding="utf-8") as handle:', publisher)
         _crosslane_publisher_thin_call(writer["publish"])
         self.assertNotRegex(_crosslane_text("claude-conflict-writer.yml"), r"MAX_ATTEMPTS = (?!3\b)")
+
+
+def _mutated_workflow(name: str, mutate):
+    module = sys.modules[__name__]
+    original = module._crosslane_text
+
+    def wrapped(n: str) -> str:
+        text = original(n)
+        return mutate(text) if n == name else text
+
+    return mock.patch.object(module, "_crosslane_text", wrapped)
+
+
+def _job_span(text: str, job: str) -> tuple[int, int]:
+    key = f"  {job}:"
+    start = text.index("\n" + key) + 1
+    rest = text[start + len(key):]
+    nxt = re.search(r"^  \S", rest, re.MULTILINE)
+    end = start + len(key) + (nxt.start() if nxt else len(rest))
+    return start, end
+
+
+def _append_job_step(text: str, job: str, run: str) -> str:
+    start, end = _job_span(text, job)
+    step = f"      - name: mutated-csl-428\n        run: |\n          {run}\n"
+    return text[:end] + step + text[end:]
+
+
+def _replace_in_job(text: str, job: str, old: str, new: str) -> str:
+    start, end = _job_span(text, job)
+    block = text[start:end]
+    if old not in block:
+        raise AssertionError(f"{job} does not contain {old!r}")
+    return text[:start] + block.replace(old, new, 1) + text[end:]
+
+
+class CrossLaneMutationTests(unittest.TestCase):
+    """Each CSL-428 gap: the mutated workflow fails the admission check after the fix."""
+
+    def test_mutation_wrong_lock_group_on_mention_is_rejected(self) -> None:
+        mutate = lambda text: _replace_in_job(
+            text, "claude-mention",
+            "group: claude-${{ needs.resolve-pr.outputs.pr_number }}",
+            "group: claude-${{ inputs.pr_number }}",
+        )
+        with _mutated_workflow("claude.yml", mutate):
+            with self.assertRaises(AssertionError):
+                CrossLaneAdmissionTests().test_writers_share_one_per_pr_lock_without_cancellation()
+
+    def test_mutation_issue_patch_label_set_is_rejected(self) -> None:
+        payload = """gh api --method PATCH repos/$REPO/issues/$PR_NUMBER --input - <<< '{"labels":["needs-decision","ci:full"]}'"""
+        with _mutated_workflow("claude.yml", lambda text: _append_job_step(text, "mention-prepare", payload)):
+            with self.assertRaises(AssertionError):
+                CrossLaneAdmissionTests().test_writers_never_add_ci_labels()
+
+    def test_mutation_handoff_constant_wrong_quotes_is_rejected(self) -> None:
+        mutate = lambda text: text.replace(
+            'HANDOFF_LABEL = "needs-decision"',
+            "HANDOFF_LABEL = 'ci:full'",
+            1,
+        )
+        with _mutated_workflow("claude.yml", mutate):
+            with self.assertRaises(AssertionError):
+                CrossLaneAdmissionTests().test_writers_never_add_ci_labels()
+
+    def test_mutation_graphql_label_add_is_rejected(self) -> None:
+        command = (
+            "gh api graphql -f query='mutation { addLabelsToLabelable(input: "
+            "{labelableId: \"X\", labelIds: [\"Y\"]}) { clientMutationId } }'"
+        )
+        with _mutated_workflow("claude.yml", lambda text: _append_job_step(text, "mention-prepare", command)):
+            with self.assertRaises(AssertionError):
+                CrossLaneAdmissionTests().test_writers_never_add_ci_labels()
+
+    def test_mutation_quoted_job_key_is_rejected(self) -> None:
+        extra = '\n  "extra-job":\n    runs-on: self-hosted\n'
+        with _mutated_workflow("claude.yml", lambda text: text + extra):
+            with self.assertRaises(AssertionError):
+                CrossLaneAdmissionTests().test_writer_workflow_and_job_sets_are_complete()
+
+    def test_mutation_git_dir_push_is_rejected(self) -> None:
+        command = 'git --git-dir "$GITHUB_WORKSPACE/.git" push origin HEAD:refs/heads/evil'
+        with _mutated_workflow("claude.yml", lambda text: _append_job_step(text, "mention-prepare", command)):
+            with self.assertRaises(AssertionError):
+                CrossLaneAdmissionTests().test_shell_grants_are_reviewed_and_the_one_push_is_exact()
+
+    def test_mutation_print_push_is_not_a_false_positive(self) -> None:
+        with _mutated_workflow("claude.yml", lambda text: _append_job_step(text, "mention-prepare", 'print("push")')):
+            CrossLaneAdmissionTests().test_shell_grants_are_reviewed_and_the_one_push_is_exact()
+
+    def test_mutation_push_pull_word_list_is_not_a_false_positive(self) -> None:
+        with _mutated_workflow("claude.yml", lambda text: _append_job_step(text, "mention-prepare", 'words = ["push", "pull"]')):
+            CrossLaneAdmissionTests().test_shell_grants_are_reviewed_and_the_one_push_is_exact()
+
+    def test_mutation_model_pull_requests_write_is_rejected(self) -> None:
+        mutate = lambda text: _replace_in_job(
+            text, "claude-mention", "      pull-requests: read", "      pull-requests: write",
+        )
+        with _mutated_workflow("claude.yml", mutate):
+            with self.assertRaises(AssertionError):
+                CrossLaneAdmissionTests().test_shell_grants_are_reviewed_and_the_one_push_is_exact()
+
+    def test_mutation_unreviewed_action_is_rejected(self) -> None:
+        step = "      - name: mutated-csl-428\n        uses: evil/publisher@v1\n"
+
+        def mutate(text: str) -> str:
+            start, end = _job_span(text, "mention-prepare")
+            return text[:end] + step + text[end:]
+
+        with _mutated_workflow("claude.yml", mutate):
+            with self.assertRaises(AssertionError):
+                CrossLaneAdmissionTests().test_shell_grants_are_reviewed_and_the_one_push_is_exact()
+
+    def test_mutation_yaml_handoff_constant_is_rejected(self) -> None:
+        with _mutated_workflow("claude.yml", lambda text: text + "\nMODEL_API_LABEL: ci:full\n"):
+            with self.assertRaises(AssertionError):
+                CrossLaneAdmissionTests().test_writers_never_add_ci_labels()
+
+    def test_mutation_unmarked_writer_caller_is_discovered(self) -> None:
+        texts = _crosslane_workflow_texts()
+        texts["sneaky-caller.yml"] = (
+            "jobs:\n  x:\n    uses: ./.github/workflows/claude-conflict-writer.yml\n"
+            "    secrets: inherit\n"
+        )
+        self.assertIn("sneaky-caller.yml", _crosslane_discovered_writers(texts))
+        self.assertNotEqual(_crosslane_discovered_writers(texts), set(CROSSLANE_WRITER_FILES))
+
 
 if __name__ == "__main__":
     unittest.main()

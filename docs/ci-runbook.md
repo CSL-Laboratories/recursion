@@ -50,8 +50,11 @@ Linear issue with an @mention; a GitHub mention alone is not enough.
 2. Actions tab shows **"Approve workflows to run"**: usually a fork PR under the external-contributor
    approval setting (E17); a writer reviews the fork diff, then approves. A `pull_request` opened,
    synchronized or reopened by a `GITHUB_TOKEN` automation also waits for approval (contract §7,
-   gap 16). Any other event caused by `GITHUB_TOKEN` (a label, `ready_for_review`) creates no run at
-   all, so recover with a human action or an App or PAT identity (GitHub docs, triggering a workflow).
+   gap 16). `workflow_dispatch` and `repository_dispatch` are the documented exceptions: they always
+   create a run even when the caller uses `GITHUB_TOKEN` (GitHub docs, triggering a workflow), including
+   `claude.yml`'s `devin-review-fix` `repository_dispatch` and the `workflow_dispatch` triggers on
+   `conflict-scan.yml` and `ci.yml`. Any other event caused by `GITHUB_TOKEN` (a label,
+   `ready_for_review`) creates no run at all, so recover with a human action or an App or PAT identity.
 3. A run is queued for minutes: check the organization's runner capacity (Team plan: 60 concurrent
    jobs, 5 macOS, shared by every repository and bot workflow in the organization; GitHub docs,
    Actions limits).

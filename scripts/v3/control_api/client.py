@@ -6,13 +6,25 @@ import http.client
 import json
 import os
 import stat
-from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from scripts.v3.control_api import errors as err
 from scripts.v3.control_api.http_server import LOOPBACK_HOSTS
 
 TOKEN_FILE_MODE_MASK = 0o077
+_PLAIN_ERROR_CODES = {
+    "body_too_large": err.TOO_LARGE,
+    "too_many_connections": err.BUSY,
+    "host_denied": err.FORBIDDEN,
+    "origin_denied": err.FORBIDDEN,
+    "unsupported_media_type": err.INVALID_REQUEST,
+    "length_required": err.INVALID_REQUEST,
+    "bad_length": err.INVALID_REQUEST,
+    "bad_query": err.INVALID_PARAMS,
+    "not_found": err.METHOD_NOT_FOUND,
+    "method_not_allowed": err.INVALID_REQUEST,
+}
 
 
 class TokenFileRefused(ValueError):
@@ -28,18 +40,32 @@ class ControlRpcError(Exception):
 
 
 def read_token_file(path: str | os.PathLike[str]) -> str:
-    """Read a bearer token. Refuses links and group- or world-accessible files."""
+    """Read a bearer token. Refuses links and group- or world-accessible files.
 
-    target = Path(path)
+    The file is opened with ``O_NOFOLLOW`` (when available) and checked via
+    ``fstat`` on that descriptor so a swap after ``lstat`` cannot redirect the
+    read.
+    """
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
     try:
-        info = target.lstat()
+        descriptor = os.open(os.fspath(path), flags)
     except OSError:
         raise TokenFileRefused("token_file_missing") from None
-    if not stat.S_ISREG(info.st_mode):
-        raise TokenFileRefused("token_file_not_regular")
-    if os.name != "nt" and info.st_mode & TOKEN_FILE_MODE_MASK:
-        raise TokenFileRefused("token_file_mode")
-    return target.read_text(encoding="utf-8").strip()
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise TokenFileRefused("token_file_not_regular")
+        if os.name != "nt" and info.st_mode & TOKEN_FILE_MODE_MASK:
+            raise TokenFileRefused("token_file_mode")
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            descriptor = -1
+            return handle.read().strip()
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def write_token_file(path: str | os.PathLike[str], token: str) -> None:
@@ -93,7 +119,7 @@ class ControlClient:
         status, response = self.exchange(method, params)
         error = response.get("error")
         if error is not None:
-            raise ControlRpcError(error["code"], error["message"], error.get("data"))
+            raise _rpc_error(error)
         return response["result"]
 
     def poll(self, after: int = 0, *, limit: int = 100, wait_s: float = 0.0) -> dict[str, Any]:
@@ -101,6 +127,20 @@ class ControlClient:
         status, _, raw = self.request("GET", f"/v1/events?{query}")
         response = json.loads(raw.decode("utf-8"))
         if "error" in response:
-            error = response["error"]
-            raise ControlRpcError(error["code"], error["message"], error.get("data"))
+            raise _rpc_error(response["error"])
         return response["result"]
+
+
+def _rpc_error(error: Any) -> ControlRpcError:
+    if isinstance(error, str):
+        return ControlRpcError(_PLAIN_ERROR_CODES.get(error, err.INVALID_REQUEST), error, None)
+    if not isinstance(error, dict):
+        return ControlRpcError(err.INTERNAL_ERROR, "internal_error", None)
+    message = error.get("message")
+    if not isinstance(message, str):
+        message = "internal_error"
+    code = error.get("code")
+    if not isinstance(code, int):
+        code = _PLAIN_ERROR_CODES.get(message, err.INTERNAL_ERROR)
+    data = error.get("data")
+    return ControlRpcError(code, message, data if isinstance(data, dict) else None)

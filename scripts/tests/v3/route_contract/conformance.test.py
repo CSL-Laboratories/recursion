@@ -897,6 +897,22 @@ class ReviewFixTests(unittest.TestCase):
         self.assertIsNone(result.validated)
         assert_valid(self, "RouteExecutionResult", result.to_record(request))
 
+    def test_short_overflow_is_killed_without_waiting_for_a_full_chunk(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        helper = Path(tmp.name) / "short.py"
+        helper.write_text(
+            "import sys, time\nsys.stdout.buffer.write(b'x' * 101)\nsys.stdout.buffer.flush()\ntime.sleep(30)\n",
+            encoding="utf-8",
+        )
+        started = time.monotonic()
+        result = SubprocessTransport().run(
+            [sys.executable, str(helper)], "", 2.0, None, max_output_bytes=100
+        )
+        self.assertTrue(result.oversized)
+        self.assertFalse(result.timed_out)
+        self.assertLess(time.monotonic() - started, 1.5)
+
     def test_transport_enforces_the_byte_cap_and_reaps(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)

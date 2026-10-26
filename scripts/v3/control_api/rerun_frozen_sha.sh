@@ -14,15 +14,14 @@
 #                        record python -m scripts.v3.control_api.record --check
 #                        scope  python tools/check_public_scope.py
 #
-# No provider or credential is used. The clone must already contain the
-# candidate and the delegated-Q base; a missing object is a hard error so the
-# gate cannot contact origin. Linux only for a real run: the recorded evidence
-# for the Nov 11 demo is the Linux run. Default --out is a temp directory
-# outside the invoking checkout.
+# No provider or credential is used. Linux only for a real run: the recorded
+# evidence for the Nov 11 demo is the Linux run. The clone must already contain
+# the candidate and the delegated-Q base ``0c908f6833e715af0eaa01b6f6788120eb577efd``
+# (``tools/ci_gate.py`` otherwise fetches it). This script does not fetch.
 set -euo pipefail
 
 ALL_STEPS="gate,record,scope"
-DQ_BASE="0c908f6833e715af0eaa01b6f6788120eb577efd"
+DQ_TASK_BASE="0c908f6833e715af0eaa01b6f6788120eb577efd"
 sha="" out="" steps="$ALL_STEPS" dry=0
 
 die() { printf '%s\n' "rerun_frozen_sha: $*" >&2; exit 2; }
@@ -32,7 +31,7 @@ while [ $# -gt 0 ]; do
     --out) [ $# -ge 2 ] || die "--out needs a directory"; out="$2"; shift 2 ;;
     --steps) [ $# -ge 2 ] || die "--steps needs a list"; steps="$2"; shift 2 ;;
     --dry-run) dry=1; shift ;;
-    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
     -*) die "unknown option: $1" ;;
     *) [ -z "$sha" ] || die "only one SHA is accepted"; sha="$1"; shift ;;
   esac
@@ -55,12 +54,20 @@ resolved="$(git -C "$repo" rev-parse --verify --quiet "${sha}^{commit}" || true)
 [ "$resolved" = "$sha" ] || die "not a commit in this clone (try: git fetch origin $sha)"
 
 if [ "$dry" -eq 1 ]; then
-  printf 'dry-run ok\nsha=%s\nsteps=%s\nout=%s\n' "$sha" "$steps" "${out:-<temp>}"
+  printf 'dry-run ok\nsha=%s\nsteps=%s\nout=%s\n' "$sha" "$steps" "${out:-<tmp>}"
   exit 0
 fi
 
 [ "$(uname -s)" = "Linux" ] || die "a real run is Linux only (uname: $(uname -s))"
 command -v python3 >/dev/null || die "python3 is required"
+case ",$steps," in
+  *,gate,*)
+    git -C "$repo" cat-file -e "${DQ_TASK_BASE}^{commit}" >/dev/null 2>&1 \
+      || die "delegated-Q base $DQ_TASK_BASE is not in this clone (full-history checkout required; this script does not fetch)"
+    ;;
+esac
+
+base="$(git -C "$repo" rev-parse --verify --quiet "${sha}^" || true)"
 
 if [ -z "$out" ]; then
   out="$(mktemp -d "${TMPDIR:-/tmp}/spine-rerun-evidence.XXXXXX")"
@@ -81,9 +88,8 @@ git -C "$repo" worktree add --detach "$tree" "$sha" >/dev/null 2>&1 || die "coul
 
 export PYTHONDONTWRITEBYTECODE=1 PYTHONUTF8=1
 unset GITHUB_OUTPUT || true
-parent="$(git -C "$tree" rev-parse --verify --quiet "${sha}^" || true)"
-if [ -n "$parent" ]; then
-  export CI_BASE_SHA="$parent"
+if [ -n "$base" ]; then
+  export CI_BASE_SHA="$base"
 else
   unset CI_BASE_SHA || true
 fi
@@ -108,12 +114,7 @@ run_step() {
 
 for step in "${step_list[@]}"; do
   case "$step" in
-    gate)
-      if ! git -C "$repo" cat-file -e "${DQ_BASE}^{commit}"; then
-        die "delegated-Q base is not in this clone; use a full-history checkout so the gate stays network-free"
-      fi
-      run_step gate python3 -X utf8 -B tools/ci_gate.py
-      ;;
+    gate)   run_step gate python3 -X utf8 -B tools/ci_gate.py ;;
     record) run_step record python3 -X utf8 -B -m scripts.v3.control_api.record --check ;;
     scope)  run_step scope python3 -X utf8 -B tools/check_public_scope.py ;;
   esac
@@ -123,8 +124,7 @@ finished_la="$(TZ=America/Los_Angeles date '+%Y-%m-%d %H:%M:%S %Z')"
 tree_dirty="$(git -C "$tree" status --porcelain | wc -l | tr -d ' ')"
 
 OUT_DIR="$out" SHA="$sha" TSV="$tsv" STARTED="$started_la" FINISHED="$finished_la" \
-TREE_DIRTY="$tree_dirty" OVERALL="$overall" COMPARISON_SHA="${CI_BASE_SHA:-}" \
-python3 -X utf8 -B - <<'PY'
+TREE_DIRTY="$tree_dirty" OVERALL="$overall" COMPARISON_SHA="${base:-}" python3 -X utf8 -B - <<'PY'
 import hashlib, json, os, platform, subprocess, sys
 from importlib import metadata
 

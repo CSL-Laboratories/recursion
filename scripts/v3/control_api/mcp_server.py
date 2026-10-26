@@ -115,12 +115,12 @@ class ControlMcpServer:
             return _error(request_id, -32602, "invalid_params")
         try:
             response = self._dispatch(TOOLS[name][0], arguments)
-        except Exception:  # noqa: BLE001 - transport faults stay a tool error, not a crash
+        except Exception:  # noqa: BLE001 - keep the stdio loop alive; leak nothing
             return {
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "result": {
-                    "content": [{"type": "text", "text": '{"error":"backend_unavailable"}'}],
+                    "content": [{"type": "text", "text": json.dumps({"error": "transport_error"}, sort_keys=True)}],
                     "isError": True,
                 },
             }

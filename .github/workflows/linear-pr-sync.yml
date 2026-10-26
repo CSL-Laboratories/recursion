@@ -3,7 +3,7 @@
 name: Linear PR sync
 
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review, closed]
   # This repository's default branch is master. The job also compares
   # github.ref_name to the repo default so a rename still stays correct.
@@ -27,7 +27,7 @@ jobs:
   sync:
     if: >-
       (
-        github.event_name == 'pull_request' &&
+        github.event_name == 'pull_request_target' &&
         github.event.pull_request.head.repo.full_name == github.repository
       ) ||
       (
@@ -39,7 +39,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # Always the default branch so pull_request events cannot run
+          # Always the default branch so pull_request_target cannot run
           # PR-head code with LINEAR_API_KEY.
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false

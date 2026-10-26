@@ -517,6 +517,20 @@ class HealthInjectionTests(unittest.TestCase):
         self.assertEqual("ok", result.status)
         self.assertFalse(health.is_open(engine))
 
+    def test_fenced_json_score_cannot_trip_the_breaker(self) -> None:
+        payload = {
+            "session_id": "s1",
+            "result": {"label": "a", "score": 429},
+        }
+        stdout = "```json\n" + json.dumps(payload, indent=2) + "\n```\n"
+        health = InMemoryHealth()
+        transport = ScriptedTransport([ProcResult(0, stdout, "", False)])
+        result = make_adapter(transport=transport, health=health).execute(make_request())
+        self.assertEqual("ok", result.status)
+        self.assertEqual({"label": "a", "score": 429}, result.validated)
+        self.assertEqual([], health.faults)
+        self.assertFalse(health.is_open("claude"))
+
     def test_engine_channels_vs_model_channel(self) -> None:
         for name in ("stderr_rate_limit", "stdout_raw_limit_text", "nonzero_exit"):
             _, _, _, health, result = self.run_case(VECTORS["health"][name])

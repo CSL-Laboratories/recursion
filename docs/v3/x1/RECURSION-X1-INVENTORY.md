@@ -43,7 +43,10 @@ git push origin refs/tags/pre-x1-recursion-20261026
 - Boundary code: `scripts/v3/harness/**` (20 files) and `scripts/v3/planning/**` (3 files).
   On `master` at the base SHA, `scripts/v3/` holds only `harness/` and `planning/`, and no
   directory named `planning/` exists at the repository root. So `planning/**` is read as
-  `scripts/v3/planning/**`. This reading is an inference. Dan or Lucas should confirm it.
+  `scripts/v3/planning/**`. This reading was an inference. Dan confirmed it in his tip review
+  of PR #303 (review `PRR_kwDOTuH3ps8AAAABUTlc8w`, 2026-10-26) and Samir agreed in his review
+  (`PRR_kwDOTuH3ps8AAAABUTzE6w`). Lucas's own words do not spell it out; his Decision 3 text
+  says only `planning/**`.
 - Legacy test files "under the boundary" are the ones whose subject is boundary code. By
   imports that is everything in `scripts/tests/v3/harness/` and `scripts/tests/v3/planning/`.
   `scripts/tests/v3/execution/` and `scripts/tests/v3/integrity/` do not import boundary code,
@@ -87,31 +90,38 @@ each file under the two legacy test directories to match exactly one row.
 
 The successor column names the file that must carry the oracle after deletion. In-place ports
 keep their path and switch their import to the successor. The test computes status. An oracle
-is `ported` only when its successor file exists, is run by `tools/ci_gate.py`, and no longer
-references the boundary. `pending` means it is not yet. `none` in the successor column means no
+is `ported` only when its successor file exists, is run by `tools/ci_gate.py`, no longer
+references the boundary, and defines every function or class named in `Successor tests`.
+`pending` means it is not yet. A `Successor tests` cell of `none` keeps the oracle `pending`. `none` in the successor column means no
 carrier path is named yet (this repository does not yet say where it will live).
 
 <!-- x1-oracle-register -->
-| Oracle | Contract | Legacy carrier | Successor |
-| --- | --- | --- | --- |
-| O-P1 | Replay of all 23 frozen planning cases, twice, with byte-identical digests | `scripts/tests/v3/planning/conformance.test.py` | `scripts/tests/v3/planning/conformance.test.py` |
-| O-P2 | Adversarial refusal probes | `scripts/tests/v3/planning/adversarial.test.py` | `scripts/tests/v3/planning/adversarial.test.py` |
-| O-P3 | Attenuation, graph and purity properties | `scripts/tests/v3/planning/property.test.py` | `scripts/tests/v3/planning/property.test.py` |
-| O-P4 | Strict decode, canonical form and DAG validation | `scripts/tests/v3/planning/validation.test.py` | `scripts/tests/v3/planning/validation.test.py` |
-| O-P5 | Literal corpus validity and reducer execution | `scripts/tests/v3/planning/red_fixture.test.py` | `scripts/tests/v3/planning/red_fixture.test.py` |
-| O-P6 | Planning wire schema and materializer byte identity | `scripts/tests/v3/planning/schema.test.py` | `scripts/tests/v3/planning/schema.test.py` |
-| O-P7 | Fixture corpus, manifest and generator `--check` | `scripts/tests/v3/planning/materialize_fixtures.py` | `scripts/tests/v3/planning/materialize_fixtures.py` |
-| O-H1 | Provider stream and usage parsers against recorded samples | `scripts/tests/v3/harness/harness.test.py` | none |
-| O-H2 | Secret custody: credential fields refused, secrets scrubbed from saved state and logs | `scripts/tests/v3/harness/harness.test.py` | `scripts/tests/v3/route_adapter/at1.test.py` |
-| O-H3 | Live-provider gate: no live start without explicit allow | `scripts/tests/v3/harness/ops.test.py` | `scripts/tests/v3/route_adapter/at1.test.py` |
-| O-H4 | Land refusal rules: never master or main, never an unreviewed tip, never a dirty tree | `scripts/tests/v3/harness/ops.test.py` | none |
-| O-H5 | Route selection: weights, cooldown fallback, disabled-provider skip, pre-call budget refusal | `scripts/tests/v3/harness/harness.test.py` | none |
+| Oracle | Contract | Legacy carrier | Successor | Successor tests |
+| --- | --- | --- | --- | --- |
+| O-P1 | Replay of all 23 frozen planning cases, twice, with byte-identical digests | `scripts/tests/v3/planning/conformance.test.py` | `scripts/tests/v3/planning/conformance.test.py` | `run_conformance` |
+| O-P2 | Adversarial refusal probes | `scripts/tests/v3/planning/adversarial.test.py` | `scripts/tests/v3/planning/adversarial.test.py` | `run_adversarial` |
+| O-P3 | Attenuation, graph and purity properties | `scripts/tests/v3/planning/property.test.py` | `scripts/tests/v3/planning/property.test.py` | `main` |
+| O-P4 | Strict decode, canonical form and DAG validation | `scripts/tests/v3/planning/validation.test.py` | `scripts/tests/v3/planning/validation.test.py` | `main` |
+| O-P5 | Literal corpus validity and reducer execution | `scripts/tests/v3/planning/red_fixture.test.py` | `scripts/tests/v3/planning/red_fixture.test.py` | `validate_corpus` |
+| O-P6 | Planning wire schema and materializer byte identity | `scripts/tests/v3/planning/schema.test.py` | `scripts/tests/v3/planning/schema.test.py` | `test_materializer_is_byte_identical` |
+| O-P7 | Fixture corpus, manifest and generator `--check` | `scripts/tests/v3/planning/materialize_fixtures.py` | `scripts/tests/v3/planning/materialize_fixtures.py` | `main` |
+| O-H1 | Provider stream and usage parsers against recorded samples | `scripts/tests/v3/harness/harness.test.py` | none | none |
+| O-H2 | Secret custody: credential fields refused, secrets scrubbed from saved state and logs | `scripts/tests/v3/harness/harness.test.py` | `scripts/tests/v3/route_adapter/at1.test.py` | none |
+| O-H3 | Live-provider gate: no live start without explicit allow | `scripts/tests/v3/harness/ops.test.py` | `scripts/tests/v3/route_adapter/at1.test.py` | none |
+| O-H4 | Land refusal rules: never master or main, never an unreviewed tip, never a dirty tree | `scripts/tests/v3/harness/ops.test.py` | none | none |
+| O-H5 | Route selection: weights, cooldown fallback, disabled-provider skip, pre-call budget refusal | `scripts/tests/v3/harness/harness.test.py` | none | none |
 
 State on the base SHA: O-P6 and O-P7 are satisfied because they stay in place and never touch
 the boundary. The other ten oracles are carried only by legacy files, so they are `pending`.
 O-H2 and O-H3 name R#301's test as successor. That file is not on `master`, so they stay
-`pending` until R#301 merges. Whether R#301's tests really cover the two contracts is not
-verified here.
+`pending` until R#301 merges and its test names are entered in the register.
+
+**What `ported` does and does not mean.** It means the successor file exists, is wired into the
+gate, is free of boundary references, and contains the named tests. It does not mean anyone
+verified that those tests cover the contract. Several names are generic (`main`), and O-H2 and
+O-H3 share one file. The deletion PR's reviewer must confirm that each successor actually covers
+its oracle's contract, most of all O-H2 and O-H3 against R#301's `at1.test.py`, which no one has
+verified yet.
 
 ## 6. Mixed files: which tests carry which oracle
 
@@ -162,13 +172,18 @@ because `ci_gate.py` discovers `scripts/tests/**/*.test.py`. It fails the job wh
    no oracle.
 3. A floor drops: 16 rows, 10 legacy `*.test.py` files, 2 support modules, 23 planning
    fixtures, 5 harness stream fixtures, 12 oracles, 10 port oracles, 2 satisfied oracles.
-4. Legacy test or boundary code files disappear before `X1_DELETION_LANDED` is set (20 harness
-   files, 3 planning files). This is the guard for "delete only after the Nov 10 rehearsal".
+4. Before `X1_DELETION_LANDED` is set, the boundary code differs from the pinned list
+   `PINNED_BOUNDARY_FILES` (the 23 `.py` files at the pre-x1 tag), in either direction, so
+   removing one module and adding another is also red. Legacy test files that disappear are
+   red through item 1. This is the guard for "delete only after the Nov 10 rehearsal".
+   Adding a boundary file before deletion requires editing the pin on purpose.
 5. Any legacy test file under the boundary is not run by `ci_gate.py`.
 6. Any keep-path overlaps the boundary.
 7. The `X1_DELETION_LANDED` flag is set while any port oracle is still `pending`, while boundary
    code remains, or while a keep-path is missing. This is the red-to-green gate for the
-   deletion PR. It stays red until every successor carrier is green in the same job.
+   deletion PR. It stays red until every successor carrier is green in the same job. The check
+   that section 6 names real legacy tests runs only before deletion; afterwards the legacy files
+   are expected to be gone and the register's successor tests carry the check.
 
 `tools/test_ci_gate.py` gains one case that fails if the floor test stops being discovered and
 run, so deleting the floor itself turns `linux` red.
@@ -196,11 +211,16 @@ for a protected path: add `scripts/tests/v3/x1/inventory.test.py` to `REQUIRED_S
 
 ## 9. Open questions
 
-1. Confirm `planning/**` means `scripts/v3/planning/**` only (section 3).
-2. Name "the receipt tests" (section 3).
+1. Settled: `planning/**` means `scripts/v3/planning/**` only (section 3, Dan and Samir).
+2. Name "the receipt tests" (section 3). Still open.
 3. Confirm each `port` and `drop` call, in particular H1 (route fallback tests as O-H5), H2
    (land refusal as O-H4) and the drop of `incremental.test.py` given the perf tooling.
-4. Choose a successor path for O-H1, O-H4 and O-H5. Until then they stay `pending`.
+4. Choose a successor path and test names for O-H1, O-H4 and O-H5, and enter R#301's test names
+   for O-H2 and O-H3. Until then they stay `pending`.
+
+Execution record: no Linear claim record was posted for this task. Its rules allowed one Linear
+comment, which was used for the review request on CSL-495. Lucas or a founder can decide whether
+a retroactive claim is wanted; this document does not depend on one.
 
 ## 10. Verification and unverified items
 

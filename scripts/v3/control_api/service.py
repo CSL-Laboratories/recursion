@@ -226,6 +226,8 @@ class ControlService:
             state.closed = True
             tenant = self._tenant(principal.tenant)
             tenant.open_count = max(0, tenant.open_count - 1)
+            # Dict order is open order. Move this record to the end so pruning
+            # drops the oldest closure, not an older open that just closed.
             key = (engine, session)
             tenant.sessions.pop(key)
             tenant.sessions[key] = state
@@ -355,6 +357,12 @@ class ControlService:
 
 
 def _prune_closed(tenant: _Tenant) -> None:
+    """Drop the oldest closed records once the tenant is over the cap.
+
+    ``session.close`` reinserts the record so closed keys are in closure order
+    even when an older open session closes after newer ones.
+    """
+
     closed = len(tenant.sessions) - tenant.open_count
     overflow = closed - MAX_CLOSED_SESSIONS_PER_TENANT
     if overflow <= 0:

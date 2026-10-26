@@ -13,11 +13,11 @@ from __future__ import annotations
 import ast
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
 import textwrap
-import threading
 import time
 import unittest
 from pathlib import Path
@@ -814,28 +814,39 @@ class ReviewFixTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         helper = Path(tmp.name) / "deadlock.py"
         helper.write_text(_HELPER_PIPE_DEADLOCK, encoding="utf-8")
-        box: dict[str, ProcResult] = {}
-
-        def invoke() -> None:
-            box["result"] = SubprocessTransport().run(
-                [sys.executable, str(helper)],
+        script = textwrap.dedent(
+            f"""
+            import sys
+            sys.path.insert(0, {str(ROOT)!r})
+            from scripts.v3.route_contract.transport import SubprocessTransport
+            result = SubprocessTransport().run(
+                [sys.executable, {str(helper)!r}],
                 "p" * (128 * 1024),
                 5.0,
                 None,
                 max_output_bytes=256 * 1024,
             )
-
-        worker = threading.Thread(target=invoke)
-        started = time.monotonic()
-        worker.start()
-        worker.join(8.0)
-        elapsed = time.monotonic() - started
-        self.assertFalse(worker.is_alive(), "stdin write blocked the deadline")
-        self.assertLess(elapsed, 8.0)
-        result = box["result"]
-        self.assertEqual(0, result.returncode)
-        self.assertFalse(result.timed_out)
-        self.assertFalse(result.oversized)
+            print(result.returncode)
+            print(int(result.timed_out))
+            print(int(result.oversized))
+            """
+        )
+        child = subprocess.Popen(
+            [sys.executable, "-c", script],
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = child.communicate(timeout=8)
+        except subprocess.TimeoutExpired:
+            os.killpg(child.pid, signal.SIGKILL)
+            child.wait(timeout=2)
+            self.fail("stdin write blocked the deadline")
+        self.assertEqual(0, child.returncode, stderr)
+        self.assertEqual(["0", "0", "0"], stdout.strip().splitlines())
 
     def test_oversized_repair_keeps_the_tree_observation(self) -> None:
         bad = json.dumps({"session_id": "s1", "result": "{}"})

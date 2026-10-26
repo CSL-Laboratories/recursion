@@ -35,6 +35,7 @@ ERROR_TOKENS = (
     "output_too_large",
     "repair_empty_output",
     "repair_limit_or_error",
+    "repair_output_too_large",
     "repair_still_invalid",
     "repair_timeout",
     "repair_vendor_error",
@@ -174,6 +175,8 @@ def _new_defs() -> dict[str, Any]:
                     },
                 },
                 {
+                    # A dispatched limit_hit may carry the tree observation from an
+                    # oversized kill. Undispatched limit_hit stays termination-null.
                     "if": {
                         "properties": {"status": {"const": "limit_hit"}, "dispatched": {"const": True}},
                         "required": ["status", "dispatched"],
@@ -181,7 +184,6 @@ def _new_defs() -> dict[str, Any]:
                     "then": {
                         "properties": {
                             "health_event": _ref("RouteHealthEvent"),
-                            "termination": {"type": "null"},
                         }
                     },
                 },

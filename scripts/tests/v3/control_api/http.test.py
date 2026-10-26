@@ -196,6 +196,14 @@ class RequestHygieneTests(HttpTestCase):
         connection.close()
         status, _, _ = self.raw("POST", "/v1/rpc", body=b" " * (65 * 1024), headers=self.auth())
         self.assertEqual(413, status)
+        client = self.live.client(self.live.control)
+        with self.assertRaises(ControlRpcError) as raised:
+            client.call(
+                "session.run",
+                {"engine": "claude", "session": "s-one", "prompt": "p" * (65 * 1024)},
+            )
+        self.assertEqual(err.TOO_LARGE, raised.exception.code)
+        self.assertEqual("body_too_large", raised.exception.message)
 
     def test_methods_and_paths_are_closed(self) -> None:
         for method, path, expected in (
@@ -266,6 +274,45 @@ class TokenFileTests(unittest.TestCase):
                 read_token_file(link)
             with self.assertRaises(TokenFileRefused):
                 read_token_file(Path(directory) / "missing")
+
+    def test_bind_failure_removes_the_token_file_this_invocation_created(self) -> None:
+        from scripts.v3.control_api.__main__ import main
+
+        stack = build_fake_stack()
+        blocker = ControlHTTPServer(stack.service).start()
+        self.addCleanup(blocker.stop)
+        with tempfile.TemporaryDirectory() as directory:
+            token_file = Path(directory) / "token"
+            code = main(
+                [
+                    "serve-fake",
+                    "--token-file",
+                    str(token_file),
+                    "--port",
+                    str(blocker.port),
+                ]
+            )
+            self.assertEqual(2, code)
+            self.assertFalse(token_file.exists())
+
+    def test_excess_connections_are_refused(self) -> None:
+        stack = build_fake_stack()
+        server = ControlHTTPServer(stack.service, max_connections=1).start()
+        self.addCleanup(server.stop)
+        token = stack.issue("op-a", "tenant-a", {SCOPE_CONTROL, SCOPE_OBSERVE})
+        held = http.client.HTTPConnection("127.0.0.1", server.port, timeout=10)
+        self.addCleanup(held.close)
+        held.request(
+            "GET",
+            "/v1/events?after=0&wait=10",
+            headers={"Authorization": f"Bearer {token}", "Host": f"127.0.0.1:{server.port}"},
+        )
+        time.sleep(0.2)
+        client = ControlClient(server.url, token)
+        with self.assertRaises(ControlRpcError) as raised:
+            client.call("service.info")
+        self.assertEqual(err.BUSY, raised.exception.code)
+        self.assertEqual("too_many_connections", raised.exception.message)
 
 
 class CliTests(unittest.TestCase):

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import sys
 import threading
@@ -28,12 +29,30 @@ from scripts.v3.control_api.http_server import ControlHTTPServer
 def _serve(args: argparse.Namespace) -> int:
     stack = build_fake_stack()
     token = stack.issue("operator", args.tenant, {SCOPE_CONTROL, SCOPE_OBSERVE})
+    server = None
+    created = False
     try:
-        write_token_file(args.token_file, token)
-    except FileExistsError:
-        print(json.dumps({"error": "token_file_exists"}), file=sys.stderr)
-        return 2
-    server = ControlHTTPServer(stack.service, "127.0.0.1", args.port).start()
+        server = ControlHTTPServer(stack.service, "127.0.0.1", args.port)
+        try:
+            write_token_file(args.token_file, token)
+        except FileExistsError:
+            print(json.dumps({"error": "token_file_exists"}), file=sys.stderr)
+            server.close()
+            return 2
+        created = True
+        server.start()
+    except OSError:
+        if created:
+            try:
+                os.unlink(args.token_file)
+            except OSError:
+                pass
+        if server is not None:
+            try:
+                server.close()
+            except OSError:
+                pass
+        raise
     print(json.dumps({"url": server.url, "tenant": args.tenant, "live_calls": False}), flush=True)
     stop = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stop.set())

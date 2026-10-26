@@ -719,7 +719,7 @@
       "step": 16
     },
     {
-      "caller": "operator",
+      "caller": "viewer",
       "http_status": 200,
       "label": "observer journal",
       "request": {
@@ -873,7 +873,7 @@
       "step": 17
     }
   ],
-  "transcript_sha256": "sha256:804ca178a22dbccb3505a3ba6d7e8d72e0fadc51c00b0bf2ff50d7f1e392d26e",
+  "transcript_sha256": "sha256:de2048be73b2a9499aa569c8d8b14a5bf84fd727e89639e87ce3002795eca985",
   "transport_calls": {
     "claude": 3,
     "codex": 2

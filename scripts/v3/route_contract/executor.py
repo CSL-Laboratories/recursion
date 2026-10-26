@@ -154,7 +154,7 @@ class ReferenceAdapter:
         self._health = health
         self._validate = validate
         self._output_schema_digest = sha256_digest(canonical_json(output_schema))
-        self._secret_values = secret_values
+        self._secret_values = argv_mod.materialize_secrets(secret_values)
         self._pinned_cwd = pinned_cwd
 
     def support(self) -> dict[str, object]:

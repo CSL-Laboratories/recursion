@@ -107,8 +107,14 @@ Keep invariant 1's force-push, merge, and deployment limits. Name the review bra
 ## P-003 — Founder GitHub PR approval as Recursion spec acceptance
 
 - Date: 2026-10-25
-- Status: **proposed**; blocked on Lucas's unprefixed authoring-session comment on
-  [CSL-524](https://linear.app/csl-laboratories/issue/CSL-524). Not authorization.
+- Status: **authoring session posted; apply stopped; pending Lucas**. Lucas posted
+  the unprefixed authoring sentence from his own account on
+  [CSL-524](https://linear.app/csl-laboratories/issue/CSL-524) as comment
+  `3bf10093-062c-43bc-a9c3-f21bb8f6ba73` (2026-10-26 2:38pm PT), naming branch
+  `cursor/csl-524-spec-acceptance-1752`. The protected-path diffs were **not**
+  applied on this branch. The proposal appends a decision headed D-044, and
+  `state/DECISIONS.md` already has D-044 (research-vault alignment; log frozen
+  through D-044, no further entries). Not merged.
 - Owner: Lucas.
 - Issue: [CSL-524](https://linear.app/csl-laboratories/issue/CSL-524) (child of CSL-494;
   related CSL-493, CSL-523). Twin of CSL-523 in the companion repo.
@@ -137,3 +143,6 @@ D-044 only), `AGENTS.md`, `CLAUDE.md`, `docs/v3/PLANNING.md`,
 - No merge. No acceptance of recursion#295. No change to Lucas's reserved
   decisions or to agent-never-merge.
 - No other-project identifiers in tracked files.
+- The authoring comment now exists. Apply still did not edit protected paths:
+  appending the proposal's D-044 would duplicate the frozen vault decision.
+  Waiting on Lucas for a distinct id and where that record lives.

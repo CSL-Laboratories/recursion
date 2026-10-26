@@ -81,6 +81,7 @@ class Harness:
             driver=driver,
             health=InMemoryHealth(),
             validate=make_validator(OUTPUT_SCHEMA),
+            output_schema=OUTPUT_SCHEMA,
             secret_values=[CANARY],
         )
         self.tokens = TokenRegistry()
@@ -282,6 +283,25 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(err.INTERNAL_ERROR, code_of(response))
         self.assertNotIn(secret_text, json.dumps(response))
         self.assertEqual("open", h.ok(h.control_a, "session.get", {"engine": "claude", "session": "s-one"})["state"])
+        events = h.ok(h.control_a, "events.poll", {"after": 0})["events"]
+        self.assertEqual(["session.opened", "run.started", "run.failed"], [e["kind"] for e in events])
+        self.assertEqual({"request_id": "req-1", "code": "internal_error"}, events[-1]["data"])
+        self.assertNotIn(secret_text, json.dumps(events))
+
+    def test_lifecycle_events_are_published_under_the_state_lock(self) -> None:
+        h = Harness()
+        held = []
+        append = h.journal.append
+
+        def checked_append(*args, **kwargs):
+            if args[1].startswith("session."):
+                held.append((args[1], h.service._lock.locked()))
+            return append(*args, **kwargs)
+
+        h.journal.append = checked_append
+        h.ok(h.control_a, "session.open", {"engine": "claude", "session": "s-one"})
+        h.ok(h.control_a, "session.close", {"engine": "claude", "session": "s-one"})
+        self.assertEqual([("session.opened", True), ("session.closed", True)], held)
 
 
 class RunTests(unittest.TestCase):

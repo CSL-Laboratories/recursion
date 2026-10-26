@@ -349,6 +349,22 @@ class RunTests(unittest.TestCase):
             code_of(h.call(h.control_a, "session.open", {"engine": "claude", "session": "s-0"})),
         )
 
+    def test_closing_an_older_session_keeps_that_closure(self) -> None:
+        h = Harness()
+        h.ok(h.control_a, "session.open", {"engine": "claude", "session": "early"})
+        for index in range(64):
+            h.ok(h.control_a, "session.open", {"engine": "claude", "session": f"s-{index}"})
+            h.ok(h.control_a, "session.close", {"engine": "claude", "session": f"s-{index}"})
+        closed = h.ok(h.control_a, "session.close", {"engine": "claude", "session": "early"})
+        self.assertEqual("closed", closed["state"])
+        again = h.ok(h.control_a, "session.close", {"engine": "claude", "session": "early"})
+        self.assertEqual(closed, again)
+        self.assertEqual("closed", h.ok(h.control_a, "session.get", {"engine": "claude", "session": "early"})["state"])
+        self.assertEqual(
+            err.UNKNOWN_SESSION,
+            code_of(h.call(h.control_a, "session.get", {"engine": "claude", "session": "s-0"})),
+        )
+
     def test_closed_session_history_is_bounded(self) -> None:
         h = Harness()
         for index in range(80):

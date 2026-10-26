@@ -364,6 +364,23 @@ class RunTests(unittest.TestCase):
             code_of(h.call(h.control_a, "session.open", {"engine": "claude", "session": "s-79"})),
         )
 
+    def test_a_freshly_closed_session_is_not_pruned(self) -> None:
+        h = Harness()
+        h.ok(h.control_a, "session.open", {"engine": "claude", "session": "s-early"})
+        for index in range(64):
+            h.ok(h.control_a, "session.open", {"engine": "claude", "session": f"s-{index}"})
+            h.ok(h.control_a, "session.close", {"engine": "claude", "session": f"s-{index}"})
+        closed = h.ok(h.control_a, "session.close", {"engine": "claude", "session": "s-early"})
+        self.assertEqual("closed", closed["state"])
+        self.assertEqual(
+            "closed",
+            h.ok(h.control_a, "session.get", {"engine": "claude", "session": "s-early"})["state"],
+        )
+        self.assertEqual(
+            err.SESSION_CLOSED,
+            code_of(h.call(h.control_a, "session.open", {"engine": "claude", "session": "s-early"})),
+        )
+
     def test_close_is_idempotent(self) -> None:
         h = Harness()
         h.ok(h.control_a, "session.open", {"engine": "claude", "session": "s-one"})

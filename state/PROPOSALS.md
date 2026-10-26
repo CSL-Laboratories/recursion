@@ -121,7 +121,15 @@ Keep invariant 1's force-push, merge, and deployment limits. Name the review bra
 - Owner: Lucas.
 - Issue: [CSL-524](https://linear.app/csl-laboratories/issue/CSL-524) (child of CSL-494;
   related CSL-493, CSL-523). Twin of CSL-523 in the companion repo.
-- Full proposed diffs: [docs/v3/proposals/ACCEPTANCE-RULE-2026-10-25.md](../docs/v3/proposals/ACCEPTANCE-RULE-2026-10-25.md).
+- Full proposed diffs: moved to csl-research. Lucas (2026-10-26 3:37pm PT, relayed
+  by Grok Bot Liaison): move the whole proposal to csl-research; recursion keeps only
+  a link. Vault copy:
+  [`contracts/recursion/amendments/ACCEPTANCE-RULE-2026-10-25.md`](https://github.com/CSL-Laboratories/csl-research/blob/2cbc2fabe9d797798af2f56f2549dd8fd07877e7/contracts/recursion/amendments/ACCEPTANCE-RULE-2026-10-25.md)
+  ([csl-research#59](https://github.com/CSL-Laboratories/csl-research/pull/59), CSLR-D-001),
+  SHA-256 `2bf5e8473639ae3707b812fd8a68017c1f38480d00789878137b30a57eb81298`.
+  Provenance: byte-for-byte copy of `docs/v3/proposals/ACCEPTANCE-RULE-2026-10-25.md`
+  at recursion commit `2d829ed74786f97ea5d6fc5eae38fcb31db32fa6`, removed from this
+  repository after that commit.
 
 ### Motivation
 
@@ -134,7 +142,7 @@ session. This proposal records the rule and the target diffs without applying th
 
 ### Proposed replacement
 
-See the proposal file. After Lucas posts the authoring sentence on CSL-524, apply
+See the vault copy linked above. After Lucas posts the authoring sentence on CSL-524, apply
 those insertions to `CONTROL_PLANE.md`, `ANCHOR.md`, `AGENTS.md`, `CLAUDE.md`,
 `docs/v3/PLANNING.md`, `docs/v3/AUTONOMOUS-PLANNING.md`,
 `docs/v3/DECISION-REGISTER.md` item 9, and `docs/v3/ACCEPTANCE.md`. Record the

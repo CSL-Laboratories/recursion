@@ -111,9 +111,19 @@ class ControlMcpServer:
 
     def _call(self, request_id: Any, params: dict[str, Any]) -> dict[str, Any]:
         name, arguments = params.get("name"), params.get("arguments", {})
-        if name not in TOOLS or not isinstance(arguments, dict):
+        if not isinstance(name, str) or name not in TOOLS or not isinstance(arguments, dict):
             return _error(request_id, -32602, "invalid_params")
-        response = self._dispatch(TOOLS[name][0], arguments)
+        try:
+            response = self._dispatch(TOOLS[name][0], arguments)
+        except Exception:  # noqa: BLE001 - transport faults stay a tool error, not a crash
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "content": [{"type": "text", "text": '{"error":"backend_unavailable"}'}],
+                    "isError": True,
+                },
+            }
         failed = "error" in response
         payload = response["error"] if failed else response["result"]
         return {

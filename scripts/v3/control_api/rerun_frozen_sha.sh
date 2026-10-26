@@ -14,12 +14,16 @@
 #                        record python -m scripts.v3.control_api.record --check
 #                        scope  python tools/check_public_scope.py
 #
-# No provider, network or credential is used. Linux only for a real run: the
-# recorded evidence for the Nov 11 demo is the Linux run.
+# No provider or credential is used. The clone must already contain the
+# candidate and the delegated-Q base; a missing object is a hard error so the
+# gate cannot contact origin. Linux only for a real run: the recorded evidence
+# for the Nov 11 demo is the Linux run. Default --out is a temp directory
+# outside the invoking checkout.
 set -euo pipefail
 
 ALL_STEPS="gate,record,scope"
-sha="" out="spine-rerun-evidence" steps="$ALL_STEPS" dry=0
+DQ_BASE="0c908f6833e715af0eaa01b6f6788120eb577efd"
+sha="" out="" steps="$ALL_STEPS" dry=0
 
 die() { printf '%s\n' "rerun_frozen_sha: $*" >&2; exit 2; }
 
@@ -28,7 +32,7 @@ while [ $# -gt 0 ]; do
     --out) [ $# -ge 2 ] || die "--out needs a directory"; out="$2"; shift 2 ;;
     --steps) [ $# -ge 2 ] || die "--steps needs a list"; steps="$2"; shift 2 ;;
     --dry-run) dry=1; shift ;;
-    -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
     -*) die "unknown option: $1" ;;
     *) [ -z "$sha" ] || die "only one SHA is accepted"; sha="$1"; shift ;;
   esac
@@ -39,8 +43,11 @@ done
 
 IFS=',' read -r -a step_list <<< "$steps"
 [ "${#step_list[@]}" -gt 0 ] || die "no steps"
+seen=","
 for step in "${step_list[@]}"; do
   case "$step" in gate|record|scope) ;; *) die "unknown step: $step" ;; esac
+  case "$seen" in *",$step,"*) die "duplicate step: $step" ;; esac
+  seen="$seen$step,"
 done
 
 repo="$(git rev-parse --show-toplevel 2>/dev/null)" || die "run inside a git clone"
@@ -48,15 +55,19 @@ resolved="$(git -C "$repo" rev-parse --verify --quiet "${sha}^{commit}" || true)
 [ "$resolved" = "$sha" ] || die "not a commit in this clone (try: git fetch origin $sha)"
 
 if [ "$dry" -eq 1 ]; then
-  printf 'dry-run ok\nsha=%s\nsteps=%s\nout=%s\n' "$sha" "$steps" "$out"
+  printf 'dry-run ok\nsha=%s\nsteps=%s\nout=%s\n' "$sha" "$steps" "${out:-<temp>}"
   exit 0
 fi
 
 [ "$(uname -s)" = "Linux" ] || die "a real run is Linux only (uname: $(uname -s))"
 command -v python3 >/dev/null || die "python3 is required"
 
-mkdir -p "$out"
-out="$(cd "$out" && pwd)"
+if [ -z "$out" ]; then
+  out="$(mktemp -d "${TMPDIR:-/tmp}/spine-rerun-evidence.XXXXXX")"
+else
+  mkdir -p "$out"
+  out="$(cd "$out" && pwd)"
+fi
 work="$(mktemp -d)"
 tree="$work/tree"
 cleanup() {
@@ -69,7 +80,13 @@ git -C "$repo" worktree add --detach "$tree" "$sha" >/dev/null 2>&1 || die "coul
 [ "$(git -C "$tree" rev-parse HEAD)" = "$sha" ] || die "checked-out HEAD differs from $sha"
 
 export PYTHONDONTWRITEBYTECODE=1 PYTHONUTF8=1
-unset CI_BASE_SHA GITHUB_OUTPUT || true
+unset GITHUB_OUTPUT || true
+parent="$(git -C "$tree" rev-parse --verify --quiet "${sha}^" || true)"
+if [ -n "$parent" ]; then
+  export CI_BASE_SHA="$parent"
+else
+  unset CI_BASE_SHA || true
+fi
 
 tsv="$out/$sha.steps.tsv"
 : > "$tsv"
@@ -91,7 +108,12 @@ run_step() {
 
 for step in "${step_list[@]}"; do
   case "$step" in
-    gate)   run_step gate python3 -X utf8 -B tools/ci_gate.py ;;
+    gate)
+      if ! git -C "$repo" cat-file -e "${DQ_BASE}^{commit}"; then
+        die "delegated-Q base is not in this clone; use a full-history checkout so the gate stays network-free"
+      fi
+      run_step gate python3 -X utf8 -B tools/ci_gate.py
+      ;;
     record) run_step record python3 -X utf8 -B -m scripts.v3.control_api.record --check ;;
     scope)  run_step scope python3 -X utf8 -B tools/check_public_scope.py ;;
   esac
@@ -101,7 +123,8 @@ finished_la="$(TZ=America/Los_Angeles date '+%Y-%m-%d %H:%M:%S %Z')"
 tree_dirty="$(git -C "$tree" status --porcelain | wc -l | tr -d ' ')"
 
 OUT_DIR="$out" SHA="$sha" TSV="$tsv" STARTED="$started_la" FINISHED="$finished_la" \
-TREE_DIRTY="$tree_dirty" OVERALL="$overall" python3 -X utf8 -B - <<'PY'
+TREE_DIRTY="$tree_dirty" OVERALL="$overall" COMPARISON_SHA="${CI_BASE_SHA:-}" \
+python3 -X utf8 -B - <<'PY'
 import hashlib, json, os, platform, subprocess, sys
 from importlib import metadata
 
@@ -119,8 +142,9 @@ except metadata.PackageNotFoundError:
 evidence = {
     "type": "SpineFrozenShaRerun@0",
     "candidate_sha": sha,
-    "passed": os.environ["OVERALL"] == "0" and all(s["exit_code"] == 0 for s in steps),
+    "passed": os.environ["OVERALL"] == "0" and int(os.environ["TREE_DIRTY"]) == 0 and all(s["exit_code"] == 0 for s in steps),
     "steps": steps,
+    "comparison_sha": os.environ.get("COMPARISON_SHA") or None,
     "tree_dirty_files_after": int(os.environ["TREE_DIRTY"]),
     "started_america_los_angeles": os.environ["STARTED"],
     "finished_america_los_angeles": os.environ["FINISHED"],

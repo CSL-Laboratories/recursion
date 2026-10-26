@@ -15,7 +15,7 @@ stays `unsupported` until CSL-460, and nothing in this package spawns a provider
 | Control MCP (RS2) | `mcp_server.py` | Newline-delimited stdio MCP; one tool per Control API method, all through the same authenticated dispatch. `mcp-fake` serves a fake stack, or proxies to a loopback URL with a token file. |
 | Direct-CLI fallback | `direct_cli.py` | `direct-fake --engine claude\|codex --prompt ...`. One fake-driver run that bypasses the Control API. **Does not satisfy X2**; output carries `satisfies_x2: false`. Neutral workload IDs `direct-cli` / `proc-req-direct-cli`. |
 | Recorded run | `record.py`, `scripts/tests/v3/control_api/recordings/spine-fake-run.json` | Fresh run must equal the committed recording byte for byte. |
-| Frozen-SHA rerun | `rerun_frozen_sha.sh` | One 40-hex SHA in, one evidence file out. |
+| Frozen-SHA rerun | `rerun_frozen_sha.sh` | One 40-hex SHA in, one evidence file out. The clone must already contain the candidate and the delegated-Q base (the gate does not contact origin). Default `--out` is a temp directory. |
 
 Methods: `service.info`, `route.list`, `session.open`, `session.run`,
 `session.get`, `session.close`, `events.poll`.

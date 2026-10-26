@@ -83,6 +83,8 @@ def _events(args: argparse.Namespace) -> int:
 
 def _mcp(args: argparse.Namespace) -> int:
     if args.url:
+        if not args.token_file:
+            raise ValueError("--url needs --token-file")
         client = _client(args)
 
         def dispatch(method: str, params: dict) -> dict:

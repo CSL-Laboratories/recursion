@@ -225,7 +225,7 @@ class ControlService:
             # Dict order is open order. Move this record to the end so pruning
             # drops the oldest closure, not an older open that just closed.
             key = (engine, session)
-            del tenant.sessions[key]
+            tenant.sessions.pop(key)
             tenant.sessions[key] = state
             _prune_closed(tenant)
             view = _session_view(state)

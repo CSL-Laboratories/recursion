@@ -54,14 +54,15 @@ git push origin refs/tags/pre-x1-recursion-20261026
 - Keep-paths: `scripts/v3/route_adapter/**`. It does not exist on `master` yet. R#301
   (CSL-537, open) adds it, with its test at `scripts/tests/v3/route_adapter/at1.test.py`. The
   boundary does not overlap it.
-- "The receipt tests" is not defined in the decision text, and this task could not verify what
-  it names. The only files named for receipts in this repository are `tools/test_claude_fixer_*`
-  tests, which sit outside the boundary and are unaffected. If it means the receipt assertions
-  inside the planning tests, rows P1 and P5 need a `keep` review.
+- "The receipt tests" means `tools/test_claude_fixer_*`. Lucas decided that on CSL-495
+  (comment `611d6aa4`, Mon 2026-10-26 1:47 PM PT: "I agree with your recommendations").
+  Those files sit outside the deletion boundary and are kept. The receipt checks inside
+  P1 and P5 stay `port`.
 
 ## 4. Disposition table
 
-Dispositions are proposals for Dan to confirm. `port` means the contract survives and a
+Dispositions below are the ones Lucas accepted on CSL-495 (comment `611d6aa4`,
+Mon 2026-10-26 1:47 PM PT). `port` means the contract survives and a
 successor carrier must run it green before the legacy file is deleted. `drop` means the file
 tests only legacy implementation detail. `keep` means the file stays as is. The test requires
 each file under the two legacy test directories to match exactly one row.
@@ -92,8 +93,9 @@ The successor column names the file that must carry the oracle after deletion. I
 keep their path and switch their import to the successor. The test computes status. An oracle
 is `ported` only when its successor file exists, is run by `tools/ci_gate.py`, no longer
 references the boundary, and defines every function or class named in `Successor tests`.
-`pending` means it is not yet. A `Successor tests` cell of `none` keeps the oracle `pending`. `none` in the successor column means no
-carrier path is named yet (this repository does not yet say where it will live).
+`pending` means it is not yet. A `Successor tests` cell of `none` keeps the oracle `pending`.
+`none` in the successor column means no carrier path is named yet. A directory path names
+the home and stays `pending` until a file and its test names are entered.
 
 <!-- x1-oracle-register -->
 | Oracle | Contract | Legacy carrier | Successor | Successor tests |
@@ -105,16 +107,18 @@ carrier path is named yet (this repository does not yet say where it will live).
 | O-P5 | Literal corpus validity and reducer execution | `scripts/tests/v3/planning/red_fixture.test.py` | `scripts/tests/v3/planning/red_fixture.test.py` | `validate_corpus` |
 | O-P6 | Planning wire schema and materializer byte identity | `scripts/tests/v3/planning/schema.test.py` | `scripts/tests/v3/planning/schema.test.py` | `test_materializer_is_byte_identical` |
 | O-P7 | Fixture corpus, manifest and generator `--check` | `scripts/tests/v3/planning/materialize_fixtures.py` | `scripts/tests/v3/planning/materialize_fixtures.py` | `main` |
-| O-H1 | Provider stream and usage parsers against recorded samples | `scripts/tests/v3/harness/harness.test.py` | none | none |
+| O-H1 | Provider stream and usage parsers against recorded samples | `scripts/tests/v3/harness/harness.test.py` | `scripts/tests/v3/route_adapter/` | none |
 | O-H2 | Secret custody: credential fields refused, secrets scrubbed from saved state and logs | `scripts/tests/v3/harness/harness.test.py` | `scripts/tests/v3/route_adapter/at1.test.py` | none |
 | O-H3 | Live-provider gate: no live start without explicit allow | `scripts/tests/v3/harness/ops.test.py` | `scripts/tests/v3/route_adapter/at1.test.py` | none |
-| O-H4 | Land refusal rules: never master or main, never an unreviewed tip, never a dirty tree | `scripts/tests/v3/harness/ops.test.py` | none | none |
-| O-H5 | Route selection: weights, cooldown fallback, disabled-provider skip, pre-call budget refusal | `scripts/tests/v3/harness/harness.test.py` | none | none |
+| O-H4 | Land refusal rules: never master or main, never an unreviewed tip, never a dirty tree | `scripts/tests/v3/harness/ops.test.py` | `scripts/tests/v3/route_adapter/` | none |
+| O-H5 | Route selection: weights, cooldown fallback, disabled-provider skip, pre-call budget refusal | `scripts/tests/v3/harness/harness.test.py` | `scripts/tests/v3/route_adapter/` | none |
 
 State on the base SHA: O-P6 and O-P7 are satisfied because they stay in place and never touch
 the boundary. The other ten oracles are carried only by legacy files, so they are `pending`.
-O-H2 and O-H3 name R#301's test as successor. That file is not on `master`, so they stay
-`pending` until R#301 merges and its test names are entered in the register.
+O-H1, O-H4 and O-H5 name the directory `scripts/tests/v3/route_adapter/` as their successor
+home. O-H2 and O-H3 name R#301's test. `Successor tests` is `none` on all five, so none of
+them can become `ported` until the file names are entered after R#301 merges. The provider
+stream fixtures (row H3) move with O-H1.
 
 **What `ported` does and does not mean.** It means the successor file exists, is wired into the
 gate, is free of boundary references, and contains the named tests. It does not mean anyone
@@ -209,22 +213,34 @@ job names are unchanged and this test runs in each. Optional, in a founder autho
 for a protected path: add `scripts/tests/v3/x1/inventory.test.py` to `REQUIRED_SUITE_TESTS` in
 `tools/ci_gate.py`, so the discovery pin lives in the gate itself as well.
 
-## 9. Open questions
+## 9. Decisions recorded 2026-10-26
 
-1. Settled: `planning/**` means `scripts/v3/planning/**` only (section 3, Dan and Samir).
-2. Name "the receipt tests" (section 3). Still open.
-3. Confirm each `port` and `drop` call, in particular H1 (route fallback tests as O-H5), H2
-   (land refusal as O-H4) and the drop of `incremental.test.py` given the perf tooling.
-4. Choose a successor path and test names for O-H1, O-H4 and O-H5, and enter R#301's test names
-   for O-H2 and O-H3. Until then they stay `pending`.
+Lucas decided these on CSL-495, comment `611d6aa4-100f-4dc5-b8eb-88a710049287`
+(Mon 2026-10-26 1:47 PM PT). His words: "I agree with your recommendations."
+The same comment says none of these block this PR. They bind the post-Nov 10 deletion PR.
+Dan was asked there to confirm the port and drop calls.
 
-Execution record: no Linear claim record was posted for this task. Its rules allowed one Linear
-comment, which was used for the review request on CSL-495. Lucas or a founder can decide whether
-a retroactive claim is wanted; this document does not depend on one.
+1. Decided: `planning/**` means `scripts/v3/planning/**` only (section 3, Dan and Samir).
+2. Decided: "the receipt tests" means `tools/test_claude_fixer_*`. Those files are outside
+   the deletion boundary and are kept. The receipt checks in P1 and P5 are ported anyway.
+3. Decided: the disposition table stands. O-H4 (land refusal) is **port**. O-H5 (route
+   selection: weights, cooldown fallback, skipping disabled providers, pre-call budget
+   refusal) is **port** and becomes part of the X2 route-contract conformance suite.
+   P6 `incremental.test.py` is **drop**. O-P1 still checks byte-identical digests. The
+   deletion PR still has to fix or retire `tools/perf_bench.py`.
+4. Decided: the successor home for O-H1, O-H4 and O-H5 is `scripts/tests/v3/route_adapter/`,
+   the keep-path. The provider stream fixtures move with O-H1. Test names are entered after
+   R#301 merges, along with O-H2 and O-H3. Until those names are in `Successor tests`, the
+   cell stays `none` and the oracle stays `pending`. The approved thin direct-Claude
+   fallback is built as new code under `route_adapter/`, not kept in `scripts/v3/harness/`.
+
+Execution record: no Linear claim was posted, and none will be added retroactively.
+Lucas's comment `611d6aa4` says the PR and its review request are the record. Commits
+carry no `Agent-Claim` trailer for that reason.
 
 ## 10. Verification and unverified items
 
 - Verified locally on the base SHA plus this change: `python -X utf8 -B tools/ci_gate.py` and
   the new test, with mutation checks listed in the PR body.
-- Unverified: the synthesis file contents beyond the sections cited; what "the receipt tests"
-  names; whether R#301 covers O-H2 and O-H3; GitHub CI on this PR head.
+- Unverified: the synthesis file contents beyond the sections cited; whether R#301 covers
+  O-H2 and O-H3 (test names are not entered until that PR merges); GitHub CI on this PR head.

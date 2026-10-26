@@ -274,6 +274,11 @@ class TokenFileTests(unittest.TestCase):
                 read_token_file(link)
             with self.assertRaises(TokenFileRefused):
                 read_token_file(Path(directory) / "missing")
+
+    def test_a_fifo_token_path_is_refused(self) -> None:
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("os.mkfifo is unavailable")
+        with tempfile.TemporaryDirectory() as directory:
             fifo = Path(directory) / "fifo"
             os.mkfifo(fifo)
             with self.assertRaises(TokenFileRefused):

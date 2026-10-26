@@ -35,11 +35,20 @@ combined workflows, persistent assistants, configurable communication and delega
 terminal controls, plugins, context/compaction, and Windows/Linux operation and recovery.
 The dedicated graphical application follows the initial terminal platform.
 
+Amendment proposed 2026-10-24 (acceptance is a human decision by Lucas): GUI timing in the
+sentence above is already superseded by D-038 (built but opt-in; no capability deferred).
+This amendment does not reopen D-038. **Beyond D-038** see
+[AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md) (daemon-served Tauri shell, standalone
+app, "goat" bar) and [PRODUCT.md](PRODUCT.md). Historical research-lane snapshots that
+still say "GUI later" are not rewritten. `ANCHOR.md` is not edited.
+
 Read only the specification slices needed for the assigned task:
 
 | Question | Authoritative product record |
 |---|---|
 | Product and first usable release | [PRODUCT](PRODUCT.md) |
+| 2026-10-24 proposed amendment (unaccepted) | [AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md) |
+| Research / open questions (F-1…F-15) | `CSL-Laboratories/csl-research` commit `250fdbbe2964e4889096a487e2dfb6d7794046a6`, path `submissions/20261025-recursion-csl494-rp0-amendment-research-01/` (candidate evidence; vault PR merged) |
 | Accepted direction and resolved Owner questions | [DECISION-REGISTER](DECISION-REGISTER.md), especially OR-021 through OR-039 |
 | Kernel, Head, ARMs and recovery | [ARCHITECTURE](ARCHITECTURE.md), [STATE](STATE.md) |
 | Task planning, amendments and delegation | [AUTONOMOUS-PLANNING](AUTONOMOUS-PLANNING.md), [EXECUTIVES](EXECUTIVES.md) |

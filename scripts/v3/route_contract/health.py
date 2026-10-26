@@ -13,6 +13,10 @@ import threading
 from dataclasses import dataclass
 from typing import Protocol
 
+_FENCE = re.compile(
+    r"\A```[A-Za-z0-9_+-]*[ \t]*\r?\n(?P<body>.*?)\r?\n?```\s*\Z",
+    re.S,
+)
 _LIMIT_PATTERNS = tuple(
     re.compile(pattern, flags)
     for pattern, flags in (
@@ -41,6 +45,14 @@ def looks_like_limit(text: str) -> bool:
     return any(pattern.search(text or "") for pattern in _LIMIT_PATTERNS)
 
 
+def strip_fence(text: str) -> str:
+    """Drop one surrounding Markdown fence. The body is the model payload."""
+
+    stripped = (text or "").strip()
+    match = _FENCE.match(stripped)
+    return match.group("body").strip() if match else stripped
+
+
 def no_nonfinite(constant: str) -> None:
     raise ValueError(f"non-finite JSON constant {constant!r}")
 
@@ -63,7 +75,7 @@ def limit_signal(stdout: str, stderr: str, prompt: str | None = None) -> bool:
 
     if looks_like_limit(scrub_prompt_echo(stderr or "", prompt)):
         return True
-    text = (stdout or "").strip()
+    text = strip_fence(stdout or "")
     if not text:
         return False
     try:

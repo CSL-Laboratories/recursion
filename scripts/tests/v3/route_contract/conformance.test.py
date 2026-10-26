@@ -154,6 +154,7 @@ def make_adapter(engine="claude", transport=None, *, health=None, driver=None, *
         driver=driver or make_driver(),
         health=health or InMemoryHealth(),
         validate=validate,
+        output_schema=OUTPUT_SCHEMA,
         **kwargs,
     )
 
@@ -945,6 +946,18 @@ class ReviewFixTests(unittest.TestCase):
             make_adapter(transport=transport).execute(make_request(output_schema={"type": "array"}))
         self.assertEqual([], transport.calls)
 
+    def test_request_schema_must_match_the_bound_validator(self) -> None:
+        transport = ScriptedTransport([proc(_ok_envelope())])
+        invoice = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["invoice_total"],
+            "properties": {"invoice_total": {"type": "number"}},
+        }
+        with self.assertRaises(Unsupported):
+            make_adapter(transport=transport).execute(make_request(output_schema=invoice))
+        self.assertEqual([], transport.calls)
+
     def test_non_object_body_is_not_reported_ok(self) -> None:
         payload = json.dumps([1, 2])
         transport = ScriptedTransport([
@@ -957,6 +970,7 @@ class ReviewFixTests(unittest.TestCase):
             driver=make_driver(),
             health=InMemoryHealth(),
             validate=lambda body: None,
+            output_schema=OUTPUT_SCHEMA,
         )
         request = make_request()
         result = adapter.execute(request)

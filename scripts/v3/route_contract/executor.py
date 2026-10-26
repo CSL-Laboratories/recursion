@@ -27,6 +27,7 @@ from scripts.v3.route_contract.model import (
     STATUS_TIMEOUT,
     ExecutionRequest,
     ExecutionResult,
+    canonical_json,
     sha256_digest,
 )
 from scripts.v3.route_contract.transport import ProcResult, Transport
@@ -141,16 +142,18 @@ class ReferenceAdapter:
         driver: FakeRouteDriver,
         health: HealthPort,
         validate: Validate,
+        output_schema: dict,
         secret_values: argv_mod.SecretSource = None,
         pinned_cwd: str | None = None,
     ) -> None:
-        if engine_id not in argv_mod.ENGINES:
+        if engine_id not in argv_mod.ENGINES or not object_output_schema(output_schema):
             raise Unsupported()
         self.engine_id = engine_id
         self._transport = transport
         self._driver = driver
         self._health = health
         self._validate = validate
+        self._output_schema_digest = sha256_digest(canonical_json(output_schema))
         self._secret_values = secret_values
         self._pinned_cwd = pinned_cwd
 
@@ -167,7 +170,7 @@ class ReferenceAdapter:
     def execute(self, request: ExecutionRequest) -> ExecutionResult:
         if request.engine_id != self.engine_id:
             raise Unsupported()
-        if not object_output_schema(request.output_schema):
+        if sha256_digest(canonical_json(request.output_schema)) != self._output_schema_digest:
             raise Unsupported()
         if request.allowed_tools:
             raise ToolPolicyRefused()

@@ -1,7 +1,8 @@
 ---
 title: Recursion v3 interface strategy (CLI, TUI, GUI)
-status: accepted-design-baseline
-last-updated: 2026-10-02
+status: amendment proposed (2026-10-24); acceptance is a human decision by Lucas
+last-updated: 2026-10-25
+prior-status: accepted-design-baseline
 authority: non-normative until ratified
 ---
 
@@ -22,6 +23,13 @@ and layouts are design candidates, not runnable product instructions.
 | Interactive TUI | Live conversation, focused work views, keyboard-first steering/queueing, inbox, split/attached views, task switching, compact inspect panels | Owning actor/process lifetime; hidden model invocation on attach; full log repaint on every token |
 | Later GUI | Spatial project/session navigation, artifact/diff review, visually clear lineage, context comparison, richer provenance inspection, accessible responsive views | Different command meanings; bypassing the common admission path; a mandatory always-on dashboard |
 | Optional transports and observers | Authorized projections and separately scoped control operations | Treating channel membership or message delivery as task authority |
+
+Amendment proposed 2026-10-24 (acceptance is a human decision by Lucas): the "Later GUI"
+row keeps its object-graph meaning. Timing was already superseded by D-038 (accepted
+2026-10-02): GUI and mobile are built but opt-in in the first release. This amendment
+does not reopen D-038. **Beyond D-038** it names a daemon-served web GUI in a thin Tauri
+shell, plus standalone app and CLI/TUI. See [AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md).
+The GUI must not own actor lifetime (window-close ≠ Stop).
 
 Views never own agent lifetime. The observer interface is read-only by default; control is a
 separate authenticated capability. A local CLI need not become a publicly listening service.
@@ -120,3 +128,11 @@ against strong source-supported baselines.
 - No graphical frontend in the initial release; terminal first, GUI later.
 - No view, tab, channel or message delivery confers authority.
 - No natural-language proposal silently becomes an authority change.
+
+Amendment proposed 2026-10-24 (F-2 answered by D-038, accepted 2026-10-02; acceptance of
+this addendum is a human decision by Lucas): the first non-goal is already superseded by
+D-038 — GUI and mobile are built but opt-in; no capability is deferred. This amendment
+does not reopen D-038. **Beyond D-038** it adds a daemon-served GUI in a thin Tauri shell
+on Linux, Windows and macOS, a standalone app, and the "goat" bar. The second and third
+non-goals stand. Demonstration journeys are to be completable in the GUI as well as the
+CLI (research RR4). Full text: [AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md).

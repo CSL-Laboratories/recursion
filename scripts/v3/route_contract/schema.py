@@ -16,8 +16,8 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[3]
 FROZEN_PATH = ROOT / "schemas" / "control-plane" / "v3" / "execution" / "schema.json"
-CONTRACT_PATH = ROOT / "schemas" / "control-plane" / "v3" / "route-contract" / "schema.json"
-CONTRACT_ID = "https://recursion.local/schemas/control-plane/v3/route-contract/schema.json"
+CONTRACT_PATH = Path(__file__).resolve().parent / "schema.json"
+CONTRACT_ID = "https://recursion.local/scripts/v3/route-contract/schema.json"
 
 PROJECTED = (
     "RouteCapabilityDescriptor",
@@ -32,6 +32,7 @@ ERROR_TOKENS = (
     "breaker_open",
     "empty_output",
     "limit_or_error",
+    "output_too_large",
     "repair_empty_output",
     "repair_limit_or_error",
     "repair_still_invalid",

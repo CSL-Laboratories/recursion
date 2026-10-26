@@ -12,7 +12,8 @@ route to the private research vault is granted to this task, so no vault record 
 Lucas decided (his words, Mon 2026-10-26 11:59 AM PT): "Decision 3: approve keep-paths and
 boundary, push pre-x1 tags, delete after the Nov 10 rehearsal".
 
-- Keep-paths: `scripts/v3/route_adapter/**` and the receipt tests.
+- Keep-paths: `scripts/v3/route_adapter/**` and the receipt tests
+  (`tools/test_claude_fixer_*`).
 - Recursion deletion boundary: `scripts/v3/harness/**` and `planning/**`.
 - Deletion happens only after the Nov 10 rehearsal. Nothing is deleted now.
 - Source plan: the attached step 4 synthesis, section 6 (WP14), section 7 (decision 3), and
@@ -54,10 +55,11 @@ git push origin refs/tags/pre-x1-recursion-20261026
 - Keep-paths: `scripts/v3/route_adapter/**`. It does not exist on `master` yet. R#301
   (CSL-537, open) adds it, with its test at `scripts/tests/v3/route_adapter/at1.test.py`. The
   boundary does not overlap it.
-- "The receipt tests" is not defined in the decision text, and this task could not verify what
-  it names. The only files named for receipts in this repository are `tools/test_claude_fixer_*`
-  tests, which sit outside the boundary and are unaffected. If it means the receipt assertions
-  inside the planning tests, rows P1 and P5 need a `keep` review.
+- "The receipt tests" are `tools/test_claude_fixer_guard.py`,
+  `tools/test_claude_fixer_publish.py` and `tools/test_claude_fixer_receipts.py`. Lucas ruled
+  this on CSL-495 comment `611d6aa4` (his words, Mon 2026-10-26 1:47 PM PT: "I agree with your
+  recommendations."). Those files sit outside the deletion boundary and are kept. The receipt
+  checks inside P1 and P5 stay `port`. The floor pins the three files and fails if one is missing.
 
 ## 4. Disposition table
 
@@ -212,19 +214,22 @@ for a protected path: add `scripts/tests/v3/x1/inventory.test.py` to `REQUIRED_S
 ## 9. Open questions
 
 1. Settled: `planning/**` means `scripts/v3/planning/**` only (section 3, Dan and Samir).
-2. Name "the receipt tests" (section 3). Still open.
+2. Settled: "the receipt tests" means `tools/test_claude_fixer_*` (CSL-495 comment `611d6aa4`,
+   Lucas, Mon 2026-10-26 1:47 PM PT). They are outside the boundary and kept. P1 and P5 receipt
+   checks stay ported.
 3. Confirm each `port` and `drop` call, in particular H1 (route fallback tests as O-H5), H2
    (land refusal as O-H4) and the drop of `incremental.test.py` given the perf tooling.
 4. Choose a successor path and test names for O-H1, O-H4 and O-H5, and enter R#301's test names
    for O-H2 and O-H3. Until then they stay `pending`.
 
-Execution record: no Linear claim record was posted for this task. Its rules allowed one Linear
-comment, which was used for the review request on CSL-495. Lucas or a founder can decide whether
-a retroactive claim is wanted; this document does not depend on one.
+Execution record: no Linear claim record was posted, and none will be added. Lucas ruled on
+CSL-495 comment `611d6aa4` (Mon 2026-10-26 1:47 PM PT): there is no retroactive claim record.
+The PR and the review request on CSL-495 are the record.
 
 ## 10. Verification and unverified items
 
 - Verified locally on the base SHA plus this change: `python -X utf8 -B tools/ci_gate.py` and
   the new test, with mutation checks listed in the PR body.
-- Unverified: the synthesis file contents beyond the sections cited; what "the receipt tests"
-  names; whether R#301 covers O-H2 and O-H3; GitHub CI on this PR head.
+- Unverified: the synthesis file contents beyond the sections cited; whether R#301 covers
+  O-H2 and O-H3; GitHub CI on this PR head. The receipt-test name and the claim record are
+  settled by CSL-495 comment `611d6aa4`.

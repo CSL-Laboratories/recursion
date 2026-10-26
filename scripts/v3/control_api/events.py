@@ -78,8 +78,11 @@ class EventJournal:
         limit = max(1, min(int(limit), MAX_POLL_EVENTS))
         wait_s = max(0.0, min(float(wait_s), MAX_WAIT_SECONDS))
         with self._cond:
-            if wait_s and not self._visible(tenant, after):
-                self._cond.wait_for(lambda: self._visible(tenant, after), timeout=wait_s)
+            if wait_s and after >= self._dropped_through and not self._visible(tenant, after):
+                self._cond.wait_for(
+                    lambda: after < self._dropped_through or self._visible(tenant, after),
+                    timeout=wait_s,
+                )
             reset = after < self._dropped_through
             start = max(after, self._dropped_through)
             out: list[dict[str, Any]] = []

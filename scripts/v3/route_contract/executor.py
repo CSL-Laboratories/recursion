@@ -33,6 +33,7 @@ from scripts.v3.route_contract.model import (
 from scripts.v3.route_contract.transport import ProcResult, Transport
 
 REPAIR_REASON_CHARS = 500
+REPAIR_REASON_TOKEN = "schema_validation_failed"
 _REPAIR_PREFIX = "\n\nYour previous output was rejected: "
 _REPAIR_SUFFIX = "\nReturn ONLY corrected JSON that matches the required schema; no prose."
 _FENCE = re.compile(r"\A```[A-Za-z0-9_+-]*[ \t]*\r?\n(?P<body>.*?)\r?\n?```\s*\Z", re.S)
@@ -41,7 +42,10 @@ Validate = Callable[[Any], "str | None"]
 
 
 def repair_prompt_for(prompt: str, reason: object) -> str:
-    return prompt + _REPAIR_PREFIX + str(reason)[:REPAIR_REASON_CHARS] + _REPAIR_SUFFIX
+    """Build the one repair prompt. ``reason`` is ignored: validator text can quote instance values."""
+
+    del reason
+    return prompt + _REPAIR_PREFIX + REPAIR_REASON_TOKEN + _REPAIR_SUFFIX
 
 
 def _strip_fence(text: str) -> str:
@@ -211,7 +215,13 @@ class ReferenceAdapter:
         argv_mod.assert_no_secret(argv, prompt, self._secret_values)
 
     def _call(self, request: ExecutionRequest, argv: list[str], prompt: str) -> ProcResult:
-        return self._transport.run(argv, prompt, request.timeout_s, request.cwd)
+        return self._transport.run(
+            argv,
+            prompt,
+            request.timeout_s,
+            request.cwd,
+            max_output_bytes=request.max_output_bytes,
+        )
 
     def _fault(
         self, proc: ProcResult, error: str, state: str, status: str, *, repaired: bool
@@ -249,6 +259,8 @@ class ReferenceAdapter:
             error, status = "timeout", STATUS_TIMEOUT
         elif proc.returncode != 0 or limit_signal(proc.stdout or "", proc.stderr or "", prompt):
             pass
+        elif len((proc.stdout or "").encode("utf-8")) > request.max_output_bytes:
+            pass
         elif not (proc.stdout or "").strip():
             error, state = "empty_output", "degraded"
         else:
@@ -269,9 +281,7 @@ class ReferenceAdapter:
         fault, parsed, session, body = self._checked(request, request.prompt, proc, repaired=False)
         if fault is not None:
             return fault
-        reason = (
-            "output was not valid JSON" if parsed is None else self._validate(body)
-        )
+        reason = self._payload_reason(parsed, body)
         if reason is None:
             return self._ok(proc, body, session, repaired=False)
         repair_prompt = repair_prompt_for(request.prompt, reason)
@@ -280,7 +290,7 @@ class ReferenceAdapter:
         fault, parsed, session2, body2 = self._checked(request, repair_prompt, proc2, repaired=True)
         if fault is not None:
             return fault
-        reason2 = "output was not valid JSON" if parsed is None else self._validate(body2)
+        reason2 = self._payload_reason(parsed, body2)
         if reason2 is None:
             return self._ok(proc2, body2, session2 or session, repaired=True)
         return ExecutionResult(
@@ -291,12 +301,27 @@ class ReferenceAdapter:
             output_digest=sha256_digest(proc2.stdout),
         )
 
+    def _payload_reason(self, parsed: Any, body: Any) -> str | None:
+        if parsed is None:
+            return "output was not valid JSON"
+        if not isinstance(body, dict):
+            return "output was not a JSON object"
+        return self._validate(body)
+
     def _ok(
         self, proc: ProcResult, body: Any, session: str | None, *, repaired: bool
     ) -> ExecutionResult:
+        if not isinstance(body, dict):
+            return ExecutionResult(
+                status=STATUS_NEEDS_HUMAN,
+                error="repair_still_invalid" if repaired else "unparseable_output",
+                repaired=repaired,
+                session_id=session,
+                output_digest=sha256_digest(proc.stdout),
+            )
         return ExecutionResult(
             status=STATUS_OK,
-            validated=body if isinstance(body, dict) else None,
+            validated=body,
             session_id=session,
             repaired=repaired,
             output_digest=sha256_digest(proc.stdout),

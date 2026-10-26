@@ -92,8 +92,16 @@ class ScriptedTransport:
         self.results = list(results)
         self.calls: list[dict] = []
 
-    def run(self, argv, input_text, timeout_s, cwd):
-        self.calls.append({"argv": list(argv), "input": input_text, "timeout_s": timeout_s, "cwd": cwd})
+    def run(self, argv, input_text, timeout_s, cwd, max_output_bytes=None):
+        self.calls.append(
+            {
+                "argv": list(argv),
+                "input": input_text,
+                "timeout_s": timeout_s,
+                "cwd": cwd,
+                "max_output_bytes": max_output_bytes,
+            }
+        )
         return self.results.pop(0)
 
 
@@ -397,10 +405,12 @@ class SecretRefusalTests(unittest.TestCase):
         driver = make_driver()
         adapter = make_adapter(transport=transport, driver=driver, secret_values=[CANARY])
         request = make_request()
-        with self.assertRaises(SecretRefused):
-            adapter.execute(request)
-        self.assertEqual(1, len(transport.calls), "the repair call must not spawn")
-        self.assertFalse(driver.owner.is_busy(request.session), "session released after refusal")
+        result = adapter.execute(request)
+        self.assertEqual("ok", result.status)
+        self.assertEqual(2, len(transport.calls), "repair proceeds without echoing the rejected body")
+        self.assertNotIn(CANARY, transport.calls[1]["input"])
+        self.assertNotIn(CANARY, json.dumps(result.to_record(request)))
+        self.assertFalse(driver.owner.is_busy(request.session), "session released after success")
 
     def test_custody_refuses_unknown_and_cross_tenant_refs(self) -> None:
         transport = ScriptedTransport([proc(_ok_envelope())])
@@ -533,6 +543,24 @@ _HELPER_OK = textwrap.dedent(
     print(json.dumps({"session_id": "s-local", "result": json.dumps({"label": "b", "score": 2})}))
     """
 )
+_HELPER_ORPHAN = textwrap.dedent(
+    """
+    import os, subprocess, sys
+    pid_file = sys.argv[1]
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    with open(pid_file, "w") as handle:
+        handle.write(str(child.pid))
+    os._exit(0)
+    """
+)
+_HELPER_BIG = textwrap.dedent(
+    """
+    import json, sys
+    sys.stdin.read()
+    print("x" * 4096)
+    print(json.dumps({"session_id": "s-big", "result": json.dumps({"label": "a", "score": 1})}))
+    """
+)
 
 
 class LocalHelperTransport:
@@ -543,9 +571,15 @@ class LocalHelperTransport:
         self.inner = SubprocessTransport()
         self.seen_argv: list[list[str]] = []
 
-    def run(self, argv, input_text, timeout_s, cwd):
+    def run(self, argv, input_text, timeout_s, cwd, max_output_bytes=None):
         self.seen_argv.append(list(argv))
-        return self.inner.run([sys.executable, *self.helper_args], input_text, timeout_s, cwd)
+        return self.inner.run(
+            [sys.executable, *self.helper_args],
+            input_text,
+            timeout_s,
+            cwd,
+            max_output_bytes=max_output_bytes,
+        )
 
 
 def pid_alive(pid: int) -> bool:
@@ -614,6 +648,29 @@ class TreeKillTests(unittest.TestCase):
         self.assertEqual("ok", result.status)
         self.assertEqual({"label": "b", "score": 2}, result.validated)
 
+    def test_timeout_kills_descendants_after_the_parent_exits(self) -> None:
+        helper = self.write("orphan.py", _HELPER_ORPHAN)
+        pid_file = str(self.tmpdir / "orphan.pid")
+        started = time.monotonic()
+        result = SubprocessTransport().run([sys.executable, helper, pid_file], "", 1.5, None)
+        elapsed = time.monotonic() - started
+        self.assertTrue(result.timed_out)
+        self.assertEqual(124, result.returncode)
+        self.assertLess(elapsed, 1.5 + 10.0)
+        child = int(Path(pid_file).read_text(encoding="utf-8"))
+        self.assertFalse(pid_alive(child), "an orphaned grandchild must still be killed")
+        self.assertEqual("terminated", result.termination["tree_status"])
+
+    def test_oversize_stdout_is_a_limit_and_does_not_validate(self) -> None:
+        helper = self.write("big.py", _HELPER_BIG)
+        result = SubprocessTransport().run(
+            [sys.executable, helper], "", 5.0, None, max_output_bytes=64
+        )
+        self.assertFalse(result.timed_out)
+        self.assertEqual(1, result.returncode)
+        self.assertLessEqual(len(result.stdout.encode("utf-8")), 64)
+        self.assertIn("[output_limit]", result.stderr)
+
     def test_partial_tree_is_reported_not_hidden(self) -> None:
         class Stubborn:
             pid = 4242
@@ -644,7 +701,7 @@ class SessionOwnershipTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.calls = 0
 
-            def run(self, argv, input_text, timeout_s, cwd):
+            def run(self, argv, input_text, timeout_s, cwd, max_output_bytes=None):
                 self.calls += 1
                 try:
                     make_adapter(transport=ScriptedTransport([]), driver=driver).execute(make_request())
@@ -665,6 +722,37 @@ class SessionOwnershipTests(unittest.TestCase):
             request = make_request(session=session)
             make_adapter(transport=ScriptedTransport(script), driver=driver).execute(request)
             self.assertFalse(driver.owner.is_busy(session), index)
+
+    def test_oversize_scripted_stdout_does_not_validate(self) -> None:
+        raw = json.dumps({"session_id": "s1", "result": json.dumps({"label": "a", "score": 1})})
+        padded = raw + (" " * 256)
+        transport = ScriptedTransport([ProcResult(0, padded, "", False)])
+        request = make_request(max_output_bytes=32)
+        result = make_adapter(transport=transport).execute(request)
+        self.assertEqual(("limit_hit", "limit_or_error"), (result.status, result.error))
+        self.assertIsNone(result.validated)
+        assert_valid(self, "RouteExecutionResult", result.to_record(request))
+        self.assertEqual(32, transport.calls[0]["max_output_bytes"])
+
+    def test_non_object_body_is_not_ok_even_when_the_validator_accepts_it(self) -> None:
+        stdout = json.dumps({"session_id": "s-arr", "result": [1, 2, 3]})
+        transport = ScriptedTransport(
+            [ProcResult(0, stdout, "", False), ProcResult(0, stdout, "", False)]
+        )
+        adapter = ReferenceAdapter(
+            "claude",
+            transport=transport,
+            driver=make_driver(),
+            health=InMemoryHealth(),
+            validate=lambda body: None if isinstance(body, list) else "not-array",
+        )
+        request = make_request()
+        result = adapter.execute(request)
+        self.assertEqual(("needs_human_review", "repair_still_invalid"), (result.status, result.error))
+        self.assertIsNone(result.validated)
+        assert_valid(self, "RouteExecutionResult", result.to_record(request))
+        self.assertEqual(2, len(transport.calls))
+        self.assertNotIn("[1, 2, 3]", transport.calls[1]["input"])
 
     def test_prompt_body_is_not_stored_in_driver_state(self) -> None:
         driver = make_driver()
@@ -708,6 +796,17 @@ class LiveAdaptersUnsupportedTests(unittest.TestCase):
             with mock.patch.object(subprocess, "Popen", side_effect=AssertionError("spawned")):
                 with self.assertRaises(Unsupported):
                     SubprocessTransport().run([binary, "-p"], "", 1.0, None)
+
+    def test_symlink_to_a_provider_cli_is_refused_without_spawning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "claude"
+            target.write_text("#!/bin/sh\necho no\n", encoding="utf-8")
+            target.chmod(0o755)
+            alias = Path(tmp) / "harmless-helper"
+            alias.symlink_to(target)
+            with mock.patch.object(subprocess, "Popen", side_effect=AssertionError("spawned")):
+                with self.assertRaises(Unsupported):
+                    SubprocessTransport().run([str(alias), "-p"], "", 1.0, None)
 
     def test_provider_cli_through_the_real_transport_is_unsupported_and_releases_the_session(self) -> None:
         driver = make_driver()

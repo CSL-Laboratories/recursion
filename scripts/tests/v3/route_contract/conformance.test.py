@@ -409,6 +409,30 @@ class SecretRefusalTests(unittest.TestCase):
             adapter.execute(make_request(prompt="carries rotated-secret"))
         self.assertEqual(1, len(transport.calls))
 
+    def test_rotated_secret_list_is_read_live(self) -> None:
+        values = ["old-secret"]
+        transport = ScriptedTransport([proc(_ok_envelope()), proc(_ok_envelope())])
+        adapter = make_adapter(transport=transport, secret_values=values)
+        adapter.execute(make_request(prompt="carries rotated-secret"))
+        values[:] = ["rotated-secret"]
+        with self.assertRaises(SecretRefused):
+            adapter.execute(make_request(prompt="carries rotated-secret"))
+        self.assertEqual(1, len(transport.calls))
+        self.assertNotIn("rotated-secret", json.dumps(transport.calls[0]["argv"]))
+
+    def test_secret_added_to_a_collection_is_refused(self) -> None:
+        for values in (["old-secret"], {"old-secret"}):
+            with self.subTest(kind=type(values).__name__):
+                transport = ScriptedTransport([proc(_ok_envelope())])
+                adapter = make_adapter(transport=transport, secret_values=values)
+                if isinstance(values, list):
+                    values.append("added-secret")
+                else:
+                    values.add("added-secret")
+                with self.assertRaises(SecretRefused):
+                    adapter.execute(make_request(prompt="carries added-secret"))
+                self.assertEqual([], transport.calls)
+
     def test_repair_prompt_is_checked_too(self) -> None:
         request = make_request(prompt=f"please use {CANARY}")
         self.assertIn(CANARY, repair_prompt_for(request.prompt, "ignored"))
@@ -566,6 +590,16 @@ _HELPER_OK = textwrap.dedent(
     """
 )
 
+_HELPER_NEAR_CAP = textwrap.dedent(
+    """
+    import sys, time
+    sys.stdin.read()
+    sys.stdout.write("x" * int(sys.argv[1]))
+    sys.stdout.flush()
+    time.sleep(60)
+    """
+)
+
 
 class LocalHelperTransport:
     """Rewrites provider argv to a local helper. The real kill path still runs."""
@@ -640,6 +674,18 @@ class TreeKillTests(unittest.TestCase):
         again = adapter.execute(make_request(timeout_s=1.5))
         self.assertEqual("breaker_open", again.error)
         self.assertEqual(VECTORS["argv"]["claude"], transport.seen_argv[0])
+
+    def test_real_near_cap_timeout_is_classified_as_timeout(self) -> None:
+        helper = self.write("near_cap.py", _HELPER_NEAR_CAP)
+        for size in (100, 91):
+            with self.subTest(stdout_bytes=size):
+                transport = LocalHelperTransport([helper, str(size)])
+                health = InMemoryHealth()
+                request = make_request(timeout_s=1.5, max_output_bytes=100)
+                result = make_adapter(transport=transport, health=health).execute(request)
+                self.assertEqual(("timeout", "timeout"), (result.status, result.error))
+                self.assertEqual([("claude", "exhausted", "timeout")], health.faults)
+                assert_valid(self, "RouteExecutionResult", result.to_record(request))
 
     def test_real_process_success_path(self) -> None:
         helper = self.write("ok.py", _HELPER_OK)
@@ -910,6 +956,28 @@ class ReviewFixTests(unittest.TestCase):
         assert_valid(self, "RouteExecutionResult", record)
         self.assertEqual("repair_output_too_large", record["health_event"]["error"])
         self.assertEqual("partial", record["termination"]["tree_status"])
+
+    def test_near_cap_timeout_stays_a_timeout(self) -> None:
+        # The transport appends "\n[timeout]" (10 bytes) to stderr on a timeout.
+        # That diagnostic is not engine output, so output at or near the cap
+        # must still classify as a timeout, not output_too_large.
+        for size in (100, 91):
+            with self.subTest(stdout_bytes=size):
+                health = InMemoryHealth()
+                transport = ScriptedTransport([ProcResult(124, "x" * size, "\n[timeout]", True)])
+                request = make_request(max_output_bytes=100)
+                result = make_adapter(transport=transport, health=health).execute(request)
+                self.assertEqual(("timeout", "timeout"), (result.status, result.error))
+                self.assertEqual([("claude", "exhausted", "timeout")], health.faults)
+                record = result.to_record(request)
+                assert_valid(self, "RouteExecutionResult", record)
+                self.assertEqual("timeout", record["health_event"]["error"])
+
+    def test_oversized_kill_outranks_timeout(self) -> None:
+        transport = ScriptedTransport([ProcResult(1, "", "", True, oversized=True)])
+        request = make_request(max_output_bytes=100)
+        result = make_adapter(transport=transport).execute(request)
+        self.assertEqual(("limit_hit", "output_too_large"), (result.status, result.error))
 
     def test_scripted_oversized_output_is_rejected(self) -> None:
         huge = "x" * 4096

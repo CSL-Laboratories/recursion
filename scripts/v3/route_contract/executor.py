@@ -253,10 +253,16 @@ class ReferenceAdapter:
     ) -> tuple[ExecutionResult | None, Any, str | None, Any]:
         parsed, session, body = None, None, None
         error, state, status = "limit_or_error", "exhausted", STATUS_LIMIT_HIT
-        if proc.oversized or _output_bytes(proc) > request.max_output_bytes:
+        # A timeout ranks before the byte count: the transport appends a
+        # "[timeout]" diagnostic to stderr, which is not engine output and must
+        # not turn a near-cap timeout into output_too_large. A transport that
+        # killed the process for size reports oversized, which ranks first.
+        if proc.oversized:
             error, status = "output_too_large", STATUS_LIMIT_HIT
         elif proc.timed_out:
             error, status = "timeout", STATUS_TIMEOUT
+        elif _output_bytes(proc) > request.max_output_bytes:
+            error, status = "output_too_large", STATUS_LIMIT_HIT
         elif proc.returncode != 0 or limit_signal(proc.stdout or "", proc.stderr or "", prompt):
             pass
         elif not (proc.stdout or "").strip():

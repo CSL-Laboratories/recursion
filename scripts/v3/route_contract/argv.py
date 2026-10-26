@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 
 from scripts.v3.route_contract.errors import CwdRefused, SecretRefused, ToolPolicyRefused
 
@@ -123,11 +123,17 @@ SecretSource = Iterable[str] | Callable[[], Iterable[str]] | None
 
 
 def materialize_secrets(secret_values: SecretSource) -> SecretSource:
-    """Copy a one-shot iterable once. Callables stay lazy and are read per check."""
+    """Copy a one-shot iterator once; keep anything re-iterable live.
 
-    if secret_values is None or callable(secret_values):
-        return secret_values
-    return tuple(secret_values)
+    Callables and collections (a list the caller rotates in place, a set) are
+    kept by reference and read on every check, so a rotated secret is refused
+    from the next check on. Only a one-shot iterator is copied, because it can
+    be read only once.
+    """
+
+    if isinstance(secret_values, Iterator):
+        return tuple(secret_values)
+    return secret_values
 
 
 def assert_no_secret(argv: Iterable[str], prompt: str, secret_values: SecretSource) -> None:
@@ -135,6 +141,6 @@ def assert_no_secret(argv: Iterable[str], prompt: str, secret_values: SecretSour
 
     values = secret_values() if callable(secret_values) else secret_values
     tokens = list(argv)
-    for secret in values or ():
+    for secret in tuple(values or ()):
         if secret and (secret in prompt or any(secret in token for token in tokens)):
             raise SecretRefused()

@@ -122,6 +122,14 @@ def assert_cwd(cwd: str | None, *, pinned_cwd: str | None) -> None:
 SecretSource = Iterable[str] | Callable[[], Iterable[str]] | None
 
 
+def materialize_secrets(secret_values: SecretSource) -> SecretSource:
+    """Copy a one-shot iterable once. Callables stay lazy and are read per check."""
+
+    if secret_values is None or callable(secret_values):
+        return secret_values
+    return tuple(secret_values)
+
+
 def assert_no_secret(argv: Iterable[str], prompt: str, secret_values: SecretSource) -> None:
     """Refuse when any provisioned secret value is in the prompt or any argv token."""
 

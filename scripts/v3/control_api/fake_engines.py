@@ -74,7 +74,12 @@ class FakeEngineTransport:
         self._lock = threading.Lock()
 
     def run(
-        self, argv: list[str], input_text: str, timeout_s: float, cwd: str | None
+        self,
+        argv: list[str],
+        input_text: str,
+        timeout_s: float,
+        cwd: str | None,
+        max_output_bytes: int | None = None,
     ) -> ProcResult:
         argv_mod.inspect_argv(argv)
         if Path(argv[0]).name != self.engine:

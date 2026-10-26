@@ -71,6 +71,10 @@ class _Server(ThreadingHTTPServer):
         if refuse:
             payload = b'{"error":"too_many_connections"}'
             try:
+                request.settimeout(1.0)
+            except OSError:
+                pass
+            try:
                 request.sendall(
                     b"HTTP/1.1 503 Service Unavailable\r\n"
                     b"Content-Type: application/json\r\n"

@@ -41,7 +41,10 @@ from scripts.v3.route_contract.errors import (  # noqa: E402
     ToolPolicyRefused,
     Unsupported,
 )
-from scripts.v3.route_contract.executor import ReferenceAdapter  # noqa: E402
+from scripts.v3.route_contract.executor import (  # noqa: E402
+    ReferenceAdapter,
+    repair_prompt_for,
+)
 from scripts.v3.route_contract.health import InMemoryHealth  # noqa: E402
 from scripts.v3.route_contract.model import ExecutionRequest, sha256_digest  # noqa: E402
 from scripts.v3.route_contract.transport import (  # noqa: E402
@@ -92,8 +95,14 @@ class ScriptedTransport:
         self.results = list(results)
         self.calls: list[dict] = []
 
-    def run(self, argv, input_text, timeout_s, cwd):
-        self.calls.append({"argv": list(argv), "input": input_text, "timeout_s": timeout_s, "cwd": cwd})
+    def run(self, argv, input_text, timeout_s, cwd, max_output_bytes=None):
+        self.calls.append({
+            "argv": list(argv),
+            "input": input_text,
+            "timeout_s": timeout_s,
+            "cwd": cwd,
+            "max_output_bytes": max_output_bytes,
+        })
         return self.results.pop(0)
 
 
@@ -391,16 +400,15 @@ class SecretRefusalTests(unittest.TestCase):
         self.assertEqual(1, len(transport.calls))
 
     def test_repair_prompt_is_checked_too(self) -> None:
-        bad = {"returncode": 0, "stdout": json.dumps({"result": json.dumps({"label": CANARY, "score": 1})}),
-               "stderr": "", "timed_out": False}
-        transport = ScriptedTransport([proc(bad), proc(_ok_envelope())])
-        driver = make_driver()
-        adapter = make_adapter(transport=transport, driver=driver, secret_values=[CANARY])
-        request = make_request()
+        request = make_request(prompt=f"please use {CANARY}")
+        self.assertIn(CANARY, repair_prompt_for(request.prompt, "ignored"))
+        transport = ScriptedTransport([proc(_ok_envelope())])
+        adapter = make_adapter(
+            transport=transport, secret_values=[CANARY]
+        )
         with self.assertRaises(SecretRefused):
             adapter.execute(request)
-        self.assertEqual(1, len(transport.calls), "the repair call must not spawn")
-        self.assertFalse(driver.owner.is_busy(request.session), "session released after refusal")
+        self.assertEqual([], transport.calls)
 
     def test_custody_refuses_unknown_and_cross_tenant_refs(self) -> None:
         transport = ScriptedTransport([proc(_ok_envelope())])
@@ -543,9 +551,11 @@ class LocalHelperTransport:
         self.inner = SubprocessTransport()
         self.seen_argv: list[list[str]] = []
 
-    def run(self, argv, input_text, timeout_s, cwd):
+    def run(self, argv, input_text, timeout_s, cwd, max_output_bytes=None):
         self.seen_argv.append(list(argv))
-        return self.inner.run([sys.executable, *self.helper_args], input_text, timeout_s, cwd)
+        return self.inner.run(
+            [sys.executable, *self.helper_args], input_text, timeout_s, cwd, max_output_bytes
+        )
 
 
 def pid_alive(pid: int) -> bool:
@@ -644,7 +654,7 @@ class SessionOwnershipTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.calls = 0
 
-            def run(self, argv, input_text, timeout_s, cwd):
+            def run(self, argv, input_text, timeout_s, cwd, max_output_bytes=None):
                 self.calls += 1
                 try:
                     make_adapter(transport=ScriptedTransport([]), driver=driver).execute(make_request())
@@ -755,6 +765,131 @@ class StaticBoundaryTests(unittest.TestCase):
             text = path.read_text(encoding="utf-8")
             self.assertNotIn("os.environ[", text, path.name)
             self.assertNotIn("putenv", text, path.name)
+
+    def test_generated_schema_is_not_under_protected_schemas(self) -> None:
+        protected = ROOT / "schemas" / "control-plane" / "v3" / "route-contract"
+        self.assertFalse(protected.exists(), "route-contract schema must not land under schemas/")
+        self.assertEqual(CONTRACT_DIR / "schema.json", schema_mod.CONTRACT_PATH)
+        self.assertTrue(schema_mod.CONTRACT_PATH.is_file())
+
+
+_HELPER_ORPHAN = textwrap.dedent(
+    """
+    import os, subprocess, sys
+    pid_file = sys.argv[1]
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import sys, time; sys.stdout.write('still-running'); sys.stdout.flush(); time.sleep(60)"]
+    )
+    with open(pid_file, "w") as handle:
+        handle.write(str(child.pid))
+    os._exit(0)
+    """
+)
+_HELPER_OVERSIZE = textwrap.dedent(
+    """
+    import sys
+    sys.stdin.read()
+    sys.stdout.write("x" * (1024 * 1024))
+    """
+)
+
+
+class ReviewFixTests(unittest.TestCase):
+    def test_max_output_bytes_reaches_the_transport(self) -> None:
+        transport = ScriptedTransport([proc(_ok_envelope())])
+        make_adapter(transport=transport).execute(make_request(max_output_bytes=4096))
+        self.assertEqual(4096, transport.calls[0]["max_output_bytes"])
+
+    def test_scripted_oversized_output_is_rejected(self) -> None:
+        huge = "x" * 4096
+        transport = ScriptedTransport([ProcResult(0, huge, "", False)])
+        request = make_request(max_output_bytes=128)
+        result = make_adapter(transport=transport).execute(request)
+        self.assertEqual(("limit_hit", "output_too_large"), (result.status, result.error))
+        self.assertIsNone(result.validated)
+        assert_valid(self, "RouteExecutionResult", result.to_record(request))
+
+    def test_transport_enforces_the_byte_cap_and_reaps(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        helper = Path(tmp.name) / "oversize.py"
+        helper.write_text(_HELPER_OVERSIZE, encoding="utf-8")
+        result = SubprocessTransport().run(
+            [sys.executable, str(helper)], "", 5.0, None, max_output_bytes=1024
+        )
+        self.assertTrue(result.oversized)
+        self.assertEqual("", result.stdout)
+        self.assertLess(len(result.stdout) + len(result.stderr), 2048)
+
+    def test_non_object_output_schema_is_refused_before_spawn(self) -> None:
+        transport = ScriptedTransport([proc(_ok_envelope())])
+        with self.assertRaises(Unsupported):
+            make_adapter(transport=transport).execute(make_request(output_schema={"type": "array"}))
+        self.assertEqual([], transport.calls)
+
+    def test_non_object_body_is_not_reported_ok(self) -> None:
+        payload = json.dumps([1, 2])
+        transport = ScriptedTransport([
+            ProcResult(0, payload, "", False),
+            ProcResult(0, payload, "", False),
+        ])
+        adapter = ReferenceAdapter(
+            "claude",
+            transport=transport,
+            driver=make_driver(),
+            health=InMemoryHealth(),
+            validate=lambda body: None,
+        )
+        request = make_request()
+        result = adapter.execute(request)
+        self.assertEqual("needs_human_review", result.status)
+        self.assertIsNone(result.validated)
+        assert_valid(self, "RouteExecutionResult", result.to_record(request))
+
+    def test_repair_prompt_does_not_quote_response_values(self) -> None:
+        bad = {
+            "returncode": 0,
+            "stdout": json.dumps({"result": json.dumps({"label": CANARY, "score": 1})}),
+            "stderr": "",
+            "timed_out": False,
+        }
+        transport = ScriptedTransport([proc(bad), proc(_ok_envelope())])
+        result = make_adapter(transport=transport).execute(make_request())
+        self.assertEqual(2, len(transport.calls))
+        self.assertNotIn(CANARY, transport.calls[1]["input"])
+        self.assertNotIn(CANARY, repair_prompt_for("PROMPT", f"'{CANARY}' is not one of"))
+        self.assertEqual("ok", result.status)
+        blob = json.dumps(result.to_record(make_request()))
+        self.assertNotIn(CANARY, blob)
+
+    def test_symlink_to_a_provider_cli_is_unsupported(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        target = Path(tmp.name) / "claude"
+        target.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        target.chmod(0o755)
+        link = Path(tmp.name) / "harmless"
+        link.symlink_to(target)
+        with mock.patch.object(subprocess, "Popen", side_effect=AssertionError("spawned")):
+            with self.assertRaises(Unsupported):
+                SubprocessTransport().run([str(link), "-p"], "", 1.0, None)
+
+
+@unittest.skipUnless(os.name == "posix", "process-group kill is asserted on POSIX; Windows taskkill path is unverified")
+class OrphanTreeKillTests(unittest.TestCase):
+    def test_exited_parent_does_not_leave_descendants(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        helper = Path(tmp.name) / "orphan.py"
+        helper.write_text(_HELPER_ORPHAN, encoding="utf-8")
+        pid_file = Path(tmp.name) / "child.pid"
+        result = SubprocessTransport().run(
+            [sys.executable, str(helper), str(pid_file)], "", 1.2, None
+        )
+        self.assertTrue(result.timed_out)
+        child = int(pid_file.read_text(encoding="utf-8"))
+        self.assertFalse(pid_alive(child), "the orphaned child must be dead")
+        self.assertEqual("terminated", result.termination["tree_status"])
 
 
 if __name__ == "__main__":

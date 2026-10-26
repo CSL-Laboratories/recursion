@@ -64,23 +64,27 @@ class _Server(ThreadingHTTPServer):
     def process_request(self, request: Any, client_address: Any) -> None:
         with self._active_lock:
             if self._active >= self.max_connections:
-                payload = b'{"error":"too_many_connections"}'
-                try:
-                    request.sendall(
-                        b"HTTP/1.1 503 Service Unavailable\r\n"
-                        b"Content-Type: application/json\r\n"
-                        b"Content-Length: " + str(len(payload)).encode("ascii") + b"\r\n"
-                        b"Connection: close\r\n"
-                        b"Cache-Control: no-store\r\n\r\n" + payload
-                    )
-                except OSError:
-                    pass
-                try:
-                    request.close()
-                except OSError:
-                    pass
-                return
-            self._active += 1
+                refuse = True
+            else:
+                self._active += 1
+                refuse = False
+        if refuse:
+            payload = b'{"error":"too_many_connections"}'
+            try:
+                request.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Content-Type: application/json\r\n"
+                    b"Content-Length: " + str(len(payload)).encode("ascii") + b"\r\n"
+                    b"Connection: close\r\n"
+                    b"Cache-Control: no-store\r\n\r\n" + payload
+                )
+            except OSError:
+                pass
+            try:
+                request.close()
+            except OSError:
+                pass
+            return
         try:
             super().process_request(request, client_address)
         except Exception:

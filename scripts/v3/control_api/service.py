@@ -33,6 +33,7 @@ API_VERSION = "control-api@0"
 MAX_BODY_BYTES = 64 * 1024
 MAX_PROMPT_CHARS = 32 * 1024
 MAX_SESSIONS_PER_TENANT = 64
+MAX_CLOSED_SESSIONS_PER_TENANT = 64
 DEFAULT_TIMEOUT_S = 30.0
 MAX_TIMEOUT_S = 120.0
 
@@ -77,6 +78,7 @@ class _Session:
 class _Tenant:
     sessions: dict[tuple[str, str], _Session] = field(default_factory=dict)
     request_seq: int = 0
+    open_count: int = 0
 
 
 class ControlService:
@@ -197,11 +199,11 @@ class ControlService:
                 if existing.closed:
                     raise err.SessionClosed()
                 return _session_view(existing)
-            active = sum(1 for item in tenant.sessions.values() if not item.closed)
-            if active >= MAX_SESSIONS_PER_TENANT:
+            if tenant.open_count >= MAX_SESSIONS_PER_TENANT:
                 raise err.RunRefused("session_limit", data={"code": "session_limit"})
             state = _Session(engine=engine, session=session)
             tenant.sessions[(engine, session)] = state
+            tenant.open_count += 1
             view = _session_view(state)
         self._journal.append(principal.tenant, "session.opened", session=session, engine=engine)
         return view
@@ -222,6 +224,9 @@ class ControlService:
             if state.in_flight:
                 raise err.SessionBusy()
             state.closed = True
+            tenant = self._tenant(principal.tenant)
+            tenant.open_count = max(0, tenant.open_count - 1)
+            _prune_closed(tenant)
             view = _session_view(state)
         self._journal.append(principal.tenant, "session.closed", session=session, engine=engine)
         return view
@@ -344,6 +349,19 @@ class ControlService:
         if state is None:
             raise err.UnknownSession()
         return state
+
+
+def _prune_closed(tenant: _Tenant) -> None:
+    closed = len(tenant.sessions) - tenant.open_count
+    overflow = closed - MAX_CLOSED_SESSIONS_PER_TENANT
+    if overflow <= 0:
+        return
+    for key, state in list(tenant.sessions.items()):
+        if overflow <= 0:
+            break
+        if state.closed:
+            del tenant.sessions[key]
+            overflow -= 1
 
 
 def _no_constant(constant: str) -> None:

@@ -155,22 +155,41 @@ def _communicate_bounded(
     max_output_bytes: int | None,
     pgid: int | None,
 ) -> ProcResult:
-    """Read stdout/stderr up to ``max_output_bytes`` combined, then kill if exceeded."""
+    """Read stdout/stderr up to ``max_output_bytes`` combined, then kill if exceeded.
 
-    if proc.stdin is not None:
-        try:
-            if input_text:
-                payload = input_text.encode("utf-8") if isinstance(input_text, str) else input_text
-                proc.stdin.write(payload)
-            proc.stdin.close()
-        except BrokenPipeError:
-            pass
+    Stdin is written on its own thread, started with the output readers, so a
+    child that fills stdout before reading a large prompt cannot block the
+    deadline. The timeout clock starts before any pipe write.
+    """
 
     out = bytearray()
     err = bytearray()
     lock = threading.Lock()
     exceeded = threading.Event()
     cap = max_output_bytes if max_output_bytes is not None else None
+
+    def writer() -> None:
+        stream = proc.stdin
+        if stream is None:
+            return
+        try:
+            payload = b""
+            if input_text:
+                payload = input_text.encode("utf-8") if isinstance(input_text, str) else input_text
+            view = memoryview(payload)
+            while len(view):
+                if exceeded.is_set():
+                    break
+                chunk = bytes(view[:_READ_CHUNK])
+                stream.write(chunk)
+                view = view[len(chunk):]
+            try:
+                stream.flush()
+            except OSError:
+                pass
+            stream.close()
+        except OSError:
+            pass
 
     def reader(stream, dest: bytearray) -> None:
         try:
@@ -194,6 +213,7 @@ def _communicate_bounded(
     threads = [
         threading.Thread(target=reader, args=(proc.stdout, out), daemon=True),
         threading.Thread(target=reader, args=(proc.stderr, err), daemon=True),
+        threading.Thread(target=writer, daemon=True),
     ]
     for thread in threads:
         thread.start()

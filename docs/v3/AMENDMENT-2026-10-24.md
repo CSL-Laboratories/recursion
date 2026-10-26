@@ -9,6 +9,8 @@ authority: proposed; does not admit work, clear a hold, select a language/store/
 
 **Status: amendment proposed (2026-10-24); acceptance is a human decision by Lucas.**
 
+> **Superseded in part by [AMENDMENT-2026-10-26.md](AMENDMENT-2026-10-26.md)** (v2, proposed; accepted only by an exact-digest receipt from Lucas). This v1 file is otherwise unchanged and stays the v1 proposal.
+
 This file **adds** proposed product direction. It does not rewrite Owner-approved wording.
 The OR-038 paragraph in [PRODUCT.md](PRODUCT.md) is preserved verbatim. `state/DECISIONS.md`
 is not edited. Publishing this proposal does not mark the issue decided, does not clear a

@@ -222,7 +222,10 @@ class ControlService:
             state.closed = True
             tenant = self._tenant(principal.tenant)
             tenant.open_count = max(0, tenant.open_count - 1)
-            _prune_closed(tenant, keep=(engine, session))
+            key = (engine, session)
+            tenant.sessions.pop(key)
+            tenant.sessions[key] = state
+            _prune_closed(tenant)
             view = _session_view(state)
         self._journal.append(principal.tenant, "session.closed", session=session, engine=engine)
         return view
@@ -347,7 +350,7 @@ class ControlService:
         return state
 
 
-def _prune_closed(tenant: _Tenant, keep: tuple[str, str] | None = None) -> None:
+def _prune_closed(tenant: _Tenant) -> None:
     closed = len(tenant.sessions) - tenant.open_count
     overflow = closed - MAX_CLOSED_SESSIONS_PER_TENANT
     if overflow <= 0:
@@ -355,7 +358,7 @@ def _prune_closed(tenant: _Tenant, keep: tuple[str, str] | None = None) -> None:
     for key, state in list(tenant.sessions.items()):
         if overflow <= 0:
             break
-        if state.closed and key != keep:
+        if state.closed:
             del tenant.sessions[key]
             overflow -= 1
 

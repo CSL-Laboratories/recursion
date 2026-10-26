@@ -222,6 +222,9 @@ class ControlService:
             state.closed = True
             tenant = self._tenant(principal.tenant)
             tenant.open_count = max(0, tenant.open_count - 1)
+            key = (engine, session)
+            tenant.sessions.pop(key)
+            tenant.sessions[key] = state
             _prune_closed(tenant)
             view = _session_view(state)
         self._journal.append(principal.tenant, "session.closed", session=session, engine=engine)

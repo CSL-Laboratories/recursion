@@ -364,6 +364,22 @@ class RunTests(unittest.TestCase):
             code_of(h.call(h.control_a, "session.open", {"engine": "claude", "session": "s-79"})),
         )
 
+    def test_prune_evicts_oldest_closed_not_newest(self) -> None:
+        h = Harness()
+        h.ok(h.control_a, "session.open", {"engine": "claude", "session": "early"})
+        for index in range(64):
+            h.ok(h.control_a, "session.open", {"engine": "claude", "session": f"s-{index}"})
+            h.ok(h.control_a, "session.close", {"engine": "claude", "session": f"s-{index}"})
+        first = h.ok(h.control_a, "session.close", {"engine": "claude", "session": "early"})
+        again = h.ok(h.control_a, "session.close", {"engine": "claude", "session": "early"})
+        self.assertEqual(first, again)
+        self.assertEqual("closed", h.ok(h.control_a, "session.get", {"engine": "claude", "session": "early"})["state"])
+        self.assertEqual(
+            err.UNKNOWN_SESSION,
+            code_of(h.call(h.control_a, "session.get", {"engine": "claude", "session": "s-0"})),
+        )
+        self.assertEqual("closed", h.ok(h.control_a, "session.get", {"engine": "claude", "session": "s-63"})["state"])
+
     def test_close_is_idempotent(self) -> None:
         h = Harness()
         h.ok(h.control_a, "session.open", {"engine": "claude", "session": "s-one"})

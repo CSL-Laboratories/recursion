@@ -403,7 +403,7 @@
             "dispatched": true,
             "error": null,
             "health_event": null,
-            "output_digest": "sha256:73357b4190887ad5e04145765b23287db3542359564f022c4d8569948b925c15",
+            "output_digest": "sha256:daafed08b5a6e5b2084d4dbeffbcf01e38ed1c759ee30d7eed4fb572a27a864f",
             "repaired": true,
             "request_id": "req-3",
             "status": "ok",
@@ -411,7 +411,7 @@
             "type": "RouteExecutionResult@0",
             "usage_state": "ok",
             "validated": {
-              "summary": "fake claude reviewed prompt 43555532",
+              "summary": "fake claude reviewed prompt d47c76b3",
               "verdict": "pass"
             }
           }
@@ -810,7 +810,7 @@
           {
             "data": {
               "error": null,
-              "output_digest": "sha256:73357b4190887ad5e04145765b23287db3542359564f022c4d8569948b925c15",
+              "output_digest": "sha256:daafed08b5a6e5b2084d4dbeffbcf01e38ed1c759ee30d7eed4fb572a27a864f",
               "repaired": true,
               "request_id": "req-3",
               "status": "ok"
@@ -873,7 +873,7 @@
       "step": 17
     }
   ],
-  "transcript_sha256": "sha256:de2048be73b2a9499aa569c8d8b14a5bf84fd727e89639e87ce3002795eca985",
+  "transcript_sha256": "sha256:35a83386c775d76f5293a200e6e463c21f7c848a26bf8c36410611d77299c937",
   "transport_calls": {
     "claude": 3,
     "codex": 2

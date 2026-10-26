@@ -191,6 +191,7 @@ def build_fake_stack(
             driver=driver,
             health=health,
             validate=validate,
+            output_schema=VERDICT_SCHEMA,
             secret_values=[material],
         )
         for engine in ENGINES

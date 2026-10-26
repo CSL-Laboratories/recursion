@@ -973,6 +973,19 @@ class ReviewFixTests(unittest.TestCase):
                 assert_valid(self, "RouteExecutionResult", record)
                 self.assertEqual("timeout", record["health_event"]["error"])
 
+    def test_timed_out_real_output_over_the_cap_is_too_large(self) -> None:
+        # stdout alone (101 bytes) or stdout plus real stderr exceeds the cap;
+        # only the transport's "\n[timeout]" suffix is excluded from the count.
+        for stdout, stderr in (("x" * 101, "\n[timeout]"), ("x" * 95, "e" * 6 + "\n[timeout]")):
+            with self.subTest(stdout_bytes=len(stdout), stderr=stderr):
+                health = InMemoryHealth()
+                transport = ScriptedTransport([ProcResult(124, stdout, stderr, True)])
+                request = make_request(max_output_bytes=100)
+                result = make_adapter(transport=transport, health=health).execute(request)
+                self.assertEqual(("limit_hit", "output_too_large"), (result.status, result.error))
+                self.assertEqual([("claude", "exhausted", "output_too_large")], health.faults)
+                assert_valid(self, "RouteExecutionResult", result.to_record(request))
+
     def test_oversized_kill_outranks_timeout(self) -> None:
         transport = ScriptedTransport([ProcResult(1, "", "", True, oversized=True)])
         request = make_request(max_output_bytes=100)

@@ -27,6 +27,10 @@ _CMD_METACHARACTERS = frozenset('&|<>^"')
 _READ_CHUNK = 4096
 
 
+# Transport-owned stderr suffix on a timeout; not engine output.
+TIMEOUT_DIAGNOSTIC = "\n[timeout]"
+
+
 @dataclass
 class ProcResult:
     returncode: int
@@ -233,7 +237,7 @@ def _communicate_bounded(
             observation = kill_tree(proc, pgid=pgid)
             for thread in threads:
                 thread.join(timeout=REAP_GRACE_SECONDS)
-            return ProcResult(124, _decode(bytes(out)), _decode(bytes(err)) + "\n[timeout]", True, observation)
+            return ProcResult(124, _decode(bytes(out)), _decode(bytes(err)) + TIMEOUT_DIAGNOSTIC, True, observation)
         if not alive:
             break
         time.sleep(0.02)

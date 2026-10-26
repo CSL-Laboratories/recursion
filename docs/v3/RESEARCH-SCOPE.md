@@ -9,7 +9,7 @@ issue. Never commit research content to this repo; this repo only links to the
 vault record (repo, 40-hex commit, path, claim, limitations). New non-public docs
 (research, specs, decisions, evidence and receipts, gate artifacts, and runbooks
 that aren't public) go to that vault through a PR there. Existing files stay;
-CSL-536 will move them. The only new docs allowed here are public knowledge-base,
+CSL-536 will move them. The existing decision logs (`state/DECISIONS.md` and `docs/v3/DECISION-REGISTER.md`) and their founder-approved authoring process are unchanged. The only new docs allowed here are public knowledge-base,
 README, setup and implementation instructions for outside readers, and agent
 instruction files. If
 csl-research is not accessible, stop and post a blocker on the Linear issue; do not
@@ -91,9 +91,12 @@ Every research task carries:
 - one machine-checkable gate with deterministic pass/fail and zero provider calls;
 - a named independent verifier (different session, different family where available) that reruns
   the exact candidate — an implementer's own PASS is never acceptance;
-- an independent-verifier receipt as a csl-research `submissions/<record_id>/`
-  record (repo, 40-hex commit, path, claim, limitations), not a directory in this
-  repository.
+- an independent-verifier receipt in the Git common directory under
+  `research-attestations/<gate>/<candidate>/`, which the gates in
+  `experiments/v3/*/check.py`, [ACCEPTANCE](ACCEPTANCE.md) and
+  [CONSTRUCTION-RUNBOOK](CONSTRUCTION-RUNBOOK.md) read to establish completion.
+  A csl-research `submissions/<record_id>/` record (repo, 40-hex commit, path,
+  claim, limitations) supplements that receipt and never replaces it.
 
 If there is no gate or no verifier, stop and comment on the Linear issue. The Linear
 issue comment is the canonical escalation; `state/INBOX.md` is optional. If a task can

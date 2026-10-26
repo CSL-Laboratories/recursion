@@ -48,7 +48,7 @@ issues and PRs.
   links to the vault record (repo, 40-hex commit, path, claim, limitations).
   New non-public docs (research, specs, decisions, evidence and receipts, gate
   artifacts, and runbooks that aren't public) go to that vault through a PR
-  there. Existing files stay; CSL-536 will move them. The only new docs
+  there. Existing files stay; CSL-536 will move them. The existing decision logs (`state/DECISIONS.md` and `docs/v3/DECISION-REGISTER.md`) and their founder-approved authoring process are unchanged. The only new docs
   allowed here are public knowledge-base, README, setup and implementation
   instructions for outside readers, and agent instruction files. If
   csl-research is not accessible, stop and post a
@@ -131,7 +131,7 @@ research registers or indexes) goes there, through that PR, with a digest on
 the Linear issue. Never commit research content to this repo. New non-public
 docs (research, specs, decisions, evidence and receipts, gate artifacts, and
 runbooks that aren't public) go there through a PR; this repo only links.
-Existing files stay; CSL-536 will move them. The only new docs allowed here
+Existing files stay; CSL-536 will move them. The existing decision logs (`state/DECISIONS.md` and `docs/v3/DECISION-REGISTER.md`) and their founder-approved authoring process are unchanged. The only new docs allowed here
 are public knowledge-base, README, setup and implementation instructions for
 outside readers, and agent instruction files. If csl-research
 is not accessible, stop and post a blocker on the Linear issue; do not fall
@@ -372,7 +372,7 @@ Linear issue. Never commit research content to this repo; this repo only links
 to the vault record (repo, 40-hex commit, path, claim, limitations). New
 non-public docs (research, specs, decisions, evidence and receipts, gate
 artifacts, and runbooks that aren't public) go to that vault through a PR
-there. Existing files stay; CSL-536 will move them. The only new docs allowed
+there. Existing files stay; CSL-536 will move them. The existing decision logs (`state/DECISIONS.md` and `docs/v3/DECISION-REGISTER.md`) and their founder-approved authoring process are unchanged. The only new docs allowed
 here are public knowledge-base, README, setup and implementation instructions
 for outside readers, and agent instruction files. If csl-research is not
 accessible, stop and post a blocker on the

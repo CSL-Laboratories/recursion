@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -792,6 +793,14 @@ _HELPER_OVERSIZE = textwrap.dedent(
     sys.stdout.write("x" * (1024 * 1024))
     """
 )
+_HELPER_PIPE_DEADLOCK = textwrap.dedent(
+    """
+    import sys
+    sys.stdout.write("y" * (128 * 1024))
+    sys.stdout.flush()
+    sys.stdin.read()
+    """
+)
 
 
 class ReviewFixTests(unittest.TestCase):
@@ -799,6 +808,56 @@ class ReviewFixTests(unittest.TestCase):
         transport = ScriptedTransport([proc(_ok_envelope())])
         make_adapter(transport=transport).execute(make_request(max_output_bytes=4096))
         self.assertEqual(4096, transport.calls[0]["max_output_bytes"])
+
+    def test_large_prompt_cannot_block_past_the_deadline(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        helper = Path(tmp.name) / "deadlock.py"
+        helper.write_text(_HELPER_PIPE_DEADLOCK, encoding="utf-8")
+        box: dict[str, ProcResult] = {}
+
+        def invoke() -> None:
+            box["result"] = SubprocessTransport().run(
+                [sys.executable, str(helper)],
+                "p" * (128 * 1024),
+                5.0,
+                None,
+                max_output_bytes=256 * 1024,
+            )
+
+        worker = threading.Thread(target=invoke)
+        started = time.monotonic()
+        worker.start()
+        worker.join(8.0)
+        elapsed = time.monotonic() - started
+        self.assertFalse(worker.is_alive(), "stdin write blocked the deadline")
+        self.assertLess(elapsed, 8.0)
+        result = box["result"]
+        self.assertEqual(0, result.returncode)
+        self.assertFalse(result.timed_out)
+        self.assertFalse(result.oversized)
+
+    def test_oversized_repair_keeps_the_tree_observation(self) -> None:
+        bad = json.dumps({"session_id": "s1", "result": "{}"})
+        observation = {
+            "type": "ProcessTerminationObservation@1",
+            "tree_status": "partial",
+            "remaining_process_refs": ["pgid:9"],
+            "effect_conclusion": "not-evaluated",
+        }
+        transport = ScriptedTransport([
+            ProcResult(0, bad, "", False),
+            ProcResult(1, "", "", False, observation, oversized=True),
+        ])
+        request = make_request(max_output_bytes=128)
+        result = make_adapter(transport=transport).execute(request)
+        self.assertEqual(("limit_hit", "repair_output_too_large"), (result.status, result.error))
+        self.assertTrue(result.repaired)
+        self.assertEqual("partial", result.termination["tree_status"])
+        record = result.to_record(request)
+        assert_valid(self, "RouteExecutionResult", record)
+        self.assertEqual("repair_output_too_large", record["health_event"]["error"])
+        self.assertEqual("partial", record["termination"]["tree_status"])
 
     def test_scripted_oversized_output_is_rejected(self) -> None:
         huge = "x" * 4096

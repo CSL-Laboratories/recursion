@@ -42,14 +42,16 @@ class ControlRpcError(Exception):
 def read_token_file(path: str | os.PathLike[str]) -> str:
     """Read a bearer token. Refuses links and group- or world-accessible files.
 
-    The file is opened with ``O_NOFOLLOW`` (when available) and checked via
-    ``fstat`` on that descriptor so a swap after ``lstat`` cannot redirect the
-    read.
+    The file is opened with ``O_NOFOLLOW`` and ``O_NONBLOCK`` (when available)
+    and checked via ``fstat`` on that descriptor so a swap after ``lstat``
+    cannot redirect the read and a FIFO cannot hang the caller.
     """
 
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
     try:
         descriptor = os.open(os.fspath(path), flags)
     except OSError:

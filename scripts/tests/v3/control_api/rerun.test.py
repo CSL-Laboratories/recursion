@@ -102,6 +102,9 @@ class EvidenceTests(unittest.TestCase):
     def test_a_passing_run_names_the_exact_commit_and_every_command(self) -> None:
         head = git("rev-parse", "HEAD")
         before = git("status", "--porcelain")
+        # Compare against the worktrees present before the run: this test can
+        # itself run inside the script's own /tree checkout (the default gate step).
+        worktrees_before = git("worktree", "list", "--porcelain")
         with tempfile.TemporaryDirectory() as directory:
             result = run_script(head, "--steps", "record,scope", "--out", directory)
             self.assertEqual(0, result.returncode, result.stdout + result.stderr)
@@ -120,7 +123,7 @@ class EvidenceTests(unittest.TestCase):
             parent = git("rev-parse", f"{head}^")
             self.assertEqual(parent, evidence["comparison_sha"])
         self.assertEqual(before, git("status", "--porcelain"), "the working tree must not change")
-        self.assertFalse(any(line.split()[0].endswith("/tree") for line in git("worktree", "list").splitlines()))
+        self.assertEqual(worktrees_before, git("worktree", "list", "--porcelain"), "the rerun worktree must be removed")
 
     @unittest.skipUnless(have_git_head(), "needs a git checkout")
     def test_default_out_does_not_dirty_the_source_checkout(self) -> None:

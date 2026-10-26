@@ -254,6 +254,11 @@ class TestInventoryTests(unittest.TestCase):
             self.assertTrue((ROOT / path).is_file(), path)
             self.assertNotIn(path, run)
 
+    def test_x1_inventory_floor_is_discovered_and_run(self) -> None:
+        run = ci_gate.assert_tests_accounted()
+        self.assertIn("scripts/tests/v3/x1/inventory.test.py", run)
+        self.assertNotIn("scripts/tests/v3/x1/inventory.test.py", ci_gate.TEST_EXCLUDE)
+
     def test_unaccounted_test_file_fails_guard(self) -> None:
         run, unaccounted, stale, missing = ci_gate.classify_tests(
             discovered=["tools/test_ci_gate.py", "orphan/test_orphan.py"],

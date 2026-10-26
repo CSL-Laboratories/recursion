@@ -349,6 +349,21 @@ class RunTests(unittest.TestCase):
             code_of(h.call(h.control_a, "session.open", {"engine": "claude", "session": "s-0"})),
         )
 
+    def test_closed_session_history_is_bounded(self) -> None:
+        h = Harness()
+        for index in range(80):
+            h.ok(h.control_a, "session.open", {"engine": "claude", "session": f"s-{index}"})
+            h.ok(h.control_a, "session.close", {"engine": "claude", "session": f"s-{index}"})
+        tenant = h.service._tenants["tenant-a"]
+        closed = sum(1 for item in tenant.sessions.values() if item.closed)
+        self.assertLessEqual(closed, 64)
+        self.assertEqual(0, tenant.open_count)
+        self.assertEqual("open", h.ok(h.control_a, "session.open", {"engine": "claude", "session": "s-0"})["state"])
+        self.assertEqual(
+            err.SESSION_CLOSED,
+            code_of(h.call(h.control_a, "session.open", {"engine": "claude", "session": "s-79"})),
+        )
+
     def test_close_is_idempotent(self) -> None:
         h = Harness()
         h.ok(h.control_a, "session.open", {"engine": "claude", "session": "s-one"})

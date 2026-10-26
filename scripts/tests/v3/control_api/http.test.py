@@ -274,6 +274,10 @@ class TokenFileTests(unittest.TestCase):
                 read_token_file(link)
             with self.assertRaises(TokenFileRefused):
                 read_token_file(Path(directory) / "missing")
+            fifo = Path(directory) / "fifo"
+            os.mkfifo(fifo)
+            with self.assertRaises(TokenFileRefused):
+                read_token_file(fifo)
 
     def test_bind_failure_removes_the_token_file_this_invocation_created(self) -> None:
         from scripts.v3.control_api.__main__ import main

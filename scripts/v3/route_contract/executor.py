@@ -8,7 +8,6 @@ secret refusal, then session ownership (Busy, custody) via the driver.
 from __future__ import annotations
 
 import json
-import re
 from collections.abc import Callable
 from typing import Any
 
@@ -20,7 +19,7 @@ from scripts.v3.route_contract.errors import (
     ToolPolicyRefused,
     Unsupported,
 )
-from scripts.v3.route_contract.health import HealthPort, limit_signal, no_nonfinite
+from scripts.v3.route_contract.health import HealthPort, limit_signal, no_nonfinite, strip_fence
 from scripts.v3.route_contract.model import (
     STATUS_LIMIT_HIT,
     STATUS_NEEDS_HUMAN,
@@ -28,6 +27,7 @@ from scripts.v3.route_contract.model import (
     STATUS_TIMEOUT,
     ExecutionRequest,
     ExecutionResult,
+    canonical_json,
     sha256_digest,
 )
 from scripts.v3.route_contract.transport import ProcResult, Transport
@@ -35,8 +35,6 @@ from scripts.v3.route_contract.transport import ProcResult, Transport
 REPAIR_REASON_GENERIC = "output did not match the required schema"
 _REPAIR_PREFIX = "\n\nYour previous output was rejected: "
 _REPAIR_SUFFIX = "\nReturn ONLY corrected JSON that matches the required schema; no prose."
-_FENCE = re.compile(r"\A```[A-Za-z0-9_+-]*[ \t]*\r?\n(?P<body>.*?)\r?\n?```\s*\Z", re.S)
-
 Validate = Callable[[Any], "str | None"]
 
 
@@ -54,14 +52,8 @@ def _output_bytes(proc: ProcResult) -> int:
     return len((proc.stdout or "").encode("utf-8")) + len((proc.stderr or "").encode("utf-8"))
 
 
-def _strip_fence(text: str) -> str:
-    stripped = (text or "").strip()
-    match = _FENCE.match(stripped)
-    return match.group("body").strip() if match else stripped
-
-
 def _loads(text: str) -> Any:
-    return json.loads(_strip_fence(text), parse_constant=no_nonfinite)
+    return json.loads(strip_fence(text), parse_constant=no_nonfinite)
 
 
 def _decode(value: Any) -> Any:
@@ -150,16 +142,18 @@ class ReferenceAdapter:
         driver: FakeRouteDriver,
         health: HealthPort,
         validate: Validate,
+        output_schema: dict,
         secret_values: argv_mod.SecretSource = None,
         pinned_cwd: str | None = None,
     ) -> None:
-        if engine_id not in argv_mod.ENGINES:
+        if engine_id not in argv_mod.ENGINES or not object_output_schema(output_schema):
             raise Unsupported()
         self.engine_id = engine_id
         self._transport = transport
         self._driver = driver
         self._health = health
         self._validate = validate
+        self._output_schema_digest = sha256_digest(canonical_json(output_schema))
         self._secret_values = secret_values
         self._pinned_cwd = pinned_cwd
 
@@ -176,7 +170,7 @@ class ReferenceAdapter:
     def execute(self, request: ExecutionRequest) -> ExecutionResult:
         if request.engine_id != self.engine_id:
             raise Unsupported()
-        if not object_output_schema(request.output_schema):
+        if sha256_digest(canonical_json(request.output_schema)) != self._output_schema_digest:
             raise Unsupported()
         if request.allowed_tools:
             raise ToolPolicyRefused()

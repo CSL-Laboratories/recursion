@@ -55,7 +55,7 @@ class StubTransport:
         self.entered = threading.Event()
         self.calls = 0
 
-    def run(self, argv, input_text, timeout_s, cwd):
+    def run(self, argv, input_text, timeout_s, cwd, max_output_bytes=None):
         self.calls += 1
         self.entered.set()
         if self.gate is not None:

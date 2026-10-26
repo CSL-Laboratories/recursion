@@ -65,6 +65,12 @@ combined workflows, upstream-only role accounting, ten terminal controls, fundam
 configuration/plugins and Windows/Linux recovery. Earlier brainstorming "v2" means this new
 architecture. The graphical application is later.
 
+Amendment proposed 2026-10-24 (acceptance is a human decision by Lucas): GUI timing in the
+sentence above is already superseded by D-038 (built but opt-in; no capability deferred).
+This amendment does not reopen D-038. **Beyond D-038** see
+[AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md). Historical Mark 2/platform snapshots
+below are not rewritten.
+
 The new [interaction contract](foundation-research/platform-round/interaction-contract.md),
 [integration evidence](foundation-research/platform-round/integration.json),
 [trials](foundation-research/platform-round/trials.json) and
@@ -114,6 +120,7 @@ The main assistant directly creates and monitors ARM executives. There is no sep
 | Document | Question it answers |
 |---|---|
 | [PRODUCT.md](PRODUCT.md) | What is v3, who is it for, and what is outside it? |
+| [AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md) | Proposed 2026-10-24 north star, pillars and GUI supersession (unaccepted; Lucas decides). Research: `CSL-Laboratories/csl-research` `250fdbbe2964e4889096a487e2dfb6d7794046a6` `submissions/20261025-recursion-csl494-rp0-amendment-research-01/` (candidate; vault PR merged) |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | How do the Recursion Head, ARMs, workers, and the kernel fit together? |
 | [ARCHITECTURE-PROOF.md](ARCHITECTURE-PROOF.md) | Which R1–R17 claims survived the focused campaign, what remains unproved, and is the contract skeleton ready? |
 | [ARCHITECTURE-OPTIONS.md](ARCHITECTURE-OPTIONS.md) | Which runtime foundations were compared, what is recommended, and what would falsify it? |

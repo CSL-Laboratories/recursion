@@ -12,7 +12,8 @@ route to the private research vault is granted to this task, so no vault record 
 Lucas decided (his words, Mon 2026-10-26 11:59 AM PT): "Decision 3: approve keep-paths and
 boundary, push pre-x1 tags, delete after the Nov 10 rehearsal".
 
-- Keep-paths: `scripts/v3/route_adapter/**` and the receipt tests.
+- Keep-paths: `scripts/v3/route_adapter/**` and the receipt tests
+  (`tools/test_claude_fixer_*`).
 - Recursion deletion boundary: `scripts/v3/harness/**` and `planning/**`.
 - Deletion happens only after the Nov 10 rehearsal. Nothing is deleted now.
 - Source plan: the attached step 4 synthesis, section 6 (WP14), section 7 (decision 3), and
@@ -54,10 +55,12 @@ git push origin refs/tags/pre-x1-recursion-20261026
 - Keep-paths: `scripts/v3/route_adapter/**`. It does not exist on `master` yet. R#301
   (CSL-537, open) adds it, with its test at `scripts/tests/v3/route_adapter/at1.test.py`. The
   boundary does not overlap it.
-- "The receipt tests" means `tools/test_claude_fixer_*`. Lucas decided that on CSL-495
-  (comment `611d6aa4`, Mon 2026-10-26 1:47 PM PT: "I agree with your recommendations").
+- "The receipt tests" are `tools/test_claude_fixer_guard.py`,
+  `tools/test_claude_fixer_publish.py` and `tools/test_claude_fixer_receipts.py`
+  (`tools/test_claude_fixer_*`). Lucas decided that on CSL-495 comment `611d6aa4`
+  (his words, Mon 2026-10-26 1:47 PM PT: "I agree with your recommendations.").
   Those files sit outside the deletion boundary and are kept. The receipt checks inside
-  P1 and P5 stay `port`.
+  P1 and P5 stay `port`. The floor pins the three files and fails if one is missing.
 
 ## 4. Disposition table
 
@@ -205,8 +208,9 @@ Checked by search on the base SHA. The deletion PR must handle each, after the N
 | `experiments/v3/swarm-research-20260911-155142/research_entry.py` | References `scripts/v3/planning/replay/kernel.py` by path. | line 23 |
 | `README.md`, `docs/v3/harness/CSL-27.md`, `docs/v3/M1A-*.md` | Document `python -m scripts.v3.harness` and the planning kernel. | grep at base SHA |
 
-If a thin direct-CLI fallback is kept (the plan says "labeled as not satisfying X2"), the
-boundary shrinks and rows H1, H2 and H4 must be re-reviewed. No such keep-path is approved.
+Lucas's comment `611d6aa4` says the thin direct-Claude fallback is new code under
+`route_adapter/`, not a keep of `scripts/v3/harness/`. The boundary stays intact. It is
+labeled as not satisfying X2.
 
 Workflow wiring for Lucas: none is needed for this change. The `linux`, `windows` and `macos`
 job names are unchanged and this test runs in each. Optional, in a founder authoring session
@@ -221,8 +225,9 @@ The same comment says none of these block this PR. They bind the post-Nov 10 del
 Dan was asked there to confirm the port and drop calls.
 
 1. Decided: `planning/**` means `scripts/v3/planning/**` only (section 3, Dan and Samir).
-2. Decided: "the receipt tests" means `tools/test_claude_fixer_*`. Those files are outside
-   the deletion boundary and are kept. The receipt checks in P1 and P5 are ported anyway.
+2. Decided: "the receipt tests" means `tools/test_claude_fixer_*`, the three files named in
+   section 3. They are outside the deletion boundary and are kept. The receipt checks in P1
+   and P5 are ported anyway.
 3. Decided: the disposition table stands. O-H4 (land refusal) is **port**. O-H5 (route
    selection: weights, cooldown fallback, skipping disabled providers, pre-call budget
    refusal) is **port** and becomes part of the X2 route-contract conformance suite.
@@ -244,3 +249,5 @@ carry no `Agent-Claim` trailer for that reason.
   the new test, with mutation checks listed in the PR body.
 - Unverified: the synthesis file contents beyond the sections cited; whether R#301 covers
   O-H2 and O-H3 (test names are not entered until that PR merges); GitHub CI on this PR head.
+  The receipt-test names, the port and drop calls, the successor home, and the claim record
+  are settled by CSL-495 comment `611d6aa4`.

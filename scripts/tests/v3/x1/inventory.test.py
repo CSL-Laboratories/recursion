@@ -29,6 +29,12 @@ X1_DELETION_LANDED = False
 BOUNDARY_CODE = ("scripts/v3/harness", "scripts/v3/planning")
 LEGACY_TEST_DIRS = ("scripts/tests/v3/harness", "scripts/tests/v3/planning")
 KEEP_PATHS = ("scripts/v3/route_adapter",)
+# CSL-495 comment 611d6aa4: "the receipt tests" are these files. Outside the boundary; kept.
+RECEIPT_TESTS = (
+    "tools/test_claude_fixer_guard.py",
+    "tools/test_claude_fixer_publish.py",
+    "tools/test_claude_fixer_receipts.py",
+)
 
 DISPOSITIONS = {"port", "drop", "keep"}
 
@@ -255,6 +261,7 @@ def collect_errors(
     landed: bool,
     floors: dict[str, int],
     pinned: tuple[str, ...] = PINNED_BOUNDARY_FILES,
+    receipt_tests: tuple[str, ...] = RECEIPT_TESTS,
 ) -> list[str]:
     errors: list[str] = []
     rows = parse_rows(doc_text)
@@ -316,6 +323,11 @@ def collect_errors(
         if keep.startswith(boundary + "/") or boundary.startswith(keep + "/") or keep == boundary
     ]
     errors.extend(keep_hit)
+    for rel in receipt_tests:
+        if any(rel == boundary or rel.startswith(boundary + "/") for boundary in BOUNDARY_CODE):
+            errors.append(f"{rel}: receipt test overlaps the deletion boundary")
+        if not (root / rel).is_file():
+            errors.append(f"{rel}: receipt test is a keep-path and is missing")
 
     if landed:
         for rel, files in boundary_code.items():
@@ -403,6 +415,17 @@ class InventoryFloorTests(unittest.TestCase):
         errors = legacy_name_errors(ROOT, self.doc, landed=X1_DELETION_LANDED)
         self.assertEqual(errors, [], "\n".join(errors))
 
+    def test_receipt_tests_pin_matches_the_fixer_files(self) -> None:
+        found = sorted(
+            path.relative_to(ROOT).as_posix()
+            for path in (ROOT / "tools").glob("test_claude_fixer_*")
+            if path.is_file()
+        )
+        self.assertEqual(found, sorted(RECEIPT_TESTS))
+        for rel in RECEIPT_TESTS:
+            self.assertTrue((ROOT / rel).is_file(), rel)
+            self.assertFalse(any(rel.startswith(boundary + "/") for boundary in BOUNDARY_CODE))
+
     def test_pinned_boundary_matches_the_tree_before_deletion(self) -> None:
         if X1_DELETION_LANDED:
             self.skipTest("deletion landed; the pin applies only before deletion")
@@ -479,6 +502,7 @@ class MutationTests(unittest.TestCase):
         run: set[str] | None = None,
         floors: dict[str, int] | None = None,
         pinned: tuple[str, ...] | None = None,
+        receipt_tests: tuple[str, ...] = (),
     ) -> list[str]:
         run_paths = run if run is not None else {self.A, self.B, self.H}
         return collect_errors(
@@ -488,10 +512,15 @@ class MutationTests(unittest.TestCase):
             landed=landed,
             floors=floors or self.ZERO_FLOORS,
             pinned=self.PIN if pinned is None else pinned,
+            receipt_tests=receipt_tests,
         ) + legacy_name_errors(root, self.DOC_TEXT, landed=landed)
 
     def test_clean_tree_is_green(self) -> None:
         self.assertEqual(self.errors(self.make_tree()), [])
+
+    def test_missing_receipt_test_is_red(self) -> None:
+        errors = self.errors(self.make_tree(), receipt_tests=("tools/test_claude_fixer_receipts.py",))
+        self.assertTrue(any("receipt test is a keep-path and is missing" in e for e in errors), errors)
 
     def test_unlisted_file_is_red(self) -> None:
         root = self.make_tree(extra={"scripts/tests/v3/harness/new.test.py": "x = 1\n"})

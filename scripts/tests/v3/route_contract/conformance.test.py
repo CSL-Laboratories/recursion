@@ -831,20 +831,38 @@ class ReviewFixTests(unittest.TestCase):
             print(int(result.oversized))
             """
         )
-        child = subprocess.Popen(
-            [sys.executable, "-c", script],
-            cwd=ROOT,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-        )
+        popen_kwargs: dict = {
+            "cwd": ROOT,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+        }
+        if os.name != "nt":
+            popen_kwargs["start_new_session"] = True
+        child = subprocess.Popen([sys.executable, "-c", script], **popen_kwargs)
         try:
-            stdout, stderr = child.communicate(timeout=8)
-        except subprocess.TimeoutExpired:
-            os.killpg(child.pid, signal.SIGKILL)
-            child.wait(timeout=2)
-            self.fail("stdin write blocked the deadline")
+            try:
+                stdout, stderr = child.communicate(timeout=8)
+            except subprocess.TimeoutExpired:
+                self.fail("stdin write blocked the deadline")
+        finally:
+            if child.poll() is None:
+                if os.name == "nt":
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(child.pid)],
+                        capture_output=True,
+                        check=False,
+                    )
+                else:
+                    try:
+                        os.killpg(child.pid, signal.SIGKILL)
+                    except OSError:
+                        child.kill()
+                try:
+                    child.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait(timeout=2)
         self.assertEqual(0, child.returncode, stderr)
         self.assertEqual(["0", "0", "0"], stdout.strip().splitlines())
 

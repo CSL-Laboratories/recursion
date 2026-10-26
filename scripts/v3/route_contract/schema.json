@@ -163,6 +163,7 @@
         "output_too_large",
         "repair_empty_output",
         "repair_limit_or_error",
+        "repair_output_too_large",
         "repair_still_invalid",
         "repair_timeout",
         "repair_vendor_error",
@@ -979,9 +980,6 @@
             "properties": {
               "health_event": {
                 "$ref": "#/$defs/RouteHealthEvent"
-              },
-              "termination": {
-                "type": "null"
               }
             }
           }

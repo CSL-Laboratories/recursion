@@ -232,7 +232,7 @@ class ReferenceAdapter:
     ) -> ExecutionResult:
         usage_state = self._health.fault(self.engine_id, state, error)
         termination = None
-        if proc.timed_out:
+        if proc.timed_out or proc.oversized:
             termination = proc.termination or {
                 "type": "ProcessTerminationObservation@1",
                 "tree_status": "unknown",

@@ -24,6 +24,7 @@ from scripts.v3.control_api.service import MAX_BODY_BYTES, ControlService
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost"})
 REQUEST_TIMEOUT_S = 15.0
+MAX_CONNECTIONS = 32
 
 _STATUS_FOR_CODE = {
     err.PARSE_ERROR: 400,
@@ -53,6 +54,46 @@ class _Server(ThreadingHTTPServer):
     allow_reuse_address = True
     service: ControlService
     allowed_hosts: frozenset[str]
+    max_connections: int = MAX_CONNECTIONS
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._active = 0
+        self._active_lock = threading.Lock()
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        with self._active_lock:
+            if self._active >= self.max_connections:
+                payload = b'{"error":"too_many_connections"}'
+                try:
+                    request.sendall(
+                        b"HTTP/1.1 503 Service Unavailable\r\n"
+                        b"Content-Type: application/json\r\n"
+                        b"Content-Length: " + str(len(payload)).encode("ascii") + b"\r\n"
+                        b"Connection: close\r\n"
+                        b"Cache-Control: no-store\r\n\r\n" + payload
+                    )
+                except OSError:
+                    pass
+                try:
+                    request.close()
+                except OSError:
+                    pass
+                return
+            self._active += 1
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            with self._active_lock:
+                self._active -= 1
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            with self._active_lock:
+                self._active -= 1
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -156,13 +197,23 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 class ControlHTTPServer:
-    def __init__(self, service: ControlService, host: str = "127.0.0.1", port: int = 0) -> None:
+    def __init__(
+        self,
+        service: ControlService,
+        host: str = "127.0.0.1",
+        port: int = 0,
+        *,
+        max_connections: int = MAX_CONNECTIONS,
+    ) -> None:
         if host not in LOOPBACK_HOSTS:
             raise RemoteBindRefused("remote_bind_refused")
+        if max_connections < 1:
+            raise ValueError("max_connections must be positive")
         bind = "127.0.0.1"
         self._server = _Server((bind, port), _Handler)
         actual = self._server.server_address[1]
         self._server.service = service
+        self._server.max_connections = max_connections
         self._server.allowed_hosts = frozenset(
             {f"127.0.0.1:{actual}", f"localhost:{actual}"}
         )
@@ -181,9 +232,15 @@ class ControlHTTPServer:
         self._thread.start()
         return self
 
-    def stop(self) -> None:
-        self._server.shutdown()
+    def close(self) -> None:
+        """Release the bound socket without waiting for serve_forever."""
+
         self._server.server_close()
+
+    def stop(self) -> None:
+        if self._thread is not None:
+            self._server.shutdown()
+        self.close()
         if self._thread is not None:
             self._thread.join(5)
 

@@ -9,7 +9,8 @@ the committed recording must equal a fresh run byte for byte.
     python -X utf8 -B -m scripts.v3.control_api.record --write
 
 Nothing here reaches a provider. Tokens are minted in memory per run and are
-never part of the recording.
+never part of the recording. Replay needs the CI-pinned ``jsonschema``
+(``requirements-ci.txt``), which supplies ``Draft202012Validator``.
 """
 
 from __future__ import annotations
@@ -60,13 +61,13 @@ class _Recorder:
         )
         return response
 
-    def poll(self, label: str, client: ControlClient) -> None:
+    def poll(self, label: str, client: ControlClient, caller: str) -> None:
         page = client.poll(0)
         self.steps.append(
             {
                 "step": len(self.steps) + 1,
                 "label": label,
-                "caller": "operator",
+                "caller": caller,
                 "request": {"method": "GET /v1/events", "params": {"after": 0}},
                 "http_status": 200,
                 "response": page,
@@ -136,7 +137,7 @@ def run_scenario() -> dict[str, Any]:
         )
         step("claude session state", "viewer", viewer, "session.get", {"engine": "claude", "session": "demo-claude"})
         step("codex session state", "viewer", viewer, "session.get", {"engine": "codex", "session": "demo-codex"})
-        recorder.poll("observer journal", viewer)
+        recorder.poll("observer journal", viewer, "viewer")
     transports = {engine: len(t.calls) for engine, t in stack.transports.items()}
     body = {
         "type": RECORDING_TYPE,

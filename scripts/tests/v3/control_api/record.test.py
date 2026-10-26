@@ -111,6 +111,7 @@ class RecordingTests(unittest.TestCase):
         self.assertEqual(3, kinds.count("session.opened"))
         self.assertEqual(5, kinds.count("run.started"))
         self.assertEqual(5, kinds.count("run.finished"))
+        self.assertEqual("viewer", self.committed["steps"][-1]["caller"])
 
 
 if __name__ == "__main__":

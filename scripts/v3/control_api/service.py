@@ -193,7 +193,8 @@ class ControlService:
                 if existing.closed:
                     raise err.SessionClosed()
                 return _session_view(existing)
-            if len(tenant.sessions) >= MAX_SESSIONS_PER_TENANT:
+            active = sum(1 for item in tenant.sessions.values() if not item.closed)
+            if active >= MAX_SESSIONS_PER_TENANT:
                 raise err.RunRefused("session_limit", data={"code": "session_limit"})
             state = _Session(engine=engine, session=session)
             tenant.sessions[(engine, session)] = state
@@ -212,6 +213,8 @@ class ControlService:
         engine, session = self._engine(params), _session_id(params)
         with self._lock:
             state = self._existing(principal.tenant, engine, session)
+            if state.closed:
+                return _session_view(state)
             if state.in_flight:
                 raise err.SessionBusy()
             state.closed = True
@@ -225,6 +228,10 @@ class ControlService:
         prompt = params["prompt"]
         if not prompt or len(prompt) > MAX_PROMPT_CHARS:
             raise err.InvalidParams("prompt_size")
+        try:
+            prompt.encode("utf-8")
+        except UnicodeEncodeError:
+            raise err.InvalidParams("prompt_encoding") from None
         timeout_s = params.get("timeout_s", DEFAULT_TIMEOUT_S)
         if isinstance(timeout_s, bool) or not 0 < timeout_s <= MAX_TIMEOUT_S:
             raise err.InvalidParams("timeout_range")
@@ -239,33 +246,33 @@ class ControlService:
             tenant = self._tenant(principal.tenant)
             tenant.request_seq += 1
             request_id = f"req-{tenant.request_seq}"
-        request = ExecutionRequest(
-            request_id=request_id,
-            route_id=f"route-{engine}",
-            engine_id=engine,
-            route_descriptor_digest=sha256_digest(canonical_json(adapter.support())),
-            process_requirement_id="proc-req-control-api",
-            workload_id="control-api",
-            session=SessionKey(principal.tenant, f"route-{engine}", session),
-            credential=CredentialRef(
-                tenant_id=principal.tenant,
-                provider=self._credential_provider,
-                name=self._credential_name,
-            ),
-            cli_model=self._cli_model,
-            prompt=prompt,
-            output_schema=self._schema,
-            timeout_s=float(timeout_s),
-        )
-        request_record = request.to_record()
-        self._journal.append(
-            principal.tenant,
-            "run.started",
-            session=session,
-            engine=engine,
-            data={"request_id": request_id, "prompt_digest": request_record["prompt_digest"]},
-        )
         try:
+            request = ExecutionRequest(
+                request_id=request_id,
+                route_id=f"route-{engine}",
+                engine_id=engine,
+                route_descriptor_digest=sha256_digest(canonical_json(adapter.support())),
+                process_requirement_id="proc-req-control-api",
+                workload_id="control-api",
+                session=SessionKey(principal.tenant, f"route-{engine}", session),
+                credential=CredentialRef(
+                    tenant_id=principal.tenant,
+                    provider=self._credential_provider,
+                    name=self._credential_name,
+                ),
+                cli_model=self._cli_model,
+                prompt=prompt,
+                output_schema=self._schema,
+                timeout_s=float(timeout_s),
+            )
+            request_record = request.to_record()
+            self._journal.append(
+                principal.tenant,
+                "run.started",
+                session=session,
+                engine=engine,
+                data={"request_id": request_id, "prompt_digest": request_record["prompt_digest"]},
+            )
             try:
                 outcome = adapter.execute(request)
             except RouteRefusal as refusal:

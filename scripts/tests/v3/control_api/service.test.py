@@ -337,6 +337,46 @@ class RunTests(unittest.TestCase):
         self.assertEqual(err.REFUSED, code_of(response))
         h.ok(h.control_b, "session.open", {"engine": "claude", "session": "s-extra"})
 
+    def test_closed_sessions_do_not_consume_the_quota(self) -> None:
+        h = Harness()
+        for index in range(64):
+            h.ok(h.control_a, "session.open", {"engine": "claude", "session": f"s-{index}"})
+            h.ok(h.control_a, "session.close", {"engine": "claude", "session": f"s-{index}"})
+        opened = h.ok(h.control_a, "session.open", {"engine": "claude", "session": "s-next"})
+        self.assertEqual("open", opened["state"])
+        self.assertEqual(
+            err.SESSION_CLOSED,
+            code_of(h.call(h.control_a, "session.open", {"engine": "claude", "session": "s-0"})),
+        )
+
+    def test_close_is_idempotent(self) -> None:
+        h = Harness()
+        h.ok(h.control_a, "session.open", {"engine": "claude", "session": "s-one"})
+        first = h.ok(h.control_a, "session.close", {"engine": "claude", "session": "s-one"})
+        again = h.ok(h.control_a, "session.close", {"engine": "claude", "session": "s-one"})
+        self.assertEqual(first, again)
+        kinds = [e["kind"] for e in h.ok(h.control_a, "events.poll", {"after": 0})["events"]]
+        self.assertEqual(["session.opened", "session.closed"], kinds)
+
+    def test_lone_surrogate_prompt_is_invalid_and_leaves_the_session_open(self) -> None:
+        h = Harness()
+        h.ok(h.control_a, "session.open", {"engine": "claude", "session": "s-one"})
+        body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "session.run",
+                "params": {"engine": "claude", "session": "s-one", "prompt": "\ud800"},
+            },
+            ensure_ascii=True,
+        )
+        response = h.service.handle(body, f"Bearer {h.control_a}")
+        self.assertEqual(err.INVALID_PARAMS, code_of(response))
+        self.assertEqual("prompt_encoding", response["error"]["message"])
+        self.assertEqual("open", h.ok(h.control_a, "session.get", {"engine": "claude", "session": "s-one"})["state"])
+        self.assertEqual(0, h.transport.calls)
+        h.ok(h.control_a, "session.close", {"engine": "claude", "session": "s-one"})
+
     def test_a_secret_in_the_prompt_is_refused_before_any_spawn(self) -> None:
         h = Harness()
         h.ok(h.control_a, "session.open", {"engine": "claude", "session": "s-one"})
@@ -406,6 +446,25 @@ class JournalTests(unittest.TestCase):
                 break
             after = page["next_after"]
         self.assertEqual(list(range(1, 8)), seen)
+
+    def test_stale_poll_returns_immediately_when_another_tenant_evicts(self) -> None:
+        journal = EventJournal(capacity=1)
+        journal.append("tenant-a", "a1")
+        journal.append("tenant-b", "b1")
+        started = threading.Event()
+        out: list[dict] = []
+
+        def waiter() -> None:
+            started.set()
+            out.append(journal.poll("tenant-a", 0, wait_s=30))
+
+        thread = threading.Thread(target=waiter)
+        thread.start()
+        started.wait(5)
+        thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(out[0]["reset"])
+        self.assertEqual([], out[0]["events"])
 
     def test_overflow_reports_a_reset_instead_of_a_silent_gap(self) -> None:
         journal = EventJournal(capacity=3)

@@ -101,3 +101,43 @@ Keep invariant 1's force-push, merge, and deployment limits. Name the review bra
 - No edit to `ANCHOR.md`.
 - No edit to `.github/workflows/**`. Workflow, pr-lint, script, and Claude/Devin
   findings stay listed on the CSL-76 PR.
+
+---
+
+## P-003 — Protected-doc edits needed by the Recursion spine build (WP16)
+
+- Date: 2026-10-26
+- Status: **proposed**. Confers no authorization. For Lucas's Oct 29 protected-doc session.
+- Owner: Lucas.
+- Issue: [CSL-495](https://linear.app/csl-laboratories/issue/CSL-495).
+
+### Motivation
+
+WP16 adds a loopback, token-authenticated Control API that runs only fake drivers
+(recursion stack off R#302, `scripts/v3/control_api/`). No edit to `ANCHOR.md`,
+`AGENTS.md` or `CONTROL_PLANE.md` was made. A search on 2026-10-26 found no line in
+those three files that mentions a daemon, listener, loopback server or Control API, so
+nothing conflicts and nothing authorizes it either. The items below are what the slice
+needs recorded.
+
+### Proposed edits (text for Lucas to author or reject)
+
+1. `AGENTS.md` hard rule 8: add one sentence that a listener bound to a loopback
+   address, authenticated per request, serving only fake drivers, is not a live
+   provider, host or spend action, and that any non-loopback bind or live adapter needs
+   a fresh admission. The code enforces this (`RemoteBindRefused`, `LIVE_ADAPTERS_ENABLED`).
+2. `AGENTS.md` "Bounded issue execution": name `scripts/v3/control_api/rerun_frozen_sha.sh`
+   as an acceptable way to produce the closeout record of the full 40-hex commit tested,
+   the commands and their results. It does not replace independent verification.
+3. `ANCHOR.md` in-scope list: say whether the Control API surface (CSL-498) is in scope.
+   Carried, not new: the Step 4 decision 10 items (ANCHOR L44 and L46, `AGENTS.md` L62,
+   `CONTROL_PLANE.md` L12-13).
+4. RP0-v2 (WP7, not a protected file): record Lucas's 2026-10-26 confirmation that a thin
+   direct-CLI fallback may exist and must be labeled as not satisfying X2, and that
+   workload IDs stay neutral instead of narrowing the public-scope regex.
+
+### Non-goals
+
+- No change to `state/DECISIONS.md` and no new decision entry.
+- No change to CSL-237 (stays Nov 12, Lucas's confirmation).
+

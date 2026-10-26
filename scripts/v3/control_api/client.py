@@ -47,13 +47,20 @@ def read_token_file(path: str | os.PathLike[str]) -> str:
     cannot redirect the read and a FIFO cannot hang the caller.
     """
 
+    raw_path = os.fspath(path)
+    try:
+        preview = os.lstat(raw_path)
+    except OSError:
+        raise TokenFileRefused("token_file_missing") from None
+    if stat.S_ISLNK(preview.st_mode) or not stat.S_ISREG(preview.st_mode):
+        raise TokenFileRefused("token_file_not_regular")
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     if hasattr(os, "O_NONBLOCK"):
         flags |= os.O_NONBLOCK
     try:
-        descriptor = os.open(os.fspath(path), flags)
+        descriptor = os.open(raw_path, flags)
     except OSError:
         raise TokenFileRefused("token_file_missing") from None
     try:

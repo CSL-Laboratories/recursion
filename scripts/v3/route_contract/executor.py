@@ -32,7 +32,7 @@ from scripts.v3.route_contract.model import (
 )
 from scripts.v3.route_contract.transport import ProcResult, Transport
 
-REPAIR_REASON_CHARS = 500
+REPAIR_REASON_GENERIC = "output did not match the required schema"
 _REPAIR_PREFIX = "\n\nYour previous output was rejected: "
 _REPAIR_SUFFIX = "\nReturn ONLY corrected JSON that matches the required schema; no prose."
 _FENCE = re.compile(r"\A```[A-Za-z0-9_+-]*[ \t]*\r?\n(?P<body>.*?)\r?\n?```\s*\Z", re.S)
@@ -41,7 +41,17 @@ Validate = Callable[[Any], "str | None"]
 
 
 def repair_prompt_for(prompt: str, reason: object) -> str:
-    return prompt + _REPAIR_PREFIX + str(reason)[:REPAIR_REASON_CHARS] + _REPAIR_SUFFIX
+    # Ignore validator text: it can quote private response values.
+    del reason
+    return prompt + _REPAIR_PREFIX + REPAIR_REASON_GENERIC + _REPAIR_SUFFIX
+
+
+def object_output_schema(schema: Any) -> bool:
+    return isinstance(schema, dict) and schema.get("type") == "object"
+
+
+def _output_bytes(proc: ProcResult) -> int:
+    return len((proc.stdout or "").encode("utf-8")) + len((proc.stderr or "").encode("utf-8"))
 
 
 def _strip_fence(text: str) -> str:
@@ -166,6 +176,8 @@ class ReferenceAdapter:
     def execute(self, request: ExecutionRequest) -> ExecutionResult:
         if request.engine_id != self.engine_id:
             raise Unsupported()
+        if not object_output_schema(request.output_schema):
+            raise Unsupported()
         if request.allowed_tools:
             raise ToolPolicyRefused()
         if self._health.is_open(self.engine_id):
@@ -211,7 +223,9 @@ class ReferenceAdapter:
         argv_mod.assert_no_secret(argv, prompt, self._secret_values)
 
     def _call(self, request: ExecutionRequest, argv: list[str], prompt: str) -> ProcResult:
-        return self._transport.run(argv, prompt, request.timeout_s, request.cwd)
+        return self._transport.run(
+            argv, prompt, request.timeout_s, request.cwd, request.max_output_bytes
+        )
 
     def _fault(
         self, proc: ProcResult, error: str, state: str, status: str, *, repaired: bool
@@ -245,7 +259,9 @@ class ReferenceAdapter:
     ) -> tuple[ExecutionResult | None, Any, str | None, Any]:
         parsed, session, body = None, None, None
         error, state, status = "limit_or_error", "exhausted", STATUS_LIMIT_HIT
-        if proc.timed_out:
+        if proc.oversized or _output_bytes(proc) > request.max_output_bytes:
+            error, status = "output_too_large", STATUS_LIMIT_HIT
+        elif proc.timed_out:
             error, status = "timeout", STATUS_TIMEOUT
         elif proc.returncode != 0 or limit_signal(proc.stdout or "", proc.stderr or "", prompt):
             pass
@@ -272,6 +288,8 @@ class ReferenceAdapter:
         reason = (
             "output was not valid JSON" if parsed is None else self._validate(body)
         )
+        if reason is None and not isinstance(body, dict):
+            reason = "output was not a JSON object"
         if reason is None:
             return self._ok(proc, body, session, repaired=False)
         repair_prompt = repair_prompt_for(request.prompt, reason)
@@ -281,6 +299,8 @@ class ReferenceAdapter:
         if fault is not None:
             return fault
         reason2 = "output was not valid JSON" if parsed is None else self._validate(body2)
+        if reason2 is None and not isinstance(body2, dict):
+            reason2 = "output was not a JSON object"
         if reason2 is None:
             return self._ok(proc2, body2, session2 or session, repaired=True)
         return ExecutionResult(
@@ -294,9 +314,11 @@ class ReferenceAdapter:
     def _ok(
         self, proc: ProcResult, body: Any, session: str | None, *, repaired: bool
     ) -> ExecutionResult:
+        if not isinstance(body, dict):
+            raise TypeError("ok result requires a JSON object body")
         return ExecutionResult(
             status=STATUS_OK,
-            validated=body if isinstance(body, dict) else None,
+            validated=body,
             session_id=session,
             repaired=repaired,
             output_digest=sha256_digest(proc.stdout),

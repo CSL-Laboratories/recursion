@@ -68,7 +68,15 @@ class RefusalTests(unittest.TestCase):
             self.assertEqual("", result.stdout)
 
     def test_bad_usage_is_refused(self) -> None:
-        for args in ((), ("--dry-run",), ("a" * 40, "b" * 40), ("a" * 40, "--steps", "gate,rm"), ("a" * 40, "--bogus"), ("a" * 40, "--out")):
+        for args in (
+            (),
+            ("--dry-run",),
+            ("a" * 40, "b" * 40),
+            ("a" * 40, "--steps", "gate,rm"),
+            ("a" * 40, "--steps", "record,record"),
+            ("a" * 40, "--bogus"),
+            ("a" * 40, "--out"),
+        ):
             self.assertEqual(2, run_script(*args).returncode, args)
 
     @unittest.skipUnless(have_git_head(), "needs a git checkout")
@@ -109,8 +117,27 @@ class EvidenceTests(unittest.TestCase):
                 self.assertTrue((Path(directory) / step["log"]).is_file())
             self.assertIn("scripts.v3.control_api.record --check", evidence["steps"][0]["command"])
             self.assertEqual(0, evidence["tree_dirty_files_after"])
+            parent = git("rev-parse", f"{head}^")
+            self.assertEqual(parent, evidence["comparison_sha"])
         self.assertEqual(before, git("status", "--porcelain"), "the working tree must not change")
         self.assertFalse(any(line.split()[0].endswith("/tree") for line in git("worktree", "list").splitlines()))
+
+    @unittest.skipUnless(have_git_head(), "needs a git checkout")
+    def test_default_out_does_not_dirty_the_source_checkout(self) -> None:
+        head = git("rev-parse", "HEAD")
+        before = git("status", "--porcelain")
+        result = run_script(head, "--steps", "scope")
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual(before, git("status", "--porcelain"))
+        self.assertNotIn("spine-rerun-evidence", before)
+        payload = json.loads(result.stdout.splitlines()[-1])
+        evidence = Path(payload["evidence"])
+        self.assertTrue(evidence.is_file())
+        self.assertFalse(str(evidence).startswith(str(ROOT)))
+        evidence.parent.joinpath(f"{head}.scope.log").unlink(missing_ok=True)
+        evidence.unlink(missing_ok=True)
+        tsv = evidence.parent.joinpath(f"{head}.steps.tsv")
+        tsv.unlink(missing_ok=True)
 
     def test_a_failing_step_fails_the_run_and_the_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

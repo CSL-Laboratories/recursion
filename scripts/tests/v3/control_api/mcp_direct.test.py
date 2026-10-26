@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.v3.control_api import mcp_server  # noqa: E402
+from scripts.v3.control_api.__main__ import main  # noqa: E402
 from scripts.v3.control_api.auth import SCOPE_CONTROL, SCOPE_OBSERVE  # noqa: E402
 from scripts.v3.control_api.direct_cli import run_direct  # noqa: E402
 from scripts.v3.control_api.fake_engines import build_fake_stack  # noqa: E402
@@ -77,6 +78,10 @@ class McpTests(unittest.TestCase):
         self.assertEqual(server.handle({"jsonrpc": "2.0", "id": 1, "method": "nope"})["error"]["code"], -32601)
         bad = server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "x"}})
         self.assertEqual(bad["error"]["code"], -32602)
+        array_name = server.handle(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": ["recursion_service_info"]}}
+        )
+        self.assertEqual(array_name["error"]["code"], -32602)
         self.assertEqual(server.handle([])["error"]["code"], -32600)
 
     def test_stdio_loop_survives_garbage(self) -> None:
@@ -86,6 +91,27 @@ class McpTests(unittest.TestCase):
         lines = [json.loads(line) for line in sink.getvalue().splitlines()]
         self.assertEqual(lines[0]["error"]["code"], -32700)
         self.assertEqual(lines[1]["result"], {})
+
+    def test_dispatch_outage_is_a_tool_error_and_the_loop_continues(self) -> None:
+        def boom(method: str, params: dict) -> dict:
+            raise OSError("connection refused")
+
+        server = mcp_server.ControlMcpServer(boom)
+        sink = io.StringIO()
+        server.serve(
+            io.StringIO(
+                '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"recursion_service_info"}}\n'
+                '{"jsonrpc":"2.0","id":2,"method":"ping"}\n'
+            ),
+            sink,
+        )
+        lines = [json.loads(line) for line in sink.getvalue().splitlines()]
+        self.assertTrue(lines[0]["result"]["isError"])
+        self.assertNotIn("connection refused", json.dumps(lines[0]))
+        self.assertEqual(lines[1]["result"], {})
+
+    def test_mcp_proxy_url_requires_a_token_file(self) -> None:
+        self.assertEqual(2, main(["mcp-fake", "--url", "http://127.0.0.1:9"]))
 
 
 class DirectCliTests(unittest.TestCase):

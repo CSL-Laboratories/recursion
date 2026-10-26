@@ -6,7 +6,7 @@ twin: CSL-523
 base: 954ddc607f6b8736a09ebf5aed872fce8355ce3e
 ---
 
-# Proposed D-044 — founder GitHub PR approval as Recursion spec acceptance
+# Proposed CSLR-D-001 — founder GitHub PR approval as Recursion spec acceptance
 
 **This file is a proposal.** It is not acceptance, not an authoring session, and
 not permission to edit protected paths. `CONTROL_PLANE.md` rule 6: protected
@@ -61,7 +61,6 @@ re-hash the then-current files and bind the accepting review to **that** head.
 |---|---|
 | `CONTROL_PLANE.md` | `73ec2f799280e2167461e7f3de6172e6fe54456ea2e7955d7832bcf03dc8ab45` |
 | `ANCHOR.md` | `0975e9151c1bafa3bd67d66fed061078b1eb75e6b808c65a7f4bfe851fc8b0e5` |
-| `state/DECISIONS.md` | `1a8c092085cbe1ecf5d69fc72dbde349686d7648562d7f62e2214ec41c6e1002` |
 | `AGENTS.md` | `310e6743e479ce30c945f25fb7129728b31eaccde40ae07a37a13a765e485eab` |
 | `CLAUDE.md` | `310e6743e479ce30c945f25fb7129728b31eaccde40ae07a37a13a765e485eab` (byte-identical to `AGENTS.md` on this base) |
 | `docs/v3/PLANNING.md` | `b83aff4256e4bd5b44951347c27b87312f9fa59f53897d88fb850be61aefc488` |
@@ -122,8 +121,9 @@ Protected-path and merge-rule amendments still require the separately recorded
 authoring session. This receipt does not change Lucas's reserved decisions.
 ```
 
-Also record D-044 in the "Changing this document" closing list, next to D-041
-and D-043, once that entry exists.
+Also record CSLR-D-001 ([csl-research#59](https://github.com/CSL-Laboratories/csl-research/pull/59)) in the "Changing
+this document" closing list, next to D-041, D-043 and D-044, once that record
+exists.
 
 ### 2. `ANCHOR.md` — new short section after Success criteria
 
@@ -140,51 +140,18 @@ file-digest map (`CONTROL_PLANE.md` product-spec acceptance). Lucas-authored
 amendments keep Lucas's existing acceptance path. Merge is not acceptance.
 ```
 
-### 3. `state/DECISIONS.md` — append D-044 (do not edit earlier entries)
+### 3. Decision record — CSLR-D-001 in csl-research, not `state/DECISIONS.md`
 
-```
-## D-044 - Founder GitHub PR approval accepts Samir/Dan spec changes
-Date: 2026-10-25 (decision) - Status: ACCEPTED founder decision; repository
-amendment pending review and merge
+Lucas (2026-10-26 2:50pm PT, relayed by Grok Bot Liaison): "Move the R#296
+decision record to csl-research with a new decision ID."
 
-**Source record:** Lucas (2026-10-24 11:58pm PT), his words: "Samir and Dan
-should be able to change and modify the product spec with their agents as
-recommended and as research is synthesized" and "Spec changes by Samir or Dan
-are accepted once another founder approves the PR." Drafting this follow-up
-was directed 2026-10-25 12:13am PT ("Yes absolutely"), matching CSL-523.
-Authoring-session approval is the unprefixed comment Lucas posts on CSL-524.
-
-**Authoring-session approval:** that CSL-524 comment. Lucas is a founder, and
-`CONTROL_PLANE.md` lets any founder approve a protected-path amendment through
-this process.
-
-**Options considered:** A) keep product-spec acceptance Lucas-only, including
-for Samir/Dan-authored PRs / B) count another founder's GitHub `APPROVED`
-review of a Samir- or Dan-authored spec PR as acceptance, bound to head SHA
-and file digests, keeping Lucas's path for Lucas-authored PRs.
-
-**Chose:** B.
-
-**Because:** the 11:58pm PT instruction is explicit; a GitHub review from the
-approver's own account is already the named-reviewer receipt
-(`CONTROL_PLANE.md` Protected paths). Binding SHA and digests prevents a
-stale-head or swapped-file approval from counting.
-
-**Consequence:** `CONTROL_PLANE.md` gains the Product-spec acceptance
-subsection. `AGENTS.md`/`CLAUDE.md` record that merge is still not
-acceptance, and that the bound GitHub approval is. GoalSpec digest
-acceptance (runtime Owner object) is not this rule.
-
-Unchanged: merge rules; agents never merge; Lucas's reserved authority; R2a;
-accepted contracts; D-038; OR-038.
-
-**Falsifier:** a non-founder approval, author self-approval, stale head, or
-digest mismatch is treated as spec acceptance; or Lucas's path for
-Lucas-authored spec PRs is removed.
-
-**Review:** at a founder revisit of this decision, or the next monthly
-decision-log review.
-```
+Do **not** append to `state/DECISIONS.md`. It is frozen through D-044 (the
+research-vault alignment) and takes no new entries; its D-044 is a different
+decision. The apply step records this decision as **CSLR-D-001** in
+[CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research)
+(`decisions/CSLR-D-001.md`, [csl-research#59](https://github.com/CSL-Laboratories/csl-research/pull/59)) and this repository only links it.
+The posted authoring sentence names `state/DECISIONS.md`; the apply step
+still leaves that file untouched.
 
 ### 4. `AGENTS.md` and `CLAUDE.md` (keep them in lockstep)
 
@@ -199,7 +166,7 @@ insert:
  Spec changes authored by Samir or Dan (or their attributed agents) are
  accepted when a founder other than the author submits a GitHub `APPROVED`
  review on the exact PR head SHA with a SHA-256 digest map of the accepted
- paths (`CONTROL_PLANE.md` product-spec acceptance; D-044). Lucas-authored
+ paths (`CONTROL_PLANE.md` product-spec acceptance; CSLR-D-001). Lucas-authored
  spec PRs keep Lucas's existing acceptance path. Self-approval, a non-founder
  review, a stale head, a digest mismatch, CI, PASS, silence and labels are
  not acceptance.
@@ -236,7 +203,7 @@ After step 4 ("Lucas accepts the exact GoalSpec digest…") and the following
 product-spec vs GoalSpec distinction as PLANNING.md.
 
 APQ-01 / APQ-02 "Lucas seam" cells stay as GoalSpec/Owner ratification items.
-Add one footnote on those two rows: product-spec acceptance is D-044, not
+Add one footnote on those two rows: product-spec acceptance is CSLR-D-001, not
 these seams.
 
 ### 7. `docs/v3/DECISION-REGISTER.md` item 9
@@ -256,7 +223,7 @@ Proposed replacement of that numbered item (the other eight items unchanged):
    each ARM exclusively owns its plan/DAG proposals while the deterministic
    kernel owns admission. Product-spec (`docs/v3`) acceptance is not this
    item: spec changes by Samir or Dan are accepted by another founder's
-   GitHub review (CSL-524 / proposed D-044). CSL's first-user Owner remains
+   GitHub review (CSL-524 / CSLR-D-001). CSL's first-user Owner remains
    Lucas until a GoalSpec names another founder.
 ```
 
@@ -281,7 +248,7 @@ PRs keep Lucas's existing acceptance path.
 - Do not edit `.github/workflows/**`.
 - Do not add a `program.json` checker in this issue (CSL-523's companion
   checker is out of Recursion scope unless Lucas asks after authoring).
-- Do not treat this proposal file's publication as D-044 taking effect.
+- Do not treat this proposal file's publication as CSLR-D-001 taking effect.
 
 ## Gate for this drafting PR
 
@@ -295,6 +262,8 @@ python -X utf8 -B tools/check_public_scope.py
 ## After Lucas posts the authoring sentence
 
 Apply the insertions above on this branch; for a successor branch, first
-obtain a matching authoring-session approval naming that branch. Re-hash the
+obtain a matching authoring-session approval naming that branch. Do not append
+to `state/DECISIONS.md`; the decision record is CSLR-D-001 in csl-research
+([csl-research#59](https://github.com/CSL-Laboratories/csl-research/pull/59)). Re-hash the
 accepted paths, request `samir-shah-ahmed` and `CDanTheMan`, and wait for
 Devin then required CI. Do not merge.

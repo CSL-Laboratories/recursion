@@ -107,14 +107,17 @@ Keep invariant 1's force-push, merge, and deployment limits. Name the review bra
 ## P-003 — Founder GitHub PR approval as Recursion spec acceptance
 
 - Date: 2026-10-25
-- Status: **authoring session posted; apply stopped; pending Lucas**. Lucas posted
+- Status: **authoring session posted; decision record moved to csl-research as
+  CSLR-D-001; protected-path diffs not yet applied**. Lucas posted
   the unprefixed authoring sentence from his own account on
   [CSL-524](https://linear.app/csl-laboratories/issue/CSL-524) as comment
   `3bf10093-062c-43bc-a9c3-f21bb8f6ba73` (2026-10-26 2:38pm PT), naming branch
   `cursor/csl-524-spec-acceptance-1752`. The protected-path diffs were **not**
-  applied on this branch. The proposal appends a decision headed D-044, and
-  `state/DECISIONS.md` already has D-044 (research-vault alignment; log frozen
-  through D-044, no further entries). Not merged.
+  applied on this branch. Lucas (2026-10-26 2:50pm PT, relayed by Grok Bot
+  Liaison): "Move the R#296 decision record to csl-research with a new decision
+  ID." The record is CSLR-D-001 (`decisions/CSLR-D-001.md`,
+  [csl-research#59](https://github.com/CSL-Laboratories/csl-research/pull/59)); `state/DECISIONS.md` stays
+  frozen through D-044 and gets no entry. Not merged.
 - Owner: Lucas.
 - Issue: [CSL-524](https://linear.app/csl-laboratories/issue/CSL-524) (child of CSL-494;
   related CSL-493, CSL-523). Twin of CSL-523 in the companion repo.
@@ -132,10 +135,11 @@ session. This proposal records the rule and the target diffs without applying th
 ### Proposed replacement
 
 See the proposal file. After Lucas posts the authoring sentence on CSL-524, apply
-those insertions to `CONTROL_PLANE.md`, `ANCHOR.md`, `state/DECISIONS.md` (append
-D-044 only), `AGENTS.md`, `CLAUDE.md`, `docs/v3/PLANNING.md`,
-`docs/v3/AUTONOMOUS-PLANNING.md`, `docs/v3/DECISION-REGISTER.md` item 9, and
-`docs/v3/ACCEPTANCE.md`.
+those insertions to `CONTROL_PLANE.md`, `ANCHOR.md`, `AGENTS.md`, `CLAUDE.md`,
+`docs/v3/PLANNING.md`, `docs/v3/AUTONOMOUS-PLANNING.md`,
+`docs/v3/DECISION-REGISTER.md` item 9, and `docs/v3/ACCEPTANCE.md`. Record the
+decision as CSLR-D-001 in csl-research ([csl-research#59](https://github.com/CSL-Laboratories/csl-research/pull/59));
+do not append to the frozen `state/DECISIONS.md`.
 
 ### Non-goals
 
@@ -143,6 +147,5 @@ D-044 only), `AGENTS.md`, `CLAUDE.md`, `docs/v3/PLANNING.md`,
 - No merge. No acceptance of recursion#295. No change to Lucas's reserved
   decisions or to agent-never-merge.
 - No other-project identifiers in tracked files.
-- The authoring comment now exists. Apply still did not edit protected paths:
-  appending the proposal's D-044 would duplicate the frozen vault decision.
-  Waiting on Lucas for a distinct id and where that record lives.
+- No entry in `state/DECISIONS.md` (frozen through D-044). The decision record
+  is CSLR-D-001 in csl-research ([csl-research#59](https://github.com/CSL-Laboratories/csl-research/pull/59)).

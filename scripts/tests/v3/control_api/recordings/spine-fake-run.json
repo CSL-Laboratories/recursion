@@ -1,0 +1,882 @@
+{
+  "driver": "fake",
+  "engine_paths": [
+    "claude",
+    "codex"
+  ],
+  "live_calls": false,
+  "steps": [
+    {
+      "caller": "operator",
+      "http_status": 200,
+      "label": "service info",
+      "request": {
+        "method": "service.info",
+        "params": {}
+      },
+      "response": {
+        "id": 1,
+        "jsonrpc": "2.0",
+        "result": {
+          "api_version": "control-api@0",
+          "engines": [
+            "claude",
+            "codex"
+          ],
+          "live_calls": false,
+          "scopes": [
+            "control",
+            "observe"
+          ],
+          "tenant": "tenant-demo",
+          "tool_profile": "zero-tools"
+        }
+      },
+      "step": 1
+    },
+    {
+      "caller": "operator",
+      "http_status": 200,
+      "label": "route list",
+      "request": {
+        "method": "route.list",
+        "params": {}
+      },
+      "response": {
+        "id": 2,
+        "jsonrpc": "2.0",
+        "result": {
+          "routes": [
+            {
+              "adapter_kind": "fake",
+              "engine_id": "claude",
+              "live_calls": false,
+              "reason": "fake-driver",
+              "state": "supported",
+              "type": "AdapterSupport@0"
+            },
+            {
+              "adapter_kind": "fake",
+              "engine_id": "codex",
+              "live_calls": false,
+              "reason": "fake-driver",
+              "state": "supported",
+              "type": "AdapterSupport@0"
+            }
+          ]
+        }
+      },
+      "step": 2
+    },
+    {
+      "caller": "operator",
+      "http_status": 200,
+      "label": "open claude session",
+      "request": {
+        "method": "session.open",
+        "params": {
+          "engine": "claude",
+          "session": "demo-claude"
+        }
+      },
+      "response": {
+        "id": 3,
+        "jsonrpc": "2.0",
+        "result": {
+          "engine": "claude",
+          "last_output_digest": null,
+          "last_status": null,
+          "runs": 0,
+          "session": "demo-claude",
+          "state": "open"
+        }
+      },
+      "step": 3
+    },
+    {
+      "caller": "operator",
+      "http_status": 200,
+      "label": "run claude (ok)",
+      "request": {
+        "method": "session.run",
+        "params": {
+          "engine": "claude",
+          "prompt": "Review the change and answer with a verdict.",
+          "session": "demo-claude"
+        }
+      },
+      "response": {
+        "id": 4,
+        "jsonrpc": "2.0",
+        "result": {
+          "adapter_events": [
+            {
+              "credential": {
+                "name": "route-ref",
+                "provider": "fake",
+                "tenant_id": "tenant-demo"
+              },
+              "generation": 1,
+              "kind": "started",
+              "op_id": "local-1"
+            },
+            {
+              "generation": 1,
+              "kind": "sent",
+              "op_id": "local-1"
+            }
+          ],
+          "request": {
+            "allowed_tools": [],
+            "cli_model": "fake-model",
+            "credential_ref": {
+              "name": "route-ref",
+              "provider": "fake",
+              "tenant_id": "tenant-demo",
+              "type": "CredentialRef@0"
+            },
+            "cwd_ref": null,
+            "engine_id": "claude",
+            "id": "req-1",
+            "max_turns": 6,
+            "output": {
+              "format": "json",
+              "max_output_bytes": 262144,
+              "raw_output_retained": false,
+              "repair_attempts": 1,
+              "schema_digest": "sha256:20c97c88bef7279615a904b57d240e338b49089adc4728216dcd80e6bff64eb4",
+              "schema_path_ref": null,
+              "type": "OutputContract@0"
+            },
+            "privacy_class": "internal",
+            "process_requirement_id": "proc-req-control-api",
+            "prompt_channel": "stdin",
+            "prompt_digest": "sha256:c103bc3ef274d62bd96d714054e03c13e8d9ea831103805021f6382e3453ccc7",
+            "route_descriptor_digest": "sha256:598f948b0191c53515b8791019f6eb2567eee33969c9658dca99c798f829e175",
+            "route_id": "route-claude",
+            "session": {
+              "route": "route-claude",
+              "session": "demo-claude",
+              "tenant": "tenant-demo",
+              "type": "SessionRef@0"
+            },
+            "timeout_ms": 30000,
+            "tool_profile": "zero-tools",
+            "type": "RouteExecutionRequest@0",
+            "workload_id": "control-api"
+          },
+          "result": {
+            "dispatched": true,
+            "error": null,
+            "health_event": null,
+            "output_digest": "sha256:e5e01e29c850541d6e9fe826ab548e9691ebd388c08f101142c3066427e76a3c",
+            "repaired": false,
+            "request_id": "req-1",
+            "status": "ok",
+            "termination": null,
+            "type": "RouteExecutionResult@0",
+            "usage_state": "ok",
+            "validated": {
+              "summary": "fake claude reviewed prompt c103bc3e",
+              "verdict": "pass"
+            }
+          }
+        }
+      },
+      "step": 4
+    },
+    {
+      "caller": "operator",
+      "http_status": 200,
+      "label": "open codex session",
+      "request": {
+        "method": "session.open",
+        "params": {
+          "engine": "codex",
+          "session": "demo-codex"
+        }
+      },
+      "response": {
+        "id": 5,
+        "jsonrpc": "2.0",
+        "result": {
+          "engine": "codex",
+          "last_output_digest": null,
+          "last_status": null,
+          "runs": 0,
+          "session": "demo-codex",
+          "state": "open"
+        }
+      },
+      "step": 5
+    },
+    {
+      "caller": "operator",
+      "http_status": 200,
+      "label": "run codex (ok)",
+      "request": {
+        "method": "session.run",
+        "params": {
+          "engine": "codex",
+          "prompt": "Review the change and answer with a verdict.",
+          "session": "demo-codex"
+        }
+      },
+      "response": {
+        "id": 6,
+        "jsonrpc": "2.0",
+        "result": {
+          "adapter_events": [
+            {
+              "credential": {
+                "name": "route-ref",
+                "provider": "fake",
+                "tenant_id": "tenant-demo"
+              },
+              "generation": 1,
+              "kind": "started",
+              "op_id": "local-2"
+            },
+            {
+              "generation": 1,
+              "kind": "sent",
+              "op_id": "local-2"
+            }
+          ],
+          "request": {
+            "allowed_tools": [],
+            "cli_model": "fake-model",
+            "credential_ref": {
+              "name": "route-ref",
+              "provider": "fake",
+              "tenant_id": "tenant-demo",
+              "type": "CredentialRef@0"
+            },
+            "cwd_ref": null,
+            "engine_id": "codex",
+            "id": "req-2",
+            "max_turns": 6,
+            "output": {
+              "format": "json",
+              "max_output_bytes": 262144,
+              "raw_output_retained": false,
+              "repair_attempts": 1,
+              "schema_digest": "sha256:20c97c88bef7279615a904b57d240e338b49089adc4728216dcd80e6bff64eb4",
+              "schema_path_ref": null,
+              "type": "OutputContract@0"
+            },
+            "privacy_class": "internal",
+            "process_requirement_id": "proc-req-control-api",
+            "prompt_channel": "stdin",
+            "prompt_digest": "sha256:c103bc3ef274d62bd96d714054e03c13e8d9ea831103805021f6382e3453ccc7",
+            "route_descriptor_digest": "sha256:f8de8c1314e1190b4b87af87fab734ab4f60b87f64d3e5aed5db43c1883c01d1",
+            "route_id": "route-codex",
+            "session": {
+              "route": "route-codex",
+              "session": "demo-codex",
+              "tenant": "tenant-demo",
+              "type": "SessionRef@0"
+            },
+            "timeout_ms": 30000,
+            "tool_profile": "zero-tools",
+            "type": "RouteExecutionRequest@0",
+            "workload_id": "control-api"
+          },
+          "result": {
+            "dispatched": true,
+            "error": null,
+            "health_event": null,
+            "output_digest": "sha256:5df2afa67b3ed85c6adbb921b43a2c7a09d833af03496d5271f4d9f9fd2c46b2",
+            "repaired": false,
+            "request_id": "req-2",
+            "status": "ok",
+            "termination": null,
+            "type": "RouteExecutionResult@0",
+            "usage_state": "ok",
+            "validated": {
+              "summary": "fake codex reviewed prompt c103bc3e",
+              "verdict": "pass"
+            }
+          }
+        }
+      },
+      "step": 6
+    },
+    {
+      "caller": "operator",
+      "http_status": 200,
+      "label": "open claude repair session",
+      "request": {
+        "method": "session.open",
+        "params": {
+          "engine": "claude",
+          "session": "demo-repair"
+        }
+      },
+      "response": {
+        "id": 7,
+        "jsonrpc": "2.0",
+        "result": {
+          "engine": "claude",
+          "last_output_digest": null,
+          "last_status": null,
+          "runs": 0,
+          "session": "demo-repair",
+          "state": "open"
+        }
+      },
+      "step": 7
+    },
+    {
+      "caller": "operator",
+      "http_status": 200,
+      "label": "run claude (invalid output, one repair, ok)",
+      "request": {
+        "method": "session.run",
+        "params": {
+          "engine": "claude",
+          "prompt": "Review the second change and answer with a verdict.",
+          "session": "demo-repair"
+        }
+      },
+      "response": {
+        "id": 8,
+        "jsonrpc": "2.0",
+        "result": {
+          "adapter_events": [
+            {
+              "credential": {
+                "name": "route-ref",
+                "provider": "fake",
+                "tenant_id": "tenant-demo"
+              },
+              "generation": 1,
+              "kind": "started",
+              "op_id": "local-3"
+            },
+            {
+              "generation": 1,
+              "kind": "sent",
+              "op_id": "local-3"
+            }
+          ],
+          "request": {
+            "allowed_tools": [],
+            "cli_model": "fake-model",
+            "credential_ref": {
+              "name": "route-ref",
+              "provider": "fake",
+              "tenant_id": "tenant-demo",
+              "type": "CredentialRef@0"
+            },
+            "cwd_ref": null,
+            "engine_id": "claude",
+            "id": "req-3",
+            "max_turns": 6,
+            "output": {
+              "format": "json",
+              "max_output_bytes": 262144,
+              "raw_output_retained": false,
+              "repair_attempts": 1,
+              "schema_digest": "sha256:20c97c88bef7279615a904b57d240e338b49089adc4728216dcd80e6bff64eb4",
+              "schema_path_ref": null,
+              "type": "OutputContract@0"
+            },
+            "privacy_class": "internal",
+            "process_requirement_id": "proc-req-control-api",
+            "prompt_channel": "stdin",
+            "prompt_digest": "sha256:f8e86d5b1df629e570a61793fc3697ed64ce0864754eccae1589dd90f52808e7",
+            "route_descriptor_digest": "sha256:598f948b0191c53515b8791019f6eb2567eee33969c9658dca99c798f829e175",
+            "route_id": "route-claude",
+            "session": {
+              "route": "route-claude",
+              "session": "demo-repair",
+              "tenant": "tenant-demo",
+              "type": "SessionRef@0"
+            },
+            "timeout_ms": 30000,
+            "tool_profile": "zero-tools",
+            "type": "RouteExecutionRequest@0",
+            "workload_id": "control-api"
+          },
+          "result": {
+            "dispatched": true,
+            "error": null,
+            "health_event": null,
+            "output_digest": "sha256:73357b4190887ad5e04145765b23287db3542359564f022c4d8569948b925c15",
+            "repaired": true,
+            "request_id": "req-3",
+            "status": "ok",
+            "termination": null,
+            "type": "RouteExecutionResult@0",
+            "usage_state": "ok",
+            "validated": {
+              "summary": "fake claude reviewed prompt 43555532",
+              "verdict": "pass"
+            }
+          }
+        }
+      },
+      "step": 8
+    },
+    {
+      "caller": "operator",
+      "http_status": 200,
+      "label": "run codex (limit hit, breaker opens)",
+      "request": {
+        "method": "session.run",
+        "params": {
+          "engine": "codex",
+          "prompt": "Review the second change and answer with a verdict.",
+          "session": "demo-codex"
+        }
+      },
+      "response": {
+        "id": 9,
+        "jsonrpc": "2.0",
+        "result": {
+          "adapter_events": [
+            {
+              "credential": {
+                "name": "route-ref",
+                "provider": "fake",
+                "tenant_id": "tenant-demo"
+              },
+              "generation": 2,
+              "kind": "started",
+              "op_id": "local-4"
+            },
+            {
+              "generation": 2,
+              "kind": "sent",
+              "op_id": "local-4"
+            }
+          ],
+          "request": {
+            "allowed_tools": [],
+            "cli_model": "fake-model",
+            "credential_ref": {
+              "name": "route-ref",
+              "provider": "fake",
+              "tenant_id": "tenant-demo",
+              "type": "CredentialRef@0"
+            },
+            "cwd_ref": null,
+            "engine_id": "codex",
+            "id": "req-4",
+            "max_turns": 6,
+            "output": {
+              "format": "json",
+              "max_output_bytes": 262144,
+              "raw_output_retained": false,
+              "repair_attempts": 1,
+              "schema_digest": "sha256:20c97c88bef7279615a904b57d240e338b49089adc4728216dcd80e6bff64eb4",
+              "schema_path_ref": null,
+              "type": "OutputContract@0"
+            },
+            "privacy_class": "internal",
+            "process_requirement_id": "proc-req-control-api",
+            "prompt_channel": "stdin",
+            "prompt_digest": "sha256:f8e86d5b1df629e570a61793fc3697ed64ce0864754eccae1589dd90f52808e7",
+            "route_descriptor_digest": "sha256:f8de8c1314e1190b4b87af87fab734ab4f60b87f64d3e5aed5db43c1883c01d1",
+            "route_id": "route-codex",
+            "session": {
+              "route": "route-codex",
+              "session": "demo-codex",
+              "tenant": "tenant-demo",
+              "type": "SessionRef@0"
+            },
+            "timeout_ms": 30000,
+            "tool_profile": "zero-tools",
+            "type": "RouteExecutionRequest@0",
+            "workload_id": "control-api"
+          },
+          "result": {
+            "dispatched": true,
+            "error": "limit_or_error",
+            "health_event": {
+              "engine_id": "codex",
+              "error": "limit_or_error",
+              "state": "exhausted",
+              "type": "RouteHealthEvent@0"
+            },
+            "output_digest": null,
+            "repaired": false,
+            "request_id": "req-4",
+            "status": "limit_hit",
+            "termination": null,
+            "type": "RouteExecutionResult@0",
+            "usage_state": "exhausted",
+            "validated": null
+          }
+        }
+      },
+      "step": 9
+    },
+    {
+      "caller": "operator",
+      "http_status": 200,
+      "label": "run codex again (breaker open, not dispatched)",
+      "request": {
+        "method": "session.run",
+        "params": {
+          "engine": "codex",
+          "prompt": "Review the second change and answer with a verdict.",
+          "session": "demo-codex"
+        }
+      },
+      "response": {
+        "id": 10,
+        "jsonrpc": "2.0",
+        "result": {
+          "adapter_events": [],
+          "request": {
+            "allowed_tools": [],
+            "cli_model": "fake-model",
+            "credential_ref": {
+              "name": "route-ref",
+              "provider": "fake",
+              "tenant_id": "tenant-demo",
+              "type": "CredentialRef@0"
+            },
+            "cwd_ref": null,
+            "engine_id": "codex",
+            "id": "req-5",
+            "max_turns": 6,
+            "output": {
+              "format": "json",
+              "max_output_bytes": 262144,
+              "raw_output_retained": false,
+              "repair_attempts": 1,
+              "schema_digest": "sha256:20c97c88bef7279615a904b57d240e338b49089adc4728216dcd80e6bff64eb4",
+              "schema_path_ref": null,
+              "type": "OutputContract@0"
+            },
+            "privacy_class": "internal",
+            "process_requirement_id": "proc-req-control-api",
+            "prompt_channel": "stdin",
+            "prompt_digest": "sha256:f8e86d5b1df629e570a61793fc3697ed64ce0864754eccae1589dd90f52808e7",
+            "route_descriptor_digest": "sha256:f8de8c1314e1190b4b87af87fab734ab4f60b87f64d3e5aed5db43c1883c01d1",
+            "route_id": "route-codex",
+            "session": {
+              "route": "route-codex",
+              "session": "demo-codex",
+              "tenant": "tenant-demo",
+              "type": "SessionRef@0"
+            },
+            "timeout_ms": 30000,
+            "tool_profile": "zero-tools",
+            "type": "RouteExecutionRequest@0",
+            "workload_id": "control-api"
+          },
+          "result": {
+            "dispatched": false,
+            "error": "breaker_open",
+            "health_event": null,
+            "output_digest": null,
+            "repaired": false,
+            "request_id": "req-5",
+            "status": "limit_hit",
+            "termination": null,
+            "type": "RouteExecutionResult@0",
+            "usage_state": "exhausted",
+            "validated": null
+          }
+        }
+      },
+      "step": 10
+    },
+    {
+      "caller": "anonymous",
+      "http_status": 401,
+      "label": "refused: no credentials",
+      "request": {
+        "method": "service.info",
+        "params": {}
+      },
+      "response": {
+        "error": {
+          "code": -32001,
+          "message": "missing_credentials"
+        },
+        "id": null,
+        "jsonrpc": "2.0"
+      },
+      "step": 11
+    },
+    {
+      "caller": "forged",
+      "http_status": 401,
+      "label": "refused: forged token",
+      "request": {
+        "method": "session.get",
+        "params": {
+          "engine": "claude",
+          "session": "demo-claude"
+        }
+      },
+      "response": {
+        "error": {
+          "code": -32001,
+          "message": "invalid_credentials"
+        },
+        "id": null,
+        "jsonrpc": "2.0"
+      },
+      "step": 12
+    },
+    {
+      "caller": "viewer",
+      "http_status": 403,
+      "label": "refused: viewer cannot run",
+      "request": {
+        "method": "session.run",
+        "params": {
+          "engine": "claude",
+          "prompt": "Review the change and answer with a verdict.",
+          "session": "demo-claude"
+        }
+      },
+      "response": {
+        "error": {
+          "code": -32002,
+          "message": "scope_denied"
+        },
+        "id": 1,
+        "jsonrpc": "2.0"
+      },
+      "step": 13
+    },
+    {
+      "caller": "outsider",
+      "http_status": 200,
+      "label": "refused: other tenant cannot see the session",
+      "request": {
+        "method": "session.get",
+        "params": {
+          "engine": "claude",
+          "session": "demo-claude"
+        }
+      },
+      "response": {
+        "error": {
+          "code": -32005,
+          "message": "unknown_session"
+        },
+        "id": 1,
+        "jsonrpc": "2.0"
+      },
+      "step": 14
+    },
+    {
+      "caller": "viewer",
+      "http_status": 200,
+      "label": "claude session state",
+      "request": {
+        "method": "session.get",
+        "params": {
+          "engine": "claude",
+          "session": "demo-claude"
+        }
+      },
+      "response": {
+        "id": 2,
+        "jsonrpc": "2.0",
+        "result": {
+          "engine": "claude",
+          "last_output_digest": "sha256:e5e01e29c850541d6e9fe826ab548e9691ebd388c08f101142c3066427e76a3c",
+          "last_status": "ok",
+          "runs": 1,
+          "session": "demo-claude",
+          "state": "open"
+        }
+      },
+      "step": 15
+    },
+    {
+      "caller": "viewer",
+      "http_status": 200,
+      "label": "codex session state",
+      "request": {
+        "method": "session.get",
+        "params": {
+          "engine": "codex",
+          "session": "demo-codex"
+        }
+      },
+      "response": {
+        "id": 3,
+        "jsonrpc": "2.0",
+        "result": {
+          "engine": "codex",
+          "last_output_digest": null,
+          "last_status": "limit_hit",
+          "runs": 3,
+          "session": "demo-codex",
+          "state": "open"
+        }
+      },
+      "step": 16
+    },
+    {
+      "caller": "operator",
+      "http_status": 200,
+      "label": "observer journal",
+      "request": {
+        "method": "GET /v1/events",
+        "params": {
+          "after": 0
+        }
+      },
+      "response": {
+        "events": [
+          {
+            "data": {},
+            "engine": "claude",
+            "kind": "session.opened",
+            "seq": 1,
+            "session": "demo-claude"
+          },
+          {
+            "data": {
+              "prompt_digest": "sha256:c103bc3ef274d62bd96d714054e03c13e8d9ea831103805021f6382e3453ccc7",
+              "request_id": "req-1"
+            },
+            "engine": "claude",
+            "kind": "run.started",
+            "seq": 2,
+            "session": "demo-claude"
+          },
+          {
+            "data": {
+              "error": null,
+              "output_digest": "sha256:e5e01e29c850541d6e9fe826ab548e9691ebd388c08f101142c3066427e76a3c",
+              "repaired": false,
+              "request_id": "req-1",
+              "status": "ok"
+            },
+            "engine": "claude",
+            "kind": "run.finished",
+            "seq": 3,
+            "session": "demo-claude"
+          },
+          {
+            "data": {},
+            "engine": "codex",
+            "kind": "session.opened",
+            "seq": 4,
+            "session": "demo-codex"
+          },
+          {
+            "data": {
+              "prompt_digest": "sha256:c103bc3ef274d62bd96d714054e03c13e8d9ea831103805021f6382e3453ccc7",
+              "request_id": "req-2"
+            },
+            "engine": "codex",
+            "kind": "run.started",
+            "seq": 5,
+            "session": "demo-codex"
+          },
+          {
+            "data": {
+              "error": null,
+              "output_digest": "sha256:5df2afa67b3ed85c6adbb921b43a2c7a09d833af03496d5271f4d9f9fd2c46b2",
+              "repaired": false,
+              "request_id": "req-2",
+              "status": "ok"
+            },
+            "engine": "codex",
+            "kind": "run.finished",
+            "seq": 6,
+            "session": "demo-codex"
+          },
+          {
+            "data": {},
+            "engine": "claude",
+            "kind": "session.opened",
+            "seq": 7,
+            "session": "demo-repair"
+          },
+          {
+            "data": {
+              "prompt_digest": "sha256:f8e86d5b1df629e570a61793fc3697ed64ce0864754eccae1589dd90f52808e7",
+              "request_id": "req-3"
+            },
+            "engine": "claude",
+            "kind": "run.started",
+            "seq": 8,
+            "session": "demo-repair"
+          },
+          {
+            "data": {
+              "error": null,
+              "output_digest": "sha256:73357b4190887ad5e04145765b23287db3542359564f022c4d8569948b925c15",
+              "repaired": true,
+              "request_id": "req-3",
+              "status": "ok"
+            },
+            "engine": "claude",
+            "kind": "run.finished",
+            "seq": 9,
+            "session": "demo-repair"
+          },
+          {
+            "data": {
+              "prompt_digest": "sha256:f8e86d5b1df629e570a61793fc3697ed64ce0864754eccae1589dd90f52808e7",
+              "request_id": "req-4"
+            },
+            "engine": "codex",
+            "kind": "run.started",
+            "seq": 10,
+            "session": "demo-codex"
+          },
+          {
+            "data": {
+              "error": "limit_or_error",
+              "output_digest": null,
+              "repaired": false,
+              "request_id": "req-4",
+              "status": "limit_hit"
+            },
+            "engine": "codex",
+            "kind": "run.finished",
+            "seq": 11,
+            "session": "demo-codex"
+          },
+          {
+            "data": {
+              "prompt_digest": "sha256:f8e86d5b1df629e570a61793fc3697ed64ce0864754eccae1589dd90f52808e7",
+              "request_id": "req-5"
+            },
+            "engine": "codex",
+            "kind": "run.started",
+            "seq": 12,
+            "session": "demo-codex"
+          },
+          {
+            "data": {
+              "error": "breaker_open",
+              "output_digest": null,
+              "repaired": false,
+              "request_id": "req-5",
+              "status": "limit_hit"
+            },
+            "engine": "codex",
+            "kind": "run.finished",
+            "seq": 13,
+            "session": "demo-codex"
+          }
+        ],
+        "next_after": 13,
+        "reset": false
+      },
+      "step": 17
+    }
+  ],
+  "transcript_sha256": "sha256:804ca178a22dbccb3505a3ba6d7e8d72e0fadc51c00b0bf2ff50d7f1e392d26e",
+  "transport_calls": {
+    "claude": 3,
+    "codex": 2
+  },
+  "type": "ControlApiRecording@0"
+}

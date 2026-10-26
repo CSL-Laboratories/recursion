@@ -1,14 +1,33 @@
 ---
 title: Next phase — research-to-experiment handoff (fresh context)
-status: active-runbook
+status: frozen-historical
 parent-goal: goal-recursion-v3-harness-orchestrator
-last-updated: 2026-10-02
+last-updated: 2026-10-25
 ---
 # Next phase — fresh-context handoff
 
-Read this first on a new context, then `docs/v3/START-HERE.md`, `docs/v3/research-lane/SYNTHESIS.md`,
+**Frozen historical runbook** (intakes through 2026-10-02). New research output goes to
+[CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research) as
+`submissions/<record_id>/`, through a PR in that repo, with a digest on the Linear
+issue. Never commit research content to this repo; this repo only links to the
+vault record (repo, 40-hex commit, path, claim, limitations). New non-public docs
+(research, specs, decisions, evidence and receipts, gate artifacts, and runbooks
+that aren't public) go to that vault through a PR there, except operational
+contracts and runbooks that this repository's code, a gate or CI reads: those
+stay here. A file stays in this repository if code, a gate or CI here reads
+it; everything else non-public goes to the vault. Existing files stay;
+CSL-536 will move them. The existing decision logs (`state/DECISIONS.md` and `docs/v3/DECISION-REGISTER.md`) and their founder-approved authoring process are unchanged. The only other new docs allowed here are public knowledge-base,
+README, setup and implementation instructions for outside readers, and agent
+instruction files. If
+csl-research is not accessible, stop and post a blocker on the Linear issue; do not
+fall back to this repo. `docs/v3/research-lane/`, `docs/v3/foundation-research/` and
+`docs/v3/prompts/` are legacy and frozen; `experiments/v3/` holds only runnable
+product checks.
+
+Read the historical packet first on a new context that is continuing that wave, then
+`docs/v3/START-HERE.md`, `docs/v3/research-lane/SYNTHESIS.md`,
 `docs/v3/research-lane/GAPS.md`, and the relevant FU spec under
-`docs/v3/research-lane/followups-20261002/`. This file is a runbook, not authority.
+`docs/v3/research-lane/followups-20261002/`. This file is a frozen runbook, not authority.
 
 ## Where we are
 
@@ -57,8 +76,8 @@ candidate contract (see the synthesis's local handoff).
   prompt-injection defense, durable memory, long-horizon autonomy, adaptive optimization,
   multimodal I/O, sandbox/supply chain, observability, evaluation science, node fabric, workspace
   graph); zip handed to the Dot. Coverage maps: `ARCHITECTURE-COVERAGE.md`, `HARNESS-COVERAGE.md`.
-- **Anti-drift map:** `docs/v3/research-lane/RESEARCH-INDEX.md` — every wave, intake, packet,
-  experiment, decision and gate in one place. Add new artifacts there on landing.
+- **Anti-drift map (frozen):** `docs/v3/research-lane/RESEARCH-INDEX.md` — historical waves
+  through 2026-10-02. New artifacts land in csl-research `submissions/<record_id>/`.
 - **Capability-composition return (packet d, revision 2):**
   `docs/v3/research-lane/capability-composition-20261002d/` (R-PC composition compiler, R-UI
   `recursion.ui-contract@candidate-2`, R-MOB mobile/remote control; +`check_intake.py`). Research

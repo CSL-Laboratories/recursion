@@ -194,7 +194,10 @@ def _communicate_bounded(
     def reader(stream, dest: bytearray) -> None:
         try:
             while True:
-                chunk = stream.read(_READ_CHUNK)
+                # read1 returns bytes already available. BufferedReader.read waits
+                # until the chunk is full or the pipe closes, so a short write
+                # past the cap would sit until the deadline.
+                chunk = stream.read1(_READ_CHUNK)
                 if not chunk:
                     break
                 with lock:

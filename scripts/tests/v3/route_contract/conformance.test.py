@@ -13,11 +13,11 @@ from __future__ import annotations
 import ast
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
 import textwrap
-import threading
 import time
 import unittest
 from pathlib import Path
@@ -154,6 +154,7 @@ def make_adapter(engine="claude", transport=None, *, health=None, driver=None, *
         driver=driver or make_driver(),
         health=health or InMemoryHealth(),
         validate=validate,
+        output_schema=OUTPUT_SCHEMA,
         **kwargs,
     )
 
@@ -517,6 +518,20 @@ class HealthInjectionTests(unittest.TestCase):
         self.assertEqual("ok", result.status)
         self.assertFalse(health.is_open(engine))
 
+    def test_fenced_json_score_cannot_trip_the_breaker(self) -> None:
+        payload = {
+            "session_id": "s1",
+            "result": {"label": "a", "score": 429},
+        }
+        stdout = "```json\n" + json.dumps(payload, indent=2) + "\n```\n"
+        health = InMemoryHealth()
+        transport = ScriptedTransport([ProcResult(0, stdout, "", False)])
+        result = make_adapter(transport=transport, health=health).execute(make_request())
+        self.assertEqual("ok", result.status)
+        self.assertEqual({"label": "a", "score": 429}, result.validated)
+        self.assertEqual([], health.faults)
+        self.assertFalse(health.is_open("claude"))
+
     def test_engine_channels_vs_model_channel(self) -> None:
         for name in ("stderr_rate_limit", "stdout_raw_limit_text", "nonzero_exit"):
             _, _, _, health, result = self.run_case(VECTORS["health"][name])
@@ -814,28 +829,57 @@ class ReviewFixTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         helper = Path(tmp.name) / "deadlock.py"
         helper.write_text(_HELPER_PIPE_DEADLOCK, encoding="utf-8")
-        box: dict[str, ProcResult] = {}
-
-        def invoke() -> None:
-            box["result"] = SubprocessTransport().run(
-                [sys.executable, str(helper)],
+        script = textwrap.dedent(
+            f"""
+            import sys
+            sys.path.insert(0, {str(ROOT)!r})
+            from scripts.v3.route_contract.transport import SubprocessTransport
+            result = SubprocessTransport().run(
+                [sys.executable, {str(helper)!r}],
                 "p" * (128 * 1024),
                 5.0,
                 None,
                 max_output_bytes=256 * 1024,
             )
-
-        worker = threading.Thread(target=invoke)
-        started = time.monotonic()
-        worker.start()
-        worker.join(8.0)
-        elapsed = time.monotonic() - started
-        self.assertFalse(worker.is_alive(), "stdin write blocked the deadline")
-        self.assertLess(elapsed, 8.0)
-        result = box["result"]
-        self.assertEqual(0, result.returncode)
-        self.assertFalse(result.timed_out)
-        self.assertFalse(result.oversized)
+            print(result.returncode)
+            print(int(result.timed_out))
+            print(int(result.oversized))
+            """
+        )
+        popen_kwargs: dict = {
+            "cwd": ROOT,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+        }
+        if os.name != "nt":
+            popen_kwargs["start_new_session"] = True
+        child = subprocess.Popen([sys.executable, "-c", script], **popen_kwargs)
+        try:
+            try:
+                stdout, stderr = child.communicate(timeout=8)
+            except subprocess.TimeoutExpired:
+                self.fail("stdin write blocked the deadline")
+        finally:
+            if child.poll() is None:
+                if os.name == "nt":
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(child.pid)],
+                        capture_output=True,
+                        check=False,
+                    )
+                else:
+                    try:
+                        os.killpg(child.pid, signal.SIGKILL)
+                    except OSError:
+                        child.kill()
+                try:
+                    child.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait(timeout=2)
+        self.assertEqual(0, child.returncode, stderr)
+        self.assertEqual(["0", "0", "0"], stdout.strip().splitlines())
 
     def test_oversized_repair_keeps_the_tree_observation(self) -> None:
         bad = json.dumps({"session_id": "s1", "result": "{}"})
@@ -868,6 +912,22 @@ class ReviewFixTests(unittest.TestCase):
         self.assertIsNone(result.validated)
         assert_valid(self, "RouteExecutionResult", result.to_record(request))
 
+    def test_short_overflow_is_killed_without_waiting_for_a_full_chunk(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        helper = Path(tmp.name) / "short.py"
+        helper.write_text(
+            "import sys, time\nsys.stdout.buffer.write(b'x' * 101)\nsys.stdout.buffer.flush()\ntime.sleep(30)\n",
+            encoding="utf-8",
+        )
+        started = time.monotonic()
+        result = SubprocessTransport().run(
+            [sys.executable, str(helper)], "", 2.0, None, max_output_bytes=100
+        )
+        self.assertTrue(result.oversized)
+        self.assertFalse(result.timed_out)
+        self.assertLess(time.monotonic() - started, 1.5)
+
     def test_transport_enforces_the_byte_cap_and_reaps(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -886,6 +946,18 @@ class ReviewFixTests(unittest.TestCase):
             make_adapter(transport=transport).execute(make_request(output_schema={"type": "array"}))
         self.assertEqual([], transport.calls)
 
+    def test_request_schema_must_match_the_bound_validator(self) -> None:
+        transport = ScriptedTransport([proc(_ok_envelope())])
+        invoice = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["invoice_total"],
+            "properties": {"invoice_total": {"type": "number"}},
+        }
+        with self.assertRaises(Unsupported):
+            make_adapter(transport=transport).execute(make_request(output_schema=invoice))
+        self.assertEqual([], transport.calls)
+
     def test_non_object_body_is_not_reported_ok(self) -> None:
         payload = json.dumps([1, 2])
         transport = ScriptedTransport([
@@ -898,6 +970,7 @@ class ReviewFixTests(unittest.TestCase):
             driver=make_driver(),
             health=InMemoryHealth(),
             validate=lambda body: None,
+            output_schema=OUTPUT_SCHEMA,
         )
         request = make_request()
         result = adapter.execute(request)

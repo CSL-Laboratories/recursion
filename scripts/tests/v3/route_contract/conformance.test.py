@@ -391,6 +391,14 @@ class SecretRefusalTests(unittest.TestCase):
             adapter.execute(make_request())
         self.assertEqual([], transport.calls)
 
+    def test_iterable_secrets_last_past_the_first_execution(self) -> None:
+        transport = ScriptedTransport([proc(_ok_envelope()), proc(_ok_envelope())])
+        adapter = make_adapter(transport=transport, secret_values=iter([CANARY]))
+        adapter.execute(make_request())
+        with self.assertRaises(SecretRefused):
+            adapter.execute(make_request(prompt=f"see {CANARY}"))
+        self.assertEqual(1, len(transport.calls))
+
     def test_secret_values_are_read_per_call(self) -> None:
         values = ["old-secret"]
         transport = ScriptedTransport([proc(_ok_envelope()), proc(_ok_envelope())])

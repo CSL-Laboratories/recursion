@@ -204,9 +204,10 @@ class ControlService:
             state = _Session(engine=engine, session=session)
             tenant.sessions[(engine, session)] = state
             tenant.open_count += 1
-            view = _session_view(state)
-        self._journal.append(principal.tenant, "session.opened", session=session, engine=engine)
-        return view
+            # Publish under the state lock so the journal order matches the
+            # order of state transitions seen by concurrent callers.
+            self._journal.append(principal.tenant, "session.opened", session=session, engine=engine)
+            return _session_view(state)
 
     def _session_get(self, principal: Principal, params: dict[str, Any]) -> dict[str, Any]:
         _only(params, engine=str, session=str)
@@ -232,9 +233,8 @@ class ControlService:
             tenant.sessions.pop(key)
             tenant.sessions[key] = state
             _prune_closed(tenant)
-            view = _session_view(state)
-        self._journal.append(principal.tenant, "session.closed", session=session, engine=engine)
-        return view
+            self._journal.append(principal.tenant, "session.closed", session=session, engine=engine)
+            return _session_view(state)
 
     def _session_run(self, principal: Principal, params: dict[str, Any]) -> dict[str, Any]:
         _only(params, optional={"timeout_s": (int, float)}, engine=str, session=str, prompt=str)
@@ -300,6 +300,17 @@ class ControlService:
                 if refusal.code == "busy":
                     raise err.SessionBusy() from None
                 raise err.RunRefused(data={"code": refusal.code, "request_id": request_id}) from None
+            except Exception:
+                # Observers need a terminal event even when the adapter faults.
+                # Only a fixed token is recorded; the fault itself is not.
+                self._journal.append(
+                    principal.tenant,
+                    "run.failed",
+                    session=session,
+                    engine=engine,
+                    data={"request_id": request_id, "code": err.ControlError.name},
+                )
+                raise
             result_record = outcome.to_record(request)
             with self._lock:
                 state.runs += 1

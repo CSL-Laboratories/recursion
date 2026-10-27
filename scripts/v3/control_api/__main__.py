@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import signal
+import stat
 import sys
 import threading
 
@@ -19,53 +20,77 @@ from scripts.v3.control_api.client import (
     ControlClient,
     ControlRpcError,
     TokenFileRefused,
+    create_token_file,
     read_token_file,
-    write_token_file,
 )
 from scripts.v3.control_api.fake_engines import build_fake_stack
 from scripts.v3.control_api.http_server import ControlHTTPServer
+
+
+def _unlink_created(path: str | os.PathLike[str], identity: tuple[int, int]) -> None:
+    """Unlink path only when it still names the file recorded at exclusive create."""
+
+    raw = os.fspath(path)
+    try:
+        info = os.lstat(raw)
+    except OSError:
+        return
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        return
+    if (info.st_dev, info.st_ino) != identity:
+        return
+    try:
+        os.unlink(raw)
+    except OSError:
+        pass
+
+
+def _close_held(descriptor: int | None) -> None:
+    if descriptor is None:
+        return
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
 
 
 def _serve(args: argparse.Namespace) -> int:
     stack = build_fake_stack()
     token = stack.issue("operator", args.tenant, {SCOPE_CONTROL, SCOPE_OBSERVE})
     server = None
-    created = False
+    identity: tuple[int, int] | None = None
+    held: int | None = None
     try:
         server = ControlHTTPServer(stack.service, "127.0.0.1", args.port)
         try:
-            write_token_file(args.token_file, token)
+            device, inode, held = create_token_file(args.token_file, token)
+            identity = (device, inode)
         except FileExistsError:
             print(json.dumps({"error": "token_file_exists"}), file=sys.stderr)
             server.close()
             return 2
-        created = True
         server.start()
     except OSError:
-        if created:
-            try:
-                os.unlink(args.token_file)
-            except OSError:
-                pass
+        if identity is not None:
+            _unlink_created(args.token_file, identity)
+        _close_held(held)
         if server is not None:
             try:
                 server.close()
             except OSError:
                 pass
         raise
-    print(json.dumps({"url": server.url, "tenant": args.tenant, "live_calls": False}), flush=True)
     stop = threading.Event()
     try:
         signal.signal(signal.SIGINT, lambda *_: stop.set())
         signal.signal(signal.SIGTERM, lambda *_: stop.set())
+        print(json.dumps({"url": server.url, "tenant": args.tenant, "live_calls": False}), flush=True)
         stop.wait()
         server.stop()
     finally:
-        if created:
-            try:
-                os.unlink(args.token_file)
-            except OSError:
-                pass
+        if identity is not None:
+            _unlink_created(args.token_file, identity)
+        _close_held(held)
     return 0
 
 

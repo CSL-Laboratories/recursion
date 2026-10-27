@@ -274,7 +274,9 @@ class TokenFileTests(unittest.TestCase):
     def test_owner_only_create_exclusive_and_strict_read(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "token"
-            write_token_file(path, "t" * 40)
+            identity = write_token_file(path, "t" * 40)
+            info = path.lstat()
+            self.assertEqual((info.st_dev, info.st_ino), identity)
             self.assertEqual("t" * 40, read_token_file(path))
             with self.assertRaises(FileExistsError):
                 write_token_file(path, "other")
@@ -483,7 +485,7 @@ class CliTests(unittest.TestCase):
                 info = json.loads(server.stdout.readline())
                 self.assertFalse(info["live_calls"])
                 self.assertTrue(token_file.is_file())
-                time.sleep(0.2)
+                self.assertIsNone(server.poll())
                 server.send_signal(signal.SIGTERM)
                 try:
                     code = server.wait(10)
@@ -508,6 +510,89 @@ class CliTests(unittest.TestCase):
                 finish(server)
                 if restarted is not None:
                     finish(restarted)
+
+    @unittest.skipIf(os.name == "nt", _SKIP_SIGTERM_STOP)
+    def test_sigterm_leaves_a_replaced_token_file_in_place(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            token_file = Path(directory) / "token"
+            env = {**os.environ, "PYTHONPATH": str(ROOT)}
+            command = [
+                sys.executable, "-X", "utf8", "-B", "-m", "scripts.v3.control_api", "serve-fake",
+                "--token-file", str(token_file),
+            ]
+
+            def launch() -> subprocess.Popen[str]:
+                return subprocess.Popen(
+                    command,
+                    cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+
+            def ready(proc: subprocess.Popen[str]) -> None:
+                line = proc.stdout.readline() if proc.stdout is not None else ""
+                if not line:
+                    err_text = proc.stderr.read() if proc.stderr is not None else ""
+                    self.fail(err_text or "serve-fake produced no ready line")
+                info = json.loads(line)
+                self.assertFalse(info["live_calls"])
+
+            def finish(proc: subprocess.Popen[str]) -> None:
+                if proc.poll() is None:
+                    proc.send_signal(signal.SIGTERM)
+                    try:
+                        proc.wait(10)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(10)
+                if proc.stdout is not None:
+                    proc.stdout.close()
+                if proc.stderr is not None:
+                    proc.stderr.close()
+
+            first = launch()
+            second: subprocess.Popen[str] | None = None
+            try:
+                ready(first)
+                original = token_file.lstat()
+                token_file.unlink()
+                second = launch()
+                ready(second)
+                replaced = token_file.lstat()
+                self.assertNotEqual(
+                    (original.st_dev, original.st_ino), (replaced.st_dev, replaced.st_ino)
+                )
+                replacement = read_token_file(token_file)
+                self.assertIsNone(first.poll())
+                first.send_signal(signal.SIGTERM)
+                try:
+                    code = first.wait(10)
+                except subprocess.TimeoutExpired:
+                    first.kill()
+                    first.wait(10)
+                    self.fail("serve-fake did not exit after SIGTERM")
+                stderr = first.stderr.read() if first.stderr is not None else ""
+                self.assertEqual(0, code, stderr)
+                self.assertEqual((replaced.st_dev, replaced.st_ino), _file_id(token_file))
+                self.assertEqual(replacement, read_token_file(token_file))
+                self.assertIsNone(second.poll())
+                second.send_signal(signal.SIGTERM)
+                try:
+                    second_code = second.wait(10)
+                except subprocess.TimeoutExpired:
+                    second.kill()
+                    second.wait(10)
+                    self.fail("replacement serve-fake did not exit after SIGTERM")
+                second_err = second.stderr.read() if second.stderr is not None else ""
+                self.assertEqual(0, second_code, second_err)
+                self.assertFalse(token_file.exists())
+            finally:
+                finish(first)
+                if second is not None:
+                    finish(second)
+
+
+def _file_id(path: Path) -> tuple[int, int]:
+    info = path.lstat()
+    return info.st_dev, info.st_ino
 
 
 if __name__ == "__main__":

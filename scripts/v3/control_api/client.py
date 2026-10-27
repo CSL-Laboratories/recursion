@@ -77,12 +77,42 @@ def read_token_file(path: str | os.PathLike[str]) -> str:
             os.close(descriptor)
 
 
-def write_token_file(path: str | os.PathLike[str], token: str) -> None:
-    """Create a new owner-only token file. An existing file is never overwritten."""
+def create_token_file(path: str | os.PathLike[str], token: str) -> tuple[int, int, int]:
+    """Create a new owner-only token file. An existing file is never overwritten.
+
+    Returns ``(st_dev, st_ino, fd)`` from the exclusive-create descriptor.
+    The caller keeps ``fd`` open until it has decided whether to unlink: that
+    holds the inode, so a replacement at the same path cannot reuse the number.
+    """
 
     descriptor = os.open(os.fspath(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-        handle.write(token + "\n")
+    try:
+        info = os.fstat(descriptor)
+        payload = memoryview((token + "\n").encode("utf-8"))
+        while payload:
+            written = os.write(descriptor, payload)
+            if written <= 0:
+                raise OSError("token file write failed")
+            payload = payload[written:]
+        return info.st_dev, info.st_ino, descriptor
+    except Exception:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise
+
+
+def write_token_file(path: str | os.PathLike[str], token: str) -> tuple[int, int]:
+    """Create a new owner-only token file. An existing file is never overwritten.
+
+    Returns ``(st_dev, st_ino)`` from the exclusive-create descriptor. The
+    descriptor is closed before return; ``create_token_file`` keeps the inode pinned.
+    """
+
+    device, inode, descriptor = create_token_file(path, token)
+    os.close(descriptor)
+    return device, inode
 
 
 class ControlClient:

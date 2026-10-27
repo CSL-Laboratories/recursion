@@ -1,6 +1,26 @@
 # Recursion v3 research scope
 
-Status: active scope, 2026-09-28. Supersedes the foundry-era work breakdown in
+Status: product research map, 2026-10-25. This page sequences product questions and
+gates; it is not the research archive. All research output (notes, briefs, findings,
+source tables, competitor or frontier writeups, research registers or indexes) goes
+to [CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research)
+as `submissions/<record_id>/`, through a PR in that repo, with a digest on the Linear
+issue. Never commit research content to this repo; this repo only links to the
+vault record (repo, 40-hex commit, path, claim, limitations). New non-public docs
+(research, specs, decisions, evidence and receipts, gate artifacts, and runbooks
+that aren't public) go to that vault through a PR there, except operational
+contracts and runbooks that this repository's code, a gate or CI reads: those
+stay here. A file stays in this repository if code, a gate or CI here reads
+it; everything else non-public goes to the vault. Existing files stay;
+CSL-536 will move them. The existing decision logs (`state/DECISIONS.md` and `docs/v3/DECISION-REGISTER.md`) and their founder-approved authoring process are unchanged. The only other new docs allowed here are public knowledge-base,
+README, setup and implementation instructions for outside readers, and agent
+instruction files. If
+csl-research is not accessible, stop and post a blocker on the Linear issue; do not
+fall back to this repo. `docs/v3/research-lane/`, `docs/v3/foundation-research/` and
+`docs/v3/prompts/` are legacy and frozen; `experiments/v3/` holds only runnable
+product checks.
+
+Supersedes the foundry-era work breakdown in
 `docs/v3/research-lane/PLAN-20260927.md` for anything that depended on the construction foundry.
 Non-normative until ratified: this page sequences research, it does not change product authority.
 
@@ -52,8 +72,10 @@ check for new branches; use the per-task gate instead.
   `experiments/v3/dq-execution-controller-20260914/test_controller.py`.
 - **T-11 external-packet privacy scanner** — hard floor before any packet leaves the local trust
   domain. Gate to be created at `tools/check_v3_packet_privacy.py`.
-- **WS-8 R-lane SPECs** — one prospective SPEC + finite domain + falsifier per lane, under
-  `docs/v3/research-lane/<lane>/` with an inert checker under `experiments/v3/<lane>/`.
+- **WS-8 R-lane SPECs** — one prospective SPEC + finite domain + falsifier per lane.
+  Historical intakes remain under frozen `docs/v3/research-lane/<lane>/`. New research
+  bodies go to csl-research `submissions/<record_id>/`; an inert product checker, if
+  needed, stays under `experiments/v3/<lane>/`.
 
 ### Blocked, Owner-gated (do not start)
 
@@ -72,9 +94,15 @@ Every research task carries:
 - one machine-checkable gate with deterministic pass/fail and zero provider calls;
 - a named independent verifier (different session, different family where available) that reruns
   the exact candidate — an implementer's own PASS is never acceptance;
-- an external receipt directory under `research-attestations/<campaign>/<candidate>/`.
+- an independent-verifier receipt in the Git common directory under
+  `research-attestations/<gate>/<candidate>/`, which the gates in
+  `experiments/v3/*/check.py`, [ACCEPTANCE](ACCEPTANCE.md) and
+  [CONSTRUCTION-RUNBOOK](CONSTRUCTION-RUNBOOK.md) read to establish completion.
+  A csl-research `submissions/<record_id>/` record (repo, 40-hex commit, path,
+  claim, limitations) supplements that receipt and never replaces it.
 
-If there is no gate or no verifier, stop and record a blocker in `state/INBOX.md`. If a task can
+If there is no gate or no verifier, stop and comment on the Linear issue. The Linear
+issue comment is the canonical escalation; `state/INBOX.md` is optional. If a task can
 be read two materially different ways, or needs a decision not in `state/DECISIONS.md`, escalate
 instead of choosing.
 

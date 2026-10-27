@@ -321,9 +321,12 @@ Option 2, sole Recursion ownership, future PAUSE direction and verifier classes 
     after PERF-001–010 produce measurements. No defaults are requested from model confidence.
 8. Decide `CANARY-01` disclosure and stop rules only when construction evidence exists; its
     fixed first task and no-external-effect boundary are not reopened.
-9. Ratify or amend the M1A proposal that only Lucas accepts/amends a GoalSpec digest, Head owns
-    ARM lifecycle/conflicts, and each ARM exclusively owns its plan/DAG proposals while the
-    deterministic kernel owns admission.
+9. Ratify or amend the M1A proposal that the authenticated Owner accepts/amends a GoalSpec
+    digest, Head owns ARM lifecycle/conflicts, and each ARM exclusively owns its plan/DAG
+    proposals while the deterministic kernel owns admission. Product-spec (`docs/v3`) acceptance
+    is not this item: spec changes by Samir or Dan are accepted by another founder's GitHub
+    review (CSL-524 / CSLR-D-001). CSL's first-user Owner remains Lucas until a GoalSpec names
+    another founder.
 
 ## Next Grill Me queue after research
 

@@ -24,8 +24,10 @@ These views are dated explanatory navigation; linked submissions are candidate
 evidence. They do not imply that all research has migrated. Check cited revisions
 and current product instructions before dependent work. Linear remains the live
 source for ownership, status and admission. Product contracts and authenticated
-human decisions retain their authority; user-facing and revision-dependent
-operational docs and contracts stay in this repository.
+human decisions retain their authority; operational contracts and runbooks
+that this repository's code, a gate or CI reads stay here, and everything
+else non-public goes to csl-research. A file stays in this repository if
+code, a gate or CI here reads it.
 
 ## Specification and authority
 
@@ -113,9 +115,26 @@ The current [orientation repair task](../../state/tasks/v3-orientation-20260913.
 separate, source-only gate. A product implementation packet must identify its own gate.
 
 Research and construction are driven from the goals and experiments directly, not through a
-standing swarm. Start at [RESEARCH-AGENDA](RESEARCH-AGENDA.md) for the open questions and
-[experiments/v3/](../../experiments/v3/) for the existing evidence checks. Any future worker
-fleet requires its own reviewed control-plane decision before use.
+standing swarm. Start at [RESEARCH-AGENDA](RESEARCH-AGENDA.md) for the open questions.
+All research output (notes, briefs, findings, source tables, competitor or frontier
+writeups, research registers or indexes) goes to
+[CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research) as
+`submissions/<record_id>/`, through a PR in that repo, with a digest on the Linear
+issue. Never commit research content to this repo; this repo only links to the
+vault record (repo, 40-hex commit, path, claim, limitations). New non-public docs
+(research, specs, decisions, evidence and receipts, gate artifacts, and runbooks
+that aren't public) go to that vault through a PR there, except operational
+contracts and runbooks that this repository's code, a gate or CI reads: those
+stay here. A file stays in this repository if code, a gate or CI here reads
+it; everything else non-public goes to the vault. Existing files stay;
+CSL-536 will move them. The existing decision logs (`state/DECISIONS.md` and `docs/v3/DECISION-REGISTER.md`) and their founder-approved authoring process are unchanged. The only other new docs allowed here are public knowledge-base,
+README, setup and implementation instructions for outside readers, and agent
+instruction files. If
+csl-research is not accessible, stop and post a blocker on the Linear issue; do not
+fall back to this repo. `docs/v3/research-lane/`, `docs/v3/foundation-research/` and
+`docs/v3/prompts/` are legacy and frozen; [experiments/v3/](../../experiments/v3/)
+holds only runnable product checks. Any future worker fleet requires its own reviewed
+control-plane decision before use.
 
 Deterministic process, deadline, quota and receipt checks should provide continuous
 awareness. Model supervision is advisory and should respond to actionable events.

@@ -7,9 +7,13 @@ subprocess is this package's own ``serve-fake`` entry point.
 
 from __future__ import annotations
 
+import argparse
+import contextlib
 import http.client
+import io
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -17,6 +21,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock as mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -29,13 +34,38 @@ from scripts.v3.control_api.client import (  # noqa: E402
     ControlClient,
     ControlRpcError,
     TokenFileRefused,
+    create_token_file,
     read_token_file,
+    unlink_created_token,
     write_token_file,
 )
 from scripts.v3.control_api.fake_engines import ENGINES, build_fake_stack  # noqa: E402
 from scripts.v3.control_api.http_server import ControlHTTPServer, RemoteBindRefused  # noqa: E402
 
 PROMPT = "Review the change and answer with a verdict."
+
+# Windows does not preserve POSIX owner/group/other bits, and read_token_file
+# skips that check when os.name == "nt". Creating a symlink there also needs
+# privileges this suite does not have. Both checks stay enforced on POSIX.
+_SKIP_POSIX_TOKEN_MODE = (
+    "POSIX permission modes are not meaningful on Windows; "
+    "read_token_file skips the mode check when os.name == 'nt'"
+)
+_SKIP_TOKEN_SYMLINK = (
+    "symbolic links need extra privileges on Windows and are unsupported for this token-file check"
+)
+_SKIP_SIGTERM_STOP = (
+    "Windows terminate() uses TerminateProcess and does not deliver a catchable SIGTERM"
+)
+_SKIP_POSIX_UNLINK_WHILE_OPEN = (
+    "POSIX shutdown unlinks the token file while its descriptor stays open; "
+    "Windows has to close that descriptor first"
+)
+_SKIP_WINDOWS_INODE_PIN = (
+    "inode pinning holds a spare descriptor across os.unlink; native Windows "
+    "raises a sharing violation and the replacement is never installed. "
+    "POSIX runs this check with os.name pinned to 'nt'"
+)
 
 
 class Live:
@@ -259,21 +289,46 @@ class TokenFileTests(unittest.TestCase):
     def test_owner_only_create_exclusive_and_strict_read(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "token"
-            write_token_file(path, "t" * 40)
-            self.assertEqual(0o600, stat.S_IMODE(path.stat().st_mode))
+            identity = write_token_file(path, "t" * 40)
+            info = path.lstat()
+            self.assertEqual((info.st_dev, info.st_ino), identity)
             self.assertEqual("t" * 40, read_token_file(path))
             with self.assertRaises(FileExistsError):
                 write_token_file(path, "other")
-            os.chmod(path, 0o644)
-            with self.assertRaises(TokenFileRefused):
-                read_token_file(path)
-            os.chmod(path, 0o600)
-            link = Path(directory) / "link"
-            link.symlink_to(path)
-            with self.assertRaises(TokenFileRefused):
-                read_token_file(link)
             with self.assertRaises(TokenFileRefused):
                 read_token_file(Path(directory) / "missing")
+
+    @unittest.skipIf(os.name == "nt", _SKIP_POSIX_TOKEN_MODE)
+    def test_posix_owner_mode_is_required(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "token"
+            write_token_file(path, "t" * 40)
+            self.assertEqual(0o600, stat.S_IMODE(path.stat().st_mode))
+            os.chmod(path, 0o644)
+            with self.assertRaises(TokenFileRefused) as raised:
+                read_token_file(path)
+            self.assertEqual("token_file_mode", str(raised.exception))
+
+    @unittest.skipIf(os.name == "nt", _SKIP_TOKEN_SYMLINK)
+    def test_a_symlink_token_path_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "token"
+            write_token_file(path, "t" * 40)
+            link = Path(directory) / "link"
+            if os.name == "posix":
+                # A POSIX failure to create the link fails the test. Skipping it
+                # would drop the refusal check this platform is required to enforce.
+                link.symlink_to(path)
+            else:
+                if not hasattr(os, "symlink"):
+                    self.skipTest("os.symlink is unavailable")
+                try:
+                    link.symlink_to(path)
+                except (OSError, NotImplementedError) as exc:
+                    self.skipTest(f"symlinks unsupported: {exc}")
+            with self.assertRaises(TokenFileRefused) as raised:
+                read_token_file(link)
+            self.assertEqual("token_file_not_regular", str(raised.exception))
 
     def test_a_fifo_token_path_is_refused(self) -> None:
         if not hasattr(os, "mkfifo"):
@@ -362,16 +417,6 @@ class CliTests(unittest.TestCase):
                 )
                 for completed in (opened, ran, events):
                     self.assertNotIn(token, completed.stdout + completed.stderr)
-                bad = Path(directory) / "loose"
-                bad.write_text(token)
-                os.chmod(bad, 0o644)
-                refused = subprocess.run(
-                    [sys.executable, "-X", "utf8", "-B", "-m", "scripts.v3.control_api", "call",
-                     "--url", info["url"], "--token-file", str(bad), "service.info"],
-                    cwd=ROOT, env=env, capture_output=True, text=True, timeout=60,
-                )
-                self.assertEqual(2, refused.returncode)
-                self.assertNotIn(token, refused.stdout + refused.stderr)
                 again = subprocess.run(
                     [sys.executable, "-X", "utf8", "-B", "-m", "scripts.v3.control_api", "serve-fake",
                      "--token-file", str(token_file)],
@@ -386,6 +431,545 @@ class CliTests(unittest.TestCase):
                     server.kill()
                 server.stdout.close()
                 server.stderr.close()
+
+    @unittest.skipIf(os.name == "nt", _SKIP_POSIX_TOKEN_MODE)
+    def test_cli_refuses_a_loose_token_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            token_file = Path(directory) / "token"
+            env = {**os.environ, "PYTHONPATH": str(ROOT)}
+            server = subprocess.Popen(
+                [sys.executable, "-X", "utf8", "-B", "-m", "scripts.v3.control_api", "serve-fake",
+                 "--token-file", str(token_file)],
+                cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            try:
+                info = json.loads(server.stdout.readline())
+                token = token_file.read_text().strip()
+                bad = Path(directory) / "loose"
+                bad.write_text(token)
+                os.chmod(bad, 0o644)
+                refused = subprocess.run(
+                    [sys.executable, "-X", "utf8", "-B", "-m", "scripts.v3.control_api", "call",
+                     "--url", info["url"], "--token-file", str(bad), "service.info"],
+                    cwd=ROOT, env=env, capture_output=True, text=True, timeout=60,
+                )
+                self.assertEqual(2, refused.returncode)
+                self.assertIn("TokenFileRefused", refused.stderr)
+                self.assertNotIn(token, refused.stdout + refused.stderr)
+            finally:
+                server.terminate()
+                try:
+                    server.wait(10)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                server.stdout.close()
+                server.stderr.close()
+
+    @unittest.skipIf(os.name == "nt", _SKIP_SIGTERM_STOP)
+    def test_sigterm_unlinks_the_token_file_and_the_path_can_be_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            token_file = Path(directory) / "token"
+            env = {**os.environ, "PYTHONPATH": str(ROOT)}
+            command = [
+                sys.executable, "-X", "utf8", "-B", "-m", "scripts.v3.control_api", "serve-fake",
+                "--token-file", str(token_file),
+            ]
+
+            def launch() -> subprocess.Popen[str]:
+                return subprocess.Popen(
+                    command,
+                    cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+
+            def finish(proc: subprocess.Popen[str]) -> None:
+                if proc.poll() is None:
+                    proc.send_signal(signal.SIGTERM)
+                    try:
+                        proc.wait(10)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(10)
+                if proc.stdout is not None:
+                    proc.stdout.close()
+                if proc.stderr is not None:
+                    proc.stderr.close()
+
+            server = launch()
+            restarted: subprocess.Popen[str] | None = None
+            try:
+                info = json.loads(server.stdout.readline())
+                self.assertFalse(info["live_calls"])
+                self.assertTrue(token_file.is_file())
+                self.assertIsNone(server.poll())
+                server.send_signal(signal.SIGTERM)
+                try:
+                    code = server.wait(10)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                    server.wait(10)
+                    self.fail("serve-fake did not exit after SIGTERM")
+                stderr = server.stderr.read() if server.stderr is not None else ""
+                self.assertEqual(0, code, stderr)
+                self.assertFalse(token_file.exists())
+
+                restarted = launch()
+                again_line = restarted.stdout.readline()
+                if not again_line:
+                    again_err = restarted.stderr.read() if restarted.stderr is not None else ""
+                    self.fail(again_err or "serve-fake produced no ready line on restart")
+                again = json.loads(again_line)
+                self.assertFalse(again["live_calls"])
+                self.assertTrue(token_file.is_file())
+                self.assertNotIn("token_file_exists", again_line)
+            finally:
+                finish(server)
+                if restarted is not None:
+                    finish(restarted)
+
+    @unittest.skipIf(os.name == "nt", _SKIP_SIGTERM_STOP)
+    def test_sigterm_leaves_a_replaced_token_file_in_place(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            token_file = Path(directory) / "token"
+            env = {**os.environ, "PYTHONPATH": str(ROOT)}
+            command = [
+                sys.executable, "-X", "utf8", "-B", "-m", "scripts.v3.control_api", "serve-fake",
+                "--token-file", str(token_file),
+            ]
+
+            def launch() -> subprocess.Popen[str]:
+                return subprocess.Popen(
+                    command,
+                    cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+
+            def ready(proc: subprocess.Popen[str]) -> None:
+                line = proc.stdout.readline() if proc.stdout is not None else ""
+                if not line:
+                    err_text = proc.stderr.read() if proc.stderr is not None else ""
+                    self.fail(err_text or "serve-fake produced no ready line")
+                info = json.loads(line)
+                self.assertFalse(info["live_calls"])
+
+            def finish(proc: subprocess.Popen[str]) -> None:
+                if proc.poll() is None:
+                    proc.send_signal(signal.SIGTERM)
+                    try:
+                        proc.wait(10)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(10)
+                if proc.stdout is not None:
+                    proc.stdout.close()
+                if proc.stderr is not None:
+                    proc.stderr.close()
+
+            first = launch()
+            second: subprocess.Popen[str] | None = None
+            try:
+                ready(first)
+                original = token_file.lstat()
+                token_file.unlink()
+                second = launch()
+                ready(second)
+                replaced = token_file.lstat()
+                self.assertNotEqual(
+                    (original.st_dev, original.st_ino), (replaced.st_dev, replaced.st_ino)
+                )
+                replacement = read_token_file(token_file)
+                self.assertIsNone(first.poll())
+                first.send_signal(signal.SIGTERM)
+                try:
+                    code = first.wait(10)
+                except subprocess.TimeoutExpired:
+                    first.kill()
+                    first.wait(10)
+                    self.fail("serve-fake did not exit after SIGTERM")
+                stderr = first.stderr.read() if first.stderr is not None else ""
+                self.assertEqual(0, code, stderr)
+                self.assertEqual((replaced.st_dev, replaced.st_ino), _file_id(token_file))
+                self.assertEqual(replacement, read_token_file(token_file))
+                self.assertIsNone(second.poll())
+                second.send_signal(signal.SIGTERM)
+                try:
+                    second_code = second.wait(10)
+                except subprocess.TimeoutExpired:
+                    second.kill()
+                    second.wait(10)
+                    self.fail("replacement serve-fake did not exit after SIGTERM")
+                second_err = second.stderr.read() if second.stderr is not None else ""
+                self.assertEqual(0, second_code, second_err)
+                self.assertFalse(token_file.exists())
+            finally:
+                finish(first)
+                if second is not None:
+                    finish(second)
+
+    def test_clean_stop_removes_an_open_token_file_and_restart_reuses_the_path(self) -> None:
+        # Windows denies unlink while the exclusive-create descriptor is open
+        # and serve-fake ignores that OSError. Simulate that denial on every
+        # platform so a close-after-unlink regression fails here, not only in
+        # Windows CI. POSIX coverage for unlink-while-open is the next test.
+        with tempfile.TemporaryDirectory() as directory:
+            token_file = Path(directory) / "token"
+            with self._token_unlink_guard(token_file, windows=True) as events:
+                code, stdout, stderr = self._drive_clean_stop(token_file)
+                self.assertEqual(0, code, stderr)
+                self.assertIn('"live_calls": false', stdout)
+                self.assertNotIn("token_file_exists", stderr)
+                self.assertFalse(token_file.exists())
+                self.assertEqual(["lstat", "close", "lstat", "unlink"], events)
+                events.clear()
+                again, again_out, again_err = self._drive_clean_stop(token_file)
+                self.assertEqual(0, again, again_err)
+                self.assertIn('"live_calls": false', again_out)
+                self.assertNotIn("token_file_exists", again_err)
+                self.assertEqual(["lstat", "close", "lstat", "unlink"], events)
+                self.assertFalse(token_file.exists())
+
+    @unittest.skipIf(os.name == "nt", _SKIP_POSIX_UNLINK_WHILE_OPEN)
+    def test_posix_clean_stop_unlinks_while_the_token_descriptor_is_open(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            token_file = Path(directory) / "token"
+            with self._token_unlink_guard(token_file, windows=False) as events:
+                code, stdout, stderr = self._drive_clean_stop(token_file)
+                self.assertEqual(0, code, stderr)
+                self.assertIn('"live_calls": false', stdout)
+                self.assertFalse(token_file.exists())
+                self.assertEqual(["lstat", "unlink", "close"], events)
+                events.clear()
+                again, again_out, again_err = self._drive_clean_stop(token_file)
+                self.assertEqual(0, again, again_err)
+                self.assertIn('"live_calls": false', again_out)
+                self.assertNotIn("token_file_exists", again_err)
+                self.assertFalse(token_file.exists())
+
+    def test_windows_startup_failure_removes_an_open_token_file(self) -> None:
+        import scripts.v3.control_api.__main__ as cli
+
+        with tempfile.TemporaryDirectory() as directory:
+            token_file = Path(directory) / "token"
+
+            def fail_start(server: object) -> None:
+                raise OSError(98, "address already in use")
+
+            with self._token_unlink_guard(token_file, windows=True) as events:
+                with mock.patch.object(cli.ControlHTTPServer, "start", fail_start):
+                    stderr = io.StringIO()
+                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+                        code = cli.main(["serve-fake", "--token-file", str(token_file), "--port", "0"])
+                self.assertIn("OSError", stderr.getvalue())
+                self.assertEqual(2, code)
+                self.assertFalse(token_file.exists())
+                self.assertEqual(["lstat", "close", "lstat", "unlink"], events)
+                events.clear()
+                again, again_out, again_err = self._drive_clean_stop(token_file)
+                self.assertEqual(0, again, again_err)
+                self.assertIn('"live_calls": false', again_out)
+                self.assertNotIn("token_file_exists", again_err)
+                self.assertFalse(token_file.exists())
+
+    @unittest.skipIf(os.name == "nt", _SKIP_WINDOWS_INODE_PIN)
+    def test_windows_cleanup_keeps_a_token_replaced_after_the_descriptor_closes(self) -> None:
+        # Closing the held descriptor lets another server replace the path
+        # before unlink. The second identity check must leave that file alone.
+        with tempfile.TemporaryDirectory() as directory:
+            token_file = Path(directory) / "token"
+            device, inode, descriptor = create_token_file(token_file, "original-token")
+            replacement = b"replacement-token\n"
+            real_close = os.close
+            swapped = {"done": False}
+            # Keep the original inode allocated so the replacement cannot reuse
+            # the number the second check compares. That reuse is the remaining
+            # Windows limit this check cannot close.
+            spare = os.open(os.fspath(token_file), os.O_RDONLY)
+
+            def close_and_replace(fd: int) -> None:
+                real_close(fd)
+                if fd != descriptor or swapped["done"]:
+                    return
+                swapped["done"] = True
+                os.unlink(os.fspath(token_file))
+                replacement_fd = os.open(
+                    os.fspath(token_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+                )
+                os.write(replacement_fd, replacement)
+                real_close(replacement_fd)
+
+            try:
+                with (
+                    mock.patch.object(os, "name", "nt"),
+                    mock.patch.object(os, "close", close_and_replace),
+                ):
+                    unlink_created_token(token_file, (device, inode), descriptor)
+            finally:
+                for held in (spare, descriptor):
+                    try:
+                        real_close(held)
+                    except OSError:
+                        pass
+            self.assertTrue(swapped["done"])
+            self.assertEqual(replacement, token_file.read_bytes())
+            self.assertNotEqual((device, inode), _file_id(token_file))
+
+    def test_a_failed_token_write_removes_the_file_and_the_path_can_be_reused(self) -> None:
+        # os.write raising, returning 0, or writing only part of the token
+        # used to leave the O_EXCL file in place. serve-fake never received
+        # the identity, so the next start on that path exited token_file_exists.
+        import scripts.v3.control_api.__main__ as cli
+
+        real_write = os.write
+
+        def raising(descriptor: int, data: object) -> int:
+            raise OSError(28, "No space left on device")
+
+        def short(descriptor: int, data: object) -> int:
+            return 0
+
+        def partial_factory():
+            sent = {"n": 0}
+
+            def partial(descriptor: int, data: object) -> int:
+                sent["n"] += 1
+                if sent["n"] == 1:
+                    view = data if isinstance(data, memoryview) else memoryview(data)
+                    return real_write(descriptor, view[:1])
+                raise OSError(28, "No space left on device")
+
+            return partial
+
+        cases = (
+            ("raise", raising, False, ["lstat", "unlink", "close"]),
+            ("short", short, False, ["lstat", "unlink", "close"]),
+            ("partial", partial_factory(), False, ["lstat", "unlink", "close"]),
+            ("raise-windows", raising, True, ["lstat", "close", "lstat", "unlink"]),
+        )
+        for label, fail_write, windows, expected in cases:
+            with self.subTest(label=label):
+                self._assert_failed_write_removes_token(
+                    cli, fail_write, windows=windows, expected=expected
+                )
+
+    def _assert_failed_write_removes_token(
+        self,
+        cli: object,
+        fail_write: object,
+        *,
+        windows: bool,
+        expected: list[str],
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            token_file = Path(directory) / "token"
+            target = os.fspath(token_file)
+            events: list[str] = []
+            held: list[int] = []
+            deferred: list[str] = []
+            real_open = os.open
+            real_lstat = os.lstat
+            real_unlink = os.unlink
+            real_close = os.close
+
+            def tracking_open(path: str, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+                if dir_fd is None:
+                    descriptor = real_open(path, flags, mode)
+                else:
+                    descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+                if os.fspath(path) == target and flags & os.O_CREAT:
+                    held.append(descriptor)
+                return descriptor
+
+            def descriptor_open(descriptor: int) -> bool:
+                try:
+                    os.fstat(descriptor)
+                except OSError:
+                    return False
+                return True
+
+            def watching_lstat(path: str):
+                if os.fspath(path) == target:
+                    events.append("lstat")
+                    self.assertTrue(held, "identity check ran before the exclusive create")
+                    open_now = descriptor_open(held[-1])
+                    if windows and "close" in events:
+                        self.assertFalse(open_now, "re-check ran before the descriptor was closed")
+                    else:
+                        self.assertTrue(
+                            open_now,
+                            "identity check ran after the descriptor was closed",
+                        )
+                return real_lstat(path)
+
+            def guarded_unlink(path: str) -> None:
+                if os.fspath(path) != target:
+                    real_unlink(path)
+                    return
+                if windows and any(descriptor_open(descriptor) for descriptor in held):
+                    raise PermissionError(
+                        13,
+                        "The process cannot access the file because it is being used by another process",
+                    )
+                events.append("unlink")
+                try:
+                    real_unlink(path)
+                except OSError:
+                    if windows or not any(descriptor_open(descriptor) for descriptor in held):
+                        raise
+                    # os.name is pinned to posix. A Windows host still refuses
+                    # to unlink an open file, so drop the name after close.
+                    deferred.append(os.fspath(path))
+
+            def tracking_close(descriptor: int) -> None:
+                if descriptor in held:
+                    events.append("close")
+                real_close(descriptor)
+                if deferred and not any(descriptor_open(item) for item in held):
+                    pending = deferred[:]
+                    deferred.clear()
+                    for path in pending:
+                        real_unlink(path)
+
+            patches = [
+                mock.patch.object(os, "open", tracking_open),
+                mock.patch.object(os, "lstat", watching_lstat),
+                mock.patch.object(os, "unlink", guarded_unlink),
+                mock.patch.object(os, "close", tracking_close),
+                mock.patch.object(os, "write", fail_write),
+                # raise/short/partial pin posix even on the Windows runner.
+                # raise-windows keeps the nt close-then-unlink order.
+                mock.patch.object(os, "name", "nt" if windows else "posix"),
+            ]
+            stderr = io.StringIO()
+            with contextlib.ExitStack() as stack:
+                for patch in patches:
+                    stack.enter_context(patch)
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+                    code = cli.main(["serve-fake", "--token-file", target, "--port", "0"])
+            self.assertEqual(2, code, stderr.getvalue())
+            self.assertIn("OSError", stderr.getvalue())
+            self.assertFalse(token_file.exists())
+            self.assertEqual(expected, events)
+            again, again_out, again_err = self._drive_clean_stop(token_file)
+            self.assertEqual(0, again, again_err)
+            self.assertIn('"live_calls": false', again_out)
+            self.assertNotIn("token_file_exists", again_err)
+            self.assertFalse(token_file.exists())
+
+    def _drive_clean_stop(self, token_file: Path) -> tuple[int, str, str]:
+        import scripts.v3.control_api.__main__ as cli
+
+        saved = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+        stop = threading.Event()
+        found = threading.Event()
+
+        def watch() -> None:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if token_file.is_file():
+                    found.set()
+                    stop.set()
+                    return
+                time.sleep(0.01)
+            stop.set()
+
+        threading.Thread(target=watch, daemon=True).start()
+        stdout, stderr = io.StringIO(), io.StringIO()
+        try:
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = cli._serve(
+                    argparse.Namespace(token_file=str(token_file), port=0, tenant="tenant-demo"),
+                    stop,
+                )
+        finally:
+            for sig, handler in saved.items():
+                signal.signal(sig, handler)
+        self.assertTrue(found.is_set(), stderr.getvalue() or "serve-fake did not create the token file")
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    @contextlib.contextmanager
+    def _token_unlink_guard(self, token_file: Path, *, windows: bool):
+        """Record identity-check, close, and unlink order for one token path.
+
+        When ``windows`` is set, unlink raises if that path still names an open
+        descriptor, which is what Windows does, and ``os.name`` is ``nt``.
+        """
+
+        import scripts.v3.control_api.__main__ as cli
+
+        events: list[str] = []
+        opened: list[int] = []
+        real_lstat = cli.os.lstat
+        real_unlink = cli.os.unlink
+        real_close = cli.os.close
+        real_create = cli.create_token_file
+        target = os.fspath(token_file)
+
+        def still_open(descriptor: int) -> bool:
+            # Use the saved lstat. os.lstat is patched to watching_lstat below,
+            # and calling it from here would recurse.
+            try:
+                held = os.fstat(descriptor)
+                current = real_lstat(target)
+            except OSError:
+                return False
+            return (held.st_dev, held.st_ino) == (current.st_dev, current.st_ino)
+
+        def tracking_create(path: str, token: str):
+            device, inode, descriptor = real_create(path, token)
+            opened.append(descriptor)
+            return device, inode, descriptor
+
+        def watching_lstat(path: str):
+            if os.fspath(path) == target:
+                events.append("lstat")
+                held_open = bool(opened) and still_open(opened[-1])
+                # Windows re-checks the path after close, immediately before unlink.
+                if "close" in events:
+                    self.assertFalse(held_open)
+                else:
+                    self.assertTrue(held_open)
+            return real_lstat(path)
+
+        def guarded_unlink(path: str) -> None:
+            if os.fspath(path) != target:
+                real_unlink(path)
+                return
+            if windows and any(still_open(descriptor) for descriptor in opened):
+                raise PermissionError(
+                    13, "The process cannot access the file because it is being used by another process"
+                )
+            if not windows:
+                self.assertTrue(any(still_open(descriptor) for descriptor in opened))
+            events.append("unlink")
+            real_unlink(path)
+
+        def tracking_close(descriptor: int) -> None:
+            if descriptor in opened:
+                events.append("close")
+            real_close(descriptor)
+
+        patches = [
+            mock.patch.object(cli.os, "lstat", watching_lstat),
+            mock.patch.object(cli.os, "unlink", guarded_unlink),
+            mock.patch.object(cli.os, "close", tracking_close),
+            mock.patch.object(cli, "create_token_file", tracking_create),
+        ]
+        if windows:
+            patches.append(mock.patch.object(cli.os, "name", "nt"))
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            try:
+                yield events
+            finally:
+                for descriptor in opened:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+
+
+def _file_id(path: Path) -> tuple[int, int]:
+    info = path.lstat()
+    return info.st_dev, info.st_ino
 
 
 if __name__ == "__main__":

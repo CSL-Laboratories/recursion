@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import socket
+import socketserver
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -164,7 +165,14 @@ class _Server(ThreadingHTTPServer):
         self.allow_reuse_address = exclusive is None
         if exclusive is not None:
             self.socket.setsockopt(socket.SOL_SOCKET, exclusive, 1)
-        super().server_bind()
+        # HTTPServer.server_bind reverse-resolves the address through
+        # socket.getfqdn. On the macOS CI runner that lookup of 127.0.0.1
+        # does not answer, so each fresh process waits out the resolver.
+        # Bind the way TCPServer does and keep the numeric host.
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = host
+        self.server_port = port
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)

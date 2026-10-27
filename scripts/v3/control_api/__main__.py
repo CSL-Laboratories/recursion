@@ -9,47 +9,11 @@ read that file. No subcommand can reach a live provider.
 from __future__ import annotations
 
 import argparse
-import faulthandler
 import json
 import os
 import signal
 import sys
 import threading
-import time
-
-# Set on serve-fake children by the HTTP tests. A macOS runner can sit for
-# tens of seconds before the ready line; the dumps say which frame that is.
-_PROCESS_T0 = time.perf_counter()
-
-
-def _trace(step: str) -> None:
-    if not os.environ.get("CONTROL_API_SERVE_TRACE"):
-        return
-    print(
-        f"serve-fake-trace {step} {time.perf_counter() - _PROCESS_T0:.3f}",
-        file=sys.stderr,
-        flush=True,
-    )
-
-
-def _start_serve_trace() -> None:
-    if not os.environ.get("CONTROL_API_SERVE_TRACE"):
-        return
-
-    def dump() -> None:
-        while True:
-            time.sleep(5)
-            try:
-                faulthandler.dump_traceback(sys.stderr, all_threads=True)
-            except Exception:
-                return
-
-    threading.Thread(target=dump, name="serve-fake-trace", daemon=True).start()
-    _trace("trace-on")
-
-
-_start_serve_trace()
-_trace("before-imports")
 
 from scripts.v3.control_api.auth import SCOPE_CONTROL, SCOPE_OBSERVE
 from scripts.v3.control_api.client import (
@@ -65,8 +29,6 @@ from scripts.v3.control_api.direct_cli import run_direct
 from scripts.v3.control_api.http_server import ControlHTTPServer
 from scripts.v3.control_api.mcp_server import ControlMcpServer
 
-_trace("imports-done")
-
 
 def _unlink_created(
     path: str | os.PathLike[str],
@@ -79,9 +41,7 @@ def _unlink_created(
 
 
 def _serve(args: argparse.Namespace, stop: threading.Event | None = None) -> int:
-    _trace("serve-enter")
     stack = build_fake_stack()
-    _trace("stack-built")
     token = stack.issue("operator", args.tenant, {SCOPE_CONTROL, SCOPE_OBSERVE})
     server = None
     identity: tuple[int, int] | None = None
@@ -95,11 +55,9 @@ def _serve(args: argparse.Namespace, stop: threading.Event | None = None) -> int
     previous_handlers = None
     try:
         server = ControlHTTPServer(stack.service, "127.0.0.1", args.port)
-        _trace("bound")
         try:
             device, inode, held = create_token_file(args.token_file, token)
             identity = (device, inode)
-            _trace("token-created")
         except FileExistsError:
             print(json.dumps({"error": "token_file_exists"}), file=sys.stderr, flush=True)
             server.close()
@@ -117,9 +75,7 @@ def _serve(args: argparse.Namespace, stop: threading.Event | None = None) -> int
             )
             signal.signal(signal.SIGINT, lambda *_: stop.set())
             signal.signal(signal.SIGTERM, lambda *_: stop.set())
-            _trace("signals-installed")
         server.start()
-        _trace("started")
         # The caller's startup deadline covers only this line. Flush it
         # before the wait loop, which is where a SIGTERM is handled.
         print(

@@ -1062,7 +1062,6 @@ def _child_env() -> dict[str, str]:
         "PYTHONPATH": str(ROOT),
         "PYTHONPYCACHEPREFIX": _PYCACHE.name,
         "PYTHONUNBUFFERED": "1",
-        "CONTROL_API_SERVE_TRACE": "1",
     }
     env.pop("PYTHONDONTWRITEBYTECODE", None)
     return env

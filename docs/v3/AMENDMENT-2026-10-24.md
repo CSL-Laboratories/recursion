@@ -9,7 +9,28 @@ authority: proposed; does not admit work, clear a hold, select a language/store/
 
 **Status: amendment proposed (2026-10-24); acceptance is a human decision by Lucas.**
 
-> **Superseded in part by [AMENDMENT-2026-10-26.md](AMENDMENT-2026-10-26.md)** (v2, proposed; accepted only by an exact-digest receipt from Lucas). This v1 file is otherwise unchanged and stays the v1 proposal.
+> **Superseded in part by the RP0-v2 amendment** (v2, proposed; accepted only by an
+> exact-digest receipt from Lucas). The text lives in
+> [CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research)
+> [`contracts/recursion/amendments/AMENDMENT-2026-10-26.md`](https://github.com/CSL-Laboratories/csl-research/blob/main/contracts/recursion/amendments/AMENDMENT-2026-10-26.md).
+> That `main` link lands when
+> [csl-research#63](https://github.com/CSL-Laboratories/csl-research/pull/63) merges.
+> This v1 file is otherwise unchanged and stays the v1 proposal.
+
+Vault record (this repository only links to it):
+
+- **Repository:** `CSL-Laboratories/csl-research`
+- **Commit:** `d480b78a` (head of csl-research#63)
+- **Path:** `contracts/recursion/amendments/AMENDMENT-2026-10-26.md`
+- **SHA-256:** `d8f2d82907033afcf6e8a78b9d3deabf9fc8936c2e16e83294f7a7942e242c04`
+  (vault file; amendment body matches source
+  `e1187b2285c71f8312bb77f330c2b74e8e2176bdaa39fa016409e5c358cee925`)
+- **Claim:** proposed RP0-v2 amendment for CSL-542. Both citations stay:
+  csl-research#50 (`541ee845cdcc0a479190ddd6f0736e4dc854dd1d`, draft evidence) and
+  csl-research#56 (author-ready source,
+  `submissions/20261026-csl542-543-rp0v2-cp0v2-author-ready-files-01/result.md`).
+- **Limitation:** candidate text; the `main` path lands when csl-research#63 merges.
+  Not an exact-digest receipt.
 
 This file **adds** proposed product direction. It does not rewrite Owner-approved wording.
 The OR-038 paragraph in [PRODUCT.md](PRODUCT.md) is preserved verbatim. `state/DECISIONS.md`

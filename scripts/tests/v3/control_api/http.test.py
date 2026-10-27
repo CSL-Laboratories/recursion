@@ -61,6 +61,11 @@ _SKIP_POSIX_UNLINK_WHILE_OPEN = (
     "POSIX shutdown unlinks the token file while its descriptor stays open; "
     "Windows has to close that descriptor first"
 )
+_SKIP_WINDOWS_INODE_PIN = (
+    "inode pinning holds a spare descriptor across os.unlink; native Windows "
+    "raises a sharing violation and the replacement is never installed. "
+    "POSIX runs this check with os.name pinned to 'nt'"
+)
 
 
 class Live:
@@ -663,6 +668,7 @@ class CliTests(unittest.TestCase):
                 self.assertNotIn("token_file_exists", again_err)
                 self.assertFalse(token_file.exists())
 
+    @unittest.skipIf(os.name == "nt", _SKIP_WINDOWS_INODE_PIN)
     def test_windows_cleanup_keeps_a_token_replaced_after_the_descriptor_closes(self) -> None:
         # Closing the held descriptor lets another server replace the path
         # before unlink. The second identity check must leave that file alone.

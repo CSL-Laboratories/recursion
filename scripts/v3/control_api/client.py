@@ -81,8 +81,11 @@ def create_token_file(path: str | os.PathLike[str], token: str) -> tuple[int, in
     """Create a new owner-only token file. An existing file is never overwritten.
 
     Returns ``(st_dev, st_ino, fd)`` from the exclusive-create descriptor.
-    The caller keeps ``fd`` open until it has decided whether to unlink: that
-    holds the inode, so a replacement at the same path cannot reuse the number.
+    The caller keeps ``fd`` open through the identity check: that holds the
+    inode, so a replacement at the same path cannot reuse the number. Windows
+    refuses to delete a file that still has an open descriptor, so the caller
+    closes ``fd`` after that check and before unlinking. POSIX can unlink
+    while ``fd`` stays open.
     """
 
     descriptor = os.open(os.fspath(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

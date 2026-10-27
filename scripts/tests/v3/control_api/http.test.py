@@ -7,7 +7,10 @@ subprocess is this package's own ``serve-fake`` entry point.
 
 from __future__ import annotations
 
+import argparse
+import contextlib
 import http.client
+import io
 import json
 import os
 import signal
@@ -18,6 +21,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock as mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -50,6 +54,10 @@ _SKIP_TOKEN_SYMLINK = (
 )
 _SKIP_SIGTERM_STOP = (
     "Windows terminate() uses TerminateProcess and does not deliver a catchable SIGTERM"
+)
+_SKIP_POSIX_UNLINK_WHILE_OPEN = (
+    "POSIX shutdown unlinks the token file while its descriptor stays open; "
+    "Windows has to close that descriptor first"
 )
 
 
@@ -588,6 +596,178 @@ class CliTests(unittest.TestCase):
                 finish(first)
                 if second is not None:
                     finish(second)
+
+    def test_clean_stop_removes_an_open_token_file_and_restart_reuses_the_path(self) -> None:
+        # Windows denies unlink while the exclusive-create descriptor is open
+        # and serve-fake ignores that OSError. Simulate that denial on every
+        # platform so a close-after-unlink regression fails here, not only in
+        # Windows CI. POSIX coverage for unlink-while-open is the next test.
+        with tempfile.TemporaryDirectory() as directory:
+            token_file = Path(directory) / "token"
+            with self._token_unlink_guard(token_file, windows=True) as events:
+                code, stdout, stderr = self._drive_clean_stop(token_file)
+                self.assertEqual(0, code, stderr)
+                self.assertIn('"live_calls": false', stdout)
+                self.assertNotIn("token_file_exists", stderr)
+                self.assertFalse(token_file.exists())
+                self.assertEqual(["lstat", "close", "unlink"], events)
+                events.clear()
+                again, again_out, again_err = self._drive_clean_stop(token_file)
+                self.assertEqual(0, again, again_err)
+                self.assertIn('"live_calls": false', again_out)
+                self.assertNotIn("token_file_exists", again_err)
+                self.assertEqual(["lstat", "close", "unlink"], events)
+                self.assertFalse(token_file.exists())
+
+    @unittest.skipIf(os.name == "nt", _SKIP_POSIX_UNLINK_WHILE_OPEN)
+    def test_posix_clean_stop_unlinks_while_the_token_descriptor_is_open(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            token_file = Path(directory) / "token"
+            with self._token_unlink_guard(token_file, windows=False) as events:
+                code, stdout, stderr = self._drive_clean_stop(token_file)
+                self.assertEqual(0, code, stderr)
+                self.assertIn('"live_calls": false', stdout)
+                self.assertFalse(token_file.exists())
+                self.assertEqual(["lstat", "unlink", "close"], events)
+                events.clear()
+                again, again_out, again_err = self._drive_clean_stop(token_file)
+                self.assertEqual(0, again, again_err)
+                self.assertIn('"live_calls": false', again_out)
+                self.assertNotIn("token_file_exists", again_err)
+                self.assertFalse(token_file.exists())
+
+    def test_windows_startup_failure_removes_an_open_token_file(self) -> None:
+        import scripts.v3.control_api.__main__ as cli
+
+        with tempfile.TemporaryDirectory() as directory:
+            token_file = Path(directory) / "token"
+
+            def fail_start(server: object) -> None:
+                raise OSError(98, "address already in use")
+
+            with self._token_unlink_guard(token_file, windows=True) as events:
+                with mock.patch.object(cli.ControlHTTPServer, "start", fail_start):
+                    stderr = io.StringIO()
+                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+                        code = cli.main(["serve-fake", "--token-file", str(token_file), "--port", "0"])
+                self.assertIn("OSError", stderr.getvalue())
+                self.assertEqual(2, code)
+                self.assertFalse(token_file.exists())
+                self.assertEqual(["lstat", "close", "unlink"], events)
+                events.clear()
+                again, again_out, again_err = self._drive_clean_stop(token_file)
+                self.assertEqual(0, again, again_err)
+                self.assertIn('"live_calls": false', again_out)
+                self.assertNotIn("token_file_exists", again_err)
+                self.assertFalse(token_file.exists())
+
+    def _drive_clean_stop(self, token_file: Path) -> tuple[int, str, str]:
+        import scripts.v3.control_api.__main__ as cli
+
+        saved = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+        stop = threading.Event()
+        found = threading.Event()
+
+        def watch() -> None:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if token_file.is_file():
+                    found.set()
+                    stop.set()
+                    return
+                time.sleep(0.01)
+            stop.set()
+
+        threading.Thread(target=watch, daemon=True).start()
+        stdout, stderr = io.StringIO(), io.StringIO()
+        try:
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = cli._serve(
+                    argparse.Namespace(token_file=str(token_file), port=0, tenant="tenant-demo"),
+                    stop,
+                )
+        finally:
+            for sig, handler in saved.items():
+                signal.signal(sig, handler)
+        self.assertTrue(found.is_set(), stderr.getvalue() or "serve-fake did not create the token file")
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    @contextlib.contextmanager
+    def _token_unlink_guard(self, token_file: Path, *, windows: bool):
+        """Record identity-check, close, and unlink order for one token path.
+
+        When ``windows`` is set, unlink raises if that path still names an open
+        descriptor, which is what Windows does, and ``os.name`` is ``nt``.
+        """
+
+        import scripts.v3.control_api.__main__ as cli
+
+        events: list[str] = []
+        opened: list[int] = []
+        real_lstat = cli.os.lstat
+        real_unlink = cli.os.unlink
+        real_close = cli.os.close
+        real_create = cli.create_token_file
+        target = os.fspath(token_file)
+
+        def still_open(descriptor: int) -> bool:
+            # Use the saved lstat. os.lstat is patched to watching_lstat below,
+            # and calling it from here would recurse.
+            try:
+                held = os.fstat(descriptor)
+                current = real_lstat(target)
+            except OSError:
+                return False
+            return (held.st_dev, held.st_ino) == (current.st_dev, current.st_ino)
+
+        def tracking_create(path: str, token: str):
+            device, inode, descriptor = real_create(path, token)
+            opened.append(descriptor)
+            return device, inode, descriptor
+
+        def watching_lstat(path: str):
+            if os.fspath(path) == target:
+                events.append("lstat")
+                self.assertTrue(opened and still_open(opened[-1]))
+            return real_lstat(path)
+
+        def guarded_unlink(path: str) -> None:
+            if os.fspath(path) != target:
+                real_unlink(path)
+                return
+            if windows and any(still_open(descriptor) for descriptor in opened):
+                raise PermissionError(
+                    13, "The process cannot access the file because it is being used by another process"
+                )
+            if not windows:
+                self.assertTrue(any(still_open(descriptor) for descriptor in opened))
+            events.append("unlink")
+            real_unlink(path)
+
+        def tracking_close(descriptor: int) -> None:
+            if descriptor in opened:
+                events.append("close")
+            real_close(descriptor)
+
+        patches = [
+            mock.patch.object(cli.os, "lstat", watching_lstat),
+            mock.patch.object(cli.os, "unlink", guarded_unlink),
+            mock.patch.object(cli.os, "close", tracking_close),
+            mock.patch.object(cli, "create_token_file", tracking_create),
+        ]
+        if windows:
+            patches.append(mock.patch.object(cli.os, "name", "nt"))
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            try:
+                yield events
+            finally:
+                for descriptor in opened:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
 
 
 def _file_id(path: Path) -> tuple[int, int]:

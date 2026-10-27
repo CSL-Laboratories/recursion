@@ -27,24 +27,6 @@ from scripts.v3.control_api.fake_engines import build_fake_stack
 from scripts.v3.control_api.http_server import ControlHTTPServer
 
 
-def _unlink_created(path: str | os.PathLike[str], identity: tuple[int, int]) -> None:
-    """Unlink path only when it still names the file recorded at exclusive create."""
-
-    raw = os.fspath(path)
-    try:
-        info = os.lstat(raw)
-    except OSError:
-        return
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-        return
-    if (info.st_dev, info.st_ino) != identity:
-        return
-    try:
-        os.unlink(raw)
-    except OSError:
-        pass
-
-
 def _close_held(descriptor: int | None) -> None:
     if descriptor is None:
         return
@@ -54,7 +36,49 @@ def _close_held(descriptor: int | None) -> None:
         pass
 
 
-def _serve(args: argparse.Namespace) -> int:
+def _unlink_created(
+    path: str | os.PathLike[str],
+    identity: tuple[int, int] | None,
+    descriptor: int | None,
+) -> None:
+    """Unlink path when it still names the file recorded at exclusive create.
+
+    ``descriptor`` stays open through the identity check so a replacement cannot
+    reuse that inode. Windows refuses to delete a file that still has an open
+    descriptor, so the descriptor is closed after the check and before unlink.
+    POSIX unlinks first and closes afterwards, which keeps the inode pinned
+    until the name is gone.
+    """
+
+    raw = os.fspath(path)
+    remove = False
+    if identity is not None:
+        try:
+            info = os.lstat(raw)
+        except OSError:
+            info = None
+        if (
+            info is not None
+            and not stat.S_ISLNK(info.st_mode)
+            and stat.S_ISREG(info.st_mode)
+            and (info.st_dev, info.st_ino) == identity
+        ):
+            remove = True
+    # Windows cannot unlink a path whose descriptor is still open (WinError 32).
+    # Close only after the identity check, then unlink. POSIX keeps the
+    # descriptor open across the unlink so the inode cannot be reused.
+    if os.name == "nt":
+        _close_held(descriptor)
+        descriptor = None
+    if remove:
+        try:
+            os.unlink(raw)
+        except OSError:
+            pass
+    _close_held(descriptor)
+
+
+def _serve(args: argparse.Namespace, stop: threading.Event | None = None) -> int:
     stack = build_fake_stack()
     token = stack.issue("operator", args.tenant, {SCOPE_CONTROL, SCOPE_OBSERVE})
     server = None
@@ -71,16 +95,15 @@ def _serve(args: argparse.Namespace) -> int:
             return 2
         server.start()
     except OSError:
-        if identity is not None:
-            _unlink_created(args.token_file, identity)
-        _close_held(held)
+        _unlink_created(args.token_file, identity, held)
         if server is not None:
             try:
                 server.close()
             except OSError:
                 pass
         raise
-    stop = threading.Event()
+    if stop is None:
+        stop = threading.Event()
     try:
         signal.signal(signal.SIGINT, lambda *_: stop.set())
         signal.signal(signal.SIGTERM, lambda *_: stop.set())
@@ -88,9 +111,7 @@ def _serve(args: argparse.Namespace) -> int:
         stop.wait()
         server.stop()
     finally:
-        if identity is not None:
-            _unlink_created(args.token_file, identity)
-        _close_held(held)
+        _unlink_created(args.token_file, identity, held)
     return 0
 
 

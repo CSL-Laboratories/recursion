@@ -1,6 +1,7 @@
 """Local operator entry point: ``python -m scripts.v3.control_api``.
 
-``serve-fake`` runs the fake-driver Control API on loopback and writes its bearer
+``mcp-fake`` serves the Control MCP over stdio. ``direct-fake`` is the labeled
+direct-CLI fallback (not X2). ``serve-fake`` runs the fake-driver Control API on loopback and writes its bearer
 token to an owner-only file. The token is never printed. ``call`` and ``events``
 read that file. No subcommand can reach a live provider.
 """
@@ -24,7 +25,9 @@ from scripts.v3.control_api.client import (
     unlink_created_token,
 )
 from scripts.v3.control_api.fake_engines import build_fake_stack
+from scripts.v3.control_api.direct_cli import run_direct
 from scripts.v3.control_api.http_server import ControlHTTPServer
+from scripts.v3.control_api.mcp_server import ControlMcpServer
 
 
 def _unlink_created(
@@ -90,6 +93,32 @@ def _events(args: argparse.Namespace) -> int:
     return 0
 
 
+def _mcp(args: argparse.Namespace) -> int:
+    if args.url:
+        if not args.token_file:
+            raise ValueError("--url needs --token-file")
+        client = _client(args)
+
+        def dispatch(method: str, params: dict) -> dict:
+            return client.exchange(method, params)[1]
+
+    else:
+        stack = build_fake_stack()
+        token = stack.issue("operator", args.tenant, {SCOPE_CONTROL, SCOPE_OBSERVE})
+
+        def dispatch(method: str, params: dict) -> dict:
+            body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+            return stack.service.handle(body, f"Bearer {token}")
+
+    ControlMcpServer(dispatch).serve(sys.stdin, sys.stdout)
+    return 0
+
+
+def _direct(args: argparse.Namespace) -> int:
+    print(json.dumps(run_direct(args.engine, args.prompt), sort_keys=True))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m scripts.v3.control_api")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -98,6 +127,18 @@ def main(argv: list[str] | None = None) -> int:
     serve.add_argument("--port", type=int, default=0)
     serve.add_argument("--tenant", default="tenant-demo")
     serve.set_defaults(handler=_serve)
+    mcp = sub.add_parser("mcp-fake", help="Control MCP over stdio; fake driver only")
+    mcp.add_argument("--tenant", default="tenant-demo")
+    mcp.add_argument("--url")
+    mcp.add_argument("--token-file")
+    mcp.set_defaults(handler=_mcp)
+    direct = sub.add_parser(
+        "direct-fake",
+        help="direct-CLI fallback: one fake run, bypasses the Control API, NOT X2",
+    )
+    direct.add_argument("--engine", required=True, choices=("claude", "codex"))
+    direct.add_argument("--prompt", required=True)
+    direct.set_defaults(handler=_direct)
     for name, handler in (("call", _call), ("events", _events)):
         command = sub.add_parser(name)
         command.add_argument("--url", required=True)

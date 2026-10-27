@@ -118,6 +118,10 @@ class ControlService:
         }
 
     @property
+    def adapters(self) -> Mapping[str, RouteAdapterLike]:
+        return dict(self._adapters)
+
+    @property
     def journal(self) -> EventJournal:
         return self._journal
 

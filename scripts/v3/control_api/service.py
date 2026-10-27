@@ -243,7 +243,9 @@ class ControlService:
         except UnicodeEncodeError:
             raise err.InvalidParams("prompt_encoding") from None
         timeout_s = params.get("timeout_s", DEFAULT_TIMEOUT_S)
-        if isinstance(timeout_s, bool) or not 0 < timeout_s <= MAX_TIMEOUT_S:
+        # to_record() stores int(timeout_s * 1000). Below 1ms that is 0, which
+        # fails Route Contract PositiveCount (minimum 1).
+        if isinstance(timeout_s, bool) or not 0.001 <= timeout_s <= MAX_TIMEOUT_S:
             raise err.InvalidParams("timeout_range")
         adapter = self._adapters[engine]
         with self._lock:

@@ -11,7 +11,6 @@ import argparse
 import json
 import os
 import signal
-import stat
 import sys
 import threading
 
@@ -22,18 +21,10 @@ from scripts.v3.control_api.client import (
     TokenFileRefused,
     create_token_file,
     read_token_file,
+    unlink_created_token,
 )
 from scripts.v3.control_api.fake_engines import build_fake_stack
 from scripts.v3.control_api.http_server import ControlHTTPServer
-
-
-def _close_held(descriptor: int | None) -> None:
-    if descriptor is None:
-        return
-    try:
-        os.close(descriptor)
-    except OSError:
-        pass
 
 
 def _unlink_created(
@@ -41,41 +32,9 @@ def _unlink_created(
     identity: tuple[int, int] | None,
     descriptor: int | None,
 ) -> None:
-    """Unlink path when it still names the file recorded at exclusive create.
+    """Unlink path when it still names the file recorded at exclusive create."""
 
-    ``descriptor`` stays open through the identity check so a replacement cannot
-    reuse that inode. Windows refuses to delete a file that still has an open
-    descriptor, so the descriptor is closed after the check and before unlink.
-    POSIX unlinks first and closes afterwards, which keeps the inode pinned
-    until the name is gone.
-    """
-
-    raw = os.fspath(path)
-    remove = False
-    if identity is not None:
-        try:
-            info = os.lstat(raw)
-        except OSError:
-            info = None
-        if (
-            info is not None
-            and not stat.S_ISLNK(info.st_mode)
-            and stat.S_ISREG(info.st_mode)
-            and (info.st_dev, info.st_ino) == identity
-        ):
-            remove = True
-    # Windows cannot unlink a path whose descriptor is still open (WinError 32).
-    # Close only after the identity check, then unlink. POSIX keeps the
-    # descriptor open across the unlink so the inode cannot be reused.
-    if os.name == "nt":
-        _close_held(descriptor)
-        descriptor = None
-    if remove:
-        try:
-            os.unlink(raw)
-        except OSError:
-            pass
-    _close_held(descriptor)
+    unlink_created_token(path, identity, descriptor)
 
 
 def _serve(args: argparse.Namespace, stop: threading.Event | None = None) -> int:

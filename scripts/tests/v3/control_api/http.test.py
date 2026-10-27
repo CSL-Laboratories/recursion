@@ -661,6 +661,128 @@ class CliTests(unittest.TestCase):
                 self.assertNotIn("token_file_exists", again_err)
                 self.assertFalse(token_file.exists())
 
+    def test_a_failed_token_write_removes_the_file_and_the_path_can_be_reused(self) -> None:
+        # os.write raising, returning 0, or writing only part of the token
+        # used to leave the O_EXCL file in place. serve-fake never received
+        # the identity, so the next start on that path exited token_file_exists.
+        import scripts.v3.control_api.__main__ as cli
+
+        real_write = os.write
+
+        def raising(descriptor: int, data: object) -> int:
+            raise OSError(28, "No space left on device")
+
+        def short(descriptor: int, data: object) -> int:
+            return 0
+
+        def partial_factory():
+            sent = {"n": 0}
+
+            def partial(descriptor: int, data: object) -> int:
+                sent["n"] += 1
+                if sent["n"] == 1:
+                    view = data if isinstance(data, memoryview) else memoryview(data)
+                    return real_write(descriptor, view[:1])
+                raise OSError(28, "No space left on device")
+
+            return partial
+
+        cases = (
+            ("raise", raising, False, ["lstat", "unlink", "close"]),
+            ("short", short, False, ["lstat", "unlink", "close"]),
+            ("partial", partial_factory(), False, ["lstat", "unlink", "close"]),
+            ("raise-windows", raising, True, ["lstat", "close", "unlink"]),
+        )
+        for label, fail_write, windows, expected in cases:
+            with self.subTest(label=label):
+                self._assert_failed_write_removes_token(
+                    cli, fail_write, windows=windows, expected=expected
+                )
+
+    def _assert_failed_write_removes_token(
+        self,
+        cli: object,
+        fail_write: object,
+        *,
+        windows: bool,
+        expected: list[str],
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            token_file = Path(directory) / "token"
+            target = os.fspath(token_file)
+            events: list[str] = []
+            held: list[int] = []
+            real_open = os.open
+            real_lstat = os.lstat
+            real_unlink = os.unlink
+            real_close = os.close
+
+            def tracking_open(path: str, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+                if dir_fd is None:
+                    descriptor = real_open(path, flags, mode)
+                else:
+                    descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+                if os.fspath(path) == target and flags & os.O_CREAT:
+                    held.append(descriptor)
+                return descriptor
+
+            def descriptor_open(descriptor: int) -> bool:
+                try:
+                    os.fstat(descriptor)
+                except OSError:
+                    return False
+                return True
+
+            def watching_lstat(path: str):
+                if os.fspath(path) == target:
+                    events.append("lstat")
+                    self.assertTrue(held, "identity check ran before the exclusive create")
+                    self.assertTrue(
+                        descriptor_open(held[-1]),
+                        "identity check ran after the descriptor was closed",
+                    )
+                return real_lstat(path)
+
+            def guarded_unlink(path: str) -> None:
+                if os.fspath(path) == target:
+                    if windows and any(descriptor_open(descriptor) for descriptor in held):
+                        raise PermissionError(
+                            13,
+                            "The process cannot access the file because it is being used by another process",
+                        )
+                    events.append("unlink")
+                real_unlink(path)
+
+            def tracking_close(descriptor: int) -> None:
+                if descriptor in held:
+                    events.append("close")
+                real_close(descriptor)
+
+            patches = [
+                mock.patch.object(os, "open", tracking_open),
+                mock.patch.object(os, "lstat", watching_lstat),
+                mock.patch.object(os, "unlink", guarded_unlink),
+                mock.patch.object(os, "close", tracking_close),
+                mock.patch.object(os, "write", fail_write),
+            ]
+            if windows:
+                patches.append(mock.patch.object(os, "name", "nt"))
+            stderr = io.StringIO()
+            with contextlib.ExitStack() as stack:
+                for patch in patches:
+                    stack.enter_context(patch)
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+                    code = cli.main(["serve-fake", "--token-file", target, "--port", "0"])
+            self.assertEqual(2, code, stderr.getvalue())
+            self.assertIn("OSError", stderr.getvalue())
+            self.assertFalse(token_file.exists())
+            self.assertEqual(expected, events)
+            again, again_out, again_err = self._drive_clean_stop(token_file)
+            self.assertEqual(0, again, again_err)
+            self.assertIn('"live_calls": false', again_out)
+            self.assertNotIn("token_file_exists", again_err)
+            self.assertFalse(token_file.exists())
+
     def _drive_clean_stop(self, token_file: Path) -> tuple[int, str, str]:
         import scripts.v3.control_api.__main__ as cli
 

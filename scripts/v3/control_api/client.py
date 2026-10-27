@@ -77,6 +77,57 @@ def read_token_file(path: str | os.PathLike[str]) -> str:
             os.close(descriptor)
 
 
+def _close_held(descriptor: int | None) -> None:
+    if descriptor is None:
+        return
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
+
+
+def unlink_created_token(
+    path: str | os.PathLike[str],
+    identity: tuple[int, int] | None,
+    descriptor: int | None,
+) -> None:
+    """Unlink path when it still names the file recorded at exclusive create.
+
+    ``descriptor`` stays open through the identity check so a replacement cannot
+    reuse that inode. Windows refuses to delete a file that still has an open
+    descriptor, so the descriptor is closed after the check and before unlink.
+    POSIX unlinks first and closes afterwards, which keeps the inode pinned
+    until the name is gone.
+    """
+
+    raw = os.fspath(path)
+    remove = False
+    if identity is not None:
+        try:
+            info = os.lstat(raw)
+        except OSError:
+            info = None
+        if (
+            info is not None
+            and not stat.S_ISLNK(info.st_mode)
+            and stat.S_ISREG(info.st_mode)
+            and (info.st_dev, info.st_ino) == identity
+        ):
+            remove = True
+    # Windows cannot unlink a path whose descriptor is still open (WinError 32).
+    # Close only after the identity check, then unlink. POSIX keeps the
+    # descriptor open across the unlink so the inode cannot be reused.
+    if os.name == "nt":
+        _close_held(descriptor)
+        descriptor = None
+    if remove:
+        try:
+            os.unlink(raw)
+        except OSError:
+            pass
+    _close_held(descriptor)
+
+
 def create_token_file(path: str | os.PathLike[str], token: str) -> tuple[int, int, int]:
     """Create a new owner-only token file. An existing file is never overwritten.
 
@@ -86,23 +137,30 @@ def create_token_file(path: str | os.PathLike[str], token: str) -> tuple[int, in
     refuses to delete a file that still has an open descriptor, so the caller
     closes ``fd`` after that check and before unlinking. POSIX can unlink
     while ``fd`` stays open.
+
+    If ``os.write`` raises or returns a short non-positive count, the file
+    this call just created is removed with that same check and close order,
+    and the write error is re-raised. A file that already existed is left
+    alone because ``O_EXCL`` fails before this cleanup can run.
     """
 
     descriptor = os.open(os.fspath(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    identity: tuple[int, int] | None = None
     try:
         info = os.fstat(descriptor)
+        identity = (info.st_dev, info.st_ino)
         payload = memoryview((token + "\n").encode("utf-8"))
         while payload:
             written = os.write(descriptor, payload)
             if written <= 0:
                 raise OSError("token file write failed")
             payload = payload[written:]
-        return info.st_dev, info.st_ino, descriptor
+        return identity[0], identity[1], descriptor
     except Exception:
         try:
-            os.close(descriptor)
-        except OSError:
-            pass
+            unlink_created_token(path, identity, descriptor)
+        except Exception:
+            _close_held(descriptor)
         raise
 
 

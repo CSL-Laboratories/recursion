@@ -39,6 +39,9 @@ class ProcResult:
     timed_out: bool = False
     termination: dict[str, object] | None = field(default=None, compare=False)
     oversized: bool = False
+    # Raw stdout+stderr bytes read from the process, before decoding and
+    # without TIMEOUT_DIAGNOSTIC. None when the transport did not measure it.
+    raw_output_bytes: int | None = field(default=None, compare=False)
 
 
 class Transport(Protocol):
@@ -237,7 +240,10 @@ def _communicate_bounded(
             observation = kill_tree(proc, pgid=pgid)
             for thread in threads:
                 thread.join(timeout=REAP_GRACE_SECONDS)
-            return ProcResult(124, _decode(bytes(out)), _decode(bytes(err)) + TIMEOUT_DIAGNOSTIC, True, observation)
+            return ProcResult(
+                124, _decode(bytes(out)), _decode(bytes(err)) + TIMEOUT_DIAGNOSTIC, True, observation,
+                raw_output_bytes=len(out) + len(err),
+            )
         if not alive:
             break
         time.sleep(0.02)
@@ -248,7 +254,9 @@ def _communicate_bounded(
         observation = kill_tree(proc, pgid=pgid)
         return ProcResult(1, "", "", False, observation, oversized=True)
     returncode = proc.wait()
-    return ProcResult(returncode, _decode(bytes(out)), _decode(bytes(err)), False)
+    return ProcResult(
+        returncode, _decode(bytes(out)), _decode(bytes(err)), False, raw_output_bytes=len(out) + len(err)
+    )
 
 
 class SubprocessTransport:

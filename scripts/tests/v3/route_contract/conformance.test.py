@@ -600,6 +600,16 @@ _HELPER_NEAR_CAP = textwrap.dedent(
     """
 )
 
+_HELPER_BINARY_STALL = textwrap.dedent(
+    """
+    import sys, time
+    sys.stdin.read()
+    sys.stdout.buffer.write(b"\\xff" * int(sys.argv[1]))
+    sys.stdout.flush()
+    time.sleep(60)
+    """
+)
+
 
 class LocalHelperTransport:
     """Rewrites provider argv to a local helper. The real kill path still runs."""
@@ -686,6 +696,22 @@ class TreeKillTests(unittest.TestCase):
                 self.assertEqual(("timeout", "timeout"), (result.status, result.error))
                 self.assertEqual([("claude", "exhausted", "timeout")], health.faults)
                 assert_valid(self, "RouteExecutionResult", result.to_record(request))
+
+    def test_real_binary_output_within_the_cap_then_stall_is_a_timeout(self) -> None:
+        # 100 raw bytes of 0xff fit a 100-byte cap. Decoding replaces each with
+        # U+FFFD (3 UTF-8 bytes), so the cap must be judged on the raw count.
+        helper = self.write("binary_stall.py", _HELPER_BINARY_STALL)
+        raw = SubprocessTransport().run([sys.executable, helper, "100"], "", 1.5, None, 100)
+        self.assertTrue(raw.timed_out)
+        self.assertFalse(raw.oversized)
+        self.assertEqual(100, raw.raw_output_bytes)
+        transport = LocalHelperTransport([helper, "100"])
+        health = InMemoryHealth()
+        request = make_request(timeout_s=1.5, max_output_bytes=100)
+        result = make_adapter(transport=transport, health=health).execute(request)
+        self.assertEqual(("timeout", "timeout"), (result.status, result.error))
+        self.assertEqual([("claude", "exhausted", "timeout")], health.faults)
+        assert_valid(self, "RouteExecutionResult", result.to_record(request))
 
     def test_real_process_success_path(self) -> None:
         helper = self.write("ok.py", _HELPER_OK)

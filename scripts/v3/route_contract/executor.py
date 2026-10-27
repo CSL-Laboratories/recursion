@@ -49,8 +49,14 @@ def object_output_schema(schema: Any) -> bool:
 
 
 def _output_bytes(proc: ProcResult) -> int:
-    """Engine output bytes; the transport's own timeout suffix is not counted."""
+    """Engine output bytes; the transport's own timeout suffix is not counted.
 
+    Prefer the transport's raw count: decoding replaces invalid UTF-8 with
+    U+FFFD, which re-encodes to three bytes and would inflate the size.
+    """
+
+    if proc.raw_output_bytes is not None:
+        return proc.raw_output_bytes
     stderr = proc.stderr or ""
     if proc.timed_out and stderr.endswith(TIMEOUT_DIAGNOSTIC):
         stderr = stderr[: -len(TIMEOUT_DIAGNOSTIC)]

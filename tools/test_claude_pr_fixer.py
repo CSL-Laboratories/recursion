@@ -1381,8 +1381,20 @@ class ConflictJobStructureTests(unittest.TestCase):
         self.assertIn("PR-sync comment", job)
         self.assertIn("Context7", job)
         self.assertIn("Parallel", job)
+        self.assertNotIn("web research (Parallel)", job)
+        self.assertIn("any deep-research source the team has", job)
+        self.assertIn("Open Deep Research", job)
         self.assertIn("when those tools are available", job)
         self.assertIn("not a denied command that blocks the push", job)
+        self.assertIn("CSL-Laboratories/csl-research", job)
+        self.assertIn("Research bodies go", job)
+        self.assertIn("submissions/<record_id>/", job)
+        self.assertIn("through a PR there", job)
+        self.assertNotIn("submission record", job)
+        self.assertIn("never to this repo", job)
+        self.assertIn("digest on the Linear issue", job)
+        self.assertIn("New non-public docs", job)
+        self.assertIn("Existing files stay (CSL-536)", job)
 
     def _prep(self, live: object, pause_var: str | None = None, env_extra: dict | None = None,
               commit: object = None, reviews: object = None, ref: object = None,

@@ -17,15 +17,19 @@ Start here:
 - [ANCHOR.md](ANCHOR.md) — why the work exists; [CONTROL_PLANE.md](CONTROL_PLANE.md) — who decides
 
 > Governance note: `CONTROL_PLANE.md` and `ANCHOR.md` are the operative authority and scope
-> records. They still describe the pre-v3 control plane and will be rewritten in an
-> Owner-authoring session, not edited as part of a cleanup.
+> records. They already describe Recursion v3 (D-017, 2026-09-28); the older claim that they
+> "still describe the pre-v3 control plane" was stale. Neither file is edited in the
+> 2026-10-24 spec amendment (`ANCHOR.md` is a protected path with no founder authoring
+> session). GUI-timing supersession for ANCHOR's "terminal first, GUI later" is already
+> D-038; additions beyond D-038 live in `docs/v3/AMENDMENT-2026-10-24.md`. Status:
+> amendment proposed (2026-10-24); acceptance is a human decision by Lucas.
 
 ## Layout
 
 | Path | What it is |
 |---|---|
-| `docs/v3/` | v3 product specifications, research and evidence |
-| `experiments/v3/` | v3 research experiments and provider-free evidence checks |
+| `docs/v3/` | existing v3 product specifications. New non-public docs go to [csl-research](https://github.com/CSL-Laboratories/csl-research), except operational contracts and runbooks that this repository's code, a gate or CI reads; existing files stay (CSL-536). |
+| `experiments/v3/` | runnable product checks only |
 | `schemas/control-plane/v3/` | v3 contract schemas (planning, execution, integrity) |
 | `scripts/v3/` | v3 planning replay and validation |
 | `scripts/v3/harness/` | CSL-27 upstream CLI harness slice; CSL-83 weights, cooldowns, and caps |

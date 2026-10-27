@@ -36,7 +36,38 @@ issues and PRs.
   a PR is ready for review.
 - Autonomously file research findings, ideas and bugs to Triage, deduped.
 - Ground every issue and every execution in research before the work; size it to
-  the task. No specific tool is required.
+  the task. No specific tool is required. Research may use any deep-research
+  source the team has, such as Parallel, Exa, Claude Deep Research, Open Deep
+  Research, ChatGPT Deep Research or the web. Each run records its tool, its
+  run id and its cost (or `unknown + reason`) in its csl-research record.
+- All research output (notes, briefs, findings, source tables, competitor or
+  frontier writeups, research registers or indexes) goes to
+  [CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research)
+  as `submissions/<record_id>/`, through a PR in that repo, with a digest on
+  the Linear issue. Never commit research content to this repo; this repo only
+  links to the vault record (repo, 40-hex commit, path, claim, limitations).
+  New non-public docs (research, specs, decisions, evidence and receipts, gate
+  artifacts, and runbooks that aren't public) go to that vault through a PR
+  there, except operational contracts and runbooks that this repository's
+  code, a gate or CI reads: those stay here. A file stays in this repository
+  if code, a gate or CI here reads it; everything else non-public goes to the
+  vault. Existing files stay; CSL-536 will move them. The existing decision logs (`state/DECISIONS.md` and `docs/v3/DECISION-REGISTER.md`) and their founder-approved authoring process are unchanged. The only other new docs
+  allowed here are public knowledge-base, README, setup and implementation
+  instructions for outside readers, and agent instruction files. If
+  csl-research is not accessible, stop and post a
+  blocker on the Linear issue; do not fall back to this repo.
+  `docs/v3/research-lane/`, `docs/v3/foundation-research/` and
+  `docs/v3/prompts/` are legacy and frozen; `experiments/v3/` holds only
+  runnable product checks. Every research pass for an issue (a) posts that
+  digest and (b) appends the submission record following that repo's README,
+  AGENTS.md, templates and `tools/check_submission.py`, and opens the vault PR
+  before releasing the issue claim. The record carries the sanitized report,
+  its SHA-256, the tool or processor, run id, retrieval time, cost or
+  `unknown + reason`, a source-to-claim mapping, and `issue_urls`. A research
+  body produced under an admitted issue is published there as part of that
+  issue; no separate admission is needed. A research pass on a Linear issue
+  is complete only when its record is in csl-research `submissions/` and the
+  PR link is on the issue.
 - On a decision or direction issue, the assignee or claimant must post the
   cited brief (options, tradeoffs, recommendation, target metrics) on the
   Linear issue. A Grok Bot coordinator acting for its owner may prepare it,
@@ -63,23 +94,44 @@ Read, in order:
 5. [`docs/v3/RESEARCH-SCOPE.md`](docs/v3/RESEARCH-SCOPE.md) — the research lane and its gates.
 
 The product specifications live in `docs/v3/*.md`. Decisions live in
-`docs/v3/DECISION-REGISTER.md`. Research evidence and runnable checks live in
-`experiments/v3/**`.
+`docs/v3/DECISION-REGISTER.md`. Existing files stay; CSL-536 will move them.
+New non-public docs go to
+[CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research)
+through a PR there, except operational contracts and runbooks that this
+repository's code, a gate or CI reads: those stay here. A file stays in
+this repository if code, a gate or CI here reads it; everything else
+non-public goes to the vault. This repo only links to vault records.
+`experiments/v3/` holds only runnable
+product checks. All research output (notes, briefs, findings, source tables, competitor
+or frontier writeups, research registers or indexes) goes to
+[CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research)
+as `submissions/<record_id>/`, through a PR in that repo, with a digest on the
+Linear issue. Never commit research content to this repo; this repo only links
+to the vault record (repo, 40-hex commit, path, claim, limitations). If
+csl-research is not accessible, stop and post a blocker on the
+Linear issue; do not fall back to this repo.
 
 ## Pick up work
 
 Every task needs a **parent goal** and a **machine-checkable gate**. There is no gate, no
-work — if you cannot name the command that proves your change, stop and ask in
-[`state/INBOX.md`](state/INBOX.md).
+work — if you cannot name the command that proves your change, stop and comment
+on the Linear issue. The Linear issue comment is the canonical escalation;
+[`state/INBOX.md`](state/INBOX.md) is optional.
 
 For a research or evidence task:
 
 1. Choose one question from `RESEARCH-AGENDA.md` (or a named open item in a spec).
 2. Write a short SPEC + finite domain + a falsifier before writing code.
-3. Put the runnable check under `experiments/v3/<your-lane>/check.py`, taking
-   `--candidate FULL_COMMIT`.
-4. Record what the check proves and what it does **not** prove. Missing verification is
-   never a pass; an implementer's own PASS is not acceptance.
+3. Publish the research body to
+   [CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research)
+   as `submissions/<record_id>/` (PR in that repo, digest on the Linear issue)
+   before releasing the issue claim. Never commit the report, findings, or
+   register here.
+4. If the task also needs a runnable product check, put it under
+   `experiments/v3/<your-lane>/check.py`, taking `--candidate FULL_COMMIT`.
+   Record what the check proves and what it does **not** prove in the vault
+   submission. Missing verification is never a pass; an implementer's own PASS
+   is not acceptance.
 
 ## Linear workflow
 

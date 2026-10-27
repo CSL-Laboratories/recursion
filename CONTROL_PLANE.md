@@ -53,6 +53,33 @@ Any founder may approve a protected-path or merge-rule amendment through the sep
 recorded authoring process below. Approval does not apply repository settings or bypass
 existing review requirements.
 
+### Product-spec acceptance
+
+Lucas (2026-10-24 11:58pm PT): Samir and Dan may change and modify the product
+spec with their agents as recommended and as research is synthesized. Spec
+changes by Samir or Dan are accepted once another founder approves the PR.
+
+Founders for this receipt: Lucas (`NotSkittlz`), Samir (`samir-shah-ahmed`),
+Dan/Chaandan (`CDanTheMan`). The approver must be a founder and must not be the
+PR author (GitHub author login, or the attributed `for <developer>` principal
+when an agent authored through a founder account). The author's own approval
+does not count.
+
+The accepting GitHub review is `APPROVED` on the exact head SHA (40-hex) that
+is the PR head at the moment of acceptance. The review body names a SHA-256
+digest map of every accepted path (inline, or a single receipt the review
+names for that same SHA). A review on a stale SHA, a digest mismatch, a
+missing map, a non-founder review, merge, labels, CI, an implementer's PASS,
+silence, a reaction, or an agent comment is not acceptance.
+
+Lucas-authored spec PRs keep Lucas's existing acceptance path (his own
+unprefixed Linear or GitHub statement on the exact candidate). Another
+founder's GitHub approval of a Lucas-authored spec PR is not required and does
+not replace Lucas's path. Agents never merge.
+
+Protected-path and merge-rule amendments still require the separately recorded
+authoring session. This receipt does not change Lucas's reserved decisions.
+
 ### Lucas - reserved decisions and final tie-break
 
 Lucas retains spending and new services, sensitive company credentials (including company
@@ -169,7 +196,9 @@ through D-044. Superseding an entry preserves the reason it was believed — a r
 approach without its reason is a dead-end waiting to be rediscovered.
 
 D-041 records the source decisions and approval for the authority-split amendment, D-043 records
-the developer-approved receipt exception, and D-044 records this research-vault alignment. Each
+the developer-approved receipt exception, D-044 records this research-vault alignment, and
+CSLR-D-001 ([csl-research#59](https://github.com/CSL-Laboratories/csl-research/pull/59)) records
+founder GitHub PR approval as Recursion spec acceptance. Each
 changes governance
 text only: settings, CODEOWNERS, rulesets, access grants and merge-queue activation require
 their own authorization and are not changed or claimed effective here. Independent review

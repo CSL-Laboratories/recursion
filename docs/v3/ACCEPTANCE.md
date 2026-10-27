@@ -418,6 +418,11 @@ One public v3 release is built incrementally and cut atomically only when:
   merge/deployment seams unless a later explicit Full Access grant and operative constitutional
   amendment authorize a different reviewed profile.
 
+Amendment proposed 2026-10-25 (CSL-524): merge of a review branch is still not product-spec
+acceptance. Spec changes authored by Samir or Dan (or their attributed agents) are accepted when
+a founder other than the author approves the PR on the exact head SHA with file digests.
+Lucas-authored spec PRs keep Lucas's existing acceptance path.
+
 ## Flow and recovery finite evidence gate
 
 The [flow/recovery packet](construction/flow-recovery-integration-20260907/handoff.md) adds two

@@ -117,6 +117,12 @@ also fences new/undispatched work immediately. Widening, relaxed privacy, new eg
 metered spend, weaker verification, publication or effect power requires a new Owner-accepted
 version and a validated safe checkpoint.
 
+Amendment proposed 2026-10-25 (acceptance is a human decision by Lucas, CSL-524): **product-spec**
+(`docs/v3`) amendments by Samir or Dan are accepted by another founder's GitHub `APPROVED` review
+on the exact head SHA with file digests (`CONTROL_PLANE.md` product-spec acceptance). That rule
+is not GoalSpec digest acceptance. GoalSpec remains Owner-authenticated; CSL's first-user Owner
+remains Lucas until a GoalSpec names another founder.
+
 Every accepted amendment increments the goal fence epoch and atomically classifies old state:
 
 | Old item | Required deterministic disposition |
@@ -438,8 +444,8 @@ the answer is canonical for this design baseline but not current runtime/constit
 
 | ID | Exact question | Canonical answer/status | Controlling locator | Fixture/falsifier | Lucas seam |
 |---|---|---|---|---|---|
-| APQ-01 | How does raw owner intent become a draft and then accepted GoalSpec? | authenticate/append exact OwnerIntent; Head compiles a non-authoritative draft; deterministic validation; Lucas accepts the exact digest (`proposal`) | [Goal compilation](#goal-compilation-and-amendment) | F-M1A-001/002 | ratify acceptance protocol/authentication later |
-| APQ-02 | Who may amend a GoalSpec? | Lucas only; constitution changes also require its own authority path (`proposal`) | [Goal compilation](#goal-compilation-and-amendment) | F-M1A-003/005/020 | Lucas may choose a narrower delegated restriction-only role |
+| APQ-01 | How does raw owner intent become a draft and then accepted GoalSpec? | authenticate/append exact OwnerIntent; Head compiles a non-authoritative draft; deterministic validation; Lucas accepts the exact digest (`proposal`) | [Goal compilation](#goal-compilation-and-amendment) | F-M1A-001/002 | ratify acceptance protocol/authentication later[^cslr-d-001] |
+| APQ-02 | Who may amend a GoalSpec? | Lucas only; constitution changes also require its own authority path (`proposal`) | [Goal compilation](#goal-compilation-and-amendment) | F-M1A-003/005/020 | Lucas may choose a narrower delegated restriction-only role[^cslr-d-001] |
 | APQ-03 | Which restrictions may tighten immediately? | operative constitutional/Owner restrictions and accepted Owner amendment fence new admission/effects immediately; Head/ARM may narrow descendants without editing GoalSpec (`proposal`) | [Goal compilation](#goal-compilation-and-amendment) | F-M1A-003/005/014 | non-Owner GoalSpec amendment authority remains unratified |
 | APQ-04 | Which changes require a safe checkpoint or new authorization? | any widening, relaxed privacy, new egress/account/spend/effect, weaker verifier or route power needs new Owner acceptance and checkpoint (`proposal`) | [Goal compilation](#goal-compilation-and-amendment) | F-M1A-003/011/013 | exact future high-impact authorization mechanism |
 | APQ-05 | How does an amendment affect plans, nodes, packets, leases, effects and evidence? | new goal epoch; old plan superseded; complete disposition; packets/leases always stale; compatible nodes/evidence need exact proof/reissue; uncertain effects quarantine (`proposal`) | [amendment disposition table](#goal-compilation-and-amendment) | F-M1A-005/006/016/023 | treatment of irreversible effect remains Owner seam |
@@ -456,6 +462,8 @@ the answer is canonical for this design baseline but not current runtime/constit
 | APQ-16 | Which decisions are semantic proposals versus kernel enforced? | Owner/Head/ARM/worker/verifier propose/decide only their semantic roles; kernel enforces every admission/transition/fence/budget/privacy/PAUSE/effect gate (`proposal`) | [Authority table](#authority-and-responsibility) | F-M1A-002/003/019/020 | Head/ARM decomposition seam requires Lucas |
 | APQ-17 | What prevents worker/verifier/plugin/harness/stale lease rewriting plan? | closed command types, role/lease/epoch/digest validation and immutable plans/packets; unauthorized command refuses/audits (`proposal`) | [common bindings](#common-immutable-envelope-and-bindings), [Replay](#deterministic-replay-and-idempotency) | F-M1A-006/019/020/021 | runtime authentication implementation later |
 | APQ-18 | What is the minimum complete lean baseline? | strict planning schemas/canonicalization, pure validation/DAG/packet/gate/retry/replan/escalation/decider/reducer and sanitized fixtures; no external subsystem (`proposal`) | [Minimum baseline](#minimum-complete-baseline-and-construction-boundary) | all F-M1A-001–023 plus static no-I/O gate | separately authorize M1A construction |
+
+[^cslr-d-001]: product-spec acceptance is CSLR-D-001, not these seams.
 
 ## Minimum complete baseline and construction boundary
 

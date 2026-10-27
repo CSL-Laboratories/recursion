@@ -107,17 +107,17 @@ Keep invariant 1's force-push, merge, and deployment limits. Name the review bra
 ## P-003 — Founder GitHub PR approval as Recursion spec acceptance
 
 - Date: 2026-10-25
-- Status: **authoring session posted; decision record moved to csl-research as
-  CSLR-D-001; protected-path diffs not yet applied**. Lucas posted
-  the unprefixed authoring sentence from his own account on
+- Status: **authoring session applied on this branch; decision record is CSLR-D-001 in
+  csl-research; nothing takes effect until this PR merges**. Lucas posted the
+  authorizing unprefixed sentence from his own account on
   [CSL-524](https://linear.app/csl-laboratories/issue/CSL-524) as comment
-  `3bf10093-062c-43bc-a9c3-f21bb8f6ba73` (2026-10-26 2:38pm PT), naming branch
-  `cursor/csl-524-spec-acceptance-1752`. The protected-path diffs were **not**
-  applied on this branch. Lucas (2026-10-26 2:50pm PT, relayed by Grok Bot
+  `c8efc4d7-9742-43db-8289-dd8b3bbe9cc4` (2026-10-26 6:55pm PT). It replaces the
+  file list in comment `3bf10093-062c-43bc-a9c3-f21bb8f6ba73` and names branch
+  `cursor/csl-524-spec-acceptance-1752`. `state/DECISIONS.md` is out of scope and
+  stays byte-identical to master. Lucas (2026-10-26 2:50pm PT, relayed by Grok Bot
   Liaison): "Move the R#296 decision record to csl-research with a new decision
   ID." The record is CSLR-D-001 (`decisions/CSLR-D-001.md`,
-  [csl-research#59](https://github.com/CSL-Laboratories/csl-research/pull/59)); `state/DECISIONS.md` stays
-  frozen through D-044 and gets no entry. Not merged.
+  [csl-research#59](https://github.com/CSL-Laboratories/csl-research/pull/59)). Not merged.
 - Owner: Lucas.
 - Issue: [CSL-524](https://linear.app/csl-laboratories/issue/CSL-524) (child of CSL-494;
   related CSL-493, CSL-523). Twin of CSL-523 in the companion repo.
@@ -138,20 +138,22 @@ agents; spec changes by Samir or Dan are accepted once another founder approves 
 PR, bound to that head SHA and exact file digests. Lucas's path stays valid.
 
 `CONTROL_PLANE.md` rule 6 forbids editing protected paths without that authoring
-session. This proposal records the rule and the target diffs without applying them.
+session. Comment `c8efc4d7-9742-43db-8289-dd8b3bbe9cc4` is that session. The vault
+text is applied on this branch and takes effect only when this PR merges.
 
 ### Proposed replacement
 
-See the vault copy linked above. After Lucas posts the authoring sentence on CSL-524, apply
-those insertions to `CONTROL_PLANE.md`, `ANCHOR.md`, `AGENTS.md`, `CLAUDE.md`,
-`docs/v3/PLANNING.md`, `docs/v3/AUTONOMOUS-PLANNING.md`,
-`docs/v3/DECISION-REGISTER.md` item 9, and `docs/v3/ACCEPTANCE.md`. Record the
-decision as CSLR-D-001 in csl-research ([csl-research#59](https://github.com/CSL-Laboratories/csl-research/pull/59));
-do not append to the frozen `state/DECISIONS.md`.
+The vault copy linked above is applied on this branch to `CONTROL_PLANE.md`, `ANCHOR.md`,
+`AGENTS.md`, `CLAUDE.md`, `docs/v3/PLANNING.md`, `docs/v3/AUTONOMOUS-PLANNING.md`,
+`docs/v3/DECISION-REGISTER.md` item 9, and `docs/v3/ACCEPTANCE.md`. The decision record
+stays CSLR-D-001 in csl-research ([csl-research#59](https://github.com/CSL-Laboratories/csl-research/pull/59)).
+`state/DECISIONS.md` is not appended. Nothing in the applied text takes effect until this
+PR merges.
 
 ### Non-goals
 
-- No protected-path edit until the CSL-524 authoring comment exists.
+- No protected-path edit beyond Lucas's CSL-524 authoring comment
+  `c8efc4d7-9742-43db-8289-dd8b3bbe9cc4`. `state/DECISIONS.md` stays untouched.
 - No merge. No acceptance of recursion#295. No change to Lucas's reserved
   decisions or to agent-never-merge.
 - No other-project identifiers in tracked files.

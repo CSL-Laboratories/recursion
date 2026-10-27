@@ -105,7 +105,12 @@ Summaries and compacted plans may reference this ledger but cannot replace it. W
 ## GoalSpec projection
 
 Owner intent is retained exactly. Head may compile a complete draft, but only Lucas accepts or
-amends the exact GoalSpec digest. Accepted versions are immutable. Operative constitutional and
+amends the exact GoalSpec digest. Amendment proposed 2026-10-25 (acceptance is a human decision
+by Lucas, CSL-524): **product-spec** (`docs/v3`) amendments by Samir or Dan are accepted by
+another founder's GitHub `APPROVED` review on the exact head SHA with file digests
+(`CONTROL_PLANE.md` product-spec acceptance). That rule is not GoalSpec digest acceptance.
+GoalSpec remains Owner-authenticated; CSL's first-user Owner remains Lucas until a GoalSpec
+names another founder. Accepted versions are immutable. Operative constitutional and
 Owner restrictions fence new admission immediately; descendant plans may narrow without changing
 the goal. Widening, relaxed privacy, new egress/account/spend/effect authority or weaker required
 verification needs a new Owner-accepted version and safe checkpoint. The required fields,

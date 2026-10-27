@@ -42,6 +42,14 @@ repository only links.
    holding credentials Recursion was not granted, and measured quota/usage burden falls versus
    driving each harness directly — or the public claim is withdrawn.
 
+## Product-spec acceptance
+
+`docs/v3` accepted text changes only by a dated amendment that is accepted.
+Spec changes by Samir or Dan (or their attributed agents) are accepted when a
+founder other than the author approves the PR on the exact head SHA with a
+file-digest map (`CONTROL_PLANE.md` product-spec acceptance). Lucas-authored
+amendments keep Lucas's existing acceptance path. Merge is not acceptance.
+
 ## Not this year / explicitly out of scope
 
 Written down so it stops re-entering scope:

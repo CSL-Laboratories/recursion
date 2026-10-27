@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import http.client
 import io
 import json
 import os
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -40,6 +42,7 @@ from scripts.v3.control_api.client import (  # noqa: E402
     write_token_file,
 )
 from scripts.v3.control_api.fake_engines import ENGINES, build_fake_stack  # noqa: E402
+from scripts.v3.control_api import http_server  # noqa: E402
 from scripts.v3.control_api.http_server import ControlHTTPServer, RemoteBindRefused  # noqa: E402
 
 PROMPT = "Review the change and answer with a verdict."
@@ -279,6 +282,31 @@ class BindTests(unittest.TestCase):
         with ControlHTTPServer(stack.service, "localhost") as server:
             self.assertTrue(server.url.startswith("http://127.0.0.1:"))
 
+    def test_windows_does_not_reuse_a_listening_loopback_port(self) -> None:
+        # HTTPServer sets SO_REUSEADDR. On Windows that accepts a second
+        # listener on the same specific address, and serve-fake then blocks.
+        stack = build_fake_stack()
+        with mock.patch.object(http_server.os, "name", "nt"):
+            windows = ControlHTTPServer(stack.service)
+            self.addCleanup(windows.close)
+            reuse = windows._server.socket.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR)
+            self.assertEqual(0, reuse)
+        holder = ControlHTTPServer(stack.service)
+        self.addCleanup(holder.close)
+        if os.name != "nt":
+            reuse = holder._server.socket.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR)
+            self.assertNotEqual(0, reuse)
+        duplicate: ControlHTTPServer | None = None
+        try:
+            duplicate = ControlHTTPServer(stack.service, port=holder.port)
+        except OSError as exc:
+            self.assertEqual(errno.EADDRINUSE, exc.errno)
+        else:
+            self.fail(f"second bind on 127.0.0.1:{holder.port} was accepted")
+        finally:
+            if duplicate is not None:
+                duplicate.close()
+
     def test_the_client_refuses_a_non_loopback_url(self) -> None:
         for url in ("http://example.com:80", "https://127.0.0.1:1", "http://192.0.2.1:1", "http://127.0.0.1"):
             with self.assertRaises(ValueError, msg=url):
@@ -347,16 +375,37 @@ class TokenFileTests(unittest.TestCase):
         self.addCleanup(blocker.stop)
         with tempfile.TemporaryDirectory() as directory:
             token_file = Path(directory) / "token"
-            code = main(
-                [
-                    "serve-fake",
-                    "--token-file",
-                    str(token_file),
-                    "--port",
-                    str(blocker.port),
-                ]
+            outcome: dict[str, object] = {}
+            stderr = io.StringIO()
+
+            def invoke() -> None:
+                try:
+                    with contextlib.redirect_stderr(stderr):
+                        outcome["code"] = main(
+                            [
+                                "serve-fake",
+                                "--token-file",
+                                str(token_file),
+                                "--port",
+                                str(blocker.port),
+                            ]
+                        )
+                except BaseException as exc:  # noqa: BLE001 - report the worker failure
+                    outcome["error"] = exc
+
+            # A Windows SO_REUSEADDR regression accepts the occupied port and
+            # serve-fake blocks in stop.wait(). Fail that here instead of
+            # waiting out the suite cap.
+            worker = threading.Thread(target=invoke, daemon=True)
+            worker.start()
+            worker.join(10)
+            self.assertFalse(
+                worker.is_alive(),
+                "serve-fake kept running on a loopback port that was already bound",
             )
-            self.assertEqual(2, code)
+            self.assertNotIn("error", outcome)
+            self.assertEqual(2, outcome.get("code"))
+            self.assertIn("OSError", stderr.getvalue())
             self.assertFalse(token_file.exists())
 
     def test_excess_connections_are_refused(self) -> None:

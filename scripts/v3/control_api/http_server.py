@@ -14,6 +14,7 @@ relay (CSL-498) are not built here, and nothing here is reachable off-host.
 from __future__ import annotations
 
 import json
+import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -51,10 +52,20 @@ def status_for(response: dict[str, Any]) -> int:
 
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
-    allow_reuse_address = True
+    # ``HTTPServer`` sets this. Leave it off unless ``server_bind`` opts in.
+    allow_reuse_address = False
     service: ControlService
     allowed_hosts: frozenset[str]
     max_connections: int = MAX_CONNECTIONS
+
+    def server_bind(self) -> None:
+        # POSIX ``SO_REUSEADDR`` only permits a bind during ``TIME_WAIT``.
+        # On Windows the same option lets a second socket bind a specific
+        # address that is still listening (same user; Winsock, Server 2003+),
+        # so ``serve-fake`` on an occupied port would run instead of failing.
+        # A default specific bind returns ``WSAEADDRINUSE``.
+        self.allow_reuse_address = os.name != "nt"
+        super().server_bind()
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)

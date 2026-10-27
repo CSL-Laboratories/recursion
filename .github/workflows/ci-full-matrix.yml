@@ -31,11 +31,13 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
-          cache-dependency-path: requirements-ci.txt
 
       - name: Install dependencies
-        run: python -m pip install -r requirements-ci.txt
+        working-directory: ${{ runner.temp }}
+        env:
+          REQUIREMENTS_CI: ${{ github.workspace }}/requirements-ci.txt
+        shell: bash
+        run: 'python -P -m pip install --only-binary=:all: -r "$REQUIREMENTS_CI"'
 
       - name: Provider-free gate
         run: python -X utf8 -B tools/ci_gate.py --force
@@ -53,11 +55,13 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
-          cache-dependency-path: requirements-ci.txt
 
       - name: Install dependencies
-        run: python -m pip install -r requirements-ci.txt
+        working-directory: ${{ runner.temp }}
+        env:
+          REQUIREMENTS_CI: ${{ github.workspace }}/requirements-ci.txt
+        shell: bash
+        run: 'python -P -m pip install --only-binary=:all: -r "$REQUIREMENTS_CI"'
 
       - name: Provider-free gate
         run: python -X utf8 -B tools/ci_gate.py --force

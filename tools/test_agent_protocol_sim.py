@@ -7,6 +7,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -67,6 +68,24 @@ def edit(at_minutes, uuid, *extra, session="claude/s1", branch="csl-1-work", con
 
 def comment(cid, issue, at, body, deleted=False):
     return {"id": cid, "issue": issue, "created_at": ts(at), "body": body, "edits": [], "deleted": deleted}
+
+
+RECORD_FIELDS = {
+    "reason": "done",
+    "done": "the change",
+    "evidence": "\n- tests pass",
+    "open": "none",
+    "next": "none",
+    "files": "tools/agent_protocol_sim.py",
+}
+
+
+def release_record(cid, issue_id, uuid, at, session="claude/s1", omit=(), **fields):
+    """An agent's `release v1` record for `uuid`, posted at `at` minutes (CSL-445)."""
+    values = {"claim": uuid, **RECORD_FIELDS, **fields}
+    lines = [f"Agent ({session}, for Lucas): release v1"]
+    lines += [f"{key}: {value}" for key, value in values.items() if key not in omit]
+    return comment(cid, issue_id, at, "\n".join(lines))
 
 
 def issue(iid, status="Todo", admitted=True, next_in_order=True, blocked_by=(), decision=None, parent=None):
@@ -190,11 +209,51 @@ class ClaimingTests(unittest.TestCase):
         result = sim.evaluate(snapshot(10, [issue("CSL-1")], [claim("c2", "CSL-1", U2), fresh]))
         self.assertEqual(codes(result), [])
 
-    def test_s22_second_claim_in_same_repository_is_flagged(self):
+    def test_s22_claims_on_two_issues_in_same_repository_are_allowed(self):
+        # Several claims per session are allowed (CSL-357 comment 0cdfd465).
         result = sim.evaluate(snapshot(10, [issue("CSL-1"), issue("CSL-4")], [
             claim("c1", "CSL-1", U1), claim("c2", "CSL-4", U2, at=1, branch="csl-4-work"),
         ]))
+        self.assertEqual(codes(result), [])
+        self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], U1)
+        self.assertEqual(result["issues"]["CSL-4"]["claims"]["recursion"]["winner"], U2)
+
+    def test_s22_own_expired_unreleased_claim_still_counts_on_another_issue(self):
+        # Codex P2 on #276: release before re-claiming (CSL-379); the same
+        # session's lapsed claim on CSL-1 still blocks a claim on CSL-4 that
+        # shares its branch.
+        result = sim.evaluate(snapshot(210, [issue("CSL-1"), issue("CSL-4")], [
+            claim("c1", "CSL-1", U1), claim("c2", "CSL-4", U2, at=200),
+        ]))
         self.assertEqual(codes(result), ["multiple_claims_per_session"])
+
+    def test_s22_own_expired_claim_released_first_is_clean(self):
+        result = sim.evaluate(snapshot(210, [issue("CSL-1"), issue("CSL-4")], [
+            claim("c1", "CSL-1", U1, more_edits=[edit(190, U1, "released")]), release_record("r1", "CSL-1", U1, 190),
+            claim("c2", "CSL-4", U2, at=200),
+        ]))
+        self.assertEqual(codes(result), [])
+        self.assertEqual(result["issues"]["CSL-4"]["claims"]["recursion"]["winner"], U2)
+
+    def test_s22_parent_scope_and_direct_child_claim_overlap(self):
+        # The parent claim's `scope: sub-issue CSL-2` already covers CSL-2.
+        family = [issue("CSL-1"), issue("CSL-2", status="In Progress", parent="CSL-1")]
+        result = sim.evaluate(snapshot(10, family, [
+            scoped("c1", "CSL-1", U1, "CSL-2"), claim("c2", "CSL-2", U2, at=1, branch="csl-2-work"),
+        ]))
+        self.assertEqual(codes(result), ["multiple_claims_per_session"])
+        # Codex 4343345426: the session's later child claim is not published
+        # as CSL-2's holder; the parent claim, whose scope covers CSL-2, holds
+        # both (Codex 4343468463).
+        self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], U1)
+        self.assertEqual(result["issues"]["CSL-2"]["claims"]["recursion"]["winner"], U1)
+
+    def test_s22_claims_on_two_issues_sharing_a_branch_are_flagged(self):
+        result = sim.evaluate(snapshot(10, [issue("CSL-1"), issue("CSL-4")], [
+            claim("c1", "CSL-1", U1), claim("c2", "CSL-4", U2, at=1, branch="csl-1-work"),
+        ]))
+        self.assertEqual(codes(result), ["multiple_claims_per_session"])
+        self.assertEqual(result["issues"]["CSL-4"]["claims"]["recursion"]["winner"], None)
 
     def test_human_revoke_ends_claim_and_agent_revoke_is_void(self):
         human = comment("h1", "CSL-1", 5, f"REVOKE CLAIM {U1}")
@@ -244,6 +303,8 @@ class LeaseTests(unittest.TestCase):
         for name, (now, edits) in cases.items():
             with self.subTest(case=name):
                 comments = [claim("c1", "CSL-1", U1, more_edits=edits), self.takeover(at=125)]
+                if name == "original released later":
+                    comments.append(release_record("r1", "CSL-1", U1, 135))
                 result = sim.evaluate(snapshot(now, [issue("CSL-1")], comments))
                 refused = [v["detail"] for v in result["violations"] if v["code"] == "takeover_refused"]
                 self.assertEqual(refused, ["lease plus grace not passed"])
@@ -265,7 +326,9 @@ class LeaseTests(unittest.TestCase):
         released["edits"].append(released_taker)
         for name, taker in (("taker live", self.takeover(at=125)), ("taker released later", released)):
             with self.subTest(case=name):
-                comments = [claim("c1", "CSL-1", U1, more_edits=objected), taker]
+                comments = [claim("c1", "CSL-1", U1, more_edits=objected), taker, release_record("r1", "CSL-1", U1, 135)]
+                if taker is released:
+                    comments.append(release_record("r2", "CSL-1", U2, 195, session="cursor/s2"))
                 result = sim.evaluate(snapshot(200, [issue("CSL-1")], comments, writes=writes))
                 state = result["issues"]["CSL-1"]
                 self.assertFalse(state["takeovers"][U2]["allowed"])
@@ -274,11 +337,12 @@ class LeaseTests(unittest.TestCase):
 
     def test_objection_then_release_still_needs_the_acknowledgement(self):
         original = claim("c1", "CSL-1", U1, more_edits=[edit(155, U1, "heartbeat-at: 155"), edit(160, U1, "released")])
-        result = sim.evaluate(snapshot(200, [issue("CSL-1")], [original, self.takeover()],
+        record = release_record("r1", "CSL-1", U1, 160)
+        result = sim.evaluate(snapshot(200, [issue("CSL-1")], [original, record, self.takeover()],
                                        config={"coordinator_ack_required": True}))
         self.assertEqual(result["issues"]["CSL-1"]["takeovers"][U2]["reason"], "coordinator acknowledgement missing")
         self.assertIsNone(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"])
-        acked = [original, self.takeover(), comment("h1", "CSL-1", 156, f"ACK TAKEOVER {U1}")]
+        acked = [original, record, self.takeover(), comment("h1", "CSL-1", 156, f"ACK TAKEOVER {U1}")]
         result = sim.evaluate(snapshot(200, [issue("CSL-1")], acked, config={"coordinator_ack_required": True}))
         self.assertTrue(result["issues"]["CSL-1"]["takeovers"][U2]["allowed"])
 
@@ -294,6 +358,35 @@ class LeaseTests(unittest.TestCase):
         result = sim.evaluate(snapshot(170, [issue("CSL-1")], comments))
         refused = [v["detail"] for v in result["violations"] if v["code"] == "takeover_refused"]
         self.assertEqual(refused, ["lease plus grace not passed"])
+
+    def test_takeover_that_lost_its_overlap_does_not_clear_the_expired_claim(self):
+        U4 = "00000000-0000-4000-8000-000000000004"
+        comments = [
+            claim("c1", "CSL-1", U1),
+            claim("c3", "CSL-4", U3, at=140, session="grok/s3", branch="shared"),
+            self.takeover(at=152, extra=()) | {"body": claim_body(U2, "cursor/s2", "shared", None, (f"takeover of {U1}",))},
+            claim("c4", "CSL-1", U4, at=170, session="codex/s4", branch="other"),
+        ]
+        for c in comments[2:3]:
+            c["edits"] = [{"at": ts(152, 70), "body": claim_body(U2, "cursor/s2", "shared", ts(152, 70), (f"takeover of {U1}",))}]
+        writes = [{"kind": "push", "issue": "CSL-1", "claim": U4, "at": ts(172)}]
+        for listed in (comments, comments[::-1]):
+            result = sim.evaluate(snapshot(180, [issue("CSL-1"), issue("CSL-4")], listed, writes=writes))
+            self.assertIn("claim_without_takeover", codes(result))
+
+    def test_a_claim_posted_as_a_takeover_wait_ends_is_evaluated(self):
+        # A fresh claim posted at the exact instant the takeover's race
+        # settles once made settling that race recurse into itself.
+        u4 = "00000000-0000-4000-8000-000000000004"
+        comments = [claim("c1", "CSL-1", U1), self.takeover(at=152),
+                    claim("c4", "CSL-1", u4, at=167, session="codex/s4", branch="other")]
+        for order in ("posted", "reversed"):
+            with self.subTest(order=order):
+                listed = comments if order == "posted" else comments[::-1]
+                result = sim.evaluate(snapshot(180, [issue("CSL-1")], listed))
+                self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], U2)
+                self.assertEqual([(v["code"], v["claim"]) for v in result["violations"]],
+                                 [("loser_confirmed", u4), ("loser_not_withdrawn", u4)])
 
     def test_violations_do_not_depend_on_comment_order(self):
         comments = [claim("c1", "CSL-1", U1), self.takeover(at=125), claim("c3", "CSL-1", U3, at=160, session="grok/s3")]
@@ -385,7 +478,8 @@ class LeaseTests(unittest.TestCase):
     def test_release_after_an_objection_clears_it(self):
         original = claim("c1", "CSL-1", U1, more_edits=[edit(155, U1, "heartbeat-at: back"), edit(160, U1, "released")])
         writes = [{"kind": "push", "issue": "CSL-1", "claim": U2, "at": ts(170)}]
-        result = sim.evaluate(snapshot(175, [issue("CSL-1")], [original, self.takeover()], writes=writes))
+        record = release_record("r1", "CSL-1", U1, 160)
+        result = sim.evaluate(snapshot(175, [issue("CSL-1")], [original, record, self.takeover()], writes=writes))
         self.assertTrue(result["issues"]["CSL-1"]["takeovers"][U2]["allowed"])
         self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], U2)
         self.assertEqual(codes(result), [])
@@ -397,7 +491,8 @@ class LeaseTests(unittest.TestCase):
 
     def test_release_inside_the_wait_is_not_an_objection(self):
         original = claim("c1", "CSL-1", U1, more_edits=[edit(160, U1, "released")])
-        result = sim.evaluate(snapshot(175, [issue("CSL-1")], [original, self.takeover()]))
+        record = release_record("r1", "CSL-1", U1, 160)
+        result = sim.evaluate(snapshot(175, [issue("CSL-1")], [original, record, self.takeover()]))
         self.assertTrue(result["issues"]["CSL-1"]["takeovers"][U2]["allowed"])
 
     def test_takeover_refused_while_claimant_run_is_in_progress(self):
@@ -409,6 +504,29 @@ class LeaseTests(unittest.TestCase):
         writes = [{"kind": "push", "issue": "CSL-1", "claim": U1, "at": ts(125)}]
         result = sim.evaluate(snapshot(130, [issue("CSL-1")], [claim("c1", "CSL-1", U1)], writes=writes))
         self.assertEqual(codes(result), ["write_after_expiry"])
+
+    def test_lease_and_grace_boundaries_are_measured_from_the_last_update(self):
+        # Codex 4343803111: the lease runs 2 hours from the last counted update
+        # (here the confirmation edit at 1m10s); a write at exactly that edge is
+        # allowed, one second later it is not. A renewal up to exactly 2h30
+        # restores the lease; one second later it does not.
+        last, second = 70 / 60, 1 / 60
+
+        def push(at):
+            return {"kind": "push", "issue": "CSL-1", "claim": U1, "at": ts(at)}
+
+        cases = {
+            "write at the lease edge": ([], [push(last + 120)], []),
+            "write just after the lease": ([], [push(last + 120 + second)], ["write_after_expiry"]),
+            "renewal at the grace edge": ([edit(last + 150, U1, "heartbeat-at: x")], [push(last + 155)], []),
+            "renewal just after grace": ([edit(last + 150 + second, U1, "heartbeat-at: x")], [push(last + 155)],
+                                         ["renewed_after_expiry", "write_after_expiry"]),
+        }
+        for name, (edits, writes, expected) in cases.items():
+            with self.subTest(case=name):
+                comment_ = claim("c1", "CSL-1", U1, more_edits=edits)
+                result = sim.evaluate(snapshot(160, [issue("CSL-1")], [comment_], writes=writes))
+                self.assertEqual(codes(result), expected)
 
     def test_heartbeat_extends_the_lease(self):
         claim_comment = claim("c1", "CSL-1", U1, more_edits=[edit(100, U1, "heartbeat-at: x")])
@@ -456,7 +574,8 @@ class LeaseTests(unittest.TestCase):
     def test_fresh_claim_after_a_released_claim_is_fine(self):
         released = claim("c1", "CSL-1", U1, more_edits=[edit(30, U1, "released")])
         fresh = claim("c2", "CSL-1", U2, at=160, session="cursor/s2")
-        self.assertEqual(codes(sim.evaluate(snapshot(170, [issue("CSL-1")], [released, fresh]))), [])
+        record = release_record("r1", "CSL-1", U1, 30)
+        self.assertEqual(codes(sim.evaluate(snapshot(170, [issue("CSL-1")], [released, record, fresh]))), [])
 
     def test_claim_during_another_takeover_wait(self):
         third = claim("c3", "CSL-1", U3, at=155, session="grok/s3")
@@ -484,6 +603,127 @@ class LeaseTests(unittest.TestCase):
         writes = [{"kind": "push", "issue": "CSL-1", "claim": U2, "at": ts(160)}]
         result = sim.evaluate(snapshot(170, [issue("CSL-1")], [claim("c1", "CSL-1", U1), self.takeover()], writes=writes))
         self.assertEqual(codes(result), ["takeover_wrote_too_early"])
+
+
+class SettlementHorizonTests(unittest.TestCase):
+    """Samir's tie order (PR #282 comment 4347949974): a race lost at the
+    instant the takeover wait ends counts against the taker, while each race
+    is settled only from parts settled strictly earlier."""
+
+    U4 = "00000000-0000-4000-8000-000000000004"
+    U5 = "00000000-0000-4000-8000-000000000005"
+    U9 = "00000000-0000-4000-8000-000000000009"
+
+    def race_at_the_wait_end(self):
+        # C holds CSL-9 on OLD's branch, so OLD (U1) loses its overlap. W (U2)
+        # renews and holds CSL-1. T (U3) takes over the expired OLD and loses
+        # its race to W at 12:48, the instant its wait ends. F (U4) then lands
+        # on the expired OLD without a takeover.
+        comments = [
+            claim("c0", "CSL-9", self.U9),
+            claim("c1", "CSL-1", U1, at=1, session="s1/x"),
+            claim("c2", "CSL-1", U2, at=5, session="s2/x", branch="w",
+                  more_edits=[edit(100, U2, "heartbeat-at: x", session="s2/x", branch="w")]),
+            claim("c3", "CSL-1", U3, at=153, session="s3/x", branch="t", extra=(f"takeover of {U1}",)),
+            claim("c4", "CSL-1", self.U4, at=170, session="s4/x", branch="f"),
+        ]
+        return comments, [issue("CSL-9"), issue("CSL-1")], 180, {}
+
+    def zero_read_back_and_wait(self):
+        # Accepted inputs, not the defaults. U2 and U4 post at the same instant,
+        # taking over the expired U1 and the expired settled loser U5.
+        comments = [
+            claim("c1", "CSL-1", U1),
+            claim("c5", "CSL-1", self.U5, at=0.5, session="other/s", branch="y"),
+            claim("c2", "CSL-1", U2, at=152, session="cursor/s2", confirm_after=None, extra=(f"takeover of {U1}",)),
+            claim("c4", "CSL-1", self.U4, at=152, session="codex/s4", branch="other", confirm_after=None,
+                  extra=(f"takeover of {self.U5}",)),
+        ]
+        return comments, [issue("CSL-1")], 160, {"readback_seconds": 0, "takeover_wait_minutes": 0}
+
+    def evaluate(self, fixture, order):
+        comments, issues, now, config = fixture
+        listed = comments if order == "posted" else comments[::-1]
+        return sim.evaluate(snapshot(now, issues, listed, config=config))
+
+    def test_a_race_lost_as_the_wait_ends_leaves_the_target_untaken(self):
+        for order in ("posted", "reversed"):
+            with self.subTest(order=order):
+                result = self.evaluate(self.race_at_the_wait_end(), order)
+                self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], U2)
+                self.assertEqual(sorted((v["code"], v["claim"], v["detail"]) for v in result["violations"]), [
+                    ("claim_without_takeover", self.U4, f"expired {U1}"),
+                    ("loser_confirmed", U3, f"winner {U2}"),
+                    ("loser_confirmed", self.U4, f"winner {U2}"),
+                    ("loser_not_withdrawn", U3, f"winner {U2}"),
+                    ("loser_not_withdrawn", self.U4, f"winner {U2}"),
+                    ("overlapping_claim", U1, f"branch overlaps {self.U9}"),
+                ])
+
+    def test_zero_read_back_and_wait_settle_each_race_from_earlier_parts(self):
+        # Zero read-back and zero wait, an accepted non-default config. U2's
+        # race is settled from parts settled strictly before 12:32, where U4's
+        # takeover still stands, so U2 wins and U4 loses. U4's takeover
+        # therefore never took effect, so U2 landed on the expired U5 without a
+        # takeover and nobody holds the issue. Samir accepted this outcome
+        # (PR #282 r4348328466). It arises only because the expired, unwithdrawn
+        # settled loser U5 still needs a takeover, which is F2 (Lucas): if F2
+        # changes, this outcome should change with it, deliberately.
+        for order in ("posted", "reversed"):
+            with self.subTest(order=order):
+                comments, issues, now, config = self.zero_read_back_and_wait()
+                listed = comments if order == "posted" else comments[::-1]
+                snap = snapshot(now, issues, listed, config=config)
+                ev = sim.Evaluation(snap)
+                result = ev.run()
+                self.assertIsNone(ev.settled_loss(ev.claims[U2], ev.now))
+                self.assertEqual(ev.settled_loss(ev.claims[self.U4], ev.now).uuid, U2)
+                self.assertIsNone(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"])
+                self.assertEqual(sorted((v["code"], v["claim"], v["detail"]) for v in result["violations"]), [
+                    ("claim_without_takeover", U2, f"expired {self.U5}"),
+                    ("loser_confirmed", self.U5, f"winner {U1}"),
+                    ("loser_not_withdrawn", self.U4, f"winner {U2}"),
+                    ("loser_not_withdrawn", self.U5, f"winner {U1}"),
+                ])
+
+    def test_a_claim_posted_as_the_wait_ends_beside_a_settled_loser(self):
+        # U4 posts at 12:47, as U2's takeover wait ends; the expired settled
+        # loser U5 was never taken over, so both land on it without a takeover.
+        comments = [
+            claim("c1", "CSL-1", U1),
+            claim("c5", "CSL-1", self.U5, at=0.5, session="other/s", branch="y"),
+            claim("c2", "CSL-1", U2, at=152, session="cursor/s2", extra=(f"takeover of {U1}",)),
+            claim("c4", "CSL-1", self.U4, at=167, session="codex/s4", branch="other"),
+        ]
+        for order in ("posted", "reversed"):
+            with self.subTest(order=order):
+                result = self.evaluate((comments, [issue("CSL-1")], 180, {}), order)
+                self.assertIsNone(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"])
+                self.assertEqual(sorted((v["code"], v["claim"]) for v in result["violations"]), [
+                    ("claim_without_takeover", U2), ("claim_without_takeover", self.U4),
+                    ("loser_confirmed", self.U5), ("loser_not_withdrawn", self.U5),
+                ])
+
+    def test_settled_parts_do_not_depend_on_the_evaluation_order(self):
+        # Each part and each race is settled from earlier parts only, so
+        # computing it first in a fresh evaluation, with nothing cached, gives
+        # the cached value.
+        for name in ("race_at_the_wait_end", "zero_read_back_and_wait"):
+            comments, issues, now, config = getattr(self, name)()
+            snap = snapshot(now, issues, comments, config=config)
+            warmed = sim.Evaluation(snap)
+            warmed.run()
+            self.assertTrue(warmed._losses)
+            for (uuid, kind), lost in warmed._losses.items():
+                with self.subTest(fixture=name, claim=uuid, part=kind):
+                    fresh = sim.Evaluation(snap)
+                    part = fresh.claims[uuid]
+                    got = fresh._settled(part, kind, dict(fresh.settle_times(part))[kind])
+                    self.assertEqual(got and got.uuid, lost and lost.uuid)
+            for (issue_id, repo, at, _), won in warmed._winners.items():
+                with self.subTest(fixture=name, race=at):
+                    got = sim.Evaluation(snap).winner(issue_id, repo, at)
+                    self.assertEqual(got and got.uuid, won and won.uuid)
 
 
 class CommitTests(unittest.TestCase):
@@ -548,11 +788,12 @@ class CommitTests(unittest.TestCase):
 
     def test_s18_release_while_run_in_progress(self):
         released = claim("c1", "CSL-1", U1, more_edits=[edit(30, U1, "released")])
+        record = release_record("r1", "CSL-1", U1, 30)
         runs = [{"id": "run-1", "claim": U1, "started_at": ts(10), "ended_at": ts(40)}]
-        result = sim.evaluate(snapshot(50, [issue("CSL-1")], [released], runs=runs))
+        result = sim.evaluate(snapshot(50, [issue("CSL-1")], [released, record], runs=runs))
         self.assertEqual(codes(result), ["release_before_writers_stopped"])
         runs = [{"id": "run-1", "claim": U1, "started_at": ts(10), "ended_at": ts(20)}]
-        result = sim.evaluate(snapshot(50, [issue("CSL-1")], [released], runs=runs))
+        result = sim.evaluate(snapshot(50, [issue("CSL-1")], [released, record], runs=runs))
         self.assertEqual(codes(result), [])
         self.assertTrue(result["issues"]["CSL-1"]["claimable"])
 
@@ -569,7 +810,7 @@ class DecisionTests(unittest.TestCase):
     def test_s11_split_after_claiming_is_not_a_violation(self):
         issues = [issue("CSL-1", blocked_by=["CSL-2"]), issue("CSL-2", decision=decision(pings=(30,)))]
         work = claim("c1", "CSL-1", U1, more_edits=[edit(35, U1, "released")])
-        result = sim.evaluate(snapshot(60, issues, [work]))
+        result = sim.evaluate(snapshot(60, issues, [work, release_record("r1", "CSL-1", U1, 35)]))
         self.assertEqual(codes(result), [])
         self.assertTrue(result["issues"]["CSL-1"]["held"])
         late_hold = comment("h1", "CSL-1", 20, "HOLD CSL-1")
@@ -1308,12 +1549,152 @@ class StandingLoserTests(unittest.TestCase):
         self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], u4)
         self.assertEqual(codes(result), [])
 
-    def test_loser_may_still_win_after_the_original_releases(self):
+    def test_loser_does_not_win_after_the_original_releases(self):
+        # D15 as amended (CSL-446, 2b10e162): a settled loser never becomes
+        # winner, even once the claim that beat it is released.
         original = claim("c1", "CSL-1", U1, more_edits=[edit(50, U1, "released")])
         loser = claim("c3", "CSL-1", U3, at=10, session="grok/s3")
-        result = sim.evaluate(snapshot(60, [issue("CSL-1")], [original, loser]))
-        self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], U3)
+        record = release_record("r1", "CSL-1", U1, 50)
+        result = sim.evaluate(snapshot(60, [issue("CSL-1")], [original, record, loser]))
+        self.assertIsNone(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"])
+        self.assertEqual(codes(result), ["loser_confirmed", "loser_not_withdrawn"])
+        self.assertTrue(result["issues"]["CSL-1"]["claimable"])
 
+
+
+class SettledLoserTests(unittest.TestCase):
+    """D15 as amended by Lucas's decision on CSL-446 (comment 2b10e162): a claim that lost its issue race or an
+    overlap at read-back stays a settled loser. It never becomes winner or holder, its writes are reported, and it
+    blocks no one; it must withdraw and post a fresh claim."""
+
+    def push(self, uuid, issue_id, at):
+        return {"kind": "push", "issue": issue_id, "claim": uuid, "at": ts(at)}
+
+    def released_winner(self, at=50):
+        return [claim("c1", "CSL-1", U1, more_edits=[edit(at, U1, "released")]), release_record("r1", "CSL-1", U1, at)]
+
+    def test_a_race_loser_pushing_after_the_winner_releases_is_reported(self):
+        loser = claim("c3", "CSL-1", U3, at=10, session="grok/s3")
+        result = sim.evaluate(snapshot(60, [issue("CSL-1")], [*self.released_winner(), loser],
+                                       writes=[self.push(U3, "CSL-1", 55)]))
+        self.assertIsNone(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"])
+        self.assertEqual([(v["code"], v["claim"]) for v in result["violations"]],
+                         [("loser_confirmed", U3), ("loser_not_withdrawn", U3), ("write_by_non_winner", U3)])
+
+    def test_an_overlap_loser_pushing_after_the_blocker_releases_is_reported(self):
+        blocker = [claim("c1", "CSL-1", U1, more_edits=[edit(3, U1, "released")]), release_record("r1", "CSL-1", U1, 3)]
+        loser = claim("c2", "CSL-4", U2, at=1, session="cursor/s2")
+        result = sim.evaluate(snapshot(10, [issue("CSL-1"), issue("CSL-4")], [*blocker, loser],
+                                       writes=[self.push(U2, "CSL-4", 8)]))
+        self.assertIsNone(result["issues"]["CSL-4"]["claims"]["recursion"]["winner"])
+        self.assertEqual([(v["code"], v["claim"]) for v in result["violations"]],
+                         [("overlapping_claim", U2), ("write_by_non_winner", U2)])
+
+    def test_a_same_session_overlap_loss_stands_after_the_earlier_claim_releases(self):
+        earlier = [claim("c1", "CSL-1", U1, more_edits=[edit(3, U1, "released")]), release_record("r1", "CSL-1", U1, 3)]
+        later = claim("c2", "CSL-4", U2, at=1)
+        result = sim.evaluate(snapshot(10, [issue("CSL-1"), issue("CSL-4")], [*earlier, later],
+                                       writes=[self.push(U2, "CSL-4", 8)]))
+        self.assertIsNone(result["issues"]["CSL-4"]["claims"]["recursion"]["winner"])
+        self.assertEqual([(v["code"], v["claim"]) for v in result["violations"]],
+                         [("multiple_claims_per_session", U2), ("write_by_non_winner", U2)])
+
+    def test_a_fresh_claim_wins_over_a_settled_loser(self):
+        loser = claim("c3", "CSL-1", U3, at=10, session="grok/s3")
+        fresh = claim("c2", "CSL-1", U2, at=55, session="cursor/s2")
+        comments = [*self.released_winner(), loser, fresh]
+        for order in ("posted", "reversed"):
+            with self.subTest(order=order):
+                listed = comments if order == "posted" else comments[::-1]
+                result = sim.evaluate(snapshot(60, [issue("CSL-1")], listed, writes=[self.push(U2, "CSL-1", 58)]))
+                self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], U2)
+                self.assertEqual([(v["code"], v["claim"]) for v in result["violations"]],
+                                 [("loser_confirmed", U3), ("loser_not_withdrawn", U3)])
+
+    def test_a_loser_that_withdraws_may_claim_again(self):
+        withdrawn = {"at": ts(10.5), "body": claim_body(U3, "grok/s3", extra=(f"withdrawn: superseded by {U1}",))}
+        loser = claim("c3", "CSL-1", U3, at=10, session="grok/s3", confirm_after=None, more_edits=[withdrawn])
+        retry = claim("c4", "CSL-1", U2, at=55, session="grok/s3")
+        result = sim.evaluate(snapshot(60, [issue("CSL-1")], [*self.released_winner(), loser, retry],
+                                       writes=[self.push(U2, "CSL-1", 58)]))
+        self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], U2)
+        self.assertEqual(codes(result), [])
+
+    def test_a_settled_loser_does_not_block_an_overlapping_claim(self):
+        # A loses to C by branch; its sub-issue scope covers CSL-5, but as a
+        # settled loser it neither keeps CSL-5 unclaimable nor blocks B there.
+        issues = [issue("CSL-1"), issue("CSL-4"), issue("CSL-5", parent="CSL-4")]
+        c = claim("c1", "CSL-1", U1)
+        a = scoped("c2", "CSL-4", U2, "CSL-5", at=1, session="cursor/s2")
+        result = sim.evaluate(snapshot(10, issues, [c, a]))
+        self.assertTrue(result["issues"]["CSL-5"]["claimable"])
+        b = claim("c3", "CSL-5", U3, at=5, session="grok/s3", branch="csl-5-work")
+        for order in ("posted", "reversed"):
+            with self.subTest(order=order):
+                listed = [c, a, b] if order == "posted" else [b, a, c]
+                result = sim.evaluate(snapshot(10, issues, listed, writes=[self.push(U3, "CSL-5", 8)]))
+                self.assertEqual(result["issues"]["CSL-5"]["claims"]["recursion"]["winner"], U3)
+                self.assertEqual([(v["code"], v["claim"]) for v in result["violations"]], [("overlapping_claim", U2)])
+
+    def test_the_session_rule_still_counts_a_settled_loser(self):
+        # Unchanged by CSL-446: a session's unwithdrawn claim still counts
+        # against a second claim of that session on the same branch, though
+        # it no longer blocks that claim from winning.
+        winner = claim("c1", "CSL-1", U3, session="cursor/s2", branch="csl-1-other")
+        loser = claim("c2", "CSL-1", U1, at=1)
+        second = claim("c3", "CSL-4", U2, at=5)
+        result = sim.evaluate(snapshot(10, [issue("CSL-1"), issue("CSL-4")], [winner, loser, second]))
+        self.assertEqual(result["issues"]["CSL-4"]["claims"]["recursion"]["winner"], U2)
+        self.assertEqual([(v["code"], v["claim"]) for v in result["violations"]],
+                         [("loser_confirmed", U1), ("loser_not_withdrawn", U1), ("multiple_claims_per_session", U2)])
+
+    def test_a_takeover_still_wins_after_its_target_objects_and_releases_late(self):
+        # Unchanged by CSL-446: the claim a takeover names is not a race it
+        # can lose. Its target objects inside the wait and releases after it.
+        original = claim("c1", "CSL-1", U1, more_edits=[edit(155, U1, "heartbeat-at: back"), edit(170, U1, "released")])
+        taker = claim("c2", "CSL-1", U2, at=152, session="cursor/s2", extra=(f"takeover of {U1}",))
+        result = sim.evaluate(snapshot(180, [issue("CSL-1")], [original, release_record("r1", "CSL-1", U1, 170), taker],
+                                       writes=[self.push(U2, "CSL-1", 175)]))
+        self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], U2)
+        self.assertEqual(codes(result), [])
+
+    def test_a_long_chain_of_overlapping_claims_is_evaluated(self):
+        # Fable 5.1 review of 13e45861: 300 claims on one branch, listed
+        # newest first, once hit Python's recursion limit. Each later claim
+        # loses to the first.
+        n = 300
+        issues = [issue(f"CSL-{i + 1}") for i in range(n)]
+        uuids = [f"00000000-0000-4000-8000-{i + 1:012d}" for i in range(n)]
+        comments = [claim(f"c{i}", f"CSL-{i + 1}", uuids[i], at=i * 0.25, session=f"agent{i}/s", confirm_after=None)
+                    for i in range(n)][::-1]
+        result = sim.evaluate(snapshot(n * 0.25 + 10, issues, comments))
+        self.assertEqual(sorted((v["code"], v["detail"]) for v in result["violations"]),
+                         sorted(("overlapping_claim", f"branch overlaps {uuids[0]}") for _ in range(n - 1)))
+
+    def test_a_long_chain_inside_a_takeover_wait_is_evaluated(self):
+        # Fable 5.1 review of f950bf0a: a takeover's race settles at the end
+        # of its 15-minute wait, after 300 claims on one branch posted inside
+        # the wait; listed newest first, settling claim by claim recursed too
+        # deep. The result must not depend on the comment order.
+        n = 300
+        uuid = "00000000-0000-4000-8000-{:012d}".format
+        issues = [issue(f"CSL-{i}") for i in range(n + 1)]
+        comments = [claim("x", "CSL-0", uuid(n + 1), at=-200, session="old/s", confirm_after=None),
+                    claim("t", "CSL-0", uuid(n + 2), at=0, session="taker/s", confirm_after=None,
+                          extra=(f"takeover of {uuid(n + 1)}",))]
+        comments += [claim(f"c{i}", f"CSL-{i}", uuid(i), at=0.01 * i, session=f"agent{i}/s", confirm_after=None)
+                     for i in range(1, n + 1)]
+        comments.append(claim("late", "CSL-0", uuid(n + 3), at=0.01 * (n + 2), session="late/s", confirm_after=None))
+        newest_first = sim.evaluate(snapshot(30, issues, comments[::-1]))
+        self.assertEqual(newest_first, sim.evaluate(snapshot(30, issues, comments)))
+        self.assertEqual(newest_first["issues"]["CSL-0"]["claims"]["recursion"]["winner"], uuid(n + 2))
+
+    def test_the_loss_is_not_settled_inside_the_read_back_window(self):
+        # Before the loser's read-back deadline it is still a live claim.
+        loser = claim("c2", "CSL-1", U2, at=9.5, session="cursor/s2", confirm_after=None)
+        result = sim.evaluate(snapshot(10, [issue("CSL-1")], [claim("c1", "CSL-1", U1), loser]))
+        self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["live_claims"], [U1, U2])
+        self.assertEqual(codes(result), [])
 
 class TakeoverEffectTests(unittest.TestCase):
     """Devin's private review of recursion#258 (CSL-389 comment 928ee10b)."""
@@ -1329,6 +1710,8 @@ class TakeoverEffectTests(unittest.TestCase):
         for how in ("withdrawn: cancelled", "released"):
             with self.subTest(how=how):
                 comments = [claim("c1", "CSL-1", U1), self.ended_taker(155, how), fresh]
+                if how == "released":
+                    comments.append(release_record("r1", "CSL-1", U2, 155, session="cursor/s2"))
                 result = sim.evaluate(snapshot(175, [issue("CSL-1")], comments, writes=writes))
                 self.assertIsNone(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"])
                 self.assertEqual(codes(result), ["claim_without_takeover", "write_by_non_winner"])
@@ -1339,7 +1722,9 @@ class TakeoverEffectTests(unittest.TestCase):
                                                                       extra=(f"takeover of {U1}", "released"))}])
         fresh = claim("c3", "CSL-1", U3, at=172, session="grok/s3")
         writes = [{"kind": "push", "issue": "CSL-1", "claim": U3, "at": ts(175)}]
-        result = sim.evaluate(snapshot(180, [issue("CSL-1")], [claim("c1", "CSL-1", U1), taker, fresh], writes=writes))
+        record = release_record("r1", "CSL-1", U2, 170, session="cursor/s2")
+        result = sim.evaluate(snapshot(180, [issue("CSL-1")], [claim("c1", "CSL-1", U1), taker, record, fresh],
+                                       writes=writes))
         self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], U3)
         self.assertEqual(codes(result), [])
 
@@ -1369,7 +1754,10 @@ class TakeoverEffectTests(unittest.TestCase):
                               more_edits=[{"at": ts(127), "body": claim_body(U2, "cursor/s2", confirmed=ts(125, 70),
                                                                               extra=(f"takeover of {U1}", how))}])
                 early.update(deleted=True, deleted_at=ts(130))
-                result = sim.evaluate(snapshot(140, [issue("CSL-1")], [claim("c1", "CSL-1", U1), early]))
+                comments = [claim("c1", "CSL-1", U1), early]
+                if how == "released":
+                    comments.append(release_record("r1", "CSL-1", U2, 127, session="cursor/s2"))
+                result = sim.evaluate(snapshot(140, [issue("CSL-1")], comments))
                 self.assertNotIn("takeover_refused", codes(result))
 
     def test_deletion_alone_keeps_the_fault(self):
@@ -1660,6 +2048,164 @@ class PrePrefixDecisionTests(unittest.TestCase):
         self.assertFalse(result["decisions"]["CSL-3"]["answered"])
 
 
+class CrossSessionOverlapTests(unittest.TestCase):
+    """Codex P1 on #276: claims from different sessions in one repository may
+    not overlap by issue scope or branch (Lucas, 18:54Z 2026-10-21, relayed)."""
+
+    def family(self):
+        return [issue("CSL-1"), issue("CSL-2", status="In Progress", parent="CSL-1"), issue("CSL-4")]
+
+    def evaluate(self, now, comments, writes=()):
+        return sim.evaluate(snapshot(now, self.family(), comments, writes=list(writes)))
+
+    def test_child_claim_after_a_parent_scoped_claim_overlaps(self):
+        child = claim("c2", "CSL-2", U2, at=1, session="cursor/s2", branch="csl-2-work")
+        result = self.evaluate(10, [scoped("c1", "CSL-1", U1, "CSL-2"), child])
+        self.assertEqual(codes(result), ["overlapping_claim"])
+
+    def test_parent_scoped_claim_after_a_child_claim_overlaps(self):
+        parent = scoped("c2", "CSL-1", U2, "CSL-2", at=1, session="cursor/s2", branch="csl-1-parent")
+        result = self.evaluate(10, [claim("c1", "CSL-2", U1, branch="csl-2-work"), parent])
+        self.assertEqual(codes(result), ["overlapping_claim"])
+
+    def test_two_issues_on_one_branch_across_sessions_overlap(self):
+        result = self.evaluate(10, [claim("c1", "CSL-1", U1), claim("c2", "CSL-4", U2, at=1, session="cursor/s2")])
+        self.assertEqual(codes(result), ["overlapping_claim"])
+
+    def test_writes_by_the_later_overlapping_claim_are_flagged(self):
+        writes = [{"kind": "push", "issue": "CSL-4", "claim": U2, "at": ts(5)},
+                  {"kind": "push", "issue": "CSL-1", "claim": U1, "at": ts(6)}]
+        result = self.evaluate(10, [claim("c1", "CSL-1", U1), claim("c2", "CSL-4", U2, at=1, session="cursor/s2")], writes)
+        self.assertEqual(codes(result), ["overlapping_claim", "write_while_overlapping"])
+
+    def test_withdrawing_at_read_back_is_clean(self):
+        withdrawn = claim("c2", "CSL-4", U2, at=1, session="cursor/s2", confirm_after=None,
+                          more_edits=[{"at": ts(2.5), "body": claim_body(U2, "cursor/s2",
+                                                                          extra=(f"withdrawn: superseded by {U1}",))}])
+        result = self.evaluate(10, [claim("c1", "CSL-1", U1), withdrawn])
+        self.assertEqual(codes(result), [])
+
+    def test_not_judged_before_the_read_back_window_ends(self):
+        fresh = claim("c2", "CSL-4", U2, at=9.5, session="cursor/s2", confirm_after=None)
+        result = self.evaluate(10, [claim("c1", "CSL-1", U1), fresh])
+        self.assertEqual(codes(result), [])
+
+    def test_other_repositories_are_independent(self):
+        elsewhere = claim("c2", "CSL-4", U2, at=1, session="cursor/s2", extra=("repo: other-repo",))
+        result = self.evaluate(10, [claim("c1", "CSL-1", U1), elsewhere])
+        self.assertEqual(codes(result), [])
+
+    def test_different_issues_and_branches_do_not_overlap(self):
+        result = self.evaluate(10, [claim("c1", "CSL-1", U1),
+                                    claim("c2", "CSL-4", U2, at=1, session="cursor/s2", branch="csl-4-work")])
+        self.assertEqual(codes(result), [])
+
+    def test_a_claim_released_before_the_overlap_does_not_block(self):
+        released = claim("c1", "CSL-1", U1, more_edits=[edit(3, U1, "released")])
+        later = claim("c2", "CSL-4", U2, at=5, session="cursor/s2")
+        writes = [{"kind": "push", "issue": "CSL-4", "claim": U2, "at": ts(8)}]
+        self.assertEqual(codes(self.evaluate(10, [released, release_record("r1", "CSL-1", U1, 3), later], writes)), [])
+
+    def test_an_expired_unreleased_claim_still_blocks(self):
+        # As on one issue, an expired claim is not bypassed without a release,
+        # revoke or takeover.
+        later = claim("c2", "CSL-4", U2, at=200, session="cursor/s2")
+        result = self.evaluate(210, [claim("c1", "CSL-1", U1), later])
+        self.assertEqual(codes(result), ["overlapping_claim"])
+
+    def test_an_expired_claim_released_later_stops_blocking(self):
+        lapsed = claim("c1", "CSL-1", U1, more_edits=[edit(190, U1, "released")])
+        later = claim("c2", "CSL-4", U2, at=200, session="cursor/s2")
+        result = self.evaluate(210, [lapsed, release_record("r1", "CSL-1", U1, 190), later])
+        self.assertEqual(codes(result), [])
+
+    def test_an_overlapping_claim_is_not_published_as_winner(self):
+        # Devin 4341055198: the loser cannot win its own issue. Once its loss
+        # is settled at read-back it is no longer live and does not keep its
+        # issue unclaimable (CSL-446, 2b10e162); it is still reported.
+        result = self.evaluate(10, [claim("c1", "CSL-1", U1), claim("c2", "CSL-4", U2, at=1, session="cursor/s2")])
+        self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], U1)
+        self.assertEqual(result["issues"]["CSL-4"]["claims"]["recursion"]["winner"], None)
+        self.assertEqual(result["issues"]["CSL-4"]["claims"]["recursion"]["live_claims"], [])
+        self.assertTrue(result["issues"]["CSL-4"]["claimable"])
+        self.assertEqual(codes(result), ["overlapping_claim"])
+
+    def test_a_late_confirmation_after_the_blocker_releases_is_still_a_loss(self):
+        # Devin 4341055382: the loss is settled at the read-back deadline, as
+        # in a race on one issue; the blocker releasing afterwards does not
+        # erase it, and the settled loser does not win (CSL-446, 2b10e162).
+        released = claim("c1", "CSL-1", U1, more_edits=[edit(3, U1, "released")])
+        late = claim("c2", "CSL-4", U2, at=1, session="cursor/s2", confirm_after=180)
+        result = self.evaluate(10, [released, release_record("r1", "CSL-1", U1, 3), late])
+        self.assertEqual(codes(result), ["overlapping_claim"])
+        self.assertIsNone(result["issues"]["CSL-4"]["claims"]["recursion"]["winner"])
+
+    def test_a_blocker_released_within_the_read_back_window_is_no_loss(self):
+        released = claim("c1", "CSL-1", U1, more_edits=[edit(1.5, U1, "released")])
+        later = claim("c2", "CSL-4", U2, at=1, session="cursor/s2", confirm_after=180)
+        writes = [{"kind": "push", "issue": "CSL-4", "claim": U2, "at": ts(5)}]
+        self.assertEqual(codes(self.evaluate(10, [released, release_record("r1", "CSL-1", U1, 1.5), later], writes)), [])
+
+    def test_a_confirmation_before_the_deadline_is_checked_at_its_own_time(self):
+        early = claim("c2", "CSL-4", U2, at=1, session="cursor/s2", confirm_after=30)
+        result = self.evaluate(10, [claim("c1", "CSL-1", U1), early])
+        self.assertEqual(codes(result), ["confirmed_too_early", "overlapping_claim"])
+
+    def test_a_settled_overlap_loser_does_not_win_its_issue_race(self):
+        # Devin 4341276529 / Samir 5605467453: C blocks A by branch; B is a
+        # later claim on A's issue. A's loss is settled at its read-back
+        # deadline, before B's race is decided, so A no longer blocks B and B
+        # wins and holds CSL-4 (CSL-446, 2b10e162).
+        c = claim("c1", "CSL-1", U1)
+        a = claim("c2", "CSL-4", U2, at=1, session="cursor/s2")
+        b = claim("c3", "CSL-4", U3, at=1.5, session="grok/s3", branch="csl-4-other")
+        writes = [{"kind": "push", "issue": "CSL-4", "claim": U3, "at": ts(5)}]
+        result = self.evaluate(10, [c, a, b], writes)
+        self.assertEqual([(v["code"], v["claim"]) for v in result["violations"]], [("overlapping_claim", U2)])
+        self.assertEqual(result["issues"]["CSL-4"]["claims"]["recursion"]["winner"], U3)
+
+    def test_a_parent_scoped_claim_alone_holds_the_child(self):
+        # Codex 4343468463 / Samir 5608007390: with only the parent claim live,
+        # its scoped child is held by it and is not claimable.
+        result = self.evaluate(10, [scoped("c1", "CSL-1", U1, "CSL-2")])
+        self.assertEqual(codes(result), [])
+        child = result["issues"]["CSL-2"]
+        self.assertEqual(child["claims"]["recursion"], {"live_claims": [U1], "winner": U1, "must_reread": False})
+        self.assertFalse(child["claimable"])
+        self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], U1)
+
+    def test_a_released_parent_claim_no_longer_covers_the_child(self):
+        released = scoped("c1", "CSL-1", U1, "CSL-2", more_edits=[edit(5, U1, "released")])
+        result = self.evaluate(10, [released, release_record("r1", "CSL-1", U1, 5)])
+        self.assertEqual(codes(result), [])
+        self.assertNotIn("recursion", result["issues"]["CSL-2"]["claims"])
+        self.assertTrue(result["issues"]["CSL-2"]["claimable"])
+
+    def test_an_expired_unreleased_parent_claim_keeps_the_child_unclaimable(self):
+        # Codex 4343611603: the expired parent still blocks a child claim, so
+        # the child is not claimable; it is not listed as live or as holder.
+        result = self.evaluate(210, [scoped("c1", "CSL-1", U1, "CSL-2")])
+        self.assertEqual(codes(result), [])
+        self.assertNotIn("recursion", result["issues"]["CSL-2"]["claims"])
+        self.assertFalse(result["issues"]["CSL-2"]["claimable"])
+        released = scoped("c1", "CSL-1", U1, "CSL-2", more_edits=[edit(190, U1, "released")])
+        result = self.evaluate(210, [released, release_record("r1", "CSL-1", U1, 190)])
+        self.assertEqual(codes(result), [])
+        self.assertTrue(result["issues"]["CSL-2"]["claimable"])
+
+    def test_a_later_child_claim_does_not_displace_the_covering_parent(self):
+        child = claim("c2", "CSL-2", U2, at=1, session="cursor/s2", branch="csl-2-work")
+        result = self.evaluate(10, [scoped("c1", "CSL-1", U1, "CSL-2"), child])
+        self.assertEqual(codes(result), ["overlapping_claim"])
+        self.assertEqual(result["issues"]["CSL-2"]["claims"]["recursion"]["winner"], U1)
+        # The child claim's loss is settled at read-back, so it is not live (CSL-446, 2b10e162).
+        self.assertEqual(result["issues"]["CSL-2"]["claims"]["recursion"]["live_claims"], [U1])
+
+    def test_same_issue_races_keep_their_own_codes(self):
+        result = self.evaluate(10, [claim("c1", "CSL-1", U1), claim("c2", "CSL-1", U2, at=1, session="cursor/s2")])
+        self.assertEqual(codes(result), ["loser_confirmed", "loser_not_withdrawn"])
+
+
 class LapsedClaimResumeTests(unittest.TestCase):
     """S31: session resumes after its claim lapsed (CSL-379). A renewal edit after lease plus grace is reported
     and does not revive the claim; the session releases it on lease expiry and takes a fresh claim."""
@@ -1701,7 +2247,8 @@ class LapsedClaimResumeTests(unittest.TestCase):
     def test_release_on_lease_expiry_then_fresh_claim_is_clean(self):
         released = claim("c1", "CSL-1", U1, more_edits=[edit(600, U1, "released")])
         fresh = claim("c2", "CSL-1", U2, at=601)
-        result = sim.evaluate(snapshot(610, [issue("CSL-1")], [released, fresh], writes=[self.push(U2, 605)]))
+        record = release_record("r1", "CSL-1", U1, 600, reason="lease expiry")
+        result = sim.evaluate(snapshot(610, [issue("CSL-1")], [released, record, fresh], writes=[self.push(U2, 605)]))
         self.assertEqual(result["issues"]["CSL-1"]["claims"]["recursion"]["winner"], U2)
         self.assertEqual(codes(result), [])
 
@@ -1717,13 +2264,237 @@ class LapsedClaimResumeTests(unittest.TestCase):
             with self.subTest(case=name):
                 renewed = claim("c1", "CSL-1", U1, more_edits=[edit(100, U1, f"heartbeat-at: {value}"),
                                                                edit(110, U1, f"heartbeat-at: {value}", "released")])
-                self.assertEqual(codes(sim.evaluate(snapshot(120, [issue("CSL-1")], [renewed]))), expected)
+                record = release_record("r1", "CSL-1", U1, 110)
+                self.assertEqual(codes(sim.evaluate(snapshot(120, [issue("CSL-1")], [renewed, record]))), expected)
 
     def test_late_renewal_with_a_stale_heartbeat_reports_both(self):
         lapsed = claim("c1", "CSL-1", U1, more_edits=[edit(600, U1, f"heartbeat-at: {ts(60)}")])
         result = sim.evaluate(snapshot(610, [issue("CSL-1")], [lapsed]))
         self.assertEqual(codes(result), ["heartbeat_time_mismatch", "renewed_after_expiry"])
 
+
+
+class ReleaseRecordTests(unittest.TestCase):
+    """A released claim needs a `release v1` record (CSL-445, receipts 0d05a0b0 and 12051696)."""
+
+    def released(self, *extra, **kwargs):
+        return claim("c1", "CSL-1", U1, more_edits=[edit(30, U1, "released", *extra)], **kwargs)
+
+    def violations(self, *comments, now=50, **rest):
+        issues = [issue("CSL-1"), issue("CSL-4")]
+        result = sim.evaluate(snapshot(now, issues, [self.released(), *comments], **rest))
+        return [(v["code"], v["claim"], v["detail"]) for v in result["violations"]]
+
+    def missing(self, detail):
+        return [("release_without_record", U1, detail)]
+
+    def record_with(self, *lines, at=30, session="claude/s1"):
+        return comment("r1", "CSL-1", at, "\n".join([f"Agent ({session}, for Lucas): release v1", f"claim: {U1}", *lines]))
+
+    def test_release_without_record(self):
+        self.assertEqual(self.violations(), self.missing("no record"))
+
+    def test_record_naming_another_claim(self):
+        self.assertEqual(self.violations(release_record("r1", "CSL-1", U2, 31)), self.missing("no record"))
+
+    def test_record_timing(self):
+        before = release_record("r1", "CSL-1", U1, 29)
+        edited_later = dict(before, edits=[{"at": ts(35), "body": before["body"] + "\nnote: edited"}])
+        cases = {
+            "before the release": (before, self.missing("no record")),
+            "at the release": (release_record("r1", "CSL-1", U1, 30), []),
+            "after the release": (release_record("r1", "CSL-1", U1, 45), []),
+            "posted before, edited after": (edited_later, self.missing("no record")),
+        }
+        for name, (record, expected) in cases.items():
+            with self.subTest(case=name):
+                self.assertEqual(self.violations(record), expected)
+
+    def test_record_missing_fields(self):
+        cases = {
+            "two omitted": ({"omit": ("done", "files")}, "missing: done, files"),
+            "whitespace only": ({"evidence": "   "}, "missing: evidence"),
+            "empty": ({"open": ""}, "missing: open"),
+            "all five": ({"omit": ("done", "evidence", "open", "next", "files")},
+                         "missing: done, evidence, files, next, open"),
+            "no claim line": ({"omit": ("claim",)}, "no record"),
+        }
+        for name, (fields, detail) in cases.items():
+            with self.subTest(case=name):
+                self.assertEqual(self.violations(release_record("r1", "CSL-1", U1, 30, **fields)), self.missing(detail))
+
+    def test_record_reason(self):
+        valid = ("done", "handoff", "lease expiry", "abandoned", "decision needed (CSL-5)", "done (recursion part)",
+                 "lease expiry (handoff to a fresh claim from this same session)", "decision needed (CSL-5) (waiting)")
+        invalid = ("decision needed", "decision needed (CSL-)", "finished", "", "Done", "done.", "done (a) (b)",
+                   "done ()", "done(recursion part)", "done (recursion part", "done\nlater text")
+        for reason in valid:
+            with self.subTest(reason=reason):
+                self.assertEqual(self.violations(release_record("r1", "CSL-1", U1, 30, reason=reason)), [])
+        for reason in invalid:
+            with self.subTest(reason=reason):
+                self.assertEqual(self.violations(release_record("r1", "CSL-1", U1, 30, reason=reason)),
+                                 self.missing("invalid reason"))
+        both = release_record("r1", "CSL-1", U1, 30, reason="", omit=("next",))
+        self.assertEqual(self.violations(both), self.missing("missing: next; invalid reason"))
+
+    def test_field_names_may_carry_one_note(self):
+        rest = ["reason: done", "done: x", "evidence: x", "next: x", "files: x"]
+        self.assertEqual(self.violations(self.record_with(*rest, "open (lessons for D12, CSL-424 and CSL-425): x")), [])
+        for line in ("open (a) (b): x", "open (): x", "open(lessons): x", "Open: x", "- open: x", "**open:** x",
+                     "**open**: x", "open : x", " open: x", "opened: x"):
+            with self.subTest(line=line):
+                self.assertEqual(self.violations(self.record_with(*rest, line)), self.missing("missing: open"))
+
+    def test_an_unclosed_note_is_rejected_quickly(self):
+        # Fable 5.1 review of 7e02948: the note pattern was quadratic on an unclosed "(".
+        long = "x" * 20000
+        rest = ["done: x", "evidence: x", "next: x", "files: x"]
+        started = time.perf_counter()
+        self.assertEqual(self.violations(self.record_with(f"reason: done ({long}", *rest, "open: x")),
+                         self.missing("invalid reason"))
+        self.assertEqual(self.violations(self.record_with("reason: done", *rest, f"open ({long}: x")),
+                         self.missing("missing: open"))
+        self.assertLess(time.perf_counter() - started, 1.0)
+
+    def test_values_continue_to_the_next_key_line(self):
+        cases = {
+            "bullets under a key": (["evidence:", "- `linux` passed", "- review 123"], []),
+            "unknown keys are value text": (["evidence:", "pr: recursion#1"], []),
+            "blank line then the next key": (["evidence:", ""], self.missing("missing: evidence")),
+        }
+        for name, (lines, expected) in cases.items():
+            with self.subTest(case=name):
+                record = self.record_with("reason: done", "done: x", *lines, "open: x", "next: x", "files: x")
+                self.assertEqual(self.violations(record), expected)
+
+    def test_first_occurrence_of_a_key_counts(self):
+        rest = ["reason: done", "evidence: x", "open: x", "next: x", "files: x"]
+        self.assertEqual(self.violations(self.record_with("done:", *rest, "done: later")), self.missing("missing: done"))
+        self.assertEqual(self.violations(self.record_with("done: x", *rest, "done:")), [])
+        self.assertEqual(self.violations(self.record_with("reason: finished", "done: x", *rest[1:], "reason: done")),
+                         self.missing("invalid reason"))
+
+    def test_release_on_lease_expiry_needs_a_record(self):
+        lapsed = claim("c1", "CSL-1", U1, more_edits=[edit(600, U1, "released")])
+        record = release_record("r1", "CSL-1", U1, 600, reason="lease expiry")
+        for name, comments, expected in (("no record", [lapsed], ["release_without_record"]),
+                                         ("record", [lapsed, record], [])):
+            with self.subTest(case=name):
+                self.assertEqual(codes(sim.evaluate(snapshot(610, [issue("CSL-1")], comments))), expected)
+
+    def test_withdrawal_needs_no_record(self):
+        cases = {
+            "withdrawn": ([edit(30, U1, "withdrawn: not needed")], []),
+            "withdrawn, then released": ([edit(20, U1, "withdrawn: x"), edit(30, U1, "withdrawn: x", "released")], []),
+            "released, then withdrawn": ([edit(30, U1, "released"), edit(40, U1, "released", "withdrawn: x")],
+                                         ["release_without_record"]),
+        }
+        for name, (edits, expected) in cases.items():
+            with self.subTest(case=name):
+                comments = [claim("c1", "CSL-1", U1, more_edits=edits)]
+                self.assertEqual(codes(sim.evaluate(snapshot(50, [issue("CSL-1")], comments))), expected)
+
+    def test_one_valid_record_is_enough(self):
+        incomplete = release_record("r1", "CSL-1", U1, 30, omit=("done",))
+        self.assertEqual(self.violations(incomplete, release_record("r2", "CSL-1", U1, 31)), [])
+
+    def test_the_most_complete_record_is_described(self):
+        worse = release_record("r1", "CSL-1", U1, 30, omit=("done", "files"))
+        better = release_record("r2", "CSL-1", U1, 40, omit=("next",))
+        self.assertEqual(self.violations(worse, better), self.missing("missing: next"))
+        self.assertEqual(self.violations(better, worse), self.missing("missing: next"))
+        # On a tie the earlier record is described, whatever the comment order.
+        tie = release_record("r3", "CSL-1", U1, 35, omit=("done",))
+        self.assertEqual(self.violations(better, tie), self.missing("missing: done"))
+        self.assertEqual(self.violations(tie, better), self.missing("missing: done"))
+        # Time decides a tie, not the names of the missing fields (Codex audit of 7e02948).
+        early = release_record("r3", "CSL-1", U1, 31, omit=("next",))
+        late = release_record("r4", "CSL-1", U1, 40, omit=("done",))
+        self.assertEqual(self.violations(early, late), self.missing("missing: next"))
+        self.assertEqual(self.violations(late, early), self.missing("missing: next"))
+        bad_reason = release_record("r4", "CSL-1", U1, 40, reason="finished")
+        self.assertEqual(self.violations(early, bad_reason), self.missing("missing: next"))
+        self.assertEqual(self.violations(bad_reason, early), self.missing("missing: next"))
+
+    def test_record_on_another_issue(self):
+        self.assertEqual(self.violations(release_record("r1", "CSL-4", U1, 30)), self.missing("no record"))
+
+    def test_record_from_another_session(self):
+        self.assertEqual(self.violations(release_record("r1", "CSL-1", U1, 30, session="cursor/s2")), [])
+
+    def test_record_needs_a_complete_agent_prefix(self):
+        fields = [f"{key}: x" for key in ("done", "evidence", "open", "next", "files")]
+        bodies = {
+            "no session": "Agent (claude, for Lucas): release v1",
+            "no developer": "Agent (claude/s1): release v1",
+            "no prefix": "release v1",
+        }
+        for name, first in bodies.items():
+            with self.subTest(case=name):
+                body = "\n".join([first, f"claim: {U1}", "reason: done", *fields])
+                self.assertEqual(self.violations(comment("r1", "CSL-1", 30, body)), self.missing("no record"))
+
+    def test_quoted_records_do_not_count(self):
+        quoted = release_record("x", "CSL-1", U1, 0)["body"]
+        cases = {
+            "agent comment quoting a record": "Agent (claude/s1, for Lucas): the release v1 record would be\n```\n"
+                                              + quoted + "\n```",
+            "human comment quoting a record": "Here is the record:\n" + quoted,
+        }
+        for name, body in cases.items():
+            with self.subTest(case=name):
+                self.assertEqual(self.violations(comment("r1", "CSL-1", 30, body)), self.missing("no record"))
+
+    def test_header_must_be_on_the_posted_first_line(self):
+        record = release_record("r1", "CSL-1", U1, 30)
+        promoted = comment("r1", "CSL-1", 30, "Agent (claude/s1, for Lucas): notes")
+        promoted["edits"] = [{"at": ts(35), "body": record["body"]}]
+        self.assertEqual(self.violations(promoted), self.missing("no record"))
+        completed = release_record("r1", "CSL-1", U1, 30, omit=("files",))
+        completed["edits"] = [{"at": ts(35), "body": record["body"]}]
+        self.assertEqual(self.violations(completed), [])
+
+    def test_deleted_record(self):
+        for name, deleted_at in (("undated", None), ("dated", ts(40))):
+            with self.subTest(case=name):
+                record = release_record("r1", "CSL-1", U1, 30)
+                record.update(deleted=True, deleted_at=deleted_at)
+                self.assertEqual(self.violations(record), self.missing("no record"))
+
+    def test_record_edited_to_drop_a_field(self):
+        record = release_record("r1", "CSL-1", U1, 30)
+        dropped = release_record("r1", "CSL-1", U1, 30, omit=("evidence",))
+        record["edits"] = [{"at": ts(35), "body": dropped["body"]}]
+        self.assertEqual(self.violations(record), self.missing("missing: evidence"))
+
+    def test_revoke_and_release(self):
+        cases = {
+            "revoked before the release": (25, []),
+            "revoked at the release": (30, []),
+            "revoked after the release": (35, self.missing("no record")),
+        }
+        for name, (at, expected) in cases.items():
+            with self.subTest(case=name):
+                self.assertEqual(self.violations(comment("h1", "CSL-1", at, f"REVOKE CLAIM {U1}")), expected)
+
+    def test_released_then_deleted_claim(self):
+        for name, deleted_at, expected in (("dated deletion", ts(40), ["release_without_record"]),
+                                           ("undated deletion", None, [])):
+            with self.subTest(case=name):
+                deleted = self.released()
+                deleted.update(deleted=True, deleted_at=deleted_at)
+                self.assertEqual(codes(sim.evaluate(snapshot(50, [issue("CSL-1")], [deleted]))), expected)
+
+    def test_developer_approved_comment_is_not_a_record(self):
+        record = release_record("r1", "CSL-1", U1, 30)
+        record["body"] += f"\ndeveloper-approved: Lucas, exact text confirmed {ts(29)}, session s1"
+        self.assertEqual(self.violations(record), self.missing("no record"))
+
+    def test_record_and_run_still_in_progress(self):
+        runs = [{"id": "run-1", "claim": U1, "started_at": ts(10), "ended_at": ts(40)}]
+        self.assertEqual(self.violations(runs=runs), [("release_before_writers_stopped", U1, "run-1"),
+                                                      ("release_without_record", U1, "no record")])
 
 if __name__ == "__main__":
     unittest.main()

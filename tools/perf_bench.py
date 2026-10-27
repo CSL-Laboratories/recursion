@@ -34,6 +34,22 @@ PAIRED_ROUND_S = 0.05
 PAIRED_WARMUP_S = 0.02
 PAIRED_DEADLINE_S = 40
 DAG_NODES = 32
+REPLAY_EVENTS = 24
+_BENCH_GENESIS = {
+    "genesis_schema_version": "m1a-genesis-1",
+    "stream_id": "STREAM-PERF",
+    "current_pause_epoch": 0,
+    "current_pause_policy_ref": {
+        "policy_id": "POLICY-PAUSE",
+        "policy_version": 1,
+        "content_digest": "a2ee2a1c66b179baed3cade14f163917cf3d28915960eed12994a72e1707a378",
+    },
+}
+_BENCH_PRIVACY = {
+    "policy_id": "POLICY-PRIVACY",
+    "policy_version": 1,
+    "content_digest": "49b764f8e8bad681fcb62a8662f156f67808d236021e3e853777aa9bf05d7d22",
+}
 
 _GUARD_INSTALLED = False
 
@@ -80,14 +96,18 @@ def load_product(root: Path):
     sys.path = [path for path in sys.path if path != root_s]
     sys.path.insert(0, root_s)
     _drop_imported_product()
+    from scripts.v3.planning.replay.kernel import genesis, reduce  # noqa: WPS433
     from scripts.v3.planning.validation.canonical import (  # noqa: WPS433
-        decode, digest, validate_policy_fixture,
+        decode, digest, seal, validate_policy_fixture,
     )
     from scripts.v3.planning.validation.contracts import validate_dag  # noqa: WPS433
 
     return SimpleNamespace(
         decode=decode,
         digest=digest,
+        seal=seal,
+        genesis=genesis,
+        reduce=reduce,
         validate_policy_fixture=validate_policy_fixture,
         validate_dag=validate_dag,
     )
@@ -152,6 +172,52 @@ def _dag(nodes: int = DAG_NODES):
     return plan, tasks
 
 
+def _replay_stream(product, count: int = REPLAY_EVENTS):
+    """Deterministic OwnerIntentRecorded chain used by the replay reduce bench."""
+
+    state = product.genesis(_BENCH_GENESIS)
+    events = []
+    for index in range(1, count + 1):
+        record = product.seal({
+            "object_type": "owner-intent",
+            "schema_version": "m1a-owner-intent-1",
+            "id": f"INTENT-PERF-{index:04d}",
+            "version": 1,
+            "created_by_actor_id": "OWNER-LUCAS",
+            "created_under_lease": None,
+            "causation_id": f"CMD-PERF-{index:04d}",
+            "correlation_id": "CORR-M1A",
+            "created_logical_time": index,
+            "payload": {
+                "intent_text": f"perf replay intent {index:04d}",
+                "source_kind": "owner-prompt",
+                "source_digest": "f6abb8b64b9d1c555085b9c1b91a9175ee87092a7d1793d377389b2f37ea7c58",
+                "privacy_policy_ref": dict(_BENCH_PRIVACY),
+                "supersedes_ref": None,
+            },
+        })
+        event = {
+            "event_schema_version": "m1a-event-1",
+            "event_id": f"EV-PERF-{index:04d}",
+            "stream_id": state["stream_id"],
+            "sequence": index,
+            "previous_event_digest": state["last_event_digest"] if not events else events[-1]["content_digest"],
+            "logical_time": index,
+            "command_id": f"CMD-PERF-{index:04d}",
+            "command_digest": "ab" * 32,
+            "event_type": "OwnerIntentRecorded",
+            "primary_record": record,
+            "related_records": [],
+        }
+        event["state_delta_digest"] = product.digest({
+            "event_type": event["event_type"],
+            "primary_record": event["primary_record"],
+            "related_records": event["related_records"],
+        })
+        events.append(product.seal(event))
+    return state, events
+
+
 def load_workload() -> dict:
     try:
         payload = json.loads(WORKLOAD_PATH.read_text(encoding="utf-8"))
@@ -190,11 +256,21 @@ def build_cases(product, workload: dict) -> list[tuple[str, object]]:
         if error is not None:
             raise RuntimeError(error)
 
+    genesis_state, replay_events = _replay_stream(product)
+
+    def replay_reduce() -> None:
+        state = genesis_state
+        for event in replay_events:
+            state = product.reduce(state, event)
+        if state["last_event_sequence"] != len(replay_events):
+            raise RuntimeError("replay reduce did not consume the frozen stream")
+
     return [
         ("canonical_digest", canonical_digest),
         ("decode_command", decode_command),
         ("validate_policy", validate_policy),
         ("validate_dag", validate_dag),
+        ("replay_reduce", replay_reduce),
     ]
 
 

@@ -44,7 +44,7 @@ class EvidenceTests(unittest.TestCase):
                     "head_repository": {"full_name": REPO}, "pull_requests": [{"number": 7}]}
         self.job = {"id": 123, "run_id": 10, "run_attempt": 1, "name": "devin-review-fix", "status": "completed", "conclusion": "failure",
                     "steps": [{"number": 8, "name": m.CONTEXT_PREFIX + HEAD + ":" + self.key["fingerprint"], "conclusion": "success"},
-                              {"number": 9, "name": "Run anthropics/claude-code-action@v1", "conclusion": "failure"}]}
+                              {"number": 9, "name": f"Run {m.ACTION_USES}", "conclusion": "failure"}]}
         self.calls = []
         self.active = 0
         self.private = False
@@ -321,7 +321,7 @@ class EvidenceTests(unittest.TestCase):
         import re
         import textwrap
         text = (ROOT / ".github/workflows/claude.yml").read_text(encoding="utf-8")
-        self.assertEqual(text.count('name: "Fixer attempt ${{ steps.eligibility.outputs.attempt_key }}"'), 1)
+        self.assertEqual(text.count('name: "Fixer attempt ${{ needs.fixer-prepare.outputs.attempt_key }}"'), 1)
         embedded = textwrap.dedent(text.split("<<'CLAUDE_FIXER_RECEIPTS'\n")[1].split("          CLAUDE_FIXER_RECEIPTS")[0]).rstrip()
         self.assertEqual(embedded, (ROOT / "scripts/ci/claude_fixer_receipts.py").read_text().rstrip())
         # Parse the supported indentation/step schema without adding a YAML
@@ -330,15 +330,25 @@ class EvidenceTests(unittest.TestCase):
         header, steps_text = job.split("    steps:\n", 1)
         self.assertNotRegex(header, r"(?m)^    (name|strategy|uses):")
         steps = re.split(r"(?m)^      - ", steps_text)[1:]
-        action = [(i, s) for i, s in enumerate(steps) if f"        uses: {m.ACTION_USES}\n" in s]
-        context = [(i, s) for i, s in enumerate(steps) if s.startswith('name: "Fixer attempt ${{ steps.eligibility.outputs.attempt_key }}"\n')]
-        eligibility = [s for s in steps if "        id: eligibility\n" in s or s.startswith("id: eligibility\n")]
+        action = [(i, s) for i, s in enumerate(steps) if f"        uses: {m.ACTION_USES}" in s]
+        context = [(i, s) for i, s in enumerate(steps) if s.startswith('name: "Fixer attempt ${{ needs.fixer-prepare.outputs.attempt_key }}"\n')]
+        # CSL-414: locked eligibility moved to the trusted fixer-prepare job; the model job
+        # keeps the devin-review-fix name and its context step before the action step.
+        prepare = re.split(r"\n  [A-Za-z0-9_-]+:\n", text.split("\n  fixer-prepare:\n", 1)[1])[0]
+        eligibility = [s for s in re.split(r"(?m)^      - ", prepare.split("    steps:\n", 1)[1])[1:]
+                       if "        id: eligibility\n" in s or s.startswith("id: eligibility\n")]
+        self.assertIn("attempt_key: ${{ steps.eligibility.outputs.attempt_key }}", prepare)
+        self.assertFalse([s for s in steps if "id: eligibility" in s])
+        self.assertIn("needs: [resolve-pr, fixer-prepare]", header)
         self.assertEqual(len(action), 1)
         self.assertEqual(len(context), 1)
         self.assertEqual(len(eligibility), 1)
         self.assertTrue(action[0][1].startswith("id: claude\n"))
+        self.assertIn("path_to_claude_code_executable: /opt/csl-claude/2.1.306/claude", action[0][1])
+        self.assertIn("DISABLE_UPDATES", action[0][1])
+        self.assertRegex(m.ACTION_USES, r"\Aanthropics/claude-code-action@[0-9a-f]{40}\Z")
         self.assertNotRegex(action[0][1], r"(?m)^        name:")
-        self.assertIn("        id: push_guard\n", context[0][1])
+        self.assertIn("        id: outbox\n", context[0][1])
         self.assertLess(context[0][0], action[0][0])
         watcher = (ROOT / ".github/workflows/stuck-thread-watch.yml").read_text()
         self.assertIn("contents: read", watcher)

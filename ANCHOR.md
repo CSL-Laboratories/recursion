@@ -20,12 +20,17 @@ the models and subscriptions they already prefer, including by reducing unnecess
 burn. It does not hold or relay provider credentials it was not explicitly granted; where
 possible it delegates to a user-authenticated tool. The comparison standard is tools like T3
 Code. "First usable release" is defined by the accepted platform release in `docs/v3/PRODUCT.md`
-(see `state/DECISIONS.md` D-018…D-034).
+(existing file; see frozen `state/DECISIONS.md` D-018…D-034). Existing `docs/v3/*` stays in
+place with its current ratification status until CSL-536. New specifications and decisions are recorded in
+[CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research) and this
+repository only links.
 
 ## Success criteria (near term)
 
-1. **One trustworthy specification.** `docs/v3/*` is evidence-grounded, internally consistent,
-   and coherent enough that a new contributor can pick up a task and act on it.
+1. **One trustworthy specification.** Existing `docs/v3/*` stays in place with its current
+   ratification status until CSL-536. It is evidence-grounded, internally consistent, and
+   coherent enough that a new contributor can pick up a task and act on it. New
+   specifications are recorded in csl-research; this repository only links.
 2. **A proven deterministic core.** The kernel and its contracts (planning, execution,
    integrity) pass their executable gates before live code is written (OR-018).
 3. **A first usable release** a person would choose for at least one real workflow, judged on
@@ -36,6 +41,14 @@ Code. "First usable release" is defined by the accepted platform release in `doc
 5. **No lock-in, measurably.** A goal can be driven through more than one harness/route without
    holding credentials Recursion was not granted, and measured quota/usage burden falls versus
    driving each harness directly — or the public claim is withdrawn.
+
+## Product-spec acceptance
+
+`docs/v3` accepted text changes only by a dated amendment that is accepted.
+Spec changes by Samir or Dan (or their attributed agents) are accepted when a
+founder other than the author approves the PR on the exact head SHA with a
+file-digest map (`CONTROL_PLANE.md` product-spec acceptance). Lucas-authored
+amendments keep Lucas's existing acceptance path. Merge is not acceptance.
 
 ## Not this year / explicitly out of scope
 

@@ -1,7 +1,8 @@
 ---
 title: Recursion v3 product specification direction
-status: accepted-direction-with-open-research
-last-updated: 2026-09-07
+status: amendment proposed (2026-10-24); acceptance is a human decision by Lucas
+last-updated: 2026-10-25
+prior-status: accepted-direction-with-open-research
 ---
 
 # Recursion v3 product hypothesis
@@ -27,6 +28,107 @@ OR-039 makes configuration, compatibility and whole-system optimization central.
 cognitive/coordination burden, intent continuity, clarity, Owner control, quality and specialized
 assistance alongside OR-024's existing ranking and floors. Additional consumption can be a
 chosen tradeoff; no universal feature-cost or plugin-efficiency claim follows.
+
+## Amendment proposed 2026-10-24 — frontier-defining harness
+
+**Status: amendment proposed (2026-10-24); acceptance is a human decision by Lucas.**
+
+This section **adds** Lucas's 2026-10-24 direction. It does not rewrite the OR-038 paragraph
+above. Full pillar designs, competitor citations and the file-by-file inventory live in
+[AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md). Publishing this text does not admit
+implementation work, clear a hold, select a language, or authorize spend.
+
+### North star
+
+Recursion is **the frontier-defining harness** — "the goat": a first-class native harness
+and a first-class unifying wrapper meant to beat any harness in the way, including Octopus
+(which Octopus is research question F-1), the DeepSeek harness (`deepseek-ai/deepseek-harness`),
+Hermes Agent, T3 Code, OpenCode, Claude Code, Codex, and more.
+
+The accepted public thesis remains **"the harness that scales with your workflow"** (D-034).
+This amendment states the competitive bar that thesis must now earn. Nov 11, 2026 is
+everything that can fit, with no shrinking of ambition. A public demo is required. A private
+held-out eval is allowed. No SWE-bench chasing. Linux-first sprint for sandboxes and nodes;
+product surfaces target Linux, Windows and macOS.
+
+### Seven-point bar
+
+Every parent and demo is scored against Lucas's seven-point bar (frontier map, 2026-10-25).
+A plan that defers the GUI fails bar 4.
+
+1. Researched and developed, with evidence (unknown ≠ pass).
+2. Practical for enterprise and developers (no credential custody, truthful Stop, audit receipts).
+3. Hyper-optimized (OR-024 visible; GUI attach launches zero inference).
+4. A real graphical interface users interact with (same daemon as the CLI; window-close ≠ kill).
+5. Directed and installed by agents (Control MCP / control API).
+6. Config syncs with providers and preferences already in use (never copy tokens).
+7. Loved features done correctly (plan, diffs, worktrees, Stop, fork, approvals, PR-as-publish,
+   honest usage — generated ≠ accepted, unknown ≠ 0, MCP ≠ grant).
+
+### Pillars
+
+Core: calling and piloting other subscriptions (Claude Max, Codex, Cursor, Devin, Grok Bot,
+OpenCode Go/Zen); cross-chat; remote control; enterprise capabilities; node orchestration
+across machines. Also: verification, quota/cost ledger, memory and learning, plugin
+portability, automation, sandboxing, observability, research mode, evaluation.
+
+Method: **design as you research, develop only once grounded, then test** — three phases with
+gates. Live Codex and Claude Code runs go on **subscriptions**, with **no dollar spend limit**,
+usage tracked against quotas. **No pay-per-token for CSL.**
+
+BYOK keys go in the **OS keyring**. First providers: **OpenRouter, OpenCode Go, OpenCode Zen**.
+
+### Surfaces (what this amendment adds beyond D-038)
+
+D-038 (accepted 2026-10-02) already made GUI and mobile **built but opt-in** in the first
+release; no capability is deferred by the old "GUI later" exclusion wording. This amendment
+does not reopen D-038.
+
+**Beyond D-038** it specifies: one headless daemon; a daemon-served web GUI in a thin
+**Tauri** shell for Linux, Windows and macOS; a standalone app; a CLI/TUI; plus phone/web
+remote; and the "goat" bar (seven-point bar). Tauri is the GUI-shell direction (Lucas
+R-Q4); it is not a product-language selection (OR-017 / D-039). Requiring the GUI, to the
+exclusion of CLI-only use, remains a non-goal. Historical "GUI later" sentences are kept;
+dated pointers send readers here. `ANCHOR.md` is not edited.
+
+### Agent operators
+
+Recursion must be operable by agent software via **MCP or a control API**, explicitly
+including Grok Bot, and Anthropic's and OpenAI's own agent/bot products (Lucas's working
+labels: Claude Bard, Codex Dots); exact products and their control surfaces are a RESEARCH
+question, decide from findings (F-15). This amendment does not assert product names for
+those labels. Lucas (2026-10-24 11:53pm PT): "Claude has their own bot, not sure what
+it's called."
+
+### Research questions, not decisions
+
+F-1 which Octopus; F-3 product language; F-4 what enterprise means by Nov 11; F-9 default
+remote relay; F-10 durable execution vs the replay kernel (PR #292); F-15 Anthropic's and
+OpenAI's own agent/bot products (working labels: Claude Bard, Codex Dots); and F-5, F-6,
+F-7, F-8, F-11, F-12, F-13, F-14. F-2 (GUI contradiction) is answered by D-038; this
+amendment adds the Surfaces paragraph above. Full questions and sources:
+`CSL-Laboratories/csl-research` commit `250fdbbe2964e4889096a487e2dfb6d7794046a6`,
+path `submissions/20261025-recursion-csl494-rp0-amendment-research-01/` (candidate
+evidence; vault PR merged).
+
+### Research and open questions
+
+Lucas (2026-10-24 11:57pm PT): the Recursion spec must be dynamic, changing with the
+issues and the research that is published. Research lives in
+`CSL-Laboratories/csl-research`, not in this repository. This amendment's record:
+commit `250fdbbe2964e4889096a487e2dfb6d7794046a6`, path
+`submissions/20261025-recursion-csl494-rp0-amendment-research-01/`. Claim: RP0
+amendment research grounding, F-1…F-15, and the parent-keyed register for CSL-494.
+Limitation: candidate evidence; vault PR
+https://github.com/CSL-Laboratories/csl-research/pull/41 merged. Not human
+product acceptance.
+
+**Accepted text in this file changes only by a dated amendment that is accepted.**
+Lucas-authored dated amendments (including this RP0 text) are accepted when Lucas
+accepts. Spec changes authored by Samir or Dan (or their agents, attributed) are
+accepted when a founder other than the author approves the PR; that approval counts
+as acceptance (Lucas 2026-10-24 11:58pm PT). A research-record update is not
+acceptance.
 
 ## Mark 2 capability map â€” research synthesis 2026-09-07
 
@@ -147,6 +249,15 @@ The first user is Lucas. The first deployment is a lightweight coordinator on th
 
 Public usability remains an explicit design requirement. Users should be able to install a useful minimal edition, bring their own official subscriptions or API credentials, select more capable bundles, and retain complete access to human-readable configuration.
 
+Amendment proposed 2026-10-24 (acceptance is a human decision by Lucas; see
+[AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md)): the CLI remains a complete operator
+surface, so an agent is still never *required* to edit settings, and Recursion is also
+**agent-operable** via MCP or a control API (Grok Bot, and Anthropic's and OpenAI's own
+agent/bot products — Lucas's working labels: Claude Bard, Codex Dots; exact products and
+their control surfaces are F-15). D-038 already put GUI and mobile in the first release as
+built-but-opt-in clients; this amendment adds the daemon-served Tauri shell, standalone
+app and "goat" bar.
+
 ## Product promises
 
 1. **Owner sovereignty.** Local operation, self-hosting, provider choice, portable configuration,
@@ -215,6 +326,10 @@ are in [PERFORMANCE-PLAN.md](PERFORMANCE-PLAN.md#canonical-optimization-decision
   grant may include supported high-impact capabilities only after constitutional reconciliation.
 - Running every worker on the coordinator VPS.
 - Exporting private prompts, source, telemetry, or project evidence by default.
+
+Amendment proposed 2026-10-24: "Requiring use of the opt-in GUI or mobile clients" is
+already the D-038 floor (CLI-only use remains valid). This amendment does not change that.
+See Surfaces above for what it adds beyond D-038.
 
 ## Release philosophy
 

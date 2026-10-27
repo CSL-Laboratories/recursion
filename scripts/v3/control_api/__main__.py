@@ -70,7 +70,12 @@ def _serve(args: argparse.Namespace, stop: threading.Event | None = None) -> int
         signal.signal(signal.SIGINT, lambda *_: stop.set())
         signal.signal(signal.SIGTERM, lambda *_: stop.set())
         print(json.dumps({"url": server.url, "tenant": args.tenant, "live_calls": False}), flush=True)
-        stop.wait()
+        # An untimed condition wait can delay the Python signal handler until
+        # that wait returns (macOS does this). SIGTERM would then leave
+        # serve-fake running. Returning to Python between short waits lets the
+        # handler set ``stop``.
+        while not stop.wait(0.2):
+            pass
         server.stop()
     finally:
         _unlink_created(args.token_file, identity, held)

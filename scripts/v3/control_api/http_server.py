@@ -17,6 +17,7 @@ import json
 import os
 import socket
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
@@ -61,20 +62,31 @@ def _close_socket(request: Any) -> None:
         pass
 
 
-def _drain_refused_request(request: Any) -> None:
-    """Read the request that was refused, up to one capped body.
+def _recv_until(request: Any, size: int, deadline: float) -> bytes:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or size <= 0:
+        return b""
+    try:
+        request.settimeout(remaining)
+        chunk = request.recv(size)
+    except OSError:
+        return b""
+    return chunk if chunk else b""
 
-    The peer usually does not half-close after sending, so this stops at the
-    end of the request instead of waiting for EOF.
+
+def _drain_refused_request(request: Any, deadline: float) -> None:
+    """Read the refused request until it ends or the deadline passes.
+
+    One socket timeout per ``recv`` is not a bound: a peer that sends a byte
+    just before each timeout keeps the accept thread in this function. The
+    deadline is absolute. The peer usually does not half-close, so this stops
+    at the end of one capped body instead of waiting for EOF.
     """
 
     cap = _REFUSE_HEADER_CAP + MAX_BODY_BYTES
     buf = bytearray()
     while b"\r\n\r\n" not in buf and len(buf) < cap:
-        try:
-            chunk = request.recv(min(4096, cap - len(buf)))
-        except OSError:
-            return
+        chunk = _recv_until(request, min(4096, cap - len(buf)), deadline)
         if not chunk:
             return
         buf += chunk
@@ -95,10 +107,7 @@ def _drain_refused_request(request: Any) -> None:
     length = min(length, MAX_BODY_BYTES)
     have = len(rest)
     while have < length:
-        try:
-            chunk = request.recv(min(4096, length - have))
-        except OSError:
-            return
+        chunk = _recv_until(request, min(4096, length - have), deadline)
         if not chunk:
             return
         have += len(chunk)
@@ -120,6 +129,7 @@ def _refuse_over_limit(request: Any) -> None:
         b"Connection: close\r\n"
         b"Cache-Control: no-store\r\n\r\n" + payload
     )
+    deadline = time.monotonic() + _REFUSE_IO_TIMEOUT_S
     try:
         request.settimeout(_REFUSE_IO_TIMEOUT_S)
     except OSError:
@@ -133,7 +143,7 @@ def _refuse_over_limit(request: Any) -> None:
         request.shutdown(socket.SHUT_WR)
     except OSError:
         pass
-    _drain_refused_request(request)
+    _drain_refused_request(request, deadline)
     _close_socket(request)
 
 

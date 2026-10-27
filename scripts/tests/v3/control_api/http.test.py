@@ -473,6 +473,44 @@ class TokenFileTests(unittest.TestCase):
         self.assertIn(b"HTTP/1.1 503", observed)
         self.assertIn(b"too_many_connections", observed)
 
+    def test_a_slow_refusal_does_not_hold_the_accept_loop(self) -> None:
+        # A peer that dribbles a byte before each recv timeout must not keep
+        # the accept thread in the refusal drain. The next caller still gets
+        # the 503 within the one-second deadline.
+        stack = build_fake_stack()
+        server = ControlHTTPServer(stack.service, max_connections=1).start()
+        self.addCleanup(server.stop)
+        token = stack.issue("op-a", "tenant-a", {SCOPE_CONTROL, SCOPE_OBSERVE})
+        held = http.client.HTTPConnection("127.0.0.1", server.port, timeout=10)
+        self.addCleanup(held.close)
+        held.request(
+            "GET",
+            "/v1/events?after=0&wait=10",
+            headers={"Authorization": f"Bearer {token}", "Host": f"127.0.0.1:{server.port}"},
+        )
+        time.sleep(0.2)
+        slow = socket.create_connection(("127.0.0.1", server.port), timeout=5)
+        self.addCleanup(slow.close)
+        slow.sendall(b"POST /v1/rpc HTTP/1.1\r\nHost: x\r\n")
+        time.sleep(0.3)
+
+        def drip() -> None:
+            for _ in range(30):
+                time.sleep(0.2)
+                try:
+                    slow.sendall(b"X")
+                except OSError:
+                    return
+
+        threading.Thread(target=drip, daemon=True).start()
+        started = time.monotonic()
+        client = ControlClient(server.url, token)
+        with self.assertRaises(ControlRpcError) as raised:
+            client.call("service.info")
+        self.assertEqual(err.BUSY, raised.exception.code)
+        self.assertEqual("too_many_connections", raised.exception.message)
+        self.assertLess(time.monotonic() - started, 3.0)
+
 
 class CliTests(unittest.TestCase):
     def test_serve_fake_call_and_events_without_printing_the_token(self) -> None:
@@ -592,7 +630,10 @@ class CliTests(unittest.TestCase):
             server = launch()
             restarted: subprocess.Popen[str] | None = None
             try:
-                info = json.loads(server.stdout.readline())
+                ready_line = _stdout_line(server)
+                if not ready_line:
+                    self.fail(_stderr_text(server) or "serve-fake produced no ready line")
+                info = json.loads(ready_line)
                 self.assertFalse(info["live_calls"])
                 self.assertTrue(token_file.is_file())
                 self.assertIsNone(server.poll())
@@ -603,15 +644,14 @@ class CliTests(unittest.TestCase):
                     server.kill()
                     server.wait(10)
                     self.fail("serve-fake did not exit after SIGTERM")
-                stderr = server.stderr.read() if server.stderr is not None else ""
+                stderr = _stderr_text(server)
                 self.assertEqual(0, code, stderr)
                 self.assertFalse(token_file.exists())
 
                 restarted = launch()
-                again_line = restarted.stdout.readline()
+                again_line = _stdout_line(restarted)
                 if not again_line:
-                    again_err = restarted.stderr.read() if restarted.stderr is not None else ""
-                    self.fail(again_err or "serve-fake produced no ready line on restart")
+                    self.fail(_stderr_text(restarted) or "serve-fake produced no ready line on restart")
                 again = json.loads(again_line)
                 self.assertFalse(again["live_calls"])
                 self.assertTrue(token_file.is_file())
@@ -638,10 +678,11 @@ class CliTests(unittest.TestCase):
                 )
 
             def ready(proc: subprocess.Popen[str]) -> None:
-                line = proc.stdout.readline() if proc.stdout is not None else ""
+                line = _stdout_line(proc)
                 if not line:
-                    err_text = proc.stderr.read() if proc.stderr is not None else ""
-                    self.fail(err_text or "serve-fake produced no ready line")
+                    if proc.poll() is None:
+                        proc.kill()
+                    self.fail(_stderr_text(proc) or "serve-fake produced no ready line")
                 info = json.loads(line)
                 self.assertFalse(info["live_calls"])
 
@@ -679,7 +720,7 @@ class CliTests(unittest.TestCase):
                     first.kill()
                     first.wait(10)
                     self.fail("serve-fake did not exit after SIGTERM")
-                stderr = first.stderr.read() if first.stderr is not None else ""
+                stderr = _stderr_text(first)
                 self.assertEqual(0, code, stderr)
                 self.assertEqual((replaced.st_dev, replaced.st_ino), _file_id(token_file))
                 self.assertEqual(replacement, read_token_file(token_file))
@@ -691,7 +732,7 @@ class CliTests(unittest.TestCase):
                     second.kill()
                     second.wait(10)
                     self.fail("replacement serve-fake did not exit after SIGTERM")
-                second_err = second.stderr.read() if second.stderr is not None else ""
+                second_err = _stderr_text(second)
                 self.assertEqual(0, second_code, second_err)
                 self.assertFalse(token_file.exists())
             finally:
@@ -1060,6 +1101,42 @@ class CliTests(unittest.TestCase):
                         os.close(descriptor)
                     except OSError:
                         pass
+
+
+def _stdout_line(proc: subprocess.Popen[str], timeout: float = 10) -> str:
+    """Read one stdout line, or return "" if the child does not write it in time.
+
+    ``readline`` has no deadline. A child that never prints the ready line
+    would otherwise sit until the suite cap.
+    """
+
+    holder: dict[str, str] = {}
+
+    def read() -> None:
+        stdout = proc.stdout
+        holder["line"] = stdout.readline() if stdout is not None else ""
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    reader.join(timeout)
+    if reader.is_alive():
+        proc.kill()
+        reader.join(2)
+        return ""
+    return holder.get("line", "")
+
+
+def _stderr_text(proc: subprocess.Popen[str], timeout: float = 2) -> str:
+    holder: dict[str, str] = {}
+
+    def read() -> None:
+        stderr = proc.stderr
+        holder["text"] = stderr.read() if stderr is not None else ""
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    reader.join(timeout)
+    return holder.get("text", "")
 
 
 def _file_id(path: Path) -> tuple[int, int]:

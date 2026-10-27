@@ -29,8 +29,7 @@ Vault record (this repository only links to it):
   csl-research#50 (`541ee845cdcc0a479190ddd6f0736e4dc854dd1d`, draft evidence) and
   csl-research#56 (author-ready source,
   `submissions/20261026-csl542-543-rp0v2-cp0v2-author-ready-files-01/result.md`).
-- **Limitation:** candidate text; pinned to the commit above. That path is on `main`
-  when csl-research#63 merges. Not an exact-digest receipt.
+- **Limitation:** candidate text; pinned to the commit above. Not an exact-digest receipt.
 
 This file **adds** proposed product direction. It does not rewrite Owner-approved wording.
 The OR-038 paragraph in [PRODUCT.md](PRODUCT.md) is preserved verbatim. `state/DECISIONS.md`

@@ -30,7 +30,7 @@ from scripts.v3.route_contract.model import (
     canonical_json,
     sha256_digest,
 )
-from scripts.v3.route_contract.transport import ProcResult, Transport
+from scripts.v3.route_contract.transport import TIMEOUT_DIAGNOSTIC, ProcResult, Transport
 
 REPAIR_REASON_GENERIC = "output did not match the required schema"
 _REPAIR_PREFIX = "\n\nYour previous output was rejected: "
@@ -49,7 +49,18 @@ def object_output_schema(schema: Any) -> bool:
 
 
 def _output_bytes(proc: ProcResult) -> int:
-    return len((proc.stdout or "").encode("utf-8")) + len((proc.stderr or "").encode("utf-8"))
+    """Engine output bytes; the transport's own timeout suffix is not counted.
+
+    Prefer the transport's raw count: decoding replaces invalid UTF-8 with
+    U+FFFD, which re-encodes to three bytes and would inflate the size.
+    """
+
+    if proc.raw_output_bytes is not None:
+        return proc.raw_output_bytes
+    stderr = proc.stderr or ""
+    if proc.timed_out and stderr.endswith(TIMEOUT_DIAGNOSTIC):
+        stderr = stderr[: -len(TIMEOUT_DIAGNOSTIC)]
+    return len((proc.stdout or "").encode("utf-8")) + len(stderr.encode("utf-8"))
 
 
 def _loads(text: str) -> Any:
@@ -253,6 +264,9 @@ class ReferenceAdapter:
     ) -> tuple[ExecutionResult | None, Any, str | None, Any]:
         parsed, session, body = None, None, None
         error, state, status = "limit_or_error", "exhausted", STATUS_LIMIT_HIT
+        # Real engine output over the cap is output_too_large even on a
+        # timeout. _output_bytes excludes the transport's "[timeout]" suffix, so
+        # a near-cap timeout stays a timeout.
         if proc.oversized or _output_bytes(proc) > request.max_output_bytes:
             error, status = "output_too_large", STATUS_LIMIT_HIT
         elif proc.timed_out:

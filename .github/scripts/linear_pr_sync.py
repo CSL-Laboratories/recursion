@@ -29,8 +29,17 @@ PURPOSE_CHARS = 800
 LINEAR_FIRST = (
     "Linear-first (CSL-88): Work from the CSL Linear issue. Check it and its "
     "PR-sync comment for overlap first. Post status and questions there. File "
-    "new findings to Triage. Use current docs (Context7) and web research "
-    "(Parallel) before implementing."
+    "new findings to Triage. Research may use any deep-research source the "
+    "team has, such as Parallel, Exa, Claude Deep Research, Open Deep "
+    "Research, ChatGPT Deep Research or the web. Current library docs "
+    "(for example Context7) also count. Research bodies go to "
+    "CSL-Laboratories/csl-research as a submissions/<record_id>/ record "
+    "through a PR there, never to this repo; post a digest on the Linear "
+    "issue. New non-public docs go there through a PR, except "
+    "operational contracts and runbooks that this repository's code, a "
+    "gate or CI reads; those stay here. This repo only links. Existing "
+    "files stay (CSL-536). Each run records its tool, its "
+    "run id and its cost (or unknown + reason) in its csl-research record."
 )
 BEHIND_STATES = frozenset({"dirty", "behind"})
 PENDING_MERGEABLE = frozenset({"", "unknown"})

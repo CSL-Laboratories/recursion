@@ -21,7 +21,7 @@ reviewed and applied.
 
 | Actor | May propose | May authoritatively decide | Must never do |
 |---|---|---|---|
-| Lucas / Owner | any goal, amendment, exception or terminal disposition | accept/amend/close GoalSpec; change constitution; authorize privacy, spend, publication, deployment and exceptional verifier seams | be inferred from model prose or an unauthenticated transport message |
+| the authenticated Owner | any goal, amendment, exception or terminal disposition | accept/amend/close GoalSpec; change constitution; authorize privacy, spend, publication, deployment and exceptional verifier seams | be inferred from model prose or an unauthenticated transport message |
 | Recursion Head | draft GoalSpec; create/replace/stop ARM run; request plan revision; resolve cross-ARM conflicts; escalate | ARM lifecycle and conflict decisions inside an accepted GoalSpec, subject to kernel admission | silently amend Owner intent, write an ARM's task DAG, widen authority or treat addressability as authority |
 | ARM executive | immutable PlanRevision, TaskNodes, retry/replan/blocker/escalation proposals | semantic tactics inside its GoalSpec and live executive lease after kernel admission | widen GoalSpec, mutate an accepted revision, grant itself authority or decide its own verification |
 | Worker | observations and one WorkPacket result | execute only an admitted immutable WorkPacket under its live work lease | amend goal/plan/task, mint packets or accept gates |
@@ -105,11 +105,11 @@ non-sensitive digests/tombstones and explicit proof state.
 3. Deterministic validation rejects missing parent/outcome/gates, ambiguous source/scope,
    unauthenticated authority, unbounded values, unknown policy, impermissible privacy/route/spend
    or internal contradiction.
-4. Lucas accepts the exact GoalSpec digest. An authenticated direct Owner command may both supply
+4. The authenticated Owner accepts the exact GoalSpec digest. An authenticated direct Owner command may both supply
    a complete spec and accept its digest; otherwise explicit acceptance is required.
 5. The kernel appends `GoalSpecAccepted`; only then may Head propose an ArmRun.
 
-Only Lucas may amend GoalSpec intent, scope, acceptance, privacy exposure, authority, spending or
+The authenticated Owner may amend GoalSpec intent, scope, acceptance, privacy exposure, authority, spending or
 terminal seams. Head and ARM may narrow descendant assignments without changing the GoalSpec.
 New operative law/constitution and authenticated Owner restrictions take effect immediately at
 admission and effect recheck; they are not GoalSpec mutations. A GoalSpec restriction amendment
@@ -444,7 +444,7 @@ the answer is canonical for this design baseline but not current runtime/constit
 
 | ID | Exact question | Canonical answer/status | Controlling locator | Fixture/falsifier | Lucas seam |
 |---|---|---|---|---|---|
-| APQ-01 | How does raw owner intent become a draft and then accepted GoalSpec? | authenticate/append exact OwnerIntent; Head compiles a non-authoritative draft; deterministic validation; Lucas accepts the exact digest (`proposal`) | [Goal compilation](#goal-compilation-and-amendment) | F-M1A-001/002 | ratify acceptance protocol/authentication later[^cslr-d-001] |
+| APQ-01 | How does raw owner intent become a draft and then accepted GoalSpec? | authenticate/append exact OwnerIntent; Head compiles a non-authoritative draft; deterministic validation; the authenticated Owner accepts the exact digest (`proposal`) | [Goal compilation](#goal-compilation-and-amendment) | F-M1A-001/002 | ratify acceptance protocol/authentication later[^cslr-d-001] |
 | APQ-02 | Who may amend a GoalSpec? | the authenticated Owner; constitution changes also require its own authority path (`proposal`) | [Goal compilation](#goal-compilation-and-amendment) | F-M1A-003/005/020 | Lucas may choose a narrower delegated restriction-only role[^cslr-d-001] |
 | APQ-03 | Which restrictions may tighten immediately? | operative constitutional/Owner restrictions and accepted Owner amendment fence new admission/effects immediately; Head/ARM may narrow descendants without editing GoalSpec (`proposal`) | [Goal compilation](#goal-compilation-and-amendment) | F-M1A-003/005/014 | non-Owner GoalSpec amendment authority remains unratified |
 | APQ-04 | Which changes require a safe checkpoint or new authorization? | any widening, relaxed privacy, new egress/account/spend/effect, weaker verifier or route power needs new Owner acceptance and checkpoint (`proposal`) | [Goal compilation](#goal-compilation-and-amendment) | F-M1A-003/011/013 | exact future high-impact authorization mechanism |

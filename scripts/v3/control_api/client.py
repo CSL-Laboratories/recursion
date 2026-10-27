@@ -86,6 +86,22 @@ def _close_held(descriptor: int | None) -> None:
         pass
 
 
+def _same_created_file(raw: str, identity: tuple[int, int] | None) -> bool:
+    """True when path is the regular file recorded at exclusive create."""
+
+    if identity is None:
+        return False
+    try:
+        info = os.lstat(raw)
+    except OSError:
+        return False
+    return (
+        not stat.S_ISLNK(info.st_mode)
+        and stat.S_ISREG(info.st_mode)
+        and (info.st_dev, info.st_ino) == identity
+    )
+
+
 def unlink_created_token(
     path: str | os.PathLike[str],
     identity: tuple[int, int] | None,
@@ -93,39 +109,30 @@ def unlink_created_token(
 ) -> None:
     """Unlink path when it still names the file recorded at exclusive create.
 
-    ``descriptor`` stays open through the identity check so a replacement cannot
-    reuse that inode. Windows refuses to delete a file that still has an open
-    descriptor, so the descriptor is closed after the check and before unlink.
-    POSIX unlinks first and closes afterwards, which keeps the inode pinned
-    until the name is gone.
-
-    Closing before unlink on Windows leaves a short window where the name can
-    be replaced. That is acceptable for this loopback fake server: an operator
-    would have to delete the token and start a second server on the same path
-    inside that window.
+    ``descriptor`` stays open through the first identity check so a replacement
+    cannot reuse that inode. Windows refuses to delete a file that still has an
+    open descriptor, so the descriptor is closed after that check. The path is
+    checked again immediately before unlink, and a replacement created after
+    the close is left in place. A swap in the remaining gap between that second
+    check and ``os.unlink`` can still remove the new file. POSIX unlinks first
+    and closes afterwards, which keeps the inode pinned until the name is gone.
     """
 
     raw = os.fspath(path)
-    remove = False
-    if identity is not None:
-        try:
-            info = os.lstat(raw)
-        except OSError:
-            info = None
-        if (
-            info is not None
-            and not stat.S_ISLNK(info.st_mode)
-            and stat.S_ISREG(info.st_mode)
-            and (info.st_dev, info.st_ino) == identity
-        ):
-            remove = True
     # Windows cannot unlink a path whose descriptor is still open (WinError 32).
-    # Close only after the identity check, then unlink. POSIX keeps the
-    # descriptor open across the unlink so the inode cannot be reused.
+    # Close after the identity check, then check again immediately before
+    # unlink. POSIX keeps the descriptor open across the unlink so the inode
+    # cannot be reused.
     if os.name == "nt":
+        matched = _same_created_file(raw, identity)
         _close_held(descriptor)
-        descriptor = None
-    if remove:
+        if matched and _same_created_file(raw, identity):
+            try:
+                os.unlink(raw)
+            except OSError:
+                pass
+        return
+    if _same_created_file(raw, identity):
         try:
             os.unlink(raw)
         except OSError:
@@ -140,8 +147,8 @@ def create_token_file(path: str | os.PathLike[str], token: str) -> tuple[int, in
     The caller keeps ``fd`` open through the identity check: that holds the
     inode, so a replacement at the same path cannot reuse the number. Windows
     refuses to delete a file that still has an open descriptor, so the caller
-    closes ``fd`` after that check and before unlinking. POSIX can unlink
-    while ``fd`` stays open.
+    closes ``fd`` after that check, checks the path again, and then unlinks.
+    POSIX can unlink while ``fd`` stays open.
 
     If ``os.write`` raises or returns a short non-positive count, the file
     this call just created is removed with that same check and close order,

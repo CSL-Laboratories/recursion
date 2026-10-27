@@ -34,7 +34,9 @@ from scripts.v3.control_api.client import (  # noqa: E402
     ControlClient,
     ControlRpcError,
     TokenFileRefused,
+    create_token_file,
     read_token_file,
+    unlink_created_token,
     write_token_file,
 )
 from scripts.v3.control_api.fake_engines import ENGINES, build_fake_stack  # noqa: E402
@@ -610,13 +612,13 @@ class CliTests(unittest.TestCase):
                 self.assertIn('"live_calls": false', stdout)
                 self.assertNotIn("token_file_exists", stderr)
                 self.assertFalse(token_file.exists())
-                self.assertEqual(["lstat", "close", "unlink"], events)
+                self.assertEqual(["lstat", "close", "lstat", "unlink"], events)
                 events.clear()
                 again, again_out, again_err = self._drive_clean_stop(token_file)
                 self.assertEqual(0, again, again_err)
                 self.assertIn('"live_calls": false', again_out)
                 self.assertNotIn("token_file_exists", again_err)
-                self.assertEqual(["lstat", "close", "unlink"], events)
+                self.assertEqual(["lstat", "close", "lstat", "unlink"], events)
                 self.assertFalse(token_file.exists())
 
     @unittest.skipIf(os.name == "nt", _SKIP_POSIX_UNLINK_WHILE_OPEN)
@@ -653,13 +655,55 @@ class CliTests(unittest.TestCase):
                 self.assertIn("OSError", stderr.getvalue())
                 self.assertEqual(2, code)
                 self.assertFalse(token_file.exists())
-                self.assertEqual(["lstat", "close", "unlink"], events)
+                self.assertEqual(["lstat", "close", "lstat", "unlink"], events)
                 events.clear()
                 again, again_out, again_err = self._drive_clean_stop(token_file)
                 self.assertEqual(0, again, again_err)
                 self.assertIn('"live_calls": false', again_out)
                 self.assertNotIn("token_file_exists", again_err)
                 self.assertFalse(token_file.exists())
+
+    def test_windows_cleanup_keeps_a_token_replaced_after_the_descriptor_closes(self) -> None:
+        # Closing the held descriptor lets another server replace the path
+        # before unlink. The second identity check must leave that file alone.
+        with tempfile.TemporaryDirectory() as directory:
+            token_file = Path(directory) / "token"
+            device, inode, descriptor = create_token_file(token_file, "original-token")
+            replacement = b"replacement-token\n"
+            real_close = os.close
+            swapped = {"done": False}
+            # Keep the original inode allocated so the replacement cannot reuse
+            # the number the second check compares. That reuse is the remaining
+            # Windows limit this check cannot close.
+            spare = os.open(os.fspath(token_file), os.O_RDONLY)
+
+            def close_and_replace(fd: int) -> None:
+                real_close(fd)
+                if fd != descriptor or swapped["done"]:
+                    return
+                swapped["done"] = True
+                os.unlink(os.fspath(token_file))
+                replacement_fd = os.open(
+                    os.fspath(token_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+                )
+                os.write(replacement_fd, replacement)
+                real_close(replacement_fd)
+
+            try:
+                with (
+                    mock.patch.object(os, "name", "nt"),
+                    mock.patch.object(os, "close", close_and_replace),
+                ):
+                    unlink_created_token(token_file, (device, inode), descriptor)
+            finally:
+                for held in (spare, descriptor):
+                    try:
+                        real_close(held)
+                    except OSError:
+                        pass
+            self.assertTrue(swapped["done"])
+            self.assertEqual(replacement, token_file.read_bytes())
+            self.assertNotEqual((device, inode), _file_id(token_file))
 
     def test_a_failed_token_write_removes_the_file_and_the_path_can_be_reused(self) -> None:
         # os.write raising, returning 0, or writing only part of the token
@@ -691,7 +735,7 @@ class CliTests(unittest.TestCase):
             ("raise", raising, False, ["lstat", "unlink", "close"]),
             ("short", short, False, ["lstat", "unlink", "close"]),
             ("partial", partial_factory(), False, ["lstat", "unlink", "close"]),
-            ("raise-windows", raising, True, ["lstat", "close", "unlink"]),
+            ("raise-windows", raising, True, ["lstat", "close", "lstat", "unlink"]),
         )
         for label, fail_write, windows, expected in cases:
             with self.subTest(label=label):
@@ -738,10 +782,14 @@ class CliTests(unittest.TestCase):
                 if os.fspath(path) == target:
                     events.append("lstat")
                     self.assertTrue(held, "identity check ran before the exclusive create")
-                    self.assertTrue(
-                        descriptor_open(held[-1]),
-                        "identity check ran after the descriptor was closed",
-                    )
+                    open_now = descriptor_open(held[-1])
+                    if windows and "close" in events:
+                        self.assertFalse(open_now, "re-check ran before the descriptor was closed")
+                    else:
+                        self.assertTrue(
+                            open_now,
+                            "identity check ran after the descriptor was closed",
+                        )
                 return real_lstat(path)
 
             def guarded_unlink(path: str) -> None:
@@ -866,7 +914,12 @@ class CliTests(unittest.TestCase):
         def watching_lstat(path: str):
             if os.fspath(path) == target:
                 events.append("lstat")
-                self.assertTrue(opened and still_open(opened[-1]))
+                held_open = bool(opened) and still_open(opened[-1])
+                # Windows re-checks the path after close, immediately before unlink.
+                if "close" in events:
+                    self.assertFalse(held_open)
+                else:
+                    self.assertTrue(held_open)
             return real_lstat(path)
 
         def guarded_unlink(path: str) -> None:

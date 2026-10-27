@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -26,6 +27,9 @@ from scripts.v3.control_api.service import MAX_BODY_BYTES, ControlService
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost"})
 REQUEST_TIMEOUT_S = 15.0
 MAX_CONNECTIONS = 32
+# Headers plus one capped body. A refusal must not read without a bound.
+_REFUSE_HEADER_CAP = 8192
+_REFUSE_IO_TIMEOUT_S = 1.0
 
 _STATUS_FOR_CODE = {
     err.PARSE_ERROR: 400,
@@ -48,6 +52,89 @@ def status_for(response: dict[str, Any]) -> int:
     if not isinstance(error, dict):
         return 200
     return _STATUS_FOR_CODE.get(error.get("code"), 200)
+
+
+def _close_socket(request: Any) -> None:
+    try:
+        request.close()
+    except OSError:
+        pass
+
+
+def _drain_refused_request(request: Any) -> None:
+    """Read the request that was refused, up to one capped body.
+
+    The peer usually does not half-close after sending, so this stops at the
+    end of the request instead of waiting for EOF.
+    """
+
+    cap = _REFUSE_HEADER_CAP + MAX_BODY_BYTES
+    buf = bytearray()
+    while b"\r\n\r\n" not in buf and len(buf) < cap:
+        try:
+            chunk = request.recv(min(4096, cap - len(buf)))
+        except OSError:
+            return
+        if not chunk:
+            return
+        buf += chunk
+    head, sep, rest = bytes(buf).partition(b"\r\n\r\n")
+    if not sep:
+        return
+    length = 0
+    for line in head.split(b"\r\n")[1:]:
+        name, _, value = line.partition(b":")
+        if name.lower() == b"content-length":
+            try:
+                length = int(value.strip() or b"0")
+            except ValueError:
+                return
+            break
+    if length < 0:
+        return
+    length = min(length, MAX_BODY_BYTES)
+    have = len(rest)
+    while have < length:
+        try:
+            chunk = request.recv(min(4096, length - have))
+        except OSError:
+            return
+        if not chunk:
+            return
+        have += len(chunk)
+
+
+def _refuse_over_limit(request: Any) -> None:
+    """Send 503, then finish the write side before reading and closing.
+
+    ``close`` with unread data aborts the socket. On Windows that RST can
+    arrive at the client before the 503, so the caller sees a reset instead
+    of ``too_many_connections``.
+    """
+
+    payload = b'{"error":"too_many_connections"}'
+    message = (
+        b"HTTP/1.1 503 Service Unavailable\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Content-Length: " + str(len(payload)).encode("ascii") + b"\r\n"
+        b"Connection: close\r\n"
+        b"Cache-Control: no-store\r\n\r\n" + payload
+    )
+    try:
+        request.settimeout(_REFUSE_IO_TIMEOUT_S)
+    except OSError:
+        pass
+    try:
+        request.sendall(message)
+    except OSError:
+        _close_socket(request)
+        return
+    try:
+        request.shutdown(socket.SHUT_WR)
+    except OSError:
+        pass
+    _drain_refused_request(request)
+    _close_socket(request)
 
 
 class _Server(ThreadingHTTPServer):
@@ -80,25 +167,7 @@ class _Server(ThreadingHTTPServer):
                 self._active += 1
                 refuse = False
         if refuse:
-            payload = b'{"error":"too_many_connections"}'
-            try:
-                request.settimeout(1.0)
-            except OSError:
-                pass
-            try:
-                request.sendall(
-                    b"HTTP/1.1 503 Service Unavailable\r\n"
-                    b"Content-Type: application/json\r\n"
-                    b"Content-Length: " + str(len(payload)).encode("ascii") + b"\r\n"
-                    b"Connection: close\r\n"
-                    b"Cache-Control: no-store\r\n\r\n" + payload
-                )
-            except OSError:
-                pass
-            try:
-                request.close()
-            except OSError:
-                pass
+            _refuse_over_limit(request)
             return
         try:
             super().process_request(request, client_address)

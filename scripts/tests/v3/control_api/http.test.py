@@ -376,29 +376,31 @@ class TokenFileTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             token_file = Path(directory) / "token"
             outcome: dict[str, object] = {}
-            stderr = io.StringIO()
 
             def invoke() -> None:
                 try:
-                    with contextlib.redirect_stderr(stderr):
-                        outcome["code"] = main(
-                            [
-                                "serve-fake",
-                                "--token-file",
-                                str(token_file),
-                                "--port",
-                                str(blocker.port),
-                            ]
-                        )
+                    outcome["code"] = main(
+                        [
+                            "serve-fake",
+                            "--token-file",
+                            str(token_file),
+                            "--port",
+                            str(blocker.port),
+                        ]
+                    )
                 except BaseException as exc:  # noqa: BLE001 - report the worker failure
                     outcome["error"] = exc
 
             # A Windows SO_REUSEADDR regression accepts the occupied port and
             # serve-fake blocks in stop.wait(). Fail that here instead of
-            # waiting out the suite cap.
-            worker = threading.Thread(target=invoke, daemon=True)
-            worker.start()
-            worker.join(10)
+            # waiting out the suite cap. The buffer is installed by the parent:
+            # a worker still inside main never runs its own cleanup, and
+            # sys.stderr is process-wide.
+            with _process_stderr_buffer() as stderr:
+                worker = threading.Thread(target=invoke, daemon=True)
+                worker.start()
+                worker.join(10)
+            self.assertIsNot(sys.stderr, stderr)
             self.assertFalse(
                 worker.is_alive(),
                 "serve-fake kept running on a loopback port that was already bound",
@@ -407,6 +409,27 @@ class TokenFileTests(unittest.TestCase):
             self.assertEqual(2, outcome.get("code"))
             self.assertIn("OSError", stderr.getvalue())
             self.assertFalse(token_file.exists())
+
+    def test_a_stuck_bind_failure_worker_restores_stderr(self) -> None:
+        release = threading.Event()
+        started = threading.Event()
+
+        def hang() -> None:
+            print("from-worker", file=sys.stderr)
+            started.set()
+            release.wait(30)
+
+        self.addCleanup(release.set)
+        with _process_stderr_buffer() as captured:
+            worker = threading.Thread(target=hang, daemon=True)
+            worker.start()
+            self.assertTrue(started.wait(2))
+            self.assertTrue(worker.is_alive())
+        self.assertIsNot(sys.stderr, captured)
+        self.assertIn("from-worker", captured.getvalue())
+        release.set()
+        worker.join(2)
+        self.assertFalse(worker.is_alive())
 
     def test_excess_connections_are_refused(self) -> None:
         stack = build_fake_stack()
@@ -426,6 +449,29 @@ class TokenFileTests(unittest.TestCase):
             client.call("service.info")
         self.assertEqual(err.BUSY, raised.exception.code)
         self.assertEqual("too_many_connections", raised.exception.message)
+        # A reset instead of the 503 must fail here. Windows aborts a close
+        # that still has unread request bytes, and that RST can hide the body.
+        raw = socket.create_connection(("127.0.0.1", server.port), timeout=5)
+        self.addCleanup(raw.close)
+        raw.sendall(
+            (
+                f"POST /v1/rpc HTTP/1.1\r\nHost: 127.0.0.1:{server.port}\r\n"
+                "Content-Type: application/json\r\nContent-Length: 2\r\n"
+                "Connection: close\r\n\r\n{}"
+            ).encode("ascii")
+        )
+        chunks: list[bytes] = []
+        while True:
+            try:
+                piece = raw.recv(4096)
+            except ConnectionResetError as exc:
+                self.fail(f"over-limit refusal reset the socket before the 503: {exc}")
+            if not piece:
+                break
+            chunks.append(piece)
+        observed = b"".join(chunks)
+        self.assertIn(b"HTTP/1.1 503", observed)
+        self.assertIn(b"too_many_connections", observed)
 
 
 class CliTests(unittest.TestCase):
@@ -1019,6 +1065,23 @@ class CliTests(unittest.TestCase):
 def _file_id(path: Path) -> tuple[int, int]:
     info = path.lstat()
     return info.st_dev, info.st_ino
+
+
+@contextlib.contextmanager
+def _process_stderr_buffer():
+    """Point stderr at a private buffer and put the previous stream back.
+
+    ``sys.stderr`` is process-wide. Restoring it in the caller covers a worker
+    that is still running when the wait ends.
+    """
+
+    captured = io.StringIO()
+    saved = sys.stderr
+    sys.stderr = captured
+    try:
+        yield captured
+    finally:
+        sys.stderr = saved
 
 
 if __name__ == "__main__":

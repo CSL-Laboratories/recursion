@@ -246,6 +246,7 @@ class ProtocolTests(unittest.TestCase):
             ("session.run", {"engine": "claude", "session": "s-one", "prompt": "p" * (33 * 1024)}),
             ("session.run", {"engine": "claude", "session": "s-one", "prompt": "p", "timeout_s": True}),
             ("session.run", {"engine": "claude", "session": "s-one", "prompt": "p", "timeout_s": 0}),
+            ("session.run", {"engine": "claude", "session": "s-one", "prompt": "p", "timeout_s": 0.0001}),
             ("session.run", {"engine": "claude", "session": "s-one", "prompt": "p", "timeout_s": 9999}),
             ("session.run", {"engine": "claude", "session": "s-one", "prompt": "p", "allowed_tools": ["Bash"]}),
             ("session.run", {"engine": "claude", "session": "s-one", "prompt": "p", "cwd": "/"}),
@@ -305,6 +306,26 @@ class ProtocolTests(unittest.TestCase):
 
 
 class RunTests(unittest.TestCase):
+    def test_sub_millisecond_timeout_is_refused_and_one_millisecond_round_trips(self) -> None:
+        h = Harness()
+        h.ok(h.control_a, "session.open", {"engine": "claude", "session": "s-one"})
+        refused = h.call(
+            h.control_a,
+            "session.run",
+            {"engine": "claude", "session": "s-one", "prompt": "p", "timeout_s": 0.0001},
+        )
+        self.assertEqual(err.INVALID_PARAMS, code_of(refused))
+        self.assertEqual("timeout_range", refused["error"]["message"])
+        self.assertEqual(0, h.transport.calls)
+        self.assertEqual("open", h.ok(h.control_a, "session.get", {"engine": "claude", "session": "s-one"})["state"])
+        result = h.ok(
+            h.control_a,
+            "session.run",
+            {"engine": "claude", "session": "s-one", "prompt": "p", "timeout_s": 0.001},
+        )
+        self.assertEqual(1, result["request"]["timeout_ms"])
+        self.assertEqual([], list(contract_validator("RouteExecutionRequest").iter_errors(result["request"])))
+
     def test_run_returns_digest_only_records_that_validate(self) -> None:
         h = Harness()
         h.ok(h.control_a, "session.open", {"engine": "claude", "session": "s-one"})

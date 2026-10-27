@@ -109,7 +109,7 @@ non-sensitive digests/tombstones and explicit proof state.
    a complete spec and accept its digest; otherwise explicit acceptance is required.
 5. The kernel appends `GoalSpecAccepted`; only then may Head propose an ArmRun.
 
-The authenticated Owner may amend GoalSpec intent, scope, acceptance, privacy exposure, authority, spending or
+Only the authenticated Owner may amend GoalSpec intent, scope, acceptance, privacy exposure, authority, spending or
 terminal seams. Head and ARM may narrow descendant assignments without changing the GoalSpec.
 New operative law/constitution and authenticated Owner restrictions take effect immediately at
 admission and effect recheck; they are not GoalSpec mutations. A GoalSpec restriction amendment

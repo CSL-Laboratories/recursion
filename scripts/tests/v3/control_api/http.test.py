@@ -712,6 +712,7 @@ class CliTests(unittest.TestCase):
             target = os.fspath(token_file)
             events: list[str] = []
             held: list[int] = []
+            deferred: list[str] = []
             real_open = os.open
             real_lstat = os.lstat
             real_unlink = os.unlink
@@ -744,19 +745,33 @@ class CliTests(unittest.TestCase):
                 return real_lstat(path)
 
             def guarded_unlink(path: str) -> None:
-                if os.fspath(path) == target:
-                    if windows and any(descriptor_open(descriptor) for descriptor in held):
-                        raise PermissionError(
-                            13,
-                            "The process cannot access the file because it is being used by another process",
-                        )
-                    events.append("unlink")
-                real_unlink(path)
+                if os.fspath(path) != target:
+                    real_unlink(path)
+                    return
+                if windows and any(descriptor_open(descriptor) for descriptor in held):
+                    raise PermissionError(
+                        13,
+                        "The process cannot access the file because it is being used by another process",
+                    )
+                events.append("unlink")
+                try:
+                    real_unlink(path)
+                except OSError:
+                    if windows or not any(descriptor_open(descriptor) for descriptor in held):
+                        raise
+                    # os.name is pinned to posix. A Windows host still refuses
+                    # to unlink an open file, so drop the name after close.
+                    deferred.append(os.fspath(path))
 
             def tracking_close(descriptor: int) -> None:
                 if descriptor in held:
                     events.append("close")
                 real_close(descriptor)
+                if deferred and not any(descriptor_open(item) for item in held):
+                    pending = deferred[:]
+                    deferred.clear()
+                    for path in pending:
+                        real_unlink(path)
 
             patches = [
                 mock.patch.object(os, "open", tracking_open),
@@ -764,9 +779,10 @@ class CliTests(unittest.TestCase):
                 mock.patch.object(os, "unlink", guarded_unlink),
                 mock.patch.object(os, "close", tracking_close),
                 mock.patch.object(os, "write", fail_write),
+                # raise/short/partial pin posix even on the Windows runner.
+                # raise-windows keeps the nt close-then-unlink order.
+                mock.patch.object(os, "name", "nt" if windows else "posix"),
             ]
-            if windows:
-                patches.append(mock.patch.object(os, "name", "nt"))
             stderr = io.StringIO()
             with contextlib.ExitStack() as stack:
                 for patch in patches:

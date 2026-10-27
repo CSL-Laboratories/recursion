@@ -98,6 +98,11 @@ def unlink_created_token(
     descriptor, so the descriptor is closed after the check and before unlink.
     POSIX unlinks first and closes afterwards, which keeps the inode pinned
     until the name is gone.
+
+    Closing before unlink on Windows leaves a short window where the name can
+    be replaced. That is acceptable for this loopback fake server: an operator
+    would have to delete the token and start a second server on the same path
+    inside that window.
     """
 
     raw = os.fspath(path)

@@ -13,7 +13,6 @@ import http.client
 import io
 import json
 import os
-import selectors
 import signal
 import socket
 import stat
@@ -31,11 +30,8 @@ ROOT = Path(__file__).resolve().parents[4]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-# The gate runs this file with -B. Passing that flag through to every
-# serve-fake child recompiles the package on each spawn. On the macOS runner
-# that startup missed the ready-line deadline and the suite sat on the 180s
-# gate. Cache bytecode in a temp directory so later children reuse it, and
-# keep those files out of the repo.
+# The gate runs this file with -B. Children do not inherit that flag.
+# Bytecode goes to a temp directory so it stays out of the repo.
 _PYCACHE = tempfile.TemporaryDirectory(prefix="control-api-pyc-")
 
 from scripts.v3.control_api import errors as err  # noqa: E402
@@ -485,7 +481,9 @@ class CliTests(unittest.TestCase):
                 cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             )
             try:
-                line = server.stdout.readline()
+                line = _stdout_line(server)
+                if not line:
+                    self.fail(_stderr_text(server) or "serve-fake produced no ready line")
                 info = json.loads(line)
                 self.assertFalse(info["live_calls"])
                 token = token_file.read_text().strip()
@@ -535,7 +533,10 @@ class CliTests(unittest.TestCase):
                 cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             )
             try:
-                info = json.loads(server.stdout.readline())
+                ready_line = _stdout_line(server)
+                if not ready_line:
+                    self.fail(_stderr_text(server) or "serve-fake produced no ready line")
+                info = json.loads(ready_line)
                 token = token_file.read_text().strip()
                 bad = Path(directory) / "loose"
                 bad.write_text(token)
@@ -1056,7 +1057,12 @@ class CliTests(unittest.TestCase):
 
 
 def _child_env() -> dict[str, str]:
-    env = {**os.environ, "PYTHONPATH": str(ROOT), "PYTHONPYCACHEPREFIX": _PYCACHE.name}
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(ROOT),
+        "PYTHONPYCACHEPREFIX": _PYCACHE.name,
+        "PYTHONUNBUFFERED": "1",
+    }
     env.pop("PYTHONDONTWRITEBYTECODE", None)
     return env
 
@@ -1107,44 +1113,72 @@ def _bind_options(*, windows: bool) -> list[tuple[int, object, int]]:
     return recorded
 
 
-def _stdout_line(proc: subprocess.Popen[str], timeout: float = 10) -> str:
-    """Read one stdout line on this thread, or "" if none arrives in time.
+# Own budget for one serve-fake process to print its ready line. This is not
+# the suite cap. A child that never prints used to sit in readline until the
+# 180s gate killed the file.
+_SERVE_FAKE_READY_S = 25.0
 
-    A bare ``readline`` has no deadline. The sigterm tests used to block there
-    until the 180s gate. The read stays on the caller so it is not waiting on
-    another thread.
+
+def _stdout_line(proc: subprocess.Popen[str], timeout: float = _SERVE_FAKE_READY_S) -> str:
+    """Read one stdout line on this thread, or "" if none arrives within ``timeout``.
+
+    The read matches the passing ``serve-fake`` test: ``readline`` on the
+    caller. A watchdog kills the child when the startup deadline passes so
+    this wait cannot consume the suite cap. stderr is drained beside the
+    read so a full pipe cannot stall the ready line.
     """
 
+    _capture_stderr(proc)
     stdout = proc.stdout
     if stdout is None:
         return ""
-    selector = selectors.DefaultSelector()
-    try:
-        selector.register(stdout, selectors.EVENT_READ)
-        if not selector.select(timeout):
+    done = threading.Event()
+
+    def watchdog() -> None:
+        if not done.wait(timeout):
             proc.kill()
-            return ""
+
+    threading.Thread(target=watchdog, daemon=True).start()
+    try:
         return stdout.readline()
     finally:
-        selector.close()
+        done.set()
+
+
+def _capture_stderr(proc: subprocess.Popen[str]) -> None:
+    if getattr(proc, "_stderr_thread", None) is not None:
+        return
+    parts: list[str] = []
+    setattr(proc, "_stderr_parts", parts)
+
+    def drain() -> None:
+        stderr = proc.stderr
+        if stderr is None:
+            return
+        parts.append(stderr.read())
+
+    reader = threading.Thread(target=drain, daemon=True)
+    setattr(proc, "_stderr_thread", reader)
+    reader.start()
 
 
 def _stderr_text(proc: subprocess.Popen[str], timeout: float = 2) -> str:
-    """Read stderr, or "" if the child does not close it within ``timeout``.
+    """stderr captured while waiting for the ready line, or a bounded read."""
 
-    ``read`` waits for EOF. A child that is still alive must not hold the suite
-    here, so the read runs beside the deadline.
-    """
-
+    reader = getattr(proc, "_stderr_thread", None)
+    parts = getattr(proc, "_stderr_parts", None)
+    if reader is not None:
+        reader.join(timeout)
+        return "".join(parts or [])
     holder: dict[str, str] = {}
 
     def read() -> None:
         stderr = proc.stderr
         holder["text"] = stderr.read() if stderr is not None else ""
 
-    reader = threading.Thread(target=read, daemon=True)
-    reader.start()
-    reader.join(timeout)
+    fallback = threading.Thread(target=read, daemon=True)
+    fallback.start()
+    fallback.join(timeout)
     return holder.get("text", "")
 
 

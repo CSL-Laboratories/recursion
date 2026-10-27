@@ -9,11 +9,11 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import errno
 import http.client
 import io
 import json
 import os
+import selectors
 import signal
 import socket
 import stat
@@ -25,10 +25,18 @@ import time
 import unittest
 import unittest.mock as mock
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[4]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+# The gate runs this file with -B. Passing that flag through to every
+# serve-fake child recompiles the package on each spawn. On the macOS runner
+# that startup missed the ready-line deadline and the suite sat on the 180s
+# gate. Cache bytecode in a temp directory so later children reuse it, and
+# keep those files out of the repo.
+_PYCACHE = tempfile.TemporaryDirectory(prefix="control-api-pyc-")
 
 from scripts.v3.control_api import errors as err  # noqa: E402
 from scripts.v3.control_api.auth import SCOPE_CONTROL, SCOPE_OBSERVE  # noqa: E402
@@ -42,7 +50,6 @@ from scripts.v3.control_api.client import (  # noqa: E402
     write_token_file,
 )
 from scripts.v3.control_api.fake_engines import ENGINES, build_fake_stack  # noqa: E402
-from scripts.v3.control_api import http_server  # noqa: E402
 from scripts.v3.control_api.http_server import ControlHTTPServer, RemoteBindRefused  # noqa: E402
 
 PROMPT = "Review the change and answer with a verdict."
@@ -282,30 +289,22 @@ class BindTests(unittest.TestCase):
         with ControlHTTPServer(stack.service, "localhost") as server:
             self.assertTrue(server.url.startswith("http://127.0.0.1:"))
 
-    def test_windows_does_not_reuse_a_listening_loopback_port(self) -> None:
-        # HTTPServer sets SO_REUSEADDR. On Windows that accepts a second
-        # listener on the same specific address, and serve-fake then blocks.
+    def test_a_busy_port_refuses_a_second_server(self) -> None:
         stack = build_fake_stack()
-        with mock.patch.object(http_server.os, "name", "nt"):
-            windows = ControlHTTPServer(stack.service)
-            self.addCleanup(windows.close)
-            reuse = windows._server.socket.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR)
-            self.assertEqual(0, reuse)
-        holder = ControlHTTPServer(stack.service)
-        self.addCleanup(holder.close)
-        if os.name != "nt":
-            reuse = holder._server.socket.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR)
-            self.assertNotEqual(0, reuse)
-        duplicate: ControlHTTPServer | None = None
-        try:
-            duplicate = ControlHTTPServer(stack.service, port=holder.port)
-        except OSError as exc:
-            self.assertEqual(errno.EADDRINUSE, exc.errno)
-        else:
-            self.fail(f"second bind on 127.0.0.1:{holder.port} was accepted")
-        finally:
-            if duplicate is not None:
-                duplicate.close()
+        blocker = ControlHTTPServer(stack.service).start()
+        self.addCleanup(blocker.stop)
+        _assert_port_refuses_a_second_server(self, stack.service, blocker.port)
+
+    def test_windows_binds_exclusively_and_never_sets_reuseaddr(self) -> None:
+        # Windows SO_REUSEADDR lets a second socket bind a listening port, so
+        # serve-fake --port <busy> served forever instead of exiting 2.
+        # The socket option is what the server branches on, not os.name.
+        self.assertEqual(
+            [(socket.SOL_SOCKET, "SO_EXCLUSIVEADDRUSE", 1)], _bind_options(windows=True)
+        )
+
+    def test_posix_keeps_reuseaddr_for_restarts(self) -> None:
+        self.assertEqual([(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)], _bind_options(windows=False))
 
     def test_the_client_refuses_a_non_loopback_url(self) -> None:
         for url in ("http://example.com:80", "https://127.0.0.1:1", "http://192.0.2.1:1", "http://127.0.0.1"):
@@ -373,63 +372,27 @@ class TokenFileTests(unittest.TestCase):
         stack = build_fake_stack()
         blocker = ControlHTTPServer(stack.service).start()
         self.addCleanup(blocker.stop)
+        # signal.signal raises ValueError off the main thread, so a worker
+        # that calls main() never reaches stop.wait() and cannot catch a
+        # Windows co-bind. Refuse the port on this thread first. If that
+        # passes, main() on the busy port fails before it serves.
+        _assert_port_refuses_a_second_server(self, stack.service, blocker.port)
         with tempfile.TemporaryDirectory() as directory:
             token_file = Path(directory) / "token"
-            outcome: dict[str, object] = {}
-
-            def invoke() -> None:
-                try:
-                    outcome["code"] = main(
-                        [
-                            "serve-fake",
-                            "--token-file",
-                            str(token_file),
-                            "--port",
-                            str(blocker.port),
-                        ]
-                    )
-                except BaseException as exc:  # noqa: BLE001 - report the worker failure
-                    outcome["error"] = exc
-
-            # A Windows SO_REUSEADDR regression accepts the occupied port and
-            # serve-fake blocks in stop.wait(). Fail that here instead of
-            # waiting out the suite cap. The buffer is installed by the parent:
-            # a worker still inside main never runs its own cleanup, and
-            # sys.stderr is process-wide.
-            with _process_stderr_buffer() as stderr:
-                worker = threading.Thread(target=invoke, daemon=True)
-                worker.start()
-                worker.join(10)
-            self.assertIsNot(sys.stderr, stderr)
-            self.assertFalse(
-                worker.is_alive(),
-                "serve-fake kept running on a loopback port that was already bound",
-            )
-            self.assertNotIn("error", outcome)
-            self.assertEqual(2, outcome.get("code"))
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                code = main(
+                    [
+                        "serve-fake",
+                        "--token-file",
+                        str(token_file),
+                        "--port",
+                        str(blocker.port),
+                    ]
+                )
+            self.assertEqual(2, code)
             self.assertIn("OSError", stderr.getvalue())
             self.assertFalse(token_file.exists())
-
-    def test_a_stuck_bind_failure_worker_restores_stderr(self) -> None:
-        release = threading.Event()
-        started = threading.Event()
-
-        def hang() -> None:
-            print("from-worker", file=sys.stderr)
-            started.set()
-            release.wait(30)
-
-        self.addCleanup(release.set)
-        with _process_stderr_buffer() as captured:
-            worker = threading.Thread(target=hang, daemon=True)
-            worker.start()
-            self.assertTrue(started.wait(2))
-            self.assertTrue(worker.is_alive())
-        self.assertIsNot(sys.stderr, captured)
-        self.assertIn("from-worker", captured.getvalue())
-        release.set()
-        worker.join(2)
-        self.assertFalse(worker.is_alive())
 
     def test_excess_connections_are_refused(self) -> None:
         stack = build_fake_stack()
@@ -516,10 +479,9 @@ class CliTests(unittest.TestCase):
     def test_serve_fake_call_and_events_without_printing_the_token(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             token_file = Path(directory) / "token"
-            env = {**os.environ, "PYTHONPATH": str(ROOT)}
+            env = _child_env()
             server = subprocess.Popen(
-                [sys.executable, "-X", "utf8", "-B", "-m", "scripts.v3.control_api", "serve-fake",
-                 "--token-file", str(token_file)],
+                _child_cmd("serve-fake", "--token-file", str(token_file)),
                 cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             )
             try:
@@ -531,8 +493,7 @@ class CliTests(unittest.TestCase):
 
                 def cli(*args: str) -> subprocess.CompletedProcess:
                     return subprocess.run(
-                        [sys.executable, "-X", "utf8", "-B", "-m", "scripts.v3.control_api", *args,
-                         "--url", info["url"], "--token-file", str(token_file)],
+                        _child_cmd(*args, "--url", info["url"], "--token-file", str(token_file)),
                         cwd=ROOT, env=env, capture_output=True, text=True, timeout=60,
                     )
 
@@ -551,8 +512,7 @@ class CliTests(unittest.TestCase):
                 for completed in (opened, ran, events):
                     self.assertNotIn(token, completed.stdout + completed.stderr)
                 again = subprocess.run(
-                    [sys.executable, "-X", "utf8", "-B", "-m", "scripts.v3.control_api", "serve-fake",
-                     "--token-file", str(token_file)],
+                    _child_cmd("serve-fake", "--token-file", str(token_file)),
                     cwd=ROOT, env=env, capture_output=True, text=True, timeout=60,
                 )
                 self.assertEqual(2, again.returncode)
@@ -569,10 +529,9 @@ class CliTests(unittest.TestCase):
     def test_cli_refuses_a_loose_token_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             token_file = Path(directory) / "token"
-            env = {**os.environ, "PYTHONPATH": str(ROOT)}
+            env = _child_env()
             server = subprocess.Popen(
-                [sys.executable, "-X", "utf8", "-B", "-m", "scripts.v3.control_api", "serve-fake",
-                 "--token-file", str(token_file)],
+                _child_cmd("serve-fake", "--token-file", str(token_file)),
                 cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             )
             try:
@@ -582,8 +541,7 @@ class CliTests(unittest.TestCase):
                 bad.write_text(token)
                 os.chmod(bad, 0o644)
                 refused = subprocess.run(
-                    [sys.executable, "-X", "utf8", "-B", "-m", "scripts.v3.control_api", "call",
-                     "--url", info["url"], "--token-file", str(bad), "service.info"],
+                    _child_cmd("call", "--url", info["url"], "--token-file", str(bad), "service.info"),
                     cwd=ROOT, env=env, capture_output=True, text=True, timeout=60,
                 )
                 self.assertEqual(2, refused.returncode)
@@ -602,11 +560,8 @@ class CliTests(unittest.TestCase):
     def test_sigterm_unlinks_the_token_file_and_the_path_can_be_reused(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             token_file = Path(directory) / "token"
-            env = {**os.environ, "PYTHONPATH": str(ROOT)}
-            command = [
-                sys.executable, "-X", "utf8", "-B", "-m", "scripts.v3.control_api", "serve-fake",
-                "--token-file", str(token_file),
-            ]
+            env = _child_env()
+            command = _child_cmd("serve-fake", "--token-file", str(token_file))
 
             def launch() -> subprocess.Popen[str]:
                 return subprocess.Popen(
@@ -665,11 +620,8 @@ class CliTests(unittest.TestCase):
     def test_sigterm_leaves_a_replaced_token_file_in_place(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             token_file = Path(directory) / "token"
-            env = {**os.environ, "PYTHONPATH": str(ROOT)}
-            command = [
-                sys.executable, "-X", "utf8", "-B", "-m", "scripts.v3.control_api", "serve-fake",
-                "--token-file", str(token_file),
-            ]
+            env = _child_env()
+            command = _child_cmd("serve-fake", "--token-file", str(token_file))
 
             def launch() -> subprocess.Popen[str]:
                 return subprocess.Popen(
@@ -1103,30 +1055,87 @@ class CliTests(unittest.TestCase):
                         pass
 
 
-def _stdout_line(proc: subprocess.Popen[str], timeout: float = 10) -> str:
-    """Read one stdout line, or return "" if the child does not write it in time.
+def _child_env() -> dict[str, str]:
+    env = {**os.environ, "PYTHONPATH": str(ROOT), "PYTHONPYCACHEPREFIX": _PYCACHE.name}
+    env.pop("PYTHONDONTWRITEBYTECODE", None)
+    return env
 
-    ``readline`` has no deadline. A child that never prints the ready line
-    would otherwise sit until the suite cap.
+
+def _child_cmd(*args: str) -> list[str]:
+    return [sys.executable, "-X", "utf8", "-m", "scripts.v3.control_api", *args]
+
+
+def _assert_port_refuses_a_second_server(case: unittest.TestCase, service: Any, port: int) -> None:
+    try:
+        second = ControlHTTPServer(service, port=port)
+    except OSError:
+        return
+    second.close()
+    case.fail(f"a second server bound busy port {port}")
+
+
+def _bind_options(*, windows: bool) -> list[tuple[int, object, int]]:
+    """Socket options a ControlHTTPServer sets before bind.
+
+    Only Windows defines socket.SO_EXCLUSIVEADDRUSE. Add or remove it to pick
+    the platform branch the server takes. The option is not taken from os.name.
     """
 
-    holder: dict[str, str] = {}
+    stack = build_fake_stack()
+    recorded: list[tuple[int, object, int]] = []
+    real_setsockopt = socket.socket.setsockopt
+    exclusive = "SO_EXCLUSIVEADDRUSE"
 
-    def read() -> None:
-        stdout = proc.stdout
-        holder["line"] = stdout.readline() if stdout is not None else ""
+    def recording(sock: socket.socket, level: int, option: object, value: int) -> None:
+        recorded.append((level, option, value))
+        if isinstance(option, int):
+            real_setsockopt(sock, level, option, value)
 
-    reader = threading.Thread(target=read, daemon=True)
-    reader.start()
-    reader.join(timeout)
-    if reader.is_alive():
-        proc.kill()
-        reader.join(2)
+    with contextlib.ExitStack() as patches:
+        if windows:
+            # A marker the recorder swallows, so the Windows-only option is
+            # observed on every platform without reaching the OS.
+            patches.enter_context(
+                mock.patch.object(socket, "SO_EXCLUSIVEADDRUSE", exclusive, create=True)
+            )
+        elif hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            # None, not delattr: patch cleanup must restore the original.
+            patches.enter_context(mock.patch.object(socket, "SO_EXCLUSIVEADDRUSE", None))
+        patches.enter_context(mock.patch.object(socket.socket, "setsockopt", recording))
+        server = ControlHTTPServer(stack.service)
+    server.close()
+    return recorded
+
+
+def _stdout_line(proc: subprocess.Popen[str], timeout: float = 10) -> str:
+    """Read one stdout line on this thread, or "" if none arrives in time.
+
+    A bare ``readline`` has no deadline. The sigterm tests used to block there
+    until the 180s gate. The read stays on the caller so it is not waiting on
+    another thread.
+    """
+
+    stdout = proc.stdout
+    if stdout is None:
         return ""
-    return holder.get("line", "")
+    selector = selectors.DefaultSelector()
+    try:
+        selector.register(stdout, selectors.EVENT_READ)
+        if not selector.select(timeout):
+            proc.kill()
+            return ""
+        return stdout.readline()
+    finally:
+        selector.close()
 
 
 def _stderr_text(proc: subprocess.Popen[str], timeout: float = 2) -> str:
+    """Read stderr, or "" if the child does not close it within ``timeout``.
+
+    ``read`` waits for EOF. A child that is still alive must not hold the suite
+    here, so the read runs beside the deadline.
+    """
+
     holder: dict[str, str] = {}
 
     def read() -> None:
@@ -1142,23 +1151,6 @@ def _stderr_text(proc: subprocess.Popen[str], timeout: float = 2) -> str:
 def _file_id(path: Path) -> tuple[int, int]:
     info = path.lstat()
     return info.st_dev, info.st_ino
-
-
-@contextlib.contextmanager
-def _process_stderr_buffer():
-    """Point stderr at a private buffer and put the previous stream back.
-
-    ``sys.stderr`` is process-wide. Restoring it in the caller covers a worker
-    that is still running when the wait ends.
-    """
-
-    captured = io.StringIO()
-    saved = sys.stderr
-    sys.stderr = captured
-    try:
-        yield captured
-    finally:
-        sys.stderr = saved
 
 
 if __name__ == "__main__":

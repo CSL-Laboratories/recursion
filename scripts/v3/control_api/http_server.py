@@ -14,7 +14,6 @@ relay (CSL-498) are not built here, and nothing here is reachable off-host.
 from __future__ import annotations
 
 import json
-import os
 import socket
 import threading
 import time
@@ -156,12 +155,15 @@ class _Server(ThreadingHTTPServer):
     max_connections: int = MAX_CONNECTIONS
 
     def server_bind(self) -> None:
-        # POSIX ``SO_REUSEADDR`` only permits a bind during ``TIME_WAIT``.
-        # On Windows the same option lets a second socket bind a specific
-        # address that is still listening (same user; Winsock, Server 2003+),
-        # so ``serve-fake`` on an occupied port would run instead of failing.
-        # A default specific bind returns ``WSAEADDRINUSE``.
-        self.allow_reuse_address = os.name != "nt"
+        # POSIX SO_REUSEADDR only lets a restart bind past TIME_WAIT. Windows
+        # SO_REUSEADDR lets a second socket bind a port that is already
+        # listening, and a default bind lets a later SO_REUSEADDR socket
+        # co-bind ours and take connections (and their bearer tokens). Only
+        # Windows defines SO_EXCLUSIVEADDRUSE; use it there.
+        exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+        self.allow_reuse_address = exclusive is None
+        if exclusive is not None:
+            self.socket.setsockopt(socket.SOL_SOCKET, exclusive, 1)
         super().server_bind()
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:

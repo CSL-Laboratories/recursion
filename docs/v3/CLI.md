@@ -1,7 +1,8 @@
 ---
 title: Recursion v3 CLI direction
-status: accepted-surface-with-open-command-research
-last-updated: 2026-09-07
+status: amendment proposed (2026-10-24); acceptance is a human decision by Lucas
+last-updated: 2026-10-25
+prior-status: accepted-surface-with-open-command-research
 ---
 
 # Recursion v3 CLI hypothesis
@@ -151,6 +152,14 @@ an owner configure and inspect Recursion without asking an agent to edit files o
 Telegram is an optional interactive transport, not a replacement configuration authority. No
 graphical frontend is required for the v3 release. The same design should remain teachable
 enough for later public users.
+
+Amendment proposed 2026-10-24 (acceptance is a human decision by Lucas): D-038 already
+superseded "No graphical frontend is required" as a release-exclusion (built but opt-in;
+no capability deferred). This amendment does not reopen D-038. The CLI remains the
+schema-driven editor and a complete operator surface. **Beyond D-038** a daemon-served GUI
+in a thin Tauri shell is a client of the same command schema. Agent-installable setup
+(`doctor --json`, Control MCP) is added; an agent is still never the only way to configure.
+See [AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md).
 
 The CLI is a schema-driven editor, validator, explainer, and control surface over human-readable configuration. It is not the only copy of settings and does not hide policy in an opaque database.
 

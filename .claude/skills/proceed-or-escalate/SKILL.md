@@ -86,8 +86,8 @@ Meanwhile: paused (or: <other work from the proceed list>)
 ```
 
 "Meanwhile" is never the option you are asking about, nor work that presupposes
-any option. In recursion, also record
-the blocker in `state/INBOX.md`. Then stop that line of work, release your claim
+any option. In recursion, the Linear issue comment is the canonical
+escalation; `state/INBOX.md` is optional. Then stop that line of work, release your claim
 (see Claims), and take only other admitted work that is next under the
 human-approved order. If there is no such order, propose one and wait. Do not ask
 again until something changes.
@@ -116,7 +116,9 @@ holds the record format and wins on any conflict.
   hours from the comment's last Linear `updatedAt`; past that, make no write until
   you renew. A renewal up to 2 hours 30 minutes after that `updatedAt` restores the
   lease; after that, never renew it. Take a claim over only under the AGENTS.md
-  takeover conditions.
+  takeover conditions. Cross-repo: the other product repository forbids
+  automatic takeover and needs `ACK TAKEOVER`; recursion allows takeover after
+  lease plus grace; an agent working in both repos follows each repo's own rule.
 - On session start or resume, before any write, check each claim you hold. If its
   lease plus grace has passed, release it as lease expiry and never renew it; then
   re-read the issue and take a fresh claim. Set `heartbeat-at` to the actual edit

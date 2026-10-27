@@ -26,6 +26,10 @@ ROOT = Path(__file__).resolve().parents[1]
 GATE_PATH = ROOT / "scripts" / "ci" / "claude_pr_fixer_gate.py"
 WORKFLOW_PATH = ROOT / ".github" / "workflows" / "claude.yml"
 SCAN_WORKFLOW_PATH = ROOT / ".github" / "workflows" / "conflict-scan.yml"
+# CSL-414 Port C: conflict-scan.yml's conflict-resolve job calls this reusable writer per PR.
+WRITER_WORKFLOW_PATH = ROOT / ".github" / "workflows" / "claude-conflict-writer.yml"
+WRITER_LOCK = "claude-${{ inputs.pr_number }}"
+CONFLICT_STAGES = ("prepare", "model", "publish")
 HEREDOC = "CLAUDE_PR_FIXER_GATE"
 SCAN_CRON = 'cron: "11 */2 * * *"'
 REPO = "acme/example"
@@ -403,6 +407,30 @@ class WholeWordTests(unittest.TestCase):
         self.assertFalse(gate.is_whole_word_mention(None))
 
 
+# CSL-414 (the CSL-377 split): each writer is a trusted prepare, an untrusted model job and a trusted publish.
+WRITER_STAGES = ("mention-prepare", "claude-mention", "mention-publish", "fixer-prepare", "devin-review-fix", "fixer-publish")
+PREPARE_JOBS = ("mention-prepare", "fixer-prepare")
+MODEL_JOBS = ("claude-mention", "devin-review-fix")
+PUBLISH_JOBS = ("mention-publish", "fixer-publish")
+PR_LOCK = "claude-${{ needs.resolve-pr.outputs.pr_number }}"
+
+
+def job_block(text: str, name: str) -> str:
+    """One top-level job of a workflow, from its key to the next job."""
+    marker = f"\n  {name}:\n"
+    start = text.index(marker) + 1
+    nxt = re.search(r"\n  \S", text[start + len(marker) - 1 :])
+    return text[start:] if nxt is None else text[start : start + len(marker) - 1 + nxt.start()]
+
+
+def step_script(text: str, marker: str) -> str:
+    """The dedented `run: |` script of the step containing marker, ending at the next step or job."""
+    start = text.index(marker)
+    run = text.index("        run: |\n", start) + len("        run: |\n")
+    end = re.search(r"\n      - |\n\n  \S|\n  \S", text[run:])
+    return textwrap.dedent(text[run:] if end is None else text[run : run + end.start()])
+
+
 def validate_shared_writer_queues(text: str, expected_groups: list[str]) -> None:
     """Strict independent gate for the one syntax feature actionlint cannot parse."""
     groups = []
@@ -423,8 +451,11 @@ def validate_shared_writer_queues(text: str, expected_groups: list[str]) -> None
 
 class SharedQueuePolicyTests(unittest.TestCase):
     def test_all_four_shared_writers_use_bounded_fifo_queue(self) -> None:
-        validate_shared_writer_queues(WORKFLOW_PATH.read_text(), ["claude-${{ needs.resolve-pr.outputs.pr_number }}"] * 2)
-        validate_shared_writer_queues(SCAN_WORKFLOW_PATH.read_text(), ["claude-${{ matrix.pr.number }}"])
+        validate_shared_writer_queues(WORKFLOW_PATH.read_text(), [PR_LOCK] * len(WRITER_STAGES))
+        # Port C: the scan caller holds no lock (it would deadlock its inner jobs); the called writer's
+        # prepare, model and publish each take the shared per-PR lock.
+        validate_shared_writer_queues(SCAN_WORKFLOW_PATH.read_text(), [])
+        validate_shared_writer_queues(WRITER_WORKFLOW_PATH.read_text(), [WRITER_LOCK] * len(CONFLICT_STAGES))
         validate_shared_writer_queues((ROOT / ".github/workflows/codex-gate.yml").read_text(), ["claude-${{ github.event.pull_request.number }}"])
 
     def test_mutations_cannot_hide_behind_actionlint_compatibility_exception(self) -> None:
@@ -437,7 +468,32 @@ class SharedQueuePolicyTests(unittest.TestCase):
             original.replace("group: claude-${{", "group: independent-${{", 1),
         ):
             with self.assertRaises(ValueError):
-                validate_shared_writer_queues(bad, ["claude-${{ needs.resolve-pr.outputs.pr_number }}"] * 2)
+                validate_shared_writer_queues(bad, [PR_LOCK] * len(WRITER_STAGES))
+
+    def test_every_split_writer_stage_takes_the_per_pr_lock(self) -> None:
+        # GitHub releases the group between jobs, so prepare, model and publish each queue
+        # for it again; publish then rechecks the live head and pause itself.
+        text = WORKFLOW_PATH.read_text()
+        for name in WRITER_STAGES:
+            with self.subTest(job=name):
+                job = job_block(text, name)
+                validate_shared_writer_queues(job, [PR_LOCK])
+                head = job.split("    steps:", 1)[0]
+                self.assertEqual(head.count("    concurrency:\n"), 1)
+        for name in ("resolve-pr", "event-paths"):
+            self.assertNotIn("concurrency:", job_block(text, name), name)
+        writer = WRITER_WORKFLOW_PATH.read_text()
+        for name in CONFLICT_STAGES:
+            with self.subTest(job=name):
+                job = job_block(writer, name)
+                validate_shared_writer_queues(job, [WRITER_LOCK])
+                self.assertEqual(job.split("    steps:", 1)[0].count("    concurrency:\n"), 1)
+        for bad in (writer.replace("queue: max", "queue: single", 1),
+                    writer.replace("cancel-in-progress: false", "cancel-in-progress: true", 1),
+                    writer.replace("group: claude-${{ inputs.pr_number }}", "group: other-${{ inputs.pr_number }}", 1)):
+            with self.assertRaises(ValueError):
+                validate_shared_writer_queues(bad, [WRITER_LOCK] * len(CONFLICT_STAGES))
+        self.assertNotIn("concurrency:", job_block(SCAN_WORKFLOW_PATH.read_text(), "conflict-resolve"))
 
     def test_codex_journal_writer_lock_rejects_queue_and_group_drift(self):
         workflow = (ROOT / ".github/workflows/codex-gate.yml").read_text()
@@ -455,10 +511,11 @@ class SharedQueuePolicyTests(unittest.TestCase):
     def test_actionlint_exception_is_exact_and_path_scoped(self) -> None:
         config = (ROOT / ".github/actionlint.yaml").read_text()
         pattern = '^unexpected key "queue" for "concurrency" section\\. expected one of "cancel-in-progress", "group"$'
-        self.assertEqual(config.count("      - '" + pattern + "'"), 3)
-        self.assertEqual(config.count("    ignore:"), 3)
+        self.assertEqual(config.count("      - '" + pattern + "'"), 4)
+        self.assertEqual(config.count("    ignore:"), 4)
         self.assertIn("  .github/workflows/claude.yml:", config)
         self.assertIn("  .github/workflows/conflict-scan.yml:", config)
+        self.assertIn("  .github/workflows/claude-conflict-writer.yml:", config)
         self.assertIn("  .github/workflows/codex-gate.yml:", config)
         # CSL-408: every job is GitHub-hosted, so no custom runner labels are declared.
         self.assertNotIn("self-hosted-runner", config)
@@ -467,14 +524,9 @@ class SharedQueuePolicyTests(unittest.TestCase):
 
 class WorkflowStructureTests(unittest.TestCase):
     def test_light_jobs_use_github_hosted_runners(self) -> None:
-        resolve = self._job("resolve-pr")
-        mention = self._job("claude-mention")
-        paths = self._job("event-paths")
-        fixer = self._job("devin-review-fix")
-        self.assertIn("runs-on: ubuntu-latest", resolve.split("timeout-minutes", 1)[0])
-        self.assertIn("runs-on: ubuntu-latest", mention.split("timeout-minutes", 1)[0])
-        self.assertIn("runs-on: ubuntu-latest", paths.split("timeout-minutes", 1)[0])
-        self.assertIn("runs-on: ubuntu-latest", fixer.split("timeout-minutes", 1)[0])
+        for name in ("resolve-pr", "event-paths") + WRITER_STAGES:
+            job = self._job(name)
+            self.assertIn("runs-on: ubuntu-latest", job.split("timeout-minutes", 1)[0], name)
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -488,10 +540,8 @@ class WorkflowStructureTests(unittest.TestCase):
     def test_job_level_concurrency_does_not_cancel(self) -> None:
         self.assertIn("group: claude-${{ needs.resolve-pr.outputs.pr_number }}", self.text)
         self.assertIn("cancel-in-progress: false", self.text)
-        mention = self._job("claude-mention")
-        devin = self._job("devin-review-fix")
-        self.assertIn("concurrency:", mention)
-        self.assertIn("concurrency:", devin)
+        for name in WRITER_STAGES:
+            self.assertIn("concurrency:", self._job(name), name)
 
     def test_privileged_jobs_require_gate_outputs(self) -> None:
         mention = self._job("claude-mention")
@@ -502,6 +552,25 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn("needs.resolve-pr.outputs.same_repo == 'true'", devin)
         self.assertIn("github.event_name == 'workflow_dispatch'", devin)
         self.assertIn("github.event_name == 'repository_dispatch'", devin)
+        # CSL-414: the trusted prepare jobs admit the same events; every later stage needs a
+        # successful, unskipped prepare from this run attempt.
+        prepares = {"mention-prepare": ("needs.resolve-pr.outputs.mention == 'true'",),
+                    "fixer-prepare": ("needs.resolve-pr.outputs.devin == 'true'",
+                                      "github.event_name == 'workflow_dispatch'",
+                                      "github.event_name == 'repository_dispatch'")}
+        for name, needles in prepares.items():
+            header = self._job(name).split("    steps:", 1)[0]
+            for needle in needles + ("needs.resolve-pr.outputs.same_repo == 'true'",):
+                self.assertIn(needle, header, name)
+        for prepare, model, publish in zip(PREPARE_JOBS, MODEL_JOBS, PUBLISH_JOBS):
+            for name in (model, publish):
+                header = self._job(name).split("    steps:", 1)[0]
+                self.assertIn(f"needs.{prepare}.result == 'success'", header, name)
+                self.assertIn(f"needs.{prepare}.outputs.skip == 'false'", header, name)
+                self.assertIn(f"needs.{prepare}.outputs.run_attempt == github.run_attempt", header, name)
+            header = self._job(publish).split("    steps:", 1)[0]
+            self.assertIn("!cancelled()", header)
+            self.assertIn(f"needs.{model}.result != 'skipped'", header)
 
     def test_resolve_pr_job_if_skips_bots(self) -> None:
         resolve = self._job("resolve-pr")
@@ -523,9 +592,19 @@ class WorkflowStructureTests(unittest.TestCase):
         mention = self._job("claude-mention")
         devin = self._job("devin-review-fix")
         needle = "ref: ${{ needs.resolve-pr.outputs.head_sha }}"
-        self.assertIn("ref: ${{ steps.live.outputs.head_sha }}", mention)
-        self.assertIn("ref: ${{ steps.cap.outputs.head_sha }}", devin)
+        self.assertIn("ref: ${{ needs.mention-prepare.outputs.head_sha }}", mention)
+        self.assertIn("ref: ${{ needs.fixer-prepare.outputs.head_sha }}", devin)
+        self.assertIn("head_sha: ${{ steps.live.outputs.head_sha }}", self._job("mention-prepare"))
+        self.assertIn("head_sha: ${{ steps.cap.outputs.head_sha }}", self._job("fixer-prepare"))
         self.assertNotIn(needle, devin)
+        self.assertNotIn(needle, mention)
+        # Only the untrusted model jobs check out PR files, without a persisted credential.
+        for name in MODEL_JOBS:
+            job = self._job(name)
+            self.assertEqual(job.count("uses: actions/checkout@v4"), 1, name)
+            self.assertIn("persist-credentials: false", job, name)
+        for name in PREPARE_JOBS + PUBLISH_JOBS:
+            self.assertNotIn("actions/checkout", self._job(name), name)
         self.assertNotIn("ref: ${{ needs.resolve-pr.outputs.head_ref }}", mention)
         self.assertNotIn("ref: ${{ github.event.pull_request.head.ref }}", mention)
 
@@ -535,13 +614,15 @@ class WorkflowStructureTests(unittest.TestCase):
         attach = 'git checkout -B "$HEAD_REF" "$HEAD_SHA"'
         self.assertIn(attach, mention)
         self.assertIn(attach, devin)
-        push = (
-            "Bash(git push origin HEAD:refs/heads/"
-            "${{ needs.resolve-pr.outputs.head_ref }})"
-        )
-        self.assertIn(push.replace("needs.resolve-pr.outputs.head_ref", "steps.live.outputs.head_ref"), mention)
-        self.assertIn(push.replace("needs.resolve-pr.outputs.head_ref", "steps.cap.outputs.head_ref"), devin)
-        self.assertNotIn("HEAD:refs/heads/*", mention)
+        # CSL-414: the model job cannot push; only the trusted publisher pushes.
+        for name, job in (("claude-mention", mention), ("devin-review-fix", devin)):
+            self.assertLess(job.index(attach), job.index("uses: anthropics/claude-code-action@"), name)
+            allow = job.split("--allowedTools", 1)[1].split("--disallowedTools", 1)[0]
+            deny = job.split("--disallowedTools", 1)[1].split("\n", 1)[0]
+            self.assertNotIn("git push", allow, name)
+            for rule in ("Bash(git push:*)", "Bash(git config:*)", "Bash(git diff --no-index:*)"):
+                self.assertIn(rule, deny, name)
+            self.assertNotIn("HEAD:refs/heads/", job, name)
 
     def test_prompt_treats_review_and_files_as_untrusted(self) -> None:
         self.assertIn("UNTRUSTED DATA", self.text)
@@ -563,18 +644,65 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn("GH_TOKEN: ${{ github.token }}", self._job("resolve-pr"))
         self.assertIn("DISPATCH_EVENTS", source)
 
-    def test_dependencies_are_installed_before_model_invocation(self) -> None:
-        for name in ("claude-mention", "devin-review-fix"):
+    ACTION_SHA = "a5a423f75c251dcbff8a74e99f83b2cb03c72bfa"
+    ACTION_TAG = "v1.0.256"
+    ACTION_USES = f"anthropics/claude-code-action@{ACTION_SHA}"
+
+    def test_model_jobs_install_and_run_no_repository_code(self) -> None:
+        # CSL-414: the model job holds the model credential, so it installs no PR-controlled
+        # dependencies and runs no repository code; the required linux job tests the pushed commit.
+        for name in MODEL_JOBS:
             job = self._job(name)
-            self.assertLess(job.index("actions/setup-python@v5"), job.index("anthropics/claude-code-action@v1"))
-            self.assertLess(job.index("pip install --disable-pip-version-check -r requirements-ci.txt"), job.index("anthropics/claude-code-action@v1"))
-            self.assertIn('python-version: "3.12"', job)
-            self.assertNotIn("continue-on-error", job)
+            for needle in ("actions/setup-python", "pip install", "requirements-ci.txt", "tools/ci_gate.py --force",
+                           "python -X utf8", "python3 -X utf8"):
+                self.assertNotIn(needle, job, name)
+            self.assertNotIn("continue-on-error", job, name)
+            action = job.index("uses: anthropics/claude-code-action@")
+            self.assertIn("--setting-sources user", job, name)
+            self.assertIn('CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"', job[action:], name)
+            self.assertIn("DISABLE_UPDATES", job[action:], name)
+            self.assertLess(job.index("command -v bwrap"), action, name)
+            self.assertNotIn("anthropics/claude-code-action@v1", job)
+            self.assertIn("anthropics/claude-code-action@a5a423f75c251dcbff8a74e99f83b2cb03c72bfa", job)
+            self.assertIn("path_to_claude_code_executable: /opt/csl-claude/2.1.306/claude", job)
+            self.assertIn("Install hash-pinned Claude Code CLI", job, name)
+
+    def test_privileged_pip_isolates_sys_path_and_reads_trusted_requirements(self) -> None:
+        # CSL-414: model jobs hold the model credential and must not pip.
+        # CSL-471: linux CI jobs that still run pip do it isolated (python -P).
+        for name in MODEL_JOBS:
+            job = self._job(name)
+            with self.subTest(job=name):
+                self.assertNotIn("pip install", job)
+                self.assertNotIn("actions/setup-python", job)
+                self.assertNotIn("requirements-ci.txt", job)
+                self.assertNotIn("cache: pip", job)
+        ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        self.assertIn('python -P -m pip install --only-binary=:all: -r "$REQUIREMENTS_CI"', ci)
+        self.assertNotIn("python -m pip install", ci)
+        self.assertNotIn("cache: pip", ci)
+
+    def test_claude_code_action_is_pinned_to_resolved_v1_commit(self) -> None:
+        pin = f"uses: {self.ACTION_USES} # {self.ACTION_TAG}"
+        self.assertGreaterEqual(self.text.count(pin), 2)
+        self.assertNotIn("uses: anthropics/claude-code-action@v1\n", self.text)
+        writer = WRITER_WORKFLOW_PATH.read_text(encoding="utf-8")
+        self.assertIn(pin, writer)
+        self.assertNotIn("uses: anthropics/claude-code-action@v1\n", writer)
+        scan = SCAN_WORKFLOW_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("anthropics/claude-code-action@", scan)
+        contract = (ROOT / "docs" / "ci-event-contract.md").read_text(encoding="utf-8")
+        self.assertIn(self.ACTION_USES, contract)
+        self.assertNotIn("anthropics/claude-code-action@v1", contract)
 
     def test_acceptance_gates_before_push(self) -> None:
         devin = self._job("devin-review-fix")
         self.assertIn("acceptance gate", devin.lower())
         self.assertIn("tools/ci_gate.py", devin)
+        allow = devin.split("--allowedTools", 1)[1].split("--disallowedTools", 1)[0]
+        self.assertNotIn("ci_gate", allow)
+        self.assertIn("do not run tests, linters or any repository code", devin.lower())
+        self.assertIn("linux CI job runs the acceptance gate on the pushed commit", devin)
 
     def test_embedded_gate_matches_source_file(self) -> None:
         start = f"python3 - <<'{HEREDOC}'\n"
@@ -592,13 +720,9 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn("head_sha: ${{ steps.pr.outputs.head_sha }}", resolve)
 
     def _job(self, name: str) -> str:
-        marker = f"  {name}:"
-        start = self.text.find(marker)
-        self.assertGreaterEqual(start, 0, name)
-        nxt = self.text.find("\n  ", start + len(marker))
-        while nxt != -1 and self.text[nxt + 3 : nxt + 4] in (" ", "\t"):
-            nxt = self.text.find("\n  ", nxt + 1)
-        return self.text[start:] if nxt == -1 else self.text[start:nxt]
+        text = getattr(self, "text", None) or WORKFLOW_PATH.read_text(encoding="utf-8")
+        self.assertIn(f"\n  {name}:\n", text, name)
+        return job_block(text, name)
 
 
 class GateCliTests(unittest.TestCase):
@@ -690,6 +814,7 @@ def load_denials():
 
 class FixerGateAndPromptTests(unittest.TestCase):
     GATES = ("Bash(python -X utf8 -B tools/ci_gate.py --force)", "Bash(python3 -X utf8 -B tools/ci_gate.py --force)")
+    HELPER = "Bash(python3 ${{ runner.temp }}/claude-fixer-guard/model-api --:*)"
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -701,8 +826,11 @@ class FixerGateAndPromptTests(unittest.TestCase):
     def test_gates_are_single_commands_allowlisted_exactly(self) -> None:
         for job in ("claude-mention", "devin-review-fix"):
             body = self._job(job)
+            # CSL-414: the fixed root-owned helper is the only Bash rule; the model job runs no gate.
+            allow = body.split("--allowedTools", 1)[1].split("--disallowedTools", 1)[0]
+            self.assertEqual(re.findall(r"Bash\([^)]*\)", allow), [self.HELPER], job)
             for gate_tool in self.GATES:
-                self.assertIn(gate_tool, body, job)
+                self.assertNotIn(gate_tool, body, job)
             self.assertNotIn("Bash(cd ", body, job)
             self.assertNotIn("cd app &&", body, job)
             self.assertNotIn("ci_gate.py:*", body, job)
@@ -715,35 +843,36 @@ class FixerGateAndPromptTests(unittest.TestCase):
             self.assertIn("prompt: |", body, job)
             self.assertIn("commit SHA", body, job)
             self.assertIn("do NOT resolve the thread", body, job)
-            self.assertIn("pre-push model-api -- reply ID BODY_FILE", body, job)
-            self.assertIn(
-                "Bash(python3 ${{ runner.temp }}/claude-fixer-guard/pre-push model-api --:*)",
-                body,
-                job,
-            )
-            self.assertIn(
-                "Bash(python3 ${{ runner.temp }}/claude-fixer-guard/pre-push model-api --:*)",
-                body,
-                job,
-            )
-            self.assertNotIn("Bash(gh api graphql:*resolveReviewThread*)", body, job)
-            self.assertIn("existing trusted watcher or human resolution", body, job)
-            self.assertIn("Do not resolve a thread you have not answered", body, job)
-            self.assertIn("Do not use graphql for any other mutation", body, job)
+            self.assertIn("claude-fixer-guard/model-api -- reply COMMENT_ID BODY_FILE", body, job)
+            allow = body.split("--allowedTools", 1)[1].split("--disallowedTools", 1)[0]
+            self.assertIn(self.HELPER, allow, job)
+            self.assertNotIn("resolveReviewThread", allow, job)
+            self.assertNotIn("graphql", allow, job)
+            # CSL-414: the model resolves no thread at all; the watcher or a human does.
+            self.assertIn("Do not resolve threads or run GraphQL mutations", body, job)
             self.assertIn("do NOT push", body, job)
-            self.assertIn("Never exit without either pushing or posting that failure reply", body, job)
+            self.assertIn("PUBLISHING: you have no push access and must not try", body, job)
+            self.assertIn("NEVER push or force-push", body, job)
+            self.assertIn("Never exit without either committing a fix or queuing that failure reply", body, job)
             self.assertIn("UNTRUSTED DATA", body, job)
-            self.assertIn("exactly as written above: no pipes, redirects, or extra words", body, job)
+            self.assertIn("(one operation per call)", body, job)
             self.assertIn("no heredocs, loops, or &&", body, job)
-            self.assertIn("git commit -m with a short message", body, job)
+            self.assertNotIn("git commit -m", body, job)
+            self.assertIn("model-api -- commit .claude-fixer-replies/NAME.txt", body, job)
+            # CSL-414 B': the commit is built after the job, so the SHA is a token the publisher fills in
+            # only from its verified push; the model never writes a SHA of its own.
+            self.assertIn("It records your one commit intent and never changes .git; a second commit is refused.", body, job)
+            self.assertIn("write {{CLAUDE_COMMIT_SHA}}: the workflow replaces it with the full pushed SHA, or drops that record",
+                          " ".join(body.split()), job)
+            self.assertNotIn("prints the full 40/64-character commit SHA", body, job)
             self.assertIn("use Edit/Write for files", body, job)
-            self.assertIn("the gate result", body, job)
+            self.assertIn("linux CI job checks the pushed commit", body, job)
             self.assertIn("Linear-first (CSL-88)", body, job)
             self.assertIn("has no Linear, Context7 or Parallel tools", body, job)
             self.assertIn("Context7", body, job)
             self.assertIn("Parallel", body, job)
             self.assertIn("PR author relays status and blockers to Linear", body, job)
-            self.assertIn("exact GitHub/gate commands below", body, job)
+            self.assertIn("exact helper commands below", body, job)
             self.assertIn("Do not install tools, request access", body, job)
 
     def test_denials_are_reported_after_each_fixer(self) -> None:
@@ -756,9 +885,11 @@ class FixerGateAndPromptTests(unittest.TestCase):
 
     def test_embedded_denials_match_source(self) -> None:
         start = f"python3 - \"$EXECUTION_FILE\" <<'{DENIALS_HEREDOC}'\n"
-        combined = self.text + "\n" + SCAN_WORKFLOW_PATH.read_text(encoding="utf-8")
+        combined = self.text + "\n" + WRITER_WORKFLOW_PATH.read_text(encoding="utf-8")
         self.assertEqual(self.text.count(start), 2)
         self.assertEqual(combined.count(start), 3)
+        # Port C: the denials report runs in the conflict writer's model job, not in the scan caller.
+        self.assertNotIn(start, SCAN_WORKFLOW_PATH.read_text(encoding="utf-8"))
         source = DENIALS_PATH.read_text(encoding="utf-8").rstrip("\n")
         for chunk in combined.split(start)[1:]:
             embedded = textwrap.dedent(chunk[: chunk.find(DENIALS_HEREDOC)]).rstrip("\n")
@@ -1074,6 +1205,36 @@ class ConflictScanTests(unittest.TestCase):
         chosen, _ = self._select([conflicted_pr(labels=["bug", "holding", "do-not-merge"])])
         self.assertEqual(len(chosen), 1)
 
+    def test_human_pause_stops_the_conflict_writer(self) -> None:
+        for labels in (["claude:pause"], ["Hold"]):
+            chosen, audit = self._select([conflicted_pr(labels=labels)])
+            self.assertEqual(chosen, [])
+            self.assertIn("skip=paused", audit[0])
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {
+                "GITHUB_REPOSITORY": REPO, "CLAUDE_FIXER_PAUSE": "true", "GITHUB_OUTPUT": str(Path(d) / "out")}), \
+                mock.patch.object(self.mod, "fixer_busy") as busy, mock.patch.object(self.mod, "fetch_prs") as fetch, \
+                mock.patch("builtins.print"):
+            self.assertEqual(self.mod.main(), 0)
+            output = (Path(d) / "out").read_text()
+        busy.assert_not_called()
+        fetch.assert_not_called()
+        self.assertIn("count=0", output)
+        text = SCAN_WORKFLOW_PATH.read_text(encoding="utf-8")
+        self.assertEqual(text.count("CLAUDE_FIXER_PAUSE: ${{ vars.CLAUDE_FIXER_PAUSE }}"), 1)
+        # CSL-414 Port C: the per-PR recheck is the trusted prepare job; the model job
+        # (checkout, merge, model) runs only after prepare proceeds, and the
+        # publish job rereads the pause before any write.
+        writer = WRITER_WORKFLOW_PATH.read_text(encoding="utf-8")
+        self.assertEqual(writer.count("CLAUDE_FIXER_PAUSE: ${{ vars.CLAUDE_FIXER_PAUSE }}"), 2)
+        prep = writer.split("\n  prepare:\n", 1)[1].split("id: prep", 1)[1].split("\n  model:\n", 1)[0]
+        self.assertLess(prep.index('"${CLAUDE_FIXER_PAUSE:-}" = "true"'), prep.index('echo "skip=false"'))
+        self.assertLess(prep.index('select(. == "claude:pause" or . == "hold")'), prep.index('echo "skip=false"'))
+        self.assertIn('if (.labels | type) != "array" or any(.labels[]; type != "object") then "unreadable"', prep)
+        self.assertNotIn("git checkout", prep)
+        self.assertNotIn("git merge", prep)
+        model = writer.split("\n  model:\n", 1)[1].split("    steps:", 1)[0]
+        self.assertIn("needs.prepare.outputs.skip == 'false'", model)
+
     def test_repo_pause_variable_selects_nothing_without_reads(self) -> None:
         env = {"GITHUB_REPOSITORY": REPO, "PR_NUMBER": "", "CLAUDE_FIXER_PAUSE": "true", "GITHUB_OUTPUT": ""}
         with mock.patch.dict(os.environ, env), \
@@ -1133,59 +1294,141 @@ class ConflictJobStructureTests(unittest.TestCase):
         self.assertIn("GH_TOKEN: ${{ github.token }}", scan)
         self.assertIn("actions: read", scan)
         self.assertIn("runs-on: ubuntu-latest", scan.split("timeout-minutes", 1)[0])
+        # Port C: the resolver is a reusable-workflow caller (it runs nothing itself); every job of
+        # the called writer runs on a GitHub-hosted runner.
         resolve = self._job("conflict-resolve")
-        self.assertIn("runs-on: ubuntu-latest", resolve.split("timeout-minutes", 1)[0])
+        self.assertNotIn("runs-on:", resolve)
+        self.assertIn("    uses: ./.github/workflows/claude-conflict-writer.yml\n", resolve)
+        for name in CONFLICT_STAGES:
+            self.assertIn("runs-on: ubuntu-latest", self._writer(name).split("timeout-minutes", 1)[0], name)
+
+    def _writer(self, name: str) -> str:
+        return job_block(WRITER_WORKFLOW_PATH.read_text(encoding="utf-8"), name)
+
+    # The conflict writer's prompt and publisher protected-path list (same as claude.yml's split writers).
+    PROTECTED = (".github/ and any .git* or .env* path, .claude/, .cursor/, .claude-fixer-out/, .claude-fixer-replies/, "
+                 "scripts/ci/, scripts/tests/**/fixtures/, tools/ci_gate.py, tools/test_ci_gate.py, the loop test suites "
+                 "tools/test_claude_*, tools/test_codex_*, tools/test_fixer_* and tools/test_stuck_*, CONTROL_PLANE.md, "
+                 "ANCHOR.md, state/DECISIONS.md, CODEOWNERS, AGENTS.md, CLAUDE.md, .mcp.json, credential files")
 
     def test_resolver_keeps_protections(self) -> None:
-        job = self._job("conflict-resolve")
-        self.assertIn("github.event_name != 'push'", job.split("steps:", 1)[0])
-        self.assertIn("group: claude-${{ matrix.pr.number }}", job)
-        self.assertIn("cancel-in-progress: false", job)
-        self.assertIn("max-parallel: 1", job)
-        self.assertIn("ref: ${{ matrix.pr.head_sha }}", job)
+        caller = self._job("conflict-resolve")
+        self.assertIn("github.event_name != 'push'", caller.split("strategy:", 1)[0])
+        self.assertIn("max-parallel: 1", caller)
+        self.assertIn("fail-fast: false", caller)
+        self.assertIn("uses: ./.github/workflows/claude-conflict-writer.yml", caller)
+        self.assertNotIn("concurrency:", caller)  # A caller lock would deadlock its inner jobs.
+        self.assertNotIn("steps:", caller)
+        prepare = self._writer("prepare")
+        job = self._writer("model")
+        publish = self._writer("publish")
+        for part in (prepare, job, publish):
+            self.assertIn("runs-on: ubuntu-latest", part.split("steps:")[0])
+            self.assertIn("group: claude-${{ inputs.pr_number }}", part)
+            self.assertIn("cancel-in-progress: false", part)
+        self.assertIn("ref: ${{ needs.prepare.outputs.head_sha }}", job)
+        self.assertIn("persist-credentials: false", job)
         self.assertIn('git checkout -B "$HEAD_REF" "$HEAD_SHA"', job)
         self.assertIn("merge --no-ff --no-commit", job)
         self.assertNotIn("--no-edit", job)
         self.assertIn('git config user.name "claude[bot]"', job)
-        self.assertIn("if: steps.prep.outputs.proceed == 'true'", job)
-        self.assertIn('"open $HEAD_SHA dirty $REPO"', job)
-        self.assertIn(".head.repo.full_name", job)
-        for path in (".github/**", "AGENTS.md", "CLAUDE.md", "CODEOWNERS", "scripts/ci/**", "tools/ci_gate.py"):
+        self.assertIn('git config user.email "209825114+claude[bot]@users.noreply.github.com"', job)
+        self.assertIn("needs.prepare.outputs.skip == 'false'", job.split("steps:")[0])
+        self.assertIn("needs.prepare.outputs.skip == 'false'", publish.split("steps:")[0])
+        self.assertIn("proceed=true", prepare)
+        self.assertIn('"open $HEAD_SHA dirty $REPO $BASE_REF"', prepare)
+        self.assertIn(".head.repo.full_name", prepare)
+        self.assertIn(".base.ref", prepare)
+        for path in (".github/**", "AGENTS.md", "CLAUDE.md", "CODEOWNERS", "scripts/ci/**", "tools/ci_gate.py",
+                     "tools/test_claude_pr_fixer.py", ".git/**", ".env*", ".claude/**"):
             self.assertIn(f'"Edit({path})"', job)
             self.assertIn(f'"Write({path})"', job)
-        self.assertIn("tools/test_claude_pr_fixer.py.", job.split("--allowedTools", 1)[0])
-        self.assertIn("Bash(git push origin HEAD:refs/heads/${{ matrix.pr.head_ref }})", job)
-        self.assertNotIn("HEAD:refs/heads/*", job)
-        self.assertIn("Bash(git rebase:*)", job.split("--disallowedTools", 1)[1])
-        self.assertIn("Bash(git reset:*)", job.split("--disallowedTools", 1)[1])
+        self.assertIn('"Read(.env)"', job)
+        # The protected list is in the prompt twice (judgment path and publishing rules), and the
+        # publisher refuses a merge touching any of them.
+        prompt = job.split("prompt: |", 1)[1].split("claude_args:", 1)[0]
+        flat = " ".join(prompt.split())
+        self.assertEqual(flat.count(self.PROTECTED), 2)
+        devin = " ".join(job_block(WORKFLOW_PATH.read_text(encoding="utf-8"), "devin-review-fix").split())
+        self.assertIn(self.PROTECTED, devin)  # same list as the Devin writer
+        allow = job.split("--allowedTools", 1)[1].split("--disallowedTools", 1)[0]
+        disallow = job.split("--disallowedTools", 1)[1].split('"', 2)[1]
+        self.assertNotIn("pytest", allow)
+        self.assertNotIn("tools/test_claude_pr_fixer.py", allow)
+        self.assertNotIn("ci_gate", allow)
+        self.assertNotIn("comments/*/replies", allow)
+        self.assertNotIn("resolveReviewThread", allow)
+        # CSL-414: no push from the model job; the publish job pushes.
+        self.assertNotIn("git push", allow)
+        self.assertNotIn("HEAD:refs/heads/", job)
+        for rule in ("Bash(git push:*)", "Bash(git rebase:*)", "Bash(git reset:*)", "Bash(git config:*)",
+                     "Bash(git diff --no-index:*)", "Bash(gh api:*)"):
+            self.assertIn(rule, disallow.split(","))
+        self.assertEqual(re.findall(r"Bash\([^)]*\)", allow), [FixerGateAndPromptTests.HELPER])
+        self.assertIn("--setting-sources user", job)
         self.assertIn("Report tool-permission denials", job)
         self.assertIn("UNTRUSTED DATA", job)
         self.assertIn("no heredocs, loops, or &&", job)
-        self.assertIn("exactly as written above", job)
-        self.assertIn("tools/ci_gate.py --force", job)
+        # The model runs no gate or repository code; the required linux job checks the pushed commit.
+        self.assertNotIn("exactly as written above", job)
+        self.assertNotIn("tools/ci_gate.py --force", job)
+        self.assertIn("Do not run tests, linters or any repository code", job)
+        self.assertIn("linux CI job runs the acceptance gate on the pushed commit", flat)
+        self.assertIn("model-api -- status and python3 ${{ runner.temp }}/claude-fixer-guard/model-api -- conflicts", job)
+        self.assertNotIn("actions/setup-python", job)
+        self.assertNotIn("pip install", job)
         self.assertIn("Linear-first (CSL-88)", job)
         self.assertIn("PR-sync comment", job)
         self.assertIn("Context7", job)
         self.assertIn("Parallel", job)
+        self.assertNotIn("web research (Parallel)", job)
+        self.assertIn("any deep-research source the team has", job)
+        self.assertIn("Open Deep Research", job)
         self.assertIn("when those tools are available", job)
         self.assertIn("not a denied command that blocks the push", job)
+        self.assertIn("CSL-Laboratories/csl-research", job)
+        self.assertIn("Research bodies go", job)
+        self.assertIn("submissions/<record_id>/", job)
+        self.assertIn("through a PR there", job)
+        self.assertNotIn("submission record", job)
+        self.assertIn("never to this repo", job)
+        self.assertIn("digest on the Linear issue", job)
+        self.assertIn("New non-public docs", job)
+        self.assertIn("Existing files stay (CSL-536)", job)
 
-    def _prep(self, live: object, pause_var: str | None = None) -> tuple[str, str]:
+    def _prep(self, live: object, pause_var: str | None = None, env_extra: dict | None = None,
+              commit: object = None, reviews: object = None, ref: object = None,
+              repo: object = None, publisher_ref: object = None) -> tuple[str, str]:
         if shutil.which("bash") is None or shutil.which("jq") is None:
             self.skipTest("bash/jq not available")
-        job = self._job("conflict-resolve")
+        job = self._writer("prepare")
         start = job.index("        id: prep\n")
         run = job.index("        run: |\n", start) + len("        run: |\n")
-        script = textwrap.dedent(job[run:job.index("\n      - ", run)])
+        script = textwrap.dedent(job[run:])
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
-            (d / "pr.json").write_text(json.dumps(live), encoding="utf-8")
+            # Each endpoint reads its own fixture; the PR view is the default.
+            fixtures = {"pr": live, "commit": commit if commit is not None else {},
+                        "reviews": reviews if reviews is not None else [],
+                        "ref": ref if ref is not None else {"object": {"sha": "c" * 40}},
+                        "repo": repo if repo is not None else {"default_branch": "master"},
+                        "publisher_ref": publisher_ref if publisher_ref is not None else {"object": {"sha": "d" * 40}}}
+            for key, value in fixtures.items():
+                (d / f"{key}.json").write_text(json.dumps(value), encoding="utf-8")
             gh = d / "gh"
             gh.write_text(
                 "#!/usr/bin/env bash\n"
-                'expr=""; prev=""\n'
-                'for a in "$@"; do if [ "$prev" = "--jq" ]; then expr="$a"; fi; prev="$a"; done\n'
-                f'jq -r "$expr" "{d}/pr.json"\n',
+                'expr=""; prev=""; file=pr\n'
+                'for a in "$@"; do if [ "$prev" = "--jq" ]; then expr="$a"; fi; prev="$a";\n'
+                '  case "$a" in\n'
+                '    repos/o/r) file=repo;;\n'
+                '    */git/ref/heads/master) file=publisher_ref;;\n'
+                '    */git/ref/heads/*) file=ref;;\n'
+                '    */commits/*) file=commit;;\n'
+                '    */reviews*) file=reviews;;\n'
+                '    */pulls/*) file=pr;;\n'
+                '  esac; done\n'
+                f'jq -r "$expr" "{d}/$file.json"\n',
                 encoding="utf-8",
             )
             gh.chmod(0o755)
@@ -1196,6 +1439,7 @@ class ConflictJobStructureTests(unittest.TestCase):
             env.pop("CLAUDE_FIXER_PAUSE", None)
             if pause_var is not None:
                 env["CLAUDE_FIXER_PAUSE"] = pause_var
+            env.update(env_extra or {})
             result = subprocess.run(["bash", "-c", script], env=env, check=True, capture_output=True, text=True, cwd=tmp)
             return out.read_text(encoding="utf-8"), result.stdout
 
@@ -1219,18 +1463,119 @@ class ConflictJobStructureTests(unittest.TestCase):
         self.assertIn("stale scan result", stdout)
         self.assertNotIn("paused", stdout)
 
+    LIVE = {"state": "open", "head": {"sha": "a" * 40, "repo": {"full_name": "o/r"}}, "mergeable_state": "dirty",
+            "base": {"ref": "main"}, "labels": [{"name": "needs-review"}]}
+
+    def test_prepare_records_the_base_and_proceeds_only_when_live(self) -> None:
+        out, _ = self._prep(self.LIVE, "false")
+        self.assertEqual(out, "proceed=true\nskip=false\nhead_sha=" + "a" * 40 + "\nhead_ref=feature/x\n"
+                         "base_sha=" + "c" * 40 + "\npublisher_sha=" + "d" * 40 + "\n")
+        for live in (self.LIVE | {"state": "closed"}, self.LIVE | {"mergeable_state": "clean"},
+                     self.LIVE | {"head": {"sha": "a" * 40, "repo": {"full_name": "evil/r"}}},
+                     self.LIVE | {"base": {"ref": "release/v2"}}):
+            with self.subTest(live=live):
+                out, stdout = self._prep(live)
+                self.assertEqual(out, "proceed=false\n")
+                self.assertIn("stale scan result", stdout)
+        for ref in ({"object": {"sha": "short"}}, {}, {"object": {"sha": "a" * 40}}):
+            with self.subTest(ref=ref):
+                out, stdout = self._prep(self.LIVE, ref=ref)
+                self.assertEqual(out, "proceed=false\n")
+                self.assertIn("base branch unreadable", stdout)
+
+    def test_prepare_records_default_branch_sha_on_a_stacked_base(self) -> None:
+        # BASE_REF is another PR branch; the publisher still comes from master.
+        live = {**self.LIVE, "base": {"ref": "feature/lower"}}
+        out, _ = self._prep(live, "false", env_extra={"BASE_REF": "feature/lower"})
+        self.assertEqual(out, "proceed=true\nskip=false\nhead_sha=" + "a" * 40 + "\nhead_ref=feature/x\n"
+                         "base_sha=" + "c" * 40 + "\npublisher_sha=" + "d" * 40 + "\n")
+
+    def test_prepare_skips_when_the_default_branch_is_unreadable(self) -> None:
+        for repo, publisher_ref in (({"default_branch": ""}, None),
+                                    ({"default_branch": "master..x"}, None),
+                                    (None, {"object": {"sha": "short"}}),
+                                    (None, {"object": {}})):
+            with self.subTest(repo=repo, publisher_ref=publisher_ref):
+                out, stdout = self._prep(self.LIVE, "false", repo=repo, publisher_ref=publisher_ref)
+                self.assertEqual(out, "proceed=false\n")
+                self.assertIn("default branch unreadable", stdout)
+
+    def test_prepare_stringifies_label_names_like_the_scan_and_publisher(self) -> None:
+        # Master's `| tostring` keeps the label check total: the scan and the publisher compare
+        # str(name), so a non-string name is an ordinary non-pause label there. Without it jq exits 5
+        # on ascii_downcase and `set -e` fails the prepare step instead of making the same decision.
+        spec = importlib.util.spec_from_file_location("publisher", ROOT / "scripts/ci/claude_fixer_publish.py")
+        publisher = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(publisher)
+        scan = load_scan()
+        for names, paused in (([5], ""), ([True], ""), ([["hold"]], ""), ([{"name": "hold"}], ""), ([1.5, "bug"], ""),
+                              ([5, "Hold"], "hold"), ([True, "CLAUDE:PAUSE"], "claude:pause")):
+            with self.subTest(names=names):
+                labels = [{"name": name} for name in names]
+                out, stdout = self._prep(self.LIVE | {"labels": labels}, "false")
+                pr = conflicted_pr(head_sha="a" * 40)
+                pr["labels"] = labels
+                chosen, _audit = scan.select([pr], REPO, lookup, max_prs=3)
+                refusal = publisher.pause_refusal({"labels": labels}, {})
+                if paused:
+                    self.assertEqual(out, "proceed=false\n")
+                    self.assertIn(f"paused by PR label ({paused})", stdout)
+                    self.assertEqual(chosen, [])
+                    self.assertTrue(refusal)
+                else:
+                    self.assertTrue(out.startswith("proceed=true\nskip=false\n"), out)
+                    self.assertEqual(len(chosen), 1)
+                    self.assertEqual(refusal, "")
+
+    def test_prepare_validates_the_scan_context_before_any_read(self) -> None:
+        for key, value in (("PR_NUMBER", "0"), ("PR_NUMBER", "1;x"), ("PR_NUMBER", ""), ("HEAD_SHA", "A" * 40),
+                           ("HEAD_SHA", "a" * 39), ("HEAD_REF", "feature x"), ("HEAD_REF", "a..b"),
+                           ("BASE_REF", "main$(id)"), ("BASE_REF", ""), ("BASE_REF", "../x")):
+            with self.subTest(key=key, value=value):
+                # Paused labels would also stop it; the invalid context must stop it first.
+                out, stdout = self._prep(self.LIVE | {"labels": [{"name": "hold"}]}, env_extra={key: value})
+                self.assertEqual(out, "proceed=false\n")
+                self.assertIn("invalid scan context", stdout)
+                self.assertNotIn("paused", stdout)
+
+    def test_prepare_waits_for_devin_on_a_claude_head_by_author_or_committer(self) -> None:
+        pending = "head is claude[bot] and Devin review of head is pending"
+        devin = [{"user": {"login": "devin-ai-integration[bot]"}, "commit_id": "a" * 40}]
+        stale = [{"user": {"login": "devin-ai-integration[bot]"}, "commit_id": "b" * 40},
+                 {"user": {"login": "someone"}, "commit_id": "a" * 40}]
+        for commit in ({"author": {"login": "claude[bot]"}}, {"commit": {"author": {"name": "claude"}}},
+                       {"committer": {"login": "claude[bot]"}, "author": {"login": "alice"}},
+                       {"commit": {"committer": {"name": "claude[bot]"}, "author": {"name": "alice"}}}):
+            for reviews, waits in (([], True), (stale, True), (devin, False)):
+                with self.subTest(commit=commit, reviews=reviews):
+                    out, stdout = self._prep(self.LIVE, commit=commit, reviews=reviews)
+                    self.assertEqual(pending in stdout, waits)
+                    self.assertEqual(out.startswith("proceed=true\n"), not waits)
+        out, stdout = self._prep(self.LIVE, commit={"author": {"login": "alice"}, "committer": {"login": "web-flow"}})
+        self.assertTrue(out.startswith("proceed=true\n"))
+
     def test_pause_variable_wired_into_scan_and_resolve(self) -> None:
         scan = self._job("conflict-scan")
         self.assertIn("CLAUDE_FIXER_PAUSE: ${{ vars.CLAUDE_FIXER_PAUSE }}", scan)
-        prep = self._job("conflict-resolve").split("        id: prep\n", 1)[1].split("\n      - ", 1)[0]
+        prep = self._writer("prepare").split("        id: prep\n", 1)[1]
         self.assertIn("CLAUDE_FIXER_PAUSE: ${{ vars.CLAUDE_FIXER_PAUSE }}", prep)
-        self.assertLess(prep.index("CLAUDE_FIXER_PAUSE:-"), prep.index("git merge --no-ff --no-commit"))
+        self.assertLess(prep.index("CLAUDE_FIXER_PAUSE:-"), prep.index('echo "skip=false"'))
+        # The merge runs only in the model job, which needs an unskipped prepare; the publisher
+        # rereads the variable and the live labels before any push or write.
+        self.assertNotIn("git merge", prep)
+        self.assertIn("git merge --no-ff --no-commit", self._writer("model"))
+        self.assertIn("CLAUDE_FIXER_PAUSE: ${{ vars.CLAUDE_FIXER_PAUSE }}", self._writer("publish"))
+        self.assertIn('PAUSE_LABELS = frozenset({"claude:pause", "hold"})',
+                      (ROOT / "scripts/ci/claude_fixer_publish.py").read_text(encoding="utf-8"))
+        self.assertIn("PUBLISHER_SHA", self._writer("publish"))
+        self.assertIn("scripts/ci/claude_fixer_publish.py", self._writer("publish"))
+        self.assertNotIn(".base.sha", self._writer("publish"))
 
     def test_resolver_uses_fixed_helper_not_raw_gh_api(self) -> None:
-        job = self._job("conflict-resolve")
+        job = self._writer("model")
         allow = job.split("--allowedTools", 1)[1].split("--disallowedTools", 1)[0]
         self.assertNotIn("gh api", allow)
-        self.assertIn("Bash(python3 ${{ runner.temp }}/claude-fixer-guard/pre-push model-api --:*)", allow)
+        self.assertIn("Bash(python3 ${{ runner.temp }}/claude-fixer-guard/model-api --:*)", allow)
         self.assertIn("Bash(gh api:*)", job.split("--disallowedTools", 1)[1].split('"', 2)[1])
         prompt = job.split("prompt: |", 1)[1].split("claude_args:", 1)[0]
         self.assertNotIn("gh api repos/", prompt)
@@ -1238,18 +1583,26 @@ class ConflictJobStructureTests(unittest.TestCase):
         self.assertIn("model-api -- comment BODY_FILE", prompt)
         self.assertIn("model-api -- label", prompt)
         self.assertIn(".claude-fixer-replies/NAME.txt", prompt)
-        guard = job.split("id: push_guard", 1)[1].split("      - id: claude", 1)[0]
-        self.assertIn("MODEL_API_LABEL: needs-decision", guard)
-        self.assertLess(job.index("id: prep"), job.index("id: push_guard"))
-        self.assertLess(job.index("id: push_guard"), job.index("      - id: claude"))
+        # Conflict mode alone enables the fixed needs-decision handoff label in model-api.
+        helper = job.split("id: outbox", 1)[1].split("      - id: claude", 1)[0]
+        self.assertIn("WRITER_MODE: conflict\n", helper)
+        self.assertNotIn("RECEIPT_CONTEXT:", helper.split("        run: |", 1)[0])  # conflict mode has no receipts
+        self.assertIn('python3 "$RUNNER_TEMP/claude-fixer-guard/model-api" install', helper)
+        chunk = job.split("<<'CLAUDE_FIXER_OUTBOX'\n", 1)[1].split("          CLAUDE_FIXER_OUTBOX", 1)[0]
+        self.assertEqual(textwrap.dedent(chunk).rstrip(),
+                         (ROOT / "scripts/ci/claude_fixer_outbox.py").read_text(encoding="utf-8").rstrip())
+        self.assertLess(job.index("id: outbox"), job.index("      - id: claude"))
+        self.assertLess(job.index("Start merge of the recorded base"), job.index("id: outbox"))
 
     def test_resolver_comments_or_labels(self) -> None:
-        job = self._job("conflict-resolve")
+        job = self._writer("model")
         self.assertIn("merge commit SHA", job)
         self.assertIn("needs-decision", job)
         self.assertIn("push NOTHING", job)
-        self.assertIn("git merge --abort", job)
-        self.assertIn("Never exit without either pushing or posting that comment", job)
+        self.assertIn("model-api -- merge-abort", job)
+        self.assertIn("model-api -- commit .claude-fixer-replies/NAME.txt", job)
+        self.assertIn("Never exit without either committing the merge or queuing that comment", job)
+        self.assertNotIn("git merge --abort", job.split("prompt: |", 1)[1])  # the helper aborts, not raw git
 
     def test_comment_and_review_jobs_ignore_conflict_events(self) -> None:
         original = self.text
@@ -1273,6 +1626,7 @@ class ActionlintTests(unittest.TestCase):
                 "-color",
                 str(WORKFLOW_PATH),
                 str(SCAN_WORKFLOW_PATH),
+                str(WRITER_WORKFLOW_PATH),
                 str(ROOT / ".github" / "workflows" / "codex-gate.yml"),
             ],
             cwd=ROOT,
@@ -1292,10 +1646,7 @@ class FixerLoopCapTests(unittest.TestCase):
 
         text = WORKFLOW_PATH.read_text(encoding="utf-8")
         cls.text = text
-        start = text.index("        id: cap\n")
-        run = text.index("        run: |\n", start) + len("        run: |\n")
-        end = text.index("\n      - ", run)
-        cls.script = textwrap.dedent(text[run:end])
+        cls.script = step_script(job_block(text, "fixer-prepare"), "        id: cap\n")
 
     def _run(
         self,
@@ -1314,6 +1665,7 @@ class FixerLoopCapTests(unittest.TestCase):
         threads: list[dict] | None = None,
         labels: object = (),
         pause_var: str | None = None,
+        draft: object = False,
     ) -> tuple[str, str]:
         import os
         import shutil
@@ -1329,6 +1681,8 @@ class FixerLoopCapTests(unittest.TestCase):
             (d / "commits.tsv").write_text("".join("\t".join(row) + "\n" for row in commits), encoding="utf-8")
             (d / "comments.txt").write_text("".join(c + "\n" for c in comments), encoding="utf-8")
             live = {"state": current_state, "head": {"sha": current_sha, "ref": current_ref, "repo": {"full_name": current_repo}}, "user": {"login": "alice"}}
+            if draft is not None:
+                live["draft"] = draft
             if labels is not None:
                 # GitHub always returns a labels array; raw non-list values model unreadable labels.
                 live["labels"] = [{"name": n} for n in labels] if isinstance(labels, tuple) else labels
@@ -1343,6 +1697,8 @@ class FixerLoopCapTests(unittest.TestCase):
                 f'  *"graphql"*) {"exit 1" if listing_error else graphql_reply};;\n'
                 f'  *"collaborators/bob/permission"*) echo {commenter_permission};;\n'
                 f'  *"collaborators"*) echo {permission};;\n'
+                f'  *"repos/o/r --jq .default_branch"*) echo master;;\n'
+                f'  *"git/ref/heads/"*) echo {"d" * 40};;\n'
                 f'  "api repos/o/r/pulls/1") cat "{d}/pr.json";;\n'
                 f'  */commits*) {"exit 1" if listing_error else "cat" + chr(32) + str(d / "commits.tsv")};;\n'
                 f'  */comments*) cat "{d}/comments.txt";;\n'
@@ -1417,6 +1773,7 @@ class FixerLoopCapTests(unittest.TestCase):
         out, posted = self._run([("claude[bot]", "claude[bot]")], [], current_sha="b" * 40, findings="PRRT_late")
         self.assertIn("skip=false", out)
         self.assertIn("head_sha=" + "b" * 40, out)
+        self.assertIn("publisher_sha=" + "d" * 40, out)
         self.assertEqual(posted, "")
 
     def test_invalid_live_sha_skips(self) -> None:
@@ -1447,26 +1804,49 @@ class FixerLoopCapTests(unittest.TestCase):
 
     def test_receipt_helper_embedded_from_trusted_workflow_before_checkout(self) -> None:
         source = (WORKFLOW_PATH.parents[2] / "scripts/ci/claude_fixer_receipts.py").read_text()
-        job = self.text[self.text.index("  devin-review-fix:"):]
+        # CSL-414: eligibility and the reservation run in the trusted fixer-prepare job,
+        # which checks out nothing; the model job sees only its prepared outputs.
+        job = job_block(self.text, "fixer-prepare")
         begin = job.index("          #!/usr/bin/env python3", job.index("id: eligibility"))
         end = job.index("          CLAUDE_FIXER_RECEIPTS", begin)
-        import textwrap
         self.assertEqual(textwrap.dedent(job[begin:end]).rstrip(), source.rstrip())
-        self.assertLess(job.index("id: eligibility"), job.index("uses: actions/checkout"))
+        self.assertNotIn("actions/checkout", job)
+        self.assertLess(job.index("id: cap"), job.index("id: eligibility"))
+        self.assertLess(job.index("id: eligibility"), job.index("id: prepared"))
         self.assertIn("MANUAL_RETRY: ${{ github.event_name == 'workflow_dispatch' }}", job)
-        self.assertIn("steps.eligibility.outputs.receipt_context", job)
+        self.assertIn("receipt_context: ${{ steps.eligibility.outputs.receipt_context }}", job)
         self.assertIn("LOOP_COMMIT_COUNT: ${{ steps.cap.outputs.loop_commit_count }}", job)
-        self.assertIn("needs-human handoffs must remain unresolved", job)
-        for step in job.split("      - uses: actions/checkout@v4", 1)[1].split("\n      - "):
-            self.assertIn("steps.eligibility.outputs.skip != 'true'", step)
+        self.assertIn("needs-human handoffs must remain unresolved", job_block(self.text, "devin-review-fix"))
+        self.assertIn("RECEIPT_CONTEXT: ${{ needs.fixer-prepare.outputs.receipt_context }}", job_block(self.text, "fixer-publish"))
+        # Every later stage is gated on a prepared, unskipped eligibility decision.
+        self.assertIn("skip: ${{ steps.prepared.outputs.skip || 'true' }}", job)
+        self.assertIn("if: steps.cap.outputs.skip != 'true' && steps.eligibility.outputs.skip == 'false'", job)
+        for name in ("devin-review-fix", "fixer-publish"):
+            self.assertIn("needs.fixer-prepare.outputs.skip == 'false'", job_block(self.text, name), name)
 
     def test_fixer_steps_gated_on_cap(self) -> None:
-        start = self.text.index("  devin-review-fix:\n")
-        job = self.text[start:]
+        job = job_block(self.text, "fixer-prepare")
         steps = job.split("        id: cap\n", 1)[1].split("\n      - ")[1:]
-        self.assertTrue(steps)
+        self.assertEqual(len(steps), 2)
         for step in steps:
             self.assertIn("steps.cap.outputs.skip != 'true'", step)
+
+    def test_devin_fixer_skips_draft_prs_and_mentions_keep_them(self) -> None:
+        # CSL-414: a draft or unreadable draft flag skips the Devin path
+        # before the commit listing; a human @claude mention may still act on a draft.
+        for draft in (True, None, "false"):
+            with self.subTest(draft=draft):
+                out, posted = self._run([("alice", "Alice")], [], draft=draft)
+                self.assertIn("skip=true", out)
+                self.assertNotIn("loop_commit_count", out)
+                self.assertNotIn("head_sha", out)
+                self.assertEqual(posted, "")
+        out, _ = self._run([("alice", "Alice")], [], draft=False)
+        self.assertIn("skip=false", out)
+        mention = MentionLiveHeadTests("test_mention_human_pause_skips")
+        mention.setUpClass()
+        out, _ = mention._run([("alice", "Alice")], [], draft=True)
+        self.assertIn("skip=false", out)
 
     def test_truncated_commit_list_counts_as_at_cap(self) -> None:
         # GitHub lists at most 250 PR commits, oldest first; the newest may be missing.
@@ -1525,21 +1905,30 @@ class FixerLoopCapTests(unittest.TestCase):
                 self.assertIn("skip=false", out)
 
     def test_pause_variable_and_notice_wired_into_writer_jobs(self) -> None:
-        for name in ("claude-mention", "devin-review-fix"):
-            job = WorkflowStructureTests._job(self, name)
+        # CSL-414: the pause is checked first in each trusted prepare job, which checks out nothing.
+        for name in PREPARE_JOBS:
+            job = job_block(self.text, name)
             first = job.split("\n      - ", 2)[1]
             self.assertIn("CLAUDE_FIXER_PAUSE: ${{ vars.CLAUDE_FIXER_PAUSE }}", first, name)
             self.assertIn('[ "${CLAUDE_FIXER_PAUSE:-}" = "true" ]', first, name)
             self.assertIn("::notice::Claude PR writer paused by", first, name)
             self.assertIn('select(. == "claude:pause" or . == "hold")', first, name)
-            self.assertLess(job.index("CLAUDE_FIXER_PAUSE"), job.index("uses: actions/checkout"), name)
+            self.assertNotIn("actions/checkout", job, name)
+        # Publish rechecks the variable and the live labels right before the push.
+        for name in PUBLISH_JOBS:
+            step = job_block(self.text, name).split("      - name: Publish validated candidate", 1)[1]
+            self.assertIn("CLAUDE_FIXER_PAUSE: ${{ vars.CLAUDE_FIXER_PAUSE }}", step, name)
+            self.assertIn('python3 -I "$RUNNER_TEMP/claude-fixer-publish/publish.py"', step, name)
 
     def test_conflict_resolve_waits_for_devin_on_claude_head(self) -> None:
-        text = SCAN_WORKFLOW_PATH.read_text(encoding="utf-8")
-        job = text[text.index("  conflict-resolve:\n"):]
+        # Port C: the wait is in the conflict writer's trusted prepare, before the model merges base.
+        text = WRITER_WORKFLOW_PATH.read_text(encoding="utf-8")
+        job = text[text.index("  prepare:\n"):text.index("\n  model:\n")]
         self.assertIn("devin-ai-integration[bot]", job)
         self.assertIn(".commit_id == ", job)
         self.assertIn("Devin review of head is pending", job)
+        self.assertIn('(.committer.login // ""), (.commit.committer.name // "")', job)
+        self.assertLess(job.index("Devin review of head is pending"), job.index('echo "skip=false"'))
 
 
 class MentionLiveHeadTests(unittest.TestCase):
@@ -1549,15 +1938,13 @@ class MentionLiveHeadTests(unittest.TestCase):
     def setUpClass(cls):
         import textwrap
         cls.text = WORKFLOW_PATH.read_text()
-        start = cls.text.index("        id: live\n")
-        run = cls.text.index("        run: |\n", start) + len("        run: |\n")
-        end = cls.text.index("\n      - ", run)
-        cls.script = textwrap.dedent(cls.text[run:end])
+        cls.script = step_script(job_block(cls.text, "mention-prepare"), "        id: live\n")
 
     def test_queued_human_request_refreshes_head_after_earlier_writer(self):
         out, posts = self._run([], [], current_sha="b" * 40)
         self.assertIn("head_sha=" + "b" * 40, out)
         self.assertIn("head_ref=feature/fix", out)
+        self.assertIn("publisher_sha=" + "d" * 40, out)
         self.assertIn("skip=false", out)
         self.assertEqual(posts, "")
 
@@ -1637,13 +2024,18 @@ class MentionLiveHeadTests(unittest.TestCase):
         self.assertIn("skip=false", out)
 
     def test_original_comment_and_fresh_branch_remain_bound(self):
-        job = self.text.split("  claude-mention:", 1)[1].split("  devin-review-fix:", 1)[0]
-        self.assertIn("COMMENTER: ${{ github.event.comment.user.login }}", job)
-        self.assertIn("COMMENT ID: ${{ github.event.comment.id }}", job)
-        self.assertIn("BRANCH: ${{ steps.live.outputs.head_ref }}", job)
-        self.assertLess(job.index("id: live"), job.index("actions/checkout"))
-        for step in job.split("      - uses: actions/checkout@v4", 1)[1].split("\n      - "):
-            self.assertIn("steps.live.outputs.skip != 'true'", step)
+        # CSL-414: the live refresh runs in the trusted mention-prepare job, which checks out
+        # nothing; the model job runs only on its unskipped outputs.
+        prepare = job_block(self.text, "mention-prepare")
+        model = job_block(self.text, "claude-mention")
+        self.assertIn("COMMENTER: ${{ github.event.comment.user.login }}", prepare)
+        self.assertIn("COMMENT ID: ${{ github.event.comment.id }}", model)
+        self.assertIn("head_ref: ${{ steps.live.outputs.head_ref }}", prepare)
+        self.assertIn("BRANCH: ${{ needs.mention-prepare.outputs.head_ref }}", model)
+        self.assertIn("skip: ${{ steps.live.outputs.skip || 'true' }}", prepare)
+        self.assertNotIn("actions/checkout", prepare)
+        self.assertIn("needs.mention-prepare.outputs.skip == 'false'", model)
+        self.assertLess(model.index("actions/checkout"), model.index("uses: anthropics/claude-code-action@"))
 
 
 class ClaudeActionInlineCommentTests(unittest.TestCase):
@@ -1660,6 +2052,73 @@ class ClaudeActionInlineCommentTests(unittest.TestCase):
         for index, (name, inputs) in enumerate(steps):
             with self.subTest(workflow=name, step=index):
                 self.assertIn('\n          classify_inline_comments: "false"\n', inputs)
+
+
+class ClaudeCodeInstallerPinTests(unittest.TestCase):
+    """CSL-473 interim E3-1: SHA-pin the action and skip its unpinned installer."""
+
+    PIN = ROOT / "scripts/ci/claude-code-2.1.306-linux-x64.pin"
+    FINGERPRINT = ROOT / "scripts/ci/claude-code-release-signing.fingerprint"
+    SCRIPT = ROOT / "scripts/ci/install_pinned_claude_code.sh"
+    ACTION = "anthropics/claude-code-action@a5a423f75c251dcbff8a74e99f83b2cb03c72bfa"
+
+    def test_committed_pin_and_fingerprint_match_the_install_script(self) -> None:
+        pin = {}
+        for line in self.PIN.read_text(encoding="utf-8").splitlines():
+            if line and not line.startswith("#") and "=" in line:
+                key, _, value = line.partition("=")
+                pin[key] = value
+        fingerprint = next(line.strip() for line in self.FINGERPRINT.read_text(encoding="utf-8").splitlines()
+                           if line and not line.startswith("#"))
+        self.assertEqual(pin["sha256"], "520bc6c1f40af466bd03a278b5ae1af1a2938bc7de5b9e5cb15526da20d71cfe")
+        self.assertEqual(pin["bytes"], "290532720")
+        self.assertEqual(pin["version"], "2.1.306")
+        self.assertEqual(fingerprint, "31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE")
+        script = self.SCRIPT.read_text(encoding="utf-8")
+        for value in (pin["sha256"], pin["bytes"], pin["version"], fingerprint):
+            self.assertIn(value, script)
+        self.assertIn('DEST_DIR="/opt/csl-claude/${CLAUDE_VERSION}"', script)
+        self.assertIn("sha256sum -c", script)
+        self.assertIn('CURL=/usr/bin/curl', script)
+        self.assertIn('GPG=/usr/bin/gpg', script)
+        self.assertIn('SUDO=/usr/bin/sudo', script)
+        self.assertIn('"$GPG" --batch --status-fd 1 --verify', script)
+        self.assertIn("[GNUPG:] VALIDSIG ${EXPECTED_FPR}", script)
+        self.assertIn("[GNUPG:] GOODSIG", script)
+        self.assertIn("EXPKEYSIG", script)
+        self.assertIn("REVKEYSIG", script)
+        self.assertIn('mkdir -m 0700 "$STAGING"', script)
+        self.assertNotIn("mkdir -m 0700 -p", script)
+        self.assertNotIn('mkdir -p "$STAGING"', script)
+        self.assertIn("install path is a symlink", script)
+        self.assertIn("install dir contains extra files", script)
+        self.assertIn("installClaudeCode()", script)
+        self.assertIn("python3 -I -c", script)
+        self.assertNotIn("python3 -c '", script)
+        self.assertIn("reference copy", script)
+        self.assertNotIn("| bash", script)
+
+    def test_every_claude_action_use_is_sha_pinned_and_skips_the_installer(self) -> None:
+        import re
+
+        steps = []
+        for path in sorted(WORKFLOW_PATH.parent.glob("*.y*ml")):
+            text = path.read_text(encoding="utf-8")
+            self.assertNotIn("claude.ai/install", text)
+            self.assertNotRegex(text, r"uses:\s*[\"']?anthropics/claude-code-action@v\d")
+            self.assertNotRegex(text, r"install\.sh\s*\|\s*bash")
+            self.assertNotIn("mkdir -m 0700 -p", text)
+            uses = re.findall(r"uses:\s*[\"']?(anthropics/claude-code-action@[^\s\"'#]*)", text)
+            if uses:
+                self.assertEqual(set(uses), {self.ACTION})
+                self.assertIn("Install hash-pinned Claude Code CLI", text)
+            for step in re.split(r"uses:\s*[\"']?anthropics/claude-code-action@", text)[1:]:
+                steps.append((path.name, re.split(r"\n      - ", step, maxsplit=1)[0]))
+        self.assertGreaterEqual(len(steps), 3)
+        for index, (name, inputs) in enumerate(steps):
+            with self.subTest(workflow=name, step=index):
+                self.assertIn("\n          path_to_claude_code_executable: /opt/csl-claude/2.1.306/claude\n", inputs)
+                self.assertIn("DISABLE_UPDATES", inputs)
 
 
 if __name__ == "__main__":

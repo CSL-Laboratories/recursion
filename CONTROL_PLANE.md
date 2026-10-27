@@ -1,13 +1,20 @@
 # Governance — Recursion
 
 Adopted 2026-09-28; authority split amended 2026-10-16 under D-041; developer-approved
-receipts added 2026-10-21 under D-043. The highest-priority
+receipts added 2026-10-21 under D-043; research-vault alignment added 2026-10-25 under D-044.
+The highest-priority
 authority document in this repository, beneath current explicit founder decisions within
 the authority defined below. If another file contradicts it, this file wins and that file
 is stale.
 
 Read `ANCHOR.md` for WHY the work exists and what is in scope. Read
 [docs/v3/START-HERE.md](docs/v3/START-HERE.md) for how the product is organized.
+Existing `docs/v3/*` stays in place with its current ratification status until CSL-536.
+New non-public docs (research, specs, decisions, evidence and receipts, gate artifacts,
+and runbooks that aren't public) go to
+[CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research) through a PR
+there; this repository only links. The only new docs allowed here are public knowledge-base,
+README, setup and implementation instructions for outside readers, plus agent instruction files.
 
 Recursion is a **single product**: the v3 agent harness. This repository builds that product.
 It does not supervise other repositories. The earlier Hermes-led control plane (v1/v2) was
@@ -19,13 +26,17 @@ Conflicts resolve in this order, highest first:
 
 1. Current explicit founder decisions within the authority below; Lucas breaks disagreements
 2. `CONTROL_PLANE.md` (this file)
-3. The v3 product specifications (`docs/v3/*`)
-4. `state/DECISIONS.md` (the decision log)
-5. Implementation docs, experiments and evidence
+3. The v3 product specifications: existing `docs/v3/*` stays in place with its current
+   ratification status until CSL-536; new specifications are recorded in
+   [CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research)
+   and this repository only links.
+4. Decision records: existing entries in `state/DECISIONS.md` (frozen legacy log through D-044);
+   new decisions are recorded in csl-research and this repository only links
+5. Implementation docs, experiments and evidence (new non-public docs go to csl-research)
 6. Runtime state
 
-A lower rank never silently overrides a higher one. On conflict, stop and record a blocker in
-`state/INBOX.md`.
+A lower rank never silently overrides a higher one. On conflict, stop and record a blocker as a
+Linear issue comment; `state/INBOX.md` is optional.
 
 ## Roles
 
@@ -41,6 +52,33 @@ Founders merge review branches after the required review and checks. Agents do n
 Any founder may approve a protected-path or merge-rule amendment through the separately
 recorded authoring process below. Approval does not apply repository settings or bypass
 existing review requirements.
+
+### Product-spec acceptance
+
+Lucas (2026-10-24 11:58pm PT): Samir and Dan may change and modify the product
+spec with their agents as recommended and as research is synthesized. Spec
+changes by Samir or Dan are accepted once another founder approves the PR.
+
+Founders for this receipt: Lucas (`NotSkittlz`), Samir (`samir-shah-ahmed`),
+Dan/Chaandan (`CDanTheMan`). The approver must be a founder and must not be the
+PR author (GitHub author login, or the attributed `for <developer>` principal
+when an agent authored through a founder account). The author's own approval
+does not count.
+
+The accepting GitHub review is `APPROVED` on the exact head SHA (40-hex) that
+is the PR head at the moment of acceptance. The review body names a SHA-256
+digest map of every accepted path (inline, or a single receipt the review
+names for that same SHA). A review on a stale SHA, a digest mismatch, a
+missing map, a non-founder review, merge, labels, CI, an implementer's PASS,
+silence, a reaction, or an agent comment is not acceptance.
+
+Lucas-authored spec PRs keep Lucas's existing acceptance path (his own
+unprefixed Linear or GitHub statement on the exact candidate). Another
+founder's GitHub approval of a Lucas-authored spec PR is not required and does
+not replace Lucas's path. Agents never merge.
+
+Protected-path and merge-rule amendments still require the separately recorded
+authoring session. This receipt does not change Lucas's reserved decisions.
 
 ### Lucas - reserved decisions and final tie-break
 
@@ -151,12 +189,17 @@ does not count.
 
 ## Changing this document
 
-Only in a reviewed authoring session a founder explicitly approves, on a review branch, recorded in
-`state/DECISIONS.md`. Superseding an entry preserves the reason it was believed — a ruled-out
+Only in a reviewed authoring session a founder explicitly approves, on a review branch.
+New decision records go to [CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research)
+through a PR there; this repository only links. `state/DECISIONS.md` is a frozen legacy log
+through D-044. Superseding an entry preserves the reason it was believed — a ruled-out
 approach without its reason is a dead-end waiting to be rediscovered.
 
-D-041 records the source decisions and approval for this amendment, and D-043 records the
-developer-approved receipt exception. Each changes governance
+D-041 records the source decisions and approval for the authority-split amendment, D-043 records
+the developer-approved receipt exception, D-044 records this research-vault alignment, and
+CSLR-D-001 ([csl-research#59](https://github.com/CSL-Laboratories/csl-research/pull/59)) records
+founder GitHub PR approval as Recursion spec acceptance. Each
+changes governance
 text only: settings, CODEOWNERS, rulesets, access grants and merge-queue activation require
 their own authorization and are not changed or claimed effective here. Independent review
 must cover the exact candidate; an implementer's PASS is not acceptance or merge permission.

@@ -37,6 +37,17 @@ from scripts.v3.control_api.http_server import ControlHTTPServer, RemoteBindRefu
 
 PROMPT = "Review the change and answer with a verdict."
 
+# Windows does not preserve POSIX owner/group/other bits, and read_token_file
+# skips that check when os.name == "nt". Creating a symlink there also needs
+# privileges this suite does not have. Both checks stay enforced on POSIX.
+_SKIP_POSIX_TOKEN_MODE = (
+    "POSIX permission modes are not meaningful on Windows; "
+    "read_token_file skips the mode check when os.name == 'nt'"
+)
+_SKIP_TOKEN_SYMLINK = (
+    "symbolic links need extra privileges on Windows and are unsupported for this token-file check"
+)
+
 
 class Live:
     """A running fake stack with tokens for two tenants and a viewer."""
@@ -260,20 +271,43 @@ class TokenFileTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "token"
             write_token_file(path, "t" * 40)
-            self.assertEqual(0o600, stat.S_IMODE(path.stat().st_mode))
             self.assertEqual("t" * 40, read_token_file(path))
             with self.assertRaises(FileExistsError):
                 write_token_file(path, "other")
-            os.chmod(path, 0o644)
-            with self.assertRaises(TokenFileRefused):
-                read_token_file(path)
-            os.chmod(path, 0o600)
-            link = Path(directory) / "link"
-            link.symlink_to(path)
-            with self.assertRaises(TokenFileRefused):
-                read_token_file(link)
             with self.assertRaises(TokenFileRefused):
                 read_token_file(Path(directory) / "missing")
+
+    @unittest.skipIf(os.name == "nt", _SKIP_POSIX_TOKEN_MODE)
+    def test_posix_owner_mode_is_required(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "token"
+            write_token_file(path, "t" * 40)
+            self.assertEqual(0o600, stat.S_IMODE(path.stat().st_mode))
+            os.chmod(path, 0o644)
+            with self.assertRaises(TokenFileRefused) as raised:
+                read_token_file(path)
+            self.assertEqual("token_file_mode", str(raised.exception))
+
+    @unittest.skipIf(os.name == "nt", _SKIP_TOKEN_SYMLINK)
+    def test_a_symlink_token_path_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "token"
+            write_token_file(path, "t" * 40)
+            link = Path(directory) / "link"
+            if os.name == "posix":
+                # A POSIX failure to create the link fails the test. Skipping it
+                # would drop the refusal check this platform is required to enforce.
+                link.symlink_to(path)
+            else:
+                if not hasattr(os, "symlink"):
+                    self.skipTest("os.symlink is unavailable")
+                try:
+                    link.symlink_to(path)
+                except (OSError, NotImplementedError) as exc:
+                    self.skipTest(f"symlinks unsupported: {exc}")
+            with self.assertRaises(TokenFileRefused) as raised:
+                read_token_file(link)
+            self.assertEqual("token_file_not_regular", str(raised.exception))
 
     def test_a_fifo_token_path_is_refused(self) -> None:
         if not hasattr(os, "mkfifo"):
@@ -362,6 +396,34 @@ class CliTests(unittest.TestCase):
                 )
                 for completed in (opened, ran, events):
                     self.assertNotIn(token, completed.stdout + completed.stderr)
+                again = subprocess.run(
+                    [sys.executable, "-X", "utf8", "-B", "-m", "scripts.v3.control_api", "serve-fake",
+                     "--token-file", str(token_file)],
+                    cwd=ROOT, env=env, capture_output=True, text=True, timeout=60,
+                )
+                self.assertEqual(2, again.returncode)
+            finally:
+                server.terminate()
+                try:
+                    server.wait(10)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                server.stdout.close()
+                server.stderr.close()
+
+    @unittest.skipIf(os.name == "nt", _SKIP_POSIX_TOKEN_MODE)
+    def test_cli_refuses_a_loose_token_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            token_file = Path(directory) / "token"
+            env = {**os.environ, "PYTHONPATH": str(ROOT)}
+            server = subprocess.Popen(
+                [sys.executable, "-X", "utf8", "-B", "-m", "scripts.v3.control_api", "serve-fake",
+                 "--token-file", str(token_file)],
+                cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            try:
+                info = json.loads(server.stdout.readline())
+                token = token_file.read_text().strip()
                 bad = Path(directory) / "loose"
                 bad.write_text(token)
                 os.chmod(bad, 0o644)
@@ -371,13 +433,8 @@ class CliTests(unittest.TestCase):
                     cwd=ROOT, env=env, capture_output=True, text=True, timeout=60,
                 )
                 self.assertEqual(2, refused.returncode)
+                self.assertIn("TokenFileRefused", refused.stderr)
                 self.assertNotIn(token, refused.stdout + refused.stderr)
-                again = subprocess.run(
-                    [sys.executable, "-X", "utf8", "-B", "-m", "scripts.v3.control_api", "serve-fake",
-                     "--token-file", str(token_file)],
-                    cwd=ROOT, env=env, capture_output=True, text=True, timeout=60,
-                )
-                self.assertEqual(2, again.returncode)
             finally:
                 server.terminate()
                 try:

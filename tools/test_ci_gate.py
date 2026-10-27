@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for tools/ci_gate.py path filtering and docs-only public-scope."""
+"""Unit tests for tools/ci_gate.py path classification, run_full and the lightweight checks."""
 from __future__ import annotations
 
 import importlib.util
@@ -113,6 +113,88 @@ class TempRepoTests(unittest.TestCase):
         self.assertFalse(ci_gate.docs_only(self.seed))
 
 
+class AlwaysRunSuiteTests(unittest.TestCase):
+    """CSL-376: no diff skips the suite, including paths suite tests read."""
+
+    setUp = TempRepoTests.setUp
+    tearDown = TempRepoTests.tearDown
+
+    # Classes the path filter calls docs that suite tests read (audited on
+    # master 2de3e737), plus plain prose.
+    DOCS_READ_BY_TESTS = (
+        "AGENTS.md",
+        "CLAUDE.md",
+        "CONTRIBUTING.md",
+        ".claude/settings.json",
+        "config/harness.json",
+        "config/harness.schema.json",
+        "docs/v3/program-control/program.json",
+        "docs/v3/research-lane/followups-20261002/MANIFEST.json",
+        "docs/v3/research-lane/shared-contracts-20261002/SHA256SUMS.txt",
+        "docs/notes.md",
+    )
+
+    def run_full_for(self, base: str | None) -> bool:
+        env = {} if base is None else {"CI_BASE_SHA": base}
+        with mock.patch.dict(os.environ, env, clear=False):
+            if base is None:
+                os.environ.pop("CI_BASE_SHA", None)
+            return ci_gate.decide_run_full(force=False)
+
+    def test_docs_only_diffs_still_run_the_suite(self) -> None:
+        for rel in self.DOCS_READ_BY_TESTS:
+            with self.subTest(path=rel):
+                before = git(self.repo, "rev-parse", "HEAD")
+                write(self.repo / rel, f"change {rel}\n")
+                commit(self.repo, f"edit {rel}")
+                self.assertFalse(ci_gate.is_gate_path(rel))
+                self.assertTrue(ci_gate.docs_only(before))
+                self.assertTrue(self.run_full_for(before))
+
+    def test_all_docs_paths_in_one_diff_run_the_suite(self) -> None:
+        for rel in self.DOCS_READ_BY_TESTS:
+            write(self.repo / rel, "x\n")
+        commit(self.repo, "docs batch")
+        self.assertTrue(ci_gate.docs_only(self.seed))
+        self.assertTrue(self.run_full_for(self.seed))
+
+    def test_empty_missing_zero_and_unknown_bases_run_the_suite(self) -> None:
+        self.assertTrue(self.run_full_for(self.seed))  # empty diff
+        self.assertTrue(self.run_full_for(None))
+        self.assertTrue(self.run_full_for(""))
+        self.assertTrue(self.run_full_for(ci_gate.ZERO_SHA))
+        self.assertTrue(self.run_full_for("1" * 40))
+
+    def _main_on_docs_diff(self, argv: list[str]):
+        write(self.repo / "AGENTS.md", "edited\n")
+        commit(self.repo, "docs")
+        outputs: list[tuple[str, str]] = []
+        cwd = os.getcwd()
+        os.chdir(self.repo)
+        try:
+            with mock.patch.dict(os.environ, {"CI_BASE_SHA": self.seed}), mock.patch.object(
+                ci_gate, "emit_output", side_effect=lambda k, v: outputs.append((k, v))
+            ), mock.patch.object(ci_gate, "run_suite") as suite, mock.patch.object(
+                ci_gate, "run_lightweight"
+            ) as lightweight, mock.patch.object(sys, "argv", argv):
+                self.assertEqual(ci_gate.main(), 0)
+        finally:
+            os.chdir(cwd)
+        return outputs, suite, lightweight
+
+    def test_paths_only_emits_run_full_true_for_docs_only_diff(self) -> None:
+        outputs, suite, lightweight = self._main_on_docs_diff(["ci_gate.py", "--paths-only"])
+        self.assertEqual(outputs, [("run_full", "true")])
+        suite.assert_not_called()
+        lightweight.assert_not_called()
+
+    def test_default_run_on_docs_only_diff_runs_the_suite(self) -> None:
+        outputs, suite, lightweight = self._main_on_docs_diff(["ci_gate.py"])
+        self.assertEqual(outputs, [("run_full", "true")])
+        suite.assert_called_once_with()
+        lightweight.assert_not_called()
+
+
 class LightweightControlTests(unittest.TestCase):
     def test_run_lightweight_invokes_public_scope(self) -> None:
         with mock.patch.object(ci_gate, "whitespace_check") as whitespace, mock.patch.object(
@@ -122,6 +204,8 @@ class LightweightControlTests(unittest.TestCase):
             whitespace.assert_called_once_with()
             run_program.assert_called_once_with(["tools/check_public_scope.py"])
 
+    # decide_run_full no longer returns False (CSL-376); this pins main()'s
+    # handling of run_full=false, which ci.yml still treats fail-closed.
     def test_docs_only_main_runs_public_scope_not_suite(self) -> None:
         with mock.patch.object(ci_gate, "decide_run_full", return_value=False), mock.patch.object(
             ci_gate, "run_lightweight"
@@ -169,6 +253,11 @@ class TestInventoryTests(unittest.TestCase):
         for path in exclude:
             self.assertTrue((ROOT / path).is_file(), path)
             self.assertNotIn(path, run)
+
+    def test_x1_inventory_floor_is_discovered_and_run(self) -> None:
+        run = ci_gate.assert_tests_accounted()
+        self.assertIn("scripts/tests/v3/x1/inventory.test.py", run)
+        self.assertNotIn("scripts/tests/v3/x1/inventory.test.py", ci_gate.TEST_EXCLUDE)
 
     def test_unaccounted_test_file_fails_guard(self) -> None:
         run, unaccounted, stale, missing = ci_gate.classify_tests(

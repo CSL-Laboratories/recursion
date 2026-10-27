@@ -200,7 +200,7 @@ class BenchTests(unittest.TestCase):
         self.assertEqual(report["provider_calls"], 0)
         self.assertEqual(
             [row["name"] for row in report["benchmarks"]],
-            ["canonical_digest", "decode_command", "validate_policy", "validate_dag"],
+            ["canonical_digest", "decode_command", "validate_policy", "validate_dag", "replay_reduce"],
         )
         for row in report["benchmarks"]:
             self.assertGreater(row["median_s"], 0)
@@ -250,7 +250,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("tools/perf_ci.py", text)
         self.assertIn("Performance regression check", text)
         start = text.index("Performance regression check")
-        step = text[start:text.index("Docs-only lightweight checks", start)]
+        # CSL-255: the perf step now lives in linux-tests, directly before the required linux job.
+        step = text[start:text.index("\n  linux:\n", start)]
         self.assertIn("pull_request", step)
         self.assertIn("timeout 55 ", step)
         self.assertIn("timeout-minutes: 1\n", step)
@@ -275,11 +276,15 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("label-churn", text)
         self.assertEqual(text.count("name: linux"), 1)
         linux = text[text.index("  linux:\n") : text.index("  windows:")]
-        self.assertIn("runs-on: blacksmith-2vcpu-ubuntu-2404", linux)
-        self.assertNotIn("github.event.pull_request.draft", linux)
+        # CSL-255: the required linux job is a free aggregate; the paid suite is linux-tests.
+        self.assertIn("runs-on: ubuntu-latest", linux)
+        tests = text[text.index("  linux-tests:\n") : text.index("  linux:\n")]
+        self.assertIn("runs-on: ubuntu-24.04", tests)
+        self.assertIn("if: always()\n", linux)
+        self.assertNotRegex(linux, r"(?m)^    if: .*draft")
         self.assertNotIn("github.event.action != 'labeled'", linux)
         windows = text[text.index("  windows:") : text.index("  macos:")]
-        self.assertIn("needs: linux", windows)
+        self.assertIn("needs: [preflight, settle, linux]", windows)
         self.assertIn("needs.linux.result == 'success'", windows)
         self.assertIn("'ci:full'", windows)
         label_wf = (ROOT / ".github" / "workflows" / "ci-full-label.yml").read_text(
@@ -314,6 +319,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("name: windows", matrix_wf)
         self.assertIn("name: macos", matrix_wf)
         self.assertNotIn("needs: linux", matrix_wf)
+        # CSL-408: the ci:full Windows job runs on the free GitHub-hosted image.
+        self.assertIn("runs-on: windows-2025", matrix_wf)
         pr_lint = (ROOT / ".github" / "workflows" / "pr-lint.yml").read_text(encoding="utf-8")
         self.assertIn("runs-on: ubuntu-latest", pr_lint)
         self.assertNotIn("blacksmith", pr_lint)

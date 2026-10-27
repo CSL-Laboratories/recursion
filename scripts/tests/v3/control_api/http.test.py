@@ -483,7 +483,7 @@ class CliTests(unittest.TestCase):
             try:
                 line = _stdout_line(server)
                 if not line:
-                    self.fail(_stderr_text(server) or "serve-fake produced no ready line")
+                    self.fail(_ready_failure(server))
                 info = json.loads(line)
                 self.assertFalse(info["live_calls"])
                 token = token_file.read_text().strip()
@@ -535,7 +535,7 @@ class CliTests(unittest.TestCase):
             try:
                 ready_line = _stdout_line(server)
                 if not ready_line:
-                    self.fail(_stderr_text(server) or "serve-fake produced no ready line")
+                    self.fail(_ready_failure(server))
                 info = json.loads(ready_line)
                 token = token_file.read_text().strip()
                 bad = Path(directory) / "loose"
@@ -588,7 +588,7 @@ class CliTests(unittest.TestCase):
             try:
                 ready_line = _stdout_line(server)
                 if not ready_line:
-                    self.fail(_stderr_text(server) or "serve-fake produced no ready line")
+                    self.fail(_ready_failure(server))
                 info = json.loads(ready_line)
                 self.assertFalse(info["live_calls"])
                 self.assertTrue(token_file.is_file())
@@ -607,7 +607,7 @@ class CliTests(unittest.TestCase):
                 restarted = launch()
                 again_line = _stdout_line(restarted)
                 if not again_line:
-                    self.fail(_stderr_text(restarted) or "serve-fake produced no ready line on restart")
+                    self.fail(_ready_failure(restarted))
                 again = json.loads(again_line)
                 self.assertFalse(again["live_calls"])
                 self.assertTrue(token_file.is_file())
@@ -635,7 +635,7 @@ class CliTests(unittest.TestCase):
                 if not line:
                     if proc.poll() is None:
                         proc.kill()
-                    self.fail(_stderr_text(proc) or "serve-fake produced no ready line")
+                    self.fail(_ready_failure(proc))
                 info = json.loads(line)
                 self.assertFalse(info["live_calls"])
 
@@ -1062,6 +1062,7 @@ def _child_env() -> dict[str, str]:
         "PYTHONPATH": str(ROOT),
         "PYTHONPYCACHEPREFIX": _PYCACHE.name,
         "PYTHONUNBUFFERED": "1",
+        "CONTROL_API_SERVE_TRACE": "1",
     }
     env.pop("PYTHONDONTWRITEBYTECODE", None)
     return env
@@ -1138,11 +1139,22 @@ def _stdout_line(proc: subprocess.Popen[str], timeout: float = _SERVE_FAKE_READY
         if not done.wait(timeout):
             proc.kill()
 
+    started = time.perf_counter()
     threading.Thread(target=watchdog, daemon=True).start()
     try:
         return stdout.readline()
     finally:
         done.set()
+        setattr(proc, "_ready_wait_s", time.perf_counter() - started)
+
+
+def _ready_failure(proc: subprocess.Popen[str]) -> str:
+    """stderr plus how long this thread waited for the ready line."""
+
+    waited = getattr(proc, "_ready_wait_s", None)
+    detail = _stderr_text(proc).strip()
+    prefix = f"ready wait {waited:.1f}s" if isinstance(waited, float) else "ready wait unknown"
+    return f"{prefix}\n{detail}" if detail else prefix or "serve-fake produced no ready line"
 
 
 def _capture_stderr(proc: subprocess.Popen[str]) -> None:

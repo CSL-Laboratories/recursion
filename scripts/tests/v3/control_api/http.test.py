@@ -10,6 +10,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -46,6 +47,9 @@ _SKIP_POSIX_TOKEN_MODE = (
 )
 _SKIP_TOKEN_SYMLINK = (
     "symbolic links need extra privileges on Windows and are unsupported for this token-file check"
+)
+_SKIP_SIGTERM_STOP = (
+    "Windows terminate() uses TerminateProcess and does not deliver a catchable SIGTERM"
 )
 
 
@@ -443,6 +447,67 @@ class CliTests(unittest.TestCase):
                     server.kill()
                 server.stdout.close()
                 server.stderr.close()
+
+    @unittest.skipIf(os.name == "nt", _SKIP_SIGTERM_STOP)
+    def test_sigterm_unlinks_the_token_file_and_the_path_can_be_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            token_file = Path(directory) / "token"
+            env = {**os.environ, "PYTHONPATH": str(ROOT)}
+            command = [
+                sys.executable, "-X", "utf8", "-B", "-m", "scripts.v3.control_api", "serve-fake",
+                "--token-file", str(token_file),
+            ]
+
+            def launch() -> subprocess.Popen[str]:
+                return subprocess.Popen(
+                    command,
+                    cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+
+            def finish(proc: subprocess.Popen[str]) -> None:
+                if proc.poll() is None:
+                    proc.send_signal(signal.SIGTERM)
+                    try:
+                        proc.wait(10)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(10)
+                if proc.stdout is not None:
+                    proc.stdout.close()
+                if proc.stderr is not None:
+                    proc.stderr.close()
+
+            server = launch()
+            restarted: subprocess.Popen[str] | None = None
+            try:
+                info = json.loads(server.stdout.readline())
+                self.assertFalse(info["live_calls"])
+                self.assertTrue(token_file.is_file())
+                time.sleep(0.2)
+                server.send_signal(signal.SIGTERM)
+                try:
+                    code = server.wait(10)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                    server.wait(10)
+                    self.fail("serve-fake did not exit after SIGTERM")
+                stderr = server.stderr.read() if server.stderr is not None else ""
+                self.assertEqual(0, code, stderr)
+                self.assertFalse(token_file.exists())
+
+                restarted = launch()
+                again_line = restarted.stdout.readline()
+                if not again_line:
+                    again_err = restarted.stderr.read() if restarted.stderr is not None else ""
+                    self.fail(again_err or "serve-fake produced no ready line on restart")
+                again = json.loads(again_line)
+                self.assertFalse(again["live_calls"])
+                self.assertTrue(token_file.is_file())
+                self.assertNotIn("token_file_exists", again_line)
+            finally:
+                finish(server)
+                if restarted is not None:
+                    finish(restarted)
 
 
 if __name__ == "__main__":

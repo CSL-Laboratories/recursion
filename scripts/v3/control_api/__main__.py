@@ -55,10 +55,17 @@ def _serve(args: argparse.Namespace) -> int:
         raise
     print(json.dumps({"url": server.url, "tenant": args.tenant, "live_calls": False}), flush=True)
     stop = threading.Event()
-    signal.signal(signal.SIGINT, lambda *_: stop.set())
-    signal.signal(signal.SIGTERM, lambda *_: stop.set())
-    stop.wait()
-    server.stop()
+    try:
+        signal.signal(signal.SIGINT, lambda *_: stop.set())
+        signal.signal(signal.SIGTERM, lambda *_: stop.set())
+        stop.wait()
+        server.stop()
+    finally:
+        if created:
+            try:
+                os.unlink(args.token_file)
+            except OSError:
+                pass
     return 0
 
 

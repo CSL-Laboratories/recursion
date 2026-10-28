@@ -46,34 +46,61 @@ def _serve(args: argparse.Namespace, stop: threading.Event | None = None) -> int
     server = None
     identity: tuple[int, int] | None = None
     held: int | None = None
+    own_stop = stop is None
+    if stop is None:
+        stop = threading.Event()
+    # Restored on the way out when this call installed them. A caller that
+    # passes ``stop`` (the in-process clean-stop tests) owns the event and
+    # does not need handlers.
+    previous_handlers = None
     try:
         server = ControlHTTPServer(stack.service, "127.0.0.1", args.port)
         try:
             device, inode, held = create_token_file(args.token_file, token)
             identity = (device, inode)
         except FileExistsError:
-            print(json.dumps({"error": "token_file_exists"}), file=sys.stderr)
+            print(json.dumps({"error": "token_file_exists"}), file=sys.stderr, flush=True)
             server.close()
             return 2
+        if own_stop:
+            # Install handlers before the accept thread starts. Doing it
+            # afterwards runs signal.signal while that thread is in select;
+            # on macOS that can delay the ready line past the caller's
+            # startup deadline. A bind failure never reaches this point, so
+            # it also does not call signal.signal while another server in
+            # this process is already blocked in select.
+            previous_handlers = (
+                signal.getsignal(signal.SIGINT),
+                signal.getsignal(signal.SIGTERM),
+            )
+            signal.signal(signal.SIGINT, lambda *_: stop.set())
+            signal.signal(signal.SIGTERM, lambda *_: stop.set())
         server.start()
+        # The caller's startup deadline covers only this line. Flush it
+        # before the wait loop, which is where a SIGTERM is handled.
+        print(
+            json.dumps({"url": server.url, "tenant": args.tenant, "live_calls": False}),
+            flush=True,
+        )
+        # An untimed condition wait can delay the Python signal handler until
+        # that wait returns (macOS does this). SIGTERM would then leave
+        # serve-fake running. Returning to Python between short waits lets the
+        # handler set ``stop``.
+        while not stop.wait(0.2):
+            pass
+        server.stop()
     except OSError:
-        _unlink_created(args.token_file, identity, held)
         if server is not None:
             try:
                 server.close()
             except OSError:
                 pass
         raise
-    if stop is None:
-        stop = threading.Event()
-    try:
-        signal.signal(signal.SIGINT, lambda *_: stop.set())
-        signal.signal(signal.SIGTERM, lambda *_: stop.set())
-        print(json.dumps({"url": server.url, "tenant": args.tenant, "live_calls": False}), flush=True)
-        stop.wait()
-        server.stop()
     finally:
         _unlink_created(args.token_file, identity, held)
+        if previous_handlers is not None:
+            signal.signal(signal.SIGINT, previous_handlers[0])
+            signal.signal(signal.SIGTERM, previous_handlers[1])
     return 0
 
 

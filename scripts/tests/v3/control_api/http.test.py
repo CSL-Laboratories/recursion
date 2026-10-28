@@ -14,6 +14,7 @@ import io
 import json
 import os
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -23,10 +24,15 @@ import time
 import unittest
 import unittest.mock as mock
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[4]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+# The gate runs this file with -B. Children do not inherit that flag.
+# Bytecode goes to a temp directory so it stays out of the repo.
+_PYCACHE = tempfile.TemporaryDirectory(prefix="control-api-pyc-")
 
 from scripts.v3.control_api import errors as err  # noqa: E402
 from scripts.v3.control_api.auth import SCOPE_CONTROL, SCOPE_OBSERVE  # noqa: E402
@@ -279,6 +285,23 @@ class BindTests(unittest.TestCase):
         with ControlHTTPServer(stack.service, "localhost") as server:
             self.assertTrue(server.url.startswith("http://127.0.0.1:"))
 
+    def test_a_busy_port_refuses_a_second_server(self) -> None:
+        stack = build_fake_stack()
+        blocker = ControlHTTPServer(stack.service).start()
+        self.addCleanup(blocker.stop)
+        _assert_port_refuses_a_second_server(self, stack.service, blocker.port)
+
+    def test_windows_binds_exclusively_and_never_sets_reuseaddr(self) -> None:
+        # Windows SO_REUSEADDR lets a second socket bind a listening port, so
+        # serve-fake --port <busy> served forever instead of exiting 2.
+        # The socket option is what the server branches on, not os.name.
+        self.assertEqual(
+            [(socket.SOL_SOCKET, "SO_EXCLUSIVEADDRUSE", 1)], _bind_options(windows=True)
+        )
+
+    def test_posix_keeps_reuseaddr_for_restarts(self) -> None:
+        self.assertEqual([(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)], _bind_options(windows=False))
+
     def test_the_client_refuses_a_non_loopback_url(self) -> None:
         for url in ("http://example.com:80", "https://127.0.0.1:1", "http://192.0.2.1:1", "http://127.0.0.1"):
             with self.assertRaises(ValueError, msg=url):
@@ -345,18 +368,26 @@ class TokenFileTests(unittest.TestCase):
         stack = build_fake_stack()
         blocker = ControlHTTPServer(stack.service).start()
         self.addCleanup(blocker.stop)
+        # signal.signal raises ValueError off the main thread, so a worker
+        # that calls main() never reaches stop.wait() and cannot catch a
+        # Windows co-bind. Refuse the port on this thread first. If that
+        # passes, main() on the busy port fails before it serves.
+        _assert_port_refuses_a_second_server(self, stack.service, blocker.port)
         with tempfile.TemporaryDirectory() as directory:
             token_file = Path(directory) / "token"
-            code = main(
-                [
-                    "serve-fake",
-                    "--token-file",
-                    str(token_file),
-                    "--port",
-                    str(blocker.port),
-                ]
-            )
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                code = main(
+                    [
+                        "serve-fake",
+                        "--token-file",
+                        str(token_file),
+                        "--port",
+                        str(blocker.port),
+                    ]
+                )
             self.assertEqual(2, code)
+            self.assertIn("OSError", stderr.getvalue())
             self.assertFalse(token_file.exists())
 
     def test_excess_connections_are_refused(self) -> None:
@@ -377,20 +408,82 @@ class TokenFileTests(unittest.TestCase):
             client.call("service.info")
         self.assertEqual(err.BUSY, raised.exception.code)
         self.assertEqual("too_many_connections", raised.exception.message)
+        # A reset instead of the 503 must fail here. Windows aborts a close
+        # that still has unread request bytes, and that RST can hide the body.
+        raw = socket.create_connection(("127.0.0.1", server.port), timeout=5)
+        self.addCleanup(raw.close)
+        raw.sendall(
+            (
+                f"POST /v1/rpc HTTP/1.1\r\nHost: 127.0.0.1:{server.port}\r\n"
+                "Content-Type: application/json\r\nContent-Length: 2\r\n"
+                "Connection: close\r\n\r\n{}"
+            ).encode("ascii")
+        )
+        chunks: list[bytes] = []
+        while True:
+            try:
+                piece = raw.recv(4096)
+            except ConnectionResetError as exc:
+                self.fail(f"over-limit refusal reset the socket before the 503: {exc}")
+            if not piece:
+                break
+            chunks.append(piece)
+        observed = b"".join(chunks)
+        self.assertIn(b"HTTP/1.1 503", observed)
+        self.assertIn(b"too_many_connections", observed)
+
+    def test_a_slow_refusal_does_not_hold_the_accept_loop(self) -> None:
+        # A peer that dribbles a byte before each recv timeout must not keep
+        # the accept thread in the refusal drain. The next caller still gets
+        # the 503 within the one-second deadline.
+        stack = build_fake_stack()
+        server = ControlHTTPServer(stack.service, max_connections=1).start()
+        self.addCleanup(server.stop)
+        token = stack.issue("op-a", "tenant-a", {SCOPE_CONTROL, SCOPE_OBSERVE})
+        held = http.client.HTTPConnection("127.0.0.1", server.port, timeout=10)
+        self.addCleanup(held.close)
+        held.request(
+            "GET",
+            "/v1/events?after=0&wait=10",
+            headers={"Authorization": f"Bearer {token}", "Host": f"127.0.0.1:{server.port}"},
+        )
+        time.sleep(0.2)
+        slow = socket.create_connection(("127.0.0.1", server.port), timeout=5)
+        self.addCleanup(slow.close)
+        slow.sendall(b"POST /v1/rpc HTTP/1.1\r\nHost: x\r\n")
+        time.sleep(0.3)
+
+        def drip() -> None:
+            for _ in range(30):
+                time.sleep(0.2)
+                try:
+                    slow.sendall(b"X")
+                except OSError:
+                    return
+
+        threading.Thread(target=drip, daemon=True).start()
+        started = time.monotonic()
+        client = ControlClient(server.url, token)
+        with self.assertRaises(ControlRpcError) as raised:
+            client.call("service.info")
+        self.assertEqual(err.BUSY, raised.exception.code)
+        self.assertEqual("too_many_connections", raised.exception.message)
+        self.assertLess(time.monotonic() - started, 3.0)
 
 
 class CliTests(unittest.TestCase):
     def test_serve_fake_call_and_events_without_printing_the_token(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             token_file = Path(directory) / "token"
-            env = {**os.environ, "PYTHONPATH": str(ROOT)}
+            env = _child_env()
             server = subprocess.Popen(
-                [sys.executable, "-X", "utf8", "-B", "-m", "scripts.v3.control_api", "serve-fake",
-                 "--token-file", str(token_file)],
+                _child_cmd("serve-fake", "--token-file", str(token_file)),
                 cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             )
             try:
-                line = server.stdout.readline()
+                line = _stdout_line(server)
+                if not line:
+                    self.fail(_ready_failure(server))
                 info = json.loads(line)
                 self.assertFalse(info["live_calls"])
                 token = token_file.read_text().strip()
@@ -398,8 +491,7 @@ class CliTests(unittest.TestCase):
 
                 def cli(*args: str) -> subprocess.CompletedProcess:
                     return subprocess.run(
-                        [sys.executable, "-X", "utf8", "-B", "-m", "scripts.v3.control_api", *args,
-                         "--url", info["url"], "--token-file", str(token_file)],
+                        _child_cmd(*args, "--url", info["url"], "--token-file", str(token_file)),
                         cwd=ROOT, env=env, capture_output=True, text=True, timeout=60,
                     )
 
@@ -418,8 +510,7 @@ class CliTests(unittest.TestCase):
                 for completed in (opened, ran, events):
                     self.assertNotIn(token, completed.stdout + completed.stderr)
                 again = subprocess.run(
-                    [sys.executable, "-X", "utf8", "-B", "-m", "scripts.v3.control_api", "serve-fake",
-                     "--token-file", str(token_file)],
+                    _child_cmd("serve-fake", "--token-file", str(token_file)),
                     cwd=ROOT, env=env, capture_output=True, text=True, timeout=60,
                 )
                 self.assertEqual(2, again.returncode)
@@ -436,21 +527,22 @@ class CliTests(unittest.TestCase):
     def test_cli_refuses_a_loose_token_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             token_file = Path(directory) / "token"
-            env = {**os.environ, "PYTHONPATH": str(ROOT)}
+            env = _child_env()
             server = subprocess.Popen(
-                [sys.executable, "-X", "utf8", "-B", "-m", "scripts.v3.control_api", "serve-fake",
-                 "--token-file", str(token_file)],
+                _child_cmd("serve-fake", "--token-file", str(token_file)),
                 cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             )
             try:
-                info = json.loads(server.stdout.readline())
+                ready_line = _stdout_line(server)
+                if not ready_line:
+                    self.fail(_ready_failure(server))
+                info = json.loads(ready_line)
                 token = token_file.read_text().strip()
                 bad = Path(directory) / "loose"
                 bad.write_text(token)
                 os.chmod(bad, 0o644)
                 refused = subprocess.run(
-                    [sys.executable, "-X", "utf8", "-B", "-m", "scripts.v3.control_api", "call",
-                     "--url", info["url"], "--token-file", str(bad), "service.info"],
+                    _child_cmd("call", "--url", info["url"], "--token-file", str(bad), "service.info"),
                     cwd=ROOT, env=env, capture_output=True, text=True, timeout=60,
                 )
                 self.assertEqual(2, refused.returncode)
@@ -469,11 +561,8 @@ class CliTests(unittest.TestCase):
     def test_sigterm_unlinks_the_token_file_and_the_path_can_be_reused(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             token_file = Path(directory) / "token"
-            env = {**os.environ, "PYTHONPATH": str(ROOT)}
-            command = [
-                sys.executable, "-X", "utf8", "-B", "-m", "scripts.v3.control_api", "serve-fake",
-                "--token-file", str(token_file),
-            ]
+            env = _child_env()
+            command = _child_cmd("serve-fake", "--token-file", str(token_file))
 
             def launch() -> subprocess.Popen[str]:
                 return subprocess.Popen(
@@ -497,7 +586,10 @@ class CliTests(unittest.TestCase):
             server = launch()
             restarted: subprocess.Popen[str] | None = None
             try:
-                info = json.loads(server.stdout.readline())
+                ready_line = _stdout_line(server)
+                if not ready_line:
+                    self.fail(_ready_failure(server))
+                info = json.loads(ready_line)
                 self.assertFalse(info["live_calls"])
                 self.assertTrue(token_file.is_file())
                 self.assertIsNone(server.poll())
@@ -508,15 +600,14 @@ class CliTests(unittest.TestCase):
                     server.kill()
                     server.wait(10)
                     self.fail("serve-fake did not exit after SIGTERM")
-                stderr = server.stderr.read() if server.stderr is not None else ""
+                stderr = _stderr_text(server)
                 self.assertEqual(0, code, stderr)
                 self.assertFalse(token_file.exists())
 
                 restarted = launch()
-                again_line = restarted.stdout.readline()
+                again_line = _stdout_line(restarted)
                 if not again_line:
-                    again_err = restarted.stderr.read() if restarted.stderr is not None else ""
-                    self.fail(again_err or "serve-fake produced no ready line on restart")
+                    self.fail(_ready_failure(restarted))
                 again = json.loads(again_line)
                 self.assertFalse(again["live_calls"])
                 self.assertTrue(token_file.is_file())
@@ -530,11 +621,8 @@ class CliTests(unittest.TestCase):
     def test_sigterm_leaves_a_replaced_token_file_in_place(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             token_file = Path(directory) / "token"
-            env = {**os.environ, "PYTHONPATH": str(ROOT)}
-            command = [
-                sys.executable, "-X", "utf8", "-B", "-m", "scripts.v3.control_api", "serve-fake",
-                "--token-file", str(token_file),
-            ]
+            env = _child_env()
+            command = _child_cmd("serve-fake", "--token-file", str(token_file))
 
             def launch() -> subprocess.Popen[str]:
                 return subprocess.Popen(
@@ -543,10 +631,11 @@ class CliTests(unittest.TestCase):
                 )
 
             def ready(proc: subprocess.Popen[str]) -> None:
-                line = proc.stdout.readline() if proc.stdout is not None else ""
+                line = _stdout_line(proc)
                 if not line:
-                    err_text = proc.stderr.read() if proc.stderr is not None else ""
-                    self.fail(err_text or "serve-fake produced no ready line")
+                    if proc.poll() is None:
+                        proc.kill()
+                    self.fail(_ready_failure(proc))
                 info = json.loads(line)
                 self.assertFalse(info["live_calls"])
 
@@ -584,7 +673,7 @@ class CliTests(unittest.TestCase):
                     first.kill()
                     first.wait(10)
                     self.fail("serve-fake did not exit after SIGTERM")
-                stderr = first.stderr.read() if first.stderr is not None else ""
+                stderr = _stderr_text(first)
                 self.assertEqual(0, code, stderr)
                 self.assertEqual((replaced.st_dev, replaced.st_ino), _file_id(token_file))
                 self.assertEqual(replacement, read_token_file(token_file))
@@ -596,7 +685,7 @@ class CliTests(unittest.TestCase):
                     second.kill()
                     second.wait(10)
                     self.fail("replacement serve-fake did not exit after SIGTERM")
-                second_err = second.stderr.read() if second.stderr is not None else ""
+                second_err = _stderr_text(second)
                 self.assertEqual(0, second_code, second_err)
                 self.assertFalse(token_file.exists())
             finally:
@@ -965,6 +1054,143 @@ class CliTests(unittest.TestCase):
                         os.close(descriptor)
                     except OSError:
                         pass
+
+
+def _child_env() -> dict[str, str]:
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(ROOT),
+        "PYTHONPYCACHEPREFIX": _PYCACHE.name,
+        "PYTHONUNBUFFERED": "1",
+    }
+    env.pop("PYTHONDONTWRITEBYTECODE", None)
+    return env
+
+
+def _child_cmd(*args: str) -> list[str]:
+    return [sys.executable, "-X", "utf8", "-m", "scripts.v3.control_api", *args]
+
+
+def _assert_port_refuses_a_second_server(case: unittest.TestCase, service: Any, port: int) -> None:
+    try:
+        second = ControlHTTPServer(service, port=port)
+    except OSError:
+        return
+    second.close()
+    case.fail(f"a second server bound busy port {port}")
+
+
+def _bind_options(*, windows: bool) -> list[tuple[int, object, int]]:
+    """Socket options a ControlHTTPServer sets before bind.
+
+    Only Windows defines socket.SO_EXCLUSIVEADDRUSE. Add or remove it to pick
+    the platform branch the server takes. The option is not taken from os.name.
+    """
+
+    stack = build_fake_stack()
+    recorded: list[tuple[int, object, int]] = []
+    real_setsockopt = socket.socket.setsockopt
+    exclusive = "SO_EXCLUSIVEADDRUSE"
+
+    def recording(sock: socket.socket, level: int, option: object, value: int) -> None:
+        recorded.append((level, option, value))
+        if isinstance(option, int):
+            real_setsockopt(sock, level, option, value)
+
+    with contextlib.ExitStack() as patches:
+        if windows:
+            # A marker the recorder swallows, so the Windows-only option is
+            # observed on every platform without reaching the OS.
+            patches.enter_context(
+                mock.patch.object(socket, "SO_EXCLUSIVEADDRUSE", exclusive, create=True)
+            )
+        elif hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            # None, not delattr: patch cleanup must restore the original.
+            patches.enter_context(mock.patch.object(socket, "SO_EXCLUSIVEADDRUSE", None))
+        patches.enter_context(mock.patch.object(socket.socket, "setsockopt", recording))
+        server = ControlHTTPServer(stack.service)
+    server.close()
+    return recorded
+
+
+# Own budget for one serve-fake process to print its ready line. This is not
+# the suite cap. A child that never prints used to sit in readline until the
+# 180s gate killed the file.
+_SERVE_FAKE_READY_S = 25.0
+
+
+def _stdout_line(proc: subprocess.Popen[str], timeout: float = _SERVE_FAKE_READY_S) -> str:
+    """Read one stdout line on this thread, or "" if none arrives within ``timeout``.
+
+    The read matches the passing ``serve-fake`` test: ``readline`` on the
+    caller. A watchdog kills the child when the startup deadline passes so
+    this wait cannot consume the suite cap. stderr is drained beside the
+    read so a full pipe cannot stall the ready line.
+    """
+
+    _capture_stderr(proc)
+    stdout = proc.stdout
+    if stdout is None:
+        return ""
+    done = threading.Event()
+
+    def watchdog() -> None:
+        if not done.wait(timeout):
+            proc.kill()
+
+    started = time.perf_counter()
+    threading.Thread(target=watchdog, daemon=True).start()
+    try:
+        return stdout.readline()
+    finally:
+        done.set()
+        setattr(proc, "_ready_wait_s", time.perf_counter() - started)
+
+
+def _ready_failure(proc: subprocess.Popen[str]) -> str:
+    """stderr plus how long this thread waited for the ready line."""
+
+    waited = getattr(proc, "_ready_wait_s", None)
+    detail = _stderr_text(proc).strip()
+    prefix = f"ready wait {waited:.1f}s" if isinstance(waited, float) else "ready wait unknown"
+    return f"{prefix}\n{detail}" if detail else prefix or "serve-fake produced no ready line"
+
+
+def _capture_stderr(proc: subprocess.Popen[str]) -> None:
+    if getattr(proc, "_stderr_thread", None) is not None:
+        return
+    parts: list[str] = []
+    setattr(proc, "_stderr_parts", parts)
+
+    def drain() -> None:
+        stderr = proc.stderr
+        if stderr is None:
+            return
+        parts.append(stderr.read())
+
+    reader = threading.Thread(target=drain, daemon=True)
+    setattr(proc, "_stderr_thread", reader)
+    reader.start()
+
+
+def _stderr_text(proc: subprocess.Popen[str], timeout: float = 2) -> str:
+    """stderr captured while waiting for the ready line, or a bounded read."""
+
+    reader = getattr(proc, "_stderr_thread", None)
+    parts = getattr(proc, "_stderr_parts", None)
+    if reader is not None:
+        reader.join(timeout)
+        return "".join(parts or [])
+    holder: dict[str, str] = {}
+
+    def read() -> None:
+        stderr = proc.stderr
+        holder["text"] = stderr.read() if stderr is not None else ""
+
+    fallback = threading.Thread(target=read, daemon=True)
+    fallback.start()
+    fallback.join(timeout)
+    return holder.get("text", "")
 
 
 def _file_id(path: Path) -> tuple[int, int]:

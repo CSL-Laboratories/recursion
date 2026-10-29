@@ -61,9 +61,8 @@ Everything below is provider-free. It runs on a plain checkout with Python 3.11+
 | T-03 | Does the OR-032 recovery reservation ledger satisfy its guards and mutations? | `python -X utf8 -B experiments/v3/recovery-ledger-20260914/test_ledger.py` | PASS, 16 tests |
 | T-04 | Does the DQ-16 delegated-Q bundle pass its static preflight and fake controls? | `python -X utf8 -B experiments/v3/delegated-q-coupling-20260914/test_contract.py` then `check.py --mode preflight` | preflight only; `--mode execute` is admission-gated |
 
-`tools/check_v3_orientation.py` is the frozen 2026-09-13 orientation-repair gate: it binds to that
-repair's allowed-path scope and fails on any later change by design. Do not use it as a general
-check for new branches; use the per-task gate instead.
+The frozen 2026-09-13 orientation-repair gate, `tools/check_v3_orientation.py`, was removed in
+CSL-573 (last copy at tag `pre-deletion-r1-20261029`). Use the per-task gate for new branches.
 
 ### Next, bounded (needs a new gate inside the packet's allowed paths)
 

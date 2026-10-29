@@ -198,9 +198,6 @@ python -X utf8 -B docs/v3/construction/next-work-20260914/check_handoff.py
 python -X utf8 -B experiments/v3/recovery-ledger-20260914/test_ledger.py
 ```
 
-The `tools/check_v3_orientation.py` gate is the frozen 2026-09-13 orientation-repair gate; it
-binds to that repair's scope and is not a general check for new branches.
-
 On Windows, paths can exceed 260 characters; pass `-c core.longpaths=true` per Git command.
 
 ## What is out of scope

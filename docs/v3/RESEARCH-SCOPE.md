@@ -62,7 +62,7 @@ Everything below is provider-free. It runs on a plain checkout with Python 3.11+
 | T-04 | Does the DQ-16 delegated-Q bundle pass its static preflight and fake controls? | `python -X utf8 -B experiments/v3/delegated-q-coupling-20260914/test_contract.py` then `check.py --mode preflight` | preflight only; `--mode execute` is admission-gated |
 
 The frozen 2026-09-13 orientation-repair gate, `tools/check_v3_orientation.py`, was removed in
-CSL-573 (last copy at tag `pre-deletion-r1-20261029`). Use the per-task gate for new branches.
+CSL-573 (last copy at commit `00004ef59b01`). Use the per-task gate for new branches.
 
 ### Next, bounded (needs a new gate inside the packet's allowed paths)
 

@@ -147,7 +147,7 @@ task's source, authority, budget, gate, checkpoint and unresolved evidence refer
 
 The frozen 2026-09-13 orientation-repair gate, `tools/check_v3_orientation.py`, was
 removed in CSL-573. It failed on any change after that repair by design and no CI job ran
-it. The last copy is at tag `pre-deletion-r1-20261029`. For current checks, run
+it. The last copy is at commit `00004ef59b01`. For current checks, run
 `python -X utf8 -B tools/ci_gate.py` from the repository root.
 
 After committing a clean candidate, add `--candidate FULL_COMMIT` to bind the checks

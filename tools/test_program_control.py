@@ -6,8 +6,12 @@ import copy
 import importlib.util
 import json
 import hashlib
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -17,15 +21,70 @@ LEDGER = ROOT / "docs/v3/program-control/program.json"
 spec = importlib.util.spec_from_file_location("check_program_control", CHECKER)
 assert spec and spec.loader
 checker = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = checker
 spec.loader.exec_module(checker)
 
 
+def symlinks_can_be_created():
+    if not hasattr(os, "symlink"):
+        return False
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "target"
+            target.write_text("target\n", encoding="utf-8")
+            os.symlink(target, root / "link")
+    except (OSError, NotImplementedError):
+        return False
+    return True
+
+
 class ProgramControlTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.root_inventory = checker.pinned_inventory(ROOT)
+        ledger_data = json.loads(LEDGER.read_text(encoding="utf-8"))
+        cls.root_pinned = tuple(
+            checker.sha256_pinned_paths(ledger_data, ROOT, inventory=cls.root_inventory))
+        cls.root_inventory.check_attr(cls.root_pinned)
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            fresh = checker.pinned_inventory(ROOT)
+            if fresh != cls.root_inventory:
+                raise AssertionError("ROOT pinned inventory changed during the test suite")
+            if cls.root_inventory.check_attr(cls.root_pinned) != fresh.check_attr(cls.root_pinned):
+                raise AssertionError("ROOT git check-attr results changed during the test suite")
+        finally:
+            super().tearDownClass()
+
     def setUp(self) -> None:
         self.data = json.loads(LEDGER.read_text(encoding="utf-8"))
+        # Mutation tests construct their own hypothetical admission envelopes.
+        # Retire the production admission receipt in this disposable fixture,
+        # otherwise those mutations correctly invalidate its bound target.
+        admission_receipt = self.data["admission"]["decision_receipt"]
+        for decision in self.data["decisions"]:
+            if admission_receipt is not None and decision["id"] == admission_receipt:
+                decision["status"] = "superseded"
+        self.data["admission"].update(
+            max_active_contract_consumers=None,
+            max_concurrent_reviews=None,
+            decision_receipt=None,
+        )
+
+    def test_checked_in_ledger_with_current_admission_receipt(self) -> None:
+        production = json.loads(LEDGER.read_text(encoding="utf-8"))
+        self.assertEqual(self.errors(production), [])
 
     def errors(self, data=None):
-        return checker.validate_program(data or self.data, ROOT)
+        # Shared snapshot of an unmodified checkout: its path list and already-queried
+        # attributes never refresh. setUpClass/tearDownClass compare the inventory and
+        # the root_pinned attributes at the suite's start and end; attribute drift for
+        # other path tuples, or a change made and reverted mid-suite, is not detected.
+        return checker.validate_program(data or self.data, ROOT, inventory=self.root_inventory)
 
     def assert_rejected(self, fragment, data=None):
         errors = self.errors(data)
@@ -243,6 +302,8 @@ class ProgramControlTests(unittest.TestCase):
 
     def test_unaccepted_contract_blocks_consumer(self) -> None:
         data = copy.deepcopy(self.data)
+        # This negative case must remain unaccepted as the checked-in ledger evolves.
+        data["contracts"][0]["status"] = "candidate"
         data["work_items"][0]["consumes_contracts"] = ["contract.issue-anti-drift"]
         self.assertTrue(any("consumes unaccepted contract" in error for error in self.errors(data)))
 
@@ -974,7 +1035,12 @@ class ProgramControlTests(unittest.TestCase):
                     self.assert_rejected(field)
 
     def test_external_routing_issues_need_not_be_local_work_rows(self):
+        # Test candidate routing, without inheriting a real approval for the old route.
+        for decision in self.data["decisions"]:
+            if decision.get("status") == "approved":
+                decision["status"] = "superseded"
         for contract in self.data["contracts"]:
+            contract["status"] = "candidate"
             contract["decision_issue"] = "CSL-991"
         self.data["capabilities"][0]["decision_issue"] = "CSL-992"
         self.data["admission"]["decision_issue"] = "CSL-993"
@@ -1533,6 +1599,964 @@ class ProgramControlTests(unittest.TestCase):
         self.promote()
         self.data["proposals"][-1]["scope"].append(" ")
         self.assert_rejected("requires explicit scope")
+
+    def test_pinned_enumeration_covers_contracts_and_manifest_payloads(self):
+        paths = checker.sha256_pinned_paths(self.data, ROOT)
+        for contract in self.data["contracts"]:
+            self.assertIn(contract["path"], paths)
+        # Intake payloads pinned by a SHA256SUMS manifest are included; the
+        # manifest and intake script themselves are not pinned payload paths.
+        self.assertIn("docs/v3/research-lane/packet-f-raudit-20261002/README.md", paths)
+        self.assertIn("docs/v3/research-lane/packet-f-raudit-20261002/corpus/report.md", paths)
+        self.assertNotIn("docs/v3/research-lane/packet-f-raudit-20261002/SHA256SUMS.txt", paths)
+        self.assertNotIn("docs/v3/research-lane/packet-f-raudit-20261002/check_intake.py", paths)
+
+    def test_pinned_enumeration_reads_manifest_entries_from_any_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            packet = root / "docs/v3/research-lane/fresh-packet"
+            packet.mkdir(parents=True)
+            (packet / "SHA256SUMS.txt").write_text(
+                "a" * 64 + "  payload.md\n" +
+                "not a sum line\n" +
+                "b" * 64 + " *blob.bin\n",
+                encoding="utf-8")
+            # Packet written from the parent dir: entries carry the dir prefix.
+            packet2 = root / "docs/v3/research-lane/parent-packet"
+            packet2.mkdir(parents=True)
+            (packet2 / "p.md").write_text("x\n", encoding="utf-8")
+            (packet2 / "SHA256SUMS.txt").write_text(
+                "c" * 64 + "  parent-packet/p.md\n" +
+                "d" * 64 + "  parent-packet/n.md\n",
+                encoding="utf-8")
+            # A same-named nested directory wins over the parent fallback.
+            nested = packet2 / "parent-packet"
+            nested.mkdir()
+            (nested / "n.md").write_text("x\n", encoding="utf-8")
+            receipts = root / "docs/audits/receipts-1"
+            receipts.mkdir(parents=True)
+            (receipts / "r1.json").write_text("{}", encoding="utf-8")
+            paths = checker.sha256_pinned_paths({"contracts": [{"path": "x/y.md"}]}, root)
+            self.assertIn("x/y.md", paths)
+            self.assertIn("docs/v3/research-lane/fresh-packet/payload.md", paths)
+            self.assertIn("docs/v3/research-lane/fresh-packet/blob.bin", paths)
+            self.assertIn("docs/v3/research-lane/parent-packet/p.md", paths)
+            self.assertIn("docs/v3/research-lane/parent-packet/parent-packet/n.md", paths)
+            self.assertIn("docs/audits/receipts-1/r1.json", paths)
+            self.assertNotIn("docs/v3/research-lane/fresh-packet/SHA256SUMS.txt", paths)
+
+    def test_eol_guard_passes_on_the_checked_in_tree(self):
+        self.assertEqual(checker.pinned_eol_errors(self.data, ROOT), [])
+
+    def test_eol_guard_flags_a_pinned_path_outside_lf_coverage(self):
+        # tools/check_program_control.py resolves eol=unspecified on this tree.
+        data = copy.deepcopy(self.data)
+        data["contracts"][0]["path"] = "tools/check_program_control.py"
+        errors = checker.pinned_eol_errors(data, ROOT)
+        self.assertTrue(any("tools/check_program_control.py" in error and "eol" in error
+                            for error in errors), errors)
+
+    def test_eol_guard_flags_new_uncovered_pins_in_a_git_worktree(self):
+        # The CSL-225 scenario: a sha256-pinned path lands without eol=lf.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+            packet = root / "docs/v3/research-lane/fresh-packet"
+            packet.mkdir(parents=True)
+            (packet / "payload.md").write_text("x\n", encoding="utf-8")
+            (packet / "SHA256SUMS.txt").write_text(
+                "a" * 64 + "  payload.md\n", encoding="utf-8")
+            errors = checker.pinned_eol_errors({"contracts": []}, root)
+            self.assertTrue(any("payload.md" in error and "eol" in error
+                                for error in errors), errors)
+
+    def test_eol_guard_accepts_lf_and_binary_pins_in_a_git_worktree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+            packet = root / "docs/v3/research-lane/fresh-packet"
+            packet.mkdir(parents=True)
+            (packet / "payload.md").write_text("x\n", encoding="utf-8")
+            (packet / "blob.bin").write_bytes(b"\x00\x01")
+            (packet / "SHA256SUMS.txt").write_text(
+                "a" * 64 + "  payload.md\n" +
+                "b" * 64 + "  blob.bin\n",
+                encoding="utf-8")
+            (root / ".gitattributes").write_text(
+                "docs/**/*.md text eol=lf\ndocs/**/*.bin binary\n", encoding="utf-8")
+            self.assertEqual(checker.pinned_eol_errors({"contracts": []}, root), [])
+
+    def test_git_check_attr_handles_inventory_larger_than_windows_argv_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+            (root / ".gitattributes").write_text("*.md text eol=lf\n", encoding="utf-8")
+            paths = tuple(
+                f"bulk/{index:04d}-{'x' * 56}.md" for index in range(2000))
+            old_argv = [
+                "git", "-C", str(root), "-c", "core.quotePath=false",
+                "check-attr", "text", "eol", "--", *paths,
+            ]
+            self.assertGreater(len(subprocess.list2cmdline(old_argv)), 32767)
+            real_run = subprocess.run
+            with mock.patch.object(checker.subprocess, "run", wraps=real_run) as run_spy:
+                resolved, failure = checker._git_check_attr(str(root), paths)
+
+            self.assertEqual(failure, "")
+            self.assertEqual(set(resolved), set(paths))
+            self.assertTrue(all(attrs == {"text": "set", "eol": "lf"}
+                                for attrs in resolved.values()))
+            self.assertEqual(run_spy.call_count, 1)
+            argv = run_spy.call_args.args[0]
+            self.assertFalse(set(paths).intersection(argv))
+            self.assertLess(len(subprocess.list2cmdline(argv)), 32767)
+            self.assertEqual(
+                run_spy.call_args.kwargs["input"],
+                b"".join(os.fsencode(path) + b"\0" for path in paths))
+            self.assertNotIn("text", run_spy.call_args.kwargs)
+
+    def test_git_check_attr_round_trips_unusual_portable_paths(self):
+        paths = (
+            "space name.md", "ab: c.md", "-dash.md", "naïve.md",
+            "#hash.md", "[br].md", "quote'.md",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+            (root / ".gitattributes").write_text("*.md text eol=lf\n", encoding="utf-8")
+
+            resolved, failure = checker._git_check_attr(str(root), paths)
+            self.assertEqual(failure, "")
+            self.assertEqual(resolved, {
+                path: {"text": "set", "eol": "lf"} for path in paths
+            })
+
+            disk_paths = tuple(path for path in paths if path != "ab: c.md")
+            sums = []
+            for path in disk_paths:
+                payload = b"unusual path\n"
+                (root / path).write_bytes(payload)
+                sums.append(f"{hashlib.sha256(payload).hexdigest()}  {path}\n")
+            (root / "SHA256SUMS.txt").write_text("".join(sums), encoding="utf-8")
+            self.assertEqual(checker.pinned_eol_errors({"contracts": []}, root), [])
+
+    def test_git_check_attr_round_trips_posix_only_paths(self):
+        if os.name == "nt":
+            self.skipTest(
+                "Windows filenames cannot contain newline, *, ?, backslash, or colon")
+        paths = (
+            "line\nbreak.md", "star*.md", "question?.md", "back\\slash.md", "a: b.md",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+            (root / ".gitattributes").write_text("*.md text eol=lf\n", encoding="utf-8")
+            for path in paths:
+                (root / path).write_text("unusual path\n", encoding="utf-8")
+
+            resolved, failure = checker._git_check_attr(str(root), paths)
+            self.assertEqual(failure, "")
+            self.assertEqual(resolved, {
+                path: {"text": "set", "eol": "lf"} for path in paths
+            })
+
+    def test_git_check_attr_rejects_malformed_and_newline_output(self):
+        cases = (
+            ("missing trailing NUL", b"notes.md\0text\0set", "missing trailing NUL"),
+            ("incomplete triple", b"notes.md\0text\0set\0notes.md\0",
+             "field count is not a multiple of 3"),
+            ("eol only", b"notes.md\0eol\0lf\0", "incomplete attributes"),
+            ("text unset only", b"notes.md\0text\0unset\0", "incomplete attributes"),
+            ("text set only", b"notes.md\0text\0set\0", "incomplete attributes"),
+            ("unknown attribute", b"notes.md\0binary\0set\0", "unknown attribute"),
+            ("unrequested path", b"other.md\0text\0set\0", "unrequested path"),
+            ("duplicate pair",
+             b"notes.md\0text\0set\0notes.md\0text\0set\0",
+             "duplicate path/attribute pair"),
+            ("undecodable value",
+             b"notes.md\0text\0s\xffet\0notes.md\0eol\0lf\0",
+             "undecodable field"),
+            ("newline format",
+             b"notes.md: text: set\nnotes.md: eol: unspecified\n",
+             "missing trailing NUL"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+            (root / "notes.md").write_text("notes\n", encoding="utf-8")
+            digest = hashlib.sha256((root / "notes.md").read_bytes()).hexdigest()
+            (root / "SHA256SUMS.txt").write_text(
+                f"{digest}  notes.md\n", encoding="utf-8")
+            for label, stdout, reason in cases:
+                completed = subprocess.CompletedProcess(
+                    ["git", "check-attr"], 0, stdout=stdout, stderr=b"")
+                with self.subTest(output=label):
+                    with mock.patch.object(
+                            checker.subprocess, "run", return_value=completed):
+                        try:
+                            resolved, failure = checker._git_check_attr(
+                                str(root), ("notes.md",))
+                        except Exception as exc:
+                            self.fail(f"malformed output raised instead of failing closed: {exc}")
+                    self.assertEqual(resolved, {})
+                    self.assertIn("git check-attr failed: malformed output", failure)
+                    self.assertIn(reason, failure)
+
+                    with mock.patch.object(
+                            checker.subprocess, "run", return_value=completed):
+                        errors = checker.pinned_eol_errors({"contracts": []}, root)
+                    self.assertIn(failure, errors)
+                    self.assertFalse(any("lacks eol=lf" in error for error in errors))
+
+    def test_git_check_attr_missing_requested_path_stays_absent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+            (root / "notes.md").write_text("notes\n", encoding="utf-8")
+            digest = hashlib.sha256((root / "notes.md").read_bytes()).hexdigest()
+            (root / "SHA256SUMS.txt").write_text(
+                f"{digest}  notes.md\n", encoding="utf-8")
+            completed = subprocess.CompletedProcess(
+                ["git", "check-attr"], 0, stdout=b"", stderr=b"")
+
+            with mock.patch.object(
+                    checker.subprocess, "run", return_value=completed):
+                self.assertEqual(
+                    checker._git_check_attr(str(root), ("notes.md",)), ({}, ""))
+            with mock.patch.object(
+                    checker.subprocess, "run", return_value=completed):
+                errors = checker.pinned_eol_errors({"contracts": []}, root)
+            self.assertIn("notes.md missing from git check-attr output", errors)
+
+    def test_git_check_attr_rejects_strict_path_decode_errors(self):
+        completed = subprocess.CompletedProcess(
+            ["git", "check-attr"], 0,
+            stdout=b"n\xffotes.md\0text\0set\0n\xffotes.md\0eol\0lf\0", stderr=b"")
+        with mock.patch.object(
+                checker.subprocess, "run", return_value=completed):
+            with mock.patch.object(
+                    checker.os, "fsdecode", side_effect=lambda field: field.decode("utf-8")):
+                resolved, failure = checker._git_check_attr("unused", ("notes.md",))
+        self.assertEqual(resolved, {})
+        self.assertEqual(
+            failure, "git check-attr failed: malformed output (undecodable field)")
+
+    def test_git_check_attr_rejects_nul_path_before_subprocess(self):
+        with mock.patch.object(checker.subprocess, "run") as run:
+            resolved, failure = checker._git_check_attr("unused", ("bad\0path.md",))
+        self.assertEqual(resolved, {})
+        self.assertEqual(failure, "git check-attr failed: path contains NUL")
+        run.assert_not_called()
+
+    def test_git_check_attr_path_encoding_failures_fail_closed(self):
+        encoding_error = UnicodeEncodeError("utf-8", "x", 0, 1, "surrogate")
+        with mock.patch.object(
+                checker.os, "fsencode", side_effect=encoding_error):
+            with mock.patch.object(checker.subprocess, "run") as run:
+                resolved, failure = checker._git_check_attr("unused", ("notes.md",))
+        self.assertEqual(resolved, {})
+        self.assertTrue(failure.startswith("git check-attr failed: "), failure)
+        run.assert_not_called()
+
+    def test_git_check_attr_incomplete_known_gap_fails_closed(self):
+        gap_path = sorted(checker.PINNED_EOL_KNOWN_GAPS)[0]
+        payload = b"incomplete attributes\n"
+        gap_name = gap_path.rsplit("/", 1)[-1]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+            target = root / gap_path
+            target.parent.mkdir(parents=True)
+            target.write_bytes(payload)
+            digest = hashlib.sha256(payload).hexdigest()
+            (target.parent / "SHA256SUMS.txt").write_text(
+                f"{digest}  {gap_name}\n", encoding="utf-8")
+            completed = subprocess.CompletedProcess(
+                ["git", "check-attr"], 0,
+                stdout=f"{gap_path}\0eol\0lf\0".encode("utf-8"), stderr=b"")
+            with mock.patch.object(
+                    checker.subprocess, "run", return_value=completed):
+                errors = checker.pinned_eol_errors({"contracts": []}, root)
+        self.assertIn(
+            "git check-attr failed: malformed output (incomplete attributes)", errors)
+        self.assertFalse(any("known eol gap is covered" in error for error in errors), errors)
+
+    def test_git_check_attr_subprocess_failures_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+            (root / "notes.md").write_text("notes\n", encoding="utf-8")
+            digest = hashlib.sha256((root / "notes.md").read_bytes()).hexdigest()
+            (root / "SHA256SUMS.txt").write_text(
+                f"{digest}  notes.md\n", encoding="utf-8")
+            cases = (
+                ("missing git", FileNotFoundError("git executable missing"),
+                 "git executable missing"),
+                ("timeout", subprocess.TimeoutExpired("git", 60), "timed out"),
+                ("nonzero exit", subprocess.CompletedProcess(
+                    ["git", "check-attr"], 2, stdout=b"", stderr=b"fatal: rejected"),
+                 "fatal: rejected"),
+                ("nonzero exit without detail", subprocess.CompletedProcess(
+                    ["git", "check-attr"], 3, stdout=b"", stderr=b""),
+                 "exit code 3"),
+                ("undecodable stderr", subprocess.CompletedProcess(
+                    ["git", "check-attr"], 2, stdout=b"", stderr=b"fatal: \xff"),
+                 "fatal: "),
+            )
+            for label, failure, expected in cases:
+                with self.subTest(failure=label):
+                    patch_args = ({"side_effect": failure}
+                                  if isinstance(failure, BaseException)
+                                  else {"return_value": failure})
+                    with mock.patch.object(checker.subprocess, "run", **patch_args):
+                        errors = checker.pinned_eol_errors({"contracts": []}, root)
+                    self.assertEqual(len(errors), 1, errors)
+                    self.assertTrue(errors[0].startswith("git check-attr failed: "), errors)
+                    self.assertIn(expected, errors[0])
+                    if label == "undecodable stderr":
+                        self.assertTrue(
+                            errors[0].startswith("git check-attr failed: fatal: "), errors)
+
+    def test_known_gap_entries_are_still_pinned_and_uncovered(self):
+        paths = set(checker.sha256_pinned_paths(self.data, ROOT))
+        self.assertTrue(checker.PINNED_EOL_KNOWN_GAPS)
+        self.assertTrue(checker.PINNED_EOL_KNOWN_GAPS <= paths)
+
+    def test_known_gap_covered_entry_is_reported_stale(self):
+        gap_path = sorted(checker.PINNED_EOL_KNOWN_GAPS)[0]
+        payload = b"now covered\n"
+        gap_name = gap_path.rsplit("/", 1)[-1]
+        expected = f"{gap_path} known eol gap is covered: remove it from PINNED_EOL_KNOWN_GAPS"
+        for attributes in ("text eol=lf", "-text"):
+            with self.subTest(attributes=attributes), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+                target = root / gap_path
+                target.parent.mkdir(parents=True)
+                target.write_bytes(payload)
+                digest = hashlib.sha256(payload).hexdigest()
+                (target.parent / "SHA256SUMS.txt").write_text(
+                    f"{digest}  {gap_name}\n", encoding="utf-8")
+                (root / ".gitattributes").write_text(
+                    f"/{gap_path} {attributes}\n", encoding="utf-8")
+
+                errors = checker.pinned_eol_errors({"contracts": []}, root)
+                path_errors = [error for error in errors if gap_path in error]
+                self.assertEqual(path_errors, [expected], errors)
+
+    def test_known_gap_removed_file_is_reported_stale(self):
+        # The frozen path snapshot can grow; only entries whose parent dirs
+        # exist in this synthetic root are stale, so assert that exact set.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "docs/v3/research-lane/overnight-20261002/semantic-guard-research"
+             ).mkdir(parents=True)
+            errors = checker.pinned_eol_errors({"contracts": []}, root)
+            stale_paths = sorted(
+                path for path in checker.PINNED_EOL_KNOWN_GAPS
+                if (root / path).parent.is_dir())
+            self.assertEqual(errors, [
+                f"{path} known eol gap is stale (unpinned or removed): "
+                "remove it from PINNED_EOL_KNOWN_GAPS"
+                for path in stale_paths
+            ])
+        # A bare synthetic root (no packet dirs) emits no stale-gap errors.
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(
+                checker.pinned_eol_errors({"contracts": []}, Path(directory)), [])
+
+    def test_sha256sums_absolute_or_escaping_entry_is_a_validation_error(self):
+        # CSL-226 P2: `sha256sum /abs/path` or a `..`-escaping entry must not
+        # crash sha256_pinned_paths via Path.relative_to raising ValueError.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            packet = root / "docs/v3/research-lane/unsafe-packet"
+            packet.mkdir(parents=True)
+            (packet / "SHA256SUMS.txt").write_text(
+                "a" * 64 + "  /etc/passwd\n" +
+                "b" * 64 + "  " + "../" * 5 + "outside.md\n",
+                encoding="utf-8")
+            errors = checker.pinned_path_errors({"contracts": []}, root)
+            self.assertTrue(any("/etc/passwd" in error and "outside the repository" in error
+                                for error in errors), errors)
+            self.assertTrue(any("outside.md" in error and "outside the repository" in error
+                                for error in errors), errors)
+            # Enumeration itself never raises for these entries; it just omits them.
+            self.assertEqual(checker.sha256_pinned_paths({"contracts": []}, root), [])
+
+    def test_manifest_pinned_text_file_outside_gap_dirs_requires_eol_lf(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+            packet = root / "docs/v3/research-lane/fresh-manifest-packet"
+            packet.mkdir(parents=True)
+            (packet / "NOTES.md").write_text("x\n", encoding="utf-8")
+            notes_sha = hashlib.sha256((packet / "NOTES.md").read_bytes()).hexdigest()
+            (packet / "MANIFEST.json").write_text(
+                json.dumps({"files": [{"path": "NOTES.md", "sha256": notes_sha}]}),
+                encoding="utf-8")
+            errors = checker.pinned_eol_errors({"contracts": []}, root)
+            self.assertTrue(any("NOTES.md" in error and "eol" in error for error in errors), errors)
+
+            (root / ".gitattributes").write_text("docs/**/*.md text eol=lf\n", encoding="utf-8")
+            self.assertEqual(checker.pinned_eol_errors({"contracts": []}, root), [])
+
+    def test_manifest_pinned_binary_entry_with_minus_text_is_tolerated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+            packet = root / "docs/v3/research-lane/fresh-manifest-packet"
+            packet.mkdir(parents=True)
+            (packet / "blob.bin").write_bytes(b"\x00\x01")
+            blob_sha = hashlib.sha256((packet / "blob.bin").read_bytes()).hexdigest()
+            (packet / "MANIFEST.json").write_text(
+                json.dumps({"files": [{"path": "blob.bin", "sha256": blob_sha}]}),
+                encoding="utf-8")
+            (root / ".gitattributes").write_text("docs/**/*.bin binary\n", encoding="utf-8")
+            self.assertEqual(checker.pinned_eol_errors({"contracts": []}, root), [])
+
+    def test_manifest_default_mapping_uses_manifest_local_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+            packet = root / "docs/v3/research-lane/fresh-raw-packet"
+            (packet / "raw" / "R-A").mkdir(parents=True)
+            (packet / "raw" / "R-A" / "report.md").write_text("x\n", encoding="utf-8")
+            report_sha = hashlib.sha256(
+                (packet / "raw" / "R-A" / "report.md").read_bytes()).hexdigest()
+            (packet / "MANIFEST.json").write_text(
+                json.dumps({"files": [{"path": "raw/R-A/report.md", "sha256": report_sha}]}),
+                encoding="utf-8")
+            paths = checker.sha256_pinned_paths({"contracts": []}, root)
+            self.assertIn("docs/v3/research-lane/fresh-raw-packet/raw/R-A/report.md", paths)
+            errors = checker.pinned_eol_errors({"contracts": []}, root)
+            self.assertTrue(any("raw/R-A/report.md" in error and "eol" in error
+                                for error in errors), errors)
+
+    def test_new_uncovered_pin_in_a_known_gap_packet_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+            packet = root / "docs/v3/research-lane/overnight-20261002"
+            packet.mkdir(parents=True)
+            (packet / "NEW.md").write_text("x\n", encoding="utf-8")
+            new_sha = hashlib.sha256((packet / "NEW.md").read_bytes()).hexdigest()
+            (packet / "MANIFEST.json").write_text(
+                json.dumps({"files": [{"path": "NEW.md", "sha256": new_sha}]}),
+                encoding="utf-8")
+            errors = checker.pinned_eol_errors({"contracts": []}, root)
+            self.assertTrue(any("NEW.md" in error and "lacks eol=lf" in error
+                                for error in errors), errors)
+
+    def test_pinned_enumeration_includes_overnight_manifest_changelog(self):
+        paths = checker.sha256_pinned_paths(self.data, ROOT)
+        self.assertIn("docs/v3/research-lane/overnight-20261002/CHANGELOG.md", paths)
+
+    def test_pinned_enumeration_includes_followups_machine_files(self):
+        packet = "docs/v3/research-lane/followups-20261002"
+        names = {"platform-manifest.json", "platform-manifest.schema.json",
+                 "negative-traces.json", "negative-traces.schema.json",
+                 "profile-fields.json", "source-register.json"}
+        paths = set(checker.sha256_pinned_paths(self.data, ROOT))
+        self.assertEqual({path for path in paths if path.startswith(packet + "/machine/")},
+                         {packet + "/machine/" + name for name in names})
+
+    def test_manifest_packet_mapping_ignores_local_raw_collisions(self):
+        layouts = [
+            ("dot-ra-rd-20261002", "DIR/report.md", "raw/DIR/report.md"),
+            ("scope-reframe-20261002", "DIR/report.md", "raw/DIR/report.md"),
+            ("overnight-20261002", "DIR/report.md", "DIR/report.md"),
+            ("other-packet", "DIR/report.md", "DIR/report.md"),
+            ("followups-20261002", "FU04-machine-specifications/spec.json", "machine/spec.json"),
+        ]
+        for packet_name, original, expected in layouts:
+            with self.subTest(packet=packet_name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                packet = root / packet_name
+                for name in {original, "raw/" + original, expected, "ROOT.md", "raw/ROOT.md"}:
+                    path = packet / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(name + "\n", encoding="utf-8")
+                manifest = packet / "MANIFEST.json"
+                manifest.write_text(json.dumps({"files": [
+                    {"path": original, "sha256": "a" * 64},
+                    {"path": "ROOT.md", "sha256": "b" * 64},
+                ]}), encoding="utf-8")
+                errors = []
+                self.assertEqual(checker._manifest_payload_paths(manifest, root, errors),
+                                 [packet / expected, packet / "ROOT.md"])
+                self.assertEqual(errors, [])
+                # An absent authoritative copy must not select a colliding copy.
+                (packet / expected).unlink()
+                self.assertEqual(checker._manifest_payload_paths(manifest, root, errors),
+                                 [packet / "ROOT.md"])
+                self.assertEqual(errors, [
+                    f"{packet.name}/MANIFEST.json: entry '{original}' payload is missing",
+                ])
+
+    def test_pinned_symlink_loops_are_validation_errors(self):
+        import os
+
+        if not hasattr(os, "symlink"):
+            self.skipTest("os.symlink unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            packet = root / "packet"
+            packet.mkdir()
+            try:
+                os.symlink("loop", packet / "loop")
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"symlinks unavailable: {exc}")
+            (packet / "SHA256SUMS.txt").write_text("a" * 64 + "  loop\n", encoding="utf-8")
+            (packet / "MANIFEST.json").write_text(json.dumps({"files": [
+                {"path": "loop", "sha256": "b" * 64},
+            ]}), encoding="utf-8")
+            errors = checker.pinned_path_errors({"contracts": []}, root)
+            self.assertEqual(errors, [
+                "packet/SHA256SUMS.txt: entry 'loop' cannot be resolved",
+                "packet/MANIFEST.json: entry 'loop' cannot be resolved",
+            ])
+            self.assertEqual(checker.sha256_pinned_paths({"contracts": []}, root), [])
+
+    def test_safe_join_reports_resolution_exceptions_deterministically(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            for exception in (RuntimeError, OSError, ValueError):
+                with self.subTest(exception=exception.__name__):
+                    errors = []
+                    with patch.object(Path, "resolve", side_effect=exception("unstable detail")):
+                        self.assertIsNone(checker._safe_join(root, "entry", root, errors, "source"))
+                    self.assertEqual(errors, ["source cannot be resolved"])
+
+    def test_manifest_mapped_symlink_escape_is_validation_error(self):
+        import os
+
+        if not hasattr(os, "symlink"):
+            self.skipTest("os.symlink unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            root, outside = base / "repo", base / "outside"
+            packet = root / "dot-ra-rd-20261002"
+            (packet / "DIR").mkdir(parents=True)
+            (outside / "DIR").mkdir(parents=True)
+            (outside / "DIR/report.md").write_text("outside\n", encoding="utf-8")
+            (packet / "DIR/report.md").write_text("local collision\n", encoding="utf-8")
+            try:
+                os.symlink(outside, packet / "raw", target_is_directory=True)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"symlinks unavailable: {exc}")
+            (packet / "MANIFEST.json").write_text(json.dumps({"files": [
+                {"path": "DIR/report.md", "sha256": "a" * 64},
+            ]}), encoding="utf-8")
+            self.assertEqual(checker.pinned_path_errors({"contracts": []}, root), [
+                "dot-ra-rd-20261002/MANIFEST.json: entry 'DIR/report.md' is outside the repository",
+            ])
+            self.assertEqual(checker.sha256_pinned_paths({"contracts": []}, root), [])
+
+    def test_sha256sums_fallback_symlink_escape_is_validation_error(self):
+        import os
+
+        if not hasattr(os, "symlink"):
+            self.skipTest("os.symlink unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            root = base / "repo"
+            packet = root / "packet"
+            packet.mkdir(parents=True)
+            outside = base / "outside.md"
+            outside.write_text("outside\n", encoding="utf-8")
+            try:
+                os.symlink(outside, packet / "report.md")
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"symlinks unavailable: {exc}")
+            (packet / "SHA256SUMS.txt").write_text(
+                "a" * 64 + "  packet/report.md\n", encoding="utf-8")
+            self.assertEqual(checker.pinned_path_errors({"contracts": []}, root), [
+                "packet/SHA256SUMS.txt: entry 'packet/report.md' is outside the repository",
+            ])
+            self.assertEqual(checker.sha256_pinned_paths({"contracts": []}, root), [])
+
+    def test_manifest_docx_entries_require_containment_and_binary_attributes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+            packet = root / "packet"
+            packet.mkdir()
+            (packet / "payload.docx").write_bytes(b"PK\x00\x01")
+            manifest = packet / "MANIFEST.json"
+            unsafe = ["/absolute.docx", "../../outside.docx", "C:/absolute.docx",
+                      "\\\\server\\share\\absolute.docx"]
+            manifest.write_text(json.dumps({"files": [
+                {"path": name, "sha256": "a" * 64}
+                for name in [*unsafe, "payload.docx", "omitted.docx"]
+            ]}), encoding="utf-8")
+            self.assertEqual(checker.pinned_path_errors({"contracts": []}, root), [
+                *(f"packet/MANIFEST.json: entry '{name}' is outside the repository" for name in unsafe),
+                "packet/MANIFEST.json: entry 'omitted.docx' payload is missing",
+            ])
+            self.assertEqual(checker.sha256_pinned_paths({"contracts": []}, root),
+                             ["packet/payload.docx"])
+            errors = checker.pinned_eol_errors({"contracts": []}, root)
+            self.assertTrue(any("payload.docx" in error and "eol" in error for error in errors), errors)
+            manifest.write_text(json.dumps({"files": [
+                {"path": "payload.docx", "sha256": "a" * 64},
+                {"path": "omitted.docx", "sha256": "b" * 64},
+            ]}), encoding="utf-8")
+            (root / ".gitattributes").write_text("*.docx binary\n", encoding="utf-8")
+            self.assertEqual(checker.pinned_eol_errors({"contracts": []}, root), [
+                "packet/MANIFEST.json: entry 'omitted.docx' payload is missing",
+            ])
+
+    def test_manifest_known_missing_source_original_allowlist_drains(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            packet = root / "docs/v3/research-lane/dot-ra-rd-20261002"
+            raw = packet / "raw/R-A"
+            raw.mkdir(parents=True)
+            payload = raw / "R-A-plugin-portability.docx"
+            payload.write_bytes(b"restored source original")
+            manifest = packet / "MANIFEST.json"
+            manifest.write_text(json.dumps({"files": [{
+                "path": "R-A/R-A-plugin-portability.docx",
+                "sha256": hashlib.sha256(payload.read_bytes()).hexdigest(),
+            }]}), encoding="utf-8")
+            errors = checker.pinned_path_errors({"contracts": []}, root)
+            self.assertTrue(any("R-A-plugin-portability.docx" in error
+                                and "known missing manifest source original is stale" in error
+                                for error in errors), errors)
+
+    def test_manifest_invalid_inventory_is_validation_error(self):
+        for payload in ('{', '{"files": {}}', '{"files": [{}]}'):
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "MANIFEST.json").write_text(payload, encoding="utf-8")
+                errors = checker.pinned_path_errors({"contracts": []}, root)
+                self.assertEqual(len(errors), 1, errors)
+                self.assertIn("MANIFEST.json:", errors[0])
+
+    def test_manifest_missing_payload_is_validation_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            packet = root / "fresh-packet"
+            packet.mkdir()
+            (packet / "MANIFEST.json").write_text(json.dumps({"files": [{
+                "path": "NEW.md", "sha256": "a" * 64,
+            }]}), encoding="utf-8")
+            self.assertEqual(checker.pinned_path_errors({"contracts": []}, root), [
+                "fresh-packet/MANIFEST.json: entry 'NEW.md' payload is missing",
+            ])
+
+    def test_pinned_enumeration_ignores_case_mismatched_names(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            packet = root / "packet"
+            packet.mkdir()
+            lower_manifest = packet / "manifest.json"
+            lower_manifest.write_text("{", encoding="utf-8")
+            lower_sums = packet / "sha256sums.txt"
+            lower_sums.write_text("a" * 64 + "  payload.md\n", encoding="utf-8")
+            (packet / "payload.md").write_text("ignored\n", encoding="utf-8")
+
+            def simulated_walk(path, *args, **kwargs):
+                self.assertEqual(Path(path), root)
+                yield str(root), ["packet"], []
+                yield str(packet), [], ["manifest.json", "payload.md", "sha256sums.txt"]
+
+            with patch.object(checker.os, "walk", new=simulated_walk):
+                self.assertEqual(checker.sha256_pinned_paths({"contracts": []}, root), [])
+                self.assertEqual(checker.pinned_path_errors({"contracts": []}, root), [])
+
+    def test_eol_guard_detects_sha256sums_pin_added_after_first_validation(self):
+        for line_ending in ("\n", "\r\n"):
+            label = "CRLF" if "\r" in line_ending else "LF"
+            with self.subTest(line_ending=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+                self.assertEqual(checker.pinned_eol_errors({"contracts": []}, root), [])
+
+                notes = root / "notes.md"
+                notes.write_text("notes\n", encoding="utf-8")
+                digest = hashlib.sha256(notes.read_bytes()).hexdigest()
+                (root / "SHA256SUMS.txt").write_bytes(
+                    f"{digest}  notes.md{line_ending}".encode("utf-8"))
+                errors = checker.pinned_eol_errors({"contracts": []}, root)
+                self.assertTrue(any("notes.md sha256-pinned path lacks eol=lf" in error
+                                    for error in errors), errors)
+
+    def test_eol_guard_detects_manifest_pin_added_after_first_validation(self):
+        for line_ending in ("\n", "\r\n"):
+            label = "CRLF" if "\r" in line_ending else "LF"
+            with self.subTest(line_ending=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+                self.assertEqual(checker.pinned_eol_errors({"contracts": []}, root), [])
+
+                notes = root / "notes.md"
+                notes.write_text("notes\n", encoding="utf-8")
+                payload = json.dumps({"files": [{
+                    "path": "notes.md",
+                    "sha256": hashlib.sha256(notes.read_bytes()).hexdigest(),
+                }]}, indent=2).replace("\n", line_ending) + line_ending
+                (root / "MANIFEST.json").write_bytes(payload.encode("utf-8"))
+                errors = checker.pinned_eol_errors({"contracts": []}, root)
+                self.assertTrue(any("notes.md sha256-pinned path lacks eol=lf" in error
+                                    for error in errors), errors)
+
+    def test_eol_guard_refreshes_gitattributes_between_validations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+            notes = root / "notes.md"
+            notes.write_text("notes\n", encoding="utf-8")
+            digest = hashlib.sha256(notes.read_bytes()).hexdigest()
+            (root / "SHA256SUMS.txt").write_text(
+                f"{digest}  notes.md\n", encoding="utf-8")
+
+            errors = checker.pinned_eol_errors({"contracts": []}, root)
+            self.assertTrue(any("notes.md sha256-pinned path lacks eol=lf" in error
+                                for error in errors), errors)
+
+            attributes = root / ".gitattributes"
+            attributes.write_text("notes.md eol=lf\n", encoding="utf-8")
+            self.assertEqual(checker.pinned_eol_errors({"contracts": []}, root), [])
+
+            attributes.write_text("notes.md eol=crlf\n", encoding="utf-8")
+            errors = checker.pinned_eol_errors({"contracts": []}, root)
+            self.assertTrue(any("notes.md sha256-pinned path lacks eol=lf" in error
+                                and "git check-attr eol: crlf" in error
+                                for error in errors), errors)
+
+    def test_eol_guard_refreshes_removed_payload_and_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+            notes = root / "notes.md"
+            notes.write_text("notes\n", encoding="utf-8")
+            digest = hashlib.sha256(notes.read_bytes()).hexdigest()
+            manifest = root / "SHA256SUMS.txt"
+            manifest.write_text(f"{digest}  notes.md\n", encoding="utf-8")
+            self.assertTrue(checker.pinned_eol_errors({"contracts": []}, root))
+
+            notes.unlink()
+            errors = checker.pinned_eol_errors({"contracts": []}, root)
+            self.assertTrue(any("notes.md pinned path does not exist" in error
+                                for error in errors), errors)
+
+            manifest.rename(root / "SHA256SUMS.old")
+            self.assertEqual(checker.pinned_eol_errors({"contracts": []}, root), [])
+
+    def test_eol_guard_refreshes_same_size_manifest_edits_with_restored_timestamps(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+            for name in ("notes.md", "other.md"):
+                (root / name).write_text(f"{name}\n", encoding="utf-8")
+            manifest = root / "SHA256SUMS.txt"
+            digest = hashlib.sha256((root / "notes.md").read_bytes()).hexdigest()
+            manifest.write_text(f"{digest}  notes.md\n", encoding="utf-8")
+            (root / ".gitattributes").write_text("notes.md eol=lf\n", encoding="utf-8")
+            self.assertEqual(checker.pinned_eol_errors({"contracts": []}, root), [])
+
+            manifest_stat = manifest.stat()
+            root_stat = root.stat()
+            manifest.write_text(f"{digest}  other.md\n", encoding="utf-8")
+            os.utime(manifest, ns=(manifest_stat.st_atime_ns, manifest_stat.st_mtime_ns))
+            os.utime(root, ns=(root_stat.st_atime_ns, root_stat.st_mtime_ns))
+
+            errors = checker.pinned_eol_errors({"contracts": []}, root)
+            self.assertTrue(any("other.md sha256-pinned path lacks eol=lf" in error
+                                for error in errors), errors)
+
+    @unittest.skipUnless(symlinks_can_be_created(), "symlink creation unavailable")
+    def test_eol_guard_refreshes_symlink_target_between_validations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+            (root / "first.md").write_text("first\n", encoding="utf-8")
+            (root / "second.md").write_text("second\n", encoding="utf-8")
+            (root / "notes.md").symlink_to("first.md")
+            (root / ".gitattributes").write_text(
+                "first.md eol=lf\nsecond.md eol=crlf\n", encoding="utf-8")
+            (root / "SHA256SUMS.txt").write_text("a" * 64 + "  notes.md\n", encoding="utf-8")
+            self.assertEqual(checker.pinned_eol_errors({"contracts": []}, root), [])
+
+            (root / "notes.md").unlink()
+            (root / "notes.md").symlink_to("second.md")
+            errors = checker.pinned_eol_errors({"contracts": []}, root)
+            self.assertTrue(any("second.md sha256-pinned path lacks eol=lf" in error
+                                and "git check-attr eol: crlf" in error
+                                for error in errors), errors)
+
+    def test_validate_program_builds_one_pinned_inventory_per_call(self):
+        from unittest.mock import patch
+
+        with patch.object(checker, "pinned_inventory", wraps=checker.pinned_inventory) as scan:
+            checker.validate_program(self.data, ROOT)
+            self.assertEqual(scan.call_count, 1)
+            checker.validate_program(self.data, ROOT)
+            self.assertEqual(scan.call_count, 2)
+
+    def test_explicit_stale_inventory_is_honored_and_fresh_call_sees_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+            inventory = checker.pinned_inventory(root)
+            notes = root / "notes.md"
+            notes.write_text("notes\n", encoding="utf-8")
+            digest = hashlib.sha256(notes.read_bytes()).hexdigest()
+            (root / "SHA256SUMS.txt").write_text(
+                f"{digest}  notes.md\n", encoding="utf-8")
+
+            self.assertEqual(
+                checker.pinned_eol_errors({"contracts": []}, root, inventory=inventory), [])
+            errors = checker.pinned_eol_errors({"contracts": []}, root)
+            self.assertTrue(any("notes.md sha256-pinned path lacks eol=lf" in error
+                                for error in errors), errors)
+
+    def test_pinned_inventory_rejects_a_mismatched_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first_root = Path(directory) / "first"
+            second_root = Path(directory) / "second"
+            first_root.mkdir()
+            second_root.mkdir()
+            inventory = checker.pinned_inventory(first_root)
+            with self.assertRaises(ValueError):
+                checker.pinned_eol_errors(
+                    {"contracts": []}, second_root, inventory=inventory)
+
+    def test_shared_root_inventory_matches_fresh_scan(self):
+        self.assertEqual(self.root_inventory, checker.pinned_inventory(ROOT))
+        self.assertEqual(
+            self.root_inventory.check_attr(self.root_pinned),
+            checker.pinned_inventory(ROOT).check_attr(self.root_pinned))
+
+    def test_check_attr_results_cannot_be_poisoned_by_caller_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+            notes = root / "notes.md"
+            notes.write_text("notes\n", encoding="utf-8")
+            digest = hashlib.sha256(notes.read_bytes()).hexdigest()
+            (root / "SHA256SUMS.txt").write_text(
+                f"{digest}  notes.md\n", encoding="utf-8")
+
+            inv = checker.pinned_inventory(root)
+            data = {"contracts": []}
+            key = tuple(checker.sha256_pinned_paths(data, root, inventory=inv))
+            self.assertEqual(key, ("notes.md",))
+            baseline = checker.pinned_eol_errors(data, root, inventory=inv)
+            self.assertTrue(any("notes.md sha256-pinned path lacks eol=lf" in error
+                                for error in baseline), baseline)
+
+            first_attrs, _ = inv.check_attr(key)
+            second_attrs, _ = inv.check_attr(key)
+            self.assertIsNot(first_attrs, second_attrs)
+            self.assertIsNot(first_attrs["notes.md"], second_attrs["notes.md"])
+
+            mutations = (
+                ("cover path", lambda attrs: (
+                    attrs["notes.md"].update({"eol": "lf", "text": "unset"}))),
+                ("delete path", lambda attrs: attrs.__delitem__("notes.md")),
+                ("clear result", lambda attrs: attrs.clear()),
+            )
+            for label, mutate in mutations:
+                with self.subTest(mutation=label):
+                    attrs, _ = inv.check_attr(key)
+                    mutate(attrs)
+                    errors = checker.pinned_eol_errors(data, root, inventory=inv)
+                    self.assertTrue(any("notes.md sha256-pinned path lacks eol=lf" in error
+                                        for error in errors), errors)
+                    self.assertFalse(any("missing from git check-attr output" in error
+                                         for error in errors), errors)
+
+            self.assertEqual(inv.check_attr(key), checker.pinned_inventory(root).check_attr(key))
+
+    def test_pinned_path_detail_errors_are_caller_copies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            packet = root / "docs/v3/research-lane/unsafe-packet"
+            packet.mkdir(parents=True)
+            (packet / "SHA256SUMS.txt").write_text(
+                "a" * 64 + "  /etc/passwd\n" +
+                "b" * 64 + "  " + "../" * 5 + "outside.md\n",
+                encoding="utf-8")
+            data = {"contracts": []}
+            inv = checker.pinned_inventory(root)
+            self.assertTrue(inv.errors)
+            self.assertIsInstance(inv.errors, tuple)
+            original = list(inv.errors)
+
+            _paths, _manifest_paths, details_errors = checker._pinned_path_details(
+                data, root, inventory=inv)
+            details_errors.append("poison")
+            path_errors = checker.pinned_path_errors(data, root, inventory=inv)
+            path_errors.append("poison")
+
+            _paths, _manifest_paths, second_details_errors = checker._pinned_path_details(
+                data, root, inventory=inv)
+            second_path_errors = checker.pinned_path_errors(data, root, inventory=inv)
+            self.assertNotIn("poison", second_details_errors)
+            self.assertNotIn("poison", second_path_errors)
+            self.assertEqual(list(inv.errors), original)
+            self.assertIsInstance(inv.errors, tuple)
+
+    def test_default_calls_rescan_between_calls(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+            data = {"contracts": []}
+            self.assertEqual(checker.sha256_pinned_paths(data, root), [])
+            self.assertEqual(checker.pinned_path_errors(data, root), [])
+            self.assertEqual(checker.pinned_eol_errors(data, root), [])
+
+            notes = root / "notes.md"
+            notes.write_text("notes\n", encoding="utf-8")
+            digest = hashlib.sha256(notes.read_bytes()).hexdigest()
+            (root / "SHA256SUMS.txt").write_text(
+                f"{digest}  notes.md\n", encoding="utf-8")
+            self.assertIn("notes.md", checker.sha256_pinned_paths(data, root))
+            errors = checker.pinned_eol_errors(data, root)
+            self.assertTrue(any("notes.md sha256-pinned path lacks eol=lf" in error
+                                for error in errors), errors)
+            self.assertEqual(checker.pinned_path_errors(data, root), [])
+
+            (root / ".gitattributes").write_text("notes.md eol=lf\n", encoding="utf-8")
+            self.assertEqual(checker.pinned_eol_errors(data, root), [])
+
+        real = checker._filesystem_pinned_path_inventory(str(ROOT.resolve()))
+        probe = "tools/check_program_control.py"
+        self.assertNotIn(probe, real[0])
+        self.assertNotIn(probe, checker.PINNED_EOL_KNOWN_GAPS)
+        probe_attrs, failure = checker._git_check_attr(str(ROOT.resolve()), (probe,))
+        self.assertEqual(failure, "")
+        self.assertNotEqual(probe_attrs.get(probe, {}).get("eol"), "lf")
+        self.assertNotEqual(probe_attrs.get(probe, {}).get("text"), "unset")
+
+        fake_paths = tuple(sorted(real[0] + (probe,)))
+        with patch.object(
+                checker, "_filesystem_pinned_path_inventory",
+                side_effect=[real, (fake_paths, real[1], real[2])]):
+            first = checker.validate_program(self.data, ROOT)
+            second = checker.validate_program(self.data, ROOT)
+        self.assertFalse(any(probe in error for error in first), first)
+        self.assertTrue(any(f"{probe} sha256-pinned path lacks eol=lf" in error
+                            for error in second), second)
+
+    def test_malformed_program_returns_before_scanning(self):
+        from unittest.mock import patch
+
+        with patch.object(checker, "pinned_inventory") as scan:
+            self.assertEqual(checker.validate_program([], ROOT), ["program must be an object"])
+            missing = checker.validate_program({}, ROOT)
+            self.assertEqual(len(missing), 1, missing)
+            self.assertTrue(missing[0].startswith("missing top-level fields:"), missing)
+            scan.assert_not_called()
 
 
 if __name__ == "__main__":

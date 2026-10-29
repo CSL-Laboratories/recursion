@@ -3,8 +3,10 @@
 
 Fail closed. Selects a PR only when GitHub reports it CONFLICTING (mergeable
 false / mergeable_state dirty), its head is in this repository, its refs are
-safe, its head is not a protected branch, it is not labelled needs-decision,
-and its author has write/maintain/admin permission. Writes a JSON matrix to
+safe, its head is not a protected branch, it is not labelled needs-decision or
+paused (claude:pause/hold, any case; unreadable labels count as paused), and
+its author has write/maintain/admin permission. Repo variable
+CLAUDE_FIXER_PAUSE=true selects nothing. Writes a JSON matrix to
 GITHUB_OUTPUT. Import select() from tests.
 """
 from __future__ import annotations
@@ -23,6 +25,8 @@ SAFE_LOGIN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
 PROTECTED_REFS = frozenset({"master", "main", "HEAD"})
 PROTECTED_PREFIXES = ("release/", "releases/", "hotfix/")
 SKIP_LABEL = "needs-decision"
+# Human pause shared with claude.yml (CSL-365): never select a paused PR.
+PAUSE_LABELS = frozenset({"claude:pause", "hold"})
 MAX_PRS = 3
 MAX_PAGES = 10
 MERGEABLE_ATTEMPTS = 4
@@ -93,7 +97,10 @@ def select(
         base_ref = _ref(base.get("ref"))
         head_sha = str(head.get("sha") or "").lower()
         same_repo = ((head.get("repo") or {}).get("full_name") or "") == repository
-        labels = {str((lb or {}).get("name") or "") for lb in pr.get("labels") or []}
+        raw_labels = pr.get("labels")
+        # Unreadable labels fail closed: a hold must not be missed.
+        readable = isinstance(raw_labels, list) and all(isinstance(lb, dict) for lb in raw_labels)
+        labels = {str(lb.get("name") or "").lower() for lb in raw_labels} if readable else set()
         author = str((pr.get("user") or {}).get("login") or "")
         reason = ""
         if str(pr.get("state") or "") != "open":
@@ -110,6 +117,8 @@ def select(
             reason = "unsafe-sha"
         elif SKIP_LABEL in labels:
             reason = "needs-decision"
+        elif not readable or PAUSE_LABELS & labels:
+            reason = "paused"
         elif not SAFE_LOGIN_RE.fullmatch(author):
             reason = "unsafe-login"
         if not reason:
@@ -273,6 +282,9 @@ def main() -> int:
     only = os.environ.get("PR_NUMBER", "").strip()
     if not repository or (only and not only.isdigit()):
         emit([], ["conflict-scan: bad-input"])
+        return 0
+    if os.environ.get("CLAUDE_FIXER_PAUSE") == "true":
+        emit([], ["conflict-scan: skip=paused (repo variable CLAUDE_FIXER_PAUSE)"])
         return 0
     try:
         if fixer_busy(repository, os.environ.get("GITHUB_RUN_ID", "")):

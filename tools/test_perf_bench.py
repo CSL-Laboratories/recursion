@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import ast
+import gc
 import importlib.util
 import json
+import os
 import socket
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -26,6 +29,10 @@ def load(name: str, path: Path):
 
 perf_compare = load("perf_compare", HERE / "perf_compare.py")
 perf_bench = load("perf_bench", HERE / "perf_bench.py")
+# perf_ci imports its siblings by name, so register them before loading it.
+sys.modules.setdefault("perf_compare", perf_compare)
+sys.modules.setdefault("perf_bench", perf_bench)
+perf_ci = load("perf_ci", HERE / "perf_ci.py")
 
 
 def _report(pairs: dict[str, float]) -> dict:
@@ -145,12 +152,61 @@ class BenchTests(unittest.TestCase):
         self.assertEqual(base["median_s"], perf_bench._positive_median(base["pass_medians_s"]))
         self.assertEqual(head["median_s"], perf_bench._positive_median(head["pass_medians_s"]))
 
+    def test_timed_call_restores_the_callers_gc_state(self) -> None:
+        gc_was_enabled = gc.isenabled()
+        try:
+            gc.enable()
+            perf_bench._timed_call(lambda: None, 1)
+            self.assertTrue(gc.isenabled())
+            gc.disable()
+            perf_bench._timed_call(lambda: None, 1)
+            self.assertFalse(gc.isenabled())
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+            else:
+                gc.disable()
+
+    def test_timed_call_keeps_gc_on_when_the_callback_enables_it(self) -> None:
+        # timeit parity: one-way restore. A callback that enables GC is not
+        # re-disabled, even when the caller entered with GC off.
+        gc_was_enabled = gc.isenabled()
+        try:
+            gc.disable()
+            perf_bench._timed_call(gc.enable, 1)
+            self.assertTrue(gc.isenabled())
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+            else:
+                gc.disable()
+
+    def test_timed_call_restores_gc_when_the_callback_raises(self) -> None:
+        def boom() -> None:
+            raise RuntimeError("boom")
+
+        gc_was_enabled = gc.isenabled()
+        try:
+            gc.enable()
+            with self.assertRaises(RuntimeError):
+                perf_bench._timed_call(boom, 1)
+            self.assertTrue(gc.isenabled())
+            gc.disable()
+            with self.assertRaises(RuntimeError):
+                perf_bench._timed_call(boom, 1)
+            self.assertFalse(gc.isenabled())
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+            else:
+                gc.disable()
+
     def test_short_suite_is_provider_free(self) -> None:
         report = perf_bench.run_suite(ROOT, rounds=2, round_s=0.005, warmup_s=0.005)
         self.assertEqual(report["provider_calls"], 0)
         self.assertEqual(
             [row["name"] for row in report["benchmarks"]],
-            ["canonical_digest", "decode_command", "validate_policy", "validate_dag"],
+            ["canonical_digest", "decode_command", "validate_policy", "validate_dag", "replay_reduce"],
         )
         for row in report["benchmarks"]:
             self.assertGreater(row["median_s"], 0)
@@ -194,13 +250,62 @@ class BenchTests(unittest.TestCase):
                 self.assertFalse(banned.intersection(modules), f"{name} imports {modules}")
 
 
+class EnvOverrideTests(unittest.TestCase):
+    NON_FINITE = ("nan", "NaN", "-nan", "inf", "+inf", "-inf", "Infinity", "1e999")
+
+    def _with_env(self, name: str, raw: str, fn):
+        with mock.patch.dict(os.environ, {name: raw}):
+            return fn()
+
+    def test_unset_or_blank_uses_defaults(self) -> None:
+        for raw in ("", "   "):
+            self.assertEqual(
+                self._with_env("PERF_REGRESSION_RATIO", raw, perf_ci._ratio_limit),
+                perf_ci.DEFAULT_RATIO,
+            )
+            self.assertEqual(
+                self._with_env("PERF_ABSOLUTE_FLOOR_S", raw, perf_ci._absolute_floor),
+                perf_compare.DEFAULT_ABSOLUTE_FLOOR_S,
+            )
+
+    def test_finite_values_are_accepted(self) -> None:
+        self.assertEqual(self._with_env("PERF_REGRESSION_RATIO", " 1.25 ", perf_ci._ratio_limit), 1.25)
+        self.assertEqual(self._with_env("PERF_ABSOLUTE_FLOOR_S", "0", perf_ci._absolute_floor), 0.0)
+        self.assertEqual(self._with_env("PERF_ABSOLUTE_FLOOR_S", "5e-5", perf_ci._absolute_floor), 5e-5)
+
+    def test_non_numbers_and_bounds_still_raise(self) -> None:
+        with self.assertRaisesRegex(perf_ci.PerfCIError, "is not a number"):
+            self._with_env("PERF_REGRESSION_RATIO", "fast", perf_ci._ratio_limit)
+        with self.assertRaisesRegex(perf_ci.PerfCIError, "greater than 1"):
+            self._with_env("PERF_REGRESSION_RATIO", "1", perf_ci._ratio_limit)
+        with self.assertRaisesRegex(perf_ci.PerfCIError, ">= 0"):
+            self._with_env("PERF_ABSOLUTE_FLOOR_S", "-0.001", perf_ci._absolute_floor)
+
+    def test_ratio_rejects_non_finite(self) -> None:
+        for raw in self.NON_FINITE:
+            with self.subTest(raw=raw):
+                with self.assertRaisesRegex(
+                    perf_ci.PerfCIError, r"^PERF_REGRESSION_RATIO=.* must be a finite number$",
+                ):
+                    self._with_env("PERF_REGRESSION_RATIO", raw, perf_ci._ratio_limit)
+
+    def test_floor_rejects_non_finite(self) -> None:
+        for raw in self.NON_FINITE:
+            with self.subTest(raw=raw):
+                with self.assertRaisesRegex(
+                    perf_ci.PerfCIError, r"^PERF_ABSOLUTE_FLOOR_S=.* must be a finite number$",
+                ):
+                    self._with_env("PERF_ABSOLUTE_FLOOR_S", raw, perf_ci._absolute_floor)
+
+
 class WorkflowTests(unittest.TestCase):
     def test_linux_job_warns_on_pull_requests_without_a_hard_fail(self) -> None:
         text = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
         self.assertIn("tools/perf_ci.py", text)
         self.assertIn("Performance regression check", text)
         start = text.index("Performance regression check")
-        step = text[start:text.index("Docs-only lightweight checks", start)]
+        # CSL-255: the perf step now lives in linux-tests, directly before the required linux job.
+        step = text[start:text.index("\n  linux:\n", start)]
         self.assertIn("pull_request", step)
         self.assertIn("timeout 55 ", step)
         self.assertIn("timeout-minutes: 1\n", step)
@@ -225,11 +330,15 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("label-churn", text)
         self.assertEqual(text.count("name: linux"), 1)
         linux = text[text.index("  linux:\n") : text.index("  windows:")]
-        self.assertIn("runs-on: blacksmith-2vcpu-ubuntu-2404", linux)
-        self.assertNotIn("github.event.pull_request.draft", linux)
+        # CSL-255: the required linux job is a free aggregate; the paid suite is linux-tests.
+        self.assertIn("runs-on: ubuntu-latest", linux)
+        tests = text[text.index("  linux-tests:\n") : text.index("  linux:\n")]
+        self.assertIn("runs-on: ubuntu-24.04", tests)
+        self.assertIn("if: always()\n", linux)
+        self.assertNotRegex(linux, r"(?m)^    if: .*draft")
         self.assertNotIn("github.event.action != 'labeled'", linux)
         windows = text[text.index("  windows:") : text.index("  macos:")]
-        self.assertIn("needs: linux", windows)
+        self.assertIn("needs: [preflight, settle, linux]", windows)
         self.assertIn("needs.linux.result == 'success'", windows)
         self.assertIn("'ci:full'", windows)
         label_wf = (ROOT / ".github" / "workflows" / "ci-full-label.yml").read_text(
@@ -264,6 +373,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("name: windows", matrix_wf)
         self.assertIn("name: macos", matrix_wf)
         self.assertNotIn("needs: linux", matrix_wf)
+        # CSL-408: the ci:full Windows job runs on the free GitHub-hosted image.
+        self.assertIn("runs-on: windows-2025", matrix_wf)
         pr_lint = (ROOT / ".github" / "workflows" / "pr-lint.yml").read_text(encoding="utf-8")
         self.assertIn("runs-on: ubuntu-latest", pr_lint)
         self.assertNotIn("blacksmith", pr_lint)

@@ -1,7 +1,8 @@
 ---
 title: Recursion v3 interactive terminal and persistent session runtime
-status: accepted-direction-with-open-research
-last-updated: 2026-09-07
+status: amendment proposed (2026-10-24); acceptance is a human decision by Lucas
+last-updated: 2026-10-25
+prior-status: accepted-direction-with-open-research
 ---
 
 # Recursion v3 interactive terminal and persistent session runtime
@@ -182,6 +183,14 @@ or daemon. A deliberate control command ends, pauses or kills work according to 
 This terminal experience is the v3 visual foundation. A later graphical frontend should be a
 new client of the same versioned observer/control protocols, not a rewrite of runtime state or
 actor semantics.
+
+Amendment proposed 2026-10-24 (acceptance is a human decision by Lucas): D-038 (accepted
+2026-10-02) already superseded the "later graphical frontend" exclusion — GUI and mobile
+are built but opt-in in the first release; no capability is deferred. This amendment does
+not reopen D-038. **Beyond D-038** the GUI client is a daemon-served web UI in a thin
+Tauri shell on Linux, Windows and macOS, on those same observer/control protocols. The
+protocol rule stands: the GUI must not rewrite runtime state or actor semantics;
+window-close is detach, not Stop. See [AMENDMENT-2026-10-24.md](AMENDMENT-2026-10-24.md).
 
 ## Process and view topology
 

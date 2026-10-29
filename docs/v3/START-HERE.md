@@ -145,21 +145,7 @@ task's source, authority, budget, gate, checkpoint and unresolved evidence refer
 
 ## Reproducible orientation and specification checks
 
-Run from the repository root with Python 3.11+ and Git:
-
-```text
-python -X utf8 -B tools/check_v3_orientation.py
-python -X utf8 -B tools/check_v3_orientation.py --contracts
-```
-
-The first command checks the repair scope against the pinned baseline, tracked entry
-points, all top-level v3 Markdown file links (excluding code), registered claim rows,
-Owner decision rows, and fixture inventory. The second also runs the existing three
-schema checks, three fixture-materialization checks and seventeen M1 test programs.
-These are provider-free source checks, not the historical scientific campaign gates,
-independent review, live provider qualification or v3 release acceptance.
-
-After committing a clean candidate, add `--candidate FULL_COMMIT` to bind the checks
-to that exact tree. Preserve the output externally. This repair gate freezes all
-pre-existing paths except its declared entry-point edits; future product changes need
-their own reviewed scope and gate rather than weakening this one.
+The frozen 2026-09-13 orientation-repair gate, `tools/check_v3_orientation.py`, was
+removed in CSL-573. It failed on any change after that repair by design and no CI job ran
+it. The last copy is at commit `00004ef59b01`. For current checks, run
+`python -X utf8 -B tools/ci_gate.py` from the repository root.

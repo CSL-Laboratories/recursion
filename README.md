@@ -35,7 +35,6 @@ Start here:
 | `scripts/v3/harness/` | CSL-27 upstream CLI harness slice; CSL-83 weights, cooldowns, and caps |
 | `config/harness.json` | shipped harness config (offline fixtures only) |
 | `scripts/tests/v3/` | v3 M1 test programs and fixtures |
-| `tools/check_v3_orientation.py` | the frozen 2026-09-13 orientation-repair gate |
 | `state/` | decision log and v3 goal/task records |
 
 ## Harness slice

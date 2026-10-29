@@ -114,11 +114,9 @@ M1_REQUIRED_TESTS = frozenset(
 )
 
 # Frozen packet gates — not general CI. See the workflow comment for why.
-#   tools/check_v3_orientation.py          frozen 2026-09-13 allowed-path repair
 #   docs/v3/construction/next-work-20260914/check_handoff.py  T-01 spec freeze
 #   delegated-q check.py --mode preflight  packet-scoped source_gate
 #   delegated-q check.py --mode execute    Owner-gated scientific admission
-#   tools/check_next_phase.py              needs Java/TLA+, not this suite
 
 
 def emit_output(key: str, value: str) -> None:

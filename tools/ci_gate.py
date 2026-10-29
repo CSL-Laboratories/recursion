@@ -76,14 +76,14 @@ TEST_EXCLUDE = {
 }
 
 # Floor against shrinking the suite. Additions are allowed; deletions fail.
-# harness.test.py matches scripts/tests/**/*.test.py and is loaded by path,
+# inventory.test.py matches scripts/tests/**/*.test.py and is loaded by path,
 # so the dotted filename is collected. Pin it so a discovery miss fails the gate.
 REQUIRED_SUITE_TESTS = frozenset(
     {
         "tools/test_ci_gate.py",
         "experiments/v3/recovery-ledger-20260914/test_ledger.py",
         "experiments/v3/delegated-q-coupling-20260914/test_contract.py",
-        "scripts/tests/v3/harness/harness.test.py",
+        "scripts/tests/v3/x1/inventory.test.py",
     }
 )
 M1_MIN_PROGRAMS = 23  # 6 materialize checks + 17 *.test.py

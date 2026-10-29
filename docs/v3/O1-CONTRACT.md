@@ -1,0 +1,994 @@
+# O1 Month-End Journeys and Capability/Release Evidence Contract
+
+**Version:** `o1-contract v0.1-draft`<br>
+**Status:** DRAFT proposal under envelope G; nothing accepted until a rule-H receipt<br>
+**Parent Issue:** [CSL-205](https://linear.app/csl-laboratories/issue/CSL-205) (Outcome O1, child of [CSL-45](https://linear.app/csl-laboratories/issue/CSL-45))<br>
+**Milestone:** W1 Research (2026-10-16 to 2026-10-22) · Target Freeze: 2026-10-23 (W2)<br>
+**Month Window Checkpoint:** 2026-11-12 (decided by Lucas Guerra, 2026-10-16, 09:42 PT, when the team's X subscriptions expire)<br>
+**Governing Documents:** [CONTROL_PLANE.md](../../CONTROL_PLANE.md), [ANCHOR.md](../../ANCHOR.md), [AGENTS.md](../../AGENTS.md)
+
+---
+
+## 1. Scope and Target Fragment
+
+### 1.1 Placement and Purpose
+This contract establishes the observable, evidence-backed foundation for Recursion v3's month-long program, advancing [CSL-45](https://linear.app/csl-laboratories/issue/CSL-45) from an aspirational feature inventory into an empirical delivery framework. It defines the formal acceptance boundary for:
+1. The **Journey Catalog** ([O1-JOURNEYS.md](O1-JOURNEYS.md)), preserving [D-024](../../state/DECISIONS.md#d-024--frontier-claim-productive-continuity)'s six release journeys and five crosswalk scenarios across native, upstream, and combined execution modes.
+2. The **All-Pillar Capability Matrix** ([O1-CAPABILITY-MATRIX.json](O1-CAPABILITY-MATRIX.json)), evaluating 12 capability pillars from native harness kernel to release/rollback operations.
+3. The **Decisions Queue and Evidence Manifest** ([O1-DECISIONS-QUEUE.md](O1-DECISIONS-QUEUE.md)), capturing pending founder decisions for Lucas Guerra, or a human he explicitly delegates under Rule H.
+4. The **Verification Interface and Fixture Manifest** (Sections 6–9 below), specifying the machine-checkable acceptance gate for downstream qualification.
+
+This contract refines existing scope without duplicating or preempting the program-control ledgers and receipt schemas developed under [CSL-204](https://linear.app/csl-laboratories/issue/CSL-204).
+
+### 1.2 Boundary Conditions
+- **Draft Status:** Everything in this document, the companion catalog, matrix, and queue is a draft proposal under Gate Envelope G.
+- **Rule H Requirement:** No capability row, target tier, release scope, or architecture choice is accepted into the normative product contract until an authenticated human receipt under Rule H is recorded on Linear.
+- **Checkpoint Date:** The month-end window ends on 2026-11-12. Target tiers for this checkpoint remain undecided pending a Rule H receipt from Lucas Guerra, or from a human he explicitly delegates under Rule H.
+
+---
+
+## 2. Non-Goals (Verbatim Intent)
+
+As specified in the [CSL-205](https://linear.app/csl-laboratories/issue/CSL-205) contract:
+- **No narrower first-release cut:** This contract does not define an unofficial subset or narrower scope cut. Downstream issue [CSL-237](https://linear.app/csl-laboratories/issue/CSL-237) proposes the R1 release boundary for founder decision; agents do not accept it.
+- **No inferred deadline:** No deadlines beyond the stated 2026-11-12 subscription expiration checkpoint and intermediate freeze milestones are inferred or imposed.
+- **No launch declaration:** Nothing in this contract authorizes public marketing claims, launch announcements, or documentation publication as a released product. Public launch page claims remain dependent on [CSL-242](https://linear.app/csl-laboratories/issue/CSL-242).
+- **No universal savings claim:** Savings in quota, tokens, or cost are hypotheses to be measured per workload under [D-018](../../state/DECISIONS.md#d-018--thesis-recursion-is-a-native-harness-and-a-unifying-wrapper-no-ecosystem-lock-in) and [D-031](../../state/DECISIONS.md#d-031--product-positioning-no-vendor-sabotage-claim), never asserted as universal marketing facts.
+- **No technology selection:** This contract selects no implementation language (A1b bake-off remains open), database/store (SQLite remains an unrun challenger), web framework, container sandbox, or transport.
+- **Incomplete release protection:** A below-release checkpoint result is not permission to ship an incomplete accepted release.
+
+---
+
+## 3. Inherited-Decision Crosswalk
+
+This contract strictly inherits and binds the decisions recorded in [state/DECISIONS.md](../../state/DECISIONS.md) and the accepted product directions in [PRODUCT.md](PRODUCT.md) and [DECISION-REGISTER.md](DECISION-REGISTER.md). Every referenced ID has been verified in the repository.
+
+### 3.1 Repository Decision Log Crosswalk (state/DECISIONS.md)
+
+| Decision ID | Summary Title | One-Line Constraint / Core Rule | Repository File Reference |
+|---|---|---|---|
+| **D-018** | Native Harness & Unifying Wrapper | Recursion must be both a native harness and an ecosystem wrapper; no vendor lock-in; quota savings are hypotheses requiring falsifiable proof. | [state/DECISIONS.md](../../state/DECISIONS.md#d-018--thesis-recursion-is-a-native-harness-and-a-unifying-wrapper-no-ecosystem-lock-in) |
+| **D-019** | Comprehensive Build, Opt-In Install | Reject Dot Option B (smaller initial release); build comprehensive capability surface; ship lean default with opt-in plugins/profiles. | [state/DECISIONS.md](../../state/DECISIONS.md#d-019--release-model-build-comprehensively-ship-lean-install-opt-in-dot-option-b-rejected) |
+| **D-020** | Availability & Monotonic Fencing | Core engine is single-node with kernel monotonic fencing; automatic coordinator takeover is an opt-in first-party plugin. | [state/DECISIONS.md](../../state/DECISIONS.md#d-020--availability-contract-automatic-node-takeover-required-core-is-single-node-closes-g-06) |
+| **D-021** | Credential Non-Intermediation | Recursion must not hold, copy, or relay ungranted credentials; delegate directly to user-authenticated local CLIs/tools. | [state/DECISIONS.md](../../state/DECISIONS.md#d-021--delegation-over-credential-intermediation) |
+| **D-023** | First Upstream Qualification Target | Qualify Codex App Server (`codex app-server`) end-to-end first; all other upstream harnesses ship as plugins. | [state/DECISIONS.md](../../state/DECISIONS.md#d-023--first-qualified-upstream-profile) |
+| **D-024** | Productive Continuity Moat | Headline measurable differentiator is productive continuity across harness change, compaction, fork, or host loss; adopt six journeys. | [state/DECISIONS.md](../../state/DECISIONS.md#d-024--frontier-claim-productive-continuity) |
+| **D-025** | Bounded Autonomous Research | 24/7 autonomous research is an optional, off-by-default, budgeted plugin; no standing executive; no idle inference in lean base. | [state/DECISIONS.md](../../state/DECISIONS.md#d-025--continuing-autonomous-research-is-an-optional-bounded-plugin) |
+| **D-026** | License and Public Posture | Release as Apache-2.0 with an early plugin contract; a public license claim still waits on counsel. | [state/DECISIONS.md](../../state/DECISIONS.md#d-026--recursions-own-license-and-public-posture) |
+| **D-027** | Counsel Packet, No Agent Spend | Prepare a counsel packet for terms, licensing, and trademark. Lucas engages counsel. An agent makes no spend or legal commitment. | [state/DECISIONS.md](../../state/DECISIONS.md#d-027--counsel-engagement-authorized-packet-only-no-spend) |
+| **D-028** | Platform Floors & OS Contracts | Windows 11 25H2/24H2, Linux 6.12/6.6 LTS cgroup v2, local NTFS/ext4; survive power loss via abrupt VM reset replay. | [state/DECISIONS.md](../../state/DECISIONS.md#d-028--platform-floors-closes-g-11) |
+| **D-029** | Trusted Launch Boundary | Operator-provisioned trusted launch boundary outside Recursion readable domain required for strong credential non-access. | [state/DECISIONS.md](../../state/DECISIONS.md#d-029--operator-provisioned-trusted-launch-boundary-strong-credential-non-intermediation) |
+| **D-031** | No Vendor-Sabotage Claim | Position on an unrestrictive environment. Savings are claimed only when measured per workload. | [state/DECISIONS.md](../../state/DECISIONS.md#d-031--product-positioning-no-vendor-sabotage-claim) |
+| **D-032** | Parent Goal Is v3 | The active parent goal is the v3 harness orchestrator. Retired control-plane wording is swept from prompt templates. | [state/DECISIONS.md](../../state/DECISIONS.md#d-032--parent-goal-is-v3-sweep-prompt-templates) |
+| **D-033** | Plugin Porting Is a Hypothesis | Treat cheap plugin import as a hypothesis to measure. Do not assume a port is cheaper than a native rewrite. | [state/DECISIONS.md](../../state/DECISIONS.md#d-033--plugin-importport-hypothesis-validate-do-not-assume) |
+| **D-034** | Workflow Scaling Moat | Thesis is "the harness that scales with your workflow"; deterministic capability composition must be reproducible, cache-aware, and injection-safe. D-034 is out of row scope. Those three obligations stay in force (`O1E-018`). | [state/DECISIONS.md](../../state/DECISIONS.md#d-034--product-thesis-the-harness-that-scales-with-your-workflow) |
+| **D-036** | Mobile Online-Only Private View | Mobile clients operate online-only for private views; no offline protected redisplay; live authentication required before rehydration. | [state/DECISIONS.md](../../state/DECISIONS.md#d-036--mobile-offline-retention-online-only-private-view-o-01) |
+| **D-037** | Disposable Test Harness | Authorize provider-free conformance fixtures; Python runtime serves strictly as a disposable test harness without selecting product language. | [state/DECISIONS.md](../../state/DECISIONS.md#d-037--conformance-fixtures-authorized-python-as-disposable-test-harness-only-o-02) |
+| **D-038** | GUI & Mobile Supersession | D-034/D-019 supersede older first-release exclusions; GUI and mobile clients are in-scope built-but-opt-in components. | [state/DECISIONS.md](../../state/DECISIONS.md#d-038--d-034d-019-supersede-older-first-release-guimobile-exclusions-o-03) |
+| **D-039** | Language-Agnostic Architecture | Mobile OS expansion advisory packet accepted; core and client architectures must remain language-agnostic and reconstructable. | [state/DECISIONS.md](../../state/DECISIONS.md#d-039--accept-the-oslanguage-expansion-as-advisory-plan-a-language-agnostic-architecture-o-04) |
+
+### 3.2 Product Requirement Directions Crosswalk (PRODUCT.md & DECISION-REGISTER.md)
+
+| Requirement ID | Direction Title | One-Line Constraint / Core Rule | Repository Mapping |
+|---|---|---|---|
+| **OR-021** | Usable Platform Scope | Standalone v3 architecture; terminal platform first, dedicated GUI built-opt-in per D-038; developer initial validation audience. | [PRODUCT.md](PRODUCT.md#accepted-first-usable-platform-release-â-2026-09-06), `CAP-014`, `CAP-015` |
+| **OR-022** | Native & Upstream Parity | Native loop and upstream harness execution are equal release requirements; upstream-only must not require a hidden API key. | [PRODUCT.md](PRODUCT.md#accepted-first-usable-platform-release-â-2026-09-06), `CAP-002`, `CAP-005` |
+| **OR-023** | Ten Platform Controls | All ten CLI controls required; maximize feature coverage across shared runtime, adapters, native loop, and plugins. | [PRODUCT.md](PRODUCT.md#accepted-first-usable-platform-release-â-2026-09-06), `CAP-007`, `CAP-014` |
+| **OR-024** | Optimization Vector Ranking | Default optimization ranking is responsiveness, subscription efficiency, then task completion; report full Pareto vector without hidden scalar weights. | [PRODUCT.md](PRODUCT.md#optimization-target), `CAP-023` |
+| **OR-025** | Remote Control & Recovery | Windows/Linux remote control, distributed stages, and recorded-work recovery are first-release requirements; macOS is a test opportunity. | [PRODUCT.md](PRODUCT.md#accepted-first-usable-platform-release-â-2026-09-06), `CAP-012` |
+| **OR-026** | Launch-Critical Harnesses | Seven launch-critical names: Grok, Cursor, Gemini, Claude, Hermes, OpenCode, ChatGPT; detect existing installs; deterministic setup. | [PRODUCT.md](PRODUCT.md#mark-2-capability-map-â-research-synthesis-2026-09-07), `CAP-004`, `CAP-005`, `CAP-005b` |
+| **OR-027** | Persistent Assistants | Persistent assistant identity across goals/sessions; project profiles; routine delegation within authorized bounds; idle lifecycle. | [PRODUCT.md](PRODUCT.md#mark-2-capability-map-â-research-synthesis-2026-09-07), `CAP-020`, `CAP-021` |
+| **OR-028** | Ten Controls & Three Stops | Implement ten controls, three Stops (Aggressive, Full, Lazy per D-022), and preserved forks with preflight notice or post-work disclosure. | [PRODUCT.md](PRODUCT.md#mark-2-capability-map-â-research-synthesis-2026-09-07), `CAP-017` |
+| **OR-029** | Plugin & Browser Adaptation | Browser/MCP adaptation, local execution, inspectable incompatibility responses (four modes), and configuration revision propagation. | [PRODUCT.md](PRODUCT.md#mark-2-capability-map-â-research-synthesis-2026-09-07), `CAP-009` |
+| **OR-030** | Context Continuity & Ledgers | Context governor and accounting ledger retain handoff quality across quota, quality, tokens, and resources through completion. | [PRODUCT.md](PRODUCT.md#mark-2-capability-map-â-research-synthesis-2026-09-07), `CAP-018`, `CAP-019` |
+| **OR-031** | Verifier Service & Reporting | Report tests run, supported fix confidence, regressions, and demonstrated benefit; verifier reporting stays lean and configurable. | [PRODUCT.md](PRODUCT.md#mark-2-capability-map-â-research-synthesis-2026-09-07), `CAP-027` |
+| **OR-032** | Recovery Coordinator Bounds | Configure recovery destination, automation, and relative recovery budget allowance as a fraction of pre-shutdown usage with cumulative reservations. | [PRODUCT.md](PRODUCT.md#mark-2-capability-map-â-research-synthesis-2026-09-07), `CAP-032` |
+| **OR-033** | Six Update Modes & Rollback | Distinguish six update modes; require compatibility verification before rollback or resume per OR-033, preserving newest work/history, maintaining an explicit hold when compatibility is unknown, and offering configured repair-forward or separate-instance alternatives without promising automatic rollback. | [PRODUCT.md](PRODUCT.md#mark-2-capability-map-â-research-synthesis-2026-09-07), `CAP-029`, `CAP-030` |
+| **OR-034** | Quality Protection | Reduce repeated instructions, compaction loss, and cache inefficiency; protect landed-change quality from superficial token cuts. | [PRODUCT.md](PRODUCT.md#mark-2-capability-map-â-research-synthesis-2026-09-07), `CAP-018`, `CAP-019` |
+| **OR-035** | Resource Governor Profiles | Deterministic resource governor admits representative profiles (CPU/RAM/disk/network) and operator hard ceilings without workstation bias. | [PRODUCT.md](PRODUCT.md#mark-2-capability-map-â-research-synthesis-2026-09-07), `CAP-024` |
+| **OR-036** | Proof Boundary Refinement | Smallest aggregate plus explicit independently checkable bounded broker refinement; include necessary broker state if separate checking fails. | [ACCEPTANCE.md](ACCEPTANCE.md#mark-3-accepted-choices-and-additional-evidence-gates-â-2026-09-07), `CAP-033` |
+| **OR-037** | GoalSpec Amendment Authority | Owner-only actual GoalSpec amendments; substantial routine delegation permitted; test avoidable interruptions before proposed delegation. | [ACCEPTANCE.md](ACCEPTANCE.md#mark-3-accepted-choices-and-additional-evidence-gates-â-2026-09-07), `CAP-034` |
+| **OR-038** | Assistant/Head Collaboration | Task-aligned autonomy and initiative within agreed boundaries; questionnaire-assistant/Head interaction across sessions and nodes. | [PRODUCT.md](PRODUCT.md#accepted-working-foundation-and-required-collaboration-â-2026-09-07), `CAP-022` |
+| **OR-039** | Whole-System Optimization | Configuration, compatibility, and whole-system optimization central; rich and lean configurations without deleting accepted capabilities. | [PRODUCT.md](PRODUCT.md#accepted-working-foundation-and-required-collaboration-â-2026-09-07), `CAP-007` |
+
+---
+
+## 4. Evidence Classes and Tiers
+
+Per [CONTROL_PLANE.md](../../CONTROL_PLANE.md) Invariant 7 and [MONTH-PROGRAM.md](program-control/MONTH-PROGRAM.md#offline-ledger-bindings) §7, evidence classes and maturity tiers remain strictly segregated.
+
+### 4.1 Evidence Classes
+Evidence classes categorize the empirical basis of a record:
+1. **Source-Documented:** Behavior, flag, schema, or limit extracted directly from public vendor documentation, specs, commit history, or static inspection of code and test files. Any evidence based only on reading code, test definitions, or schemas without a recorded execution command, full 40-hex candidate commit SHA, and observed exit/trace result must be classified as `source_documented`, never `locally_observed`.
+2. **Locally-Observed:** Traces, exit codes, event streams, or logs recorded during deterministic execution on a clean local or CI workspace, binding the exact execution command, candidate commit SHA, and result.
+3. **Inferred:** Deductions or interpolations from related mechanisms. Must be explicitly labeled and cannot satisfy an empirical gate.
+4. **Unmeasured:** Capabilities, performance numbers, or quota claims lacking recorded instrumentation.
+
+### 4.2 Proposed Maturity Tiers (Candidate Vocabulary)
+The following eight-tier monotonic progression is an **Envelope G proposal** derived from [MONTH-PROGRAM.md](program-control/MONTH-PROGRAM.md#2-capability-and-release-matrix) §2; it remains a candidate schema vocabulary until ratified by founder receipt:
+1. `researched` — Source-documented requirements, options, and tradeoffs filed.
+2. `human_decided` — Human decision receipt recorded under Rule H selecting direction.
+3. `contract_frozen` — Exact JSON/markdown schema frozen with SHA-256 digest.
+4. `prototyped` — Exploratory implementation demonstrating core mechanics.
+5. `implemented` — Production code integrated into repository structure.
+6. `provider_free_verified` — Passes deterministic provider-free fixtures/mocks.
+7. `locally_qualified` — Passes end-to-end trials on real OS environments (Windows/Linux).
+8. `release_qualified` — Composed useful-outcome and fault traces verified across all platforms.
+
+### 4.3 Promotion Rules ("No Promotion Without Evidence")
+- **Synthetic-to-Live Prohibition:** Synthetic fixture passes and simulated traces (e.g., canned JSONL streams from [CSL-84](harness/CSL-84.md)) can never be promoted to or support `locally_qualified` or `release_qualified` live evidence tiers under any circumstances, regardless of whether a genuine or authentic execution record of the mock execution exists. An authentic execution record of a mock or synthetic test run remains synthetic evidence and strictly cannot qualify live or release tiers.
+- **Composition Requirement:** Isolated component passes (e.g., unit test green) cannot stand in for composed, useful-outcome journey verification.
+- **Candidate Immutability:** Any modification to candidate source invalidates prior verification passes; verification must re-execute on the exact 40-hex commit.
+
+---
+
+## 5. Value Conventions
+
+To prevent semantic drift, silent failures, and unearned claims, all matrix entries and journey definitions adhere to the following value rules:
+
+1. **Target Tiers:** All row target tiers remain `null` until set in a Rule H receipt by Lucas Guerra, or by a human he explicitly delegates under Rule H.
+2. **Pending Rows Fail Acceptance:** Rows with `target: null` and missing recognized disposition (`unmet`, `blocked`, `no-release-claim`) represent undecided work and **must fail** the acceptance gate (`O1E-003`). Draft status `disposition_status: "pending-H"` is permitted only in draft-only structural inspection, never in positive acceptance baselines.
+3. **Unknown Counters:** Missing or unmeasured counters (tokens, latency, cache hits, cost) must be recorded as `null` with explicit `"unknown"` status. An unknown counter must **never** be coerced or defaulted to `0`.
+4. **Control Point Availability:** Surface control coverage values are drawn strictly from `{offered-proposed, not-offered, unknown}`. Blank, missing, or omitted cells are strictly forbidden. Unverified remote controls (e.g. Mobile Full Stop) are marked `unknown`, not attributed to unrelated decisions like D-036.
+5. **Withdrawn Claims:** If a capability claim is dropped, it remains visible in the matrix with `withdrawn: true` and an explanation. Silently deleting rows or claims is an admission violation.
+6. **Implementation Deferrals:** Marking a capability as deferred is an operational scheduling choice, not an accepted product removal. The row remains present with disposition `unmet`, `blocked`, or `no-release-claim`.
+7. **Claim Permissions:** In draft proposals, all capability rows must declare `"claim_permission": "none"`. No public capability claim is authorized prior to founder release sign-off.
+
+---
+
+## 6. Gate Specification: check_release_journey_contract.py
+
+### 6.1 Proposed Command
+```text
+python -X utf8 -B tools/check_release_journey_contract.py --candidate <FULL_SHA>
+```
+
+### 6.2 Admission and Execution Status
+- **Status:** This command is **proposed and specified now, NOT implemented**.
+- **Lifecycle Placement:** It is a **proposed child task** that requires **separate implementation admission under Gate Envelope G after a Rule-H receipt** freezes this contract digest. Freezing this contract does not constitute admission to implement the checker; downstream checker implementation requires its own separately admitted child issue, finite acceptance contract, and machine-checkable gate.
+- **Self-Gating Prohibition:** Under Gate Envelope G, this contract does not use its own future existence as its gate. Manual, cross-family, and structural verification precede automated checker construction.
+- **Draft Inspection Mode:** When implemented, the checker may provide a distinct `--draft` flag for non-gating structural schema validation of in-progress drafts. Running in acceptance mode (the default) strictly rejects any undecided rows.
+
+### 6.3 Gate Inputs and Allowed Paths
+- **Allowed Paths:** Only non-protected documentation and contract files:
+  - `docs/v3/O1-CONTRACT.md`
+  - `docs/v3/O1-JOURNEYS.md`
+  - `docs/v3/O1-CAPABILITY-MATRIX.json`
+  - `docs/v3/O1-CAPABILITY-MATRIX.schema.json`
+  - `docs/v3/O1-DECISIONS-QUEUE.md`
+  - `docs/v3/fixtures/O1/**` (subject to placement decision DQ-05)
+- **Input Manifest and Unified Binding Specification:**
+  One unified manifest binds all four contract artifacts, pinned repository sources, and test fixtures:
+  1. Candidate git commit SHA (`<FULL_SHA>`).
+  2. Exact SHA-256 digests of all four O1 contract artifacts:
+     - `docs/v3/O1-CONTRACT.md`
+     - `docs/v3/O1-JOURNEYS.md`
+     - `docs/v3/O1-CAPABILITY-MATRIX.json`
+     - `docs/v3/O1-DECISIONS-QUEUE.md`
+  3. Pinned repository governance, decision, and specification sources. Real mode's `pinned_sources` map is exactly this set:
+     - `CONTROL_PLANE.md`
+     - `ANCHOR.md`
+     - `AGENTS.md`
+     - `state/DECISIONS.md`
+     - `docs/v3/PRODUCT.md`
+     - `docs/v3/ACCEPTANCE.md`
+     - `docs/v3/DECISION-REGISTER.md`
+     - `docs/v3/program-control/MONTH-PROGRAM.md`
+     - `docs/v3/harness/CSL-27.md`
+     - `docs/v3/harness/CSL-82.md`
+     - `docs/v3/harness/CSL-83.md`
+     - `docs/v3/harness/CSL-84.md`
+     - `docs/v3/research-lane/scope-reframe-20261002/raw/01-current-strategy/Recursion_Interface_and_Product_Strategy.md` (§7, six demonstration journeys)
+     - `docs/v3/O1-CAPABILITY-MATRIX.schema.json`
+  4. Conformance test fixture files and inline fixture definitions (`docs/v3/fixtures/O1/**`).
+  5. Linear comment ID and author human identity for the Rule H receipt. The author is Lucas Guerra (`@lucassalvador987`), or a human he explicitly delegates under Rule H. The receipt binds the candidate commit, the manifest digest, every pin digest, and every artifact and fixture digest (§9).
+  - **Stale-Binding Rejection Rule:** Any modification, missing file, or SHA-256 digest mismatch across ANY of the four covered artifacts, pinned sources, or test fixtures invalidates the candidate and triggers immediate nonzero exit (`O1E-010`). A real-mode manifest that omits a §6.3 pin, including any of `docs/v3/harness/CSL-27.md`, `CSL-82.md`, `CSL-83.md`, `CSL-84.md`, or the matrix schema, is a mismatch. Changes to any covered input without an updated matching human receipt are strictly rejected. The checker reads the harness pins. It does not write them.
+
+### 6.4 Nonzero-Exit Conditions and Error IDs
+The checker script must exit nonzero if any of the following conditions occur:
+
+| Error ID | Error Category | Precise Nonzero-Exit Condition |
+|---|---|---|
+| **O1E-001** | Missing Pillar or Journey | Matrix omits any of the 12 pillars or catalog omits any of D-024's six journeys (J1–J6). |
+| **O1E-002** | Missing Surface Control Coverage | A journey lacks a cell in the Journey × Surface × Control matrix, or any cell value is outside the declared vocabulary `{offered-proposed, not-offered, unknown}`. |
+| **O1E-003** | Missing Target or Disposition | A capability row has `target: null` and does not declare an explicit recognized disposition (`unmet`, `blocked`, or `no-release-claim`). Draft marker `pending-H` fails this gate. |
+| **O1E-004** | Unsupported Evidence Promotion | Synthetic or fixture evidence (such as mock stream fixtures or simulated execution traces) is assigned to support locally_qualified, release_qualified, or live evidence qualification, regardless of execution-record presence or authenticity. |
+| **O1E-005** | Unknown Counter Coerced to Zero | An unmeasured or missing usage/performance counter is recorded as `0` instead of `null` with explicit `"unknown"` status. |
+| **O1E-006** | Unauthorized Scope Deferral/Removal | An implementation deferral is treated as an accepted product scope removal without a founder decision receipt under Rule H. |
+| **O1E-007** | Opaque Upstream State Transfer | A row claims state moves between native and upstream sessions without naming the transferred artifact, its format/schema URI, and a round-trip evidence ID. |
+| **O1E-008** | Component Pass as Composed Outcome | A component-level unit test pass is presented as satisfying composed end-to-end journey acceptance. |
+| **O1E-009** | Stale or Mismatched Receipt | A Rule H receipt omits or mismatches the candidate commit, the manifest digest, an artifact digest, a pinned-source digest, or a fixture digest, or it names an unauthorized author or an unrelated issue key. A receipt that matches only the four artifact digests is still a mismatch. |
+| **O1E-010** | Stale or Mismatched Input Binding | Any of the four contract artifacts (contract, journeys, matrix, decisions queue), pinned sources, or fixtures has a mismatched, stale, or missing cross-referencing SHA-256 digest against the manifest. Real mode's `pinned_sources` keys must equal the §6.3 set, including the four harness pins and `docs/v3/O1-CAPABILITY-MATRIX.schema.json`. A missing key is a mismatch. |
+| **O1E-011** | Schema or JSON Syntax Violation | `docs/v3/O1-CAPABILITY-MATRIX.json` fails to parse, fails Draft 2020-12 validation against `docs/v3/O1-CAPABILITY-MATRIX.schema.json`, uses a value outside a schema enum, carries an extra property, repeats a row `id`, or the schema file is missing. |
+| **O1E-012** | Dangling Identity Reference | Matrix row, journey, or fixture references an entity ID (e.g. dependency, test ref, requirement) that does not exist in the repository or baseline. |
+| **O1E-013** | Unresolved Freeze-Blocking Seam | Contract claims freeze or acceptance while an admitted freeze-blocking open decision or architecture seam has no recorded disposition. Freeze-blocking packets are DQ-01–DQ-06 and DQ-08–DQ-11; DQ-07 is accounting-only and excluded. |
+| **O1E-014** | Absent Independent Verification Evidence | Candidate presented in acceptance mode without an authentic candidate-level independent verification report from a different model family (fails unconditionally in acceptance mode regardless of whether any capability rows are promoted), or capability claim promoted without authentic independent evidence, or receipt exports are not compared against actual Linear comments. |
+| **O1E-015** | Unauthorized Populated Target | Row declares a populated target tier (`target != null`) while an authentic Rule-H founder receipt is absent. |
+| **O1E-016** | Missing Mobile Capability-Row Coverage | A journey (J1–J6) is not mapped in the `journeys` array of mobile client capability row `CAP-016` in `docs/v3/O1-CAPABILITY-MATRIX.json`. |
+| **O1E-017** | Upstream-Only API or Model Dependency | Every row with `modes.upstream_only: true` must carry a non-empty `upstream_only_requires` list, and that list's closure must stay inside the allowed terminals. A missing or empty list, an unknown token, an unknown row, an API token, or an API-backed row (`CAP-006` included) fails. This is every such row, not only four named ones. |
+| **O1E-018** | Dropped Composition Obligation | `out_of_row_scope` lists D-034 without `reproducible`, `cache-aware`, and `injection-safe` in `retained_obligations`, or `CAP-009` `composition_obligations` does not contain that same set. The row exemption does not drop the obligations. |
+| **O1E-019** | Missing Journey Proof Gate | A journey J1–J6 omits `**Baseline:**`, `**Measurement:**`, or `**Falsification:**`, or omits an obligatory §7 substring from §6.6. Existence of the journey heading is `O1E-001` and does not satisfy this gate. |
+
+### 6.5 Upstream-only closure (O1E-017)
+
+A blacklist of known API tokens on four rows is not closure. For every matrix row with `modes.upstream_only: true`, the checker requires an explicit non-empty `upstream_only_requires` list and walks that closure. A missing list, an empty list, or a list that does not close is `O1E-017`.
+
+Edges, once the list is present:
+
+- Every string in that row's `upstream_only_requires`.
+- Every `dependencies` entry, on that row and on each reached row, whose id matches `CAP-`. Decision ids, requirement ids, and document paths are not capability edges.
+- From each reached capability row, the same two edge kinds, including that row's `upstream_only_requires`. A reached row with `modes.upstream_only: true` and no list is unclosed.
+
+Allowed terminals are `installed-cli`, `local-capsule-file`, `local-test-command`, `local-files`, and `os-process-supervision`.
+
+`O1E-017` fires when any of the following is true:
+
+- Any row with `modes.upstream_only: true` omits `upstream_only_requires` or gives an empty list. `CAP-004` and `CAP-005` carry closed lists in the matrix; deleting either list fails this gate. The obligation is not limited to `CAP-018`, `CAP-019`, `CAP-020`, and `CAP-027`.
+- An unknown token: not an allowed terminal and not the id of a row in the matrix. `CAP-999` and `not-a-closed-requirement` are unknown.
+- An API token: `api`, `api-key`, `provider-api`, `model`, or `byok`.
+- An API-backed row. `CAP-006` (BYOK and local HTTP / OpenAI-compatible transport) is API-backed even if its `upstream_only` flag is edited to true. Any other row with `modes.upstream_only: false` is API-backed for this gate. A row whose own closure contains an API token is API-backed.
+
+`CAP-010` does not claim `upstream_only`. Its named source is an MCP API, which is not a closed local dependency. The schema `if`/`then` in §6.7 also requires the field when `upstream_only` is true, so deleting it is `O1E-011` as well as `O1E-017`. An empty list fails the schema `minItems` of 1 (`O1E-011`) and the closure rule (`O1E-017`). `O1F-N17g` expects both errors for a deleted list. The checker does not suppress either.
+
+The walk keeps a seen-set. A cycle of allowed rows is not itself a failure. Reaching `CAP-006` through `upstream_only_requires` or through a `CAP-*` dependency fails. `CAP-020` requiring `CAP-019` while `CAP-019` requires `provider-api` fails. `O1E-012` does not scan `upstream_only_requires`. An unknown token there is only `O1E-017`.
+
+### 6.6 Journey proof gates (O1E-019)
+
+[D-024](../../state/DECISIONS.md#d-024--frontier-claim-productive-continuity) adopts the six strategy §7 journeys as release-acceptance scenarios. Each source journey defines a comparison baseline, measurements, and a falsification condition. `O1E-001` checks that J1–J6 exist. It does not check those clauses. `O1E-019` fails unless each journey section in [O1-JOURNEYS.md](O1-JOURNEYS.md) contains `**Baseline:**`, `**Measurement:**`, and `**Falsification:**` and every obligatory substring below. A section runs from its `### Journey Jn` heading through the next heading that starts with `### ` or `## `. The checker parses the three clause spans separately. A clause span runs from its marker to the next of the three markers or the section end. Each table substring is checked only inside its matching span, and an empty span fails. A substring found under a different clause does not count.
+
+| Journey | Baseline substring | Measurement substrings | Falsification substrings |
+|---|---|---|---|
+| **J1** | `manual artifact handoff` | `human reconstruction`; `route-switch latency`; `verified downstream outcome` | `equal or less effort` |
+| **J2** | `simple reversible observation masking` | `unsafe continuation`; `recovery time` | `simpler retention/restart performs as well or better` |
+| **J3** | `native cancellation` | `installed fence` | `fully stopped` |
+| **J4** | `Git-plus-snapshot` | `both alternatives` | `original bytes` |
+| **J5** | `genuine endpoint semantics` | `latency to a trustworthy status` | `stale authority or lost newest work` |
+| **J6** | `matched-engine attribution` | `cost per closure is undefined` | `equal or less effort`; `invented savings` |
+
+The catalog text carries the adopted §7 clause. A shorter paraphrase that drops one of these substrings fails the gate.
+
+### 6.7 Matrix schema (O1E-011)
+
+`docs/v3/O1-CAPABILITY-MATRIX.json` is validated against [O1-CAPABILITY-MATRIX.schema.json](O1-CAPABILITY-MATRIX.schema.json) (JSON Schema draft 2020-12). The checker loads that repository path. It does not fetch a schema over the network. `additionalProperties` is false on the document and on each row. A syntax error, a schema violation, an extra property, a value outside an enum, a duplicate row `id`, or a missing schema file is `O1E-011`. A digest mismatch of the schema file against the manifest is `O1E-010`.
+
+The matrix property `schema` stays the version identifier `o1-capability-matrix/v0.1-draft`. The instance property `$schema` is the repository-relative path of the schema file. This draft adds that schema and requires validation against it. The row schema uses `if`/`then`: when `modes.upstream_only` is true, `upstream_only_requires` is required. Token closure stays `O1E-017`. The schema does not enum the tokens, so an adverse API token still parses.
+
+---
+
+## 7. Frozen Fixture Manifest
+
+The following manifest defines the test suite for `tools/check_release_journey_contract.py`. Every error condition (`O1E-001` through `O1E-019`) is matched with at least one distinct adverse mutation fixture testing exactly its condition against concrete, complete inline baseline inputs.
+
+### 7.1 Reproducible Baseline Definition
+To guarantee deterministic execution and full reproducibility without relying on external state, all fixtures evaluate against a concrete, reproducible nominal baseline. Physical test files under `docs/v3/fixtures/O1/` remain deferred pending DQ-05.
+
+#### Deterministic Construction Rule
+The **Nominal Valid Baseline** is defined by an exact deterministic construction:
+> `baseline = docs/v3/O1-CAPABILITY-MATRIX.json and O1-JOURNEYS.md at the frozen candidate SHA, with every row's disposition replaced by no-release-claim, all DQ-01..DQ-11 seams marked dispositioned (fixture), and the inline receipt/verifier records below`
+
+Specifically, under this deterministic construction:
+1. Every row from `docs/v3/O1-CAPABILITY-MATRIX.json` has its disposition replaced with `disposition: "no-release-claim"`, `disposition_status: "accepted-H"`, and `target: null`, ensuring zero undecided rows and zero unapproved claims in the nominal baseline.
+2. The exact declaration of all 12 pillars and 35 capability rows (`CAP-001` through `CAP-034`, including `CAP-005b`) is preserved directly from the real matrix.
+3. The complete Journey × Surface × Control matrix covering all 6 journeys (J1–J6) across CLI, TUI, GUI, and Mobile surfaces is preserved directly from `docs/v3/O1-JOURNEYS.md`.
+4. All mutation fixtures (`O1F-N01a` through `O1F-N19`, including `O1F-N09d`, `O1F-N10b`, and `O1F-N17a` through `O1F-N17g`) operate deterministically against this constructed baseline, naming rows and journeys that exist in the real matrix (e.g., `O1F-N06` deletes `CAP-015`, which exists in the real matrix; `O1F-N02b` removes `J2` from `CAP-016`).
+
+#### Baseline Seam Dispositions
+In the nominal valid baseline, every decision packet `DQ-01` through `DQ-11` in the decisions queue record (`docs/v3/O1-DECISIONS-QUEUE.md`) is recorded with status `'dispositioned (fixture)'` in the fixture queue record:
+- `DQ-01`: `dispositioned (fixture)`
+- `DQ-02`: `dispositioned (fixture)`
+- `DQ-03`: `dispositioned (fixture)`
+- `DQ-04`: `dispositioned (fixture)`
+- `DQ-05`: `dispositioned (fixture)`
+- `DQ-06`: `dispositioned (fixture)`
+- `DQ-07`: `dispositioned (fixture)`
+- `DQ-08`: `dispositioned (fixture)`
+- `DQ-09`: `dispositioned (fixture)`
+- `DQ-10`: `dispositioned (fixture)`
+- `DQ-11`: `dispositioned (fixture)`
+
+The freeze-blocking set is explicit: `DQ-01` through `DQ-06` and `DQ-08` through `DQ-11`. `DQ-07` (recorded research deviation) is accounting-only. It blocks no row, journey, fixture or freeze, so `O1E-013` ignores it even when it is open or unsigned. The baseline still records it as `'dispositioned (fixture)'` so the queue record stays complete; the real queue keeps its unsigned deviation.
+
+Recording all 11 decision packets as `'dispositioned (fixture)'` in the baseline fixture queue record guarantees that all freeze-blocking seams are deterministically closed in the nominal baseline. Consequently, `O1E-013` (Unresolved Freeze-Blocking Seam) does not fire in the nominal baseline or during unrelated adverse mutations, and fires exclusively in adverse fixture `O1F-N13`.
+
+#### Deterministic Rebinding Rule
+When evaluating adverse mutation fixtures, the fixture harness runs three phases:
+1. **Mutation Application:** Apply the fixture's content mutation to the baseline (for example a removed pillar, a counter set to 0, a pinned-source byte change, or an upstream-only dependency change).
+2. **Digest Rebinding:** Recompute the SHA-256 of every covered artifact, pinned source, and test payload. Write those digests, in the same phase, into:
+   - the manifest maps `artifacts`, `pinned_sources`, and `fixtures`
+   - the receipt fields `candidate_commit`, `contract_sha256`, `journeys_sha256`, `matrix_sha256`, `decisions_queue_sha256`, `manifest_sha256`, `pinned_source_sha256`, and `fixture_sha256`
+   - the verifier field `manifest_check.manifest_sha256` and the verifier maps `artifact_digests`, `pinned_source_digests`, and `fixture_digests`
+   A rebind that updates only the manifest is invalid. Receipt digests are part of the rebind, so a re-hashed fixture does not leave a stale receipt.
+3. **Receipt-only mutations:** `O1F-N09a`, `O1F-N09b`, `O1F-N09c`, and `O1F-N09d` apply their receipt mutation after phase 2. Phase 2 must not overwrite that mutation.
+
+`O1F-N10` skips phase 2. The manifest, the receipt, and the verifier report keep the pre-mutation digests. Its targets are the matrix JSON, the journeys catalog, the decisions queue, and the pinned scope-reframe source. The pinned-source target appends the UTF-8 line `# fixture-mutation` to `docs/v3/research-lane/scope-reframe-20261002/raw/01-current-strategy/Recursion_Interface_and_Product_Strategy.md` and does not update `pinned_source_sha256` or the manifest entry for that path. Because the receipt still names the pre-mutation digests, the checker reports `O1E-009`. Because the manifest still names them, the checker reports `O1E-010`. `O1F-N10b` reports `{O1E-009, O1E-010}`. No other adverse fixture reports `O1E-010`.
+
+#### Expected Results Specification
+The checker reports an exact set of error IDs. It does not suppress or rank them.
+- **Positive Fixtures (`O1F-P01`–`O1F-P04`):** Exit code `0` and an empty set (`PASS (exit 0, set())`).
+- **Adverse Fixtures:** Exit code `1` and the set derived from the rules below.
+- **Derived sets:** Phase 2 leaves only the error the mutation itself introduces, except:
+  - `O1F-N01a` deletes the `nodes` pillar and rows `CAP-011`, `CAP-012`, and `CAP-013`. The `pillars` array drops to 11 entries and violates the schema `minItems` of 12, so the set is `{O1E-001, O1E-006, O1E-011}`.
+  - `O1F-N01b` deletes journey `J6`, which also removes it from `CAP-016` and removes J6's baseline, measurement, and falsification clauses, so the set is `{O1E-001, O1E-016, O1E-019}`.
+  - `O1F-N17g` deletes `upstream_only_requires` from `CAP-004`. The schema `if`/`then` fails and the closure list is missing, so the set is `{O1E-011, O1E-017}`.
+  - `O1F-N10` skips phase 2. Each target, including the pinned scope-reframe source, leaves both the receipt and the manifest on the pre-mutation digests, so the set is `{O1E-009, O1E-010}`.
+  - `O1F-N10b` builds the real-mode `pinned_sources` set from §6.3, then deletes `docs/v3/harness/CSL-27.md` and does not rebind. The manifest digest changes while the receipt still binds the old manifest and that pin, so the set is `{O1E-009, O1E-010}`.
+- Every other adverse fixture expects a singleton set containing only its own error ID.
+
+#### Manifest Canonical Serialization Specification
+The manifest is serialized to canonical JSON before computing its SHA-256 digest:
+- **Encoding:** UTF-8
+- **Key Order:** Lexicographically sorted keys (`sort_keys=True`)
+- **Separators:** No whitespace between keys, colons, and values: `separators=(',', ':')`
+- **Trailing Newline:** Strictly omitted (no trailing newline `\n` or `\r\n`)
+- **Python Serialization Procedure:**
+  ```python
+  manifest_bytes = json.dumps(manifest_object, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
+  manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+  ```
+
+#### Fixture-Only Trust Input
+To allow fully reproducible offline testing of receipt and verifier validation without connecting to external Linear APIs, the fixture harness provides a fixture-only trust input: a **fixture trust list** naming the fixture-only founder identity `'fixture-founder'`:
+- **Scope & Validity:** The identity `'fixture-founder'` is valid **ONLY** in fixture mode (when evaluating test fixtures or executing with `--fixture`).
+- **Strict Prohibition Against Rule H Satisfaction:** The fixture trust input can **NEVER** satisfy real Rule H. In real candidate acceptance mode (`python tools/check_release_journey_contract.py --candidate <FULL_SHA>`), the checker strictly disallows and rejects any fixture trust list. Real acceptance requires comparison against an actual, unedited Linear comment authored by Lucas Guerra (`@lucassalvador987`), or by a human he explicitly delegates under Rule H.
+
+#### Literal Baseline Fixture Artifacts and Digest Construction
+For every digest placeholder used across the contract schemas and baseline traces, literal fixture artifact content is defined inline below. For each artifact, its digest is computed at check time as the SHA-256 of the exact bytes shown (with no trailing newline). No literal hex hashes are hardcoded in contract schemas or fixture payloads:
+
+1. **`goal_prompt`:**
+   ```text
+   Task: Fix routing capability filtering bug and order providers by user weights.
+   ```
+   Digest: `sha256` of those exact UTF-8 bytes (no trailing newline), computed by the checker.
+
+2. **`goal_spec`:**
+   ```json
+   {"action":"refactor_routing","goal_id":"GOAL-J1-001","target_module":"scripts/v3/harness/routing.py"}
+   ```
+   Digest: `sha256` of those exact UTF-8 bytes (no trailing newline), computed by the checker.
+
+3. **`j1_patch`:**
+   ```diff
+   --- a/scripts/v3/harness/routing.py
+   +++ b/scripts/v3/harness/routing.py
+   @@ -1,3 +1,3 @@
+   -# routing draft
+   +# routing verified
+   ```
+   Digest: `sha256` of those exact UTF-8 bytes (no trailing newline), computed by the checker.
+
+4. **`stale_draft`:**
+   ```text
+   # Stale Unapproved O1 Candidate Draft v0.0.0-obsolete
+   ```
+   Digest: `sha256` of those exact UTF-8 bytes (no trailing newline), computed by the checker (used in adverse fixture `O1F-N09a`).
+
+5. **`fixture_exec_stdout`:**
+   ```text
+   test_fixture_execution_pass (scripts.tests.v3.harness.harness.test) ... ok
+   ```
+   Digest: `sha256` of those exact UTF-8 bytes (no trailing newline), computed by the checker (used in `genuine_fixture_execution_record_synth_01`).
+
+6. **`state_transfer_inbound` and `state_transfer_outbound`:**
+   ```json
+   {"active_constraints":["no-hidden-api-keys","preserve-dirty-work"],"capsule_id":"capsule-20261023-001","checkpoint_epoch":4,"goal_spec_digest":"<computed:sha256(goal_spec)>","modified_files":["docs/v3/O1-CONTRACT.md"],"owner_intent":"Preserve task context across upstream CLI boundary","task_id":"task-j1-transfer-demo"}
+   ```
+   Digest: `sha256` of those exact UTF-8 canonical JSON bytes (no trailing newline), computed by the checker.
+
+7. **`manifest`:**
+   The literal object below, serialized as canonical JSON (UTF-8, sorted keys, separators `(",", ":")`, no trailing newline). Each `<computed:…>` value is replaced with the lowercase hex sha256 of the named input before the manifest itself is serialized. `<candidate:FULL_SHA>` is the exact 40-hex SHA passed to `--candidate`, in fixture mode and in real mode alike, so the verifier report and the manifest bind the same candidate.
+   ```json
+   {"artifacts":{"O1-CAPABILITY-MATRIX.json":"<computed:sha256(matrix)>","O1-CONTRACT.md":"<computed:sha256(contract)>","O1-DECISIONS-QUEUE.md":"<computed:sha256(queue)>","O1-JOURNEYS.md":"<computed:sha256(journeys)>"},"candidate_commit":"<candidate:FULL_SHA>","fixtures":{"goal_prompt":"<computed:sha256(goal_prompt)>","goal_spec":"<computed:sha256(goal_spec)>","j1_patch":"<computed:sha256(j1_patch)>","state_transfer_inbound":"<computed:sha256(state_transfer_inbound)>","state_transfer_outbound":"<computed:sha256(state_transfer_outbound)>"},"manifest_version":"o1-manifest/v0.1-draft","pinned_sources":{"docs/v3/research-lane/scope-reframe-20261002/raw/01-current-strategy/Recursion_Interface_and_Product_Strategy.md":"<computed:sha256(docs/v3/research-lane/scope-reframe-20261002/raw/01-current-strategy/Recursion_Interface_and_Product_Strategy.md)>"}}
+   ```
+   The fixture baseline pins only the scope-reframe strategy report so `O1F-N10` has a pinned-source digest that can mismatch. That literal is not the real-mode set. Real candidate mode's `pinned_sources` keys are exactly the §6.3 list: `CONTROL_PLANE.md`, `ANCHOR.md`, `AGENTS.md`, `state/DECISIONS.md`, `docs/v3/PRODUCT.md`, `docs/v3/ACCEPTANCE.md`, `docs/v3/DECISION-REGISTER.md`, `docs/v3/program-control/MONTH-PROGRAM.md`, `docs/v3/harness/CSL-27.md`, `docs/v3/harness/CSL-82.md`, `docs/v3/harness/CSL-83.md`, `docs/v3/harness/CSL-84.md`, `docs/v3/research-lane/scope-reframe-20261002/raw/01-current-strategy/Recursion_Interface_and_Product_Strategy.md`, and `docs/v3/O1-CAPABILITY-MATRIX.schema.json`. Omitting any of those keys, adding a key outside the set, or a digest mismatch is `O1E-010`. Digests in this schema stay `<computed:…>` placeholders. The checker fills them from bytes. The decisions queue records the precomputed pins for the evidence manifest.
+
+8. **Covered Artifacts (`O1-CONTRACT.md`, `O1-JOURNEYS.md`, `O1-CAPABILITY-MATRIX.json`, `O1-DECISIONS-QUEUE.md`):**
+   In real candidate mode, computed as sha256 of exact bytes of the files on disk; in baseline fixture mode, computed over the modified baseline artifacts. The matrix is re-serialized as canonical JSON (UTF-8, sorted keys, separators `(",", ":")`, no trailing newline) after the baseline modifications. Each Markdown artifact is its exact candidate bytes, with the baseline's textual replacements applied in document order and no other normalization.
+
+#### Digest Computation Rule
+All cryptographic digests binding artifacts, pinned sources, and test payloads are **computed at check/freeze time as sha256 of the exact bytes on disk or in-memory literal fixture bytes**, represented in schemas and fixtures using explicit computation placeholders (e.g., `<computed:sha256(docs/v3/O1-CONTRACT.md)>`), never literal invented or unverified hexadecimal strings.
+
+#### Fixture-Only Record Schemas (Inline)
+
+##### Fixture Receipt Record Schema
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FixtureReceiptRecordSchema",
+  "type": "object",
+  "properties": {
+    "comment_id": {
+      "type": "string",
+      "pattern": "^receipt-[a-zA-Z0-9_-]+$"
+    },
+    "author": {
+      "type": "string",
+      "enum": ["fixture-founder"],
+      "description": "In fixture mode, author is fixture-founder, valid only under the fixture trust list. Real acceptance requires Lucas Guerra (@lucassalvador987), or a human he explicitly delegates under Rule H."
+    },
+    "issue_key": {
+      "type": "string",
+      "enum": ["CSL-205"]
+    },
+    "contract_sha256": {
+      "type": "string",
+      "description": "Computed at freeze as sha256 of docs/v3/O1-CONTRACT.md exact file bytes"
+    },
+    "journeys_sha256": {
+      "type": "string",
+      "description": "Computed at freeze as sha256 of docs/v3/O1-JOURNEYS.md exact file bytes"
+    },
+    "matrix_sha256": {
+      "type": "string",
+      "description": "Computed at freeze as sha256 of docs/v3/O1-CAPABILITY-MATRIX.json exact file bytes"
+    },
+    "candidate_commit": {
+      "type": "string",
+      "description": "Full 40-hex candidate SHA. The same value as manifest candidate_commit. Matching the four artifact digests without this field is not a receipt."
+    },
+    "decisions_queue_sha256": {
+      "type": "string",
+      "description": "Computed at freeze as sha256 of docs/v3/O1-DECISIONS-QUEUE.md exact file bytes"
+    },
+    "manifest_sha256": {
+      "type": "string",
+      "description": "Computed at freeze as sha256 of the canonical unified manifest. The manifest binds the candidate, the artifact digests, the pin digests, and the fixture digests."
+    },
+    "pinned_source_sha256": {
+      "type": "object",
+      "minProperties": 1,
+      "description": "sha256 of each pinned source, keyed by repository path. Real mode's keys equal the §6.3 set, including docs/v3/harness/CSL-27.md, CSL-82.md, CSL-83.md, CSL-84.md, and docs/v3/O1-CAPABILITY-MATRIX.schema.json. Updated in the same rebind phase as the manifest and the other receipt digests.",
+      "additionalProperties": { "type": "string" }
+    },
+    "fixture_sha256": {
+      "type": "object",
+      "minProperties": 1,
+      "description": "sha256 of each manifest fixture payload, keyed exactly as the manifest fixtures map (goal_prompt, goal_spec, j1_patch, state_transfer_inbound, state_transfer_outbound).",
+      "additionalProperties": { "type": "string" }
+    },
+    "scope": {
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 4
+    },
+    "selected_options": {
+      "type": "object"
+    },
+    "rejected_options": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "rationale": {
+      "type": "string"
+    },
+    "conditions": {
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 1
+    },
+    "revisit_triggers": {
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 1
+    },
+    "decided_on": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+    }
+  },
+  "required": [
+    "comment_id",
+    "author",
+    "issue_key",
+    "candidate_commit",
+    "contract_sha256",
+    "journeys_sha256",
+    "matrix_sha256",
+    "decisions_queue_sha256",
+    "manifest_sha256",
+    "pinned_source_sha256",
+    "fixture_sha256",
+    "scope",
+    "selected_options",
+    "rejected_options",
+    "rationale",
+    "conditions",
+    "revisit_triggers",
+    "decided_on"
+  ],
+  "additionalProperties": false
+}
+```
+
+##### Fixture Verifier Report Record Schema
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FixtureVerifierReportRecordSchema",
+  "type": "object",
+  "properties": {
+    "report_id": {
+      "type": "string",
+      "pattern": "^VR-[a-zA-Z0-9_-]+$"
+    },
+    "verifier_model_family": {
+      "type": "string",
+      "description": "Must differ from drafting_model_family per CONTROL_PLANE.md"
+    },
+    "drafting_model_family": {
+      "type": "string"
+    },
+    "candidate_commit": {
+      "type": "string",
+      "description": "Full 40-hex Git commit SHA evaluated"
+    },
+    "receipt_validation": {
+      "type": "object",
+      "properties": {
+        "comment_id": { "type": "string" },
+        "fixture_trust_input": {
+          "type": "object",
+          "properties": {
+            "trust_list_identity": { "type": "string", "enum": ["fixture-founder"] },
+            "valid_only_in_fixture_mode": { "type": "boolean", "const": true }
+          },
+          "required": ["trust_list_identity", "valid_only_in_fixture_mode"]
+        },
+        "author_confirmed": { "type": "string" },
+        "unmodified_body": { "type": "boolean" }
+      },
+      "required": ["comment_id", "fixture_trust_input", "author_confirmed", "unmodified_body"]
+    },
+    "manifest_check": {
+      "type": "object",
+      "properties": {
+        "artifacts_verified": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "artifact_digests": {
+          "type": "object",
+          "description": "sha256 of each of the four O1 artifacts, keyed by basename exactly as in the manifest `artifacts` map; compared against the candidate manifest",
+          "minProperties": 4,
+          "additionalProperties": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        },
+        "pinned_source_digests": {
+          "type": "object",
+          "description": "sha256 of each pinned governance/specification source, keyed by path; empty only in fixture baseline",
+          "additionalProperties": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        },
+        "fixture_digests": {
+          "type": "object",
+          "description": "sha256 of each conformance test fixture, keyed by payload name exactly as in the manifest `fixtures` map (goal_prompt, goal_spec, j1_patch, state_transfer_inbound, state_transfer_outbound)",
+          "additionalProperties": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        },
+        "manifest_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "sha256 of the canonical unified manifest. Same digest as the receipt manifest_sha256. Required by §8."
+        },
+        "digests_matched": { "type": "boolean" },
+        "stale_entries": { "type": "integer", "maximum": 0 }
+      },
+      "required": ["artifacts_verified", "artifact_digests", "pinned_source_digests", "fixture_digests", "manifest_sha256", "digests_matched", "stale_entries"]
+    },
+    "coverage_diff": {
+      "type": "object",
+      "properties": {
+        "unmapped_requirements": { "type": "array", "maxItems": 0 },
+        "unmapped_decisions": { "type": "array", "maxItems": 0 },
+        "out_of_row_scope": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Decisions excluded from the row diff. Baseline lists only D-034. retained_obligations stay in force.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "decision_id": { "type": "string" },
+              "retained_obligations": {
+                "type": "array",
+                "items": { "type": "string" },
+                "minItems": 1
+              }
+            },
+            "required": ["decision_id", "retained_obligations"]
+          }
+        },
+        "diff_empty": { "type": "boolean", "const": true }
+      },
+      "required": ["unmapped_requirements", "unmapped_decisions", "out_of_row_scope", "diff_empty"]
+    },
+    "protected_paths_check": {
+      "type": "object",
+      "properties": {
+        "modified_protected_paths": { "type": "array", "maxItems": 0 },
+        "clean": { "type": "boolean", "const": true }
+      },
+      "required": ["modified_protected_paths", "clean"]
+    },
+    "status": {
+      "type": "string",
+      "enum": ["PASS", "FAIL"]
+    }
+  },
+  "required": [
+    "report_id",
+    "verifier_model_family",
+    "drafting_model_family",
+    "candidate_commit",
+    "receipt_validation",
+    "manifest_check",
+    "coverage_diff",
+    "protected_paths_check",
+    "status"
+  ]
+}
+```
+
+#### Complete Inline Baseline Inputs
+
+```json
+{
+  "receipt_record_baseline": {
+    "comment_id": "receipt-csl205-rule-h-baseline-sample",
+    "author": "fixture-founder",
+    "issue_key": "CSL-205",
+    "candidate_commit": "<candidate:FULL_SHA>",
+    "contract_sha256": "<computed:sha256(docs/v3/O1-CONTRACT.md)>",
+    "journeys_sha256": "<computed:sha256(docs/v3/O1-JOURNEYS.md)>",
+    "matrix_sha256": "<computed:sha256(docs/v3/O1-CAPABILITY-MATRIX.json)>",
+    "decisions_queue_sha256": "<computed:sha256(docs/v3/O1-DECISIONS-QUEUE.md)>",
+    "manifest_sha256": "<computed:sha256(manifest)>",
+    "pinned_source_sha256": {
+      "docs/v3/research-lane/scope-reframe-20261002/raw/01-current-strategy/Recursion_Interface_and_Product_Strategy.md": "<computed:sha256(docs/v3/research-lane/scope-reframe-20261002/raw/01-current-strategy/Recursion_Interface_and_Product_Strategy.md)>"
+    },
+    "fixture_sha256": {
+      "goal_prompt": "<computed:sha256(goal_prompt)>",
+      "goal_spec": "<computed:sha256(goal_spec)>",
+      "j1_patch": "<computed:sha256(j1_patch)>",
+      "state_transfer_inbound": "<computed:sha256(state_transfer_inbound)>",
+      "state_transfer_outbound": "<computed:sha256(state_transfer_outbound)>"
+    },
+    "scope": [
+      "docs/v3/O1-CONTRACT.md",
+      "docs/v3/O1-JOURNEYS.md",
+      "docs/v3/O1-CAPABILITY-MATRIX.json",
+      "docs/v3/O1-DECISIONS-QUEUE.md"
+    ],
+    "selected_options": {
+      "DQ-01": "dispositioned (fixture)",
+      "DQ-02": "dispositioned (fixture)",
+      "DQ-03": "dispositioned (fixture)",
+      "DQ-04": "dispositioned (fixture)",
+      "DQ-05": "dispositioned (fixture)",
+      "DQ-06": "dispositioned (fixture)",
+      "DQ-07": "dispositioned (fixture)",
+      "DQ-08": "dispositioned (fixture)",
+      "DQ-09": "dispositioned (fixture)",
+      "DQ-10": "dispositioned (fixture)",
+      "DQ-11": "dispositioned (fixture)"
+    },
+    "rejected_options": [],
+    "rationale": "Freezes candidate contract and nominal baseline for downstream verification under Gate Envelope G with all baseline seams dispositioned.",
+    "conditions": [
+      "Fixture-only record; valid under the fixture trust list and never in acceptance mode."
+    ],
+    "revisit_triggers": [
+      "Any change to the candidate commit, the manifest digest, a bound artifact digest, a pinned source, or a fixture digest."
+    ],
+    "decided_on": "2026-10-23"
+  },
+  "verifier_report_baseline": {
+    "report_id": "VR-CSL205-20261023-01",
+    "verifier_model_family": "fixture-family-B",
+    "drafting_model_family": "fixture-family-A",
+    "candidate_commit": "<candidate:FULL_SHA>",
+    "receipt_validation": {
+      "comment_id": "receipt-csl205-rule-h-baseline-sample",
+      "fixture_trust_input": {
+        "trust_list_identity": "fixture-founder",
+        "valid_only_in_fixture_mode": true
+      },
+      "author_confirmed": "fixture-founder",
+      "unmodified_body": true
+    },
+    "manifest_check": {
+      "artifacts_verified": [
+        "docs/v3/O1-CONTRACT.md",
+        "docs/v3/O1-JOURNEYS.md",
+        "docs/v3/O1-CAPABILITY-MATRIX.json",
+        "docs/v3/O1-DECISIONS-QUEUE.md"
+      ],
+      "artifact_digests": {
+        "O1-CONTRACT.md": "<computed:sha256(contract)>",
+        "O1-JOURNEYS.md": "<computed:sha256(journeys)>",
+        "O1-CAPABILITY-MATRIX.json": "<computed:sha256(matrix)>",
+        "O1-DECISIONS-QUEUE.md": "<computed:sha256(queue)>"
+      },
+      "pinned_source_digests": {
+        "docs/v3/research-lane/scope-reframe-20261002/raw/01-current-strategy/Recursion_Interface_and_Product_Strategy.md": "<computed:sha256(docs/v3/research-lane/scope-reframe-20261002/raw/01-current-strategy/Recursion_Interface_and_Product_Strategy.md)>"
+      },
+      "fixture_digests": {
+        "goal_prompt": "<computed:sha256(goal_prompt)>",
+        "goal_spec": "<computed:sha256(goal_spec)>",
+        "j1_patch": "<computed:sha256(j1_patch)>",
+        "state_transfer_inbound": "<computed:sha256(state_transfer_inbound)>",
+        "state_transfer_outbound": "<computed:sha256(state_transfer_outbound)>"
+      },
+      "manifest_sha256": "<computed:sha256(manifest)>",
+      "digests_matched": true,
+      "stale_entries": 0
+    },
+    "coverage_diff": {
+      "unmapped_requirements": [],
+      "unmapped_decisions": [],
+      "out_of_row_scope": [
+        {
+          "decision_id": "D-034",
+          "retained_obligations": ["reproducible", "cache-aware", "injection-safe"]
+        }
+      ],
+      "diff_empty": true
+    },
+    "protected_paths_check": {
+      "modified_protected_paths": [],
+      "clean": true
+    },
+    "status": "PASS"
+  },
+  "composed_journey_trace_p04": {
+    "trace_id": "TRACE-J1-COMPOSED-NOMINAL-01",
+    "journey": "J1",
+    "mode": "combined",
+    "stages": [
+      {
+        "stage_index": 1,
+        "role": "native_head",
+        "action": "goal_spec_compilation",
+        "input_digest": "<computed:sha256(goal_prompt)>",
+        "output_digest": "<computed:sha256(goal_spec)>",
+        "status": "PASS"
+      },
+      {
+        "stage_index": 2,
+        "role": "native_arm",
+        "action": "workspace_scaffolding_and_static_analysis",
+        "worktree": "worktrees/j1-stage2",
+        "status": "PASS"
+      },
+      {
+        "stage_index": 3,
+        "role": "upstream_claude",
+        "action": "delegated_refactoring_turn",
+        "argv": ["claude", "-p", "--stream-json"],
+        "token_allowance_ceiling": 10000,
+        "status": "PASS"
+      },
+      {
+        "stage_index": 4,
+        "role": "native_broker",
+        "action": "stream_monitoring_and_token_redaction",
+        "redacted_tokens_count": 0,
+        "status": "PASS"
+      },
+      {
+        "stage_index": 5,
+        "role": "native_kernel",
+        "action": "workspace_re_adoption_and_verification",
+        "diff_digest": "<computed:sha256(j1_patch)>",
+        "tests_executed": ["scripts/tests/v3/harness/harness.test.py"],
+        "status": "PASS"
+      }
+    ],
+    "verification_status": "PASS",
+    "accounting": {
+      "native_tokens": 1200,
+      "upstream_tokens": 4850,
+      "recovery_reservation_tokens": 605,
+      "unmeasured_counters": null
+    }
+  },
+  "synthetic_evidence_EV_SYNTH_01": {
+    "id": "EV-SYNTH-01",
+    "evidence_class": "source_documented",
+    "type": "synthetic_mock_fixture",
+    "source_ref": "docs/v3/harness/CSL-84.md",
+    "notes": "Synthetic mock stream fixture for provider-free offline harness validation; cannot satisfy locally_qualified or release_qualified live evidence gates per Invariant 7 and Rule 6"
+  },
+  "genuine_fixture_execution_record_synth_01": {
+    "evidence_id": "EV-SYNTH-01-EXEC",
+    "evidence_class": "locally_observed",
+    "observation_subject": "synthetic_mock_fixture",
+    "execution_type": "offline_fixture_execution",
+    "run_id": "run-fixture-synth-exec-001",
+    "command": "python -X utf8 -B scripts/tests/v3/harness/harness.test.py",
+    "executed": true,
+    "exit_code": 0,
+    "executed_at": "2026-10-21T16:00:00Z",
+    "stdout_digest": "<computed:sha256(fixture_exec_stdout)>",
+    "stdout_origin": "digest of the fixture literal fixture_exec_stdout; the checker binds that literal and does not re-run the command",
+    "authenticity": "genuine_offline_mock_execution",
+    "live_tier_eligible": false,
+    "notes": "Adverse input for a completed local run whose subject is synthetic mock EV-SYNTH-01. An authentic run on a synthetic fixture stays synthetic evidence. It cannot support locally_qualified or release_qualified. This object specifies that case. It is not a claim that the drafting session captured a process."
+  },
+  "usage_tracking_record_n05": {
+    "task_id": "task-j6-metering-baseline",
+    "provider": "anthropic",
+    "route": "claude-code-stream",
+    "tokens_consumed": null,
+    "tokens_consumed_status": "unknown",
+    "estimated_cost_usd": null,
+    "estimated_cost_status": "unknown",
+    "recovery_reservation_tokens": 1500,
+    "cooldown_active": false
+  },
+  "state_transfer_p03": {
+    "artifact_id": "transfer-capsule-j1-nominal",
+    "schema_uri": "urn:recursion:schema:v3:context-capsule-transfer-v1",
+    "schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "ContextCapsuleTransferPayload",
+      "type": "object",
+      "properties": {
+        "active_constraints": {"type": "array", "items": {"type": "string"}},
+        "capsule_id": {"type": "string"},
+        "checkpoint_epoch": {"type": "integer", "minimum": 1},
+        "goal_spec_digest": {"type": "string"},
+        "modified_files": {"type": "array", "items": {"type": "string"}},
+        "owner_intent": {"type": "string"},
+        "task_id": {"type": "string"}
+      },
+      "required": ["active_constraints", "capsule_id", "checkpoint_epoch", "goal_spec_digest", "modified_files", "owner_intent", "task_id"]
+    },
+    "serialization_specification": {
+      "format": "canonical JSON",
+      "encoding": "UTF-8",
+      "key_order": "lexicographically sorted",
+      "whitespace": "none (separators=(',', ':'))",
+      "python_serializer": "json.dumps(payload, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode('utf-8')",
+      "digest_procedure": "sha256 of exact UTF-8 encoded canonical JSON bytes with sorted keys and no whitespace"
+    },
+    "inbound_payload": {
+      "active_constraints": ["no-hidden-api-keys", "preserve-dirty-work"],
+      "capsule_id": "capsule-20261023-001",
+      "checkpoint_epoch": 4,
+      "goal_spec_digest": "<computed:sha256(goal_spec)>",
+      "modified_files": ["docs/v3/O1-CONTRACT.md"],
+      "owner_intent": "Preserve task context across upstream CLI boundary",
+      "task_id": "task-j1-transfer-demo"
+    },
+    "expected_returned_payload": {
+      "active_constraints": ["no-hidden-api-keys", "preserve-dirty-work"],
+      "capsule_id": "capsule-20261023-001",
+      "checkpoint_epoch": 4,
+      "goal_spec_digest": "<computed:sha256(goal_spec)>",
+      "modified_files": ["docs/v3/O1-CONTRACT.md"],
+      "owner_intent": "Preserve task context across upstream CLI boundary",
+      "task_id": "task-j1-transfer-demo"
+    },
+    "round_trip_record": {
+      "evidence_id": "EV-ROUNDTRIP-SYNTH-01",
+      "evidence_class": "source_documented",
+      "status": "expected synthetic result, not executed",
+      "serialization_format": "application/json; canonical=true",
+      "inbound_sha256": "<computed:sha256(state_transfer_inbound)>",
+      "outbound_sha256": "<computed:sha256(state_transfer_outbound)>",
+      "lossless": true,
+      "notes": "Expected synthetic result, not executed. Synthetic serialization-deserialization round trip procedure defined against fixture-local Context Capsule payload with canonical UTF-8 JSON encoding; explicitly synthetic per O1E-007"
+    }
+  }
+}
+```
+
+### 7.2 Manifest of Positive and Adverse Test Fixtures
+
+| Fixture ID | Fixture Class | Description / Test Intent | Deterministic Mutation / Condition Against Baseline | Expected Result |
+|---|---|---|---|---|
+| **O1F-P01** | Positive | Nominal valid baseline | Complete baseline constructed deterministically from matrix and journeys at frozen candidate SHA with all rows dispositioned as no-release-claim, all DQ-01..DQ-11 seams marked 'dispositioned (fixture)', all artifact SHA-256 digests computed, and verified fixture Rule-H receipt record `receipt_record_baseline`. | **PASS** (exit 0, set()) |
+| **O1F-P02** | Positive | Explicit non-offered / unknown cell | Nominal baseline setting offline redisplay to `"not-offered"` per D-036, and mobile Full Stop to `"unknown"`. | **PASS** (exit 0, set()) |
+| **O1F-P03** | Positive | Transparent state transfer | Row specifies fixture-local payload `transfer-capsule-j1-nominal`, schema URI `urn:recursion:schema:v3:context-capsule-transfer-v1`, canonical JSON serialization, expected returned payload, and round-trip record `EV-ROUNDTRIP-SYNTH-01` (labeled 'expected synthetic result, not executed'). | **PASS** (exit 0, set()) |
+| **O1F-P04** | Positive | Multi-stage composed journey | Journey J1 composed trace from native initiation to Claude execution to native resumption (trace `composed_journey_trace_p04`). | **PASS** (exit 0, set()) |
+| **O1F-N01a** | Adverse | Missing required pillar | Delete the `"nodes"` pillar and all its associated rows (`CAP-011`, `CAP-012`, `CAP-013`) from constructed baseline matrix. | **FAIL** `{'O1E-001', 'O1E-006', 'O1E-011'}` (deleting CAP-011..CAP-013 also removes three rows without a `no-release-claim` disposition, and 11 pillars violate the schema `minItems` of 12; all are expected, no suppression) |
+| **O1F-N01b** | Adverse | Missing required journey | Delete journey `"J6"` from Journey Catalog and matrix row references. | **FAIL** `{'O1E-001', 'O1E-016', 'O1E-019'}` (removing J6 from CAP-016's `journeys` also removes J6's baseline, measurement, and falsification clauses; all three are expected, no suppression) |
+| **O1F-N02a** | Adverse | Missing surface control cell | Omit mobile column or leave control cell blank in Journey × Surface × Control matrix for J1. | **FAIL** `{'O1E-002'}` |
+| **O1F-N02b** | Adverse | Missing journey in mobile capability row | Remove journey `"J2"` from `CAP-016`'s journeys array in baseline matrix while retaining J2's cells in Journey × Surface × Control matrix. | **FAIL** `{'O1E-016'}` |
+| **O1F-N03a** | Adverse | Undecided row (missing target & disposition) | Mutate row CAP-001 to `target: null` and `disposition: null` with `disposition_status: "pending-H"`. | **FAIL** `{'O1E-003'}` |
+| **O1F-N03b** | Adverse | Target populated without Rule H | Set `target: "release_qualified"` on row CAP-001 while Rule-H receipt binding is absent or null. | **FAIL** `{'O1E-015'}` |
+| **O1F-N04** | Adverse | Synthetic without execution record promoted to live | Assign synthetic evidence `EV-SYNTH-01` without an execution record to support a `locally_qualified` or `release_qualified` maturity tier on CAP-001. | **FAIL** `{'O1E-004'}` |
+| **O1F-N04b** | Adverse | Authentic run on a synthetic fixture promoted to live | Assign synthetic evidence `EV-SYNTH-01` with `genuine_fixture_execution_record_synth_01` (`executed: true`, `authenticity: genuine_offline_mock_execution`, subject `synthetic_mock_fixture`) to a `locally_qualified` or `release_qualified` tier on CAP-001. A completed local run of the mock still cannot support a live tier. | **FAIL** `{'O1E-004'}` |
+| **O1F-N05** | Adverse | Unknown counter set to zero | In usage tracking record `usage_tracking_record_n05`, mutate `tokens_consumed: null` (status `"unknown"`) to `tokens_consumed: 0`. | **FAIL** `{'O1E-005'}` |
+| **O1F-N06** | Adverse | Deferral treated as deletion | Silently delete `CAP-015` (Desktop GUI Client) from matrix rows in constructed baseline instead of recording disposition `"no-release-claim"`. | **FAIL** `{'O1E-006'}` |
+| **O1F-N07** | Adverse | Opaque upstream state transfer | Mutate state transfer specification by setting `schema_uri: ""` and deleting `evidence_id` in `round_trip_record`. | **FAIL** `{'O1E-007'}` |
+| **O1F-N08** | Adverse | Component pass as journey proof | Present unit test `scripts/tests/v3/harness/ops.test.py` as proof of Journey J1 completion. | **FAIL** `{'O1E-008'}` |
+| **O1F-N09a** | Adverse | Stale proposal digest in receipt | Bind a receipt containing SHA-256 digest of literal `stale_draft` fixture content (`<computed:sha256(stale_draft)>`) instead of candidate contract content. | **FAIL** `{'O1E-009'}` |
+| **O1F-N09b** | Adverse | Unauthorized receipt author | Bind a receipt authored by non-founder account or non-trusted identity (e.g. `"unauthorized-user"`) failing the fixture trust list. | **FAIL** `{'O1E-009'}` |
+| **O1F-N09c** | Adverse | Wrong-scope receipt issue key | Bind a receipt comment from Linear issue `"CSL-117"` to the CSL-205 contract. | **FAIL** `{'O1E-009'}` |
+| **O1F-N09d** | Adverse | Receipt keeps artifact digests and drops commit or fixture binding | After phase 2, set `candidate_commit` to `0000000000000000000000000000000000000000` and set `fixture_sha256.goal_prompt` to `<computed:sha256(stale_draft)>`. The four artifact digests and the manifest stay correct. | **FAIL** `{'O1E-009'}` |
+| **O1F-N10** | Adverse | Stale input binding, including pinned source | Skip phase 2. Mutate one of: matrix JSON, journeys catalog, decisions queue, or the pinned scope-reframe file (append `# fixture-mutation`). Receipt and manifest stay on the pre-mutation digests. | **FAIL** `{'O1E-009', 'O1E-010'}` |
+| **O1F-N10b** | Adverse | Real-mode manifest omits a harness pin | Build the §6.3 real-mode `pinned_sources` set, delete `docs/v3/harness/CSL-27.md`, and skip rebind. The receipt still binds the old manifest and that pin's digest. Omitting `CSL-82.md`, `CSL-83.md`, `CSL-84.md`, or the matrix schema is the same condition. | **FAIL** `{'O1E-009', 'O1E-010'}` |
+| **O1F-N11** | Adverse | Schema violation | Inject undeclared maturity tier `"candidate-contract"` into row CAP-001, add an undeclared property on that row, or introduce a JSON trailing comma. Validation is against `docs/v3/O1-CAPABILITY-MATRIX.schema.json`. | **FAIL** `{'O1E-011'}` |
+| **O1F-N12** | Adverse | Dangling identity reference | Add a dependency reference to `CAP-001` (`upstream_only: false`, so the upstream-only closure does not walk it) pointing to nonexistent ID `CAP-999`, or add one pointing to nonexistent decision `D-999` on any row. | **FAIL** `{'O1E-012'}` |
+| **O1F-N13** | Adverse | Unresolved freeze-blocking seam | Mutate decision packet DQ-01 in fixture queue record to remove `'dispositioned (fixture)'`, asserting contract freeze while seam remains open without disposition. | **FAIL** `{'O1E-013'}` |
+| **O1F-N14a** | Adverse | Absent candidate verifier report (no promotion) | Baseline candidate with all rows dispositioned (`disposition: "no-release-claim"`, zero promoted rows), but verifier report `verifier_report_baseline` is absent or null in acceptance mode. | **FAIL** `{'O1E-014'}` |
+| **O1F-N14b** | Adverse | Absent independent evidence on promoted row | Capability claim promoted (`CAP-001` `target: "release_qualified"`) without an authentic independent verification report from a different model family or without receipt export comparison against actual Linear comments. | **FAIL** `{'O1E-014'}` |
+| **O1F-N17a** | Adverse | Upstream-only planning depends on an API or model | Set `CAP-020` `upstream_only_requires` to `["provider-api", "model"]`. | **FAIL** `{'O1E-017'}` |
+| **O1F-N17b** | Adverse | Upstream-only compaction depends on an API or model | Set `CAP-018` and `CAP-019` `upstream_only_requires` to `["provider-api", "model"]`. | **FAIL** `{'O1E-017'}` |
+| **O1F-N17c** | Adverse | Upstream-only verification depends on an API or model | Set `CAP-027` `upstream_only_requires` to `["provider-api", "model"]`. | **FAIL** `{'O1E-017'}` |
+| **O1F-N17d** | Adverse | Upstream-only planning depends on API-backed CAP-006 | Set `CAP-020` `upstream_only_requires` to `["CAP-006"]`. `CAP-006` stays the BYOK / HTTP transport row. The closure reaches that row and fails. The string `CAP-006` is not on the old token blacklist. | **FAIL** `{'O1E-017'}` |
+| **O1F-N17e** | Adverse | Transitive API dependency | Set `CAP-020` `upstream_only_requires` to `["CAP-019"]` and `CAP-019` `upstream_only_requires` to `["provider-api"]`. `CAP-020`'s own list names only another row. | **FAIL** `{'O1E-017'}` |
+| **O1F-N17f** | Adverse | Unknown upstream-only dependency | Set `CAP-020` `upstream_only_requires` to `["not-a-closed-requirement"]`. The token is not an allowed terminal and not a row id. | **FAIL** `{'O1E-017'}` |
+| **O1F-N17g** | Adverse | Upstream-only row omits its dependency list | Delete `upstream_only_requires` from `CAP-004` (an `upstream_only: true` row that is not one of the old four). The schema `if`/`then` fails and the closure list is missing. | **FAIL** `{'O1E-011', 'O1E-017'}` |
+| **O1F-N18** | Adverse | D-034 exemption drops a composition obligation | Remove `injection-safe` from D-034 `retained_obligations` and from `CAP-009` `composition_obligations`. | **FAIL** `{'O1E-018'}` |
+| **O1F-N19** | Adverse | Journey missing its falsification gate | Delete the obligatory substring `equal or less effort` from journey J1's `**Falsification:**` clause. J1's heading remains. | **FAIL** `{'O1E-019'}` |
+
+---
+
+## 8. Independent Verification Requirements
+
+Under Gate Envelope G and [CONTROL_PLANE.md](../../CONTROL_PLANE.md) § "Independent verifiers", verification must satisfy the following criteria:
+
+1. **Mandatory Cross-Family Verification & Unconditional Candidate Report:** The verifier report **must** be produced by an independent verifier from a **different model family** than the drafting agent (e.g., Anthropic Claude vs. OpenAI Codex or Google Gemini). A verification report produced by the same model family cannot satisfy this gate. Candidate-level independent verification is mandatory unconditionally in acceptance mode regardless of promotion: an otherwise complete candidate where all rows are dispositioned as `unmet`, `blocked`, or `no-release-claim` without any promoted claims must still fail acceptance (`O1E-014`) if an authentic independent verifier report is absent.
+2. **Receipt Verification Against Linear:** The independent verifier must export and independently inspect candidate receipts, directly comparing them against actual Linear comments (verifying comment ID, author human identity, exact unedited comment body, and timestamp).
+3. **Artifact and Manifest Binding:** The verifier report must bind:
+   - The full 40-hex candidate commit SHA.
+   - The SHA-256 of the canonical unified manifest.
+   - The exact SHA-256 digests of all four O1 artifacts (`O1-CONTRACT.md`, `O1-JOURNEYS.md`, `O1-CAPABILITY-MATRIX.json`, and `O1-DECISIONS-QUEUE.md`).
+   - The SHA-256 digests of every §6.3 pinned source, including `docs/v3/harness/CSL-27.md`, `CSL-82.md`, `CSL-83.md`, `CSL-84.md`, and `docs/v3/O1-CAPABILITY-MATRIX.schema.json`, and of every conformance test fixture.
+4. **Envelope G Verification Checks:** The verifier must explicitly inspect for:
+   - Zero dangling identity references across rows, journeys, and decisions.
+   - Zero unresolved freeze-blocking seams without recorded disposition.
+   - Presence of authentic candidate-level independent verifier report unconditionally in acceptance mode.
+   - Presence of authentic independent evidence for every promoted claim.
+5. **Execution Ledger:** The report must list every manifest fixture (`O1F-P01`–`P04`, `O1F-N01a`–`N19`, including `O1F-N09d`, `O1F-N10b`, `O1F-N17a` through `O1F-N17g`), recording:
+   - The exact command executed.
+   - The expected exit code and error ID.
+   - The observed exit code and error ID.
+6. **Coverage Diff:** The verifier reconstructs OR-021–OR-039 and D-018–D-039 and diffs that set against row `dependencies` in `O1-CAPABILITY-MATRIX.json`. A decision is mapped when at least one row cites it. Rows cite D-024, D-026, D-027, D-031, D-032, and D-033. D-034 is the only `out_of_row_scope` entry: the thesis does not map to one row. The exemption does not drop its composition obligations. `retained_obligations` lists `reproducible`, `cache-aware`, and `injection-safe`, and `CAP-009` `composition_obligations` lists the same three. A missing obligation is `O1E-018`. The verifier field `out_of_row_scope` is required. `unmapped_decisions` is empty only when every inventory decision is cited by a row or listed in `out_of_row_scope` with its retained obligations.
+7. **Pass Condition:** Verification passes **only** when:
+   - All manifest fixtures match expected results exactly.
+   - `unmapped_requirements` and `unmapped_decisions` are empty, and `out_of_row_scope` lists D-034 with `reproducible`, `cache-aware`, and `injection-safe`.
+   - No protected paths were touched.
+
+---
+
+## 9. Human Acceptance (Rule H)
+
+As established in [CSL-205](https://linear.app/csl-laboratories/issue/CSL-205) and [CSL-204](https://linear.app/csl-laboratories/issue/CSL-204):
+
+1. **Authorship:** Only a human-authored comment on the matching Linear issue ([CSL-205](https://linear.app/csl-laboratories/issue/CSL-205)) can approve a product decision, research continuation, or acceptance into the normative product contract.
+2. **Authorized Decider:** Lucas Guerra (`@lucassalvador987`), or a human he explicitly delegates under Rule H ([CONTROL_PLANE.md](../../CONTROL_PLANE.md) D-041).
+3. **Mandatory Comment Bindings:** The human comment must bind the same subjects as the fixture receipt schema. Matching only the four artifact digests is not acceptance.
+   - Comment ID and author human identity. The author is Lucas Guerra (`@lucassalvador987`), or a human he explicitly delegates under Rule H.
+   - Scoped delegation record when the author is not Lucas.
+   - `candidate_commit`: the full 40-hex SHA of the candidate.
+   - `manifest_sha256`: the SHA-256 of the canonical unified manifest. That manifest carries the candidate, the artifact digests, the pin digests, and the fixture digests.
+   - Exact SHA-256 digests of all four artifacts (`O1-CONTRACT.md`, `O1-JOURNEYS.md`, `O1-CAPABILITY-MATRIX.json`, and `O1-DECISIONS-QUEUE.md`).
+   - `pinned_source_sha256`: every §6.3 pin, including `docs/v3/harness/CSL-27.md`, `CSL-82.md`, `CSL-83.md`, `CSL-84.md`, and `docs/v3/O1-CAPABILITY-MATRIX.schema.json`.
+   - `fixture_sha256`: every fixture payload digest named by the manifest `fixtures` map.
+   - Explicit scope of acceptance.
+   - Selected options and rejected options.
+   - Substantive rationale.
+   - Conditions and revisit triggers.
+   - Calendar date (`YYYY-MM-DD`).
+   A later commit that changes a fixture, a pin, or the candidate and keeps the four artifact digests still needs a new receipt (`O1E-009`).
+4. **Non-Qualifying Actions:** Labels, issue status changes (e.g., moving to "Done"), PR approvals, GitHub merges, bot relays, and green test runs do **not** qualify as acceptance under Rule H.
+5. **Scope of Acceptance:** Human closure of CSL-205 accepts this contract, the journey catalog, the capability matrix, and the decisions queue. It does **not** constitute a release decision or authorize deployment.
+
+---
+
+## 10. Supplemental Structural Checks
+
+In addition to this contract's proposed future journey checker, candidates maintain clean passes on existing repository program-control checks:
+```text
+python -X utf8 -B tools/check_program_control.py
+python -X utf8 -B tools/test_program_control.py
+```
+> [!IMPORTANT]
+> **Actual Scope of Program-Control Checks vs. O1 Structural Inspection:**<br>
+> The existing candidate checks (`tools/check_program_control.py` and `tools/test_program_control.py`) validate the repository-level program-control ledger established under [CSL-204](https://linear.app/csl-laboratories/issue/CSL-204) (`docs/v3/program-control/MONTH-PROGRAM.json` and `MONTH-PROGRAM.md`). **They do not inspect or validate these O1 draft artifacts** (`O1-CONTRACT.md`, `O1-JOURNEYS.md`, `O1-CAPABILITY-MATRIX.json`, `O1-DECISIONS-QUEUE.md`).<br>
+>
+> Inspection of O1 drafts is a distinct, separate validation scope:<br>
+> 1. In-progress drafts undergo schema validation against [O1-CAPABILITY-MATRIX.schema.json](O1-CAPABILITY-MATRIX.schema.json) and cross-family review, during which draft marker `disposition_status: "pending-H"` is permitted.<br>
+> 2. Acceptance qualification is enforced by the proposed release journey checker upon its separate admission after Rule H, which strictly rejects any undecided rows.<br>
+>
+> Program-control checks verify ledger consistency across the repository; they neither authenticate human authorship nor inspect O1 internal tables, and they cannot substitute for the positive acceptance gate.

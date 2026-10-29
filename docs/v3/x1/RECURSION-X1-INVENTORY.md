@@ -27,7 +27,7 @@ functionality when we are literally redesigning the entire thing". Told that thi
 Decision 3's timing and the port calls in section 9, he answered: "Actually cancel that. Delete
 and drop tests too, they aren't relevant". So `scripts/v3/harness/**`, its tests and fixtures,
 and `config/harness*.json` are deleted, and oracles O-H1 to O-H5 are dropped with no successor.
-`scripts/v3/planning/**` keeps the Nov 10 plan and everything below that concerns it.
+`scripts/v3/planning/**` keeps the 2026-11-10 plan and everything below that concerns it.
 
 ## 2. Tag
 

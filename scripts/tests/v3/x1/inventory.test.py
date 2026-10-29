@@ -10,7 +10,7 @@ The deletion PR (after the Nov 10 rehearsal) flips the flag; the test then stays
 port oracle has a successor carrier that exists, is run by the gate and no longer references the
 boundary.
 
-CSL-578 (Oct 29): Lucas had the legacy CLI harness deleted ahead of the rehearsal and dropped its
+CSL-578 (2026-10-29): Lucas had the legacy CLI harness deleted ahead of the rehearsal and dropped its
 five oracles (O-H1 to O-H5) without a port. The boundary is now `scripts/v3/planning/**` only.
 """
 from __future__ import annotations

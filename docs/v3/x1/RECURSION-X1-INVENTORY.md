@@ -205,7 +205,6 @@ Checked by search on the base SHA. The deletion PR must handle each, after the N
 | `tools/test_ci_gate.py` | Asserts `len(M1_REQUIRED_TESTS) == 17`. | line 341 |
 | `tools/perf_bench.py`, `tools/perf_workload.json` | `perf_bench.py` imports the planning kernel and validators. The workload reads `F-M1A-002.json`. The perf step in `ci.yml` is `continue-on-error`, so it would only warn. | `tools/perf_bench.py` lines 99 to 103; `.github/workflows/ci.yml` lines 195 to 204 |
 | `experiments/v3/effect-evidence/` (`ee_common.py`) | Imports the planning kernel and validators. Not part of general CI (packet-scoped). | `ee_common.py` lines 5 to 7 |
-| `experiments/v3/swarm-research-20260911-155142/research_entry.py` | References `scripts/v3/planning/replay/kernel.py` by path. | line 23 |
 | `README.md`, `docs/v3/harness/CSL-27.md`, `docs/v3/M1A-*.md` | Document `python -m scripts.v3.harness` and the planning kernel. | grep at base SHA |
 
 Lucas's comment `611d6aa4` says the thin direct-Claude fallback is new code under

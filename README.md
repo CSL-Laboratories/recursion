@@ -36,6 +36,7 @@ Start here:
 | `config/harness.json` | shipped harness config (offline fixtures only) |
 | `scripts/tests/v3/` | v3 M1 test programs and fixtures |
 | `state/` | decision log and v3 goal/task records |
+| `contract/PRODUCT.pin.json` | pin to the product contract in csl-research (repository, full commit, path, SHA-256); `tools/check_product_pin.py` checks it (CSL-585) |
 
 ## Harness slice
 

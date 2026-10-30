@@ -27,8 +27,6 @@
       "Bash(python3 -X utf8 -B tools/test_linear_pr_sync.py)",
       "Bash(python -X utf8 -B tools/test_perf_bench.py)",
       "Bash(python3 -X utf8 -B tools/test_perf_bench.py)",
-      "Bash(python -X utf8 -B tools/test_program_control.py)",
-      "Bash(python3 -X utf8 -B tools/test_program_control.py)",
       "Bash(python -X utf8 -B tools/test_stuck_thread_watch.py)",
       "Bash(python3 -X utf8 -B tools/test_stuck_thread_watch.py)",
       "Bash(python -X utf8 -B tools/test_claude_fixer_guard.py)",

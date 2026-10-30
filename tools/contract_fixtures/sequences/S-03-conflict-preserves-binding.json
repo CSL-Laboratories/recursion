@@ -1,0 +1,54 @@
+{
+  "type": "WireJournalSequence@1",
+  "sequence_id": "seq:conflict-preserves-binding",
+  "steps": [
+    {
+      "send": {
+        "command_id": "cmd:admit-0030",
+        "command_digest": "sha256:1f3a94c2b8e6470d9a51c2e6f8b4d0a7c5e2f19b3d6a8c4e5b7d9f0a2c4e6b81"
+      },
+      "expect": {
+        "type": "WireCommandOutcome@1",
+        "command_id": "cmd:admit-0030",
+        "command_digest": "sha256:1f3a94c2b8e6470d9a51c2e6f8b4d0a7c5e2f19b3d6a8c4e5b7d9f0a2c4e6b81",
+        "outcome": "accepted"
+      }
+    },
+    {
+      "send": {
+        "command_id": "cmd:admit-0030",
+        "command_digest": "sha256:0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b"
+      },
+      "expect": {
+        "type": "WireCommandOutcome@1",
+        "command_id": "cmd:admit-0030",
+        "command_digest": "sha256:0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b",
+        "outcome": "conflict"
+      }
+    },
+    {
+      "send": {
+        "command_id": "cmd:admit-0030",
+        "command_digest": "sha256:1f3a94c2b8e6470d9a51c2e6f8b4d0a7c5e2f19b3d6a8c4e5b7d9f0a2c4e6b81"
+      },
+      "expect": {
+        "type": "WireCommandOutcome@1",
+        "command_id": "cmd:admit-0030",
+        "command_digest": "sha256:1f3a94c2b8e6470d9a51c2e6f8b4d0a7c5e2f19b3d6a8c4e5b7d9f0a2c4e6b81",
+        "outcome": "duplicate"
+      }
+    },
+    {
+      "send": {
+        "command_id": "cmd:admit-0030",
+        "command_digest": "sha256:0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b"
+      },
+      "expect": {
+        "type": "WireCommandOutcome@1",
+        "command_id": "cmd:admit-0030",
+        "command_digest": "sha256:0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b",
+        "outcome": "conflict"
+      }
+    }
+  ]
+}

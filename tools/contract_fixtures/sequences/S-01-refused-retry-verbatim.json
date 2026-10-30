@@ -1,0 +1,40 @@
+{
+  "type": "WireJournalSequence@1",
+  "sequence_id": "seq:refused-retry-verbatim",
+  "steps": [
+    {
+      "send": {
+        "command_id": "cmd:admit-0010",
+        "command_digest": "sha256:2b4c8f0e1a3d5b7c9e2f4a6c8d0b2e4f6a8c0d2e4f6a8b0c2d4e6f8a0b2c4d6e"
+      },
+      "expect": {
+        "type": "WireCommandOutcome@1",
+        "command_id": "cmd:admit-0010",
+        "command_digest": "sha256:2b4c8f0e1a3d5b7c9e2f4a6c8d0b2e4f6a8c0d2e4f6a8b0c2d4e6f8a0b2c4d6e",
+        "outcome": "refused",
+        "refusal": {
+          "reason_code": "paused",
+          "refusal_class": "retryable",
+          "retry_after_seconds": 30
+        }
+      }
+    },
+    {
+      "send": {
+        "command_id": "cmd:admit-0010",
+        "command_digest": "sha256:2b4c8f0e1a3d5b7c9e2f4a6c8d0b2e4f6a8c0d2e4f6a8b0c2d4e6f8a0b2c4d6e"
+      },
+      "expect": {
+        "type": "WireCommandOutcome@1",
+        "command_id": "cmd:admit-0010",
+        "command_digest": "sha256:2b4c8f0e1a3d5b7c9e2f4a6c8d0b2e4f6a8c0d2e4f6a8b0c2d4e6f8a0b2c4d6e",
+        "outcome": "refused",
+        "refusal": {
+          "reason_code": "paused",
+          "refusal_class": "retryable",
+          "retry_after_seconds": 30
+        }
+      }
+    }
+  ]
+}

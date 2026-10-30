@@ -1,0 +1,10 @@
+{
+  "format": "csl-product-pin/v1",
+  "status": "awaiting",
+  "repository": "CSL-Laboratories/csl-research",
+  "path": null,
+  "commit": null,
+  "sha256": null,
+  "claim": null,
+  "limitations": "No product contract is pinned yet. A pin names exact bytes in csl-research; it does not accept, admit or bind them. How a pinned contract binds Recursion is an open founder decision (CSL-585)."
+}

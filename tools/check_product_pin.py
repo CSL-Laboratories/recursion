@@ -29,8 +29,8 @@ FORMAT = "csl-product-pin/v1"
 REPOSITORY = "CSL-Laboratories/csl-research"
 KEYS = {"format", "status", "repository", "path", "commit", "sha256", "claim", "limitations"}
 PINNED_FIELDS = ("path", "commit", "sha256", "claim")
-COMMIT = re.compile(r"^[0-9a-f]{40}$")
-SHA256 = re.compile(r"^[0-9a-f]{64}$")
+COMMIT = re.compile(r"[0-9a-f]{40}")
+SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
 def errors(pin: object) -> list[str]:
@@ -65,9 +65,9 @@ def errors(pin: object) -> list[str]:
             parts = path.split("/")
             if path.startswith("/") or "\\" in path or {"", ".", ".."} & set(parts):
                 out.append("path must be a relative posix path inside the repository")
-        if not isinstance(pin.get("commit"), str) or not COMMIT.match(pin["commit"]):
+        if not isinstance(pin.get("commit"), str) or not COMMIT.fullmatch(pin["commit"]):
             out.append("commit must be a full 40-hex lowercase SHA")
-        if not isinstance(pin.get("sha256"), str) or not SHA256.match(pin["sha256"]):
+        if not isinstance(pin.get("sha256"), str) or not SHA256.fullmatch(pin["sha256"]):
             out.append("sha256 must be 64 lowercase hex characters")
         claim = pin.get("claim")
         if not isinstance(claim, str) or not claim.strip():

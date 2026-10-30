@@ -55,6 +55,11 @@ class ShapeTests(unittest.TestCase):
         self.assertIn("commit must be a full 40-hex lowercase SHA", problems)
         self.assertIn("sha256 must be 64 lowercase hex characters", problems)
 
+    def test_pinned_rejects_trailing_newline_in_hex_fields(self) -> None:
+        problems = pin_check.errors({**PINNED, "commit": "a" * 40 + "\n", "sha256": "b" * 64 + "\n"})
+        self.assertIn("commit must be a full 40-hex lowercase SHA", problems)
+        self.assertIn("sha256 must be 64 lowercase hex characters", problems)
+
     def test_pinned_rejects_escaping_paths(self) -> None:
         for path in ("/etc/passwd", "../x.md", "a/../b.md", "a\\b.md", "./a.md"):
             with self.subTest(path=path):

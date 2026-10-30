@@ -2,8 +2,10 @@
 
 **Recursion v3** is a provider-neutral agent platform: a harness with its own client,
 execution kernel, context/compaction engine and multi-node fabric, plus adapters for
-supported upstream harnesses. The current development target and single source of truth is
-[docs/v3/START-HERE.md](docs/v3/START-HERE.md).
+supported upstream harnesses. The v3 specifications, research and decision log that used to
+live under `docs/` and `state/` moved to csl-research under CSL-536: see
+[`contracts/recursion/history/`](https://github.com/CSL-Laboratories/csl-research/tree/f9d8526acbaf02abb227b38d88ed95e170a1f6d4/contracts/recursion/history). The next product contract
+will be a `PRODUCT.md` in csl-research.
 
 V1/v2 — the previous Hermes-based supervisor and control plane — are **retired**. They were
 removed from the trunk on 2026-09-28 and remain recoverable from the
@@ -11,8 +13,7 @@ removed from the trunk on 2026-09-28 and remain recoverable from the
 
 Start here:
 
-- [docs/v3/START-HERE.md](docs/v3/START-HERE.md) — orientation and specification map
-- [docs/v3/RESEARCH-SCOPE.md](docs/v3/RESEARCH-SCOPE.md) — research goals and the gates that pass
+- [csl-research `contracts/recursion/history/`](https://github.com/CSL-Laboratories/csl-research/tree/f9d8526acbaf02abb227b38d88ed95e170a1f6d4/contracts/recursion/history) — the former `docs/` and `state/` records, byte for byte
 - [CONTRIBUTING.md](CONTRIBUTING.md) — how to contribute
 - [ANCHOR.md](ANCHOR.md) — why the work exists; [CONTROL_PLANE.md](CONTROL_PLANE.md) — who decides
 
@@ -21,19 +22,20 @@ Start here:
 > "still describe the pre-v3 control plane" was stale. Neither file is edited in the
 > 2026-10-24 spec amendment (`ANCHOR.md` is a protected path with no founder authoring
 > session). GUI-timing supersession for ANCHOR's "terminal first, GUI later" is already
-> D-038; additions beyond D-038 live in `docs/v3/AMENDMENT-2026-10-24.md`. Status:
+> D-038; additions beyond D-038 live in `docs/v3/AMENDMENT-2026-10-24.md` (now in csl-research
+> history, see above). Status:
 > amendment proposed (2026-10-24); acceptance is a human decision by Lucas.
 
 ## Layout
 
 | Path | What it is |
 |---|---|
-| `docs/v3/` | existing v3 product specifications. New non-public docs go to [csl-research](https://github.com/CSL-Laboratories/csl-research), except operational contracts and runbooks that this repository's code, a gate or CI reads; existing files stay (CSL-536). |
+| `docs/` | only the operational files this repository's code, a gate or CI reads (`docs/ci-event-contract.md`, `docs/v3/x1/`). Every other doc goes to [csl-research](https://github.com/CSL-Laboratories/csl-research) (CSL-536). |
 | `experiments/v3/` | runnable product checks only |
 | `schemas/control-plane/v3/` | v3 contract schemas (planning, execution, integrity) |
 | `scripts/v3/` | v3 planning replay and validation |
 | `scripts/tests/v3/` | v3 M1 test programs and fixtures |
-| `state/` | decision log and v3 goal/task records |
+| `state/` | `INBOX.md` (optional escalation) and `PROPOSALS.md` (protected-change proposals). The frozen decision log moved to csl-research history. |
 
 ## Retired
 

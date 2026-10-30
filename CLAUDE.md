@@ -51,13 +51,13 @@ issues and PRs.
   there, except operational contracts and runbooks that this repository's
   code, a gate or CI reads: those stay here. A file stays in this repository
   if code, a gate or CI here reads it; everything else non-public goes to the
-  vault. Existing files stay; CSL-536 will move them. The existing decision logs (`state/DECISIONS.md` and `docs/v3/DECISION-REGISTER.md`) and their founder-approved authoring process are unchanged. The only other new docs
+  vault. Existing files stay out of this repo now: CSL-536 moved the existing docs and the frozen decision logs (`state/DECISIONS.md` and `docs/v3/DECISION-REGISTER.md`, through D-044) to csl-research `contracts/recursion/history/`; they stay frozen there, and new decision records go to csl-research. The only other new docs
   allowed here are public knowledge-base, README, setup and implementation
   instructions for outside readers, and agent instruction files. If
   csl-research is not accessible, stop and post a
   blocker on the Linear issue; do not fall back to this repo.
-  `docs/v3/research-lane/`, `docs/v3/foundation-research/` and
-  `docs/v3/prompts/` are legacy and frozen; `experiments/v3/` holds only
+  The former `docs/v3/` research lanes are frozen history in csl-research;
+  `experiments/v3/` holds only
   runnable product checks. Every research pass for an issue (a) posts that
   digest and (b) appends the submission record following that repo's README,
   AGENTS.md, templates and `tools/check_submission.py`, and opens the vault PR
@@ -85,8 +85,9 @@ issues and PRs.
 
 This repository builds Recursion v3, a provider-neutral agent harness. Read
 `CONTROL_PLANE.md` first — it says who decides. Read `ANCHOR.md` before any planning task —
-it says what is in scope. Then read [docs/v3/START-HERE.md](docs/v3/START-HERE.md) before
-selecting a task.
+it says what is in scope. Then read the Linear issue and the csl-research records it links
+before selecting a task. The former v3 docs are history in csl-research
+[`contracts/recursion/history/`](https://github.com/CSL-Laboratories/csl-research/tree/f9d8526acbaf02abb227b38d88ed95e170a1f6d4/contracts/recursion/history).
 
 ## Bounded issue execution and shared evidence
 
@@ -94,7 +95,7 @@ selecting a task.
 
 The loop starts from an objective, feature admission or direction decision approved by a founder acting within `CONTROL_PLANE.md` authority. Within one admitted task (one repository/worktree, explicit allowed paths, explicit non-goals and one machine-checkable gate), an agent runs bounded research, development and tests. It then closes out with independent evidence on the exact candidate. Closeout records the full 40-hex commit tested, the commands and results, unresolved criteria, review evidence and linked follow-ups. An implementer's PASS, a GitHub merge and a Linear **Done** status are never empirical or product acceptance.
 
-When blocked, an agent preserves its work and records the blocker. The Linear issue comment is the canonical escalation; `state/INBOX.md` is optional. Flag required decision-log entries; `state/DECISIONS.md` remains protected and may be changed only through its separately founder-approved authoring process. A product task grants no permission to write that log. The agent comments on the Linear issue with @mentions, then releases its claim with a release record (below). Releasing the claim does not release the hold. A human-decision hold needs an explicit human decision receipt. A technical or dependency blocker needs evidence that its condition has cleared. Either way, the agent rechecks the gate and readiness and takes a fresh claim before resuming. Product decisions are never inferred from silence, elapsed time, CI results or issue status. A founder merge records its merge decision; it does not itself accept a product fragment or release an unrelated decision hold. Spec changes authored by Samir or Dan (or their attributed agents) are accepted when a founder other than the author submits a GitHub `APPROVED` review on the exact PR head SHA with a SHA-256 digest map of the accepted paths (`CONTROL_PLANE.md` product-spec acceptance; CSLR-D-001). Lucas-authored spec PRs keep Lucas's existing acceptance path. Self-approval, a non-founder review, a stale head, a digest mismatch, CI, PASS, silence and labels are not acceptance. Agents do not invent receipts or present their own records as founder statements; the one exception is a developer-approved comment that counts under `CONTROL_PLANE.md` (D-043).
+When blocked, an agent preserves its work and records the blocker. The Linear issue comment is the canonical escalation; `state/INBOX.md` is optional. Flag required decision records; new ones go to csl-research through a PR there, and the frozen legacy log (`state/DECISIONS.md`, now in csl-research history) is never edited. A product task grants no permission to write decision records. The agent comments on the Linear issue with @mentions, then releases its claim with a release record (below). Releasing the claim does not release the hold. A human-decision hold needs an explicit human decision receipt. A technical or dependency blocker needs evidence that its condition has cleared. Either way, the agent rechecks the gate and readiness and takes a fresh claim before resuming. Product decisions are never inferred from silence, elapsed time, CI results or issue status. A founder merge records its merge decision; it does not itself accept a product fragment or release an unrelated decision hold. Spec changes authored by Samir or Dan (or their attributed agents) are accepted when a founder other than the author submits a GitHub `APPROVED` review on the exact PR head SHA with a SHA-256 digest map of the accepted paths (`CONTROL_PLANE.md` product-spec acceptance; CSLR-D-001). Lucas-authored spec PRs keep Lucas's existing acceptance path. Self-approval, a non-founder review, a stale head, a digest mismatch, CI, PASS, silence and labels are not acceptance. Agents do not invent receipts or present their own records as founder statements; the one exception is a developer-approved comment that counts under `CONTROL_PLANE.md` (D-043).
 
 Moving to other work means taking only a separately admitted, already-authorised task. That task must be next under an explicit human-approved priority or order. If no such order exists, or it is ambiguous, propose the next choice to the founders on Linear and wait. Do not choose for them.
 
@@ -137,12 +138,12 @@ runbooks that aren't public) go there through a PR, except operational
 contracts and runbooks that this repository's code, a gate or CI reads:
 those stay here. A file stays in this repository if code, a gate or CI here
 reads it; everything else non-public goes to the vault. This repo only
-links to vault records. Existing files stay; CSL-536 will move them. The existing decision logs (`state/DECISIONS.md` and `docs/v3/DECISION-REGISTER.md`) and their founder-approved authoring process are unchanged. The only other new docs allowed here
+links to vault records. Existing files stay out of this repo now: CSL-536 moved the existing docs and the frozen decision logs (`state/DECISIONS.md` and `docs/v3/DECISION-REGISTER.md`, through D-044) to csl-research `contracts/recursion/history/`; they stay frozen there, and new decision records go to csl-research. The only other new docs allowed here
 are public knowledge-base, README, setup and implementation instructions for
 outside readers, and agent instruction files. If csl-research
 is not accessible, stop and post a blocker on the Linear issue; do not fall
-back to this repo. `docs/v3/research-lane/`, `docs/v3/foundation-research/` and
-`docs/v3/prompts/` are legacy and frozen; `experiments/v3/` holds only
+back to this repo. The former `docs/v3/` research lanes are frozen history in
+csl-research; `experiments/v3/` holds only
 runnable product checks. The vault is evidence storage, not a supervisor or
 decision authority. This section grants that submission write route only; it
 does not grant other access, orchestration, or any other write. The
@@ -223,7 +224,8 @@ developer-approved comment is never a review verdict ([Review roles](#review-rol
 Never post decision language as an agent comment otherwise; link the record instead.
 A decision exists only if a human posted it from their own account, a
 developer-approved comment that counts under this rule carries it, or it is in
-`state/DECISIONS.md` or `docs/adr/`. When relying on a developer-approved comment,
+the frozen legacy log (`state/DECISIONS.md`, now in csl-research history) or a
+csl-research decision record. When relying on a developer-approved comment,
 check that the marker is present, the comment is unedited and the named developer
 has not disputed it; if any of that is unclear, ask that developer before acting.
 A comment from a founder or developer account that has no agent prefix and was
@@ -283,19 +285,19 @@ If a task could be read two materially different ways, stop and comment on the L
 ## Escalate, don't guess
 
 Stop and comment on the Linear issue when a task is ambiguous, needs a decision not recorded in
-`state/DECISIONS.md`, conflicts with the research, or makes a claim you cannot verify. The Linear
+csl-research (the frozen legacy log included), conflicts with the research, or makes a claim you cannot verify. The Linear
 issue comment is the canonical escalation; `state/INBOX.md` is optional.
 
 ## Working with the v3 specifications
 
-`docs/v3` is non-normative until ratified. Do not reopen answered Owner questions or select a
+The former `docs/v3` specifications, now csl-research history, are non-normative until ratified. Do not reopen answered Owner questions or select a
 language, store, framework or sandbox from a research recommendation. Keep evidence classes
 distinct: source-documented, locally observed, inferred and unmeasured are different things.
 
 ## Recorded decisions
 
-Before proposing architecture or direction, read `docs/adr/` and the linked
-decision issues; do not re-argue a recorded decision without new evidence.
+Before proposing architecture or direction, read the csl-research decision records
+and the linked decision issues; do not re-argue a recorded decision without new evidence.
 
 ## Style
 
@@ -381,7 +383,7 @@ artifacts, and runbooks that aren't public) go to that vault through a PR
 there, except operational contracts and runbooks that this repository's
 code, a gate or CI reads: those stay here. A file stays in this repository
 if code, a gate or CI here reads it; everything else non-public goes to the
-vault. Existing files stay; CSL-536 will move them. The existing decision logs (`state/DECISIONS.md` and `docs/v3/DECISION-REGISTER.md`) and their founder-approved authoring process are unchanged. The only other new docs allowed
+vault. Existing files stay out of this repo now: CSL-536 moved the existing docs and the frozen decision logs (`state/DECISIONS.md` and `docs/v3/DECISION-REGISTER.md`, through D-044) to csl-research `contracts/recursion/history/`; they stay frozen there, and new decision records go to csl-research. The only other new docs allowed
 here are public knowledge-base, README, setup and implementation instructions
 for outside readers, and agent instruction files. If csl-research is not
 accessible, stop and post a blocker on the

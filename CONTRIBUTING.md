@@ -194,7 +194,7 @@ check, for example:
 
 ```text
 python -X utf8 -B tools/ci_gate.py --force
-python -X utf8 -B experiments/v3/recovery-ledger-20260914/test_ledger.py
+python -X utf8 -B tools/test_ci_gate.py
 ```
 
 On Windows, paths can exceed 260 characters; pass `-c core.longpaths=true` per Git command.

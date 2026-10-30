@@ -15,8 +15,8 @@ assert_tests_accounted fails if a test-like file is neither run nor excluded.
 
 Path filter: every diff runs the contract-test suite (CSL-376). Suite tests
 read files the path filter classes as docs (AGENTS.md, CLAUDE.md,
-.claude/settings.json, config/*.json, docs/v3/program-control), so skipping
-the suite for a docs-only diff could pass a check whose tests never ran.
+.claude/settings.json, config/*.json), so skipping the suite for a docs-only
+diff could pass a check whose tests never ran.
 The docs-only classification is still logged. --force is kept for callers.
 """
 from __future__ import annotations
@@ -32,8 +32,6 @@ ROOT = Path(__file__).resolve().parents[1]
 ZERO_SHA = "0" * 40
 GIT = ["git", "-c", "core.longpaths=true", "-c", "core.quotePath=false"]
 RUN_TIMEOUT = 180
-# delegated-Q fake controls resolve this TASK_BASE tree; shallow clones omit it.
-DQ_TASK_BASE = "0c908f6833e715af0eaa01b6f6788120eb577efd"
 
 # Paths that can break the provider-free gate. Only logged since CSL-376.
 GATE_PREFIXES = (
@@ -67,12 +65,6 @@ TEST_GLOBS = (
 TEST_EXCLUDE = {
     # Claude fixer workflow runs this; not part of the linux runtime budget.
     "tools/test_claude_pr_fixer.py",
-    # Packet-scoped experiment suites; not general CI.
-    "experiments/v3/interface-probes/observer_tests.py",
-    "experiments/v3/external-20260914/broker_wire_tests.py",
-    "experiments/v3/external-20260914/recovery_allowance_tests.py",
-    "experiments/v3/external-20260914/replay_reader_tests.py",
-    "experiments/v3/external-20260914/reservation_witness_tests.py",
 }
 
 # Floor against shrinking the suite. Additions are allowed; deletions fail.
@@ -81,8 +73,6 @@ TEST_EXCLUDE = {
 REQUIRED_SUITE_TESTS = frozenset(
     {
         "tools/test_ci_gate.py",
-        "experiments/v3/recovery-ledger-20260914/test_ledger.py",
-        "experiments/v3/delegated-q-coupling-20260914/test_contract.py",
         "scripts/tests/v3/x1/inventory.test.py",
     }
 )
@@ -112,11 +102,6 @@ M1_REQUIRED_TESTS = frozenset(
     }.items()
     for name in names
 )
-
-# Frozen packet gates — not general CI. See the workflow comment for why.
-#   docs/v3/construction/next-work-20260914/check_handoff.py  T-01 spec freeze
-#   delegated-q check.py --mode preflight  packet-scoped source_gate
-#   delegated-q check.py --mode execute    Owner-gated scientific admission
 
 
 def emit_output(key: str, value: str) -> None:
@@ -401,27 +386,10 @@ def whitespace_check() -> None:
         raise SystemExit("whitespace check failed (git diff --check)")
 
 
-def ensure_commit(sha: str) -> None:
-    try:
-        git("cat-file", "-e", f"{sha}^{{commit}}")
-        return
-    except subprocess.CalledProcessError:
-        pass
-    print(f"fetching missing commit {sha[:12]}", flush=True)
-    result = subprocess.run(
-        [*GIT, "fetch", "--no-tags", "--prune", "--depth=1", "origin", sha],
-        cwd=ROOT,
-        check=False,
-    )
-    if result.returncode:
-        raise SystemExit(
-            f"git object {sha} is not in this clone and could not be fetched; "
-            "use a full-history checkout (fetch-depth: 0)"
-        )
-
-
 def byte_compile() -> None:
-    targets = ["tools", "scripts", "schemas", "experiments", "docs"]
+    # Directories emptied by deletions (CSL-597) are skipped, not failed.
+    names = ("tools", "scripts", "schemas", "experiments", "docs")
+    targets = [name for name in names if (ROOT / name).is_dir()]
     print("RUN python -m compileall " + " ".join(targets), flush=True)
     result = subprocess.run(
         [sys.executable, "-m", "compileall", "-q", *targets],
@@ -440,7 +408,6 @@ def run_lightweight() -> None:
 
 
 def run_suite() -> None:
-    ensure_commit(DQ_TASK_BASE)
     run_lightweight()
     byte_compile()
     tests = suite_test_files()

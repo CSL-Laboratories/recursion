@@ -9,6 +9,9 @@ Deletion is gated: while X1_DELETION_LANDED is False the boundary must still exi
 The deletion PR (after the Nov 10 rehearsal) flips the flag; the test then stays red until every
 port oracle has a successor carrier that exists, is run by the gate and no longer references the
 boundary.
+
+CSL-578 (2026-10-29): Lucas had the legacy CLI harness deleted ahead of the rehearsal and dropped its
+five oracles (O-H1 to O-H5) without a port. The boundary is now `scripts/v3/planning/**` only.
 """
 from __future__ import annotations
 
@@ -26,8 +29,8 @@ DOC = "docs/v3/x1/RECURSION-X1-INVENTORY.md"
 
 X1_DELETION_LANDED = False
 
-BOUNDARY_CODE = ("scripts/v3/harness", "scripts/v3/planning")
-LEGACY_TEST_DIRS = ("scripts/tests/v3/harness", "scripts/tests/v3/planning")
+BOUNDARY_CODE = ("scripts/v3/planning",)
+LEGACY_TEST_DIRS = ("scripts/tests/v3/planning",)
 KEEP_PATHS = ("scripts/v3/route_adapter",)
 # CSL-495 comment 611d6aa4: "the receipt tests" are these files. Outside the boundary; kept.
 RECEIPT_TESTS = (
@@ -41,51 +44,24 @@ DISPOSITIONS = {"port", "drop", "keep"}
 # Pinned floors (M1_MIN_PROGRAMS style). Raise when the inventory grows; lowering one is a
 # reviewed decision, not a drive-by edit.
 FLOORS = {
-    "rows": 16,
-    "legacy_test_files": 10,
+    "rows": 12,
+    "legacy_test_files": 8,
     "support_modules": 2,
     "planning_fixtures": 23,
-    "harness_stream_fixtures": 5,
-    "oracles": 12,
-    "port_oracles": 10,
+    "oracles": 7,
+    "port_oracles": 5,
     "satisfied_oracles": 2,
 }
 
-# The exact boundary code set at the pre-x1 tag (base 2f1fc17e). While X1_DELETION_LANDED is
-# False the tree must match it exactly: a count cannot tell a removed module from an added one.
+# The exact boundary code set at the pre-x1 tag (base 2f1fc17e), less the harness that CSL-578
+# deleted. While X1_DELETION_LANDED is False the tree must match it exactly: a count cannot tell
+# a removed module from an added one.
 PINNED_BOUNDARY_FILES = (
-    "scripts/v3/harness/__init__.py",
-    "scripts/v3/harness/__main__.py",
-    "scripts/v3/harness/availability.py",
-    "scripts/v3/harness/clean.py",
-    "scripts/v3/harness/cli.py",
-    "scripts/v3/harness/config.py",
-    "scripts/v3/harness/context.py",
-    "scripts/v3/harness/cooldowns.py",
-    "scripts/v3/harness/doctor.py",
-    "scripts/v3/harness/errors.py",
-    "scripts/v3/harness/land.py",
-    "scripts/v3/harness/log.py",
-    "scripts/v3/harness/providers.py",
-    "scripts/v3/harness/redact.py",
-    "scripts/v3/harness/review.py",
-    "scripts/v3/harness/routing.py",
-    "scripts/v3/harness/run.py",
-    "scripts/v3/harness/state.py",
-    "scripts/v3/harness/streams.py",
-    "scripts/v3/harness/usage.py",
     "scripts/v3/planning/replay/kernel.py",
     "scripts/v3/planning/validation/canonical.py",
     "scripts/v3/planning/validation/contracts.py",
 )
 
-HARNESS_STREAM_FIXTURES = (
-    "scripts/tests/v3/harness/fixtures/claude-stream-json.txt",
-    "scripts/tests/v3/harness/fixtures/codex-cumulative.txt",
-    "scripts/tests/v3/harness/fixtures/codex-exec-jsonl.txt",
-    "scripts/tests/v3/harness/fixtures/grok-review.txt",
-    "scripts/tests/v3/harness/fixtures/grok-streaming-json.txt",
-)
 SUPPORT_MODULES = (
     "scripts/tests/v3/planning/materialize_fixtures.py",
     "scripts/tests/v3/planning/reduce_reference.py",
@@ -223,36 +199,6 @@ def oracle_status(root: Path, oracle: Oracle, run_paths: set[str]) -> str:
     return "ported"
 
 
-def legacy_name_errors(root: Path, doc_text: str, *, landed: bool) -> list[str]:
-    """Check the section 6 map against the legacy files, which exist only before deletion.
-
-    After X1_DELETION_LANDED the legacy files are gone by design; what must survive is checked
-    through the oracle register (successor file plus named successor tests).
-    """
-    if landed:
-        return []
-    if "## 6. Mixed files" not in doc_text:
-        return []
-    section = doc_text.split("## 6. Mixed files", 1)[1].split("\n## ", 1)[0]
-    errors: list[str] = []
-    current: Path | None = None
-    for line in section.splitlines():
-        head = re.match(r"`(\w+\.test\.py)`:", line)
-        if head:
-            current = root / "scripts/tests/v3/harness" / head.group(1)
-        names = re.findall(r"`(test_\w+)`", line)
-        if not names:
-            continue
-        if current is None or not current.is_file():
-            errors.append(f"section 6 names tests but the legacy file is missing: {current}")
-            continue
-        source = current.read_text(encoding="utf-8")
-        for name in names:
-            if f"def {name}(" not in source:
-                errors.append(f"{name} not in {current.name}")
-    return errors
-
-
 def collect_errors(
     root: Path,
     doc_text: str,
@@ -357,13 +303,12 @@ def collect_errors(
         "planning_fixtures": len(
             [p for p in disk if fnmatch.fnmatchcase(p, "scripts/tests/v3/planning/fixtures/F-M1A-*.json")]
         ),
-        "harness_stream_fixtures": len([p for p in HARNESS_STREAM_FIXTURES if p in disk]),
         "oracles": len(oracles),
         "port_oracles": len(port_oracles),
         "satisfied_oracles": len(satisfied),
     }
     for key, count in counts.items():
-        if landed and key in {"legacy_test_files", "support_modules", "planning_fixtures", "harness_stream_fixtures"}:
+        if landed and key in {"legacy_test_files", "support_modules", "planning_fixtures"}:
             continue
         if count < floors[key]:
             errors.append(f"floor {key}: {count} < {floors[key]}")
@@ -411,10 +356,6 @@ class InventoryFloorTests(unittest.TestCase):
         )
         self.assertEqual(len(statuses), len(oracles))
 
-    def test_summarized_test_names_exist(self) -> None:
-        errors = legacy_name_errors(ROOT, self.doc, landed=X1_DELETION_LANDED)
-        self.assertEqual(errors, [], "\n".join(errors))
-
     def test_receipt_tests_pin_matches_the_fixer_files(self) -> None:
         found = sorted(
             path.relative_to(ROOT).as_posix()
@@ -443,8 +384,8 @@ class MutationTests(unittest.TestCase):
 
     A = "scripts/tests/v3/planning/a.test.py"
     B = "scripts/tests/v3/planning/b.test.py"
-    H = "scripts/tests/v3/harness/b.test.py"
-    PIN = ("scripts/v3/harness/__init__.py", "scripts/v3/planning/__init__.py")
+    H = "scripts/tests/v3/planning/c.test.py"
+    PIN = ("scripts/v3/planning/__init__.py", "scripts/v3/planning/replay/__init__.py")
 
     DOC_TEXT = "\n".join(
         [
@@ -453,18 +394,12 @@ class MutationTests(unittest.TestCase):
             "| --- | --- | --- | --- | --- | --- |",
             "| A | `scripts/tests/v3/planning/a.test.py` | 1 | port | O-P1 | reason |",
             "| B | `scripts/tests/v3/planning/b.test.py` | 1 | drop | none | reason |",
-            "| C | `scripts/tests/v3/harness/b.test.py` | 1 | drop | none | reason |",
+            "| C | `scripts/tests/v3/planning/c.test.py` | 1 | drop | none | reason |",
             "",
             "<!-- x1-oracle-register -->",
             "| Oracle | Contract | Legacy carrier | Successor | Successor tests |",
             "| --- | --- | --- | --- | --- |",
             "| O-P1 | c | `scripts/tests/v3/planning/a.test.py` | `scripts/tests/v3/planning/a.test.py` | `run_a` |",
-            "",
-            "## 6. Mixed files: which tests carry which oracle",
-            "",
-            "`b.test.py`:",
-            "",
-            "- O-P1: `test_alpha`",
             "",
             "## 7. Floors",
             "",
@@ -484,8 +419,8 @@ class MutationTests(unittest.TestCase):
             self.A: a_body,
             self.B: "x = 1\n",
             self.H: "def test_alpha(self):\n    pass\n",
-            "scripts/v3/harness/__init__.py": "",
             "scripts/v3/planning/__init__.py": "",
+            "scripts/v3/planning/replay/__init__.py": "",
             **(extra or {}),
         }
         for rel, body in files.items():
@@ -513,7 +448,7 @@ class MutationTests(unittest.TestCase):
             floors=floors or self.ZERO_FLOORS,
             pinned=self.PIN if pinned is None else pinned,
             receipt_tests=receipt_tests,
-        ) + legacy_name_errors(root, self.DOC_TEXT, landed=landed)
+        )
 
     def test_clean_tree_is_green(self) -> None:
         self.assertEqual(self.errors(self.make_tree()), [])
@@ -523,7 +458,7 @@ class MutationTests(unittest.TestCase):
         self.assertTrue(any("receipt test is a keep-path and is missing" in e for e in errors), errors)
 
     def test_unlisted_file_is_red(self) -> None:
-        root = self.make_tree(extra={"scripts/tests/v3/harness/new.test.py": "x = 1\n"})
+        root = self.make_tree(extra={"scripts/tests/v3/planning/new.test.py": "x = 1\n"})
         self.assertTrue(any("new.test.py" in e for e in self.errors(root)))
 
     def test_deleted_legacy_test_is_red(self) -> None:
@@ -537,8 +472,8 @@ class MutationTests(unittest.TestCase):
         self.assertTrue(any("floor rows" in e for e in errors))
 
     def test_removed_boundary_module_is_red_even_if_another_is_added(self) -> None:
-        root = self.make_tree(extra={"scripts/v3/harness/new.py": ""})
-        (root / "scripts/v3/harness/__init__.py").unlink()
+        root = self.make_tree(extra={"scripts/v3/planning/new.py": ""})
+        (root / "scripts/v3/planning/replay/__init__.py").unlink()
         errors = self.errors(root)
         self.assertTrue(any("pinned boundary file is missing" in e for e in errors), errors)
         self.assertTrue(any("not in PINNED_BOUNDARY_FILES" in e for e in errors), errors)
@@ -562,11 +497,6 @@ class MutationTests(unittest.TestCase):
         for rel in (*self.PIN, self.B, self.H):
             (root / rel).unlink()
         self.assertEqual(self.errors(root, landed=True), [])
-
-    def test_before_deletion_a_missing_summary_file_is_red(self) -> None:
-        root = self.make_tree()
-        (root / self.H).unlink()
-        self.assertTrue(any("legacy file is missing" in e for e in self.errors(root)))
 
     def test_successor_without_named_test_is_not_ported(self) -> None:
         root = self.make_tree(a_body="def other():\n    return 1\n")

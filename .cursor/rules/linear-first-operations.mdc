@@ -54,13 +54,13 @@ issues and PRs.
   there, except operational contracts and runbooks that this repository's
   code, a gate or CI reads: those stay here. A file stays in this repository
   if code, a gate or CI here reads it; everything else non-public goes to the
-  vault. Existing files stay; CSL-536 will move them. The existing decision logs (`state/DECISIONS.md` and `docs/v3/DECISION-REGISTER.md`) and their founder-approved authoring process are unchanged. The only other new docs
+  vault. Existing files stay out of this repo now: CSL-536 moved the existing docs and the frozen decision logs (`state/DECISIONS.md` and `docs/v3/DECISION-REGISTER.md`, through D-044) to csl-research `contracts/recursion/history/`; they stay frozen there, and new decision records go to csl-research. The only other new docs
   allowed here are public knowledge-base, README, setup and implementation
   instructions for outside readers, and agent instruction files. If
   csl-research is not accessible, stop and post a
   blocker on the Linear issue; do not fall back to this repo.
-  `docs/v3/research-lane/`, `docs/v3/foundation-research/` and
-  `docs/v3/prompts/` are legacy and frozen; `experiments/v3/` holds only
+  The former `docs/v3/` research lanes are frozen history in csl-research;
+  `experiments/v3/` holds only
   runnable product checks. Every research pass for an issue (a) posts that
   digest and (b) appends the submission record following that repo's README,
   AGENTS.md, templates and `tools/check_submission.py`, and opens the vault PR

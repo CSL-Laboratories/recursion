@@ -20,15 +20,16 @@ the models and subscriptions they already prefer, including by reducing unnecess
 burn. It does not hold or relay provider credentials it was not explicitly granted; where
 possible it delegates to a user-authenticated tool. The comparison standard is tools like T3
 Code. "First usable release" is defined by the accepted platform release in `docs/v3/PRODUCT.md`
-(existing file; see frozen `state/DECISIONS.md` D-018…D-034). Existing `docs/v3/*` stays in
-place with its current ratification status until CSL-536. New specifications and decisions are recorded in
+(see frozen `state/DECISIONS.md` D-018…D-034). Under CSL-536 both, and the rest of the existing
+`docs/v3/*` text, moved byte for byte to csl-research `contracts/recursion/history/` with their
+current ratification status. New specifications and decisions are recorded in
 [CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research) and this
 repository only links.
 
 ## Success criteria (near term)
 
-1. **One trustworthy specification.** Existing `docs/v3/*` stays in place with its current
-   ratification status until CSL-536. It is evidence-grounded, internally consistent, and
+1. **One trustworthy specification.** The existing `docs/v3/*` text keeps its current
+   ratification status in csl-research history (CSL-536). It is evidence-grounded, internally consistent, and
    coherent enough that a new contributor can pick up a task and act on it. New
    specifications are recorded in csl-research; this repository only links.
 2. **A proven deterministic core.** The kernel and its contracts (planning, execution,

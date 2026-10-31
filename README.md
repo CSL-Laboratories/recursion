@@ -31,7 +31,7 @@ Start here:
 | Path | What it is |
 |---|---|
 | `docs/` | only the operational files this repository's code, a gate or CI reads (`docs/ci-event-contract.md`, `docs/v3/x1/`). Every other doc goes to [csl-research](https://github.com/CSL-Laboratories/csl-research) (CSL-536). |
-| `experiments/v3/` | runnable product checks only |
+| `experiments/v3/` | runnable product checks only. Earlier runs are kept as evidence in csl-research [`contracts/recursion/evidence/experiments/v3/`](https://github.com/CSL-Laboratories/csl-research/tree/d29bb4a4bec86fb6637eaa7ec3afeaab083eb0e0/contracts/recursion/evidence/experiments/v3) (CSL-596). |
 | `schemas/control-plane/v3/` | v3 contract schemas (planning, execution, integrity) |
 | `scripts/v3/` | v3 planning replay and validation |
 | `scripts/tests/v3/` | v3 M1 test programs and fixtures |

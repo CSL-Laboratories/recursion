@@ -1,9 +1,0 @@
-{
-  "execution_relative": "11fd058457ced148855ec1e31d07d310ec0b02f8/20260909T090511266800/execution.json",
-  "execution_sha256": "bcda54db4d68d05c5fd48cb176faef14d1219a15d184f3ce2c72857e81a9ebf2",
-  "source_commit": "11fd058457ced148855ec1e31d07d310ec0b02f8",
-  "factory": "ee_cases.unsigned",
-  "classification": "stipulated-valid-original-inputs",
-  "source_validity_proven": false,
-  "semantic_input_sha256": "720e5d704f2edcebe28b0ef057be32ec1261e307b23c61b152f56c85a53f3b49"
-}

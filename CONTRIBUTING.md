@@ -51,13 +51,13 @@ issues and PRs.
   there, except operational contracts and runbooks that this repository's
   code, a gate or CI reads: those stay here. A file stays in this repository
   if code, a gate or CI here reads it; everything else non-public goes to the
-  vault. Existing files stay; CSL-536 will move them. The existing decision logs (`state/DECISIONS.md` and `docs/v3/DECISION-REGISTER.md`) and their founder-approved authoring process are unchanged. The only other new docs
+  vault. Existing files stay out of this repo now: CSL-536 moved the existing docs and the frozen decision logs (`state/DECISIONS.md` and `docs/v3/DECISION-REGISTER.md`, through D-044) to csl-research `contracts/recursion/history/`; they stay frozen there, and new decision records go to csl-research. The only other new docs
   allowed here are public knowledge-base, README, setup and implementation
   instructions for outside readers, and agent instruction files. If
   csl-research is not accessible, stop and post a
   blocker on the Linear issue; do not fall back to this repo.
-  `docs/v3/research-lane/`, `docs/v3/foundation-research/` and
-  `docs/v3/prompts/` are legacy and frozen; `experiments/v3/` holds only
+  The former `docs/v3/` research lanes are frozen history in csl-research;
+  `experiments/v3/` holds only
   runnable product checks. Every research pass for an issue (a) posts that
   digest and (b) appends the submission record following that repo's README,
   AGENTS.md, templates and `tools/check_submission.py`, and opens the vault PR
@@ -89,13 +89,12 @@ Read, in order:
 
 1. [`CONTROL_PLANE.md`](CONTROL_PLANE.md) — who decides.
 2. [`ANCHOR.md`](ANCHOR.md) — what is in scope.
-3. [`docs/v3/START-HERE.md`](docs/v3/START-HERE.md) — how the v3 work is organized.
-4. [`docs/v3/RESEARCH-AGENDA.md`](docs/v3/RESEARCH-AGENDA.md) — the open research questions.
-5. [`docs/v3/RESEARCH-SCOPE.md`](docs/v3/RESEARCH-SCOPE.md) — the research lane and its gates.
+3. The Linear issue and the csl-research records it links — what to do and why.
 
-The product specifications live in `docs/v3/*.md`. Decisions live in
-`docs/v3/DECISION-REGISTER.md`. Existing files stay; CSL-536 will move them.
-New non-public docs go to
+The former v3 specifications, research and decision registers moved to csl-research
+under CSL-536, byte for byte, at
+[`contracts/recursion/history/`](https://github.com/CSL-Laboratories/csl-research/tree/f9d8526acbaf02abb227b38d88ed95e170a1f6d4/contracts/recursion/history).
+They are history, not current scope. New non-public docs go to
 [CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research)
 through a PR there, except operational contracts and runbooks that this
 repository's code, a gate or CI reads: those stay here. A file stays in
@@ -190,12 +189,12 @@ fallback lives in [When Claude can't fix a review thread](AGENTS.md#when-claude-
 ## Run a gate
 
 From the repository root, with Python 3.11+ and Git, run the gate named by your task. The
-provider-free gates that currently pass are listed in
-[`docs/v3/RESEARCH-SCOPE.md`](docs/v3/RESEARCH-SCOPE.md), for example:
+provider-free repository gate is `tools/ci_gate.py`, and a task may name a narrower
+check, for example:
 
 ```text
-python -X utf8 -B docs/v3/construction/next-work-20260914/check_handoff.py
-python -X utf8 -B experiments/v3/recovery-ledger-20260914/test_ledger.py
+python -X utf8 -B tools/ci_gate.py --force
+python -X utf8 -B tools/test_ci_gate.py
 ```
 
 On Windows, paths can exceed 260 characters; pass `-c core.longpaths=true` per Git command.

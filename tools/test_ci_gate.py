@@ -126,8 +126,6 @@ class AlwaysRunSuiteTests(unittest.TestCase):
         "CLAUDE.md",
         "CONTRIBUTING.md",
         ".claude/settings.json",
-        "config/harness.json",
-        "config/harness.schema.json",
         "docs/v3/program-control/program.json",
         "docs/v3/research-lane/followups-20261002/MANIFEST.json",
         "docs/v3/research-lane/shared-contracts-20261002/SHA256SUMS.txt",

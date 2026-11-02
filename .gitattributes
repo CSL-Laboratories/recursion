@@ -16,12 +16,3 @@ scripts/resolve-engine.py text eol=lf
 scripts/provider-egress-profiles.json text eol=lf
 scripts/capacity-pools.json text eol=lf
 scripts/engines/*.json text eol=lf
-
-# Research-lane intakes are hash-pinned: delivered bytes must survive cross-platform checkouts.
-docs/v3/research-lane/capability-composition-20261002d/** text eol=lf
-docs/v3/research-lane/ios-android-20261002/** text eol=lf
-docs/v3/research-lane/core-language-control-surfaces-20261002/** text eol=lf
-docs/v3/research-lane/packet-f-raudit-20261002/** text eol=lf
-
-# Program-control contracts are sha256-pinned in program.json: bytes must survive cross-platform checkouts.
-docs/v3/program-control/** text eol=lf

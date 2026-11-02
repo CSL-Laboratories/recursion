@@ -7,9 +7,10 @@ authority document in this repository, beneath current explicit founder decision
 the authority defined below. If another file contradicts it, this file wins and that file
 is stale.
 
-Read `ANCHOR.md` for WHY the work exists and what is in scope. Read
-[docs/v3/START-HERE.md](docs/v3/START-HERE.md) for how the product is organized.
-Existing `docs/v3/*` stays in place with its current ratification status until CSL-536.
+Read `ANCHOR.md` for WHY the work exists and what is in scope. Under CSL-536 the existing
+`docs/v3/*` text and the frozen decision log moved byte for byte, with their current
+ratification status, to csl-research
+[`contracts/recursion/history/`](https://github.com/CSL-Laboratories/csl-research/tree/f9d8526acbaf02abb227b38d88ed95e170a1f6d4/contracts/recursion/history).
 New non-public docs (research, specs, decisions, evidence and receipts, gate artifacts,
 and runbooks that aren't public) go to
 [CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research) through a PR
@@ -26,11 +27,12 @@ Conflicts resolve in this order, highest first:
 
 1. Current explicit founder decisions within the authority below; Lucas breaks disagreements
 2. `CONTROL_PLANE.md` (this file)
-3. The v3 product specifications: existing `docs/v3/*` stays in place with its current
-   ratification status until CSL-536; new specifications are recorded in
+3. The v3 product specifications: the existing `docs/v3/*` text, now in csl-research
+   `contracts/recursion/history/` with its current ratification status (CSL-536); new specifications are recorded in
    [CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research)
    and this repository only links.
-4. Decision records: existing entries in `state/DECISIONS.md` (frozen legacy log through D-044);
+4. Decision records: existing entries in the frozen legacy log through D-044 (`state/DECISIONS.md`,
+   now in csl-research history);
    new decisions are recorded in csl-research and this repository only links
 5. Implementation docs, experiments and evidence (new non-public docs go to csl-research)
 6. Runtime state
@@ -191,8 +193,8 @@ does not count.
 
 Only in a reviewed authoring session a founder explicitly approves, on a review branch.
 New decision records go to [CSL-Laboratories/csl-research](https://github.com/CSL-Laboratories/csl-research)
-through a PR there; this repository only links. `state/DECISIONS.md` is a frozen legacy log
-through D-044. Superseding an entry preserves the reason it was believed — a ruled-out
+through a PR there; this repository only links. `state/DECISIONS.md`, now in csl-research
+history, is a frozen legacy log through D-044. Superseding an entry preserves the reason it was believed — a ruled-out
 approach without its reason is a dead-end waiting to be rediscovered.
 
 D-041 records the source decisions and approval for the authority-split amendment, D-043 records

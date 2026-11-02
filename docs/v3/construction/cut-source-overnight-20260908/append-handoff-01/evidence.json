@@ -1,9 +1,0 @@
-{
-  "candidate": "50c953630c40afbc26549459205366227c5a79ff",
-  "receipt_relative_to_cache": "50c953630c40afbc26549459205366227c5a79ff/20260909T174135907672/execution.json",
-  "receipt_sha256": "3715162c9b4cd5c5e18c810ad0ed027b199921cb76886d1dcaeeec69321545c8",
-  "result_sha256": "ec5762c206379d4464848d4f60a6c4f53a89e9c29468e7da6b1bc8ca4c6f69eb",
-  "status": "LOCAL_PACKET_PASS",
-  "full_historical_gates_at_recording": 0,
-  "publication_ready_at_recording": false
-}

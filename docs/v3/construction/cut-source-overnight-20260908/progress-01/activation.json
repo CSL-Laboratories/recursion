@@ -1,7 +1,0 @@
-{
-  "receipt_relative_to_git_common": "research-attestations/cut-source-overnight/progress-01/activation-receipt.json",
-  "receipt_sha256": "79c984d19700a36fa5d52fa6a5d8e78de8aa0544f1b7717a81bd2e5aaf52540c",
-  "original_started_at": "2026-09-09T03:40:33Z",
-  "deadline_utc": "2026-09-09T15:30:00Z",
-  "clock_restart": false
-}

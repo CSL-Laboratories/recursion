@@ -33,14 +33,12 @@
 # ci-full-label.yml is unchanged and remains an explicit full request.
 #
 # Excluded from this gate (not general CI / not runnable here):
-# - tools/check_v3_orientation.py — frozen 2026-09-13 allowed-path repair
 # - docs/v3/construction/next-work-20260914/check_handoff.py — T-01 spec freeze
 #   (already fails on master: ACCEPTANCE.md changed after that packet)
 # - delegated-q check.py --mode preflight — packet-scoped source_gate (seven
 #   additive paths from TASK_BASE only)
 # - delegated-q check.py --mode execute — Owner-gated scientific admission;
 #   needs secrets, a trusted controller, and live resource observations
-# - tools/check_next_phase.py — needs Java/TLA+, not the current product suite
 #
 # PRs also run tools/perf_ci.py inside the linux-tests job. It times the
 # provider-free planning kernel against the PR base and warns above a 10%

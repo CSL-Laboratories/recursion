@@ -36,6 +36,7 @@ Start here:
 | `scripts/v3/` | v3 planning replay and validation |
 | `scripts/tests/v3/` | v3 M1 test programs and fixtures |
 | `state/` | `INBOX.md` (optional escalation) and `PROPOSALS.md` (protected-change proposals). The frozen decision log moved to csl-research history. |
+| `contract/PRODUCT.pin.json` | pin to the product contract in csl-research (repository, full commit, path, SHA-256); `tools/check_product_pin.py` checks it (CSL-585) |
 
 ## Retired
 

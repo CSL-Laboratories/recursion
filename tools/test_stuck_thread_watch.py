@@ -2798,7 +2798,7 @@ class WorkflowAndDocsTests(unittest.TestCase):
     def test_docs_point_at_the_workflow(self) -> None:
         for text in (self.agents, self.claude):
             self.assertIn("stuck-thread-watch.yml", text)
-            self.assertIn("Devin reviews", text)
+            self.assertIn("Codex reviews", text)
             self.assertIn("@codex review", text)
             self.assertIn("needs-decision", text)
             self.assertIn("Stuck PR threads: recursion#", text)

@@ -27,10 +27,9 @@ issues and PRs.
   eligible code owner can be requested and that the founders' reviews are
   independent review, not code-owner review. Both (a) the Linear @mention
   and (b) this GitHub request are required. This is mandatory for agents too.
-- **Wait for jobs before human sign-off.** Order: Devin Review runs first, then the
-  Claude fixer job (`devin-review-fix`) acts on its findings, then required
-  CI reruns on the fixer's push. No human approves or requests changes on a PR until all
-  of these have finished on the current head commit. A review on a stale head does not
+- **Wait for jobs before human sign-off.** Order: the Codex review that the Codex gate
+  requests on each non-draft head runs first, then required CI. No human approves or
+  requests changes on a PR until both have finished on the current head commit. A review on a stale head does not
   count. After new pushes, the reviewer reviews again. Review requests and their status
   are posted as @mention comments on the CSL Linear issue, and a watcher posts there when
   a PR is ready for review.
@@ -171,7 +170,7 @@ expands on this section; Cursor, Codex and Grok follow this section.
 **Scope.** This governs agents acting through a developer's account or session:
 interactive sessions, scheduled loops and Grok Bots. Repository workflows
 (`claude.yml` fixer, Codex gate, stuck-thread-watch, conflict-scan,
-linear-pr-sync and other repository workflows) and Devin automations keep the roles in
+linear-pr-sync and other repository workflows) keep the roles in
 [Review roles](#review-roles) and [Automations](#automations); their documented
 markers, receipts and audit comments are unchanged.
 
@@ -326,19 +325,19 @@ Current tools. Do not add paid services or raise spend limits.
   Start a billable run only when it keeps you under the cap, and record each run's cost in
   its research record. Same query rules as Parallel.
 - **Linear** — source of truth for work. Workspace **CSL laboratories**, team key **CSL**,
-  project **recursion**. Use the Linear MCP (`https://mcp.linear.app/mcp`) or the Devin
-  Linear integration. Declared in `.cursor/mcp.json` and `.mcp.json`.
+  project **recursion**. Use the Linear MCP (`https://mcp.linear.app/mcp`). Declared in
+  `.cursor/mcp.json` and `.mcp.json`.
 - **GitHub** — org **CSL-Laboratories**.
-- **Devin** — GitHub PR reviewer only (on PR creation and on demand). See
-  [Review roles](#review-roles).
-- **Claude Code Action** — PR fixer for Devin findings and `@claude` mentions
-  on open same-repo PRs by verified repository writers (`.github/workflows/claude.yml`).
+- **Codex** — bot PR reviewer of record since CSL-645 (Devin retires Nov 11, 2026). The
+  Codex gate requests a review on each non-draft head. See [Review roles](#review-roles).
+- **Claude Code Action** — PR fixer for `@claude` mentions on open same-repo PRs by
+  verified repository writers (`.github/workflows/claude.yml`).
 - **GitHub Actions** — only CI, on free GitHub-hosted runners (CSL-408). See [CI](#ci).
 - **Google Workspace** (`csl-laboratories.com`) — meetings and notes.
 - **Discord bot** (`csl-bot-operations`) — Liaison. Commands and MCP; see below. Trigger CI
   and reviews through these (or the `ci:full` label), not by editing config.
   - Commands: `/issue`, `/plan`, `/debug`, `/feature`, `/standup`; `/ci full|run`;
-    `/devin review pr:<url>|run|status`; `/telemetry`, `/help`, `/connect`. There is no
+    `/telemetry`, `/help`, `/connect`. There is no
     top-level `/review` and no `/ci` without an argument.
   - MCP: `https://csl-discord-bot-production.up.railway.app/mcp`, declared in
     `.cursor/mcp.json` and `.mcp.json`. Human-assigned authorization:
@@ -346,8 +345,9 @@ Current tools. Do not add paid services or raise spend limits.
     Each dev mints a bearer token via `/connect`. Never commit the token; reference it
     via env var `CSL_DISCORD_BOT_MCP_TOKEN` only.
   - Tools: `issue_create`, `issue_list`, `issue_status`, `issue_assign`, `plan`, `debug`,
-    `feature`, `standup`, `ci_full`, `ci_run`, `devin_review`, `devin_run`,
-    `devin_status`, `telemetry`.
+    `feature`, `standup`, `ci_full`, `ci_run`, `telemetry`. The bot's Devin commands
+    (`/devin`, `devin_review`, `devin_run`, `devin_status`) stop working when Devin
+    retires on Nov 11, 2026; do not use them for review.
 
 ## Linear-first workflow
 
@@ -355,7 +355,7 @@ Every change starts from a Linear issue (`CSL-N`). Be Linear-aware and proactive
 protected paths, and merge still follow `CONTROL_PLANE.md`.
 
 **Before starting.** Find or create the issue (team **CSL**, project **recursion**) via the
-Linear MCP or the Devin Linear integration. Do not start code without `CSL-N`. When you
+Linear MCP. Do not start code without `CSL-N`. When you
 start, post a claim record ([Bounded issue execution](#bounded-issue-execution-and-shared-evidence));
 the owner stays the assignee. Move the issue to **In Progress** once your claim is
 confirmed. If you stop, release with a release record.
@@ -419,18 +419,18 @@ developer and does not decide.
 - One issue per PR; keep PRs small and stackable.
 - Comment progress on the issue. If the PR does not move the issue to **In Review**, move
   it yourself.
-- Route issues with `for-devin`, `for-claude`, or `for-cursor`. Use `needs-decision` when a
+- Route issues with `for-claude` or `for-cursor`. Use `needs-decision` when a
   human direction call is needed.
 - **Shared files.** [`.github/workflows/linear-pr-sync.yml`](.github/workflows/linear-pr-sync.yml)
   upserts one Linear comment per PR, marked `<!-- pr-sync:<repo>#<n> -->` (edit in
   place, never a second comment). It shows the PR link, author, purpose, status
-  (draft/open/merged/closed), mergeable state, head SHA, Devin review on head,
+  (draft/open/merged/closed), mergeable state, head SHA, Codex review on head,
   and the top changed files. A push to the default branch refreshes every open
   PR and flags `out of date / conflicts with <default-branch>`. **Grok Bots
   must read those Linear PR-sync comments before touching shared files** —
   three people work at once. This workflow is not a required check.
-- On your own PR, address CI comments, then resolve the threads. Eligible Devin
-  findings and `@claude` mentions are handled by the Claude Code Action
+- On your own PR, address CI comments, then resolve the threads. `@claude`
+  mentions are handled by the Claude Code Action
   (`.github/workflows/claude.yml`; see [Review roles](#review-roles)). Do not
   run review-fix loops on other agents' PRs.
 - Humans make the load-bearing decisions (architecture, specs, merge order). Agents propose;
@@ -484,30 +484,28 @@ Linear is the team's primary async channel, alongside Google Meet and Discord.
 - A new `tools/test_*.py` file also needs its two `.claude/settings.json` allow rules,
   which a founder approves in the PR; the Claude fixer must not add them.
 
-Trigger CI and reviews through the Discord bot (`/ci full|run`, `/devin review
-pr:<url>|run|status`, or MCP `ci_full` / `ci_run` / `devin_review`) or the `ci:full`
-label, not by editing config.
+Trigger CI through the Discord bot (`/ci full|run`, or MCP `ci_full` / `ci_run`) or the
+`ci:full` label, not by editing config. The Codex gate requests the Codex review itself.
 
 ## Review roles
 
-- **Devin** is the only GitHub PR reviewer. It does not auto-fix.
-- **Claude Code Action** (`.github/workflows/claude.yml`) is the fixer for Devin
-  findings and `@claude` mentions. It runs only on open same-repo PRs whose
-  author has write, maintain or admin repository permission. `@claude` also
-  requires a human commenter with that permission. Association is audit-only:
-  private org members may appear as CONTRIBUTOR. Forks and nonwriters are skipped.
-  Submitted Devin bot reviews wake the fixer directly; under the PR lock it
-  refreshes the live head and reconciles unresolved, non-outdated findings,
-  including roots on older commits.
-  Codex never dispatches fixes. Every fixer shares the per-PR
+- **Codex** is the bot PR reviewer of record (CSL-645). The Codex gate
+  (`.github/workflows/codex-gate.yml`) posts one `@codex review` per non-draft head.
+  Codex does not fix and never dispatches fixes. Devin was the reviewer until it
+  retires on Nov 11, 2026; its fixer path was removed in CSL-645.
+- **Claude Code Action** (`.github/workflows/claude.yml`) is the fixer for `@claude`
+  mentions. It runs only on open same-repo PRs whose author has write, maintain or
+  admin repository permission, and only for a human commenter with that permission.
+  Association is audit-only: private org members may appear as CONTRIBUTOR. Forks and
+  nonwriters are skipped. Reviews and dispatches never start it. Every fixer shares the per-PR
   concurrency group, without cancelling an active run. Native `queue: max`
   retains up to 100 pending writers in queue-entry order; further arrivals are
   cancelled when full. This is bounded buffering, not an unlimited guarantee.
 - **Stuck-thread watch** (`.github/workflows/stuck-thread-watch.yml`) asks Codex
-  to mediate Devin threads Claude could not settle. A **MEDIATE** verdict
+  to mediate Devin threads Claude could not settle. With Devin retired it has no
+  threads to act on; its removal or retargeting is CSL-648. A **MEDIATE** verdict
   updates one Linear roll-up per PR (`Stuck PR threads: recursion#<PR>`), not
-  one issue per thread. Codex is a mediator, not a reviewer of record and not
-  a fixer: it must not push code. The workflow may auto-resolve a thread after
+  one issue per thread. As mediator Codex is not a fixer: it must not push code. The workflow may auto-resolve a thread after
   a trusted `CODEX-THREAD: RESOLVE` ruling (see [Review loop](#review-loop)).
 - **GitHub Actions** (GitHub-hosted runners) is the only CI.
 - Cursor, Codex, Grok, and interactive Claude Code develop features from Linear
@@ -515,11 +513,11 @@ label, not by editing config.
   agents' PRs, except the Codex `CODEX-GATE:` line in [Code Review Rules](#code-review-rules).
   The author agent may fix CI failures on its own PR.
 - Humans still merge (`CONTROL_PLANE.md`). Independent task gates still apply; they are not
-  a substitute for Devin PR review.
+  a substitute for Codex PR review.
 
 ## When Claude can't fix a review thread
 
-Devin reviews only and never fixes, so a thread is never handed back to Devin. Claude
+Codex reviews only and never fixes, so a thread is never handed back to Codex. Claude
 leaves the thread open, replies explaining why it couldn't fix it, and @mentions the PR
 author. If no `Stuck PR threads: recursion#<PR>` issue appears within one watcher
 cycle, the PR author files it titled `Stuck PR threads: recursion#<PR>` with
@@ -527,7 +525,9 @@ cycle, the PR author files it titled `Stuck PR threads: recursion#<PR>` with
 
 ## Review loop
 
-Devin reviews. Claude fixes (`.github/workflows/claude.yml`). If a Devin thread
+Codex reviews. Claude fixes on a human `@claude` request (`.github/workflows/claude.yml`).
+The watcher below was built for Devin threads and acts on no other threads (see
+[Review roles](#review-roles)). If a Devin thread
 stays stuck — Claude said it needs a human / could not fix, or the thread is
 still open more than six hours (configurable) after Claude's last reply —
 [`.github/workflows/stuck-thread-watch.yml`](.github/workflows/stuck-thread-watch.yml)
@@ -564,15 +564,15 @@ as the first line of the description.
 ## Code Review Rules
 
 Codex GitHub reviews route CI readiness and human mediation (CSL-102/CSL-201),
-not fixes. Devin remains reviewer of record; Devin and human requests trigger
-Claude. When ready or needing human mediation, end the Codex review with exactly one
+not fixes. Codex is the bot reviewer of record (CSL-645); only human `@claude`
+requests trigger Claude. When ready or needing human mediation, end the Codex review with exactly one
 of these lines (not in a code fence or only an inline comment):
 
 CODEX-GATE: READY
 CODEX-GATE: MEDIATE
 
 - **READY** — no fixer; apply the `ci:full` label so the full CI matrix runs.
-- **MEDIATE** — Devin and Claude are stuck; hand off to
+- **MEDIATE** — a review thread is stuck after Claude's reply; hand off to
   `.github/workflows/stuck-thread-watch.yml` for this PR. The watcher still
   applies its own stuck rules (Claude said it needs a human, or the thread
   has been open more than six hours after Claude's last reply), so a MEDIATE
@@ -583,22 +583,24 @@ If findings still need fixing without human mediation, report pending without
 a verdict. Legacy `CODEX-GATE: FIX` is ignored and produces no acted marker;
 missing verdicts never dispatch a fixer. No timeout/wait job exists. Historical
 FIX/timeout markers do not block later READY/MEDIATE. A human `@claude` mention runs the mention
-fixer immediately. There is no daily dispatch cap. The batched fixer pauses
+fixer immediately. There is no daily dispatch cap. The mention fixer pauses
 after eight Claude commits since the last human commit; other bot commits
-neither count nor reset the streak. A human commit re-arms it. Legacy
-`bypass_cap` inputs are accepted for compatibility but never bypass this guard.
+neither count nor reset the streak. A human commit re-arms it.
 
 ## Automations
 
-Devin automations (**Main CI failure fixer** and **Weekly dead-code sweep**, Wednesdays
-10 AM PT) are human-managed. Other agents must not create, edit, or trigger Devin
-automations, and must not edit Devin settings.
+Devin and its automations (**Main CI failure fixer** and **Weekly dead-code sweep**,
+Wednesdays 10 AM PT) retire on Nov 11, 2026 (Lucas, Oct 29). Until then they are
+human-managed. Other agents must not create, edit, or trigger Devin automations, and must
+not edit Devin settings.
 
 ## Post-merge
 
-- A CI failure on `master` triggers the Devin fixer, which opens a Linear Bug (run id in
-  the title) and a fix PR. The Discord bot posts the failure to the alerts channel.
-- The weekly dead-code sweep opens a Linear Chore plus a cleanup PR.
+- The Discord bot posts a CI failure on `master` to the alerts channel. Until Nov 11,
+  2026 the Devin fixer also opens a Linear Bug (run id in the title) and a fix PR; after
+  that, file the Bug yourself.
+- Until Nov 11, 2026 the weekly Devin dead-code sweep opens a Linear Chore plus a
+  cleanup PR.
 - The Discord bot sends a weekly digest of stale PRs and issues.
 
 ## Security
@@ -622,6 +624,11 @@ or the MCP server list, unless a Linear issue explicitly assigned by a human ask
 Do not add paid services or raise spend limits.
 
 ### Batched fixer retries and handled findings
+
+CSL-645 removed the batched Devin fixer jobs. The eligibility and retry rules in the
+next two paragraphs applied to that path and now apply to no live job. The receipt,
+journal and READY reconciliation rules after them still govern the Codex gate and the
+shared fixer helpers.
 
 Only unresolved, non-outdated roots from the verified Devin bot with valid
 `devin-review-comment` metadata whose kind is exactly `bug` are eligible. Missing

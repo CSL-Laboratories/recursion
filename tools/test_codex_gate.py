@@ -172,41 +172,19 @@ class AdmitResolvePrTests(unittest.TestCase):
         }
         self.assertFalse(gate.admit_resolve_pr("pull_request_review_comment", event))
 
-    def test_submitted_devin_findings_are_admitted(self) -> None:
-        for state in ("commented", "changes_requested"):
-            event = review_event(login=gate.DEVIN_REVIEW_LOGIN, body="finding")
-            event["review"]["state"] = state
-            self.assertTrue(gate.admit_resolve_pr("pull_request_review", event), state)
+    def test_reviews_never_start_the_fixer(self) -> None:
+        # CSL-645 removed the Devin review path: no review, from any identity or in
+        # any state, admits resolve-pr.
+        for login in (gate.CODEX_REVIEW_LOGIN, "devin-ai-integration[bot]", "cursor[bot]", "alice"):
+            for state in ("commented", "changes_requested", "approved"):
+                with self.subTest(login=login, state=state):
+                    event = review_event(login=login, body="finding")
+                    event["review"]["state"] = state
+                    self.assertFalse(gate.admit_resolve_pr("pull_request_review", event))
 
-    def test_review_admission_requires_exact_bot_identity_action_and_state(self) -> None:
-        cases = [
-            ("login", gate.CODEX_REVIEW_LOGIN),
-            ("login", "cursor[bot]"),
-            ("login", "devin-ai-integration"),
-            ("login", "Devin-ai-integration[bot]"),
-            ("login", "devin-ai-integration[bot] "),
-            ("type", "User"),
-            ("type", "bot"),
-            ("type", None),
-            ("action", "edited"),
-            ("action", "dismissed"),
-            ("action", None),
-            ("state", "approved"),
-            ("state", "pending"),
-            ("state", None),
-        ]
-        for key, value in cases:
-            with self.subTest(key=key, value=value):
-                event = review_event(login=gate.DEVIN_REVIEW_LOGIN, body="finding")
-                target = event if key == "action" else event["review"]
-                if key in {"login", "type"}:
-                    target = event["review"]["user"]
-                target[key] = value
-                self.assertFalse(gate.admit_resolve_pr("pull_request_review", event))
-
-    def test_dispatch_is_admitted(self) -> None:
-        self.assertTrue(gate.admit_resolve_pr("workflow_dispatch", {}))
-        self.assertTrue(gate.admit_resolve_pr("repository_dispatch", {}))
+    def test_dispatch_is_not_admitted(self) -> None:
+        self.assertFalse(gate.admit_resolve_pr("workflow_dispatch", {}))
+        self.assertFalse(gate.admit_resolve_pr("repository_dispatch", {}))
 
 
 class DecisionTests(unittest.TestCase):
@@ -275,7 +253,7 @@ class DecisionTests(unittest.TestCase):
     def test_verdict_ignores_non_codex(self) -> None:
         self.assertEqual(
             gate.decide_verdict(
-                login=gate.DEVIN_REVIEW_LOGIN,
+                login="cursor[bot]",
                 body="CODEX-GATE: FIX",
                 sha=SHA,
                 comments=[],
@@ -1006,15 +984,12 @@ class WorkflowStructureTests(unittest.TestCase):
             self.text,
         )
 
-    def test_fixer_accepts_direct_devin_and_dispatch_triggers(self) -> None:
-        start = self.fixer.index("  devin-review-fix:\n")
-        nxt = self.fixer.find("\n  ", start + 4)
-        while nxt != -1 and self.fixer[nxt + 3 : nxt + 4] in (" ", "\t"):
-            nxt = self.fixer.find("\n  ", nxt + 1)
-        job = self.fixer[start:] if nxt == -1 else self.fixer[start:nxt]
-        self.assertIn("workflow_dispatch", job)
-        self.assertIn("repository_dispatch", job)
-        self.assertIn("pull_request_review", job)
+    def test_fixer_has_no_review_or_dispatch_trigger(self) -> None:
+        # CSL-645: only human @claude comments start the fixer.
+        triggers = self.fixer.split("\npermissions:", 1)[0]
+        for name in ("pull_request_review:", "workflow_dispatch:", "repository_dispatch:", "devin"):
+            self.assertNotIn(name, triggers)
+        self.assertNotIn("  devin-review-fix:\n", self.fixer)
 
     def test_agents_code_review_rules(self) -> None:
         self.assertIn("## Code Review Rules", self.agents)

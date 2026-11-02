@@ -36,7 +36,7 @@ def load_mod():
 
 
 mod = load_mod()
-DEVIN = "devin-ai-integration[bot]"
+CODEX = "chatgpt-codex-connector[bot]"
 
 
 def cfg(**kwargs: Any) -> mod.Config:
@@ -114,21 +114,21 @@ class ParseTests(unittest.TestCase):
         self.assertIn("Do the thing.", excerpt)
         self.assertNotIn("CURSOR_AGENT", excerpt)
 
-    def test_devin_on_head_requires_matching_sha(self) -> None:
+    def test_review_on_head_requires_matching_sha(self) -> None:
         reviews = [
-            {"user": {"login": DEVIN}, "commit_id": "old", "state": "COMMENTED"},
-            {"user": {"login": DEVIN}, "commit_id": "abc123def456", "state": "COMMENTED"},
+            {"user": {"login": CODEX}, "commit_id": "old", "state": "COMMENTED"},
+            {"user": {"login": CODEX}, "commit_id": "abc123def456", "state": "COMMENTED"},
         ]
-        self.assertTrue(mod.devin_on_head(reviews, "abc123def456", DEVIN))
+        self.assertTrue(mod.review_on_head(reviews, "abc123def456", CODEX))
         self.assertTrue(
-            mod.devin_on_head(
-                [{"user": {"login": "devin-ai-integration"}, "commit_id": "abc123def456", "state": "COMMENTED"}],
+            mod.review_on_head(
+                [{"user": {"login": "chatgpt-codex-connector"}, "commit_id": "abc123def456", "state": "COMMENTED"}],
                 "abc123def456",
-                DEVIN,
+                CODEX,
             )
         )
-        self.assertFalse(mod.devin_on_head(reviews, "other", DEVIN))
-        self.assertFalse(mod.devin_on_head([], "abc123def456", DEVIN))
+        self.assertFalse(mod.review_on_head(reviews, "other", CODEX))
+        self.assertFalse(mod.review_on_head([], "abc123def456", CODEX))
 
 
 class BodyTests(unittest.TestCase):
@@ -136,7 +136,7 @@ class BodyTests(unittest.TestCase):
         body = mod.comment_body(
             pull(
                 reviews=(
-                    {"user": {"login": DEVIN}, "commit_id": "abc123def456", "state": "COMMENTED"},
+                    {"user": {"login": CODEX}, "commit_id": "abc123def456", "state": "COMMENTED"},
                 )
             ),
             cfg(),
@@ -147,7 +147,7 @@ class BodyTests(unittest.TestCase):
         self.assertIn("**Status:** open", body)
         self.assertIn("`clean`", body)
         self.assertIn("abc123def456", body)
-        self.assertIn("**Devin review on head:** yes", body)
+        self.assertIn("**Codex review on head:** yes", body)
         self.assertIn("Replace the out-of-repo watch.", body)
         self.assertIn("`.github/workflows/linear-pr-sync.yml`", body)
         self.assertIn("Linear-first (CSL-88)", body)
@@ -593,7 +593,7 @@ class HttpGuardTests(unittest.TestCase):
         self.assertLess(sum(1 for count in fetches.values() if count > 1), 15)
         self.assertLessEqual(now[0], 12.0)
 
-    def test_reviews_paginate_until_devin_on_head(self) -> None:
+    def test_reviews_paginate_until_review_on_head(self) -> None:
         pr = {
             "number": 191,
             "title": "CSL-87: x",
@@ -614,7 +614,7 @@ class HttpGuardTests(unittest.TestCase):
         ] * 100
         page2 = [
             {
-                "user": {"login": "devin-ai-integration"},
+                "user": {"login": "chatgpt-codex-connector"},
                 "commit_id": "deadbeef",
                 "state": "COMMENTED",
             }
@@ -635,7 +635,7 @@ class HttpGuardTests(unittest.TestCase):
         with mock.patch.object(client, "_request", side_effect=fake_request):
             snap = client.load_pull(191)
         assert snap is not None
-        self.assertTrue(mod.devin_on_head(list(snap.reviews), "deadbeef", DEVIN))
+        self.assertTrue(mod.review_on_head(list(snap.reviews), "deadbeef", CODEX))
 
     def test_from_env(self) -> None:
         env = {

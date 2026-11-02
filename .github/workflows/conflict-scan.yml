@@ -363,7 +363,7 @@ jobs:
         pr: ${{ fromJSON(needs.conflict-scan.outputs.prs) }}
     # CSL-414 (the CSL-377 split): per PR, trusted prepare -> untrusted model ->
     # trusted publish in claude-conflict-writer.yml. Each inner job takes the same
-    # per-PR claude-<PR> lock as the @claude/Devin writers; this caller holds no lock
+    # per-PR claude-<PR> lock as the @claude writer; this caller holds no lock
     # (a caller lock would deadlock its own inner jobs). A reusable workflow keeps
     # each PR's prepare outputs separate; matrix job outputs cannot. The caller grants
     # the callee's ceiling: only the inner publish job uses the write scopes and id-token.

@@ -12,7 +12,8 @@ on:
 
 env:
   LINEAR_TEAM_KEY: "CSL"
-  DEVIN_LOGIN: "devin-ai-integration[bot]"
+  # Bot reviewer of record since CSL-645 (Devin retired Nov 11).
+  REVIEWER_LOGIN: "chatgpt-codex-connector[bot]"
   TOP_FILES: "10"
 
 concurrency:

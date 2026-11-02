@@ -33,15 +33,15 @@ permissions:
 jobs:
   prepare:
     concurrency:
-      # Same per-PR group as the @claude/Devin fixers: serializes every Claude push to this branch.
+      # Same per-PR group as the @claude fixer: serializes every Claude push to this branch.
       group: claude-${{ inputs.pr_number }}
       # GitHub queues up to 100 pending writers; never replace a queued fixer.
       queue: max
       cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # Trusted and model-free: input, pause, staleness and Devin-race checks under the
-    # PR lock, and the recorded base commit. Reads only; no checkout.
+    # Trusted and model-free: input, pause and staleness checks under the PR lock,
+    # and the recorded base commit. Reads only; no checkout.
     permissions:
       contents: read
       pull-requests: read
@@ -53,7 +53,7 @@ jobs:
       publisher_sha: ${{ steps.prep.outputs.publisher_sha }}
       run_attempt: ${{ github.run_attempt }}
     steps:
-      - name: Recheck pause, branch and Devin review under the PR lock
+      - name: Recheck pause and branch under the PR lock
         id: prep
         env:
           GH_TOKEN: ${{ github.token }}
@@ -94,22 +94,6 @@ jobs:
             echo "proceed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # Do not race Devin: if the head is a claude[bot] commit (by author or
-          # committer, since PR code can set the author name) and Devin has not yet
-          # reviewed that exact head, wait for the review before merging base.
-          head_author="$(gh api "repos/$REPO/commits/$HEAD_SHA" --jq '[(.author.login // ""), (.commit.author.name // ""), (.committer.login // ""), (.commit.committer.name // "")] | join(" ")')"
-          case " $head_author " in
-            *" claude[bot] "*|*" claude "*)
-              devin_on_head="$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/reviews?per_page=100" \
-                --jq "[.[] | select(.user.login == \"devin-ai-integration[bot]\" and .commit_id == \"$HEAD_SHA\")] | length" \
-                | awk '{s+=$1} END {print s+0}')"
-              if [ "$devin_on_head" = "0" ]; then
-                echo "conflict-resolve: head is claude[bot] and Devin review of head is pending, skipping"
-                echo "proceed=false" >> "$GITHUB_OUTPUT"
-                exit 0
-              fi
-              ;;
-          esac
           base_sha="$(gh api "repos/$REPO/git/ref/heads/$BASE_REF" --jq '.object.sha')"
           if ! [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]] || [ "$base_sha" = "$HEAD_SHA" ]; then
             echo "conflict-resolve: base branch unreadable, skipping"

@@ -22,7 +22,7 @@ LINEAR_API = "https://api.linear.app/graphql"
 CSL_KEY_RE = re.compile(r"CSL-(\d+)")
 HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 MARKER_PREFIX = "pr-sync"
-DEVIN_DEFAULT = "devin-ai-integration[bot]"
+REVIEWER_DEFAULT = "chatgpt-codex-connector[bot]"
 TOP_FILES_DEFAULT = 10
 PURPOSE_LINES = 8
 PURPOSE_CHARS = 800
@@ -143,9 +143,9 @@ def _norm_login(value: str | None) -> str:
     return text[: -len(suffix)] if text.endswith(suffix) else text
 
 
-def devin_on_head(reviews: list[dict[str, Any]], head_sha: str, devin_login: str) -> bool:
+def review_on_head(reviews: list[dict[str, Any]], head_sha: str, reviewer_login: str) -> bool:
     want = (head_sha or "").strip().lower()
-    login = _norm_login(devin_login)
+    login = _norm_login(reviewer_login)
     if not want or not login:
         return False
     for review in reviews:
@@ -184,7 +184,7 @@ class Config:
     linear_team_key: str = "CSL"
     default_branch: str = "master"
     pr_number: int | None = None
-    devin_login: str = DEVIN_DEFAULT
+    reviewer_login: str = REVIEWER_DEFAULT
     top_files: int = TOP_FILES_DEFAULT
     dry_run: bool = False
 
@@ -209,7 +209,7 @@ class Config:
             linear_team_key=os.environ.get("LINEAR_TEAM_KEY", "CSL").strip() or "CSL",
             default_branch=os.environ.get("DEFAULT_BRANCH", "master").strip() or "master",
             pr_number=int(raw_pr) if raw_pr else None,
-            devin_login=os.environ.get("DEVIN_LOGIN", DEVIN_DEFAULT).strip() or DEVIN_DEFAULT,
+            reviewer_login=os.environ.get("REVIEWER_LOGIN", REVIEWER_DEFAULT).strip() or REVIEWER_DEFAULT,
             top_files=env_int("TOP_FILES", TOP_FILES_DEFAULT),
             dry_run=dry_run,
         )
@@ -218,7 +218,7 @@ class Config:
 def comment_body(pull: PullSnapshot, cfg: Config) -> str:
     marker = sync_marker(cfg.repo, pull.number)
     status = pr_status(state=pull.state, draft=pull.draft, merged=pull.merged)
-    on_head = "yes" if devin_on_head(list(pull.reviews), pull.head_sha, cfg.devin_login) else "no"
+    on_head = "yes" if review_on_head(list(pull.reviews), pull.head_sha, cfg.reviewer_login) else "no"
     flag = merge_flag(pull.mergeable_state, cfg.default_branch)
     files = pull.files[: cfg.top_files]
     file_lines = "\n".join(f"- `{path}`" for path in files) if files else "- _(none)_"
@@ -235,7 +235,7 @@ def comment_body(pull: PullSnapshot, cfg: Config) -> str:
         f"- **Mergeable:** `{mergeable}`\n"
         f"{flag_line}"
         f"- **Head SHA:** `{pull.head_sha}`\n"
-        f"- **Devin review on head:** {on_head}\n\n"
+        f"- **Codex review on head:** {on_head}\n\n"
         f"### Purpose\n\n{purpose}\n\n"
         f"### Top changed files\n\n{file_lines}\n"
     )
@@ -307,7 +307,7 @@ class GitHubClient:
             if not isinstance(batch, list) or not batch:
                 break
             reviews.extend(item for item in batch if isinstance(item, dict))
-            if devin_on_head(reviews, head_sha, self.cfg.devin_login):
+            if review_on_head(reviews, head_sha, self.cfg.reviewer_login):
                 break
             if len(batch) < 100:
                 break

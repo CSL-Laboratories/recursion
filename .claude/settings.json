@@ -7,7 +7,6 @@
       "Bash(python3 -X utf8 -B tools/ci_gate.py)",
       "Bash(python3 -X utf8 -B tools/ci_gate.py --force)",
       "Bash(python3 -X utf8 -B tools/ci_gate.py --paths-only)",
-      "Bash(python3 -X utf8 -B tools/ci_gate.py --paths-only)",
       "Bash(python -X utf8 -B tools/test_check_product_pin.py)",
       "Bash(python3 -X utf8 -B tools/test_check_product_pin.py)",
       "Bash(python -X utf8 -B tools/test_ci_gate.py)",

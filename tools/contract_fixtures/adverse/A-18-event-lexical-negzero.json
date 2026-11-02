@@ -1,0 +1,9 @@
+{
+  "type": "WireEventEnvelope@1",
+  "event_id": "evt:2026-10-17-0007",
+  "stream_id": "stream:goal-7f3",
+  "sequence": -0,
+  "event_type": "ArmRun.Admitted",
+  "schema_ref": "ArmAdmittedPayload@1",
+  "payload_digest": "sha256:6b37d055cf919995ede7f52359cfca64b9458b789c7745e2329ff7d34a464fea"
+}

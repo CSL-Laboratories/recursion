@@ -152,7 +152,7 @@ class IdentityTests(unittest.TestCase):
 
     def test_look_alikes_still_never_count_as_human_requests(self) -> None:
         # Bot-typed Codex identities (genuine or forged) never admit a human @claude
-        # request, and no Codex identity is admitted as a Devin finding.
+        # request, and no review from any of them starts the fixer.
         for user in (GENUINE, *(u for u in FORGED.values() if u.get("type") == "Bot")):
             with self.subTest(user=user):
                 event = {"sender": dict(user), "comment": {"body": "@claude fix", "user": dict(user)},
@@ -160,8 +160,6 @@ class IdentityTests(unittest.TestCase):
                 self.assertFalse(gate.admit_resolve_pr("issue_comment", event))
                 self.assertFalse(gate.admit_resolve_pr("pull_request_review_comment", event))
         for user in (GENUINE, *FORGED.values()):
-            if user.get("login") == gate.DEVIN_REVIEW_LOGIN:
-                continue
             with self.subTest(review=user):
                 event = review_event(user, "READY")
                 self.assertFalse(gate.admit_resolve_pr("pull_request_review", event))

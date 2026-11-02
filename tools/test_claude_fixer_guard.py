@@ -538,10 +538,10 @@ def workflow_job(text, name):
     return re.split(r"\n  (?=\S)", body, maxsplit=1)[0]
 
 
-# CSL-414 (the CSL-377 split): claude.yml's writers are a trusted prepare, an untrusted
-# model job with no push credential, and a trusted publish job that pushes.
-SPLIT_WRITERS = (("mention-prepare", "claude-mention", "mention-publish"),
-                 ("fixer-prepare", "devin-review-fix", "fixer-publish"))
+# CSL-414 (the CSL-377 split): claude.yml's writer is a trusted prepare, an untrusted
+# model job with no push credential, and a trusted publish job that pushes. CSL-645 removed
+# the Devin writer (fixer-prepare, devin-review-fix, fixer-publish); only the @claude writer remains.
+SPLIT_WRITERS = (("mention-prepare", "claude-mention", "mention-publish"),)
 # Port C: the conflict writer (called by conflict-scan.yml) has the same three stages.
 CONFLICT_WRITER = ".github/workflows/claude-conflict-writer.yml"
 CONFLICT_STAGES = ("prepare", "model", "publish")
@@ -582,11 +582,11 @@ class WorkflowTests(unittest.TestCase):
             self.assertNotIn(".base.sha", job, publish)
             self.assertNotIn("github.sha", job, publish)
             self.assertNotIn("github.workflow_sha", job, publish)
-        self.assertEqual(text.count("timeout-minutes: 20"), 2)
-        self.assertEqual(text.count("--max-turns 30"), 2)
+        self.assertEqual(text.count("timeout-minutes: 20"), len(SPLIT_WRITERS))
+        self.assertEqual(text.count("--max-turns 30"), len(SPLIT_WRITERS))
         bodies = text.split("      - id: claude\n")[1:]
-        self.assertEqual(len(bodies), 2)
-        for index, body in enumerate(bodies):
+        self.assertEqual(len(bodies), len(SPLIT_WRITERS))
+        for body in bodies:
             allow = body.split("--allowedTools", 1)[1].split("--disallowedTools", 1)[0]
             disallow = body.split("--disallowedTools", 1)[1].split("\n", 1)[0]
             self.assertNotIn("Bash(gh api", allow)
@@ -601,8 +601,7 @@ class WorkflowTests(unittest.TestCase):
             flat = " ".join(body.split("claude_args:", 1)[0].split())
             self.assertIn("PUBLISHING: you have no push access and must not try.", flat)
             # CSL-414 B': one commit, built by the workflow from the model's final tree.
-            self.assertIn(("The workflow posts them only after it has pushed your commit.",
-                           "only after it has pushed your commit and verified the live PR head.")[index], flat)
+            self.assertIn("The workflow posts them only after it has pushed your commit.", flat)
             self.assertIn("Record a commit intent only.", flat)
             self.assertIn("has no Linear, Context7 or Parallel tools", body)
 
@@ -669,7 +668,7 @@ class GuardedWriterJobTests(unittest.TestCase):
         jobs = self.jobs()
         self.assertEqual(sorted(jobs), [])
         models = self.model_jobs()
-        self.assertEqual(sorted(models), ["claude-mention", "devin-review-fix", "model"])
+        self.assertEqual(sorted(models), ["claude-mention", "model"])
         # CSL-414: every model job (the conflict writer's included) keeps the broad .git and guard denies.
         for name, job in list(jobs.items()) + list(models.items()):
             deny = job.split('"deny": [', 1)[1].split("]", 1)[0]
@@ -679,7 +678,6 @@ class GuardedWriterJobTests(unittest.TestCase):
 
     def test_writer_jobs_keep_workflow_denies_and_raw_api_disallows(self):
         workflow_deny = {"claude-mention": ('"Edit(.github/workflows/**)"', '"Write(.github/workflows/**)"'),
-                         "devin-review-fix": ('"Edit(.github/workflows/**)"', '"Write(.github/workflows/**)"'),
                          # Port C: the conflict writer's model job keeps the conflict job's wider denies.
                          "model": ('"Edit(.github/**)"', '"Write(.github/**)"', '"Edit(AGENTS.md)"', '"Write(AGENTS.md)"',
                                    '"Edit(CLAUDE.md)"', '"Write(CLAUDE.md)"', '"Edit(CODEOWNERS)"', '"Write(CODEOWNERS)"',
@@ -722,7 +720,7 @@ class GuardedWriterJobTests(unittest.TestCase):
         # needs-decision label only in conflict mode, which only the conflict writer's model job sets.
         for name in WRITER_WORKFLOWS:
             self.assertNotIn("MODEL_API_LABEL", (ROOT / ".github/workflows" / name).read_text(encoding="utf-8"), name)
-        modes = {"claude-mention": "mention", "devin-review-fix": "fixer", "model": "conflict"}
+        modes = {"claude-mention": "mention", "model": "conflict"}
         for name, job in self.model_jobs().items():
             with self.subTest(job=name):
                 install = job.split("id: outbox", 1)[1].split("<<'CLAUDE_FIXER_OUTBOX'", 1)[0]
@@ -960,18 +958,15 @@ class TerminalReceiptIntegrationTests(unittest.TestCase):
         with patch.object(m, "api", side_effect=ValueError("bad JSON")), self.assertRaises(m.AuditReadError):
             m.bounded_reader()("fixture")
 
-    def test_install_captures_context_and_workflow_uses_trusted_consumer(self):
+    def test_install_captures_context_and_only_the_publisher_embeds_receipts(self):
         text = (ROOT / ".github/workflows/claude.yml").read_text(encoding="utf-8")
-        # CSL-414: fixer-prepare runs the trusted consumer; its eligibility context reaches the
-        # model's outbox helper and the publisher only through the prepare job's output.
-        prepare = workflow_job(text, "fixer-prepare")
-        self.assertIn('cat > "$RUNNER_TEMP/claude-fixer-guard/receipts.py"', prepare)
-        self.assertIn('python3 "$RUNNER_TEMP/claude-fixer-guard/receipts.py"', prepare)
-        self.assertEqual(text.count("receipt_context: ${{ steps.eligibility.outputs.receipt_context }}"), 1)
-        self.assertEqual(text.count("RECEIPT_CONTEXT: ${{ needs.fixer-prepare.outputs.receipt_context }}"), 2)
-        for name in ("devin-review-fix", "fixer-publish"):
-            self.assertIn("RECEIPT_CONTEXT: ${{ needs.fixer-prepare.outputs.receipt_context }}", workflow_job(text, name))
-        self.assertEqual(text.count('cat > "$RUNNER_TEMP/claude-fixer-publish/receipts.py"'), 2)
+        # CSL-645: the Devin path's trusted eligibility consumer (fixer-prepare) is gone, so no job
+        # passes a receipt context; only mention-publish installs the receipt helper for its audit.
+        self.assertNotIn('"$RUNNER_TEMP/claude-fixer-guard/receipts.py"', text)
+        self.assertNotIn("receipt_context: ${{", text)
+        self.assertNotIn("RECEIPT_CONTEXT: ${{", text)
+        self.assertEqual(text.count('cat > "$RUNNER_TEMP/claude-fixer-publish/receipts.py"'), 1)
+        self.assertIn('cat > "$RUNNER_TEMP/claude-fixer-publish/receipts.py"', workflow_job(text, "mention-publish"))
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp)
             script = path / "pre-push"

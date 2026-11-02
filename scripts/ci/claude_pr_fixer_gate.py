@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Evaluate Claude PR Fixer event paths. Fail closed. Provider-free.
 
-Authorization uses the repository permission of the relevant user
-(PR author for the Devin path; PR author and comment author for @claude),
-looked up with the workflow GITHUB_TOKEN. author_association is logged only:
+Authorization uses the repository permission of the PR author and the
+@claude comment author, looked up with the workflow GITHUB_TOKEN. author_association is logged only:
 private org members are reported as CONTRIBUTOR, so it cannot authorize.
 
 Reads the GitHub event JSON and optional PR payload. Writes GitHub Actions
@@ -19,14 +18,10 @@ from typing import Any, Callable
 
 WRITE_PERMISSIONS = frozenset({"admin", "maintain", "write"})
 SAFE_LOGIN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
-DEVIN_BOT = "devin-ai-integration[bot]"
-DEVIN_STATES = frozenset({"commented", "changes_requested"})
 MENTION_EVENTS = frozenset({"issue_comment", "pull_request_review_comment"})
-DISPATCH_EVENTS = frozenset({"workflow_dispatch", "repository_dispatch"})
 MENTION_RE = re.compile(r"(?<![A-Za-z0-9_])@claude(?![A-Za-z0-9_])")
 SAFE_REF_RE = re.compile(r"^(?!.*\.\.)[A-Za-z0-9._/-]+$")
 SAFE_SHA_RE = re.compile(r"^[0-9a-f]{40}$|^[0-9a-f]{64}$")
-SAFE_PR_RE = re.compile(r"^[1-9][0-9]{0,9}$")
 PROTECTED_REFS = frozenset({"master", "main", "HEAD"})
 
 
@@ -82,16 +77,6 @@ def safe_head_sha(sha: str | None) -> str:
     return value
 
 
-def dispatch_pr_number(event_name: str, event: dict[str, Any]) -> str:
-    raw = ""
-    if event_name == "workflow_dispatch":
-        raw = str((event.get("inputs") or {}).get("pr_number") or "")
-    elif event_name == "repository_dispatch":
-        raw = str((event.get("client_payload") or {}).get("pr_number") or "")
-    text = raw.strip()
-    return text if SAFE_PR_RE.fullmatch(text) else ""
-
-
 def _head_repo(pr: dict[str, Any] | None) -> str:
     if not pr:
         return ""
@@ -105,7 +90,7 @@ def evaluate(
     pr: dict[str, Any] | None = None,
     permission_lookup: PermissionLookup | None = None,
 ) -> dict[str, str]:
-    """Return mention/devin/same_repo/head_ref/pr_number/reason plus audit fields."""
+    """Return mention/same_repo/head_ref/pr_number/reason plus audit fields."""
     lookup = permission_lookup or _no_lookup
     cache: dict[str, str] = {}
     payload = pr if pr is not None else (event.get("pull_request") or None)
@@ -113,7 +98,6 @@ def evaluate(
     if payload is None and issue.get("pull_request"):
         return {
             "mention": "false",
-            "devin": "false",
             "same_repo": "false",
             "head_ref": "",
             "head_sha": "",
@@ -153,30 +137,13 @@ def evaluate(
         if has_write(commenter_perm):
             mention = "true"
 
-    review = event.get("review") or {}
-    devin = "false"
-    if (
-        event_name == "pull_request_review"
-        and event.get("action") == "submitted"
-        and open_same_writer
-        and (review.get("user") or {}).get("login") == DEVIN_BOT
-        and (review.get("user") or {}).get("type") == "Bot"
-        and safe_head_sha(review.get("commit_id"))
-        and str(review.get("state") or "").lower() in DEVIN_STATES
-    ):
-        devin = "true"
-    elif event_name in DISPATCH_EVENTS and open_same_writer:
-        # Explicitly requested batched fixer dispatch; Codex never dispatches fixes.
-        devin = "true"
-
     return {
         "mention": mention,
-        "devin": devin,
         "same_repo": "true" if same_repo else "false",
         "head_ref": head_ref,
         "head_sha": head_sha,
         "pr_number": number,
-        "reason": "ok" if (mention == "true" or devin == "true" or same_repo) else "fork-or-skip",
+        "reason": "ok" if (mention == "true" or same_repo) else "fork-or-skip",
         "pr_author": safe_login(author),
         "pr_author_association": author_assoc,
         "pr_author_permission": author_perm,
@@ -189,7 +156,6 @@ def evaluate(
 def _skip(reason: str) -> dict[str, str]:
     return {
         "mention": "false",
-        "devin": "false",
         "same_repo": "false",
         "head_ref": "",
         "head_sha": "",
@@ -258,25 +224,6 @@ def main() -> int:
         return 0
     pr = event.get("pull_request") if isinstance(event.get("pull_request"), dict) else None
     issue = event.get("issue") if isinstance(event.get("issue"), dict) else None
-    if event_name == "pull_request_review":
-        # Event payloads may be stale by the time the runner starts.
-        raw = str((pr or {}).get("number") or "")
-        if not SAFE_PR_RE.fullmatch(raw):
-            emit(_skip("bad-pr-number"))
-            return 0
-        pr = fetch_pr(repository, int(raw))
-        if pr is None:
-            emit(_skip("pr-fetch-failed"))
-            return 0
-    if pr is None and event_name in DISPATCH_EVENTS:
-        raw = dispatch_pr_number(event_name, event)
-        if not raw:
-            emit(_skip("bad-pr-number"))
-            return 0
-        pr = fetch_pr(repository, int(raw))
-        if pr is None:
-            emit(_skip("pr-fetch-failed"))
-            return 0
     if pr is None and issue and issue.get("pull_request"):
         try:
             number = int(issue.get("number"))

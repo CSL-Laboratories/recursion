@@ -317,39 +317,20 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(len(m.receipts.findings(self.threads, self.comments)), 1)
         self.assertEqual(m.receipts.attempt_count(self.history, m.receipts.attempt_key("b" * 40, self.items)), 0)
 
-    def test_workflow_emits_context_from_actual_locked_eligibility_and_embeds_consumer(self):
-        import re
+    def test_workflow_embeds_consumer_and_has_no_devin_fixer_attempt_step(self):
         import textwrap
         text = (ROOT / ".github/workflows/claude.yml").read_text(encoding="utf-8")
-        self.assertEqual(text.count('name: "Fixer attempt ${{ needs.fixer-prepare.outputs.attempt_key }}"'), 1)
+        # CSL-645: the Devin fixer (fixer-prepare's locked eligibility and devin-review-fix's
+        # "Fixer attempt" context step) was removed; the one remaining receipts embed (the
+        # mention publisher's) still matches its source byte for byte.
+        self.assertNotIn(m.CONTEXT_PREFIX, text)
+        self.assertNotIn("\n  devin-review-fix:\n", text)
+        self.assertNotIn("\n  fixer-prepare:\n", text)
+        self.assertEqual(text.count("<<'CLAUDE_FIXER_RECEIPTS'\n"), 1)
         embedded = textwrap.dedent(text.split("<<'CLAUDE_FIXER_RECEIPTS'\n")[1].split("          CLAUDE_FIXER_RECEIPTS")[0]).rstrip()
         self.assertEqual(embedded, (ROOT / "scripts/ci/claude_fixer_receipts.py").read_text().rstrip())
-        # Parse the supported indentation/step schema without adding a YAML
-        # dependency to the existing standard-library-only event-path job.
-        job = re.split(r"\n  [A-Za-z0-9_-]+:\n", text.split("\n  devin-review-fix:\n", 1)[1])[0]
-        header, steps_text = job.split("    steps:\n", 1)
-        self.assertNotRegex(header, r"(?m)^    (name|strategy|uses):")
-        steps = re.split(r"(?m)^      - ", steps_text)[1:]
-        action = [(i, s) for i, s in enumerate(steps) if f"        uses: {m.ACTION_USES}" in s]
-        context = [(i, s) for i, s in enumerate(steps) if s.startswith('name: "Fixer attempt ${{ needs.fixer-prepare.outputs.attempt_key }}"\n')]
-        # CSL-414: locked eligibility moved to the trusted fixer-prepare job; the model job
-        # keeps the devin-review-fix name and its context step before the action step.
-        prepare = re.split(r"\n  [A-Za-z0-9_-]+:\n", text.split("\n  fixer-prepare:\n", 1)[1])[0]
-        eligibility = [s for s in re.split(r"(?m)^      - ", prepare.split("    steps:\n", 1)[1])[1:]
-                       if "        id: eligibility\n" in s or s.startswith("id: eligibility\n")]
-        self.assertIn("attempt_key: ${{ steps.eligibility.outputs.attempt_key }}", prepare)
-        self.assertFalse([s for s in steps if "id: eligibility" in s])
-        self.assertIn("needs: [resolve-pr, fixer-prepare]", header)
-        self.assertEqual(len(action), 1)
-        self.assertEqual(len(context), 1)
-        self.assertEqual(len(eligibility), 1)
-        self.assertTrue(action[0][1].startswith("id: claude\n"))
-        self.assertIn("path_to_claude_code_executable: /opt/csl-claude/2.1.306/claude", action[0][1])
-        self.assertIn("DISABLE_UPDATES", action[0][1])
         self.assertRegex(m.ACTION_USES, r"\Aanthropics/claude-code-action@[0-9a-f]{40}\Z")
-        self.assertNotRegex(action[0][1], r"(?m)^        name:")
-        self.assertIn("        id: outbox\n", context[0][1])
-        self.assertLess(context[0][0], action[0][0])
+        self.assertIn(f"        uses: {m.ACTION_USES}", text)
         watcher = (ROOT / ".github/workflows/stuck-thread-watch.yml").read_text()
         self.assertIn("contents: read", watcher)
         self.assertIn("GH_TOKEN: ${{ github.token }}", watcher)

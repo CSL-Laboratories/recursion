@@ -3389,8 +3389,8 @@ class FrozenDenyTests(unittest.TestCase):
               "Edit(~/.config/git/**)", "Write(~/.config/git/**)", "Read(~/.claude/**)"]
 
     def test_deny_lists_are_unchanged(self):
+        # CSL-645: devin-review-fix was removed with the Devin path; the remaining model jobs keep theirs.
         for workflow, job, expected in (("claude.yml", "claude-mention", self.CLAUDE_YML),
-                                        ("claude.yml", "devin-review-fix", self.CLAUDE_YML),
                                         ("claude-conflict-writer.yml", "model", self.WRITER)):
             with self.subTest(job=job):
                 action = [s for s in jobs(workflow)[job]["steps"] if s.get("id") == "claude"][0]
@@ -3747,12 +3747,12 @@ RECEIPTS_STEP = "Install trusted receipt helper"
 SNAPSHOT_LINE = ('          if result="$(env -i /usr/bin/python3 -I "$RUNNER_TEMP/claude-fixer-guard/model-api" snapshot '
                  '"$out" /usr/bin/git)"; then').strip()
 # CSL-414: every Claude writer is split (Port B: claude.yml; Port C: the conflict writer).
+# CSL-645: the Devin writer (fixer-prepare, devin-review-fix, fixer-publish) was removed.
 PIPELINES = {
-    "claude.yml": [("mention-prepare", "claude-mention", "mention-publish", "claude-${{ needs.resolve-pr.outputs.pr_number }}"),
-                   ("fixer-prepare", "devin-review-fix", "fixer-publish", "claude-${{ needs.resolve-pr.outputs.pr_number }}")],
+    "claude.yml": [("mention-prepare", "claude-mention", "mention-publish", "claude-${{ needs.resolve-pr.outputs.pr_number }}")],
     "claude-conflict-writer.yml": [("prepare", "model", "publish", "claude-${{ inputs.pr_number }}")],
 }
-WRITER_MODES = {"mention-publish": "mention", "fixer-publish": "fixer", "publish": "conflict"}
+WRITER_MODES = {"mention-publish": "mention", "publish": "conflict"}
 
 
 def step(job, name):
@@ -3804,12 +3804,18 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertIn("-- reply ROOT_COMMENT_ID BODY_FILE", prompt)
         self.assertIn("A reply accepts only a root review-comment ID on this PR", prompt)
 
-    def test_conflict_writer_devin_race_check_reads_author_and_committer(self):
-        text = (ROOT / ".github/workflows/claude-conflict-writer.yml").read_text(encoding="utf-8")
-        lines = [l for l in text.splitlines() if l.strip().startswith('head_author="$(gh api')]
-        self.assertEqual(len(lines), 1)
-        for field in ("(.author.login", "(.commit.author.name", "(.committer.login", "(.commit.committer.name"):
-            self.assertIn(field, lines[0])
+    def test_conflict_writer_prepare_does_no_review_or_commit_lookup(self):
+        # CSL-645: with no Devin fixer there is no race to wait for, so the conflict writer's prepare
+        # reads only the PR, its base ref and the default branch: no review or commit lookup.
+        prep = [s for s in jobs("claude-conflict-writer.yml")["prepare"]["steps"] if s.get("id") == "prep"][0]
+        self.assertEqual(prep["name"], "Recheck pause and branch under the PR lock")
+        endpoints = re.findall(r'gh api (?:--\S+ )*"([^"]+)"', prep["run"])
+        self.assertEqual(endpoints, ["repos/$REPO/pulls/$PR_NUMBER", "repos/$REPO/pulls/$PR_NUMBER",
+                                     "repos/$REPO/git/ref/heads/$BASE_REF", "repos/$REPO",
+                                     "repos/$REPO/git/ref/heads/${default_branch}"])
+        self.assertEqual(prep["run"].count("gh api"), len(endpoints))
+        for gone in ("/reviews", "/commits/", "devin", "Devin", "head_author"):
+            self.assertNotIn(gone, prep["run"], gone)
 
     def pipelines(self):
         for name, triples in PIPELINES.items():
@@ -4130,12 +4136,13 @@ class WorkflowWiringTests(unittest.TestCase):
                    "CLAUDE_FIXER_RECEIPTS": "claude_fixer_receipts.py", "CLAUDE_FIXER_GUARD": "claude_fixer_guard.py",
                    "CLAUDE_DENIALS_REPORT": "claude_denials.py", "CLAUDE_PR_FIXER_GATE": "claude_pr_fixer_gate.py",
                    "CLAUDE_CONFLICT_SCAN": "claude_conflict_scan.py"}
-        # Receipts: mention-publish, fixer-prepare's eligibility and fixer-publish, plus the conflict
-        # writer's publish (its publisher loads the consumer; conflict mode writes no receipts). Port C
+        # Receipts: mention-publish plus the conflict writer's publish (its publisher loads the consumer;
+        # conflict mode writes no receipts). CSL-645 removed the Devin writer's copies (fixer-prepare's
+        # eligibility, devin-review-fix's outbox and denials, fixer-publish's receipts). Port C
         # removes the pre-push guard from every workflow; its source and unit tests stay until Port D.
-        expected = {("claude.yml", "CLAUDE_FIXER_PUBLISH"): 0, ("claude.yml", "CLAUDE_FIXER_OUTBOX"): 2,
-                    ("claude.yml", "CLAUDE_FIXER_RECEIPTS"): 3,
-                    ("claude.yml", "CLAUDE_DENIALS_REPORT"): 2, ("claude.yml", "CLAUDE_PR_FIXER_GATE"): 1,
+        expected = {("claude.yml", "CLAUDE_FIXER_PUBLISH"): 0, ("claude.yml", "CLAUDE_FIXER_OUTBOX"): 1,
+                    ("claude.yml", "CLAUDE_FIXER_RECEIPTS"): 1,
+                    ("claude.yml", "CLAUDE_DENIALS_REPORT"): 1, ("claude.yml", "CLAUDE_PR_FIXER_GATE"): 1,
                     ("claude-conflict-writer.yml", "CLAUDE_FIXER_PUBLISH"): 0,
                     ("claude-conflict-writer.yml", "CLAUDE_FIXER_OUTBOX"): 1,
                     ("claude-conflict-writer.yml", "CLAUDE_FIXER_RECEIPTS"): 1,
@@ -4181,21 +4188,18 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertEqual(publish["BASE_SHA"], "${{ needs.prepare.outputs.base_sha }}")
         self.assertEqual(publish["WRITER_MODE"], "conflict")
         self.assertNotIn("RECEIPT_CONTEXT", publish)  # conflict mode has no receipts
-        self.assertEqual(step(jobs("claude.yml")["fixer-publish"], PUBLISH_STEP)["env"]["RECEIPT_CONTEXT"],
-                         "${{ needs.fixer-prepare.outputs.receipt_context }}")
         self.assertNotIn("RECEIPT_CONTEXT", step(jobs("claude.yml")["mention-publish"], PUBLISH_STEP)["env"])
 
-    def test_receipt_context_flows_from_prepare_to_model_and_publish_only(self):
+    def test_no_writer_step_is_handed_a_receipt_context(self):
+        # CSL-645: only the removed Devin writer (fixer-prepare -> devin-review-fix -> fixer-publish)
+        # carried a receipt context; no remaining claude.yml job produces or receives one.
         all_jobs = jobs("claude.yml")
-        prepare = all_jobs["fixer-prepare"]
-        self.assertEqual(prepare["outputs"]["receipt_context"], "${{ steps.eligibility.outputs.receipt_context }}")
-        self.assertEqual(prepare["outputs"]["attempt_key"], "${{ steps.eligibility.outputs.attempt_key }}")
-        outbox = [s for s in all_jobs["devin-review-fix"]["steps"] if s.get("id") == "outbox"][0]
-        self.assertEqual(outbox["name"], "Fixer attempt ${{ needs.fixer-prepare.outputs.attempt_key }}")
-        self.assertEqual(outbox["env"]["RECEIPT_CONTEXT"], "${{ needs.fixer-prepare.outputs.receipt_context }}")
-        self.assertEqual(outbox["env"]["WRITER_MODE"], "fixer")
-        self.assertEqual(step(all_jobs["fixer-publish"], PUBLISH_STEP)["env"]["RECEIPT_CONTEXT"],
-                         "${{ needs.fixer-prepare.outputs.receipt_context }}")
+        for job_name, job in all_jobs.items():
+            self.assertNotIn("receipt_context", job.get("outputs") or {}, job_name)
+            self.assertNotIn("attempt_key", job.get("outputs") or {}, job_name)
+            for item in job.get("steps") or []:
+                self.assertNotIn("RECEIPT_CONTEXT", item.get("env") or {}, (job_name, item.get("name")))
+                self.assertFalse(str(item.get("name") or "").startswith("Fixer attempt"), (job_name, item.get("name")))
         self.assertNotIn("RECEIPT_CONTEXT", step(all_jobs["mention-publish"], PUBLISH_STEP)["env"])
         mention_outbox = [s for s in all_jobs["claude-mention"]["steps"] if s.get("id") == "outbox"][0]
         self.assertNotIn("RECEIPT_CONTEXT", mention_outbox["env"])
@@ -4208,24 +4212,21 @@ class WorkflowWiringTests(unittest.TestCase):
             for item in job["steps"]:
                 self.assertNotIn("RECEIPT_CONTEXT", item.get("env") or {}, (job_name, item.get("name")))
 
-    def test_devin_prepare_skips_drafts_before_any_reservation(self):
-        cap = [s for s in jobs("claude.yml")["fixer-prepare"]["steps"] if s.get("id") == "cap"][0]["run"]
-        draft = cap.index("if ! jq -e '.draft == false' <<< \"$current_pr\" >/dev/null; then")
-        self.assertLess(cap.index("pause=\"\""), draft)
-        self.assertLess(draft, cap.index("commits=\"$(gh api --paginate"))
+    def test_mention_prepare_does_not_skip_drafts(self):
         live = [s for s in jobs("claude.yml")["mention-prepare"]["steps"] if s.get("id") == "live"][0]["run"]
         self.assertNotIn(".draft", live)  # a human @claude mention may act on a draft
 
     def test_every_claude_yml_action_use_is_pinned_and_equals_the_escalation_binding(self):
-        # CSL-414: the exhausted-fixer escalation names the action step "Run <uses>", so both
-        # claude.yml model jobs must use exactly its pinned ACTION_USES (v1.0.256, as CSL-412).
+        # CSL-414: the exhausted-fixer escalation names the action step "Run <uses>", so the
+        # claude.yml model job must use exactly its pinned ACTION_USES (v1.0.256, as CSL-412).
+        # CSL-645: claude-mention is the only claude.yml model job left.
         escalation = load("fixer_failure_escalation", "scripts/ci/fixer_failure_escalation.py")
         self.assertRegex(escalation.ACTION_USES, r"^anthropics/claude-code-action@[0-9a-f]{40}$")
         text = WORKFLOWS["claude.yml"].read_text(encoding="utf-8")
         uses = re.findall(r"(?m)^\s*(?:-\s+)?uses:\s*(anthropics/claude-code-action@[0-9a-f]{40})", text)
-        self.assertEqual(uses, [escalation.ACTION_USES] * 2)
-        self.assertEqual(text.count("anthropics/claude-code-action@"), 2)
-        for name in ("claude-mention", "devin-review-fix"):
+        self.assertEqual(uses, [escalation.ACTION_USES])
+        self.assertEqual(text.count("anthropics/claude-code-action@"), 1)
+        for name in ("claude-mention",):
             action = [s for s in jobs("claude.yml")[name]["steps"] if s.get("id") == "claude"]
             self.assertEqual([s["uses"] for s in action], [escalation.ACTION_USES], name)
 
@@ -4236,7 +4237,7 @@ class WorkflowWiringTests(unittest.TestCase):
         counts = {name: path.read_text(encoding="utf-8").count("anthropics/claude-code-action@")
                   for name, path in WORKFLOWS.items()}
         self.assertEqual({name: n for name, n in counts.items() if n},
-                         {"claude.yml": 2, "claude-conflict-writer.yml": 1})
+                         {"claude.yml": 1, "claude-conflict-writer.yml": 1})
         text = WORKFLOWS["claude-conflict-writer.yml"].read_text(encoding="utf-8")
         uses = re.findall(r"(?m)^\s*(?:-\s+)?uses:\s*(anthropics/claude-code-action@[0-9a-f]{40})", text)
         self.assertEqual(uses, [escalation.ACTION_USES])
@@ -4314,7 +4315,9 @@ class TrustedPublisherLoadTests(unittest.TestCase):
             result.output = (result.stdout or "") + (result.stderr or "")
             return result, calls, comment
 
-    def test_three_publish_steps_share_one_thin_call(self):
+    def test_both_publish_steps_share_one_thin_call(self):
+        # CSL-645: mention-publish and the conflict writer's publish (fixer-publish was removed).
+        self.assertEqual(sum(len(triples) for triples in PIPELINES.values()), 2)
         self.publish_run()
 
     def test_stacked_base_still_loads_the_recorded_default_branch_sha(self):

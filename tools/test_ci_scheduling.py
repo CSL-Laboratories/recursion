@@ -616,7 +616,7 @@ class ClassifierTests(unittest.TestCase):
         self.assertTrue(self.decide(sha, ["docs/x.md"], missing=True))
 
 # CSL-416 (CSL-255 exit criterion 5): a static guard on the admission surface of the Claude
-# writers. The fixer and `@claude` jobs (`claude.yml`) and the conflict resolver
+# writers. The `@claude` jobs (`claude.yml`; the Devin fixer was removed in CSL-645) and the conflict resolver
 # (`conflict-scan.yml`, which calls `claude-conflict-writer.yml` per PR) reach CI only through the
 # `synchronize` of their own push: no CI dispatch,
 # re-run, ready-for-review or CI-label add (the only CI-label write is revoking a gate-owned
@@ -631,13 +631,11 @@ class ClassifierTests(unittest.TestCase):
 # tools/test_claude_pr_fixer.py, which the fixer workflow runs.
 CROSSLANE_WORKFLOWS = ROOT / ".github" / "workflows"
 CROSSLANE_WRITER_FILES = ("claude.yml", "conflict-scan.yml", "claude-conflict-writer.yml")
-CROSSLANE_ALL_JOBS = {"claude.yml": {"resolve-pr", "event-paths", "mention-prepare", "claude-mention", "mention-publish",
-                                     "fixer-prepare", "devin-review-fix", "fixer-publish"},
+CROSSLANE_ALL_JOBS = {"claude.yml": {"resolve-pr", "event-paths", "mention-prepare", "claude-mention", "mention-publish"},
                       "conflict-scan.yml": {"conflict-scan", "conflict-resolve"},
                       "claude-conflict-writer.yml": {"prepare", "model", "publish"}}
 # Every writer stage takes the shared per-PR lock: GitHub releases it between jobs.
-CROSSLANE_WRITER_JOBS = {"claude.yml": ("mention-prepare", "claude-mention", "mention-publish",
-                                        "fixer-prepare", "devin-review-fix", "fixer-publish"),
+CROSSLANE_WRITER_JOBS = {"claude.yml": ("mention-prepare", "claude-mention", "mention-publish"),
                          "claude-conflict-writer.yml": ("prepare", "model", "publish")}
 # Reusable-workflow callers: (workflow, job) -> called writer file. A caller runs no steps and
 # takes no lock (it would deadlock the callee's jobs, which each take the per-PR lock).
@@ -645,8 +643,7 @@ CROSSLANE_CALLERS = {("conflict-scan.yml", "conflict-resolve"): "claude-conflict
 # Model jobs that hold a granted push: none since Port C. Kept so a new one must be reviewed here.
 CROSSLANE_PUSH_MODEL_JOBS: dict[str, tuple[str, ...]] = {}
 # CSL-414 split stages: (trusted prepare, untrusted model, trusted publish).
-CROSSLANE_SPLIT = {"claude.yml": (("mention-prepare", "claude-mention", "mention-publish"),
-                                  ("fixer-prepare", "devin-review-fix", "fixer-publish")),
+CROSSLANE_SPLIT = {"claude.yml": (("mention-prepare", "claude-mention", "mention-publish"),),
                    "claude-conflict-writer.yml": (("prepare", "model", "publish"),)}
 CROSSLANE_PREPARE_JOBS = {name: tuple(s[0] for s in stages) for name, stages in CROSSLANE_SPLIT.items()}
 CROSSLANE_MODEL_JOBS = {name: tuple(s[1] for s in stages) for name, stages in CROSSLANE_SPLIT.items()}
@@ -1073,12 +1070,8 @@ class CrossLaneAdmissionTests(unittest.TestCase):
                 self.assertIn("CLAUDE_FIXER_PAUSE: ${{ vars.CLAUDE_FIXER_PAUSE }}", blocks[publish])
                 self.assertIn('PAUSE_LABELS = frozenset({"claude:pause", "hold"})',
                               CROSSLANE_PUBLISHER.read_text(encoding="utf-8"))
-        # The eight-commit guard: shell skip in the @claude path, eligibility check in the Devin path.
+        # The eight-commit guard: shell skip in the @claude path (CSL-645 removed the Devin path).
         self.assertIn('if [ "$count" -ge 8 ]; then', blocks["mention-prepare"])
-        self.assertIn("LOOP_COMMIT_COUNT: ${{ steps.cap.outputs.loop_commit_count }}", blocks["fixer-prepare"])
-        self.assertIn("if int(count) >= 8:", blocks["fixer-prepare"])
-        # The Devin path reserves at most three automatic attempts per head and finding set.
-        self.assertEqual(re.findall(r"^\s*MAX_ATTEMPTS = (\d+)$", blocks["fixer-prepare"], re.MULTILINE), ["3"])
         self.assertNotRegex(_crosslane_text("claude.yml"), r"MAX_ATTEMPTS = (?!3\b)")
         # The conflict resolver: one push per run, started by scheduled or manual scans only, paused like the rest.
         # Port C: the caller runs the split writer; its prepare checks the pause before anything else

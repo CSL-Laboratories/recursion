@@ -24,11 +24,9 @@ CI_FULL_LABEL = "ci:full"
 MEDIATE_WORKFLOW = "stuck-thread-watch.yml"
 GATE_MARKER_PREFIX = "codex-gate"
 ACTED_PREFIX = "codex-gate-acted"
-DEVIN_REVIEW_LOGIN = "devin-ai-integration[bot]"
 CODEX_REVIEW_LOGIN = "chatgpt-codex-connector[bot]"
 # Codex GitHub App bot user id, verified from genuine Codex reviews.
 CODEX_REVIEW_ID = 199175422
-DISPATCH_EVENTS = frozenset({"workflow_dispatch", "repository_dispatch"})
 MENTION_EVENTS = frozenset({"issue_comment", "pull_request_review_comment"})
 VERDICT_RE = re.compile(r"^CODEX-GATE:\s*(FIX|READY|MEDIATE)\s*$", re.MULTILINE)
 SAFE_SHA_RE = re.compile(r"^[0-9a-f]{40}$|^[0-9a-f]{64}$")
@@ -112,20 +110,9 @@ def bodies_have(marker: str, bodies: list[str]) -> bool:
 def admit_resolve_pr(event_name: str, event: dict[str, Any]) -> bool:
     """Mirror of the claude.yml resolve-pr job-level `if:`.
 
-    Skipped events must not allocate a runner. Allow only human @claude comments
-    and fixer dispatch events, plus submitted findings from the exact Devin bot.
+    Skipped events must not allocate a runner. Allow only human @claude comments.
+    Reviews and dispatches never start the fixer (the Devin path was removed, CSL-645).
     """
-    if event_name in DISPATCH_EVENTS:
-        return True
-    if event_name == "pull_request_review":
-        review = event.get("review") or {}
-        user = review.get("user") or {}
-        return (
-            event.get("action") == "submitted"
-            and user.get("login") == DEVIN_REVIEW_LOGIN
-            and is_bot_type(user.get("type"))
-            and review.get("state") in {"commented", "changes_requested"}
-        )
     sender = event.get("sender") or {}
     if event_name in MENTION_EVENTS:
         if event_name == "issue_comment" and not (event.get("issue") or {}).get("pull_request"):
@@ -149,9 +136,9 @@ def request_comment_body(sha: str) -> str:
         "CODEX-GATE: READY\n"
         "CODEX-GATE: MEDIATE\n\n"
         "- READY: no fixer; the `ci:full` label should be applied.\n"
-        "- MEDIATE: Devin and Claude are stuck; hand off to stuck-thread-watch.\n\n"
+        "- MEDIATE: a review thread is stuck after Claude's reply; hand off to stuck-thread-watch.\n\n"
         "If findings still need fixing without human mediation, report pending without a verdict.\n"
-        "Only Devin and human requests trigger fixes. Do not push, merge, or resolve threads.\n"
+        "Only human requests to Claude trigger fixes. Do not push, merge, or resolve threads.\n"
     )
 
 

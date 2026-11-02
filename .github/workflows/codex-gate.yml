@@ -1,5 +1,5 @@
 # Codex routes READY to ci:full and MEDIATE to stuck-thread-watch.
-# Devin and human requests alone trigger fixes. Missing/FIX verdicts do nothing.
+# Only human @claude requests trigger fixes. Missing/FIX verdicts do nothing.
 # Writes use CODEX_TRIGGER_PAT; missing PAT skips without printing secrets.
 name: Codex CI/mediation gate
 

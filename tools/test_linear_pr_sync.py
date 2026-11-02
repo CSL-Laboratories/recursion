@@ -120,9 +120,25 @@ class ParseTests(unittest.TestCase):
             {"user": {"login": CODEX}, "commit_id": "abc123def456", "state": "COMMENTED"},
         ]
         self.assertTrue(mod.review_on_head(reviews, "abc123def456", CODEX))
-        self.assertTrue(
+        # The bare alias is an ordinary user login, not the Codex App.
+        self.assertFalse(
             mod.review_on_head(
                 [{"user": {"login": "chatgpt-codex-connector"}, "commit_id": "abc123def456", "state": "COMMENTED"}],
+                "abc123def456",
+                CODEX,
+            )
+        )
+        # A [bot] login whose REST type is not Bot does not count either.
+        self.assertFalse(
+            mod.review_on_head(
+                [{"user": {"login": CODEX, "type": "User"}, "commit_id": "abc123def456", "state": "COMMENTED"}],
+                "abc123def456",
+                CODEX,
+            )
+        )
+        self.assertTrue(
+            mod.review_on_head(
+                [{"user": {"login": CODEX, "type": "Bot"}, "commit_id": "abc123def456", "state": "COMMENTED"}],
                 "abc123def456",
                 CODEX,
             )
@@ -614,7 +630,7 @@ class HttpGuardTests(unittest.TestCase):
         ] * 100
         page2 = [
             {
-                "user": {"login": "chatgpt-codex-connector"},
+                "user": {"login": CODEX, "type": "Bot"},
                 "commit_id": "deadbeef",
                 "state": "COMMENTED",
             }

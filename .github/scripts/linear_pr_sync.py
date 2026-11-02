@@ -138,9 +138,9 @@ def purpose_excerpt(body: str, *, max_lines: int = PURPOSE_LINES, max_chars: int
 
 
 def _norm_login(value: str | None) -> str:
-    text = (value or "").strip().casefold()
-    suffix = "[bot]"
-    return text[: -len(suffix)] if text.endswith(suffix) else text
+    # GitHub logins are case-insensitive. The "[bot]" suffix is kept: a bare
+    # alias like "chatgpt-codex-connector" is an ordinary user, not the App.
+    return (value or "").strip().casefold()
 
 
 def review_on_head(reviews: list[dict[str, Any]], head_sha: str, reviewer_login: str) -> bool:
@@ -148,9 +148,12 @@ def review_on_head(reviews: list[dict[str, Any]], head_sha: str, reviewer_login:
     login = _norm_login(reviewer_login)
     if not want or not login:
         return False
+    want_bot = login.endswith("[bot]")
     for review in reviews:
         user = review.get("user") or {}
         if _norm_login(user.get("login")) != login:
+            continue
+        if want_bot and "type" in user and user.get("type") != "Bot":
             continue
         commit = (review.get("commit_id") or "").strip().lower()
         state = (review.get("state") or "").upper()

@@ -7,8 +7,8 @@ live-capable. It stacks on the AT1 fake driver in `scripts/v3/route_adapter/`
 ## What it is
 
 - `scripts/v3/route_contract/schema.json` (generated; kept next to the
-  package so `schemas/` stays a protected path) projects the
-  frozen M1B shapes `RouteCapabilityDescriptor@1`, `RouteRequirement@1`,
+  package) projects the frozen M1B shapes
+  `RouteCapabilityDescriptor@1`, `RouteRequirement@1`,
   `SandboxDescriptor@1`, `ProcessRequirement@1`, `ProcessCapabilityDescriptor@1`
   and `ProcessTerminationObservation@1` byte for byte from
   `schemas/control-plane/v3/execution/schema.json`. It adds five draft records:

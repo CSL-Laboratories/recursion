@@ -165,7 +165,7 @@ See [AGENTS.md#when-claude-cant-fix-a-review-thread](AGENTS.md#when-claude-cant-
   Until rulesets enforce it, no founder merges their own PR without another founder's
   approval.
 - Keep changes inside your declared allowed paths. `CONTROL_PLANE.md`, `ANCHOR.md`,
-  `state/DECISIONS.md`, `schemas/` and `.env` are protected paths — a change
+  `state/DECISIONS.md` and `.env` are protected paths — a change
   there needs a separately recorded founder-approved authoring session under
   `CONTROL_PLANE.md`, not a product PR. Option B (D-042). The core rule is CSL-117
   ruling `e59021c7-3a77-445f-a04c-832cf1e5fe46`. Fixtures are from the CSL-117 brief

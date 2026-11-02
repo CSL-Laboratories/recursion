@@ -3121,6 +3121,33 @@ class LateMarkerGitTests(FlowCase):
         self.package()
         self.assertIn("refused: conflicted path has a working-tree-encoding", self.publish().audit)
 
+def volume_is_case_sensitive(directory):
+    """True when ``directory`` keeps two names that differ only by case.
+
+    Probes that directory. GitHub-hosted macOS is case-insensitive, so
+    ``app/a.py`` and ``app/A.py`` are one entry there; a case-sensitive volume
+    (Linux CI, or a case-sensitive APFS disk) keeps both.
+    """
+    directory = Path(directory)
+    descriptor, base = tempfile.mkstemp(prefix="caseprobe", suffix="a", dir=directory)
+    os.close(descriptor)
+    other = base[:-1] + "A"
+    try:
+        try:
+            return not os.path.samefile(base, other)
+        except FileNotFoundError:
+            return True
+    finally:
+        os.unlink(base)
+
+
+def case_only_rename_skip_reason(directory):
+    """Why a case-only rename cannot be asserted here, or "" when it can."""
+    if volume_is_case_sensitive(directory):
+        return ""
+    return "case-only rename needs a case-sensitive temp directory"
+
+
 @POSIX
 class AmendmentA1Tests(FlowCase):
     """Founder-approved amendment A1 (receipt e4437522): worktree modes and live-tree collisions."""
@@ -3163,7 +3190,7 @@ class AmendmentA1Tests(FlowCase):
         self.assertEqual(self.remote_git("diff-tree", "-r", "--name-only", "--no-commit-id", self.head,
                                          result.pushed).decode().split(), ["a.txt"])
 
-    def test_file_directory_replacements_and_case_only_renames_are_accepted_and_exact(self):
+    def test_file_directory_replacements_are_accepted_and_exact(self):
         def to_directory(work):
             (work.path / "app/b.py").unlink()
             work.write("app/b.py/inner.py", "inner\n")
@@ -3179,6 +3206,13 @@ class AmendmentA1Tests(FlowCase):
         tree = self.entries(result.pushed)
         self.assertEqual((tree.get("lib/one"), "lib/one/x.py" in tree), ("100644", False))
         self.assertEqual(self.remote_git("show", f"{result.pushed}:lib/one"), b"now a file\n")
+
+    def test_case_only_rename_is_accepted_and_exact(self):
+        # Isolated from the file/directory scenarios above. Skip only this
+        # assertion unless the fixture temp directory can store both cases.
+        reason = case_only_rename_skip_reason(self.root)
+        if reason:
+            self.skipTest(reason)
 
         def rename(work):
             os.rename(work.path / "app/a.py", work.path / "app/A.py")
@@ -3197,6 +3231,27 @@ class AmendmentA1Tests(FlowCase):
             shutil.rmtree(work.path / ".claude")
             work.write(".claude", "file\n")
         self.assertIn("candidate changes a protected path", self.run_fixer(protected_dir).audit)
+
+
+class CaseVolumeProbeTests(unittest.TestCase):
+    """The case-only rename skip follows the temp directory, not the platform."""
+
+    def test_skip_reason_is_empty_only_when_case_variants_are_distinct(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            probe = directory / "only-a"
+            probe.write_bytes(b"a")
+            try:
+                distinct = not os.path.samefile(probe, directory / "only-A")
+            except FileNotFoundError:
+                distinct = True
+            finally:
+                probe.unlink()
+            reason = case_only_rename_skip_reason(directory)
+            if distinct:
+                self.assertEqual(reason, "")
+            else:
+                self.assertEqual(reason, "case-only rename needs a case-sensitive temp directory")
 
 
 @POSIX

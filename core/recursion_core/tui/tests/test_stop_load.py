@@ -3,8 +3,10 @@
 The fake driver emits engine output at a fixed 20,000 events/s (100-byte lines, batches of 200 every
 10 ms) into a running Loop. The bound: the run.stop request leaves the TUI within STOP_BOUND_S = 250 ms
 of the confirming key press, and the screen ends on the "stopped" or "pending" the API reported.
-Measured locally 2026-11-07 on the Grok Bot box: see the PR body (worst of 10 trials on CPython 3.13.5
-and 3.14t -X gil=0, both well under the bound). The test prints its measured worst and median.
+Measured 2026-11-07 on the Grok Bot box at 9e8e89cd, 10 trials each (5 stopped, 5 pending): worst 0.8 ms,
+median 0.6 ms on CPython 3.13.5; worst 0.6 ms, median 0.4 ms on 3.14.10 free-threaded (-X gil=0). The
+flood was checked separately at 20.2k events/s emitted, all drained, about 70 frames/s, none dropped.
+The test prints its measured worst and median on every run.
 """
 
 from __future__ import annotations

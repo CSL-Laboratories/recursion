@@ -8,7 +8,11 @@ reviewed or accepted.
 - `check_route(engine, profile, child_env, route_home=..., parent_env=..., operator_home=...)`
   validates one `pi`, `hermes` or `opencode` profile and the exact child environment, and
   returns a `RouteDecision` or raises `SubscriptionRouteRefused(engine, cause, detail)`.
-- `guard_then_spawn(launcher, argv, ...)` calls `check_route` and only then the launcher.
+- `guard_then_spawn(launcher, argv, ...)` calls `check_route` and only then the launcher,
+  always with the checked env and `shell=False`. It refuses `env`, `shell`, `executable`,
+  `preexec_fn`, fd, user and group options before any check. `launcher` and `argv` are
+  trusted, core-owned inputs: argv is not parsed, so it must not carry a provider, config
+  or login flag the profile did not choose.
 
 What refuses:
 
@@ -18,9 +22,17 @@ What refuses:
 - a Claude-subscription provider or auth kind (OpenCode's Claude Agent provider, Pi and
   Hermes Anthropic OAuth), and any provider, auth kind or credential variable not on the
   engine's explicit API-key list (fail closed);
+- engine config, home and store selectors (`HERMES_HOME`, `PI_CODING_AGENT_DIR`,
+  `OPENCODE_CONFIG`, `OPENCODE_CONFIG_DIR`, `OPENCODE_CONFIG_CONTENT`, `XDG_CONFIG_HOME`,
+  `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`), and, failing closed, any child env
+  name other than `PATH`, `HOME`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TERM`, `TZ`, `TMPDIR` and the
+  one selected API-key variable. Proxy and certificate names refuse here until the
+  owners decide which ones these engines need;
 - stored-credential adoption: the child's HOME must be the route home, private, not the
   operator's home, and must hold no Claude Code store entry (`.claude`, `.claude.json`,
-  `.config/claude`). Checked with `lstat` only; no credential file is opened.
+  `.config/claude`) and no Pi, Hermes or OpenCode state or login entry (`.pi`, `.hermes`,
+  `.local/share/opencode`, `.config/opencode`, `.codex/auth.json`). So the route home must
+  be fresh at spawn. Checked with `lstat` only; no credential file is opened.
 
 A subscription variable present only in the parent env is flagged in `RouteDecision.flags`.
 API-key routes (`anthropic`, `openai`) launch.

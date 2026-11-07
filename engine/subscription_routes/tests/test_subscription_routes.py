@@ -17,7 +17,10 @@ from unittest import mock
 
 from engine.subscription_routes import (
     CLAUDE_SUBSCRIPTION_ENV,
+    ENGINE_SELECTOR_ENV,
+    ENGINE_STORE_ENTRIES,
     ENGINES,
+    SAFE_ENV,
     SubscriptionRouteRefused,
     check_route,
     guard_then_spawn,
@@ -202,6 +205,88 @@ class StoredCredentialTests(_Base):
         self.assertRefusedBeforeSpawn("hermes", self.profile(), self.env(HOME=str(self.operator)), "child_home_not_route_home")
         os.chmod(self.home, 0o755)
         self.assertRefusedBeforeSpawn("hermes", self.profile(), self.env(), "route_home_not_private")
+
+
+@unittest.skipIf(os.name == "nt", "POSIX home checks")
+class SelectorAndExtraEnvTests(_Base):
+    """Engine config/home selectors and any name outside the small baseline refuse before the launcher runs."""
+
+    def test_engine_config_and_home_selectors_refuse(self) -> None:
+        for engine in ENGINES_UNDER_TEST:
+            for name in ("HERMES_HOME", "PI_CODING_AGENT_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "OPENCODE_CONFIG",
+                         "OPENCODE_CONFIG_DIR", "OPENCODE_CONFIG_CONTENT"):
+                with self.subTest(engine=engine, name=name):
+                    value = '{"provider":{"claude-agent":{}}}' if name == "OPENCODE_CONFIG_CONTENT" else str(self.operator)
+                    self.assertRefusedBeforeSpawn(engine, self.profile(), self.env(**{name: value}), "engine_selector_env")
+        self.assertLessEqual({"HERMES_HOME", "OPENCODE_CONFIG_CONTENT", "XDG_DATA_HOME"}, set(ENGINE_SELECTOR_ENV))
+
+    def test_any_other_name_fails_closed(self) -> None:
+        for engine in ENGINES_UNDER_TEST:
+            for name in ("PI_OAUTH_PROVIDER", "OPENCODE_PROVIDER", "HERMES_PROVIDER", "NODE_OPTIONS", "LD_PRELOAD",
+                         "HTTPS_PROXY", "SSL_CERT_FILE", "ANTHROPIC_BASE_URL"):
+                with self.subTest(engine=engine, name=name):
+                    self.assertRefusedBeforeSpawn(engine, self.profile(), self.env(**{name: "x"}), "child_env_not_allowed")
+
+    def test_the_safe_baseline_launches(self) -> None:
+        env = {name: "x" for name in SAFE_ENV}
+        env.update(PATH="/usr/bin:/bin", HOME=str(self.home), LANG="C.UTF-8", ANTHROPIC_API_KEY=FAKE_KEY)
+        for engine in ENGINES_UNDER_TEST:
+            with self.subTest(engine=engine):
+                decision, _ = self.spawn(engine, self.profile(), env)
+                self.assertEqual("ANTHROPIC_API_KEY", decision.credential_env)
+        self.assertEqual(len(ENGINES_UNDER_TEST), self.launcher.call_count)
+
+    def test_engine_store_entries_in_the_route_home_refuse_without_being_read(self) -> None:
+        real_open = builtins.open
+        opened: list[str] = []
+
+        def spy(path, *args, **kwargs):
+            opened.append(str(path))
+            return real_open(path, *args, **kwargs)
+
+        for entry in (".pi/agent", ".hermes", ".local/share/opencode/auth.json", ".config/opencode", ".codex/auth.json"):
+            for engine in ENGINES_UNDER_TEST:
+                with self.subTest(entry=entry, engine=engine):
+                    target = self.home / entry
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    if entry.endswith(".json"):
+                        target.write_text("{}", encoding="ascii")
+                    else:
+                        target.mkdir()
+                    with mock.patch("builtins.open", spy), mock.patch("io.open", spy):
+                        self.assertRefusedBeforeSpawn(engine, self.profile(), self.env(), "engine_store_in_route_home")
+                    shutil.rmtree(self.home / entry.split("/")[0])
+        self.assertEqual([], [path for path in opened if str(self.home) in path])
+        self.assertLessEqual({".pi", ".hermes", ".local/share/opencode"}, set(ENGINE_STORE_ENTRIES))
+
+
+@unittest.skipIf(os.name == "nt", "POSIX home checks")
+class LaunchOptionTests(_Base):
+    """guard_then_spawn cannot be used to replace the child env or widen the launch."""
+
+    def test_env_shell_executable_and_preexec_refuse_before_any_check(self) -> None:
+        for key, value in (("env", {"CLAUDE_CODE_OAUTH_TOKEN": FAKE_OAUTH}), ("shell", True), ("executable", "/bin/sh"),
+                           ("preexec_fn", print), ("pass_fds", (0,)), ("close_fds", False), ("user", 0)):
+            for engine in ENGINES_UNDER_TEST:
+                with self.subTest(key=key, engine=engine), self.assertRaises(SubscriptionRouteRefused) as caught:
+                    guard_then_spawn(self.launcher, [engine], engine, self.profile(), self.env(),
+                                     route_home=str(self.home), operator_home=str(self.operator), **{key: value})
+                self.assertEqual(("launch_option_denied", key), (caught.exception.cause, caught.exception.detail))
+        self.launcher.assert_not_called()
+
+    def test_malformed_argv_refuses(self) -> None:
+        for argv in ("pi run", [], [None], b"pi"):
+            with self.subTest(argv=argv), self.assertRaises(SubscriptionRouteRefused) as caught:
+                guard_then_spawn(self.launcher, argv, "pi", self.profile(), self.env(), route_home=str(self.home),
+                                 operator_home=str(self.operator))
+            self.assertEqual("argv_malformed", caught.exception.cause)
+        self.launcher.assert_not_called()
+
+    def test_the_launcher_gets_exactly_the_checked_env_and_no_shell(self) -> None:
+        self.spawn("opencode", self.profile(), self.env())
+        args, kwargs = self.launcher.call_args
+        self.assertEqual((["opencode", "run"],), args)
+        self.assertEqual({"env": self.env(), "shell": False}, kwargs)
 
 
 @unittest.skipIf(os.name == "nt", "POSIX home checks")

@@ -16,9 +16,17 @@ Claude-subscription route (csl-research CSL-712 grounding, #1077):
 ``check_route`` validates one engine profile and the environment the core intends to give the
 child, and raises ``SubscriptionRouteRefused`` before any spawn. It fails closed: the provider,
 auth kind and credential variable must be explicit and on the profile's list of API-key
-providers. Stored-credential discovery is refused by checking, with ``lstat`` only, that the
-child's home is route-owned, is not the operator's home and holds no Claude Code store entry.
-No credential file is opened or read.
+providers, and the child env may hold only a small explicit baseline plus that one credential.
+The vault records do not establish every name and file each engine reads to pick its login
+(Pi's agent-dir variable and auth file, Hermes's own auth file), so every other name refuses;
+the engine config and home selectors the records do name get their own cause. Stored-credential
+discovery is refused by checking, with ``lstat`` only, that the child's home is route-owned, is
+not the operator's home and holds no Claude Code store and no Pi, Hermes or OpenCode state or
+login entry. No credential file is opened or read.
+
+``guard_then_spawn`` takes the launcher and argv as trusted, core-owned inputs: it does not parse
+argv, so an engine flag that selects a provider or config is the caller's responsibility. It
+only refuses launch options that would replace the env or widen the launch.
 
 Candidate code: no engine, provider or network is used, and nothing here claims a running core
 calls it yet. Provider ids marked unverified below were not read from the engines' source.
@@ -36,7 +44,10 @@ from types import MappingProxyType
 __all__ = [
     "CLAUDE_SUBSCRIPTION_ENV",
     "ENGINES",
+    "ENGINE_SELECTOR_ENV",
+    "ENGINE_STORE_ENTRIES",
     "RouteDecision",
+    "SAFE_ENV",
     "SubscriptionRouteRefused",
     "check_route",
     "guard_then_spawn",
@@ -64,8 +75,35 @@ CLAUDE_SUBSCRIPTION_ENV = (
 )
 # Names that point an engine at a Claude Code credential store somewhere else.
 CLAUDE_STORE_ENV = ("CLAUDE_CONFIG_DIR",)
-# Claude Code store entries under a home. Checked with lstat for presence only; never opened.
+# Engine config, home and store selectors named in the vault records: each can move an engine to a
+# config or store that picks a stored login or defines a provider inline. Refused with their own cause;
+# any other name outside SAFE_ENV refuses too. Sources: OPENCODE_CONFIG* (csl496 deep419/f6/f9 records,
+# csl501 custody map); HERMES_HOME (Hermes frontier h2 records); XDG_CONFIG_HOME, XDG_DATA_HOME (csl653
+# grounding, CX-306); PI_CODING_AGENT_DIR (named in review; not found in the records, refused anyway).
+ENGINE_SELECTOR_ENV = (
+    "HERMES_HOME",
+    "PI_CODING_AGENT_DIR",
+    "OPENCODE_CONFIG",
+    "OPENCODE_CONFIG_DIR",
+    "OPENCODE_CONFIG_CONTENT",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+)
+# The only names a Pi/Hermes/OpenCode child may get besides its one selected credential.
+SAFE_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ", "TMPDIR")
+# Store entries under a home. Checked with lstat for presence only; never opened or read.
 CLAUDE_STORE_ENTRIES = (".claude", ".claude.json", ".config/claude")
+# Pi, Hermes and OpenCode state that can hold or point at a stored login. Pi's and Hermes's own auth files
+# are not named in the records, so their whole state dirs refuse: ~/.pi/agent (Pi frontier records),
+# ~/.hermes (Hermes frontier h2 records). OpenCode: ~/.local/share/opencode/auth.json (csl501 custody map)
+# and its config dir ~/.config/opencode. Hermes imports ~/.codex/auth.json (CSL-712 H3).
+ENGINE_STORE_ENTRIES = (".pi", ".hermes", ".local/share/opencode", ".config/opencode", ".codex/auth.json")
+# Launch options a caller may not pass: each would replace the child env or widen the launch.
+_FORBIDDEN_LAUNCH = frozenset(
+    {"env", "shell", "executable", "preexec_fn", "close_fds", "pass_fds", "user", "group", "extra_groups", "cwd_fd"}
+)
 # A Claude Code OAuth token in an API-key variable. Inferred prefix (not read from engine source):
 # Hermes routes some Anthropic tokens "down the OAuth path by prefix" (auth.py:203-209).
 _OAUTH_PREFIXES = ("sk-ant-oat",)
@@ -177,6 +215,12 @@ def check_route(
     )
     if others:  # one credential per route: a second key could be picked by the engine's own precedence
         raise SubscriptionRouteRefused(engine, "extra_credential_env", ",".join(others))
+    selectors = sorted(name for name in ENGINE_SELECTOR_ENV if name in env)
+    if selectors:
+        raise SubscriptionRouteRefused(engine, "engine_selector_env", ",".join(selectors))
+    extra = sorted(name for name in env if name != credential and name not in SAFE_ENV)
+    if extra:  # fail closed: the records do not establish which other names an engine reads to pick a login
+        raise SubscriptionRouteRefused(engine, "child_env_not_allowed", ",".join(extra))
 
     _check_home(engine, env, route_home, parent_env, operator_home)
     flags = tuple(f"parent_env_has:{name}" for name in CLAUDE_SUBSCRIPTION_ENV if name in (parent_env or {}))
@@ -195,12 +239,22 @@ def guard_then_spawn(
     operator_home: str | None = None,
     **launch_kwargs: object,
 ) -> tuple[RouteDecision, object]:
-    """Run ``check_route`` and only then call ``launcher(argv, env=child_env, ...)``. A refusal never reaches it."""
+    """Run ``check_route`` and only then call ``launcher(argv, env=child_env, ...)``. A refusal never reaches it.
 
+    ``launcher`` and ``argv`` are trusted, core-owned inputs: argv is not parsed, so it must not carry a
+    provider, config or login flag the profile did not choose. ``launch_kwargs`` may not replace the env
+    or widen the launch (shell, executable, preexec_fn, fds, user or group); those refuse before any check.
+    """
+
+    bad = sorted(_FORBIDDEN_LAUNCH.intersection(launch_kwargs))
+    if bad:
+        raise SubscriptionRouteRefused(engine if isinstance(engine, str) else None, "launch_option_denied", ",".join(bad))
+    if isinstance(argv, (str, bytes)) or not argv or not all(isinstance(item, str) for item in argv):
+        raise SubscriptionRouteRefused(engine if isinstance(engine, str) else None, "argv_malformed")
     decision = check_route(
         engine, profile, child_env, route_home=route_home, parent_env=parent_env, operator_home=operator_home
     )
-    return decision, launcher(list(argv), env=dict(child_env), **launch_kwargs)
+    return decision, launcher(list(argv), **launch_kwargs, env=dict(child_env), shell=False)
 
 
 def _looks_like_claude_login(provider: str) -> bool:
@@ -216,7 +270,7 @@ def _check_home(
     parent_env: Mapping[str, str] | None,
     operator_home: str | None,
 ) -> None:
-    """The child's home is route-owned, private, not the operator's, and holds no Claude Code store entry."""
+    """The child's home is route-owned, private, not the operator's, and holds no store or engine state entry."""
 
     if os.name == "nt":
         raise SubscriptionRouteRefused(engine, "platform_unsupported")
@@ -237,6 +291,9 @@ def _check_home(
     for entry in CLAUDE_STORE_ENTRIES:
         if os.path.lexists(os.path.join(route_home, entry)):  # presence only; never opened or read
             raise SubscriptionRouteRefused(engine, "claude_store_in_route_home", entry)
+    for entry in ENGINE_STORE_ENTRIES:
+        if os.path.lexists(os.path.join(route_home, entry)):  # presence only; never opened or read
+            raise SubscriptionRouteRefused(engine, "engine_store_in_route_home", entry)
 
 
 def _operator_homes(parent_env: Mapping[str, str] | None, operator_home: str | None) -> list[str]:

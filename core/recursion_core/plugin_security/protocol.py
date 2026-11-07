@@ -65,6 +65,8 @@ class CoreService:
             body = {"protocol": PROTOCOL_VERSION, "ok": True, "result": result}
         except Refused as exc:
             body = {"protocol": PROTOCOL_VERSION, "ok": False, "refusal": {"code": exc.code}}
+        except Exception:  # noqa: BLE001 - the boundary fails closed with a typed code, never raises
+            body = {"protocol": PROTOCOL_VERSION, "ok": False, "refusal": {"code": "core_internal_error"}}
         return canonical(body)
 
     def _permission_for(self, kind: str) -> str:
@@ -113,6 +115,8 @@ class CoreService:
                             credential: object, decision: object) -> dict:
         if decision not in ("approve", "veto"):
             raise Refused("decision_invalid")
+        if type(approval_id) is not str or type(digest) is not str:
+            raise Refused("approval_unknown")
         return {"state": self._gate.decide(approval_id, digest, credential, decision == "approve")}
 
     def _require_host(self, caller: str) -> None:

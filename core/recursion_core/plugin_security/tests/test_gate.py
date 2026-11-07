@@ -193,6 +193,22 @@ class ProtocolTests(unittest.TestCase):
                 out = json.loads(self.w.host(raw))
                 self.assertEqual(out, {"ok": False, "protocol": "csl-core/v0", "refusal": {"code": code}})
 
+    def test_wrong_argument_types_get_typed_refusals(self) -> None:
+        cases = [
+            ("approval.decide", dict(approval_id=[1], digest="d", credential="c", decision="approve"),
+             "approval_unknown"),
+            ("approval.decide", dict(approval_id="a", digest={"x": 1}, credential="c", decision="approve"),
+             "approval_unknown"),
+            ("run.bind", dict(run_id=7, connection="c"), "invalid_run_id"),
+            ("breaker.report", dict(connection=["c"], event_type="plan_limit"), "invalid_connection"),
+            ("effect.request", dict(effect=[1]), "effect_fields"),
+            ("plugin.permissions", dict(plugin_id={"a": 1}), "core_internal_error"),
+        ]
+        for op, args, code in cases:
+            with self.subTest(op=op, args=args):
+                out = self.w.call(self.w.host, op, **args)
+                self.assertEqual(out["refusal"]["code"], code)
+
     def test_responses_are_canonical_and_ops_match_the_published_list(self) -> None:
         raw = self.w.host(canonical({"protocol": "csl-core/v0", "op": "plugin.permissions",
                                      "args": {"plugin_id": "demo.plugin"}}))

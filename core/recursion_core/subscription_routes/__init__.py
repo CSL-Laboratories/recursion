@@ -1,6 +1,6 @@
 """Claude-subscription route refusal for Pi, Hermes and OpenCode profiles (CSL-786, candidate). See README.md."""
 
-from engine.subscription_routes.policy import (
+from recursion_core.subscription_routes.policy import (
     CLAUDE_SUBSCRIPTION_ENV,
     ENGINE_SELECTOR_ENV,
     ENGINE_STORE_ENTRIES,

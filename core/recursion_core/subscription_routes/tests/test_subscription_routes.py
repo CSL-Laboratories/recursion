@@ -1,6 +1,6 @@
 """CSL-786: Pi, Hermes and OpenCode profiles refuse Claude-subscription routes before spawn (candidate tests).
 
-Run from the repository root: ``python3 -B -m unittest discover -s engine/subscription_routes/tests -t . -v``.
+Run from the repository root: ``python3 -B -m unittest discover -s core/recursion_core/subscription_routes/tests -t . -v``.
 No engine, provider or network is used. Every credential value is a fake string, and no real
 credential store is opened: store checks run against scratch homes the tests create.
 """
@@ -15,7 +15,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from engine.subscription_routes import (
+from recursion_core.subscription_routes import (
     CLAUDE_SUBSCRIPTION_ENV,
     ENGINE_SELECTOR_ENV,
     ENGINE_STORE_ENTRIES,

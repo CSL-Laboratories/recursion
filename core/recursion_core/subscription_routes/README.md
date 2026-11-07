@@ -1,4 +1,4 @@
-# engine/subscription_routes (CSL-786, candidate)
+# core/recursion_core/subscription_routes (CSL-786, candidate)
 
 Refuses Claude-subscription routes in Pi, Hermes and OpenCode engine profiles before any
 spawn. Under Q12 the Claude subscription is used only inside Claude Code; other harnesses
@@ -42,7 +42,7 @@ API-key routes (`anthropic`, `openai`) launch.
 From the repository root (Python 3.11+, standard library only):
 
 ```sh
-python3 -B -m unittest discover -s engine/subscription_routes/tests -t . -v
+python3 -B -m unittest discover -s core/recursion_core/subscription_routes/tests -t . -v
 ```
 
 `tools/ci_gate.py` does not discover `engine/` tests; they run only when started by hand.

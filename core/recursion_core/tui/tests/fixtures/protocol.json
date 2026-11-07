@@ -1,0 +1,21 @@
+{
+  "about": "TUI action -> control API request, and the item 8 CLI argv that sends the same request. Reusable by a later TUI in any language: replay 'tui' against a client whose run.list answers 'setup_runs', compare the requests after the open's run.list.",
+  "setup_runs": [{"run_id": "run-1", "tenant": "t1", "engine": "codex", "state": "running"}],
+  "cases": [
+    {"name": "list via command", "tui": {"command": "list"}, "cli": ["list"], "request": {"method": "run.list", "params": {}}},
+    {"name": "refresh key", "tui": {"keys": ["r"]}, "cli": ["list"], "request": {"method": "run.list", "params": {}}},
+    {"name": "status via command", "tui": {"command": "status run-1"}, "cli": ["status", "run-1"], "request": {"method": "run.status", "params": {"run_id": "run-1"}}},
+    {"name": "attach key", "tui": {"keys": ["a"]}, "cli": ["status", "run-1"], "request": {"method": "run.status", "params": {"run_id": "run-1"}}},
+    {"name": "stop via command", "tui": {"command": "stop run-1"}, "cli": ["stop", "run-1"], "request": {"method": "run.stop", "params": {"run_id": "run-1"}}},
+    {"name": "stop key then confirm", "tui": {"keys": ["s", "y"]}, "cli": ["stop", "run-1"], "request": {"method": "run.stop", "params": {"run_id": "run-1"}}},
+    {"name": "start", "tui": {"command": "start --tenant t1 --engine codex --prompt hi"}, "cli": ["start", "--tenant", "t1", "--engine", "codex", "--prompt", "hi"], "request": {"method": "run.start", "params": {"tenant": "t1", "engine": "codex", "prompt": "hi"}}},
+    {"name": "start with client key", "tui": {"command": "start --tenant t1 --engine codex --prompt 'two words' --client-key k1"}, "cli": ["start", "--tenant", "t1", "--engine", "codex", "--prompt", "two words", "--client-key", "k1"], "request": {"method": "run.start", "params": {"tenant": "t1", "engine": "codex", "prompt": "two words", "client_key": "k1"}}}
+  ],
+  "no_request": [
+    {"name": "stop key cancelled", "tui": {"keys": ["s", "n"]}},
+    {"name": "selection only", "tui": {"keys": ["j", "k", "down", "up"]}},
+    {"name": "usage error", "tui": {"command": "stop"}},
+    {"name": "unknown verb", "tui": {"command": "approve run-1"}},
+    {"name": "close", "tui": {"keys": ["q"]}}
+  ]
+}

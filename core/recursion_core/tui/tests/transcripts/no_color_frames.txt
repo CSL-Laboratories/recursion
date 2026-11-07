@@ -1,0 +1,205 @@
+=== open and attach run-1; run-2 is stop_pending (UNRECONCILED)
+Recursion TUI | surface=cli | view=live | runs=2 | control API client
+status=ok method=run.status
+UNRECONCILED: run=run-2 state=stop_pending reason=cgroup_populated: stop requested, cleanup not con…
+
+
+
+runs:
+> run-1 state=running engine=codex tenant=t1 attached
+  run-2 state=stop_pending engine=codex tenant=t1
+
+
+
+-- output run=run-1 (untrusted engine text, display only) --
+│ engine says ⟦OSC 0⟧hi
+│ ⟦OSC 52⟧done
+│
+│
+│
+│
+│
+│
+│
+│
+│
+│
+│
+│
+errors: none
+
+recursion: j/k select  a attach  r refresh  s stop  : command  q close (runs keep going)
+=== stop run-1 answered pending (UNCERTAIN)
+Recursion TUI | surface=cli | view=live | runs=2 | control API client
+status=pending method=run.stop run_id=run-1 state=pending reason=cgroup_populated
+UNRECONCILED: run=run-1 state=stop_pending reason=cgroup_populated: stop requested, cleanup not con…
+UNRECONCILED: run=run-2 state=stop_pending reason=cgroup_populated: stop requested, cleanup not con…
+UNCERTAIN: stop not confirmed for run=run-1: reason=cgroup_populated; run may still be running
+
+runs:
+> run-1 state=stop_pending engine=codex tenant=t1 attached
+  run-2 state=stop_pending engine=codex tenant=t1
+
+
+
+-- output run=run-1 (untrusted engine text, display only) --
+│ engine says ⟦OSC 0⟧hi
+│ ⟦OSC 52⟧done
+│
+│
+│
+│
+│
+│
+│
+│
+│
+│
+│
+│
+errors: none
+stop run=run-1: control API answered pending
+recursion: j/k select  a attach  r refresh  s stop  : command  q close (runs keep going)
+=== stop of an unknown run is refused (REFUSED, error row)
+Recursion TUI | surface=cli | view=live | runs=2 | control API client
+status=run_unknown method=run.stop run_id=nope
+UNRECONCILED: run=run-1 state=stop_pending reason=cgroup_populated: stop requested, cleanup not con…
+UNRECONCILED: run=run-2 state=stop_pending reason=cgroup_populated: stop requested, cleanup not con…
+REFUSED: run_unknown nope
+
+runs:
+> run-1 state=stop_pending engine=codex tenant=t1 attached
+  run-2 state=stop_pending engine=codex tenant=t1
+
+
+
+-- output run=run-1 (untrusted engine text, display only) --
+│ engine says ⟦OSC 0⟧hi
+│ ⟦OSC 52⟧done
+│
+│
+│
+│
+│
+│
+│
+│
+│
+│
+│
+│
+error 1: REFUSED: run.stop status=run_unknown run_unknown nope
+stop run=nope: control API answered run_unknown
+recursion: j/k select  a attach  r refresh  s stop  : command  q close (runs keep going)
+=== refresh failed and snapshot is 30s old (UNAVAILABLE, STALE, watch_only)
+Recursion TUI | surface=cli | view=watch_only | runs=2 | control API client
+status=control_api_unavailable method=run.status detail=ConnectionError
+UNAVAILABLE: control API unavailable: ConnectionError
+UNRECONCILED: run=run-1 state=stop_pending reason=cgroup_populated: stop requested, cleanup not con…
+UNRECONCILED: run=run-2 state=stop_pending reason=cgroup_populated: stop requested, cleanup not con…
+STALE: watch_only (start disabled; stop and reads work): refresh failed: run.list answered control_…
+runs:
+> run-1 state=stop_pending engine=codex tenant=t1 attached
+  run-2 state=stop_pending engine=codex tenant=t1
+
+
+
+-- output run=run-1 (untrusted engine text, display only) --
+│ engine says ⟦OSC 0⟧hi
+│ ⟦OSC 52⟧done
+│
+│
+│
+│
+│
+│
+│
+│
+│
+│
+│
+│
+error 3: UNAVAILABLE: run.status status=control_api_unavailable control API unavailable: Connection…
+stop run=nope: control API answered run_unknown
+recursion: j/k select  a attach  r refresh  s stop  : command  q close (runs keep going)
+=== start refused locally while watch_only; stop still allowed
+Recursion TUI | surface=cli | view=watch_only | runs=2 | control API client
+status=control_api_unavailable method=run.status detail=ConnectionError
+UNAVAILABLE: control API unavailable: ConnectionError
+UNRECONCILED: run=run-1 state=stop_pending reason=cgroup_populated: stop requested, cleanup not con…
+UNRECONCILED: run=run-2 state=stop_pending reason=cgroup_populated: stop requested, cleanup not con…
+STALE: watch_only (start disabled; stop and reads work): refresh failed: run.list answered control_…
+runs:
+> run-1 state=stop_pending engine=codex tenant=t1 attached
+  run-2 state=stop_pending engine=codex tenant=t1
+
+
+
+-- output run=run-1 (untrusted engine text, display only) --
+│ engine says ⟦OSC 0⟧hi
+│ ⟦OSC 52⟧done
+│
+│
+│
+│
+│
+│
+│
+│
+│
+│
+│
+│
+error 4: refused locally: start while watch_only (refresh failed: run.list answered control_api_una…
+stop run=nope: control API answered run_unknown
+recursion: j/k select  a attach  r refresh  s stop  : command  q close (runs keep going)
+=== after 500 output lines the latest error is still on screen
+Recursion TUI | surface=cli | view=watch_only | runs=2 | control API client
+status=control_api_unavailable method=run.status detail=ConnectionError
+UNAVAILABLE: control API unavailable: ConnectionError
+UNRECONCILED: run=run-1 state=stop_pending reason=cgroup_populated: stop requested, cleanup not con…
+UNRECONCILED: run=run-2 state=stop_pending reason=cgroup_populated: stop requested, cleanup not con…
+STALE: watch_only (start disabled; stop and reads work): refresh failed: run.list answered control_…
+runs:
+> run-1 state=stop_pending engine=codex tenant=t1 attached
+  run-2 state=stop_pending engine=codex tenant=t1
+
+
+
+-- output run=run-1 (untrusted engine text, display only) --
+│ flood line 486
+│ flood line 487
+│ flood line 488
+│ flood line 489
+│ flood line 490
+│ flood line 491
+│ flood line 492
+│ flood line 493
+│ flood line 494
+│ flood line 495
+│ flood line 496
+│ flood line 497
+│ flood line 498
+│ flood line 499
+error 4: refused locally: start while watch_only (refresh failed: run.list answered control_api_una…
+stop run=nope: control API answered run_unknown
+recursion: j/k select  a attach  r refresh  s stop  : command  q close (runs keep going)
+=== transcript (append-only)
+open surface=cli: reads run.list; starts nothing
+request run.list
+answer run.list status=ok surface=cli watch_only=false conditions=UNRECONCILED
+attach run=run-1: reads run.status; starts nothing
+request run.status run_id=run-1
+answer run.status status=ok surface=cli watch_only=false conditions=none
+request run.stop run_id=run-1
+answer run.stop status=pending run_id=run-1 state=pending reason=cgroup_populated surface=cli watch_only=false conditions=UNCERTAIN
+request run.stop run_id=nope
+answer run.stop status=run_unknown run_id=nope surface=cli watch_only=false conditions=REFUSED
+error 1: REFUSED: run.stop status=run_unknown run_unknown nope
+request run.list
+answer run.list status=control_api_unavailable detail=ConnectionError surface=cli watch_only=true conditions=UNAVAILABLE
+error 2: UNAVAILABLE: run.list status=control_api_unavailable control API unavailable: ConnectionError
+request run.status run_id=run-1
+answer run.status status=control_api_unavailable detail=ConnectionError surface=cli watch_only=true conditions=UNAVAILABLE
+error 3: UNAVAILABLE: run.status status=control_api_unavailable control API unavailable: ConnectionError
+error 4: refused locally: start while watch_only (refresh failed: run.list answered control_api_unavailable; snapshot age 30.0s > 10.0s); refresh first

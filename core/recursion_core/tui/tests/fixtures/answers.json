@@ -1,0 +1,166 @@
+{
+ "about": "Canned control API answers and the text a TUI must show for each (O7: same status_code as text, refusal/uncertainty/stale/unreconciled readable without colour).",
+ "cases": [
+  {
+   "name": "stopped",
+   "method": "run.stop",
+   "answer": {
+    "code": "stopped",
+    "run_id": "run-1",
+    "state": "stopped",
+    "repeat": false
+   },
+   "status_text": "status=stopped",
+   "labels": []
+  },
+  {
+   "name": "pending is uncertainty",
+   "method": "run.stop",
+   "answer": {
+    "code": "pending",
+    "run_id": "run-1",
+    "state": "pending",
+    "reason": "cgroup_populated"
+   },
+   "status_text": "status=pending",
+   "labels": [
+    "UNCERTAIN",
+    "UNRECONCILED"
+   ],
+   "must_show": [
+    "reason=cgroup_populated",
+    "stop not confirmed"
+   ]
+  },
+  {
+   "name": "confirm timeout is uncertainty",
+   "method": "run.stop",
+   "answer": {
+    "code": "pending",
+    "run_id": "run-1",
+    "state": "pending",
+    "reason": "confirm_timeout"
+   },
+   "status_text": "status=pending",
+   "labels": [
+    "UNCERTAIN",
+    "UNRECONCILED"
+   ],
+   "must_show": [
+    "reason=confirm_timeout"
+   ]
+  },
+  {
+   "name": "unknown run is a refusal",
+   "method": "run.stop",
+   "answer": {
+    "code": "run_unknown",
+    "run_id": "nope"
+   },
+   "status_text": "status=run_unknown",
+   "labels": [
+    "REFUSED"
+   ],
+   "must_show": [
+    "run_unknown nope"
+   ]
+  },
+  {
+   "name": "invalid request is a refusal",
+   "method": "run.status",
+   "answer": {
+    "code": "request_invalid",
+    "detail": "run_id"
+   },
+   "status_text": "status=request_invalid",
+   "labels": [
+    "REFUSED"
+   ],
+   "must_show": [
+    "request_invalid run_id"
+   ]
+  },
+  {
+   "name": "start failed is a refusal",
+   "method": "run.start",
+   "answer": {
+    "code": "start_failed",
+    "detail": "RuntimeError"
+   },
+   "status_text": "status=start_failed",
+   "labels": [
+    "REFUSED"
+   ],
+   "must_show": [
+    "start_failed RuntimeError"
+   ]
+  },
+  {
+   "name": "unknown code is a refusal, not success",
+   "method": "run.status",
+   "answer": {
+    "code": "something_new"
+   },
+   "status_text": "status=something_new",
+   "labels": [
+    "REFUSED"
+   ]
+  },
+  {
+   "name": "stop_pending run is unreconciled",
+   "method": "run.list",
+   "answer": {
+    "code": "ok",
+    "runs": [
+     {
+      "run_id": "run-2",
+      "state": "stop_pending",
+      "stop": {
+       "reason": "cgroup_populated"
+      }
+     }
+    ]
+   },
+   "status_text": "status=ok",
+   "labels": [
+    "UNRECONCILED"
+   ],
+   "must_show": [
+    "run=run-2 state=stop_pending"
+   ]
+  },
+  {
+   "name": "api-marked stale forces watch_only",
+   "method": "run.list",
+   "answer": {
+    "code": "ok",
+    "runs": [],
+    "stale": true
+   },
+   "status_text": "status=ok",
+   "labels": [
+    "STALE"
+   ],
+   "must_show": [
+    "view=watch_only",
+    "STALE: watch_only (start disabled"
+   ]
+  },
+  {
+   "name": "api-reported unreconciled",
+   "method": "run.status",
+   "answer": {
+    "code": "ok",
+    "run": {
+     "run_id": "run-1",
+     "state": "running"
+    },
+    "reconciliation": "unreconciled"
+   },
+   "status_text": "status=ok",
+   "labels": [
+    "UNRECONCILED"
+   ]
+  }
+ ]
+}

@@ -1,10 +1,10 @@
 {
   "format": "csl-product-pin/v1",
-  "status": "awaiting",
+  "status": "pinned",
   "repository": "CSL-Laboratories/csl-research",
-  "path": null,
-  "commit": null,
-  "sha256": null,
-  "claim": null,
-  "limitations": "No product contract is pinned yet. A pin names exact bytes in csl-research; it does not accept, admit or bind them. How a pinned contract binds Recursion is an open founder decision (CSL-585)."
+  "path": "contracts/PRODUCT.md",
+  "commit": "e3119b0ba1bc682253d01f20e97686c27fbeb44e",
+  "sha256": "916f3f6a34d4182b2963fe510894904c25a198b94a0c105c7b514448e77a2409",
+  "claim": "Lucas's exact-digest receipts of Nov 7 2026 17:23Z on CSL-703, CSL-542 and CSL-543 accept these PRODUCT.md bytes (csl-research #1074 head; vault pointer CSLR-D-003 on csl-research #1079). Values from CSL-770; pin issue CSL-794.",
+  "limitations": "A pin names exact bytes in csl-research; it does not accept, admit or bind them. The commit is the head of draft csl-research #1074; if #1074 is squashed or rebased on merge, the pin moves to the main commit that holds the same bytes. The earlier version 09d4e762 (SHA-256 1c029e5a...d544) is superseded and not pinned. How a pinned contract binds Recursion stays as PRODUCT.md and CSL-585 say."
 }

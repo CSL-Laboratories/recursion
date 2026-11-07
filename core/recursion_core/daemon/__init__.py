@@ -317,10 +317,26 @@ class SystemdUserManager:
         return {line.split()[0] for line in text.splitlines() if line.split()}
 
 
-def check_linger(users, call=subprocess.run):
-    """Read-only host prerequisite; never enables lingering."""
-    for user in users:
-        result = call(['loginctl', 'show-user', user, '--property=Linger', '--value'],
-                      check=True, text=True, capture_output=True, timeout=15)
-        if result.stdout.strip() != 'yes':
-            raise RuntimeError(f'Linger=yes required for {user}; founder host setup needed')
+def check_operator_linger(user, call=subprocess.run):
+    """Read-only B9 check for the operator only; never enables or disables lingering.
+
+    Operator Linger=yes keeps the operator's user manager, and so this daemon and its
+    run units, alive after the last SSH session closes. It is never required of an
+    engine user: a lingering engine user manager can start units outside an operator
+    leaf (owner-reported host evidence on CSL-728/CSL-738, Nov 7), so the future
+    cross-uid path requires the engine user to have no user manager during runs.
+    """
+    result = call(['loginctl', 'show-user', user, '--property=Linger', '--value'],
+                  check=True, text=True, capture_output=True, timeout=15)
+    if result.stdout.strip() != 'yes':
+        raise RuntimeError(f'Linger=yes required for operator {user}; founder host setup needed')
+
+
+def refuse_engine_user(environ):
+    """Nov 11 is same-uid only (CSL-728 B6). A configured engine user is refused, not checked."""
+    engine = environ.get('RECURSION_ENGINE_USER', '').strip()
+    if engine:
+        raise RuntimeError(
+            f'RECURSION_ENGINE_USER={engine} is not supported: the cross-uid path is not '
+            'implemented, and it will require the engine user to have no user manager '
+            '(no linger, no user@ engine service) during runs')

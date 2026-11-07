@@ -10,8 +10,8 @@ import threading
 import unittest
 from unittest.mock import patch, Mock
 from recursion_core.daemon import (AlreadyRunning, Daemon, Registry, UserLock,
-                                   SystemdUserManager, check_linger, require_free_threaded)
-from recursion_core.daemon.__main__ import linger_users
+                                   SystemdUserManager, check_operator_linger,
+                                   refuse_engine_user, require_free_threaded)
 
 UNIT_FILE = Path(__file__).resolve().parents[3] / 'systemd' / 'recursion-daemon.service'
 
@@ -350,23 +350,41 @@ class RuntimeTests(unittest.TestCase):
              patch('recursion_core.daemon.sys._is_gil_enabled', return_value=False, create=True):
             require_free_threaded()
 
-    def test_linger_checks_both_users(self):
+    def test_operator_linger_read_only(self):
         call = Mock(return_value=Mock(stdout='yes\n'))
-        check_linger(['operator', 'engine'], call)
-        self.assertEqual(call.call_count, 2)
-        self.assertTrue(all('enable-linger' not in c.args[0] for c in call.call_args_list))
+        check_operator_linger('operator', call)
+        argv = call.call_args.args[0]
+        self.assertEqual(argv[:3], ['loginctl', 'show-user', 'operator'])
+        self.assertNotIn('enable-linger', argv)
+        self.assertNotIn('disable-linger', argv)
 
-    def test_linger_no_refused(self):
+    def test_operator_linger_no_refused(self):
         with self.assertRaises(RuntimeError):
-            check_linger(['operator'], Mock(return_value=Mock(stdout='no')))
+            check_operator_linger('operator', Mock(return_value=Mock(stdout='no')))
 
-    def test_linger_users_engine_when_present(self):
-        with patch('recursion_core.daemon.__main__.getpass.getuser', return_value='op'):
-            self.assertEqual(linger_users({'RECURSION_ENGINE_USER': 'eng'}, Mock()), ['op', 'eng'])
-            self.assertEqual(linger_users({}, Mock()), ['op'])
-            with self.assertLogs(level='WARNING'):
-                self.assertEqual(linger_users({'RECURSION_ENGINE_USER': 'eng'},
-                                              Mock(side_effect=KeyError('eng'))), ['op'])
+    def test_engine_user_refused_not_linger_checked(self):
+        # Engine Linger=yes conflicts with leaf containment (B6/B9 conflict); Nov 11 is same-uid.
+        refuse_engine_user({})
+        refuse_engine_user({'RECURSION_ENGINE_USER': '  '})
+        with self.assertRaisesRegex(RuntimeError, 'no user manager'):
+            refuse_engine_user({'RECURSION_ENGINE_USER': 'csl-engine'})
+
+    def test_main_checks_only_operator_linger(self):
+        import recursion_core.daemon.__main__ as entry
+        with patch.object(entry, 'require_free_threaded'), \
+             patch.object(entry.getpass, 'getuser', return_value='op'), \
+             patch.object(entry, 'check_operator_linger',
+                          side_effect=RuntimeError('stop here')) as linger, \
+             patch.dict(entry.os.environ, {'RECURSION_ENGINE_USER': ''}):
+            with self.assertRaisesRegex(RuntimeError, 'stop here'):
+                entry.main()
+        linger.assert_called_once_with('op')
+        with patch.object(entry, 'require_free_threaded'), \
+             patch.object(entry, 'check_operator_linger') as linger, \
+             patch.dict(entry.os.environ, {'RECURSION_ENGINE_USER': 'csl-engine'}):
+            with self.assertRaisesRegex(RuntimeError, 'not supported'):
+                entry.main()
+        linger.assert_not_called()
 
     def test_unit_file(self):
         text = UNIT_FILE.read_text()

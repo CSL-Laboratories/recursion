@@ -12,10 +12,22 @@ service. The daemon refuses to start on a GIL build. Plugin loading must call
 `require_free_threaded()` after each import, before invoking plugin code.
 
 Host prerequisites (founder setup, not performed by this package): cgroup v2,
-`user@.service` delegation, and `loginctl show-user USER -p Linger` returning
-`Linger=yes` for the operator and, when `RECURSION_ENGINE_USER` names a user that
-exists on the host, the engine user. `check_linger` only reads; nothing here runs
-`loginctl enable-linger`. The daemon fails closed when Linger is not `yes`.
+`user@.service` delegation, and `Linger=yes` for the **operator** (B9), so the
+operator's user manager, this daemon and its run units outlive the last SSH
+session. `check_operator_linger` only reads `loginctl show-user`; nothing here
+enables or disables lingering or touches any service. The daemon fails closed
+when operator Linger is not `yes`.
+
+Operator linger is not engine linger. Lucas (Nov 7, recorded on B6 and B9):
+linger for the engine user conflicts with leaf containment. Owner-reported host
+evidence (gs-worker-nbg, Nov 7, recorded on CSL-728 and CSL-738): a lingering
+engine user inside a root-created wrapper unit ran `systemd-run --user` and
+started a process in its own `user@.service` tree, outside the wrapper. Nov 11 is
+same-uid only, so the daemon refuses to start when `RECURSION_ENGINE_USER` is set.
+The later cross-uid path must require that the engine user has no user manager
+during runs: no linger and no running `user@<engine uid>.service`. So the engine
+user does not get its own lingering `systemd --user` daemon; Q38's "engine user
+gets its own daemon" clause stays open under that invariant.
 
 ## Behaviour
 
@@ -44,6 +56,11 @@ Workload checkpoint and restart after reboot is not implemented.
 
 ## Limits
 
+- Same uid: a run can call `systemd-run --user`, or write another `cgroup.procs`
+  it owns, and leave its unit's cgroup. The escaped process is unseen, and the
+  unit can read empty while it lives. `terminated` means the run unit's cgroup was
+  seen empty, not that every process the run started is gone. Same uid is not a
+  containment or security boundary.
 - If the systemd user manager itself stops (no Linger at last logout, or
   `user@.service` restart), it stops the run units too. Linger is the guard.
 - Fake-manager tests only. Live restart, `kill -9`, supervisor death, reboot,

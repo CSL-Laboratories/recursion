@@ -32,10 +32,22 @@ path (normal return, exception, launch failure, cancellation) kills the leaf.
 
 ## Limits
 
-- Same uid only. A process of the same uid can move itself out of the leaf, so
-  this is not a security boundary against a hostile same-uid process. An escaped
-  process is unseen; the leaf can read empty while it lives. Cross-uid (B6 proper,
-  engine under a second uid) comes later.
+- Same uid only; there is no cross-uid kill path here. Same uid cannot hold a
+  process in the leaf against a user-manager escape. The child can run
+  `systemd-run --user`, or write any other `cgroup.procs` it owns, and leave the
+  leaf. The escaped process is unseen, and the leaf can read empty while it lives.
+  This is not a containment or security boundary against a same-uid process.
+- Cross-uid (B6 proper) comes later and must require that the engine user has no
+  user manager during runs: no linger and no running `user@<engine uid>.service`.
+  Engine linger plus an operator-owned leaf is not containment. Lucas, Nov 7,
+  recorded on B6 and B9: "linger for the engine user and leaf containment
+  conflict ... design the cross-uid path so the engine has no user manager during
+  runs." Owner-reported host evidence (gs-worker-nbg, Ubuntu 26.04.1, kernel 7.0,
+  systemd 259, Nov 7; recorded on CSL-728 and CSL-738, not re-measured here): a
+  lingering engine user inside a root-created wrapper unit ran
+  `systemd-run --user` (exit 0) and started a process in its own
+  `user@.service/app.slice` tree, outside the wrapper. It was still the same uid,
+  so this was not privilege escalation.
 - Tests use a fake cgroupfs that models a leaf as a process group, with real
   processes. They exercise the trampoline, pidfd and evidence logic, not kernel
   cgroup behaviour. The live cell runs only when `RECURSION_CGROUP_ROOT` points at

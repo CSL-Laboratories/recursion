@@ -6,8 +6,13 @@ so no target code runs outside the leaf. Every exit path (normal return, excepti
 launch failure, cancellation) kills the leaf with ``cgroup.kill`` and books
 ``terminated`` only on positive evidence: ``populated 0`` and the main process's exit
 seen through its pidfd and ``waitpid``. Anything else is ``running`` (populated) or
-``unknown``. Same uid only: a hostile process of the same uid can leave the leaf, so
-this is not a security boundary (cross-uid is CSL-728's later B6 half).
+``unknown``.
+
+Same uid only, and no cross-uid kill path. A process of the same uid can leave the
+leaf, for example through ``systemd-run --user`` into its user manager, so this is not
+a containment or security boundary. The later cross-uid path must require that the
+engine user has no user manager during runs (no linger, no running user@ service):
+engine linger plus an operator leaf is not containment (Lucas, Nov 7, on B6 and B9).
 """
 from __future__ import annotations
 

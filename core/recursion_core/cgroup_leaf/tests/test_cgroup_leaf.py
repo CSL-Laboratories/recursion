@@ -5,6 +5,7 @@ start_new_session). It exercises the real trampoline, pidfd and evidence logic; 
 not prove kernel cgroup behaviour. Set RECURSION_CGROUP_ROOT to a writable delegated
 cgroup v2 directory containing this process to run the live cell.
 """
+import inspect
 import os
 from pathlib import Path
 import signal
@@ -299,6 +300,13 @@ class LeafTests(unittest.TestCase):
     def test_empty_argv_refused(self):
         with self.assertRaises(ValueError):
             self.root.launch('run-a', [])
+
+    def test_same_uid_only_no_cross_uid_switch(self):
+        params = set(inspect.signature(DelegatedRoot.launch).parameters)
+        self.assertFalse(params & {'user', 'group', 'uid', 'gid', 'extra_groups'})
+        source = Path(cgroup_leaf.__file__).read_text()
+        for forbidden in ('setuid', 'setresuid', '--uid', 'sudo'):
+            self.assertNotIn(forbidden, source)
 
     def test_source_avoids_forbidden_primitives(self):
         source = Path(cgroup_leaf.__file__).read_text()

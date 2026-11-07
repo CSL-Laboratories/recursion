@@ -9,6 +9,7 @@ import unittest
 from recursion_core.control import cli
 from recursion_core.tui.app import Loop, TuiApp
 from recursion_core.tui.tests.fakes import Clock, FakeDriver, RecordingAPI
+from recursion_core.tui.tests.test_stop_load import wait_for
 
 
 class LifetimeTest(unittest.TestCase):
@@ -45,8 +46,8 @@ class LifetimeTest(unittest.TestCase):
         loop = Loop(app, driver.api)
         loop.start()
         loop.press("q")
+        self.assertTrue(wait_for(lambda: app.closed), "the loop thread handles q before shutdown")
         loop.shutdown()
-        self.assertTrue(app.closed)
         self.assertEqual(driver.registry.get(run_id)["state"], "running")
         self.assertEqual(driver.kill.requests, [])
 

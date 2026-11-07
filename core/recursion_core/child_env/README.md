@@ -1,4 +1,4 @@
-# engine/child_env (CSL-785, candidate)
+# core/recursion_core/child_env (CSL-785, candidate)
 
 New-core child environment for engine children. Candidate code: not yet called by a
 running core, and not reviewed or accepted.
@@ -22,8 +22,8 @@ POSIX only. On Windows every call refuses with `platform_unsupported`.
 From the repository root (Python 3.11+, standard library only):
 
 ```sh
-python3 -B -m unittest discover -s engine/child_env/tests -t . -v
-python3 -B -m engine.child_env.tests.cells 5
+python3 -B -m unittest discover -s core/recursion_core/child_env/tests -t . -v
+python3 -B -m recursion_core.child_env.tests.cells 5
 ```
 
 The second command prints one JSON row per cell (n trials each) and a per-group summary.

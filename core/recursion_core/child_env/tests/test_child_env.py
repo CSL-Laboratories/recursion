@@ -1,6 +1,6 @@
 """CSL-785: child-environment allowlist and launch boundary in the new core (candidate tests).
 
-Run from the repository root: ``python3 -B -m unittest discover -s engine/child_env/tests -t . -v``.
+Run from the repository root: ``python3 -B -m unittest discover -s core/recursion_core/child_env/tests -t . -v``.
 No engine, provider, network or real credential is used; every secret-shaped value is fake.
 """
 
@@ -15,8 +15,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from engine.child_env import BASE_NAMES, ENGINE_PROFILES, EnvRefused, ValidatedEnv, build_child_env, spawn
-from engine.child_env.tests import cells
+from recursion_core.child_env import BASE_NAMES, ENGINE_PROFILES, EnvRefused, ValidatedEnv, build_child_env, spawn
+from recursion_core.child_env.tests import cells
 
 FAKE = "fake-value-not-a-credential"
 
@@ -178,7 +178,7 @@ class ProfileTests(unittest.TestCase):
             ValidatedEnv({"PATH": "/usr/bin"}, "codex", ())
 
     def test_windows_refuses_instead_of_passing_values_unchecked(self) -> None:
-        with mock.patch("engine.child_env.policy.os.name", "nt"), self.assertRaises(EnvRefused) as caught:
+        with mock.patch("recursion_core.child_env.policy.os.name", "nt"), self.assertRaises(EnvRefused) as caught:
             build_child_env("codex", home="C:\\x", parent={})
         self.assertEqual("platform_unsupported", caught.exception.cause)
 

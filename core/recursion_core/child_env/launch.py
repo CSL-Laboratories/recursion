@@ -19,7 +19,7 @@ import shutil
 import subprocess
 from collections.abc import Callable, Sequence
 
-from engine.child_env.policy import EnvRefused, ValidatedEnv, _unsafe_file
+from recursion_core.child_env.policy import EnvRefused, ValidatedEnv, _unsafe_file
 
 __all__ = ["spawn"]
 

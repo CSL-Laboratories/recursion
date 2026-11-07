@@ -20,8 +20,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from engine.child_env import policy
-from engine.child_env.policy import EnvRefused, build_child_env
+from recursion_core.child_env import policy
+from recursion_core.child_env.policy import EnvRefused, build_child_env
 
 N = 5
 PROXY = "http://127.0.0.1:3128"

@@ -1,9 +1,15 @@
 """The TUI as a control API client (CSL-799, candidate). See README.md.
 
 ``TuiApp`` holds view state only: the last answers it was given, which run is selected, a bounded
-copy of engine output and an append-only transcript. It owns no session, run, approval or plugin
-state. Opening reads ``run.list``; attaching reads ``run.status``; closing sends nothing. Every
-request goes through the injected ``api.call(method, params)``, the same surface the CLI uses.
+copy of engine output and one ordered event log (``events.EventLog``). It owns no session, run,
+approval or plugin state. Opening reads ``run.list``; attaching reads ``run.status``; closing sends
+nothing. Every request goes through the injected ``api.call(method, params)``, the same surface the
+CLI uses.
+
+Every request, answer, condition edge, engine output chunk, notice and error is appended to the log
+before anything shows it. The full-screen frame, the inline painter and the linear (screen-reader)
+renderer all read that log. A condition is logged only when it appears, changes or clears; the
+``conditions`` command logs the current set on demand.
 
 ``Loop`` runs a ``TuiApp`` on its own thread for a real terminal: key presses are handled before
 queued engine output, output draining is time-sliced, and ``run.stop`` has its own request lane, so a
@@ -20,6 +26,7 @@ import time
 from collections.abc import Callable, Mapping
 
 from recursion_core.tui import protocol as p
+from recursion_core.tui.events import LOG_CAP, Event, EventLog
 from recursion_core.tui.sanitize import OutputSanitizer, field, wrap
 from recursion_core.tui.view import Row, color_enabled
 
@@ -34,18 +41,22 @@ def _fmt(params: Mapping) -> str:
 
 
 class _Output:
-    def __init__(self, cap: int) -> None:
+    def __init__(self, cap: int, run_id: str) -> None:
         self.lines: collections.deque[str] = collections.deque(maxlen=cap)
         self.partial = ""
         self.sanitizer = OutputSanitizer()
         self.events = 0
         self.dropped = 0
+        self.label = f"output run={field(run_id)}: "
 
-    def feed(self, text: str | bytes) -> None:
+    def feed(self, text: str | bytes) -> tuple[str, list[str]]:
+        """Sanitize one chunk; return it and the lines it finished."""
+
         self.events += 1
-        clean = self.partial + self.sanitizer.feed(text)
-        *done, self.partial = clean.split("\n")
+        chunk = self.sanitizer.feed(text)
+        *done, self.partial = (self.partial + chunk).split("\n")
         self.lines.extend(done)
+        return chunk, done
 
     def tail(self, rows: int, width: int) -> list[str]:
         out: list[str] = []
@@ -56,15 +67,20 @@ class _Output:
         return out[-rows:] if rows else []
 
 
+
+
 class TuiApp:
     def __init__(self, api, *, clock: Callable[[], float], environ: Mapping[str, str] | None = None,
                  width: int = 100, height: int = 30, stale_after_s: float = 10.0,
-                 dispatch: Dispatch | None = None, output_lines: int = OUTPUT_LINES) -> None:
+                 dispatch: Dispatch | None = None, output_lines: int = OUTPUT_LINES,
+                 log_cap: int = LOG_CAP) -> None:
         self._api, self._clock = api, clock
         self.dispatch: Dispatch = dispatch or self._inline
         self.color = color_enabled(environ or {})
         self.width, self.height, self.stale_after_s = max(width, 20), max(height, 16), stale_after_s
         self._output_lines = output_lines
+        self.log = EventLog(log_cap)
+        self._t0 = clock()
         self.runs: list[dict] = []
         self.selected: str | None = None
         self.attached: str | None = None
@@ -72,24 +88,52 @@ class TuiApp:
         self.refresh_failed: str | None = None
         self.last: dict | None = None
         self.last_method: str | None = None
+        self._answer_keyed: list[tuple[str, str, str]] = []
         self.answer_conditions: list[tuple[str, str]] = []
+        self.shown: dict[tuple[str, str], tuple[str, str]] = {}  # conditions as last logged
+        self._uncertain: dict[str, str] = {}  # per run, until the API shows that run is no longer stop_pending
         self.errors: list[str] = []
-        self.transcript: list[str] = []
+        self.last_error: Event | None = None  # kept here too, so a bounded log cannot drop it
         self.mode, self.line, self.stop_target = "keys", "", None
         self.notice = ""
         self.closed = False
+        self._state = "live"
         self.skipped_events = 0  # engine output events a Loop dropped from its presentation queue
         self.outputs: dict[str, _Output] = {}
         self.in_flight: dict[str, int] = collections.defaultdict(int)
 
+    # -- the event log --------------------------------------------------------------------------
+    def _emit(self, event_type: str, source: str, text: str, speech: str | None = None,
+              state: str | None = None) -> Event:
+        ms = int(round((self._clock() - self._t0) * 1000))
+        return self.log.append(ms, event_type, source, state or self._view_state(), text,
+                               text if speech is None else speech, self._focus())
+
+    @property
+    def transcript(self) -> list[str]:
+        """Every logged line except engine output, in order (append-only)."""
+
+        return [e.text for e in self.log if e.event_type != "output"]
+
+    def _view_state(self) -> str:
+        self._state = "closed" if self.closed else "watch_only" if self.watch_only else "live"
+        return self._state
+
+    def _focus(self) -> str:
+        if self.mode == "confirm_stop":
+            return f"confirm_stop run={field(self.stop_target)}"
+        if self.mode == "command":
+            return "command_line"
+        return f"runs run={field(self.selected)}" if self.selected else "runs"
+
     # -- lifecycle: opening and attaching are reads; closing sends nothing ----------------------
     def open(self) -> None:
-        self._note(f"open surface={p.SURFACE}: reads run.list; starts nothing")
+        self._emit("open", "operator", f"open surface={p.SURFACE}: reads run.list; starts nothing")
         self.request("run.list", {})
 
     def attach(self, run_id: str) -> None:
         self.attached = self.selected = run_id
-        self._note(f"attach run={field(run_id)}: reads run.status; starts nothing")
+        self._emit("attach", "operator", f"attach run={field(run_id)}: reads run.status; starts nothing")
         self.request("run.status", {"run_id": run_id})
 
     def refresh(self) -> None:
@@ -99,7 +143,7 @@ class TuiApp:
 
     def close(self) -> None:
         self.closed = True
-        self._note("closed: no request sent; runs keep going and can be reattached")
+        self._emit("close", "operator", "closed: no request sent; runs keep going and can be reattached")
 
     # -- requests -------------------------------------------------------------------------------
     def request(self, method: str, params: dict) -> None:
@@ -109,7 +153,7 @@ class TuiApp:
             self._error(f"refused locally: start while watch_only ({self._stale_text()}); refresh first")
             return
         self.in_flight[method] += 1
-        self._note(f"request {method} {_fmt(params)}".rstrip())
+        self._emit("request", "operator", f"request {method} {_fmt(params)}".rstrip())
         self.dispatch(method, params, self.on_answer)
 
     def _inline(self, method: str, params: dict, done: Callable[[str, dict, dict], None]) -> None:
@@ -137,16 +181,24 @@ class TuiApp:
                     run["stop"] = {**(run.get("stop") or {}), "reason": answer.get("reason")}
         elif code == "started" and isinstance(answer.get("run"), dict):
             self._merge(answer["run"])
-        self.answer_conditions = p.answer_conditions(answer)
+        self._answer_keyed = p.keyed_conditions(answer)
+        self.answer_conditions = [(label, text) for label, _, text in self._answer_keyed]
+        self._uncertain.update({subject: text for label, subject, text in self._answer_keyed if label == p.UNCERTAIN})
+        states = {f"run={r.get('run_id')}": r.get("state") for r in self.runs}
+        for subject in list(self._uncertain):  # a later answer about another run does not clear it
+            if states.get(subject, "stop_pending") != "stop_pending":
+                del self._uncertain[subject]
         labels = ",".join(sorted({label for label, _ in self.answer_conditions})) or "none"
-        parts = [f"answer {method} status={field(code)}", self._answer_fields(answer), f"surface={p.SURFACE}",
-                 f"watch_only={str(self.watch_only).lower()}", f"conditions={labels}"]
-        self._note(" ".join(x for x in parts if x))
-        if method == "run.stop":
-            self.notice = f"stop run={field(params.get('run_id'))}: control API answered {field(code)}"
+        said = " ".join(x for x in (f"answer {method} status={field(code)}", self._answer_fields(answer)) if x)
+        # The full line keeps the view state for the transcript; speech leaves it to the condition edges.
+        self._emit("answer", "recursion", f"{said} surface={p.SURFACE} watch_only={str(self.watch_only).lower()} "
+                                         f"conditions={labels}", speech=said)
         for label, text in self.answer_conditions:
             if label in (p.REFUSED, p.UNAVAILABLE_LABEL):
                 self._error(f"{label}: {method} status={field(code)} {field(text)}")
+        if method == "run.stop":  # the answer line above already said it
+            self._notice(f"stop run={field(params.get('run_id'))}: control API answered {field(code)}", speech="")
+        self.sync_conditions()
 
     def _merge(self, run: dict) -> None:
         for i, known in enumerate(self.runs):
@@ -165,8 +217,11 @@ class TuiApp:
         run_id = str(event.get("run_id"))
         out = self.outputs.get(run_id)
         if out is None:
-            out = self.outputs[run_id] = _Output(self._output_lines)
-        out.feed(event.get("text", ""))
+            out = self.outputs[run_id] = _Output(self._output_lines, run_id)
+        chunk, done = out.feed(event.get("text", ""))
+        # Logged already sanitized; the linear renderer says each finished line once, marked as output.
+        self._emit("output", "engine", chunk, speech="\n".join(out.label + line for line in done),
+                   state=self._state)
 
     # -- keys -----------------------------------------------------------------------------------
     def press(self, key: str) -> None:
@@ -175,7 +230,7 @@ class TuiApp:
             if key in ("y", "Y"):
                 self.stop(target)
             else:
-                self.notice = f"stop of {field(target)} cancelled; nothing sent"
+                self._notice(f"stop of {field(target)} cancelled; nothing sent")
             return
         if self.mode == "command":
             if key == "enter":
@@ -198,27 +253,39 @@ class TuiApp:
             if self.selected:  # the target is fixed now; a later refresh or output cannot change it
                 self.mode, self.stop_target = "confirm_stop", self.selected
             else:
-                self.notice = "no run selected; nothing to stop"
+                self._notice("no run selected; nothing to stop")
         elif key == ":":
             self.mode, self.line = "command", ""
         elif key == "q":
             self.close()
 
     def command(self, line: str) -> None:
-        """A command line in the CLI's grammar: ``list``, ``status RUN``, ``stop RUN``, ``start ...``."""
+        """A command line in the CLI's grammar: ``list``, ``status RUN``, ``stop RUN``, ``start ...``,
+        ``conditions``."""
 
         try:
             method, params = p.parse_command(line)
         except p.CommandError as exc:
             self._error(f"usage error: {field(exc)}; nothing sent")
             return
+        if method == p.CONDITIONS:
+            self.show_conditions()
+            return
         if method == "run.status":
             self.attached = self.selected = params["run_id"]
         self.request(method, params)
 
     def stop(self, run_id: str) -> None:
-        self.notice = f"stop requested for {field(run_id)}; waiting for the control API answer"
+        self._notice(f"stop requested for {field(run_id)}; waiting for the control API answer")
         self.request("run.stop", {"run_id": run_id})
+
+    def show_conditions(self) -> None:
+        """The ``conditions`` command: log every current condition again, for a user who missed one."""
+
+        self.sync_conditions()
+        rows = [f"{label}: {text}" for label, text in self.shown.values()]
+        head = f"conditions now: {len(rows)}" if rows else "conditions now: none"
+        self._emit("conditions", "recursion", "\n".join([head, *rows]))
 
     def _move(self, step: int) -> None:
         ids = [str(r.get("run_id")) for r in self.runs]
@@ -240,42 +307,66 @@ class TuiApp:
         return self.stale
 
     def _stale_text(self) -> str:
+        # No running numbers here: the text names the condition, so it is logged once, not every tick.
         reasons = []
         if self.refresh_failed:
             reasons.append(f"refresh failed: {self.refresh_failed}")
         if any(label == p.STALE for label, _ in self.answer_conditions):
             reasons.append("API marked its answer stale")
         if self.snapshot_at is not None and self._clock() - self.snapshot_at > self.stale_after_s:
-            reasons.append(f"snapshot age {self._clock() - self.snapshot_at:.1f}s > {self.stale_after_s:.1f}s")
+            reasons.append(f"snapshot older than {self.stale_after_s:.1f}s")
         return "; ".join(reasons)
 
-    def conditions(self) -> list[tuple[str, str]]:
-        found = [c for c in self.answer_conditions if c[0] != p.STALE]
+    def _current(self) -> dict[tuple[str, str], tuple[str, str]]:
+        found: dict[tuple[str, str], tuple[str, str]] = {}
+        for label, subject, text in self._answer_keyed:
+            if label not in (p.STALE, p.UNCERTAIN):
+                found.setdefault((label, subject), (label, text))
+        for subject, text in self._uncertain.items():
+            found[(p.UNCERTAIN, subject)] = (p.UNCERTAIN, text)
         if self.stale:
-            found.append((p.STALE, f"watch_only (start disabled; stop and reads work): {self._stale_text()}"))
-        for cond in p.answer_conditions({"code": "ok", "runs": self.runs}):  # what the snapshot itself says
-            if cond not in found:
-                found.append(cond)
-        return sorted(found, key=lambda c: p.LABELS.index(c[0]))
+            found[(p.STALE, "view")] = (p.STALE, f"watch_only (start disabled; stop and reads work): "
+                                                 f"{self._stale_text()}")
+        for label, subject, text in p.keyed_conditions({"code": "ok", "runs": self.runs}):  # the snapshot's own
+            found.setdefault((label, subject), (label, text))
+        return dict(sorted(found.items(), key=lambda kv: p.LABELS.index(kv[0][0])))
+
+    def conditions(self) -> list[tuple[str, str]]:
+        return list(self._current().values())
+
+    def sync_conditions(self) -> None:
+        """Log each condition that appeared, changed or cleared since the last sync; nothing else."""
+
+        now = self._current()
+        for key, (label, text) in self.shown.items():
+            if key not in now:
+                self._emit("condition", "recursion", f"{label} cleared, was: {text}")
+        for key, (label, text) in now.items():
+            old = self.shown.get(key)
+            if old is None:
+                self._emit("condition", "recursion", f"{label}: {text}")
+            elif old[1] != text:
+                self._emit("condition", "recursion", f"{label} changed: {text}")
+        self.shown = now
+        self._view_state()
 
     # -- frame ----------------------------------------------------------------------------------
     def frame(self) -> list[Row]:
+        """One full-screen frame. It first logs any condition edge (one may appear with time alone)."""
+
+        self.sync_conditions()
         w = self.width
         rows: list[Row] = []
 
         def put(text: str, style: str | None = None) -> None:  # a clipped row ends in "…"; the transcript has it all
             parts = wrap(text, w) if text else [""]
-            rows.append((parts[0] if len(parts) == 1 else wrap(text, w - 1)[0] + "\u2026", style))
+            rows.append((parts[0] if len(parts) == 1 else wrap(text, w - 1)[0] + "…", style))
 
         mode = "watch_only" if self.watch_only else "live"
         put(f"Recursion TUI | surface={p.SURFACE} | view={mode} | runs={len(self.runs)} | control API client",
             "header")
-        if self.last is None:
-            put("status=none (no answer yet)")
-        else:
-            put(" ".join(x for x in (f"status={field(self.last.get('code'))}", f"method={self.last_method}",
-                                     self._answer_fields(self.last)) if x))
-        conds = self.conditions()
+        put(self.status_row())
+        conds = list(self.shown.values())
         shown = conds[:CONDITION_ROWS]
         for label, text in shown:
             put(f"{label}: {text}", label)
@@ -304,28 +395,60 @@ class TuiApp:
             put("│ " + line)
         for _ in range(out_rows - len(lines)):
             put("│")
-        if self.errors:
-            put(f"error {len(self.errors)}: {self.errors[-1]}", "error")
-        else:
-            put("errors: none")
+        put(self.error_row(), "error" if self.last_error else None)
         put(self.notice)
-        put(self._prompt(), "prompt")
+        put(self.prompt(), "prompt")
         return rows
 
-    def _prompt(self) -> str:
+    def status_row(self) -> str:
+        if self.last is None:
+            return "status=none (no answer yet)"
+        return " ".join(x for x in (f"status={field(self.last.get('code'))}", f"method={self.last_method}",
+                                    self._answer_fields(self.last)) if x)
+
+    def error_row(self) -> str:
+        """The latest error stays until a newer error replaces it."""
+
+        return self.last_error.text if self.last_error else "errors: none"
+
+    def live_rows(self) -> list[Row]:
+        """The inline mode's live region: status, current condition labels, the error that stays,
+        the notice and the input line. Each row is clipped one cell short of the width (no autowrap)."""
+
+        self.sync_conditions()
+        w = self.width - 1
+
+        def clip(text: str) -> str:
+            parts = wrap(text, w) if text else [""]
+            return parts[0] if len(parts) == 1 else wrap(text, w - 1)[0] + "…"
+
+        labels = ",".join(dict.fromkeys(label for label, _ in self.shown.values())) or "none"
+        mode = "watch_only" if self.watch_only else "live"
+        rows: list[Row] = [
+            (clip(f"surface={p.SURFACE} view={mode} runs={len(self.runs)} | {self.status_row()}"), "header"),
+            (clip(f"conditions now: {labels}"), None),
+            (clip(self.error_row()), "error" if self.last_error else None),
+        ]
+        if self.notice:
+            rows.append((clip(self.notice), None))
+        rows.append((clip(self.prompt()), "prompt"))
+        return rows
+
+    def prompt(self) -> str:
         if self.mode == "confirm_stop":
             return f"recursion: stop run {field(self.stop_target)}? y sends run.stop, any other key cancels"
         if self.mode == "command":
             return f"recursion: {self.line}"
         return "recursion: j/k select  a attach  r refresh  s stop  : command  q close (runs keep going)"
 
-    # -- transcript and errors (append-only: an error is never redrawn away) ---------------------
-    def _note(self, line: str) -> None:
-        self.transcript.append(line)
+    # -- notices and errors (logged; an error is never redrawn away) -----------------------------
+    def _notice(self, text: str, speech: str | None = None) -> None:
+        self.notice = text
+        self._emit("notice", "recursion", text, speech=speech)
 
     def _error(self, line: str) -> None:
         self.errors.append(line)
-        self._note(f"error {len(self.errors)}: {line}")
+        self.last_error = self._emit("error", "recursion", f"error {len(self.errors)}: {line}")
 
 
 def call_api(api, method: str, params: dict) -> dict:
@@ -348,8 +471,10 @@ class Loop:
     """
 
     def __init__(self, app: TuiApp, api, *, sink: Callable[[list[Row]], None] | None = None,
-                 tick_s: float = 1 / 60, drain_budget_s: float = 0.008, event_cap: int = 50_000) -> None:
+                 tick_s: float = 1 / 60, drain_budget_s: float = 0.008, event_cap: int = 50_000,
+                 render: Callable[[], list[Row]] | None = None) -> None:
         self.app, self._api, self._sink = app, api, sink
+        self._render = render or app.frame  # inline mode paints from the log and needs no frame
         self.tick_s, self.drain_budget_s, self.event_cap = tick_s, drain_budget_s, event_cap
         self._keys: queue.SimpleQueue = queue.SimpleQueue()
         self._answers: queue.SimpleQueue = queue.SimpleQueue()
@@ -437,7 +562,7 @@ class Loop:
                 break
         if self.dropped_events:
             app.skipped_events = self.dropped_events
-        self.frame = app.frame()  # 4. one repaint
+        self.frame = self._render()  # 4. one repaint
         self.frames += 1
         if self._sink is not None:
             self._sink(self.frame)

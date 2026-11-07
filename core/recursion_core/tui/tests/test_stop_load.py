@@ -6,6 +6,9 @@ of the confirming key press, and the screen ends on the "stopped" or "pending" t
 Measured 2026-11-07 on the Grok Bot box at 9e8e89cd, 10 trials each (5 stopped, 5 pending): worst 0.8 ms,
 median 0.6 ms on CPython 3.13.5; worst 0.6 ms, median 0.4 ms on 3.14.10 free-threaded (-X gil=0). The
 flood was checked separately at 20.2k events/s emitted, all drained, about 70 frames/s, none dropped.
+Re-measured 2026-11-07 with the event log (CSL-799 correction, tree based on a849c44a), 3 runs of 10
+trials each: worst 1.6 ms, medians 0.6-0.7 ms on 3.13.5; worst 1.2 ms, medians 0.3-0.4 ms on 3.14.10
+free-threaded without -X gil=0; worst 0.9 ms, medians 0.3-0.4 ms with -X gil=0.
 The test prints its measured worst and median on every run.
 """
 

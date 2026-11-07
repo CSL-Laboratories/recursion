@@ -1,9 +1,11 @@
 """What the TUI may ask the control API, and how it reads the answers (CSL-799, candidate).
 
 The TUI has exactly the item 8 CLI's commands (``list``, ``status RUN``, ``stop RUN``,
-``start --tenant --engine --prompt [--client-key]``) and turns each into the same
-``(method, params)`` the CLI sends. There is no approve, deny, order or mid-run verb: the control API
-has none, and the TUI never gets a command the CLI lacks.
+``start --tenant --engine --prompt [--client-key]``, ``conditions``) and turns each request command
+into the same ``(method, params)`` the CLI sends. ``conditions`` reads the current conditions again on
+demand: the TUI answers it from what it already knows and sends nothing; the one-shot CLI keeps no
+state, so it reads ``run.list`` first. There is no approve, deny, order or mid-run verb: the control
+API has none, and the TUI never gets a command the CLI lacks.
 
 ``conditions`` turns an API answer into text labels, so refusal, uncertainty, stale and unreconciled
 states are readable without colour (Cockpit O7 ``o7.operator.v0`` presentation rules).
@@ -15,7 +17,8 @@ import argparse
 import shlex
 from collections.abc import Mapping
 
-COMMANDS = ("list", "status", "stop", "start")
+COMMANDS = ("list", "status", "stop", "start", "conditions")
+CONDITIONS = "conditions"  # local in the TUI; not a control API method
 METHODS = {"list": "run.list", "status": "run.status", "stop": "run.stop", "start": "run.start"}
 ALLOWED_METHODS = frozenset(METHODS.values())
 SUCCESS = frozenset({"ok", "started", "stopped"})
@@ -46,6 +49,7 @@ def _parser() -> argparse.ArgumentParser:
     p = _Parser(prog="", add_help=False)
     sub = p.add_subparsers(dest="command", required=True, parser_class=_Parser)
     sub.add_parser("list", add_help=False)
+    sub.add_parser(CONDITIONS, add_help=False)
     sub.add_parser("status", add_help=False).add_argument("run_id")
     sub.add_parser("stop", add_help=False).add_argument("run_id")
     start = sub.add_parser("start", add_help=False)
@@ -57,7 +61,9 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def parse_command(line: str) -> tuple[str, dict]:
-    """``"stop run-1"`` -> ``("run.stop", {"run_id": "run-1"})``, the CLI's grammar and mapping."""
+    """``"stop run-1"`` -> ``("run.stop", {"run_id": "run-1"})``, the CLI's grammar and mapping.
+
+    ``conditions`` parses to ``("conditions", {})``, which is not a control API method."""
 
     try:
         argv = shlex.split(line)
@@ -66,6 +72,8 @@ def parse_command(line: str) -> tuple[str, dict]:
     if not argv or argv[0] not in COMMANDS:  # own wording: argparse's differs across Python versions
         raise CommandError(f"unknown command {argv[0] if argv else ''!r}; commands are {', '.join(COMMANDS)}")
     ns = _parser().parse_args(argv)
+    if ns.command == CONDITIONS:
+        return CONDITIONS, {}
     if ns.command == "list":
         return METHODS["list"], {}
     if ns.command in ("status", "stop"):
@@ -84,26 +92,36 @@ def _runs(answer: Mapping) -> list[Mapping]:
     return [run] if isinstance(run, Mapping) else []
 
 
-def answer_conditions(answer: Mapping) -> list[tuple[str, str]]:
-    """Conditions one API answer exposes, as (label, plain text). Nothing the answer says is dropped."""
+def keyed_conditions(answer: Mapping) -> list[tuple[str, str, str]]:
+    """Conditions one API answer exposes, as (label, subject, plain text). Nothing the answer says is
+    dropped. ``(label, subject)`` names one condition, so a renderer can tell when it appears, changes
+    or clears."""
 
     code = answer.get("code")
-    found: list[tuple[str, str]] = []
+    found: list[tuple[str, str, str]] = []
     if code == UNAVAILABLE:
-        found.append((UNAVAILABLE_LABEL, f"control API unavailable: {answer.get('detail', 'no answer')}"))
+        found.append((UNAVAILABLE_LABEL, "api", f"control API unavailable: {answer.get('detail', 'no answer')}"))
     elif code in UNCERTAIN_CODES:
-        found.append((UNCERTAIN, f"stop not confirmed for run={answer.get('run_id')}: "
-                                 f"reason={answer.get('reason', 'unknown')}; run may still be running"))
+        found.append((UNCERTAIN, f"run={answer.get('run_id')}",
+                      f"stop not confirmed for run={answer.get('run_id')}: "
+                      f"reason={answer.get('reason', 'unknown')}; run may still be running"))
     elif code not in SUCCESS:
         what = answer.get("detail", answer.get("run_id", ""))
-        found.append((REFUSED, f"{code} {what}".strip()))
+        found.append((REFUSED, "answer", f"{code} {what}".strip()))
     if answer.get("stale") is True:
-        found.append((STALE, "API marked this answer stale"))
+        found.append((STALE, "answer", "API marked this answer stale"))
     for run in _runs(answer):
         if run.get("state") == "stop_pending":
             reason = (run.get("stop") or {}).get("reason") if isinstance(run.get("stop"), Mapping) else None
-            found.append((UNRECONCILED, f"run={run.get('run_id')} state=stop_pending reason={reason}: "
-                                        "stop requested, cleanup not confirmed"))
+            found.append((UNRECONCILED, f"run={run.get('run_id')}",
+                          f"run={run.get('run_id')} state=stop_pending reason={reason}: "
+                          "stop requested, cleanup not confirmed"))
     if answer.get("reconciliation") == "unreconciled":
-        found.append((UNRECONCILED, "API reports unreconciled state"))
+        found.append((UNRECONCILED, "api", "API reports unreconciled state"))
     return found
+
+
+def answer_conditions(answer: Mapping) -> list[tuple[str, str]]:
+    """Conditions one API answer exposes, as (label, plain text). Nothing the answer says is dropped."""
+
+    return [(label, text) for label, _, text in keyed_conditions(answer)]

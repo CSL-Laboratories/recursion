@@ -64,14 +64,14 @@ class O7Falsifiers(unittest.TestCase):
         app = TuiApp(api, clock=Clock(), environ={})
         app.open()
         app.command("stop x")
-        app.conditions = lambda: []  # mutant: a view that drops conditions
+        app._current = lambda: {}  # mutant: a view that drops conditions
         self.assertNotEqual(visible_everywhere(app, {p.REFUSED}), [])
 
     def test_o7_2_and_b_1_every_reachable_request_is_a_cli_request(self) -> None:
         rng = random.Random(799)
         keys = list("jkarsy:qnYS ") + ["enter", "esc", "backspace", "up", "down"]
         words = ["list", "status run-1", "stop run-1", "start --tenant t --engine e --prompt p",
-                 "approve run-1", "deny run-1", "order buy", "submit", "kill run-1", "steer run-1 x"]
+                 "conditions", "approve run-1", "deny run-1", "order buy", "submit", "kill run-1", "steer run-1 x"]
         for trial in range(200):
             api = ScriptedAPI({"run.list": {"code": "ok", "runs": [{"run_id": "run-1", "state": "running"}]}})
             app = TuiApp(api, clock=Clock(), environ={})

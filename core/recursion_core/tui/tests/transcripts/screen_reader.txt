@@ -1,38 +1,36 @@
 open surface=cli: reads run.list; starts nothing
 request run.list
-answer run.list status=ok surface=cli watch_only=false conditions=UNRECONCILED
+answer run.list status=ok
 UNRECONCILED: run=run-2 state=stop_pending reason=cgroup_populated: stop requested, cleanup not confirmed
 request run.list
-answer run.list status=ok surface=cli watch_only=false conditions=UNRECONCILED
-UNRECONCILED: run=run-2 state=stop_pending reason=cgroup_populated: stop requested, cleanup not confirmed
+answer run.list status=ok
 request run.status run_id=run-1
-answer run.status status=ok surface=cli watch_only=false conditions=none
-UNRECONCILED: run=run-2 state=stop_pending reason=cgroup_populated: stop requested, cleanup not confirmed
+answer run.status status=ok
 request run.stop run_id=run-1
-answer run.stop status=pending run_id=run-1 state=pending reason=cgroup_populated surface=cli watch_only=false conditions=UNCERTAIN
+answer run.stop status=pending run_id=run-1 state=pending reason=cgroup_populated
 UNRECONCILED: run=run-1 state=stop_pending reason=cgroup_populated: stop requested, cleanup not confirmed
-UNRECONCILED: run=run-2 state=stop_pending reason=cgroup_populated: stop requested, cleanup not confirmed
 UNCERTAIN: stop not confirmed for run=run-1: reason=cgroup_populated; run may still be running
 request run.stop run_id=nope
-answer run.stop status=run_unknown run_id=nope surface=cli watch_only=false conditions=REFUSED
+answer run.stop status=run_unknown run_id=nope
 error 1: REFUSED: run.stop status=run_unknown run_unknown nope
-UNRECONCILED: run=run-1 state=stop_pending reason=cgroup_populated: stop requested, cleanup not confirmed
-UNRECONCILED: run=run-2 state=stop_pending reason=cgroup_populated: stop requested, cleanup not confirmed
 REFUSED: run_unknown nope
-error 2: usage error: unknown command 'approve'; commands are list, status, stop, start; nothing sent
-UNRECONCILED: run=run-1 state=stop_pending reason=cgroup_populated: stop requested, cleanup not confirmed
-UNRECONCILED: run=run-2 state=stop_pending reason=cgroup_populated: stop requested, cleanup not confirmed
-REFUSED: run_unknown nope
+error 2: usage error: unknown command 'approve'; commands are list, status, stop, start, conditions; nothing sent
+STALE: watch_only (start disabled; stop and reads work): snapshot older than 10.0s
 request run.list
-answer run.list status=control_api_unavailable detail=ConnectionError surface=cli watch_only=true conditions=UNAVAILABLE
+answer run.list status=control_api_unavailable detail=ConnectionError
 error 3: UNAVAILABLE: run.list status=control_api_unavailable control API unavailable: ConnectionError
+REFUSED cleared, was: run_unknown nope
+UNAVAILABLE: control API unavailable: ConnectionError
+STALE changed: watch_only (start disabled; stop and reads work): refresh failed: run.list answered control_api_unavailable; snapshot older than 10.0s
+error 4: refused locally: start while watch_only (refresh failed: run.list answered control_api_unavailable; snapshot older than 10.0s); refresh first
+conditions now: 5
 UNAVAILABLE: control API unavailable: ConnectionError
 UNRECONCILED: run=run-1 state=stop_pending reason=cgroup_populated: stop requested, cleanup not confirmed
 UNRECONCILED: run=run-2 state=stop_pending reason=cgroup_populated: stop requested, cleanup not confirmed
-STALE: watch_only (start disabled; stop and reads work): refresh failed: run.list answered control_api_unavailable; snapshot age 30.0s > 10.0s
-error 4: refused locally: start while watch_only (refresh failed: run.list answered control_api_unavailable; snapshot age 30.0s > 10.0s); refresh first
-UNAVAILABLE: control API unavailable: ConnectionError
-UNRECONCILED: run=run-1 state=stop_pending reason=cgroup_populated: stop requested, cleanup not confirmed
-UNRECONCILED: run=run-2 state=stop_pending reason=cgroup_populated: stop requested, cleanup not confirmed
-STALE: watch_only (start disabled; stop and reads work): refresh failed: run.list answered control_api_unavailable; snapshot age 30.0s > 10.0s
+STALE: watch_only (start disabled; stop and reads work): refresh failed: run.list answered control_api_unavailable; snapshot older than 10.0s
+UNCERTAIN: stop not confirmed for run=run-1: reason=cgroup_populated; run may still be running
+request run.list
+answer run.list status=ok
+UNAVAILABLE cleared, was: control API unavailable: ConnectionError
+STALE cleared, was: watch_only (start disabled; stop and reads work): refresh failed: run.list answered control_api_unavailable; snapshot older than 10.0s
 closed: no request sent; runs keep going and can be reattached

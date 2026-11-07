@@ -17,5 +17,8 @@
     {"name": "usage error", "tui": {"command": "stop"}},
     {"name": "unknown verb", "tui": {"command": "approve run-1"}},
     {"name": "close", "tui": {"keys": ["q"]}}
+  ],
+  "reads_current_conditions": [
+    {"name": "conditions", "about": "Same command on both surfaces, no new control API method. The TUI already holds its view state, so it sends nothing; the one-shot CLI holds none, so it reads run.list first.", "tui": {"command": "conditions"}, "cli": ["conditions"], "tui_requests": [], "cli_requests": [{"method": "run.list", "params": {}}]}
   ]
 }

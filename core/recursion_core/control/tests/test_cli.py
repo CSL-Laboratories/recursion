@@ -71,6 +71,21 @@ class CliThroughApiTest(unittest.TestCase):
         self.assertEqual((code, json.loads(out)["state"]), (cli.EXIT_OK, "stopped"))
         self.assertEqual(len(kill.requests), 1)
 
+    def test_conditions_reads_the_list_and_shows_its_labels(self) -> None:
+        api, _, _, _ = make_api(FakeKillTree([POPULATED]))
+        rid = started(api)
+        run(["stop", rid], api)  # pending: the run is now stop_pending
+        code, out, _ = run(["conditions"], api)
+        self.assertEqual(code, cli.EXIT_OK)
+        shown = json.loads(out)
+        self.assertEqual(shown["code"], "ok")
+        self.assertEqual([c["label"] for c in shown["conditions"]], ["UNRECONCILED"])
+        self.assertIn(f"run={rid} state=stop_pending", shown["conditions"][0]["text"])
+        api = FakeAPI({"code": "ok", "runs": []})
+        self.assertEqual(json.loads(run(["conditions"], api)[1]), {"code": "ok", "conditions": []})
+        self.assertEqual(api.calls, [("run.list", {})], "conditions adds no control API method")
+        self.assertEqual(run(["conditions", "extra"], api)[0], cli.EXIT_USAGE)
+
     def test_no_factory_is_a_typed_error(self) -> None:
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):

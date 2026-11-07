@@ -4,6 +4,11 @@ A thin surface over the control API: it parses arguments, makes one ``api.call(m
 the API's answer verbatim as JSON and maps its code to an exit status. It has no process or signal
 access of its own; Stop goes through the control API like every other surface.
 
+``conditions`` (CSL-799) reads ``run.list`` and prints the conditions that answer exposes, with the
+same labels and words as the TUI (``REFUSED``, ``UNCERTAIN``, ``STALE``, ``UNRECONCILED``,
+``UNAVAILABLE``): ``{"code": ..., "conditions": [{"label": ..., "text": ...}]}``. It adds no control API
+method; the TUI has the same command.
+
 Exit codes: 0 ok/started/stopped, 3 pending (stop not confirmed), 4 run_unknown, 1 other API error,
 2 usage error.
 """
@@ -15,6 +20,8 @@ import json
 import sys
 from collections.abc import Callable
 from typing import TextIO
+
+from recursion_core.tui.protocol import answer_conditions
 
 EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_PENDING, EXIT_UNKNOWN = 0, 1, 2, 3, 4
 _EXIT = {"ok": EXIT_OK, "started": EXIT_OK, "stopped": EXIT_OK, "pending": EXIT_PENDING, "run_unknown": EXIT_UNKNOWN}
@@ -40,6 +47,7 @@ def _parser() -> argparse.ArgumentParser:
     start.add_argument("--engine", required=True)
     start.add_argument("--prompt", required=True)
     start.add_argument("--client-key")
+    sub.add_parser("conditions")
     return p
 
 
@@ -52,6 +60,11 @@ def main(argv: list[str], api, out: TextIO | None = None, err: TextIO | None = N
     except _Usage as exc:
         print(f"usage error: {exc}", file=err)
         return EXIT_USAGE
+    if ns.command == "conditions":  # no state between invocations, so read the list, then show its conditions
+        result = api.call("run.list", {})
+        shown = [{"label": label, "text": text} for label, text in answer_conditions(result)]
+        print(json.dumps({"code": result.get("code"), "conditions": shown}, sort_keys=True), file=out)
+        return _EXIT.get(result.get("code"), EXIT_ERROR)
     if ns.command == "list":
         method, params = "run.list", {}
     elif ns.command in ("status", "stop"):

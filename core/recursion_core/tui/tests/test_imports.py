@@ -5,9 +5,11 @@ No module has process, signal or network access; only term.py may import os (ter
 from __future__ import annotations
 
 import ast
+import os
 import pathlib
 import subprocess
 import sys
+import sysconfig
 import unittest
 
 PKG = pathlib.Path(__file__).resolve().parents[1]
@@ -103,6 +105,17 @@ class ImportBoundaryTest(unittest.TestCase):
         out = subprocess.run([sys.executable, "-B", "-c", code], cwd=CORE, capture_output=True, text=True,
                              env={"PYTHONPATH": str(CORE), "PATH": ""}, check=True).stdout.split()
         self.assertEqual([m for m in out if not m.startswith("recursion_core.tui") and m != "recursion_core"], [])
+
+    @unittest.skipUnless(sysconfig.get_config_var("Py_GIL_DISABLED"), "free-threaded build only")
+    def test_loading_the_tui_keeps_the_gil_off_without_forcing_it(self) -> None:
+        # A fresh interpreter without -X gil=0 and without PYTHON_GIL: forcing the GIL off would hide an
+        # extension module that turns it back on (CPython warns with a RuntimeWarning when that happens).
+        code = ("import sys, recursion_core.tui, recursion_core.tui.term, recursion_core.control.cli; "
+                "print(sys._is_gil_enabled())")
+        env = {k: v for k, v in os.environ.items() if k != "PYTHON_GIL"} | {"PYTHONPATH": str(CORE)}
+        out = subprocess.run([sys.executable, "-B", "-W", "error::RuntimeWarning", "-c", code], cwd=CORE,
+                             capture_output=True, text=True, env=env, check=True).stdout.strip()
+        self.assertEqual(out, "False")
 
 
 if __name__ == "__main__":

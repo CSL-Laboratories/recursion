@@ -21,7 +21,9 @@ recorded on F60, CSL-762).
 - `cli.py`: `recursion-control list | status RUN | stop RUN | start --tenant --engine --prompt`. It
   makes one API call, prints the API's answer verbatim as JSON and exits 0 (ok, started, stopped),
   3 (pending), 4 (run_unknown), 1 (other error) or 2 (usage). It imports no `os`, `signal` or
-  `subprocess`.
+  `subprocess`. `recursion-control conditions` (CSL-799) reads `run.list` and prints the conditions it
+  exposes with the TUI's labels and words (`{"code": ..., "conditions": [{"label", "text"}]}`); the TUI
+  has the same command, and no control API method was added.
 - `mcp_tools.py`: Control MCP tool descriptors with every annotation set explicitly, and `call_tool`,
   which forwards to the control API:
 

@@ -16,6 +16,7 @@ from recursion_core.control.registry import EMPTY, POPULATED
 from recursion_core.tui import protocol as p
 from recursion_core.tui import term
 from recursion_core.tui.app import TuiApp
+from recursion_core.tui.events import speech_lines
 from recursion_core.tui.tests.fakes import TRANSCRIPTS, Clock, FakeDriver, ScriptedAPI, fixture
 from recursion_core.tui.view import to_ansi, to_text
 
@@ -70,12 +71,13 @@ def frame_scenario() -> str:
     for i in range(500):
         app.on_event({"run_id": "run-1", "text": f"flood line {i}\n"})
     shot("after 500 output lines the latest error is still on screen")
-    return "\n".join(shots) + "\n=== transcript (append-only)\n" + "\n".join(app.transcript) + "\n"
+    return "\n".join(shots) + "\n=== transcript (append-only, the log's text)\n" + "\n".join(app.transcript) + "\n"
 
 
-def screen_reader_scenario() -> str:
+def screen_reader_scenario() -> tuple[str, TuiApp]:
     driver, api = scenario_driver()
     clock = Clock()
+    app = TuiApp(api, clock=clock, environ={"NO_COLOR": "1"})
 
     def lines():
         yield "list\n"
@@ -87,11 +89,14 @@ def screen_reader_scenario() -> str:
         api.down = True
         yield "list\n"
         yield "start --tenant t1 --engine codex --prompt hi\n"
+        yield "conditions\n"
+        api.down = False
+        yield "list\n"
         yield "q\n"
 
     out = io.StringIO()
-    term.main(["--plain"], lambda: api, stdin=lines(), stdout=out, environ={"NO_COLOR": "1"}, clock=clock)
-    return out.getvalue()
+    term.plain(api, lines(), out, {"NO_COLOR": "1"}, app=app)
+    return out.getvalue(), app
 
 
 def golden(name: str, text: str) -> str:
@@ -110,8 +115,10 @@ class TranscriptTest(unittest.TestCase):
         self.assertNotIn("\x1b", text)
 
     def test_screen_reader_transcript_matches_golden(self) -> None:
-        text = screen_reader_scenario()
+        text, app = screen_reader_scenario()
         self.assertEqual(text, golden("screen_reader.txt", text))
+        self.assertEqual(text, "".join(line + "\n" for line in speech_lines(app.log)),
+                         "the linear renderer says exactly the log's speech, in order")
         for needle in ("REFUSED: run_unknown nope", "UNCERTAIN: stop not confirmed for run=run-1",
                        "UNRECONCILED: run=run-2 state=stop_pending", "STALE: watch_only (start disabled; stop and reads work): refresh failed",
                        "UNAVAILABLE: control API unavailable", "watch_only", "usage error",
@@ -119,6 +126,26 @@ class TranscriptTest(unittest.TestCase):
             self.assertIn(needle, text)
         self.assertNotIn("\x1b", text)
         self.assertNotIn("\r", text)
+
+    def test_screen_reader_announces_a_condition_only_on_an_edge(self) -> None:
+        text, _ = screen_reader_scenario()
+        lines = text.splitlines()
+        readout = lines.index(next(x for x in lines if x.startswith("conditions now: ")))
+        announced = lines[:readout] + lines[readout + 6:]  # outside the on-demand readout
+        appeared = [x for x in announced if x.startswith("UNRECONCILED: run=run-2 ")]
+        self.assertEqual(len(appeared), 1, "run-2 stays stop_pending; it is announced once, when it appears")
+        usage = lines.index(next(x for x in lines if "usage error" in x))
+        # After the usage error the clock moved 30 s, so the next line is STALE appearing, not a repeat.
+        self.assertTrue(lines[usage + 1].startswith("STALE: "), lines[usage + 1])
+        self.assertNotIn(lines[usage + 1], lines[:usage], "a usage error sends nothing and repeats nothing")
+        self.assertIn("STALE cleared, was: watch_only", text)
+        self.assertIn("UNAVAILABLE cleared, was: control API unavailable", text)
+        self.assertEqual(lines[readout], "conditions now: 5")
+        self.assertEqual(sum(x.startswith("UNRECONCILED: run=run-2 ") for x in lines[readout + 1:readout + 6]), 1,
+                         "the conditions command says run-2 again on demand")
+        self.assertEqual([x.split(":")[0] for x in lines[readout + 1:readout + 6]],
+                         ["UNAVAILABLE", "UNRECONCILED", "UNRECONCILED", "STALE", "UNCERTAIN"])
+        self.assertNotIn("UNCERTAIN cleared", text, "run-1's stop is still unconfirmed; other answers do not clear it")
 
 
 class AnswerTextTest(unittest.TestCase):
@@ -177,7 +204,7 @@ class StaleWatchOnlyTest(unittest.TestCase):
         clock.now += 10.5
         self.assertTrue(app.watch_only)
         self.assertIn("view=watch_only", app.frame()[0][0])
-        self.assertIn("STALE: watch_only (start disabled; stop and reads work): snapshot age 10.5s > 10.0s", to_text(app.frame()))
+        self.assertIn("STALE: watch_only (start disabled; stop and reads work): snapshot older than 10.0s", to_text(app.frame()))
         app.command("start --tenant t1 --engine codex --prompt hi")
         self.assertEqual(driver.model_calls, 1, "no start while watch_only")
         self.assertIn("refused locally: start while watch_only", app.errors[-1])

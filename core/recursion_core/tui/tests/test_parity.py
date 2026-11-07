@@ -41,8 +41,16 @@ class ParityTest(unittest.TestCase):
                 self.assertEqual(cli_requests(case["cli"]), want)
 
     def test_fixture_covers_every_cli_command(self) -> None:
-        covered = {case["cli"][0] for case in SPEC["cases"]}
+        covered = {case["cli"][0] for case in SPEC["cases"] + SPEC["reads_current_conditions"]}
         self.assertEqual(covered, set(protocol.COMMANDS))
+
+    def test_conditions_is_on_both_surfaces_and_adds_no_method(self) -> None:
+        for case in SPEC["reads_current_conditions"]:
+            with self.subTest(case["name"]):
+                self.assertEqual(tui_requests(case), [(r["method"], r["params"]) for r in case["tui_requests"]])
+                self.assertEqual(cli_requests(case["cli"]), [(r["method"], r["params"]) for r in case["cli_requests"]])
+                for r in case["cli_requests"]:
+                    self.assertIn(r["method"], protocol.ALLOWED_METHODS)
 
     def test_view_only_actions_send_nothing(self) -> None:
         for case in SPEC["no_request"]:
@@ -51,7 +59,7 @@ class ParityTest(unittest.TestCase):
 
     def test_command_grammar_refuses_what_the_cli_refuses(self) -> None:
         for line in ("stop", "status", "kill run-1", "approve run-1", "deny run-1", "start --tenant t",
-                     "stop run-1 extra", "list --all", "stop 'unbalanced"):
+                     "stop run-1 extra", "list --all", "stop 'unbalanced", "conditions run-1"):
             with self.subTest(line):
                 with self.assertRaises(protocol.CommandError):
                     protocol.parse_command(line)

@@ -204,7 +204,9 @@ def build_child_env(
     """Return the environment for one engine child, or raise ``EnvRefused`` before any spawn.
 
     ``home`` is the route-owned private home the child gets as HOME; the parent's HOME is never passed.
-    ``overrides`` are names the core itself sets (never credential-shaped, never a scrubbed name).
+    ``overrides`` are values the core itself sets. An override may only set a name already on this engine's
+    allowlist (never HOME, PATH, a credential or a scrubbed name), and it is merged before the checks, so it
+    meets exactly the value, PATH, NO_PROXY and temp rules an inherited value meets.
     """
 
     if os.name == "nt":
@@ -218,6 +220,17 @@ def build_child_env(
     env = {name: source[name] for name in profile.allowed if name in source and name != "HOME"}
     dropped = tuple(sorted(name for name in source if name not in env and name != "HOME"))
 
+    # Overrides are merged first and then checked by exactly the rules below, like any inherited value.
+    # They may only set a name this engine's allowlist already carries: never HOME, PATH or a credential.
+    for name, value in (overrides or {}).items():
+        if not isinstance(name, str) or not isinstance(value, str) or not name or "=" in name or "\0" in name + value:
+            raise EnvRefused(None, "override_malformed")
+        if _DENIED.search(name) or name in profile.scrub or name in ("HOME", "PATH"):
+            raise EnvRefused(name, "override_denied")
+        if name not in profile.allowed:
+            raise EnvRefused(name, "override_not_allowed")
+        env[name] = value
+
     for name in [name for name in env if name not in ("PATH", *TEMP_NAMES, *NO_PROXY_NAMES)]:
         cause = _unsafe_value(name, env[name]) if env[name] else None  # empty: no path or URL to check
         if cause is not None:
@@ -229,18 +242,12 @@ def build_child_env(
         for name in [name for name in NO_PROXY_NAMES if name in env]:
             if (cause := _no_proxy_bypass(env[name], profile.hosts)) is not None:
                 raise EnvRefused(name, cause)
-    # N5h option A: a parent temp name is replaced by one private route temp root, never checked or passed.
+    # N5h option A: a temp name is replaced by one private route temp root, never checked or passed.
     present = [name for name in TEMP_NAMES if name in env]
     if present:
         env.update(dict.fromkeys(present, _route_tmp()))
     env["HOME"] = home
 
-    for name, value in (overrides or {}).items():
-        if not isinstance(name, str) or not isinstance(value, str) or not name or "=" in name or "\0" in value:
-            raise EnvRefused(None, "override_malformed")
-        if _DENIED.search(name) or name in profile.scrub or name in ("HOME", "PATH"):
-            raise EnvRefused(name, "override_denied")
-        env[name] = value
     leaked = sorted(name for name in env if name in profile.scrub or (name not in profile.allowed and _DENIED.search(name)))
     if leaked:  # unreachable by construction; kept so a later edit to the allowlist fails closed
         raise EnvRefused(leaked[0], "scrub_failed")

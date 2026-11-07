@@ -115,8 +115,55 @@ class ProfileTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(EnvRefused) as caught:
                 build_child_env(engine, home=home, parent={}, overrides={name: FAKE})
             self.assertEqual("override_denied", caught.exception.cause)
-        env = build_child_env("claude_code", home=home, parent={}, overrides={"DISABLE_AUTOUPDATER": "1"})
-        self.assertEqual("1", env["DISABLE_AUTOUPDATER"])
+
+    def test_overrides_cannot_add_names_outside_the_allowlist(self) -> None:
+        home = _home(self)
+        for engine in ENGINE_PROFILES:
+            for name in ("LD_PRELOAD", "NODE_OPTIONS", "PYTHONPATH", "ALL_PROXY", "DISABLE_AUTOUPDATER"):
+                with self.subTest(engine=engine, name=name), self.assertRaises(EnvRefused) as caught:
+                    build_child_env(engine, home=home, parent={"PATH": "/usr/bin"}, overrides={name: "/mock/not-loaded.so"})
+                self.assertEqual((name, "override_not_allowed"), (caught.exception.name, caught.exception.cause))
+
+    def test_override_values_meet_the_same_rules_as_inherited_values(self) -> None:
+        """Review counterexamples (Nov 7): each override must refuse exactly as the same parent value does."""
+
+        home = _home(self)
+        cases = (
+            ({"LD_PRELOAD": "/mock/not-loaded.so"}, ("LD_PRELOAD", "override_not_allowed")),
+            ({"SSL_CERT_FILE": "relative-cert.pem"}, ("SSL_CERT_FILE", "value_relative")),
+            ({"NO_PROXY": "*", "HTTPS_PROXY": "http://proxy.invalid:8080"}, ("NO_PROXY", "no_proxy_wildcard")),
+            ({"NO_PROXY": ".openai.com", "HTTPS_PROXY": "http://proxy.invalid:8080"}, ("NO_PROXY", "no_proxy_engine_host")),
+            ({"HTTPS_PROXY": "http://u:p@proxy.invalid:8080"}, ("HTTPS_PROXY", "proxy_userinfo")),
+            ({"SSL_CERT_DIR": "/proc/self/cwd"}, ("SSL_CERT_DIR", "value_perspective")),
+            ({"TZ": "../../etc/zone"}, ("TZ", "tz_relative_path")),
+        )
+        for overrides, expected in cases:
+            with self.subTest(overrides=overrides), self.assertRaises(EnvRefused) as caught:
+                build_child_env("codex", home=home, parent={"PATH": "/usr/bin"}, overrides=overrides)
+            self.assertEqual(expected, (caught.exception.name, caught.exception.cause))
+        # Split across parent and override: a proxy override still meets the parent's NO_PROXY, and back.
+        for parent, overrides in (({"NO_PROXY": "*"}, {"HTTPS_PROXY": "http://proxy.invalid:8080"}),
+                                  ({"HTTPS_PROXY": "http://proxy.invalid:8080"}, {"no_proxy": "*"})):
+            with self.subTest(parent=parent), self.assertRaises(EnvRefused) as caught:
+                build_child_env("codex", home=home, parent={"PATH": "/usr/bin", **parent}, overrides=overrides)
+            self.assertEqual("no_proxy_wildcard", caught.exception.cause)
+
+    def test_safe_overrides_pass(self) -> None:
+        home = _home(self)
+        cert = Path(home) / "cert.pem"
+        cert.write_text("not a real certificate\n", encoding="ascii")
+        cert.chmod(0o600)
+        overrides = {"LANG": "C.UTF-8", "TZ": "UTC", "SSL_CERT_FILE": str(cert),
+                     "HTTPS_PROXY": "http://127.0.0.1:3128", "NO_PROXY": "localhost,127.0.0.1"}
+        for engine in ENGINE_PROFILES:
+            with self.subTest(engine=engine):
+                env = build_child_env(engine, home=home, parent={"PATH": "/usr/bin", "LANG": "C"}, overrides=overrides)
+                self.assertEqual(overrides, {name: env[name] for name in overrides})
+                self.assertEqual(home, env["HOME"])
+        # A temp override is replaced by the private route temp root, exactly as a parent TMPDIR is.
+        env = build_child_env("codex", home=home, parent={"PATH": "/usr/bin"}, overrides={"TMPDIR": "/tmp"})
+        self.assertNotEqual("/tmp", env["TMPDIR"])
+        self.assertEqual(0, os.lstat(env["TMPDIR"]).st_mode & 0o077)
 
     def test_home_must_be_private(self) -> None:
         home = _home(self)
@@ -205,6 +252,20 @@ class LaunchTests(unittest.TestCase):
             env = self._env(HTTPS_PROXY="http://u:p@127.0.0.1:9")
             spawn(["fake-engine"], env, popen=self.popen)
         self.popen.assert_not_called()
+
+    def test_a_bad_override_never_reaches_popen(self) -> None:
+        overrides = ({"LD_PRELOAD": "/mock/not-loaded.so"}, {"SSL_CERT_FILE": "relative-cert.pem"},
+                     {"NO_PROXY": "*", "HTTPS_PROXY": "http://proxy.invalid:8080"})
+        parent = {"PATH": f"{self.bin}:/usr/bin:/bin"}  # fake-engine resolves, so only the override can refuse
+        for bad in overrides:
+            for _ in range(5):
+                with self.subTest(overrides=bad), self.assertRaises(EnvRefused):
+                    env = build_child_env("codex", home=self.home, parent=parent, overrides=bad)
+                    spawn(["fake-engine"], env, popen=self.popen)
+        self.popen.assert_not_called()
+        env = build_child_env("codex", home=self.home, parent=parent, overrides={"LANG": "C.UTF-8"})
+        spawn(["fake-engine"], env, popen=self.popen)
+        self.assertEqual("C.UTF-8", self.popen.call_args.kwargs["env"]["LANG"])
 
     def test_real_child_sees_only_the_validated_env(self) -> None:
         """One real local child (/usr/bin/env, no engine): it prints exactly the validated names."""

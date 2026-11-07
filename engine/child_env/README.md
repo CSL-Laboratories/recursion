@@ -6,7 +6,9 @@ running core, and not reviewed or accepted.
 - `policy.build_child_env(engine, home=..., parent=...)` builds the child environment
   from an exact-name allowlist per engine profile (`claude_code`, `codex`), checks the
   values, and returns a `ValidatedEnv` or raises `EnvRefused(name, cause)` before any
-  spawn. Values are never included in errors or `repr`.
+  spawn. Values are never included in errors or `repr`. `overrides=` may only set a name
+  already on the engine's allowlist (never `HOME`, `PATH` or a credential name); overrides
+  are merged first and then meet exactly the same value, PATH, NO_PROXY and temp rules.
 - `launch.spawn(argv, validated_env, ...)` is the launch boundary. It accepts only a
   `ValidatedEnv`, always passes it as Popen's explicit `env=`, resolves argv[0] on the
   validated PATH, and refuses caller options that would replace or widen the launch.

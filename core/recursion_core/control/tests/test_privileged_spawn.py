@@ -698,16 +698,23 @@ class DevinReview5818620711Tests(unittest.TestCase):
         self.assertEqual(sudo.target_user, "nobody")
 
     def test_sudo_detection_ignores_a_precreated_probe_secret(self) -> None:
-        # r4507085798: the detection directory is 1777 so another uid can
-        # create the writer file, but the writer used a fixed name
-        # (probe.secret). A local user can create that file while sleep 8
-        # runs; the sudo writer then fails and a working other-uid backend
-        # is rejected, falling back to managed-login-folder isolation.
+        # r4507085798 / r4507255229: a local user can plant probe.secret
+        # once the detection directory is 1777. The earlier test planted
+        # that name during sleep 8, before chmod, as the directory owner,
+        # and the fake runner never created the target-user file, so it
+        # only checked the changed filename. Plant after the directory is
+        # world-writable, then create the writer file the same way
+        # production does (store_writer_script). This process cannot
+        # create a file as another uid without host or sudoers changes,
+        # so this does not simulate a second uid.
         import re
 
         policy = _sudo_policy(_nobody_allows(*ALL_REQUIRED))
         planted: list[str] = []
         writer_paths: list[str] = []
+        created_payloads: list[bytes] = []
+        created_modes: list[int] = []
+        sleep_modes: list[int] = []
 
         def run(cmd, timeout: float) -> ProcResult:
             key = tuple(cmd)
@@ -715,16 +722,24 @@ class DevinReview5818620711Tests(unittest.TestCase):
                 tmp = tempfile.gettempdir()
                 for name in os.listdir(tmp):
                     if name.startswith("csl734-sudo-probe-"):
-                        secret = os.path.join(tmp, name, "probe.secret")
-                        fd = os.open(secret, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-                        os.close(fd)
-                        planted.append(secret)
+                        directory = os.path.join(tmp, name)
+                        sleep_modes.append(stat.S_IMODE(os.stat(directory).st_mode))
             if len(key) >= 3 and key[-3:-1] == ("python3", "-c"):
                 match = re.search(r"p=('[^']*')", key[-1])
                 path = ast.literal_eval(match.group(1))
                 writer_paths.append(path)
-                if os.path.lexists(path):
-                    return ProcResult(1, "", "PermissionError: [Errno 13] Permission denied")
+                directory = os.path.dirname(path)
+                mode = stat.S_IMODE(os.stat(directory).st_mode)
+                if mode & 0o1777 != 0o1777:
+                    return ProcResult(1, "", "detection directory is not world-writable")
+                secret = os.path.join(directory, "probe.secret")
+                fd = os.open(secret, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                os.close(fd)
+                planted.append(secret)
+                exec(store_writer_script(path), {})
+                with open(path, "rb") as fh:
+                    created_payloads.append(fh.read())
+                created_modes.append(stat.S_IMODE(os.stat(path).st_mode))
             return policy(cmd, timeout)
 
         backends = detect_backends(
@@ -734,9 +749,13 @@ class DevinReview5818620711Tests(unittest.TestCase):
             env={},
         )
         sudo = next(b for b in backends if b.name == "sudo")
+        self.assertEqual(len(sleep_modes), 1, sleep_modes)
+        self.assertNotEqual(sleep_modes[0] & 0o1777, 0o1777)
         self.assertEqual(len(planted), 1, planted)
         self.assertEqual(len(writer_paths), 1, writer_paths)
         self.assertNotEqual(writer_paths[0], planted[0])
+        self.assertEqual(created_payloads, [b"store-bytes"])
+        self.assertEqual(created_modes, [0o600])
         self.assertTrue(sudo.available, sudo.reason)
         self.assertEqual(sudo.target_user, "nobody")
 

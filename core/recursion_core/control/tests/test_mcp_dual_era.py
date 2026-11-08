@@ -1,0 +1,305 @@
+"""CSL-766 B5 / F56: Claude Code dual-era MCP, same run id and Stop, n>=5.
+
+No Claude Code binary, provider, network or real credential is used. Negotiation
+is the offline reading recorded in ``mcp_dual_era.py``. Live wire-capture of a
+real handshake is unmeasured.
+"""
+
+from __future__ import annotations
+
+import unittest
+
+from recursion_core.control.mcp_dual_era import (
+    CLAUDE_CODE_DOCS,
+    CLAUDE_CODE_PACKAGE_VERSION,
+    LEGACY_PROTOCOL,
+    LIVE_WIRE_CAPTURE,
+    MCP_SPEC_COMMIT,
+    MCP_SPEC_FILE,
+    MODERN_PROTOCOL,
+    TASKS_EXTENSION,
+    DualEraServer,
+    Negotiation,
+    claude_code_negotiate,
+    modern_params,
+    negotiation_mode,
+)
+from recursion_core.control.tests.fakes import FakeKillTree, make_api
+
+N = 5
+
+
+def _server():
+    api, registry, kill, starter = make_api(FakeKillTree())
+    return DualEraServer(api), api, registry, kill, starter
+
+
+class SourcePinTest(unittest.TestCase):
+    def test_sources_are_recorded_and_live_wire_capture_is_unmeasured(self) -> None:
+        self.assertEqual(CLAUDE_CODE_PACKAGE_VERSION, "2.1.312")
+        self.assertEqual(CLAUDE_CODE_DOCS, "https://code.claude.com/docs/en/mcp")
+        self.assertEqual(MCP_SPEC_COMMIT, "38353251fab3bdeead03dd8283b9e66076ce1a7f")
+        self.assertEqual(len(MCP_SPEC_COMMIT), 40)
+        int(MCP_SPEC_COMMIT, 16)
+        self.assertEqual(MCP_SPEC_FILE, "schema/2026-07-28/schema.ts")
+        self.assertIsNone(LIVE_WIRE_CAPTURE)
+
+
+class NegotiationTests(unittest.TestCase):
+    def test_invalid_env_is_ignored(self) -> None:
+        self.assertIsNone(negotiation_mode(None))
+        self.assertIsNone(negotiation_mode(""))
+        self.assertIsNone(negotiation_mode("modern"))
+        self.assertEqual(negotiation_mode("legacy"), "legacy")
+        self.assertEqual(negotiation_mode("auto"), "auto")
+
+    def _repeat(self, check) -> None:
+        results = [check() for _ in range(N)]
+        self.assertEqual((N, N), (len(results), results.count(True)), results)
+
+    def test_default_negotiates_modern_when_the_server_supports_it(self) -> None:
+        def check() -> bool:
+            for env in (None, "auto", "unexpected"):
+                got = claude_code_negotiate(env, server_supports_modern=True)
+                if got != Negotiation("modern", MODERN_PROTOCOL, "server/discover", True, negotiation_mode(env)):
+                    return False
+            return True
+
+        self._repeat(check)
+
+    def test_legacy_env_initializes_on_2025_06_18(self) -> None:
+        def check() -> bool:
+            got = claude_code_negotiate("legacy", server_supports_modern=True)
+            return got == Negotiation("legacy", LEGACY_PROTOCOL, "initialize", False, "legacy")
+
+        self._repeat(check)
+
+    def test_unset_may_skip_a_cached_stdio_probe_but_auto_does_not(self) -> None:
+        skipped = claude_code_negotiate(None, server_supports_modern=True, skip_cached_probe=True)
+        self.assertEqual(skipped.era, "legacy")
+        self.assertFalse(skipped.probed)
+        forced = claude_code_negotiate("auto", server_supports_modern=True, skip_cached_probe=True)
+        self.assertEqual(forced.era, "modern")
+        self.assertTrue(forced.probed)
+
+    def test_server_without_modern_falls_back_to_initialize(self) -> None:
+        got = claude_code_negotiate(None, server_supports_modern=False)
+        self.assertEqual(got, Negotiation("legacy", LEGACY_PROTOCOL, "initialize", True, None))
+
+
+class HandshakeTests(unittest.TestCase):
+    def test_server_discover_advertises_both_versions(self) -> None:
+        server, *_ = _server()
+        reply = server.handle({
+            "jsonrpc": "2.0", "id": "discover-1", "method": "server/discover",
+            "params": modern_params(),
+        })
+        result = reply["result"]
+        self.assertEqual(result["resultType"], "complete")
+        self.assertIn(MODERN_PROTOCOL, result["supportedVersions"])
+        self.assertIn(LEGACY_PROTOCOL, result["supportedVersions"])
+        self.assertIn(TASKS_EXTENSION, result["capabilities"]["extensions"])
+
+    def test_initialize_answers_legacy_2025_06_18(self) -> None:
+        server, *_ = _server()
+        reply = server.handle({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": LEGACY_PROTOCOL, "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}},
+        })
+        self.assertEqual(reply["result"]["protocolVersion"], LEGACY_PROTOCOL)
+        self.assertEqual(server.legacy_sessions, 1)
+
+    def test_default_handshake_then_legacy_handshake_against_the_same_server(self) -> None:
+        """B5: modern by default and initialize under MCP_PROTOCOL_NEGOTIATION=legacy, n>=5."""
+
+        results = []
+        for _ in range(N):
+            server, *_ = _server()
+            default = claude_code_negotiate(None)
+            legacy = claude_code_negotiate("legacy")
+            modern_reply = server.handle({
+                "jsonrpc": "2.0", "id": "d", "method": default.handshake,
+                "params": modern_params(),
+            })
+            legacy_reply = server.handle({
+                "jsonrpc": "2.0", "id": "i", "method": legacy.handshake,
+                "params": {"protocolVersion": legacy.protocol, "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}},
+            })
+            results.append(
+                default.protocol == MODERN_PROTOCOL
+                and default.handshake == "server/discover"
+                and MODERN_PROTOCOL in modern_reply["result"]["supportedVersions"]
+                and legacy.protocol == LEGACY_PROTOCOL
+                and legacy.handshake == "initialize"
+                and legacy_reply["result"]["protocolVersion"] == LEGACY_PROTOCOL
+            )
+        self.assertEqual((N, N), (len(results), results.count(True)), results)
+
+
+class SameRunAndStopTests(unittest.TestCase):
+    def _start_legacy(self, server: DualEraServer, prompt: str = "p") -> str:
+        reply = server.handle({
+            "jsonrpc": "2.0", "id": "ls", "method": "tools/call",
+            "params": {
+                "name": "recursion_run_start",
+                "arguments": {"tenant": "t1", "engine": "codex", "prompt": prompt},
+            },
+        })
+        return reply["result"]["structuredContent"]["run"]["run_id"]
+
+    def _start_modern(self, server: DualEraServer, prompt: str = "p") -> str:
+        reply = server.handle({
+            "jsonrpc": "2.0", "id": "ms", "method": "tools/call",
+            "params": modern_params(
+                tasks=True,
+                name="recursion_run_start",
+                arguments={"tenant": "t1", "engine": "codex", "prompt": prompt},
+            ),
+        })
+        result = reply["result"]
+        self.assertEqual(result["resultType"], "task")
+        self.assertEqual(result["status"], "working")
+        self.assertLessEqual(len(result["taskId"]), 128)
+        return result["taskId"]
+
+    def _repeat(self, check) -> None:
+        results = [check() for _ in range(N)]
+        self.assertEqual((N, N), (len(results), results.count(True)), results)
+
+    def test_same_run_id_from_both_eras(self) -> None:
+        def check() -> bool:
+            server, api, *_ = _server()
+            modern_id = self._start_modern(server)
+            status = server.handle({
+                "jsonrpc": "2.0", "id": "st", "method": "tools/call",
+                "params": {"name": "recursion_run_status", "arguments": {"run_id": modern_id}},
+            })
+            legacy_seen = status["result"]["structuredContent"]["run"]["run_id"]
+            poll = server.handle({
+                "jsonrpc": "2.0", "id": "tg", "method": "tasks/get",
+                "params": modern_params(taskId=modern_id),
+            })
+            return legacy_seen == modern_id == poll["result"]["taskId"] == api.call(
+                "run.status", {"run_id": modern_id})["run"]["run_id"]
+
+        self._repeat(check)
+
+    def test_legacy_start_is_visible_as_a_modern_task(self) -> None:
+        def check() -> bool:
+            server, *_ = _server()
+            run_id = self._start_legacy(server)
+            poll = server.handle({
+                "jsonrpc": "2.0", "id": "tg", "method": "tasks/get",
+                "params": modern_params(taskId=run_id),
+            })
+            return poll["result"]["taskId"] == run_id and poll["result"]["status"] == "working"
+
+        self._repeat(check)
+
+    def test_stop_from_legacy_after_modern_start(self) -> None:
+        def check() -> bool:
+            server, _, _, kill, _ = _server()
+            run_id = self._start_modern(server)
+            stop = server.handle({
+                "jsonrpc": "2.0", "id": "stop", "method": "tools/call",
+                "params": {"name": "recursion_run_stop", "arguments": {"run_id": run_id}},
+            })
+            poll = server.handle({
+                "jsonrpc": "2.0", "id": "tg", "method": "tasks/get",
+                "params": modern_params(taskId=run_id),
+            })
+            return (
+                stop["result"]["structuredContent"]["code"] == "stopped"
+                and poll["result"]["status"] == "cancelled"
+                and poll["result"]["taskId"] == run_id
+                and len(kill.requests) == 1
+                and server.notifications == []
+            )
+
+        self._repeat(check)
+
+    def test_stop_from_modern_after_legacy_start(self) -> None:
+        def check() -> bool:
+            server, _, _, kill, _ = _server()
+            run_id = self._start_legacy(server)
+            cancel = server.handle({
+                "jsonrpc": "2.0", "id": "tc", "method": "tasks/cancel",
+                "params": modern_params(taskId=run_id),
+            })
+            status = server.handle({
+                "jsonrpc": "2.0", "id": "st", "method": "tools/call",
+                "params": {"name": "recursion_run_status", "arguments": {"run_id": run_id}},
+            })
+            return (
+                cancel["result"]["resultType"] == "complete"
+                and cancel["result"]["status"] == "cancelled"
+                and cancel["result"]["taskId"] == run_id
+                and status["result"]["structuredContent"]["run"]["state"] == "stopped"
+                and len(kill.requests) == 1
+                and server.notifications == []
+            )
+
+        self._repeat(check)
+
+    def test_modern_start_without_tasks_extension_is_a_plain_tool_result(self) -> None:
+        server, *_ = _server()
+        reply = server.handle({
+            "jsonrpc": "2.0", "id": "ms", "method": "tools/call",
+            "params": modern_params(
+                tasks=False,
+                name="recursion_run_start",
+                arguments={"tenant": "t1", "engine": "codex", "prompt": "p"},
+            ),
+        })
+        self.assertEqual(reply["result"]["resultType"], "complete")
+        self.assertNotIn("taskId", reply["result"])
+        self.assertEqual(reply["result"]["structuredContent"]["code"], "started")
+
+    def test_list_runs_stays_a_plain_tool_and_tasks_list_is_not_served(self) -> None:
+        server, *_ = _server()
+        listed = server.handle({
+            "jsonrpc": "2.0", "id": "l", "method": "tools/call",
+            "params": modern_params(name="recursion_run_list", arguments={}),
+        })
+        self.assertEqual(listed["result"]["resultType"], "complete")
+        refused = server.handle({"jsonrpc": "2.0", "id": "tl", "method": "tasks/list", "params": modern_params()})
+        self.assertIn("error", refused)
+
+    def test_tasks_require_auth_when_a_token_is_configured(self) -> None:
+        api, *_rest = make_api(FakeKillTree())
+        server = DualEraServer(api, auth_token="secret")
+        start = server.handle({
+            "jsonrpc": "2.0", "id": "ms", "method": "tools/call",
+            "params": {
+                "name": "recursion_run_start",
+                "arguments": {"tenant": "t1", "engine": "codex", "prompt": "p"},
+            },
+        })
+        run_id = start["result"]["structuredContent"]["run"]["run_id"]
+        denied = server.handle({
+            "jsonrpc": "2.0", "id": "tg", "method": "tasks/get",
+            "params": modern_params(taskId=run_id),
+        })
+        self.assertEqual(denied["error"]["message"], "unauthorized")
+        allowed = server.handle({
+            "jsonrpc": "2.0", "id": "tg2", "method": "tasks/get",
+            "params": modern_params(taskId=run_id, meta={"authorization": "secret"}),
+        })
+        self.assertEqual(allowed["result"]["taskId"], run_id)
+
+    def test_ungguessable_length_and_whitespace_ids_are_rejected(self) -> None:
+        server, *_ = _server()
+        bad = server.handle({
+            "jsonrpc": "2.0", "id": "tg", "method": "tasks/get",
+            "params": modern_params(taskId="has space"),
+        })
+        self.assertIn("error", bad)
+        too_long = server.handle({
+            "jsonrpc": "2.0", "id": "tg2", "method": "tasks/cancel",
+            "params": modern_params(taskId="a" * 129),
+        })
+        self.assertIn("error", too_long)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -33,6 +33,16 @@ recorded on F60, CSL-762).
 
   Stop carries `destructiveHint: true` per 398cd812; the older CSL-762/F60 handoff wording
   (`destructiveHint: false` on start and stop) is superseded.
+- `mcp_dual_era.py` (CSL-766, B5 / F56): an offline reading of Claude Code
+  ``2.1.312`` and MCP spec ``38353251fab3bdeead03dd8283b9e66076ce1a7f``. Default
+  (unset or ``auto``) negotiates ``2026-07-28`` via ``server/discover`` when the
+  server supports it; ``MCP_PROTOCOL_NEGOTIATION=legacy`` initializes on
+  ``2025-06-18``. A dual-era mock server speaks both over one ``ControlAPI`` so
+  the same run id and Stop are visible from either era (n=5). Native Tasks
+  ``CreateTaskResult`` is returned from ``tools/call`` only when the request
+  lists ``io.modelcontextprotocol/tasks``. ``tasks/list`` and
+  ``notifications/cancelled`` are not served. Live binary wire-capture is
+  unmeasured (no Claude Code is spawned).
 - `codex_config.py`: `codex_operator_snippet(server_id, command, args)` writes the operator's Codex TOML,
   setting `approval_mode = "approve"` under `mcp_servers.<id>.tools.recursion_run_stop`, so stop does not
   prompt where that setting is in place. `strict_auto_review` or a managed approval requirement can still

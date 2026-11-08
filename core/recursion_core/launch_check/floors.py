@@ -5,11 +5,14 @@ refused (``engine_unknown``). Each engine has two separate slots:
 
 * ``functional``: the Q43 functional floor (PRODUCT.md O50, 11.6), the lowest
   version that passes the conformance cells. ``None`` means no functional floor
-  is recorded, and the check refuses (``floor_unset``): "functional floors from
-  day one" fails closed rather than launching an unfloored engine.
+  is recorded. O50 ("Beta until measured") does not refuse the engine for that:
+  the grant is tagged ``beta`` for route.list, and only known security floors
+  are checked.
 * ``security``: a relayed security floor (hygiene, not containment; 11.6).
 
-A grant needs ``found >= security`` (when set) and ``found >= functional``.
+A grant needs ``found >= security`` (when set). When a functional floor is set,
+it also needs ``found >= functional``. When it is unset, the engine still runs
+under the beta tag.
 A floor change is a new ``FLOOR_TABLE_VERSION``, never an in-place edit; grants
 issued under another table version are refused (``grant_stale``).
 """
@@ -22,7 +25,7 @@ from types import MappingProxyType
 
 from recursion_core.launch_check.refusals import LaunchRefused
 
-FLOOR_TABLE_VERSION = "r2a-floors/1.0.0-candidate-2026-11-07"
+FLOOR_TABLE_VERSION = "r2a-floors/1.1.0-candidate-2026-11-08"
 
 
 @dataclass(frozen=True)
@@ -47,14 +50,14 @@ _SPECS = (
         ident=r"\bclaude\b",
         probe_env=(("DISABLE_AUTOUPDATER", "1"), ("DISABLE_UPDATES", "1")),
     ),
-    # Codex: Lucas's build instruction (Nov 7) is "no lower than 0.131.0 security floor".
-    # The functional slot holds 0.131.0 as a CANDIDATE pending measurement (Q43 accept:
-    # the security floor is the lower bound). rust-v0.145.0 (first tag with all 15
-    # --disable keys, PRODUCT.md 11.6) is an unmeasured candidate and is NOT applied here.
+    # Codex: 0.131.0 is a security floor only (A-35, 11.6). There is no measured
+    # functional floor, so Codex runs as beta until measured (O50). rust-v0.145.0
+    # (first tag with all 15 --disable keys, PRODUCT.md 11.6) is an unmeasured
+    # candidate and is NOT applied here.
     EngineSpec(
-        "codex", ("codex",), "semver", "0.131.0", "0.131.0",
-        "candidate pending measurement: set to the 0.131.0 security floor per Lucas's Nov 7 build "
-        "instruction; rust-v0.145.0 is an unmeasured candidate (11.6)",
+        "codex", ("codex",), "semver", None, "0.131.0",
+        "O50: no conformance measurement; tagged beta until measured. rust-v0.145.0 "
+        "is an unmeasured candidate (11.6) and is not applied",
         "A-35, PRODUCT.md 11.6",
         ident=r"\bcodex",
     ),
@@ -174,13 +177,18 @@ def _floor_key(spec: EngineSpec, floor: str) -> tuple[int, ...]:
 
 
 def check_floors(spec: EngineSpec, found: ParsedVersion) -> None:
-    """Security floor (when set), then the functional floor; ``floor_unset`` when none."""
+    """Security floor (when set), then the functional floor when one is measured.
+
+    An unset functional floor is not a refusal: the caller tags the grant beta
+    for route.list (O50). ``floor_unset`` is reserved for a table floor that
+    does not parse.
+    """
     if found.prerelease is not None:
         raise LaunchRefused("version_refused", spec.engine, f"prerelease {found.prerelease!r}; floors name releases only")
     if spec.security is not None and found.key < _floor_key(spec, spec.security):
         raise LaunchRefused("version_refused", spec.engine, f"found {found.text} < security floor {spec.security}")
     if spec.functional is None:
-        raise LaunchRefused("floor_unset", spec.engine, f"found {found.text}; no functional floor ({spec.functional_basis})")
+        return
     if found.key < _floor_key(spec, spec.functional):
         raise LaunchRefused("version_refused", spec.engine, f"found {found.text} < functional floor {spec.functional}")
 

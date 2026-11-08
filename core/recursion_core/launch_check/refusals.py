@@ -21,7 +21,7 @@ REFUSAL_CODES = frozenset(
         "binary_changed",  # digest or resolution differs from the grant
         "engine_mismatch",  # version line names another engine
         "version_unparsed",  # version token does not match the engine's format
-        "floor_unset",  # no functional floor recorded: fail closed
+        "floor_unset",  # a floor in the table does not parse
         "version_refused",  # below a floor, or a prerelease
         "argv_empty",  # launch plan with no argv
         "argv0_mismatch",  # argv[0] is not the bare engine name

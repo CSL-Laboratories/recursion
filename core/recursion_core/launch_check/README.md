@@ -5,9 +5,9 @@ version is checked against a versioned floor table, failing closed. Candidate co
 yet called by a running core, and not reviewed or accepted. Master `scripts/v3` is frozen
 and untouched; its `LIVE_ADAPTERS_ENABLED` stays `False`.
 
-Governing spec: `contracts/PRODUCT.md` at csl-research `398cd812cb8a9cf0ef3d1950f1b15bd9a76e3dfa`
-(SHA-256 `36666beeadacb2af741db0ee55022b2e3911513b4de329ec500d50badbb3a226`), section 3.3
-"R2a defined" (grill Q22), O50 and 11.6 (grill Q43, functional floors), 34b (nine engines).
+Governing spec: `contracts/PRODUCT.md` at csl-research `055cc7a5c793b7135e5d0565dc4198cf96230531`
+(SHA-256 `e64783152f6d67d4ede774dc41d112fe46c2d7536d53cb2c04e71a3566044daf`), section 3.3
+"R2a defined" (grill Q22), O50 ("Beta until measured") and 11.6 (grill Q43, functional floors), 34b (nine engines).
 Build-order item 5 (B10). Recursion hard rule 8 still applies: no live provider call until
 R2a merges and `CONTROL_PLANE.md` records each route's account and spend ceiling.
 
@@ -28,11 +28,12 @@ R2a merges and `CONTROL_PLANE.md` records each route's account and spend ceiling
   `.sh`, text). It hashes the realpath (full SHA-256 and size), runs the zero-egress version
   probe, re-hashes (`binary_changed` if it changed while probing), and refuses a non-zero
   exit or timeout (`version_probe_failed`), a line naming another engine (`engine_mismatch`),
-  an unparsed version (`version_unparsed`), a prerelease or a version below a floor
-  (`version_refused`), and an engine with no functional floor (`floor_unset`).
+  an unparsed version (`version_unparsed`), or a prerelease or a version below a
+  known floor (`version_refused`). An unset functional floor is not a refusal:
+  the grant is tagged `beta` for route.list (O50).
 - The grant record holds engine, path, realpath, sha256 (64 hex), size, raw version line,
-  exit code, parsed version, both floors, the floor-table version and the refusal-code
-  version. The grant is a frozen dataclass whose fields are MACed (HMAC-SHA-256) with a
+  exit code, parsed version, both floors, a `beta` tag when the functional floor is
+  unset, the floor-table version and the refusal-code version. The grant is a frozen dataclass whose fields are MACed (HMAC-SHA-256) with a
   per-process key; `launch_plan` refuses anything else (`grant_forged`) and any grant issued
   under another table or code version (`grant_stale`), and re-checks the floors.
 - `launch_plan(grant, argv, env)`: `argv` non-empty (`argv_empty`); `argv[0]` is the bare
@@ -64,16 +65,19 @@ Claude Code's `DISABLE_AUTOUPDATER=1` and `DISABLE_UPDATES=1`. No proxy, credent
 config-path or `CLI_VERSION` variable can reach it. Limit: this is not a kernel network
 block; a network namespace belongs to the launch sandbox (B6), not this check.
 
-## Floor table `r2a-floors/1.0.0-candidate-2026-11-07`
+## Floor table `r2a-floors/1.1.0-candidate-2026-11-08`
 
-Two slots per engine. A grant needs `found >= security` (when set) **and** a functional
-floor with `found >= functional`; with no functional floor it refuses `floor_unset`.
-A floor change is a new table version (grants under the old version become `grant_stale`).
+Two slots per engine. A grant needs `found >= security` when a security floor is set.
+When a functional floor is set, it also needs `found >= functional`. With no functional
+floor the engine still runs and the grant is tagged `beta` for route.list (O50, "Beta
+until measured"). A floor change is a new table version (grants under the old version
+become `grant_stale`). `floor_unset` remains in the closed refusal set for a table
+floor that does not parse.
 
 | Engine (binaries) | Scheme | Functional floor (Q43) | Security floor (relayed) |
 |---|---|---|---|
 | claude_code (`claude`) | semver | 2.1.314 (decided, O50/Q43; not yet measured, CX-956) | 2.1.260 (11.6) |
-| codex (`codex`) | semver | 0.131.0 **candidate pending measurement** | 0.131.0 (A-35, 11.6) |
+| codex (`codex`) | semver | unset (beta until measured) | 0.131.0 (A-35, 11.6; security floor only) |
 | opencode (`opencode`, `opencode2`) | semver | unset | 1.18.33 (D2-72) |
 | grok (`grok`) | semver | unset (O50: once measured) | none |
 | antigravity (`agy`) | semver (assumed) | unset | none |
@@ -82,10 +86,10 @@ A floor change is a new table version (grants under the old version become `gran
 | pi (`pi`) | semver (assumed) | unset | none |
 | hermes (`hermes`, read via `hermes-acp`) | semver (assumed) | unset | none |
 
-Codex: Lucas's instruction for this build is "no lower than 0.131.0 security floor", so
-the functional slot holds 0.131.0 as a candidate until measured (Q43: the security floor
-is the lower bound). `rust-v0.145.0` (first tag with all 15 `--disable` keys, 11.6) is an
-**unmeasured candidate** and is not applied; measuring it is F17 work.
+Codex: 0.131.0 is a security floor only. There is no measured functional floor, so Codex
+runs as beta until measured (O50). `rust-v0.145.0` (first tag with all 15 `--disable`
+keys, 11.6) is an **unmeasured candidate** and is not applied; measuring it is F17 work.
+Claude Code keeps its 2.1.314 functional floor and 2.1.260 security floor.
 
 Version parsing is strict. Semver: the first word holding `digit.digit` must be
 `[v]MAJOR.MINOR.PATCH[-prerelease]` with no leading zeros; a prerelease is `version_refused`
@@ -98,7 +102,7 @@ unparsed. Real-shape lines covered: `2.1.318 (Claude Code)`, `codex-cli 0.160.0`
 Known consequences, by design: Gemini CLI and Pi run JS bundles under node and Hermes is a
 Python entry point (11.6), so under the native-binary rule they are `wrapper_refused`
 until a launcher-plus-tree pin exists; Cursor likewise (no native engine binary, #1087
-section 6.2). With functional floors unset they would refuse `floor_unset` anyway.
+section 6.2). Once a native pin exists they run as beta until a functional floor is measured.
 
 ## Limits
 

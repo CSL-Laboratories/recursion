@@ -62,14 +62,14 @@ class FloorTableTests(unittest.TestCase):
         slots = {e: (s.functional, s.security) for e, s in FLOORS.items()}
         self.assertEqual(
             {
-                "claude_code": ("2.1.314", "2.1.260"), "codex": ("0.131.0", "0.131.0"),
+                "claude_code": ("2.1.314", "2.1.260"), "codex": (None, "0.131.0"),
                 "opencode": (None, "1.18.33"), "grok": (None, None), "antigravity": (None, None),
                 "cursor": (None, "2025.09.17-25b418f"), "gemini": (None, "0.39.1"), "pi": (None, None),
                 "hermes": (None, None),
             },
             slots,
         )
-        self.assertIn("candidate pending measurement", FLOORS["codex"].functional_basis)
+        self.assertIn("beta until measured", FLOORS["codex"].functional_basis)
         self.assertIn("0.145.0", FLOORS["codex"].functional_basis)
 
     def test_table_is_read_only(self) -> None:
@@ -243,10 +243,13 @@ class LaunchCheckTests(unittest.TestCase):
         grants, records = launch_check(d, probe=F.probe)
         by = {r["engine"]: r for r in records}
         self.assertEqual(set(FLOORS), set(by))
-        self.assertEqual({"claude_code", "codex"}, set(grants))
+        self.assertEqual({"claude_code", "codex", "opencode"}, set(grants))
         self.assertEqual("granted", by["claude_code"]["outcome"])
         self.assertEqual("2.1.318 (Claude Code)", by["claude_code"]["version_raw"])
-        self.assertEqual(("refused", "floor_unset"), (by["opencode"]["outcome"], by["opencode"]["refusal"]))
+        self.assertFalse(by["claude_code"]["beta"])
+        self.assertTrue(by["codex"]["beta"])
+        self.assertEqual("granted", by["opencode"]["outcome"])
+        self.assertTrue(by["opencode"]["beta"])
         self.assertEqual("version_refused", by["gemini"]["refusal"])
         self.assertEqual("wrapper_refused", by["cursor"]["refusal"])
         for engine in ("grok", "antigravity", "pi", "hermes"):

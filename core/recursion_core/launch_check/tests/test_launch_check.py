@@ -107,12 +107,14 @@ class GrantTests(Base):
         self.assertEqual("2.1.318", g.version)
         self.assertEqual(0, g.exit_code)
         self.assertEqual(("2.1.314", "2.1.260"), (g.floor_functional, g.floor_security))
+        self.assertFalse(rec["beta"])
         self.assertNotIn("mac", rec)
 
     def test_codex_real_shape_line_grants(self) -> None:
         g = self.g("codex", F.make("codex", CODEX))
         self.assertEqual("0.160.0", g.version)
-        self.assertEqual(("0.131.0", "0.131.0"), (g.floor_functional, g.floor_security))
+        self.assertEqual((None, "0.131.0"), (g.floor_functional, g.floor_security))
+        self.assertTrue(g.record()["beta"])
 
     def test_floor_boundaries(self) -> None:
         cells = [
@@ -129,26 +131,32 @@ class GrantTests(Base):
             ("codex", "codex", "codex-cli 0.145.0", None),
             ("codex", "codex", "codex-cli 0.167.0", None),
             ("codex", "codex", "codex-cli 0.131.0-alpha.2", "version_refused"),
-            ("opencode", "opencode", "opencode v2.2.5", "floor_unset"),
-            ("opencode", "opencode2", "opencode v2.2.5", "floor_unset"),
+            ("opencode", "opencode", "opencode v2.2.5", None),
+            ("opencode", "opencode2", "opencode v2.2.5", None),
             ("opencode", "opencode", "1.18.32", "version_refused"),
-            ("opencode", "opencode", "1.18.33", "floor_unset"),
-            ("cursor", "agent", "2026.10.22", "floor_unset"),
-            ("cursor", "cursor-agent", "2026.10.01-e373342", "floor_unset"),
+            ("opencode", "opencode", "1.18.33", None),
+            ("cursor", "agent", "2026.10.22", None),
+            ("cursor", "cursor-agent", "2026.10.01-e373342", None),
             ("cursor", "agent", "2025.09.16-abcdef0", "version_refused"),
-            ("cursor", "agent", "2025.09.17-25b418f", "floor_unset"),
+            ("cursor", "agent", "2025.09.17-25b418f", None),
             ("gemini", "gemini", "0.39.0", "version_refused"),
-            ("gemini", "gemini", "0.39.1", "floor_unset"),
-            ("grok", "grok", "grok 1.0.0", "floor_unset"),
-            ("antigravity", "agy", "1.2.3", "floor_unset"),
-            ("pi", "pi", "0.30.2", "floor_unset"),
+            ("gemini", "gemini", "0.39.1", None),
+            ("grok", "grok", "grok 1.0.0", None),
+            ("antigravity", "agy", "1.2.3", None),
+            ("pi", "pi", "0.30.2", None),
         ]
         for engine, name, line, want in cells:
             for i in range(N):
                 with self.subTest(engine=engine, line=line, i=i):
                     p = F.make(name, line)
                     if want is None:
-                        self.assertEqual(engine, self.g(engine, p).engine)
+                        g = self.g(engine, p)
+                        self.assertEqual(engine, g.engine)
+                        rec = g.record()
+                        if engine == "claude_code":
+                            self.assertFalse(rec["beta"])
+                        else:
+                            self.assertTrue(rec["beta"], engine)
                     else:
                         self.refused(want, self.g, engine, p)
 
@@ -160,11 +168,14 @@ class GrantTests(Base):
         d = F.dir()
         F.make("hermes", "", where=d)
         F.make("hermes-acp", "hermes-acp 0.9.1", where=d)
-        self.refused("floor_unset", self.g, "hermes", os.path.join(d, "hermes"))
+        g = self.g("hermes", os.path.join(d, "hermes"))
+        self.assertTrue(g.record()["beta"])
+        self.assertEqual("0.9.1", g.version)
         table = dict(floors_mod.FLOORS)
         table["hermes"] = dataclasses.replace(table["hermes"], functional="0.9.0")
         with mock.patch.object(floors_mod, "FLOORS", table):
             g = self.g("hermes", os.path.join(d, "hermes"))
+            self.assertFalse(g.record()["beta"])
             self.assertEqual(os.path.join(d, "hermes-acp"), g.probe_path)
             self.assertNotEqual(g.sha256, g.probe_sha256)
             self.assertEqual("hermes-acp 0.9.1", g.version_raw)
@@ -398,8 +409,11 @@ class LaunchPlanTests(Base):
         with mock.patch.object(floors_mod, "FLOORS", table):
             self.refused("version_refused", launch_plan, g, ["claude"])
 
-    def test_floor_unset_engine_never_reaches_a_plan(self) -> None:
-        self.refused("floor_unset", self.g, "grok", F.make("grok", "grok 1.0.0"))
+    def test_unset_functional_floor_grants_as_beta_and_reaches_a_plan(self) -> None:
+        g = self.g("grok", F.make("grok", "grok 1.0.0"))
+        self.assertTrue(g.record()["beta"])
+        plan = launch_plan(g, ["grok"])
+        self.assertEqual(g.realpath, plan.exec_argv()[0])
 
 
 @needs_exec

@@ -60,6 +60,8 @@ class Grant:
     def record(self) -> dict[str, object]:
         out = {f.name: getattr(self, f.name) for f in fields(self) if f.name != "mac"}
         out["outcome"] = "granted"
+        # O50: no measured functional floor => beta on route.list.
+        out["beta"] = self.floor_functional is None
         return out
 
 

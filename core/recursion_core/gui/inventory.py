@@ -7,8 +7,10 @@ Nov 11 needs that the control API did not report, as a gap with its blocker.
 Rubric: a route is ``mature`` only when every bar (``BARS``) passed *and* names its
 evidence. A failing, missing or evidence-less bar makes it ``beta``. A record that
 claims ``mature`` while the rubric says ``beta`` is shown as beta with the claim marked
-rejected; a record without a ``maturity`` field is shown as beta and flagged. There is
-no score and no majority rule.
+rejected; a record without a ``maturity`` field is shown as beta and flagged. A
+malformed record (not an object, a missing or non-string class, or a non-string subject field) is
+shown as a beta row flagged ``malformed_route_record`` and covers no required route.
+There is no score and no majority rule.
 
 O50 ("Beta until measured"): a route the control API or its launch record tags beta
 (``maturity`` exactly ``"beta"``, or ``beta`` set to ``true`` as the R2a launch grant does
@@ -42,21 +44,38 @@ _ID = re.compile(r"[A-Za-z0-9_.:/-]{1,96}")
 def _subject(record: dict) -> str | None:
     """The thing a record covers inside its class, e.g. the engine id or the MCP version."""
     cls = record.get("class")
+    if type(cls) is not str:
+        return None
     key = {"engine": "engine", "own_loop": "vendor", "surface": "surface", "mcp": "mcp_version"}.get(cls)
     if key:
-        return record.get(key)
+        return record.get(key) if type(record.get(key)) is str else None
     if cls == "venue_use":
-        return "%s:%s" % (record.get("venue"), record.get("use"))
+        venue, use = record.get("venue"), record.get("use")
+        return "%s:%s" % (venue, use) if type(venue) is str and type(use) is str else None
     if cls == "plugin_panels":
         return "plugin_panels"
     return None
 
 
+_SUBJECT_FIELDS = {"engine": ("engine",), "own_loop": ("vendor",), "surface": ("surface",),
+                   "mcp": ("mcp_version",), "venue_use": ("venue", "use")}
+
+
+def _well_formed(record: object) -> bool:
+    """An object with a string class whose subject fields, where present, are strings."""
+    if type(record) is not dict or type(record.get("class")) is not str:
+        return False
+    return all(type(record[f]) is str for f in _SUBJECT_FIELDS.get(record["class"], ()) if f in record)
+
+
 def assess(record: object) -> dict:
     """Return the record as the GUI shows it, with the rubric applied. Never upgrades."""
-    if type(record) is not dict:
-        return {"id": "invalid", "class": "invalid", "maturity": "beta", "claim": "invalid_record",
-                "beta_tag": False, "failed_bars": list(BARS), "blocker": "control API returned a malformed route record"}
+    if not _well_formed(record):
+        rid = record.get("id") if type(record) is dict else None
+        return {"id": rid if type(rid) is str and _ID.fullmatch(rid) else "invalid",
+                "class": "invalid", "subject": "", "sign_in": "", "configured": False,
+                "maturity": "beta", "claim": "malformed_route_record", "beta_tag": False,
+                "failed_bars": list(BARS), "blocker": "malformed route record from the control API"}
     bars = record.get("bars") if type(record.get("bars")) is dict else {}
     failed = []
     for bar in BARS:
@@ -93,7 +112,7 @@ def coverage_gaps(records: list, required: dict | None = None) -> list[dict]:
     """Required route classes the control API did not report. Each gap is beta with a blocker."""
     seen: dict[str, set] = {}
     for record in records:
-        if type(record) is dict:
+        if _well_formed(record):  # a malformed record never hides a required-route gap
             seen.setdefault(record.get("class"), set()).add(_subject(record))
     gaps = []
     for cls, subjects in (REQUIRED if required is None else required).items():

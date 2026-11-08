@@ -321,8 +321,90 @@ class PageTests(GuiHarness):
     def test_routes_unavailable_is_reported(self) -> None:
         self.app = Application(ControlClient(broken_transport), _Door(), frozenset({HOST}), frozenset({ORIGIN}))
         body = self.request("GET", "/")[2]
-        self.assertIn("Routes unavailable: control_api_unavailable", body)
+        self.assertIn("Route inventory unavailable: control_api_unavailable", body)
         self.assertNotIn("MATURE</span>", body)
+
+    def test_route_outage_is_not_reported_as_missing_inventory(self) -> None:
+        # Devin r4505409118: a failed GET /v1/routes must not list required routes as gaps.
+        outages = {"transport": broken_transport,
+                   "error_status": lambda m, p, b: (503, b'{"error": "starting"}'),
+                   "bad_json": lambda m, p, b: (200, b"not json"),
+                   "routes_not_a_list": lambda m, p, b: (200, b'{"routes": {}}')}
+        for name, transport in outages.items():
+            with self.subTest(outage=name):
+                self.app = Application(ControlClient(transport), _Door(), frozenset({HOST}), frozenset({ORIGIN}))
+                status, _, body = self.request("GET", "/")
+                self.assertEqual(status, "200 OK")
+                self.assertIn("Route inventory unavailable:", body)
+                self.assertIn("Route coverage is unknown", body)
+                self.assertNotIn("gap:", body)
+                self.assertNotIn("did not report this route", body)
+                self.assertNotIn('<span class="badge">', body)
+
+    def test_malformed_route_records_render_as_flagged_rows(self) -> None:
+        # Devin r4505409084: malformed /v1/routes records must never crash the overview.
+        good = _route("engine:codex:chatgpt", "engine", "mature", _bars(), engine="codex", sign_in="chatgpt")
+        malformed = [None, 7, "engine", [], {}, {"id": "no-class"}, {"id": "list-class", "class": []},
+                     {"id": "dict-class", "class": {"a": 1}}, _route("engine:list", "engine", engine=[]),
+                     _route("mcp:dict", "mcp", mcp_version={"v": 1}),
+                     _route("venue:bad", "venue_use", venue="kalshi", use=None)]
+        for record in malformed:
+            with self.subTest(record=record):
+                row = assess(record)
+                self.assertEqual((row["maturity"], row["claim"], row["class"]),
+                                 ("beta", "malformed_route_record", "invalid"))
+                for key in ("id", "subject", "sign_in", "configured", "beta_tag", "failed_bars", "blocker"):
+                    self.assertIn(key, row)
+                self.assertEqual(project(row, "gui"), "BETA")
+        # Malformed records cover nothing, so they never hide a required-route gap.
+        self.assertEqual(coverage_gaps(malformed), coverage_gaps([]))
+        self.assertEqual(assess(good)["maturity"], "mature")  # well-formed records are unaffected
+        self.assertEqual(assess(_route("engine:no-subject", "engine"))["claim"], "ok")  # missing is not malformed
+        self.api.routes = [good] + malformed
+        status, _, body = self.request("GET", "/")
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(body.count("(malformed_route_record)"), len(malformed))
+        self.assertIn("malformed route record from the control API", body)
+        self.assertEqual(body.count('<span class="badge">MATURE</span>'), 1)
+        self.assertIn("gap:engine:hermes", body)
+        self.assertNotIn("gap:engine:codex", body)
+
+    def test_lost_intervention_reply_is_uncertain_not_unsent(self) -> None:
+        # Devin r4505409056: a sent intervention with no readable reply has an unknown outcome.
+        sent = []
+
+        def after_sending(reply):
+            def transport(method, path, body):
+                sent.append(path)
+                return reply()
+            return transport
+
+        def timeout():
+            raise TimeoutError("reply lost")
+        failures = {"timeout": timeout,
+                    "connection_reset": lambda: (_ for _ in ()).throw(ConnectionResetError("closed")),
+                    "malformed_json": lambda: (200, b"{truncated"),
+                    "non_object_reply": lambda: (200, b"[]"),
+                    "error_status": lambda: (502, b'{"error": "upstream"}')}
+        for name, reply in failures.items():
+            with self.subTest(failure=name):
+                sent.clear()
+                self.app = Application(ControlClient(after_sending(reply)), _Door(), frozenset({HOST}),
+                                       frozenset({ORIGIN}))
+                status, _, body = self.request("POST", "/action", {"command": ACTIONS[2], "confirm": "explicit"})
+                self.assertEqual((status, sent), ("200 OK", ["/v1/operator"]))
+                self.assertIn("Intervention outcome: unknown", body)
+                self.assertIn("Check the run and event log before retrying", body)
+                self.assertNotIn("not sent", body.lower())
+
+    def test_intervention_refused_before_sending_says_not_sent(self) -> None:
+        class RefusingClient(ControlClient):
+            def operator(self, command, confirmed=False):
+                raise ControlError("confirmation_required")  # as o7_command does, before any transport call
+        self.app = Application(RefusingClient(broken_transport), _Door(), frozenset({HOST}), frozenset({ORIGIN}))
+        body = self.request("POST", "/action", {"command": ACTIONS[0], "confirm": "explicit"})[2]
+        self.assertIn("Request not sent: confirmation_required", body)
+        self.assertNotIn("outcome: unknown", body)
 
     def test_venue_data_withheld_while_switch_off(self) -> None:
         secret_number = "4242.17"

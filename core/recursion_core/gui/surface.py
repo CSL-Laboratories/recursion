@@ -47,6 +47,8 @@ _CSS_HASH = base64.b64encode(hashlib.sha256(_CSS.encode()).digest()).decode()
 _CSP = ("default-src 'none'; style-src 'sha256-%s'; form-action 'self'; frame-ancestors 'none'; "
         "base-uri 'none'" % _CSS_HASH)
 _MAX_BODY = 4096
+# Codes the client raises before anything is sent; every other failure is after sending.
+_REFUSED_BEFORE_SENDING = frozenset({"command_not_in_operator_contract", "confirmation_required"})
 _LABELS = {
     "operator.evidence.inspect": "Evidence and provenance", "operator.strategies.inspect": "Strategies",
     "operator.positions.inspect": "Positions and collateral", "operator.decisions.inspect": "Decisions and refusals",
@@ -148,9 +150,11 @@ class Application:
         try:
             records = self._client.routes()
         except ControlError as exc:
-            records, error = [], exc.code
-        else:
-            error = None
+            # No inventory is not an empty inventory: report no route and no gap.
+            return ('<section aria-labelledby="routes-h"><h2 id="routes-h">Routes</h2>'
+                    '<p role="status">Route inventory unavailable: %s. Route coverage is unknown; '
+                    "no route is reported present or missing until the control API answers.</p></section>"
+                    % escape(exc.code))
         rows = [assess(r) for r in records] + coverage_gaps(records, self._required)
         body = "".join(
             "<tr><th scope=\"row\">%s</th><td>%s</td><td>%s</td><td>%s</td><td><span class=\"badge\">%s</span>"
@@ -160,13 +164,12 @@ class Application:
                                                + ([] if r["claim"] == "ok" else ["(" + r["claim"] + ")"]))),
                 escape(", ".join(r["failed_bars"]) or "none"), escape(r["blocker"] or "-"))
             for r in rows)
-        note = "" if error is None else "<p role=\"status\">Routes unavailable: %s</p>" % escape(error)
-        return ('<section aria-labelledby="routes-h"><h2 id="routes-h">Routes</h2>%s<table><caption>'
+        return ('<section aria-labelledby="routes-h"><h2 id="routes-h">Routes</h2><table><caption>'
                 "Routes from the control API plus required routes it did not report. Bars: %s.</caption>"
                 '<thead><tr><th scope="col">Route</th><th scope="col">Class</th><th scope="col">Covers</th>'
                 '<th scope="col">Sign-in</th><th scope="col">Maturity</th><th scope="col">Failed bars</th>'
                 '<th scope="col">Blocker</th></tr></thead><tbody>%s</tbody></table></section>'
-                % (note, escape(", ".join(BARS)), body))
+                % (escape(", ".join(BARS)), body))
 
     def _home(self, env: dict) -> tuple[str, str]:
         reads = "".join('<li><a href="/read?command=%s">%s</a></li>' % (quote(c), escape(_LABELS[c]))
@@ -249,7 +252,12 @@ class Application:
         try:
             data = self._client.operator(form["command"], confirmed=True)
         except ControlError as exc:
-            return "Request not sent", '<p role="status">Not confirmed: %s</p>' % escape(exc.code)
+            if exc.code in _REFUSED_BEFORE_SENDING:
+                return "Request not sent", '<p role="status">Request not sent: %s</p>' % escape(exc.code)
+            # Sent, but no readable answer: the control API may have recorded it.
+            return "Intervention outcome unknown", (
+                '<p role="status">Intervention outcome: unknown. The request may have reached the '
+                "control API (%s). Check the run and event log before retrying.</p>" % escape(exc.code))
         return _LABELS[form["command"]], "<h2>%s</h2>%s" % (escape(_LABELS[form["command"]]),
                                                              self._o7_view(form["command"], data))
 

@@ -3,7 +3,8 @@
 This module runs no probe. It only judges an evidence record that a founder's host
 run produced (or a structural fixture in tests) and never touches systemd, cgroups
 or another uid. A record whose ``evidence_class`` is not ``host`` can at best be
-``structural``: it checks the contract's shape, not kernel or systemd behaviour.
+``structural``: it checks the record's schema and the contract's logic, not kernel
+or systemd behaviour. Nothing here is a measurement.
 
 Bars (all kept from Nov 7, plus the Nov 8 migration probe):
 
@@ -14,16 +15,21 @@ Bars (all kept from Nov 7, plus the Nov 8 migration probe):
 - migration probe, n=10 per method, with the engine user manager absent: a process
   already in the operator's leaf, as the engine uid, tries
   ``systemd-run --user --scope -- sleep 60`` and a direct write of its own pid to a
-  ``cgroup.procs`` outside the leaf. Every attempt fails, and afterwards
-  ``/proc/<pid>/cgroup`` names the leaf for every pid in the run;
-- the same probe with the engine user manager present is a control and must
-  reproduce the Nov 7 escape through ``systemd-run --user --scope``. A control that
-  does not escape means the probe is not reaching the user manager: the record is
-  ``invalid``, never a pass;
+  ``cgroup.procs`` outside the leaf. Each attempt records the caller's uid and pid,
+  the caller's cgroup before the attempt (it must already be in the leaf), and the
+  run's expected pids. Every attempt fails, and afterwards ``/proc/<pid>/cgroup``
+  names the leaf for every expected pid in the run;
+- the same probe, both methods, n=10 each, with the engine user manager present is
+  a control. Its scope attempts must reproduce the Nov 7 escape (exit 0, sleep in a
+  canonical cgroup outside the leaf); its direct writes are recorded with an explicit
+  outcome either way. A control whose scope attempts do not all escape means the
+  probe is not reaching the user manager: the record is ``invalid``, never a pass;
 - B33: in the cross-uid spawn path, ``PR_SET_PDEATHSIG`` is armed after the uid
   switch (the kernel clears it on a credential change) and before exec. Cleanup
   still never relies on it (cgroup + pidfd, CSL-706); this same-uid launcher does
   not arm it at all.
+
+Malformed records fail closed; ``evaluate`` never raises on them.
 """
 from __future__ import annotations
 
@@ -35,63 +41,128 @@ HOST_FIELDS = ('host', 'kernel', 'systemd', 'captured_at', 'command_log_sha256')
 METHODS = ('scope', 'direct_write')
 
 
-def _inside(path, leaf):
-    try:
-        p, l = PurePosixPath(path), PurePosixPath(leaf)
-    except TypeError:
+def _int(value, minimum=0):
+    return isinstance(value, int) and not isinstance(value, bool) and value >= minimum
+
+
+def _canonical(path):
+    """An absolute, canonical cgroup path: no '.', '..', '//', trailing '/' or NUL."""
+    if not isinstance(path, str) or not path.startswith('/') or '\0' in path:
         return False
-    return p.is_absolute() and '..' not in p.parts and (p == l or l in p.parents)
+    if path != '/' and (path.endswith('/') or '//' in path):
+        return False
+    parts = PurePosixPath(path).parts
+    return '..' not in parts and '.' not in path.split('/') and str(PurePosixPath(path)) == path
+
+
+def _inside(path, leaf):
+    if not (_canonical(path) and _canonical(leaf)):
+        return False
+    p, l = PurePosixPath(path), PurePosixPath(leaf)
+    return p == l or l in p.parents
 
 
 def _count(value, n):
-    """(ok, total) pairs must be exactly n trials with integer counts."""
     if not isinstance(value, dict):
         return None
     ok, total = value.get('ok'), value.get('total')
-    if any(isinstance(v, bool) or not isinstance(v, int) for v in (ok, total)):
-        return None
-    if total != n or not 0 <= ok <= total:
+    if not (_int(ok) and _int(total)) or total != n or ok > total:
         return None
     return ok
 
 
-def _attempt_failed(attempt, leaf):
-    """One manager-absent migration attempt: refused, and every run pid still in the leaf."""
-    method = attempt.get('method')
-    if method == 'scope':
-        if tuple(attempt.get('argv', ())) != SCOPE_ARGV:
-            return False, 'scope argv differs from the contract'
-        if not isinstance(attempt.get('exit_code'), int) or attempt['exit_code'] == 0:
-            return False, 'systemd-run --user --scope succeeded'
-        sleep_cgroup = attempt.get('sleep_cgroup')
-        if sleep_cgroup is not None and not _inside(sleep_cgroup, leaf):
-            return False, f'sleep landed outside the leaf: {sleep_cgroup}'
-    elif method == 'direct_write':
-        target = attempt.get('target')
-        if not isinstance(target, str) or _inside(target, leaf) or not target.endswith('/cgroup.procs'):
-            return False, 'direct write target is not a cgroup.procs outside the leaf'
-        if attempt.get('refused') is not True:
-            return False, f'write of own pid to {target} was not refused'
-    else:
-        return False, f'unknown method {method!r}'
+def _pid_key(key):
+    if isinstance(key, bool):
+        return None
+    if isinstance(key, int):
+        return key if key > 0 else None
+    if isinstance(key, str) and key.isdigit() and not key.startswith('0'):
+        return int(key)
+    return None
+
+
+def _shape(attempt, leaf, engine_uid):
+    """Common migration-attempt fields. Returns (ok, reason, run_pids as {int: path})."""
+    if not isinstance(attempt, dict):
+        return False, 'attempt is not a mapping', {}
+    if attempt.get('uid') != engine_uid or not _int(attempt.get('uid'), 1):
+        return False, 'attempt did not run as the engine uid', {}
+    pid = attempt.get('pid')
+    if not _int(pid, 1):
+        return False, 'caller pid missing or invalid', {}
+    if not _inside(attempt.get('initial_cgroup'), leaf):
+        return False, 'caller was not inside the leaf before the attempt', {}
+    expected = attempt.get('expected_pids')
+    if not isinstance(expected, list) or not expected or not all(_int(p, 1) for p in expected) \
+            or len(set(expected)) != len(expected) or pid not in expected:
+        return False, 'expected run pids missing, invalid, or without the caller', {}
     pids = attempt.get('run_pids')
-    if not isinstance(pids, dict) or not pids:
-        return False, 'no /proc/<pid>/cgroup read-back for the run'
-    stray = sorted(str(pid) for pid, group in pids.items() if not _inside(group, leaf))
+    if not isinstance(pids, dict):
+        return False, 'no /proc/<pid>/cgroup read-back for the run', {}
+    readback = {}
+    for key, group in pids.items():
+        k = _pid_key(key)
+        if k is None or k in readback:
+            return False, f'invalid pid in read-back: {key!r}', {}
+        readback[k] = group
+    if set(readback) != set(expected):
+        return False, 'read-back pids differ from the expected run pids', {}
+    if attempt.get('method') == 'scope':
+        if not isinstance(attempt.get('argv'), list) or tuple(attempt['argv']) != SCOPE_ARGV:
+            return False, 'scope argv differs from the contract', {}
+        code = attempt.get('exit_code')
+        if isinstance(code, bool) or not isinstance(code, int):
+            return False, 'scope exit code missing or not an int', {}
+    elif attempt.get('method') == 'direct_write':
+        target = attempt.get('target')
+        if not _canonical(target) or _inside(target, leaf) or not target.endswith('/cgroup.procs'):
+            return False, 'direct write target is not a canonical cgroup.procs outside the leaf', {}
+        if attempt.get('written_pid') != pid:
+            return False, 'direct write did not write the caller\'s own pid', {}
+        if not isinstance(attempt.get('refused'), bool):
+            return False, 'direct write outcome not recorded', {}
+    else:
+        return False, f'unknown method {attempt.get("method")!r}', {}
+    return True, '', readback
+
+
+def _absent_attempt(attempt, leaf, engine_uid):
+    ok, why, readback = _shape(attempt, leaf, engine_uid)
+    if not ok:
+        return False, why
+    if attempt['method'] == 'scope':
+        if attempt['exit_code'] == 0:
+            return False, 'systemd-run --user --scope succeeded'
+        sleep = attempt.get('sleep_cgroup')
+        if sleep is not None and not _inside(sleep, leaf):
+            return False, f'sleep landed outside the leaf: {sleep!r}'
+    elif attempt['refused'] is not True:
+        return False, f'write of own pid to {attempt["target"]} was not refused'
+    stray = sorted(str(p) for p, group in readback.items() if not _inside(group, leaf))
     if stray:
         return False, f'pids outside the leaf after the attempt: {", ".join(stray)}'
     return True, ''
 
 
-def _control_escaped(attempt, leaf):
-    return (attempt.get('method') == 'scope'
-            and tuple(attempt.get('argv', ())) == SCOPE_ARGV
-            and attempt.get('exit_code') == 0
-            and isinstance(attempt.get('sleep_cgroup'), str)
-            and not _inside(attempt['sleep_cgroup'], leaf))
+def _control_attempt(attempt, leaf, engine_uid):
+    ok, why, _ = _shape(attempt, leaf, engine_uid)
+    if not ok:
+        return False, why
+    if attempt['method'] == 'scope':
+        sleep = attempt.get('sleep_cgroup')
+        if attempt['exit_code'] != 0 or not _canonical(sleep) or _inside(sleep, leaf):
+            return False, 'scope control did not escape to a canonical cgroup outside the leaf'
+    return True, ''  # direct-write controls: shape and explicit outcome only
 
 
-def _per_method(attempts, method):
+def _attempts(arm):
+    if not isinstance(arm, dict):
+        return None
+    attempts = arm.get('attempts')
+    return attempts if isinstance(attempts, list) else None
+
+
+def _by_method(attempts, method):
     return [a for a in attempts if isinstance(a, dict) and a.get('method') == method]
 
 
@@ -101,57 +172,79 @@ def evaluate(record):
     ``pass`` needs host-class evidence and every bar. ``invalid`` means the manager-
     present control did not escape, so the manager-absent result proves nothing.
     """
-    reasons = []
     if not isinstance(record, dict):
         return {'verdict': 'fail', 'reasons': ['record is not a mapping']}
     leaf = record.get('leaf')
-    if not isinstance(leaf, str) or not PurePosixPath(leaf).is_absolute():
-        return {'verdict': 'fail', 'reasons': ['leaf path missing']}
+    if not _canonical(leaf) or leaf == '/':
+        return {'verdict': 'fail', 'reasons': ['leaf path missing or not canonical']}
+    engine_uid, operator_uid = record.get('engine_uid'), record.get('operator_uid')
+    if not (_int(engine_uid, 1) and _int(operator_uid) and engine_uid != operator_uid):
+        return {'verdict': 'fail', 'reasons': ['engine_uid must be a non-root uid different from operator_uid']}
+    reasons = []
 
     escapers = record.get('escapers')
     if not isinstance(escapers, dict) or escapers.get('total') != N_ESCAPERS \
-            or escapers.get('escaped') != 0:
+            or not _int(escapers.get('total')) or escapers.get('escaped') != 0 \
+            or not _int(escapers.get('escaped')):
         reasons.append('escapers must be 0/120')
     if _count(record.get('procs_write_refused'), N_PROBE) != N_PROBE:
         reasons.append('engine cgroup.procs writes must be refused 10/10')
     if _count(record.get('user_spawn_refused_or_contained'), N_PROBE) != N_PROBE:
         reasons.append('systemd-run --user must be refused or leaf-contained 10/10')
-    if record.get('terminated_while_populated') != 0:
-        reasons.append('terminated booked while populated=1')
+    populated = record.get('terminated_while_populated')
+    if populated != 0 or not _int(populated):
+        reasons.append('terminated booked while populated=1 (or not recorded)')
 
-    absent = record.get('manager_absent') or {}
-    if absent.get('user_manager') != 'inactive' or absent.get('manager_socket') != 'absent':
+    absent = record.get('manager_absent')
+    attempts = _attempts(absent)
+    if attempts is None:
+        reasons.append('manager-absent arm missing or malformed')
+        attempts = []
+    elif absent.get('user_manager') != 'inactive' or absent.get('manager_socket') != 'absent':
         reasons.append('manager-absent arm did not record user@ inactive and socket absent')
-    attempts = absent.get('attempts') or []
     for method in METHODS:
-        mine = _per_method(attempts, method)
+        mine = _by_method(attempts, method)
         if len(mine) != N_PROBE:
             reasons.append(f'migration {method}: need n={N_PROBE}, got {len(mine)}')
         for i, attempt in enumerate(mine):
-            ok, why = _attempt_failed(attempt, leaf)
+            ok, why = _absent_attempt(attempt, leaf, engine_uid)
             if not ok:
                 reasons.append(f'migration {method} #{i + 1}: {why}')
-    if len(attempts) != len(_per_method(attempts, 'scope')) + len(_per_method(attempts, 'direct_write')):
-        reasons.append('manager-absent attempts include an unknown method')
+    if len(attempts) != sum(len(_by_method(attempts, m)) for m in METHODS):
+        reasons.append('manager-absent attempts include an unknown or malformed entry')
 
     order = record.get('spawn_order')
-    if not isinstance(order, list) or not {'uid_switch', 'pdeathsig', 'exec'} <= set(order) \
+    if not isinstance(order, list) or not all(isinstance(s, str) for s in order) \
+            or not all(order.count(s) == 1 for s in ('uid_switch', 'pdeathsig', 'exec')) \
             or not order.index('uid_switch') < order.index('pdeathsig') < order.index('exec'):
         reasons.append('PR_SET_PDEATHSIG must be armed after the uid switch and before exec (B33)')
 
-    present = record.get('manager_present') or {}
-    controls = _per_method(present.get('attempts') or [], 'scope')
-    control_valid = (present.get('user_manager') == 'active' and len(controls) == N_PROBE
-                     and all(_control_escaped(a, leaf) for a in controls))
+    present = record.get('manager_present')
+    controls = _attempts(present)
+    control_reasons = []
+    if controls is None or present.get('user_manager') != 'active':
+        control_reasons.append('manager-present arm missing, malformed or not active')
+        controls = []
+    for method in METHODS:
+        mine = _by_method(controls, method)
+        if len(mine) != N_PROBE:
+            control_reasons.append(f'control {method}: need n={N_PROBE}, got {len(mine)}')
+        for i, attempt in enumerate(mine):
+            ok, why = _control_attempt(attempt, leaf, engine_uid)
+            if not ok:
+                control_reasons.append(f'control {method} #{i + 1}: {why}')
+    if len(controls) != sum(len(_by_method(controls, m)) for m in METHODS):
+        control_reasons.append('control attempts include an unknown or malformed entry')
 
     if record.get('evidence_class') != 'host':
-        return {'verdict': 'structural', 'reasons': reasons
+        return {'verdict': 'structural', 'reasons': reasons + control_reasons
                 + ['not host evidence: structural check only, no B6 pass']}
-    missing = [f for f in HOST_FIELDS if not record.get(f)]
+    missing = [f for f in HOST_FIELDS if not (isinstance(record.get(f), str) and record.get(f))]
     if missing:
-        return {'verdict': 'fail', 'reasons': reasons + [f'host fields missing: {missing}']}
-    if not control_valid:
-        return {'verdict': 'invalid', 'reasons': reasons + [
-            'manager-present control did not escape 10/10 via systemd-run --user --scope: '
-            'the probe is not reaching the user manager; fix the probe before reading a pass']}
+        return {'verdict': 'fail', 'reasons': reasons + control_reasons + [f'host fields missing: {missing}']}
+    if control_reasons:
+        return {'verdict': 'invalid', 'reasons': reasons + control_reasons + [
+            'manager-present control did not reproduce the escape via systemd-run --user --scope '
+            '(or is incomplete): the probe is not reaching the user manager; fix the probe before '
+            'reading a pass']}
     return {'verdict': 'fail' if reasons else 'pass', 'reasons': reasons}

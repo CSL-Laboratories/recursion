@@ -67,13 +67,19 @@ switches no uid.
 - Migration probe, n=10 per method, engine user manager absent (`user@` inactive,
   `systemd/private` absent): a process already in the leaf, as the engine uid,
   tries `systemd-run --user --scope -- sleep 60` and a direct write of its own pid
-  to a `cgroup.procs` outside the leaf. Every attempt must fail (exit 0 of the
-  scope call fails the bar even if the sleep stayed inside), and afterwards
-  `/proc/<pid>/cgroup` must name the leaf, or a cgroup below it, for every pid in
-  the run.
-- Control, engine user manager present: all 10 scope attempts must exit 0 with
-  the sleep outside the leaf, reproducing the Nov 7 escape. Otherwise the verdict
-  is `invalid`: the probe is not reaching the user manager, and no pass is read.
+  to a `cgroup.procs` outside the leaf. Each attempt records the caller's uid
+  (must be the record's `engine_uid`, not the operator's), its pid, its cgroup
+  before the attempt (must already be in the leaf) and the run's expected pids.
+  Every attempt must fail (exit 0 of the scope call fails the bar even if the
+  sleep stayed inside; a direct write must target a canonical `cgroup.procs`
+  outside the leaf with the caller's own pid), and afterwards
+  `/proc/<pid>/cgroup` must name the leaf, or a cgroup below it, for exactly the
+  expected pids. Paths must be absolute and canonical (no `.`, `..`, `//`).
+- Control, engine user manager present, both methods n=10: all 10 scope attempts
+  must exit 0 with the sleep in a canonical cgroup outside the leaf, reproducing
+  the Nov 7 escape; the 10 direct writes need a recorded outcome either way.
+  Otherwise the verdict is `invalid`: the probe is not reaching the user manager,
+  and no pass is read. Malformed records fail closed and never raise.
 - B33: `spawn_order` must show `PR_SET_PDEATHSIG` armed after the uid switch and
   before exec (the kernel clears it on a credential change). This same-uid
   launcher still never arms it, and cleanup never relies on it (CSL-706).

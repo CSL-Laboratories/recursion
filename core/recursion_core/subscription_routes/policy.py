@@ -28,6 +28,14 @@ login entry. No credential file is opened or read.
 argv, so an engine flag that selects a provider or config is the caller's responsibility. It
 only refuses launch options that would replace the env or widen the launch.
 
+Nov 8 briefing (Lucas): allow a subscription sign-in in these harnesses only where the provider names
+that harness. ChatGPT: OpenCode and Pi, through their registered Sign in with ChatGPT method only. Grok:
+OpenCode and Hermes. Claude and Google sign-ins stay refused in all three; Hermes's setting that borrows
+Claude Code's stored login is off; anything unconfirmed is refused; an API key still works. A profile
+picks one with ``auth: "subscription"`` plus a ``method``; the method is checked, not just the provider
+label (``SUBSCRIPTION_SIGN_INS``). The sign-in stays in the engine's own login store in the route home:
+Recursion holds, copies or ships no token, and a subscription child env carries no credential at all.
+
 Candidate code: no engine, provider or network is used, and nothing here claims a running core
 calls it yet. Provider ids marked unverified below were not read from the engines' source.
 """
@@ -43,6 +51,7 @@ from types import MappingProxyType
 
 __all__ = [
     "CLAUDE_SUBSCRIPTION_ENV",
+    "SUBSCRIPTION_SIGN_INS",
     "ENGINES",
     "ENGINE_SELECTOR_ENV",
     "ENGINE_STORE_ENTRIES",
@@ -142,12 +151,35 @@ ENGINES: Mapping[str, Engine] = MappingProxyType(
 )
 
 
+# Subscription sign-ins allowed per harness (Nov 8 briefing): (provider label, sign-in method), both in
+# Recursion's own normalised names. The engines' native provider and method ids are not in repository
+# evidence, so no other spelling or alias is accepted; the injected argv/driver maps these to the engine.
+# "grok_sign_in" is Recursion's label for the harness's own Grok account sign-in: the briefing allows Grok
+# in OpenCode and Hermes without naming the method, and the engine-native method id is unconfirmed.
+SUBSCRIPTION_SIGN_INS: Mapping[str, Mapping[str, str]] = MappingProxyType(
+    {
+        "opencode": MappingProxyType({"chatgpt": "sign_in_with_chatgpt", "grok": "grok_sign_in"}),
+        "pi": MappingProxyType({"chatgpt": "sign_in_with_chatgpt"}),
+        "hermes": MappingProxyType({"grok": "grok_sign_in"}),
+    }
+)
+# Each engine's own login store, which a subscription route home may hold (presence only; never read).
+# Every other engine's store, and every Claude Code store, still refuses.
+OWN_STORE_ENTRIES: Mapping[str, tuple[str, ...]] = MappingProxyType(
+    {"pi": (".pi",), "hermes": (".hermes",), "opencode": (".local/share/opencode", ".config/opencode")}
+)
+# Google consumer and subscription labels: refused in all three harnesses.
+_GOOGLE_LABELS = ("google", "gemini", "antigravity", "google_one", "google_ai")
+
+
 @dataclass(frozen=True)
 class RouteDecision:
     engine: str
     provider: str
-    credential_env: str
+    credential_env: str  # "" on a subscription sign-in: no credential is in the child env
     flags: tuple[str, ...] = field(default=())  # allowed, but worth a line in the run record
+    auth: str = "api_key"
+    method: str = ""
 
 
 def check_route(
@@ -171,9 +203,17 @@ def check_route(
         raise SubscriptionRouteRefused(engine, "unknown_engine")
     if not isinstance(profile, Mapping):
         raise SubscriptionRouteRefused(engine, "profile_malformed")
-    unknown = sorted(set(profile) - {"provider", "auth", "credential_env", "model"})
+    unknown = sorted(set(profile) - {"provider", "auth", "credential_env", "model", "method",
+                                     "borrow_claude_code_login"})
     if unknown:
         raise SubscriptionRouteRefused(engine, "profile_unknown_field", ",".join(unknown))
+    if profile.get("borrow_claude_code_login", False) is not False:
+        # Hermes can use Claude Code's stored login directly; that setting stays off in every engine.
+        raise SubscriptionRouteRefused(engine, "claude_code_login_borrowing")
+    if isinstance(profile.get("auth"), str) and _norm(profile["auth"]) == "subscription":
+        return _check_subscription(engine, spec, profile, child_env, route_home, parent_env, operator_home)
+    if "method" in profile:
+        raise SubscriptionRouteRefused(engine, "method_without_subscription")
     provider, auth, credential = profile.get("provider"), profile.get("auth"), profile.get("credential_env")
     model = profile.get("model")
     for name, value in (("provider", provider), ("auth", auth), ("credential_env", credential)):
@@ -227,6 +267,73 @@ def check_route(
     return RouteDecision(engine, provider, credential, flags)
 
 
+def _norm(label: str) -> str:
+    """Case, spaces, hyphens and underscores are spelling, not identity: "Sign in with ChatGPT" matches."""
+
+    return "_".join(label.strip().lower().replace("-", " ").replace("_", " ").split())
+
+
+def _check_subscription(
+    engine: str,
+    spec: Engine,
+    profile: Mapping[str, object],
+    child_env: Mapping[str, str],
+    route_home: str,
+    parent_env: Mapping[str, str] | None,
+    operator_home: str | None,
+) -> RouteDecision:
+    """A subscription sign-in: allowed only for a (provider, method) pair on ``SUBSCRIPTION_SIGN_INS``."""
+
+    provider, method, model = profile.get("provider"), profile.get("method"), profile.get("model")
+    if not isinstance(provider, str) or not provider.strip():
+        raise SubscriptionRouteRefused(engine, "provider_missing")
+    raw = provider.strip().lower()
+    label = _norm(provider)
+    if raw in spec.subscription_providers or _looks_like_claude_login(raw) or label.startswith("anthropic"):
+        raise SubscriptionRouteRefused(engine, "claude_subscription_auth" if label == "anthropic"
+                                       else "claude_subscription_provider", raw)
+    if label.startswith(_GOOGLE_LABELS):
+        raise SubscriptionRouteRefused(engine, "google_subscription_refused", raw)
+    allowed = SUBSCRIPTION_SIGN_INS[engine]
+    if label not in allowed:
+        raise SubscriptionRouteRefused(engine, "subscription_unconfirmed", label)
+    if not isinstance(method, str) or not method.strip():
+        raise SubscriptionRouteRefused(engine, "method_missing")
+    if _norm(method) != allowed[label]:
+        raise SubscriptionRouteRefused(engine, "subscription_method_not_registered", _norm(method))
+    if "credential_env" in profile:
+        raise SubscriptionRouteRefused(engine, "credential_env_on_subscription")
+    if model is not None:
+        if not isinstance(model, str) or "/" not in model:
+            raise SubscriptionRouteRefused(engine, "model_malformed")
+        model_provider = _norm(model.split("/", 1)[0])
+        if model_provider in spec.subscription_providers or _looks_like_claude_login(model_provider.replace("_", "-")):
+            raise SubscriptionRouteRefused(engine, "claude_subscription_provider", model_provider)
+        if model_provider != label:
+            raise SubscriptionRouteRefused(engine, "model_provider_mismatch", model_provider)
+
+    env = dict(child_env)
+    present = sorted(name for name in CLAUDE_SUBSCRIPTION_ENV if name in env)
+    if present:
+        raise SubscriptionRouteRefused(engine, "claude_subscription_env", ",".join(present))
+    stores = sorted(name for name in CLAUDE_STORE_ENV if name in env)
+    if stores:
+        raise SubscriptionRouteRefused(engine, "claude_store_env", ",".join(stores))
+    keys = sorted(name for name in env if any(name in p.credential_env for p in spec.providers.values()))
+    if keys:  # a key in the env could outrank the sign-in; one route is one method
+        raise SubscriptionRouteRefused(engine, "credential_env_on_subscription", ",".join(keys))
+    selectors = sorted(name for name in ENGINE_SELECTOR_ENV if name in env)
+    if selectors:
+        raise SubscriptionRouteRefused(engine, "engine_selector_env", ",".join(selectors))
+    extra = sorted(name for name in env if name not in SAFE_ENV)
+    if extra:  # no token of any kind: Recursion holds no ChatGPT or Grok token
+        raise SubscriptionRouteRefused(engine, "child_env_not_allowed", ",".join(extra))
+
+    _check_home(engine, env, route_home, parent_env, operator_home, own=OWN_STORE_ENTRIES[engine])
+    flags = tuple(f"parent_env_has:{name}" for name in CLAUDE_SUBSCRIPTION_ENV if name in (parent_env or {}))
+    return RouteDecision(engine, label, "", flags, auth="subscription", method=allowed[label])
+
+
 def guard_then_spawn(
     launcher: Callable[..., object],
     argv: list[str],
@@ -269,8 +376,12 @@ def _check_home(
     route_home: str,
     parent_env: Mapping[str, str] | None,
     operator_home: str | None,
+    own: tuple[str, ...] = (),
 ) -> None:
-    """The child's home is route-owned, private, not the operator's, and holds no store or engine state entry."""
+    """The child's home is route-owned, private, not the operator's, and holds no store or engine state entry.
+
+    ``own`` lists the engine's own login store entries a subscription sign-in may keep there.
+    """
 
     if os.name == "nt":
         raise SubscriptionRouteRefused(engine, "platform_unsupported")
@@ -292,6 +403,8 @@ def _check_home(
         if os.path.lexists(os.path.join(route_home, entry)):  # presence only; never opened or read
             raise SubscriptionRouteRefused(engine, "claude_store_in_route_home", entry)
     for entry in ENGINE_STORE_ENTRIES:
+        if entry in own:
+            continue
         if os.path.lexists(os.path.join(route_home, entry)):  # presence only; never opened or read
             raise SubscriptionRouteRefused(engine, "engine_store_in_route_home", entry)
 

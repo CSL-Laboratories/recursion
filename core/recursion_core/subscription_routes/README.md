@@ -37,6 +37,43 @@ What refuses:
 A subscription variable present only in the parent env is flagged in `RouteDecision.flags`.
 API-key routes (`anthropic`, `openai`) launch.
 
+## Subscription sign-ins (Nov 8 briefing)
+
+Lucas's Nov 8 briefing: allow a subscription sign-in only where the provider names that
+harness. A profile asks for one with `auth: "subscription"` and a `method`, and both are
+checked against `SUBSCRIPTION_SIGN_INS`:
+
+| Harness | Allowed (provider, method) |
+|---|---|
+| OpenCode (E3) | `chatgpt` + `sign_in_with_chatgpt`; `grok` + `grok_sign_in` |
+| Pi (E8) | `chatgpt` + `sign_in_with_chatgpt` |
+| Hermes (E9) | `grok` + `grok_sign_in` |
+
+- Case, spaces, hyphens and underscores are spelling only ("Sign in with ChatGPT" matches).
+  No other alias is accepted: the engines' native provider and method ids are not in
+  repository evidence, and `grok_sign_in` is Recursion's label for a method the briefing
+  allows without naming it.
+- Claude (`claude*`, `anthropic*`) and Google (`google*`, `gemini*`, `antigravity*`) sign-ins
+  refuse in all three. A provider not on the harness's row is `subscription_unconfirmed`; a
+  wrong method is `subscription_method_not_registered`.
+- `borrow_claude_code_login` must be absent or `false` (Hermes can otherwise use Claude Code's
+  stored login).
+- The child env carries no credential at all: no API key, no token, no `CODEX_*`. The sign-in
+  lives in the engine's own login store in the route home (`.pi`, `.hermes`, or OpenCode's
+  `.local/share/opencode` and `.config/opencode`), which the check allows for that engine only,
+  by `lstat`. Every other engine's store, `.codex/auth.json` and every Claude Code store still
+  refuse. Recursion never stores, copies or ships these tokens and cannot see what else a store
+  holds without reading it, which it does not do.
+
+## Gemini CLI (E7)
+
+`check_gemini_cli_sign_in(route)`: Gemini CLI consumer accounts ended June 18, 2026. Only a
+paid API key (`{"method": "api_key", "paid": true}`, the user's statement; not checkable
+offline) or an existing Code Assist Standard or Enterprise licence
+(`{"method": "code_assist", "licence": "standard"|"enterprise", "existing": true}`) passes.
+Consumer, free-tier and unknown methods refuse. No Gemini CLI route adapter exists yet, so
+nothing calls it.
+
 ## Tests
 
 From the repository root (Python 3.11+, standard library only):

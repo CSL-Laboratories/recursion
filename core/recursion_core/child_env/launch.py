@@ -24,7 +24,8 @@ from recursion_core.child_env.policy import EnvRefused, ValidatedEnv, _unsafe_fi
 __all__ = ["spawn"]
 
 # Keyword arguments a caller may not pass: each would replace or widen what the child gets.
-_FORBIDDEN = frozenset({"env", "shell", "executable", "preexec_fn", "close_fds", "pass_fds", "user", "group", "extra_groups"})
+_FORBIDDEN = frozenset({"env", "shell", "executable", "preexec_fn", "close_fds", "pass_fds", "user", "group", "extra_groups",
+                        "process_group"})
 
 
 def spawn(
@@ -42,6 +43,8 @@ def spawn(
     if isinstance(argv, (str, bytes)) or not argv or not all(isinstance(item, str) for item in argv):
         raise EnvRefused(None, "argv_malformed")
     bad = sorted(_FORBIDDEN.intersection(popen_kwargs))
+    if "start_new_session" in popen_kwargs and popen_kwargs["start_new_session"] is not True:
+        bad.append("start_new_session")  # the child always gets its own session (cleanup signals its group)
     if bad:
         raise EnvRefused(None, "launch_option_denied:" + ",".join(bad))
     executable = _resolve_executable(argv[0], env)
@@ -49,7 +52,7 @@ def spawn(
     kwargs: dict[str, object] = dict(popen_kwargs)
     kwargs.update(env=child_env, cwd=cwd, close_fds=True, shell=False)
     if os.name != "nt":
-        kwargs.setdefault("start_new_session", True)
+        kwargs["start_new_session"] = True
     return popen([executable, *argv[1:]], **kwargs)
 
 

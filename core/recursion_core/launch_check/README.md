@@ -101,6 +101,13 @@ Cursor: `[v]YYYY.M.D[-HH-MM-SS][-<hex commit>]`, compared numerically as
 unparsed. Real-shape lines covered: `2.1.318 (Claude Code)`, `codex-cli 0.160.0`,
 `opencode v2.2.5`, `2026.10.01-e373342`, `hermes-acp 0.9.1`.
 
+Hermes detector (B27, CSL-772): the unofficial npm `hermes-agent` bridge (0.23.0, bins `hermes`,
+`hermes-npm`, `hermes-agent` as `bin/*.js` under node) is not upstream Hermes. `detect()` names it
+(a `node_modules/hermes-agent/` path, or a `package.json` named `hermes-agent` above a `bin/` file),
+reports it in the detection note, and gives it no candidate even if a native file sat in its tree.
+Nothing is executed. A `hermes` found by other means is still judged by the binary rules below;
+this adds a named refusal reason, not a new refusal code.
+
 Known consequences, by design: Gemini CLI and Pi run JS bundles under node and Hermes is a
 Python entry point (11.6), so under the native-binary rule they are `wrapper_refused`
 until a launcher-plus-tree pin exists; Cursor likewise (no native engine binary, #1087

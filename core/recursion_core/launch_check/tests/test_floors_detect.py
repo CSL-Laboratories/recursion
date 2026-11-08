@@ -22,6 +22,7 @@ from recursion_core.launch_check import (
     detect_all,
     grant,
     launch_check,
+    npm_hermes_agent_root,
     parse_version,
     table_record,
 )
@@ -249,6 +250,69 @@ class DetectTests(unittest.TestCase):
         d = F.dir()
         js = F.script(os.path.join(d, "codex.js"), "#!/usr/bin/env node\n")
         self.assertIsNone(codex_vendored_binary(js))
+
+
+@unittest.skipUnless(os.name == "posix", "POSIX fixtures")
+class NpmHermesBridgeTests(unittest.TestCase):
+    """B27 (CSL-772): the unofficial npm hermes-agent bridge is named and never a candidate."""
+
+    def _bridge(self, *, package_name: str = "hermes-agent", under_node_modules: bool = True) -> tuple[str, str]:
+        prefix = F.dir()
+        base = os.path.join(prefix, "lib", "node_modules") if under_node_modules else os.path.join(prefix, "pkgs")
+        root = os.path.join(base, package_name if under_node_modules else "x")
+        os.makedirs(os.path.join(root, "bin"))
+        with open(os.path.join(root, "package.json"), "w") as f:
+            f.write('{"name": "%s", "version": "0.23.0"}' % package_name)
+        js = F.script(os.path.join(root, "bin", "hermes.js"), "#!/usr/bin/env node\n")
+        bindir = os.path.join(prefix, "bin")
+        os.makedirs(bindir)
+        os.symlink(js, os.path.join(bindir, "hermes"))
+        return bindir, root
+
+    def test_npm_bridge_is_named_and_refused(self) -> None:
+        bindir, root = self._bridge()
+        found = detect("hermes", bindir)
+        self.assertIsNone(found.candidate)
+        self.assertIn("npm hermes-agent bridge", found.note)
+        self.assertIn("not upstream Hermes", found.note)
+        _, records = launch_check(bindir, probe=F.probe)
+        rec = next(r for r in records if r["engine"] == "hermes")
+        self.assertEqual("refused", rec["outcome"])
+        self.assertIn("npm hermes-agent bridge", rec["detection"])
+
+    def test_package_json_name_recognises_the_bridge_outside_node_modules(self) -> None:
+        bindir, root = self._bridge(under_node_modules=False)
+        # Not under node_modules/hermes-agent, but package.json says hermes-agent.
+        self.assertEqual(root, npm_hermes_agent_root(os.path.join(root, "bin", "hermes.js")))
+        self.assertIn("npm hermes-agent bridge", detect("hermes", bindir).note)
+
+    def test_other_packages_are_not_called_the_bridge(self) -> None:
+        d = F.dir()
+        os.makedirs(os.path.join(d, "bin"))
+        with open(os.path.join(d, "package.json"), "w") as f:
+            f.write('{"name": "something-else"}')
+        self.assertIsNone(npm_hermes_agent_root(os.path.join(d, "bin", "hermes.js")))
+        with open(os.path.join(d, "package.json"), "w") as f:
+            f.write("not json")
+        self.assertIsNone(npm_hermes_agent_root(os.path.join(d, "bin", "hermes.js")))
+        self.assertIsNone(npm_hermes_agent_root(os.path.join(d, "hermes")))
+
+    def test_native_file_in_the_bridge_tree_is_not_a_candidate(self) -> None:
+        bindir, root = self._bridge()
+        native = F.make("hermes-native", "hermes 0.9.1", where=os.path.join(root, "bin"))
+        os.remove(os.path.join(bindir, "hermes"))
+        os.symlink(native, os.path.join(bindir, "hermes"))
+        found = detect("hermes", bindir)
+        self.assertEqual("native", found.hits[0].kind)
+        self.assertIsNone(found.candidate)
+        self.assertIn("npm hermes-agent bridge", found.note)
+
+    def test_detection_never_executes_the_bridge(self) -> None:
+        bindir, root = self._bridge()
+        marker = os.path.join(F.dir(), "ran")
+        F.script(os.path.join(root, "bin", "hermes.js"), f"#!/bin/sh\ntouch {marker}\n")
+        detect("hermes", bindir)
+        self.assertFalse(os.path.exists(marker))
 
 
 @unittest.skipUnless(os.name == "posix", "POSIX fixtures")

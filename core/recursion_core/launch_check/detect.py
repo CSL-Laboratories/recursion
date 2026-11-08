@@ -10,6 +10,7 @@ so ``grant()`` is never offered a wrapper.
 
 from __future__ import annotations
 
+import json
 import os
 import platform
 from dataclasses import dataclass
@@ -79,6 +80,36 @@ def codex_vendored_binary(js_realpath: str) -> str | None:
     return found[0] if len(found) == 1 else None
 
 
+NPM_HERMES_PACKAGE = "hermes-agent"
+_PACKAGE_JSON_MAX = 1 << 16
+
+
+def npm_hermes_agent_root(realpath: str) -> str | None:
+    """Package root if ``realpath`` belongs to the unofficial npm ``hermes-agent`` bridge.
+
+    The bridge (npm ``hermes-agent`` 0.23.0, "Unofficial npm bridge for Hermes Agent") installs
+    a ``hermes`` bin that is ``bin/hermes.js`` under node; it is not upstream Hermes (B27).
+    It is recognised by the ``node_modules/hermes-agent/`` path segment, or by a
+    ``package.json`` named ``hermes-agent`` in the grandparent directory of a ``bin/`` file.
+    Nothing is executed; the file is read, size-capped, and a read error means "not recognised".
+    """
+    parts = os.path.normpath(realpath).split(os.sep)
+    for i in range(len(parts) - 2):
+        if parts[i] == "node_modules" and parts[i + 1] == NPM_HERMES_PACKAGE:
+            return os.sep.join(parts[: i + 2]) or os.sep
+    if os.path.basename(os.path.dirname(realpath)) != "bin":
+        return None
+    root = os.path.dirname(os.path.dirname(realpath))
+    try:
+        with open(os.path.join(root, "package.json"), "rb") as f:
+            data = json.loads(f.read(_PACKAGE_JSON_MAX))
+    except (OSError, ValueError):
+        return None
+    if isinstance(data, dict) and data.get("name") == NPM_HERMES_PACKAGE:
+        return root
+    return None
+
+
 def path_hits(name: str, path_string: str) -> list[str]:
     exts = ("", ".exe") if os.name == "nt" else ("",)
     hits: list[str] = []
@@ -110,6 +141,13 @@ def detect(engine: str, path_string: str) -> Detection:
                 firsts.append(hits[-1])
     notes = []
     for h in firsts:
+        if spec.engine == "hermes":
+            bridge = npm_hermes_agent_root(h.realpath)
+            if bridge is not None:
+                notes.append(
+                    f"{h.path}: npm {NPM_HERMES_PACKAGE} bridge at {bridge} (unofficial, not upstream Hermes); refused"
+                )
+                continue
         if h.kind == "native":
             return Detection(spec.engine, tuple(hits), h.path, "native on PATH")
         if spec.engine == "codex" and h.kind == "script":

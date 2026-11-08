@@ -29,6 +29,35 @@ during runs: no linger and no running `user@<engine uid>.service`. So the engine
 user does not get its own lingering `systemd --user` daemon; Q38's "engine user
 gets its own daemon" clause stays open under that invariant.
 
+## Engine user: no linger, no user manager (Lucas, Nov 8)
+
+Lucas's Nov 8 call replaces "Linger=yes for both": the operator keeps
+`Linger=yes`; the engine user gets `Linger=no` and no `user@<engine uid>.service`.
+Stop still ends just the one run. `engine_user.py` holds read-only pieces for the
+later cross-uid path, which this package still refuses:
+
+- `check_engine_no_user_manager(user, uid)` passes only when `loginctl show-user
+  <engine> --property=Linger --value` says `no` (or logind says the user is not
+  logged in or lingering), `systemctl is-active user@<uid>.service` says
+  `inactive`, and `/run/user/<uid>/systemd/private` does not exist. Anything else,
+  including a probe that cannot run, fails closed. It enables, disables, masks or
+  stops nothing. `systemctl mask user@<uid>.service` is proposed hardening,
+  unmeasured, and not part of this bar.
+- `refuse_session_launch(argv)`: `Daemon.start` refuses, before recording a run,
+  launchers that open a PAM/logind session and would start the engine user's
+  manager again (`su`, `runuser`, `sudo`, `login`, `machinectl`, `pkexec`, `doas`,
+  `ssh`, `run0`, and `systemd-run` with `PAMName=`).
+- `SPAWN_PATH` records the spawn path this package uses today: same-uid transient
+  `systemd-run --user` units in the operator's user manager, no engine uid, no PAM.
+  B7 (CSL-734) picks the cross-uid spawn path; nothing here chooses it.
+- `signin_without_session_bus(engine_env, uid)` is an offline check that the
+  engine env names no session bus and no bus socket exists for the engine. It never
+  opens a credential store, and its verdict is at most `pending`. Store paths are
+  listed only where repository evidence names them: Codex `~/.codex/auth.json`
+  (cited by #321 `subscription_routes/policy.py`, CSL-712 H3); Claude Code is
+  `unconfirmed`. Behaviour with the bus absent is unconfirmed for both until a
+  founder-attended signed-in run of each.
+
 ## Behaviour
 
 - Singleton: `flock` on `$XDG_RUNTIME_DIR/recursion-daemon.lock`. The kernel drops

@@ -16,6 +16,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable, Protocol
 
+from .engine_user import refuse_session_launch
+
 log = logging.getLogger(__name__)
 
 RUN_ID = re.compile(r'[a-zA-Z0-9_-]{1,64}')
@@ -196,6 +198,7 @@ class Daemon:
             raise RuntimeError('Daemon closed')
 
     def start(self, run_id, argv):
+        refuse_session_launch(argv)  # before any record: no PAM/logind session wrapper
         with self.lock:
             self._open()
             boot = self.boot_id()
@@ -338,5 +341,6 @@ def refuse_engine_user(environ):
     if engine:
         raise RuntimeError(
             f'RECURSION_ENGINE_USER={engine} is not supported: the cross-uid path is not '
-            'implemented, and it will require the engine user to have no user manager '
-            '(no linger, no user@ engine service) during runs')
+            'implemented (B7, CSL-734 picks its spawn path), and it will require the engine '
+            'user to have no user manager (Linger=no, user@<engine uid>.service inactive, '
+            'no /run/user/<uid>/systemd/private) during runs; see engine_user.py')

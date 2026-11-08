@@ -256,6 +256,10 @@ class Application:
             raise _BadRequest("panel_not_registered")
         panel = self._panels[form["id"][0]]
         body = "<h2>%s</h2><p>Read-only plugin panel.</p>" % escape(panel["title"])
+        if panel["venue_use"] is not None:
+            body += ('<p role="note">Declared venue use: <code>%s</code>. The control API\'s O7 v0 '
+                     'reads take no venue argument, so the results below are not scoped to this '
+                     'venue; venue data stays behind the venue-data switch.</p>' % escape(panel["venue_use"]))
         for command in panel["reads"]:
             body += "<section><h3>%s</h3>" % escape(_LABELS[command])
             try:

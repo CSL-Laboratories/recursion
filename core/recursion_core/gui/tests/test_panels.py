@@ -81,6 +81,22 @@ class PanelTests(GuiHarness):
         self.app._client.operator = unavailable
         self.assertIn("Unavailable: offline", self.request("GET", "/panel", query="id=p")[2])
 
+    def test_declared_venue_use_is_kept_shown_and_never_sent_as_a_scope(self):
+        self.mount([{"id": "v", "title": "Venue panel", "reads": [READS[0]],
+                     "venue_use": "kalshi:model_fed_read", "withhold_venue_data": True},
+                    {"id": "n", "title": "Plain panel", "reads": [READS[0]]}])
+        self.assertEqual(self.app._panels["v"]["venue_use"], "kalshi:model_fed_read")
+        self.api.calls.clear()
+        body = self.request("GET", "/panel", query="id=v")[2]
+        self.assertIn("Declared venue use: <code>kalshi:model_fed_read</code>", body)
+        self.assertIn("not scoped to this venue", body)
+        self.assertEqual([c[2]["arguments"] for c in self.api.calls], [{}])  # O7 v0 has no venue argument
+        self.assertNotIn("Declared venue use", self.request("GET", "/panel", query="id=n")[2])
+        for bad in ({"venue_use": "kalshi"}, {"venue_use": ["kalshi:model_fed_read"]},
+                    {"venue_use": "Kalshi:<x>"}, {"withhold_venue_data": "no"}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.mount([{"id": "b", "title": "Bad", "reads": [READS[0]], **bad}])
+
     def test_real_cockpit_registry_renders(self):
         try:
             plugin = importlib.import_module("cockpit.gui.panels")

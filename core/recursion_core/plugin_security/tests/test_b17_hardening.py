@@ -178,6 +178,42 @@ class ApprovalRetentionTests(unittest.TestCase):
         self.assertLessEqual(len(used._expiry), 10)
         self.assertTrue(all(item.raw is None for item in used._approvals.values()))
 
+    def test_expiry_heap_compaction_is_amortized(self) -> None:
+        # Devin r4507255083: with many pending approvals and a small
+        # max_retained, compacting when stale > max_retained rebuilt the
+        # whole heap under the lock roughly every second veto (example:
+        # max_retained=1, 10,000 pending, then 10,000 vetoes — about 50
+        # million tuples scanned). Compact only when stale tuples exceed
+        # max(max_retained, live) so rebuild work stays linear.
+        class CountingGate(ApprovalGate):
+            def __init__(self, *args, **kwargs) -> None:
+                super().__init__(*args, **kwargs)
+                self.compactions = 0
+
+            def _compact_expiry_if_needed(self) -> None:
+                before = id(self._expiry)
+                super()._compact_expiry_if_needed()
+                if id(self._expiry) != before:
+                    self.compactions += 1
+
+        clock = Clock()
+        gate = CountingGate(
+            lambda *a: None, authenticate, clock, ttl_seconds=300, max_retained=1
+        )
+        n = 200
+        pending = []
+        for i in range(n):
+            pending.append(gate.request(
+                effect(kind="note.post", amount=0, payload={"a": i})
+            ))
+        self.assertEqual(gate.compactions, 0)
+        for approval_id, digest in pending:
+            gate.decide(approval_id, digest, OPERATOR_TOKEN, False)
+        # The old threshold compacted about every second veto (~n/2).
+        self.assertLess(gate.compactions, n // 4)
+        self.assertLessEqual(len(gate._expiry), 1)
+        self.assertLessEqual(len(gate._approvals), 1)
+
     def test_cap_must_be_positive(self) -> None:
         with self.assertRaises(ValueError):
             self._gate(Clock(), cap=0)

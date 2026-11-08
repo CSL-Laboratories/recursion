@@ -24,8 +24,10 @@ tombstones are kept, oldest evicted first. An evicted id is unknown, which ``tak
 still refuses (``approval_required``). Each ``request`` sweeps expired pending or
 approved entries into tombstones from an expiry heap (only due entries are touched), so
 live entries are bounded by request rate times TTL. The heap itself is compacted when
-terminal or evicted entries would push it past ``max_retained`` plus the live count,
-so early use or veto cannot grow heap storage beyond that bound.
+stale tuples exceed ``max(max_retained, live_count)``, so the heap is at least about
+half garbage (or past the retention cap when few entries are live). Early use or veto
+cannot grow heap storage unbounded, and total rebuild work stays linear instead of
+rescanning every pending approval on every other veto.
 """
 
 from __future__ import annotations
@@ -104,8 +106,9 @@ class ApprovalGate:
         self._tombstones: OrderedDict[str, None] = OrderedDict()
         # (expires_at, approval_id) for live approvals; the sweep pops only due
         # entries, so a burst inside the TTL never rescans live approvals.
-        # Terminal entries are dropped from the heap when they exceed the
-        # retention cap, so a burst of use or veto cannot grow it unbounded.
+        # Terminal tuples are dropped once stale entries exceed
+        # max(max_retained, live), so a burst of use or veto cannot grow
+        # the heap unbounded and rebuilds stay amortized.
         self._expiry: list[tuple[int, str]] = []
         self._live = 0
 
@@ -123,8 +126,16 @@ class ApprovalGate:
         self._compact_expiry_if_needed()
 
     def _compact_expiry_if_needed(self) -> None:
-        """Drop stale heap tuples once they exceed the retention cap. Lock held."""
-        if len(self._expiry) <= self._max_retained + self._live:
+        """Rebuild the expiry heap only when stale tuples are a large fraction.
+
+        Compact when stale > max(max_retained, live) so the heap is at least
+        about half garbage, or past the retention cap when few entries are
+        live. That keeps total rebuild work linear in the number of terminal
+        operations instead of rescanning every pending approval on every
+        other veto. Lock held.
+        """
+        stale = len(self._expiry) - self._live
+        if stale <= max(self._max_retained, self._live):
             return
         kept: list[tuple[int, str]] = []
         for expires_at, approval_id in self._expiry:

@@ -7,8 +7,8 @@ its own session, then kills the daemon with SIGKILL at a chosen point:
   daemon re-adopts it as ``running``.
 - B14 ``before_signal``: Stop intent committed, daemon killed before signalling the run.
 - B14 ``after_signal``: daemon killed after the manager's stop returned (SIGTERM sent,
-  grace wait and any SIGKILL escalation done) and before the daemon recorded the
-  outcome. The run is already gone at the kill, so this cell measures the record
+  grace wait and any SIGKILL escalation done, with stop() waiting until an escalated
+  run is positively gone) and before the daemon recorded the outcome. The run is already gone at the kill, so this cell measures the record
   step, not recovery of a live signalled run.
 - B14 ``signal_sent``: Stop intent committed and SIGTERM sent to a run that
   records and ignores it; daemon killed while that signalled run is still alive. The
@@ -215,6 +215,35 @@ class KillNineCells(unittest.TestCase):
 
     def test_b14_kill9_signalled_run_still_alive(self):
         self._phase('signal_sent')
+
+
+_IGNORE_TERM = ('import signal, sys, time\n'
+                'signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
+                'open(sys.argv[1], "w").close()\n'
+                'time.sleep(60)\n')
+
+
+@unittest.skipUnless(sys.platform.startswith('linux') and Path('/proc/self/stat').exists(),
+                     'escalation cells need Linux /proc')
+class StopEscalationWaits(unittest.TestCase):
+    """Devin r4506539119: after stop() escalates to SIGKILL it returns only once the run
+    is gone, so the after_signal cell's survived check cannot race the kill."""
+
+    def test_stop_returns_only_after_escalated_run_is_gone(self):
+        gone = []
+        with tempfile.TemporaryDirectory() as temp:
+            manager = ProcessGroupManager(Path(temp) / 'units', grace=0.05)
+            for index in range(CELLS):
+                unit = f'recursion-run-escalate-{index}.service'
+                ready = Path(temp) / f'ready-{index}'
+                manager.start(unit, [*_python(), '-c', _IGNORE_TERM, str(ready)])
+                self.assertTrue(_wait(ready.exists), 'run never installed its SIGTERM handler')
+                manager.stop(unit)
+                gone.append(not manager.alive(unit))
+                pid = manager.pid(unit)
+                if manager.alive(unit):
+                    os.killpg(pid, signal.SIGKILL)
+        self.assertEqual(gone, [True] * CELLS)
 
 
 class RecordedStopGuard(unittest.TestCase):

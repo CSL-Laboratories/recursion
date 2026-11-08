@@ -121,8 +121,11 @@ SIGKILL, n=10 per phase:
   `terminated`.
 - B14 `after_signal`: killed after the manager's stop returned (SIGTERM sent,
   grace wait and any SIGKILL done) and before the daemon recorded the outcome. The
-  run is already gone at the kill, so this measures the record step only. The
-  restart sweep reads `terminated`; never `running`.
+  test manager's stop waits (up to 5 s) after a SIGKILL escalation until the run is
+  dead or a zombie, so the cell's "run gone" check cannot race the kill
+  (`StopEscalationWaits`, n=10). The run is already gone at the kill, so this
+  measures the record step only. The restart sweep reads `terminated`; never
+  `running`.
 - B14 `signal_sent`: the run records and ignores SIGTERM; killed right after
   SIGTERM reached it, while the signalled run is still alive. A first restart sweep
   whose Stop has not reached the run yet reads `stopping` with the run alive; the

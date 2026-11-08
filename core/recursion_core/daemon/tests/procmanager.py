@@ -14,6 +14,8 @@ import subprocess
 import time
 
 UNIT_SUFFIX = '.service'
+# Bound on waiting for a SIGKILLed run to be gone after escalation.
+KILL_WAIT = 5.0
 
 
 def _proc_stat(pid):
@@ -81,6 +83,12 @@ class ProcessGroupManager:
                     os.killpg(record['pid'], signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+                # SIGKILL delivery is asynchronous: return only once the run is
+                # positively gone (dead or zombie), so a caller that checks right after
+                # stop() never sees a run that is merely still dying (Devin r4506539119).
+                deadline = time.monotonic() + KILL_WAIT
+                while self._alive(record) and time.monotonic() < deadline:
+                    time.sleep(0.005)
         if self.stop_hook:
             self.stop_hook('after_signal', unit)
 

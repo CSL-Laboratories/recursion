@@ -84,7 +84,9 @@ class ClaudeCodeTest(unittest.TestCase):
         h.handle(request(kind="api_key", conn_id="key-2", credential_env="ANTHROPIC_API_KEY"))
         env = h.launcher.calls[0]["env"]
         self.assertEqual(env["ANTHROPIC_API_KEY"], "route-anthropic")
-        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", env)
+        self.assertNotEqual(env["ANTHROPIC_API_KEY"], PARENT_ENV["ANTHROPIC_API_KEY"])
+        # Lucas's correction: nothing removes a sign-in method from every run; the key outranks it here.
+        self.assertEqual(env["CLAUDE_CODE_OAUTH_TOKEN"], "parent-oauth")
 
     def test_typed_rate_limit_event_is_plan_limit_with_reset(self) -> None:
         h = Harness([claude_limit(reset_at=2_000_000.0)])

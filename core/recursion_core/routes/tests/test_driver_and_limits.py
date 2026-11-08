@@ -113,8 +113,9 @@ class ApiKeyAndPassthroughTest(unittest.TestCase):
         self.assertEqual(res["status"], "ok")
         call = h.launcher.calls[0]
         self.assertEqual(call["argv"][:2], ["claude", "--bare"])
-        self.assertEqual(call["env"]["ANTHROPIC_API_KEY"], "route-anthropic")
-        for name in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK"):
+        self.assertEqual(call["env"]["ANTHROPIC_API_KEY"], "route-anthropic")  # their own key, from custody
+        self.assertEqual(call["env"]["CLAUDE_CODE_OAUTH_TOKEN"], "users-own-token")  # never dropped
+        for name in ("ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK"):
             self.assertNotIn(name, call["env"])
 
     def test_api_key_helper_route_adds_no_key(self) -> None:
@@ -125,6 +126,7 @@ class ApiKeyAndPassthroughTest(unittest.TestCase):
         env = h.launcher.calls[0]["env"]
         self.assertNotIn("ANTHROPIC_API_KEY", env)
         self.assertEqual(env["CLAUDE_CONFIG_DIR"], "/home/op/.claude-alt")  # the user's settings, untouched
+        self.assertEqual(env["CLAUDE_CODE_OAUTH_TOKEN"], "users-own-token")
         self.assertEqual(h.lookups, [])
 
     def test_key_source_only_for_claude_code_api_key(self) -> None:
@@ -147,10 +149,31 @@ class ApiKeyAndPassthroughTest(unittest.TestCase):
         req["route"]["connection"]["method"] = "x"
         self.assertEqual(Harness([]).handle(req)["code"], c.REQUEST_INVALID)
 
-    def test_bare_refused_on_passthrough(self) -> None:
+    def test_bare_is_the_users_choice_on_passthrough(self) -> None:
+        h = Harness([claude_ok()])
         req = request(kind="passthrough", bare=True)
         req["route"]["connection"]["method"] = "bedrock"
-        self.assertEqual(Harness([]).handle(req)["code"], c.LAUNCH_REFUSED)
+        self.assertEqual(h.handle(req)["status"], "ok")
+        self.assertEqual(h.launcher.calls[0]["argv"][:2], ["claude", "--bare"])
+        self.assertEqual(h.launcher.calls[0]["env"]["CLAUDE_CODE_OAUTH_TOKEN"], "users-own-token")
+
+    def test_oauth_token_kept_on_every_route_and_parent_env_never_changed(self) -> None:
+        before = dict(PARENT)
+        h = Harness([claude_ok(), claude_ok(), claude_ok(), claude_ok()])
+        reqs = [request(rid="s"), request(rid="k", kind="api_key", conn_id="key-2", credential_env="ANTHROPIC_API_KEY"),
+                request(rid="h", kind="api_key", conn_id="helper"), request(rid="p", kind="passthrough")]
+        reqs[2]["route"]["connection"]["key_source"] = "api_key_helper"
+        reqs[3]["route"]["connection"]["method"] = "vertex"
+        for req in reqs:
+            self.assertEqual(h.handle(req)["status"], "ok", req["request_id"])
+        for call in h.launcher.calls:
+            self.assertEqual(call["env"]["CLAUDE_CODE_OAUTH_TOKEN"], "users-own-token")
+        self.assertEqual(PARENT, before)
+        adapter = h.service._adapters["claude_code"]
+        self.assertEqual(adapter._parent_env, before)
+        from recursion_core.routes import claude_code
+        for drop in (claude_code.SUBSCRIPTION_DROP_ENV, claude_code.API_KEY_DROP_ENV):
+            self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", drop)
 
     def test_nothing_removes_a_sign_in_method_from_every_run(self) -> None:
         # Each route changes only its own run: the next subscription run still sees the user's sign-in.

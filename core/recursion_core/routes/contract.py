@@ -15,7 +15,7 @@ Request::
                               "key_source": "custody" | "api_key_helper",  # claude_code api_key only
                               "method": "<built-in method>",  # passthrough (claude_code only)
                               "metered_per_model": false},
-               "bare": false,                             # claude_code: API-key route only
+               "bare": false,                             # claude_code: refused on subscription only
                "api_key_helper": "absent" | "present",    # claude_code subscription: reported by the surface
                "billing_ack": "api_key_helper",           # the user chose to run billing their API key
                "limits": {"on_limit": "ask" | "wait" | "fallback", "fallback": [<route>, ...]},

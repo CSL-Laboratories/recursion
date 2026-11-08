@@ -40,13 +40,17 @@ SUBSCRIPTION_DROP_ENV = (
     "CLAUDE_CODE_SIMPLE", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_PROFILE",
     "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
 )
-# The user's own sign-in and config location, passed through untouched (name copied, value never inspected).
-SUBSCRIPTION_KEEP_ENV = ("CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR")
-# API-key route: the run bills the user's key, so the sign-in token and the cloud switches stay out of
-# this run only. The key comes from custody (ANTHROPIC_API_KEY) or from the user's own apiKeyHelper.
-API_KEY_DROP_ENV = ("ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK",
-                    "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY")
-# Kept for callers that import the old name; it now means "names an API-key run never inherits".
+# The user's own sign-in and config location, passed through untouched on every route (name copied, value
+# never inspected, logged or stored). No route drops CLAUDE_CODE_OAUTH_TOKEN.
+USER_KEEP_ENV = ("CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR")
+SUBSCRIPTION_KEEP_ENV = USER_KEEP_ENV
+# API-key route: the user's key outranks the sign-in by the engine's own precedence, so only the bearer
+# token and the cloud switches stay out of this run. The key comes from custody (ANTHROPIC_API_KEY) or the
+# user's own apiKeyHelper.
+API_KEY_DROP_ENV = ("ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+                    "CLAUDE_CODE_USE_FOUNDRY")
+# Kept for callers that import the old name; it now means "names an API-key run does not inherit from the
+# parent" (its own key comes from custody instead).
 CLAUDE_CREDENTIAL_ENV = API_KEY_DROP_ENV + ("ANTHROPIC_API_KEY",)
 API_KEY_HELPER_STATES = ("absent", "present")
 
@@ -68,9 +72,9 @@ class ClaudeCodeAdapter(RouteAdapter):
         bare = route.get("bare", False)
         if bare is not True and bare is not False:
             raise c.RouteError(c.REQUEST_INVALID, "route.bare")
-        if bare and kind != "api_key":
-            # Subscription: --bare ignores the sign-in. Other methods: not confirmed, so not offered.
-            raise c.RouteError(c.LAUNCH_REFUSED, f"--bare is only allowed on the API-key route, not {kind}")
+        if bare and kind == "subscription":
+            # --bare ignores the sign-in. API-key and other user-picked built-in methods may use it.
+            raise c.RouteError(c.LAUNCH_REFUSED, "--bare ignores the sign-in: not on the subscription route")
         if kind == "subscription":
             self._check_api_key_helper(route)
         # --verbose: stream-json output in print mode is documented to need it (unverified on this box).
@@ -86,9 +90,9 @@ class ClaudeCodeAdapter(RouteAdapter):
             never = API_KEY_DROP_ENV + ("ANTHROPIC_API_KEY",)
             if conn.get("key_source") == "api_key_helper":
                 # The user's own apiKeyHelper in their settings supplies the key; Recursion adds none.
-                return child_env(self._parent_env, extra_names=("CLAUDE_CONFIG_DIR",), never=never)
+                return child_env(self._parent_env, extra_names=USER_KEEP_ENV, never=never)
             cred = self.credential(request, ("ANTHROPIC_API_KEY",))
-            return child_env(self._parent_env, extra_names=("CLAUDE_CONFIG_DIR",), never=never, credential=cred)
+            return child_env(self._parent_env, extra_names=USER_KEEP_ENV, never=never, credential=cred)
         if kind == "passthrough":
             # Cloud providers (Bedrock, Vertex, Foundry) and any other built-in method the user picked:
             # the user's environment passes through for this run, unchanged.

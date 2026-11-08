@@ -60,9 +60,11 @@ run's environment changes:
   `route_choice_required`: the run would bill their API key, and they pick (`billing_ack`, the API-key
   route, or cancel). Not reported is the same question.
 - `api_key`: the user's own key from custody (`ANTHROPIC_API_KEY`) or their own `apiKeyHelper`
-  (`key_source: "api_key_helper"`, no key added); `--bare` is allowed (`route.bare`).
+  (`key_source: "api_key_helper"`, no key added); `--bare` is allowed (`route.bare`). The user's
+  `CLAUDE_CODE_OAUTH_TOKEN` still passes through; the key outranks it by the engine's own precedence.
 - `passthrough` (cloud providers and any other built-in method the user picks): the env passes through
-  unchanged for that run. `--bare` is not offered there (not confirmed).
+  unchanged for that run, and `--bare` is the user's choice there too. `--bare` is refused only on the
+  subscription route. No route drops `CLAUDE_CODE_OAUTH_TOKEN`, and the parent env is never changed.
 - The adapter never edits settings or credential files, never sets `DISABLE_LOGIN_COMMAND`, and never
   sets, stores or reads `CLAUDE_CODE_OAUTH_TOKEN`. The binary is `claude` itself; its hash and version are
   the R2a launch check's (CSL-732). The Commercial Terms review of this env scrub is still open in

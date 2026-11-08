@@ -18,6 +18,11 @@ of every backend that can already spawn another *host* uid, runs the three F21
 same-uid probes under each, and selects the managed-login-folder fallback as
 beta when no such backend is available.
 
+The probes target the engine process itself: a process whose real,
+effective, saved and filesystem uids all equal the backend's target uid (for
+systemd-run, the transient unit's MainPID). They never fall back to the
+launcher. A probe that cannot run is counted as an error, never as blocked.
+
 Unmeasured here (need a founder Linux box, or would require creating a real
 other-uid home and signing in):
 
@@ -47,8 +52,9 @@ import stat
 import subprocess
 import tempfile
 import time
+import uuid
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
@@ -69,6 +75,17 @@ SETUID_HELPER_CANDIDATES = (
 HELPER_ENV = "RECURSION_SPAWN_HELPER"
 SUDO_TARGET_CANDIDATES = ("nobody", "daemon")
 DEFAULT_N = 20
+# Commands every measured backend must be able to run as the target user:
+# overhead timing (``true``), the process probes (``sleep``) and the store
+# writer (``python3``). Sudoers rules are per-command and per-target.
+SUDO_REQUIRED_COMMANDS: tuple[tuple[str, ...], ...] = (
+    ("true",),
+    ("sleep", "0"),
+    ("python3", "-c", "pass"),
+)
+# Backends ``spawn_command`` can actually launch. Detection may still report
+# others (for example a working subuid map) but they are never selected.
+SPAWNABLE_BACKENDS: frozenset[str] = frozenset({"sudo", "systemd_run"})
 PTRACE_ATTACH = 16
 PTRACE_DETACH = 17
 
@@ -77,6 +94,8 @@ PathName = Literal[
     "setuid_helper", "sudo", "systemd_run", "subuid_userns", "managed_login_folder"
 ]
 ProbeName = Literal["proc_pid_root", "ptrace", "abs_store_read"]
+# True = blocked, False = open, None = the probe could not run (not a result).
+ProbeOutcome = tuple[bool | None, str]
 ByokKind = Literal["model_provider", "broker", "venue"]
 ByokStorage = Literal["owner_only_file", "fail_closed"]
 
@@ -122,14 +141,26 @@ class Overhead:
 
 @dataclass(frozen=True, slots=True)
 class ProbeSummary:
+    """``n`` attempts = ``blocked_count`` + open + ``error_count``.
+
+    ``targets`` names the processes or files actually probed, for example
+    ``sleep uid=65534 x20``, so a reader can check which uid was measured.
+    """
+
     name: ProbeName
     n: int
     blocked_count: int
     detail: str
+    error_count: int = 0
+    targets: str = ""
+
+    @property
+    def open_count(self) -> int:
+        return self.n - self.blocked_count - self.error_count
 
     @property
     def blocked(self) -> bool:
-        return self.n > 0 and self.blocked_count == self.n
+        return self.n > 0 and self.error_count == 0 and self.blocked_count == self.n
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +188,7 @@ class Evaluation:
     overhead: dict[str, Overhead]
     probes: dict[str, tuple[ProbeSummary, ...]]
     unmeasured: dict[str, None]
+    errors: dict[str, str]
 
 
 def byok_storage_when_secret_service_fails_closed(kind: str) -> ByokStorage:
@@ -184,8 +216,20 @@ def percentile(sorted_samples: Sequence[float], p: float) -> float:
     return sorted_samples[rank - 1]
 
 
+def can_spawn(backend: Backend) -> bool:
+    """True when ``spawn_command`` can launch an engine through ``backend``."""
+
+    if backend.name not in SPAWNABLE_BACKENDS:
+        return False
+    try:
+        spawn_command(backend, ("true",))
+    except ValueError:
+        return False
+    return True
+
+
 def select_path(backends: Sequence[Backend]) -> SelectedPath:
-    """Pick the first backend that already changes the host uid; else beta fallback."""
+    """Pick the first spawnable backend that changes the host uid; else beta fallback."""
 
     order: tuple[BackendName, ...] = (
         "setuid_helper",
@@ -196,7 +240,12 @@ def select_path(backends: Sequence[Backend]) -> SelectedPath:
     by_name = {b.name: b for b in backends}
     for name in order:
         backend = by_name.get(name)
-        if backend is not None and backend.available and backend.changes_host_uid:
+        if (
+            backend is not None
+            and backend.available
+            and backend.changes_host_uid
+            and can_spawn(backend)
+        ):
             return SelectedPath(
                 name,
                 False,
@@ -206,8 +255,8 @@ def select_path(backends: Sequence[Backend]) -> SelectedPath:
     return SelectedPath(
         "managed_login_folder",
         True,
-        "no other-uid backend is available without installing a helper or "
-        "editing sudoers/polkit; managed-login-folder fallback ships as beta "
+        "no spawnable other-uid backend is available without installing a helper "
+        "or editing sudoers/polkit; managed-login-folder fallback ships as beta "
         '(Lucas, Nov 7: "Yes the fallback ships as beta")',
         None,
     )
@@ -299,17 +348,37 @@ def _sudo_n_true(run_fn: RunFn) -> bool:
 
 
 def _probe_sudo_target(run_fn: RunFn, our_uid: int) -> tuple[str | None, int | None, str]:
+    """First candidate sudo reaches as a non-root other uid for every command in
+    ``SUDO_REQUIRED_COMMANDS``. Independent of ``sudo -n true`` (root target)."""
+
     notes: list[str] = []
     for user in SUDO_TARGET_CANDIDATES:
         result = run_fn(("sudo", "-n", "-u", user, "--", "id", "-u"), 8.0)
         uid = _parse_uid_output(result.stdout)
-        if result.returncode == 0 and uid is not None and uid != our_uid:
-            notes.append(f"sudo -n -u {user} -- id -u -> {uid}")
-            return user, uid, "; ".join(notes)
-        err = (result.stderr or result.stdout).strip().replace("\n", " ")
+        if result.returncode != 0 or uid is None or uid == our_uid or uid == 0:
+            err = (result.stderr or result.stdout).strip().replace("\n", " ")
+            notes.append(
+                f"sudo -n -u {user} -- id -u rc={result.returncode} uid={uid} err={err[:160]}"
+            )
+            continue
+        notes.append(f"sudo -n -u {user} -- id -u -> {uid}")
+        denied = None
+        for argv in SUDO_REQUIRED_COMMANDS:
+            check = run_fn(("sudo", "-n", "-u", user, "--", *argv), 8.0)
+            if check.returncode != 0:
+                err = (check.stderr or check.stdout).strip().replace("\n", " ")
+                denied = (
+                    f"sudo -n -u {user} -- {' '.join(argv)} "
+                    f"rc={check.returncode} err={err[:160]}"
+                )
+                break
+        if denied is not None:
+            notes.append(denied)
+            continue
         notes.append(
-            f"sudo -n -u {user} -- id -u rc={result.returncode} uid={uid} err={err[:160]}"
+            f"sudo -n -u {user} runs {', '.join(a[0] for a in SUDO_REQUIRED_COMMANDS)}"
         )
+        return user, uid, "; ".join(notes)
     return None, None, "; ".join(notes) if notes else "no sudo target candidates"
 
 
@@ -361,12 +430,28 @@ def _proc_field(pid: int, key: str) -> str | None:
     return None
 
 
-def host_uid_of(pid: int) -> int | None:
+def host_uids_of(pid: int) -> tuple[int, ...] | None:
+    """Real, effective, saved and filesystem uid of ``pid`` (``/proc`` Uid line)."""
+
     field = _proc_field(pid, "Uid")
     if not field:
         return None
-    token = field.split()[0]
-    return int(token) if token.isdigit() else None
+    tokens = field.split()
+    if not tokens or not all(token.isdigit() for token in tokens):
+        return None
+    return tuple(int(token) for token in tokens)
+
+
+def host_uid_of(pid: int) -> int | None:
+    uids = host_uids_of(pid)
+    return uids[0] if uids else None
+
+
+def _comm_of(pid: int) -> str:
+    try:
+        return Path(f"/proc/{pid}/comm").read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return "?"
 
 
 def _children_of(pid: int) -> list[int]:
@@ -377,12 +462,24 @@ def _children_of(pid: int) -> list[int]:
     return [int(part) for part in raw.split() if part.isdigit()]
 
 
-def find_other_uid_pid(root_pid: int, our_uid: int, *, timeout_s: float = 1.5) -> tuple[int, int]:
-    """Walk ``root_pid`` and its descendants; prefer a process whose host uid differs."""
+def find_target_uid_pid(
+    root_pid: int,
+    target_uid: int,
+    *,
+    timeout_s: float = 1.5,
+    uids_fn: Callable[[int], tuple[int, ...] | None] = host_uids_of,
+    children_fn: Callable[[int], list[int]] = _children_of,
+) -> int | None:
+    """Walk ``root_pid`` and its descendants for the engine process.
+
+    Matches only a process whose real, effective, saved and filesystem uids
+    all equal ``target_uid``, so a launcher such as sudo (real uid = caller,
+    effective uid = 0) is never returned. ``None`` when nothing matches before
+    the timeout; callers record that as an error and never probe another pid.
+    """
 
     deadline = time.monotonic() + timeout_s
-    last = (root_pid, host_uid_of(root_pid) if host_uid_of(root_pid) is not None else our_uid)
-    while time.monotonic() < deadline:
+    while True:
         seen: set[int] = set()
         stack = [root_pid]
         while stack:
@@ -390,14 +487,41 @@ def find_other_uid_pid(root_pid: int, our_uid: int, *, timeout_s: float = 1.5) -
             if pid in seen:
                 continue
             seen.add(pid)
-            uid = host_uid_of(pid)
-            if uid is not None:
-                last = (pid, uid)
-                if uid != our_uid:
-                    return pid, uid
-            stack.extend(_children_of(pid))
+            uids = uids_fn(pid)
+            if uids and all(uid == target_uid for uid in uids):
+                return pid
+            stack.extend(children_fn(pid))
+        if time.monotonic() >= deadline:
+            return None
         time.sleep(0.02)
-    return last
+
+
+def systemd_unit_main_pid(
+    unit: str,
+    target_uid: int,
+    *,
+    run_fn: RunFn,
+    timeout_s: float = 3.0,
+    uids_fn: Callable[[int], tuple[int, ...] | None] = host_uids_of,
+) -> int | None:
+    """MainPID of a transient systemd-run unit, if it runs entirely as ``target_uid``.
+
+    The unit is forked by PID 1, not by the systemd-run client, so a walk of
+    the client's descendants cannot find it.
+    """
+
+    deadline = time.monotonic() + timeout_s
+    while True:
+        result = run_fn(("systemctl", "show", "-p", "MainPID", "--value", unit), 5.0)
+        token = (result.stdout or "").strip()
+        if result.returncode == 0 and token.isdigit() and int(token) > 0:
+            pid = int(token)
+            uids = uids_fn(pid)
+            if uids and all(uid == target_uid for uid in uids):
+                return pid
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.05)
 
 
 def _ptrace(request: int, pid: int) -> tuple[int, int]:
@@ -417,7 +541,7 @@ def _ptrace(request: int, pid: int) -> tuple[int, int]:
     return rc, ctypes.get_errno()
 
 
-def probe_proc_pid_root(pid: int) -> tuple[bool, str]:
+def probe_proc_pid_root(pid: int) -> ProbeOutcome:
     path = f"/proc/{pid}/root"
     try:
         fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
@@ -427,8 +551,10 @@ def probe_proc_pid_root(pid: int) -> tuple[bool, str]:
     return False, "opened"
 
 
-def probe_ptrace(pid: int) -> tuple[bool, str]:
+def probe_ptrace(pid: int) -> ProbeOutcome:
     rc, err = _ptrace(PTRACE_ATTACH, pid)
+    if rc == -1 and err == 0:
+        return None, "ptrace unavailable: libc not found"
     if rc == 0:
         try:
             os.waitpid(pid, 0)
@@ -439,7 +565,19 @@ def probe_ptrace(pid: int) -> tuple[bool, str]:
     return True, f"rc={rc}:errno={err}:{os.strerror(err) if err else 'ptrace failed'}"
 
 
-def probe_abs_store_read(write_cmd: Sequence[str], directory: str) -> tuple[bool, str]:
+def probe_abs_store_read(
+    write_cmd: Sequence[str],
+    directory: str,
+    *,
+    expected_owner: int | None = None,
+    run_fn: RunFn = _default_run,
+) -> ProbeOutcome:
+    """Have ``write_cmd`` create a 0600 store, then try to read it by absolute path.
+
+    A writer that fails, leaves no file, or wrote as a uid other than
+    ``expected_owner`` is an error (``None``), not a blocked read.
+    """
+
     store = Path(directory) / f"store-{os.getpid()}-{time.time_ns()}.secret"
     quoted = repr(str(store))
     script = (
@@ -447,9 +585,19 @@ def probe_abs_store_read(write_cmd: Sequence[str], directory: str) -> tuple[bool
         "fd=os.open(p, os.O_CREAT|os.O_WRONLY|os.O_TRUNC, 0o600); "
         "os.write(fd, b'store-bytes'); os.close(fd); os.chmod(p, 0o600)"
     )
-    result = _default_run([*write_cmd, "python3", "-c", script], 8.0)
+    result = run_fn([*write_cmd, "python3", "-c", script], 8.0)
     if result.returncode != 0:
-        return True, f"writer_failed rc={result.returncode} err={(result.stderr or '')[:160]}"
+        return None, f"writer_failed rc={result.returncode} err={(result.stderr or '')[:160]}"
+    try:
+        owner_uid = store.stat().st_uid
+    except OSError as exc:
+        return None, f"writer_left_no_store {type(exc).__name__}:{exc.errno}"
+    if expected_owner is not None and owner_uid != expected_owner:
+        try:
+            store.unlink()
+        except OSError:
+            pass
+        return None, f"writer_wrong_uid owner={owner_uid} expected={expected_owner}"
     try:
         data = store.read_bytes()
     except OSError as exc:
@@ -470,7 +618,11 @@ def probe_abs_store_read(write_cmd: Sequence[str], directory: str) -> tuple[bool
     return False, f"read {len(data)} bytes"
 
 
-def spawn_command(backend: Backend, argv: Sequence[str]) -> list[str]:
+def spawn_command(
+    backend: Backend, argv: Sequence[str], *, unit: str | None = None
+) -> list[str]:
+    """``unit`` names the transient systemd-run unit; other backends ignore it."""
+
     if backend.name == "sudo":
         if not backend.target_user:
             raise ValueError("sudo backend needs target_user")
@@ -481,6 +633,7 @@ def spawn_command(backend: Backend, argv: Sequence[str]) -> list[str]:
         return [
             "systemd-run",
             f"--uid={backend.target_user}",
+            *([f"--unit={unit}"] if unit else []),
             "--wait",
             "--pipe",
             "--collect",
@@ -490,7 +643,9 @@ def spawn_command(backend: Backend, argv: Sequence[str]) -> list[str]:
     if backend.name == "setuid_helper":
         raise ValueError("setuid helper invocation protocol is not recorded")
     if backend.name == "subuid_userns":
-        raise ValueError("subuid user-namespace spawn is not available without newuidmap")
+        raise ValueError(
+            "subuid user-namespace spawn is not implemented or measured; detection only"
+        )
     raise ValueError(f"unknown backend: {backend.name}")
 
 
@@ -534,36 +689,105 @@ def _terminate(proc: subprocess.Popen[bytes]) -> None:
             pass
 
 
-def run_same_uid_probes(backend: Backend, n: int = DEFAULT_N) -> tuple[ProbeSummary, ...]:
+class _Tally:
+    """Per-channel counts: blocked, open, or error (probe could not run)."""
+
+    def __init__(self) -> None:
+        self.blocked = {"proc_pid_root": 0, "ptrace": 0, "abs_store_read": 0}
+        self.errors = {"proc_pid_root": 0, "ptrace": 0, "abs_store_read": 0}
+        self.details = {"proc_pid_root": "", "ptrace": "", "abs_store_read": ""}
+        self.targets: dict[str, dict[str, int]] = {
+            "proc_pid_root": {},
+            "ptrace": {},
+            "abs_store_read": {},
+        }
+
+    def add(self, name: str, outcome: ProbeOutcome, target: str) -> None:
+        result, detail = outcome
+        if result is None:
+            self.errors[name] += 1
+        elif result:
+            self.blocked[name] += 1
+        self.details[name] = detail
+        seen = self.targets[name]
+        seen[target] = seen.get(target, 0) + 1
+
+    def summaries(self, n: int) -> tuple[ProbeSummary, ...]:
+        def targets(name: str) -> str:
+            return ", ".join(f"{k} x{v}" for k, v in sorted(self.targets[name].items()))
+
+        return tuple(
+            ProbeSummary(
+                name,  # type: ignore[arg-type]
+                n,
+                self.blocked[name],
+                self.details[name],
+                self.errors[name],
+                targets(name),
+            )
+            for name in ("proc_pid_root", "ptrace", "abs_store_read")
+        )
+
+
+def _probe_pid(tally: _Tally, pid: int | None, missing: str) -> None:
+    if pid is None:
+        tally.add("proc_pid_root", (None, missing), "not found")
+        tally.add("ptrace", (None, missing), "not found")
+        return
+    uids = host_uids_of(pid)
+    target = f"{_comm_of(pid)} uid={uids[0] if uids else '?'}"
+    tally.add("proc_pid_root", probe_proc_pid_root(pid), target)
+    tally.add("ptrace", probe_ptrace(pid), target)
+
+
+def run_same_uid_probes(
+    backend: Backend,
+    n: int = DEFAULT_N,
+    *,
+    run_fn: RunFn = _default_run,
+) -> tuple[ProbeSummary, ...]:
+    """F21 probes from the calling uid against an engine running as ``backend.target_uid``.
+
+    The probed process is the one whose uids all equal ``target_uid`` (for
+    systemd-run, the unit's MainPID), never the launcher. When it cannot be
+    found, the attempt counts as an error, not as blocked.
+    """
+
     if n < 10:
         raise ValueError(f"probe n must be >= 10, got {n}")
-    our_uid = os.getuid()
-    counts = {"proc_pid_root": 0, "ptrace": 0, "abs_store_read": 0}
-    details = {"proc_pid_root": "", "ptrace": "", "abs_store_read": ""}
+    target_uid = backend.target_uid
+    if target_uid is None:
+        raise ValueError(f"{backend.name} backend has no target_uid to probe")
+    tally = _Tally()
     write_prefix = spawn_command(backend, ())
     with tempfile.TemporaryDirectory(prefix="csl734-store-") as tmp:
         os.chmod(tmp, 0o1777)
         for _ in range(n):
-            blocked, detail = probe_abs_store_read(write_prefix, tmp)
-            counts["abs_store_read"] += int(blocked)
-            details["abs_store_read"] = detail
-            cmd = spawn_command(backend, ("sleep", "8"))
+            tally.add(
+                "abs_store_read",
+                probe_abs_store_read(
+                    write_prefix, tmp, expected_owner=target_uid, run_fn=run_fn
+                ),
+                f"0600 store owner uid={target_uid}",
+            )
+            unit = None
+            if backend.name == "systemd_run":
+                unit = f"csl734-probe-{uuid.uuid4().hex[:12]}"
+            cmd = spawn_command(backend, ("sleep", "8"), unit=unit)
             proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             try:
-                pid, _uid = find_other_uid_pid(proc.pid, our_uid)
-                blocked, detail = probe_proc_pid_root(pid)
-                counts["proc_pid_root"] += int(blocked)
-                details["proc_pid_root"] = detail
-                blocked, detail = probe_ptrace(pid)
-                counts["ptrace"] += int(blocked)
-                details["ptrace"] = detail
+                if unit is not None:
+                    pid = systemd_unit_main_pid(unit, target_uid, run_fn=run_fn)
+                    missing = f"no MainPID with uid {target_uid} for unit {unit}"
+                else:
+                    pid = find_target_uid_pid(proc.pid, target_uid)
+                    missing = f"no process with uid {target_uid} under launcher pid {proc.pid}"
+                _probe_pid(tally, pid, missing)
             finally:
                 _terminate(proc)
-    return (
-        ProbeSummary("proc_pid_root", n, counts["proc_pid_root"], details["proc_pid_root"]),
-        ProbeSummary("ptrace", n, counts["ptrace"], details["ptrace"]),
-        ProbeSummary("abs_store_read", n, counts["abs_store_read"], details["abs_store_read"]),
-    )
+                if unit is not None:
+                    run_fn(("systemctl", "stop", unit), 5.0)
+    return tally.summaries(n)
 
 
 def run_same_uid_control_probes(n: int = DEFAULT_N) -> tuple[ProbeSummary, ...]:
@@ -571,32 +795,25 @@ def run_same_uid_control_probes(n: int = DEFAULT_N) -> tuple[ProbeSummary, ...]:
 
     if n < 10:
         raise ValueError(f"probe n must be >= 10, got {n}")
-    counts = {"proc_pid_root": 0, "ptrace": 0, "abs_store_read": 0}
-    details = {"proc_pid_root": "", "ptrace": "", "abs_store_read": ""}
+    our_uid = os.getuid()
+    tally = _Tally()
     with tempfile.TemporaryDirectory(prefix="csl734-store-same-") as tmp:
         os.chmod(tmp, 0o1777)
         for _ in range(n):
-            blocked, detail = probe_abs_store_read((), tmp)
-            counts["abs_store_read"] += int(blocked)
-            details["abs_store_read"] = detail
+            tally.add(
+                "abs_store_read",
+                probe_abs_store_read((), tmp, expected_owner=our_uid),
+                f"0600 store owner uid={our_uid}",
+            )
             proc = subprocess.Popen(
                 ["sleep", "8"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
             try:
-                pid = proc.pid
-                blocked, detail = probe_proc_pid_root(pid)
-                counts["proc_pid_root"] += int(blocked)
-                details["proc_pid_root"] = detail
-                blocked, detail = probe_ptrace(pid)
-                counts["ptrace"] += int(blocked)
-                details["ptrace"] = detail
+                pid = find_target_uid_pid(proc.pid, our_uid)
+                _probe_pid(tally, pid, f"no process with uid {our_uid} at pid {proc.pid}")
             finally:
                 _terminate(proc)
-    return (
-        ProbeSummary("proc_pid_root", n, counts["proc_pid_root"], details["proc_pid_root"]),
-        ProbeSummary("ptrace", n, counts["ptrace"], details["ptrace"]),
-        ProbeSummary("abs_store_read", n, counts["abs_store_read"], details["abs_store_read"]),
-    )
+    return tally.summaries(n)
 
 
 def collect_host_facts(*, run_fn: RunFn | None = None) -> HostFacts:
@@ -683,32 +900,27 @@ def detect_backends(
         helper_path=helper_found,
     )
 
-    if not facts.sudo_n_true:
+    # Sudoers can grant a target user without granting root, so the target
+    # probe runs whatever ``sudo -n true`` (root target) returned.
+    root_note = "sudo -n true ok" if facts.sudo_n_true else "sudo -n true failed"
+    user, target_uid, sudo_note = _probe_sudo_target(run, our_uid)
+    if user is not None and target_uid is not None:
+        sudo_backend = Backend(
+            "sudo",
+            True,
+            True,
+            f"{root_note}; {sudo_note}",
+            target_user=user,
+            target_uid=target_uid,
+        )
+    else:
         sudo_backend = Backend(
             "sudo",
             False,
             False,
-            "sudo -n true failed; not editing sudoers",
+            f"{root_note}; cannot sudo to another uid for the required commands: "
+            f"{sudo_note}; not editing sudoers",
         )
-    else:
-        user, target_uid, sudo_note = _probe_sudo_target(run, our_uid)
-        if user is not None and target_uid is not None:
-            sudo_backend = Backend(
-                "sudo",
-                True,
-                True,
-                f"sudo -n true ok; {sudo_note}",
-                target_user=user,
-                target_uid=target_uid,
-            )
-        else:
-            sudo_backend = Backend(
-                "sudo",
-                False,
-                False,
-                f"sudo -n true ok, but cannot sudo to another uid: {sudo_note}; "
-                "not editing sudoers",
-            )
 
     systemd_user = sudo_backend.target_user or "nobody"
     sys_ok, sys_uid, sys_reason = _probe_systemd_run(run, systemd_user, our_uid)
@@ -728,8 +940,15 @@ def detect_backends(
         f"subgid={','.join(facts.subgid_lines) or 'none'}"
     )
     if facts.newuidmap_path and facts.newuidmap_is_setuid_root and facts.subuid_lines:
-        # A working newuidmap could map subordinate uids. Probe map-auto; only
-        # accept the backend if the host uid of the child actually changes.
+        # A working newuidmap could map subordinate uids. Probe map-auto and
+        # record whether the child's host uid changes. --map-auto maps the
+        # first subuid block to ns uid 0, so ns uid 1 is block start + 1.
+        # spawn_command does not implement this path, so it is detection only
+        # and never available for selection.
+        expected_uid = None
+        fields = facts.subuid_lines[0].split(":")
+        if len(fields) >= 2 and fields[1].isdigit():
+            expected_uid = int(fields[1]) + 1
         mapped = run(
             ("unshare", "--user", "--map-auto", "--setuid", "1", "--setgid", "1", "id", "-u"),
             8.0,
@@ -743,23 +962,27 @@ def detect_backends(
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            child_host_uid = find_other_uid_pid(proc.pid, our_uid)[1]
-            host_changed = child_host_uid != our_uid
+            if expected_uid is not None and expected_uid != our_uid:
+                child_pid = find_target_uid_pid(proc.pid, expected_uid)
+                if child_pid is not None:
+                    child_host_uid = expected_uid
+                    host_changed = True
         except FileNotFoundError:
             mapped = ProcResult(127, "", "unshare not found")
         finally:
             if proc is not None:
                 _terminate(proc)
-        available = mapped.returncode == 0 and host_changed
+        host_changed = mapped.returncode == 0 and host_changed
         subuid_backend = Backend(
             "subuid_userns",
-            available,
-            available,
+            False,
+            host_changed,
             (
                 f"{range_note}; newuidmap={facts.newuidmap_path} setuid_root; "
-                f"unshare --map-auto rc={mapped.returncode} host_uid={child_host_uid}"
+                f"unshare --map-auto rc={mapped.returncode} host_uid={child_host_uid}; "
+                "spawn path not implemented or measured, so not selectable"
             ),
-            target_uid=child_host_uid if available else None,
+            target_uid=child_host_uid if host_changed else None,
         )
     else:
         why = []
@@ -785,21 +1008,54 @@ def detect_backends(
     return (setuid_backend, sudo_backend, systemd_backend, subuid_backend)
 
 
-def evaluate_host(*, n: int = DEFAULT_N, run_fn: RunFn | None = None) -> Evaluation:
-    facts = collect_host_facts(run_fn=run_fn)
-    backends = detect_backends(facts=facts, run_fn=run_fn)
-    selected = select_path(backends)
+def evaluate_host(
+    *,
+    n: int = DEFAULT_N,
+    run_fn: RunFn | None = None,
+    facts: HostFacts | None = None,
+    backends: Sequence[Backend] | None = None,
+    measure_fn: Callable[[Backend, int], Overhead] = measure_overhead,
+    probe_fn: Callable[[Backend, int], tuple[ProbeSummary, ...]] = run_same_uid_probes,
+) -> Evaluation:
+    """Measure every spawnable other-uid backend, then select a path.
+
+    A backend whose measurement fails (for example a sudoers rule that denies
+    a command mid-run) is recorded in ``errors`` and marked unavailable, so
+    selection falls through to the next backend or the beta fallback instead
+    of aborting the evaluation.
+    """
+
+    facts = facts or collect_host_facts(run_fn=run_fn)
+    detected = tuple(backends) if backends is not None else detect_backends(
+        facts=facts, run_fn=run_fn
+    )
     overhead: dict[str, Overhead] = {}
     probes: dict[str, tuple[ProbeSummary, ...]] = {}
-    for backend in backends:
-        if not (backend.available and backend.changes_host_uid):
+    errors: dict[str, str] = {}
+    final: list[Backend] = []
+    for backend in detected:
+        if not (backend.available and backend.changes_host_uid and can_spawn(backend)):
+            final.append(backend)
             continue
         try:
-            spawn_command(backend, ("true",))
-        except ValueError:
+            measured = measure_fn(backend, n)
+            probed = probe_fn(backend, n)
+        except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as exc:
+            message = f"{type(exc).__name__}: {str(exc)[:300]}"
+            errors[backend.name] = message
+            final.append(
+                replace(
+                    backend,
+                    available=False,
+                    reason=f"{backend.reason}; measurement failed, not selectable: {message}",
+                )
+            )
             continue
-        overhead[backend.name] = measure_overhead(backend, n)
-        probes[backend.name] = run_same_uid_probes(backend, n)
+        overhead[backend.name] = measured
+        probes[backend.name] = probed
+        final.append(backend)
+    backends = tuple(final)
+    selected = select_path(backends)
     return Evaluation(
         product_commit=PRODUCT_MD_COMMIT,
         product_sha256=PRODUCT_MD_SHA256,
@@ -814,6 +1070,7 @@ def evaluate_host(*, n: int = DEFAULT_N, run_fn: RunFn | None = None) -> Evaluat
             "codex_signin_survives_reboot": CODEX_SIGNIN_SURVIVES_REBOOT,
             "headless_secret_service_live": HEADLESS_SECRET_SERVICE_LIVE,
         },
+        errors=errors,
     )
 
 
@@ -825,6 +1082,8 @@ __all__ = [
     "HEADLESS_SECRET_SERVICE_LIVE",
     "PRODUCT_MD_COMMIT",
     "PRODUCT_MD_SHA256",
+    "SPAWNABLE_BACKENDS",
+    "SUDO_REQUIRED_COMMANDS",
     "Backend",
     "Evaluation",
     "HostFacts",
@@ -832,13 +1091,16 @@ __all__ = [
     "ProbeSummary",
     "SelectedPath",
     "byok_storage_when_secret_service_fails_closed",
+    "can_spawn",
     "collect_host_facts",
     "detect_backends",
     "evaluate_host",
+    "find_target_uid_pid",
     "measure_overhead",
     "percentile",
     "run_same_uid_control_probes",
     "run_same_uid_probes",
     "select_path",
     "spawn_command",
+    "systemd_unit_main_pid",
 ]

@@ -1,13 +1,18 @@
 """CSL-734 B7 / F21: privileged spawn detection, measured backends, beta fallback.
 
-Live probes on this host do not install helpers, edit sudoers or polkit, create a
-system user, copy credentials, or launch Claude Code or Codex.
+The default run is pure unit tests with injected host facts and commands. The
+live host checks (real sudo, systemd-run, unshare and process probes) run only
+when ``RECURSION_LIVE_HOST_PROBES=1`` is set. They do not install helpers, edit
+sudoers or polkit, create a system user, copy credentials, or launch Claude
+Code or Codex.
 """
 
 from __future__ import annotations
 
+import ast
 import os
 import stat
+import tempfile
 import unittest
 from types import SimpleNamespace
 
@@ -21,15 +26,25 @@ from recursion_core.control.privileged_spawn import (
     PRODUCT_MD_SHA256,
     Backend,
     HostFacts,
+    Overhead,
+    ProbeSummary,
     ProcResult,
     byok_storage_when_secret_service_fails_closed,
+    can_spawn,
     collect_host_facts,
     detect_backends,
     evaluate_host,
+    find_target_uid_pid,
     percentile,
+    probe_abs_store_read,
     run_same_uid_control_probes,
+    run_same_uid_probes,
     select_path,
+    systemd_unit_main_pid,
 )
+
+LIVE_ENV = "RECURSION_LIVE_HOST_PROBES"
+LIVE = os.environ.get(LIVE_ENV) == "1"
 
 
 def _facts(**overrides) -> HostFacts:
@@ -52,6 +67,28 @@ def _facts(**overrides) -> HostFacts:
 
 def _run_fail(cmd, timeout: float) -> ProcResult:
     return ProcResult(1, "", f"denied:{' '.join(cmd)}")
+
+
+def _sudo_policy(allowed: dict[tuple[str, ...], str]):
+    """Fake runner: ``allowed`` maps an exact argv to its stdout; all else is denied."""
+
+    def run(cmd, timeout: float) -> ProcResult:
+        key = tuple(cmd)
+        if key in allowed:
+            return ProcResult(0, allowed[key], "")
+        return ProcResult(1, "", f"denied:{' '.join(cmd)}")
+
+    return run
+
+
+def _nobody_allows(*argvs: tuple[str, ...]) -> dict[tuple[str, ...], str]:
+    out = {("sudo", "-n", "-u", "nobody", "--", "id", "-u"): "65534\n"}
+    for argv in argvs:
+        out[("sudo", "-n", "-u", "nobody", "--", *argv)] = ""
+    return out
+
+
+ALL_REQUIRED = (("true",), ("sleep", "0"), ("python3", "-c", "pass"))
 
 
 class PinAndUnmeasuredTests(unittest.TestCase):
@@ -134,8 +171,22 @@ class SelectionTests(unittest.TestCase):
         subuid = Backend("subuid_userns", True, True, "ok", target_uid=100000)
         helper = Backend("setuid_helper", True, True, "ok", helper_path="/helper", target_uid=123)
         self.assertEqual(select_path((sudo, systemd, subuid)).name, "sudo")
-        self.assertEqual(select_path((helper, sudo, systemd, subuid)).name, "setuid_helper")
-        self.assertFalse(select_path((helper, sudo)).beta)
+        self.assertEqual(select_path((systemd, subuid)).name, "systemd_run")
+        self.assertFalse(select_path((sudo,)).beta)
+
+    def test_backends_spawn_command_rejects_are_never_selected(self) -> None:
+        # Devin r4506181267: a working subuid map, or a setuid helper without a
+        # recorded protocol, cannot launch an engine, so selecting it is wrong.
+        subuid = Backend("subuid_userns", True, True, "ok", target_uid=100001)
+        helper = Backend("setuid_helper", True, True, "ok", helper_path="/helper", target_uid=123)
+        self.assertFalse(can_spawn(subuid))
+        self.assertFalse(can_spawn(helper))
+        selected = select_path((helper, subuid))
+        self.assertEqual(selected.name, "managed_login_folder")
+        self.assertTrue(selected.beta)
+        sudo = Backend("sudo", True, True, "ok", target_user="nobody", target_uid=65534)
+        self.assertTrue(can_spawn(sudo))
+        self.assertEqual(select_path((helper, sudo, subuid)).name, "sudo")
 
 
 class DetectionInjectionTests(unittest.TestCase):
@@ -194,6 +245,208 @@ class DetectionInjectionTests(unittest.TestCase):
         self.assertIn("not executed", helper.reason)
 
 
+class SudoPolicyDetectionTests(unittest.TestCase):
+    def _sudo(self, allowed) -> Backend:
+        backends = detect_backends(
+            facts=_facts(sudo_n_true=False),
+            run_fn=_sudo_policy(allowed),
+            helper_paths=("/tmp/csl734-no-such-helper",),
+            env={},
+        )
+        return next(b for b in backends if b.name == "sudo")
+
+    def test_target_only_sudo_is_detected_without_root(self) -> None:
+        # Devin r4506181429: sudoers grants nobody but not root.
+        sudo = self._sudo(_nobody_allows(*ALL_REQUIRED))
+        self.assertTrue(sudo.available)
+        self.assertTrue(sudo.changes_host_uid)
+        self.assertEqual(sudo.target_user, "nobody")
+        self.assertEqual(sudo.target_uid, 65534)
+        self.assertIn("sudo -n true failed", sudo.reason)
+        backends = (Backend("setuid_helper", False, False, "absent"), sudo)
+        selected = select_path(backends)
+        self.assertEqual(selected.name, "sudo")
+        self.assertFalse(selected.beta)
+
+    def test_target_sudo_missing_a_required_command_is_unavailable(self) -> None:
+        # Devin r4506181499: id -u allowed as nobody, true denied.
+        sudo = self._sudo(_nobody_allows(("sleep", "0"), ("python3", "-c", "pass")))
+        self.assertFalse(sudo.available)
+        self.assertIsNone(sudo.target_user)
+        self.assertIn("-- true rc=1", sudo.reason)
+        sudo = self._sudo(_nobody_allows(("true",), ("sleep", "0")))
+        self.assertFalse(sudo.available)
+        self.assertIn("python3 -c pass rc=1", sudo.reason)
+
+    def test_sudo_target_that_is_root_or_our_uid_is_rejected(self) -> None:
+        allowed = {("sudo", "-n", "-u", "nobody", "--", "id", "-u"): "0\n"}
+        allowed.update({("sudo", "-n", "-u", "nobody", "--", *a): "" for a in ALL_REQUIRED})
+        allowed[("sudo", "-n", "-u", "daemon", "--", "id", "-u")] = "1000\n"
+        self.assertFalse(self._sudo(allowed).available)
+
+
+class EvaluateHostInjectionTests(unittest.TestCase):
+    def _backends(self) -> tuple[Backend, ...]:
+        return (
+            Backend("setuid_helper", False, False, "absent"),
+            Backend("sudo", True, True, "ok", target_user="nobody", target_uid=65534),
+            Backend("systemd_run", False, False, "no systemd"),
+            Backend("subuid_userns", False, True, "detection only", target_uid=100001),
+        )
+
+    def test_measurement_failure_is_recorded_and_falls_back(self) -> None:
+        def measure_fn(backend: Backend, n: int) -> Overhead:
+            raise RuntimeError("overhead command failed rc=1 err=sudo: a password is required")
+
+        def probe_fn(backend: Backend, n: int):
+            raise AssertionError("probes must not run after a failed measurement")
+
+        evaluation = evaluate_host(
+            n=DEFAULT_N,
+            facts=_facts(sudo_n_true=True),
+            backends=self._backends(),
+            measure_fn=measure_fn,
+            probe_fn=probe_fn,
+        )
+        self.assertIn("sudo", evaluation.errors)
+        self.assertIn("password is required", evaluation.errors["sudo"])
+        sudo = next(b for b in evaluation.backends if b.name == "sudo")
+        self.assertFalse(sudo.available)
+        self.assertIn("measurement failed", sudo.reason)
+        self.assertEqual(evaluation.overhead, {})
+        self.assertEqual(evaluation.probes, {})
+        self.assertEqual(evaluation.selected.name, "managed_login_folder")
+        self.assertTrue(evaluation.selected.beta)
+
+    def test_measured_backend_is_selected_and_subuid_is_not_measured(self) -> None:
+        seen: list[str] = []
+        overhead = Overhead(DEFAULT_N, 0.01, 0.02, 0.005, 0.03, ("sudo",))
+        summaries = tuple(
+            ProbeSummary(name, DEFAULT_N, DEFAULT_N, "denied", 0, "sleep uid=65534 x20")
+            for name in ("proc_pid_root", "ptrace", "abs_store_read")
+        )
+
+        def measure_fn(backend: Backend, n: int) -> Overhead:
+            seen.append(backend.name)
+            return overhead
+
+        evaluation = evaluate_host(
+            n=DEFAULT_N,
+            facts=_facts(),
+            backends=self._backends(),
+            measure_fn=measure_fn,
+            probe_fn=lambda backend, n: summaries,
+        )
+        self.assertEqual(seen, ["sudo"])
+        self.assertEqual(evaluation.errors, {})
+        self.assertEqual(evaluation.selected.name, "sudo")
+        self.assertEqual(evaluation.probes["sudo"], summaries)
+
+
+class ProbeTargetTests(unittest.TestCase):
+    def test_walk_skips_the_sudo_launcher_and_finds_the_engine(self) -> None:
+        # Devin r4506181329: sudo (ruid=caller, euid=0) -> sleep (all 65534).
+        uids = {100: (1000, 0, 0, 0), 101: (0, 0, 0, 0), 102: (65534,) * 4}
+        children = {100: [101], 101: [102], 102: []}
+        pid = find_target_uid_pid(
+            100, 65534, timeout_s=0.0, uids_fn=uids.get, children_fn=lambda p: children[p]
+        )
+        self.assertEqual(pid, 102)
+
+    def test_walk_never_returns_a_non_target_process(self) -> None:
+        uids = {100: (1000, 0, 0, 0), 101: (0, 0, 0, 0), 102: (65534, 65534, 65534, 0)}
+        children = {100: [101], 101: [102], 102: []}
+        self.assertIsNone(
+            find_target_uid_pid(
+                100, 65534, timeout_s=0.05, uids_fn=uids.get, children_fn=lambda p: children[p]
+            )
+        )
+        # Root as the target never matches the sudo launcher (ruid = caller).
+        self.assertIsNone(
+            find_target_uid_pid(
+                100, 0, timeout_s=0.0, uids_fn={100: (1000, 0, 0, 0)}.get, children_fn=lambda p: []
+            )
+        )
+
+    def test_systemd_unit_main_pid_checks_the_unit_uid(self) -> None:
+        calls: list[tuple[str, ...]] = []
+
+        def run(cmd, timeout: float) -> ProcResult:
+            calls.append(tuple(cmd))
+            return ProcResult(0, "4242\n", "")
+
+        pid = systemd_unit_main_pid(
+            "csl734-probe-x", 65534, run_fn=run, timeout_s=0.0, uids_fn={4242: (65534,) * 4}.get
+        )
+        self.assertEqual(pid, 4242)
+        self.assertEqual(
+            calls[0], ("systemctl", "show", "-p", "MainPID", "--value", "csl734-probe-x")
+        )
+        self.assertIsNone(
+            systemd_unit_main_pid(
+                "u", 65534, run_fn=run, timeout_s=0.0, uids_fn={4242: (1000,) * 4}.get
+            )
+        )
+        self.assertIsNone(
+            systemd_unit_main_pid(
+                "u",
+                65534,
+                run_fn=lambda cmd, t: ProcResult(0, "0\n", ""),
+                timeout_s=0.0,
+                uids_fn={0: (65534,) * 4}.get,
+            )
+        )
+
+    def test_probes_require_a_target_uid(self) -> None:
+        with self.assertRaises(ValueError):
+            run_same_uid_probes(Backend("sudo", True, True, "ok", target_user="nobody"))
+
+
+class StoreProbeErrorTests(unittest.TestCase):
+    def test_failed_writer_is_an_error_not_a_blocked_read(self) -> None:
+        # Devin r4506181376.
+        with tempfile.TemporaryDirectory() as tmp:
+            result, detail = probe_abs_store_read(
+                ("sudo", "-n", "-u", "nobody", "--"),
+                tmp,
+                expected_owner=65534,
+                run_fn=lambda cmd, t: ProcResult(1, "", "sudo: a password is required"),
+            )
+        self.assertIsNone(result)
+        self.assertIn("writer_failed", detail)
+
+    def test_writer_that_left_no_store_is_an_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result, detail = probe_abs_store_read(
+                (), tmp, expected_owner=65534, run_fn=lambda cmd, t: ProcResult(0, "", "")
+            )
+        self.assertIsNone(result)
+        self.assertIn("writer_left_no_store", detail)
+
+    def test_store_written_by_the_wrong_uid_is_an_error(self) -> None:
+        def run(cmd, timeout: float) -> ProcResult:
+            # Executes nothing: the fake writer plants the file as our own uid.
+            script = cmd[-1]
+            path = script.split("p=", 1)[1].split(";", 1)[0]
+            with open(ast.literal_eval(path), "wb") as handle:
+                handle.write(b"x")
+            return ProcResult(0, "", "")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result, detail = probe_abs_store_read((), tmp, expected_owner=os.getuid() + 1, run_fn=run)
+            self.assertEqual(os.listdir(tmp), [])
+        self.assertIsNone(result)
+        self.assertIn("writer_wrong_uid", detail)
+
+    def test_summary_with_errors_is_never_blocked(self) -> None:
+        summary = ProbeSummary("abs_store_read", 20, 19, "writer_failed", 1)
+        self.assertFalse(summary.blocked)
+        self.assertEqual(summary.open_count, 0)
+        self.assertTrue(ProbeSummary("ptrace", 20, 20, "denied", 0).blocked)
+        self.assertFalse(ProbeSummary("ptrace", 20, 0, "x", 20).blocked)
+
+
+@unittest.skipUnless(LIVE, f"live host probes run only with {LIVE_ENV}=1")
 class LiveHostTests(unittest.TestCase):
     """Real probes and timings for backends that already work on this host."""
 
@@ -248,12 +501,14 @@ class LiveHostTests(unittest.TestCase):
         for name in ("proc_pid_root", "ptrace", "abs_store_read"):
             probe = by_name[name]
             self.assertEqual(probe.n, DEFAULT_N)
+            self.assertEqual(probe.error_count, 0, f"{name} errored: {probe.detail}")
             self.assertEqual(
                 probe.blocked_count,
                 0,
                 f"{name} should stay open under the same uid; detail={probe.detail}",
             )
             self.assertFalse(probe.blocked)
+            self.assertIn(f"uid={os.getuid()}", probe.targets)
 
     def test_measured_backends_block_f21_channels_and_report_percentiles(self) -> None:
         evaluation = self.evaluation
@@ -283,6 +538,12 @@ class LiveHostTests(unittest.TestCase):
             for name in ("proc_pid_root", "ptrace", "abs_store_read"):
                 probe = probes[name]
                 self.assertEqual(probe.n, DEFAULT_N)
+                self.assertEqual(probe.error_count, 0, f"{name} errored: {probe.detail}")
+                # Every attempt probed the engine uid, never the launcher.
+                self.assertEqual(
+                    probe.targets.count("uid="), 1, f"{name} targets={probe.targets}"
+                )
+                self.assertIn(f"uid={backend.target_uid} x{DEFAULT_N}", probe.targets)
                 self.assertEqual(
                     probe.blocked_count,
                     DEFAULT_N,

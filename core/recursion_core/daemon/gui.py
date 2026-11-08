@@ -4,6 +4,7 @@ The control transport and device door are injected by the control-API adapter.
 Until that adapter is attached, authentication refuses every request; the fallback
 transport reports unavailable, never an invented empty route inventory.
 """
+from collections.abc import Mapping
 from threading import Thread
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer
 
@@ -17,6 +18,22 @@ def _unavailable(*_):
 
 def _unpaired(_):
     return False
+
+
+def _snapshot(plugin):
+    """Materialise one plugin's panels and required subjects once.
+
+    Validation at construction and the served application at bind must see the same
+    declarations, so one-shot iterables (generators) are read exactly once here.
+    """
+    if not isinstance(plugin, Mapping):
+        raise ValueError("plugin must be a mapping")
+    snapshot = dict(plugin)
+    if "panels" in snapshot:
+        snapshot["panels"] = tuple(dict(p) if isinstance(p, Mapping) else p for p in snapshot["panels"])
+    if "required" in snapshot:
+        snapshot["required"] = {cls: tuple(subjects) for cls, subjects in snapshot["required"].items()}
+    return snapshot
 
 
 class _Handler(WSGIRequestHandler):
@@ -34,10 +51,11 @@ class LoopbackGUI:
     def __init__(self, client=None, door=None, *, plugins=(), port=8765):
         self.client = client if client is not None else ControlClient(_unavailable)
         self.door = door if door is not None else _unpaired
-        self.plugins, self.port = tuple(plugins), port
+        self.plugins, self.port = tuple(_snapshot(p) for p in plugins), port
         self.server = self.thread = None
         # Validate plugin panels before any bind, so a bad registry fails at startup
-        # even when the port is occupied and the bind is retried later.
+        # even when the port is occupied and the bind is retried later. Both compose()
+        # calls read the same snapshot, so generator-backed panels are not lost.
         compose(self.client, self.door, frozenset(), frozenset(), plugins=self.plugins)
 
     def __enter__(self):

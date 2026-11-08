@@ -69,6 +69,29 @@ class LoopbackTests(TestCase):
             self.assertNotIn("<form", main)
             self.assertEqual([c[2]["command"] for c in self.api.calls], ["operator.health.inspect"])
 
+    def test_generator_backed_plugin_panels_survive_startup_validation(self):
+        # Devin r4507809767: the constructor-time check must not exhaust one-shot iterables.
+        plugin = {"panels": (p for p in [{"id": "health", "title": "Health",
+                                          "reads": ["operator.health.inspect"]}])}
+        with LoopbackGUI(self.client, lambda _: True, plugins=(plugin,), port=0) as gui:
+            status, _, page = self.request(gui, "/panel?id=health")
+            self.assertEqual(status, 200)
+            self.assertIn("Health", page)
+            self.assertEqual([c[2]["command"] for c in self.api.calls], ["operator.health.inspect"])
+
+    def test_generator_backed_required_routes_survive_startup_validation(self):
+        plugin = {"required": {"venue_use": (s for s in ["kalshi:model_fed_read"])}}
+        with LoopbackGUI(self.client, lambda _: True, plugins=(plugin,), port=0) as gui:
+            status, _, page = self.request(gui)
+            self.assertEqual(status, 200)
+            self.assertIn("gap:venue_use:kalshi:model_fed_read", page)
+
+    def test_plugin_that_is_not_a_mapping_is_refused_before_any_bind(self):
+        with mock.patch("recursion_core.daemon.gui.WSGIServer") as server:
+            with self.assertRaises(ValueError):
+                LoopbackGUI(self.client, lambda _: True, plugins=([("panels", ())],), port=0)
+        server.assert_not_called()
+
     def test_bad_plugin_does_not_leave_a_bound_socket(self):
         servers = []
         def bind(*args):

@@ -148,7 +148,7 @@ closes its HTTP listener before closing the registry. The listener binds only
 opens no socket. If that port is already taken (any `OSError` on bind), the
 daemon logs "GUI unavailable" once, keeps its five-second reconciliation and Stop
 replay running, and retries the bind on every sweep; it logs "GUI available again"
-when the bind succeeds. A bad plugin registry still stops the service, and it is checked before any bind, so it fails at startup even while the port is occupied. This branch carries the #330 GUI prerequisite unchanged by
+when the bind succeeds. A bad plugin registry still stops the service, and it is checked before any bind, so it fails at startup even while the port is occupied. Each plugin's panels and required subjects are read once into a snapshot that both the startup check and the served page use, so generator-backed registries are not emptied by the check. This branch carries the #330 GUI prerequisite unchanged by
 cherry-pick so its real HTTP test is self-contained; merge order is not assumed.
 
 The control-API device door and `ControlClient` can be injected into `main`.

@@ -19,6 +19,7 @@ block; a network namespace belongs to the launch sandbox (B6), not this check.
 from __future__ import annotations
 
 import os
+import select
 import shutil
 import signal
 import subprocess
@@ -87,21 +88,47 @@ def _kill_group(proc: subprocess.Popen) -> None:
 
 
 class _CappedReader(threading.Thread):
-    """Read one pipe into memory, keeping at most ``PROBE_OUTPUT_CAP + 1`` bytes; flag when over."""
+    """Read one pipe into memory, keeping at most ``PROBE_OUTPUT_CAP + 1`` bytes; flag when over.
+
+    On POSIX the pipe is polled with ``select`` so ``stop`` always ends the thread, even when a
+    process that left the probe's session still holds the write end open. The stream is closed
+    only after the thread has ended, so closing never waits on a blocked read.
+    """
 
     def __init__(self, stream, over: threading.Event) -> None:
         super().__init__(daemon=True)
         self.stream, self.over, self.data = stream, over, bytearray()
+        self.stop = threading.Event()
+        self.eof = False
+
+    def _keep(self, chunk: bytes) -> bool:
+        room = PROBE_OUTPUT_CAP + 1 - len(self.data)
+        if room > 0:
+            self.data += chunk[:room]
+        if len(self.data) > PROBE_OUTPUT_CAP:
+            self.over.set()
+            return False  # stop reading; the probe is killed and the pipe closed
+        return True
 
     def run(self) -> None:
         try:
-            while chunk := self.stream.read1(65536):
-                room = PROBE_OUTPUT_CAP + 1 - len(self.data)
-                if room > 0:
-                    self.data += chunk[:room]
-                if len(self.data) > PROBE_OUTPUT_CAP:
-                    self.over.set()
-                    return  # stop reading; the probe is killed and the pipe closed
+            if os.name == "nt":
+                while chunk := self.stream.read1(65536):
+                    if not self._keep(chunk):
+                        return
+                self.eof = True
+                return
+            fd = self.stream.fileno()
+            while not self.stop.is_set():
+                ready, _, _ = select.select([fd], [], [], _POLL_S)
+                if not ready:
+                    continue
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    self.eof = True
+                    return
+                if not self._keep(chunk):
+                    return
         except (OSError, ValueError):
             pass
 
@@ -148,13 +175,24 @@ def run_version_probe(spec: EngineSpec, realpath: str, timeout: float = PROBE_TI
                     os.killpg(proc.pid, signal.SIGKILL)
                 except (ProcessLookupError, PermissionError):
                     pass
+            drain_until = max(deadline, time.monotonic() + 1.0)
             for r in readers:
+                r.join(max(0.0, drain_until - time.monotonic()))
+            held = [r for r in readers if r.is_alive()]
+            for r in held:
+                r.stop.set()
                 r.join(1.0)
             ms = round((time.monotonic() - t0) * 1000)
             if over.is_set() or any(len(r.data) > PROBE_OUTPUT_CAP for r in readers):
                 raise LaunchRefused("version_probe_failed", spec.engine, f"--version output over {PROBE_OUTPUT_CAP} bytes")
+            if held:
+                raise LaunchRefused("version_probe_failed", spec.engine,
+                                    "--version exited but a process outside its session kept the output open")
             raw = _first_line(bytes(readers[0].data)) or _first_line(bytes(readers[1].data))
         finally:
+            for r in readers:
+                r.stop.set()
+                r.join(1.0)
             for stream in (proc.stdout, proc.stderr):
                 try:
                     stream.close()

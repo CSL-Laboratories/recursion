@@ -59,7 +59,9 @@ after an error.
 `<realpath> --version` (for Hermes, the sibling `hermes-acp --version`, which skips the
 network update check; its digest is pinned and re-verified too), argv as a list, no shell,
 stdin `/dev/null`, `close_fds`, a new session killed as a group on timeout (20 s default),
-output to private files capped at 64 KiB. The environment is built from nothing: `PATH=/usr/bin:/bin`,
+output read in memory and capped at 64 KiB while it runs (nothing is written to disk). A
+process that leaves the probe's session and keeps the output open past the timeout refuses
+`version_probe_failed` instead of hanging the check. The environment is built from nothing: `PATH=/usr/bin:/bin`,
 `HOME`, `TMPDIR` and `XDG_*` inside a fresh temp dir removed afterwards, `LC_ALL=C`, plus
 Claude Code's `DISABLE_AUTOUPDATER=1` and `DISABLE_UPDATES=1`. No proxy, credential,
 config-path or `CLI_VERSION` variable can reach it. Limit: this is not a kernel network

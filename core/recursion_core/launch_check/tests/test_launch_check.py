@@ -289,6 +289,19 @@ class GrantRefusalTests(Base):
         leftovers = [n for n in os.listdir(tempfile.gettempdir()) if n.startswith("r2a-probe-")]
         self.assertEqual([], [n for n in leftovers if n not in before])
 
+    @unittest.skipIf(os.name == "nt" or not shutil.which("setsid"), "needs POSIX setsid")
+    def test_detached_child_holding_output_cannot_hang_the_probe(self) -> None:
+        # Devin r4508033381: a process that leaves the probe's session and keeps stdout open
+        # must not block the check past its timeout.
+        d = F.dir()
+        held = F.script(os.path.join(d, "claude"), "#!/bin/sh\necho 2.1.318\nsetsid sleep 4 &\nsleep 0.3\nexit 0\n")
+        t0 = time.monotonic()
+        with self.assertRaises(LaunchRefused) as cm:
+            run_version_probe(FLOORS["claude_code"], held, timeout=1.0)
+        self.assertEqual("version_probe_failed", cm.exception.code)
+        self.assertIn("kept the output open", cm.exception.detail)
+        self.assertLess(time.monotonic() - t0, 3.5)
+
     def test_binary_changed_during_probe(self) -> None:
         p = self.claude()
 

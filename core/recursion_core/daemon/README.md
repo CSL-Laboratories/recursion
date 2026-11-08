@@ -139,3 +139,28 @@ not systemd: the measuring box has no systemd PID 1 or user manager. Not
 measured here: systemd `--user` scopes and `systemctl --user restart`, a real
 reboot, operator linger on a host, and Windows (job handle held outside the
 daemon, CSL-746).
+
+## Loopback GUI (O68 bar 4 / A45, Nov 8 correction)
+
+The service composition root now starts `LoopbackGUI` beside reconciliation and
+closes its HTTP listener before closing the registry. The listener binds only
+`127.0.0.1:8765` (`--gui-port` overrides the port, never the address). The GUI package
+opens no socket. This branch carries the #330 GUI prerequisite unchanged by
+cherry-pick so its real HTTP test is self-contained; merge order is not assumed.
+
+The control-API device door and `ControlClient` can be injected into `main`.
+Without the #327 adapter the production default refuses authentication on every
+request (401); it does not silently trust loopback, invent data, or manufacture a
+token. Tests inject a fake API/device door and prove a real GET returns the page.
+Control-API credential/pairing integration remains with #327, not claimed here.
+
+For an installed Cockpit plugin, configure the composition root with the explicit
+trusted factory `--plugin cockpit.gui:registry` (Cockpit's `engine` must be on the
+module path). The root passes the registry's plain `required`/`panels` mappings to
+`recursion_core.gui.compose`; Cockpit does not import Recursion. `/panel?id=...`
+renders only the named O7 reads, with the shared venue-data filter, no panel order
+verb and no panel Stop. Shared interventions and run Stop stay in the core page.
+
+Contract: `contracts/PRODUCT.md` at
+`055cc7a5c793b7135e5d0565dc4198cf96230531`, SHA-256
+`e64783152f6d67d4ede774dc41d112fe46c2d7536d53cb2c04e71a3566044daf`.

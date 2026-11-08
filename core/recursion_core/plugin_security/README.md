@@ -26,6 +26,23 @@ patch the verifier, rewrite the ledger, self-approve in memory). Containment nee
 separate OS user or process (F11, F21, F35). Blocked in the same table: a profile forged
 with the plugin's own key, a replay after restart, a deleted ledger, and a plugin whose
 manifest names itself `host` to reach host-only ops (`host` is a reserved plugin id).
+Same-uid is not a security boundary. The real boundary is a separate OS user or process
+(F21), and F21 is not done.
+
+**Nov 11 same-uid fallback (O69, decided).** Lucas, Nov 8 (t1415u), PRODUCT.md 055cc7a5
+O69:
+
+> "the in-process Cockpit plugin holds paper-order permission on Nov 11 under the same-uid fallback. The signed authority profile is tamper evidence there, not a boundary, and the docs say so. Paper only; live capital stays separately authorised (5.2)."
+
+So under the same-uid fallback the signed authority profile is tamper evidence, not a
+boundary: it binds honest plugins and records what happened, and the mutants above
+still rewrite it. The in-process Cockpit plugin holds paper-order permission on Nov 11.
+Paper only. This fallback grants no live-order permission; live capital stays
+separately authorised (PRODUCT.md 5.2). The code has one `order` permission and does not
+tell paper from live venues (`scope.venue` is an opaque string), so paper only is what
+the installer signs, not a runtime check. The quote is frozen in
+`policy.SAME_UID_FALLBACK_POLICY` and `tests/test_o69_policy.py` checks this section
+against it.
 
 Production runtime: CPython 3.14 free-threaded, started with `-X gil=0`
 (`runtime.require_production_runtime`). Signature checks need `cryptography`

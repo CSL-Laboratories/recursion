@@ -23,7 +23,14 @@ Same-uid limit (B17, stated, not solved): every guard above lives in the daemon'
 process and files, which in-process plugin code running as the same uid can rewrite
 (replace the anchor attribute, patch ``verify``, edit or recreate the ledger). The
 tests record which of those mutants succeed. Containment needs a separate OS user or
-process for the anchor and ledger (F11, F21).
+process for the anchor and ledger (F11, F21); F21 is not done.
+
+Nov 11 same-uid fallback (O69, ``policy.SAME_UID_FALLBACK_POLICY``; Lucas, Nov 8,
+t1415u): the in-process Cockpit plugin holds paper-order permission. Under that
+fallback the signed authority profile is tamper evidence, not a boundary. Paper only;
+live capital stays separately authorised (PRODUCT.md 5.2). This module has one
+``order`` permission and no paper/live distinction (``scope.venue`` is an opaque
+string), so "paper only" is what the installer signs, not a check ``charge`` makes.
 """
 
 from __future__ import annotations

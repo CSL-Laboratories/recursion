@@ -11,12 +11,14 @@ from .canonical import canonical, parse
 from .errors import Refused
 from .loader import CoreHealth, LoadedPlugin, PluginLoader
 from .manifest import MANIFEST_SCHEMA, PERMISSIONS, Grant, ReservedEffects, TrustStore, parse_manifest
+from .policy import SAME_UID_FALLBACK_POLICY, SAME_UID_FALLBACK_POLICY_SOURCE
 from .protocol import HOST, PROTOCOL, PROTOCOL_VERSION, CoreService
 from .runtime import GilProbe, require_production_runtime, runtime_report
 
 __all__ = [
     "EFFECT_SCHEMA", "HOST", "MANIFEST_SCHEMA", "PERMISSIONS", "PROFILE_SCHEMA", "PROTOCOL",
-    "PROTOCOL_VERSION", "TYPED_LIMITS", "ApprovalGate", "Authority", "ConnectionBreaker",
+    "PROTOCOL_VERSION", "SAME_UID_FALLBACK_POLICY", "SAME_UID_FALLBACK_POLICY_SOURCE",
+    "TYPED_LIMITS", "ApprovalGate", "Authority", "ConnectionBreaker",
     "CoreHealth", "CoreService", "GilProbe", "Grant", "LoadedPlugin", "PluginLoader", "Refused",
     "ReservedEffects", "TrustStore", "canonical", "check_effect", "create_ledger", "effect_digest",
     "parse", "parse_manifest", "require_production_runtime", "runtime_report",

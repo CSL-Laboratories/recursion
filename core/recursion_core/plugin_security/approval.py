@@ -22,12 +22,14 @@ State is bounded. A terminal approval (used, vetoed or expired) drops its effect
 and keeps only its digest and state as a replay tombstone; at most ``max_retained``
 tombstones are kept, oldest evicted first. An evicted id is unknown, which ``take``
 still refuses (``approval_required``). Each ``request`` sweeps expired pending or
-approved entries into tombstones, so live entries are bounded by request rate times TTL.
+approved entries into tombstones from an expiry heap (only due entries are touched), so
+live entries are bounded by request rate times TTL.
 """
 
 from __future__ import annotations
 
 import hashlib
+import heapq
 import re
 import secrets
 import threading
@@ -98,6 +100,9 @@ class ApprovalGate:
         self._max_retained = max_retained
         self._approvals: dict[str, _Approval] = {}
         self._tombstones: OrderedDict[str, None] = OrderedDict()
+        # (expires_at, approval_id) for every request; the sweep pops only due
+        # entries, so a burst inside the TTL never rescans live approvals.
+        self._expiry: list[tuple[int, str]] = []
 
     def _retire(self, approval_id: str, item: _Approval, state: str) -> None:
         """Make an entry terminal: drop its bytes, keep a bounded tombstone. Lock held."""
@@ -110,9 +115,11 @@ class ApprovalGate:
             self._approvals.pop(old, None)
 
     def _sweep(self, now: int) -> None:
-        """Retire live entries whose TTL has passed. Lock held."""
-        for approval_id, item in list(self._approvals.items()):
-            if item.state not in _TERMINAL and now >= item.expires_at:
+        """Retire live entries whose TTL has passed, touching only due ones. Lock held."""
+        while self._expiry and self._expiry[0][0] <= now:
+            _, approval_id = heapq.heappop(self._expiry)
+            item = self._approvals.get(approval_id)
+            if item is not None and item.state not in _TERMINAL:
                 self._retire(approval_id, item, "expired")
 
     def request(self, effect: dict) -> tuple[str, str]:
@@ -123,6 +130,7 @@ class ApprovalGate:
             now = self._clock()
             self._sweep(now)
             self._approvals[approval_id] = _Approval(digest, raw, now + self._ttl)
+            heapq.heappush(self._expiry, (now + self._ttl, approval_id))
         # Drawn from the stored bytes, after storage: the caller cannot alter either.
         self._draw(approval_id, digest, raw)
         return approval_id, digest

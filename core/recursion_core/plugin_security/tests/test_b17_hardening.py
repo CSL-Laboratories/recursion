@@ -125,6 +125,33 @@ class ApprovalRetentionTests(unittest.TestCase):
             gate.take(approval_id, effect(kind="note.post", amount=0, payload={"x": 2}))
         self.assertEqual(ctx.exception.code, "approval_digest_mismatch")
 
+    def test_sweep_touches_only_due_entries(self) -> None:
+        # Devin r4507067541: a burst inside the TTL must not rescan every entry.
+        class CountingDict(dict):
+            scans = 0
+
+            def items(self):
+                CountingDict.scans += 1
+                return super().items()
+
+            def values(self):
+                CountingDict.scans += 1
+                return super().values()
+
+        clock = Clock()
+        gate = self._gate(clock, cap=10)
+        gate._approvals = CountingDict()
+        for i in range(200):
+            gate.request(effect(kind="note.post", amount=0, payload={"b": i}))
+        self.assertEqual(CountingDict.scans, 0)
+        self.assertEqual(len(gate._approvals), 200)  # all live, none due
+        clock.now += 301
+        gate.request(effect(kind="note.post", amount=0, payload={"after": 1}))
+        self.assertEqual(CountingDict.scans, 0)
+        live = [k for k, v in dict.items(gate._approvals) if v.state == "pending"]
+        self.assertEqual(len(live), 1)
+        self.assertLessEqual(len(gate._approvals), 11)
+
     def test_cap_must_be_positive(self) -> None:
         with self.assertRaises(ValueError):
             self._gate(Clock(), cap=0)

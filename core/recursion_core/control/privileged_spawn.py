@@ -75,13 +75,17 @@ SETUID_HELPER_CANDIDATES = (
 HELPER_ENV = "RECURSION_SPAWN_HELPER"
 SUDO_TARGET_CANDIDATES = ("nobody", "daemon")
 DEFAULT_N = 20
-# Commands every measured backend must be able to run as the target user:
-# overhead timing (``true``), the process probes (``sleep``) and the store
-# writer (``python3``). Sudoers rules are per-command and per-target.
+# Commands every measured backend must be able to run as the target user.
+# Overhead times ``true``. Process probes launch ``sleep 8`` (not a stand-in
+# such as ``sleep 0``). The store writer runs ``python3 -c`` with
+# ``store_writer_script`` (not ``python3 -c pass``). Sudoers rules are
+# per-command, per-target and per-argument, so detection checks those
+# launches rather than shorter aliases.
+SLEEP_PROBE_ARGV: tuple[str, ...] = ("sleep", "8")
+OVERHEAD_ARGV: tuple[str, ...] = ("true",)
 SUDO_REQUIRED_COMMANDS: tuple[tuple[str, ...], ...] = (
-    ("true",),
-    ("sleep", "0"),
-    ("python3", "-c", "pass"),
+    OVERHEAD_ARGV,
+    SLEEP_PROBE_ARGV,
 )
 # Backends ``spawn_command`` can actually launch. Detection may still report
 # others (for example a working subuid map) but they are never selected.
@@ -347,9 +351,20 @@ def _sudo_n_true(run_fn: RunFn) -> bool:
     return result.returncode == 0
 
 
+def store_writer_script(path: str) -> str:
+    """Python ``-c`` body used by the absolute-path store probe (and sudo detection)."""
+
+    quoted = repr(str(path))
+    return (
+        "import os; p=" + quoted + "; "
+        "fd=os.open(p, os.O_CREAT|os.O_WRONLY|os.O_TRUNC, 0o600); "
+        "os.write(fd, b'store-bytes'); os.close(fd); os.chmod(p, 0o600)"
+    )
+
+
 def _probe_sudo_target(run_fn: RunFn, our_uid: int) -> tuple[str | None, int | None, str]:
-    """First candidate sudo reaches as a non-root other uid for every command in
-    ``SUDO_REQUIRED_COMMANDS``. Independent of ``sudo -n true`` (root target)."""
+    """First candidate sudo reaches as a non-root other uid for every launch
+    the measured path actually runs. Independent of ``sudo -n true`` (root)."""
 
     notes: list[str] = []
     for user in SUDO_TARGET_CANDIDATES:
@@ -363,20 +378,25 @@ def _probe_sudo_target(run_fn: RunFn, our_uid: int) -> tuple[str | None, int | N
             continue
         notes.append(f"sudo -n -u {user} -- id -u -> {uid}")
         denied = None
-        for argv in SUDO_REQUIRED_COMMANDS:
-            check = run_fn(("sudo", "-n", "-u", user, "--", *argv), 8.0)
-            if check.returncode != 0:
-                err = (check.stderr or check.stdout).strip().replace("\n", " ")
-                denied = (
-                    f"sudo -n -u {user} -- {' '.join(argv)} "
-                    f"rc={check.returncode} err={err[:160]}"
-                )
-                break
+        with tempfile.TemporaryDirectory(prefix="csl734-sudo-probe-") as tmp:
+            store = str(Path(tmp) / "probe.secret")
+            launches = SUDO_REQUIRED_COMMANDS + (("python3", "-c", store_writer_script(store)),)
+            for argv in launches:
+                check = run_fn(("sudo", "-n", "-u", user, "--", *argv), 8.0)
+                if check.returncode != 0:
+                    err = (check.stderr or check.stdout).strip().replace("\n", " ")
+                    shown = " ".join(argv[:2]) if argv and argv[0] == "python3" else " ".join(argv)
+                    denied = (
+                        f"sudo -n -u {user} -- {shown} "
+                        f"rc={check.returncode} err={err[:160]}"
+                    )
+                    break
         if denied is not None:
             notes.append(denied)
             continue
         notes.append(
-            f"sudo -n -u {user} runs {', '.join(a[0] for a in SUDO_REQUIRED_COMMANDS)}"
+            "sudo -n -u "
+            f"{user} runs true, sleep 8 and the store-writer python3 -c script"
         )
         return user, uid, "; ".join(notes)
     return None, None, "; ".join(notes) if notes else "no sudo target candidates"
@@ -579,13 +599,7 @@ def probe_abs_store_read(
     """
 
     store = Path(directory) / f"store-{os.getpid()}-{time.time_ns()}.secret"
-    quoted = repr(str(store))
-    script = (
-        "import os; p=" + quoted + "; "
-        "fd=os.open(p, os.O_CREAT|os.O_WRONLY|os.O_TRUNC, 0o600); "
-        "os.write(fd, b'store-bytes'); os.close(fd); os.chmod(p, 0o600)"
-    )
-    result = run_fn([*write_cmd, "python3", "-c", script], 8.0)
+    result = run_fn([*write_cmd, "python3", "-c", store_writer_script(str(store))], 8.0)
     if result.returncode != 0:
         return None, f"writer_failed rc={result.returncode} err={(result.stderr or '')[:160]}"
     try:
@@ -652,7 +666,7 @@ def spawn_command(
 def measure_overhead(backend: Backend, n: int = DEFAULT_N) -> Overhead:
     if n < 10:
         raise ValueError(f"overhead n must be >= 10, got {n}")
-    cmd = tuple(spawn_command(backend, ("true",)))
+    cmd = tuple(spawn_command(backend, OVERHEAD_ARGV))
     samples: list[float] = []
     for _ in range(n):
         t0 = time.perf_counter()
@@ -773,7 +787,7 @@ def run_same_uid_probes(
             unit = None
             if backend.name == "systemd_run":
                 unit = f"csl734-probe-{uuid.uuid4().hex[:12]}"
-            cmd = spawn_command(backend, ("sleep", "8"), unit=unit)
+            cmd = spawn_command(backend, SLEEP_PROBE_ARGV, unit=unit)
             proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             try:
                 if unit is not None:
@@ -806,7 +820,7 @@ def run_same_uid_control_probes(n: int = DEFAULT_N) -> tuple[ProbeSummary, ...]:
                 f"0600 store owner uid={our_uid}",
             )
             proc = subprocess.Popen(
-                ["sleep", "8"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                list(SLEEP_PROBE_ARGV), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
             try:
                 pid = find_target_uid_pid(proc.pid, our_uid)
@@ -1008,6 +1022,38 @@ def detect_backends(
     return (setuid_backend, sudo_backend, systemd_backend, subuid_backend)
 
 
+def _launch_failure(probes: Sequence[ProbeSummary]) -> str | None:
+    """Return a reason when probes show the backend could not launch or write.
+
+    Process-not-found and store-writer failures are permission or availability
+    problems, not F21 channel outcomes (blocked vs open). Other probe errors,
+    such as ptrace being unavailable on the host, stay with the summaries.
+    """
+
+    reasons: list[str] = []
+    for probe in probes:
+        if probe.error_count <= 0:
+            continue
+        detail = probe.detail or ""
+        if probe.name == "abs_store_read" and "writer_" in detail:
+            reasons.append(
+                f"{probe.name} writer failed on {probe.error_count}/{probe.n} "
+                f"attempts: {detail}"
+            )
+        elif probe.name in {"proc_pid_root", "ptrace"} and (
+            "not found" in detail
+            or "no process with uid" in detail
+            or "no MainPID" in detail
+        ):
+            reasons.append(
+                f"{probe.name} engine process did not appear on "
+                f"{probe.error_count}/{probe.n} attempts: {detail}"
+            )
+    if not reasons:
+        return None
+    return "; ".join(reasons)
+
+
 def evaluate_host(
     *,
     n: int = DEFAULT_N,
@@ -1022,8 +1068,13 @@ def evaluate_host(
     A backend whose measurement fails (for example a sudoers rule that denies
     a command mid-run) is recorded in ``errors`` and marked unavailable, so
     selection falls through to the next backend or the beta fallback instead
-    of aborting the evaluation.
+    of aborting the evaluation. Failure to launch the probe process or write
+    the store is treated the same way: those are not F21 channel outcomes,
+    and they must not leave an unusable backend selected.
     """
+
+    if n < 10:
+        raise ValueError(f"evaluate_host n must be >= 10, got {n}")
 
     facts = facts or collect_host_facts(run_fn=run_fn)
     detected = tuple(backends) if backends is not None else detect_backends(
@@ -1048,6 +1099,17 @@ def evaluate_host(
                     backend,
                     available=False,
                     reason=f"{backend.reason}; measurement failed, not selectable: {message}",
+                )
+            )
+            continue
+        launch_err = _launch_failure(probed)
+        if launch_err is not None:
+            errors[backend.name] = launch_err
+            final.append(
+                replace(
+                    backend,
+                    available=False,
+                    reason=f"{backend.reason}; launch failed, not selectable: {launch_err}",
                 )
             )
             continue
@@ -1082,6 +1144,7 @@ __all__ = [
     "HEADLESS_SECRET_SERVICE_LIVE",
     "PRODUCT_MD_COMMIT",
     "PRODUCT_MD_SHA256",
+    "SLEEP_PROBE_ARGV",
     "SPAWNABLE_BACKENDS",
     "SUDO_REQUIRED_COMMANDS",
     "Backend",
@@ -1102,5 +1165,6 @@ __all__ = [
     "run_same_uid_probes",
     "select_path",
     "spawn_command",
+    "store_writer_script",
     "systemd_unit_main_pid",
 ]

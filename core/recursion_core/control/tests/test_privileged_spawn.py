@@ -40,6 +40,9 @@ from recursion_core.control.privileged_spawn import (
     run_same_uid_control_probes,
     run_same_uid_probes,
     select_path,
+    SLEEP_PROBE_ARGV,
+    store_writer_script,
+    SUDO_REQUIRED_COMMANDS,
     systemd_unit_main_pid,
 )
 
@@ -70,12 +73,20 @@ def _run_fail(cmd, timeout: float) -> ProcResult:
 
 
 def _sudo_policy(allowed: dict[tuple[str, ...], str]):
-    """Fake runner: ``allowed`` maps an exact argv to its stdout; all else is denied."""
+    """Fake runner: ``allowed`` maps an exact argv to its stdout; all else is denied.
+
+    A trailing ``*`` after ``python3 -c`` matches any store-writer script body,
+    so tests can grant the real writer without copying a temp path.
+    """
 
     def run(cmd, timeout: float) -> ProcResult:
         key = tuple(cmd)
         if key in allowed:
             return ProcResult(0, allowed[key], "")
+        if len(key) >= 3 and key[-3:-1] == ("python3", "-c"):
+            wildcard = key[:-1] + ("*",)
+            if wildcard in allowed:
+                return ProcResult(0, allowed[wildcard], "")
         return ProcResult(1, "", f"denied:{' '.join(cmd)}")
 
     return run
@@ -88,7 +99,7 @@ def _nobody_allows(*argvs: tuple[str, ...]) -> dict[tuple[str, ...], str]:
     return out
 
 
-ALL_REQUIRED = (("true",), ("sleep", "0"), ("python3", "-c", "pass"))
+ALL_REQUIRED = (("true",), ("sleep", "8"), ("python3", "-c", "*"))
 
 
 class PinAndUnmeasuredTests(unittest.TestCase):
@@ -108,6 +119,15 @@ class PinAndUnmeasuredTests(unittest.TestCase):
         self.assertIsNone(CLAUDE_CODE_SIGNIN_SURVIVES_REBOOT)
         self.assertIsNone(CODEX_SIGNIN_SURVIVES_REBOOT)
         self.assertIsNone(HEADLESS_SECRET_SERVICE_LIVE)
+
+    def test_required_sudo_commands_match_the_probe_launches(self) -> None:
+        self.assertEqual(SLEEP_PROBE_ARGV, ("sleep", "8"))
+        self.assertIn(("true",), SUDO_REQUIRED_COMMANDS)
+        self.assertIn(SLEEP_PROBE_ARGV, SUDO_REQUIRED_COMMANDS)
+        self.assertNotIn(("sleep", "0"), SUDO_REQUIRED_COMMANDS)
+        script = store_writer_script("/tmp/example.secret")
+        self.assertIn("store-bytes", script)
+        self.assertIn("/tmp/example.secret", script)
 
 
 class ByokStorageTests(unittest.TestCase):
@@ -165,14 +185,38 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(selected.name, "managed_login_folder")
         self.assertTrue(selected.beta)
 
-    def test_prefers_setuid_helper_then_sudo_then_systemd_then_subuid(self) -> None:
+    def test_prefers_sudo_then_systemd_among_spawnable_backends(self) -> None:
+        # Devin r4506565344: these assertions replaced an earlier helper-first
+        # selection check after setuid_helper and subuid_userns stopped being
+        # selectable (spawn_command cannot launch them). A named human reviewer
+        # must submit their own GitHub review of the changed assertions.
+        # Agents do not approve, dismiss, or treat this comment as that review.
         sudo = Backend("sudo", True, True, "ok", target_user="nobody", target_uid=65534)
         systemd = Backend("systemd_run", True, True, "ok", target_user="nobody", target_uid=65534)
         subuid = Backend("subuid_userns", True, True, "ok", target_uid=100000)
         helper = Backend("setuid_helper", True, True, "ok", helper_path="/helper", target_uid=123)
-        self.assertEqual(select_path((sudo, systemd, subuid)).name, "sudo")
-        self.assertEqual(select_path((systemd, subuid)).name, "systemd_run")
-        self.assertFalse(select_path((sudo,)).beta)
+        selected_sudo = select_path((sudo, systemd, subuid))
+        self.assertEqual(
+            selected_sudo.name,
+            "sudo",
+            "sudo ranks above systemd_run among spawnable backends",
+        )
+        self.assertFalse(
+            selected_sudo.beta,
+            "a spawnable other-uid path is not the beta fallback",
+        )
+        selected_systemd = select_path((systemd, subuid))
+        self.assertEqual(
+            selected_systemd.name,
+            "systemd_run",
+            "systemd_run ranks above detection-only backends",
+        )
+        self.assertFalse(selected_systemd.beta)
+        selected_sudo_only = select_path((sudo,))
+        self.assertEqual(selected_sudo_only.name, "sudo")
+        self.assertFalse(selected_sudo_only.beta)
+        self.assertFalse(can_spawn(helper))
+        self.assertFalse(can_spawn(subuid))
 
     def test_backends_spawn_command_rejects_are_never_selected(self) -> None:
         # Devin r4506181267: a working subuid map, or a setuid helper without a
@@ -270,13 +314,24 @@ class SudoPolicyDetectionTests(unittest.TestCase):
 
     def test_target_sudo_missing_a_required_command_is_unavailable(self) -> None:
         # Devin r4506181499: id -u allowed as nobody, true denied.
-        sudo = self._sudo(_nobody_allows(("sleep", "0"), ("python3", "-c", "pass")))
+        sudo = self._sudo(_nobody_allows(("sleep", "8"), ("python3", "-c", "*")))
         self.assertFalse(sudo.available)
         self.assertIsNone(sudo.target_user)
         self.assertIn("-- true rc=1", sudo.reason)
-        sudo = self._sudo(_nobody_allows(("true",), ("sleep", "0")))
+        sudo = self._sudo(_nobody_allows(("true",), ("sleep", "8")))
         self.assertFalse(sudo.available)
-        self.assertIn("python3 -c pass rc=1", sudo.reason)
+        self.assertIn("python3 -c rc=1", sudo.reason)
+
+    def test_argument_specific_sleep_0_and_pass_policy_is_unavailable(self) -> None:
+        # Devin r4506565205: sudoers allows id -u, true, sleep 0 and
+        # python3 -c pass, but not the actual probe launches (sleep 8 and
+        # the store-writer script).
+        sudo = self._sudo(
+            _nobody_allows(("true",), ("sleep", "0"), ("python3", "-c", "pass"))
+        )
+        self.assertFalse(sudo.available)
+        self.assertIsNone(sudo.target_user)
+        self.assertIn("sleep 8", sudo.reason)
 
     def test_sudo_target_that_is_root_or_our_uid_is_rejected(self) -> None:
         allowed = {("sudo", "-n", "-u", "nobody", "--", "id", "-u"): "0\n"}
@@ -341,6 +396,82 @@ class EvaluateHostInjectionTests(unittest.TestCase):
         self.assertEqual(evaluation.errors, {})
         self.assertEqual(evaluation.selected.name, "sudo")
         self.assertEqual(evaluation.probes["sudo"], summaries)
+
+    def test_invalid_sample_count_raises_instead_of_selecting_fallback(self) -> None:
+        # Devin r4506565268: n<10 used to be swallowed as a backend failure.
+        def measure_fn(backend: Backend, n: int) -> Overhead:
+            raise AssertionError("must not measure when n is invalid")
+
+        def probe_fn(backend: Backend, n: int):
+            raise AssertionError("must not probe when n is invalid")
+
+        with self.assertRaises(ValueError) as ctx:
+            evaluate_host(
+                n=9,
+                facts=_facts(sudo_n_true=True),
+                backends=self._backends(),
+                measure_fn=measure_fn,
+                probe_fn=probe_fn,
+            )
+        self.assertIn("n must be >= 10", str(ctx.exception))
+        self.assertIn("got 9", str(ctx.exception))
+        with self.assertRaises(ValueError):
+            evaluate_host(
+                n=0,
+                facts=_facts(),
+                backends=self._backends(),
+                measure_fn=measure_fn,
+                probe_fn=probe_fn,
+            )
+
+    def test_launch_failures_in_probes_demote_the_backend(self) -> None:
+        # Devin r4506565205: process-not-found and store-writer errors must
+        # not leave sudo selected.
+        overhead = Overhead(DEFAULT_N, 0.01, 0.02, 0.005, 0.03, ("sudo",))
+        failed = (
+            ProbeSummary(
+                "proc_pid_root",
+                DEFAULT_N,
+                0,
+                "no process with uid 65534 under launcher pid 1",
+                DEFAULT_N,
+                "not found x20",
+            ),
+            ProbeSummary(
+                "ptrace",
+                DEFAULT_N,
+                0,
+                "no process with uid 65534 under launcher pid 1",
+                DEFAULT_N,
+                "not found x20",
+            ),
+            ProbeSummary(
+                "abs_store_read",
+                DEFAULT_N,
+                0,
+                "writer_failed rc=1 err=denied",
+                DEFAULT_N,
+                "0600 store owner uid=65534 x20",
+            ),
+        )
+
+        evaluation = evaluate_host(
+            n=DEFAULT_N,
+            facts=_facts(sudo_n_true=True),
+            backends=self._backends(),
+            measure_fn=lambda backend, n: overhead,
+            probe_fn=lambda backend, n: failed,
+        )
+        self.assertIn("sudo", evaluation.errors)
+        self.assertIn("writer failed", evaluation.errors["sudo"])
+        self.assertIn("engine process did not appear", evaluation.errors["sudo"])
+        sudo = next(b for b in evaluation.backends if b.name == "sudo")
+        self.assertFalse(sudo.available)
+        self.assertIn("launch failed", sudo.reason)
+        self.assertEqual(evaluation.overhead, {})
+        self.assertNotIn("sudo", evaluation.probes)
+        self.assertEqual(evaluation.selected.name, "managed_login_folder")
+        self.assertTrue(evaluation.selected.beta)
 
 
 class ProbeTargetTests(unittest.TestCase):

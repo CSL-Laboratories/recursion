@@ -53,3 +53,31 @@ path (normal return, exception, launch failure, cancellation) kills the leaf.
   cgroup behaviour. The live cell runs only when `RECURSION_CGROUP_ROOT` points at
   a writable delegated root. The hd18/escgrp/dwdump cells are not run here.
 - Child environment (B1) is not handled here: `env` is passed through as given.
+
+## B6 evidence contract (Lucas, Nov 8)
+
+Lucas's Nov 8 call: the engine user gets no linger and no systemd user manager;
+the operator keeps linger. `b6_evidence.evaluate(record)` judges a recorded host
+run against every B6 bar. It runs no probe, touches no systemd or cgroup, and
+switches no uid.
+
+- Kept bars: escapers 0/120; engine `cgroup.procs` writes refused 10/10;
+  `systemd-run --user` refused or inside the leaf 10/10; `terminated` never booked
+  while `populated` is 1.
+- Migration probe, n=10 per method, engine user manager absent (`user@` inactive,
+  `systemd/private` absent): a process already in the leaf, as the engine uid,
+  tries `systemd-run --user --scope -- sleep 60` and a direct write of its own pid
+  to a `cgroup.procs` outside the leaf. Every attempt must fail (exit 0 of the
+  scope call fails the bar even if the sleep stayed inside), and afterwards
+  `/proc/<pid>/cgroup` must name the leaf, or a cgroup below it, for every pid in
+  the run.
+- Control, engine user manager present: all 10 scope attempts must exit 0 with
+  the sleep outside the leaf, reproducing the Nov 7 escape. Otherwise the verdict
+  is `invalid`: the probe is not reaching the user manager, and no pass is read.
+- B33: `spawn_order` must show `PR_SET_PDEATHSIG` armed after the uid switch and
+  before exec (the kernel clears it on a credential change). This same-uid
+  launcher still never arms it, and cleanup never relies on it (CSL-706).
+- Verdicts: `pass` needs `evidence_class: host` plus host, kernel, systemd,
+  capture time and the command log's SHA-256. Any other class is `structural` at
+  best. The tests use hand-built fixtures, so they are structural only; no host
+  evidence for these bars exists yet.

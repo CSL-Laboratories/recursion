@@ -23,7 +23,9 @@ and keeps only its digest and state as a replay tombstone; at most ``max_retaine
 tombstones are kept, oldest evicted first. An evicted id is unknown, which ``take``
 still refuses (``approval_required``). Each ``request`` sweeps expired pending or
 approved entries into tombstones from an expiry heap (only due entries are touched), so
-live entries are bounded by request rate times TTL.
+live entries are bounded by request rate times TTL. The heap itself is compacted when
+terminal or evicted entries would push it past ``max_retained`` plus the live count,
+so early use or veto cannot grow heap storage beyond that bound.
 """
 
 from __future__ import annotations
@@ -100,9 +102,12 @@ class ApprovalGate:
         self._max_retained = max_retained
         self._approvals: dict[str, _Approval] = {}
         self._tombstones: OrderedDict[str, None] = OrderedDict()
-        # (expires_at, approval_id) for every request; the sweep pops only due
+        # (expires_at, approval_id) for live approvals; the sweep pops only due
         # entries, so a burst inside the TTL never rescans live approvals.
+        # Terminal entries are dropped from the heap when they exceed the
+        # retention cap, so a burst of use or veto cannot grow it unbounded.
         self._expiry: list[tuple[int, str]] = []
+        self._live = 0
 
     def _retire(self, approval_id: str, item: _Approval, state: str) -> None:
         """Make an entry terminal: drop its bytes, keep a bounded tombstone. Lock held."""
@@ -113,6 +118,21 @@ class ApprovalGate:
         while len(self._tombstones) > self._max_retained:
             old, _ = self._tombstones.popitem(last=False)
             self._approvals.pop(old, None)
+        if self._live > 0:
+            self._live -= 1
+        self._compact_expiry_if_needed()
+
+    def _compact_expiry_if_needed(self) -> None:
+        """Drop stale heap tuples once they exceed the retention cap. Lock held."""
+        if len(self._expiry) <= self._max_retained + self._live:
+            return
+        kept: list[tuple[int, str]] = []
+        for expires_at, approval_id in self._expiry:
+            item = self._approvals.get(approval_id)
+            if item is not None and item.state not in _TERMINAL:
+                kept.append((expires_at, approval_id))
+        self._expiry = kept
+        heapq.heapify(self._expiry)
 
     def _sweep(self, now: int) -> None:
         """Retire live entries whose TTL has passed, touching only due ones. Lock held."""
@@ -130,6 +150,7 @@ class ApprovalGate:
             now = self._clock()
             self._sweep(now)
             self._approvals[approval_id] = _Approval(digest, raw, now + self._ttl)
+            self._live += 1
             heapq.heappush(self._expiry, (now + self._ttl, approval_id))
         # Drawn from the stored bytes, after storage: the caller cannot alter either.
         self._draw(approval_id, digest, raw)

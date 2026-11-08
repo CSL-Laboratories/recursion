@@ -152,6 +152,32 @@ class ApprovalRetentionTests(unittest.TestCase):
         self.assertEqual(len(live), 1)
         self.assertLessEqual(len(gate._approvals), 11)
 
+    def test_terminal_approvals_do_not_grow_the_expiry_heap(self) -> None:
+        # Devin r4507084791: take and decide retire an approval before its TTL,
+        # but _retire capped only the tombstone dictionary. Until a later
+        # request swept expired entries, _expiry kept one tuple for every
+        # completed request in the TTL window, even after its tombstone was
+        # evicted. With max_retained=10 and a fixed clock, request-and-veto
+        # (or use) of 200 approvals left 10 tombstones and 200 heap tuples.
+        clock = Clock()
+        vetoed = self._gate(clock, cap=10)
+        for i in range(200):
+            approval_id, digest = vetoed.request(
+                effect(kind="note.post", amount=0, payload={"v": i})
+            )
+            vetoed.decide(approval_id, digest, OPERATOR_TOKEN, False)
+        self.assertLessEqual(len(vetoed._approvals), 10)
+        self.assertLessEqual(len(vetoed._expiry), 10)
+
+        used = self._gate(clock, cap=10)
+        for i in range(200):
+            eff = effect(kind="note.post", amount=0, payload={"u": i})
+            approval_id = self._approve(used, eff)
+            used.take(approval_id, eff)
+        self.assertLessEqual(len(used._approvals), 10)
+        self.assertLessEqual(len(used._expiry), 10)
+        self.assertTrue(all(item.raw is None for item in used._approvals.values()))
+
     def test_cap_must_be_positive(self) -> None:
         with self.assertRaises(ValueError):
             self._gate(Clock(), cap=0)

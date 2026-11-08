@@ -402,21 +402,35 @@ def _probe_sudo_target(run_fn: RunFn, our_uid: int) -> tuple[str | None, int | N
         with tempfile.TemporaryDirectory(prefix="csl734-sudo-probe-") as tmp:
             # The writer runs as the target user: like the probe store
             # directory, let another uid create its file (sticky, 1777).
-            os.chmod(tmp, 0o1777)
-            store = str(Path(tmp) / "probe.secret")
-            launches = SUDO_REQUIRED_COMMANDS + (("python3", "-c", store_writer_script(store)),)
-            for argv in launches:
+            # chmod after the sleep launches so a local user cannot spend
+            # those eight seconds planting a file the writer will open.
+            # Unpredictable name: a pre-created probe.secret (r4507085798)
+            # must not be the path the target-user writer opens.
+            for argv in SUDO_REQUIRED_COMMANDS:
                 check = run_fn(
                     ("sudo", "-n", "-u", user, "--", *argv), _launch_timeout(argv)
                 )
                 if check.returncode != 0:
                     err = (check.stderr or check.stdout).strip().replace("\n", " ")
-                    shown = " ".join(argv[:2]) if argv and argv[0] == "python3" else " ".join(argv)
+                    shown = " ".join(argv)
                     denied = (
                         f"sudo -n -u {user} -- {shown} "
                         f"rc={check.returncode} err={err[:160]}"
                     )
                     break
+            else:
+                os.chmod(tmp, 0o1777)
+                store = str(Path(tmp) / f"probe-{os.getpid()}-{time.time_ns()}.secret")
+                argv = ("python3", "-c", store_writer_script(store))
+                check = run_fn(
+                    ("sudo", "-n", "-u", user, "--", *argv), _launch_timeout(argv)
+                )
+                if check.returncode != 0:
+                    err = (check.stderr or check.stdout).strip().replace("\n", " ")
+                    denied = (
+                        f"sudo -n -u {user} -- python3 -c "
+                        f"rc={check.returncode} err={err[:160]}"
+                    )
         if denied is not None:
             notes.append(denied)
             continue

@@ -697,6 +697,49 @@ class DevinReview5818620711Tests(unittest.TestCase):
         self.assertTrue(sudo.available, sudo.reason)
         self.assertEqual(sudo.target_user, "nobody")
 
+    def test_sudo_detection_ignores_a_precreated_probe_secret(self) -> None:
+        # r4507085798: the detection directory is 1777 so another uid can
+        # create the writer file, but the writer used a fixed name
+        # (probe.secret). A local user can create that file while sleep 8
+        # runs; the sudo writer then fails and a working other-uid backend
+        # is rejected, falling back to managed-login-folder isolation.
+        import re
+
+        policy = _sudo_policy(_nobody_allows(*ALL_REQUIRED))
+        planted: list[str] = []
+        writer_paths: list[str] = []
+
+        def run(cmd, timeout: float) -> ProcResult:
+            key = tuple(cmd)
+            if key[-2:] == ("sleep", "8"):
+                tmp = tempfile.gettempdir()
+                for name in os.listdir(tmp):
+                    if name.startswith("csl734-sudo-probe-"):
+                        secret = os.path.join(tmp, name, "probe.secret")
+                        fd = os.open(secret, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                        os.close(fd)
+                        planted.append(secret)
+            if len(key) >= 3 and key[-3:-1] == ("python3", "-c"):
+                match = re.search(r"p=('[^']*')", key[-1])
+                path = ast.literal_eval(match.group(1))
+                writer_paths.append(path)
+                if os.path.lexists(path):
+                    return ProcResult(1, "", "PermissionError: [Errno 13] Permission denied")
+            return policy(cmd, timeout)
+
+        backends = detect_backends(
+            facts=_facts(sudo_n_true=False),
+            run_fn=run,
+            helper_paths=("/tmp/csl734-no-such-helper",),
+            env={},
+        )
+        sudo = next(b for b in backends if b.name == "sudo")
+        self.assertEqual(len(planted), 1, planted)
+        self.assertEqual(len(writer_paths), 1, writer_paths)
+        self.assertNotEqual(writer_paths[0], planted[0])
+        self.assertTrue(sudo.available, sudo.reason)
+        self.assertEqual(sudo.target_user, "nobody")
+
 
 @unittest.skipUnless(LIVE, f"live host probes run only with {LIVE_ENV}=1")
 class LiveHostTests(unittest.TestCase):

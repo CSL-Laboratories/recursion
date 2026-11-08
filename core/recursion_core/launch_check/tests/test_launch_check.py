@@ -13,6 +13,7 @@ import importlib
 import os
 import shutil
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -31,11 +32,12 @@ from recursion_core.launch_check import (
     probe_env,
 )
 from recursion_core.launch_check import floors as floors_mod
-from recursion_core.launch_check.probe import ProbeResult
+from recursion_core.launch_check.probe import ProbeResult, run_version_probe
 from recursion_core.launch_check.tests.fixtures import Factory
 
 # The package re-exports the grant() function under the module's name; fetch the module itself.
 grant_mod = importlib.import_module("recursion_core.launch_check.grant")
+LaunchPlan = grant_mod.LaunchPlan
 
 N = 3  # repetitions per boundary cell
 F: Factory
@@ -273,6 +275,20 @@ class GrantRefusalTests(Base):
         r = self.refused("version_probe_failed", self.g, "claude_code", p, timeout=0.3)
         self.assertIn("exceeded", r.detail)
 
+    def test_flooding_probe_is_killed_at_the_output_cap(self) -> None:
+        # Devin r4503714542: the 64 KiB cap is enforced while the probe runs, not after it exits.
+        d = F.dir()
+        flood = F.script(os.path.join(d, "claude"), "#!/bin/sh\nexec yes 2.1.318\n")
+        before = {n for n in os.listdir(tempfile.gettempdir()) if n.startswith("r2a-probe-")}
+        t0 = time.monotonic()
+        with self.assertRaises(LaunchRefused) as cm:
+            run_version_probe(FLOORS["claude_code"], flood, timeout=15.0)
+        self.assertEqual("version_probe_failed", cm.exception.code)
+        self.assertIn("output over", cm.exception.detail)
+        self.assertLess(time.monotonic() - t0, 5.0)  # killed at the cap, long before the timeout
+        leftovers = [n for n in os.listdir(tempfile.gettempdir()) if n.startswith("r2a-probe-")]
+        self.assertEqual([], [n for n in leftovers if n not in before])
+
     def test_binary_changed_during_probe(self) -> None:
         p = self.claude()
 
@@ -362,6 +378,39 @@ class LaunchPlanTests(Base):
         self.refused("spawn_too_large", launch_plan, self.grant, ["claude"], {"A=B": "c"})
         self.refused("spawn_too_large", launch_plan, self.grant, ["claude", 7])
         launch_plan(self.grant, ["claude", "a" * (MAX_ARG_BYTES - 2)])  # just under the per-item cap
+
+    def test_hand_built_plan_meets_the_same_checks_on_use(self) -> None:
+        # Devin r4503715086: a valid grant does not let a hand-built LaunchPlan skip argv/env checks.
+        good = launch_plan(self.grant, ["claude", "-p"], {"HOME": "/tmp/x"})
+        cases = {
+            "wrapper_refused": LaunchPlan(self.grant, ("sh", "-c", "x"), (), good.spawn_bytes),
+            "argv0_mismatch": LaunchPlan(self.grant, (self.grant.realpath, "-p"), (), good.spawn_bytes),
+            "argv_empty": LaunchPlan(self.grant, (), (), 0),
+        }
+        big_env = (("X", "c" * MAX_ARG_BYTES),)
+        cases_size = [
+            dataclasses.replace(good, env=big_env),
+            dataclasses.replace(good, env=(("A=B", "c"),)),
+            dataclasses.replace(good, argv=("claude", "a\x00b")),
+            dataclasses.replace(good, env=(("HOME", "/tmp/x"), ("PATH", "/evil"))),  # spawn_bytes no longer matches
+            dataclasses.replace(good, env={"HOME": "/tmp/x"}),  # not a tuple of pairs
+        ]
+        for code, plan in cases.items():
+            for use in (plan.exec_argv, plan.exec_env):
+                with self.subTest(code=code, use=use.__name__):
+                    self.refused(code, use)
+        for plan in cases_size:
+            for use in (plan.exec_argv, plan.exec_env):
+                with self.subTest(env=plan.env, argv=plan.argv, use=use.__name__):
+                    self.refused("spawn_too_large", use)
+        self.assertEqual({"HOME": "/tmp/x"}, good.exec_env())
+
+    def test_exec_bit_removed_after_grant_is_missing(self) -> None:
+        # Devin r4503714827: refuse in verify, not as an untyped spawn failure later.
+        plan = launch_plan(self.grant, ["claude"])
+        os.chmod(self.grant.realpath, 0o644)
+        self.addCleanup(os.chmod, self.grant.realpath, 0o755)
+        self.refused("binary_missing", plan.exec_argv)
 
     def test_grant_forged(self) -> None:
         g = self.grant

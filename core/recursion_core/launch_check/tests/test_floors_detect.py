@@ -136,6 +136,16 @@ class ParseTests(unittest.TestCase):
                 self.assertIsNone(parse_version("date", line))
         self.assertIsNone(parse_version("calver", "2026.10.22"))
 
+    def test_impossible_calendar_dates_are_unparsed(self) -> None:
+        # Devin r4503714950: day 31 is not valid in every month.
+        for line in ("2026.02.31", "2026.02.29", "2026.04.31", "2026.06.31", "2026.09.31", "2026.11.31",
+                     "2025.02.29-e373342"):
+            with self.subTest(line=line):
+                self.assertIsNone(parse_version("date", line))
+        for line, key in (("2028.02.29", (2028, 2, 29, 0, 0, 0)), ("2026.01.31", (2026, 1, 31, 0, 0, 0))):
+            with self.subTest(line=line):
+                self.assertEqual(key, parse_version("date", line).key)
+
 
 @unittest.skipUnless(os.name == "posix", "POSIX fixtures")
 class DetectTests(unittest.TestCase):
@@ -163,6 +173,16 @@ class DetectTests(unittest.TestCase):
         found = detect("claude_code", os.pathsep.join([d1, d2]))
         self.assertIsNone(found.candidate)
         self.assertEqual(2, len(found.hits))
+
+    def test_non_executable_file_does_not_shadow_a_later_native(self) -> None:
+        # Devin r4503714702: a shell skips a file it cannot execute; so does detection.
+        d1, d2 = F.dir(), F.dir()
+        stray = F.make("claude", "2.1.318 (Claude Code)", where=d1)
+        os.chmod(stray, 0o644)
+        real = F.make("claude", "2.1.318 (Claude Code)", where=d2)
+        found = detect("claude_code", os.pathsep.join([d1, d2]))
+        self.assertEqual(real, found.candidate)
+        self.assertEqual([real], [h.path for h in found.hits])
 
     def test_detection_never_executes_a_hit(self) -> None:
         d = F.dir()

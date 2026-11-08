@@ -19,6 +19,8 @@ issued under another table version are refused (``grant_stale``).
 
 from __future__ import annotations
 
+import datetime
+
 import re
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -156,7 +158,11 @@ def parse_version(scheme: str, raw: str) -> ParsedVersion | None:
         y, mo, d, hh, mi, ss, _commit = m.groups()
         year, month, day = int(y), int(mo), int(d)
         h, mn, s = int(hh or 0), int(mi or 0), int(ss or 0)
-        if not (1 <= month <= 12 and 1 <= day <= 31 and h < 24 and mn < 60 and s < 60):
+        if not (h < 24 and mn < 60 and s < 60):
+            return None
+        try:  # the whole calendar date must exist (no 2026.02.31, no 2025.02.29)
+            datetime.date(year, month, day)
+        except ValueError:
             return None
         # The commit hash does not order; equal dates with no build time compare equal.
         return ParsedVersion((year, month, day, h, mn, s), f"{year}.{month}.{day}")

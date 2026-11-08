@@ -87,7 +87,8 @@ def path_hits(name: str, path_string: str) -> list[str]:
             continue
         for ext in exts:
             p = os.path.join(d, name + ext)
-            if os.path.isfile(p) and p not in hits:
+            # A shell skips a file it cannot execute, so such a file never shadows a later hit.
+            if os.path.isfile(p) and os.access(p, os.X_OK) and p not in hits:
                 hits.append(p)
     return hits
 

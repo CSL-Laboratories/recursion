@@ -171,6 +171,8 @@ def verify(g: Grant) -> None:
             raise LaunchRefused("binary_missing", spec.engine, path)
         if os.path.realpath(path) != real:
             raise LaunchRefused("binary_changed", spec.engine, f"{path} now resolves elsewhere")
+        if not os.access(real, os.X_OK):  # exec bit removed after the grant: refuse here, not at spawn
+            raise LaunchRefused("binary_missing", spec.engine, f"{real} is not executable")
         if _hash(spec, real)[0] != digest:
             raise LaunchRefused("binary_changed", spec.engine, f"{real} digest differs from the grant")
 
@@ -204,17 +206,41 @@ class LaunchPlan:
     spawn_bytes: int
 
     def exec_argv(self) -> list[str]:
-        """Authenticate and re-verify on every use; return ``[realpath, *argv[1:]]``."""
-        authenticate(self.grant)
-        verify(self.grant)
+        """Re-run every ``launch_plan`` check on every use; return ``[realpath, *argv[1:]]``.
+
+        A ``LaunchPlan`` built by hand (or with ``dataclasses.replace``) gets no pass: its argv and env
+        meet the same argv[0], wrapper and size rules as ``launch_plan`` before anything is returned.
+        """
+        self._recheck()
         return [self.grant.realpath, *self.argv[1:]]
 
     def exec_env(self) -> dict[str, str]:
+        self._recheck()
         return dict(self.env)
+
+    def _recheck(self) -> None:
+        env = self.env
+        if not isinstance(env, tuple) or not all(isinstance(kv, tuple) and len(kv) == 2 for kv in env):
+            spec = authenticate(self.grant)
+            raise LaunchRefused("spawn_too_large", spec.engine, "env is not a tuple of name/value pairs")
+        if len(dict(env)) != len(env):
+            spec = authenticate(self.grant)
+            raise LaunchRefused("spawn_too_large", spec.engine, "env repeats a name")
+        size = _checked_launch(self.grant, self.argv, dict(env))
+        if size != self.spawn_bytes:
+            raise LaunchRefused("spawn_too_large", self.grant.engine, "spawn_bytes does not match argv and env")
 
 
 def launch_plan(g: object, argv: Sequence[str], env: Mapping[str, str] | None = None) -> LaunchPlan:
     """Check a launch against a grant. ``env`` is the already-built child env (child_env), not os.environ."""
+    argv = tuple(argv) if argv is not None else ()
+    env = dict(env or {})
+    size = _checked_launch(g, argv, env)
+    return LaunchPlan(g, argv, tuple(sorted(env.items())), size)
+
+
+def _checked_launch(g: object, argv: Sequence[str], env: dict[str, str]) -> int:
+    """Every launch check; returns the spawn size. Used by ``launch_plan`` and again on every plan use."""
     spec = authenticate(g)  # before any field of g is trusted
     argv = tuple(argv) if argv is not None else ()
     if not argv:
@@ -226,7 +252,6 @@ def launch_plan(g: object, argv: Sequence[str], env: Mapping[str, str] | None = 
         raise LaunchRefused("wrapper_refused", spec.engine, f"argv[0] {a0!r} is a wrapper shape")
     if a0 not in spec.names:
         raise LaunchRefused("argv0_mismatch", spec.engine, f"argv[0] {a0!r} must be the bare engine name")
-    env = dict(env or {})
     size = _spawn_bytes(spec, argv, env)
     verify(g)
-    return LaunchPlan(g, argv, tuple(sorted(env.items())), size)
+    return size

@@ -400,6 +400,9 @@ def _probe_sudo_target(run_fn: RunFn, our_uid: int) -> tuple[str | None, int | N
         notes.append(f"sudo -n -u {user} -- id -u -> {uid}")
         denied = None
         with tempfile.TemporaryDirectory(prefix="csl734-sudo-probe-") as tmp:
+            # The writer runs as the target user: like the probe store
+            # directory, let another uid create its file (sticky, 1777).
+            os.chmod(tmp, 0o1777)
             store = str(Path(tmp) / "probe.secret")
             launches = SUDO_REQUIRED_COMMANDS + (("python3", "-c", store_writer_script(store)),)
             for argv in launches:

@@ -579,7 +579,7 @@ class StoreProbeErrorTests(unittest.TestCase):
 
 
 class DevinReview5818620711Tests(unittest.TestCase):
-    """Devin review 5818620711 on c46a151f (r4506887696, r4506887763)."""
+    """Devin reviews 5818620711 on c46a151f (r4506887696, r4506887763) and r4507075865 on 782094d5."""
 
     def test_sudo_sleep_launch_gets_a_timeout_longer_than_the_sleep(self) -> None:
         # r4506887696: a runner that honours its timeout returns 124 when the
@@ -663,6 +663,39 @@ class DevinReview5818620711Tests(unittest.TestCase):
         self.assertIn("writer failed on 1/20", evaluation.errors["sudo"])
         self.assertEqual(evaluation.selected.name, "managed_login_folder")
         self.assertTrue(evaluation.selected.beta)
+
+
+    def test_sudo_detection_writer_can_create_its_store_as_another_user(self) -> None:
+        # r4507075865: the writer runs as the target user, so the detection
+        # directory must let another uid create a file (1777, like the probe
+        # store directory), not a caller-owned 0700 temp dir.
+        import ast
+        import re
+
+        policy = _sudo_policy(_nobody_allows(*ALL_REQUIRED))
+        modes: list[int] = []
+
+        def run(cmd, timeout: float) -> ProcResult:
+            key = tuple(cmd)
+            if len(key) >= 3 and key[-3:-1] == ("python3", "-c"):
+                match = re.search(r"p=('[^']*')", key[-1])
+                directory = os.path.dirname(ast.literal_eval(match.group(1)))
+                mode = stat.S_IMODE(os.stat(directory).st_mode)
+                modes.append(mode)
+                if mode & 0o1777 != 0o1777:  # another uid cannot create here
+                    return ProcResult(1, "", "PermissionError: [Errno 13]")
+            return policy(cmd, timeout)
+
+        backends = detect_backends(
+            facts=_facts(sudo_n_true=False),
+            run_fn=run,
+            helper_paths=("/tmp/csl734-no-such-helper",),
+            env={},
+        )
+        sudo = next(b for b in backends if b.name == "sudo")
+        self.assertEqual(len(modes), 1)
+        self.assertTrue(sudo.available, sudo.reason)
+        self.assertEqual(sudo.target_user, "nobody")
 
 
 @unittest.skipUnless(LIVE, f"live host probes run only with {LIVE_ENV}=1")

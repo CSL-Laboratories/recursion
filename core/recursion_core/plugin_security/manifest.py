@@ -48,6 +48,9 @@ _FIELDS = frozenset({
     "credential_refs",
 })
 _ID = re.compile(r"[a-z][a-z0-9_.-]{1,63}")
+# Caller names the core binds for itself. A plugin manifest may never claim one, so no
+# plugin client can carry a host-only identity (B17, CSL-787).
+RESERVED_PLUGIN_IDS = frozenset({"host"})
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 _HOST = re.compile(r"[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?)+(:[0-9]{1,5})?")
 _CRED = re.compile(r"[a-z][a-z0-9_.:/-]{1,127}")
@@ -84,6 +87,8 @@ def parse_manifest(raw: bytes) -> Manifest:
         raise Refused("manifest_schema")
     if type(data["plugin_id"]) is not str or not _ID.fullmatch(data["plugin_id"]):
         raise Refused("manifest_plugin_id")
+    if data["plugin_id"] in RESERVED_PLUGIN_IDS:
+        raise Refused("manifest_plugin_id_reserved")
     if type(data["version"]) is not str or not 0 < len(data["version"]) <= 64:
         raise Refused("manifest_version")
     if type(data["artifact_sha256"]) is not str or not _HEX64.fullmatch(data["artifact_sha256"]):

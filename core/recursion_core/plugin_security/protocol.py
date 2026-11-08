@@ -25,12 +25,15 @@ from .breaker import ConnectionBreaker
 from .canonical import canonical, parse
 from .errors import Refused
 from .loader import CoreHealth, PluginLoader
+from .manifest import RESERVED_PLUGIN_IDS
 
 __all__ = ["HOST", "PROTOCOL", "PROTOCOL_VERSION", "CoreService"]
 
 PROTOCOL = json.loads((Path(__file__).with_name("protocol.json")).read_text(encoding="utf-8"))
 PROTOCOL_VERSION = PROTOCOL["protocol"]
 HOST = "host"
+if HOST not in RESERVED_PLUGIN_IDS:  # no plugin manifest may name itself the host
+    raise RuntimeError("host caller name must be a reserved plugin id")
 
 
 class CoreService:
@@ -120,7 +123,9 @@ class CoreService:
         return {"state": self._gate.decide(approval_id, digest, credential, decision == "approve")}
 
     def _require_host(self, caller: str) -> None:
-        if caller != HOST:
+        # The host name is reserved at manifest parse, so no loaded plugin carries it;
+        # refuse anyway if one ever did.
+        if caller != HOST or self._loader.artifact(HOST) is not None:
             raise Refused("host_only")
 
     def _op_run_bind(self, caller: str, run_id: str, connection: str) -> dict:

@@ -54,6 +54,10 @@ def _int(value: object, low: int = 0) -> bool:
     return type(value) is int and value >= low
 
 
+# Each charge sums prior charges for its profile; index that lookup (no full scan).
+_CHARGES_INDEX = "CREATE INDEX IF NOT EXISTS charges_by_profile ON charges (profile_id)"
+
+
 def create_ledger(path: str, anchor_public_key: str) -> None:
     """Installer step: create the ledger bound to one anchor. Refuses if it exists."""
     parse_public_key(anchor_public_key)
@@ -66,6 +70,7 @@ def create_ledger(path: str, anchor_public_key: str) -> None:
         db.execute("CREATE TABLE profiles (profile_id TEXT PRIMARY KEY, digest TEXT NOT NULL)")
         db.execute("CREATE TABLE charges (idempotency_key TEXT PRIMARY KEY, profile_id TEXT NOT NULL,"
                    " amount_minor INTEGER NOT NULL CHECK (amount_minor > 0))")
+        db.execute(_CHARGES_INDEX)
         db.execute("INSERT INTO meta VALUES ('magic', ?), ('anchor', ?)",
                    (_LEDGER_MAGIC, key_id(anchor_public_key)))
     finally:
@@ -95,6 +100,7 @@ class Authority:
         if meta.get("magic") != _LEDGER_MAGIC or meta.get("anchor") != self._anchor_id:
             self._db.close()
             raise Refused("ledger_anchor_mismatch")
+        self._db.execute(_CHARGES_INDEX)  # ledgers created before the index gain it here
         self._lock = threading.Lock()
 
     def _check_profile(self, envelope: object) -> tuple[dict, str]:

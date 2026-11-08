@@ -23,7 +23,9 @@ yet called by a running daemon, and not reviewed or accepted.
 **Not a sandbox.** Plugins run as ordinary Python in the daemon's process and uid.
 `tests/test_mutants.py` shows four in-process attacks that succeed (swap the anchor,
 patch the verifier, rewrite the ledger, self-approve in memory). Containment needs a
-separate OS user or process (F11, F21, F35).
+separate OS user or process (F11, F21, F35). Blocked in the same table: a profile forged
+with the plugin's own key, a replay after restart, a deleted ledger, and a plugin whose
+manifest names itself `host` to reach host-only ops (`host` is a reserved plugin id).
 
 Production runtime: CPython 3.14 free-threaded, started with `-X gil=0`
 (`runtime.require_production_runtime`). Signature checks need `cryptography`

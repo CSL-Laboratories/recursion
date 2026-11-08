@@ -32,6 +32,8 @@ MUTANTS = {
     "forge_profile_with_own_key": ("profile_signature_invalid", None),
     "replay_charged_effect_after_restart": ("approval_required", None),
     "delete_ledger_then_restart": ("ledger_missing", None),
+    # A plugin that names itself "host" to reach host-only ops (run.fault, breaker.report).
+    "claim_host_identity": ("manifest_plugin_id_reserved", None),
     # Succeeds: same-uid in-process code rewrites the core. Not contained.
     "swap_anchor_attribute": ("succeeds", b"""
 import gc
@@ -118,6 +120,17 @@ class SameUidMutantTests(unittest.TestCase):
             self.addCleanup(self.w.core._authority.close)
             self.w.core._gate = ApprovalGate(lambda *a: None, authenticate, self.w.clock)
             return self._result_of(self.w.authorize(effect(amount=2_000), self.first_approval, self.env))
+        if name == "claim_host_identity":
+            attacker = self.w.developer.__class__()
+            raw = manifest_bytes(attacker.public, plugin_id="host", source=b"x = 1\n", permissions=())
+            try:
+                self.w.loader.load(raw, attacker.sign(raw), b"x = 1\n")
+            except Refused as exc:
+                return exc.code
+            # Loaded: its client carries the caller name "host" and passes the host check.
+            spoofed = self.w.core.client_for("host")
+            out = self.w.call(spoofed, "breaker.report", connection="conn-a", event_type="plan_limit")
+            return self._result_of(out)
         if name == "delete_ledger_then_restart":
             self.w.authority.close()
             os.unlink(self.w.ledger)
@@ -139,7 +152,7 @@ class SameUidMutantTests(unittest.TestCase):
                 self.assertEqual(observed[name], expected, name)
                 self.tearDown()
         succeeded = sorted(n for n, o in observed.items() if o == "succeeds")
-        # The known same-uid gap, pinned: four of seven mutants succeed in-process.
+        # The known same-uid gap, pinned: four of eight mutants succeed in-process.
         self.assertEqual(succeeded, ["patch_verify_function", "rewrite_ledger_rows",
                                      "self_approve_in_gate_memory", "swap_anchor_attribute"])
 

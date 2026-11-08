@@ -17,6 +17,12 @@ units and an opaque ``payload``. The gate never interprets the payload.
 
 Approvals live only in memory: a restart drops every pending or unused approval, so a
 restart can only ask again, never approve.
+
+State is bounded. A terminal approval (used, vetoed or expired) drops its effect bytes
+and keeps only its digest and state as a replay tombstone; at most ``max_retained``
+tombstones are kept, oldest evicted first. An evicted id is unknown, which ``take``
+still refuses (``approval_required``). Each ``request`` sweeps expired pending or
+approved entries into tombstones, so live entries are bounded by request rate times TTL.
 """
 
 from __future__ import annotations
@@ -25,6 +31,7 @@ import hashlib
 import re
 import secrets
 import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Callable
 
@@ -70,28 +77,52 @@ def effect_digest(effect: object) -> str:
 @dataclass
 class _Approval:
     digest: str
-    raw: bytes
+    raw: bytes | None  # None once terminal: a tombstone keeps no effect bytes
     expires_at: int
-    state: str = "pending"  # pending -> approved | vetoed -> used
+    state: str = "pending"  # pending -> approved | vetoed | expired; approved -> used | expired
+
+_TERMINAL = frozenset({"used", "vetoed", "expired"})
 
 
 class ApprovalGate:
     def __init__(self, draw: Callable[[str, str, bytes], None],
                  authenticate: Callable[[object], str | None], clock: Callable[[], int],
-                 ttl_seconds: int = 300) -> None:
+                 ttl_seconds: int = 300, max_retained: int = 4096) -> None:
+        if type(max_retained) is not int or max_retained < 1:
+            raise ValueError("max_retained must be a positive int")
         self._draw = draw
         self._authenticate = authenticate
         self._clock = clock
         self._ttl = ttl_seconds
         self._lock = threading.Lock()
+        self._max_retained = max_retained
         self._approvals: dict[str, _Approval] = {}
+        self._tombstones: OrderedDict[str, None] = OrderedDict()
+
+    def _retire(self, approval_id: str, item: _Approval, state: str) -> None:
+        """Make an entry terminal: drop its bytes, keep a bounded tombstone. Lock held."""
+        item.state = state
+        item.raw = None
+        self._tombstones[approval_id] = None
+        self._tombstones.move_to_end(approval_id)
+        while len(self._tombstones) > self._max_retained:
+            old, _ = self._tombstones.popitem(last=False)
+            self._approvals.pop(old, None)
+
+    def _sweep(self, now: int) -> None:
+        """Retire live entries whose TTL has passed. Lock held."""
+        for approval_id, item in list(self._approvals.items()):
+            if item.state not in _TERMINAL and now >= item.expires_at:
+                self._retire(approval_id, item, "expired")
 
     def request(self, effect: dict) -> tuple[str, str]:
         raw = check_effect(effect)
         digest = hashlib.sha256(raw).hexdigest()
         approval_id = "apr_" + secrets.token_hex(16)
         with self._lock:
-            self._approvals[approval_id] = _Approval(digest, raw, self._clock() + self._ttl)
+            now = self._clock()
+            self._sweep(now)
+            self._approvals[approval_id] = _Approval(digest, raw, now + self._ttl)
         # Drawn from the stored bytes, after storage: the caller cannot alter either.
         self._draw(approval_id, digest, raw)
         return approval_id, digest
@@ -106,14 +137,19 @@ class ApprovalGate:
             item = self._approvals.get(approval_id)
             if item is None:
                 raise Refused("approval_unknown")
+            if item.state == "expired":
+                raise Refused("approval_expired")
             if item.state != "pending":
                 raise Refused("approval_already_decided")
             if item.digest != digest:
                 raise Refused("approval_digest_mismatch")
             if self._clock() >= item.expires_at:
-                item.state = "expired"
+                self._retire(approval_id, item, "expired")
                 raise Refused("approval_expired")
-            item.state = "approved" if approve else "vetoed"
+            if approve:
+                item.state = "approved"
+            else:
+                self._retire(approval_id, item, "vetoed")
             return item.state
 
     def take(self, approval_id: str, effect: dict) -> str:
@@ -124,14 +160,16 @@ class ApprovalGate:
             item = self._approvals.get(approval_id)
             if item is None:
                 raise Refused("approval_required")
-            if item.raw != raw or item.digest != digest:
+            if item.digest != digest or (item.raw is not None and item.raw != raw):
                 raise Refused("approval_digest_mismatch")
             if item.state == "used":
                 raise Refused("approval_replayed")
+            if item.state == "expired":
+                raise Refused("approval_expired")
             if item.state != "approved":
                 raise Refused("approval_not_granted", item.state)
             if self._clock() >= item.expires_at:
-                item.state = "expired"
+                self._retire(approval_id, item, "expired")
                 raise Refused("approval_expired")
-            item.state = "used"
+            self._retire(approval_id, item, "used")
             return digest

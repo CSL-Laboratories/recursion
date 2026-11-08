@@ -27,6 +27,7 @@ connection. A live binary wire-capture of a real handshake is unmeasured here.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -137,12 +138,20 @@ class DualEraServer:
     request lists the Tasks extension. ``tasks/list`` and
     ``notifications/cancelled`` / ``notifications/tasks`` are not emitted.
     A "list runs" call stays the plain ``recursion_run_list`` tool in both eras.
+
+    ``tools/list`` returns the control tool descriptors in both eras. When
+    ``auth_token`` is set, ``tools/list``, ``tools/call`` and every ``tasks/*``
+    request need it (``_meta.authorization``) before anything reaches
+    ``ControlAPI``; only the handshakes are open. An unknown ``taskId`` is a
+    JSON-RPC ``-32602`` ``run_unknown`` error, never a task that "failed". Task
+    timestamps come from the run record's ``started_at``; the default clock is
+    wall time.
     """
 
     def __init__(self, api: ControlAPI, *, auth_token: str | None = None, clock=None) -> None:
         self.api = api
         self.auth_token = auth_token
-        self._clock = clock or (lambda: 1_000.0)
+        self._clock = clock or time.time
         self.notifications: list[dict] = []
         self.legacy_sessions = 0
 
@@ -154,6 +163,10 @@ class DualEraServer:
             return self._ok(req_id, self._initialize(params))
         if method == "server/discover":
             return self._ok(req_id, self._discover(params))
+        if method in {"tools/list", "tools/call"} and not self._authorized(params):
+            return self._error(req_id, -32001, "unauthorized")
+        if method == "tools/list":
+            return self._ok(req_id, self._tools_list(params))
         if method == "tools/call":
             return self._ok(req_id, self._tools_call(params))
         if method == "tasks/get":
@@ -214,6 +227,12 @@ class DualEraServer:
         meta = _meta(params)
         return meta.get("authorization") == self.auth_token or params.get("authorization") == self.auth_token
 
+    def _tools_list(self, params: Mapping) -> dict:
+        tools = mcp_tools.descriptors()
+        if self._modern_request(params):
+            return {"resultType": "complete", "tools": tools}
+        return {"tools": tools}
+
     def _tools_call(self, params: Mapping) -> dict:
         name = params.get("name")
         arguments = params.get("arguments") if isinstance(params.get("arguments"), Mapping) else {}
@@ -243,7 +262,8 @@ class DualEraServer:
         run_id = _printable_id(run.get("run_id"))
         if run_id is None:
             return self._plain_modern_tool(result)
-        now = _iso(self._clock())
+        started = run.get("started_at")
+        now = _iso(started if isinstance(started, (int, float)) else self._clock())
         return {
             "resultType": "task",
             "taskId": run_id,
@@ -259,7 +279,10 @@ class DualEraServer:
         task_id = _printable_id(params.get("taskId"))
         if task_id is None:
             return self._error(req_id, -32602, "invalid taskId")
-        return self._ok(req_id, handler(task_id, params))
+        body = handler(task_id, params)
+        if body is None:
+            return self._error(req_id, -32602, "run_unknown")
+        return self._ok(req_id, body)
 
     def _task_body(self, rec: Mapping, *, extra: dict | None = None) -> dict:
         now = _iso(rec.get("started_at", self._clock()) if rec.get("started_at") else self._clock())
@@ -280,9 +303,7 @@ class DualEraServer:
     def _tasks_get(self, task_id: str, params: Mapping) -> dict:
         answer = self.api.call("run.status", {"run_id": task_id})
         if answer.get("code") != "ok":
-            return {"resultType": "complete", "taskId": task_id, "status": "failed",
-                    "createdAt": _iso(self._clock()), "lastUpdatedAt": _iso(self._clock()),
-                    "ttlMs": None, "error": {"code": -32602, "message": answer.get("code", "run_unknown")}}
+            return None  # unknown run: -32602, not a task that failed
         rec = answer["run"]
         extra = {}
         if rec.get("state") == "stopped":
@@ -291,13 +312,12 @@ class DualEraServer:
 
     def _tasks_cancel(self, task_id: str, params: Mapping) -> dict:
         # Cooperative cancel through the shared Stop path. No notifications/cancelled.
+        if self.api.call("run.status", {"run_id": task_id}).get("code") != "ok":
+            return None  # unknown run: -32602; nothing is sent to the Stop path
         answer = self.api.call("run.stop", {"run_id": task_id})
         status_answer = self.api.call("run.status", {"run_id": task_id})
         if status_answer.get("code") != "ok":
-            return {"resultType": "complete", "taskId": task_id, "status": "failed",
-                    "createdAt": _iso(self._clock()), "lastUpdatedAt": _iso(self._clock()),
-                    "ttlMs": None,
-                    "error": {"code": -32602, "message": answer.get("code", "run_unknown")}}
+            return None
         rec = status_answer["run"]
         extra = {"statusMessage": answer.get("code")}
         if rec.get("state") == "stopped":

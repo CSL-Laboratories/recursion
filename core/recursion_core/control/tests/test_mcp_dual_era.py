@@ -24,7 +24,9 @@ from recursion_core.control.mcp_dual_era import (
     modern_params,
     negotiation_mode,
 )
-from recursion_core.control.tests.fakes import FakeKillTree, make_api
+from recursion_core.control import mcp_tools
+from recursion_core.control.api import ControlAPI
+from recursion_core.control.tests.fakes import FakeKillTree, FakeStarter, InMemoryRunRegistry, make_api
 
 N = 5
 
@@ -273,6 +275,7 @@ class SameRunAndStopTests(unittest.TestCase):
             "params": {
                 "name": "recursion_run_start",
                 "arguments": {"tenant": "t1", "engine": "codex", "prompt": "p"},
+                "_meta": {"authorization": "secret"},
             },
         })
         run_id = start["result"]["structuredContent"]["run"]["run_id"]
@@ -286,6 +289,70 @@ class SameRunAndStopTests(unittest.TestCase):
             "params": modern_params(taskId=run_id, meta={"authorization": "secret"}),
         })
         self.assertEqual(allowed["result"]["taskId"], run_id)
+
+    def test_tools_list_returns_the_control_tool_descriptors_in_both_eras(self) -> None:
+        # Devin r4506001295: the handshake advertises tools, so tools/list must answer.
+        server, *_ = _server()
+        legacy = server.handle({"jsonrpc": "2.0", "id": "tl", "method": "tools/list", "params": {}})
+        modern = server.handle({"jsonrpc": "2.0", "id": "tl2", "method": "tools/list", "params": modern_params()})
+        expected = mcp_tools.descriptors()
+        self.assertEqual(legacy["result"], {"tools": expected})
+        self.assertEqual(modern["result"], {"resultType": "complete", "tools": expected})
+        names = [t["name"] for t in expected]
+        self.assertEqual(names, ["recursion_run_list", "recursion_run_status", "recursion_run_start",
+                                 "recursion_run_stop"])
+        stop = next(t for t in expected if t["name"] == "recursion_run_stop")
+        self.assertIs(stop["annotations"]["destructiveHint"], True)
+
+    def test_unknown_task_ids_are_a_jsonrpc_invalid_params_error(self) -> None:
+        # Devin r4506001365: a typo id must not read as a real run that failed.
+        server, api, registry, kill, _ = _server()
+        for method in ("tasks/get", "tasks/cancel"):
+            with self.subTest(method=method):
+                reply = server.handle({"jsonrpc": "2.0", "id": "u", "method": method,
+                                       "params": modern_params(taskId="run-typo")})
+                self.assertNotIn("result", reply)
+                self.assertEqual(reply["error"], {"code": -32602, "message": "run_unknown"})
+        self.assertEqual(api.call("run.list", {})["runs"], [])
+        self.assertEqual(kill.requests, [])
+
+    def test_task_timestamps_come_from_the_run_record_not_1970(self) -> None:
+        # Devin r4506001424: creation reply and later polls agree on the run's real start time.
+        registry, kill, starter = InMemoryRunRegistry(), FakeKillTree(), FakeStarter()
+        now = 1_762_639_200.0  # 2025-11-08T22:00:00Z
+        api = ControlAPI(registry, kill, starter, clock=lambda: now)
+        server = DualEraServer(api)
+        created = server.handle({
+            "jsonrpc": "2.0", "id": "ms", "method": "tools/call",
+            "params": modern_params(tasks=True, name="recursion_run_start",
+                                    arguments={"tenant": "t1", "engine": "codex", "prompt": "p"}),
+        })["result"]
+        self.assertEqual(created["resultType"], "task")
+        self.assertEqual(created["createdAt"], "2025-11-08T22:00:00Z")
+        polled = server.handle({"jsonrpc": "2.0", "id": "g", "method": "tasks/get",
+                                "params": modern_params(taskId=created["taskId"])})["result"]
+        self.assertEqual(polled["createdAt"], created["createdAt"])
+        self.assertFalse(DualEraServer(api)._clock() < 1_000_000_000.0, "default clock must be wall time")
+
+    def test_tool_calls_require_auth_when_a_token_is_configured(self) -> None:
+        # Devin r4506001468: tools/call and tools/list never reach ControlAPI without the token.
+        api, registry, *_ = make_api(FakeKillTree())
+        server = DualEraServer(api, auth_token="secret")
+        calls = []
+        real = api.call
+        api.call = lambda method, params: calls.append(method) or real(method, params)
+        start = {"name": "recursion_run_start", "arguments": {"tenant": "t1", "engine": "codex", "prompt": "p"}}
+        for label, params in (("legacy", dict(start)), ("modern", modern_params(tasks=True, **start)),
+                              ("wrong", dict(start, _meta={"authorization": "nope"}))):
+            for method in ("tools/call", "tools/list"):
+                with self.subTest(era=label, method=method):
+                    denied = server.handle({"jsonrpc": "2.0", "id": "x", "method": method, "params": params})
+                    self.assertEqual(denied["error"], {"code": -32001, "message": "unauthorized"})
+        self.assertEqual(calls, [])
+        ok = server.handle({"jsonrpc": "2.0", "id": "y", "method": "tools/call",
+                            "params": dict(start, _meta={"authorization": "secret"})})
+        self.assertEqual(ok["result"]["structuredContent"]["code"], "started")
+        self.assertEqual(calls, ["run.start"])
 
     def test_ungguessable_length_and_whitespace_ids_are_rejected(self) -> None:
         server, *_ = _server()

@@ -41,7 +41,13 @@ recorded on F60, CSL-762).
   the same run id and Stop are visible from either era (n=5). Native Tasks
   ``CreateTaskResult`` is returned from ``tools/call`` only when the request
   lists ``io.modelcontextprotocol/tasks``. ``tasks/list`` and
-  ``notifications/cancelled`` are not served. Live binary wire-capture is
+  ``notifications/cancelled`` are not served. ``tools/list`` returns the four
+  control tool descriptors in both eras. With ``auth_token`` set, ``tools/list``,
+  ``tools/call`` and ``tasks/*`` need ``_meta.authorization`` before anything
+  reaches ``ControlAPI`` (only the handshakes are open). An unknown ``taskId`` is
+  a JSON-RPC ``-32602`` ``run_unknown`` error, and ``tasks/cancel`` sends nothing
+  to the Stop path for it. Task ``createdAt`` comes from the run's
+  ``started_at``; the default clock is wall time. Live binary wire-capture is
   unmeasured (no Claude Code is spawned).
 - `codex_config.py`: `codex_operator_snippet(server_id, command, args)` writes the operator's Codex TOML,
   setting `approval_mode = "approve"` under `mcp_servers.<id>.tools.recursion_run_stop`, so stop does not

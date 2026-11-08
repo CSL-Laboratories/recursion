@@ -162,11 +162,16 @@ class Registry:
                 raise KeyError(run_id)
 
     def state(self, run_id, value, detail=''):
-        """Record an observation. A terminal state is never overwritten."""
+        """Record an observation. A terminal state is never overwritten.
+
+        B14: a run with a recorded Stop is never written as running, even by a caller
+        holding a Run read before the Stop committed; a live unit becomes stopping.
+        """
         with self._tx():
-            self.db.execute("UPDATE runs SET state=?, detail=?, updated=? WHERE run_id=? "
+            self.db.execute("UPDATE runs SET state=CASE WHEN stop=1 AND ?='running' "
+                            "THEN 'stopping' ELSE ? END, detail=?, updated=? WHERE run_id=? "
                             "AND state NOT IN ('terminated', 'lost_reboot')",
-                            (value, detail[:500], time.time(), run_id))
+                            (value, value, detail[:500], time.time(), run_id))
 
     def close(self):
         with self.lock:

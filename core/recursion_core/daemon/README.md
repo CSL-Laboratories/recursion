@@ -100,3 +100,31 @@ Workload checkpoint and restart after reboot is not implemented.
 - No control API, provider launch route or token file here; this lifts no R2a,
   account or spend gate. The same-uid beta is not a security boundary against a
   hostile process of that uid.
+
+## B14: a recorded Stop survives a daemon crash (kill -9 cells)
+
+`Daemon.stop` commits the Stop intent (`stop=1`, state `stopping`) before any signal.
+`Registry.state` never writes `running` for a run with a recorded Stop, even from a
+caller holding a `Run` read before the Stop committed; a live unit reads `stopping`.
+The startup sweep replays the Stop and records `terminated` only after the run is
+positively gone.
+
+`tests/test_stop_crash.py` measures this with real processes: a real daemon process
+(`tests/crash_child.py`) starts a real run in its own session and is killed with
+SIGKILL, n=10 per phase:
+
+- B8 `running` (no Stop): the run outlives the daemon, the kernel releases the
+  daemon lock, and a new daemon re-adopts the same pid as `running`.
+- B14 `before_signal`: killed after the Stop intent committed and before any
+  signal. A first restart sweep whose Stop has not reached the run yet reads
+  `stopping` with the run alive; the next sweep replays the Stop and reaches
+  `terminated`.
+- B14 `after_signal`: killed after the run was signalled and before the daemon
+  confirmed it gone. The restart sweep reads `terminated`; never `running`.
+
+The service manager in these cells is the test-only `tests/procmanager.py`
+(one session and process group per run, pid plus kernel start time per record),
+not systemd: the measuring box has no systemd PID 1 or user manager. Not
+measured here: systemd `--user` scopes and `systemctl --user restart`, a real
+reboot, operator linger on a host, and Windows (job handle held outside the
+daemon, CSL-746).

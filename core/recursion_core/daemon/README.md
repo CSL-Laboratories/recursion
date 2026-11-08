@@ -119,8 +119,16 @@ SIGKILL, n=10 per phase:
   signal. A first restart sweep whose Stop has not reached the run yet reads
   `stopping` with the run alive; the next sweep replays the Stop and reaches
   `terminated`.
-- B14 `after_signal`: killed after the run was signalled and before the daemon
-  confirmed it gone. The restart sweep reads `terminated`; never `running`.
+- B14 `after_signal`: killed after the manager's stop returned (SIGTERM sent,
+  grace wait and any SIGKILL done) and before the daemon recorded the outcome. The
+  run is already gone at the kill, so this measures the record step only. The
+  restart sweep reads `terminated`; never `running`.
+- B14 `signal_sent`: the run records and ignores SIGTERM; killed right after
+  SIGTERM reached it, while the signalled run is still alive. A first restart sweep
+  whose Stop has not reached the run yet reads `stopping` with the run alive; the
+  next sweep replays the Stop and escalates to SIGKILL after a 1 s grace. It still
+  reads `stopping` when the kill has not landed by its observation; a later sweep
+  reaches `terminated` once the run is positively gone.
 
 The service manager in these cells is the test-only `tests/procmanager.py`
 (one session and process group per run, pid plus kernel start time per record),

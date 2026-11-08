@@ -6,10 +6,16 @@ its own session, then kills the daemon with SIGKILL at a chosen point:
 - B8 ``running``: run started, no Stop. After kill -9 the run is still alive and a new
   daemon re-adopts it as ``running``.
 - B14 ``before_signal``: Stop intent committed, daemon killed before signalling the run.
-- B14 ``after_signal``: Stop intent committed and the run signalled, daemon killed
-  before it observed the run gone (no confirmation).
+- B14 ``after_signal``: daemon killed after the manager's stop returned (SIGTERM sent,
+  grace wait and any SIGKILL escalation done) and before the daemon recorded the
+  outcome. The run is already gone at the kill, so this cell measures the record
+  step, not recovery of a live signalled run.
+- B14 ``signal_sent``: Stop intent committed and SIGTERM sent to a run that
+  records and ignores it; daemon killed while that signalled run is still alive. The
+  new daemon reads ``stopping`` with the run alive, replays the Stop and escalates to
+  SIGKILL, and reads ``terminated`` once a later sweep sees the run gone.
 
-For both B14 phases the new daemon must never report the run ``running``: it replays
+For all B14 phases the new daemon must never report the run ``running``: it replays
 the recorded Stop and reaches ``terminated`` only when the run is positively gone.
 The service manager is the test-only ProcessGroupManager, because systemd is not PID 1
 on the box that measured these cells; systemd scopes, reboot and Windows are unmeasured.
@@ -30,7 +36,12 @@ from recursion_core.daemon.tests.procmanager import ProcessGroupManager, _proc_s
 
 CHILD = Path(__file__).with_name('crash_child.py')
 CELLS = int(os.environ.get('RECURSION_CRASH_CELLS', '10'))
-PHASES = ('running', 'before_signal', 'after_signal')
+PHASES = ('running', 'before_signal', 'after_signal', 'signal_sent')
+# Phases killed while the run is alive with a Stop recorded: a first restart sweep whose
+# Stop does not take effect yet must read stopping.
+HELD = ('before_signal', 'signal_sent')
+# Restart grace before SIGKILL; signal_sent ignores SIGTERM, so it always escalates.
+RESTART_GRACE = 1.0
 
 
 def _python():
@@ -80,6 +91,8 @@ def run_cell(root: Path, index: int, phase: str):
                                  f'{child.stderr.read1(4096) if child.poll() is not None else b""!r}')
         if marker.read_text() != phase:
             raise AssertionError(f'{run_id}: daemon passed {phase} without blocking')
+        # signal_sent: kill only once the SIGTERM reached the run's handler.
+        term_received = phase == 'signal_sent' and _wait((root / 'term').exists)
         pid = manager.pid(unit)
         stop, state = _row(root, run_id)
         before = {'stop': stop, 'state': state}
@@ -90,9 +103,9 @@ def run_cell(root: Path, index: int, phase: str):
         # The kernel released the daemon's flock on kill -9: a new daemon may start.
         with UserLock(root / 'runtime'):
             registry = Registry(root / 'state')
-            daemon = Daemon(registry, manager)
+            daemon = Daemon(registry, ProcessGroupManager(root / 'units', grace=RESTART_GRACE))
             try:
-                if phase == 'before_signal':
+                if phase in HELD:
                     # First restart sweep with a Stop that does not take effect yet: the
                     # run is alive, the Stop is recorded, so it must read stopping.
                     held = Daemon(registry, _NoSignal(root / 'units'))
@@ -116,7 +129,8 @@ def run_cell(root: Path, index: int, phase: str):
             finally:
                 daemon.close()
         return {'run_id': run_id, 'phase': phase, 'before': before, 'survived': survived,
-                'held_alive': phase != 'before_signal' or held_alive,
+                'term_received': term_received,
+                'held_alive': phase not in HELD or held_alive,
                 'observed': observed, 'readopted': readopted, 'alive_after': alive_after,
                 'final': final, 'stop_after': stop_after, 'pid': pid}
     finally:
@@ -147,8 +161,14 @@ def check_cell(result):
             failures.append(f'Stop not durable before kill: {result["before"]}')
         if phase == 'before_signal' and not result['survived']:
             failures.append('run died before any signal')
-        if phase == 'before_signal' and (result['observed'][:1] != ['stopping']
-                                         or not result['held_alive']):
+        if phase == 'after_signal' and result['survived']:
+            failures.append('run alive after stop returned; cell not at its point')
+        if phase == 'signal_sent' and not (result['survived']
+                                               and result['term_received']):
+            failures.append(f'not a live signalled run at the kill: survived='
+                            f'{result["survived"]} term={result["term_received"]}')
+        if phase in HELD and (result['observed'][:1] != ['stopping']
+                              or not result['held_alive']):
             failures.append(f'live run with recorded Stop read {result["observed"][:1]}')
         if 'running' in result['observed']:
             failures.append(f're-adopted as running: {result["observed"]}')
@@ -190,8 +210,11 @@ class KillNineCells(unittest.TestCase):
     def test_b14_kill9_before_signal_stop_survives(self):
         self._phase('before_signal')
 
-    def test_b14_kill9_after_signal_before_confirmation(self):
+    def test_b14_kill9_after_stop_returned_run_gone_before_record(self):
         self._phase('after_signal')
+
+    def test_b14_kill9_signalled_run_still_alive(self):
+        self._phase('signal_sent')
 
 
 class RecordedStopGuard(unittest.TestCase):

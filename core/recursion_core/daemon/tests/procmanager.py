@@ -71,6 +71,8 @@ class ProcessGroupManager:
                 os.killpg(record['pid'], signal.SIGTERM)
             except ProcessLookupError:
                 pass
+            if self.stop_hook:
+                self.stop_hook('signal_sent', unit)
             deadline = time.monotonic() + self.grace
             while self._alive(record) and time.monotonic() < deadline:
                 time.sleep(0.01)

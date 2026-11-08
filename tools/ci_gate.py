@@ -59,7 +59,12 @@ TEST_GLOBS = (
     "experiments/**/test_*.py",
     "experiments/**/*_tests.py",
     "experiments/**/*.test.py",
+    "core/**/test_*.py",
 )
+
+# The rebuilt core (CSL-795, PRODUCT.md A19/A38). Its tests import the package
+# ``recursion_core`` from core/, so the gate puts core/ on PYTHONPATH for them.
+CORE_ROOT = "core"
 
 # Intentionally skipped/slow/platform tests. Paths are posix, relative to ROOT.
 TEST_EXCLUDE = {
@@ -256,12 +261,19 @@ def run_test_file(rel: str, *, root: Path | None = None, timeout: int = RUN_TIME
     else:
         cmd = ["-c", UNITTEST_FILE_RUNNER, rel]
         display = f"unittest {rel}"
+    env = None
+    if rel.startswith(CORE_ROOT + "/"):
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.pathsep.join(
+            part for part in (str(base / CORE_ROOT), env.get("PYTHONPATH", "")) if part
+        )
     print(f"RUN {display}", flush=True)
     result = subprocess.run(
         [sys.executable, "-X", "utf8", "-B", *cmd],
         cwd=base,
         timeout=timeout,
         check=False,
+        env=env,
     )
     if result.returncode:
         raise SystemExit(f"gate failed: {display} (exit {result.returncode})")
@@ -388,7 +400,7 @@ def whitespace_check() -> None:
 
 def byte_compile() -> None:
     # Directories emptied by deletions (CSL-597) are skipped, not failed.
-    names = ("tools", "scripts", "schemas", "experiments", "docs")
+    names = ("tools", "scripts", "schemas", "experiments", "docs", "core")
     targets = [name for name in names if (ROOT / name).is_dir()]
     print("RUN python -m compileall " + " ".join(targets), flush=True)
     result = subprocess.run(

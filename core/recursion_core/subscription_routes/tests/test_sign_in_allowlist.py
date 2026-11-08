@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import builtins
 import os
+import shutil
 import unittest
 from unittest import mock
 
@@ -115,6 +116,31 @@ class AllowlistTests(_Base):
         (self.home / ".codex" / "auth.json").touch()  # Hermes can import Codex's login: refused
         self.assertRefusedBeforeSpawn("hermes", self.sub("grok", "grok_sign_in"), self.bare_env(),
                                       "engine_store_in_route_home")
+
+    def test_own_store_may_not_link_outside_the_route_home(self) -> None:
+        # Devin r4505333922: a linked .pi/.hermes/opencode store could reach the operator's login.
+        op_store = self.operator / ".pi"
+        op_store.mkdir(exist_ok=True)
+        (self.home / ".pi").symlink_to(op_store)
+        self.assertRefusedBeforeSpawn("pi", self.sub("chatgpt", "sign_in_with_chatgpt"), self.bare_env(),
+                                      "own_store_is_link")
+        (self.home / ".pi").unlink()
+        (self.home / ".pi").mkdir()
+        (self.home / ".pi" / "agent").mkdir()
+        (self.home / ".pi" / "agent" / "auth.json").symlink_to(op_store / "auth.json")
+        self.assertRefusedBeforeSpawn("pi", self.sub("chatgpt", "sign_in_with_chatgpt"), self.bare_env(),
+                                      "own_store_links_outside_route_home")
+        (self.home / ".pi" / "agent" / "auth.json").unlink()
+        (self.home / ".pi" / "agent" / "auth.json").write_text("{}")
+        (self.home / ".pi" / "agent" / "alias.json").symlink_to(self.home / ".pi" / "agent" / "auth.json")
+        decision, _ = self.spawn("pi", self.sub("chatgpt", "sign_in_with_chatgpt"), self.bare_env())
+        self.assertEqual(decision.engine, "pi")  # a link that stays inside the route home is fine
+        self.launcher.reset_mock()
+        shutil.rmtree(self.home / ".pi")
+        (self.home / ".local" / "share").mkdir(parents=True)
+        (self.home / ".local" / "share" / "opencode").symlink_to(op_store)
+        self.assertRefusedBeforeSpawn("opencode", self.sub("chatgpt", "sign_in_with_chatgpt"), self.bare_env(),
+                                      "own_store_is_link")
 
     def test_claude_store_still_refused_on_a_sign_in(self) -> None:
         (self.home / ".claude").mkdir()

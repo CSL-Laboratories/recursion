@@ -404,9 +404,38 @@ def _check_home(
             raise SubscriptionRouteRefused(engine, "claude_store_in_route_home", entry)
     for entry in ENGINE_STORE_ENTRIES:
         if entry in own:
+            _check_own_store(engine, route_home, real, entry)
             continue
         if os.path.lexists(os.path.join(route_home, entry)):  # presence only; never opened or read
             raise SubscriptionRouteRefused(engine, "engine_store_in_route_home", entry)
+
+
+_STORE_WALK_CAP = 10_000
+
+
+def _check_own_store(engine: str, route_home: str, real_home: str, entry: str) -> None:
+    """The engine's own store must live inside the route home: no link on the way to it, and no link
+    inside it that resolves outside the route home (it could reach the operator's store). lstat only."""
+
+    path, parts = route_home, entry.split("/")
+    for part in parts:
+        path = os.path.join(path, part)
+        if not os.path.lexists(path):
+            return  # absent: nothing to check
+        if os.path.islink(path):
+            raise SubscriptionRouteRefused(engine, "own_store_is_link", entry)
+    if not os.path.isdir(path):
+        return
+    inside = real_home.rstrip("/") + "/"
+    seen = 0
+    for top, dirs, files in os.walk(path, followlinks=False):
+        for name in dirs + files:
+            seen += 1
+            if seen > _STORE_WALK_CAP:
+                raise SubscriptionRouteRefused(engine, "own_store_too_large", entry)
+            item = os.path.join(top, name)
+            if os.path.islink(item) and not os.path.realpath(item).startswith(inside):
+                raise SubscriptionRouteRefused(engine, "own_store_links_outside_route_home", entry)
 
 
 def _operator_homes(parent_env: Mapping[str, str] | None, operator_home: str | None) -> list[str]:

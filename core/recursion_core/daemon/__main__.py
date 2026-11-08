@@ -27,14 +27,42 @@ def main(*, client=None, door=None, plugins=(), port=8765):
     signal.signal(signal.SIGINT, lambda *_: stopped.set())
     with UserLock(runtime):
         daemon = Daemon(Registry(state), SystemdUserManager())
+        gui = None
         try:
             daemon.sweep()
-            with LoopbackGUI(client, door, plugins=plugins, port=port):
-                while not stopped.wait(5):
-                    require_free_threaded()
-                    daemon.sweep()
+            gui = _start_gui(client, door, plugins, port, announced=False)
+            announced = gui is None
+            while not stopped.wait(5):
+                require_free_threaded()
+                daemon.sweep()
+                if gui is None:
+                    gui = _start_gui(client, door, plugins, port, announced=announced)
+                    announced = gui is None
         finally:
-            daemon.close()  # Deliberately do not stop independent run services.
+            try:
+                if gui is not None:
+                    gui.__exit__(None, None, None)
+            finally:
+                daemon.close()  # Deliberately do not stop independent run services.
+
+
+def _start_gui(client, door, plugins, port, *, announced):
+    """Bind the loopback GUI, or return None so reconciliation keeps running.
+
+    Only a bind failure (OSError, e.g. another listener on the port) is tolerated
+    and retried on the next sweep; a bad plugin registry still raises.
+    """
+    gui = LoopbackGUI(client, door, plugins=plugins, port=port)
+    try:
+        gui.__enter__()
+    except OSError as exc:
+        if not announced:
+            log.warning('GUI unavailable: cannot bind 127.0.0.1:%d (%s); '
+                        'reconciliation continues and the bind is retried every sweep', port, exc)
+        return None
+    if announced:
+        log.info('GUI available again on 127.0.0.1:%d', port)
+    return gui
 
 
 def cli():

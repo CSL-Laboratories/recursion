@@ -114,3 +114,65 @@ class LoopbackTests(TestCase):
             gui.return_value.__enter__.assert_called_once()
             gui.return_value.__exit__.assert_called_once()
             daemon.return_value.close.assert_called_once()
+
+    def test_occupied_gui_port_keeps_reconciliation_running_and_retries(self):
+        occupant = socket.socket()
+        occupant.bind(("127.0.0.1", 0))
+        occupant.listen()
+        port = occupant.getsockname()[1]
+        seen = []
+        def wait(_timeout):
+            tick = len(seen)
+            if tick == 1:
+                occupant.close()  # the unrelated listener goes away
+            if tick == 2:  # one sweep after the retry: our GUI now owns the port
+                connection = HTTPConnection("127.0.0.1", port, timeout=3)
+                try:
+                    connection.request("GET", "/")
+                    response = connection.getresponse()
+                    seen.append((response.status, response.read().decode()))
+                finally:
+                    connection.close()
+                return True
+            seen.append(None)
+            return False
+        try:
+            with mock.patch.object(entry, "require_free_threaded"), \
+                 mock.patch.object(entry, "check_operator_linger"), \
+                 mock.patch.object(entry.signal, "signal"), \
+                 mock.patch.object(entry, "UserLock"), \
+                 mock.patch.object(entry, "Registry"), \
+                 mock.patch.object(entry, "SystemdUserManager"), \
+                 mock.patch.object(entry, "Daemon") as daemon, \
+                 mock.patch.object(entry, "threading") as threads, \
+                 mock.patch.dict(entry.os.environ, {"RECURSION_ENGINE_USER": ""}), \
+                 self.assertLogs("recursion_core.daemon", "INFO") as logs:
+                threads.Event.return_value.wait.side_effect = wait  # module-local: real GUI threads keep real Events
+                entry.main(client=self.client, port=port)
+        finally:
+            occupant.close()
+        # Initial sweep plus one per elapsed tick: the loop survived the failed bind.
+        self.assertEqual(daemon.return_value.sweep.call_count, 3)
+        daemon.return_value.close.assert_called_once()
+        status, body = seen[-1]
+        self.assertEqual(status, 401)  # default door: fails closed, but the page is ours
+        self.assertIn("device_not_authenticated", body)
+        warnings = [line for line in logs.output if "GUI unavailable" in line]
+        self.assertEqual(len(warnings), 1)  # logged once, not every sweep
+        self.assertTrue(any("GUI available again" in line for line in logs.output))
+        with socket.socket() as probe:
+            self.assertNotEqual(probe.connect_ex(("127.0.0.1", port)), 0)
+
+    def test_bad_plugin_registry_still_stops_the_service(self):
+        with mock.patch.object(entry, "require_free_threaded"), \
+             mock.patch.object(entry, "check_operator_linger"), \
+             mock.patch.object(entry.signal, "signal"), \
+             mock.patch.object(entry, "UserLock"), \
+             mock.patch.object(entry, "Registry"), \
+             mock.patch.object(entry, "SystemdUserManager"), \
+             mock.patch.object(entry, "Daemon") as daemon, \
+             mock.patch.dict(entry.os.environ, {"RECURSION_ENGINE_USER": ""}):
+            bad = {"panels": [{"id": "bad", "title": "Bad", "reads": ["stop"]}]}
+            with self.assertRaises(ValueError):
+                entry.main(client=self.client, plugins=(bad,), port=0)
+            daemon.return_value.close.assert_called_once()

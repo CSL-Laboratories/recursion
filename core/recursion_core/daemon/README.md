@@ -145,7 +145,10 @@ daemon, CSL-746).
 The service composition root now starts `LoopbackGUI` beside reconciliation and
 closes its HTTP listener before closing the registry. The listener binds only
 `127.0.0.1:8765` (`--gui-port` overrides the port, never the address). The GUI package
-opens no socket. This branch carries the #330 GUI prerequisite unchanged by
+opens no socket. If that port is already taken (any `OSError` on bind), the
+daemon logs "GUI unavailable" once, keeps its five-second reconciliation and Stop
+replay running, and retries the bind on every sweep; it logs "GUI available again"
+when the bind succeeds. A bad plugin registry still stops the service. This branch carries the #330 GUI prerequisite unchanged by
 cherry-pick so its real HTTP test is self-contained; merge order is not assumed.
 
 The control-API device door and `ControlClient` can be injected into `main`.

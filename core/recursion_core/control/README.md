@@ -38,6 +38,12 @@ recorded on F60, CSL-762).
   prompt where that setting is in place. `strict_auto_review` or a managed approval requirement can still
   force a prompt. Without the setting, stop prompts in Auto mode and is refused under `codex exec`. Start
   is not auto-approved.
+- `codex_exec.py` (CSL-762, B4 / F60 Arm E): an offline reading of Codex's mark check under
+  `codex exec` (approval policy never). A call that would prompt is refused. Arms A
+  (`destructiveHint: false` only), B (`destructiveHint: false` and `openWorldHint: false`)
+  and C (read tools) run at n=5, plus `approval_mode = "approve"` on start. Source commit
+  `e0aa0434f415b0c5bc0fb64abd7f03c5510f9ed6` is recorded; the live binary version is
+  unmeasured (no Codex is spawned).
 
 ## Candidate and unwired
 

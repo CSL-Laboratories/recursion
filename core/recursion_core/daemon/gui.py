@@ -36,6 +36,9 @@ class LoopbackGUI:
         self.door = door if door is not None else _unpaired
         self.plugins, self.port = tuple(plugins), port
         self.server = self.thread = None
+        # Validate plugin panels before any bind, so a bad registry fails at startup
+        # even when the port is occupied and the bind is retried later.
+        compose(self.client, self.door, frozenset(), frozenset(), plugins=self.plugins)
 
     def __enter__(self):
         server = WSGIServer(("127.0.0.1", self.port), _Handler)

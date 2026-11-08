@@ -76,13 +76,10 @@ class LoopbackTests(TestCase):
             servers.append(server)
             return server
         with mock.patch("recursion_core.daemon.gui.WSGIServer", side_effect=bind):
-            gui = LoopbackGUI(self.client, lambda _: True,
-                              plugins=({"panels": [{"id": "bad", "title": "Bad", "reads": ["stop"]}]},), port=0)
             with self.assertRaises(ValueError):
-                gui.__enter__()
-        self.assertIsNone(gui.server)
-        self.assertEqual(len(servers), 1)
-        self.assertEqual(servers[0].socket.fileno(), -1)
+                LoopbackGUI(self.client, lambda _: True,
+                            plugins=({"panels": [{"id": "bad", "title": "Bad", "reads": ["stop"]}]},), port=0)
+        self.assertEqual(servers, [])  # rejected before any socket is bound
 
     def test_cli_registers_explicit_plugin_and_checks_runtime_after_import(self):
         plugin = {"panels": []}
@@ -176,3 +173,29 @@ class LoopbackTests(TestCase):
             with self.assertRaises(ValueError):
                 entry.main(client=self.client, plugins=(bad,), port=0)
             daemon.return_value.close.assert_called_once()
+
+    def test_bad_plugin_registry_stops_the_service_even_when_the_port_is_occupied(self):
+        occupant = socket.socket()
+        occupant.bind(("127.0.0.1", 0))
+        occupant.listen()
+        port = occupant.getsockname()[1]
+        bad = {"panels": [{"id": "bad", "title": "Bad", "reads": ["stop"]}]}
+        try:
+            with mock.patch.object(entry, "require_free_threaded"), \
+                 mock.patch.object(entry, "check_operator_linger"), \
+                 mock.patch.object(entry.signal, "signal"), \
+                 mock.patch.object(entry, "UserLock"), \
+                 mock.patch.object(entry, "Registry"), \
+                 mock.patch.object(entry, "SystemdUserManager"), \
+                 mock.patch.object(entry, "Daemon") as daemon, \
+                 mock.patch.object(entry, "threading") as threads, \
+                 mock.patch.dict(entry.os.environ, {"RECURSION_ENGINE_USER": ""}):
+                threads.Event.return_value.wait.side_effect = [False, False, True]  # bounded if tolerated
+                with self.assertRaises(ValueError):
+                    entry.main(client=self.client, plugins=(bad,), port=port)
+        finally:
+            occupant.close()
+        # Fails at startup, before the reconciliation loop, not on a later retry.
+        self.assertEqual(daemon.return_value.sweep.call_count, 1)
+        threads.Event.return_value.wait.assert_not_called()
+        daemon.return_value.close.assert_called_once()

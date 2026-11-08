@@ -304,6 +304,28 @@ class TestInventoryTests(unittest.TestCase):
         finally:
             shutil.rmtree(repo, ignore_errors=True)
 
+    def test_core_test_is_globbed_but_venv_tests_are_not(self) -> None:
+        repo = Path(tempfile.mkdtemp(prefix="ci-gate-disc-"))
+        try:
+            write(repo / "core" / "recursion_core" / "tests" / "test_a.py", "x = 1\n")
+            venv_test = "core/.venv/lib/python3.13/site-packages/widget/test_widget.py"
+            write(repo / venv_test, "x = 1\n")
+            globbed = ci_gate.glob_suite_tests(repo)
+            discovered = ci_gate.discover_all_test_files(repo)
+            self.assertIn("core/recursion_core/tests/test_a.py", globbed)
+            self.assertNotIn(venv_test, globbed)
+            self.assertNotIn(venv_test, discovered)
+            run, unaccounted, _, _ = ci_gate.classify_tests(
+                discovered=discovered,
+                globbed=globbed,
+                exclude=set(),
+                required=set(),
+            )
+            self.assertEqual(run, ["core/recursion_core/tests/test_a.py"])
+            self.assertEqual(unaccounted, [])
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
+
     def test_orphan_test_is_discovered_but_not_globbed(self) -> None:
         repo = Path(tempfile.mkdtemp(prefix="ci-gate-disc-"))
         try:

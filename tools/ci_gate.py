@@ -265,7 +265,7 @@ def run_test_file(rel: str, *, root: Path | None = None, timeout: int = RUN_TIME
     if rel.startswith(CORE_ROOT + "/"):
         env = dict(os.environ)
         env["PYTHONPATH"] = os.pathsep.join(
-            part for part in (str(base / CORE_ROOT), env.get("PYTHONPATH", "")) if part
+            part for part in (str((base / CORE_ROOT).resolve()), env.get("PYTHONPATH", "")) if part
         )
     print(f"RUN {display}", flush=True)
     result = subprocess.run(
@@ -289,8 +289,12 @@ def glob_suite_tests(root: Path | None = None) -> list[str]:
     found: set[str] = set()
     for pattern in TEST_GLOBS:
         for path in base.glob(pattern):
+            rel = path.relative_to(base)
+            # Same directory skips as the inventory walk, so a venv's tests never run.
+            if any(part in SKIP_DIR_NAMES for part in rel.parts[:-1]):
+                continue
             if path.is_file() and is_test_filename(path.name):
-                found.add(_posix_rel(path, base))
+                found.add(rel.as_posix())
     return sorted(found)
 
 

@@ -16,8 +16,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable, Protocol
 
-from .engine_user import refuse_session_launch
-
 log = logging.getLogger(__name__)
 
 RUN_ID = re.compile(r'[a-zA-Z0-9_-]{1,64}')
@@ -198,7 +196,6 @@ class Daemon:
             raise RuntimeError('Daemon closed')
 
     def start(self, run_id, argv):
-        refuse_session_launch(argv)  # before any record: no PAM/logind session wrapper
         with self.lock:
             self._open()
             boot = self.boot_id()

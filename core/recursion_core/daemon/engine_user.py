@@ -5,8 +5,12 @@ linger. Nothing here enables, disables, masks or starts anything: the probe only
 reads `loginctl`, `systemctl is-active` and the presence of one socket path.
 
 This module does not choose the engine spawn path. B7 (CSL-734) picks it. It only
-refuses launch wrappers that would open a PAM/logind session for the engine user
-and so start `user@<engine uid>.service` again.
+provides a guard that refuses launch wrappers that would open a PAM/logind session
+for the engine user and so start `user@<engine uid>.service` again.
+
+Nothing in the daemon calls these yet: the cross-uid path is not implemented and
+`RECURSION_ENGINE_USER` is refused, so the daemon does not enforce engine-manager
+absence today. Same-uid operator runs (`Daemon.start`) are not filtered by them.
 """
 from __future__ import annotations
 
@@ -49,7 +53,10 @@ class SessionLaunchRefused(ValueError):
 
 
 def refuse_session_launch(argv):
-    """Refuse argv that would open a PAM/logind session (e.g. `su -`, `runuser -l`)."""
+    """Refuse argv that would open a PAM/logind session (e.g. `su -`, `runuser -l`).
+
+    For the later cross-uid engine spawn (B7, CSL-734), not for same-uid operator runs.
+    """
     if not argv or not all(isinstance(a, str) for a in argv):
         raise SessionLaunchRefused('argv must be a non-empty list of strings')
     name = os.path.basename(argv[0])

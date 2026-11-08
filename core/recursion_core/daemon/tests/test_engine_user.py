@@ -148,18 +148,22 @@ class SessionLaunchTests(unittest.TestCase):
             with self.subTest(argv=argv), self.assertRaises(SessionLaunchRefused):
                 refuse_session_launch(argv)
 
-    def test_daemon_refuses_before_recording(self):
+    def test_same_uid_operator_runs_are_not_filtered(self):
+        # The guard is for the later cross-uid engine spawn; it does not restrict same-uid operator
+        # commands, and the daemon does not claim to enforce engine-manager absence.
         with tempfile.TemporaryDirectory() as temp:
             registry = Registry(Path(temp) / 'state')
             manager = FakeManager()
             daemon = Daemon(registry, manager, Boot())
             try:
-                with self.assertRaises(SessionLaunchRefused):
-                    daemon.start('one', ['runuser', '-l', ENGINE, '-c', '/x'])
-                self.assertEqual(registry.all(), [])
-                self.assertEqual(manager.starts, [])
+                self.assertEqual(daemon.start('one', ['ssh', 'build-host', 'make']).state, 'running')
+                self.assertEqual(manager.starts, ['recursion-run-one.service'])
             finally:
                 registry.close()
+        import recursion_core.daemon as pkg
+        source = Path(pkg.__file__).read_text()
+        self.assertNotIn('refuse_session_launch', source)
+        self.assertNotIn('check_engine_no_user_manager', source)
 
     def test_recorded_spawn_path_is_same_uid_without_pam(self):
         self.assertIn('systemd-run --user', SPAWN_PATH['path'])

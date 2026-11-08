@@ -34,7 +34,9 @@ gets its own daemon" clause stays open under that invariant.
 Lucas's Nov 8 call replaces "Linger=yes for both": the operator keeps
 `Linger=yes`; the engine user gets `Linger=no` and no `user@<engine uid>.service`.
 Stop still ends just the one run. `engine_user.py` holds read-only pieces for the
-later cross-uid path, which this package still refuses:
+later cross-uid path, which this package still refuses. The daemon does not call
+them, so it does not enforce engine-manager absence today; same-uid operator runs
+are unaffected:
 
 - `check_engine_no_user_manager(user, uid)` passes only when `loginctl show-user
   <engine> --property=Linger --value` says `no` (or logind says the user is not
@@ -43,10 +45,11 @@ later cross-uid path, which this package still refuses:
   including a probe that cannot run, fails closed. It enables, disables, masks or
   stops nothing. `systemctl mask user@<uid>.service` is proposed hardening,
   unmeasured, and not part of this bar.
-- `refuse_session_launch(argv)`: `Daemon.start` refuses, before recording a run,
-  launchers that open a PAM/logind session and would start the engine user's
-  manager again (`su`, `runuser`, `sudo`, `login`, `machinectl`, `pkexec`, `doas`,
-  `ssh`, `run0`, and `systemd-run` with `PAMName=`).
+- `refuse_session_launch(argv)`: a guard for the later cross-uid engine spawn. It
+  refuses launchers that open a PAM/logind session and would start the engine
+  user's manager again (`su`, `runuser`, `sudo`, `login`, `machinectl`, `pkexec`,
+  `doas`, `ssh`, `run0`, and `systemd-run` with `PAMName=`). It is not applied to
+  same-uid operator runs.
 - `SPAWN_PATH` records the spawn path this package uses today: same-uid transient
   `systemd-run --user` units in the operator's user manager, no engine uid, no PAM.
   B7 (CSL-734) picks the cross-uid spawn path; nothing here chooses it.

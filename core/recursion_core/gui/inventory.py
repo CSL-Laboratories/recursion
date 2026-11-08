@@ -31,13 +31,14 @@ BARS = ("launch_check", "floor", "conformance", "truthful_stop", "venue_switch",
 # vendors are this slice's reading of the briefing, flagged for review. Venue uses belong
 # to the Cockpit plugin, which passes its own classes in through ``required``.
 REQUIRED = {
-    "engine": ("claude_code", "codex", "opencode", "grok", "antigravity", "cursor", "gemini_cli", "pi",
+    "engine": ("claude_code", "codex", "opencode", "grok", "antigravity", "cursor", "gemini", "pi",
                "hermes"),
-    "own_loop": ("anthropic", "openai", "google", "xai"),
+    "own_loop": ("anthropic", "openai", "google", "xai", "copilot", "nous"),
     "surface": ("cli", "desktop", "phone"),
     "mcp": ("2025-06-18", "2026-07-28"),
     "plugin_panels": ("plugin_panels",),
 }
+_O61_HELD = frozenset({"copilot", "nous"})
 _ID = re.compile(r"[A-Za-z0-9_.:/-]{1,96}")
 
 
@@ -94,9 +95,12 @@ def assess(record: object) -> dict:
         claim = "mature_claim_rejected"
     else:
         claim = "ok"
-    tagged = claimed == "beta" or tag is True
+    held = record["class"] == "own_loop" and _subject(record) in _O61_HELD
+    tagged = claimed == "beta" or tag is True or held
     route_id = record.get("id") if type(record.get("id")) is str and _ID.fullmatch(record["id"]) else "invalid"
     blocker = record.get("blocker") if type(record.get("blocker")) is str else ""
+    if held:
+        blocker = "O61: per-vendor permission verification held" + ("; " + blocker if blocker else "")
     if failed and not blocker:
         blocker = "not reported by control API"
     out = {
@@ -114,14 +118,20 @@ def coverage_gaps(records: list, required: dict | None = None) -> list[dict]:
     for record in records:
         if _well_formed(record):  # a malformed record never hides a required-route gap
             seen.setdefault(record.get("class"), set()).add(_subject(record))
+    combined = {cls: list(subjects) for cls, subjects in REQUIRED.items()}
+    for cls, subjects in (required or {}).items():
+        combined[cls] = list(dict.fromkeys([*combined.get(cls, ()), *subjects]))
     gaps = []
-    for cls, subjects in (REQUIRED if required is None else required).items():
+    for cls, subjects in combined.items():
         for subject in subjects:
             if subject not in seen.get(cls, set()):
                 gaps.append({"id": "gap:%s:%s" % (cls, subject), "class": cls, "subject": subject,
                              "sign_in": "", "configured": False, "maturity": "beta", "claim": "not_in_inventory",
-                             "beta_tag": False, "failed_bars": list(BARS),
-                             "blocker": "upstream: control API did not report this route"})
+                             "beta_tag": cls == "own_loop" and subject in _O61_HELD,
+                             "failed_bars": list(BARS),
+                             "blocker": "upstream: control API did not report this route"
+                             + ("; O61: per-vendor permission verification held"
+                                if cls == "own_loop" and subject in _O61_HELD else "")})
     return gaps
 
 

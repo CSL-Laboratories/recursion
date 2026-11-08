@@ -34,6 +34,7 @@ from urllib.parse import parse_qs, quote
 
 from .client import ACTIONS, READS, ControlClient, ControlError
 from .inventory import BARS, assess, coverage_gaps, project
+from .panels import panel_registry
 
 __all__ = ["Application", "withhold_venue_data"]
 
@@ -76,9 +77,10 @@ def withhold_venue_data(value: object) -> object:
 
 class Application:
     def __init__(self, client: ControlClient, door: Callable[[dict], bool], hosts: frozenset,
-                 origins: frozenset, required: dict | None = None) -> None:
+                 origins: frozenset, required: dict | None = None, panels=()) -> None:
         self._client = client
         self._required = required
+        self._panels = panel_registry(panels)
         self._door = door
         self._hosts = frozenset(hosts)
         self._origins = frozenset(origins)
@@ -106,7 +108,7 @@ class Application:
             status = "401 Unauthorized" if refusal == "device_not_authenticated" else "403 Forbidden"
             return self._send(start_response, status, self._page("Refused", "<p>Refused: %s</p>" % escape(refusal)))
         method, path = env.get("REQUEST_METHOD"), env.get("PATH_INFO", "")
-        routes = {("GET", "/"): self._home, ("GET", "/read"): self._read,
+        routes = {("GET", "/"): self._home, ("GET", "/read"): self._read, ("GET", "/panel"): self._panel,
                   ("POST", "/action"): self._action, ("POST", "/stop"): self._stop}
         handler = routes.get((method, path))
         if handler is None:
@@ -189,7 +191,10 @@ class Application:
                 '<p><input type="checkbox" id="confirm-stop" name="confirm" value="explicit" required>'
                 '<label for="confirm-stop">I confirm stopping this run</label></p>'
                 '<button type="submit">Request stop</button></form></section>')
-        main = (self._routes_table() + '<section aria-labelledby="reads-h"><h2 id="reads-h">Reads</h2><ul>'
+        panels = ('<section aria-labelledby="panels-h"><h2 id="panels-h">Plugin panels</h2><ul>'
+                  + "".join('<li><a href="/panel?id=%s">%s</a></li>' % (quote(pid), escape(p["title"]))
+                            for pid, p in self._panels.items()) + "</ul></section>")
+        main = (panels + self._routes_table() + '<section aria-labelledby="reads-h"><h2 id="reads-h">Reads</h2><ul>'
                 + reads + '</ul></section><section aria-labelledby="actions-h"><h2 id="actions-h">'
                 "Interventions</h2>" + actions + "</section>" + stop)
         return "Overview", main
@@ -244,6 +249,21 @@ class Application:
         except ControlError as exc:
             return _LABELS[command], '<p role="status">Unavailable: %s</p>' % escape(exc.code)
         return _LABELS[command], "<h2>%s</h2>%s" % (escape(_LABELS[command]), self._o7_view(command, data))
+
+    def _panel(self, env: dict) -> tuple[str, str]:
+        form = self._query(env)
+        if set(form) != {"id"} or len(form["id"]) != 1 or form["id"][0] not in self._panels:
+            raise _BadRequest("panel_not_registered")
+        panel = self._panels[form["id"][0]]
+        body = "<h2>%s</h2><p>Read-only plugin panel.</p>" % escape(panel["title"])
+        for command in panel["reads"]:
+            body += "<section><h3>%s</h3>" % escape(_LABELS[command])
+            try:
+                body += self._o7_view(command, self._client.operator(command))
+            except ControlError as exc:
+                body += '<p role="status">Unavailable: %s</p>' % escape(exc.code)
+            body += "</section>"
+        return panel["title"], body
 
     def _action(self, env: dict) -> tuple[str, str]:
         form = self._form(env, {"command", "confirm"})

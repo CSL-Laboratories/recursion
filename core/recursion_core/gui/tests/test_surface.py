@@ -282,7 +282,7 @@ class RubricTests(unittest.TestCase):
         self.assertIn("gap:mcp:2026-07-28", ids)
         plugin = {"venue_use": ("kalshi:model_fed_read", "kalshi:model_fed_propose")}
         self.assertEqual({g["id"] for g in coverage_gaps(reported, plugin)},
-                         {"gap:venue_use:kalshi:model_fed_propose"})
+                         ids | {"gap:venue_use:kalshi:model_fed_propose"})
 
 
 class PageTests(GuiHarness):
@@ -316,7 +316,7 @@ class PageTests(GuiHarness):
                                frozenset({ORIGIN}), required={"venue_use": ("kalshi:model_fed_read",)})
         body = self.request("GET", "/")[2]
         self.assertIn("gap:venue_use:kalshi:model_fed_read", body)
-        self.assertNotIn("gap:engine:hermes", body)
+        self.assertIn("gap:engine:hermes", body)
 
     def test_routes_unavailable_is_reported(self) -> None:
         self.app = Application(ControlClient(broken_transport), _Door(), frozenset({HOST}), frozenset({ORIGIN}))

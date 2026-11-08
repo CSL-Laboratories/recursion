@@ -1,0 +1,99 @@
+"""Read-only mount and additive plugin inventory regressions."""
+import importlib
+import unittest
+from collections.abc import Mapping
+
+from recursion_core.gui import compose
+from recursion_core.gui.client import ACTIONS, READS, ControlClient, ControlError
+from recursion_core.gui.inventory import BARS, REQUIRED, assess, coverage_gaps
+from recursion_core.gui.tests.fakes import wsgi_transport
+from recursion_core.gui.tests.test_surface import GuiHarness, HOST, ORIGIN
+
+
+class InventoryTests(unittest.TestCase):
+    def test_plugin_requirements_extend_all_core_classes_and_same_class(self):
+        original = {k: tuple(v) for k, v in REQUIRED.items()}
+        gaps = coverage_gaps([], {"venue_use": ["paper:own_trading"], "engine": ["plugin_engine", "codex"]})
+        ids = [g["id"] for g in gaps]
+        for cls, subjects in original.items():
+            for subject in subjects:
+                self.assertIn(f"gap:{cls}:{subject}", ids)
+        self.assertIn("gap:venue_use:paper:own_trading", ids)
+        self.assertIn("gap:engine:plugin_engine", ids)
+        self.assertEqual(ids.count("gap:engine:codex"), 1)
+        self.assertEqual(REQUIRED, original)
+
+    def test_gemini_floor_id_and_own_loop_permission_holds(self):
+        self.assertIn("gemini", REQUIRED["engine"])
+        self.assertNotIn("gemini_cli", REQUIRED["engine"])
+        self.assertIn("xai", REQUIRED["own_loop"])
+        for vendor in ("copilot", "nous"):
+            gap = next(g for g in coverage_gaps([]) if g["id"] == f"gap:own_loop:{vendor}")
+            self.assertTrue(gap["beta_tag"])
+            self.assertIn("O61", gap["blocker"])
+            row = assess({"id": vendor, "class": "own_loop", "vendor": vendor, "maturity": "mature",
+                          "bars": {bar: {"pass": True, "evidence": "fixture"} for bar in BARS}})
+            self.assertEqual((row["maturity"], row["beta_tag"]), ("beta", True))
+            self.assertIn("O61", row["blocker"])
+
+
+class PanelTests(GuiHarness):
+    def mount(self, panels):
+        self.app = compose(ControlClient(wsgi_transport(self.api)), self.door, {HOST}, {ORIGIN},
+                           plugins=({"panels": panels},))
+
+    def test_read_only_panel_renders_named_reads_and_escapes(self):
+        panel = {"id": "example.panel", "title": "Example <panel>", "reads": list(READS[:2])}
+        self.mount([panel])
+        panel["reads"].append(ACTIONS[0])  # validated snapshot cannot be mutated by the plugin
+        self.assertIn("/panel?id=example.panel", self.request("GET", "/")[2])
+        self.api.calls.clear()
+        status, _, body = self.request("GET", "/panel", query="id=example.panel")
+        self.assertEqual(status, "200 OK")
+        self.assertIn("Example &lt;panel&gt;", body)
+        main = body.split('<main id="main"', 1)[1].split('</main>', 1)[0]
+        self.assertNotIn('<form', main)
+        self.assertNotIn('Request stop', main)
+        self.assertEqual([c[2]["command"] for c in self.api.calls], list(READS[:2]))
+        self.assertEqual(self.request("POST", "/panel", {"id": "example.panel"})[0], "405 Method Not Allowed")
+        self.assertEqual(self.request("GET", "/panel", query="id=missing")[0], "400 Bad Request")
+
+    def test_panel_declarations_refuse_actions_stop_orders_and_duplicates(self):
+        for read in (*ACTIONS, "stop", "operator.orders.submit", ["bad"]):
+            with self.subTest(read=read), self.assertRaises(ValueError):
+                self.mount([{"id": "p", "title": "Panel", "reads": [read]}])
+        p = {"id": "p", "title": "Panel", "reads": [READS[0]]}
+        with self.assertRaises(ValueError):
+            self.mount([p, p])
+        with self.assertRaises(ValueError):
+            self.mount([{**p, "stop": True}])
+
+    def test_panel_filters_venue_data_and_shows_read_outage(self):
+        self.mount([{"id": "p", "title": "Panel", "reads": [READS[0]], "withhold_venue_data": False}])
+        self.api.extra[READS[0]] = {"result": {"venue_data": "not-for-display", "venue_data_switch": "off"}}
+        body = self.request("GET", "/panel", query="id=p")[2]
+        self.assertNotIn("not-for-display", body)
+        self.assertIn("withheld", body)
+        self.api.extra[READS[0]] = {"result": {"venue_data": "permitted", "venue_data_switch": "on"}}
+        self.assertIn("permitted", self.request("GET", "/panel", query="id=p")[2])
+        def unavailable(*_):
+            raise ControlError("offline")
+        self.app._client.operator = unavailable
+        self.assertIn("Unavailable: offline", self.request("GET", "/panel", query="id=p")[2])
+
+    def test_real_cockpit_registry_renders(self):
+        try:
+            plugin = importlib.import_module("cockpit.gui.panels")
+        except ModuleNotFoundError as exc:
+            if exc.name not in {"cockpit", "cockpit.gui", "cockpit.gui.panels"}:
+                raise
+            self.skipTest("run with Cockpit #318 engine on PYTHONPATH for cross-repo integration")
+        self.app = compose(ControlClient(wsgi_transport(self.api)), self.door, {HOST}, {ORIGIN},
+                           plugins=(plugin.registry(),))
+        self.assertIsInstance(plugin.PANELS[0], Mapping)
+        self.assertIn("gap:engine:hermes", self.request("GET", "/")[2])
+        self.api.calls.clear()
+        status, _, body = self.request("GET", "/panel", query="id=cockpit.paper_own_trading")
+        self.assertEqual(status, "200 OK")
+        self.assertIn(plugin.PANELS[0]["title"], body)
+        self.assertEqual([c[2]["command"] for c in self.api.calls], list(plugin.PANELS[0]["reads"]))

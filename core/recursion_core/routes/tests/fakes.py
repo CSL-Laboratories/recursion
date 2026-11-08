@@ -76,6 +76,10 @@ def request(rid="r1", tenant="t1", engine="claude_code", model="claude-sonnet", 
     conn = {"kind": kind, "id": conn_id}
     if credential_env:
         conn["credential_env"] = credential_env
+    if engine == "claude_code" and kind == "subscription":
+        # The surface reports whether the user's settings carry an apiKeyHelper; unreported is a question.
+        route_extra.setdefault("api_key_helper", "absent")
+    route_extra = {k: v for k, v in route_extra.items() if v is not None}
     return {"contract": c.CONTRACT_VERSION, "request_id": rid, "tenant": tenant, "prompt": prompt,
             "deadline_s": deadline_s, "route": {"engine": engine, "model": model, "connection": conn, **route_extra}}
 

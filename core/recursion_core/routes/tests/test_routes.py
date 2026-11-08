@@ -56,7 +56,8 @@ class ContractShapeTest(unittest.TestCase):
         res = h.handle(request())
         self.assertEqual((res["status"], res["code"], res["text"]), ("ok", None, "hi"))
         self.assertEqual(set(res), {"contract", "request_id", "status", "code", "text", "limit", "events",
-                                    "detail", "retry_at", "breaker_effect"})
+                                    "detail", "retry_at", "breaker_effect", "limit_notice"})
+        self.assertIsNone(res["limit_notice"])
 
 
 class ClaudeCodeTest(unittest.TestCase):
@@ -70,10 +71,13 @@ class ClaudeCodeTest(unittest.TestCase):
         self.assertEqual(proc.sent[0]["message"]["content"][0]["text"], "do it")
         self.assertTrue(proc.stdin_closed)
 
-    def test_subscription_child_env_is_explicit_and_holds_no_credential(self) -> None:
+    def test_subscription_child_env_is_explicit_and_leaves_the_users_sign_in_alone(self) -> None:
+        # Lucas's correction (Nov 7 ~6:34pm PST): "Leave the user's own CLAUDE_CODE_OAUTH_TOKEN and /login
+        # alone." The name passes through as the user set it; the API key the parent holds does not.
         h = Harness([claude_ok()])
         h.handle(request())
-        self.assertEqual(h.launcher.calls[0]["env"], {"PATH": "/usr/bin", "HOME": "/home/op", "LANG": "C.UTF-8"})
+        self.assertEqual(h.launcher.calls[0]["env"], {"PATH": "/usr/bin", "HOME": "/home/op", "LANG": "C.UTF-8",
+                                                      "CLAUDE_CODE_OAUTH_TOKEN": "parent-oauth"})
 
     def test_api_key_route_gets_only_its_key(self) -> None:
         h = Harness([claude_ok()])

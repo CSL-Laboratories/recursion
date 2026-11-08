@@ -27,8 +27,28 @@ from recursion_core.routes import contract as c
 from recursion_core.routes.base import RouteAdapter, scalar
 from recursion_core.routes.launch import child_env
 
-# Anthropic credential names a Claude Code child never inherits; an API-key route adds its one key back.
-CLAUDE_CREDENTIAL_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
+# Lucas, Nov 7 ~6:34pm PST (correction to the Nov 8 briefing; replaces "refuse --bare, clear apiKeyHelper,
+# CLAUDE_CODE_OAUTH_TOKEN and CLAUDE_CODE_SIMPLE"): launch the unmodified ``claude`` binary; each run uses
+# the route the user picked and only that run's environment changes; nothing removes a sign-in method
+# from every run. Recursion never edits the user's Claude Code settings or credential files, never sets
+# DISABLE_LOGIN_COMMAND, and never sets, stores or reads CLAUDE_CODE_OAUTH_TOKEN itself.
+#
+# Subscription route: dropped for this run only, because they ignore or outrank the sign-in. The
+# federation variable names are not in repository evidence; any name not on the allowlist is dropped
+# anyway, so an unlisted federation variable never reaches a subscription run.
+SUBSCRIPTION_DROP_ENV = (
+    "CLAUDE_CODE_SIMPLE", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_PROFILE",
+    "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+)
+# The user's own sign-in and config location, passed through untouched (name copied, value never inspected).
+SUBSCRIPTION_KEEP_ENV = ("CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR")
+# API-key route: the run bills the user's key, so the sign-in token and the cloud switches stay out of
+# this run only. The key comes from custody (ANTHROPIC_API_KEY) or from the user's own apiKeyHelper.
+API_KEY_DROP_ENV = ("ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK",
+                    "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY")
+# Kept for callers that import the old name; it now means "names an API-key run never inherits".
+CLAUDE_CREDENTIAL_ENV = API_KEY_DROP_ENV + ("ANTHROPIC_API_KEY",)
+API_KEY_HELPER_STATES = ("absent", "present")
 
 
 class ClaudeCodeAdapter(RouteAdapter):
@@ -36,17 +56,69 @@ class ClaudeCodeAdapter(RouteAdapter):
 
     def __init__(self, *args, binary: str = "claude", **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        # Anthropic's own binary, unmodified: no wrapper name here. Its exact path, hash and version are
+        # the R2a launch check's job (CSL-732), not this adapter's.
+        if not isinstance(binary, str) or binary.rsplit("/", 1)[-1] != "claude":
+            raise ValueError("Claude Code routes launch the claude binary itself")
         self._binary = binary
 
     def argv(self, request: dict) -> list[str]:
-        model = request["route"]["model"]
+        route = request["route"]
+        kind = route["connection"]["kind"]
+        bare = route.get("bare", False)
+        if bare is not True and bare is not False:
+            raise c.RouteError(c.REQUEST_INVALID, "route.bare")
+        if bare and kind != "api_key":
+            # Subscription: --bare ignores the sign-in. Other methods: not confirmed, so not offered.
+            raise c.RouteError(c.LAUNCH_REFUSED, f"--bare is only allowed on the API-key route, not {kind}")
+        if kind == "subscription":
+            self._check_api_key_helper(route)
         # --verbose: stream-json output in print mode is documented to need it (unverified on this box).
-        return [self._binary, "-p", "--input-format", "stream-json", "--output-format", "stream-json",
-                "--verbose", "--model", model]
+        return [self._binary, *(["--bare"] if bare else []), "-p", "--input-format", "stream-json",
+                "--output-format", "stream-json", "--verbose", "--model", route["model"]]
 
     def env(self, request: dict) -> dict[str, str]:
-        cred = self.credential(request, ("ANTHROPIC_API_KEY",))
-        return child_env(self._parent_env, never=CLAUDE_CREDENTIAL_ENV, credential=cred)
+        conn = request["route"]["connection"]
+        kind = conn["kind"]
+        if kind == "subscription":
+            return child_env(self._parent_env, extra_names=SUBSCRIPTION_KEEP_ENV, never=SUBSCRIPTION_DROP_ENV)
+        if kind == "api_key":
+            never = API_KEY_DROP_ENV + ("ANTHROPIC_API_KEY",)
+            if conn.get("key_source") == "api_key_helper":
+                # The user's own apiKeyHelper in their settings supplies the key; Recursion adds none.
+                return child_env(self._parent_env, extra_names=("CLAUDE_CONFIG_DIR",), never=never)
+            cred = self.credential(request, ("ANTHROPIC_API_KEY",))
+            return child_env(self._parent_env, extra_names=("CLAUDE_CONFIG_DIR",), never=never, credential=cred)
+        if kind == "passthrough":
+            # Cloud providers (Bedrock, Vertex, Foundry) and any other built-in method the user picked:
+            # the user's environment passes through for this run, unchanged.
+            return dict(self._parent_env)
+        raise c.RouteError(c.LAUNCH_REFUSED, f"connection kind {kind} not supported for claude_code")
+
+    @staticmethod
+    def _check_api_key_helper(route: dict) -> None:
+        """An apiKeyHelper in the user's settings outranks the sign-in: show it and let the user pick.
+
+        The surface reports whether the user's settings carry one (``route.api_key_helper``); this adapter
+        never opens the settings. Present, or not reported, is a typed question, not a silent override.
+        The user answers with ``route.billing_ack = "api_key_helper"`` (run anyway, billing their API key)
+        or by picking the API-key route.
+        """
+        state = route.get("api_key_helper")
+        if state is not None and state not in API_KEY_HELPER_STATES:
+            raise c.RouteError(c.REQUEST_INVALID, "route.api_key_helper")
+        if state == "absent":
+            return
+        if state == "present" and route.get("billing_ack") == "api_key_helper":
+            return
+        if state == "present":
+            why = ("your Claude Code settings carry an apiKeyHelper, which outranks the sign-in: "
+                   "this run would bill your API key")
+        else:
+            why = ("whether your Claude Code settings carry an apiKeyHelper was not reported; if they do, "
+                   "this run would bill your API key")
+        raise c.RouteError(c.ROUTE_CHOICE_REQUIRED, why + "; choose: run anyway "
+                           "(billing_ack=api_key_helper), the API-key route, or cancel")
 
     def drive(self, process, request, deadline_at, events):
         rid, model = request["request_id"], request["route"]["model"]

@@ -40,10 +40,41 @@ engine), 11.2 (breaker, plan limits), Q12 (Claude subscription only inside Claud
   `codex -c check_for_update_on_startup=false app-server` and the adapter starts nothing else; a test runs
   48 turns over 72 fake minutes and checks every spawn. `daemon_config()` holds
   `updater.autoUpdateEnabled = false` and `check_daemon_config()` refuses anything else.
-- Child env: Codex never inherits `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN` or `OPENAI_API_KEY`; Claude Code
-  never inherits `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` or `CLAUDE_CODE_OAUTH_TOKEN`. An `api_key`
-  route gets back only the one key it selects, from the injected credential lookup. The full child-env
-  rules (B1, CSL-785, #320) are a separate module.
+- Child env: Codex never inherits `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN` or `OPENAI_API_KEY`; a Codex
+  subscription run uses Codex's own CLI login under `CODEX_HOME`, and Recursion holds no ChatGPT token.
+  An `api_key` route gets back only the one key it selects, from the injected credential lookup. The full
+  child-env rules (B1, CSL-785, #320) are a separate module.
+
+## Claude Code driver (Lucas's correction, Nov 7 ~6:34pm PST)
+
+This replaces the Nov 8 briefing sentence "Refuse --bare. Clear apiKeyHelper, CLAUDE_CODE_OAUTH_TOKEN and
+CLAUDE_CODE_SIMPLE from the engine environment." Each run uses the route the user picked, and only that
+run's environment changes:
+
+- `subscription`: no `--bare`. Dropped for the run: `CLAUDE_CODE_SIMPLE`, `ANTHROPIC_API_KEY`,
+  `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_PROFILE`, `CLAUDE_CODE_USE_BEDROCK` / `_VERTEX` / `_FOUNDRY`; any
+  other unlisted name (including federation variables, whose names are not in repository evidence) is
+  dropped by the allowlist. The user's own `CLAUDE_CODE_OAUTH_TOKEN` and `CLAUDE_CONFIG_DIR` pass through
+  untouched; `/login` is the engine's. If the user's settings carry an `apiKeyHelper` (reported by the
+  surface as `route.api_key_helper`; this adapter never opens settings), the result is
+  `route_choice_required`: the run would bill their API key, and they pick (`billing_ack`, the API-key
+  route, or cancel). Not reported is the same question.
+- `api_key`: the user's own key from custody (`ANTHROPIC_API_KEY`) or their own `apiKeyHelper`
+  (`key_source: "api_key_helper"`, no key added); `--bare` is allowed (`route.bare`).
+- `passthrough` (cloud providers and any other built-in method the user picks): the env passes through
+  unchanged for that run. `--bare` is not offered there (not confirmed).
+- The adapter never edits settings or credential files, never sets `DISABLE_LOGIN_COMMAND`, and never
+  sets, stores or reads `CLAUDE_CODE_OAUTH_TOKEN`. The binary is `claude` itself; its hash and version are
+  the R2a launch check's (CSL-732). The Commercial Terms review of this env scrub is still open in
+  csl-research.
+
+## Limits (`limits.py`)
+
+At a `plan_limit` or `breaker_open` result, the result carries a `limit_notice` (connection, engine,
+model, scope, reset time, choices). `route.limits` or the service default sets `on_limit`: `ask` (default:
+nothing else runs), `wait` (nothing else runs; re-submit at `reset_at`) or `fallback` (the user's own
+`fallback` routes in the user's order, each switch shown as a `fallback` event and `switched_to`).
+Nothing picks a route by itself; `fallback` with an empty list is refused.
 
 Lesson: [CSL-608](https://linear.app/csl-laboratories/issue/CSL-608) (Done research) found master's breaker
 keyed by engine, shared by every tenant and never reset. This module does not claim to have measured

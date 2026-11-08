@@ -10,9 +10,15 @@ Request::
      "deadline_s": 120.0,
      "route": {"engine": "claude_code" | "codex" | "pi" | "hermes" | "opencode",
                "model": "<model id>",
-               "connection": {"kind": "subscription" | "api_key", "id": "<login or key id>",
-                              "credential_env": "<name>"   # api_key only
+               "connection": {"kind": "subscription" | "api_key" | "passthrough", "id": "<login or key id>",
+                              "credential_env": "<name>",  # api_key, unless key_source is api_key_helper
+                              "key_source": "custody" | "api_key_helper",  # claude_code api_key only
+                              "method": "<built-in method>",  # passthrough (claude_code only)
                               "metered_per_model": false},
+               "bare": false,                             # claude_code: API-key route only
+               "api_key_helper": "absent" | "present",    # claude_code subscription: reported by the surface
+               "billing_ack": "api_key_helper",           # the user chose to run billing their API key
+               "limits": {"on_limit": "ask" | "wait" | "fallback", "fallback": [<route>, ...]},
                "profile": {...}}}                         # pi/hermes/opencode only (B3)
 
 Result::
@@ -20,11 +26,12 @@ Result::
     {"contract", "request_id", "status": "ok" | "error", "code": None | <CODES>, "text",
      "limit": None | <limit signal>, "events": [<event>], "detail": str,
      "retry_at": None | float,     # when a BREAKER_OPEN / PROBE_IN_FLIGHT refusal may clear
-     "breaker_effect": "none" | "opened" | "short_fault" | "closed" | "probe_released"}
+     "breaker_effect": "none" | "opened" | "short_fault" | "closed" | "probe_released",
+     "limit_notice": None | <limits.notice>}   # shown to the user at a limit; never a silent switch
 
 Event::
 
-    {"kind": "retry" | "usage" | "limit" | "text", "source": "<vendor field it was read from>", "data": {...}}
+    {"kind": "retry" | "usage" | "limit" | "text" | "fallback", "source": "<vendor field it was read from>", "data": {...}}
 
 Limit signal (the only thing that can trip a connection's breaker)::
 
@@ -55,6 +62,7 @@ SUBSCRIPTION_ROUTE_REFUSED = "subscription_route_refused"  # B3, from subscripti
 LAUNCH_REFUSED = "launch_refused"  # e.g. a Codex config that would enable the updater (B11)
 REQUEST_INVALID = "request_invalid"
 ENGINE_UNKNOWN = "engine_unknown"
+ROUTE_CHOICE_REQUIRED = "route_choice_required"  # the user must pick (e.g. apiKeyHelper outranks sign-in)
 
 CODES = frozenset(
     {
@@ -71,6 +79,7 @@ CODES = frozenset(
         LAUNCH_REFUSED,
         REQUEST_INVALID,
         ENGINE_UNKNOWN,
+        ROUTE_CHOICE_REQUIRED,
     }
 )
 # Codes that come from the engine run itself (as opposed to a refusal before launch).
@@ -78,7 +87,7 @@ ENGINE_CODES = frozenset({PLAN_LIMIT, SHORT_FAULT, ENGINE_ERROR, AUTH_FAILED, PR
 
 ENGINES = ("claude_code", "codex", "pi", "hermes", "opencode")
 PROFILE_ENGINES = ("pi", "hermes", "opencode")
-CONNECTION_KINDS = ("subscription", "api_key")
+CONNECTION_KINDS = ("subscription", "api_key", "passthrough")
 
 
 class RouteError(Exception):
@@ -116,8 +125,20 @@ def validate_request(request: object) -> dict:
         raise RouteError(REQUEST_INVALID, "route.connection.kind")
     if not isinstance(conn.get("id"), str) or not conn["id"]:
         raise RouteError(REQUEST_INVALID, "route.connection.id")
-    if conn["kind"] == "api_key" and not (isinstance(conn.get("credential_env"), str) and conn["credential_env"]):
+    key_source = conn.get("key_source", "custody")
+    if key_source not in ("custody", "api_key_helper") or (key_source == "api_key_helper" and (
+            conn["kind"] != "api_key" or engine != "claude_code")):
+        raise RouteError(REQUEST_INVALID, "route.connection.key_source")
+    if conn["kind"] == "api_key" and key_source == "custody" and not (
+            isinstance(conn.get("credential_env"), str) and conn["credential_env"]):
         raise RouteError(REQUEST_INVALID, "route.connection.credential_env")
+    if conn["kind"] == "passthrough" and (engine != "claude_code" or not (
+            isinstance(conn.get("method"), str) and conn["method"])):
+        raise RouteError(REQUEST_INVALID, "route.connection.method")
+    if "limits" in route:
+        from recursion_core.routes.limits import validate_limits  # local: limits imports this module
+
+        validate_limits(route["limits"])
     if engine in PROFILE_ENGINES and not isinstance(route.get("profile"), Mapping):
         raise RouteError(REQUEST_INVALID, "route.profile")
     out = dict(request)
@@ -162,6 +183,7 @@ def result(request_id: str, code: str | None, *, text: str = "", limit: dict | N
         "detail": detail,
         "retry_at": retry_at,
         "breaker_effect": "none",
+        "limit_notice": None,
     }
 
 

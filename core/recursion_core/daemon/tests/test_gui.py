@@ -87,12 +87,12 @@ class LoopbackTests(TestCase):
     def test_cli_registers_explicit_plugin_and_checks_runtime_after_import(self):
         plugin = {"panels": []}
         with mock.patch.object(entry, "require_free_threaded") as check, \
-             mock.patch.object(entry.importlib, "import_module") as load, \
+             mock.patch.object(entry, "importlib") as imports, \
              mock.patch.object(entry, "main") as main, \
              mock.patch("sys.argv", ["daemon", "--plugin", "cockpit.gui:registry", "--gui-port", "0"]):
-            load.return_value = SimpleNamespace(registry=lambda: plugin)
+            imports.import_module.return_value = SimpleNamespace(registry=lambda: plugin)
             entry.cli()
-            load.assert_called_once_with("cockpit.gui")
+            imports.import_module.assert_called_once_with("cockpit.gui")
             main.assert_called_once_with(plugins=[plugin], port=0)
             self.assertEqual(check.call_count, 3)
 

@@ -157,6 +157,11 @@ class ProbeSummary:
     detail: str
     error_count: int = 0
     targets: str = ""
+    # Attempts whose error was a launch failure (engine process never appeared,
+    # store writer failed), counted per attempt so a later success cannot hide
+    # one; ``launch_failure_detail`` keeps the first such diagnostic.
+    launch_failure_count: int = 0
+    launch_failure_detail: str = ""
 
     @property
     def open_count(self) -> int:
@@ -362,6 +367,22 @@ def store_writer_script(path: str) -> str:
     )
 
 
+def _launch_timeout(argv: Sequence[str]) -> float:
+    """Timeout for one detection launch: 8 s, plus the sleep itself for ``sleep N``.
+
+    The launch is the exact measured command (``sleep 8``); only the runner's
+    timeout grows, so an authorised sleep is not reported as rc 124.
+    """
+
+    base = 8.0
+    if len(argv) == 2 and argv[0] == "sleep":
+        try:
+            return base + float(argv[1])
+        except ValueError:
+            return base
+    return base
+
+
 def _probe_sudo_target(run_fn: RunFn, our_uid: int) -> tuple[str | None, int | None, str]:
     """First candidate sudo reaches as a non-root other uid for every launch
     the measured path actually runs. Independent of ``sudo -n true`` (root)."""
@@ -382,7 +403,9 @@ def _probe_sudo_target(run_fn: RunFn, our_uid: int) -> tuple[str | None, int | N
             store = str(Path(tmp) / "probe.secret")
             launches = SUDO_REQUIRED_COMMANDS + (("python3", "-c", store_writer_script(store)),)
             for argv in launches:
-                check = run_fn(("sudo", "-n", "-u", user, "--", *argv), 8.0)
+                check = run_fn(
+                    ("sudo", "-n", "-u", user, "--", *argv), _launch_timeout(argv)
+                )
                 if check.returncode != 0:
                     err = (check.stderr or check.stdout).strip().replace("\n", " ")
                     shown = " ".join(argv[:2]) if argv and argv[0] == "python3" else " ".join(argv)
@@ -710,6 +733,8 @@ class _Tally:
         self.blocked = {"proc_pid_root": 0, "ptrace": 0, "abs_store_read": 0}
         self.errors = {"proc_pid_root": 0, "ptrace": 0, "abs_store_read": 0}
         self.details = {"proc_pid_root": "", "ptrace": "", "abs_store_read": ""}
+        self.launch_failures = {"proc_pid_root": 0, "ptrace": 0, "abs_store_read": 0}
+        self.launch_details = {"proc_pid_root": "", "ptrace": "", "abs_store_read": ""}
         self.targets: dict[str, dict[str, int]] = {
             "proc_pid_root": {},
             "ptrace": {},
@@ -720,6 +745,10 @@ class _Tally:
         result, detail = outcome
         if result is None:
             self.errors[name] += 1
+            if _is_launch_failure(name, detail):
+                self.launch_failures[name] += 1
+                if not self.launch_details[name]:
+                    self.launch_details[name] = detail
         elif result:
             self.blocked[name] += 1
         self.details[name] = detail
@@ -738,6 +767,8 @@ class _Tally:
                 self.details[name],
                 self.errors[name],
                 targets(name),
+                self.launch_failures[name],
+                self.launch_details[name],
             )
             for name in ("proc_pid_root", "ptrace", "abs_store_read")
         )
@@ -1022,32 +1053,50 @@ def detect_backends(
     return (setuid_backend, sudo_backend, systemd_backend, subuid_backend)
 
 
-def _launch_failure(probes: Sequence[ProbeSummary]) -> str | None:
-    """Return a reason when probes show the backend could not launch or write.
+def _is_launch_failure(name: str, detail: str) -> bool:
+    """True when one probe error means the backend could not launch or write.
 
     Process-not-found and store-writer failures are permission or availability
     problems, not F21 channel outcomes (blocked vs open). Other probe errors,
     such as ptrace being unavailable on the host, stay with the summaries.
     """
 
-    reasons: list[str] = []
-    for probe in probes:
-        if probe.error_count <= 0:
-            continue
-        detail = probe.detail or ""
-        if probe.name == "abs_store_read" and "writer_" in detail:
-            reasons.append(
-                f"{probe.name} writer failed on {probe.error_count}/{probe.n} "
-                f"attempts: {detail}"
-            )
-        elif probe.name in {"proc_pid_root", "ptrace"} and (
+    detail = detail or ""
+    if name == "abs_store_read":
+        return "writer_" in detail
+    if name in {"proc_pid_root", "ptrace"}:
+        return (
             "not found" in detail
             or "no process with uid" in detail
             or "no MainPID" in detail
-        ):
+        )
+    return False
+
+
+def _launch_failure(probes: Sequence[ProbeSummary]) -> str | None:
+    """Return a reason when any attempt shows the backend could not launch or write.
+
+    Uses the per-attempt launch-failure count, so a failure on an early attempt
+    is not hidden by a later success. Summaries built without that count fall
+    back to classifying the last detail.
+    """
+
+    reasons: list[str] = []
+    for probe in probes:
+        count = probe.launch_failure_count
+        detail = probe.launch_failure_detail
+        if count <= 0 and probe.error_count > 0 and _is_launch_failure(probe.name, probe.detail):
+            count, detail = probe.error_count, probe.detail
+        if count <= 0:
+            continue
+        if probe.name == "abs_store_read":
+            reasons.append(
+                f"{probe.name} writer failed on {count}/{probe.n} attempts: {detail}"
+            )
+        else:
             reasons.append(
                 f"{probe.name} engine process did not appear on "
-                f"{probe.error_count}/{probe.n} attempts: {detail}"
+                f"{count}/{probe.n} attempts: {detail}"
             )
     if not reasons:
         return None

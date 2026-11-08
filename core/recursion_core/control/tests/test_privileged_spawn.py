@@ -45,6 +45,7 @@ from recursion_core.control.privileged_spawn import (
     SUDO_REQUIRED_COMMANDS,
     systemd_unit_main_pid,
 )
+from recursion_core.control.privileged_spawn import _Tally, _launch_failure
 
 LIVE_ENV = "RECURSION_LIVE_HOST_PROBES"
 LIVE = os.environ.get(LIVE_ENV) == "1"
@@ -575,6 +576,93 @@ class StoreProbeErrorTests(unittest.TestCase):
         self.assertEqual(summary.open_count, 0)
         self.assertTrue(ProbeSummary("ptrace", 20, 20, "denied", 0).blocked)
         self.assertFalse(ProbeSummary("ptrace", 20, 0, "x", 20).blocked)
+
+
+class DevinReview5818620711Tests(unittest.TestCase):
+    """Devin review 5818620711 on c46a151f (r4506887696, r4506887763)."""
+
+    def test_sudo_sleep_launch_gets_a_timeout_longer_than_the_sleep(self) -> None:
+        # r4506887696: a runner that honours its timeout returns 124 when the
+        # command needs longer than the timeout; sleep 8 needs more than 8 s.
+        allowed = _nobody_allows(*ALL_REQUIRED)
+        policy = _sudo_policy(allowed)
+        seen: dict[tuple[str, ...], float] = {}
+
+        def run(cmd, timeout: float) -> ProcResult:
+            key = tuple(cmd)
+            seen[key] = timeout
+            if key[-2:] == SLEEP_PROBE_ARGV and timeout <= float(SLEEP_PROBE_ARGV[1]):
+                return ProcResult(124, "", "timeout")
+            return policy(cmd, timeout)
+
+        backends = detect_backends(
+            facts=_facts(sudo_n_true=False),
+            run_fn=run,
+            helper_paths=("/tmp/csl734-no-such-helper",),
+            env={},
+        )
+        sudo = next(b for b in backends if b.name == "sudo")
+        self.assertTrue(sudo.available, sudo.reason)
+        self.assertEqual(sudo.target_user, "nobody")
+        sleep_key = ("sudo", "-n", "-u", "nobody", "--", *SLEEP_PROBE_ARGV)
+        self.assertGreater(seen[sleep_key], float(SLEEP_PROBE_ARGV[1]))
+        # The probe command itself is unchanged: exactly the measured launch.
+        self.assertIn(sleep_key, seen)
+
+    def test_earlier_writer_failure_is_kept_when_the_last_attempt_succeeds(self) -> None:
+        # r4506887763: first of 20 writer calls fails, the other 19 block.
+        tally = _Tally()
+        tally.add("abs_store_read", (None, "writer_failed rc=1 err=denied"), "0600 store owner uid=65534")
+        for _ in range(DEFAULT_N - 1):
+            tally.add("abs_store_read", (True, "PermissionError"), "0600 store owner uid=65534")
+        summary = next(s for s in tally.summaries(DEFAULT_N) if s.name == "abs_store_read")
+        self.assertEqual(summary.error_count, 1)
+        self.assertEqual(summary.detail, "PermissionError")  # last detail, as before
+        self.assertEqual(summary.launch_failure_count, 1)
+        self.assertIn("writer_failed", summary.launch_failure_detail)
+        reason = _launch_failure((summary,))
+        self.assertIsNotNone(reason)
+        self.assertIn("writer failed on 1/20", reason)
+
+    def test_earlier_missing_engine_process_is_kept(self) -> None:
+        tally = _Tally()
+        tally.add("ptrace", (None, "no process with uid 65534 under launcher pid 7"), "not found")
+        for _ in range(DEFAULT_N - 1):
+            tally.add("ptrace", (True, "EPERM"), "sleep uid=65534")
+        summary = next(s for s in tally.summaries(DEFAULT_N) if s.name == "ptrace")
+        self.assertEqual(summary.launch_failure_count, 1)
+        self.assertIn("engine process did not appear on 1/20", _launch_failure((summary,)))
+
+    def test_other_probe_errors_are_not_launch_failures(self) -> None:
+        tally = _Tally()
+        tally.add("ptrace", (None, "ptrace unavailable: ENOSYS"), "sleep uid=65534")
+        for _ in range(DEFAULT_N - 1):
+            tally.add("ptrace", (True, "EPERM"), "sleep uid=65534")
+        summary = next(s for s in tally.summaries(DEFAULT_N) if s.name == "ptrace")
+        self.assertEqual(summary.launch_failure_count, 0)
+        self.assertIsNone(_launch_failure((summary,)))
+
+    def test_evaluate_host_demotes_on_one_early_launch_failure(self) -> None:
+        tally = _Tally()
+        tally.add("abs_store_read", (None, "writer_failed rc=1 err=denied"), "0600 store owner uid=65534")
+        for _ in range(DEFAULT_N - 1):
+            tally.add("abs_store_read", (True, "PermissionError"), "0600 store owner uid=65534")
+            tally.add("proc_pid_root", (True, "EACCES"), "sleep uid=65534")
+            tally.add("ptrace", (True, "EPERM"), "sleep uid=65534")
+        tally.add("proc_pid_root", (True, "EACCES"), "sleep uid=65534")
+        tally.add("ptrace", (True, "EPERM"), "sleep uid=65534")
+        probes = tally.summaries(DEFAULT_N)
+        overhead = Overhead(DEFAULT_N, 0.01, 0.02, 0.005, 0.03, ("sudo",))
+        evaluation = evaluate_host(
+            n=DEFAULT_N,
+            facts=_facts(sudo_n_true=True),
+            backends=EvaluateHostInjectionTests._backends(self),
+            measure_fn=lambda backend, n: overhead,
+            probe_fn=lambda backend, n: probes,
+        )
+        self.assertIn("writer failed on 1/20", evaluation.errors["sudo"])
+        self.assertEqual(evaluation.selected.name, "managed_login_folder")
+        self.assertTrue(evaluation.selected.beta)
 
 
 @unittest.skipUnless(LIVE, f"live host probes run only with {LIVE_ENV}=1")

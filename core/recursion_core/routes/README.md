@@ -25,7 +25,9 @@ engine), 11.2 (breaker, plan limits), Q12 (Claude subscription only inside Claud
   vendor bucket. Never keyed by engine id or tenant.
 - `profile_route.py`: Pi, Hermes and OpenCode routes; every launch goes through
   `recursion_core.subscription_routes.guard_then_spawn` (B3, CSL-786), so a Claude-subscription provider is
-  refused as `subscription_route_refused` before the launcher is called.
+  refused as `subscription_route_refused` before the launcher is called. Pi and Hermes also pass
+  `route.wrapper` (the measured launcher and package pin); without it the launch is
+  `wrapper_pin_missing`. The launcher receives the env `check_route` accepted.
 - `launch.py`: the injected launcher / process interface, `require_free_threaded()` (refuses a GIL build;
   the daemon calls it before starting processes and after each plugin load) and `child_env()` (explicit
   env from an allowlist; never `os.environ`).

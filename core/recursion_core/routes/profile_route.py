@@ -54,10 +54,11 @@ class ProfileRouteAdapter(RouteAdapter):
                 return c.result(rid, c.LAUNCH_REFUSED, detail=f"no credential for {conn['id']}")
             env[name] = value
         try:
+            # Pi and Hermes refuse without the wrapper pin CSL-786 measures. OpenCode leaves it unset.
             _decision, process = guard_then_spawn(
                 self._launcher, self._argv(request), self.engine, dict(route["profile"]), env,
                 route_home=home if isinstance(home, str) else "", parent_env=self._parent_env,
-                operator_home=self._operator_home,
+                operator_home=self._operator_home, wrapper=route.get("wrapper"),
             )
         except SubscriptionRouteRefused as err:
             return c.result(rid, c.SUBSCRIPTION_ROUTE_REFUSED, detail=err.cause)

@@ -236,8 +236,25 @@ class Application:
         warn = ""
         if result.get("order_submitted") is not False and command in ACTIONS:
             warn = '<p role="alert">Contract problem: the response does not state order_submitted=false.</p>'
-        return ('<p role="status">Status reported by the control API: <strong>%s</strong></p>%s%s'
-                % (escape(status), warn, self._response_view(data if shown is None else shown)))
+        return ('<p role="status">Status reported by the control API: <strong>%s</strong></p>%s%s%s'
+                % (escape(status), self._visibility(data), warn,
+                   self._response_view(data if shown is None else shown)))
+
+    @staticmethod
+    def _visibility(data: dict) -> str:
+        """O7's refusal, uncertainty, stale and reconciliation states, from the unfiltered response.
+
+        Rendered as text on every O7 view, so a venue panel's filter never hides them. Only
+        text values are shown; anything else is reported as not text, never passed through.
+        """
+        vis = data.get("visibility")
+        if type(vis) is not dict:
+            return '<p role="status">Visibility: not reported by the control API.</p>'
+        items = "".join("<li>%s: <strong>%s</strong></li>" % (
+            escape(str(k)), escape(v) if type(v) is str else "reported, not as text")
+            for k, v in sorted(vis.items(), key=lambda kv: str(kv[0])))
+        return ('<section aria-label="Visibility"><p role="status">Visibility reported by the '
+                "control API:</p><ul>%s</ul></section>" % items)
 
     def _read(self, env: dict) -> tuple[str, str]:
         form = self._query(env)
@@ -263,12 +280,15 @@ class Application:
                 body += ('The control API\'s O7 v0 reads take no venue argument; returned data '
                          'is filtered to <code>%s</code> before display and anything not labelled '
                          'with it is withheld, except unlabelled response-level errors and '
-                         'provenance; venue data stays behind the venue-data switch.</p>'
+                         'provenance. The GUI redacts only fields the control API marks with '
+                         'a venue-data switch that is not on; O7 v0 reports no switch state for '
+                         'venue-labelled rows, so their clearance is the control API\'s to '
+                         'enforce.</p>'
                          % escape(panel["venue"]))
             else:
                 body += ('The control API\'s O7 v0 reads take no venue argument, so the results '
-                         'below are not scoped to this venue; venue data stays behind the '
-                         'venue-data switch.</p>')
+                         'below are not scoped to this venue. The GUI redacts only fields the '
+                         'control API marks with a venue-data switch that is not on.</p>')
         elif panel.get("venue") is not None:
             body += ('<p role="note">The control API\'s O7 v0 reads take no venue argument; '
                      'returned data is filtered to <code>%s</code> before display and anything '

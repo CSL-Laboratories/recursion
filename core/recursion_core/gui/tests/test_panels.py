@@ -177,6 +177,42 @@ class PanelTests(GuiHarness):
         mixed["rows"][0]["venue_data_switch"] = "on"
         self.assertIn("kalshi-switch-gated", self.request("GET", "/panel", query="id=k")[2])
 
+    def test_o7_visibility_shows_on_a_venue_panel(self):
+        self.mount([{"id": "k", "title": "Kalshi", "reads": ["operator.positions.inspect"],
+                     "venue": "kalshi_demo"}])
+        self.api.extra["operator.positions.inspect"] = {"visibility": {
+            "uncertainty": "visible", "refusal": "visible", "stale_data": "visible",
+            "reconciliation": "unreconciled_visible", "detail": {"venue": "stock", "px": "VIS-LEAK-1"}}}
+        body = self.request("GET", "/panel", query="id=k")[2]
+        for shown in ("stale_data: <strong>visible</strong>", "refusal: <strong>visible</strong>",
+                      "uncertainty: <strong>visible</strong>",
+                      "reconciliation: <strong>unreconciled_visible</strong>",
+                      "detail: <strong>reported, not as text</strong>", "KXDEMO-1"):
+            self.assertIn(shown, body)
+        for hidden in ("AAPL", "VIS-LEAK-1"):
+            self.assertNotIn(hidden, body)
+        self.api.extra["operator.positions.inspect"] = {"visibility": None}
+        self.assertIn("Visibility: not reported by the control API.",
+                      self.request("GET", "/panel", query="id=k")[2])
+
+    def test_o7_shaped_venue_rows_are_not_switch_gated_by_the_gui(self):
+        # O7 v0 labels rows with `venue` and reports no switch state; the GUI only redacts
+        # `venue_data` fields the control API marks, so clearance of these rows is the
+        # control API's. This pins that behaviour and the panel note that states it.
+        self.mount([{"id": "k", "title": "Kalshi", "reads": ["operator.positions.inspect"],
+                     "venue": "kalshi_demo", "venue_use": "kalshi_demo:own_trading"}])
+        self.api.calls.clear()
+        body = self.request("GET", "/panel", query="id=k")[2]
+        self.assertIn("KXDEMO-1", body)
+        self.assertNotIn("AAPL", body)
+        self.assertNotIn("withheld: venue data switch is off", body)
+        self.assertIn("O7 v0 reports no switch state for venue-labelled rows", body)
+        self.assertNotIn("venue data stays behind the venue-data switch", body)
+        self.assertEqual([c[2]["arguments"] for c in self.api.calls], [{}])
+        read = self.request("GET", "/read", query="command=operator.positions.inspect")[2]
+        self.assertIn("KXDEMO-1", read)
+        self.assertIn("stale_data: <strong>absent_not_hidden</strong>", read)
+
     def test_real_cockpit_registry_renders(self):
         try:
             plugin = importlib.import_module("cockpit.gui.panels")

@@ -312,3 +312,35 @@ class LeftoverBotFindingsTest(unittest.TestCase):
                 self.assertTrue(any("not named here" in r for r in found) or
                                 all(run["run_id"] in "".join(found) for run in app.runs), (label, rows))
 
+    def test_two_row_terminal_keeps_the_error_and_the_prompt(self) -> None:
+        # 4517702948: at two rows a real error was dropped so the condition row could stay.
+        driver = FakeDriver(confirm_answers=[POPULATED])
+        driver.start_run()
+        app = TuiApp(driver.api, clock=Clock(), environ={"NO_COLOR": "1"}, width=80, height=2)
+        app.open()
+        app.command("stop nope")
+        rows = screen(app)
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(any(r.startswith("error 1:") for r in rows), rows)
+        self.assertTrue(rows[-1].startswith("recursion:"), rows)
+        self.assertTrue(any(ev.event_type == "condition" and ev.text.startswith("REFUSED:") for ev in app.log),
+                        "the condition the frame dropped stays in the log")
+
+    def test_unreconciled_head_counts_only_ids_that_fit(self) -> None:
+        # 4517703119: the no-spare-row heading put a long disclaimer before the run id, so clipping
+        # hid every id, and a wider heading still said both runs were unnamed.
+        app = pending_stops(2, stale=True, width=80, height=6)
+        text = "\n".join(block_rows(screen(app), p.UNRECONCILED))
+        self.assertIn("run-1", text)
+        self.assertIn("run-2", text)
+        self.assertNotIn("not named", text)
+        app = pending_stops(2, stale=True, real_ids=True, width=80, height=6)
+        ids = [run["run_id"] for run in app.runs]
+        text = "\n".join(block_rows(screen(app), p.UNRECONCILED))
+        self.assertEqual([i for i in ids if i in text], ids[:1], text)
+        self.assertIn("1 more not named here", text)
+        self.assertNotIn("2 not named", text)
+        app.resize(160, 6)
+        text = "\n".join(block_rows(screen(app), p.UNRECONCILED))
+        self.assertTrue(all(i in text for i in ids), text)
+        self.assertNotIn("not named", text)

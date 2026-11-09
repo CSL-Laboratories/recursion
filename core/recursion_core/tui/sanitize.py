@@ -1,22 +1,27 @@
 """Untrusted engine text to inert display text (CSL-799, candidate; fixtures UI-10, RJ-F21).
 
 Engine output is data. ``OutputSanitizer`` is a streaming parser: ESC, CSI, OSC (including OSC 52
-clipboard and OSC 0/2 titles), DCS, SOS, PM, APC, their C1 forms, other C0/C1 controls and bidi or
-invisible format characters never reach the terminal. Each is replaced by a visible marker such as
-``⟦OSC 52⟧`` so nothing is hidden either. Parser state carries across chunks, so splitting the same bytes
-at any point gives the same text. A control string longer than ``MAX_SEQ`` is cut, marked ``overlong`` and
-the parser returns to text, so a missing terminator cannot swallow later output.
+clipboard and OSC 0/2 titles), DCS, SOS, PM, APC, their C1 forms, other C0/C1 controls, bidi controls,
+and other invisible characters never reach the terminal. Each is replaced by a visible marker such as
+``⟦OSC 52⟧`` so nothing is hidden either. Invisible characters are every Unicode format (``Cf``),
+private-use (``Co``) and unassigned (``Cn``) character, plus variation selectors and the blank Hangul
+fillers, which are not in those categories but render as nothing. Parser state carries across chunks,
+so splitting the same bytes at any point gives the same text. A control string longer than ``MAX_SEQ``
+is cut, marked ``overlong`` and the parser returns to text, so a missing terminator cannot swallow
+later output.
 """
 
 from __future__ import annotations
 
 import codecs
-import re
 import unicodedata
 
 MAX_SEQ = 4096
 
-_SPECIAL = re.compile("[\x00-\x1f\x7f-\x9f؜​-‏ -‮⁠-⁩﻿]")
+# Not Cf/Co/Cn, but blank or invisible. U+034F and U+FE0F are the code points measured in the
+# t1435u review; the rest of each variation-selector block is the same mechanism. U+115F and
+# U+3164 are the blank Hangul fillers (t1435u and bot review 4503921323).
+_EXTRA = frozenset("\u034f\u115f\u3164")
 _STRING_INTRO = {"]": "OSC", "P": "DCS", "X": "SOS", "^": "PM", "_": "APC"}
 _C1_STRING = {"\x9d": "OSC", "\x90": "DCS", "\x98": "SOS", "\x9e": "PM", "\x9f": "APC"}
 _NAMED = {"\x07": "BEL", "\x08": "BS", "\x7f": "DEL", "\x0b": "VT", "\x0c": "FF", "\x18": "CAN", "\x1a": "SUB"}
@@ -26,6 +31,34 @@ _GROUND, _ESC, _ESC_INT, _CSI, _STR, _STR_ESC = range(6)
 
 def _marker(name: str) -> str:
     return f"⟦{name}⟧"
+
+
+def _marked(ch: str) -> bool:
+    """True when ``ch`` must become a marker instead of reaching the terminal.
+
+    Newlines, tabs, CR and ESC are marked too; ``_ground`` still gives them their own handling.
+    """
+
+    o = ord(ch)
+    if o < 0x20 or o == 0x7F or 0x80 <= o <= 0x9F:
+        return True
+    if 0xFE00 <= o <= 0xFE0F or 0xE0100 <= o <= 0xE01EF:
+        return True
+    if o < 0x80:
+        return False
+    if ch in _EXTRA:
+        return True
+    return unicodedata.category(ch) in ("Cf", "Co", "Cn")
+
+
+def _next_marked(text: str, start: int) -> int:
+    n = len(text)
+    i = start
+    while i < n:
+        if _marked(text[i]):
+            return i
+        i += 1
+    return n
 
 
 def _char_marker(ch: str) -> str:
@@ -53,8 +86,7 @@ class OutputSanitizer:
         i, n = 0, len(text)
         while i < n:
             if self._state == _GROUND and not self._cr:
-                m = _SPECIAL.search(text, i)
-                end = m.start() if m else n
+                end = _next_marked(text, i)
                 if end > i:  # fast path: plain text is copied as is
                     out.append(text[i:end])
                     i = end
@@ -122,7 +154,7 @@ class OutputSanitizer:
                 self._after_esc(ch, out)
 
     def _ground(self, ch: str, out: list[str]) -> None:
-        if not _SPECIAL.match(ch):
+        if not _marked(ch):
             out.append(ch)
         elif ch == "\n":
             out.append("\n")

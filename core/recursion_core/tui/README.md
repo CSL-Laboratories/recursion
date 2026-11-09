@@ -21,7 +21,8 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
 - `app.py`: `TuiApp` (view state, keys, frame, inline live rows, all fed through the log) and `Loop`
   (runs it on a thread for a real terminal).
 - `sanitize.py`: engine output is untrusted. A streaming parser removes ESC, CSI, OSC (52 clipboard,
-  0/2 title, 8 link), DCS, SOS, PM, APC, C0/C1 controls and bidi or invisible format characters, and
+  0/2 title, 8 link), DCS, SOS, PM, APC, C0/C1 controls, bidi controls, and other invisible characters
+  (Unicode format, private-use and unassigned, variation selectors, and the blank Hangul fillers), and
   shows each as a visible marker such as `⟦OSC 52⟧`. Its state carries across chunk boundaries.
 - `view.py`: a frame is a list of `(text, style)` rows. It renders as plain text, as one full-screen
   ANSI repaint, or through `InlinePainter`. Colour is only decoration and is off under `NO_COLOR`.

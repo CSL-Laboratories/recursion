@@ -32,8 +32,10 @@ from recursion_core.tui.view import Row, color_enabled
 
 Dispatch = Callable[[str, dict, Callable[[str, dict, dict], None]], None]
 OUTPUT_LINES = 2000  # per run; older engine lines leave the view (the run's own record is elsewhere)
+PARTIAL_CAP = 8192  # unfinished line with no newline; older cells are marked, not stored
 RUN_ROWS = 5
 CONDITION_ROWS = 4
+_TRUNCATED = "⟦truncated⟧"
 
 
 def _fmt(params: Mapping) -> str:
@@ -44,6 +46,7 @@ class _Output:
     def __init__(self, cap: int, run_id: str) -> None:
         self.lines: collections.deque[str] = collections.deque(maxlen=cap)
         self.partial = ""
+        self.partial_cut = False
         self.sanitizer = OutputSanitizer()
         self.events = 0
         self.dropped = 0
@@ -54,7 +57,21 @@ class _Output:
 
         self.events += 1
         chunk = self.sanitizer.feed(text)
-        *done, self.partial = (self.partial + chunk).split("\n")
+        # The truncation marker is display text, not part of the engine line, so a later chunk joins
+        # the retained tail (bot review 4503920972).
+        was_cut = self.partial_cut
+        body = self.partial[len(_TRUNCATED):] if was_cut else self.partial
+        *done, partial = (body + chunk).split("\n")
+        if was_cut and done:
+            done[0] = _TRUNCATED + done[0]
+        keep = PARTIAL_CAP - len(_TRUNCATED)
+        if len(partial) > keep:
+            self.dropped += len(partial) - keep
+            partial = _TRUNCATED + partial[-keep:]
+            self.partial_cut = True
+        else:
+            self.partial_cut = False
+        self.partial = partial
         self.lines.extend(done)
         return chunk, done
 
@@ -87,7 +104,9 @@ class TuiApp:
         self.selected: str | None = None
         self.attached: str | None = None
         self.snapshot_at: float | None = None
-        self.refresh_failed: str | None = None
+        self.refresh_failed: str | None = None  # last run.list read failed
+        self.status_refresh_failed: str | None = None  # last run.status read failed
+        self.list_stale = False  # last successful run.list was marked stale; only a fresh list clears it
         self.last: dict | None = None
         self.last_method: str | None = None
         self._answer_keyed: list[tuple[str, str, str]] = []
@@ -169,11 +188,23 @@ class TuiApp:
             if code == "ok" and isinstance(answer.get("runs"), list):
                 self.runs = [r for r in answer["runs"] if isinstance(r, dict)]
                 self.snapshot_at, self.refresh_failed = self._clock(), None
+                # A stale list stays stale until a later list is not. A status answer must not clear it
+                # (bot review 4503920848).
+                self.list_stale = answer.get("stale") is True
                 ids = [str(r.get("run_id")) for r in self.runs]
                 if self.selected not in ids:
                     self.selected = ids[0] if ids else None
             else:
                 self.refresh_failed = f"run.list answered {field(code)}"
+        elif method == "run.status":
+            # An unavailable status stays failed until a later status succeeds. A refusal is an answer,
+            # not a failed read, and a successful list must not clear it (bot review 4503920903).
+            if code == "ok":
+                self.status_refresh_failed = None
+                if isinstance(answer.get("run"), dict):
+                    self._merge(answer["run"])
+            elif code == p.UNAVAILABLE:
+                self.status_refresh_failed = f"run.status answered {field(code)}"
         elif code == "ok" and isinstance(answer.get("run"), dict):
             self._merge(answer["run"])
         elif code in ("stopped", "pending") and isinstance(answer.get("run_id"), str):
@@ -298,7 +329,8 @@ class TuiApp:
     # -- derived state --------------------------------------------------------------------------
     @property
     def stale(self) -> bool:
-        if self.refresh_failed or any(label == p.STALE for label, _ in self.answer_conditions):
+        if (self.refresh_failed or self.status_refresh_failed or self.list_stale
+                or any(label == p.STALE for label, _ in self.answer_conditions)):
             return True
         return self.snapshot_at is not None and self._clock() - self.snapshot_at > self.stale_after_s
 
@@ -313,6 +345,10 @@ class TuiApp:
         reasons = []
         if self.refresh_failed:
             reasons.append(f"refresh failed: {self.refresh_failed}")
+        if self.status_refresh_failed:
+            reasons.append(f"refresh failed: {self.status_refresh_failed}")
+        if self.list_stale:
+            reasons.append("run.list answer was stale")
         if any(label == p.STALE for label, _ in self.answer_conditions):
             reasons.append("API marked its answer stale")
         if self.snapshot_at is not None and self._clock() - self.snapshot_at > self.stale_after_s:
@@ -430,7 +466,7 @@ class TuiApp:
         if cond is None and keyed and len(grouped) <= budget:
             cond = grouped
         if cond is None and keyed and len(by_label) <= budget:
-            cond = self._squeeze(by_label, heads, listed, budget)
+            cond = self._squeeze(by_label, heads, listed, budget, w)
         if cond is None:
             cond = summary if keyed else [("conditions: none", None)]
         rem = max(0, h - fixed - len(cond))
@@ -470,14 +506,16 @@ class TuiApp:
             rows.extend((6, "│", None) for _ in range(rem - 1 - len(lines)))
         # An empty "errors: none" row gives way before the prompt, and on a tie the prompt is kept, so a Stop
         # confirmation or a typed command stays visible on a two-row terminal (bot review 4511540462).
-        rows += [(1 if self.last_error else 2, self.error_row(), "error" if self.last_error else None),
-                 (4, self.notice, None), (1, self.prompt(), "prompt")]
+        # A real error outranks the condition rows: at two rows the frame keeps `error N:` and the prompt,
+        # and the condition text stays in the log (bot review 4517702948).
+        rows += [(-1 if self.last_error else 2, self.error_row(), "error" if self.last_error else None),
+                 (4, self.notice, None), (-2 if self.last_error else 1, self.prompt(), "prompt")]
         while len(rows) > h:  # a terminal shorter than the layout: drop the least needed row
             rows.remove(max(reversed(rows), key=lambda r: (r[0], r[2] != "prompt")))
         return [(clip(text), style) for _, text, style in rows]
 
     @staticmethod
-    def _squeeze(by_label: dict, heads: dict, listed: dict, budget: int) -> list[Row]:
+    def _squeeze(by_label: dict, heads: dict, listed: dict, budget: int, width: int) -> list[Row]:
         """More named subjects than the terminal has rows: every label keeps its head row, and the rows
         left go to UNCERTAIN first (an unconfirmed Stop), then UNRECONCILED, then the rest. A label that
         cannot name all its subjects says on screen how many it left out and where to read them."""
@@ -490,10 +528,8 @@ class TuiApp:
         out: list[Row] = []
         for label in by_label:
             rows, k = listed[label], give[label]
-            if rows and k == 0:  # no row left under it: the head itself says none are named (bot 4511719327)
-                n = len(by_label[label])
-                out.append((f"{label}: {n} active, {n} not named here (terminal too small; --plain or a larger "
-                            f"terminal names every one): {by_label[label][0][1]}", label))
+            if rows and k == 0:  # no row left under it: the head itself names what fits (bot 4511719327, 4517703119)
+                out.append((TuiApp._ids_on_one_row(label, by_label[label], width), label))
                 continue
             out.append(heads[label])
             if k >= len(rows):
@@ -506,6 +542,24 @@ class TuiApp:
                 out.append((f"  … {missing} more not named here (terminal too small; --plain or a larger "
                             f"terminal names every one)", label))
         return out
+
+    @staticmethod
+    def _ids_on_one_row(label: str, found: list[tuple[str, str]], width: int) -> str:
+        """One head row and no name rows under it. Whole run ids come first; the omitted count is how
+        many of those ids do not fit on the row (bot review 4517703119). A clipped id is not counted
+        as named. The full condition text stays in the event log."""
+
+        names = [field(subject[4:] if subject.startswith("run=") else subject) for subject, _ in found]
+        n = len(names)
+        line = f"{label}: {n} not named here"
+        for count in range(1, n + 1):
+            omitted = n - count
+            body = ", ".join(names[:count])
+            candidate = f"{label}: {body}" if omitted == 0 else f"{label}: {body} ({omitted} more not named here)"
+            if sum(cell_width(c) for c in candidate) > width:
+                break
+            line = candidate
+        return line
 
     def resize(self, width: int, height: int) -> bool:
         """Take the terminal's current size; True if it changed. No floor: the frame fits any size."""

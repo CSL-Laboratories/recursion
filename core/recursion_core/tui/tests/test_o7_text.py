@@ -233,6 +233,63 @@ class StaleWatchOnlyTest(unittest.TestCase):
         self.assertEqual(labels, {p.UNAVAILABLE_LABEL, p.STALE})
         self.assertNotEqual(app.last["code"], "ok")
 
+    def test_stale_list_stays_stale_after_a_fresh_status(self) -> None:
+        # 4503920848: attaching replaced the stale list answer and watch_only turned off.
+        run = {"run_id": "r", "state": "running", "engine": "codex", "tenant": "t1"}
+        api = ScriptedAPI({"run.list": {"code": "ok", "runs": [run], "stale": True},
+                           "run.status": {"code": "ok", "run": run}})
+        app = TuiApp(api, clock=Clock(), environ={"NO_COLOR": "1"})
+        app.open()
+        self.assertTrue(app.list_stale)
+        self.assertTrue(app.watch_only)
+        app.attach("r")
+        self.assertEqual(app.last["code"], "ok")
+        self.assertTrue(app.list_stale)
+        self.assertTrue(app.watch_only)
+        app.command("start --tenant t1 --engine codex --prompt p")
+        self.assertNotIn("run.start", [method for method, _ in api.calls])
+        api.answers["run.list"] = {"code": "ok", "runs": [run]}
+        app.press("r")
+        self.assertFalse(app.list_stale)
+        self.assertFalse(app.watch_only)
+
+    def test_failed_status_refresh_is_not_cleared_by_a_successful_list(self) -> None:
+        # 4503920903: refresh's list succeeded and its status failed, and watch_only stayed off.
+        run = {"run_id": "r", "state": "running", "engine": "codex", "tenant": "t1"}
+
+        class API:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+                self.status_code = "ok"
+
+            def call(self, method: str, params: dict | None = None) -> dict:
+                self.calls.append(method)
+                if method == "run.list":
+                    return {"code": "ok", "runs": [run]}
+                if method == "run.status":
+                    if self.status_code != "ok":
+                        return {"code": self.status_code}
+                    return {"code": "ok", "run": run}
+                return {"code": "started", "run": {**run, "run_id": "new"}}
+
+        api = API()
+        app = TuiApp(api, clock=Clock(), environ={"NO_COLOR": "1"})
+        app.open()
+        app.attach("r")
+        self.assertFalse(app.watch_only)
+        api.status_code = "control_api_unavailable"
+        app.press("r")
+        self.assertIsNone(app.refresh_failed)
+        self.assertIsNotNone(app.status_refresh_failed)
+        self.assertTrue(app.watch_only)
+        app.request("run.list", {})
+        self.assertTrue(app.watch_only, "a later list does not clear a failed status")
+        app.command("start --tenant t1 --engine codex --prompt p")
+        self.assertNotIn("run.start", api.calls)
+        api.status_code = "ok"
+        app.request("run.status", {"run_id": "r"})
+        self.assertFalse(app.watch_only)
+
 
 class ErrorStaysTest(unittest.TestCase):
     def test_error_is_never_redrawn_away(self) -> None:

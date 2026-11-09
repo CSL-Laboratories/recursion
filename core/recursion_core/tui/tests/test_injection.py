@@ -8,12 +8,20 @@ import unittest
 
 from recursion_core.tui import sanitize as s
 from recursion_core.tui.app import TuiApp
-from recursion_core.tui.tests.fakes import Clock, FakeDriver, RecordingAPI, fixture
+from recursion_core.tui.tests.fakes import Clock, FakeDriver, RecordingAPI, ScriptedAPI, fixture
 from recursion_core.tui.view import to_ansi, to_text
 
 CORPUS = fixture("injection.json")["cases"]
-FORBIDDEN = re.compile("[\x00-\x09\x0b-\x1f\x7f-\x9f؜​-‏ -‮⁠-⁩﻿]")
 OWN_SGR = re.compile(r"\x1b\[(?:H|J|K|\d+(?:;\d+)*m)")
+
+
+def leaked(text: str) -> str | None:
+    """A character the sanitizer must mark, other than a newline the renderer keeps."""
+
+    for ch in text:
+        if ch != "\n" and s._marked(ch):
+            return ch
+    return None
 
 
 def violations(render, raw: str) -> list[str]:
@@ -21,7 +29,7 @@ def violations(render, raw: str) -> list[str]:
 
     found = []
     whole = render([raw])
-    if FORBIDDEN.search(whole):
+    if leaked(whole):
         found.append("control or bidi character reached the display")
     step = 1 if len(raw) < 400 else 97
     for cut in range(0, len(raw) + 1, step):
@@ -71,6 +79,21 @@ class SanitizerTest(unittest.TestCase):
     def test_api_fields_are_sanitized_too(self) -> None:
         self.assertEqual(s.field("run-1\x1b]0;x\x07\nfake"), "run-1⟦OSC 0⟧⟦LF⟧fake")
 
+    def test_invisible_format_characters_are_marked(self) -> None:
+        # t1435u finding 1 and bot review 4503921323. Category Cf/Co/Cn, plus the measured
+        # non-category blanks (variation selectors and Hangul fillers).
+        import unicodedata
+
+        samples = ["\u00ad", "\u180e", "\u034f", "\ufe0f", "\U000e0100", "\u115f", "\u3164",
+                   "\U000e0041", "\U0001d173", "\ue000", "\u0378"]
+        for ch in samples:
+            with self.subTest(cp=f"U+{ord(ch):04X}", category=unicodedata.category(ch)):
+                out = s.sanitize("a" + ch + "b")
+                self.assertNotIn(ch, out)
+                self.assertIn(f"U+{ord(ch):04X}", out)
+                san = s.OutputSanitizer()
+                self.assertEqual(san.feed("a") + san.feed(ch) + san.feed("b") + san.flush(), out)
+
 
 class InjectionInAppTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -110,7 +133,7 @@ class InjectionInAppTest(unittest.TestCase):
         self.assertEqual(len(frame), self.app.height)
         for text, _ in frame:
             self.assertLessEqual(sum(s.cell_width(ch) for ch in text), self.app.width, text)
-            self.assertIsNone(FORBIDDEN.search(text), repr(text))
+            self.assertIsNone(leaked(text), repr(text))
         ansi = to_ansi(frame, color=True)
         self.assertNotIn("\x1b", OWN_SGR.sub("", ansi), "only the TUI's own repaint and SGR codes are emitted")
         self.assertNotIn("\x1b", to_text(frame))
@@ -124,6 +147,31 @@ class InjectionInAppTest(unittest.TestCase):
         self.assertTrue(frame[-1].startswith("recursion: j/k select"))
         self.app.press("y")  # a "y" after look-alike text confirms nothing
         self.assertEqual(self.api.calls, [])
+
+    def test_api_condition_text_cannot_inject_controls(self) -> None:
+        # 4503921230: a run id or stop reason with OSC or bidi was copied into the condition row.
+        run = {"run_id": "r\x1b]52;c;ZXZpbA==\x07", "state": "stop_pending", "engine": "e\x1b[2J",
+               "tenant": "t", "stop": {"reason": "x\u202e"}}
+        api = ScriptedAPI({"run.list": {"code": "ok", "runs": [run]}})
+        app = TuiApp(api, clock=Clock(), environ={"NO_COLOR": "1"}, width=120, height=20)
+        app.open()
+        text = to_text(app.frame())
+        self.assertNotIn("\x1b", text)
+        self.assertNotIn("\u202e", text)
+        self.assertIn("OSC 52", text)
+        self.assertIn("U+202E", text)
+        self.assertNotIn("\x1b]", to_ansi(app.frame(), color=False))
+
+    def test_newline_free_output_stays_bounded(self) -> None:
+        # 4503920972: chunks with no newline grew `partial` without the line cap.
+        from recursion_core.tui.app import PARTIAL_CAP
+
+        for _ in range(300):
+            self.app.on_event({"run_id": self.r1, "text": "a" * 100})
+        partial = self.app.outputs[self.r1].partial
+        self.assertLessEqual(len(partial), PARTIAL_CAP)
+        self.assertTrue(partial.startswith("⟦truncated⟧"), partial[:20])
+        self.assertNotIn("\n", partial)
 
     def test_output_for_another_run_is_not_drawn_in_this_pane(self) -> None:
         self.app.on_event({"run_id": self.r2, "text": "other run says hello\n"})

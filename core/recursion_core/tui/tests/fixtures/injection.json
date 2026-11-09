@@ -150,6 +150,66 @@
    "name": "save-restore-cursor-draw",
    "raw": "\u001b7\u001b[1;1Hstatus=stopped\u001b8tail",
    "rendered": "\u27e6ESC\u27e7\u27e6CSI\u27e7status=stopped\u27e6ESC\u27e7tail"
+  },
+  {
+   "fixture": "RJ-F21",
+   "name": "format-soft-hyphen",
+   "raw": "a\u00adb",
+   "rendered": "a\u27e6U+00AD\u27e7b"
+  },
+  {
+   "fixture": "RJ-F21",
+   "name": "format-mongolian-vowel-separator",
+   "raw": "a\u180eb",
+   "rendered": "a\u27e6U+180E\u27e7b"
+  },
+  {
+   "fixture": "RJ-F21",
+   "name": "format-combining-grapheme-joiner",
+   "raw": "a\u034fb",
+   "rendered": "a\u27e6U+034F\u27e7b"
+  },
+  {
+   "fixture": "RJ-F21",
+   "name": "format-variation-selector-16",
+   "raw": "a\ufe0fb",
+   "rendered": "a\u27e6U+FE0F\u27e7b"
+  },
+  {
+   "fixture": "RJ-F21",
+   "name": "format-variation-selector-supplement",
+   "raw": "a\udb40\udd00b",
+   "rendered": "a\u27e6U+E0100\u27e7b"
+  },
+  {
+   "fixture": "RJ-F21",
+   "name": "format-hangul-fillers",
+   "raw": "a\u115f\u3164b",
+   "rendered": "a\u27e6U+115F\u27e7\u27e6U+3164\u27e7b"
+  },
+  {
+   "fixture": "RJ-F21",
+   "name": "format-tag-character",
+   "raw": "a\udb40\udc41b",
+   "rendered": "a\u27e6U+E0041\u27e7b"
+  },
+  {
+   "fixture": "RJ-F21",
+   "name": "format-musical-beam",
+   "raw": "a\ud834\udd73b",
+   "rendered": "a\u27e6U+1D173\u27e7b"
+  },
+  {
+   "fixture": "RJ-F21",
+   "name": "format-private-use",
+   "raw": "a\ue000b",
+   "rendered": "a\u27e6U+E000\u27e7b"
+  },
+  {
+   "fixture": "RJ-F21",
+   "name": "format-unassigned",
+   "raw": "a\u0378b",
+   "rendered": "a\u27e6U+0378\u27e7b"
   }
  ]
 }

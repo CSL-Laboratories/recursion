@@ -100,7 +100,8 @@ UNRECONCILED: run=run-1 state=stop_pending reason=cgroup_populated: stop request
 UNRECONCILED: run=run-2 state=stop_pending reason=cgroup_populated: stop requested, cleanup not
   confirmed
 STALE: watch_only (start disabled; stop and reads work): refresh failed: run.list answered
-  control_api_unavailable; snapshot older than 10.0s
+  control_api_unavailable; refresh failed: run.status answered control_api_unavailable; snapshot
+  older than 10.0s
 UNCERTAIN: stop not confirmed for run=run-1: reason=cgroup_populated; run may still be running
 runs:
 > run-1 state=stop_pending engine=codex tenant=t1 attached
@@ -111,7 +112,6 @@ runs:
 -- output run=run-1 (untrusted engine text, display only) --
 │ engine says ⟦OSC 0⟧hi
 │ ⟦OSC 52⟧done
-│
 │
 │
 │
@@ -131,7 +131,8 @@ UNRECONCILED: run=run-1 state=stop_pending reason=cgroup_populated: stop request
 UNRECONCILED: run=run-2 state=stop_pending reason=cgroup_populated: stop requested, cleanup not
   confirmed
 STALE: watch_only (start disabled; stop and reads work): refresh failed: run.list answered
-  control_api_unavailable; snapshot older than 10.0s
+  control_api_unavailable; refresh failed: run.status answered control_api_unavailable; snapshot
+  older than 10.0s
 UNCERTAIN: stop not confirmed for run=run-1: reason=cgroup_populated; run may still be running
 runs:
 > run-1 state=stop_pending engine=codex tenant=t1 attached
@@ -142,7 +143,6 @@ runs:
 -- output run=run-1 (untrusted engine text, display only) --
 │ engine says ⟦OSC 0⟧hi
 │ ⟦OSC 52⟧done
-│
 │
 │
 │
@@ -162,7 +162,8 @@ UNRECONCILED: run=run-1 state=stop_pending reason=cgroup_populated: stop request
 UNRECONCILED: run=run-2 state=stop_pending reason=cgroup_populated: stop requested, cleanup not
   confirmed
 STALE: watch_only (start disabled; stop and reads work): refresh failed: run.list answered
-  control_api_unavailable; snapshot older than 10.0s
+  control_api_unavailable; refresh failed: run.status answered control_api_unavailable; snapshot
+  older than 10.0s
 UNCERTAIN: stop not confirmed for run=run-1: reason=cgroup_populated; run may still be running
 runs:
 > run-1 state=stop_pending engine=codex tenant=t1 attached
@@ -171,7 +172,6 @@ runs:
 
 
 -- output run=run-1 (untrusted engine text, display only) --
-│ flood line 490
 │ flood line 491
 │ flood line 492
 │ flood line 493
@@ -212,4 +212,5 @@ STALE: watch_only (start disabled; stop and reads work): refresh failed: run.lis
 request run.status run_id=run-1
 answer run.status status=control_api_unavailable detail=ConnectionError surface=cli watch_only=true conditions=UNAVAILABLE
 error 3: UNAVAILABLE: run.status status=control_api_unavailable control API unavailable: ConnectionError
-error 4: refused locally: start while watch_only (refresh failed: run.list answered control_api_unavailable; snapshot older than 10.0s); refresh first
+STALE changed: watch_only (start disabled; stop and reads work): refresh failed: run.list answered control_api_unavailable; refresh failed: run.status answered control_api_unavailable; snapshot older than 10.0s
+error 4: refused locally: start while watch_only (refresh failed: run.list answered control_api_unavailable; refresh failed: run.status answered control_api_unavailable; snapshot older than 10.0s); refresh first

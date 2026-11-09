@@ -17,6 +17,8 @@ import argparse
 import shlex
 from collections.abc import Mapping
 
+from recursion_core.tui.sanitize import field
+
 COMMANDS = ("list", "status", "stop", "start", "conditions")
 CONDITIONS = "conditions"  # local in the TUI; not a control API method
 METHODS = {"list": "run.list", "status": "run.status", "stop": "run.stop", "start": "run.start"}
@@ -110,22 +112,23 @@ def keyed_conditions(answer: Mapping) -> list[tuple[str, str, str]]:
     code = answer.get("code")
     found: list[tuple[str, str, str]] = []
     if code == UNAVAILABLE:
-        found.append((UNAVAILABLE_LABEL, "api", f"control API unavailable: {answer.get('detail', 'no answer')}"))
+        found.append((UNAVAILABLE_LABEL, "api",
+                      f"control API unavailable: {field(answer.get('detail', 'no answer'))}"))
     elif code in UNCERTAIN_CODES:
         found.append((UNCERTAIN, f"run={answer.get('run_id')}",
-                      f"stop not confirmed for run={answer.get('run_id')}: "
-                      f"reason={answer.get('reason', 'unknown')}; run may still be running"))
+                      f"stop not confirmed for run={field(answer.get('run_id'))}: "
+                      f"reason={field(answer.get('reason', 'unknown'))}; run may still be running"))
     elif code not in SUCCESS:
         what = answer.get("detail", answer.get("run_id", ""))
-        found.append((REFUSED, "answer", f"{code} {what}".strip()))
+        found.append((REFUSED, "answer", f"{field(code)} {field(what)}".strip()))
     if answer.get("stale") is True:
         found.append((STALE, "answer", "API marked this answer stale"))
     for run in _runs(answer):
         if stop_unconfirmed(run):
             reason = run["stop"].get("reason") if isinstance(run.get("stop"), Mapping) else None
             found.append((UNRECONCILED, f"run={run.get('run_id')}",
-                          f"run={run.get('run_id')} state={run.get('state')} reason={reason}: "
-                          "stop requested, cleanup not confirmed"))
+                          f"run={field(run.get('run_id'))} state={field(run.get('state'))} "
+                          f"reason={field(reason)}: stop requested, cleanup not confirmed"))
     if answer.get("reconciliation") == "unreconciled":
         found.append((UNRECONCILED, "api", "API reports unreconciled state"))
     return found

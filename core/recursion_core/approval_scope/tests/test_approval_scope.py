@@ -16,6 +16,7 @@ from recursion_core.approval_scope import (ApprovalAuthority, ApprovalRequest, A
 from recursion_core.approval_scope import prompt as prompt_mod
 from recursion_core.approval_scope.canonical import canonical
 from recursion_core.approval_scope.prompt import MAX_EFFECT_BYTES, MAX_EXPIRES_AT
+from recursion_core.approval_scope.scope import MAX_OPEN_PER_OPENER
 
 PKG = pathlib.Path(__file__).resolve().parents[1]
 T0 = 1_800_000_000
@@ -48,15 +49,54 @@ def grant(auth: ApprovalAuthority, credential: object, request_ids, ttl_seconds:
     return auth.grant(credential, request_ids, ttl_seconds=ttl_seconds)
 
 
-def request(expires_at: int = T0 + 600, effect: object = EFFECT, display=(("note", "hello"),),
-            request_id: str | None = None) -> ApprovalRequest:
-    return ApprovalRequest.create(effect, list(display), expires_at, request_id=request_id)
+def request(expires_at: int = T0 + 600, effect: object = EFFECT, display=(("note", "hello"),)
+            ) -> ApprovalRequest:
+    return ApprovalRequest.create(effect, list(display), expires_at)
 
 
 def effect_block(text: str) -> list[str]:
     lines = text.splitlines()
     start = lines.index("-- effect: drawn by Recursion from the bytes the digest covers --")
     return lines[start + 1:lines.index("-- end of effect --")]
+
+
+# csl-canonical/1 vectors (recursion #339). Bytes and SHA-256 were produced by #339's
+# ``canonical_form.canonical.canonical_bytes`` at bde6f13f; the approval digest must match.
+CANONICAL_VECTORS = (
+    ("del_in_value", {"s": "a\x7fb"}, b'{"s":"a\x7fb"}',
+     "8f8675bc3c1b43644730acf12db2473c92a6a1668eb2b89c20b9d5a6930148f7"),
+    ("del_in_key_and_every_short_escape",
+     {"k\x7f": "\x00\x08\x09\x0a\x0c\x0d\x1f\"\\/\x7f~"},
+     b'{"k\x7f":"\\u0000\\b\\t\\n\\f\\r\\u001f\\"\\\\/\x7f~"}',
+     "9ecdf57c49e2ee58dae933a543c4a9491df2f7919d62ae0844cee9128116b9f3"),
+)
+
+
+class CanonicalFormTests(unittest.TestCase):
+    # t1430u X1b: DEL was written as \u007f, so digests differed from #339's csl-canonical/1.
+    def test_matches_csl_canonical_1_vectors(self) -> None:
+        for name, value, raw, sha in CANONICAL_VECTORS:
+            with self.subTest(name=name):
+                self.assertEqual(canonical(value), raw)
+                self.assertEqual(hashlib.sha256(raw).hexdigest(), sha)
+                self.assertEqual(request(effect=value).digest, sha)
+
+    def test_del_is_written_as_itself_not_escaped(self) -> None:
+        raw = canonical({"s": "\x7f"})
+        self.assertIn(b"\x7f", raw)
+        self.assertNotIn(b"\\u007f", raw)
+        # The old json.dumps(ensure_ascii=True) digest is gone.
+        self.assertNotEqual(request(effect={"s": "a\x7fb"}).digest,
+                            "268d56190bc04a690df6a3e0d03348aad0b9191466b01e008b4489972bc32e7f")
+
+    def test_prompt_still_marks_del_in_the_drawn_effect(self) -> None:
+        text = render_prompt(request(effect={"s": "a\x7fb"}), "plugin.example")
+        self.assertNotIn("\x7f", text)
+        self.assertIn("a\\u007fb", "\n".join(effect_block(text)))
+
+    def test_member_order_and_integers_match_csl_canonical_1(self) -> None:
+        self.assertEqual(canonical({"b": [1, True, None], "B": -3, "_": {"z": 0, "Z": 1}}),
+                         b'{"B":-3,"_":{"Z":1,"z":0},"b":[1,true,null]}')
 
 
 class PromptTextTests(unittest.TestCase):
@@ -208,8 +248,8 @@ class ScopeTests(unittest.TestCase):
         self.registry = CredentialRegistry()
         self.auth = ApprovalAuthority(self.clock, self.registry)
         self.plugin = cred(self.registry, "plugin", {"control"})
-        self.req = request()
-        self.prompt = self.auth.open(self.plugin, self.req)
+        opened = self.auth.open(self.plugin, request())
+        self.req, self.prompt = opened.request, opened.prompt
         self.device = cred(self.registry, "paired_device", {"observe", "approve"})
 
     def test_paired_device_without_manage_approves_once(self) -> None:
@@ -345,8 +385,7 @@ class ScopeTests(unittest.TestCase):
     def test_grant_refuses_ids_passed_along_without_the_core_prompt(self) -> None:
         # The plugin opens effect B and hands its id and digest to the approver with a
         # made-up rendering; without reading B's prompt from the core, no grant.
-        other = request(effect={"kind": "example.other"})
-        self.auth.open(self.plugin, other)
+        other = self.auth.open(self.plugin, request(effect={"kind": "example.other"})).request
         for ids in ([other.request_id], [self.req.request_id, other.request_id]):
             with self.subTest(ids=ids):
                 with self.assertRaises(Refused) as ctx:
@@ -390,6 +429,50 @@ class ScopeTests(unittest.TestCase):
         self.assertEqual([i["request_id"] for i in self.auth.pending(self.device)],
                          [self.req.request_id])
 
+    # t1430u X1b: the core assigns request ids; the caller cannot pick one.
+    def test_create_takes_no_request_id(self) -> None:
+        with self.assertRaises(TypeError):
+            ApprovalRequest.create(EFFECT, [], T0 + 60, request_id="ab" * 16)
+
+    def test_open_assigns_a_core_id_over_any_caller_id(self) -> None:
+        draft = request()
+        chosen = ApprovalRequest(request_id=self.req.request_id, effect_bytes=draft.effect_bytes,
+                                 digest=draft.digest, display=draft.display,
+                                 expires_at=draft.expires_at)
+        first = self.auth.open(self.plugin, chosen)
+        second = self.auth.open(self.plugin, chosen)
+        ids = {self.req.request_id, first.request_id, second.request_id, chosen.request_id}
+        self.assertEqual(len(ids), 3)  # chosen == self.req's id; the core gave two new ones
+        self.assertNotIn(chosen.request_id, (first.request_id, second.request_id))
+        self.assertIn(f"request id: {first.request_id}", first.prompt)
+        self.assertEqual(first.digest, draft.digest)
+        self.assertEqual(self.auth.state(self.req.request_id), "pending")
+
+    def test_open_requests_are_capped_per_opener(self) -> None:
+        # setUp already holds one open request for the plugin.
+        extra = [self.auth.open(self.plugin, request(effect={"n": i})).request
+                 for i in range(MAX_OPEN_PER_OPENER - 1)]
+        with self.assertRaises(Refused) as ctx:
+            self.auth.open(self.plugin, request())
+        self.assertEqual(ctx.exception.code, "open_cap_reached")
+        # A second credential with the same principal shares the cap.
+        same = self.registry.issue(self.plugin.principal, "plugin", {"control"})
+        with self.assertRaises(Refused) as ctx:
+            self.auth.open(same, request())
+        self.assertEqual(ctx.exception.code, "open_cap_reached")
+        # Another opener is unaffected.
+        other = self.registry.issue("plugin:2", "plugin", {"control"})
+        self.auth.open(other, request())
+        # Answering one frees a slot.
+        scope = grant(self.auth, self.device, [extra[0].request_id], ttl_seconds=60)
+        self.auth.deny(self.device, scope.scope_id, extra[0].request_id, extra[0].digest)
+        self.auth.open(self.plugin, request())
+        with self.assertRaises(Refused):
+            self.auth.open(self.plugin, request())
+        # Expiry frees every slot.
+        self.clock.now = T0 + 600
+        self.auth.open(self.plugin, request(expires_at=T0 + 1200))
+
     def test_authority_requires_a_registry(self) -> None:
         with self.assertRaises(Refused) as ctx:
             ApprovalAuthority(self.clock, object())
@@ -402,8 +485,7 @@ class ScopeExpiryTests(unittest.TestCase):
         self.registry = CredentialRegistry()
         self.auth = ApprovalAuthority(self.clock, self.registry)
         self.plugin = cred(self.registry, "plugin", {"control"})
-        self.req = request()
-        self.auth.open(self.plugin, self.req)
+        self.req = self.auth.open(self.plugin, request()).request
         self.device = cred(self.registry, "operator_ui", {"approve"})
         self.scope = grant(self.auth, self.device, [self.req.request_id], ttl_seconds=60)
 
@@ -448,8 +530,7 @@ class ScopeExpiryTests(unittest.TestCase):
     def test_expired_request_cannot_be_opened_or_granted(self) -> None:
         with self.assertRaises(Refused):
             self.auth.open(self.plugin, request(expires_at=T0))
-        late = request(expires_at=T0 + 5)
-        self.auth.open(self.plugin, late)
+        late = self.auth.open(self.plugin, request(expires_at=T0 + 5)).request
         self.clock.now = T0 + 5
         with self.assertRaises(Refused) as ctx:
             grant(self.auth, self.device, [late.request_id], ttl_seconds=60)
@@ -458,8 +539,7 @@ class ScopeExpiryTests(unittest.TestCase):
 
     def test_scoped_grant_uses_each_binding_once(self) -> None:
         reqs = [request(effect={"n": i}) for i in range(3)]
-        for r in reqs:
-            self.auth.open(self.plugin, r)
+        reqs = [self.auth.open(self.plugin, r).request for r in reqs]
         scope = grant(self.auth, self.device, [r.request_id for r in reqs], ttl_seconds=60)
         self.assertEqual(len(scope.bindings), 3)
         for r in reqs:
@@ -477,8 +557,7 @@ class ScopeExpiryTests(unittest.TestCase):
         # Earliest in the middle, so neither first-wins nor last-wins passes.
         expiries = (T0 + 900, T0 + 300, T0 + 600)
         reqs = [request(expires_at=e, effect={"n": i}) for i, e in enumerate(expiries)]
-        for r in reqs:
-            self.auth.open(self.plugin, r)
+        reqs = [self.auth.open(self.plugin, r).request for r in reqs]
         ids = [r.request_id for r in reqs]
         for perm in (ids, ids[::-1], [ids[1], ids[0], ids[2]]):
             with self.subTest(perm=perm):

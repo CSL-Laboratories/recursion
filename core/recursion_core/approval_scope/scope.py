@@ -17,7 +17,11 @@ whether the in-process path is a boundary or only tamper evidence is open under 
 ``ApprovalAuthority.open`` takes the opener's credential, which must hold ``control``
 (a non-read scope); an ``observe``-only or scope-less credential cannot write to the
 operator's inbox. The prompt's ``requester`` line is that credential's principal, never
-caller text.
+caller text. The core assigns the request id: ``open`` ignores whatever id the request
+object carries and returns an ``OpenedRequest`` holding the request under a fresh
+core-chosen id. One opener principal may hold at most ``MAX_OPEN_PER_OPENER`` open
+(pending, unexpired) requests at a time; past that ``open`` refuses with
+``open_cap_reached``, so one plugin cannot flood the operator's inbox.
 
 The approver reads the prompt the core drew from the core, not from the opener:
 ``pending`` (the inbox, ``approval.list``) and ``show`` return the stored prompt text to an
@@ -45,20 +49,23 @@ import hmac
 import re
 import secrets
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable
 
 from .errors import Refused
 from .prompt import _PRINCIPAL, ApprovalRequest, render_prompt
 
-__all__ = ["APPROVER_KINDS", "KINDS", "MAX_BINDINGS", "SCOPE_SCHEMA", "SCOPES",
-           "ApprovalAuthority", "ApprovalScope", "Credential", "CredentialRegistry"]
+__all__ = ["APPROVER_KINDS", "KINDS", "MAX_BINDINGS", "MAX_OPEN_PER_OPENER", "SCOPE_SCHEMA",
+           "SCOPES", "ApprovalAuthority", "ApprovalScope", "Credential", "CredentialRegistry",
+           "OpenedRequest"]
 
 SCOPE_SCHEMA = "csl-approval-scope/v0"
 KINDS = frozenset({"operator_ui", "paired_device", "agent", "plugin"})
 APPROVER_KINDS = frozenset({"operator_ui", "paired_device"})
 SCOPES = frozenset({"observe", "control", "manage", "approve"})
 MAX_BINDINGS = 16
+# Open (pending, unexpired) requests one opener principal may hold at once.
+MAX_OPEN_PER_OPENER = 32
 _ID = re.compile(r"[0-9a-f]{32}")
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 _WIRE_FIELDS = frozenset({"schema", "scope_id", "holder", "bindings", "expires_at",
@@ -180,6 +187,22 @@ class ApprovalScope:
                    expires_at=wire["expires_at"])
 
 
+@dataclass(frozen=True)
+class OpenedRequest:
+    """What ``ApprovalAuthority.open`` returns: the request under its core id, and its prompt."""
+
+    request: ApprovalRequest
+    prompt: str
+
+    @property
+    def request_id(self) -> str:
+        return self.request.request_id
+
+    @property
+    def digest(self) -> str:
+        return self.request.digest
+
+
 @dataclass
 class _Request:
     request: ApprovalRequest
@@ -214,11 +237,14 @@ class ApprovalAuthority:
             raise Refused("clock")
         return now
 
-    def open(self, credential: object, request: ApprovalRequest) -> str:
-        """Register ``request`` for ``credential`` and return the prompt the core draws.
+    def open(self, credential: object, request: ApprovalRequest) -> "OpenedRequest":
+        """Register ``request`` for ``credential`` under a core-assigned id.
 
-        The prompt's requester is ``credential.principal``. Any kind may open a request,
-        but only with the ``control`` scope; ``observe`` alone is read-only.
+        Returns the ``OpenedRequest``: the request re-keyed to the id the core chose, and
+        the prompt the core drew. The prompt's requester is ``credential.principal``. Any
+        kind may open a request, but only with the ``control`` scope; ``observe`` alone
+        is read-only. Each opener principal holds at most ``MAX_OPEN_PER_OPENER`` open
+        requests.
         """
         opener = self._registry.resolve(credential)
         if "control" not in opener.scopes:
@@ -226,14 +252,23 @@ class ApprovalAuthority:
         if type(request) is not ApprovalRequest:
             raise Refused("request_type")
         with self._lock:
-            if request.expires_at <= self._now():
+            now = self._now()
+            if request.expires_at <= now:
                 raise Refused("request_expired")
-            if request.request_id in self._requests:
-                raise Refused("request_duplicate")
+            held = sum(1 for e in self._requests.values()
+                       if e.requester == opener.principal and e.state == "pending"
+                       and e.request.expires_at > now)
+            if held >= MAX_OPEN_PER_OPENER:
+                raise Refused("open_cap_reached")
+            # The core picks the id; the caller's draft id is discarded.
+            request_id = secrets.token_hex(16)
+            while request_id in self._requests:
+                request_id = secrets.token_hex(16)
+            request = replace(request, request_id=request_id)
             # Render before registering: a request whose prompt cannot be drawn is not open.
             text = render_prompt(request, opener.principal)
-            self._requests[request.request_id] = _Request(request, opener.principal, text)
-        return text
+            self._requests[request_id] = _Request(request, opener.principal, text)
+        return OpenedRequest(request, text)
 
     def pending(self, credential: object) -> list[dict]:
         """The approver's inbox: every open, unexpired request with the prompt the core drew.

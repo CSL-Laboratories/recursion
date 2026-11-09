@@ -143,14 +143,18 @@ class ApprovalRequest:
             raise Refused("expires_at")
 
     @classmethod
-    def create(cls, effect: object, display: object, expires_at: int,
-               request_id: str | None = None) -> "ApprovalRequest":
-        """Build a request; the digest is taken over ``effect``'s canonical bytes."""
+    def create(cls, effect: object, display: object, expires_at: int) -> "ApprovalRequest":
+        """Build a request; the digest is taken over ``effect``'s canonical bytes.
+
+        The caller cannot pick ``request_id``. ``create`` fills in a random draft id, and
+        ``ApprovalAuthority.open`` replaces it with an id the core assigns, so the id an
+        approver sees and answers is always the core's.
+        """
         try:
             raw = canonical(effect)
         except Refused:
             raise Refused("effect_noncanonical") from None
-        return cls(request_id=request_id or secrets.token_hex(16), effect_bytes=raw,
+        return cls(request_id=secrets.token_hex(16), effect_bytes=raw,
                    digest=canonical_digest(effect), display=_check_fields(display),
                    expires_at=expires_at)
 

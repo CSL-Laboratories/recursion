@@ -1,7 +1,14 @@
-"""Restricted canonical JSON for the approval digest (candidate form ``csl-cj/v0``).
+r"""Canonical JSON for the approval digest: the ASCII subset of ``csl-cj/v0`` serialised
+exactly as ``csl-canonical/1`` (recursion #339, ``core/recursion_core/canonical_form``).
 
-Mirrors ``plugin_security/canonical.py`` (recursion #328) so both packages hash the same
-bytes for the same value; O49 (the final digest form) is still open. Accepted values:
+The bytes are the ones #339's ``canonical_bytes`` gives for the same value, so an approval
+digest and a #339 digest over the same effect agree (PRODUCT.md 4.2; O49, the final digest
+form, is still open). String escaping follows RFC 8785 / #339: ``"`` and ``\`` are
+backslash-escaped, ``\b \t \n \f \r`` use their short forms, other characters below
+U+0020 are ``\u00xx``, and everything else, DEL (U+007F) included, is written as itself.
+Members sort by UTF-16 code units (for ASCII keys, the same as sorting by code point).
+Earlier heads used ``json.dumps(ensure_ascii=True)``, which writes DEL as ``\u007f`` and so
+gave a different digest than #339 for any string holding DEL. Accepted values:
 
 * objects with ASCII string keys (sorted, no duplicates), arrays, ASCII strings,
   ``true``, ``false``, ``null``;
@@ -12,7 +19,6 @@ bytes for the same value; O49 (the final digest form) is still open. Accepted va
 from __future__ import annotations
 
 import hashlib
-import json
 
 from .errors import Refused
 
@@ -49,11 +55,59 @@ def check_value(value: object, depth: int = 0) -> None:
     raise Refused("noncanonical_value", type(value).__name__)
 
 
+# Same table and rule as #339 ``canonical_form/canonical.py`` ``_string``.
+_ESC = {'"': '\\"', "\\": "\\\\", "\b": "\\b", "\t": "\\t", "\n": "\\n", "\f": "\\f",
+        "\r": "\\r"}
+
+
+def _string(s: str) -> str:
+    out = ['"']
+    for ch in s:
+        if ch in _ESC:
+            out.append(_ESC[ch])
+        elif ord(ch) < 0x20:
+            out.append(f"\\u{ord(ch):04x}")
+        else:
+            out.append(ch)
+    out.append('"')
+    return "".join(out)
+
+
+def _serialize(value: object, out: list[str]) -> None:
+    if value is None:
+        out.append("null")
+    elif value is True:
+        out.append("true")
+    elif value is False:
+        out.append("false")
+    elif type(value) is int:
+        out.append(str(value))
+    elif type(value) is str:
+        out.append(_string(value))
+    elif type(value) in (list, tuple):
+        out.append("[")
+        for i, item in enumerate(value):
+            if i:
+                out.append(",")
+            _serialize(item, out)
+        out.append("]")
+    else:
+        out.append("{")
+        for i, key in enumerate(sorted(value, key=lambda k: k.encode("utf-16-be"))):
+            if i:
+                out.append(",")
+            out.append(_string(key))
+            out.append(":")
+            _serialize(value[key], out)
+        out.append("}")
+
+
 def canonical(value: object) -> bytes:
     """Return the canonical bytes of ``value`` or refuse."""
     check_value(value)
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
-                      allow_nan=False).encode("ascii")
+    out: list[str] = []
+    _serialize(value, out)
+    return "".join(out).encode("ascii")
 
 
 def digest(value: object) -> str:

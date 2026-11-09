@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import stat
 from dataclasses import dataclass
 
 from recursion_core.launch_check.binary import file_kind
@@ -92,6 +93,8 @@ def npm_hermes_agent_root(realpath: str) -> str | None:
     It is recognised by the ``node_modules/hermes-agent/`` path segment, or by a
     ``package.json`` named ``hermes-agent`` in the grandparent directory of a ``bin/`` file.
     Nothing is executed; the file is read, size-capped, and a read error means "not recognised".
+    It is opened non-blocking and read only if it is a regular file, so a FIFO or device named
+    ``package.json`` (e.g. ``/usr/package.json`` above ``/usr/bin/hermes``) cannot hang detection.
     """
     parts = os.path.normpath(realpath).split(os.sep)
     for i in range(len(parts) - 2):
@@ -101,7 +104,11 @@ def npm_hermes_agent_root(realpath: str) -> str | None:
         return None
     root = os.path.dirname(os.path.dirname(realpath))
     try:
-        with open(os.path.join(root, "package.json"), "rb") as f:
+        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOCTTY", 0)
+        fd = os.open(os.path.join(root, "package.json"), flags)
+        with open(fd, "rb") as f:
+            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                return None
             data = json.loads(f.read(_PACKAGE_JSON_MAX))
     except (OSError, ValueError, RecursionError):
         return None

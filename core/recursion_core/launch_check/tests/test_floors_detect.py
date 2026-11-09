@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 import unittest
 from types import MappingProxyType
 from unittest import mock
@@ -315,6 +316,28 @@ class NpmHermesBridgeTests(unittest.TestCase):
             self.assertIsNone(npm_hermes_agent_root(path))
             _grants, records = launch_check(bindir, probe=F.probe)
         self.assertEqual(set(FLOORS), {r["engine"] for r in records})
+
+    def test_package_json_that_is_not_a_regular_file_does_not_hang_detection(self) -> None:
+        # /usr/bin/hermes makes detect() look at /usr/package.json. A FIFO there must mean
+        # "not recognised", not a blocking open that stops launch_check for every engine.
+        prefix = F.dir()
+        bindir = os.path.join(prefix, "bin")
+        os.makedirs(bindir)
+        F.make("hermes", "hermes 0.9.1", where=bindir)
+        fifo = os.path.join(prefix, "package.json")
+        os.mkfifo(fifo)
+        out: dict[str, object] = {}
+        t = threading.Thread(target=lambda: out.update(found=detect("hermes", bindir)), daemon=True)
+        t.start()
+        t.join(5)
+        if t.is_alive():
+            os.close(os.open(fifo, os.O_RDWR))  # release the blocked reader before failing
+            self.fail("detect() blocked on a FIFO package.json")
+        self.assertEqual(os.path.join(bindir, "hermes"), out["found"].candidate)
+        self.assertIsNone(npm_hermes_agent_root(os.path.join(bindir, "hermes")))
+        os.remove(fifo)
+        os.makedirs(fifo)  # a directory named package.json is not recognised either
+        self.assertIsNone(npm_hermes_agent_root(os.path.join(bindir, "hermes")))
 
     def test_native_file_in_the_bridge_tree_is_not_a_candidate(self) -> None:
         bindir, root = self._bridge()

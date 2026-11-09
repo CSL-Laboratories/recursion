@@ -1,0 +1,493 @@
+{
+  "format": "csl-canonical-vectors/1",
+  "canonical_form": "csl-canonical/1",
+  "scope": "Run@1.outcome and Run@1.breaker_tripped only (Lucas: two fields)",
+  "source": "CSL-Laboratories/csl-research#1100@114b48be2b4f062974b983ab2106fc2d25d53c38",
+  "source_path": "contracts/recursion-cockpit/v1.1-proposed",
+  "source_file_sha256": {
+    "schemas/run.schema.json": "ce8abb5235614691c11a849add2755266e74ee83b21d887fa86740e3cf5e99d0",
+    "schemas/common.schema.json": "efd6b76a7a86da13e9e6e7621a5640da5d9b7809f47f3dbc87c1a3e434a01087",
+    "vectors/canonical-v1.json": "7af8e2b2dd7860b5f399e27e1e0e361e912a3cf023403671bbea8bb068d620b0"
+  },
+  "vectors": [
+    {
+      "name": "doc_run_outcome_breaker",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":true,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"limit_hit\",\"outcome\":\"route_breaker_tripped\",\"state_seq\":2,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":null,\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":true,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"outcome\":\"route_breaker_tripped\",\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"limit_hit\",\"state_seq\":2,\"stop\":null,\"termination\":{\"exit_code\":0,\"observed_at\":\"2026-11-07T20:01:00Z\",\"observer\":\"cgroup_events\",\"signal\":null,\"tree_empty\":true},\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a747275652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a22323032362d31312d30375432303a30313a30305a222c226f7574636f6d65223a22726f7574655f627265616b65725f74726970706564222c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a226c696d69745f686974222c2273746174655f736571223a322c2273746f70223a6e756c6c2c227465726d696e6174696f6e223a7b22657869745f636f6465223a302c226f627365727665645f6174223a22323032362d31312d30375432303a30313a30305a222c226f62736572766572223a226367726f75705f6576656e7473222c227369676e616c223a6e756c6c2c22747265655f656d707479223a747275657d2c2274797065223a2252756e4031227d",
+      "sha256": "e46ebf300f8bd1616631c76123342a4f569f8634382e610b6e6e59472d99bc0d",
+      "run_errors": [],
+      "note": "terminal limit_hit Run@1, outcome route_breaker_tripped, breaker tripped",
+      "upstream": "doc_run_outcome_breaker"
+    },
+    {
+      "name": "doc_run_outcome_breaker_not_tripped",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":false,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"limit_hit\",\"outcome\":\"route_breaker_tripped\",\"state_seq\":2,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":null,\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":false,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"outcome\":\"route_breaker_tripped\",\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"limit_hit\",\"state_seq\":2,\"stop\":null,\"termination\":{\"exit_code\":0,\"observed_at\":\"2026-11-07T20:01:00Z\",\"observer\":\"cgroup_events\",\"signal\":null,\"tree_empty\":true},\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a66616c73652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a22323032362d31312d30375432303a30313a30305a222c226f7574636f6d65223a22726f7574655f627265616b65725f74726970706564222c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a226c696d69745f686974222c2273746174655f736571223a322c2273746f70223a6e756c6c2c227465726d696e6174696f6e223a7b22657869745f636f6465223a302c226f627365727665645f6174223a22323032362d31312d30375432303a30313a30305a222c226f62736572766572223a226367726f75705f6576656e7473222c227369676e616c223a6e756c6c2c22747265655f656d707479223a747275657d2c2274797065223a2252756e4031227d",
+      "sha256": "f13174fb187e6cb6e04bf0331b37eea0a2f1fb63f40c04122184264588e92237",
+      "run_errors": [
+        "breaker_outcome_without_breaker"
+      ],
+      "note": "canonical form is fine; the Run@1 is refused (#1100 A3 note: route_breaker_tripped needs breaker_tripped true)",
+      "upstream": "doc_run_outcome_breaker_not_tripped"
+    },
+    {
+      "name": "doc_run_outcome_duplicate",
+      "input": "{\"type\":\"Run@1\",\"state\":\"failed\",\"outcome\":\"failed\",\"outcome\":\"succeeded\"}",
+      "expect": "reject",
+      "reason": "duplicate_key",
+      "note": "a later outcome cannot overwrite an earlier one: refused, never last-wins",
+      "upstream": "doc_run_outcome_duplicate"
+    },
+    {
+      "name": "run_pending_null_outcome",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":false,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"pending\",\"outcome\":null,\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":null,\"ended_at\":null,\"stop\":null,\"termination\":null}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":false,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":null,\"outcome\":null,\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":null,\"state\":\"pending\",\"state_seq\":1,\"stop\":null,\"termination\":null,\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a66616c73652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a6e756c6c2c226f7574636f6d65223a6e756c6c2c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a6e756c6c2c227374617465223a2270656e64696e67222c2273746174655f736571223a312c2273746f70223a6e756c6c2c227465726d696e6174696f6e223a6e756c6c2c2274797065223a2252756e4031227d",
+      "sha256": "a17c8de804201d8222036486babff252a4471fe3d747593af66bb1815ec6d1d0",
+      "run_errors": [],
+      "note": "pending: outcome null, breaker untripped"
+    },
+    {
+      "name": "run_running_null_outcome",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":false,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"running\",\"outcome\":null,\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":null,\"stop\":null,\"termination\":null}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":false,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":null,\"outcome\":null,\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"running\",\"state_seq\":1,\"stop\":null,\"termination\":null,\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a66616c73652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a6e756c6c2c226f7574636f6d65223a6e756c6c2c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a2272756e6e696e67222c2273746174655f736571223a312c2273746f70223a6e756c6c2c227465726d696e6174696f6e223a6e756c6c2c2274797065223a2252756e4031227d",
+      "sha256": "2ed84c30e1aff319f92c5bcfdb2690c6500e4e14f46eb58c702ad97d0700cfb5",
+      "run_errors": [],
+      "note": "running: outcome null, breaker untripped"
+    },
+    {
+      "name": "run_running_breaker_tripped",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":true,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"running\",\"outcome\":null,\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":null,\"stop\":null,\"termination\":null}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":true,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":null,\"outcome\":null,\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"running\",\"state_seq\":1,\"stop\":null,\"termination\":null,\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a747275652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a6e756c6c2c226f7574636f6d65223a6e756c6c2c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a2272756e6e696e67222c2273746174655f736571223a312c2273746f70223a6e756c6c2c227465726d696e6174696f6e223a6e756c6c2c2274797065223a2252756e4031227d",
+      "sha256": "06b51b965614b46d06283cc15016dec52b8914c8f8d965e6d5b154039aba3cdf",
+      "run_errors": [],
+      "note": "running with the breaker tripped: outcome stays null (the breaker is a snapshot, not an outcome)"
+    },
+    {
+      "name": "run_stopping_null_outcome",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":false,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"stopping\",\"outcome\":null,\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":null,\"stop\":{\"requested_by\":\"caller\",\"reason\":\"caller_stop\",\"requested_at\":\"2026-11-07T20:00:05.250Z\",\"confirmed_at\":null},\"termination\":null}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":false,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":null,\"outcome\":null,\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"stopping\",\"state_seq\":1,\"stop\":{\"confirmed_at\":null,\"reason\":\"caller_stop\",\"requested_at\":\"2026-11-07T20:00:05.250Z\",\"requested_by\":\"caller\"},\"termination\":null,\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a66616c73652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a6e756c6c2c226f7574636f6d65223a6e756c6c2c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a2273746f7070696e67222c2273746174655f736571223a312c2273746f70223a7b22636f6e6669726d65645f6174223a6e756c6c2c22726561736f6e223a2263616c6c65725f73746f70222c227265717565737465645f6174223a22323032362d31312d30375432303a30303a30352e3235305a222c227265717565737465645f6279223a2263616c6c6572227d2c227465726d696e6174696f6e223a6e756c6c2c2274797065223a2252756e4031227d",
+      "sha256": "34c886df5dcc09f80635da6f359d199d8e51acc966950611336f42fbacc0b156",
+      "run_errors": [],
+      "note": "stopping: outcome null until the stop is confirmed"
+    },
+    {
+      "name": "run_running_outcome_set",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":false,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"running\",\"outcome\":\"succeeded\",\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":null,\"stop\":null,\"termination\":null}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":false,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":null,\"outcome\":\"succeeded\",\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"running\",\"state_seq\":1,\"stop\":null,\"termination\":null,\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a66616c73652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a6e756c6c2c226f7574636f6d65223a22737563636565646564222c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a2272756e6e696e67222c2273746174655f736571223a312c2273746f70223a6e756c6c2c227465726d696e6174696f6e223a6e756c6c2c2274797065223a2252756e4031227d",
+      "sha256": "11e9375b3a1f9f57ea0b40ee33d7cde375f2a6d10702cf34b4f55871cc61aef7",
+      "run_errors": [
+        "outcome_not_null"
+      ],
+      "note": "running with an outcome: refused, outcome is null exactly while not terminal"
+    },
+    {
+      "name": "run_running_breaker_outcome_early",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":true,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"running\",\"outcome\":\"route_breaker_tripped\",\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":null,\"stop\":null,\"termination\":null}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":true,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":null,\"outcome\":\"route_breaker_tripped\",\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"running\",\"state_seq\":1,\"stop\":null,\"termination\":null,\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a747275652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a6e756c6c2c226f7574636f6d65223a22726f7574655f627265616b65725f74726970706564222c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a2272756e6e696e67222c2273746174655f736571223a312c2273746f70223a6e756c6c2c227465726d696e6174696f6e223a6e756c6c2c2274797065223a2252756e4031227d",
+      "sha256": "122b0f41bbc0e8c9bbfceff2cced4c287b37b6a4327e7c4c7645bc5413055bc1",
+      "run_errors": [
+        "outcome_not_null"
+      ],
+      "note": "running with outcome route_breaker_tripped: refused even with the breaker tripped"
+    },
+    {
+      "name": "run_completed_succeeded",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":false,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"completed\",\"outcome\":\"succeeded\",\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":null,\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":false,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"outcome\":\"succeeded\",\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"completed\",\"state_seq\":1,\"stop\":null,\"termination\":{\"exit_code\":0,\"observed_at\":\"2026-11-07T20:01:00Z\",\"observer\":\"cgroup_events\",\"signal\":null,\"tree_empty\":true},\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a66616c73652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a22323032362d31312d30375432303a30313a30305a222c226f7574636f6d65223a22737563636565646564222c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a22636f6d706c65746564222c2273746174655f736571223a312c2273746f70223a6e756c6c2c227465726d696e6174696f6e223a7b22657869745f636f6465223a302c226f627365727665645f6174223a22323032362d31312d30375432303a30313a30305a222c226f62736572766572223a226367726f75705f6576656e7473222c227369676e616c223a6e756c6c2c22747265655f656d707479223a747275657d2c2274797065223a2252756e4031227d",
+      "sha256": "8623a7e03530a17db70a021865251e14485723970181294c6433cf74e594cabb",
+      "run_errors": [],
+      "note": "completed is the only state that is succeeded"
+    },
+    {
+      "name": "run_completed_succeeded_breaker_tripped",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":true,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"completed\",\"outcome\":\"succeeded\",\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":null,\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":true,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"outcome\":\"succeeded\",\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"completed\",\"state_seq\":1,\"stop\":null,\"termination\":{\"exit_code\":0,\"observed_at\":\"2026-11-07T20:01:00Z\",\"observer\":\"cgroup_events\",\"signal\":null,\"tree_empty\":true},\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a747275652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a22323032362d31312d30375432303a30313a30305a222c226f7574636f6d65223a22737563636565646564222c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a22636f6d706c65746564222c2273746174655f736571223a312c2273746f70223a6e756c6c2c227465726d696e6174696f6e223a7b22657869745f636f6465223a302c226f627365727665645f6174223a22323032362d31312d30375432303a30313a30305a222c226f62736572766572223a226367726f75705f6576656e7473222c227369676e616c223a6e756c6c2c22747265655f656d707479223a747275657d2c2274797065223a2252756e4031227d",
+      "sha256": "aadadd609982e73bd99b3441d7b1fdd79697e7a4e080f08cc973f9e3180547b4",
+      "run_errors": [],
+      "note": "breaker_tripped true does not force the outcome"
+    },
+    {
+      "name": "run_failed_failed",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":false,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"failed\",\"outcome\":\"failed\",\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":null,\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":false,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"outcome\":\"failed\",\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"failed\",\"state_seq\":1,\"stop\":null,\"termination\":{\"exit_code\":0,\"observed_at\":\"2026-11-07T20:01:00Z\",\"observer\":\"cgroup_events\",\"signal\":null,\"tree_empty\":true},\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a66616c73652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a22323032362d31312d30375432303a30313a30305a222c226f7574636f6d65223a226661696c6564222c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a226661696c6564222c2273746174655f736571223a312c2273746f70223a6e756c6c2c227465726d696e6174696f6e223a7b22657869745f636f6465223a302c226f627365727665645f6174223a22323032362d31312d30375432303a30313a30305a222c226f62736572766572223a226367726f75705f6576656e7473222c227369676e616c223a6e756c6c2c22747265655f656d707479223a747275657d2c2274797065223a2252756e4031227d",
+      "sha256": "b8eeee469d1cf035abfbfc8eebea85184035af19a889f35ee8752d2c9a573c7b",
+      "run_errors": [],
+      "note": "failed: outcome failed"
+    },
+    {
+      "name": "run_failed_unknown_breaker_tripped",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":true,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"failed\",\"outcome\":\"unknown\",\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":null,\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":true,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"outcome\":\"unknown\",\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"failed\",\"state_seq\":1,\"stop\":null,\"termination\":{\"exit_code\":0,\"observed_at\":\"2026-11-07T20:01:00Z\",\"observer\":\"cgroup_events\",\"signal\":null,\"tree_empty\":true},\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a747275652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a22323032362d31312d30375432303a30313a30305a222c226f7574636f6d65223a22756e6b6e6f776e222c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a226661696c6564222c2273746174655f736571223a312c2273746f70223a6e756c6c2c227465726d696e6174696f6e223a7b22657869745f636f6465223a302c226f627365727665645f6174223a22323032362d31312d30375432303a30313a30305a222c226f62736572766572223a226367726f75705f6576656e7473222c227369676e616c223a6e756c6c2c22747265655f656d707479223a747275657d2c2274797065223a2252756e4031227d",
+      "sha256": "d57da27a68dcbd247cc9119d4c61838b592cede96522cf505770978a1cd401e4",
+      "run_errors": [],
+      "note": "failed: unknown allowed; breaker true does not make it route_breaker_tripped"
+    },
+    {
+      "name": "run_timed_out",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":false,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"timed_out\",\"outcome\":\"timed_out\",\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":null,\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":false,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"outcome\":\"timed_out\",\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"timed_out\",\"state_seq\":1,\"stop\":null,\"termination\":{\"exit_code\":0,\"observed_at\":\"2026-11-07T20:01:00Z\",\"observer\":\"cgroup_events\",\"signal\":null,\"tree_empty\":true},\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a66616c73652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a22323032362d31312d30375432303a30313a30305a222c226f7574636f6d65223a2274696d65645f6f7574222c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a2274696d65645f6f7574222c2273746174655f736571223a312c2273746f70223a6e756c6c2c227465726d696e6174696f6e223a7b22657869745f636f6465223a302c226f627365727665645f6174223a22323032362d31312d30375432303a30313a30305a222c226f62736572766572223a226367726f75705f6576656e7473222c227369676e616c223a6e756c6c2c22747265655f656d707479223a747275657d2c2274797065223a2252756e4031227d",
+      "sha256": "ce4712a95ec8d0c20ce72095835edcd763d4da599fcd73962275fdf190868d96",
+      "run_errors": [],
+      "note": "own timeout: only timed_out (F2: never a fault or breaker trip)"
+    },
+    {
+      "name": "run_timed_out_as_breaker",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":true,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"timed_out\",\"outcome\":\"route_breaker_tripped\",\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":null,\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":true,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"outcome\":\"route_breaker_tripped\",\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"timed_out\",\"state_seq\":1,\"stop\":null,\"termination\":{\"exit_code\":0,\"observed_at\":\"2026-11-07T20:01:00Z\",\"observer\":\"cgroup_events\",\"signal\":null,\"tree_empty\":true},\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a747275652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a22323032362d31312d30375432303a30313a30305a222c226f7574636f6d65223a22726f7574655f627265616b65725f74726970706564222c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a2274696d65645f6f7574222c2273746174655f736571223a312c2273746f70223a6e756c6c2c227465726d696e6174696f6e223a7b22657869745f636f6465223a302c226f627365727665645f6174223a22323032362d31312d30375432303a30313a30305a222c226f62736572766572223a226367726f75705f6576656e7473222c227369676e616c223a6e756c6c2c22747265655f656d707479223a747275657d2c2274797065223a2252756e4031227d",
+      "sha256": "5318cb549f680d2444116faac932f0eb5a1c23fff8f1f274a3cce6b0fcdcb493",
+      "run_errors": [
+        "outcome_state_mismatch"
+      ],
+      "note": "own timeout claiming the breaker: refused"
+    },
+    {
+      "name": "run_cancelled",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":false,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"cancelled\",\"outcome\":\"cancelled\",\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":{\"requested_by\":\"caller\",\"reason\":\"caller_stop\",\"requested_at\":\"2026-11-07T20:00:05.250Z\",\"confirmed_at\":\"2026-11-07T20:01:00Z\"},\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":false,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"outcome\":\"cancelled\",\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"cancelled\",\"state_seq\":1,\"stop\":{\"confirmed_at\":\"2026-11-07T20:01:00Z\",\"reason\":\"caller_stop\",\"requested_at\":\"2026-11-07T20:00:05.250Z\",\"requested_by\":\"caller\"},\"termination\":{\"exit_code\":0,\"observed_at\":\"2026-11-07T20:01:00Z\",\"observer\":\"cgroup_events\",\"signal\":null,\"tree_empty\":true},\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a66616c73652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a22323032362d31312d30375432303a30313a30305a222c226f7574636f6d65223a2263616e63656c6c6564222c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a2263616e63656c6c6564222c2273746174655f736571223a312c2273746f70223a7b22636f6e6669726d65645f6174223a22323032362d31312d30375432303a30313a30305a222c22726561736f6e223a2263616c6c65725f73746f70222c227265717565737465645f6174223a22323032362d31312d30375432303a30303a30352e3235305a222c227265717565737465645f6279223a2263616c6c6572227d2c227465726d696e6174696f6e223a7b22657869745f636f6465223a302c226f627365727665645f6174223a22323032362d31312d30375432303a30313a30305a222c226f62736572766572223a226367726f75705f6576656e7473222c227369676e616c223a6e756c6c2c22747265655f656d707479223a747275657d2c2274797065223a2252756e4031227d",
+      "sha256": "ee3e852782e7b3c754481f61006d577e0667584caa14d7b0226e71514dbd677f",
+      "run_errors": [],
+      "note": "caller stop: cancelled"
+    },
+    {
+      "name": "run_stopped_kill_switch",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":false,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"stopped\",\"outcome\":\"stopped\",\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":{\"requested_by\":\"core\",\"reason\":\"kill_switch\",\"requested_at\":\"2026-11-07T20:00:05.250Z\",\"confirmed_at\":\"2026-11-07T20:01:00Z\"},\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":false,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"outcome\":\"stopped\",\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"stopped\",\"state_seq\":1,\"stop\":{\"confirmed_at\":\"2026-11-07T20:01:00Z\",\"reason\":\"kill_switch\",\"requested_at\":\"2026-11-07T20:00:05.250Z\",\"requested_by\":\"core\"},\"termination\":{\"exit_code\":0,\"observed_at\":\"2026-11-07T20:01:00Z\",\"observer\":\"cgroup_events\",\"signal\":null,\"tree_empty\":true},\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a66616c73652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a22323032362d31312d30375432303a30313a30305a222c226f7574636f6d65223a2273746f70706564222c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a2273746f70706564222c2273746174655f736571223a312c2273746f70223a7b22636f6e6669726d65645f6174223a22323032362d31312d30375432303a30313a30305a222c22726561736f6e223a226b696c6c5f737769746368222c227265717565737465645f6174223a22323032362d31312d30375432303a30303a30352e3235305a222c227265717565737465645f6279223a22636f7265227d2c227465726d696e6174696f6e223a7b22657869745f636f6465223a302c226f627365727665645f6174223a22323032362d31312d30375432303a30313a30305a222c226f62736572766572223a226367726f75705f6576656e7473222c227369676e616c223a6e756c6c2c22747265655f656d707479223a747275657d2c2274797065223a2252756e4031227d",
+      "sha256": "30fb76c700cab5a4b6638b54bf4b39b427ea06c22965a6e3aaf4c1a9306d5989",
+      "run_errors": [],
+      "note": "core stop: stopped"
+    },
+    {
+      "name": "run_stopped_breaker",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":true,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"stopped\",\"outcome\":\"route_breaker_tripped\",\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":{\"requested_by\":\"core\",\"reason\":\"breaker\",\"requested_at\":\"2026-11-07T20:00:05.250Z\",\"confirmed_at\":\"2026-11-07T20:01:00Z\"},\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":true,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"outcome\":\"route_breaker_tripped\",\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"stopped\",\"state_seq\":1,\"stop\":{\"confirmed_at\":\"2026-11-07T20:01:00Z\",\"reason\":\"breaker\",\"requested_at\":\"2026-11-07T20:00:05.250Z\",\"requested_by\":\"core\"},\"termination\":{\"exit_code\":0,\"observed_at\":\"2026-11-07T20:01:00Z\",\"observer\":\"cgroup_events\",\"signal\":null,\"tree_empty\":true},\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a747275652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a22323032362d31312d30375432303a30313a30305a222c226f7574636f6d65223a22726f7574655f627265616b65725f74726970706564222c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a2273746f70706564222c2273746174655f736571223a312c2273746f70223a7b22636f6e6669726d65645f6174223a22323032362d31312d30375432303a30313a30305a222c22726561736f6e223a22627265616b6572222c227265717565737465645f6174223a22323032362d31312d30375432303a30303a30352e3235305a222c227265717565737465645f6279223a22636f7265227d2c227465726d696e6174696f6e223a7b22657869745f636f6465223a302c226f627365727665645f6174223a22323032362d31312d30375432303a30313a30305a222c226f62736572766572223a226367726f75705f6576656e7473222c227369676e616c223a6e756c6c2c22747265655f656d707479223a747275657d2c2274797065223a2252756e4031227d",
+      "sha256": "780c0fe0bc964108cebd167817ddc8160674f98a48490c5eca8823090c7a74fc",
+      "run_errors": [],
+      "note": "core stop for the breaker: route_breaker_tripped with breaker_tripped true"
+    },
+    {
+      "name": "run_stopped_breaker_not_tripped",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":false,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"stopped\",\"outcome\":\"route_breaker_tripped\",\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":{\"requested_by\":\"core\",\"reason\":\"breaker\",\"requested_at\":\"2026-11-07T20:00:05.250Z\",\"confirmed_at\":\"2026-11-07T20:01:00Z\"},\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":false,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"outcome\":\"route_breaker_tripped\",\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"stopped\",\"state_seq\":1,\"stop\":{\"confirmed_at\":\"2026-11-07T20:01:00Z\",\"reason\":\"breaker\",\"requested_at\":\"2026-11-07T20:00:05.250Z\",\"requested_by\":\"core\"},\"termination\":{\"exit_code\":0,\"observed_at\":\"2026-11-07T20:01:00Z\",\"observer\":\"cgroup_events\",\"signal\":null,\"tree_empty\":true},\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a66616c73652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a22323032362d31312d30375432303a30313a30305a222c226f7574636f6d65223a22726f7574655f627265616b65725f74726970706564222c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a2273746f70706564222c2273746174655f736571223a312c2273746f70223a7b22636f6e6669726d65645f6174223a22323032362d31312d30375432303a30313a30305a222c22726561736f6e223a22627265616b6572222c227265717565737465645f6174223a22323032362d31312d30375432303a30303a30352e3235305a222c227265717565737465645f6279223a22636f7265227d2c227465726d696e6174696f6e223a7b22657869745f636f6465223a302c226f627365727665645f6174223a22323032362d31312d30375432303a30313a30305a222c226f62736572766572223a226367726f75705f6576656e7473222c227369676e616c223a6e756c6c2c22747265655f656d707479223a747275657d2c2274797065223a2252756e4031227d",
+      "sha256": "d7aa8698c5216e73f68bc50b29bb4c70fbe51a443548e11def1fb985fce29f4b",
+      "run_errors": [
+        "breaker_outcome_without_breaker"
+      ],
+      "note": "breaker stop reporting the breaker untripped: refused (A3 note)"
+    },
+    {
+      "name": "run_stopped_breaker_as_stopped",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":true,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"stopped\",\"outcome\":\"stopped\",\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":{\"requested_by\":\"core\",\"reason\":\"breaker\",\"requested_at\":\"2026-11-07T20:00:05.250Z\",\"confirmed_at\":\"2026-11-07T20:01:00Z\"},\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":true,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"outcome\":\"stopped\",\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"stopped\",\"state_seq\":1,\"stop\":{\"confirmed_at\":\"2026-11-07T20:01:00Z\",\"reason\":\"breaker\",\"requested_at\":\"2026-11-07T20:00:05.250Z\",\"requested_by\":\"core\"},\"termination\":{\"exit_code\":0,\"observed_at\":\"2026-11-07T20:01:00Z\",\"observer\":\"cgroup_events\",\"signal\":null,\"tree_empty\":true},\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a747275652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a22323032362d31312d30375432303a30313a30305a222c226f7574636f6d65223a2273746f70706564222c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a2273746f70706564222c2273746174655f736571223a312c2273746f70223a7b22636f6e6669726d65645f6174223a22323032362d31312d30375432303a30313a30305a222c22726561736f6e223a22627265616b6572222c227265717565737465645f6174223a22323032362d31312d30375432303a30303a30352e3235305a222c227265717565737465645f6279223a22636f7265227d2c227465726d696e6174696f6e223a7b22657869745f636f6465223a302c226f627365727665645f6174223a22323032362d31312d30375432303a30313a30305a222c226f62736572766572223a226367726f75705f6576656e7473222c227369676e616c223a6e756c6c2c22747265655f656d707479223a747275657d2c2274797065223a2252756e4031227d",
+      "sha256": "8296b27f947e8cd5f9d912838193e93bbb8a70d6d297f42760bb556983521bde",
+      "run_errors": [
+        "outcome_stop_reason_mismatch"
+      ],
+      "note": "breaker stop must say route_breaker_tripped, not stopped"
+    },
+    {
+      "name": "run_stopped_kill_switch_as_breaker",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":true,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"stopped\",\"outcome\":\"route_breaker_tripped\",\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":{\"requested_by\":\"core\",\"reason\":\"kill_switch\",\"requested_at\":\"2026-11-07T20:00:05.250Z\",\"confirmed_at\":\"2026-11-07T20:01:00Z\"},\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":true,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"outcome\":\"route_breaker_tripped\",\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"stopped\",\"state_seq\":1,\"stop\":{\"confirmed_at\":\"2026-11-07T20:01:00Z\",\"reason\":\"kill_switch\",\"requested_at\":\"2026-11-07T20:00:05.250Z\",\"requested_by\":\"core\"},\"termination\":{\"exit_code\":0,\"observed_at\":\"2026-11-07T20:01:00Z\",\"observer\":\"cgroup_events\",\"signal\":null,\"tree_empty\":true},\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a747275652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a22323032362d31312d30375432303a30313a30305a222c226f7574636f6d65223a22726f7574655f627265616b65725f74726970706564222c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a2273746f70706564222c2273746174655f736571223a312c2273746f70223a7b22636f6e6669726d65645f6174223a22323032362d31312d30375432303a30313a30305a222c22726561736f6e223a226b696c6c5f737769746368222c227265717565737465645f6174223a22323032362d31312d30375432303a30303a30352e3235305a222c227265717565737465645f6279223a22636f7265227d2c227465726d696e6174696f6e223a7b22657869745f636f6465223a302c226f627365727665645f6174223a22323032362d31312d30375432303a30313a30305a222c226f62736572766572223a226367726f75705f6576656e7473222c227369676e616c223a6e756c6c2c22747265655f656d707479223a747275657d2c2274797065223a2252756e4031227d",
+      "sha256": "488b3a35a8660b16b7efec9322194f8dc61d3351a622995bbede09a3e9d6dc0d",
+      "run_errors": [
+        "outcome_stop_reason_mismatch"
+      ],
+      "note": "kill switch stop cannot claim the breaker ended it"
+    },
+    {
+      "name": "run_stopped_orphan_sweep",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":false,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"stopped\",\"outcome\":\"unknown\",\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":{\"requested_by\":\"core\",\"reason\":\"orphan_sweep\",\"requested_at\":\"2026-11-07T20:00:05.250Z\",\"confirmed_at\":\"2026-11-07T20:01:00Z\"},\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":false,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"outcome\":\"unknown\",\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"stopped\",\"state_seq\":1,\"stop\":{\"confirmed_at\":\"2026-11-07T20:01:00Z\",\"reason\":\"orphan_sweep\",\"requested_at\":\"2026-11-07T20:00:05.250Z\",\"requested_by\":\"core\"},\"termination\":{\"exit_code\":0,\"observed_at\":\"2026-11-07T20:01:00Z\",\"observer\":\"cgroup_events\",\"signal\":null,\"tree_empty\":true},\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a66616c73652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a22323032362d31312d30375432303a30313a30305a222c226f7574636f6d65223a22756e6b6e6f776e222c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a2273746f70706564222c2273746174655f736571223a312c2273746f70223a7b22636f6e6669726d65645f6174223a22323032362d31312d30375432303a30313a30305a222c22726561736f6e223a226f727068616e5f7377656570222c227265717565737465645f6174223a22323032362d31312d30375432303a30303a30352e3235305a222c227265717565737465645f6279223a22636f7265227d2c227465726d696e6174696f6e223a7b22657869745f636f6465223a302c226f627365727665645f6174223a22323032362d31312d30375432303a30313a30305a222c226f62736572766572223a226367726f75705f6576656e7473222c227369676e616c223a6e756c6c2c22747265655f656d707479223a747275657d2c2274797065223a2252756e4031227d",
+      "sha256": "5dec0f68d6a04617a1bfad11ed4e0d827e32720649d2d17c23588d45d0eb70fa",
+      "run_errors": [],
+      "note": "orphan sweep: unknown (never success)"
+    },
+    {
+      "name": "run_limit_hit_breaker_tripped",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":true,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"limit_hit\",\"outcome\":\"route_breaker_tripped\",\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":null,\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":true,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"outcome\":\"route_breaker_tripped\",\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"limit_hit\",\"state_seq\":1,\"stop\":null,\"termination\":{\"exit_code\":0,\"observed_at\":\"2026-11-07T20:01:00Z\",\"observer\":\"cgroup_events\",\"signal\":null,\"tree_empty\":true},\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a747275652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a22323032362d31312d30375432303a30313a30305a222c226f7574636f6d65223a22726f7574655f627265616b65725f74726970706564222c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a226c696d69745f686974222c2273746174655f736571223a312c2273746f70223a6e756c6c2c227465726d696e6174696f6e223a7b22657869745f636f6465223a302c226f627365727665645f6174223a22323032362d31312d30375432303a30313a30305a222c226f62736572766572223a226367726f75705f6576656e7473222c227369676e616c223a6e756c6c2c22747265655f656d707479223a747275657d2c2274797065223a2252756e4031227d",
+      "sha256": "e6fafdfb20079faaff651dbdf945323c52b53f015274595f37b03107066b9092",
+      "run_errors": [],
+      "note": "typed plan limit: route_breaker_tripped, breaker tripped"
+    },
+    {
+      "name": "run_refused",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":false,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"refused\",\"outcome\":\"refused\",\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":null,\"stop\":null,\"termination\":null}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":false,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":null,\"outcome\":\"refused\",\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"refused\",\"state_seq\":1,\"stop\":null,\"termination\":null,\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a66616c73652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a6e756c6c2c226f7574636f6d65223a2272656675736564222c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a2272656675736564222c2273746174655f736571223a312c2273746f70223a6e756c6c2c227465726d696e6174696f6e223a6e756c6c2c2274797065223a2252756e4031227d",
+      "sha256": "9ec399bef2b01ce72b568fbd2e9d11a3afbc1c28e9f5d5df9d54d45a459e8e70",
+      "run_errors": [],
+      "note": "refused: outcome refused"
+    },
+    {
+      "name": "run_completed_unknown",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":false,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"completed\",\"outcome\":\"unknown\",\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":null,\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":false,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"outcome\":\"unknown\",\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"completed\",\"state_seq\":1,\"stop\":null,\"termination\":{\"exit_code\":0,\"observed_at\":\"2026-11-07T20:01:00Z\",\"observer\":\"cgroup_events\",\"signal\":null,\"tree_empty\":true},\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a66616c73652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a22323032362d31312d30375432303a30313a30305a222c226f7574636f6d65223a22756e6b6e6f776e222c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a22636f6d706c65746564222c2273746174655f736571223a312c2273746f70223a6e756c6c2c227465726d696e6174696f6e223a7b22657869745f636f6465223a302c226f627365727665645f6174223a22323032362d31312d30375432303a30313a30305a222c226f62736572766572223a226367726f75705f6576656e7473222c227369676e616c223a6e756c6c2c22747265655f656d707479223a747275657d2c2274797065223a2252756e4031227d",
+      "sha256": "e4540bce23ba8570b96aef250eca94dcd7a4ea0888509e4622c485c00cc52c38",
+      "run_errors": [
+        "outcome_state_mismatch"
+      ],
+      "note": "unknown never pretends success"
+    },
+    {
+      "name": "run_completed_null_outcome",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":false,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"completed\",\"outcome\":null,\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":null,\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":false,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"outcome\":null,\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"completed\",\"state_seq\":1,\"stop\":null,\"termination\":{\"exit_code\":0,\"observed_at\":\"2026-11-07T20:01:00Z\",\"observer\":\"cgroup_events\",\"signal\":null,\"tree_empty\":true},\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a66616c73652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a22323032362d31312d30375432303a30313a30305a222c226f7574636f6d65223a6e756c6c2c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a22636f6d706c65746564222c2273746174655f736571223a312c2273746f70223a6e756c6c2c227465726d696e6174696f6e223a7b22657869745f636f6465223a302c226f627365727665645f6174223a22323032362d31312d30375432303a30313a30305a222c226f62736572766572223a226367726f75705f6576656e7473222c227369676e616c223a6e756c6c2c22747265655f656d707479223a747275657d2c2274797065223a2252756e4031227d",
+      "sha256": "ac0e08658a88d7f2e895fab0d484ba0c16aa01abb96100bb6054bd741a3006e5",
+      "run_errors": [
+        "outcome_null_terminal"
+      ],
+      "note": "terminal with null outcome: refused"
+    },
+    {
+      "name": "run_outcome_absent",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":false,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"running\",\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":null,\"stop\":null,\"termination\":null}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":false,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":null,\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"running\",\"state_seq\":1,\"stop\":null,\"termination\":null,\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a66616c73652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a6e756c6c2c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a2272756e6e696e67222c2273746174655f736571223a312c2273746f70223a6e756c6c2c227465726d696e6174696f6e223a6e756c6c2c2274797065223a2252756e4031227d",
+      "sha256": "11439fa1d5627d2ddf918006535b7c8c223ee18eeed40e40b44a4f8984b8cc06",
+      "run_errors": [
+        "outcome_required"
+      ],
+      "note": "outcome is required even while null"
+    },
+    {
+      "name": "run_breaker_tripped_absent",
+      "input": "{\"type\":\"Run@1\",\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"running\",\"outcome\":null,\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":null,\"stop\":null,\"termination\":null}",
+      "expect": "ok",
+      "canonical": "{\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":null,\"outcome\":null,\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"running\",\"state_seq\":1,\"stop\":null,\"termination\":null,\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a6e756c6c2c226f7574636f6d65223a6e756c6c2c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a2272756e6e696e67222c2273746174655f736571223a312c2273746f70223a6e756c6c2c227465726d696e6174696f6e223a6e756c6c2c2274797065223a2252756e4031227d",
+      "sha256": "89ca83d08391ec278d918e32a52276262e0a2852bd567f4fc9c9b74ee509e4f2",
+      "run_errors": [
+        "breaker_tripped_required"
+      ],
+      "note": "breaker_tripped is required"
+    },
+    {
+      "name": "run_both_fields_absent",
+      "input": "{\"type\":\"Run@1\",\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"completed\",\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":null,\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "ok",
+      "canonical": "{\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"completed\",\"state_seq\":1,\"stop\":null,\"termination\":{\"exit_code\":0,\"observed_at\":\"2026-11-07T20:01:00Z\",\"observer\":\"cgroup_events\",\"signal\":null,\"tree_empty\":true},\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a22323032362d31312d30375432303a30313a30305a222c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a22636f6d706c65746564222c2273746174655f736571223a312c2273746f70223a6e756c6c2c227465726d696e6174696f6e223a7b22657869745f636f6465223a302c226f627365727665645f6174223a22323032362d31312d30375432303a30313a30305a222c226f62736572766572223a226367726f75705f6576656e7473222c227369676e616c223a6e756c6c2c22747265655f656d707479223a747275657d2c2274797065223a2252756e4031227d",
+      "sha256": "ce218490c6a859d82f51a4432e2286a194cf86157e28c18b2888f96ac9b9e2fb",
+      "run_errors": [
+        "breaker_tripped_required",
+        "outcome_required"
+      ],
+      "note": "both fields absent"
+    },
+    {
+      "name": "run_breaker_tripped_null",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":null,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"running\",\"outcome\":null,\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":null,\"stop\":null,\"termination\":null}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":null,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":null,\"outcome\":null,\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"running\",\"state_seq\":1,\"stop\":null,\"termination\":null,\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a6e756c6c2c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a6e756c6c2c226f7574636f6d65223a6e756c6c2c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a2272756e6e696e67222c2273746174655f736571223a312c2273746f70223a6e756c6c2c227465726d696e6174696f6e223a6e756c6c2c2274797065223a2252756e4031227d",
+      "sha256": "5cea876b7763a05bae920965599b4fd18bc8452f68c8b23c23df7a8982fa1856",
+      "run_errors": [
+        "breaker_tripped_not_boolean"
+      ],
+      "note": "null is not a boolean"
+    },
+    {
+      "name": "run_breaker_tripped_int",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":1,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"running\",\"outcome\":null,\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":null,\"stop\":null,\"termination\":null}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":null,\"outcome\":null,\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"running\",\"state_seq\":1,\"stop\":null,\"termination\":null,\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a312c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a6e756c6c2c226f7574636f6d65223a6e756c6c2c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a2272756e6e696e67222c2273746174655f736571223a312c2273746f70223a6e756c6c2c227465726d696e6174696f6e223a6e756c6c2c2274797065223a2252756e4031227d",
+      "sha256": "586741d24df1e54cef9466365b5164e0c562a07abea0224486b301e1a5edc933",
+      "run_errors": [
+        "breaker_tripped_not_boolean"
+      ],
+      "note": "1 is not true: canonical text keeps 1 and true distinct"
+    },
+    {
+      "name": "run_breaker_tripped_string",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":\"true\",\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"running\",\"outcome\":null,\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":null,\"stop\":null,\"termination\":null}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":\"true\",\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":null,\"outcome\":null,\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"running\",\"state_seq\":1,\"stop\":null,\"termination\":null,\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a2274727565222c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a6e756c6c2c226f7574636f6d65223a6e756c6c2c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a2272756e6e696e67222c2273746174655f736571223a312c2273746f70223a6e756c6c2c227465726d696e6174696f6e223a6e756c6c2c2274797065223a2252756e4031227d",
+      "sha256": "3d568e540bf5b0a16faa3fa9d2eaa3caf3a0981cecf099d9b36f356b29149e8f",
+      "run_errors": [
+        "breaker_tripped_not_boolean"
+      ],
+      "note": "a string is not a boolean"
+    },
+    {
+      "name": "run_outcome_not_in_enum",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":false,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"completed\",\"outcome\":\"Succeeded\",\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":null,\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":false,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"outcome\":\"Succeeded\",\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"completed\",\"state_seq\":1,\"stop\":null,\"termination\":{\"exit_code\":0,\"observed_at\":\"2026-11-07T20:01:00Z\",\"observer\":\"cgroup_events\",\"signal\":null,\"tree_empty\":true},\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a66616c73652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a22323032362d31312d30375432303a30313a30305a222c226f7574636f6d65223a22537563636565646564222c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a22636f6d706c65746564222c2273746174655f736571223a312c2273746f70223a6e756c6c2c227465726d696e6174696f6e223a7b22657869745f636f6465223a302c226f627365727665645f6174223a22323032362d31312d30375432303a30313a30305a222c226f62736572766572223a226367726f75705f6576656e7473222c227369676e616c223a6e756c6c2c22747265655f656d707479223a747275657d2c2274797065223a2252756e4031227d",
+      "sha256": "3e3570fb729e268c236b7fc03471456db9cd480146c4a8f75618bf65fa89901f",
+      "run_errors": [
+        "outcome_not_in_enum"
+      ],
+      "note": "closed enum, case-sensitive"
+    },
+    {
+      "name": "run_outcome_state_name",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":true,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"limit_hit\",\"outcome\":\"limit_hit\",\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":null,\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":true,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"outcome\":\"limit_hit\",\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"limit_hit\",\"state_seq\":1,\"stop\":null,\"termination\":{\"exit_code\":0,\"observed_at\":\"2026-11-07T20:01:00Z\",\"observer\":\"cgroup_events\",\"signal\":null,\"tree_empty\":true},\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a747275652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a22323032362d31312d30375432303a30313a30305a222c226f7574636f6d65223a226c696d69745f686974222c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a226c696d69745f686974222c2273746174655f736571223a312c2273746f70223a6e756c6c2c227465726d696e6174696f6e223a7b22657869745f636f6465223a302c226f627365727665645f6174223a22323032362d31312d30375432303a30313a30305a222c226f62736572766572223a226367726f75705f6576656e7473222c227369676e616c223a6e756c6c2c22747265655f656d707479223a747275657d2c2274797065223a2252756e4031227d",
+      "sha256": "ca309cb88f796e4c7cc526d93c0c9e32ffc868b86bb661ba72f3ecc231aaaf71",
+      "run_errors": [
+        "outcome_not_in_enum"
+      ],
+      "note": "a state name is not an outcome"
+    },
+    {
+      "name": "doc_run_outcome_breaker_reordered",
+      "input": "{\n  \"termination\": {\"signal\": null, \"observed_at\": \"2026-11-07T20:01:00Z\", \"exit_code\": 0, \"observer\": \"cgroup_events\", \"tree_empty\": true},\n  \"stop\": null, \"state_seq\": 2, \"state\": \"limit_hit\", \"started_at\": \"2026-11-07T20:00:00Z\", \"run_id\": \"run-1\",\n  \"request_id\": \"req-1\", \"outcome\": \"route_breaker_tripped\", \"ended_at\": \"2026-11-07T20:01:00Z\", \"created_at\": \"2026-11-07T20:00:00Z\", \"breaker_tripped\": true, \"type\": \"Run@1\"\n}\n",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":true,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"outcome\":\"route_breaker_tripped\",\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"limit_hit\",\"state_seq\":2,\"stop\":null,\"termination\":{\"exit_code\":0,\"observed_at\":\"2026-11-07T20:01:00Z\",\"observer\":\"cgroup_events\",\"signal\":null,\"tree_empty\":true},\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a747275652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a22323032362d31312d30375432303a30313a30305a222c226f7574636f6d65223a22726f7574655f627265616b65725f74726970706564222c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a226c696d69745f686974222c2273746174655f736571223a322c2273746f70223a6e756c6c2c227465726d696e6174696f6e223a7b22657869745f636f6465223a302c226f627365727665645f6174223a22323032362d31312d30375432303a30313a30305a222c226f62736572766572223a226367726f75705f6576656e7473222c227369676e616c223a6e756c6c2c22747265655f656d707479223a747275657d2c2274797065223a2252756e4031227d",
+      "sha256": "e46ebf300f8bd1616631c76123342a4f569f8634382e610b6e6e59472d99bc0d",
+      "run_errors": [],
+      "note": "same Run@1 as doc_run_outcome_breaker with keys reversed and whitespace: same digest"
+    },
+    {
+      "name": "doc_run_outcome_escaped_key",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":true,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"limit_hit\",\"\\u006futcome\":\"route_\\u0062reaker_tripped\",\"state_seq\":2,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":null,\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":true,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"outcome\":\"route_breaker_tripped\",\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"limit_hit\",\"state_seq\":2,\"stop\":null,\"termination\":{\"exit_code\":0,\"observed_at\":\"2026-11-07T20:01:00Z\",\"observer\":\"cgroup_events\",\"signal\":null,\"tree_empty\":true},\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a747275652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a22323032362d31312d30375432303a30313a30305a222c226f7574636f6d65223a22726f7574655f627265616b65725f74726970706564222c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a226c696d69745f686974222c2273746174655f736571223a322c2273746f70223a6e756c6c2c227465726d696e6174696f6e223a7b22657869745f636f6465223a302c226f627365727665645f6174223a22323032362d31312d30375432303a30313a30305a222c226f62736572766572223a226367726f75705f6576656e7473222c227369676e616c223a6e756c6c2c22747265655f656d707479223a747275657d2c2274797065223a2252756e4031227d",
+      "sha256": "e46ebf300f8bd1616631c76123342a4f569f8634382e610b6e6e59472d99bc0d",
+      "run_errors": [],
+      "note": "escapes in the key and value unescape to the same Run@1: same digest as doc_run_outcome_breaker"
+    },
+    {
+      "name": "dup_breaker_tripped",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":false,\"breaker_tripped\":true,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"limit_hit\",\"outcome\":\"route_breaker_tripped\",\"state_seq\":2,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":null,\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "reject",
+      "reason": "duplicate_key",
+      "note": "duplicate breaker_tripped: refused, never last-wins (false then true would otherwise pass A3)"
+    },
+    {
+      "name": "dup_outcome_via_escape",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":true,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"limit_hit\",\"outcome\":\"failed\",\"\\u006futcome\":\"route_breaker_tripped\",\"state_seq\":2,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":null,\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "reject",
+      "reason": "duplicate_key",
+      "note": "duplicate outcome compared after unescaping"
+    },
+    {
+      "name": "dup_outcome_nested_termination",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":true,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"limit_hit\",\"outcome\":\"route_breaker_tripped\",\"state_seq\":2,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":null,\"termination\":{\"tree_empty\":true,\"tree_empty\":false,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "reject",
+      "reason": "duplicate_key",
+      "note": "duplicate inside the enclosing Run@1's termination: the whole document is refused"
+    },
+    {
+      "name": "breaker_tripped_nan",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":NaN,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"limit_hit\",\"outcome\":\"route_breaker_tripped\",\"state_seq\":2,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":null,\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "reject",
+      "reason": "non_finite",
+      "note": "NaN is refused"
+    },
+    {
+      "name": "breaker_tripped_infinity",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":Infinity,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"limit_hit\",\"outcome\":\"route_breaker_tripped\",\"state_seq\":2,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":null,\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "reject",
+      "reason": "non_finite",
+      "note": "Infinity is refused"
+    },
+    {
+      "name": "outcome_negative_infinity",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":true,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"limit_hit\",\"outcome\":-Infinity,\"state_seq\":2,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":null,\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "reject",
+      "reason": "non_finite",
+      "note": "-Infinity is refused"
+    },
+    {
+      "name": "breaker_tripped_float_one",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":1.0,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"limit_hit\",\"outcome\":\"route_breaker_tripped\",\"state_seq\":2,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":null,\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "reject",
+      "reason": "float",
+      "note": "an integral float is still a float"
+    },
+    {
+      "name": "state_seq_exponent",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":true,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"limit_hit\",\"outcome\":\"route_breaker_tripped\",\"state_seq\":2e0,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":null,\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "reject",
+      "reason": "float",
+      "note": "exponent form refused even when integral"
+    },
+    {
+      "name": "state_seq_past_2_53",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":true,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"limit_hit\",\"outcome\":\"route_breaker_tripped\",\"state_seq\":9007199254740992,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":null,\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "reject",
+      "reason": "integer_range",
+      "note": "past 2^53-1: refused, never rounded"
+    },
+    {
+      "name": "outcome_lone_surrogate",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":true,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"limit_hit\",\"outcome\":\"\\ud800\",\"state_seq\":2,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":null,\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "reject",
+      "reason": "lone_surrogate",
+      "note": "a lone surrogate is not a Unicode scalar value"
+    },
+    {
+      "name": "outcome_bare_true",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":true,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"limit_hit\",\"outcome\":True,\"state_seq\":2,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":null,\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "reject",
+      "reason": "not_json",
+      "note": "Python-style True is not JSON"
+    },
+    {
+      "name": "run_bom",
+      "input_utf8_hex": "efbbbf7b2274797065223a2252756e4031222c22627265616b65725f74726970706564223a747275652c2272756e5f6964223a2272756e2d31222c22726571756573745f6964223a227265712d31222c227374617465223a226c696d69745f686974222c226f7574636f6d65223a22726f7574655f627265616b65725f74726970706564222c2273746174655f736571223a322c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a22323032362d31312d30375432303a30313a30305a222c2273746f70223a6e756c6c2c227465726d696e6174696f6e223a7b22747265655f656d707479223a747275652c226f62736572766572223a226367726f75705f6576656e7473222c22657869745f636f6465223a302c227369676e616c223a6e756c6c2c226f627365727665645f6174223a22323032362d31312d30375432303a30313a30305a227d7d",
+      "expect": "reject",
+      "reason": "bom",
+      "note": "a byte order mark is refused"
+    }
+  ]
+}

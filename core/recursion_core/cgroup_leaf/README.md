@@ -28,11 +28,23 @@ path (normal return, exception, launch failure, cancellation) kills the leaf.
   so an empty leaf does not prove the tree ended (PRODUCT.md 055cc7a5 §3.4 S5 and
   the Stop bullet, C1-27). Every outcome carries `escape_observable=False`;
   `terminated` is reserved for a launch path that can observe escapes. A populated
-  or unobserved leaf is never removed. `sweep()` kills leftover leaves after a
-  launcher crash and books them `empty`, not `terminated`, because their exits
-  were not seen.
+  or unobserved leaf is never removed: populated `0` with the main exit unseen is
+  `unknown`, and the leaf and pidfd are kept so a later `close()` retries the kill.
+- Restart: `sweep(keep)` kills leftover leaves the durable run registry no longer
+  lists and books them `empty`, not `terminated`, because their exits were not
+  seen. `keep` is required (no kill-everything default) and must name every leaf
+  the registry still owns, including another launcher's on the same root; those
+  leaves are untouched. `adopt(name)` returns a handle for a kept leaf so the
+  restarted daemon can kill it later; its best outcome is `empty`
+  (PRODUCT.md 055cc7a5 §3.1, Q38/O53).
 - Errors: a cleanup problem never replaces the original exception; it is added
   as a note. On a clean exit, incomplete cleanup raises `CleanupIncomplete`.
+- Interrupted cleanup: `finally` can be interrupted (PRODUCT.md 055cc7a5 §3.4,
+  C2-10), so an exception raised inside cleanup (a second `KeyboardInterrupt`, for example)
+  is noted and the kill retried, up to 5 attempts, on every exit path; the
+  interrupt still propagates. Only a final outcome (leaf removed) is cached; any
+  other `close()` outcome is retried by the next `close()`. If every attempt is
+  interrupted the leaf stays on disk, and the startup `sweep()` is the backstop.
 
 ## Limits
 
@@ -56,6 +68,11 @@ path (normal return, exception, launch failure, cancellation) kills the leaf.
   processes. They exercise the trampoline, pidfd and evidence logic, not kernel
   cgroup behaviour. The live cell runs only when `RECURSION_CGROUP_ROOT` points at
   a writable delegated root. The hd18/escgrp/dwdump cells are not run here.
+- Open for Lucas (CSL-738 wiring): the launcher must sit in the delegated
+  subtree, so if the daemon unit is the launcher, its runs sit inside the
+  daemon's own unit and a default `KillMode=control-group` stop ends them,
+  against §3.1 ("runs live outside the daemon's own unit"). Which process
+  launches, and where the delegated root sits, is not decided here.
 - Child environment (B1) is not handled here: `env` is passed through as given.
 
 ## B6 evidence contract (Lucas, Nov 8)
@@ -74,7 +91,9 @@ switches no uid.
   to a `cgroup.procs` outside the leaf, and an unprivileged
   `AttachProcessesToUnit` call for its own pid on the system bus (O65: PID 1
   checks only process ownership; the attempt records bus, call, unit, subcgroup
-  and pids, and must be refused). Each attempt records the caller's uid
+  and pids, and must be refused). Each attempt runs from its own caller
+  process: a caller pid repeated within an arm fails, so one trial copied ten
+  times is not 10/10. Each attempt records the caller's uid
   (must be the record's `engine_uid`, not the operator's), its pid, its cgroup
   before the attempt (must already be in the leaf) and the run's expected pids.
   Every attempt must fail (exit 0 of the scope call fails the bar even if the
@@ -96,6 +115,8 @@ switches no uid.
   spawning thread fails. This same-uid
   launcher still never arms it, and cleanup never relies on it (CSL-706).
 - Verdicts: `pass` needs `evidence_class: host` plus host, kernel, systemd,
-  capture time and the command log's SHA-256. Any other class is `structural` at
+  capture time and the command log's SHA-256 (64 lowercase hex characters; the
+  contract reads no files, so matching it to the log is the reviewer's check).
+  Any other class is `structural` at
   best. The tests use hand-built fixtures, so they are structural only; no host
   evidence for these bars exists yet.

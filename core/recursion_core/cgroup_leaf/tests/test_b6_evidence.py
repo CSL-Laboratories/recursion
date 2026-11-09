@@ -5,6 +5,7 @@ schema and the contract's logic; they say nothing about kernel or systemd behavi
 No systemd, cgroup write, uid switch or root command runs here.
 """
 import copy
+import itertools
 import random
 import unittest
 
@@ -16,7 +17,14 @@ OUTSIDE = '/user.slice/user-1000.slice/user@1000.service/app.slice/run-x.scope'
 ENGINE_UID, OPERATOR_UID = 1000, 1001
 
 
-def attempt(method, *, pid=4101, child=4102, **fields):
+CALLERS = itertools.count(9101, 2)  # each trial is its own caller process
+
+
+def attempt(method, *, pid=None, child=None, **fields):
+    if pid is None:
+        pid = next(CALLERS)
+    if child is None:
+        child = pid + 1
     base = {'method': method, 'uid': ENGINE_UID, 'pid': pid, 'initial_cgroup': LEAF,
             'expected_pids': [pid, child], 'run_pids': {str(pid): LEAF, str(child): LEAF + '/sub'}}
     if method == 'scope':
@@ -30,15 +38,20 @@ def attempt(method, *, pid=4101, child=4102, **fields):
     return base
 
 
+def arm(first_pid, **per_method):
+    """30 attempts, one caller per trial: attempt i has pid first_pid + 2*i, child pid + 1."""
+    methods = [m for m in ('scope', 'direct_write', 'attach_unit') for _ in range(10)]
+    return [attempt(m, pid=first_pid + 2 * i, **per_method.get(m, {}))
+            for i, m in enumerate(methods)]
+
+
 def absent_attempts():
-    return ([attempt('scope') for _ in range(10)] + [attempt('direct_write') for _ in range(10)]
-            + [attempt('attach_unit') for _ in range(10)])
+    return arm(4101)
 
 
 def control_attempts():
-    return ([attempt('scope', exit_code=0, sleep_cgroup=OUTSIDE) for _ in range(10)]
-            + [attempt('direct_write', refused=False) for _ in range(10)]
-            + [attempt('attach_unit', refused=False) for _ in range(10)])
+    return arm(5101, scope={'exit_code': 0, 'sleep_cgroup': OUTSIDE},
+               direct_write={'refused': False}, attach_unit={'refused': False})
 
 
 def host_record():
@@ -80,6 +93,37 @@ class ContractTests(unittest.TestCase):
             with self.subTest(field=field):
                 self.assertEqual(self.mutated(lambda r: r.pop(field)), 'fail')
         self.assertEqual(self.mutated(lambda r: r.update(host=True)), 'fail')
+
+    def test_command_log_hash_must_be_a_sha256_digest(self):
+        for value in ('x', 'a' * 63, 'a' * 65, 'A' * 64, 'g' * 64, ' ' + 'a' * 63):
+            with self.subTest(value=value):
+                self.assertEqual(self.mutated(lambda r: r.update(command_log_sha256=value)), 'fail')
+
+    def test_one_trial_copied_ten_times_is_not_ten_trials(self):
+        # O65 10/10: a repeated caller pid within an arm is one trial copied, not n=10.
+        def copy_absent(r):
+            r['manager_absent']['attempts'] = [attempt(m, pid=4101) for m in
+                                               b6_evidence.METHODS for _ in range(10)]
+        record = host_record()
+        copy_absent(record)
+        result = evaluate(record)
+        self.assertEqual(result['verdict'], 'fail')
+        self.assertTrue(any('repeat a caller pid' in r for r in result['reasons']))
+
+        def copy_control(r):
+            controls = r['manager_present']['attempts']
+            controls[1] = copy.deepcopy(controls[0])
+        record = host_record()
+        copy_control(record)
+        result = evaluate(record)
+        self.assertEqual(result['verdict'], 'invalid')
+        self.assertTrue(any('repeat a caller pid' in r for r in result['reasons']))
+
+    def test_fixture_trials_are_distinct(self):
+        record = host_record()
+        for arm in ('manager_absent', 'manager_present'):
+            pids = [a['pid'] for a in record[arm]['attempts']]
+            self.assertEqual(len(pids), len(set(pids)))
 
     def test_existing_bars_kept(self):
         cases = [('escapers', {'escaped': 1, 'total': 120}), ('escapers', {'escaped': 0, 'total': 119}),
@@ -137,18 +181,20 @@ class ContractTests(unittest.TestCase):
                                  'fail')
 
     def test_every_expected_pid_must_be_read_back_inside_the_leaf(self):
-        cases = [lambda a: a['run_pids'].update({'4102': OUTSIDE}),
-                 lambda a: a['run_pids'].update({'4102': LEAF + '/../escape'}),
-                 lambda a: a['run_pids'].update({'4102': LEAF + '-evil'}),
-                 lambda a: a['run_pids'].pop('4102'),                        # subset read back
+        def own(a):
+            return a['pid'], a['pid'] + 1, str(a['pid']), str(a['pid'] + 1)
+        cases = [lambda a: a['run_pids'].update({own(a)[3]: OUTSIDE}),
+                 lambda a: a['run_pids'].update({own(a)[3]: LEAF + '/../escape'}),
+                 lambda a: a['run_pids'].update({own(a)[3]: LEAF + '-evil'}),
+                 lambda a: a['run_pids'].pop(own(a)[3]),                     # subset read back
                  lambda a: a['run_pids'].update({'4999': LEAF}),             # unexpected pid
                  lambda a: a.update(run_pids={}),
-                 lambda a: a.update(run_pids={'abc': LEAF, '4101': LEAF}),
-                 lambda a: a.update(run_pids={'04101': LEAF, '4102': LEAF}),
-                 lambda a: a.update(expected_pids=[4102]),                   # caller missing
-                 lambda a: a.update(expected_pids=[4101, 4101, 4102]),
-                 lambda a: a.update(expected_pids=[4101, True]),
-                 lambda a: a.update(expected_pids='4101')]
+                 lambda a: a.update(run_pids={'abc': LEAF, own(a)[2]: LEAF}),
+                 lambda a: a.update(run_pids={'0' + own(a)[2]: LEAF, own(a)[3]: LEAF}),
+                 lambda a: a.update(expected_pids=[own(a)[1]]),              # caller missing
+                 lambda a: a.update(expected_pids=[own(a)[0], own(a)[0], own(a)[1]]),
+                 lambda a: a.update(expected_pids=[own(a)[0], True]),
+                 lambda a: a.update(expected_pids=own(a)[2])]
         for index in (0, 15, 25):
             for i, change in enumerate(cases):
                 with self.subTest(index=index, case=i):
@@ -193,7 +239,8 @@ class ContractTests(unittest.TestCase):
 
     def test_attach_moving_a_pid_out_fails(self):
         self.assertEqual(self.mutated(
-            lambda r: r['manager_absent']['attempts'][21]['run_pids'].update({'4101': OUTSIDE})), 'fail')
+            lambda r: r['manager_absent']['attempts'][21]['run_pids'].update(
+                {str(r['manager_absent']['attempts'][21]['pid'] + 1): OUTSIDE})), 'fail')
 
     def test_control_needs_n10_attach_with_recorded_outcome(self):
         for mutate in (lambda c: c['attempts'].pop(25),

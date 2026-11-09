@@ -44,6 +44,8 @@ class FakeCgroup(Cgroup2):
         self.events_broken = False
         self.member_override = None
         self.procs_override = None
+        self.interrupts = 0  # cgroup.kill raises KeyboardInterrupt this many times
+        self.interrupt_after_remove = False
 
     def make_leaf(self, leaf):
         os.mkdir(leaf, 0o755)
@@ -60,6 +62,9 @@ class FakeCgroup(Cgroup2):
         return int(text) if text else None
 
     def kill(self, leaf):
+        if self.interrupts:
+            self.interrupts -= 1
+            raise KeyboardInterrupt('second interrupt during cleanup')
         if self.kill_broken:
             raise OSError('cgroup.kill refused')
         main = self.main(leaf)
@@ -97,6 +102,9 @@ class FakeCgroup(Cgroup2):
         for name in ('cgroup.procs', 'cgroup.kill', 'cgroup.events'):
             (leaf / name).unlink(missing_ok=True)
         os.rmdir(leaf)
+        if self.interrupt_after_remove:
+            self.interrupt_after_remove = False
+            raise KeyboardInterrupt('interrupt right after rmdir')
 
 
 class LeafTests(unittest.TestCase):
@@ -279,17 +287,132 @@ class LeafTests(unittest.TestCase):
         run.proc.wait(5)  # killed by cgroup.kill and pidfd before the observer raised
         self.assertTrue(any('ZeroDivisionError' in n for n in caught.exception.__notes__))
 
-    def test_sweep_of_unseen_leaf_is_empty_not_terminated(self):
-        leaf = self.root_path / 'run-left'
+    def orphan_leaf(self, name):
+        leaf = self.root_path / name
         self.fs.make_leaf(leaf)
         orphan = subprocess.Popen(['sleep', '60'], start_new_session=True)
         self.cleanup_pids.append(orphan.pid)
         (leaf / 'cgroup.procs').write_text(str(orphan.pid))
-        outcomes = self.root.sweep()
+        return orphan
+
+    def test_sweep_of_unseen_leaf_is_empty_not_terminated(self):
+        orphan = self.orphan_leaf('run-left')
+        outcomes = self.root.sweep(keep=())
         orphan.wait(5)
         self.assertEqual(outcomes['run-left'].state, 'empty')
         self.assertFalse(outcomes['run-left'].main_exit_seen)
         self.assertEqual(self.leaves(), [])
+
+    # Restart (finding 1): the registry's live runs survive the startup sweep
+    def test_sweep_spares_registered_runs_and_adopt_kills_later(self):
+        live = self.orphan_leaf('run-live')
+        other = self.orphan_leaf('run-other-launcher')
+        stale = self.orphan_leaf('run-stale')
+        outcomes = self.root.sweep(keep={'run-live', 'run-other-launcher'})
+        stale.wait(5)
+        self.assertEqual(set(outcomes), {'run-stale'})
+        self.assertTrue(alive(live.pid) and alive(other.pid))
+        self.assertEqual(self.leaves(), ['run-live', 'run-other-launcher'])
+        outcome = self.root.adopt('run-live').close()
+        live.wait(5)
+        self.assertEqual(outcome.state, 'empty')  # exit not seen by this process
+        self.assertFalse(outcome.main_exit_seen)
+        self.assertTrue(alive(other.pid))
+        self.assertEqual(self.leaves(), ['run-other-launcher'])
+
+    def test_sweep_has_no_kill_everything_default(self):
+        self.assertIs(inspect.signature(DelegatedRoot.sweep).parameters['keep'].default,
+                      inspect.Parameter.empty)
+        for bad in ('run-live', b'run-live', ['../run-x']):
+            with self.assertRaises((TypeError, ValueError), msg=repr(bad)):
+                self.root.sweep(keep=bad)
+
+    def test_adopt_refuses_missing_or_bad_leaf(self):
+        with self.assertRaises(PermissionError):
+            self.root.adopt('run-missing')
+        with self.assertRaises(ValueError):
+            self.root.adopt('../run-x')
+
+    # Unseen exit (finding 4): an empty leaf without a seen exit is kept
+    def test_empty_leaf_with_unseen_exit_is_kept_with_its_pidfd(self):
+        run = self.root.launch('run-a', ['sleep', '60'], kill_timeout=0.2)
+        self.cleanup_pids.append(run.pid)
+        self.fs.kill_broken = True
+        with patch.object(self.fs, 'populated', return_value=False), \
+             patch.object(cgroup_leaf.signal, 'pidfd_send_signal', side_effect=PermissionError):
+            outcome = run.close()
+        self.assertEqual(outcome.state, 'unknown')
+        self.assertFalse(outcome.main_exit_seen)
+        self.assertTrue(alive(run.pid))
+        self.assertEqual(self.leaves(), ['run-a'])  # evidence kept
+        self.assertIsNotNone(run.pidfd)  # kill handle kept
+        self.fs.kill_broken = False
+        retried = run.close()  # not final, so close() retries the kill
+        self.assertEqual(retried.state, 'leaf_empty')
+        self.assertEqual(retried.returncode, -signal.SIGKILL)
+        self.assertIsNone(run.pidfd)
+        self.assertEqual(self.leaves(), [])
+        self.assertIs(run.close(), retried)  # final outcome is cached
+
+    # Interrupted cleanup (finding 5): retried on every exit path
+    def test_interrupt_during_cleanup_after_exception_is_retried(self):
+        with self.assertLogs(level='ERROR'), \
+             self.assertRaisesRegex(ValueError, 'body') as caught:
+            with self.root.launch('run-a', self.sh('sleep 60 & echo $! > gc; wait'),
+                                  cwd=self.work) as run:
+                gc = self.grandchild()
+                self.fs.interrupts = 2
+                raise ValueError('body')
+        self.assertEqual(run.outcome.state, 'leaf_empty')
+        self.assertFalse(alive(gc))
+        self.assertEqual(self.leaves(), [])
+        notes = [n for n in caught.exception.__notes__ if 'KeyboardInterrupt' in n]
+        self.assertEqual(len(notes), 2)
+
+    def test_interrupt_during_cleanup_on_normal_exit_is_retried_and_propagates(self):
+        with self.assertLogs(level='ERROR'), self.assertRaises(KeyboardInterrupt):
+            with self.root.launch('run-a', self.sh('sleep 60 & echo $! > gc; wait'),
+                                  cwd=self.work) as run:
+                gc = self.grandchild()
+                self.fs.interrupts = 1
+        self.assertEqual(run.outcome.state, 'leaf_empty')
+        self.assertFalse(alive(gc))
+        self.assertEqual(self.leaves(), [])
+
+    def test_interrupt_during_launch_cleanup_is_retried(self):
+        self.fs.member_override = self.mount / 'elsewhere'
+        self.fs.interrupts = 1
+        with patch.object(cgroup_leaf.LeafRun, '_cleanup_after',
+                          autospec=True, side_effect=cgroup_leaf.LeafRun._cleanup_after) as spy, \
+             self.assertLogs(level='ERROR'), self.assertRaises(LaunchError):
+            self.root.launch('run-a', ['sleep', '60'])
+        run = spy.call_args.args[0]
+        self.assertEqual(run.outcome.state, 'leaf_empty')
+        self.assertFalse(alive(run.pid))
+
+    def test_interrupt_after_rmdir_rebuilds_outcome(self):
+        with self.assertLogs(level='ERROR'), self.assertRaises(KeyboardInterrupt):
+            with self.root.launch('run-a', ['sleep', '60']) as run:
+                self.fs.interrupt_after_remove = True
+        self.assertEqual(run.outcome.state, 'leaf_empty')
+        self.assertEqual(run.outcome.errors, ())
+        self.assertEqual(self.leaves(), [])
+
+    def test_interrupt_storm_keeps_leaf_for_the_sweep(self):
+        with self.assertLogs(level='ERROR'), \
+             self.assertRaisesRegex(ValueError, 'body') as caught:
+            with self.root.launch('run-a', self.sh('sleep 60 & echo $! > gc; wait'),
+                                  cwd=self.work) as run:
+                gc = self.grandchild()
+                self.fs.interrupts = cgroup_leaf.CLEANUP_ATTEMPTS
+                raise ValueError('body')
+        self.assertTrue(any('abandoned' in n for n in caught.exception.__notes__))
+        self.assertIsNone(run.outcome)
+        self.assertEqual(self.leaves(), ['run-a'])
+        outcomes = self.root.sweep(keep=())  # the durable backstop after a crash
+        self.assertEqual(outcomes['run-a'].state, 'empty')
+        run.proc.wait(5)
+        self.assertFalse(alive(gc))
 
     # Path constraints
     def test_root_constraints(self):

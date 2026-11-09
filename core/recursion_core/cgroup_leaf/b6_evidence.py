@@ -17,7 +17,9 @@ Bars (all kept from Nov 7, plus the Nov 8 migration probe):
   ``systemd-run --user --scope -- sleep 60``, a direct write of its own pid to a
   ``cgroup.procs`` outside the leaf, and an unprivileged ``AttachProcessesToUnit``
   call on the system bus for its own pid (O65: PID 1 checks only process
-  ownership). Each attempt records the caller's uid and pid,
+  ownership). Each attempt runs from its own caller process and records the
+  caller's uid and pid (a pid repeated within an arm fails: one trial copied N
+  times is not N trials),
   the caller's cgroup before the attempt (it must already be in the leaf), and the
   run's expected pids. Every attempt fails, and afterwards ``/proc/<pid>/cgroup``
   names the leaf for every expected pid in the run;
@@ -38,6 +40,7 @@ Malformed records fail closed; ``evaluate`` never raises on them.
 """
 from __future__ import annotations
 
+import re
 from pathlib import PurePosixPath
 
 N_ESCAPERS, N_PROBE = 120, 10
@@ -45,6 +48,7 @@ SCOPE_ARGV = ('systemd-run', '--user', '--scope', '--', 'sleep', '60')
 HOST_FIELDS = ('host', 'kernel', 'systemd', 'captured_at', 'command_log_sha256')
 METHODS = ('scope', 'direct_write', 'attach_unit')
 ATTACH_CALL = 'org.freedesktop.systemd1.Manager.AttachProcessesToUnit'
+SHA256_HEX = re.compile(r'[0-9a-f]{64}')
 
 
 def _int(value, minimum=0):
@@ -186,6 +190,13 @@ def _by_method(attempts, method):
     return [a for a in attempts if isinstance(a, dict) and a.get('method') == method]
 
 
+def _distinct_callers(attempts):
+    """Each attempt is its own process: a caller pid repeated within an arm means one
+    trial was copied, not N_PROBE trials run (O65 10/10)."""
+    pids = [a.get('pid') for a in attempts if isinstance(a, dict) and _int(a.get('pid'), 1)]
+    return len(pids) == len(set(pids))
+
+
 def _spawner(order, spawner):
     """B33: armed after the uid switch, before exec, from one long-lived spawning thread."""
     if not isinstance(order, list) or not all(isinstance(s, str) for s in order) \
@@ -249,6 +260,8 @@ def evaluate(record):
                 reasons.append(f'migration {method} #{i + 1}: {why}')
     if len(attempts) != sum(len(_by_method(attempts, m)) for m in METHODS):
         reasons.append('manager-absent attempts include an unknown or malformed entry')
+    if not _distinct_callers(attempts):
+        reasons.append('manager-absent attempts repeat a caller pid: trials are not distinct')
 
     b33 = _spawner(record.get('spawn_order'), record.get('pdeathsig_spawner'))
     if b33:
@@ -270,6 +283,8 @@ def evaluate(record):
                 control_reasons.append(f'control {method} #{i + 1}: {why}')
     if len(controls) != sum(len(_by_method(controls, m)) for m in METHODS):
         control_reasons.append('control attempts include an unknown or malformed entry')
+    if not _distinct_callers(controls):
+        control_reasons.append('control attempts repeat a caller pid: trials are not distinct')
 
     if record.get('evidence_class') != 'host':
         return {'verdict': 'structural', 'reasons': reasons + control_reasons
@@ -277,6 +292,9 @@ def evaluate(record):
     missing = [f for f in HOST_FIELDS if not (isinstance(record.get(f), str) and record.get(f))]
     if missing:
         return {'verdict': 'fail', 'reasons': reasons + control_reasons + [f'host fields missing: {missing}']}
+    if not SHA256_HEX.fullmatch(record['command_log_sha256']):
+        return {'verdict': 'fail', 'reasons': reasons + control_reasons + [
+            'command_log_sha256 is not a lowercase hex SHA-256 digest']}
     if control_reasons:
         return {'verdict': 'invalid', 'reasons': reasons + control_reasons + [
             'manager-present control did not reproduce the escape via systemd-run --user --scope '

@@ -38,6 +38,7 @@ from dataclasses import dataclass
 log = logging.getLogger(__name__)
 
 LEAF_NAME = re.compile(r'run-[a-zA-Z0-9_-]{1,64}')
+CLEANUP_ATTEMPTS = 5  # bounded: an interrupt storm leaves the leaf to the sweep
 
 # Runs in the child: join the leaf, then exec. On any failure it reports through
 # the error pipe and exits without exec, so the target never runs outside the leaf.
@@ -163,10 +164,36 @@ class DelegatedRoot:
             raise
         return run
 
-    def sweep(self, kill_timeout=5.0):
-        """Kill leftover leaves (launcher died). Their exits are unseen: never terminated."""
+    def adopt(self, name, kill_timeout=5.0):
+        """Re-adopt a registered leaf after a restart: a handle that can kill it later.
+
+        The pid is not this process's child, so its exit can never be seen here; the
+        best close() can book is ``empty`` (S5: never terminated without a seen exit).
+        """
+        leaf = self.leaf(name)
+        if leaf.is_symlink() or not leaf.is_dir() or os.lstat(leaf).st_uid != os.getuid():
+            raise PermissionError('Leaf is not an operator-owned directory')
+        return LeafRun(self.fs, leaf, kill_timeout)
+
+    def sweep(self, keep, kill_timeout=5.0):
+        """Kill leftover leaves that the durable run registry does not list.
+
+        ``keep`` is required and must be every leaf name the registry still owns
+        (runs to re-adopt and runs of any other launcher on this root). Those leaves
+        are not touched; re-adopt them with adopt(). There is deliberately no
+        kill-everything default: a daemon restart or upgrade must not end live runs
+        (PRODUCT.md 055cc7a5 section 3.1, grill Q38 / O53). Exits of swept leaves are
+        unseen, so they are never booked terminated.
+        """
+        if isinstance(keep, (str, bytes)):
+            raise TypeError('keep must be a collection of leaf names, not a string')
+        keep = set(keep)
+        for name in keep:
+            self.leaf(name)  # validate: a malformed name cannot match a leaf
         outcomes = {}
         for leaf in sorted(self.path.iterdir()):
+            if leaf.name in keep:
+                continue
             if leaf.is_dir() and not leaf.is_symlink() and LEAF_NAME.fullmatch(leaf.name):
                 outcomes[leaf.name] = LeafRun(self.fs, leaf, kill_timeout).close()
         return outcomes
@@ -178,6 +205,7 @@ class LeafRun:
         self.proc = None
         self.pidfd = None
         self.outcome = None
+        self.removing = self.removed = False
         self.lock = threading.Lock()
 
     @property
@@ -226,13 +254,24 @@ class LeafRun:
         return self.proc.wait(timeout)
 
     def close(self) -> Outcome:
-        """Kill the leaf and collect evidence. Idempotent; never raises for kill errors."""
+        """Kill the leaf and collect evidence. Never raises for kill errors.
+
+        A final outcome (the leaf was removed) is cached and returned again. Any other
+        outcome keeps the leaf and, while the main exit is unseen, the pidfd, so a
+        later close() (or the startup sweep) retries the kill.
+        """
         with self.lock:
-            if self.outcome is None:
+            if self.outcome is None or not self.removed:
                 self.outcome = self._terminate()
             return self.outcome
 
     def _terminate(self):
+        if self.removing and not os.path.lexists(self.leaf):
+            self.removed = True  # interrupted inside or after the rmdir
+        if self.removed:  # the leaf was empty and is gone: rebuild the outcome
+            seen = self.proc is not None and self.proc.returncode is not None
+            return Outcome('leaf_empty' if seen else 'empty',
+                           self.proc.returncode if self.proc else None, False, seen)
         errors = {}  # distinct messages, first-seen order; the loop retries
         deadline = time.monotonic() + self.kill_timeout
         populated = None
@@ -257,10 +296,12 @@ class LeafRun:
             if time.monotonic() >= deadline:
                 break
             time.sleep(0.01)
-        if self.pidfd is not None:
-            os.close(self.pidfd)
-            self.pidfd = None
         seen = self.proc is not None and self.proc.returncode is not None
+        if seen and self.pidfd is not None:
+            # Close only once the exit is seen: until then the pidfd is the kill handle.
+            # Detach first, so an interrupt leaks the fd rather than closing it twice.
+            fd, self.pidfd = self.pidfd, None
+            os.close(fd)
         if populated is False and seen:
             state = 'leaf_empty'  # not 'terminated': a same-uid escapee would be unseen
         elif populated is False and self.proc is None:
@@ -268,10 +309,12 @@ class LeafRun:
         elif populated is True:
             state = 'running'
         else:
-            state = 'unknown'
-        if populated is False:
+            state = 'unknown'  # includes populated 0 with the main exit unseen
+        if state in ('leaf_empty', 'empty'):
+            self.removing = True
             try:
                 self.fs.remove(self.leaf)
+                self.removed = True
             except OSError as exc:
                 errors.setdefault(f'rmdir: {exc!r}')
         outcome = Outcome(state, self.proc.returncode if self.proc else None, populated,
@@ -280,15 +323,28 @@ class LeafRun:
             log.error('leaf %s: %s', self.leaf, outcome)
         return outcome
 
+    def _close_retrying(self):
+        """close(), retried when an interrupt lands inside it (C2-10: finally can be
+        interrupted). Returns (outcome or None, interrupts). If every attempt is
+        interrupted the leaf stays on disk for the startup sweep."""
+        interrupts = []
+        for _ in range(CLEANUP_ATTEMPTS):
+            try:
+                return self.close(), interrupts
+            except BaseException as cleanup:
+                interrupts.append(cleanup)
+                log.exception('leaf %s cleanup interrupted', self.leaf)
+        return None, interrupts
+
     def _cleanup_after(self, exc):
         """Clean up after a failure without hiding the original exception."""
-        try:
-            outcome = self.close()
-        except BaseException as cleanup:
+        outcome, interrupts = self._close_retrying()
+        for cleanup in interrupts:
             exc.add_note(f'leaf cleanup raised: {cleanup!r}')
-            log.exception('leaf %s cleanup raised', self.leaf)
-            return
-        if outcome.state not in ('leaf_empty', 'empty') or outcome.errors:
+        if outcome is None:
+            exc.add_note(f'leaf cleanup abandoned after {CLEANUP_ATTEMPTS} interrupted '
+                         'attempts; leaf kept for the startup sweep')
+        elif outcome.state not in ('leaf_empty', 'empty') or outcome.errors:
             exc.add_note(f'leaf cleanup incomplete: {outcome}')
 
     def __enter__(self):
@@ -298,7 +354,12 @@ class LeafRun:
         if exc is not None:
             self._cleanup_after(exc)
             return False
-        outcome = self.close()
+        try:
+            outcome = self.close()
+        except BaseException as interrupt:
+            log.exception('leaf %s cleanup interrupted', self.leaf)
+            self._cleanup_after(interrupt)  # retries; the interrupt still propagates
+            raise
         if outcome.state != 'leaf_empty' or outcome.errors:
             raise CleanupIncomplete(outcome)
         return False

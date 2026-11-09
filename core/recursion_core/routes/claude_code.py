@@ -53,6 +53,9 @@ API_KEY_DROP_ENV = ("ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_C
 # parent" (its own key comes from custody instead).
 CLAUDE_CREDENTIAL_ENV = API_KEY_DROP_ENV + ("ANTHROPIC_API_KEY",)
 API_KEY_HELPER_STATES = ("absent", "present")
+# B20 (CSL-726): whether this claude build makes --bare the -p default, as reported by the surface from
+# bare_default.probe(). Only "absent" lets the subscription route launch.
+BARE_DEFAULT_STATES = ("absent", "present", "unknown")
 
 
 class ClaudeCodeAdapter(RouteAdapter):
@@ -76,6 +79,7 @@ class ClaudeCodeAdapter(RouteAdapter):
             # --bare ignores the sign-in. API-key and other user-picked built-in methods may use it.
             raise c.RouteError(c.LAUNCH_REFUSED, "--bare ignores the sign-in: not on the subscription route")
         if kind == "subscription":
+            self._check_bare_default(route)
             self._check_api_key_helper(route)
         # --verbose: stream-json output in print mode is documented to need it (unverified on this box).
         return [self._binary, *(["--bare"] if bare else []), "-p", "--input-format", "stream-json",
@@ -98,6 +102,33 @@ class ClaudeCodeAdapter(RouteAdapter):
             # the user's environment passes through for this run, unchanged.
             return dict(self._parent_env)
         raise c.RouteError(c.LAUNCH_REFUSED, f"connection kind {kind} not supported for claude_code")
+
+    @staticmethod
+    def _check_bare_default(route: dict) -> None:
+        """B20 (CSL-726): refuse the subscription route unless ``--bare`` is known not to be the -p default.
+
+        The docs say ``--bare`` "will become the default for -p in a future release", and ``--bare`` never
+        reads OAuth or the keychain. If a build makes it the default, ``claude -p`` without ``--bare``
+        would ignore the user's sign-in. No opt-out flag is in repository evidence, so the adapter does
+        not pass one; the surface reports ``route.bare_default`` from ``bare_default.probe()`` and this
+        adapter never runs the binary to find out. "present", "unknown" or not reported is refused with
+        a typed code; the API-key and passthrough routes are unaffected (``--bare`` is fine there).
+        """
+        state = route.get("bare_default")
+        if state is not None and state not in BARE_DEFAULT_STATES:
+            raise c.RouteError(c.REQUEST_INVALID, "route.bare_default")
+        if state == "absent":
+            return
+        if state == "present":
+            why = ("this claude build makes --bare the -p default, and --bare never reads the sign-in: "
+                   "the subscription route cannot launch it (no opt-out flag is known)")
+        elif state == "unknown":
+            why = ("this claude build's help did not show whether --bare is the -p default; under --bare "
+                   "the sign-in is never read, so the subscription route does not launch it")
+        else:
+            why = ("whether --bare is the -p default for this claude build was not reported; under --bare "
+                   "the sign-in is never read, so the subscription route does not launch it")
+        raise c.RouteError(c.LAUNCH_REFUSED, why + "; use the API-key route or another build")
 
     @staticmethod
     def _check_api_key_helper(route: dict) -> None:

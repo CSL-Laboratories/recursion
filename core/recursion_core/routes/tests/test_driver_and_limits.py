@@ -231,7 +231,7 @@ class LimitsTest(unittest.TestCase):
     def test_default_is_show_and_ask_never_switch(self) -> None:
         h = Harness(limited_then(claude_ok("never")))
         fallback = [{"engine": "claude_code", "model": "m2", "connection": {"kind": "subscription", "id": "login-B"},
-                     "api_key_helper": "absent"}]
+                     "api_key_helper": "absent", "bare_default": "absent"}]
         res = h.handle(request(limits={"fallback": fallback}))  # on_limit omitted: ask
         self.assertEqual(res["code"], c.PLAN_LIMIT)
         notice = res["limit_notice"]
@@ -264,9 +264,9 @@ class LimitsTest(unittest.TestCase):
     def test_fallback_follows_the_users_order_visibly(self) -> None:
         h = Harness(limited_then(claude_limit(), claude_ok("from C")))
         order = [{"engine": "claude_code", "model": "m-b", "connection": {"kind": "subscription", "id": "login-B"},
-                  "api_key_helper": "absent"},
+                  "api_key_helper": "absent", "bare_default": "absent"},
                  {"engine": "claude_code", "model": "m-c", "connection": {"kind": "subscription", "id": "login-C"},
-                  "api_key_helper": "absent"}]
+                  "api_key_helper": "absent", "bare_default": "absent"}]
         res = h.handle(request(limits={"on_limit": "fallback", "fallback": order}))
         self.assertEqual((res["status"], res["text"]), ("ok", "from C"))
         notice = res["limit_notice"]
@@ -279,7 +279,7 @@ class LimitsTest(unittest.TestCase):
     def test_fallback_all_limited_returns_the_first_limit_with_notice(self) -> None:
         h = Harness(limited_then(claude_limit()))
         order = [{"engine": "claude_code", "model": "m-b", "connection": {"kind": "subscription", "id": "login-B"},
-                  "api_key_helper": "absent"}]
+                  "api_key_helper": "absent", "bare_default": "absent"}]
         res = h.handle(request(limits={"on_limit": "fallback", "fallback": order}))
         self.assertEqual(res["code"], c.PLAN_LIMIT)
         self.assertIsNone(res["limit_notice"]["switched_to"])

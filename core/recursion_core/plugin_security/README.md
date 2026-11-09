@@ -32,6 +32,19 @@ yet called by a running daemon, and not reviewed or accepted.
   SQLite store and survive a restart. An effect may cite only a run its own plugin owns.
 - `protocol.CoreService` is the one boundary: canonical JSON bytes in and out
   (`csl-core/v0`, ops in `protocol.json`), so a later Rust core can reuse the tests.
+  A tripped connection clears through the host ops `breaker.probe_begin` and
+  `breaker.probe_reset`, so a consumer holding only `client_for` clients can run the
+  leased probe.
+
+**Consumer changes since the first version of this API.** A consumer written against it
+must change, or every effect is refused: create the breaker store and the revocation
+store at install (`create_breaker_store`, `create_revocation_store`) and pass their
+paths (`ConnectionBreaker(store_path)`, `TrustStore(..., revocation_store=...)`); bind
+runs with owner, provider and model version (`run.bind` args `connection`,
+`model_version`, `plugin_id`, `provider`, `run_id`); send the five-field effect
+`scope` (`account`, `venue`, `contract_family`, `adapter`, `environment`), or
+`check_effect` refuses `effect_scope`; sign profiles with the matching `scope`,
+`provider`, `model_version` and `actions`; and clear trips through the leased probe.
 
 **Not a sandbox.** Plugins run as ordinary Python in the daemon's process and uid.
 `tests/test_mutants.py` shows four in-process attacks that succeed (swap the anchor,

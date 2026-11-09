@@ -10,8 +10,11 @@ import os
 import threading
 import unittest
 
-from recursion_core.plugin_security import ConnectionBreaker, Refused, create_breaker_store
-from recursion_core.plugin_security.tests.support import temp_dir
+from recursion_core.plugin_security import (
+    ApprovalGate, ConnectionBreaker, CoreHealth, CoreService, PluginLoader, Refused, ReservedEffects,
+    TrustStore, canonical, create_breaker_store, parse,
+)
+from recursion_core.plugin_security.tests.support import FakeGilProbe, authenticate, temp_dir
 
 
 class FakeClock:
@@ -120,6 +123,59 @@ class BreakerStoreTests(unittest.TestCase):
             t.join()
         winners = {r for r in results if r != "run_binding_mismatch"}
         self.assertEqual(len(winners), 1, results)
+
+
+class ProbeOverProtocolTests(unittest.TestCase):
+    """Round 2 finding 2: a consumer holding only ``client_for`` clients can clear a trip,
+    and only through the leased probe."""
+
+    def setUp(self) -> None:
+        path = os.path.join(temp_dir(self), "breaker.db")
+        create_breaker_store(path)
+        self.clock = FakeClock()
+        self.breaker = ConnectionBreaker(path, clock=self.clock, probe_lease_seconds=10)
+        self.addCleanup(self.breaker.close)
+        health = CoreHealth()
+        loader = PluginLoader(TrustStore({}), {}, ReservedEffects(), health, FakeGilProbe())
+        core = CoreService(loader=loader, gate=ApprovalGate(lambda *a: None, authenticate, self.clock),
+                           breaker=self.breaker, health=health, authority=None,
+                           effect_permissions={}, authority_required=frozenset())
+        self.host = core.client_for("host")
+        self.plugin = core.client_for("demo.plugin")
+
+    def _call(self, client, op: str, **args) -> dict:
+        return parse(client(canonical({"protocol": "csl-core/v0", "op": op, "args": args})))
+
+    def _code(self, out: dict):
+        return None if out["ok"] else out["refusal"]["code"]
+
+    def test_trip_clears_only_through_host_probe_ops(self) -> None:
+        self.assertEqual(self._code(self._call(self.host, "breaker.probe_begin", connection="conn-a")),
+                         "connection_not_tripped")
+        self.assertTrue(self._call(self.host, "breaker.report", connection="conn-a",
+                                   event_type="rate_limit")["result"]["tripped"])
+        for op, args in (("breaker.probe_begin", dict(connection="conn-a")),
+                         ("breaker.probe_reset", dict(connection="conn-a", lease="x", probe_ok=True))):
+            self.assertEqual(self._code(self._call(self.plugin, op, **args)), "host_only")
+        lease = self._call(self.host, "breaker.probe_begin", connection="conn-a")["result"]["lease"]
+        self.assertEqual(self._code(self._call(self.host, "breaker.probe_begin", connection="conn-a")),
+                         "probe_lease_held")
+        # A wrong lease, or a failed probe, leaves the trip in place.
+        self.assertFalse(self._call(self.host, "breaker.probe_reset", connection="conn-a", lease="nope",
+                                    probe_ok=True)["result"]["reset"])
+        self.assertFalse(self._call(self.host, "breaker.probe_reset", connection="conn-a", lease=lease,
+                                    probe_ok=False)["result"]["reset"])
+        self.assertTrue(self.breaker.tripped("conn-a"))
+        lease = self._call(self.host, "breaker.probe_begin", connection="conn-a")["result"]["lease"]
+        self.assertEqual(self._code(self._call(self.host, "breaker.probe_reset", connection=["conn-a"],
+                                               lease=lease, probe_ok=True)), "invalid_connection")
+        self.assertTrue(self._call(self.host, "breaker.probe_reset", connection="conn-a", lease=lease,
+                                   probe_ok=True)["result"]["reset"])
+        self.assertFalse(self.breaker.tripped("conn-a"))
+        # One use: the spent lease clears nothing a second time.
+        self._call(self.host, "breaker.report", connection="conn-a", event_type="rate_limit")
+        self.assertFalse(self._call(self.host, "breaker.probe_reset", connection="conn-a", lease=lease,
+                                    probe_ok=True)["result"]["reset"])
 
 
 if __name__ == "__main__":

@@ -15,6 +15,8 @@
     "run.bind": {"caller": "host", "args": ["connection", "model_version", "plugin_id", "provider", "run_id"], "result": []},
     "run.fault": {"caller": "host", "args": ["run_id"], "result": []},
     "breaker.report": {"caller": "host", "args": ["connection", "event_type"], "result": ["tripped"]},
+    "breaker.probe_begin": {"caller": "host", "args": ["connection"], "result": ["lease"]},
+    "breaker.probe_reset": {"caller": "host", "args": ["connection", "lease", "probe_ok"], "result": ["reset"]},
     "key.revoke": {"caller": "host", "args": ["key_id"], "result": ["order_off"]}
   }
 }

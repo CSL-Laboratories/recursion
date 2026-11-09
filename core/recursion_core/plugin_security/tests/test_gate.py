@@ -236,7 +236,9 @@ class PermissionAndBreakerTests(unittest.TestCase):
                                            provider="p", model_version="m")),
                          ("run.fault", dict(run_id="run-1")),
                          ("breaker.report", dict(connection="conn-a", event_type="plan_limit")),
-                         ("key.revoke", dict(key_id=key_id(self.w.developer.public)))):
+                         ("key.revoke", dict(key_id=key_id(self.w.developer.public))),
+                         ("breaker.probe_begin", dict(connection="conn-a")),
+                         ("breaker.probe_reset", dict(connection="conn-a", lease="x", probe_ok=True))):
             with self.subTest(op=op):
                 self.assertEqual(_code(self.w.call(self.w.plugin, op, **args)), "host_only")
 

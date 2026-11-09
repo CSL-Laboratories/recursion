@@ -140,6 +140,7 @@ class ConnectionBreaker:
 
     def reset_after_probe(self, connection: str, lease: object, probe_ok: bool) -> bool:
         """Spend the probe lease. The trip clears only for a live lease and ``probe_ok is True``."""
+        connection = _check_id(connection, "invalid_connection")
         with self._lock:
             held = self._leases.get(connection)
             if held is None or type(lease) is not str or not secrets.compare_digest(held[0], lease):

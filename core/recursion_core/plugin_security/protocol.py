@@ -12,6 +12,11 @@ which permission, and which permissions need an authority profile, are injected.
 core health, caller is the effect's plugin, permission, run (owned by the caller, on
 the effect's connection, not faulted, connection not tripped),
 the one-use approval for this exact digest, then the authority profile and budgets.
+
+A tripped connection clears only through the host ops ``breaker.probe_begin`` (one
+lease per tripped connection) and ``breaker.probe_reset`` (spends the lease; clears the
+trip only for a live lease and ``probe_ok`` true), so a consumer that holds only a
+``client_for`` client can still run the leased probe.
 """
 
 from __future__ import annotations
@@ -147,3 +152,12 @@ class CoreService:
     def _op_breaker_report(self, caller: str, connection: str, event_type: str) -> dict:
         self._require_host(caller)
         return {"tripped": self._breaker.report(connection, event_type)}
+
+    def _op_breaker_probe_begin(self, caller: str, connection: str) -> dict:
+        self._require_host(caller)
+        return {"lease": self._breaker.begin_probe(connection)}
+
+    def _op_breaker_probe_reset(self, caller: str, connection: str, lease: object,
+                                probe_ok: object) -> dict:
+        self._require_host(caller)
+        return {"reset": self._breaker.reset_after_probe(connection, lease, probe_ok is True)}

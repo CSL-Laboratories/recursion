@@ -262,7 +262,8 @@ class Application:
             if panel.get("venue") is not None:
                 body += ('The control API\'s O7 v0 reads take no venue argument; returned data '
                          'is filtered to <code>%s</code> before display and anything not labelled '
-                         'with it is withheld; venue data stays behind the venue-data switch.</p>'
+                         'with it is withheld, except unlabelled response-level errors and '
+                         'provenance; venue data stays behind the venue-data switch.</p>'
                          % escape(panel["venue"]))
             else:
                 body += ('The control API\'s O7 v0 reads take no venue argument, so the results '
@@ -271,7 +272,8 @@ class Application:
         elif panel.get("venue") is not None:
             body += ('<p role="note">The control API\'s O7 v0 reads take no venue argument; '
                      'returned data is filtered to <code>%s</code> before display and anything '
-                     'not labelled with it is withheld.</p>'
+                     'not labelled with it is withheld, except unlabelled response-level errors '
+                     'and provenance.</p>'
                      % escape(panel["venue"]))
         for command in panel["reads"]:
             body += "<section><h3>%s</h3>" % escape(_LABELS[command])

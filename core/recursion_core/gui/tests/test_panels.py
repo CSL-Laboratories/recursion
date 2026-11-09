@@ -141,6 +141,22 @@ class PanelTests(GuiHarness):
             self.assertNotIn(hidden, body)
         self.assertIn("Withheld: data not labelled <code>kalshi</code>.", body)
 
+    def test_unlabelled_response_level_errors_and_provenance_show_on_a_venue_panel(self):
+        self.mount([{"id": "k", "title": "Kalshi", "reads": [READS[0]], "venue": "kalshi"}])
+        self.api.extra[READS[0]] = {
+            "errors": [{"code": "ERR-MARKER-515151"}], "provenance": {"source": "PROV-MARKER-626262"},
+            "result": {"positions": {"KXUNLABELLED": {"qty": 424242}}, "total": 919191,
+                       "errors": ["NESTED-ERR-313131"], "provenance": {"source": "NESTED-PROV-353535"},
+                       "rows": [{"venue": "kalshi", "symbol": "KALSHI-VISIBLE"}]}}
+        body = self.request("GET", "/panel", query="id=k")[2]
+        for shown in ("ERR-MARKER-515151", "PROV-MARKER-626262", "KALSHI-VISIBLE"):
+            self.assertIn(shown, body)
+        for hidden in ("KXUNLABELLED", "424242", "919191", "NESTED-ERR-313131", "NESTED-PROV-353535"):
+            self.assertNotIn(hidden, body)
+        self.assertIn("Withheld: data not labelled <code>kalshi</code>.", body)
+        self.api.extra[READS[0]]["provenance"] = {"venue": "paper", "source": "PAPER-PROV-747474"}
+        self.assertNotIn("PAPER-PROV-747474", self.request("GET", "/panel", query="id=k")[2])
+
     def test_venue_data_switch_off_still_governs_with_and_without_a_venue_filter(self):
         self.mount([{"id": "k", "title": "Kalshi", "reads": [READS[0]], "venue": "kalshi"},
                     {"id": "n", "title": "Plain", "reads": [READS[0]]}])

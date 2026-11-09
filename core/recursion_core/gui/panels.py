@@ -37,21 +37,29 @@ def panel_registry(panels):
 
 
 _DROP = object()
+_RESPONSE_LEVEL = ("errors", "provenance")
 
 
 def filter_venue_rows(value, venue):
     """Keep only read data labelled with a declared panel venue, without mutating the response.
 
     Returns ``(kept, withheld)``. Fails closed: a dict labelled with another venue, and any
-    value outside a dict labelled ``venue`` (unlabelled nested dicts, totals, response-level
-    errors or provenance), is dropped and ``withheld`` is true. A matching dict is kept, and
-    its nested data inherits the venue unless it declares a different one. Unlabelled
-    containers stay only as the path to kept data. This is a display filter, not order
-    authorization or an API scope.
+    value outside a dict labelled ``venue`` (unlabelled nested dicts, totals, scalars), is
+    dropped and ``withheld`` is true. A matching dict is kept, and its nested data inherits
+    the venue unless it declares a different one. Unlabelled containers stay only as the
+    path to kept data. Exception: top-level ``errors`` and ``provenance`` of the response
+    pass through unfiltered unless they are a dict with a ``venue`` label; nested keys with
+    those names get no exception. This is a display filter, not order authorization or an
+    API scope.
     """
     withheld = []
+    passed = {}
+    if isinstance(value, dict) and "venue" not in value:
+        passed = {key: value[key] for key in _RESPONSE_LEVEL
+                  if key in value and not (isinstance(value[key], dict) and "venue" in value[key])}
+        value = {key: item for key, item in value.items() if key not in passed}
     kept = _venue_only(value, venue, False, withheld)
-    return ({} if kept is _DROP else kept), bool(withheld)
+    return {**({} if kept is _DROP else kept), **passed}, bool(withheld)
 
 
 def _venue_only(value, venue, scoped, withheld):

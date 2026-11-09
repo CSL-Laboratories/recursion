@@ -294,6 +294,12 @@ def is_shared_system_account(backend: Backend) -> bool:
     )
 
 
+def is_root_target(backend: Backend) -> bool:
+    """True when ``backend`` targets root; root is never the engine user."""
+
+    return backend.target_uid == 0 or backend.target_user == "root"
+
+
 def select_path(
     backends: Sequence[Backend],
     *,
@@ -304,7 +310,7 @@ def select_path(
     ``f21_open`` lists unmeasured F21 items (default: ``f21_open_items()``).
     While it is non-empty the managed-login-folder fallback is the beta
     default (O19) and a working engine-user backend is only the ``candidate``.
-    Backends that target a shared system account are never selected.
+    Backends that target root or a shared system account are never selected.
     """
 
     open_items = tuple(f21_open_items() if f21_open is None else f21_open)
@@ -325,6 +331,8 @@ def select_path(
             and backend.changes_host_uid
             and can_spawn(backend)
         ):
+            continue
+        if is_root_target(backend):
             continue
         if is_shared_system_account(backend):
             stand_ins.append(f"{name} as {backend.target_user or backend.target_uid}")
@@ -567,13 +575,17 @@ def _probe_systemd_run(run_fn: RunFn, user: str, our_uid: int) -> tuple[bool, in
     )
     uid = _parse_uid_output(result.stdout)
     err = (result.stderr or "").strip().replace("\n", " ")
-    ok = result.returncode == 0 and uid is not None and uid != our_uid
+    # Like the sudo target: never root, never our own uid. Root passes every
+    # F21 probe from uid 1000, so the gate cannot catch it later.
+    ok = result.returncode == 0 and uid is not None and uid != our_uid and uid != 0
     reason = (
         f"systemd-run --uid={user} --wait --pipe --collect /usr/bin/id -u "
         f"rc={result.returncode} uid={uid}"
     )
     if err:
         reason = f"{reason} err={err[:240]}"
+    if result.returncode == 0 and uid in (0, our_uid):
+        reason = f"{reason}; rejected: engine user must not be root or the calling uid"
     return ok, uid if ok else None, reason
 
 
@@ -1401,6 +1413,7 @@ __all__ = [
     "evaluate_host",
     "f21_open_items",
     "find_target_uid_pid",
+    "is_root_target",
     "is_shared_system_account",
     "measure_overhead",
     "percentile",

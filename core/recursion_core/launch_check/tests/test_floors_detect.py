@@ -75,7 +75,10 @@ class FloorTableTests(unittest.TestCase):
     def test_identity_column(self) -> None:
         engines = table_record()["engines"]
         self.assertEqual("unverified", engines["pi"]["identity"])
-        for engine in set(FLOORS) - {"pi"}:
+        required = {"claude_code", "codex", "opencode", "hermes"}
+        for engine in required:
+            self.assertEqual("required", engines[engine]["identity"], engine)
+        for engine in set(FLOORS) - required - {"pi"}:
             self.assertEqual("rule", engines[engine]["identity"], engine)
 
     def test_table_is_read_only(self) -> None:

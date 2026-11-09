@@ -32,7 +32,8 @@ window between `exec_argv()` and the exec itself is still open (CX-1402, see Lim
   (`identity_unverified`) without being run. It hashes the realpath (full SHA-256 and size), runs the zero-egress version
   probe, re-hashes (`binary_changed` if it changed while probing), and refuses a non-zero
   exit or timeout (`version_probe_failed`), a line naming another engine (`engine_mismatch`),
-  an unparsed version (`version_unparsed`), or a prerelease or a version below a
+  for claude_code, codex, opencode and hermes a line that does not name the engine
+  (`identity_mismatch`), an unparsed version (`version_unparsed`), or a prerelease or a version below a
   known floor (`version_refused`). An unset functional floor is not a refusal:
   the grant is tagged `beta` for route.list (O50).
 - The grant record holds engine, path, realpath, sha256 (64 hex), size, raw version line,
@@ -55,7 +56,7 @@ window between `exec_argv()` and the exec itself is still open (CX-1402, see Lim
   (`granted`, `refused` with code, or `absent`). Grants are returned apart from records.
 
 Every failure is a `LaunchRefused` with a code from the closed set `REFUSAL_CODES`
-(`r2a-refusals/1.1.0-candidate-2026-11-09`, 17 codes). No path returns a grant or plan
+(`r2a-refusals/1.2.0-candidate-2026-11-09`, 18 codes). No path returns a grant or plan
 after an error.
 
 ### Zero-egress version probe
@@ -71,7 +72,7 @@ Claude Code's `DISABLE_AUTOUPDATER=1` and `DISABLE_UPDATES=1`. No proxy, credent
 config-path or `CLI_VERSION` variable can reach it. Limit: this is not a kernel network
 block; a network namespace belongs to the launch sandbox (B6), not this check.
 
-## Floor table `r2a-floors/1.2.0-candidate-2026-11-09`
+## Floor table `r2a-floors/1.3.0-candidate-2026-11-09`
 
 Two slots per engine. A grant needs `found >= security` when a security floor is set.
 When a functional floor is set, it also needs `found >= functional`. With no functional
@@ -79,8 +80,17 @@ floor the engine still runs and the grant is tagged `beta` for route.list (O50, 
 until measured"). A floor change is a new table version (grants under the old version
 become `grant_stale`). `floor_unset` remains in the closed refusal set for a table
 floor that does not parse. An engine with no identity rule (no `ident` regex and no
-pinned digest) is refused `identity_unverified` before its binary is run: a bare name plus a
-semver line does not identify an engine.
+pinned digest) is refused `identity_unverified` before its binary is run.
+
+Identity is checked positively only for the four engines whose real version line is
+recorded and names the engine: claude_code (`2.1.318 (Claude Code)`), codex
+(`codex-cli 0.160.0`), opencode (`opencode v2.2.5`) and hermes (via `hermes-acp 0.9.1`).
+For these a line that does not match the engine's identity rule is `identity_mismatch`
+(so a native `claude` printing `2.1.400` is refused). For grok, antigravity, cursor and
+gemini the real line is bare (`0.39.1`, `2026.10.01-e373342`) or was never read, and no
+format is invented: a native binary with the right name printing a bare version that
+passes the floors is granted; the only identity check is that the line names no other
+engine. Whether those four need a pinned digest or are accepted as is, is open for Lucas.
 
 | Engine (binaries) | Scheme | Functional floor (Q43) | Security floor (relayed) |
 |---|---|---|---|

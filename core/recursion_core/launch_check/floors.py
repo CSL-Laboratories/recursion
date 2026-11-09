@@ -13,9 +13,16 @@ refused (``engine_unknown``). Each engine has two separate slots:
 A grant needs ``found >= security`` (when set). When a functional floor is set,
 it also needs ``found >= functional``. When it is unset, the engine still runs
 under the beta tag.
-An engine with no identity rule (``ident=None``) is refused
-(``identity_unverified``) before its binary is run: a bare name plus a semver line
-does not identify an engine.
+Identity is checked positively only where the real version line is recorded and
+names the engine (``ident_required``): claude_code (``2.1.318 (Claude Code)``),
+codex (``codex-cli 0.160.0``), opencode (``opencode v2.2.5``) and hermes (read via
+``hermes-acp 0.9.1``). For these, a line that does not match ``ident`` is refused
+(``identity_mismatch``). An engine with no identity rule (``ident=None``; Pi) is
+refused (``identity_unverified``) before its binary is run. For grok, antigravity,
+cursor and gemini the real line is bare or unread, so no format is invented: a
+native binary with the right name printing a bare version that passes the floors
+is granted, and the only identity check is that the line names no other engine.
+Whether those four need a pinned digest or are accepted as is, is open for Lucas.
 A floor change is a new ``FLOOR_TABLE_VERSION``, never an in-place edit; grants
 issued under another table version are refused (``grant_stale``).
 """
@@ -30,7 +37,7 @@ from types import MappingProxyType
 
 from recursion_core.launch_check.refusals import LaunchRefused
 
-FLOOR_TABLE_VERSION = "r2a-floors/1.2.0-candidate-2026-11-09"
+FLOOR_TABLE_VERSION = "r2a-floors/1.3.0-candidate-2026-11-09"
 
 
 @dataclass(frozen=True)
@@ -43,6 +50,7 @@ class EngineSpec:
     functional_basis: str
     security_basis: str
     ident: str | None = None  # regex naming this engine in a version line
+    ident_required: bool = False  # the real line names the engine: require an ident match
     probe_name: str | None = None  # sibling binary read for the version, if not the engine itself
     probe_env: tuple[tuple[str, str], ...] = ()  # extra fixed probe variables (no secrets)
 
@@ -52,7 +60,7 @@ _SPECS = (
         "claude_code", ("claude",), "semver", "2.1.314", "2.1.260",
         "decided by Lucas (O50, grill Q43); not yet measured as the lowest passing version (CX-956)",
         "PRODUCT.md 11.6",
-        ident=r"\bclaude\b",
+        ident=r"\bclaude\b", ident_required=True,
         probe_env=(("DISABLE_AUTOUPDATER", "1"), ("DISABLE_UPDATES", "1")),
     ),
     # Codex: 0.131.0 is a security floor only (A-35, 11.6). There is no measured
@@ -64,12 +72,12 @@ _SPECS = (
         "O50: no conformance measurement; tagged beta until measured. rust-v0.145.0 "
         "is an unmeasured candidate (11.6) and is not applied",
         "A-35, PRODUCT.md 11.6",
-        ident=r"\bcodex",
+        ident=r"\bcodex", ident_required=True,
     ),
     EngineSpec(
         "opencode", ("opencode", "opencode2"), "semver", None, "1.18.33",
         "no conformance measurement", "D2-72 (CVE map 1.18.22, raised to 1.18.33)",
-        ident=r"\bopencode",
+        ident=r"\bopencode", ident_required=True,
     ),
     EngineSpec(
         "grok", ("grok",), "semver", None, None,
@@ -103,7 +111,7 @@ _SPECS = (
     EngineSpec(
         "hermes", ("hermes",), "semver", None, None,
         "no record", "none recorded",
-        ident=r"\bhermes\b",
+        ident=r"\bhermes\b", ident_required=True,
         probe_name="hermes-acp",
     ),
 )
@@ -196,6 +204,12 @@ def check_identity(spec: EngineSpec) -> None:
         )
 
 
+def check_self_named(spec: EngineSpec, raw: str) -> None:
+    """For an engine whose real version line names it, refuse a line that does not."""
+    if spec.ident_required and not (spec.ident and re.search(spec.ident, raw, re.IGNORECASE)):
+        raise LaunchRefused("identity_mismatch", spec.engine, f"version line does not name the engine: {raw[:120]!r}")
+
+
 def check_floors(spec: EngineSpec, found: ParsedVersion) -> None:
     """Security floor (when set), then the functional floor when one is measured.
 
@@ -236,7 +250,7 @@ def table_record() -> dict[str, object]:
                 "functional_basis": s.functional_basis,
                 "security_basis": s.security_basis,
                 "probe_name": s.probe_name,
-                "identity": "rule" if s.ident else "unverified",
+                "identity": "required" if s.ident_required else ("rule" if s.ident else "unverified"),
             }
             for s in _SPECS
         },

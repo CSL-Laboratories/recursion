@@ -27,7 +27,7 @@ from dataclasses import asdict, dataclass, fields
 from recursion_core.launch_check import floors
 from recursion_core.launch_check.binary import HEX64, WRAPPER_EXT, file_kind, is_wrapper_name, sha256_file, stem
 from recursion_core.launch_check.floors import (
-    EngineSpec, check_floors, check_identity, other_engine_named, parse_version, spec_for,
+    EngineSpec, check_floors, check_identity, check_self_named, other_engine_named, parse_version, spec_for,
 )
 from recursion_core.launch_check.probe import PROBE_TIMEOUT_S, Probe, run_version_probe
 from recursion_core.launch_check.refusals import REFUSAL_CODES_VERSION, LaunchRefused
@@ -127,6 +127,7 @@ def grant(engine: str, path: str, *, timeout: float = PROBE_TIMEOUT_S, probe: Pr
     other = other_engine_named(spec, result.raw)
     if other is not None:
         raise LaunchRefused("engine_mismatch", spec.engine, f"version line names {other}: {result.raw[:120]!r}")
+    check_self_named(spec, result.raw)
     parsed = parse_version(spec.scheme, result.raw)
     if parsed is None:
         raise LaunchRefused("version_unparsed", spec.engine, f"raw {result.raw[:120]!r}")
@@ -160,6 +161,7 @@ def authenticate(g: object) -> EngineSpec:
     parsed = parse_version(spec.scheme, g.version_raw)
     if parsed is None or parsed.text != g.version:
         raise LaunchRefused("grant_forged", engine, "version fields do not re-parse")
+    check_self_named(spec, g.version_raw)  # re-checked at the trusted boundary
     check_floors(spec, parsed)  # re-checked at the trusted boundary
     return spec
 

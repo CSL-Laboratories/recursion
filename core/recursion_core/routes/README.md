@@ -59,13 +59,17 @@ run's environment changes:
   surface as `route.api_key_helper`; this adapter never opens settings), the result is
   `route_choice_required`: the run would bill their API key, and they pick (`billing_ack`, the API-key
   route, or cancel). Not reported is the same question.
-- `--bare` as the `-p` default (B20, CSL-726): Anthropic's headless docs say `--bare` "will become the
-  default for `-p` in a future release", and under `--bare` OAuth and the keychain are never read. No
-  opt-out flag is in repository evidence, so none is passed. Instead the surface reports
-  `route.bare_default` from `bare_default.probe()` (one `claude --help`, small fixed env, 10 s timeout):
-  `absent` launches; `present`, `unknown` or not reported is `launch_refused` before anything spawns, and
-  never trips the login's breaker. 2.1.312's help lists `--bare` with no default note, so it reads
-  `absent`. The API-key and passthrough routes do not need the field.
+- `--bare` as the `-p` default (B20, CSL-726; t1418u correction): the surface reports
+  `route.bare_default` and `route.bare_opt_out` from `bare_default.probe_auth_mode()`
+  (one `claude --help`, small fixed env, 10 s timeout). Both the `--bare` and
+  `-p/--print` help blocks are checked. Neutral or incomplete help is `unknown`,
+  not proof that the default is off. The recorded 2.1.312 excerpt omits print help
+  and therefore reads `unknown`.
+  When the build advertises `--no-bare`, the subscription driver passes it explicitly,
+  including on fallback routes. No flag is invented. Without an opt-out, only an
+  explicitly known `absent` default launches. `unknown` or not reported always
+  refuses before spawn and never trips the login's breaker. API-key and passthrough
+  routes are unaffected. No user settings or credentials are edited.
 - `api_key`: the user's own key from custody (`ANTHROPIC_API_KEY`) or their own `apiKeyHelper`
   (`key_source: "api_key_helper"`, no key added); `--bare` is allowed (`route.bare`). The user's
   `CLAUDE_CODE_OAUTH_TOKEN` still passes through; the key outranks it by the engine's own precedence.

@@ -15,7 +15,7 @@ from pathlib import Path
 
 from recursion_core.routes import bare_default as bd
 from recursion_core.routes import contract as c
-from recursion_core.routes.tests.fakes import claude_ok, request
+from recursion_core.routes.tests.fakes import claude_limit, claude_ok, request
 from recursion_core.routes.tests.test_driver_and_limits import Harness
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "claude-2.1.312-help-excerpt.txt"
@@ -32,9 +32,9 @@ def help_with_bare(description: str, extra: str = "") -> str:
 
 
 class ClassifyHelpTest(unittest.TestCase):
-    def test_recorded_2_1_312_help_is_absent(self) -> None:
-        # 2.1.312 lists --bare and says nothing about it being the -p default.
-        self.assertEqual(bd.classify_help(HEAD + FIXTURE.read_text()), "absent")
+    def test_recorded_incomplete_help_is_unknown(self) -> None:
+        # The recorded excerpt omits -p/--print; it cannot establish its default.
+        self.assertEqual(bd.classify_help(HEAD + FIXTURE.read_text()), "unknown")
 
     def test_future_tense_note_is_absent(self) -> None:
         text = help_with_bare("Minimal mode. --bare will become the default for -p in a future release.")
@@ -57,7 +57,18 @@ class ClassifyHelpTest(unittest.TestCase):
         extra = ("  --system-prompt-mode <mode>           Rendered on the first request (the\n"
                  "                                        default, except under --bare outside\n"
                  "                                        cloud sessions); default for -p too\n")
-        self.assertEqual(bd.classify_help(help_with_bare("Minimal mode.", extra=extra)), "absent")
+        self.assertEqual(bd.classify_help(help_with_bare("Minimal mode.", extra=extra)), "unknown")
+
+    def test_print_help_announces_default_independently(self):
+        for flag in ("-p, --print", "--print"):
+            text = help_with_bare("Minimal mode.").replace(
+                "-p, --print                           Print response and exit",
+                flag + "                           Runs in bare mode by default")
+            self.assertEqual(bd.classify_help(text), "present")
+
+    def test_neutral_or_ambiguous_help_is_unknown(self):
+        for description in ("Minimal mode.", "Minimal bare mode is planned."):
+            self.assertEqual(bd.classify_help(help_with_bare(description)), "unknown")
 
     def test_missing_or_unreadable_help_is_unknown(self) -> None:
         for text in (None, "", "   ", b"--bare", HEAD + "  --print   Print response\n",
@@ -78,7 +89,7 @@ class ReadHelpTest(unittest.TestCase):
         return run, calls
 
     def test_only_help_with_a_small_fixed_env(self) -> None:
-        run, calls = self._run(stdout=(HEAD + FIXTURE.read_text()).encode())
+        run, calls = self._run(stdout=help_with_bare("Bare default: false").encode())
         parent = {"PATH": "/usr/bin", "HOME": "/home/op", "LANG": "C.UTF-8", "ANTHROPIC_API_KEY": "k",
                   "CLAUDE_CODE_OAUTH_TOKEN": "t", "CLAUDE_CODE_SIMPLE": "1"}
         self.assertEqual(bd.probe("/opt/claude/bin/claude", parent, run), "absent")
@@ -122,6 +133,29 @@ class SubscriptionRouteBareDefaultTest(unittest.TestCase):
                 self.assertEqual(h.launcher.calls, [])
                 self.assertEqual(res["breaker_effect"], "none")  # a refusal never trips the login
 
+    def test_documented_opt_out_is_passed_explicitly(self):
+        text = help_with_bare("Minimal mode.", extra="  --no-bare       Disable bare mode\n")
+        metadata = bd.auth_mode(text)
+        self.assertEqual(metadata, {"bare_default": "present", "bare_opt_out": "--no-bare"})
+        h = Harness([claude_ok()])
+        self.assertEqual(h.handle(request(**metadata))["status"], "ok")
+        self.assertEqual(h.launcher.calls[0]["argv"][:3], ["claude", "--no-bare", "-p"])
+
+    def test_unknown_still_refuses_even_with_opt_out(self):
+        h = Harness([])
+        self.assertEqual(h.handle(request(bare_default="unknown", bare_opt_out="--no-bare"))["code"],
+                         c.LAUNCH_REFUSED)
+        self.assertEqual(h.launcher.calls, [])
+
+    def test_fallback_passes_documented_auth_mode(self):
+        h = Harness([claude_limit(), claude_ok()])
+        order = [{"engine": "claude_code", "model": "m-b", "connection": {"kind": "subscription", "id": "login-B"},
+                  "api_key_helper": "absent", "bare_default": "present", "bare_opt_out": "--no-bare"}]
+        res = h.handle(request(limits={"on_limit": "fallback", "fallback": order}))
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(len(h.launcher.calls), 2)
+        self.assertIn("--no-bare", h.launcher.calls[1]["argv"])
+
     def test_invalid_value_is_request_invalid(self) -> None:
         h = Harness([])
         self.assertEqual(h.handle(request(bare_default="maybe"))["code"], c.REQUEST_INVALID)
@@ -137,13 +171,14 @@ class SubscriptionRouteBareDefaultTest(unittest.TestCase):
         self.assertEqual(h.handle(req)["status"], "ok")
 
     def test_fallback_entry_carries_the_same_check(self) -> None:
-        h = Harness([])
+        h = Harness([claude_limit()])
         order = [{"engine": "claude_code", "model": "m-b", "connection": {"kind": "subscription", "id": "login-B"},
                   "api_key_helper": "absent", "bare_default": "present"}]
         # Validation accepts the key; the refusal happens when that route would launch.
-        res = h.handle(request(bare_default="present", limits={"on_limit": "fallback", "fallback": order}))
+        res = h.handle(request(bare_default="absent", limits={"on_limit": "fallback", "fallback": order}))
         self.assertEqual(res["code"], c.LAUNCH_REFUSED)
-        self.assertEqual(h.launcher.calls, [])
+        self.assertEqual(len(h.launcher.calls), 1)
+        self.assertEqual(res["limit_notice"]["attempts"][-1]["connection"], "subscription:login-B")
 
 
 if __name__ == "__main__":

@@ -1,24 +1,8 @@
-"""Is ``--bare`` the ``-p`` default in this claude build? (CSL-726, B20; candidate). See README.md.
+"""Read build help for print-mode bare defaults and a documented auth-mode opt-out.
 
-Anthropic's headless docs say ``--bare`` "will become the default for ``-p`` in a future release", and
-the 2.1.312 help says that under ``--bare`` "Anthropic auth is strictly ANTHROPIC_API_KEY or apiKeyHelper
-... (OAuth and keychain are never read)". The subscription route launches ``claude -p`` without
-``--bare`` and relies on the user's own sign-in. If a build makes ``--bare`` the ``-p`` default, that run
-would ignore the sign-in, so the route has to know before it launches.
-
-No opt-out flag is in repository evidence, so this module does not invent one. It reads the build's
-own ``--help`` text and classifies it:
-
-* ``"absent"``: the ``--bare`` option is listed and nothing says it is (now) the ``-p`` default.
-  A future-tense note ("will become", "future release") also reads as absent.
-* ``"present"``: the help says, in the present tense, that ``--bare`` is the ``-p`` / print-mode
-  default (or lists an option that turns bare mode off for ``-p``).
-* ``"unknown"``: no ``--bare`` option in the text, empty text, or the help could not be read.
-
-The surface (or the R2a launch check, CSL-732) reports the result as ``route.bare_default``; the Claude
-Code adapter never runs the binary itself. ``read_help`` is the one place that does, with ``--help``
-only, a short timeout and a small fixed environment: no sign-in, settings or credential file is read
-or written by Recursion, and no request leaves the machine on Recursion's behalf.
+Unknown or incomplete help fails closed. Only help is executed; no provider call,
+settings edit or credential lookup is performed. Adapters consume the reported
+metadata rather than probing the executable themselves.
 """
 
 from __future__ import annotations
@@ -66,14 +50,36 @@ def classify_help(text: object) -> str:
     if not isinstance(text, str) or not text.strip():
         return "unknown"
     blocks = _option_blocks(text)
-    if "--bare" not in blocks:
+    if "--bare" not in blocks or "--print" not in blocks:
         return "unknown"
     if any(opt in blocks for opt in _OPT_OUT):
         return "present"
-    for sentence in _sentences(blocks["--bare"]):
-        if _DEFAULT_NOW.search(sentence) and not _FUTURE.search(sentence):
-            return "present"
-    return "absent"
+    absent = False
+    for option in ("--bare", "--print"):
+        for sentence in _sentences(blocks[option]):
+            if _FUTURE.search(sentence):
+                if "bare" in sentence.lower() and _DEFAULT_NOW.search(sentence):
+                    absent = True
+                continue
+            if option == "--print":
+                # Print's own help may announce the default even when --bare does not.
+                if re.search(r"\bbare\b.*\b(?:by default|default mode)\b|\bdefault\b.*\bbare\b",
+                             sentence, re.I):
+                    return "present"
+            elif _DEFAULT_NOW.search(sentence):
+                return "present"
+            if option == "--bare" and re.search(r"default\s*[:=]?\s*(?:false|off|disabled)\b",
+                                                sentence, re.I):
+                absent = True
+    return "absent" if absent else "unknown"
+
+
+def auth_mode(text: object) -> dict:
+    """Route metadata, including only an opt-out actually advertised by this build."""
+    state = classify_help(text)
+    blocks = _option_blocks(text) if isinstance(text, str) else {}
+    return {"bare_default": state,
+            "bare_opt_out": next((flag for flag in _OPT_OUT if flag in blocks), None)}
 
 
 Runner = Callable[..., "subprocess.CompletedProcess[bytes]"]
@@ -106,3 +112,8 @@ def probe(binary: str, parent_env: Mapping[str, str], run: Runner = subprocess.r
     """``classify_help(read_help(...))``: the value a surface reports as ``route.bare_default``."""
 
     return classify_help(read_help(binary, parent_env, run))
+
+
+def probe_auth_mode(binary: str, parent_env: Mapping[str, str], run: Runner = subprocess.run) -> dict:
+    """Read help once and report the explicit subscription auth-mode capability."""
+    return auth_mode(read_help(binary, parent_env, run))

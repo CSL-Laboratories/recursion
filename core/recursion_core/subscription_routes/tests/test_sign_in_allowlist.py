@@ -8,11 +8,13 @@ from __future__ import annotations
 import builtins
 import os
 import shutil
+import sys
 import unittest
 from unittest import mock
 
 from recursion_core.subscription_routes import (
-    SUBSCRIPTION_SIGN_INS, GeminiCliRefused, SubscriptionRouteRefused, check_gemini_cli_sign_in, check_route,
+    HERMES_ADOPT_EXTERNAL_LOGINS, SUBSCRIPTION_SIGN_INS, GeminiCliRefused, SubscriptionRouteRefused,
+    check_gemini_cli_sign_in, check_route,
 )
 from recursion_core.subscription_routes.tests.test_subscription_routes import FAKE_KEY, FAKE_OAUTH, _Base
 
@@ -23,7 +25,9 @@ ALLOWED = [("opencode", "chatgpt", "sign_in_with_chatgpt"), ("opencode", "grok",
 @unittest.skipIf(os.name == "nt", "POSIX home checks")
 class AllowlistTests(_Base):
     def sub(self, provider: str, method: object = "", **extra: object) -> dict:
-        profile = {"provider": provider, "auth": "subscription", **extra}
+        # A subscription route must name its model; default to one under the signed-in provider.
+        extra.setdefault("model", "_".join(provider.strip().lower().split()) + "/test-model")
+        profile = {"provider": provider, "auth": "subscription", **{k: v for k, v in extra.items() if v is not None}}
         if method is not None:
             profile["method"] = method
         return profile
@@ -80,14 +84,54 @@ class AllowlistTests(_Base):
                 self.assertRefusedBeforeSpawn(engine, self.sub(provider, "sign_in_with_google"), self.bare_env(),
                                               "google_subscription_refused")
 
-    def test_hermes_claude_code_login_borrowing_is_off(self) -> None:
-        for engine in ("hermes", "opencode", "pi"):
-            for value in (True, "yes", 1):
-                self.assertRefusedBeforeSpawn(engine, self.sub("grok", "grok_sign_in", borrow_claude_code_login=value),
-                                              self.bare_env(), "claude_code_login_borrowing")
-        decision, _ = self.spawn("hermes", self.sub("grok", "grok_sign_in", borrow_claude_code_login=False),
-                                 self.bare_env())
-        self.assertEqual(decision.method, "grok_sign_in")
+    def test_hermes_without_adopt_external_logins_false_is_refused(self) -> None:
+        # PRODUCT.md 055cc7a5 section 2 (E9): "the E9 profile sets Hermes's auth.adopt_external_logins: false".
+        self.assertEqual(HERMES_ADOPT_EXTERNAL_LOGINS, "auth.adopt_external_logins")
+        for profile in (self.sub("grok", "grok_sign_in"), self.profile()):  # sign-in and API-key routes alike
+            self.assertRefusedBeforeSpawn("hermes", profile, self.bare_env() if profile["auth"] != "api_key"
+                                          else self.env(), "hermes_adopt_external_logins_not_off",
+                                          hermes_override=False)
+        for value in (True, "false", 0, "no"):  # only the boolean False turns adoption off
+            self.assertRefusedBeforeSpawn("hermes", self.sub("grok", "grok_sign_in",
+                                                             **{HERMES_ADOPT_EXTERNAL_LOGINS: value}),
+                                          self.bare_env(), "hermes_adopt_external_logins_not_off",
+                                          hermes_override=False)
+        with self.assertRaises(SubscriptionRouteRefused) as caught:
+            check_route("hermes", {**self.sub("grok", "grok_sign_in"), HERMES_ADOPT_EXTERNAL_LOGINS: None},
+                        self.bare_env(), route_home=str(self.home), parent_env=self.parent(),
+                        operator_home=str(self.operator))
+        self.assertEqual(caught.exception.cause, "hermes_adopt_external_logins_not_off")
+        # The Recursion-only key the first draft checked is gone: it is not Hermes's setting.
+        self.assertRefusedBeforeSpawn("hermes", self.sub("grok", "grok_sign_in", borrow_claude_code_login=False),
+                                      self.bare_env(), "profile_unknown_field")
+
+    def test_hermes_override_is_recorded_for_the_driver(self) -> None:
+        for profile, env in ((self.sub("grok", "grok_sign_in"), self.bare_env()), (self.profile(), self.env())):
+            decision, _ = self.spawn("hermes", {**profile, HERMES_ADOPT_EXTERNAL_LOGINS: False}, env,
+                                     hermes_override=False)
+            self.assertEqual(decision.engine_config, (("auth.adopt_external_logins", False),))
+            self.launcher.reset_mock()
+        # Hermes's key is Hermes's alone; the other engines record no engine config and refuse the key.
+        for engine in ("pi", "opencode"):
+            decision, _ = self.spawn(engine, self.profile(), self.env())
+            self.assertEqual(decision.engine_config, ())
+            self.launcher.reset_mock()
+            self.assertRefusedBeforeSpawn(engine, self.profile(**{HERMES_ADOPT_EXTERNAL_LOGINS: False}), self.env(),
+                                          "profile_unknown_field")
+
+    def test_macos_keychain_is_not_hidden_by_home_so_hermes_needs_the_override_there(self) -> None:
+        # Claude Code keeps its macOS login in the login Keychain, which a route home does not hide.
+        with mock.patch.object(sys, "platform", "darwin"):
+            self.assertRefusedBeforeSpawn("hermes", self.sub("grok", "grok_sign_in"), self.bare_env(),
+                                          "hermes_adopt_external_logins_not_off", hermes_override=False)
+            decision, _ = self.spawn("hermes", self.sub("grok", "grok_sign_in"), self.bare_env())
+        self.assertEqual(decision.engine_config, ((HERMES_ADOPT_EXTERNAL_LOGINS, False),))
+
+    def test_subscription_route_requires_a_model(self) -> None:
+        # red-team #321 F1: with no model, the engine's own default (e.g. OpenCode's anthropic/...) picks.
+        for engine, provider, method in ALLOWED:
+            self.assertRefusedBeforeSpawn(engine, self.sub(provider, method, model=None), self.bare_env(),
+                                          "model_missing")
 
     def test_no_token_rides_along_with_a_sign_in(self) -> None:
         cases = [({"OPENAI_API_KEY": FAKE_KEY}, "credential_env_on_subscription"),
@@ -147,7 +191,10 @@ class AllowlistTests(_Base):
         self.assertRefusedBeforeSpawn("hermes", self.sub("grok", "grok_sign_in"), self.bare_env(),
                                       "claude_store_in_route_home")
 
-    def test_store_presence_only_never_read(self) -> None:
+    def test_own_store_is_never_read_and_the_decision_says_it_was_not_inspected(self) -> None:
+        # red-team #321 F1: an OAuth-labelled .hermes/auth.json (it could hold a login `hermes auth` adopted) is
+        # not read, so the route may not pass silently: the decision flags the uninspected store. Whether to
+        # read or refuse such stores is open for Lucas.
         (self.home / ".hermes").mkdir()
         (self.home / ".hermes" / "auth.json").write_text(FAKE_OAUTH)
         real_open = builtins.open
@@ -155,9 +202,21 @@ class AllowlistTests(_Base):
         def guard(path, *args, **kwargs):
             raise AssertionError(f"opened {path}")
         with mock.patch.object(builtins, "open", guard), mock.patch.object(os, "open", guard):
-            check_route("hermes", self.sub("grok", "grok_sign_in"), self.bare_env(), route_home=str(self.home),
-                        parent_env=self.parent(), operator_home=str(self.operator))
+            decision = check_route("hermes", {**self.sub("grok", "grok_sign_in"), HERMES_ADOPT_EXTERNAL_LOGINS: False},
+                                   self.bare_env(), route_home=str(self.home), parent_env=self.parent(),
+                                   operator_home=str(self.operator))
         self.assertIs(builtins.open, real_open)
+        self.assertIn("own_login_store_not_inspected:.hermes", decision.flags)
+        self.assertNotIn(FAKE_OAUTH, repr(decision))
+        (self.home / ".config" / "opencode").mkdir(parents=True)  # could hold a Claude provider plugin
+        shutil.rmtree(self.home / ".hermes")
+        decision, _ = self.spawn("opencode", self.sub("chatgpt", "sign_in_with_chatgpt"), self.bare_env())
+        self.assertEqual([f for f in decision.flags if f.startswith("own_login_store")],
+                         ["own_login_store_not_inspected:.config/opencode"])
+
+    def test_no_own_store_no_flag(self) -> None:
+        decision, _ = self.spawn("pi", self.sub("chatgpt", "sign_in_with_chatgpt"), self.bare_env())
+        self.assertFalse([f for f in decision.flags if f.startswith("own_login_store")])
 
     def test_model_must_match_the_signed_in_provider(self) -> None:
         decision, _ = self.spawn("opencode", self.sub("chatgpt", "sign_in_with_chatgpt", model="chatgpt/gpt-x"),

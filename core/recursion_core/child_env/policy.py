@@ -6,13 +6,24 @@ The old route transport hands every engine child the whole parent environment
 replacement. It builds the child environment from nothing:
 
 * an exact-name allowlist per engine profile (Claude Code, Codex). Nothing outside
-  it reaches the child, so credential names are absent by construction, and each
-  profile also lists the names it scrubs so a test can assert them by name;
+  it reaches the child, so credential names are absent by construction (except the
+  user's own sign-in token below), and each profile also lists the names it scrubs so a
+  test can assert them by name;
 * the value rules ported from csl-research candidate records C2-37 and C2-38
   (``submissions/20261102-csl678-value-check-v3-01``, rule N5h, and
   ``submissions/20261103-csl678-envpath-path-noproxy-01``, rule N5i): file, directory,
   proxy, ``TZ``, perspective-path, private temp root, ``PATH`` and per-engine
   ``NO_PROXY`` checks, refused before any spawn;
+* the names PRODUCT.md 055cc7a5 section 3.8 says the Nov 5 list dropped (C1-46, csl-research
+  ``20261102-csl653-quota-credential-hardening-grounding-01`` section 5.8): ``ALL_PROXY`` /
+  ``all_proxy`` and ``XDG_RUNTIME_DIR`` for both engines, and Claude Code's mTLS and cert-store
+  names (``CLAUDE_CODE_CLIENT_CERT``, ``_CLIENT_KEY``, ``_CLIENT_KEY_PASSPHRASE``,
+  ``CLAUDE_CODE_CERT_STORE``, ``network-config.md:64-105``) for the Claude profile, each under
+  the same value rules as its peers;
+* the user's own ``CLAUDE_CODE_OAUTH_TOKEN`` passes through to a Claude child unchanged
+  (PRODUCT.md 055cc7a5 section 3.3, Nov 8 fleet correction: nothing removes a built-in sign-in
+  method from every run). It is never checked, logged or settable by an override; absent in the
+  parent means absent in the child;
 * one change beyond N5h/N5i: links are resolved one component at a time and every
   link met on the way, including links inside a link's target, must be root's or
   ours in a directory chain no one else can write, and no step may enter ``/proc``,
@@ -66,7 +77,9 @@ class EnvRefused(Exception):
 
 
 # The 29 names the Nov 5 tree's route allowlist carried (csl-research
-# 20261102-csl672-a4-child-env-values-grounding-01 section 5.1: PATH, HOME and 27 more).
+# 20261102-csl672-a4-child-env-values-grounding-01 section 5.1: PATH, HOME and 27 more), plus the three
+# engine-neutral names PRODUCT.md 055cc7a5 section 3.8 says it dropped (C1-46): ALL_PROXY, all_proxy and
+# XDG_RUNTIME_DIR. 32 names.
 BASE_NAMES = (
     "PATH",
     "HOME",
@@ -78,6 +91,8 @@ BASE_NAMES = (
     "HTTPS_PROXY",
     "http_proxy",
     "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
     "NO_PROXY",
     "no_proxy",
     "TMPDIR",
@@ -97,18 +112,33 @@ BASE_NAMES = (
     "APPDATA",
     "LOCALAPPDATA",
     "USERPROFILE",
+    "XDG_RUNTIME_DIR",
+)
+# Claude Code's mTLS and cert-store names (C1-46; network-config.md:64-105, env-vars.md:219-223).
+CLAUDE_TLS_NAMES = (
+    "CLAUDE_CODE_CLIENT_CERT",
+    "CLAUDE_CODE_CLIENT_KEY",
+    "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE",
+    "CLAUDE_CODE_CERT_STORE",
 )
 
-VALUE_FILES = ("SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE", "SHELL")
+VALUE_FILES = ("SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE", "SHELL",
+               "CLAUDE_CODE_CLIENT_CERT", "CLAUDE_CODE_CLIENT_KEY")
 VALUE_DIRS = ("SSL_CERT_DIR",)
+VALUE_DIR_SINGLE = ("XDG_RUNTIME_DIR",)  # one directory, not a list: no separator split
 VALUE_URLS = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
+# ALL_PROXY may name a SOCKS proxy (curl's ALL_PROXY); same shape rule otherwise, and it counts as a proxy for NO_PROXY.
+VALUE_ALL_PROXY = ("ALL_PROXY", "all_proxy")
+_ALL_PROXY_SCHEMES = ("http", "https", "socks4", "socks4a", "socks5", "socks5h")
+# CLAUDE_CODE_CERT_STORE: a comma list of the documented sources (network-config.md:64-66).
+_CERT_STORE_SOURCES = ("bundled", "system")
 TEMP_NAMES = ("TMPDIR", "TMP", "TEMP")
 NO_PROXY_NAMES = ("NO_PROXY", "no_proxy")
 # N5i: the names the engines run by bare name. A link for a name outside this list is
 # not checked (envpath record, cell path_tool_link_py); PATH_TOOLS=None checks every entry.
 PATH_TOOLS: tuple[str, ...] | None = ("bash", "zsh", "sh", "git", "rg", "node", "sleep")
 # A name an override may never set, whatever the profile (the Nov 5 tree's _DENIED).
-_DENIED = re.compile(r"(API_?KEY|SECRET|TOKEN|PASSWORD|BASE_URL|_PAT$|USE_BEDROCK|USE_VERTEX|USE_FOUNDRY)", re.IGNORECASE)
+_DENIED = re.compile(r"(API_?KEY|SECRET|TOKEN|PASSWORD|PASSPHRASE|BASE_URL|_PAT$|USE_BEDROCK|USE_VERTEX|USE_FOUNDRY)", re.IGNORECASE)
 # Paths that name a different file in the child than in this process (its own cwd, fds, root).
 _PERSPECTIVE = re.compile(r"^/(?:proc|dev/fd|dev/std(?:in|out|err))(?:/|$)")
 _PROXY_URL = re.compile(
@@ -126,12 +156,14 @@ class EngineProfile:
     allowed: tuple[str, ...]
     hosts: tuple[str, ...]  # its own endpoints: a NO_PROXY entry matching one refuses while a proxy is set
     scrub: tuple[str, ...]  # credential and route selectors, asserted absent (they are not allowlisted)
+    # The user's own sign-in names: copied from the parent unchanged when present, never checked, never set by
+    # an override, absent when the parent lacks them (PRODUCT.md 055cc7a5 section 3.3, Nov 8 fleet correction).
+    passthrough: tuple[str, ...] = ()
 
 
 _CLAUDE_SCRUB = (
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
-    "CLAUDE_CODE_OAUTH_TOKEN",
     "ANTHROPIC_OAUTH_TOKEN",
     "ANTHROPIC_TOKEN",
     "CLAUDE_CODE_USE_BEDROCK",
@@ -151,9 +183,10 @@ ENGINE_PROFILES: Mapping[str, EngineProfile] = MappingProxyType(
         # login/src/server.rs:77 (as read in the envpath record, section 5).
         "claude_code": EngineProfile(
             "claude_code",
-            BASE_NAMES,
+            BASE_NAMES + CLAUDE_TLS_NAMES,
             ("api.anthropic.com", "platform.claude.com", "claude.ai", "mcp-proxy.anthropic.com"),
             _CLAUDE_SCRUB,
+            ("CLAUDE_CODE_OAUTH_TOKEN",),
         ),
         "codex": EngineProfile(
             "codex",
@@ -218,14 +251,15 @@ def build_child_env(
         raise EnvRefused("HOME", "home_unsafe")
     source = dict(os.environ if parent is None else parent)
     env = {name: source[name] for name in profile.allowed if name in source and name != "HOME"}
-    dropped = tuple(sorted(name for name in source if name not in env and name != "HOME"))
+    passed = {name: source[name] for name in profile.passthrough if name in source}
+    dropped = tuple(sorted(name for name in source if name not in env and name not in passed and name != "HOME"))
 
     # Overrides are merged first and then checked by exactly the rules below, like any inherited value.
     # They may only set a name this engine's allowlist already carries: never HOME, PATH or a credential.
     for name, value in (overrides or {}).items():
         if not isinstance(name, str) or not isinstance(value, str) or not name or "=" in name or "\0" in name + value:
             raise EnvRefused(None, "override_malformed")
-        if _DENIED.search(name) or name in profile.scrub or name in ("HOME", "PATH"):
+        if _DENIED.search(name) or name in profile.scrub or name in profile.passthrough or name in ("HOME", "PATH"):
             raise EnvRefused(name, "override_denied")
         if name not in profile.allowed:
             raise EnvRefused(name, "override_not_allowed")
@@ -238,7 +272,7 @@ def build_child_env(
     if "PATH" in env and (cause := _unsafe_path(env["PATH"])) is not None:
         raise EnvRefused("PATH", cause)
     # A bypass only matters when a proxy is set: "*" skips it for every host, an engine-host entry for that engine.
-    if any(env.get(name) for name in VALUE_URLS):
+    if any(env.get(name) for name in VALUE_URLS + VALUE_ALL_PROXY):
         for name in [name for name in NO_PROXY_NAMES if name in env]:
             if (cause := _no_proxy_bypass(env[name], profile.hosts)) is not None:
                 raise EnvRefused(name, cause)
@@ -247,8 +281,10 @@ def build_child_env(
     if present:
         env.update(dict.fromkeys(present, _route_tmp()))
     env["HOME"] = home
+    env.update(passed)  # after every check: the user's own sign-in value is passed as it is, never read here
 
-    leaked = sorted(name for name in env if name in profile.scrub or (name not in profile.allowed and _DENIED.search(name)))
+    leaked = sorted(name for name in env if name in profile.scrub
+                    or (name not in profile.allowed and name not in profile.passthrough and _DENIED.search(name)))
     if leaked:  # unreachable by construction; kept so a later edit to the allowlist fails closed
         raise EnvRefused(leaked[0], "scrub_failed")
     return ValidatedEnv(env, engine, dropped, _seal=ValidatedEnv._seal)
@@ -259,6 +295,13 @@ def _unsafe_value(name: str, value: str) -> str | None:
         return "value_malformed"
     if name in VALUE_URLS:
         return _unsafe_proxy(value)
+    if name in VALUE_ALL_PROXY:
+        return _unsafe_proxy(value, _ALL_PROXY_SCHEMES)
+    if name == "CLAUDE_CODE_CERT_STORE":
+        sources = [part.strip() for part in value.split(",")]
+        return None if all(part in _CERT_STORE_SOURCES for part in sources) else "cert_store_malformed"
+    if name in VALUE_DIR_SINGLE:
+        return _unsafe_dir(value)
     if name == "TZ":
         path = value[1:] if value.startswith(":") else value
         if path.startswith("/"):
@@ -390,11 +433,11 @@ def _no_proxy_bypass(value: str, hosts: tuple[str, ...]) -> str | None:
     return None
 
 
-def _unsafe_proxy(value: str) -> str | None:
-    """A proxy URL is [http[s]://]host[:port][/]: no user name or password, no path."""
+def _unsafe_proxy(value: str, schemes: tuple[str, ...] = ("http", "https")) -> str | None:
+    """A proxy URL is [scheme://]host[:port][/]: no user name or password, no path."""
 
     match = _PROXY_URL.match(value)
-    if match is None or match["scheme"] is not None and match["scheme"].lower() not in ("http", "https"):
+    if match is None or match["scheme"] is not None and match["scheme"].lower() not in schemes:
         return "proxy_malformed"
     if match["userinfo"] is not None:
         return "proxy_userinfo"

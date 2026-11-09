@@ -16,6 +16,7 @@ from pathlib import Path
 from unittest import mock
 
 from recursion_core.child_env import BASE_NAMES, ENGINE_PROFILES, EnvRefused, ValidatedEnv, build_child_env, spawn
+from recursion_core.child_env.policy import CLAUDE_TLS_NAMES
 from recursion_core.child_env.tests import cells
 
 FAKE = "fake-value-not-a-credential"
@@ -59,6 +60,13 @@ class CellTests(unittest.TestCase):
     def test_extras_and_c2_40_shapes(self) -> None:
         self._assert_all(self._group("extra", "c2_40"), 8 + 6)
 
+    def test_c1_46_names_carried_and_value_checked(self) -> None:
+        self._assert_all(self._group("c1_46"), 7)
+        self._assert_all(self._group("c1_46_ok"), 6)
+
+    def test_users_own_claude_sign_in_token_cells(self) -> None:
+        self._assert_all(self._group("auth_ok"), 3)
+
     def test_the_fifteenth_path_cell_is_open_by_default_and_closed_by_the_scan_switch(self) -> None:
         self._assert_all(self._group("path_open", "path_scan"), 2)
 
@@ -80,19 +88,68 @@ class ProfileTests(unittest.TestCase):
             "ANTHROPIC_PROFILE", "ANTHROPIC_FEDERATION_RULE_ID", "ANTHROPIC_ORGANIZATION_ID", "ANTHROPIC_BASE_URL",
             "CLAUDE_CONFIG_DIR", "GEMINI_API_KEY", "XAI_API_KEY", "CURSOR_API_KEY", "GITHUB_TOKEN", "GH_TOKEN",
             "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "NPM_TOKEN", "DATABASE_PASSWORD", "MY_SERVICE_SECRET",
-            "SSH_AUTH_SOCK", "LD_PRELOAD", "NODE_OPTIONS", "PYTHONPATH", "ALL_PROXY", "XDG_RUNTIME_DIR",
-            "CLAUDE_CODE_CLIENT_KEY", "CLAUDE_CODE_SHELL", "CLAUDE_ENV_FILE", "CODEX_CA_CERTIFICATE")}
+            "SSH_AUTH_SOCK", "LD_PRELOAD", "NODE_OPTIONS", "PYTHONPATH", "CLAUDE_CODE_SHELL", "CLAUDE_ENV_FILE",
+            "CODEX_CA_CERTIFICATE", "XDG_CONFIG_HOME", "CLAUDE_SECURESTORAGE_CONFIG_DIR")}
         parent = {"PATH": "/usr/bin:/bin", "HOME": "/home/operator", "LANG": "C.UTF-8", **planted}
         for engine, profile in ENGINE_PROFILES.items():
             with self.subTest(engine=engine):
                 env = build_child_env(engine, home=home, parent=parent)
-                self.assertLessEqual(set(env), set(BASE_NAMES))
-                self.assertFalse(set(planted) & set(env))
+                self.assertLessEqual(set(env), set(profile.allowed) | set(profile.passthrough))
+                # The only planted name that may arrive is the user's own sign-in token, on the Claude profile only.
+                self.assertEqual(set(profile.passthrough), set(planted) & set(env))
+                self.assertEqual({"claude_code": {"CLAUDE_CODE_OAUTH_TOKEN"}, "codex": set()}[engine],
+                                 set(profile.passthrough))
                 self.assertFalse(set(profile.scrub) & set(env))
                 self.assertEqual(home, env["HOME"])
-                self.assertNotIn(FAKE, env.to_dict().values())
-                self.assertLessEqual(set(planted), set(env.dropped))
+                self.assertEqual(set(profile.passthrough), {k for k, v in env.to_dict().items() if v == FAKE})
+                self.assertLessEqual(set(planted) - set(profile.passthrough), set(env.dropped))
                 self.assertNotIn(FAKE, repr(env))
+
+    def test_allowlist_counts(self) -> None:
+        # 29 Nov 5 names + ALL_PROXY, all_proxy, XDG_RUNTIME_DIR (PRODUCT.md 055cc7a5 section 3.8, C1-46).
+        self.assertEqual(32, len(BASE_NAMES))
+        self.assertEqual(32, len(set(BASE_NAMES)))
+        self.assertLessEqual({"ALL_PROXY", "all_proxy", "XDG_RUNTIME_DIR"}, set(BASE_NAMES))
+        self.assertEqual(BASE_NAMES + CLAUDE_TLS_NAMES, ENGINE_PROFILES["claude_code"].allowed)
+        self.assertEqual(BASE_NAMES, ENGINE_PROFILES["codex"].allowed)
+        self.assertEqual({"CLAUDE_CODE_CLIENT_CERT", "CLAUDE_CODE_CLIENT_KEY", "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE",
+                          "CLAUDE_CODE_CERT_STORE"}, set(CLAUDE_TLS_NAMES))
+
+    def test_users_own_oauth_token_passes_to_claude_unchanged(self) -> None:
+        """PRODUCT.md 055cc7a5 3.3 (Nov 8 fleet correction): the user's CLAUDE_CODE_OAUTH_TOKEN stays as it is."""
+
+        home = _home(self)
+        for value in (FAKE, "", "fake value with spaces/../and=signs"):
+            with self.subTest(value=value):
+                env = build_child_env("claude_code", home=home, parent={"PATH": "/usr/bin", "CLAUDE_CODE_OAUTH_TOKEN": value})
+                self.assertEqual(value, env["CLAUDE_CODE_OAUTH_TOKEN"])
+                self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", env.dropped)
+                self.assertNotIn(FAKE, repr(env))
+        # It is not a Codex sign-in: the Codex child never sees it.
+        env = build_child_env("codex", home=home, parent={"PATH": "/usr/bin", "CLAUDE_CODE_OAUTH_TOKEN": FAKE})
+        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", env)
+        self.assertIn("CLAUDE_CODE_OAUTH_TOKEN", env.dropped)
+
+    def test_oauth_token_absent_in_parent_is_absent_in_child(self) -> None:
+        home = _home(self)
+        for parent in ({"PATH": "/usr/bin"}, {"PATH": "/usr/bin", "ANTHROPIC_OAUTH_TOKEN": FAKE, "ANTHROPIC_AUTH_TOKEN": FAKE}):
+            with self.subTest(parent=sorted(parent)):
+                env = build_child_env("claude_code", home=home, parent=parent)
+                self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", env)
+                self.assertNotIn(FAKE, env.to_dict().values())
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_OAUTH_TOKEN": FAKE}):  # an explicit parent wins over os.environ
+            self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", build_child_env("claude_code", home=home, parent={}))
+
+    def test_oauth_token_and_tls_secrets_cannot_be_set_by_override(self) -> None:
+        home = _home(self)
+        cases = (("claude_code", "CLAUDE_CODE_OAUTH_TOKEN", {}), ("claude_code", "CLAUDE_CODE_OAUTH_TOKEN", {"CLAUDE_CODE_OAUTH_TOKEN": FAKE}),
+                 ("codex", "CLAUDE_CODE_OAUTH_TOKEN", {}), ("claude_code", "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE", {}))
+        for engine, name, extra in cases:
+            with self.subTest(engine=engine, name=name, parent=sorted(extra)), self.assertRaises(EnvRefused) as caught:
+                build_child_env(engine, home=home, parent={"PATH": "/usr/bin", **extra}, overrides={name: "fake-override"})
+            self.assertEqual((name, "override_denied"), (caught.exception.name, caught.exception.cause))
+        env = build_child_env("claude_code", home=home, parent={"PATH": "/usr/bin", "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE": FAKE})
+        self.assertEqual(FAKE, env["CLAUDE_CODE_CLIENT_KEY_PASSPHRASE"])  # the operator's own value is carried
 
     def test_codex_scrub_names_are_listed(self) -> None:
         self.assertLessEqual({"CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI_API_KEY"}, set(ENGINE_PROFILES["codex"].scrub))
@@ -119,7 +176,7 @@ class ProfileTests(unittest.TestCase):
     def test_overrides_cannot_add_names_outside_the_allowlist(self) -> None:
         home = _home(self)
         for engine in ENGINE_PROFILES:
-            for name in ("LD_PRELOAD", "NODE_OPTIONS", "PYTHONPATH", "ALL_PROXY", "DISABLE_AUTOUPDATER"):
+            for name in ("LD_PRELOAD", "NODE_OPTIONS", "PYTHONPATH", "XDG_CONFIG_HOME", "DISABLE_AUTOUPDATER"):
                 with self.subTest(engine=engine, name=name), self.assertRaises(EnvRefused) as caught:
                     build_child_env(engine, home=home, parent={"PATH": "/usr/bin"}, overrides={name: "/mock/not-loaded.so"})
                 self.assertEqual((name, "override_not_allowed"), (caught.exception.name, caught.exception.cause))
@@ -136,6 +193,10 @@ class ProfileTests(unittest.TestCase):
             ({"HTTPS_PROXY": "http://u:p@proxy.invalid:8080"}, ("HTTPS_PROXY", "proxy_userinfo")),
             ({"SSL_CERT_DIR": "/proc/self/cwd"}, ("SSL_CERT_DIR", "value_perspective")),
             ({"TZ": "../../etc/zone"}, ("TZ", "tz_relative_path")),
+            ({"ALL_PROXY": "socks5://u:p@proxy.invalid:1080"}, ("ALL_PROXY", "proxy_userinfo")),
+            ({"NO_PROXY": "*", "ALL_PROXY": "socks5://proxy.invalid:1080"}, ("NO_PROXY", "no_proxy_wildcard")),
+            ({"XDG_RUNTIME_DIR": "/proc/self/cwd"}, ("XDG_RUNTIME_DIR", "value_perspective")),
+            ({"CLAUDE_CODE_CLIENT_CERT": "relative.pem"}, ("CLAUDE_CODE_CLIENT_CERT", "override_not_allowed")),
         )
         for overrides, expected in cases:
             with self.subTest(overrides=overrides), self.assertRaises(EnvRefused) as caught:
@@ -172,6 +233,33 @@ class ProfileTests(unittest.TestCase):
             with self.subTest(home=value), self.assertRaises(EnvRefused) as caught:
                 build_child_env("codex", home=value, parent={})
             self.assertEqual(("HOME", "home_unsafe"), (caught.exception.name, caught.exception.cause))
+
+    def test_home_behind_a_link_whose_resolved_parent_others_can_write_is_refused(self) -> None:
+        # #1098 review F4: the link itself is ours and safe; the directory it resolves into is not.
+        base = Path(_home(self))
+        for mode in (0o777, 0o775, 0o757, 0o1777):  # 1777 is ours, not root's, so the sticky exception does not apply
+            with self.subTest(mode=oct(mode)):
+                real_parent = base / f"real-{mode:o}"
+                real_parent.mkdir(mode=0o700)
+                (real_parent / "home").mkdir(mode=0o700)
+                real_parent.chmod(mode)
+                link = base / f"link-{mode:o}"
+                os.symlink(real_parent, link)
+                with self.assertRaises(EnvRefused) as caught:
+                    build_child_env("codex", home=str(link / "home"), parent={})
+                self.assertEqual(("HOME", "home_unsafe"), (caught.exception.name, caught.exception.cause))
+                real_parent.chmod(0o700)  # control: the same link and home pass once the resolved parent is private
+                self.assertEqual(str(link / "home"), build_child_env("codex", home=str(link / "home"), parent={})["HOME"])
+        # A link two levels up whose target's parent others can write is refused too.
+        loose = base / "loose"
+        loose.mkdir(mode=0o700)
+        (loose / "mid").mkdir(mode=0o700)
+        (loose / "mid" / "home").mkdir(mode=0o700)
+        loose.chmod(0o777)
+        os.symlink(loose / "mid", base / "deep-link")
+        with self.assertRaises(EnvRefused) as caught:
+            build_child_env("codex", home=str(base / "deep-link" / "home"), parent={})
+        self.assertEqual("home_unsafe", caught.exception.cause)
 
     def test_home_under_a_symlinked_parent_is_accepted(self) -> None:
         # Devin r4503135764: macOS /var -> private/var. Modelled with an own-uid link, which _resolve also accepts.

@@ -14,7 +14,8 @@ This breaker is the other way round (PRODUCT.md 398cd812, 3.4 S3 and S4, grill Q
 * A vague quota-sounding error is a SHORT_FAULT: it fences one model for one tenant for
   ``short_fault_s`` (grill Q23), never the connection and never another tenant. The refusal while
   that fence holds is itself ``SHORT_FAULT``, not ``BREAKER_OPEN``, so it is never reported as a
-  usage limit and never offered as a switch point.
+  usage limit and never offered as a switch point. Open and half-open keys are checked first, so a
+  short fault never hides a real limit on the same connection from that tenant.
 * It always recovers. An open key has a finite ``open_until`` (the vendor's reset time when the
   signal carries one, capped at ``max_open_s``; otherwise a cooldown with backoff up to
   ``max_cooldown_s``). After it, exactly one leased half-open probe is admitted at a time. The
@@ -76,11 +77,8 @@ class ConnectionBreaker:
 
         with self._lock:
             now = self._clock()
-            until = self._short.get((connection, model, tenant))
-            if until is not None:
-                if now < until:
-                    return _refused(c.SHORT_FAULT, until, f"short_fault:{model}")
-                del self._short[(connection, model, tenant)]
+            # Open and half-open keys first: a short fault never hides a real connection or model limit
+            # from its tenant (grill Q23), so that tenant still gets the limit notice and its on_limit.
             probe_key = None
             for key in self._keys_for(connection, model):
                 rec = self._keys.get(key)
@@ -91,6 +89,11 @@ class ConnectionBreaker:
                 if rec["state"] == HALF_OPEN and rec["lease_until"] is not None and now < rec["lease_until"]:
                     return _refused(c.PROBE_IN_FLIGHT, rec["lease_until"], key)
                 probe_key = probe_key or key  # cooldown over, or the last probe's lease expired
+            until = self._short.get((connection, model, tenant))
+            if until is not None:
+                if now < until:
+                    return _refused(c.SHORT_FAULT, until, f"short_fault:{model}")
+                del self._short[(connection, model, tenant)]
             if probe_key is None:
                 return {"admitted": True, "code": None, "probe": None, "retry_at": None, "key": None}
             rec = self._keys[probe_key]

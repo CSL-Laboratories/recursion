@@ -31,7 +31,8 @@ engine), 11.2 (breaker, plan limits), Q12 (Claude subscription only inside Claud
   connection. Text inside the model's payload (assistant/user content, Codex agent messages) is never
   inspected. Vague quota-sounding error text is a `short_fault`: one model, one tenant, 60 s (grill Q23).
   The refusal while that fence holds is `short_fault` too, never `breaker_open`, so it gets no
-  `limit_notice` and never triggers a fallback.
+  `limit_notice` and never triggers a fallback. Open and half-open keys are checked before it, so a
+  short fault never hides a real limit on the same connection from that tenant.
 - Recursion's own deadline is `deadline_exceeded`: the run is fenced (`EngineProcess.fence`) for that
   request only and the breaker is not told. Other engine failures are request-local too.
 - Recovery: an open key always has a finite end (vendor `reset_at`, capped; otherwise a 300 s cooldown

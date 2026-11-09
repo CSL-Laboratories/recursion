@@ -104,6 +104,27 @@ class BreakerTest(unittest.TestCase):
         self.assertEqual((refused["code"], refused["key"]), (c.SHORT_FAULT, "short_fault:m"))
         self.assertEqual(self.b.state("subscription:A"), "closed")
 
+    def test_short_fault_never_hides_a_connection_limit(self) -> None:
+        # t1's short fault on m, then the connection hits a typed limit: t1 sees the limit too, with the
+        # vendor's reset time, not the end of its own short fault.
+        self.b.record("subscription:A", "m", "t1", {"code": c.SHORT_FAULT})
+        reset_at = self.clock.now + 900
+        limit = {"code": c.PLAN_LIMIT, "limit": c.limit_signal("connection", "test.typed", reset_at=reset_at)}
+        self.assertEqual(self.b.record("subscription:A", "m", "t2", limit), "opened")
+        for tenant in ("t1", "t2"):
+            refused = self.b.admit("subscription:A", "m", tenant)
+            self.assertEqual((refused["code"], refused["key"], refused["retry_at"]),
+                             (c.BREAKER_OPEN, "subscription:A", reset_at), tenant)
+        # Once the cooldown is over, t1's own short fault takes no probe lease; t2 probes, and t1 then sees
+        # the probe in flight, not its short fault.
+        self.b.reset("subscription:A")
+        self.b.record("subscription:A", "m", "t2", LIMIT)
+        self.clock.advance(300)
+        self.b.record("subscription:A", "m", "t1", {"code": c.SHORT_FAULT})
+        self.assertEqual(self.b.admit("subscription:A", "m", "t1")["code"], c.SHORT_FAULT)
+        self.assertIsNotNone(self.b.admit("subscription:A", "m", "t2")["probe"])
+        self.assertEqual(self.b.admit("subscription:A", "m", "t1")["code"], c.PROBE_IN_FLIGHT)
+
     def test_probe_failure_reopens_with_backoff(self) -> None:
         self.b.record("subscription:A", "m", "t1", LIMIT)
         self.clock.advance(300)

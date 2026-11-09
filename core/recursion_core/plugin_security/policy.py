@@ -8,9 +8,5 @@ from __future__ import annotations
 
 __all__ = ["SAME_UID_FALLBACK_POLICY", "SAME_UID_FALLBACK_POLICY_SOURCE"]
 
-SAME_UID_FALLBACK_POLICY = (
-    "the in-process Cockpit plugin holds paper-order permission on Nov 11 under the same-uid"
-    " fallback. The signed authority profile is tamper evidence there, not a boundary, and"
-    " the docs say so. Paper only; live capital stays separately authorised (5.2)."
-)
-SAME_UID_FALLBACK_POLICY_SOURCE = "Lucas, Nov 8 (t1415u), PRODUCT.md 055cc7a5 O69"
+SAME_UID_FALLBACK_POLICY = "it should have permission to run paper testing nov 11 regardless"
+SAME_UID_FALLBACK_POLICY_SOURCE = "Lucas, Nov 8 (t1418u), O69 correction; not yet in PRODUCT.md 055cc7a5"

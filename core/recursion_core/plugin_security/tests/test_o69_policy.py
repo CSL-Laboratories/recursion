@@ -1,6 +1,6 @@
 """O69 (CSL-787): the Nov 11 same-uid fallback policy, quoted exactly in code and docs.
 
-Lucas, Nov 8 (t1415u), PRODUCT.md 055cc7a5 O69. The decision changes no runtime check;
+Lucas, Nov 8 (t1418u), O69 correction; not yet in PRODUCT.md 055cc7a5. The decision changes no runtime check;
 these tests pin the recorded wording and check that nothing in the shipped code or docs
 reads as a live-order grant. The code has one ``order`` permission and no paper/live
 mode, so the only code-level check is that a profile cannot name any other permission.
@@ -19,11 +19,7 @@ from recursion_core.plugin_security.manifest import PERMISSIONS
 from recursion_core.plugin_security.policy import SAME_UID_FALLBACK_POLICY, SAME_UID_FALLBACK_POLICY_SOURCE
 from recursion_core.plugin_security.tests.support import PLUGIN_SOURCE, Clock, Key, needs_crypto, profile, temp_dir
 
-O69_QUOTE = (
-    "the in-process Cockpit plugin holds paper-order permission on Nov 11 under the same-uid"
-    " fallback. The signed authority profile is tamper evidence there, not a boundary, and"
-    " the docs say so. Paper only; live capital stays separately authorised (5.2)."
-)
+O69_QUOTE = "it should have permission to run paper testing nov 11 regardless"
 PACKAGE_DIR = os.path.dirname(plugin_security.__file__)
 
 
@@ -39,7 +35,7 @@ def _flat(text: str) -> str:
 class PolicyTextTests(unittest.TestCase):
     def test_constant_is_the_exact_quote(self) -> None:
         self.assertEqual(SAME_UID_FALLBACK_POLICY, O69_QUOTE)
-        self.assertEqual(SAME_UID_FALLBACK_POLICY_SOURCE, "Lucas, Nov 8 (t1415u), PRODUCT.md 055cc7a5 O69")
+        self.assertEqual(SAME_UID_FALLBACK_POLICY_SOURCE, "Lucas, Nov 8 (t1418u), O69 correction; not yet in PRODUCT.md 055cc7a5")
         self.assertIs(plugin_security.SAME_UID_FALLBACK_POLICY, SAME_UID_FALLBACK_POLICY)
 
     def test_readme_quotes_the_constant_with_attribution(self) -> None:
@@ -53,8 +49,6 @@ class PolicyTextTests(unittest.TestCase):
             self.assertIn("signed authority profile is tamper evidence, not a boundary", text, name)
 
     def test_paper_only_and_live_capital_separate(self) -> None:
-        self.assertIn("Paper only;", SAME_UID_FALLBACK_POLICY)
-        self.assertIn("live capital stays separately authorised", SAME_UID_FALLBACK_POLICY)
         for name in ("README.md", "authority.py"):
             text = _flat(_read(name))
             self.assertIn("Paper only", text, name)

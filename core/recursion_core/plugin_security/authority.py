@@ -26,7 +26,8 @@ tests record which of those mutants succeed. Containment needs a separate OS use
 process for the anchor and ledger (F11, F21); F21 is not done.
 
 Nov 11 same-uid fallback (O69, ``policy.SAME_UID_FALLBACK_POLICY``; Lucas, Nov 8,
-t1415u): the in-process Cockpit plugin holds paper-order permission. Under that
+t1418u; not yet in PRODUCT.md 055cc7a5). Implementation explanation, not a quote:
+the in-process Cockpit plugin holds paper-order permission. Under that
 fallback the signed authority profile is tamper evidence, not a boundary. Paper only;
 live capital stays separately authorised (PRODUCT.md 5.2). This module has one
 ``order`` permission and no paper/live distinction (``scope.venue`` is an opaque

@@ -29,12 +29,11 @@ manifest names itself `host` to reach host-only ops (`host` is a reserved plugin
 Same-uid is not a security boundary. The real boundary is a separate OS user or process
 (F21), and F21 is not done.
 
-**Nov 11 same-uid fallback (O69, decided).** Lucas, Nov 8 (t1415u), PRODUCT.md 055cc7a5
-O69:
+**Nov 11 same-uid fallback (O69, decided).** Lucas, Nov 8 (t1418u), O69 correction; not yet in PRODUCT.md 055cc7a5:
 
-> "the in-process Cockpit plugin holds paper-order permission on Nov 11 under the same-uid fallback. The signed authority profile is tamper evidence there, not a boundary, and the docs say so. Paper only; live capital stays separately authorised (5.2)."
+> "it should have permission to run paper testing nov 11 regardless"
 
-So under the same-uid fallback the signed authority profile is tamper evidence, not a
+Implementation explanation (not Lucas's quoted words): under the same-uid fallback the signed authority profile is tamper evidence, not a
 boundary: it binds honest plugins and records what happened, and the mutants above
 still rewrite it. The in-process Cockpit plugin holds paper-order permission on Nov 11.
 Paper only. This fallback grants no live-order permission; live capital stays

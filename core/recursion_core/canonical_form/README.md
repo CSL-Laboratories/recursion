@@ -76,14 +76,19 @@ Run these from the repository root. They need Python 3.11+ and the standard libr
     PYTHONPATH=core python3 -B -m recursion_core.canonical_form.vectors_build --check
 
 - `test_vectors.py` rebuilds and checks every vector and tests how the two fields interact.
-- `test_rp0_v2_floor.py` is the floor that the Q13 redesign has to keep (PRODUCT.md
-  055cc7a5, CSLR-D-011: section 1 and A27, RP0-v2 section 5.2's RP2 verifier; section 4.2,
-  B15; section 4.3, Q13; O49). It checks four things:
+- `test_candidate_floor_1100.py` is a *candidate* floor for the two fields, taken from
+  csl-research #1100 at 114b48be. It is not the RP0-v2 floor: #1100 is proposed and not
+  accepted, and no accepted RP0-v2 test requires these rules (RP0-v2's accepted material
+  names only Route Contract v0 conformance against the fake driver). It is pending
+  acceptance through C5 / CSL-707, and whether #1100's two-field rules become the Q13 floor
+  (PRODUCT.md 055cc7a5, CSLR-D-011, section 1 and section 4.3) is Lucas's decision. It
+  checks five things against #1100's proposal:
   - both fields stay required;
-  - the outcome enum stays closed and is not narrowed;
+  - the outcome enum equals #1100's closed 8-value `RunOutcome`;
   - `breaker_tripped` stays a strict boolean;
+  - #1100's A3, F2 and unknown-is-never-success refusals hold;
   - the committed digests do not move unless `VECTOR_SET_SHA256` is edited in the same
-    commit.
+    commit, and the vendored #1100 digests still match.
 
 `tools/ci_gate.py` `TEST_GLOBS` does not include `core/` yet, so the gate reports these
 tests as "neither run nor excluded" until the founder-only change on CSL-795 lands.

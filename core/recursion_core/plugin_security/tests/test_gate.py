@@ -10,10 +10,12 @@ import json
 import unittest
 from pathlib import Path
 
-from recursion_core.plugin_security import PROTOCOL, CoreService, canonical, parse_manifest
+from recursion_core.plugin_security import (
+    PROTOCOL, CoreHealth, CoreService, PluginLoader, Refused, TrustStore, canonical, parse_manifest,
+)
 from recursion_core.plugin_security.tests.support import (
-    AGENT_TOKEN, OPERATOR_TOKEN, PLUGIN_TOKEN, FakeGilProbe, World, effect, needs_crypto, profile,
-    scope_of,
+    AGENT_TOKEN, OPERATOR_TOKEN, PLUGIN_SOURCE, PLUGIN_TOKEN, FakeGilProbe, World, effect, needs_crypto,
+    profile, scope_of,
 )
 from recursion_core.plugin_security.signing import key_id
 
@@ -145,6 +147,34 @@ class RevocationTests(unittest.TestCase):
         trust, kid, reason = self.w.loader._trust.classify(parse_manifest(self.w.manifest),
                                                            self.w.developer.sign(self.w.manifest))
         self.assertEqual((trust, kid, reason), ("unsigned", None, "signer_key_revoked"))
+
+    def test_revocation_survives_a_restart(self) -> None:
+        """Round 2 finding 1: a restart rebuilds the trust store from installer config,
+        which never saw the revocation; the durable store keeps the key revoked."""
+        self.assertTrue(self.w.call(self.w.host, "key.revoke", key_id=self.kid)["ok"])
+        # A daemon restart: the same installer config and the same revocation store.
+        trust = TrustStore(self.w.trusted, revocation_store=self.w.revocation_store)
+        self.addCleanup(trust.close)
+        self.assertIn(self.kid, trust.revoked)
+        loader = PluginLoader(trust, {"demo.plugin": self.w.grant}, self.w.reserved, CoreHealth(),
+                              FakeGilProbe())
+        loaded = loader.load(self.w.manifest, self.w.developer.sign(self.w.manifest), PLUGIN_SOURCE)
+        self.assertEqual(loaded.trust, "unsigned")
+        self.assertNotIn("order", loader.permissions("demo.plugin"))
+        codes = [f["code"] for f in loaded.findings]
+        self.assertIn("signer_key_revoked", codes)
+        self.assertIn("grant_signer_mismatch", codes)  # the user's step is a fresh grant
+
+    def test_revocation_without_a_store_is_refused_but_order_is_off(self) -> None:
+        trust = TrustStore(self.w.trusted)  # no durable store configured
+        loader = PluginLoader(trust, {"demo.plugin": self.w.grant}, self.w.reserved, CoreHealth(),
+                              FakeGilProbe())
+        loader.load(self.w.manifest, self.w.developer.sign(self.w.manifest), PLUGIN_SOURCE)
+        with self.assertRaises(Refused) as ctx:
+            loader.revoke_key(self.kid)
+        self.assertEqual(ctx.exception.code, "revocation_not_durable")
+        self.assertNotIn("order", loader.permissions("demo.plugin"))
+        self.assertIn(self.kid, trust.revoked)
 
 
 @needs_crypto

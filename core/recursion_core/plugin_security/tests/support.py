@@ -14,7 +14,8 @@ import unittest
 
 from recursion_core.plugin_security import (
     ApprovalGate, Authority, ConnectionBreaker, CoreHealth, CoreService, Grant, PluginLoader,
-    ReservedEffects, TrustStore, canonical, create_breaker_store, create_ledger, parse, parse_manifest,
+    ReservedEffects, TrustStore, canonical, create_breaker_store, create_ledger, create_revocation_store,
+    parse, parse_manifest,
 )
 from recursion_core.plugin_security.signing import backend_available
 
@@ -143,13 +144,17 @@ class World:
         create_breaker_store(self.breaker_store)
         self.breaker = ConnectionBreaker(self.breaker_store)
         test.addCleanup(self.breaker.close)
-        trust = TrustStore({"dev": self.developer.public} if signed else {})
+        self.revocation_store = os.path.join(self.dir, "revoked.db")
+        create_revocation_store(self.revocation_store)
+        self.trusted = {"dev": self.developer.public} if signed else {}
+        trust = TrustStore(self.trusted, revocation_store=self.revocation_store)
+        test.addCleanup(trust.close)
         self.manifest = manifest_bytes(self.developer.public)
         kid = trust.classify(parse_manifest(self.manifest), self.developer.sign(self.manifest))[1]
-        grant = Grant("demo.plugin", hashlib.sha256(PLUGIN_SOURCE).hexdigest(), kid,
-                      tuple(grant_permissions), unsigned_ack)
-        self.loader = PluginLoader(trust, {"demo.plugin": grant},
-                                   ReservedEffects(frozenset({"venue.example"}), ("venue:",)),
+        self.grant = Grant("demo.plugin", hashlib.sha256(PLUGIN_SOURCE).hexdigest(), kid,
+                           tuple(grant_permissions), unsigned_ack)
+        self.reserved = ReservedEffects(frozenset({"venue.example"}), ("venue:",))
+        self.loader = PluginLoader(trust, {"demo.plugin": self.grant}, self.reserved,
                                    self.health, gil_probe or FakeGilProbe())
         self.gate = ApprovalGate(lambda *drawn: self.drawn.append(drawn), authenticate, self.clock)
         self.ledger = os.path.join(self.dir, "ledger.db")

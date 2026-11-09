@@ -10,7 +10,8 @@ from .breaker import TYPED_LIMITS, ConnectionBreaker, create_breaker_store
 from .canonical import canonical, parse
 from .errors import Refused
 from .loader import CoreHealth, LoadedPlugin, PluginLoader
-from .manifest import MANIFEST_SCHEMA, PERMISSIONS, Grant, ReservedEffects, TrustStore, parse_manifest
+from .manifest import (MANIFEST_SCHEMA, PERMISSIONS, Grant, ReservedEffects, TrustStore,
+                       create_revocation_store, parse_manifest)
 from .policy import SAME_UID_FALLBACK_POLICY, SAME_UID_FALLBACK_POLICY_SOURCE
 from .protocol import HOST, PROTOCOL, PROTOCOL_VERSION, CoreService
 from .runtime import GilProbe, require_production_runtime, runtime_report
@@ -21,6 +22,7 @@ __all__ = [
     "TYPED_LIMITS", "ApprovalGate", "Authority", "ConnectionBreaker",
     "CoreHealth", "CoreService", "GilProbe", "Grant", "LoadedPlugin", "PluginLoader", "Refused",
     "ReservedEffects", "TrustStore", "canonical", "check_effect", "create_breaker_store", "create_ledger",
+    "create_revocation_store",
     "effect_digest",
     "parse", "parse_manifest", "require_production_runtime", "runtime_report",
 ]

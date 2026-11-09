@@ -99,20 +99,27 @@ class PluginLoader:
         developer key loses ``order`` at once, signed or manually granted, so a stolen key
         cannot keep trading until the next restart. Its other grants stay (O12 open).
         Turning order back on is the user's step: a fresh grant and load, never this call.
+        The revocation is stored durably (``TrustStore``), so a restart keeps the key
+        revoked. Order is turned off before the durable write, so if that write fails
+        the running plugins are already off and ``revocation_not_durable`` is raised.
         """
         if type(kid) is not str or not kid.startswith("ed25519:"):
             raise Refused("invalid_key_id")
         with self._lock:
+            turned_off = self._order_off(kid)
             self._trust.revoke(kid)
-            turned_off = []
-            for plugin_id, plugin in sorted(self._active.items()):
-                if plugin.developer_key_id == kid and "order" in plugin.permissions:
-                    perms = tuple(p for p in plugin.permissions if p != "order")
-                    finding = _finding("active", "signer_key_revoked_order_off", "warn", kid)
-                    self._active[plugin_id] = replace(plugin, permissions=perms,
-                                                      findings=plugin.findings + (finding,))
-                    turned_off.append(plugin_id)
             return turned_off
+
+    def _order_off(self, kid: str) -> list[str]:
+        turned_off = []
+        for plugin_id, plugin in sorted(self._active.items()):
+            if plugin.developer_key_id == kid and "order" in plugin.permissions:
+                perms = tuple(p for p in plugin.permissions if p != "order")
+                finding = _finding("active", "signer_key_revoked_order_off", "warn", kid)
+                self._active[plugin_id] = replace(plugin, permissions=perms,
+                                                  findings=plugin.findings + (finding,))
+                turned_off.append(plugin_id)
+        return turned_off
 
     def artifact(self, plugin_id: str) -> str | None:
         plugin = self._active.get(plugin_id)

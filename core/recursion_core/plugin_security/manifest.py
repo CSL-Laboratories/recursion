@@ -19,7 +19,9 @@ PRODUCT.md 4.1 and 4.3 (at 055cc7a5, CSLR-D-011), as implemented here:
 
 from __future__ import annotations
 
+import os
 import re
+import sqlite3
 import threading
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -35,6 +37,7 @@ __all__ = [
     "Manifest",
     "ReservedEffects",
     "TrustStore",
+    "create_revocation_store",
     "effective_permissions",
     "parse_manifest",
 ]
@@ -115,27 +118,95 @@ def parse_manifest(raw: bytes) -> Manifest:
                     data["developer_key"], tuple(perms), nets, creds, raw)
 
 
+_REVOCATION_MAGIC = "csl-revocation-store/v0"
+
+
+def create_revocation_store(path: str) -> None:
+    """Installer step: create the durable revoked-key store. Refuses if it exists."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(fd)
+    db = sqlite3.connect(path, isolation_level=None)
+    try:
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
+        db.execute("CREATE TABLE revoked (key_id TEXT PRIMARY KEY)")
+        db.execute("INSERT INTO meta VALUES ('magic', ?)", (_REVOCATION_MAGIC,))
+    finally:
+        db.close()
+
+
 class TrustStore:
-    """This install's own trusted developer keys and the revoked-key list it last read.
+    """This install's own trusted developer keys and its revoked-key list.
 
     Built by the composition root from installer-owned configuration, never from a
     plugin. CSL's key, if present, is one entry like any other. A key revoked while
     plugins are running goes through ``PluginLoader.revoke_key``, which also turns off
     order permission for active plugins under that key.
+
+    A runtime revocation must outlive a restart (4.4: order stays off "until the user
+    turns it back on"), and the installer configuration never sees it. So it is written
+    to an installer-created SQLite store (``create_revocation_store``; WAL,
+    ``synchronous=FULL``) before it takes effect, and every key in that store is read
+    back as revoked when the trust store is built. The daemon never creates the store;
+    a named store that is missing or invalid refuses. Without a store, ``revoke`` still
+    revokes in memory but refuses ``revocation_not_durable`` so the host knows. The
+    same-uid limit in ``authority.py`` applies: in-process plugin code can rewrite this
+    file (B17).
     """
 
-    def __init__(self, trusted_keys: dict[str, str], revoked_key_ids: frozenset = frozenset()):
+    def __init__(self, trusted_keys: dict[str, str], revoked_key_ids: frozenset = frozenset(),
+                 *, revocation_store: str | None = None):
         keys = {}
         for label, hex_key in trusted_keys.items():
             keys[key_id(hex_key)] = (label, hex_key)
         self._keys = MappingProxyType(keys)
         self._lock = threading.Lock()
-        self._revoked = frozenset(revoked_key_ids)
+        self._db = None if revocation_store is None else self._open_store(revocation_store)
+        stored = () if self._db is None else (r[0] for r in self._db.execute("SELECT key_id FROM revoked"))
+        self._revoked = frozenset(revoked_key_ids) | frozenset(stored)
+
+    @staticmethod
+    def _open_store(path: str) -> sqlite3.Connection:
+        if not os.path.isfile(path):
+            raise Refused("revocation_store_missing")
+        db = sqlite3.connect(path, isolation_level=None, check_same_thread=False, timeout=30)
+        try:
+            db.execute("PRAGMA synchronous=FULL")
+            db.execute("PRAGMA busy_timeout=30000")
+            meta = dict(db.execute("SELECT k, v FROM meta").fetchall())
+            db.execute("SELECT key_id FROM revoked LIMIT 1").fetchall()
+        except sqlite3.DatabaseError:
+            db.close()
+            raise Refused("revocation_store_invalid") from None
+        if meta.get("magic") != _REVOCATION_MAGIC:
+            db.close()
+            raise Refused("revocation_store_invalid")
+        return db
+
+    @property
+    def revoked(self) -> frozenset:
+        return self._revoked
 
     def revoke(self, kid: str) -> None:
-        """Add a key id to the revoked list; later loads classify it as unsigned (4.4)."""
+        """Revoke a key id; later loads, including after a restart, classify it unsigned (4.4).
+
+        The durable write comes first. The in-memory list is updated even if that write
+        fails or there is no store, then ``revocation_not_durable`` is raised.
+        """
         with self._lock:
-            self._revoked = self._revoked | {kid}
+            durable = False
+            try:
+                if self._db is not None:
+                    self._db.execute("INSERT OR IGNORE INTO revoked VALUES (?)", (kid,))
+                    durable = True
+            finally:
+                self._revoked = self._revoked | {kid}
+            if not durable:
+                raise Refused("revocation_not_durable", kid)
+
+    def close(self) -> None:
+        if self._db is not None:
+            self._db.close()
 
     def classify(self, manifest: Manifest, signature: object) -> tuple[str, str | None, str]:
         """Return ``(trust, signer_key_id, reason)``; trust is ``signed`` or ``unsigned``."""

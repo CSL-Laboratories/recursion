@@ -230,14 +230,14 @@ class Application:
         shown = withhold_venue_data(data)
         return "<pre>%s</pre>" % escape(json.dumps(shown, indent=2, sort_keys=True))
 
-    def _o7_view(self, command: str, data: dict) -> str:
+    def _o7_view(self, command: str, data: dict, shown: object = None) -> str:
         status = data.get("status_code") if type(data.get("status_code")) is str else "not reported"
         result = data.get("result") if type(data.get("result")) is dict else {}
         warn = ""
         if result.get("order_submitted") is not False and command in ACTIONS:
             warn = '<p role="alert">Contract problem: the response does not state order_submitted=false.</p>'
         return ('<p role="status">Status reported by the control API: <strong>%s</strong></p>%s%s'
-                % (escape(status), warn, self._response_view(data)))
+                % (escape(status), warn, self._response_view(data if shown is None else shown)))
 
     def _read(self, env: dict) -> tuple[str, str]:
         form = self._query(env)
@@ -260,24 +260,31 @@ class Application:
             body += ('<p role="note">Declared venue use: <code>%s</code> (a label). '
                      % escape(panel["venue_use"]))
             if panel.get("venue") is not None:
-                body += ('The control API\'s O7 v0 reads take no venue argument; returned rows '
-                         'are filtered to <code>%s</code> before display; venue data stays behind '
-                         'the venue-data switch.</p>' % escape(panel["venue"]))
+                body += ('The control API\'s O7 v0 reads take no venue argument; returned data '
+                         'is filtered to <code>%s</code> before display and anything not labelled '
+                         'with it is withheld; venue data stays behind the venue-data switch.</p>'
+                         % escape(panel["venue"]))
             else:
                 body += ('The control API\'s O7 v0 reads take no venue argument, so the results '
                          'below are not scoped to this venue; venue data stays behind the '
                          'venue-data switch.</p>')
         elif panel.get("venue") is not None:
             body += ('<p role="note">The control API\'s O7 v0 reads take no venue argument; '
-                     'returned rows are filtered to <code>%s</code> before display.</p>'
+                     'returned data is filtered to <code>%s</code> before display and anything '
+                     'not labelled with it is withheld.</p>'
                      % escape(panel["venue"]))
         for command in panel["reads"]:
             body += "<section><h3>%s</h3>" % escape(_LABELS[command])
             try:
                 data = self._client.operator(command)
-                if panel.get("venue") is not None:
-                    data = filter_venue_rows(data, panel["venue"])
-                body += self._o7_view(command, data)
+                if panel.get("venue") is None:
+                    body += self._o7_view(command, data)
+                else:
+                    shown, withheld = filter_venue_rows(data, panel["venue"])
+                    if withheld:
+                        body += ('<p role="note">Withheld: data not labelled <code>%s</code>.</p>'
+                                 % escape(panel["venue"]))
+                    body += self._o7_view(command, data, shown)
             except ControlError as exc:
                 body += '<p role="status">Unavailable: %s</p>' % escape(exc.code)
             body += "</section>"

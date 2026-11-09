@@ -118,6 +118,49 @@ class PanelTests(GuiHarness):
         self.assertEqual(len(rows), 3)  # display filtering does not alter the source
         self.assertEqual([c[2]["arguments"] for c in self.api.calls], [{}])
 
+    def test_unlabelled_nested_dict_is_withheld_on_a_venue_panel(self):
+        self.mount([{"id": "k", "title": "Kalshi", "reads": [READS[0]], "venue": "kalshi"}])
+        self.api.extra[READS[0]] = {"result": {
+            "positions": {"KXUNLABELLED": {"qty": 424242}},
+            "rows": [{"venue": "kalshi", "symbol": "KALSHI-VISIBLE", "fills": {"qty": 7}}]}}
+        body = self.request("GET", "/panel", query="id=k")[2]
+        self.assertIn("KALSHI-VISIBLE", body)
+        self.assertIn("&quot;qty&quot;: 7", body)  # nested data in a kalshi row inherits its label
+        for hidden in ("KXUNLABELLED", "424242"):
+            self.assertNotIn(hidden, body)
+        self.assertIn("Withheld: data not labelled <code>kalshi</code>.", body)
+
+    def test_cross_venue_and_other_venue_totals_are_withheld_on_a_venue_panel(self):
+        self.mount([{"id": "k", "title": "Kalshi", "reads": [READS[0]], "venue": "kalshi"}])
+        self.api.extra[READS[0]] = {"result": {
+            "total": 919191, "totals": {"all_venues": 828282},
+            "by_venue": [{"venue": "paper", "total": 737373}, {"venue": "kalshi", "total": 646464}]}}
+        body = self.request("GET", "/panel", query="id=k")[2]
+        self.assertIn("646464", body)
+        for hidden in ("919191", "828282", "737373", "all_venues"):
+            self.assertNotIn(hidden, body)
+        self.assertIn("Withheld: data not labelled <code>kalshi</code>.", body)
+
+    def test_venue_data_switch_off_still_governs_with_and_without_a_venue_filter(self):
+        self.mount([{"id": "k", "title": "Kalshi", "reads": [READS[0]], "venue": "kalshi"},
+                    {"id": "n", "title": "Plain", "reads": [READS[0]]}])
+        mixed = {"positions": {"KXUNLABELLED": {"qty": 424242}}, "total": 919191,
+                 "rows": [{"venue": "kalshi", "symbol": "KALSHI-VISIBLE",
+                           "venue_data": "kalshi-switch-gated", "venue_data_switch": "off"}]}
+        self.api.extra[READS[0]] = {"result": mixed}
+        plain = self.request("GET", "/panel", query="id=n")[2]  # no venue: unfiltered data renders
+        for shown in ("KXUNLABELLED", "424242", "919191", "KALSHI-VISIBLE"):
+            self.assertIn(shown, plain)
+        self.assertNotIn("kalshi-switch-gated", plain)
+        self.assertIn("withheld: venue data switch is off", plain)
+        kalshi = self.request("GET", "/panel", query="id=k")[2]
+        self.assertIn("KALSHI-VISIBLE", kalshi)
+        for hidden in ("KXUNLABELLED", "424242", "919191", "kalshi-switch-gated"):
+            self.assertNotIn(hidden, kalshi)
+        self.assertIn("withheld: venue data switch is off", kalshi)
+        mixed["rows"][0]["venue_data_switch"] = "on"
+        self.assertIn("kalshi-switch-gated", self.request("GET", "/panel", query="id=k")[2])
+
     def test_real_cockpit_registry_renders(self):
         try:
             plugin = importlib.import_module("cockpit.gui.panels")

@@ -30,27 +30,44 @@ def panel_registry(panels):
         if type(panel.get("withhold_venue_data", True)) is not bool:
             raise ValueError("withhold_venue_data must be a boolean")
         # Always use the shared venue-data filter, even if the plugin asks otherwise.
-        # O7 reads stay unscoped; venue_use is a label; declared venue filters rows after the read.
+        # O7 reads stay unscoped; venue_use is a label; declared venue filters data after the read.
         registered[pid] = MappingProxyType({"title": title, "reads": tuple(dict.fromkeys(reads)),
                                             "venue": venue, "venue_use": venue_use})
     return MappingProxyType(registered)
 
 
-def filter_venue_rows(value, venue, *, scoped=False):
-    """Filter unscoped read rows for a declared panel venue, without mutating the response.
+_DROP = object()
 
-    Rows without venue attribution are withheld too. Nested data in a matching row
-    inherits its venue, unless it declares a different one. This is a display filter,
-    not order authorization or an API scope.
+
+def filter_venue_rows(value, venue):
+    """Keep only read data labelled with a declared panel venue, without mutating the response.
+
+    Returns ``(kept, withheld)``. Fails closed: a dict labelled with another venue, and any
+    value outside a dict labelled ``venue`` (unlabelled nested dicts, totals, response-level
+    errors or provenance), is dropped and ``withheld`` is true. A matching dict is kept, and
+    its nested data inherits the venue unless it declares a different one. Unlabelled
+    containers stay only as the path to kept data. This is a display filter, not order
+    authorization or an API scope.
     """
+    withheld = []
+    kept = _venue_only(value, venue, False, withheld)
+    return ({} if kept is _DROP else kept), bool(withheld)
+
+
+def _venue_only(value, venue, scoped, withheld):
     if isinstance(value, dict):
         if "venue" in value:
             if value["venue"] != venue:
-                return {}
+                withheld.append(value)
+                return _DROP
             scoped = True
-        return {key: filter_venue_rows(item, venue, scoped=scoped) for key, item in value.items()}
-    if isinstance(value, list):
-        return [filter_venue_rows(item, venue, scoped=scoped) for item in value
-                if (isinstance(item, dict) and item.get("venue", venue if scoped else None) == venue)
-                or (scoped and not isinstance(item, dict))]
-    return value
+        pairs = ((key, _venue_only(item, venue, scoped, withheld)) for key, item in value.items())
+        out = {key: item for key, item in pairs if item is not _DROP}
+    elif isinstance(value, list):
+        out = [item for item in (_venue_only(v, venue, scoped, withheld) for v in value) if item is not _DROP]
+    elif scoped:
+        return value
+    else:
+        withheld.append(value)
+        return _DROP
+    return out if out or scoped else _DROP

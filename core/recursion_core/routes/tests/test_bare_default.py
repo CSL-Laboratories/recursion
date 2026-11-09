@@ -6,6 +6,8 @@ No provider call. The one optional test runs the local ``claude --help`` (offlin
 
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import shutil
 import subprocess
@@ -65,6 +67,30 @@ class ClassifyHelpTest(unittest.TestCase):
                 "-p, --print                           Print response and exit",
                 flag + "                           Runs in bare mode by default")
             self.assertEqual(bd.classify_help(text), "present")
+
+    def test_bare_help_saying_it_is_the_default_is_present(self) -> None:
+        for desc in ("Minimal mode. --bare is the default.", "Minimal mode (default).",
+                     "Minimal mode. Defaults to on.", "Minimal mode. Bare is now the default."):
+            with self.subTest(desc=desc):
+                self.assertEqual(bd.classify_help(help_with_bare(desc)), "present")
+
+    def test_only_print_help_saying_bare_is_default_is_present(self) -> None:
+        for note in ("--bare is the default.", "Bare mode is now the default.", "Defaults to --bare.",
+                     "Implies --bare (default).", "Default is bare mode."):
+            with self.subTest(note=note):
+                text = help_with_bare("Minimal mode.").replace("Print response and exit",
+                                                               "Print response and exit. " + note)
+                self.assertEqual(bd.classify_help(text), "present")
+
+    def test_future_or_negated_print_wording_keeps_its_classification(self) -> None:
+        cases = {"--bare will become the default for -p in a future release.": "absent",
+                 "--bare is not the default.": "unknown",
+                 "The default system prompt is skipped with --bare.": "unknown"}
+        for note, state in cases.items():
+            with self.subTest(note=note):
+                text = help_with_bare("Minimal mode.").replace("Print response and exit",
+                                                               "Print response and exit. " + note)
+                self.assertEqual(bd.classify_help(text), state)
 
     def test_neutral_or_ambiguous_help_is_unknown(self):
         for description in ("Minimal mode.", "Minimal bare mode is planned."):
@@ -140,6 +166,36 @@ class SubscriptionRouteBareDefaultTest(unittest.TestCase):
         h = Harness([claude_ok()])
         self.assertEqual(h.handle(request(**metadata))["status"], "ok")
         self.assertEqual(h.launcher.calls[0]["argv"][:3], ["claude", "--no-bare", "-p"])
+
+    def test_unreadable_or_unparseable_help_refuses_the_route(self) -> None:
+        def unreadable(argv, **kwargs):
+            raise subprocess.TimeoutExpired(argv, bd.HELP_TIMEOUT_S)
+
+        def unparseable(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 0, stdout=b"Usage: claude [options]\n")
+        for run in (unreadable, unparseable):
+            with self.subTest(run=run.__name__):
+                metadata = bd.probe_auth_mode("claude", {"PATH": "/usr/bin"}, run)
+                self.assertEqual(metadata, {"bare_default": "unknown", "bare_opt_out": None})
+                h = Harness([])
+                self.assertEqual(h.handle(request(**metadata))["code"], c.LAUNCH_REFUSED)
+                self.assertEqual(h.launcher.calls, [])
+
+    def test_cli_reports_classification_route_and_help_lines(self) -> None:
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, stdout=help_with_bare("Minimal mode.").encode())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(bd.main(["--claude", "/opt/claude"], run), 0)
+        self.assertEqual(calls, [["/opt/claude", "--help"]])
+        text = out.getvalue()
+        self.assertIn("bare_default: unknown", text)
+        self.assertIn("subscription route: refuses", text)
+        self.assertIn("  --bare", text)
+        self.assertIn("  -p, --print", text)
 
     def test_unknown_still_refuses_even_with_opt_out(self):
         h = Harness([])

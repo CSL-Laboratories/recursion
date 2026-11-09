@@ -62,9 +62,13 @@ run's environment changes:
 - `--bare` as the `-p` default (B20, CSL-726; t1418u correction): the surface reports
   `route.bare_default` and `route.bare_opt_out` from `bare_default.probe_auth_mode()`
   (one `claude --help`, small fixed env, 10 s timeout). Both the `--bare` and
-  `-p/--print` help blocks are checked. Neutral or incomplete help is `unknown`,
-  not proof that the default is off. The recorded 2.1.312 excerpt omits print help
-  and therefore reads `unknown`.
+  `-p/--print` help blocks are checked: if either says `--bare` is the default now,
+  the state is `present`. Future-tense wording ("will become the default for -p")
+  is `absent`; negated wording never proves the default. Neutral or incomplete help
+  is `unknown`, not proof that the default is off. The recorded 2.1.312 excerpt omits
+  print help and therefore reads `unknown`. To check a build:
+  `PYTHONPATH=core python3 -B -m recursion_core.routes.bare_default --claude PATH`
+  runs only `PATH --help` and prints the state, the route's answer and both help blocks.
   When the build advertises `--no-bare`, the subscription driver passes it explicitly,
   including on fallback routes. No flag is invented. Without an opt-out, only an
   explicitly known `absent` default launches. `unknown` or not reported always

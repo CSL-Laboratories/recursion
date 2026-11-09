@@ -13,6 +13,9 @@ refused (``engine_unknown``). Each engine has two separate slots:
 A grant needs ``found >= security`` (when set). When a functional floor is set,
 it also needs ``found >= functional``. When it is unset, the engine still runs
 under the beta tag.
+An engine with no identity rule (``ident=None``) is refused
+(``identity_unverified``) before its binary is run: a bare name plus a semver line
+does not identify an engine.
 A floor change is a new ``FLOOR_TABLE_VERSION``, never an in-place edit; grants
 issued under another table version are refused (``grant_stale``).
 """
@@ -27,7 +30,7 @@ from types import MappingProxyType
 
 from recursion_core.launch_check.refusals import LaunchRefused
 
-FLOOR_TABLE_VERSION = "r2a-floors/1.1.0-candidate-2026-11-08"
+FLOOR_TABLE_VERSION = "r2a-floors/1.2.0-candidate-2026-11-09"
 
 
 @dataclass(frozen=True)
@@ -91,7 +94,9 @@ _SPECS = (
     EngineSpec(
         "pi", ("pi",), "semver", None, None,
         "no record", "none recorded",
-        ident=None,  # "pi" is too short to search for safely
+        # "pi" is too short to search for safely, and the real Pi is a JS bundle (11.6), so a
+        # native `pi` is some other tool. No identity rule: refused (identity_unverified).
+        ident=None,
     ),
     # Hermes: read with `hermes-acp --version`, which skips the network update check
     # (PRODUCT.md 11.6, CSL-712 engine CLIs record).
@@ -182,6 +187,15 @@ def _floor_key(spec: EngineSpec, floor: str) -> tuple[int, ...]:
     return parsed.key
 
 
+def check_identity(spec: EngineSpec) -> None:
+    """Refuse an engine with no identity rule: its name and a version line alone prove nothing."""
+    if spec.ident is None:
+        raise LaunchRefused(
+            "identity_unverified", spec.engine,
+            "no identity rule or pinned digest for this engine; a name plus a version line is not enough",
+        )
+
+
 def check_floors(spec: EngineSpec, found: ParsedVersion) -> None:
     """Security floor (when set), then the functional floor when one is measured.
 
@@ -222,6 +236,7 @@ def table_record() -> dict[str, object]:
                 "functional_basis": s.functional_basis,
                 "security_basis": s.security_basis,
                 "probe_name": s.probe_name,
+                "identity": "rule" if s.ident else "unverified",
             }
             for s in _SPECS
         },

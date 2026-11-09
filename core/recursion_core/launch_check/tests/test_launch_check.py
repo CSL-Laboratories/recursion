@@ -56,7 +56,7 @@ CLAUDE = "2.1.318 (Claude Code)"
 CODEX = "codex-cli 0.160.0"
 EXPECTED_CODES = {
     "engine_unknown", "path_not_absolute", "binary_missing", "wrapper_refused", "name_mismatch",
-    "version_probe_failed", "binary_changed", "engine_mismatch", "version_unparsed", "floor_unset",
+    "version_probe_failed", "binary_changed", "engine_mismatch", "identity_unverified", "version_unparsed", "floor_unset",
     "version_refused", "argv_empty", "argv0_mismatch", "grant_forged", "grant_stale", "spawn_too_large",
 }
 needs_exec = unittest.skipUnless(os.name == "posix", "POSIX fixtures")
@@ -145,7 +145,7 @@ class GrantTests(Base):
             ("gemini", "gemini", "0.39.1", None),
             ("grok", "grok", "grok 1.0.0", None),
             ("antigravity", "agy", "1.2.3", None),
-            ("pi", "pi", "0.30.2", None),
+            ("pi", "pi", "0.30.2", "identity_unverified"),
         ]
         for engine, name, line, want in cells:
             for i in range(N):
@@ -310,6 +310,42 @@ class GrantRefusalTests(Base):
             return ProbeResult(CLAUDE, 0, 1)
 
         self.refused("binary_changed", grant, "claude_code", p, probe=swapping_probe)
+
+    def test_native_pi_printing_a_semver_is_refused_unprobed(self) -> None:
+        # Red-team F3 (#323): Pi has no identity rule and the real Pi is a JS bundle, so a native
+        # `pi` printing a clean semver is some other tool. Refused before its binary is run.
+        calls: list[str] = []
+
+        def counting_probe(spec, realpath, timeout):
+            calls.append(realpath)
+            return F.probe(spec, realpath, timeout)
+
+        for line in ("0.30.2", "pi 1.0.0", "v2.0.0"):
+            with self.subTest(line=line):
+                p = F.make("pi", line)
+                r = self.refused("identity_unverified", grant, "pi", p, probe=counting_probe)
+                self.assertEqual("pi", r.engine)
+        self.assertEqual([], calls)
+        if F.compiled:  # the real probe path too: the fixture must never be executed
+            self.refused("identity_unverified", grant, "pi", F.make("pi", "0.30.2"))
+        # A JS-bundle pi is still wrapper_refused first.
+        d = F.dir()
+        self.refused("wrapper_refused", self.g, "pi", F.script(os.path.join(d, "pi"), "#!/usr/bin/env node\n"))
+
+    def test_every_engine_without_an_identity_rule_is_refused(self) -> None:
+        unverified = [e for e, s in FLOORS.items() if s.ident is None]
+        self.assertEqual(["pi"], unverified)
+        table = dict(floors_mod.FLOORS)
+        table["grok"] = dataclasses.replace(table["grok"], ident=None)
+        with mock.patch.object(floors_mod, "FLOORS", table):
+            self.refused("identity_unverified", self.g, "grok", F.make("grok", "grok 1.0.0"))
+
+    def test_identity_rechecked_at_launch_plan(self) -> None:
+        g = self.g("grok", F.make("grok", "grok 1.0.0"))
+        table = dict(floors_mod.FLOORS)
+        table["grok"] = dataclasses.replace(table["grok"], ident=None)
+        with mock.patch.object(floors_mod, "FLOORS", table):
+            self.refused("identity_unverified", launch_plan, g, ["grok"])
 
     def test_engine_mismatch(self) -> None:
         self.refused("engine_mismatch", self.g, "claude_code", self.claude(CODEX))

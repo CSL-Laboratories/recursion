@@ -7,7 +7,7 @@ error: the only way out of a failed check is this exception.
 
 from __future__ import annotations
 
-REFUSAL_CODES_VERSION = "r2a-refusals/1.0.0-candidate-2026-11-07"
+REFUSAL_CODES_VERSION = "r2a-refusals/1.1.0-candidate-2026-11-09"
 
 # Closed set. Adding, removing or renaming a code is a new REFUSAL_CODES_VERSION.
 REFUSAL_CODES = frozenset(
@@ -20,6 +20,7 @@ REFUSAL_CODES = frozenset(
         "version_probe_failed",  # --version exited non-zero, timed out or flooded
         "binary_changed",  # digest or resolution differs from the grant
         "engine_mismatch",  # version line names another engine
+        "identity_unverified",  # engine has no identity rule or pinned digest (refused before probing)
         "version_unparsed",  # version token does not match the engine's format
         "floor_unset",  # a floor in the table does not parse
         "version_refused",  # below a floor, or a prerelease

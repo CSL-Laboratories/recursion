@@ -34,7 +34,7 @@ from urllib.parse import parse_qs, quote
 
 from .client import ACTIONS, READS, ControlClient, ControlError
 from .inventory import BARS, assess, coverage_gaps, project
-from .panels import panel_registry
+from .panels import filter_venue_rows, panel_registry
 
 __all__ = ["Application", "withhold_venue_data"]
 
@@ -257,13 +257,27 @@ class Application:
         panel = self._panels[form["id"][0]]
         body = "<h2>%s</h2><p>Read-only plugin panel.</p>" % escape(panel["title"])
         if panel["venue_use"] is not None:
-            body += ('<p role="note">Declared venue use: <code>%s</code>. The control API\'s O7 v0 '
-                     'reads take no venue argument, so the results below are not scoped to this '
-                     'venue; venue data stays behind the venue-data switch.</p>' % escape(panel["venue_use"]))
+            body += ('<p role="note">Declared venue use: <code>%s</code> (a label). '
+                     % escape(panel["venue_use"]))
+            if panel.get("venue") is not None:
+                body += ('The control API\'s O7 v0 reads take no venue argument; returned rows '
+                         'are filtered to <code>%s</code> before display; venue data stays behind '
+                         'the venue-data switch.</p>' % escape(panel["venue"]))
+            else:
+                body += ('The control API\'s O7 v0 reads take no venue argument, so the results '
+                         'below are not scoped to this venue; venue data stays behind the '
+                         'venue-data switch.</p>')
+        elif panel.get("venue") is not None:
+            body += ('<p role="note">The control API\'s O7 v0 reads take no venue argument; '
+                     'returned rows are filtered to <code>%s</code> before display.</p>'
+                     % escape(panel["venue"]))
         for command in panel["reads"]:
             body += "<section><h3>%s</h3>" % escape(_LABELS[command])
             try:
-                body += self._o7_view(command, self._client.operator(command))
+                data = self._client.operator(command)
+                if panel.get("venue") is not None:
+                    data = filter_venue_rows(data, panel["venue"])
+                body += self._o7_view(command, data)
             except ControlError as exc:
                 body += '<p role="status">Unavailable: %s</p>' % escape(exc.code)
             body += "</section>"

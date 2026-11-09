@@ -83,19 +83,40 @@ class PanelTests(GuiHarness):
 
     def test_declared_venue_use_is_kept_shown_and_never_sent_as_a_scope(self):
         self.mount([{"id": "v", "title": "Venue panel", "reads": [READS[0]],
-                     "venue_use": "kalshi:model_fed_read", "withhold_venue_data": True},
+                     "venue": "kalshi", "venue_use": "kalshi:model_fed_read",
+                     "withhold_venue_data": True},
                     {"id": "n", "title": "Plain panel", "reads": [READS[0]]}])
         self.assertEqual(self.app._panels["v"]["venue_use"], "kalshi:model_fed_read")
+        self.assertEqual(self.app._panels["v"]["venue"], "kalshi")
         self.api.calls.clear()
         body = self.request("GET", "/panel", query="id=v")[2]
-        self.assertIn("Declared venue use: <code>kalshi:model_fed_read</code>", body)
-        self.assertIn("not scoped to this venue", body)
+        self.assertIn("Declared venue use: <code>kalshi:model_fed_read</code> (a label)", body)
+        self.assertIn("filtered to <code>kalshi</code>", body)
         self.assertEqual([c[2]["arguments"] for c in self.api.calls], [{}])  # O7 v0 has no venue argument
         self.assertNotIn("Declared venue use", self.request("GET", "/panel", query="id=n")[2])
         for bad in ({"venue_use": "kalshi"}, {"venue_use": ["kalshi:model_fed_read"]},
-                    {"venue_use": "Kalshi:<x>"}, {"withhold_venue_data": "no"}):
+                    {"venue_use": "Kalshi:<x>"}, {"venue": "kalshi:model_fed_read"},
+                    {"venue": "Kalshi"}, {"withhold_venue_data": "no"}):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 self.mount([{"id": "b", "title": "Bad", "reads": [READS[0]], **bad}])
+
+    def test_stock_row_never_renders_on_a_kalshi_panel(self):
+        self.mount([{"id": "k", "title": "Kalshi", "reads": [READS[0]],
+                     "venue": "kalshi", "venue_use": "kalshi:model_fed_read"}])
+        rows = [{"venue": "stocks", "symbol": "STOCK-SECRET"},
+                {"venue": "kalshi", "symbol": "KALSHI-VISIBLE",
+                 "details": [{"value": "inherited-kalshi"},
+                             {"venue": "stocks", "value": "nested-stock-secret"}]},
+                {"symbol": "UNATTRIBUTED-SECRET"}]
+        self.api.extra[READS[0]] = {"result": {"rows": rows}}
+        self.api.calls.clear()
+        body = self.request("GET", "/panel", query="id=k")[2]
+        self.assertIn("KALSHI-VISIBLE", body)
+        self.assertIn("inherited-kalshi", body)
+        for hidden in ("STOCK-SECRET", "nested-stock-secret", "UNATTRIBUTED-SECRET"):
+            self.assertNotIn(hidden, body)
+        self.assertEqual(len(rows), 3)  # display filtering does not alter the source
+        self.assertEqual([c[2]["arguments"] for c in self.api.calls], [{}])
 
     def test_real_cockpit_registry_renders(self):
         try:

@@ -138,7 +138,7 @@ class LeafTests(unittest.TestCase):
             self.assertEqual(run.wait(5), 3)
             gc = self.grandchild()
             self.assertTrue(alive(gc))
-        self.assertEqual(run.outcome.state, 'terminated')
+        self.assertEqual(run.outcome.state, 'leaf_empty')
         self.assertEqual(run.outcome.returncode, 3)
         self.assertTrue(run.outcome.main_exit_seen)
         self.assertFalse(alive(gc))
@@ -150,7 +150,7 @@ class LeafTests(unittest.TestCase):
                                   cwd=self.work) as run:
                 gc = self.grandchild()
                 raise ValueError('body')
-        self.assertEqual(run.outcome.state, 'terminated')
+        self.assertEqual(run.outcome.state, 'leaf_empty')
         self.assertFalse(alive(gc))
         self.assertFalse(alive(run.pid))
 
@@ -160,7 +160,7 @@ class LeafTests(unittest.TestCase):
                                   cwd=self.work) as run:
                 gc = self.grandchild()
                 raise KeyboardInterrupt
-        self.assertEqual(run.outcome.state, 'terminated')
+        self.assertEqual(run.outcome.state, 'leaf_empty')
         self.assertFalse(alive(gc))
 
     def test_explicit_close_idempotent_and_thread_safe(self):
@@ -172,7 +172,7 @@ class LeafTests(unittest.TestCase):
         for t in threads:
             t.join()
         self.assertEqual(len({id(r) for r in results}), 1)
-        self.assertEqual(results[0].state, 'terminated')
+        self.assertEqual(results[0].state, 'leaf_empty')
         self.assertEqual(results[0].returncode, -signal.SIGKILL)
 
     # Launch race and failures
@@ -203,7 +203,7 @@ class LeafTests(unittest.TestCase):
             with self.assertRaisesRegex(LaunchError, 'not in the leaf'):
                 self.root.launch('run-a', ['sleep', '60'])
         run = spy.call_args.args[0]
-        self.assertEqual(run.outcome.state, 'terminated')
+        self.assertEqual(run.outcome.state, 'leaf_empty')
         self.assertFalse(alive(run.pid))
         self.assertEqual(self.leaves(), [])
 
@@ -233,6 +233,25 @@ class LeafTests(unittest.TestCase):
         self.assertTrue(caught.exception.outcome.populated)
         self.assertTrue(alive(gc))
         self.assertEqual(self.leaves(), ['run-a'])  # populated leaf is never removed
+
+    def test_escapee_unseen_so_never_terminated(self):
+        # S5 / C1-27: a same-uid process that leaves the leaf is unseen and the leaf reads
+        # empty while it lives. The fake models leaving as setsid (a new process group).
+        script = ('setsid sh -c \'echo $$ > gc; exec sleep 60\' & '
+                  'while [ ! -s gc ]; do sleep 0.01; done; exit 0')
+        with self.root.launch('run-a', self.sh(script), cwd=self.work) as run:
+            self.assertEqual(run.wait(5), 0)
+            escapee = self.grandchild()
+        self.cleanup_pids.append(escapee)
+        self.assertTrue(alive(escapee))
+        self.assertEqual(run.outcome.state, 'leaf_empty')
+        self.assertFalse(run.outcome.escape_observable)
+        self.assertEqual(self.leaves(), [])
+
+    def test_launcher_never_books_terminated(self):
+        source = Path(cgroup_leaf.__file__).read_text()
+        self.assertNotIn("state = 'terminated'", source)
+        self.assertNotIn('escape_observable=True', source)
 
     def test_unreadable_events_is_unknown(self):
         self.fs.events_broken = True
@@ -323,7 +342,7 @@ class RealCgroupTests(unittest.TestCase):
             with root.launch(f'run-test{os.getpid()}', ['/bin/sh', '-c',
                              'sleep 60 & echo $! > gc; setsid sleep 60 & wait'], cwd=work) as run:
                 gc = int(wait_file(Path(work) / 'gc'))
-            self.assertEqual(run.outcome.state, 'terminated')
+            self.assertEqual(run.outcome.state, 'leaf_empty')
             self.assertFalse(alive(gc))
 
 

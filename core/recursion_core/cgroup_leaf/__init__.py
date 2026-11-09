@@ -4,9 +4,16 @@ The launcher creates a leaf under an operator-owned, delegated cgroup v2 root an
 starts the child through a trampoline that joins the leaf before it execs the target,
 so no target code runs outside the leaf. Every exit path (normal return, exception,
 launch failure, cancellation) kills the leaf with ``cgroup.kill`` and books
-``terminated`` only on positive evidence: ``populated 0`` and the main process's exit
+``leaf_empty`` only on positive evidence: ``populated 0`` and the main process's exit
 seen through its pidfd and ``waitpid``. Anything else is ``running`` (populated) or
 ``unknown``.
+
+This launcher never books ``terminated``. A same-uid process can leave the leaf
+unseen, and the leaf then reads empty while it lives, so an empty leaf is not proof
+that the tree ended (PRODUCT.md 055cc7a5 section 3.4 S5 and the Stop bullet, C1-27:
+never ``terminated`` for a tree with an unobservable escapee). ``terminated`` is
+reserved for a launch path that can observe escapes; every outcome here carries
+``escape_observable=False``.
 
 Same uid only, and no cross-uid kill path. A process of the same uid can leave the
 leaf, for example through ``systemd-run --user`` into its user manager, so this is not
@@ -59,11 +66,12 @@ class CleanupIncomplete(RuntimeError):
 
 @dataclass(frozen=True)
 class Outcome:
-    state: str  # terminated | empty | running | unknown
+    state: str  # leaf_empty | empty | running | unknown; never terminated (S5, C1-27)
     returncode: int | None
     populated: bool | None
     main_exit_seen: bool
     errors: tuple[str, ...] = ()
+    escape_observable: bool = False  # same uid: a process that left the leaf is unseen
 
 
 class Cgroup2:
@@ -254,7 +262,7 @@ class LeafRun:
             self.pidfd = None
         seen = self.proc is not None and self.proc.returncode is not None
         if populated is False and seen:
-            state = 'terminated'
+            state = 'leaf_empty'  # not 'terminated': a same-uid escapee would be unseen
         elif populated is False and self.proc is None:
             state = 'empty'  # sweep, or no process started: empty, but no exit was seen
         elif populated is True:
@@ -268,7 +276,7 @@ class LeafRun:
                 errors.setdefault(f'rmdir: {exc!r}')
         outcome = Outcome(state, self.proc.returncode if self.proc else None, populated,
                           seen, tuple(errors))
-        if state not in ('terminated', 'empty') or errors:
+        if state not in ('leaf_empty', 'empty') or errors:
             log.error('leaf %s: %s', self.leaf, outcome)
         return outcome
 
@@ -280,7 +288,7 @@ class LeafRun:
             exc.add_note(f'leaf cleanup raised: {cleanup!r}')
             log.exception('leaf %s cleanup raised', self.leaf)
             return
-        if outcome.state not in ('terminated', 'empty') or outcome.errors:
+        if outcome.state not in ('leaf_empty', 'empty') or outcome.errors:
             exc.add_note(f'leaf cleanup incomplete: {outcome}')
 
     def __enter__(self):
@@ -291,6 +299,6 @@ class LeafRun:
             self._cleanup_after(exc)
             return False
         outcome = self.close()
-        if outcome.state != 'terminated' or outcome.errors:
+        if outcome.state != 'leaf_empty' or outcome.errors:
             raise CleanupIncomplete(outcome)
         return False

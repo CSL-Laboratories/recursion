@@ -14,18 +14,23 @@ Bars (all kept from Nov 7, plus the Nov 8 migration probe):
 - ``terminated`` never booked while ``populated`` is 1;
 - migration probe, n=10 per method, with the engine user manager absent: a process
   already in the operator's leaf, as the engine uid, tries
-  ``systemd-run --user --scope -- sleep 60`` and a direct write of its own pid to a
-  ``cgroup.procs`` outside the leaf. Each attempt records the caller's uid and pid,
+  ``systemd-run --user --scope -- sleep 60``, a direct write of its own pid to a
+  ``cgroup.procs`` outside the leaf, and an unprivileged ``AttachProcessesToUnit``
+  call on the system bus for its own pid (O65: PID 1 checks only process
+  ownership). Each attempt records the caller's uid and pid,
   the caller's cgroup before the attempt (it must already be in the leaf), and the
   run's expected pids. Every attempt fails, and afterwards ``/proc/<pid>/cgroup``
   names the leaf for every expected pid in the run;
-- the same probe, both methods, n=10 each, with the engine user manager present is
-  a control. Its scope attempts must reproduce the Nov 7 escape (exit 0, sleep in a
-  canonical cgroup outside the leaf); its direct writes are recorded with an explicit
-  outcome either way. A control whose scope attempts do not all escape means the
+- the same probe, all three methods, n=10 each, with the engine user manager present
+  is a control. Its scope attempts must reproduce the Nov 7 escape (exit 0, sleep in
+  a canonical cgroup outside the leaf); its direct writes and system-bus attach calls
+  are recorded with an explicit outcome either way. A control whose scope attempts do not all escape means the
   probe is not reaching the user manager: the record is ``invalid``, never a pass;
 - B33: in the cross-uid spawn path, ``PR_SET_PDEATHSIG`` is armed after the uid
-  switch (the kernel clears it on a credential change) and before exec. Cleanup
+  switch (the kernel clears it on a credential change) and before exec, from one
+  long-lived spawning thread: the signal fires when the forking *thread* exits, so
+  the record names that thread's tid, every spawn's tid must equal it, and it must
+  be marked long-lived. Cleanup
   still never relies on it (cgroup + pidfd, CSL-706); this same-uid launcher does
   not arm it at all.
 
@@ -38,7 +43,8 @@ from pathlib import PurePosixPath
 N_ESCAPERS, N_PROBE = 120, 10
 SCOPE_ARGV = ('systemd-run', '--user', '--scope', '--', 'sleep', '60')
 HOST_FIELDS = ('host', 'kernel', 'systemd', 'captured_at', 'command_log_sha256')
-METHODS = ('scope', 'direct_write')
+METHODS = ('scope', 'direct_write', 'attach_unit')
+ATTACH_CALL = 'org.freedesktop.systemd1.Manager.AttachProcessesToUnit'
 
 
 def _int(value, minimum=0):
@@ -121,6 +127,18 @@ def _shape(attempt, leaf, engine_uid):
             return False, 'direct write did not write the caller\'s own pid', {}
         if not isinstance(attempt.get('refused'), bool):
             return False, 'direct write outcome not recorded', {}
+    elif attempt.get('method') == 'attach_unit':
+        if attempt.get('bus') != 'system' or attempt.get('call') != ATTACH_CALL:
+            return False, 'attach attempt is not AttachProcessesToUnit on the system bus', {}
+        unit = attempt.get('unit')
+        if not isinstance(unit, str) or not unit or '/' in unit or '\0' in unit:
+            return False, 'attach target unit missing or invalid', {}
+        if not isinstance(attempt.get('subcgroup'), str):
+            return False, 'attach subcgroup argument not recorded', {}
+        if attempt.get('pids') != [pid]:
+            return False, 'attach call did not name exactly the caller\'s own pid', {}
+        if not isinstance(attempt.get('refused'), bool):
+            return False, 'attach outcome not recorded', {}
     else:
         return False, f'unknown method {attempt.get("method")!r}', {}
     return True, '', readback
@@ -136,8 +154,10 @@ def _absent_attempt(attempt, leaf, engine_uid):
         sleep = attempt.get('sleep_cgroup')
         if sleep is not None and not _inside(sleep, leaf):
             return False, f'sleep landed outside the leaf: {sleep!r}'
-    elif attempt['refused'] is not True:
+    elif attempt['method'] == 'direct_write' and attempt['refused'] is not True:
         return False, f'write of own pid to {attempt["target"]} was not refused'
+    elif attempt['method'] == 'attach_unit' and attempt['refused'] is not True:
+        return False, f'AttachProcessesToUnit into {attempt["unit"]} was not refused'
     stray = sorted(str(p) for p, group in readback.items() if not _inside(group, leaf))
     if stray:
         return False, f'pids outside the leaf after the attempt: {", ".join(stray)}'
@@ -152,7 +172,7 @@ def _control_attempt(attempt, leaf, engine_uid):
         sleep = attempt.get('sleep_cgroup')
         if attempt['exit_code'] != 0 or not _canonical(sleep) or _inside(sleep, leaf):
             return False, 'scope control did not escape to a canonical cgroup outside the leaf'
-    return True, ''  # direct-write controls: shape and explicit outcome only
+    return True, ''  # direct-write and attach controls: shape and explicit outcome only
 
 
 def _attempts(arm):
@@ -164,6 +184,23 @@ def _attempts(arm):
 
 def _by_method(attempts, method):
     return [a for a in attempts if isinstance(a, dict) and a.get('method') == method]
+
+
+def _spawner(order, spawner):
+    """B33: armed after the uid switch, before exec, from one long-lived spawning thread."""
+    if not isinstance(order, list) or not all(isinstance(s, str) for s in order) \
+            or not all(order.count(s) == 1 for s in ('uid_switch', 'pdeathsig', 'exec')) \
+            or not order.index('uid_switch') < order.index('pdeathsig') < order.index('exec'):
+        return 'PR_SET_PDEATHSIG must be armed after the uid switch and before exec (B33)'
+    if not isinstance(spawner, dict) or not _int(spawner.get('tid'), 1):
+        return 'spawning thread tid not recorded (B33)'
+    if spawner.get('long_lived') is not True:
+        return 'spawning thread not recorded as long-lived (B33)'
+    tids = spawner.get('spawn_tids')
+    if not isinstance(tids, list) or not tids or not all(_int(t, 1) for t in tids) \
+            or any(t != spawner['tid'] for t in tids):
+        return 'spawns did not all come from the one long-lived spawning thread (B33)'
+    return None
 
 
 def evaluate(record):
@@ -213,11 +250,9 @@ def evaluate(record):
     if len(attempts) != sum(len(_by_method(attempts, m)) for m in METHODS):
         reasons.append('manager-absent attempts include an unknown or malformed entry')
 
-    order = record.get('spawn_order')
-    if not isinstance(order, list) or not all(isinstance(s, str) for s in order) \
-            or not all(order.count(s) == 1 for s in ('uid_switch', 'pdeathsig', 'exec')) \
-            or not order.index('uid_switch') < order.index('pdeathsig') < order.index('exec'):
-        reasons.append('PR_SET_PDEATHSIG must be armed after the uid switch and before exec (B33)')
+    b33 = _spawner(record.get('spawn_order'), record.get('pdeathsig_spawner'))
+    if b33:
+        reasons.append(b33)
 
     present = record.get('manager_present')
     controls = _attempts(present)

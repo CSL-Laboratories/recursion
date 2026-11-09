@@ -9,7 +9,7 @@ import random
 import unittest
 
 from recursion_core.cgroup_leaf import b6_evidence
-from recursion_core.cgroup_leaf.b6_evidence import SCOPE_ARGV, evaluate
+from recursion_core.cgroup_leaf.b6_evidence import ATTACH_CALL, SCOPE_ARGV, evaluate
 
 LEAF = '/system.slice/csl-b6-wrapper-rerun.service/run-probe'
 OUTSIDE = '/user.slice/user-1000.slice/user@1000.service/app.slice/run-x.scope'
@@ -21,19 +21,24 @@ def attempt(method, *, pid=4101, child=4102, **fields):
             'expected_pids': [pid, child], 'run_pids': {str(pid): LEAF, str(child): LEAF + '/sub'}}
     if method == 'scope':
         base.update(argv=list(SCOPE_ARGV), exit_code=1, sleep_cgroup=None)
-    else:
+    elif method == 'direct_write':
         base.update(target='/user.slice/cgroup.procs', written_pid=pid, refused=True, errno='EACCES')
+    else:
+        base.update(bus='system', call=ATTACH_CALL, unit='user@1000.service', subcgroup='',
+                    pids=[pid], refused=True, error='org.freedesktop.DBus.Error.AccessDenied')
     base.update(fields)
     return base
 
 
 def absent_attempts():
-    return [attempt('scope') for _ in range(10)] + [attempt('direct_write') for _ in range(10)]
+    return ([attempt('scope') for _ in range(10)] + [attempt('direct_write') for _ in range(10)]
+            + [attempt('attach_unit') for _ in range(10)])
 
 
 def control_attempts():
     return ([attempt('scope', exit_code=0, sleep_cgroup=OUTSIDE) for _ in range(10)]
-            + [attempt('direct_write', refused=False) for _ in range(10)])
+            + [attempt('direct_write', refused=False) for _ in range(10)]
+            + [attempt('attach_unit', refused=False) for _ in range(10)])
 
 
 def host_record():
@@ -46,6 +51,7 @@ def host_record():
         'user_spawn_refused_or_contained': {'ok': 10, 'total': 10},
         'terminated_while_populated': 0,
         'spawn_order': ['fork', 'uid_switch', 'pdeathsig', 'exec'],
+        'pdeathsig_spawner': {'tid': 4000, 'long_lived': True, 'spawn_tids': [4000, 4000, 4000]},
         'manager_absent': {'user_manager': 'inactive', 'manager_socket': 'absent',
                            'attempts': absent_attempts()},
         'manager_present': {'user_manager': 'active', 'attempts': control_attempts()},
@@ -143,7 +149,7 @@ class ContractTests(unittest.TestCase):
                  lambda a: a.update(expected_pids=[4101, 4101, 4102]),
                  lambda a: a.update(expected_pids=[4101, True]),
                  lambda a: a.update(expected_pids='4101')]
-        for index in (0, 15):
+        for index in (0, 15, 25):
             for i, change in enumerate(cases):
                 with self.subTest(index=index, case=i):
                     self.assertEqual(self.mutated(lambda r: change(r['manager_absent']['attempts'][index])),
@@ -155,12 +161,52 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(self.verdict(record), 'pass')
 
     def test_n10_per_method(self):
-        for drop in (0, 19):
+        for drop in (0, 19, 29):
             with self.subTest(drop=drop):
                 self.assertEqual(self.mutated(lambda r: r['manager_absent']['attempts'].pop(drop)), 'fail')
         self.assertEqual(self.mutated(lambda r: r['manager_absent']['attempts'].append({'method': 'ptrace'})),
                          'fail')
         self.assertEqual(self.mutated(lambda r: r['manager_absent']['attempts'].append('junk')), 'fail')
+
+    def test_record_without_attach_probe_fails(self):
+        record = host_record()  # scope and direct-write only, as at b993f986
+        record['manager_absent']['attempts'] = record['manager_absent']['attempts'][:20]
+        result = evaluate(record)
+        self.assertEqual(result['verdict'], 'fail')
+        self.assertTrue(any('attach_unit: need n=10, got 0' in r for r in result['reasons']))
+
+    def test_attach_accepted_in_absent_arm_fails(self):
+        record = host_record()
+        record['manager_absent']['attempts'][22].update(refused=False)
+        result = evaluate(record)
+        self.assertEqual(result['verdict'], 'fail')
+        self.assertTrue(any('attach_unit #3' in r for r in result['reasons']))
+
+    def test_attach_attempt_shape(self):
+        for fields in ({'bus': 'session'}, {'bus': None}, {'call': 'AttachProcessesToUnit'},
+                       {'unit': ''}, {'unit': None}, {'unit': '../x.service'}, {'subcgroup': None},
+                       {'pids': [999]}, {'pids': [4101, 4102]}, {'pids': 4101}, {'pids': []},
+                       {'refused': None}, {'refused': 'yes'}, {'uid': OPERATOR_UID}):
+            with self.subTest(fields=fields):
+                self.assertEqual(self.mutated(lambda r: r['manager_absent']['attempts'][20].update(fields)),
+                                 'fail')
+
+    def test_attach_moving_a_pid_out_fails(self):
+        self.assertEqual(self.mutated(
+            lambda r: r['manager_absent']['attempts'][21]['run_pids'].update({'4101': OUTSIDE})), 'fail')
+
+    def test_control_needs_n10_attach_with_recorded_outcome(self):
+        for mutate in (lambda c: c['attempts'].pop(25),
+                       lambda c: c['attempts'][22].pop('refused'),
+                       lambda c: c['attempts'][22].update(bus='session'),
+                       lambda c: c.update(attempts=c['attempts'][:20])):
+            record = host_record()
+            mutate(record['manager_present'])
+            self.assertEqual(self.verdict(record), 'invalid')
+        record = host_record()  # a refused attach in the control is fine: it is recorded either way
+        for a in record['manager_present']['attempts'][20:]:
+            a['refused'] = True
+        self.assertEqual(self.verdict(record), 'pass')
 
     def test_wrong_scope_argv_fails(self):
         for argv in (['systemd-run', '--user', 'sleep', '60'], 'systemd-run --user --scope -- sleep 60', None):
@@ -212,6 +258,27 @@ class ContractTests(unittest.TestCase):
                       'uid_switch,pdeathsig,exec', None, [1, 2]):
             with self.subTest(order=order):
                 self.assertEqual(self.mutated(lambda r: r.update(spawn_order=order)), 'fail')
+
+    def test_pdeathsig_from_one_long_lived_spawning_thread(self):
+        cases = [None, 'x', {}, {'tid': 4000, 'spawn_tids': [4000]},                  # long_lived missing
+                 {'tid': 4000, 'long_lived': False, 'spawn_tids': [4000]},
+                 {'tid': 4000, 'long_lived': 'yes', 'spawn_tids': [4000]},
+                 {'tid': 4000, 'long_lived': True, 'spawn_tids': [4000, 4001]},       # a second thread
+                 {'tid': 4000, 'long_lived': True, 'spawn_tids': [4001]},
+                 {'tid': 4000, 'long_lived': True, 'spawn_tids': []},
+                 {'tid': 4000, 'long_lived': True, 'spawn_tids': 4000},
+                 {'tid': 4000, 'long_lived': True},
+                 {'tid': 0, 'long_lived': True, 'spawn_tids': [0]},
+                 {'tid': True, 'long_lived': True, 'spawn_tids': [True]},
+                 {'tid': '4000', 'long_lived': True, 'spawn_tids': ['4000']}]
+        for spawner in cases:
+            with self.subTest(spawner=spawner):
+                result = evaluate(dict(host_record(), pdeathsig_spawner=spawner))
+                self.assertEqual(result['verdict'], 'fail')
+                self.assertTrue(any('B33' in r for r in result['reasons']))
+        record = host_record()
+        del record['pdeathsig_spawner']
+        self.assertEqual(self.verdict(record), 'fail')
 
     def test_malformed_records_fail_closed_without_raising(self):
         self.assertEqual(self.verdict(None), 'fail')

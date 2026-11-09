@@ -21,9 +21,13 @@ path (normal return, exception, launch failure, cancellation) kills the leaf.
 - Identity: the parent opens a pidfd for the unreaped child right after spawn and
   signals through it, so a reused pid is never signalled.
 - Kill: write `1` to `cgroup.kill`, SIGKILL the main process through its pidfd,
-  and repeat until the deadline. The outcome is `terminated` only when
+  and repeat until the deadline. The outcome is `leaf_empty` only when
   `cgroup.events` reads `populated 0` and the main process's exit was seen by
-  `waitpid`. Otherwise it is `running` (still populated) or `unknown`. A populated
+  `waitpid`. Otherwise it is `running` (still populated) or `unknown`. This
+  launcher never books `terminated`: a same-uid escapee is unseen (see Limits),
+  so an empty leaf does not prove the tree ended (PRODUCT.md 055cc7a5 §3.4 S5 and
+  the Stop bullet, C1-27). Every outcome carries `escape_observable=False`;
+  `terminated` is reserved for a launch path that can observe escapes. A populated
   or unobserved leaf is never removed. `sweep()` kills leftover leaves after a
   launcher crash and books them `empty`, not `terminated`, because their exits
   were not seen.
@@ -66,8 +70,11 @@ switches no uid.
   while `populated` is 1.
 - Migration probe, n=10 per method, engine user manager absent (`user@` inactive,
   `systemd/private` absent): a process already in the leaf, as the engine uid,
-  tries `systemd-run --user --scope -- sleep 60` and a direct write of its own pid
-  to a `cgroup.procs` outside the leaf. Each attempt records the caller's uid
+  tries `systemd-run --user --scope -- sleep 60`, a direct write of its own pid
+  to a `cgroup.procs` outside the leaf, and an unprivileged
+  `AttachProcessesToUnit` call for its own pid on the system bus (O65: PID 1
+  checks only process ownership; the attempt records bus, call, unit, subcgroup
+  and pids, and must be refused). Each attempt records the caller's uid
   (must be the record's `engine_uid`, not the operator's), its pid, its cgroup
   before the attempt (must already be in the leaf) and the run's expected pids.
   Every attempt must fail (exit 0 of the scope call fails the bar even if the
@@ -75,13 +82,18 @@ switches no uid.
   outside the leaf with the caller's own pid), and afterwards
   `/proc/<pid>/cgroup` must name the leaf, or a cgroup below it, for exactly the
   expected pids. Paths must be absolute and canonical (no `.`, `..`, `//`).
-- Control, engine user manager present, both methods n=10: all 10 scope attempts
-  must exit 0 with the sleep in a canonical cgroup outside the leaf, reproducing
-  the Nov 7 escape; the 10 direct writes need a recorded outcome either way.
+- Control, engine user manager present, all three methods n=10: all 10 scope
+  attempts must exit 0 with the sleep in a canonical cgroup outside the leaf,
+  reproducing the Nov 7 escape; the 10 direct writes and 10 attach calls need a
+  recorded outcome either way.
   Otherwise the verdict is `invalid`: the probe is not reaching the user manager,
   and no pass is read. Malformed records fail closed and never raise.
 - B33: `spawn_order` must show `PR_SET_PDEATHSIG` armed after the uid switch and
-  before exec (the kernel clears it on a credential change). This same-uid
+  before exec (the kernel clears it on a credential change), from one long-lived
+  spawning thread (B33): `pdeathsig_spawner` records the thread's `tid`,
+  `long_lived: true`, and `spawn_tids`, every one equal to `tid`. The signal
+  fires when the forking thread exits, so a missing, short-lived or second
+  spawning thread fails. This same-uid
   launcher still never arms it, and cleanup never relies on it (CSL-706).
 - Verdicts: `pass` needs `evidence_class: host` plus host, kernel, systemd,
   capture time and the command log's SHA-256. Any other class is `structural` at

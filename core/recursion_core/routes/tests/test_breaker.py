@@ -135,6 +135,35 @@ class BreakerTest(unittest.TestCase):
         self.clock.advance(1)
         self.assertTrue(self.b.admit("subscription:A", "m", "t1")["admitted"])
 
+    def test_model_limit_on_a_connection_probe_frees_the_connection_lease(self) -> None:
+        self.b.record("subscription:A", "m1", "t1", LIMIT)
+        self.clock.advance(300)
+        admit = self.b.admit("subscription:A", "m1", "t1", deadline_s=600)
+        self.assertEqual(admit["key"], "subscription:A")
+        model_limit = {"code": c.PLAN_LIMIT, "limit": c.limit_signal("model", "test.bucket", model="m1")}
+        self.assertEqual(self.b.record("subscription:A", "m1", "t1", model_limit, admit["probe"]), "opened")
+        self.assertEqual(self.b.admit("subscription:A", "m1", "t2")["code"], c.BREAKER_OPEN)
+        other = self.b.admit("subscription:A", "m2", "t2")
+        self.assertTrue(other["admitted"])
+        self.assertEqual(other["key"], "subscription:A")  # a new probe, not PROBE_IN_FLIGHT until t=931
+        self.assertNotEqual(other["probe"], admit["probe"])
+
+    def test_connection_limit_on_a_model_probe_frees_the_model_lease(self) -> None:
+        model_limit = {"code": c.PLAN_LIMIT, "limit": c.limit_signal("model", "test.bucket", model="m1")}
+        self.b.record("subscription:A", "m1", "t1", model_limit)
+        self.clock.advance(300)
+        admit = self.b.admit("subscription:A", "m1", "t1", deadline_s=600)
+        self.assertEqual(admit["key"], ConnectionBreaker.model_key("subscription:A", "m1"))
+        self.assertEqual(self.b.record("subscription:A", "m1", "t1", LIMIT, admit["probe"]), "opened")
+        self.assertEqual(self.b.admit("subscription:A", "m1", "t2")["code"], c.BREAKER_OPEN)
+        self.clock.advance(300)  # connection cooldown over; the model key's old lease would run to t=930
+        conn = self.b.admit("subscription:A", "m1", "t2", deadline_s=10)
+        self.assertEqual(conn["key"], "subscription:A")
+        self.assertEqual(self.b.record("subscription:A", "m1", "t2", {"code": None}, conn["probe"]), "closed")
+        model = self.b.admit("subscription:A", "m1", "t2")
+        self.assertTrue(model["admitted"])
+        self.assertEqual(model["key"], ConnectionBreaker.model_key("subscription:A", "m1"))
+
     def test_probe_deadline_releases_lease_without_closing(self) -> None:
         self.b.record("subscription:A", "m", "t1", LIMIT)
         self.clock.advance(300)

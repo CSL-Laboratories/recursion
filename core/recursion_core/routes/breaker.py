@@ -22,7 +22,8 @@ This breaker is the other way round (PRODUCT.md 398cd812, 3.4 S3 and S4, grill Q
   lease is bounded at the probe run's own deadline plus ``probe_grace_s`` (PRODUCT.md 11.2, C1-18),
   or ``probe_lease_s`` when the caller gives no deadline: a probe that never reports cannot hold it
   forever, and a probe still inside its deadline is never joined by a second one.
-  Probe success closes; a probe that hits a limit reopens with backoff; ``reset`` closes at once.
+  Probe success closes; a probe that hits a limit reopens with backoff (the key the limit names);
+  its lease is freed on whichever key held it; ``reset`` closes at once.
 
 The cooldown, lease and short-fault numbers are uncalibrated defaults (PRODUCT.md 11.2, B-10);
 this module does not claim to have measured anything. It is thread-safe: one lock guards all
@@ -111,7 +112,7 @@ class ConnectionBreaker:
         with self._lock:
             now = self._clock()
             if code == c.PLAN_LIMIT and _is_signal(outcome.get("limit")):
-                return self._open(connection, outcome["limit"], now)
+                return self._open(connection, outcome["limit"], now, probe)
             if code == c.SHORT_FAULT:
                 self._short[(connection, model, tenant)] = now + self._short_s
                 return self._release(probe, now) or "short_fault"
@@ -121,8 +122,12 @@ class ConnectionBreaker:
             # proved nothing, so its lease is released for the next request to probe.
             return self._release(probe, now) or "none"
 
-    def _open(self, connection: str, signal: dict, now: float) -> str:
+    def _open(self, connection: str, signal: dict, now: float, probe: str | None = None) -> str:
         key = connection if signal["scope"] == "connection" else self.model_key(connection, signal["model"])
+        # The limit can land on the other key than the one the probe leased (a model-scoped limit on a
+        # connection probe, or the reverse). That probe is over either way: free its lease so the key
+        # it held does not refuse with PROBE_IN_FLIGHT while no probe runs.
+        self._release(probe, now)
         rec = self._keys.setdefault(key, {"state": CLOSED, "failures": 0, "probe": None, "lease_until": None})
         rec["failures"] += 1
         backoff = min(self._cooldown_s * 2 ** (rec["failures"] - 1), self._max_cooldown_s)

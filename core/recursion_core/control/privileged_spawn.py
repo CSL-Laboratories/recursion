@@ -1123,8 +1123,17 @@ def detect_backends(
             f"{sudo_note}; not editing sudoers",
         )
 
-    systemd_user = engine or sudo_backend.target_user or "nobody"
+    stand_in = sudo_backend.target_user or "nobody"
+    systemd_user = engine or stand_in
     sys_ok, sys_uid, sys_reason = _probe_systemd_run(run, systemd_user, our_uid)
+    if not sys_ok and engine is not None and stand_in != engine:
+        # The configured engine user cannot be reached, but systemd-run may still reach the stand-in.
+        # Probe it so that working path is still measured and reported (bot review 4512091152); a shared
+        # stand-in is never selected (select_path), so this changes evidence, not selection.
+        alt_ok, alt_uid, alt_reason = _probe_systemd_run(run, stand_in, our_uid)
+        sys_reason = f"engine user {engine}: {sys_reason}; stand-in {stand_in}: {alt_reason}"
+        if alt_ok:
+            sys_ok, sys_uid, systemd_user = True, alt_uid, stand_in
     if not facts.systemd_is_pid1 and not sys_ok:
         sys_reason = f"systemd is not PID 1; {sys_reason}"
     systemd_backend = Backend(

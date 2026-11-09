@@ -560,6 +560,34 @@ class EngineUserDetectionTests(unittest.TestCase):
                 self.assertIsNone(evaluation.selected.backend)
                 self.assertIsNone(evaluation.selected.candidate)
 
+    def test_systemd_stand_in_is_still_measured_when_the_engine_user_is_refused(self) -> None:
+        # Bot review 4512091152 at da749a72: systemd-run refused --uid=<engine user> but allowed
+        # --uid=nobody, and detection reported systemd-run unavailable without trying the stand-in.
+        def run(cmd, timeout: float) -> ProcResult:
+            if cmd[0] == "systemd-run" and cmd[1] == "--uid=nobody":
+                return ProcResult(0, "65534\n", "")
+            return ProcResult(1, "", "denied")
+
+        measured: list[str] = []
+
+        def measure(backend: Backend, n: int):
+            measured.append(backend.name)
+            return Overhead(DEFAULT_N, 0.01, 0.02, 0.005, 0.03, ("systemd-run",))
+
+        evaluation = evaluate_host(
+            n=DEFAULT_N, facts=_facts(), run_fn=run, measure_fn=measure,
+            probe_fn=lambda backend, n: ALL_BLOCKED, f21_open=(), engine_user=ENGINE_USER, env={},
+        )
+        systemd = next(b for b in evaluation.backends if b.name == "systemd_run")
+        self.assertTrue(systemd.available)
+        self.assertEqual((systemd.target_user, systemd.target_uid), ("nobody", 65534))
+        self.assertIn(f"engine user {ENGINE_USER}:", systemd.reason)
+        self.assertIn("systemd_run", measured)
+        # The shared stand-in is evidence only: never the selected path nor the candidate.
+        self.assertEqual(evaluation.selected.name, "managed_login_folder")
+        self.assertIsNone(evaluation.selected.backend)
+        self.assertIsNone(evaluation.selected.candidate)
+
     def test_select_path_never_picks_a_root_target(self) -> None:
         for backend in (
             Backend("systemd_run", True, True, "ok", target_user="root", target_uid=0),

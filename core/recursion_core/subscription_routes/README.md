@@ -61,7 +61,9 @@ checked against `SUBSCRIPTION_SIGN_INS`:
 - The child env carries no credential at all: no API key, no token, no `CODEX_*`. The sign-in
   lives in the engine's own login store in the route home (`.pi`, `.hermes`, or OpenCode's
   `.local/share/opencode` and `.config/opencode`), which the check allows for that engine only,
-  by `lstat`. Every other engine's store, `.codex/auth.json` and every Claude Code store still
+  by `lstat`. The own store may not be a link or sit under one (`own_store_is_link`), and no link
+  inside it may resolve outside the route home (`own_store_links_outside_route_home`), so it cannot
+  reach the operator's store. Every other engine's store, `.codex/auth.json` and every Claude Code store still
   refuse. Recursion never stores, copies or ships these tokens and cannot see what else a store
   holds without reading it, which it does not do.
 
@@ -75,7 +77,9 @@ PRODUCT.md `055cc7a5` section 3.3. `own_loop.py`, checked before any spawn or re
   looks like a token, key or credential refuses, and `GITHUB_COPILOT_API_TOKEN`,
   `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN` and `COPILOT_API_URL` (plus the `gh`
   selectors `GH_HOST`, `GH_CONFIG_DIR`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`) are
-  removed from that run's child. With no stored `copilot` login (or no probe, or a failing probe)
+  removed from that run's child, as is every other provider credential (`*_API_KEY`, `*_TOKEN`, for
+  example `ANTHROPIC_API_KEY`). An optional `model` is checked (printable, no spaces, at most 128
+  characters) and carried on the decision. With no stored `copilot` login (or no probe, or a failing probe)
   the run refuses rather than fall back to `gh`. The probe is the caller's; nothing here opens a
   login store.
 - **Nous, "Local proxy"**: `check_nous_own_loop(route, parent_env, ...)` with
@@ -84,7 +88,10 @@ PRODUCT.md `055cc7a5` section 3.3. `own_loop.py`, checked before any spawn or re
   (`127.0.0.0/8`, `::1`, or IPv4-mapped loopback); names, including `localhost`, are not resolved
   and refuse. Adapters are `["nous"]` only; `xai` refuses (`adapter_must_stay_off`). Recursion holds
   no Nous token: token-like route fields and URL credentials refuse, and provider credential
-  variables are removed from the child.
+  variables are removed from the child. Proxy settings (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, any
+  case) are removed too, so loopback-bound traffic cannot be carried off the host. An optional
+  `model` is checked and carried; an adapter-prefixed id must name `nous` (`xai/grok-3` refuses
+  `adapter_must_stay_off`).
 - `nous_proxy_doctor(base_url, current_user=..., interactive_users=[...])` reports the address,
   refuses one that is not loopback, and warns when other interactive users share the host (any
   local user can reach a loopback proxy, which "accepts any bearer").

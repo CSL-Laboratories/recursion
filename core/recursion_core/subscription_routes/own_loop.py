@@ -53,6 +53,19 @@ _NOUS_SCHEMES = ("http", "https")
 _COPILOT_FIELDS = frozenset({"engine", "auth", "method", "model"})
 _NOUS_FIELDS = frozenset({"engine", "auth", "method", "base_url", "adapters", "model"})
 _TOKEN_HINTS = ("token", "key", "secret", "bearer", "password", "credential", "authorization")
+# Proxy settings would send a loopback-bound request to another host (proxy-aware clients honour them).
+_PROXY_ENV = frozenset({"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "FTP_PROXY", "SOCKS_PROXY", "SOCKS5_PROXY"})
+_MODEL_MAX = 128
+
+
+def _model(engine: str, value: object) -> str:
+    """Optional model id: printable, no spaces, at most 128 characters. ``""`` when absent."""
+    if value is None:
+        return ""
+    if not isinstance(value, str) or not value or len(value) > _MODEL_MAX or \
+            any(ord(ch) < 33 or ord(ch) > 126 for ch in value):
+        raise OwnLoopRouteRefused(engine, "model_malformed")
+    return value
 
 
 class OwnLoopRouteRefused(Exception):
@@ -72,6 +85,7 @@ class OwnLoopDecision:
     base_url: str = ""
     adapters: tuple[str, ...] = ()
     warnings: tuple[str, ...] = field(default_factory=tuple)
+    model: str = ""  # checked here; "" means the engine's default
 
 
 def _norm(value: object) -> str:
@@ -121,10 +135,12 @@ def check_copilot_own_loop(
         raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", type(exc).__name__) from None
     if not present:
         raise OwnLoopRouteRefused("copilot", "no_stored_copilot_login", "run `copilot login`; gh fallback refused")
+    model = _model("copilot", route.get("model"))
     strip = COPILOT_STRIP_ENV + _GH_FALLBACK_ENV
-    removed = tuple(n for n in strip if n in parent_env)
-    child = {k: v for k, v in parent_env.items() if k not in strip}
-    return OwnLoopDecision("copilot", "copilot_cli_sign_in", MappingProxyType(child), removed)
+    # Any other provider credential (ANTHROPIC_API_KEY, OPENAI_API_KEY, ...) is not this run's either.
+    removed = tuple(n for n in parent_env if n in strip or _is_provider_credential(n))
+    child = {k: v for k, v in parent_env.items() if k not in removed}
+    return OwnLoopDecision("copilot", "copilot_cli_sign_in", MappingProxyType(child), removed, model=model)
 
 
 def _loopback_url(base_url: object) -> str:
@@ -217,10 +233,18 @@ def check_nous_own_loop(
         raise OwnLoopRouteRefused("nous", "parent_env_malformed")
     url = _loopback_url(route.get("base_url"))
     adapters = _adapters(route.get("adapters"))
-    strip = tuple(n for n in parent_env if _is_provider_credential(n))
+    model = _model("nous", route.get("model"))
+    if "/" in model:  # an adapter-prefixed id must name the nous adapter (xai/grok-3 would leave it)
+        prefix = _norm(model.split("/", 1)[0])
+        if prefix in _NOUS_OFF_ADAPTERS:
+            raise OwnLoopRouteRefused("nous", "adapter_must_stay_off", prefix)
+        if prefix != NOUS_ADAPTER:
+            raise OwnLoopRouteRefused("nous", "nous_adapter_only", prefix)
+    # Provider credentials, and proxy settings that would carry loopback traffic off the host.
+    strip = tuple(n for n in parent_env if _is_provider_credential(n) or n.upper() in _PROXY_ENV)
     child = {k: v for k, v in parent_env.items() if k not in strip}
     return OwnLoopDecision("nous", "hermes_local_proxy", MappingProxyType(child), strip, url, adapters,
-                           _shared_host_warning(current_user, interactive_users))
+                           _shared_host_warning(current_user, interactive_users), model)
 
 
 def _is_provider_credential(name: str) -> bool:

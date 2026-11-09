@@ -5,14 +5,25 @@ PRODUCT.md at csl-research ``055cc7a5c793b7135e5d0565dc4198cf96230531`` (SHA-256
 ``codex exec``, whose approval policy is never, a call that would prompt is refused,
 unless a full-access permission profile (Disabled, External, or Managed with full-disk
 write) or a per-tool ``approval_mode = "approve"`` approves it. ``strict_auto_review``
-and a managed approval requirement can still force a prompt, which exec then refuses.
+and a managed approval requirement can still force a prompt.
 
 This module is an offline reading of openai/codex ``e0aa0434f415b0c5bc0fb64abd7f03c5510f9ed6``,
-``codex-rs/core/src/mcp_tool_call.rs`` (``requires_mcp_tool_approval`` and
-``requires_mcp_tool_approval_for_mode``). It does not spawn Codex, talk to a provider,
-or open a network connection. The live ``codex`` binary version is unmeasured here.
-"""
+``codex-rs/core/src/mcp_tool_call.rs`` (``requires_mcp_tool_approval``,
+``requires_mcp_tool_approval_for_mode`` and ``prepare_mcp_tool_approval``). At that commit
+neither exception is a plain refusal under exec: ``strict_auto_review`` skips the
+auto-approve shortcuts and sends the call to Codex's automatic reviewer
+(``tools/approvals.rs`` ``request_guardian_approval``, ``require_guardian``), which
+approves without a model review under a full-access profile and otherwise runs a model
+review that can approve or deny. A managed requirement (``guardian/decision.rs``,
+``auto_review_required_for_model`` or a reviewer that cannot be set to the user) does not
+skip the shortcuts; a call that still needs approval goes to the same reviewer. The
+outcome ``"auto_review"`` names that case: the call is neither known to run nor known to be
+refused. It assumes no permission-request hook and the default approvals reviewer.
 
+Status (PRODUCT.md Rule 4): grounded in that source reading, unmeasured. It does not spawn
+Codex, talk to a provider, or open a network connection. No ``codex exec`` run backs it, and
+the live ``codex`` binary version is unmeasured here.
+"""
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -24,7 +35,7 @@ CODEX_SOURCE_FILE = "codex-rs/core/src/mcp_tool_call.rs"
 CODEX_BINARY_VERSION: str | None = None
 
 ApprovalMode = Literal["auto", "prompt", "writes", "approve"]
-ExecOutcome = Literal["allowed", "refused"]
+ExecOutcome = Literal["allowed", "refused", "auto_review"]
 
 # PRODUCT.md O41: full-access profiles that auto-approve a prompt under exec.
 FULL_ACCESS_PROFILES = frozenset({"disabled", "external", "managed_full_disk"})
@@ -89,12 +100,18 @@ def exec_outcome(
     strict_auto_review: bool = False,
     managed_approval: bool = False,
 ) -> ExecOutcome:
-    """Would this MCP call run or be refused under ``codex exec`` (approval policy never)?"""
+    """Would this MCP call run, be refused, or go to the automatic reviewer under ``codex exec``?
 
-    if strict_auto_review or managed_approval:
-        return "refused"
-    if profile in FULL_ACCESS_PROFILES:
+    Approval policy never, default approvals reviewer, no permission-request hook.
+    """
+
+    needs_approval = requires_approval_for_mode(annotations, approval_mode)
+    full_access = profile in FULL_ACCESS_PROFILES
+    if strict_auto_review:
+        # Shortcuts skipped; the reviewer approves outright only under full access.
+        return "allowed" if full_access else "auto_review"
+    if full_access or not needs_approval:  # per-tool approve never needs approval
         return "allowed"
-    if requires_approval_for_mode(annotations, approval_mode):
-        return "refused"
-    return "allowed"
+    if managed_approval:
+        return "auto_review"
+    return "refused"

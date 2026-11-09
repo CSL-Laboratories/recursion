@@ -182,9 +182,11 @@ def _adapters(value: object) -> tuple[str, ...]:
     return names
 
 
-def _other_users(current_user: str | None, interactive_users: Iterable[str] | None) -> tuple[str, ...]:
-    if interactive_users is None:
-        return ()
+HOST_USERS_UNKNOWN = ("host users unknown: interactive_users was not given, so other local users may be able "
+                      "to reach the loopback proxy")
+
+
+def _other_users(current_user: str | None, interactive_users: Iterable[str]) -> tuple[str, ...]:
     return tuple(sorted({u for u in interactive_users if u and u != current_user}))
 
 
@@ -197,7 +199,8 @@ def nous_proxy_doctor(
     """Doctor line for the Hermes proxy: report the address, refuse non-loopback, warn on shared hosts.
 
     Never raises; returns ``{"ok", "address", "cause", "warnings"}``. ``interactive_users`` is the
-    caller's list of interactive accounts on this host; nothing is probed here.
+    caller's list of interactive accounts on this host; nothing is probed here. Without it the doctor
+    warns that the host's users are unknown rather than reporting a clean host.
     """
 
     warnings = _shared_host_warning(current_user, interactive_users)
@@ -210,6 +213,8 @@ def nous_proxy_doctor(
 
 
 def _shared_host_warning(current_user: str | None, interactive_users: Iterable[str] | None) -> tuple[str, ...]:
+    if interactive_users is None:  # "not checked" must not read as "nobody else is here"
+        return (HOST_USERS_UNKNOWN,)
     others = _other_users(current_user, interactive_users)
     if not others:
         return ()

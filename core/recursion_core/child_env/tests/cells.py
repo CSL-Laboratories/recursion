@@ -55,6 +55,8 @@ class Scratch:
         for tool in ("bash", "zsh", "git", "sleep", "python3"):
             _script(self.pub / tool)
         (self.op / "ca.pem").write_text("operator ca\n", encoding="ascii")
+        (self.op / "key.pem").write_text("fake operator key\n", encoding="ascii")
+        (self.op / "key.pem").chmod(0o600)
         (self.op / "d").mkdir()
         (self.op / "certs").mkdir()
         (self.op / "certs" / "ca.crt").write_text("operator ca\n", encoding="ascii")
@@ -194,6 +196,31 @@ def cells(s: Scratch) -> list[Cell]:
     add("c2_40", "alias_shell", {"SHELL": f"{op}/procalias/bash"}, R("value_perspective"))
     add("c2_40", "alias_path", {"PATH": f"{op}/procalias:/usr/bin:/bin"}, R("value_perspective"))
     add("c2_40", "alias_sslfile", {"SSL_CERT_FILE": f"{op}/procalias/ca.crt"}, R("value_perspective"))
+
+    # C1-46 (PRODUCT.md 055cc7a5 section 3.8): the names the Nov 5 list dropped, now carried under the same rules.
+    socks = "socks5h://127.0.0.1:1080"
+    add("c1_46", "allproxy_userinfo", {"ALL_PROXY": "socks5://fakeuser:fakepass@127.0.0.1:1080"}, R("proxy_userinfo"))
+    add("c1_46", "allproxy_scheme", {"all_proxy": "ftp://127.0.0.1:21"}, R("proxy_malformed"), engine="codex")
+    add("c1_46", "allproxy_noproxy_star", {"ALL_PROXY": socks, "NO_PROXY": "*"}, R("no_proxy_wildcard"), engine="codex")
+    add("c1_46", "xdg_runtime_pub", {"XDG_RUNTIME_DIR": pub}, R("value_chain_unsafe"))
+    add("c1_46", "client_cert_pub", {"CLAUDE_CODE_CLIENT_CERT": f"{pub}/ca.pem"}, R("value_chain_unsafe"))
+    add("c1_46", "client_key_group", {"CLAUDE_CODE_CLIENT_KEY": f"{grp}/ca.pem"}, R("value_chain_unsafe"))
+    add("c1_46", "cert_store_path", {"CLAUDE_CODE_CERT_STORE": f"bundled,{pub}/ca.pem"}, R("cert_store_malformed"))
+    mtls = {"CLAUDE_CODE_CLIENT_CERT": f"{op}/ca.pem", "CLAUDE_CODE_CLIENT_KEY": f"{op}/key.pem",
+            "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE": "fake-passphrase"}
+    add("c1_46_ok", "allproxy_socks", {"ALL_PROXY": socks}, L(_same(ALL_PROXY=socks)))
+    add("c1_46_ok", "all_proxy_lower", {"all_proxy": PROXY}, L(_same(all_proxy=PROXY)), engine="codex")
+    add("c1_46_ok", "xdg_runtime_op", {"XDG_RUNTIME_DIR": op}, L(_same(XDG_RUNTIME_DIR=op)))
+    add("c1_46_ok", "mtls_op", mtls, L(_same(**mtls)))
+    add("c1_46_ok", "cert_store_bundled", {"CLAUDE_CODE_CERT_STORE": "bundled", "SSL_CERT_FILE": f"{op}/ca.pem"},
+        L(_same(CLAUDE_CODE_CERT_STORE="bundled", SSL_CERT_FILE=f"{op}/ca.pem")))
+    add("c1_46_ok", "mtls_not_codex", mtls, L(_absent(*mtls)), engine="codex")
+    # PRODUCT.md 055cc7a5 section 3.3, Nov 8 fleet correction: the user's own Claude sign-in token stays as it is.
+    add("auth_ok", "oauth_passthrough", {"CLAUDE_CODE_OAUTH_TOKEN": "fake-not-a-token"},
+        L(_same(CLAUDE_CODE_OAUTH_TOKEN="fake-not-a-token")))
+    add("auth_ok", "oauth_absent", {}, L(_absent("CLAUDE_CODE_OAUTH_TOKEN")))
+    add("auth_ok", "oauth_not_codex", {"CLAUDE_CODE_OAUTH_TOKEN": "fake-not-a-token"},
+        L(_absent("CLAUDE_CODE_OAUTH_TOKEN")), engine="codex")
 
     # C2-38: the 15 PATH attack cells (envpath record section 3.1); path_tool_link_py is open under the
     # default tool list by design of N5i and is reported, not counted as closed.

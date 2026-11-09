@@ -1,6 +1,6 @@
 """CSL-785: child-environment allowlist and launch boundary in the new core (candidate tests).
 
-Run from the repository root: ``python3 -B -m unittest discover -s core/recursion_core/child_env/tests -t . -v``.
+Run from the repository root: ``PYTHONPATH=core python3 -B -m unittest discover -s core/recursion_core/child_env/tests -t core -v``.
 No engine, provider, network or real credential is used; every secret-shaped value is fake.
 """
 
@@ -173,6 +173,20 @@ class ProfileTests(unittest.TestCase):
                 build_child_env("codex", home=value, parent={})
             self.assertEqual(("HOME", "home_unsafe"), (caught.exception.name, caught.exception.cause))
 
+    def test_home_under_a_symlinked_parent_is_accepted(self) -> None:
+        # Devin r4503135764: macOS /var -> private/var. Modelled with an own-uid link, which _resolve also accepts.
+        base = Path(_home(self))
+        real_parent = base / "real"
+        real_parent.mkdir(mode=0o700)
+        (real_parent / "home").mkdir(mode=0o700)
+        os.symlink(real_parent, base / "link")
+        env = build_child_env("codex", home=str(base / "link" / "home"), parent={})
+        self.assertEqual(str(base / "link" / "home"), env["HOME"])
+        os.symlink(real_parent / "home", base / "home-link")
+        with self.assertRaises(EnvRefused) as caught:  # the home itself being a link stays refused
+            build_child_env("codex", home=str(base / "home-link"), parent={})
+        self.assertEqual("home_unsafe", caught.exception.cause)
+
     def test_validated_env_cannot_be_hand_made(self) -> None:
         with self.assertRaises(TypeError):
             ValidatedEnv({"PATH": "/usr/bin"}, "codex", ())
@@ -224,6 +238,17 @@ class LaunchTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises((EnvRefused, TypeError)):  # env= is a TypeError
                 spawn(["fake-engine"], env, popen=self.popen, **{key: None})
         self.popen.assert_not_called()
+
+    def test_caller_cannot_put_the_child_in_the_parents_session(self) -> None:
+        # Devin r4503135702: start_new_session=False or a process_group would undo the child's own session.
+        env = self._env()
+        for kwargs in ({"start_new_session": False}, {"start_new_session": None}, {"process_group": 0}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(EnvRefused) as caught:
+                spawn(["fake-engine"], env, popen=self.popen, **kwargs)
+            self.assertTrue(caught.exception.cause.startswith("launch_option_denied:"))
+        self.popen.assert_not_called()
+        spawn(["fake-engine"], env, popen=self.popen, start_new_session=True)
+        self.assertIs(True, self.popen.call_args.kwargs["start_new_session"])
 
     def test_argv0_resolves_only_on_the_validated_path(self) -> None:
         env = build_child_env("codex", home=self.home, parent={"PATH": "/usr/bin:/bin"})
@@ -280,6 +305,34 @@ class LaunchTests(unittest.TestCase):
         names = {line.split("=", 1)[0] for line in out.decode().splitlines() if "=" in line}
         self.assertEqual(set(env), names)
         self.assertNotIn(FAKE, out.decode())
+
+    def _fresh_tmp(self) -> None:
+        from recursion_core.child_env import policy
+        saved = dict(policy._TMP)
+        policy._TMP.clear()
+        self.addCleanup(lambda: (policy._TMP.clear(), policy._TMP.update(saved)))
+
+    def test_route_temp_root_never_sits_in_a_directory_others_can_write(self) -> None:
+        # Devin r4503135904: the daemon's own TMPDIR may point at another user's writable directory.
+        self._fresh_tmp()
+        unsafe = _home(self)
+        os.chmod(unsafe, 0o777)  # writable by others, not sticky: anyone could rename what we make there
+        with mock.patch("recursion_core.child_env.policy.tempfile.gettempdir", return_value=unsafe):
+            env = self._env(TMPDIR="/tmp")
+        self.assertFalse(env["TMPDIR"].startswith(unsafe + os.sep))
+        self.assertEqual([], os.listdir(unsafe))  # the rejected attempt was removed
+        st = os.lstat(env["TMPDIR"])
+        self.assertEqual((os.geteuid(), 0), (st.st_uid, st.st_mode & 0o077))
+
+    def test_route_temp_root_refuses_when_no_safe_base_exists(self) -> None:
+        self._fresh_tmp()
+        unsafe = _home(self)
+        os.chmod(unsafe, 0o777)
+        with mock.patch("recursion_core.child_env.policy._tmp_bases", return_value=[unsafe]), \
+                self.assertRaises(EnvRefused) as caught:
+            self._env(TMPDIR="/tmp")
+        self.assertEqual(("TMPDIR", "tmp_root_unsafe"), (caught.exception.name, caught.exception.cause))
+        self.assertEqual([], os.listdir(unsafe))
 
     def test_route_temp_root_is_private(self) -> None:
         env = self._env(TMPDIR="/tmp")

@@ -430,18 +430,48 @@ def _existing_ancestor(path: str) -> str:
 
 
 def _private_dir(path: str | None) -> bool:
-    if not isinstance(path, str) or not os.path.isabs(path) or _resolve(path)[2] is not None:
+    if not isinstance(path, str) or not os.path.isabs(path):
+        return False
+    real, missing, cause = _resolve(path)
+    if cause is not None or missing or real is None:
         return False
     try:
-        st = os.lstat(path)
+        if not stat.S_ISDIR(os.lstat(path).st_mode):  # the home itself may not be a link
+            return False
+        st = os.lstat(real)
     except OSError:
         return False
-    # The home itself is ours and 0700; its parents follow the chain rule (a root sticky /tmp above it is fine).
-    return stat.S_ISDIR(st.st_mode) and st.st_uid == os.geteuid() and not st.st_mode & 0o077 and _owned_chain(path)
+    # The home is ours and 0700. Its parents follow the chain rule on the resolved path, so an accepted link
+    # above it (macOS /var -> private/var) is fine, and a root sticky /tmp above it is fine.
+    return stat.S_ISDIR(st.st_mode) and st.st_uid == os.geteuid() and not st.st_mode & 0o077 and _owned_chain(real)
 
 
 _TMP: dict[int, str] = {}
 _TMP_LOCK = threading.Lock()
+
+
+def _tmp_bases() -> list[str]:
+    """Where a route temp root may be made: the process temp dir, then /tmp. Each is checked before use."""
+
+    return [tempfile.gettempdir(), "/tmp"]
+
+
+def _make_route_tmp() -> str:
+    # The daemon's own TMPDIR may name a directory someone else can write (Devin r4503135904). Make the root,
+    # then keep it only if its whole resolved chain passes the owned-chain rule; otherwise remove it and try
+    # the next base. No safe base refuses rather than handing children a root another user could swap.
+    for base in _tmp_bases():
+        try:
+            path = tempfile.mkdtemp(prefix="recursion-child-tmp-", dir=os.path.realpath(base))
+        except OSError:
+            continue
+        if _owned_chain(path):
+            return path
+        try:
+            os.rmdir(path)
+        except OSError:
+            pass
+    raise EnvRefused("TMPDIR", "tmp_root_unsafe")
 
 
 def _route_tmp() -> str:
@@ -454,6 +484,7 @@ def _route_tmp() -> str:
             st = os.lstat(path) if path else None
         except OSError:
             st = None
-        if st is None or not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077:
-            path = _TMP[key] = tempfile.mkdtemp(prefix="recursion-child-tmp-")
+        if (st is None or not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077
+                or not _owned_chain(path)):
+            path = _TMP[key] = _make_route_tmp()
         return path

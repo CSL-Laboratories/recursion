@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Callable, Mapping
 
 from recursion_core.routes import contract as c
@@ -22,9 +23,16 @@ class RouteAdapter:
     engine = ""
 
     def __init__(self, launcher: Launcher, clock: Callable[[], float], credentials: Credentials,
-                 parent_env: Mapping[str, str]) -> None:
+                 parent_env: Mapping[str, str], *, wall_clock: Callable[[], float] | None = None) -> None:
         self._launcher, self._clock, self._credentials = launcher, clock, credentials
         self._parent_env = dict(parent_env)  # explicit input; never os.environ
+        # ``clock`` may be monotonic. Vendor epochs are translated with ``wall_clock`` (Unix seconds).
+        self._wall = wall_clock if wall_clock is not None else time.time
+
+    def vendor_reset(self, epoch: object) -> float | None:
+        """Vendor ``resetsAt`` (Unix epoch) as an absolute reading of the breaker clock."""
+
+        return c.vendor_reset(epoch, self._clock, self._wall)
 
     def run(self, request: dict, deadline_at: float) -> dict:
         rid = request["request_id"]
@@ -45,6 +53,11 @@ class RouteAdapter:
         except _Protocol as err:
             process.fence("protocol_error")
             return c.result(rid, c.PROTOCOL_ERROR, events=events, detail=str(err))
+        except OSError as err:
+            # A child that exits before the request is written raises BrokenPipeError. That stays a
+            # typed result, and the process is fenced, instead of escaping the route boundary.
+            process.fence("io_error")
+            return c.result(rid, c.ENGINE_ERROR, events=events, detail=f"engine io: {type(err).__name__}")
 
     # -- subclass hooks -----------------------------------------------------------------------
     def argv(self, request: dict) -> list[str]:

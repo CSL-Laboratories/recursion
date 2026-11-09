@@ -12,10 +12,14 @@ engine), 11.2 (breaker, plan limits), Q12 (Claude subscription only inside Claud
   call `RouteService.handle(request) -> result` and nothing else, so the tests drive behaviour through
   the protocol and a later port can reuse them.
 - `claude_code.py`: `ClaudeCodeAdapter`, `claude -p --input-format stream-json --output-format stream-json`.
-  Reads typed limit signals only: `rate_limit_event`, `api_error_params.rate_limit_info` (also on
-  `system`/`api_retry`, which is surfaced as a typed `retry` event), and a typed `error: "rate_limit"`.
+  Reads typed limit signals only: `rate_limit_event` with `status: rejected`,
+  `api_error_params.rate_limit_info` on an error `result`, and a typed `error: "rate_limit"`.
+  `system`/`api_retry` is a `retry` event and does not open the breaker. `seven_day_opus` and
+  `seven_day_sonnet` fence that model family; other `rateLimitType` values fence the connection.
 - `codex.py`: `CodexAdapter`, `codex app-server` (JSON-RPC over JSONL on stdio). Reads
   `account/rateLimits/read`, `account/rateLimits/updated` and typed JSON-RPC / turn errors.
+  A named `limitId` is the breaker key. An `api_key` route ignores a ChatGPT-auth error from the
+  rate-limit read and still runs the turn.
 - `breaker.py`: `ConnectionBreaker`, keyed by the connection a route is billed through
   (`subscription:<login>` or `api_key:<key id>`), per model only when the typed signal names a per-model
   vendor bucket. Never keyed by engine id or tenant.
@@ -36,8 +40,10 @@ engine), 11.2 (breaker, plan limits), Q12 (Claude subscription only inside Claud
   short fault never hides a real limit on the same connection from that tenant.
 - Recursion's own deadline is `deadline_exceeded`: the run is fenced (`EngineProcess.fence`) for that
   request only and the breaker is not told. Other engine failures are request-local too.
-- Recovery: an open key always has a finite end (vendor `reset_at`, capped; otherwise a 300 s cooldown
-  doubling to 3600 s). Then one leased half-open probe at a time (lease = the probe run's own deadline
+- Recovery: an open key always has a finite end (`reset_at` on the breaker clock, capped; otherwise a
+  300 s cooldown doubling to 3600 s). Vendor `resetsAt` is Unix epoch and is translated onto that clock
+  before it is stored, so a monotonic deadline clock does not turn one limit into an 8-day fence.
+  Then one leased half-open probe at a time (lease = the time still left on the request's deadline
   plus 30 s, 11.2 C1-18; 150 s only when no deadline is given); success closes, a limit
   reopens, a lease that expires lets the next request probe; `reset()` closes at once. These numbers are
   uncalibrated defaults (11.2, B-10).
@@ -79,8 +85,9 @@ run's environment changes:
   variables is `launch_refused`, and so is a method whose own switch or credential is unset
   (`CLAUDE_CODE_USE_BEDROCK` / `_VERTEX` / `_FOUNDRY`; for `gateway` both `ANTHROPIC_BASE_URL` and
   `ANTHROPIC_AUTH_TOKEN`): without it the run would fall back to the sign-in and bill the subscription.
-  A `CLAUDE_CODE_USE_*` switch counts as set only for `1`, `true`, `yes` or `on` (any case); `off`, `no`
-  or anything else is refused. These four methods are the whole passthrough contract; any other method
+  A `CLAUDE_CODE_USE_*` switch counts as set only for `1`, `true`, `yes` or `on`; `off`, `no`
+  or anything else is refused. The child receives that spelling stripped and lowercased (Claude Code's
+  bool parser accepts those four). These four methods are the whole passthrough contract; any other method
   is refused. Bedrock also passes the AWS SDK web-identity role variables (`AWS_ROLE_ARN`,
   `AWS_WEB_IDENTITY_TOKEN_FILE`, `AWS_ROLE_SESSION_NAME`). `--bare` is the user's choice there too. `--bare` is refused only on the
   subscription route. No route drops `CLAUDE_CODE_OAUTH_TOKEN`, and the parent env is never changed.
@@ -92,10 +99,11 @@ run's environment changes:
 ## Limits (`limits.py`)
 
 At a `plan_limit`, `breaker_open` or `probe_in_flight` result, the result carries a `limit_notice` (connection, engine,
-model, scope, reset time, choices). `route.limits` or the service default sets `on_limit`: `ask` (default:
+model, scope, reset time, choices). When the vendor sent no reset, `wait` uses the breaker's cooldown
+end. `route.limits` or the service default sets `on_limit`: `ask` (default:
 nothing else runs), `wait` (nothing else runs; re-submit at `reset_at`) or `fallback` (the user's own
 `fallback` routes in the user's order, each switch shown as a `fallback` event and `switched_to`).
-Nothing picks a route by itself; `fallback` with an empty list is refused.
+Every attempt shares the request's one deadline. Nothing picks a route by itself; `fallback` with an empty list is refused.
 
 Lesson: [CSL-608](https://linear.app/csl-laboratories/issue/CSL-608) (Done research) found master's breaker
 keyed by engine, shared by every tenant and never reset. This module does not claim to have measured

@@ -12,6 +12,7 @@ import unittest
 from recursion_core.routes import contract as c
 from recursion_core.routes.breaker import ConnectionBreaker
 from recursion_core.routes.codex import CodexAdapter, check_daemon_config, daemon_config
+from recursion_core.routes.base import Deadline
 from recursion_core.routes.launch import GilBuildRefused, child_env, require_free_threaded
 from recursion_core.routes.profile_route import profile_adapters
 from recursion_core.routes.service import RouteService
@@ -71,6 +72,19 @@ class SubscriptionRouteReuseTest(unittest.TestCase):
     def req(self, engine: str, profile: dict, **kw) -> dict:
         return request(engine=engine, model="m", kind="api_key", conn_id="k1", credential_env="ANTHROPIC_API_KEY",
                        profile=profile, home=self.home, **kw)
+
+    def test_driver_deadline_is_fenced_and_typed(self) -> None:
+        def drive(process, req, deadline_at, events):
+            raise Deadline()
+
+        adapters = profile_adapters(self.launcher, self.clock, lambda cid, name: "sk-test",
+                                    {"PATH": "/usr/bin", "HOME": "/home/operator"},
+                                    argv=lambda req: ["pi"], driver=drive, operator_home="/home/operator")
+        service = RouteService(adapters, ConnectionBreaker(self.clock), self.clock)
+        res = service.handle(self.req("pi", {"provider": "anthropic", "auth": "api_key",
+                                              "credential_env": "ANTHROPIC_API_KEY"}))
+        self.assertEqual(res["code"], c.DEADLINE_EXCEEDED)
+        self.assertEqual(self.launcher.processes[-1].fenced, ["deadline"])
 
     def test_claude_subscription_provider_is_refused_and_never_launched(self) -> None:
         cases = [("pi", {"provider": "claude-pro", "auth": "oauth", "credential_env": "ANTHROPIC_API_KEY"}),

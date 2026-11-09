@@ -92,17 +92,45 @@ format is invented: a native binary with the right name printing a bare version 
 passes the floors is granted; the only identity check is that the line names no other
 engine. Whether those four need a pinned digest or are accepted as is, is open for Lucas.
 
-| Engine (binaries) | Scheme | Functional floor (Q43) | Security floor (relayed) |
-|---|---|---|---|
-| claude_code (`claude`) | semver | 2.1.314 (decided, O50/Q43; not yet measured, CX-956) | 2.1.260 (11.6) |
-| codex (`codex`) | semver | unset (beta until measured) | 0.131.0 (A-35, 11.6; security floor only) |
-| opencode (`opencode`, `opencode2`) | semver | unset | 1.18.33 (D2-72) |
-| grok (`grok`) | semver | unset (O50: once measured) | none |
-| antigravity (`agy`) | semver (assumed) | unset | none |
-| cursor (`agent`, `cursor-agent`) | date | unset | 2025.09.17-25b418f (D2-72) |
-| gemini (`gemini`) | semver | unset | 0.39.1 (D2-72) |
-| pi (`pi`) | semver (assumed); no identity rule: `identity_unverified` | unset | none |
-| hermes (`hermes`, read via `hermes-acp`) | semver (assumed) | unset | none |
+| Engine (binaries) | Scheme | Functional floor (Q43) | Security floor (relayed) | Measured help |
+|---|---|---|---|---|
+| claude_code (`claude`) | semver | 2.1.314 (decided, O50/Q43; not yet measured, CX-956) | 2.1.260 (11.6) | #336 fixtures, one per measured build (see below) |
+| codex (`codex`) | semver | unset (beta until measured) | 0.131.0 (A-35, 11.6; security floor only) | none measured |
+| opencode (`opencode`, `opencode2`) | semver | unset | 1.18.33 (D2-72) | none measured |
+| grok (`grok`) | semver | unset (O50: once measured) | none | none measured |
+| antigravity (`agy`) | semver (assumed) | unset | none | none measured |
+| cursor (`agent`, `cursor-agent`) | date | unset | 2025.09.17-25b418f (D2-72) | none measured |
+| gemini (`gemini`) | semver | unset | 0.39.1 (D2-72) | none measured |
+| pi (`pi`) | semver (assumed); no identity rule: `identity_unverified` | unset | none | none measured |
+| hermes (`hermes`, read via `hermes-acp`) | semver (assumed) | unset | none | none measured |
+
+Agent (Grok Bot Liaison, for Lucas): Claude Code measured builds. Data only: nothing below
+changes `floors.py`, the table version or any refusal (wrapper refusals and #336's
+`--bare` refusal both wait on Lucas). "Measured help" is the full `claude --help` committed
+on #336 (CSL-726) at `14f8b011`, measured on linux-x64 with
+`env -i PATH=/usr/bin:/bin HOME="$HOME" LANG=C.UTF-8 COLUMNS=80 <claude> --help` (no login,
+no model call); the full method and hashes are in #336's
+[`bare-default-measured-table.md`](https://github.com/CSL-Laboratories/recursion/blob/14f8b0114b673193fe46cd4275f2112fc73c4aed/core/recursion_core/routes/tests/fixtures/bare-default-measured-table.md). "This table" is
+`r2a-floors/1.3.0-candidate-2026-11-09` at this PR's head.
+
+| Build | npm tag (2026-11-09 12:17 PST) | This table | Measured help (#336 fixture) | `--bare` default for `-p` (#336 `classify_help`) |
+|---|---|---|---|---|
+| 2.1.311 | `stable` | `version_refused` (below 2.1.314) | [`claude-2.1.311-help.txt`](https://github.com/CSL-Laboratories/recursion/blob/14f8b0114b673193fe46cd4275f2112fc73c4aed/core/recursion_core/routes/tests/fixtures/claude-2.1.311-help.txt) (identical to 2.1.312) | unknown, refused |
+| 2.1.312 | none | `version_refused` (below 2.1.314) | [`claude-2.1.312-help.txt`](https://github.com/CSL-Laboratories/recursion/blob/14f8b0114b673193fe46cd4275f2112fc73c4aed/core/recursion_core/routes/tests/fixtures/claude-2.1.312-help.txt) | unknown, refused |
+| 2.1.313 | never published | n/a | none | n/a |
+| 2.1.314 | none (the floor) | passes floors | [`claude-2.1.314-help.txt`](https://github.com/CSL-Laboratories/recursion/blob/14f8b0114b673193fe46cd4275f2112fc73c4aed/core/recursion_core/routes/tests/fixtures/claude-2.1.314-help.txt) | unknown, refused |
+| 2.1.315-2.1.318 | none | passes floors | same SHA-256 as 2.1.314, no separate file | unknown, refused |
+| 2.1.319 | none (was `latest` on Nov 8) | passes floors | [`claude-2.1.319-help.txt`](https://github.com/CSL-Laboratories/recursion/blob/14f8b0114b673193fe46cd4275f2112fc73c4aed/core/recursion_core/routes/tests/fixtures/claude-2.1.319-help.txt) (identical to 2.1.314) | unknown, refused |
+| 2.1.320 | never published (npm 404, native bucket 404) | n/a | none | n/a |
+| 2.1.321 | `latest`, `next` | passes floors | [`claude-2.1.321-help.txt`](https://github.com/CSL-Laboratories/recursion/blob/14f8b0114b673193fe46cd4275f2112fc73c4aed/core/recursion_core/routes/tests/fixtures/claude-2.1.321-help.txt) (identical to 2.1.314) | unknown, refused |
+
+npm `stable` is 2.1.311, below the 2.1.314 functional floor, so a user who installs the
+`stable` channel is refused `version_refused` here. Measured 2026-11-09 12:17 PST: this PR's
+`grant("claude_code", …)` on the real npm binaries refused 2.1.311 (`version_refused`) and
+granted 2.1.319 and 2.1.321 (version lines `2.1.319 (Claude Code)`, `2.1.321 (Claude Code)`).
+"Passes floors" for the other rows is `check_floors` on the version line only. A build that
+passes these floors is still refused on the Claude subscription route by #336 until its help
+settles the `--bare` question; that pick is Lucas's.
 
 Codex: 0.131.0 is a security floor only. There is no measured functional floor, so Codex
 runs as beta until measured (O50). `rust-v0.145.0` (first tag with all 15 `--disable`

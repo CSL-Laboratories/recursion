@@ -286,6 +286,148 @@ class RoundTripTests(_TmpCase):
             framing.encode_frame(["not", "object"])  # type: ignore[arg-type]
 
 
+def _wait_for(predicate, timeout_s: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return predicate()
+
+
+def _new_peer_served(path: str) -> bool:
+    try:
+        with UnixControlClient(path, timeout_s=1.0) as client:
+            return client.request({"op": "ping"})["op"] == "pong"
+    except (ConnectionError, OSError, ct.FrameError):
+        return False
+
+
+@unittest.skipUnless(LINUX, "Linux is the tested path")
+class ClientResyncTests(_TmpCase):
+    """A failed request must never let a later request read an earlier request's reply."""
+
+    def test_timed_out_stop_reply_is_never_returned_for_the_next_request(self) -> None:
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def slow_stop(message: dict) -> dict:
+            if message.get("op") == "stop":
+                release.wait(1.5)
+                return {"ok": True, "op": "stop", "state": "stopped"}
+            return {"ok": True, "op": "pong"}
+
+        srv = self.server(slow_stop)
+        client = UnixControlClient(srv.path, timeout_s=0.3)
+        self.addCleanup(client.close)
+        with self.assertRaises(TimeoutError):
+            client.request({"op": "stop", "id": "s1"})
+        release.set()
+        time.sleep(0.1)  # the late stop reply is now on the wire
+        with self.assertRaises(ConnectionError):
+            client.request({"op": "ping", "id": "p1"})
+        # A fresh client is in sync.
+        with UnixControlClient(srv.path) as fresh:
+            self.assertEqual(fresh.request({"op": "ping", "id": "p2"}), {"ok": True, "op": "pong", "id": "p2"})
+
+    def test_reply_with_another_id_is_refused_and_closes_the_client(self) -> None:
+        srv = self.server(lambda message: {"ok": True, "op": "stop", "state": "stopped", "id": "s1"})
+        client = UnixControlClient(srv.path)
+        self.addCleanup(client.close)
+        with self.assertRaises(ct.FrameError) as caught:
+            client.request({"op": "ping", "id": "p1"})
+        self.assertIn("reply_id_mismatch", str(caught.exception))
+        with self.assertRaises(ConnectionError):
+            client.request({"op": "ping", "id": "p2"})
+
+    def test_reply_missing_the_request_id_is_refused(self) -> None:
+        def strip_id(message: dict) -> dict:
+            return {"ok": True, "op": "pong", "id": None}
+
+        srv = self.server(strip_id)
+        with UnixControlClient(srv.path) as client:
+            with self.assertRaises(ct.FrameError):
+                client.request({"op": "ping", "id": "p1"})
+
+    def test_partial_reply_then_timeout_closes_the_client(self) -> None:
+        """A frame cut off mid-body must not leave the rest to be read as the next reply."""
+        os.makedirs(self.sock_dir, 0o700, exist_ok=True)
+        path = os.path.join(self.sock_dir, "half.sock")
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(listener.close)
+        listener.bind(path)
+        listener.listen(1)
+        done = threading.Event()
+        self.addCleanup(done.set)
+        body = b'{"ok":true,"op":"stop","state":"stopped","id":"s1"}'
+
+        def half_server() -> None:
+            conn, _ = listener.accept()
+            with conn:
+                framing.read_frame(conn)
+                conn.sendall(framing.HEADER.pack(len(body)) + body[:10])
+                done.wait(2.0)
+                conn.sendall(body[10:])
+                done.wait(2.0)
+
+        threading.Thread(target=half_server, daemon=True).start()
+        client = UnixControlClient(path, timeout_s=0.3)
+        self.addCleanup(client.close)
+        with self.assertRaises(TimeoutError):
+            client.request({"op": "stop", "id": "s1"})
+        with self.assertRaises(ConnectionError):
+            client.request({"op": "ping", "id": "p1"})
+
+
+@unittest.skipUnless(LINUX, "Linux is the tested path")
+class ConnectionBoundTests(_TmpCase):
+    """The connection cap and idle timeout are the transport's flood bounds (CX-026)."""
+
+    def test_connection_over_the_cap_gets_no_frame_and_is_counted(self) -> None:
+        recorder = _Recorder()
+        srv = self.server(ct.with_ping_health(recorder), max_connections=1)
+        holder = UnixControlClient(srv.path)
+        self.addCleanup(holder.close)
+        self.assertEqual(holder.request({"op": "ping"})["op"], "pong")
+        raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        with raw:
+            raw.settimeout(5)
+            raw.connect(srv.path)
+            try:
+                raw.sendall(framing.encode_frame({"op": "stop", "run_id": "r1"}))
+                reply = raw.recv(4096)
+            except (ConnectionResetError, BrokenPipeError):
+                reply = b""
+        self.assertEqual(reply, b"")
+        self.assertTrue(_wait_for(lambda: srv.refused == ["max_connections"]), srv.refused)
+        self.assertEqual(srv.accepted, 1)
+        self.assertEqual(recorder.seen, [])
+        # The held slot still works, and closing it hands the slot to a new peer.
+        self.assertEqual(holder.request({"op": "ping"})["op"], "pong")
+        holder.close()
+        self.assertTrue(_wait_for(lambda: _new_peer_served(srv.path)))
+
+    def test_idle_peer_is_dropped_and_gives_its_slot_back(self) -> None:
+        srv = self.server(max_connections=1, idle_timeout_s=0.3)
+        idle = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        with idle:
+            idle.settimeout(5)
+            idle.connect(srv.path)
+            started = time.monotonic()
+            self.assertEqual(idle.recv(4096), b"")  # server hangs up, no frame
+            self.assertLess(time.monotonic() - started, 4.0)
+        self.assertTrue(_wait_for(lambda: _new_peer_served(srv.path)))
+
+    def test_idle_client_between_requests_is_dropped(self) -> None:
+        srv = self.server(idle_timeout_s=0.3)
+        client = UnixControlClient(srv.path)
+        self.addCleanup(client.close)
+        self.assertEqual(client.request({"op": "ping"})["op"], "pong")
+        time.sleep(0.8)
+        with self.assertRaises((ConnectionError, OSError, ct.FrameError)):
+            client.request({"op": "ping"})
+
+
 class RemoteBindRefusedTests(_TmpCase):
     NETWORK = (
         ("0.0.0.0", 8080),

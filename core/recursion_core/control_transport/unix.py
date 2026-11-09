@@ -428,13 +428,27 @@ class UnixControlClient:
         self._sock: socket.socket | None = sock
 
     def request(self, message: Message) -> Message:
+        """Send one frame and return its reply; any failure closes the client for good.
+
+        A timeout or partial read leaves the stream mid-frame, so the next read would hand
+        back an earlier request's late reply (a Stop's answer as a ping's). The socket is
+        closed instead, and a reply whose ``id`` differs from the request's is refused.
+        """
         with self._lock:
-            if self._sock is None:
+            sock = self._sock
+            if sock is None:
                 raise ConnectionError("client closed")
-            write_frame(self._sock, message, max_bytes=self._max_frame_bytes)
-            response = read_frame(self._sock, max_bytes=self._max_frame_bytes)
-        if response is None:
-            raise ConnectionError("server closed the connection")
+            try:
+                write_frame(sock, message, max_bytes=self._max_frame_bytes)
+                response = read_frame(sock, max_bytes=self._max_frame_bytes)
+                if response is None:
+                    raise ConnectionError("server closed the connection")
+                if "id" in message and response.get("id") != message["id"]:
+                    raise FrameError("reply_id_mismatch")
+            except BaseException:
+                self._sock = None
+                sock.close()
+                raise
         return response
 
     def close(self) -> None:

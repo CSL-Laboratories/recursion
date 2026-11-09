@@ -5,9 +5,11 @@
   or a lease ends; a probe token from before a ``reset`` or a lease handover cannot close
   the key it no longer owns; untyped failures never open a key, however many race.
 * recursion #328 ``plugin_security.breaker.ConnectionBreaker`` (O11, B15): a run binds one
-  connection once; a fault or a trip, once returned, is seen by every later ``check``. The
-  known #328 stale-probe race is pinned in ``test_race_stress.py`` and
-  ``drivers/repro_328_stale_probe.py``, not repeated here.
+  connection once; a fault or a trip, once returned, is seen by every later ``check``; a
+  reset with no leased probe must not clear a trip (``expectedFailure``: #328 has no lease).
+  The known #328 stale-probe race is pinned in ``test_race_stress.py`` and
+  ``drivers/repro_328_stale_probe.py``, not repeated here. The #326 cross-scope lease gap
+  (a model-scoped limit from a connection probe fences other models) is ``expectedFailure``.
 
 The clock is a shared fake, so "the instant the cooldown ends" is exact rather than hoped for.
 Needs ``RACE_STRESS_TREE_326`` / ``RACE_STRESS_TREE_328``. Run under ``python3.14t -X gil=0``.
@@ -165,6 +167,30 @@ class HalfOpenStampedeTests(RoutesBreakerCase):
             # "closed" first then "opened" -> open; "opened" first -> the probe finds nothing.
             self.assertEqual(self.br.state(CONN), self.mod.OPEN, f"iteration {i}: {effects}")
 
+    @unittest.expectedFailure  # CSL-801 finding: #326 cross-scope lease gap (see README.md)
+    def test_model_limit_from_a_connection_probe_leaves_other_models_available(self) -> None:
+        """PRODUCT.md 055cc7a5 3.4 S3: per model only where the vendor meters per model.
+
+        The connection key is open and its cooldown is over, so admitting (CONN, m1) leases the
+        *connection* key's probe. That probe ends with a model-scoped PLAN_LIMIT: the vendor
+        metered m1's own bucket, so m1 opens and the connection itself is not limited. Another
+        model on the same connection must then be admitted. #326 at 82247cbc opens the m1 key
+        but keeps the connection key's lease, so m2 is refused ``probe_in_flight`` until
+        ``probe_lease_s`` runs out (150 s by default): one per-model limit fences the whole
+        connection. ``expectedFailure`` until #326 settles the connection lease on that result.
+        """
+        self.br.reset(CONN)
+        self.assertEqual(self.br.record(CONN, MODEL, "t0", self.limit()), "opened")
+        self.clock.advance(10)  # cooldown over
+        res = self.br.admit(CONN, MODEL, "t0")
+        self.assertEqual(res["key"], CONN, "the probe should lease the connection key")
+        self.assertIsNotNone(res["probe"])
+        self.assertEqual(self.br.record(CONN, MODEL, "t0", self.limit("model"), res["probe"]), "opened")
+        self.assertEqual(self.br.state(CONN, MODEL), self.mod.OPEN)
+        self.assertFalse(self.br.admit(CONN, MODEL, "t1")["admitted"])  # m1 itself stays fenced
+        other = self.br.admit(CONN, "m2", "t1")
+        self.assertTrue(other["admitted"], f"m2 on {CONN} refused after an m1-only limit: {other}")
+
     def test_untyped_failures_never_open_however_many_race(self) -> None:
         codes = [code for code in self.c.CODES if code not in (self.c.PLAN_LIMIT, self.c.SHORT_FAULT)]
 
@@ -300,7 +326,37 @@ class PluginBreakerTests(PluginBreakerCase):
             self.assertEqual(late_pass, [], f"iteration {i}")
             self.assertTrue(self.br.tripped(conn))
 
+    @unittest.expectedFailure  # CSL-801 finding: #328 resets without a leased probe (see README.md)
+    def test_reset_without_a_leased_probe_does_not_clear_a_trip(self) -> None:
+        """PRODUCT.md 055cc7a5 3.4 S3 ("a leased probe resets it") and the engine contract,
+        "Report a plan limit" item 4 ("the leased probe resets it when the limit clears").
+
+        A connection is tripped by a typed limit and no probe is admitted or leased; #328 at
+        0264628b has no admit or lease call at all. A bare ``reset_after_probe(conn, True)`` is
+        then the caller's word that some probe succeeded, and it must be refused: the trip
+        stays and ``check`` keeps refusing. This is wider than the stale-probe ordering pinned
+        in ``test_race_stress.py``: a trip-generation counter alone would pass those tests and
+        still fail this one. ``expectedFailure`` until #328 ties a reset to a live leased probe.
+        """
+        run, conn = "r-unleased", "c-unleased"
+        self.br.bind_run(run, conn)
+        self.assertTrue(self.br.report(conn, "plan_limit"))
+        try:
+            cleared = self.br.reset_after_probe(conn, True)
+        except (self.mod.Refused, TypeError, ValueError):
+            cleared = False  # refused outright, or the call now needs a probe it was not given
+        self.assertFalse(cleared, "reset_after_probe cleared a trip with no leased probe")
+        self.assertTrue(self.br.tripped(conn))
+        self.assertEqual(self.code_of(self.br.check, run, conn), "connection_tripped")
+
     def test_report_reset_race_leaves_tripped_and_check_consistent(self) -> None:
+        """Consistency only: ``tripped`` and ``check`` agree after report/reset flapping.
+
+        #328 at 0264628b has no admit or lease call, so the resets below are *unleased*
+        ``reset_after_probe(conn, True)`` calls, not real probes; no lease can be taken. This
+        test does not claim they are legal. That they must be refused is pinned by
+        ``test_reset_without_a_leased_probe_does_not_clear_a_trip`` (``expectedFailure``).
+        """
         for i in range(ITERATIONS):
             run, conn = f"r{i}", f"c{i}"
             self.br.bind_run(run, conn)
@@ -311,7 +367,7 @@ class PluginBreakerTests(PluginBreakerCase):
                     if rng.random() < 0.5:
                         self.br.report(conn, rng.choice(sorted(self.mod.TYPED_LIMITS)))
                     else:
-                        self.br.reset_after_probe(conn, True)
+                        self.br.reset_after_probe(conn, True)  # unleased: #328 has no lease API
                     # Non-trip events race too and must never trip.
                     self.assertFalse(self.br.report(conn, "core_deadline"))
 

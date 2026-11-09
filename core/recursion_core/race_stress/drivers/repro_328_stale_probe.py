@@ -28,8 +28,9 @@ def main() -> None:
 
     breaker = ConnectionBreaker()
     breaker.bind_run("run-1", "conn-a")
-    breaker.report("conn-a", "rate_limit")          # 1. tripped; a probe starts
-    probe_ok = True                                  # 2. the probe succeeded and ended
+    lease_api = any(hasattr(breaker, n) for n in ("admit", "lease_probe", "start_probe", "begin_probe"))
+    breaker.report("conn-a", "rate_limit")          # 1. tripped; the host says a probe starts
+    probe_ok = True                                  # 2. ...and succeeded; no lease exists to take
     breaker.report("conn-a", "plan_limit")           # 3. a newer limit lands
     cleared = breaker.reset_after_probe("conn-a", probe_ok)  # 4. the older probe reports
     try:
@@ -38,7 +39,8 @@ def main() -> None:
     except Refused as exc:
         check = exc.code
     print(json.dumps({"reset_returned": cleared, "tripped_after": breaker.tripped("conn-a"),
-                      "check_after": check, "erased": cleared and not breaker.tripped("conn-a")},
+                      "check_after": check, "erased": cleared and not breaker.tripped("conn-a"),
+                      "probe_leased": False, "lease_api": lease_api},
                      sort_keys=True))
 
 

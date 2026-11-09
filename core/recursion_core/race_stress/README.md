@@ -56,6 +56,21 @@ PYTHON_GIL=0 python3.14t -X gil=0 -B core/recursion_core/race_stress/drivers/bre
   3.14t: it is a logic race, not a free-threading one. The two tests that state the wanted
   behaviour are `expectedFailure` until #328 changes. The #326 breaker does not have it: its
   probe tokens are dropped when a key reopens.
+* **#328 breaker: a reset with no leased probe clears a trip.** Wider than the ordering race
+  above. #328 has no admit or lease call, so `reset_after_probe(connection, True)` is only the
+  caller's word that a probe succeeded, and it clears any trip. PRODUCT.md 055cc7a5 3.4 S3 says
+  "a leased probe resets it", and the engine contract's "Report a plan limit" item 4 says the
+  same. A trip-generation fix alone would turn the two tests above into passes and leave this
+  open, so `test_interleave_breaker.py::test_reset_without_a_leased_probe_does_not_clear_a_trip`
+  pins it as `expectedFailure`. The repro and the report/reset flap test use unleased resets
+  because no lease can be taken; the flap test checks only that `tripped` and `check` agree.
+* **#326 breaker: a model-scoped limit from a connection probe fences every model.** When the
+  probe leased on the connection key ends with a model-scoped `PLAN_LIMIT`, `record` opens the
+  model key but leaves the connection key's lease in place. Every other model on that
+  connection is then refused `probe_in_flight` until `probe_lease_s` (default 150 s) runs out,
+  against S3 ("per model only where the vendor meters per model"). Sequential, not a
+  free-threading race. Pinned as `expectedFailure` by
+  `test_interleave_breaker.py::test_model_limit_from_a_connection_probe_leaves_other_models_available`.
 * **#324 registry lock is load-bearing for memory safety.** With the Registry and Daemon
   locks removed (`--mutant`), the shared `sqlite3` connection crashes the interpreter with
   SIGSEGV on both builds. The real code holds the lock on every connection use, and no
@@ -72,8 +87,8 @@ checks the invariant across it. They load the measured module in-process from th
 | File | Target | Windows forced |
 | --- | --- | --- |
 | `test_interleave_registry.py` | #324 registry | Stop committed while a reconcile holds a stale `Run` and is paused in `observe` (B14); `Daemon.stop` behind a paused sweep; random writers against terminal stickiness |
-| `test_interleave_breaker.py` | #326 routes breaker | half-open stampede at the exact cooldown end; lease handover stampede plus a late report from the expired probe; all 6 orders of reset / new limit / stale probe; a typed limit landing mid-probe (the #328 interleaving: #326 keeps the key open); untyped storms; randomized mix with a lock-held monitor |
-| | #328 plugin breaker | concurrent `bind_run` of one run; fault and trip monotonic for every later `check`; report/reset flapping keeps `tripped` and `check` consistent |
+| `test_interleave_breaker.py` | #326 routes breaker | half-open stampede at the exact cooldown end; lease handover stampede plus a late report from the expired probe; all 6 orders of reset / new limit / stale probe; a typed limit landing mid-probe (the #328 interleaving: #326 keeps the key open); a model-scoped limit from a connection probe (`expectedFailure`, see Findings); untyped storms; randomized mix with a lock-held monitor |
+| | #328 plugin breaker | concurrent `bind_run` of one run; fault and trip monotonic for every later `check`; report/reset flapping keeps `tripped` and `check` consistent (unleased resets); a reset with no leased probe is refused (`expectedFailure`, see Findings) |
 
 Sensitivity (local, not committed): removing B14's `CASE` in `Registry.state`, or the lock in
 #326 `admit`, makes these tests fail (B14 broken; 8 probes leased instead of 1).

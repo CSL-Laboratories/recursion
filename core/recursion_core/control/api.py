@@ -15,11 +15,18 @@ Methods and typed result codes::
 Stop: the first call asks the cleanup layer to stop the run's tree, then asks it to confirm. Only a
 confirmed empty cgroup yields ``stopped``; a populated cgroup, a confirm timeout, an unknown answer or a
 cleanup error yields ``pending`` with that reason. A repeat stop on a stopped run sends nothing; on a
-pending run it only re-checks. Reads never change state and never call the cleanup layer.
+pending run it only re-checks, unless the earlier cleanup request itself raised (``stop.requested`` is
+false), in which case it sends the request again (``cgroup.kill`` and pidfd signals are safe to repeat).
+Reads never change state and never call the cleanup layer.
+
+``client_key`` dedupes a retried start per tenant and is bound to that start's engine and prompt (the
+prompt is kept only as a SHA-256 digest). Another tenant may use the same key; the same tenant reusing a
+key for a different request gets ``request_invalid`` / ``client_key_reused`` and nothing is launched.
 """
 
 from __future__ import annotations
 
+import hashlib
 import threading
 from collections.abc import Callable, Mapping
 
@@ -43,7 +50,7 @@ class ControlAPI:
         self._confirm_timeout_s = confirm_timeout_s
         self._stop_lock = threading.Lock()  # one stop decision at a time, so a kill is never sent twice
         self._start_lock = threading.Lock()  # a retried start with the same client_key launches once
-        self._keys: dict[str, str] = {}
+        self._keys: dict[tuple[str, str], tuple[str, tuple[str, str]]] = {}
 
     def call(self, method: str, params: Mapping | None = None) -> dict:
         params = dict(params or {})
@@ -79,8 +86,13 @@ class ControlAPI:
 
     def _start(self, params: Mapping) -> dict:
         key = params.get("client_key")
-        if isinstance(key, str) and key in self._keys:  # a retried start is not run twice (11.8)
-            return {"code": STARTED, "run": self._registry.get(self._keys[key]), "duplicate": True}
+        scoped = (params["tenant"], key) if isinstance(key, str) else None
+        request = (params["engine"], hashlib.sha256(params["prompt"].encode()).hexdigest())
+        if scoped is not None and scoped in self._keys:  # a retried start is not run twice (11.8)
+            run_id, original = self._keys[scoped]
+            if original != request:
+                return {"code": REQUEST_INVALID, "detail": "client_key_reused"}
+            return {"code": STARTED, "run": self._registry.get(run_id), "duplicate": True}
         try:
             handle = self._starter(dict(params))
         except Exception as err:  # the launch path refused or failed; the API answers with a code
@@ -88,8 +100,8 @@ class ControlAPI:
         rec = {"run_id": handle["run_id"], "tenant": params["tenant"], "engine": params["engine"],
                "state": "running", "cgroup": handle["cgroup"], "started_at": self._clock(), "stop": None}
         self._registry.put(rec)
-        if isinstance(key, str):
-            self._keys[key] = rec["run_id"]
+        if scoped is not None:
+            self._keys[scoped] = (rec["run_id"], request)
         return {"code": STARTED, "run": rec, "duplicate": False}
 
     # -- stop ---------------------------------------------------------------------------------
@@ -102,11 +114,14 @@ class ControlAPI:
                 return {"code": STOPPED, "run_id": run_id, "state": "stopped", "repeat": True}
             first = rec["state"] != "stop_pending"
             if first:
-                rec["stop"] = {"requested_at": self._clock(), "checks": 0, "reason": None}
+                rec["stop"] = {"requested_at": self._clock(), "checks": 0, "reason": None, "requested": False}
+            if not rec["stop"].get("requested", True):
+                # First stop, or an earlier request raised before it was known to be sent: (re)send it.
                 try:
                     self._kill.request_stop(rec["cgroup"])
                 except Exception as err:
                     return self._pending(rec, f"cleanup_error:{type(err).__name__}")
+                rec["stop"]["requested"] = True
             try:
                 answer = self._kill.confirm(rec["cgroup"], self._confirm_timeout_s)
             except Exception as err:

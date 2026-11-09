@@ -25,7 +25,10 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
 - `view.py`: a frame is a list of `(text, style)` rows. It renders as plain text, as one full-screen
   ANSI repaint, or through `InlinePainter`. Colour is only decoration and is off under `NO_COLOR`.
 - `term.py`: the terminal driver. Its three modes all read the same log:
-  - default on a TTY: full screen on the alternate screen.
+  - default on a TTY: full screen on the alternate screen. The terminal size is polled every tick, so a
+    resize repaints at the new size; there is no minimum size. Every current condition stays on screen:
+    one row each when they fit, else one row per label naming each subject, else one row naming every
+    label. Output, runs, the notice, the header and the status row give up their rows first.
   - `--no-alt-screen`: inline mode, preserving terminal scrollback history. Finished output is appended
     once as plain lines, so it lands in scrollback and can be copied. Only a small live region at the
     bottom (status, current condition labels, the latest error, notice, input) is redrawn. Keys work as
@@ -33,6 +36,8 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
   - `--plain` or `--screen-reader` (the same mode), `TERM=dumb`, or no TTY: the linear renderer for
     screen readers. One CLI-grammar command per line; it says each logged event's `speech` once, in
     order, with no redraw or cursor movement.
+  - `--no-color` turns colour off in any mode, like `NO_COLOR`. Usage errors and a missing API client
+    go to stderr; stdout carries only the screen or the transcript.
 
   The toolkit is this package's own small driver. No dependency is added; prompt_toolkit stays the
   candidate and Ratatui the fallback while O7 `cli-implementation-stack` is open.

@@ -222,9 +222,11 @@ class LinearRendererTest(unittest.TestCase):
         self.assertNotIn("\x1b", outs[0])
 
     def test_unknown_flag_is_a_usage_error(self) -> None:
-        out = io.StringIO()
-        self.assertEqual(term.main(["--approve"], lambda: None, stdin=io.StringIO(""), stdout=out, environ={}), 2)
-        self.assertIn("usage error: unrecognized arguments: --approve", out.getvalue())
+        out, err = io.StringIO(), io.StringIO()
+        self.assertEqual(term.main(["--approve"], lambda: None, stdin=io.StringIO(""), stdout=out, environ={},
+                                   stderr=err), 2)
+        self.assertIn("usage error: unrecognized arguments: --approve", err.getvalue())
+        self.assertEqual(out.getvalue(), "", "a diagnostic is not part of the transcript stream")
 
     def test_a_reader_that_falls_behind_a_bounded_log_is_told(self) -> None:
         log = EventLog(cap=3)

@@ -25,9 +25,10 @@ class PlainModeTest(unittest.TestCase):
         self.assertEqual(driver.model_calls, 1)
 
     def test_no_api_client_is_a_text_error(self) -> None:
-        out = io.StringIO()
-        self.assertEqual(term.main(["--plain"], None, stdin=io.StringIO(""), stdout=out, environ={}), 1)
-        self.assertIn("status=control_api_unavailable", out.getvalue())
+        out, err = io.StringIO(), io.StringIO()
+        self.assertEqual(term.main(["--plain"], None, stdin=io.StringIO(""), stdout=out, environ={}, stderr=err), 1)
+        self.assertIn("status=control_api_unavailable", err.getvalue())
+        self.assertEqual(out.getvalue(), "", "diagnostics go to stderr (O7)")
 
 
 if __name__ == "__main__":

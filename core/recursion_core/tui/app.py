@@ -77,7 +77,9 @@ class TuiApp:
         self._api, self._clock = api, clock
         self.dispatch: Dispatch = dispatch or self._inline
         self.color = color_enabled(environ or {})
-        self.width, self.height, self.stale_after_s = max(width, 20), max(height, 16), stale_after_s
+        self.width = self.height = 0
+        self.resize(width, height)
+        self.stale_after_s = stale_after_s
         self._output_lines = output_lines
         self.log = EventLog(log_cap)
         self._t0 = clock()
@@ -352,53 +354,84 @@ class TuiApp:
 
     # -- frame ----------------------------------------------------------------------------------
     def frame(self) -> list[Row]:
-        """One full-screen frame. It first logs any condition edge (one may appear with time alone)."""
+        """One full-screen frame of exactly ``self.height`` rows, none wider than ``self.width`` cells.
+
+        It first logs any condition edge (one may appear with time alone). Every current condition stays
+        on screen: one row each when they fit, else one row per label naming each subject, else (a
+        terminal only a few rows tall) one row naming every label. Runs, output, the notice, the header
+        and the status row give up their rows first; conditions, the error row and the prompt last."""
 
         self.sync_conditions()
-        w = self.width
-        rows: list[Row] = []
+        w, h = self.width, self.height
 
-        def put(text: str, style: str | None = None) -> None:  # a clipped row ends in "…"; the transcript has it all
+        def clip(text: str) -> str:  # a clipped row ends in "…"; the transcript has it all
             parts = wrap(text, w) if text else [""]
-            rows.append((parts[0] if len(parts) == 1 else wrap(text, w - 1)[0] + "…", style))
+            if len(parts) == 1:
+                return parts[0]
+            return wrap(text, w - 1)[0] + "…" if w > 1 else "…"
+
+        keyed = list(self.shown.items())
+        detail = [(f"{label}: {text}", label) for (label, _), (_, text) in keyed]
+        by_label: dict[str, list[tuple[str, str]]] = {}
+        for (label, subject), (_, text) in keyed:
+            by_label.setdefault(label, []).append((subject, text))
+        grouped = [(f"{label}: {text}" if len(found) == 1 else
+                    f"{label}: {len(found)} active ({', '.join(field(s) for s, _ in found)}): {found[0][1]}", label)
+                   for label, found in by_label.items()]
+        summary = [(f"{','.join(by_label)}: {len(keyed)} conditions active (terminal too small for detail; "
+                    f"the transcript lists them)", next(iter(by_label), None))]  # labels first: they survive clipping
+        fixed = 5  # header, status, error, notice, prompt
+        cond = next((tier for tier in (detail, grouped) if tier and len(tier) + fixed <= h), None)
+        if cond is None:
+            cond = summary if keyed else [("conditions: none", None)]
+        rem = max(0, h - fixed - len(cond))
+        pad = min(max(0, CONDITION_ROWS - len(cond)), max(0, rem - (RUN_ROWS + 3)))  # keep the layout steady
+        rem -= pad
+        run_rows = min(RUN_ROWS, rem - 1) if rem >= 2 else 0
+        rem -= run_rows + (1 if run_rows else 0)
 
         mode = "watch_only" if self.watch_only else "live"
-        put(f"Recursion TUI | surface={p.SURFACE} | view={mode} | runs={len(self.runs)} | control API client",
-            "header")
-        put(self.status_row())
-        conds = list(self.shown.values())
-        shown = conds[:CONDITION_ROWS]
-        for label, text in shown:
-            put(f"{label}: {text}", label)
-        if len(conds) > CONDITION_ROWS:
-            rows.pop()
-            put(f"(+{len(conds) - CONDITION_ROWS + 1} more conditions, listed in the transcript)", shown[-1][0])
-        for _ in range(CONDITION_ROWS - len(shown)):
-            put("conditions: none" if not conds and _ == 0 else "")
-        put("runs:")
-        ids = [str(r.get("run_id")) for r in self.runs]
-        start = max(0, min(ids.index(self.selected) - RUN_ROWS + 1 if self.selected in ids else 0, len(ids)))
-        for run in self.runs[start:start + RUN_ROWS]:
-            rid = str(run.get("run_id"))
-            mark = ">" if rid == self.selected else " "
-            att = " attached" if rid == self.attached else ""
-            put(f"{mark} {field(rid)} state={field(run.get('state'))} engine={field(run.get('engine'))} "
-                f"tenant={field(run.get('tenant'))}{att}", "selected" if rid == self.selected else None)
-        for _ in range(RUN_ROWS - len(self.runs[start:start + RUN_ROWS])):
-            put("")
-        out = self.outputs.get(self.attached or "")
-        put(f"-- output run={field(self.attached) if self.attached else 'none'} (untrusted engine text, "
-            f"display only)" + (f" skipped_events={self.skipped_events}" if self.skipped_events else "") + " --")
-        out_rows = self.height - len(rows) - 3
-        lines = out.tail(out_rows, w - 2) if out else []
-        for line in lines:
-            put("│ " + line)
-        for _ in range(out_rows - len(lines)):
-            put("│")
-        put(self.error_row(), "error" if self.last_error else None)
-        put(self.notice)
-        put(self.prompt(), "prompt")
-        return rows
+        # (priority, text, style) in screen order; when the terminal is too short the highest number goes first
+        rows: list[tuple[int, str, str | None]] = [
+            (3, f"Recursion TUI | surface={p.SURFACE} | view={mode} | runs={len(self.runs)} | control API client",
+             "header"),
+            (2, self.status_row(), None),
+            *((0, text, style) for text, style in cond),
+            *((0, "", None) for _ in range(pad)),
+        ]
+        if run_rows:
+            rows.append((5, "runs:", None))
+            ids = [str(r.get("run_id")) for r in self.runs]
+            start = max(0, min(ids.index(self.selected) - run_rows + 1 if self.selected in ids else 0, len(ids)))
+            for run in self.runs[start:start + run_rows]:
+                rid = str(run.get("run_id"))
+                mark = ">" if rid == self.selected else " "
+                att = " attached" if rid == self.attached else ""
+                rows.append((5, f"{mark} {field(rid)} state={field(run.get('state'))} "
+                                f"engine={field(run.get('engine'))} tenant={field(run.get('tenant'))}{att}",
+                             "selected" if rid == self.selected else None))
+            rows.extend((5, "", None) for _ in range(run_rows - len(self.runs[start:start + run_rows])))
+        if rem:
+            out = self.outputs.get(self.attached or "")
+            rows.append((6, f"-- output run={field(self.attached) if self.attached else 'none'} (untrusted engine "
+                            f"text, display only)" + (f" skipped_events={self.skipped_events}"
+                                                      if self.skipped_events else "") + " --", None))
+            lines = out.tail(rem - 1, max(1, w - 2)) if out else []
+            rows.extend((6, "│ " + line, None) for line in lines)
+            rows.extend((6, "│", None) for _ in range(rem - 1 - len(lines)))
+        rows += [(1, self.error_row(), "error" if self.last_error else None), (4, self.notice, None),
+                 (1, self.prompt(), "prompt")]
+        while len(rows) > h:  # a terminal shorter than the layout: drop the least needed row
+            rows.remove(max(reversed(rows), key=lambda r: r[0]))
+        return [(clip(text), style) for _, text, style in rows]
+
+    def resize(self, width: int, height: int) -> bool:
+        """Take the terminal's current size; True if it changed. No floor: the frame fits any size."""
+
+        size = (max(int(width), 1), max(int(height), 1))
+        changed = size != (self.width, self.height)
+        self.width, self.height = size
+        return changed
 
     def status_row(self) -> str:
         if self.last is None:
@@ -468,12 +501,14 @@ class Loop:
 
     Keys and API answers are handled before engine output each tick; output draining stops after
     ``drain_budget_s`` so one tick stays short under any flood; ``run.stop`` has its own lane.
+    ``size``, when given, is polled every tick, so a resized terminal gets a frame that fits it.
     """
 
     def __init__(self, app: TuiApp, api, *, sink: Callable[[list[Row]], None] | None = None,
                  tick_s: float = 1 / 60, drain_budget_s: float = 0.008, event_cap: int = 50_000,
-                 render: Callable[[], list[Row]] | None = None) -> None:
-        self.app, self._api, self._sink = app, api, sink
+                 render: Callable[[], list[Row]] | None = None,
+                 size: Callable[[], tuple[int, int]] | None = None) -> None:
+        self.app, self._api, self._sink, self._size = app, api, sink, size
         self._render = render or app.frame  # inline mode paints from the log and needs no frame
         self.tick_s, self.drain_budget_s, self.event_cap = tick_s, drain_budget_s, event_cap
         self._keys: queue.SimpleQueue = queue.SimpleQueue()
@@ -562,7 +597,9 @@ class Loop:
                 break
         if self.dropped_events:
             app.skipped_events = self.dropped_events
-        self.frame = self._render()  # 4. one repaint
+        if self._size is not None:  # 4. one repaint, at the terminal's size now
+            app.resize(*self._size())
+        self.frame = self._render()
         self.frames += 1
         if self._sink is not None:
             self._sink(self.frame)

@@ -97,7 +97,8 @@ status=control_api_unavailable method=run.status detail=ConnectionError
 UNAVAILABLE: control API unavailable: ConnectionError
 UNRECONCILED: run=run-1 state=stop_pending reason=cgroup_populated: stop requested, cleanup not con…
 UNRECONCILED: run=run-2 state=stop_pending reason=cgroup_populated: stop requested, cleanup not con…
-(+2 more conditions, listed in the transcript)
+STALE: watch_only (start disabled; stop and reads work): refresh failed: run.list answered control_…
+UNCERTAIN: stop not confirmed for run=run-1: reason=cgroup_populated; run may still be running
 runs:
 > run-1 state=stop_pending engine=codex tenant=t1 attached
   run-2 state=stop_pending engine=codex tenant=t1
@@ -107,7 +108,6 @@ runs:
 -- output run=run-1 (untrusted engine text, display only) --
 │ engine says ⟦OSC 0⟧hi
 │ ⟦OSC 52⟧done
-│
 │
 │
 │
@@ -128,7 +128,8 @@ status=control_api_unavailable method=run.status detail=ConnectionError
 UNAVAILABLE: control API unavailable: ConnectionError
 UNRECONCILED: run=run-1 state=stop_pending reason=cgroup_populated: stop requested, cleanup not con…
 UNRECONCILED: run=run-2 state=stop_pending reason=cgroup_populated: stop requested, cleanup not con…
-(+2 more conditions, listed in the transcript)
+STALE: watch_only (start disabled; stop and reads work): refresh failed: run.list answered control_…
+UNCERTAIN: stop not confirmed for run=run-1: reason=cgroup_populated; run may still be running
 runs:
 > run-1 state=stop_pending engine=codex tenant=t1 attached
   run-2 state=stop_pending engine=codex tenant=t1
@@ -149,7 +150,6 @@ runs:
 │
 │
 │
-│
 error 4: refused locally: start while watch_only (refresh failed: run.list answered control_api_una…
 stop run=nope: control API answered run_unknown
 recursion: j/k select  a attach  r refresh  s stop  : command  q close (runs keep going)
@@ -159,7 +159,8 @@ status=control_api_unavailable method=run.status detail=ConnectionError
 UNAVAILABLE: control API unavailable: ConnectionError
 UNRECONCILED: run=run-1 state=stop_pending reason=cgroup_populated: stop requested, cleanup not con…
 UNRECONCILED: run=run-2 state=stop_pending reason=cgroup_populated: stop requested, cleanup not con…
-(+2 more conditions, listed in the transcript)
+STALE: watch_only (start disabled; stop and reads work): refresh failed: run.list answered control_…
+UNCERTAIN: stop not confirmed for run=run-1: reason=cgroup_populated; run may still be running
 runs:
 > run-1 state=stop_pending engine=codex tenant=t1 attached
   run-2 state=stop_pending engine=codex tenant=t1
@@ -167,7 +168,6 @@ runs:
 
 
 -- output run=run-1 (untrusted engine text, display only) --
-│ flood line 486
 │ flood line 487
 │ flood line 488
 │ flood line 489

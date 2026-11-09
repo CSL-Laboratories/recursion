@@ -10,6 +10,9 @@
   renderer. It reads one CLI-grammar command per line and only appends text lines (no redraw, no cursor
   movement), so no error is redrawn away.
 
+``--no-color`` turns colour off like ``NO_COLOR`` does. Usage errors and a missing API client go to
+stderr; stdout carries only the screen or the line-mode transcript.
+
 All three read the app's one event log. Ctrl-C or ``q`` closes the TUI; that sends nothing and stops
 no run.
 """
@@ -31,8 +34,8 @@ from recursion_core.tui.view import InlinePainter, to_ansi
 
 _KEYS = {"\r": "enter", "\n": "enter", "\x7f": "backspace", "\x08": "backspace", "\x1b": "esc",
          "\x1b[A": "up", "\x1b[B": "down"}
-FLAGS = {"--plain": "plain", "--screen-reader": "plain", "--no-alt-screen": "no_alt_screen"}
-USAGE = "usage: recursion-tui [--plain | --screen-reader] [--no-alt-screen]"
+FLAGS = {"--plain": "plain", "--screen-reader": "plain", "--no-alt-screen": "no_alt_screen", "--no-color": "no_color"}
+USAGE = "usage: recursion-tui [--plain | --screen-reader] [--no-alt-screen] [--no-color]"
 
 
 class LogReader:
@@ -106,9 +109,12 @@ class Tty:
 
 
 def interactive(api, stdout: TextIO, environ: Mapping[str, str], terminal, *, alt_screen: bool = True,
-                on_app: Callable[[TuiApp], None] | None = None) -> int:
-    size = terminal.size()
-    app = TuiApp(api, clock=time.monotonic, environ=environ, width=size.columns, height=size.lines)
+                on_app: Callable[[TuiApp], None] | None = None, stderr: TextIO | None = None) -> int:
+    def size() -> tuple[int, int]:  # polled every tick: a resize gets a frame that fits (no signal handler)
+        now = terminal.size()
+        return now.columns, now.lines
+
+    app = TuiApp(api, clock=time.monotonic, environ=environ, width=size()[0], height=size()[1])
     if on_app is not None:
         on_app(app)
 
@@ -118,12 +124,20 @@ def interactive(api, stdout: TextIO, environ: Mapping[str, str], terminal, *, al
             stdout.flush()
 
     if alt_screen:
-        loop = Loop(app, api, sink=lambda frame: write(to_ansi(frame, app.color)))
+        painted = [(app.width, app.height)]
+
+        def paint(frame) -> None:
+            now = (app.width, app.height)
+            clear = "\x1b[2J" if now != painted[0] else ""  # a new size: no row of the old layout stays
+            painted[0] = now
+            write(clear + to_ansi(frame, app.color))
+
+        loop = Loop(app, api, sink=paint, size=size)
         write("\x1b[?1049h\x1b[?25l")
     else:  # the full-screen painter homes the cursor and clears below; inline mode never uses it
         painter, reader = InlinePainter(app.color), LogReader(app)
         loop = Loop(app, api, sink=lambda frame: write(painter.paint(reader.new_lines(), app.live_rows())),
-                    render=lambda: [])
+                    render=lambda: [], size=size)
     try:
         with terminal.cbreak():
             loop.start()
@@ -141,22 +155,24 @@ def interactive(api, stdout: TextIO, environ: Mapping[str, str], terminal, *, al
             write(painter.end(reader.new_lines()))
     if alt_screen:
         for line in app.errors:  # the error log survives leaving the alternate screen
-            print(f"error: {line}", file=sys.stderr)
+            print(f"error: {line}", file=stderr or sys.stderr)
     return 0
 
 
 def main(argv: list[str], api_factory: Callable[[], object] | None, *, stdin: TextIO | None = None,
          stdout: TextIO | None = None, environ: Mapping[str, str] | None = None,
-         clock: Callable[[], float] = time.monotonic, terminal=None) -> int:
-    stdin, stdout = stdin or sys.stdin, stdout or sys.stdout
+         clock: Callable[[], float] = time.monotonic, terminal=None, stderr: TextIO | None = None) -> int:
+    stdin, stdout, stderr = stdin or sys.stdin, stdout or sys.stdout, stderr or sys.stderr
     environ = os.environ if environ is None else environ
     unknown = [a for a in argv if a not in FLAGS]
-    if unknown:
-        print(f"usage error: unrecognized arguments: {' '.join(unknown)}; {USAGE}", file=stdout)
+    if unknown:  # diagnostics go to stderr, never into the transcript stream
+        print(f"usage error: unrecognized arguments: {' '.join(unknown)}; {USAGE}", file=stderr)
         return 2
     modes = {FLAGS[a] for a in argv}
+    if "no_color" in modes:
+        environ = {**environ, "NO_COLOR": "1"}
     if api_factory is None:
-        print("status=control_api_unavailable: no control API client was given; nothing sent", file=stdout)
+        print("status=control_api_unavailable: no control API client was given; nothing sent", file=stderr)
         return 1
     api = api_factory()
 
@@ -165,4 +181,5 @@ def main(argv: list[str], api_factory: Callable[[], object] | None, *, stdin: Te
 
     if "plain" in modes or environ.get("TERM") == "dumb" or not (is_tty(stdin) and is_tty(stdout)):
         return plain(api, stdin, stdout, environ, clock)
-    return interactive(api, stdout, environ, terminal or Tty(stdin), alt_screen="no_alt_screen" not in modes)
+    return interactive(api, stdout, environ, terminal or Tty(stdin), alt_screen="no_alt_screen" not in modes,
+                       stderr=stderr)

@@ -38,6 +38,29 @@ class StopTest(unittest.TestCase):
         self.assertEqual((res["code"], res["reason"]), (a.PENDING, "cleanup_error:PermissionError"))
         self.assertEqual(kill.confirms, [])
 
+    def test_failed_cleanup_request_is_retried_on_the_next_stop(self) -> None:
+        # Devin r4503746546: a request that never went out must not leave the run stranded as pending.
+        kill = FakeKillTree([EMPTY], request_error=PermissionError())
+        api, registry, _, _ = make_api(kill)
+        run = started(api)
+        self.assertEqual(api.call("run.stop", {"run_id": run})["reason"], "cleanup_error:PermissionError")
+        self.assertIs(registry.get(run)["stop"]["requested"], False)
+        kill.request_error = None  # the transient error clears
+        res = api.call("run.stop", {"run_id": run})
+        self.assertEqual(res["code"], a.STOPPED)
+        self.assertEqual(len(kill.requests), 2)  # the failed attempt, then the retry
+        self.assertEqual(len(kill.confirms), 1)
+        self.assertIs(registry.get(run)["stop"]["requested"], True)
+
+    def test_issued_cleanup_request_is_not_resent_while_pending(self) -> None:
+        kill = FakeKillTree([POPULATED, EMPTY])
+        api, registry, _, _ = make_api(kill)
+        run = started(api)
+        self.assertEqual(api.call("run.stop", {"run_id": run})["code"], a.PENDING)
+        self.assertIs(registry.get(run)["stop"]["requested"], True)
+        self.assertEqual(api.call("run.stop", {"run_id": run})["code"], a.STOPPED)
+        self.assertEqual(len(kill.requests), 1)
+
     def test_repeat_stop_on_stopped_run_sends_nothing(self) -> None:
         api, _, kill, _ = make_api(FakeKillTree([EMPTY]))
         run = started(api)
@@ -108,6 +131,27 @@ class ReadsAndStartTest(unittest.TestCase):
         self.assertEqual(len(starter.calls), 1)
         self.assertEqual(registry.get("run-1")["state"], "running")
         self.assertEqual(api.call("run.start", {"tenant": "t1"})["code"], a.REQUEST_INVALID)
+
+    def test_client_key_is_scoped_to_the_tenant(self) -> None:
+        # Devin r4503746563: another tenant reusing a key gets its own run.
+        api, registry, _, starter = make_api()
+        a_run = api.call("run.start", {"tenant": "A", "engine": "codex", "prompt": "p", "client_key": "daily"})
+        b_run = api.call("run.start", {"tenant": "B", "engine": "codex", "prompt": "p", "client_key": "daily"})
+        self.assertEqual((a_run["duplicate"], b_run["duplicate"]), (False, False))
+        self.assertNotEqual(a_run["run"]["run_id"], b_run["run"]["run_id"])
+        self.assertEqual(b_run["run"]["tenant"], "B")
+        self.assertEqual(len(starter.calls), 2)
+
+    def test_reused_client_key_with_different_request_is_refused(self) -> None:
+        api, registry, _, starter = make_api()
+        api.call("run.start", {"tenant": "t1", "engine": "codex", "prompt": "p", "client_key": "k"})
+        for changed in ({"engine": "claude_code"}, {"prompt": "other"}):
+            with self.subTest(changed=changed):
+                res = api.call("run.start", {"tenant": "t1", "engine": "codex", "prompt": "p",
+                                             "client_key": "k", **changed})
+                self.assertEqual(res, {"code": a.REQUEST_INVALID, "detail": "client_key_reused"})
+        self.assertEqual(len(starter.calls), 1)
+        self.assertEqual(len(registry.list()), 1)
 
     def test_start_failure_is_typed(self) -> None:
         def refuse(params: dict) -> dict:

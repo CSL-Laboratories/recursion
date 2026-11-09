@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from recursion_core.gui import compose
 from recursion_core.gui.client import ACTIONS, READS, ControlClient, ControlError
 from recursion_core.gui.inventory import BARS, REQUIRED, assess, coverage_gaps
+from recursion_core.gui.panels import filter_venue_rows
 from recursion_core.gui.tests.fakes import wsgi_transport
 from recursion_core.gui.tests.test_surface import GuiHarness, HOST, ORIGIN
 
@@ -264,3 +265,101 @@ class PanelTests(GuiHarness):
         self.assertEqual(status, "200 OK")
         self.assertIn(plugin.PANELS[0]["title"], body)
         self.assertEqual([c[2]["command"] for c in self.api.calls], list(plugin.PANELS[0]["reads"]))
+
+    def test_paper_panel_keeps_paper_stock_and_paper_keys_as_one_book(self):
+        # The page filter matches the paper book: paper rows, stock rows, and paper_* keys
+        # (stock_* too, the other label's prefix). kalshi_demo and other venues stay out.
+        # Unlabelled response-level errors and provenance still show.
+        rows = [
+            {"venue": "paper", "symbol": "PAPER-ROW-1"},
+            {"venue": "stock", "symbol": "STOCK-ROW-1"},
+            {"venue": "kalshi_demo", "symbol": "KXDEMO-SECRET"},
+            {"venue": "kalshi", "symbol": "KALSHI-SECRET"},
+            {"venue": "coinbase", "symbol": "COINBASE-SECRET"},
+            {"venue": "gemini", "symbol": "GEMINI-SECRET"},
+            {"venue": "Paper", "symbol": "CASE-SECRET"},
+            {"symbol": "UNLABELLED-SECRET"},
+        ]
+        payload = {
+            "errors": [{"code": "ERR-MARKER-515151"}],
+            "provenance": {"source": "PROV-MARKER-626262"},
+            "paper_cash_minor": 100000,
+            "kalshi_demo_yes_price": "4242.17",
+            "gemini_balance": "GEMINI-KEY-SECRET",
+            "result": {
+                "paper_open_orders": 2,
+                "stock_buying_power_minor": 50000,
+                "rows": rows,
+                "paper_rows": [
+                    {"venue": "kalshi_demo", "symbol": "NESTED-KX-SECRET"},
+                    {"venue": "paper", "symbol": "NESTED-PAPER-ROW"},
+                ],
+            },
+        }
+        for declared, venue_use in (("stock", "paper:own_trading"), ("paper", None)):
+            panel = {"id": "p", "title": "Paper", "reads": [READS[0]], "venue": declared}
+            if venue_use is not None:
+                panel["venue_use"] = venue_use
+            self.mount([panel])
+            self.api.extra[READS[0]] = payload
+            kept, withheld = filter_venue_rows(payload, declared)
+            self.assertTrue(withheld)
+            self.assertEqual(kept["paper_cash_minor"], 100000)
+            self.assertEqual(kept["result"]["paper_open_orders"], 2)
+            self.assertEqual(kept["result"]["stock_buying_power_minor"], 50000)
+            self.assertEqual([row["symbol"] for row in kept["result"]["rows"]],
+                             ["PAPER-ROW-1", "STOCK-ROW-1"])
+            self.assertEqual([row["symbol"] for row in kept["result"]["paper_rows"]],
+                             ["NESTED-PAPER-ROW"])
+            self.assertEqual(kept["errors"], payload["errors"])
+            self.assertEqual(kept["provenance"], payload["provenance"])
+            self.assertNotIn("kalshi_demo_yes_price", kept)
+            self.assertNotIn("gemini_balance", kept)
+            body = self.request("GET", "/panel", query="id=p")[2]
+            for shown in ("PAPER-ROW-1", "STOCK-ROW-1", "NESTED-PAPER-ROW", "paper_cash_minor",
+                          "paper_open_orders", "stock_buying_power_minor", "ERR-MARKER-515151",
+                          "PROV-MARKER-626262", "filtered to the paper book",
+                          "Withheld: data not in the paper book"):
+                self.assertIn(shown, body)
+            for hidden in ("KXDEMO-SECRET", "KALSHI-SECRET", "COINBASE-SECRET", "GEMINI-SECRET",
+                           "CASE-SECRET", "UNLABELLED-SECRET", "NESTED-KX-SECRET", "4242.17",
+                           "GEMINI-KEY-SECRET", "filtered to <code>%s</code>" % declared):
+                self.assertNotIn(hidden, body)
+            self.assertEqual(len(payload["result"]["rows"]), 8)
+        labelled = dict(payload, provenance={"venue": "kalshi_demo", "source": "KX-PROV-SECRET"})
+        self.mount([{"id": "p", "title": "Paper", "reads": [READS[0]], "venue": "stock"}])
+        self.api.extra[READS[0]] = labelled
+        self.assertNotIn("KX-PROV-SECRET", self.request("GET", "/panel", query="id=p")[2])
+        paper_prov = dict(payload, provenance={"venue": "paper", "source": "PAPER-PROV-OK"})
+        self.api.extra[READS[0]] = paper_prov
+        self.assertIn("PAPER-PROV-OK", self.request("GET", "/panel", query="id=p")[2])
+
+    def test_kalshi_panel_does_not_keep_the_paper_book(self):
+        self.mount([{"id": "k", "title": "Kalshi", "reads": [READS[0]], "venue": "kalshi"}])
+        payload = {
+            "errors": [{"code": "ERR-MARKER-515151"}],
+            "provenance": {"source": "PROV-MARKER-626262"},
+            "paper_cash_minor": 100000,
+            "result": {"paper_open_orders": 2, "rows": [
+                {"venue": "paper", "symbol": "PAPER-ROW-1"},
+                {"venue": "stock", "symbol": "STOCK-ROW-1"},
+                {"venue": "kalshi", "symbol": "KALSHI-VISIBLE"},
+                {"venue": "kalshi_demo", "symbol": "KXDEMO-SECRET"},
+            ]},
+        }
+        self.api.extra[READS[0]] = payload
+        kept, _ = filter_venue_rows(payload, "kalshi")
+        self.assertEqual([row["symbol"] for row in kept["result"]["rows"]], ["KALSHI-VISIBLE"])
+        self.assertNotIn("paper_cash_minor", kept)
+        self.assertNotIn("paper_open_orders", kept["result"])
+        self.assertEqual(kept["errors"], payload["errors"])
+        self.assertEqual(kept["provenance"], payload["provenance"])
+        body = self.request("GET", "/panel", query="id=k")[2]
+        self.assertIn("KALSHI-VISIBLE", body)
+        self.assertIn("filtered to <code>kalshi</code>", body)
+        self.assertIn("Withheld: data not labelled <code>kalshi</code>.", body)
+        self.assertIn("ERR-MARKER-515151", body)
+        self.assertIn("PROV-MARKER-626262", body)
+        for hidden in ("PAPER-ROW-1", "STOCK-ROW-1", "KXDEMO-SECRET", "paper_cash_minor",
+                       "paper_open_orders", "100000"):
+            self.assertNotIn(hidden, body)

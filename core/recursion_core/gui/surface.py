@@ -34,7 +34,7 @@ from urllib.parse import parse_qs, quote
 
 from .client import ACTIONS, READS, ControlClient, ControlError
 from .inventory import BARS, assess, coverage_gaps, project
-from .panels import filter_venue_rows, panel_registry
+from .panels import PAPER_BOOK, filter_venue_rows, panel_registry
 
 __all__ = ["Application", "withhold_venue_data"]
 
@@ -82,6 +82,28 @@ def withhold_venue_data(value: object) -> object:
     if type(value) is list:
         return [withhold_venue_data(v) for v in value]
     return value
+
+
+def _venue_scope_sentence(venue: str) -> str:
+    """How the panel note names the post-read filter for a declared venue id."""
+    if venue in PAPER_BOOK:
+        labels = " and ".join("<code>%s</code>" % escape(label) for label in sorted(PAPER_BOOK))
+        prefixes = " and ".join("<code>%s_*</code>" % escape(label) for label in sorted(PAPER_BOOK))
+        return ("filtered to the paper book (%s rows, and %s keys) before display and "
+                "anything from another venue is withheld, except unlabelled response-level "
+                "errors and provenance." % (labels, prefixes))
+    return ("filtered to <code>%s</code> before display and anything not labelled "
+            "with it is withheld, except unlabelled response-level errors and provenance."
+            % escape(venue))
+
+
+def _withheld_note(venue: str) -> str:
+    if venue in PAPER_BOOK:
+        parts = ["<code>%s</code>" % escape(label) for label in sorted(PAPER_BOOK)]
+        parts += ["<code>%s_*</code>" % escape(label) for label in sorted(PAPER_BOOK)]
+        return ('<p role="note">Withheld: data not in the paper book (%s).</p>'
+                % ", ".join(parts))
+    return '<p role="note">Withheld: data not labelled <code>%s</code>.</p>' % escape(venue)
 
 
 class Application:
@@ -297,23 +319,18 @@ class Application:
                      % escape(panel["venue_use"]))
             if panel.get("venue") is not None:
                 body += ('The control API\'s O7 v0 reads take no venue argument; returned data '
-                         'is filtered to <code>%s</code> before display and anything not labelled '
-                         'with it is withheld, except unlabelled response-level errors and '
-                         'provenance. The GUI redacts only fields the control API marks with '
+                         'is %s The GUI redacts only fields the control API marks with '
                          'a venue-data switch that is not on; O7 v0 reports no switch state for '
                          'venue-labelled rows, so their clearance is the control API\'s to '
                          'enforce.</p>'
-                         % escape(panel["venue"]))
+                         % _venue_scope_sentence(panel["venue"]))
             else:
                 body += ('The control API\'s O7 v0 reads take no venue argument, so the results '
                          'below are not scoped to this venue. The GUI redacts only fields the '
                          'control API marks with a venue-data switch that is not on.</p>')
         elif panel.get("venue") is not None:
             body += ('<p role="note">The control API\'s O7 v0 reads take no venue argument; '
-                     'returned data is filtered to <code>%s</code> before display and anything '
-                     'not labelled with it is withheld, except unlabelled response-level errors '
-                     'and provenance.</p>'
-                     % escape(panel["venue"]))
+                     'returned data is %s</p>' % _venue_scope_sentence(panel["venue"]))
         for command in panel["reads"]:
             body += "<section><h3>%s</h3>" % escape(_LABELS[command])
             try:
@@ -323,8 +340,7 @@ class Application:
                 else:
                     shown, withheld = filter_venue_rows(data, panel["venue"])
                     if withheld:
-                        body += ('<p role="note">Withheld: data not labelled <code>%s</code>.</p>'
-                                 % escape(panel["venue"]))
+                        body += _withheld_note(panel["venue"])
                     body += self._o7_view(command, data, shown)
             except ControlError as exc:
                 body += '<p role="status">Unavailable: %s</p>' % escape(exc.code)

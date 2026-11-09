@@ -160,7 +160,7 @@ token. Tests inject a fake API/device door and prove a real GET returns the page
 Control-API credential/pairing integration remains with #327, not claimed here.
 
 For an installed Cockpit plugin, configure the composition root with the explicit
-trusted factory `--plugin cockpit.gui:registry` (Cockpit's `engine` must be on the
+trusted factory `--plugin cockpit.gui.panels:registry` (Cockpit's `engine` must be on the
 module path). The root passes the registry's plain `required`/`panels` mappings to
 `recursion_core.gui.compose`; Cockpit does not import Recursion. `/panel?id=...`
 renders only the named O7 reads, with the shared venue-data filter, no panel order

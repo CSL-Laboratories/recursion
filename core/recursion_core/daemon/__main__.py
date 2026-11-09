@@ -69,7 +69,7 @@ def cli():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gui-port", type=int, default=8765)
     parser.add_argument("--plugin", action="append", default=[], metavar="MODULE:REGISTRY",
-                        help="explicit trusted plugin registry factory, e.g. cockpit.gui:registry")
+                        help="explicit trusted plugin registry factory, e.g. cockpit.gui.panels:registry")
     args = parser.parse_args()
     require_free_threaded()
     plugins = []

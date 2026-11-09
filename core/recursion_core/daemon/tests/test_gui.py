@@ -1,5 +1,7 @@
 """Real loopback HTTP requests through the daemon's GUI composition root."""
 from http.client import HTTPConnection
+import importlib
+from pathlib import Path
 from unittest import TestCase, mock
 import socket
 from types import SimpleNamespace
@@ -109,12 +111,30 @@ class LoopbackTests(TestCase):
         with mock.patch.object(entry, "require_free_threaded") as check, \
              mock.patch.object(entry, "importlib") as imports, \
              mock.patch.object(entry, "main") as main, \
-             mock.patch("sys.argv", ["daemon", "--plugin", "cockpit.gui:registry", "--gui-port", "0"]):
+             mock.patch("sys.argv", ["daemon", "--plugin", "cockpit.gui.panels:registry", "--gui-port", "0"]):
             imports.import_module.return_value = SimpleNamespace(registry=lambda: plugin)
             entry.cli()
-            imports.import_module.assert_called_once_with("cockpit.gui")
+            imports.import_module.assert_called_once_with("cockpit.gui.panels")
             main.assert_called_once_with(plugins=[plugin], port=0)
             self.assertEqual(check.call_count, 3)
+
+    def test_cli_documented_cockpit_plugin_imports_for_real(self):
+        # Unmocked import of the path documented in --help and the README.
+        try:
+            importlib.import_module("cockpit.gui.panels")
+        except ModuleNotFoundError as exc:
+            if exc.name not in {"cockpit", "cockpit.gui", "cockpit.gui.panels"}:
+                raise
+            self.skipTest("run with Cockpit #318 engine on PYTHONPATH for cross-repo integration")
+        documented = "cockpit.gui.panels:registry"
+        self.assertIn(documented, Path(entry.__file__).read_text())  # the --help example
+        with mock.patch.object(entry, "require_free_threaded"), \
+             mock.patch.object(entry, "main") as main, \
+             mock.patch("sys.argv", ["daemon", "--plugin", documented, "--gui-port", "0"]):
+            entry.cli()
+        plugin, = main.call_args.kwargs["plugins"]
+        self.assertIn("panels", plugin)
+        self.assertTrue(plugin["panels"])
 
     def test_service_entry_point_starts_and_closes_gui(self):
         plugin = {"panels": []}

@@ -171,6 +171,30 @@ class ApiKeyAndPassthroughTest(unittest.TestCase):
         self.assertEqual(h.handle(req)["code"], c.LAUNCH_REFUSED)
         self.assertEqual(h.launcher.calls, [])
 
+    def test_passthrough_without_its_switch_or_credential_refuses_before_launch(self) -> None:
+        # Without the method's own switch claude runs on the sign-in; a gateway without its token would get
+        # the sign-in. Either would bill the subscription under another route's label.
+        cases = {
+            "bedrock": ("CLAUDE_CODE_USE_BEDROCK",), "vertex": ("CLAUDE_CODE_USE_VERTEX",),
+            "foundry": ("CLAUDE_CODE_USE_FOUNDRY",), "gateway": ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"),
+        }
+        parent = dict(PARENT, ANTHROPIC_BASE_URL="https://gw.example")
+        for method, names in cases.items():
+            for name in names:
+                for value in (None, "", "0", "false"):
+                    h = Harness([claude_ok()])
+                    env = dict(parent)
+                    if value is None:
+                        env.pop(name)
+                    else:
+                        env[name] = value
+                    h.service._adapters["claude_code"]._parent_env = env
+                    req = request(kind="passthrough", conn_id=f"user-{method}")
+                    req["route"]["connection"]["method"] = method
+                    res = h.handle(req)
+                    self.assertEqual(res["code"], c.LAUNCH_REFUSED, (method, name, value))
+                    self.assertEqual(h.launcher.calls, [], (method, name, value))
+
     def test_passthrough_needs_method_and_is_claude_code_only(self) -> None:
         self.assertEqual(Harness([]).handle(request(kind="passthrough"))["code"], c.REQUEST_INVALID)
         req = request(engine="codex", kind="passthrough")

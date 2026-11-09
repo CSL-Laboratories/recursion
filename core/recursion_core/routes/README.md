@@ -74,7 +74,9 @@ run's environment changes:
   `foundry` or `gateway`): that method's own variables (names from Claude Code's public docs) pass through
   unchanged for that run, with the base allowlist and the user's sign-in; nothing else from the daemon's
   environment does (no other engine's key, no stray `ANTHROPIC_API_KEY`). A method with no listed
-  variables is `launch_refused`. `--bare` is the user's choice there too. `--bare` is refused only on the
+  variables is `launch_refused`, and so is a method whose own switch or credential is unset
+  (`CLAUDE_CODE_USE_BEDROCK` / `_VERTEX` / `_FOUNDRY`; for `gateway` both `ANTHROPIC_BASE_URL` and
+  `ANTHROPIC_AUTH_TOKEN`): without it the run would fall back to the sign-in and bill the subscription. `--bare` is the user's choice there too. `--bare` is refused only on the
   subscription route. No route drops `CLAUDE_CODE_OAUTH_TOKEN`, and the parent env is never changed.
 - The adapter never edits settings or credential files, never sets `DISABLE_LOGIN_COMMAND`, and never
   sets, stores or reads `CLAUDE_CODE_OAUTH_TOKEN`. The binary is `claude` itself; its hash and version are

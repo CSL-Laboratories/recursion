@@ -70,6 +70,16 @@ PASSTHROUGH_METHOD_ENV = {
 }
 # Per-model Vertex region overrides (VERTEX_REGION_CLAUDE_<model>) are a documented name family.
 PASSTHROUGH_METHOD_PREFIX = {"vertex": ("VERTEX_REGION_CLAUDE_",)}
+# The variables that make the run actually use the picked method. Without them claude falls back to the
+# user's sign-in, so a route labelled Bedrock or gateway would bill the subscription (and a gateway would
+# be handed the sign-in): refused before launch instead.
+PASSTHROUGH_METHOD_REQUIRED = {
+    "bedrock": ("CLAUDE_CODE_USE_BEDROCK",),
+    "vertex": ("CLAUDE_CODE_USE_VERTEX",),
+    "foundry": ("CLAUDE_CODE_USE_FOUNDRY",),
+    "gateway": ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"),
+}
+_OFF = ("", "0", "false")
 
 
 class ClaudeCodeAdapter(RouteAdapter):
@@ -117,6 +127,11 @@ class ClaudeCodeAdapter(RouteAdapter):
             names = PASSTHROUGH_METHOD_ENV.get(method) if isinstance(method, str) else None
             if names is None:
                 raise c.RouteError(c.LAUNCH_REFUSED, f"passthrough method {scalar(method)} has no listed variables")
+            missing = [n for n in PASSTHROUGH_METHOD_REQUIRED[method]
+                       if self._parent_env.get(n, "").strip().lower() in _OFF]
+            if missing:
+                raise c.RouteError(c.LAUNCH_REFUSED, f"passthrough method {method} needs {', '.join(missing)} "
+                                   "set; without it the run would use the sign-in instead")
             prefixes = PASSTHROUGH_METHOD_PREFIX.get(method, ())
             names += tuple(sorted(n for n in self._parent_env if prefixes and n.startswith(prefixes)))
             return child_env(self._parent_env, extra_names=USER_KEEP_ENV + names)

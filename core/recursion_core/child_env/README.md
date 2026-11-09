@@ -15,9 +15,10 @@ running core, and not reviewed or accepted.
   `CLAUDE_CODE_CERT_STORE` (PRODUCT.md 055cc7a5 section 3.8, C1-46). `ALL_PROXY` meets the proxy
   rule with SOCKS schemes allowed and counts as a set proxy for the `NO_PROXY` rule; the client
   cert and key meet the file rule when inherited; `XDG_RUNTIME_DIR` meets the directory rule;
-  `CLAUDE_CODE_CERT_STORE` must be a comma list of `bundled` / `system`. The client private
-  key and its passphrase are carried from the parent and cannot be set by an override
-  (`override_denied`).
+  `CLAUDE_CODE_CERT_STORE` must be a comma list of `bundled` / `system`. The client
+  certificate, its private key and the passphrase are carried from the parent and cannot be
+  set by an override (`override_denied`); for a Codex child the certificate name is not on
+  the allowlist at all (`override_not_allowed`).
 - `CLAUDE_CODE_SIMPLE` is on the Claude scrub list by name (PRODUCT.md 055cc7a5 section 3.3), so
   it never reaches a Claude Code child and an override naming it is refused.
 - The user's own `CLAUDE_CODE_OAUTH_TOKEN` reaches a Claude Code child unchanged when the

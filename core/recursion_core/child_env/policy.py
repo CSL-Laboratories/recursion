@@ -19,8 +19,8 @@ replacement. It builds the child environment from nothing:
   ``all_proxy`` and ``XDG_RUNTIME_DIR`` for both engines, and Claude Code's mTLS and cert-store
   names (``CLAUDE_CODE_CLIENT_CERT``, ``_CLIENT_KEY``, ``_CLIENT_KEY_PASSPHRASE``,
   ``CLAUDE_CODE_CERT_STORE``, ``network-config.md:64-105``) for the Claude profile, each under
-  the same value rules as its peers. An override cannot set the client private key or its
-  passphrase; the parent's own values are still carried;
+  the same value rules as its peers. An override cannot set the client certificate, its
+  private key or the passphrase; the parent's own values are still carried;
 * the user's own ``CLAUDE_CODE_OAUTH_TOKEN`` passes through to a Claude child unchanged
   (PRODUCT.md 055cc7a5 section 3.3, Nov 8 fleet correction: nothing removes a built-in sign-in
   method from every run). It is never checked, logged or settable by an override; absent in the
@@ -143,6 +143,10 @@ _DENIED = re.compile(r"(API_?KEY|SECRET|TOKEN|PASSWORD|PASSPHRASE|BASE_URL|_PAT$
 # Private-key paths the pattern misses. An override must not point the child at a different key
 # (Devin r4510867706). The parent's own value still meets the file rule.
 _OVERRIDE_DENIED_NAMES = frozenset({"CLAUDE_CODE_CLIENT_KEY"})
+# The client certificate is the other half of that identity: with the key carried from the parent, an override
+# of the cert could only pair another file (the key file itself included) with the operator's key (review of
+# 58e7081f). It is refused where a profile carries the name; elsewhere the name is simply not allowed.
+_CARRIED_ONLY_NAMES = frozenset({"CLAUDE_CODE_CLIENT_CERT"})
 # Paths that name a different file in the child than in this process (its own cwd, fds, root).
 _PERSPECTIVE = re.compile(r"^/(?:proc|dev/fd|dev/std(?:in|out|err))(?:/|$)")
 _PROXY_URL = re.compile(
@@ -269,6 +273,8 @@ def build_child_env(
             raise EnvRefused(name, "override_denied")
         if name not in profile.allowed:
             raise EnvRefused(name, "override_not_allowed")
+        if name in _CARRIED_ONLY_NAMES:
+            raise EnvRefused(name, "override_denied")
         env[name] = value
 
     for name in [name for name in env if name not in ("PATH", *TEMP_NAMES, *NO_PROXY_NAMES)]:

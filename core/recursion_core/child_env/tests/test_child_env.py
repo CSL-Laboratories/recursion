@@ -187,6 +187,29 @@ class ProfileTests(unittest.TestCase):
             )
         self.assertEqual(("CLAUDE_CODE_CLIENT_KEY", "override_denied"), (caught.exception.name, caught.exception.cause))
 
+    def test_client_certificate_cannot_be_set_by_an_override(self) -> None:
+        # Review of 58e7081f: an override could aim CLAUDE_CODE_CLIENT_CERT at the key file or at another cert.
+        home = Path(_home(self))
+        cert, key, other = home / "cert.pem", home / "key.pem", home / "other.pem"
+        for path in (cert, key, other):
+            path.write_text("not a real key or certificate\n", encoding="ascii")
+            path.chmod(0o600)
+        own = {"PATH": "/usr/bin", "CLAUDE_CODE_CLIENT_CERT": str(cert), "CLAUDE_CODE_CLIENT_KEY": str(key)}
+        for parent in ({"PATH": "/usr/bin"}, {"PATH": "/usr/bin", "CLAUDE_CODE_CLIENT_KEY": str(key)}, own):
+            for target in (key, other):
+                with self.subTest(parent=sorted(parent), target=target.name):
+                    with self.assertRaises(EnvRefused) as caught:
+                        build_child_env("claude_code", home=str(home), parent=parent,
+                                        overrides={"CLAUDE_CODE_CLIENT_CERT": str(target)})
+                    self.assertEqual(("CLAUDE_CODE_CLIENT_CERT", "override_denied"),
+                                     (caught.exception.name, caught.exception.cause))
+        # The operator's own certificate and key are still carried, under the file rule.
+        env = build_child_env("claude_code", home=str(home), parent=own)
+        self.assertEqual((str(cert), str(key)), (env["CLAUDE_CODE_CLIENT_CERT"], env["CLAUDE_CODE_CLIENT_KEY"]))
+        with self.assertRaises(EnvRefused) as caught:
+            build_child_env("claude_code", home=str(home), parent={"PATH": "/usr/bin", "CLAUDE_CODE_CLIENT_CERT": "cert.pem"})
+        self.assertEqual(("CLAUDE_CODE_CLIENT_CERT", "value_relative"), (caught.exception.name, caught.exception.cause))
+
     def test_claude_code_simple_is_scrubbed_by_name(self) -> None:
         # PRODUCT.md 055cc7a5 section 3.3 names CLAUDE_CODE_SIMPLE in the Claude scrub list (review of 3503f6a6, finding 2).
         home = _home(self)

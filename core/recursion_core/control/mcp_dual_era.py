@@ -303,8 +303,10 @@ class DualEraServer:
         if task_id is None:
             return self._error(req_id, -32602, "invalid taskId")
         body = handler(task_id, params)
-        if body is None:
-            return self._error(req_id, -32602, "run_unknown")
+        if isinstance(body, str):
+            # Only an unknown run is invalid params; a registry outage is the server's error, not a
+            # missing task (red-team r3 finding 1).
+            return self._error(req_id, -32602 if body in {"run_unknown", "request_invalid"} else -32603, body)
         return self._ok(req_id, body)
 
     def _task_body(self, rec: Mapping, *, extra: dict | None = None) -> dict:
@@ -325,29 +327,44 @@ class DualEraServer:
             body["statusMessage"] = "pending"
         return body
 
-    def _tasks_get(self, task_id: str, params: Mapping) -> dict:
+    def _tasks_get(self, task_id: str, params: Mapping) -> dict | str:
         answer = self.api.call("run.status", {"run_id": task_id})
         if answer.get("code") != "ok":
-            return None  # unknown run: -32602, not a task that failed
+            return _error_code(answer)  # run_unknown: -32602, not a task that failed
         rec = answer["run"]
         extra = {}
         if rec.get("state") == "stopped":
             extra["result"] = {"content": [{"type": "text", "text": "cancelled"}]}
         return self._task_body(rec, extra=extra)
 
-    def _tasks_cancel(self, task_id: str, params: Mapping) -> dict:
+    def _tasks_cancel(self, task_id: str, params: Mapping) -> dict | str:
         # Cooperative cancel through the shared Stop path. No notifications/cancelled.
-        if self.api.call("run.status", {"run_id": task_id}).get("code") != "ok":
-            return None  # unknown run: -32602; nothing is sent to the Stop path
+        before = self.api.call("run.status", {"run_id": task_id})
+        if before.get("code") != "ok":
+            return _error_code(before)  # nothing is sent to the Stop path
         answer = self.api.call("run.stop", {"run_id": task_id})
+        if answer.get("code") not in {"stopped", "pending"}:
+            return _error_code(answer)  # run.stop sent nothing (unknown run or registry down at its read)
         status_answer = self.api.call("run.status", {"run_id": task_id})
-        if status_answer.get("code") != "ok":
-            return None
-        rec = status_answer["run"]
+        if status_answer.get("code") == "ok":
+            rec = status_answer["run"]
+        else:
+            # The Stop was attempted but the record cannot be re-read: the run.stop answer is the truth
+            # (S6), so an unconfirmed Stop still reads working + "pending" (red-team r3 finding 1).
+            state = "stopped" if answer["code"] == "stopped" else "stop_pending"
+            rec = dict(before["run"], state=state)
+            rec["stop"] = dict(rec.get("stop") or {}, requested_at=self._clock())
         extra = {"statusMessage": answer.get("code")}
         if rec.get("state") == "stopped":
             extra["result"] = {"content": [{"type": "text", "text": "cancelled"}]}
         return self._task_body(rec, extra=extra)
+
+
+def _error_code(answer: Mapping) -> str:
+    """Typed API code carried as the JSON-RPC error message (``run_unknown``, ``registry_unavailable``...)."""
+
+    code = answer.get("code")
+    return code if isinstance(code, str) and code else "internal_error"
 
 
 def modern_params(protocol: str = MODERN_PROTOCOL, *, tasks: bool = False, **extra) -> dict:

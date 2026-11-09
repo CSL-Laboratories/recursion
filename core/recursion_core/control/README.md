@@ -75,7 +75,10 @@ recorded on F60, CSL-762).
   ``tools/call`` and ``tasks/*`` need ``_meta.authorization`` before anything
   reaches ``ControlAPI`` (only the handshakes are open). An unknown ``taskId`` is
   a JSON-RPC ``-32602`` ``run_unknown`` error, and ``tasks/cancel`` sends nothing
-  to the Stop path for it. Task ``createdAt`` comes from the run's
+  to the Stop path for it. A registry outage is a JSON-RPC ``-32603``
+  ``registry_unavailable`` error, not an unknown task; if the registry stops
+  answering after ``tasks/cancel`` sent the Stop, the reply still carries the
+  Stop's own answer (``working`` + ``"pending"`` while unconfirmed). Task ``createdAt`` comes from the run's
   ``started_at``; the default clock is wall time. Live binary wire-capture is
   unmeasured (no Claude Code is spawned). A Stop the core has not confirmed
   reads ``working`` with ``statusMessage: "pending"`` through ``tasks/cancel``,

@@ -27,9 +27,30 @@ from recursion_core.control.mcp_dual_era import (
 from recursion_core.control import mcp_tools
 from recursion_core.control.api import ControlAPI
 from recursion_core.control.registry import POPULATED
-from recursion_core.control.tests.fakes import FakeKillTree, FakeStarter, InMemoryRunRegistry, make_api
+from recursion_core.control.tests.fakes import FakeKillTree, FakeStarter, InMemoryRunRegistry, make_api, started
 
 N = 5
+
+
+class _OutageRegistry(InMemoryRunRegistry):
+    """Answers until ``down`` is set, then every read and write raises (a registry outage)."""
+
+    down = False
+
+    def get(self, run_id: str):
+        if self.down:
+            raise OSError("registry")
+        return super().get(run_id)
+
+    def put(self, record: dict) -> None:
+        if self.down:
+            raise OSError("registry")
+        super().put(record)
+
+    def list(self):
+        if self.down:
+            raise OSError("registry")
+        return super().list()
 
 
 def _server():
@@ -429,6 +450,47 @@ class SameRunAndStopTests(unittest.TestCase):
                 self.assertEqual(reply["error"], {"code": -32602, "message": "run_unknown"})
         self.assertEqual(api.call("run.list", {})["runs"], [])
         self.assertEqual(kill.requests, [])
+
+    def test_cancel_after_the_kill_reads_pending_when_the_registry_stops_answering(self) -> None:
+        # Red-team r3 finding 1: the Stop was sent and is unconfirmed, then the record cannot be re-read.
+        # tasks/cancel keeps run.stop's "pending" (S6) instead of calling the task unknown.
+        registry = _OutageRegistry()
+        api, registry, kill, _ = make_api(FakeKillTree(answers=(POPULATED,)), registry=registry)
+        server = DualEraServer(api)
+        run_id = server.handle({
+            "jsonrpc": "2.0", "id": "s", "method": "tools/call",
+            "params": {"name": "recursion_run_start", "arguments": {"tenant": "t1", "engine": "codex", "prompt": "p"}},
+        })["result"]["structuredContent"]["run"]["run_id"]
+        real_stop = api.stop
+
+        def stop_then_outage(rid: str) -> dict:
+            answer = real_stop(rid)
+            registry.down = True
+            return answer
+
+        api.stop = stop_then_outage
+        cancel = server.handle({"jsonrpc": "2.0", "id": "tc", "method": "tasks/cancel",
+                                "params": modern_params(taskId=run_id)})
+        self.assertEqual(kill.requests, [f"/sys/fs/cgroup/fake/{run_id}"])
+        self.assertNotIn("error", cancel)
+        body = cancel["result"]
+        self.assertEqual((body["taskId"], body["status"], body["statusMessage"]), (run_id, "working", "pending"))
+        self.assertNotIn("result", body)
+        self.assertEqual(server.notifications, [])
+
+    def test_registry_outage_on_tasks_is_an_internal_error_not_an_unknown_task(self) -> None:
+        registry = _OutageRegistry()
+        api, registry, kill, _ = make_api(FakeKillTree(), registry=registry)
+        server = DualEraServer(api)
+        run_id = started(api)
+        registry.down = True
+        for method in ("tasks/get", "tasks/cancel"):
+            with self.subTest(method=method):
+                reply = server.handle({"jsonrpc": "2.0", "id": "o", "method": method,
+                                       "params": modern_params(taskId=run_id)})
+                self.assertNotIn("result", reply)
+                self.assertEqual(reply["error"], {"code": -32603, "message": "registry_unavailable"})
+        self.assertEqual(kill.requests, [])  # nothing is sent to the Stop path while the record is unreadable
 
     def test_task_timestamps_come_from_the_run_record_not_1970(self) -> None:
         # Devin r4506001424: creation reply and later polls agree on the run's real start time.

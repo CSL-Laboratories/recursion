@@ -14,7 +14,7 @@ import unittest
 
 from recursion_core.plugin_security import (
     ApprovalGate, Authority, ConnectionBreaker, CoreHealth, CoreService, Grant, PluginLoader,
-    ReservedEffects, TrustStore, canonical, create_ledger, parse, parse_manifest,
+    ReservedEffects, TrustStore, canonical, create_breaker_store, create_ledger, parse, parse_manifest,
 )
 from recursion_core.plugin_security.signing import backend_available
 
@@ -87,14 +87,17 @@ class Clock:
 
 def profile(installer: Key, *, plugin_id="demo.plugin", source=PLUGIN_SOURCE, profile_id="prof-1",
             account="paper-acct", venue="paper", total=10_000, max_effect=5_000,
-            not_before=0, expires_at=2_000_000, **overrides) -> dict:
+            not_before=0, expires_at=2_000_000, scope=None, **overrides) -> dict:
     body = {
         "schema": "csl-authority-profile/vNext",
         "profile_id": profile_id,
         "issuer": "installer",
         "plugin_id": plugin_id,
         "artifact_sha256": hashlib.sha256(source).hexdigest(),
-        "scope": {"account": account, "venue": venue},
+        "scope": scope if scope is not None else scope_of(account=account, venue=venue),
+        "provider": "fake-provider",
+        "model_version": "fake-model-1",
+        "actions": ["order.submit"],
         "permission": "order",
         "not_before": not_before,
         "expires_at": expires_at,
@@ -104,11 +107,18 @@ def profile(installer: Key, *, plugin_id="demo.plugin", source=PLUGIN_SOURCE, pr
     return {"profile": body, "signature": installer.sign(canonical(body))}
 
 
+def scope_of(*, account="paper-acct", venue="paper", contract_family="fake-futures",
+             adapter="fake-adapter", environment="paper") -> dict:
+    return {"account": account, "venue": venue, "contract_family": contract_family,
+            "adapter": adapter, "environment": environment}
+
+
 def effect(*, kind="order.submit", plugin_id="demo.plugin", run_id="run-1", connection="conn-a",
-           amount=1_000, account="paper-acct", venue="paper", payload=None) -> dict:
+           amount=1_000, account="paper-acct", venue="paper", payload=None, scope=None) -> dict:
     return {
         "schema": "csl-effect/vNext", "kind": kind, "plugin_id": plugin_id, "run_id": run_id,
-        "connection": connection, "scope": {"account": account, "venue": venue},
+        "connection": connection,
+        "scope": scope if scope is not None else scope_of(account=account, venue=venue),
         "currency": "USD", "amount_minor": amount,
         "payload": payload if payload is not None else {"note": "fake"},
     }
@@ -129,7 +139,10 @@ class World:
         self.clock = Clock()
         self.drawn: list = []
         self.health = CoreHealth()
-        self.breaker = ConnectionBreaker()
+        self.breaker_store = os.path.join(self.dir, "breaker.db")
+        create_breaker_store(self.breaker_store)
+        self.breaker = ConnectionBreaker(self.breaker_store)
+        test.addCleanup(self.breaker.close)
         trust = TrustStore({"dev": self.developer.public} if signed else {})
         self.manifest = manifest_bytes(self.developer.public)
         kid = trust.classify(parse_manifest(self.manifest), self.developer.sign(self.manifest))[1]
@@ -157,8 +170,11 @@ class World:
     def call(client, op: str, **args) -> dict:
         return parse(client(canonical({"protocol": "csl-core/v0", "op": op, "args": args})))
 
-    def bind(self, run_id="run-1", connection="conn-a") -> None:
-        assert self.call(self.host, "run.bind", run_id=run_id, connection=connection)["ok"]
+    def bind(self, run_id="run-1", connection="conn-a", plugin_id="demo.plugin",
+             provider="fake-provider", model_version="fake-model-1") -> None:
+        out = self.call(self.host, "run.bind", run_id=run_id, connection=connection,
+                        plugin_id=plugin_id, provider=provider, model_version=model_version)
+        assert out["ok"], out
 
     def approve(self, eff: dict) -> str:
         out = self.call(self.plugin, "effect.request", effect=eff)

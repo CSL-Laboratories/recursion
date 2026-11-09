@@ -6,7 +6,7 @@ Candidate code for build-order item 9. In-process plugins are *not* contained: s
 
 from .approval import EFFECT_SCHEMA, ApprovalGate, check_effect, effect_digest
 from .authority import PROFILE_SCHEMA, Authority, create_ledger
-from .breaker import TYPED_LIMITS, ConnectionBreaker
+from .breaker import TYPED_LIMITS, ConnectionBreaker, create_breaker_store
 from .canonical import canonical, parse
 from .errors import Refused
 from .loader import CoreHealth, LoadedPlugin, PluginLoader
@@ -20,6 +20,7 @@ __all__ = [
     "PROTOCOL_VERSION", "SAME_UID_FALLBACK_POLICY", "SAME_UID_FALLBACK_POLICY_SOURCE",
     "TYPED_LIMITS", "ApprovalGate", "Authority", "ConnectionBreaker",
     "CoreHealth", "CoreService", "GilProbe", "Grant", "LoadedPlugin", "PluginLoader", "Refused",
-    "ReservedEffects", "TrustStore", "canonical", "check_effect", "create_ledger", "effect_digest",
+    "ReservedEffects", "TrustStore", "canonical", "check_effect", "create_breaker_store", "create_ledger",
+    "effect_digest",
     "parse", "parse_manifest", "require_production_runtime", "runtime_report",
 ]

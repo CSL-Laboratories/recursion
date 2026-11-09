@@ -10,10 +10,12 @@ import json
 import unittest
 from pathlib import Path
 
-from recursion_core.plugin_security import PROTOCOL, CoreService, canonical
+from recursion_core.plugin_security import PROTOCOL, CoreService, canonical, parse_manifest
 from recursion_core.plugin_security.tests.support import (
     AGENT_TOKEN, OPERATOR_TOKEN, PLUGIN_TOKEN, FakeGilProbe, World, effect, needs_crypto, profile,
+    scope_of,
 )
+from recursion_core.plugin_security.signing import key_id
 
 
 def _code(response: dict) -> str | None:
@@ -112,6 +114,78 @@ class GateFlowTests(unittest.TestCase):
 
 
 @needs_crypto
+class RevocationTests(unittest.TestCase):
+    """Round 1 finding 1: revoking a key turns off order permission for a running plugin (4.4)."""
+
+    def setUp(self) -> None:
+        self.w = World(self)
+        self.w.load()
+        self.w.bind()
+        self.env = profile(self.w.installer)
+        self.kid = key_id(self.w.developer.public)
+
+    def test_revocation_turns_off_order_for_an_active_plugin(self) -> None:
+        eff = effect()
+        approval = self.w.approve(eff)  # approved before the revocation
+        out = self.w.call(self.w.host, "key.revoke", key_id=self.kid)
+        self.assertEqual(out["result"]["order_off"], ["demo.plugin"])
+        self.assertEqual(_code(self.w.authorize(eff, approval, self.env)), "permission_required")
+        self.assertEqual(_code(self.w.call(self.w.plugin, "effect.request", effect=effect(amount=5))),
+                         "permission_required")
+        perms = self.w.call(self.w.host, "plugin.permissions", plugin_id="demo.plugin")["result"]
+        self.assertEqual(perms["permissions"], ["read", "propose"])  # other grants stay (O12 open)
+        self.assertIn("signer_key_revoked_order_off",
+                      [f["code"] for f in self.w.loader._active["demo.plugin"].findings])
+        # Idempotent, and a key with no active plugin turns nothing off.
+        self.assertEqual(self.w.call(self.w.host, "key.revoke", key_id=self.kid)["result"]["order_off"], [])
+        self.assertEqual(_code(self.w.call(self.w.host, "key.revoke", key_id="nope")), "invalid_key_id")
+
+    def test_revoked_key_loads_unsigned_afterwards(self) -> None:
+        self.w.call(self.w.host, "key.revoke", key_id=self.kid)
+        trust, kid, reason = self.w.loader._trust.classify(parse_manifest(self.w.manifest),
+                                                           self.w.developer.sign(self.w.manifest))
+        self.assertEqual((trust, kid, reason), ("unsigned", None, "signer_key_revoked"))
+
+
+@needs_crypto
+class AuthorityFieldTests(unittest.TestCase):
+    """Round 1 finding 5: the K3 field set is signed, digested and matched exactly."""
+
+    def setUp(self) -> None:
+        self.w = World(self)
+        self.w.load()
+        self.w.bind()
+
+    def _authorize(self, eff, env) -> dict:
+        return self.w.authorize(eff, self.w.approve(eff), env)
+
+    def test_paper_profile_cannot_charge_a_live_effect(self) -> None:
+        env = profile(self.w.installer)
+        self.assertEqual(_code(self._authorize(effect(scope=scope_of(environment="live")), env)),
+                         "profile_scope_mismatch")
+        for field in ("contract_family", "adapter"):
+            with self.subTest(field=field):
+                eff = effect(scope=scope_of(**{field: "other"}))
+                self.assertEqual(_code(self._authorize(eff, env)), "profile_scope_mismatch")
+        self.assertTrue(self._authorize(effect(), env)["ok"])
+
+    def test_environment_is_in_the_approval_digest(self) -> None:
+        paper, live = effect(), effect(scope=scope_of(environment="live"))
+        approval = self.w.approve(paper)
+        self.assertEqual(_code(self.w.authorize(live, approval, profile(self.w.installer))),
+                         "approval_digest_mismatch")
+
+    def test_action_and_model_must_match_the_profile(self) -> None:
+        env = profile(self.w.installer, actions=["order.cancel"])
+        self.assertEqual(_code(self._authorize(effect(), env)), "profile_action_not_permitted")
+        self.w.bind("run-2", "conn-a", model_version="fake-model-2")
+        env = profile(self.w.installer, profile_id="prof-2")
+        self.assertEqual(_code(self._authorize(effect(run_id="run-2"), env)), "profile_model_mismatch")
+        old_scope = effect(scope={"account": "paper-acct", "venue": "paper"})  # pre-K3 effect shape
+        self.assertEqual(_code(self.w.call(self.w.plugin, "effect.request", effect=old_scope)), "effect_scope")
+
+
+@needs_crypto
 class PermissionAndBreakerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.w = World(self, grant_permissions=("read", "propose"))
@@ -128,8 +202,11 @@ class PermissionAndBreakerTests(unittest.TestCase):
         other = self.w.core.client_for("other.plugin")
         self.assertEqual(_code(self.w.call(other, "effect.request", effect=effect(kind="note.post"))),
                          "caller_not_effect_plugin")
-        for op, args in (("run.bind", dict(run_id="r", connection="c")), ("run.fault", dict(run_id="run-1")),
-                         ("breaker.report", dict(connection="conn-a", event_type="plan_limit"))):
+        for op, args in (("run.bind", dict(run_id="r", connection="c", plugin_id="demo.plugin",
+                                           provider="p", model_version="m")),
+                         ("run.fault", dict(run_id="run-1")),
+                         ("breaker.report", dict(connection="conn-a", event_type="plan_limit")),
+                         ("key.revoke", dict(key_id=key_id(self.w.developer.public)))):
             with self.subTest(op=op):
                 self.assertEqual(_code(self.w.call(self.w.plugin, op, **args)), "host_only")
 
@@ -144,12 +221,37 @@ class PermissionAndBreakerTests(unittest.TestCase):
                                     event_type="plan_limit")["result"]["tripped"])
         self.assertEqual(_code(self.w.authorize(eff, approval, None)), "connection_tripped")
         self.assertEqual(_code(self.w.call(self.w.plugin, "effect.request", effect=eff)), "connection_tripped")
-        self.assertTrue(self.w.breaker.reset_after_probe("conn-a", True))
+        self.assertFalse(self.w.breaker.reset_after_probe("conn-a", None, True))  # no lease, no reset
+        self.assertTrue(self.w.breaker.reset_after_probe("conn-a", self.w.breaker.begin_probe("conn-a"), True))
         self.assertTrue(self.w.authorize(eff, approval, None)["ok"])
         eff2 = effect(kind="note.post", amount=0, payload={"n": 2})
         approval2 = self.w.approve(eff2)
         self.w.call(self.w.host, "run.fault", run_id="run-1")
         self.assertEqual(_code(self.w.authorize(eff2, approval2, None)), "run_faulted")
+
+    def test_effect_cannot_cite_a_run_its_plugin_does_not_own(self) -> None:
+        # Round 1 finding 2: a plugin whose own run faulted, or whose connection tripped,
+        # names another plugin's (or the host's) healthy run. Refused, not borrowed.
+        self.w.bind("run-other", "conn-b", plugin_id="other.plugin")
+        self.w.bind("run-host", "conn-b", plugin_id="host")
+        self.w.call(self.w.host, "run.fault", run_id="run-1")
+        self.w.call(self.w.host, "breaker.report", connection="conn-a", event_type="plan_limit")
+        eff = effect(kind="note.post", amount=0)
+        self.assertEqual(_code(self.w.call(self.w.plugin, "effect.request", effect=eff)), "run_faulted")
+        for run_id in ("run-other", "run-host"):
+            with self.subTest(run_id=run_id):
+                borrowed = effect(kind="note.post", amount=0, run_id=run_id, connection="conn-b")
+                self.assertEqual(_code(self.w.call(self.w.plugin, "effect.request", effect=borrowed)),
+                                 "run_not_owned")
+                self.assertEqual(_code(self.w.authorize(borrowed, "apr_x", None)), "run_not_owned")
+
+    def test_run_binding_cannot_change_owner_or_model(self) -> None:
+        for change in (dict(plugin_id="other.plugin"), dict(provider="other"), dict(model_version="m2")):
+            with self.subTest(change=change):
+                args = dict(run_id="run-1", connection="conn-a", plugin_id="demo.plugin",
+                            provider="fake-provider", model_version="fake-model-1")
+                args.update(change)
+                self.assertEqual(_code(self.w.call(self.w.host, "run.bind", **args)), "run_binding_mismatch")
 
     def test_breaker_keys_on_connection_and_only_typed_limits_trip(self) -> None:
         self.w.bind("run-2", "conn-b")
@@ -162,7 +264,8 @@ class PermissionAndBreakerTests(unittest.TestCase):
         ok = self.w.call(self.w.plugin, "effect.request", effect=effect(kind="note.post", run_id="run-2",
                                                                       connection="conn-b"))
         self.assertTrue(ok["ok"])
-        self.assertFalse(self.w.breaker.reset_after_probe("conn-a", False))
+        self.assertFalse(self.w.breaker.reset_after_probe("conn-a", self.w.breaker.begin_probe("conn-a"), False))
+        self.assertTrue(self.w.breaker.tripped("conn-a"))
         self.assertEqual(_code(self.w.call(self.w.plugin, "effect.request", effect=effect(
             kind="note.post", run_id="run-2", connection="conn-a"))), "run_connection_mismatch")
         self.assertEqual(_code(self.w.call(self.w.plugin, "effect.request", effect=effect(
@@ -199,7 +302,8 @@ class ProtocolTests(unittest.TestCase):
              "approval_unknown"),
             ("approval.decide", dict(approval_id="a", digest={"x": 1}, credential="c", decision="approve"),
              "approval_unknown"),
-            ("run.bind", dict(run_id=7, connection="c"), "invalid_run_id"),
+            ("run.bind", dict(run_id=7, connection="c", plugin_id="p", provider="p", model_version="m"),
+             "invalid_run_id"),
             ("breaker.report", dict(connection=["c"], event_type="plan_limit"), "invalid_connection"),
             ("effect.request", dict(effect=[1]), "effect_fields"),
             ("plugin.permissions", dict(plugin_id={"a": 1}), "core_internal_error"),

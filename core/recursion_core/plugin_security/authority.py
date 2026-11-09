@@ -1,8 +1,13 @@
 """Installer-signed authority profiles (lane K3, grill Q28) with a durable spend ledger.
 
 A profile (``csl-authority-profile/vNext``) is the order permission's authority: one
-plugin artifact, one scope (account and venue), a validity window and spending budgets
-in integer minor units. The installer signs the canonical profile bytes with a key made
+plugin artifact; one scope (account, venue, contract family, adapter and environment);
+the provider and model version the proposing run must be bound to; the permitted
+actions (effect kinds); a validity window; and spending budgets in integer minor units.
+Every field is required and matched exactly, so an unknown value fails closed rather
+than selecting a more permissive profile (PRODUCT.md 4.1). Not built yet from the 4.1
+field set: legal perimeter, information restrictions, stop and recovery owners,
+evidence dossier and human receipt. The installer signs the canonical profile bytes with a key made
 on the user's machine. The composition root injects only the installer's *public* key;
 nothing a plugin supplies can become the anchor, and a key on CSL's published list is
 refused as an anchor (the profile is signed on the user's machine, never by CSL).
@@ -30,8 +35,10 @@ t1418u; not yet in PRODUCT.md 055cc7a5). Implementation explanation, not a quote
 the in-process Cockpit plugin holds paper-order permission. Under that
 fallback the signed authority profile is tamper evidence, not a boundary. Paper only;
 live capital stays separately authorised (PRODUCT.md 5.2). This module has one
-``order`` permission and no paper/live distinction (``scope.venue`` is an opaque
-string), so "paper only" is what the installer signs, not a check ``charge`` makes.
+``order`` permission. ``scope.environment`` is signed into the profile and the effect's
+approval digest and must match exactly, so a profile signed for ``paper`` cannot charge
+a ``live`` effect; but the core takes no view on which environment names are allowed,
+so "paper only" is still what the installer signs, not a value ``charge`` refuses.
 """
 
 from __future__ import annotations
@@ -43,6 +50,7 @@ import sqlite3
 import threading
 from typing import Callable
 
+from .approval import SCOPE_FIELDS
 from .canonical import MAX_INT, canonical
 from .errors import Refused
 from .signing import key_id, parse_public_key, verify
@@ -51,10 +59,12 @@ __all__ = ["PROFILE_SCHEMA", "Authority", "create_ledger"]
 
 PROFILE_SCHEMA = "csl-authority-profile/vNext"
 _FIELDS = frozenset({"schema", "profile_id", "issuer", "plugin_id", "artifact_sha256", "scope",
-                     "permission", "not_before", "expires_at", "budgets"})
+                     "provider", "model_version", "actions", "permission", "not_before",
+                     "expires_at", "budgets"})
 _BUDGETS = frozenset({"currency", "max_effect_minor", "total_minor"})
 _ID = re.compile(r"[a-z0-9][a-z0-9_.:-]{0,127}")
 _SCOPE_VALUE = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
+_KIND = re.compile(r"[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+")
 _LEDGER_MAGIC = "csl-authority-ledger/v0"
 
 
@@ -128,9 +138,16 @@ class Authority:
         if type(profile["profile_id"]) is not str or not _ID.fullmatch(profile["profile_id"]):
             raise Refused("profile_id")
         scope = profile["scope"]
-        if (type(scope) is not dict or set(scope) != {"account", "venue"}
+        if (type(scope) is not dict or set(scope) != SCOPE_FIELDS
                 or any(type(v) is not str or not _SCOPE_VALUE.fullmatch(v) for v in scope.values())):
             raise Refused("profile_scope")
+        if any(type(profile[k]) is not str or not _SCOPE_VALUE.fullmatch(profile[k])
+               for k in ("provider", "model_version")):
+            raise Refused("profile_model")
+        actions = profile["actions"]
+        if (type(actions) is not list or not actions or actions != sorted(set(actions))
+                or any(type(a) is not str or not _KIND.fullmatch(a) for a in actions)):
+            raise Refused("profile_actions")
         budgets = profile["budgets"]
         if (type(budgets) is not dict or set(budgets) != _BUDGETS
                 or type(budgets["currency"]) is not str or not re.fullmatch(r"[A-Z]{3}", budgets["currency"])
@@ -142,8 +159,9 @@ class Authority:
             raise Refused("profile_window")
         return profile, hashlib.sha256(raw).hexdigest()
 
-    def charge(self, envelope: object, *, plugin_id: str, artifact_sha256: str, account: str,
-               venue: str, currency: str, amount_minor: object, idempotency_key: str) -> dict:
+    def charge(self, envelope: object, *, plugin_id: str, artifact_sha256: str, scope: dict,
+               kind: str, provider: str, model_version: str, currency: str, amount_minor: object,
+               idempotency_key: str) -> dict:
         """Charge one effect against the profile. Refuses before writing anything if any check fails."""
         profile, digest = self._check_profile(envelope)
         now = self._clock()
@@ -155,8 +173,12 @@ class Authority:
             raise Refused("profile_expired")
         if (profile["plugin_id"], profile["artifact_sha256"]) != (plugin_id, artifact_sha256):
             raise Refused("profile_plugin_mismatch")
-        if (profile["scope"]["account"], profile["scope"]["venue"]) != (account, venue):
+        if profile["scope"] != scope:
             raise Refused("profile_scope_mismatch")
+        if (profile["provider"], profile["model_version"]) != (provider, model_version):
+            raise Refused("profile_model_mismatch")
+        if kind not in profile["actions"]:
+            raise Refused("profile_action_not_permitted")
         if currency != profile["budgets"]["currency"]:
             raise Refused("profile_currency_mismatch")
         if not _int(amount_minor, 1) or amount_minor > MAX_INT:

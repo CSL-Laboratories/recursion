@@ -9,7 +9,8 @@ language-neutral). The core holds no consumer-specific code: which effect kinds 
 which permission, and which permissions need an authority profile, are injected.
 
 ``effect.authorize`` runs the checks in this order and stops at the first refusal:
-core health, caller is the effect's plugin, permission, run and connection (breaker),
+core health, caller is the effect's plugin, permission, run (owned by the caller, on
+the effect's connection, not faulted, connection not tripped),
 the one-use approval for this exact digest, then the authority profile and budgets.
 """
 
@@ -78,7 +79,7 @@ class CoreService:
             raise Refused("effect_kind_unmapped")
         return self._effect_permissions[family]
 
-    def _check_plugin_effect(self, caller: str, effect: dict) -> str:
+    def _check_plugin_effect(self, caller: str, effect: dict) -> tuple[str, dict]:
         self._health.require_healthy()
         check_effect(effect)
         if caller != effect["plugin_id"]:
@@ -86,8 +87,8 @@ class CoreService:
         permission = self._permission_for(effect["kind"])
         if permission not in self._loader.permissions(caller):
             raise Refused("permission_required", permission)
-        self._breaker.check(effect["run_id"], effect["connection"])
-        return permission
+        run = self._breaker.check(effect["run_id"], effect["connection"], caller)
+        return permission, run
 
     def _op_plugin_permissions(self, caller: str, plugin_id: str) -> dict:
         return {"permissions": list(self._loader.permissions(plugin_id))}
@@ -99,7 +100,7 @@ class CoreService:
 
     def _op_effect_authorize(self, caller: str, effect: dict, approval_id: object,
                              authority: object) -> dict:
-        permission = self._check_plugin_effect(caller, effect)
+        permission, run = self._check_plugin_effect(caller, effect)
         if type(approval_id) is not str:
             raise Refused("approval_required")
         digest = self._gate.take(approval_id, effect)
@@ -109,8 +110,8 @@ class CoreService:
                 raise Refused("authority_unconfigured")
             charge = self._authority.charge(
                 authority, plugin_id=caller, artifact_sha256=self._loader.artifact(caller),
-                account=effect["scope"]["account"], venue=effect["scope"]["venue"],
-                currency=effect["currency"], amount_minor=effect["amount_minor"],
+                scope=effect["scope"], kind=effect["kind"], provider=run["provider"],
+                model_version=run["model_version"], currency=effect["currency"], amount_minor=effect["amount_minor"],
                 idempotency_key=approval_id)
         return {"authorized": True, "digest": digest, "charge": charge}
 
@@ -128,15 +129,20 @@ class CoreService:
         if caller != HOST or self._loader.artifact(HOST) is not None:
             raise Refused("host_only")
 
-    def _op_run_bind(self, caller: str, run_id: str, connection: str) -> dict:
+    def _op_run_bind(self, caller: str, run_id: str, connection: str, plugin_id: str,
+                     provider: str, model_version: str) -> dict:
         self._require_host(caller)
-        self._breaker.bind_run(run_id, connection)
+        self._breaker.bind_run(run_id, connection, plugin_id, provider, model_version)
         return {}
 
     def _op_run_fault(self, caller: str, run_id: str) -> dict:
         self._require_host(caller)
         self._breaker.fault_run(run_id)
         return {}
+
+    def _op_key_revoke(self, caller: str, key_id: str) -> dict:
+        self._require_host(caller)
+        return {"order_off": self._loader.revoke_key(key_id)}
 
     def _op_breaker_report(self, caller: str, connection: str, event_type: str) -> dict:
         self._require_host(caller)

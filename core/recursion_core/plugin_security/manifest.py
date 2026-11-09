@@ -20,6 +20,7 @@ PRODUCT.md 4.1 and 4.3 (at 055cc7a5, CSLR-D-011), as implemented here:
 from __future__ import annotations
 
 import re
+import threading
 from dataclasses import dataclass, field
 from types import MappingProxyType
 
@@ -118,7 +119,9 @@ class TrustStore:
     """This install's own trusted developer keys and the revoked-key list it last read.
 
     Built by the composition root from installer-owned configuration, never from a
-    plugin. CSL's key, if present, is one entry like any other.
+    plugin. CSL's key, if present, is one entry like any other. A key revoked while
+    plugins are running goes through ``PluginLoader.revoke_key``, which also turns off
+    order permission for active plugins under that key.
     """
 
     def __init__(self, trusted_keys: dict[str, str], revoked_key_ids: frozenset = frozenset()):
@@ -126,7 +129,13 @@ class TrustStore:
         for label, hex_key in trusted_keys.items():
             keys[key_id(hex_key)] = (label, hex_key)
         self._keys = MappingProxyType(keys)
+        self._lock = threading.Lock()
         self._revoked = frozenset(revoked_key_ids)
+
+    def revoke(self, kid: str) -> None:
+        """Add a key id to the revoked list; later loads classify it as unsigned (4.4)."""
+        with self._lock:
+            self._revoked = self._revoked | {kid}
 
     def classify(self, manifest: Manifest, signature: object) -> tuple[str, str | None, str]:
         """Return ``(trust, signer_key_id, reason)``; trust is ``signed`` or ``unsigned``."""

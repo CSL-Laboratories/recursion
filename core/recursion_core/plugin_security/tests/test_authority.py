@@ -10,17 +10,18 @@ import unittest
 from recursion_core.plugin_security import Authority, Refused, canonical, create_ledger
 from recursion_core.plugin_security.signing import key_id
 from recursion_core.plugin_security.tests.support import (
-    PLUGIN_SOURCE, Clock, Key, needs_crypto, profile, temp_dir,
+    PLUGIN_SOURCE, Clock, Key, needs_crypto, profile, scope_of, temp_dir,
 )
 import hashlib
 
 DIGEST = hashlib.sha256(PLUGIN_SOURCE).hexdigest()
-SCOPE = dict(plugin_id="demo.plugin", artifact_sha256=DIGEST, account="paper-acct", venue="paper",
-             currency="USD")
+SCOPE = dict(plugin_id="demo.plugin", artifact_sha256=DIGEST, kind="order.submit",
+             provider="fake-provider", model_version="fake-model-1", currency="USD")
 
 
-def _charge(auth: Authority, envelope, amount, key, **overrides):
-    return auth.charge(envelope, **{**SCOPE, **overrides}, amount_minor=amount, idempotency_key=key)
+def _charge(auth: Authority, envelope, amount, key, scope=None, **overrides):
+    return auth.charge(envelope, **{**SCOPE, **overrides}, scope=scope or scope_of(),
+                       amount_minor=amount, idempotency_key=key)
 
 
 def _child_charges(path: str, anchor: str, envelope: dict, prefix: str, count: int, out) -> None:
@@ -84,7 +85,9 @@ class AuthorityTests(unittest.TestCase):
     def test_signed_but_invalid_profiles_refused(self) -> None:
         cases = {
             "profile_issuer_or_permission": dict(issuer="csl"),
-            "profile_scope": dict(scope={"account": "a"}),
+            "profile_scope": dict(scope={"account": "a", "venue": "paper"}),
+            "profile_model": dict(model_version=""),
+            "profile_actions": dict(actions=[]),
             "profile_budgets": dict(budgets={"currency": "USD", "max_effect_minor": 9, "total_minor": 5}),
             "profile_window": dict(not_before=5, expires_at=5),
         }
@@ -94,8 +97,9 @@ class AuthorityTests(unittest.TestCase):
 
     def test_scope_expiry_and_binding(self) -> None:
         env = profile(self.installer, not_before=999_000, expires_at=1_000_100)
-        self._refused("profile_scope_mismatch", _charge, self.auth, env, 1, "a", account="other")
-        self._refused("profile_scope_mismatch", _charge, self.auth, env, 1, "b", venue="live")
+        self._refused("profile_scope_mismatch", _charge, self.auth, env, 1, "a",
+                      scope=scope_of(account="other"))
+        self._refused("profile_scope_mismatch", _charge, self.auth, env, 1, "b", scope=scope_of(venue="live"))
         self._refused("profile_plugin_mismatch", _charge, self.auth, env, 1, "c", plugin_id="other.plugin")
         self._refused("profile_plugin_mismatch", _charge, self.auth, env, 1, "d", artifact_sha256="0" * 64)
         self._refused("profile_currency_mismatch", _charge, self.auth, env, 1, "e", currency="EUR")

@@ -29,10 +29,11 @@ import importlib.machinery
 import sys
 import threading
 import types
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .errors import Refused
 from .manifest import Grant, Manifest, ReservedEffects, TrustStore, effective_permissions, parse_manifest
+from .signing import key_id
 from .runtime import GilProbe
 
 __all__ = ["CoreHealth", "LoadedPlugin", "PluginLoader"]
@@ -68,6 +69,7 @@ class LoadedPlugin:
     permissions: tuple
     module: types.ModuleType
     findings: tuple
+    developer_key_id: str | None = None
 
 
 def _finding(stage: str, code: str, severity: str, detail: str = "") -> dict:
@@ -89,6 +91,28 @@ class PluginLoader:
     def permissions(self, plugin_id: str) -> tuple:
         plugin = self._active.get(plugin_id)
         return () if plugin is None or self._health.poisoned else plugin.permissions
+
+    def revoke_key(self, kid: str) -> list[str]:
+        """Revoke a developer key now (PRODUCT.md 4.4) and return the plugin ids it turned off.
+
+        Later loads treat the key as unsigned. Every active plugin whose manifest names that
+        developer key loses ``order`` at once, signed or manually granted, so a stolen key
+        cannot keep trading until the next restart. Its other grants stay (O12 open).
+        Turning order back on is the user's step: a fresh grant and load, never this call.
+        """
+        if type(kid) is not str or not kid.startswith("ed25519:"):
+            raise Refused("invalid_key_id")
+        with self._lock:
+            self._trust.revoke(kid)
+            turned_off = []
+            for plugin_id, plugin in sorted(self._active.items()):
+                if plugin.developer_key_id == kid and "order" in plugin.permissions:
+                    perms = tuple(p for p in plugin.permissions if p != "order")
+                    finding = _finding("active", "signer_key_revoked_order_off", "warn", kid)
+                    self._active[plugin_id] = replace(plugin, permissions=perms,
+                                                      findings=plugin.findings + (finding,))
+                    turned_off.append(plugin_id)
+            return turned_off
 
     def artifact(self, plugin_id: str) -> str | None:
         plugin = self._active.get(plugin_id)
@@ -193,7 +217,7 @@ class PluginLoader:
             raise Refused("plugin_import_failed", type(failure).__name__) from None
         findings.append(_finding("active", "active", "info", "in_process_not_contained"))
         loaded = LoadedPlugin(manifest.plugin_id, manifest.artifact_sha256, trust, kid, label,
-                              perms, module, tuple(findings))
+                              perms, module, tuple(findings), key_id(manifest.developer_key))
         self._active[manifest.plugin_id] = loaded
         self.last_findings = loaded.findings
         return loaded

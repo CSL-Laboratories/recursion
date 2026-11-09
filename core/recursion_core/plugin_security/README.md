@@ -9,14 +9,23 @@ yet called by a running daemon, and not reviewed or accepted.
   key, refuses reserved (effect-owner) credentials and destinations, and reports
   findings at `verify`, `admit`, `stage` and `active`. A bad or untrusted signature loads
   as unsigned; verified is a label, not a gate. After every load attempt it reads
-  `sys._is_gil_enabled()` and poisons the core if the GIL is on.
+  `sys._is_gil_enabled()` and poisons the core if the GIL is on. A key revoked while
+  plugins run (host op `key.revoke`) turns off `order` for every active plugin under
+  that key at once (PRODUCT.md 4.4); turning it back on is a fresh grant and load.
 - `approval.ApprovalGate` draws every approval from the effect's canonical bytes,
   accepts only the `operator_ui` principal, binds the decision to the digest and allows
   one use.
 - `authority.Authority` verifies installer-signed `csl-authority-profile/vNext`
-  profiles against an injected public anchor and enforces scope, window and budgets on a
-  durable SQLite ledger (split, replayed and restarted spending cannot reset a cap).
-- `breaker.ConnectionBreaker` trips per billed connection on typed limits only.
+  profiles against an injected public anchor and enforces scope (account, venue, contract
+  family, adapter, environment), provider and model version, permitted actions, window
+  and budgets on a durable SQLite ledger (split, replayed and restarted spending cannot
+  reset a cap). Every field matches exactly; unknown fails closed. Not built from the 4.1
+  field set: legal perimeter, information restrictions, stop and recovery owners,
+  evidence dossier, human receipt.
+- `breaker.ConnectionBreaker` trips per billed connection on typed limits only and
+  clears only through a one-use, expiring probe lease. Run bindings (connection, owning
+  plugin, provider, model version), faults and trips are kept in an installer-created
+  SQLite store and survive a restart. An effect may cite only a run its own plugin owns.
 - `protocol.CoreService` is the one boundary: canonical JSON bytes in and out
   (`csl-core/v0`, ops in `protocol.json`), so a later Rust core can reuse the tests.
 
@@ -37,9 +46,11 @@ Implementation explanation (not Lucas's quoted words): under the same-uid fallba
 boundary: it binds honest plugins and records what happened, and the mutants above
 still rewrite it. The in-process Cockpit plugin holds paper-order permission on Nov 11.
 Paper only. This fallback grants no live-order permission; live capital stays
-separately authorised (PRODUCT.md 5.2). The code has one `order` permission and does not
-tell paper from live venues (`scope.venue` is an opaque string), so paper only is what
-the installer signs, not a runtime check. The quote is frozen in
+separately authorised (PRODUCT.md 5.2). The code has one `order` permission.
+`scope.environment` is signed into the profile and the approval digest and must match
+exactly, so a `paper` profile cannot charge a `live` effect; but the core does not
+refuse any environment name itself, so paper only is what the installer signs, not a
+runtime check. The quote is frozen in
 `policy.SAME_UID_FALLBACK_POLICY` and `tests/test_o69_policy.py` checks this section
 against it.
 

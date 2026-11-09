@@ -1,7 +1,8 @@
 """Core approval gate (O11, grill Q24): the core draws every approval for any effect.
 
 Domain-neutral. An effect (``csl-effect/vNext``) is a canonical object naming its kind,
-the plugin, the run and connection it came from, its scope, its amount in integer minor
+the plugin, the run and connection it came from, its scope (account, venue, contract
+family, adapter and environment, so paper and live differ in the digest), its amount in integer minor
 units and an opaque ``payload``. The gate never interprets the payload.
 
 * ``request`` stores the effect's canonical bytes (immutable) and hands the core-owned
@@ -44,11 +45,14 @@ from typing import Callable
 from .canonical import canonical
 from .errors import Refused
 
-__all__ = ["EFFECT_SCHEMA", "ApprovalGate", "check_effect", "effect_digest"]
+__all__ = ["EFFECT_SCHEMA", "SCOPE_FIELDS", "ApprovalGate", "check_effect", "effect_digest"]
 
 EFFECT_SCHEMA = "csl-effect/vNext"
 _FIELDS = frozenset({"schema", "kind", "plugin_id", "run_id", "connection", "scope",
                      "currency", "amount_minor", "payload"})
+# The K3 scope an effect names and its digest binds; the authority profile must match it
+# exactly (PRODUCT.md 4.1; K2 binds account, venue and mode).
+SCOPE_FIELDS = frozenset({"account", "venue", "contract_family", "adapter", "environment"})
 _KIND = re.compile(r"[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+")
 OPERATOR = "operator_ui"
 
@@ -64,7 +68,7 @@ def check_effect(effect: object) -> bytes:
     if type(effect["kind"]) is not str or not _KIND.fullmatch(effect["kind"]):
         raise Refused("effect_kind")
     scope = effect["scope"]
-    if type(scope) is not dict or set(scope) != {"account", "venue"} \
+    if type(scope) is not dict or set(scope) != SCOPE_FIELDS \
             or any(type(v) is not str or not v for v in scope.values()):
         raise Refused("effect_scope")
     if type(effect["amount_minor"]) is not int or effect["amount_minor"] < 0:

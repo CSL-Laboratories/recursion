@@ -17,7 +17,9 @@ from recursion_core import plugin_security
 from recursion_core.plugin_security import Authority, Refused, create_ledger
 from recursion_core.plugin_security.manifest import PERMISSIONS
 from recursion_core.plugin_security.policy import SAME_UID_FALLBACK_POLICY, SAME_UID_FALLBACK_POLICY_SOURCE
-from recursion_core.plugin_security.tests.support import PLUGIN_SOURCE, Clock, Key, needs_crypto, profile, temp_dir
+from recursion_core.plugin_security.tests.support import (
+    PLUGIN_SOURCE, Clock, Key, needs_crypto, profile, scope_of, temp_dir,
+)
 
 O69_QUOTE = "it should have permission to run paper testing nov 11 regardless"
 PACKAGE_DIR = os.path.dirname(plugin_security.__file__)
@@ -93,8 +95,9 @@ class NoLivePermissionInCodeTests(unittest.TestCase):
         for i, permission in enumerate(("live_order", "live-order", "live", "order:live")):
             env = profile(installer, permission=permission)
             with self.assertRaises(Refused) as ctx:
-                auth.charge(env, plugin_id="demo.plugin", artifact_sha256=digest, account="paper-acct",
-                            venue="paper", currency="USD", amount_minor=1, idempotency_key="k-%d" % i)
+                auth.charge(env, plugin_id="demo.plugin", artifact_sha256=digest, scope=scope_of(),
+                            kind="order.submit", provider="fake-provider", model_version="fake-model-1",
+                            currency="USD", amount_minor=1, idempotency_key="k-%d" % i)
             self.assertEqual(ctx.exception.code, "profile_issuer_or_permission", permission)
 
 

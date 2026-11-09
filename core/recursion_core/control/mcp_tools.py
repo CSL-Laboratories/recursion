@@ -1,7 +1,7 @@
 """Control MCP tool descriptors and dispatch (CSL-798, candidate). See README.md.
 
 Each tool is one control API method; ``call_tool`` forwards to ``ControlAPI.call`` and adds nothing,
-so the MCP face has no Stop path of its own. Every annotation is set explicitly (PRODUCT.md 398cd812,
+so the MCP face has no Stop path of its own. Every annotation is set explicitly (PRODUCT.md 055cc7a5,
 O41, decided Nov 7 "All picks"; Q48 is recorded on F60, CSL-762):
 
 * read tools: ``readOnlyHint: true``, ``destructiveHint: false``, ``idempotentHint: true``,

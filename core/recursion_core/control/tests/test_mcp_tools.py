@@ -1,4 +1,4 @@
-"""Control MCP descriptors (O41, Q48 as receipted into PRODUCT.md 398cd812) and the Codex snippet."""
+"""Control MCP descriptors (O41, Q48 as receipted into PRODUCT.md 055cc7a5) and the Codex snippet."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ class DescriptorTest(unittest.TestCase):
 
     def test_stop_is_destructive_closed_world_start_is_open_world(self) -> None:
         tools = {t["name"]: t["annotations"] for t in mcp_tools.descriptors()}
-        self.assertIs(tools["recursion_run_stop"]["destructiveHint"], True)  # 398cd812 wins over older F60 wording
+        self.assertIs(tools["recursion_run_stop"]["destructiveHint"], True)  # 055cc7a5 O41 wins over older F60 wording
         self.assertIs(tools["recursion_run_stop"]["openWorldHint"], False)
         self.assertIs(tools["recursion_run_start"]["openWorldHint"], True)
 

@@ -1,7 +1,8 @@
 # control: control API, CLI and Control MCP descriptors with truthful Stop (CSL-798)
 
-Candidate code for build item 8. Spec: PRODUCT.md at csl-research `398cd812cb8a9cf0ef3d1950f1b15bd9a76e3dfa`
-(SHA-256 `36666beeadacb2af741db0ee55022b2e3911513b4de329ec500d50badbb3a226`): 3.4 S6 (Stop), 11.3 (#916
+Candidate code for build item 8. Spec: PRODUCT.md at csl-research `055cc7a5c793b7135e5d0565dc4198cf96230531`
+(SHA-256 `e64783152f6d67d4ede774dc41d112fe46c2d7536d53cb2c04e71a3566044daf`, receipt pointer CSLR-D-011; first written
+against `398cd812`, whose 3.4 S6, 11.3, 11.8 and O41 text 055cc7a5 keeps): 3.4 S6 (Stop), 11.3 (#916
 procedure), 11.8 (control API), O41 (Codex control-tool posture, decided Nov 7 "All picks"; Q48 is
 recorded on F60, CSL-762).
 
@@ -24,7 +25,8 @@ recorded on F60, CSL-762).
   `start_key`) and only then calls the injected starter with that `run_id`. If that first write fails,
   nothing is launched (`registry_unavailable`). If the write after launch fails, the answer is
   `start_unconfirmed` and the record stays `starting`, but the API keeps the starter's cgroup in memory:
-  `run.stop` aims the cleanup layer at it, and a same-key retry records it once the registry answers.
+  `run.stop` aims the cleanup layer at it (even when the registry cannot be read at all, answering
+  `"recorded": false`), and a same-key retry records it once the registry answers.
   A `run.stop` that arrives before the launch is recorded answers `pending` / `cgroup_unknown` and is
   kept as a stop intent; the start acts on it once the launch is recorded and returns that stop result
   under `stop`. A same-key retry never upgrades an unconfirmed or failed start to `started`: a starter
@@ -36,10 +38,16 @@ recorded on F60, CSL-762).
 - Registry errors never escape `ControlAPI.call`: a read, a stop lookup or the launch-intent write that
   fails answers `registry_unavailable`. Once the cleanup layer has answered, Stop returns `stopped` or
   `pending` even if writing that back fails, with `"recorded": false`; the next stop then sees the old
-  record and asks the cleanup layer again, which is safe to repeat.
+  record and asks the cleanup layer again, which is safe to repeat. For a launch whose own write failed,
+  the API keeps the Stop decision with that launch, so a later Stop or a same-key retry continues it
+  (re-sends a request that raised, writes back a confirmed `stopped`) and never records a bare `running`
+  over it. A failed start whose record cannot be re-read writes nothing, so it never erases a Stop
+  intent recorded during the launch.
 - Stop decisions and launch records are serialised per run, not API-wide, so one hung cleanup never
   queues another run's Stop (11.3, D2-55 / B-19), and a launch never overwrites a Stop that landed
   during it.
+- Starts are serialised only per `(tenant, client_key)`, so a slow or hung starter delays only a retry
+  of that same start; a start without a key, or with another tenant or key, never waits on it.
 - **Unscoped (open decision).** `ControlAPI.call` takes no caller identity. `run.list` and `run.status`
   return every tenant's records, and `run.stop` stops any run by id, whoever asks. Tenant is only a
   namespace for `client_key`, not an access boundary. Caller scopes (11.8 / D3) are not built here.
@@ -60,7 +68,7 @@ recorded on F60, CSL-762).
   | `recursion_run_stop` | false | true | true | false |
   | `recursion_run_start` | false | false | false | true |
 
-  Stop carries `destructiveHint: true` per 398cd812; the older CSL-762/F60 handoff wording
+  Stop carries `destructiveHint: true` per 055cc7a5 O41; the older CSL-762/F60 handoff wording
   (`destructiveHint: false` on start and stop) is superseded.
 - `codex_config.py`: `codex_operator_snippet(server_id, command, args)` writes the operator's Codex TOML,
   setting `approval_mode = "approve"` under `mcp_servers.<id>.tools.recursion_run_stop`, so stop does not

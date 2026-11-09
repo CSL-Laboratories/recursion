@@ -31,6 +31,8 @@ The probes target the engine process itself: a process whose real,
 effective, saved and filesystem uids all equal the backend's target uid (for
 systemd-run, the transient unit's MainPID). They never fall back to the
 launcher. A probe that cannot run is counted as an error, never as blocked.
+Only ``EACCES`` or ``EPERM`` counts as blocked; any other errno (for example
+``ENOENT`` or ``ESRCH`` when the engine exited first) is an error.
 
 Unmeasured here (need a founder Linux box, or would require creating a real
 other-uid home and signing in):
@@ -53,6 +55,7 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import errno
 import math
 import os
 import pwd
@@ -108,6 +111,10 @@ SUDO_REQUIRED_COMMANDS: tuple[tuple[str, ...], ...] = (
 SPAWNABLE_BACKENDS: frozenset[str] = frozenset({"sudo", "systemd_run"})
 PTRACE_ATTACH = 16
 PTRACE_DETACH = 17
+# Only a permission denial counts as a blocked F21 channel. Any other errno
+# (the target exited or was reaped: ENOENT, ESRCH; or EIO, ENOTDIR, ...) means
+# the channel was not tested on that attempt, so it is an error.
+BLOCKED_ERRNOS: frozenset[int] = frozenset({errno.EACCES, errno.EPERM})
 
 BackendName = Literal["setuid_helper", "sudo", "systemd_run", "subuid_userns"]
 PathName = Literal[
@@ -683,7 +690,10 @@ def probe_proc_pid_root(pid: int) -> ProbeOutcome:
     try:
         fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     except OSError as exc:
-        return True, f"{type(exc).__name__}:{exc.errno}:{exc.strerror}"
+        detail = f"{type(exc).__name__}:{exc.errno}:{exc.strerror}"
+        if exc.errno in BLOCKED_ERRNOS:
+            return True, detail
+        return None, f"not_denied {detail}"
     os.close(fd)
     return False, "opened"
 
@@ -699,7 +709,10 @@ def probe_ptrace(pid: int) -> ProbeOutcome:
             pass
         _ptrace(PTRACE_DETACH, pid)
         return False, "attached"
-    return True, f"rc={rc}:errno={err}:{os.strerror(err) if err else 'ptrace failed'}"
+    detail = f"rc={rc}:errno={err}:{os.strerror(err) if err else 'ptrace failed'}"
+    if err in BLOCKED_ERRNOS:
+        return True, detail
+    return None, f"not_denied {detail}"
 
 
 def probe_abs_store_read(
@@ -740,7 +753,10 @@ def probe_abs_store_read(
             mode = oct(st.st_mode)
         except OSError:
             pass
-        return True, f"{type(exc).__name__}:{exc.errno}:{exc.strerror} owner={owner} mode={mode}"
+        detail = f"{type(exc).__name__}:{exc.errno}:{exc.strerror} owner={owner} mode={mode}"
+        if exc.errno in BLOCKED_ERRNOS:
+            return True, detail
+        return None, f"not_denied {detail}"
     finally:
         try:
             store.unlink()
@@ -1321,6 +1337,7 @@ def evaluate_host(
 
 
 __all__ = [
+    "BLOCKED_ERRNOS",
     "CLAUDE_CODE_SIGNIN_SURVIVES_REBOOT",
     "CODEX_SIGNIN_SURVIVES_REBOOT",
     "DEFAULT_N",

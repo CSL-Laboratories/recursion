@@ -10,11 +10,14 @@ Code or Codex.
 from __future__ import annotations
 
 import ast
+import errno
 import os
 import stat
+import subprocess
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 from recursion_core.control.privileged_spawn import (
     CLAUDE_CODE_SIGNIN_SURVIVES_REBOOT,
@@ -39,6 +42,8 @@ from recursion_core.control.privileged_spawn import (
     is_shared_system_account,
     percentile,
     probe_abs_store_read,
+    probe_proc_pid_root,
+    probe_ptrace,
     run_same_uid_control_probes,
     run_same_uid_probes,
     select_path,
@@ -47,6 +52,7 @@ from recursion_core.control.privileged_spawn import (
     SUDO_REQUIRED_COMMANDS,
     systemd_unit_main_pid,
 )
+from recursion_core.control import privileged_spawn
 from recursion_core.control.privileged_spawn import _Tally, _launch_failure
 
 LIVE_ENV = "RECURSION_LIVE_HOST_PROBES"
@@ -709,6 +715,93 @@ class StoreProbeErrorTests(unittest.TestCase):
         self.assertEqual(summary.open_count, 0)
         self.assertTrue(ProbeSummary("ptrace", 20, 20, "denied", 0).blocked)
         self.assertFalse(ProbeSummary("ptrace", 20, 0, "x", 20).blocked)
+
+
+class ProbeErrnoTests(unittest.TestCase):
+    """Red-team round 2 finding 1: only EACCES/EPERM count as blocked."""
+
+    NOT_DENIED = (errno.ENOENT, errno.ESRCH, errno.EIO, errno.ENOTDIR)
+
+    def _proc_root(self, err: int):
+        with mock.patch.object(
+            privileged_spawn.os, "open", side_effect=OSError(err, os.strerror(err))
+        ):
+            return probe_proc_pid_root(4242)
+
+    def _ptrace(self, err: int):
+        with mock.patch.object(privileged_spawn, "_ptrace", return_value=(-1, err)):
+            return probe_ptrace(4242)
+
+    def test_permission_denials_are_blocked(self) -> None:
+        for err in (errno.EACCES, errno.EPERM):
+            with self.subTest(errno=errno.errorcode[err]):
+                self.assertIs(self._proc_root(err)[0], True)
+                self.assertIs(self._ptrace(err)[0], True)
+
+    def test_vanished_target_and_other_errnos_are_errors_not_blocked(self) -> None:
+        for err in self.NOT_DENIED:
+            with self.subTest(errno=errno.errorcode[err]):
+                result, detail = self._proc_root(err)
+                self.assertIsNone(result)
+                self.assertIn("not_denied", detail)
+                result, detail = self._ptrace(err)
+                self.assertIsNone(result)
+                self.assertIn("not_denied", detail)
+
+    def test_reaped_process_is_an_error_on_both_process_channels(self) -> None:
+        # Unmocked: a reaped pid gives ENOENT for /proc/<pid>/root and ESRCH
+        # for ptrace. Skip if the pid was reused in between.
+        proc = subprocess.Popen(["true"])
+        proc.wait()
+        if os.path.exists(f"/proc/{proc.pid}"):
+            self.skipTest("pid reused")
+        self.assertIsNone(probe_proc_pid_root(proc.pid)[0])
+        self.assertIsNone(probe_ptrace(proc.pid)[0])
+
+    def test_store_read_error_other_than_a_denial_is_an_error(self) -> None:
+        def run(cmd, timeout: float) -> ProcResult:
+            # The fake writer leaves a directory at the store path, so the
+            # read fails with EISDIR, not a permission denial.
+            script = cmd[-1]
+            path = script.split("p=", 1)[1].split(";", 1)[0]
+            os.mkdir(ast.literal_eval(path))
+            return ProcResult(0, "", "")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result, detail = probe_abs_store_read(
+                (), tmp, expected_owner=os.getuid(), run_fn=run
+            )
+        self.assertIsNone(result)
+        self.assertIn("not_denied", detail)
+
+    def test_vanished_targets_demote_the_backend_in_evaluate_host(self) -> None:
+        tally = _Tally()
+        for _ in range(DEFAULT_N):
+            tally.add("proc_pid_root", self._proc_root(errno.ENOENT), "sleep uid=990")
+            tally.add("ptrace", self._ptrace(errno.ESRCH), "sleep uid=990")
+            tally.add("abs_store_read", (True, "PermissionError:13"), "store uid=990")
+        probed = tally.summaries(DEFAULT_N)
+        by_name = {probe.name: probe for probe in probed}
+        for name in ("proc_pid_root", "ptrace"):
+            self.assertEqual(by_name[name].blocked_count, 0)
+            self.assertEqual(by_name[name].error_count, DEFAULT_N)
+            self.assertFalse(by_name[name].blocked)
+        # Not a launch failure: the engine appeared, the channel was untested.
+        self.assertIsNone(_launch_failure(probed))
+        overhead = Overhead(DEFAULT_N, 0.01, 0.02, 0.005, 0.03, ("sudo",))
+        evaluation = evaluate_host(
+            n=DEFAULT_N,
+            facts=_facts(),
+            backends=(_engine("sudo"),),
+            measure_fn=lambda backend, n: overhead,
+            probe_fn=lambda backend, n: probed,
+            f21_open=(),
+        )
+        self.assertIn("F21 channels not blocked", evaluation.errors["sudo"])
+        self.assertFalse(evaluation.backends[0].available)
+        self.assertEqual(evaluation.selected.name, "managed_login_folder")
+        self.assertTrue(evaluation.selected.beta)
+        self.assertIsNone(evaluation.selected.candidate)
 
 
 class DevinReview5818620711Tests(unittest.TestCase):

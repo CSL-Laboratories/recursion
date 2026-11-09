@@ -21,7 +21,13 @@ Reads never change state and never call the cleanup layer.
 
 ``client_key`` dedupes a retried start per tenant and is bound to that start's engine and prompt (the
 prompt is kept only as a SHA-256 digest). Another tenant may use the same key; the same tenant reusing a
-key for a different request gets ``request_invalid`` / ``client_key_reused`` and nothing is launched.
+key for a different request gets ``request_invalid`` / ``client_key_reused`` and nothing is launched. The
+key and digest live in the run record (``start_key``) and are looked up through the registry, so a
+``ControlAPI`` rebuilt over the same durable registry after a restart still answers the retried start
+with the original run (11.3, B-17).
+
+Stop decisions are serialised per run, so a slow or hung cleanup on one run never queues another run's
+Stop (11.3, D2-55 / B-19).
 """
 
 from __future__ import annotations
@@ -48,9 +54,9 @@ class ControlAPI:
                  *, confirm_timeout_s: float = 5.0) -> None:
         self._registry, self._kill, self._starter, self._clock = registry, kill_tree, starter, clock
         self._confirm_timeout_s = confirm_timeout_s
-        self._stop_lock = threading.Lock()  # one stop decision at a time, so a kill is never sent twice
+        self._locks_lock = threading.Lock()
+        self._stop_locks: dict[str, threading.Lock] = {}  # one stop decision per run, so a kill is never sent twice
         self._start_lock = threading.Lock()  # a retried start with the same client_key launches once
-        self._keys: dict[tuple[str, str], tuple[str, tuple[str, str]]] = {}
 
     def call(self, method: str, params: Mapping | None = None) -> dict:
         params = dict(params or {})
@@ -86,27 +92,32 @@ class ControlAPI:
 
     def _start(self, params: Mapping) -> dict:
         key = params.get("client_key")
-        scoped = (params["tenant"], key) if isinstance(key, str) else None
-        request = (params["engine"], hashlib.sha256(params["prompt"].encode()).hexdigest())
-        if scoped is not None and scoped in self._keys:  # a retried start is not run twice (11.8)
-            run_id, original = self._keys[scoped]
-            if original != request:
-                return {"code": REQUEST_INVALID, "detail": "client_key_reused"}
-            return {"code": STARTED, "run": self._registry.get(run_id), "duplicate": True}
+        start_key = None
+        if isinstance(key, str):
+            start_key = {"client_key": key, "engine": params["engine"],
+                         "prompt_sha256": hashlib.sha256(params["prompt"].encode()).hexdigest()}
+            prior = self._registry.find_start(params["tenant"], key)
+            if prior is not None:  # a retried start is not run twice, across restarts too (11.3, 11.8)
+                if prior.get("start_key") != start_key:
+                    return {"code": REQUEST_INVALID, "detail": "client_key_reused"}
+                return {"code": STARTED, "run": prior, "duplicate": True}
         try:
             handle = self._starter(dict(params))
         except Exception as err:  # the launch path refused or failed; the API answers with a code
             return {"code": START_FAILED, "detail": type(err).__name__}
         rec = {"run_id": handle["run_id"], "tenant": params["tenant"], "engine": params["engine"],
-               "state": "running", "cgroup": handle["cgroup"], "started_at": self._clock(), "stop": None}
+               "state": "running", "cgroup": handle["cgroup"], "started_at": self._clock(), "stop": None,
+               "start_key": start_key}
         self._registry.put(rec)
-        if scoped is not None:
-            self._keys[scoped] = (rec["run_id"], request)
         return {"code": STARTED, "run": rec, "duplicate": False}
 
     # -- stop ---------------------------------------------------------------------------------
     def stop(self, run_id: str) -> dict:
-        with self._stop_lock:
+        if self._registry.get(run_id) is None:  # no lock is kept for ids that name no run
+            return {"code": RUN_UNKNOWN, "run_id": run_id}
+        with self._locks_lock:
+            lock = self._stop_locks.setdefault(run_id, threading.Lock())
+        with lock:
             rec = self._registry.get(run_id)
             if rec is None:
                 return {"code": RUN_UNKNOWN, "run_id": run_id}

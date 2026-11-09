@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import unittest
@@ -106,6 +107,37 @@ class StopTest(unittest.TestCase):
         self.assertEqual(results, [a.STOPPED] * 12)
         self.assertEqual(len(kill.requests), 1)
 
+    def test_hung_confirm_on_one_run_does_not_queue_another_runs_stop(self) -> None:
+        # Red-team r1 finding 2 (11.3, D2-55 / B-19): Stop is never queued behind another run's Stop.
+        entered, release = threading.Event(), threading.Event()
+
+        class BlockingKillTree(FakeKillTree):
+            def confirm(self, cgroup: str, timeout_s: float) -> str:
+                if cgroup.endswith("/run-1"):
+                    entered.set()
+                    release.wait(10)
+                return super().confirm(cgroup, timeout_s)
+
+        kill = BlockingKillTree([EMPTY])
+        api, _, _, _ = make_api(kill)
+        run_a, run_b = started(api), started(api)
+        slow: list[str] = []
+        t = threading.Thread(target=lambda: slow.append(api.call("run.stop", {"run_id": run_a})["code"]))
+        t.start()
+        try:
+            self.assertTrue(entered.wait(5))
+            done: list[str] = []
+            u = threading.Thread(target=lambda: done.append(api.call("run.stop", {"run_id": run_b})["code"]))
+            u.start()
+            u.join(2)
+            self.assertEqual(done, [a.STOPPED])  # run B stopped while run A's confirm is still blocked
+            self.assertEqual(slow, [])
+        finally:
+            release.set()
+            t.join()
+        self.assertEqual(slow, [a.STOPPED])
+        self.assertEqual(sorted(kill.requests), ["/sys/fs/cgroup/fake/run-1", "/sys/fs/cgroup/fake/run-2"])
+
 
 class ReadsAndStartTest(unittest.TestCase):
     def test_reads_have_no_side_effects(self) -> None:
@@ -131,6 +163,22 @@ class ReadsAndStartTest(unittest.TestCase):
         self.assertEqual(len(starter.calls), 1)
         self.assertEqual(registry.get("run-1")["state"], "running")
         self.assertEqual(api.call("run.start", {"tenant": "t1"})["code"], a.REQUEST_INVALID)
+
+    def test_client_key_dedupe_survives_a_restart(self) -> None:
+        # Red-team r1 finding 1 (11.3, B-17): a start re-issued after a daemon restart runs once.
+        api, registry, kill, starter = make_api()
+        p = {"tenant": "t1", "engine": "codex", "prompt": "p", "client_key": "k1"}
+        first = api.call("run.start", p)
+        self.assertEqual(registry.get("run-1")["start_key"]["client_key"], "k1")
+        self.assertEqual(registry.get("run-1")["start_key"]["prompt_sha256"], hashlib.sha256(b"p").hexdigest())
+        restarted = a.ControlAPI(registry, kill, starter, clock=lambda: 2000.0)  # fresh API, same registry
+        again = restarted.call("run.start", p)
+        self.assertEqual((again["code"], again["duplicate"]), (a.STARTED, True))
+        self.assertEqual(again["run"]["run_id"], first["run"]["run_id"])
+        self.assertEqual(restarted.call("run.start", {**p, "prompt": "other"}),
+                         {"code": a.REQUEST_INVALID, "detail": "client_key_reused"})
+        self.assertEqual(len(starter.calls), 1)
+        self.assertEqual(len(registry.list()), 1)
 
     def test_client_key_is_scoped_to_the_tenant(self) -> None:
         # Devin r4503746563: another tenant reusing a key gets its own run.

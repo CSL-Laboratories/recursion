@@ -5,7 +5,11 @@ control API only sees these two interfaces, and tests fake them. A run record is
 
     {"run_id", "tenant", "engine", "state": "running" | "stop_pending" | "stopped",
      "cgroup": "<cgroup path or handle id>", "started_at",
-     "stop": None | {"requested_at", "checks", "reason"}}
+     "stop": None | {"requested_at", "checks", "reason", "requested"},
+     "start_key": None | {"client_key", "engine", "prompt_sha256"}}
+
+``start_key`` is stored with the record so start dedupe survives a daemon restart: a durable registry
+must persist it and answer ``find_start`` from what it persisted.
 """
 
 from __future__ import annotations
@@ -24,6 +28,8 @@ class RunRegistry(Protocol):
     def list(self) -> list[dict]: ...  # copies
 
     def put(self, record: dict) -> None: ...
+
+    def find_start(self, tenant: str, client_key: str) -> dict | None: ...  # a copy of the run started with it
 
 
 class KillTree(Protocol):
@@ -55,3 +61,11 @@ class InMemoryRunRegistry:
     def put(self, record: dict) -> None:
         with self._lock:
             self._runs[record["run_id"]] = copy.deepcopy(record)
+
+    def find_start(self, tenant: str, client_key: str) -> dict | None:
+        with self._lock:
+            for rec in self._runs.values():
+                key = rec.get("start_key")
+                if rec.get("tenant") == tenant and key is not None and key.get("client_key") == client_key:
+                    return copy.deepcopy(rec)
+            return None

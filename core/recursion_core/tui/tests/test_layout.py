@@ -260,3 +260,55 @@ class NoColorFlagTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LeftoverBotFindingsTest(unittest.TestCase):
+    """Bot review findings left open after the round-3 stop (t1430u X1c)."""
+
+    def test_two_row_terminal_keeps_the_prompt(self) -> None:
+        # 4511540462: at two rows the prompt was dropped before the empty "errors: none" row.
+        driver = FakeDriver(confirm_answers=[POPULATED])
+        run_id = driver.start_run()
+        app = TuiApp(driver.api, clock=Clock(), environ={"NO_COLOR": "1"}, width=80, height=2)
+        app.open()
+        app.selected = run_id
+        app.press("s")
+        rows = screen(app)
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(rows[-1].startswith("recursion: stop run"), rows)
+
+    def test_inline_rows_stay_narrower_than_a_one_or_two_column_terminal(self) -> None:
+        # 4511540618: at widths 1 and 2 the ellipsis branch emitted two cells, so rows autowrapped.
+        app = pending_stops(2, stale=True, width=80, height=24)
+        for width in (1, 2, 3):
+            with self.subTest(width=width):
+                app.resize(width, 24)
+                for text, _ in app.live_rows():
+                    self.assertLess(sum(cell_width(c) for c in text), width, (width, text))
+
+    def test_wrapped_run_id_rows_are_never_blank(self) -> None:
+        # 4511719145: at 20 columns flow broke inside the "  " indent and emitted a blank row per label.
+        for height in (10, 12, 24):
+            with self.subTest(height=height):
+                app = pending_stops(1, stale=True, real_ids=True, width=20, height=height)
+                rows = screen(app)
+                for label in (p.UNCERTAIN, p.UNRECONCILED):
+                    self.assertFalse(any(not r.strip() for r in block_rows(rows, label)), (label, rows))
+        app = pending_stops(1, stale=True, real_ids=True, width=20, height=10)
+        ConditionsNeverHiddenTest.assert_every_condition_on_screen(self, app)
+
+    def test_a_label_with_no_rows_left_says_its_runs_are_not_named(self) -> None:
+        # 4511719327: UNCERTAIN took every spare row and UNRECONCILED read "listed below" over nothing.
+        app = pending_stops(30, stale=True, real_ids=True, width=80, height=20)
+        rows = screen(app)
+        self.assertEqual(len(rows), 20)
+        for label in (p.UNCERTAIN, p.UNRECONCILED):
+            found = block_rows(rows, label)
+            self.assertTrue(found, (label, rows))
+            if len(found) == 1:  # only the head row: it must say so itself
+                self.assertIn("not named here", found[0], rows)
+                self.assertNotIn("listed below", found[0], rows)
+            else:
+                self.assertTrue(any("not named here" in r for r in found) or
+                                all(run["run_id"] in "".join(found) for run in app.runs), (label, rows))
+

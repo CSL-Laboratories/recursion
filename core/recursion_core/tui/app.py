@@ -381,9 +381,12 @@ class TuiApp:
             while rest or not out:
                 lead = pad if out else ""
                 chunk = wrap(rest, w - len(lead))[0]
-                if len(chunk) < len(rest) and " " in chunk[1:] and (out or " " in chunk[:chunk.rindex(" ")]):
+                # break only at a space after a word, never inside leading indentation (a name row's "  "
+                # would otherwise become a blank row that spends the condition budget; bot review 4511719145)
+                cuts = [i for i, ch in enumerate(chunk) if ch == " " and chunk[:i].strip()]
+                if len(chunk) < len(rest) and cuts and (out or chunk.startswith(" ") or " " in chunk[:cuts[-1]]):
                     # (the first row never breaks right after its "LABEL:", so the label keeps its text)
-                    chunk = chunk[:chunk.rindex(" ") + 1]
+                    chunk = chunk[:cuts[-1] + 1]
                 out.append(((lead + chunk).rstrip(" ") or lead + chunk, style))
                 rest = rest[len(chunk):].lstrip(" ")
             return out
@@ -465,10 +468,12 @@ class TuiApp:
             lines = out.tail(rem - 1, max(1, w - 2)) if out else []
             rows.extend((6, "│ " + line, None) for line in lines)
             rows.extend((6, "│", None) for _ in range(rem - 1 - len(lines)))
-        rows += [(1, self.error_row(), "error" if self.last_error else None), (4, self.notice, None),
-                 (1, self.prompt(), "prompt")]
+        # An empty "errors: none" row gives way before the prompt, and on a tie the prompt is kept, so a Stop
+        # confirmation or a typed command stays visible on a two-row terminal (bot review 4511540462).
+        rows += [(1 if self.last_error else 2, self.error_row(), "error" if self.last_error else None),
+                 (4, self.notice, None), (1, self.prompt(), "prompt")]
         while len(rows) > h:  # a terminal shorter than the layout: drop the least needed row
-            rows.remove(max(reversed(rows), key=lambda r: r[0]))
+            rows.remove(max(reversed(rows), key=lambda r: (r[0], r[2] != "prompt")))
         return [(clip(text), style) for _, text, style in rows]
 
     @staticmethod
@@ -485,6 +490,11 @@ class TuiApp:
         out: list[Row] = []
         for label in by_label:
             rows, k = listed[label], give[label]
+            if rows and k == 0:  # no row left under it: the head itself says none are named (bot 4511719327)
+                n = len(by_label[label])
+                out.append((f"{label}: {n} active, {n} not named here (terminal too small; --plain or a larger "
+                            f"terminal names every one): {by_label[label][0][1]}", label))
+                continue
             out.append(heads[label])
             if k >= len(rows):
                 out.extend((text, style) for text, style, _ in rows)
@@ -524,8 +534,13 @@ class TuiApp:
         w = self.width - 1
 
         def clip(text: str) -> str:
+            # strictly fewer cells than the terminal, even at widths 1 and 2 (bot review 4511540618)
+            if w <= 0:
+                return ""
             parts = wrap(text, w) if text else [""]
-            return parts[0] if len(parts) == 1 else wrap(text, w - 1)[0] + "…"
+            if len(parts) == 1:
+                return parts[0]
+            return (wrap(text, w - 1)[0] if w > 1 else "") + "…"
 
         labels = ",".join(dict.fromkeys(label for label, _ in self.shown.values())) or "none"
         mode = "watch_only" if self.watch_only else "live"

@@ -26,6 +26,7 @@ from dataclasses import asdict, dataclass, fields
 
 from recursion_core.launch_check import floors
 from recursion_core.launch_check.binary import HEX64, WRAPPER_EXT, file_kind, is_wrapper_name, sha256_file, stem
+from recursion_core.launch_check.detect import NPM_HERMES_PACKAGE, npm_hermes_agent_root
 from recursion_core.launch_check.floors import (
     EngineSpec, check_floors, check_identity, check_self_named, other_engine_named, parse_version, spec_for,
 )
@@ -81,6 +82,7 @@ def _realpath_native(spec: EngineSpec, path: str, what: str) -> str:
     real = os.path.realpath(path)
     if is_wrapper_name(real):
         raise LaunchRefused("wrapper_refused", spec.engine, f"{what} resolves to a wrapper name: {os.path.basename(real)}")
+    _refuse_npm_hermes_bridge(spec, real, what)
     try:
         kind = file_kind(real)
     except OSError as e:
@@ -90,6 +92,18 @@ def _realpath_native(spec: EngineSpec, path: str, what: str) -> str:
     if not os.access(real, os.X_OK):
         raise LaunchRefused("binary_missing", spec.engine, f"{what} is not executable")
     return real
+
+
+def _refuse_npm_hermes_bridge(spec: EngineSpec, real: str, what: str) -> None:
+    """B27 (CSL-772): no file inside the unofficial npm hermes-agent tree is granted, probed or launched."""
+    if spec.engine != "hermes":
+        return
+    bridge = npm_hermes_agent_root(real)
+    if bridge is not None:
+        raise LaunchRefused(
+            "wrapper_refused", spec.engine,
+            f"{what} is in the npm {NPM_HERMES_PACKAGE} bridge at {bridge} (unofficial, not upstream Hermes)",
+        )
 
 
 def _hash(spec: EngineSpec, real: str) -> tuple[str, int]:
@@ -177,6 +191,7 @@ def verify(g: Grant) -> None:
             raise LaunchRefused("binary_missing", spec.engine, path)
         if os.path.realpath(path) != real:
             raise LaunchRefused("binary_changed", spec.engine, f"{path} now resolves elsewhere")
+        _refuse_npm_hermes_bridge(spec, real, path)
         if not os.access(real, os.X_OK):  # exec bit removed after the grant: refuse here, not at spawn
             raise LaunchRefused("binary_missing", spec.engine, f"{real} is not executable")
         if _hash(spec, real)[0] != digest:

@@ -23,9 +23,11 @@ from recursion_core.launch_check import (
     detect_all,
     grant,
     launch_check,
+    launch_plan,
     npm_hermes_agent_root,
     parse_version,
     table_record,
+    verify,
 )
 from recursion_core.launch_check.detect import _triples
 from recursion_core.launch_check.tests.fixtures import Factory
@@ -355,6 +357,79 @@ class NpmHermesBridgeTests(unittest.TestCase):
         F.script(os.path.join(root, "bin", "hermes.js"), f"#!/bin/sh\ntouch {marker}\n")
         detect("hermes", bindir)
         self.assertFalse(os.path.exists(marker))
+
+
+@unittest.skipUnless(os.name == "posix", "POSIX fixtures")
+class NpmHermesBridgeGrantTests(unittest.TestCase):
+    """B27 (CSL-772): grant(), its hermes-acp probe and verify() refuse the bridge too, not only detect()."""
+
+    def _tree(self) -> tuple[str, str]:
+        """A hermes-agent package tree under node_modules and an empty bin/ outside it."""
+        prefix = F.dir()
+        root = os.path.join(prefix, "lib", "node_modules", "hermes-agent")
+        os.makedirs(os.path.join(root, "bin"))
+        with open(os.path.join(root, "package.json"), "w") as f:
+            f.write('{"name": "hermes-agent", "version": "0.23.0"}')
+        bindir = os.path.join(prefix, "bin")
+        os.makedirs(bindir)
+        return bindir, root
+
+    def _no_probe(self, *a: object) -> None:
+        self.fail("the version probe ran on the npm hermes-agent bridge")
+
+    def _refused(self, fn, *a, **kw) -> LaunchRefused:
+        with self.assertRaises(LaunchRefused) as cm:
+            fn(*a, **kw)
+        self.assertEqual("wrapper_refused", cm.exception.code)
+        self.assertIn("npm hermes-agent bridge", cm.exception.detail)
+        return cm.exception
+
+    def test_grant_refuses_a_hermes_path_into_the_bridge_tree(self) -> None:
+        bindir, root = self._tree()
+        os.symlink(F.make("hermes-native", "hermes 0.9.1", where=os.path.join(root, "bin")),
+                   os.path.join(bindir, "hermes"))
+        os.symlink(F.make("hermes-acp-native", "hermes-acp 0.9.1", where=os.path.join(root, "bin")),
+                   os.path.join(bindir, "hermes-acp"))
+        self._refused(grant, "hermes", os.path.join(bindir, "hermes"), probe=self._no_probe)
+
+    def test_grant_refuses_a_hermes_acp_probe_into_the_bridge_tree(self) -> None:
+        # A native hermes outside the bridge, but the hermes-acp that the version probe runs is
+        # inside it: refused before anything runs, on the default (real) probe path as well.
+        bindir, root = self._tree()
+        F.make("hermes", "hermes 0.9.1", where=bindir)
+        os.symlink(F.make("hermes-acp-native", "hermes-acp 0.9.1", where=os.path.join(root, "bin")),
+                   os.path.join(bindir, "hermes-acp"))
+        r = self._refused(grant, "hermes", os.path.join(bindir, "hermes"), probe=self._no_probe)
+        self.assertIn("hermes-acp", r.detail)
+        with mock.patch("recursion_core.launch_check.grant.run_version_probe", side_effect=self._no_probe) as run:
+            self._refused(grant, "hermes", os.path.join(bindir, "hermes"))
+            grants, records = launch_check(bindir)
+        run.assert_not_called()
+        self.assertNotIn("hermes", grants)
+        rec = next(r for r in records if r["engine"] == "hermes")
+        self.assertEqual(("refused", "wrapper_refused"), (rec["outcome"], rec["refusal"]))
+
+    def test_verify_refuses_a_grant_whose_tree_became_the_bridge(self) -> None:
+        prefix = F.dir()
+        bindir = os.path.join(prefix, "bin")
+        os.makedirs(bindir)
+        F.make("hermes", "hermes 0.9.1", where=bindir)
+        F.make("hermes-acp", "hermes-acp 0.9.1", where=bindir)
+        g = grant("hermes", os.path.join(bindir, "hermes"), probe=F.probe)
+        plan = launch_plan(g, ["hermes", "acp"])
+        with open(os.path.join(prefix, "package.json"), "w") as f:
+            f.write('{"name": "hermes-agent"}')
+        self._refused(verify, g)
+        self._refused(plan.exec_argv)
+
+    def test_other_engines_are_not_judged_by_the_hermes_bridge_rule(self) -> None:
+        prefix = F.dir()
+        bindir = os.path.join(prefix, "bin")
+        os.makedirs(bindir)
+        with open(os.path.join(prefix, "package.json"), "w") as f:
+            f.write('{"name": "hermes-agent"}')
+        p = F.make("claude", "2.1.318 (Claude Code)", where=bindir)
+        self.assertEqual(p, grant("claude_code", p, probe=F.probe).path)
 
 
 @unittest.skipUnless(os.name == "posix", "POSIX fixtures")

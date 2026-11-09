@@ -121,7 +121,9 @@ Hermes detector (B27, CSL-772): the unofficial npm `hermes-agent` bridge (0.23.0
 `hermes-npm`, `hermes-agent` as `bin/*.js` under node) is not upstream Hermes. `detect()` names it
 (a `node_modules/hermes-agent/` path, or a `package.json` named `hermes-agent` above a `bin/` file),
 reports it in the detection note, and gives it no candidate even if a native file sat in its tree.
-Nothing is executed. A `hermes` found by other means is still judged by the binary rules below;
+`grant()` and `verify()` apply the same rule to the `hermes` path and to the `hermes-acp` the
+version probe runs (`wrapper_refused` before anything runs), so a configured path cannot get past
+detection. `package.json` is read only if it is a regular file (opened non-blocking). Nothing is executed. A `hermes` found by other means is still judged by the binary rules below;
 this adds a named refusal reason, not a new refusal code.
 
 Known consequences at this head: Gemini CLI and Pi run JS bundles under node and Hermes is a

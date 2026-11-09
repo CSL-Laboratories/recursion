@@ -103,7 +103,7 @@ def npm_hermes_agent_root(realpath: str) -> str | None:
     try:
         with open(os.path.join(root, "package.json"), "rb") as f:
             data = json.loads(f.read(_PACKAGE_JSON_MAX))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return None
     if isinstance(data, dict) and data.get("name") == NPM_HERMES_PACKAGE:
         return root

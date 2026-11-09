@@ -297,6 +297,16 @@ class NpmHermesBridgeTests(unittest.TestCase):
         self.assertIsNone(npm_hermes_agent_root(os.path.join(d, "bin", "hermes.js")))
         self.assertIsNone(npm_hermes_agent_root(os.path.join(d, "hermes")))
 
+    def test_package_json_recursion_error_is_not_recognised_and_does_not_abort(self) -> None:
+        # json.loads can raise RecursionError on a deeply nested package.json.
+        # That must mean "not recognised", not abort launch_check for every engine.
+        bindir, root = self._bridge(under_node_modules=False)
+        path = os.path.join(root, "bin", "hermes.js")
+        with mock.patch("recursion_core.launch_check.detect.json.loads", side_effect=RecursionError):
+            self.assertIsNone(npm_hermes_agent_root(path))
+            _grants, records = launch_check(bindir, probe=F.probe)
+        self.assertEqual(set(FLOORS), {r["engine"] for r in records})
+
     def test_native_file_in_the_bridge_tree_is_not_a_candidate(self) -> None:
         bindir, root = self._bridge()
         native = F.make("hermes-native", "hermes 0.9.1", where=os.path.join(root, "bin"))

@@ -22,19 +22,24 @@ recorded on F60, CSL-762).
   dedupe across a daemon restart (11.3, B-17).
 - Launch intent first: `run.start` picks the run id, writes the record as `starting` (with its
   `start_key`) and only then calls the injected starter with that `run_id`. If that first write fails,
-  nothing is launched (`registry_unavailable`). If the write after launch fails, or the starter hands
-  back no cgroup, the answer is `start_unconfirmed` and the record stays `starting`: `run.list` shows the
-  run, a same-key retry answers with it instead of launching again, and `run.stop` answers `pending` /
-  `cgroup_unknown` without calling the cleanup layer. A starter that raises leaves the record
-  `start_failed`; a same-key retry relaunches under the same run id. A daemon crash between launch and
-  the second write leaves the same `starting` record; reconciling it against the host (the startup
-  sweep) belongs to the durable-registry item, CSL-738.
+  nothing is launched (`registry_unavailable`). If the write after launch fails, the answer is
+  `start_unconfirmed` and the record stays `starting`, but the API keeps the starter's cgroup in memory:
+  `run.stop` aims the cleanup layer at it, and a same-key retry records it once the registry answers.
+  A `run.stop` that arrives before the launch is recorded answers `pending` / `cgroup_unknown` and is
+  kept as a stop intent; the start acts on it once the launch is recorded and returns that stop result
+  under `stop`. A same-key retry never upgrades an unconfirmed or failed start to `started`: a starter
+  that raised is relaunched under the same run id (unless a Stop was asked for it, which answers
+  `start_failed` / `stop_requested`), and a `starting` record with no known cgroup (the starter handed
+  back none, or a daemon restart lost the in-memory cgroup) answers `start_unconfirmed`. Reconciling such
+  a record against the host after a restart (the startup sweep) belongs to the durable-registry item,
+  CSL-738.
 - Registry errors never escape `ControlAPI.call`: a read, a stop lookup or the launch-intent write that
   fails answers `registry_unavailable`. Once the cleanup layer has answered, Stop returns `stopped` or
   `pending` even if writing that back fails, with `"recorded": false`; the next stop then sees the old
   record and asks the cleanup layer again, which is safe to repeat.
-- Stop decisions are serialised per run, not API-wide, so one hung cleanup never queues another run's
-  Stop (11.3, D2-55 / B-19).
+- Stop decisions and launch records are serialised per run, not API-wide, so one hung cleanup never
+  queues another run's Stop (11.3, D2-55 / B-19), and a launch never overwrites a Stop that landed
+  during it.
 - **Unscoped (open decision).** `ControlAPI.call` takes no caller identity. `run.list` and `run.status`
   return every tenant's records, and `run.stop` stops any run by id, whoever asks. Tenant is only a
   namespace for `client_key`, not an access boundary. Caller scopes (11.8 / D3) are not built here.

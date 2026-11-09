@@ -139,6 +139,49 @@ class StopTest(unittest.TestCase):
         self.assertEqual(slow, [a.STOPPED])
         self.assertEqual(sorted(kill.requests), ["/sys/fs/cgroup/fake/run-1", "/sys/fs/cgroup/fake/run-2"])
 
+    def test_stop_during_launch_is_kept_and_acted_on(self) -> None:
+        # Red-team r3 finding 2: a Stop that lands while the starter runs answers pending, and the start
+        # carries it out once the launch is recorded.
+        in_starter, release = threading.Event(), threading.Event()
+
+        def slow(params: dict) -> dict:
+            in_starter.set()
+            release.wait(10)
+            return {"cgroup": f"/cg/{params['run_id']}"}
+
+        api, registry, kill, _ = make_api(FakeKillTree([EMPTY]), starter=slow)
+        out: list[dict] = []
+        t = threading.Thread(target=lambda: out.append(
+            api.call("run.start", {"tenant": "t1", "engine": "codex", "prompt": "p"})))
+        t.start()
+        try:
+            self.assertTrue(in_starter.wait(5))
+            stop = api.call("run.stop", {"run_id": "run-1"})
+            self.assertEqual((stop["code"], stop["reason"]), (a.PENDING, "cgroup_unknown"))
+            self.assertIsNotNone(registry.get("run-1")["stop"])  # the stop intent is recorded
+            self.assertEqual(kill.requests, [])
+        finally:
+            release.set()
+            t.join()
+        self.assertEqual((out[0]["code"], out[0]["stop"]["code"]), (a.STARTED, a.STOPPED))
+        self.assertEqual(kill.requests, ["/cg/run-1"])
+        rec = registry.get("run-1")
+        self.assertEqual((rec["state"], rec["cgroup"]), ("stopped", "/cg/run-1"))
+        self.assertEqual(api.call("run.stop", {"run_id": "run-1"})["repeat"], True)
+        self.assertEqual(len(kill.requests), 1)
+
+    def test_stop_on_refused_start_blocks_same_key_relaunch(self) -> None:
+        def refuse(params: dict) -> dict:
+            raise RuntimeError("refused")
+
+        api, registry, kill, _ = make_api(starter=refuse)
+        p = {"tenant": "t1", "engine": "codex", "prompt": "p", "client_key": "k"}
+        api.call("run.start", p)
+        self.assertEqual(api.call("run.stop", {"run_id": "run-1"})["reason"], "cgroup_unknown")
+        again = api.call("run.start", p)
+        self.assertEqual((again["code"], again["detail"]), (a.START_FAILED, "stop_requested"))
+        self.assertEqual(kill.requests, [])
+
 
 class ReadsAndStartTest(unittest.TestCase):
     def test_reads_have_no_side_effects(self) -> None:
@@ -260,6 +303,7 @@ class RegistryFailureTest(unittest.TestCase):
     P = {"tenant": "t1", "engine": "codex", "prompt": "p", "client_key": "k1"}
 
     def test_failed_write_after_launch_leaves_a_listable_stoppable_deduped_run(self) -> None:
+        # Red-team r3 finding 1: the starter's cgroup is kept, so a later Stop reaches request_stop.
         registry = FailingRegistry()
         api, _, kill, starter = make_api(FakeKillTree([EMPTY]), registry=registry)
         registry.fail_puts = "running"  # the launch intent lands; the write after launch fails
@@ -269,20 +313,87 @@ class RegistryFailureTest(unittest.TestCase):
         self.assertEqual(len(starter.calls), 1)
         listed = api.call("run.list")["runs"]
         self.assertEqual([(r["run_id"], r["state"]) for r in listed], [("run-1", "starting")])
-        retry = api.call("run.start", self.P)  # same key: answered from the intent, nothing relaunched
-        self.assertEqual((retry["code"], retry["duplicate"], retry["run"]["run_id"]), (a.STARTED, True, "run-1"))
+        retry = api.call("run.start", self.P)  # same key, registry still failing: repeats unconfirmed
+        self.assertEqual((retry["code"], retry["duplicate"], retry["run"]["run_id"]),
+                         (a.START_UNCONFIRMED, True, "run-1"))
         self.assertEqual(len(starter.calls), 1)
-        stop = api.call("run.stop", {"run_id": "run-1"})  # found, and truthfully not stopped
-        self.assertEqual((stop["code"], stop["reason"]), (a.PENDING, "cgroup_unknown"))
-        self.assertEqual(kill.requests, [])
+        registry.fail_puts = False  # the registry recovers
+        stop = api.call("run.stop", {"run_id": "run-1"})
+        self.assertEqual(stop["code"], a.STOPPED)
+        self.assertEqual(kill.requests, ["/sys/fs/cgroup/fake/run-1"])
+        rec = registry.get("run-1")
+        self.assertEqual((rec["state"], rec["cgroup"]), ("stopped", "/sys/fs/cgroup/fake/run-1"))
+
+    def test_stop_aims_at_unrecorded_launch_even_while_the_registry_is_down(self) -> None:
+        registry = FailingRegistry()
+        api, _, kill, _ = make_api(FakeKillTree([EMPTY]), registry=registry)
+        registry.fail_puts = "running"
+        api.call("run.start", self.P)
+        for _ in range(2):  # the stopped write-back fails too: answer stopped, unrecorded, and ask again
+            registry.fail_puts = True
+            stop = api.call("run.stop", {"run_id": "run-1"})
+            self.assertEqual((stop["code"], stop["recorded"]), (a.STOPPED, False))
+        self.assertEqual(len(kill.requests), 2)
+        registry.fail_puts = False
+        self.assertEqual(api.call("run.stop", {"run_id": "run-1"}).get("recorded", True), True)
+        self.assertEqual(registry.get("run-1")["state"], "stopped")
+
+    def test_same_key_retry_records_the_launch_once_the_registry_recovers(self) -> None:
+        registry = FailingRegistry()
+        api, _, kill, starter = make_api(registry=registry)
+        registry.fail_puts = "running"
+        api.call("run.start", self.P)
+        registry.fail_puts = False
+        retry = api.call("run.start", self.P)
+        self.assertEqual((retry["code"], retry["duplicate"]), (a.STARTED, True))
+        self.assertEqual(retry["run"]["cgroup"], "/sys/fs/cgroup/fake/run-1")
+        self.assertEqual(registry.get("run-1")["state"], "running")
+        self.assertEqual((len(starter.calls), kill.requests), (1, []))
 
     def test_starter_handle_without_cgroup_is_typed_and_the_run_stays_visible(self) -> None:
-        api, registry, kill, _ = make_api(starter=lambda params: {"run_id": params["run_id"]})
+        api, registry, kill, starter = make_api(starter=lambda params: {"run_id": params["run_id"]})
         res = api.call("run.start", self.P)
         self.assertEqual((res["code"], res["detail"]), (a.START_UNCONFIRMED, "starter_handle_invalid"))
         self.assertEqual(registry.get("run-1")["state"], "starting")
+        # Red-team r3 finding 3: the retry repeats the unconfirmed answer, never "started".
+        retry = api.call("run.start", self.P)
+        self.assertEqual((retry["code"], retry["duplicate"], retry["detail"]),
+                         (a.START_UNCONFIRMED, True, "launch_unconfirmed"))
+        self.assertTrue(mcp_tools.call_tool(api, "recursion_run_start", self.P)["isError"])
         self.assertEqual(api.call("run.stop", {"run_id": "run-1"})["code"], a.PENDING)
         self.assertEqual(kill.requests, [])
+
+    def test_retry_after_unrecorded_start_failure_relaunches(self) -> None:
+        # Red-team r3 finding 3: the starter raised and the start_failed write failed, so the record still
+        # says starting. The retry must not answer started; it relaunches under the same run id.
+        calls: list[dict] = []
+
+        def flaky(params: dict) -> dict:
+            calls.append(params)
+            if len(calls) == 1:
+                raise RuntimeError("refused")
+            return {"cgroup": f"/cg/{params['run_id']}"}
+
+        registry = FailingRegistry()
+        api, _, _, _ = make_api(registry=registry, starter=flaky)
+        registry.fail_puts = "start_failed"
+        first = api.call("run.start", self.P)
+        self.assertEqual((first["code"], first["recorded"]), (a.START_FAILED, False))
+        self.assertEqual(registry.get("run-1")["state"], "starting")
+        again = api.call("run.start", self.P)
+        self.assertEqual((again["code"], again["duplicate"], again["run"]["run_id"]), (a.STARTED, False, "run-1"))
+        self.assertEqual([c["run_id"] for c in calls], ["run-1", "run-1"])
+
+    def test_retry_after_restart_with_unconfirmed_launch_is_not_started(self) -> None:
+        registry = FailingRegistry()
+        api, _, kill, starter = make_api(registry=registry)
+        registry.fail_puts = "running"
+        api.call("run.start", self.P)
+        registry.fail_puts = False
+        restarted = a.ControlAPI(registry, kill, starter, clock=lambda: 2000.0)  # in-memory cgroup is gone
+        retry = restarted.call("run.start", self.P)
+        self.assertEqual((retry["code"], retry["duplicate"]), (a.START_UNCONFIRMED, True))
+        self.assertEqual(len(starter.calls), 1)
 
     def test_failed_intent_write_launches_nothing(self) -> None:
         registry = FailingRegistry()

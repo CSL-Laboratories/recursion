@@ -27,6 +27,13 @@ processes run under them, so they are same-uid attackers against an engine
 there, and ``nobody`` has no home to hold logins. They are measurement
 stand-ins only and are never selected as the engine user.
 
+The dedicated engine user is named by the installer, not by this module:
+``detect_backends(engine_user=...)`` or ``RECURSION_ENGINE_USER``. Detection
+tries that user first and only then the stand-ins, so a host where sudo or
+systemd-run reaches the engine user reports it as ``SelectedPath.candidate``
+(and selects it once F21 has run). With no engine user configured, detection
+can only reach stand-ins and selection is always the beta fallback.
+
 The probes target the engine process itself: a process whose real,
 effective, saved and filesystem uids all equal the backend's target uid (for
 systemd-run, the transient unit's MainPID). They never fall back to the
@@ -85,6 +92,9 @@ SETUID_HELPER_CANDIDATES = (
     "/usr/local/bin/recursion-spawn-as",
 )
 HELPER_ENV = "RECURSION_SPAWN_HELPER"
+# Names the dedicated engine user detection should try first. No default:
+# the name and its creation at install are F21 install work.
+ENGINE_USER_ENV = "RECURSION_ENGINE_USER"
 # Measurement stand-ins for the engine user. Never selected (see
 # SHARED_SYSTEM_ACCOUNTS): they only show whether sudo reaches another uid.
 SUDO_TARGET_CANDIDATES = ("nobody", "daemon")
@@ -402,6 +412,18 @@ def _helper_paths(env: Mapping[str, str] | None) -> tuple[str, ...]:
     return tuple(extra + list(SETUID_HELPER_CANDIDATES))
 
 
+def _configured_engine_user(
+    engine_user: str | None, env: Mapping[str, str] | None
+) -> str | None:
+    """``engine_user`` if given, else ``RECURSION_ENGINE_USER``; ``None`` when unset."""
+
+    if engine_user is None:
+        source = env if env is not None else os.environ
+        engine_user = source.get(ENGINE_USER_ENV, "")
+    engine_user = engine_user.strip()
+    return engine_user or None
+
+
 def _is_setuid_root(st: os.stat_result) -> bool:
     return bool(st.st_mode & stat.S_ISUID) and st.st_uid == 0
 
@@ -467,12 +489,16 @@ def _launch_timeout(argv: Sequence[str]) -> float:
     return base
 
 
-def _probe_sudo_target(run_fn: RunFn, our_uid: int) -> tuple[str | None, int | None, str]:
+def _probe_sudo_target(
+    run_fn: RunFn,
+    our_uid: int,
+    candidates: Sequence[str] = SUDO_TARGET_CANDIDATES,
+) -> tuple[str | None, int | None, str]:
     """First candidate sudo reaches as a non-root other uid for every launch
     the measured path actually runs. Independent of ``sudo -n true`` (root)."""
 
     notes: list[str] = []
-    for user in SUDO_TARGET_CANDIDATES:
+    for user in candidates:
         result = run_fn(("sudo", "-n", "-u", user, "--", "id", "-u"), 8.0)
         uid = _parse_uid_output(result.stdout)
         if result.returncode != 0 or uid is None or uid == our_uid or uid == 0:
@@ -1037,11 +1063,19 @@ def detect_backends(
     stat_fn: StatFn | None = None,
     env: Mapping[str, str] | None = None,
     helper_paths: Sequence[str] | None = None,
+    engine_user: str | None = None,
 ) -> tuple[Backend, ...]:
+    """Detect spawn backends. ``engine_user`` (else ``RECURSION_ENGINE_USER``)
+    is tried before the ``nobody``/``daemon`` measurement stand-ins."""
+
     run = run_fn or _default_run
     stat_fn = stat_fn or os.stat
     facts = facts or collect_host_facts(run_fn=run)
     our_uid = facts.uid
+    engine = _configured_engine_user(engine_user, env)
+    candidates = SUDO_TARGET_CANDIDATES
+    if engine is not None:
+        candidates = (engine, *(u for u in SUDO_TARGET_CANDIDATES if u != engine))
 
     helper_found, helper_note = _inspect_helpers(
         helper_paths if helper_paths is not None else _helper_paths(env),
@@ -1058,7 +1092,7 @@ def detect_backends(
     # Sudoers can grant a target user without granting root, so the target
     # probe runs whatever ``sudo -n true`` (root target) returned.
     root_note = "sudo -n true ok" if facts.sudo_n_true else "sudo -n true failed"
-    user, target_uid, sudo_note = _probe_sudo_target(run, our_uid)
+    user, target_uid, sudo_note = _probe_sudo_target(run, our_uid, candidates)
     if user is not None and target_uid is not None:
         sudo_backend = Backend(
             "sudo",
@@ -1077,7 +1111,7 @@ def detect_backends(
             f"{sudo_note}; not editing sudoers",
         )
 
-    systemd_user = sudo_backend.target_user or "nobody"
+    systemd_user = engine or sudo_backend.target_user or "nobody"
     sys_ok, sys_uid, sys_reason = _probe_systemd_run(run, systemd_user, our_uid)
     if not facts.systemd_is_pid1 and not sys_ok:
         sys_reason = f"systemd is not PID 1; {sys_reason}"
@@ -1243,6 +1277,8 @@ def evaluate_host(
     measure_fn: Callable[[Backend, int], Overhead] = measure_overhead,
     probe_fn: Callable[[Backend, int], tuple[ProbeSummary, ...]] = run_same_uid_probes,
     f21_open: Sequence[str] | None = None,
+    engine_user: str | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> Evaluation:
     """Measure every spawnable other-uid backend, then select a path.
 
@@ -1256,7 +1292,8 @@ def evaluate_host(
     A backend that launches but leaves any F21 channel open or errored is
     kept in ``overhead`` and ``probes`` as evidence, recorded in ``errors``,
     and marked unavailable: the separate uid exists to close those channels.
-    ``f21_open`` is passed to ``select_path``.
+    ``f21_open`` is passed to ``select_path``; ``engine_user`` and ``env``
+    to ``detect_backends`` when ``backends`` is not given.
     """
 
     if n < 10:
@@ -1264,7 +1301,7 @@ def evaluate_host(
 
     facts = facts or collect_host_facts(run_fn=run_fn)
     detected = tuple(backends) if backends is not None else detect_backends(
-        facts=facts, run_fn=run_fn
+        facts=facts, run_fn=run_fn, env=env, engine_user=engine_user
     )
     overhead: dict[str, Overhead] = {}
     probes: dict[str, tuple[ProbeSummary, ...]] = {}
@@ -1342,6 +1379,7 @@ __all__ = [
     "CODEX_SIGNIN_SURVIVES_REBOOT",
     "DEFAULT_N",
     "ENGINE_USER_CREATED_AT_INSTALL",
+    "ENGINE_USER_ENV",
     "HEADLESS_SECRET_SERVICE_LIVE",
     "PRODUCT_MD_COMMIT",
     "PRODUCT_MD_SHA256",

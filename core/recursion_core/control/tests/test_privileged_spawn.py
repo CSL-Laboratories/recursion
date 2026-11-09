@@ -24,6 +24,7 @@ from recursion_core.control.privileged_spawn import (
     CODEX_SIGNIN_SURVIVES_REBOOT,
     DEFAULT_N,
     ENGINE_USER_CREATED_AT_INSTALL,
+    ENGINE_USER_ENV,
     HEADLESS_SECRET_SERVICE_LIVE,
     PRODUCT_MD_COMMIT,
     PRODUCT_MD_SHA256,
@@ -419,6 +420,105 @@ class SudoPolicyDetectionTests(unittest.TestCase):
         allowed.update({("sudo", "-n", "-u", "nobody", "--", *a): "" for a in ALL_REQUIRED})
         allowed[("sudo", "-n", "-u", "daemon", "--", "id", "-u")] = "1000\n"
         self.assertFalse(self._sudo(allowed).available)
+
+
+class EngineUserDetectionTests(unittest.TestCase):
+    """Red-team round 2 finding 2: detection reaches a configured engine user.
+
+    Drives ``detect_backends`` -> ``evaluate_host`` with a fake sudoers
+    policy; no hand-built engine-user ``Backend``.
+    """
+
+    def _policy(self, user: str = ENGINE_USER, uid: int = ENGINE_UID):
+        allowed = _nobody_allows(*ALL_REQUIRED)
+        allowed[("sudo", "-n", "-u", user, "--", "id", "-u")] = f"{uid}\n"
+        for argv in ALL_REQUIRED:
+            allowed[("sudo", "-n", "-u", user, "--", *argv)] = ""
+        return _sudo_policy(allowed)
+
+    def _evaluate(self, **kwargs):
+        overhead = Overhead(DEFAULT_N, 0.01, 0.02, 0.005, 0.03, ("sudo",))
+        probed: list[Backend] = []
+
+        def probe_fn(backend: Backend, n: int):
+            probed.append(backend)
+            return ALL_BLOCKED
+
+        evaluation = evaluate_host(
+            n=DEFAULT_N,
+            facts=_facts(),
+            run_fn=self._policy(),
+            measure_fn=lambda backend, n: overhead,
+            probe_fn=probe_fn,
+            **kwargs,
+        )
+        return evaluation, probed
+
+    def test_no_engine_user_configured_only_reaches_stand_ins(self) -> None:
+        evaluation, probed = self._evaluate(env={}, f21_open=())
+        self.assertEqual([b.target_user for b in probed], ["nobody"])
+        self.assertEqual(evaluation.selected.name, "managed_login_folder")
+        self.assertTrue(evaluation.selected.beta)
+        self.assertIsNone(evaluation.selected.candidate)
+
+    def test_configured_engine_user_is_the_candidate_while_f21_is_open(self) -> None:
+        for kwargs in (
+            {"env": {}, "engine_user": ENGINE_USER},
+            {"env": {ENGINE_USER_ENV: ENGINE_USER}},
+        ):
+            with self.subTest(kwargs=kwargs):
+                evaluation, probed = self._evaluate(**kwargs)
+                self.assertEqual([b.target_user for b in probed], [ENGINE_USER])
+                self.assertEqual(evaluation.selected.name, "managed_login_folder")
+                self.assertTrue(evaluation.selected.beta)
+                candidate = evaluation.selected.candidate
+                self.assertIsNotNone(candidate)
+                self.assertEqual(candidate.name, "sudo")
+                self.assertEqual(candidate.target_user, ENGINE_USER)
+                self.assertEqual(candidate.target_uid, ENGINE_UID)
+
+    def test_configured_engine_user_is_selected_once_f21_has_run(self) -> None:
+        evaluation, _ = self._evaluate(env={ENGINE_USER_ENV: ENGINE_USER}, f21_open=())
+        self.assertEqual(evaluation.errors, {})
+        self.assertEqual(evaluation.selected.name, "sudo")
+        self.assertFalse(evaluation.selected.beta)
+        self.assertEqual(evaluation.selected.backend.target_user, ENGINE_USER)
+
+    def test_engine_user_sudo_cannot_reach_falls_back_to_a_stand_in(self) -> None:
+        backends = detect_backends(
+            facts=_facts(),
+            run_fn=_sudo_policy(_nobody_allows(*ALL_REQUIRED)),
+            helper_paths=("/tmp/csl734-no-such-helper",),
+            env={ENGINE_USER_ENV: ENGINE_USER},
+        )
+        sudo = next(b for b in backends if b.name == "sudo")
+        self.assertEqual(sudo.target_user, "nobody")
+        self.assertIn(f"sudo -n -u {ENGINE_USER} -- id -u rc=1", sudo.reason)
+        selected = select_path(backends, f21_open=())
+        self.assertEqual(selected.name, "managed_login_folder")
+        self.assertIsNone(selected.candidate)
+
+    def test_systemd_run_targets_the_configured_engine_user(self) -> None:
+        seen: list[tuple[str, ...]] = []
+
+        def run(cmd, timeout: float) -> ProcResult:
+            seen.append(tuple(cmd))
+            if cmd[0] == "systemd-run" and cmd[1] == f"--uid={ENGINE_USER}":
+                return ProcResult(0, f"{ENGINE_UID}\n", "")
+            return ProcResult(1, "", "denied")
+
+        backends = detect_backends(
+            facts=_facts(),
+            run_fn=run,
+            helper_paths=("/tmp/csl734-no-such-helper",),
+            env={},
+            engine_user=ENGINE_USER,
+        )
+        systemd = next(b for b in backends if b.name == "systemd_run")
+        self.assertTrue(systemd.available)
+        self.assertEqual(systemd.target_user, ENGINE_USER)
+        self.assertEqual(systemd.target_uid, ENGINE_UID)
+        self.assertEqual(select_path(backends).candidate, systemd)
 
 
 class EvaluateHostInjectionTests(unittest.TestCase):

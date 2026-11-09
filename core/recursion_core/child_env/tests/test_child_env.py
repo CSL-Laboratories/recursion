@@ -19,6 +19,12 @@ from recursion_core.child_env import BASE_NAMES, ENGINE_PROFILES, EnvRefused, Va
 from recursion_core.child_env.policy import CLAUDE_TLS_NAMES
 from recursion_core.child_env.tests import cells
 
+
+def _running_as_root() -> bool:
+    geteuid = getattr(os, "geteuid", None)
+    return geteuid is not None and geteuid() == 0
+
+
 FAKE = "fake-value-not-a-credential"
 
 
@@ -239,6 +245,9 @@ class ProfileTests(unittest.TestCase):
         base = Path(_home(self))
         for mode in (0o777, 0o775, 0o757, 0o1777):  # 1777 is ours, not root's, so the sticky exception does not apply
             with self.subTest(mode=oct(mode)):
+                if mode == 0o1777 and _running_as_root():
+                    # As root the directory is root-owned, so the root-owned sticky exception applies.
+                    self.skipTest("mode 1777 is only 'ours, not root's' when euid is not 0")
                 real_parent = base / f"real-{mode:o}"
                 real_parent.mkdir(mode=0o700)
                 (real_parent / "home").mkdir(mode=0o700)

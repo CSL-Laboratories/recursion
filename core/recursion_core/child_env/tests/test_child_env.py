@@ -157,6 +157,36 @@ class ProfileTests(unittest.TestCase):
         env = build_child_env("claude_code", home=home, parent={"PATH": "/usr/bin", "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE": FAKE})
         self.assertEqual(FAKE, env["CLAUDE_CODE_CLIENT_KEY_PASSPHRASE"])  # the operator's own value is carried
 
+    def test_client_private_key_cannot_be_replaced_by_an_override(self) -> None:
+        """Devin r4510867706: CLAUDE_CODE_CLIENT_KEY is a credential path the denylist pattern misses."""
+
+        home = Path(_home(self))
+        parent_key = home / "parent-key.pem"
+        other_key = home / "other-key.pem"
+        for path in (parent_key, other_key):
+            path.write_text("not a real key\n", encoding="ascii")
+            path.chmod(0o600)
+        with self.assertRaises(EnvRefused) as caught:
+            build_child_env(
+                "claude_code",
+                home=str(home),
+                parent={"PATH": "/usr/bin", "CLAUDE_CODE_CLIENT_KEY": str(parent_key)},
+                overrides={"CLAUDE_CODE_CLIENT_KEY": str(other_key)},
+            )
+        self.assertEqual(("CLAUDE_CODE_CLIENT_KEY", "override_denied"), (caught.exception.name, caught.exception.cause))
+        env = build_child_env(
+            "claude_code", home=str(home), parent={"PATH": "/usr/bin", "CLAUDE_CODE_CLIENT_KEY": str(parent_key)}
+        )
+        self.assertEqual(str(parent_key), env["CLAUDE_CODE_CLIENT_KEY"])
+        with self.assertRaises(EnvRefused) as caught:
+            build_child_env(
+                "codex",
+                home=str(home),
+                parent={"PATH": "/usr/bin"},
+                overrides={"CLAUDE_CODE_CLIENT_KEY": str(other_key)},
+            )
+        self.assertEqual(("CLAUDE_CODE_CLIENT_KEY", "override_denied"), (caught.exception.name, caught.exception.cause))
+
     def test_codex_scrub_names_are_listed(self) -> None:
         self.assertLessEqual({"CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI_API_KEY"}, set(ENGINE_PROFILES["codex"].scrub))
         self.assertLessEqual({"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"}, set(ENGINE_PROFILES["claude_code"].scrub))
@@ -283,6 +313,32 @@ class ProfileTests(unittest.TestCase):
         with self.assertRaises(EnvRefused) as caught:  # the home itself being a link stays refused
             build_child_env("codex", home=str(base / "home-link"), parent={})
         self.assertEqual("home_unsafe", caught.exception.cause)
+
+    def test_a_linked_home_stays_refused_with_a_trailing_slash_or_dot(self) -> None:
+        """Devin r4508023438: lstat follows link/ and link/., so both spellings must refuse."""
+
+        base = Path(_home(self))
+        real = base / "real-home"
+        real.mkdir(mode=0o700)
+        link = base / "home-link"
+        os.symlink(real, link)
+        for spelling in (str(link), str(link) + "/", str(link) + "/.", str(link) + "/./", str(link) + "//"):
+            with self.subTest(home=spelling), self.assertRaises(EnvRefused) as caught:
+                build_child_env("codex", home=spelling, parent={})
+            self.assertEqual(("HOME", "home_unsafe"), (caught.exception.name, caught.exception.cause))
+        parent_link = base / "parent-link"
+        os.symlink(base, parent_link)
+        accepted = (
+            str(real),
+            str(real) + "/",
+            str(real) + "/.",
+            str(parent_link / "real-home"),
+            str(parent_link / "real-home") + "/",
+            str(parent_link / "real-home") + "/.",
+        )
+        for spelling in accepted:
+            with self.subTest(home=spelling):
+                self.assertEqual(spelling, build_child_env("codex", home=spelling, parent={})["HOME"])
 
     def test_validated_env_cannot_be_hand_made(self) -> None:
         with self.assertRaises(TypeError):

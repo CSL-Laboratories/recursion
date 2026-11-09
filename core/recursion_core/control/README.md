@@ -80,8 +80,10 @@ recorded on F60, CSL-762).
   lists ``io.modelcontextprotocol/tasks``. ``tasks/list`` and
   ``notifications/cancelled`` are not served. ``tools/list`` returns the four
   control tool descriptors in both eras. With ``auth_token`` set, ``tools/list``,
-  ``tools/call`` and ``tasks/*`` need ``_meta.authorization`` before anything
-  reaches ``ControlAPI`` (only the handshakes are open). An unknown ``taskId`` is
+  ``tools/call`` and ``tasks/*`` need the token in ``_meta.authorization`` or in
+  top-level ``params.authorization`` before anything reaches ``ControlAPI``
+  (only the handshakes are open). This mock compares those fields; it does not
+  read an HTTP ``Authorization`` header. An unknown ``taskId`` is
   a JSON-RPC ``-32602`` ``run_unknown`` error, and ``tasks/cancel`` sends nothing
   to the Stop path for it. A registry outage is a JSON-RPC ``-32603``
   ``registry_unavailable`` error, not an unknown task; if the registry stops
@@ -97,7 +99,9 @@ recorded on F60, CSL-762).
   ``start_failed`` run also reads ``working`` + ``"pending"``. When ``run.stop``
   answered but its write-back failed (``"recorded": false``), ``tasks/cancel``
   answers from that answer, so a confirmed Stop reads ``cancelled`` rather than a
-  stale ``pending``; the fallback keeps the record's own stop time.
+  stale ``pending``. The fallback keeps a stop time the record already has. It
+  does not invent one when the write never stored a stop, so ``lastUpdatedAt``
+  stays the start time the next ``tasks/get`` still reads.
 
   Deferred (PRODUCT.md O60 / A45): the ``2026-07-28`` side is not yet tested
   against a pinned pre-release conformance tool. The shapes (``server/discover``,

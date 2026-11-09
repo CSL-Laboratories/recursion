@@ -532,6 +532,36 @@ class SameRunAndStopTests(unittest.TestCase):
         self.assertEqual(body["lastUpdatedAt"], polled["lastUpdatedAt"])
         self.assertEqual(registry.get(run_id)["stop"]["requested_at"], recorded)
 
+    def test_unrecorded_first_stop_does_not_invent_a_later_timestamp(self) -> None:
+        # Bot review 4517669064 at 7372b527: a confirmed Stop whose write never
+        # lands must not publish the server clock. The next tasks/get still
+        # reads the unchanged start time, so the two lastUpdatedAt values match.
+        from recursion_core.control.registry import EMPTY
+        registry = _OutageRegistry()
+        now = [1000.0]
+        api = ControlAPI(registry, FakeKillTree(answers=(EMPTY,)), FakeStarter(), clock=lambda: now[0])
+        server = DualEraServer(api, clock=lambda: now[0])
+        run_id = started(api)
+        real_put = registry.put
+
+        def refuse_stop_write(record: dict) -> None:
+            if record.get("stop") is not None:
+                raise OSError("registry")
+            real_put(record)
+
+        registry.put = refuse_stop_write
+        now[0] = 2000.0
+        body = self._cancel(server, run_id)["result"]
+        polled = server.handle({"jsonrpc": "2.0", "id": "g", "method": "tasks/get",
+                                "params": modern_params(taskId=run_id)})["result"]
+        self.assertEqual(body["status"], "cancelled")
+        self.assertEqual(body["lastUpdatedAt"], "1970-01-01T00:16:40Z")
+        self.assertEqual(body["lastUpdatedAt"], polled["lastUpdatedAt"])
+        self.assertNotEqual(body["lastUpdatedAt"], "1970-01-01T00:33:20Z")
+        stored = registry.get(run_id)
+        self.assertIsNone(stored.get("stop"))
+        self.assertNotEqual(stored.get("state"), "stopped")
+
     def test_stop_intent_on_a_failed_start_stays_working_pending(self) -> None:
         # Same rule as the TUI and CLI: a Stop kept as intent on a start_failed run is unconfirmed, so the
         # task is working + "pending", never the terminal "failed".
@@ -595,6 +625,12 @@ class SameRunAndStopTests(unittest.TestCase):
         ok = server.handle({"jsonrpc": "2.0", "id": "y", "method": "tools/call",
                             "params": dict(start, _meta={"authorization": "secret"})})
         self.assertEqual(ok["result"]["structuredContent"]["code"], "started")
+        top = server.handle({"jsonrpc": "2.0", "id": "z", "method": "tools/list",
+                             "params": {"authorization": "secret"}})
+        self.assertEqual(top["result"]["tools"][0]["name"], "recursion_run_list")
+        weird = server.handle({"jsonrpc": "2.0", "id": "w", "method": "tools/list",
+                               "params": {"authorization": 1}})
+        self.assertEqual(weird["error"], {"code": -32001, "message": "unauthorized"})
         self.assertEqual(calls, ["run.start"])
 
     def test_ungguessable_length_and_whitespace_ids_are_rejected(self) -> None:

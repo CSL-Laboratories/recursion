@@ -31,6 +31,7 @@ Deferred (O60 / A45): no pinned pre-release conformance tool has checked the
 
 from __future__ import annotations
 
+import hmac
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -101,6 +102,14 @@ def claude_code_negotiate(
     if server_supports_modern:
         return Negotiation("modern", MODERN_PROTOCOL, "server/discover", True, mode)
     return Negotiation("legacy", LEGACY_PROTOCOL, "initialize", True, mode)
+
+
+def _same_token(expected: str, presented: object) -> bool:
+    """Constant-time match. A non-string presented value is not the token."""
+
+    if not isinstance(presented, str):
+        return False
+    return hmac.compare_digest(presented, expected)
 
 
 def _meta(params: Mapping | None) -> dict:
@@ -251,7 +260,9 @@ class DualEraServer:
         if self.auth_token is None:
             return True
         meta = _meta(params)
-        return meta.get("authorization") == self.auth_token or params.get("authorization") == self.auth_token
+        return _same_token(self.auth_token, meta.get("authorization")) or _same_token(
+            self.auth_token, params.get("authorization")
+        )
 
     def _tools_list(self, params: Mapping) -> dict:
         tools = mcp_tools.descriptors()
@@ -364,13 +375,16 @@ class DualEraServer:
             # write-back did): the run.stop answer is the truth (S6). An unconfirmed Stop reads working +
             # "pending", and a confirmed one reads cancelled, never pending from a stale record (red-team r3
             # finding 1; bot review 4511585104). The stop time is kept from the record when it has one
-            # (bot review 4511755938), so lastUpdatedAt never moves backward on the next poll.
+            # (bot review 4511755938). A write that never landed has no stored time: inventing the server
+            # clock makes this reply newer than the next tasks/get, which still reads the start time
+            # (bot review 4517669064).
             state = "stopped" if answer["code"] == "stopped" else "stop_pending"
             rec = dict(before["run"], state=state)
             stop = dict(rec.get("stop") or {})
-            if not isinstance(stop.get("requested_at"), (int, float)):
+            if not isinstance(stop.get("requested_at"), (int, float)) and answer.get("recorded") is not False:
                 stop["requested_at"] = self._clock()
-            rec["stop"] = stop
+            if stop:
+                rec["stop"] = stop
         extra = {"statusMessage": answer.get("code")}
         if rec.get("state") == "stopped":
             extra["result"] = {"content": [{"type": "text", "text": "cancelled"}]}

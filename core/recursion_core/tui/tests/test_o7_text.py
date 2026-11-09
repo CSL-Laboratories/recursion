@@ -233,6 +233,20 @@ class StaleWatchOnlyTest(unittest.TestCase):
         self.assertEqual(labels, {p.UNAVAILABLE_LABEL, p.STALE})
         self.assertNotEqual(app.last["code"], "ok")
 
+    def test_stopped_answer_clears_uncertainty_for_a_run_absent_from_the_list(self) -> None:
+        # 4504133355: a Stop of a run another client started stayed UNCERTAIN after the API said stopped.
+        api = ScriptedAPI({"run.list": {"code": "ok", "runs": []},
+                           "run.stop": {"code": "pending", "run_id": "run-1", "reason": "cgroup_unknown"}})
+        app = TuiApp(api, clock=Clock(), environ={"NO_COLOR": "1"})
+        app.open()
+        app.command("stop run-1")
+        self.assertIn("run=run-1", app._uncertain)
+        api.answers["run.stop"] = {"code": "stopped", "run_id": "run-1", "reason": "stopped"}
+        app.command("stop run-1")
+        self.assertEqual(app.last["code"], "stopped")
+        self.assertNotIn("run=run-1", app._uncertain)
+        self.assertNotIn(p.UNCERTAIN, {label for label, _ in app.conditions()})
+
     def test_stale_list_stays_stale_after_a_fresh_status(self) -> None:
         # 4503920848: attaching replaced the stale list answer and watch_only turned off.
         run = {"run_id": "r", "state": "running", "engine": "codex", "tenant": "t1"}

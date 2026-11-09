@@ -221,6 +221,10 @@ class TuiApp:
         for subject in list(self._uncertain):  # a later answer about another run does not clear it
             if not open_stop.get(subject, True):
                 del self._uncertain[subject]
+        # A stopped answer for a run that is not in this snapshot still confirms that Stop.
+        # The cleanup above keeps it when the run is absent (bot review 4504133355).
+        if method == "run.stop" and code == "stopped" and isinstance(answer.get("run_id"), str):
+            self._uncertain.pop(f"run={answer['run_id']}", None)
         labels = ",".join(sorted({label for label, _ in self.answer_conditions})) or "none"
         said = " ".join(x for x in (f"answer {method} status={field(code)}", self._answer_fields(answer)) if x)
         # The full line keeps the view state for the transcript; speech leaves it to the condition edges.

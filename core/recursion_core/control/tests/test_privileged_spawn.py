@@ -40,6 +40,7 @@ from recursion_core.control.privileged_spawn import (
     evaluate_host,
     f21_open_items,
     find_target_uid_pid,
+    is_root_target,
     is_shared_system_account,
     percentile,
     probe_abs_store_read,
@@ -519,6 +520,61 @@ class EngineUserDetectionTests(unittest.TestCase):
         self.assertEqual(systemd.target_user, ENGINE_USER)
         self.assertEqual(systemd.target_uid, ENGINE_UID)
         self.assertEqual(select_path(backends).candidate, systemd)
+
+    def test_systemd_run_engine_user_that_is_root_or_our_uid_is_rejected(self) -> None:
+        # Red-team round 3: a configured engine user reaches systemd-run
+        # directly, so it needs the sudo path's "never root, never our uid"
+        # rule. Root passes every F21 probe from uid 1000.
+        for user, uid in (("root", 0), (ENGINE_USER, 0), (ENGINE_USER, 1000)):
+            with self.subTest(user=user, uid=uid):
+
+                def run(cmd, timeout: float, user=user, uid=uid) -> ProcResult:
+                    if cmd[0] == "systemd-run" and cmd[1] == f"--uid={user}":
+                        return ProcResult(0, f"{uid}\n", "")
+                    return ProcResult(1, "", "denied")
+
+                probed: list[Backend] = []
+
+                def probe_fn(backend: Backend, n: int):
+                    probed.append(backend)
+                    return ALL_BLOCKED
+
+                overhead = Overhead(DEFAULT_N, 0.01, 0.02, 0.005, 0.03, ("systemd-run",))
+                evaluation = evaluate_host(
+                    n=DEFAULT_N,
+                    facts=_facts(),
+                    run_fn=run,
+                    measure_fn=lambda backend, n: overhead,
+                    probe_fn=probe_fn,
+                    f21_open=(),
+                    engine_user=user,
+                    env={},
+                )
+                systemd = next(b for b in evaluation.backends if b.name == "systemd_run")
+                self.assertFalse(systemd.available)
+                self.assertIsNone(systemd.target_uid)
+                self.assertIn("rejected: engine user must not be root", systemd.reason)
+                self.assertEqual(probed, [])
+                self.assertEqual(evaluation.selected.name, "managed_login_folder")
+                self.assertTrue(evaluation.selected.beta)
+                self.assertIsNone(evaluation.selected.backend)
+                self.assertIsNone(evaluation.selected.candidate)
+
+    def test_select_path_never_picks_a_root_target(self) -> None:
+        for backend in (
+            Backend("systemd_run", True, True, "ok", target_user="root", target_uid=0),
+            Backend("sudo", True, True, "ok", target_user=ENGINE_USER, target_uid=0),
+            Backend("sudo", True, True, "ok", target_user="root", target_uid=ENGINE_UID),
+        ):
+            with self.subTest(backend=backend):
+                self.assertTrue(is_root_target(backend))
+                for f21_open in ((), None):
+                    selected = select_path((backend,), f21_open=f21_open)
+                    self.assertEqual(selected.name, "managed_login_folder")
+                    self.assertTrue(selected.beta)
+                    self.assertIsNone(selected.backend)
+                    self.assertIsNone(selected.candidate)
+        self.assertFalse(is_root_target(_engine("systemd_run")))
 
 
 class EvaluateHostInjectionTests(unittest.TestCase):

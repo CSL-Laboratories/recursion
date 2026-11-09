@@ -3,13 +3,15 @@
 The durable registry (B8/B9) and the cgroup v2 + pidfd cleanup layer (B6) are other build items; the
 control API only sees these two interfaces, and tests fake them. A run record is a plain dict::
 
-    {"run_id", "tenant", "engine", "state": "running" | "stop_pending" | "stopped",
-     "cgroup": "<cgroup path or handle id>", "started_at",
+    {"run_id", "tenant", "engine",
+     "state": "starting" | "start_failed" | "running" | "stop_pending" | "stopped",
+     "cgroup": None | "<cgroup path or handle id>", "started_at",
      "stop": None | {"requested_at", "checks", "reason", "requested"},
      "start_key": None | {"client_key", "engine", "prompt_sha256"}}
 
 ``start_key`` is stored with the record so start dedupe survives a daemon restart: a durable registry
-must persist it and answer ``find_start`` from what it persisted.
+must persist it and answer ``find_start`` from what it persisted. A ``starting`` record is the launch
+intent the control API writes before it calls the starter; ``cgroup`` is None until the launch is recorded.
 """
 
 from __future__ import annotations

@@ -65,14 +65,18 @@ class FakeDriver:
     def __init__(self, confirm_answers=(EMPTY,)) -> None:
         self.registry, self.kill = InMemoryRunRegistry(), FakeKillTree(list(confirm_answers))
         self.model_calls = 0
-        self.api = ControlAPI(self.registry, self.kill, self._start, clock=lambda: 1000.0)
+        self._ids = 0
+        self.api = ControlAPI(self.registry, self.kill, self._start, clock=lambda: 1000.0, new_run_id=self._new_id)
         self._stop = threading.Event()
         self.emitted = 0
 
+    def _new_id(self) -> str:  # the API picks the run id (#327); sequential here so goldens stay stable
+        self._ids += 1
+        return f"run-{self._ids}"
+
     def _start(self, params: dict) -> dict:
         self.model_calls += 1
-        n = self.model_calls
-        return {"run_id": f"run-{n}", "cgroup": f"/sys/fs/cgroup/fake/run-{n}"}
+        return {"cgroup": f"/sys/fs/cgroup/fake/{params['run_id']}"}
 
     def start_run(self) -> str:
         return self.api.call("run.start", {"tenant": "t1", "engine": "codex", "prompt": "p"})["run"]["run_id"]

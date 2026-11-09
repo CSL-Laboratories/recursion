@@ -312,21 +312,28 @@ class SystemdUserManager:
 
         systemd prunes a unit's cgroup once it is empty and the unit is inactive, failed
         or (RemainAfterExit) active/exited, so ControlGroup= is then blank: a loaded unit
-        in one of those states with no cgroup is ended. A cgroup that still exists is
-        read directly. Not-found is gone (garbage-collected or never launched).
+        in one of those states with no cgroup is ended, but only with evidence that it
+        ran (an InvocationID or a main-process start time) and no queued job. A unit
+        whose start job is still queued (systemd-run timed out, or the daemon died
+        mid-launch) also reads loaded/inactive/dead with no cgroup; that is unknown.
+        A cgroup that still exists is read directly. Not-found is gone
+        (garbage-collected or never launched).
         """
         try:
             text = self._call(['systemctl', '--user', 'show', '--property=LoadState,'
-                               'ActiveState,SubState,ControlGroup', '--', unit])
+                               'ActiveState,SubState,ControlGroup,Job,InvocationID,'
+                               'ExecMainStartTimestampMonotonic', '--', unit])
             props = dict(line.split('=', 1) for line in text.splitlines() if '=' in line)
             group = props.get('ControlGroup', '')
             if not group:
                 load, active = props.get('LoadState'), props.get('ActiveState')
                 if load == 'not-found' and active == 'inactive':
                     return 'gone'
-                if load == 'loaded' and (active in ('inactive', 'failed')
-                                         or (active == 'active'
-                                             and props.get('SubState') == 'exited')):
+                ran = (props.get('InvocationID', '').strip('0')
+                       or props.get('ExecMainStartTimestampMonotonic', '0') not in ('', '0'))
+                if (load == 'loaded' and ran and props.get('Job', '') in ('', '0')
+                        and (active in ('inactive', 'failed')
+                             or (active == 'active' and props.get('SubState') == 'exited'))):
                     return 'empty'
                 return 'unknown'
             if not group.startswith('/') or '..' in Path(group).parts:

@@ -414,9 +414,13 @@ class SystemdManagerTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def show(self, group, active='active', sub='running', load='loaded'):
+    def show(self, group, active='active', sub='running', load='loaded',
+             invocation='0b5a2f3c9d8e4f60a1b2c3d4e5f60718', started='81234567', job=None):
+        extra = '' if job is None else f'Job={job}\n'
         self.manager._call = Mock(return_value=f'LoadState={load}\nActiveState={active}\n'
-                                               f'SubState={sub}\nControlGroup={group}\n')
+                                               f'SubState={sub}\nControlGroup={group}\n'
+                                               f'{extra}InvocationID={invocation}\n'
+                                               f'ExecMainStartTimestampMonotonic={started}\n')
 
     def events(self, group, populated):
         path = self.root / group.lstrip('/')
@@ -458,6 +462,50 @@ class SystemdManagerTests(unittest.TestCase):
         # RemainAfterExit=yes: active (exited); systemd prunes the empty cgroup.
         self.show('', active='active', sub='exited')
         self.assertEqual(self.manager.observe('a'), 'empty')
+
+    def test_never_started_unit_is_not_empty(self):
+        # A transient unit whose start job is still queued: no cgroup yet, no invocation.
+        self.show('', active='inactive', sub='dead', invocation='', started='0', job='4211')
+        self.assertEqual(self.manager.observe('a'), 'unknown')
+        self.show('', active='inactive', sub='dead', invocation='', started='0')
+        self.assertEqual(self.manager.observe('a'), 'unknown')
+        # Ran before, but a new start job is queued: not positively ended.
+        self.show('', active='inactive', sub='dead', job='4212')
+        self.assertEqual(self.manager.observe('a'), 'unknown')
+        # Either piece of evidence that it ran is enough once no job is queued.
+        self.show('', active='inactive', sub='dead', invocation='', started='81234567')
+        self.assertEqual(self.manager.observe('a'), 'empty')
+        self.show('', active='inactive', sub='dead', started='0')
+        self.assertEqual(self.manager.observe('a'), 'empty')
+
+    def test_launch_timeout_with_queued_job_is_unknown_and_not_swept(self):
+        # Round-2 red team: systemd-run hits the _call timeout while the start job is
+        # queued. The run must read unknown (never terminated) and the sweep must not
+        # stop its unit.
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        registry = Registry(Path(temp.name) / 'state')
+        self.addCleanup(registry.close)
+        unit = 'recursion-run-one.service'
+        calls = []
+        def call(argv):
+            calls.append(argv)
+            if argv[0] == 'systemd-run':
+                raise subprocess.TimeoutExpired(argv, 15)
+            if argv[:3] == ['systemctl', '--user', 'show']:
+                return ('LoadState=loaded\nActiveState=inactive\nSubState=dead\n'
+                        'ControlGroup=\nJob=4211\nInvocationID=\n'
+                        'ExecMainStartTimestampMonotonic=0\n')
+            if argv[:3] == ['systemctl', '--user', 'list-units']:
+                return f'{unit} loaded inactive dead /fake\n'
+            return ''
+        self.manager._call = call
+        daemon = Daemon(registry, self.manager, lambda: 'boot-a')
+        with self.assertRaises(subprocess.TimeoutExpired):
+            daemon.start('one', ['/fake'])
+        self.assertEqual(registry.get('one').state, 'unknown')
+        self.assertEqual(daemon.sweep()[0].state, 'unknown')
+        self.assertFalse([a for a in calls if a[:3] == ['systemctl', '--user', 'stop']])
 
     def test_ended_unit_with_live_cgroup_is_not_empty(self):
         # failed with processes left behind: the cgroup still exists and is populated.

@@ -48,25 +48,37 @@ class InMemoryRunRegistry:
     """Thread-safe in-memory registry for tests and the candidate CLI; not durable.
 
     ``find_start`` is an indexed lookup on ``(tenant, client_key)``, so keyed starts do not slow down as
-    runs accumulate (a durable registry should index it too)."""
+    runs accumulate (a durable registry should index it too). The index keeps every run id for a key, in
+    first-seen order. Changing or clearing the first record's key leaves the next record that still
+    carries that key (bot review 4517642164)."""
 
     def __init__(self, records: list[dict] | None = None) -> None:
         self._lock = threading.Lock()
         self._runs: dict[str, dict] = {}
-        self._starts: dict[tuple[str, str], str] = {}  # (tenant, client_key) -> run_id
+        self._starts: dict[tuple[str, str], list[str]] = {}  # (tenant, client_key) -> run ids, first seen first
         for r in records or []:
             self._store(copy.deepcopy(r))
 
     def _store(self, rec: dict) -> None:
         old = self._runs.get(rec["run_id"])
-        if old is not None:
-            okey = _start_index_key(old)
-            if okey is not None and self._starts.get(okey) == rec["run_id"]:
-                del self._starts[okey]
+        old_key = _start_index_key(old) if old is not None else None
+        new_key = _start_index_key(rec)
+        if old_key is not None and old_key != new_key:
+            self._unlink_start(old_key, rec["run_id"])
         self._runs[rec["run_id"]] = rec
-        key = _start_index_key(rec)
-        if key is not None:
-            self._starts.setdefault(key, rec["run_id"])
+        if new_key is None:
+            return
+        ids = self._starts.setdefault(new_key, [])
+        if rec["run_id"] not in ids:  # same key on update keeps its place; a new duplicate is appended
+            ids.append(rec["run_id"])
+
+    def _unlink_start(self, key: tuple[str, str], run_id: str) -> None:
+        ids = self._starts.get(key)
+        if not ids or run_id not in ids:
+            return
+        ids.remove(run_id)
+        if not ids:
+            del self._starts[key]
 
     def get(self, run_id: str) -> dict | None:
         with self._lock:
@@ -83,8 +95,10 @@ class InMemoryRunRegistry:
 
     def find_start(self, tenant: str, client_key: str) -> dict | None:
         with self._lock:
-            run_id = self._starts.get((tenant, client_key))
-            return copy.deepcopy(self._runs[run_id]) if run_id is not None else None
+            ids = self._starts.get((tenant, client_key))
+            if not ids:
+                return None
+            return copy.deepcopy(self._runs[ids[0]])
 
 
 def _start_index_key(rec: dict) -> tuple[str, str] | None:

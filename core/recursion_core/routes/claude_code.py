@@ -5,7 +5,7 @@ One user message goes in as a JSONL line, stdin is closed, and stdout is read un
 envelope. The Claude subscription is used only here (Q12); other harnesses go through
 ``profile_route`` and ``subscription_routes``.
 
-Typed limit signals read (field names from the PRODUCT.md 398cd812 11.2 records: ``rate_limit_event``
+Typed limit signals read (field names from the PRODUCT.md 055cc7a5 11.2 records: ``rate_limit_event``
 and ``api_error_params.rate_limit_info``; inner names marked unverified were not read from the
 vendor's source):
 
@@ -64,7 +64,10 @@ BARE_DEFAULT_STATES = ("absent", "present", "unknown")
 PASSTHROUGH_METHOD_ENV = {
     "bedrock": ("CLAUDE_CODE_USE_BEDROCK", "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_PROFILE", "AWS_ACCESS_KEY_ID",
                 "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_BEARER_TOKEN_BEDROCK", "AWS_CONFIG_FILE",
-                "AWS_SHARED_CREDENTIALS_FILE", "ANTHROPIC_BEDROCK_BASE_URL", "ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION"),
+                "AWS_SHARED_CREDENTIALS_FILE", "ANTHROPIC_BEDROCK_BASE_URL", "ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION",
+                # AWS SDK web-identity role (EKS IRSA and similar); names from the AWS SDKs and Tools
+                # reference guide, "Assume role credential provider" (retrieved 2026-11-09).
+                "AWS_ROLE_ARN", "AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_ROLE_SESSION_NAME"),
     "vertex": ("CLAUDE_CODE_USE_VERTEX", "CLOUD_ML_REGION", "ANTHROPIC_VERTEX_PROJECT_ID", "ANTHROPIC_VERTEX_BASE_URL",
                "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_PROJECT", "GCLOUD_PROJECT"),
     "foundry": ("CLAUDE_CODE_USE_FOUNDRY", "ANTHROPIC_FOUNDRY_API_KEY", "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
@@ -82,7 +85,16 @@ PASSTHROUGH_METHOD_REQUIRED = {
     "foundry": ("CLAUDE_CODE_USE_FOUNDRY",),
     "gateway": ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"),
 }
-_OFF = ("", "0", "false")
+# A CLAUDE_CODE_USE_* switch counts as on only for a clearly true value; anything else ("off", "no", a
+# typo) is refused, since claude would read it as off and bill the sign-in under a cloud label (fail closed).
+_SWITCH_ON = ("1", "true", "yes", "on")
+
+
+def _method_var_missing(name: str, value: str | None) -> bool:
+    value = (value or "").strip()
+    if name.startswith("CLAUDE_CODE_USE_"):
+        return value.lower() not in _SWITCH_ON
+    return value.lower() in ("", "0", "false")  # a gateway URL or token: set, and not a placeholder off value
 
 
 class ClaudeCodeAdapter(RouteAdapter):
@@ -133,7 +145,7 @@ class ClaudeCodeAdapter(RouteAdapter):
             if names is None:
                 raise c.RouteError(c.LAUNCH_REFUSED, f"passthrough method {scalar(method)} has no listed variables")
             missing = [n for n in PASSTHROUGH_METHOD_REQUIRED[method]
-                       if self._parent_env.get(n, "").strip().lower() in _OFF]
+                       if _method_var_missing(n, self._parent_env.get(n))]
             if missing:
                 raise c.RouteError(c.LAUNCH_REFUSED, f"passthrough method {method} needs {', '.join(missing)} "
                                    "set; without it the run would use the sign-in instead")

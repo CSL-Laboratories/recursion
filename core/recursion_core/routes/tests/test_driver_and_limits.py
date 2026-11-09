@@ -195,6 +195,37 @@ class ApiKeyAndPassthroughTest(unittest.TestCase):
                     self.assertEqual(res["code"], c.LAUNCH_REFUSED, (method, name, value))
                     self.assertEqual(h.launcher.calls, [], (method, name, value))
 
+    def test_passthrough_switch_must_be_clearly_on(self) -> None:
+        # Bot review 4511550474 at 09d0c36f: a denylist of off values let "off" or "no" through, which claude
+        # reads as off, so the run billed the sign-in under a cloud label. The switch is now an allowlist.
+        for method, name in (("bedrock", "CLAUDE_CODE_USE_BEDROCK"), ("vertex", "CLAUDE_CODE_USE_VERTEX"),
+                             ("foundry", "CLAUDE_CODE_USE_FOUNDRY")):
+            for value, launches in (("off", False), ("no", False), ("disabled", False), ("2", False),
+                                    ("1", True), ("true", True), (" Yes ", True), ("ON", True)):
+                h = Harness([claude_ok()])
+                h.service._adapters["claude_code"]._parent_env = dict(PARENT, **{name: value})
+                req = request(kind="passthrough", conn_id=f"user-{method}")
+                req["route"]["connection"]["method"] = method
+                res = h.handle(req)
+                self.assertEqual(res["code"] != c.LAUNCH_REFUSED, launches, (method, value, res["code"]))
+                self.assertEqual(bool(h.launcher.calls), launches, (method, value))
+
+    def test_bedrock_passthrough_keeps_the_web_identity_role(self) -> None:
+        # Bot review 4511222552 at 92a897b3: an AWS web-identity role (EKS IRSA) lost its two variables.
+        h = Harness([claude_ok()])
+        h.service._adapters["claude_code"]._parent_env = dict(
+            PARENT, AWS_ROLE_ARN="arn:aws:iam::123456789012:role/bedrock",
+            AWS_WEB_IDENTITY_TOKEN_FILE="/var/run/secrets/eks.amazonaws.com/serviceaccount/token",
+            AWS_ROLE_SESSION_NAME="recursion")
+        req = request(kind="passthrough", conn_id="user-bedrock")
+        req["route"]["connection"]["method"] = "bedrock"
+        h.handle(req)
+        env = h.launcher.calls[0]["env"]
+        for name in ("AWS_ROLE_ARN", "AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_ROLE_SESSION_NAME"):
+            self.assertIn(name, env)
+        for name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CODEX_ACCESS_TOKEN"):
+            self.assertNotIn(name, env)
+
     def test_passthrough_needs_method_and_is_claude_code_only(self) -> None:
         self.assertEqual(Harness([]).handle(request(kind="passthrough"))["code"], c.REQUEST_INVALID)
         req = request(engine="codex", kind="passthrough")

@@ -1,7 +1,8 @@
 # routes: one route contract, Claude Code and Codex adapters, connection-keyed breaker (CSL-797)
 
-Candidate code for build item 7. Spec: PRODUCT.md at csl-research `398cd812cb8a9cf0ef3d1950f1b15bd9a76e3dfa`
-(SHA-256 `36666beeadacb2af741db0ee55022b2e3911513b4de329ec500d50badbb3a226`): 3.4 S3 (breaker), S4 (hung
+Candidate code for build item 7. Spec: PRODUCT.md at csl-research `055cc7a5c793b7135e5d0565dc4198cf96230531`
+(SHA-256 `e64783152f6d67d4ede774dc41d112fe46c2d7536d53cb2c04e71a3566044daf`, receipt pointer CSLR-D-011; first written
+against `398cd812`, whose 3.4 S3/S4, 11.2 and Q12 text 055cc7a5 keeps): 3.4 S3 (breaker), S4 (hung
 engine), 11.2 (breaker, plan limits), Q12 (Claude subscription only inside Claude Code).
 
 ## What it is
@@ -92,7 +93,11 @@ run's environment changes:
   environment does (no other engine's key, no stray `ANTHROPIC_API_KEY`). A method with no listed
   variables is `launch_refused`, and so is a method whose own switch or credential is unset
   (`CLAUDE_CODE_USE_BEDROCK` / `_VERTEX` / `_FOUNDRY`; for `gateway` both `ANTHROPIC_BASE_URL` and
-  `ANTHROPIC_AUTH_TOKEN`): without it the run would fall back to the sign-in and bill the subscription. `--bare` is the user's choice there too. `--bare` is refused only on the
+  `ANTHROPIC_AUTH_TOKEN`): without it the run would fall back to the sign-in and bill the subscription.
+  A `CLAUDE_CODE_USE_*` switch counts as set only for `1`, `true`, `yes` or `on` (any case); `off`, `no`
+  or anything else is refused. These four methods are the whole passthrough contract; any other method
+  is refused. Bedrock also passes the AWS SDK web-identity role variables (`AWS_ROLE_ARN`,
+  `AWS_WEB_IDENTITY_TOKEN_FILE`, `AWS_ROLE_SESSION_NAME`). `--bare` is the user's choice there too. `--bare` is refused only on the
   subscription route. No route drops `CLAUDE_CODE_OAUTH_TOKEN`, and the parent env is never changed.
 - The adapter never edits settings or credential files, never sets `DISABLE_LOGIN_COMMAND`, and never
   sets, stores or reads `CLAUDE_CODE_OAUTH_TOKEN`. The binary is `claude` itself; its hash and version are

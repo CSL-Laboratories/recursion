@@ -17,9 +17,18 @@ recorded on F60, CSL-762).
   run sends nothing; on a pending run it only re-checks, unless the earlier cleanup request itself
   raised, in which case the next stop sends it again. An unknown run is `run_unknown`. A start's
   `client_key` dedupes retries per tenant and is bound to that start's engine and prompt digest; reusing
-  it for a different request is `request_invalid` / `client_key_reused`.
+  it for a different request is `request_invalid` / `client_key_reused`. The key and digest are stored in
+  the run record (`start_key`) and found through `RunRegistry.find_start`, so a durable registry keeps
+  dedupe across a daemon restart (11.3, B-17). A start that launches and then crashes before the record
+  is written is not covered; that needs a launch intent written first, in the durable registry item.
+- Stop decisions are serialised per run, not API-wide, so one hung cleanup never queues another run's
+  Stop (11.3, D2-55 / B-19).
+- **Unscoped (open decision).** `ControlAPI.call` takes no caller identity. `run.list` and `run.status`
+  return every tenant's records, and `run.stop` stops any run by id, whoever asks. Tenant is only a
+  namespace for `client_key`, not an access boundary. Caller scopes (11.8 / D3) are not built here.
 - Reads (`run.status`, `run.list`) return copies, change no state and never call the cleanup layer.
-- `registry.py`: the `RunRegistry` and `KillTree` interfaces, plus an in-memory registry for tests.
+- `registry.py`: the `RunRegistry` (`get`, `list`, `put`, `find_start`) and `KillTree` interfaces, plus an
+  in-memory registry for tests.
   The durable registry (B8, B9) and the real cgroup/pidfd cleanup (B6) are other build items.
 - `cli.py`: `recursion-control list | status RUN | stop RUN | start --tenant --engine --prompt`. It
   makes one API call, prints the API's answer verbatim as JSON and exits 0 (ok, started, stopped),

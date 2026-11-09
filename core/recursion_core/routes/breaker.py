@@ -2,7 +2,7 @@
 
 Lesson: CSL-608 (https://linear.app/csl-laboratories/issue/CSL-608, Done research) records that
 master's breaker is keyed by engine id, is shared by every tenant on that engine and never resets.
-This breaker is the other way round (PRODUCT.md 398cd812, 3.4 S3 and S4, grill Q8 and Q23):
+This breaker is the other way round (PRODUCT.md 055cc7a5, CSLR-D-011: 3.4 S3 and S4, grill Q8 and Q23):
 
 * It is keyed by the connection a route is billed through (``"<kind>:<id>"``, an API key or a
   subscription login), and by (connection, model) only when the typed limit signal says the

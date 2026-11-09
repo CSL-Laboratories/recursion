@@ -119,7 +119,9 @@ unparsed. Real-shape lines covered: `2.1.318 (Claude Code)`, `codex-cli 0.160.0`
 
 Hermes detector (B27, CSL-772): the unofficial npm `hermes-agent` bridge (0.23.0, bins `hermes`,
 `hermes-npm`, `hermes-agent` as `bin/*.js` under node) is not upstream Hermes. `detect()` names it
-(a `node_modules/hermes-agent/` path, or a `package.json` named `hermes-agent` above a `bin/` file),
+(a `node_modules/hermes-agent/` segment or a `package.json` named `hermes-agent` in any ancestor
+directory, checked on the path as written, after each symlink hop and on the realpath, so an
+`npm link`ed or `npm install -g <folder>` root and a native outside `bin/` are caught too),
 reports it in the detection note, and gives it no candidate even if a native file sat in its tree.
 `grant()` and `verify()` apply the same rule to the `hermes` path and to the `hermes-acp` the
 version probe runs (`wrapper_refused` before anything runs), so a configured path cannot get past

@@ -85,35 +85,94 @@ NPM_HERMES_PACKAGE = "hermes-agent"
 _PACKAGE_JSON_MAX = 1 << 16
 
 
-def npm_hermes_agent_root(realpath: str) -> str | None:
-    """Package root if ``realpath`` belongs to the unofficial npm ``hermes-agent`` bridge.
+_MAX_HOPS = 40
+
+
+def _resolution_paths(path: str) -> list[str]:
+    """``path`` as written, then the whole path again after each symlink hop, ending at the realpath.
+
+    Resolution goes component by component (like ``os.path.realpath``) and records every hop,
+    so a symlink such as npm's ``lib/node_modules/hermes-agent`` -> ``src/hermes-agent`` (``npm link``,
+    ``npm install -g <folder>``) is still seen after the final target leaves ``node_modules``.
+    Nothing is opened or executed; a readlink error or a loop just ends the walk.
+    """
+    first = os.path.abspath(path)
+    out = [first]
+    drive, rest = os.path.splitdrive(first)
+    resolved = drive + os.sep
+    pending = [c for c in rest.split(os.sep) if c]
+    hops = 0
+    while pending:
+        c = pending.pop(0)
+        if c == ".":
+            continue
+        if c == "..":
+            resolved = os.path.dirname(resolved)
+            continue
+        nxt = os.path.join(resolved, c)
+        if not os.path.islink(nxt):
+            resolved = nxt
+            continue
+        hops += 1
+        try:
+            target = os.readlink(nxt)
+        except OSError:
+            break
+        if hops > _MAX_HOPS:
+            break
+        if os.path.isabs(target):
+            drive, target = os.path.splitdrive(target)
+            resolved = (drive or os.path.splitdrive(resolved)[0]) + os.sep
+        pending = [t for t in target.split(os.sep) if t] + pending
+        out.append(os.path.join(resolved, *pending) if pending else resolved)
+    out.append(os.path.realpath(path))
+    return list(dict.fromkeys(out))
+
+
+def _package_json_names_bridge(directory: str) -> bool:
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOCTTY", 0)
+        fd = os.open(os.path.join(directory, "package.json"), flags)
+        with open(fd, "rb") as f:
+            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                return False
+            data = json.loads(f.read(_PACKAGE_JSON_MAX))
+    except (OSError, ValueError, RecursionError):
+        return False
+    return isinstance(data, dict) and data.get("name") == NPM_HERMES_PACKAGE
+
+
+def npm_hermes_agent_root(path: str) -> str | None:
+    """Package root if ``path`` (or any symlink hop to it) is in the unofficial npm ``hermes-agent`` bridge.
 
     The bridge (npm ``hermes-agent`` 0.23.0, "Unofficial npm bridge for Hermes Agent") installs
     a ``hermes`` bin that is ``bin/hermes.js`` under node; it is not upstream Hermes (B27).
-    It is recognised by the ``node_modules/hermes-agent/`` path segment, or by a
-    ``package.json`` named ``hermes-agent`` in the grandparent directory of a ``bin/`` file.
-    Nothing is executed; the file is read, size-capped, and a read error means "not recognised".
-    It is opened non-blocking and read only if it is a regular file, so a FIFO or device named
-    ``package.json`` (e.g. ``/usr/package.json`` above ``/usr/bin/hermes``) cannot hang detection.
+    It is recognised on ``path`` as written, on the path after every symlink hop, and on its
+    realpath, by either a ``node_modules/hermes-agent/`` path segment or a ``package.json``
+    named ``hermes-agent`` in any ancestor directory (so a symlinked package root, or a file
+    outside ``bin/`` such as ``<root>/bin/<platform>/hermes`` or ``<root>/vendor/hermes``, is
+    still the bridge). Nothing is executed; each ``package.json`` is size-capped, opened
+    non-blocking and read only if it is a regular file, so a FIFO or device named
+    ``package.json`` (e.g. ``/usr/package.json`` above ``/usr/bin/hermes``) cannot hang
+    detection, and a read error means "not recognised".
     """
-    parts = os.path.normpath(realpath).split(os.sep)
-    for i in range(len(parts) - 2):
-        if parts[i] == "node_modules" and parts[i + 1] == NPM_HERMES_PACKAGE:
-            return os.sep.join(parts[: i + 2]) or os.sep
-    if os.path.basename(os.path.dirname(realpath)) != "bin":
-        return None
-    root = os.path.dirname(os.path.dirname(realpath))
-    try:
-        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOCTTY", 0)
-        fd = os.open(os.path.join(root, "package.json"), flags)
-        with open(fd, "rb") as f:
-            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
-                return None
-            data = json.loads(f.read(_PACKAGE_JSON_MAX))
-    except (OSError, ValueError, RecursionError):
-        return None
-    if isinstance(data, dict) and data.get("name") == NPM_HERMES_PACKAGE:
-        return root
+    views = [os.path.normpath(p) for p in _resolution_paths(path)]
+    for view in views:
+        parts = view.split(os.sep)
+        for i in range(len(parts) - 2):
+            if parts[i] == "node_modules" and parts[i + 1] == NPM_HERMES_PACKAGE:
+                return os.sep.join(parts[: i + 2]) or os.sep
+    seen: set[str] = set()
+    for view in views:
+        d = os.path.dirname(view)
+        while d not in seen:
+            seen.add(d)
+            if _package_json_names_bridge(d):
+                return d
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
     return None
 
 
@@ -149,7 +208,7 @@ def detect(engine: str, path_string: str) -> Detection:
     notes = []
     for h in firsts:
         if spec.engine == "hermes":
-            bridge = npm_hermes_agent_root(h.realpath)
+            bridge = npm_hermes_agent_root(h.path)
             if bridge is not None:
                 notes.append(
                     f"{h.path}: npm {NPM_HERMES_PACKAGE} bridge at {bridge} (unofficial, not upstream Hermes); refused"

@@ -82,7 +82,7 @@ def _realpath_native(spec: EngineSpec, path: str, what: str) -> str:
     real = os.path.realpath(path)
     if is_wrapper_name(real):
         raise LaunchRefused("wrapper_refused", spec.engine, f"{what} resolves to a wrapper name: {os.path.basename(real)}")
-    _refuse_npm_hermes_bridge(spec, real, what)
+    _refuse_npm_hermes_bridge(spec, path, what)
     try:
         kind = file_kind(real)
     except OSError as e:
@@ -94,11 +94,14 @@ def _realpath_native(spec: EngineSpec, path: str, what: str) -> str:
     return real
 
 
-def _refuse_npm_hermes_bridge(spec: EngineSpec, real: str, what: str) -> None:
-    """B27 (CSL-772): no file inside the unofficial npm hermes-agent tree is granted, probed or launched."""
+def _refuse_npm_hermes_bridge(spec: EngineSpec, path: str, what: str) -> None:
+    """B27 (CSL-772): no file inside the unofficial npm hermes-agent tree is granted, probed or launched.
+
+    ``path`` is the configured path, not its realpath, so each symlink hop is judged too.
+    """
     if spec.engine != "hermes":
         return
-    bridge = npm_hermes_agent_root(real)
+    bridge = npm_hermes_agent_root(path)
     if bridge is not None:
         raise LaunchRefused(
             "wrapper_refused", spec.engine,
@@ -191,7 +194,7 @@ def verify(g: Grant) -> None:
             raise LaunchRefused("binary_missing", spec.engine, path)
         if os.path.realpath(path) != real:
             raise LaunchRefused("binary_changed", spec.engine, f"{path} now resolves elsewhere")
-        _refuse_npm_hermes_bridge(spec, real, path)
+        _refuse_npm_hermes_bridge(spec, path, path)
         if not os.access(real, os.X_OK):  # exec bit removed after the grant: refuse here, not at spawn
             raise LaunchRefused("binary_missing", spec.engine, f"{real} is not executable")
         if _hash(spec, real)[0] != digest:

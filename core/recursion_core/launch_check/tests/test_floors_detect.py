@@ -351,6 +351,58 @@ class NpmHermesBridgeTests(unittest.TestCase):
         self.assertIsNone(found.candidate)
         self.assertIn("npm hermes-agent bridge", found.note)
 
+    @staticmethod
+    def _linked_bridge() -> tuple[str, str, str]:
+        """``npm link`` / ``npm install -g <folder>``: ``lib/node_modules/hermes-agent`` is a symlink to a
+        source folder outside any node_modules, with native files under ``vendor/`` (not ``bin/``)."""
+        prefix = F.dir()
+        src = os.path.join(prefix, "src", "hermes-agent")
+        vendor = os.path.join(src, "vendor")
+        os.makedirs(vendor)
+        with open(os.path.join(src, "package.json"), "w") as f:
+            f.write('{"name": "hermes-agent", "version": "0.23.0"}')
+        F.make("hermes", "hermes 0.9.1", where=vendor)
+        F.make("hermes-acp", "hermes-acp 0.9.1", where=vendor)
+        nm = os.path.join(prefix, "lib", "node_modules")
+        os.makedirs(nm)
+        os.symlink(src, os.path.join(nm, "hermes-agent"))
+        bindir = os.path.join(prefix, "bin")
+        os.makedirs(bindir)
+        for name in ("hermes", "hermes-acp"):
+            os.symlink(os.path.join("..", "lib", "node_modules", "hermes-agent", "vendor", name),
+                       os.path.join(bindir, name))
+        return bindir, src, nm
+
+    def test_symlinked_package_root_is_still_the_bridge(self) -> None:
+        bindir, src, nm = NpmHermesBridgeTests._linked_bridge()
+        hermes = os.path.join(bindir, "hermes")
+        self.assertEqual(os.path.join(src, "vendor", "hermes"), os.path.realpath(hermes))
+        self.assertEqual(os.path.join(nm, "hermes-agent"), npm_hermes_agent_root(hermes))
+        found = detect("hermes", bindir)
+        self.assertEqual("native", found.hits[0].kind)
+        self.assertIsNone(found.candidate)
+        self.assertIn("npm hermes-agent bridge", found.note)
+
+    def test_symlinked_package_root_without_package_json_is_still_the_bridge(self) -> None:
+        # Only the symlink hop names node_modules/hermes-agent; the realpath does not, and no package.json.
+        bindir, src, nm = NpmHermesBridgeTests._linked_bridge()
+        os.remove(os.path.join(src, "package.json"))
+        self.assertEqual(os.path.join(nm, "hermes-agent"), npm_hermes_agent_root(os.path.join(bindir, "hermes")))
+        self.assertIsNone(detect("hermes", bindir).candidate)
+
+    def test_native_outside_bin_is_recognised_by_an_ancestor_package_json(self) -> None:
+        # Reached directly (no symlink hop), a native nested under <root>/bin/<platform>/ or
+        # <root>/vendor/ is still in the tree named by <root>/package.json.
+        bindir, src, nm = NpmHermesBridgeTests._linked_bridge()
+        nested = os.path.join(src, "bin", "linux-x64")
+        os.makedirs(nested)
+        native = F.make("hermes", "hermes 0.9.1", where=nested)
+        self.assertEqual(src, npm_hermes_agent_root(native))
+        self.assertEqual(src, npm_hermes_agent_root(os.path.join(src, "vendor", "hermes")))
+        found = detect("hermes", nested)
+        self.assertIsNone(found.candidate)
+        self.assertIn("npm hermes-agent bridge", found.note)
+
     def test_detection_never_executes_the_bridge(self) -> None:
         bindir, root = self._bridge()
         marker = os.path.join(F.dir(), "ran")
@@ -421,6 +473,35 @@ class NpmHermesBridgeGrantTests(unittest.TestCase):
             f.write('{"name": "hermes-agent"}')
         self._refused(verify, g)
         self._refused(plan.exec_argv)
+
+    def test_grant_and_verify_refuse_a_symlinked_package_root(self) -> None:
+        # npm link layout: the realpath is src/hermes-agent/vendor/hermes, outside node_modules.
+        bindir, _src, _nm = NpmHermesBridgeTests._linked_bridge()
+        self._refused(grant, "hermes", os.path.join(bindir, "hermes"), probe=self._no_probe)
+        with mock.patch("recursion_core.launch_check.grant.run_version_probe", side_effect=self._no_probe) as run:
+            grants, records = launch_check(bindir)
+        run.assert_not_called()
+        self.assertNotIn("hermes", grants)
+        rec = next(r for r in records if r["engine"] == "hermes")
+        self.assertEqual("refused", rec["outcome"])
+
+    def test_verify_refuses_a_grant_whose_path_was_relinked_through_the_bridge_root(self) -> None:
+        # Same realpath and digest, but the configured path now reaches it through node_modules/hermes-agent.
+        prefix = F.dir()
+        src = os.path.join(prefix, "src")
+        os.makedirs(src)
+        F.make("hermes", "hermes 0.9.1", where=src)
+        F.make("hermes-acp", "hermes-acp 0.9.1", where=src)
+        link = os.path.join(prefix, "link")
+        os.symlink(src, link)
+        g = grant("hermes", os.path.join(link, "hermes"), probe=F.probe)
+        verify(g)
+        nm = os.path.join(prefix, "node_modules")
+        os.makedirs(nm)
+        os.symlink(src, os.path.join(nm, "hermes-agent"))
+        os.remove(link)
+        os.symlink(os.path.join(nm, "hermes-agent"), link)
+        self._refused(verify, g)
 
     def test_other_engines_are_not_judged_by_the_hermes_bridge_rule(self) -> None:
         prefix = F.dir()

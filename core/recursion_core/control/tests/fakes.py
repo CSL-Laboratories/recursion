@@ -33,13 +33,18 @@ class FakeStarter:
 
     def __call__(self, params: dict) -> dict:
         self.calls.append(params)
-        n = len(self.calls)
-        return {"run_id": f"run-{n}", "cgroup": f"/sys/fs/cgroup/fake/run-{n}"}
+        return {"cgroup": f"/sys/fs/cgroup/fake/{params['run_id']}"}
 
 
-def make_api(kill: FakeKillTree | None = None):
-    registry, kill, starter = InMemoryRunRegistry(), kill or FakeKillTree(), FakeStarter()
-    api = ControlAPI(registry, kill, starter, clock=lambda: 1000.0)
+def run_ids():
+    """Deterministic ``new_run_id``: run-1, run-2, ..."""
+    n = iter(range(1, 1_000_000))
+    return lambda: f"run-{next(n)}"
+
+
+def make_api(kill: FakeKillTree | None = None, registry=None, starter=None):
+    registry, kill, starter = registry or InMemoryRunRegistry(), kill or FakeKillTree(), starter or FakeStarter()
+    api = ControlAPI(registry, kill, starter, clock=lambda: 1000.0, new_run_id=run_ids())
     return api, registry, kill, starter
 
 

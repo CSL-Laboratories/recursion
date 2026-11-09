@@ -96,7 +96,8 @@ class NousTests(unittest.TestCase):
     def test_loopback_proxy_with_nous_adapter_only_runs(self) -> None:
         for url in ("http://127.0.0.1:8645/v1", "http://127.8.9.1:1/", "http://[::1]:8645", "https://127.0.0.1"):
             with self.subTest(url=url):
-                d = check_nous_own_loop(nous(base_url=url, adapters=["nous"]), BASE)
+                d = check_nous_own_loop(nous(base_url=url, adapters=["nous"]), BASE, current_user="u",
+                                        interactive_users=["u"])
                 self.assertEqual((d.base_url, d.adapters, d.warnings), (url, ("nous",), ()))
         d = check_nous_own_loop(nous(), BASE)
         self.assertEqual(d.adapters, ("nous",))
@@ -164,10 +165,18 @@ class NousTests(unittest.TestCase):
         self.assertEqual(len(d.warnings), 1)
         self.assertIn("alice, bob", d.warnings[0])
 
+    def test_unknown_host_users_warn(self) -> None:
+        # red-team #321 F3: "not checked" must not read as "nobody else is here".
+        d = check_nous_own_loop(nous(), BASE)
+        self.assertEqual(len(d.warnings), 1)
+        self.assertTrue(d.warnings[0].startswith("host users unknown"))
+        d = check_nous_own_loop(nous(), BASE, current_user="u", interactive_users=[])
+        self.assertEqual(d.warnings, ())
+
 
 class DoctorTests(unittest.TestCase):
     def test_doctor_reports_address_and_never_raises(self) -> None:
-        self.assertEqual(nous_proxy_doctor("http://127.0.0.1:8645/v1"),
+        self.assertEqual(nous_proxy_doctor("http://127.0.0.1:8645/v1", current_user="u", interactive_users=["u"]),
                          {"ok": True, "address": "http://127.0.0.1:8645/v1", "cause": "", "warnings": ()})
         bad = nous_proxy_doctor("http://10.1.2.3:8645")
         self.assertEqual((bad["ok"], bad["address"], bad["cause"]), (False, "http://10.1.2.3:8645", "proxy_not_loopback"))
@@ -175,6 +184,12 @@ class DoctorTests(unittest.TestCase):
         shared = nous_proxy_doctor("http://127.0.0.1:1", current_user="u", interactive_users=["u", "eve"])
         self.assertTrue(shared["ok"])
         self.assertIn("eve", shared["warnings"][0])
+
+    def test_doctor_warns_when_host_users_unknown(self) -> None:
+        for url in ("http://127.0.0.1:8645/v1", "http://10.1.2.3:8645"):
+            got = nous_proxy_doctor(url)
+            self.assertEqual(len(got["warnings"]), 1)
+            self.assertTrue(got["warnings"][0].startswith("host users unknown"))
 
 
 if __name__ == "__main__":

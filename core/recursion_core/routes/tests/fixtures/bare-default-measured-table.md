@@ -56,3 +56,15 @@ to 2.1.314/2.1.319 and 2.1.311 help is identical to 2.1.312; both are committed 
 so each measured build has a fixture. 2.1.320 was never published. `classifier_verdict_readonly`
 for the new rows is `classify_help` at #336 head 5138c4181787b743348e57e3154beb1d28010e4b. The
 refusal logic is unchanged; the subscription route still refuses at every measured build.
+
+## Admission table (one entry)
+
+Nov 9 owner call. The measurement rows above stay as evidence. The subscription
+route's allow table is this one hash, not one row per version. Classifier
+`unknown` is not an allow. A build runs as beta only when its `claude --help`
+text hashes to this entry and the build is at or above the 2.1.314 floor. Help
+that differs names the build and needs re-measuring. Below the floor refuses.
+
+| help_sha256 | label | floor |
+|-------------|-------|-------|
+| `5ca3a9dac2026e56c221fdd34380c7d7d45ebbb51c1d01b7c17c75cb076a0be8` | beta | 2.1.314 |

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 
+from recursion_core.routes import bare_default as bd
 from recursion_core.routes import contract as c
 from recursion_core.routes.base import RouteAdapter, scalar
 from recursion_core.routes.launch import child_env
@@ -109,6 +110,7 @@ class ClaudeCodeAdapter(RouteAdapter):
         self._binary = binary
 
     def argv(self, request: dict) -> list[str]:
+        self._run_label = None
         route = request["route"]
         kind = route["connection"]["kind"]
         bare = route.get("bare", False)
@@ -119,7 +121,12 @@ class ClaudeCodeAdapter(RouteAdapter):
             raise c.RouteError(c.LAUNCH_REFUSED, "--bare ignores the sign-in: not on the subscription route")
         auth_args = []
         if kind == "subscription":
+            # When the surface reports the build and its help, the measured-hash gate
+            # decides. A beta admission launches with no --bare. Unknown is not an allow.
+            gated = "help_text" in route or "claude_build" in route
             auth_args = self._subscription_auth_args(route)
+            if gated:
+                self._run_label = "beta"
             self._check_api_key_helper(route)
         # --verbose: stream-json output in print mode is documented to need it (unverified on this box).
         return [self._binary, *auth_args, *(["--bare"] if bare else []), "-p", "--input-format", "stream-json",
@@ -156,7 +163,18 @@ class ClaudeCodeAdapter(RouteAdapter):
 
     @staticmethod
     def _subscription_auth_args(route: dict) -> list[str]:
-        """Pass the build's documented opt-out; never guess a flag or accept unknown help."""
+        """Pass the build's documented opt-out; never guess a flag or accept unknown help.
+
+        When ``claude_build`` or ``help_text`` is reported, the subscription route runs
+        as beta only for an exact measured-help match at or above the 2.1.314 floor.
+        Help that differs names the build and refuses. Below the floor refuses.
+        ``bare_default`` does not bypass that gate, and unknown is not beta.
+        """
+        if "help_text" in route or "claude_build" in route:
+            decision = bd.subscription_beta(route.get("claude_build"), route.get("help_text"))
+            if decision["disposition"] != "beta" or decision["label"] != "beta":
+                raise c.RouteError(c.LAUNCH_REFUSED, decision["detail"])
+            return []
         state = route.get("bare_default")
         flag = route.get("bare_opt_out")
         if state is not None and state not in BARE_DEFAULT_STATES:

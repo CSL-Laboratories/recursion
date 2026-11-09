@@ -18,6 +18,8 @@ Request::
                "bare": false,                             # claude_code: refused on subscription only
                "bare_opt_out": "--no-bare" | null,         # only if reported by this build help
                "bare_default": "absent" | "present" | "unknown",  # claude_code subscription: reported (B20)
+               "claude_build": "<major.minor.patch>",     # with help_text: measured-help gate (B20)
+               "help_text": "<claude --help text>",       # exact text; one measured hash runs as beta
                "api_key_helper": "absent" | "present",    # claude_code subscription: reported by the surface
                "billing_ack": "api_key_helper",           # the user chose to run billing their API key
                "limits": {"on_limit": "ask" | "wait" | "fallback", "fallback": [<route>, ...]},

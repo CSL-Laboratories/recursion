@@ -38,13 +38,22 @@ class RouteAdapter:
             return c.result(rid, c.ENGINE_ERROR, detail=f"launch failed: {type(err).__name__}")
         events: list[dict] = []
         try:
-            return self.drive(process, request, deadline_at, events)
+            out = self.drive(process, request, deadline_at, events)
         except Deadline:
             process.fence("deadline")  # fenced for this request only; the breaker never hears of it
             return c.result(rid, c.DEADLINE_EXCEEDED, events=events, detail="recursion deadline")
         except _Protocol as err:
             process.fence("protocol_error")
             return c.result(rid, c.PROTOCOL_ERROR, events=events, detail=str(err))
+        return self._apply_run_label(out)
+
+    def _apply_run_label(self, out: dict) -> dict:
+        """A measured-help subscription run is beta. Other results keep their detail."""
+        label = getattr(self, "_run_label", None)
+        self._run_label = None
+        if label == "beta" and out.get("code") is None and out.get("detail") == "":
+            out["detail"] = "beta"
+        return out
 
     # -- subclass hooks -----------------------------------------------------------------------
     def argv(self, request: dict) -> list[str]:

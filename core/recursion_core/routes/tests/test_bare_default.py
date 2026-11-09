@@ -55,9 +55,8 @@ class ClassifyHelpTest(unittest.TestCase):
         self.assertEqual(bd.classify_help(text), "present")
 
     def test_measured_builds_read_unknown(self) -> None:
-        # Full help of the builds measured on 2026-11-08 (bare-default-measured-table.md): the
-        # floor 2.1.314, npm latest 2.1.319 then 2.1.321 (Nov 9) and npm stable 2.1.311 must keep
-        # refusing until their help settles it. 2.1.320 was never published.
+        # Classifier unknown is not an allow. Without claude_build/help_text these measured
+        # builds still refuse. 2.1.320 was never published.
         for version in ("2.1.311", "2.1.312", "2.1.314", "2.1.319", "2.1.321"):
             with self.subTest(version=version):
                 text = (FIXTURE.parent / f"claude-{version}-help.txt").read_text()
@@ -66,6 +65,84 @@ class ClassifyHelpTest(unittest.TestCase):
                 h = Harness([])
                 self.assertEqual(h.handle(request(**metadata))["code"], c.LAUNCH_REFUSED)
                 self.assertEqual(h.launcher.calls, [])
+
+    def test_matching_measured_hash_runs_subscription_as_beta(self) -> None:
+        # One entry, not a version allow list. 2.1.314, 2.1.319 and 2.1.321 share it.
+        self.assertEqual(len(bd.MEASURED_HELP), 1)
+        self.assertEqual(set(bd.MEASURED_HELP[0]), {"help_sha256", "label"})
+        self.assertEqual(bd.MEASURED_HELP[0]["label"], "beta")
+        hashes = set()
+        for version in ("2.1.314", "2.1.319", "2.1.321"):
+            text = (FIXTURE.parent / f"claude-{version}-help.txt").read_text()
+            hashes.add(bd.help_sha256(text))
+            decision = bd.subscription_beta(version, text)
+            self.assertEqual(decision["disposition"], "beta")
+            self.assertEqual(decision["label"], "beta")
+            self.assertEqual(decision["detail"], "beta")
+            h = Harness([claude_ok()])
+            # Classifier unknown is still not an allow; the exact help text is.
+            res = h.handle(request(claude_build=f"{version} (Claude Code)", help_text=text,
+                                   bare_default="unknown"))
+            self.assertEqual((res["status"], res["detail"]), ("ok", "beta"))
+            self.assertNotIn("--bare", h.launcher.calls[0]["argv"])
+            self.assertNotIn("--no-bare", h.launcher.calls[0]["argv"])
+        self.assertEqual(hashes, {bd.MEASURED_HELP[0]["help_sha256"]})
+        # A build that is not listed still runs as beta when the help hash matches.
+        text = (FIXTURE.parent / "claude-2.1.314-help.txt").read_text()
+        self.assertEqual(bd.subscription_beta("2.1.400", text)["label"], "beta")
+
+    def test_changed_help_refuses_and_names_the_build(self) -> None:
+        text = (FIXTURE.parent / "claude-2.1.321-help.txt").read_text() + "\n"
+        self.assertNotEqual(bd.help_sha256(text), bd.MEASURED_HELP[0]["help_sha256"])
+        decision = bd.subscription_beta("2.1.321", text)
+        self.assertEqual(decision["disposition"], "refuse")
+        self.assertIsNone(decision["label"])
+        self.assertIn("2.1.321", decision["detail"])
+        self.assertIn("needs re-measuring", decision["detail"])
+        h = Harness([claude_ok()])
+        # absent does not bypass a help text that is not the measured fixture.
+        res = h.handle(request(claude_build="2.1.321 (Claude Code)", help_text=text, bare_default="absent"))
+        self.assertEqual(res["code"], c.LAUNCH_REFUSED)
+        self.assertIn("2.1.321", res["detail"])
+        self.assertIn("needs re-measuring", res["detail"])
+        self.assertNotIn("beta", res["detail"])
+        self.assertEqual(h.launcher.calls, [])
+
+    def test_below_floor_refuses(self) -> None:
+        measured = (FIXTURE.parent / "claude-2.1.314-help.txt").read_text()
+        cases = (
+            ("2.1.311", (FIXTURE.parent / "claude-2.1.311-help.txt").read_text()),
+            ("2.1.312", (FIXTURE.parent / "claude-2.1.312-help.txt").read_text()),
+            ("2.1.313", measured),  # same hash as the measured entry; the floor still refuses
+        )
+        for version, text in cases:
+            with self.subTest(version=version):
+                decision = bd.subscription_beta(version, text)
+                self.assertEqual(decision["disposition"], "refuse")
+                self.assertIsNone(decision["label"])
+                self.assertIn(version, decision["detail"])
+                self.assertIn("below the 2.1.314 floor", decision["detail"])
+                self.assertNotIn("re-measuring", decision["detail"])
+                h = Harness([claude_ok()])
+                res = h.handle(request(claude_build=version, help_text=text, bare_default="absent"))
+                self.assertEqual(res["code"], c.LAUNCH_REFUSED)
+                self.assertIn("below the 2.1.314 floor", res["detail"])
+                self.assertEqual(h.launcher.calls, [])
+
+    def test_unknown_build_or_help_is_not_beta(self) -> None:
+        text = (FIXTURE.parent / "claude-2.1.314-help.txt").read_text()
+        for build, help_text in (("latest", text), ("2.1.321-dev", text), ("2.1.321", ""), (None, text),
+                                 ("2.1.321", None)):
+            with self.subTest(build=build, help_text=help_text):
+                decision = bd.subscription_beta(build, help_text)
+                self.assertEqual(decision["disposition"], "refuse")
+                self.assertNotEqual(decision["label"], "beta")
+                self.assertNotIn("beta", decision["detail"])
+        h = Harness([claude_ok()])
+        res = h.handle(request(claude_build="latest", help_text=text, bare_default="absent"))
+        self.assertEqual(res["code"], c.LAUNCH_REFUSED)
+        self.assertIn("unknown is not safe", res["detail"])
+        self.assertEqual(h.launcher.calls, [])
 
     def test_default_wording_in_another_option_does_not_count(self) -> None:
         # 2.1.312 has "default, except under --bare" inside a different option's block.
@@ -200,14 +277,20 @@ class SubscriptionRouteBareDefaultTest(unittest.TestCase):
 
         def run(argv, **kwargs):
             calls.append(argv)
+            self.assertIs(kwargs["shell"], False)
+            self.assertEqual(kwargs["timeout"], bd.HELP_TIMEOUT_S)
+            if argv[-1] == "--version":
+                return subprocess.CompletedProcess(argv, 0, stdout=b"2.1.321 (Claude Code)\n")
             return subprocess.CompletedProcess(argv, 0, stdout=help_with_bare("Minimal mode.").encode())
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             self.assertEqual(bd.main(["--claude", "/opt/claude"], run), 0)
-        self.assertEqual(calls, [["/opt/claude", "--help"]])
+        self.assertEqual(calls, [["/opt/claude", "--version"], ["/opt/claude", "--help"]])
         text = out.getvalue()
         self.assertIn("bare_default: unknown", text)
         self.assertIn("subscription route: refuses", text)
+        self.assertIn("2.1.321", text)
+        self.assertIn("needs re-measuring", text)
         self.assertIn("  --bare", text)
         self.assertIn("  -p, --print", text)
 

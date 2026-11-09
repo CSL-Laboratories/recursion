@@ -32,8 +32,8 @@ MAX_FALLBACK = 8
 # for one tenant for a minute (grill Q23), not a subscription limit, so it is not offered as a switch
 # point, including the breaker's refusal while that short fence holds.
 LIMIT_CODES = (c.PLAN_LIMIT, c.BREAKER_OPEN, c.PROBE_IN_FLIGHT)
-_ROUTE_KEYS = {"engine", "model", "connection", "profile", "home", "bare", "bare_default", "bare_opt_out", "api_key_helper",
-               "billing_ack"}
+_ROUTE_KEYS = {"engine", "model", "connection", "profile", "home", "bare", "bare_default", "bare_opt_out",
+               "api_key_helper", "billing_ack", "claude_build", "help_text"}
 
 
 def validate_limits(limits: object) -> dict:

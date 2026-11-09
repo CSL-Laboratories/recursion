@@ -78,12 +78,22 @@ run's environment changes:
   is `unknown`, not proof that the default is off. The recorded 2.1.312 excerpt omits
   print help and therefore reads `unknown`. To check a build:
   `PYTHONPATH=core python3 -B -m recursion_core.routes.bare_default --claude PATH`
-  runs only `PATH --help` and prints the state, the route's answer and both help blocks.
+  runs only `PATH --version` and `PATH --help` and prints the state, the route's answer and both help blocks.
   When the build advertises `--no-bare`, the subscription driver passes it explicitly,
   including on fallback routes. No flag is invented. Without an opt-out, only an
   explicitly known `absent` default launches. `unknown` or not reported always
-  refuses before spawn and never trips the login's breaker. API-key and passthrough
-  routes are unaffected. No user settings or credentials are edited.
+  refuses before spawn and never trips the login's breaker. Unknown is not an allow.
+  API-key and passthrough routes are unaffected. No user settings or credentials are edited.
+- Measured-help beta (Lucas, Nov 9 owner call; same spec). When the route carries
+  `claude_build` or `help_text`, the subscription route runs as beta only if that
+  help text hashes to the one entry in `bare_default.MEASURED_HELP` and the build
+  is at or above the 2.1.314 floor. Builds 2.1.314 through 2.1.321 share that hash,
+  so the table is not a per-version allow list. A match launches with no `--bare`
+  and the result detail is `beta`. Help that differs refuses, names the build, and
+  says it needs re-measuring. A build below 2.1.314 refuses even if the hash matches.
+  An unknown build or unknown help refuses. Classifier `unknown` stays `unknown`.
+  `bare_default: absent` does not bypass this gate. The same keys are allowed on a
+  fallback route.
 - `api_key`: the user's own key from custody (`ANTHROPIC_API_KEY`) or their own `apiKeyHelper`
   (`key_source: "api_key_helper"`, no key added); `--bare` is allowed (`route.bare`). The user's
   `CLAUDE_CODE_OAUTH_TOKEN` still passes through; the key outranks it by the engine's own precedence.

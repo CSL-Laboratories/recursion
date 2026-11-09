@@ -22,7 +22,11 @@ MAX_FRAME_BYTES = 1 << 20
 def encode_frame(message: dict[str, Any], *, max_bytes: int = MAX_FRAME_BYTES) -> bytes:
     if not isinstance(message, dict):
         raise FrameError("frame_not_object")
-    body = json.dumps(message, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+    try:
+        body = json.dumps(message, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except RecursionError:
+        # A deeply nested message must refuse as a frame error, not kill the worker.
+        raise FrameError("frame_too_deep") from None
     if len(body) > max_bytes:
         raise FrameError("frame_too_large")
     return HEADER.pack(len(body)) + body
@@ -31,6 +35,10 @@ def encode_frame(message: dict[str, Any], *, max_bytes: int = MAX_FRAME_BYTES) -
 def decode_body(body: bytes) -> dict[str, Any]:
     try:
         message = json.loads(body.decode("utf-8"))
+    except RecursionError:
+        # A 1 MiB frame can nest ~500k deep; json.loads would raise RecursionError, which is
+        # not a ValueError and used to escape the server worker. Refuse it as a frame error.
+        raise FrameError("frame_too_deep") from None
     except (UnicodeDecodeError, ValueError) as exc:
         raise FrameError("frame_not_json") from exc
     if not isinstance(message, dict):

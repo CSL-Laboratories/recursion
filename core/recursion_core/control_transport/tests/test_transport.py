@@ -285,6 +285,63 @@ class RoundTripTests(_TmpCase):
         with self.assertRaises(ct.FrameError):
             framing.encode_frame(["not", "object"])  # type: ignore[arg-type]
 
+    # t1430u X1b: a 200k-deep frame raised RecursionError (not ValueError) in decode_body and
+    # killed the server worker instead of answering bad_frame.
+    def test_deeply_nested_frame_is_a_frame_error_and_the_server_lives(self) -> None:
+        deep = b"[" * 200_000 + b"]" * 200_000
+        with self.assertRaises(ct.FrameError) as caught:
+            framing.decode_body(deep)
+        self.assertEqual(str(caught.exception), "frame_too_deep")
+        nested: dict = {}
+        cur = nested
+        for _ in range(200_000):
+            cur["a"] = {}
+            cur = cur["a"]
+        with self.assertRaises(ct.FrameError) as caught:
+            framing.encode_frame(nested)
+        self.assertEqual(str(caught.exception), "frame_too_deep")
+        srv = self.server()
+        body = b'{"op":' + deep + b"}"
+        raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        with raw:
+            raw.settimeout(10)
+            raw.connect(srv.path)
+            raw.sendall(framing.HEADER.pack(len(body)) + body)
+            reply = framing.read_frame(raw)
+        self.assertEqual(reply, {"ok": False, "error": {"code": "bad_frame", "detail": "frame_too_deep"}})
+        with UnixControlClient(srv.path) as client:
+            self.assertEqual(client.request({"op": "ping"}), {"ok": True, "op": "pong"})
+
+    # t1430u X1b: a handler reply that claims layer "transport" busy was read by the client as
+    # "not delivered" (TransportBusy) although the handler saw and acted on the request, which
+    # invites a duplicate retry of a Stop.
+    def test_handler_reply_cannot_pose_as_the_transport_busy_frame(self) -> None:
+        seen: list[dict] = []
+        forged = {"ok": False, "error": {"code": "busy", "layer": "transport", "delivered": False, "retryable": True}}
+
+        def liar(message: dict, conn: ct.Connection) -> dict:
+            seen.append(message)
+            return dict(forged)
+
+        srv = self.server(liar)
+        with UnixControlClient(srv.path) as client:
+            for request in ({"op": "stop", "run_id": "r1"}, {"op": "stop", "run_id": "r1", "id": "s1"}):
+                with self.subTest(request=request):
+                    reply = client.request(request)  # no TransportBusy: it was delivered
+                    self.assertEqual(reply["error"]["layer"], "handler")
+                    self.assertIs(reply["error"]["delivered"], True)
+                    self.assertEqual(reply["error"]["code"], "busy")
+        self.assertEqual(len(seen), 2)
+
+    def test_handler_reply_rewrite_keeps_other_errors(self) -> None:
+        from recursion_core.control_transport.unix import BUSY_FRAME, _handler_reply, _is_busy
+        plain = {"ok": False, "error": {"code": "nope", "layer": "app"}}
+        self.assertIs(_handler_reply(plain), plain)
+        self.assertEqual(_handler_reply({"ok": True}), {"ok": True})
+        self.assertTrue(_is_busy(framing.decode_body(BUSY_FRAME[4:])))
+        self.assertFalse(_is_busy(_handler_reply(framing.decode_body(BUSY_FRAME[4:]))))
+        self.assertFalse(_is_busy({**framing.decode_body(BUSY_FRAME[4:]), "extra": 1}))
+
 
 class FrameDeadlineTests(unittest.TestCase):
     def test_read_frame_deadline_bounds_the_whole_frame_not_each_recv(self) -> None:

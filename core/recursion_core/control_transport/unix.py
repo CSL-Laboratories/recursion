@@ -31,7 +31,7 @@ except ImportError:  # pragma: no cover - Windows has no fcntl; it is the F40 st
     fcntl = None  # type: ignore[assignment]
 
 from .errors import FrameError, InsecureSocketPath, PeerRefused, RemoteBindRefused, TransportBusy
-from .framing import MAX_FRAME_BYTES, encode_frame, read_frame, write_frame
+from .framing import HEADER, MAX_FRAME_BYTES, decode_body, encode_frame, read_frame, write_frame
 from .handlers import Connection, Handler, Message
 from .peercred import PeerCred, get_peer_cred
 
@@ -396,6 +396,7 @@ class UnixControlServer:
                         raise TypeError("handler returned a non-object")
                 except Exception:
                     response = {"ok": False, "error": {"code": "internal_error"}}
+                response = _handler_reply(response)
                 if "id" in request and "id" not in response:
                     response = {**response, "id": request["id"]}
                 try:
@@ -423,15 +424,29 @@ def _send_busy(conn: socket.socket) -> None:
         pass
 
 
-def _is_busy(response: Message) -> bool:
+# The one transport-layer frame: what the accept loop sends a peer over the cap.
+_BUSY_MESSAGE = decode_body(BUSY_FRAME[HEADER.size:])
+
+
+def _handler_reply(response: Message) -> Message:
+    """A handler reply may not speak for the transport layer.
+
+    ``layer: "transport"`` is reserved for the accept-path busy frame, which the client
+    reads as "not delivered". A handler that saw the request and answered with that layer
+    (a Stop that ran, then said busy) would make the client report not delivered and
+    invite a duplicate retry. Such an error is rewritten to ``layer: "handler"`` and
+    ``delivered: True``; the code is kept.
+    """
     error = response.get("error")
-    return (
-        response.get("ok") is False
-        and "id" not in response
-        and isinstance(error, dict)
-        and error.get("code") == "busy"
-        and error.get("layer") == "transport"
-    )
+    if isinstance(error, dict) and error.get("layer") == "transport":
+        return {**response, "error": {**error, "layer": "handler", "delivered": True}}
+    return response
+
+
+def _is_busy(response: Message) -> bool:
+    # Only the exact accept-path busy frame counts; handler replies can never match it
+    # because ``_serve`` rewrites any handler error that claims the transport layer.
+    return response == _BUSY_MESSAGE
 
 
 def _send_quietly(conn: socket.socket, message: Message) -> None:

@@ -229,6 +229,10 @@ class PeerCredEdgeTests(_TmpCase):
     @unittest.skipUnless(LINUX and os.geteuid() == 0, "needs root to drop to a real foreign uid")
     def test_real_foreign_uid_gets_no_frame(self) -> None:  # pragma: no cover - root-only
         srv = self.server()
+        # mkdtemp makes the base 0700, so the foreign uid could not even reach the socket and
+        # the test failed as root for the wrong reason. Open the base too: the only thing
+        # left to refuse the foreign uid is the peer check.
+        os.chmod(self.base, 0o755)
         os.chmod(self.sock_dir, 0o755)  # chmod escape: open the dir, the peer check must still refuse
         os.chmod(srv.path, 0o666)
         pid = os.fork()

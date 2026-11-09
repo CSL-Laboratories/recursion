@@ -14,7 +14,8 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
   `start --tenant --engine --prompt [--client-key]`, `conditions`) and the same `run.*` request each
   request command sends. There is no approve, deny, order or mid-run verb. `keyed_conditions` turns an
   answer into text labels: `REFUSED`, `UNCERTAIN` (a `pending` stop), `STALE`, `UNRECONCILED` (a
-  `stop_pending` run), `UNAVAILABLE`.
+  run with an unconfirmed Stop: `stop_pending`, or any state but `stopped` that carries a stop record,
+  such as a `starting` run whose Stop the API kept as intent with `cgroup_unknown`), `UNAVAILABLE`.
 - `events.py`: the one ordered event log (requests, answers, condition edges, engine output chunks,
   notices, errors) and its JSON Lines form. Toolkit-neutral.
 - `app.py`: `TuiApp` (view state, keys, frame, inline live rows, all fed through the log) and `Loop`
@@ -60,8 +61,8 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
   that log; neither renders from the other's frame or strings. `transcript` is the log's text.
 - A condition is said only when it appears, changes or clears (`UNRECONCILED: ...`,
   `UNRECONCILED changed: ...`, `UNRECONCILED cleared, was: ...`), not again after every command. A
-  usage error says only the error. `UNCERTAIN` for a run stays until the API shows that run is no longer
-  `stop_pending`. The `conditions` command says the current set again on demand. The CLI has the same
+  usage error says only the error. `UNCERTAIN` for a run stays until the API lists that run with no
+  unconfirmed Stop (`stopped`, or no stop record). The `conditions` command says the current set again on demand. The CLI has the same
   command (`recursion-control conditions`), which reads `run.list` because it keeps no state. No control
   API method was added.
 - The latest error stays on its own row (and in the inline live region) until a newer error replaces

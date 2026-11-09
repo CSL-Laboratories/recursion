@@ -92,6 +92,16 @@ def _runs(answer: Mapping) -> list[Mapping]:
     return [run] if isinstance(run, Mapping) else []
 
 
+def stop_unconfirmed(run: Mapping) -> bool:
+    """A Stop was asked for this run and not confirmed: ``stop_pending``, or any other state but ``stopped``
+    that still carries a stop record (a Stop kept as intent while the launch was unrecorded leaves the run
+    ``starting`` with ``stop.reason=cgroup_unknown``; red-team round 3 finding 1)."""
+
+    if run.get("state") == "stopped":
+        return False
+    return run.get("state") == "stop_pending" or isinstance(run.get("stop"), Mapping)
+
+
 def keyed_conditions(answer: Mapping) -> list[tuple[str, str, str]]:
     """Conditions one API answer exposes, as (label, subject, plain text). Nothing the answer says is
     dropped. ``(label, subject)`` names one condition, so a renderer can tell when it appears, changes
@@ -111,10 +121,10 @@ def keyed_conditions(answer: Mapping) -> list[tuple[str, str, str]]:
     if answer.get("stale") is True:
         found.append((STALE, "answer", "API marked this answer stale"))
     for run in _runs(answer):
-        if run.get("state") == "stop_pending":
-            reason = (run.get("stop") or {}).get("reason") if isinstance(run.get("stop"), Mapping) else None
+        if stop_unconfirmed(run):
+            reason = run["stop"].get("reason") if isinstance(run.get("stop"), Mapping) else None
             found.append((UNRECONCILED, f"run={run.get('run_id')}",
-                          f"run={run.get('run_id')} state=stop_pending reason={reason}: "
+                          f"run={run.get('run_id')} state={run.get('state')} reason={reason}: "
                           "stop requested, cleanup not confirmed"))
     if answer.get("reconciliation") == "unreconciled":
         found.append((UNRECONCILED, "api", "API reports unreconciled state"))

@@ -9,10 +9,14 @@ RECURSION_TUI_REGEN=1 PYTHONPATH=core python3 -B -m unittest recursion_core.tui.
 from __future__ import annotations
 
 import io
+import json
 import os
 import unittest
 
-from recursion_core.control.registry import EMPTY, POPULATED
+from recursion_core.control import cli
+from recursion_core.control.api import ControlAPI
+from recursion_core.control.registry import EMPTY, POPULATED, InMemoryRunRegistry
+from recursion_core.control.tests.fakes import FakeKillTree
 from recursion_core.tui import protocol as p
 from recursion_core.tui import term
 from recursion_core.tui.app import TuiApp
@@ -259,3 +263,62 @@ class ErrorStaysTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StopBeforeLaunchRecordedTest(unittest.TestCase):
+    """Red-team round 3 finding 1: a Stop sent while the launch is unrecorded stays visible after refresh."""
+
+    def setUp(self) -> None:
+        self.model_calls = 0
+
+        def starter(params: dict) -> dict:  # launched, but the handle names no cgroup: start_unconfirmed
+            self.model_calls += 1
+            return {}
+
+        registry = InMemoryRunRegistry()
+        self.api = ControlAPI(registry, FakeKillTree([EMPTY]), starter, clock=lambda: 1000.0,
+                              new_run_id=lambda: "run-" + "a" * 32)
+        start = self.api.call("run.start", {"tenant": "t1", "engine": "codex", "prompt": "p"})
+        self.assertEqual((start["code"], start["detail"]), ("start_unconfirmed", "starter_handle_invalid"))
+        self.run_id = start["run"]["run_id"]
+
+    def labels(self, app: TuiApp) -> set[str]:
+        return {label for label, text in app.conditions() if self.run_id in text}
+
+    def test_pending_stop_on_a_starting_run_survives_refresh_status_and_conditions(self) -> None:
+        app = TuiApp(self.api, clock=Clock(), environ={"NO_COLOR": "1"}, width=100, height=30)
+        app.open()
+        app.attach(self.run_id)
+        app.press("s")
+        app.press("y")
+        self.assertEqual((app.last["code"], app.last["reason"]), ("pending", "cgroup_unknown"))
+        self.assertEqual(self.labels(app), {p.UNCERTAIN, p.UNRECONCILED})
+        record = self.api.call("run.status", {"run_id": self.run_id})["run"]
+        self.assertEqual((record["state"], record["stop"]["reason"]), ("starting", "cgroup_unknown"))
+        for step in (lambda: app.press("r"), lambda: app.command(f"status {self.run_id}"),
+                     lambda: app.command("conditions")):
+            step()
+            self.assertEqual(self.labels(app), {p.UNCERTAIN, p.UNRECONCILED})
+            text = to_text(app.frame())
+            self.assertNotIn("conditions: none", text)
+            self.assertIn(f"run={self.run_id} state=starting reason=cgroup_unknown", text)
+        self.assertEqual(self.model_calls, 1, "the Stop and the reads start no model call")
+
+    def test_cli_conditions_reports_the_pending_stop_on_a_starting_run(self) -> None:
+        self.api.call("run.stop", {"run_id": self.run_id})
+        out = io.StringIO()
+        cli.main(["conditions"], self.api, out, io.StringIO())
+        shown = json.loads(out.getvalue())["conditions"]
+        self.assertIn({"label": p.UNRECONCILED,
+                       "text": f"run={self.run_id} state=starting reason=cgroup_unknown: "
+                               "stop requested, cleanup not confirmed"}, shown)
+
+    def test_only_a_confirmed_stop_clears_it(self) -> None:
+        stop = {"requested_at": 1000.0, "checks": 1, "reason": None, "requested": True}
+        cases = [({"state": "running", "stop": None}, False), ({"state": "starting", "stop": None}, False),
+                 ({"state": "stopped", "stop": stop}, False), ({"state": "stop_pending", "stop": stop}, True),
+                 ({"state": "starting", "stop": {**stop, "reason": "cgroup_unknown"}}, True),
+                 ({"state": "start_failed", "stop": {**stop, "reason": "cgroup_unknown"}}, True)]
+        for run, want in cases:
+            with self.subTest(run=run):
+                self.assertIs(p.stop_unconfirmed({"run_id": "r", **run}), want)

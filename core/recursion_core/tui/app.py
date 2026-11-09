@@ -93,7 +93,7 @@ class TuiApp:
         self._answer_keyed: list[tuple[str, str, str]] = []
         self.answer_conditions: list[tuple[str, str]] = []
         self.shown: dict[tuple[str, str], tuple[str, str]] = {}  # conditions as last logged
-        self._uncertain: dict[str, str] = {}  # per run, until the API shows that run is no longer stop_pending
+        self._uncertain: dict[str, str] = {}  # per run, until the API lists that run with no unconfirmed Stop
         self.errors: list[str] = []
         self.last_error: Event | None = None  # kept here too, so a bounded log cannot drop it
         self.mode, self.line, self.stop_target = "keys", "", None
@@ -186,9 +186,9 @@ class TuiApp:
         self._answer_keyed = p.keyed_conditions(answer)
         self.answer_conditions = [(label, text) for label, _, text in self._answer_keyed]
         self._uncertain.update({subject: text for label, subject, text in self._answer_keyed if label == p.UNCERTAIN})
-        states = {f"run={r.get('run_id')}": r.get("state") for r in self.runs}
+        open_stop = {f"run={r.get('run_id')}": p.stop_unconfirmed(r) for r in self.runs}
         for subject in list(self._uncertain):  # a later answer about another run does not clear it
-            if states.get(subject, "stop_pending") != "stop_pending":
+            if not open_stop.get(subject, True):
                 del self._uncertain[subject]
         labels = ",".join(sorted({label for label, _ in self.answer_conditions})) or "none"
         said = " ".join(x for x in (f"answer {method} status={field(code)}", self._answer_fields(answer)) if x)

@@ -30,19 +30,28 @@ engine), 11.2 (breaker, plan limits), Q12 (Claude subscription only inside Claud
 - Only a typed limit signal opens a connection; it fences every tenant on that connection and no other
   connection. Text inside the model's payload (assistant/user content, Codex agent messages) is never
   inspected. Vague quota-sounding error text is a `short_fault`: one model, one tenant, 60 s (grill Q23).
+  The refusal while that fence holds is `short_fault` too, never `breaker_open`, so it gets no
+  `limit_notice` and never triggers a fallback. Open and half-open keys are checked before it, so a
+  short fault never hides a real limit on the same connection from that tenant.
 - Recursion's own deadline is `deadline_exceeded`: the run is fenced (`EngineProcess.fence`) for that
   request only and the breaker is not told. Other engine failures are request-local too.
 - Recovery: an open key always has a finite end (vendor `reset_at`, capped; otherwise a 300 s cooldown
-  doubling to 3600 s). Then one leased half-open probe at a time (150 s lease); success closes, a limit
+  doubling to 3600 s). Then one leased half-open probe at a time (lease = the probe run's own deadline
+  plus 30 s, 11.2 C1-18; 150 s only when no deadline is given); success closes, a limit
   reopens, a lease that expires lets the next request probe; `reset()` closes at once. These numbers are
   uncalibrated defaults (11.2, B-10).
 - B11 (CSL-783 F70, CSL-727 F19): the Codex stdio worker is launched as
   `codex -c check_for_update_on_startup=false app-server` and the adapter starts nothing else; a test runs
-  48 turns over 72 fake minutes and checks every spawn. `daemon_config()` holds
+  48 turns over 72 fake minutes and checks every spawn the adapter makes. That test cannot see what a
+  real `codex` process spawns itself; the override's key name was read in Codex source (below), and
+  a process-tree check on a real binary is still open. `daemon_config()` holds
   `updater.autoUpdateEnabled = false` and `check_daemon_config()` refuses anything else.
 - Child env: Codex never inherits `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN` or `OPENAI_API_KEY`; a Codex
   subscription run uses Codex's own CLI login under `CODEX_HOME`, and Recursion holds no ChatGPT token.
-  An `api_key` route gets back only the one key it selects, from the injected credential lookup. The full
+  An `api_key` route gets back only the one key it selects (`CODEX_API_KEY` or `OPENAI_API_KEY`; the
+  `CODEX_ACCESS_TOKEN` sign-in token is never selectable), from the injected credential lookup. A
+  Pi/Hermes/OpenCode `api_key` route selects only a name `subscription_routes` lists for that engine and
+  the profile names, and refuses (`launch_refused`) when custody holds no key for it. The full
   child-env rules (B1, CSL-785, #320) are a separate module.
 
 ## Claude Code driver (Lucas's correction, Nov 7 ~6:34pm PST)
@@ -77,8 +86,13 @@ run's environment changes:
 - `api_key`: the user's own key from custody (`ANTHROPIC_API_KEY`) or their own `apiKeyHelper`
   (`key_source: "api_key_helper"`, no key added); `--bare` is allowed (`route.bare`). The user's
   `CLAUDE_CODE_OAUTH_TOKEN` still passes through; the key outranks it by the engine's own precedence.
-- `passthrough` (cloud providers and any other built-in method the user picks): the env passes through
-  unchanged for that run, and `--bare` is the user's choice there too. `--bare` is refused only on the
+- `passthrough` (a cloud provider or gateway the user picks, `connection.method`: `bedrock`, `vertex`,
+  `foundry` or `gateway`): that method's own variables (names from Claude Code's public docs) pass through
+  unchanged for that run, with the base allowlist and the user's sign-in; nothing else from the daemon's
+  environment does (no other engine's key, no stray `ANTHROPIC_API_KEY`). A method with no listed
+  variables is `launch_refused`, and so is a method whose own switch or credential is unset
+  (`CLAUDE_CODE_USE_BEDROCK` / `_VERTEX` / `_FOUNDRY`; for `gateway` both `ANTHROPIC_BASE_URL` and
+  `ANTHROPIC_AUTH_TOKEN`): without it the run would fall back to the sign-in and bill the subscription. `--bare` is the user's choice there too. `--bare` is refused only on the
   subscription route. No route drops `CLAUDE_CODE_OAUTH_TOKEN`, and the parent env is never changed.
 - The adapter never edits settings or credential files, never sets `DISABLE_LOGIN_COMMAND`, and never
   sets, stores or reads `CLAUDE_CODE_OAUTH_TOKEN`. The binary is `claude` itself; its hash and version are
@@ -87,7 +101,7 @@ run's environment changes:
 
 ## Limits (`limits.py`)
 
-At a `plan_limit` or `breaker_open` result, the result carries a `limit_notice` (connection, engine,
+At a `plan_limit`, `breaker_open` or `probe_in_flight` result, the result carries a `limit_notice` (connection, engine,
 model, scope, reset time, choices). `route.limits` or the service default sets `on_limit`: `ask` (default:
 nothing else runs), `wait` (nothing else runs; re-submit at `reset_at`) or `fallback` (the user's own
 `fallback` routes in the user's order, each switch shown as a `fallback` event and `switched_to`).
@@ -102,7 +116,8 @@ anything; no real limit capture has gone through it.
 - No daemon calls `RouteService` yet; no real launcher (cgroup v2 leaf + pidfd) is in this module.
 - Vendor field and option names marked "unverified" in the code were not read from vendor source
   (Claude `rate_limit_info` inner fields, Codex method names beyond `account/rateLimits/*`,
-  `codexErrorInfo` values, `check_for_update_on_startup`).
+  `codexErrorInfo` values). `check_for_update_on_startup` was read in openai/codex source at
+  `8703d32bd0ea5cf26768859a3dd476df906ba053`; no real-binary process-tree check has been run.
 - Pi/Hermes/OpenCode stdio drivers are injected, not built here.
 - No live provider call, real `claude`/`codex` process or network is used anywhere; tests use fakes only.
 

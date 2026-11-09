@@ -59,7 +59,9 @@ class RouteService:
         if adapter is None:
             return c.result(rid, c.ENGINE_UNKNOWN, detail=f"no adapter for {route['engine']}")
         connection, model, tenant = c.connection_key(route), route["model"], req["tenant"]
-        admit = self._breaker.admit(connection, model, tenant)
+        # The probe lease is bounded by this run's own deadline (plus grace), so a probe still running
+        # inside its deadline is never joined by a second probe on the same connection (11.2, C1-18).
+        admit = self._breaker.admit(connection, model, tenant, deadline_s=float(req["deadline_s"]))
         if not admit["admitted"]:
             return c.result(rid, admit["code"], detail=admit["key"], retry_at=admit["retry_at"])
         deadline_at = self._clock() + float(req["deadline_s"])

@@ -27,7 +27,7 @@ Result::
 
     {"contract", "request_id", "status": "ok" | "error", "code": None | <CODES>, "text",
      "limit": None | <limit signal>, "events": [<event>], "detail": str,
-     "retry_at": None | float,     # when a BREAKER_OPEN / PROBE_IN_FLIGHT refusal may clear
+     "retry_at": None | float,     # when a BREAKER_OPEN / PROBE_IN_FLIGHT / SHORT_FAULT refusal may clear
      "breaker_effect": "none" | "opened" | "short_fault" | "closed" | "probe_released",
      "limit_notice": None | <limits.notice>}   # shown to the user at a limit; never a silent switch
 

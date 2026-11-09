@@ -18,7 +18,7 @@ Agent message text is model payload and is never inspected. Free error text that
 quota is a SHORT_FAULT (grill Q23).
 
 B11 (CSL-783 F70, CSL-727 F19): the stdio worker is launched with ``-c check_for_update_on_startup=false``
-(option name unverified) and this adapter starts nothing else: no updater, no ``codex update``. If the
+(option name read from Codex source; see ``NO_UPDATE_OVERRIDE``) and this adapter starts nothing else: no updater, no ``codex update``. If the
 app-server daemon mode is ever used, its config must hold ``updater.autoUpdateEnabled = false``;
 ``check_daemon_config`` refuses any other value, including a missing one.
 """
@@ -31,9 +31,17 @@ from recursion_core.routes import contract as c
 from recursion_core.routes.base import RouteAdapter, _Protocol, scalar
 from recursion_core.routes.launch import child_env
 
-# Never inherited by a Codex child; added back only when the route explicitly selects that key (B1 note).
+# Never inherited by a Codex child (B1 note).
 CODEX_CREDENTIAL_ENV = ("CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI_API_KEY")
-NO_UPDATE_OVERRIDE = ("-c", "check_for_update_on_startup=false")  # option name unverified
+# The only names an api_key route may select and custody may fill: the user's own API keys. CODEX_ACCESS_TOKEN
+# is a sign-in token, not an API key; Codex uses its own CLI login only and Recursion holds no ChatGPT token
+# (Lucas, Nov 8; PRODUCT.md 3.3, O61), so it is scrubbed and never selectable.
+CODEX_API_KEY_ENV = ("CODEX_API_KEY", "OPENAI_API_KEY")
+# Top-level config key ``check_for_update_on_startup: Option<bool>`` (default true), read in openai/codex
+# 8703d32bd0ea5cf26768859a3dd476df906ba053 codex-rs/config/src/config_toml.rs:533 and only consulted by the
+# TUI's update check (codex-rs/tui/src/updates.rs:28, :153); no app-server source references the update
+# check. A process-tree check on a real binary has not been run (hard rule 8).
+NO_UPDATE_OVERRIDE = ("-c", "check_for_update_on_startup=false")
 DEFAULT_LIMIT_ID = "codex"  # name of the credential-wide bucket (unverified)
 _LIMIT_ERRORS = ("usageLimitExceeded",)  # codexErrorInfo values (unverified)
 _AUTH_ERRORS = ("unauthorized",)  # codexErrorInfo values (unverified)
@@ -66,7 +74,7 @@ class CodexAdapter(RouteAdapter):
         return [self._binary, *NO_UPDATE_OVERRIDE, "app-server"]
 
     def env(self, request: dict) -> dict[str, str]:
-        cred = self.credential(request, CODEX_CREDENTIAL_ENV)
+        cred = self.credential(request, CODEX_API_KEY_ENV)
         return child_env(self._parent_env, extra_names=("CODEX_HOME",), never=CODEX_CREDENTIAL_ENV, credential=cred)
 
     def drive(self, process, request, deadline_at, events):

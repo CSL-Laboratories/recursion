@@ -56,6 +56,33 @@ API_KEY_HELPER_STATES = ("absent", "present")
 # B20 (CSL-726): whether this claude build makes --bare the -p default, as reported by the surface from
 # bare_default.probe_auth_mode(). Unknown refuses; a documented opt-out is passed explicitly.
 BARE_DEFAULT_STATES = ("absent", "present", "unknown")
+# Passthrough route: the method the user picked gets its own variables for this run, and nothing else from
+# the daemon's environment (no other engine's key, no stray ANTHROPIC_API_KEY that would move the run to the
+# API meter; PRODUCT.md 3.4 S8, 11.5). Names are from Claude Code's public docs (code.claude.com/docs/en/
+# amazon-bedrock, google-vertex-ai, microsoft-foundry, llm-gateway; retrieved 2026-11-09), not from engine
+# source. A method not listed here is refused, never widened to the whole environment.
+PASSTHROUGH_METHOD_ENV = {
+    "bedrock": ("CLAUDE_CODE_USE_BEDROCK", "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_PROFILE", "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_BEARER_TOKEN_BEDROCK", "AWS_CONFIG_FILE",
+                "AWS_SHARED_CREDENTIALS_FILE", "ANTHROPIC_BEDROCK_BASE_URL", "ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION"),
+    "vertex": ("CLAUDE_CODE_USE_VERTEX", "CLOUD_ML_REGION", "ANTHROPIC_VERTEX_PROJECT_ID", "ANTHROPIC_VERTEX_BASE_URL",
+               "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_PROJECT", "GCLOUD_PROJECT"),
+    "foundry": ("CLAUDE_CODE_USE_FOUNDRY", "ANTHROPIC_FOUNDRY_API_KEY", "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
+                "ANTHROPIC_FOUNDRY_RESOURCE", "ANTHROPIC_FOUNDRY_BASE_URL"),
+    "gateway": ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS"),
+}
+# Per-model Vertex region overrides (VERTEX_REGION_CLAUDE_<model>) are a documented name family.
+PASSTHROUGH_METHOD_PREFIX = {"vertex": ("VERTEX_REGION_CLAUDE_",)}
+# The variables that make the run actually use the picked method. Without them claude falls back to the
+# user's sign-in, so a route labelled Bedrock or gateway would bill the subscription (and a gateway would
+# be handed the sign-in): refused before launch instead.
+PASSTHROUGH_METHOD_REQUIRED = {
+    "bedrock": ("CLAUDE_CODE_USE_BEDROCK",),
+    "vertex": ("CLAUDE_CODE_USE_VERTEX",),
+    "foundry": ("CLAUDE_CODE_USE_FOUNDRY",),
+    "gateway": ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"),
+}
+_OFF = ("", "0", "false")
 
 
 class ClaudeCodeAdapter(RouteAdapter):
@@ -99,9 +126,20 @@ class ClaudeCodeAdapter(RouteAdapter):
             cred = self.credential(request, ("ANTHROPIC_API_KEY",))
             return child_env(self._parent_env, extra_names=USER_KEEP_ENV, never=never, credential=cred)
         if kind == "passthrough":
-            # Cloud providers (Bedrock, Vertex, Foundry) and any other built-in method the user picked:
-            # the user's environment passes through for this run, unchanged.
-            return dict(self._parent_env)
+            # Cloud providers (Bedrock, Vertex, Foundry) or a gateway the user picked: that method's own
+            # variables pass through unchanged for this run, with the user's own sign-in and config location.
+            method = conn.get("method")
+            names = PASSTHROUGH_METHOD_ENV.get(method) if isinstance(method, str) else None
+            if names is None:
+                raise c.RouteError(c.LAUNCH_REFUSED, f"passthrough method {scalar(method)} has no listed variables")
+            missing = [n for n in PASSTHROUGH_METHOD_REQUIRED[method]
+                       if self._parent_env.get(n, "").strip().lower() in _OFF]
+            if missing:
+                raise c.RouteError(c.LAUNCH_REFUSED, f"passthrough method {method} needs {', '.join(missing)} "
+                                   "set; without it the run would use the sign-in instead")
+            prefixes = PASSTHROUGH_METHOD_PREFIX.get(method, ())
+            names += tuple(sorted(n for n in self._parent_env if prefixes and n.startswith(prefixes)))
+            return child_env(self._parent_env, extra_names=USER_KEEP_ENV + names)
         raise c.RouteError(c.LAUNCH_REFUSED, f"connection kind {kind} not supported for claude_code")
 
     @staticmethod

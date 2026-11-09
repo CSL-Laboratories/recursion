@@ -74,7 +74,8 @@ class SubscriptionRouteReuseTest(unittest.TestCase):
 
     def test_claude_subscription_provider_is_refused_and_never_launched(self) -> None:
         cases = [("pi", {"provider": "claude-pro", "auth": "oauth", "credential_env": "ANTHROPIC_API_KEY"}),
-                 ("hermes", {"provider": "claude-code", "auth": "api_key", "credential_env": "ANTHROPIC_API_KEY"}),
+                 ("hermes", {"provider": "claude-code", "auth": "api_key", "credential_env": "ANTHROPIC_API_KEY",
+                             "auth.adopt_external_logins": False}),  # required on every Hermes profile (#321)
                  ("opencode", {"provider": "claude-agent", "auth": "subscription", "credential_env": "ANTHROPIC_API_KEY"})]
         for engine, profile in cases:
             res = self.service.handle(self.req(engine, profile))
@@ -88,6 +89,29 @@ class SubscriptionRouteReuseTest(unittest.TestCase):
         self.assertEqual((res["status"], res["text"]), ("ok", "driven"))
         env = self.launcher.calls[0]["env"]
         self.assertEqual(env, {"PATH": "/usr/bin", "HOME": self.home, "ANTHROPIC_API_KEY": "sk-test"})
+
+    def test_missing_custody_key_refuses_instead_of_launching_keyless(self) -> None:
+        profile = {"provider": "openai", "auth": "api_key", "credential_env": "OPENAI_API_KEY"}
+        for engine in ("pi", "hermes", "opencode"):
+            prof = dict(profile, **({"auth.adopt_external_logins": False} if engine == "hermes" else {}))
+            req = request(engine=engine, model="m", kind="api_key", conn_id="no-such-key",
+                          credential_env="OPENAI_API_KEY", profile=prof, home=self.home)
+            res = self.service.handle(req)
+            self.assertEqual((res["code"], res["detail"]), (c.LAUNCH_REFUSED, "no credential for no-such-key"), engine)
+        self.assertEqual(self.launcher.calls, [])
+
+    def test_unlisted_or_mismatched_credential_env_refuses_before_custody(self) -> None:
+        asked = []
+        adapters = profile_adapters(self.launcher, self.clock, lambda cid, name: asked.append(name) or "sk-test",
+                                    {"PATH": "/usr/bin"}, argv=lambda req: ["pi"], driver=lambda *a: {},
+                                    operator_home="/home/operator")
+        service = RouteService(adapters, ConnectionBreaker(self.clock), self.clock)
+        profile = {"provider": "anthropic", "auth": "api_key", "credential_env": "ANTHROPIC_API_KEY"}
+        for name in ("SECRET_THING", "OPENAI_API_KEY"):  # not listed for pi; listed but not the profile's
+            req = request(engine="pi", model="m", kind="api_key", conn_id="k1", credential_env=name,
+                          profile=profile, home=self.home)
+            self.assertEqual(service.handle(req)["code"], c.LAUNCH_REFUSED, name)
+        self.assertEqual((asked, self.launcher.calls), ([], []))
 
     def test_reuses_subscription_routes_not_a_copy(self) -> None:
         text = (PKG / "profile_route.py").read_text()

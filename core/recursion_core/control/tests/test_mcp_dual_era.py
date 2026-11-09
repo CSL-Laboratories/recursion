@@ -26,6 +26,7 @@ from recursion_core.control.mcp_dual_era import (
 )
 from recursion_core.control import mcp_tools
 from recursion_core.control.api import ControlAPI
+from recursion_core.control.registry import POPULATED
 from recursion_core.control.tests.fakes import FakeKillTree, FakeStarter, InMemoryRunRegistry, make_api
 
 N = 5
@@ -242,6 +243,71 @@ class SameRunAndStopTests(unittest.TestCase):
             )
 
         self._repeat(check)
+
+    def _pending_server(self):
+        api, registry, kill, starter = make_api(FakeKillTree(answers=(POPULATED,)))
+        return DualEraServer(api), kill
+
+    def _assert_pending(self, server: DualEraServer, run_id: str, reply: dict) -> bool:
+        poll = server.handle({"jsonrpc": "2.0", "id": "tg", "method": "tasks/get",
+                              "params": modern_params(taskId=run_id)})["result"]
+        status = server.handle({
+            "jsonrpc": "2.0", "id": "st", "method": "tools/call",
+            "params": {"name": "recursion_run_status", "arguments": {"run_id": run_id}},
+        })["result"]["structuredContent"]["run"]
+        return (
+            all(body["status"] == "working" and body.get("statusMessage") == "pending"
+                and "result" not in body for body in (reply, poll))
+            and status["state"] == "stop_pending"
+            and server.notifications == []
+        )
+
+    def test_unconfirmed_stop_from_modern_reads_pending_never_cancelled(self) -> None:
+        # Red-team r1 finding 2: S6 "pending" through tasks/cancel and tasks/get, from both start eras.
+        def check() -> bool:
+            ok = True
+            for start in (self._start_modern, self._start_legacy):
+                server, kill = self._pending_server()
+                run_id = start(server)
+                cancel = server.handle({"jsonrpc": "2.0", "id": "tc", "method": "tasks/cancel",
+                                        "params": modern_params(taskId=run_id)})["result"]
+                ok = ok and self._assert_pending(server, run_id, cancel) and len(kill.requests) == 1
+            return ok
+
+        self._repeat(check)
+
+    def test_unconfirmed_stop_from_legacy_reads_pending_as_a_task(self) -> None:
+        def check() -> bool:
+            ok = True
+            for start in (self._start_modern, self._start_legacy):
+                server, kill = self._pending_server()
+                run_id = start(server)
+                stop = server.handle({
+                    "jsonrpc": "2.0", "id": "stop", "method": "tools/call",
+                    "params": {"name": "recursion_run_stop", "arguments": {"run_id": run_id}},
+                })["result"]["structuredContent"]
+                poll = server.handle({"jsonrpc": "2.0", "id": "tg", "method": "tasks/get",
+                                      "params": modern_params(taskId=run_id)})["result"]
+                ok = ok and stop["code"] == "pending" and self._assert_pending(server, run_id, poll)
+            return ok
+
+        self._repeat(check)
+
+    def test_stop_during_launch_reads_pending_not_failed(self) -> None:
+        # A launch intent (state "starting", merged from #327) is a working task; a Stop kept as intent
+        # during the launch reads "pending", and the starting run never reads as "failed".
+        api, registry, kill, _ = make_api(FakeKillTree())
+        server = DualEraServer(api)
+        registry.put({"run_id": "run-launching", "tenant": "t1", "engine": "codex", "state": "starting",
+                      "cgroup": None, "started_at": 1_762_639_200.0, "stop": None, "start_key": None})
+        poll = server.handle({"jsonrpc": "2.0", "id": "tg", "method": "tasks/get",
+                              "params": modern_params(taskId="run-launching")})["result"]
+        self.assertEqual(poll["status"], "working")
+        self.assertNotIn("statusMessage", poll)
+        cancel = server.handle({"jsonrpc": "2.0", "id": "tc", "method": "tasks/cancel",
+                                "params": modern_params(taskId="run-launching")})["result"]
+        self.assertEqual((cancel["status"], cancel["statusMessage"]), ("working", "pending"))
+        self.assertEqual(kill.requests, [])
 
     def test_modern_start_without_tasks_extension_is_a_plain_tool_result(self) -> None:
         server, *_ = _server()

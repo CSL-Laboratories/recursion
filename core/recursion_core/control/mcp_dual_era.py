@@ -111,13 +111,24 @@ def _iso(ts: float) -> str:
 
 
 def _run_status(state: str) -> str:
-    """F56 run-state map onto the Tasks extension statuses."""
+    """F56 run-state map onto the Tasks extension statuses.
+
+    ``cancelled`` is terminal for Claude Code, so only a confirmed ``stopped`` maps to it. An unconfirmed
+    Stop (``stop_pending``) and a launch still being recorded (``starting``) stay ``working``.
+    """
 
     if state == "stopped":
         return "cancelled"
-    if state in {"running", "stop_pending"}:
+    if state in {"starting", "running", "stop_pending"}:
         return "working"
     return "failed"
+
+
+def _stop_pending(rec: Mapping) -> bool:
+    """S6: a Stop the core has not confirmed reads "pending" on every surface, Tasks included."""
+
+    state = rec.get("state")
+    return state == "stop_pending" or (state == "starting" and rec.get("stop") is not None)
 
 
 def _printable_id(value: object) -> str | None:
@@ -298,6 +309,8 @@ class DualEraServer:
         }
         if extra:
             body.update(extra)
+        if _stop_pending(rec):
+            body["statusMessage"] = "pending"
         return body
 
     def _tasks_get(self, task_id: str, params: Mapping) -> dict:

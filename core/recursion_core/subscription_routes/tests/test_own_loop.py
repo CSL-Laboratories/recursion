@@ -39,6 +39,23 @@ class CopilotTests(unittest.TestCase):
         self.assertIn("COPILOT_API_URL", d.removed_env)
         self.assertNotIn(FAKE, repr(d))
 
+    def test_unrelated_provider_credentials_do_not_reach_the_copilot_child(self) -> None:
+        # Devin r4505395174: the stored Copilot sign-in is the only credential this run uses.
+        env = {**BASE, "ANTHROPIC_API_KEY": FAKE, "OPENAI_API_KEY": FAKE, "XAI_API_KEY": FAKE,
+               "CLAUDE_CODE_OAUTH_TOKEN": FAKE}
+        d = check_copilot_own_loop(copilot(), env, has_copilot_login=lambda: True)
+        self.assertEqual(dict(d.child_env), BASE)
+        self.assertEqual(set(d.removed_env), set(env) - set(BASE))
+        self.assertNotIn(FAKE, repr(d.child_env))
+
+    def test_copilot_model_is_checked_and_carried(self) -> None:
+        d = check_copilot_own_loop(copilot(model="gpt-5"), BASE, has_copilot_login=lambda: True)
+        self.assertEqual(d.model, "gpt-5")
+        self.assertEqual(check_copilot_own_loop(copilot(), BASE, has_copilot_login=lambda: True).model, "")
+        for bad in ("", "has space", 7, "x" * 129, "line\nbreak"):
+            with self.subTest(model=bad):
+                self.refused("model_malformed", copilot(model=bad))
+
     def test_no_stored_login_refuses_and_does_not_fall_back_to_gh(self) -> None:
         self.refused("no_stored_copilot_login", copilot(), {**BASE, "GH_TOKEN": FAKE}, probe=lambda: False)
 
@@ -90,6 +107,24 @@ class NousTests(unittest.TestCase):
         d = check_nous_own_loop(nous(), env)
         self.assertEqual(dict(d.child_env), BASE)
         self.assertNotIn(FAKE, repr(d.child_env))
+
+    def test_proxy_settings_never_reach_the_nous_child(self) -> None:
+        # Devin r4505395127: a proxy-aware client would send loopback-bound traffic to the proxy host.
+        proxies = {"HTTP_PROXY": "http://proxy.example:3128", "https_proxy": "http://proxy.example:3128",
+                   "ALL_PROXY": "socks5://proxy.example:1080", "all_proxy": "socks5://p:1"}
+        d = check_nous_own_loop(nous(), {**BASE, **proxies})
+        self.assertEqual(dict(d.child_env), BASE)
+        self.assertEqual(set(d.removed_env), set(proxies))
+
+    def test_nous_model_must_stay_on_the_nous_adapter(self) -> None:
+        # Devin r4505395083: the model is checked and carried, not left to the caller.
+        self.refused("adapter_must_stay_off", nous(model="xai/grok-3"))
+        self.refused("nous_adapter_only", nous(model="openai/gpt-5"))
+        self.refused("model_malformed", nous(model="has space"))
+        for model in ("Hermes-4-405B", "nous/Hermes-4-70B"):
+            with self.subTest(model=model):
+                self.assertEqual(check_nous_own_loop(nous(model=model), BASE).model, model)
+        self.assertEqual(check_nous_own_loop(nous(), BASE).model, "")
 
     def test_non_loopback_and_names_refuse(self) -> None:
         for url in ("http://10.0.0.5:8645", "http://192.168.1.2", "http://0.0.0.0:8645", "http://[::]:1",

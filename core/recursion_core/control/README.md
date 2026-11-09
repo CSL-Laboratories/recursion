@@ -14,7 +14,10 @@ recorded on F60, CSL-762).
   abstraction running the #916 procedure) to stop the run's tree, then to confirm. Only a confirmed
   empty cgroup answers `stopped`. A populated cgroup, a confirm timeout, an unknown answer or a cleanup
   error answers `pending` with that reason, never `stopped` or `terminated`. A repeat stop on a stopped
-  run sends nothing; on a pending run it only re-checks. An unknown run is `run_unknown`.
+  run sends nothing; on a pending run it only re-checks, unless the earlier cleanup request itself
+  raised, in which case the next stop sends it again. An unknown run is `run_unknown`. A start's
+  `client_key` dedupes retries per tenant and is bound to that start's engine and prompt digest; reusing
+  it for a different request is `request_invalid` / `client_key_reused`.
 - Reads (`run.status`, `run.list`) return copies, change no state and never call the cleanup layer.
 - `registry.py`: the `RunRegistry` and `KillTree` interfaces, plus an in-memory registry for tests.
   The durable registry (B8, B9) and the real cgroup/pidfd cleanup (B6) are other build items.

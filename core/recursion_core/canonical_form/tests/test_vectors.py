@@ -166,6 +166,26 @@ class TwoFieldInteractionTests(unittest.TestCase):
             with self.subTest(name):
                 self.assertIn("state_not_in_enum", self.by[name]["run_errors"])
 
+    # t1430u X1b: a stopped run with a missing or unknown stop.reason used to pass with any
+    # outcome stopped allows; the outcome cannot follow a reason that is not there.
+    def test_stopped_without_a_core_stop_reason_is_refused(self) -> None:
+        base = vb.run("stopped")
+        stops = [None, {}, {k: v for k, v in base["stop"].items() if k != "reason"}]
+        stops += [{**base["stop"], "reason": r} for r in (None, "", "Breaker", "operator_whim", "caller_stop", 1, ["breaker"])]
+        for stop in stops:
+            for outcome in ("stopped", "unknown", "route_breaker_tripped"):
+                with self.subTest(stop=stop, outcome=outcome):
+                    doc = {**base, "stop": stop, "outcome": outcome, "breaker_tripped": True}
+                    self.assertEqual(["stop_reason_not_core"], run_field_errors(doc))
+        for reason in ("kill_switch", "daemon_shutdown", "budget_cap", "breaker", "orphan_sweep"):
+            with self.subTest(reason=reason):
+                self.assertEqual([], run_field_errors(vb.run("stopped", stop_reason=reason)))
+        for name in ("run_stopped_reason_absent", "run_stopped_reason_unknown", "run_stopped_reason_null",
+                     "run_stopped_reason_caller_stop", "run_stopped_stop_null",
+                     "run_stopped_reason_unknown_as_breaker"):
+            with self.subTest(name):
+                self.assertEqual(["stop_reason_not_core"], self.by[name]["run_errors"])
+
     def test_every_run_state_is_checked(self) -> None:
         for state in sorted(vb.OUTCOME) + ["pending", "running", "stopping"]:
             with self.subTest(state=state):

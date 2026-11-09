@@ -4,7 +4,8 @@ Taken from the #1100 contract (csl-research PR #1100 at 114b48be,
 ``contracts/recursion-cockpit/v1.1-proposed/schemas/run.schema.json`` and the
 ``RunOutcome`` / ``StateOutcome`` definitions in ``schemas/common.schema.json``). Only the
 rules that decide these two fields are here; the rest of Run@1 (ids, timestamps, the
-``stop`` and ``termination`` objects) is checked for presence only. This is not the full
+``stop`` and ``termination`` objects) is checked for presence only, except that a stopped
+run's ``stop.reason`` must be a core stop reason, because the outcome follows it. This is not the full
 contract validator and does not replace it.
 
 ``run_field_errors(doc)`` returns a sorted list of rule ids; an empty list means the two
@@ -65,6 +66,8 @@ RULES = {
     "outcome_null_terminal": "outcome is null while the state is terminal",
     "outcome_state_mismatch": "outcome does not describe the terminal state truthfully",
     "outcome_stop_reason_mismatch": "a stopped run's outcome does not follow its stop reason",
+    "stop_reason_not_core": "a stopped run has no stop object, no stop.reason, or a reason that is not a core"
+                            " stop reason, so its outcome cannot be shown to follow it",
     "breaker_tripped_required": "breaker_tripped is absent",
     "breaker_tripped_not_boolean": "breaker_tripped is not a JSON boolean",
     "breaker_outcome_without_breaker": "outcome route_breaker_tripped while breaker_tripped is not true",
@@ -110,7 +113,13 @@ def run_field_errors(doc: Any) -> list[str]:
             stop = doc.get("stop")
             reason = stop.get("reason") if isinstance(stop, dict) else None
             want = STOP_REASON_OUTCOME.get(reason) if isinstance(reason, str) else None
-            if want is not None and outcome != want:
+            if want is None:
+                # #1100 run.schema.json: a stopped run's stop is an object with
+                # requested_by "core" and a reason from the Stop enum, and caller_stop is
+                # caller-only. A missing, null, unknown or caller reason fails that, and
+                # without a core reason the outcome cannot be checked: refuse, never pass.
+                errors.add("stop_reason_not_core")
+            elif outcome != want:
                 errors.add("outcome_stop_reason_mismatch")
 
     # #1100 A3 note: route_breaker_tripped is refused unless breaker_tripped is true;

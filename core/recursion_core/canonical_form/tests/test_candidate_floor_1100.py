@@ -29,7 +29,9 @@ from recursion_core.canonical_form import vectors_build as vb
 
 # Digest over (name, expect, sha256 | reason, run_errors) of every committed vector.
 # Changing a vector's digest or verdict must change this constant in the same commit.
-VECTOR_SET_SHA256 = "8038dce7d06ae87b16f579f80d62c3eb64f56ef1bf4087b97af7ab9053b6f375"
+# t1430u X1b: moved from 8038dce7... when the six stopped-run stop.reason vectors were added
+# (no existing vector changed its digest or verdict).
+VECTOR_SET_SHA256 = "32fb421404790ab8687dff3373b543ccd09107fc68839baafccaa61275b3a7fb"
 
 # Candidate (from #1100@114b48be, not accepted): the RunOutcome enum as #1100 proposes it.
 CANDIDATE_OUTCOMES_1100 = frozenset({

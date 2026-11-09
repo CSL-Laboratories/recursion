@@ -245,6 +245,78 @@
       "note": "orphan sweep: unknown (never success)"
     },
     {
+      "name": "run_stopped_reason_absent",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":false,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"stopped\",\"outcome\":\"stopped\",\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":{\"requested_by\":\"core\",\"requested_at\":\"2026-11-07T20:00:05.250Z\",\"confirmed_at\":\"2026-11-07T20:01:00Z\"},\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":false,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"outcome\":\"stopped\",\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"stopped\",\"state_seq\":1,\"stop\":{\"confirmed_at\":\"2026-11-07T20:01:00Z\",\"requested_at\":\"2026-11-07T20:00:05.250Z\",\"requested_by\":\"core\"},\"termination\":{\"exit_code\":0,\"observed_at\":\"2026-11-07T20:01:00Z\",\"observer\":\"cgroup_events\",\"signal\":null,\"tree_empty\":true},\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a66616c73652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a22323032362d31312d30375432303a30313a30305a222c226f7574636f6d65223a2273746f70706564222c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a2273746f70706564222c2273746174655f736571223a312c2273746f70223a7b22636f6e6669726d65645f6174223a22323032362d31312d30375432303a30313a30305a222c227265717565737465645f6174223a22323032362d31312d30375432303a30303a30352e3235305a222c227265717565737465645f6279223a22636f7265227d2c227465726d696e6174696f6e223a7b22657869745f636f6465223a302c226f627365727665645f6174223a22323032362d31312d30375432303a30313a30305a222c226f62736572766572223a226367726f75705f6576656e7473222c227369676e616c223a6e756c6c2c22747265655f656d707479223a747275657d2c2274797065223a2252756e4031227d",
+      "sha256": "67f00e8ae50c3767d6e7dd807c8594a445b605add7ce97db1d35a8d5b2156875",
+      "run_errors": [
+        "stop_reason_not_core"
+      ],
+      "note": "stopped with no stop.reason: the outcome cannot be shown to follow it, refused"
+    },
+    {
+      "name": "run_stopped_reason_unknown",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":false,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"stopped\",\"outcome\":\"stopped\",\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":{\"requested_by\":\"core\",\"reason\":\"operator_whim\",\"requested_at\":\"2026-11-07T20:00:05.250Z\",\"confirmed_at\":\"2026-11-07T20:01:00Z\"},\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":false,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"outcome\":\"stopped\",\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"stopped\",\"state_seq\":1,\"stop\":{\"confirmed_at\":\"2026-11-07T20:01:00Z\",\"reason\":\"operator_whim\",\"requested_at\":\"2026-11-07T20:00:05.250Z\",\"requested_by\":\"core\"},\"termination\":{\"exit_code\":0,\"observed_at\":\"2026-11-07T20:01:00Z\",\"observer\":\"cgroup_events\",\"signal\":null,\"tree_empty\":true},\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a66616c73652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a22323032362d31312d30375432303a30313a30305a222c226f7574636f6d65223a2273746f70706564222c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a2273746f70706564222c2273746174655f736571223a312c2273746f70223a7b22636f6e6669726d65645f6174223a22323032362d31312d30375432303a30313a30305a222c22726561736f6e223a226f70657261746f725f7768696d222c227265717565737465645f6174223a22323032362d31312d30375432303a30303a30352e3235305a222c227265717565737465645f6279223a22636f7265227d2c227465726d696e6174696f6e223a7b22657869745f636f6465223a302c226f627365727665645f6174223a22323032362d31312d30375432303a30313a30305a222c226f62736572766572223a226367726f75705f6576656e7473222c227369676e616c223a6e756c6c2c22747265655f656d707479223a747275657d2c2274797065223a2252756e4031227d",
+      "sha256": "d030429c6fc35e6622241c8731560e81c216846d6ff77040d3eacdae215b5828",
+      "run_errors": [
+        "stop_reason_not_core"
+      ],
+      "note": "stopped with a reason outside the Stop enum: refused, never treated as consistent"
+    },
+    {
+      "name": "run_stopped_reason_null",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":false,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"stopped\",\"outcome\":\"stopped\",\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":{\"requested_by\":\"core\",\"reason\":null,\"requested_at\":\"2026-11-07T20:00:05.250Z\",\"confirmed_at\":\"2026-11-07T20:01:00Z\"},\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":false,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"outcome\":\"stopped\",\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"stopped\",\"state_seq\":1,\"stop\":{\"confirmed_at\":\"2026-11-07T20:01:00Z\",\"reason\":null,\"requested_at\":\"2026-11-07T20:00:05.250Z\",\"requested_by\":\"core\"},\"termination\":{\"exit_code\":0,\"observed_at\":\"2026-11-07T20:01:00Z\",\"observer\":\"cgroup_events\",\"signal\":null,\"tree_empty\":true},\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a66616c73652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a22323032362d31312d30375432303a30313a30305a222c226f7574636f6d65223a2273746f70706564222c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a2273746f70706564222c2273746174655f736571223a312c2273746f70223a7b22636f6e6669726d65645f6174223a22323032362d31312d30375432303a30313a30305a222c22726561736f6e223a6e756c6c2c227265717565737465645f6174223a22323032362d31312d30375432303a30303a30352e3235305a222c227265717565737465645f6279223a22636f7265227d2c227465726d696e6174696f6e223a7b22657869745f636f6465223a302c226f627365727665645f6174223a22323032362d31312d30375432303a30313a30305a222c226f62736572766572223a226367726f75705f6576656e7473222c227369676e616c223a6e756c6c2c22747265655f656d707479223a747275657d2c2274797065223a2252756e4031227d",
+      "sha256": "0912c8b26b4489dcc19c81da591384ef765d5c187269108ede804c933d9f5472",
+      "run_errors": [
+        "stop_reason_not_core"
+      ],
+      "note": "stopped with stop.reason null: refused"
+    },
+    {
+      "name": "run_stopped_reason_caller_stop",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":false,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"stopped\",\"outcome\":\"stopped\",\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":{\"requested_by\":\"core\",\"reason\":\"caller_stop\",\"requested_at\":\"2026-11-07T20:00:05.250Z\",\"confirmed_at\":\"2026-11-07T20:01:00Z\"},\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":false,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"outcome\":\"stopped\",\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"stopped\",\"state_seq\":1,\"stop\":{\"confirmed_at\":\"2026-11-07T20:01:00Z\",\"reason\":\"caller_stop\",\"requested_at\":\"2026-11-07T20:00:05.250Z\",\"requested_by\":\"core\"},\"termination\":{\"exit_code\":0,\"observed_at\":\"2026-11-07T20:01:00Z\",\"observer\":\"cgroup_events\",\"signal\":null,\"tree_empty\":true},\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a66616c73652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a22323032362d31312d30375432303a30313a30305a222c226f7574636f6d65223a2273746f70706564222c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a2273746f70706564222c2273746174655f736571223a312c2273746f70223a7b22636f6e6669726d65645f6174223a22323032362d31312d30375432303a30313a30305a222c22726561736f6e223a2263616c6c65725f73746f70222c227265717565737465645f6174223a22323032362d31312d30375432303a30303a30352e3235305a222c227265717565737465645f6279223a22636f7265227d2c227465726d696e6174696f6e223a7b22657869745f636f6465223a302c226f627365727665645f6174223a22323032362d31312d30375432303a30313a30305a222c226f62736572766572223a226367726f75705f6576656e7473222c227369676e616c223a6e756c6c2c22747265655f656d707479223a747275657d2c2274797065223a2252756e4031227d",
+      "sha256": "f255dcdae05c97f1b7e86009c0e60542a193fc5300cd01ba10812a8bc3ce3a97",
+      "run_errors": [
+        "stop_reason_not_core"
+      ],
+      "note": "caller_stop is a caller reason (that run is cancelled); a stopped run needs a core reason"
+    },
+    {
+      "name": "run_stopped_stop_null",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":false,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"stopped\",\"outcome\":\"stopped\",\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":null,\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":false,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"outcome\":\"stopped\",\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"stopped\",\"state_seq\":1,\"stop\":null,\"termination\":{\"exit_code\":0,\"observed_at\":\"2026-11-07T20:01:00Z\",\"observer\":\"cgroup_events\",\"signal\":null,\"tree_empty\":true},\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a66616c73652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a22323032362d31312d30375432303a30313a30305a222c226f7574636f6d65223a2273746f70706564222c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a2273746f70706564222c2273746174655f736571223a312c2273746f70223a6e756c6c2c227465726d696e6174696f6e223a7b22657869745f636f6465223a302c226f627365727665645f6174223a22323032362d31312d30375432303a30313a30305a222c226f62736572766572223a226367726f75705f6576656e7473222c227369676e616c223a6e756c6c2c22747265655f656d707479223a747275657d2c2274797065223a2252756e4031227d",
+      "sha256": "276ea4f013e7a49d074e9277714da9bffe06187d0eee4447315e4157e06b4b52",
+      "run_errors": [
+        "stop_reason_not_core"
+      ],
+      "note": "stopped with stop null: refused"
+    },
+    {
+      "name": "run_stopped_reason_unknown_as_breaker",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":true,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"stopped\",\"outcome\":\"route_breaker_tripped\",\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":{\"requested_by\":\"core\",\"reason\":\"operator_whim\",\"requested_at\":\"2026-11-07T20:00:05.250Z\",\"confirmed_at\":\"2026-11-07T20:01:00Z\"},\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":true,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"outcome\":\"route_breaker_tripped\",\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"stopped\",\"state_seq\":1,\"stop\":{\"confirmed_at\":\"2026-11-07T20:01:00Z\",\"reason\":\"operator_whim\",\"requested_at\":\"2026-11-07T20:00:05.250Z\",\"requested_by\":\"core\"},\"termination\":{\"exit_code\":0,\"observed_at\":\"2026-11-07T20:01:00Z\",\"observer\":\"cgroup_events\",\"signal\":null,\"tree_empty\":true},\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a747275652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a22323032362d31312d30375432303a30313a30305a222c226f7574636f6d65223a22726f7574655f627265616b65725f74726970706564222c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a2273746f70706564222c2273746174655f736571223a312c2273746f70223a7b22636f6e6669726d65645f6174223a22323032362d31312d30375432303a30313a30305a222c22726561736f6e223a226f70657261746f725f7768696d222c227265717565737465645f6174223a22323032362d31312d30375432303a30303a30352e3235305a222c227265717565737465645f6279223a22636f7265227d2c227465726d696e6174696f6e223a7b22657869745f636f6465223a302c226f627365727665645f6174223a22323032362d31312d30375432303a30313a30305a222c226f62736572766572223a226367726f75705f6576656e7473222c227369676e616c223a6e756c6c2c22747265655f656d707479223a747275657d2c2274797065223a2252756e4031227d",
+      "sha256": "2c98770d7ef8faff8b4419e008e5b62678ba5c0c1c01b5ba863e6d678105cfef",
+      "run_errors": [
+        "stop_reason_not_core"
+      ],
+      "note": "an unknown reason cannot carry a breaker outcome either"
+    },
+    {
       "name": "run_limit_hit_breaker_tripped",
       "input": "{\"type\":\"Run@1\",\"breaker_tripped\":true,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"limit_hit\",\"outcome\":\"route_breaker_tripped\",\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":null,\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
       "expect": "ok",

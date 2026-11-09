@@ -59,14 +59,19 @@ The vectors cover:
 - missing or mistyped fields;
 - a `state` outside the closed Run@1 state set (wrong case, null, a number, an array,
   absent), which is refused as `state_not_in_enum` whatever the outcome says;
+- a `stopped` run whose `stop` is null, has no `reason`, or has a reason that is not a core
+  stop reason (unknown, null, or the caller-only `caller_stop`), which is refused as
+  `stop_reason_not_core` whatever the outcome says;
 - key order, whitespace and escapes that leave the digest unchanged;
 - duplicate keys, including one hidden by an escape (refused, never last-wins), NaN, the
   infinities, floats, integers past 2^53, a lone surrogate and a BOM.
 
 I checked every accepted case once against #1100's own validator (`csl_contract.check`)
 at 114b48be. All of them agreed. That check is not committed, because #1100's code lives in
-csl-research. The six `run_state_*` cases were added later (red-team round 1 on #339) and
-have not been run against #1100's validator.
+csl-research. On Nov 9 (t1430u) every accepted case, including the six `run_state_*` cases
+from red-team round 1 and the six `run_stopped_reason_*` / `run_stopped_stop_null` cases,
+was run again against `csl_contract.check` at 114b48be: every one agreed (no `run_errors`
+means #1100 accepts; any `run_errors` means #1100 refuses with `schema_invalid`).
 
 ## Tests
 

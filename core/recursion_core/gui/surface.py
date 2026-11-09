@@ -48,6 +48,15 @@ _CSS_HASH = base64.b64encode(hashlib.sha256(_CSS.encode()).digest()).decode()
 _CSP = ("default-src 'none'; style-src 'sha256-%s'; form-action 'self'; frame-ancestors 'none'; "
         "base-uri 'none'" % _CSS_HASH)
 _MAX_BODY = 4096
+# O7 operator-response.schema.json: the visibility object is closed to these four keys and values
+# (Cockpit #318, docs/replacement/outcomes/O7). The GUI renders only these fixed strings.
+_VISIBILITY = (
+    ("uncertainty", ("visible", "absent_not_hidden")),
+    ("refusal", ("visible", "absent_not_hidden")),
+    ("stale_data", ("visible", "absent_not_hidden")),
+    ("reconciliation", ("reconciled", "unreconciled_visible")),
+)
+_VISIBILITY_KEYS = frozenset(k for k, _ in _VISIBILITY)
 # Codes the client raises before anything is sent; every other failure is after sending.
 _REFUSED_BEFORE_SENDING = frozenset({"command_not_in_operator_contract", "confirmation_required"})
 _LABELS = {
@@ -236,8 +245,35 @@ class Application:
         warn = ""
         if result.get("order_submitted") is not False and command in ACTIONS:
             warn = '<p role="alert">Contract problem: the response does not state order_submitted=false.</p>'
-        return ('<p role="status">Status reported by the control API: <strong>%s</strong></p>%s%s'
-                % (escape(status), warn, self._response_view(data if shown is None else shown)))
+        return ('<p role="status">Status reported by the control API: <strong>%s</strong></p>%s%s%s'
+                % (escape(status), self._visibility(data), warn,
+                   self._response_view(data if shown is None else shown)))
+
+    @staticmethod
+    def _visibility(data: dict) -> str:
+        """O7's refusal, uncertainty, stale and reconciliation states, from the unfiltered response.
+
+        Rendered on every O7 view, so a venue panel's filter never hides them. Only the four
+        keys of O7's closed visibility object are read, and only their schema values are shown,
+        as fixed text from _VISIBILITY. The response's own text is never passed through: any
+        other value reads as not an O7 value, and any other key is counted, not named.
+        """
+        vis = data.get("visibility")
+        if type(vis) is not dict:
+            return '<p role="status">Visibility: not reported by the control API.</p>'
+        items = []
+        for key, allowed in _VISIBILITY:
+            if key not in vis:
+                shown = "not reported"
+            else:
+                value = vis[key]
+                shown = value if type(value) is str and value in allowed else "reported, not an O7 value"
+            items.append("<li>%s: <strong>%s</strong></li>" % (key, shown))
+        extra = sum(1 for k in vis if k not in _VISIBILITY_KEYS)
+        if extra:
+            items.append("<li>Other fields: <strong>%d withheld, not in O7 visibility</strong></li>" % extra)
+        return ('<section aria-label="Visibility"><p role="status">Visibility reported by the '
+                "control API:</p><ul>%s</ul></section>" % "".join(items))
 
     def _read(self, env: dict) -> tuple[str, str]:
         form = self._query(env)
@@ -263,12 +299,15 @@ class Application:
                 body += ('The control API\'s O7 v0 reads take no venue argument; returned data '
                          'is filtered to <code>%s</code> before display and anything not labelled '
                          'with it is withheld, except unlabelled response-level errors and '
-                         'provenance; venue data stays behind the venue-data switch.</p>'
+                         'provenance. The GUI redacts only fields the control API marks with '
+                         'a venue-data switch that is not on; O7 v0 reports no switch state for '
+                         'venue-labelled rows, so their clearance is the control API\'s to '
+                         'enforce.</p>'
                          % escape(panel["venue"]))
             else:
                 body += ('The control API\'s O7 v0 reads take no venue argument, so the results '
-                         'below are not scoped to this venue; venue data stays behind the '
-                         'venue-data switch.</p>')
+                         'below are not scoped to this venue. The GUI redacts only fields the '
+                         'control API marks with a venue-data switch that is not on.</p>')
         elif panel.get("venue") is not None:
             body += ('<p role="note">The control API\'s O7 v0 reads take no venue argument; '
                      'returned data is filtered to <code>%s</code> before display and anything '

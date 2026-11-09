@@ -15,7 +15,7 @@ from collections.abc import Callable, Mapping
 
 from recursion_core.routes import contract as c
 from recursion_core.routes.base import RouteAdapter
-from recursion_core.subscription_routes import SAFE_ENV, SubscriptionRouteRefused, guard_then_spawn
+from recursion_core.subscription_routes import ENGINES, SAFE_ENV, SubscriptionRouteRefused, guard_then_spawn
 
 # driver(process, request, deadline_at, events) -> contract result
 Driver = Callable[..., dict]
@@ -37,12 +37,22 @@ class ProfileRouteAdapter(RouteAdapter):
         if isinstance(home, str):
             env["HOME"] = home
         if conn["kind"] == "api_key":
+            # The route's key goes only under a name subscription_routes lists for this engine and the profile
+            # selects; a key custody does not hold refuses here instead of launching keyless (the engine would
+            # fall back to whatever login its home holds and bill differently from what the route says).
+            name = conn["credential_env"]
+            allowed = {n for p in ENGINES[self.engine].providers.values() for n in p.credential_env}
+            if name not in allowed:
+                return c.result(rid, c.LAUNCH_REFUSED, detail=f"credential_env {name} not allowed for {self.engine}")
+            if route["profile"].get("credential_env") != name:
+                return c.result(rid, c.LAUNCH_REFUSED, detail="credential_env differs from the profile's")
             try:
-                value = self._credentials(conn["id"], conn["credential_env"])
+                value = self._credentials(conn["id"], name)
             except KeyError:
                 value = ""
-            if value:
-                env[conn["credential_env"]] = value
+            if not isinstance(value, str) or not value:
+                return c.result(rid, c.LAUNCH_REFUSED, detail=f"no credential for {conn['id']}")
+            env[name] = value
         try:
             _decision, process = guard_then_spawn(
                 self._launcher, self._argv(request), self.engine, dict(route["profile"]), env,

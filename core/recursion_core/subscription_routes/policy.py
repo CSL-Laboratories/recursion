@@ -1,7 +1,9 @@
 """Refuse Claude-subscription routes in Pi, Hermes and OpenCode profiles (CSL-786, candidate).
 
-Q12 (PRODUCT.md at csl-research #1074 head 09d4e762): the Claude subscription is used only
-inside Claude Code; other harnesses use an Anthropic API key. Three harnesses now offer a
+Q12 as widened Nov 8 (PRODUCT.md 055cc7a5, CSLR-D-011, sections 2 and 3.3; this replaces the 09d4e762
+"only inside Claude Code" reading): a subscription may run through another harness's own sign-in only where
+that provider's pages allow that harness; Claude-subscription sign-ins in other harnesses stay refused until
+an Anthropic approval for that harness is found, and an Anthropic API key still works. Three harnesses offer a
 Claude-subscription route (csl-research CSL-712 grounding, #1077):
 
 * Pi reads ``ANTHROPIC_OAUTH_TOKEN`` and ``ANTHROPIC_AUTH_TOKEN`` as Anthropic credentials and
@@ -30,11 +32,19 @@ only refuses launch options that would replace the env or widen the launch.
 
 Nov 8 briefing (Lucas): allow a subscription sign-in in these harnesses only where the provider names
 that harness. ChatGPT: OpenCode and Pi, through their registered Sign in with ChatGPT method only. Grok:
-OpenCode and Hermes. Claude and Google sign-ins stay refused in all three; Hermes's setting that borrows
-Claude Code's stored login is off; anything unconfirmed is refused; an API key still works. A profile
+OpenCode and Hermes. Claude and Google sign-ins stay refused in all three; anything unconfirmed is refused; an API key
+still works. PRODUCT.md 055cc7a5 section 2 (E9): "the E9 profile sets Hermes's
+``auth.adopt_external_logins: false`` so it never reads Claude Code's stored login". Every Hermes
+profile must carry that key, under Hermes's own name and set to ``False``, and the decision records it in
+``engine_config`` for the driver to pass to Hermes. Moving HOME does not hide a login kept in the macOS
+Keychain, so this is required on every platform, macOS included; a Hermes profile without it refuses. A profile
 picks one with ``auth: "subscription"`` plus a ``method``; the method is checked, not just the provider
-label (``SUBSCRIPTION_SIGN_INS``). The sign-in stays in the engine's own login store in the route home:
+label (``SUBSCRIPTION_SIGN_INS``), and a ``model`` (``"<provider>/<model>"``) is required so the engine's
+own default cannot pick a Claude model. The sign-in stays in the engine's own login store in the route home:
 Recursion holds, copies or ships no token, and a subscription child env carries no credential at all.
+That store is allowed by presence only and never read, so whether it also holds an adopted Claude or
+Codex login is not known here: the decision says so with an ``own_login_store_not_inspected:<entry>``
+flag. Whether to read or refuse those stores is open for Lucas (PRODUCT.md 055cc7a5 section 2).
 
 Candidate code: no engine, provider or network is used, and nothing here claims a running core
 calls it yet. Provider ids marked unverified below were not read from the engines' source.
@@ -55,6 +65,7 @@ __all__ = [
     "ENGINES",
     "ENGINE_SELECTOR_ENV",
     "ENGINE_STORE_ENTRIES",
+    "HERMES_ADOPT_EXTERNAL_LOGINS",
     "RouteDecision",
     "SAFE_ENV",
     "SubscriptionRouteRefused",
@@ -168,6 +179,9 @@ SUBSCRIPTION_SIGN_INS: Mapping[str, Mapping[str, str]] = MappingProxyType(
 OWN_STORE_ENTRIES: Mapping[str, tuple[str, ...]] = MappingProxyType(
     {"pi": (".pi",), "hermes": (".hermes",), "opencode": (".local/share/opencode", ".config/opencode")}
 )
+# Hermes's own config setting that stops it adopting Claude Code's (and other) stored logins
+# (PRODUCT.md 055cc7a5 section 2, E9). Required, exactly False, in every Hermes profile.
+HERMES_ADOPT_EXTERNAL_LOGINS = "auth.adopt_external_logins"
 # Google consumer and subscription labels: refused in all three harnesses.
 _GOOGLE_LABELS = ("google", "gemini", "antigravity", "google_one", "google_ai")
 
@@ -180,6 +194,9 @@ class RouteDecision:
     flags: tuple[str, ...] = field(default=())  # allowed, but worth a line in the run record
     auth: str = "api_key"
     method: str = ""
+    # Engine-native settings the driver must pass to the engine, e.g. Hermes's
+    # (("auth.adopt_external_logins", False),).
+    engine_config: tuple[tuple[str, object], ...] = ()
 
 
 def check_route(
@@ -194,7 +211,8 @@ def check_route(
     """Validate one Pi/Hermes/OpenCode profile; raise ``SubscriptionRouteRefused`` or return the decision.
 
     ``profile`` keys: ``provider`` (id), ``auth`` (must be ``"api_key"``), ``credential_env`` (the variable
-    that carries the key) and optionally ``model`` (``"<provider>/<model>"``). ``child_env`` is the exact
+    that carries the key) and optionally ``model`` (``"<provider>/<model>"``; required on a subscription
+    route). A Hermes profile also needs ``"auth.adopt_external_logins": False``. ``child_env`` is the exact
     environment the core will pass; ``route_home`` its HOME.
     """
 
@@ -203,15 +221,25 @@ def check_route(
         raise SubscriptionRouteRefused(engine, "unknown_engine")
     if not isinstance(profile, Mapping):
         raise SubscriptionRouteRefused(engine, "profile_malformed")
-    unknown = sorted(set(profile) - {"provider", "auth", "credential_env", "model", "method",
-                                     "borrow_claude_code_login"})
+    known = {"provider", "auth", "credential_env", "model", "method"}
+    if engine == "hermes":
+        known.add(HERMES_ADOPT_EXTERNAL_LOGINS)
+    unknown = sorted(str(key) for key in set(profile) - known)
     if unknown:
         raise SubscriptionRouteRefused(engine, "profile_unknown_field", ",".join(unknown))
-    if profile.get("borrow_claude_code_login", False) is not False:
-        # Hermes can use Claude Code's stored login directly; that setting stays off in every engine.
-        raise SubscriptionRouteRefused(engine, "claude_code_login_borrowing")
+    engine_config: tuple[tuple[str, object], ...] = ()
+    if engine == "hermes":
+        # Hermes "will use Claude Code's credential store directly when available", and on macOS that store
+        # is the login Keychain, which a route home does not hide: the override is required everywhere.
+        if HERMES_ADOPT_EXTERNAL_LOGINS not in profile:
+            raise SubscriptionRouteRefused(engine, "hermes_adopt_external_logins_not_off", "missing")
+        if profile[HERMES_ADOPT_EXTERNAL_LOGINS] is not False:
+            raise SubscriptionRouteRefused(engine, "hermes_adopt_external_logins_not_off",
+                                           repr(profile[HERMES_ADOPT_EXTERNAL_LOGINS])[:32])
+        engine_config = ((HERMES_ADOPT_EXTERNAL_LOGINS, False),)
     if isinstance(profile.get("auth"), str) and _norm(profile["auth"]) == "subscription":
-        return _check_subscription(engine, spec, profile, child_env, route_home, parent_env, operator_home)
+        return _check_subscription(engine, spec, profile, child_env, route_home, parent_env, operator_home,
+                                   engine_config)
     if "method" in profile:
         raise SubscriptionRouteRefused(engine, "method_without_subscription")
     provider, auth, credential = profile.get("provider"), profile.get("auth"), profile.get("credential_env")
@@ -264,7 +292,7 @@ def check_route(
 
     _check_home(engine, env, route_home, parent_env, operator_home)
     flags = tuple(f"parent_env_has:{name}" for name in CLAUDE_SUBSCRIPTION_ENV if name in (parent_env or {}))
-    return RouteDecision(engine, provider, credential, flags)
+    return RouteDecision(engine, provider, credential, flags, engine_config=engine_config)
 
 
 def _norm(label: str) -> str:
@@ -281,6 +309,7 @@ def _check_subscription(
     route_home: str,
     parent_env: Mapping[str, str] | None,
     operator_home: str | None,
+    engine_config: tuple[tuple[str, object], ...] = (),
 ) -> RouteDecision:
     """A subscription sign-in: allowed only for a (provider, method) pair on ``SUBSCRIPTION_SIGN_INS``."""
 
@@ -303,14 +332,15 @@ def _check_subscription(
         raise SubscriptionRouteRefused(engine, "subscription_method_not_registered", _norm(method))
     if "credential_env" in profile:
         raise SubscriptionRouteRefused(engine, "credential_env_on_subscription")
-    if model is not None:
-        if not isinstance(model, str) or "/" not in model:
-            raise SubscriptionRouteRefused(engine, "model_malformed")
-        model_provider = _norm(model.split("/", 1)[0])
-        if model_provider in spec.subscription_providers or _looks_like_claude_login(model_provider.replace("_", "-")):
-            raise SubscriptionRouteRefused(engine, "claude_subscription_provider", model_provider)
-        if model_provider != label:
-            raise SubscriptionRouteRefused(engine, "model_provider_mismatch", model_provider)
+    if model is None:  # the engine's own default could be a Claude model (e.g. OpenCode's anthropic/...)
+        raise SubscriptionRouteRefused(engine, "model_missing")
+    if not isinstance(model, str) or "/" not in model:
+        raise SubscriptionRouteRefused(engine, "model_malformed")
+    model_provider = _norm(model.split("/", 1)[0])
+    if model_provider in spec.subscription_providers or _looks_like_claude_login(model_provider.replace("_", "-")):
+        raise SubscriptionRouteRefused(engine, "claude_subscription_provider", model_provider)
+    if model_provider != label:
+        raise SubscriptionRouteRefused(engine, "model_provider_mismatch", model_provider)
 
     env = dict(child_env)
     present = sorted(name for name in CLAUDE_SUBSCRIPTION_ENV if name in env)
@@ -329,9 +359,15 @@ def _check_subscription(
     if extra:  # no token of any kind: Recursion holds no ChatGPT or Grok token
         raise SubscriptionRouteRefused(engine, "child_env_not_allowed", ",".join(extra))
 
-    _check_home(engine, env, route_home, parent_env, operator_home, own=OWN_STORE_ENTRIES[engine])
+    own = OWN_STORE_ENTRIES[engine]
+    _check_home(engine, env, route_home, parent_env, operator_home, own=own)
     flags = tuple(f"parent_env_has:{name}" for name in CLAUDE_SUBSCRIPTION_ENV if name in (parent_env or {}))
-    return RouteDecision(engine, label, "", flags, auth="subscription", method=allowed[label])
+    # The engine's own store was allowed by presence only; whether it holds an adopted Claude or Codex
+    # login, or a Claude provider plugin, was not inspected (open for Lucas).
+    flags += tuple(f"own_login_store_not_inspected:{entry}" for entry in own
+                   if os.path.lexists(os.path.join(route_home, entry)))
+    return RouteDecision(engine, label, "", flags, auth="subscription", method=allowed[label],
+                         engine_config=engine_config)
 
 
 def guard_then_spawn(

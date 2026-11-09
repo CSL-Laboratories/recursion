@@ -1,8 +1,10 @@
 # core/recursion_core/subscription_routes (CSL-786, candidate)
 
 Refuses Claude-subscription routes in Pi, Hermes and OpenCode engine profiles before any
-spawn. Under Q12 the Claude subscription is used only inside Claude Code; other harnesses
-use an Anthropic API key. Candidate code: not yet called by a running core, and not
+spawn. Under Q12 as widened Nov 8 (PRODUCT.md `055cc7a5`, CSLR-D-011, sections 2 and 3.3) a
+subscription runs through another harness's own sign-in only where that provider allows that
+harness; Claude-subscription sign-ins stay refused in these three, and an Anthropic API key
+still works. Candidate code: not yet called by a running core, and not
 reviewed or accepted.
 
 - `check_route(engine, profile, child_env, route_home=..., parent_env=..., operator_home=...)`
@@ -56,8 +58,14 @@ checked against `SUBSCRIPTION_SIGN_INS`:
 - Claude (`claude*`, `anthropic*`) and Google (`google*`, `gemini*`, `antigravity*`) sign-ins
   refuse in all three. A provider not on the harness's row is `subscription_unconfirmed`; a
   wrong method is `subscription_method_not_registered`.
-- `borrow_claude_code_login` must be absent or `false` (Hermes can otherwise use Claude Code's
-  stored login).
+- A subscription route must name its `model` (`"<provider>/<model>"`, under the signed-in
+  provider), so the engine's own default cannot pick a Claude model (`model_missing`).
+- Every Hermes profile (sign-in or API key) must carry Hermes's own setting
+  `"auth.adopt_external_logins": false` (PRODUCT.md `055cc7a5` section 2, E9); missing or any other
+  value refuses `hermes_adopt_external_logins_not_off`. The decision records it in
+  `RouteDecision.engine_config` for the driver to pass to Hermes. It is required on every
+  platform: on macOS Claude Code's login sits in the login Keychain, which moving HOME does not
+  hide. Pi and OpenCode profiles refuse the key as unknown.
 - The child env carries no credential at all: no API key, no token, no `CODEX_*`. The sign-in
   lives in the engine's own login store in the route home (`.pi`, `.hermes`, or OpenCode's
   `.local/share/opencode` and `.config/opencode`), which the check allows for that engine only,
@@ -65,7 +73,10 @@ checked against `SUBSCRIPTION_SIGN_INS`:
   inside it may resolve outside the route home (`own_store_links_outside_route_home`), so it cannot
   reach the operator's store. Every other engine's store, `.codex/auth.json` and every Claude Code store still
   refuse. Recursion never stores, copies or ships these tokens and cannot see what else a store
-  holds without reading it, which it does not do.
+  holds without reading it, which it does not do. So a present own store is flagged in
+  `RouteDecision.flags` as `own_login_store_not_inspected:<entry>`: it could hold a login
+  `hermes auth` adopted or an OpenCode Claude provider plugin. Reading those stores (provider
+  entry presence only) or refusing them is open for Lucas.
 
 ## Own-loop routes: Copilot and Nous (Lucas, Nov 8)
 
@@ -94,7 +105,9 @@ PRODUCT.md `055cc7a5` section 3.3. `own_loop.py`, checked before any spawn or re
   `adapter_must_stay_off`).
 - `nous_proxy_doctor(base_url, current_user=..., interactive_users=[...])` reports the address,
   refuses one that is not loopback, and warns when other interactive users share the host (any
-  local user can reach a loopback proxy, which "accepts any bearer").
+  local user can reach a loopback proxy, which "accepts any bearer"). With no
+  `interactive_users`, it and `check_nous_own_loop` warn "host users unknown" instead of
+  reporting a clean host.
 - Still *[to verify]* in PRODUCT.md (O61): GitHub's Generative AI Services terms for Copilot, and
   whether the Nous Portal terms' consent clause covers an app calling through the proxy. No
   provider, DNS or network call is made here.
@@ -113,10 +126,11 @@ nothing calls it.
 From the repository root (Python 3.11+, standard library only):
 
 ```sh
-python3 -B -m unittest discover -s core/recursion_core/subscription_routes/tests -t . -v
+python3 -B -m unittest discover -s core/recursion_core/subscription_routes/tests -t core -v
 ```
 
-`tools/ci_gate.py` does not discover `engine/` tests; they run only when started by hand.
+(`-t core` puts `core/` on the import path so `recursion_core` imports; `-t .` fails with
+`ModuleNotFoundError`.) `tools/ci_gate.py` does not discover `core/` tests; they run only when started by hand.
 
 ## Evidence
 

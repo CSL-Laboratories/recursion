@@ -1,6 +1,6 @@
 """CSL-786: Pi, Hermes and OpenCode profiles refuse Claude-subscription routes before spawn (candidate tests).
 
-Run from the repository root: ``python3 -B -m unittest discover -s core/recursion_core/subscription_routes/tests -t . -v``.
+Run from the repository root: ``python3 -B -m unittest discover -s core/recursion_core/subscription_routes/tests -t core -v``.
 No engine, provider or network is used. Every credential value is a fake string, and no real
 credential store is opened: store checks run against scratch homes the tests create.
 """
@@ -20,6 +20,7 @@ from recursion_core.subscription_routes import (
     ENGINE_SELECTOR_ENV,
     ENGINE_STORE_ENTRIES,
     ENGINES,
+    HERMES_ADOPT_EXTERNAL_LOGINS,
     SAFE_ENV,
     SubscriptionRouteRefused,
     check_route,
@@ -53,15 +54,20 @@ class _Base(unittest.TestCase):
         base.update(changes)
         return {key: value for key, value in base.items() if value is not None}
 
-    def spawn(self, engine: str, profile: dict, env: dict, parent: dict | None = None):
+    def spawn(self, engine: str, profile: dict, env: dict, parent: dict | None = None, hermes_override: bool = True):
+        # Every Hermes profile must carry Hermes's own auth.adopt_external_logins: false (PRODUCT.md 055cc7a5
+        # section 2, E9). Added here for Hermes unless a test turns it off to show the refusal.
+        if hermes_override and engine == "hermes" and HERMES_ADOPT_EXTERNAL_LOGINS not in profile:
+            profile = {**profile, HERMES_ADOPT_EXTERNAL_LOGINS: False}
         return guard_then_spawn(self.launcher, [engine, "run"], engine, profile, env, route_home=str(self.home),
                                 parent_env=parent if parent is not None else self.parent(),
                                 operator_home=str(self.operator))
 
-    def assertRefusedBeforeSpawn(self, engine: str, profile: dict, env: dict, cause: str, parent: dict | None = None):
+    def assertRefusedBeforeSpawn(self, engine: str, profile: dict, env: dict, cause: str, parent: dict | None = None,
+                                 hermes_override: bool = True):
         for _ in range(N):
             with self.assertRaises(SubscriptionRouteRefused) as caught:
-                self.spawn(engine, profile, env, parent)
+                self.spawn(engine, profile, env, parent, hermes_override)
             self.assertEqual((engine, cause), (caught.exception.engine, caught.exception.cause))
             self.assertNotIn(FAKE_OAUTH, str(caught.exception))
             self.assertNotIn(FAKE_KEY, str(caught.exception))
@@ -170,7 +176,8 @@ class StoredCredentialTests(_Base):
         for home, cause in ((self.operator, "route_home_is_operator_home"), (inside, "route_home_is_operator_home")):
             for engine in ENGINES_UNDER_TEST:
                 with self.subTest(engine=engine, home=home.name), self.assertRaises(SubscriptionRouteRefused) as caught:
-                    guard_then_spawn(self.launcher, [engine], engine, self.profile(), self.env(HOME=str(home)),
+                    profile = self.profile(**({HERMES_ADOPT_EXTERNAL_LOGINS: False} if engine == "hermes" else {}))
+                    guard_then_spawn(self.launcher, [engine], engine, profile, self.env(HOME=str(home)),
                                      route_home=str(home), parent_env=self.parent(), operator_home=str(self.operator))
                 self.assertEqual(cause, caught.exception.cause)
         self.launcher.assert_not_called()

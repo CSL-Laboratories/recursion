@@ -1,4 +1,4 @@
-"""Nov 8 own-loop routes: Copilot on the user's own copilot CLI sign-in, Nous via Hermes's loopback proxy.
+"""2026-11-08 own-loop routes: Copilot on the user's own copilot CLI sign-in, Nous via Hermes's loopback proxy.
 
 Fakes only: no engine, login store, provider, DNS or network is touched.
 """

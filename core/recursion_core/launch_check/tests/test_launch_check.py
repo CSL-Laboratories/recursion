@@ -56,7 +56,7 @@ CLAUDE = "2.1.318 (Claude Code)"
 CODEX = "codex-cli 0.160.0"
 EXPECTED_CODES = {
     "engine_unknown", "path_not_absolute", "binary_missing", "wrapper_refused", "name_mismatch",
-    "version_probe_failed", "binary_changed", "engine_mismatch", "version_unparsed", "floor_unset",
+    "version_probe_failed", "binary_changed", "engine_mismatch", "identity_mismatch", "identity_unverified", "version_unparsed", "floor_unset",
     "version_refused", "argv_empty", "argv0_mismatch", "grant_forged", "grant_stale", "spawn_too_large",
 }
 needs_exec = unittest.skipUnless(os.name == "posix", "POSIX fixtures")
@@ -135,8 +135,8 @@ class GrantTests(Base):
             ("codex", "codex", "codex-cli 0.131.0-alpha.2", "version_refused"),
             ("opencode", "opencode", "opencode v2.2.5", None),
             ("opencode", "opencode2", "opencode v2.2.5", None),
-            ("opencode", "opencode", "1.18.32", "version_refused"),
-            ("opencode", "opencode", "1.18.33", None),
+            ("opencode", "opencode", "opencode 1.18.32", "version_refused"),
+            ("opencode", "opencode", "opencode 1.18.33", None),
             ("cursor", "agent", "2026.10.22", None),
             ("cursor", "cursor-agent", "2026.10.01-e373342", None),
             ("cursor", "agent", "2025.09.16-abcdef0", "version_refused"),
@@ -145,7 +145,7 @@ class GrantTests(Base):
             ("gemini", "gemini", "0.39.1", None),
             ("grok", "grok", "grok 1.0.0", None),
             ("antigravity", "agy", "1.2.3", None),
-            ("pi", "pi", "0.30.2", None),
+            ("pi", "pi", "0.30.2", "identity_unverified"),
         ]
         for engine, name, line, want in cells:
             for i in range(N):
@@ -311,6 +311,86 @@ class GrantRefusalTests(Base):
 
         self.refused("binary_changed", grant, "claude_code", p, probe=swapping_probe)
 
+    def test_native_pi_printing_a_semver_is_refused_unprobed(self) -> None:
+        # Red-team F3 (#323): Pi has no identity rule and the real Pi is a JS bundle, so a native
+        # `pi` printing a clean semver is some other tool. Refused before its binary is run.
+        calls: list[str] = []
+
+        def counting_probe(spec, realpath, timeout):
+            calls.append(realpath)
+            return F.probe(spec, realpath, timeout)
+
+        for line in ("0.30.2", "pi 1.0.0", "v2.0.0"):
+            with self.subTest(line=line):
+                p = F.make("pi", line)
+                r = self.refused("identity_unverified", grant, "pi", p, probe=counting_probe)
+                self.assertEqual("pi", r.engine)
+        self.assertEqual([], calls)
+        if F.compiled:  # the real probe path too: the fixture must never be executed
+            self.refused("identity_unverified", grant, "pi", F.make("pi", "0.30.2"))
+        # A JS-bundle pi is still wrapper_refused first.
+        d = F.dir()
+        self.refused("wrapper_refused", self.g, "pi", F.script(os.path.join(d, "pi"), "#!/usr/bin/env node\n"))
+
+    def test_self_naming_engines_require_their_name_in_the_version_line(self) -> None:
+        # Red-team round 2 F1 (#323): identity was only ever a refusal (another engine named),
+        # never a requirement. Engines whose real line names them now need a positive match.
+        required = sorted(e for e, s in FLOORS.items() if s.ident_required)
+        self.assertEqual(["claude_code", "codex", "hermes", "opencode"], required)
+        cells = [
+            ("claude_code", "claude", "2.1.400"),
+            ("claude_code", "claude", "v2.1.400"),
+            ("claude_code", "claude", "2.1.400 (Code)"),
+            ("claude_code", "claude", ""),
+            ("codex", "codex", "0.160.0"),
+            ("codex", "codex", "cli 0.160.0"),
+            ("opencode", "opencode", "1.18.33"),
+            ("opencode", "opencode2", "v2.2.5"),
+        ]
+        for engine, name, line in cells:
+            for i in range(N):
+                with self.subTest(engine=engine, line=line, i=i):
+                    r = self.refused("identity_mismatch", self.g, engine, F.make(name, line))
+                    self.assertIn("does not name the engine", r.detail)
+        self.refused("identity_mismatch", self.g, "hermes", self._hermes("0.9.1"))
+        # Real-format lines still grant.
+        for engine, name, line in (("claude_code", "claude", CLAUDE), ("claude_code", "claude", "2.1.400 (claude code)"),
+                                   ("codex", "codex", CODEX), ("opencode", "opencode", "opencode v2.2.5")):
+            with self.subTest(engine=engine, line=line):
+                self.assertEqual(engine, self.g(engine, F.make(name, line)).engine)
+        self.assertEqual("0.9.1", self.g("hermes", self._hermes("hermes-acp 0.9.1")).version)
+
+    def test_bare_line_engines_have_no_positive_identity_check(self) -> None:
+        # Gemini, Cursor, Antigravity and Grok: the real line is bare or unread, so no format is
+        # invented (open for Lucas: pinned digest vs accept). A bare line passing the floors grants.
+        for engine, name, line in (("gemini", "gemini", "0.39.1"), ("cursor", "agent", "2026.10.22"),
+                                   ("antigravity", "agy", "1.2.3"), ("grok", "grok", "1.0.0")):
+            with self.subTest(engine=engine):
+                self.assertFalse(FLOORS[engine].ident_required)
+                self.assertEqual(engine, self.g(engine, F.make(name, line)).engine)
+
+    def test_self_naming_rechecked_at_launch_plan(self) -> None:
+        g = self.g("grok", F.make("grok", "1.0.0"))
+        table = dict(floors_mod.FLOORS)
+        table["grok"] = dataclasses.replace(table["grok"], ident_required=True)
+        with mock.patch.object(floors_mod, "FLOORS", table):
+            self.refused("identity_mismatch", launch_plan, g, ["grok"])
+
+    def test_every_engine_without_an_identity_rule_is_refused(self) -> None:
+        unverified = [e for e, s in FLOORS.items() if s.ident is None]
+        self.assertEqual(["pi"], unverified)
+        table = dict(floors_mod.FLOORS)
+        table["grok"] = dataclasses.replace(table["grok"], ident=None)
+        with mock.patch.object(floors_mod, "FLOORS", table):
+            self.refused("identity_unverified", self.g, "grok", F.make("grok", "grok 1.0.0"))
+
+    def test_identity_rechecked_at_launch_plan(self) -> None:
+        g = self.g("grok", F.make("grok", "grok 1.0.0"))
+        table = dict(floors_mod.FLOORS)
+        table["grok"] = dataclasses.replace(table["grok"], ident=None)
+        with mock.patch.object(floors_mod, "FLOORS", table):
+            self.refused("identity_unverified", launch_plan, g, ["grok"])
+
     def test_engine_mismatch(self) -> None:
         self.refused("engine_mismatch", self.g, "claude_code", self.claude(CODEX))
         self.refused("engine_mismatch", self.g, "codex", F.make("codex", CLAUDE))
@@ -324,7 +404,7 @@ class GrantRefusalTests(Base):
         return os.path.join(d, "hermes")
 
     def test_version_unparsed(self) -> None:
-        for line in ("", "Claude Code", "2.1 (Claude Code)", "2.1.318.4 (Claude Code)", "2.1.318abc (Claude Code)",
+        for line in ("Claude Code", "2.1 (Claude Code)", "2.1.318.4 (Claude Code)", "2.1.318abc (Claude Code)",
                      "2.1.318+build.5 (Claude Code)", "v02.1.318 (Claude Code)", "2.1.x (Claude Code)",
                      "2.1.318" + " " * 300 + "(Claude Code)"):
             with self.subTest(line=line):

@@ -73,6 +73,15 @@ class FloorTableTests(unittest.TestCase):
         self.assertIn("beta until measured", FLOORS["codex"].functional_basis)
         self.assertIn("0.145.0", FLOORS["codex"].functional_basis)
 
+    def test_identity_column(self) -> None:
+        engines = table_record()["engines"]
+        self.assertEqual("unverified", engines["pi"]["identity"])
+        required = {"claude_code", "codex", "opencode", "hermes"}
+        for engine in required:
+            self.assertEqual("required", engines[engine]["identity"], engine)
+        for engine in set(FLOORS) - required - {"pi"}:
+            self.assertEqual("rule", engines[engine]["identity"], engine)
+
     def test_table_is_read_only(self) -> None:
         self.assertIsInstance(FLOORS, MappingProxyType)
         with self.assertRaises(TypeError):
@@ -334,6 +343,7 @@ class LaunchCheckTests(unittest.TestCase):
         F.make("opencode", "opencode v2.2.5", where=d)
         F.make("gemini", "0.38.0", where=d)
         F.script(os.path.join(d, "agent"), "#!/bin/sh\nexec node index.js \"$@\"\n")
+        F.make("pi", "0.30.2", where=d)  # a native `pi` is not Pi (F3): identity_unverified
         grants, records = launch_check(d, probe=F.probe)
         by = {r["engine"]: r for r in records}
         self.assertEqual(set(FLOORS), set(by))
@@ -346,7 +356,8 @@ class LaunchCheckTests(unittest.TestCase):
         self.assertTrue(by["opencode"]["beta"])
         self.assertEqual("version_refused", by["gemini"]["refusal"])
         self.assertEqual("wrapper_refused", by["cursor"]["refusal"])
-        for engine in ("grok", "antigravity", "pi", "hermes"):
+        self.assertEqual("identity_unverified", by["pi"]["refusal"])
+        for engine in ("grok", "antigravity", "hermes"):
             self.assertEqual("absent", by[engine]["outcome"])
         for r in records:
             self.assertEqual(FLOOR_TABLE_VERSION, r["floor_table"])

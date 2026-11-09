@@ -26,7 +26,9 @@ from dataclasses import asdict, dataclass, fields
 
 from recursion_core.launch_check import floors
 from recursion_core.launch_check.binary import HEX64, WRAPPER_EXT, file_kind, is_wrapper_name, sha256_file, stem
-from recursion_core.launch_check.floors import EngineSpec, check_floors, other_engine_named, parse_version, spec_for
+from recursion_core.launch_check.floors import (
+    EngineSpec, check_floors, check_identity, check_self_named, other_engine_named, parse_version, spec_for,
+)
 from recursion_core.launch_check.probe import PROBE_TIMEOUT_S, Probe, run_version_probe
 from recursion_core.launch_check.refusals import REFUSAL_CODES_VERSION, LaunchRefused
 
@@ -112,6 +114,7 @@ def grant(engine: str, path: str, *, timeout: float = PROBE_TIMEOUT_S, probe: Pr
     else:
         probe_path = os.path.join(os.path.dirname(path), spec.probe_name)
         probe_real = _realpath_native(spec, probe_path, spec.probe_name)
+    check_identity(spec)  # before the binary is run
     digest, size = _hash(spec, real)
     probe_digest = digest if probe_real == real else _hash(spec, probe_real)[0]
 
@@ -124,6 +127,7 @@ def grant(engine: str, path: str, *, timeout: float = PROBE_TIMEOUT_S, probe: Pr
     other = other_engine_named(spec, result.raw)
     if other is not None:
         raise LaunchRefused("engine_mismatch", spec.engine, f"version line names {other}: {result.raw[:120]!r}")
+    check_self_named(spec, result.raw)
     parsed = parse_version(spec.scheme, result.raw)
     if parsed is None:
         raise LaunchRefused("version_unparsed", spec.engine, f"raw {result.raw[:120]!r}")
@@ -151,11 +155,13 @@ def authenticate(g: object) -> EngineSpec:
     if g.floor_table != floors.FLOOR_TABLE_VERSION or g.refusal_codes != REFUSAL_CODES_VERSION:
         raise LaunchRefused("grant_stale", engine, f"issued under {g.floor_table}; table is now {floors.FLOOR_TABLE_VERSION}")
     spec = spec_for(engine)
+    check_identity(spec)
     if not HEX64.fullmatch(g.sha256) or not HEX64.fullmatch(g.probe_sha256):
         raise LaunchRefused("grant_forged", engine, "digest is not a full 64-hex SHA-256")
     parsed = parse_version(spec.scheme, g.version_raw)
     if parsed is None or parsed.text != g.version:
         raise LaunchRefused("grant_forged", engine, "version fields do not re-parse")
+    check_self_named(spec, g.version_raw)  # re-checked at the trusted boundary
     check_floors(spec, parsed)  # re-checked at the trusted boundary
     return spec
 

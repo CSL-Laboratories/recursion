@@ -10,6 +10,9 @@ Governing spec: `contracts/PRODUCT.md` at csl-research `055cc7a5c793b7135e5d0565
 "R2a defined" (grill Q22), O50 ("Beta until measured") and 11.6 (grill Q43, functional floors), 34b (nine engines).
 Build-order item 5 (B10). Recursion hard rule 8 still applies: no live provider call until
 R2a merges and `CONTROL_PLANE.md` records each route's account and spend ceiling.
+Facts for that gate (whether merging this package counts as "R2a landed" is open for Lucas):
+nothing in the repository calls this check yet, so no launch path enforces it, and the
+window between `exec_argv()` and the exec itself is still open (CX-1402, see Limits).
 
 ## What it does
 
@@ -25,10 +28,12 @@ R2a merges and `CONTROL_PLANE.md` records each route's account and spend ceiling
   names (`name_mismatch`, or `wrapper_refused` for an interpreter or wrapper name); the path
   exists and is executable (`binary_missing`); the resolved file is native and not a
   wrapper name (`wrapper_refused`: shebang scripts, links to scripts, `.cmd`/`.ps1`/`.js`/
-  `.sh`, text). It hashes the realpath (full SHA-256 and size), runs the zero-egress version
+  `.sh`, text). An engine with no identity rule (Pi) is then refused
+  (`identity_unverified`) without being run. It hashes the realpath (full SHA-256 and size), runs the zero-egress version
   probe, re-hashes (`binary_changed` if it changed while probing), and refuses a non-zero
   exit or timeout (`version_probe_failed`), a line naming another engine (`engine_mismatch`),
-  an unparsed version (`version_unparsed`), or a prerelease or a version below a
+  for claude_code, codex, opencode and hermes a line that does not name the engine
+  (`identity_mismatch`), an unparsed version (`version_unparsed`), or a prerelease or a version below a
   known floor (`version_refused`). An unset functional floor is not a refusal:
   the grant is tagged `beta` for route.list (O50).
 - The grant record holds engine, path, realpath, sha256 (64 hex), size, raw version line,
@@ -51,7 +56,7 @@ R2a merges and `CONTROL_PLANE.md` records each route's account and spend ceiling
   (`granted`, `refused` with code, or `absent`). Grants are returned apart from records.
 
 Every failure is a `LaunchRefused` with a code from the closed set `REFUSAL_CODES`
-(`r2a-refusals/1.0.0-candidate-2026-11-07`, 16 codes). No path returns a grant or plan
+(`r2a-refusals/1.2.0-candidate-2026-11-09`, 18 codes). No path returns a grant or plan
 after an error.
 
 ### Zero-egress version probe
@@ -67,14 +72,25 @@ Claude Code's `DISABLE_AUTOUPDATER=1` and `DISABLE_UPDATES=1`. No proxy, credent
 config-path or `CLI_VERSION` variable can reach it. Limit: this is not a kernel network
 block; a network namespace belongs to the launch sandbox (B6), not this check.
 
-## Floor table `r2a-floors/1.1.0-candidate-2026-11-08`
+## Floor table `r2a-floors/1.3.0-candidate-2026-11-09`
 
 Two slots per engine. A grant needs `found >= security` when a security floor is set.
 When a functional floor is set, it also needs `found >= functional`. With no functional
 floor the engine still runs and the grant is tagged `beta` for route.list (O50, "Beta
 until measured"). A floor change is a new table version (grants under the old version
 become `grant_stale`). `floor_unset` remains in the closed refusal set for a table
-floor that does not parse.
+floor that does not parse. An engine with no identity rule (no `ident` regex and no
+pinned digest) is refused `identity_unverified` before its binary is run.
+
+Identity is checked positively only for the four engines whose real version line is
+recorded and names the engine: claude_code (`2.1.318 (Claude Code)`), codex
+(`codex-cli 0.160.0`), opencode (`opencode v2.2.5`) and hermes (via `hermes-acp 0.9.1`).
+For these a line that does not match the engine's identity rule is `identity_mismatch`
+(so a native `claude` printing `2.1.400` is refused). For grok, antigravity, cursor and
+gemini the real line is bare (`0.39.1`, `2026.10.01-e373342`) or was never read, and no
+format is invented: a native binary with the right name printing a bare version that
+passes the floors is granted; the only identity check is that the line names no other
+engine. Whether those four need a pinned digest or are accepted as is, is open for Lucas.
 
 | Engine (binaries) | Scheme | Functional floor (Q43) | Security floor (relayed) |
 |---|---|---|---|
@@ -85,7 +101,7 @@ floor that does not parse.
 | antigravity (`agy`) | semver (assumed) | unset | none |
 | cursor (`agent`, `cursor-agent`) | date | unset | 2025.09.17-25b418f (D2-72) |
 | gemini (`gemini`) | semver | unset | 0.39.1 (D2-72) |
-| pi (`pi`) | semver (assumed) | unset | none |
+| pi (`pi`) | semver (assumed); no identity rule: `identity_unverified` | unset | none |
 | hermes (`hermes`, read via `hermes-acp`) | semver (assumed) | unset | none |
 
 Codex: 0.131.0 is a security floor only. There is no measured functional floor, so Codex
@@ -108,10 +124,18 @@ reports it in the detection note, and gives it no candidate even if a native fil
 Nothing is executed. A `hermes` found by other means is still judged by the binary rules below;
 this adds a named refusal reason, not a new refusal code.
 
-Known consequences, by design: Gemini CLI and Pi run JS bundles under node and Hermes is a
+Known consequences at this head: Gemini CLI and Pi run JS bundles under node and Hermes is a
 Python entry point (11.6), so under the native-binary rule they are `wrapper_refused`
-until a launcher-plus-tree pin exists; Cursor likewise (no native engine binary, #1087
-section 6.2). Once a native pin exists they run as beta until a functional floor is measured.
+(refused, not beta) until a launcher-plus-tree pin exists; Cursor likewise (no native
+engine binary, #1087 section 6.2). So on a real install these four routes are refused.
+Whether to build a launcher-plus-tree pin or accept four refused routes is open for Lucas.
+Pi additionally needs an identity rule or pinned digest: a native `pi` is not the real Pi,
+so it is `identity_unverified`. Antigravity (`agy`) keeps its identity rule (a line naming
+another engine is refused) and is not changed here: its version line was never read, so
+requiring it to name itself could refuse the real binary; its format remains an assumption.
+The `beta` field is `true` exactly when no functional floor is set; Claude Code (2.1.314,
+not yet measured, CX-956) therefore shows `beta: false`. What `beta` should mean is open
+for Lucas.
 
 ## Limits
 

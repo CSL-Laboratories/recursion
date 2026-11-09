@@ -478,6 +478,73 @@ class SameRunAndStopTests(unittest.TestCase):
         self.assertNotIn("result", body)
         self.assertEqual(server.notifications, [])
 
+    def _cancel(self, server, run_id: str) -> dict:
+        return server.handle({"jsonrpc": "2.0", "id": "tc", "method": "tasks/cancel",
+                              "params": modern_params(taskId=run_id)})
+
+    def test_confirmed_stop_whose_write_fails_reads_cancelled_not_pending(self) -> None:
+        # Bot review 4511585104 at 5b64f8d2: the first cancel left the run stop_pending; the second confirmed
+        # an empty cgroup but its write-back failed, and the reply read the stale record as "pending".
+        from recursion_core.control.registry import EMPTY
+        registry = _OutageRegistry()
+        api, registry, kill, _ = make_api(FakeKillTree(answers=(POPULATED, EMPTY)), registry=registry)
+        server = DualEraServer(api)
+        run_id = started(api)
+        first = self._cancel(server, run_id)["result"]
+        self.assertEqual((first["status"], first["statusMessage"]), ("working", "pending"))
+        real_put = registry.put
+
+        def refuse_stopped(record: dict) -> None:
+            if record.get("state") == "stopped":
+                raise OSError("registry")
+            real_put(record)
+
+        registry.put = refuse_stopped
+        body = self._cancel(server, run_id)["result"]
+        self.assertEqual(body["status"], "cancelled")
+        self.assertNotEqual(body.get("statusMessage"), "pending")
+        self.assertEqual(body["result"], {"content": [{"type": "text", "text": "cancelled"}]})
+
+    def test_cancel_fallback_keeps_the_recorded_stop_time(self) -> None:
+        # Bot review 4511755938 at 6f0360b0: the fallback reply replaced the stop time with the server clock,
+        # so lastUpdatedAt moved backward on the next successful poll.
+        from recursion_core.control.registry import EMPTY
+        registry = _OutageRegistry()
+        now = [1000.0]
+        api = ControlAPI(registry, FakeKillTree(answers=(EMPTY,)), FakeStarter(), clock=lambda: now[0])
+        server = DualEraServer(api, clock=lambda: now[0])
+        run_id = started(api)
+        self._cancel(server, run_id)
+        recorded = registry.get(run_id)["stop"]["requested_at"]
+        now[0] = 4600.0
+        real_stop = api.stop
+
+        def stop_then_outage(rid: str) -> dict:
+            answer = real_stop(rid)
+            registry.down = True
+            return answer
+
+        api.stop = stop_then_outage
+        body = self._cancel(server, run_id)["result"]
+        registry.down = False
+        polled = server.handle({"jsonrpc": "2.0", "id": "g", "method": "tasks/get",
+                                "params": modern_params(taskId=run_id)})["result"]
+        self.assertEqual(body["lastUpdatedAt"], polled["lastUpdatedAt"])
+        self.assertEqual(registry.get(run_id)["stop"]["requested_at"], recorded)
+
+    def test_stop_intent_on_a_failed_start_stays_working_pending(self) -> None:
+        # Same rule as the TUI and CLI: a Stop kept as intent on a start_failed run is unconfirmed, so the
+        # task is working + "pending", never the terminal "failed".
+        registry = InMemoryRunRegistry()
+        api, registry, _, _ = make_api(registry=registry)
+        registry.put({"run_id": "run-x", "tenant": "t1", "engine": "codex", "state": "start_failed",
+                      "cgroup": None, "started_at": 1000.0, "start_key": None,
+                      "stop": {"requested_at": 1000.0, "checks": 1, "reason": "cgroup_unknown", "requested": False}})
+        server = DualEraServer(api)
+        body = server.handle({"jsonrpc": "2.0", "id": "g", "method": "tasks/get",
+                              "params": modern_params(taskId="run-x")})["result"]
+        self.assertEqual((body["status"], body["statusMessage"]), ("working", "pending"))
+
     def test_registry_outage_on_tasks_is_an_internal_error_not_an_unknown_task(self) -> None:
         registry = _OutageRegistry()
         api, registry, kill, _ = make_api(FakeKillTree(), registry=registry)

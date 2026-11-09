@@ -92,7 +92,12 @@ recorded on F60, CSL-762).
   reads ``working`` with ``statusMessage: "pending"`` through ``tasks/cancel``,
   ``tasks/get`` and the ``CreateTaskResult`` of a start whose launch a Stop
   landed during, never ``cancelled`` (S6); a ``starting`` launch reads
-  ``working``, not ``failed``.
+  ``working``, not ``failed``. "Not confirmed" is the TUI and CLI rule: any state
+  but ``stopped`` that carries a stop record, so a Stop kept as intent on a
+  ``start_failed`` run also reads ``working`` + ``"pending"``. When ``run.stop``
+  answered but its write-back failed (``"recorded": false``), ``tasks/cancel``
+  answers from that answer, so a confirmed Stop reads ``cancelled`` rather than a
+  stale ``pending``; the fallback keeps the record's own stop time.
 
   Deferred (PRODUCT.md O60 / A45): the ``2026-07-28`` side is not yet tested
   against a pinned pre-release conformance tool. The shapes (``server/discover``,

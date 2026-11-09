@@ -128,11 +128,22 @@ def _run_status(state: str) -> str:
     return "failed"
 
 
+def _task_status(rec: Mapping) -> str:
+    """A run whose Stop is not confirmed stays ``working`` (S6 "pending"), even ``start_failed``: the launch
+    may have happened, so a terminal ``failed`` would tell the client nothing is left to stop."""
+
+    return "working" if _stop_pending(rec) else _run_status(rec.get("state", "failed"))
+
+
 def _stop_pending(rec: Mapping) -> bool:
     """S6: a Stop the core has not confirmed reads "pending" on every surface, Tasks included."""
 
+    # Same rule as the TUI and CLI (``tui.protocol.stop_unconfirmed``): any state but ``stopped`` that carries a
+    # stop record, e.g. a Stop kept as intent on a ``starting`` or ``start_failed`` run (t1430u X1c).
     state = rec.get("state")
-    return state == "stop_pending" or (state == "starting" and rec.get("stop") is not None)
+    if state == "stopped":
+        return False
+    return state == "stop_pending" or isinstance(rec.get("stop"), Mapping)
 
 
 def _printable_id(value: object) -> str | None:
@@ -287,7 +298,7 @@ class DualEraServer:
         body = {
             "resultType": "task",
             "taskId": run_id,
-            "status": _run_status(run.get("state", "running")),
+            "status": _task_status(dict(run, state=run.get("state", "running"))),
             "createdAt": now,
             "lastUpdatedAt": now,
             "ttlMs": None,
@@ -316,7 +327,7 @@ class DualEraServer:
         body = {
             "resultType": "complete",
             "taskId": rec["run_id"],
-            "status": _run_status(rec.get("state", "failed")),
+            "status": _task_status(rec),
             "createdAt": _iso(rec.get("started_at", self._clock())),
             "lastUpdatedAt": _iso(last) if isinstance(last, (int, float)) else now,
             "ttlMs": None,
@@ -346,14 +357,20 @@ class DualEraServer:
         if answer.get("code") not in {"stopped", "pending"}:
             return _error_code(answer)  # run.stop sent nothing (unknown run or registry down at its read)
         status_answer = self.api.call("run.status", {"run_id": task_id})
-        if status_answer.get("code") == "ok":
+        if status_answer.get("code") == "ok" and answer.get("recorded") is not False:
             rec = status_answer["run"]
         else:
-            # The Stop was attempted but the record cannot be re-read: the run.stop answer is the truth
-            # (S6), so an unconfirmed Stop still reads working + "pending" (red-team r3 finding 1).
+            # The Stop was attempted but its result is not in the registry (the re-read failed, or the
+            # write-back did): the run.stop answer is the truth (S6). An unconfirmed Stop reads working +
+            # "pending", and a confirmed one reads cancelled, never pending from a stale record (red-team r3
+            # finding 1; bot review 4511585104). The stop time is kept from the record when it has one
+            # (bot review 4511755938), so lastUpdatedAt never moves backward on the next poll.
             state = "stopped" if answer["code"] == "stopped" else "stop_pending"
             rec = dict(before["run"], state=state)
-            rec["stop"] = dict(rec.get("stop") or {}, requested_at=self._clock())
+            stop = dict(rec.get("stop") or {})
+            if not isinstance(stop.get("requested_at"), (int, float)):
+                stop["requested_at"] = self._clock()
+            rec["stop"] = stop
         extra = {"statusMessage": answer.get("code")}
         if rec.get("state") == "stopped":
             extra["result"] = {"content": [{"type": "text", "text": "cancelled"}]}

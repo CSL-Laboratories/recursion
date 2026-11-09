@@ -11,11 +11,14 @@ yet called by a running daemon, and not reviewed or accepted.
   as unsigned; verified is a label, not a gate. After every load attempt it reads
   `sys._is_gil_enabled()` and poisons the core if the GIL is on. A key revoked while
   plugins run (host op `key.revoke`) turns off `order` for every active plugin under
-  that key at once (PRODUCT.md 4.4); turning it back on is a fresh grant and load. The
+  that key at once (PRODUCT.md 4.4). The
   revocation is written to an installer-created SQLite store
   (`create_revocation_store`) and read back when the trust store is built, so a restart
   keeps the key revoked; without a store `key.revoke` still turns order off but refuses
-  `revocation_not_durable`.
+  `revocation_not_durable`. Every later load of a plugin under a revoked key, signed or
+  manually granted, on the trusted list or not, has no `order` until the user grants it
+  again with `Grant.order_after_revoked_key` naming that key (a manual grant still needs
+  `unsigned_order_acknowledged`).
 - `approval.ApprovalGate` draws every approval from the effect's canonical bytes,
   accepts only the `operator_ui` principal, binds the decision to the digest and allows
   one use.

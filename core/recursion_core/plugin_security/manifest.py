@@ -211,10 +211,10 @@ class TrustStore:
     def classify(self, manifest: Manifest, signature: object) -> tuple[str, str | None, str]:
         """Return ``(trust, signer_key_id, reason)``; trust is ``signed`` or ``unsigned``."""
         kid = key_id(manifest.developer_key)
+        if kid in self._revoked:  # checked first: revocation also holds for an untrusted key
+            return "unsigned", None, "signer_key_revoked"
         if kid not in self._keys:
             return "unsigned", None, "signer_not_on_trusted_list"
-        if kid in self._revoked:
-            return "unsigned", None, "signer_key_revoked"
         if not verify(manifest.developer_key, signature, manifest.raw):
             return "unsigned", None, "signature_invalid"
         return "signed", kid, "signature_valid_trusted_key"
@@ -229,6 +229,9 @@ class Grant:
     signer_key_id: str | None
     permissions: tuple
     unsigned_order_acknowledged: bool = False
+    # The user's step to turn order back on under a revoked developer key (4.4): the
+    # grant names that key id. A grant made before the revocation never names it.
+    order_after_revoked_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -247,8 +250,14 @@ class ReservedEffects:
 
 
 def effective_permissions(manifest: Manifest, trust: str, signer_key_id: str | None,
-                          grant: Grant | None) -> tuple[tuple, list[tuple[str, str]]]:
-    """Requested ∩ granted, in canonical order, plus the reasons anything was dropped."""
+                          grant: Grant | None, revoked_key_id: str | None = None
+                          ) -> tuple[tuple, list[tuple[str, str]]]:
+    """Requested ∩ granted, in canonical order, plus the reasons anything was dropped.
+
+    ``revoked_key_id`` is the manifest's developer key id when that key is revoked. Then
+    order stays off, for a signed or a manual grant, until the grant names that key in
+    ``order_after_revoked_key`` (PRODUCT.md 4.4).
+    """
     dropped: list[tuple[str, str]] = []
     if grant is None:
         return (), [("no_grant", "no installer grant for this plugin")]
@@ -265,6 +274,9 @@ def effective_permissions(manifest: Manifest, trust: str, signer_key_id: str | N
             continue
         if perm == "order" and trust != "signed" and not grant.unsigned_order_acknowledged:
             dropped.append(("unsigned_order_requires_manual_grant", perm))
+            continue
+        if perm == "order" and revoked_key_id is not None and grant.order_after_revoked_key != revoked_key_id:
+            dropped.append(("signer_key_revoked_order_off", revoked_key_id))
             continue
         out.append(perm)
     return tuple(out), dropped

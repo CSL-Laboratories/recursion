@@ -98,9 +98,11 @@ class PluginLoader:
         Later loads treat the key as unsigned. Every active plugin whose manifest names that
         developer key loses ``order`` at once, signed or manually granted, so a stolen key
         cannot keep trading until the next restart. Its other grants stay (O12 open).
-        Turning order back on is the user's step: a fresh grant and load, never this call.
-        The revocation is stored durably (``TrustStore``), so a restart keeps the key
-        revoked. Order is turned off before the durable write, so if that write fails
+        Turning order back on is the user's step: a fresh grant that names the revoked key in
+        ``order_after_revoked_key``, then a load; never this call. The revocation is stored
+        durably (``TrustStore``), so a restart keeps the key revoked, and every later load
+        keeps order off for a grant that does not name the key, signed or manual, on the
+        trusted list or not. Order is turned off before the durable write, so if that write fails
         the running plugins are already off and ``revocation_not_durable`` is raised.
         """
         if type(kid) is not str or not kid.startswith("ed25519:"):
@@ -154,7 +156,10 @@ class PluginLoader:
         for ref in manifest.credential_refs:
             if self._reserved.credential_reserved(ref):
                 raise Refused("reserved_credential", ref)
-        perms, dropped = effective_permissions(manifest, trust, kid, self._grants.get(manifest.plugin_id))
+        dev_kid = key_id(manifest.developer_key)
+        revoked = dev_kid if dev_kid in self._trust.revoked else None
+        perms, dropped = effective_permissions(manifest, trust, kid, self._grants.get(manifest.plugin_id),
+                                               revoked)
         for code, detail in dropped:
             findings.append(_finding("admit", code, "warn", detail))
         for perm in ("process", "network", "credential"):

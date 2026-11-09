@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 
 from recursion_core.plugin_security import (
-    PROTOCOL, CoreHealth, CoreService, PluginLoader, Refused, TrustStore, canonical, parse_manifest,
+    PROTOCOL, CoreHealth, CoreService, Grant, PluginLoader, Refused, TrustStore, canonical, parse_manifest,
 )
 from recursion_core.plugin_security.tests.support import (
     AGENT_TOKEN, OPERATOR_TOKEN, PLUGIN_SOURCE, PLUGIN_TOKEN, FakeGilProbe, World, effect, needs_crypto,
@@ -164,6 +164,42 @@ class RevocationTests(unittest.TestCase):
         codes = [f["code"] for f in loaded.findings]
         self.assertIn("signer_key_revoked", codes)
         self.assertIn("grant_signer_mismatch", codes)  # the user's step is a fresh grant
+
+    def _restart_load(self, trusted: dict, grant: Grant):
+        # A daemon restart: installer config and the same revocation store.
+        trust = TrustStore(trusted, revocation_store=self.w.revocation_store)
+        self.addCleanup(trust.close)
+        loader = PluginLoader(trust, {"demo.plugin": grant}, self.w.reserved, CoreHealth(), FakeGilProbe())
+        loaded = loader.load(self.w.manifest, self.w.developer.sign(self.w.manifest), PLUGIN_SOURCE)
+        return loader, loaded
+
+    def test_manual_grant_does_not_get_order_back_after_a_restart(self) -> None:
+        """Round 3 finding 1: a manual grant (no signer, unsigned order acknowledged) stays
+        without order after a restart, with the key on the trusted list or off it."""
+        self.assertTrue(self.w.call(self.w.host, "key.revoke", key_id=self.kid)["ok"])
+        manual = Grant("demo.plugin", self.w.grant.artifact_sha256, None, ("read", "propose", "order"), True)
+        for name, trusted in (("on_trusted_list", self.w.trusted), ("off_trusted_list", {})):
+            with self.subTest(name):
+                loader, loaded = self._restart_load(trusted, manual)
+                self.assertEqual(loaded.trust, "unsigned")
+                self.assertEqual(loader.permissions("demo.plugin"), ("read", "propose"))
+                codes = [f["code"] for f in loaded.findings]
+                self.assertIn("signer_key_revoked", codes)
+                self.assertIn("signer_key_revoked_order_off", codes)
+
+    def test_order_comes_back_only_through_a_grant_naming_the_revoked_key(self) -> None:
+        self.assertTrue(self.w.call(self.w.host, "key.revoke", key_id=self.kid)["ok"])
+        digest = self.w.grant.artifact_sha256
+        other = "ed25519:" + "cd" * 16
+        wrong = Grant("demo.plugin", digest, None, ("read", "propose", "order"), True, other)
+        self.assertNotIn("order", self._restart_load({}, wrong)[0].permissions("demo.plugin"))
+        # The user's step: a fresh manual grant behind the warning that names the revoked key.
+        again = Grant("demo.plugin", digest, None, ("read", "propose", "order"), True, self.kid)
+        loader, loaded = self._restart_load(self.w.trusted, again)
+        self.assertEqual(loader.permissions("demo.plugin"), ("read", "propose", "order"))
+        # Naming the key does not stand in for the unsigned-order acknowledgement.
+        no_ack = Grant("demo.plugin", digest, None, ("read", "propose", "order"), False, self.kid)
+        self.assertNotIn("order", self._restart_load({}, no_ack)[0].permissions("demo.plugin"))
 
     def test_revocation_without_a_store_is_refused_but_order_is_off(self) -> None:
         trust = TrustStore(self.w.trusted)  # no durable store configured

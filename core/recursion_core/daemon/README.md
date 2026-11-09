@@ -74,8 +74,10 @@ are unaffected:
   does not stop runs; the sweep re-adopts them. The `recursion-run-` namespace is
   reserved: the sweep stops units there that have no live registry entry.
 - States: `starting`, `running`, `stopping`, `unknown`, and the sticky terminal
-  states `terminated` (cgroup positively observed empty, `populated 0`, in this
-  boot) and `lost_reboot`. A run with a recorded Stop is never reported `running`.
+  states `terminated` (systemd saw the run unit end in this boot: its cgroup read
+  `populated 0`; or the loaded unit is `inactive`, `failed` or `active (exited)` with
+  its cgroup already pruned; or a synchronous `systemctl stop` returned and the unit
+  was then garbage-collected) and `lost_reboot`. A run with a recorded Stop is never reported `running`.
   Anything not positively observed is `unknown`, never `terminated`.
 
 ## Reboot
@@ -90,8 +92,8 @@ Workload checkpoint and restart after reboot is not implemented.
 
 - Same uid: a run can call `systemd-run --user`, or write another `cgroup.procs`
   it owns, and leave its unit's cgroup. The escaped process is unseen, and the
-  unit can read empty while it lives. `terminated` means the run unit's cgroup was
-  seen empty, not that every process the run started is gone. Same uid is not a
+  unit can read empty while it lives. `terminated` means systemd saw the run unit's
+  cgroup empty or the unit end, not that every process the run started is gone. Same uid is not a
   containment or security boundary.
 - If the systemd user manager itself stops (no Linger at last logout, or
   `user@.service` restart), it stops the run units too. Linger is the guard.

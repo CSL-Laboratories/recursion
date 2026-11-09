@@ -21,7 +21,9 @@ log = logging.getLogger(__name__)
 RUN_ID = re.compile(r'[a-zA-Z0-9_-]{1,64}')
 UNIT = re.compile(r'recursion-run-[a-zA-Z0-9_-]{1,64}\.service')
 # Terminal states are sticky: once recorded they are never re-observed or re-adopted.
-# terminated: the run's cgroup was positively observed empty in this boot.
+# terminated: systemd positively saw the run unit end in this boot: its cgroup read
+# empty, the loaded unit reached inactive/failed/exited with its cgroup pruned, or a
+# synchronous systemctl stop returned and the unit was then garbage-collected.
 # lost_reboot: the run belongs to an earlier boot (boot_id changed). Its processes
 # cannot exist in this kernel, but nothing saw them end, so it is not "terminated".
 # Nothing is relaunched: workload restart after reboot needs a founder policy.
@@ -184,7 +186,7 @@ class ServiceManager(Protocol):
     def start(self, unit: str, argv: list[str]) -> None: ...
     def stop(self, unit: str) -> None: ...
     def observe(self, unit: str) -> str:
-        """Return running, empty (positively observed), or unknown."""
+        """Return running, empty (positively observed ended), gone (not loaded), or unknown."""
         ...
     def owned_units(self) -> set[str]: ...
 
@@ -237,9 +239,16 @@ class Daemon:
         try:
             if boot is None:
                 raise OSError('boot_id unreadable')
+            stopped = False
             if run.stop_requested:
                 self.manager.stop(run.unit)
+                stopped = True
             observation = self.manager.observe(run.unit)
+            # A gone (not-found) unit is terminated only right after this reconcile's
+            # stop returned: systemctl stop waits for the unit to go inactive, then systemd
+            # garbage-collects it. A unit that is merely absent may never have launched.
+            if observation == 'gone' and stopped:
+                observation = 'empty'
             state = {'running': 'stopping' if run.stop_requested else 'running',
                      'empty': 'terminated'}.get(observation, 'unknown')
         except (OSError, subprocess.SubprocessError) as exc:
@@ -299,12 +308,28 @@ class SystemdUserManager:
         self._call(['systemctl', '--user', 'stop', '--', unit])
 
     def observe(self, unit):
+        """Read systemd's view of the unit.
+
+        systemd prunes a unit's cgroup once it is empty and the unit is inactive, failed
+        or (RemainAfterExit) active/exited, so ControlGroup= is then blank: a loaded unit
+        in one of those states with no cgroup is ended. A cgroup that still exists is
+        read directly. Not-found is gone (garbage-collected or never launched).
+        """
         try:
             text = self._call(['systemctl', '--user', 'show', '--property=LoadState,'
-                               'ActiveState,ControlGroup', '--', unit])
+                               'ActiveState,SubState,ControlGroup', '--', unit])
             props = dict(line.split('=', 1) for line in text.splitlines() if '=' in line)
             group = props.get('ControlGroup', '')
-            if not group or not group.startswith('/') or '..' in Path(group).parts:
+            if not group:
+                load, active = props.get('LoadState'), props.get('ActiveState')
+                if load == 'not-found' and active == 'inactive':
+                    return 'gone'
+                if load == 'loaded' and (active in ('inactive', 'failed')
+                                         or (active == 'active'
+                                             and props.get('SubState') == 'exited')):
+                    return 'empty'
+                return 'unknown'
+            if not group.startswith('/') or '..' in Path(group).parts:
                 return 'unknown'
             events = (self.cgroup_root / group.lstrip('/') / 'cgroup.events').read_text()
             populated = dict(line.split() for line in events.splitlines()).get('populated')
@@ -331,10 +356,16 @@ def check_operator_linger(user, call=subprocess.run):
     leaf (owner-reported host evidence on CSL-728/CSL-738, Nov 7), so the future
     cross-uid path requires the engine user to have no user manager during runs.
     """
-    result = call(['loginctl', 'show-user', user, '--property=Linger', '--value'],
-                  check=True, text=True, capture_output=True, timeout=15)
+    refusal = f'Linger=yes required for operator {user}; founder host setup needed'
+    try:
+        result = call(['loginctl', 'show-user', user, '--property=Linger', '--value'],
+                      check=True, text=True, capture_output=True, timeout=15)
+    except (OSError, subprocess.SubprocessError) as exc:
+        # logind unknown user, logind not running, loginctl missing or hung: fail closed
+        # with the named refusal, not a raw traceback.
+        raise RuntimeError(f'{refusal} (linger probe failed: {type(exc).__name__}: {exc})') from exc
     if result.stdout.strip() != 'yes':
-        raise RuntimeError(f'Linger=yes required for operator {user}; founder host setup needed')
+        raise RuntimeError(refusal)
 
 
 def refuse_engine_user(environ):

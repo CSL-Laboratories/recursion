@@ -23,23 +23,22 @@ class FakeManager:
         self.stops = []
         self.starts = []
         self.fail_stop = False
-        self.unload_on_stop = False
 
     def start(self, unit, argv):
         self.starts.append(unit)
         self.units[unit] = 'running'
 
     def stop(self, unit):
+        """Like systemctl stop: waits for inactive; the cgroup and transient unit go away."""
         self.stops.append(unit)
         if self.fail_stop:
             raise OSError('interrupted')
-        if self.unload_on_stop:
-            self.units.pop(unit, None)  # a stopped transient unit is garbage-collected
-        else:
-            self.units[unit] = 'empty'
+        if unit not in self.units:
+            raise subprocess.CalledProcessError(5, ['systemctl', 'stop'])  # not loaded
+        del self.units[unit]
 
     def observe(self, unit):
-        return self.units.get(unit, 'unknown')
+        return self.units.get(unit, 'gone')  # not-found, as systemd reports it
 
     def owned_units(self):
         return set(self.units)
@@ -199,11 +198,16 @@ class DaemonTests(unittest.TestCase):
         self.assertEqual(self.daemon.stop('one').state, 'stopping')
 
     def test_terminated_is_sticky_after_unit_unloads(self):
-        self.manager.unload_on_stop = False
         self.daemon.start('one', ['fake'])
         self.assertEqual(self.daemon.stop('one').state, 'terminated')
-        self.manager.units.clear()  # systemd garbage-collected the transient unit
+        self.assertNotIn('recursion-run-one.service', self.manager.units)  # collected
         self.assertEqual(self.daemon.sweep()[0].state, 'terminated')
+
+    def test_stop_of_already_collected_unit_is_unknown(self):
+        # A Stop replayed after the unit was collected cannot see it end: not terminated.
+        self.daemon.start('one', ['fake'])
+        self.manager.units.clear()
+        self.assertEqual(self.daemon.stop('one').state, 'unknown')
 
     def test_natural_exit_terminated_and_unit_released(self):
         self.daemon.start('one', ['fake'])
@@ -362,6 +366,12 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             check_operator_linger('operator', Mock(return_value=Mock(stdout='no')))
 
+    def test_operator_linger_probe_failure_is_named_refusal(self):
+        for exc in (subprocess.CalledProcessError(1, ['loginctl']), FileNotFoundError('loginctl'),
+                    subprocess.TimeoutExpired(['loginctl'], 15)):
+            with self.assertRaisesRegex(RuntimeError, 'Linger=yes required for operator op'):
+                check_operator_linger('op', Mock(side_effect=exc))
+
     def test_engine_user_refused_not_linger_checked(self):
         # Engine Linger=yes conflicts with leaf containment (B6/B9 conflict); Nov 11 is same-uid.
         refuse_engine_user({})
@@ -404,9 +414,9 @@ class SystemdManagerTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def show(self, group, active='active'):
-        self.manager._call = Mock(return_value=f'LoadState=loaded\nActiveState={active}\n'
-                                               f'ControlGroup={group}\n')
+    def show(self, group, active='active', sub='running', load='loaded'):
+        self.manager._call = Mock(return_value=f'LoadState={load}\nActiveState={active}\n'
+                                               f'SubState={sub}\nControlGroup={group}\n')
 
     def events(self, group, populated):
         path = self.root / group.lstrip('/')
@@ -429,6 +439,52 @@ class SystemdManagerTests(unittest.TestCase):
     def test_missing_control_group_unknown(self):
         self.manager._call = Mock(return_value='LoadState=not-found\nControlGroup=\n')
         self.assertEqual(self.manager.observe('missing'), 'unknown')
+        self.show('', active='active')  # running but no cgroup: not positively ended
+        self.assertEqual(self.manager.observe('a'), 'unknown')
+        self.show('', active='deactivating', sub='stop-sigterm')
+        self.assertEqual(self.manager.observe('a'), 'unknown')
+
+    def test_real_post_stop_show_output(self):
+        # systemctl --user show after systemctl --user stop of a transient unit: the
+        # cgroup is pruned (ControlGroup= blank) and the unit is collected (not-found).
+        self.show('', active='inactive', sub='dead', load='not-found')
+        self.assertEqual(self.manager.observe('a'), 'gone')
+        # Not yet collected (or failed): loaded, ended, cgroup pruned.
+        for active, sub in (('inactive', 'dead'), ('failed', 'failed')):
+            self.show('', active=active, sub=sub)
+            self.assertEqual(self.manager.observe('a'), 'empty')
+
+    def test_real_natural_exit_show_output(self):
+        # RemainAfterExit=yes: active (exited); systemd prunes the empty cgroup.
+        self.show('', active='active', sub='exited')
+        self.assertEqual(self.manager.observe('a'), 'empty')
+
+    def test_ended_unit_with_live_cgroup_is_not_empty(self):
+        # failed with processes left behind: the cgroup still exists and is populated.
+        self.events('/user.slice/a.service', 1)
+        self.show('/user.slice/a.service', active='failed', sub='failed')
+        self.assertEqual(self.manager.observe('a'), 'unknown')
+
+    def test_daemon_stop_reaches_terminated_on_real_show_output(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        registry = Registry(Path(temp.name) / 'state')
+        self.addCleanup(registry.close)
+        self.events('/user.slice/r.service', 1)
+        calls = []
+        def call(argv):
+            calls.append(argv[:3])
+            if argv[:3] == ['systemctl', '--user', 'show']:
+                if ['systemctl', '--user', 'stop'] in calls:
+                    return 'LoadState=not-found\nActiveState=inactive\nSubState=dead\nControlGroup=\n'
+                return ('LoadState=loaded\nActiveState=active\nSubState=running\n'
+                        'ControlGroup=/user.slice/r.service\n')
+            return ''
+        self.manager._call = call
+        daemon = Daemon(registry, self.manager, lambda: 'boot-a')
+        self.assertEqual(daemon.start('one', ['/fake']).state, 'running')
+        self.assertEqual(daemon.stop('one').state, 'terminated')
+        self.assertEqual(daemon.sweep()[0].state, 'terminated')
 
     def test_populated_zero_is_empty(self):
         self.events('/user.slice/a.service', 0)

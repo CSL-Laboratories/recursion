@@ -309,6 +309,54 @@ class SameRunAndStopTests(unittest.TestCase):
         self.assertEqual((cancel["status"], cancel["statusMessage"]), ("working", "pending"))
         self.assertEqual(kill.requests, [])
 
+    def test_create_task_reads_pending_when_a_stop_lands_during_the_launch(self) -> None:
+        # Red-team r2 finding 1: the CreateTaskResult itself carries S6 "pending" when a Stop lands while
+        # the starter runs and the core cannot confirm it; it never reads cancelled.
+        def check() -> bool:
+            stops: list[dict] = []
+            box: list[ControlAPI] = []
+
+            def stop_during_launch(params: dict) -> dict:
+                stops.append(box[0].call("run.stop", {"run_id": params["run_id"]}))
+                return {"cgroup": f"/cg/{params['run_id']}"}
+
+            api, registry, kill, _ = make_api(FakeKillTree(answers=(POPULATED,)), starter=stop_during_launch)
+            box.append(api)
+            server = DualEraServer(api)
+            reply = server.handle({
+                "jsonrpc": "2.0", "id": "ms", "method": "tools/call",
+                "params": modern_params(
+                    tasks=True,
+                    name="recursion_run_start",
+                    arguments={"tenant": "t1", "engine": "codex", "prompt": "p"},
+                ),
+            })["result"]
+            run_id = reply.get("taskId")
+            return (
+                [s["code"] for s in stops] == ["pending"]
+                and reply["resultType"] == "task"
+                and reply["status"] == "working"
+                and reply.get("statusMessage") == "pending"
+                and registry.get(run_id)["state"] == "stop_pending"
+                and kill.requests == [f"/cg/{run_id}"]
+                and server.notifications == []
+            )
+
+        self._repeat(check)
+
+    def test_create_task_without_a_stop_has_no_status_message(self) -> None:
+        server, *_ = _server()
+        reply = server.handle({
+            "jsonrpc": "2.0", "id": "ms", "method": "tools/call",
+            "params": modern_params(
+                tasks=True,
+                name="recursion_run_start",
+                arguments={"tenant": "t1", "engine": "codex", "prompt": "p"},
+            ),
+        })["result"]
+        self.assertEqual((reply["resultType"], reply["status"]), ("task", "working"))
+        self.assertNotIn("statusMessage", reply)
+
     def test_modern_start_without_tasks_extension_is_a_plain_tool_result(self) -> None:
         server, *_ = _server()
         reply = server.handle({

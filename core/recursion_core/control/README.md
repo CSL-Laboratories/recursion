@@ -78,8 +78,9 @@ recorded on F60, CSL-762).
   to the Stop path for it. Task ``createdAt`` comes from the run's
   ``started_at``; the default clock is wall time. Live binary wire-capture is
   unmeasured (no Claude Code is spawned). A Stop the core has not confirmed
-  reads ``working`` with ``statusMessage: "pending"`` through ``tasks/cancel``
-  and ``tasks/get``, never ``cancelled`` (S6); a ``starting`` launch reads
+  reads ``working`` with ``statusMessage: "pending"`` through ``tasks/cancel``,
+  ``tasks/get`` and the ``CreateTaskResult`` of a start whose launch a Stop
+  landed during, never ``cancelled`` (S6); a ``starting`` launch reads
   ``working``, not ``failed``.
 
   Deferred (PRODUCT.md O60 / A45): the ``2026-07-28`` side is not yet tested

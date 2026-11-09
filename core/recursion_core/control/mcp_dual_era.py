@@ -277,9 +277,14 @@ class DualEraServer:
         run_id = _printable_id(run.get("run_id"))
         if run_id is None:
             return self._plain_modern_tool(result)
+        # Re-read the record: a Stop that landed during the launch (#327 stop intent) leaves the run
+        # stop_pending, and S6 says the first Tasks reply reads "pending" too (red-team r2 finding 1).
+        status_answer = self.api.call("run.status", {"run_id": run_id})
+        if status_answer.get("code") == "ok" and isinstance(status_answer.get("run"), Mapping):
+            run = status_answer["run"]
         started = run.get("started_at")
         now = _iso(started if isinstance(started, (int, float)) else self._clock())
-        return {
+        body = {
             "resultType": "task",
             "taskId": run_id,
             "status": _run_status(run.get("state", "running")),
@@ -287,6 +292,9 @@ class DualEraServer:
             "lastUpdatedAt": now,
             "ttlMs": None,
         }
+        if _stop_pending(run):
+            body["statusMessage"] = "pending"
+        return body
 
     def _tasks(self, req_id, params: Mapping, handler) -> dict:
         if not self._authorized(params):

@@ -22,6 +22,11 @@ import threading
 from collections.abc import Callable
 from typing import Any, Protocol
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no fcntl; it is the F40 stub path
+    fcntl = None  # type: ignore[assignment]
+
 from .errors import FrameError, InsecureSocketPath, PeerRefused, RemoteBindRefused
 from .framing import MAX_FRAME_BYTES, read_frame, write_frame
 from .peercred import PeerCred, get_peer_cred
@@ -85,6 +90,8 @@ def refuse_remote_bind(address: object) -> str:
         raise RemoteBindRefused(f"remote_bind_refused: {address!r}")
     if not address or address.startswith("\0"):
         raise InsecureSocketPath("abstract or empty socket names are refused; use a 0700 directory")
+    if "\0" in address:
+        raise InsecureSocketPath("socket path contains a NUL byte")
     if not os.path.isabs(address):
         raise InsecureSocketPath("socket path must be absolute")
     if len(os.fsencode(address)) > _MAX_SUN_PATH:
@@ -121,6 +128,35 @@ def ensure_private_dir(directory: str) -> None:
         raise InsecureSocketPath(f"{directory} has mode {stat.S_IMODE(st.st_mode):04o}, want 0700")
 
 
+def _acquire_lock(path: str) -> int:
+    """Take an exclusive ``flock`` on ``path`` (a regular file of ours) and return its fd.
+
+    Held for the server's lifetime, it serialises the stale-socket probe, unlink and bind:
+    without it two servers starting on one stale socket can both bind, and the loser keeps
+    listening on an unlinked inode nobody can reach. The lock file is never unlinked, so a
+    later server always locks the same inode.
+    """
+    if fcntl is None:  # pragma: no cover - POSIX only
+        raise InsecureSocketPath("no flock on this platform")
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise InsecureSocketPath(f"{path} cannot be opened as our lock file: {exc}") from exc
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
+            raise InsecureSocketPath(f"{path} exists and is not our lock file")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise InsecureSocketPath(f"{path} is held: another server is starting or live") from exc
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 def _clear_stale_socket(path: str) -> None:
     try:
         st = os.lstat(path)
@@ -146,8 +182,10 @@ def check_peer(sock: socket.socket, getter: PeerCredGetter, expected_uid: int) -
     """Fail closed: unreadable credentials and a foreign uid both raise ``PeerRefused``."""
     try:
         cred = getter(sock)
-    except OSError as exc:
+    except Exception as exc:  # any getter failure is a refusal, never a dead accept loop
         raise PeerRefused(f"peer credentials unreadable: {exc}") from exc
+    if not isinstance(cred, PeerCred) or type(cred.uid) is not int:
+        raise PeerRefused("peer credentials malformed")
     if cred.uid != expected_uid:
         raise PeerRefused(f"peer uid {cred.uid} is not {expected_uid}")
     return cred
@@ -187,6 +225,8 @@ class UnixControlServer:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._sock: socket.socket | None = None
+        self._lock_fd: int | None = None
+        self._bound: tuple[int, int] | None = None
         self._thread: threading.Thread | None = None
         self._workers: set[threading.Thread] = set()
         self._conns: set[socket.socket] = set()
@@ -201,24 +241,36 @@ class UnixControlServer:
         with self._lock:
             if self._sock is not None:
                 raise RuntimeError("server already started")
+            if self._stop.is_set():
+                raise RuntimeError("server already closed")
             ensure_private_dir(self.directory)
-            _clear_stale_socket(self._path)
+            lock_fd = _acquire_lock(self._path + ".lock")
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            bound = False
             try:
+                _clear_stale_socket(self._path)
                 # The 0700 directory already keeps other uids out of the bind-to-chmod window;
                 # chmod rather than umask because umask is process-wide and racy across threads.
                 sock.bind(self._path)
+                bound = True
                 os.chmod(self._path, 0o600)
+                st = os.lstat(self._path)
+                if not stat.S_ISSOCK(st.st_mode) or st.st_uid != self._uid:
+                    raise InsecureSocketPath(f"{self._path} changed under us after bind")
                 sock.listen(socket.SOMAXCONN)
                 sock.settimeout(_ACCEPT_POLL_S)
             except BaseException:
                 sock.close()
-                try:
-                    os.unlink(self._path)
-                except FileNotFoundError:
-                    pass
+                if bound:
+                    try:
+                        os.unlink(self._path)
+                    except FileNotFoundError:
+                        pass
+                os.close(lock_fd)
                 raise
             self._sock = sock
+            self._lock_fd = lock_fd
+            self._bound = (st.st_dev, st.st_ino)
             self._thread = threading.Thread(target=self._accept_loop, name="control-transport-accept", daemon=True)
             self._thread.start()
 
@@ -239,12 +291,23 @@ class UnixControlServer:
             worker.join(timeout=self._idle_timeout_s + 1.0)
         with self._lock:
             sock, self._sock = self._sock, None
+            lock_fd, self._lock_fd = self._lock_fd, None
+            bound, self._bound = self._bound, None
         if sock is not None:
             sock.close()
+            # Unlink only the inode we bound: if an operator removed our socket and a
+            # successor bound the path, closing us must not take its socket away.
             try:
-                os.unlink(self._path)
+                st = os.lstat(self._path)
             except FileNotFoundError:
-                pass
+                st = None
+            if st is not None and bound == (st.st_dev, st.st_ino):
+                try:
+                    os.unlink(self._path)
+                except FileNotFoundError:
+                    pass
+        if lock_fd is not None:
+            os.close(lock_fd)
 
     def __enter__(self) -> UnixControlServer:
         self.start()
@@ -284,7 +347,15 @@ class UnixControlServer:
                 self.accepted += 1
                 self._workers.add(worker)
                 self._conns.add(conn)
-            worker.start()
+            try:
+                worker.start()
+            except RuntimeError:  # thread limit: drop this connection, keep accepting
+                self._refuse("worker_start_failed")
+                with self._lock:
+                    self._workers.discard(worker)
+                    self._conns.discard(conn)
+                conn.close()
+                self._slots.release()
 
     def _serve(self, conn: socket.socket) -> None:
         try:

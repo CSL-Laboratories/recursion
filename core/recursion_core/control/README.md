@@ -47,13 +47,19 @@ recorded on F60, CSL-762).
   queues another run's Stop (11.3, D2-55 / B-19), and a launch never overwrites a Stop that landed
   during it.
 - Starts are serialised only per `(tenant, client_key)`, so a slow or hung starter delays only a retry
-  of that same start; a start without a key, or with another tenant or key, never waits on it.
+  of that same start; a start without a key, or with another tenant or key, never waits on it. That
+  lock is dropped once the in-flight starts for the key have returned, so distinct keys do not keep
+  locks for the life of the process.
+- A prompt that is not strict UTF-8 (an unpaired surrogate) is `request_invalid` / `prompt` on
+  `run.start`, keyed or not, and nothing is launched. The prompt digest is SHA-256 of the UTF-8 bytes.
 - **Unscoped (open decision).** `ControlAPI.call` takes no caller identity. `run.list` and `run.status`
   return every tenant's records, and `run.stop` stops any run by id, whoever asks. Tenant is only a
   namespace for `client_key`, not an access boundary. Caller scopes (11.8 / D3) are not built here.
 - Reads (`run.status`, `run.list`) return copies, change no state and never call the cleanup layer.
 - `registry.py`: the `RunRegistry` (`get`, `list`, `put`, `find_start`) and `KillTree` interfaces, plus an
-  in-memory registry for tests.
+  in-memory registry for tests. `find_start` is an indexed lookup. If more than one record carries the
+  same `(tenant, client_key)`, the first one stored is the one returned; changing that record's key
+  leaves the next one indexed.
   The durable registry (B8, B9) and the real cgroup/pidfd cleanup (B6) are other build items.
 - `cli.py`: `recursion-control list | status RUN | stop RUN | start --tenant --engine --prompt`. It
   makes one API call, prints the API's answer verbatim as JSON and exits 0 (ok, started, stopped),

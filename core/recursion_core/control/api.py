@@ -41,16 +41,19 @@ false: it raised, or it is a stop intent from before the launch was recorded), i
 Reads never change state and never call the cleanup layer.
 
 ``client_key`` dedupes a retried start per tenant and is bound to that start's engine and prompt (the
-prompt is kept only as a SHA-256 digest). Another tenant may use the same key; the same tenant reusing a
-key for a different request gets ``request_invalid`` / ``client_key_reused`` and nothing is launched. The
-key and digest live in the run record (``start_key``) and are looked up through the registry, so a
-``ControlAPI`` rebuilt over the same durable registry after a restart still answers the retried start
-with the original run (11.3, B-17).
+prompt is kept only as a SHA-256 digest of its UTF-8 bytes). A prompt that is not strict UTF-8 (an
+unpaired surrogate, which JSON can carry) is ``request_invalid`` / ``prompt`` and nothing is launched,
+with or without a key (bot review 4508015577). Another tenant may use the same key; the same tenant
+reusing a key for a different request gets ``request_invalid`` / ``client_key_reused`` and nothing is
+launched. The key and digest live in the run record (``start_key``) and are looked up through the
+registry, so a ``ControlAPI`` rebuilt over the same durable registry after a restart still answers the
+retried start with the original run (11.3, B-17).
 
 Stop decisions and launch records are serialised per run, so a slow or hung cleanup on one run never
 queues another run's Stop (11.3, D2-55 / B-19), and a launch never overwrites a Stop that landed during it.
 Starts are serialised only per ``(tenant, client_key)``: a slow or hung starter delays only a retry of the
-same start, never another start.
+same start, never another start. The lock is dropped once that start, and any same-key start waiting on
+it, have returned, so distinct keys do not keep locks for the life of the process (bot review 4517611266).
 """
 
 from __future__ import annotations
@@ -95,7 +98,8 @@ class ControlAPI:
         # during a launch is never overwritten by it.
         self._run_locks: dict[str, threading.Lock] = {}
         # A retried start with the same (tenant, client_key) launches once; other starts never wait on it.
-        self._start_locks: dict[tuple[str, str], threading.Lock] = {}
+        # Value is [lock, in_flight]. The entry is removed when the count hits zero (bot review 4517611266).
+        self._start_locks: dict[tuple[str, str], list] = {}
         # In-memory only (a restart loses them; reconciling then is the CSL-738 startup sweep):
         self._launched: dict[str, dict] = {}  # run_id -> record (with cgroup) of a launch whose write failed
         self._stop_wanted: set[str] = set()  # Stops that arrived before the launch was recorded
@@ -141,20 +145,36 @@ class ControlAPI:
         for name in ("tenant", "engine", "prompt"):
             if not isinstance(params.get(name), str) or not params[name]:
                 return {"code": REQUEST_INVALID, "detail": name}
+        try:
+            params["prompt"].encode("utf-8")  # JSON can carry an unpaired surrogate; reject it before launch
+        except UnicodeEncodeError:
+            return {"code": REQUEST_INVALID, "detail": "prompt"}
         key = params.get("client_key")
         if not isinstance(key, str):
             return self._start(params)  # no key: a fresh run id, nothing to dedupe
+        slot_key = (params["tenant"], key)
         with self._locks_lock:
-            lock = self._start_locks.setdefault((params["tenant"], key), threading.Lock())
-        with lock:
-            return self._start(params)
+            slot = self._start_locks.get(slot_key)
+            if slot is None:
+                slot = [threading.Lock(), 0]
+                self._start_locks[slot_key] = slot
+            slot[1] += 1
+            lock = slot[0]
+        try:
+            with lock:
+                return self._start(params)
+        finally:
+            with self._locks_lock:
+                slot[1] -= 1
+                if slot[1] == 0 and self._start_locks.get(slot_key) is slot:
+                    del self._start_locks[slot_key]
 
     def _start(self, params: Mapping) -> dict:
         key = params.get("client_key")
         start_key = None
         if isinstance(key, str):
             start_key = {"client_key": key, "engine": params["engine"],
-                         "prompt_sha256": hashlib.sha256(params["prompt"].encode()).hexdigest()}
+                         "prompt_sha256": hashlib.sha256(params["prompt"].encode("utf-8")).hexdigest()}
         prior = self._reg("find_start", params["tenant"], key) if start_key is not None else None
         if prior is not None and prior.get("start_key") != start_key:
             return {"code": REQUEST_INVALID, "detail": "client_key_reused"}

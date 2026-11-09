@@ -6,7 +6,7 @@ caller fields as opaque labelled text. Consumers filter their own domain reads.
 
 from .errors import Refused
 from .prompt import ApprovalRequest, render_prompt, sanitize
-from .scope import ApprovalAuthority, ApprovalScope, Credential
+from .scope import ApprovalAuthority, ApprovalScope, Credential, CredentialRegistry
 
-__all__ = ["ApprovalAuthority", "ApprovalRequest", "ApprovalScope", "Credential", "Refused",
-           "render_prompt", "sanitize"]
+__all__ = ["ApprovalAuthority", "ApprovalRequest", "ApprovalScope", "Credential",
+           "CredentialRegistry", "Refused", "render_prompt", "sanitize"]

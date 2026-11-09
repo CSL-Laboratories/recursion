@@ -8,6 +8,15 @@ Only the ``operator_ui`` and ``paired_device`` principal kinds can approve. An
 ``agent`` or ``plugin`` credential is refused by ``approve`` even if its scope set
 names ``approve``.
 
+Credentials come from a ``CredentialRegistry`` (the control API's authenticator). The
+authority accepts only the exact credential objects its registry issued and has not
+revoked, so a hand-built ``Credential`` naming ``operator_ui`` and ``approve`` is refused
+(``credential_unknown``). In-process code that holds the registry itself can still mint;
+whether the in-process path is a boundary or only tamper evidence is open under O69.
+
+``ApprovalAuthority.open`` takes the opener's credential; the prompt's ``requester`` line
+is that credential's principal, never caller text.
+
 ``ApprovalAuthority.grant`` issues an ``ApprovalScope``:
 
 * bound to the one credential it was granted to (``holder``); it is not delegable,
@@ -32,10 +41,10 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from .errors import Refused
-from .prompt import ApprovalRequest, render_prompt
+from .prompt import _PRINCIPAL, ApprovalRequest, render_prompt
 
 __all__ = ["APPROVER_KINDS", "KINDS", "MAX_BINDINGS", "SCOPE_SCHEMA", "SCOPES",
-           "ApprovalAuthority", "ApprovalScope", "Credential"]
+           "ApprovalAuthority", "ApprovalScope", "Credential", "CredentialRegistry"]
 
 SCOPE_SCHEMA = "csl-approval-scope/v0"
 KINDS = frozenset({"operator_ui", "paired_device", "agent", "plugin"})
@@ -60,7 +69,7 @@ class Credential:
     def __post_init__(self) -> None:
         if type(self.token_id) is not str or not _ID.fullmatch(self.token_id):
             raise Refused("credential_token_id")
-        if type(self.principal) is not str or not self.principal:
+        if type(self.principal) is not str or not _PRINCIPAL.fullmatch(self.principal):
             raise Refused("credential_principal")
         if self.kind not in KINDS:
             raise Refused("credential_kind")
@@ -70,9 +79,43 @@ class Credential:
             raise Refused("pairing_grants_no_manage")
 
 
-def _check_approver(credential: object) -> Credential:
-    if type(credential) is not Credential:
-        raise Refused("credential_type")
+class CredentialRegistry:
+    """Mints credentials and resolves only the ones it minted and has not revoked."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._issued: dict[str, Credential] = {}
+
+    def issue(self, principal: str, kind: str, scopes: object) -> Credential:
+        if type(scopes) not in (set, frozenset):
+            raise Refused("credential_scopes")
+        with self._lock:
+            token_id = secrets.token_hex(16)
+            while token_id in self._issued:
+                token_id = secrets.token_hex(16)
+            credential = Credential(token_id=token_id, principal=principal, kind=kind,
+                                    scopes=frozenset(scopes))
+            self._issued[token_id] = credential
+        return credential
+
+    def revoke(self, token_id: str) -> None:
+        with self._lock:
+            self._issued.pop(token_id, None)
+
+    def resolve(self, credential: object) -> Credential:
+        """Return ``credential`` if this registry issued that very object; else refuse."""
+        if type(credential) is not Credential:
+            raise Refused("credential_type")
+        with self._lock:
+            # Identity, not equality: equal fields copied from a wire scope's holder do
+            # not make a credential this registry issued.
+            if self._issued.get(credential.token_id) is not credential:
+                raise Refused("credential_unknown")
+        return credential
+
+
+def _check_approver(registry: CredentialRegistry, credential: object) -> Credential:
+    credential = registry.resolve(credential)
     if credential.kind not in APPROVER_KINDS:
         raise Refused("principal_not_approver", credential.kind)
     if "approve" not in credential.scopes:
@@ -132,6 +175,7 @@ class ApprovalScope:
 @dataclass
 class _Request:
     request: ApprovalRequest
+    requester: str
     state: str = "pending"  # pending -> approved | denied
 
 
@@ -144,8 +188,11 @@ class _Grant:
 class ApprovalAuthority:
     """Core-owned registry of open requests and the scopes granted to answer them."""
 
-    def __init__(self, clock: Callable[[], int]) -> None:
+    def __init__(self, clock: Callable[[], int], registry: CredentialRegistry) -> None:
+        if type(registry) is not CredentialRegistry:
+            raise Refused("registry_type")
         self._clock = clock
+        self._registry = registry
         self._lock = threading.Lock()
         self._requests: dict[str, _Request] = {}
         self._grants: dict[str, _Grant] = {}
@@ -156,8 +203,12 @@ class ApprovalAuthority:
             raise Refused("clock")
         return now
 
-    def open(self, request: ApprovalRequest) -> str:
-        """Register ``request`` and return the prompt text the core draws for it."""
+    def open(self, credential: object, request: ApprovalRequest) -> str:
+        """Register ``request`` for ``credential`` and return the prompt the core draws.
+
+        The prompt's requester is ``credential.principal``; any kind may open a request.
+        """
+        opener = self._registry.resolve(credential)
         if type(request) is not ApprovalRequest:
             raise Refused("request_type")
         with self._lock:
@@ -165,12 +216,14 @@ class ApprovalAuthority:
                 raise Refused("request_expired")
             if request.request_id in self._requests:
                 raise Refused("request_duplicate")
-            self._requests[request.request_id] = _Request(request)
-        return render_prompt(request)
+            # Render before registering: a request whose prompt cannot be drawn is not open.
+            text = render_prompt(request, opener.principal)
+            self._requests[request.request_id] = _Request(request, opener.principal)
+        return text
 
     def grant(self, credential: object, request_ids: object, ttl_seconds: int) -> ApprovalScope:
         """Issue a non-delegable scope to ``credential`` for the named open requests."""
-        holder = _check_approver(credential)
+        holder = _check_approver(self._registry, credential)
         if type(ttl_seconds) is not int or ttl_seconds <= 0:
             raise Refused("scope_ttl")
         if type(request_ids) not in (list, tuple) or not request_ids:
@@ -211,7 +264,7 @@ class ApprovalAuthority:
 
     def _decide(self, credential: object, scope_id: object, request_id: object,
                 digest: object, outcome: str) -> dict:
-        holder = _check_approver(credential)
+        holder = _check_approver(self._registry, credential)
         if type(digest) is not str or not _HEX64.fullmatch(digest):
             raise Refused("digest_form")
         with self._lock:
@@ -239,5 +292,5 @@ class ApprovalAuthority:
             grant.used.add(request_id)
             entry.state = outcome
             return {"request_id": request_id, "digest": bound, "outcome": outcome,
-                    "principal": holder.principal, "scope_id": scope.scope_id,
+                    "principal": holder.principal, "requester": entry.requester, "scope_id": scope.scope_id,
                     "decided_at": now}

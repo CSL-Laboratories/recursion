@@ -137,8 +137,9 @@ NO_PROXY_NAMES = ("NO_PROXY", "no_proxy")
 # N5i: the names the engines run by bare name. A link for a name outside this list is
 # not checked (envpath record, cell path_tool_link_py); PATH_TOOLS=None checks every entry.
 PATH_TOOLS: tuple[str, ...] | None = ("bash", "zsh", "sh", "git", "rg", "node", "sleep")
-# A name an override may never set, whatever the profile (the Nov 5 tree's _DENIED).
-_DENIED = re.compile(r"(API_?KEY|SECRET|TOKEN|PASSWORD|PASSPHRASE|BASE_URL|_PAT$|USE_BEDROCK|USE_VERTEX|USE_FOUNDRY)", re.IGNORECASE)
+# A name an override may never set, whatever the profile (the Nov 5 tree's _DENIED, plus PASSPHRASE and
+# CLIENT_KEY for the mTLS private key and its passphrase: the operator's own are carried, never replaced).
+_DENIED = re.compile(r"(API_?KEY|SECRET|TOKEN|PASSWORD|PASSPHRASE|CLIENT_KEY|BASE_URL|_PAT$|USE_BEDROCK|USE_VERTEX|USE_FOUNDRY)", re.IGNORECASE)
 # Paths that name a different file in the child than in this process (its own cwd, fds, root).
 _PERSPECTIVE = re.compile(r"^/(?:proc|dev/fd|dev/std(?:in|out|err))(?:/|$)")
 _PROXY_URL = re.compile(
@@ -174,6 +175,7 @@ _CLAUDE_SCRUB = (
     "ANTHROPIC_ORGANIZATION_ID",
     "ANTHROPIC_BASE_URL",
     "CLAUDE_CONFIG_DIR",
+    "CLAUDE_CODE_SIMPLE",  # PRODUCT.md 055cc7a5 section 3.3 names it in the Claude scrub list
 )
 _CODEX_SCRUB = ("CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_HOME")
 
@@ -478,8 +480,15 @@ def _private_dir(path: str | None) -> bool:
     real, missing, cause = _resolve(path)
     if cause is not None or missing or real is None:
         return False
+    # lstat follows a final link when the path ends in a separator or "/." (Devin r4508023438), so the no-link
+    # rule is asked of the path cut back to its last named entry. A home ending in ".." names no entry: refused.
+    parts = path.split(os.sep)
+    while parts and parts[-1] in ("", "."):
+        parts.pop()
+    if parts and parts[-1] == "..":
+        return False
     try:
-        if not stat.S_ISDIR(os.lstat(path).st_mode):  # the home itself may not be a link
+        if not stat.S_ISDIR(os.lstat(os.sep.join(parts) or os.sep).st_mode):  # the home itself may not be a link
             return False
         st = os.lstat(real)
     except OSError:

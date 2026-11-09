@@ -15,8 +15,11 @@ running core, and not reviewed or accepted.
   `CLAUDE_CODE_CERT_STORE` (PRODUCT.md 055cc7a5 section 3.8, C1-46). `ALL_PROXY` meets the proxy
   rule with SOCKS schemes allowed and counts as a set proxy for the `NO_PROXY` rule; the client
   cert and key meet the file rule; `XDG_RUNTIME_DIR` meets the directory rule;
-  `CLAUDE_CODE_CERT_STORE` must be a comma list of `bundled` / `system`. The passphrase is
-  carried from the parent but, like every secret-shaped name, cannot be set by an override.
+  `CLAUDE_CODE_CERT_STORE` must be a comma list of `bundled` / `system`. The client key and its
+  passphrase are carried from the parent but, like every secret-shaped name, cannot be set by an
+  override (`override_denied`).
+- `CLAUDE_CODE_SIMPLE` is on the Claude scrub list by name (PRODUCT.md 055cc7a5 section 3.3), so
+  it never reaches a Claude Code child and an override naming it is refused.
 - The user's own `CLAUDE_CODE_OAUTH_TOKEN` reaches a Claude Code child unchanged when the
   parent has it, and is absent when the parent does not (PRODUCT.md 055cc7a5 section 3.3,
   Nov 8 fleet correction: nothing removes a built-in sign-in method from every run). The
@@ -33,6 +36,8 @@ running core, and not reviewed or accepted.
   `/tmp`; with no safe base the build refuses with `TMPDIR` / `tmp_root_unsafe`.
 - `HOME` must be our own 0700 directory and not itself a link; its parents are checked
   on the resolved path, so an accepted link above it (macOS `/var`) does not refuse it.
+  The no-link rule reads the last named entry, so a linked home is refused with a trailing
+  separator or `/.` too, and a home path ending in `..` is refused.
 - The old route transport (`scripts/v3/route_contract/transport.py`) is frozen and
   unchanged; it still passes `os.environ.copy()`.
 
@@ -57,7 +62,8 @@ PYTHONPATH=core python3 -B -m recursion_core.child_env.tests.cells 5
 ```
 
 The second command prints one JSON row per cell (n trials each) and a per-group summary.
-`tools/ci_gate.py` does not discover `core/` tests; they run only when started by hand.
+Since CSL-795 (#334) `tools/ci_gate.py` discovers `core/**/test_*.py`, so the first command's
+tests also run in the gate; the cells command runs only when started by hand.
 
 ## Evidence
 

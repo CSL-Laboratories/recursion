@@ -48,6 +48,15 @@ _CSS_HASH = base64.b64encode(hashlib.sha256(_CSS.encode()).digest()).decode()
 _CSP = ("default-src 'none'; style-src 'sha256-%s'; form-action 'self'; frame-ancestors 'none'; "
         "base-uri 'none'" % _CSS_HASH)
 _MAX_BODY = 4096
+# O7 operator-response.schema.json: the visibility object is closed to these four keys and values
+# (Cockpit #318, docs/replacement/outcomes/O7). The GUI renders only these fixed strings.
+_VISIBILITY = (
+    ("uncertainty", ("visible", "absent_not_hidden")),
+    ("refusal", ("visible", "absent_not_hidden")),
+    ("stale_data", ("visible", "absent_not_hidden")),
+    ("reconciliation", ("reconciled", "unreconciled_visible")),
+)
+_VISIBILITY_KEYS = frozenset(k for k, _ in _VISIBILITY)
 # Codes the client raises before anything is sent; every other failure is after sending.
 _REFUSED_BEFORE_SENDING = frozenset({"command_not_in_operator_contract", "confirmation_required"})
 _LABELS = {
@@ -244,17 +253,27 @@ class Application:
     def _visibility(data: dict) -> str:
         """O7's refusal, uncertainty, stale and reconciliation states, from the unfiltered response.
 
-        Rendered as text on every O7 view, so a venue panel's filter never hides them. Only
-        text values are shown; anything else is reported as not text, never passed through.
+        Rendered on every O7 view, so a venue panel's filter never hides them. Only the four
+        keys of O7's closed visibility object are read, and only their schema values are shown,
+        as fixed text from _VISIBILITY. The response's own text is never passed through: any
+        other value reads as not an O7 value, and any other key is counted, not named.
         """
         vis = data.get("visibility")
         if type(vis) is not dict:
             return '<p role="status">Visibility: not reported by the control API.</p>'
-        items = "".join("<li>%s: <strong>%s</strong></li>" % (
-            escape(str(k)), escape(v) if type(v) is str else "reported, not as text")
-            for k, v in sorted(vis.items(), key=lambda kv: str(kv[0])))
+        items = []
+        for key, allowed in _VISIBILITY:
+            if key not in vis:
+                shown = "not reported"
+            else:
+                value = vis[key]
+                shown = value if type(value) is str and value in allowed else "reported, not an O7 value"
+            items.append("<li>%s: <strong>%s</strong></li>" % (key, shown))
+        extra = sum(1 for k in vis if k not in _VISIBILITY_KEYS)
+        if extra:
+            items.append("<li>Other fields: <strong>%d withheld, not in O7 visibility</strong></li>" % extra)
         return ('<section aria-label="Visibility"><p role="status">Visibility reported by the '
-                "control API:</p><ul>%s</ul></section>" % items)
+                "control API:</p><ul>%s</ul></section>" % "".join(items))
 
     def _read(self, env: dict) -> tuple[str, str]:
         form = self._query(env)

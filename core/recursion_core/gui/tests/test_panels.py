@@ -1,5 +1,6 @@
 """Read-only mount and additive plugin inventory regressions."""
 import importlib
+import re
 import unittest
 from collections.abc import Mapping
 
@@ -187,13 +188,47 @@ class PanelTests(GuiHarness):
         for shown in ("stale_data: <strong>visible</strong>", "refusal: <strong>visible</strong>",
                       "uncertainty: <strong>visible</strong>",
                       "reconciliation: <strong>unreconciled_visible</strong>",
-                      "detail: <strong>reported, not as text</strong>", "KXDEMO-1"):
+                      "Other fields: <strong>1 withheld, not in O7 visibility</strong>", "KXDEMO-1"):
             self.assertIn(shown, body)
-        for hidden in ("AAPL", "VIS-LEAK-1"):
+        for hidden in ("AAPL", "VIS-LEAK-1", "detail"):
             self.assertNotIn(hidden, body)
         self.api.extra["operator.positions.inspect"] = {"visibility": None}
         self.assertIn("Visibility: not reported by the control API.",
                       self.request("GET", "/panel", query="id=k")[2])
+
+    def test_o7_visibility_on_a_venue_panel_shows_only_the_four_keys_with_fixed_values(self):
+        # X1a (t1430u): the visibility block is outside the venue filter, so it must not carry the
+        # response's own text. Unknown keys and off-schema values never reach the page.
+        self.mount([{"id": "k", "title": "Kalshi", "reads": ["operator.positions.inspect"],
+                     "venue": "kalshi_demo"}])
+        self.api.extra["operator.positions.inspect"] = {"visibility": {
+            "uncertainty": "STOCK-AAPL-LEAK-171717", "refusal": "visible",
+            "stale_data": ["visible"], "AAPL-KEY-LEAK-181818": "visible",
+            "NOTE-KEY-LEAK-202020": "stock AAPL qty 191919", "reconciliation": "visible"}}
+        body = self.request("GET", "/panel", query="id=k")[2]
+        start = body.index('<section aria-label="Visibility">')
+        block = body[start:body.index("</section>", start)]
+        self.assertEqual(
+            ["uncertainty: <strong>reported, not an O7 value</strong>",
+             "refusal: <strong>visible</strong>",
+             "stale_data: <strong>reported, not an O7 value</strong>",
+             "reconciliation: <strong>reported, not an O7 value</strong>",
+             "Other fields: <strong>2 withheld, not in O7 visibility</strong>"],
+            re.findall(r"<li>(.*?)</li>", block))
+        for hidden in ("STOCK-AAPL-LEAK-171717", "AAPL-KEY-LEAK-181818", "191919", "NOTE-KEY-LEAK-202020"):
+            self.assertNotIn(hidden, body)
+        self.api.extra["operator.positions.inspect"] = {"visibility": {"refusal": "absent_not_hidden"}}
+        block = self.request("GET", "/panel", query="id=k")[2]
+        for shown in ("uncertainty: <strong>not reported</strong>", "refusal: <strong>absent_not_hidden</strong>",
+                      "stale_data: <strong>not reported</strong>", "reconciliation: <strong>not reported</strong>"):
+            self.assertIn(shown, block)
+        self.assertNotIn("Other fields", block)
+        allowed = {"uncertainty": "absent_not_hidden", "refusal": "visible", "stale_data": "absent_not_hidden",
+                   "reconciliation": "reconciled"}
+        self.api.extra["operator.positions.inspect"] = {"visibility": dict(allowed)}
+        block = self.request("GET", "/panel", query="id=k")[2]
+        for key, value in allowed.items():
+            self.assertIn("%s: <strong>%s</strong>" % (key, value), block)
 
     def test_o7_shaped_venue_rows_are_not_switch_gated_by_the_gui(self):
         # O7 v0 labels rows with `venue` and reports no switch state; the GUI only redacts

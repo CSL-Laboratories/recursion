@@ -1,6 +1,6 @@
 """Redesigned plugin manifest (``csl-plugin-manifest/vNext``), trust store and grants.
 
-PRODUCT.md 4.1 and 4.3 (receipted at 398cd812), as implemented here:
+PRODUCT.md 4.1 and 4.3 (at 055cc7a5, CSLR-D-011), as implemented here:
 
 * The developer signs the canonical manifest bytes with their own Ed25519 key. The
   manifest carries the artifact's SHA-256, so the signature covers the code.

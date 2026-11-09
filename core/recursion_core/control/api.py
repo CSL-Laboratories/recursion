@@ -172,9 +172,16 @@ class ControlAPI:
             handle = self._starter({**params, "run_id": run_id})
         except Exception as err:  # the launch path refused or failed; the API answers with a code
             with self._run_lock(run_id):
-                current = self._current(rec)
-                current["state"] = "start_failed"
-                recorded = self._try_put(current)
+                # Re-read first: a Stop may have written its intent while the starter ran. If the read fails,
+                # write nothing rather than overwrite that intent with the launch-intent copy (t1430u X1c).
+                try:
+                    current = self._reg("get", run_id)
+                except _RegistryError:
+                    current = None
+                recorded = False
+                if current is not None:
+                    current["state"] = "start_failed"
+                    recorded = self._try_put(current)
                 if not recorded:  # the record still says starting; a same-key retry must still relaunch
                     self._failed.add(run_id)
             return {"code": START_FAILED, "run_id": run_id, "detail": type(err).__name__, "recorded": recorded}
@@ -209,18 +216,20 @@ class ControlAPI:
             return None  # the starter refused: relaunch under the same run id
         if state != "starting" or prior.get("cgroup"):
             return {"code": STARTED, "run": prior, "duplicate": True}
-        cgroup = self._launched_cgroup(run_id)
-        if cgroup is None:  # starter handle had no cgroup, or a restart lost it: nothing confirms the launch
+        launched = self._launched.get(run_id)
+        if launched is None:  # starter handle had no cgroup, or a restart lost it: nothing confirms the launch
             return {"code": START_UNCONFIRMED, "run": prior, "duplicate": True, "detail": "launch_unconfirmed"}
-        prior.update(state="running", cgroup=cgroup)  # launched here, but the write after launch failed
+        # Launched here, but the write after launch failed. The kept record carries any Stop decided since
+        # (its write-back failed too): carry it out or record it, never record a bare "running" over it.
+        prior = dict(launched)
+        if prior.get("stop") is not None:
+            stop = self._stop(prior)  # a kept "stopped" is written back; anything else is continued
+            code = START_UNCONFIRMED if stop.get("recorded") is False else STARTED
+            return {"code": code, "run": prior, "duplicate": True, "stop": stop}
         if not self._try_put(prior):
             return {"code": START_UNCONFIRMED, "run": prior, "duplicate": True, "detail": "registry_unavailable"}
         self._launched.pop(run_id, None)
         return {"code": STARTED, "run": prior, "duplicate": True}
-
-    def _launched_cgroup(self, run_id: str) -> str | None:
-        launched = self._launched.get(run_id)
-        return launched.get("cgroup") if launched is not None else None
 
     def _current(self, rec: dict) -> dict:
         """The registry's copy of ``rec``, or ``rec`` itself if the registry cannot answer."""
@@ -267,12 +276,19 @@ class ControlAPI:
         """One stop decision on ``rec``. Caller holds the run lock."""
         run_id = rec["run_id"]
         if rec["state"] == "stopped":
-            return {"code": STOPPED, "run_id": run_id, "state": "stopped", "repeat": True}
+            res = {"code": STOPPED, "run_id": run_id, "state": "stopped", "repeat": True}
+            # A stopped launch this process still holds was never written: try again now.
+            return self._recorded(res, rec) if run_id in self._launched else res
         if not rec.get("cgroup"):
-            cgroup = self._launched_cgroup(run_id)
-            if cgroup is None:  # launch not confirmed yet (starting / start_failed): keep the Stop as intent
+            launched = self._launched.get(run_id)
+            if launched is None:  # launch not confirmed yet (starting / start_failed): keep the Stop as intent
                 return self._stop_intent(rec)
-            rec.update(state="running", cgroup=cgroup)  # launched, write after launch failed: aim at it now
+            # Launched, write after launch failed: aim at it now, from the kept record, so a Stop whose own
+            # write-back failed earlier is continued rather than started again.
+            rec.clear()
+            rec.update(launched)
+            if rec["state"] == "stopped":
+                return self._recorded({"code": STOPPED, "run_id": run_id, "state": "stopped", "repeat": True}, rec)
         self._stop_wanted.discard(run_id)
         first = rec["state"] != "stop_pending"
         if rec.get("stop") is None:
@@ -318,6 +334,8 @@ class ControlAPI:
         # stop then sees the old state and asks again, which is safe (cgroup.kill and pidfds repeat).
         if not self._try_put(rec):
             res["recorded"] = False
+            if rec["run_id"] in self._launched:  # keep the decision with the launch until a write lands
+                self._launched[rec["run_id"]] = dict(rec, stop=dict(rec["stop"]) if rec.get("stop") else None)
         else:
             self._launched.pop(rec["run_id"], None)  # the cgroup is in the registry now
         return res

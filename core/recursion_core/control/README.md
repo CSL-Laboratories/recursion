@@ -38,7 +38,11 @@ recorded on F60, CSL-762).
 - Registry errors never escape `ControlAPI.call`: a read, a stop lookup or the launch-intent write that
   fails answers `registry_unavailable`. Once the cleanup layer has answered, Stop returns `stopped` or
   `pending` even if writing that back fails, with `"recorded": false`; the next stop then sees the old
-  record and asks the cleanup layer again, which is safe to repeat.
+  record and asks the cleanup layer again, which is safe to repeat. For a launch whose own write failed,
+  the API keeps the Stop decision with that launch, so a later Stop or a same-key retry continues it
+  (re-sends a request that raised, writes back a confirmed `stopped`) and never records a bare `running`
+  over it. A failed start whose record cannot be re-read writes nothing, so it never erases a Stop
+  intent recorded during the launch.
 - Stop decisions and launch records are serialised per run, not API-wide, so one hung cleanup never
   queues another run's Stop (11.3, D2-55 / B-19), and a launch never overwrites a Stop that landed
   during it.

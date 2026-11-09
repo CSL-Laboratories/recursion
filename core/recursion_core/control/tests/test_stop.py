@@ -329,11 +329,12 @@ class RegistryFailureTest(unittest.TestCase):
         api, _, kill, _ = make_api(FakeKillTree([EMPTY]), registry=registry)
         registry.fail_puts = "running"
         api.call("run.start", self.P)
-        for _ in range(2):  # the stopped write-back fails too: answer stopped, unrecorded, and ask again
+        for _ in range(2):  # the stopped write-back fails too: answer stopped, unrecorded, and try the write again
             registry.fail_puts = True
             stop = api.call("run.stop", {"run_id": "run-1"})
             self.assertEqual((stop["code"], stop["recorded"]), (a.STOPPED, False))
-        self.assertEqual(len(kill.requests), 2)
+        # The confirmed Stop is kept with the launch (t1430u X1c), so the repeat sends no second kill.
+        self.assertEqual(len(kill.requests), 1)
         registry.fail_puts = False
         self.assertEqual(api.call("run.stop", {"run_id": "run-1"}).get("recorded", True), True)
         self.assertEqual(registry.get("run-1")["state"], "stopped")
@@ -452,6 +453,85 @@ class RegistryFailureTest(unittest.TestCase):
         api.call("run.stop", {"run_id": "run-1"})
         self.assertEqual(registry.get("run-1")["state"], "stopped")
 
+    def test_same_key_retry_carries_out_an_unrecorded_stop(self) -> None:
+        # Bot review 4511961481 at 77aa248c: the post-launch write failed, then Stop's cleanup request
+        # raised and its stop_pending write failed. A same-key retry recorded "running" and dropped the Stop.
+        registry = FailingRegistry()
+        kill = FakeKillTree([EMPTY], request_error=PermissionError("denied"))
+        api, _, _, starter = make_api(kill, registry=registry)
+        registry.fail_puts = "running"
+        api.call("run.start", self.P)
+        registry.fail_puts = True
+        stop = api.call("run.stop", {"run_id": "run-1"})
+        self.assertEqual((stop["code"], stop["reason"], stop["recorded"]),
+                         (a.PENDING, "cleanup_error:PermissionError", False))
+        registry.fail_puts, kill.request_error = False, None
+        retry = api.call("run.start", self.P)
+        self.assertEqual((retry["code"], retry["duplicate"], retry["stop"]["code"]), (a.STARTED, True, a.STOPPED))
+        self.assertEqual(kill.requests, ["/sys/fs/cgroup/fake/run-1"] * 2)  # the raised request is re-sent
+        self.assertEqual(registry.get("run-1")["state"], "stopped")
+        self.assertEqual(len(starter.calls), 1)
+
+    def test_same_key_retry_records_a_confirmed_but_unrecorded_stop(self) -> None:
+        registry = FailingRegistry()
+        api, _, kill, _ = make_api(FakeKillTree([EMPTY]), registry=registry)
+        registry.fail_puts = "running"
+        api.call("run.start", self.P)
+        registry.fail_puts = True
+        self.assertEqual(api.call("run.stop", {"run_id": "run-1"})["recorded"], False)
+        registry.fail_puts = False
+        retry = api.call("run.start", self.P)
+        self.assertEqual((retry["code"], retry["stop"]["code"]), (a.STARTED, a.STOPPED))
+        self.assertEqual(registry.get("run-1")["state"], "stopped")  # never recorded "running" over the Stop
+        self.assertEqual(len(kill.requests), 1)
+
+    def test_failed_start_never_overwrites_a_stop_intent_it_could_not_read(self) -> None:
+        # Bot review 4511961630 at 77aa248c: Stop recorded its intent during the launch, the starter raised
+        # and the re-read failed; the start_failed write erased the intent, so a fresh API relaunched.
+        registry = FailingRegistry()
+        in_starter, release = threading.Event(), threading.Event()
+        calls: list[str] = []
+
+        def failing(params: dict) -> dict:
+            calls.append(params["run_id"])
+            if len(calls) == 1:
+                in_starter.set()
+                release.wait(10)
+            raise RuntimeError("refused")
+
+        api, _, kill, _ = make_api(registry=registry, starter=failing)
+        out: list[dict] = []
+        t = threading.Thread(target=lambda: out.append(api.call("run.start", self.P)))
+        t.start()
+        try:
+            self.assertTrue(in_starter.wait(5))
+            self.assertEqual(api.call("run.stop", {"run_id": "run-1"})["code"], a.PENDING)
+            registry.fail_reads = True
+        finally:
+            release.set()
+            t.join()
+        self.assertEqual((out[0]["code"], out[0]["recorded"]), (a.START_FAILED, False))
+        registry.fail_reads = False
+        self.assertIsNotNone(registry.get("run-1")["stop"])  # the intent survived
+        fresh = a.ControlAPI(registry, kill, failing, clock=lambda: 1000.0)  # a restart
+        again = fresh.call("run.start", self.P)
+        self.assertNotEqual(again["code"], a.STARTED)
+        self.assertEqual(calls, ["run-1"])  # never relaunched after the Stop
+
+
+class RegistryIndexTest(unittest.TestCase):
+    def test_find_start_index_follows_puts(self) -> None:
+        # Bot review 4511191935: find_start scanned every record on each keyed start; now it is indexed.
+        reg = InMemoryRunRegistry([{"run_id": "r0", "tenant": "t", "start_key": {"client_key": "k0"}}])
+        for i in range(1, 2001):
+            reg.put({"run_id": f"r{i}", "tenant": "t", "start_key": {"client_key": f"k{i}"}})
+        self.assertEqual(reg.find_start("t", "k0")["run_id"], "r0")
+        self.assertEqual(reg.find_start("t", "k2000")["run_id"], "r2000")
+        self.assertIsNone(reg.find_start("other", "k1"))
+        reg.put({"run_id": "r1", "tenant": "t", "start_key": None})
+        self.assertIsNone(reg.find_start("t", "k1"))
+        reg.put({"run_id": "dup", "tenant": "t", "start_key": {"client_key": "k2"}})
+        self.assertEqual(reg.find_start("t", "k2")["run_id"], "r2")  # the first run started with a key wins
 
 class StartConcurrencyTest(unittest.TestCase):
     # t1430u X1c (round-3 follow-up): starts were serialised by one API-wide lock held across the starter,

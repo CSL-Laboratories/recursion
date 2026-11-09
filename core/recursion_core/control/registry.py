@@ -45,11 +45,28 @@ class KillTree(Protocol):
 
 
 class InMemoryRunRegistry:
-    """Thread-safe in-memory registry for tests and the candidate CLI; not durable."""
+    """Thread-safe in-memory registry for tests and the candidate CLI; not durable.
+
+    ``find_start`` is an indexed lookup on ``(tenant, client_key)``, so keyed starts do not slow down as
+    runs accumulate (a durable registry should index it too)."""
 
     def __init__(self, records: list[dict] | None = None) -> None:
         self._lock = threading.Lock()
-        self._runs: dict[str, dict] = {r["run_id"]: copy.deepcopy(r) for r in records or []}
+        self._runs: dict[str, dict] = {}
+        self._starts: dict[tuple[str, str], str] = {}  # (tenant, client_key) -> run_id
+        for r in records or []:
+            self._store(copy.deepcopy(r))
+
+    def _store(self, rec: dict) -> None:
+        old = self._runs.get(rec["run_id"])
+        if old is not None:
+            okey = _start_index_key(old)
+            if okey is not None and self._starts.get(okey) == rec["run_id"]:
+                del self._starts[okey]
+        self._runs[rec["run_id"]] = rec
+        key = _start_index_key(rec)
+        if key is not None:
+            self._starts.setdefault(key, rec["run_id"])
 
     def get(self, run_id: str) -> dict | None:
         with self._lock:
@@ -62,12 +79,16 @@ class InMemoryRunRegistry:
 
     def put(self, record: dict) -> None:
         with self._lock:
-            self._runs[record["run_id"]] = copy.deepcopy(record)
+            self._store(copy.deepcopy(record))
 
     def find_start(self, tenant: str, client_key: str) -> dict | None:
         with self._lock:
-            for rec in self._runs.values():
-                key = rec.get("start_key")
-                if rec.get("tenant") == tenant and key is not None and key.get("client_key") == client_key:
-                    return copy.deepcopy(rec)
-            return None
+            run_id = self._starts.get((tenant, client_key))
+            return copy.deepcopy(self._runs[run_id]) if run_id is not None else None
+
+
+def _start_index_key(rec: dict) -> tuple[str, str] | None:
+    key = rec.get("start_key")
+    if not isinstance(key, dict) or not isinstance(key.get("client_key"), str):
+        return None
+    return (rec.get("tenant"), key["client_key"])

@@ -39,7 +39,7 @@ class BreakerTest(unittest.TestCase):
 
     def test_short_fault_is_one_model_one_tenant_and_brief(self) -> None:
         self.assertEqual(self.b.record("subscription:A", "m", "t1", {"code": c.SHORT_FAULT}), "short_fault")
-        self.assertEqual(self.b.admit("subscription:A", "m", "t1")["code"], c.BREAKER_OPEN)
+        self.assertEqual(self.b.admit("subscription:A", "m", "t1")["code"], c.SHORT_FAULT)
         self.assertTrue(self.b.admit("subscription:A", "m", "t2")["admitted"])
         self.assertTrue(self.b.admit("subscription:A", "m2", "t1")["admitted"])
         self.assertEqual(self.b.state("subscription:A"), "closed")
@@ -79,6 +79,30 @@ class BreakerTest(unittest.TestCase):
         self.assertNotEqual(second["probe"], lost)
         self.assertEqual(self.b.record("subscription:A", "m", "t1", {"code": None}, lost), "none")  # stale probe
         self.assertEqual(self.b.state("subscription:A"), "half_open")
+
+    def test_probe_lease_covers_the_probe_deadline_plus_grace(self) -> None:
+        # 11.2 C1-18: the lease is bounded at the probe run's deadline plus 30 s, so a long probe still
+        # inside its deadline is never joined by a second probe on the same connection.
+        self.b.record("subscription:A", "m", "t1", LIMIT)
+        self.clock.advance(300)
+        first = self.b.admit("subscription:A", "m", "t1", deadline_s=600)["probe"]
+        self.assertIsNotNone(first)
+        self.clock.advance(629)
+        self.assertEqual(self.b.admit("subscription:A", "m", "t2", deadline_s=600)["code"], c.PROBE_IN_FLIGHT)
+        self.assertEqual(self.b.record("subscription:A", "m", "t1", {"code": None}, first), "closed")
+        self.b.record("subscription:A", "m", "t1", LIMIT)
+        self.clock.advance(600)
+        short = self.b.admit("subscription:A", "m", "t1", deadline_s=10)
+        self.clock.advance(39)
+        self.assertEqual(self.b.admit("subscription:A", "m", "t2", deadline_s=10)["code"], c.PROBE_IN_FLIGHT)
+        self.clock.advance(1)
+        self.assertNotEqual(self.b.admit("subscription:A", "m", "t2", deadline_s=10)["probe"], short["probe"])
+
+    def test_short_fault_refusal_is_not_breaker_open(self) -> None:
+        self.b.record("subscription:A", "m", "t1", {"code": c.SHORT_FAULT})
+        refused = self.b.admit("subscription:A", "m", "t1")
+        self.assertEqual((refused["code"], refused["key"]), (c.SHORT_FAULT, "short_fault:m"))
+        self.assertEqual(self.b.state("subscription:A"), "closed")
 
     def test_probe_failure_reopens_with_backoff(self) -> None:
         self.b.record("subscription:A", "m", "t1", LIMIT)

@@ -130,7 +130,10 @@ class ClaudeCodeTest(unittest.TestCase):
         self.assertEqual(h.breaker.state("subscription:login-A"), "closed")
         self.assertEqual(h.handle(request(tenant="t2"))["status"], "ok")
         self.assertEqual(h.handle(request(model="claude-other"))["status"], "ok")
-        self.assertEqual(h.handle(request())["code"], c.BREAKER_OPEN)
+        refused = h.handle(request())
+        # The short fence's own refusal is a short fault, not a usage limit: no notice, no switch point.
+        self.assertEqual((refused["code"], refused["limit_notice"]), (c.SHORT_FAULT, None))
+        self.assertEqual(refused["detail"], "short_fault:claude-sonnet")
 
     def test_non_json_stdout_is_protocol_error_and_fenced(self) -> None:
         h = Harness([["not json"]])

@@ -18,7 +18,8 @@ from recursion_core.routes.breaker import ConnectionBreaker
 from recursion_core.routes.claude_code import ClaudeCodeAdapter, SUBSCRIPTION_DROP_ENV
 from recursion_core.routes.codex import CodexAdapter
 from recursion_core.routes.service import RouteService
-from recursion_core.routes.tests.fakes import FakeClock, FakeLauncher, claude_limit, claude_ok, codex_script, request
+from recursion_core.routes.tests.fakes import (FakeClock, FakeLauncher, claude_error, claude_limit, claude_ok,
+                                               codex_script, request)
 
 PKG = Path(__file__).resolve().parents[1]
 PARENT = {
@@ -43,8 +44,9 @@ class Harness:
             return (credentials or KEYS)[(conn_id, name)]
 
         args = (self.launcher, self.clock, creds, PARENT)
+        self.breaker = ConnectionBreaker(self.clock)
         self.service = RouteService({"claude_code": ClaudeCodeAdapter(*args), "codex": CodexAdapter(*args)},
-                                    ConnectionBreaker(self.clock), self.clock, limits=limits)
+                                    self.breaker, self.clock, limits=limits)
 
     def handle(self, req):
         res = self.service.handle(json.loads(json.dumps(req)))
@@ -255,6 +257,51 @@ class LimitsTest(unittest.TestCase):
         res = h.handle(request(rid="r2"))
         self.assertEqual(res["code"], c.BREAKER_OPEN)
         self.assertEqual(res["limit_notice"]["reset_at"], 1_000_500.0)
+
+    def test_short_fault_refusal_is_no_limit_and_never_switches(self) -> None:
+        # Grill Q23: vague quota text fences one model for one tenant; it is not a usage limit, so the
+        # follow-up refusal gets no notice and the user's fallback order is not used.
+        h = Harness([claude_error("Quota exceeded, try later")])
+        order = [{"engine": "codex", "model": "gpt-5", "connection": {"kind": "subscription", "id": "c"}}]
+        first = h.handle(request(limits={"on_limit": "fallback", "fallback": order}))
+        self.assertEqual((first["code"], first["limit_notice"]), (c.SHORT_FAULT, None))
+        res = h.handle(request(rid="r2", limits={"on_limit": "fallback", "fallback": order}))
+        self.assertEqual((res["code"], res["limit_notice"]), (c.SHORT_FAULT, None))
+        self.assertEqual(len(h.launcher.calls), 1)  # no fallback route ever launched
+
+    def test_probe_in_flight_shows_the_limit_and_follows_the_users_choice(self) -> None:
+        h = Harness(limited_then(codex_script("codex answer")))
+        h.handle(request())
+        h.clock.advance(500)
+        self.assertIsNotNone(h.breaker.admit("subscription:login-A", "claude-sonnet", "t9")["probe"])
+        asked = h.handle(request(rid="r2"))
+        self.assertEqual(asked["code"], c.PROBE_IN_FLIGHT)
+        self.assertEqual(asked["limit_notice"]["on_limit"], "ask")
+        self.assertEqual([ch["action"] for ch in asked["limit_notice"]["choices"]], ["wait", "cancel"])
+        order = [{"engine": "codex", "model": "gpt-5", "connection": {"kind": "subscription", "id": "codex-login"}}]
+        res = h.handle(request(rid="r3", limits={"on_limit": "fallback", "fallback": order}))
+        self.assertEqual(res["text"], "codex answer")
+        self.assertEqual(res["limit_notice"]["code"], c.PROBE_IN_FLIGHT)
+        self.assertEqual(res["limit_notice"]["switched_to"]["engine"], "codex")
+
+    def test_probe_lease_follows_the_run_deadline(self) -> None:
+        # A probe run with a 600 s deadline still holds its lease 599 s in: no second probe is admitted.
+        seen = []
+
+        def scripts(argv, env):
+            if len(seen) == 0:
+                seen.append("limit")
+                return claude_limit(reset_at=1_000_500.0)
+            h.clock.advance(599)
+            seen.append(h.breaker.admit("subscription:login-A", "claude-sonnet", "t2", deadline_s=600)["code"])
+            return claude_ok("probe")
+
+        h = Harness(scripts)
+        h.handle(request())
+        h.clock.advance(500)
+        res = h.handle(request(rid="r2", deadline_s=600))
+        self.assertEqual((res["text"], res["breaker_effect"]), ("probe", "closed"))
+        self.assertEqual(seen, ["limit", c.PROBE_IN_FLIGHT])
 
     def test_wait_runs_nothing_else(self) -> None:
         h = Harness(limited_then())

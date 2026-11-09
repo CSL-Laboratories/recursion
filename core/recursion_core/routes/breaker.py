@@ -12,11 +12,15 @@ This breaker is the other way round (PRODUCT.md 398cd812, 3.4 S3 and S4, grill Q
   field) opens a connection. Recursion's own deadlines and every other engine failure leave it
   alone; a hung run is fenced for its own request only.
 * A vague quota-sounding error is a SHORT_FAULT: it fences one model for one tenant for
-  ``short_fault_s`` (grill Q23), never the connection and never another tenant.
+  ``short_fault_s`` (grill Q23), never the connection and never another tenant. The refusal while
+  that fence holds is itself ``SHORT_FAULT``, not ``BREAKER_OPEN``, so it is never reported as a
+  usage limit and never offered as a switch point.
 * It always recovers. An open key has a finite ``open_until`` (the vendor's reset time when the
   signal carries one, capped at ``max_open_s``; otherwise a cooldown with backoff up to
-  ``max_cooldown_s``). After it, exactly one leased half-open probe is admitted at a time; the
-  lease expires after ``probe_lease_s``, so a probe that never reports cannot hold it forever.
+  ``max_cooldown_s``). After it, exactly one leased half-open probe is admitted at a time. The
+  lease is bounded at the probe run's own deadline plus ``probe_grace_s`` (PRODUCT.md 11.2, C1-18),
+  or ``probe_lease_s`` when the caller gives no deadline: a probe that never reports cannot hold it
+  forever, and a probe still inside its deadline is never joined by a second one.
   Probe success closes; a probe that hits a limit reopens with backoff; ``reset`` closes at once.
 
 The cooldown, lease and short-fault numbers are uncalibrated defaults (PRODUCT.md 11.2, B-10);
@@ -45,10 +49,11 @@ class ConnectionBreaker:
         max_open_s: float = 8 * 24 * 3600.0,
         probe_lease_s: float = 150.0,
         short_fault_s: float = 60.0,
+        probe_grace_s: float = 30.0,
     ) -> None:
         self._clock = clock
         self._cooldown_s, self._max_cooldown_s, self._max_open_s = cooldown_s, max_cooldown_s, max_open_s
-        self._lease_s, self._short_s = probe_lease_s, short_fault_s
+        self._lease_s, self._short_s, self._grace_s = probe_lease_s, short_fault_s, probe_grace_s
         self._lock = threading.Lock()
         self._keys: dict[str, dict] = {}  # breaker key -> state record
         self._short: dict[tuple[str, str, str], float] = {}  # (connection, model, tenant) -> until
@@ -63,15 +68,18 @@ class ConnectionBreaker:
         return (connection, self.model_key(connection, model))
 
     # -- admission ----------------------------------------------------------------------------
-    def admit(self, connection: str, model: str, tenant: str) -> dict:
-        """Decide whether one request may launch. Returns ``{"admitted", "code", "probe", "retry_at", "key"}``."""
+    def admit(self, connection: str, model: str, tenant: str, *, deadline_s: float | None = None) -> dict:
+        """Decide whether one request may launch. Returns ``{"admitted", "code", "probe", "retry_at", "key"}``.
+
+        ``deadline_s`` is the run's own deadline; a probe lease lasts that long plus ``probe_grace_s``.
+        """
 
         with self._lock:
             now = self._clock()
             until = self._short.get((connection, model, tenant))
             if until is not None:
                 if now < until:
-                    return _refused(c.BREAKER_OPEN, until, f"short_fault:{model}")
+                    return _refused(c.SHORT_FAULT, until, f"short_fault:{model}")
                 del self._short[(connection, model, tenant)]
             probe_key = None
             for key in self._keys_for(connection, model):
@@ -87,7 +95,8 @@ class ConnectionBreaker:
                 return {"admitted": True, "code": None, "probe": None, "retry_at": None, "key": None}
             rec = self._keys[probe_key]
             token = f"probe-{next(self._tokens)}"
-            rec.update(state=HALF_OPEN, probe=token, lease_until=now + self._lease_s)
+            lease = self._lease_s if deadline_s is None else float(deadline_s) + self._grace_s
+            rec.update(state=HALF_OPEN, probe=token, lease_until=now + lease)
             return {"admitted": True, "code": None, "probe": token, "retry_at": None, "key": probe_key}
 
     # -- outcomes -----------------------------------------------------------------------------

@@ -27,9 +27,11 @@ from recursion_core.routes import contract as c
 ON_LIMIT = ("ask", "wait", "fallback")
 DEFAULT_LIMITS = {"on_limit": "ask", "fallback": []}
 MAX_FALLBACK = 8
-# Results that mean "this connection is at a limit now". SHORT_FAULT is one model for one tenant for a
-# minute (grill Q23), not a subscription limit, so it is not offered as a switch point.
-LIMIT_CODES = (c.PLAN_LIMIT, c.BREAKER_OPEN)
+# Results that mean "this connection is at a limit now": a typed limit, a breaker still open on it, or
+# its half-open probe still running (the connection has not shown it recovered). SHORT_FAULT is one model
+# for one tenant for a minute (grill Q23), not a subscription limit, so it is not offered as a switch
+# point, including the breaker's refusal while that short fence holds.
+LIMIT_CODES = (c.PLAN_LIMIT, c.BREAKER_OPEN, c.PROBE_IN_FLIGHT)
 _ROUTE_KEYS = {"engine", "model", "connection", "profile", "home", "bare", "api_key_helper", "billing_ack"}
 
 
@@ -77,7 +79,7 @@ def notice(result: Mapping, route: Mapping, limits: Mapping) -> dict | None:
         "message": f"{here['connection']} ({here['engine']}, {here['model']}) is at a usage limit",
         "route": here,
         "code": result["code"],
-        "scope": signal.get("scope", "connection"),
+        "scope": signal.get("scope", _refusal_scope(result)),
         "source": signal.get("source", result.get("detail", "")),
         "reset_at": reset_at,
         "on_limit": limits["on_limit"],
@@ -85,3 +87,10 @@ def notice(result: Mapping, route: Mapping, limits: Mapping) -> dict | None:
         "switched_to": None,
         "attempts": [here],
     }
+
+
+def _refusal_scope(result: Mapping) -> str:
+    """A breaker refusal names the key it hit in ``detail``: a model bucket key is model scope."""
+
+    detail = result.get("detail")
+    return "model" if isinstance(detail, str) and "#model:" in detail else "connection"

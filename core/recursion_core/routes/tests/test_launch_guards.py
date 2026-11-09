@@ -74,7 +74,8 @@ class SubscriptionRouteReuseTest(unittest.TestCase):
 
     def test_claude_subscription_provider_is_refused_and_never_launched(self) -> None:
         cases = [("pi", {"provider": "claude-pro", "auth": "oauth", "credential_env": "ANTHROPIC_API_KEY"}),
-                 ("hermes", {"provider": "claude-code", "auth": "api_key", "credential_env": "ANTHROPIC_API_KEY"}),
+                 ("hermes", {"provider": "claude-code", "auth": "api_key", "credential_env": "ANTHROPIC_API_KEY",
+                             "auth.adopt_external_logins": False}),  # required on every Hermes profile (#321)
                  ("opencode", {"provider": "claude-agent", "auth": "subscription", "credential_env": "ANTHROPIC_API_KEY"})]
         for engine, profile in cases:
             res = self.service.handle(self.req(engine, profile))

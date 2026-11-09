@@ -1,8 +1,10 @@
-"""The full-screen frame fits the terminal and never hides a condition (PR #329 red-team round 1).
+"""The full-screen frame fits the terminal and never hides a condition (PR #329 red-team rounds 1, 2).
 
 Finding 1: more than four active conditions cut UNCERTAIN and REFUSED off the screen.
 Finding 2: the size was read once and floored at 20x16, so a smaller or resized terminal scrolled the
 condition rows away. Finding 4: ``--no-color`` was a usage error and diagnostics went to stdout.
+Round 2 finding 1: with the API's real 36-character run ids (``run-`` + 32 hex), the per-label row was clipped at the width,
+so at 80x24 only one of 12 unconfirmed Stops was named (and below ~76 columns not even one).
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ import io
 import re
 import unittest
 
+from recursion_core.control.api import _new_run_id
 from recursion_core.control.registry import POPULATED
 from recursion_core.tui import protocol as p
 from recursion_core.tui import term
@@ -23,17 +26,18 @@ SIZES = [(1, 1), (2, 1), (10, 3), (12, 5), (20, 6), (40, 8), (19, 15), (60, 12),
 SGR = re.compile(r"\x1b\[[0-9;]*m")
 
 
-def pending_stops(n: int, *, stale: bool, clock: Clock | None = None, **size) -> TuiApp:
-    """The reviewer's repro: ``n`` runs, ``s y`` on each, every Stop answered ``pending``."""
+def pending_stops(n: int, *, stale: bool, clock: Clock | None = None, real_ids: bool = False,
+                  **size) -> TuiApp:
+    """The reviewer's repro: ``n`` runs, ``s y`` on each, every Stop answered ``pending``. ``real_ids``
+    uses the control API's own ``run-<32 hex>`` ids instead of the goldens' ``run-1``."""
 
-    driver = FakeDriver(confirm_answers=[POPULATED])
-    for _ in range(n):
-        driver.start_run()
+    driver = FakeDriver(confirm_answers=[POPULATED], new_run_id=_new_run_id if real_ids else None)
+    ids = [driver.start_run() for _ in range(n)]
     clock = clock or Clock()
     app = TuiApp(driver.api, clock=clock, environ={"NO_COLOR": "1"}, stale_after_s=10.0, **size)
     app.open()
-    for i in range(n):
-        app.selected = f"run-{i + 1}"
+    for run_id in ids:
+        app.selected = run_id
         app.press("s")
         app.press("y")
     if stale:
@@ -46,14 +50,37 @@ def screen(app: TuiApp) -> list[str]:
     return [text for text, _ in app.frame()]
 
 
+def block_rows(rows: list[str], label: str) -> list[str]:
+    """The label's rows: its head row and the indented rows under it (indent removed)."""
+
+    out, inside = [], False
+    for r in rows:
+        if r.startswith(f"{label}: "):
+            inside = True
+        elif inside and not r.startswith("  "):
+            inside = False
+        if inside:
+            out.append(r[2:] if r.startswith("  ") else r)
+    return out
+
+
+def block(rows: list[str], label: str) -> str:
+    """The label's rows joined two ways: with a space (text broken at a word) and with nothing (a run id
+    wider than the terminal, broken mid-id), so either reads whole."""
+
+    found = block_rows(rows, label)
+    return " ".join(found) + "\n" + "".join(found)
+
+
 class ConditionsNeverHiddenTest(unittest.TestCase):
     def assert_every_condition_on_screen(self, app: TuiApp) -> None:
         rows = screen(app)
         for (label, subject), (_, text) in app.shown.items():
             self.assertTrue(any(r.startswith(f"{label}: ") for r in rows), f"{label} has no row: {rows}")
-            if label == p.UNCERTAIN:  # each unconfirmed Stop is named, not only the label
-                self.assertTrue(any(r.startswith(f"{label}: ") and subject.split("=")[-1] in r for r in rows),
-                                f"{label} {subject} not named: {rows}")
+            if label in (p.UNCERTAIN, p.UNRECONCILED) and subject.startswith("run="):  # each run is named whole
+                run_id = subject.split("=", 1)[1]
+                self.assertRegex(block(rows, label), rf"(?<![0-9a-f-]){re.escape(run_id)}(?![0-9a-f])",
+                                 f"{label} {subject} not named: {rows}")
 
     def test_two_pending_stops_and_stale_keep_both_uncertain_rows(self) -> None:
         app = pending_stops(2, stale=True, width=100, height=30)
@@ -77,6 +104,41 @@ class ConditionsNeverHiddenTest(unittest.TestCase):
         uncertain = next(r for r in rows if r.startswith("UNCERTAIN: "))
         self.assertIn("12 active", uncertain)
 
+    def test_real_run_ids_at_80x24_name_every_pending_stop(self) -> None:
+        for n in (1, 6, 12):
+            with self.subTest(pending=n):
+                app = pending_stops(n, stale=True, real_ids=True, width=80, height=24)
+                ids = [run["run_id"] for run in app.runs]
+                self.assertTrue(all(len(i) == 36 for i in ids), ids)
+                rows = screen(app)
+                self.assertEqual(len(rows), 24)
+                self.assertTrue(all(len(r) <= 80 for r in rows))
+                self.assert_every_condition_on_screen(app)
+                for label in (p.UNCERTAIN, p.UNRECONCILED):
+                    shown = block_rows(rows, label)
+                    for run_id in ids:  # at 80 columns no id is split across rows
+                        self.assertTrue(any(run_id in r for r in shown), (label, run_id, rows))
+                    self.assertFalse(any("…" in r for r in shown[1:]), "a name row is never clipped")
+
+    def test_one_pending_stop_keeps_its_id_on_a_narrow_terminal(self) -> None:
+        for width in (20, 40, 60, 75):
+            with self.subTest(width=width):
+                app = pending_stops(1, stale=False, real_ids=True, width=width, height=24)
+                self.assert_every_condition_on_screen(app)
+
+    def test_more_names_than_rows_say_how_many_are_not_named(self) -> None:
+        app = pending_stops(30, stale=True, real_ids=True, width=80, height=24)
+        rows = screen(app)
+        self.assertEqual(len(rows), 24)
+        self.assertTrue(rows[-1].startswith("recursion: "), "the prompt stays")
+        for label in (p.UNRECONCILED, p.STALE, p.UNCERTAIN):
+            self.assertTrue(any(r.startswith(f"{label}: ") for r in rows), label)
+        uncertain = block(rows, p.UNCERTAIN)
+        named = [run["run_id"] for run in app.runs if run["run_id"] in uncertain]
+        self.assertGreaterEqual(len(named), 12, "UNCERTAIN gets the rows first")
+        if len(named) < 30:
+            self.assertIn(f"… {30 - len(named)} more not named here", uncertain)
+
     def test_refused_and_uncertain_survive_together(self) -> None:
         app = pending_stops(3, stale=True, width=100, height=30)
         app.command("stop nope")
@@ -94,12 +156,12 @@ class ConditionsNeverHiddenTest(unittest.TestCase):
 class FrameFitsTerminalTest(unittest.TestCase):
     def test_every_size_gets_exactly_its_rows_and_columns(self) -> None:
         for width, height in SIZES:
-            for n in (0, 1, 3, 12):
-                with self.subTest(width=width, height=height, pending=n):
-                    app = pending_stops(n, stale=bool(n), width=width, height=height)
+            for n, real in ((0, False), (1, False), (3, False), (12, False), (1, True), (12, True)):
+                with self.subTest(width=width, height=height, pending=n, real_ids=real):
+                    app = pending_stops(n, stale=bool(n), real_ids=real, width=width, height=height)
                     for i in range(300):
-                        app.on_event({"run_id": "run-1", "text": f"noise {'w' * 150} {i}\n"})
-                    app.attached = "run-1"
+                        app.on_event({"run_id": app.runs[0]["run_id"] if app.runs else "run-1", "text": f"noise {'w' * 150} {i}\n"})
+                    app.attached = app.runs[0]["run_id"] if app.runs else "run-1"
                     rows = screen(app)
                     self.assertEqual(len(rows), height)
                     for r in rows:

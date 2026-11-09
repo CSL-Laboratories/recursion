@@ -62,11 +62,11 @@ class ScriptedAPI:
 class FakeDriver:
     """The engine side: a real ControlAPI over fakes, plus an output emitter at a fixed rate."""
 
-    def __init__(self, confirm_answers=(EMPTY,)) -> None:
+    def __init__(self, confirm_answers=(EMPTY,), new_run_id=None) -> None:
         self.registry, self.kill = InMemoryRunRegistry(), FakeKillTree(list(confirm_answers))
         self.model_calls = 0
         self._ids = 0
-        self.api = ControlAPI(self.registry, self.kill, self._start, clock=lambda: 1000.0, new_run_id=self._new_id)
+        self.api = ControlAPI(self.registry, self.kill, self._start, clock=lambda: 1000.0, new_run_id=new_run_id or self._new_id)
         self._stop = threading.Event()
         self.emitted = 0
 

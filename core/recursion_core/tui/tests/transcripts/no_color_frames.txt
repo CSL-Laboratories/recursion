@@ -1,8 +1,8 @@
 === open and attach run-1; run-2 is stop_pending (UNRECONCILED)
 Recursion TUI | surface=cli | view=live | runs=2 | control API client
 status=ok method=run.status
-UNRECONCILED: run=run-2 state=stop_pending reason=cgroup_populated: stop requested, cleanup not con…
-
+UNRECONCILED: run=run-2 state=stop_pending reason=cgroup_populated: stop requested, cleanup not
+  confirmed
 
 
 runs:
@@ -32,10 +32,11 @@ recursion: j/k select  a attach  r refresh  s stop  : command  q close (runs kee
 === stop run-1 answered pending (UNCERTAIN)
 Recursion TUI | surface=cli | view=live | runs=2 | control API client
 status=pending method=run.stop run_id=run-1 state=pending reason=cgroup_populated
-UNRECONCILED: run=run-1 state=stop_pending reason=cgroup_populated: stop requested, cleanup not con…
-UNRECONCILED: run=run-2 state=stop_pending reason=cgroup_populated: stop requested, cleanup not con…
+UNRECONCILED: run=run-1 state=stop_pending reason=cgroup_populated: stop requested, cleanup not
+  confirmed
+UNRECONCILED: run=run-2 state=stop_pending reason=cgroup_populated: stop requested, cleanup not
+  confirmed
 UNCERTAIN: stop not confirmed for run=run-1: reason=cgroup_populated; run may still be running
-
 runs:
 > run-1 state=stop_pending engine=codex tenant=t1 attached
   run-2 state=stop_pending engine=codex tenant=t1
@@ -56,15 +57,16 @@ runs:
 │
 │
 │
-│
 errors: none
 stop run=run-1: control API answered pending
 recursion: j/k select  a attach  r refresh  s stop  : command  q close (runs keep going)
 === stop of an unknown run is refused (REFUSED, error row)
 Recursion TUI | surface=cli | view=live | runs=2 | control API client
 status=run_unknown method=run.stop run_id=nope
-UNRECONCILED: run=run-1 state=stop_pending reason=cgroup_populated: stop requested, cleanup not con…
-UNRECONCILED: run=run-2 state=stop_pending reason=cgroup_populated: stop requested, cleanup not con…
+UNRECONCILED: run=run-1 state=stop_pending reason=cgroup_populated: stop requested, cleanup not
+  confirmed
+UNRECONCILED: run=run-2 state=stop_pending reason=cgroup_populated: stop requested, cleanup not
+  confirmed
 REFUSED: run_unknown nope
 UNCERTAIN: stop not confirmed for run=run-1: reason=cgroup_populated; run may still be running
 runs:
@@ -86,8 +88,6 @@ runs:
 │
 │
 │
-│
-│
 error 1: REFUSED: run.stop status=run_unknown run_unknown nope
 stop run=nope: control API answered run_unknown
 recursion: j/k select  a attach  r refresh  s stop  : command  q close (runs keep going)
@@ -95,9 +95,12 @@ recursion: j/k select  a attach  r refresh  s stop  : command  q close (runs kee
 Recursion TUI | surface=cli | view=watch_only | runs=2 | control API client
 status=control_api_unavailable method=run.status detail=ConnectionError
 UNAVAILABLE: control API unavailable: ConnectionError
-UNRECONCILED: run=run-1 state=stop_pending reason=cgroup_populated: stop requested, cleanup not con…
-UNRECONCILED: run=run-2 state=stop_pending reason=cgroup_populated: stop requested, cleanup not con…
-STALE: watch_only (start disabled; stop and reads work): refresh failed: run.list answered control_…
+UNRECONCILED: run=run-1 state=stop_pending reason=cgroup_populated: stop requested, cleanup not
+  confirmed
+UNRECONCILED: run=run-2 state=stop_pending reason=cgroup_populated: stop requested, cleanup not
+  confirmed
+STALE: watch_only (start disabled; stop and reads work): refresh failed: run.list answered
+  control_api_unavailable; snapshot older than 10.0s
 UNCERTAIN: stop not confirmed for run=run-1: reason=cgroup_populated; run may still be running
 runs:
 > run-1 state=stop_pending engine=codex tenant=t1 attached
@@ -108,9 +111,6 @@ runs:
 -- output run=run-1 (untrusted engine text, display only) --
 │ engine says ⟦OSC 0⟧hi
 │ ⟦OSC 52⟧done
-│
-│
-│
 │
 │
 │
@@ -126,9 +126,12 @@ recursion: j/k select  a attach  r refresh  s stop  : command  q close (runs kee
 Recursion TUI | surface=cli | view=watch_only | runs=2 | control API client
 status=control_api_unavailable method=run.status detail=ConnectionError
 UNAVAILABLE: control API unavailable: ConnectionError
-UNRECONCILED: run=run-1 state=stop_pending reason=cgroup_populated: stop requested, cleanup not con…
-UNRECONCILED: run=run-2 state=stop_pending reason=cgroup_populated: stop requested, cleanup not con…
-STALE: watch_only (start disabled; stop and reads work): refresh failed: run.list answered control_…
+UNRECONCILED: run=run-1 state=stop_pending reason=cgroup_populated: stop requested, cleanup not
+  confirmed
+UNRECONCILED: run=run-2 state=stop_pending reason=cgroup_populated: stop requested, cleanup not
+  confirmed
+STALE: watch_only (start disabled; stop and reads work): refresh failed: run.list answered
+  control_api_unavailable; snapshot older than 10.0s
 UNCERTAIN: stop not confirmed for run=run-1: reason=cgroup_populated; run may still be running
 runs:
 > run-1 state=stop_pending engine=codex tenant=t1 attached
@@ -147,9 +150,6 @@ runs:
 │
 │
 │
-│
-│
-│
 error 4: refused locally: start while watch_only (refresh failed: run.list answered control_api_una…
 stop run=nope: control API answered run_unknown
 recursion: j/k select  a attach  r refresh  s stop  : command  q close (runs keep going)
@@ -157,9 +157,12 @@ recursion: j/k select  a attach  r refresh  s stop  : command  q close (runs kee
 Recursion TUI | surface=cli | view=watch_only | runs=2 | control API client
 status=control_api_unavailable method=run.status detail=ConnectionError
 UNAVAILABLE: control API unavailable: ConnectionError
-UNRECONCILED: run=run-1 state=stop_pending reason=cgroup_populated: stop requested, cleanup not con…
-UNRECONCILED: run=run-2 state=stop_pending reason=cgroup_populated: stop requested, cleanup not con…
-STALE: watch_only (start disabled; stop and reads work): refresh failed: run.list answered control_…
+UNRECONCILED: run=run-1 state=stop_pending reason=cgroup_populated: stop requested, cleanup not
+  confirmed
+UNRECONCILED: run=run-2 state=stop_pending reason=cgroup_populated: stop requested, cleanup not
+  confirmed
+STALE: watch_only (start disabled; stop and reads work): refresh failed: run.list answered
+  control_api_unavailable; snapshot older than 10.0s
 UNCERTAIN: stop not confirmed for run=run-1: reason=cgroup_populated; run may still be running
 runs:
 > run-1 state=stop_pending engine=codex tenant=t1 attached
@@ -168,9 +171,6 @@ runs:
 
 
 -- output run=run-1 (untrusted engine text, display only) --
-│ flood line 487
-│ flood line 488
-│ flood line 489
 │ flood line 490
 │ flood line 491
 │ flood line 492

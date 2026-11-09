@@ -27,7 +27,7 @@ from collections.abc import Callable, Mapping
 
 from recursion_core.tui import protocol as p
 from recursion_core.tui.events import LOG_CAP, Event, EventLog
-from recursion_core.tui.sanitize import OutputSanitizer, field, wrap
+from recursion_core.tui.sanitize import OutputSanitizer, cell_width, field, wrap
 from recursion_core.tui.view import Row, color_enabled
 
 Dispatch = Callable[[str, dict, Callable[[str, dict, dict], None]], None]
@@ -357,7 +357,10 @@ class TuiApp:
         """One full-screen frame of exactly ``self.height`` rows, none wider than ``self.width`` cells.
 
         It first logs any condition edge (one may appear with time alone). Every current condition stays
-        on screen: one row each when they fit, else one row per label naming each subject, else (a
+        on screen, and a condition's text or run id is wrapped onto more rows, never cut at the width:
+        each condition in full when they fit; else one row per label with its subjects (run ids) named
+        whole on the rows below it; else, when even those rows outnumber the terminal's, every label's row
+        with as many names as fit (UNCERTAIN first) and a row saying how many are not named; else (a
         terminal only a few rows tall) one row naming every label. Runs, output, the notice, the header
         and the status row give up their rows first; conditions, the error row and the prompt last."""
 
@@ -370,18 +373,61 @@ class TuiApp:
                 return parts[0]
             return wrap(text, w - 1)[0] + "…" if w > 1 else "…"
 
+        def flow(text: str, style: str | None) -> list[tuple[str, str | None]]:
+            # all of ``text`` on as many rows as it needs, broken at a space when one fits (later rows
+            # indented): a run id is never cut off at the width
+            pad = "  " if w > 2 else ""
+            out, rest = [], text
+            while rest or not out:
+                lead = pad if out else ""
+                chunk = wrap(rest, w - len(lead))[0]
+                if len(chunk) < len(rest) and " " in chunk[1:] and (out or " " in chunk[:chunk.rindex(" ")]):
+                    # (the first row never breaks right after its "LABEL:", so the label keeps its text)
+                    chunk = chunk[:chunk.rindex(" ") + 1]
+                out.append(((lead + chunk).rstrip(" ") or lead + chunk, style))
+                rest = rest[len(chunk):].lstrip(" ")
+            return out
+
+        def names(label: str, found: list[tuple[str, str]]) -> list[tuple[str, str | None, int]]:
+            # each subject (a run id, or "api"/"answer"/"view") whole, packed on indented rows;
+            # the int is how many subjects that row completes, so a cut list can count what it left out
+            packed: list[tuple[str, int]] = []
+            cur, n = "", 0
+            for subject, _ in found:
+                name = field(subject[4:] if subject.startswith("run=") else subject)
+                joined = f"{cur}, {name}" if cur else f"  {name}"
+                if cur and sum(cell_width(c) for c in joined) + 1 > w:  # room for the trailing ","
+                    packed.append((cur + ",", n))
+                    joined, n = f"  {name}", 0
+                cur, n = joined, n + 1
+            packed.append((cur, n))
+            out = []
+            for row, count in packed:
+                part = flow(row, label)
+                out += [(text, style, count if i == len(part) - 1 else 0) for i, (text, style) in enumerate(part)]
+            return out
+
         keyed = list(self.shown.items())
-        detail = [(f"{label}: {text}", label) for (label, _), (_, text) in keyed]
+        detail = [r for (label, _), (_, text) in keyed for r in flow(f"{label}: {text}", label)]
         by_label: dict[str, list[tuple[str, str]]] = {}
         for (label, subject), (_, text) in keyed:
             by_label.setdefault(label, []).append((subject, text))
-        grouped = [(f"{label}: {text}" if len(found) == 1 else
-                    f"{label}: {len(found)} active ({', '.join(field(s) for s, _ in found)}): {found[0][1]}", label)
-                   for label, found in by_label.items()]
+        # one head row per label, then (for several conditions, or any run's) the subjects named in full
+        heads = {label: (f"{label}: {found[0][1]}" if len(found) == 1 else
+                         f"{label}: {len(found)} active, listed below: {found[0][1]}", label)
+                 for label, found in by_label.items()}
+        listed = {label: names(label, found) if len(found) > 1 or found[0][0].startswith("run=") else []
+                  for label, found in by_label.items()}
+        grouped = [row for label in by_label for row in (heads[label], *((t, s) for t, s, _ in listed[label]))]
         summary = [(f"{','.join(by_label)}: {len(keyed)} conditions active (terminal too small for detail; "
                     f"the transcript lists them)", next(iter(by_label), None))]  # labels first: they survive clipping
         fixed = 5  # header, status, error, notice, prompt
+        budget = max(1, h - 2)  # header, status and notice give way; the error row and the prompt stay
         cond = next((tier for tier in (detail, grouped) if tier and len(tier) + fixed <= h), None)
+        if cond is None and keyed and len(grouped) <= budget:
+            cond = grouped
+        if cond is None and keyed and len(by_label) <= budget:
+            cond = self._squeeze(by_label, heads, listed, budget)
         if cond is None:
             cond = summary if keyed else [("conditions: none", None)]
         rem = max(0, h - fixed - len(cond))
@@ -424,6 +470,32 @@ class TuiApp:
         while len(rows) > h:  # a terminal shorter than the layout: drop the least needed row
             rows.remove(max(reversed(rows), key=lambda r: r[0]))
         return [(clip(text), style) for _, text, style in rows]
+
+    @staticmethod
+    def _squeeze(by_label: dict, heads: dict, listed: dict, budget: int) -> list[Row]:
+        """More named subjects than the terminal has rows: every label keeps its head row, and the rows
+        left go to UNCERTAIN first (an unconfirmed Stop), then UNRECONCILED, then the rest. A label that
+        cannot name all its subjects says on screen how many it left out and where to read them."""
+
+        spare = budget - len(by_label)
+        give: dict[str, int] = {}
+        for label in sorted(by_label, key=lambda lb: (lb != p.UNCERTAIN, lb != p.UNRECONCILED)):
+            give[label] = min(len(listed[label]), spare)
+            spare -= give[label]
+        out: list[Row] = []
+        for label in by_label:
+            rows, k = listed[label], give[label]
+            out.append(heads[label])
+            if k >= len(rows):
+                out.extend((text, style) for text, style, _ in rows)
+                continue
+            shown = rows[:k - 1] if k else []
+            out.extend((text, style) for text, style, _ in shown)
+            if k:
+                missing = len(by_label[label]) - sum(n for _, _, n in shown)
+                out.append((f"  … {missing} more not named here (terminal too small; --plain or a larger "
+                            f"terminal names every one)", label))
+        return out
 
     def resize(self, width: int, height: int) -> bool:
         """Take the terminal's current size; True if it changed. No floor: the frame fits any size."""

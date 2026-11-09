@@ -16,9 +16,10 @@ from .errors import (
     PeerRefused,
     PlatformNotSupported,
     RemoteBindRefused,
+    TransportBusy,
     TransportRefused,
 )
-from .handlers import with_ping_health
+from .handlers import Connection, with_ping_health
 from .peercred import PeerCred, get_peer_cred
 from .unix import TransportClient, TransportServer, UnixControlClient, UnixControlServer, refuse_remote_bind
 from .windows import WindowsControlClient, WindowsControlServer
@@ -43,12 +44,14 @@ def create_client(path: object, *, platform: str | None = None, **kwargs: Any) -
 
 
 __all__ = [
+    "Connection",
     "FrameError",
     "InsecureSocketPath",
     "PeerCred",
     "PeerRefused",
     "PlatformNotSupported",
     "RemoteBindRefused",
+    "TransportBusy",
     "TransportClient",
     "TransportRefused",
     "TransportServer",

@@ -37,7 +37,7 @@ class _Recorder:
         self.lock = threading.Lock()
         self.seen: list[dict] = []
 
-    def __call__(self, message: dict) -> dict:
+    def __call__(self, message: dict, conn: ct.Connection | None = None) -> dict:
         with self.lock:
             self.seen.append(message)
         if message.get("op") == "stop":
@@ -222,7 +222,7 @@ class RoundTripTests(_TmpCase):
         self.assertEqual(srv.refused, [])
 
     def test_handler_exception_becomes_internal_error_without_detail(self) -> None:
-        def boom(message: dict) -> dict:
+        def boom(message: dict, conn: ct.Connection) -> dict:
             raise RuntimeError("secret detail")
 
         srv = self.server(boom)
@@ -286,6 +286,31 @@ class RoundTripTests(_TmpCase):
             framing.encode_frame(["not", "object"])  # type: ignore[arg-type]
 
 
+class FrameDeadlineTests(unittest.TestCase):
+    def test_read_frame_deadline_bounds_the_whole_frame_not_each_recv(self) -> None:
+        a, b = socket.socketpair()
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+        frame = framing.encode_frame({"op": "ping", "pad": "x" * 64})
+        stop = threading.Event()
+        self.addCleanup(stop.set)
+
+        def drip() -> None:
+            for byte in frame:
+                if stop.wait(0.05):
+                    return
+                try:
+                    b.sendall(bytes([byte]))
+                except OSError:
+                    return
+
+        threading.Thread(target=drip, daemon=True).start()
+        started = time.monotonic()
+        with self.assertRaises(TimeoutError):
+            framing.read_frame(a, deadline=started + 0.4)
+        self.assertLess(time.monotonic() - started, 2.0)
+
+
 def _wait_for(predicate, timeout_s: float = 5.0) -> bool:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -311,7 +336,7 @@ class ClientResyncTests(_TmpCase):
         release = threading.Event()
         self.addCleanup(release.set)
 
-        def slow_stop(message: dict) -> dict:
+        def slow_stop(message: dict, conn: ct.Connection) -> dict:
             if message.get("op") == "stop":
                 release.wait(1.5)
                 return {"ok": True, "op": "stop", "state": "stopped"}
@@ -331,7 +356,7 @@ class ClientResyncTests(_TmpCase):
             self.assertEqual(fresh.request({"op": "ping", "id": "p2"}), {"ok": True, "op": "pong", "id": "p2"})
 
     def test_reply_with_another_id_is_refused_and_closes_the_client(self) -> None:
-        srv = self.server(lambda message: {"ok": True, "op": "stop", "state": "stopped", "id": "s1"})
+        srv = self.server(lambda message, conn: {"ok": True, "op": "stop", "state": "stopped", "id": "s1"})
         client = UnixControlClient(srv.path)
         self.addCleanup(client.close)
         with self.assertRaises(ct.FrameError) as caught:
@@ -341,7 +366,7 @@ class ClientResyncTests(_TmpCase):
             client.request({"op": "ping", "id": "p2"})
 
     def test_reply_missing_the_request_id_is_refused(self) -> None:
-        def strip_id(message: dict) -> dict:
+        def strip_id(message: dict, conn: ct.Connection) -> dict:
             return {"ok": True, "op": "pong", "id": None}
 
         srv = self.server(strip_id)
@@ -367,7 +392,10 @@ class ClientResyncTests(_TmpCase):
                 framing.read_frame(conn)
                 conn.sendall(framing.HEADER.pack(len(body)) + body[:10])
                 done.wait(2.0)
-                conn.sendall(body[10:])
+                try:
+                    conn.sendall(body[10:])
+                except BrokenPipeError:  # the client already gave up, which is the point
+                    pass
                 done.wait(2.0)
 
         threading.Thread(target=half_server, daemon=True).start()
@@ -380,10 +408,50 @@ class ClientResyncTests(_TmpCase):
 
 
 @unittest.skipUnless(LINUX, "Linux is the tested path")
+class ConnectionContextTests(_TmpCase):
+    """The handler learns who is on the other end, so the layer above can scope (D3, I-42)."""
+
+    def test_handler_gets_peer_credentials_and_a_per_connection_context(self) -> None:
+        seen: list[tuple[int, ct.PeerCred, int]] = []
+
+        def handler(message: dict, conn: ct.Connection) -> dict:
+            conn.state["n"] = conn.state.get("n", 0) + 1
+            seen.append((conn.conn_id, conn.peer, conn.state["n"]))
+            return {"ok": True}
+
+        srv = self.server(handler)
+        with UnixControlClient(srv.path) as first, UnixControlClient(srv.path) as second:
+            first.request({"op": "a"})
+            first.request({"op": "b"})
+            second.request({"op": "c"})
+        self.assertEqual(len(seen), 3)
+        (id_a, peer_a, n_a), (id_b, _, n_b), (id_c, peer_c, n_c) = seen
+        self.assertEqual(id_a, id_b)
+        self.assertNotEqual(id_a, id_c)
+        self.assertEqual((n_a, n_b, n_c), (1, 2, 1))  # state is per connection
+        for peer in (peer_a, peer_c):
+            self.assertEqual(peer.uid, os.geteuid())
+            self.assertEqual(peer.pid, os.getpid())
+
+    def test_injected_peer_cred_is_what_the_handler_sees(self) -> None:
+        engine = PeerCred(pid=4242, uid=os.geteuid(), gid=0)
+        seen: list[ct.PeerCred] = []
+
+        def handler(message: dict, conn: ct.Connection) -> dict:
+            seen.append(conn.peer)
+            return {"ok": True}
+
+        srv = self.server(handler, peer_cred=lambda _s: engine)
+        with UnixControlClient(srv.path) as client:
+            client.request({"op": "approve"})
+        self.assertEqual(seen, [engine])
+
+
+@unittest.skipUnless(LINUX, "Linux is the tested path")
 class ConnectionBoundTests(_TmpCase):
     """The connection cap and idle timeout are the transport's flood bounds (CX-026)."""
 
-    def test_connection_over_the_cap_gets_no_frame_and_is_counted(self) -> None:
+    def test_connection_over_the_cap_gets_a_typed_busy_frame_and_is_counted(self) -> None:
         recorder = _Recorder()
         srv = self.server(ct.with_ping_health(recorder), max_connections=1)
         holder = UnixControlClient(srv.path)
@@ -395,10 +463,13 @@ class ConnectionBoundTests(_TmpCase):
             raw.connect(srv.path)
             try:
                 raw.sendall(framing.encode_frame({"op": "stop", "run_id": "r1"}))
-                reply = raw.recv(4096)
             except (ConnectionResetError, BrokenPipeError):
-                reply = b""
-        self.assertEqual(reply, b"")
+                pass
+            reply = framing.read_frame(raw)
+        self.assertEqual(
+            reply,
+            {"ok": False, "error": {"code": "busy", "layer": "transport", "delivered": False, "retryable": True}},
+        )
         self.assertTrue(_wait_for(lambda: srv.refused == ["max_connections"]), srv.refused)
         self.assertEqual(srv.accepted, 1)
         self.assertEqual(recorder.seen, [])
@@ -406,6 +477,77 @@ class ConnectionBoundTests(_TmpCase):
         self.assertEqual(holder.request({"op": "ping"})["op"], "pong")
         holder.close()
         self.assertTrue(_wait_for(lambda: _new_peer_served(srv.path)))
+
+    def test_stop_with_every_slot_held_gets_a_typed_refusal_not_a_silent_close(self) -> None:
+        """S6/D3: a Stop the server cannot take must come back as 'not delivered', typed."""
+        recorder = _Recorder()
+        srv = self.server(ct.with_ping_health(recorder), max_connections=2)
+        holders = [UnixControlClient(srv.path) for _ in range(2)]
+        for holder in holders:
+            self.addCleanup(holder.close)
+            self.assertEqual(holder.request({"op": "ping"})["op"], "pong")
+        for _ in range(5):  # either race (busy read before or after our write) gives the same answer
+            with UnixControlClient(srv.path) as client:
+                with self.assertRaises(ct.TransportBusy) as caught:
+                    client.request({"op": "stop", "run_id": "r1", "id": "s1"})
+                self.assertIsInstance(caught.exception, ConnectionError)
+                self.assertNotIsInstance(caught.exception, ct.PeerRefused)
+                with self.assertRaises(ConnectionError):
+                    client.request({"op": "ping"})
+        self.assertEqual(recorder.seen, [])
+        holders[0].close()
+        replies: list[dict] = []
+
+        def stop_delivered() -> bool:
+            try:
+                with UnixControlClient(srv.path) as client:
+                    replies.append(client.request({"op": "stop", "run_id": "r1", "id": "s2"}))
+                    return True
+            except ct.TransportBusy:  # the freed slot is released just after the close
+                return False
+
+        self.assertTrue(_wait_for(stop_delivered))
+        self.assertEqual(replies[-1]["state"], "stop_requested")
+
+    def test_foreign_uid_still_gets_no_frame_even_when_full(self) -> None:
+        srv = self.server(max_connections=1, peer_cred=_foreign_uid)
+        raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        with raw:
+            raw.settimeout(5)
+            raw.connect(srv.path)
+            try:
+                reply = raw.recv(4096)
+            except ConnectionResetError:
+                reply = b""
+        self.assertEqual(reply, b"")
+
+    def test_peer_dripping_a_byte_at_a_time_is_dropped_at_the_frame_deadline(self) -> None:
+        srv = self.server(max_connections=1, idle_timeout_s=0.5)
+        frame = framing.encode_frame({"op": "ping", "pad": "x" * 64})
+        drip = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        with drip:
+            drip.settimeout(5)
+            drip.connect(srv.path)
+            started = time.monotonic()
+            closed_at = None
+            for byte in frame:  # each gap is well under the deadline; the whole frame is not
+                try:
+                    drip.sendall(bytes([byte]))
+                except (BrokenPipeError, ConnectionResetError):
+                    closed_at = time.monotonic()
+                    break
+                time.sleep(0.1)
+            if closed_at is None:
+                self.fail("server kept a byte-dripping peer past the frame deadline")
+            self.assertLess(closed_at - started, 3.0)
+        self.assertTrue(_wait_for(lambda: _new_peer_served(srv.path)))
+
+    def test_busy_client_between_frames_keeps_its_slot_within_the_deadline(self) -> None:
+        srv = self.server(idle_timeout_s=0.6)
+        with UnixControlClient(srv.path) as client:
+            for _ in range(4):  # 4 x 0.3 s > one deadline: the clock restarts per request
+                time.sleep(0.3)
+                self.assertEqual(client.request({"op": "ping"})["op"], "pong")
 
     def test_idle_peer_is_dropped_and_gives_its_slot_back(self) -> None:
         srv = self.server(max_connections=1, idle_timeout_s=0.3)

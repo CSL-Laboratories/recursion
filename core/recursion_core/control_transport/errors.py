@@ -29,3 +29,11 @@ class FrameError(TransportRefused, ValueError):
 
 class PlatformNotSupported(TransportRefused, NotImplementedError):
     """The transport has no tested implementation on this platform (Windows: F40)."""
+
+
+class TransportBusy(TransportRefused, ConnectionError):
+    """The server was at its connection cap and sent a typed ``busy`` frame.
+
+    The request was not delivered: no handler saw it. A surface can report a Stop sent
+    into this as not delivered (S6 "pending"), never as stopped.
+    """

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import socket
 import struct
+import time
 from typing import Any
 
 from .errors import FrameError
@@ -37,11 +38,20 @@ def decode_body(body: bytes) -> dict[str, Any]:
     return message
 
 
-def _recv_exact(sock: socket.socket, n: int) -> bytes | None:
-    """Read exactly ``n`` bytes; ``None`` on a clean close before the first byte."""
+def _recv_exact(sock: socket.socket, n: int, deadline: float | None = None) -> bytes | None:
+    """Read exactly ``n`` bytes; ``None`` on a clean close before the first byte.
+
+    With ``deadline`` (a ``time.monotonic()`` value) the whole read must finish by then:
+    a peer sending one byte at a time cannot reset the clock on every ``recv``.
+    """
     chunks: list[bytes] = []
     got = 0
     while got < n:
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("frame_deadline")
+            sock.settimeout(remaining)
         chunk = sock.recv(n - got)
         if not chunk:
             if got == 0:
@@ -52,15 +62,20 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes | None:
     return b"".join(chunks)
 
 
-def read_frame(sock: socket.socket, *, max_bytes: int = MAX_FRAME_BYTES) -> dict[str, Any] | None:
-    """Read one frame; ``None`` when the peer closed cleanly between frames."""
-    header = _recv_exact(sock, HEADER.size)
+def read_frame(
+    sock: socket.socket, *, max_bytes: int = MAX_FRAME_BYTES, deadline: float | None = None
+) -> dict[str, Any] | None:
+    """Read one frame; ``None`` when the peer closed cleanly between frames.
+
+    ``deadline`` bounds the whole frame, header and body together (``TimeoutError``).
+    """
+    header = _recv_exact(sock, HEADER.size, deadline)
     if header is None:
         return None
     (length,) = HEADER.unpack(header)
     if length > max_bytes:
         raise FrameError("frame_too_large")
-    body = _recv_exact(sock, length)
+    body = _recv_exact(sock, length, deadline)
     if body is None:
         raise FrameError("frame_truncated")
     return decode_body(body)

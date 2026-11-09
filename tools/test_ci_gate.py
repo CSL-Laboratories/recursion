@@ -239,6 +239,68 @@ class LightweightControlTests(unittest.TestCase):
         self.assertTrue(ci_gate.is_gate_path(paths[1]))
 
 
+class CoreGateTests(unittest.TestCase):
+    """CSL-795: core/ tests get core/ on PYTHONPATH, and compileall covers core/."""
+
+    def setUp(self) -> None:
+        self.repo = Path(tempfile.mkdtemp(prefix="ci-gate-core-"))
+        self.addCleanup(shutil.rmtree, self.repo, ignore_errors=True)
+
+    def run_env(self, rel: str, pythonpath: str | None) -> dict[str, str] | None:
+        write(self.repo / rel, "x = 1\n")
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        if pythonpath is not None:
+            env["PYTHONPATH"] = pythonpath
+        done = subprocess.CompletedProcess([], 0)
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
+            ci_gate.subprocess, "run", return_value=done
+        ) as run:
+            ci_gate.run_test_file(rel, root=self.repo)
+        return run.call_args.kwargs["env"]
+
+    def test_core_test_gets_absolute_core_first_on_pythonpath(self) -> None:
+        core = str((self.repo / "core").resolve())
+        env = self.run_env("core/recursion_core/tests/test_a.py", None)
+        self.assertEqual(env["PYTHONPATH"], core)
+        env = self.run_env("core/recursion_core/tests/test_a.py", "/opt/extra")
+        self.assertEqual(env["PYTHONPATH"], os.pathsep.join((core, "/opt/extra")))
+
+    def test_non_core_tests_keep_the_inherited_environment(self) -> None:
+        for rel in ("tools/test_a.py", "core_extras/test_a.py", "scripts/core/test_a.py"):
+            with self.subTest(rel=rel):
+                self.assertIsNone(self.run_env(rel, "/opt/extra"))
+
+    def test_core_test_imports_its_package_when_run(self) -> None:
+        write(self.repo / "core" / "pkg_795" / "__init__.py", "VALUE = 795\n")
+        write(
+            self.repo / "core" / "pkg_795" / "tests" / "test_import.py",
+            "import unittest\n"
+            "import pkg_795\n"
+            "class T(unittest.TestCase):\n"
+            "    def test_value(self):\n"
+            "        self.assertEqual(pkg_795.VALUE, 795)\n",
+        )
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            ci_gate.run_test_file("core/pkg_795/tests/test_import.py", root=self.repo)
+
+    def test_byte_compile_targets_core(self) -> None:
+        (self.repo / "core").mkdir()
+        (self.repo / "tools").mkdir()
+        done = subprocess.CompletedProcess([], 0)
+        with mock.patch.object(ci_gate, "ROOT", self.repo), mock.patch.object(
+            ci_gate.subprocess, "run", return_value=done
+        ) as run:
+            ci_gate.byte_compile()
+        self.assertEqual(run.call_args.args[0][-2:], ["tools", "core"])
+
+    def test_byte_compile_fails_on_core_syntax_error(self) -> None:
+        write(self.repo / "core" / "recursion_core" / "broken.py", "def broken(:\n")
+        with mock.patch.object(ci_gate, "ROOT", self.repo), self.assertRaises(SystemExit) as raised:
+            ci_gate.byte_compile()
+        self.assertEqual(str(raised.exception), "byte-compile failed")
+
+
 class TestInventoryTests(unittest.TestCase):
     def test_repo_test_files_are_run_or_excluded(self) -> None:
         run = ci_gate.assert_tests_accounted()
@@ -301,6 +363,28 @@ class TestInventoryTests(unittest.TestCase):
             discovered = ci_gate.discover_all_test_files(repo)
             self.assertIn("tools/test_new.py", globbed)
             self.assertIn("tools/test_new.py", discovered)
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
+
+    def test_core_test_is_globbed_but_venv_tests_are_not(self) -> None:
+        repo = Path(tempfile.mkdtemp(prefix="ci-gate-disc-"))
+        try:
+            write(repo / "core" / "recursion_core" / "tests" / "test_a.py", "x = 1\n")
+            venv_test = "core/.venv/lib/python3.13/site-packages/widget/test_widget.py"
+            write(repo / venv_test, "x = 1\n")
+            globbed = ci_gate.glob_suite_tests(repo)
+            discovered = ci_gate.discover_all_test_files(repo)
+            self.assertIn("core/recursion_core/tests/test_a.py", globbed)
+            self.assertNotIn(venv_test, globbed)
+            self.assertNotIn(venv_test, discovered)
+            run, unaccounted, _, _ = ci_gate.classify_tests(
+                discovered=discovered,
+                globbed=globbed,
+                exclude=set(),
+                required=set(),
+            )
+            self.assertEqual(run, ["core/recursion_core/tests/test_a.py"])
+            self.assertEqual(unaccounted, [])
         finally:
             shutil.rmtree(repo, ignore_errors=True)
 

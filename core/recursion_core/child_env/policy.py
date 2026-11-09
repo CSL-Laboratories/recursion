@@ -19,7 +19,8 @@ replacement. It builds the child environment from nothing:
   ``all_proxy`` and ``XDG_RUNTIME_DIR`` for both engines, and Claude Code's mTLS and cert-store
   names (``CLAUDE_CODE_CLIENT_CERT``, ``_CLIENT_KEY``, ``_CLIENT_KEY_PASSPHRASE``,
   ``CLAUDE_CODE_CERT_STORE``, ``network-config.md:64-105``) for the Claude profile, each under
-  the same value rules as its peers;
+  the same value rules as its peers. An override cannot set the client private key or its
+  passphrase; the parent's own values are still carried;
 * the user's own ``CLAUDE_CODE_OAUTH_TOKEN`` passes through to a Claude child unchanged
   (PRODUCT.md 055cc7a5 section 3.3, Nov 8 fleet correction: nothing removes a built-in sign-in
   method from every run). It is never checked, logged or settable by an override; absent in the
@@ -137,9 +138,11 @@ NO_PROXY_NAMES = ("NO_PROXY", "no_proxy")
 # N5i: the names the engines run by bare name. A link for a name outside this list is
 # not checked (envpath record, cell path_tool_link_py); PATH_TOOLS=None checks every entry.
 PATH_TOOLS: tuple[str, ...] | None = ("bash", "zsh", "sh", "git", "rg", "node", "sleep")
-# A name an override may never set, whatever the profile (the Nov 5 tree's _DENIED, plus PASSPHRASE and
-# CLIENT_KEY for the mTLS private key and its passphrase: the operator's own are carried, never replaced).
-_DENIED = re.compile(r"(API_?KEY|SECRET|TOKEN|PASSWORD|PASSPHRASE|CLIENT_KEY|BASE_URL|_PAT$|USE_BEDROCK|USE_VERTEX|USE_FOUNDRY)", re.IGNORECASE)
+# A name an override may never set, whatever the profile (the Nov 5 tree's _DENIED).
+_DENIED = re.compile(r"(API_?KEY|SECRET|TOKEN|PASSWORD|PASSPHRASE|BASE_URL|_PAT$|USE_BEDROCK|USE_VERTEX|USE_FOUNDRY)", re.IGNORECASE)
+# Private-key paths the pattern misses. An override must not point the child at a different key
+# (Devin r4510867706). The parent's own value still meets the file rule.
+_OVERRIDE_DENIED_NAMES = frozenset({"CLAUDE_CODE_CLIENT_KEY"})
 # Paths that name a different file in the child than in this process (its own cwd, fds, root).
 _PERSPECTIVE = re.compile(r"^/(?:proc|dev/fd|dev/std(?:in|out|err))(?:/|$)")
 _PROXY_URL = re.compile(
@@ -261,7 +264,8 @@ def build_child_env(
     for name, value in (overrides or {}).items():
         if not isinstance(name, str) or not isinstance(value, str) or not name or "=" in name or "\0" in name + value:
             raise EnvRefused(None, "override_malformed")
-        if _DENIED.search(name) or name in profile.scrub or name in profile.passthrough or name in ("HOME", "PATH"):
+        if (_DENIED.search(name) or name in _OVERRIDE_DENIED_NAMES or name in profile.scrub
+                or name in profile.passthrough or name in ("HOME", "PATH")):
             raise EnvRefused(name, "override_denied")
         if name not in profile.allowed:
             raise EnvRefused(name, "override_not_allowed")
@@ -474,21 +478,29 @@ def _existing_ancestor(path: str) -> str:
     return path
 
 
+def _lexical_dir(path: str) -> str:
+    """The directory entry ``lstat`` must see: trailing slashes and ``.`` removed, ``..`` kept.
+
+    ``lstat`` follows a final symlink when the path ends in a slash or a ``.`` component
+    (Devin r4508023438), so ``link`` and ``link/`` have to name the same entry. ``Path``
+    does that lexically and does not collapse ``..``, which would drop an intermediate symlink.
+    A path that still ends in ``..`` names no entry of its own; ``_private_dir`` refuses it.
+    """
+
+    return str(Path(path))
+
+
 def _private_dir(path: str | None) -> bool:
     if not isinstance(path, str) or not os.path.isabs(path):
         return False
-    real, missing, cause = _resolve(path)
+    entry = _lexical_dir(path)  # the home itself may not be a link, whatever the trailing spelling
+    if os.path.basename(entry) == "..":  # link/sub/.. names the link's target without naming an entry: refused
+        return False
+    real, missing, cause = _resolve(entry)
     if cause is not None or missing or real is None:
         return False
-    # lstat follows a final link when the path ends in a separator or "/." (Devin r4508023438), so the no-link
-    # rule is asked of the path cut back to its last named entry. A home ending in ".." names no entry: refused.
-    parts = path.split(os.sep)
-    while parts and parts[-1] in ("", "."):
-        parts.pop()
-    if parts and parts[-1] == "..":
-        return False
     try:
-        if not stat.S_ISDIR(os.lstat(os.sep.join(parts) or os.sep).st_mode):  # the home itself may not be a link
+        if not stat.S_ISDIR(os.lstat(entry).st_mode):
             return False
         st = os.lstat(real)
     except OSError:

@@ -157,23 +157,35 @@ class ProfileTests(unittest.TestCase):
         env = build_child_env("claude_code", home=home, parent={"PATH": "/usr/bin", "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE": FAKE})
         self.assertEqual(FAKE, env["CLAUDE_CODE_CLIENT_KEY_PASSPHRASE"])  # the operator's own value is carried
 
-    def test_client_private_key_cannot_be_set_by_override(self) -> None:
-        # Devin r4510867706: an override could point the Claude child at another readable private key.
-        home = _home(self)
-        own, other = Path(home) / "own-key.pem", Path(home) / "other-key.pem"
-        for key in (own, other):
-            key.write_text("not a real key\n", encoding="ascii")
-            key.chmod(0o600)
-        for parent in ({"PATH": "/usr/bin"}, {"PATH": "/usr/bin", "CLAUDE_CODE_CLIENT_KEY": str(own)}):
-            with self.subTest(parent=sorted(parent)), self.assertRaises(EnvRefused) as caught:
-                build_child_env("claude_code", home=home, parent=parent, overrides={"CLAUDE_CODE_CLIENT_KEY": str(other)})
-            self.assertEqual(("CLAUDE_CODE_CLIENT_KEY", "override_denied"), (caught.exception.name, caught.exception.cause))
-        # The operator's own key path is still carried, under the file rule.
-        env = build_child_env("claude_code", home=home, parent={"PATH": "/usr/bin", "CLAUDE_CODE_CLIENT_KEY": str(own)})
-        self.assertEqual(str(own), env["CLAUDE_CODE_CLIENT_KEY"])
+    def test_client_private_key_cannot_be_replaced_by_an_override(self) -> None:
+        """Devin r4510867706: CLAUDE_CODE_CLIENT_KEY is a credential path the denylist pattern misses."""
+
+        home = Path(_home(self))
+        parent_key = home / "parent-key.pem"
+        other_key = home / "other-key.pem"
+        for path in (parent_key, other_key):
+            path.write_text("not a real key\n", encoding="ascii")
+            path.chmod(0o600)
         with self.assertRaises(EnvRefused) as caught:
-            build_child_env("claude_code", home=home, parent={"PATH": "/usr/bin", "CLAUDE_CODE_CLIENT_KEY": "relative-key.pem"})
-        self.assertEqual(("CLAUDE_CODE_CLIENT_KEY", "value_relative"), (caught.exception.name, caught.exception.cause))
+            build_child_env(
+                "claude_code",
+                home=str(home),
+                parent={"PATH": "/usr/bin", "CLAUDE_CODE_CLIENT_KEY": str(parent_key)},
+                overrides={"CLAUDE_CODE_CLIENT_KEY": str(other_key)},
+            )
+        self.assertEqual(("CLAUDE_CODE_CLIENT_KEY", "override_denied"), (caught.exception.name, caught.exception.cause))
+        env = build_child_env(
+            "claude_code", home=str(home), parent={"PATH": "/usr/bin", "CLAUDE_CODE_CLIENT_KEY": str(parent_key)}
+        )
+        self.assertEqual(str(parent_key), env["CLAUDE_CODE_CLIENT_KEY"])
+        with self.assertRaises(EnvRefused) as caught:
+            build_child_env(
+                "codex",
+                home=str(home),
+                parent={"PATH": "/usr/bin"},
+                overrides={"CLAUDE_CODE_CLIENT_KEY": str(other_key)},
+            )
+        self.assertEqual(("CLAUDE_CODE_CLIENT_KEY", "override_denied"), (caught.exception.name, caught.exception.cause))
 
     def test_claude_code_simple_is_scrubbed_by_name(self) -> None:
         # PRODUCT.md 055cc7a5 section 3.3 names CLAUDE_CODE_SIMPLE in the Claude scrub list (review of 3503f6a6, finding 2).
@@ -313,27 +325,51 @@ class ProfileTests(unittest.TestCase):
             build_child_env("codex", home=str(base / "home-link"), parent={})
         self.assertEqual("home_unsafe", caught.exception.cause)
 
-    def test_a_linked_home_is_refused_in_every_spelling(self) -> None:
-        # Devin r4508023438: lstat follows a final link when the path ends in a separator or "/.".
+    def test_a_linked_home_stays_refused_with_a_trailing_slash_or_dot(self) -> None:
+        """Devin r4508023438: lstat follows link/ and link/., so both spellings must refuse."""
+
+        base = Path(_home(self))
+        real = base / "real-home"
+        real.mkdir(mode=0o700)
+        link = base / "home-link"
+        os.symlink(real, link)
+        for spelling in (str(link), str(link) + "/", str(link) + "/.", str(link) + "/./", str(link) + "//"):
+            with self.subTest(home=spelling), self.assertRaises(EnvRefused) as caught:
+                build_child_env("codex", home=spelling, parent={})
+            self.assertEqual(("HOME", "home_unsafe"), (caught.exception.name, caught.exception.cause))
+        parent_link = base / "parent-link"
+        os.symlink(base, parent_link)
+        accepted = (
+            str(real),
+            str(real) + "/",
+            str(real) + "/.",
+            str(parent_link / "real-home"),
+            str(parent_link / "real-home") + "/",
+            str(parent_link / "real-home") + "/.",
+        )
+        for spelling in accepted:
+            with self.subTest(home=spelling):
+                self.assertEqual(spelling, build_child_env("codex", home=spelling, parent={})["HOME"])
+
+    def test_a_linked_home_is_refused_when_spelled_through_dot_dot(self) -> None:
+        # Review of 58e7081f: link/sub/.. reaches the link's target, and lstat of it sees a directory.
         base = Path(_home(self))
         real_home = base / "real-home"
         real_home.mkdir(mode=0o700)
         (real_home / "sub").mkdir(mode=0o700)
         os.symlink(real_home, base / "home-link")
         link = str(base / "home-link")
-        for home in (link, link + "/", link + "//", link + "/.", link + "/./", link + "/./.", link + "/sub/..",
-                     link + "/sub/../", f"{base}/real-home/../home-link/"):
+        # The last spelling has no link in it: a home ending in ".." is refused whatever it reaches.
+        for home in (link + "/sub/..", link + "/sub/../", link + "/sub/../.", link + "/./sub/..", link + "//sub/..",
+                     f"{base}/real-home/../home-link/", f"{real_home}/sub/.."):
             with self.subTest(home=home[len(str(base)):]), self.assertRaises(EnvRefused) as caught:
                 build_child_env("codex", home=home, parent={})
             self.assertEqual(("HOME", "home_unsafe"), (caught.exception.name, caught.exception.cause))
-        # Control: the directory itself passes in the same spellings, and the child gets HOME as it was given.
-        for home in (str(real_home), f"{real_home}/", f"{real_home}//", f"{real_home}/.", f"{real_home}/./",
-                     f"{base}/home-link/../real-home", f"{real_home}/sub/../../real-home/"):
+        # Control: ".." before the last named entry is fine, and the child gets HOME as it was given.
+        for home in (f"{base}/home-link/../real-home", f"{real_home}/sub/../../real-home/", f"{link}/sub/../sub",
+                     f"{link}/sub/"):
             with self.subTest(home=home[len(str(base)):]):
                 self.assertEqual(home, build_child_env("codex", home=home, parent={})["HOME"])
-        # A link above the home (r4503135764) still passes with a trailing separator.
-        (real_home / "inner").mkdir(mode=0o700)
-        self.assertEqual(f"{link}/inner/", build_child_env("codex", home=f"{link}/inner/", parent={})["HOME"])
 
     def test_validated_env_cannot_be_hand_made(self) -> None:
         with self.assertRaises(TypeError):

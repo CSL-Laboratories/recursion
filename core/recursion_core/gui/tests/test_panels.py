@@ -363,3 +363,83 @@ class PanelTests(GuiHarness):
         for hidden in ("PAPER-ROW-1", "STOCK-ROW-1", "KXDEMO-SECRET", "paper_cash_minor",
                        "paper_open_orders", "100000"):
             self.assertNotIn(hidden, body)
+
+    def test_paper_key_holding_an_object_or_list_shows_on_the_paper_panel(self):
+        # A paper_* key counts as the book whatever it holds. A row under it labelled
+        # with another venue still stays out.
+        payload = {
+            "paper_account": {"cash_minor": 313131, "note": "PAPER-ACCOUNT-NOTE"},
+            "result": {
+                "paper_fills": [{"qty": 474747}, {"venue": "kalshi_demo", "symbol": "FILL-KX-SECRET"}],
+                "stock_limits": {"max_minor": 585858, "by_venue": [{"venue": "kalshi", "cap": 696969}]},
+                "paper_empty": [],
+                "account": {"cash_minor": 808080},
+            },
+        }
+        for declared in ("stock", "paper"):
+            with self.subTest(declared=declared):
+                kept, withheld = filter_venue_rows(payload, declared)
+                self.assertTrue(withheld)
+                self.assertEqual(kept, {
+                    "paper_account": {"cash_minor": 313131, "note": "PAPER-ACCOUNT-NOTE"},
+                    "result": {"paper_fills": [{"qty": 474747}],
+                               "stock_limits": {"max_minor": 585858, "by_venue": []},
+                               "paper_empty": []}})
+                self.mount([{"id": "p", "title": "Paper", "reads": [READS[0]], "venue": declared}])
+                self.api.extra[READS[0]] = payload
+                body = self.request("GET", "/panel", query="id=p")[2]
+                for shown in ("paper_account", "313131", "PAPER-ACCOUNT-NOTE", "474747", "585858",
+                              "Withheld: data not in the paper book"):
+                    self.assertIn(shown, body)
+                for hidden in ("FILL-KX-SECRET", "696969", "808080"):
+                    self.assertNotIn(hidden, body)
+        self.assertEqual(filter_venue_rows({"paper_account": {"cash_minor": 313131}}, "stock"),
+                         ({"paper_account": {"cash_minor": 313131}}, False))
+        self.assertEqual(len(payload["result"]["paper_fills"]), 2)  # the source is not altered
+        # No other panel keeps the book's keys: only its own labelled row comes through.
+        self.assertEqual(filter_venue_rows(payload, "kalshi_demo")[0], {"result": {"paper_fills": [
+            {"venue": "kalshi_demo", "symbol": "FILL-KX-SECRET"}]}})
+        self.assertEqual(filter_venue_rows(payload, "kalshi")[0], {"result": {"stock_limits": {
+            "by_venue": [{"venue": "kalshi", "cap": 696969}]}}})
+
+    def test_errors_and_provenance_labelled_with_another_venue_stay_off_a_venue_panel(self):
+        # Unlabelled response-level errors and provenance show. An entry in them labelled
+        # kalshi_demo does not reach the paper panel; one labelled paper or stock stays.
+        payload = {
+            "errors": [{"code": "ERR-MARKER-515151"}, "ERR-TEXT-525252",
+                       {"venue": "kalshi_demo", "message": "KX-ERR-SECRET"},
+                       {"venue": "paper", "message": "PAPER-ERR-OK"}],
+            "provenance": {"source": "PROV-MARKER-626262",
+                           "inputs": [{"venue": "kalshi_demo", "source": "KX-PROV-SECRET"},
+                                      {"venue": "stock", "source": "STOCK-PROV-OK"},
+                                      {"source": "PROV-INPUT-636363"}]},
+            "result": {"rows": [{"venue": "paper", "symbol": "PAPER-ROW-1"}]},
+        }
+        for declared in ("stock", "paper"):
+            with self.subTest(declared=declared):
+                kept, withheld = filter_venue_rows(payload, declared)
+                self.assertTrue(withheld)
+                self.assertEqual(kept["errors"], [{"code": "ERR-MARKER-515151"}, "ERR-TEXT-525252",
+                                                  {"venue": "paper", "message": "PAPER-ERR-OK"}])
+                self.assertEqual(kept["provenance"], {"source": "PROV-MARKER-626262", "inputs": [
+                    {"venue": "stock", "source": "STOCK-PROV-OK"}, {"source": "PROV-INPUT-636363"}]})
+                self.mount([{"id": "p", "title": "Paper", "reads": [READS[0]], "venue": declared}])
+                self.api.extra[READS[0]] = payload
+                body = self.request("GET", "/panel", query="id=p")[2]
+                for shown in ("ERR-MARKER-515151", "ERR-TEXT-525252", "PAPER-ERR-OK", "PROV-MARKER-626262",
+                              "STOCK-PROV-OK", "PROV-INPUT-636363", "PAPER-ROW-1",
+                              "Withheld: data not in the paper book"):
+                    self.assertIn(shown, body)
+                for hidden in ("KX-ERR-SECRET", "KX-PROV-SECRET"):
+                    self.assertNotIn(hidden, body)
+        self.assertEqual(len(payload["errors"]), 4)  # the source is not altered
+        unlabelled = {"errors": [{"code": "ERR-MARKER-515151"}], "provenance": {"source": "PROV-MARKER-626262"}}
+        for venue in ("stock", "paper", "kalshi_demo"):
+            self.assertEqual(filter_venue_rows(unlabelled, venue), (unlabelled, False))
+        kept, withheld = filter_venue_rows(payload, "kalshi_demo")
+        self.assertTrue(withheld)
+        self.assertEqual(kept["errors"], [{"code": "ERR-MARKER-515151"}, "ERR-TEXT-525252",
+                                          {"venue": "kalshi_demo", "message": "KX-ERR-SECRET"}])
+        self.assertEqual(kept["provenance"]["inputs"], [{"venue": "kalshi_demo", "source": "KX-PROV-SECRET"},
+                                                        {"source": "PROV-INPUT-636363"}])
+        self.assertNotIn("result", kept)

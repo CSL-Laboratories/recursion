@@ -41,7 +41,7 @@ _DROP = object()
 _RESPONSE_LEVEL = ("errors", "provenance")
 # One paper book. O7 v0 labels positions ``stock``; the paper gateway labels orders ``paper``.
 # A panel declaring either id keeps both row labels and both key prefixes. Any other venue
-# matches one id exactly. Same book as Cockpit #318 at 70302970. Display only.
+# matches one id exactly. Display only.
 PAPER_BOOK = frozenset({"paper", "stock"})
 
 
@@ -69,22 +69,40 @@ def filter_venue_rows(value, venue):
     that id. Fails closed: a dict labelled with a venue the panel does not own, and any
     value outside a dict labelled with an owned venue (unlabelled nested dicts, totals,
     scalars), is dropped and ``withheld`` is true. A matching dict is kept, and its nested
-    data inherits that venue unless it declares a different one. A paper-book key is kept:
-    a scalar shows, and a dict or list under it is still filtered, so a foreign row inside
-    ``paper_*`` stays out. Unlabelled containers stay only as the path to kept data.
-    Exception: top-level ``errors`` and ``provenance`` of the response pass through
-    unfiltered unless they are a dict with a ``venue`` label; nested keys with those
-    names get no exception. This is a display filter, not order authorization or an
-    API scope.
+    data inherits that venue unless it declares a different one. A paper-book key is kept
+    with what is under it, scalar or object, as part of the book; a dict under it labelled
+    with another venue still stays out. Unlabelled containers stay only as the path to
+    kept data. Exception: top-level ``errors`` and ``provenance`` of the response show
+    whatever in them is unlabelled or labelled with an owned venue; a dict in them
+    labelled with another venue, at any depth, is withheld. Nested keys with those names
+    get no exception. This is a display filter, not order authorization or an API scope.
     """
     withheld = []
     passed = {}
     if isinstance(value, dict) and "venue" not in value:
-        passed = {key: value[key] for key in _RESPONSE_LEVEL
-                  if key in value and not (isinstance(value[key], dict) and "venue" in value[key])}
-        value = {key: item for key, item in value.items() if key not in passed}
+        owned = _owned_labels(venue)
+        for key in _RESPONSE_LEVEL:
+            if key in value:
+                shown = _without_other_venues(value[key], owned, withheld)
+                if shown is not _DROP:
+                    passed[key] = shown
+        value = {key: item for key, item in value.items() if key not in _RESPONSE_LEVEL}
     kept = _venue_only(value, venue, False, withheld)
     return {**({} if kept is _DROP else kept), **passed}, bool(withheld)
+
+
+def _without_other_venues(value, owned, withheld):
+    """Response-level errors and provenance: drop only dicts labelled with a venue not owned."""
+    if isinstance(value, dict):
+        if "venue" in value and not (isinstance(value["venue"], str) and value["venue"] in owned):
+            withheld.append(value)
+            return _DROP
+        shown = ((key, _without_other_venues(item, owned, withheld)) for key, item in value.items())
+        return {key: item for key, item in shown if item is not _DROP}
+    if isinstance(value, list):
+        shown = (_without_other_venues(item, owned, withheld) for item in value)
+        return [item for item in shown if item is not _DROP]
+    return value
 
 
 def _venue_only(value, venue, scoped, withheld):
@@ -98,15 +116,8 @@ def _venue_only(value, venue, scoped, withheld):
             scoped = True
         out = {}
         for key, item in value.items():
-            if not scoped and _paper_book_key(key, venue):
-                if isinstance(item, (dict, list)):
-                    child = _venue_only(item, venue, False, withheld)
-                    if child is not _DROP:
-                        out[key] = child
-                else:
-                    out[key] = item
-                continue
-            child = _venue_only(item, venue, scoped, withheld)
+            # What sits under a paper_* / stock_* key is the book's own, like a labelled row.
+            child = _venue_only(item, venue, scoped or _paper_book_key(key, venue), withheld)
             if child is not _DROP:
                 out[key] = child
     elif isinstance(value, list):

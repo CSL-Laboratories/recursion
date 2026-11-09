@@ -65,8 +65,11 @@ run's environment changes:
 - `api_key`: the user's own key from custody (`ANTHROPIC_API_KEY`) or their own `apiKeyHelper`
   (`key_source: "api_key_helper"`, no key added); `--bare` is allowed (`route.bare`). The user's
   `CLAUDE_CODE_OAUTH_TOKEN` still passes through; the key outranks it by the engine's own precedence.
-- `passthrough` (cloud providers and any other built-in method the user picks): the env passes through
-  unchanged for that run, and `--bare` is the user's choice there too. `--bare` is refused only on the
+- `passthrough` (a cloud provider or gateway the user picks, `connection.method`: `bedrock`, `vertex`,
+  `foundry` or `gateway`): that method's own variables (names from Claude Code's public docs) pass through
+  unchanged for that run, with the base allowlist and the user's sign-in; nothing else from the daemon's
+  environment does (no other engine's key, no stray `ANTHROPIC_API_KEY`). A method with no listed
+  variables is `launch_refused`. `--bare` is the user's choice there too. `--bare` is refused only on the
   subscription route. No route drops `CLAUDE_CODE_OAUTH_TOKEN`, and the parent env is never changed.
 - The adapter never edits settings or credential files, never sets `DISABLE_LOGIN_COMMAND`, and never
   sets, stores or reads `CLAUDE_CODE_OAUTH_TOKEN`. The binary is `claude` itself; its hash and version are

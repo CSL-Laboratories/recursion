@@ -137,13 +137,39 @@ class ApiKeyAndPassthroughTest(unittest.TestCase):
             req["route"]["connection"]["key_source"] = "api_key_helper"
             self.assertEqual(Harness([]).handle(req)["code"], c.REQUEST_INVALID, (engine, kind))
 
-    def test_cloud_and_other_builtin_methods_pass_through(self) -> None:
-        for method in ("bedrock", "vertex", "foundry", "some-other-builtin"):
+    def test_cloud_methods_pass_only_their_own_variables(self) -> None:
+        # The picked method's variables pass through unchanged for this run; the daemon's other secrets
+        # (another engine's key, a stray ANTHROPIC_API_KEY that would bill the API) never reach it.
+        parent = dict(PARENT, AWS_SECRET_ACCESS_KEY="aws-s", AWS_PROFILE="p", CLOUD_ML_REGION="us-east5",
+                      ANTHROPIC_VERTEX_PROJECT_ID="proj", VERTEX_REGION_CLAUDE_HAIKU_4_5="eu",
+                      ANTHROPIC_FOUNDRY_RESOURCE="res", ANTHROPIC_BASE_URL="https://gw.example", DAEMON_SECRET="d")
+        expected = {
+            "bedrock": {"CLAUDE_CODE_USE_BEDROCK": "1", "AWS_REGION": "us-east-1", "AWS_SECRET_ACCESS_KEY": "aws-s",
+                        "AWS_PROFILE": "p"},
+            "vertex": {"CLAUDE_CODE_USE_VERTEX": "1", "CLOUD_ML_REGION": "us-east5",
+                       "ANTHROPIC_VERTEX_PROJECT_ID": "proj", "VERTEX_REGION_CLAUDE_HAIKU_4_5": "eu"},
+            "foundry": {"CLAUDE_CODE_USE_FOUNDRY": "1", "ANTHROPIC_FOUNDRY_RESOURCE": "res"},
+            "gateway": {"ANTHROPIC_BASE_URL": "https://gw.example", "ANTHROPIC_AUTH_TOKEN": "parent-bearer"},
+        }
+        base = {"PATH": "/usr/bin", "HOME": "/home/op", "LANG": "C.UTF-8",
+                "CLAUDE_CODE_OAUTH_TOKEN": "users-own-token", "CLAUDE_CONFIG_DIR": "/home/op/.claude-alt"}
+        for method, own in expected.items():
             h = Harness([claude_ok()])
+            h.service._adapters["claude_code"]._parent_env = dict(parent)
             req = request(kind="passthrough", conn_id=f"user-{method}")
             req["route"]["connection"]["method"] = method
             self.assertEqual(h.handle(req)["status"], "ok", method)
-            self.assertEqual(h.launcher.calls[0]["env"], PARENT)  # this run, unchanged
+            env = h.launcher.calls[0]["env"]
+            self.assertEqual(env, {**base, **own}, method)  # this run: the method's own names, values unchanged
+            for name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CODEX_ACCESS_TOKEN", "DAEMON_SECRET"):
+                self.assertNotIn(name, env, (method, name))
+
+    def test_unlisted_passthrough_method_refuses_before_launch(self) -> None:
+        h = Harness([])
+        req = request(kind="passthrough", conn_id="user-x")
+        req["route"]["connection"]["method"] = "some-other-builtin"
+        self.assertEqual(h.handle(req)["code"], c.LAUNCH_REFUSED)
+        self.assertEqual(h.launcher.calls, [])
 
     def test_passthrough_needs_method_and_is_claude_code_only(self) -> None:
         self.assertEqual(Harness([]).handle(request(kind="passthrough"))["code"], c.REQUEST_INVALID)

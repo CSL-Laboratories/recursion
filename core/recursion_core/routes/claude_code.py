@@ -53,6 +53,23 @@ API_KEY_DROP_ENV = ("ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_C
 # parent" (its own key comes from custody instead).
 CLAUDE_CREDENTIAL_ENV = API_KEY_DROP_ENV + ("ANTHROPIC_API_KEY",)
 API_KEY_HELPER_STATES = ("absent", "present")
+# Passthrough route: the method the user picked gets its own variables for this run, and nothing else from
+# the daemon's environment (no other engine's key, no stray ANTHROPIC_API_KEY that would move the run to the
+# API meter; PRODUCT.md 3.4 S8, 11.5). Names are from Claude Code's public docs (code.claude.com/docs/en/
+# amazon-bedrock, google-vertex-ai, microsoft-foundry, llm-gateway; retrieved 2026-11-09), not from engine
+# source. A method not listed here is refused, never widened to the whole environment.
+PASSTHROUGH_METHOD_ENV = {
+    "bedrock": ("CLAUDE_CODE_USE_BEDROCK", "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_PROFILE", "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_BEARER_TOKEN_BEDROCK", "AWS_CONFIG_FILE",
+                "AWS_SHARED_CREDENTIALS_FILE", "ANTHROPIC_BEDROCK_BASE_URL", "ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION"),
+    "vertex": ("CLAUDE_CODE_USE_VERTEX", "CLOUD_ML_REGION", "ANTHROPIC_VERTEX_PROJECT_ID", "ANTHROPIC_VERTEX_BASE_URL",
+               "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_PROJECT", "GCLOUD_PROJECT"),
+    "foundry": ("CLAUDE_CODE_USE_FOUNDRY", "ANTHROPIC_FOUNDRY_API_KEY", "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
+                "ANTHROPIC_FOUNDRY_RESOURCE", "ANTHROPIC_FOUNDRY_BASE_URL"),
+    "gateway": ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS"),
+}
+# Per-model Vertex region overrides (VERTEX_REGION_CLAUDE_<model>) are a documented name family.
+PASSTHROUGH_METHOD_PREFIX = {"vertex": ("VERTEX_REGION_CLAUDE_",)}
 
 
 class ClaudeCodeAdapter(RouteAdapter):
@@ -94,9 +111,15 @@ class ClaudeCodeAdapter(RouteAdapter):
             cred = self.credential(request, ("ANTHROPIC_API_KEY",))
             return child_env(self._parent_env, extra_names=USER_KEEP_ENV, never=never, credential=cred)
         if kind == "passthrough":
-            # Cloud providers (Bedrock, Vertex, Foundry) and any other built-in method the user picked:
-            # the user's environment passes through for this run, unchanged.
-            return dict(self._parent_env)
+            # Cloud providers (Bedrock, Vertex, Foundry) or a gateway the user picked: that method's own
+            # variables pass through unchanged for this run, with the user's own sign-in and config location.
+            method = conn.get("method")
+            names = PASSTHROUGH_METHOD_ENV.get(method) if isinstance(method, str) else None
+            if names is None:
+                raise c.RouteError(c.LAUNCH_REFUSED, f"passthrough method {scalar(method)} has no listed variables")
+            prefixes = PASSTHROUGH_METHOD_PREFIX.get(method, ())
+            names += tuple(sorted(n for n in self._parent_env if prefixes and n.startswith(prefixes)))
+            return child_env(self._parent_env, extra_names=USER_KEEP_ENV + names)
         raise c.RouteError(c.LAUNCH_REFUSED, f"connection kind {kind} not supported for claude_code")
 
     @staticmethod

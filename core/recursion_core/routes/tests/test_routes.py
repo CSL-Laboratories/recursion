@@ -20,7 +20,8 @@ PARENT_ENV = {
     "OPENAI_API_KEY": "parent-openai", "CODEX_API_KEY": "parent-codex", "CODEX_ACCESS_TOKEN": "parent-access",
     "CODEX_HOME": "/home/op/.codex-route",
 }
-KEYS = {("key-1", "OPENAI_API_KEY"): "route-openai", ("key-2", "ANTHROPIC_API_KEY"): "route-anthropic"}
+KEYS = {("key-1", "OPENAI_API_KEY"): "route-openai", ("key-2", "ANTHROPIC_API_KEY"): "route-anthropic",
+        ("key-3", "CODEX_ACCESS_TOKEN"): "custody-access-token"}
 
 
 def credentials(conn_id: str, name: str) -> str:
@@ -242,6 +243,13 @@ class CodexTest(unittest.TestCase):
         self.assertEqual(env["OPENAI_API_KEY"], "route-openai")
         self.assertNotIn("CODEX_API_KEY", env)
         self.assertNotIn("CODEX_ACCESS_TOKEN", env)
+
+    def test_codex_access_token_is_never_selectable(self) -> None:
+        # A sign-in token, not an API key: Codex uses its own CLI login only (Nov 8; 3.3, O61). Even when
+        # custody would answer for it, the route refuses before asking and nothing launches.
+        h, res = self.codex([], kind="api_key", conn_id="key-3", credential_env="CODEX_ACCESS_TOKEN")
+        self.assertEqual(res["code"], c.LAUNCH_REFUSED)
+        self.assertEqual(h.launcher.calls, [])
 
     def test_unselectable_key_refuses_before_launch(self) -> None:
         h, res = self.codex([], kind="api_key", conn_id="key-1", credential_env="SECRET_THING")

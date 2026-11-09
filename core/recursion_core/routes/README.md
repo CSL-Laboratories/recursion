@@ -41,11 +41,16 @@ engine), 11.2 (breaker, plan limits), Q12 (Claude subscription only inside Claud
   uncalibrated defaults (11.2, B-10).
 - B11 (CSL-783 F70, CSL-727 F19): the Codex stdio worker is launched as
   `codex -c check_for_update_on_startup=false app-server` and the adapter starts nothing else; a test runs
-  48 turns over 72 fake minutes and checks every spawn. `daemon_config()` holds
+  48 turns over 72 fake minutes and checks every spawn the adapter makes. That test cannot see what a
+  real `codex` process spawns itself; the override's key name was read in Codex source (below), and
+  a process-tree check on a real binary is still open. `daemon_config()` holds
   `updater.autoUpdateEnabled = false` and `check_daemon_config()` refuses anything else.
 - Child env: Codex never inherits `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN` or `OPENAI_API_KEY`; a Codex
   subscription run uses Codex's own CLI login under `CODEX_HOME`, and Recursion holds no ChatGPT token.
-  An `api_key` route gets back only the one key it selects, from the injected credential lookup. The full
+  An `api_key` route gets back only the one key it selects (`CODEX_API_KEY` or `OPENAI_API_KEY`; the
+  `CODEX_ACCESS_TOKEN` sign-in token is never selectable), from the injected credential lookup. A
+  Pi/Hermes/OpenCode `api_key` route selects only a name `subscription_routes` lists for that engine and
+  the profile names, and refuses (`launch_refused`) when custody holds no key for it. The full
   child-env rules (B1, CSL-785, #320) are a separate module.
 
 ## Claude Code driver (Lucas's correction, Nov 7 ~6:34pm PST)
@@ -93,7 +98,8 @@ anything; no real limit capture has gone through it.
 - No daemon calls `RouteService` yet; no real launcher (cgroup v2 leaf + pidfd) is in this module.
 - Vendor field and option names marked "unverified" in the code were not read from vendor source
   (Claude `rate_limit_info` inner fields, Codex method names beyond `account/rateLimits/*`,
-  `codexErrorInfo` values, `check_for_update_on_startup`).
+  `codexErrorInfo` values). `check_for_update_on_startup` was read in openai/codex source at
+  `8703d32bd0ea5cf26768859a3dd476df906ba053`; no real-binary process-tree check has been run.
 - Pi/Hermes/OpenCode stdio drivers are injected, not built here.
 - No live provider call, real `claude`/`codex` process or network is used anywhere; tests use fakes only.
 

@@ -56,8 +56,9 @@ class ClassifyHelpTest(unittest.TestCase):
 
     def test_measured_builds_read_unknown(self) -> None:
         # Full help of the builds measured on 2026-11-08 (bare-default-measured-table.md): the
-        # floor 2.1.314 and npm latest 2.1.319 must keep refusing until their help settles it.
-        for version in ("2.1.312", "2.1.314", "2.1.319"):
+        # floor 2.1.314, npm latest 2.1.319 then 2.1.321 (Nov 9) and npm stable 2.1.311 must keep
+        # refusing until their help settles it. 2.1.320 was never published.
+        for version in ("2.1.311", "2.1.312", "2.1.314", "2.1.319", "2.1.321"):
             with self.subTest(version=version):
                 text = (FIXTURE.parent / f"claude-{version}-help.txt").read_text()
                 metadata = bd.auth_mode(text)

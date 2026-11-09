@@ -26,6 +26,9 @@ run read-only. npm `latest` for `@anthropic-ai/claude-code` was 2.1.319 at measu
 | 2.1.317 | 0 | `5ca3a9dac2026e56c221fdd34380c7d7d45ebbb51c1d01b7c17c75cb076a0be8` | Same as 2.1.314 (whole help identical). | none | unknown | 2026-11-08 23:23 |
 | 2.1.318 | 0 | `5ca3a9dac2026e56c221fdd34380c7d7d45ebbb51c1d01b7c17c75cb076a0be8` | Same as 2.1.314 (whole help identical). | none | unknown | 2026-11-08 23:23 |
 | 2.1.319 | 0 | `5ca3a9dac2026e56c221fdd34380c7d7d45ebbb51c1d01b7c17c75cb076a0be8` | Same as 2.1.314 (whole help identical). | none | unknown | 2026-11-08 23:23 |
+| 2.1.320 | n/a | n/a | Not published. `npm view @anthropic-ai/claude-code@2.1.320` is 404 and the native release bucket has no `2.1.320/manifest.json` (404), checked 2026-11-09 12:17 PST. Nothing to measure. | n/a | n/a | 2026-11-09 12:17 |
+| 2.1.321 | 0 | `5ca3a9dac2026e56c221fdd34380c7d7d45ebbb51c1d01b7c17c75cb076a0be8` | Same as 2.1.314 (whole help identical). npm `latest` and `next` as of 2026-11-09 (published 2026-11-09 11:02 PST). | none | unknown | 2026-11-09 12:17 |
+| 2.1.311 | 0 | `fc9af56f65f8a84a9e7e98cd538ccac13f57d1cc0e22099666508198ba88d64d` | Same as 2.1.312 (whole help identical). npm `stable` as of 2026-11-09, below the 2.1.314 floor. | none | unknown | 2026-11-09 12:17 |
 
 Notes:
 
@@ -41,6 +44,15 @@ Notes:
 - So help text alone neither shows bare is the `-p` default nor says it is not; the classifier
   returns `unknown` for every build, and the route refuses before launch as it does today.
 
-Fixtures (full help, stdout+stderr): `claude-2.1.312-help.txt`, `claude-2.1.314-help.txt`,
-`claude-2.1.319-help.txt`. 2.1.315 to 2.1.318 have the 2.1.314 hash, so they have no separate
+Fixtures (full help, stdout+stderr): `claude-2.1.311-help.txt`, `claude-2.1.312-help.txt`,
+`claude-2.1.314-help.txt`, `claude-2.1.319-help.txt`, `claude-2.1.321-help.txt`. 2.1.315 to 2.1.318 have the 2.1.314 hash, so they have no separate
 file. `claude-2.1.312-help-excerpt.txt` is the earlier excerpt, unchanged.
+
+Agent (Grok Bot Liaison, for Lucas): second measurement, 2026-11-09 12:17 PST, same command and
+platform, npm installs into a scratch prefix (install scripts not run; `--version` printed the
+expected build). npm dist-tags then: `latest` 2.1.321, `next` 2.1.321, `stable` 2.1.311. 2.1.319
+was re-measured and still matches its committed fixture byte for byte. 2.1.321 help is identical
+to 2.1.314/2.1.319 and 2.1.311 help is identical to 2.1.312; both are committed as their own files
+so each measured build has a fixture. 2.1.320 was never published. `classifier_verdict_readonly`
+for the new rows is `classify_help` at #336 head 5138c4181787b743348e57e3154beb1d28010e4b. The
+refusal logic is unchanged; the subscription route still refuses at every measured build.

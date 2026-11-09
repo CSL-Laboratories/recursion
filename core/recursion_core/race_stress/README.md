@@ -60,3 +60,33 @@ PYTHON_GIL=0 python3.14t -X gil=0 -B core/recursion_core/race_stress/drivers/bre
   locks removed (`--mutant`), the shared `sqlite3` connection crashes the interpreter with
   SIGSEGV on both builds. The real code holds the lock on every connection use, and no
   crash or violation was seen without the mutant.
+
+## Forced interleavings and the flake runner
+
+`tests/test_interleave_*.py` complement the randomized drivers. Each test holds one window open
+on purpose (a `Gate` inside a fake's method, or a barrier at an exact fake-clock instant) and
+checks the invariant across it. They load the measured module in-process from the same
+`RACE_STRESS_TREE_*` checkouts with the head's package `__init__` skipped, so the #324, #326 and
+#328 copies of `recursion_core` coexist in one process. A test whose tree is unset is skipped.
+
+| File | Target | Windows forced |
+| --- | --- | --- |
+| `test_interleave_registry.py` | #324 registry | Stop committed while a reconcile holds a stale `Run` and is paused in `observe` (B14); `Daemon.stop` behind a paused sweep; random writers against terminal stickiness |
+| `test_interleave_breaker.py` | #326 routes breaker | half-open stampede at the exact cooldown end; lease handover stampede plus a late report from the expired probe; all 6 orders of reset / new limit / stale probe; a typed limit landing mid-probe (the #328 interleaving: #326 keeps the key open); untyped storms; randomized mix with a lock-held monitor |
+| | #328 plugin breaker | concurrent `bind_run` of one run; fault and trip monotonic for every later `check`; report/reset flapping keeps `tripped` and `check` consistent |
+
+Sensitivity (local, not committed): removing B14's `CASE` in `Registry.state`, or the lock in
+#326 `admit`, makes these tests fail (B14 broken; 8 probes leased instead of 1).
+
+`flake_runner.py` repeats the suite in fresh child processes, one seed per run, and reports
+flaky tests (passed and failed across runs) and steady failures, each with a replay command:
+
+```
+PYTHON_GIL=0 python3.14t -X gil=0 -B core/recursion_core/race_stress/flake_runner.py \
+  --runs 100 --iterations 20 --out /tmp/flakes.jsonl
+```
+
+It refuses a GIL build or an enabled GIL unless `--allow-gil` (a labelled control run).
+`--cmd` repeats extra scripts with the same interpreter (paths relative to `core/`, `{seed}`
+substituted), for example `--cmd "recursion_core/race_stress/drivers/breaker_326.py --tree
+$RACE_STRESS_TREE_326 --iters 200 --seed {seed}"`. A driver exiting non-zero counts as a failure.

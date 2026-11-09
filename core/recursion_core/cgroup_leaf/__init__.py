@@ -19,7 +19,7 @@ Same uid only, and no cross-uid kill path. A process of the same uid can leave t
 leaf, for example through ``systemd-run --user`` into its user manager, so this is not
 a containment or security boundary. The later cross-uid path must require that the
 engine user has no user manager during runs (no linger, no running user@ service):
-engine linger plus an operator leaf is not containment (Lucas, Nov 7, on B6 and B9).
+engine linger plus an operator leaf is not containment (Lucas, 2026-11-07, on B6 and B9).
 """
 from __future__ import annotations
 

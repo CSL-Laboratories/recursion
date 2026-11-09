@@ -1,4 +1,4 @@
-"""B6 (CSL-728, F23) acceptance contract over recorded host evidence (Lucas, Nov 8).
+"""B6 (CSL-728, F23) acceptance contract over recorded host evidence (Lucas, 2026-11-08).
 
 This module runs no probe. It only judges an evidence record that a founder's host
 run produced (or a structural fixture in tests) and never touches systemd, cgroups
@@ -6,7 +6,7 @@ or another uid. A record whose ``evidence_class`` is not ``host`` can at best be
 ``structural``: it checks the record's schema and the contract's logic, not kernel
 or systemd behaviour. Nothing here is a measurement.
 
-Bars (all kept from Nov 7, plus the Nov 8 migration probe):
+Bars (all kept from 2026-11-07, plus the 2026-11-08 migration probe):
 
 - escapers 0/120;
 - engine writes to ``cgroup.procs`` refused 10/10;
@@ -21,10 +21,13 @@ Bars (all kept from Nov 7, plus the Nov 8 migration probe):
   caller's uid and pid (a pid repeated within an arm fails: one trial copied N
   times is not N trials),
   the caller's cgroup before the attempt (it must already be in the leaf), and the
-  run's expected pids. Every attempt fails, and afterwards ``/proc/<pid>/cgroup``
-  names the leaf for every expected pid in the run;
+  run's expected pids. A manager-absent scope attempt fails when its exit code is
+  0, or when ``sleep_cgroup`` is set and lies outside the leaf. A missing
+  ``sleep_cgroup`` with a non-zero exit does not by itself fail that check.
+  A direct write and an attach call fail unless ``refused`` is true. Afterwards
+  ``/proc/<pid>/cgroup`` names the leaf for every expected pid in the run;
 - the same probe, all three methods, n=10 each, with the engine user manager present
-  is a control. Its scope attempts must reproduce the Nov 7 escape (exit 0, sleep in
+  is a control. Its scope attempts must reproduce the 2026-11-07 escape (exit 0, sleep in
   a canonical cgroup outside the leaf); its direct writes and system-bus attach calls
   are recorded with an explicit outcome either way. A control whose scope attempts do not all escape means the
   probe is not reaching the user manager: the record is ``invalid``, never a pass;
@@ -82,11 +85,12 @@ def _count(value, n):
 
 
 def _pid_key(key):
+    """A positive pid. Non-ASCII digits pass ``str.isdigit`` and must not raise."""
     if isinstance(key, bool):
         return None
     if isinstance(key, int):
         return key if key > 0 else None
-    if isinstance(key, str) and key.isdigit() and not key.startswith('0'):
+    if isinstance(key, str) and key.isascii() and key.isdigit() and not key.startswith('0'):
         return int(key)
     return None
 

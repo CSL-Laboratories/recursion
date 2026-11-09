@@ -1,4 +1,4 @@
-"""Structural tests for the B6 evidence contract (Lucas, Nov 8).
+"""Structural tests for the B6 evidence contract (Lucas, 2026-11-08).
 
 The records here are hand-built fixtures, not host evidence. They check the evidence
 schema and the contract's logic; they say nothing about kernel or systemd behaviour.
@@ -205,6 +205,13 @@ class ContractTests(unittest.TestCase):
         record = host_record()
         record['manager_absent']['attempts'][0]['run_pids'] = {4101: LEAF, 4102: LEAF}
         self.assertEqual(self.verdict(record), 'pass')
+
+    def test_superscript_pid_key_fails_closed(self):
+        record = host_record()
+        record['manager_absent']['attempts'][0]['run_pids'] = {'²': LEAF}
+        result = evaluate(record)
+        self.assertEqual(result['verdict'], 'fail')
+        self.assertTrue(any('invalid pid in read-back' in reason for reason in result['reasons']))
 
     def test_n10_per_method(self):
         for drop in (0, 19, 29):

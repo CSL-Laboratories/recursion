@@ -55,11 +55,11 @@ path (normal return, exception, launch failure, cancellation) kills the leaf.
   This is not a containment or security boundary against a same-uid process.
 - Cross-uid (B6 proper) comes later and must require that the engine user has no
   user manager during runs: no linger and no running `user@<engine uid>.service`.
-  Engine linger plus an operator-owned leaf is not containment. Lucas, Nov 7,
+  Engine linger plus an operator-owned leaf is not containment. Lucas, 2026-11-07,
   recorded on B6 and B9: "linger for the engine user and leaf containment
   conflict ... design the cross-uid path so the engine has no user manager during
   runs." Owner-reported host evidence (gs-worker-nbg, Ubuntu 26.04.1, kernel 7.0,
-  systemd 259, Nov 7; recorded on CSL-728 and CSL-738, not re-measured here): a
+  systemd 259, 2026-11-07; recorded on CSL-728 and CSL-738, not re-measured here): a
   lingering engine user inside a root-created wrapper unit ran
   `systemd-run --user` (exit 0) and started a process in its own
   `user@.service/app.slice` tree, outside the wrapper. It was still the same uid,
@@ -75,9 +75,9 @@ path (normal return, exception, launch failure, cancellation) kills the leaf.
   launches, and where the delegated root sits, is not decided here.
 - Child environment (B1) is not handled here: `env` is passed through as given.
 
-## B6 evidence contract (Lucas, Nov 8)
+## B6 evidence contract (Lucas, 2026-11-08)
 
-Lucas's Nov 8 call: the engine user gets no linger and no systemd user manager;
+Lucas's 2026-11-08 call: the engine user gets no linger and no systemd user manager;
 the operator keeps linger. `b6_evidence.evaluate(record)` judges a recorded host
 run against every B6 bar. It runs no probe, touches no systemd or cgroup, and
 switches no uid.
@@ -96,14 +96,18 @@ switches no uid.
   times is not 10/10. Each attempt records the caller's uid
   (must be the record's `engine_uid`, not the operator's), its pid, its cgroup
   before the attempt (must already be in the leaf) and the run's expected pids.
-  Every attempt must fail (exit 0 of the scope call fails the bar even if the
-  sleep stayed inside; a direct write must target a canonical `cgroup.procs`
-  outside the leaf with the caller's own pid), and afterwards
+  A manager-absent scope attempt fails when `exit_code` is 0, or when
+  `sleep_cgroup` is present and is not inside the leaf. A missing
+  `sleep_cgroup` with a non-zero exit does not by itself fail that check
+  (open; this pass does not change it). A direct write must name a canonical
+  `cgroup.procs` outside the leaf, write the caller's own pid, and record
+  `refused: true`. An attach attempt must name `AttachProcessesToUnit` on the
+  system bus for the caller's own pid and record `refused: true`. Afterwards
   `/proc/<pid>/cgroup` must name the leaf, or a cgroup below it, for exactly the
   expected pids. Paths must be absolute and canonical (no `.`, `..`, `//`).
 - Control, engine user manager present, all three methods n=10: all 10 scope
   attempts must exit 0 with the sleep in a canonical cgroup outside the leaf,
-  reproducing the Nov 7 escape; the 10 direct writes and 10 attach calls need a
+  reproducing the 2026-11-07 escape; the 10 direct writes and 10 attach calls need a
   recorded outcome either way.
   Otherwise the verdict is `invalid`: the probe is not reaching the user manager,
   and no pass is read. Malformed records fail closed and never raise.

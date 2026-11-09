@@ -57,13 +57,16 @@ The vectors cover:
 - the #1100 A3 rule: `outcome: route_breaker_tripped` is refused unless `breaker_tripped`
   is true;
 - missing or mistyped fields;
+- a `state` outside the closed Run@1 state set (wrong case, null, a number, an array,
+  absent), which is refused as `state_not_in_enum` whatever the outcome says;
 - key order, whitespace and escapes that leave the digest unchanged;
 - duplicate keys, including one hidden by an escape (refused, never last-wins), NaN, the
   infinities, floats, integers past 2^53, a lone surrogate and a BOM.
 
 I checked every accepted case once against #1100's own validator (`csl_contract.check`)
 at 114b48be. All of them agreed. That check is not committed, because #1100's code lives in
-csl-research.
+csl-research. The six `run_state_*` cases were added later (red-team round 1 on #339) and
+have not been run against #1100's validator.
 
 ## Tests
 

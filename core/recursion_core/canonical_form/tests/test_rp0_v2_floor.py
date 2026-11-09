@@ -22,7 +22,7 @@ from recursion_core.canonical_form import vectors_build as vb
 
 # Digest over (name, expect, sha256 | reason, run_errors) of every committed vector.
 # Changing a vector's digest or verdict must change this constant in the same commit.
-VECTOR_SET_SHA256 = "81d3a372ec4472e9e6eec55ba52d039b1d06609a2a36c39b6f52599a2dc533aa"
+VECTOR_SET_SHA256 = "8038dce7d06ae87b16f579f80d62c3eb64f56ef1bf4087b97af7ab9053b6f375"
 
 FLOOR_OUTCOMES = frozenset({
     "succeeded", "failed", "timed_out", "cancelled", "stopped", "route_breaker_tripped", "refused", "unknown",

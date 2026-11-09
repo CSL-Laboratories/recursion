@@ -150,6 +150,27 @@ class TwoFieldInteractionTests(unittest.TestCase):
             with self.subTest(state=state):
                 self.assertEqual(["outcome_null_terminal"], run_field_errors(vb.run(state, outcome=None)))
 
+    def test_state_outside_the_enum_is_never_consistent(self) -> None:
+        # Red-team #339 finding 1: a state outside RUN_STATES used to skip both outcome checks.
+        for state in ("Completed", "COMPLETED", " completed", "done", "", None, 1, 0, True, 1.5, [], ["completed"],
+                      {}, {"state": "completed"}):
+            for outcome in (None, "succeeded", "route_breaker_tripped", "unknown"):
+                with self.subTest(state=state, outcome=outcome):
+                    run = {**vb.run("limit_hit"), "state": state, "outcome": outcome}
+                    self.assertIn("state_not_in_enum", run_field_errors(run))
+        run = vb.run("completed")
+        del run["state"]
+        self.assertEqual(["missing_required", "state_not_in_enum"], run_field_errors(run))
+        for name in ("run_state_wrong_case", "run_state_null", "run_state_int_breaker", "run_state_array",
+                     "run_state_null_outcome_null", "run_state_absent"):
+            with self.subTest(name):
+                self.assertIn("state_not_in_enum", self.by[name]["run_errors"])
+
+    def test_every_run_state_is_checked(self) -> None:
+        for state in sorted(vb.OUTCOME) + ["pending", "running", "stopping"]:
+            with self.subTest(state=state):
+                self.assertNotIn("state_not_in_enum", run_field_errors(vb.run(state)))
+
     def test_duplicate_two_field_keys_never_last_win(self) -> None:
         for name in ("doc_run_outcome_duplicate", "dup_breaker_tripped", "dup_outcome_via_escape"):
             with self.subTest(name):

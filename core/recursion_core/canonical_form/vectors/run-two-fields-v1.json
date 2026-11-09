@@ -386,6 +386,79 @@
       "note": "a state name is not an outcome"
     },
     {
+      "name": "run_state_wrong_case",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":false,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":\"Completed\",\"outcome\":\"succeeded\",\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":null,\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":false,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"outcome\":\"succeeded\",\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":\"Completed\",\"state_seq\":1,\"stop\":null,\"termination\":{\"exit_code\":0,\"observed_at\":\"2026-11-07T20:01:00Z\",\"observer\":\"cgroup_events\",\"signal\":null,\"tree_empty\":true},\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a66616c73652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a22323032362d31312d30375432303a30313a30305a222c226f7574636f6d65223a22737563636565646564222c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a22436f6d706c65746564222c2273746174655f736571223a312c2273746f70223a6e756c6c2c227465726d696e6174696f6e223a7b22657869745f636f6465223a302c226f627365727665645f6174223a22323032362d31312d30375432303a30313a30305a222c226f62736572766572223a226367726f75705f6576656e7473222c227369676e616c223a6e756c6c2c22747265655f656d707479223a747275657d2c2274797065223a2252756e4031227d",
+      "sha256": "cace05798dca4a3e8bc8076a67a5b1f45289cc797407d1b73d330f9534c754ec",
+      "run_errors": [
+        "state_not_in_enum"
+      ],
+      "note": "state enum is case-sensitive: Completed with succeeded is refused, not consistent"
+    },
+    {
+      "name": "run_state_null",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":false,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":null,\"outcome\":\"succeeded\",\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":null,\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":false,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"outcome\":\"succeeded\",\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":null,\"state_seq\":1,\"stop\":null,\"termination\":{\"exit_code\":0,\"observed_at\":\"2026-11-07T20:01:00Z\",\"observer\":\"cgroup_events\",\"signal\":null,\"tree_empty\":true},\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a66616c73652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a22323032362d31312d30375432303a30313a30305a222c226f7574636f6d65223a22737563636565646564222c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a6e756c6c2c2273746174655f736571223a312c2273746f70223a6e756c6c2c227465726d696e6174696f6e223a7b22657869745f636f6465223a302c226f627365727665645f6174223a22323032362d31312d30375432303a30313a30305a222c226f62736572766572223a226367726f75705f6576656e7473222c227369676e616c223a6e756c6c2c22747265655f656d707479223a747275657d2c2274797065223a2252756e4031227d",
+      "sha256": "a1a724981255cd5673d04602a581d89d1e92b8cb1dabfad70889b3a8ab9ff911",
+      "run_errors": [
+        "state_not_in_enum"
+      ],
+      "note": "null state with outcome succeeded: refused"
+    },
+    {
+      "name": "run_state_int_breaker",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":true,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":1,\"outcome\":\"route_breaker_tripped\",\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":null,\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":true,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"outcome\":\"route_breaker_tripped\",\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":1,\"state_seq\":1,\"stop\":null,\"termination\":{\"exit_code\":0,\"observed_at\":\"2026-11-07T20:01:00Z\",\"observer\":\"cgroup_events\",\"signal\":null,\"tree_empty\":true},\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a747275652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a22323032362d31312d30375432303a30313a30305a222c226f7574636f6d65223a22726f7574655f627265616b65725f74726970706564222c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a312c2273746174655f736571223a312c2273746f70223a6e756c6c2c227465726d696e6174696f6e223a7b22657869745f636f6465223a302c226f627365727665645f6174223a22323032362d31312d30375432303a30313a30305a222c226f62736572766572223a226367726f75705f6576656e7473222c227369676e616c223a6e756c6c2c22747265655f656d707479223a747275657d2c2274797065223a2252756e4031227d",
+      "sha256": "1b96adeb3d6b2c90bd4b362179e4c4807e6e63a6f6efa728f8fe8864ae8686d5",
+      "run_errors": [
+        "state_not_in_enum"
+      ],
+      "note": "integer state with route_breaker_tripped and the breaker tripped: refused"
+    },
+    {
+      "name": "run_state_array",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":false,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":[\"running\"],\"outcome\":null,\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":null,\"stop\":null,\"termination\":null}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":false,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":null,\"outcome\":null,\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":[\"running\"],\"state_seq\":1,\"stop\":null,\"termination\":null,\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a66616c73652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a6e756c6c2c226f7574636f6d65223a6e756c6c2c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a5b2272756e6e696e67225d2c2273746174655f736571223a312c2273746f70223a6e756c6c2c227465726d696e6174696f6e223a6e756c6c2c2274797065223a2252756e4031227d",
+      "sha256": "dbdf544280dc953b6d8c6d89764524fcaad7e3bde4d27bd936c4690b67595dc1",
+      "run_errors": [
+        "state_not_in_enum"
+      ],
+      "note": "array state: refused, never a crash"
+    },
+    {
+      "name": "run_state_null_outcome_null",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":false,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"state\":null,\"outcome\":null,\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":null,\"stop\":null,\"termination\":null}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":false,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":null,\"outcome\":null,\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state\":null,\"state_seq\":1,\"stop\":null,\"termination\":null,\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a66616c73652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a6e756c6c2c226f7574636f6d65223a6e756c6c2c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c227374617465223a6e756c6c2c2273746174655f736571223a312c2273746f70223a6e756c6c2c227465726d696e6174696f6e223a6e756c6c2c2274797065223a2252756e4031227d",
+      "sha256": "57d310df8a5a3364ed8319a2de14e4dc242877ad6c461c9e1cf231d22875f7b9",
+      "run_errors": [
+        "state_not_in_enum"
+      ],
+      "note": "null state with null outcome: refused even though the outcome is null"
+    },
+    {
+      "name": "run_state_absent",
+      "input": "{\"type\":\"Run@1\",\"breaker_tripped\":false,\"run_id\":\"run-1\",\"request_id\":\"req-1\",\"outcome\":\"succeeded\",\"state_seq\":1,\"created_at\":\"2026-11-07T20:00:00Z\",\"started_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"stop\":null,\"termination\":{\"tree_empty\":true,\"observer\":\"cgroup_events\",\"exit_code\":0,\"signal\":null,\"observed_at\":\"2026-11-07T20:01:00Z\"}}",
+      "expect": "ok",
+      "canonical": "{\"breaker_tripped\":false,\"created_at\":\"2026-11-07T20:00:00Z\",\"ended_at\":\"2026-11-07T20:01:00Z\",\"outcome\":\"succeeded\",\"request_id\":\"req-1\",\"run_id\":\"run-1\",\"started_at\":\"2026-11-07T20:00:00Z\",\"state_seq\":1,\"stop\":null,\"termination\":{\"exit_code\":0,\"observed_at\":\"2026-11-07T20:01:00Z\",\"observer\":\"cgroup_events\",\"signal\":null,\"tree_empty\":true},\"type\":\"Run@1\"}",
+      "canonical_utf8_hex": "7b22627265616b65725f74726970706564223a66616c73652c22637265617465645f6174223a22323032362d31312d30375432303a30303a30305a222c22656e6465645f6174223a22323032362d31312d30375432303a30313a30305a222c226f7574636f6d65223a22737563636565646564222c22726571756573745f6964223a227265712d31222c2272756e5f6964223a2272756e2d31222c22737461727465645f6174223a22323032362d31312d30375432303a30303a30305a222c2273746174655f736571223a312c2273746f70223a6e756c6c2c227465726d696e6174696f6e223a7b22657869745f636f6465223a302c226f627365727665645f6174223a22323032362d31312d30375432303a30313a30305a222c226f62736572766572223a226367726f75705f6576656e7473222c227369676e616c223a6e756c6c2c22747265655f656d707479223a747275657d2c2274797065223a2252756e4031227d",
+      "sha256": "e27e9a40841214c3f5eb02a2f342169cd4ab0e66d638f7048c2917f76039d665",
+      "run_errors": [
+        "missing_required",
+        "state_not_in_enum"
+      ],
+      "note": "absent state with outcome succeeded: refused"
+    },
+    {
       "name": "doc_run_outcome_breaker_reordered",
       "input": "{\n  \"termination\": {\"signal\": null, \"observed_at\": \"2026-11-07T20:01:00Z\", \"exit_code\": 0, \"observer\": \"cgroup_events\", \"tree_empty\": true},\n  \"stop\": null, \"state_seq\": 2, \"state\": \"limit_hit\", \"started_at\": \"2026-11-07T20:00:00Z\", \"run_id\": \"run-1\",\n  \"request_id\": \"req-1\", \"outcome\": \"route_breaker_tripped\", \"ended_at\": \"2026-11-07T20:01:00Z\", \"created_at\": \"2026-11-07T20:00:00Z\", \"breaker_tripped\": true, \"type\": \"Run@1\"\n}\n",
       "expect": "ok",

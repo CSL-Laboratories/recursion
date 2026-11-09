@@ -58,6 +58,7 @@ STOP_REASON_OUTCOME = {
 RULES = {
     "not_run": "document is not an object with type Run@1",
     "missing_required": "a Run@1 required field other than the two is absent",
+    "state_not_in_enum": "state is not a Run@1 state, so no outcome can be checked against it",
     "outcome_required": "outcome is absent (it is required, null while not terminal)",
     "outcome_not_in_enum": "outcome is neither null nor a RunOutcome value",
     "outcome_not_null": "outcome is set while the state is not terminal",
@@ -84,6 +85,12 @@ def run_field_errors(doc: Any) -> list[str]:
         errors.add("breaker_tripped_not_boolean")
 
     state = doc.get("state")
+    if not isinstance(state, str) or state not in RUN_STATES:
+        # Outside the closed state set neither the null-while-not-terminal rule nor the
+        # terminal pairing applies, so the outcome cannot be shown truthful: refuse.
+        # (Also keeps an unhashable state such as a list out of the set lookups below.)
+        errors.add("state_not_in_enum")
+        state = None
     if "outcome" not in doc:
         errors.add("outcome_required")
         return sorted(errors)

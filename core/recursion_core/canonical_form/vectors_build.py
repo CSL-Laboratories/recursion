@@ -148,6 +148,16 @@ CASES: list[tuple[str, ...]] = [
     ("run_breaker_tripped_string", text(run("running", breaker_tripped="true")), "a string is not a boolean"),
     ("run_outcome_not_in_enum", text(run("completed", outcome="Succeeded")), "closed enum, case-sensitive"),
     ("run_outcome_state_name", text(run("limit_hit", outcome="limit_hit")), "a state name is not an outcome"),
+    # --- state outside the closed Run@1 state set: the outcome cannot be checked, refused
+    ("run_state_wrong_case", text({**run("completed"), "state": "Completed"}),
+     "state enum is case-sensitive: Completed with succeeded is refused, not consistent"),
+    ("run_state_null", text({**run("completed"), "state": None}), "null state with outcome succeeded: refused"),
+    ("run_state_int_breaker", text({**run("limit_hit"), "state": 1}),
+     "integer state with route_breaker_tripped and the breaker tripped: refused"),
+    ("run_state_array", text({**run("running"), "state": ["running"]}), "array state: refused, never a crash"),
+    ("run_state_null_outcome_null", text({**run("running"), "state": None}),
+     "null state with null outcome: refused even though the outcome is null"),
+    ("run_state_absent", text({k: v for k, v in run("completed").items() if k != "state"}), "absent state with outcome succeeded: refused"),
     # --- key order and whitespace do not change the digest
     ("doc_run_outcome_breaker_reordered",
      "{\n  \"termination\": {\"signal\": null, \"observed_at\": \"2026-11-07T20:01:00Z\", \"exit_code\": 0,"

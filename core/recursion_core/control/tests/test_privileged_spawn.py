@@ -34,7 +34,9 @@ from recursion_core.control.privileged_spawn import (
     collect_host_facts,
     detect_backends,
     evaluate_host,
+    f21_open_items,
     find_target_uid_pid,
+    is_shared_system_account,
     percentile,
     probe_abs_store_read,
     run_same_uid_control_probes,
@@ -67,6 +69,19 @@ def _facts(**overrides) -> HostFacts:
     )
     values.update(overrides)
     return HostFacts(**values)
+
+
+# A dedicated engine user, as F21 would create at install. Not a host account.
+ENGINE_USER = "recursion-engine"
+ENGINE_UID = 990
+ALL_BLOCKED = tuple(
+    ProbeSummary(name, DEFAULT_N, DEFAULT_N, "denied", 0, f"sleep uid={ENGINE_UID} x20")
+    for name in ("proc_pid_root", "ptrace", "abs_store_read")
+)
+
+
+def _engine(name: str = "sudo") -> Backend:
+    return Backend(name, True, True, "ok", target_user=ENGINE_USER, target_uid=ENGINE_UID)
 
 
 def _run_fail(cmd, timeout: float) -> ProcResult:
@@ -192,11 +207,14 @@ class SelectionTests(unittest.TestCase):
         # selectable (spawn_command cannot launch them). A named human reviewer
         # must submit their own GitHub review of the changed assertions.
         # Agents do not approve, dismiss, or treat this comment as that review.
-        sudo = Backend("sudo", True, True, "ok", target_user="nobody", target_uid=65534)
-        systemd = Backend("systemd_run", True, True, "ok", target_user="nobody", target_uid=65534)
+        # Red-team round 1 (findings 1 and 3) changed them again: the target
+        # is a dedicated engine user, not nobody, and F21 is marked as run
+        # (f21_open=()), the only case where an engine-user path is not beta.
+        sudo = _engine("sudo")
+        systemd = _engine("systemd_run")
         subuid = Backend("subuid_userns", True, True, "ok", target_uid=100000)
         helper = Backend("setuid_helper", True, True, "ok", helper_path="/helper", target_uid=123)
-        selected_sudo = select_path((sudo, systemd, subuid))
+        selected_sudo = select_path((sudo, systemd, subuid), f21_open=())
         self.assertEqual(
             selected_sudo.name,
             "sudo",
@@ -206,14 +224,14 @@ class SelectionTests(unittest.TestCase):
             selected_sudo.beta,
             "a spawnable other-uid path is not the beta fallback",
         )
-        selected_systemd = select_path((systemd, subuid))
+        selected_systemd = select_path((systemd, subuid), f21_open=())
         self.assertEqual(
             selected_systemd.name,
             "systemd_run",
             "systemd_run ranks above detection-only backends",
         )
         self.assertFalse(selected_systemd.beta)
-        selected_sudo_only = select_path((sudo,))
+        selected_sudo_only = select_path((sudo,), f21_open=())
         self.assertEqual(selected_sudo_only.name, "sudo")
         self.assertFalse(selected_sudo_only.beta)
         self.assertFalse(can_spawn(helper))
@@ -229,9 +247,61 @@ class SelectionTests(unittest.TestCase):
         selected = select_path((helper, subuid))
         self.assertEqual(selected.name, "managed_login_folder")
         self.assertTrue(selected.beta)
-        sudo = Backend("sudo", True, True, "ok", target_user="nobody", target_uid=65534)
+        sudo = _engine("sudo")
         self.assertTrue(can_spawn(sudo))
-        self.assertEqual(select_path((helper, sudo, subuid)).name, "sudo")
+        self.assertEqual(select_path((helper, sudo, subuid), f21_open=()).name, "sudo")
+
+    def test_engine_user_backend_stays_beta_while_f21_is_unmeasured(self) -> None:
+        # Red-team round 1 finding 1 (O19): until F21 has run, the
+        # managed-login-folder fallback is the beta default even when an
+        # engine-user backend works; that backend is only the candidate.
+        self.assertEqual(
+            f21_open_items(),
+            (
+                "engine_user_created_at_install",
+                "claude_code_signin_survives_reboot",
+                "codex_signin_survives_reboot",
+                "headless_secret_service_live",
+            ),
+        )
+        sudo = _engine("sudo")
+        for selected in (
+            select_path((sudo,)),
+            select_path((sudo,), f21_open=("codex_signin_survives_reboot",)),
+        ):
+            self.assertEqual(selected.name, "managed_login_folder")
+            self.assertTrue(selected.beta)
+            self.assertIsNone(selected.backend)
+            self.assertEqual(selected.candidate, sudo)
+            self.assertIn("F21 has not fully run", selected.reason)
+            self.assertIn("codex_signin_survives_reboot", selected.reason)
+            self.assertIn("fallback ships as beta", selected.reason)
+        ran = select_path((sudo,), f21_open=())
+        self.assertEqual(ran.name, "sudo")
+        self.assertFalse(ran.beta)
+        self.assertIsNone(ran.candidate)
+
+    def test_shared_system_accounts_are_never_selected(self) -> None:
+        # Red-team round 1 finding 3: nobody/daemon are shared uids, so other
+        # processes under them are same-uid attackers; measurement only.
+        shared = (
+            Backend("sudo", True, True, "ok", target_user="nobody", target_uid=65534),
+            Backend("sudo", True, True, "ok", target_user="daemon", target_uid=1),
+            Backend("sudo", True, True, "ok", target_user="nfsnobody", target_uid=65534),
+            Backend("systemd_run", True, True, "ok", target_user="nobody", target_uid=65534),
+        )
+        for backend in shared:
+            self.assertTrue(is_shared_system_account(backend))
+            selected = select_path((backend,), f21_open=())
+            self.assertEqual(selected.name, "managed_login_folder")
+            self.assertTrue(selected.beta)
+            self.assertIsNone(selected.candidate)
+            self.assertIn("measurement stand-ins", selected.reason)
+        self.assertFalse(is_shared_system_account(_engine()))
+        # A shared-account sudo does not hide a dedicated systemd_run engine user.
+        selected = select_path((shared[0], _engine("systemd_run")), f21_open=())
+        self.assertEqual(selected.name, "systemd_run")
+        self.assertEqual(selected.backend.target_user, ENGINE_USER)
 
 
 class DetectionInjectionTests(unittest.TestCase):
@@ -309,9 +379,13 @@ class SudoPolicyDetectionTests(unittest.TestCase):
         self.assertEqual(sudo.target_uid, 65534)
         self.assertIn("sudo -n true failed", sudo.reason)
         backends = (Backend("setuid_helper", False, False, "absent"), sudo)
-        selected = select_path(backends)
-        self.assertEqual(selected.name, "sudo")
-        self.assertFalse(selected.beta)
+        # Red-team round 1 finding 3: nobody is a measurement stand-in, so
+        # even with F21 marked as run the selection is the beta fallback.
+        selected = select_path(backends, f21_open=())
+        self.assertEqual(selected.name, "managed_login_folder")
+        self.assertTrue(selected.beta)
+        self.assertIsNone(selected.candidate)
+        self.assertIn("sudo as nobody", selected.reason)
 
     def test_target_sudo_missing_a_required_command_is_unavailable(self) -> None:
         # Devin r4506181499: id -u allowed as nobody, true denied.
@@ -375,12 +449,12 @@ class EvaluateHostInjectionTests(unittest.TestCase):
         self.assertTrue(evaluation.selected.beta)
 
     def test_measured_backend_is_selected_and_subuid_is_not_measured(self) -> None:
+        # Red-team round 1: selected only for a dedicated engine user with all
+        # F21 channels blocked and F21 marked as run (f21_open=()).
         seen: list[str] = []
         overhead = Overhead(DEFAULT_N, 0.01, 0.02, 0.005, 0.03, ("sudo",))
-        summaries = tuple(
-            ProbeSummary(name, DEFAULT_N, DEFAULT_N, "denied", 0, "sleep uid=65534 x20")
-            for name in ("proc_pid_root", "ptrace", "abs_store_read")
-        )
+        summaries = ALL_BLOCKED
+        backends = (self._backends()[0], _engine("sudo"), *self._backends()[2:])
 
         def measure_fn(backend: Backend, n: int) -> Overhead:
             seen.append(backend.name)
@@ -389,14 +463,73 @@ class EvaluateHostInjectionTests(unittest.TestCase):
         evaluation = evaluate_host(
             n=DEFAULT_N,
             facts=_facts(),
-            backends=self._backends(),
+            backends=backends,
             measure_fn=measure_fn,
             probe_fn=lambda backend, n: summaries,
+            f21_open=(),
         )
         self.assertEqual(seen, ["sudo"])
         self.assertEqual(evaluation.errors, {})
         self.assertEqual(evaluation.selected.name, "sudo")
+        self.assertFalse(evaluation.selected.beta)
         self.assertEqual(evaluation.probes["sudo"], summaries)
+        # Default f21_open: F21 has not run, so the same host is beta.
+        pending = evaluate_host(
+            n=DEFAULT_N,
+            facts=_facts(),
+            backends=backends,
+            measure_fn=lambda backend, n: overhead,
+            probe_fn=lambda backend, n: summaries,
+        )
+        self.assertEqual(pending.selected.name, "managed_login_folder")
+        self.assertTrue(pending.selected.beta)
+        self.assertEqual(pending.selected.candidate.name, "sudo")
+
+    def test_open_or_errored_f21_channels_demote_the_backend(self) -> None:
+        # Red-team round 1 finding 2: a backend that leaves any F21 channel
+        # open, or errored without a launch failure, is not selectable.
+        overhead = Overhead(DEFAULT_N, 0.01, 0.02, 0.005, 0.03, ("sudo",))
+        backends = (self._backends()[0], _engine("sudo"), *self._backends()[2:])
+        cases = {
+            "proc open": (
+                ProbeSummary("proc_pid_root", DEFAULT_N, DEFAULT_N - 3, "open", 0, "x"),
+                *ALL_BLOCKED[1:],
+            ),
+            "ptrace all open": (
+                ALL_BLOCKED[0],
+                ProbeSummary("ptrace", DEFAULT_N, 0, "attached", 0, "x"),
+                ALL_BLOCKED[2],
+            ),
+            "ptrace unavailable": (
+                ALL_BLOCKED[0],
+                ProbeSummary(
+                    "ptrace", DEFAULT_N, 0, "ptrace unavailable: libc not found", DEFAULT_N, "x"
+                ),
+                ALL_BLOCKED[2],
+            ),
+            "store read missing": ALL_BLOCKED[:2],
+        }
+        for label, probed in cases.items():
+            with self.subTest(label):
+                self.assertIsNone(_launch_failure(probed))
+                evaluation = evaluate_host(
+                    n=DEFAULT_N,
+                    facts=_facts(),
+                    backends=backends,
+                    measure_fn=lambda backend, n: overhead,
+                    probe_fn=lambda backend, n, probed=probed: probed,
+                    f21_open=(),
+                )
+                self.assertIn("F21 channels not blocked", evaluation.errors["sudo"])
+                sudo = next(b for b in evaluation.backends if b.name == "sudo")
+                self.assertFalse(sudo.available)
+                self.assertIn("not selectable", sudo.reason)
+                # Kept as evidence of what was measured.
+                self.assertEqual(evaluation.probes["sudo"], probed)
+                self.assertEqual(evaluation.overhead["sudo"], overhead)
+                self.assertEqual(evaluation.selected.name, "managed_login_folder")
+                self.assertTrue(evaluation.selected.beta)
+                self.assertIsNone(evaluation.selected.candidate)
 
     def test_invalid_sample_count_raises_instead_of_selecting_fallback(self) -> None:
         # Devin r4506565268: n<10 used to be swallowed as a backend failure.
@@ -636,7 +769,8 @@ class DevinReview5818620711Tests(unittest.TestCase):
     def test_other_probe_errors_are_not_launch_failures(self) -> None:
         tally = _Tally()
         tally.add("ptrace", (None, "ptrace unavailable: ENOSYS"), "sleep uid=65534")
-        for _ in range(DEFAULT_N - 1):
+        tally.add("ptrace", (None, "ptrace unavailable: libc not found"), "sleep uid=65534")
+        for _ in range(DEFAULT_N - 2):
             tally.add("ptrace", (True, "EPERM"), "sleep uid=65534")
         summary = next(s for s in tally.summaries(DEFAULT_N) if s.name == "ptrace")
         self.assertEqual(summary.launch_failure_count, 0)
@@ -837,8 +971,13 @@ class LiveHostTests(unittest.TestCase):
             self.assertEqual(evaluation.overhead, {})
             self.assertEqual(evaluation.probes, {})
             return
-        self.assertIn(evaluation.selected.name, {b.name for b in measured})
-        self.assertFalse(evaluation.selected.beta)
+        # Red-team round 1: F21 has not run, and nobody/daemon are shared
+        # system accounts, so the measured backend is never selected here.
+        self.assertEqual(evaluation.selected.name, "managed_login_folder")
+        self.assertTrue(evaluation.selected.beta)
+        for backend in measured:
+            self.assertTrue(is_shared_system_account(backend))
+        self.assertIsNone(evaluation.selected.candidate)
         for backend in measured:
             overhead = evaluation.overhead[backend.name]
             self.assertGreaterEqual(overhead.n, 10)

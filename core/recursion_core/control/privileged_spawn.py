@@ -18,6 +18,15 @@ of every backend that can already spawn another *host* uid, runs the three F21
 same-uid probes under each, and selects the managed-login-folder fallback as
 beta when no such backend is available.
 
+Selection follows O19: while any F21 engine-user item below is unmeasured, the
+managed-login-folder fallback stays the beta default even when an other-uid
+backend works; that backend is reported as ``SelectedPath.candidate``, not
+selected. A backend is selectable only when all three F21 channels are blocked
+on every attempt. ``nobody`` and ``daemon`` are shared system accounts: other
+processes run under them, so they are same-uid attackers against an engine
+there, and ``nobody`` has no home to hold logins. They are measurement
+stand-ins only and are never selected as the engine user.
+
 The probes target the engine process itself: a process whose real,
 effective, saved and filesystem uids all equal the backend's target uid (for
 systemd-run, the transient unit's MainPID). They never fall back to the
@@ -73,7 +82,14 @@ SETUID_HELPER_CANDIDATES = (
     "/usr/local/bin/recursion-spawn-as",
 )
 HELPER_ENV = "RECURSION_SPAWN_HELPER"
+# Measurement stand-ins for the engine user. Never selected (see
+# SHARED_SYSTEM_ACCOUNTS): they only show whether sudo reaches another uid.
 SUDO_TARGET_CANDIDATES = ("nobody", "daemon")
+# Shared system accounts that other processes also run as. An engine under
+# one of these uids shares it with them, so the F21 same-uid channels stay
+# open to those processes. 65534 is the kernel overflow uid (nobody).
+SHARED_SYSTEM_ACCOUNTS: frozenset[str] = frozenset({"nobody", "daemon"})
+SHARED_SYSTEM_UIDS: frozenset[int] = frozenset({65534})
 DEFAULT_N = 20
 # Commands every measured backend must be able to run as the target user.
 # Overhead times ``true``. Process probes launch ``sleep 8`` (not a stand-in
@@ -131,6 +147,9 @@ class SelectedPath:
     beta: bool
     reason: str
     backend: Backend | None = None
+    # A working engine-user backend that is not selected because F21 has not
+    # fully run (O19). Only set when ``name`` is ``managed_login_folder``.
+    candidate: Backend | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,9 +256,41 @@ def can_spawn(backend: Backend) -> bool:
     return True
 
 
-def select_path(backends: Sequence[Backend]) -> SelectedPath:
-    """Pick the first spawnable backend that changes the host uid; else beta fallback."""
+def f21_open_items() -> tuple[str, ...]:
+    """F21 engine-user items not yet measured (``None``). Empty once F21 has run."""
 
+    items = {
+        "engine_user_created_at_install": ENGINE_USER_CREATED_AT_INSTALL,
+        "claude_code_signin_survives_reboot": CLAUDE_CODE_SIGNIN_SURVIVES_REBOOT,
+        "codex_signin_survives_reboot": CODEX_SIGNIN_SURVIVES_REBOOT,
+        "headless_secret_service_live": HEADLESS_SECRET_SERVICE_LIVE,
+    }
+    return tuple(name for name, value in items.items() if value is None)
+
+
+def is_shared_system_account(backend: Backend) -> bool:
+    """True when ``backend`` targets a shared system account such as ``nobody``."""
+
+    return (
+        backend.target_user in SHARED_SYSTEM_ACCOUNTS
+        or backend.target_uid in SHARED_SYSTEM_UIDS
+    )
+
+
+def select_path(
+    backends: Sequence[Backend],
+    *,
+    f21_open: Sequence[str] | None = None,
+) -> SelectedPath:
+    """Pick the first spawnable engine-user backend once F21 has run; else beta fallback.
+
+    ``f21_open`` lists unmeasured F21 items (default: ``f21_open_items()``).
+    While it is non-empty the managed-login-folder fallback is the beta
+    default (O19) and a working engine-user backend is only the ``candidate``.
+    Backends that target a shared system account are never selected.
+    """
+
+    open_items = tuple(f21_open_items() if f21_open is None else f21_open)
     order: tuple[BackendName, ...] = (
         "setuid_helper",
         "sudo",
@@ -247,27 +298,53 @@ def select_path(backends: Sequence[Backend]) -> SelectedPath:
         "subuid_userns",
     )
     by_name = {b.name: b for b in backends}
+    stand_ins: list[str] = []
+    candidate: Backend | None = None
     for name in order:
         backend = by_name.get(name)
-        if (
+        if not (
             backend is not None
             and backend.available
             and backend.changes_host_uid
             and can_spawn(backend)
         ):
-            return SelectedPath(
-                name,
-                False,
-                f"{name} can spawn another host uid without mutating system config",
-                backend,
-            )
+            continue
+        if is_shared_system_account(backend):
+            stand_ins.append(f"{name} as {backend.target_user or backend.target_uid}")
+            continue
+        candidate = backend
+        break
+    if candidate is not None and not open_items:
+        return SelectedPath(
+            candidate.name,
+            False,
+            f"{candidate.name} can spawn the engine user without mutating system "
+            "config, and F21 has run",
+            candidate,
+        )
+    why: list[str] = []
+    if candidate is not None:
+        why.append(
+            f"{candidate.name} can spawn the engine user but F21 has not fully run "
+            f"(unmeasured: {', '.join(open_items)})"
+        )
+    else:
+        why.append(
+            "no spawnable engine-user backend is available without installing a "
+            "helper or editing sudoers/polkit"
+        )
+    if stand_ins:
+        why.append(
+            "shared system accounts are measurement stand-ins, never the engine "
+            f"user: {', '.join(stand_ins)}"
+        )
     return SelectedPath(
         "managed_login_folder",
         True,
-        "no spawnable other-uid backend is available without installing a helper "
-        "or editing sudoers/polkit; managed-login-folder fallback ships as beta "
+        f"{'; '.join(why)}; managed-login-folder fallback ships as beta "
         '(Lucas, Nov 7: "Yes the fallback ships as beta")',
         None,
+        candidate,
     )
 
 
@@ -1082,6 +1159,9 @@ def _is_launch_failure(name: str, detail: str) -> bool:
     if name == "abs_store_read":
         return "writer_" in detail
     if name in {"proc_pid_root", "ptrace"}:
+        # "ptrace unavailable: libc not found" is a host limit, not a launch.
+        if detail.startswith("ptrace unavailable"):
+            return False
         return (
             "not found" in detail
             or "no process with uid" in detail
@@ -1120,6 +1200,24 @@ def _launch_failure(probes: Sequence[ProbeSummary]) -> str | None:
     return "; ".join(reasons)
 
 
+def _f21_not_blocked(probes: Sequence[ProbeSummary]) -> str | None:
+    """Return a reason when any F21 channel is not blocked on every attempt."""
+
+    reasons = [
+        f"{probe.name} {probe.blocked_count} blocked/{probe.open_count} open/"
+        f"{probe.error_count} error of {probe.n}: {probe.detail}"
+        for probe in probes
+        if not probe.blocked
+    ]
+    names = {probe.name for probe in probes}
+    for name in ("proc_pid_root", "ptrace", "abs_store_read"):
+        if name not in names:
+            reasons.append(f"{name} not probed")
+    if not reasons:
+        return None
+    return "; ".join(reasons)
+
+
 def evaluate_host(
     *,
     n: int = DEFAULT_N,
@@ -1128,6 +1226,7 @@ def evaluate_host(
     backends: Sequence[Backend] | None = None,
     measure_fn: Callable[[Backend, int], Overhead] = measure_overhead,
     probe_fn: Callable[[Backend, int], tuple[ProbeSummary, ...]] = run_same_uid_probes,
+    f21_open: Sequence[str] | None = None,
 ) -> Evaluation:
     """Measure every spawnable other-uid backend, then select a path.
 
@@ -1137,6 +1236,11 @@ def evaluate_host(
     of aborting the evaluation. Failure to launch the probe process or write
     the store is treated the same way: those are not F21 channel outcomes,
     and they must not leave an unusable backend selected.
+
+    A backend that launches but leaves any F21 channel open or errored is
+    kept in ``overhead`` and ``probes`` as evidence, recorded in ``errors``,
+    and marked unavailable: the separate uid exists to close those channels.
+    ``f21_open`` is passed to ``select_path``.
     """
 
     if n < 10:
@@ -1181,9 +1285,23 @@ def evaluate_host(
             continue
         overhead[backend.name] = measured
         probes[backend.name] = probed
+        not_blocked = _f21_not_blocked(probed)
+        if not_blocked is not None:
+            errors[backend.name] = f"F21 channels not blocked: {not_blocked}"
+            final.append(
+                replace(
+                    backend,
+                    available=False,
+                    reason=(
+                        f"{backend.reason}; F21 channels not blocked, not selectable: "
+                        f"{not_blocked}"
+                    ),
+                )
+            )
+            continue
         final.append(backend)
     backends = tuple(final)
-    selected = select_path(backends)
+    selected = select_path(backends, f21_open=f21_open)
     return Evaluation(
         product_commit=PRODUCT_MD_COMMIT,
         product_sha256=PRODUCT_MD_SHA256,
@@ -1210,6 +1328,8 @@ __all__ = [
     "HEADLESS_SECRET_SERVICE_LIVE",
     "PRODUCT_MD_COMMIT",
     "PRODUCT_MD_SHA256",
+    "SHARED_SYSTEM_ACCOUNTS",
+    "SHARED_SYSTEM_UIDS",
     "SLEEP_PROBE_ARGV",
     "SPAWNABLE_BACKENDS",
     "SUDO_REQUIRED_COMMANDS",
@@ -1224,7 +1344,9 @@ __all__ = [
     "collect_host_facts",
     "detect_backends",
     "evaluate_host",
+    "f21_open_items",
     "find_target_uid_pid",
+    "is_shared_system_account",
     "measure_overhead",
     "percentile",
     "run_same_uid_control_probes",

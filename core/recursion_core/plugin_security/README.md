@@ -58,14 +58,15 @@ manifest names itself `host` to reach host-only ops (`host` is a reserved plugin
 Same-uid is not a security boundary. The real boundary is a separate OS user or process
 (F21), and F21 is not done.
 
-**Nov 11 same-uid fallback (O69, decided).** Lucas, Nov 8 (t1418u), O69 correction; not yet in PRODUCT.md 055cc7a5:
+**Nov 11 same-uid fallback (O69, Lucas's Nov 8 direction; not accepted text).** Lucas, Nov 8 (t1418u), O69 correction; not yet in PRODUCT.md 055cc7a5:
 
 > "it should have permission to run paper testing nov 11 regardless"
 
 Implementation explanation (not Lucas's quoted words): under the same-uid fallback the signed authority profile is tamper evidence, not a
 boundary: it binds honest plugins and records what happened, and the mutants above
 still rewrite it. The in-process Cockpit plugin holds paper-order permission on Nov 11.
-Paper only. This fallback grants no live-order permission; live capital stays
+Paper only, by PRODUCT.md 5.2 / CP0-v2 ("order authority stays paper-first"), not by O69: O69 is
+the signed-profile item. This fallback grants no live-order permission; live capital stays
 separately authorised (PRODUCT.md 5.2). The code has one `order` permission.
 `scope.environment` is signed into the profile and the approval digest and must match
 exactly, so a `paper` profile cannot charge a `live` effect; but the core does not

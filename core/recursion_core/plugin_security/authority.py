@@ -33,7 +33,8 @@ process for the anchor and ledger (F11, F21); F21 is not done.
 Nov 11 same-uid fallback (O69, ``policy.SAME_UID_FALLBACK_POLICY``; Lucas, Nov 8,
 t1418u; not yet in PRODUCT.md 055cc7a5). Implementation explanation, not a quote:
 the in-process Cockpit plugin holds paper-order permission. Under that
-fallback the signed authority profile is tamper evidence, not a boundary. Paper only;
+fallback the signed authority profile is tamper evidence, not a boundary. Paper only
+(PRODUCT.md 5.2 / CP0-v2, order authority stays paper-first; O69 is the signed-profile item);
 live capital stays separately authorised (PRODUCT.md 5.2). This module has one
 ``order`` permission. ``scope.environment`` is signed into the profile and the effect's
 approval digest and must match exactly, so a profile signed for ``paper`` cannot charge
@@ -64,6 +65,9 @@ _FIELDS = frozenset({"schema", "profile_id", "issuer", "plugin_id", "artifact_sh
 _BUDGETS = frozenset({"currency", "max_effect_minor", "total_minor"})
 _ID = re.compile(r"[a-z0-9][a-z0-9_.:-]{0,127}")
 _SCOPE_VALUE = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
+# Provider and model version use the same grammar ``ConnectionBreaker.bind_run`` accepts (``breaker._ID``),
+# so every model a run can be bound to (``vendor/model``, ``model@rev``) can also be named in a profile.
+_MODEL_VALUE = re.compile(r"[A-Za-z0-9_.:@/-]{1,128}")
 _KIND = re.compile(r"[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+")
 _LEDGER_MAGIC = "csl-authority-ledger/v0"
 
@@ -141,7 +145,7 @@ class Authority:
         if (type(scope) is not dict or set(scope) != SCOPE_FIELDS
                 or any(type(v) is not str or not _SCOPE_VALUE.fullmatch(v) for v in scope.values())):
             raise Refused("profile_scope")
-        if any(type(profile[k]) is not str or not _SCOPE_VALUE.fullmatch(profile[k])
+        if any(type(profile[k]) is not str or not _MODEL_VALUE.fullmatch(profile[k])
                for k in ("provider", "model_version")):
             raise Refused("profile_model")
         actions = profile["actions"]

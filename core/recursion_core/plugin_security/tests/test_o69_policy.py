@@ -74,7 +74,15 @@ class PolicyTextTests(unittest.TestCase):
         readme = _flat(_read("README.md")).lower()
         for phrase in ("remains a founder step", "founder step", "undecided", "not yet decided"):
             self.assertNotIn(phrase, readme)
-        self.assertIn("nov 11 same-uid fallback (o69, decided)", readme)
+        self.assertIn("nov 11 same-uid fallback (o69, lucas's nov 8 direction; not accepted text)", readme)
+
+    def test_paper_only_is_cited_to_5_2_and_cp0_v2_not_o69(self) -> None:
+        # t1430u brief: paper-only is PRODUCT.md 5.2 / CP0-v2; O69 is the signed-profile item.
+        for name in ("README.md", "authority.py"):
+            text = _flat(_read(name))
+            self.assertIn("PRODUCT.md 5.2 / CP0-v2", text, name)
+            self.assertNotRegex(text, r"(?i)paper[- ]only \(O69", name)
+            self.assertNotIn("O69, decided", text, name)
 
 
 @needs_crypto

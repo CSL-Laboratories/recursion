@@ -250,6 +250,16 @@ class AuthorityFieldTests(unittest.TestCase):
         old_scope = effect(scope={"account": "paper-acct", "venue": "paper"})  # pre-K3 effect shape
         self.assertEqual(_code(self.w.call(self.w.plugin, "effect.request", effect=old_scope)), "effect_scope")
 
+    def test_a_bindable_model_name_can_be_named_in_a_profile(self) -> None:
+        # Bot review 4511542761 at 7e5c3502: run.bind accepted "vendor/model" and "@", but profile validation
+        # refused both, so no profile could authorise an order from such a run.
+        from recursion_core.plugin_security import authority, breaker
+        self.assertEqual(authority._MODEL_VALUE.pattern, breaker._ID.pattern)
+        self.w.bind("run-3", "conn-a", provider="acme", model_version="acme/model-v1@2026-11")
+        env = profile(self.w.installer, profile_id="prof-3", provider="acme", model_version="acme/model-v1@2026-11")
+        self.assertTrue(self._authorize(effect(run_id="run-3"), env)["ok"])
+        env = profile(self.w.installer, profile_id="prof-4", model_version="bad model")
+        self.assertEqual(_code(self._authorize(effect(), env)), "profile_model")
 
 @needs_crypto
 class PermissionAndBreakerTests(unittest.TestCase):

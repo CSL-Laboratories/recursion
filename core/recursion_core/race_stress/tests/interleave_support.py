@@ -25,6 +25,8 @@ import types
 import unittest
 from pathlib import Path
 
+from recursion_core.race_stress.pins import require_pinned
+
 ITERATIONS = int(os.environ.get("RACE_STRESS_ITERS", "20"))
 THREADS = int(os.environ.get("RACE_STRESS_THREADS", "8"))
 SEED = int(os.environ.get("RACE_STRESS_SEED", "0")) or random.SystemRandom().randrange(1, 2**31)
@@ -45,6 +47,7 @@ def ref_root(env: str) -> Path:
     root = Path(value)
     if not root.is_dir():
         raise unittest.SkipTest(f"{env}={value} is not a directory")
+    require_pinned(env, root)  # skips, with a message, on a tree nobody pinned
     return root
 
 

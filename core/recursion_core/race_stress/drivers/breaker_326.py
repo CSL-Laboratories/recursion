@@ -11,7 +11,9 @@ Checks:
 * linearizability: replaying the history in stamp order on a fresh breaker (each call given
   the clock values it read) reproduces every result and the final state;
 * one probe per key: in that order, no key leases a second half-open probe while an earlier
-  probe's lease is live and unresolved (closed, released, reopened or reset);
+  probe's lease is live and unresolved (closed, released, reopened or reset). A probe whose
+  holder reports a limit frees its lease on the key it held even when the limit opens a
+  different key (#326 ``_open`` releases the probe first);
 * no call raises.
 """
 
@@ -145,9 +147,12 @@ def one_iteration(mod, c, rng, args, v: h.Violations, counters: dict) -> None:
             counters["probes"] += 1
         elif name == "record":
             probe = kw.get("probe")
-            if result in ("closed", "probe_released", "short_fault", "none") and probe:
+            # A probe's lease ends when its holder reports it: closed, released, or (since #326
+            # 09d0c36f) opened, where the limit may name a different key than the one the probe
+            # leased and the lease is freed on whichever key held it.
+            if probe and result in ("closed", "probe_released", "opened"):
                 for key, (token, _) in list(live.items()):
-                    if token == probe and result in ("closed", "probe_released"):
+                    if token == probe:
                         del live[key]
             if result == "opened":
                 conn, model = a[0], a[1]

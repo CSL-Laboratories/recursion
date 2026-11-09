@@ -4,11 +4,17 @@ Concurrency stress for core code that lives on stacked PRs. Mock only: the syste
 and the vendor clock are in-memory fakes; nothing launches and no provider or network is
 touched.
 
-| Driver | Measured code | Pinned head |
+| Driver | Measured code | Pinned head (`pins.py`) |
 | --- | --- | --- |
-| `drivers/daemon_324.py` | recursion #324 `core/recursion_core/daemon/__init__.py` (Registry, Daemon, UserLock) | `55a31508` |
-| `drivers/breaker_326.py` | recursion #326 `core/recursion_core/routes/breaker.py` | `82247cbc` |
-| `drivers/breaker_328.py` | recursion #328 `core/recursion_core/plugin_security/breaker.py` | `0264628b` |
+| `drivers/daemon_324.py` | recursion #324 `core/recursion_core/daemon/` (Registry, Daemon, UserLock) | `7c729db9` |
+| `drivers/breaker_326.py` | recursion #326 `core/recursion_core/routes/breaker.py` | `3147f979` |
+| `drivers/breaker_328.py` | recursion #328 `core/recursion_core/plugin_security/breaker.py` (SQLite store, probe leases) | `54a2d771` |
+
+`pins.py` holds each pinned head and the git object ids of the measured paths. A test uses a
+`RACE_STRESS_TREE_*` checkout only when its HEAD is the pinned head, or when every measured
+path has the pinned object id (the PR moved but the measured code did not). Any other tree
+skips with a message naming both heads; `RACE_STRESS_UNPINNED=1` measures it anyway. Earlier
+heads of this PR measured #324 `55a31508`/`9aa03185`, #326 `82247cbc` and #328 `0264628b`.
 
 Each driver prints one JSON line with the tree's git HEAD, the measured file's SHA-256, the
 interpreter (free-threaded build, GIL state), the seed, counters and any violations. It runs as
@@ -49,28 +55,28 @@ PYTHON_GIL=0 python3.14t -X gil=0 -B core/recursion_core/race_stress/drivers/bre
 
 ## Findings
 
-* **#328 breaker: a probe older than a trip clears it.** `reset_after_probe(connection, True)`
-  takes no probe identity, lease or trip generation, so a probe that ended before a newer
-  typed limit still erases that limit. `drivers/repro_328_stale_probe.py` is the minimal
-  repro; `breaker_328.py` counts it as `lost_trips`. Reproduces on CPython 3.13.5 and on
-  3.14t: it is a logic race, not a free-threading one. The two tests that state the wanted
-  behaviour are `expectedFailure` until #328 changes. The #326 breaker does not have it: its
-  probe tokens are dropped when a key reopens.
-* **#328 breaker: a reset with no leased probe clears a trip.** Wider than the ordering race
-  above. #328 has no admit or lease call, so `reset_after_probe(connection, True)` is only the
-  caller's word that a probe succeeded, and it clears any trip. PRODUCT.md 055cc7a5 3.4 S3 says
-  "a leased probe resets it", and the engine contract's "Report a plan limit" item 4 says the
-  same. A trip-generation fix alone would turn the two tests above into passes and leave this
-  open, so `test_interleave_breaker.py::test_reset_without_a_leased_probe_does_not_clear_a_trip`
-  pins it as `expectedFailure`. The repro and the report/reset flap test use unleased resets
-  because no lease can be taken; the flap test checks only that `tripped` and `check` agree.
-* **#326 breaker: a model-scoped limit from a connection probe fences every model.** When the
-  probe leased on the connection key ends with a model-scoped `PLAN_LIMIT`, `record` opens the
-  model key but leaves the connection key's lease in place. Every other model on that
-  connection is then refused `probe_in_flight` until `probe_lease_s` (default 150 s) runs out,
-  against S3 ("per model only where the vendor meters per model"). Sequential, not a
-  free-threading race. Pinned as `expectedFailure` by
-  `test_interleave_breaker.py::test_model_limit_from_a_connection_probe_leaves_other_models_available`.
+Status at the pinned heads (Nov 9, t1430u): the two #328 findings and the #326 finding
+below are **fixed**. Their tests are now plain tests, not `expectedFailure`.
+
+* **#328 breaker: a probe older than a trip clears it (CSL-804). Fixed at #328 `afe38c1f`.**
+  At `0264628b`, `reset_after_probe(connection, True)` took no probe identity, lease or trip
+  generation, so a probe that ended before a newer typed limit still erased it (about 190k
+  lost trips per 1000 iterations on both builds). Now `begin_probe` hands out one lease per
+  tripped connection, `report` drops it on every new trip, and `reset_after_probe(connection,
+  lease, ok)` clears only for that live lease. `drivers/repro_328_stale_probe.py` (rewritten
+  for the lease API) and `breaker_328.py`'s `lost_trips` both show 0. With the lease drop
+  removed in a local mutant of `afe38c1f`, the repro, the stress test and
+  `test_lease_dropped_by_a_newer_trip_cannot_clear_it` all fail again.
+* **#328 breaker: a reset with no leased probe clears a trip. Fixed at `afe38c1f`.** No lease,
+  a made-up lease or a non-string lease now leaves the trip in place
+  (`test_reset_without_a_leased_probe_does_not_clear_a_trip`).
+* **#326 breaker: a model-scoped limit from a connection probe fenced every model. Fixed at
+  #326 `09d0c36f`.** `_open` now releases the probe on whichever key held it. This is pinned by
+  `test_model_limit_from_a_connection_probe_leaves_other_models_available`, which was an
+  unexpected success at the new head and is now a plain test. `breaker_326.py`'s
+  one-probe-per-key check models that release, so an opened result ends the reporting
+  probe's lease. Without that modelling, the driver reported 9 false "second live probe"
+  violations at `09d0c36f`.
 * **#324 registry lock is load-bearing for memory safety.** With the Registry and Daemon
   locks removed (`--mutant`), the shared `sqlite3` connection crashes the interpreter with
   SIGSEGV on both builds. The real code holds the lock on every connection use, and no
@@ -87,8 +93,8 @@ checks the invariant across it. They load the measured module in-process from th
 | File | Target | Windows forced |
 | --- | --- | --- |
 | `test_interleave_registry.py` | #324 registry | Stop committed while a reconcile holds a stale `Run` and is paused in `observe` (B14); `Daemon.stop` behind a paused sweep; random writers against terminal stickiness |
-| `test_interleave_breaker.py` | #326 routes breaker | half-open stampede at the exact cooldown end; lease handover stampede plus a late report from the expired probe; all 6 orders of reset / new limit / stale probe; a typed limit landing mid-probe (the #328 interleaving: #326 keeps the key open); a model-scoped limit from a connection probe (`expectedFailure`, see Findings); untyped storms; randomized mix with a lock-held monitor |
-| | #328 plugin breaker | concurrent `bind_run` of one run; fault and trip monotonic for every later `check`; report/reset flapping keeps `tripped` and `check` consistent (unleased resets); a reset with no leased probe is refused (`expectedFailure`, see Findings) |
+| `test_interleave_breaker.py` | #326 routes breaker | half-open stampede at the exact cooldown end; lease handover stampede plus a late report from the expired probe; all 6 orders of reset / new limit / stale probe; a typed limit landing mid-probe (the #328 interleaving: #326 keeps the key open); a model-scoped limit from a connection probe leaves other models available (fixed at `09d0c36f`); untyped storms; randomized mix with a lock-held monitor |
+| | #328 plugin breaker | concurrent `bind_run` of one run; fault and trip monotonic for every later `check`; report / leased-probe-reset flapping keeps `tripped` and `check` consistent; a reset with no lease, a made-up lease or a non-string lease is refused; a lease dropped by a newer trip cannot clear it (CSL-804); one live lease per connection under a stampede, and an expired lease cannot reset |
 
 Sensitivity (local, not committed): removing B14's `CASE` in `Registry.state`, or the lock in
 #326 `admit`, makes these tests fail (B14 broken; 8 probes leased instead of 1).

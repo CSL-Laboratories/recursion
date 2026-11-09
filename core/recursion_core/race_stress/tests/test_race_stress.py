@@ -27,6 +27,8 @@ DRIVERS = Path(__file__).resolve().parents[1] / "drivers"
 sys.path.insert(0, str(DRIVERS))
 import _harness as h
 
+from recursion_core.race_stress.pins import require_pinned
+
 FREE_THREADED = bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
 
 
@@ -56,6 +58,7 @@ def tree(name: str) -> str:
     value = os.environ.get(name)
     if not value:
         raise unittest.SkipTest(f"{name} not set; see README.md")
+    require_pinned(name, Path(value))  # skips, with a message, on a tree nobody pinned
     return value
 
 
@@ -107,6 +110,39 @@ class HarnessTests(unittest.TestCase):
             self.assertFalse(rt["gil_enabled"], "run the suite with -X gil=0")
 
 
+class PinTests(unittest.TestCase):
+    """The tree-HEAD pin itself (t1430u X1b): an unpinned tree is never measured silently."""
+
+    def test_a_tree_that_is_not_a_checkout_is_refused_with_a_message(self) -> None:
+        import tempfile
+        from recursion_core.race_stress.pins import PINS, pin_status
+        with tempfile.TemporaryDirectory() as tmp:
+            for env in PINS:
+                ok, message = pin_status(env, Path(tmp))
+                self.assertFalse(ok)
+                self.assertIn(PINS[env]["head"][:8], message)
+
+    def test_wrong_head_is_refused_and_names_both_heads(self) -> None:
+        from recursion_core.race_stress.pins import pin_status
+        here = Path(__file__).resolve().parents[4]  # this checkout: not any measured head
+        ok, message = pin_status("RACE_STRESS_TREE_328", here)
+        if ok:
+            self.skipTest("this checkout happens to carry the pinned #328 files")
+        self.assertIn("54a2d771", message)
+        self.assertIn("RACE_STRESS_UNPINNED=1", message)
+
+    def test_set_trees_match_their_pins(self) -> None:
+        from recursion_core.race_stress.pins import PINS, pin_status
+        checked = 0
+        for env in PINS:
+            value = os.environ.get(env)
+            if value:
+                ok, message = pin_status(env, Path(value))
+                self.assertTrue(ok or os.environ.get("RACE_STRESS_UNPINNED") == "1", message)
+                checked += 1
+        if not checked:
+            self.skipTest("no RACE_STRESS_TREE_* set")
+
 class DaemonRegistry324(unittest.TestCase):
     def test_invariants_hold_under_concurrency(self) -> None:
         result = run_driver("daemon_324.py", tree("RACE_STRESS_TREE_324"))
@@ -137,18 +173,22 @@ class PluginSecurityBreaker328(unittest.TestCase):
         result = run_driver("breaker_328.py", tree("RACE_STRESS_TREE_328"), iters=5, mutant=True)
         self.assertGreater(result["violation_count"], 0)
 
-    @unittest.expectedFailure  # CSL-801 finding: a probe older than a trip clears it (see README.md)
+    # CSL-804: a probe older than a trip cleared it at #328 0264628b (these two tests were
+    # expectedFailure). #328 afe38c1f drops the probe lease on a new trip; both now pass.
     def test_probe_older_than_a_trip_does_not_clear_it(self) -> None:
         result = run_driver("breaker_328.py", tree("RACE_STRESS_TREE_328"), iters=3)
+        self.assertEqual(result["violation_count"], 0, result["violations"])
+        self.assertGreater(result["counters"]["stale_probe_leases"], 0, result["counters"])
         self.assertEqual(result["counters"]["lost_trips"], 0, result["counters"])
 
-    @unittest.expectedFailure  # same finding, deterministic minimal repro
     def test_minimal_repro_probe_older_than_a_trip(self) -> None:
         argv = [sys.executable, "-B", str(DRIVERS / "repro_328_stale_probe.py"), "--tree",
                 tree("RACE_STRESS_TREE_328")]
         out = json.loads(subprocess.run(argv, capture_output=True, text=True, timeout=60, check=True).stdout)
         self.assertFalse(out["erased"], out)
-
+        self.assertFalse(out["reset_returned"], out)
+        self.assertTrue(out["tripped_after"], out)
+        self.assertEqual(out["check_after"], "connection_tripped", out)
 
 if __name__ == "__main__":
     unittest.main()

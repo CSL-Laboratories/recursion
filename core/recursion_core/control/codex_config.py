@@ -1,6 +1,6 @@
 """Operator Codex config snippet for the Control MCP (CSL-798, candidate). See README.md.
 
-PRODUCT.md 398cd812, O41 (decided Nov 7, "All picks"): the operator's Codex config sets stop's
+PRODUCT.md 055cc7a5, O41 (decided Nov 7, "All picks"): the operator's Codex config sets stop's
 per-tool ``approval_mode = "approve"`` under ``mcp_servers.<id>.tools.<tool>``, so stop does not
 prompt where that setting is in place. Exception: ``strict_auto_review`` or a managed approval
 requirement can still force a prompt. Without the setting, stop prompts in Auto mode and is refused
@@ -24,7 +24,7 @@ def codex_operator_snippet(server_id: str, command: str, args: list[str] | None 
     if not _BARE_KEY.match(server_id):
         raise ValueError("server_id must be a bare TOML key")
     lines = [
-        "# Recursion Control MCP (PRODUCT.md 398cd812, O41).",
+        "# Recursion Control MCP (PRODUCT.md 055cc7a5, O41).",
         "# stop is marked destructiveHint: true, openWorldHint: false. The per-tool approval_mode below",
         "# makes Codex approve it without a prompt. strict_auto_review or a managed approval requirement",
         "# can still force a prompt. Without this setting, stop prompts in Auto mode and is refused under",

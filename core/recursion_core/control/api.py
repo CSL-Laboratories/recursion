@@ -1,6 +1,6 @@
 """Control API: the one path every surface uses to start, read and stop runs (CSL-798, candidate).
 
-PRODUCT.md 398cd812, 3.4 S6 and 11.3/11.8: Stop follows the #916 procedure on every surface, and a Stop
+PRODUCT.md 055cc7a5 (CSLR-D-011), 3.4 S6 and 11.3/11.8: Stop follows the #916 procedure on every surface, and a Stop
 that has not been confirmed answers "pending", never "stopped". Surfaces (the CLI now, the GUI and the
 Control MCP later) call ``ControlAPI.call(method, params)`` with plain dicts and print what it returns;
 none has its own Stop path.
@@ -23,7 +23,8 @@ Start writes a launch intent first: the API picks the run id, records the run as
 ``start_key``), and only then calls the starter with that id. So a launched run is always listed, Stop
 always finds it, and a same-key retry always sees it. If the write after launch fails
 (``start_unconfirmed``), the API keeps the starter's cgroup in memory: Stop aims cleanup at it, and a
-same-key retry records it once the registry answers. A Stop that arrives before the launch is recorded
+same-key retry records it once the registry answers. That launch stays stoppable while the registry
+cannot even be read: Stop then aims at the record this process kept and answers ``"recorded": false``. A Stop that arrives before the launch is recorded
 answers ``pending`` / ``cgroup_unknown`` and is kept as a stop intent (in the record and in memory); the
 start acts on it once the launch is recorded, and its answer carries that stop result. A same-key retry
 repeats an unconfirmed or failed answer and never upgrades it to ``started``: a starter that raised is
@@ -48,6 +49,8 @@ with the original run (11.3, B-17).
 
 Stop decisions and launch records are serialised per run, so a slow or hung cleanup on one run never
 queues another run's Stop (11.3, D2-55 / B-19), and a launch never overwrites a Stop that landed during it.
+Starts are serialised only per ``(tenant, client_key)``: a slow or hung starter delays only a retry of the
+same start, never another start.
 """
 
 from __future__ import annotations
@@ -91,9 +94,10 @@ class ControlAPI:
         # One stop or launch-record decision per run, so a kill is never sent twice and a Stop that lands
         # during a launch is never overwritten by it.
         self._run_locks: dict[str, threading.Lock] = {}
-        self._start_lock = threading.Lock()  # a retried start with the same client_key launches once
+        # A retried start with the same (tenant, client_key) launches once; other starts never wait on it.
+        self._start_locks: dict[tuple[str, str], threading.Lock] = {}
         # In-memory only (a restart loses them; reconciling then is the CSL-738 startup sweep):
-        self._launched: dict[str, str] = {}  # run_id -> cgroup of a launch whose record write failed
+        self._launched: dict[str, dict] = {}  # run_id -> record (with cgroup) of a launch whose write failed
         self._stop_wanted: set[str] = set()  # Stops that arrived before the launch was recorded
         self._failed: set[str] = set()  # starts that raised but whose start_failed write failed
 
@@ -137,7 +141,12 @@ class ControlAPI:
         for name in ("tenant", "engine", "prompt"):
             if not isinstance(params.get(name), str) or not params[name]:
                 return {"code": REQUEST_INVALID, "detail": name}
-        with self._start_lock:
+        key = params.get("client_key")
+        if not isinstance(key, str):
+            return self._start(params)  # no key: a fresh run id, nothing to dedupe
+        with self._locks_lock:
+            lock = self._start_locks.setdefault((params["tenant"], key), threading.Lock())
+        with lock:
             return self._start(params)
 
     def _start(self, params: Mapping) -> dict:
@@ -175,9 +184,9 @@ class ControlAPI:
         with self._run_lock(run_id):
             # Known to this process even if the write below fails, so Stop and a retry can still aim at it
             # (red-team r3 finding 1).
-            self._launched[run_id] = cgroup
             current = self._current(rec)  # re-read: keeps a stop intent written while the starter ran
             current.update(state="running", cgroup=cgroup)
+            self._launched[run_id] = dict(current)
             if current.get("stop") is not None or run_id in self._stop_wanted:
                 # A Stop arrived during the launch and answered pending; act on it now (red-team r3 finding 2).
                 stop = self._stop(current)
@@ -200,7 +209,7 @@ class ControlAPI:
             return None  # the starter refused: relaunch under the same run id
         if state != "starting" or prior.get("cgroup"):
             return {"code": STARTED, "run": prior, "duplicate": True}
-        cgroup = self._launched.get(run_id)
+        cgroup = self._launched_cgroup(run_id)
         if cgroup is None:  # starter handle had no cgroup, or a restart lost it: nothing confirms the launch
             return {"code": START_UNCONFIRMED, "run": prior, "duplicate": True, "detail": "launch_unconfirmed"}
         prior.update(state="running", cgroup=cgroup)  # launched here, but the write after launch failed
@@ -208,6 +217,10 @@ class ControlAPI:
             return {"code": START_UNCONFIRMED, "run": prior, "duplicate": True, "detail": "registry_unavailable"}
         self._launched.pop(run_id, None)
         return {"code": STARTED, "run": prior, "duplicate": True}
+
+    def _launched_cgroup(self, run_id: str) -> str | None:
+        launched = self._launched.get(run_id)
+        return launched.get("cgroup") if launched is not None else None
 
     def _current(self, rec: dict) -> dict:
         """The registry's copy of ``rec``, or ``rec`` itself if the registry cannot answer."""
@@ -230,13 +243,25 @@ class ControlAPI:
 
     # -- stop ---------------------------------------------------------------------------------
     def stop(self, run_id: str) -> dict:
-        if self._reg("get", run_id) is None:  # no lock is kept for ids that name no run
+        if self._stop_target(run_id) is None:  # no lock is kept for ids that name no run
             return {"code": RUN_UNKNOWN, "run_id": run_id}
         with self._run_lock(run_id):
-            rec = self._reg("get", run_id)
+            rec = self._stop_target(run_id)
             if rec is None:
                 return {"code": RUN_UNKNOWN, "run_id": run_id}
             return self._stop(rec)
+
+    def _stop_target(self, run_id: str) -> dict | None:
+        """The registry's record, or, when the registry cannot be read, the record this process kept for a
+        launch whose write failed: that run is live and its cgroup is known, so Stop still reaches cleanup
+        (S6). Any other read failure answers ``registry_unavailable``."""
+        try:
+            return self._reg("get", run_id)
+        except _RegistryError:
+            launched = self._launched.get(run_id)
+            if launched is None:
+                raise
+            return dict(launched)
 
     def _stop(self, rec: dict) -> dict:
         """One stop decision on ``rec``. Caller holds the run lock."""
@@ -244,7 +269,7 @@ class ControlAPI:
         if rec["state"] == "stopped":
             return {"code": STOPPED, "run_id": run_id, "state": "stopped", "repeat": True}
         if not rec.get("cgroup"):
-            cgroup = self._launched.get(run_id)
+            cgroup = self._launched_cgroup(run_id)
             if cgroup is None:  # launch not confirmed yet (starting / start_failed): keep the Stop as intent
                 return self._stop_intent(rec)
             rec.update(state="running", cgroup=cgroup)  # launched, write after launch failed: aim at it now

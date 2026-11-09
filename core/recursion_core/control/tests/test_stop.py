@@ -1,4 +1,4 @@
-"""Stop semantics through the control API (PRODUCT.md 398cd812 S6, 11.3, 11.8)."""
+"""Stop semantics through the control API (PRODUCT.md 055cc7a5, CSLR-D-011: S6, 11.3, 11.8)."""
 
 from __future__ import annotations
 
@@ -432,6 +432,82 @@ class RegistryFailureTest(unittest.TestCase):
             with self.subTest(method=method):
                 self.assertEqual(api.call(method, params)["code"], a.REGISTRY_UNAVAILABLE)
         self.assertEqual((kill.requests, starter.calls), ([], []))
+
+
+    def test_stop_reaches_an_unrecorded_launch_when_the_registry_cannot_be_read(self) -> None:
+        # t1430u X1c (round-3 follow-up): the write after launch failed and now reads fail too. The API
+        # still holds that launch's record, so Stop reaches cleanup and says it is unrecorded (S6).
+        registry = FailingRegistry()
+        api, _, kill, _ = make_api(FakeKillTree([EMPTY]), registry=registry)
+        registry.fail_puts = "running"
+        self.assertEqual(api.call("run.start", self.P)["code"], a.START_UNCONFIRMED)
+        registry.fail_puts, registry.fail_reads = True, True
+        stop = api.call("run.stop", {"run_id": "run-1"})
+        self.assertEqual((stop["code"], stop["recorded"]), (a.STOPPED, False))
+        self.assertEqual(kill.requests, ["/sys/fs/cgroup/fake/run-1"])
+        # A run this process never launched still answers registry_unavailable and sends nothing.
+        self.assertEqual(api.call("run.stop", {"run_id": "run-2"})["code"], a.REGISTRY_UNAVAILABLE)
+        self.assertEqual(len(kill.requests), 1)
+        registry.fail_puts, registry.fail_reads = False, False
+        api.call("run.stop", {"run_id": "run-1"})
+        self.assertEqual(registry.get("run-1")["state"], "stopped")
+
+
+class StartConcurrencyTest(unittest.TestCase):
+    # t1430u X1c (round-3 follow-up): starts were serialised by one API-wide lock held across the starter,
+    # so one hung launch blocked every other start, for every tenant.
+
+    def _blocking_starter(self, block_tenant: str):
+        in_starter, release, calls = threading.Event(), threading.Event(), []
+
+        def starter(params: dict) -> dict:
+            calls.append(params["run_id"])
+            if params["tenant"] == block_tenant:
+                in_starter.set()
+                release.wait(10)
+            return {"cgroup": f"/cg/{params['run_id']}"}
+
+        return starter, in_starter, release, calls
+
+    def test_a_hung_starter_does_not_block_another_start(self) -> None:
+        starter, in_starter, release, _ = self._blocking_starter("slow")
+        api, _, _, _ = make_api(starter=starter)
+        t = threading.Thread(target=api.call, args=(
+            "run.start", {"tenant": "slow", "engine": "codex", "prompt": "p", "client_key": "k"}))
+        t.start()
+        try:
+            self.assertTrue(in_starter.wait(5))
+            done: list[dict] = []
+            other = threading.Thread(target=lambda: done.append(api.call(
+                "run.start", {"tenant": "fast", "engine": "codex", "prompt": "p", "client_key": "k"})))
+            other.start()
+            other.join(5)
+            self.assertFalse(other.is_alive(), "a start for another tenant waited on a hung starter")
+            self.assertEqual(done[0]["code"], a.STARTED)
+            keyless = threading.Thread(target=api.call, args=(
+                "run.start", {"tenant": "fast", "engine": "codex", "prompt": "p2"}))
+            keyless.start()
+            keyless.join(5)
+            self.assertFalse(keyless.is_alive(), "a start without a client_key waited on a hung starter")
+        finally:
+            release.set()
+            t.join()
+
+    def test_concurrent_same_key_starts_launch_once(self) -> None:
+        starter, in_starter, release, calls = self._blocking_starter("t1")
+        api, _, _, _ = make_api(starter=starter)
+        p = {"tenant": "t1", "engine": "codex", "prompt": "p", "client_key": "k1"}
+        out: list[dict] = []
+        threads = [threading.Thread(target=lambda: out.append(api.call("run.start", p))) for _ in range(4)]
+        for t in threads:
+            t.start()
+        self.assertTrue(in_starter.wait(5))
+        release.set()
+        for t in threads:
+            t.join(10)
+        self.assertEqual(calls, ["run-1"])
+        self.assertEqual(sorted(r["duplicate"] for r in out), [False, True, True, True])
+        self.assertEqual({r["run"]["run_id"] for r in out}, {"run-1"})
 
 
 if __name__ == "__main__":

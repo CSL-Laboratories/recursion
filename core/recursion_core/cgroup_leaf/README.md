@@ -96,12 +96,13 @@ switches no uid.
   times is not 10/10. Each attempt records the caller's uid
   (must be the record's `engine_uid`, not the operator's), its pid, its cgroup
   before the attempt (must already be in the leaf) and the run's expected pids.
-  A manager-absent scope attempt fails when `exit_code` is 0, or when
-  `sleep_cgroup` is present and is not inside the leaf. A missing
-  `sleep_cgroup` with a non-zero exit does not by itself fail that check
-  (open; this pass does not change it). A direct write must name a canonical
-  `cgroup.procs` outside the leaf, write the caller's own pid, and record
-  `refused: true`. An attach attempt must name `AttachProcessesToUnit` on the
+  A manager-absent scope attempt is a refusal only when `exit_code` is not 0,
+  `sleep_cgroup` is `never_started`, `refused` is true, and `error` is a
+  non-empty string. `systemd-run --scope` returns the command's own status, so
+  exit 124 or 143 with a missing `sleep_cgroup` is not a refusal. A cgroup path,
+  including one inside the leaf, is not a refusal either. A direct write must
+  name a canonical `cgroup.procs` outside the leaf, write the caller's own pid,
+  and record `refused: true`. An attach attempt must name `AttachProcessesToUnit` on the
   system bus for the caller's own pid and record `refused: true`. Afterwards
   `/proc/<pid>/cgroup` must name the leaf, or a cgroup below it, for exactly the
   expected pids. Paths must be absolute and canonical (no `.`, `..`, `//`).

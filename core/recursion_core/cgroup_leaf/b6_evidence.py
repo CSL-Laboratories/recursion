@@ -21,10 +21,12 @@ Bars (all kept from 2026-11-07, plus the 2026-11-08 migration probe):
   caller's uid and pid (a pid repeated within an arm fails: one trial copied N
   times is not N trials),
   the caller's cgroup before the attempt (it must already be in the leaf), and the
-  run's expected pids. A manager-absent scope attempt fails when its exit code is
-  0, or when ``sleep_cgroup`` is set and lies outside the leaf. A missing
-  ``sleep_cgroup`` with a non-zero exit does not by itself fail that check.
-  A direct write and an attach call fail unless ``refused`` is true. Afterwards
+  run's expected pids. ``systemd-run --scope`` waits and returns the command's
+  status, so a non-zero exit is not a refusal. A manager-absent scope attempt
+  passes only when ``exit_code`` is not 0, ``sleep_cgroup`` is ``never_started``
+  (missing, null, or any cgroup path fails), ``refused`` is true, and ``error``
+  is a non-empty string. A direct write and an attach call fail unless
+  ``refused`` is true. Afterwards
   ``/proc/<pid>/cgroup`` names the leaf for every expected pid in the run;
 - the same probe, all three methods, n=10 each, with the engine user manager present
   is a control. Its scope attempts must reproduce the 2026-11-07 escape (exit 0, sleep in
@@ -48,6 +50,9 @@ from pathlib import PurePosixPath
 
 N_ESCAPERS, N_PROBE = 120, 10
 SCOPE_ARGV = ('systemd-run', '--user', '--scope', '--', 'sleep', '60')
+# systemd-run --scope returns the command status once the scope exists.
+# Only this sentinel, plus refused and a recorded error, is a refusal (O65).
+NEVER_STARTED = 'never_started'
 HOST_FIELDS = ('host', 'kernel', 'systemd', 'captured_at', 'command_log_sha256')
 METHODS = ('scope', 'direct_write', 'attach_unit')
 ATTACH_CALL = 'org.freedesktop.systemd1.Manager.AttachProcessesToUnit'
@@ -152,16 +157,34 @@ def _shape(attempt, leaf, engine_uid):
     return True, '', readback
 
 
+def _scope_refusal(attempt, leaf):
+    """Manager-absent scope bar. A non-zero exit is not a refusal: --scope waits
+    and returns the sleep's status (man systemd-run, ``--scope``)."""
+    if attempt['exit_code'] == 0:
+        return False, 'systemd-run --user --scope succeeded'
+    if 'sleep_cgroup' not in attempt:
+        return False, 'scope attempt did not record sleep_cgroup'
+    sleep = attempt['sleep_cgroup']
+    if isinstance(sleep, str) and _canonical(sleep) and not _inside(sleep, leaf):
+        return False, f'sleep landed outside the leaf: {sleep!r}'
+    if sleep != NEVER_STARTED:
+        return False, 'scope attempt is not an explicit refusal (sleep_cgroup must be never_started)'
+    if attempt.get('refused') is not True:
+        return False, 'scope attempt was not recorded as refused'
+    error = attempt.get('error')
+    if not isinstance(error, str) or not error.strip():
+        return False, 'scope refusal error not recorded'
+    return True, ''
+
+
 def _absent_attempt(attempt, leaf, engine_uid):
     ok, why, readback = _shape(attempt, leaf, engine_uid)
     if not ok:
         return False, why
     if attempt['method'] == 'scope':
-        if attempt['exit_code'] == 0:
-            return False, 'systemd-run --user --scope succeeded'
-        sleep = attempt.get('sleep_cgroup')
-        if sleep is not None and not _inside(sleep, leaf):
-            return False, f'sleep landed outside the leaf: {sleep!r}'
+        ok, why = _scope_refusal(attempt, leaf)
+        if not ok:
+            return False, why
     elif attempt['method'] == 'direct_write' and attempt['refused'] is not True:
         return False, f'write of own pid to {attempt["target"]} was not refused'
     elif attempt['method'] == 'attach_unit' and attempt['refused'] is not True:

@@ -10,7 +10,7 @@ import random
 import unittest
 
 from recursion_core.cgroup_leaf import b6_evidence
-from recursion_core.cgroup_leaf.b6_evidence import ATTACH_CALL, SCOPE_ARGV, evaluate
+from recursion_core.cgroup_leaf.b6_evidence import ATTACH_CALL, NEVER_STARTED, SCOPE_ARGV, evaluate
 
 LEAF = '/system.slice/csl-b6-wrapper-rerun.service/run-probe'
 OUTSIDE = '/user.slice/user-1000.slice/user@1000.service/app.slice/run-x.scope'
@@ -28,7 +28,8 @@ def attempt(method, *, pid=None, child=None, **fields):
     base = {'method': method, 'uid': ENGINE_UID, 'pid': pid, 'initial_cgroup': LEAF,
             'expected_pids': [pid, child], 'run_pids': {str(pid): LEAF, str(child): LEAF + '/sub'}}
     if method == 'scope':
-        base.update(argv=list(SCOPE_ARGV), exit_code=1, sleep_cgroup=None)
+        base.update(argv=list(SCOPE_ARGV), exit_code=1, sleep_cgroup=NEVER_STARTED,
+                    refused=True, error='Failed to connect to bus: No such file or directory')
     elif method == 'direct_write':
         base.update(target='/user.slice/cgroup.procs', written_pid=pid, refused=True, errno='EACCES')
     else:
@@ -50,8 +51,13 @@ def absent_attempts():
 
 
 def control_attempts():
-    return arm(5101, scope={'exit_code': 0, 'sleep_cgroup': OUTSIDE},
-               direct_write={'refused': False}, attach_unit={'refused': False})
+    attempts = arm(5101, scope={'exit_code': 0, 'sleep_cgroup': OUTSIDE},
+                   direct_write={'refused': False}, attach_unit={'refused': False})
+    for item in attempts:
+        if item['method'] == 'scope':
+            item.pop('refused', None)
+            item.pop('error', None)
+    return attempts
 
 
 def host_record():
@@ -161,6 +167,40 @@ class ContractTests(unittest.TestCase):
     def test_scope_exit_zero_is_failure_even_if_contained(self):
         self.assertEqual(self.mutated(
             lambda r: r['manager_absent']['attempts'][0].update(exit_code=0, sleep_cgroup=LEAF)), 'fail')
+
+    def test_nonzero_exit_without_sleep_cgroup_is_not_a_refusal(self):
+        # O65: systemd-run --scope propagates the command status. 124 and 143
+        # with no sleep_cgroup are not a refusal.
+        for code in (124, 143, 1):
+            record = host_record()
+            attempt = record['manager_absent']['attempts'][0]
+            attempt['exit_code'] = code
+            attempt.pop('sleep_cgroup')
+            result = evaluate(record)
+            self.assertEqual(result['verdict'], 'fail', code)
+            self.assertTrue(any('did not record sleep_cgroup' in reason for reason in result['reasons']))
+
+    def test_null_or_started_sleep_is_not_a_scope_refusal(self):
+        for sleep in (None, '', LEAF, LEAF + '/sub'):
+            record = host_record()
+            record['manager_absent']['attempts'][0].update(exit_code=143, sleep_cgroup=sleep)
+            result = evaluate(record)
+            self.assertEqual(result['verdict'], 'fail', sleep)
+            self.assertTrue(any('never_started' in reason for reason in result['reasons']), sleep)
+
+    def test_scope_killed_outside_the_leaf_is_not_a_refusal(self):
+        record = host_record()
+        record['manager_absent']['attempts'][3].update(exit_code=124, sleep_cgroup=OUTSIDE)
+        result = evaluate(record)
+        self.assertEqual(result['verdict'], 'fail')
+        self.assertTrue(any('outside the leaf' in reason for reason in result['reasons']))
+
+    def test_scope_refusal_needs_refused_and_an_error(self):
+        for fields in ({'refused': False}, {'refused': None}, {'refused': 'yes'},
+                       {'error': ''}, {'error': '  '}, {'error': None}, {'error': 1}):
+            record = host_record()
+            record['manager_absent']['attempts'][0].update(fields)
+            self.assertEqual(self.verdict(record), 'fail', fields)
 
     def test_exit_code_must_be_an_int(self):
         for code in (None, False, True, '1', 1.0):

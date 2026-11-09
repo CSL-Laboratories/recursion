@@ -1,5 +1,5 @@
-"""Claude-subscription route refusal for Pi, Hermes and OpenCode profiles, plus the Nov 8 Copilot and Nous
-own-loop routes (CSL-786, candidate). See README.md."""
+"""Claude-subscription route refusal for Pi, Hermes and OpenCode profiles, plus the 2026-11-08 Copilot and Nous
+own-loop routes and the 2026-11-09 wrapper pins (CSL-786, candidate). See README.md."""
 
 from recursion_core.subscription_routes.gemini_cli import GeminiCliRefused, check_gemini_cli_sign_in
 from recursion_core.subscription_routes.own_loop import (
@@ -22,8 +22,19 @@ from recursion_core.subscription_routes.policy import (
     SUBSCRIPTION_SIGN_INS,
     RouteDecision,
     SubscriptionRouteRefused,
+    check_antigravity_route,
+    check_cursor_route,
     check_route,
+    guard_antigravity_then_spawn,
+    guard_cursor_then_spawn,
     guard_then_spawn,
+)
+from recursion_core.subscription_routes.wrapper_pin import (
+    AntigravityPin,
+    PackagePin,
+    WrapperInstall,
+    measure_antigravity_pin,
+    measure_package_pin,
 )
 
 __all__ = [
@@ -37,6 +48,11 @@ __all__ = [
     "nous_proxy_doctor",
     "GeminiCliRefused",
     "check_gemini_cli_sign_in",
+    "AntigravityPin",
+    "PackagePin",
+    "WrapperInstall",
+    "measure_antigravity_pin",
+    "measure_package_pin",
     "CLAUDE_SUBSCRIPTION_ENV",
     "ENGINES",
     "ENGINE_SELECTOR_ENV",
@@ -46,6 +62,10 @@ __all__ = [
     "SAFE_ENV",
     "SUBSCRIPTION_SIGN_INS",
     "SubscriptionRouteRefused",
+    "check_antigravity_route",
+    "check_cursor_route",
     "check_route",
+    "guard_antigravity_then_spawn",
+    "guard_cursor_then_spawn",
     "guard_then_spawn",
 ]

@@ -54,6 +54,18 @@ class ClassifyHelpTest(unittest.TestCase):
         text = help_with_bare("Minimal mode.", extra="  --no-bare                             Turn bare off\n")
         self.assertEqual(bd.classify_help(text), "present")
 
+    def test_measured_builds_read_unknown(self) -> None:
+        # Full help of the builds measured on 2026-11-08 (bare-default-measured-table.md): the
+        # floor 2.1.314 and npm latest 2.1.319 must keep refusing until their help settles it.
+        for version in ("2.1.312", "2.1.314", "2.1.319"):
+            with self.subTest(version=version):
+                text = (FIXTURE.parent / f"claude-{version}-help.txt").read_text()
+                metadata = bd.auth_mode(text)
+                self.assertEqual(metadata, {"bare_default": "unknown", "bare_opt_out": None})
+                h = Harness([])
+                self.assertEqual(h.handle(request(**metadata))["code"], c.LAUNCH_REFUSED)
+                self.assertEqual(h.launcher.calls, [])
+
     def test_default_wording_in_another_option_does_not_count(self) -> None:
         # 2.1.312 has "default, except under --bare" inside a different option's block.
         extra = ("  --system-prompt-mode <mode>           Rendered on the first request (the\n"
@@ -138,8 +150,9 @@ class ReadHelpTest(unittest.TestCase):
     @unittest.skipUnless(os.environ.get("RECURSION_LIVE_CLAUDE_HELP") == "1" and shutil.which("claude"),
                          "set RECURSION_LIVE_CLAUDE_HELP=1 with claude on PATH")
     def test_local_claude_help(self) -> None:
+        # Every measured build reads "unknown" (refuses); a later build may settle it either way.
         state = bd.probe(shutil.which("claude"), {k: v for k, v in os.environ.items() if k in ("PATH", "HOME")})
-        self.assertIn(state, ("absent", "present"))
+        self.assertIn(state, bd.STATES)
         print(f"\nlocal claude --help: bare_default={state}")
 
 

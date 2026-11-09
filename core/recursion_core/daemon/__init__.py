@@ -182,9 +182,18 @@ class Registry:
                 self.db.close()
 
 
+class UnitNotLoaded(subprocess.SubprocessError):
+    """systemctl stop reported the unit as not loaded (exit 5, "Unit <unit> not loaded.")."""
+    def __init__(self, unit):
+        super().__init__(f'Unit {unit} not loaded')
+        self.unit = unit
+
+
 class ServiceManager(Protocol):
     def start(self, unit: str, argv: list[str]) -> None: ...
-    def stop(self, unit: str) -> None: ...
+    def stop(self, unit: str) -> None:
+        """Stop and wait for inactive. Raises UnitNotLoaded only for systemd's not-loaded error."""
+        ...
     def observe(self, unit: str) -> str:
         """Return running, empty (positively observed ended), gone (not loaded), or unknown."""
         ...
@@ -239,16 +248,25 @@ class Daemon:
         try:
             if boot is None:
                 raise OSError('boot_id unreadable')
-            stopped = False
+            stopped = not_loaded = False
             if run.stop_requested:
-                self.manager.stop(run.unit)
-                stopped = True
+                try:
+                    self.manager.stop(run.unit)
+                    stopped = True
+                except UnitNotLoaded:
+                    not_loaded = True
             observation = self.manager.observe(run.unit)
-            # A gone (not-found) unit is terminated only right after this reconcile's
-            # stop returned: systemctl stop waits for the unit to go inactive, then systemd
-            # garbage-collects it. A unit that is merely absent may never have launched.
-            if observation == 'gone' and stopped:
+            # A gone (not-found) unit is terminated only with a recorded Stop and either
+            # this reconcile's stop returning (systemctl stop waits for inactive, then
+            # systemd garbage-collects the unit) or systemd answering that stop with "not
+            # loaded": a replayed Stop whose earlier stop already ended and collected the
+            # unit, or a run that never launched. Either way nothing runs under the unit,
+            # and a same-name unit that appears later is stopped by the orphan sweep. A unit
+            # that is merely absent with no recorded Stop may never have launched: unknown.
+            if observation == 'gone' and (stopped or not_loaded):
                 observation = 'empty'
+                if not_loaded and not detail:
+                    detail = 'stop: unit not loaded, unit gone'
             state = {'running': 'stopping' if run.stop_requested else 'running',
                      'empty': 'terminated'}.get(observation, 'unknown')
         except (OSError, subprocess.SubprocessError) as exc:
@@ -305,7 +323,14 @@ class SystemdUserManager:
                     '--property=RemainAfterExit=yes', '--', *argv])
 
     def stop(self, unit):
-        self._call(['systemctl', '--user', 'stop', '--', unit])
+        try:
+            self._call(['systemctl', '--user', 'stop', '--', unit])
+        except subprocess.CalledProcessError as exc:
+            # systemctl exits 5 with "Failed to stop <unit>: Unit <unit> not loaded." for a
+            # unit systemd has no record of. Anything else stays a plain stop failure.
+            if exc.returncode == 5 and f'Unit {unit} not loaded' in (exc.stderr or ''):
+                raise UnitNotLoaded(unit) from exc
+            raise
 
     def observe(self, unit):
         """Read systemd's view of the unit.

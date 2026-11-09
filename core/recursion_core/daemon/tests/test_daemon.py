@@ -10,7 +10,7 @@ import threading
 import unittest
 from unittest.mock import patch, Mock
 from recursion_core.daemon import (AlreadyRunning, Daemon, Registry, UserLock,
-                                   SystemdUserManager, check_operator_linger,
+                                   SystemdUserManager, UnitNotLoaded, check_operator_linger,
                                    refuse_engine_user, require_free_threaded)
 
 UNIT_FILE = Path(__file__).resolve().parents[3] / 'systemd' / 'recursion-daemon.service'
@@ -34,7 +34,7 @@ class FakeManager:
         if self.fail_stop:
             raise OSError('interrupted')
         if unit not in self.units:
-            raise subprocess.CalledProcessError(5, ['systemctl', 'stop'])  # not loaded
+            raise UnitNotLoaded(unit)  # systemctl stop: exit 5, "Unit <unit> not loaded."
         del self.units[unit]
 
     def observe(self, unit):
@@ -203,11 +203,50 @@ class DaemonTests(unittest.TestCase):
         self.assertNotIn('recursion-run-one.service', self.manager.units)  # collected
         self.assertEqual(self.daemon.sweep()[0].state, 'terminated')
 
-    def test_stop_of_already_collected_unit_is_unknown(self):
-        # A Stop replayed after the unit was collected cannot see it end: not terminated.
+    def test_stop_of_already_collected_unit_is_ended(self):
+        # X1a (t1430u): a recorded Stop that systemd answers "not loaded", with the unit
+        # gone, is ended. Nothing runs under the unit; a later same-name unit is an orphan.
         self.daemon.start('one', ['fake'])
         self.manager.units.clear()
-        self.assertEqual(self.daemon.stop('one').state, 'unknown')
+        run = self.daemon.stop('one')
+        self.assertEqual(run.state, 'terminated')
+        self.assertEqual(run.detail, 'stop: unit not loaded, unit gone')
+        self.manager.units['recursion-run-one.service'] = 'running'  # late same-name unit
+        self.assertEqual(self.daemon.sweep()[0].state, 'terminated')
+        self.assertEqual(self.manager.stops[-1], 'recursion-run-one.service')
+
+    def test_stop_that_ended_the_unit_before_a_crash_replays_to_terminated(self):
+        # The earlier systemctl stop ended and collected the unit, then the daemon died
+        # before recording it. The replayed Stop gets "not loaded"; it must not stick at unknown.
+        self.daemon.start('one', ['fake'])
+        self.registry.request_stop('one')
+        del self.manager.units['recursion-run-one.service']  # stop took effect; record did not
+        run = self.restart().sweep()[0]
+        self.assertEqual((run.state, run.stop_requested), ('terminated', True))
+
+    def test_not_loaded_stop_without_a_gone_unit_is_not_terminated(self):
+        self.daemon.start('one', ['fake'])
+        for seen, expected in (('unknown', 'unknown'), ('running', 'stopping')):
+            with self.subTest(observe=seen):
+                self.manager.stop = Mock(side_effect=UnitNotLoaded('recursion-run-one.service'))
+                self.manager.observe = Mock(return_value=seen)
+                self.assertEqual(self.daemon.stop('one').state, expected)
+
+    def test_other_stop_errors_with_a_gone_unit_stay_unknown(self):
+        self.daemon.start('one', ['fake'])
+        self.manager.units.clear()
+        for exc in (subprocess.CalledProcessError(5, ['systemctl', 'stop']),
+                    subprocess.CalledProcessError(1, ['systemctl', 'stop'], stderr='Unit x not loaded'),
+                    OSError('interrupted')):
+            with self.subTest(exc=exc):
+                self.manager.stop = Mock(side_effect=exc)
+                self.assertEqual(self.daemon.stop('one').state, 'unknown')
+
+    def test_absent_unit_without_a_stop_stays_unknown(self):
+        self.daemon.start('one', ['fake'])
+        self.manager.units.clear()
+        self.assertEqual(self.daemon.sweep()[0].state, 'unknown')
+        self.assertEqual(self.manager.stops, [])
 
     def test_natural_exit_terminated_and_unit_released(self):
         self.daemon.start('one', ['fake'])
@@ -447,6 +486,22 @@ class SystemdManagerTests(unittest.TestCase):
         self.assertEqual(self.manager.observe('a'), 'unknown')
         self.show('', active='deactivating', sub='stop-sigterm')
         self.assertEqual(self.manager.observe('a'), 'unknown')
+
+    def test_stop_maps_only_systemds_not_loaded_error(self):
+        unit = 'recursion-run-one.service'
+        self.manager._call = Mock(side_effect=subprocess.CalledProcessError(
+            5, ['systemctl'], stderr=f'Failed to stop {unit}: Unit {unit} not loaded.\n'))
+        with self.assertRaises(UnitNotLoaded):
+            self.manager.stop(unit)
+        for exc in (subprocess.CalledProcessError(5, ['systemctl'], stderr='Access denied\n'),
+                    subprocess.CalledProcessError(1, ['systemctl'], stderr=f'Unit {unit} not loaded.'),
+                    subprocess.CalledProcessError(5, ['systemctl'], stderr='Unit recursion-run-two.service not loaded.'),
+                    subprocess.TimeoutExpired(['systemctl'], 15)):
+            with self.subTest(exc=exc):
+                self.manager._call = Mock(side_effect=exc)
+                with self.assertRaises(subprocess.SubprocessError) as caught:
+                    self.manager.stop(unit)
+                self.assertNotIsInstance(caught.exception, UnitNotLoaded)
 
     def test_real_post_stop_show_output(self):
         # systemctl --user show after systemctl --user stop of a transient unit: the

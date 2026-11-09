@@ -77,7 +77,10 @@ are unaffected:
   states `terminated` (systemd saw the run unit end in this boot: its cgroup read
   `populated 0`; or the loaded unit is `inactive`, `failed` or `active (exited)` with
   its cgroup already pruned; or a synchronous `systemctl stop` returned and the unit
-  was then garbage-collected) and `lost_reboot`. A run with a recorded Stop is never reported `running`.
+  was then garbage-collected; or, for a run with a recorded Stop, `systemctl stop`
+  answered "Unit ... not loaded" (exit 5) and the unit reads not-found, as when a
+  replayed Stop finds the unit an earlier stop already ended and collected; the
+  orphan sweep stops any same-name unit that appears later) and `lost_reboot`. A run with a recorded Stop is never reported `running`.
   Anything not positively observed is `unknown`, never `terminated`.
 
 ## Reboot

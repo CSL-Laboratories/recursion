@@ -129,7 +129,8 @@ def create_revocation_store(path: str) -> None:
     try:
         db.execute("PRAGMA journal_mode=WAL")
         db.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
-        db.execute("CREATE TABLE revoked (key_id TEXT PRIMARY KEY)")
+        db.execute(
+            "CREATE TABLE revoked (key_id TEXT PRIMARY KEY, generation INTEGER NOT NULL)")
         db.execute("INSERT INTO meta VALUES ('magic', ?)", (_REVOCATION_MAGIC,))
     finally:
         db.close()
@@ -147,11 +148,13 @@ class TrustStore:
     turns it back on"), and the installer configuration never sees it. So it is written
     to an installer-created SQLite store (``create_revocation_store``; WAL,
     ``synchronous=FULL``) before it takes effect, and every key in that store is read
-    back as revoked when the trust store is built. The daemon never creates the store;
-    a named store that is missing or invalid refuses. Without a store, ``revoke`` still
-    revokes in memory but refuses ``revocation_not_durable`` so the host knows. The
-    same-uid limit in ``authority.py`` applies: in-process plugin code can rewrite this
-    file (B17).
+    back as revoked when the trust store is built. Each ``revoke`` advances that key's
+    generation, including a repeat, so a grant that turned order back on after an
+    earlier revocation does not apply to the later one. The daemon never creates the
+    store; a named store that is missing or invalid refuses. Without a store, or when
+    the SQLite write fails, ``revoke`` still revokes in memory but refuses
+    ``revocation_not_durable`` (the SQLite error does not escape). The same-uid limit
+    in ``authority.py`` applies: in-process plugin code can rewrite this file (B17).
     """
 
     def __init__(self, trusted_keys: dict[str, str], revoked_key_ids: frozenset = frozenset(),
@@ -162,8 +165,22 @@ class TrustStore:
         self._keys = MappingProxyType(keys)
         self._lock = threading.Lock()
         self._db = None if revocation_store is None else self._open_store(revocation_store)
-        stored = () if self._db is None else (r[0] for r in self._db.execute("SELECT key_id FROM revoked"))
-        self._revoked = frozenset(revoked_key_ids) | frozenset(stored)
+        generations = {}
+        if self._db is not None:
+            try:
+                rows = self._db.execute("SELECT key_id, generation FROM revoked").fetchall()
+            except sqlite3.DatabaseError:
+                self._db.close()
+                raise Refused("revocation_store_invalid") from None
+            for kid, generation in rows:
+                if type(generation) is not int or generation < 1:
+                    self._db.close()
+                    raise Refused("revocation_store_invalid")
+                generations[kid] = generation
+        for kid in revoked_key_ids:
+            generations.setdefault(kid, 1)
+        self._generation = MappingProxyType(generations)
+        self._revoked = frozenset(generations)
 
     @staticmethod
     def _open_store(path: str) -> sqlite3.Connection:
@@ -181,32 +198,60 @@ class TrustStore:
         if meta.get("magic") != _REVOCATION_MAGIC:
             db.close()
             raise Refused("revocation_store_invalid")
+        columns = [row[1] for row in db.execute("PRAGMA table_info(revoked)")]
+        if "generation" not in columns:
+            try:
+                db.execute(
+                    "ALTER TABLE revoked ADD COLUMN generation INTEGER NOT NULL DEFAULT 1")
+            except sqlite3.DatabaseError:
+                db.close()
+                raise Refused("revocation_store_invalid") from None
         return db
 
     @property
     def revoked(self) -> frozenset:
         return self._revoked
 
-    def revoke(self, kid: str) -> None:
-        """Revoke a key id; later loads, including after a restart, classify it unsigned (4.4).
+    def generation(self, kid: str) -> int | None:
+        """Revocation generation for ``kid``, or ``None`` when that key is not revoked."""
+        return self._generation.get(kid)
 
-        The durable write comes first. The in-memory list is updated even if that write
-        fails or there is no store, then ``revocation_not_durable`` is raised.
+    def revoke(self, kid: str) -> int:
+        """Revoke a key id and return its new generation (4.4).
+
+        Later loads, including after a restart, classify it unsigned. A repeat revoke
+        of the same key advances the generation again. The in-memory generation is
+        updated even when the durable write fails or there is no store, and then
+        ``revocation_not_durable`` is raised. A ``sqlite3`` error is that refusal; it
+        does not escape the method.
         """
         with self._lock:
-            durable = False
-            try:
-                if self._db is not None:
-                    self._db.execute("INSERT OR IGNORE INTO revoked VALUES (?)", (kid,))
-                    durable = True
-            finally:
-                self._revoked = self._revoked | {kid}
-            if not durable:
+            generation = self._generation.get(kid, 0) + 1
+            updated = dict(self._generation)
+            updated[kid] = generation
+            self._generation = MappingProxyType(updated)
+            self._revoked = frozenset(updated)
+            if self._db is None:
                 raise Refused("revocation_not_durable", kid)
+            try:
+                self._db.execute(
+                    "INSERT INTO revoked (key_id, generation) VALUES (?, ?) "
+                    "ON CONFLICT(key_id) DO UPDATE SET generation = excluded.generation",
+                    (kid, generation),
+                )
+                row = self._db.execute(
+                    "SELECT generation FROM revoked WHERE key_id = ?", (kid,)).fetchone()
+            except sqlite3.Error:
+                raise Refused("revocation_not_durable", kid) from None
+            if row is None or row[0] != generation:
+                raise Refused("revocation_not_durable", kid)
+            return generation
 
     def close(self) -> None:
-        if self._db is not None:
-            self._db.close()
+        db = self._db
+        self._db = None
+        if db is not None:
+            db.close()
 
     def classify(self, manifest: Manifest, signature: object) -> tuple[str, str | None, str]:
         """Return ``(trust, signer_key_id, reason)``; trust is ``signed`` or ``unsigned``."""
@@ -230,8 +275,11 @@ class Grant:
     permissions: tuple
     unsigned_order_acknowledged: bool = False
     # The user's step to turn order back on under a revoked developer key (4.4): the
-    # grant names that key id. A grant made before the revocation never names it.
+    # grant names that key id. A grant that only names the key covers generation 1,
+    # the first revocation. A later revocation needs ``order_after_revocation_generation``
+    # equal to ``TrustStore.generation`` for that key (the ``key.revoke`` result).
     order_after_revoked_key: str | None = None
+    order_after_revocation_generation: int | None = None
 
 
 @dataclass(frozen=True)
@@ -249,14 +297,27 @@ class ReservedEffects:
         return any(ref.startswith(p) for p in self.credential_prefixes)
 
 
+def _order_cites_this_revocation(grant: Grant, revoked_key_id: str, generation: int) -> bool:
+    """True when the grant is the user's step for this revocation, not an older one."""
+    if grant.order_after_revoked_key != revoked_key_id:
+        return False
+    cited = grant.order_after_revocation_generation
+    if cited is None:
+        return generation == 1
+    return type(cited) is int and cited == generation
+
+
 def effective_permissions(manifest: Manifest, trust: str, signer_key_id: str | None,
-                          grant: Grant | None, revoked_key_id: str | None = None
+                          grant: Grant | None, revoked_key_id: str | None = None,
+                          revocation_generation: int | None = None
                           ) -> tuple[tuple, list[tuple[str, str]]]:
     """Requested ∩ granted, in canonical order, plus the reasons anything was dropped.
 
     ``revoked_key_id`` is the manifest's developer key id when that key is revoked. Then
-    order stays off, for a signed or a manual grant, until the grant names that key in
-    ``order_after_revoked_key`` (PRODUCT.md 4.4).
+    order stays off, for a signed or a manual grant, until the grant names that key.
+    Naming the key alone covers the first revocation (generation 1). A later revocation
+    stays off until the grant's ``order_after_revocation_generation`` equals
+    ``revocation_generation`` (PRODUCT.md 4.4). ``None`` means generation 1.
     """
     dropped: list[tuple[str, str]] = []
     if grant is None:
@@ -275,8 +336,10 @@ def effective_permissions(manifest: Manifest, trust: str, signer_key_id: str | N
         if perm == "order" and trust != "signed" and not grant.unsigned_order_acknowledged:
             dropped.append(("unsigned_order_requires_manual_grant", perm))
             continue
-        if perm == "order" and revoked_key_id is not None and grant.order_after_revoked_key != revoked_key_id:
-            dropped.append(("signer_key_revoked_order_off", revoked_key_id))
-            continue
+        if perm == "order" and revoked_key_id is not None:
+            generation = 1 if revocation_generation is None else revocation_generation
+            if type(generation) is not int or not _order_cites_this_revocation(grant, revoked_key_id, generation):
+                dropped.append(("signer_key_revoked_order_off", revoked_key_id))
+                continue
         out.append(perm)
     return tuple(out), dropped

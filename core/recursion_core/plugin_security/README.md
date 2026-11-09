@@ -14,11 +14,15 @@ yet called by a running daemon, and not reviewed or accepted.
   that key at once (PRODUCT.md 4.4). The
   revocation is written to an installer-created SQLite store
   (`create_revocation_store`) and read back when the trust store is built, so a restart
-  keeps the key revoked; without a store `key.revoke` still turns order off but refuses
-  `revocation_not_durable`. Every later load of a plugin under a revoked key, signed or
-  manually granted, on the trusted list or not, has no `order` until the user grants it
-  again with `Grant.order_after_revoked_key` naming that key (a manual grant still needs
-  `unsigned_order_acknowledged`).
+  keeps the key revoked; without a store, or when the SQLite write fails, `key.revoke`
+  still turns order off but refuses `revocation_not_durable` (the database error does
+  not become `core_internal_error`). Every later load of a plugin under a revoked key,
+  signed or manually granted, on the trusted list or not, has no `order` until the user
+  grants it again with `Grant.order_after_revoked_key` naming that key (a manual grant
+  still needs `unsigned_order_acknowledged`). Naming the key covers the first revocation
+  only (`revocation_generation` 1, returned by `key.revoke`). Each later revoke advances
+  that generation in the store, and order stays off until a new grant sets
+  `Grant.order_after_revocation_generation` to it (PRODUCT.md 4.4).
 - `approval.ApprovalGate` draws every approval from the effect's canonical bytes,
   accepts only the `operator_ui` principal, binds the decision to the digest and allows
   one use.
@@ -47,7 +51,9 @@ runs with owner, provider and model version (`run.bind` args `connection`,
 `model_version`, `plugin_id`, `provider`, `run_id`); send the five-field effect
 `scope` (`account`, `venue`, `contract_family`, `adapter`, `environment`), or
 `check_effect` refuses `effect_scope`; sign profiles with the matching `scope`,
-`provider`, `model_version` and `actions`; and clear trips through the leased probe.
+`provider`, `model_version` and `actions`; clear trips through the leased probe; and,
+after a repeated `key.revoke`, copy `revocation_generation` onto
+`Grant.order_after_revocation_generation`.
 
 **Not a sandbox.** Plugins run as ordinary Python in the daemon's process and uid.
 `tests/test_mutants.py` shows four in-process attacks that succeed (swap the anchor,
@@ -58,13 +64,13 @@ manifest names itself `host` to reach host-only ops (`host` is a reserved plugin
 Same-uid is not a security boundary. The real boundary is a separate OS user or process
 (F21), and F21 is not done.
 
-**Nov 11 same-uid fallback (O69, Lucas's Nov 8 direction; not accepted text).** Lucas, Nov 8 (t1418u), O69 correction; not yet in PRODUCT.md 055cc7a5:
+**2026-11-11 same-uid fallback (O69, Lucas's 2026-11-08 direction; not accepted text).** Lucas, 2026-11-08 (t1418u), O69 correction; not accepted text in CSL-Laboratories/csl-research contracts/PRODUCT.md 055cc7a5c793b7135e5d0565dc4198cf96230531 (SHA-256 e64783152f6d67d4ede774dc41d112fe46c2d7536d53cb2c04e71a3566044daf); receipt CSLR-D-011; claim is the quoted sentence; limitation is that the sentence is not accepted PRODUCT.md text and paper-only is PRODUCT.md 5.2 / CP0-v2:
 
 > "it should have permission to run paper testing nov 11 regardless"
 
 Implementation explanation (not Lucas's quoted words): under the same-uid fallback the signed authority profile is tamper evidence, not a
 boundary: it binds honest plugins and records what happened, and the mutants above
-still rewrite it. The in-process Cockpit plugin holds paper-order permission on Nov 11.
+still rewrite it. The in-process Cockpit plugin holds paper-order permission on 2026-11-11.
 Paper only, by PRODUCT.md 5.2 / CP0-v2 ("order authority stays paper-first"), not by O69: O69 is
 the signed-profile item. This fallback grants no live-order permission; live capital stays
 separately authorised (PRODUCT.md 5.2). The code has one `order` permission.

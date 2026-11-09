@@ -147,7 +147,11 @@ class CoreService:
 
     def _op_key_revoke(self, caller: str, key_id: str) -> dict:
         self._require_host(caller)
-        return {"order_off": self._loader.revoke_key(key_id)}
+        order_off = self._loader.revoke_key(key_id)
+        generation = self._loader.revocation_generation(key_id)
+        if type(generation) is not int:
+            raise Refused("revocation_not_durable", key_id)
+        return {"order_off": order_off, "revocation_generation": generation}
 
     def _op_breaker_report(self, caller: str, connection: str, event_type: str) -> dict:
         self._require_host(caller)

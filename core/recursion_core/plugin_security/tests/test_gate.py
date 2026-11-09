@@ -201,6 +201,31 @@ class RevocationTests(unittest.TestCase):
         no_ack = Grant("demo.plugin", digest, None, ("read", "propose", "order"), False, self.kid)
         self.assertNotIn("order", self._restart_load({}, no_ack)[0].permissions("demo.plugin"))
 
+    def test_a_failed_revocation_write_is_revocation_not_durable(self) -> None:
+        self.w.loader._trust._db.execute("PRAGMA query_only=ON")
+        out = self.w.call(self.w.host, "key.revoke", key_id=self.kid)
+        self.assertEqual(out["refusal"]["code"], "revocation_not_durable")
+        self.assertNotIn("order", self.w.loader.permissions("demo.plugin"))
+
+    def test_a_second_revocation_does_not_reuse_the_order_grant(self) -> None:
+        first = self.w.call(self.w.host, "key.revoke", key_id=self.kid)
+        self.assertEqual(first["result"]["revocation_generation"], 1)
+        digest = self.w.grant.artifact_sha256
+        named = Grant("demo.plugin", digest, None, ("read", "propose", "order"), True, self.kid)
+        self.assertEqual(self._restart_load(self.w.trusted, named)[0].permissions("demo.plugin"),
+                         ("read", "propose", "order"))
+        second = self.w.call(self.w.host, "key.revoke", key_id=self.kid)
+        self.assertEqual(second["result"]["revocation_generation"], 2)
+        self.assertEqual(self._restart_load(self.w.trusted, named)[0].permissions("demo.plugin"),
+                         ("read", "propose"))
+        stale = Grant("demo.plugin", digest, None, ("read", "propose", "order"), True, self.kid,
+                      order_after_revocation_generation=1)
+        self.assertNotIn("order", self._restart_load(self.w.trusted, stale)[0].permissions("demo.plugin"))
+        fresh = Grant("demo.plugin", digest, None, ("read", "propose", "order"), True, self.kid,
+                      order_after_revocation_generation=2)
+        self.assertEqual(self._restart_load(self.w.trusted, fresh)[0].permissions("demo.plugin"),
+                         ("read", "propose", "order"))
+
     def test_revocation_without_a_store_is_refused_but_order_is_off(self) -> None:
         trust = TrustStore(self.w.trusted)  # no durable store configured
         loader = PluginLoader(trust, {"demo.plugin": self.w.grant}, self.w.reserved, CoreHealth(),

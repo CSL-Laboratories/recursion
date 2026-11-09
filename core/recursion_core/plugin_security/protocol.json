@@ -17,6 +17,6 @@
     "breaker.report": {"caller": "host", "args": ["connection", "event_type"], "result": ["tripped"]},
     "breaker.probe_begin": {"caller": "host", "args": ["connection"], "result": ["lease"]},
     "breaker.probe_reset": {"caller": "host", "args": ["connection", "lease", "probe_ok"], "result": ["reset"]},
-    "key.revoke": {"caller": "host", "args": ["key_id"], "result": ["order_off"]}
+    "key.revoke": {"caller": "host", "args": ["key_id"], "result": ["order_off", "revocation_generation"]}
   }
 }

@@ -99,11 +99,15 @@ class PluginLoader:
         developer key loses ``order`` at once, signed or manually granted, so a stolen key
         cannot keep trading until the next restart. Its other grants stay (O12 open).
         Turning order back on is the user's step: a fresh grant that names the revoked key in
-        ``order_after_revoked_key``, then a load; never this call. The revocation is stored
+        ``order_after_revoked_key``, then a load; never this call. The first revocation is
+        generation 1, and naming the key is enough for that one. Each later call advances
+        the generation, and the new grant has to set ``order_after_revocation_generation``
+        to the value ``revoke`` stored. The revocation is stored
         durably (``TrustStore``), so a restart keeps the key revoked, and every later load
-        keeps order off for a grant that does not name the key, signed or manual, on the
-        trusted list or not. Order is turned off before the durable write, so if that write fails
-        the running plugins are already off and ``revocation_not_durable`` is raised.
+        keeps order off for a grant that does not cite the current generation, signed or
+        manual, on the trusted list or not. Order is turned off before the durable write,
+        so if that write fails the running plugins are already off and
+        ``revocation_not_durable`` is raised.
         """
         if type(kid) is not str or not kid.startswith("ed25519:"):
             raise Refused("invalid_key_id")
@@ -111,6 +115,9 @@ class PluginLoader:
             turned_off = self._order_off(kid)
             self._trust.revoke(kid)
             return turned_off
+
+    def revocation_generation(self, kid: str) -> int | None:
+        return self._trust.generation(kid)
 
     def _order_off(self, kid: str) -> list[str]:
         turned_off = []
@@ -158,8 +165,9 @@ class PluginLoader:
                 raise Refused("reserved_credential", ref)
         dev_kid = key_id(manifest.developer_key)
         revoked = dev_kid if dev_kid in self._trust.revoked else None
+        generation = None if revoked is None else self._trust.generation(dev_kid)
         perms, dropped = effective_permissions(manifest, trust, kid, self._grants.get(manifest.plugin_id),
-                                               revoked)
+                                               revoked, generation)
         for code, detail in dropped:
             findings.append(_finding("admit", code, "warn", detail))
         for perm in ("process", "network", "credential"):

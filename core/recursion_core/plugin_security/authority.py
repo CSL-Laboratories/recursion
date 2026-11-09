@@ -30,8 +30,11 @@ process and files, which in-process plugin code running as the same uid can rewr
 tests record which of those mutants succeed. Containment needs a separate OS user or
 process for the anchor and ledger (F11, F21); F21 is not done.
 
-Nov 11 same-uid fallback (O69, ``policy.SAME_UID_FALLBACK_POLICY``; Lucas, Nov 8,
-t1418u; not yet in PRODUCT.md 055cc7a5). Implementation explanation, not a quote:
+2026-11-11 same-uid fallback (O69, ``policy.SAME_UID_FALLBACK_POLICY``; Lucas,
+2026-11-08, t1418u; not accepted text in CSL-Laboratories/csl-research
+contracts/PRODUCT.md 055cc7a5c793b7135e5d0565dc4198cf96230531, SHA-256
+e64783152f6d67d4ede774dc41d112fe46c2d7536d53cb2c04e71a3566044daf, receipt
+CSLR-D-011). Implementation explanation, not a quote:
 the in-process Cockpit plugin holds paper-order permission. Under that
 fallback the signed authority profile is tamper evidence, not a boundary. Paper only
 (PRODUCT.md 5.2 / CP0-v2, order authority stays paper-first; O69 is the signed-profile item);

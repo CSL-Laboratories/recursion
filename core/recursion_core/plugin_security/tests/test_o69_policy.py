@@ -1,6 +1,7 @@
-"""O69 (CSL-787): the Nov 11 same-uid fallback policy, quoted exactly in code and docs.
+"""O69 (CSL-787): the 2026-11-11 same-uid fallback policy, quoted exactly in code and docs.
 
-Lucas, Nov 8 (t1418u), O69 correction; not yet in PRODUCT.md 055cc7a5. The decision changes no runtime check;
+Lucas, 2026-11-08 (t1418u). The quoted sentence is not accepted text in PRODUCT.md
+055cc7a5c793b7135e5d0565dc4198cf96230531 (CSLR-D-011). It changes no runtime check;
 these tests pin the recorded wording and check that nothing in the shipped code or docs
 reads as a live-order grant. The code has one ``order`` permission and no paper/live
 mode, so the only code-level check is that a profile cannot name any other permission.
@@ -37,7 +38,14 @@ def _flat(text: str) -> str:
 class PolicyTextTests(unittest.TestCase):
     def test_constant_is_the_exact_quote(self) -> None:
         self.assertEqual(SAME_UID_FALLBACK_POLICY, O69_QUOTE)
-        self.assertEqual(SAME_UID_FALLBACK_POLICY_SOURCE, "Lucas, Nov 8 (t1418u), O69 correction; not yet in PRODUCT.md 055cc7a5")
+        self.assertEqual(SAME_UID_FALLBACK_POLICY_SOURCE, (
+            "Lucas, 2026-11-08 (t1418u), O69 correction; not accepted text in "
+            "CSL-Laboratories/csl-research contracts/PRODUCT.md "
+            "055cc7a5c793b7135e5d0565dc4198cf96230531 "
+            "(SHA-256 e64783152f6d67d4ede774dc41d112fe46c2d7536d53cb2c04e71a3566044daf); "
+            "receipt CSLR-D-011; claim is the quoted sentence; limitation is that the sentence "
+            "is not accepted PRODUCT.md text and paper-only is PRODUCT.md 5.2 / CP0-v2"
+        ))
         self.assertIs(plugin_security.SAME_UID_FALLBACK_POLICY, SAME_UID_FALLBACK_POLICY)
 
     def test_readme_quotes_the_constant_with_attribution(self) -> None:
@@ -74,7 +82,9 @@ class PolicyTextTests(unittest.TestCase):
         readme = _flat(_read("README.md")).lower()
         for phrase in ("remains a founder step", "founder step", "undecided", "not yet decided"):
             self.assertNotIn(phrase, readme)
-        self.assertIn("nov 11 same-uid fallback (o69, lucas's nov 8 direction; not accepted text)", readme)
+        self.assertIn(
+            "2026-11-11 same-uid fallback (o69, lucas's 2026-11-08 direction; not accepted text)",
+            readme)
 
     def test_paper_only_is_cited_to_5_2_and_cp0_v2_not_o69(self) -> None:
         # t1430u brief: paper-only is PRODUCT.md 5.2 / CP0-v2; O69 is the signed-profile item.

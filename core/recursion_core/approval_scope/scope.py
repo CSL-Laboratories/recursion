@@ -14,8 +14,16 @@ revoked, so a hand-built ``Credential`` naming ``operator_ui`` and ``approve`` i
 (``credential_unknown``). In-process code that holds the registry itself can still mint;
 whether the in-process path is a boundary or only tamper evidence is open under O69.
 
-``ApprovalAuthority.open`` takes the opener's credential; the prompt's ``requester`` line
-is that credential's principal, never caller text.
+``ApprovalAuthority.open`` takes the opener's credential, which must hold ``control``
+(a non-read scope); an ``observe``-only or scope-less credential cannot write to the
+operator's inbox. The prompt's ``requester`` line is that credential's principal, never
+caller text.
+
+The approver reads the prompt the core drew from the core, not from the opener:
+``pending`` (the inbox, ``approval.list``) and ``show`` return the stored prompt text to an
+approver credential and record that this credential was shown it. ``grant`` refuses a
+request whose prompt this credential was never shown (``prompt_not_shown``), so a request
+id and digest passed along by a plugin are not enough to approve.
 
 ``ApprovalAuthority.grant`` issues an ``ApprovalScope``:
 
@@ -176,7 +184,10 @@ class ApprovalScope:
 class _Request:
     request: ApprovalRequest
     requester: str
+    prompt: str
     state: str = "pending"  # pending -> approved | denied
+    # Token ids of approver credentials the core has handed this prompt to.
+    shown: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -206,9 +217,12 @@ class ApprovalAuthority:
     def open(self, credential: object, request: ApprovalRequest) -> str:
         """Register ``request`` for ``credential`` and return the prompt the core draws.
 
-        The prompt's requester is ``credential.principal``; any kind may open a request.
+        The prompt's requester is ``credential.principal``. Any kind may open a request,
+        but only with the ``control`` scope; ``observe`` alone is read-only.
         """
         opener = self._registry.resolve(credential)
+        if "control" not in opener.scopes:
+            raise Refused("open_scope_required")
         if type(request) is not ApprovalRequest:
             raise Refused("request_type")
         with self._lock:
@@ -218,11 +232,51 @@ class ApprovalAuthority:
                 raise Refused("request_duplicate")
             # Render before registering: a request whose prompt cannot be drawn is not open.
             text = render_prompt(request, opener.principal)
-            self._requests[request.request_id] = _Request(request, opener.principal)
+            self._requests[request.request_id] = _Request(request, opener.principal, text)
         return text
 
+    def pending(self, credential: object) -> list[dict]:
+        """The approver's inbox: every open, unexpired request with the prompt the core drew.
+
+        Each listed prompt counts as shown to ``credential``.
+        """
+        viewer = _check_approver(self._registry, credential)
+        with self._lock:
+            now = self._now()
+            out = []
+            for rid, entry in self._requests.items():
+                if entry.state != "pending" or entry.request.expires_at <= now:
+                    continue
+                entry.shown.add(viewer.token_id)
+                out.append(self._inbox_item(rid, entry))
+        return out
+
+    def show(self, credential: object, request_id: object) -> dict:
+        """Return one open request's core-drawn prompt to an approver and record it shown."""
+        viewer = _check_approver(self._registry, credential)
+        with self._lock:
+            entry = self._requests.get(request_id) if type(request_id) is str else None
+            if entry is None:
+                raise Refused("request_unknown")
+            if entry.state != "pending":
+                raise Refused("request_answered")
+            if entry.request.expires_at <= self._now():
+                raise Refused("request_expired")
+            entry.shown.add(viewer.token_id)
+            return self._inbox_item(request_id, entry)
+
+    @staticmethod
+    def _inbox_item(request_id: str, entry: _Request) -> dict:
+        return {"request_id": request_id, "digest": entry.request.digest,
+                "requester": entry.requester, "expires_at": entry.request.expires_at,
+                "prompt": entry.prompt}
+
     def grant(self, credential: object, request_ids: object, ttl_seconds: int) -> ApprovalScope:
-        """Issue a non-delegable scope to ``credential`` for the named open requests."""
+        """Issue a non-delegable scope to ``credential`` for the named open requests.
+
+        Each request's prompt must already have been shown to ``credential`` through
+        ``pending`` or ``show``; otherwise the grant refuses with ``prompt_not_shown``.
+        """
         holder = _check_approver(self._registry, credential)
         if type(ttl_seconds) is not int or ttl_seconds <= 0:
             raise Refused("scope_ttl")
@@ -240,6 +294,8 @@ class ApprovalAuthority:
                     raise Refused("request_answered")
                 if entry.request.expires_at <= now:
                     raise Refused("request_expired")
+                if holder.token_id not in entry.shown:
+                    raise Refused("prompt_not_shown")
                 pairs.append((rid, entry.request.digest))
                 expires_at = min(expires_at, entry.request.expires_at)
             scope = ApprovalScope(scope_id=secrets.token_hex(16), holder=holder.token_id,

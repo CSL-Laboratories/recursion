@@ -40,6 +40,14 @@ def cred(registry: CredentialRegistry, kind: str, scopes: set[str]) -> Credentia
     return registry.issue(f"{kind}:1", kind, scopes)
 
 
+def grant(auth: ApprovalAuthority, credential: object, request_ids, ttl_seconds: int):
+    """Grant the way an approver client does: read each prompt from the core first."""
+    if type(request_ids) in (list, tuple):
+        for rid in request_ids:
+            auth.show(credential, rid)
+    return auth.grant(credential, request_ids, ttl_seconds=ttl_seconds)
+
+
 def request(expires_at: int = T0 + 600, effect: object = EFFECT, display=(("note", "hello"),),
             request_id: str | None = None) -> ApprovalRequest:
     return ApprovalRequest.create(effect, list(display), expires_at, request_id=request_id)
@@ -206,7 +214,7 @@ class ScopeTests(unittest.TestCase):
 
     def test_paired_device_without_manage_approves_once(self) -> None:
         self.assertNotIn("manage", self.device.scopes)
-        scope = self.auth.grant(self.device, [self.req.request_id], ttl_seconds=60)
+        scope = grant(self.auth, self.device, [self.req.request_id], ttl_seconds=60)
         out = self.auth.approve(self.device, scope.scope_id, self.req.request_id, self.req.digest)
         self.assertEqual(out["outcome"], "approved")
         self.assertEqual(out["digest"], self.req.digest)
@@ -219,7 +227,7 @@ class ScopeTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "pairing_grants_no_manage")
 
     def test_agent_plugin_and_unscoped_tokens_refuse_approve(self) -> None:
-        scope = self.auth.grant(self.device, [self.req.request_id], ttl_seconds=60)
+        scope = grant(self.auth, self.device, [self.req.request_id], ttl_seconds=60)
         cases = {
             "agent": (cred(self.registry, "agent", {"observe", "control", "approve"}),
                       "principal_not_approver"),
@@ -237,11 +245,11 @@ class ScopeTests(unittest.TestCase):
                     self.auth.approve(token, scope.scope_id, self.req.request_id, self.req.digest)
                 self.assertEqual(ctx.exception.code, code)
                 with self.assertRaises(Refused):
-                    self.auth.grant(token, [self.req.request_id], ttl_seconds=60)
+                    grant(self.auth, token, [self.req.request_id], ttl_seconds=60)
         self.assertEqual(self.auth.state(self.req.request_id), "pending")
 
     def test_scope_is_not_delegable(self) -> None:
-        scope = self.auth.grant(self.device, [self.req.request_id], ttl_seconds=60)
+        scope = grant(self.auth, self.device, [self.req.request_id], ttl_seconds=60)
         other = cred(self.registry, "paired_device", {"approve"})
         with self.assertRaises(Refused) as ctx:
             self.auth.approve(other, scope.scope_id, self.req.request_id, self.req.digest)
@@ -255,21 +263,21 @@ class ScopeTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "scope_not_delegable")
 
     def test_digest_must_match_what_was_shown(self) -> None:
-        scope = self.auth.grant(self.device, [self.req.request_id], ttl_seconds=60)
+        scope = grant(self.auth, self.device, [self.req.request_id], ttl_seconds=60)
         with self.assertRaises(Refused) as ctx:
             self.auth.approve(self.device, scope.scope_id, self.req.request_id, "e" * 64)
         self.assertEqual(ctx.exception.code, "digest_mismatch")
         self.assertEqual(self.auth.state(self.req.request_id), "pending")
 
     def test_scope_expiry_is_bounded_by_request_expiry(self) -> None:
-        scope = self.auth.grant(self.device, [self.req.request_id], ttl_seconds=10_000)
+        scope = grant(self.auth, self.device, [self.req.request_id], ttl_seconds=10_000)
         self.assertEqual(scope.expires_at, self.req.expires_at)
 
     # Red-team Finding 2: requester comes from the opener's credential.
     def test_requester_is_the_opening_credential(self) -> None:
         self.assertIn("requester: plugin:1\n", self.prompt)
         self.assertNotIn("operator_ui", self.prompt)
-        scope = self.auth.grant(self.device, [self.req.request_id], ttl_seconds=60)
+        scope = grant(self.auth, self.device, [self.req.request_id], ttl_seconds=60)
         out = self.auth.approve(self.device, scope.scope_id, self.req.request_id, self.req.digest)
         self.assertEqual(out["requester"], "plugin:1")
         self.assertEqual(out["principal"], "paired_device:1")
@@ -283,7 +291,7 @@ class ScopeTests(unittest.TestCase):
 
     # Red-team Finding 3 (API-layer part): credentials must come from the registry.
     def test_hand_built_or_copied_operator_credential_refused(self) -> None:
-        scope = self.auth.grant(self.device, [self.req.request_id], ttl_seconds=60)
+        scope = grant(self.auth, self.device, [self.req.request_id], ttl_seconds=60)
         forged = Credential(token_id="ab" * 16, principal="operator_ui:lucas",
                             kind="operator_ui", scopes=frozenset({"approve"}))
         # Same fields as the real holder, token id read off the wire scope.
@@ -294,7 +302,7 @@ class ScopeTests(unittest.TestCase):
                             ("replaced", dataclasses.replace(self.device))):
             with self.subTest(name):
                 with self.assertRaises(Refused) as ctx:
-                    self.auth.grant(token, [self.req.request_id], ttl_seconds=60)
+                    grant(self.auth, token, [self.req.request_id], ttl_seconds=60)
                 self.assertEqual(ctx.exception.code, "credential_unknown")
                 with self.assertRaises(Refused) as ctx:
                     self.auth.approve(token, scope.scope_id, self.req.request_id,
@@ -305,16 +313,82 @@ class ScopeTests(unittest.TestCase):
     def test_another_registry_credential_refused(self) -> None:
         stranger = cred(CredentialRegistry(), "operator_ui", {"approve"})
         with self.assertRaises(Refused) as ctx:
-            self.auth.grant(stranger, [self.req.request_id], ttl_seconds=60)
+            grant(self.auth, stranger, [self.req.request_id], ttl_seconds=60)
         self.assertEqual(ctx.exception.code, "credential_unknown")
 
     def test_revoked_credential_refused(self) -> None:
-        scope = self.auth.grant(self.device, [self.req.request_id], ttl_seconds=60)
+        scope = grant(self.auth, self.device, [self.req.request_id], ttl_seconds=60)
         self.registry.revoke(self.device.token_id)
         with self.assertRaises(Refused) as ctx:
             self.auth.approve(self.device, scope.scope_id, self.req.request_id, self.req.digest)
         self.assertEqual(ctx.exception.code, "credential_unknown")
         self.assertEqual(self.auth.state(self.req.request_id), "pending")
+
+    # Red-team round 2 Finding 1: the approver reads the prompt from the core.
+    def test_approver_inbox_returns_the_core_drawn_prompt(self) -> None:
+        items = self.auth.pending(self.device)
+        self.assertEqual(len(items), 1)
+        item = items[0]
+        self.assertEqual(item["request_id"], self.req.request_id)
+        self.assertEqual(item["digest"], self.req.digest)
+        self.assertEqual(item["requester"], "plugin:1")
+        self.assertEqual(item["expires_at"], self.req.expires_at)
+        self.assertEqual(item["prompt"], self.prompt)
+        self.assertEqual(self.auth.show(self.device, self.req.request_id), item)
+        scope = self.auth.grant(self.device, [self.req.request_id], ttl_seconds=60)
+        self.auth.approve(self.device, scope.scope_id, self.req.request_id, self.req.digest)
+        self.assertEqual(self.auth.pending(self.device), [])
+        with self.assertRaises(Refused) as ctx:
+            self.auth.show(self.device, self.req.request_id)
+        self.assertEqual(ctx.exception.code, "request_answered")
+
+    def test_grant_refuses_ids_passed_along_without_the_core_prompt(self) -> None:
+        # The plugin opens effect B and hands its id and digest to the approver with a
+        # made-up rendering; without reading B's prompt from the core, no grant.
+        other = request(effect={"kind": "example.other"})
+        self.auth.open(self.plugin, other)
+        for ids in ([other.request_id], [self.req.request_id, other.request_id]):
+            with self.subTest(ids=ids):
+                with self.assertRaises(Refused) as ctx:
+                    self.auth.grant(self.device, ids, ttl_seconds=60)
+                self.assertEqual(ctx.exception.code, "prompt_not_shown")
+        # Shown to one approver is not shown to another.
+        self.auth.show(self.device, other.request_id)
+        second = cred(self.registry, "operator_ui", {"approve"})
+        with self.assertRaises(Refused) as ctx:
+            self.auth.grant(second, [other.request_id], ttl_seconds=60)
+        self.assertEqual(ctx.exception.code, "prompt_not_shown")
+        self.auth.grant(self.device, [other.request_id], ttl_seconds=60)
+        self.assertEqual(self.auth.state(other.request_id), "pending")
+
+    def test_inbox_is_approver_only(self) -> None:
+        for token in (self.plugin, cred(self.registry, "agent", {"observe", "approve"}),
+                      cred(self.registry, "paired_device", {"observe"})):
+            with self.subTest(kind=token.kind):
+                with self.assertRaises(Refused):
+                    self.auth.pending(token)
+                with self.assertRaises(Refused):
+                    self.auth.show(token, self.req.request_id)
+
+    def test_inbox_skips_expired_requests(self) -> None:
+        self.clock.now = self.req.expires_at
+        self.assertEqual(self.auth.pending(self.device), [])
+        with self.assertRaises(Refused) as ctx:
+            self.auth.show(self.device, self.req.request_id)
+        self.assertEqual(ctx.exception.code, "request_expired")
+
+    # Red-team round 2 Finding 2: opening needs the control scope.
+    def test_observe_only_or_scopeless_opener_refused(self) -> None:
+        for name, scopes in (("observe", {"observe"}), ("none", set()),
+                             ("approve_only", {"observe", "approve"})):
+            for kind in ("paired_device", "operator_ui", "plugin", "agent"):
+                with self.subTest(kind=kind, scopes=name):
+                    token = self.registry.issue(f"{kind}:obs", kind, scopes)
+                    with self.assertRaises(Refused) as ctx:
+                        self.auth.open(token, request())
+                    self.assertEqual(ctx.exception.code, "open_scope_required")
+        self.assertEqual([i["request_id"] for i in self.auth.pending(self.device)],
+                         [self.req.request_id])
 
     def test_authority_requires_a_registry(self) -> None:
         with self.assertRaises(Refused) as ctx:
@@ -331,7 +405,7 @@ class ScopeExpiryTests(unittest.TestCase):
         self.req = request()
         self.auth.open(self.plugin, self.req)
         self.device = cred(self.registry, "operator_ui", {"approve"})
-        self.scope = self.auth.grant(self.device, [self.req.request_id], ttl_seconds=60)
+        self.scope = grant(self.auth, self.device, [self.req.request_id], ttl_seconds=60)
 
     def approve(self) -> dict:
         return self.auth.approve(self.device, self.scope.scope_id, self.req.request_id,
@@ -364,7 +438,7 @@ class ScopeExpiryTests(unittest.TestCase):
 
     def test_first_answer_wins_across_scopes(self) -> None:
         other = cred(self.registry, "paired_device", {"approve"})
-        second = self.auth.grant(other, [self.req.request_id], ttl_seconds=60)
+        second = grant(self.auth, other, [self.req.request_id], ttl_seconds=60)
         self.auth.deny(self.device, self.scope.scope_id, self.req.request_id, self.req.digest)
         with self.assertRaises(Refused) as ctx:
             self.auth.approve(other, second.scope_id, self.req.request_id, self.req.digest)
@@ -378,7 +452,7 @@ class ScopeExpiryTests(unittest.TestCase):
         self.auth.open(self.plugin, late)
         self.clock.now = T0 + 5
         with self.assertRaises(Refused) as ctx:
-            self.auth.grant(self.device, [late.request_id], ttl_seconds=60)
+            grant(self.auth, self.device, [late.request_id], ttl_seconds=60)
         self.assertEqual(ctx.exception.code, "request_expired")
         self.assertEqual(self.auth.state(late.request_id), "expired")
 
@@ -386,7 +460,7 @@ class ScopeExpiryTests(unittest.TestCase):
         reqs = [request(effect={"n": i}) for i in range(3)]
         for r in reqs:
             self.auth.open(self.plugin, r)
-        scope = self.auth.grant(self.device, [r.request_id for r in reqs], ttl_seconds=60)
+        scope = grant(self.auth, self.device, [r.request_id for r in reqs], ttl_seconds=60)
         self.assertEqual(len(scope.bindings), 3)
         for r in reqs:
             self.auth.approve(self.device, scope.scope_id, r.request_id, r.digest)
@@ -408,13 +482,13 @@ class ScopeExpiryTests(unittest.TestCase):
         ids = [r.request_id for r in reqs]
         for perm in (ids, ids[::-1], [ids[1], ids[0], ids[2]]):
             with self.subTest(perm=perm):
-                scope = self.auth.grant(self.device, perm, ttl_seconds=10_000)
+                scope = grant(self.auth, self.device, perm, ttl_seconds=10_000)
                 self.assertEqual(scope.expires_at, T0 + 300)
                 self.assertEqual(scope.to_wire()["expires_at"], T0 + 300)
                 self.assertEqual(ApprovalScope.from_wire(scope.to_wire()).expires_at, T0 + 300)
         # A ttl shorter than every request still wins.
-        self.assertEqual(self.auth.grant(self.device, ids, ttl_seconds=30).expires_at, T0 + 30)
-        scope = self.auth.grant(self.device, ids, ttl_seconds=10_000)
+        self.assertEqual(grant(self.auth, self.device, ids, ttl_seconds=30).expires_at, T0 + 30)
+        scope = grant(self.auth, self.device, ids, ttl_seconds=10_000)
         # The later requests are still open, but this scope has ended with the earliest.
         self.clock.now = T0 + 300
         for r in (reqs[0], reqs[2]):

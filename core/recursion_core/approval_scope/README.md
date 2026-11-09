@@ -16,11 +16,17 @@ PRODUCT.md 4.2, I-42, O74).
   with `credential_unknown`. Code in the same process that holds the registry can still
   mint; whether that path is a boundary is open under O69.
 - `ApprovalAuthority(clock, registry)` opens requests (`open(credential, request)`, where
-  the prompt's requester is the opener's principal), grants an `ApprovalScope` to an
+  the opener must hold `control` and the prompt's requester is the opener's principal;
+  `observe`-only or scope-less credentials are refused with `open_scope_required`),
+  serves the approver inbox (`pending(credential)` lists open requests with the prompt the
+  core drew; `show(credential, request_id)` returns one) to approver credentials only, grants an `ApprovalScope` to an
   `operator_ui` or `paired_device` credential holding the `approve` scope (`manage` not
   needed; pairing never grants it), and checks `approve`/`deny`. Scopes are non-delegable,
   bound to fixed `(request_id, digest)` pairs, each used once, and expire no later than
   the earliest of their requests. `agent` and `plugin` credentials are always refused.
+  `grant` refuses (`prompt_not_shown`) any request whose prompt was not handed to that
+  same credential through `pending` or `show`, so a request id and digest relayed by the
+  opener are not enough to approve (PRODUCT.md 4.2: bound to what was shown).
 
 The core names no consumer domain here. Consumers filter their own domain reads (O74).
 

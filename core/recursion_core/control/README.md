@@ -19,8 +19,20 @@ recorded on F60, CSL-762).
   `client_key` dedupes retries per tenant and is bound to that start's engine and prompt digest; reusing
   it for a different request is `request_invalid` / `client_key_reused`. The key and digest are stored in
   the run record (`start_key`) and found through `RunRegistry.find_start`, so a durable registry keeps
-  dedupe across a daemon restart (11.3, B-17). A start that launches and then crashes before the record
-  is written is not covered; that needs a launch intent written first, in the durable registry item.
+  dedupe across a daemon restart (11.3, B-17).
+- Launch intent first: `run.start` picks the run id, writes the record as `starting` (with its
+  `start_key`) and only then calls the injected starter with that `run_id`. If that first write fails,
+  nothing is launched (`registry_unavailable`). If the write after launch fails, or the starter hands
+  back no cgroup, the answer is `start_unconfirmed` and the record stays `starting`: `run.list` shows the
+  run, a same-key retry answers with it instead of launching again, and `run.stop` answers `pending` /
+  `cgroup_unknown` without calling the cleanup layer. A starter that raises leaves the record
+  `start_failed`; a same-key retry relaunches under the same run id. A daemon crash between launch and
+  the second write leaves the same `starting` record; reconciling it against the host (the startup
+  sweep) belongs to the durable-registry item, CSL-738.
+- Registry errors never escape `ControlAPI.call`: a read, a stop lookup or the launch-intent write that
+  fails answers `registry_unavailable`. Once the cleanup layer has answered, Stop returns `stopped` or
+  `pending` even if writing that back fails, with `"recorded": false`; the next stop then sees the old
+  record and asks the cleanup layer again, which is safe to repeat.
 - Stop decisions are serialised per run, not API-wide, so one hung cleanup never queues another run's
   Stop (11.3, D2-55 / B-19).
 - **Unscoped (open decision).** `ControlAPI.call` takes no caller identity. `run.list` and `run.status`
@@ -56,6 +68,14 @@ recorded on F60, CSL-762).
 No daemon serves this API yet, no MCP transport is implemented, the CLI has no packaged entry point (its
 API client factory is injected) and no real cleanup layer is wired. Nothing here talks to a real Codex or
 Claude Code client, a provider or the network; tests use fakes only.
+
+**Not built here, owner not assigned: the daemon adapter.** This PR does not build the production
+adapter that makes the daemon (recursion #324, CSL-738) construct a `ControlAPI`, hand its client to
+this CLI, and give the GUI a device/pairing door onto it. #324's body says #327 owns that adapter; this
+PR does not take it on, and no other lane or issue is named for it yet. Until one is, the daemon's GUI
+door answers 401 and `cli.run(..., None)` answers `control_api_unavailable`, so Stop through the GUI or
+the packaged CLI on Nov 11 (PRODUCT.md 2.1, 3.4 S6) has no owner. Which lane and issue own it is
+Lucas's call.
 
 ## Tests
 

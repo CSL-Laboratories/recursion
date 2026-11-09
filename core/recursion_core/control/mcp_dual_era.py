@@ -23,6 +23,10 @@ This module is an offline reading of:
 
 It does not spawn Claude Code, talk to a provider, or open a network
 connection. A live binary wire-capture of a real handshake is unmeasured here.
+
+Deferred (O60 / A45): no pinned pre-release conformance tool has checked the
+``2026-07-28`` shapes; they rest on the reading of ``schema.ts`` above.
+``DualEraServer`` is an in-process mock with no stdio or HTTP transport.
 """
 
 from __future__ import annotations

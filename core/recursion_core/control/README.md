@@ -77,7 +77,17 @@ recorded on F60, CSL-762).
   a JSON-RPC ``-32602`` ``run_unknown`` error, and ``tasks/cancel`` sends nothing
   to the Stop path for it. Task ``createdAt`` comes from the run's
   ``started_at``; the default clock is wall time. Live binary wire-capture is
-  unmeasured (no Claude Code is spawned).
+  unmeasured (no Claude Code is spawned). A Stop the core has not confirmed
+  reads ``working`` with ``statusMessage: "pending"`` through ``tasks/cancel``
+  and ``tasks/get``, never ``cancelled`` (S6); a ``starting`` launch reads
+  ``working``, not ``failed``.
+
+  Deferred (PRODUCT.md O60 / A45): the ``2026-07-28`` side is not yet tested
+  against a pinned pre-release conformance tool. The shapes (``server/discover``,
+  ``_meta``, ``resultType``, ``CreateTaskResult``, ``ttlMs``) are checked only
+  against this module's reading of ``schema.ts``. ``DualEraServer`` is an
+  in-process mock with no transport: no stdio or HTTP entry point serves it yet.
+  Choosing and pinning the conformance tool and wiring the transport are open.
 - `codex_config.py`: `codex_operator_snippet(server_id, command, args)` writes the operator's Codex TOML,
   setting `approval_mode = "approve"` under `mcp_servers.<id>.tools.recursion_run_stop`, so stop does not
   prompt where that setting is in place. `strict_auto_review` or a managed approval requirement can still

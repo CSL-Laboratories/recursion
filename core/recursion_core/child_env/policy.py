@@ -31,6 +31,10 @@ replacement. It builds the child environment from nothing:
   the parent's values never reach the child in any mode, and the child gets one only from the
   ``ChildRoute`` the caller passes for the route it launched. This module reads no keyring and no key
   file; the caller hands it a key it already fetched, on an ``api_key`` route only;
+* a ``subscription`` route's base URL is refused unless its origin is exactly ``https://api.anthropic.com``, the
+  caller passes that origin as one the user already trusted, or the run uses the named full-access profile
+  (owner call; CSLR-D-011): the ``CLAUDE_CODE_OAUTH_TOKEN`` passed through would go to that base. This module
+  stores no trusted list and asks nothing; the driver does both;
 * one change beyond N5h/N5i: links are resolved one component at a time and every
   link met on the way, including links inside a link's target, must be root's or
   ours in a directory chain no one else can write, and no step may enter ``/proc``,
@@ -166,6 +170,9 @@ _BASE_URL = re.compile(
     r"^(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*)://(?P<userinfo>[^@/?#]*@)?"
     r"(?P<host>\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+)(?::(?P<port>[0-9]{1,5}))?(?P<path>/[A-Za-z0-9._~/-]*)?\Z"
 )
+# The one base a subscription route may name without the user's say: Anthropic's own API, as (scheme, host, port).
+_OFFICIAL_ORIGIN = ("https", "api.anthropic.com", 443)
+_DEFAULT_PORTS = {"http": 80, "https": 443}
 _MAX_LINKS = 40
 # The three routes Recursion owns (PRODUCT.md 055cc7a5 section 3.3; CSLR-D-011). Nothing else is a mode.
 AUTH_MODES = ("subscription", "api_key", "cloud_provider")
@@ -178,18 +185,29 @@ class ChildRoute:
     ``api_key`` is a user-entered vendor key the caller already fetched (from the OS keyring, or the owner-only
     file on a host with no keyring); it is accepted on an ``api_key`` route only. ``base_url`` is the route's own
     Anthropic-compatible base, if it has one. ``provider_switches`` are the cloud-provider switches the user
-    picked, by name. ``repr`` and ``str`` show whether a value is set, never the value.
+    picked, by name.
+
+    The next two matter on a ``subscription`` route with a ``base_url`` and nowhere else. ``trusted_base_urls``
+    are the origins (``scheme://host[:port]``) the user already agreed to send their subscription sign-in to;
+    the driver keeps that list and fills it in, this module only compares. ``full_access_acknowledged`` says
+    this run uses the named full-access profile and the user acknowledged it for this run (PRODUCT.md 055cc7a5
+    Q20, O44, H-06); only the bool ``True`` counts. ``repr`` and ``str`` show whether a value is set, a count or
+    a flag, never a key or a URL.
     """
 
     api_key: str | None = field(default=None, repr=False)
     base_url: str | None = field(default=None, repr=False)
     provider_switches: tuple[str, ...] = ()
+    trusted_base_urls: tuple[str, ...] = field(default=(), repr=False)
+    full_access_acknowledged: bool = False
 
     def __repr__(self) -> str:
         key, url = ("set" if value is not None else "none" for value in (self.api_key, self.base_url))
-        switches = self.provider_switches
-        count = len(switches) if isinstance(switches, (tuple, list, frozenset)) else "?"
-        return f"ChildRoute(api_key=<{key}>, base_url=<{url}>, provider_switches=<{count}>)"
+        switches, trusted = (len(value) if isinstance(value, (tuple, list, frozenset)) else "?"
+                             for value in (self.provider_switches, self.trusted_base_urls))
+        full = "yes" if self.full_access_acknowledged is True else "no"
+        return (f"ChildRoute(api_key=<{key}>, base_url=<{url}>, provider_switches=<{switches}>, "
+                f"trusted_base_urls=<{trusted}>, full_access_acknowledged=<{full}>)")
 
 
 @dataclass(frozen=True)
@@ -207,7 +225,7 @@ class EngineProfile:
     # gets it only from the caller's ``ChildRoute``, in the mode that allows it. None or empty: the engine has
     # no such route here.
     key_name: str | None = None  # the user-entered vendor key, ``api_key`` mode only
-    base_url_name: str | None = None  # the route's own base URL, any mode
+    base_url_name: str | None = None  # the route's own base URL, any mode (``subscription``: see ``_route_env``)
     provider_switches: tuple[str, ...] = ()  # set to "1" when picked, ``cloud_provider`` mode only
 
 
@@ -297,7 +315,9 @@ def build_child_env(
 
     ``auth_mode`` is required: one of ``AUTH_MODES``. Omitted refuses with ``auth_mode_missing``, anything else
     with ``auth_mode_unknown``. ``route`` carries what the caller says about the route it launched (see
-    ``ChildRoute``); the parent's vendor key, base URL and provider switches are dropped in every mode.
+    ``ChildRoute``); the parent's vendor key, base URL and provider switches are dropped in every mode. On a
+    ``subscription`` route a base URL that is not Anthropic's own, not in the route's trusted list and not under
+    an acknowledged full-access run refuses with ``route_base_url_untrusted``.
     ``home`` is the route-owned private home the child gets as HOME; the parent's HOME is never passed.
     ``overrides`` are values the core itself sets. An override may only set a name already on this engine's
     allowlist (never HOME, PATH, a credential or a scrubbed name), and it is merged before the checks, so it
@@ -371,6 +391,13 @@ def _route_env(profile: EngineProfile, auth_mode: str, route: ChildRoute | None)
     switches = route.provider_switches
     if not isinstance(switches, (tuple, list, frozenset)) or not all(isinstance(name, str) for name in switches):
         raise EnvRefused(None, "route_malformed")
+    # The two subscription base-URL inputs are shape-checked in every mode, so a malformed route never launches;
+    # well-formed, they change nothing outside a subscription route that has a base URL.
+    trusted = _trusted_origins(route.trusted_base_urls)
+    if trusted is None:
+        raise EnvRefused(None, "route_trusted_base_urls_malformed")
+    if not isinstance(route.full_access_acknowledged, bool):  # "yes", 1 and the like are not an acknowledgment
+        raise EnvRefused(None, "route_full_access_malformed")
     if auth_mode == "cloud_provider" and not profile.provider_switches:
         raise EnvRefused(None, "auth_mode_unsupported")  # this engine has no cloud-provider route here
     out: dict[str, str] = {}
@@ -402,8 +429,48 @@ def _route_env(profile: EngineProfile, auth_mode: str, route: ChildRoute | None)
             raise EnvRefused(None, "route_base_url_unsupported")
         if (cause := _unsafe_base_url(route.base_url)) is not None:
             raise EnvRefused(profile.base_url_name, cause)
+        # A subscription child carries the user's own CLAUDE_CODE_OAUTH_TOKEN (passed through above), and the
+        # engine sends it to this base. So the base must be Anthropic's own origin, an origin the user already
+        # trusted (the driver asks once and remembers; nothing is stored or asked here), or the run must use the
+        # named full-access profile the user acknowledged for this run (owner call; CSLR-D-011; PRODUCT.md
+        # 055cc7a5 Q20, O44, H-06). Origins are compared whole, never by prefix or substring. An api_key or
+        # cloud_provider route is not checked: its base URL behaves as before.
+        if auth_mode == "subscription" and route.full_access_acknowledged is not True:
+            origin = _origin(route.base_url)
+            if origin != _OFFICIAL_ORIGIN and origin not in trusted:
+                raise EnvRefused(profile.base_url_name, "route_base_url_untrusted")
         out[profile.base_url_name] = route.base_url
     return out
+
+
+def _origin(value: str) -> tuple[str, str, int]:
+    """(scheme, host, port) of a URL that passed ``_unsafe_base_url``: what two base URLs share when one endpoint.
+
+    Scheme and host are lowercased and a missing port is the scheme's own (443 for https, 80 for http); the path
+    is not part of it. Nothing else is folded: a host with a trailing dot, and another spelling of the same IP
+    address, are different origins, so they are never the official one and need their own trusted entry.
+    """
+
+    match = _BASE_URL.match(value)
+    scheme = match["scheme"].lower()
+    return scheme, match["host"].lower(), int(match["port"]) if match["port"] is not None else _DEFAULT_PORTS[scheme]
+
+
+def _trusted_origins(value: object) -> frozenset[tuple[str, str, int]] | None:
+    """The route's trusted list as origins, or None when it is not a tuple or frozenset of ``scheme://host[:port]``.
+
+    An entry meets the base URL rule and names an origin only: a path beyond ``/`` refuses, since trust is given
+    to an endpoint, not to one path on it. One bad entry refuses the whole list.
+    """
+
+    if not isinstance(value, (tuple, frozenset)):
+        return None
+    origins = set()
+    for entry in value:
+        if _unsafe_base_url(entry) is not None or _BASE_URL.match(entry)["path"] not in (None, "/"):
+            return None
+        origins.add(_origin(entry))
+    return frozenset(origins)
 
 
 def _unsafe_base_url(value: object) -> str | None:

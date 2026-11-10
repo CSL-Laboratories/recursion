@@ -332,7 +332,8 @@ def cells(s: Scratch) -> list[Cell]:
     token = {"CLAUDE_CODE_OAUTH_TOKEN": "fake-not-a-token"}
     add("auth_route_ok", "sub_ambient_dropped", {**ambient, **token}, L(both(_absent(*gone), _same(**token))))
     add("auth_route_ok", "sub_route_base_url", ambient, L(both(_same(**{url: base_url}), _absent(*(set(gone) - {url})))),
-        route=ChildRoute(base_url=base_url))
+        route=ChildRoute(base_url=base_url, trusted_base_urls=("https://gateway.invalid",)),
+        note="launches as before only because the caller passes the origin as trusted by the user")
     add("auth_route_ok", "key_injected", {**ambient, **token},
         L(both(_same(**{key: USER_KEY}, **token), _absent(*(set(gone) - {key})))), auth=api, route=ChildRoute(api_key=USER_KEY),
         note="the caller's key, not the ambient one; no ambient base URL; the sign-in token stays")
@@ -348,6 +349,43 @@ def cells(s: Scratch) -> list[Cell]:
     add("auth_route_ok", "cloud_route_base_url", ambient, L(_same(**{foundry: "1", url: base_url})), auth=cloud,
         route=ChildRoute(base_url=base_url, provider_switches=(foundry,)))
     add("auth_route_ok", "codex_sub_ambient_dropped", {**ambient, **token}, L(_absent(*gone, *token)), engine="codex")
+
+    # Owner call (CSLR-D-011): a subscription base URL would receive the passed-through sign-in token, so it
+    # refuses unless its origin is Anthropic's own, the caller passes it as trusted by the user, or the run
+    # uses the acknowledged full-access profile. api_key and cloud_provider routes are not checked.
+    official, untrusted, origin = "https://api.anthropic.com", R("route_base_url_untrusted"), "https://gateway.invalid"
+    sub_url = lambda value, **more: ChildRoute(base_url=value, **more)  # noqa: E731
+    add("sub_base_url", "custom_untrusted", token, untrusted, route=sub_url(base_url))
+    add("sub_base_url", "ambient_is_not_trust", {**token, url: base_url, "RECURSION_FULL_ACCESS": "1",
+                                                 "RECURSION_TRUSTED_BASE_URLS": origin}, untrusted, route=sub_url(base_url))
+    add("sub_base_url", "official_http", token, untrusted, route=sub_url("http://api.anthropic.com"))
+    add("sub_base_url", "official_other_port", token, untrusted, route=sub_url(official + ":8443"))
+    add("sub_base_url", "official_suffix", token, untrusted, route=sub_url(official + ".evil"))
+    add("sub_base_url", "official_suffix_com", token, untrusted, route=sub_url(official + ".evil.com"))
+    add("sub_base_url", "official_trailing_dot", token, untrusted, route=sub_url(official + "."))
+    add("sub_base_url", "official_userinfo", token, R("base_url_userinfo"), route=sub_url("https://user@api.anthropic.com"))
+    add("sub_base_url", "trusted_other_origin", token, untrusted,
+        route=sub_url(base_url, trusted_base_urls=("https://other.invalid", origin + ":8443", "http://gateway.invalid")))
+    add("sub_base_url", "trusted_entry_malformed", token, R("route_trusted_base_urls_malformed"),
+        route=sub_url(base_url, trusted_base_urls=("gateway.invalid",)))
+    add("sub_base_url", "trusted_not_a_tuple", token, R("route_trusted_base_urls_malformed"),
+        route=sub_url(base_url, trusted_base_urls=origin))
+    add("sub_base_url", "full_access_truthy_string", token, R("route_full_access_malformed"),
+        route=sub_url(base_url, full_access_acknowledged="true"))
+    add("sub_base_url_ok", "none", token, L(both(_absent(url), _same(**token))))
+    add("sub_base_url_ok", "official", token, L(_same(**{url: official}, **token)), route=sub_url(official))
+    add("sub_base_url_ok", "official_upper_host", token, L(_same(**{url: "HTTPS://API.Anthropic.COM"})),
+        route=sub_url("HTTPS://API.Anthropic.COM"))
+    add("sub_base_url_ok", "official_explicit_443", token, L(_same(**{url: official + ":443/"})), route=sub_url(official + ":443/"))
+    add("sub_base_url_ok", "trusted", token, L(_same(**{url: base_url}, **token)), route=sub_url(base_url, trusted_base_urls=(origin,)))
+    add("sub_base_url_ok", "trusted_normalized", token, L(_same(**{url: base_url})),
+        route=sub_url(base_url, trusted_base_urls=frozenset({"HTTPS://Gateway.Invalid:443/"})))
+    add("sub_base_url_ok", "full_access", token, L(_same(**{url: base_url}, **token)),
+        route=sub_url(base_url, full_access_acknowledged=True))
+    add("sub_base_url_ok", "key_needs_no_trust", {}, L(_same(**{key: USER_KEY, url: base_url})), auth=api,
+        route=ChildRoute(api_key=USER_KEY, base_url=base_url))
+    add("sub_base_url_ok", "cloud_needs_no_trust", {}, L(_same(**{bedrock: "1", url: base_url})), auth=cloud,
+        route=ChildRoute(base_url=base_url, provider_switches=(bedrock,)))
     add("auth_route_ok", "codex_key_injected", {**ambient, **token},
         L(both(_same(CODEX_API_KEY=USER_KEY), _absent(*(set(gone) - {"CODEX_API_KEY"}), *token))), engine="codex", auth=api,
         route=ChildRoute(api_key=USER_KEY))

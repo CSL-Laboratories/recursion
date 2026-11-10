@@ -95,6 +95,10 @@ class CellTests(unittest.TestCase):
         self._assert_all(self._group("auth_route"), 14)
         self._assert_all(self._group("auth_route_ok"), 10)
 
+    def test_subscription_base_url_cells(self) -> None:
+        self._assert_all(self._group("sub_base_url"), 12)
+        self._assert_all(self._group("sub_base_url_ok"), 9)
+
     def test_the_fifteenth_path_cell_is_open_by_default_and_closed_by_the_scan_switch(self) -> None:
         self._assert_all(self._group("path_open", "path_scan"), 2)
 
@@ -499,7 +503,7 @@ class AuthRouteTests(unittest.TestCase):
                     with mock.patch.dict(os.environ, {"PATH": "/usr/bin", URL: ambient}, clear=True):
                         self.assertNotIn(URL, build_child_env("claude_code", home=home, auth_mode=mode, route=ROUTES[mode]))
 
-    def test_route_base_url_is_set_in_every_mode_and_only_from_the_route(self) -> None:
+    def test_route_base_url_is_set_only_from_the_route_and_a_subscription_route_needs_trust(self) -> None:
         home = _home(self)
         for mode in AUTH_MODES:
             for url in ("https://gateway.invalid", "https://gateway.invalid/api", "http://127.0.0.1:4000",
@@ -508,6 +512,10 @@ class AuthRouteTests(unittest.TestCase):
                     route = ChildRoute(api_key=ROUTES[mode].api_key, base_url=url,
                                        provider_switches=ROUTES[mode].provider_switches)
                     parent = {"PATH": "/usr/bin", URL: "https://ambient.invalid"}
+                    if mode == SUB:  # the sign-in token would go there: see SubscriptionBaseUrlTests
+                        self.assertEqual((URL, "route_base_url_untrusted"),
+                                         self._refused("claude_code", home, auth_mode=mode, route=route, parent=parent))
+                        continue
                     env = build_child_env("claude_code", home=home, auth_mode=mode, route=route, parent=parent)
                     self.assertEqual(url, env[URL])
 
@@ -628,7 +636,8 @@ class AuthRouteTests(unittest.TestCase):
             self.assertNotIn(OAUTH, env)
             self.assertNotIn(FAKE, env.to_dict().values())
         # The route has no field that could carry or store the token, and the module names it only as a passthrough.
-        self.assertEqual({"api_key", "base_url", "provider_switches"}, set(ChildRoute.__dataclass_fields__))
+        self.assertEqual({"api_key", "base_url", "provider_switches", "trusted_base_urls", "full_access_acknowledged"},
+                         set(ChildRoute.__dataclass_fields__))
         for profile in ENGINE_PROFILES.values():
             self.assertNotIn(OAUTH, (profile.key_name, profile.base_url_name, *profile.provider_switches, *profile.allowed))
         with self.assertRaises(TypeError):
@@ -721,6 +730,223 @@ class AuthRouteTests(unittest.TestCase):
                 self.assertNotIn("DISABLE_AUTOUPDATER", env)
                 self.assertEqual(("DISABLE_AUTOUPDATER", "override_not_allowed"), self._refused(
                     "claude_code", home, auth_mode=mode, route=ROUTES[mode], parent={}, overrides={"DISABLE_AUTOUPDATER": "1"}))
+
+
+@unittest.skipIf(os.name == "nt", "POSIX rules")
+class SubscriptionBaseUrlTests(unittest.TestCase):
+    """Owner call (CSLR-D-011): a subscription base URL refuses unless official, trusted by the user or full access."""
+
+    CUSTOM = "https://gateway.invalid/api"
+    OFFICIAL = ("https://api.anthropic.com", "https://api.anthropic.com/", "https://api.anthropic.com:443",
+                "HTTPS://API.Anthropic.COM", "https://Api.Anthropic.com:443/", "https://api.anthropic.com:0443",
+                "https://api.anthropic.com/v1")
+    LOOK_ALIKES = ("http://api.anthropic.com", "http://api.anthropic.com:443", "https://api.anthropic.com:8443",
+                   "https://api.anthropic.com:80", "https://api.anthropic.com.evil", "https://api.anthropic.com.evil.com",
+                   "https://api.anthropic.com.", "https://evil-api.anthropic.com", "https://xapi.anthropic.com",
+                   "https://anthropic.com", "https://api.anthropic.co", "https://api-anthropic.com",
+                   "https://api.anthropic.com.evil.com/api.anthropic.com", "https://evil.invalid/api.anthropic.com",
+                   "https://api.anthropic.com-evil.invalid",
+                   "https://[::1]", "https://127.0.0.1")
+    UNTRUSTED = (URL, "route_base_url_untrusted")
+
+    def _refused(self, home: str, mode: str = SUB, engine: str = "claude_code", **route: object) -> tuple[str | None, str]:
+        fields = {"api_key": ROUTES[mode].api_key, "provider_switches": ROUTES[mode].provider_switches, **route}
+        with self.assertRaises(EnvRefused) as caught:
+            build_child_env(engine, home=home, auth_mode=mode, route=ChildRoute(**fields), parent={"PATH": "/usr/bin", OAUTH: FAKE})
+        self.assertNotIn("://", str(caught.exception) + repr(caught.exception))
+        return caught.exception.name, caught.exception.cause
+
+    def _launched(self, home: str, mode: str = SUB, **route: object) -> ValidatedEnv:
+        fields = {"api_key": ROUTES[mode].api_key, "provider_switches": ROUTES[mode].provider_switches, **route}
+        return build_child_env("claude_code", home=home, auth_mode=mode, route=ChildRoute(**fields),
+                               parent={"PATH": "/usr/bin", OAUTH: FAKE, URL: "https://ambient.invalid"})
+
+    def test_subscription_with_no_base_url_launches(self) -> None:
+        home = _home(self)
+        for route in ({}, {"trusted_base_urls": ("https://gateway.invalid",)}, {"full_access_acknowledged": True}):
+            with self.subTest(route=sorted(route)):
+                env = self._launched(home, **route)
+                self.assertNotIn(URL, env)
+                self.assertEqual(FAKE, env[OAUTH])
+
+    def test_the_official_origin_launches_without_trust(self) -> None:
+        home = _home(self)
+        for url in self.OFFICIAL:
+            with self.subTest(url=url):
+                env = self._launched(home, base_url=url)
+                self.assertEqual(url, env[URL])  # the child gets the route's own spelling
+                self.assertEqual(FAKE, env[OAUTH])
+
+    def test_look_alikes_of_the_official_origin_refuse(self) -> None:
+        home = _home(self)
+        for url in self.LOOK_ALIKES:
+            with self.subTest(url=url):
+                self.assertEqual(self.UNTRUSTED, self._refused(home, base_url=url))
+        # A user name or password refuses by the value rule, before any origin is compared and even when trusted.
+        for url in ("https://user@api.anthropic.com", "https://api.anthropic.com@evil.invalid", "https://api.anthropic.com:443@evil.invalid"):
+            for route in ({}, {"trusted_base_urls": ("https://evil.invalid", "https://api.anthropic.com")},
+                          {"full_access_acknowledged": True}):
+                with self.subTest(url=url, route=sorted(route)):
+                    self.assertEqual((URL, "base_url_userinfo"), self._refused(home, base_url=url, **route))
+
+    def test_an_untrusted_custom_url_refuses(self) -> None:
+        home = _home(self)
+        for url in (self.CUSTOM, "https://gateway.invalid", "http://127.0.0.1:4000", "https://[::1]:8443/v1/"):
+            with self.subTest(url=url):
+                self.assertEqual(self.UNTRUSTED, self._refused(home, base_url=url))
+                self.assertEqual(self.UNTRUSTED, self._refused(home, base_url=url, trusted_base_urls=frozenset()))
+                self.assertEqual(self.UNTRUSTED, self._refused(home, base_url=url, full_access_acknowledged=False))
+
+    def test_the_same_url_passed_as_trusted_launches(self) -> None:
+        home = _home(self)
+        cases = ((self.CUSTOM, "https://gateway.invalid"), (self.CUSTOM, "https://gateway.invalid:443"),
+                 (self.CUSTOM, "HTTPS://Gateway.INVALID/"), ("https://Gateway.invalid:443", "https://gateway.invalid"),
+                 ("http://127.0.0.1:4000/v1", "http://127.0.0.1:4000"), ("http://localhost", "http://localhost:80"),
+                 ("https://[::1]:8443/v1/", "https://[::1]:8443"))
+        for url, entry in cases:
+            for trusted in ((entry,), frozenset({entry}), ("https://other.invalid", entry)):
+                with self.subTest(url=url, trusted=sorted(trusted)):
+                    env = self._launched(home, base_url=url, trusted_base_urls=trusted)
+                    self.assertEqual(url, env[URL])
+                    self.assertEqual(FAKE, env[OAUTH])
+
+    def test_a_trusted_list_holding_a_different_origin_still_refuses(self) -> None:
+        home = _home(self)
+        for entry in ("https://other.invalid", "http://gateway.invalid", "https://gateway.invalid:8443", "https://gateway.invalid.",
+                      "https://gateway.invalid.evil", "https://sub.gateway.invalid", "https://invalid", "https://api.anthropic.com"):
+            with self.subTest(entry=entry):
+                self.assertEqual(self.UNTRUSTED, self._refused(home, base_url=self.CUSTOM, trusted_base_urls=(entry,)))
+        # Another spelling of the same address is another origin: nothing is folded beyond case and the default port.
+        self.assertEqual(self.UNTRUSTED, self._refused(home, base_url="https://[::1]", trusted_base_urls=("https://[0:0:0:0:0:0:0:1]",)))
+
+    def test_a_malformed_trusted_list_refuses_in_every_mode(self) -> None:
+        home = _home(self)
+        malformed = (None, "https://gateway.invalid", ["https://gateway.invalid"], {"https://gateway.invalid": True},
+                     (b"https://gateway.invalid",), (7,), (None,), ("",), ("gateway.invalid",), ("//gateway.invalid",),
+                     ("ftp://gateway.invalid",), ("https://fakeuser@gateway.invalid",), ("https://gateway.invalid/api",),
+                     ("https://gateway.invalid?k=v",), ("https://gateway.invalid:0",), ("https://gateway.invalid", "*"),
+                     ("https://*.invalid",), ("https://gateway.invalid\n",))
+        for trusted in malformed:
+            for mode in AUTH_MODES:
+                for url in (None, self.CUSTOM, "https://api.anthropic.com"):
+                    with self.subTest(trusted=trusted, mode=mode, url=url):
+                        self.assertEqual((None, "route_trusted_base_urls_malformed"),
+                                         self._refused(home, mode, base_url=url, trusted_base_urls=trusted))
+
+    def test_the_full_access_acknowledgment_launches_a_custom_url(self) -> None:
+        home = _home(self)
+        for url in (self.CUSTOM, "http://127.0.0.1:4000", "https://api.anthropic.com.evil"):
+            with self.subTest(url=url):
+                env = self._launched(home, base_url=url, full_access_acknowledged=True)
+                self.assertEqual(url, env[URL])
+                self.assertEqual(FAKE, env[OAUTH])
+        # The URL value rule still applies under full access.
+        for url, cause in (("gateway.invalid", "base_url_malformed"), ("https://gateway.invalid/?k=v", "base_url_malformed"),
+                           ("https://fakeuser:fakepass@gateway.invalid", "base_url_userinfo")):
+            with self.subTest(url=url):
+                self.assertEqual((URL, cause), self._refused(home, base_url=url, full_access_acknowledged=True))
+
+    def test_only_the_bool_true_is_an_acknowledgment(self) -> None:
+        home = _home(self)
+        for value in ("true", "True", "yes", "1", 1, 1.0, b"1", (True,), [True], {"ack": True}, None, 0, "", mock.Mock()):
+            for mode in AUTH_MODES:
+                for url in (None, self.CUSTOM):
+                    with self.subTest(value=value, mode=mode, url=url):
+                        self.assertEqual((None, "route_full_access_malformed"),
+                                         self._refused(home, mode, base_url=url, full_access_acknowledged=value))
+
+    def test_full_access_and_trust_are_never_read_from_the_parent_or_an_override(self) -> None:
+        home = _home(self)
+        route = ChildRoute(base_url=self.CUSTOM)
+        ambient = {"PATH": "/usr/bin", URL: self.CUSTOM, "RECURSION_FULL_ACCESS": "1", "FULL_ACCESS": "1",
+                   "RECURSION_FULL_ACCESS_ACKNOWLEDGED": "true", "RECURSION_TRUSTED_BASE_URLS": "https://gateway.invalid",
+                   "TRUSTED_BASE_URLS": "https://gateway.invalid", "CLAUDE_CODE_DANGEROUSLY_SKIP_PERMISSIONS": "1"}
+        with self.assertRaises(EnvRefused) as caught:
+            build_child_env("claude_code", home=home, auth_mode=SUB, route=route, parent=ambient)
+        self.assertEqual(self.UNTRUSTED, (caught.exception.name, caught.exception.cause))
+        with mock.patch.dict(os.environ, ambient, clear=True), self.assertRaises(EnvRefused) as caught:
+            build_child_env("claude_code", home=home, auth_mode=SUB, route=route)
+        self.assertEqual(self.UNTRUSTED, (caught.exception.name, caught.exception.cause))
+        # An override cannot name the base URL, and no override stands in for the route's two inputs.
+        for name in (URL, "RECURSION_TRUSTED_BASE_URLS", "RECURSION_FULL_ACCESS"):
+            with self.subTest(override=name), self.assertRaises(EnvRefused) as caught:
+                build_child_env("claude_code", home=home, auth_mode=SUB, route=ChildRoute(), parent={}, overrides={name: self.CUSTOM})
+            self.assertEqual((name, "override_not_allowed" if name == "RECURSION_FULL_ACCESS" else "override_denied"),
+                             (caught.exception.name, caught.exception.cause))
+        # Nothing is stored or opened to decide: the trusted list is only the tuple the caller passed.
+        boom = AssertionError("child_env opened a file")
+        with mock.patch("builtins.open", side_effect=boom), mock.patch("io.open", side_effect=boom), \
+                mock.patch("os.open", side_effect=boom), mock.patch("os.read", side_effect=boom), \
+                mock.patch("builtins.input", side_effect=AssertionError("child_env prompted")):
+            self.assertEqual(self.UNTRUSTED, self._refused(home, base_url=self.CUSTOM))
+            self.assertEqual(self.CUSTOM, self._launched(home, base_url=self.CUSTOM, trusted_base_urls=("https://gateway.invalid",))[URL])
+            self.assertEqual(self.UNTRUSTED, self._refused(home, base_url=self.CUSTOM))  # a launch remembered nothing
+
+    def test_api_key_and_cloud_provider_base_urls_are_unchanged(self) -> None:
+        home = _home(self)
+        for mode in (API, CLOUD):
+            for url in (self.CUSTOM, "http://127.0.0.1:4000", "http://api.anthropic.com", "https://api.anthropic.com.evil",
+                        "https://api.anthropic.com"):
+                # No trust is needed, and a trusted list or an acknowledgment changes nothing.
+                for route in ({}, {"trusted_base_urls": ("https://other.invalid",)}, {"full_access_acknowledged": True},
+                              {"trusted_base_urls": ("https://gateway.invalid",), "full_access_acknowledged": True}):
+                    with self.subTest(mode=mode, url=url, route=sorted(route)):
+                        env = self._launched(home, mode, base_url=url, **route)
+                        self.assertEqual(url, env[URL])
+                        plain = self._launched(home, mode, base_url=url)
+                        self.assertEqual(plain.to_dict(), env.to_dict())
+            self.assertNotIn(URL, self._launched(home, mode, full_access_acknowledged=True, trusted_base_urls=("https://gateway.invalid",)))
+        self.assertEqual(USER_KEY, self._launched(home, API, base_url=self.CUSTOM)[KEY])
+        self.assertEqual("1", self._launched(home, CLOUD, base_url=self.CUSTOM)[BEDROCK])
+        # The inputs do not loosen what a subscription route may carry.
+        self.assertEqual((KEY, "route_key_not_allowed"), self._refused(home, api_key=USER_KEY, full_access_acknowledged=True))
+        self.assertEqual((None, "route_provider_not_allowed"),
+                         self._refused(home, provider_switches=(BEDROCK,), full_access_acknowledged=True))
+
+    def test_codex_has_no_base_url_route_whatever_the_trust(self) -> None:
+        home = _home(self)
+        for route in ({}, {"trusted_base_urls": ("https://gateway.invalid",)}, {"full_access_acknowledged": True}):
+            for url in (self.CUSTOM, "https://api.anthropic.com"):
+                with self.subTest(route=sorted(route), url=url):
+                    self.assertEqual((None, "route_base_url_unsupported"), self._refused(home, engine="codex", base_url=url, **route))
+        env = build_child_env("codex", home=home, auth_mode=SUB, parent={"PATH": "/usr/bin", OAUTH: FAKE},
+                              route=ChildRoute(trusted_base_urls=("https://gateway.invalid",), full_access_acknowledged=True))
+        self.assertFalse({URL, OAUTH, "OPENAI_BASE_URL"} & set(env))
+
+    def test_no_url_in_repr_str_or_refusal_text(self) -> None:
+        home = _home(self)
+        marks = ("gateway", "invalid", "anthropic.com", "://", "8443", "trusted-host", "secret-path")
+        urls = (self.CUSTOM, "https://api.anthropic.com", "https://api.anthropic.com.evil", "http://trusted-host.invalid:8443/secret-path",
+                "https://fakeuser:fakepass@gateway.invalid", "not a url")
+        lists = ((), ("https://gateway.invalid",), ("https://trusted-host.invalid:8443", "https://gateway.invalid"),
+                 ("https://gateway.invalid/secret-path",), "https://gateway.invalid")
+        texts: list[str] = []
+        refusals = launched = 0
+        for url in (None, *urls):
+            for trusted in lists:
+                for ack in (False, True, "https://gateway.invalid"):
+                    route = ChildRoute(base_url=url, trusted_base_urls=trusted, full_access_acknowledged=ack)
+                    texts += [repr(route), str(route), f"{route}", repr([route]), repr({"route": route})]
+                    for mode in (*AUTH_MODES, None):
+                        try:
+                            env = build_child_env("claude_code", home=home, auth_mode=mode, route=route, parent={"PATH": "/usr/bin"})
+                        except EnvRefused as refused:
+                            refusals += 1
+                            texts += [str(refused), repr(refused), repr(refused.args), str(refused.name), refused.cause]
+                        else:
+                            launched += 1
+                            texts += [repr(env), str(env), repr(env.dropped), repr(sorted(env))]
+        self.assertGreater(refusals, 50)
+        self.assertGreater(launched, 5)
+        for text in texts:
+            for mark in marks:
+                self.assertNotIn(mark, text.lower())
+        self.assertEqual("ChildRoute(api_key=<none>, base_url=<set>, provider_switches=<0>, trusted_base_urls=<2>, "
+                         "full_access_acknowledged=<yes>)",
+                         repr(ChildRoute(base_url=self.CUSTOM, trusted_base_urls=lists[2], full_access_acknowledged=True)))
+        self.assertEqual("ChildRoute(api_key=<none>, base_url=<none>, provider_switches=<0>, trusted_base_urls=<?>, "
+                         "full_access_acknowledged=<no>)",
+                         repr(ChildRoute(trusted_base_urls="https://gateway.invalid", full_access_acknowledged="yes")))
 
 
 @unittest.skipIf(os.name == "nt", "POSIX rules")

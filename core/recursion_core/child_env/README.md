@@ -50,6 +50,11 @@ Spec: CSLR-D-011, PRODUCT.md `055cc7a5c793b7135e5d0565dc4198cf96230531` (SHA-256
   is the same entry, so a link spelled that way is still refused. A home path ending in
   `..` is refused, since `link/sub/..` reaches the link's target. Parents are checked
   on the resolved path, so an accepted link above it (macOS `/var`) does not refuse it.
+- A path value is resolved one component at a time. A directory that a `..` steps back out
+  of, in the value or in a link's target, must pass the owned-chain rule too, although it
+  is not part of the resolved path: `pub/hop/../../ca.pem` with `pub` open to others
+  refuses with `value_chain_unsafe`, since `hop` could be swapped for a link after the
+  check. A `..` out of directories only root or we can write is accepted.
 - The old route transport (`scripts/v3/route_contract/transport.py`) is frozen and
   unchanged; it still passes `os.environ.copy()`.
 

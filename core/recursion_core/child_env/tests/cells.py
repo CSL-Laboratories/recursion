@@ -123,6 +123,11 @@ class Scratch:
         (self.op / "outer").symlink_to(self.pub / "inner")
         (self.pub / "inner_d").symlink_to(self.op / "d")
         (self.op / "outer_d").symlink_to(self.pub / "inner_d")
+        # #320 review: a plain directory in pub that a ".." steps back out of, in a value and in a link's target.
+        (self.pub / "hop").mkdir()
+        (self.op / "bin3").mkdir()
+        (self.op / "bin3" / "bash").symlink_to("../../pub/hop/../../op/sys/usr/bin/bash")  # dotdot_tool_link
+        (self.op / "up").symlink_to("d/../certs/ca.crt")  # dotdot_ok_link: ".." through our own directories only
         # CX-3771: an owned alias to /proc/self/cwd.
         (self.op / "procalias").symlink_to("/proc/self/cwd")
         # The cells' own system tree, merged-usr style (bin -> usr/bin, sbin -> usr/sbin): every directory and
@@ -263,6 +268,20 @@ def cells(s: Scratch) -> list[Cell]:
     add("c2_40", "alias_shell", {"SHELL": f"{op}/procalias/bash"}, R("value_perspective"))
     add("c2_40", "alias_path", {"PATH": f"{op}/procalias:{rest}"}, R("value_perspective"))
     add("c2_40", "alias_sslfile", {"SSL_CERT_FILE": f"{op}/procalias/ca.crt"}, R("value_perspective"))
+
+    # #320 review (Codex thread on _resolve): pub/hop is a plain directory today, so no link is met, and the
+    # ".." drops it from the resolved path. Whoever can write pub can swap hop for a link after the check.
+    hop = f"{pub}/hop/../.."  # resolves to the scratch root
+    add("dotdot", "dotdot_ca", {"SSL_CERT_FILE": f"{hop}/op/ca.pem"}, R("value_chain_unsafe"))
+    add("dotdot", "dotdot_ssldir", {"SSL_CERT_DIR": f"{hop}/op/certs"}, R("value_chain_unsafe"))
+    add("dotdot", "dotdot_shell", {"SHELL": f"{hop}/op/sys/usr/bin/bash"}, R("value_chain_unsafe"))
+    add("dotdot", "dotdot_path", {"PATH": f"{hop}/op/obin:{rest}"}, R("value_chain_unsafe"))
+    add("dotdot", "dotdot_tool_link", {"PATH": f"{op}/bin3:{rest}"}, R("path_tool_value_chain_unsafe"))
+    up_path = f"{op}/obin/../obin:{rest}"
+    add("dotdot_ok", "dotdot_ok_ssldir", {"SSL_CERT_DIR": f"{op}/d/../certs"}, L(_same(SSL_CERT_DIR=f"{op}/d/../certs")))
+    add("dotdot_ok", "dotdot_ok_shell", {"SHELL": f"{ubin}/../bin/bash"}, L(_same(SHELL=f"{ubin}/../bin/bash")))
+    add("dotdot_ok", "dotdot_ok_path", {"PATH": up_path}, L(_same(PATH=up_path)))
+    add("dotdot_ok", "dotdot_ok_link", {"SSL_CERT_FILE": f"{op}/up"}, L(_same(SSL_CERT_FILE=f"{op}/up")))
 
     # C1-46 (PRODUCT.md 055cc7a5 section 3.8): the names the Nov 5 list dropped, now carried under the same rules.
     socks = "socks5h://127.0.0.1:1080"

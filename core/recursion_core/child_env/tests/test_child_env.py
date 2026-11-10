@@ -99,6 +99,10 @@ class CellTests(unittest.TestCase):
         self._assert_all(self._group("sub_base_url"), 12)
         self._assert_all(self._group("sub_base_url_ok"), 9)
 
+    def test_a_dot_dot_out_of_a_directory_others_can_write_is_refused(self) -> None:
+        self._assert_all(self._group("dotdot"), 5)
+        self._assert_all(self._group("dotdot_ok"), 4)
+
     def test_the_fifteenth_path_cell_is_open_by_default_and_closed_by_the_scan_switch(self) -> None:
         self._assert_all(self._group("path_open", "path_scan"), 2)
 
@@ -438,6 +442,33 @@ class ProfileTests(unittest.TestCase):
                      f"{link}/sub/"):
             with self.subTest(home=home[len(str(base)):]):
                 self.assertEqual(home, build_child_env("codex", home=home, auth_mode=SUB, parent={})["HOME"])
+
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
+    def test_a_directory_left_by_dot_dot_is_checked_before_it_is_dropped(self) -> None:
+        # #320 review: hop is a plain directory, so no link rule fires, and ".." used to drop it unchecked.
+        root = Path(_home(self))
+        safe, pub = root / "safe", root / "safe" / "pub"
+        (pub / "hop").mkdir(parents=True)
+        (safe / "certs").mkdir()
+        (safe / "ca.pem").write_text("fake\n", encoding="ascii")
+        (safe / "ca.pem").chmod(0o644)
+        for path, mode in ((safe, 0o755), (safe / "certs", 0o755), (pub / "hop", 0o755), (pub, 0o777)):
+            path.chmod(mode)
+        self.assertIsNone(policy._unsafe_file(f"{safe}/ca.pem"))
+        self.assertEqual("value_missing", policy._unsafe_file(f"{pub}/x"))
+        self.assertEqual("value_chain_unsafe", policy._unsafe_file(f"{pub}/hop/../../ca.pem"))
+        self.assertEqual("value_chain_unsafe", policy._unsafe_dir(f"{pub}/hop/../../certs"))
+        self.assertEqual("value_chain_unsafe", policy._unsafe_dir(f"{pub}/hop/.."))
+        self.assertEqual("value_chain_unsafe", policy._unsafe_path(f"{pub}/hop/../../certs"))
+        os.symlink("pub/hop/../../ca.pem", safe / "via")  # the same ".." met in a link's target
+        self.assertEqual("value_chain_unsafe", policy._unsafe_file(f"{safe}/via"))
+        # Control: ".." out of directories only we can write passes, in a value and in a link's target.
+        self.assertIsNone(policy._unsafe_file(f"{safe}/certs/../ca.pem"))
+        self.assertIsNone(policy._unsafe_file(f"{safe}/certs/../certs/../ca.pem"))
+        self.assertIsNone(policy._unsafe_dir(f"{safe}/certs/../certs"))
+        self.assertIsNone(policy._unsafe_path(f"{safe}/certs/../certs"))
+        os.symlink("certs/../ca.pem", safe / "owned-via")
+        self.assertIsNone(policy._unsafe_file(f"{safe}/owned-via"))
 
     def test_validated_env_cannot_be_hand_made(self) -> None:
         with self.assertRaises(TypeError):

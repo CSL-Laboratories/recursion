@@ -520,7 +520,8 @@ def _resolve(path: str) -> tuple[str | None, bool, str | None]:
     """Resolve ``path`` one component at a time: (real path, leaf missing, cause).
 
     Every link met, including links inside another link's target, must be root's or ours and sit in a
-    directory whose own chain no one else can write; no step may enter a perspective path. A missing
+    directory whose own chain no one else can write; so must every directory a ``..`` steps back out of,
+    in the value or in a link's target; no step may enter a perspective path. A missing
     component ends the walk: the rest cannot be a link yet, and the caller decides whether that is safe.
     """
 
@@ -536,6 +537,10 @@ def _resolve(path: str) -> tuple[str | None, bool, str | None]:
         if part in ("", "."):
             continue
         if part == "..":
+            # The directory ".." leaves drops out of the result, so the final chain check never sees it; the
+            # child still walks it. Where someone else could swap it for a link, the value is theirs to redirect.
+            if current != "/" and not _owned_chain(current):
+                return None, False, "value_chain_unsafe"
             current = os.path.dirname(current)
             continue
         candidate = os.path.join(current, part)

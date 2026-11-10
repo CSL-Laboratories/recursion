@@ -63,6 +63,7 @@ import re
 import shutil
 import socket
 import stat
+import unicodedata
 import tempfile
 import threading
 from collections.abc import Mapping
@@ -495,7 +496,9 @@ def _canonical_ipv4(host: str) -> bool:
     if len(parts) != 4:
         return False
     for part in parts:
-        if not part.isdigit() or (len(part) > 1 and part[0] == "0") or int(part) > 255:
+        # Longer than three digits is not an octet. Do not call int() on it: a
+        # thousands-digit string raises ValueError at the conversion limit.
+        if not part.isdigit() or len(part) > 3 or (len(part) > 1 and part[0] == "0") or int(part) > 255:
             return False
     return True
 
@@ -741,47 +744,126 @@ def _host_addrs(host: str) -> tuple[ipaddress.IPv4Address | ipaddress.IPv6Addres
     return (address,)
 
 
-def _ipv4_shorthand_network(entry: str) -> ipaddress.IPv4Network | None:
-    """requests-style IPv4 CIDR: ``socket.inet_aton`` on the address, then the mask.
+# requests int() skips this leading whitespace and an optional '+'. curl's strtoul does too,
+# and then keeps the leading digits when junk follows (``8x`` is 8). A longer digit run is refused:
+# converting it would raise ValueError at the integer limit.
+_PREFIX_SPACE = frozenset(" \t\n\r\v\f")
 
-    ``10.0/8`` is ``10.0.0.0/8``. ``ipaddress`` rejects that shorthand. A prefix of 0
-    (``0/0``, ``10.0/0``) is the whole IPv4 family.
+
+def _prefix_bits(text: str) -> tuple[str, int | None]:
+    """``('ok', bits)``, ``('no', None)`` when this is not a prefix, or ``('bad', None)``.
+
+    ``bad`` is a prefix that cannot be judged without raising: a NUL, a thousands-digit
+    integer, or no digits where ``int()`` would raise (``²``).
+    """
+
+    if "\0" in text:
+        return "bad", None
+    i = 0
+    while i < len(text) and text[i] in _PREFIX_SPACE:
+        i += 1
+    if i < len(text) and text[i] == "+":
+        i += 1
+    start = i
+    # ASCII digits only. ``²``.isdigit() is true, and int() then raises.
+    while i < len(text) and text[i] in "0123456789":
+        i += 1
+        if i - start > 4:
+            return "bad", None
+    if i == start:
+        if text[i:].strip("".join(_PREFIX_SPACE)):
+            return "bad", None
+        return "no", None
+    bits = int(text[start:i])
+    if bits > 128:
+        return "no", None
+    return "ok", bits
+
+
+def _permissive_cidr(entry: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network | str | None:
+    """A CIDR ``ipaddress`` rejected, read the way requests or curl would.
+
+    ``10.0/+8`` and ``10.0.0.0/\\t8`` are ``/8`` (requests). ``10.0.0.0/8x`` is ``/8`` (curl).
+    Returns ``'bad'`` when the prefix cannot be read without raising.
     """
 
     if entry.count("/") != 1:
         return None
     addr, bits_s = entry.split("/", 1)
-    if not addr or not bits_s.isdigit():
+    if not addr:
         return None
-    bits = int(bits_s)
-    if not 0 <= bits <= 32:
+    kind, bits = _prefix_bits(bits_s)
+    if kind == "bad":
+        return "bad"
+    if kind != "ok" or bits is None:
+        return None
+    if bits <= 32:
+        try:
+            packed = socket.inet_aton(addr)
+        except (OSError, ValueError):
+            packed = None
+        if packed is not None:
+            try:
+                return ipaddress.IPv4Network((ipaddress.IPv4Address(packed), bits), strict=False)
+            except ValueError:
+                return "bad"
+    try:
+        address = ipaddress.ip_address(addr)
+    except ValueError:
+        return None
+    limit = 32 if address.version == 4 else 128
+    if bits > limit:
         return None
     try:
-        packed = socket.inet_aton(addr)
-    except OSError:
-        return None
-    return ipaddress.IPv4Network((ipaddress.IPv4Address(packed), bits), strict=False)
+        if address.version == 4:
+            return ipaddress.IPv4Network((address, bits), strict=False)
+        return ipaddress.IPv6Network((address, bits), strict=False)
+    except ValueError:
+        return "bad"
 
 
-def _no_proxy_network(entry: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network | None:
-    """A CIDR entry, or None. Host bits may be set (``10.1.2.3/8``); the prefix is what is matched.
+def _no_proxy_network(entry: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network | str | None:
+    """A CIDR entry, None, or ``'bad'`` when reading it would raise.
 
-    A prefix length of 0 covers that whole address family (``0.0.0.0/0``, ``::/0``).
-    The bare entry ``/0`` is not a network; the caller treats it as every IP.
+    Host bits may be set (``10.1.2.3/8``); the prefix is what is matched. A prefix length of 0
+    covers that whole address family (``0.0.0.0/0``, ``::/0``). The bare entry ``/0`` is not a
+    network; the caller treats it as every IP. ``ipaddress`` runs first. What it rejects is read
+    again with the requests/curl prefix rules, including a shorthand address (``10.0/8``).
     """
 
     if "/" not in entry or entry == "/0":
         return None
+    if "\0" in entry:
+        return "bad"
     try:
         return ipaddress.ip_network(entry, strict=False)
     except ValueError:
-        return _ipv4_shorthand_network(entry)
+        return _permissive_cidr(entry)
+
+
+def _ipv4_view_of_mapped(network: ipaddress.IPv6Network) -> ipaddress.IPv4Network | None:
+    """Go's ``IPNet.Contains``: an IPv4-mapped network is compared as IPv4.
+
+    ``::ffff:10.0.0.0/104`` is ``10.0.0.0/8``. ``::ffff:0:0/96`` is ``0.0.0.0/0``.
+    A network that does not keep the mapped prefix (``::/0``) is not an IPv4 network.
+    """
+
+    mapped = network.network_address.ipv4_mapped
+    if mapped is None or network.prefixlen < 96:
+        return None
+    try:
+        return ipaddress.IPv4Network((mapped, network.prefixlen - 96), strict=False)
+    except ValueError:
+        return None
 
 
 def _network_covers(network: ipaddress.IPv4Network | ipaddress.IPv6Network, hosts: tuple[str, ...]) -> bool:
+    v4_view = _ipv4_view_of_mapped(network) if isinstance(network, ipaddress.IPv6Network) else None
     for host in hosts:
         for address in _host_addrs(host):
             if address.version == network.version and address in network:
+                return True
+            if v4_view is not None and isinstance(address, ipaddress.IPv4Address) and address in v4_view:
                 return True
     return False
 
@@ -804,25 +886,92 @@ def _no_proxy_entries(value: str) -> tuple[str, ...]:
     return tuple(seen)
 
 
-def _idna_forms(label: str) -> set[str] | None:
-    """ASCII, punycode and unicode spellings of one host or entry.
+def _idna2008_name(body: str) -> str:
+    """IDNA2008 / UTS46 nontransitional, per label, the way Go's proxy encodes a name.
 
-    None means a non-ASCII label will not encode. The caller refuses: while a proxy
+    ``ß`` stays ``ß`` (``xn--fa-hia``), not ``ss``. ``ẞ`` lowercases to ``ß``, so it is the
+    same name. Final sigma ``ς`` stays distinct from ``σ``. This is the Go 1.22
+    ``ProxyFromEnvironment`` reading. IDNA2003 (``encode('idna')``) is kept as well.
+    """
+
+    labels = []
+    for label in body.lower().split("."):
+        if not label:
+            raise UnicodeError("empty label")
+        text = unicodedata.normalize("NFC", label)
+        if text.isascii():
+            labels.append(text)
+        else:
+            labels.append("xn--" + text.encode("punycode").decode("ascii"))
+    return ".".join(labels)
+
+
+def _idna_forms(label: str) -> set[str] | None:
+    """ASCII, IDNA2003, and IDNA2008 spellings of one host or entry.
+
+    A single leading dot is suffix syntax and is not an empty label. None means a
+    non-ASCII label will not encode under IDNA2003. The caller refuses: while a proxy
     is set, an entry that cannot be compared must not be kept.
     """
 
-    forms = {label.rstrip(".")}
+    raw = label.rstrip(".")
+    suffix = raw.startswith(".")
+    body = raw[1:] if suffix else raw
+    if not body:
+        return {raw} if raw else set()
+    forms: set[str] = set()
+    nonascii = any(ord(ch) > 127 for ch in body)
     try:
-        forms.add(label.encode("idna").decode("ascii").rstrip("."))
+        forms.add(body.lower().encode("idna").decode("ascii"))
     except UnicodeError:
-        if any(ord(ch) > 127 for ch in label):
+        if nonascii:
             return None
-    if label.isascii():
-        try:
-            forms.add(label.encode("ascii").decode("idna").rstrip("."))
-        except UnicodeError:
-            pass
+    try:
+        forms.add(_idna2008_name(body))
+    except UnicodeError:
+        pass
+    forms.add(body.lower())
+    if suffix:
+        forms |= {"." + form for form in list(forms)}
     return {form for form in forms if form}
+
+
+def _exact_name(entry: str, host: str) -> bool:
+    """True when two names are the same host under either IDNA reading."""
+
+    entry_forms = _idna_forms(entry)
+    host_forms = _idna_forms(host)
+    if entry_forms is None or host_forms is None:
+        return True
+    left = {form.lstrip(".") for form in entry_forms if form.lstrip(".")}
+    right = {form.lstrip(".") for form in host_forms if form.lstrip(".")}
+    return bool(left & right)
+
+
+def _star_match(pattern: str, text: str) -> bool:
+    """Match a ``*``-only pattern in one left-to-right pass.
+
+    Consecutive stars are one star. ``*`` matches across dots (``gate*invalid`` matches
+    ``gateway.invalid``). A leading ``*.`` does not by itself match the apex; the caller
+    adds that comparison.
+    """
+
+    parts = pattern.split("*")
+    if not text.startswith(parts[0]):
+        return False
+    pos = len(parts[0])
+    for part in parts[1:-1]:
+        if not part:
+            continue
+        found = text.find(part, pos)
+        if found < 0:
+            return False
+        pos = found + len(part)
+    last = parts[-1]
+    if not last:
+        return True
+    start = len(text) - len(last)
+    return start >= pos and text.endswith(last)
 
 
 def _normalize_no_proxy_entry(entry: str) -> str:
@@ -847,7 +996,8 @@ def _names_match(entry: str, host: str) -> bool:
     still attached). ``ateway.invalid`` therefore exempts ``gateway.invalid``. This
     check follows that reading, because a child may still run that requests. A dot
     boundary (``host == bare`` or ``host.endswith('.' + bare)``) is included in it.
-    IDNA spellings are compared both ways (``bücher.invalid`` and ``xn--bcher-kva.invalid``).
+    IDNA2003 and IDNA2008 spellings are compared both ways (``bücher.invalid`` and
+    ``xn--bcher-kva.invalid``; ``faß.invalid`` and ``xn--fa-hia.invalid``).
     """
 
     entry_forms = _idna_forms(entry)
@@ -872,26 +1022,34 @@ def _names_match(entry: str, host: str) -> bool:
 
 
 def _no_proxy_bypass(value: str, hosts: tuple[str, ...]) -> str | None:
-    """N5i: the union of curl, requests, hyper-util, undici and Codex matchers.
+    """N5i: the union of curl, requests, hyper-util, undici, Go and Codex matchers.
 
     ``hosts`` is the engine's own endpoints plus the route base host, when the route has one. A CIDR entry
-    matches an IP host it contains (curl, requests and hyper-util), including a requests shorthand
-    (``10.0/8``) and an IPv4-mapped route host (``[::ffff:10.1.2.3]``). It does not match a domain name:
-    none of those matchers resolve DNS. ``/0`` covers every IP of both families. Two spellings of one IP
-    address match (``::1`` and ``0:0:0:0:0:0:0:1``). A plain suffix matches without a dot boundary, which is
-    what requests <=2.32.3 does.
+    matches an IP host it contains, including a requests shorthand (``10.0/8``), a permissive prefix
+    (``+8``, a tab, ``8x``), an IPv4-mapped route host, and an IPv4-mapped CIDR compared as IPv4
+    (Go: ``::ffff:10.0.0.0/104``). It does not match a domain name: none of those matchers resolve DNS.
+    ``/0`` covers every IP of both families. A leading ``*.`` also matches the apex (Undici 7.30.1).
+    IDNA2003 and IDNA2008 spellings are compared. A plain suffix matches without a dot boundary, which is
+    what requests <=2.32.3 does. A NUL is ``value_malformed``. A CIDR prefix that cannot be read without
+    raising is ``no_proxy_malformed``.
     """
 
+    if "\0" in value:
+        return "value_malformed"
     checked = tuple(_no_proxy_host(host) for host in hosts)
     for raw in _no_proxy_entries(value):
         entry = re.sub(r"^[a-z][a-z0-9+.-]*://", "", raw)
         if not entry:
             continue
+        if "\0" in entry:
+            return "value_malformed"
         if entry == "/0":
             if any(_host_addrs(host) for host in checked):
                 return "no_proxy_engine_host"
             continue
         network = _no_proxy_network(entry)
+        if network == "bad":
+            return "no_proxy_malformed"
         if network is not None:
             if network.prefixlen == 0 and any(
                 address.version == network.version for host in checked for address in _host_addrs(host)
@@ -908,14 +1066,16 @@ def _no_proxy_bypass(value: str, hosts: tuple[str, ...]) -> str | None:
         if entry.strip("*.") == "":
             return "no_proxy_wildcard"
         if "*" in entry:
-            # ``*`` is ``.*``, so a glob in the middle crosses dots (``gate*invalid`` matches
-            # ``gateway.invalid``). That is wider than a shell glob and is kept on purpose.
-            pattern = re.compile(".*".join(re.escape(part) for part in entry.split("*")) + r"\Z")
+            # ``*`` matches across dots (``gate*invalid`` matches ``gateway.invalid``).
+            # Undici 7.30.1 also treats a leading ``*.`` as the apex itself.
             forms: list[str] = []
             for host in checked:
                 host_forms = _idna_forms(host)
                 forms.extend(host_forms or ())
-            hit = any(pattern.match(host) for host in forms)
+            hit = any(_star_match(entry, host) for host in forms)
+            apex = entry[2:] if entry.startswith("*.") else ""
+            if apex and "*" not in apex:
+                hit = hit or any(_exact_name(apex, host) for host in checked)
         else:
             hit = any(_names_match(entry, host) for host in checked)
         if hit:

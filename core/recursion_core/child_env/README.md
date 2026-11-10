@@ -104,15 +104,23 @@ Foundry switches are dropped. The child gets one only from the route:
   route base host as well as the engine's own endpoints. Either name is enough to refuse.
   `NO_PROXY=gateway.invalid` cannot send `https://gateway.invalid` around the proxy
   (`no_proxy_engine_host`). A CIDR matches an IP it contains (`10.0.0.0/8` covers `10.1.2.3`,
-  `::1/128` covers `::1`), including a requests shorthand (`10.0/8` via `socket.inet_aton`) and
-  the IPv4 address inside `[::ffff:10.1.2.3]`. A prefix of 0 covers that whole address family
-  (`0.0.0.0/0`, `::/0`); a bare `/0` covers every IP of both families. A CIDR does not match a
-  domain name. A bracketed IPv6 entry (`[::1]`) is that address. IDNA spellings match
-  (`bücher.invalid` and `xn--bcher-kva.invalid`). A non-ASCII entry that will not encode refuses.
+  `::1/128` covers `::1`), including a requests shorthand (`10.0/8` via `socket.inet_aton`),
+  a permissive prefix (`10.0.0.0/+8`, `10.0.0.0/\t8` from requests, `10.0.0.0/8x` from curl),
+  the IPv4 address inside `[::ffff:10.1.2.3]`, and an IPv4-mapped CIDR compared as IPv4
+  (Go: `::ffff:10.0.0.0/104` is `10.0.0.0/8`, `::ffff:0:0/96` is every IPv4). `::/0` stays IPv6.
+  A prefix of 0 covers that whole address family (`0.0.0.0/0`, `::/0`); a bare `/0` covers every
+  IP of both families. A CIDR does not match a domain name. A prefix that cannot be read without
+  raising (`10/²`, a thousands-digit mask) refuses with `no_proxy_malformed`. A NUL in the value
+  refuses with `value_malformed`. A bracketed IPv6 entry (`[::1]`) is that address. IDNA2003 and
+  IDNA2008 spellings both match (`bücher.invalid`, `faß.invalid` and `xn--fa-hia.invalid`,
+  `FAẞ.INVALID`, a trailing dot). Final sigma (`ς`) is not small sigma (`σ`). A leading dot is
+  suffix syntax, so `.münchen.example` does not match an unrelated host. A non-ASCII entry that
+  will not encode refuses. Undici 7.30.1's leading `*.` matches the apex, so `*.gateway.invalid`
+  and `*.gateway.invalid:443` match `gateway.invalid`.
   With no proxy set, `NO_PROXY` is kept as it is.
   The match is the union of the readers, and it over-refuses on purpose:
   - ports are dropped, so `gateway.invalid:9` matches `gateway.invalid`;
-  - a `*` in the middle is `.*`, so `gate*invalid` matches `gateway.invalid` across the dot;
+  - a `*` in the middle matches across dots, so `gate*invalid` matches `gateway.invalid`;
   - an entry that is only `*`, `.`, or both (`*`, `*.`, `**`, `.*`) is `no_proxy_wildcard`;
   - a scheme is stripped, so `http://gateway.invalid` is `gateway.invalid`;
   - spaces are deleted the way requests does, so `gate way.invalid` is `gateway.invalid`;

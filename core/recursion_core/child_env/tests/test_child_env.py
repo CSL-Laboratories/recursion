@@ -9,10 +9,12 @@ from __future__ import annotations
 import ast
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import tempfile
 import unittest
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -190,9 +192,15 @@ class ProfileTests(unittest.TestCase):
             os.chmod(home, 0o700)
             with self.assertRaises(EnvRefused) as caught:
                 build_child_env("codex", home=home, auth_mode=SUB, parent={"PATH": "/usr/bin"})
-            # os.name is still posix, so the Windows early return does not run. The home helper
-            # refuses because it cannot see an owner. It does not raise AttributeError.
-            self.assertEqual(("HOME", "home_unsafe"), (caught.exception.name, caught.exception.cause))
+            # Windows (os.name == "nt") refuses before any helper, even with geteuid missing.
+            # A POSIX process still reaches the home helper, which refuses without an owner.
+            if os.name == "nt":
+                self.assertEqual((None, "platform_unsupported"), (caught.exception.name, caught.exception.cause))
+            else:
+                self.assertEqual(("HOME", "home_unsafe"), (caught.exception.name, caught.exception.cause))
+            with mock.patch("recursion_core.child_env.policy.os.name", "nt"), self.assertRaises(EnvRefused) as caught:
+                build_child_env("codex", home=home, auth_mode=SUB, parent={"PATH": "/usr/bin"})
+            self.assertEqual((None, "platform_unsupported"), (caught.exception.name, caught.exception.cause))
             self.assertIs(False, policy._owned_chain(home))
             self.assertIs(False, policy._private_dir(home))
             os.chmod(home, 0o777)
@@ -839,6 +847,125 @@ class AuthRouteTests(unittest.TestCase):
                          refused({**proxy, "NO_PROXY": "gateway.invalid"},
                                  ChildRoute(base_url="https://gateway.invalid/api"), auth_mode=SUB))
 
+    def test_review_no_proxy_gaps_refuse_and_do_not_raise(self) -> None:
+        """Codex review of 345a1811: each gap refuses, and hostile input is a typed refusal."""
+
+        home = _home(self)
+        proxy = {"HTTPS_PROXY": "http://127.0.0.1:3128"}
+        gateway = ChildRoute(api_key=USER_KEY, base_url="https://gateway.invalid/api")
+        ip = ChildRoute(api_key=USER_KEY, base_url="http://10.1.2.3:4000")
+
+        def refused(parent: dict, route: ChildRoute) -> tuple[str | None, str]:
+            return self._refused("claude_code", home, route=route, auth_mode=API,
+                                 parent={"PATH": "/usr/bin", **proxy, **parent})
+
+        def launched(parent: dict, route: ChildRoute):
+            return build_child_env("claude_code", home=home, route=route, auth_mode=API,
+                                   parent={"PATH": "/usr/bin", **proxy, **parent})
+
+        # C1. Undici 7.30.1 strips a leading "*." and matches the apex, including with a port.
+        for entry in ("*.gateway.invalid", "*.gateway.invalid:443"):
+            with self.subTest(entry=entry):
+                self.assertEqual(("NO_PROXY", "no_proxy_engine_host"), refused({"NO_PROXY": entry}, gateway))
+        sub = ChildRoute(api_key=USER_KEY, base_url="https://a.gateway.invalid/api")
+        self.assertEqual(("NO_PROXY", "no_proxy_engine_host"), refused({"NO_PROXY": "*.gateway.invalid"}, sub))
+
+        # C2. The permissive CIDR prefix: requests accepts "+8" and a tab, curl accepts "8x".
+        for entry in ("10.0.0.0/+8", "10.0.0.0/\t8", "10.0.0.0/8x"):
+            with self.subTest(entry=entry):
+                self.assertEqual(("NO_PROXY", "no_proxy_engine_host"), refused({"NO_PROXY": entry}, ip))
+        self.assertEqual("192.168.0.0/+16", launched({"NO_PROXY": "192.168.0.0/+16"}, ip)["NO_PROXY"])
+
+        # C3. Go projects an IPv4-mapped CIDR onto the IPv4 host. "::/0" does not.
+        self.assertEqual(("NO_PROXY", "no_proxy_engine_host"),
+                         refused({"NO_PROXY": "::ffff:10.0.0.0/104"}, ip))
+        other = ChildRoute(api_key=USER_KEY, base_url="http://192.0.2.1:9")
+        self.assertEqual(("NO_PROXY", "no_proxy_engine_host"),
+                         refused({"NO_PROXY": "::ffff:0:0/96"}, other))
+        self.assertEqual("::ffff:10.0.0.0/104",
+                         launched({"NO_PROXY": "::ffff:10.0.0.0/104"},
+                                  ChildRoute(api_key=USER_KEY, base_url="http://192.168.1.1:9"))["NO_PROXY"])
+        self.assertEqual("::/0", launched({"NO_PROXY": "::/0"}, ip)["NO_PROXY"])
+
+        # C4. IDNA2008 alongside IDNA2003: sharp s, capital sharp s, trailing dot, final sigma.
+        sharp = ChildRoute(api_key=USER_KEY, base_url="https://xn--fa-hia.invalid/api")
+        for entry in ("faß.invalid", "FAẞ.INVALID", "faß.invalid.", "FAẞ.INVALID."):
+            with self.subTest(entry=entry):
+                self.assertEqual(("NO_PROXY", "no_proxy_engine_host"), refused({"NO_PROXY": entry}, sharp))
+        self.assertEqual("fass.invalid", launched({"NO_PROXY": "fass.invalid"}, sharp)["NO_PROXY"])
+        final = ChildRoute(api_key=USER_KEY, base_url="https://xn--3xa.invalid/api")
+        small = ChildRoute(api_key=USER_KEY, base_url="https://xn--4xa.invalid/api")
+        self.assertEqual(("NO_PROXY", "no_proxy_engine_host"), refused({"NO_PROXY": "ς.invalid"}, final))
+        self.assertEqual(("NO_PROXY", "no_proxy_engine_host"), refused({"NO_PROXY": "Σ.invalid"}, small))
+        self.assertEqual("Σ.invalid", launched({"NO_PROXY": "Σ.invalid"}, final)["NO_PROXY"])
+
+        # C5. Hostile input is a typed refusal, not ValueError.
+        self.assertEqual(("NO_PROXY", "no_proxy_malformed"), refused({"NO_PROXY": "10/²"}, ip))
+        self.assertEqual(("NO_PROXY", "no_proxy_malformed"), refused({"NO_PROXY": "10/" + "9" * 5000}, ip))
+        self.assertEqual(("NO_PROXY", "value_malformed"), refused({"NO_PROXY": "10\0/8"}, ip))
+        huge = "http://" + "9" * 5000 + ".1.1.1"
+        self.assertEqual((URL, "base_url_malformed"), self._refused(
+            "claude_code", home, auth_mode=API, parent={"PATH": "/usr/bin"},
+            route=ChildRoute(api_key=USER_KEY, base_url=huge)))
+
+        # C6. A leading dot is suffix syntax. It is not an empty IDNA label, and it does not
+        # match an unrelated host.
+        self.assertEqual(".münchen.example", launched({"NO_PROXY": ".münchen.example"}, gateway)["NO_PROXY"])
+        munchen = ChildRoute(api_key=USER_KEY, base_url="https://a.xn--mnchen-3ya.example/api")
+        self.assertEqual(("NO_PROXY", "no_proxy_engine_host"),
+                         refused({"NO_PROXY": ".münchen.example"}, munchen))
+
+        # C8. Twelve stars must not backtrack. The host is not a match, and the call returns.
+        def _too_slow(signum, frame):
+            raise AssertionError("wildcard match exceeded 1s")
+
+        previous = signal.signal(signal.SIGALRM, _too_slow)
+        signal.setitimer(signal.ITIMER_REAL, 1.0)
+        try:
+            self.assertIsNone(policy._no_proxy_bypass("*" * 12 + "never.invalid", ("api.anthropic.com",)))
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous)
+
+    def test_installed_client_bypass_is_refused(self) -> None:
+        """Where a real client would exempt the host, this check refuses. Others are skipped."""
+
+        samples = (
+            ("gateway.invalid", "gateway.invalid"),
+            (".invalid", "gateway.invalid"),
+            ("*.gateway.invalid", "gateway.invalid"),
+            ("10.0.0.0/+8", "10.1.2.3"),
+            ("10.0.0.0/8x", "10.1.2.3"),
+            ("::ffff:10.0.0.0/104", "10.1.2.3"),
+            ("faß.invalid", "xn--fa-hia.invalid"),
+        )
+        saw = False
+        for entry, host in samples:
+            if not urllib.request.proxy_bypass_environment(host, {"no": entry}):
+                continue
+            saw = True
+            with self.subTest(client="urllib", entry=entry, host=host):
+                self.assertIn(policy._no_proxy_bypass(entry, (host,)),
+                              ("no_proxy_engine_host", "no_proxy_wildcard"))
+        self.assertTrue(saw, "urllib bypassed none of the sample hosts")
+        try:
+            import requests
+        except ImportError:
+            return
+        bypass = getattr(requests.utils, "should_bypass_proxies", None)
+        if bypass is None:
+            return
+        for entry, host in samples:
+            try:
+                skipped = bypass(f"http://{host}", no_proxy=entry)
+            except Exception:
+                continue
+            if not skipped:
+                continue
+            with self.subTest(client="requests", entry=entry, host=host):
+                self.assertIn(policy._no_proxy_bypass(entry, (host,)),
+                              ("no_proxy_engine_host", "no_proxy_wildcard"))
+
     def test_npm_and_global_agent_no_proxy_names_are_dropped(self) -> None:
         home = _home(self)
         blocked = ("npm_config_no_proxy", "NPM_CONFIG_NO_PROXY", "GLOBAL_AGENT_NO_PROXY")
@@ -1011,7 +1138,8 @@ class AuthRouteTests(unittest.TestCase):
 
     def test_child_env_reads_no_keyring_and_no_key_file(self) -> None:
         # Key custody: the caller fetches the key (OS keyring, or the owner-only file); this package is handed it.
-        allowed = {"__future__", "ipaddress", "os", "re", "shutil", "socket", "stat", "subprocess", "tempfile", "threading", "collections.abc",
+        allowed = {"__future__", "ipaddress", "os", "re", "shutil", "socket", "stat", "subprocess", "tempfile", "threading",
+                   "unicodedata", "collections.abc",
                    "dataclasses", "pathlib", "types", "recursion_core.child_env.policy", "recursion_core.child_env.launch"}
         for module in (policy, launch):
             tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))

@@ -126,5 +126,36 @@ class OverrideAndExceptionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             exec_outcome(ARM_C, "untrusted", profile="disabled")
 
+    def test_blank_approval_mode_is_rejected(self) -> None:
+        # "" is not the auto default. None is the omitted-argument default.
+        for mode in ("", " ", False, 1):
+            with self.subTest(mode=mode):
+                with self.assertRaises(ValueError):
+                    requires_approval_for_mode(ARM_B, mode)
+                with self.assertRaises(ValueError):
+                    exec_outcome(ARM_B, mode)
+        self.assertEqual(exec_outcome(ARM_C, None), "allowed")
+
+    def test_string_false_does_not_enable_strict_auto_review(self) -> None:
+        start = next(t["annotations"] for t in mcp_tools.TOOLS if t["name"] == "recursion_run_start")
+        for value in ("false", "true", 0, 1):
+            with self.subTest(value=value):
+                with self.assertRaises(TypeError):
+                    exec_outcome(start, strict_auto_review=value)
+                with self.assertRaises(TypeError):
+                    exec_outcome(ARM_C, managed_approval=value)
+        self.assertEqual(exec_outcome(start, strict_auto_review=False), "refused")
+        self.assertEqual(exec_outcome(ARM_C, managed_approval=False), "allowed")
+
+    def test_profile_tokens_are_the_lowercase_set_only(self) -> None:
+        # Owner question: title case and a bare "managed" are not full access.
+        start = next(t["annotations"] for t in mcp_tools.TOOLS if t["name"] == "recursion_run_start")
+        self.assertEqual(exec_outcome(start, profile="disabled"), "allowed")
+        self.assertEqual(exec_outcome(start, profile="Disabled"), "refused")
+        self.assertEqual(exec_outcome(start, profile="managed"), "refused")
+        self.assertEqual(
+            exec_outcome(start, "prompt", profile="disabled", strict_auto_review=True), "allowed"
+        )
+
 if __name__ == "__main__":
     unittest.main()

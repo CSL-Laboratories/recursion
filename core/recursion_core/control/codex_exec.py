@@ -76,11 +76,17 @@ def requires_mcp_tool_approval(annotations: Mapping[str, object] | None) -> bool
 
 def requires_approval_for_mode(
     annotations: Mapping[str, object] | None,
-    approval_mode: str = "auto",
+    approval_mode: str | None = "auto",
 ) -> bool:
     """Per-tool ``approval_mode`` overlay (e0aa0434 ``requires_mcp_tool_approval_for_mode``)."""
 
-    mode = approval_mode or "auto"
+    # None is the omitted default. A blank string is not auto: it is rejected.
+    if approval_mode is None:
+        mode = "auto"
+    elif not isinstance(approval_mode, str):
+        raise ValueError(f"unknown approval_mode: {approval_mode!r}")
+    else:
+        mode = approval_mode
     if mode not in _MODES:
         raise ValueError(f"unknown approval_mode: {mode!r}")
     if mode == "auto":
@@ -105,6 +111,8 @@ def exec_outcome(
     Approval policy never, default approvals reviewer, no permission-request hook.
     """
 
+    if type(strict_auto_review) is not bool or type(managed_approval) is not bool:
+        raise TypeError("strict_auto_review and managed_approval must be bool")
     needs_approval = requires_approval_for_mode(annotations, approval_mode)
     full_access = profile in FULL_ACCESS_PROFILES
     if strict_auto_review:

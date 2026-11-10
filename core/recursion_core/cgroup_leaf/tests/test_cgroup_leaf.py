@@ -5,9 +5,11 @@ start_new_session). It exercises the real trampoline, pidfd and evidence logic; 
 not prove kernel cgroup behaviour. Set RECURSION_CGROUP_ROOT to a writable delegated
 cgroup v2 directory containing this process to run the live cell.
 """
+import errno
 import inspect
 import os
 from pathlib import Path
+import stat
 import signal
 import subprocess
 import tempfile
@@ -17,7 +19,7 @@ import unittest
 from unittest.mock import patch
 import recursion_core.cgroup_leaf as cgroup_leaf
 from recursion_core.cgroup_leaf import (Cgroup2, CleanupIncomplete, DelegatedRoot,
-                                        LaunchError)
+                                        LaunchError, LeafRun)
 
 
 def alive(pid):
@@ -61,7 +63,7 @@ class FakeCgroup(Cgroup2):
         text = (leaf / 'cgroup.procs').read_text().strip()
         return int(text) if text else None
 
-    def kill(self, leaf):
+    def kill(self, leaf, deadline=None):
         if self.interrupts:
             self.interrupts -= 1
             raise KeyboardInterrupt('second interrupt during cleanup')
@@ -74,7 +76,7 @@ class FakeCgroup(Cgroup2):
             except ProcessLookupError:
                 pass
 
-    def populated(self, leaf):
+    def populated(self, leaf, deadline=None):
         if self.events_broken:
             return None
         main = self.main(leaf)
@@ -98,7 +100,9 @@ class FakeCgroup(Cgroup2):
                 return leaf.parent
         return None
 
-    def remove(self, leaf):
+    def remove(self, leaf, deadline=None, identity=None):
+        if identity is not None and cgroup_identity(leaf) != identity:
+            raise OSError(errno.EBUSY, 'cgroup identity changed')
         for name in ('cgroup.procs', 'cgroup.kill', 'cgroup.events'):
             (leaf / name).unlink(missing_ok=True)
         os.rmdir(leaf)
@@ -282,7 +286,7 @@ class LeafTests(unittest.TestCase):
         with self.assertLogs(level='ERROR'), \
              self.assertRaisesRegex(ValueError, 'original') as caught:
             with self.root.launch('run-a', ['sleep', '60']) as run:
-                self.fs.populated = lambda leaf: 1 / 0
+                self.fs.populated = lambda leaf, deadline=None: 1 / 0
                 raise ValueError('original')
         run.proc.wait(5)  # killed by cgroup.kill and pidfd before the observer raised
         self.assertTrue(any('ZeroDivisionError' in n for n in caught.exception.__notes__))
@@ -454,6 +458,326 @@ class LeafTests(unittest.TestCase):
         source = Path(cgroup_leaf.__file__).read_text()
         for forbidden in ('preexec_fn', 'PDEATHSIG', 'prctl'):
             self.assertNotIn(forbidden, source)
+
+    def test_unknown_retry_does_not_delete_foreign_cgroup(self):
+        # Empty replacement: an emptiness check alone would allow rmdir.
+        run = self.root.launch('run-a', ['sleep', '60'], kill_timeout=0.2)
+        self.cleanup_pids.append(run.pid)
+        self.fs.kill_broken = True
+        with patch.object(self.fs, 'populated', return_value=False), \
+             patch.object(cgroup_leaf.signal, 'pidfd_send_signal', side_effect=PermissionError):
+            outcome = run.close()
+        self.assertEqual(outcome.state, 'unknown')
+        leaf = self.root_path / 'run-a'
+        leaf.rename(self.root_path / 'run-a-old')
+        self.fs.make_leaf(leaf)
+        kills = []
+        real_kill = self.fs.kill
+
+        def spy(target, deadline=None):
+            kills.append(target)
+            return real_kill(target)
+
+        self.fs.kill = spy
+        self.fs.kill_broken = False
+        retried = run.close()
+        self.assertEqual(kills, [])
+        self.assertEqual(retried.state, 'unknown')
+        self.assertTrue((leaf / 'cgroup.procs').is_file())
+        self.assertTrue((self.root_path / 'run-a-old').is_dir())
+        try:
+            os.killpg(run.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        run.proc.wait(2)
+
+    def test_unknown_identity_does_not_delete_foreign_cgroup(self):
+        leaf = self.root_path / 'run-foreign'
+        run = cgroup_leaf.LeafRun(self.fs, leaf, 0.2)
+        self.fs.make_leaf(leaf)
+        (leaf / 'marker').write_text('foreign')
+        outcome = run.close()
+        self.assertEqual(outcome.state, 'unknown')
+        self.assertEqual((leaf / 'marker').read_text(), 'foreign')
+
+
+def cgroup_identity(path):
+    st = os.lstat(path)
+    if stat_is_symlink(st) or not stat.S_ISDIR(st.st_mode):
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def stat_is_symlink(st):
+    return stat.S_ISLNK(st.st_mode)
+
+
+def write_cgroup(path, procs=''):
+    """A tmpdir stand-in for one cgroup directory. Never a host cgroupfs path."""
+    path.mkdir(parents=True, exist_ok=True)
+    (path / 'cgroup.procs').write_text(procs)
+    populated = '1' if procs.strip() else '0'
+    (path / 'cgroup.events').write_text(f'populated {populated}\n')
+    (path / 'cgroup.kill').write_text('')
+    (path / 'cgroup.controllers').touch()
+
+
+class TmpCgroup(Cgroup2):
+    """Cgroup2 on a tmpdir. ``_rmdir`` models cgroupfs: interface files do not block removal."""
+    def __init__(self, mount):
+        super().__init__(mount)
+        self.rmdir_calls = []
+
+    def _rmdir(self, directory):
+        directory = Path(directory)
+        self.rmdir_calls.append(directory)
+        procs = directory / 'cgroup.procs'
+        if procs.is_file() and procs.read_text().strip():
+            raise OSError(errno.EBUSY, 'procs not empty')
+        if any(entry.is_dir() and not entry.is_symlink() for entry in directory.iterdir()):
+            raise OSError(errno.EBUSY, 'child cgroup remains')
+        for entry in list(directory.iterdir()):
+            if entry.is_dir() or entry.is_symlink():
+                raise OSError(errno.EBUSY, 'not an interface file')
+            entry.unlink()
+        os.rmdir(directory)
+
+
+class RemovalContractTests(unittest.TestCase):
+    """Cleanup contracts on a fake cgroup tree in a tmpdir. No host cgroup writes."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        base = Path(os.path.realpath(self.temp.name))
+        self.mount = base / 'cgroup'
+        self.root_path = self.mount / 'user.slice' / 'delegated'
+        self.root_path.mkdir(parents=True)
+        for name in ('cgroup.procs', 'cgroup.kill', 'cgroup.controllers'):
+            (self.root_path / name).touch()
+        self.fs = TmpCgroup(self.mount)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_rmdir_only_after_procs_and_children_are_empty(self):
+        leaf = self.root_path / 'run-a'
+        write_cgroup(leaf, procs='')
+        write_cgroup(leaf / 'sub', procs='9\n')
+        with patch.object(cgroup_leaf.os, 'rmdir', side_effect=AssertionError('rmdir')):
+            with self.assertRaises(OSError) as caught:
+                self.fs.remove(leaf, identity=cgroup_identity(leaf),
+                               deadline=time.monotonic() + 0.5)
+        self.assertEqual(caught.exception.errno, errno.EBUSY)
+        self.assertTrue((leaf / 'sub' / 'cgroup.procs').is_file())
+        self.assertEqual(self.fs.rmdir_calls, [])
+
+    def test_ebusy_while_still_populated_is_not_spun(self):
+        leaf = self.root_path / 'run-a'
+        write_cgroup(leaf, procs='9\n')
+        start = time.monotonic()
+        with self.assertRaises(OSError) as caught:
+            self.fs.remove(leaf, identity=cgroup_identity(leaf),
+                           deadline=time.monotonic() + 2)
+        self.assertEqual(caught.exception.errno, errno.EBUSY)
+        self.assertLess(time.monotonic() - start, 0.5)
+        self.assertEqual(self.fs.rmdir_calls, [])
+        self.assertTrue(leaf.is_dir())
+
+    def test_ebusy_while_empty_retries_until_deadline(self):
+        # Dying-task race: procs and children are empty, rmdir still returns EBUSY.
+        leaf = self.root_path / 'run-a'
+        write_cgroup(leaf, procs='')
+        real = TmpCgroup._rmdir
+
+        def always_busy(fs, directory):
+            fs.rmdir_calls.append(Path(directory))
+            raise OSError(errno.EBUSY, 'dying task')
+
+        self.fs._rmdir = always_busy.__get__(self.fs, TmpCgroup)
+        start = time.monotonic()
+        with self.assertRaises(OSError) as caught:
+            self.fs.remove(leaf, identity=cgroup_identity(leaf),
+                           deadline=time.monotonic() + 0.25)
+        elapsed = time.monotonic() - start
+        self.assertEqual(caught.exception.errno, errno.EBUSY)
+        self.assertGreater(len(self.fs.rmdir_calls), 1)
+        self.assertLessEqual(len(self.fs.rmdir_calls), 40)
+        self.assertLess(elapsed, 1.2)
+        self.assertTrue(leaf.is_dir())
+        self.assertIs(real, TmpCgroup._rmdir)
+
+    def test_ebusy_while_empty_then_succeeds(self):
+        leaf = self.root_path / 'run-a'
+        write_cgroup(leaf, procs='')
+        write_cgroup(leaf / 'sub', procs='')
+        remaining = {'n': 2}
+        real = TmpCgroup._rmdir.__get__(self.fs, TmpCgroup)
+
+        def flaky(directory):
+            if remaining['n']:
+                remaining['n'] -= 1
+                self.fs.rmdir_calls.append(Path(directory))
+                raise OSError(errno.EBUSY, 'dying task')
+            real(directory)
+
+        self.fs._rmdir = flaky
+        self.fs.remove(leaf, identity=cgroup_identity(leaf),
+                       deadline=time.monotonic() + 1)
+        self.assertFalse(leaf.exists())
+
+    def test_unknown_identity_does_not_remove_directory(self):
+        leaf = self.root_path / 'run-foreign'
+        leaf.mkdir()
+        with self.assertRaises(OSError) as caught:
+            self.fs.remove(leaf)
+        self.assertEqual(caught.exception.errno, errno.EBUSY)
+        self.assertTrue(leaf.is_dir())
+
+    def test_changed_identity_does_not_remove_replacement(self):
+        leaf = self.root_path / 'run-a'
+        write_cgroup(leaf, procs='')
+        old = cgroup_identity(leaf)
+        for entry in list(leaf.iterdir()):
+            entry.unlink()
+        leaf.rmdir()
+        leaf.mkdir()
+        (leaf / 'marker').write_text('foreign')
+        with self.assertRaises(OSError) as caught:
+            self.fs.remove(leaf, identity=old, deadline=time.monotonic() + 0.5)
+        self.assertEqual(caught.exception.errno, errno.EBUSY)
+        self.assertEqual((leaf / 'marker').read_text(), 'foreign')
+        self.assertEqual(self.fs.rmdir_calls, [])
+
+    def test_populated_and_kill_files_do_not_hang_cleanup(self):
+        leaf = self.root_path / 'run-a'
+        leaf.mkdir()
+        os.mkfifo(leaf / 'cgroup.events')
+        os.mkfifo(leaf / 'cgroup.kill')
+        (leaf / 'cgroup.procs').write_text('')
+        box = {}
+
+        def read_events():
+            try:
+                box['populated'] = self.fs.populated(leaf)
+            except BaseException as exc:
+                box['populated_error'] = exc
+
+        def write_kill():
+            try:
+                self.fs.kill(leaf)
+            except OSError as exc:
+                box['kill_error'] = exc
+
+        readers = [threading.Thread(target=read_events), threading.Thread(target=write_kill)]
+        for thread in readers:
+            thread.start()
+        for thread in readers:
+            thread.join(1.5)
+        hung = [thread for thread in readers if thread.is_alive()]
+        if hung:
+            # Unblock a blocking open/read so the suite can finish, then fail.
+            try:
+                writer = os.open(leaf / 'cgroup.events', os.O_WRONLY | os.O_NONBLOCK)
+                os.write(writer, b'populated 0\n')
+                os.close(writer)
+            except OSError:
+                pass
+            try:
+                reader = os.open(leaf / 'cgroup.kill', os.O_RDONLY | os.O_NONBLOCK)
+                os.close(reader)
+            except OSError:
+                pass
+            for thread in hung:
+                thread.join(2)
+            self.fail('cgroup file operation blocked past the cleanup window')
+        self.assertNotIn('populated_error', box)
+        self.assertIsNone(box.get('populated'))
+        self.assertIn('kill_error', box)
+
+    def test_sweep_removes_unregistered_owned_names_only(self):
+        free = self.root_path / 'run-not.valid'
+        busy = self.root_path / 'run-busy.name'
+        foreign = self.root_path / 'app.slice'
+        write_cgroup(free, procs='')
+        write_cgroup(busy, procs='')
+        (busy / 'cgroup.procs').write_text('5\n')
+        (busy / 'cgroup.events').write_text('populated 0\n')
+        foreign.mkdir()
+        (foreign / 'marker').write_text('foreign')
+        link = self.root_path / 'run-link'
+        link.symlink_to(foreign, target_is_directory=True)
+        kept = self.root_path / 'run-kept'
+        write_cgroup(kept, procs='')
+        root = DelegatedRoot(self.root_path, self.fs)
+        outcomes = root.sweep(keep={'run-kept'})
+        self.assertFalse(free.exists(), outcomes)
+        self.assertTrue(busy.is_dir())
+        self.assertEqual((busy / 'cgroup.procs').read_text(), '5\n')
+        self.assertEqual((foreign / 'marker').read_text(), 'foreign')
+        self.assertTrue(link.is_symlink())
+        self.assertTrue(kept.is_dir())
+        self.assertNotIn(busy, self.fs.rmdir_calls)
+        self.assertIn('run-not.valid', outcomes)
+        self.assertNotIn('app.slice', outcomes)
+        self.assertNotIn('run-link', outcomes)
+        self.assertNotIn('run-kept', outcomes)
+
+    def test_close_does_not_hang_on_slow_events_or_exit(self):
+        leaf = self.root_path / 'run-a'
+        write_cgroup(leaf, procs='')
+        os.unlink(leaf / 'cgroup.events')
+        os.mkfifo(leaf / 'cgroup.events')
+        # A slow exit: wait() holds the child unreaped. Cleanup must still return.
+        proc = subprocess.Popen(['sleep', '30'], start_new_session=True)
+        waiter = threading.Thread(target=proc.wait)
+        waiter.start()
+
+        def stop_slow_exit():
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            waiter.join(2)
+
+        self.addCleanup(stop_slow_exit)
+        run = LeafRun(self.fs, leaf, 0.3)
+        run.proc = proc
+
+        def populated(leaf, *args, **kwargs):
+            return Cgroup2.populated(self.fs, leaf, *args, **kwargs)
+
+        self.fs.populated = populated
+        box = {}
+
+        def cleanup():
+            try:
+                box['outcome'] = run.close()
+            except BaseException as exc:
+                box['error'] = exc
+
+        thread = threading.Thread(target=cleanup)
+        start = time.monotonic()
+        try:
+            thread.start()
+            thread.join(1.5)
+            if thread.is_alive():
+                try:
+                    writer = os.open(leaf / 'cgroup.events', os.O_WRONLY | os.O_NONBLOCK)
+                    os.write(writer, b'populated 1\n')
+                    os.close(writer)
+                except OSError:
+                    pass
+                thread.join(2)
+                self.fail(f'close() blocked for {time.monotonic() - start:.2f}s')
+            self.assertNotIn('error', box)
+            self.assertLess(time.monotonic() - start, 1.5)
+            self.assertNotEqual(box['outcome'].state, 'leaf_empty')
+            self.assertTrue(leaf.is_dir())
+        finally:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            waiter.join(2)
 
 
 class RealCgroupTests(unittest.TestCase):

@@ -35,7 +35,7 @@ process for the anchor and ledger (F11, F21); F21 is not done.
 contracts/PRODUCT.md 055cc7a5c793b7135e5d0565dc4198cf96230531, SHA-256
 e64783152f6d67d4ede774dc41d112fe46c2d7536d53cb2c04e71a3566044daf, receipt
 CSLR-D-011). Implementation explanation, not a quote:
-the in-process Cockpit plugin holds paper-order permission. Under that
+an in-process paper-order plugin holds paper-order permission. Under that
 fallback the signed authority profile is tamper evidence, not a boundary. Paper only
 (PRODUCT.md 5.2 / CP0-v2, order authority stays paper-first; O69 is the signed-profile item);
 live capital stays separately authorised (PRODUCT.md 5.2). This module has one

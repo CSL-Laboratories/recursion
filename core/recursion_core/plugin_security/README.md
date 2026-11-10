@@ -25,7 +25,11 @@ yet called by a running daemon, and not reviewed or accepted.
   `Grant.order_after_revocation_generation` to it (PRODUCT.md 4.4).
 - `approval.ApprovalGate` draws every approval from the effect's canonical bytes,
   accepts only the `operator_ui` principal, binds the decision to the digest and allows
-  one use.
+  one use. A veto is final for that effect digest (CSL-743): a later request for the
+  same effect, an approve of another pending approval for it, and a take of one
+  approved earlier all refuse `approval_vetoed`; a retry is a new intent with a
+  different digest. Expired, used and still-pending approvals do not block a re-request.
+  Vetoes are kept in memory only, so a restart forgets them (known limit).
 - `authority.Authority` verifies installer-signed `csl-authority-profile/vNext`
   profiles against an injected public anchor and enforces scope (account, venue, contract
   family, adapter, environment), provider and model version, permitted actions, window
@@ -70,7 +74,7 @@ Same-uid is not a security boundary. The real boundary is a separate OS user or 
 
 Implementation explanation (not Lucas's quoted words): under the same-uid fallback the signed authority profile is tamper evidence, not a
 boundary: it binds honest plugins and records what happened, and the mutants above
-still rewrite it. The in-process Cockpit plugin holds paper-order permission on 2026-11-11.
+still rewrite it. An in-process paper-order plugin holds paper-order permission on 2026-11-11.
 Paper only, by PRODUCT.md 5.2 / CP0-v2 ("order authority stays paper-first"), not by O69: O69 is
 the signed-profile item. This fallback grants no live-order permission; live capital stays
 separately authorised (PRODUCT.md 5.2). The code has one `order` permission.

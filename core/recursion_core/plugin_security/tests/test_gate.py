@@ -93,6 +93,8 @@ class GateFlowTests(unittest.TestCase):
         self.assertEqual(decide("veto")["result"]["state"], "vetoed")
         self.assertEqual(_code(decide("approve")), "approval_already_decided")
         self.assertEqual(_code(self.w.authorize(eff, req["approval_id"], self.env)), "approval_not_granted")
+        # A veto is final for that digest (CSL-743), so the expiry arm uses a new intent.
+        eff = effect(payload={"note": "second intent"})
         approval = self.w.approve(eff)
         self.w.clock.now += 301
         self.assertEqual(_code(self.w.authorize(eff, approval, self.env)), "approval_expired")

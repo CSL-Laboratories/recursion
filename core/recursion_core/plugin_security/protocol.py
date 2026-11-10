@@ -1,6 +1,6 @@
 """The core's language-neutral boundary (``csl-core/v0``): canonical JSON bytes in and out.
 
-Plugins and consumers (Cockpit included) reach the approval gate, the authority ledger
+Plugins and consumers (including in-process plugins) reach the approval gate, the authority ledger
 and the breaker only through ``CoreService.client_for(caller)``, a callable taking
 request bytes and returning response bytes. The ops, their arguments and the order of
 checks are listed in ``protocol.json`` beside this file, so a later Rust core can be
@@ -12,6 +12,11 @@ which permission, and which permissions need an authority profile, are injected.
 core health, caller is the effect's plugin, permission, run (owned by the caller, on
 the effect's connection, not faulted, connection not tripped),
 the one-use approval for this exact digest, then the authority profile and budgets.
+
+A veto is final for that effect digest (CSL-743): after ``approval.decide`` with
+``veto``, ``effect.request`` for the same effect, ``approval.decide`` with ``approve``
+on another approval for it and ``effect.authorize`` with one approved earlier all
+refuse ``approval_vetoed``. The gate's refusal code goes on the wire unchanged.
 
 A tripped connection clears only through the host ops ``breaker.probe_begin`` (one
 lease per tripped connection) and ``breaker.probe_reset`` (spends the lease; clears the

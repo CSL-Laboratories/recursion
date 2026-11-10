@@ -379,8 +379,8 @@ owner calls described above.
 ## Evidence
 
 Governing spec: csl-research `contracts/PRODUCT.md` at
-`055cc7a5c793b7135e5d0565dc4198cf96230531`, SHA-256
-`e64783152f6d67d4ede774dc41d112fe46c2d7536d53cb2c04e71a3566044daf`, CSLR-D-011.
+`d84cdd26a4de2366f3c5d34c4aec5215f822a494`, SHA-256
+`e1d5fb8c02594b2ca88281113ffc14e6f3125daded2a00d45739cfb9d2ed04dd`, CSLR-D-012.
 
 Candidate record this module was written against (research stays in the vault):
 

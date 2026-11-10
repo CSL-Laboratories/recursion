@@ -286,7 +286,7 @@ full-access mode; PRODUCT.md `055cc7a5` section 3.3, grill Q20, O44, H-06). The 
 meaning match `child_env`'s `ChildRoute.full_access_acknowledged`.
 
 - Only the bool `True` counts. Any value that is not a bool (`"true"`, `1`, `None`) refuses
-  `full_access_ack_not_bool`.
+  `route_full_access_malformed`.
 - It is never inferred. No parent environment variable, child environment variable,
   profile field or override turns it on.
 - This package renders no UI. The driver must show the danger notice when the named
@@ -326,7 +326,7 @@ What it never relaxes:
 | `requirements_malformed` | a `RouteRequirements` field (or the value itself) has the wrong type or shape |
 | `requirements_forbidden_launch_option` | `extra_launch_options` names a forbidden or reserved option |
 | `hermes_home_not_owned` | `owned_hermes_home` does not resolve to the route home |
-| `full_access_ack_not_bool` | `full_access_acknowledged` is not a bool |
+| `route_full_access_malformed` | `full_access_acknowledged` is not a bool |
 
 `launch_option_denied` now also covers `engine_config` and `model`.
 `hermes_config_blocks_adopt_override` now means a `config.yaml` that is not exactly

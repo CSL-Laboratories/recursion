@@ -689,7 +689,7 @@ def _checked_requirements(engine: str | None, requirements: object, full_access_
     """Validate the configured inputs, fail closed. Only the bool ``True`` turns full access on."""
 
     if not isinstance(full_access_acknowledged, bool):  # "true", 1 and the like are not an acknowledgment
-        raise SubscriptionRouteRefused(engine, "full_access_ack_not_bool")
+        raise SubscriptionRouteRefused(engine, "route_full_access_malformed")
     if requirements is None:
         requirements = RouteRequirements()
     if not isinstance(requirements, RouteRequirements):

@@ -113,7 +113,7 @@ def check_link_requirements(allowed_link_targets: object, full_access_acknowledg
     """
 
     if not isinstance(full_access_acknowledged, bool):  # "true", 1 and the like are not an acknowledgment
-        raise WrapperPinRefused("full_access_ack_not_bool", "")
+        raise WrapperPinRefused("route_full_access_malformed", "")
     if not isinstance(allowed_link_targets, (tuple, frozenset)):
         raise WrapperPinRefused("requirements_malformed", "allowed_link_targets")
     for target in allowed_link_targets:

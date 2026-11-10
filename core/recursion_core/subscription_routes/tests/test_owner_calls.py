@@ -500,14 +500,14 @@ class FullAccessTests(_Calls):
         for value in ("true", "True", 1, 0, None, "yes", [True], 1.0):
             with self.subTest(value=value):
                 for engine in self.guards():
-                    self.refused("full_access_ack_not_bool", self.launch, engine, full_access_acknowledged=value)
-                self.refused("full_access_ack_not_bool", self.cursor, full_access_acknowledged=value)
-                self.refused("full_access_ack_not_bool", check_antigravity_route, self.bare(), version="1.2.3",
+                    self.refused("route_full_access_malformed", self.launch, engine, full_access_acknowledged=value)
+                self.refused("route_full_access_malformed", self.cursor, full_access_acknowledged=value)
+                self.refused("route_full_access_malformed", check_antigravity_route, self.bare(), version="1.2.3",
                              binary_path=str(self.agy / "agy"), launcher_path=str(self.agy / "agy-launch"),
                              pin=self.agy_pin, route_home=str(self.home), full_access_acknowledged=value)
-                self.refused("full_access_ack_not_bool", check_route, "opencode", self.profile(), self.env(),
+                self.refused("route_full_access_malformed", check_route, "opencode", self.profile(), self.env(),
                              route_home=str(self.home), full_access_acknowledged=value)
-                self.pin_refused("full_access_ack_not_bool", self.launcher_path, str(self.install),
+                self.pin_refused("route_full_access_malformed", self.launcher_path, str(self.install),
                                  full_access_acknowledged=value)
         self.launcher.assert_not_called()
 

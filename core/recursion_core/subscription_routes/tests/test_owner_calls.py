@@ -511,16 +511,33 @@ class FullAccessTests(_Calls):
                                  full_access_acknowledged=value)
         self.launcher.assert_not_called()
 
-    def test_full_access_forwards_an_unknown_option_and_is_recorded_on_the_decision(self) -> None:
+    def test_full_access_refuses_an_unknown_option_and_is_recorded_on_the_decision(self) -> None:
         for engine in self.guards():
             with self.subTest(engine=engine):
                 self.launcher.reset_mock()
-                decision, _ = self.launch(engine, full_access_acknowledged=True, start_new_session=True)
-                self.assertIs(self.launcher.call_args.kwargs["start_new_session"], True)
+                exc = self.refused("launch_option_unknown", self.launch, engine, full_access_acknowledged=True,
+                                   start_new_session=True)
+                self.assertEqual("start_new_session", exc.detail)
+                self.launcher.assert_not_called()
+                decision, _ = self.launch(engine, full_access_acknowledged=True)
                 self.assertIn("full_access_profile_acknowledged", decision.flags)
+                self.assertEqual({"env", "shell", "engine_config", "model"}, set(self.launcher.call_args.kwargs))
                 self.launcher.reset_mock()
                 decision, _ = self.launch(engine)
                 self.assertNotIn("full_access_profile_acknowledged", decision.flags)
+
+    def test_full_access_forwards_an_option_listed_in_extra_launch_options(self) -> None:
+        listed = RouteRequirements(extra_launch_options=("start_new_session",))
+        for engine in self.guards():
+            with self.subTest(engine=engine):
+                self.launcher.reset_mock()
+                decision, _ = self.launch(engine, full_access_acknowledged=True, requirements=listed,
+                                          start_new_session=True)
+                self.assertIs(self.launcher.call_args.kwargs["start_new_session"], True)
+                self.assertIn("full_access_profile_acknowledged", decision.flags)
+                # Only the listed name: full access does not forward another one.
+                self.refused("launch_option_unknown", self.launch, engine, full_access_acknowledged=True,
+                             requirements=listed, start_new_session=True, umask=0)
 
     def test_parent_environment_cannot_turn_full_access_on(self) -> None:
         names = ("FULL_ACCESS_ACKNOWLEDGED", "full_access_acknowledged", "RECURSION_FULL_ACCESS",

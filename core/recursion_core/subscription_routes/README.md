@@ -224,7 +224,8 @@ Owner call 5. Keyword options passed to a guard are sorted into three groups:
   and `model`, which the guard itself passes to the launcher.
 - Forwarded to the launcher unchanged: `cwd` (`FORWARDED_LAUNCH_OPTIONS`), plus any name the
   caller lists in `RouteRequirements.extra_launch_options`.
-- Everything else refuses `launch_option_unknown`. Nothing is silently dropped.
+- Everything else refuses `launch_option_unknown`, under the full-access profile too.
+  Nothing is silently dropped.
 
 ### Hermes route-home reuse
 
@@ -296,9 +297,7 @@ meaning match `child_env`'s `ChildRoute.full_access_acknowledged`.
 What it relaxes:
 
 - a package link may resolve outside the install root (its contents are still hashed and
-  must still match the pin);
-- a launch option that is neither forbidden nor known is forwarded instead of refusing
-  `launch_option_unknown`.
+  must still match the pin). Nothing else.
 
 What it never relaxes:
 
@@ -306,6 +305,10 @@ What it never relaxes:
   credential and route-home rule;
 - the forbidden launch options (`launch_option_denied`,
   `requirements_forbidden_launch_option`);
+- the forwarded launch options: still `cwd` plus the names in
+  `RouteRequirements.extra_launch_options`. Any other name still refuses
+  `launch_option_unknown`, so a driver that wants `start_new_session` or the like lists it
+  in `extra_launch_options`;
 - the pin itself (`wrapper_pin_mismatch`, `package_manifest_empty`,
   `install_root_not_absolute`, `launcher_outside_root`, `package_link_dangling`) and the
   `argv[0]` binding (`argv0_not_pinned`);

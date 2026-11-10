@@ -155,8 +155,8 @@ _FORBIDDEN_LAUNCH = frozenset(
 # Names the guard itself passes to the launcher; a caller may not pass or configure them.
 _RESERVED_LAUNCH = frozenset({"engine_config", "model"})
 # Launch options forwarded to the launcher by default. Anything else that is not forbidden refuses
-# ``launch_option_unknown`` unless the caller lists it in ``RouteRequirements.extra_launch_options``
-# or the run uses the acknowledged full-access profile.
+# ``launch_option_unknown`` unless the caller lists it in ``RouteRequirements.extra_launch_options``.
+# The full-access profile adds none.
 FORWARDED_LAUNCH_OPTIONS = frozenset({"cwd"})
 # A Claude Code OAuth token in an API-key variable. Inferred prefix (not read from engine source):
 # Hermes routes some Anthropic tokens "down the OAuth path by prefix" (auth.py:203-209).
@@ -728,7 +728,7 @@ def _reject_launch_shape(
         raise SubscriptionRouteRefused(engine, "argv_malformed")
     checked = _checked_requirements(engine, requirements, full_access_acknowledged)
     unknown = sorted(set(launch_kwargs) - FORWARDED_LAUNCH_OPTIONS - checked.extra_launch_options)
-    if unknown and not checked.full_access:
+    if unknown:  # full access adds no launch option
         raise SubscriptionRouteRefused(engine, "launch_option_unknown", ",".join(unknown))
     return dict(launch_kwargs)
 

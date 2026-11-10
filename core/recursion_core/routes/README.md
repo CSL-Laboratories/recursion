@@ -20,10 +20,11 @@ engine), 11.2 (breaker, plan limits), Q12 (Claude subscription only inside Claud
   `account/rateLimits/read`, `account/rateLimits/updated` and typed JSON-RPC / turn errors.
   A named `limitId` is the breaker key. An `api_key` route ignores a ChatGPT-auth error from the
   rate-limit read and still runs the turn.
-- `breaker.py`: `ConnectionBreaker`. The service passes `engine:kind:id` (`contract.breaker_key`), so
-  two engines that reuse one connection id do not share a slot. Within an engine the slot is the
-  connection (`subscription:<login>` or `api_key:<key id>`), and per model only when the typed signal
-  names a per-model vendor bucket. Never keyed by tenant, and never by engine id alone.
+- `breaker.py`: `ConnectionBreaker`. An API key's slot is `api_key:<family>:<env>:<id>`
+  (`contract.breaker_key`): the same Anthropic custody lookup shares a meter across Claude Code and
+  OpenCode, and a Codex OpenAI key with the same id does not. A subscription login stays
+  `engine:kind:id`, so the same label on Claude and on Codex is not one login. Per model only when
+  the typed signal names a per-model vendor bucket. Never keyed by tenant, and never by engine id alone.
 - `profile_route.py`: Pi, Hermes and OpenCode routes; every launch goes through
   `recursion_core.subscription_routes.guard_then_spawn` (B3, CSL-786), so a Claude-subscription provider is
   refused as `subscription_route_refused` before the launcher is called. Pi and Hermes also pass
@@ -110,7 +111,7 @@ model, scope, reset time, choices). When the vendor sent no reset, `wait` uses t
 end. `route.limits` or the service default sets `on_limit`: `ask` (default:
 nothing else runs), `wait` (nothing else runs; re-submit at `reset_at`) or `fallback` (the user's own
 `fallback` routes in the user's order, each switch shown as a `fallback` event and `switched_to`).
-Every attempt shares the request's one deadline. Nothing picks a route by itself; `fallback` with an empty list is refused. A fallback entry may carry `wrapper` (the Pi/Hermes pin, as the measured object or the same fields in JSON). A request id that is already running is refused (`launch_refused`, detail `request in flight`) instead of launching a second child. `RouteService.shutdown()` fences children still in flight and refuses later requests. Details and event fields are redacted when they contain a credential-shaped string. Vague quota text matches a whole word or phrase, so `unexhausted` and `not exhausted` are not short faults. `no quota` still is.
+Every attempt shares the request's one deadline. Nothing picks a route by itself; `fallback` with an empty list is refused. A fallback entry may carry `wrapper` (the Pi/Hermes pin, as the measured object or the same fields in JSON). A request id that is already running is refused (`launch_refused`, detail `request in flight`) instead of launching a second child. `RouteService.shutdown()` waits for a launch that has already passed the closed check, fences every child it still has, and refuses later requests. A fence that fails stays tracked and the call raises, so a later shutdown retries it. Handles are tracked by identity, so the process object does not have to be hashable. Details and event fields are redacted when they contain a credential-shaped string (bearer tokens, JWTs, URL userinfo, JSON `\u` escapes); ordinary words such as `task-12345678` are left as written. Vague quota text matches a Unicode word or phrase, including `rate-limited` and `rate limiting`. `unexhausted`, `not exhausted`, `isn't exhausted` and `quota is not exhausted` are not short faults. `no quota` still is. The wait time on a limit notice is the breaker's open window. A vendor reset that is earlier than that window stays on the signal and is not the advertised retry.
 
 Lesson: [CSL-608](https://linear.app/csl-laboratories/issue/CSL-608) (Done research) found master's breaker
 keyed by engine, shared by every tenant and never reset. This module does not claim to have measured

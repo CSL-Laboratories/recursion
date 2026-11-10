@@ -159,14 +159,57 @@ def connection_key(route: Mapping) -> str:
 
 
 def breaker_key(route: Mapping) -> str:
-    """Breaker slot: the engine plus :func:`connection_key`.
+    """The credential that is billed, not the engine that carries it.
 
-    A connection id is a caller-chosen label. The same id on Claude Code and on Codex is not the
-    same meter, so the two must not share a slot. The id is still what fences every tenant on that
-    engine's meter, which is the CSL-608 lesson (not "drop the engine and collide vendors").
+    An API key is one meter wherever the same custody lookup runs: billing family, env name, and
+    key id. Claude Code's ``ANTHROPIC_API_KEY`` id ``k1`` and an OpenCode anthropic profile with
+    that same id and env share a slot. Codex's ``OPENAI_API_KEY`` id ``k1`` is a different key.
+    A subscription login stays on its engine: the same label on Claude and on Codex is not one
+    login. A passthrough method bills that cloud account, not the Anthropic key.
     """
 
-    return f"{route['engine']}:{connection_key(route)}"
+    conn = route["connection"]
+    kind, ident = conn["kind"], conn["id"]
+    engine = route["engine"]
+    if kind == "api_key":
+        family, env = _api_key_meter(route)
+        return f"api_key:{family}:{env}:{ident}"
+    if kind == "passthrough":
+        method = conn.get("method") if isinstance(conn.get("method"), str) else ""
+        return f"{engine}:passthrough:{method}:{ident}"
+    return f"{engine}:{kind}:{ident}"
+
+
+def _api_key_meter(route: Mapping) -> tuple[str, str]:
+    """Billing family and the env name custody is asked for."""
+
+    conn = route["connection"]
+    engine = route.get("engine")
+    profile = route.get("profile") if isinstance(route.get("profile"), Mapping) else {}
+    provider = profile.get("provider") if isinstance(profile.get("provider"), str) else ""
+    provider = provider.strip().lower()
+    env = conn.get("credential_env") if isinstance(conn.get("credential_env"), str) else ""
+    if not env and isinstance(profile.get("credential_env"), str):
+        env = profile["credential_env"]
+    if conn.get("key_source") == "api_key_helper":
+        return "anthropic", env or "api_key_helper"
+    if engine == "claude_code":
+        return "anthropic", env or "ANTHROPIC_API_KEY"
+    if engine == "codex":
+        return "openai", env or "OPENAI_API_KEY"
+    return _profile_family(engine, provider), env
+
+
+def _profile_family(engine: object, provider: str) -> str:
+    """``Provider.family`` from subscription_routes, or the provider id when it is not listed."""
+
+    if not isinstance(engine, str) or not provider:
+        return provider or (engine if isinstance(engine, str) else "")
+    from recursion_core.subscription_routes.policy import ENGINES
+
+    spec = ENGINES.get(engine)
+    known = spec.providers.get(provider) if spec is not None else None
+    return known.family if known is not None else provider
 
 
 def vendor_reset(epoch: object, clock: Callable[[], float], wall: Callable[[], float]) -> float | None:
@@ -226,31 +269,88 @@ def result(request_id: str, code: str | None, *, text: str = "", limit: dict | N
 
 # Phrases that sound like a quota. Seen outside the model payload (a typed error envelope's free text),
 # they make at most a SHORT_FAULT on one model for one tenant (grill Q23); they never make a PLAN_LIMIT.
-# Matched on word boundaries so "unexhausted" is not "exhausted", and an immediate "not" / "never"
-# cancels the hit ("not exhausted" is not a quota). "no quota" stays a hit: the word "no" is the
-# claim, not a denial.
+# Boundaries are Unicode word characters, so "unexhausted" and "éexhaustedé" are not hits, and
+# "rate-limited" / "rate limiting" are. An immediate denial cancels the hit ("not exhausted",
+# "isn't exhausted", "not a rate limit", "quota is not exhausted"). "no quota" stays a hit.
 _QUOTA = re.compile(
-    r"(?<![A-Za-z0-9])(?:quotas?|rate[\s-]*limits?|usage limits?|limits? reached|exhausted|too many requests)(?![A-Za-z0-9])",
+    r"(?<!\w)(?:quotas?|rate[\s-]*limit(?:ed|ing|s)?|usage[\s-]*limits?|limits?[\s-]*reached|exhausted|too many requests)(?!\w)",
     re.IGNORECASE,
 )
-_QUOTA_NEGATED = re.compile(r"(?:^|[^A-Za-z0-9])(?:not|never|n't)\s+$", re.IGNORECASE)
-# Vendor and custody strings that must not ride along in a result detail or an event.
-_SECRET = re.compile(
-    r"sk-[A-Za-z0-9_\-]{8,}"
-    r"|AKIA[0-9A-Z]{16}"
-    r"|ASIA[0-9A-Z]{16}"
-    r"|(?:Bearer|bearer)\s+[A-Za-z0-9._\-]{8,}"
-    r"|ghp_[A-Za-z0-9]{20,}"
-    r"|github_pat_[A-Za-z0-9_]{20,}"
-    r"|xox[baprs]-[A-Za-z0-9\-]{10,}"
-    r"|ya29\.[A-Za-z0-9._\-]{10,}"
+_QUOTA_NEGATED = re.compile(
+    r"(?:^|[^\w])(?:not|never|(?:is|are|was|were|do|does|did|wo|can|could|should|would)n['’]t)"
+    r"(?:\s+(?:a|an|the))?\s+$",
+    re.IGNORECASE,
 )
+_QUOTA_DENIED_AFTER = re.compile(
+    r"^\s*(?:is|are|was|were)?\s*(?:not|never|(?:is|are|was|were)n['’]t)\b",
+    re.IGNORECASE,
+)
+# Credential shapes. Word boundaries so "task-12345678" is not an sk- key. Case-insensitive, and
+# applied after JSON ``\uXXXX`` escapes are decoded, so a hyphen written as ``\u002d`` still matches.
+# The decoded text is only a search view: non-secret escapes stay as they were written.
+_SECRET = re.compile(
+    r"(?<!\w)eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}(?!\w)"
+    r"|(?<!\w)sk-[A-Za-z0-9_-]{8,}(?!\w)"
+    r"|(?<!\w)(?:AKIA|ASIA)[A-Z0-9]{16}(?!\w)"
+    r"|(?<!\w)bearer\s+[A-Za-z0-9+/=._~-]{8,}"
+    r"|(?<!\w)ghp_[A-Za-z0-9]{20,}(?!\w)"
+    r"|(?<!\w)github_pat_[A-Za-z0-9_]{20,}(?!\w)"
+    r"|(?<!\w)xox[baprs]-[A-Za-z0-9-]{10,}(?!\w)"
+    r"|(?<!\w)ya29\.[A-Za-z0-9._-]{10,}(?!\w)",
+    re.IGNORECASE,
+)
+_URL_USERINFO = re.compile(r"https?://([^\s/@:]+:[^\s/@]+)@", re.IGNORECASE)
+_JSON_U = re.compile(r"\\u([0-9a-fA-F]{4})")
+
+
+def _decode_json_u(value: str) -> tuple[str, list[tuple[int, int]]]:
+    """Decode ``\\uXXXX`` sequences. Each output character maps back to an original span."""
+
+    out: list[str] = []
+    spans: list[tuple[int, int]] = []
+    index = 0
+    length = len(value)
+    while index < length:
+        match = _JSON_U.match(value, index)
+        if match is not None:
+            out.append(chr(int(match.group(1), 16)))
+            spans.append((match.start(), match.end()))
+            index = match.end()
+            continue
+        out.append(value[index])
+        spans.append((index, index + 1))
+        index += 1
+    return "".join(out), spans
 
 
 def redact(value: str) -> str:
     """Replace credential-shaped substrings. Connection ids and ordinary error codes are left as they are."""
 
-    return _SECRET.sub("[redacted]", value)
+    if not value:
+        return value
+    decoded, spans = _decode_json_u(value)
+    hits: list[tuple[int, int]] = []
+    for match in _URL_USERINFO.finditer(decoded):
+        hits.append((spans[match.start(1)][0], spans[match.end(1) - 1][1]))
+    for match in _SECRET.finditer(decoded):
+        hits.append((spans[match.start()][0], spans[match.end() - 1][1]))
+    if not hits:
+        return value
+    hits.sort()
+    merged: list[tuple[int, int]] = []
+    for start, end in hits:
+        if merged and start < merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            continue
+        merged.append((start, end))
+    pieces: list[str] = []
+    cursor = 0
+    for start, end in merged:
+        pieces.append(value[cursor:start])
+        pieces.append("[redacted]")
+        cursor = end
+    pieces.append(value[cursor:])
+    return "".join(pieces)
 
 
 def sounds_like_quota(text: object) -> bool:
@@ -258,6 +358,8 @@ def sounds_like_quota(text: object) -> bool:
         return False
     for match in _QUOTA.finditer(text):
         if _QUOTA_NEGATED.search(text[:match.start()]):
+            continue
+        if _QUOTA_DENIED_AFTER.match(text[match.end():]):
             continue
         return True
     return False

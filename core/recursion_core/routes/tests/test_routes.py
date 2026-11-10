@@ -310,7 +310,7 @@ class CodexTest(unittest.TestCase):
                   {"method": "turn/completed", "params": {"turn": {"id": "tu-1", "status": "completed"}}}]
         h, res = self.codex([script], kind="api_key", conn_id="key-1", credential_env="OPENAI_API_KEY")
         self.assertEqual((res["status"], res["text"]), ("ok", "keyed"))
-        self.assertEqual(h.breaker.state("codex:api_key:key-1"), "closed")
+        self.assertEqual(h.breaker.state("api_key:openai:OPENAI_API_KEY:key-1"), "closed")
         methods = [m.get("method") for m in h.launcher.processes[0].sent]
         self.assertIn("turn/start", methods)
 

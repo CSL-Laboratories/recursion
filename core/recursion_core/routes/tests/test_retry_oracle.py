@@ -10,11 +10,14 @@ from __future__ import annotations
 import json
 import threading
 import unittest
+from dataclasses import dataclass, field
 
 from recursion_core.routes import contract as c
+from recursion_core.routes import limits as lim
 from recursion_core.routes.breaker import ConnectionBreaker
 from recursion_core.routes.claude_code import ClaudeCodeAdapter
 from recursion_core.routes.codex import CodexAdapter
+from recursion_core.routes.profile_route import profile_adapters
 from recursion_core.routes.service import RouteService
 from recursion_core.routes.tests.fakes import (
     FakeClock, FakeLauncher, FakeProcess, claude_error, claude_limit, claude_ok, codex_script, request,
@@ -252,6 +255,11 @@ class ServiceOracleTest(unittest.TestCase):
             ("too many requests", c.SHORT_FAULT),
             ("unexhausted", c.ENGINE_ERROR),
             ("not exhausted", c.ENGINE_ERROR),
+            ("isn't exhausted", c.ENGINE_ERROR),
+            ("quota is not exhausted", c.ENGINE_ERROR),
+            ("éexhaustedé", c.ENGINE_ERROR),
+            ("rate-limited", c.SHORT_FAULT),
+            ("rate limiting", c.SHORT_FAULT),
             ("no quota remains", c.SHORT_FAULT),  # "no" is the claim; only not/never cancels
             ("something broke", c.ENGINE_ERROR),
         )
@@ -280,7 +288,7 @@ class ServiceOracleTest(unittest.TestCase):
                                      credential_env="OPENAI_API_KEY"))
         self.assertEqual(res["code"], c.PLAN_LIMIT)
         self.assertNotIn("turn/start", [m.get("method") for m in launcher.processes[0].sent])
-        self.assertEqual(breaker.state("codex:api_key:key-1"), "open")
+        self.assertEqual(breaker.state("api_key:openai:OPENAI_API_KEY:key-1"), "open")
 
     def test_malformed_engine_objects_are_a_typed_fenced_result(self) -> None:
         # Claude: errors is not a list. Codex: params is a list. Neither escapes, neither leaves the child up.
@@ -423,6 +431,209 @@ class ServiceOracleTest(unittest.TestCase):
             service.handle(request())
         self.assertEqual(proc.fenced, ["cancelled"])
         self.assertEqual(service._breaker.state("claude_code:subscription:login-A"), "closed")
+
+
+class ReviewFollowupTest(unittest.TestCase):
+    """The second pass: redaction, one meter per credential, shutdown that actually finishes."""
+
+    def test_redaction_covers_tokens_and_leaves_ordinary_words(self) -> None:
+        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+        rows = (
+            ("task-12345678 failed", "task-12345678 failed"),
+            ("route-anthropic", "route-anthropic"),
+            ("BEARER abcdefghijklmnop", "[redacted]"),
+            ("Bearer ab+cd/ef== trailing", "[redacted] trailing"),
+            (jwt, "[redacted]"),
+            ("https://user:s3cret@example.com/v1", "https://[redacted]@example.com/v1"),
+            ("sk-\\u002dabcdefghij", "[redacted]"),
+            ("\\u0073\\u006b-abcdefghij", "[redacted]"),
+            ("key sk-ant-api03-supersecretvalue end", "key [redacted] end"),
+        )
+        for raw, expected in rows:
+            with self.subTest(raw=raw):
+                self.assertEqual(c.redact(raw), expected)
+
+    def test_same_anthropic_key_is_one_meter_and_codex_is_not(self) -> None:
+        clock = FakeClock()
+        launcher = FakeLauncher([claude_limit(), codex_script("codex-ok")], clock)
+        parent = {"PATH": "/usr/bin", "HOME": "/home/operator"}
+        profiles = profile_adapters(
+            launcher, clock, lambda *_: "sk-test", parent,
+            argv=lambda req: ["opencode"], driver=lambda *a: c.result(a[1]["request_id"], None, text="no"),
+            operator_home="/home/operator")
+        breaker = ConnectionBreaker(clock)
+        service = RouteService(
+            {"claude_code": ClaudeCodeAdapter(launcher, clock, lambda *_: "sk-test", parent, wall_clock=clock),
+             "codex": CodexAdapter(launcher, clock, lambda *_: "sk-test", parent, wall_clock=clock),
+             **profiles},
+            breaker, clock)
+        claude = request(kind="api_key", conn_id="k1", credential_env="ANTHROPIC_API_KEY")
+        opencode = request(
+            rid="o", engine="opencode", model="m", kind="api_key", conn_id="k1",
+            credential_env="ANTHROPIC_API_KEY",
+            profile={"provider": "anthropic", "auth": "api_key", "credential_env": "ANTHROPIC_API_KEY"})
+        codex = request(rid="c", engine="codex", model="gpt-5", kind="api_key", conn_id="k1",
+                        credential_env="OPENAI_API_KEY")
+        self.assertEqual(c.breaker_key(claude["route"]), "api_key:anthropic:ANTHROPIC_API_KEY:k1")
+        self.assertEqual(c.breaker_key(opencode["route"]), c.breaker_key(claude["route"]))
+        self.assertNotEqual(c.breaker_key(codex["route"]), c.breaker_key(claude["route"]))
+        self.assertEqual(service.handle(claude)["code"], c.PLAN_LIMIT)
+        blocked = service.handle(opencode)
+        self.assertEqual(blocked["code"], c.BREAKER_OPEN)
+        self.assertEqual(len(launcher.calls), 1)
+        self.assertEqual(service.handle(codex)["text"], "codex-ok")
+        self.assertEqual(breaker.state("api_key:anthropic:ANTHROPIC_API_KEY:k1"), "open")
+        self.assertEqual(breaker.state("api_key:openai:OPENAI_API_KEY:k1"), "closed")
+
+    def test_unhashable_process_is_tracked_and_fenced(self) -> None:
+        started, release = threading.Event(), threading.Event()
+
+        @dataclass
+        class Proc:
+            fenced: list = field(default_factory=list)
+
+            def send(self, line: str) -> None:
+                return None
+
+            def close_stdin(self) -> None:
+                return None
+
+            def read_line(self, timeout_s: float):
+                started.set()
+                assert release.wait(5)
+                return json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "ok"})
+
+            def fence(self, reason: str) -> None:
+                self.fenced.append(reason)
+
+        clock = FakeClock()
+        proc = Proc()
+        service = RouteService(
+            {"claude_code": ClaudeCodeAdapter(lambda argv, **kwargs: proc, clock, lambda *_: "",
+                                              {"PATH": "/usr/bin"}, wall_clock=clock)},
+            ConnectionBreaker(clock), clock)
+        holder: dict = {}
+        thread = threading.Thread(target=lambda: holder.update(res=service.handle(request())), daemon=True)
+        thread.start()
+        try:
+            self.assertTrue(started.wait(5))
+            service.shutdown()
+            self.assertEqual(proc.fenced, ["shutdown"])
+        finally:
+            release.set()
+        thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(holder["res"]["status"], "ok")
+
+    def test_shutdown_waits_for_a_launch_still_inside_the_spawner(self) -> None:
+        started, release = threading.Event(), threading.Event()
+        order: list[str] = []
+
+        def launch(argv, **kwargs):
+            started.set()
+            assert release.wait(5)
+            proc = FakeProcess([json.dumps(item) for item in claude_ok()], FakeClock())
+            order.append("created")
+
+            def fence(reason, _proc=proc):
+                order.append("fenced")
+                _proc.fenced.append(reason)
+
+            proc.fence = fence
+            return proc
+
+        clock = FakeClock()
+        service = RouteService(
+            {"claude_code": ClaudeCodeAdapter(launch, clock, lambda *_: "", {"PATH": "/usr/bin"}, wall_clock=clock)},
+            ConnectionBreaker(clock), clock)
+        worker = threading.Thread(target=lambda: service.handle(request()), daemon=True)
+        worker.start()
+        self.assertTrue(started.wait(5))
+        stopper = threading.Thread(target=lambda: (service.shutdown(), order.append("shutdown_returned")), daemon=True)
+        stopper.start()
+        stopper.join(0.2)
+        self.assertNotIn("shutdown_returned", order)
+        release.set()
+        stopper.join(5)
+        worker.join(5)
+        self.assertFalse(stopper.is_alive())
+        self.assertEqual(order, ["created", "fenced", "shutdown_returned"])
+
+    def test_a_failed_fence_stays_tracked_and_the_next_shutdown_retries(self) -> None:
+        started, release = threading.Event(), threading.Event()
+
+        class Proc:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.fenced: list[str] = []
+
+            def send(self, line: str) -> None:
+                return None
+
+            def close_stdin(self) -> None:
+                return None
+
+            def read_line(self, timeout_s: float):
+                started.set()
+                assert release.wait(5)
+                return json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "ok"})
+
+            def fence(self, reason: str) -> None:
+                self.calls += 1
+                if self.calls == 1:
+                    raise OSError("busy")
+                self.fenced.append(reason)
+
+        clock = FakeClock()
+        proc = Proc()
+        service = RouteService(
+            {"claude_code": ClaudeCodeAdapter(lambda argv, **kwargs: proc, clock, lambda *_: "k",
+                                              {"PATH": "/usr/bin"}, wall_clock=clock)},
+            ConnectionBreaker(clock), clock)
+        worker = threading.Thread(target=lambda: service.handle(request()), daemon=True)
+        worker.start()
+        try:
+            self.assertTrue(started.wait(5))
+            with self.assertRaises(OSError):
+                service.shutdown()
+            self.assertEqual((proc.calls, len(service._live)), (1, 1))
+            service.shutdown()
+            self.assertEqual(proc.fenced, ["shutdown"])
+            self.assertEqual(service._live, {})
+        finally:
+            release.set()
+        worker.join(5)
+        self.assertFalse(worker.is_alive())
+
+    def test_wait_notice_uses_the_breaker_hold_not_an_earlier_vendor_reset(self) -> None:
+        clock = FakeClock()
+        breaker = ConnectionBreaker(clock)
+        now = clock()
+        first = {"code": c.PLAN_LIMIT, "limit": _limit("connection", reset_at=now + 500)}
+        breaker.record(CONN, "m", "t1", first)
+        second = {"code": c.PLAN_LIMIT, "limit": _limit("connection", reset_at=now + 100)}
+        breaker.record(CONN, "m", "t1", second)
+        self.assertEqual(second["retry_at"], now + 500)
+        self.assertEqual(second["limit"]["reset_at"], now + 100)
+        notice = lim.notice(
+            c.result("r", c.PLAN_LIMIT, limit=second["limit"], retry_at=second["retry_at"]),
+            request()["route"], {"on_limit": "wait", "fallback": []})
+        self.assertEqual(notice["reset_at"], now + 500)
+        self.assertEqual(notice["choices"][0]["until"], now + 500)
+
+    def test_backoff_exponent_saturates_before_float_overflow(self) -> None:
+        clock = FakeClock()
+        breaker = ConnectionBreaker(clock)  # the float defaults, not integer stand-ins
+        for _ in range(1025):
+            breaker.record(CONN, "m", "t1", {"code": c.PLAN_LIMIT, "limit": _limit("connection")})
+            clock.advance(3600)
+        refused = breaker.admit(CONN, "m", "t1")
+        # The last record opened a window of the capped cooldown; advance already passed it, so the
+        # next admit is the probe. Recording once more must still be the cap, not an overflow.
+        breaker.record(CONN, "m", "t1", {"code": c.PLAN_LIMIT, "limit": _limit("connection")}, refused["probe"])
+        again = breaker.admit(CONN, "m", "t1")
+        self.assertEqual(again["code"], c.BREAKER_OPEN)
+        self.assertEqual(again["retry_at"] - clock(), 3600)
 
 
 if __name__ == "__main__":

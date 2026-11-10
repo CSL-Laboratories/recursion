@@ -14,6 +14,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 
 from recursion_core.routes import contract as c
+from recursion_core.routes import limits as lim
 from recursion_core.routes.base import Deadline, RouteAdapter, _Protocol
 from recursion_core.subscription_routes import (
     ENGINES, PackagePin, SAFE_ENV, SubscriptionRouteRefused, WrapperInstall, guard_then_spawn,
@@ -95,21 +96,19 @@ class ProfileRouteAdapter(RouteAdapter):
 
 
 def _coerce_wrapper(wrapper: object) -> object:
-    """Accept the in-process pin or the JSON shape of the same fields."""
+    """Accept the in-process pin or the JSON shape of the same fields.
+
+    A wrapper that was sent but is not that shape is ``request_invalid``. An absent wrapper is
+    left absent so the guard can still say ``wrapper_pin_missing``.
+    """
 
     if wrapper is None or isinstance(wrapper, WrapperInstall):
         return wrapper
-    if not isinstance(wrapper, Mapping):
-        return wrapper
-    pin = wrapper.get("pin")
-    if not isinstance(pin, Mapping) or not isinstance(pin.get("package_files"), list):
-        return wrapper
-    files = tuple((str(path), str(digest)) for path, digest in pin["package_files"])
-    return WrapperInstall(
-        str(wrapper.get("launcher_path") or ""),
-        str(wrapper.get("install_root") or ""),
-        PackagePin(str(pin.get("launcher_sha256") or ""), files),
-    )
+    if not lim.valid_wrapper(wrapper):
+        raise c.RouteError(c.REQUEST_INVALID, "route.wrapper")
+    pin = wrapper["pin"]
+    files = tuple((path, digest) for path, digest in pin["package_files"])
+    return WrapperInstall(wrapper["launcher_path"], wrapper["install_root"], PackagePin(pin["launcher_sha256"], files))
 
 
 def profile_adapters(launcher, clock, credentials: Callable[[str, str], str], parent_env: Mapping[str, str], *,

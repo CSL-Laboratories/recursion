@@ -20,6 +20,17 @@ from recursion_core.routes.service import RouteService
 from recursion_core.routes.tests.fakes import FakeClock, FakeLauncher, codex_script, request
 from recursion_core.subscription_routes import WrapperInstall, measure_package_pin
 
+
+def _pinned_argv(req: dict) -> list[str]:
+    """argv[0] is the measured launcher. A bare engine name is not the pinned file."""
+
+    wrapper = req["route"].get("wrapper")
+    if isinstance(wrapper, WrapperInstall):
+        return [wrapper.launcher_path]
+    if isinstance(wrapper, dict) and isinstance(wrapper.get("launcher_path"), str):
+        return [wrapper["launcher_path"]]
+    return [req["route"]["engine"]]
+
 PKG = pathlib.Path(__file__).resolve().parents[1]
 
 
@@ -68,7 +79,7 @@ class SubscriptionRouteReuseTest(unittest.TestCase):
         drive = lambda process, req, deadline_at, events: c.result(req["request_id"], None, text="driven")
         adapters = profile_adapters(self.launcher, self.clock, lambda cid, name: {"k1": "sk-test"}[cid],
                                     {"PATH": "/usr/bin", "HOME": "/home/operator", "CLAUDE_CODE_OAUTH_TOKEN": "x"},
-                                    argv=lambda req: [req["route"]["engine"]], driver=drive, operator_home="/home/operator")
+                                    argv=_pinned_argv, driver=drive, operator_home="/home/operator")
         self.service = RouteService(adapters, ConnectionBreaker(self.clock), self.clock)
 
     def pin(self) -> WrapperInstall:
@@ -89,7 +100,7 @@ class SubscriptionRouteReuseTest(unittest.TestCase):
 
         adapters = profile_adapters(self.launcher, self.clock, lambda cid, name: "sk-test",
                                     {"PATH": "/usr/bin", "HOME": "/home/operator"},
-                                    argv=lambda req: ["pi"], driver=drive, operator_home="/home/operator")
+                                    argv=_pinned_argv, driver=drive, operator_home="/home/operator")
         service = RouteService(adapters, ConnectionBreaker(self.clock), self.clock)
         res = service.handle(self.req("pi", {"provider": "anthropic", "auth": "api_key",
                                               "credential_env": "ANTHROPIC_API_KEY"}, wrapper=self.pin()))
@@ -136,6 +147,20 @@ class SubscriptionRouteReuseTest(unittest.TestCase):
                     "profile": profile, "home": self.home, "wrapper": wrapper}
         limits = lim.validate_limits({"on_limit": "fallback", "fallback": [json.loads(json.dumps(fallback))]})
         self.assertEqual(limits["fallback"][0]["wrapper"]["pin"]["launcher_sha256"], pin.pin.launcher_sha256)
+
+    def test_malformed_wrapper_is_request_invalid(self) -> None:
+        profile = {"provider": "anthropic", "auth": "api_key", "credential_env": "ANTHROPIC_API_KEY"}
+        wrapper = {"launcher_path": "/tmp/launcher.js", "install_root": "/tmp",
+                   "pin": {"launcher_sha256": "ab", "package_files": [["only-one-field"]]}}
+        res = self.service.handle(self.req("pi", profile, wrapper=wrapper))
+        self.assertEqual(res["code"], c.REQUEST_INVALID)
+        with self.assertRaises(c.RouteError):
+            from recursion_core.routes import limits as lim
+            lim.validate_limits({"on_limit": "fallback", "fallback": [{
+                "engine": "pi", "model": "m",
+                "connection": {"kind": "api_key", "id": "k1", "credential_env": "ANTHROPIC_API_KEY"},
+                "profile": profile, "wrapper": wrapper,
+            }]})
 
     def test_api_key_profile_passes_the_guard_then_launches(self) -> None:
         profile = {"provider": "anthropic", "auth": "api_key", "credential_env": "ANTHROPIC_API_KEY"}

@@ -142,9 +142,9 @@ class ConnectionBreaker:
                 return "none"
             if code == c.PLAN_LIMIT and _is_signal(outcome.get("limit")):
                 until = self._open(connection, outcome["limit"], now, probe)
-                limit = outcome.get("limit")
-                if isinstance(limit, dict) and limit.get("reset_at") is None:
-                    outcome["retry_at"] = until  # the cooldown the notice can tell the user to wait for
+                # The wait is this open_until, including when a later signal names an earlier vendor
+                # reset. The vendor time stays on the signal; it is not the retry the breaker allows.
+                outcome["retry_at"] = until
                 return "opened"
             if code == c.SHORT_FAULT:
                 self._short[(connection, model, tenant)] = now + self._short_s
@@ -174,10 +174,26 @@ class ConnectionBreaker:
             rec["source"] = signal["source"]
             return rec["open_until"]
         rec["failures"] += 1
-        backoff = min(self._cooldown_s * 2 ** (rec["failures"] - 1), self._max_cooldown_s)
+        backoff = self._backoff(rec["failures"])
         until = min(reset_at, now + self._max_open_s) if reset_at is not None and reset_at > now else now + backoff
         rec.update(state=OPEN, open_until=until, probe=None, lease_until=None, source=signal["source"])
         return until
+
+    def _backoff(self, failures: int) -> float:
+        """Cooldown for this incident. Doubling stops at the cap, before ``2**1024`` overflows float."""
+
+        cooldown, cap = float(self._cooldown_s), float(self._max_cooldown_s)
+        if failures <= 1 or cooldown <= 0 or cap <= cooldown:
+            return min(cooldown, cap)
+        delay = cooldown
+        for _ in range(failures - 1):
+            if delay >= cap:
+                return cap
+            nxt = delay * 2
+            if nxt >= cap or nxt == float("inf"):
+                return cap
+            delay = nxt
+        return delay
 
     def _find_probe(self, probe: str | None) -> dict | None:
         if probe is None:

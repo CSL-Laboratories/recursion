@@ -22,49 +22,85 @@ class RouteService:
         self._adapters, self._breaker, self._clock = dict(adapters), breaker, clock
         # The user's default limit behaviour; a request's own route.limits overrides it. Default: ask.
         self._limits = lim.validate_limits(limits if limits is not None else lim.DEFAULT_LIMITS)
-        self._gate = threading.Lock()
+        self._gate = threading.Condition()
         self._closed = False
-        self._live: set = set()
+        self._pending = 0  # launches past the closed check that have not registered yet
+        self._live: dict[int, object] = {}  # id(proc) -> proc; a handle need not be hashable
         self._inflight: set[str] = set()
         for adapter in self._adapters.values():
             adapter._drop_process = self._drop_process
             adapter._launcher = self._wrap_launcher(adapter._launcher)
 
     def shutdown(self) -> None:
-        """Refuse later requests and fence every child this service still has."""
+        """Refuse later requests and fence every child this service still has.
+
+        Waits for a launch that has already passed the closed check, so a child created after
+        this call began is fenced before this call returns. A fence that raises stays in the
+        live set and this call raises; a later shutdown retries it.
+        """
 
         with self._gate:
             self._closed = True
-            live = list(self._live)
-        for proc in live:
-            try:
-                proc.fence("shutdown")
-            except Exception:
-                pass
-            self._drop_process(proc)
+            while self._pending:
+                self._gate.wait()
+            live = list(self._live.items())
+        errors: list[BaseException] = []
+        for key, proc in live:
+            err = self._fence(proc)
+            if err is None:
+                with self._gate:
+                    if self._live.get(key) is proc:
+                        del self._live[key]
+            else:
+                errors.append(err)
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise ExceptionGroup("shutdown fence failed", errors)
 
     def _wrap_launcher(self, inner):
         def launch(argv, **kwargs):
             with self._gate:
-                closed = self._closed
-            if closed:
-                raise c.RouteError(c.LAUNCH_REFUSED, "shutdown")
-            proc = inner(argv, **kwargs)
-            with self._gate:
                 if self._closed:
-                    try:
-                        proc.fence("shutdown")
-                    except Exception:
-                        pass
                     raise c.RouteError(c.LAUNCH_REFUSED, "shutdown")
-                self._live.add(proc)
-            return proc
+                self._pending += 1
+            try:
+                proc = inner(argv, **kwargs)
+                with self._gate:
+                    closed = self._closed
+                if closed:
+                    err = self._fence(proc)
+                    if err is not None:
+                        with self._gate:
+                            self._live[id(proc)] = proc
+                        raise err
+                    raise c.RouteError(c.LAUNCH_REFUSED, "shutdown")
+                with self._gate:
+                    self._live[id(proc)] = proc
+                return proc
+            finally:
+                with self._gate:
+                    self._pending -= 1
+                    self._gate.notify_all()
 
         return launch
 
+    @staticmethod
+    def _fence(proc) -> BaseException | None:
+        try:
+            proc.fence("shutdown")
+        except Exception as err:
+            return err
+        return None
+
     def _drop_process(self, proc) -> None:
         with self._gate:
-            self._live.discard(proc)
+            # After a failed shutdown fence the child stays tracked so the next shutdown retries.
+            # A successful fence has already removed it. A normal end, before shutdown, forgets it.
+            if self._closed:
+                return
+            if self._live.get(id(proc)) is proc:
+                del self._live[id(proc)]
 
     def handle(self, request: object) -> dict:
         rid = request.get("request_id") if isinstance(request, Mapping) else None
@@ -123,7 +159,7 @@ class RouteService:
         adapter = self._adapters.get(route["engine"])
         if adapter is None:
             return c.result(rid, c.ENGINE_UNKNOWN, detail=f"no adapter for {route['engine']}")
-        # engine:kind:id, not kind:id. Two engines labelled with the same id are different meters.
+        # API keys share a meter by custody lookup. Subscription logins stay per engine.
         connection, model, tenant = c.breaker_key(route), route["model"], req["tenant"]
         remaining = deadline_at - self._clock()
         if remaining <= 0:

@@ -54,6 +54,10 @@ detect_mod = importlib.import_module("recursion_core.launch_check.detect")
 
 F: Factory
 PINNED = {"antigravity": "binary+launcher", "cursor": "launcher+tree", "pi": "launcher+tree", "hermes": "launcher+tree"}
+# The entries of the committed rows (table 1.6.0), as measured on sentry on 2026-11-10.
+CURSOR_ENTRY = ("node.exe", "index.js")
+PI_ENTRY = ("node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",)
+COMMITTED_ENTRY = {"cursor": CURSOR_ENTRY, "pi": PI_ENTRY, "antigravity": ()}
 
 
 def setUpModule() -> None:
@@ -263,25 +267,67 @@ class PinTableTests(unittest.TestCase):
                 datetime.date.fromisoformat(p.measured)
                 self.assertTrue(p.platform and p.source)
                 self.assertFalse(pins_mod.archive_sourced(p.source))
-                self.assertEqual((), p.entry)  # no entry has been measured
-                # Pi's launchers run the Node found on PATH; Cursor's node.exe is inside its tree.
+                kind = PINNED[p.engine]
+                pins_mod.check_entry(kind, p.entry)  # no ValueError
+                pins_mod.check_interpreter(p.interpreter)
+                self.assertEqual("", pins_mod._unusable(p, kind))
+                # Cursor's node.exe is inside its tree; Pi's launchers run the Node found on PATH;
+                # a binary+launcher pin carries no entry (its measured binary is its entry).
+                self.assertEqual(COMMITTED_ENTRY[p.engine], p.entry)
                 self.assertEqual("node (PATH)" if p.engine == "pi" else "", p.interpreter)
+                if kind == "launcher+tree":
+                    self.assertTrue(p.entry)
+                    self.assertNotEqual("", p.target)
+                    # The resolve shape: each item is a plain relative path to a regular file inside the root.
+                    root = os.path.realpath(F.dir())
+                    for item in p.entry:
+                        self.assertIs(str, type(item))
+                        self.assertFalse(item.startswith("/") or "\\" in item or ":" in item, item)
+                        self.assertFalse({"", ".", ".."} & set(item.split("/")), item)
+                        write(os.path.join(root, *item.split("/")), "x\n")
+                    reals = pins_mod.resolve_entry(root, p.entry)
+                    self.assertEqual(tuple(os.path.join(root, *i.split("/")) for i in p.entry), reals)
+                    for real in reals:
+                        self.assertTrue(pins_mod.inside(root, real))
                 if p.target == "":
                     self.assertEqual("binary+launcher", PINNED[p.engine])
                     self.assertEqual(p.launcher_sha256, p.target_sha256)
         keys = [(p.engine, p.launcher_sha256, p.target, p.target_sha256) for p in PINS]
         self.assertEqual(len(keys), len(set(keys)))
 
-    def test_committed_table_has_no_antigravity_pin_and_no_archive_source(self) -> None:
+    def test_committed_table_has_one_install_sourced_antigravity_pin_and_no_archive_source(self) -> None:
         # Lucas, 2026-11-10: "pins stay measured from a real install only for Nov 11; no archive-derived pins".
-        # The 1.5.3 linux_amd64 row was hashed from the release archive, so it is gone until an installed agy is measured.
-        self.assertEqual("r2a-pins/1.5.0-candidate-2026-11-10", PIN_TABLE_VERSION)
-        self.assertFalse([p for p in PINS if p.engine == "antigravity"])
-        self.assertNotIn("antigravity", {r["engine"] for r in table_record()["pins"]})
+        # The 1.5.3 linux_amd64 row was hashed from the release archive and stays gone. The one row is 1.5.5,
+        # measured from the agy.exe that install.ps1 installed on sentry; the release manifest is a cross-check only.
+        self.assertEqual("r2a-pins/1.6.0-candidate-2026-11-10", PIN_TABLE_VERSION)
+        agy = Pin(
+            engine="antigravity",
+            version="1.5.5",
+            launcher_sha256="fe9eb2f3884ca6cd630c57eed117580819341bce4b87d2c40b441ddd01cb8f2a",
+            launcher_bytes=226117784,
+            target="",
+            target_sha256="fe9eb2f3884ca6cd630c57eed117580819341bce4b87d2c40b441ddd01cb8f2a",
+            platform="windows_amd64",
+            measured="2026-11-10",
+            source="https://antigravity.google/cli/install.ps1 (installed agy.exe)",
+        )
+        self.assertEqual([agy], [p for p in PINS if p.engine == "antigravity"])
+        self.assertEqual(1, [r["engine"] for r in table_record()["pins"]].count("antigravity"))
+        self.assertEqual(((), ""), (agy.entry, agy.interpreter))
+        self.assertFalse(pins_mod.archive_sourced(agy.source))
+        self.assertIn("install.ps1", agy.source)
+        self.assertNotIn("1.5.3", [p.version for p in PINS])
+        self.assertTrue(pins_mod.listed("antigravity", "binary+launcher", "1.5.5", agy.launcher_sha256, agy.target_sha256))
+        self.assertFalse(pins_mod.listed("antigravity", "binary+launcher", "1.5.3", agy.launcher_sha256, agy.target_sha256))
+        # target "" is the launcher itself: the engine name resolves straight to the binary.
+        self.assertEqual("/u/agy/bin/agy.exe", pins_mod.resolve_target("/u/agy/bin/agy.exe", agy.target))
         self.assertTrue(PINS)
         for p in PINS:
             with self.subTest(engine=p.engine, source=p.source):
                 self.assertFalse(pins_mod.archive_sourced(p.source))
+        # The same row recorded from the vendor archive would never be matched.
+        with table(dataclasses.replace(agy, source="https://vendor.example/cli_windows_x64.zip")):
+            self.assertFalse(pins_mod.listed("antigravity", "binary+launcher", "1.5.5", agy.launcher_sha256, agy.target_sha256))
         self.assertEqual("binary+launcher", FLOORS["antigravity"].pin)  # the route and its pin kind stay
 
     def test_archive_sourced_reads_the_source_path(self) -> None:
@@ -314,9 +360,9 @@ class PinTableTests(unittest.TestCase):
             pins_mod.measure("antigravity", "binary+launcher", agy.path, "", source="fake", entry=("agy",), **kw)
 
     def test_committed_windows_amd64_cursor_and_pi_pins_have_the_measured_values(self) -> None:
-        # Verified fixtures, measured 2026-11-09 on Lucas's Windows machine "sentry" (hasher at 66fe11b1);
+        # Verified fixtures, measured 2026-11-10 on Lucas's Windows machine "sentry" (pins.measure() at 6cce8ff9);
         # the trees are not committed. Reachable on Windows through the pinned .cmd/.ps1 launcher rule.
-        self.assertEqual("r2a-pins/1.5.0-candidate-2026-11-10", PIN_TABLE_VERSION)
+        self.assertEqual("r2a-pins/1.6.0-candidate-2026-11-10", PIN_TABLE_VERSION)
         self.assertEqual("r2a-refusals/1.7.0-candidate-2026-11-10", REFUSAL_CODES_VERSION)
         cursor = Pin(
             engine="cursor",
@@ -326,61 +372,62 @@ class PinTableTests(unittest.TestCase):
             target="versions/2026.11.05-86047df",
             target_sha256="d9088fb279e9a004d4098b927df9b1257cd05b367cdc0959ba11d082e291bf23",
             platform="windows_amd64",
-            measured="2026-11-09",
+            measured="2026-11-10",
             source="https://cursor.com/install?win32=true",
+            entry=("node.exe", "index.js"),
         )
+        cursor_cmd = dataclasses.replace(
+            cursor, launcher_sha256="9244cdfcf1f42640f3ee17f40f9140171eb1ac3285077db066f51ccb4d6199a1", launcher_bytes=517)
         pi = Pin(
             engine="pi",
-            version="1.5.1",
+            version="1.5.2",
             launcher_sha256="c56ef3cdd441b3c00d49e6e36d4a163bbcc715bf32e4de3473ece96efd232c4b",
             launcher_bytes=464,
-            target="../install/releases/1.5.1",
-            target_sha256="2c477ce6abcd257434138b4affd6f9b12b92ec2527bc8eb50f04948a25323ac7",
+            target="../install/releases/1.5.2",
+            target_sha256="0e2feb8977d64e87901d4bb9d4d5d01156e1b217e35faa89ec090496380eb4fa",
             platform="windows_amd64",
-            measured="2026-11-09",
+            measured="2026-11-10",
             source="https://pi.dev/install.ps1",
+            entry=("node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",),
             interpreter="node (PATH)",
         )
-        pi_ps1 = Pin(
-            engine="pi",
-            version="1.5.1",
-            launcher_sha256="3f422e96483162aad373b8e3e28f282236bdffb5cc1b8bfb6c25a8d918bd31d1",
-            launcher_bytes=500,
-            target="../install/releases/1.5.1",
-            target_sha256="2c477ce6abcd257434138b4affd6f9b12b92ec2527bc8eb50f04948a25323ac7",
-            platform="windows_amd64",
-            measured="2026-11-09",
-            source="https://pi.dev/install.ps1",
-            interpreter="node (PATH)",
-        )
+        pi_ps1 = dataclasses.replace(
+            pi, launcher_sha256="3f422e96483162aad373b8e3e28f282236bdffb5cc1b8bfb6c25a8d918bd31d1", launcher_bytes=500)
+        pi_bare = dataclasses.replace(
+            pi, launcher_sha256="e05c2aba9e41123c919ca34d8478a18aeb2ec65fc298522aa9b1694e5487df98", launcher_bytes=390)
         cells = (
             (cursor, "/u/cursor-agent/cursor-agent.ps1", "/u/cursor-agent/versions/2026.11.05-86047df", "2026.11.06-86047df"),
-            (pi, "/u/.pi/agent/bin/pi.cmd", "/u/.pi/agent/install/releases/1.5.1", "1.5.2"),
-            (pi_ps1, "/u/.pi/agent/bin/pi.ps1", "/u/.pi/agent/install/releases/1.5.1", "1.5.2"),
+            (cursor_cmd, "/u/cursor-agent/cursor-agent.cmd", "/u/cursor-agent/versions/2026.11.05-86047df", "2026.11.06-86047df"),
+            (pi, "/u/.pi/agent/bin/pi.cmd", "/u/.pi/agent/install/releases/1.5.2", "1.5.1"),
+            (pi_ps1, "/u/.pi/agent/bin/pi.ps1", "/u/.pi/agent/install/releases/1.5.2", "1.5.1"),
+            (pi_bare, "/u/.pi/agent/bin/pi", "/u/.pi/agent/install/releases/1.5.2", "1.5.1"),
         )
         for pin, launcher, root, other_version in cells:
             with self.subTest(engine=pin.engine, launcher=launcher):
                 self.assertIn(pin, PINS)
                 self.assertTrue(pins_mod.listed(pin.engine, "launcher+tree", pin.version, pin.launcher_sha256, pin.target_sha256))
                 self.assertFalse(pins_mod.listed(pin.engine, "launcher+tree", other_version, pin.launcher_sha256, pin.target_sha256))
-                # No entry has been measured, so a grant on this launcher would refuse pin_entry_unset at launch;
-                # Pi's refuses interpreter_unpinned first (its Node is on PATH, outside the tree).
-                self.assertEqual((), pin.entry)
+                # Cursor's entry is inside its tree, with no interpreter outside it. Pi's entry is measured too,
+                # but its Node is on PATH, outside the tree: a launch on it refuses interpreter_unpinned.
+                self.assertEqual(COMMITTED_ENTRY[pin.engine], pin.entry)
                 self.assertEqual("node (PATH)" if pin.engine == "pi" else "", pin.interpreter)
                 # The target is a plain relative path: no ValueError.
                 self.assertEqual(os.path.realpath(root), pins_mod.resolve_target(launcher, pin.target))
-        self.assertTrue(pins_mod.listed(
-            "pi", "launcher+tree", "1.5.1", "3f422e96483162aad373b8e3e28f282236bdffb5cc1b8bfb6c25a8d918bd31d1",
-            "2c477ce6abcd257434138b4affd6f9b12b92ec2527bc8eb50f04948a25323ac7"))
-        self.assertFalse(pins_mod.listed(
-            "pi", "launcher+tree", "1.5.2", "3f422e96483162aad373b8e3e28f282236bdffb5cc1b8bfb6c25a8d918bd31d1",
-            "2c477ce6abcd257434138b4affd6f9b12b92ec2527bc8eb50f04948a25323ac7"))
-        self.assertEqual([cursor], [p for p in PINS if p.engine == "cursor"])
-        # Pi has exactly the two windows_amd64 launchers, pi.cmd then pi.ps1, over one tree.
-        self.assertEqual([pi, pi_ps1], [p for p in PINS if p.engine == "pi"])
-        self.assertEqual((pi.target, pi.target_sha256, pi.platform), (pi_ps1.target, pi_ps1.target_sha256, pi_ps1.platform))
-        self.assertEqual({"cursor", "pi"}, {p.engine for p in PINS})
-        self.assertEqual(3, len(PINS))
+        # Cursor has exactly the .ps1 and the .cmd launcher rows, over one tree and one entry.
+        self.assertEqual([cursor, cursor_cmd], [p for p in PINS if p.engine == "cursor"])
+        # Pi has exactly the three 1.5.2 windows_amd64 launchers (pi.cmd, pi.ps1, bare pi) over one tree.
+        self.assertEqual([pi, pi_ps1, pi_bare], [p for p in PINS if p.engine == "pi"])
+        self.assertEqual({"1.5.2"}, {p.version for p in PINS if p.engine == "pi"})
+        # The 1.5.1 rows are replaced: neither their version nor their tree digest is recorded.
+        old_tree = "2c477ce6abcd257434138b4affd6f9b12b92ec2527bc8eb50f04948a25323ac7"
+        self.assertFalse([p for p in PINS if p.version == "1.5.1" or p.target_sha256 == old_tree or "1.5.1" in p.target])
+        for launcher_sha256 in (pi.launcher_sha256, pi_ps1.launcher_sha256):
+            self.assertFalse(pins_mod.listed("pi", "launcher+tree", "1.5.1", launcher_sha256, old_tree))
+            self.assertFalse(pins_mod.listed("pi", "launcher+tree", "1.5.2", launcher_sha256, old_tree))
+        self.assertEqual(1, len([p for p in PINS if p.engine == "antigravity"]))
+        self.assertEqual({"cursor", "pi", "antigravity"}, {p.engine for p in PINS})
+        self.assertEqual(6, len(PINS))
+        self.assertEqual({("windows_amd64", "2026-11-10")}, {(p.platform, p.measured) for p in PINS})
         # Hermes was measured on Windows for its launchers only; no tree hash exists, so no pin.
         self.assertFalse([p for p in PINS if p.engine == "hermes"])
 
@@ -1115,8 +1162,9 @@ class InterpreterUnpinnedTests(Base):
     EXTS = (".cmd", ".ps1")
 
     def test_committed_pi_pins_name_the_interpreter_and_cursor_does_not(self) -> None:
-        self.assertEqual([NODE_ON_PATH, NODE_ON_PATH], [p.interpreter for p in PINS if p.engine == "pi"])
-        self.assertEqual([""], [p.interpreter for p in PINS if p.engine == "cursor"])
+        self.assertEqual([NODE_ON_PATH] * 3, [p.interpreter for p in PINS if p.engine == "pi"])
+        self.assertEqual(["", ""], [p.interpreter for p in PINS if p.engine == "cursor"])
+        self.assertEqual([""], [p.interpreter for p in PINS if p.engine == "antigravity"])
         self.assertEqual("", {f.name: f for f in dataclasses.fields(Pin)}["interpreter"].default)
         self.assertEqual("", {f.name: f for f in dataclasses.fields(Grant)}["interpreter"].default)
 
@@ -1596,12 +1644,181 @@ class MeasuredBinaryEntryTests(Base):
                 argv0 = FLOORS[inst.engine].names[0]
                 self.refused("interpreter_unpinned", launch_plan, g, [argv0], {})
 
-    def test_committed_cursor_and_pi_rows_stay_refused(self) -> None:
-        self.assertEqual("r2a-pins/1.5.0-candidate-2026-11-10", PIN_TABLE_VERSION)
+    def test_committed_pi_rows_stay_refused_and_no_committed_row_is_pin_entry_unset(self) -> None:
+        self.assertEqual("r2a-pins/1.6.0-candidate-2026-11-10", PIN_TABLE_VERSION)
         for pin in pins_mod.PINS:
-            self.assertEqual("launcher+tree", PINNED[pin.engine])
-            self.assertEqual((), pin.entry)  # no measured entry: pin_entry_unset, or interpreter_unpinned for Pi
+            if PINNED[pin.engine] == "launcher+tree":
+                self.assertTrue(pin.entry)  # a measured entry: never pin_entry_unset
+            else:  # antigravity: the launcher is the native binary itself, executed by its realpath
+                self.assertEqual(((), ""), (pin.entry, pin.target))
+            # Pi names the Node on PATH, so every Pi launch is interpreter_unpinned; no other row names one.
             self.assertEqual(NODE_ON_PATH if pin.engine == "pi" else "", pin.interpreter)
+
+
+@unittest.skipUnless(os.name == "posix", "POSIX fixtures")
+class SentryShapedInstallTests(Base):
+    """Installs shaped like the three measured on sentry on 2026-11-10 (table 1.6.0), with the committed
+    rows' target, entry and interpreter values. The real hashes cannot be reproduced here, so each fake
+    install is measured in place and the pin table is patched.
+
+    Windows is simulated through ``binary.is_windows()``; no test here runs on real Windows.
+    """
+
+    def pi_152(self) -> dict[str, Install]:
+        """agent/bin/{pi,pi.cmd,pi.ps1,pi-launcher.js} beside agent/install/releases/1.5.2; Node is on PATH."""
+        home = F.dir()
+        ran = os.path.join(home, "ran")
+        agent = os.path.join(home, ".pi", "agent")
+        root = os.path.join(agent, "install", "releases", "1.5.2")
+        write(os.path.join(root, *PI_ENTRY[0].split("/")), "console.log(1);\n")
+        write(os.path.join(root, "package.json"), '{"version": "1.5.2"}\n')
+        write(os.path.join(agent, "install", "current-version"), "1.5.2\n")
+        bindir = os.path.join(agent, "bin")
+        write(os.path.join(bindir, "pi-launcher.js"), "// outside the pinned tree\n")
+        write(os.path.join(bindir, "pi"), f'#!/bin/sh\ntouch {ran}\nexec node "$(dirname "$0")/pi-launcher.js" "$@"\n', 0o755)
+        write(os.path.join(bindir, "pi.cmd"), '@echo off\r\nnode "%~dp0pi-launcher.js" %*\r\n', 0o755)
+        write(os.path.join(bindir, "pi.ps1"), '& node "$PSScriptRoot\\pi-launcher.js" @args\n', 0o755)
+        return {
+            name: Install("pi", os.path.join(bindir, name), "../install/releases/1.5.2", root, "1.5.2", ran, PI_ENTRY, NODE_ON_PATH)
+            for name in ("pi", "pi.cmd", "pi.ps1")
+        }
+
+    def cursor_windows(self) -> dict[str, Install]:
+        """cursor-agent/{cursor-agent,agent}.{cmd,ps1} beside versions/<v>, which holds its own node.exe."""
+        home = F.dir()
+        ran = os.path.join(home, "ran")
+        version = "2026.11.05-86047df"
+        base = os.path.join(home, "cursor-agent")
+        root = os.path.join(base, "versions", version)
+        F.make("node.exe", "v24.22.1", where=os.makedirs(root) or root, dump=ran)
+        write(os.path.join(root, "index.js"), "console.log(1);\n")
+        os.makedirs(os.path.join(root, ".running"))  # the real tree has this empty directory
+        out = {}
+        for name in ("cursor-agent", "agent"):  # both names carry the same bytes, as measured
+            write(os.path.join(base, name + ".cmd"), '@echo off\r\n"%~dp0versions\\x\\node.exe" "%~dp0versions\\x\\index.js" %*\r\n', 0o755)
+            write(os.path.join(base, name + ".ps1"), '& "$PSScriptRoot\\versions\\x\\node.exe" "$PSScriptRoot\\versions\\x\\index.js" @args\n', 0o755)
+            for ext in (".cmd", ".ps1"):
+                out[name + ext] = Install("cursor", os.path.join(base, name + ext), "versions/" + version, root, version, ran, CURSOR_ENTRY)
+        return out
+
+    def agy_windows_native(self) -> Install:
+        """agy/bin/agy.exe: one native file; the engine name resolves straight to it (target "")."""
+        home = F.dir()
+        ran = os.path.join(home, "ran")
+        bindir = os.path.join(home, "agy", "bin")
+        os.makedirs(bindir)
+        binary = F.make("agy.exe", "1.5.5", where=bindir, dump=ran)
+        return Install("antigravity", binary, "", binary, "1.5.5", ran)
+
+    def test_pi_152_shape_is_granted_check_only_and_refused_interpreter_unpinned_at_launch(self) -> None:
+        installs = self.pi_152()
+        pins = [i.pin() for i in installs.values()]
+        self.assertEqual({(PI_ENTRY, NODE_ON_PATH, "../install/releases/1.5.2", "1.5.2")},
+                         {(p.entry, p.interpreter, p.target, p.version) for p in pins})
+        self.assertEqual(1, len({p.target_sha256 for p in pins}))  # three launchers over one tree
+        self.assertEqual(3, len({p.launcher_sha256 for p in pins}))
+        cli = os.path.realpath(os.path.join(installs["pi"].root, *PI_ENTRY[0].split("/")))
+        with windows(), table(*pins):
+            for name, inst in installs.items():
+                with self.subTest(launcher=name):
+                    g = self.g(inst)  # the launcher and tree checks pass
+                    self.assertTrue(g.check_only)  # .cmd/.ps1 by name; the bare `pi` by content (not native)
+                    self.assertEqual("1.5.2", g.version)
+                    self.assertEqual((cli,), g.entry)
+                    self.assertEqual(NODE_ON_PATH, g.interpreter)
+                    self.assertTrue(g.record()["beta"])
+                    # Lucas's rule: Node from PATH is outside the pinned tree. With or without a child_env.
+                    for env in ({}, {"PI_MANAGED_INSTALL_ROOT": os.path.dirname(os.path.dirname(inst.root))}):
+                        r = self.refused("interpreter_unpinned", launch_plan, g, ["pi", "-p", "hi"], env)
+                        self.assertIn(NODE_ON_PATH, r.detail)
+                    hand = grant_mod.LaunchPlan(g, ("pi",), (), 3)
+                    self.refused("interpreter_unpinned", hand.exec_argv)
+                    self.refused("interpreter_unpinned", hand.exec_env)
+            # detect.path_hits tries the bare name first on Windows for a pinned route, then .cmd, then .ps1.
+            bindir = installs["pi"].bindir
+            self.assertEqual([installs[n].path for n in ("pi", "pi.cmd", "pi.ps1")], detect_mod.path_hits("pi", bindir, True))
+            self.assertEqual(installs["pi"].path, detect("pi", bindir).candidate)
+            grants, records = launch_check(bindir, probe=self.never_probe)
+            self.assertEqual(installs["pi"].path, grants["pi"].path)
+            self.refused("interpreter_unpinned", launch_plan, grants["pi"], ["pi"], {})
+            # Without the bare launcher's row the first PATH hit matches no pin: the row is needed.
+            with table(*pins[1:]):
+                self.assertEqual("pin_mismatch", {r["engine"]: r for r in launch_check(bindir, probe=self.never_probe)[1]}["pi"]["refusal"])
+        self.assertFalse(os.path.exists(installs["pi"].ran))
+
+    def test_cursor_shape_behind_cmd_or_ps1_is_check_only_and_execs_the_entry_never_the_launcher(self) -> None:
+        installs = self.cursor_windows()
+        any_inst = installs["agent.cmd"]
+        reals = entry_reals(any_inst)
+        self.assertEqual([os.path.join(os.path.realpath(any_inst.root), n) for n in CURSOR_ENTRY], reals)
+        # One row per launcher hash, as committed: agent.* and cursor-agent.* share bytes.
+        pins = [installs["cursor-agent.ps1"].pin(), installs["cursor-agent.cmd"].pin()]
+        self.assertEqual(installs["agent.ps1"].pin(), pins[0])
+        self.assertEqual(installs["agent.cmd"].pin(), pins[1])
+        self.assertEqual({(CURSOR_ENTRY, "")}, {(p.entry, p.interpreter) for p in pins})
+        launchers = {i.path for i in installs.values()}
+        with windows(), table(*pins):
+            for name, inst in installs.items():
+                with self.subTest(launcher=name):
+                    g = self.g(inst)
+                    self.assertTrue(g.check_only)
+                    self.assertEqual("launcher+tree", g.pin_kind)
+                    self.assertEqual(tuple(reals), g.entry)
+                    self.assertEqual("", g.interpreter)
+                    self.assertTrue(g.record()["beta"])
+                    argv0 = name.split(".")[0]
+                    plan = launch_plan(g, [argv0, "-p", "hi"], {"CURSOR_ROUTE": "1"})
+                    for _ in range(2):
+                        out = plan.exec_argv()
+                        self.assertEqual([*reals, "-p", "hi"], out)
+                        self.assertFalse(launchers & set(out))  # never a launcher
+                        self.assertFalse([a for a in out if a.lower().endswith((".cmd", ".ps1"))])
+                    self.assertEqual({"CURSOR_ROUTE": "1"}, plan.exec_env())
+                    self.refused("wrapper_refused", launch_plan, g, [name], {})
+            # A PATH search offers agent.cmd: .cmd is tried before .ps1, so the .cmd row is needed.
+            base = any_inst.bindir
+            self.assertEqual(installs["agent.cmd"].path, detect("cursor", base).candidate)
+            grants, records = launch_check(base, probe=self.never_probe)
+            self.assertEqual(installs["agent.cmd"].path, grants["cursor"].path)
+            self.assertEqual([*reals, "-p"], launch_plan(grants["cursor"], ["agent", "-p"], {}).exec_argv())
+            with table(pins[0]):  # the .ps1 row alone: the .cmd first hits match no pin
+                self.assertEqual("pin_mismatch", {r["engine"]: r for r in launch_check(base, probe=self.never_probe)[1]}["cursor"]["refusal"])
+            # A file written into the tree's .running directory after the grant is drift.
+            plan = launch_plan(grants["cursor"], ["agent"], {})
+            write(os.path.join(any_inst.root, ".running", "pid"), "1\n")
+            self.refused("binary_changed", plan.exec_argv)
+        self.assertFalse(os.path.exists(any_inst.ran))
+
+    def test_agy_shape_native_exe_with_empty_target_is_granted_and_execs_the_binary(self) -> None:
+        inst = self.agy_windows_native()
+        pin = inst.pin()
+        self.assertEqual(("", (), "", pin.launcher_sha256), (pin.target, pin.entry, pin.interpreter, pin.target_sha256))
+        binary = os.path.realpath(inst.path)
+        with windows(), table(pin):
+            self.assertEqual(inst.path, detect("antigravity", inst.bindir).candidate)  # agy.exe, by the .exe search
+            g = self.g(inst)
+            self.assertFalse(g.check_only)
+            self.assertFalse(g.record()["check_only"])
+            self.assertEqual("binary+launcher", g.pin_kind)
+            self.assertEqual(("1.5.5", binary, binary, ()), (g.version, g.realpath, g.pin_target, g.entry))
+            self.assertEqual((pin.launcher_sha256, pin.target_sha256), (g.sha256, g.pin_sha256))
+            self.assertTrue(g.record()["beta"])
+            plan = launch_plan(g, ["agy", "-p", "hi"], {"A": "1"})
+            for _ in range(2):
+                out = plan.exec_argv()
+                self.assertEqual(binary, out[0])
+                self.assertEqual([binary, "-p", "hi"], out)
+            self.assertEqual({"A": "1"}, plan.exec_env())
+            grants, records = launch_check(inst.bindir, probe=self.never_probe)
+            self.assertEqual("granted", {r["engine"]: r for r in records}["antigravity"]["outcome"])
+            # A self-update replaces agy.exe: the plan and the old grant are binary_changed, a new grant
+            # is pin_mismatch until re-pinned.
+            F.write(inst.path, "1.5.6", dump=inst.ran)
+            self.refused("binary_changed", plan.exec_argv)
+            self.refused("binary_changed", launch_plan, g, ["agy"], {})
+            r = self.refused("pin_mismatch", self.g, inst)
+            self.assertIn("matches no pin (pinned: 1.5.5)", r.detail)
+        self.assertFalse(os.path.exists(inst.ran))
 
 
 @unittest.skipUnless(os.name == "posix", "POSIX fixtures")

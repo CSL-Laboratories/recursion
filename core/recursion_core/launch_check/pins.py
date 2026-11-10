@@ -64,7 +64,10 @@ from recursion_core.launch_check.refusals import LaunchRefused
 # archive, not from an installed agy); archive-sourced pins are never matched; Pin gains `entry`.
 # 1.5.0: Pin gains `interpreter`; the two Pi 1.5.1 windows_amd64 rows record "node (PATH)" (their
 # launchers run the Node found on PATH, outside the pinned tree). No hash, size, target or entry changed.
-PIN_TABLE_VERSION = "r2a-pins/1.5.0-candidate-2026-11-10"
+# 1.6.0: data only, measured on sentry 2026-11-10. Cursor 2026.11.05-86047df gains its entry
+# (node.exe, index.js) and a .cmd launcher row; Antigravity CLI 1.5.5 windows_amd64 is pinned from
+# an installed agy.exe; Pi 1.5.2 (.cmd, .ps1 and bare launchers, with its entry) replaces both 1.5.1 rows.
+PIN_TABLE_VERSION = "r2a-pins/1.6.0-candidate-2026-11-10"
 
 KINDS = ("launcher+tree", "binary+launcher")
 _WHAT = {"launcher+tree": "installed package files", "binary+launcher": "binary"}
@@ -105,25 +108,30 @@ class Match:
 
 # Measured pins only. An engine with no pin here is refused (pin_mismatch).
 # Lucas, 2026-11-10 (csl-research PR #1159 comment 6777082374): "pins stay measured from a real
-# install only for Nov 11; no archive-derived pins". Antigravity CLI has no pin: its 1.5.3
-# linux_amd64 row was hashed from the release archive and is removed until someone measures an
-# installed agy. No committed pin has a measured entry, so every entry is ().
+# install only for Nov 11; no archive-derived pins". The Antigravity CLI 1.5.3 linux_amd64 row,
+# hashed from the release archive, was removed in 1.4.0; the 1.5.5 windows_amd64 row below is
+# measured from an installed agy.exe.
+# Entries: both Cursor rows and the three Pi rows carry a measured entry. The Antigravity row is
+# binary+launcher, so its entry is (): its measured binary is its entry.
 # Lucas, 2026-11-10: "A Windows Pi launch whose interpreter (Node from PATH) is outside the pinned
-# tree must refuse with a new typed code `interpreter_unpinned`." Both Pi launchers run the Node
-# found on PATH (the installer's templates contain no path), so both Pi rows record it. Cursor's
-# node.exe is inside its tree, so its row records none.
+# tree must refuse with a new typed code `interpreter_unpinned`." Every Pi launcher runs the Node
+# found on PATH, so the three Pi rows record it and Pi still refuses at launch. Cursor's node.exe
+# is inside its tree, so its rows record none.
 PINS: tuple[Pin, ...] = (
-    # The windows_amd64 pins below were measured on Lucas's Windows machine "sentry" with the
-    # hasher at commit 66fe11b1. They are reachable on Windows through the .cmd/.ps1 rule
-    # (Lucas's owner call of 2026-11-09): detect.path_hits tries "", .exe, .cmd, .ps1 for a
-    # pinned route, and grant() accepts a <name>.cmd or <name>.ps1 launcher only bound to a
-    # pin (its SHA-256 is a recorded launcher and the pinned tree matches); any other
-    # .cmd/.ps1 launcher is pin_mismatch.
+    # The windows_amd64 pins below were measured on Lucas's Windows machine "sentry" on 2026-11-10
+    # with pins.measure() at commit 6cce8ff96eab600f14d3109d4547cf9b3eda95ab (Lucas, 2026-11-10,
+    # on recording agy, Cursor and Pi from sentry: "Yes"). The .cmd/.ps1 rows are reachable on
+    # Windows through the .cmd/.ps1 rule (Lucas's owner call of 2026-11-09): for a pinned route
+    # detect.path_hits tries "", .exe, .cmd, .ps1, in that order, in each PATH directory, and
+    # grant() accepts a <name>.cmd or <name>.ps1 launcher only bound to a pin (its SHA-256 is a
+    # recorded launcher and the pinned tree matches); any other .cmd/.ps1 launcher is pin_mismatch.
     #
     # Cursor 2026.11.05-86047df, windows_amd64: launcher
-    # C:\Users\Lucas\AppData\Local\cursor-agent\cursor-agent.ps1 (2527 bytes), recorded as
-    # measured. Tree of versions/2026.11.05-86047df: 408 entries, 265684223 bytes. It includes
-    # an empty .running directory, so this pin goes stale if Cursor writes into it or removes it.
+    # C:\Users\Lucas\AppData\Local\cursor-agent\cursor-agent.ps1 (2527 bytes); agent.ps1 has the
+    # same SHA-256. Tree of versions/2026.11.05-86047df: 408 entries, 265684223 bytes, unchanged
+    # since 2026-11-09. It includes an empty .running directory, so this pin goes stale if Cursor
+    # writes into it or removes it. Entry: node.exe (v24.22.1, 93915464 bytes) and index.js
+    # (7970872 bytes), both inside the tree, so no interpreter outside it.
     Pin(
         engine="cursor",
         version="2026.11.05-86047df",
@@ -132,36 +140,90 @@ PINS: tuple[Pin, ...] = (
         target="versions/2026.11.05-86047df",
         target_sha256="d9088fb279e9a004d4098b927df9b1257cd05b367cdc0959ba11d082e291bf23",
         platform="windows_amd64",
-        measured="2026-11-09",
+        measured="2026-11-10",
         source="https://cursor.com/install?win32=true",
+        entry=("node.exe", "index.js"),
     ),
-    # Pi 1.5.1, windows_amd64: launcher C:\Users\Lucas\.pi\agent\bin\pi.cmd (464 bytes). Tree of
-    # ../install/releases/1.5.1: 16776 entries, 113981899 bytes.
+    # Cursor 2026.11.05-86047df, windows_amd64: launcher cursor-agent.cmd (517 bytes); agent.cmd
+    # has the same SHA-256. Same tree and entry as the .ps1 pin. detect.path_hits tries .cmd
+    # before .ps1, so this is the launcher a Windows PATH search offers when both are present.
+    Pin(
+        engine="cursor",
+        version="2026.11.05-86047df",
+        launcher_sha256="9244cdfcf1f42640f3ee17f40f9140171eb1ac3285077db066f51ccb4d6199a1",
+        launcher_bytes=517,
+        target="versions/2026.11.05-86047df",
+        target_sha256="d9088fb279e9a004d4098b927df9b1257cd05b367cdc0959ba11d082e291bf23",
+        platform="windows_amd64",
+        measured="2026-11-10",
+        source="https://cursor.com/install?win32=true",
+        entry=("node.exe", "index.js"),
+    ),
+    # Antigravity CLI (agy) 1.5.5, windows_amd64: the native
+    # C:\Users\Lucas\AppData\Local\agy\bin\agy.exe (226117784 bytes), installed by
+    # https://antigravity.google/cli/install.ps1. The launcher is the binary itself, so target is
+    # "" and both digests are the one file's. The source is the install. Cross-check only: the
+    # file's SHA-512 matches Google's windows_amd64 release manifest for 1.5.5. agy updates itself
+    # in the background, so this pin goes stale (pin_mismatch) after an update until re-pinned.
+    Pin(
+        engine="antigravity",
+        version="1.5.5",
+        launcher_sha256="fe9eb2f3884ca6cd630c57eed117580819341bce4b87d2c40b441ddd01cb8f2a",
+        launcher_bytes=226117784,
+        target="",
+        target_sha256="fe9eb2f3884ca6cd630c57eed117580819341bce4b87d2c40b441ddd01cb8f2a",
+        platform="windows_amd64",
+        measured="2026-11-10",
+        source="https://antigravity.google/cli/install.ps1 (installed agy.exe)",
+    ),
+    # Pi 1.5.2, windows_amd64 (replaces the 1.5.1 rows): launcher pi.cmd (464 bytes). Tree of
+    # ../install/releases/1.5.2: 16776 entries. Chain: launcher -> bin/pi-launcher.js (outside the
+    # tree), which reads install/current-version and spawns process.execPath on the entry (cli.js)
+    # with PI_MANAGED_INSTALL_ROOT set. Executing the entry skips pi-launcher.js, and the route's
+    # child_env decides PI_MANAGED_INSTALL_ROOT; it is never inherited. The Node is the one found
+    # on PATH, outside the tree, so every launch is still refused (interpreter_unpinned).
     Pin(
         engine="pi",
-        version="1.5.1",
+        version="1.5.2",
         launcher_sha256="c56ef3cdd441b3c00d49e6e36d4a163bbcc715bf32e4de3473ece96efd232c4b",
         launcher_bytes=464,
-        target="../install/releases/1.5.1",
-        target_sha256="2c477ce6abcd257434138b4affd6f9b12b92ec2527bc8eb50f04948a25323ac7",
+        target="../install/releases/1.5.2",
+        target_sha256="0e2feb8977d64e87901d4bb9d4d5d01156e1b217e35faa89ec090496380eb4fa",
         platform="windows_amd64",
-        measured="2026-11-09",
+        measured="2026-11-10",
         source="https://pi.dev/install.ps1",
+        entry=("node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",),
         interpreter="node (PATH)",
     ),
-    # Pi 1.5.1, windows_amd64: launcher C:\Users\Lucas\.pi\agent\bin\pi.ps1 (500 bytes), next to
-    # pi.cmd; same tree as the pi.cmd pin (../install/releases/1.5.1: 16776 entries,
-    # 113981899 bytes).
+    # Pi 1.5.2, windows_amd64: launcher pi.ps1 (500 bytes); same tree, entry and chain as the
+    # pi.cmd pin.
     Pin(
         engine="pi",
-        version="1.5.1",
+        version="1.5.2",
         launcher_sha256="3f422e96483162aad373b8e3e28f282236bdffb5cc1b8bfb6c25a8d918bd31d1",
         launcher_bytes=500,
-        target="../install/releases/1.5.1",
-        target_sha256="2c477ce6abcd257434138b4affd6f9b12b92ec2527bc8eb50f04948a25323ac7",
+        target="../install/releases/1.5.2",
+        target_sha256="0e2feb8977d64e87901d4bb9d4d5d01156e1b217e35faa89ec090496380eb4fa",
         platform="windows_amd64",
-        measured="2026-11-09",
+        measured="2026-11-10",
         source="https://pi.dev/install.ps1",
+        entry=("node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",),
+        interpreter="node (PATH)",
+    ),
+    # Pi 1.5.2, windows_amd64: the bare `pi` launcher (390 bytes); same tree, entry and chain as
+    # the pi.cmd pin. For a pinned route on Windows detect.path_hits tries the bare name ("")
+    # first, before .exe, .cmd and .ps1, so this is the file a PATH search offers when present.
+    Pin(
+        engine="pi",
+        version="1.5.2",
+        launcher_sha256="e05c2aba9e41123c919ca34d8478a18aeb2ec65fc298522aa9b1694e5487df98",
+        launcher_bytes=390,
+        target="../install/releases/1.5.2",
+        target_sha256="0e2feb8977d64e87901d4bb9d4d5d01156e1b217e35faa89ec090496380eb4fa",
+        platform="windows_amd64",
+        measured="2026-11-10",
+        source="https://pi.dev/install.ps1",
+        entry=("node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",),
         interpreter="node (PATH)",
     ),
 )

@@ -64,17 +64,18 @@ route starts with an explicit auth mode").
 (`policy.AUTH_MODES`). Omitted refuses with `auth_mode_missing`; anything else refuses with
 `auth_mode_unknown`. No mode is a default and none is read from the launching shell.
 
-`route=ChildRoute(api_key=None, base_url=None, provider_switches=())` is what the caller says
-about the route it launched. It is a separate input from the parent environment and from
-`overrides`. The override path is unchanged: it still refuses every key, token, base URL and
-provider-switch name (`override_denied`).
+`route=ChildRoute(api_key=None, base_url=None, provider_switches=(), trusted_base_urls=(),
+full_access_acknowledged=False)` is what the caller says about the route it launched. It is a
+separate input from the parent environment and from `overrides`. The override path is
+unchanged: it still refuses every key, token, base URL and provider-switch name
+(`override_denied`).
 
 In every mode the parent's vendor keys, `ANTHROPIC_BASE_URL` and the Bedrock, Vertex and
 Foundry switches are dropped. The child gets one only from the route:
 
 | Mode | Claude Code child | Refuses |
 | --- | --- | --- |
-| `subscription` | No key. The OAuth passthrough above is kept. | A route with a key (`route_key_not_allowed`) or a switch (`route_provider_not_allowed`). |
+| `subscription` | No key. The OAuth passthrough above is kept. | A route with a key (`route_key_not_allowed`) or a switch (`route_provider_not_allowed`), and a base URL the user has not trusted (`route_base_url_untrusted`, see [below](#subscription-base-url)). |
 | `api_key` | `ANTHROPIC_API_KEY` is the route's key, never the parent's. `CLAUDE_CODE_OAUTH_TOKEN` stays if the parent has it; the key outranks it (section 3.3). | No key (`route_key_missing`), an empty or malformed key (`route_key_malformed`), a switch (`route_provider_not_allowed`). |
 | `cloud_provider` | Each switch the route names (`CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`) is set to `1`. A switch left in the parent is not a pick. | No switch (`route_provider_missing`), another name (`route_provider_unknown`), a key (`route_key_not_allowed`). |
 
@@ -83,7 +84,9 @@ Foundry switches are dropped. The child gets one only from the route:
   proxy, an OpenRouter-style gateway, another Anthropic-compatible base); with none it is
   unset. The supplied URL must be `http(s)://host[:port][/path]`: a user name or password
   refuses with `base_url_userinfo`, and a missing or other scheme, a query, a fragment, a bad
-  port or a `..` path refuses with `base_url_malformed`.
+  port or a `..` path refuses with `base_url_malformed`. On an `api_key` or `cloud_provider`
+  route a URL that meets this rule is set as it is. On a `subscription` route it must also
+  pass the rule in [Subscription base URL](#subscription-base-url).
 - **Key custody.** This package is the launch boundary only. It never reads the OS keyring or
   the owner-only key file (A44), and does no keyring or file I/O. The caller fetches the
   user-entered key from the OS keyring, or from the owner-only file on a host with no
@@ -98,6 +101,81 @@ Foundry switches are dropped. The child gets one only from the route:
   the Codex profile has no base-URL or cloud-provider route here.
 - A route that is not a `ChildRoute`, or whose switches are not a tuple, list or frozenset
   of names, refuses with `route_malformed`.
+
+### Subscription base URL
+
+Decided by Lucas (CSLR-D-011; PRODUCT.md `055cc7a5c793b7135e5d0565dc4198cf96230531`, SHA-256
+`e64783152f6d67d4ede774dc41d112fe46c2d7536d53cb2c04e71a3566044daf`, section 3.3 and the
+full-access passages Q20, O44 and H-06): refuse a subscription base URL by default, allow
+official Anthropic without a prompt, trust a named endpoint once and remember it, and let the
+named full-access profile skip the check with its danger notice.
+
+A `subscription` route with `base_url` set refuses with `ANTHROPIC_BASE_URL` /
+`route_base_url_untrusted` by default. The reason: the accepted `CLAUDE_CODE_OAUTH_TOKEN`
+passthrough would go to that base. It launches in exactly four cases:
+
+1. **No base URL.** The child uses the engine's own default, as before.
+2. **Official Anthropic.** The base URL's origin is exactly `https://api.anthropic.com`. No
+   prompt and no trusted entry is needed.
+3. **Trusted by the user.** The route's `trusted_base_urls` holds the base URL's origin.
+4. **Named full-access profile.** The route's `full_access_acknowledged` is `True`.
+
+The inputs, both on `ChildRoute`:
+
+- `trusted_base_urls: tuple[str, ...] = ()` holds the origins the user already agreed to send
+  their subscription sign-in to. It is a tuple or frozenset of `scheme://host[:port]` strings.
+  Each entry must meet the base URL rule above and name an origin only (no path beyond `/`).
+  Any other container or entry refuses the whole route with
+  `route_trusted_base_urls_malformed`. A list that holds a different origin does not help:
+  the route still refuses with `route_base_url_untrusted`.
+- `full_access_acknowledged: bool = False` means this run uses the named full-access profile
+  and the user acknowledged it for this run (CSL-460's full-access mode; PRODUCT.md 055cc7a5
+  Q20, O44, H-06). Only the bool `True` counts. Any value that is not a bool (`"true"`, `1`,
+  `None`) refuses with `route_full_access_malformed`. With it set, a subscription base URL
+  launches without the trust check; the base URL value rule (`base_url_malformed`,
+  `base_url_userinfo`) still applies.
+
+How origins are compared. The base URL value rule runs first. Then the origin is the scheme,
+host and port, and two origins match only when all three are equal. Nothing is matched by
+prefix or substring.
+
+- Scheme and host are lowercased, so `HTTPS://API.Anthropic.COM` is the official origin.
+- A missing port is the scheme's default (443 for `https`, 80 for `http`), so
+  `https://api.anthropic.com:443` is the official origin and `https://api.anthropic.com:8443`
+  is not.
+- The path is not part of the origin. `https://api.anthropic.com/v1` is official, and a
+  trusted origin covers every path on it.
+- A trailing dot is kept: `https://api.anthropic.com.` is a different origin, is not
+  official, and needs its own trusted entry.
+- IP addresses are compared as written. `https://[::1]` and `https://[0:0:0:0:0:0:0:1]` are
+  different origins.
+- These refuse as untrusted: `http://api.anthropic.com`, `https://api.anthropic.com:8443`,
+  `https://api.anthropic.com.evil`, `https://api.anthropic.com.evil.com`. A URL with a user
+  name, such as `https://user@api.anthropic.com`, refuses earlier with `base_url_userinfo`,
+  whatever is trusted.
+
+What this package does not do:
+
+- The one-time prompt and the remembered trusted list live at the driver layer, not in
+  `child_env`. This package reads and writes no storage for them, reads no environment
+  variable for them, and never prompts. The driver asks the user once, saves the origin in
+  the user's config, and passes the saved origins in `trusted_base_urls` on later runs.
+- That prompt must warn the user that their subscription token goes to that endpoint.
+- The driver must show the danger notice when the named full-access profile is turned on.
+  `child_env` renders no UI.
+- Full access is never inferred from the parent environment or from an override. Only the
+  route's `full_access_acknowledged=True` counts.
+
+Other modes and engines:
+
+- `api_key` and `cloud_provider` routes are unchanged. A custom base URL still sets
+  `ANTHROPIC_BASE_URL` with no trust needed. Well-formed `trusted_base_urls` and
+  `full_access_acknowledged` values are ignored there and change nothing. Malformed ones
+  refuse in every mode, like any other malformed route.
+- A Codex child is unchanged. A route `base_url` still refuses with
+  `route_base_url_unsupported`, whatever is trusted or acknowledged.
+- `repr` and `str` of a `ChildRoute` show a count for `trusted_base_urls` and `yes` or `no`
+  for `full_access_acknowledged`. No URL appears there or in any refusal.
 
 Not in this package:
 

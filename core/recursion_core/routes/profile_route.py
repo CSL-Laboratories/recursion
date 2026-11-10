@@ -15,7 +15,9 @@ from collections.abc import Callable, Mapping
 
 from recursion_core.routes import contract as c
 from recursion_core.routes.base import Deadline, RouteAdapter, _Protocol
-from recursion_core.subscription_routes import ENGINES, SAFE_ENV, SubscriptionRouteRefused, guard_then_spawn
+from recursion_core.subscription_routes import (
+    ENGINES, PackagePin, SAFE_ENV, SubscriptionRouteRefused, WrapperInstall, guard_then_spawn,
+)
 
 # driver(process, request, deadline_at, events) -> contract result
 Driver = Callable[..., dict]
@@ -55,27 +57,59 @@ class ProfileRouteAdapter(RouteAdapter):
             env[name] = value
         try:
             # Pi and Hermes refuse without the wrapper pin CSL-786 measures. OpenCode leaves it unset.
+            # A JSON request carries the pin as a dict; the guard still wants the measured object.
             _decision, process = guard_then_spawn(
                 self._launcher, self._argv(request), self.engine, dict(route["profile"]), env,
                 route_home=home if isinstance(home, str) else "", parent_env=self._parent_env,
-                operator_home=self._operator_home, wrapper=route.get("wrapper"),
+                operator_home=self._operator_home, wrapper=_coerce_wrapper(route.get("wrapper")),
             )
         except SubscriptionRouteRefused as err:
             return c.result(rid, c.SUBSCRIPTION_ROUTE_REFUSED, detail=err.cause)
+        except c.RouteError as err:
+            return c.result(rid, err.code, detail=err.detail)
         except OSError as err:
             return c.result(rid, c.ENGINE_ERROR, detail=f"launch failed: {type(err).__name__}")
         events: list[dict] = []
         try:
-            return self._driver(process, request, deadline_at, events)
-        except Deadline:
-            process.fence("deadline")
-            return c.result(rid, c.DEADLINE_EXCEEDED, events=events, detail="recursion deadline")
-        except _Protocol as err:
-            process.fence("protocol_error")
-            return c.result(rid, c.PROTOCOL_ERROR, events=events, detail=str(err))
-        except OSError as err:
-            process.fence("io_error")
-            return c.result(rid, c.ENGINE_ERROR, events=events, detail=f"engine io: {type(err).__name__}")
+            try:
+                return self._driver(process, request, deadline_at, events)
+            except Deadline:
+                process.fence("deadline")
+                return c.result(rid, c.DEADLINE_EXCEEDED, events=events, detail="recursion deadline")
+            except _Protocol as err:
+                process.fence("protocol_error")
+                return c.result(rid, c.PROTOCOL_ERROR, events=events, detail=str(err))
+            except OSError as err:
+                process.fence("io_error")
+                return c.result(rid, c.ENGINE_ERROR, events=events, detail=f"engine io: {type(err).__name__}")
+            except Exception as err:
+                process.fence("internal")
+                return c.result(rid, c.ENGINE_ERROR, events=events, detail=type(err).__name__)
+            except BaseException:
+                process.fence("cancelled")
+                raise
+        finally:
+            drop = getattr(self, "_drop_process", None)
+            if drop is not None:
+                drop(process)
+
+
+def _coerce_wrapper(wrapper: object) -> object:
+    """Accept the in-process pin or the JSON shape of the same fields."""
+
+    if wrapper is None or isinstance(wrapper, WrapperInstall):
+        return wrapper
+    if not isinstance(wrapper, Mapping):
+        return wrapper
+    pin = wrapper.get("pin")
+    if not isinstance(pin, Mapping) or not isinstance(pin.get("package_files"), list):
+        return wrapper
+    files = tuple((str(path), str(digest)) for path, digest in pin["package_files"])
+    return WrapperInstall(
+        str(wrapper.get("launcher_path") or ""),
+        str(wrapper.get("install_root") or ""),
+        PackagePin(str(pin.get("launcher_sha256") or ""), files),
+    )
 
 
 def profile_adapters(launcher, clock, credentials: Callable[[str, str], str], parent_env: Mapping[str, str], *,

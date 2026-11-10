@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 import re
@@ -111,6 +112,30 @@ class SubscriptionRouteReuseTest(unittest.TestCase):
         res = self.service.handle(self.req("pi", profile))
         self.assertEqual((res["code"], res["detail"]), (c.SUBSCRIPTION_ROUTE_REFUSED, "wrapper_pin_missing"))
         self.assertEqual(self.launcher.calls, [])
+
+    def test_json_wrapper_pin_is_accepted_on_the_route_and_on_a_fallback(self) -> None:
+        # A JSON request cannot carry the dataclass. The same fields, including on a fallback entry,
+        # have to validate and still satisfy the pin check.
+        from recursion_core.routes import limits as lim
+
+        pin = self.pin()
+        wrapper = {
+            "launcher_path": pin.launcher_path,
+            "install_root": pin.install_root,
+            "pin": {
+                "launcher_sha256": pin.pin.launcher_sha256,
+                "package_files": [list(item) for item in pin.pin.package_files],
+            },
+        }
+        profile = {"provider": "anthropic", "auth": "api_key", "credential_env": "ANTHROPIC_API_KEY"}
+        req = json.loads(json.dumps(self.req("pi", profile, wrapper=wrapper)))
+        res = self.service.handle(req)
+        self.assertEqual((res["status"], res["text"]), ("ok", "driven"))
+        fallback = {"engine": "pi", "model": "m",
+                    "connection": {"kind": "api_key", "id": "k1", "credential_env": "ANTHROPIC_API_KEY"},
+                    "profile": profile, "home": self.home, "wrapper": wrapper}
+        limits = lim.validate_limits({"on_limit": "fallback", "fallback": [json.loads(json.dumps(fallback))]})
+        self.assertEqual(limits["fallback"][0]["wrapper"]["pin"]["launcher_sha256"], pin.pin.launcher_sha256)
 
     def test_api_key_profile_passes_the_guard_then_launches(self) -> None:
         profile = {"provider": "anthropic", "auth": "api_key", "credential_env": "ANTHROPIC_API_KEY"}

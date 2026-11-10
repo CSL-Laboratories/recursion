@@ -18,6 +18,9 @@ This breaker is the other way round (PRODUCT.md 055cc7a5, CSLR-D-011: 3.4 S3 and
   short fault never hides a real limit on the same connection from that tenant.
 * It always recovers. An open key has a finite ``open_until`` (the signal's ``reset_at`` when it
   carries one, capped at ``max_open_s``; otherwise a cooldown with backoff up to ``max_cooldown_s``).
+  Repeated typed limits while that window still holds are one incident: they do not stack the
+  failure count or extend a cooldown that has no later vendor reset. A probe admitted after the
+  window, whose own result is a limit, is the next incident and doubles the cooldown.
   ``reset_at`` is a reading of this breaker's clock, not a vendor epoch: adapters translate
   ``resetsAt`` first (``contract.vendor_reset``). After it, exactly one leased half-open probe is
   admitted at a time. The
@@ -25,7 +28,9 @@ This breaker is the other way round (PRODUCT.md 055cc7a5, CSLR-D-011: 3.4 S3 and
   or ``probe_lease_s`` when the caller gives no deadline: a probe that never reports cannot hold it
   forever, and a probe still inside its deadline is never joined by a second one.
   Probe success closes; a probe that hits a limit reopens with backoff (the key the limit names);
-  its lease is freed on whichever key held it; ``reset`` closes at once.
+  its lease is freed on whichever key held it; ``reset`` closes at once. A probe token is booked
+  once. A second ``record`` for that token, or a record whose token is no longer the current probe,
+  changes nothing: a late limit must not clear the lease a newer probe holds.
 
 The cooldown, lease and short-fault numbers are uncalibrated defaults (PRODUCT.md 11.2, B-10);
 this module does not claim to have measured anything. It is thread-safe: one lock guards all
@@ -83,9 +88,9 @@ class ConnectionBreaker:
         slots = [self._slot(connection, None), self._slot(connection, model)]
         # Claude's seven_day_opus / seven_day_sonnet signals use the family token as the model id
         # (claude_code._MODEL_FAMILY). A later request for another id in that family hits the same slot.
-        lower = model.lower()
+        # Family windows are tokens ("claude-opus-4"), not substrings ("notopus").
         for family in ("opus", "sonnet"):
-            if family in lower and family != model:
+            if family in _model_tokens(model) and family != model.lower():
                 slots.append(self._slot(connection, family))
         return tuple(slots)
 
@@ -131,6 +136,10 @@ class ConnectionBreaker:
         code = outcome.get("code")
         with self._lock:
             now = self._clock()
+            # Once, and only for the probe that still holds the lease. A replay or a stale token must
+            # not stack a failure or wipe the probe that replaced it.
+            if probe is not None and self._find_probe(probe) is None:
+                return "none"
             if code == c.PLAN_LIMIT and _is_signal(outcome.get("limit")):
                 until = self._open(connection, outcome["limit"], now, probe)
                 limit = outcome.get("limit")
@@ -139,7 +148,8 @@ class ConnectionBreaker:
                 return "opened"
             if code == c.SHORT_FAULT:
                 self._short[(connection, model, tenant)] = now + self._short_s
-                return self._release(probe, now) or "short_fault"
+                self._release(probe, now)
+                return "short_fault"
             if code is None:
                 return self._close_probe(probe) or "none"
             # Deadlines, engine errors, auth, protocol, exit: request-local. A probe that ends this way
@@ -153,11 +163,18 @@ class ConnectionBreaker:
         # it held does not refuse with PROBE_IN_FLIGHT while no probe runs.
         self._release(probe, now)
         rec = self._keys.setdefault(slot, {"state": CLOSED, "failures": 0, "probe": None, "lease_until": None})
-        rec["failures"] += 1
-        backoff = min(self._cooldown_s * 2 ** (rec["failures"] - 1), self._max_cooldown_s)
         reset_at = signal.get("reset_at")
         # reset_at is already on this clock. A raw vendor epoch that was not translated is far past
         # now + max_open_s and is capped here; adapters translate so a real reset is not the cap.
+        open_until = rec.get("open_until")
+        if rec["state"] == OPEN and isinstance(open_until, (int, float)) and now < open_until:
+            # One incident per open window. A later vendor reset can extend it; a cooldown is not stacked.
+            if reset_at is not None and reset_at > open_until:
+                rec["open_until"] = min(reset_at, now + self._max_open_s)
+            rec["source"] = signal["source"]
+            return rec["open_until"]
+        rec["failures"] += 1
+        backoff = min(self._cooldown_s * 2 ** (rec["failures"] - 1), self._max_cooldown_s)
         until = min(reset_at, now + self._max_open_s) if reset_at is not None and reset_at > now else now + backoff
         rec.update(state=OPEN, open_until=until, probe=None, lease_until=None, source=signal["source"])
         return until
@@ -204,6 +221,20 @@ class ConnectionBreaker:
             if rec["state"] == OPEN and self._clock() < rec["open_until"]:
                 return OPEN
             return HALF_OPEN
+
+
+def _model_tokens(model: str) -> set[str]:
+    token: list[str] = []
+    tokens: set[str] = set()
+    for ch in model.lower():
+        if ch.isalnum():
+            token.append(ch)
+        elif token:
+            tokens.add("".join(token))
+            token = []
+    if token:
+        tokens.add("".join(token))
+    return tokens
 
 
 def _is_signal(value: object) -> bool:

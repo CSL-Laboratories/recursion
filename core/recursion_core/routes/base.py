@@ -42,22 +42,37 @@ class RouteAdapter:
             return c.result(rid, err.code, detail=err.detail)
         try:
             process = self._launcher(argv, env=env, shell=False)
+        except c.RouteError as err:
+            return c.result(rid, err.code, detail=err.detail)
         except OSError as err:
             return c.result(rid, c.ENGINE_ERROR, detail=f"launch failed: {type(err).__name__}")
         events: list[dict] = []
         try:
-            return self.drive(process, request, deadline_at, events)
-        except Deadline:
-            process.fence("deadline")  # fenced for this request only; the breaker never hears of it
-            return c.result(rid, c.DEADLINE_EXCEEDED, events=events, detail="recursion deadline")
-        except _Protocol as err:
-            process.fence("protocol_error")
-            return c.result(rid, c.PROTOCOL_ERROR, events=events, detail=str(err))
-        except OSError as err:
-            # A child that exits before the request is written raises BrokenPipeError. That stays a
-            # typed result, and the process is fenced, instead of escaping the route boundary.
-            process.fence("io_error")
-            return c.result(rid, c.ENGINE_ERROR, events=events, detail=f"engine io: {type(err).__name__}")
+            try:
+                return self.drive(process, request, deadline_at, events)
+            except Deadline:
+                process.fence("deadline")  # fenced for this request only; the breaker never hears of it
+                return c.result(rid, c.DEADLINE_EXCEEDED, events=events, detail="recursion deadline")
+            except _Protocol as err:
+                process.fence("protocol_error")
+                return c.result(rid, c.PROTOCOL_ERROR, events=events, detail=str(err))
+            except OSError as err:
+                # A child that exits before the request is written raises BrokenPipeError. That stays a
+                # typed result, and the process is fenced, instead of escaping the route boundary.
+                process.fence("io_error")
+                return c.result(rid, c.ENGINE_ERROR, events=events, detail=f"engine io: {type(err).__name__}")
+            except Exception as err:
+                # A malformed envelope or a driver bug must not escape as an untyped exception, and
+                # must not leave the child running. The detail is the type name, never the message.
+                process.fence("internal")
+                return c.result(rid, c.ENGINE_ERROR, events=events, detail=type(err).__name__)
+            except BaseException:
+                process.fence("cancelled")
+                raise
+        finally:
+            drop = getattr(self, "_drop_process", None)
+            if drop is not None:
+                drop(process)
 
     # -- subclass hooks -----------------------------------------------------------------------
     def argv(self, request: dict) -> list[str]:

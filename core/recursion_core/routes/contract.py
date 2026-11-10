@@ -45,6 +45,7 @@ Limit signal (the only thing that can trip a connection's breaker)::
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Callable, Mapping
 
 CONTRACT_VERSION = "recursion.route/v0"
@@ -151,10 +152,21 @@ def validate_request(request: object) -> dict:
 
 
 def connection_key(route: Mapping) -> str:
-    """The meter a route is billed through: the login or key, never the engine id (grill Q8)."""
+    """The meter a route is billed through: the login or key, never the engine id alone (grill Q8)."""
 
     conn = route["connection"]
     return f"{conn['kind']}:{conn['id']}"
+
+
+def breaker_key(route: Mapping) -> str:
+    """Breaker slot: the engine plus :func:`connection_key`.
+
+    A connection id is a caller-chosen label. The same id on Claude Code and on Codex is not the
+    same meter, so the two must not share a slot. The id is still what fences every tenant on that
+    engine's meter, which is the CSL-608 lesson (not "drop the engine and collide vendors").
+    """
+
+    return f"{route['engine']}:{connection_key(route)}"
 
 
 def vendor_reset(epoch: object, clock: Callable[[], float], wall: Callable[[], float]) -> float | None:
@@ -164,12 +176,15 @@ def vendor_reset(epoch: object, clock: Callable[[], float], wall: Callable[[], f
     seconds (``time.time``). The same function for both leaves the number unchanged, which is what
     the fakes do. A non-finite value, or a reset that is already past on ``clock``, becomes None so
     the breaker uses its own cooldown instead of treating a real epoch as eight days away.
+    Both clocks are read once: a second read would move a monotonic clock forward and could reject
+    a reset that was still in the future at the first read.
     """
 
     if isinstance(epoch, bool) or not isinstance(epoch, (int, float)) or not math.isfinite(float(epoch)):
         return None
-    translated = clock() + (float(epoch) - wall())
-    if not math.isfinite(translated) or translated <= clock():
+    now_clock, now_wall = clock(), wall()
+    translated = now_clock + (float(epoch) - now_wall)
+    if not math.isfinite(translated) or translated <= now_clock:
         return None
     return translated
 
@@ -185,7 +200,9 @@ def limit_signal(scope: str, source: str, *, model: str | None = None, reset_at:
 
 
 def event(kind: str, source: str, data: Mapping | None = None) -> dict:
-    return {"kind": kind, "source": source, "data": dict(data or {})}
+    raw = dict(data or {})
+    return {"kind": kind, "source": source, "data": {key: redact(value) if isinstance(value, str) else value
+                                                     for key, value in raw.items()}}
 
 
 def result(request_id: str, code: str | None, *, text: str = "", limit: dict | None = None,
@@ -200,17 +217,47 @@ def result(request_id: str, code: str | None, *, text: str = "", limit: dict | N
         "text": text,
         "limit": limit,
         "events": list(events or []),
-        "detail": detail,
+        "detail": redact(detail),
         "retry_at": retry_at,
         "breaker_effect": "none",
         "limit_notice": None,
     }
 
 
-# Words that sound like a quota. Seen outside the model payload (a typed error envelope's free text),
+# Phrases that sound like a quota. Seen outside the model payload (a typed error envelope's free text),
 # they make at most a SHORT_FAULT on one model for one tenant (grill Q23); they never make a PLAN_LIMIT.
-_QUOTA_WORDS = ("quota", "rate limit", "rate-limit", "usage limit", "limit reached", "exhausted", "too many requests")
+# Matched on word boundaries so "unexhausted" is not "exhausted", and an immediate "not" / "never"
+# cancels the hit ("not exhausted" is not a quota). "no quota" stays a hit: the word "no" is the
+# claim, not a denial.
+_QUOTA = re.compile(
+    r"(?<![A-Za-z0-9])(?:quotas?|rate[\s-]*limits?|usage limits?|limits? reached|exhausted|too many requests)(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+_QUOTA_NEGATED = re.compile(r"(?:^|[^A-Za-z0-9])(?:not|never|n't)\s+$", re.IGNORECASE)
+# Vendor and custody strings that must not ride along in a result detail or an event.
+_SECRET = re.compile(
+    r"sk-[A-Za-z0-9_\-]{8,}"
+    r"|AKIA[0-9A-Z]{16}"
+    r"|ASIA[0-9A-Z]{16}"
+    r"|(?:Bearer|bearer)\s+[A-Za-z0-9._\-]{8,}"
+    r"|ghp_[A-Za-z0-9]{20,}"
+    r"|github_pat_[A-Za-z0-9_]{20,}"
+    r"|xox[baprs]-[A-Za-z0-9\-]{10,}"
+    r"|ya29\.[A-Za-z0-9._\-]{10,}"
+)
+
+
+def redact(value: str) -> str:
+    """Replace credential-shaped substrings. Connection ids and ordinary error codes are left as they are."""
+
+    return _SECRET.sub("[redacted]", value)
 
 
 def sounds_like_quota(text: object) -> bool:
-    return isinstance(text, str) and any(word in text.lower() for word in _QUOTA_WORDS)
+    if not isinstance(text, str):
+        return False
+    for match in _QUOTA.finditer(text):
+        if _QUOTA_NEGATED.search(text[:match.start()]):
+            continue
+        return True
+    return False

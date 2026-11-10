@@ -359,7 +359,7 @@ class LimitsTest(unittest.TestCase):
         h = Harness(limited_then(codex_script("codex answer")))
         h.handle(request())
         h.clock.advance(500)
-        self.assertIsNotNone(h.breaker.admit("subscription:login-A", "claude-sonnet", "t9")["probe"])
+        self.assertIsNotNone(h.breaker.admit("claude_code:subscription:login-A", "claude-sonnet", "t9")["probe"])
         asked = h.handle(request(rid="r2"))
         self.assertEqual(asked["code"], c.PROBE_IN_FLIGHT)
         self.assertEqual(asked["limit_notice"]["on_limit"], "ask")
@@ -379,7 +379,7 @@ class LimitsTest(unittest.TestCase):
                 seen.append("limit")
                 return claude_limit(reset_at=1_000_500.0)
             h.clock.advance(599)
-            seen.append(h.breaker.admit("subscription:login-A", "claude-sonnet", "t2", deadline_s=600)["code"])
+            seen.append(h.breaker.admit("claude_code:subscription:login-A", "claude-sonnet", "t2", deadline_s=600)["code"])
             return claude_ok("probe")
 
         h = Harness(scripts)

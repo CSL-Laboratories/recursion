@@ -32,7 +32,7 @@ MAX_FALLBACK = 8
 # for one tenant for a minute (grill Q23), not a subscription limit, so it is not offered as a switch
 # point, including the breaker's refusal while that short fence holds.
 LIMIT_CODES = (c.PLAN_LIMIT, c.BREAKER_OPEN, c.PROBE_IN_FLIGHT)
-_ROUTE_KEYS = {"engine", "model", "connection", "profile", "home", "bare", "api_key_helper", "billing_ack"}
+_ROUTE_KEYS = {"engine", "model", "connection", "profile", "home", "bare", "api_key_helper", "billing_ack", "wrapper"}
 
 
 def validate_limits(limits: object) -> dict:
@@ -50,7 +50,7 @@ def validate_limits(limits: object) -> dict:
         raise c.RouteError(c.REQUEST_INVALID, "route.limits.fallback is empty: nothing the user chose to switch to")
     routes = []
     for entry in fallback:
-        if not isinstance(entry, Mapping) or set(entry) - _ROUTE_KEYS:
+        if not isinstance(entry, Mapping) or set(entry) - _ROUTE_KEYS or not _valid_wrapper(entry.get("wrapper")):
             raise c.RouteError(c.REQUEST_INVALID, "route.limits.fallback entry")
         probe = {"contract": c.CONTRACT_VERSION, "request_id": "limits", "tenant": "limits", "prompt": "-",
                  "deadline_s": 1.0, "route": dict(entry)}
@@ -90,6 +90,34 @@ def notice(result: Mapping, route: Mapping, limits: Mapping) -> dict | None:
         "switched_to": None,
         "attempts": [here],
     }
+
+
+def _valid_wrapper(value: object) -> bool:
+    """A fallback may carry the Pi/Hermes pin: the in-process object, or the same fields as JSON."""
+
+    if value is None:
+        return True
+    if isinstance(value, Mapping):
+        pin = value.get("pin")
+        files = pin.get("package_files") if isinstance(pin, Mapping) else None
+        return (
+            isinstance(value.get("launcher_path"), str) and bool(value["launcher_path"])
+            and isinstance(value.get("install_root"), str) and bool(value["install_root"])
+            and isinstance(pin, Mapping)
+            and isinstance(pin.get("launcher_sha256"), str) and bool(pin["launcher_sha256"])
+            and isinstance(files, list)
+            and all(
+                isinstance(item, (list, tuple)) and len(item) == 2 and all(isinstance(part, str) and part for part in item)
+                for item in files
+            )
+        )
+    pin = getattr(value, "pin", None)
+    return (
+        isinstance(getattr(value, "launcher_path", None), str) and bool(value.launcher_path)
+        and isinstance(getattr(value, "install_root", None), str) and bool(value.install_root)
+        and isinstance(getattr(pin, "launcher_sha256", None), str) and bool(pin.launcher_sha256)
+        and isinstance(getattr(pin, "package_files", None), tuple)
+    )
 
 
 def _refusal_scope(result: Mapping) -> str:

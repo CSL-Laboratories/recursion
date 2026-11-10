@@ -20,9 +20,10 @@ engine), 11.2 (breaker, plan limits), Q12 (Claude subscription only inside Claud
   `account/rateLimits/read`, `account/rateLimits/updated` and typed JSON-RPC / turn errors.
   A named `limitId` is the breaker key. An `api_key` route ignores a ChatGPT-auth error from the
   rate-limit read and still runs the turn.
-- `breaker.py`: `ConnectionBreaker`, keyed by the connection a route is billed through
-  (`subscription:<login>` or `api_key:<key id>`), per model only when the typed signal names a per-model
-  vendor bucket. Never keyed by engine id or tenant.
+- `breaker.py`: `ConnectionBreaker`. The service passes `engine:kind:id` (`contract.breaker_key`), so
+  two engines that reuse one connection id do not share a slot. Within an engine the slot is the
+  connection (`subscription:<login>` or `api_key:<key id>`), and per model only when the typed signal
+  names a per-model vendor bucket. Never keyed by tenant, and never by engine id alone.
 - `profile_route.py`: Pi, Hermes and OpenCode routes; every launch goes through
   `recursion_core.subscription_routes.guard_then_spawn` (B3, CSL-786), so a Claude-subscription provider is
   refused as `subscription_route_refused` before the launcher is called. Pi and Hermes also pass
@@ -43,8 +44,12 @@ engine), 11.2 (breaker, plan limits), Q12 (Claude subscription only inside Claud
 - Recursion's own deadline is `deadline_exceeded`: the run is fenced (`EngineProcess.fence`) for that
   request only and the breaker is not told. Other engine failures are request-local too.
 - Recovery: an open key always has a finite end (`reset_at` on the breaker clock, capped; otherwise a
-  300 s cooldown doubling to 3600 s). Vendor `resetsAt` is Unix epoch and is translated onto that clock
-  before it is stored, so a monotonic deadline clock does not turn one limit into an 8-day fence.
+  300 s cooldown doubling to 3600 s). Another typed limit while that window still holds is the same
+  incident: it does not stack the cooldown. A probe that runs after the window and hits a limit again
+  is the next incident. A probe token is booked once; a late record for a token that is no longer
+  current does not change the key. Vendor `resetsAt` is Unix epoch and is translated onto that clock
+  (one sample of each clock) before it is stored, so a monotonic deadline clock does not turn one
+  limit into an 8-day fence.
   Then one leased half-open probe at a time (lease = the time still left on the request's deadline
   plus 30 s, 11.2 C1-18; 150 s only when no deadline is given); success closes, a limit
   reopens, a lease that expires lets the next request probe; `reset()` closes at once. These numbers are
@@ -105,7 +110,7 @@ model, scope, reset time, choices). When the vendor sent no reset, `wait` uses t
 end. `route.limits` or the service default sets `on_limit`: `ask` (default:
 nothing else runs), `wait` (nothing else runs; re-submit at `reset_at`) or `fallback` (the user's own
 `fallback` routes in the user's order, each switch shown as a `fallback` event and `switched_to`).
-Every attempt shares the request's one deadline. Nothing picks a route by itself; `fallback` with an empty list is refused.
+Every attempt shares the request's one deadline. Nothing picks a route by itself; `fallback` with an empty list is refused. A fallback entry may carry `wrapper` (the Pi/Hermes pin, as the measured object or the same fields in JSON). A request id that is already running is refused (`launch_refused`, detail `request in flight`) instead of launching a second child. `RouteService.shutdown()` fences children still in flight and refuses later requests. Details and event fields are redacted when they contain a credential-shaped string. Vague quota text matches a whole word or phrase, so `unexhausted` and `not exhausted` are not short faults. `no quota` still is.
 
 Lesson: [CSL-608](https://linear.app/csl-laboratories/issue/CSL-608) (Done research) found master's breaker
 keyed by engine, shared by every tenant and never reset. This module does not claim to have measured

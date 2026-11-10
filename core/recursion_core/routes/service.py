@@ -7,6 +7,7 @@ contract result with a typed code, so the same tests can drive a later port thro
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable, Mapping
 
 from recursion_core.routes import contract as c
@@ -21,6 +22,49 @@ class RouteService:
         self._adapters, self._breaker, self._clock = dict(adapters), breaker, clock
         # The user's default limit behaviour; a request's own route.limits overrides it. Default: ask.
         self._limits = lim.validate_limits(limits if limits is not None else lim.DEFAULT_LIMITS)
+        self._gate = threading.Lock()
+        self._closed = False
+        self._live: set = set()
+        self._inflight: set[str] = set()
+        for adapter in self._adapters.values():
+            adapter._drop_process = self._drop_process
+            adapter._launcher = self._wrap_launcher(adapter._launcher)
+
+    def shutdown(self) -> None:
+        """Refuse later requests and fence every child this service still has."""
+
+        with self._gate:
+            self._closed = True
+            live = list(self._live)
+        for proc in live:
+            try:
+                proc.fence("shutdown")
+            except Exception:
+                pass
+            self._drop_process(proc)
+
+    def _wrap_launcher(self, inner):
+        def launch(argv, **kwargs):
+            with self._gate:
+                closed = self._closed
+            if closed:
+                raise c.RouteError(c.LAUNCH_REFUSED, "shutdown")
+            proc = inner(argv, **kwargs)
+            with self._gate:
+                if self._closed:
+                    try:
+                        proc.fence("shutdown")
+                    except Exception:
+                        pass
+                    raise c.RouteError(c.LAUNCH_REFUSED, "shutdown")
+                self._live.add(proc)
+            return proc
+
+        return launch
+
+    def _drop_process(self, proc) -> None:
+        with self._gate:
+            self._live.discard(proc)
 
     def handle(self, request: object) -> dict:
         rid = request.get("request_id") if isinstance(request, Mapping) else None
@@ -30,6 +74,20 @@ class RouteService:
             limits = lim.validate_limits(req["route"]["limits"]) if "limits" in req["route"] else self._limits
         except c.RouteError as err:
             return c.result(rid, err.code, detail=err.detail)
+        with self._gate:
+            if self._closed:
+                return c.result(req["request_id"], c.LAUNCH_REFUSED, detail="shutdown")
+            if req["request_id"] in self._inflight:
+                # A second run of the same id would book a second attempt and launch another child.
+                return c.result(req["request_id"], c.LAUNCH_REFUSED, detail="request in flight")
+            self._inflight.add(req["request_id"])
+        try:
+            return self._handle_locked(req, limits)
+        finally:
+            with self._gate:
+                self._inflight.discard(req["request_id"])
+
+    def _handle_locked(self, req: dict, limits: Mapping) -> dict:
         # One absolute deadline for the request, shared by every fallback. A later attempt does not
         # get a fresh deadline_s (11.2: the request stops at the deadline the caller set).
         deadline_at = self._clock() + float(req["deadline_s"])
@@ -65,7 +123,8 @@ class RouteService:
         adapter = self._adapters.get(route["engine"])
         if adapter is None:
             return c.result(rid, c.ENGINE_UNKNOWN, detail=f"no adapter for {route['engine']}")
-        connection, model, tenant = c.connection_key(route), route["model"], req["tenant"]
+        # engine:kind:id, not kind:id. Two engines labelled with the same id are different meters.
+        connection, model, tenant = c.breaker_key(route), route["model"], req["tenant"]
         remaining = deadline_at - self._clock()
         if remaining <= 0:
             return c.result(rid, c.DEADLINE_EXCEEDED, detail="recursion deadline")

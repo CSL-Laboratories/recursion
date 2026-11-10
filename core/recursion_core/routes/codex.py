@@ -93,7 +93,8 @@ class CodexAdapter(RouteAdapter):
                 # ChatGPT auth is required for this read. An API-key session is rejected with wording
                 # that sounds like a quota ("rate limits"), which would short-fault every such request
                 # before a turn. Ignore that one error on an api_key route and continue.
-                if kind != "api_key":
+                # A typed usage limit or an auth failure is not that error: it still stops the turn.
+                if kind != "api_key" or _typed_limit_or_auth(err.error):
                     raise
                 events.append(c.event("usage", "codex.account/rateLimits/read", {
                     "ignored": scalar(err.error.get("message"))}))
@@ -103,7 +104,8 @@ class CodexAdapter(RouteAdapter):
             if limit is not None:
                 return c.result(rid, c.PLAN_LIMIT, limit=limit, events=events, detail="limit before turn")
             thread = rpc.call("thread/start", {"model": model})
-            thread_id = thread.get("thread", {}).get("id") if isinstance(thread, dict) else None
+            inner = thread.get("thread") if isinstance(thread, dict) else None
+            thread_id = inner.get("id") if isinstance(inner, dict) else None
             if not isinstance(thread_id, str):
                 raise _Protocol("thread/start returned no thread id")
             rpc.call("turn/start", {"threadId": thread_id, "input": [{"type": "text", "text": request["prompt"]}]})
@@ -147,7 +149,8 @@ class _Rpc:
         while True:
             msg = self._next()
             if msg.get("method") == "turn/completed":
-                turn = (msg.get("params") or {}).get("turn") or {}
+                params = _object(msg.get("params"), "turn/completed params")
+                turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
                 if turn.get("status") == "completed":
                     return c.result(rid, None, text="".join(self.text), events=self.events)
                 error = turn.get("error") if isinstance(turn.get("error"), dict) else {}
@@ -161,7 +164,8 @@ class _Rpc:
         return msg
 
     def _notification(self, msg: dict) -> None:
-        method, params = msg.get("method"), msg.get("params") or {}
+        method = msg.get("method")
+        params = _object(msg.get("params"), "notification params")
         if "id" in msg and isinstance(method, str):  # a server request (e.g. an approval): not supported here
             self.process.send(json.dumps({"id": msg["id"], "error": {"code": -32601, "message": "unsupported"}}))
             self.events.append(c.event("server_request_refused", "codex.jsonrpc", {"method": method}))
@@ -169,7 +173,7 @@ class _Rpc:
             self.limit = _exhausted(params.get("rateLimits"), "codex.account/rateLimits/updated",
                                     self.events, self.adapter.vendor_reset) or self.limit
         elif method == "item/completed":
-            item = params.get("item") or {}
+            item = params.get("item") if isinstance(params.get("item"), dict) else {}
             if item.get("type") == "agentMessage" and isinstance(item.get("text"), str):
                 self.text.append(item["text"])  # model payload: kept as the answer, never classified
 
@@ -193,11 +197,30 @@ def _exhausted(snapshot: object, source: str, events: list, translate) -> dict |
     return c.limit_signal("connection", source, reset_at=reset_at)
 
 
-def _classify_error(rid: str, error: dict, limit: dict | None, events: list, model: str) -> dict:
+def _object(value: object, what: str) -> dict:
+    """A JSON object field. ``None`` is an empty object; a list or a string is a protocol error."""
+
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    raise _Protocol(f"{what} is not an object")
+
+
+def _error_info(error: dict) -> object:
     data = error.get("data") if isinstance(error.get("data"), dict) else {}
     info = error.get("codexErrorInfo", data.get("codexErrorInfo"))
     if isinstance(info, dict):  # a tagged variant: {"usageLimitExceeded": {...}} (shape unverified)
         info = next(iter(info), None)
+    return info
+
+
+def _typed_limit_or_auth(error: dict) -> bool:
+    return _error_info(error) in (*_LIMIT_ERRORS, *_AUTH_ERRORS)
+
+
+def _classify_error(rid: str, error: dict, limit: dict | None, events: list, model: str) -> dict:
+    info = _error_info(error)
     if info in _AUTH_ERRORS:
         return c.result(rid, c.AUTH_FAILED, events=events, detail=str(info))
     if info in _LIMIT_ERRORS:

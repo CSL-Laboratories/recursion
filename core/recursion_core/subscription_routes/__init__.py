@@ -1,7 +1,7 @@
 """Claude-subscription route refusal for Pi, Hermes and OpenCode profiles, plus the 2026-11-08 Copilot and Nous
-own-loop routes and the 2026-11-09 wrapper pins (CSL-786, candidate). See README.md."""
+own-loop routes and the 2026-11-09 wrapper pins (CSL-786, candidate). The Gemini CLI route was dropped by
+owner call; Antigravity CLI is the Google route. See README.md."""
 
-from recursion_core.subscription_routes.gemini_cli import GeminiCliRefused, check_gemini_cli_sign_in
 from recursion_core.subscription_routes.own_loop import (
     COPILOT_STRIP_ENV,
     COPILOT_TOKEN_ENV,
@@ -46,8 +46,6 @@ __all__ = [
     "check_copilot_own_loop",
     "check_nous_own_loop",
     "nous_proxy_doctor",
-    "GeminiCliRefused",
-    "check_gemini_cli_sign_in",
     "AntigravityPin",
     "PackagePin",
     "WrapperInstall",

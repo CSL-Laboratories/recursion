@@ -44,8 +44,12 @@ replacement. It builds the child environment from nothing:
 The engine is an explicit profile id, never inferred from argv (ledger CX-082: a
 first-token guess let wrapped or renamed argv through). An unknown engine refuses.
 
-POSIX only. On Windows the ownership checks the rules rely on do not exist here, so
-every call refuses (``platform_unsupported``) instead of passing values unchecked.
+POSIX only. On Windows (``os.name == "nt"``) every call refuses
+(``platform_unsupported``) instead of passing values unchecked. The ownership,
+symlink-owner and ``0o077`` mode checks run only where ``os.geteuid`` exists.
+Where it does not, those helpers refuse (``owner_check_unsupported``, or a false
+owned-chain / private-dir result): they never return True and never invent a uid.
+A Windows SID/DACL backend is future work.
 
 Candidate code: no engine, provider or network is used, and nothing here claims the
 new core's runtime calls it yet.
@@ -57,6 +61,7 @@ import ipaddress
 import os
 import re
 import shutil
+import socket
 import stat
 import tempfile
 import threading
@@ -325,6 +330,10 @@ def build_child_env(
     meets exactly the value, PATH, NO_PROXY and temp rules an inherited value meets.
     """
 
+    # Windows has no euid and no Unix mode bits these rules read, so the call
+    # refuses instead of passing values unchecked. A SID/DACL backend is future
+    # work. Helpers that would call os.geteuid refuse on their own if it is missing;
+    # they do not run on this path.
     if os.name == "nt":
         raise EnvRefused(None, "platform_unsupported")
     profile = ENGINE_PROFILES.get(engine) if isinstance(engine, str) else None
@@ -479,6 +488,38 @@ def _trusted_origins(value: object) -> frozenset[tuple[str, str, int]] | None:
     return frozenset(origins)
 
 
+def _canonical_ipv4(host: str) -> bool:
+    """Four decimal octets, 0-255, no leading zero (``10.1.2.3``, ``0.0.0.0``)."""
+
+    parts = host.split(".")
+    if len(parts) != 4:
+        return False
+    for part in parts:
+        if not part.isdigit() or (len(part) > 1 and part[0] == "0") or int(part) > 255:
+            return False
+    return True
+
+
+def _noncanonical_numeric_ipv4(host: str) -> bool:
+    """A numeric IPv4 spelling that is not four decimal octets.
+
+    ``socket.inet_aton`` accepts hex (``0x0a010203``), octal (``010.1.2.3``), a single
+    integer (``2130706433``) and a short form (``10.1``, ``10.0``). A host that is only
+    digits and dots, or a ``0x`` form, and is not canonical, is the same kind of address.
+    A name (``gateway.invalid``) is not.
+    """
+
+    if _canonical_ipv4(host):
+        return False
+    if re.fullmatch(r"[0-9.]+", host) or re.fullmatch(r"0x[0-9a-f.]+", host):
+        return True
+    try:
+        socket.inet_aton(host)
+    except OSError:
+        return False
+    return True
+
+
 def _bad_bracket_host(host: str) -> bool:
     """A bracketed host that is not an IPv6 address (``[:::]``, ``[1:2:3]``): no engine could reach it.
 
@@ -506,6 +547,11 @@ def _unsafe_base_url(value: object) -> str | None:
     if match["userinfo"] is not None:
         return "base_url_userinfo"
     if _bad_bracket_host(match["host"]):
+        return "base_url_malformed"
+    # Hex, octal, a single integer and a short dotted form (``10.1``, ``0x0a010203``)
+    # are not the four-decimal address some clients parse them into. Refuse them
+    # here so a NO_PROXY CIDR for the canonical address cannot be skipped.
+    if not match["host"].startswith("[") and _noncanonical_numeric_ipv4(match["host"]):
         return "base_url_malformed"
     if match["port"] is not None and not 0 < int(match["port"]) < 65536:
         return "base_url_malformed"
@@ -540,6 +586,21 @@ def _unsafe_value(name: str, value: str) -> str | None:
     return None
 
 
+def _posix_euid() -> int | None:
+    """Effective uid where the POSIX owner and mode checks can run, else None.
+
+    Windows has no ``os.geteuid``. None is not a pass and not a stand-in for uid 0.
+    Callers refuse the path (``owner_check_unsupported``, or a false owned-chain /
+    private-dir result) instead of accepting one the uid, symlink-owner or ``0o077``
+    checks would refuse. A Windows SID/DACL backend is future work.
+    """
+
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is None:
+        return None
+    return geteuid()
+
+
 def _resolve(path: str) -> tuple[str | None, bool, str | None]:
     """Resolve ``path`` one component at a time: (real path, leaf missing, cause).
 
@@ -547,13 +608,19 @@ def _resolve(path: str) -> tuple[str | None, bool, str | None]:
     directory whose own chain no one else can write; so must every directory a ``..`` steps back out of,
     in the value or in a link's target; no step may enter a perspective path. A missing
     component ends the walk: the rest cannot be a link yet, and the caller decides whether that is safe.
+
+    Without ``os.geteuid`` the symlink-owner check cannot be done, so the walk does not start and the
+    path is refused (``owner_check_unsupported``). That does not accept a link the POSIX rule would refuse.
     """
 
     if not os.path.isabs(path):
         return None, False, "value_relative"
     if _PERSPECTIVE.match(path):
         return None, False, "value_perspective"
-    euid, hops = os.geteuid(), 0
+    euid = _posix_euid()
+    if euid is None:
+        return None, False, "owner_check_unsupported"
+    hops = 0
     pending = list(reversed(Path(path).parts[1:]))
     current = "/"
     while pending:
@@ -601,7 +668,10 @@ def _unsafe_file(path: str) -> str | None:
     if missing:  # harmless only where no one else can create it
         return None if _owned_chain(_existing_ancestor(real)) else "value_missing"
     st = os.stat(real)
-    if not stat.S_ISREG(st.st_mode) or st.st_uid not in (0, os.geteuid()) or st.st_mode & 0o022:
+    euid = _posix_euid()
+    if euid is None:
+        return "owner_check_unsupported"  # do not read 0o022 as a pass when the mode bits are not Unix
+    if not stat.S_ISREG(st.st_mode) or st.st_uid not in (0, euid) or st.st_mode & 0o022:
         return "value_file_unsafe"
     return None if _owned_chain(os.path.dirname(real)) else "value_chain_unsafe"
 
@@ -657,23 +727,102 @@ def _no_proxy_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | N
         return None
 
 
-def _no_proxy_network(entry: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network | None:
-    """A CIDR entry, or None. Host bits may be set (``10.1.2.3/8``); the prefix is what is matched."""
+def _host_addrs(host: str) -> tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, ...]:
+    """The host as an IP, plus the IPv4 address inside an IPv4-mapped IPv6 host.
 
-    if "/" not in entry:
+    ``[::ffff:10.1.2.3]`` is also ``10.1.2.3``, so an IPv4 entry or CIDR can exempt it.
+    """
+
+    address = _no_proxy_ip(host)
+    if address is None:
+        return ()
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        return (address, address.ipv4_mapped)
+    return (address,)
+
+
+def _ipv4_shorthand_network(entry: str) -> ipaddress.IPv4Network | None:
+    """requests-style IPv4 CIDR: ``socket.inet_aton`` on the address, then the mask.
+
+    ``10.0/8`` is ``10.0.0.0/8``. ``ipaddress`` rejects that shorthand. A prefix of 0
+    (``0/0``, ``10.0/0``) is the whole IPv4 family.
+    """
+
+    if entry.count("/") != 1:
+        return None
+    addr, bits_s = entry.split("/", 1)
+    if not addr or not bits_s.isdigit():
+        return None
+    bits = int(bits_s)
+    if not 0 <= bits <= 32:
+        return None
+    try:
+        packed = socket.inet_aton(addr)
+    except OSError:
+        return None
+    return ipaddress.IPv4Network((ipaddress.IPv4Address(packed), bits), strict=False)
+
+
+def _no_proxy_network(entry: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network | None:
+    """A CIDR entry, or None. Host bits may be set (``10.1.2.3/8``); the prefix is what is matched.
+
+    A prefix length of 0 covers that whole address family (``0.0.0.0/0``, ``::/0``).
+    The bare entry ``/0`` is not a network; the caller treats it as every IP.
+    """
+
+    if "/" not in entry or entry == "/0":
         return None
     try:
         return ipaddress.ip_network(entry, strict=False)
     except ValueError:
-        return None
+        return _ipv4_shorthand_network(entry)
 
 
 def _network_covers(network: ipaddress.IPv4Network | ipaddress.IPv6Network, hosts: tuple[str, ...]) -> bool:
     for host in hosts:
-        address = _no_proxy_ip(host)
-        if address is not None and address.version == network.version and address in network:
-            return True
+        for address in _host_addrs(host):
+            if address.version == network.version and address in network:
+                return True
     return False
+
+
+def _no_proxy_entries(value: str) -> tuple[str, ...]:
+    """Every entry either reading would see. A hit in either refuses.
+
+    Commas and whitespace split the curl / hyper-util reading. requests <=2.32.3
+    deletes spaces first (``replace(' ', '').split(',')``), so ``gate way.invalid``
+    is the one entry ``gateway.invalid``.
+    """
+
+    lowered = value.strip().lower()
+    spaced = [part for part in re.split(r"[,\s]+", lowered) if part]
+    packed = [part for part in lowered.replace(" ", "").split(",") if part]
+    seen: list[str] = []
+    for part in spaced + packed:
+        if part not in seen:
+            seen.append(part)
+    return tuple(seen)
+
+
+def _idna_forms(label: str) -> set[str] | None:
+    """ASCII, punycode and unicode spellings of one host or entry.
+
+    None means a non-ASCII label will not encode. The caller refuses: while a proxy
+    is set, an entry that cannot be compared must not be kept.
+    """
+
+    forms = {label.rstrip(".")}
+    try:
+        forms.add(label.encode("idna").decode("ascii").rstrip("."))
+    except UnicodeError:
+        if any(ord(ch) > 127 for ch in label):
+            return None
+    if label.isascii():
+        try:
+            forms.add(label.encode("ascii").decode("idna").rstrip("."))
+        except UnicodeError:
+            pass
+    return {form for form in forms if form}
 
 
 def _normalize_no_proxy_entry(entry: str) -> str:
@@ -691,39 +840,84 @@ def _normalize_no_proxy_entry(entry: str) -> str:
     return re.sub(r":[0-9]*$", "", entry.strip("[]")).rstrip(".")
 
 
+def _names_match(entry: str, host: str) -> bool:
+    """Host match, including a plain suffix with no dot boundary.
+
+    requests <=2.32.3 uses ``hostname.endswith(entry)`` (and the same with the port
+    still attached). ``ateway.invalid`` therefore exempts ``gateway.invalid``. This
+    check follows that reading, because a child may still run that requests. A dot
+    boundary (``host == bare`` or ``host.endswith('.' + bare)``) is included in it.
+    IDNA spellings are compared both ways (``bücher.invalid`` and ``xn--bcher-kva.invalid``).
+    """
+
+    entry_forms = _idna_forms(entry)
+    host_forms = _idna_forms(host)
+    if entry_forms is None or host_forms is None:
+        return True  # cannot compare a non-ASCII label: refuse
+    for bare in entry_forms:
+        bare = bare.lstrip(".")
+        if not bare:
+            continue
+        address = _no_proxy_ip(bare)
+        mapped = address.ipv4_mapped if isinstance(address, ipaddress.IPv6Address) else None
+        for form in host_forms:
+            if form == bare or form.endswith(bare):
+                return True
+            for host_ip in _host_addrs(form):
+                if address is not None and host_ip == address:
+                    return True
+                if mapped is not None and host_ip == mapped:
+                    return True
+    return False
+
+
 def _no_proxy_bypass(value: str, hosts: tuple[str, ...]) -> str | None:
-    """N5i: comma and whitespace split; the union of curl, requests, hyper-util, undici and Codex matchers.
+    """N5i: the union of curl, requests, hyper-util, undici and Codex matchers.
 
     ``hosts`` is the engine's own endpoints plus the route base host, when the route has one. A CIDR entry
-    matches an IP host it contains (curl, requests and hyper-util). It does not match a domain name: none of
-    those matchers resolve DNS. Two spellings of one IP address match (``::1`` and ``0:0:0:0:0:0:0:1``).
+    matches an IP host it contains (curl, requests and hyper-util), including a requests shorthand
+    (``10.0/8``) and an IPv4-mapped route host (``[::ffff:10.1.2.3]``). It does not match a domain name:
+    none of those matchers resolve DNS. ``/0`` covers every IP of both families. Two spellings of one IP
+    address match (``::1`` and ``0:0:0:0:0:0:0:1``). A plain suffix matches without a dot boundary, which is
+    what requests <=2.32.3 does.
     """
 
     checked = tuple(_no_proxy_host(host) for host in hosts)
-    for raw in re.split(r"[,\s]+", value.strip().lower()):
+    for raw in _no_proxy_entries(value):
         entry = re.sub(r"^[a-z][a-z0-9+.-]*://", "", raw)
         if not entry:
             continue
+        if entry == "/0":
+            if any(_host_addrs(host) for host in checked):
+                return "no_proxy_engine_host"
+            continue
         network = _no_proxy_network(entry)
         if network is not None:
+            if network.prefixlen == 0 and any(
+                address.version == network.version for host in checked for address in _host_addrs(host)
+            ):
+                return "no_proxy_engine_host"
             if _network_covers(network, checked):
                 return "no_proxy_engine_host"
             continue
         entry = _normalize_no_proxy_entry(entry)
         if not entry:
             continue
+        if _idna_forms(entry) is None or any(_idna_forms(host) is None for host in checked):
+            return "no_proxy_engine_host"
         if entry.strip("*.") == "":
             return "no_proxy_wildcard"
         if "*" in entry:
+            # ``*`` is ``.*``, so a glob in the middle crosses dots (``gate*invalid`` matches
+            # ``gateway.invalid``). That is wider than a shell glob and is kept on purpose.
             pattern = re.compile(".*".join(re.escape(part) for part in entry.split("*")) + r"\Z")
-            hit = any(pattern.match(host) for host in checked)
+            forms: list[str] = []
+            for host in checked:
+                host_forms = _idna_forms(host)
+                forms.extend(host_forms or ())
+            hit = any(pattern.match(host) for host in forms)
         else:
-            bare = entry.lstrip(".")
-            address = _no_proxy_ip(bare)
-            hit = any(
-                host == bare or host.endswith("." + bare) or (address is not None and _no_proxy_ip(host) == address)
-                for host in checked
-            )
+            hit = any(_names_match(entry, host) for host in checked)
         if hit:
             return "no_proxy_engine_host"
     return None
@@ -749,9 +943,16 @@ def _owned_chain(path: str) -> bool:
 
     A root-owned sticky directory above it (``/tmp``) may be world-writable: there only an entry's owner can
     rename the entry (OpenSSH ``safe_path``). Same rule as the Nov 5 tree's ``transport._owned_chain``.
+
+    POSIX only. Where ``os.geteuid`` is missing, the uid and ``0o022`` bits this rule reads are not
+    available, so the chain is not accepted. False here is a refusal, not a pass: a path the POSIX
+    rule would refuse must not be accepted because the check could not be run.
     """
 
-    euid, parts = os.geteuid(), Path(path).parts
+    euid = _posix_euid()
+    if euid is None:
+        return False
+    parts = Path(path).parts
     try:
         for i in range(1, len(parts) + 1):
             st = os.lstat(os.path.join(*parts[:i]))
@@ -783,6 +984,9 @@ def _lexical_dir(path: str) -> str:
 
 
 def _private_dir(path: str | None) -> bool:
+    # No euid: do not treat a directory as private, and do not read 0o077 as a pass.
+    if _posix_euid() is None:
+        return False
     if not isinstance(path, str) or not os.path.isabs(path):
         return False
     entry = _lexical_dir(path)  # the home itself may not be a link, whatever the trailing spelling
@@ -799,7 +1003,10 @@ def _private_dir(path: str | None) -> bool:
         return False
     # The home is ours and 0700. Its parents follow the chain rule on the resolved path, so an accepted link
     # above it (macOS /var -> private/var) is fine, and a root sticky /tmp above it is fine.
-    return stat.S_ISDIR(st.st_mode) and st.st_uid == os.geteuid() and not st.st_mode & 0o077 and _owned_chain(real)
+    euid = _posix_euid()
+    if euid is None:
+        return False
+    return stat.S_ISDIR(st.st_mode) and st.st_uid == euid and not st.st_mode & 0o077 and _owned_chain(real)
 
 
 _TMP: dict[int, str] = {}
@@ -840,7 +1047,9 @@ def _route_tmp() -> str:
             st = os.lstat(path) if path else None
         except OSError:
             st = None
-        if (st is None or not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077
+        euid = _posix_euid()
+        # No euid: do not read 0o077 as a pass. The replacement below refuses when no base is owned.
+        if (euid is None or st is None or not stat.S_ISDIR(st.st_mode) or st.st_uid != euid or st.st_mode & 0o077
                 or not _owned_chain(path)):
             path = _TMP[key] = _make_route_tmp()
         return path

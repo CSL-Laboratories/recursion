@@ -58,7 +58,12 @@ Spec: CSLR-D-011, PRODUCT.md `055cc7a5c793b7135e5d0565dc4198cf96230531` (SHA-256
 - The old route transport (`scripts/v3/route_contract/transport.py`) is frozen and
   unchanged; it still passes `os.environ.copy()`.
 
-POSIX only. On Windows every call refuses with `platform_unsupported`.
+POSIX only. On Windows every call refuses with `platform_unsupported` instead of
+passing values the ownership rules cannot judge. A Windows SID/DACL backend is
+future work. Until then the directory-owner, symlink-owner and mode `0o077` checks
+run only where `os.geteuid` exists. Where it does not, they refuse
+(`owner_check_unsupported`, or the owned-chain and private-dir checks return
+false). They never return true and never invent a uid.
 
 ## Auth mode and the route
 
@@ -95,11 +100,29 @@ Foundry switches are dropped. The child gets one only from the route:
   route a URL that meets this rule is set as it is. On a `subscription` route it must also
   pass the rule in [Subscription base URL](#subscription-base-url).
 - **`NO_PROXY` includes the route host.** While a proxy is set (`HTTP_PROXY`, `HTTPS_PROXY`,
-  `ALL_PROXY`, or the lowercase names), `NO_PROXY` / `no_proxy` is checked against the route
-  base host as well as the engine's own endpoints. `NO_PROXY=gateway.invalid` cannot send
-  `https://gateway.invalid` around the proxy (`no_proxy_engine_host`). A CIDR entry matches an
-  IP host it contains (`10.0.0.0/8` covers `10.1.2.3`, `::1/128` covers `::1`) and does not
-  match a domain name. With no proxy set, `NO_PROXY` is kept as it is.
+  `ALL_PROXY`, or the lowercase names), both `NO_PROXY` and `no_proxy` are checked against the
+  route base host as well as the engine's own endpoints. Either name is enough to refuse.
+  `NO_PROXY=gateway.invalid` cannot send `https://gateway.invalid` around the proxy
+  (`no_proxy_engine_host`). A CIDR matches an IP it contains (`10.0.0.0/8` covers `10.1.2.3`,
+  `::1/128` covers `::1`), including a requests shorthand (`10.0/8` via `socket.inet_aton`) and
+  the IPv4 address inside `[::ffff:10.1.2.3]`. A prefix of 0 covers that whole address family
+  (`0.0.0.0/0`, `::/0`); a bare `/0` covers every IP of both families. A CIDR does not match a
+  domain name. A bracketed IPv6 entry (`[::1]`) is that address. IDNA spellings match
+  (`bücher.invalid` and `xn--bcher-kva.invalid`). A non-ASCII entry that will not encode refuses.
+  With no proxy set, `NO_PROXY` is kept as it is.
+  The match is the union of the readers, and it over-refuses on purpose:
+  - ports are dropped, so `gateway.invalid:9` matches `gateway.invalid`;
+  - a `*` in the middle is `.*`, so `gate*invalid` matches `gateway.invalid` across the dot;
+  - an entry that is only `*`, `.`, or both (`*`, `*.`, `**`, `.*`) is `no_proxy_wildcard`;
+  - a scheme is stripped, so `http://gateway.invalid` is `gateway.invalid`;
+  - spaces are deleted the way requests does, so `gate way.invalid` is `gateway.invalid`;
+  - a plain suffix needs no dot boundary. That is requests <=2.32.3 (`hostname.endswith(entry)`),
+    and this check follows it because a child may still run that requests. `ateway.invalid`
+    therefore exempts `gateway.invalid`. A minimum requests version is not assumed.
+  `corp.internal`, `localhost`, `127.0.0.1` and `::1` do not match a remote name such as
+  `gateway.invalid`, and the list is kept.
+  `npm_config_no_proxy`, `NPM_CONFIG_NO_PROXY` and `GLOBAL_AGENT_NO_PROXY` are not on the
+  allowlist, so they are dropped and are not read as bypass lists.
 - **Key custody.** This package is the launch boundary only. It never reads the OS keyring or
   the owner-only key file (A44), and does no keyring or file I/O. The caller fetches the
   user-entered key from the OS keyring, or from the owner-only file on a host with no

@@ -11,6 +11,7 @@ import os
 import shutil
 import stat
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -34,6 +35,7 @@ from recursion_core.child_env.tests import cells
 def _running_as_root() -> bool:
     geteuid = getattr(os, "geteuid", None)
     return geteuid is not None and geteuid() == 0
+
 
 
 FAKE = "fake-value-not-a-credential"
@@ -104,7 +106,7 @@ class CellTests(unittest.TestCase):
         self._assert_all(self._group("bracket_host_ok"), 5)
 
     def test_no_proxy_covers_the_route_host_and_cidr_cells(self) -> None:
-        self._assert_all(self._group("no_proxy_route"), 5)
+        self._assert_all(self._group("no_proxy_route"), 9)
         self._assert_all(self._group("no_proxy_route_ok"), 5)
 
     def test_a_dot_dot_out_of_a_directory_others_can_write_is_refused(self) -> None:
@@ -133,6 +135,92 @@ class CellTests(unittest.TestCase):
 
 
 class ProfileTests(unittest.TestCase):
+    """Names, counts and the Windows refusal. No private home and no os.geteuid."""
+
+    def test_allowlist_counts(self) -> None:
+        # 29 Nov 5 names + ALL_PROXY, all_proxy, XDG_RUNTIME_DIR (PRODUCT.md 055cc7a5 section 3.8, C1-46).
+        self.assertEqual(32, len(BASE_NAMES))
+        self.assertEqual(32, len(set(BASE_NAMES)))
+        self.assertLessEqual({"ALL_PROXY", "all_proxy", "XDG_RUNTIME_DIR"}, set(BASE_NAMES))
+        self.assertEqual(BASE_NAMES + CLAUDE_TLS_NAMES, ENGINE_PROFILES["claude_code"].allowed)
+        self.assertEqual(BASE_NAMES, ENGINE_PROFILES["codex"].allowed)
+        self.assertEqual({"CLAUDE_CODE_CLIENT_CERT", "CLAUDE_CODE_CLIENT_KEY", "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE",
+                          "CLAUDE_CODE_CERT_STORE"}, set(CLAUDE_TLS_NAMES))
+
+    def test_npm_and_global_agent_no_proxy_are_not_allowlisted(self) -> None:
+        """These names are not NO_PROXY. Nothing copies them, so they are not a second bypass list."""
+
+        blocked = {"npm_config_no_proxy", "NPM_CONFIG_NO_PROXY", "GLOBAL_AGENT_NO_PROXY"}
+        self.assertFalse(blocked & set(BASE_NAMES))
+        for profile in ENGINE_PROFILES.values():
+            self.assertFalse(blocked & set(profile.allowed))
+            self.assertFalse(blocked & set(profile.passthrough))
+
+    def test_codex_scrub_names_are_listed(self) -> None:
+        self.assertLessEqual({"CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI_API_KEY"}, set(ENGINE_PROFILES["codex"].scrub))
+        self.assertLessEqual({"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"}, set(ENGINE_PROFILES["claude_code"].scrub))
+        for profile in ENGINE_PROFILES.values():
+            self.assertFalse(set(profile.scrub) & set(profile.allowed), profile.engine)
+
+    def test_validated_env_cannot_be_hand_made(self) -> None:
+        with self.assertRaises(TypeError):
+            ValidatedEnv({"PATH": "/usr/bin"}, "codex", ())
+
+    def test_windows_refuses_instead_of_passing_values_unchecked(self) -> None:
+        with mock.patch("recursion_core.child_env.policy.os.name", "nt"), self.assertRaises(EnvRefused) as caught:
+            build_child_env("codex", home="C:\\x", auth_mode=SUB, parent={})
+        self.assertEqual("platform_unsupported", caught.exception.cause)
+
+    def test_missing_geteuid_refuses_without_attribute_error(self) -> None:
+        """No os.geteuid (Windows, or this deletion): refuse, do not raise, do not accept.
+
+        A 0700 directory the POSIX rule would accept is not accepted. A 0777 directory
+        the POSIX rule would refuse is not accepted either. Symlink resolution and the
+        0o077 mode check take the same fallback.
+        """
+
+        had = hasattr(os, "geteuid")
+        saved = getattr(os, "geteuid", None)
+        if had:
+            delattr(os, "geteuid")
+        try:
+            self.assertFalse(hasattr(os, "geteuid"))
+            home = tempfile.mkdtemp(prefix="csl785-noeuid-")
+            self.addCleanup(shutil.rmtree, home, True)
+            os.chmod(home, 0o700)
+            with self.assertRaises(EnvRefused) as caught:
+                build_child_env("codex", home=home, auth_mode=SUB, parent={"PATH": "/usr/bin"})
+            # os.name is still posix, so the Windows early return does not run. The home helper
+            # refuses because it cannot see an owner. It does not raise AttributeError.
+            self.assertEqual(("HOME", "home_unsafe"), (caught.exception.name, caught.exception.cause))
+            self.assertIs(False, policy._owned_chain(home))
+            self.assertIs(False, policy._private_dir(home))
+            os.chmod(home, 0o777)
+            self.assertIs(False, policy._owned_chain(home))
+            self.assertIs(False, policy._private_dir(home))
+            link = os.path.join(home, "link")
+            try:
+                os.symlink(home, link)
+            except OSError:
+                link = home
+            self.assertEqual((None, False, "owner_check_unsupported"), policy._resolve(link))
+            cert = os.path.join(home, "cert.pem")
+            with open(cert, "w", encoding="ascii") as handle:
+                handle.write("not a real certificate\n")
+            os.chmod(cert, 0o600)
+            self.assertEqual("owner_check_unsupported", policy._unsafe_file(cert))
+            self.assertEqual("owner_check_unsupported", policy._unsafe_dir(home))
+            with self.assertRaises(EnvRefused) as caught:
+                policy._route_tmp()
+            self.assertEqual(("TMPDIR", "tmp_root_unsafe"), (caught.exception.name, caught.exception.cause))
+        finally:
+            if had and saved is not None:
+                setattr(os, "geteuid", saved)
+
+@unittest.skipUnless(hasattr(os, "geteuid"), "POSIX owner and mode checks need os.geteuid")
+class ProfilePosixTests(unittest.TestCase):
+    """Owner, mode and home fixtures. Production Windows never reaches these: it refuses with platform_unsupported."""
+
     def test_unknown_or_wrapped_engines_refuse(self) -> None:
         home = _home(self)
         for engine in ("claude", "Codex", "env", "sh", "npx", "codex-cli", "", None, "pi", "hermes", "opencode"):
@@ -165,16 +253,6 @@ class ProfileTests(unittest.TestCase):
                 self.assertEqual(set(profile.passthrough), {k for k, v in env.to_dict().items() if v == FAKE})
                 self.assertLessEqual(set(planted) - set(profile.passthrough), set(env.dropped))
                 self.assertNotIn(FAKE, repr(env))
-
-    def test_allowlist_counts(self) -> None:
-        # 29 Nov 5 names + ALL_PROXY, all_proxy, XDG_RUNTIME_DIR (PRODUCT.md 055cc7a5 section 3.8, C1-46).
-        self.assertEqual(32, len(BASE_NAMES))
-        self.assertEqual(32, len(set(BASE_NAMES)))
-        self.assertLessEqual({"ALL_PROXY", "all_proxy", "XDG_RUNTIME_DIR"}, set(BASE_NAMES))
-        self.assertEqual(BASE_NAMES + CLAUDE_TLS_NAMES, ENGINE_PROFILES["claude_code"].allowed)
-        self.assertEqual(BASE_NAMES, ENGINE_PROFILES["codex"].allowed)
-        self.assertEqual({"CLAUDE_CODE_CLIENT_CERT", "CLAUDE_CODE_CLIENT_KEY", "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE",
-                          "CLAUDE_CODE_CERT_STORE"}, set(CLAUDE_TLS_NAMES))
 
     def test_users_own_oauth_token_passes_to_claude_unchanged(self) -> None:
         """PRODUCT.md 055cc7a5 3.3 (Nov 8 fleet correction): the user's CLAUDE_CODE_OAUTH_TOKEN stays as it is."""
@@ -277,12 +355,6 @@ class ProfileTests(unittest.TestCase):
         with self.assertRaises(EnvRefused) as caught:
             build_child_env("claude_code", home=home, auth_mode=SUB, parent={"PATH": "/usr/bin"}, overrides={"CLAUDE_CODE_SIMPLE": "1"})
         self.assertEqual(("CLAUDE_CODE_SIMPLE", "override_denied"), (caught.exception.name, caught.exception.cause))
-
-    def test_codex_scrub_names_are_listed(self) -> None:
-        self.assertLessEqual({"CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI_API_KEY"}, set(ENGINE_PROFILES["codex"].scrub))
-        self.assertLessEqual({"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"}, set(ENGINE_PROFILES["claude_code"].scrub))
-        for profile in ENGINE_PROFILES.values():
-            self.assertFalse(set(profile.scrub) & set(profile.allowed), profile.engine)
 
     def test_engine_hosts_differ_per_profile(self) -> None:
         home = _home(self)
@@ -478,14 +550,6 @@ class ProfileTests(unittest.TestCase):
         os.symlink("certs/../ca.pem", safe / "owned-via")
         self.assertIsNone(policy._unsafe_file(f"{safe}/owned-via"))
 
-    def test_validated_env_cannot_be_hand_made(self) -> None:
-        with self.assertRaises(TypeError):
-            ValidatedEnv({"PATH": "/usr/bin"}, "codex", ())
-
-    def test_windows_refuses_instead_of_passing_values_unchecked(self) -> None:
-        with mock.patch("recursion_core.child_env.policy.os.name", "nt"), self.assertRaises(EnvRefused) as caught:
-            build_child_env("codex", home="C:\\x", auth_mode=SUB, parent={})
-        self.assertEqual("platform_unsupported", caught.exception.cause)
 
 
 @unittest.skipIf(os.name == "nt", "POSIX rules")
@@ -565,6 +629,11 @@ class AuthRouteTests(unittest.TestCase):
                ("ftp://gateway.invalid", "base_url_malformed"), ("file:///etc/passwd", "base_url_malformed"),
                ("https://gateway.invalid/api?key=v", "base_url_malformed"), ("https://gateway.invalid/#f", "base_url_malformed"),
                ("https://gateway.invalid:0", "base_url_malformed"), ("https://gateway.invalid:99999", "base_url_malformed"),
+               ("http://10.1", "base_url_malformed"), ("http://10.1.2", "base_url_malformed"),
+               ("http://10", "base_url_malformed"), ("http://0x0a010203", "base_url_malformed"),
+               ("http://0x7f000001", "base_url_malformed"), ("http://0x7f.0.0.1", "base_url_malformed"),
+               ("http://010.1.2.3", "base_url_malformed"), ("http://2130706433", "base_url_malformed"),
+               ("http://08.1.2.3", "base_url_malformed"), ("http://256.1.2.3", "base_url_malformed"),
                ("https://gateway.invalid/a/../b", "base_url_malformed"), ("https://gateway.invalid/a b", "base_url_malformed"),
                ("https://gateway.invalid\n", "base_url_malformed"), ("https://gateway.invalid\0", "base_url_malformed"),
                ("", "base_url_malformed"), (b"https://gateway.invalid", "base_url_malformed"), (7, "base_url_malformed"))
@@ -668,7 +737,17 @@ class AuthRouteTests(unittest.TestCase):
             (".invalid", gateway, API, {}),
             ("https://Gateway.Invalid:443", gateway, API, {}),
             ("::1", ChildRoute(api_key=USER_KEY, base_url="https://[::1]:8443/v1/"), API, {}),
+            ("[::1]", ChildRoute(api_key=USER_KEY, base_url="http://[::1]:4000"), API, {}),
+            ("[::1]:4000", ChildRoute(api_key=USER_KEY, base_url="https://[::1]:8443/v1/"), API, {}),
             ("::1", ChildRoute(api_key=USER_KEY, base_url="https://[0:0:0:0:0:0:0:1]"), API, {}),
+            ("*.invalid", gateway, API, {}),
+            ("gateway.*", gateway, API, {}),
+            ("invalid", gateway, API, {}),
+            ("ateway.invalid", gateway, API, {}),  # requests <=2.32.3: endswith, no dot boundary
+            ("gate way.invalid", gateway, API, {}),  # requests deletes spaces before splitting
+            ("gateway.invalid:9", gateway, API, {}),
+            ("gate*invalid", gateway, API, {}),
+            ("http://gateway.invalid", gateway, API, {}),
             ("10.1.2.3", ChildRoute(api_key=USER_KEY, base_url="http://10.1.2.3:4000"), API, {}),
             ("gateway.invalid", ChildRoute(base_url="https://gateway.invalid/api",
                                             trusted_base_urls=("https://gateway.invalid",)), SUB, {}),
@@ -683,6 +762,11 @@ class AuthRouteTests(unittest.TestCase):
                          refused({**proxy, "no_proxy": "gateway.invalid"}, gateway, auth_mode=API))
         self.assertEqual(("NO_PROXY", "no_proxy_engine_host"),
                          refused({"ALL_PROXY": "socks5://127.0.0.1:1080", "NO_PROXY": "gateway.invalid"}, gateway, auth_mode=API))
+        # A bare "*" refuses with no_proxy_wildcard, and so does an entry that is only stars and dots.
+        for star in ("*", "*.", "**", ".*"):
+            with self.subTest(star=star):
+                self.assertEqual(("NO_PROXY", "no_proxy_wildcard"),
+                                 refused({**proxy, "NO_PROXY": star}, gateway, auth_mode=API))
         self.assertEqual(("NO_PROXY", "no_proxy_engine_host"),
                          refused({"NO_PROXY": "gateway.invalid"}, gateway, auth_mode=API,
                                  overrides={"HTTPS_PROXY": "http://proxy.invalid:8080"}))
@@ -693,6 +777,12 @@ class AuthRouteTests(unittest.TestCase):
             ("::1/128", "http://[::1]:4000"),
             ("::/0", "https://[2001:db8::1]"),
             ("::1/128", "https://[0:0:0:0:0:0:0:1]"),
+            ("10.0/8", "http://10.1.2.3:4000"),  # requests shorthand: inet_aton("10.0") is 10.0.0.0
+            ("10.0.0.0/8", "http://[::ffff:10.1.2.3]:4000"),
+            ("10.1.2.3", "http://[::ffff:10.1.2.3]:4000"),
+            ("/0", "http://10.1.2.3:4000"),
+            ("/0", "http://[::1]:4000"),
+            ("0.0.0.0/0", "http://[::ffff:192.0.2.1]"),
         )
         for entry, url in cidr_cases:
             with self.subTest(entry=entry, url=url):
@@ -707,6 +797,12 @@ class AuthRouteTests(unittest.TestCase):
             ({**proxy, "NO_PROXY": "notgateway.invalid,gateway.invalid.example"}, gateway, API),
             ({**proxy, "NO_PROXY": "0.0.0.0/0,::/0"}, ChildRoute(api_key=USER_KEY, base_url="https://gateway.invalid/api"), API),
             ({**proxy, "NO_PROXY": "10.0.0.0/8"}, None, SUB),
+            ({**proxy, "NO_PROXY": "corp.internal,localhost,127.0.0.1,::1"}, gateway, API),
+            ({**proxy, "NO_PROXY": "192.168/16"}, ChildRoute(api_key=USER_KEY, base_url="http://10.1.2.3:4000"), API),
+            ({**proxy, "NO_PROXY": "11.0.0.0/8"}, ChildRoute(api_key=USER_KEY, base_url="http://[::ffff:10.1.2.3]"), API),
+            ({**proxy, "NO_PROXY": "/0"}, gateway, API),
+            ({**proxy, "NO_PROXY": "münchen.example"},
+             ChildRoute(api_key=USER_KEY, base_url="https://xn--bcher-kva.invalid/api"), API),
         )
         for parent, route, mode in kept:
             with self.subTest(parent=parent.get("NO_PROXY"), mode=mode, route=bool(route)):
@@ -717,10 +813,44 @@ class AuthRouteTests(unittest.TestCase):
         # Codex has no base URL here. A private CIDR still does not match its domain endpoints.
         env = build_child_env("codex", home=home, auth_mode=SUB, parent={"PATH": "/usr/bin", **proxy, "NO_PROXY": "10.0.0.0/8"})
         self.assertEqual("10.0.0.0/8", env["NO_PROXY"])
+        # Either name is enough. The other may name something that does not match.
+        self.assertEqual(("no_proxy", "no_proxy_engine_host"),
+                         refused({**proxy, "NO_PROXY": "localhost", "no_proxy": "gateway.invalid"}, gateway, auth_mode=API))
+        self.assertEqual(("NO_PROXY", "no_proxy_engine_host"),
+                         refused({**proxy, "NO_PROXY": "gateway.invalid", "no_proxy": "localhost"}, gateway, auth_mode=API))
+        # Plain suffix, no dot: the route host itself ends with the entry.
+        self.assertEqual(("NO_PROXY", "no_proxy_engine_host"),
+                         refused({**proxy, "NO_PROXY": "gateway.invalid"},
+                                 ChildRoute(api_key=USER_KEY, base_url="https://notgateway.invalid/api"), auth_mode=API))
+        puny = ChildRoute(api_key=USER_KEY, base_url="https://xn--bcher-kva.invalid/api")
+        for entry in ("bücher.invalid", "xn--bcher-kva.invalid"):
+            with self.subTest(entry=entry):
+                self.assertEqual(("NO_PROXY", "no_proxy_engine_host"),
+                                 refused({**proxy, "NO_PROXY": entry}, puny, auth_mode=API))
+        # A non-ASCII entry that will not encode cannot be compared, so it refuses.
+        self.assertEqual(("NO_PROXY", "no_proxy_engine_host"),
+                         refused({**proxy, "NO_PROXY": "\uffff.invalid"}, gateway, auth_mode=API))
+        # A canonical IPv4 route is still a route. The shorthand and mapped forms above are what refuse.
+        self.assertEqual("http://10.1.2.3:4000",
+                         launched({**proxy, "NO_PROXY": "192.168/16"},
+                                  ChildRoute(api_key=USER_KEY, base_url="http://10.1.2.3:4000"), auth_mode=API)[URL])
         # Trust still runs first: an untrusted subscription base refuses before the proxy check.
         self.assertEqual((URL, "route_base_url_untrusted"),
                          refused({**proxy, "NO_PROXY": "gateway.invalid"},
                                  ChildRoute(base_url="https://gateway.invalid/api"), auth_mode=SUB))
+
+    def test_npm_and_global_agent_no_proxy_names_are_dropped(self) -> None:
+        home = _home(self)
+        blocked = ("npm_config_no_proxy", "NPM_CONFIG_NO_PROXY", "GLOBAL_AGENT_NO_PROXY")
+        parent = {"PATH": "/usr/bin", **{name: "gateway.invalid" for name in blocked}}
+        env = build_child_env("claude_code", home=home, auth_mode=SUB, parent=parent)
+        for name in blocked:
+            self.assertNotIn(name, env)
+            self.assertIn(name, env.dropped)
+            for engine in ENGINE_PROFILES:
+                with self.subTest(engine=engine, name=name):
+                    self.assertEqual((name, "override_not_allowed"), self._refused(
+                        engine, home, auth_mode=SUB, parent={"PATH": "/usr/bin"}, overrides={name: "gateway.invalid"}))
 
     def test_ambient_keys_are_dropped_in_every_mode(self) -> None:
         home = _home(self)
@@ -881,7 +1011,7 @@ class AuthRouteTests(unittest.TestCase):
 
     def test_child_env_reads_no_keyring_and_no_key_file(self) -> None:
         # Key custody: the caller fetches the key (OS keyring, or the owner-only file); this package is handed it.
-        allowed = {"__future__", "ipaddress", "os", "re", "shutil", "stat", "subprocess", "tempfile", "threading", "collections.abc",
+        allowed = {"__future__", "ipaddress", "os", "re", "shutil", "socket", "stat", "subprocess", "tempfile", "threading", "collections.abc",
                    "dataclasses", "pathlib", "types", "recursion_core.child_env.policy", "recursion_core.child_env.launch"}
         for module in (policy, launch):
             tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
@@ -1133,6 +1263,44 @@ class SubscriptionBaseUrlTests(unittest.TestCase):
         self.assertEqual("ChildRoute(api_key=<none>, base_url=<none>, provider_switches=<0>, trusted_base_urls=<?>, "
                          "full_access_acknowledged=<no>)",
                          repr(ChildRoute(trusted_base_urls="https://gateway.invalid", full_access_acknowledged="yes")))
+
+    def test_recorded_behaviour_for_trailing_dot_full_access_and_trusted_path(self) -> None:
+        """What the code does today for three cases whose semantics are not chosen here.
+
+        Trailing-dot host: origin comparison keeps the dot. ``https://gateway.invalid.``
+        does not trust ``https://gateway.invalid``, and ``https://api.anthropic.com.`` is
+        not official. NO_PROXY comparison strips the dot, so ``gateway.invalid.`` exempts
+        the route host ``gateway.invalid``.
+
+        Non-bool full access: ``"true"``, ``1`` and ``"yes"`` are not an acknowledgment.
+        They refuse with ``route_full_access_malformed`` even when the origin is trusted.
+
+        Trusted entry with a path: ``https://gateway.invalid/api`` refuses the whole list
+        with ``route_trusted_base_urls_malformed``. The same path on the base URL is not
+        part of the origin, so ``https://gateway.invalid`` trusts ``https://gateway.invalid/api``.
+        """
+
+        home = _home(self)
+        plain = "https://gateway.invalid/api"
+        dotted = "https://gateway.invalid."
+        self.assertEqual(self.UNTRUSTED, self._refused(home, base_url=plain, trusted_base_urls=(dotted,)))
+        self.assertEqual(self.UNTRUSTED, self._refused(home, base_url="https://api.anthropic.com."))
+        self.assertEqual(dotted + "/v1", self._launched(home, base_url=dotted + "/v1", trusted_base_urls=(dotted,))[URL])
+        route = ChildRoute(api_key=USER_KEY, base_url=plain)
+        with self.assertRaises(EnvRefused) as caught:
+            build_child_env("claude_code", home=home, auth_mode=API, route=route,
+                            parent={"PATH": "/usr/bin", "HTTPS_PROXY": "http://127.0.0.1:3128", "NO_PROXY": "gateway.invalid."})
+        self.assertEqual(("NO_PROXY", "no_proxy_engine_host"), (caught.exception.name, caught.exception.cause))
+        for value in ("true", 1, "yes"):
+            with self.subTest(value=value):
+                self.assertEqual((None, "route_full_access_malformed"),
+                                 self._refused(home, base_url=plain, trusted_base_urls=("https://gateway.invalid",),
+                                               full_access_acknowledged=value))
+        self.assertEqual(plain, self._launched(home, base_url=plain, full_access_acknowledged=True)[URL])
+        self.assertEqual((None, "route_trusted_base_urls_malformed"),
+                         self._refused(home, base_url=plain, trusted_base_urls=("https://gateway.invalid/api",)))
+        self.assertEqual(plain, self._launched(home, base_url=plain, trusted_base_urls=("https://gateway.invalid",))[URL])
+        self.assertEqual(plain, self._launched(home, base_url=plain, trusted_base_urls=("https://gateway.invalid/",))[URL])
 
 
 @unittest.skipIf(os.name == "nt", "POSIX rules")

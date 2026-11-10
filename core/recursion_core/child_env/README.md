@@ -3,8 +3,8 @@
 New-core child environment for engine children. Candidate code: not yet called by a
 running core, and not reviewed or accepted.
 
-Spec: CSLR-D-011, PRODUCT.md `055cc7a5c793b7135e5d0565dc4198cf96230531` (SHA-256
-`e64783152f6d67d4ede774dc41d112fe46c2d7536d53cb2c04e71a3566044daf`), section 3.3.
+Spec: CSLR-D-012, PRODUCT.md `d84cdd26a4de2366f3c5d34c4aec5215f822a494` (SHA-256
+`e1d5fb8c02594b2ca88281113ffc14e6f3125daded2a00d45739cfb9d2ed04dd`), section 3.3.
 
 - `policy.build_child_env(engine, home=..., auth_mode=..., route=..., parent=...)` builds the
   child environment from an exact-name allowlist per engine profile (`claude_code`, `codex`),
@@ -23,10 +23,10 @@ Spec: CSLR-D-011, PRODUCT.md `055cc7a5c793b7135e5d0565dc4198cf96230531` (SHA-256
   certificate, its private key and the passphrase are carried from the parent and cannot be
   set by an override (`override_denied`); for a Codex child the certificate name is not on
   the allowlist at all (`override_not_allowed`).
-- `CLAUDE_CODE_SIMPLE` is on the Claude scrub list by name (PRODUCT.md 055cc7a5 section 3.3), so
+- `CLAUDE_CODE_SIMPLE` is on the Claude scrub list by name (PRODUCT.md d84cdd26 section 3.3), so
   it never reaches a Claude Code child and an override naming it is refused.
 - The user's own `CLAUDE_CODE_OAUTH_TOKEN` reaches a Claude Code child unchanged when the
-  parent has it (PRODUCT.md 055cc7a5 section 3.3, Nov 8 fleet correction: nothing removes a
+  parent has it (PRODUCT.md d84cdd26 section 3.3, Nov 8 fleet correction: nothing removes a
   built-in sign-in method from every run). This passthrough is accepted (owner call). What
   holds in every auth mode:
   - absent in the parent means absent in the child;

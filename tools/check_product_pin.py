@@ -20,6 +20,7 @@ import json
 import re
 import subprocess
 import sys
+import unicodedata
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -31,6 +32,17 @@ KEYS = {"format", "status", "repository", "path", "commit", "sha256", "claim", "
 PINNED_FIELDS = ("path", "commit", "sha256", "claim")
 COMMIT = re.compile(r"[0-9a-f]{40}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
+GIT_TIMEOUT_SECONDS = 60
+
+
+def _unsafe_text(text: str) -> bool:
+    """True when text holds a control character (NUL included) or a lone surrogate."""
+    return any(unicodedata.category(char) in ("Cc", "Cs") for char in text)
+
+
+def _printable(text: object) -> str:
+    """Escape whatever print() could not encode (a lone surrogate) and any NUL."""
+    return str(text).encode("utf-8", "backslashreplace").decode("utf-8").replace("\0", "\\x00")
 
 
 def errors(pin: object) -> list[str]:
@@ -65,6 +77,8 @@ def errors(pin: object) -> list[str]:
             parts = path.split("/")
             if path.startswith("/") or "\\" in path or {"", ".", ".."} & set(parts):
                 out.append("path must be a relative posix path inside the repository")
+            if _unsafe_text(path):
+                out.append("path must not contain control characters or lone surrogates")
         if not isinstance(pin.get("commit"), str) or not COMMIT.fullmatch(pin["commit"]):
             out.append("commit must be a full 40-hex lowercase SHA")
         if not isinstance(pin.get("sha256"), str) or not SHA256.fullmatch(pin["sha256"]):
@@ -87,7 +101,13 @@ def vault_errors(pin: dict, vault: Path) -> list[str]:
             ["git", "-C", str(vault), "show", spec],
             check=True,
             capture_output=True,
+            timeout=GIT_TIMEOUT_SECONDS,
         ).stdout
+    except subprocess.TimeoutExpired:
+        return [f"cannot read {spec!a} from {str(vault)!a}: git timed out after {GIT_TIMEOUT_SECONDS} seconds"]
+    except ValueError as exc:
+        # A NUL byte or a lone surrogate in the path or the vault cannot be passed to git.
+        return [f"cannot read {spec!a} from {str(vault)!a}: {_printable(exc)}"]
     except (OSError, subprocess.CalledProcessError) as exc:
         detail = exc.stderr.decode("utf-8", "replace").strip() if hasattr(exc, "stderr") else exc
         return [f"cannot read {spec} from {vault}: {detail}"]
@@ -106,14 +126,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         pin = json.loads(args.pin.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        print(f"FAIL: cannot read {args.pin}: {exc}")
+        print(_printable(f"FAIL: cannot read {args.pin}: {exc}"))
         return 1
     problems = errors(pin)
     if not problems and args.vault is not None:
         problems = vault_errors(pin, args.vault)
     if problems:
         for problem in problems:
-            print(f"FAIL: {problem}")
+            print(_printable(f"FAIL: {problem}"))
         return 1
     print(f"PASS: product pin is {pin['status']}")
     return 0

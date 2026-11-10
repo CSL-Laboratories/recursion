@@ -114,18 +114,28 @@ Foundry switches are dropped. The child gets one only from the route:
     `127.0.0.0/8`, `::1` and IPv4-mapped loopback (`[::ffff:127.0.0.1]`), in any spelling.
     `NO_PROXY=127.*` on such a route launches. Any other IPv6 embedding of an IPv4 address
     (`[::127.0.0.1]`, `[64:ff9b::7f00:1]`) is not loopback and is refused by design (fail closed).
-  - An all-address CIDR block counts as `*` on any route, with or without a `base_url`, loopback
-    or not, for either engine: it refuses with `no_proxy_wildcard`. These are `0.0.0.0/0`, `::/0`,
-    `::ffff:0:0/96` (every IPv4-mapped address) and any IPv6 block that holds it (`::/64`, `::/1`),
-    in any spelling (`[::]/0`, `10.0.0.0/0`, `::ffff:0.0.0.0/96`). A block that holds less
-    (`0.0.0.0/1`, `128.0.0.0/1`, `8000::/1`, `2000::/3`, `::ffff:0:0/97`) is not one.
+  - CIDR entries that cover every IPv4 address count as `*` on any route, with or without a
+    `base_url`, loopback or not, for either engine: they refuse with `no_proxy_wildcard`. The
+    cover is all of IPv4 (`0.0.0.0/0`) or, in IPv6, all of one of the three blocks that carry
+    IPv4 addresses: `::ffff:0:0/96` (IPv4-mapped), `64:ff9b::/96` (NAT64) and `::/96`
+    (IPv4-compatible). It can be a single block (`0.0.0.0/0`, `::/0`, `::/64`, `64:ff9b::/95`, in
+    any spelling: `[::]/0`, `10.0.0.0/0`, `::ffff:0.0.0.0/96`) or the union of the blocks in one
+    variable's value (`0.0.0.0/1,128.0.0.0/1`, `::ffff:0:0/97 ::ffff:8000:0/97`), in any order,
+    with duplicates or overlaps. A bare address joins the union as a single-address block.
+    `NO_PROXY` and `no_proxy` are each judged alone, and IPv4 and IPv6 blocks are not combined.
+    Blocks that leave a gap (`0.0.0.0/1`, `0.0.0.0/1,192.0.0.0/2`, `8000::/1`, `2000::/3`,
+    `::ffff:0:0/97`, `64:ff9b::/97`, `::/97`) are not a cover.
+  - An entry that contains `/` and is not a valid CIDR block also refuses with
+    `no_proxy_wildcard` (fail closed: a matcher may read it as a block): `0/0`, `10.0.0.0/33`,
+    `::/129`, `abc/8`, `10.0.0.0/`, `/8`. That includes a name with a trailing slash or a path
+    (`example.com/`, `http://example.com/`, `.corp/path`); write the bare name instead.
   - Any other CIDR block never matches a host name: nothing is resolved here. It is checked for
     the route host only; the engine's own hosts are names.
-  - `*` or an all-address block (`no_proxy_wildcard`) and an engine-host entry
-    (`no_proxy_engine_host`) are checked first, in both names, and keep their cause when a
+  - `*`, an all-address cover or a malformed `/` entry (`no_proxy_wildcard`) and an engine-host
+    entry (`no_proxy_engine_host`) are checked first, in both names, and keep their cause when a
     route-host entry is also present.
-  - Unchanged: with no proxy set nothing here refuses, and with no route `base_url` only an
-    all-address block does. Lookalikes
+  - Unchanged: with no proxy set nothing here refuses, and with no route `base_url` only the
+    `no_proxy_wildcard` and engine-host rules do. Lookalikes
     (`notgateway.example`, `gateway.example.evil`) and a child of the host
     (`api.gateway.example` for `gateway.example`) are not refused.
 - **Key custody.** This package is the launch boundary only. It never reads the OS keyring or

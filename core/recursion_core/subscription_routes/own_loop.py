@@ -23,10 +23,11 @@ answered by a caller-supplied probe (``has_copilot_login``), and with no probe t
 from __future__ import annotations
 
 import ipaddress
+import threading
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 __all__ = [
     "COPILOT_TOKEN_ENV",
@@ -54,7 +55,20 @@ _COPILOT_FIELDS = frozenset({"engine", "auth", "method", "model"})
 _NOUS_FIELDS = frozenset({"engine", "auth", "method", "base_url", "adapters", "model"})
 _TOKEN_HINTS = ("token", "key", "secret", "bearer", "password", "credential", "authorization")
 # Proxy settings would send a loopback-bound request to another host (proxy-aware clients honour them).
-_PROXY_ENV = frozenset({"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "FTP_PROXY", "SOCKS_PROXY", "SOCKS5_PROXY"})
+_PROXY_ENV = frozenset({
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "FTP_PROXY", "SOCKS_PROXY", "SOCKS5_PROXY", "GRPC_PROXY", "WS_PROXY",
+    "WSS_PROXY",
+})
+# Base-URL overrides that would point the child at a paid or remote API the decision does not name.
+_BASE_URL_ENV = frozenset({
+    "OPENAI_BASE_URL", "OPENAI_API_BASE", "OPENAI_API_BASE_URL", "OPENAI_BASE", "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_API_URL", "COPILOT_API_URL",
+})
+# Name components that carry a secret (GITHUB_PASSWORD, GITHUB_PAT, AWS_SECRET_ACCESS_KEY). PWD is not one.
+_SECRET_PARTS = frozenset({"SECRET", "PASSWORD", "PASSWD", "TOKEN", "CREDENTIAL", "CREDENTIALS", "KEY", "PAT",
+                           "PRIVATE", "APIKEY"})
+# How long the caller's stored-login probe may run before the route refuses.
+COPILOT_PROBE_TIMEOUT_S = 5.0
 _MODEL_MAX = 128
 
 
@@ -129,16 +143,12 @@ def check_copilot_own_loop(
         raise OwnLoopRouteRefused("copilot", "parent_env_malformed")
     if has_copilot_login is None:
         raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "no stored-login probe; gh fallback refused")
-    try:
-        present = has_copilot_login() is True
-    except Exception as exc:  # a failing probe is not a login
-        raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", type(exc).__name__) from None
-    if not present:
+    if not _copilot_login_present(has_copilot_login):
         raise OwnLoopRouteRefused("copilot", "no_stored_copilot_login", "run `copilot login`; gh fallback refused")
     model = _model("copilot", route.get("model"))
     strip = COPILOT_STRIP_ENV + _GH_FALLBACK_ENV
     # Any other provider credential (ANTHROPIC_API_KEY, OPENAI_API_KEY, ...) is not this run's either.
-    removed = tuple(n for n in parent_env if n in strip or _is_provider_credential(n))
+    removed = tuple(n for n in parent_env if n in strip or _is_provider_credential(n) or _is_secret_or_base(n))
     child = {k: v for k, v in parent_env.items() if k not in removed}
     return OwnLoopDecision("copilot", "copilot_cli_sign_in", MappingProxyType(child), removed, model=model)
 
@@ -150,10 +160,10 @@ def _loopback_url(base_url: object) -> str:
         parts = urlsplit(base_url.strip())
         host = parts.hostname
         parts.port  # noqa: B018 - raises on a bad port
-    except ValueError as exc:
-        raise OwnLoopRouteRefused("nous", "proxy_address_malformed", str(exc)) from None
+    except ValueError:
+        raise OwnLoopRouteRefused("nous", "proxy_address_malformed", _redact_url(base_url)) from None
     if parts.scheme not in _NOUS_SCHEMES or not host:
-        raise OwnLoopRouteRefused("nous", "proxy_address_malformed", base_url)
+        raise OwnLoopRouteRefused("nous", "proxy_address_malformed", _redact_url(base_url))
     if parts.username or parts.password:
         raise OwnLoopRouteRefused("nous", "recursion_holds_no_token", "credentials in proxy URL")
     try:
@@ -207,8 +217,8 @@ def nous_proxy_doctor(
     try:
         url = _loopback_url(base_url)
     except OwnLoopRouteRefused as exc:
-        return {"ok": False, "address": base_url if isinstance(base_url, str) else "", "cause": exc.cause,
-                "warnings": warnings}
+        return {"ok": False, "address": _redact_url(base_url) if isinstance(base_url, str) else "",
+                "cause": exc.cause, "warnings": warnings}
     return {"ok": True, "address": url, "cause": "", "warnings": warnings}
 
 
@@ -246,7 +256,8 @@ def check_nous_own_loop(
         if prefix != NOUS_ADAPTER:
             raise OwnLoopRouteRefused("nous", "nous_adapter_only", prefix)
     # Provider credentials, and proxy settings that would carry loopback traffic off the host.
-    strip = tuple(n for n in parent_env if _is_provider_credential(n) or n.upper() in _PROXY_ENV)
+    strip = tuple(n for n in parent_env
+                  if _is_provider_credential(n) or n.upper() in _PROXY_ENV or _is_secret_or_base(n))
     child = {k: v for k, v in parent_env.items() if k not in strip}
     return OwnLoopDecision("nous", "hermes_local_proxy", MappingProxyType(child), strip, url, adapters,
                            _shared_host_warning(current_user, interactive_users), model)
@@ -257,3 +268,54 @@ def _is_provider_credential(name: str) -> bool:
     if upper.startswith(("NOUS_", "XAI_", "GROK_", "HERMES_")):
         return True
     return upper.endswith(("_API_KEY", "_TOKEN", "_AUTH_TOKEN")) or upper in ("OPENAI_BASE_URL",)
+
+
+def _is_secret_or_base(name: str) -> bool:
+    """A base-URL override, git's env-form config (``http.extraheader`` bearer), or a secret-shaped name."""
+
+    upper = name.upper()
+    if upper in _BASE_URL_ENV or upper.startswith("GIT_CONFIG_"):
+        return True
+    return any(part in _SECRET_PARTS for part in upper.split("_"))
+
+
+def _redact_url(url: str) -> str:
+    """``url`` without its user name and password; unchanged when it has neither; ``""`` when unparsable."""
+
+    if "@" not in url:
+        return url
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return ""
+    netloc = parts.netloc.rsplit("@", 1)[1]
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+
+def _copilot_login_present(probe: Callable[[], bool], timeout: float | None = None) -> bool:
+    """True only when the probe returns exactly True before the deadline.
+
+    A hung probe, ``SystemExit`` (a missing CLI that calls ``sys.exit``) and any other error refuse
+    ``copilot_login_unknown``; ``KeyboardInterrupt`` still propagates. The probe runs on a daemon thread,
+    so a timeout does not keep the process alive.
+    """
+
+    box: dict[str, object] = {}
+
+    def run() -> None:
+        try:
+            box["value"] = probe()
+        except BaseException as exc:  # noqa: BLE001 - SystemExit included; re-raised below for KeyboardInterrupt
+            box["exc"] = exc
+
+    thread = threading.Thread(target=run, name="copilot-login-probe", daemon=True)
+    thread.start()
+    thread.join(COPILOT_PROBE_TIMEOUT_S if timeout is None else timeout)
+    if thread.is_alive():
+        raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe_timeout")
+    exc = box.get("exc")
+    if isinstance(exc, KeyboardInterrupt):
+        raise exc
+    if exc is not None:
+        raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", type(exc).__name__) from None
+    return box.get("value") is True

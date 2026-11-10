@@ -755,15 +755,28 @@ def _argv0_is_pinned(argv: list[str], pinned: tuple[str, ...]) -> bool:
     return any(isinstance(path, str) and os.path.isabs(path) and os.path.realpath(path) == real for path in pinned)
 
 
-def _argv_binds_model(argv: list[str], model: str) -> bool:
-    if model in argv:
-        return True
+def _argv_model_flags(argv: list[str]) -> list[str]:
+    """Every ``--model`` / ``-m`` value in argv, in order; a flag with no value counts as ``""``."""
+
+    chosen = []
     for index, item in enumerate(argv):
-        if item == f"--model={model}":
-            return True
-        if item in _MODEL_FLAGS and index + 1 < len(argv) and argv[index + 1] == model:
-            return True
-    return False
+        if item in _MODEL_FLAGS:
+            chosen.append(argv[index + 1] if index + 1 < len(argv) else "")
+        elif item.startswith(tuple(flag + "=" for flag in _MODEL_FLAGS)):
+            chosen.append(item.split("=", 1)[1])
+    return chosen
+
+
+def _argv_binds_model(argv: list[str], model: str) -> bool:
+    """Every model flag names the subscription model; with no flag the model is its own argv item.
+
+    A second ``--model`` naming another model refuses even when the subscription model is also on argv.
+    """
+
+    flagged = _argv_model_flags(argv)
+    if flagged:
+        return all(value == model for value in flagged)
+    return model in argv
 
 
 def _refuse_hermes_config(engine: str, detail: str) -> SubscriptionRouteRefused:

@@ -10,7 +10,6 @@ import os
 import shutil
 import stat
 import subprocess
-import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -29,7 +28,7 @@ FAKE = "fake-value-not-a-credential"
 
 
 def _home(test: unittest.TestCase) -> str:
-    home = tempfile.mkdtemp(prefix="csl785-home-")
+    home = cells.owned_tmpdir("csl785-home-")  # its chain is owned whatever TMPDIR names
     test.addCleanup(shutil.rmtree, home, True)
     return home
 
@@ -75,6 +74,23 @@ class CellTests(unittest.TestCase):
 
     def test_the_fifteenth_path_cell_is_open_by_default_and_closed_by_the_scan_switch(self) -> None:
         self._assert_all(self._group("path_open", "path_scan"), 2)
+
+    def test_the_hosted_runner_layout_is_refused_by_the_rules_not_met_by_accident(self) -> None:
+        # Run 42733662905: /usr/local/bin is 0777 on the hosted image and /usr/bin links into the 0777 /usr/share.
+        self._assert_all(self._group("hosted", "hosted_scan"), 3)
+        rows = {row["cell"]: row["expect"] for row in self._group("hosted", "hosted_scan")}
+        self.assertEqual({"hosted_local_bin_0777": "refused:value_chain_unsafe", "hosted_share_tool": "launched",
+                          "hosted_share_tool[PATH_TOOLS=None]": "refused:path_tool_value_file_unsafe"}, rows)
+
+    def test_no_cell_puts_a_host_directory_on_path(self) -> None:
+        # Each cell's PATH entries are fixture directories (or /proc, refused by spelling): the host layout decides nothing.
+        scratch = cells.Scratch()
+        self.addCleanup(scratch.close)
+        for cell in cells.cells(scratch):
+            for entry in cell.parent.get("PATH", "").split(os.pathsep):
+                if entry and os.path.isabs(entry) and not entry.startswith("/proc/"):
+                    with self.subTest(cell=cell.name, entry=entry):
+                        self.assertEqual(str(scratch.root), os.path.commonpath([str(scratch.root), os.path.normpath(entry)]))
 
 
 class ProfileTests(unittest.TestCase):

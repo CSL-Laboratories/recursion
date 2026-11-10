@@ -11,6 +11,9 @@ host's: a GitHub-hosted runner image makes ``/usr/local/bin`` mode 0777 and has 
 the 0777 ``/usr/share``, which the rules refuse (run 42733662905). The ``hosted`` cells keep that layout
 as a refusal. The scratch root is made where its whole chain passes the owned-chain rule.
 
+Each cell names its auth mode (``subscription`` unless the cell says otherwise) and, where the cell is
+about a route, the ``ChildRoute`` a caller would pass after it fetched the user's key itself.
+
 A cell expects either a refusal (``("refused", cause)``; cause None means any cause) or a launch
 (``("launched", check)``, where ``check(env)`` returns an error string or None).
 """
@@ -27,10 +30,12 @@ from pathlib import Path
 from typing import Callable
 
 from recursion_core.child_env import policy
-from recursion_core.child_env.policy import EnvRefused, build_child_env
+from recursion_core.child_env.policy import ChildRoute, EnvRefused, build_child_env
 
 N = 5
 PROXY = "http://127.0.0.1:3128"
+USER_KEY = "fake-user-entered-key-not-a-credential"  # what a caller would have fetched from the keyring
+AMBIENT = "fake-ambient-value-not-a-credential"  # what the launching shell happens to hold
 
 
 @dataclass(frozen=True)
@@ -41,6 +46,8 @@ class Cell:
     parent: dict
     expect: tuple
     note: str = ""
+    auth_mode: str | None = "subscription"
+    route: ChildRoute | None = None
 
 
 def owned_tmpdir(prefix: str) -> str:
@@ -202,8 +209,9 @@ def cells(s: Scratch) -> list[Cell]:
     cc = "claude_code"
     out: list[Cell] = []
 
-    def add(group, name, parent, expect, engine=cc, note="", raw=False):
-        out.append(Cell(group, name, engine, dict(parent) if raw or "PATH" in parent else {**base, **parent}, expect, note))
+    def add(group, name, parent, expect, engine=cc, note="", raw=False, auth="subscription", route=None):
+        out.append(Cell(group, name, engine, dict(parent) if raw or "PATH" in parent else {**base, **parent}, expect, note,
+                        auth, route))
 
     # C2-37: #776's 15 attack cells (value record section 3).
     add("value", "trust_extra", {"NODE_EXTRA_CA_CERTS": f"{pub}/ca.pem"}, R("value_chain_unsafe"))
@@ -281,6 +289,69 @@ def cells(s: Scratch) -> list[Cell]:
     add("auth_ok", "oauth_not_codex", {"CLAUDE_CODE_OAUTH_TOKEN": "fake-not-a-token"},
         L(_absent("CLAUDE_CODE_OAUTH_TOKEN")), engine="codex")
 
+    # CSLR-D-011, PRODUCT.md 055cc7a5 section 3.3: three explicit auth modes; the key, the base URL and the
+    # provider switches come from the caller's route, never from the parent.
+    key, url, sub, api, cloud = "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "subscription", "api_key", "cloud_provider"
+    bedrock, vertex, foundry = "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"
+    base_url = "https://gateway.invalid/api"
+    ambient = {key: AMBIENT, "ANTHROPIC_AUTH_TOKEN": AMBIENT, url: "https://ambient.invalid", bedrock: "1", vertex: "1",
+               foundry: "1", "CODEX_API_KEY": AMBIENT, "OPENAI_API_KEY": AMBIENT, "OPENAI_BASE_URL": "https://ambient.invalid"}
+    gone = tuple(ambient)
+    add("auth_mode", "mode_omitted", {}, R("auth_mode_missing"), auth=None)
+    add("auth_mode", "mode_omitted_codex", {}, R("auth_mode_missing"), engine="codex", auth=None)
+    add("auth_mode", "mode_unknown", {}, R("auth_mode_unknown"), auth="oauth")
+    add("auth_mode", "mode_wrong_case", {}, R("auth_mode_unknown"), auth="API_KEY")
+    add("auth_mode", "mode_empty", {}, R("auth_mode_unknown"), auth="")
+    add("auth_route", "sub_key_refused", {}, R("route_key_not_allowed"), route=ChildRoute(api_key=USER_KEY))
+    add("auth_route", "sub_switch_refused", {}, R("route_provider_not_allowed"), route=ChildRoute(provider_switches=(bedrock,)))
+    add("auth_route", "key_missing", {key: AMBIENT}, R("route_key_missing"), auth=api,
+        note="an ambient key is never the route's key")
+    add("auth_route", "key_empty", {}, R("route_key_malformed"), auth=api, route=ChildRoute(api_key=""))
+    add("auth_route", "key_switch_refused", {}, R("route_provider_not_allowed"), auth=api,
+        route=ChildRoute(api_key=USER_KEY, provider_switches=(vertex,)))
+    add("auth_route", "cloud_key_refused", {}, R("route_key_not_allowed"), auth=cloud,
+        route=ChildRoute(api_key=USER_KEY, provider_switches=(bedrock,)))
+    add("auth_route", "cloud_none_picked", {bedrock: "1"}, R("route_provider_missing"), auth=cloud,
+        note="an ambient switch is never the user's pick")
+    add("auth_route", "cloud_unknown_switch", {}, R("route_provider_unknown"), auth=cloud,
+        route=ChildRoute(provider_switches=("CLAUDE_CODE_USE_OTHER",)))
+    add("auth_route", "base_url_userinfo", {}, R("base_url_userinfo"),
+        route=ChildRoute(base_url="https://fakeuser:fakepass@gateway.invalid"))
+    add("auth_route", "base_url_no_scheme", {}, R("base_url_malformed"), auth=api,
+        route=ChildRoute(api_key=USER_KEY, base_url="gateway.invalid/api"))
+    add("auth_route", "base_url_query", {}, R("base_url_malformed"), auth=cloud,
+        route=ChildRoute(base_url="https://gateway.invalid/api?k=v", provider_switches=(bedrock,)))
+    add("auth_route", "codex_cloud_refused", {}, R("auth_mode_unsupported"), engine="codex", auth=cloud)
+    add("auth_route", "codex_base_url_refused", {}, R("route_base_url_unsupported"), engine="codex", auth=api,
+        route=ChildRoute(api_key=USER_KEY, base_url=base_url))
+    add("auth_route", "codex_sub_key_refused", {}, R("route_key_not_allowed"), engine="codex", route=ChildRoute(api_key=USER_KEY))
+
+    def both(*checks):
+        return lambda env: next((error for error in (check(env) for check in checks) if error), None)
+
+    token = {"CLAUDE_CODE_OAUTH_TOKEN": "fake-not-a-token"}
+    add("auth_route_ok", "sub_ambient_dropped", {**ambient, **token}, L(both(_absent(*gone), _same(**token))))
+    add("auth_route_ok", "sub_route_base_url", ambient, L(both(_same(**{url: base_url}), _absent(*(set(gone) - {url})))),
+        route=ChildRoute(base_url=base_url))
+    add("auth_route_ok", "key_injected", {**ambient, **token},
+        L(both(_same(**{key: USER_KEY}, **token), _absent(*(set(gone) - {key})))), auth=api, route=ChildRoute(api_key=USER_KEY),
+        note="the caller's key, not the ambient one; no ambient base URL; the sign-in token stays")
+    add("auth_route_ok", "key_route_base_url", ambient, L(_same(**{key: USER_KEY, url: "http://127.0.0.1:4000"})), auth=api,
+        route=ChildRoute(api_key=USER_KEY, base_url="http://127.0.0.1:4000"))
+    add("auth_route_ok", "key_no_oauth_made", {}, L(both(_same(**{key: USER_KEY}), _absent("CLAUDE_CODE_OAUTH_TOKEN", url))),
+        auth=api, route=ChildRoute(api_key=USER_KEY))
+    add("auth_route_ok", "cloud_picked_only", {**ambient, **token},
+        L(both(_same(**{bedrock: "1"}, **token), _absent(*(set(gone) - {bedrock})))), auth=cloud,
+        route=ChildRoute(provider_switches=(bedrock,)), note="ambient Vertex and Foundry switches are not the user's pick")
+    add("auth_route_ok", "cloud_not_ambient_value", {vertex: "ambient-leftover"}, L(_same(**{vertex: "1"})), auth=cloud,
+        route=ChildRoute(provider_switches=(vertex,)))
+    add("auth_route_ok", "cloud_route_base_url", ambient, L(_same(**{foundry: "1", url: base_url})), auth=cloud,
+        route=ChildRoute(base_url=base_url, provider_switches=(foundry,)))
+    add("auth_route_ok", "codex_sub_ambient_dropped", {**ambient, **token}, L(_absent(*gone, *token)), engine="codex")
+    add("auth_route_ok", "codex_key_injected", {**ambient, **token},
+        L(both(_same(CODEX_API_KEY=USER_KEY), _absent(*(set(gone) - {"CODEX_API_KEY"}), *token))), engine="codex", auth=api,
+        route=ChildRoute(api_key=USER_KEY))
+
     # C2-38: the 15 PATH attack cells (envpath record section 3.1); path_tool_link_py is open under the
     # default tool list by design of N5i and is reported, not counted as closed.
     add("path", "path_pub", {"PATH": f"{pub}:{rest}"}, R("value_chain_unsafe"))
@@ -344,7 +415,7 @@ def run_cell(cell: Cell, home: str) -> tuple[str, str | None]:
     """One trial: ("refused", cause) or ("launched", check error or None)."""
 
     try:
-        env = build_child_env(cell.engine, home=home, parent=cell.parent)
+        env = build_child_env(cell.engine, home=home, auth_mode=cell.auth_mode, route=cell.route, parent=cell.parent)
     except EnvRefused as refused:
         return "refused", refused.cause
     return "launched", cell.expect[1](env.to_dict()) if cell.expect[0] == "launched" else None
@@ -369,6 +440,7 @@ def run_all(n: int = N) -> list[dict]:
                 "group": cell.group,
                 "cell": cell.name,
                 "engine": cell.engine,
+                "auth_mode": cell.auth_mode,
                 "expect": cell.expect[0] + (":" + cell.expect[1] if isinstance(cell.expect[1], str) else ""),
                 "outcomes": sorted({f"{k}:{d}" if d else k for k, d in outcomes}),
                 "pass": sum(passed(cell, o) for o in outcomes),
@@ -390,7 +462,7 @@ def _scan_switch(s: Scratch, n: int, group: str, name: str, cause: str) -> dict:
     finally:
         policy.PATH_TOOLS = saved
     ok = [o == ("refused", cause) for o in outcomes]
-    return {"group": group, "cell": f"{name}[PATH_TOOLS=None]", "engine": cell.engine,
+    return {"group": group, "cell": f"{name}[PATH_TOOLS=None]", "engine": cell.engine, "auth_mode": cell.auth_mode,
             "expect": f"refused:{cause}", "outcomes": sorted({f"{k}:{d}" for k, d in outcomes}),
             "pass": sum(ok), "n": n}
 

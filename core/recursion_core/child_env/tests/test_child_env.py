@@ -6,6 +6,7 @@ No engine, provider, network or real credential is used; every secret-shaped val
 
 from __future__ import annotations
 
+import ast
 import os
 import shutil
 import stat
@@ -14,7 +15,18 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from recursion_core.child_env import BASE_NAMES, ENGINE_PROFILES, EnvRefused, ValidatedEnv, build_child_env, spawn
+from recursion_core.child_env import (
+    AUTH_MODES,
+    BASE_NAMES,
+    ENGINE_PROFILES,
+    ChildRoute,
+    EnvRefused,
+    ValidatedEnv,
+    build_child_env,
+    launch,
+    policy,
+    spawn,
+)
 from recursion_core.child_env.policy import CLAUDE_TLS_NAMES
 from recursion_core.child_env.tests import cells
 
@@ -25,6 +37,12 @@ def _running_as_root() -> bool:
 
 
 FAKE = "fake-value-not-a-credential"
+SUB, API, CLOUD = "subscription", "api_key", "cloud_provider"
+USER_KEY = "fake-user-entered-key-not-a-credential"  # stands for a key the caller already fetched
+KEY, URL, OAUTH = "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN"
+BEDROCK, VERTEX, FOUNDRY = "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"
+# A minimal valid route per mode, as a caller would pass it.
+ROUTES = {SUB: ChildRoute(), API: ChildRoute(api_key=USER_KEY), CLOUD: ChildRoute(provider_switches=(BEDROCK,))}
 
 
 def _home(test: unittest.TestCase) -> str:
@@ -72,6 +90,11 @@ class CellTests(unittest.TestCase):
     def test_users_own_claude_sign_in_token_cells(self) -> None:
         self._assert_all(self._group("auth_ok"), 3)
 
+    def test_auth_mode_and_route_cells(self) -> None:
+        self._assert_all(self._group("auth_mode"), 5)
+        self._assert_all(self._group("auth_route"), 14)
+        self._assert_all(self._group("auth_route_ok"), 10)
+
     def test_the_fifteenth_path_cell_is_open_by_default_and_closed_by_the_scan_switch(self) -> None:
         self._assert_all(self._group("path_open", "path_scan"), 2)
 
@@ -98,7 +121,7 @@ class ProfileTests(unittest.TestCase):
         home = _home(self)
         for engine in ("claude", "Codex", "env", "sh", "npx", "codex-cli", "", None, "pi", "hermes", "opencode"):
             with self.subTest(engine=engine), self.assertRaises(EnvRefused) as caught:
-                build_child_env(engine, home=home, parent={"PATH": "/usr/bin"})
+                build_child_env(engine, home=home, auth_mode=SUB, parent={"PATH": "/usr/bin"})
             self.assertEqual("unknown_engine", caught.exception.cause)
 
     def test_only_allowlisted_names_reach_either_engine(self) -> None:
@@ -115,7 +138,7 @@ class ProfileTests(unittest.TestCase):
         parent = {"PATH": "/usr/bin:/bin", "HOME": "/home/operator", "LANG": "C.UTF-8", **planted}
         for engine, profile in ENGINE_PROFILES.items():
             with self.subTest(engine=engine):
-                env = build_child_env(engine, home=home, parent=parent)
+                env = build_child_env(engine, home=home, auth_mode=SUB, parent=parent)
                 self.assertLessEqual(set(env), set(profile.allowed) | set(profile.passthrough))
                 # The only planted name that may arrive is the user's own sign-in token, on the Claude profile only.
                 self.assertEqual(set(profile.passthrough), set(planted) & set(env))
@@ -143,12 +166,12 @@ class ProfileTests(unittest.TestCase):
         home = _home(self)
         for value in (FAKE, "", "fake value with spaces/../and=signs"):
             with self.subTest(value=value):
-                env = build_child_env("claude_code", home=home, parent={"PATH": "/usr/bin", "CLAUDE_CODE_OAUTH_TOKEN": value})
+                env = build_child_env("claude_code", home=home, auth_mode=SUB, parent={"PATH": "/usr/bin", "CLAUDE_CODE_OAUTH_TOKEN": value})
                 self.assertEqual(value, env["CLAUDE_CODE_OAUTH_TOKEN"])
                 self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", env.dropped)
                 self.assertNotIn(FAKE, repr(env))
         # It is not a Codex sign-in: the Codex child never sees it.
-        env = build_child_env("codex", home=home, parent={"PATH": "/usr/bin", "CLAUDE_CODE_OAUTH_TOKEN": FAKE})
+        env = build_child_env("codex", home=home, auth_mode=SUB, parent={"PATH": "/usr/bin", "CLAUDE_CODE_OAUTH_TOKEN": FAKE})
         self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", env)
         self.assertIn("CLAUDE_CODE_OAUTH_TOKEN", env.dropped)
 
@@ -156,11 +179,11 @@ class ProfileTests(unittest.TestCase):
         home = _home(self)
         for parent in ({"PATH": "/usr/bin"}, {"PATH": "/usr/bin", "ANTHROPIC_OAUTH_TOKEN": FAKE, "ANTHROPIC_AUTH_TOKEN": FAKE}):
             with self.subTest(parent=sorted(parent)):
-                env = build_child_env("claude_code", home=home, parent=parent)
+                env = build_child_env("claude_code", home=home, auth_mode=SUB, parent=parent)
                 self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", env)
                 self.assertNotIn(FAKE, env.to_dict().values())
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_OAUTH_TOKEN": FAKE}):  # an explicit parent wins over os.environ
-            self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", build_child_env("claude_code", home=home, parent={}))
+            self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", build_child_env("claude_code", home=home, auth_mode=SUB, parent={}))
 
     def test_oauth_token_and_tls_secrets_cannot_be_set_by_override(self) -> None:
         home = _home(self)
@@ -168,9 +191,9 @@ class ProfileTests(unittest.TestCase):
                  ("codex", "CLAUDE_CODE_OAUTH_TOKEN", {}), ("claude_code", "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE", {}))
         for engine, name, extra in cases:
             with self.subTest(engine=engine, name=name, parent=sorted(extra)), self.assertRaises(EnvRefused) as caught:
-                build_child_env(engine, home=home, parent={"PATH": "/usr/bin", **extra}, overrides={name: "fake-override"})
+                build_child_env(engine, home=home, auth_mode=SUB, parent={"PATH": "/usr/bin", **extra}, overrides={name: "fake-override"})
             self.assertEqual((name, "override_denied"), (caught.exception.name, caught.exception.cause))
-        env = build_child_env("claude_code", home=home, parent={"PATH": "/usr/bin", "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE": FAKE})
+        env = build_child_env("claude_code", home=home, auth_mode=SUB, parent={"PATH": "/usr/bin", "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE": FAKE})
         self.assertEqual(FAKE, env["CLAUDE_CODE_CLIENT_KEY_PASSPHRASE"])  # the operator's own value is carried
 
     def test_client_private_key_cannot_be_replaced_by_an_override(self) -> None:
@@ -186,18 +209,20 @@ class ProfileTests(unittest.TestCase):
             build_child_env(
                 "claude_code",
                 home=str(home),
+                auth_mode=SUB,
                 parent={"PATH": "/usr/bin", "CLAUDE_CODE_CLIENT_KEY": str(parent_key)},
                 overrides={"CLAUDE_CODE_CLIENT_KEY": str(other_key)},
             )
         self.assertEqual(("CLAUDE_CODE_CLIENT_KEY", "override_denied"), (caught.exception.name, caught.exception.cause))
         env = build_child_env(
-            "claude_code", home=str(home), parent={"PATH": "/usr/bin", "CLAUDE_CODE_CLIENT_KEY": str(parent_key)}
+            "claude_code", home=str(home), auth_mode=SUB, parent={"PATH": "/usr/bin", "CLAUDE_CODE_CLIENT_KEY": str(parent_key)}
         )
         self.assertEqual(str(parent_key), env["CLAUDE_CODE_CLIENT_KEY"])
         with self.assertRaises(EnvRefused) as caught:
             build_child_env(
                 "codex",
                 home=str(home),
+                auth_mode=SUB,
                 parent={"PATH": "/usr/bin"},
                 overrides={"CLAUDE_CODE_CLIENT_KEY": str(other_key)},
             )
@@ -215,26 +240,26 @@ class ProfileTests(unittest.TestCase):
             for target in (key, other):
                 with self.subTest(parent=sorted(parent), target=target.name):
                     with self.assertRaises(EnvRefused) as caught:
-                        build_child_env("claude_code", home=str(home), parent=parent,
+                        build_child_env("claude_code", home=str(home), auth_mode=SUB, parent=parent,
                                         overrides={"CLAUDE_CODE_CLIENT_CERT": str(target)})
                     self.assertEqual(("CLAUDE_CODE_CLIENT_CERT", "override_denied"),
                                      (caught.exception.name, caught.exception.cause))
         # The operator's own certificate and key are still carried, under the file rule.
-        env = build_child_env("claude_code", home=str(home), parent=own)
+        env = build_child_env("claude_code", home=str(home), auth_mode=SUB, parent=own)
         self.assertEqual((str(cert), str(key)), (env["CLAUDE_CODE_CLIENT_CERT"], env["CLAUDE_CODE_CLIENT_KEY"]))
         with self.assertRaises(EnvRefused) as caught:
-            build_child_env("claude_code", home=str(home), parent={"PATH": "/usr/bin", "CLAUDE_CODE_CLIENT_CERT": "cert.pem"})
+            build_child_env("claude_code", home=str(home), auth_mode=SUB, parent={"PATH": "/usr/bin", "CLAUDE_CODE_CLIENT_CERT": "cert.pem"})
         self.assertEqual(("CLAUDE_CODE_CLIENT_CERT", "value_relative"), (caught.exception.name, caught.exception.cause))
 
     def test_claude_code_simple_is_scrubbed_by_name(self) -> None:
         # PRODUCT.md 055cc7a5 section 3.3 names CLAUDE_CODE_SIMPLE in the Claude scrub list (review of 3503f6a6, finding 2).
         home = _home(self)
         self.assertIn("CLAUDE_CODE_SIMPLE", ENGINE_PROFILES["claude_code"].scrub)
-        env = build_child_env("claude_code", home=home, parent={"PATH": "/usr/bin", "CLAUDE_CODE_SIMPLE": "1"})
+        env = build_child_env("claude_code", home=home, auth_mode=SUB, parent={"PATH": "/usr/bin", "CLAUDE_CODE_SIMPLE": "1"})
         self.assertNotIn("CLAUDE_CODE_SIMPLE", env)
         self.assertIn("CLAUDE_CODE_SIMPLE", env.dropped)
         with self.assertRaises(EnvRefused) as caught:
-            build_child_env("claude_code", home=home, parent={"PATH": "/usr/bin"}, overrides={"CLAUDE_CODE_SIMPLE": "1"})
+            build_child_env("claude_code", home=home, auth_mode=SUB, parent={"PATH": "/usr/bin"}, overrides={"CLAUDE_CODE_SIMPLE": "1"})
         self.assertEqual(("CLAUDE_CODE_SIMPLE", "override_denied"), (caught.exception.name, caught.exception.cause))
 
     def test_codex_scrub_names_are_listed(self) -> None:
@@ -246,9 +271,9 @@ class ProfileTests(unittest.TestCase):
     def test_engine_hosts_differ_per_profile(self) -> None:
         home = _home(self)
         parent = {"PATH": "/usr/bin", "HTTPS_PROXY": "http://127.0.0.1:3128", "NO_PROXY": ".openai.com"}
-        self.assertEqual(".openai.com", build_child_env("claude_code", home=home, parent=parent)["NO_PROXY"])
+        self.assertEqual(".openai.com", build_child_env("claude_code", home=home, auth_mode=SUB, parent=parent)["NO_PROXY"])
         with self.assertRaises(EnvRefused) as caught:
-            build_child_env("codex", home=home, parent=parent)
+            build_child_env("codex", home=home, auth_mode=SUB, parent=parent)
         self.assertEqual(("NO_PROXY", "no_proxy_engine_host"), (caught.exception.name, caught.exception.cause))
 
     def test_overrides_never_carry_credentials(self) -> None:
@@ -256,7 +281,7 @@ class ProfileTests(unittest.TestCase):
         for name in ("CODEX_API_KEY", "OPENAI_API_KEY", "MY_TOKEN", "ANTHROPIC_BASE_URL", "CODEX_HOME", "HOME", "PATH"):
             engine = "codex" if name.startswith(("CODEX", "OPENAI")) else "claude_code"
             with self.subTest(name=name), self.assertRaises(EnvRefused) as caught:
-                build_child_env(engine, home=home, parent={}, overrides={name: FAKE})
+                build_child_env(engine, home=home, auth_mode=SUB, parent={}, overrides={name: FAKE})
             self.assertEqual("override_denied", caught.exception.cause)
 
     def test_overrides_cannot_add_names_outside_the_allowlist(self) -> None:
@@ -264,7 +289,7 @@ class ProfileTests(unittest.TestCase):
         for engine in ENGINE_PROFILES:
             for name in ("LD_PRELOAD", "NODE_OPTIONS", "PYTHONPATH", "XDG_CONFIG_HOME", "DISABLE_AUTOUPDATER"):
                 with self.subTest(engine=engine, name=name), self.assertRaises(EnvRefused) as caught:
-                    build_child_env(engine, home=home, parent={"PATH": "/usr/bin"}, overrides={name: "/mock/not-loaded.so"})
+                    build_child_env(engine, home=home, auth_mode=SUB, parent={"PATH": "/usr/bin"}, overrides={name: "/mock/not-loaded.so"})
                 self.assertEqual((name, "override_not_allowed"), (caught.exception.name, caught.exception.cause))
 
     def test_override_values_meet_the_same_rules_as_inherited_values(self) -> None:
@@ -286,13 +311,13 @@ class ProfileTests(unittest.TestCase):
         )
         for overrides, expected in cases:
             with self.subTest(overrides=overrides), self.assertRaises(EnvRefused) as caught:
-                build_child_env("codex", home=home, parent={"PATH": "/usr/bin"}, overrides=overrides)
+                build_child_env("codex", home=home, auth_mode=SUB, parent={"PATH": "/usr/bin"}, overrides=overrides)
             self.assertEqual(expected, (caught.exception.name, caught.exception.cause))
         # Split across parent and override: a proxy override still meets the parent's NO_PROXY, and back.
         for parent, overrides in (({"NO_PROXY": "*"}, {"HTTPS_PROXY": "http://proxy.invalid:8080"}),
                                   ({"HTTPS_PROXY": "http://proxy.invalid:8080"}, {"no_proxy": "*"})):
             with self.subTest(parent=parent), self.assertRaises(EnvRefused) as caught:
-                build_child_env("codex", home=home, parent={"PATH": "/usr/bin", **parent}, overrides=overrides)
+                build_child_env("codex", home=home, auth_mode=SUB, parent={"PATH": "/usr/bin", **parent}, overrides=overrides)
             self.assertEqual("no_proxy_wildcard", caught.exception.cause)
 
     def test_safe_overrides_pass(self) -> None:
@@ -304,11 +329,11 @@ class ProfileTests(unittest.TestCase):
                      "HTTPS_PROXY": "http://127.0.0.1:3128", "NO_PROXY": "localhost,127.0.0.1"}
         for engine in ENGINE_PROFILES:
             with self.subTest(engine=engine):
-                env = build_child_env(engine, home=home, parent={"PATH": "/usr/bin", "LANG": "C"}, overrides=overrides)
+                env = build_child_env(engine, home=home, auth_mode=SUB, parent={"PATH": "/usr/bin", "LANG": "C"}, overrides=overrides)
                 self.assertEqual(overrides, {name: env[name] for name in overrides})
                 self.assertEqual(home, env["HOME"])
         # A temp override is replaced by the private route temp root, exactly as a parent TMPDIR is.
-        env = build_child_env("codex", home=home, parent={"PATH": "/usr/bin"}, overrides={"TMPDIR": "/tmp"})
+        env = build_child_env("codex", home=home, auth_mode=SUB, parent={"PATH": "/usr/bin"}, overrides={"TMPDIR": "/tmp"})
         self.assertNotEqual("/tmp", env["TMPDIR"])
         self.assertEqual(0, os.lstat(env["TMPDIR"]).st_mode & 0o077)
 
@@ -317,7 +342,7 @@ class ProfileTests(unittest.TestCase):
         os.chmod(home, 0o755)
         for value in (home, "relative/home", "/nonexistent-csl785", None):
             with self.subTest(home=value), self.assertRaises(EnvRefused) as caught:
-                build_child_env("codex", home=value, parent={})
+                build_child_env("codex", home=value, auth_mode=SUB, parent={})
             self.assertEqual(("HOME", "home_unsafe"), (caught.exception.name, caught.exception.cause))
 
     def test_home_behind_a_link_whose_resolved_parent_others_can_write_is_refused(self) -> None:
@@ -335,10 +360,10 @@ class ProfileTests(unittest.TestCase):
                 link = base / f"link-{mode:o}"
                 os.symlink(real_parent, link)
                 with self.assertRaises(EnvRefused) as caught:
-                    build_child_env("codex", home=str(link / "home"), parent={})
+                    build_child_env("codex", home=str(link / "home"), auth_mode=SUB, parent={})
                 self.assertEqual(("HOME", "home_unsafe"), (caught.exception.name, caught.exception.cause))
                 real_parent.chmod(0o700)  # control: the same link and home pass once the resolved parent is private
-                self.assertEqual(str(link / "home"), build_child_env("codex", home=str(link / "home"), parent={})["HOME"])
+                self.assertEqual(str(link / "home"), build_child_env("codex", home=str(link / "home"), auth_mode=SUB, parent={})["HOME"])
         # A link two levels up whose target's parent others can write is refused too.
         loose = base / "loose"
         loose.mkdir(mode=0o700)
@@ -347,7 +372,7 @@ class ProfileTests(unittest.TestCase):
         loose.chmod(0o777)
         os.symlink(loose / "mid", base / "deep-link")
         with self.assertRaises(EnvRefused) as caught:
-            build_child_env("codex", home=str(base / "deep-link" / "home"), parent={})
+            build_child_env("codex", home=str(base / "deep-link" / "home"), auth_mode=SUB, parent={})
         self.assertEqual("home_unsafe", caught.exception.cause)
 
     def test_home_under_a_symlinked_parent_is_accepted(self) -> None:
@@ -357,11 +382,11 @@ class ProfileTests(unittest.TestCase):
         real_parent.mkdir(mode=0o700)
         (real_parent / "home").mkdir(mode=0o700)
         os.symlink(real_parent, base / "link")
-        env = build_child_env("codex", home=str(base / "link" / "home"), parent={})
+        env = build_child_env("codex", home=str(base / "link" / "home"), auth_mode=SUB, parent={})
         self.assertEqual(str(base / "link" / "home"), env["HOME"])
         os.symlink(real_parent / "home", base / "home-link")
         with self.assertRaises(EnvRefused) as caught:  # the home itself being a link stays refused
-            build_child_env("codex", home=str(base / "home-link"), parent={})
+            build_child_env("codex", home=str(base / "home-link"), auth_mode=SUB, parent={})
         self.assertEqual("home_unsafe", caught.exception.cause)
 
     def test_a_linked_home_stays_refused_with_a_trailing_slash_or_dot(self) -> None:
@@ -374,7 +399,7 @@ class ProfileTests(unittest.TestCase):
         os.symlink(real, link)
         for spelling in (str(link), str(link) + "/", str(link) + "/.", str(link) + "/./", str(link) + "//"):
             with self.subTest(home=spelling), self.assertRaises(EnvRefused) as caught:
-                build_child_env("codex", home=spelling, parent={})
+                build_child_env("codex", home=spelling, auth_mode=SUB, parent={})
             self.assertEqual(("HOME", "home_unsafe"), (caught.exception.name, caught.exception.cause))
         parent_link = base / "parent-link"
         os.symlink(base, parent_link)
@@ -388,7 +413,7 @@ class ProfileTests(unittest.TestCase):
         )
         for spelling in accepted:
             with self.subTest(home=spelling):
-                self.assertEqual(spelling, build_child_env("codex", home=spelling, parent={})["HOME"])
+                self.assertEqual(spelling, build_child_env("codex", home=spelling, auth_mode=SUB, parent={})["HOME"])
 
     def test_a_linked_home_is_refused_when_spelled_through_dot_dot(self) -> None:
         # Review of 58e7081f: link/sub/.. reaches the link's target, and lstat of it sees a directory.
@@ -402,13 +427,13 @@ class ProfileTests(unittest.TestCase):
         for home in (link + "/sub/..", link + "/sub/../", link + "/sub/../.", link + "/./sub/..", link + "//sub/..",
                      f"{base}/real-home/../home-link/", f"{real_home}/sub/.."):
             with self.subTest(home=home[len(str(base)):]), self.assertRaises(EnvRefused) as caught:
-                build_child_env("codex", home=home, parent={})
+                build_child_env("codex", home=home, auth_mode=SUB, parent={})
             self.assertEqual(("HOME", "home_unsafe"), (caught.exception.name, caught.exception.cause))
         # Control: ".." before the last named entry is fine, and the child gets HOME as it was given.
         for home in (f"{base}/home-link/../real-home", f"{real_home}/sub/../../real-home/", f"{link}/sub/../sub",
                      f"{link}/sub/"):
             with self.subTest(home=home[len(str(base)):]):
-                self.assertEqual(home, build_child_env("codex", home=home, parent={})["HOME"])
+                self.assertEqual(home, build_child_env("codex", home=home, auth_mode=SUB, parent={})["HOME"])
 
     def test_validated_env_cannot_be_hand_made(self) -> None:
         with self.assertRaises(TypeError):
@@ -416,8 +441,286 @@ class ProfileTests(unittest.TestCase):
 
     def test_windows_refuses_instead_of_passing_values_unchecked(self) -> None:
         with mock.patch("recursion_core.child_env.policy.os.name", "nt"), self.assertRaises(EnvRefused) as caught:
-            build_child_env("codex", home="C:\\x", parent={})
+            build_child_env("codex", home="C:\\x", auth_mode=SUB, parent={})
         self.assertEqual("platform_unsupported", caught.exception.cause)
+
+
+@unittest.skipIf(os.name == "nt", "POSIX rules")
+class AuthRouteTests(unittest.TestCase):
+    """CSLR-D-011, PRODUCT.md 055cc7a5 section 3.3: an explicit auth mode, and a route-owned key, base URL and switches."""
+
+    AMBIENT = {KEY: FAKE, "ANTHROPIC_AUTH_TOKEN": FAKE, URL: "https://ambient.invalid", BEDROCK: "1", VERTEX: "1",
+               FOUNDRY: "1", "CODEX_API_KEY": FAKE, "OPENAI_API_KEY": FAKE, "OPENAI_BASE_URL": "https://ambient.invalid"}
+
+    def _refused(self, engine: str, home: str, **kwargs: object) -> tuple[str | None, str]:
+        with self.assertRaises(EnvRefused) as caught:
+            build_child_env(engine, home=home, **kwargs)
+        return caught.exception.name, caught.exception.cause
+
+    def test_auth_mode_is_required_and_one_of_exactly_three(self) -> None:
+        home = _home(self)
+        self.assertEqual(("subscription", "api_key", "cloud_provider"), AUTH_MODES)
+        for engine in ENGINE_PROFILES:
+            with self.subTest(engine=engine):
+                self.assertEqual((None, "auth_mode_missing"), self._refused(engine, home, parent={"PATH": "/usr/bin"}))
+                self.assertEqual((None, "auth_mode_missing"), self._refused(engine, home, auth_mode=None, parent={}))
+                # A complete route does not stand in for the mode.
+                self.assertEqual((None, "auth_mode_missing"), self._refused(engine, home, route=ROUTES[API], parent={}))
+            for mode in ("", "oauth", "Subscription", "API_KEY", "api-key", "bedrock", "cloud", " subscription", 1, True,
+                         b"api_key", ("api_key",), ["subscription"]):
+                with self.subTest(engine=engine, mode=mode):
+                    self.assertEqual((None, "auth_mode_unknown"),
+                                     self._refused(engine, home, auth_mode=mode, route=ROUTES[API], parent={}))
+        for mode in AUTH_MODES:
+            with self.subTest(mode=mode):
+                env = build_child_env("claude_code", home=home, auth_mode=mode, route=ROUTES[mode], parent={"PATH": "/usr/bin"})
+                self.assertEqual(mode, env.auth_mode)
+                self.assertIn(repr(mode), repr(env))
+
+    def test_the_mode_is_never_taken_from_the_launching_shell(self) -> None:
+        # A parent that looks like an API-key or a Bedrock shell does not pick the mode, and no mode is the default.
+        home = _home(self)
+        for parent in ({KEY: FAKE}, {BEDROCK: "1"}, {OAUTH: FAKE}, {"RECURSION_AUTH_MODE": "api_key", "AUTH_MODE": "api_key"}):
+            with self.subTest(parent=sorted(parent)):
+                self.assertEqual((None, "auth_mode_missing"), self._refused("claude_code", home, parent=parent))
+                with mock.patch.dict(os.environ, parent):
+                    self.assertEqual((None, "auth_mode_missing"), self._refused("claude_code", home))
+
+    def test_ambient_base_url_is_dropped_in_every_mode(self) -> None:
+        home = _home(self)
+        for mode in AUTH_MODES:
+            for ambient in ("https://ambient.invalid", "http://127.0.0.1:9", "", "not a url"):
+                with self.subTest(mode=mode, ambient=ambient):
+                    parent = {"PATH": "/usr/bin", URL: ambient, "OPENAI_BASE_URL": ambient}
+                    env = build_child_env("claude_code", home=home, auth_mode=mode, route=ROUTES[mode], parent=parent)
+                    self.assertNotIn(URL, env)
+                    self.assertIn(URL, env.dropped)
+                    # os.environ as the parent: the same. Cleared first, so the host's own PATH decides nothing.
+                    with mock.patch.dict(os.environ, {"PATH": "/usr/bin", URL: ambient}, clear=True):
+                        self.assertNotIn(URL, build_child_env("claude_code", home=home, auth_mode=mode, route=ROUTES[mode]))
+
+    def test_route_base_url_is_set_in_every_mode_and_only_from_the_route(self) -> None:
+        home = _home(self)
+        for mode in AUTH_MODES:
+            for url in ("https://gateway.invalid", "https://gateway.invalid/api", "http://127.0.0.1:4000",
+                        "https://[::1]:8443/v1/", "HTTPS://Gateway.invalid:443/anthropic"):
+                with self.subTest(mode=mode, url=url):
+                    route = ChildRoute(api_key=ROUTES[mode].api_key, base_url=url,
+                                       provider_switches=ROUTES[mode].provider_switches)
+                    parent = {"PATH": "/usr/bin", URL: "https://ambient.invalid"}
+                    env = build_child_env("claude_code", home=home, auth_mode=mode, route=route, parent=parent)
+                    self.assertEqual(url, env[URL])
+
+    def test_route_base_url_meets_the_url_rule(self) -> None:
+        home = _home(self)
+        bad = (("https://fakeuser:fakepass@gateway.invalid", "base_url_userinfo"), ("https://fakeuser@gateway.invalid/api", "base_url_userinfo"),
+               ("gateway.invalid", "base_url_malformed"), ("//gateway.invalid", "base_url_malformed"),
+               ("ftp://gateway.invalid", "base_url_malformed"), ("file:///etc/passwd", "base_url_malformed"),
+               ("https://gateway.invalid/api?key=v", "base_url_malformed"), ("https://gateway.invalid/#f", "base_url_malformed"),
+               ("https://gateway.invalid:0", "base_url_malformed"), ("https://gateway.invalid:99999", "base_url_malformed"),
+               ("https://gateway.invalid/a/../b", "base_url_malformed"), ("https://gateway.invalid/a b", "base_url_malformed"),
+               ("https://gateway.invalid\n", "base_url_malformed"), ("https://gateway.invalid\0", "base_url_malformed"),
+               ("", "base_url_malformed"), (b"https://gateway.invalid", "base_url_malformed"), (7, "base_url_malformed"))
+        for mode in AUTH_MODES:
+            for url, cause in bad:
+                with self.subTest(mode=mode, url=url):
+                    route = ChildRoute(api_key=ROUTES[mode].api_key, base_url=url,
+                                       provider_switches=ROUTES[mode].provider_switches)
+                    self.assertEqual((URL, cause), self._refused("claude_code", home, auth_mode=mode, route=route, parent={}))
+
+    def test_ambient_keys_are_dropped_in_every_mode(self) -> None:
+        home = _home(self)
+        for engine, profile in ENGINE_PROFILES.items():
+            for mode in AUTH_MODES:
+                if engine == "codex" and mode == CLOUD:
+                    continue  # refused: see test_codex_routes
+                with self.subTest(engine=engine, mode=mode):
+                    env = build_child_env(engine, home=home, auth_mode=mode, route=ROUTES[mode],
+                                          parent={"PATH": "/usr/bin", **self.AMBIENT})
+                    self.assertNotIn(FAKE, env.to_dict().values())  # no ambient key value, under any name
+                    self.assertNotIn("https://ambient.invalid", env.to_dict().values())
+                    route_set = {API: {profile.key_name}, CLOUD: {BEDROCK}, SUB: set()}[mode]
+                    self.assertEqual(route_set, set(self.AMBIENT) & set(env))
+                    self.assertLessEqual(set(self.AMBIENT) - route_set, set(env.dropped))
+
+    def test_a_user_key_is_injected_only_on_an_api_key_route(self) -> None:
+        home = _home(self)
+        env = build_child_env("claude_code", home=home, auth_mode=API, route=ChildRoute(api_key=USER_KEY),
+                              parent={"PATH": "/usr/bin", KEY: FAKE})
+        self.assertEqual(USER_KEY, env[KEY])  # the caller's key, not the parent's
+        self.assertEqual({KEY}, {name for name, value in env.to_dict().items() if value == USER_KEY})
+        for mode, extra in ((SUB, ()), (CLOUD, (BEDROCK,))):
+            for parent in ({}, {KEY: FAKE}):
+                with self.subTest(mode=mode, parent=sorted(parent)):
+                    route = ChildRoute(api_key=USER_KEY, provider_switches=extra)
+                    self.assertEqual((KEY, "route_key_not_allowed"),
+                                     self._refused("claude_code", home, auth_mode=mode, route=route, parent=parent))
+        # An api_key route with no key refuses: the ambient key is not used, and the run does not fall back to a sign-in.
+        for route in (None, ChildRoute(), ChildRoute(base_url="https://gateway.invalid")):
+            with self.subTest(route=route):
+                self.assertEqual((KEY, "route_key_missing"),
+                                 self._refused("claude_code", home, auth_mode=API, route=route, parent={KEY: FAKE, OAUTH: FAKE}))
+        for key in ("", "fake\0key", b"fake-bytes", 7):
+            with self.subTest(key=key):
+                self.assertEqual((KEY, "route_key_malformed"),
+                                 self._refused("claude_code", home, auth_mode=API, route=ChildRoute(api_key=key), parent={}))
+
+    def test_provider_switches_come_only_from_the_route(self) -> None:
+        home = _home(self)
+        leftovers = {"PATH": "/usr/bin", BEDROCK: "1", VERTEX: "true", FOUNDRY: "1"}
+        for picked in ((BEDROCK,), (VERTEX,), (FOUNDRY,), (BEDROCK, VERTEX), [FOUNDRY], frozenset({VERTEX})):
+            with self.subTest(picked=picked):
+                env = build_child_env("claude_code", home=home, auth_mode=CLOUD, route=ChildRoute(provider_switches=picked),
+                                      parent=leftovers)
+                self.assertEqual(dict.fromkeys(picked, "1"), {n: env[n] for n in (BEDROCK, VERTEX, FOUNDRY) if n in env})
+        for mode in (SUB, API):  # in the other modes an ambient switch is dropped and a picked one refuses
+            env = build_child_env("claude_code", home=home, auth_mode=mode, route=ROUTES[mode], parent=leftovers)
+            self.assertFalse({BEDROCK, VERTEX, FOUNDRY} & set(env))
+            route = ChildRoute(api_key=ROUTES[mode].api_key, provider_switches=(BEDROCK,))
+            self.assertEqual((None, "route_provider_not_allowed"),
+                             self._refused("claude_code", home, auth_mode=mode, route=route, parent=leftovers))
+        self.assertEqual((None, "route_provider_missing"), self._refused("claude_code", home, auth_mode=CLOUD, parent=leftovers))
+        for unknown in ("CLAUDE_CODE_USE_OTHER", "ANTHROPIC_API_KEY", "PATH", "LD_PRELOAD", "claude_code_use_bedrock", ""):
+            with self.subTest(unknown=unknown):
+                route = ChildRoute(provider_switches=(BEDROCK, unknown))
+                self.assertEqual((None, "route_provider_unknown"),
+                                 self._refused("claude_code", home, auth_mode=CLOUD, route=route, parent={}))
+
+    def test_the_route_is_its_own_input_not_a_mapping_or_an_override(self) -> None:
+        home = _home(self)
+        for route in ({"api_key": USER_KEY}, (USER_KEY,), USER_KEY, mock.Mock(api_key=USER_KEY, base_url=None, provider_switches=())):
+            with self.subTest(route=type(route).__name__):
+                self.assertEqual((None, "route_malformed"), self._refused("claude_code", home, auth_mode=API, route=route, parent={}))
+        for switches in (BEDROCK, (1,), {BEDROCK: "1"}, None):
+            with self.subTest(switches=switches):
+                self.assertEqual((None, "route_malformed"), self._refused(
+                    "claude_code", home, auth_mode=CLOUD, route=ChildRoute(provider_switches=switches), parent={}))
+        # The override path is unchanged in every mode: it never carries a key, a base URL, a switch or the sign-in token.
+        for mode in AUTH_MODES:
+            for name in (KEY, "ANTHROPIC_AUTH_TOKEN", URL, BEDROCK, VERTEX, FOUNDRY, OAUTH):
+                with self.subTest(mode=mode, name=name):
+                    self.assertEqual((name, "override_denied"), self._refused(
+                        "claude_code", home, auth_mode=mode, route=ROUTES[mode], parent={}, overrides={name: "fake-override"}))
+        self.assertEqual(("CODEX_API_KEY", "override_denied"), self._refused(
+            "codex", home, auth_mode=API, route=ROUTES[API], parent={}, overrides={"CODEX_API_KEY": "fake-override"}))
+
+    def test_oauth_token_invariants_hold_in_every_mode(self) -> None:
+        home = _home(self)
+        for mode in AUTH_MODES:
+            with self.subTest(mode=mode):
+                # Absent in the parent stays absent: no mode and no route makes one.
+                env = build_child_env("claude_code", home=home, auth_mode=mode, route=ROUTES[mode],
+                                      parent={"PATH": "/usr/bin", "ANTHROPIC_OAUTH_TOKEN": FAKE, "ANTHROPIC_AUTH_TOKEN": FAKE})
+                self.assertNotIn(OAUTH, env)
+                self.assertNotIn(FAKE, env.to_dict().values())
+                # Present in the parent is carried unchanged (on an api_key route the key outranks it, section 3.3).
+                env = build_child_env("claude_code", home=home, auth_mode=mode, route=ROUTES[mode],
+                                      parent={"PATH": "/usr/bin", OAUTH: FAKE})
+                self.assertEqual(FAKE, env[OAUTH])
+                self.assertNotIn(FAKE, repr(env))
+                # An override naming it is refused, with or without one in the parent.
+                for parent in ({}, {OAUTH: FAKE}):
+                    self.assertEqual((OAUTH, "override_denied"), self._refused(
+                        "claude_code", home, auth_mode=mode, route=ROUTES[mode], parent=parent, overrides={OAUTH: "fake-override"}))
+        # A Codex child never gets it, in any mode it can run.
+        for mode in (SUB, API):
+            env = build_child_env("codex", home=home, auth_mode=mode, route=ROUTES[mode], parent={"PATH": "/usr/bin", OAUTH: FAKE})
+            self.assertNotIn(OAUTH, env)
+            self.assertNotIn(FAKE, env.to_dict().values())
+        # The route has no field that could carry or store the token, and the module names it only as a passthrough.
+        self.assertEqual({"api_key", "base_url", "provider_switches"}, set(ChildRoute.__dataclass_fields__))
+        for profile in ENGINE_PROFILES.values():
+            self.assertNotIn(OAUTH, (profile.key_name, profile.base_url_name, *profile.provider_switches, *profile.allowed))
+        with self.assertRaises(TypeError):
+            ChildRoute(oauth_token=FAKE)
+
+    def test_codex_routes(self) -> None:
+        home = _home(self)
+        parent = {"PATH": "/usr/bin", **self.AMBIENT, OAUTH: FAKE}
+        env = build_child_env("codex", home=home, auth_mode=SUB, parent=parent)  # as before this change: nothing vendor-shaped
+        self.assertFalse((set(self.AMBIENT) | {OAUTH}) & set(env))
+        env = build_child_env("codex", home=home, auth_mode=API, route=ChildRoute(api_key=USER_KEY), parent=parent)
+        self.assertEqual({"CODEX_API_KEY"}, (set(self.AMBIENT) | {OAUTH}) & set(env))
+        self.assertEqual(USER_KEY, env["CODEX_API_KEY"])
+        self.assertEqual(("CODEX_API_KEY", "route_key_missing"), self._refused("codex", home, auth_mode=API, parent=parent))
+        self.assertEqual(("CODEX_API_KEY", "route_key_not_allowed"),
+                         self._refused("codex", home, auth_mode=SUB, route=ChildRoute(api_key=USER_KEY), parent=parent))
+        self.assertEqual((None, "route_base_url_unsupported"), self._refused(
+            "codex", home, auth_mode=API, route=ChildRoute(api_key=USER_KEY, base_url="https://gateway.invalid"), parent=parent))
+        for route in (None, ChildRoute(provider_switches=(BEDROCK,))):
+            self.assertEqual((None, "auth_mode_unsupported"), self._refused("codex", home, auth_mode=CLOUD, route=route, parent=parent))
+
+    def test_no_secret_in_repr_str_or_refusal_text(self) -> None:
+        home = _home(self)
+        secret, url_secret = "fake-user-entered-SECRET-0123456789", "fakepass-SECRET-9876"
+        url = f"https://fakeuser:{url_secret}@gateway.invalid/api"
+        routes = [ChildRoute(api_key=secret), ChildRoute(api_key=secret, base_url=url),
+                  ChildRoute(api_key=secret, base_url="https://gateway.invalid"),
+                  ChildRoute(api_key=secret, provider_switches=(BEDROCK,)), ChildRoute(api_key=secret, provider_switches=(secret,)),
+                  ChildRoute(api_key=secret + "\0"), ChildRoute(base_url=url), ChildRoute(base_url=url, provider_switches=(VERTEX,))]
+        texts: list[str] = []
+        for route in routes:
+            texts += [repr(route), str(route), f"{route}", f"{route!r:>80}", repr([route]), repr({"route": route})]
+            self.assertTrue(repr(route).startswith("ChildRoute(api_key=<"))
+        refusals = launched = 0
+        for engine in ENGINE_PROFILES:
+            for mode in (*AUTH_MODES, None, "unknown-mode"):
+                for route in routes:
+                    for overrides in (None, {KEY: secret}, {OAUTH: secret}):
+                        try:
+                            env = build_child_env(engine, home=home, auth_mode=mode, route=route, overrides=overrides,
+                                                  parent={"PATH": "/usr/bin", OAUTH: FAKE})
+                        except EnvRefused as refused:
+                            refusals += 1
+                            texts += [str(refused), repr(refused), repr(refused.args), str(refused.name), refused.cause]
+                        else:
+                            launched += 1
+                            texts += [repr(env), str(env), repr(env.dropped), repr(sorted(env))]
+                            self.assertEqual(secret, env[ENGINE_PROFILES[engine].key_name])  # the child does get it
+        self.assertGreater(refusals, 50)
+        self.assertGreater(launched, 1)
+        for text in texts:
+            self.assertNotIn(secret, text)
+            self.assertNotIn(url_secret, text)
+            self.assertNotIn(FAKE, text)
+
+    def test_child_env_reads_no_keyring_and_no_key_file(self) -> None:
+        # Key custody: the caller fetches the key (OS keyring, or the owner-only file); this package is handed it.
+        allowed = {"__future__", "os", "re", "shutil", "stat", "subprocess", "tempfile", "threading", "collections.abc",
+                   "dataclasses", "pathlib", "types", "recursion_core.child_env.policy", "recursion_core.child_env.launch"}
+        for module in (policy, launch):
+            tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+            imported = {alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
+            imported |= {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
+            self.assertLessEqual(imported, allowed, module.__name__)
+            calls = {node.func.id for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+            self.assertNotIn("open", calls, module.__name__)
+        home = _home(self)
+        boom = AssertionError("child_env opened a file")
+        with mock.patch("builtins.open", side_effect=boom), mock.patch("io.open", side_effect=boom), \
+                mock.patch("os.open", side_effect=boom), mock.patch("os.read", side_effect=boom):
+            for mode in AUTH_MODES:
+                env = build_child_env("claude_code", home=home, auth_mode=mode, route=ROUTES[mode],
+                                      parent={"PATH": "/usr/bin", "LANG": "C.UTF-8", OAUTH: FAKE})
+                self.assertEqual(mode, env.auth_mode)
+        self.assertEqual(USER_KEY, build_child_env("claude_code", home=home, auth_mode=API, route=ROUTES[API], parent={})[KEY])
+
+    def test_disable_autoupdater_stays_off_the_claude_allowlist(self) -> None:
+        # Owner call: a Claude child may update its own binary. The name is not carried, not set, and not settable.
+        home = _home(self)
+        for profile in ENGINE_PROFILES.values():
+            self.assertNotIn("DISABLE_AUTOUPDATER", profile.allowed)
+            self.assertNotIn("DISABLE_AUTOUPDATER", profile.passthrough)
+        for mode in AUTH_MODES:
+            with self.subTest(mode=mode):
+                env = build_child_env("claude_code", home=home, auth_mode=mode, route=ROUTES[mode],
+                                      parent={"PATH": "/usr/bin", "DISABLE_AUTOUPDATER": "1"})
+                self.assertNotIn("DISABLE_AUTOUPDATER", env)
+                self.assertIn("DISABLE_AUTOUPDATER", env.dropped)
+                env = build_child_env("claude_code", home=home, auth_mode=mode, route=ROUTES[mode], parent={"PATH": "/usr/bin"})
+                self.assertNotIn("DISABLE_AUTOUPDATER", env)
+                self.assertEqual(("DISABLE_AUTOUPDATER", "override_not_allowed"), self._refused(
+                    "claude_code", home, auth_mode=mode, route=ROUTES[mode], parent={}, overrides={"DISABLE_AUTOUPDATER": "1"}))
 
 
 @unittest.skipIf(os.name == "nt", "POSIX rules")
@@ -434,7 +737,7 @@ class LaunchTests(unittest.TestCase):
 
     def _env(self, engine: str = "codex", **extra: str) -> ValidatedEnv:
         parent = {"PATH": f"{self.bin}:/usr/bin:/bin", "LANG": "C.UTF-8", **extra}
-        return build_child_env(engine, home=self.home, parent=parent)
+        return build_child_env(engine, home=self.home, auth_mode=SUB, parent=parent)
 
     def test_popen_gets_exactly_the_validated_env_not_the_parent(self) -> None:
         planted = {"CODEX_API_KEY": FAKE, "CODEX_ACCESS_TOKEN": FAKE, "OPENAI_API_KEY": FAKE, "ANTHROPIC_API_KEY": FAKE}
@@ -448,6 +751,21 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(env.to_dict(), kwargs["env"])
         self.assertFalse(set(planted) & set(kwargs["env"]))
         self.assertEqual((False, True, True), (kwargs["shell"], kwargs["close_fds"], kwargs["start_new_session"]))
+
+    def test_an_api_key_route_reaches_popen_only_through_the_validated_env(self) -> None:
+        parent = {"PATH": f"{self.bin}:/usr/bin:/bin", KEY: FAKE, URL: "https://ambient.invalid"}
+        with mock.patch.dict(os.environ, {KEY: FAKE, URL: "https://ambient.invalid"}):
+            env = build_child_env("claude_code", home=self.home, auth_mode=API, parent=parent,
+                                  route=ChildRoute(api_key=USER_KEY, base_url="https://gateway.invalid/api"))
+            spawn(["fake-engine", "-p"], env, popen=self.popen)
+        child = self.popen.call_args.kwargs["env"]
+        self.assertEqual((USER_KEY, "https://gateway.invalid/api"), (child[KEY], child[URL]))
+        self.assertNotIn(FAKE, child.values())
+        self.popen.reset_mock()
+        with self.assertRaises(EnvRefused):  # a subscription route carrying a key never reaches Popen
+            env = build_child_env("claude_code", home=self.home, auth_mode=SUB, parent=parent, route=ChildRoute(api_key=USER_KEY))
+            spawn(["fake-engine", "-p"], env, popen=self.popen)
+        self.popen.assert_not_called()
 
     def test_a_plain_mapping_or_os_environ_is_refused(self) -> None:
         for env in (dict(os.environ), os.environ, {"PATH": "/usr/bin"}, None):
@@ -474,7 +792,7 @@ class LaunchTests(unittest.TestCase):
         self.assertIs(True, self.popen.call_args.kwargs["start_new_session"])
 
     def test_argv0_resolves_only_on_the_validated_path(self) -> None:
-        env = build_child_env("codex", home=self.home, parent={"PATH": "/usr/bin:/bin"})
+        env = build_child_env("codex", home=self.home, auth_mode=SUB, parent={"PATH": "/usr/bin:/bin"})
         with mock.patch.dict(os.environ, {"PATH": f"{self.bin}:/usr/bin"}), self.assertRaises(EnvRefused) as caught:
             spawn(["fake-engine"], env, popen=self.popen)
         self.assertEqual("argv0_not_found", caught.exception.cause)
@@ -508,10 +826,10 @@ class LaunchTests(unittest.TestCase):
         for bad in overrides:
             for _ in range(5):
                 with self.subTest(overrides=bad), self.assertRaises(EnvRefused):
-                    env = build_child_env("codex", home=self.home, parent=parent, overrides=bad)
+                    env = build_child_env("codex", home=self.home, auth_mode=SUB, parent=parent, overrides=bad)
                     spawn(["fake-engine"], env, popen=self.popen)
         self.popen.assert_not_called()
-        env = build_child_env("codex", home=self.home, parent=parent, overrides={"LANG": "C.UTF-8"})
+        env = build_child_env("codex", home=self.home, auth_mode=SUB, parent=parent, overrides={"LANG": "C.UTF-8"})
         spawn(["fake-engine"], env, popen=self.popen)
         self.assertEqual("C.UTF-8", self.popen.call_args.kwargs["env"]["LANG"])
 
@@ -521,7 +839,7 @@ class LaunchTests(unittest.TestCase):
         if not os.path.exists("/usr/bin/env"):
             self.skipTest("needs /usr/bin/env")
         with mock.patch.dict(os.environ, {"CODEX_API_KEY": FAKE, "OPENAI_API_KEY": FAKE}):
-            env = build_child_env("codex", home=self.home, parent={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8",
+            env = build_child_env("codex", home=self.home, auth_mode=SUB, parent={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8",
                                                                   "CODEX_API_KEY": FAKE})
             proc = spawn(["/usr/bin/env"], env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             out, _ = proc.communicate(timeout=10)

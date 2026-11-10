@@ -25,6 +25,12 @@ replacement. It builds the child environment from nothing:
   (PRODUCT.md 055cc7a5 section 3.3, Nov 8 fleet correction: nothing removes a built-in sign-in
   method from every run). It is never checked, logged or settable by an override; absent in the
   parent means absent in the child;
+* every call names its auth mode (``subscription``, ``api_key`` or ``cloud_provider``; PRODUCT.md
+  055cc7a5 section 3.3, "Every route starts with an explicit auth mode"; CSLR-D-011). An omitted or
+  unknown mode refuses. The vendor key, the base URL and the cloud-provider switches are route-owned:
+  the parent's values never reach the child in any mode, and the child gets one only from the
+  ``ChildRoute`` the caller passes for the route it launched. This module reads no keyring and no key
+  file; the caller hands it a key it already fetched, on an ``api_key`` route only;
 * one change beyond N5h/N5i: links are resolved one component at a time and every
   link met on the way, including links inside a link's target, must be root's or
   ours in a directory chain no one else can write, and no step may enter ``/proc``,
@@ -50,7 +56,7 @@ import stat
 import tempfile
 import threading
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 
@@ -58,6 +64,8 @@ __all__ = [
     "BASE_NAMES",
     "ENGINE_PROFILES",
     "EngineProfile",
+    "AUTH_MODES",
+    "ChildRoute",
     "EnvRefused",
     "ValidatedEnv",
     "build_child_env",
@@ -153,7 +161,35 @@ _PROXY_URL = re.compile(
     r"^(?:(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*)://)?(?P<userinfo>[^@/]*@)?"
     r"(?P<host>\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+)(?::(?P<port>[0-9]{1,5}))?/?$"
 )
+# A route base URL: http(s)://host[:port][/path]. No user name or password, no query, no fragment.
+_BASE_URL = re.compile(
+    r"^(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*)://(?P<userinfo>[^@/?#]*@)?"
+    r"(?P<host>\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+)(?::(?P<port>[0-9]{1,5}))?(?P<path>/[A-Za-z0-9._~/-]*)?\Z"
+)
 _MAX_LINKS = 40
+# The three routes Recursion owns (PRODUCT.md 055cc7a5 section 3.3; CSLR-D-011). Nothing else is a mode.
+AUTH_MODES = ("subscription", "api_key", "cloud_provider")
+
+
+@dataclass(frozen=True, repr=False)
+class ChildRoute:
+    """What the caller says about the route it launched. Separate from the parent environment and from overrides.
+
+    ``api_key`` is a user-entered vendor key the caller already fetched (from the OS keyring, or the owner-only
+    file on a host with no keyring); it is accepted on an ``api_key`` route only. ``base_url`` is the route's own
+    Anthropic-compatible base, if it has one. ``provider_switches`` are the cloud-provider switches the user
+    picked, by name. ``repr`` and ``str`` show whether a value is set, never the value.
+    """
+
+    api_key: str | None = field(default=None, repr=False)
+    base_url: str | None = field(default=None, repr=False)
+    provider_switches: tuple[str, ...] = ()
+
+    def __repr__(self) -> str:
+        key, url = ("set" if value is not None else "none" for value in (self.api_key, self.base_url))
+        switches = self.provider_switches
+        count = len(switches) if isinstance(switches, (tuple, list, frozenset)) else "?"
+        return f"ChildRoute(api_key=<{key}>, base_url=<{url}>, provider_switches=<{count}>)"
 
 
 @dataclass(frozen=True)
@@ -167,6 +203,12 @@ class EngineProfile:
     # The user's own sign-in names: copied from the parent unchanged when present, never checked, never set by
     # an override, absent when the parent lacks them (PRODUCT.md 055cc7a5 section 3.3, Nov 8 fleet correction).
     passthrough: tuple[str, ...] = ()
+    # Route-owned names. Each is on ``scrub``, so the parent's value and an override never set it; the child
+    # gets it only from the caller's ``ChildRoute``, in the mode that allows it. None or empty: the engine has
+    # no such route here.
+    key_name: str | None = None  # the user-entered vendor key, ``api_key`` mode only
+    base_url_name: str | None = None  # the route's own base URL, any mode
+    provider_switches: tuple[str, ...] = ()  # set to "1" when picked, ``cloud_provider`` mode only
 
 
 _CLAUDE_SCRUB = (
@@ -196,12 +238,16 @@ ENGINE_PROFILES: Mapping[str, EngineProfile] = MappingProxyType(
             ("api.anthropic.com", "platform.claude.com", "claude.ai", "mcp-proxy.anthropic.com"),
             _CLAUDE_SCRUB,
             ("CLAUDE_CODE_OAUTH_TOKEN",),
+            key_name="ANTHROPIC_API_KEY",
+            base_url_name="ANTHROPIC_BASE_URL",
+            provider_switches=("CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"),
         ),
         "codex": EngineProfile(
             "codex",
             BASE_NAMES,
             ("chatgpt.com", "auth.openai.com", "api.openai.com"),
             _CODEX_SCRUB,
+            key_name="CODEX_API_KEY",  # the variable ``codex exec`` reads; no base URL and no cloud switch here
         ),
     }
 )
@@ -210,14 +256,16 @@ ENGINE_PROFILES: Mapping[str, EngineProfile] = MappingProxyType(
 class ValidatedEnv(Mapping[str, str]):
     """An environment ``build_child_env`` produced. Only this type is accepted by the launch boundary."""
 
-    __slots__ = ("_env", "engine", "dropped")
+    __slots__ = ("_env", "engine", "dropped", "auth_mode")
     _seal = object()
 
-    def __init__(self, env: Mapping[str, str], engine: str, dropped: tuple[str, ...], *, _seal: object = None) -> None:
+    def __init__(self, env: Mapping[str, str], engine: str, dropped: tuple[str, ...], *, auth_mode: str | None = None,
+                 _seal: object = None) -> None:
         if _seal is not ValidatedEnv._seal:
             raise TypeError("ValidatedEnv is made only by build_child_env")
         self._env = dict(env)
         self.engine = engine
+        self.auth_mode = auth_mode
         self.dropped = dropped  # parent names left out (names only, never values)
 
     def __getitem__(self, name: str) -> str:
@@ -230,7 +278,7 @@ class ValidatedEnv(Mapping[str, str]):
         return len(self._env)
 
     def __repr__(self) -> str:  # names only: values may be paths an operator considers private
-        return f"ValidatedEnv(engine={self.engine!r}, names={sorted(self._env)!r})"
+        return f"ValidatedEnv(engine={self.engine!r}, auth_mode={self.auth_mode!r}, names={sorted(self._env)!r})"
 
     def to_dict(self) -> dict[str, str]:
         return dict(self._env)
@@ -240,11 +288,16 @@ def build_child_env(
     engine: str,
     *,
     home: str,
+    auth_mode: str | None = None,
+    route: ChildRoute | None = None,
     parent: Mapping[str, str] | None = None,
     overrides: Mapping[str, str] | None = None,
 ) -> ValidatedEnv:
     """Return the environment for one engine child, or raise ``EnvRefused`` before any spawn.
 
+    ``auth_mode`` is required: one of ``AUTH_MODES``. Omitted refuses with ``auth_mode_missing``, anything else
+    with ``auth_mode_unknown``. ``route`` carries what the caller says about the route it launched (see
+    ``ChildRoute``); the parent's vendor key, base URL and provider switches are dropped in every mode.
     ``home`` is the route-owned private home the child gets as HOME; the parent's HOME is never passed.
     ``overrides`` are values the core itself sets. An override may only set a name already on this engine's
     allowlist (never HOME, PATH, a credential or a scrubbed name), and it is merged before the checks, so it
@@ -256,6 +309,11 @@ def build_child_env(
     profile = ENGINE_PROFILES.get(engine) if isinstance(engine, str) else None
     if profile is None:
         raise EnvRefused(None, "unknown_engine")
+    if auth_mode is None:
+        raise EnvRefused(None, "auth_mode_missing")
+    if not isinstance(auth_mode, str) or auth_mode not in AUTH_MODES:
+        raise EnvRefused(None, "auth_mode_unknown")
+    route_env = _route_env(profile, auth_mode, route)  # refuses before anything is read from the parent
     if not _private_dir(home):
         raise EnvRefused("HOME", "home_unsafe")
     source = dict(os.environ if parent is None else parent)
@@ -299,7 +357,70 @@ def build_child_env(
                     or (name not in profile.allowed and name not in profile.passthrough and _DENIED.search(name)))
     if leaked:  # unreachable by construction; kept so a later edit to the allowlist fails closed
         raise EnvRefused(leaked[0], "scrub_failed")
-    return ValidatedEnv(env, engine, dropped, _seal=ValidatedEnv._seal)
+    env.update(route_env)  # last: only what this call's route named, never a parent or override value
+    return ValidatedEnv(env, engine, dropped, auth_mode=auth_mode, _seal=ValidatedEnv._seal)
+
+
+def _route_env(profile: EngineProfile, auth_mode: str, route: ChildRoute | None) -> dict[str, str]:
+    """The route-owned names for this call, or a refusal. A refusal names the variable, never a value."""
+
+    if route is None:
+        route = ChildRoute()
+    if type(route) is not ChildRoute:
+        raise EnvRefused(None, "route_malformed")
+    switches = route.provider_switches
+    if not isinstance(switches, (tuple, list, frozenset)) or not all(isinstance(name, str) for name in switches):
+        raise EnvRefused(None, "route_malformed")
+    if auth_mode == "cloud_provider" and not profile.provider_switches:
+        raise EnvRefused(None, "auth_mode_unsupported")  # this engine has no cloud-provider route here
+    out: dict[str, str] = {}
+
+    if route.api_key is not None:
+        if auth_mode != "api_key":
+            raise EnvRefused(profile.key_name, "route_key_not_allowed")
+        if not isinstance(route.api_key, str) or not route.api_key or "\0" in route.api_key:
+            raise EnvRefused(profile.key_name, "route_key_malformed")
+    if auth_mode == "api_key":
+        if profile.key_name is None:
+            raise EnvRefused(None, "auth_mode_unsupported")
+        if route.api_key is None:  # without a key the child would fall back to a sign-in: a different billing class
+            raise EnvRefused(profile.key_name, "route_key_missing")
+        out[profile.key_name] = route.api_key
+
+    if auth_mode == "cloud_provider":
+        if not switches:
+            raise EnvRefused(None, "route_provider_missing")
+        for name in switches:
+            if name not in profile.provider_switches:
+                raise EnvRefused(None, "route_provider_unknown")
+            out[name] = "1"
+    elif switches:
+        raise EnvRefused(None, "route_provider_not_allowed")
+
+    if route.base_url is not None:
+        if profile.base_url_name is None:
+            raise EnvRefused(None, "route_base_url_unsupported")
+        if (cause := _unsafe_base_url(route.base_url)) is not None:
+            raise EnvRefused(profile.base_url_name, cause)
+        out[profile.base_url_name] = route.base_url
+    return out
+
+
+def _unsafe_base_url(value: object) -> str | None:
+    """A route base URL is http(s)://host[:port][/path]: no user name or password, no query, no fragment."""
+
+    if not isinstance(value, str):
+        return "base_url_malformed"
+    match = _BASE_URL.match(value)
+    if match is None or match["scheme"].lower() not in ("http", "https"):
+        return "base_url_malformed"
+    if match["userinfo"] is not None:
+        return "base_url_userinfo"
+    if match["port"] is not None and not 0 < int(match["port"]) < 65536:
+        return "base_url_malformed"
+    if ".." in (match["path"] or "").split("/"):
+        return "base_url_malformed"
+    return None
 
 
 def _unsafe_value(name: str, value: str) -> str | None:

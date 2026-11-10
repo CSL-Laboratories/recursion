@@ -857,11 +857,14 @@ def _hermes_config_is_ours(engine: str, route_home: str) -> bool:
         except OSError:
             raise _refuse_hermes_config(engine, "config.yaml") from None
         try:
-            opened = os.fstat(fd)
-            if (not stat.S_ISREG(opened.st_mode) or opened.st_size != len(_HERMES_ADOPT_YAML)
-                    or opened.st_uid != os.geteuid()):
-                raise _refuse_hermes_config(engine, "config.yaml")
-            data = os.read(fd, len(_HERMES_ADOPT_YAML) + 1)
+            try:
+                opened = os.fstat(fd)
+                if (not stat.S_ISREG(opened.st_mode) or opened.st_size != len(_HERMES_ADOPT_YAML)
+                        or opened.st_uid != os.geteuid()):
+                    raise _refuse_hermes_config(engine, "config.yaml")
+                data = os.read(fd, len(_HERMES_ADOPT_YAML) + 1)
+            except OSError:
+                raise _refuse_hermes_config(engine, "config.yaml") from None
         finally:
             os.close(fd)
     finally:

@@ -177,7 +177,7 @@ class NousTests(unittest.TestCase):
 class DoctorTests(unittest.TestCase):
     def test_doctor_reports_address_and_never_raises(self) -> None:
         self.assertEqual(nous_proxy_doctor("http://127.0.0.1:8645/v1", current_user="u", interactive_users=["u"]),
-                         {"ok": True, "address": "http://127.0.0.1:8645/v1", "cause": "", "warnings": ()})
+                         {"ok": True, "address": "http://127.0.0.1:8645", "cause": "", "warnings": ()})
         bad = nous_proxy_doctor("http://10.1.2.3:8645")
         self.assertEqual((bad["ok"], bad["address"], bad["cause"]), (False, "http://10.1.2.3:8645", "proxy_not_loopback"))
         self.assertEqual(nous_proxy_doctor(None)["cause"], "proxy_address_missing")

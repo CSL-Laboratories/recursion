@@ -27,7 +27,7 @@ import os
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 __all__ = [
     "COPILOT_TOKEN_ENV",
@@ -143,54 +143,89 @@ def check_copilot_own_loop(
     return OwnLoopDecision("copilot", "copilot_cli_sign_in", MappingProxyType(child), removed, model=model)
 
 
-def _screen_parent_env(engine: str, parent_env: object) -> Mapping[str, str]:
-    """Refuse a parent env that is not a string map ``Popen`` can encode.
+def _screen_parent_env(engine: str, parent_env: object) -> dict[str, str]:
+    """Copy a parent env into a plain dict ``Popen`` can encode.
 
-    A non-string name used to raise ``AttributeError`` from ``str.upper``. A null or text this
-    process cannot encode used to crash at launch (``ValueError`` or ``UnicodeEncodeError``).
+    The returned dict is the only map the rest of the check reads. A later ``.items()`` on the
+    caller's mapping, or a login callback that mutates that mapping, cannot add a null or a new
+    name. A non-string used to raise ``AttributeError``. A null, an ``=`` in a name, or text this
+    process cannot encode used to crash at launch.
     """
 
     if not isinstance(parent_env, Mapping):
         raise OwnLoopRouteRefused(engine, "parent_env_malformed")
+    snapshot: dict[str, str] = {}
     for name, value in parent_env.items():
-        if not isinstance(name, str) or not isinstance(value, str) or "\x00" in name or "\x00" in value:
+        if (not isinstance(name, str) or not isinstance(value, str) or "=" in name
+                or "\x00" in name or "\x00" in value):
             raise OwnLoopRouteRefused(engine, "parent_env_malformed")
         try:
             os.fsencode(name)
             os.fsencode(value)
         except UnicodeEncodeError:
             raise OwnLoopRouteRefused(engine, "env_unencodable") from None
-    return parent_env
+        snapshot[name] = value
+    return snapshot
+
+
+_ORIGIN_PORTS = {"http": 80, "https": 443, "ftp": 21}
 
 
 def _reported_address(base_url: object) -> str:
-    """The address a doctor line may repeat. A URL with a user or password is not repeated."""
+    """``scheme://host:port`` only. The raw input, userinfo, path, query and fragment are never returned.
+
+    A percent-encoded authority that hides ``user:secret@host`` (``user%3Asecret%40host``) has no
+    safe host to report, so the address is empty.
+    """
 
     if not isinstance(base_url, str):
         return ""
+    raw = base_url.strip()
+    if not raw or any(ord(char) < 32 or ord(char) == 127 for char in raw):
+        return ""
     try:
-        parts = urlsplit(base_url)
+        parts = urlsplit(raw)
     except ValueError:
         return ""
-    if parts.username or parts.password:
+    netloc = parts.netloc
+    if "%" in netloc and "@" in unquote(netloc):
         return ""
-    return base_url
+    try:
+        host = parts.hostname
+        port = parts.port
+    except ValueError:
+        return ""
+    scheme = parts.scheme.lower()
+    if not scheme or not host or "%" in host or "@" in host:
+        return ""
+    if port is None:
+        port = _ORIGIN_PORTS.get(scheme)
+    host_text = f"[{host}]" if ":" in host else host
+    if port is None:
+        return f"{scheme}://{host_text}"
+    return f"{scheme}://{host_text}:{port}"
 
 
 def _loopback_url(base_url: object) -> str:
     if not isinstance(base_url, str) or not base_url.strip():
         raise OwnLoopRouteRefused("nous", "proxy_address_missing")
     text = base_url.strip()
+    if any(ord(char) < 32 or ord(char) == 127 for char in text):
+        raise OwnLoopRouteRefused("nous", "proxy_address_malformed")
     try:
         parts = urlsplit(text)
-        host = parts.hostname
     except ValueError:
         raise OwnLoopRouteRefused("nous", "proxy_address_malformed") from None
-    # Before the scheme check: a bad scheme used to put the whole URL, password included, in the refusal.
-    if parts.username or parts.password:
+    # Before the scheme check, and before any host is copied into a refusal. ``user%3Asecret%40host``
+    # is userinfo even though ``urlsplit`` does not set ``username``. A query or fragment can carry
+    # a token; an empty ``?`` or ``#`` does not.
+    netloc = parts.netloc
+    if (parts.username is not None or parts.password is not None
+            or ("%" in netloc and "@" in unquote(netloc)) or parts.query or parts.fragment):
         raise OwnLoopRouteRefused("nous", "recursion_holds_no_token", "credentials in proxy URL")
     try:
-        parts.port  # noqa: B018 - raises on a bad port
+        host = parts.hostname
+        _ = parts.port  # raises ValueError when the port is not an integer; the text is not reused
     except ValueError:
         raise OwnLoopRouteRefused("nous", "proxy_address_malformed") from None
     if parts.scheme not in _NOUS_SCHEMES or not host:
@@ -199,11 +234,15 @@ def _loopback_url(base_url: object) -> str:
         addr = ipaddress.ip_address(host)
     except ValueError:
         # A name (even "localhost") is not resolved here; only a loopback literal is provably local.
-        raise OwnLoopRouteRefused("nous", "proxy_not_loopback", f"{host}: use 127.0.0.1 or ::1") from None
+        detail = host if host and "%" not in host and "@" not in host else ""
+        raise OwnLoopRouteRefused("nous", "proxy_not_loopback",
+                                  f"{detail}: use 127.0.0.1 or ::1" if detail else "use 127.0.0.1 or ::1") from None
     if getattr(addr, "ipv4_mapped", None) is not None:
         addr = addr.ipv4_mapped
     if not addr.is_loopback:
-        raise OwnLoopRouteRefused("nous", "proxy_not_loopback", host)
+        detail = host if "%" not in host and "@" not in host else ""
+        raise OwnLoopRouteRefused("nous", "proxy_not_loopback",
+                                  f"{detail}: use 127.0.0.1 or ::1" if detail else "use 127.0.0.1 or ::1")
     return base_url.strip()
 
 
@@ -244,11 +283,11 @@ def nous_proxy_doctor(
 
     warnings = _shared_host_warning(current_user, interactive_users)
     try:
-        url = _loopback_url(base_url)
+        _loopback_url(base_url)
     except OwnLoopRouteRefused as exc:
         return {"ok": False, "address": _reported_address(base_url), "cause": exc.cause,
                 "warnings": warnings}
-    return {"ok": True, "address": url, "cause": "", "warnings": warnings}
+    return {"ok": True, "address": _reported_address(base_url), "cause": "", "warnings": warnings}
 
 
 def _shared_host_warning(current_user: str | None, interactive_users: Iterable[str] | None) -> tuple[str, ...]:

@@ -13,6 +13,7 @@ database path.
 
 from __future__ import annotations
 
+import errno
 import os
 import shutil
 import stat
@@ -20,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from unittest import mock
 
@@ -148,11 +150,103 @@ class SubscriptionRobustness(unittest.TestCase):
         self.assertNotIn(_SECRET, str(caught.exception))
         self.assertNotIn(_SECRET, caught.exception.detail)
         doctor = nous_proxy_doctor(url)
-        self.assertEqual((False, "", "recursion_holds_no_token"), (doctor["ok"], doctor["address"], doctor["cause"]))
+        self.assertEqual((False, "ftp://127.0.0.1:9", "recursion_holds_no_token"),
+                         (doctor["ok"], doctor["address"], doctor["cause"]))
         self.assertNotIn(_SECRET, str(doctor))
         http = nous_proxy_doctor(f"http://user:{_SECRET}@10.1.2.3:9")
-        self.assertEqual("", http["address"])
+        self.assertEqual("http://10.1.2.3:9", http["address"])
         self.assertNotIn(_SECRET, str(http))
+
+    def test_screened_parent_env_is_a_snapshot(self) -> None:
+        # A mapping that changes between .items() calls, and a login callback that mutates the
+        # caller's dict, must not put a NUL into the child after the screen has passed.
+        class _Flip(Mapping[str, str]):
+            def __init__(self) -> None:
+                self.reads = 0
+
+            def __getitem__(self, key: str) -> str:
+                return dict(self.items())[key]
+
+            def __iter__(self) -> Iterator[str]:
+                return iter(dict(self.items()))
+
+            def __len__(self) -> int:
+                return 3
+
+            def items(self):  # type: ignore[override]
+                self.reads += 1
+                lang = "C" if self.reads == 1 else "C\0"
+                return iter((("PATH", "/usr/bin"), ("HOME", str(self_home)), ("LANG", lang)))
+
+        self_home = str(self.home)
+        route = {"engine": "nous", "auth": "subscription", "method": "hermes_local_proxy",
+                 "base_url": "http://127.0.0.1:9"}
+        decision = check_nous_own_loop(route, _Flip())
+        self.assertEqual("C", dict(decision.child_env).get("LANG"))
+        self.assertNotIn("\0", "".join(dict(decision.child_env).values()))
+        original = {"PATH": "/usr/bin", "HOME": str(self.home), "LANG": "C"}
+
+        def mutate() -> bool:
+            original["LANG"] = "C\0"
+            return True
+
+        copilot = check_copilot_own_loop(
+            {"engine": "copilot", "auth": "subscription", "method": "copilot_cli_sign_in"},
+            original, has_copilot_login=mutate,
+        )
+        self.assertEqual("C", dict(copilot.child_env).get("LANG"))
+        self.assertNotIn("\0", "".join(dict(copilot.child_env).values()))
+
+    def test_doctor_reports_canonical_origin_only(self) -> None:
+        secret = "CANARYSECRET"
+        route = {"engine": "nous", "auth": "subscription", "method": "hermes_local_proxy"}
+        malformed = f"ftp:user:{secret}@127.0.0.1:9"
+        doctor = nous_proxy_doctor(malformed)
+        self.assertNotIn(secret, str(doctor))
+        self.assertEqual("", doctor["address"])
+        queried = f"http://127.0.0.1:9/?token={secret}"
+        with self.assertRaises(OwnLoopRouteRefused) as caught:
+            check_nous_own_loop({**route, "base_url": queried}, {"PATH": "/usr/bin", "HOME": str(self.home)})
+        self.assertEqual("recursion_holds_no_token", caught.exception.cause)
+        self.assertNotIn(secret, str(caught.exception))
+        queried_doctor = nous_proxy_doctor(queried)
+        self.assertEqual((False, "http://127.0.0.1:9"), (queried_doctor["ok"], queried_doctor["address"]))
+        self.assertNotIn(secret, str(queried_doctor))
+        encoded = f"http://user%3A{secret}%40127.0.0.1:9"
+        with self.assertRaises(OwnLoopRouteRefused) as encoded_caught:
+            check_nous_own_loop({**route, "base_url": encoded}, {"PATH": "/usr/bin", "HOME": str(self.home)})
+        self.assertNotIn(secret, str(encoded_caught.exception))
+        self.assertNotIn("%3A", str(encoded_caught.exception))
+        encoded_doctor = nous_proxy_doctor(encoded)
+        self.assertEqual("", encoded_doctor["address"])
+        self.assertNotIn(secret, str(encoded_doctor))
+        self.assertNotIn("%3A", encoded_doctor["address"])
+
+    def test_equals_in_env_name_refuses(self) -> None:
+        with self.assertRaises(OwnLoopRouteRefused) as caught:
+            check_nous_own_loop(
+                {"engine": "nous", "auth": "subscription", "method": "hermes_local_proxy",
+                 "base_url": "http://127.0.0.1:9"},
+                {"PATH": "/usr/bin", "HOME": str(self.home), "BAD=NAME": "value"},
+            )
+        self.assertEqual("parent_env_malformed", caught.exception.cause)
+        self.assertNotIn("BAD=NAME", str(caught.exception))
+
+    def test_hermes_config_read_eio_refuses(self) -> None:
+        hermes = self.home / ".hermes"
+        hermes.mkdir(mode=0o700)
+        config = hermes / "config.yaml"
+        config.write_bytes(b"auth:\n  adopt_external_logins: false\n")
+        os.chmod(config, 0o600)
+
+        def fail_read(fd: int, size: int) -> bytes:
+            raise OSError(errno.EIO, "Input/output error")
+
+        with mock.patch("recursion_core.subscription_routes.policy.os.read", side_effect=fail_read):
+            with self.assertRaises(SubscriptionRouteRefused) as caught:
+                self._guard()
+        self.assertEqual("hermes_config_blocks_adopt_override", caught.exception.cause)
+        self.calls.assert_not_called()
 
     def test_non_string_env_key_refuses(self) -> None:
         with self.assertRaises(OwnLoopRouteRefused) as caught:

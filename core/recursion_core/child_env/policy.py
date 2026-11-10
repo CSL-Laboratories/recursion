@@ -362,10 +362,15 @@ def build_child_env(
             raise EnvRefused(name, cause)
     if "PATH" in env and (cause := _unsafe_path(env["PATH"])) is not None:
         raise EnvRefused("PATH", cause)
-    # A bypass only matters when a proxy is set: "*" skips it for every host, an engine-host entry for that engine.
+    # A bypass only matters when a proxy is set. "*" skips every host. An entry that matches an engine
+    # endpoint, or the route's own base host, skips the proxy for that host; a CIDR matches an IP it contains.
     if any(env.get(name) for name in VALUE_URLS + VALUE_ALL_PROXY):
+        hosts = profile.hosts
+        base = route_env.get(profile.base_url_name) if profile.base_url_name else None
+        if base is not None:
+            hosts = hosts + (_origin(base)[1],)
         for name in [name for name in NO_PROXY_NAMES if name in env]:
-            if (cause := _no_proxy_bypass(env[name], profile.hosts)) is not None:
+            if (cause := _no_proxy_bypass(env[name], hosts)) is not None:
                 raise EnvRefused(name, cause)
     # N5h option A: a temp name is replaced by one private route temp root, never checked or passed.
     present = [name for name in TEMP_NAMES if name in env]
@@ -634,22 +639,89 @@ def _unsafe_path(value: str) -> str | None:
     return None
 
 
-def _no_proxy_bypass(value: str, hosts: tuple[str, ...]) -> str | None:
-    """N5i: comma and whitespace split; the union of curl, requests, hyper-util, undici and Codex matchers."""
+def _no_proxy_host(host: str) -> str:
+    """The host a NO_PROXY entry is compared with: lower case, no brackets, no trailing dot."""
 
-    for entry in re.split(r"[,\s]+", value.strip().lower()):
-        entry = re.sub(r"^[a-z][a-z0-9+.-]*://", "", entry).strip("[]")
-        entry = re.sub(r":[0-9]*$", "", entry).rstrip(".")
+    host = host.lower()
+    if len(host) >= 2 and host[0] == "[" and host[-1] == "]":
+        host = host[1:-1]
+    return host.rstrip(".")
+
+
+def _no_proxy_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    try:
+        return ipaddress.ip_address(host)
+    except ValueError:
+        return None
+
+
+def _no_proxy_network(entry: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network | None:
+    """A CIDR entry, or None. Host bits may be set (``10.1.2.3/8``); the prefix is what is matched."""
+
+    if "/" not in entry:
+        return None
+    try:
+        return ipaddress.ip_network(entry, strict=False)
+    except ValueError:
+        return None
+
+
+def _network_covers(network: ipaddress.IPv4Network | ipaddress.IPv6Network, hosts: tuple[str, ...]) -> bool:
+    for host in hosts:
+        address = _no_proxy_ip(host)
+        if address is not None and address.version == network.version and address in network:
+            return True
+    return False
+
+
+def _normalize_no_proxy_entry(entry: str) -> str:
+    """Scheme already removed. Strip a port from a name or an IPv4 address, and keep every IPv6 hextet.
+
+    ``api.anthropic.com:443`` and ``10.1.2.3:80`` lose their port. A bare or bracketed IPv6 address does not:
+    the old ``:[0-9]*$`` strip turned ``::1`` into ``:``.
+    """
+
+    bracket = re.fullmatch(r"\[([^\]]*)\](?::[0-9]*)?", entry)
+    if bracket:
+        return bracket.group(1).rstrip(".")
+    if entry.count(":") > 1:
+        return entry.rstrip(".")
+    return re.sub(r":[0-9]*$", "", entry.strip("[]")).rstrip(".")
+
+
+def _no_proxy_bypass(value: str, hosts: tuple[str, ...]) -> str | None:
+    """N5i: comma and whitespace split; the union of curl, requests, hyper-util, undici and Codex matchers.
+
+    ``hosts`` is the engine's own endpoints plus the route base host, when the route has one. A CIDR entry
+    matches an IP host it contains (curl, requests and hyper-util). It does not match a domain name: none of
+    those matchers resolve DNS. Two spellings of one IP address match (``::1`` and ``0:0:0:0:0:0:0:1``).
+    """
+
+    checked = tuple(_no_proxy_host(host) for host in hosts)
+    for raw in re.split(r"[,\s]+", value.strip().lower()):
+        entry = re.sub(r"^[a-z][a-z0-9+.-]*://", "", raw)
+        if not entry:
+            continue
+        network = _no_proxy_network(entry)
+        if network is not None:
+            if _network_covers(network, checked):
+                return "no_proxy_engine_host"
+            continue
+        entry = _normalize_no_proxy_entry(entry)
         if not entry:
             continue
         if entry.strip("*.") == "":
             return "no_proxy_wildcard"
         if "*" in entry:
             pattern = re.compile(".*".join(re.escape(part) for part in entry.split("*")) + r"\Z")
-            hit = any(pattern.match(host) for host in hosts)
+            hit = any(pattern.match(host) for host in checked)
         else:
             bare = entry.lstrip(".")
-            hit = any(host == bare or host.endswith("." + bare) for host in hosts)
+            address = _no_proxy_ip(bare)
+            hit = any(
+                host == bare or host.endswith("." + bare) or (address is not None and _no_proxy_ip(host) == address)
+                for host in checked
+            )
         if hit:
             return "no_proxy_engine_host"
     return None

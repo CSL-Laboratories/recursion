@@ -486,6 +486,31 @@ def cells(s: Scratch) -> list[Cell]:
     for name, engine, value, with_proxy in ordinary:
         parent = {"NO_PROXY": value, **({"HTTPS_PROXY": PROXY} if with_proxy else {})}
         add("no_proxy_ok", name, parent, L(_same(NO_PROXY=value)), engine=engine)
+
+    # The route base host is an endpoint the child uses. While a proxy is set, a NO_PROXY entry that matches it
+    # refuses, including a CIDR that contains an IP literal. A CIDR does not match a domain name.
+    gateway = ChildRoute(api_key=USER_KEY, base_url=base_url)
+    ip_route = ChildRoute(api_key=USER_KEY, base_url="http://10.1.2.3:4000")
+    add("no_proxy_route", "route_host", {"HTTPS_PROXY": PROXY, "NO_PROXY": "gateway.invalid"}, R("no_proxy_engine_host"),
+        auth=api, route=gateway)
+    add("no_proxy_route", "route_suffix", {"HTTPS_PROXY": PROXY, "NO_PROXY": ".invalid"}, R("no_proxy_engine_host"),
+        auth=api, route=gateway)
+    add("no_proxy_route", "route_cidr", {"HTTPS_PROXY": PROXY, "NO_PROXY": "10.0.0.0/8"}, R("no_proxy_engine_host"),
+        auth=api, route=ip_route)
+    add("no_proxy_route", "route_cidr_v6", {"HTTPS_PROXY": PROXY, "NO_PROXY": "::1/128"}, R("no_proxy_engine_host"),
+        auth=api, route=ChildRoute(api_key=USER_KEY, base_url="http://[::1]:4000"))
+    add("no_proxy_route", "route_host_trusted", {"HTTPS_PROXY": PROXY, "NO_PROXY": "gateway.invalid"},
+        R("no_proxy_engine_host"), route=ChildRoute(base_url=base_url, trusted_base_urls=("https://gateway.invalid",)))
+    add("no_proxy_route_ok", "cidr_other_net", {"HTTPS_PROXY": PROXY, "NO_PROXY": "192.168.0.0/16"},
+        L(_same(NO_PROXY="192.168.0.0/16", **{url: "http://10.1.2.3:4000"})), auth=api, route=ip_route)
+    add("no_proxy_route_ok", "cidr_domain", {"HTTPS_PROXY": PROXY, "NO_PROXY": "10.0.0.0/8"},
+        L(_same(NO_PROXY="10.0.0.0/8", **{url: base_url})), auth=api, route=gateway)
+    add("no_proxy_route_ok", "cidr_no_route", {"HTTPS_PROXY": PROXY, "NO_PROXY": "10.0.0.0/8,localhost"},
+        L(_same(NO_PROXY="10.0.0.0/8,localhost")))
+    add("no_proxy_route_ok", "host_without_proxy", {"NO_PROXY": "gateway.invalid"},
+        L(_same(NO_PROXY="gateway.invalid", **{url: base_url})), auth=api, route=gateway)
+    add("no_proxy_route_ok", "lookalike", {"HTTPS_PROXY": PROXY, "NO_PROXY": "notgateway.invalid,gateway.invalid.example"},
+        L(_same(**{url: base_url})), auth=api, route=gateway)
     return out
 
 

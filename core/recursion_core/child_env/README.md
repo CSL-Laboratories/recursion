@@ -94,6 +94,12 @@ Foundry switches are dropped. The child gets one only from the route:
   and the same host in a proxy value refuses with `proxy_malformed`. On an `api_key` or `cloud_provider`
   route a URL that meets this rule is set as it is. On a `subscription` route it must also
   pass the rule in [Subscription base URL](#subscription-base-url).
+- **`NO_PROXY` includes the route host.** While a proxy is set (`HTTP_PROXY`, `HTTPS_PROXY`,
+  `ALL_PROXY`, or the lowercase names), `NO_PROXY` / `no_proxy` is checked against the route
+  base host as well as the engine's own endpoints. `NO_PROXY=gateway.invalid` cannot send
+  `https://gateway.invalid` around the proxy (`no_proxy_engine_host`). A CIDR entry matches an
+  IP host it contains (`10.0.0.0/8` covers `10.1.2.3`, `::1/128` covers `::1`) and does not
+  match a domain name. With no proxy set, `NO_PROXY` is kept as it is.
 - **Key custody.** This package is the launch boundary only. It never reads the OS keyring or
   the owner-only key file (A44), and does no keyring or file I/O. The caller fetches the
   user-entered key from the OS keyring, or from the owner-only file on a host with no

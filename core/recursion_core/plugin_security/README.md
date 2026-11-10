@@ -25,7 +25,11 @@ yet called by a running daemon, and not reviewed or accepted.
   `Grant.order_after_revocation_generation` to it (PRODUCT.md 4.4).
 - `approval.ApprovalGate` draws every approval from the effect's canonical bytes,
   accepts only the `operator_ui` principal, binds the decision to the digest and allows
-  one use.
+  one use. A veto is final for that effect digest (CSL-743): a later request for the
+  same effect, an approve of another pending approval for it, and a take of one
+  approved earlier all refuse `approval_vetoed`; a retry is a new intent with a
+  different digest. Expired, used and still-pending approvals do not block a re-request.
+  Vetoes are kept in memory only, so a restart forgets them (known limit).
 - `authority.Authority` verifies installer-signed `csl-authority-profile/vNext`
   profiles against an injected public anchor and enforces scope (account, venue, contract
   family, adapter, environment), provider and model version, permitted actions, window

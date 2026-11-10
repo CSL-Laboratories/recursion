@@ -13,6 +13,11 @@ core health, caller is the effect's plugin, permission, run (owned by the caller
 the effect's connection, not faulted, connection not tripped),
 the one-use approval for this exact digest, then the authority profile and budgets.
 
+A veto is final for that effect digest (CSL-743): after ``approval.decide`` with
+``veto``, ``effect.request`` for the same effect, ``approval.decide`` with ``approve``
+on another approval for it and ``effect.authorize`` with one approved earlier all
+refuse ``approval_vetoed``. The gate's refusal code goes on the wire unchanged.
+
 A tripped connection clears only through the host ops ``breaker.probe_begin`` (one
 lease per tripped connection) and ``breaker.probe_reset`` (spends the lease; clears the
 trip only for a live lease and ``probe_ok`` true), so a consumer that holds only a

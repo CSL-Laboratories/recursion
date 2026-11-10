@@ -16,8 +16,18 @@ units and an opaque ``payload``. The gate never interprets the payload.
   digest from the effect presented, requires an approved, unexpired, unused approval for
   exactly that digest, and consumes it. A second use is refused (replay).
 
+A veto is final for that intent (CSL-743; Lucas's decision on csl-research #1161 item
+5): once the operator vetoes an approval, ``request`` refuses the same effect digest
+with ``approval_vetoed``, without drawing it or storing anything. A still-pending
+approval for that digest can no longer be approved, and one approved earlier can no
+longer be taken; both refuse ``approval_vetoed``. A retry must be a new intent, which
+is a different effect and so a different digest. Only a veto blocks a digest: an
+expired, used or still-undecided approval leaves its effect requestable again.
+
 Approvals live only in memory: a restart drops every pending or unused approval, so a
-restart can only ask again, never approve.
+restart can only ask again, never approve. The vetoed digests are in memory only too,
+so a restart also forgets every veto and the same effect can be requested again. That
+is a known limit: a veto is not final across restarts.
 
 State is bounded. A terminal approval (used, vetoed or expired) drops its effect bytes
 and keeps only its digest and state as a replay tombstone; at most ``max_retained``
@@ -29,6 +39,12 @@ stale tuples exceed ``max(max_retained, live_count)``, so the heap is at least a
 half garbage (or past the retention cap when few entries are live). Early use or veto
 cannot grow heap storage unbounded, and total rebuild work stays linear instead of
 rescanning every pending approval on every other veto.
+
+The vetoed digests are the one structure ``max_retained`` does not bound. They are kept
+apart from the tombstones, so a burst of other approvals cannot evict a veto and undo
+its finality. Each entry is one SHA-256 hex digest (no effect bytes), and the set grows
+only by one per distinct digest the operator vetoes: only the ``operator_ui`` principal
+can add to it, never a plugin request.
 """
 
 from __future__ import annotations
@@ -115,6 +131,11 @@ class ApprovalGate:
         # the heap unbounded and rebuilds stay amortized.
         self._expiry: list[tuple[int, str]] = []
         self._live = 0
+        # Digests the operator vetoed: final for that intent. Not tombstones, so
+        # max_retained eviction never drops one. Digest only, no effect bytes. Growth
+        # is bounded by operator veto decisions (operator_ui principal only), not by
+        # plugin requests. In memory only: a restart forgets every veto.
+        self._vetoed: set[str] = set()
 
     def _retire(self, approval_id: str, item: _Approval, state: str) -> None:
         """Make an entry terminal: drop its bytes, keep a bounded tombstone. Lock held."""
@@ -160,8 +181,11 @@ class ApprovalGate:
     def request(self, effect: dict) -> tuple[str, str]:
         raw = check_effect(effect)
         digest = hashlib.sha256(raw).hexdigest()
-        approval_id = "apr_" + secrets.token_hex(16)
         with self._lock:
+            # Before any id, storage or draw: a refused request leaves no state.
+            if digest in self._vetoed:
+                raise Refused("approval_vetoed")
+            approval_id = "apr_" + secrets.token_hex(16)
             now = self._clock()
             self._sweep(now)
             self._approvals[approval_id] = _Approval(digest, raw, now + self._ttl)
@@ -191,8 +215,13 @@ class ApprovalGate:
                 self._retire(approval_id, item, "expired")
                 raise Refused("approval_expired")
             if approve:
+                # A veto of another approval for this digest is final for the intent.
+                # This one stays pending until it is vetoed or expires.
+                if item.digest in self._vetoed:
+                    raise Refused("approval_vetoed")
                 item.state = "approved"
             else:
+                self._vetoed.add(item.digest)
                 self._retire(approval_id, item, "vetoed")
             return item.state
 
@@ -215,5 +244,8 @@ class ApprovalGate:
             if self._clock() >= item.expires_at:
                 self._retire(approval_id, item, "expired")
                 raise Refused("approval_expired")
+            # Approved before another approval for this digest was vetoed: not usable.
+            if item.digest in self._vetoed:
+                raise Refused("approval_vetoed")
             self._retire(approval_id, item, "used")
             return digest

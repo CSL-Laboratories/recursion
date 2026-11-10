@@ -23,10 +23,12 @@ answered by a caller-supplied probe (``has_copilot_login``), and with no probe t
 from __future__ import annotations
 
 import ipaddress
+import math
+import threading
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 __all__ = [
     "COPILOT_TOKEN_ENV",
@@ -55,6 +57,20 @@ _NOUS_FIELDS = frozenset({"engine", "auth", "method", "base_url", "adapters", "m
 _TOKEN_HINTS = ("token", "key", "secret", "bearer", "password", "credential", "authorization")
 # Proxy settings would send a loopback-bound request to another host (proxy-aware clients honour them).
 _PROXY_ENV = frozenset({"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "FTP_PROXY", "SOCKS_PROXY", "SOCKS5_PROXY"})
+# Credential names the ``*_API_KEY`` / ``*_TOKEN`` suffix misses. ``OPENAI_API_BASE`` is the older
+# spelling of ``OPENAI_BASE_URL``. Git's ``GIT_CONFIG_KEY_*`` / ``GIT_CONFIG_VALUE_*`` channel can
+# carry an HTTP bearer (``http.extraheader``). Matched case-insensitively.
+_CREDENTIAL_ENV = frozenset({
+    "OPENAI_BASE_URL",
+    "OPENAI_API_BASE",
+    "GITHUB_PASSWORD",
+    "GITHUB_PAT",
+    "AWS_SECRET_ACCESS_KEY",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+})
+# A stored-login probe that does not return is not a login. Callers may pass a shorter bound.
+LOGIN_PROBE_DEADLINE_S = 5.0
 _MODEL_MAX = 128
 
 
@@ -118,10 +134,14 @@ def check_copilot_own_loop(
     parent_env: Mapping[str, str],
     *,
     has_copilot_login: Callable[[], bool] | None = None,
+    probe_deadline: float = LOGIN_PROBE_DEADLINE_S,
 ) -> OwnLoopDecision:
     """Decide one Copilot own-loop run. ``route``: engine="copilot", auth="subscription",
     method="copilot_cli_sign_in" (optional ``model``). Returns the child env with every token variable
     and ``COPILOT_API_URL`` removed, or raises ``OwnLoopRouteRefused``.
+
+    The login probe runs with a deadline (``probe_deadline``, at most ``LOGIN_PROBE_DEADLINE_S``).
+    A probe that raises, including ``SystemExit``, or that does not return in time, is not a login.
     """
 
     _common("copilot", route, _COPILOT_FIELDS, "copilot_cli_sign_in")
@@ -129,10 +149,7 @@ def check_copilot_own_loop(
         raise OwnLoopRouteRefused("copilot", "parent_env_malformed")
     if has_copilot_login is None:
         raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "no stored-login probe; gh fallback refused")
-    try:
-        present = has_copilot_login() is True
-    except Exception as exc:  # a failing probe is not a login
-        raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", type(exc).__name__) from None
+    present = _probe_login(has_copilot_login, probe_deadline)
     if not present:
         raise OwnLoopRouteRefused("copilot", "no_stored_copilot_login", "run `copilot login`; gh fallback refused")
     model = _model("copilot", route.get("model"))
@@ -143,19 +160,45 @@ def check_copilot_own_loop(
     return OwnLoopDecision("copilot", "copilot_cli_sign_in", MappingProxyType(child), removed, model=model)
 
 
+def _redact_proxy_address(base_url: object) -> str:
+    """``base_url`` with userinfo removed. Empty when it is not a string ``urlsplit`` can read."""
+
+    if not isinstance(base_url, str):
+        return ""
+    raw = base_url.strip()
+    if not raw:
+        return ""
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return ""
+    if parts.username is None and parts.password is None:
+        return raw
+    netloc = parts.netloc
+    at = netloc.rfind("@")
+    if at == -1:
+        return ""
+    return urlunsplit((parts.scheme, netloc[at + 1:], parts.path, parts.query, parts.fragment))
+
+
 def _loopback_url(base_url: object) -> str:
     if not isinstance(base_url, str) or not base_url.strip():
         raise OwnLoopRouteRefused("nous", "proxy_address_missing")
+    raw = base_url.strip()
     try:
-        parts = urlsplit(base_url.strip())
+        parts = urlsplit(raw)
+    except ValueError:
+        raise OwnLoopRouteRefused("nous", "proxy_address_malformed", "unparseable") from None
+    # Before the scheme check, so an ftp://user:secret@... URL is not copied into the refusal.
+    if parts.username is not None or parts.password is not None:
+        raise OwnLoopRouteRefused("nous", "recursion_holds_no_token", "credentials in proxy URL")
+    try:
         host = parts.hostname
         parts.port  # noqa: B018 - raises on a bad port
     except ValueError as exc:
         raise OwnLoopRouteRefused("nous", "proxy_address_malformed", str(exc)) from None
     if parts.scheme not in _NOUS_SCHEMES or not host:
-        raise OwnLoopRouteRefused("nous", "proxy_address_malformed", base_url)
-    if parts.username or parts.password:
-        raise OwnLoopRouteRefused("nous", "recursion_holds_no_token", "credentials in proxy URL")
+        raise OwnLoopRouteRefused("nous", "proxy_address_malformed", raw)
     try:
         addr = ipaddress.ip_address(host)
     except ValueError:
@@ -165,7 +208,7 @@ def _loopback_url(base_url: object) -> str:
         addr = addr.ipv4_mapped
     if not addr.is_loopback:
         raise OwnLoopRouteRefused("nous", "proxy_not_loopback", host)
-    return base_url.strip()
+    return raw
 
 
 def _adapters(value: object) -> tuple[str, ...]:
@@ -198,16 +241,17 @@ def nous_proxy_doctor(
 ) -> dict:
     """Doctor line for the Hermes proxy: report the address, refuse non-loopback, warn on shared hosts.
 
-    Never raises; returns ``{"ok", "address", "cause", "warnings"}``. ``interactive_users`` is the
-    caller's list of interactive accounts on this host; nothing is probed here. Without it the doctor
-    warns that the host's users are unknown rather than reporting a clean host.
+    Never raises; returns ``{"ok", "address", "cause", "warnings"}``. ``address`` never includes URL
+    userinfo, including when the scheme is not http(s). ``interactive_users`` is the caller's list of
+    interactive accounts on this host; nothing is probed here. Without it the doctor warns that the
+    host's users are unknown rather than reporting a clean host.
     """
 
     warnings = _shared_host_warning(current_user, interactive_users)
     try:
         url = _loopback_url(base_url)
     except OwnLoopRouteRefused as exc:
-        return {"ok": False, "address": base_url if isinstance(base_url, str) else "", "cause": exc.cause,
+        return {"ok": False, "address": _redact_proxy_address(base_url), "cause": exc.cause,
                 "warnings": warnings}
     return {"ok": True, "address": url, "cause": "", "warnings": warnings}
 
@@ -252,8 +296,45 @@ def check_nous_own_loop(
                            _shared_host_warning(current_user, interactive_users), model)
 
 
+def _probe_login(probe: Callable[[], bool], deadline: float) -> bool:
+    """Run ``probe`` until ``deadline``. ``SystemExit`` and a missed deadline are not a login.
+
+    A probe that is still running is not killed (a thread cannot be). It is a daemon, so it does
+    not keep the process alive, and its result is ignored.
+    """
+
+    if (isinstance(deadline, bool) or not isinstance(deadline, (int, float)) or not math.isfinite(deadline)
+            or deadline <= 0 or deadline > LOGIN_PROBE_DEADLINE_S):
+        raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe deadline")
+    box: dict[str, object] = {}
+
+    def run() -> None:
+        try:
+            box["value"] = probe()
+        except BaseException as exc:  # SystemExit included; it must not escape the probe thread
+            box["exc"] = exc
+
+    thread = threading.Thread(target=run, name="copilot-login-probe", daemon=True)
+    thread.start()
+    thread.join(deadline)
+    if thread.is_alive():
+        raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe deadline")
+    exc = box.get("exc")
+    if isinstance(exc, KeyboardInterrupt):
+        raise exc
+    if exc is not None:
+        raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", type(exc).__name__) from None
+    return box.get("value") is True
+
+
+def _is_git_config_injection(upper: str) -> bool:
+    return upper in ("GIT_CONFIG_KEY", "GIT_CONFIG_VALUE") or upper.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
+
+
 def _is_provider_credential(name: str) -> bool:
     upper = name.upper()
     if upper.startswith(("NOUS_", "XAI_", "GROK_", "HERMES_")):
         return True
-    return upper.endswith(("_API_KEY", "_TOKEN", "_AUTH_TOKEN")) or upper in ("OPENAI_BASE_URL",)
+    if upper.endswith(("_API_KEY", "_TOKEN", "_AUTH_TOKEN")) or upper in _CREDENTIAL_ENV:
+        return True
+    return _is_git_config_injection(upper)

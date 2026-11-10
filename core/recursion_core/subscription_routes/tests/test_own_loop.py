@@ -5,6 +5,8 @@ Fakes only: no engine, login store, provider, DNS or network is touched.
 
 from __future__ import annotations
 
+import threading
+import time
 import unittest
 
 from recursion_core.subscription_routes import (
@@ -67,6 +69,39 @@ class CopilotTests(unittest.TestCase):
         self.refused("copilot_login_unknown", copilot(), probe=boom)
         self.refused("no_stored_copilot_login", copilot(), probe=lambda: "yes")
 
+    def test_login_probe_systemexit_refuses(self) -> None:
+        # SystemExit is a BaseException, so `except Exception` lets a probe sys.exit escape.
+        def exits() -> bool:
+            raise SystemExit("do-not-leak-this")
+
+        try:
+            check_copilot_own_loop(copilot(), BASE, has_copilot_login=exits)
+        except OwnLoopRouteRefused as exc:
+            self.assertEqual(exc.cause, "copilot_login_unknown")
+            self.assertEqual(exc.detail, "SystemExit")
+            self.assertNotIn("do-not-leak-this", str(exc))
+        except SystemExit:
+            self.fail("SystemExit escaped the login probe")
+        else:
+            self.fail("probe SystemExit was ignored")
+
+    def test_login_probe_deadline_refuses(self) -> None:
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def hang() -> bool:
+            release.wait(3)
+            return True
+
+        started = time.monotonic()
+        with self.assertRaises(OwnLoopRouteRefused) as caught:
+            check_copilot_own_loop(copilot(), BASE, has_copilot_login=hang, probe_deadline=0.2)
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual(caught.exception.cause, "copilot_login_unknown")
+        self.assertIn("deadline", caught.exception.detail)
+        kept = check_copilot_own_loop(copilot(), BASE, has_copilot_login=lambda: True, probe_deadline=0.5)
+        self.assertEqual(kept.method, "copilot_cli_sign_in")
+
     def test_route_may_not_pass_a_token(self) -> None:
         for name in ("token", "github_token", "COPILOT_GITHUB_TOKEN", "api_key", "bearer"):
             with self.subTest(name=name):
@@ -108,6 +143,25 @@ class NousTests(unittest.TestCase):
         d = check_nous_own_loop(nous(), env)
         self.assertEqual(dict(d.child_env), BASE)
         self.assertNotIn(FAKE, repr(d.child_env))
+
+    def test_credential_aliases_and_git_config_bearer_never_reach_the_child(self) -> None:
+        # Names the *_API_KEY / *_TOKEN matcher misses, and git's config-injection channel.
+        secret = "bearer-not-a-real-token"
+        names = (
+            "GITHUB_PASSWORD", "github_pat", "AWS_SECRET_ACCESS_KEY", "OPENAI_API_BASE",
+            "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_VALUE",
+            "GIT_CONFIG_PARAMETERS",
+        )
+        env = {**BASE, **{name: secret for name in names}}
+        for check in (
+            lambda: check_copilot_own_loop(copilot(), env, has_copilot_login=lambda: True),
+            lambda: check_nous_own_loop(nous(), env),
+        ):
+            with self.subTest(check=check):
+                decision = check()
+                self.assertEqual(dict(decision.child_env), BASE)
+                self.assertNotIn(secret, repr(decision.child_env))
+                self.assertTrue(set(names) <= set(decision.removed_env))
 
     def test_proxy_settings_never_reach_the_nous_child(self) -> None:
         # Devin r4505395127: a proxy-aware client would send loopback-bound traffic to the proxy host.
@@ -184,6 +238,30 @@ class DoctorTests(unittest.TestCase):
         shared = nous_proxy_doctor("http://127.0.0.1:1", current_user="u", interactive_users=["u", "eve"])
         self.assertTrue(shared["ok"])
         self.assertIn("eve", shared["warnings"][0])
+
+    def test_doctor_does_not_echo_proxy_userinfo(self) -> None:
+        secret = "userinfo-secret"
+        leaked = (
+            f"http://user:{secret}@127.0.0.1:8645/v1",
+            f"http://user:{secret}@[::1]:8645/v1",
+            f"ftp://user:{secret}@127.0.0.1/x",
+        )
+        for url in leaked:
+            with self.subTest(url=url.split("@", 1)[0]):
+                report = nous_proxy_doctor(url)
+                self.assertFalse(report["ok"])
+                self.assertNotIn(secret, str(report))
+                self.assertNotIn("@", report["address"].split("://", 1)[-1])
+                try:
+                    check_nous_own_loop(nous(base_url=url), BASE)
+                except OwnLoopRouteRefused as exc:
+                    self.assertNotIn(secret, str(exc))
+                    self.assertNotIn(secret, exc.detail)
+                    if url.startswith("ftp://"):
+                        self.assertEqual(exc.cause, report["cause"])
+                        self.assertEqual("recursion_holds_no_token", exc.cause)
+                else:
+                    self.fail("credential URL was accepted")
 
     def test_doctor_warns_when_host_users_unknown(self) -> None:
         for url in ("http://127.0.0.1:8645/v1", "http://10.1.2.3:8645"):

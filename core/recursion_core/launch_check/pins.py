@@ -29,10 +29,19 @@ items: relative ``/``-separated paths inside the package root. Lucas's owner cal
 2026-11-10 (calls 13/14): "accept a pinned .cmd/.ps1 launcher as a check, but execute the
 pinned entry directly". A Windows ``.cmd``/``.ps1`` launcher is hashed and never executed;
 what is executed is the entry (``grant.LaunchPlan.exec_argv``). Empty means not measured,
-and such a launcher's grant refuses at launch (``pin_entry_unset``).
+and such a launcher's grant refuses at launch (``pin_entry_unset``). Lucas's answer of
+2026-11-10 extends the check-only rule "to a bare or .exe granted path that resolves to a
+script (.cmd/.ps1, by content or resolution as appropriate)"; ``grant`` decides that.
 
-Limits: the interpreter a launcher names (``node``, ``python``) is not pinned unless it
-sits inside the pinned tree; a symlink inside the tree is pinned by its text, not by the
+``Pin.interpreter`` records, as measured fact, that the launcher starts an interpreter from
+outside the pinned tree, named as the launcher resolves it (``node (PATH)``); empty means
+none, or one inside the tree. Lucas's answer of 2026-11-10: "A Windows Pi launch whose
+interpreter (Node from PATH) is outside the pinned tree must refuse with a new typed code
+`interpreter_unpinned`. Hashing external interpreters is post-Nov-11; don't implement it."
+The pin still matches and its grant is issued; every launch on it is refused
+(``interpreter_unpinned``). No outside interpreter is hashed or looked up here.
+
+Limits: a symlink inside the tree is pinned by its text, not by the
 file it points to; a tree that differs per machine (dependency resolution, absolute
 shebang paths, ``__pycache__``) needs its own pin.
 """
@@ -49,7 +58,9 @@ from recursion_core.launch_check.refusals import LaunchRefused
 # A pin added, removed or changed is a new PIN_TABLE_VERSION; grants under another are grant_stale.
 # 1.4.0: the Antigravity CLI 1.5.3 linux_amd64 pin is removed (it was hashed from the release
 # archive, not from an installed agy); archive-sourced pins are never matched; Pin gains `entry`.
-PIN_TABLE_VERSION = "r2a-pins/1.4.0-candidate-2026-11-10"
+# 1.5.0: Pin gains `interpreter`; the two Pi 1.5.1 windows_amd64 rows record "node (PATH)" (their
+# launchers run the Node found on PATH, outside the pinned tree). No hash, size, target or entry changed.
+PIN_TABLE_VERSION = "r2a-pins/1.5.0-candidate-2026-11-10"
 
 KINDS = ("launcher+tree", "binary+launcher")
 _WHAT = {"launcher+tree": "installed package files", "binary+launcher": "binary"}
@@ -74,6 +85,10 @@ class Pin:
     # launcher+tree only: the program the launcher reaches, as argv items relative to `target`
     # (an interpreter and a script inside the tree, say). () is not measured.
     entry: tuple[str, ...] = ()
+    # An interpreter the launcher starts from outside the pinned tree, named as the launcher
+    # resolves it ("node (PATH)"). "" is none, or one inside the tree. It is not hashed, so a
+    # launch on a pin that names one is refused (interpreter_unpinned).
+    interpreter: str = ""
 
 
 @dataclass(frozen=True)
@@ -88,6 +103,10 @@ class Match:
 # install only for Nov 11; no archive-derived pins". Antigravity CLI has no pin: its 1.5.3
 # linux_amd64 row was hashed from the release archive and is removed until someone measures an
 # installed agy. No committed pin has a measured entry, so every entry is ().
+# Lucas, 2026-11-10: "A Windows Pi launch whose interpreter (Node from PATH) is outside the pinned
+# tree must refuse with a new typed code `interpreter_unpinned`." Both Pi launchers run the Node
+# found on PATH (the installer's templates contain no path), so both Pi rows record it. Cursor's
+# node.exe is inside its tree, so its row records none.
 PINS: tuple[Pin, ...] = (
     # The windows_amd64 pins below were measured on Lucas's Windows machine "sentry" with the
     # hasher at commit 66fe11b1. They are reachable on Windows through the .cmd/.ps1 rule
@@ -123,6 +142,7 @@ PINS: tuple[Pin, ...] = (
         platform="windows_amd64",
         measured="2026-11-09",
         source="https://pi.dev/install.ps1",
+        interpreter="node (PATH)",
     ),
     # Pi 1.5.1, windows_amd64: launcher C:\Users\Lucas\.pi\agent\bin\pi.ps1 (500 bytes), next to
     # pi.cmd; same tree as the pi.cmd pin (../install/releases/1.5.1: 16776 entries,
@@ -137,6 +157,7 @@ PINS: tuple[Pin, ...] = (
         platform="windows_amd64",
         measured="2026-11-09",
         source="https://pi.dev/install.ps1",
+        interpreter="node (PATH)",
     ),
 )
 
@@ -213,6 +234,12 @@ def check_entry(kind: str, entry: object) -> None:
                 raise ValueError(f"pin entry {item!r} is not a plain relative path inside the package root")
 
 
+def check_interpreter(interpreter: object) -> None:
+    """``ValueError`` unless ``interpreter`` is text ("" for none outside the tree)."""
+    if type(interpreter) is not str:
+        raise ValueError("pin interpreter is not text")
+
+
 def inside(root_real: str, real: str) -> bool:
     return real.startswith(root_real.rstrip(os.sep) + os.sep)
 
@@ -250,7 +277,7 @@ def launcher_listed(engine: str, launcher_sha256: str) -> bool:
 
 
 def _unusable(p: Pin, kind: str) -> str:
-    """Why a pin is never matched, or "": an archive-derived source, or a bad entry (table bug)."""
+    """Why a pin is never matched, or "": an archive-derived source, or a bad entry or interpreter (table bug)."""
     if archive_sourced(p.source):
         return (
             f"its source {p.source!r} is a vendor archive: archive-derived pins are never matched "
@@ -258,6 +285,7 @@ def _unusable(p: Pin, kind: str) -> str:
         )
     try:
         check_entry(kind, p.entry)
+        check_interpreter(p.interpreter)
     except ValueError as e:
         return str(e)
     return ""
@@ -312,19 +340,21 @@ def match(engine: str, kind: str, launcher_real: str, launcher_sha256: str, note
 
 def measure(
     engine: str, kind: str, path: str, target: str, *, version: str, platform: str, measured: str, source: str,
-    entry: tuple[str, ...] = (),
+    entry: tuple[str, ...] = (), interpreter: str = "",
 ) -> Pin:
     """Measure an install on disk into a ``Pin`` (for re-pinning and tests). Nothing is executed.
 
     ``version`` is supplied by whoever measures (release manifest, package metadata or a
     version read by hand); ``source`` says where the files and the version came from: the
-    real install, never a vendor archive. ``entry`` is what the launcher was read to start.
+    real install, never a vendor archive. ``entry`` is what the launcher was read to start;
+    ``interpreter`` names an interpreter it starts from outside the tree ("" for none).
     """
     if kind not in KINDS:
         raise ValueError(f"unknown pin kind {kind!r}")
     if archive_sourced(source):
         raise ValueError(f"pin source {source!r} is a vendor archive; measure a real install")
     check_entry(kind, entry)
+    check_interpreter(interpreter)
     real = os.path.realpath(path)
     digest, size = sha256_file(real)
     root = resolve_target(real, target)
@@ -332,7 +362,7 @@ def measure(
     return Pin(
         engine=engine, version=version, launcher_sha256=digest, launcher_bytes=size, target=target,
         target_sha256=target_sha256(kind, root),
-        platform=platform, measured=measured, source=source, entry=entry,
+        platform=platform, measured=measured, source=source, entry=entry, interpreter=interpreter,
     )
 
 

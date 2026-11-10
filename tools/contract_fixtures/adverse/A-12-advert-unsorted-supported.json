@@ -1,0 +1,11 @@
+{
+  "type": "WireVersionAdvertisement@1",
+  "vocabulary_version": 1,
+  "supported": [
+    "WireEventEnvelope@1",
+    "WireCommandOutcome@1",
+    "WireIdentityRef@1",
+    "WireVersionAdvertisement@1"
+  ],
+  "sunset": []
+}

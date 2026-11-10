@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fixtures.csl.dev/journal-sequence.schema.json",
+  "title": "WireJournalSequence@1 — command journal replay scenario",
+  "x-status": "draft",
+  "x-description": "Ordered send/expect steps pinning the command journal rules in docs/v3/PUBLIC-WIRE-CONTRACTS.md: first receipt journals command_id -> command_digest; identical retries replay the journaled decision (duplicate for admitted, verbatim for refused/conflict); a different digest under a journaled id is conflict and never rebinds. The send/expect scalar patterns mirror wire-vocab-draft.schema.json's public_id/digest defs.",
+  "type": "object",
+  "required": ["type", "sequence_id", "steps"],
+  "additionalProperties": false,
+  "properties": {
+    "type": { "const": "WireJournalSequence@1" },
+    "sequence_id": {
+      "type": "string",
+      "pattern": "^seq:[a-z0-9][a-z0-9._~-]{0,127}(?![\\s\\S])"
+    },
+    "steps": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "required": ["send", "expect"],
+        "additionalProperties": false,
+        "properties": {
+          "send": {
+            "type": "object",
+            "required": ["command_id", "command_digest"],
+            "additionalProperties": false,
+            "properties": {
+              "command_id": {
+                "type": "string",
+                "pattern": "^cmd:[A-Za-z0-9._~-]{1,128}(?![\\s\\S])"
+              },
+              "command_digest": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}(?![\\s\\S])"
+              }
+            }
+          },
+          "expect": { "type": "object" }
+        }
+      }
+    }
+  }
+}

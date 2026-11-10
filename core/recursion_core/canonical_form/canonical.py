@@ -54,6 +54,12 @@ def _no_constant(text: str) -> Any:
 
 
 def _int(text: str) -> int:
+    # 2^53-1 is 16 digits. Longer tokens are out of range; reject them before
+    # int() so CPython's integer-string limit (4300 digits by default) cannot
+    # turn them into ValueError and then not_json.
+    digits = text[1:] if text.startswith("-") else text
+    if len(digits) > 16:
+        raise CanonicalError("integer_range", text[:40])
     value = int(text)
     if not -MAX_SAFE <= value <= MAX_SAFE:
         raise CanonicalError("integer_range", text[:40])
@@ -70,7 +76,12 @@ def _pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def loads_strict(data: str | bytes) -> Any:
-    """Parse JSON text in the canonical-form domain, or raise :class:`CanonicalError`."""
+    """Parse JSON text in the canonical-form domain, or raise :class:`CanonicalError`.
+
+    A value that is not ``str`` or ``bytes`` is ``not_json``. Nesting the host
+    decoder cannot walk is ``depth``, the same rule as a value deeper than
+    :data:`MAX_DEPTH`.
+    """
     if isinstance(data, bytes):
         if data.startswith(b"\xef\xbb\xbf"):
             raise CanonicalError("bom")
@@ -78,14 +89,19 @@ def loads_strict(data: str | bytes) -> Any:
             data = data.decode("utf-8")
         except UnicodeDecodeError as e:
             raise CanonicalError("not_utf8", e.reason) from None
-    elif data.startswith("﻿"):
-        raise CanonicalError("bom")
+    elif isinstance(data, str):
+        if data.startswith("\ufeff"):
+            raise CanonicalError("bom")
+    else:
+        raise CanonicalError("not_json", type(data).__name__)
     try:
         value = json.loads(data, object_pairs_hook=_pairs, parse_float=_no_float, parse_int=_int,
                            parse_constant=_no_constant)
     except CanonicalError:
         raise
-    except (ValueError, RecursionError) as e:
+    except RecursionError:
+        raise CanonicalError("depth", f"nesting deeper than {MAX_DEPTH}") from None
+    except ValueError as e:
         raise CanonicalError("not_json", str(e)) from None
     check_value(value)
     return value

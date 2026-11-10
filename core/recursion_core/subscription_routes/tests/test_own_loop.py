@@ -21,6 +21,7 @@ import recursion_core.subscription_routes.own_loop as own_loop
 from recursion_core.subscription_routes import (
     COPILOT_STRIP_ENV, OwnLoopRouteRefused, check_copilot_own_loop, check_nous_own_loop, nous_proxy_doctor,
 )
+from recursion_core.child_env import EnvRefused
 from recursion_core.subscription_routes.validated_launch import _blocked_secret
 
 FAKE = "fake-not-a-real-token"
@@ -462,33 +463,57 @@ class CopilotTests(unittest.TestCase):
             self.assertTrue(_process_not_running(sleeper))
 
     def test_an_external_reaper_cannot_free_the_process_group_id(self) -> None:
-        # A SIGCHLD handler that reaps the worker must not leave killpg aimed at a reusable PGID.
-        order: list[str] = []
+        # Once a SIGCHLD handler has reaped the leader, killpg must not run: the process-group id
+        # can be reused. The leader is signalled through its pidfd instead.
+        events: list[tuple[str, int]] = []
         real_killpg = os.killpg
-        real_open = os.pidfd_open
-
-        opened: dict[int, int] = {}
+        real_send = own_loop._pidfd_send_signal
 
         def killpg(pgid: int, sig: int):
-            if sig != 0:
-                order.append("signal")
-                # After an external reap, fdinfo reports Pid -1 while the fd still reserves the id.
-                self.assertTrue(_pidfd_is_open(pgid, opened.get(pgid)), "killpg on a PGID with no live pidfd")
+            events.append(("killpg", sig))
             return real_killpg(pgid, sig)
 
-        def pidfd_open(pid: int, flags: int = 0) -> int:
-            order.append("pidfd")
-            fd = real_open(pid, flags)
-            opened[pid] = fd
-            return fd
+        def send(pidfd: int, sig: int) -> None:
+            events.append(("pidfd", sig))
+            real_send(pidfd, sig)
 
-        previous = signal.signal(signal.SIGCHLD, _reap_children)
+        def note_reap(signum: int, frame: object) -> None:
+            while True:
+                try:
+                    pid, _status = os.waitpid(-1, os.WNOHANG)
+                except ChildProcessError:
+                    return
+                if pid == 0:
+                    return
+                events.append(("reap", pid))
+
+        previous = signal.signal(signal.SIGCHLD, note_reap)
         self.addCleanup(signal.signal, signal.SIGCHLD, previous)
-        with mock.patch.object(own_loop.os, "killpg", killpg), mock.patch.object(own_loop.os, "pidfd_open", pidfd_open):
+        with mock.patch.object(own_loop.os, "killpg", killpg), \
+                mock.patch.object(own_loop, "_pidfd_send_signal", send):
             check_copilot_own_loop(copilot(), BASE, home=_route_home(), has_copilot_login=lambda: True, probe_deadline=1.0)
-        self.assertIn("pidfd", order)
-        self.assertIn("signal", order)
-        self.assertLess(order.index("pidfd"), order.index("signal"))
+        self.assertTrue(any(kind == "reap" for kind, _sig in events), events)
+        self.assertTrue(any(kind == "pidfd" for kind, _sig in events), events)
+        for index, (kind, _sig) in enumerate(events):
+            if kind != "killpg":
+                continue
+            self.assertFalse(
+                any(events[earlier][0] == "reap" for earlier in range(index)),
+                events,
+            )
+
+    def test_an_unsafe_home_does_not_leave_a_copilot_directory(self) -> None:
+        root = tempfile.mkdtemp(prefix="csl-unsafe-home-")
+        self.addCleanup(shutil.rmtree, root, True)
+        os.chmod(root, 0o700)
+        home = os.path.join(root, "open")
+        os.mkdir(home, 0o777)
+        os.chmod(home, 0o777)
+        with self.assertRaises(EnvRefused) as caught:
+            check_copilot_own_loop(copilot(), BASE, home=home, has_copilot_login=lambda: True)
+        self.assertEqual(caught.exception.name, "HOME")
+        self.assertEqual(caught.exception.cause, "home_unsafe")
+        self.assertFalse(os.path.lexists(os.path.join(home, ".copilot")))
 
     def test_check_without_a_route_home_refuses(self) -> None:
         # Ambient account A must not approve a later child that selects account B.
@@ -905,51 +930,6 @@ def _kill_new_children(before: set[int]) -> None:
             os.waitpid(pid, os.WNOHANG)
         except ChildProcessError:
             pass
-
-
-def _reap_children(signum: int, frame: object) -> None:
-    while True:
-        try:
-            pid, _status = os.waitpid(-1, os.WNOHANG)
-        except ChildProcessError:
-            return
-        if pid == 0:
-            return
-
-
-def _pidfd_is_open(pid: int, fd: int | None = None) -> bool:
-    """True when a pidfd for ``pid`` is open.
-
-    ``anon_inode:[pidfd]`` does not include the pid. fdinfo does, until the task is reaped: then
-    the same fd reports ``Pid: -1`` and still reserves the id until it is closed. ``fd`` is the
-    descriptor opened for ``pid``.
-    """
-
-    if fd is not None:
-        try:
-            target = os.readlink(f"/proc/self/fd/{fd}")
-            with open(f"/proc/self/fdinfo/{fd}", encoding="ascii") as handle:
-                info = handle.read()
-        except OSError:
-            return False
-        if "pidfd" not in target:
-            return False
-        return f"Pid:\t{pid}\n" in info or "Pid:\t-1\n" in info
-    for name in os.listdir("/proc/self/fd"):
-        try:
-            target = os.readlink(f"/proc/self/fd/{name}")
-        except OSError:
-            continue
-        if "pidfd" not in target:
-            continue
-        try:
-            with open(f"/proc/self/fdinfo/{name}", encoding="ascii") as handle:
-                info = handle.read()
-        except OSError:
-            continue
-        if f"Pid:\t{pid}\n" in info:
-            return True
-    return False
 
 
 def _stop_recorded(path: str) -> None:

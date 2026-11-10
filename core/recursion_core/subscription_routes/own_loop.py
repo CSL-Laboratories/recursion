@@ -43,9 +43,9 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from urllib.parse import urlsplit
 
-from recursion_core.child_env import build_child_env, spawn
+from recursion_core.child_env import EnvRefused, build_child_env, spawn
 from recursion_core.child_env.policy import (
-    BASE_NAMES, VALUE_ALL_PROXY, VALUE_URLS, _ALL_PROXY_SCHEMES, _unsafe_proxy,
+    BASE_NAMES, VALUE_ALL_PROXY, VALUE_URLS, _ALL_PROXY_SCHEMES, _private_dir, _unsafe_proxy,
 )
 
 __all__ = [
@@ -436,10 +436,11 @@ _ACK = b"\x01"
 
 
 def _probe_enforceable() -> bool:
-    """True when the probe can be grouped and that group id cannot be reused before the signal.
+    """True when the leader can be signalled by pidfd and the group only while it is unreaped.
 
-    ``pidfd_open`` holds the worker pid until the last signal. Without it a reaped leader's
-    process-group id can be reused, so the probe refuses instead of calling ``killpg``.
+    ``pidfd_open`` plus ``pidfd_send_signal`` name the leader after its numeric pid would be
+    unsafe. ``waitid(P_PIDFD)`` says whether that leader is still unreaped before any
+    ``killpg``. Without those, the probe refuses instead of signalling a process-group id.
     """
 
     return (
@@ -448,6 +449,10 @@ def _probe_enforceable() -> bool:
         and hasattr(os, "killpg")
         and hasattr(os, "setsid")
         and hasattr(os, "pidfd_open")
+        and hasattr(os, "waitid")
+        and hasattr(os, "P_PIDFD")
+        and hasattr(os, "WNOWAIT")
+        and _pidfd_send_available()
     )
 
 
@@ -616,7 +621,7 @@ def _probe_login_group(
             outcome["error"] = exc
     finally:
         try:
-            _stop_probe(pid, pgid, started, deadline)
+            _stop_probe(pid, pgid, started, deadline, pidfd)
         finally:
             if selector is not None:
                 selector.close()
@@ -821,19 +826,41 @@ def _finish_probe(outcome: dict[str, object]) -> bool:
     return _interpret_probe_line(line)
 
 
-def _signal_group(pid: int, pgid: int | None, sig: int) -> None:
-    """Signal the confirmed group, or ``pid`` alone when the handshake never arrived.
+_PIDFD_SEND: bool | None = None
+_LIBC = None
 
-    ``InterruptedError`` is retried. This process's group is never signalled. The caller reaps
-    only after this returns, so the numeric pid is not reused before the signal.
+
+def _pidfd_send_available() -> bool:
+    """True when the leader can be signalled by pidfd, not by its numeric pid."""
+
+    global _PIDFD_SEND
+    if _PIDFD_SEND is None:
+        if hasattr(os, "pidfd_send_signal"):
+            _PIDFD_SEND = True
+        else:
+            try:
+                import ctypes
+                _PIDFD_SEND = hasattr(ctypes.CDLL(None, use_errno=True), "pidfd_send_signal")
+            except OSError:
+                _PIDFD_SEND = False
+    return _PIDFD_SEND
+
+
+def _pidfd_send_signal(pidfd: int, sig: int) -> None:
+    """Signal the task ``pidfd`` refers to. A reused numeric pid is not a target.
+
+    ``os.pidfd_send_signal`` is used when this interpreter provides it. Otherwise the libc
+    function of the same name is used. ``ESRCH`` means that task is already gone.
+    ``InterruptedError`` is retried.
     """
 
     while True:
         try:
-            if pgid is not None and pgid > 1 and pgid != os.getpgrp():
-                os.killpg(pgid, sig)
-            elif pid > 0 and pid != os.getpid():
-                os.kill(pid, sig)
+            send = getattr(os, "pidfd_send_signal", None)
+            if send is not None:
+                send(pidfd, sig)
+            else:
+                _pidfd_send_signal_libc(pidfd, sig)
             return
         except InterruptedError:
             continue
@@ -841,13 +868,88 @@ def _signal_group(pid: int, pgid: int | None, sig: int) -> None:
             return
 
 
-def _group_alive(pid: int, pgid: int | None) -> bool:
+def _pidfd_send_signal_libc(pidfd: int, sig: int) -> None:
+    global _LIBC
+    import ctypes
+    if _LIBC is None:
+        _LIBC = ctypes.CDLL(None, use_errno=True)
+        _LIBC.pidfd_send_signal.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_int)
+        _LIBC.pidfd_send_signal.restype = ctypes.c_int
+    if _LIBC.pidfd_send_signal(pidfd, sig, None, 0) == 0:
+        return
+    err = ctypes.get_errno()
+    raise OSError(err, os.strerror(err))
+
+
+def _leader_state(pidfd: int) -> str:
+    """``running``, ``zombie``, or ``reaped``. ``WNOWAIT`` observes the pidfd and does not reap."""
+
     while True:
         try:
-            if pgid is not None and pgid > 1 and pgid != os.getpgrp():
-                os.killpg(pgid, 0)
-            else:
-                os.kill(pid, 0)
+            info = os.waitid(os.P_PIDFD, pidfd, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        except InterruptedError:
+            continue
+        except ChildProcessError:
+            return "reaped"
+        except OSError:
+            return "reaped"
+        return "zombie" if info is not None else "running"
+
+
+def _killpg_if_unreaped(pidfd: int, pgid: int | None, sig: int) -> None:
+    """``killpg`` only while ``waitid`` says the leader is still unreaped.
+
+    A reaped leader's process-group id can be reused, so this returns without signalling.
+    ``SIGCHLD`` is blocked by the caller across this check and the signal. This process's
+    group is never signalled. ``InterruptedError`` is retried.
+    """
+
+    if pgid is None or pgid <= 1 or pgid == os.getpgrp():
+        return
+    if _leader_state(pidfd) == "reaped":
+        return
+    while True:
+        try:
+            os.killpg(pgid, sig)
+            return
+        except InterruptedError:
+            continue
+        except ProcessLookupError:
+            return
+
+
+def _deliver(pidfd: int, pgid: int | None, sig: int) -> None:
+    """Signal the leader through its pidfd, then the group only if the leader is unreaped."""
+
+    _pidfd_send_signal(pidfd, sig)
+    _killpg_if_unreaped(pidfd, pgid, sig)
+
+
+def _deliver_forcing(pidfd: int, pgid: int | None, sig: int) -> None:
+    """``_deliver`` that retries ``KeyboardInterrupt`` so the final signal still lands."""
+
+    for _ in range(8):
+        try:
+            _deliver(pidfd, pgid, sig)
+            return
+        except KeyboardInterrupt:
+            continue
+    _deliver(pidfd, pgid, sig)
+
+
+def _group_alive(pidfd: int, pgid: int | None) -> bool:
+    """True when the leader is unreaped and ``killpg(0)`` sees a live member.
+
+    The ``waitid`` check comes first, so a reaped leader is not passed to ``killpg``.
+    """
+
+    if _leader_state(pidfd) == "reaped":
+        return False
+    if pgid is None or pgid <= 1 or pgid == os.getpgrp():
+        return False
+    while True:
+        try:
+            os.killpg(pgid, 0)
             return True
         except InterruptedError:
             continue
@@ -857,76 +959,57 @@ def _group_alive(pid: int, pgid: int | None) -> bool:
             return True
 
 
-def _leader_zombie(pid: int) -> bool:
-    """True when ``/proc/<pid>/stat`` shows a zombie. This is not a wait and does not reap."""
-
-    try:
-        with open(f"/proc/{pid}/stat", encoding="ascii") as handle:
-            text = handle.read()
-    except OSError:
-        return False
-    end = text.rfind(")")
-    if end < 0 or end + 2 >= len(text):
-        return False
-    return text[end + 2:].split(" ", 1)[0] == "Z"
-
-
-def _signal_last(pid: int, pgid: int | None, sig: int) -> None:
-    """Deliver ``sig``. A ``KeyboardInterrupt`` during the call is retried so the signal still lands."""
-
-    for _ in range(8):
-        try:
-            _signal_group(pid, pgid, sig)
-            return
-        except KeyboardInterrupt:
-            continue
-    _signal_group(pid, pgid, sig)
-
-
-def _stop_probe(pid: int | None, pgid: int | None, started: float, deadline: float) -> None:
+def _stop_probe(pid: int | None, pgid: int | None, started: float, deadline: float, pidfd: int | None) -> None:
     """Signal the original process group confirmed by the handshake. The caller reaps after this.
 
-    SIGTERM, then SIGKILL if a live member is still in that process group when the grace runs out.
-    A descendant that calls setpgid(0, 0) leaves the process group and is not signalled. This is
+    The leader is signalled with ``pidfd_send_signal``. ``killpg`` runs only after
+    ``waitid(P_PIDFD, WNOHANG|WNOWAIT)`` shows that leader is still unreaped. SIGTERM, then
+    SIGKILL if a live member is still in that process group when the grace runs out. A
+    descendant that calls setpgid(0, 0) leaves the process group and is not signalled. This is
     not session cleanup: that descendant stays in the session. The grace is at most 20% of the
     deadline, and never more than ``_PROBE_GRACE_S`` or past ``started + deadline``. A zombie
-    leader, seen from ``/proc`` and not by waiting, skips the grace. The direct child is not
-    reaped here. SIGKILL still runs when SIGTERM raises ``KeyboardInterrupt``. SIGINT is blocked
-    for the duration so a real interrupt cannot skip that final signal.
+    or reaped leader skips the grace. The direct child is not reaped here. SIGKILL still runs
+    when SIGTERM raises ``KeyboardInterrupt``. SIGINT and SIGCHLD are blocked for the duration
+    so a real interrupt cannot skip that final signal and a handler cannot reap the leader
+    between the ``waitid`` check and ``killpg``.
     """
 
     if pid is None or pid <= 0 or pid == os.getpid():
         return
-    blocked = False
+    if pidfd is None:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        return
+    blocked: set[int] = set()
     if hasattr(signal, "pthread_sigmask"):
         try:
-            signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
-            blocked = True
+            signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGCHLD})
+            blocked = {signal.SIGINT, signal.SIGCHLD}
         except (OSError, ValueError):
-            blocked = False
+            blocked = set()
     pending = False
     try:
         try:
-            _signal_group(pid, pgid, signal.SIGTERM)
+            _deliver(pidfd, pgid, signal.SIGTERM)
         except KeyboardInterrupt:
             pending = True
         finally:
-            if not pending and not _leader_zombie(pid) and _group_alive(pid, pgid):
+            if not pending and _leader_state(pidfd) == "running" and _group_alive(pidfd, pgid):
                 try:
                     remaining = (started + deadline) - time.monotonic()
                     grace = min(_kill_grace(deadline), max(0.0, remaining))
                     stop = time.monotonic() + grace
-                    while _group_alive(pid, pgid) and time.monotonic() < stop:
-                        if _leader_zombie(pid):
-                            break
+                    while time.monotonic() < stop and _leader_state(pidfd) == "running" and _group_alive(pidfd, pgid):
                         time.sleep(0.01)
                 except KeyboardInterrupt:
                     pending = True
-            _signal_last(pid, pgid, signal.SIGKILL)
+            _deliver_forcing(pidfd, pgid, signal.SIGKILL)
     finally:
         if blocked:
             try:
-                signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})
+                signal.pthread_sigmask(signal.SIG_UNBLOCK, blocked)
             except OSError:
                 pass
     if pending:
@@ -975,10 +1058,13 @@ def _copilot_runtime_env(child: Mapping[str, str], home: str):
 
     ``COPILOT_HOME`` is ``<home>/.copilot``. A parent ``COPILOT_HOME`` or ``XDG_CONFIG_HOME`` does
     not select a different account. Copilot CLI >= 1.0.1 reads ``COPILOT_HOME`` and ignores
-    ``XDG_CONFIG_HOME``. The directory is created mode ``0700`` when it is absent. An existing
-    entry, including a symlink, is left in place and must already be a private directory.
+    ``XDG_CONFIG_HOME``. ``home`` is validated before ``.copilot`` is created, so an unsafe home
+    leaves no directory behind. The directory is created mode ``0700`` when it is absent. An
+    existing entry, including a symlink, is left in place and must already be a private directory.
     """
 
+    if not _private_dir(home):
+        raise EnvRefused("HOME", "home_unsafe")
     copilot_home = os.path.join(home, ".copilot")
     if not os.path.lexists(copilot_home):
         try:

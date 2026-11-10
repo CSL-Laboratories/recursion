@@ -146,20 +146,23 @@ PRODUCT.md `055cc7a5` section 3.3. `own_loop.py`, checked before any spawn or re
   That includes a `threading` thread, a thread started with `_thread`, and any extra native thread
   in `/proc/self/task`. A lock that thread holds is never released in the child. A thread started
   in the gap before `fork` is still a race. `home` is required (`route_home_missing` otherwise):
-  a probe without it would approve the ambient account. Where `fork`, `setsid`, `killpg` and
-  `pidfd_open` exist, the child calls `setsid`, writes a handshake byte, and does not run the
-  callable until the parent has recorded that process group and written an ack. The parent holds
-  a pidfd from just after `fork` until after the last signal, so a handler that reaps the worker
-  first cannot free the process-group id for reuse. Every exit, including a probe that returns
-  true, signals that original process group: SIGTERM, then at most 20% of the deadline (never
-  more than 200 ms) and still inside the deadline, then SIGKILL. A `KeyboardInterrupt` during
-  cleanup still delivers SIGKILL, then closes the pipe fds and reaps. The direct child is reaped
-  only after those signals. A descendant that calls `setpgid(0, 0)` leaves the process group and
-  stays in the session; it is not signalled. This is not session cleanup. Where the group cannot
-  be enforced (Windows, or any platform without `pidfd_open`), the route refuses
-  `probe unenforceable` and does not leave a daemon thread running.
+  a probe without it would approve the ambient account.   Where `fork`, `setsid`, `killpg`, `pidfd_open`, `pidfd_send_signal` and `waitid(P_PIDFD)` exist,
+  the child calls `setsid`, writes a handshake byte, and does not run the callable until the
+  parent has recorded that process group and written an ack. The parent holds a pidfd from just
+  after `fork` until after the last signal. The leader is signalled with `pidfd_send_signal`.
+  `killpg` runs only after `waitid(P_PIDFD, WNOHANG|WNOWAIT)` shows that leader is still unreaped,
+  with `SIGCHLD` blocked across the check and the signal, so a handler that has already reaped
+  the worker cannot make `killpg` hit a reused process-group id. Every exit, including a probe
+  that returns true, signals that original process group: SIGTERM, then at most 20% of the
+  deadline (never more than 200 ms) and still inside the deadline, then SIGKILL. A
+  `KeyboardInterrupt` during cleanup still delivers SIGKILL, then closes the pipe fds and reaps.
+  The direct child is reaped only after those signals. A descendant that calls `setpgid(0, 0)`
+  leaves the process group and stays in the session; it is not signalled. This is not session
+  cleanup. Where the group cannot be enforced (Windows, or any platform without a pidfd signal),
+  the route refuses `probe unenforceable` and does not leave a daemon thread running.
   The probe runs with the child's final environment: `HOME` is the route home and `COPILOT_HOME`
-  is `<home>/.copilot`, created mode `0700` when absent. An existing `COPILOT_HOME` must be a
+  is `<home>/.copilot`, created mode `0700` when absent and only after `home` itself is a private
+  directory. An unsafe home leaves no `.copilot` behind. An existing `COPILOT_HOME` must be a
   private directory owned by this user, not a symlink and not world-accessible, the same rule as
   `HOME`. Copilot CLI >= 1.0.1 reads `COPILOT_HOME` (otherwise `~/.copilot`) and ignores
   `XDG_CONFIG_HOME`, which is not on the allowlist. A parent `COPILOT_HOME` does not select

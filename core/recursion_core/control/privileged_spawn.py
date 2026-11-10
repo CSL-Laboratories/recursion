@@ -294,10 +294,17 @@ def is_shared_system_account(backend: Backend) -> bool:
     )
 
 
-def is_root_target(backend: Backend) -> bool:
-    """True when ``backend`` targets root; root is never the engine user."""
+_ROOT_USER_NAMES = frozenset({"root", "0", "#0"})
 
-    return backend.target_uid == 0 or backend.target_user == "root"
+
+def is_root_target(backend: Backend) -> bool:
+    """True when ``backend`` targets root; root is never the engine user.
+
+    ``target_user`` of ``"0"`` or ``"#0"`` is uid 0 even when ``target_uid`` was
+    not filled in. The username match is the exact token ``root``.
+    """
+
+    return backend.target_uid == 0 or backend.target_user in _ROOT_USER_NAMES
 
 
 def select_path(
@@ -444,6 +451,13 @@ def _inspect_helpers(
     found: str | None = None
     for path in paths:
         try:
+            link = os.lstat(path)
+        except OSError:
+            link = None
+        if link is not None and stat.S_ISLNK(link.st_mode):
+            notes.append(f"{path} is a symlink; not a setuid helper")
+            continue
+        try:
             st = stat_fn(path)
         except OSError:
             notes.append(f"{path} absent")
@@ -476,7 +490,7 @@ def store_writer_script(path: str) -> str:
     quoted = repr(str(path))
     return (
         "import os; p=" + quoted + "; "
-        "fd=os.open(p, os.O_CREAT|os.O_WRONLY|os.O_TRUNC, 0o600); "
+        "fd=os.open(p, os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_WRONLY, 0o600); "
         "os.write(fd, b'store-bytes'); os.close(fd); os.chmod(p, 0o600)"
     )
 
@@ -742,10 +756,12 @@ def probe_ptrace(pid: int) -> ProbeOutcome:
         return None, "ptrace unavailable: libc not found"
     if rc == 0:
         try:
-            os.waitpid(pid, 0)
-        except ChildProcessError:
-            pass
-        _ptrace(PTRACE_DETACH, pid)
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+        finally:
+            _ptrace(PTRACE_DETACH, pid)
         return False, "attached"
     detail = f"rc={rc}:errno={err}:{os.strerror(err) if err else 'ptrace failed'}"
     if err in BLOCKED_ERRNOS:
@@ -762,8 +778,9 @@ def probe_abs_store_read(
 ) -> ProbeOutcome:
     """Have ``write_cmd`` create a 0600 store, then try to read it by absolute path.
 
-    A writer that fails, leaves no file, or wrote as a uid other than
-    ``expected_owner`` is an error (``None``), not a blocked read.
+    A writer that fails, leaves no file, leaves a symlink, or wrote as a uid
+    other than ``expected_owner`` is an error (``None``), not a blocked read.
+    The read does not follow a symlink at the store path.
     """
 
     store = Path(directory) / f"store-{os.getpid()}-{time.time_ns()}.secret"
@@ -771,33 +788,32 @@ def probe_abs_store_read(
     if result.returncode != 0:
         return None, f"writer_failed rc={result.returncode} err={(result.stderr or '')[:160]}"
     try:
-        owner_uid = store.stat().st_uid
+        fd = os.open(str(store), os.O_RDONLY | os.O_NOFOLLOW)
     except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            return None, f"store_symlink {exc.errno}"
         return None, f"writer_left_no_store {type(exc).__name__}:{exc.errno}"
-    if expected_owner is not None and owner_uid != expected_owner:
-        try:
-            store.unlink()
-        except OSError:
-            pass
-        return None, f"writer_wrong_uid owner={owner_uid} expected={expected_owner}"
     try:
-        data = store.read_bytes()
-    except OSError as exc:
-        owner = None
-        mode = None
+        st = os.fstat(fd)
+        owner_uid = st.st_uid
+        if expected_owner is not None and owner_uid != expected_owner:
+            return None, f"writer_wrong_uid owner={owner_uid} expected={expected_owner}"
+        if not stat.S_ISREG(st.st_mode):
+            return None, f"not_denied store_not_regular mode={oct(st.st_mode)}"
         try:
-            st = store.stat()
-            owner = st.st_uid
-            mode = oct(st.st_mode)
-        except OSError:
-            pass
-        detail = f"{type(exc).__name__}:{exc.errno}:{exc.strerror} owner={owner} mode={mode}"
-        if exc.errno in BLOCKED_ERRNOS:
-            return True, detail
-        return None, f"not_denied {detail}"
+            data = os.read(fd, 1024 * 1024)
+        except OSError as exc:
+            detail = (
+                f"{type(exc).__name__}:{exc.errno}:{exc.strerror} "
+                f"owner={owner_uid} mode={oct(st.st_mode)}"
+            )
+            if exc.errno in BLOCKED_ERRNOS:
+                return True, detail
+            return None, f"not_denied {detail}"
     finally:
+        os.close(fd)
         try:
-            store.unlink()
+            os.unlink(str(store))
         except OSError:
             pass
     return False, f"read {len(data)} bytes"
@@ -951,6 +967,8 @@ def run_same_uid_probes(
     target_uid = backend.target_uid
     if target_uid is None:
         raise ValueError(f"{backend.name} backend has no target_uid to probe")
+    if is_root_target(backend):
+        raise ValueError("refusing to probe uid 0")
     tally = _Tally()
     write_prefix = spawn_command(backend, ())
     with tempfile.TemporaryDirectory(prefix="csl734-store-") as tmp:

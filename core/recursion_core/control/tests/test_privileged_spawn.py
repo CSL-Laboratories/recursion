@@ -55,7 +55,7 @@ from recursion_core.control.privileged_spawn import (
     systemd_unit_main_pid,
 )
 from recursion_core.control import privileged_spawn
-from recursion_core.control.privileged_spawn import _Tally, _launch_failure
+from recursion_core.control.privileged_spawn import _Tally, _launch_failure, _probe_sudo_target
 
 LIVE_ENV = "RECURSION_LIVE_HOST_PROBES"
 LIVE = os.environ.get(LIVE_ENV) == "1"
@@ -823,6 +823,16 @@ class ProbeTargetTests(unittest.TestCase):
             )
         )
 
+    def test_walk_finds_a_process_whose_uids_are_all_zero(self) -> None:
+        # uid 0 is a real uid. A guard that treats 0 as missing must not drop it,
+        # and the mixed-uid sudo launcher is still not that process.
+        uids = {100: (1000, 0, 0, 0), 101: (0, 0, 0, 0)}
+        children = {100: [101], 101: []}
+        pid = find_target_uid_pid(
+            100, 0, timeout_s=0.0, uids_fn=uids.get, children_fn=lambda p: children[p]
+        )
+        self.assertEqual(pid, 101)
+
     def test_systemd_unit_main_pid_checks_the_unit_uid(self) -> None:
         calls: list[tuple[str, ...]] = []
 
@@ -1280,6 +1290,126 @@ class LiveHostTests(unittest.TestCase):
                     f"{backend.name} {name} should drop to 0/n open; detail={probe.detail}",
                 )
                 self.assertTrue(probe.blocked)
+
+
+class SpawnDefectTests(unittest.TestCase):
+    def test_store_writer_does_not_follow_a_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            victim = os.path.join(tmp, "victim")
+            with open(victim, "wb") as handle:
+                handle.write(b"keep-me")
+            link = os.path.join(tmp, "link.secret")
+            os.symlink(victim, link)
+            with self.assertRaises(OSError):
+                exec(store_writer_script(link), {})
+            with open(victim, "rb") as handle:
+                self.assertEqual(handle.read(), b"keep-me")
+
+    def test_store_read_does_not_follow_a_symlink(self) -> None:
+        victim_bytes = b"keep-me"
+
+        def run(cmd, timeout: float) -> ProcResult:
+            script = cmd[-1]
+            path = ast.literal_eval(script.split("p=", 1)[1].split(";", 1)[0])
+            os.symlink(victim, path)
+            return ProcResult(0, "", "")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            victim = os.path.join(tmp, "victim")
+            with open(victim, "wb") as handle:
+                handle.write(victim_bytes)
+            result, detail = probe_abs_store_read(
+                (), tmp, expected_owner=os.getuid(), run_fn=run
+            )
+            with open(victim, "rb") as handle:
+                self.assertEqual(handle.read(), victim_bytes)
+        self.assertIsNone(result)
+        self.assertIn("store_symlink", detail)
+
+    def test_symlink_to_a_setuid_root_binary_is_not_a_helper(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            link = os.path.join(tmp, "helper")
+            os.symlink("/usr/bin/sudo", link)
+            backends = detect_backends(
+                facts=_facts(),
+                run_fn=_run_fail,
+                helper_paths=(link,),
+                env={},
+            )
+        helper = next(b for b in backends if b.name == "setuid_helper")
+        self.assertIsNone(helper.helper_path)
+        self.assertIn("symlink", helper.reason)
+
+    def test_numeric_root_names_are_not_selected(self) -> None:
+        for user in ("0", "#0"):
+            backend = Backend("sudo", True, True, "ok", target_user=user, target_uid=None)
+            with self.subTest(user=user):
+                self.assertTrue(is_root_target(backend))
+                selected = select_path((backend,), f21_open=())
+                self.assertEqual(selected.name, "managed_login_folder")
+                self.assertIsNone(selected.backend)
+                self.assertIsNone(selected.candidate)
+        # Owner question: the username match is the exact token "root".
+        titled = Backend("sudo", True, True, "ok", target_user="ROOT", target_uid=1001)
+        self.assertFalse(is_root_target(titled))
+
+    def test_www_data_is_not_a_shared_system_account(self) -> None:
+        # Owner question: www-data stays out of the shared-account set.
+        backend = Backend("sudo", True, True, "ok", target_user="www-data", target_uid=33)
+        self.assertFalse(is_shared_system_account(backend))
+
+    def test_sudo_id_zero_is_recorded_as_uid_zero(self) -> None:
+        def run(cmd, timeout: float) -> ProcResult:
+            return ProcResult(0, "0\n", "")
+
+        user, uid, reason = _probe_sudo_target(run, 1000, candidates=("rootish",))
+        self.assertIsNone(user)
+        self.assertIsNone(uid)
+        self.assertIn("uid=0", reason)
+
+    def test_same_uid_probes_refuse_uid_zero_before_launch(self) -> None:
+        def run(cmd, timeout: float) -> ProcResult:
+            raise AssertionError(cmd)
+
+        with mock.patch.object(
+            privileged_spawn.subprocess, "Popen", side_effect=AssertionError("popen")
+        ):
+            with self.assertRaises(ValueError):
+                run_same_uid_probes(
+                    Backend("sudo", True, True, "ok", target_user="#0", target_uid=0),
+                    n=10,
+                    run_fn=run,
+                )
+
+    def test_ptrace_detaches_when_waitpid_fails(self) -> None:
+        calls: list[int] = []
+
+        def ptrace(request, pid, *args):
+            calls.append(request)
+            return (0, 0)
+
+        with mock.patch.object(privileged_spawn, "_ptrace", side_effect=ptrace):
+            with mock.patch.object(
+                privileged_spawn.os, "waitpid", side_effect=OSError(errno.EINTR, "interrupted")
+            ):
+                with self.assertRaises(OSError):
+                    probe_ptrace(4242)
+        self.assertEqual(len(calls), 2)
+
+    def test_ptrace_detaches_when_the_child_is_already_reaped(self) -> None:
+        calls: list[int] = []
+
+        def ptrace(request, pid, *args):
+            calls.append(request)
+            return (0, 0)
+
+        with mock.patch.object(privileged_spawn, "_ptrace", side_effect=ptrace):
+            with mock.patch.object(
+                privileged_spawn.os, "waitpid", side_effect=ChildProcessError("reaped")
+            ):
+                result, detail = probe_ptrace(7)
+        self.assertEqual((result, detail), (False, "attached"))
+        self.assertEqual(len(calls), 2)
 
 
 def live_newuidmap_ready(facts: HostFacts) -> bool:

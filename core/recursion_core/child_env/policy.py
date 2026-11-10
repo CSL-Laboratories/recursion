@@ -37,7 +37,9 @@ replacement. It builds the child environment from nothing:
   stores no trusted list and asks nothing; the driver does both;
 * while a proxy is set, a ``NO_PROXY`` entry that matches the route's own base URL host refuses
   (``no_proxy_route_host``, CSL-839; PRODUCT.md 055cc7a5 / CSLR-D-011): the child would reach the route gateway
-  around the proxy. A loopback route host (``localhost``, ``127.0.0.0/8``, ``::1``) is exempt;
+  around the proxy. A loopback route host (``localhost``, ``127.0.0.0/8``, ``::1``) is exempt. An all-address
+  CIDR entry (``0.0.0.0/0``, ``::/0``, ``::ffff:0:0/96`` or an IPv6 block that holds it) counts as ``*`` on any
+  route (``no_proxy_wildcard``);
 * one change beyond N5h/N5i: links are resolved one component at a time and every
   link met on the way, including links inside a link's target, must be root's or
   ours in a directory chain no one else can write, and no step may enter ``/proc``,
@@ -329,6 +331,8 @@ def build_child_env(
     NO_PROXY entry that matches the route's base URL host refuses with ``no_proxy_route_host`` (CSL-839), unless
     that host is loopback (``localhost``, ``127.0.0.0/8``, ``::1`` or IPv4-mapped loopback); a ``*`` or
     engine-host entry anywhere in either name is reported first, with its own cause, loopback route or not.
+    An all-address CIDR entry (``0.0.0.0/0``, ``::/0``, ``::ffff:0:0/96`` or an IPv6 block that holds it) is a
+    ``*``: ``no_proxy_wildcard`` on any route, with or without a base URL.
     """
 
     if os.name == "nt":
@@ -368,15 +372,15 @@ def build_child_env(
             raise EnvRefused(name, cause)
     if "PATH" in env and (cause := _unsafe_path(env["PATH"])) is not None:
         raise EnvRefused("PATH", cause)
-    # A bypass only matters when a proxy is set: "*" skips it for every host, an engine-host entry for that engine,
-    # an entry for the route's base host for the route gateway.
+    # A bypass only matters when a proxy is set: "*" or an all-address CIDR block skips it for every host, an
+    # engine-host entry for that engine, an entry for the route's base host for the route gateway.
     if any(env.get(name) for name in VALUE_URLS + VALUE_ALL_PROXY):
         for name in [name for name in NO_PROXY_NAMES if name in env]:
             if (cause := _no_proxy_bypass(env[name], profile.hosts)) is not None:
                 raise EnvRefused(name, cause)
         # CSL-839: the route's own base host is an endpoint too; an entry matching it would send the child to the
-        # route gateway around the proxy. Checked after both names passed the rule above, so a "*" or engine-host
-        # entry keeps its own cause whatever else the lists hold. A loopback route host is exempt from this check
+        # route gateway around the proxy. Checked after both names passed the rule above, so a "*", all-address or
+        # engine-host entry keeps its own cause whatever else the lists hold. A loopback route host is exempt from this check
         # only (owner call, 2026-11-10): NO_PROXY may name a gateway on this machine.
         base = route_env.get(profile.base_url_name) if profile.base_url_name else None
         if base is not None and not _loopback_host(host := _BASE_URL.match(base)["host"]):
@@ -675,12 +679,16 @@ def _no_proxy_hit(entry: str, hosts: tuple[str, ...]) -> bool:
 
 
 def _no_proxy_bypass(value: str, hosts: tuple[str, ...]) -> str | None:
-    """N5i: comma and whitespace split; the union of curl, requests, hyper-util, undici and Codex matchers."""
+    """N5i: comma and whitespace split; the union of curl, requests, hyper-util, undici and Codex matchers.
 
-    for entry in map(_no_proxy_name, _no_proxy_entries(value)):
+    An all-address CIDR block is a ``*`` (owner call, 2026-11-10; CSL-839): see ``_all_address_block``.
+    """
+
+    for raw in _no_proxy_entries(value):
+        entry = _no_proxy_name(raw)
         if not entry:
             continue
-        if entry.strip("*.") == "":
+        if entry.strip("*.") == "" or _all_address_block(raw):
             return "no_proxy_wildcard"
         if _no_proxy_hit(entry, hosts):
             return "no_proxy_engine_host"
@@ -740,11 +748,11 @@ def _loopback_host(host: str) -> bool:
     return bool(addresses) and all(address.is_loopback for address in addresses)
 
 
-def _no_proxy_ip_hit(entry: str, addresses: set) -> bool | None:
-    """Whether an entry is one of these addresses, or a CIDR block that holds one; None when it is neither shape.
+def _no_proxy_ip(entry: str):
+    """The address or CIDR block (an ``ipaddress`` object) an entry is, or None when it is neither shape.
 
     Read as ``ip``, ``ip:port``, ``[ip]``, ``[ip]:port`` or any of those with ``/prefix``; the port is dropped,
-    as for a name. Addresses are compared parsed, so ``::1`` and ``0:0:0:0:0:0:0:1`` are one.
+    as for a name. Host bits may be set in a block: ``10.1.2.3/8``.
     """
 
     text, slash, prefix = entry.partition("/")
@@ -755,12 +763,42 @@ def _no_proxy_ip_hit(entry: str, addresses: set) -> bool | None:
         text = text.split(":")[0]
     text = text.rstrip(".")
     try:
-        if slash:
-            network = ipaddress.ip_network(f"{text}/{prefix}", strict=False)  # host bits may be set: 10.1.2.3/8
-            return any(address.version == network.version and address in network for address in addresses)
-        return bool(_ip_forms(ipaddress.ip_address(text)) & addresses)
+        return ipaddress.ip_network(f"{text}/{prefix}", strict=False) if slash else ipaddress.ip_address(text)
     except ValueError:
         return None
+
+
+_NETWORKS = (ipaddress.IPv4Network, ipaddress.IPv6Network)
+_MAPPED_IPV4 = ipaddress.IPv6Network("::ffff:0:0/96")  # every IPv4 address in its IPv4-mapped IPv6 form
+
+
+def _all_address_block(entry: str) -> bool:
+    """Whether an entry is a CIDR block that skips the proxy for every address, as ``*`` does (CSL-839).
+
+    That is an IPv4 block of prefix 0 (``0.0.0.0/0``, ``10.0.0.0/0``), or an IPv6 block that holds all of
+    ``::ffff:0:0/96`` (that block itself, ``::/64``, ``::/0``): a matcher that maps IPv4 into IPv6 (Go, undici)
+    would skip the proxy for every IPv4 host. A block that holds less (``0.0.0.0/1``, ``2000::/3``,
+    ``::ffff:0:0/97``) is not one, and neither is a bare address. The shapes are ``_no_proxy_ip``'s.
+    """
+
+    block = _no_proxy_ip(entry)
+    if not isinstance(block, _NETWORKS):
+        return False
+    return block.prefixlen == 0 if block.version == 4 else block.supernet_of(_MAPPED_IPV4)
+
+
+def _no_proxy_ip_hit(entry: str, addresses: set) -> bool | None:
+    """Whether an entry is one of these addresses, or a CIDR block that holds one; None when it is neither shape.
+
+    The shapes are ``_no_proxy_ip``'s. Addresses are compared parsed, so ``::1`` and ``0:0:0:0:0:0:0:1`` are one.
+    """
+
+    parsed = _no_proxy_ip(entry)
+    if parsed is None:
+        return None
+    if isinstance(parsed, _NETWORKS):
+        return any(address.version == parsed.version and address in parsed for address in addresses)
+    return bool(_ip_forms(parsed) & addresses)
 
 
 def _no_proxy_route_bypass(value: str, host: str) -> bool:
@@ -774,7 +812,7 @@ def _no_proxy_route_bypass(value: str, host: str) -> bool:
     7.86+, requests, undici and Go honour CIDR). A CIDR entry never matches a name: no matcher resolves DNS.
     An entry that is an address or a block is decided as one and not also as a name, so the port strip cannot
     turn ``::1:0`` into ``::1``. A loopback host never gets here: ``build_child_env`` exempts it
-    (``_loopback_host``).
+    (``_loopback_host``). Neither does an all-address block: ``_no_proxy_bypass`` refused it as a ``*``.
     """
 
     host = host.lower().strip("[]").rstrip(".")

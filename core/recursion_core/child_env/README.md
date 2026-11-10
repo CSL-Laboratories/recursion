@@ -107,16 +107,25 @@ Foundry switches are dropped. The child gets one only from the route:
   - An IP-literal host (`10.1.2.3`, `[2001:db8::1]`) is also matched as an address: by an entry
     that is that address (`10.1.2.3`, `10.1.2.3:4000`, `[2001:db8::1]`, `[2001:db8::1]:8443`,
     `2001:db8::1`, another spelling of it such as `2001:db8:0:0:0:0:0:1`) and by a CIDR block
-    that holds it (`10.0.0.0/8`, `2001:db8::/32`, `0.0.0.0/0`). `10.1.2.3` and
-    `[::ffff:10.1.2.3]` are one address (so `::/0` also holds an IPv4 host), and a short, hex or
+    that holds it (`10.0.0.0/8`, `2001:db8::/32`, `0.0.0.0/1`). `10.1.2.3` and
+    `[::ffff:10.1.2.3]` are one address (so `::ffff:0:0/97` also holds an IPv4 host), and a short, hex or
     decimal IPv4 host (`10.1`, `0x0a.0.0.1`, `167772161`) is read as a URL parser reads it.
   - A loopback route host is exempt, and only that: `localhost` (not a subdomain of it),
     `127.0.0.0/8`, `::1` and IPv4-mapped loopback (`[::ffff:127.0.0.1]`), in any spelling.
-  - A CIDR block never matches a host name: nothing is resolved here. CIDR is checked for the
-    route host only; the engine's own hosts are names, so their check is unchanged.
-  - `*` (`no_proxy_wildcard`) and an engine-host entry (`no_proxy_engine_host`) are checked
-    first, in both names, and keep their cause when a route-host entry is also present.
-  - Unchanged: with no proxy set, or no route `base_url`, nothing here refuses. Lookalikes
+    `NO_PROXY=127.*` on such a route launches. Any other IPv6 embedding of an IPv4 address
+    (`[::127.0.0.1]`, `[64:ff9b::7f00:1]`) is not loopback and is refused by design (fail closed).
+  - An all-address CIDR block counts as `*` on any route, with or without a `base_url`, loopback
+    or not, for either engine: it refuses with `no_proxy_wildcard`. These are `0.0.0.0/0`, `::/0`,
+    `::ffff:0:0/96` (every IPv4-mapped address) and any IPv6 block that holds it (`::/64`, `::/1`),
+    in any spelling (`[::]/0`, `10.0.0.0/0`, `::ffff:0.0.0.0/96`). A block that holds less
+    (`0.0.0.0/1`, `128.0.0.0/1`, `8000::/1`, `2000::/3`, `::ffff:0:0/97`) is not one.
+  - Any other CIDR block never matches a host name: nothing is resolved here. It is checked for
+    the route host only; the engine's own hosts are names.
+  - `*` or an all-address block (`no_proxy_wildcard`) and an engine-host entry
+    (`no_proxy_engine_host`) are checked first, in both names, and keep their cause when a
+    route-host entry is also present.
+  - Unchanged: with no proxy set nothing here refuses, and with no route `base_url` only an
+    all-address block does. Lookalikes
     (`notgateway.example`, `gateway.example.evil`) and a child of the host
     (`api.gateway.example` for `gateway.example`) are not refused.
 - **Key custody.** This package is the launch boundary only. It never reads the OS keyring or

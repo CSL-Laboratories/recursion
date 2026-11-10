@@ -33,7 +33,7 @@ from typing import Callable
 from urllib.parse import parse_qs, quote
 
 from .client import ACTIONS, READS, ControlClient, ControlError
-from .inventory import BARS, assess, coverage_gaps, project
+from .inventory import BARS, SIGN_IN_REJECTED, assess, coverage_gaps, project
 from .panels import PAPER_BOOK, filter_venue_rows, panel_registry
 
 __all__ = ["Application", "withhold_venue_data"]
@@ -70,6 +70,17 @@ _LABELS = {
     "operator.interventions.request_reconciliation": "Reconciliation request",
     "operator.interventions.request_revocation": "Revocation request",
 }
+
+
+def _sign_in_cell(value: object) -> str:
+    """Sign-in column. A string is escaped; any other type is the fixed rejection.
+
+    Empty text is a dash. ``escape`` is only called with a string, so a non-string
+    cannot crash this cell and a falsy non-string is not shown as missing.
+    """
+    if type(value) is not str:
+        value = SIGN_IN_REJECTED
+    return escape(value) if value else "-"
 
 
 def withhold_venue_data(value: object) -> object:
@@ -192,7 +203,7 @@ class Application:
         body = "".join(
             "<tr><th scope=\"row\">%s</th><td>%s</td><td>%s</td><td>%s</td><td><span class=\"badge\">%s</span>"
             " %s</td><td>%s</td><td>%s</td></tr>" % (
-                escape(r["id"]), escape(r["class"]), escape(r["subject"]), escape(r["sign_in"] or "-"),
+                escape(r["id"]), escape(r["class"]), escape(r["subject"]), _sign_in_cell(r["sign_in"]),
                 project(r, "gui"), escape(" ".join((["(beta tag)"] if r["beta_tag"] else [])
                                                + ([] if r["claim"] == "ok" else ["(" + r["claim"] + ")"]))),
                 escape(", ".join(r["failed_bars"]) or "none"), escape(r["blocker"] or "-"))

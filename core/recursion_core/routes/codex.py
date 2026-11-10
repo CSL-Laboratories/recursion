@@ -8,9 +8,12 @@ field name below, are unverified against the vendor's source and marked so.
 Typed limit signals:
 
 * ``account/rateLimits/read`` result and ``account/rateLimits/updated`` notifications: a window whose
-  ``usedPercent`` is at least 100 is a limit, with its ``resetsAt`` (fields unverified). Codex's
-  default bucket is credential-wide; a named bucket (``limitId`` other than the default, unverified)
-  is metered per model, so it fences only that model on the connection.
+  ``usedPercent`` is at least 100 is a limit, with its ``resetsAt`` (fields unverified; ``resetsAt``
+  is translated from Unix epoch onto the breaker clock). Codex's default bucket (``limitId``
+  ``codex``) is credential-wide. Any other ``limitId`` is the breaker model key itself: the requested
+  route model is not used, so a notice for one bucket does not fence a different model. An
+  ``api_key`` route that is told this read needs ChatGPT auth ignores that one error and continues
+  the turn; a subscription route does not.
 * a JSON-RPC error, or a failed turn, whose typed ``codexErrorInfo`` is ``usageLimitExceeded``
   (unverified name).
 
@@ -83,9 +86,20 @@ class CodexAdapter(RouteAdapter):
         try:
             rpc.call("initialize", {"clientInfo": {"name": "recursion", "version": "0"}})
             rpc.notify("initialized")
-            limits = rpc.call("account/rateLimits/read", {})
+            kind = request["route"]["connection"]["kind"]
+            try:
+                limits = rpc.call("account/rateLimits/read", {})
+            except _RpcError as err:
+                # ChatGPT auth is required for this read. An API-key session is rejected with wording
+                # that sounds like a quota ("rate limits"), which would short-fault every such request
+                # before a turn. Ignore that one error on an api_key route and continue.
+                if kind != "api_key":
+                    raise
+                events.append(c.event("usage", "codex.account/rateLimits/read", {
+                    "ignored": scalar(err.error.get("message"))}))
+                limits = None
             limit = _exhausted(limits.get("rateLimits") if isinstance(limits, dict) else None,
-                               "codex.account/rateLimits/read", model, events)
+                               "codex.account/rateLimits/read", events, self.vendor_reset)
             if limit is not None:
                 return c.result(rid, c.PLAN_LIMIT, limit=limit, events=events, detail="limit before turn")
             thread = rpc.call("thread/start", {"model": model})
@@ -97,7 +111,10 @@ class CodexAdapter(RouteAdapter):
         except _RpcError as err:
             return _classify_error(rid, err.error, rpc.limit, events, model)
         finally:
-            process.close_stdin()
+            try:
+                process.close_stdin()
+            except OSError:
+                pass  # the child's pipe is already gone; do not hide the drive error
 
 
 class _RpcError(Exception):
@@ -150,14 +167,14 @@ class _Rpc:
             self.events.append(c.event("server_request_refused", "codex.jsonrpc", {"method": method}))
         elif method == "account/rateLimits/updated":
             self.limit = _exhausted(params.get("rateLimits"), "codex.account/rateLimits/updated",
-                                    self.model, self.events) or self.limit
+                                    self.events, self.adapter.vendor_reset) or self.limit
         elif method == "item/completed":
             item = params.get("item") or {}
             if item.get("type") == "agentMessage" and isinstance(item.get("text"), str):
                 self.text.append(item["text"])  # model payload: kept as the answer, never classified
 
 
-def _exhausted(snapshot: object, source: str, model: str, events: list) -> dict | None:
+def _exhausted(snapshot: object, source: str, events: list, translate) -> dict | None:
     if not isinstance(snapshot, dict):
         return None
     windows = {name: snapshot.get(name) for name in ("primary", "secondary") if isinstance(snapshot.get(name), dict)}
@@ -170,9 +187,9 @@ def _exhausted(snapshot: object, source: str, model: str, events: list) -> dict 
     if not hit:
         return None
     resets = [w["resetsAt"] for w in hit if isinstance(w.get("resetsAt"), (int, float))]
-    reset_at = max(resets) if resets else None
+    reset_at = translate(max(resets)) if resets else None
     if isinstance(limit_id, str) and limit_id and limit_id != DEFAULT_LIMIT_ID:
-        return c.limit_signal("model", source, model=model, reset_at=reset_at)
+        return c.limit_signal("model", source, model=limit_id, reset_at=reset_at)
     return c.limit_signal("connection", source, reset_at=reset_at)
 
 
@@ -181,15 +198,18 @@ def _classify_error(rid: str, error: dict, limit: dict | None, events: list, mod
     info = error.get("codexErrorInfo", data.get("codexErrorInfo"))
     if isinstance(info, dict):  # a tagged variant: {"usageLimitExceeded": {...}} (shape unverified)
         info = next(iter(info), None)
+    if info in _AUTH_ERRORS:
+        return c.result(rid, c.AUTH_FAILED, events=events, detail=str(info))
     if info in _LIMIT_ERRORS:
         return c.result(rid, c.PLAN_LIMIT, limit=limit or c.limit_signal("connection", f"codex.{info}"),
                         events=events, detail="typed limit")
+    # A saved exhausted-bucket signal is a typed limit even when the turn then fails with untyped text.
+    # Auth (above) keeps precedence. EOF after that signal is the same limit, not an exit.
+    if limit is not None:
+        return c.result(rid, c.PLAN_LIMIT, limit=limit, events=events,
+                        detail="exit after limit" if error.get("_eof") else "typed limit")
     if error.get("_eof"):
-        if limit is not None:
-            return c.result(rid, c.PLAN_LIMIT, limit=limit, events=events, detail="exit after limit")
         return c.result(rid, c.ENGINE_EXITED, events=events, detail="stdout closed before turn/completed")
-    if info in _AUTH_ERRORS:
-        return c.result(rid, c.AUTH_FAILED, events=events, detail=str(info))
     if c.sounds_like_quota(error.get("message")):
         return c.result(rid, c.SHORT_FAULT, events=events, detail=f"untyped quota-like text on {model}")
     return c.result(rid, c.ENGINE_ERROR, events=events, detail=str(scalar(info) or scalar(error.get("code")) or "error"))

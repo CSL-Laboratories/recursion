@@ -35,7 +35,9 @@ class Harness:
         args = (self.launcher, self.clock, credentials, PARENT_ENV)
         self.breaker = ConnectionBreaker(self.clock)
         self.service = RouteService(
-            {"claude_code": ClaudeCodeAdapter(*args), "codex": CodexAdapter(*args)}, self.breaker, self.clock)
+            {"claude_code": ClaudeCodeAdapter(*args, wall_clock=self.clock),
+             "codex": CodexAdapter(*args, wall_clock=self.clock)},
+            self.breaker, self.clock)
 
     def handle(self, req: dict) -> dict:
         res = self.service.handle(json.loads(json.dumps(req)))  # requests cross the boundary as JSON
@@ -97,15 +99,88 @@ class ClaudeCodeTest(unittest.TestCase):
                                         "source": "claude.rate_limit_event"})
         self.assertEqual(res["breaker_effect"], "opened")
 
-    def test_api_retry_is_a_typed_retry_event_and_rate_limit_info_is_a_limit(self) -> None:
+    def test_api_retry_with_rate_limit_info_does_not_open_the_connection(self) -> None:
+        # A 429 Claude is still retrying is a retry event. It is not a plan limit, even with
+        # rate_limit_info, and a later unrelated error does not book the connection.
         retry = {"type": "system", "subtype": "api_retry", "attempt": 1, "error_status": 429, "error": "rate_limit",
-                 "api_error_params": {"rate_limit_info": {"resetsAt": 1_500_000}}}
-        h = Harness([[retry, *claude_error("x")]])
+                 "api_error_params": {"rate_limit_info": {"status": "rejected", "resetsAt": 1_500_000,
+                                                         "rateLimitType": "five_hour"}}}
+        h = Harness([[retry, *claude_error("error_max_turns")]])
         res = h.handle(request())
         self.assertEqual(res["events"][0]["kind"], "retry")
         self.assertEqual(res["events"][0]["data"]["error_status"], 429)
+        self.assertEqual(res["code"], c.ENGINE_ERROR)
+        self.assertEqual(h.breaker.state("subscription:login-A"), "closed")
+        h = Harness([[retry]])  # stream ends after the retry, with no result
+        res = h.handle(request())
+        self.assertEqual(res["code"], c.ENGINE_EXITED)
+        self.assertEqual(h.breaker.state("subscription:login-A"), "closed")
+
+    def test_result_rate_limit_info_is_a_plan_limit_even_without_status(self) -> None:
+        result = {"type": "result", "subtype": "error_during_execution", "is_error": True,
+                  "api_error_params": {"rate_limit_info": {"resetsAt": 1_000_800}}}
+        h = Harness([[result]])
+        res = h.handle(request())
         self.assertEqual(res["code"], c.PLAN_LIMIT)
-        self.assertEqual(res["limit"]["source"], "claude.api_retry.rate_limit_info")
+        self.assertEqual(res["limit"]["source"], "claude.result.rate_limit_info")
+        self.assertEqual(res["limit"]["reset_at"], 1_000_800.0)
+
+    def test_opus_weekly_window_does_not_fence_sonnet(self) -> None:
+        info = {"status": "rejected", "rateLimitType": "seven_day_opus", "resetsAt": 1_000_400.0}
+        script = [{"type": "rate_limit_event", "rate_limit_info": info},
+                  {"type": "result", "subtype": "error", "is_error": True, "result": "limit"}]
+        h = Harness([script, claude_ok("sonnet"), claude_ok("other-opus")])
+        res = h.handle(request(model="claude-opus-4"))
+        self.assertEqual(res["limit"], {"scope": "model", "model": "opus", "reset_at": 1_000_400.0,
+                                        "source": "claude.rate_limit_event"})
+        self.assertEqual(h.breaker.state("subscription:login-A"), "closed")
+        self.assertEqual(h.handle(request(rid="s", model="claude-sonnet-4"))["status"], "ok")
+        self.assertEqual(h.handle(request(rid="o", model="claude-opus-4-5"))["code"], c.BREAKER_OPEN)
+
+    def test_vendor_epoch_reset_is_translated_onto_a_monotonic_clock(self) -> None:
+        mono, wall = FakeClock(1_000.0), FakeClock(1_700_000_000.0)
+        launcher = FakeLauncher([claude_limit(reset_at=wall.now + 300.0)], mono)
+        adapter = ClaudeCodeAdapter(launcher, mono, credentials, PARENT_ENV, wall_clock=wall)
+        service = RouteService({"claude_code": adapter}, ConnectionBreaker(mono), mono)
+        res = service.handle(request())
+        self.assertEqual(res["code"], c.PLAN_LIMIT)
+        self.assertEqual(res["limit"]["reset_at"], 1_300.0)
+        refused = service.handle(request(rid="r2"))
+        self.assertEqual((refused["code"], refused["retry_at"]), (c.BREAKER_OPEN, 1_300.0))
+
+    def test_limit_without_reset_tells_the_user_the_cooldown(self) -> None:
+        h = Harness([[{"type": "result", "subtype": "error", "is_error": True, "error": "rate_limit"}]])
+        res = h.handle(request(limits={"on_limit": "wait"}))
+        self.assertEqual(res["code"], c.PLAN_LIMIT)
+        self.assertIsNone(res["limit"]["reset_at"])
+        self.assertEqual(res["limit_notice"]["choices"][0], {"action": "wait", "until": 1_000_300.0})
+
+    def test_broken_pipe_is_a_typed_engine_error_and_fenced(self) -> None:
+        class Pipe:
+            def __init__(self) -> None:
+                self.fenced: list[str] = []
+
+            def send(self, line: str) -> None:
+                raise BrokenPipeError("closed")
+
+            def close_stdin(self) -> None:
+                return None
+
+            def read_line(self, timeout_s: float):
+                return None
+
+            def fence(self, reason: str) -> None:
+                self.fenced.append(reason)
+
+        clock = FakeClock()
+        pipe = Pipe()
+        adapter = ClaudeCodeAdapter(lambda argv, **kwargs: pipe, clock, credentials, PARENT_ENV, wall_clock=clock)
+        service = RouteService({"claude_code": adapter}, ConnectionBreaker(clock), clock)
+        res = service.handle(request())
+        self.assertEqual(res["code"], c.ENGINE_ERROR)
+        self.assertIn("BrokenPipeError", res["detail"])
+        self.assertEqual(pipe.fenced, ["io_error"])
+        self.assertEqual(service._breaker.state("subscription:login-A"), "closed")
 
     def test_api_retry_without_rate_limit_info_does_not_trip(self) -> None:
         retry = {"type": "system", "subtype": "api_retry", "attempt": 1, "error_status": 529, "error": "overloaded"}
@@ -208,8 +283,36 @@ class CodexTest(unittest.TestCase):
         h, res = self.codex([codex_script(notes=[note], turn=turn)])
         self.assertEqual(res["code"], c.PLAN_LIMIT)
         self.assertEqual(res["limit"]["scope"], "model")
-        self.assertEqual(h.breaker.state("subscription:login-A", "gpt-5"), "open")
+        self.assertEqual(res["limit"]["model"], "gpt-5-bucket")
+        # The vendor bucket is the key. The route model is not fenced just because this turn asked for it.
+        self.assertEqual(h.breaker.state("subscription:login-A", "gpt-5"), "closed")
+        self.assertEqual(h.breaker.state("subscription:login-A", "gpt-5-bucket"), "open")
         self.assertEqual(h.breaker.state("subscription:login-A"), "closed")
+
+    def test_failed_turn_after_an_exhausted_bucket_opens_that_bucket(self) -> None:
+        note = {"method": "account/rateLimits/updated",
+                "params": {"rateLimits": {"limitId": "gpt-5-bucket",
+                                           "primary": {"usedPercent": 100, "resetsAt": 1_000_900}}}}
+        turn = {"id": "tu-1", "status": "failed", "error": {"message": "upstream error"}}
+        h, res = self.codex([codex_script(notes=[note], turn=turn), codex_script("next")])
+        self.assertEqual(res["code"], c.PLAN_LIMIT)
+        self.assertEqual(res["limit"]["model"], "gpt-5-bucket")
+        self.assertEqual(h.breaker.state("subscription:login-A", "gpt-5"), "closed")
+        self.assertEqual(h.handle(request(rid="other", engine="codex", model="gpt-5"))["text"], "next")
+
+    def test_api_key_route_ignores_a_chatgpt_rate_limit_read_error(self) -> None:
+        script = [{"id": 1, "result": {"userAgent": "fake"}},
+                  {"id": 2, "error": {"code": -32000,
+                                      "message": "chatgpt authentication required to read rate limits"}},
+                  {"id": 3, "result": {"thread": {"id": "th-1"}}},
+                  {"id": 4, "result": {"turn": {"id": "tu-1"}}},
+                  {"method": "item/completed", "params": {"item": {"type": "agentMessage", "text": "keyed"}}},
+                  {"method": "turn/completed", "params": {"turn": {"id": "tu-1", "status": "completed"}}}]
+        h, res = self.codex([script], kind="api_key", conn_id="key-1", credential_env="OPENAI_API_KEY")
+        self.assertEqual((res["status"], res["text"]), ("ok", "keyed"))
+        self.assertEqual(h.breaker.state("api_key:key-1"), "closed")
+        methods = [m.get("method") for m in h.launcher.processes[0].sent]
+        self.assertIn("turn/start", methods)
 
     def test_typed_jsonrpc_error_is_plan_limit(self) -> None:
         script = codex_script()[:3] + [{"id": 4, "error": {"code": -32000, "message": "nope",

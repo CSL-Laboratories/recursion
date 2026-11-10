@@ -71,7 +71,10 @@ def notice(result: Mapping, route: Mapping, limits: Mapping) -> dict | None:
     if result.get("code") not in LIMIT_CODES:
         return None
     signal = result.get("limit") or {}
-    reset_at = signal.get("reset_at", result.get("retry_at"))
+    reset_at = signal.get("reset_at") if isinstance(signal, Mapping) else None
+    if reset_at is None:
+        # A typed limit with no vendor reset still has the breaker's finite open_until on retry_at.
+        reset_at = result.get("retry_at")
     here = describe(route)
     choices = [{"action": "wait", "until": reset_at}]
     choices += [{"action": "switch", "route": describe(r)} for r in limits["fallback"]]

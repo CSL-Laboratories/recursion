@@ -9,12 +9,17 @@ Typed limit signals read (field names from the PRODUCT.md 055cc7a5 11.2 records:
 and ``api_error_params.rate_limit_info``; inner names marked unverified were not read from the
 vendor's source):
 
-* a ``rate_limit_event`` envelope whose ``rate_limit_info.status`` is ``"rejected"`` (unverified);
-* ``api_error_params.rate_limit_info`` on a ``system``/``api_retry`` or an error ``result`` envelope;
-* an envelope-level typed ``error == "rate_limit"`` on an error result (unverified).
+* a ``rate_limit_event`` envelope whose ``rate_limit_info.status`` is ``"rejected"``;
+* ``api_error_params.rate_limit_info`` on an error ``result`` envelope (a missing status there counts
+  as rejected);
+* an envelope-level typed ``error == "rate_limit"`` on an error result.
 
-``resetsAt`` (unverified, epoch seconds) becomes the signal's ``reset_at``. ``system``/``api_retry``
-is surfaced as a typed ``retry`` event. Assistant and user message content is model payload and is
+``system``/``api_retry`` is a typed ``retry`` event only. A 429 Claude is still retrying does not
+open the breaker, including when that envelope carries ``rate_limit_info``. ``resetsAt`` is Unix
+epoch seconds and is translated onto the breaker clock (``vendor_reset``) before it is stored.
+``rateLimitType`` ``seven_day_opus`` and ``seven_day_sonnet`` are that family's window (model scope);
+``five_hour``, ``seven_day``, ``seven_day_overage_included``, ``overage`` and any unlisted type stay
+connection scope. Assistant and user message content is model payload and is
 never inspected, so JSON or limit wording inside it cannot trip the breaker. Free text on an error
 ``result`` that only sounds like a quota is a SHORT_FAULT (grill Q23). Stderr is not read.
 """
@@ -88,7 +93,15 @@ PASSTHROUGH_METHOD_REQUIRED = {
 }
 # A CLAUDE_CODE_USE_* switch counts as on only for a clearly true value; anything else ("off", "no", a
 # typo) is refused, since claude would read it as off and bill the sign-in under a cloud label (fail closed).
+# The child receives the stripped lowercase spelling. Claude Code's bool parser accepts 1 / true / yes / on
+# (decoded 2.1.169 env schema, https://github.com/wtfwhs/tengu-decoded blob versions/2.1.169/environment-variables.md,
+# retrieved 2026-11-09). Padding or capitals are not passed through unchanged. The parent env is not edited.
 _SWITCH_ON = ("1", "true", "yes", "on")
+# rateLimitType from the Claude Code 2.1.205 schema quoted in
+# https://github.com/meawoppl/rust-code-agent-sdks/pull/180 (extracted from the CLI binary) and from
+# anthropics/claude-code#50518. Retrieved 2026-11-09. The two family windows are per model family;
+# every other listed type, and any type not listed, is the login's window.
+_MODEL_FAMILY = {"seven_day_opus": "opus", "seven_day_sonnet": "sonnet"}
 
 
 def _method_var_missing(name: str, value: str | None) -> bool:
@@ -146,7 +159,8 @@ class ClaudeCodeAdapter(RouteAdapter):
             return child_env(self._parent_env, extra_names=USER_KEEP_ENV, never=never, credential=cred)
         if kind == "passthrough":
             # Cloud providers (Bedrock, Vertex, Foundry) or a gateway the user picked: that method's own
-            # variables pass through unchanged for this run, with the user's own sign-in and config location.
+            # variables pass through for this run, with the user's own sign-in and config location.
+            # CLAUDE_CODE_USE_* is copied as its stripped lowercase spelling so the child sees 1/true/yes/on.
             method = conn.get("method")
             names = PASSTHROUGH_METHOD_ENV.get(method) if isinstance(method, str) else None
             if names is None:
@@ -158,7 +172,11 @@ class ClaudeCodeAdapter(RouteAdapter):
                                    "set; without it the run would use the sign-in instead")
             prefixes = PASSTHROUGH_METHOD_PREFIX.get(method, ())
             names += tuple(sorted(n for n in self._parent_env if prefixes and n.startswith(prefixes)))
-            return child_env(self._parent_env, extra_names=USER_KEEP_ENV + names)
+            env = child_env(self._parent_env, extra_names=USER_KEEP_ENV + names)
+            for name in list(env):
+                if name.startswith("CLAUDE_CODE_USE_"):
+                    env[name] = env[name].strip().lower()
+            return env
         raise c.RouteError(c.LAUNCH_REFUSED, f"connection kind {kind} not supported for claude_code")
 
     @staticmethod
@@ -232,13 +250,14 @@ class ClaudeCodeAdapter(RouteAdapter):
             if kind == "system" and sub == "api_retry":
                 events.append(c.event("retry", "claude.system.api_retry", {
                     k: scalar(msg.get(k)) for k in ("attempt", "max_retries", "retry_delay_ms", "error_status", "error")}))
-                limit = _rate_limit_info(msg.get("api_error_params"), "claude.api_retry.rate_limit_info") or limit
+                # Not booked. A retry Claude is still attempting is not a rejected plan limit, even when
+                # the envelope carries rate_limit_info (11.2: a throttle is not a connection-wide limit).
             elif kind == "rate_limit_event":
                 info = msg.get("rate_limit_info")
                 events.append(c.event("usage", "claude.rate_limit_event", _info_fields(info)))
-                limit = _rejected(info, "claude.rate_limit_event", model) or limit
+                limit = _rejected(info, "claude.rate_limit_event", self.vendor_reset) or limit
             elif kind == "result":
-                return _classify_result(rid, msg, limit, events, model)
+                return _classify_result(rid, msg, limit, events, model, self.vendor_reset)
             # assistant / user / other system envelopes: model payload or progress, never classified
 
 
@@ -248,27 +267,30 @@ def _info_fields(info: object) -> dict:
     return {k: scalar(info.get(k)) for k in ("status", "resetsAt", "rateLimitType")}
 
 
-def _rejected(info: object, source: str, model: str) -> dict | None:
+def _rejected(info: object, source: str, translate) -> dict | None:
     if not isinstance(info, dict) or info.get("status") != "rejected":
         return None
-    reset = info.get("resetsAt")
-    # Claude session and weekly limits apply to the whole login across models (B-05): connection scope.
-    return c.limit_signal("connection", source, reset_at=reset if isinstance(reset, (int, float)) else None)
+    reset = translate(info.get("resetsAt"))
+    family = _MODEL_FAMILY.get(info.get("rateLimitType"))
+    if isinstance(family, str):
+        # The family token, not the requested model id: a later Opus id shares the Opus window.
+        return c.limit_signal("model", source, model=family, reset_at=reset)
+    return c.limit_signal("connection", source, reset_at=reset)
 
 
-def _rate_limit_info(params: object, source: str) -> dict | None:
+def _rate_limit_info(params: object, source: str, translate) -> dict | None:
     if not isinstance(params, dict) or not isinstance(params.get("rate_limit_info"), dict):
         return None
     info = dict(params["rate_limit_info"])
-    info.setdefault("status", "rejected")  # present on a rejected turn even without a status (D2-17)
-    return _rejected(info, source, "")
+    info.setdefault("status", "rejected")  # present on a rejected result even without a status (D2-17)
+    return _rejected(info, source, translate)
 
 
-def _classify_result(rid: str, msg: dict, limit: dict | None, events: list, model: str) -> dict:
+def _classify_result(rid: str, msg: dict, limit: dict | None, events: list, model: str, translate) -> dict:
     if msg.get("is_error") is not True and msg.get("subtype") == "success":
         text = msg.get("result")
         return c.result(rid, None, text=text if isinstance(text, str) else "", events=events)
-    limit = _rate_limit_info(msg.get("api_error_params"), "claude.result.rate_limit_info") or limit
+    limit = _rate_limit_info(msg.get("api_error_params"), "claude.result.rate_limit_info", translate) or limit
     if limit is None and msg.get("error") == "rate_limit":
         limit = c.limit_signal("connection", "claude.result.error")
     if limit is not None:

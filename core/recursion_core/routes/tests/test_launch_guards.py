@@ -12,10 +12,12 @@ import unittest
 from recursion_core.routes import contract as c
 from recursion_core.routes.breaker import ConnectionBreaker
 from recursion_core.routes.codex import CodexAdapter, check_daemon_config, daemon_config
+from recursion_core.routes.base import Deadline
 from recursion_core.routes.launch import GilBuildRefused, child_env, require_free_threaded
 from recursion_core.routes.profile_route import profile_adapters
 from recursion_core.routes.service import RouteService
 from recursion_core.routes.tests.fakes import FakeClock, FakeLauncher, codex_script, request
+from recursion_core.subscription_routes import WrapperInstall, measure_package_pin
 
 PKG = pathlib.Path(__file__).resolve().parents[1]
 
@@ -68,9 +70,30 @@ class SubscriptionRouteReuseTest(unittest.TestCase):
                                     argv=lambda req: [req["route"]["engine"]], driver=drive, operator_home="/home/operator")
         self.service = RouteService(adapters, ConnectionBreaker(self.clock), self.clock)
 
+    def pin(self) -> WrapperInstall:
+        root = pathlib.Path(tempfile.mkdtemp(prefix="route-pin-"))
+        self.addCleanup(shutil.rmtree, root)
+        root.joinpath("launcher.js").write_text("launcher\n", encoding="ascii")
+        root.joinpath("lib.js").write_text("lib\n", encoding="ascii")
+        launcher = str(root / "launcher.js")
+        return WrapperInstall(launcher, str(root), measure_package_pin(launcher, str(root)))
+
     def req(self, engine: str, profile: dict, **kw) -> dict:
         return request(engine=engine, model="m", kind="api_key", conn_id="k1", credential_env="ANTHROPIC_API_KEY",
                        profile=profile, home=self.home, **kw)
+
+    def test_driver_deadline_is_fenced_and_typed(self) -> None:
+        def drive(process, req, deadline_at, events):
+            raise Deadline()
+
+        adapters = profile_adapters(self.launcher, self.clock, lambda cid, name: "sk-test",
+                                    {"PATH": "/usr/bin", "HOME": "/home/operator"},
+                                    argv=lambda req: ["pi"], driver=drive, operator_home="/home/operator")
+        service = RouteService(adapters, ConnectionBreaker(self.clock), self.clock)
+        res = service.handle(self.req("pi", {"provider": "anthropic", "auth": "api_key",
+                                              "credential_env": "ANTHROPIC_API_KEY"}, wrapper=self.pin()))
+        self.assertEqual(res["code"], c.DEADLINE_EXCEEDED)
+        self.assertEqual(self.launcher.processes[-1].fenced, ["deadline"])
 
     def test_claude_subscription_provider_is_refused_and_never_launched(self) -> None:
         cases = [("pi", {"provider": "claude-pro", "auth": "oauth", "credential_env": "ANTHROPIC_API_KEY"}),
@@ -83,9 +106,15 @@ class SubscriptionRouteReuseTest(unittest.TestCase):
             self.assertEqual(res["detail"], "claude_subscription_provider")
         self.assertEqual(self.launcher.calls, [])
 
-    def test_api_key_profile_passes_the_guard_then_launches(self) -> None:
+    def test_pi_without_a_wrapper_pin_refuses_before_launch(self) -> None:
         profile = {"provider": "anthropic", "auth": "api_key", "credential_env": "ANTHROPIC_API_KEY"}
         res = self.service.handle(self.req("pi", profile))
+        self.assertEqual((res["code"], res["detail"]), (c.SUBSCRIPTION_ROUTE_REFUSED, "wrapper_pin_missing"))
+        self.assertEqual(self.launcher.calls, [])
+
+    def test_api_key_profile_passes_the_guard_then_launches(self) -> None:
+        profile = {"provider": "anthropic", "auth": "api_key", "credential_env": "ANTHROPIC_API_KEY"}
+        res = self.service.handle(self.req("pi", profile, wrapper=self.pin()))
         self.assertEqual((res["status"], res["text"]), ("ok", "driven"))
         env = self.launcher.calls[0]["env"]
         self.assertEqual(env, {"PATH": "/usr/bin", "HOME": self.home, "ANTHROPIC_API_KEY": "sk-test"})

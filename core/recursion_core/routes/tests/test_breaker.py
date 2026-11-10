@@ -190,6 +190,15 @@ class BreakerTest(unittest.TestCase):
         self.clock.advance(8 * 24 * 3600)
         self.assertTrue(self.b.admit("subscription:B", "m", "t1")["admitted"])
 
+    def test_connection_id_containing_the_model_marker_does_not_collide(self) -> None:
+        # String keys "A" + "#model:" + "b#model:c" and "A#model:b" + "#model:" + "c" used to be one slot.
+        model_limit = {"code": c.PLAN_LIMIT, "limit": c.limit_signal("model", "t", model="b#model:c")}
+        self.b.record("subscription:A", "b#model:c", "t1", model_limit)
+        other = self.b.admit("subscription:A#model:b", "c", "t2")
+        self.assertTrue(other["admitted"])
+        self.assertIsNone(other["probe"])
+        self.assertEqual(self.b.admit("subscription:A", "b#model:c", "t2")["code"], c.BREAKER_OPEN)
+
     def test_explicit_reset(self) -> None:
         self.b.record("subscription:A", "m", "t1", LIMIT)
         self.b.record("subscription:A", "m", "t1", {"code": c.SHORT_FAULT})

@@ -1,15 +1,17 @@
 # core/recursion_core/subscription_routes (CSL-786, candidate)
 
 Refuses Claude-subscription routes in Pi, Hermes and OpenCode engine profiles before any
-spawn. Under Q12 as widened Nov 8 (PRODUCT.md `055cc7a5`, CSLR-D-011, sections 2 and 3.3) a
+spawn. Under Q12 as widened 2026-11-08 (PRODUCT.md `055cc7a5`, CSLR-D-011, sections 2 and 3.3) a
 subscription runs through another harness's own sign-in only where that provider allows that
 harness; Claude-subscription sign-ins stay refused in these three, and an Anthropic API key
 still works. Candidate code: not yet called by a running core, and not
 reviewed or accepted.
 
-- `check_route(engine, profile, child_env, route_home=..., parent_env=..., operator_home=...)`
+- `check_route(engine, profile, child_env, route_home=..., parent_env=..., operator_home=..., wrapper=...)`
   validates one `pi`, `hermes` or `opencode` profile and the exact child environment, and
   returns a `RouteDecision` or raises `SubscriptionRouteRefused(engine, cause, detail)`.
+  Pi and Hermes require `wrapper` (see Wrapper pins). Cursor and Antigravity CLI use
+  `check_cursor_route` and `check_antigravity_route`.
 - `guard_then_spawn(launcher, argv, ...)` calls `check_route` and only then the launcher,
   always with the checked env and `shell=False`. It refuses `env`, `shell`, `executable`,
   `preexec_fn`, fd, user and group options before any check. `launcher` and `argv` are
@@ -39,9 +41,9 @@ What refuses:
 A subscription variable present only in the parent env is flagged in `RouteDecision.flags`.
 API-key routes (`anthropic`, `openai`) launch.
 
-## Subscription sign-ins (Nov 8 briefing)
+## Subscription sign-ins (2026-11-08 briefing)
 
-Lucas's Nov 8 briefing: allow a subscription sign-in only where the provider names that
+Lucas's 2026-11-08 briefing: allow a subscription sign-in only where the provider names that
 harness. A profile asks for one with `auth: "subscription"` and a `method`, and both are
 checked against `SUBSCRIPTION_SIGN_INS`:
 
@@ -78,7 +80,7 @@ checked against `SUBSCRIPTION_SIGN_INS`:
   `hermes auth` adopted or an OpenCode Claude provider plugin. Reading those stores (provider
   entry presence only) or refusing them is open for Lucas.
 
-## Own-loop routes: Copilot and Nous (Lucas, Nov 8)
+## Own-loop routes: Copilot and Nous (Lucas, 2026-11-08)
 
 PRODUCT.md `055cc7a5` section 3.3. `own_loop.py`, checked before any spawn or request, fail closed:
 
@@ -112,14 +114,44 @@ PRODUCT.md `055cc7a5` section 3.3. `own_loop.py`, checked before any spawn or re
   whether the Nous Portal terms' consent clause covers an app calling through the proxy. No
   provider, DNS or network call is made here.
 
-## Gemini CLI (E7)
+## Gemini CLI (E7) and Antigravity CLI (2026-11-09)
 
-`check_gemini_cli_sign_in(route)`: Gemini CLI consumer accounts ended June 18, 2026. Only a
-paid API key (`{"method": "api_key", "paid": true}`, the user's statement; not checkable
-offline) or an existing Code Assist Standard or Enterprise licence
-(`{"method": "code_assist", "licence": "standard"|"enterprise", "existing": true}`) passes.
-Consumer, free-tier and unknown methods refuse. No Gemini CLI route adapter exists yet, so
-nothing calls it.
+Google, [Gemini Code Assist consumer accounts](https://developers.google.com/gemini-code-assist/docs/deprecations/code-assist-individuals):
+on 2026-06-18 Gemini CLI stopped serving consumer accounts, and Login with Google no longer
+works. Google, [transitioning Gemini CLI to Antigravity CLI](https://developers.googleblog.com/an-important-update-transitioning-gemini-cli-to-antigravity-cli/):
+the subscription path is Antigravity CLI; Gemini CLI remains available with a paid API key.
+The same post says Code Assist Standard and Enterprise licences are on a separate schedule.
+Lucas's 2026-11-09 call keeps Gemini CLI here only as that paid API-key route.
+`check_gemini_cli_sign_in({"method": "api_key", "paid": true})` passes (`paid` is the user's
+statement; a tier cannot be checked offline). A Code Assist licence and every other
+subscription sign-in refuse (`subscription_sign_in_dropped` or `consumer_account_ended`).
+No Gemini CLI route adapter exists yet, so nothing calls it.
+
+`check_antigravity_route` is the beta wrapper for `agy`. Its pin is the version plus the
+sha256 of the `agy` binary and of its launcher. Package files are not part of that pin.
+A mismatch refuses `wrapper_pin_mismatch` until the pin is replaced. The binary is not run.
+T3 Code is background only: this package has no T3 Code route.
+
+The floor table's Measured help column (which builds have a measured `--help`) already
+landed on recursion #323. It is not repeated here.
+
+## Wrapper pins (Pi, Hermes, Cursor)
+
+Lucas, 2026-11-09: Pi, Hermes and Cursor run as beta when the launcher script and the
+installed package files match a pin. `measure_package_pin(launcher, install_root)` hashes
+the launcher and every file under the install root (a symlink is hashed as its link text,
+and directory symlinks are not followed). Pass that pin as `wrapper=` to `check_route`
+(Pi, Hermes) or `check_cursor_route`. A changed, extra or missing file, or a different
+launcher, refuses `wrapper_pin_mismatch`. OpenCode is not in this pin. Cursor's child env
+carries no credential. A missing pin on Pi or Hermes refuses `wrapper_pin_missing`.
+
+`guard_then_spawn` launches the env `check_route` accepted, not a second read of the
+caller's mapping. A subscription `model` must appear in argv (or as `--model` / `-m`);
+otherwise the launch refuses `model_not_bound`. An empty model segment (`anthropic/`)
+refuses `model_name_empty`. Hermes's `auth.adopt_external_logins: false` is written to
+`.hermes/config.yaml` in the route home before the launcher runs (Hermes defaults that
+switch to true). An existing `config.yaml` is not read and refuses
+`hermes_config_blocks_adopt_override`. `borrow_claude_code_login` is not a profile field.
 
 ## Tests
 
@@ -134,7 +166,20 @@ python3 -B -m unittest discover -s core/recursion_core/subscription_routes/tests
 
 ## Evidence
 
-Candidate csl-research records (links only; the research stays there):
-`submissions/20261107-csl786-subscription-routes-01` (this change's record), and the CSL-712
-grounding records on csl-research branch `grounding-1077` (engine CLIs V51 and V56; vendor
-terms H1 to H3).
+Governing spec: csl-research `contracts/PRODUCT.md` at
+`055cc7a5c793b7135e5d0565dc4198cf96230531`, SHA-256
+`e64783152f6d67d4ede774dc41d112fe46c2d7536d53cb2c04e71a3566044daf`, CSLR-D-011.
+
+Candidate record this module was written against (research stays in the vault):
+
+- Repository: `CSL-Laboratories/csl-research`
+- Commit: `3b9a8469a3bd10ba22b7875b08da427144dcee09`
+- Path: `submissions/20261107-csl786-subscription-routes-01/`
+- Claim: Pi, Hermes and OpenCode refuse a Claude-subscription route before spawn, and the
+  2026-11-08 sign-in allowlist matches PRODUCT.md sections 2 and 3.3.
+- Limitations: candidate evidence, not founder acceptance. This VM could not re-read
+  csl-research (GitHub HTTP 404). `3b9a8469a3bd10ba22b7875b08da427144dcee09` is the last
+  full SHA this module's earlier notes recorded (CSL-786, 2026-11-09). A later comment on
+  the same issue (2026-11-09T21:54:27Z) names csl-research #1099 head
+  `8592d47062153875ca36f9fbe5b4228f0c70bdf6`; that tree was not opened here. The old
+  pointer at branch `grounding-1077` is not a pin and is not cited as one.

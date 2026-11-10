@@ -41,12 +41,15 @@ Limit signal (the only thing that can trip a connection's breaker)::
 
     {"scope": "connection" | "model", "model": str | None, "reset_at": float | None,
      "source": "<typed vendor field>"}
+
+``reset_at`` is an absolute reading of the breaker clock (the same clock as deadlines). A vendor
+``resetsAt`` is Unix epoch seconds and is translated with ``vendor_reset`` before it is stored.
 """
 
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 CONTRACT_VERSION = "recursion.route/v0"
 
@@ -156,6 +159,23 @@ def connection_key(route: Mapping) -> str:
 
     conn = route["connection"]
     return f"{conn['kind']}:{conn['id']}"
+
+
+def vendor_reset(epoch: object, clock: Callable[[], float], wall: Callable[[], float]) -> float | None:
+    """Translate a vendor Unix-epoch ``resetsAt`` onto ``clock``.
+
+    ``clock`` is the breaker and deadline clock and may be monotonic. ``wall`` reads Unix epoch
+    seconds (``time.time``). The same function for both leaves the number unchanged, which is what
+    the fakes do. A non-finite value, or a reset that is already past on ``clock``, becomes None so
+    the breaker uses its own cooldown instead of treating a real epoch as eight days away.
+    """
+
+    if isinstance(epoch, bool) or not isinstance(epoch, (int, float)) or not math.isfinite(float(epoch)):
+        return None
+    translated = clock() + (float(epoch) - wall())
+    if not math.isfinite(translated) or translated <= clock():
+        return None
+    return translated
 
 
 def limit_signal(scope: str, source: str, *, model: str | None = None, reset_at: float | None = None) -> dict:

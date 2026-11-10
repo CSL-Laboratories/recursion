@@ -18,7 +18,7 @@ from recursion_core.routes.breaker import ConnectionBreaker
 from recursion_core.routes.claude_code import ClaudeCodeAdapter, SUBSCRIPTION_DROP_ENV
 from recursion_core.routes.codex import CodexAdapter
 from recursion_core.routes.service import RouteService
-from recursion_core.routes.tests.fakes import (FakeClock, FakeLauncher, claude_error, claude_limit, claude_ok,
+from recursion_core.routes.tests.fakes import (HANG, FakeClock, FakeLauncher, claude_error, claude_limit, claude_ok,
                                                codex_script, request)
 
 PKG = Path(__file__).resolve().parents[1]
@@ -45,8 +45,10 @@ class Harness:
 
         args = (self.launcher, self.clock, creds, PARENT)
         self.breaker = ConnectionBreaker(self.clock)
-        self.service = RouteService({"claude_code": ClaudeCodeAdapter(*args), "codex": CodexAdapter(*args)},
-                                    self.breaker, self.clock, limits=limits)
+        self.service = RouteService(
+            {"claude_code": ClaudeCodeAdapter(*args, wall_clock=self.clock),
+             "codex": CodexAdapter(*args, wall_clock=self.clock)},
+            self.breaker, self.clock, limits=limits)
 
     def handle(self, req):
         res = self.service.handle(json.loads(json.dumps(req)))
@@ -209,6 +211,9 @@ class ApiKeyAndPassthroughTest(unittest.TestCase):
                 res = h.handle(req)
                 self.assertEqual(res["code"] != c.LAUNCH_REFUSED, launches, (method, value, res["code"]))
                 self.assertEqual(bool(h.launcher.calls), launches, (method, value))
+                if launches:
+                    # The child sees the canonical spelling, not the padded or capitalised parent value.
+                    self.assertEqual(h.launcher.calls[0]["env"][name], value.strip().lower())
 
     def test_bedrock_passthrough_keeps_the_web_identity_role(self) -> None:
         # Bot review 4511222552 at 92a897b3: an AWS web-identity role (EKS IRSA) lost its two variables.
@@ -401,8 +406,70 @@ class LimitsTest(unittest.TestCase):
         self.assertEqual(notice["switched_to"]["connection"], "subscription:login-C")
         self.assertEqual([a["connection"] for a in notice["attempts"]],
                          ["subscription:login-A", "subscription:login-B", "subscription:login-C"])
-        self.assertEqual(res["events"][0]["kind"], "fallback")
+        self.assertEqual([e["data"]["to"] for e in res["events"] if e["kind"] == "fallback"],
+                         ["subscription:login-B", "subscription:login-C"])
         self.assertEqual([call["argv"][-1] for call in h.launcher.calls], ["claude-sonnet", "m-b", "m-c"])
+
+    def test_fallback_shares_the_request_deadline(self) -> None:
+        # The primary consumes 40s of a 100s deadline. A hanging fallback must wait out the remainder,
+        # not a fresh 100s.
+        seen = []
+
+        def scripts(argv, env):
+            if not seen:
+                seen.append(argv[-1])
+                h.clock.advance(40)
+                return claude_limit()
+            seen.append(argv[-1])
+            return [HANG]
+
+        h = Harness(scripts)
+        order = [{"engine": "claude_code", "model": "m-b", "connection": {"kind": "subscription", "id": "login-B"},
+                  "api_key_helper": "absent"}]
+        res = h.handle(request(deadline_s=100, limits={"on_limit": "fallback", "fallback": order}))
+        self.assertEqual(res["text"], "")  # the hang becomes deadline_exceeded on the fallback
+        self.assertEqual(res["code"], c.DEADLINE_EXCEEDED)
+        self.assertEqual(seen, ["claude-sonnet", "m-b"])
+        self.assertEqual(h.clock.now, 1_000_000.0 + 100)  # 40s primary + 60s left, not 40 + 100
+
+    def test_fallback_does_not_start_when_the_deadline_is_already_spent(self) -> None:
+        # The limit is read, and the last line moves the clock onto the deadline. The fallback must not launch.
+        clock = FakeClock()
+        lines = [json.dumps(item) for item in claude_limit()]
+
+        class Proc:
+            def __init__(self) -> None:
+                self.fenced: list[str] = []
+                self.pending = list(lines)
+
+            def send(self, line: str) -> None:
+                return None
+
+            def close_stdin(self) -> None:
+                return None
+
+            def read_line(self, timeout_s: float):
+                item = self.pending.pop(0)
+                if not self.pending:
+                    clock.advance(60)
+                return item
+
+            def fence(self, reason: str) -> None:
+                self.fenced.append(reason)
+
+        calls: list[list[str]] = []
+
+        def launch(argv, **kwargs):
+            calls.append(list(argv))
+            return Proc()
+
+        adapter = ClaudeCodeAdapter(launch, clock, lambda *a: "", PARENT, wall_clock=clock)
+        service = RouteService({"claude_code": adapter}, ConnectionBreaker(clock), clock)
+        order = [{"engine": "claude_code", "model": "m-b", "connection": {"kind": "subscription", "id": "login-B"},
+                  "api_key_helper": "absent"}]
+        res = service.handle(request(deadline_s=60, limits={"on_limit": "fallback", "fallback": order}))
+        self.assertEqual(res["code"], c.PLAN_LIMIT)
+        self.assertEqual(len(calls), 1)
 
     def test_fallback_all_limited_returns_the_first_limit_with_notice(self) -> None:
         h = Harness(limited_then(claude_limit()))

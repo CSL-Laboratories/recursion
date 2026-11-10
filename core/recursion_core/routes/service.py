@@ -30,41 +30,50 @@ class RouteService:
             limits = lim.validate_limits(req["route"]["limits"]) if "limits" in req["route"] else self._limits
         except c.RouteError as err:
             return c.result(rid, err.code, detail=err.detail)
-        res = self._run(req)
+        # One absolute deadline for the request, shared by every fallback. A later attempt does not
+        # get a fresh deadline_s (11.2: the request stops at the deadline the caller set).
+        deadline_at = self._clock() + float(req["deadline_s"])
+        res = self._run(req, deadline_at)
         notice = lim.notice(res, req["route"], limits)
         if notice is None:
             return res
         res["limit_notice"] = notice
         if limits["on_limit"] != "fallback":
             return res  # ask / wait: shown to the user; nothing else runs
+        trail: list[dict] = []
         for route in limits["fallback"]:  # only the user's own routes, in the user's order
+            if self._clock() >= deadline_at:
+                break  # no time left for another attempt; the limit result stands
             nxt = dict(req, route=dict(route))
-            other = self._run(nxt)
+            other = self._run(nxt, deadline_at)
             notice["attempts"].append(lim.describe(route))
             event = c.event("fallback", "recursion.limits", {
                 "from": notice["route"]["connection"], "to": c.connection_key(route), "model": route["model"],
                 "code": other["code"]})
             if other["code"] not in lim.LIMIT_CODES:
                 notice["switched_to"] = lim.describe(route)
-                other["events"] = [event, *other["events"]]
+                other["events"] = [*trail, event, *other["events"]]
                 other["limit_notice"] = notice
                 return other
+            trail.append(event)
             res["events"].append(event)
         return res
 
-    def _run(self, req: dict) -> dict:
+    def _run(self, req: dict, deadline_at: float) -> dict:
         rid = req["request_id"]
         route = req["route"]
         adapter = self._adapters.get(route["engine"])
         if adapter is None:
             return c.result(rid, c.ENGINE_UNKNOWN, detail=f"no adapter for {route['engine']}")
         connection, model, tenant = c.connection_key(route), route["model"], req["tenant"]
-        # The probe lease is bounded by this run's own deadline (plus grace), so a probe still running
+        remaining = deadline_at - self._clock()
+        if remaining <= 0:
+            return c.result(rid, c.DEADLINE_EXCEEDED, detail="recursion deadline")
+        # The probe lease is bounded by the time still left (plus grace), so a probe still running
         # inside its deadline is never joined by a second probe on the same connection (11.2, C1-18).
-        admit = self._breaker.admit(connection, model, tenant, deadline_s=float(req["deadline_s"]))
+        admit = self._breaker.admit(connection, model, tenant, deadline_s=remaining)
         if not admit["admitted"]:
             return c.result(rid, admit["code"], detail=admit["key"], retry_at=admit["retry_at"])
-        deadline_at = self._clock() + float(req["deadline_s"])
         try:
             res = adapter.run(req, deadline_at)
         except BaseException:

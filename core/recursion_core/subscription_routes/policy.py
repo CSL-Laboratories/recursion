@@ -514,8 +514,9 @@ def guard_then_spawn(
     """Run ``check_route`` and only then call the launcher with the env that check accepted.
 
     A later change to ``child_env`` is not what launches: the launcher receives ``decision.child_env``.
-    A subscription route's ``model`` must be an argv element (or ``--model`` / ``-m``), so the engine is
-    not left to its own default. On Pi and Hermes ``argv[0]`` must be an absolute path that resolves to
+    A subscription route's ``model`` must be an argv element, or every ``--model`` / ``--model=`` / ``-m``
+    before ``--`` must name that model. A second flag with a different value refuses ``model_not_bound``.
+    On Pi and Hermes ``argv[0]`` must be an absolute path that resolves to
     the pinned ``wrapper.launcher_path`` (``argv0_not_pinned``); OpenCode has no pin and no such check.
     Hermes's ``auth.adopt_external_logins: false`` is written into the route home's
     ``.hermes/config.yaml`` before the launcher runs; a config already there is reused only when it is
@@ -766,14 +767,33 @@ def _argv0_is_pinned(argv: list[str], pinned: tuple[str, ...]) -> bool:
 
 
 def _argv_binds_model(argv: list[str], model: str) -> bool:
-    if model in argv:
-        return True
-    for index, item in enumerate(argv):
-        if item == f"--model={model}":
-            return True
-        if item in _MODEL_FLAGS and index + 1 < len(argv) and argv[index + 1] == model:
-            return True
-    return False
+    """True when argv selects ``model`` and no model flag selects anything else.
+
+    Real CLIs take the last ``--model``, ``--model=`` or ``-m``. Returning on the first match lets a
+    second flag launch a different model. Every flag before ``--`` must name ``model``. With no model
+    flag, ``model`` must still appear as an argv element. A flag with no value does not bind.
+    """
+
+    bindings: list[str] = []
+    index = 1  # argv[0] is the program, not a flag
+    while index < len(argv):
+        item = argv[index]
+        if item == "--":
+            break
+        if item in _MODEL_FLAGS:
+            if index + 1 >= len(argv):
+                return False
+            bindings.append(argv[index + 1])
+            index += 2
+            continue
+        if item.startswith("--model="):
+            bindings.append(item[len("--model="):])
+            index += 1
+            continue
+        index += 1
+    if bindings:
+        return all(value == model for value in bindings)
+    return model in argv
 
 
 def _refuse_hermes_config(engine: str, detail: str) -> SubscriptionRouteRefused:
@@ -933,7 +953,8 @@ def _link_hermes_config(engine: str, route_home: str, parent: str) -> None:
     """``.hermes`` holds Hermes's own entries and no ``config.yaml``: add the switch without replacing.
 
     The switch is written to a temp file in the route home and hard-linked into ``.hermes``. A link
-    never overwrites, so a ``config.yaml`` that appeared meanwhile refuses instead of being replaced.
+    never overwrites and does not follow a source symlink, so a ``config.yaml`` that appeared
+    meanwhile refuses instead of being replaced. The caller checks the result is that regular file.
     """
 
     temp = os.path.join(route_home, _HERMES_STAGING_PREFIX + secrets.token_hex(8))
@@ -942,7 +963,7 @@ def _link_hermes_config(engine: str, route_home: str, parent: str) -> None:
         try:
             parent_fd = os.open(parent, _DIR_OPEN_FLAGS)
             try:
-                os.link(temp, "config.yaml", dst_dir_fd=parent_fd)
+                os.link(temp, "config.yaml", dst_dir_fd=parent_fd, follow_symlinks=False)
                 _fsync_dir(parent_fd)
             finally:
                 os.close(parent_fd)
@@ -953,8 +974,36 @@ def _link_hermes_config(engine: str, route_home: str, parent: str) -> None:
     _fsync_dir(route_home)
 
 
+def _drop_config_symlink(route_home: str) -> None:
+    """Remove a ``config.yaml`` symlink the link step just installed. A regular file is left alone."""
+
+    dest = os.path.join(route_home, ".hermes", "config.yaml")
+    if os.path.islink(dest):
+        try:
+            os.unlink(dest)
+        except OSError:
+            pass
+
+
+def _confirm_hermes_switch(engine: str, route_home: str) -> None:
+    """The switch just written is the regular file we expect. A symlink is removed and the launch refuses."""
+
+    try:
+        ok = _hermes_config_is_ours(engine, route_home)
+    except SubscriptionRouteRefused:
+        _drop_config_symlink(route_home)
+        raise
+    if not ok:
+        _drop_config_symlink(route_home)
+        raise _refuse_hermes_config(engine, "config.yaml")
+
+
 def _apply_hermes_adopt_override(decision: RouteDecision, route_home: str) -> None:
-    """Write Hermes's adopt switch, or reuse the one an earlier launch in this home wrote."""
+    """Write Hermes's adopt switch, or reuse the one an earlier launch in this home wrote.
+
+    After a write, the switch is read back. Anything that is not that regular file refuses, and a
+    symlink left at ``config.yaml`` is removed, before the launcher runs.
+    """
 
     if decision.engine != "hermes":
         return
@@ -969,6 +1018,7 @@ def _apply_hermes_adopt_override(decision: RouteDecision, route_home: str) -> No
         raise _refuse_hermes_config(decision.engine, ".hermes")
     else:
         _link_hermes_config(decision.engine, route_home, parent)
+    _confirm_hermes_switch(decision.engine, route_home)
 
 
 def _launch_checked(

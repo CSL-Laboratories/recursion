@@ -476,6 +476,21 @@ class HermesHomeReuseTests(_Calls):
         self.launch_sub()  # and the next launch reuses it
         self.assertEqual(2, self.launcher.call_count)
 
+    def test_link_that_installs_a_symlink_does_not_launch(self) -> None:
+        # The new hard-link path must not leave a symlink at config.yaml and then launch.
+        (self.home / ".hermes").mkdir(mode=0o700)
+        (self.home / ".hermes" / "state.db").write_bytes(b"hermes-state")
+
+        def plant(src: object, dst: object, **kwargs: object) -> None:
+            os.symlink(src, dst, dir_fd=kwargs.get("dst_dir_fd"))
+
+        with mock.patch.object(policy.os, "link", side_effect=plant):
+            self.refused("hermes_config_blocks_adopt_override", self.launch_sub)
+        self.assertFalse(self.config().exists())
+        self.assertEqual(b"hermes-state", (self.home / ".hermes" / "state.db").read_bytes())
+        self.assertEqual([], self.stray())
+        self.launcher.assert_not_called()
+
     def test_link_failure_refuses_and_leaves_no_temp_file(self) -> None:
         (self.home / ".hermes").mkdir(mode=0o700)
         (self.home / ".hermes" / "state.db").write_bytes(b"hermes-state")

@@ -163,6 +163,44 @@ class AllowlistTests(_Base):
         self.assertEqual("chatgpt/test-model", decision.model)
         self.assertIn("chatgpt/test-model", self.launcher.call_args.args[0])
 
+    def test_a_second_model_flag_does_not_bind(self) -> None:
+        # A later --model / -m wins on real CLIs. Binding the first flag and ignoring the second
+        # lets the launch select a different model than the one check_route accepted.
+        model = "chatgpt/test-model"
+        profile = self.sub("chatgpt", "sign_in_with_chatgpt", model=model)
+        env = self.bare_env()
+        kwargs = {"route_home": str(self.home), "parent_env": self.parent(), "operator_home": str(self.operator)}
+        other = "grok/other"
+        refused = (
+            ["opencode", "--model", model, "--model", other],
+            ["opencode", "--model", other, "--model", model],
+            ["opencode", model, "--model", other],
+            ["opencode", "--model=" + model, "--model", other],
+            ["opencode", "-m", model, "-m", other],
+            ["opencode", "--model", model, "--model=" + other],
+            ["opencode", "--model", other, "--", model],
+        )
+        for argv in refused:
+            with self.subTest(argv=argv):
+                with self.assertRaises(SubscriptionRouteRefused) as caught:
+                    guard_then_spawn(self.launcher, argv, "opencode", profile, env, **kwargs)
+                self.assertEqual(caught.exception.cause, "model_not_bound")
+                self.launcher.assert_not_called()
+        # One flag, the same model twice, a bare element, or a flag only after -- still binds.
+        accepted = (
+            ["opencode", "--model", model],
+            ["opencode", "--model=" + model],
+            ["opencode", "-m", model],
+            ["opencode", model],
+            ["opencode", "--model", model, "--model", model],
+            ["opencode", "--", model, "--model", other],
+        )
+        for argv in accepted:
+            with self.subTest(argv=argv):
+                self.launcher.reset_mock()
+                decision, _ = guard_then_spawn(self.launcher, argv, "opencode", profile, env, **kwargs)
+                self.assertEqual(model, decision.model)
+
     def test_no_token_rides_along_with_a_sign_in(self) -> None:
         cases = [({"OPENAI_API_KEY": FAKE_KEY}, "credential_env_on_subscription"),
                  ({"ANTHROPIC_API_KEY": FAKE_KEY}, "credential_env_on_subscription"),

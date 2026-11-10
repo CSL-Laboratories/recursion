@@ -99,24 +99,32 @@ PRODUCT.md `055cc7a5` section 3.3. `own_loop.py`, checked before any spawn or re
   looks like a token, key or credential refuses, and `GITHUB_COPILOT_API_TOKEN`,
   `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN` and `COPILOT_API_URL` (plus the `gh`
   selectors `GH_HOST`, `GH_CONFIG_DIR`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`) are
-  removed from that run's child, as is every other provider credential (`*_API_KEY`, `*_TOKEN`, for
-  example `ANTHROPIC_API_KEY`). An optional `model` is checked (printable, no spaces, at most 128
-  characters) and carried on the decision. With no stored `copilot` login (or no probe, or a failing probe)
-  the run refuses rather than fall back to `gh`. The probe is the caller's; nothing here opens a
-  login store.
+  removed from that run's child, as is every other provider credential (`*_API_KEY`, `*_TOKEN`,
+  `GITHUB_PAT`, `GITHUB_PASSWORD`, `AWS_SECRET_ACCESS_KEY`, `OPENAI_BASE_URL`, `OPENAI_API_BASE`,
+  for example `ANTHROPIC_API_KEY`) and git's config-injection channel (`GIT_CONFIG_COUNT`,
+  `GIT_CONFIG_KEY_*`, `GIT_CONFIG_VALUE_*`, `GIT_CONFIG_PARAMETERS`), which can carry an HTTP
+  bearer. An optional `model` is checked (printable, no spaces, at most 128 characters) and
+  carried on the decision. With no
+  stored `copilot` login, no probe, a probe that fails or raises `SystemExit`, or a probe that
+  does not return within 5 seconds (`LOGIN_PROBE_DEADLINE_S`; a caller may pass a shorter
+  `probe_deadline`, not a longer one) the run refuses rather than fall back to `gh`. The probe is
+  the caller's; nothing here opens a login store.
 - **Nous, "Local proxy"**: `check_nous_own_loop(route, parent_env, ...)` with
   `{"engine": "nous", "auth": "subscription", "method": "hermes_local_proxy", "base_url": ...}`.
   The own loop calls only the user's own Hermes subscription proxy at a loopback IP literal
   (`127.0.0.0/8`, `::1`, or IPv4-mapped loopback); names, including `localhost`, are not resolved
   and refuse. Adapters are `["nous"]` only; `xai` refuses (`adapter_must_stay_off`). Recursion holds
-  no Nous token: token-like route fields and URL credentials refuse, and provider credential
-  variables are removed from the child. Proxy settings (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, any
-  case) are removed too, so loopback-bound traffic cannot be carried off the host. An optional
+  no Nous token: token-like route fields and URL credentials refuse, and the same provider
+  credentials as on the Copilot child (including `OPENAI_API_BASE`) are removed from the child.
+  Proxy settings (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, any case) are removed too, so
+  loopback-bound traffic cannot be carried off the host. An optional
   `model` is checked and carried; an adapter-prefixed id must name `nous` (`xai/grok-3` refuses
   `adapter_must_stay_off`).
 - `nous_proxy_doctor(base_url, current_user=..., interactive_users=[...])` reports the address,
   refuses one that is not loopback, and warns when other interactive users share the host (any
-  local user can reach a loopback proxy, which "accepts any bearer"). With no
+  local user can reach a loopback proxy, which "accepts any bearer"). The reported address and
+  the refusal text leave out URL userinfo, so `ftp://user:secret@...` and `http://user:secret@...`
+  do not echo that secret. With no
   `interactive_users`, it and `check_nous_own_loop` warn "host users unknown" instead of
   reporting a clean host.
 - Still *[to verify]* in PRODUCT.md (O61): GitHub's Generative AI Services terms for Copilot, and
@@ -211,10 +219,12 @@ pinned file passes, and argv reaches the launcher unchanged. OpenCode has no pin
 compares paths at guard time; it does not hold the file open across the launch.
 
 `guard_then_spawn` launches the env `check_route` accepted, not a second read of the
-caller's mapping. A subscription `model` must appear in argv (or as `--model` / `-m`);
-otherwise the launch refuses `model_not_bound`. An empty model segment (`anthropic/`)
-refuses `model_name_empty`. `borrow_claude_code_login` is not a profile field.
-`repr(RouteDecision)` leaves out `child_env`, which holds the API key on an API-key route.
+caller's mapping. A subscription `model` must appear in argv, or every `--model`,
+`--model=` and `-m` before `--` must name that same model. A second flag with a
+different value refuses `model_not_bound` (the first match does not bind). An empty
+model segment (`anthropic/`) refuses `model_name_empty`. `borrow_claude_code_login`
+is not a profile field. `repr(RouteDecision)` leaves out `child_env`, which holds the
+API key on an API-key route.
 
 ### Launch options
 
@@ -264,8 +274,10 @@ How the switch is written:
   `hermes_config_blocks_adopt_override` and the staging directory is removed.
 - `.hermes` holds entries and no `config.yaml` (a sign-in route's own store): the 37 bytes
   go to a `.hermes.recursion-<random>` temp file in the route home, which is hard-linked to
-  `.hermes/config.yaml` and then removed. A link never overwrites. Any failure on this path
-  refuses `hermes_config_blocks_adopt_override`.
+  `.hermes/config.yaml` and then removed. A link never overwrites and does not follow a source
+  symlink. Any failure on this path refuses `hermes_config_blocks_adopt_override`.
+- After either write the guard reads the switch back with the same rules and refuses to launch
+  if it is not exactly that regular file. A symlink left at `config.yaml` is removed.
 - Fallback for any other leftover (a partial or foreign `config.yaml`, a `.hermes` this
   route refuses): the driver discards the route home and makes a new one. The guard does
   not repair it.

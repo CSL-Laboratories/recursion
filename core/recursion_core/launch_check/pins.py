@@ -35,7 +35,7 @@ from recursion_core.launch_check.binary import file_kind, sha256_file
 from recursion_core.launch_check.refusals import LaunchRefused
 
 # A pin added, removed or changed is a new PIN_TABLE_VERSION; grants under another are grant_stale.
-PIN_TABLE_VERSION = "r2a-pins/1.1.0-candidate-2026-11-09"
+PIN_TABLE_VERSION = "r2a-pins/1.2.0-candidate-2026-11-09"
 
 KINDS = ("launcher+tree", "binary+launcher")
 _WHAT = {"launcher+tree": "installed package files", "binary+launcher": "binary"}
@@ -79,6 +79,46 @@ PINS: tuple[Pin, ...] = (
         platform="linux_amd64",
         measured="2026-11-09",
         source="https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.3-6604829099950080/linux-x64/cli_linux_x64.tar.gz",
+    ),
+    # The two windows_amd64 pins below were measured on Lucas's Windows machine "sentry" with
+    # the hasher at commit 66fe11b1. They are recorded data and not reachable yet: on Windows
+    # detect.path_hits tries only the bare name and ".exe", and grant() refuses a path whose
+    # stem is not the bare engine name or that has a wrapper extension (.cmd, .ps1) as
+    # wrapper_refused before any pin is checked. So a real Windows install still gets no
+    # grant (it fails closed) until Windows launcher resolution is decided, which is a logic
+    # change and open for Lucas. The code does not decide between launchers; each launcher
+    # here is recorded as measured.
+    #
+    # Cursor 2026.11.05-86047df, windows_amd64: launcher
+    # C:\Users\Lucas\AppData\Local\cursor-agent\cursor-agent.ps1 (2527 bytes), recorded as
+    # measured. Tree of versions/2026.11.05-86047df: 408 entries, 265684223 bytes. It includes
+    # an empty .running directory, so this pin goes stale if Cursor writes into it or removes it.
+    Pin(
+        engine="cursor",
+        version="2026.11.05-86047df",
+        launcher_sha256="b5975caa126e855f4be9b6084791a47eb40dd0babccb297265bf131df033acfc",
+        launcher_bytes=2527,
+        target="versions/2026.11.05-86047df",
+        target_sha256="d9088fb279e9a004d4098b927df9b1257cd05b367cdc0959ba11d082e291bf23",
+        platform="windows_amd64",
+        measured="2026-11-09",
+        source="https://cursor.com/install?win32=true",
+    ),
+    # Pi 1.5.1, windows_amd64: launcher C:\Users\Lucas\.pi\agent\bin\pi.cmd (464 bytes), the
+    # pinned launcher, recorded as measured. Tree of ../install/releases/1.5.1: 16776 entries,
+    # 113981899 bytes. PowerShell resolves `pi` to pi.ps1 first (sha256
+    # 3f422e96483162aad373b8e3e28f282236bdffb5cc1b8bfb6c25a8d918bd31d1, 500 bytes), which is
+    # not pinned. Which launcher Recursion binds on Windows is an open item for Lucas.
+    Pin(
+        engine="pi",
+        version="1.5.1",
+        launcher_sha256="c56ef3cdd441b3c00d49e6e36d4a163bbcc715bf32e4de3473ece96efd232c4b",
+        launcher_bytes=464,
+        target="../install/releases/1.5.1",
+        target_sha256="2c477ce6abcd257434138b4affd6f9b12b92ec2527bc8eb50f04948a25323ac7",
+        platform="windows_amd64",
+        measured="2026-11-09",
+        source="https://pi.dev/install.ps1",
     ),
 )
 

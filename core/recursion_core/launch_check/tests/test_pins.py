@@ -210,27 +210,63 @@ class PinTableTests(unittest.TestCase):
 
     def test_committed_antigravity_1_5_3_pin_has_the_measured_values(self) -> None:
         # Verified fixture, measured 2026-11-09 on linux_amd64 with sha256sum; the 246 MB binary is not committed.
-        self.assertEqual("r2a-pins/1.1.0-candidate-2026-11-09", PIN_TABLE_VERSION)
-        self.assertEqual(
-            (
-                Pin(
-                    engine="antigravity",
-                    version="1.5.3",
-                    launcher_sha256="7ca212748ca0dfda718efbc39a776a104472e7e9344d4b6ea147c543684f96a3",
-                    launcher_bytes=246837648,
-                    target="",
-                    target_sha256="7ca212748ca0dfda718efbc39a776a104472e7e9344d4b6ea147c543684f96a3",
-                    platform="linux_amd64",
-                    measured="2026-11-09",
-                    source="https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.3-6604829099950080/linux-x64/cli_linux_x64.tar.gz",
-                ),
-            ),
-            PINS,
+        self.assertEqual("r2a-pins/1.2.0-candidate-2026-11-09", PIN_TABLE_VERSION)
+        agy = Pin(
+            engine="antigravity",
+            version="1.5.3",
+            launcher_sha256="7ca212748ca0dfda718efbc39a776a104472e7e9344d4b6ea147c543684f96a3",
+            launcher_bytes=246837648,
+            target="",
+            target_sha256="7ca212748ca0dfda718efbc39a776a104472e7e9344d4b6ea147c543684f96a3",
+            platform="linux_amd64",
+            measured="2026-11-09",
+            source="https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.3-6604829099950080/linux-x64/cli_linux_x64.tar.gz",
         )
+        self.assertIn(agy, PINS)
+        self.assertEqual([agy], [p for p in PINS if p.engine == "antigravity"])
         self.assertTrue(pins_mod.listed("antigravity", "1.5.3", "7ca212748ca0dfda718efbc39a776a104472e7e9344d4b6ea147c543684f96a3", "7ca212748ca0dfda718efbc39a776a104472e7e9344d4b6ea147c543684f96a3"))
         self.assertFalse(pins_mod.listed("antigravity", "1.5.4", "7ca212748ca0dfda718efbc39a776a104472e7e9344d4b6ea147c543684f96a3", "7ca212748ca0dfda718efbc39a776a104472e7e9344d4b6ea147c543684f96a3"))
-        # Pi, Hermes and Cursor were not installed where this was measured: no pin, so they refuse.
-        self.assertEqual({"antigravity"}, {p.engine for p in PINS})
+
+    def test_committed_windows_amd64_cursor_and_pi_pins_have_the_measured_values(self) -> None:
+        # Verified fixtures, measured 2026-11-09 on Lucas's Windows machine "sentry" (hasher at 66fe11b1);
+        # the trees are not committed. Recorded data: Windows launcher resolution still refuses .cmd/.ps1.
+        cursor = Pin(
+            engine="cursor",
+            version="2026.11.05-86047df",
+            launcher_sha256="b5975caa126e855f4be9b6084791a47eb40dd0babccb297265bf131df033acfc",
+            launcher_bytes=2527,
+            target="versions/2026.11.05-86047df",
+            target_sha256="d9088fb279e9a004d4098b927df9b1257cd05b367cdc0959ba11d082e291bf23",
+            platform="windows_amd64",
+            measured="2026-11-09",
+            source="https://cursor.com/install?win32=true",
+        )
+        pi = Pin(
+            engine="pi",
+            version="1.5.1",
+            launcher_sha256="c56ef3cdd441b3c00d49e6e36d4a163bbcc715bf32e4de3473ece96efd232c4b",
+            launcher_bytes=464,
+            target="../install/releases/1.5.1",
+            target_sha256="2c477ce6abcd257434138b4affd6f9b12b92ec2527bc8eb50f04948a25323ac7",
+            platform="windows_amd64",
+            measured="2026-11-09",
+            source="https://pi.dev/install.ps1",
+        )
+        cells = (
+            (cursor, "/u/cursor-agent/cursor-agent.ps1", "/u/cursor-agent/versions/2026.11.05-86047df", "2026.11.06-86047df"),
+            (pi, "/u/.pi/agent/bin/pi.cmd", "/u/.pi/agent/install/releases/1.5.1", "1.5.2"),
+        )
+        for pin, launcher, root, other_version in cells:
+            with self.subTest(engine=pin.engine):
+                self.assertIn(pin, PINS)
+                self.assertEqual([pin], [p for p in PINS if p.engine == pin.engine])
+                self.assertTrue(pins_mod.listed(pin.engine, pin.version, pin.launcher_sha256, pin.target_sha256))
+                self.assertFalse(pins_mod.listed(pin.engine, other_version, pin.launcher_sha256, pin.target_sha256))
+                # The target is a plain relative path: no ValueError.
+                self.assertEqual(os.path.realpath(root), pins_mod.resolve_target(launcher, pin.target))
+        self.assertEqual({"antigravity", "cursor", "pi"}, {p.engine for p in PINS})
+        # Hermes was measured on Windows for its launchers only; no tree hash exists, so no pin.
+        self.assertFalse([p for p in PINS if p.engine == "hermes"])
 
     def test_target_must_be_a_plain_relative_path(self) -> None:
         self.assertEqual("/a/b/agy", pins_mod.resolve_target("/a/b/agy", ""))

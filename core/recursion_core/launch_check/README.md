@@ -167,7 +167,7 @@ for Lucas.
 
 ## Pinned routes
 
-Pin table `r2a-pins/1.1.0-candidate-2026-11-09`. Lucas's owner call of 2026-11-09 (item 2),
+Pin table `r2a-pins/1.2.0-candidate-2026-11-09`. Lucas's owner call of 2026-11-09 (item 2),
 with the same rules as the route layer on #321 (`wrapper_pin.py` at `38f41d3b`). Pi, Hermes and Cursor are wrapper installs (JS
 bundles under node, a Python entry point; 11.6, #1087 section 6.2) and Antigravity CLI is
 one Go binary. These four are granted only when the install on disk matches a pin in
@@ -200,11 +200,29 @@ Recorded pins (measured from real installs only; no hash here is invented):
 | Engine | Version | Platform | Launcher SHA-256 (bytes) | Target | Target SHA-256 | Measured | Source |
 |---|---|---|---|---|---|---|---|
 | antigravity | 1.5.3 | linux_amd64 | `7ca212748ca0dfda718efbc39a776a104472e7e9344d4b6ea147c543684f96a3` (246837648) | empty (`agy` is the binary) | `7ca212748ca0dfda718efbc39a776a104472e7e9344d4b6ea147c543684f96a3` | 2026-11-09 | the `antigravity` member of [`cli_linux_x64.tar.gz`](https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.3-6604829099950080/linux-x64/cli_linux_x64.tar.gz), which Google's installer copies to `agy`; version from the installer's `manifest_linux_amd64.json`, whose SHA-512 the archive matched |
+| cursor | 2026.11.05-86047df | windows_amd64 | `b5975caa126e855f4be9b6084791a47eb40dd0babccb297265bf131df033acfc` (2527) | `versions/2026.11.05-86047df` (408 entries, 265684223 bytes, includes an empty `.running` directory) | `d9088fb279e9a004d4098b927df9b1257cd05b367cdc0959ba11d082e291bf23` | 2026-11-09 | launcher `C:\Users\Lucas\AppData\Local\cursor-agent\cursor-agent.ps1` on sentry, installed from https://cursor.com/install?win32=true |
+| pi | 1.5.1 | windows_amd64 | `c56ef3cdd441b3c00d49e6e36d4a163bbcc715bf32e4de3473ece96efd232c4b` (464) | `../install/releases/1.5.1` (16776 entries, 113981899 bytes) | `2c477ce6abcd257434138b4affd6f9b12b92ec2527bc8eb50f04948a25323ac7` | 2026-11-09 | launcher `C:\Users\Lucas\.pi\agent\bin\pi.cmd` on sentry, installed from https://pi.dev/install.ps1; PowerShell resolves `pi` to `pi.ps1` first (SHA-256 `3f422e96483162aad373b8e3e28f282236bdffb5cc1b8bfb6c25a8d918bd31d1`, 500 bytes), which is not pinned |
 
-Pi, Hermes and Cursor were not installed on the box where this was measured, so they have
-no pin and are refused `pin_mismatch` on a real install until someone pins them. Antigravity
-CLI on another platform, or any build but 1.5.3, is refused the same way. `install.sh` is
-the bootstrapper, not the launcher, and is not pinned.
+The two `windows_amd64` rows were measured on Lucas's Windows machine "sentry" with the
+hasher at commit `66fe11b1`. They are recorded data, and a real Windows install still does
+not get a grant (it fails closed). The code does not decide between `pi.cmd` and `pi.ps1`
+on Windows: `detect.path_hits` tries only the bare name and `.exe` there, and `grant()`
+refuses a path whose stem is not the bare engine name or that has a wrapper extension
+(`.cmd`, `.ps1`) as `wrapper_refused` before any pin is checked. So the measured `pi.cmd`
+is the pinned launcher, recorded as measured, and `pi.ps1` (which PowerShell resolves
+first) is not pinned. Cursor is the same: `cursor-agent.ps1` is recorded as measured.
+Which launcher Recursion binds on Windows is an open item for Lucas, and Windows launcher
+resolution is a logic change that is not in this commit. The Cursor tree includes an empty
+`.running` directory, so its tree pin goes stale if Cursor writes into it or removes it.
+
+Hermes v0.23.1 (`3b421578588243f920886e6fe79a6faa87ea026e`) was measured on Windows only
+for its launchers (`hermes.exe`, `hermes-acp.exe`) and has no pin. Its Windows checkout
+was 170870 entries (~2.85 GiB), over `MAX_TREE_ENTRIES` (100000), and stock `open()` hit
+`MAX_PATH` under `node_modules/.pnpm`, so no tree hash exists and Hermes stays
+`pin_mismatch`. Pi and Cursor on linux_amd64, or on any other platform or version, still
+have no pin and are refused `pin_mismatch`. Antigravity CLI on another platform, or any
+build but 1.5.3, is refused the same way. `install.sh` is the bootstrapper, not the
+launcher, and is not pinned.
 
 To re-pin: measure the install with `pins.measure(engine, kind, path, target, version=...,
 platform=..., measured=..., source=...)` (it hashes; it runs nothing), add the `Pin` to
@@ -251,8 +269,9 @@ this package ships.
 - Only installs that were measured can match. When an engine updates (Antigravity CLI's
   installer downloads from a host named as an auto-updater; whether `agy` replaces itself
   was not observed), its pin goes stale and the route is refused until re-pinned.
-- POSIX only in the tests. Windows detection here does not read npm `.cmd` shims, so on
-  Windows such engines are not grantable (fail closed).
+- POSIX only in the tests. Windows detection here reads neither npm `.cmd` shims nor
+  `.ps1` launchers, so on Windows such engines are not grantable (fail closed) and the
+  `windows_amd64` pins are not reachable yet.
 
 ## Tests
 
@@ -269,7 +288,8 @@ given version line and exit code (and can dump its environment for the zero-egre
 without one, copies of `/bin/true` plus a test-only probe seam, and the exec-only tests
 skip. Pinned-route tests (`tests/test_pins.py`) build fake installs (an npm-shaped Pi, a
 venv-shaped Hermes, a Cursor version directory, an `agy` binary with and without a
-launcher), measure them in place and patch the pin table; none of those pins is real.
+launcher), measure them in place and patch the pin table; none of those fake-install pins
+is real. The committed rows in `PINS` are real measurements, checked value by value.
 No real `claude`, `codex` or other engine, account, provider or network is used.
 `tools/ci_gate.py` runs these files since CSL-795 (#334) merged: each `core/**/test_*.py`
 is run on its own with `core/` on `PYTHONPATH`.

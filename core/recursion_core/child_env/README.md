@@ -3,10 +3,14 @@
 New-core child environment for engine children. Candidate code: not yet called by a
 running core, and not reviewed or accepted.
 
-- `policy.build_child_env(engine, home=..., parent=...)` builds the child environment
-  from an exact-name allowlist per engine profile (`claude_code`, `codex`), checks the
-  values, and returns a `ValidatedEnv` or raises `EnvRefused(name, cause)` before any
-  spawn. Values are never included in errors or `repr`. `overrides=` may only set a name
+Spec: CSLR-D-011, PRODUCT.md `055cc7a5c793b7135e5d0565dc4198cf96230531` (SHA-256
+`e64783152f6d67d4ede774dc41d112fe46c2d7536d53cb2c04e71a3566044daf`), section 3.3.
+
+- `policy.build_child_env(engine, home=..., auth_mode=..., route=..., parent=...)` builds the
+  child environment from an exact-name allowlist per engine profile (`claude_code`, `codex`),
+  checks the values, and returns a `ValidatedEnv` or raises `EnvRefused(name, cause)` before
+  any spawn. `auth_mode` is required (see [Auth mode and the route](#auth-mode-and-the-route)).
+  Values are never included in errors or `repr`. `overrides=` may only set a name
   already on the engine's allowlist (never `HOME`, `PATH` or a credential name); overrides
   are merged first and then meet exactly the same value, PATH, NO_PROXY and temp rules.
 - Allowlist: the 29 names the Nov 5 tree carried plus `ALL_PROXY`, `all_proxy` and
@@ -22,10 +26,17 @@ running core, and not reviewed or accepted.
 - `CLAUDE_CODE_SIMPLE` is on the Claude scrub list by name (PRODUCT.md 055cc7a5 section 3.3), so
   it never reaches a Claude Code child and an override naming it is refused.
 - The user's own `CLAUDE_CODE_OAUTH_TOKEN` reaches a Claude Code child unchanged when the
-  parent has it, and is absent when the parent does not (PRODUCT.md 055cc7a5 section 3.3,
-  Nov 8 fleet correction: nothing removes a built-in sign-in method from every run). The
-  module does not check, log or set it, and an override naming it is refused
-  (`override_denied`). A Codex child never gets it.
+  parent has it (PRODUCT.md 055cc7a5 section 3.3, Nov 8 fleet correction: nothing removes a
+  built-in sign-in method from every run). This passthrough is accepted (owner call). What
+  holds in every auth mode:
+  - absent in the parent means absent in the child;
+  - an override naming it is refused (`override_denied`);
+  - a Codex child never gets it;
+  - this package never sets, stores, checks or logs it, and `ChildRoute` has no field for it.
+- A Claude Code child may update its own binary. This is intended (owner call):
+  `DISABLE_AUTOUPDATER` is not on the Claude allowlist and the core does not set it, so the
+  parent's value does not reach the child. An override naming `DISABLE_AUTOUPDATER` is still
+  refused (`override_not_allowed`).
 - `launch.spawn(argv, validated_env, ...)` is the launch boundary. It accepts only a
   `ValidatedEnv`, always passes it as Popen's explicit `env=`, resolves argv[0] on the
   validated PATH, and refuses caller options that would replace or widen the launch.
@@ -44,14 +55,59 @@ running core, and not reviewed or accepted.
 
 POSIX only. On Windows every call refuses with `platform_unsupported`.
 
-## Open (Lucas's call)
+## Auth mode and the route
 
-- There is no per-route auth mode yet (PRODUCT.md 055cc7a5 section 3.3 "Every route starts
-  with an explicit auth mode"; CX-950 open). The API-key and cloud-provider scrub lists
-  apply to every run, so an API-key or Bedrock/Vertex/Foundry route cannot be launched
-  through this boundary, and the `ANTHROPIC_BASE_URL` question the spec leaves open is
-  settled here as "dropped". How a user-entered key gets from local secure storage into a
-  child (A28, A44) is a product choice; this module does not pick it.
+Decided by Lucas and implemented here (CSLR-D-011; PRODUCT.md 055cc7a5 section 3.3, "Every
+route starts with an explicit auth mode").
+
+`auth_mode` is required and is exactly one of `subscription`, `api_key`, `cloud_provider`
+(`policy.AUTH_MODES`). Omitted refuses with `auth_mode_missing`; anything else refuses with
+`auth_mode_unknown`. No mode is a default and none is read from the launching shell.
+
+`route=ChildRoute(api_key=None, base_url=None, provider_switches=())` is what the caller says
+about the route it launched. It is a separate input from the parent environment and from
+`overrides`. The override path is unchanged: it still refuses every key, token, base URL and
+provider-switch name (`override_denied`).
+
+In every mode the parent's vendor keys, `ANTHROPIC_BASE_URL` and the Bedrock, Vertex and
+Foundry switches are dropped. The child gets one only from the route:
+
+| Mode | Claude Code child | Refuses |
+| --- | --- | --- |
+| `subscription` | No key. The OAuth passthrough above is kept. | A route with a key (`route_key_not_allowed`) or a switch (`route_provider_not_allowed`). |
+| `api_key` | `ANTHROPIC_API_KEY` is the route's key, never the parent's. `CLAUDE_CODE_OAUTH_TOKEN` stays if the parent has it; the key outranks it (section 3.3). | No key (`route_key_missing`), an empty or malformed key (`route_key_malformed`), a switch (`route_provider_not_allowed`). |
+| `cloud_provider` | Each switch the route names (`CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`) is set to `1`. A switch left in the parent is not a pick. | No switch (`route_provider_missing`), another name (`route_provider_unknown`), a key (`route_key_not_allowed`). |
+
+- **`ANTHROPIC_BASE_URL` is route-owned, not inherited.** The parent's value is dropped in
+  every mode. The child gets `ANTHROPIC_BASE_URL` only when the route supplies `base_url` (a
+  proxy, an OpenRouter-style gateway, another Anthropic-compatible base); with none it is
+  unset. The supplied URL must be `http(s)://host[:port][/path]`: a user name or password
+  refuses with `base_url_userinfo`, and a missing or other scheme, a query, a fragment, a bad
+  port or a `..` path refuses with `base_url_malformed`.
+- **Key custody.** This package is the launch boundary only. It never reads the OS keyring or
+  the owner-only key file (A44), and does no keyring or file I/O. The caller fetches the
+  user-entered key from the OS keyring, or from the owner-only file on a host with no
+  keyring, and passes it as `ChildRoute(api_key=...)` on an `api_key` route only. The key is
+  never in `repr` or `str` of the route, in a refusal, or in `repr` of the `ValidatedEnv`.
+  CSL holds no credential (A28).
+- **Codex child.** It never gets `CLAUDE_CODE_OAUTH_TOKEN`. `subscription` is the behaviour
+  before this change: no vendor name reaches it. `api_key` sets `CODEX_API_KEY` (the variable
+  `codex exec` reads) to the route's key; the parent's `CODEX_API_KEY`, `OPENAI_API_KEY` and
+  `OPENAI_BASE_URL` are dropped in every mode. A route `base_url` refuses with
+  `route_base_url_unsupported`, and `cloud_provider` refuses with `auth_mode_unsupported`:
+  the Codex profile has no base-URL or cloud-provider route here.
+- A route that is not a `ChildRoute`, or whose switches are not a tuple, list or frozenset
+  of names, refuses with `route_malformed`.
+
+Not in this package:
+
+- The `apiKeyHelper` prompt in section 3.3 (show the user that a subscription run would bill
+  their API key and let them pick) belongs to the driver and launch layer. An `api_key` route
+  here needs the key itself.
+- Cloud-provider credentials and region names (for example `AWS_*`) are not on the
+  allowlist. A `cloud_provider` route carries the switch and nothing else from the parent.
+- CX-950 (whether per-run changes for the picked route restrict a built-in method) stays
+  open. Nothing here decides it.
 
 ## Tests
 
@@ -63,6 +119,16 @@ PYTHONPATH=core python3 -B -m recursion_core.child_env.tests.cells 5
 ```
 
 The second command prints one JSON row per cell (n trials each) and a per-group summary.
+
+The cells build their own directory chain and never put a host directory on `PATH`. Run
+42733662905 (`Linux tests`, ubuntu-24.04 image 20261101.360) failed three cells that named
+the host's `/usr/local/bin` and scanned the host's `/usr/bin`: the image makes
+`/usr/local/bin` mode 0777 (`install-nodejs.sh`, `chmod -R 777 /usr/local/bin`) and
+`/usr/share` 0777 (`configure-system.sh`), with `/usr/bin` links into it. The rules refuse
+both, correctly. The fixtures now use their own `usr/bin`, `bin`, `usr/local/bin` and
+`usr/sbin` under the scratch root, the scratch root is made where its whole chain is owned,
+and the `hosted` cells keep the runner layout as a refusal. A real child launched on such a
+host with `/usr/local/bin` on `PATH` is refused (`PATH` / `value_chain_unsafe`).
 `tools/ci_gate.py` discovers `core/**/test_*.py` and puts `core/` on `PYTHONPATH` for
 those tests (CSL-795). The commands above run this package on its own.
 

@@ -38,6 +38,9 @@ PINNED = {
     "sha256": "b" * 64,
     "claim": "Recursion product contract, candidate.",
 }
+# The committed contract/PRODUCT.pin.json names exactly these csl-research bytes.
+COMMITTED_COMMIT = "d84cdd26a4de2366f3c5d34c4aec5215f822a494"
+COMMITTED_SHA256 = "e1d5fb8c02594b2ca88281113ffc14e6f3125daded2a00d45739cfb9d2ed04dd"
 # One NUL, one other control character and one lone surrogate: none can be passed to git or printed raw.
 UNSAFE_PATHS = ("contracts/PRO\x00DUCT.md", "contracts/PRO\nDUCT.md", "contracts/PRO\ud800DUCT.md")
 UNSAFE_PATH = "path must not contain control characters or lone surrogates"
@@ -47,6 +50,11 @@ class ShapeTests(unittest.TestCase):
     def test_committed_pin_is_valid(self) -> None:
         pin = json.loads(pin_check.PIN.read_text(encoding="utf-8"))
         self.assertEqual(pin_check.errors(pin), [])
+        self.assertEqual(pin["status"], "pinned")
+        self.assertEqual(pin["repository"], "CSL-Laboratories/csl-research")
+        self.assertEqual(pin["path"], "contracts/PRODUCT.md")
+        self.assertEqual(pin["commit"], COMMITTED_COMMIT)
+        self.assertEqual(pin["sha256"], COMMITTED_SHA256)
 
     def test_awaiting_and_pinned_examples_pass(self) -> None:
         self.assertEqual(pin_check.errors(AWAITING), [])

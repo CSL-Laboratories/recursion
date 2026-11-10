@@ -85,6 +85,8 @@ _CHARGES_INDEX = "CREATE INDEX IF NOT EXISTS charges_by_profile ON charges (prof
 
 def create_ledger(path: str, anchor_public_key: str) -> None:
     """Installer step: create the ledger bound to one anchor. Refuses if it exists."""
+    from .paths import check_store_path
+    path = check_store_path(path)
     parse_public_key(anchor_public_key)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     os.close(fd)
@@ -105,6 +107,8 @@ def create_ledger(path: str, anchor_public_key: str) -> None:
 class Authority:
     def __init__(self, anchor_public_key: str, ledger_path: str, clock: Callable[[], int],
                  csl_key_ids: frozenset = frozenset()) -> None:
+        from .paths import check_store_path
+        ledger_path = check_store_path(ledger_path)
         parse_public_key(anchor_public_key)
         self._anchor_id = key_id(anchor_public_key)
         if self._anchor_id in csl_key_ids:

@@ -5,7 +5,11 @@ subscription login), never on an engine or model name. Only a typed limit event
 trips it; the core's own timeouts and deadlines never do (S3, S4). A tripped
 connection resets only through a successful leased probe: ``begin_probe`` hands out
 one lease per tripped connection, and ``reset_after_probe`` clears the trip only for
-that lease. A lease is one use and expires after ``probe_lease_seconds``.
+that lease. Each trip stores a generation. The lease is bound to the generation it
+saw, and a reset deletes the row only when that generation is still current, so a
+probe that finished before a later trip cannot clear it. That holds for two breakers
+on one store: the generation lives in SQLite, not in one process's lease table. A
+lease is one use and expires after ``probe_lease_seconds``.
 
 A run that ended in a fault is recorded here too, so an effect proposed by that run,
 or by any run on a tripped connection, is refused at the approval gate (4.2, B15).
@@ -33,6 +37,7 @@ import time
 from typing import Callable
 
 from .errors import Refused
+from .paths import check_store_path
 
 __all__ = ["ConnectionBreaker", "TYPED_LIMITS", "create_breaker_store"]
 
@@ -50,16 +55,27 @@ def _check_id(value: object, code: str) -> str:
 
 def create_breaker_store(path: str) -> None:
     """Installer step: create the breaker store. Refuses if it exists."""
+    path = check_store_path(path)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     os.close(fd)
-    db = sqlite3.connect(path, isolation_level=None)
+    try:
+        db = sqlite3.connect(path, isolation_level=None)
+    except sqlite3.OperationalError as exc:
+        if "unable to open" in str(exc).lower():
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            raise Refused("store_path_too_long") from None
+        raise
     try:
         db.execute("PRAGMA journal_mode=WAL")
         db.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
         db.execute("CREATE TABLE runs (run_id TEXT PRIMARY KEY, connection TEXT NOT NULL,"
                    " plugin_id TEXT NOT NULL, provider TEXT NOT NULL, model_version TEXT NOT NULL)")
         db.execute("CREATE TABLE faulted (run_id TEXT PRIMARY KEY)")
-        db.execute("CREATE TABLE tripped (connection TEXT PRIMARY KEY, event_type TEXT NOT NULL)")
+        db.execute("CREATE TABLE tripped (connection TEXT PRIMARY KEY, event_type TEXT NOT NULL,"
+                   " generation INTEGER NOT NULL)")
         db.execute("INSERT INTO meta VALUES ('magic', ?)", (_STORE_MAGIC,))
     finally:
         db.close()
@@ -68,6 +84,7 @@ def create_breaker_store(path: str) -> None:
 class ConnectionBreaker:
     def __init__(self, store_path: str, *, clock: Callable[[], float] = time.monotonic,
                  probe_lease_seconds: float = 300.0) -> None:
+        store_path = check_store_path(store_path)
         if not os.path.isfile(store_path):
             raise Refused("breaker_store_missing")
         self._db = sqlite3.connect(store_path, isolation_level=None, check_same_thread=False,
@@ -82,10 +99,12 @@ class ConnectionBreaker:
         if meta.get("magic") != _STORE_MAGIC:
             self._db.close()
             raise Refused("breaker_store_invalid")
+        self._ensure_generation()
         self._lock = threading.Lock()
         self._clock = clock
         self._lease_seconds = probe_lease_seconds
-        self._leases: dict[str, tuple[str, float]] = {}
+        # lease id, expiry, trip generation the lease is allowed to clear
+        self._leases: dict[str, tuple[str, float, int]] = {}
 
     def bind_run(self, run_id: str, connection: str, plugin_id: str, provider: str,
                  model_version: str) -> None:
@@ -115,7 +134,20 @@ class ConnectionBreaker:
         if event_type not in TYPED_LIMITS:
             raise Refused("untyped_breaker_event")
         with self._lock:
-            self._db.execute("INSERT OR REPLACE INTO tripped VALUES (?, ?)", (connection, event_type))
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._db.execute(
+                    "SELECT generation FROM tripped WHERE connection=?", (connection,)).fetchone()
+                generation = 1 if row is None or row[0] is None else int(row[0]) + 1
+                self._db.execute(
+                    "INSERT INTO tripped (connection, event_type, generation) VALUES (?, ?, ?) "
+                    "ON CONFLICT(connection) DO UPDATE SET event_type = excluded.event_type, "
+                    "generation = excluded.generation",
+                    (connection, event_type, generation))
+                self._db.execute("COMMIT")
+            except BaseException:
+                self._db.execute("ROLLBACK")
+                raise
             self._leases.pop(connection, None)
         return True
 
@@ -128,14 +160,16 @@ class ConnectionBreaker:
         """Lease the one probe allowed on a tripped connection. Returns the lease id."""
         connection = _check_id(connection, "invalid_connection")
         with self._lock:
-            if not self._is_tripped(connection):
+            row = self._db.execute(
+                "SELECT generation FROM tripped WHERE connection=?", (connection,)).fetchone()
+            if row is None or row[0] is None:
                 raise Refused("connection_not_tripped")
             now = self._clock()
             held = self._leases.get(connection)
             if held is not None and held[1] > now:
                 raise Refused("probe_lease_held")
             lease = secrets.token_hex(16)
-            self._leases[connection] = (lease, now + self._lease_seconds)
+            self._leases[connection] = (lease, now + self._lease_seconds, int(row[0]))
             return lease
 
     def reset_after_probe(self, connection: str, lease: object, probe_ok: bool) -> bool:
@@ -148,8 +182,22 @@ class ConnectionBreaker:
             del self._leases[connection]
             if held[1] <= self._clock() or probe_ok is not True:
                 return False
-            self._db.execute("DELETE FROM tripped WHERE connection=?", (connection,))
-            return True
+            # A trip that landed after this lease was issued has a newer generation.
+            cursor = self._db.execute(
+                "DELETE FROM tripped WHERE connection=? AND generation=?", (connection, held[2]))
+            return cursor.rowcount == 1
+
+    def _ensure_generation(self) -> None:
+        """Stores created before the trip generation column gain it, starting at 1."""
+        columns = [row[1] for row in self._db.execute("PRAGMA table_info(tripped)")]
+        if "generation" in columns:
+            return
+        try:
+            self._db.execute(
+                "ALTER TABLE tripped ADD COLUMN generation INTEGER NOT NULL DEFAULT 1")
+        except sqlite3.DatabaseError:
+            self._db.close()
+            raise Refused("breaker_store_invalid") from None
 
     def _is_tripped(self, connection: str) -> bool:
         return self._db.execute("SELECT 1 FROM tripped WHERE connection=?", (connection,)).fetchone() is not None

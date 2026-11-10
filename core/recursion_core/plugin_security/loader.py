@@ -70,6 +70,7 @@ class LoadedPlugin:
     module: types.ModuleType
     findings: tuple
     developer_key_id: str | None = None
+    manifest_raw: bytes = b""
 
 
 def _finding(stage: str, code: str, severity: str, detail: str = "") -> dict:
@@ -187,13 +188,17 @@ class PluginLoader:
         with self._lock:
             self._health.require_healthy()
             findings: list[dict] = []
+            active: LoadedPlugin | None = None
             try:
                 manifest, trust, kid, label, perms = self._verify_admit(
                     manifest_bytes, signature, artifact, registry_label, findings)
-                if manifest.plugin_id in self._active:
+                active = self._active.get(manifest.plugin_id)
+                if active is not None and active.manifest_raw == manifest.raw and (
+                        active.artifact_sha256 == manifest.artifact_sha256):
                     raise Refused("plugin_already_active", manifest.plugin_id)
-                code = compile(artifact, "<plugin %s>" % manifest.plugin_id, "exec", dont_inherit=True)
-                findings.append(_finding("stage", "compiled", "info"))
+                if active is None:
+                    code = compile(artifact, "<plugin %s>" % manifest.plugin_id, "exec", dont_inherit=True)
+                    findings.append(_finding("stage", "compiled", "info"))
             except (Refused, SyntaxError, ValueError) as exc:
                 # No plugin code ran, but the rule is a GIL read after every load attempt.
                 if self._gil_gate("refused_load", findings):
@@ -202,6 +207,27 @@ class PluginLoader:
                 if isinstance(exc, Refused):
                     raise
                 raise Refused("plugin_compile_failed", type(exc).__name__) from None
+            if active is not None:
+                # The running module is the old artifact. A changed manifest is classified
+                # again and replaces the recorded trust. A changed artifact is not executed;
+                # the recorded trust is dropped because it no longer describes the bytes running.
+                if self._gil_gate(manifest.plugin_id, findings):
+                    raise Refused("core_poisoned_gil_enabled", manifest.plugin_id)
+                if manifest.artifact_sha256 != active.artifact_sha256:
+                    cleared = replace(
+                        active, trust="unsigned", signer_key_id=None, permissions=(),
+                        findings=tuple(findings) + (_finding("verify", "plugin_artifact_changed", "refuse"),),
+                        manifest_raw=manifest.raw)
+                    self._active[manifest.plugin_id] = cleared
+                    self.last_findings = cleared.findings
+                    raise Refused("plugin_artifact_changed", manifest.plugin_id)
+                updated = replace(
+                    active, trust=trust, signer_key_id=kid, registry_label=label, permissions=perms,
+                    findings=tuple(findings), developer_key_id=key_id(manifest.developer_key),
+                    manifest_raw=manifest.raw)
+                self._active[manifest.plugin_id] = updated
+                self.last_findings = updated.findings
+                return updated
             return self._activate(manifest, trust, kid, label, perms, code, findings)
 
     def _gil_gate(self, name: str, findings: list) -> bool:
@@ -237,7 +263,8 @@ class PluginLoader:
             raise Refused("plugin_import_failed", type(failure).__name__) from None
         findings.append(_finding("active", "active", "info", "in_process_not_contained"))
         loaded = LoadedPlugin(manifest.plugin_id, manifest.artifact_sha256, trust, kid, label,
-                              perms, module, tuple(findings), key_id(manifest.developer_key))
+                              perms, module, tuple(findings), key_id(manifest.developer_key),
+                              manifest.raw)
         self._active[manifest.plugin_id] = loaded
         self.last_findings = loaded.findings
         return loaded

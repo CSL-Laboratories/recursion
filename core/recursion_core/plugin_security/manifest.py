@@ -114,6 +114,8 @@ def parse_manifest(raw: bytes) -> Manifest:
         raise Refused("manifest_credential_mismatch")
     scripts = _str_list(data["install_scripts"], re.compile(r"[ -~]{1,200}"), "manifest_install_scripts",
                         ordered=False)
+    if any(_script_escapes(script) for script in scripts):
+        raise Refused("manifest_install_scripts")
     return Manifest(data["plugin_id"], data["version"], data["artifact_sha256"], lock, scripts,
                     data["developer_key"], tuple(perms), nets, creds, raw)
 
@@ -121,8 +123,18 @@ def parse_manifest(raw: bytes) -> Manifest:
 _REVOCATION_MAGIC = "csl-revocation-store/v0"
 
 
+def _script_escapes(value: str) -> bool:
+    """An install-script name that is absolute or walks out with ``..``."""
+    if os.path.isabs(value) or "\\" in value:
+        return True
+    parts = value.split("/")
+    return not parts or any(part in ("", ".", "..") for part in parts)
+
+
 def create_revocation_store(path: str) -> None:
     """Installer step: create the durable revoked-key store. Refuses if it exists."""
+    from .paths import check_store_path
+    path = check_store_path(path)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     os.close(fd)
     db = sqlite3.connect(path, isolation_level=None)
@@ -184,6 +196,8 @@ class TrustStore:
 
     @staticmethod
     def _open_store(path: str) -> sqlite3.Connection:
+        from .paths import check_store_path
+        path = check_store_path(path)
         if not os.path.isfile(path):
             raise Refused("revocation_store_missing")
         db = sqlite3.connect(path, isolation_level=None, check_same_thread=False, timeout=30)
@@ -234,18 +248,33 @@ class TrustStore:
             if self._db is None:
                 raise Refused("revocation_not_durable", kid)
             try:
+                # The stored generation only moves forward. A store opened before a
+                # later revoke still holds the old number in memory; writing that
+                # number would roll the row backward. The conflict path adds one to
+                # whatever is stored, and this opener adopts the higher result.
+                self._db.execute("BEGIN IMMEDIATE")
                 self._db.execute(
                     "INSERT INTO revoked (key_id, generation) VALUES (?, ?) "
-                    "ON CONFLICT(key_id) DO UPDATE SET generation = excluded.generation",
+                    "ON CONFLICT(key_id) DO UPDATE SET generation = revoked.generation + 1",
                     (kid, generation),
                 )
                 row = self._db.execute(
                     "SELECT generation FROM revoked WHERE key_id = ?", (kid,)).fetchone()
+                self._db.execute("COMMIT")
             except sqlite3.Error:
+                try:
+                    self._db.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
                 raise Refused("revocation_not_durable", kid) from None
-            if row is None or row[0] != generation:
+            if row is None or type(row[0]) is not int or row[0] < generation:
                 raise Refused("revocation_not_durable", kid)
-            return generation
+            if row[0] != generation:
+                updated = dict(self._generation)
+                updated[kid] = row[0]
+                self._generation = MappingProxyType(updated)
+                self._revoked = frozenset(updated)
+            return row[0]
 
     def close(self) -> None:
         db = self._db

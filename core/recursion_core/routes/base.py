@@ -39,23 +39,28 @@ class RouteAdapter:
         try:
             argv, env = self.argv(request), self.env(request)
         except c.RouteError as err:
+            self._run_label = None
             return c.result(rid, err.code, detail=err.detail)
         try:
             process = self._launcher(argv, env=env, shell=False)
         except OSError as err:
+            self._run_label = None
             return c.result(rid, c.ENGINE_ERROR, detail=f"launch failed: {type(err).__name__}")
         events: list[dict] = []
         try:
             out = self.drive(process, request, deadline_at, events)
         except Deadline:
+            self._run_label = None
             process.fence("deadline")  # fenced for this request only; the breaker never hears of it
             return c.result(rid, c.DEADLINE_EXCEEDED, events=events, detail="recursion deadline")
         except _Protocol as err:
+            self._run_label = None
             process.fence("protocol_error")
             return c.result(rid, c.PROTOCOL_ERROR, events=events, detail=str(err))
         except OSError as err:
             # A child that exits before the request is written raises BrokenPipeError. That stays a
             # typed result, and the process is fenced, instead of escaping the route boundary.
+            self._run_label = None
             process.fence("io_error")
             return c.result(rid, c.ENGINE_ERROR, events=events, detail=f"engine io: {type(err).__name__}")
         return self._apply_run_label(out)

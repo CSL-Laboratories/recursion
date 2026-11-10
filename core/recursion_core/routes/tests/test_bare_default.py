@@ -17,7 +17,7 @@ from pathlib import Path
 
 from recursion_core.routes import bare_default as bd
 from recursion_core.routes import contract as c
-from recursion_core.routes.tests.fakes import claude_limit, claude_ok, request
+from recursion_core.routes.tests.fakes import MEASURED_HELP_TEXT, claude_limit, claude_ok, request
 from recursion_core.routes.tests.test_driver_and_limits import Harness
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "claude-2.1.312-help-excerpt.txt"
@@ -63,7 +63,7 @@ class ClassifyHelpTest(unittest.TestCase):
                 metadata = bd.auth_mode(text)
                 self.assertEqual(metadata, {"bare_default": "unknown", "bare_opt_out": None})
                 h = Harness([])
-                self.assertEqual(h.handle(request(**metadata))["code"], c.LAUNCH_REFUSED)
+                self.assertEqual(h.handle(request(measured=False, **metadata))["code"], c.LAUNCH_REFUSED)
                 self.assertEqual(h.launcher.calls, [])
 
     def test_matching_measured_hash_runs_subscription_as_beta(self) -> None:
@@ -235,28 +235,48 @@ class ReadHelpTest(unittest.TestCase):
 
 
 class SubscriptionRouteBareDefaultTest(unittest.TestCase):
-    def test_absent_launches_without_bare(self) -> None:
+    def test_absent_without_measured_help_does_not_launch(self) -> None:
+        # bare_default absent used to return [] and spawn with no hash check and no beta label.
         h = Harness([claude_ok()])
-        self.assertEqual(h.handle(request(bare_default="absent"))["status"], "ok")
+        res = h.handle(request(bare_default="absent", measured=False))
+        self.assertEqual(res["code"], c.LAUNCH_REFUSED)
+        self.assertIn("unknown is not safe", res["detail"])
+        self.assertNotEqual(res["detail"], "beta")
+        self.assertEqual(h.launcher.calls, [])
+        self.assertEqual(res["breaker_effect"], "none")
+
+    def test_absent_with_measured_help_runs_as_beta(self) -> None:
+        h = Harness([claude_ok()])
+        res = h.handle(request(claude_build="2.1.321", help_text=MEASURED_HELP_TEXT, bare_default="absent"))
+        self.assertEqual((res["status"], res["detail"]), ("ok", "beta"))
         self.assertNotIn("--bare", h.launcher.calls[0]["argv"])
+        self.assertNotIn("--no-bare", h.launcher.calls[0]["argv"])
 
     def test_present_unknown_and_unreported_are_refused_before_launch(self) -> None:
         for state in ("present", "unknown", None):
             with self.subTest(state=state):
                 h = Harness([])
-                res = h.handle(request(bare_default=state))
+                res = h.handle(request(bare_default=state, measured=False))
                 self.assertEqual(res["code"], c.LAUNCH_REFUSED)
-                self.assertIn("--bare", res["detail"])
+                self.assertIn("unknown is not safe", res["detail"])
+                self.assertNotEqual(res["detail"], "beta")
                 self.assertEqual(h.launcher.calls, [])
                 self.assertEqual(res["breaker_effect"], "none")  # a refusal never trips the login
 
-    def test_documented_opt_out_is_passed_explicitly(self):
+    def test_documented_opt_out_does_not_launch_without_the_measured_hash(self):
         text = help_with_bare("Minimal mode.", extra="  --no-bare       Disable bare mode\n")
         metadata = bd.auth_mode(text)
         self.assertEqual(metadata, {"bare_default": "present", "bare_opt_out": "--no-bare"})
         h = Harness([claude_ok()])
-        self.assertEqual(h.handle(request(**metadata))["status"], "ok")
-        self.assertEqual(h.launcher.calls[0]["argv"][:3], ["claude", "--no-bare", "-p"])
+        res = h.handle(request(measured=False, **metadata))
+        self.assertEqual(res["code"], c.LAUNCH_REFUSED)
+        self.assertEqual(h.launcher.calls, [])
+        # The synthetic help is not the measured fixture, so --no-bare is not passed.
+        res = h.handle(request(claude_build="2.1.321", help_text=text, **metadata))
+        self.assertEqual(res["code"], c.LAUNCH_REFUSED)
+        self.assertIn("needs re-measuring", res["detail"])
+        self.assertNotEqual(res["detail"], "beta")
+        self.assertEqual(h.launcher.calls, [])
 
     def test_unreadable_or_unparseable_help_refuses_the_route(self) -> None:
         def unreadable(argv, **kwargs):
@@ -269,7 +289,7 @@ class SubscriptionRouteBareDefaultTest(unittest.TestCase):
                 metadata = bd.probe_auth_mode("claude", {"PATH": "/usr/bin"}, run)
                 self.assertEqual(metadata, {"bare_default": "unknown", "bare_opt_out": None})
                 h = Harness([])
-                self.assertEqual(h.handle(request(**metadata))["code"], c.LAUNCH_REFUSED)
+                self.assertEqual(h.handle(request(measured=False, **metadata))["code"], c.LAUNCH_REFUSED)
                 self.assertEqual(h.launcher.calls, [])
 
     def test_cli_reports_classification_route_and_help_lines(self) -> None:
@@ -296,18 +316,31 @@ class SubscriptionRouteBareDefaultTest(unittest.TestCase):
 
     def test_unknown_still_refuses_even_with_opt_out(self):
         h = Harness([])
-        self.assertEqual(h.handle(request(bare_default="unknown", bare_opt_out="--no-bare"))["code"],
-                         c.LAUNCH_REFUSED)
+        self.assertEqual(h.handle(request(bare_default="unknown", bare_opt_out="--no-bare",
+                                         measured=False))["code"], c.LAUNCH_REFUSED)
         self.assertEqual(h.launcher.calls, [])
 
-    def test_fallback_passes_documented_auth_mode(self):
+    def test_fallback_without_measured_help_does_not_launch(self):
         h = Harness([claude_limit(), claude_ok()])
         order = [{"engine": "claude_code", "model": "m-b", "connection": {"kind": "subscription", "id": "login-B"},
                   "api_key_helper": "absent", "bare_default": "present", "bare_opt_out": "--no-bare"}]
         res = h.handle(request(limits={"on_limit": "fallback", "fallback": order}))
-        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["code"], c.LAUNCH_REFUSED)
+        self.assertIn("unknown is not safe", res["detail"])
+        self.assertNotEqual(res["detail"], "beta")
+        self.assertEqual(len(h.launcher.calls), 1)
+        self.assertNotIn("--no-bare", h.launcher.calls[0]["argv"])
+
+    def test_fallback_with_measured_help_is_beta(self):
+        h = Harness([claude_limit(), claude_ok()])
+        order = [{"engine": "claude_code", "model": "m-b", "connection": {"kind": "subscription", "id": "login-B"},
+                  "api_key_helper": "absent", "bare_default": "absent",
+                  "claude_build": "2.1.321", "help_text": MEASURED_HELP_TEXT}]
+        res = h.handle(request(limits={"on_limit": "fallback", "fallback": order}))
+        self.assertEqual((res["status"], res["detail"]), ("ok", "beta"))
         self.assertEqual(len(h.launcher.calls), 2)
-        self.assertIn("--no-bare", h.launcher.calls[1]["argv"])
+        self.assertNotIn("--bare", h.launcher.calls[1]["argv"])
+        self.assertNotIn("--no-bare", h.launcher.calls[1]["argv"])
 
     def test_invalid_value_is_request_invalid(self) -> None:
         h = Harness([])
@@ -326,12 +359,23 @@ class SubscriptionRouteBareDefaultTest(unittest.TestCase):
     def test_fallback_entry_carries_the_same_check(self) -> None:
         h = Harness([claude_limit()])
         order = [{"engine": "claude_code", "model": "m-b", "connection": {"kind": "subscription", "id": "login-B"},
-                  "api_key_helper": "absent", "bare_default": "present"}]
-        # Validation accepts the key; the refusal happens when that route would launch.
+                  "api_key_helper": "absent", "bare_default": "absent"}]
+        # The primary matches the measured help and hits a limit. The fallback has no help, so it refuses.
         res = h.handle(request(bare_default="absent", limits={"on_limit": "fallback", "fallback": order}))
         self.assertEqual(res["code"], c.LAUNCH_REFUSED)
+        self.assertIn("unknown is not safe", res["detail"])
+        self.assertNotEqual(res["detail"], "beta")
         self.assertEqual(len(h.launcher.calls), 1)
         self.assertEqual(res["limit_notice"]["attempts"][-1]["connection"], "subscription:login-B")
+
+    def test_a_later_refusal_does_not_keep_the_beta_label(self) -> None:
+        h = Harness([claude_ok(), claude_ok()])
+        ok = h.handle(request(claude_build="2.1.321", help_text=MEASURED_HELP_TEXT, bare_default="absent"))
+        self.assertEqual(ok["detail"], "beta")
+        refused = h.handle(request(rid="r2", measured=False))
+        self.assertEqual(refused["code"], c.LAUNCH_REFUSED)
+        self.assertNotEqual(refused["detail"], "beta")
+        self.assertEqual(len(h.launcher.calls), 1)
 
 
 if __name__ == "__main__":

@@ -18,8 +18,8 @@ from recursion_core.routes.breaker import ConnectionBreaker
 from recursion_core.routes.claude_code import ClaudeCodeAdapter, SUBSCRIPTION_DROP_ENV
 from recursion_core.routes.codex import CodexAdapter
 from recursion_core.routes.service import RouteService
-from recursion_core.routes.tests.fakes import (HANG, FakeClock, FakeLauncher, claude_error, claude_limit, claude_ok,
-                                               codex_script, request)
+from recursion_core.routes.tests.fakes import (HANG, FakeClock, FakeLauncher, claude_error, claude_fallback,
+                                               claude_limit, claude_ok, codex_script, request)
 
 PKG = Path(__file__).resolve().parents[1]
 PARENT = {
@@ -396,10 +396,7 @@ class LimitsTest(unittest.TestCase):
 
     def test_fallback_follows_the_users_order_visibly(self) -> None:
         h = Harness(limited_then(claude_limit(), claude_ok("from C")))
-        order = [{"engine": "claude_code", "model": "m-b", "connection": {"kind": "subscription", "id": "login-B"},
-                  "api_key_helper": "absent", "bare_default": "absent"},
-                 {"engine": "claude_code", "model": "m-c", "connection": {"kind": "subscription", "id": "login-C"},
-                  "api_key_helper": "absent", "bare_default": "absent"}]
+        order = [claude_fallback("m-b", "login-B"), claude_fallback("m-c", "login-C")]
         res = h.handle(request(limits={"on_limit": "fallback", "fallback": order}))
         self.assertEqual((res["status"], res["text"]), ("ok", "from C"))
         notice = res["limit_notice"]
@@ -424,8 +421,7 @@ class LimitsTest(unittest.TestCase):
             return [HANG]
 
         h = Harness(scripts)
-        order = [{"engine": "claude_code", "model": "m-b", "connection": {"kind": "subscription", "id": "login-B"},
-                  "api_key_helper": "absent"}]
+        order = [claude_fallback("m-b", "login-B")]
         res = h.handle(request(deadline_s=100, limits={"on_limit": "fallback", "fallback": order}))
         self.assertEqual(res["text"], "")  # the hang becomes deadline_exceeded on the fallback
         self.assertEqual(res["code"], c.DEADLINE_EXCEEDED)
@@ -473,8 +469,7 @@ class LimitsTest(unittest.TestCase):
 
     def test_fallback_all_limited_returns_the_first_limit_with_notice(self) -> None:
         h = Harness(limited_then(claude_limit()))
-        order = [{"engine": "claude_code", "model": "m-b", "connection": {"kind": "subscription", "id": "login-B"},
-                  "api_key_helper": "absent", "bare_default": "absent"}]
+        order = [claude_fallback("m-b", "login-B")]
         res = h.handle(request(limits={"on_limit": "fallback", "fallback": order}))
         self.assertEqual(res["code"], c.PLAN_LIMIT)
         self.assertIsNone(res["limit_notice"]["switched_to"])

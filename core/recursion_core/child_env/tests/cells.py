@@ -579,9 +579,9 @@ def cells(s: Scratch) -> list[Cell]:
     # CSL-839, owner call 2026-11-10: an all-address CIDR block is a "*". While a proxy is set it refuses with
     # no_proxy_wildcard on any route: no base URL (either engine), a gateway, a loopback gateway. All-address is
     # an IPv4 block of prefix 0, or an IPv6 block that holds all of ::ffff:0:0/96 (every IPv4-mapped address);
-    # the other two IPv4-mapping blocks, unions and malformed "/" entries follow below.
+    # the other two IPv4-mapping blocks, unions and unparseable entries follow below.
     all_address = [
-        ("v4", "0.0.0.0/0"), ("v4_host_bits", "10.0.0.0/0"), ("v4_netmask", "0.0.0.0/0.0.0.0"), ("v4_scheme", "http://0.0.0.0/0"),
+        ("v4", "0.0.0.0/0"), ("v4_host_bits", "10.0.0.0/0"), ("v4_scheme", "http://0.0.0.0/0"),
         ("v4_port", "0.0.0.0:80/0"), ("v6", "::/0"), ("v6_bracket", "[::]/0"), ("v6_long", "0:0:0:0:0:0:0:0/0"),
         ("v6_host_bits", "2001:db8::1/0"), ("v6_scheme", "https://[::]/0"), ("mapped", "::ffff:0:0/96"),
         ("mapped_dotted", "::ffff:0.0.0.0/96"), ("mapped_upper", "[::FFFF:0:0]/96"), ("mapped_host_bits", "::ffff:10.1.2.3/96"),
@@ -655,8 +655,9 @@ def cells(s: Scratch) -> list[Cell]:
             add("no_proxy_mapping", f"npm_{name}_{route_name}", {"HTTPS_PROXY": PROXY, "NO_PROXY": entry},
                 R("no_proxy_wildcard"), engine=engine, auth=api, route=route)
 
-    # (2a): the union of one variable's blocks counts as one block. Halves, quarters, any order, any separator,
-    # duplicates and overlaps; a bare address joins as its single-address block. Each variable is judged alone.
+    # (2a): the union of the blocks counts as one block. Halves, quarters, any order, any separator, duplicates
+    # and overlaps; a bare address joins as its single-address block. NO_PROXY and no_proxy are one combined
+    # list (the no_proxy_combined cells below).
     last_v4, last_mapped = "255.255.255.255", "::ffff:ffff:ffff"
     but_last_v4 = ",".join(map(str, policy._ALL_IPV4.address_exclude(ipaddress.ip_network(last_v4))))
     but_last_mapped = ",".join(map(str, policy._IPV4_MAPPING_BLOCKS[0].address_exclude(ipaddress.ip_network(last_mapped))))
@@ -680,37 +681,106 @@ def cells(s: Scratch) -> list[Cell]:
         R("no_proxy_wildcard"), auth=api, route=keyed(v4_url))
     add("no_proxy_union", "npu_engine_host_first", {"HTTPS_PROXY": PROXY, "NO_PROXY": "0.0.0.0/1,api.anthropic.com,128.0.0.0/1"},
         R("no_proxy_engine_host"), auth=api, route=no_base)
-    # No cover: a gap, the bare address left out, halves of two different blocks or of the two families, and
-    # halves split across NO_PROXY and no_proxy (neither value covers on its own).
+    # No cover: a gap or the bare address left out.
     union_gaps = [
         ("v4_gap", {"NO_PROXY": "0.0.0.0/1,192.0.0.0/2"}), ("v4_no_bare_address", {"NO_PROXY": but_last_v4}),
         ("mapped_no_bare_address", {"NO_PROXY": but_last_mapped}), ("mapped_gap", {"NO_PROXY": "::ffff:0:0/97,::ffff:c000:0/98"}),
-        ("two_blocks", {"NO_PROXY": "::ffff:0:0/97,64:ff9b::8000:0/97"}), ("two_families", {"NO_PROXY": "0.0.0.0/1,::ffff:8000:0/97"}),
-        ("v4_two_names", {"NO_PROXY": "0.0.0.0/1", "no_proxy": "128.0.0.0/1"}),
-        ("mapped_two_names", {"NO_PROXY": "::ffff:0:0/97", "no_proxy": "::ffff:8000:0/97"}),
-        ("nat64_two_names", {"NO_PROXY": "64:ff9b::/97", "no_proxy": "64:ff9b::8000:0/97"}),
-        ("compatible_two_names", {"NO_PROXY": "::/97", "no_proxy": "::8000:0/97"}),
+        ("v4_gap_two_names", {"NO_PROXY": "0.0.0.0/1", "no_proxy": "192.0.0.0/2"}),
+        ("mapped_gap_two_names", {"NO_PROXY": "::ffff:0:0/97", "no_proxy": "::ffff:c000:0/98"}),
     ]
     for name, lists in union_gaps:
         for route_name, engine in (("none", cc), ("none_codex", "codex")):
             add("no_proxy_union_ok", f"npu_ok_{name}_{route_name}", {"HTTPS_PROXY": PROXY, **lists},
                 L(both(_same(**lists), _absent(url))), engine=engine, auth=api, route=no_base)
 
-    # (2b): an entry with a "/" that is no CIDR block is a "*" too (fail closed): a matcher may read it as one.
-    # That takes in a name with a path or a trailing slash.
+    # Owner call, 2026-11-10 (2a): NO_PROXY and no_proxy are one combined list, NO_PROXY's entries first. A cover
+    # split across the two names refuses as one in a single name does, on any route, in either order.
+    v4_quarters = ("0.0.0.0/2,128.0.0.0/2", "64.0.0.0/2,192.0.0.0/2")
+    split = [
+        ("v4_halves", "0.0.0.0/1", "128.0.0.0/1"), ("v4_halves_swapped", "128.0.0.0/1", "0.0.0.0/1"),
+        ("v4_quarters", *v4_quarters), ("v4_quarters_swapped", *reversed(v4_quarters)),
+        ("v4_in_lists", f"{corp},0.0.0.0/1", "localhost 128.0.0.0/1"), ("v4_bare_address", but_last_v4, last_v4),
+        ("mapped_halves", "::ffff:0:0/97", "::ffff:8000:0/97"), ("mapped_halves_swapped", "::ffff:8000:0/97", "::ffff:0:0/97"),
+        ("mapped_spellings", "::ffff:0.0.0.0/97", "[::FFFF:128.0.0.0]/97"),
+        ("nat64_halves", "64:ff9b::/97", "64:ff9b::8000:0/97"), ("compatible_halves", "::/97", "::8000:0/97"),
+    ]
+    for name, upper, lower in split:
+        for route_name, engine, route in all_routes:
+            add("no_proxy_combined", f"npc_{name}_{route_name}", {"HTTPS_PROXY": PROXY, "NO_PROXY": upper, "no_proxy": lower},
+                R("no_proxy_wildcard"), engine=engine, auth=api, route=route)
+    # Which cause wins is decided in combined order: an engine-host, "*" or unparseable entry before the entry
+    # that completes the cover keeps its own cause, and the cover wins over one after it.
+    combined_first = [
+        ("engine_host_first", cc, {"NO_PROXY": "0.0.0.0/1,api.anthropic.com", "no_proxy": "128.0.0.0/1"}, "no_proxy_engine_host"),
+        ("engine_host_first_codex", "codex", {"NO_PROXY": "0.0.0.0/1 .openai.com", "no_proxy": "128.0.0.0/1"}, "no_proxy_engine_host"),
+        ("engine_host_after", cc, {"NO_PROXY": "0.0.0.0/1", "no_proxy": "128.0.0.0/1,api.anthropic.com"}, "no_proxy_wildcard"),
+        ("star_first", cc, {"NO_PROXY": "0.0.0.0/1,*", "no_proxy": "128.0.0.0/1"}, "no_proxy_wildcard"),
+        ("star_before_unparseable", cc, {"NO_PROXY": "*", "no_proxy": "10.0.0.0/33"}, "no_proxy_wildcard"),
+        ("unparseable_before_star", cc, {"NO_PROXY": "10.0.0.0/33", "no_proxy": "*"}, "no_proxy_unparseable"),
+        ("unparseable_first", cc, {"NO_PROXY": "0.0.0.0/1,example.com/", "no_proxy": "128.0.0.0/1"}, "no_proxy_unparseable"),
+        ("unparseable_after", "codex", {"NO_PROXY": "0.0.0.0/1", "no_proxy": "128.0.0.0/1,example.com/"}, "no_proxy_wildcard"),
+    ]
+    for name, engine, lists, cause in combined_first:
+        add("no_proxy_combined", f"npc_{name}", {"HTTPS_PROXY": PROXY, **lists}, R(cause), engine=engine, auth=api, route=no_base)
+    add("no_proxy_combined", "npc_route_host_too", {"HTTPS_PROXY": PROXY, "NO_PROXY": "0.0.0.0/1", "no_proxy": "128.0.0.0/1"},
+        R("no_proxy_wildcard"), auth=api, route=keyed(v4_url))
+    add("no_proxy_combined", "npc_all_proxy_only", {"ALL_PROXY": socks, "NO_PROXY": "128.0.0.0/1", "no_proxy": "0.0.0.0/1"},
+        R("no_proxy_wildcard"), auth=api, route=no_base)
+    for route_name, engine in (("none", cc), ("none_codex", "codex")):  # no proxy set: nothing to bypass
+        lists = {"NO_PROXY": "0.0.0.0/1", "no_proxy": "128.0.0.0/1"}
+        add("no_proxy_combined_ok", f"npc_ok_noproxy_{route_name}", lists, L(both(_same(**lists), _absent(url))), engine=engine,
+            auth=api, route=no_base)
+
+    # Still open, for after Nov 11 (owner call, 2026-11-10; not closed here): the union never mixes the two
+    # families, never joins halves of two different mapping blocks, and knows no IPv4-embedding prefix but the
+    # three in _IPV4_MAPPING_BLOCKS. Each of these launches with no base URL.
+    still_open = [
+        ("two_families", {"NO_PROXY": "0.0.0.0/1,::ffff:8000:0/97"}),
+        ("two_families_two_names", {"NO_PROXY": "0.0.0.0/1", "no_proxy": "::ffff:8000:0/97"}),
+        ("two_blocks", {"NO_PROXY": "::ffff:0:0/97,64:ff9b::8000:0/97"}),
+        ("two_blocks_two_names", {"NO_PROXY": "::ffff:0:0/97", "no_proxy": "64:ff9b::8000:0/97"}),
+        ("nat64_local_use", {"NO_PROXY": "64:ff9b:1::/48"}), ("nat64_next_96", {"NO_PROXY": "64:ff9a::/96"}),
+        ("six_to_four", {"NO_PROXY": "2002::/16"}), ("nat64_site", {"NO_PROXY": "2001:db8:64::/96"}),
+    ]
+    for name, lists in still_open:
+        for route_name, engine in (("none", cc), ("none_codex", "codex")):
+            add("no_proxy_open", f"npo_{name}_{route_name}", {"HTTPS_PROXY": PROXY, **lists},
+                L(both(_same(**lists), _absent(url))), engine=engine, auth=api, route=no_base,
+                note="open: mixed families, two mapping blocks and other IPv4-embedding prefixes are post-Nov-11 work")
+
+    # Owner calls, 2026-11-10 (1, 2b, 2c): an unparseable entry refuses with its own cause, no_proxy_unparseable
+    # (fail closed: a matcher may read it some other way). First, an entry with a "/" that is no CIDR block;
+    # that takes in a name with a path or a trailing slash.
     slash = [
         ("zero_slash_zero", "0/0"), ("v4_prefix_33", "10.0.0.0/33"), ("v6_prefix_129", "::/129"), ("name_prefix", "abc/8"),
         ("no_prefix", "10.0.0.0/"), ("no_address", "/8"), ("minus_prefix", "0.0.0.0/-0"), ("two_slashes", "0.0.0.0/0/0"),
         ("name_slash", "example.com/"), ("url_slash", "http://example.com/"), ("dot_name_path", ".corp/path"),
+        ("engine_name_slash", "api.anthropic.com/"), ("localhost_slash", "localhost/"),
         ("in_a_list", "localhost,127.0.0.1 10.0.0.0/33,.corp.example"),
+    ]
+    # (2b): what follows the last "/" must be a plain decimal prefix length. A netmask or hostmask, a leading
+    # zero, a sign, hex and a non-ASCII digit are not one.
+    suffix = [
+        ("netmask_all", "0.0.0.0/0.0.0.0"), ("hostmask_all", "0.0.0.0/255.255.255.255"), ("netmask", "10.0.0.0/255.0.0.0"),
+        ("hostmask", "10.0.0.0/0.255.255.255"), ("leading_zero", "10.0.0.0/08"), ("double_zero", "0.0.0.0/00"),
+        ("plus", "10.0.0.0/+8"), ("hex", "::/0x0"), ("arabic_indic_digit", "10.0.0.0/٨"),
+    ]
+    # (2c): any entry with a "%": an IPv6 zone id, with or without a prefix, a percent escape, a name.
+    percent = [
+        ("zone_block", "fe80::1%eth0/64"), ("zone_address", "fe80::1%eth0"), ("zone_escaped", "[fe80::1%25eth0]"),
+        ("alone", "%"), ("name_escape", "host%2f"), ("in_a_list", "localhost,fe80::1%eth0 .corp.example"),
     ]
     slash_routes = [("none", cc, no_base), ("none_codex", "codex", no_base), ("gateway", cc, keyed(base_url)),
                     ("localhost", cc, keyed("http://localhost:4000"))]
-    for name, entry in slash:
-        for route_name, engine, route in slash_routes:
-            add("no_proxy_slash", f"nps_{name}_{route_name}", {"HTTPS_PROXY": PROXY, "NO_PROXY": entry},
-                R("no_proxy_wildcard"), engine=engine, auth=api, route=route)
-    for name, entry in (("zero_slash_zero", "0/0"), ("name_slash", "example.com/")):  # no proxy set: nothing to bypass
+    for group, short, entries in (("no_proxy_slash", "nps", slash), ("no_proxy_suffix", "npx", suffix),
+                                  ("no_proxy_percent", "npp", percent)):
+        for name, entry in entries:
+            for route_name, engine, route in slash_routes:
+                add(group, f"{short}_{name}_{route_name}", {"HTTPS_PROXY": PROXY, "NO_PROXY": entry},
+                    R("no_proxy_unparseable"), engine=engine, auth=api, route=route)
+    # no proxy set: nothing to bypass
+    for name, entry in (("zero_slash_zero", "0/0"), ("name_slash", "example.com/"), ("netmask", "10.0.0.0/255.0.0.0"),
+                        ("zone", "fe80::1%eth0")):
         for route_name, engine in (("none", cc), ("none_codex", "codex")):
             add("no_proxy_slash_ok", f"nps_ok_noproxy_{name}_{route_name}", {"NO_PROXY": entry},
                 L(both(_same(NO_PROXY=entry), _absent(url))), engine=engine, auth=api, route=no_base)

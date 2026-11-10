@@ -274,8 +274,8 @@ skip. Pinned-route tests (`tests/test_pins.py`) build fake installs (an npm-shap
 venv-shaped Hermes, a Cursor version directory, an `agy` binary with and without a
 launcher), measure them in place and patch the pin table; none of those pins is real.
 No real `claude`, `codex` or other engine, account, provider or network is used.
-`tools/ci_gate.py` does not discover `core/` tests yet (its `TEST_GLOBS` edit is build
-item 1, a protected-path change on its own issue).
+`tools/ci_gate.py` runs these files since CSL-795 (#334) merged: each `core/**/test_*.py`
+is run on its own with `core/` on `PYTHONPATH`.
 
 ## Evidence (links only; the research stays in csl-research)
 

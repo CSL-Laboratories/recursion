@@ -194,6 +194,17 @@ def agy_launcher_install() -> Install:
     return Install("antigravity", launcher, "../lib/antigravity", binary, "1.5.3", ran)
 
 
+def agy_windows_install(ext: str = ".cmd") -> Install:
+    """A Windows script launcher (bin/agy.cmd or agy.ps1) in front of the native binary: both are pinned."""
+    d = F.dir()
+    ran = os.path.join(d, "ran")
+    os.makedirs(os.path.join(d, "lib"))
+    binary = F.make("antigravity.exe", "1.5.3", where=os.path.join(d, "lib"), dump=ran)
+    text = {".cmd": '@echo off\r\n"%~dp0..\\lib\\antigravity.exe" %*\r\n', ".ps1": '& "$PSScriptRoot\\..\\lib\\antigravity.exe" @args\n'}[ext]
+    launcher = write(os.path.join(d, "bin", "agy" + ext), text, 0o755)
+    return Install("antigravity", launcher, "../lib/antigravity.exe", binary, "1.5.3", ran)
+
+
 BUILDERS = {
     "pi": pi_install, "hermes": hermes_install, "cursor": cursor_install,
     "antigravity": agy_install, "antigravity (launcher)": agy_launcher_install,
@@ -1308,18 +1319,21 @@ class CheckOnlyResolutionTests(Base):
                 self.assertEqual([g.realpath, "-p"], launch_plan(g, [argv0, "-p"], {}).exec_argv())
             self.assertFalse(os.path.exists(inst.ran))
 
-    def test_binary_launcher_pin_behind_a_script_launcher_on_windows_fails_closed(self) -> None:
+    def test_binary_launcher_pin_behind_a_script_launcher_on_windows_executes_the_pinned_binary(self) -> None:
         native = agy_install()
         with windows(), table(native.pin()):  # the launcher is the native binary: unchanged
             g = self.g(native)
             self.assertFalse(g.check_only)
             self.assertEqual([g.realpath], launch_plan(g, ["agy"], {}).exec_argv())
         script = agy_launcher_install()
-        with windows(), table(script.pin()):  # a binary+launcher pin can carry no entry
+        with windows(), table(script.pin()):  # check-only by content: the pin's measured binary is the entry
             g = self.g(script)
             self.assertTrue(g.check_only)
-            self.assertEqual((), g.entry)
-            self.refused("pin_entry_unset", launch_plan, g, ["agy"], {})
+            self.assertEqual((os.path.realpath(script.root),), g.entry)
+            self.assertEqual((g.pin_target,), g.entry)
+            out = launch_plan(g, ["agy", "-p"], {}).exec_argv()
+            self.assertEqual([os.path.realpath(script.root), "-p"], out)
+            self.assertNotIn(g.realpath, out)  # never the launcher
         self.assertFalse(os.path.exists(script.ran))
 
     def test_unreadable_file_for_the_content_check_is_binary_missing(self) -> None:
@@ -1378,6 +1392,188 @@ class CheckOnlyResolutionTests(Base):
             os.symlink("pi.ps1", inst.path)
             self.assertEqual(entry_reals(inst), plan.exec_argv())
         self.assertFalse(os.path.exists(inst.ran))
+
+
+@unittest.skipUnless(os.name == "posix", "POSIX fixtures")
+class MeasuredBinaryEntryTests(Base):
+    """Lucas, 2026-11-10 (calls 13/14): "accept a pinned .cmd/.ps1 launcher as a check, but execute the
+    pinned entry directly". Restated for him the same day: a pin with a measured binary or entry behind a
+    script launcher has the launcher checked and that binary or entry executed directly, a binary+launcher
+    pin included; ``pin_entry_unset`` only when no binary or entry has been measured.
+
+    Windows is simulated through ``binary.is_windows()``; no test here runs on real Windows.
+    """
+
+    EXTS = (".cmd", ".ps1")
+
+    def test_binary_launcher_pin_behind_a_cmd_executes_the_pinned_binary_never_the_launcher(self) -> None:
+        for ext in self.EXTS:
+            with self.subTest(ext=ext):
+                inst = agy_windows_install(ext)
+                binary = os.path.realpath(inst.root)
+                with windows(), table(inst.pin()):
+                    self.assertEqual((), inst.pin().entry)  # the pin row carries no entry: its binary is the entry
+                    g = self.g(inst)
+                    self.assertTrue(g.check_only)
+                    self.assertTrue(g.record()["check_only"])
+                    self.assertEqual("binary+launcher", g.pin_kind)
+                    self.assertEqual(binary, g.pin_target)
+                    self.assertEqual((binary,), g.entry)
+                    self.assertEqual(binary_mod.sha256_file(binary)[0], g.pin_sha256)
+                    self.assertEqual(inst.pin().target_sha256, g.pin_sha256)
+                    self.assertTrue(g.realpath.endswith("agy" + ext))
+                    plan = launch_plan(g, ["agy", "-p", "hi"], {"A": "1"})
+                    out = plan.exec_argv()
+                    self.assertEqual(binary, out[0])
+                    self.assertEqual([binary, "-p", "hi"], out)
+                    self.assertNotIn(g.path, out)  # never the launcher
+                    self.assertNotIn(g.realpath, out)
+                    self.assertEqual({"A": "1"}, plan.exec_env())
+                    # argv[0] of the request is still the bare engine name.
+                    self.refused("wrapper_refused", launch_plan, g, ["agy" + ext], {})
+                # The grant decides, not the platform switch at the time of use.
+                with table(inst.pin()):
+                    self.assertEqual([binary, "-p", "hi"], plan.exec_argv())
+                self.assertFalse(os.path.exists(inst.ran))
+
+    def test_binary_changed_after_the_grant_is_binary_changed(self) -> None:
+        inst = agy_windows_install(".cmd")
+        binary = os.path.realpath(inst.root)
+        with windows(), table(inst.pin()):
+            g = self.g(inst)
+            plan = launch_plan(g, ["agy"], {})
+            with open(binary, "rb") as f:
+                original = f.read()
+            st = os.stat(binary)
+
+            def restore() -> None:
+                if os.path.lexists(binary):
+                    os.unlink(binary)
+                with open(binary, "wb") as f:
+                    f.write(original)
+                os.chmod(binary, 0o755)
+                self.assertEqual([binary], plan.exec_argv())
+
+            # A same-size native rewrite with the mtime restored: the full re-hash decides.
+            F.write(binary, "1.5.3", dump=inst.ran)
+            self.assertEqual(st.st_size, os.stat(binary).st_size)
+            os.utime(binary, ns=(st.st_atime_ns, st.st_mtime_ns))
+            r = self.refused("binary_changed", plan.exec_argv)
+            self.assertIn("digest differs from the grant", r.detail)
+            self.refused("binary_changed", plan.exec_env)
+            self.refused("binary_changed", launch_plan, g, ["agy"], {})
+            restore()
+            # No longer native.
+            flip_first_byte(binary)
+            self.refused("binary_changed", plan.exec_argv)
+            restore()
+            # Replaced by a link to another native file.
+            other = F.make("other.exe", "1.5.3", dump=inst.ran)
+            os.unlink(binary)
+            os.symlink(other, binary)
+            r = self.refused("binary_changed", plan.exec_argv)
+            self.assertIn("now resolves elsewhere", r.detail)
+            restore()
+            # Removed, then present without its exec bit.
+            os.unlink(binary)
+            self.refused("binary_changed", plan.exec_argv)
+            restore()
+            os.chmod(binary, 0o644)
+            self.refused("binary_missing", plan.exec_argv)
+            os.chmod(binary, 0o755)
+            self.assertEqual([binary], plan.exec_argv())
+            # The launcher is still re-hashed although it is never executed.
+            flip_first_byte(inst.path)
+            self.refused("binary_changed", plan.exec_argv)
+        self.assertFalse(os.path.exists(inst.ran))
+
+    def test_edited_entry_is_forged(self) -> None:
+        inst = agy_windows_install(".cmd")
+        with windows(), table(inst.pin()):
+            g = self.g(inst)
+            binary = g.pin_target
+            other = F.make("other.exe", "1.5.3", dump=inst.ran)
+            for entry in ((), (g.realpath,), (other,), ("/bin/sh", binary), (binary, binary), (binary, "-c"), binary, [binary]):
+                with self.subTest(entry=entry):
+                    fake = dataclasses.replace(g, entry=entry)
+                    self.refused("grant_forged", launch_plan, fake, ["agy"], {})
+                    self.refused("grant_forged", grant_mod.LaunchPlan(fake, ("agy",), (), 4).exec_argv)
+                    self.refused("grant_forged", grant_mod.LaunchPlan(fake, ("agy",), (), 4).exec_env)
+            self.refused("grant_forged", launch_plan, dataclasses.replace(g, check_only=False), ["agy"], {})
+            self.refused("grant_forged", launch_plan, dataclasses.replace(g, check_only=False, entry=()), ["agy"], {})
+            self.refused("grant_forged", launch_plan, dataclasses.replace(g, pin_target=other), ["agy"], {})
+            # Even re-MACed with the same-process key, the entry must be exactly (pin_target,).
+            for entry in ((), (g.realpath,), (other,), (binary, binary)):
+                with self.subTest(remade=entry):
+                    values = {**dataclasses.asdict(g), "entry": entry}
+                    values.pop("mac")
+                    remade = Grant(mac=grant_mod._mac(values), **values)
+                    r = self.refused("grant_forged", launch_plan, remade, ["agy"], {})
+                    self.assertIn("is not its pinned binary", r.detail)
+                    r = self.refused("grant_forged", grant_mod.verify, remade)
+                    self.assertIn("is not its pinned binary", r.detail)
+            self.assertEqual([binary], launch_plan(g, ["agy"], {}).exec_argv())
+        self.assertFalse(os.path.exists(inst.ran))
+
+    def test_binary_mismatch_before_the_grant_is_pin_mismatch(self) -> None:
+        inst = agy_windows_install(".cmd")
+        pin = inst.pin()
+        F.write(inst.root, "1.5.3", dump=inst.ran)
+        with windows(), table(pin):
+            self.refused("pin_mismatch", self.g, inst)
+        inst = agy_windows_install(".cmd")
+        pin = inst.pin()
+        os.chmod(inst.root, 0o644)
+        with windows(), table(pin):
+            self.refused("binary_missing", self.g, inst)
+
+    def test_launcher_tree_pin_with_no_entry_and_no_interpreter_is_pin_entry_unset(self) -> None:
+        inst = pi_windows_install(".cmd", entry=())
+        with windows(), table(inst.pin()):
+            self.assertEqual((), inst.pin().entry)
+            self.assertEqual("", inst.pin().interpreter)
+            g = self.g(inst)
+            self.assertTrue(g.check_only)
+            self.assertEqual("launcher+tree", g.pin_kind)
+            self.assertEqual((), g.entry)
+            self.assertEqual("", g.interpreter)
+            self.refused("pin_entry_unset", launch_plan, g, ["pi", "-p", "hi"], {})
+            self.refused("pin_entry_unset", grant_mod.LaunchPlan(g, ("pi",), (), 3).exec_argv)
+        self.assertFalse(os.path.exists(inst.ran))
+
+    def test_script_named_launcher_that_is_itself_the_binary_has_nothing_behind_it(self) -> None:
+        d = F.dir()
+        ran = os.path.join(d, "ran")
+        path = F.make("agy.cmd", "1.5.3", where=d, dump=ran)  # a native file under a script name; target ""
+        inst = Install("antigravity", path, "", path, "1.5.3", ran)
+        with windows(), table(inst.pin()):
+            g = self.g(inst)
+            self.assertTrue(g.check_only)
+            self.assertEqual(g.realpath, g.pin_target)
+            self.assertEqual((), g.entry)  # the launcher is never executed, and no binary is measured behind it
+            r = self.refused("pin_entry_unset", launch_plan, g, ["agy"], {})
+            self.assertIn("no binary is measured behind it", r.detail)
+            self.refused("grant_forged", launch_plan, dataclasses.replace(g, entry=(g.realpath,)), ["agy"], {})
+            values = {**dataclasses.asdict(g), "entry": (g.realpath,)}
+            values.pop("mac")
+            self.refused("grant_forged", launch_plan, Grant(mac=grant_mod._mac(values), **values), ["agy"], {})
+        self.assertFalse(os.path.exists(ran))
+
+    def test_interpreter_unpinned_still_comes_before_the_entry(self) -> None:
+        for inst in (dataclasses.replace(agy_windows_install(".cmd"), interpreter=NODE_ON_PATH),
+                     dataclasses.replace(pi_windows_install(".cmd", entry=()), interpreter=NODE_ON_PATH)):
+            with self.subTest(engine=inst.engine), windows(), table(inst.pin()):
+                g = self.g(inst)
+                self.assertTrue(g.check_only)
+                argv0 = FLOORS[inst.engine].names[0]
+                self.refused("interpreter_unpinned", launch_plan, g, [argv0], {})
+
+    def test_committed_cursor_and_pi_rows_stay_refused(self) -> None:
+        self.assertEqual("r2a-pins/1.5.0-candidate-2026-11-10", PIN_TABLE_VERSION)
+        for pin in pins_mod.PINS:
+            self.assertEqual("launcher+tree", PINNED[pin.engine])
+            self.assertEqual((), pin.entry)  # no measured entry: pin_entry_unset, or interpreter_unpinned for Pi
+            self.assertEqual(NODE_ON_PATH if pin.engine == "pi" else "", pin.interpreter)
 
 
 @unittest.skipUnless(os.name == "posix", "POSIX fixtures")

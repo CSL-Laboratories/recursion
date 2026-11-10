@@ -52,7 +52,9 @@ window between `exec_argv()` and the exec itself is still open (CX-1402, see Lim
   SHA-256 must be a recorded launcher pin for that engine and the pinned tree must match,
   otherwise `pin_mismatch`. That launcher is a check only and is never executed: the grant
   records the pin's `entry` (each item a regular file inside the pinned tree, else
-  `pin_mismatch`), and the grant is still issued when the pin has no entry. The same holds
+  `pin_mismatch`), and the grant is still issued when the pin has no entry. For a
+  `binary+launcher` pin the measured binary is the entry: the grant records
+  `entry = (pin_target,)`, the pinned native binary behind the launcher. The same holds
   for a bare or `.exe` path that resolves to a script: check-only is decided here, at grant
   time, and recorded in the grant's `check_only` field (see
   [Check-only launchers](#check-only-launchers)). The grant also copies the pin's
@@ -64,7 +66,8 @@ window between `exec_argv()` and the exec itself is still open (CX-1402, see Lim
   unset, the floor-table version and the refusal-code version;
   for a pinned route also the pin kind, pin-table version, and the matched target and its
   digest, `check_only` (the launcher is a script that is checked and never executed),
-  `entry` (for a check-only grant, the realpaths of the pin's entry items) and
+  `entry` (for a check-only grant, the realpaths of the pin's entry items or, for a
+  `binary+launcher` pin, of its pinned binary) and
   `interpreter` (the pin's interpreter outside the pinned tree, or empty). The grant is a frozen dataclass whose fields are MACed (HMAC-SHA-256) with a
   per-process key; `launch_plan` refuses anything else (`grant_forged`) and any grant issued
   under another table or code version (`grant_stale`), and re-checks the floors.
@@ -78,8 +81,8 @@ window between `exec_argv()` and the exec itself is still open (CX-1402, see Lim
   only environment a plan holds, `exec_env()` returns exactly it, and no `env` means an
   empty one (see [Environment](#environment-the-routes-child_env-only)). Then, here and on
   every plan use: a grant whose pin names an interpreter outside the pinned tree is refused
-  (`interpreter_unpinned`), and a check-only grant whose pin records no entry is refused
-  (`pin_entry_unset`), in that order.
+  (`interpreter_unpinned`), and a check-only grant with no measured binary or entry to
+  execute is refused (`pin_entry_unset`), in that order.
 - `LaunchPlan.exec_argv()` authenticates and re-verifies on **every use** (C1-37): the
   path must still resolve to the pinned realpath and the whole file is re-hashed. A binary
   swapped behind an unchanged symlink shim, a retargeted link, or a same-size rewrite with
@@ -91,7 +94,10 @@ window between `exec_argv()` and the exec itself is still open (CX-1402, see Lim
   that resolves to a script) it returns `[*entry, *argv[1:]]` instead,
   never the launcher's path: the launcher digest and the tree digest (which covers the
   entry files' bytes) are re-checked as above, and each entry path must still resolve to
-  the same file inside the tree (`binary_changed`).
+  the same file inside the tree (`binary_changed`). For a check-only `binary+launcher`
+  grant it returns `[pin_target, *argv[1:]]`: the entry must be exactly the pinned binary
+  (`grant_forged`), which must still resolve to itself, be native and hash to the pin
+  (`binary_changed`).
 - `launch_check(path_string)`: one pass over all eight engines; one record each
   (`granted`, `refused` with code, or `absent`). Grants are returned apart from records.
 
@@ -240,7 +246,9 @@ re-pins.
 - A `launcher+tree` pin may carry an `entry`: the program its launcher reaches, as argv
   items, each a relative `/`-separated path inside the package root (Cursor's would have
   the shape `("node.exe", "index.js")`; no such entry is committed). Empty means not
-  measured. An entry on a `binary+launcher` pin, an absolute path, an empty item, a `..`
+  measured. A `binary+launcher` pin carries no `entry` field value: its measured binary
+  (`target`) is its entry (see [Check-only launchers](#check-only-launchers)). An entry on
+  a `binary+launcher` pin, an absolute path, an empty item, a `..`
   that leaves the root or a non-tuple is a table bug: that pin is never matched
   (`pin_mismatch`).
 - A pin may carry an `interpreter`: a measured fact that its launcher starts an interpreter
@@ -301,6 +309,12 @@ never executed. His answer of 2026-11-10 (via Liaison): "Extend the check-only r
 bare or .exe granted path that resolves to a script (.cmd/.ps1, by content or resolution as
 appropriate). It fails closed, with tests."
 
+The first call as restated by Liaison for Lucas (2026-11-10, 1:42pm PST; a restatement, not
+a quote): when a pin has a measured binary or entry behind a Windows script launcher, the
+launcher is checked and that pinned binary or entry is executed directly, a
+`binary+launcher` pin included; `pin_entry_unset` only when no binary or entry has been
+measured.
+
 - Check-only is decided once, at grant time, and recorded in the grant's MAC-covered
   `check_only` field (`grant_forged` if edited, or if it is not a bool). A pinned route's
   grant (`launcher+tree` or `binary+launcher`) is check-only when any of these holds:
@@ -311,12 +325,25 @@ appropriate). It fails closed, with tests."
     is not a native executable (batch, PowerShell, shebang or other text behind a bare or
     `.exe` name). If the file cannot be read for this check the grant is refused
     (`binary_missing`).
-- A check-only grant records the pin's entry as realpaths under the matched tree root.
-  Each item must be a regular file whose realpath is inside that root, else
-  `pin_mismatch`. With no entry in the pin the grant is still issued (the launcher check
-  passed) with an empty `entry`.
-- `launch_plan` and every plan use refuse such a grant with `pin_entry_unset` when it has
-  no entry. With one, `exec_argv()` returns `[*entry, *argv[1:]]`, never the launcher's
+- A check-only `launcher+tree` grant records the pin's entry as realpaths under the
+  matched tree root. Each item must be a regular file whose realpath is inside that root,
+  else `pin_mismatch`. With no entry in the pin the grant is still issued (the launcher
+  check passed) with an empty `entry`.
+- A `binary+launcher` pin's measured binary is its entry. A check-only grant on one
+  records `entry = (pin_target,)`: the realpath of the native binary behind the launcher,
+  which `pins.match` found native and whose SHA-256 it matched to the pin's
+  `target_sha256` at grant time (it must also be executable, else `binary_missing`).
+  `exec_argv()` returns `[pin_target, *argv[1:]]`; the launcher is hashed and never
+  executed. On `launch_plan` and every plan use the entry must be exactly `(pin_target,)`
+  (`grant_forged` otherwise, even with a valid MAC), and the binary must still resolve to
+  itself, be a native executable and hash to `pin_sha256` in a full re-hash
+  (`binary_changed`; `binary_missing` if its exec bit is gone). The pin row itself still
+  carries no `entry` field value, and one there is still a table bug (`pin_mismatch`).
+- `launch_plan` and every plan use refuse a check-only grant with `pin_entry_unset` when
+  it has no entry, that is, when no binary or entry has been measured behind the
+  launcher: a `launcher+tree` pin with an empty entry, or a `binary+launcher` pin whose
+  script-named launcher is itself the pinned binary (empty `target`; nothing is behind
+  it, and the launcher is never executed). With one, `exec_argv()` returns `[*entry, *argv[1:]]`, never the launcher's
   path, after re-checking the launcher digest, the tree digest (the entry files are inside
   the tree, so their bytes are covered) and that each entry path still resolves to the same
   file inside the tree (`binary_changed`). `argv[0]` of the request is still the bare
@@ -330,8 +357,13 @@ appropriate). It fails closed, with tests."
   `launcher+tree` shape, such as a `pi` shell script or a link to `cli.js`) is still
   executed by its realpath and its pin's entry is not used. A native bare or `.exe`
   launcher is unchanged on every platform, as is a `binary+launcher` pin whose launcher is
-  the native binary. A `binary+launcher` pin behind a script launcher on Windows is
-  check-only and, since such a pin can carry no entry, always `pin_entry_unset`.
+  the native binary. Off Windows a `binary+launcher` pin behind a bare shebang launcher
+  still executes that launcher by its realpath.
+- Changed from the previous candidate: a `binary+launcher` pin behind a script launcher
+  that is check-only (a `.cmd`/`.ps1`, or on Windows a bare or `.exe` script) was always
+  `pin_entry_unset`; it now executes the pinned binary, as above. No pin row, hash, size,
+  target, entry or interpreter changed, so `PIN_TABLE_VERSION` is not bumped, and the
+  refusal code set and its version are unchanged.
 
 ### Interpreter outside the pinned tree
 
@@ -429,14 +461,20 @@ this package ships.
   non-pinned engine's npm `.cmd` shim or `.ps1` launcher is still not grantable (fail closed).
 - A check-only launcher is never executed (Lucas, 2026-11-10: "accept a
   pinned .cmd/.ps1 launcher as a check, but execute the pinned entry directly").
-  `exec_argv()` returns the pin's entry files and `argv[1:]`. The launcher's working
+  `exec_argv()` returns the pin's entry files and `argv[1:]`; for a `binary+launcher` pin
+  the measured binary is the entry, so it returns that binary and `argv[1:]`. The launcher's working
   directory and any arguments it adds between the entry and the user's are not reproduced.
   Its environment is not reproduced either, by rule: "A launch uses the Recursion route's
   child_env, never the environment the launcher would have set; nothing ambient is
   inherited, which is Lucas's route-owned design on #320."
 - Cursor and Pi stay refused (`pin_entry_unset` / `interpreter_unpinned`) until entries are
   measured; sentry not touched. Committed pins carry no entry, and both Pi rows record the
-  Node on PATH.
+  Node on PATH. All three committed rows are `launcher+tree`, so the `binary+launcher`
+  rule above reaches no committed pin: Antigravity CLI has no pin and stays `pin_mismatch`.
+- For a `binary+launcher` pin the code checks that the binary behind the launcher is the
+  pinned one (native, full SHA-256), not that the launcher's text actually starts it, and
+  any arguments the launcher would add are not reproduced. A script-named launcher that is
+  itself the pinned binary is refused (`pin_entry_unset`), never executed.
 - The entry is a statement by whoever measures the pin of what the launcher starts. The
   code checks that the entry files are inside the pinned tree and unchanged, not that the
   launcher's text actually names them.
@@ -466,7 +504,7 @@ skip. Pinned-route tests (`tests/test_pins.py`) build fake installs (an npm-shap
 venv-shaped Hermes, a Cursor version directory, an `agy` binary with and without a
 launcher, and a Windows-shaped Pi whose fake tree holds its own `node.exe` so its pin can
 carry an entry; the same fixture with a synthetic `interpreter` covers `interpreter_unpinned`,
-and bare or `.exe` links and copies of its launchers cover the check-only rule), measure them in place and patch the pin table; none of those fake-install
+and bare or `.exe` links and copies of its launchers cover the check-only rule; an `agy.cmd`/`agy.ps1` in front of a native `antigravity.exe` covers the `binary+launcher` entry), measure them in place and patch the pin table; none of those fake-install
 pins is real. The committed rows in `PINS` are real measurements, checked value by value.
 No real `claude`, `codex` or other engine, account, provider or network is used.
 `tools/ci_gate.py` runs these files since CSL-795 (#334) merged: each `core/**/test_*.py`

@@ -24,12 +24,16 @@ Two pin kinds (``EngineSpec.pin``):
 the binary: empty (the launcher itself), ``.`` or ``/``-separated names and ``..``.
 Nothing is executed here: the version comes from the pin, never from running a wrapper.
 
-``Pin.entry`` (``launcher+tree`` only) is the program the launcher would reach, as argv
+``Pin.entry`` (a field of ``launcher+tree`` pins only) is the program the launcher would reach, as argv
 items: relative ``/``-separated paths inside the package root. Lucas's owner call of
 2026-11-10 (calls 13/14): "accept a pinned .cmd/.ps1 launcher as a check, but execute the
 pinned entry directly". A Windows ``.cmd``/``.ps1`` launcher is hashed and never executed;
 what is executed is the entry (``grant.LaunchPlan.exec_argv``). Empty means not measured,
-and such a launcher's grant refuses at launch (``pin_entry_unset``). Lucas's answer of
+and such a launcher's grant refuses at launch (``pin_entry_unset``). A ``binary+launcher``
+pin leaves ``entry`` empty because its measured binary is its entry: behind a script
+launcher the launcher is checked and the pinned binary (``target``, matched to
+``target_sha256``) is executed directly. Only a pin with no measured binary or entry behind
+its launcher is ``pin_entry_unset``. Lucas's answer of
 2026-11-10 extends the check-only rule "to a bare or .exe granted path that resolves to a
 script (.cmd/.ps1, by content or resolution as appropriate)"; ``grant`` decides that.
 
@@ -83,7 +87,8 @@ class Pin:
     measured: str  # YYYY-MM-DD
     source: str  # where the measured files came from: a real install, never a vendor archive
     # launcher+tree only: the program the launcher reaches, as argv items relative to `target`
-    # (an interpreter and a script inside the tree, say). () is not measured.
+    # (an interpreter and a script inside the tree, say). () is not measured. A binary+launcher pin
+    # leaves this (): its measured binary (`target`) is the entry a check-only launch executes.
     entry: tuple[str, ...] = ()
     # An interpreter the launcher starts from outside the pinned tree, named as the launcher
     # resolves it ("node (PATH)"). "" is none, or one inside the tree. It is not hashed, so a

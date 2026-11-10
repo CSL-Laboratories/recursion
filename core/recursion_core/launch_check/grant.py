@@ -12,8 +12,16 @@ pinned route's ``<name>.cmd`` or ``<name>.ps1`` launcher takes the same pin chec
 other wrapper extension, engine and platform is still ``wrapper_refused``. That launcher is
 a check only and is never executed (Lucas's owner call of 2026-11-10: "accept a pinned
 .cmd/.ps1 launcher as a check, but execute the pinned entry directly"): its grant records
-the pin's entry, resolved inside the pinned tree, and a launch executes those files. With
-no entry in the pin the grant is still issued and every launch is ``pin_entry_unset``.
+the pin's entry, resolved inside the pinned tree, and a launch executes those files.
+
+The same call, restated for Lucas on 2026-11-10: when a pin has a measured binary or entry
+behind a script launcher, the launcher is checked and that pinned binary or entry is executed
+directly. A ``binary+launcher`` pin's measured binary is its entry: a check-only grant on one
+records ``entry = (pin_target,)``, the native binary's realpath, whose SHA-256 matched the pin
+at grant time, and a launch executes that binary, never the launcher. A ``launcher+tree`` pin
+with no entry has nothing measured to execute: its grant is still issued and every launch is
+``pin_entry_unset``. So is a ``binary+launcher`` grant whose script-named launcher is itself
+the pinned binary: no binary is measured behind it, and the launcher is never executed.
 
 Lucas's answer of 2026-11-10: "Extend the check-only rule to a bare or .exe granted path
 that resolves to a script (.cmd/.ps1, by content or resolution as appropriate). It fails
@@ -98,8 +106,9 @@ class Grant:
     pin_table: str = ""
     pin_target: str = ""  # realpath of the package root or binary
     pin_sha256: str = ""
-    # A check-only grant only: realpaths of the pin's entry, inside pin_target.
-    # They are what is executed; () means the pin records no entry and every launch is refused.
+    # A check-only grant only, and what it executes. launcher+tree: realpaths of the pin's entry, inside
+    # pin_target. binary+launcher: (pin_target,), the pinned native binary behind the launcher.
+    # () means nothing is measured to execute (no pin entry, or no binary behind the launcher): every launch is refused.
     entry: tuple[str, ...] = ()
     # Pinned routes only, decided at grant time: the launcher is a script (.cmd/.ps1 by name, by
     # resolution or, on Windows, by content) that is checked and never executed.
@@ -246,7 +255,14 @@ def _grant_pinned(spec: EngineSpec, path: str) -> Grant:
     check_floors(spec, parsed)
     entry: tuple[str, ...] = ()
     check_only = _check_only_path(spec, path, real)
-    if check_only:  # the launcher is a check; the entry is what a launch executes
+    if check_only and spec.pin == "binary+launcher":
+        # The pin's measured binary is the entry: pins.match found it native and hashed it to the pin.
+        # A script-named launcher that is itself the binary has nothing behind it: () and pin_entry_unset.
+        if found.target != real:
+            if not os.access(found.target, os.X_OK):
+                raise LaunchRefused("binary_missing", spec.engine, "pinned binary is not executable")
+            entry = (found.target,)
+    elif check_only:  # the launcher is a check; the entry is what a launch executes
         try:
             entry = pins.resolve_entry(found.target, found.pin.entry)
         except (OSError, ValueError) as e:
@@ -261,6 +277,11 @@ def _grant_pinned(spec: EngineSpec, path: str) -> Grant:
         entry=entry, check_only=check_only, interpreter=found.pin.interpreter,
     )
     return Grant(mac=_mac(values), **values)
+
+
+def _binary_entry(g: Grant) -> tuple[str, ...]:
+    """The only entry ``grant()`` gives a check-only ``binary+launcher`` grant: the pinned binary behind the launcher."""
+    return (g.pin_target,) if g.pin_target != g.realpath else ()
 
 
 def authenticate(g: object) -> EngineSpec:
@@ -293,6 +314,8 @@ def authenticate(g: object) -> EngineSpec:
         raise LaunchRefused("grant_forged", engine, "check_only, entry or interpreter on a grant with no pin")
     if g.entry and not g.check_only:
         raise LaunchRefused("grant_forged", engine, "entry on a grant that is not check-only")
+    if g.check_only and g.pin_kind == "binary+launcher" and g.entry != _binary_entry(g):
+        raise LaunchRefused("grant_forged", engine, "entry of a binary+launcher grant is not its pinned binary")
     if spec.pin is not None:
         if g.pin_table != pins.PIN_TABLE_VERSION:
             raise LaunchRefused("grant_stale", engine, f"issued under {g.pin_table}; pin table is now {pins.PIN_TABLE_VERSION}")
@@ -306,7 +329,11 @@ def authenticate(g: object) -> EngineSpec:
 
 
 def verify(g: Grant) -> None:
-    """Re-verify the pinned binary (and probe binary, package tree, entry): resolution, then a full re-hash."""
+    """Re-verify the pinned binary (and probe binary, package tree, entry): resolution, then a full re-hash.
+
+    A check-only ``binary+launcher`` grant's entry must be exactly ``(pin_target,)`` (``grant_forged``);
+    that binary must still resolve to itself, be native and hash to ``pin_sha256`` (``binary_changed``).
+    """
     spec = spec_for(g.engine)
     pairs = [(g.path, g.realpath, g.sha256)]
     if g.probe_path != g.path:
@@ -329,6 +356,13 @@ def verify(g: Grant) -> None:
             raise LaunchRefused("binary_changed", spec.engine, f"{g.pin_target} unreadable: {e.__class__.__name__}") from None
         if digest != g.pin_sha256:
             raise LaunchRefused("binary_changed", spec.engine, f"{g.pin_target} digest differs from the grant")
+    if g.check_only and g.pin_kind == "binary+launcher":
+        # The entry is the pinned binary itself: re-resolved, found native and re-hashed to pin_sha256 above.
+        if g.entry != _binary_entry(g):
+            raise LaunchRefused("grant_forged", spec.engine, "entry of a binary+launcher grant is not its pinned binary")
+        if g.entry and not os.access(g.pin_target, os.X_OK):  # exec bit removed after the grant
+            raise LaunchRefused("binary_missing", spec.engine, f"{g.pin_target} is not executable")
+        return
     for e in g.entry:  # the tree digest above covers their bytes; each must still be the same file inside it
         if os.path.realpath(e) != e or not pins.inside(g.pin_target, e) or not os.path.isfile(e):
             raise LaunchRefused("binary_changed", spec.engine, f"entry {e} now resolves elsewhere")
@@ -370,7 +404,8 @@ class LaunchPlan:
 
         For a check-only grant (a pinned ``.cmd``/``.ps1`` launcher, or a bare or ``.exe`` path that
         resolves to a script) the result is ``[*entry, *argv[1:]]``: the launcher was a check and is
-        never in it (``pin_entry_unset`` when the grant has no entry). A grant whose pin names an
+        never in it (``pin_entry_unset`` when the grant has no entry). For a ``binary+launcher`` pin the
+        entry is the pinned native binary, so the result is ``[pin_target, *argv[1:]]``. A grant whose pin names an
         interpreter outside the pinned tree is ``interpreter_unpinned``.
         """
         self._recheck()
@@ -431,7 +466,9 @@ def _checked_launch(g: object, argv: Sequence[str], env: dict[str, str]) -> int:
         raise LaunchRefused(
             "pin_entry_unset", spec.engine,
             "pinned script launcher (.cmd/.ps1, or a bare or .exe name that resolves to one) accepted as a check, "
-            "but the pin records no entry to execute; refused until the entry is measured",
+            "but the pin records no entry to execute; refused until the entry is measured"
+            + (" (the launcher is itself the pinned binary: no binary is measured behind it)"
+               if g.pin_kind == "binary+launcher" else ""),
         )
     verify(g)
     return size

@@ -1396,6 +1396,110 @@ class SpawnDefectTests(unittest.TestCase):
                     probe_ptrace(4242)
         self.assertEqual(len(calls), 2)
 
+    def test_detection_does_not_launch_uid_zero_names(self) -> None:
+        seen: list[tuple[str, ...]] = []
+
+        def run(cmd, timeout: float) -> ProcResult:
+            seen.append(tuple(cmd))
+            return ProcResult(1, "", "denied")
+
+        for user in ("0", "#0"):
+            with self.subTest(user=user):
+                seen.clear()
+                detect_backends(
+                    facts=_facts(),
+                    run_fn=run,
+                    helper_paths=("/tmp/csl734-no-such-helper",),
+                    env={},
+                    engine_user=user,
+                )
+                argv = [part for cmd in seen for part in cmd]
+                self.assertFalse(any(part in {"--uid=0", "--uid=#0"} for part in argv), seen)
+                sudo_users = [
+                    cmd[3] for cmd in seen if len(cmd) > 3 and cmd[:3] == ("sudo", "-n", "-u")
+                ]
+                self.assertFalse(any(user in {"0", "#0"} for user in sudo_users), seen)
+
+    def test_helper_stat_uses_one_nofollow_fd(self) -> None:
+        # lstat then os.stat follows a symlink swapped in between the two calls.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "helper")
+            with open(path, "wb") as handle:
+                handle.write(b"not-sudo")
+            os.chmod(path, 0o755)
+            opens: list[int] = []
+            real_open = privileged_spawn.os.open
+            real_stat = privileged_spawn.os.stat
+
+            def spy_open(file, flags, *args, **kwargs):
+                if os.fspath(file) == path:
+                    opens.append(flags)
+                return real_open(file, flags, *args, **kwargs)
+
+            def followed_stat(file):
+                if os.fspath(file) == path:
+                    return real_stat("/usr/bin/sudo")
+                return real_stat(file)
+
+            with mock.patch.object(privileged_spawn.os, "open", spy_open):
+                with mock.patch.object(privileged_spawn.os, "stat", followed_stat):
+                    backends = detect_backends(
+                        facts=_facts(),
+                        run_fn=_run_fail,
+                        helper_paths=(path,),
+                        env={},
+                    )
+        helper = next(b for b in backends if b.name == "setuid_helper")
+        self.assertIsNone(helper.helper_path)
+        self.assertNotIn("setuid_root=True", helper.reason)
+        self.assertTrue(opens, "helper check did not open the path")
+        self.assertTrue(
+            all(flags & os.O_NOFOLLOW and flags & os.O_PATH for flags in opens),
+            opens,
+        )
+
+    def test_store_writer_fchmods_the_fd(self) -> None:
+        script = store_writer_script("/tmp/example.secret")
+        self.assertIn("os.fchmod(fd, 0o600)", script)
+        self.assertNotIn("os.chmod(", script)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "store.secret")
+            exec(store_writer_script(path), {})
+            self.assertEqual(os.stat(path).st_size, len(b"store-bytes"))
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+
+    def test_store_paths_do_not_follow_an_intermediate_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            outsider = os.path.join(tmp, "outsider")
+            holder = os.path.join(tmp, "holder")
+            os.mkdir(outsider)
+            os.mkdir(holder)
+            link = os.path.join(holder, "link")
+            os.symlink(outsider, link)
+            target = os.path.join(link, "store.secret")
+            with self.assertRaises(OSError):
+                exec(store_writer_script(target), {})
+            self.assertEqual(os.listdir(outsider), [])
+
+            planted: list[str] = []
+
+            def run(cmd, timeout: float) -> ProcResult:
+                script = cmd[-1]
+                path = ast.literal_eval(script.split("p=", 1)[1].split(";", 1)[0])
+                # Plant the bytes through the directory symlink. The reader must not follow it.
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as handle:
+                    handle.write(b"store-bytes")
+                planted.append(path)
+                return ProcResult(0, "", "")
+
+            result, detail = probe_abs_store_read((), link, expected_owner=os.getuid(), run_fn=run)
+            self.assertIsNone(result)
+            self.assertIn("store_symlink", detail)
+            self.assertEqual(len(planted), 1)
+            with open(planted[0], "rb") as handle:
+                self.assertEqual(handle.read(), b"store-bytes")
+
     def test_ptrace_detaches_when_the_child_is_already_reaped(self) -> None:
         calls: list[int] = []
 

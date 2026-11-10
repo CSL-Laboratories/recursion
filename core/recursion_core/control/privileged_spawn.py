@@ -443,24 +443,64 @@ def _is_setuid_root(st: os.stat_result) -> bool:
     return bool(st.st_mode & stat.S_ISUID) and st.st_uid == 0
 
 
+def _fstat_nofollow(path: str) -> os.stat_result:
+    """Stat one inode. ``O_PATH|O_NOFOLLOW`` does not follow a final symlink."""
+
+    fd = os.open(path, os.O_PATH | os.O_NOFOLLOW)
+    try:
+        return os.fstat(fd)
+    finally:
+        os.close(fd)
+
+
+def _open_leaf_nofollow(path: str, flags: int, mode: int = 0o777) -> tuple[int, int, str]:
+    """Open the last component via a directory fd.
+
+    Each directory component is opened with ``O_DIRECTORY|O_NOFOLLOW``, then
+    the leaf with ``O_NOFOLLOW``. ``O_NOFOLLOW`` on a single ``open`` of the
+    full path only covers the last component. Returns ``(leaf_fd, dir_fd, name)``.
+    The caller closes both descriptors.
+    """
+
+    absolute = os.path.isabs(path)
+    parts = [part for part in path.split(os.sep) if part]
+    if not parts:
+        raise OSError(errno.ENOENT, os.strerror(errno.ENOENT), path)
+    name = parts.pop()
+    cur = os.open(os.sep if absolute else ".", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts:
+            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=cur)
+            os.close(cur)
+            cur = nxt
+        leaf = os.open(name, flags | os.O_NOFOLLOW, mode, dir_fd=cur)
+    except BaseException:
+        os.close(cur)
+        raise
+    return leaf, cur, name
+
+
 def _inspect_helpers(
     paths: Sequence[str],
     stat_fn: StatFn,
 ) -> tuple[str | None, str]:
     notes: list[str] = []
     found: str | None = None
+    # The default ``os.stat`` follows a symlink swapped in after ``lstat``.
+    # One ``O_PATH|O_NOFOLLOW`` fd is the inode we report. Injected stats stay
+    # available for tests that have no real file.
+    follow_free = stat_fn is os.stat
     for path in paths:
         try:
-            link = os.lstat(path)
-        except OSError:
-            link = None
-        if link is not None and stat.S_ISLNK(link.st_mode):
-            notes.append(f"{path} is a symlink; not a setuid helper")
+            st = _fstat_nofollow(path) if follow_free else stat_fn(path)
+        except OSError as exc:
+            if follow_free and exc.errno == errno.ELOOP:
+                notes.append(f"{path} is a symlink; not a setuid helper")
+            else:
+                notes.append(f"{path} absent")
             continue
-        try:
-            st = stat_fn(path)
-        except OSError:
-            notes.append(f"{path} absent")
+        if stat.S_ISLNK(st.st_mode):
+            notes.append(f"{path} is a symlink; not a setuid helper")
             continue
         mode = stat.filemode(st.st_mode)
         setuid_root = _is_setuid_root(st)
@@ -485,13 +525,23 @@ def _sudo_n_true(run_fn: RunFn) -> bool:
 
 
 def store_writer_script(path: str) -> str:
-    """Python ``-c`` body used by the absolute-path store probe (and sudo detection)."""
+    """Python ``-c`` body used by the absolute-path store probe (and sudo detection).
+
+    The leaf is created through a directory fd. ``O_NOFOLLOW`` applies to every
+    component, and the mode is set with ``fchmod`` on that fd before it is closed.
+    """
 
     quoted = repr(str(path))
     return (
         "import os; p=" + quoted + "; "
-        "fd=os.open(p, os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_WRONLY, 0o600); "
-        "os.write(fd, b'store-bytes'); os.close(fd); os.chmod(p, 0o600)"
+        "abs=os.path.isabs(p); parts=[part for part in p.split(os.sep) if part]; "
+        "name=parts.pop(); "
+        "cur=os.open(os.sep if abs else '.', os.O_RDONLY|os.O_DIRECTORY); "
+        "\n"
+        "for part in parts:\n"
+        " nxt=os.open(part, os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW, dir_fd=cur); os.close(cur); cur=nxt\n"
+        "fd=os.open(name, os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_WRONLY, 0o600, dir_fd=cur); "
+        "os.write(fd, b'store-bytes'); os.fchmod(fd, 0o600); os.close(fd); os.close(cur)"
     )
 
 
@@ -521,6 +571,12 @@ def _probe_sudo_target(
 
     notes: list[str] = []
     for user in candidates:
+        if user in _ROOT_USER_NAMES:
+            notes.append(
+                f"sudo -n -u {user} refused before launch; "
+                "rejected: engine user must not be root or the calling uid"
+            )
+            continue
         result = run_fn(("sudo", "-n", "-u", user, "--", "id", "-u"), 8.0)
         uid = _parse_uid_output(result.stdout)
         if result.returncode != 0 or uid is None or uid == our_uid or uid == 0:
@@ -575,6 +631,11 @@ def _probe_sudo_target(
 
 
 def _probe_systemd_run(run_fn: RunFn, user: str, our_uid: int) -> tuple[bool, int | None, str]:
+    if user in _ROOT_USER_NAMES:
+        return False, None, (
+            f"systemd-run --uid={user} refused before launch; "
+            "rejected: engine user must not be root or the calling uid"
+        )
     result = run_fn(
         (
             "systemd-run",
@@ -780,7 +841,9 @@ def probe_abs_store_read(
 
     A writer that fails, leaves no file, leaves a symlink, or wrote as a uid
     other than ``expected_owner`` is an error (``None``), not a blocked read.
-    The read does not follow a symlink at the store path.
+    The read walks the path with ``O_NOFOLLOW`` on every component, not only
+    the leaf. Callers still pass a directory this process created and a unique
+    final name (``store-<pid>-<ns>.secret``).
     """
 
     store = Path(directory) / f"store-{os.getpid()}-{time.time_ns()}.secret"
@@ -788,9 +851,11 @@ def probe_abs_store_read(
     if result.returncode != 0:
         return None, f"writer_failed rc={result.returncode} err={(result.stderr or '')[:160]}"
     try:
-        fd = os.open(str(store), os.O_RDONLY | os.O_NOFOLLOW)
+        fd, dirfd, name = _open_leaf_nofollow(str(store), os.O_RDONLY)
     except OSError as exc:
-        if exc.errno == errno.ELOOP:
+        # ELOOP: the leaf is a symlink. ENOTDIR: an earlier component is a
+        # symlink (O_DIRECTORY|O_NOFOLLOW does not follow it).
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
             return None, f"store_symlink {exc.errno}"
         return None, f"writer_left_no_store {type(exc).__name__}:{exc.errno}"
     try:
@@ -813,9 +878,10 @@ def probe_abs_store_read(
     finally:
         os.close(fd)
         try:
-            os.unlink(str(store))
+            os.unlink(name, dir_fd=dirfd)
         except OSError:
             pass
+        os.close(dirfd)
     return False, f"read {len(data)} bytes"
 
 
@@ -1104,7 +1170,9 @@ def detect_backends(
     our_uid = facts.uid
     engine = _configured_engine_user(engine_user, env)
     candidates = SUDO_TARGET_CANDIDATES
-    if engine is not None:
+    # ``0`` and ``#0`` are uid 0 before any ``id -u`` output. Do not prepend
+    # them, and do not launch sudo or systemd-run against a root name.
+    if engine is not None and engine not in _ROOT_USER_NAMES:
         candidates = (engine, *(u for u in SUDO_TARGET_CANDIDATES if u != engine))
 
     helper_found, helper_note = _inspect_helpers(

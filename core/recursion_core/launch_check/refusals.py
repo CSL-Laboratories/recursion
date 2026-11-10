@@ -7,9 +7,12 @@ error: the only way out of a failed check is this exception.
 
 from __future__ import annotations
 
-# 1.5.0: the same 19 codes; a Windows .cmd/.ps1 launcher on a pinned route moves from
+# 1.6.0: 20 codes; adds pin_entry_unset. A pinned route's Windows .cmd/.ps1 launcher is a check
+# only and is never executed (Lucas, 2026-11-10: "accept a pinned .cmd/.ps1 launcher as a check,
+# but execute the pinned entry directly"); with no entry in the pin, the launch is refused.
+# 1.5.0: the same 19 codes as 1.4.0; a Windows .cmd/.ps1 launcher on a pinned route moves from
 # wrapper_refused to the pin check (pin_mismatch unless pinned).
-REFUSAL_CODES_VERSION = "r2a-refusals/1.5.0-candidate-2026-11-09"
+REFUSAL_CODES_VERSION = "r2a-refusals/1.6.0-candidate-2026-11-10"
 
 # Closed set. Adding, removing or renaming a code is a new REFUSAL_CODES_VERSION.
 REFUSAL_CODES = frozenset(
@@ -26,8 +29,10 @@ REFUSAL_CODES = frozenset(
         "identity_mismatch",  # version line does not name an engine whose real line names it
         "identity_unverified",  # engine has no identity rule or pinned digest (refused before probing)
         # pinned route: launcher (on Windows also <name>.cmd/.ps1), package files or binary match no
-        # recorded pin (until re-pinned)
+        # recorded pin (until re-pinned); an archive-sourced pin or a bad pin entry is never matched
         "pin_mismatch",
+        # pinned Windows .cmd/.ps1 launcher accepted as a check, but its pin records no entry to execute
+        "pin_entry_unset",
         "version_unparsed",  # version token does not match the engine's format
         "floor_unset",  # a floor in the table does not parse
         "version_refused",  # below a floor, or a prerelease

@@ -9,12 +9,19 @@ A pinned route (``EngineSpec.pin``: pi, hermes, cursor, antigravity) is not prob
 launcher and its package tree or binary must match a pin in ``pins.py``; the version is
 the pin's, and anything else is ``pin_mismatch`` until re-pinned. On Windows only, a
 pinned route's ``<name>.cmd`` or ``<name>.ps1`` launcher takes the same pin check; every
-other wrapper extension, engine and platform is still ``wrapper_refused``.
+other wrapper extension, engine and platform is still ``wrapper_refused``. That launcher is
+a check only and is never executed (Lucas's owner call of 2026-11-10: "accept a pinned
+.cmd/.ps1 launcher as a check, but execute the pinned entry directly"): its grant records
+the pin's entry, resolved inside the pinned tree, and a launch executes those files. With
+no entry in the pin the grant is still issued and every launch is ``pin_entry_unset``.
 
 ``launch_plan(grant, argv, env)`` authenticates the grant, checks argv and the spawn
 size, re-verifies the binary, and returns a ``LaunchPlan``. Every use of a plan
 (``plan.exec_argv()``) authenticates and re-verifies again: a full re-hash, never a
 stat key, so a same-size rewrite with the mtime restored is still ``binary_changed``.
+``exec_argv()`` returns the granted realpath followed by ``argv[1:]``; for a pinned Windows
+``.cmd``/``.ps1`` launcher it returns the entry realpaths instead, never the launcher. No
+shell or PowerShell is named anywhere, and the launcher's environment is not reproduced.
 
 Limit: same-process code can read the MAC key; the real boundary is the core's
 process and IPC edge. The MAC stops forged or edited grant objects reaching a plan.
@@ -53,7 +60,7 @@ _GRANT_KEY = secrets.token_bytes(32)
 class Grant:
     engine: str
     path: str  # the path granted (a PATH hit or a configured path)
-    realpath: str  # what is executed
+    realpath: str  # what is executed, unless `entry` is (a pinned Windows .cmd/.ps1 launcher is only checked)
     sha256: str  # full 64-hex digest of realpath
     size: int
     version_raw: str  # first non-empty line of --version, as read
@@ -70,6 +77,9 @@ class Grant:
     pin_table: str = ""
     pin_target: str = ""  # realpath of the package root or binary
     pin_sha256: str = ""
+    # A pinned Windows .cmd/.ps1 launcher only: realpaths of the pin's entry, inside pin_target.
+    # They are what is executed; () means the pin records no entry and every launch is refused.
+    entry: tuple[str, ...] = ()
     mac: str = ""
 
     def record(self) -> dict[str, object]:
@@ -120,6 +130,11 @@ def _pinned_windows_launcher(spec: EngineSpec, path: str) -> bool:
     return name in spec.names and ext.lower() in PINNED_LAUNCHER_EXT
 
 
+def _check_only_launcher(g: Grant) -> bool:
+    """A grant on a pinned route's ``.cmd``/``.ps1`` launcher (issued on Windows only): checked, never executed."""
+    return bool(g.pin_kind) and os.path.splitext(g.path)[1].lower() in PINNED_LAUNCHER_EXT
+
+
 def grant(engine: str, path: str, *, timeout: float = PROBE_TIMEOUT_S, probe: Probe | None = None) -> Grant:
     """Pin one engine. Refuses with a typed code on every failure; never returns after one."""
     spec = spec_for(engine)
@@ -164,7 +179,7 @@ def grant(engine: str, path: str, *, timeout: float = PROBE_TIMEOUT_S, probe: Pr
         floor_functional=spec.functional, floor_security=spec.security,
         floor_table=floors.FLOOR_TABLE_VERSION, refusal_codes=REFUSAL_CODES_VERSION,
         probe_path=probe_path, probe_realpath=probe_real, probe_sha256=probe_digest,
-        pin_kind="", pin_table="", pin_target="", pin_sha256="",
+        pin_kind="", pin_table="", pin_target="", pin_sha256="", entry=(),
     )
     return Grant(mac=_mac(values), **values)
 
@@ -182,6 +197,12 @@ def _grant_pinned(spec: EngineSpec, path: str) -> Grant:
     if parsed is None:  # table bug: fail closed
         raise LaunchRefused("pin_mismatch", spec.engine, f"pin version {found.pin.version!r} does not parse")
     check_floors(spec, parsed)
+    entry: tuple[str, ...] = ()
+    if _pinned_windows_launcher(spec, path):  # the launcher is a check; the entry is what a launch executes
+        try:
+            entry = pins.resolve_entry(found.target, found.pin.entry)
+        except (OSError, ValueError) as e:
+            raise LaunchRefused("pin_mismatch", spec.engine, f"{e}; refused until re-pinned") from None
     values: dict[str, object] = dict(
         engine=spec.engine, path=path, realpath=real, sha256=digest, size=size,
         version_raw=found.pin.version, version=parsed.text, exit_code=0,
@@ -189,6 +210,7 @@ def _grant_pinned(spec: EngineSpec, path: str) -> Grant:
         floor_table=floors.FLOOR_TABLE_VERSION, refusal_codes=REFUSAL_CODES_VERSION,
         probe_path=path, probe_realpath=real, probe_sha256=digest,
         pin_kind=spec.pin, pin_table=pins.PIN_TABLE_VERSION, pin_target=found.target, pin_sha256=found.target_sha256,
+        entry=entry,
     )
     return Grant(mac=_mac(values), **values)
 
@@ -215,16 +237,22 @@ def authenticate(g: object) -> EngineSpec:
     check_floors(spec, parsed)  # re-checked at the trusted boundary
     if (spec.pin or "") != g.pin_kind:
         raise LaunchRefused("grant_forged", engine, "pin kind does not match the floor table")
+    if type(g.entry) is not tuple or not all(isinstance(e, str) for e in g.entry):
+        raise LaunchRefused("grant_forged", engine, "entry is not a tuple of paths")
     if spec.pin is not None:
         if g.pin_table != pins.PIN_TABLE_VERSION:
             raise LaunchRefused("grant_stale", engine, f"issued under {g.pin_table}; pin table is now {pins.PIN_TABLE_VERSION}")
-        if not pins.listed(engine, g.version_raw, g.sha256, g.pin_sha256):
-            raise LaunchRefused("pin_mismatch", engine, with_note(spec, "the grant's pin is no longer recorded; refused until re-pinned"))
+        if not pins.listed(engine, spec.pin, g.version_raw, g.sha256, g.pin_sha256):
+            raise LaunchRefused("pin_mismatch", engine, with_note(
+                spec,
+                "the grant's pin is no longer recorded, or is archive-derived (pins are measured from a real "
+                "install only) or has a bad entry; refused until re-pinned",
+            ))
     return spec
 
 
 def verify(g: Grant) -> None:
-    """Re-verify the pinned binary (and probe binary, package tree): resolution, then a full re-hash."""
+    """Re-verify the pinned binary (and probe binary, package tree, entry): resolution, then a full re-hash."""
     spec = spec_for(g.engine)
     pairs = [(g.path, g.realpath, g.sha256)]
     if g.probe_path != g.path:
@@ -247,6 +275,9 @@ def verify(g: Grant) -> None:
             raise LaunchRefused("binary_changed", spec.engine, f"{g.pin_target} unreadable: {e.__class__.__name__}") from None
         if digest != g.pin_sha256:
             raise LaunchRefused("binary_changed", spec.engine, f"{g.pin_target} digest differs from the grant")
+    for e in g.entry:  # the tree digest above covers their bytes; each must still be the same file inside it
+        if os.path.realpath(e) != e or not pins.inside(g.pin_target, e) or not os.path.isfile(e):
+            raise LaunchRefused("binary_changed", spec.engine, f"entry {e} now resolves elsewhere")
 
 
 def _spawn_bytes(spec: EngineSpec, argv: Sequence[str], env: Mapping[str, str]) -> int:
@@ -282,8 +313,13 @@ class LaunchPlan:
 
         A ``LaunchPlan`` built by hand (or with ``dataclasses.replace``) gets no pass: its argv and env
         meet the same argv[0], wrapper and size rules as ``launch_plan`` before anything is returned.
+
+        For a pinned Windows ``.cmd``/``.ps1`` launcher the result is ``[*entry, *argv[1:]]``: the
+        launcher was a check and is never in it (``pin_entry_unset`` when the grant has no entry).
         """
         self._recheck()
+        if _check_only_launcher(self.grant):
+            return [*self.grant.entry, *self.argv[1:]]
         return [self.grant.realpath, *self.argv[1:]]
 
     def exec_env(self) -> dict[str, str]:
@@ -325,5 +361,11 @@ def _checked_launch(g: object, argv: Sequence[str], env: dict[str, str]) -> int:
     if a0 not in spec.names:
         raise LaunchRefused("argv0_mismatch", spec.engine, f"argv[0] {a0!r} must be the bare engine name")
     size = _spawn_bytes(spec, argv, env)
+    if _check_only_launcher(g) and not g.entry:
+        raise LaunchRefused(
+            "pin_entry_unset", spec.engine,
+            "pinned Windows .cmd/.ps1 launcher accepted as a check, but the pin records no entry to execute; "
+            "refused until the entry is measured",
+        )
     verify(g)
     return size

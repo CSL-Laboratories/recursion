@@ -58,7 +58,7 @@ EXPECTED_CODES = {
     "engine_unknown", "path_not_absolute", "binary_missing", "wrapper_refused", "name_mismatch",
     "version_probe_failed", "binary_changed", "engine_mismatch", "identity_mismatch", "identity_unverified", "version_unparsed", "floor_unset",
     "version_refused", "argv_empty", "argv0_mismatch", "grant_forged", "grant_stale", "spawn_too_large",
-    "pin_mismatch",
+    "pin_mismatch", "pin_entry_unset",
 }
 needs_exec = unittest.skipUnless(os.name == "posix", "POSIX fixtures")
 
@@ -97,7 +97,8 @@ class RefusalCodeTests(Base):
     def test_closed_set_is_exactly_the_listed_codes(self) -> None:
         self.assertEqual(EXPECTED_CODES, set(REFUSAL_CODES))
         self.assertIsInstance(REFUSAL_CODES, frozenset)
-        self.assertEqual("r2a-refusals/1.5.0-candidate-2026-11-09", REFUSAL_CODES_VERSION)
+        self.assertEqual(20, len(REFUSAL_CODES))
+        self.assertEqual("r2a-refusals/1.6.0-candidate-2026-11-10", REFUSAL_CODES_VERSION)
         self.assertNotIn("sign_in_refused", REFUSAL_CODES)  # went with the Gemini CLI row
 
     def test_unknown_code_cannot_be_raised(self) -> None:

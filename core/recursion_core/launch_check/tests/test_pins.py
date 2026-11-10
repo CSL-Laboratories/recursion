@@ -6,6 +6,10 @@ and launcher match a pin; any mismatch is refused until re-pinned. Gemini CLI is
 engine here (his call of the same day: drop the row). Every install below is a fake built in a temp dir and measured there. No real
 engine is run and no pin in these tests is a real one.
 
+Lucas's owner calls of 2026-11-10 (csl-research PR #1159 comment 6777082374): "pins stay
+measured from a real install only for Nov 11; no archive-derived pins", and "accept a pinned
+.cmd/.ps1 launcher as a check, but execute the pinned entry directly".
+
 Run from the repository root:
 ``PYTHONPATH=core python3 -B -m unittest discover -s core/recursion_core/launch_check/tests -t core -v``.
 """
@@ -75,6 +79,7 @@ class Install:
     root: str  # absolute package root or binary
     version: str
     ran: str  # a file the launcher would create if anything ran it
+    entry: tuple[str, ...] = ()  # the pin's entry, relative to root
 
     @property
     def bindir(self) -> str:
@@ -83,7 +88,7 @@ class Install:
     def pin(self, version: str | None = None) -> Pin:
         return pins_mod.measure(
             self.engine, PINNED[self.engine], self.path, self.target, version=version or self.version,
-            platform="test", measured="2026-11-09", source="fake install built by test_pins.py",
+            platform="test", measured="2026-11-09", source="fake install built by test_pins.py", entry=self.entry,
         )
 
 
@@ -104,17 +109,29 @@ def pi_install() -> Install:
     return Install("pi", link, "..", pkg, "0.30.2", ran)
 
 
-def pi_windows_install(ext: str = ".cmd") -> Install:
-    """Pi's Windows installer shape: agent/bin/pi.cmd and pi.ps1 beside agent/install/releases/<v>."""
+WIN_ENTRY = ("node.exe", "dist/cli.js")
+
+
+def pi_windows_install(ext: str = ".cmd", entry: tuple[str, ...] = WIN_ENTRY) -> Install:
+    """Pi's Windows installer shape: agent/bin/pi.cmd and pi.ps1 beside agent/install/releases/<v>.
+
+    Unlike the real Pi, whose Node is on PATH, this fake tree holds its own ``node.exe`` so
+    the pin can carry an entry (``entry=()`` builds the pin without one).
+    """
     home = F.dir()
     ran = os.path.join(home, "ran")
     root = os.path.join(home, "agent", "install", "releases", "1.5.1")
     write(os.path.join(root, "dist", "cli.js"), "console.log(1);\n")
+    F.make("node.exe", "v22.0.0", where=root, dump=ran)
     write(os.path.join(root, "package.json"), '{"version": "1.5.1"}\n')
     bindir = os.path.join(home, "agent", "bin")
     write(os.path.join(bindir, "pi.cmd"), '@echo off\r\nnode "%~dp0..\\install\\releases\\1.5.1\\dist\\cli.js" %*\r\n', 0o755)
     write(os.path.join(bindir, "pi.ps1"), '& node "$PSScriptRoot\\..\\install\\releases\\1.5.1\\dist\\cli.js" @args\n', 0o755)
-    return Install("pi", os.path.join(bindir, "pi" + ext), "../install/releases/1.5.1", root, "1.5.1", ran)
+    return Install("pi", os.path.join(bindir, "pi" + ext), "../install/releases/1.5.1", root, "1.5.1", ran, entry)
+
+
+def entry_reals(inst: Install) -> list[str]:
+    return [os.path.realpath(os.path.join(inst.root, *e.split("/"))) for e in inst.entry]
 
 
 def flip_first_byte(path: str) -> None:
@@ -230,36 +247,60 @@ class PinTableTests(unittest.TestCase):
                 check_floors(FLOORS[p.engine], parsed)
                 datetime.date.fromisoformat(p.measured)
                 self.assertTrue(p.platform and p.source)
+                self.assertFalse(pins_mod.archive_sourced(p.source))
+                self.assertEqual((), p.entry)  # no entry has been measured
                 if p.target == "":
                     self.assertEqual("binary+launcher", PINNED[p.engine])
                     self.assertEqual(p.launcher_sha256, p.target_sha256)
         keys = [(p.engine, p.launcher_sha256, p.target, p.target_sha256) for p in PINS]
         self.assertEqual(len(keys), len(set(keys)))
 
-    def test_committed_antigravity_1_5_3_pin_has_the_measured_values(self) -> None:
-        # Verified fixture, measured 2026-11-09 on linux_amd64 with sha256sum; the 246 MB binary is not committed.
-        self.assertEqual("r2a-pins/1.3.0-candidate-2026-11-09", PIN_TABLE_VERSION)
-        agy = Pin(
-            engine="antigravity",
-            version="1.5.3",
-            launcher_sha256="7ca212748ca0dfda718efbc39a776a104472e7e9344d4b6ea147c543684f96a3",
-            launcher_bytes=246837648,
-            target="",
-            target_sha256="7ca212748ca0dfda718efbc39a776a104472e7e9344d4b6ea147c543684f96a3",
-            platform="linux_amd64",
-            measured="2026-11-09",
-            source="https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.3-6604829099950080/linux-x64/cli_linux_x64.tar.gz",
-        )
-        self.assertIn(agy, PINS)
-        self.assertEqual([agy], [p for p in PINS if p.engine == "antigravity"])
-        self.assertTrue(pins_mod.listed("antigravity", "1.5.3", "7ca212748ca0dfda718efbc39a776a104472e7e9344d4b6ea147c543684f96a3", "7ca212748ca0dfda718efbc39a776a104472e7e9344d4b6ea147c543684f96a3"))
-        self.assertFalse(pins_mod.listed("antigravity", "1.5.4", "7ca212748ca0dfda718efbc39a776a104472e7e9344d4b6ea147c543684f96a3", "7ca212748ca0dfda718efbc39a776a104472e7e9344d4b6ea147c543684f96a3"))
+    def test_committed_table_has_no_antigravity_pin_and_no_archive_source(self) -> None:
+        # Lucas, 2026-11-10: "pins stay measured from a real install only for Nov 11; no archive-derived pins".
+        # The 1.5.3 linux_amd64 row was hashed from the release archive, so it is gone until an installed agy is measured.
+        self.assertEqual("r2a-pins/1.4.0-candidate-2026-11-10", PIN_TABLE_VERSION)
+        self.assertFalse([p for p in PINS if p.engine == "antigravity"])
+        self.assertNotIn("antigravity", {r["engine"] for r in table_record()["pins"]})
+        self.assertTrue(PINS)
+        for p in PINS:
+            with self.subTest(engine=p.engine, source=p.source):
+                self.assertFalse(pins_mod.archive_sourced(p.source))
+        self.assertEqual("binary+launcher", FLOORS["antigravity"].pin)  # the route and its pin kind stay
+
+    def test_archive_sourced_reads_the_source_path(self) -> None:
+        base = "https://vendor.example/releases/1.2.3/cli_linux_x64"
+        for suffix in pins_mod.ARCHIVE_SUFFIXES:
+            for source in (base + suffix, base + suffix.upper(), base + suffix + "?alt=media", base + suffix + "#sha",
+                           base + suffix + "?a=1#b", "cli" + suffix, "C:\\Users\\x\\Downloads\\cli" + suffix):
+                with self.subTest(source=source):
+                    self.assertTrue(pins_mod.archive_sourced(source))
+        self.assertEqual(
+            {".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.bz2", ".tbz2", ".tar.zst", ".tar", ".zip", ".7z"},
+            set(pins_mod.ARCHIVE_SUFFIXES))
+        for source in ("https://cursor.com/install?win32=true", "https://pi.dev/install.ps1", "fake install built by test_pins.py",
+                       "installed agy on a linux_amd64 host", "https://vendor.example/install?file=cli.tar.gz",
+                       "https://vendor.example/install#cli.zip", "https://vendor.example/tar", ""):
+            with self.subTest(source=source):
+                self.assertFalse(pins_mod.archive_sourced(source))
+        self.assertTrue(pins_mod.archive_sourced(None))  # table bug: fail closed
+
+    def test_measure_refuses_an_archive_source_and_a_bad_entry(self) -> None:
+        inst = pi_windows_install()
+        kw = dict(version="1.5.1", platform="test", measured="2026-11-10")
+        self.assertEqual(WIN_ENTRY, inst.pin().entry)
+        for source, entry in (("https://vendor.example/pi.zip", ()), ("fake", ("../x.js",)), ("fake", ("dist/missing.js",)),
+                              ("fake", ("dist",))):
+            with self.subTest(source=source, entry=entry), self.assertRaises(ValueError):
+                pins_mod.measure("pi", "launcher+tree", inst.path, inst.target, source=source, entry=entry, **kw)
+        agy = agy_install()
+        with self.assertRaises(ValueError):
+            pins_mod.measure("antigravity", "binary+launcher", agy.path, "", source="fake", entry=("agy",), **kw)
 
     def test_committed_windows_amd64_cursor_and_pi_pins_have_the_measured_values(self) -> None:
         # Verified fixtures, measured 2026-11-09 on Lucas's Windows machine "sentry" (hasher at 66fe11b1);
         # the trees are not committed. Reachable on Windows through the pinned .cmd/.ps1 launcher rule.
-        self.assertEqual("r2a-pins/1.3.0-candidate-2026-11-09", PIN_TABLE_VERSION)
-        self.assertEqual("r2a-refusals/1.5.0-candidate-2026-11-09", REFUSAL_CODES_VERSION)
+        self.assertEqual("r2a-pins/1.4.0-candidate-2026-11-10", PIN_TABLE_VERSION)
+        self.assertEqual("r2a-refusals/1.6.0-candidate-2026-11-10", REFUSAL_CODES_VERSION)
         cursor = Pin(
             engine="cursor",
             version="2026.11.05-86047df",
@@ -301,21 +342,24 @@ class PinTableTests(unittest.TestCase):
         for pin, launcher, root, other_version in cells:
             with self.subTest(engine=pin.engine, launcher=launcher):
                 self.assertIn(pin, PINS)
-                self.assertTrue(pins_mod.listed(pin.engine, pin.version, pin.launcher_sha256, pin.target_sha256))
-                self.assertFalse(pins_mod.listed(pin.engine, other_version, pin.launcher_sha256, pin.target_sha256))
+                self.assertTrue(pins_mod.listed(pin.engine, "launcher+tree", pin.version, pin.launcher_sha256, pin.target_sha256))
+                self.assertFalse(pins_mod.listed(pin.engine, "launcher+tree", other_version, pin.launcher_sha256, pin.target_sha256))
+                # No entry has been measured, so a grant on this launcher would refuse pin_entry_unset at launch.
+                self.assertEqual((), pin.entry)
                 # The target is a plain relative path: no ValueError.
                 self.assertEqual(os.path.realpath(root), pins_mod.resolve_target(launcher, pin.target))
         self.assertTrue(pins_mod.listed(
-            "pi", "1.5.1", "3f422e96483162aad373b8e3e28f282236bdffb5cc1b8bfb6c25a8d918bd31d1",
+            "pi", "launcher+tree", "1.5.1", "3f422e96483162aad373b8e3e28f282236bdffb5cc1b8bfb6c25a8d918bd31d1",
             "2c477ce6abcd257434138b4affd6f9b12b92ec2527bc8eb50f04948a25323ac7"))
         self.assertFalse(pins_mod.listed(
-            "pi", "1.5.2", "3f422e96483162aad373b8e3e28f282236bdffb5cc1b8bfb6c25a8d918bd31d1",
+            "pi", "launcher+tree", "1.5.2", "3f422e96483162aad373b8e3e28f282236bdffb5cc1b8bfb6c25a8d918bd31d1",
             "2c477ce6abcd257434138b4affd6f9b12b92ec2527bc8eb50f04948a25323ac7"))
         self.assertEqual([cursor], [p for p in PINS if p.engine == "cursor"])
         # Pi has exactly the two windows_amd64 launchers, pi.cmd then pi.ps1, over one tree.
         self.assertEqual([pi, pi_ps1], [p for p in PINS if p.engine == "pi"])
         self.assertEqual((pi.target, pi.target_sha256, pi.platform), (pi_ps1.target, pi_ps1.target_sha256, pi_ps1.platform))
-        self.assertEqual({"antigravity", "cursor", "pi"}, {p.engine for p in PINS})
+        self.assertEqual({"cursor", "pi"}, {p.engine for p in PINS})
+        self.assertEqual(3, len(PINS))
         # Hermes was measured on Windows for its launchers only; no tree hash exists, so no pin.
         self.assertFalse([p for p in PINS if p.engine == "hermes"])
 
@@ -520,6 +564,61 @@ class PinnedGrantTests(Base):
         with table(pin):
             self.assertIn("not a file, directory or link", self.refused("pin_mismatch", self.g, inst).detail)
 
+    def test_archive_sourced_pin_is_never_matched(self) -> None:
+        # Lucas, 2026-11-10: "pins stay measured from a real install only for Nov 11; no archive-derived pins".
+        sources = ("https://vendor.example/cli/1.5.3/linux-x64/cli_linux_x64.tar.gz",
+                   "https://vendor.example/cli/CLI.ZIP?alt=media#frag")
+        for name, build in BUILDERS.items():
+            for source in sources:
+                with self.subTest(install=name, source=source):
+                    inst = build()
+                    good = inst.pin()  # a perfect match for this install
+                    archive = dataclasses.replace(good, source=source)
+                    argv = [FLOORS[inst.engine].names[0]]
+                    with table(archive):
+                        r = self.refused("pin_mismatch", self.g, inst)
+                        self.assertIn("archive-derived pins are never matched", r.detail)
+                        self.assertIn("real install only", r.detail)
+                    with table(good):
+                        g = self.g(inst)
+                        plan = launch_plan(g, argv)
+                        self.assertEqual([g.realpath], plan.exec_argv())
+                    with table(archive):  # an existing grant re-checks the table on every use
+                        for use in (plan.exec_argv, plan.exec_env):
+                            self.assertIn("archive-derived", self.refused("pin_mismatch", use).detail)
+                        self.refused("pin_mismatch", launch_plan, g, argv)
+                    with table(archive, good):  # the measured pin beside it still matches
+                        self.assertEqual(g, self.g(inst))
+                        self.assertEqual([g.realpath], plan.exec_argv())
+                    self.assertFalse(os.path.exists(inst.ran))
+
+    def test_non_windows_launcher_tree_grant_ignores_the_entry_and_execs_the_realpath(self) -> None:
+        inst = dataclasses.replace(pi_install(), entry=("dist/cli.js",))
+        self.assertFalse(binary_mod.is_windows())
+        with table(inst.pin()):
+            g = self.g(inst)
+            self.assertEqual((), g.entry)
+            plan = launch_plan(g, ["pi", "-p", "hi"])
+            self.assertEqual([g.realpath, "-p", "hi"], plan.exec_argv())
+        with windows(), table(inst.pin()):  # a bare-name launcher on Windows: unchanged too
+            g = self.g(inst)
+            self.assertEqual((), g.entry)
+            self.assertEqual([g.realpath, "-p", "hi"], launch_plan(g, ["pi", "-p", "hi"]).exec_argv())
+
+    def test_entry_on_a_binary_launcher_pin_is_a_table_bug(self) -> None:
+        for build in (agy_install, agy_launcher_install):
+            inst = build()
+            good = inst.pin()
+            bad = dataclasses.replace(good, entry=("agy",))
+            with self.subTest(install=build.__name__):
+                with table(bad):
+                    r = self.refused("pin_mismatch", self.g, inst)
+                    self.assertIn("only a launcher+tree pin can carry one", r.detail)
+                with table(good):
+                    plan = launch_plan(self.g(inst), ["agy"])
+                with table(bad):
+                    self.refused("pin_mismatch", plan.exec_argv)
+
 
 @unittest.skipUnless(os.name == "posix", "POSIX fixtures")
 class PinnedReverifyTests(Base):
@@ -669,8 +768,18 @@ class WindowsPinnedLauncherTests(Base):
                     self.assertEqual(pin.target_sha256, g.pin_sha256)
                     self.assertEqual((inst.path, pin.launcher_sha256), (g.path, g.sha256))
                     self.assertTrue(g.record()["beta"])
+                    # Lucas, 2026-11-10: "accept a pinned .cmd/.ps1 launcher as a check, but execute the
+                    # pinned entry directly". The launcher is hashed and is never in the exec argv.
+                    self.assertEqual(tuple(entry_reals(inst)), g.entry)
+                    self.assertEqual(g.entry, g.record()["entry"])
                     plan = launch_plan(g, ["pi", "-p", "hi"], {})
-                    self.assertEqual([os.path.realpath(inst.path), "-p", "hi"], plan.exec_argv())
+                    for _ in range(3):
+                        out = plan.exec_argv()
+                        self.assertEqual([*entry_reals(inst), "-p", "hi"], out)
+                        self.assertNotIn(g.realpath, out)
+                        self.assertNotIn(inst.path, out)
+                        self.assertFalse([a for a in out if a.lower().endswith((".cmd", ".ps1"))])
+                    self.assertEqual({}, plan.exec_env())  # no environment is set for the entry
                     # argv[0] is still the bare engine name, never the launcher's name.
                     self.refused("wrapper_refused", launch_plan, g, ["pi" + ext])
                 self.assertFalse(os.path.exists(inst.ran))
@@ -777,7 +886,7 @@ class WindowsPinnedLauncherTests(Base):
                     self.refused("binary_changed", launch_plan, g, ["pi"], {})
                     self.refused("binary_changed", plan.exec_argv)
                     flip_first_byte(inst.path)
-                    self.assertEqual([g.realpath], plan.exec_argv())
+                    self.assertEqual(entry_reals(inst), plan.exec_argv())
 
     def test_tampered_tree_byte_is_refused(self) -> None:
         for ext in self.EXTS:
@@ -824,6 +933,147 @@ class WindowsPinnedLauncherTests(Base):
             # A pinned route's launcher name belongs to that route only.
             self.refused("wrapper_refused", grant, "hermes", inst.path, probe=self.never_probe)
             self.refused("wrapper_refused", grant, "claude_code", inst.path, probe=self.never_probe)
+
+
+@unittest.skipUnless(os.name == "posix", "POSIX fixtures")
+class WindowsPinnedEntryTests(Base):
+    """Lucas, 2026-11-10: "accept a pinned .cmd/.ps1 launcher as a check, but execute the pinned entry directly".
+
+    Windows is simulated through ``binary.is_windows()``; no test here runs on real Windows.
+    """
+
+    EXTS = (".cmd", ".ps1")
+
+    def test_no_entry_in_the_pin_is_granted_and_refused_at_launch(self) -> None:
+        for ext in self.EXTS:
+            with self.subTest(ext=ext):
+                inst = pi_windows_install(ext, entry=())
+                with_entry = dataclasses.replace(inst, entry=WIN_ENTRY)
+                with windows(), table(inst.pin()):
+                    g = self.g(inst)  # the launcher check passed
+                    self.assertEqual((), g.entry)
+                    self.assertEqual("launcher+tree", g.pin_kind)
+                    self.assertTrue(g.record()["beta"])
+                    r = self.refused("pin_entry_unset", launch_plan, g, ["pi", "-p", "hi"], {})
+                    self.assertIn("accepted as a check, but the pin records no entry to execute", r.detail)
+                    self.assertIn("refused until the entry is measured", r.detail)
+                    hand = grant_mod.LaunchPlan(g, ("pi",), (), 3)
+                    self.refused("pin_entry_unset", hand.exec_argv)
+                    self.refused("pin_entry_unset", hand.exec_env)
+                    # argv[0] rules still come first.
+                    self.refused("wrapper_refused", launch_plan, g, ["pi" + ext])
+                    self.refused("argv_empty", launch_plan, g, [])
+                with windows(), table(with_entry.pin()):
+                    good = launch_plan(self.g(with_entry), ["pi"], {})
+                    self.assertEqual(entry_reals(with_entry), good.exec_argv())
+                    swapped = dataclasses.replace(good, grant=g)
+                    self.refused("pin_entry_unset", swapped.exec_argv)
+                    self.refused("pin_entry_unset", swapped.exec_env)
+                # The grant decides, not the platform switch at the time of use.
+                with table(inst.pin()):
+                    self.refused("pin_entry_unset", hand.exec_argv)
+                self.assertFalse(os.path.exists(inst.ran))
+
+    def test_entry_file_changed_after_the_grant_is_binary_changed(self) -> None:
+        for ext in self.EXTS:
+            for item in WIN_ENTRY:
+                with self.subTest(ext=ext, item=item):
+                    inst = pi_windows_install(ext)
+                    victim = os.path.join(inst.root, *item.split("/"))
+                    with windows(), table(inst.pin()):
+                        g = self.g(inst)
+                        plan = launch_plan(g, ["pi"], {})
+                        flip_first_byte(victim)
+                        r = self.refused("binary_changed", plan.exec_argv)
+                        self.assertIn("digest differs from the grant", r.detail)  # the tree digest covers the entry
+                        self.refused("binary_changed", launch_plan, g, ["pi"], {})
+                        flip_first_byte(victim)
+                        self.assertEqual(entry_reals(inst), plan.exec_argv())
+
+    def test_entry_replaced_by_a_link_outside_the_tree_is_refused(self) -> None:
+        inst = pi_windows_install(".ps1")
+        outside = write(os.path.join(F.dir(), "evil.js"), "console.log(1);\n")  # the same bytes as dist/cli.js
+        cli = os.path.join(inst.root, "dist", "cli.js")
+        with windows(), table(inst.pin()):
+            g = self.g(inst)
+            plan = launch_plan(g, ["pi"], {})
+            os.unlink(cli)
+            os.symlink(outside, cli)
+            self.refused("binary_changed", plan.exec_argv)  # the tree digest: a file became a link
+            # Were the tree digest ever to miss it, the entry no longer resolves to the granted file.
+            with mock.patch.object(pins_mod, "target_sha256", return_value=g.pin_sha256):
+                r = self.refused("binary_changed", plan.exec_argv)
+                self.assertIn("now resolves elsewhere", r.detail)
+                self.refused("binary_changed", launch_plan, g, ["pi"], {})
+                os.unlink(cli)  # gone
+                self.assertIn("now resolves elsewhere", self.refused("binary_changed", plan.exec_argv).detail)
+                os.mkdir(cli)  # not a regular file
+                self.assertIn("now resolves elsewhere", self.refused("binary_changed", plan.exec_argv).detail)
+
+    def test_entry_must_be_a_regular_file_inside_the_tree_at_grant_time(self) -> None:
+        inst = pi_windows_install(".cmd", entry=())
+        outside = write(os.path.join(F.dir(), "evil.js"), "x\n")
+        os.symlink(outside, os.path.join(inst.root, "dist", "out.js"))  # in the tree, pinned by its text
+        os.symlink("cli.js", os.path.join(inst.root, "dist", "alias.js"))
+        pin = inst.pin()
+        with windows():
+            for entry in (("node.exe", "dist/missing.js"), ("dist",), ("node.exe", "dist/out.js"), ("dist/cli.js/x",)):
+                with self.subTest(entry=entry), table(dataclasses.replace(pin, entry=entry)):
+                    r = self.refused("pin_mismatch", self.g, inst)
+                    self.assertIn("is not a regular file inside the pinned tree", r.detail)
+            # A link that stays inside the tree resolves to the file it names; `..` inside the root is fine.
+            for entry in (("node.exe", "dist/alias.js"), ("dist/../node.exe", "dist/cli.js")):
+                with self.subTest(entry=entry), table(dataclasses.replace(pin, entry=entry)):
+                    g = self.g(inst)
+                    self.assertEqual(tuple(entry_reals(dataclasses.replace(inst, entry=WIN_ENTRY))), g.entry)
+                    self.assertEqual([*g.entry, "-p"], launch_plan(g, ["pi", "-p"], {}).exec_argv())
+
+    def test_bad_entry_in_the_table_is_pin_mismatch(self) -> None:
+        inst = pi_windows_install(".cmd")
+        pin = inst.pin()
+        write(os.path.join(os.path.dirname(inst.root), "outside.js"), "x\n")
+        bad = (("../outside.js",), ("node.exe", "dist/../../outside.js"), ("/etc/passwd",), ("node.exe", ""), ("",),
+               ("./node.exe",), ("dist//cli.js",), ("dist\\cli.js",), ("C:/node.exe",), (os.path.join(inst.root, "node.exe"),),
+               "node.exe", ["node.exe", "dist/cli.js"], (1,), (None,), None)
+        with windows():
+            with table(pin):
+                g = self.g(inst)
+                plan = launch_plan(g, ["pi"], {})
+            for entry in bad:
+                with self.subTest(entry=entry), table(dataclasses.replace(pin, entry=entry)):
+                    self.refused("pin_mismatch", self.g, inst)
+                    self.refused("pin_mismatch", plan.exec_argv)  # wherever the table is consulted
+                    self.refused("pin_mismatch", launch_plan, g, ["pi"], {})
+        # The same table bug refuses off Windows and on a bare-name launcher, where no entry is used.
+        posix = pi_install()
+        for entry in (("../outside.js",), ("/etc/passwd",), "dist/cli.js"):
+            with self.subTest(entry=entry), table(dataclasses.replace(posix.pin(), entry=entry)):
+                self.refused("pin_mismatch", self.g, posix)
+
+    def test_edited_entry_field_is_forged(self) -> None:
+        inst = pi_windows_install(".ps1")
+        bare = pi_windows_install(".ps1", entry=())
+        with windows(), table(inst.pin(), bare.pin()):
+            g = self.g(inst)
+            node, cli = g.entry
+            for entry in ((cli,), (), (node, os.path.join(inst.root, "package.json")), ("/bin/sh", cli), (cli, node),
+                          g.realpath, [node, cli], (node, 1)):
+                with self.subTest(entry=entry):
+                    fake = dataclasses.replace(g, entry=entry)
+                    self.refused("grant_forged", launch_plan, fake, ["pi"], {})
+                    self.refused("grant_forged", grant_mod.LaunchPlan(fake, ("pi",), (), 3).exec_argv)
+            # A grant with no entry cannot be given one.
+            n = self.g(bare)
+            self.refused("grant_forged", launch_plan, dataclasses.replace(n, entry=("/bin/sh",)), ["pi"], {})
+            self.refused("pin_entry_unset", launch_plan, n, ["pi"], {})
+            self.assertEqual([node, cli], launch_plan(g, ["pi"], {}).exec_argv())
+
+    def test_pin_entry_unset_is_a_listed_code(self) -> None:
+        self.assertIn("pin_entry_unset", REFUSAL_CODES)
+        self.assertEqual(20, len(REFUSAL_CODES))
+        self.assertEqual("r2a-refusals/1.6.0-candidate-2026-11-10", REFUSAL_CODES_VERSION)
+        self.assertIn("entry", [f.name for f in dataclasses.fields(Grant)])
+        self.assertEqual((), {f.name: f for f in dataclasses.fields(Pin)}["entry"].default)
 
 
 @unittest.skipUnless(os.name == "posix", "POSIX fixtures")

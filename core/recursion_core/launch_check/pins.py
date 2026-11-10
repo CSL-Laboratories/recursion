@@ -7,6 +7,11 @@ when its binary and its launcher match a pin. Any mismatch is refused (``pin_mis
 until someone re-pins. A pin is measured from a real install and committed on its own;
 no hash here is invented, and an engine with no pin recorded is refused.
 
+Lucas's owner call of 2026-11-10 (csl-research PR #1159, call 6): "pins stay measured from
+a real install only for Nov 11; no archive-derived pins". A pin whose ``source`` names a
+vendor archive (``archive_sourced``) is never matched: ``pin_mismatch``. An archive may be
+recorded as a cross-check of a measured pin, never as its source.
+
 Two pin kinds (``EngineSpec.pin``):
 
 * ``launcher+tree``: the SHA-256 of the launcher (the file the engine name resolves to)
@@ -18,6 +23,13 @@ Two pin kinds (``EngineSpec.pin``):
 ``Pin.target`` is a relative path from the launcher's directory to the package root or
 the binary: empty (the launcher itself), ``.`` or ``/``-separated names and ``..``.
 Nothing is executed here: the version comes from the pin, never from running a wrapper.
+
+``Pin.entry`` (``launcher+tree`` only) is the program the launcher would reach, as argv
+items: relative ``/``-separated paths inside the package root. Lucas's owner call of
+2026-11-10 (calls 13/14): "accept a pinned .cmd/.ps1 launcher as a check, but execute the
+pinned entry directly". A Windows ``.cmd``/``.ps1`` launcher is hashed and never executed;
+what is executed is the entry (``grant.LaunchPlan.exec_argv``). Empty means not measured,
+and such a launcher's grant refuses at launch (``pin_entry_unset``).
 
 Limits: the interpreter a launcher names (``node``, ``python``) is not pinned unless it
 sits inside the pinned tree; a symlink inside the tree is pinned by its text, not by the
@@ -35,13 +47,17 @@ from recursion_core.launch_check.binary import file_kind, sha256_file
 from recursion_core.launch_check.refusals import LaunchRefused
 
 # A pin added, removed or changed is a new PIN_TABLE_VERSION; grants under another are grant_stale.
-PIN_TABLE_VERSION = "r2a-pins/1.3.0-candidate-2026-11-09"
+# 1.4.0: the Antigravity CLI 1.5.3 linux_amd64 pin is removed (it was hashed from the release
+# archive, not from an installed agy); archive-sourced pins are never matched; Pin gains `entry`.
+PIN_TABLE_VERSION = "r2a-pins/1.4.0-candidate-2026-11-10"
 
 KINDS = ("launcher+tree", "binary+launcher")
 _WHAT = {"launcher+tree": "installed package files", "binary+launcher": "binary"}
 TREE_FORMAT = b"r2a-tree/1\0"
 MAX_TREE_ENTRIES = 100_000
 MAX_TREE_BYTES = 4 * 1024**3
+# A pin source whose path ends in one of these names a vendor archive, not a real install.
+ARCHIVE_SUFFIXES = (".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.bz2", ".tbz2", ".tar.zst", ".tar", ".zip", ".7z")
 
 
 @dataclass(frozen=True)
@@ -54,7 +70,10 @@ class Pin:
     target_sha256: str  # tree_sha256 (launcher+tree) or the binary's SHA-256 (binary+launcher)
     platform: str  # where it was measured, e.g. linux_amd64
     measured: str  # YYYY-MM-DD
-    source: str  # where the measured files came from
+    source: str  # where the measured files came from: a real install, never a vendor archive
+    # launcher+tree only: the program the launcher reaches, as argv items relative to `target`
+    # (an interpreter and a script inside the tree, say). () is not measured.
+    entry: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -65,21 +84,11 @@ class Match:
 
 
 # Measured pins only. An engine with no pin here is refused (pin_mismatch).
+# Lucas, 2026-11-10 (csl-research PR #1159 comment 6777082374): "pins stay measured from a real
+# install only for Nov 11; no archive-derived pins". Antigravity CLI has no pin: its 1.5.3
+# linux_amd64 row was hashed from the release archive and is removed until someone measures an
+# installed agy. No committed pin has a measured entry, so every entry is ().
 PINS: tuple[Pin, ...] = (
-    # Antigravity CLI 1.5.3, linux_amd64: the `antigravity` member of the release archive,
-    # which Google's installer copies to `agy`. The engine name resolves straight to the
-    # binary, so launcher and binary are one file. Version from manifest_linux_amd64.json.
-    Pin(
-        engine="antigravity",
-        version="1.5.3",
-        launcher_sha256="7ca212748ca0dfda718efbc39a776a104472e7e9344d4b6ea147c543684f96a3",
-        launcher_bytes=246837648,
-        target="",
-        target_sha256="7ca212748ca0dfda718efbc39a776a104472e7e9344d4b6ea147c543684f96a3",
-        platform="linux_amd64",
-        measured="2026-11-09",
-        source="https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.3-6604829099950080/linux-x64/cli_linux_x64.tar.gz",
-    ),
     # The windows_amd64 pins below were measured on Lucas's Windows machine "sentry" with the
     # hasher at commit 66fe11b1. They are reachable on Windows through the .cmd/.ps1 rule
     # (Lucas's owner call of 2026-11-09): detect.path_hits tries "", .exe, .cmd, .ps1 for a
@@ -182,6 +191,43 @@ def resolve_target(launcher_real: str, target: str) -> str:
     return os.path.realpath(os.path.join(os.path.dirname(launcher_real), *parts))
 
 
+def archive_sourced(source: object) -> bool:
+    """True if a pin's ``source`` names a vendor archive: its path, less query and fragment, has an archive suffix."""
+    if not isinstance(source, str):  # table bug: fail closed
+        return True
+    path = source.split("#", 1)[0].split("?", 1)[0]
+    return path.strip().rstrip("/").lower().endswith(ARCHIVE_SUFFIXES)
+
+
+def check_entry(kind: str, entry: object) -> None:
+    """``ValueError`` unless ``entry`` is a tuple of plain relative paths that stay inside the package root."""
+    if type(entry) is not tuple:
+        raise ValueError("pin entry is not a tuple")
+    if entry and kind != "launcher+tree":
+        raise ValueError(f"pin entry on a {kind} pin: only a launcher+tree pin can carry one")
+    for item in entry:
+        depth = 0
+        for p in item.split("/") if isinstance(item, str) else [""]:
+            depth += -1 if p == ".." else 1
+            if p in ("", ".") or "\\" in p or ":" in p or depth < 0:
+                raise ValueError(f"pin entry {item!r} is not a plain relative path inside the package root")
+
+
+def inside(root_real: str, real: str) -> bool:
+    return real.startswith(root_real.rstrip(os.sep) + os.sep)
+
+
+def resolve_entry(root_real: str, entry: tuple[str, ...]) -> tuple[str, ...]:
+    """Absolute realpaths of a pin's entry items. ``ValueError`` unless each is a regular file inside the package root."""
+    out = []
+    for item in entry:
+        real = os.path.realpath(os.path.join(root_real, *item.split("/")))
+        if not inside(root_real, real) or not os.path.isfile(real):
+            raise ValueError(f"pin entry {item!r} is not a regular file inside the pinned tree")
+        out.append(real)
+    return tuple(out)
+
+
 def target_sha256(kind: str, target_real: str) -> str:
     """Digest of a resolved target: the tree, or the native binary. ``OSError`` or ``ValueError`` on failure."""
     if kind == "launcher+tree":
@@ -203,10 +249,25 @@ def launcher_listed(engine: str, launcher_sha256: str) -> bool:
     return any(p.launcher_sha256 == launcher_sha256 for p in _for(engine))
 
 
-def listed(engine: str, version: str, launcher_sha256: str, digest: str) -> bool:
-    """True if the table holds exactly this pin (re-checked on every grant use)."""
+def _unusable(p: Pin, kind: str) -> str:
+    """Why a pin is never matched, or "": an archive-derived source, or a bad entry (table bug)."""
+    if archive_sourced(p.source):
+        return (
+            f"its source {p.source!r} is a vendor archive: archive-derived pins are never matched "
+            "(pins are measured from a real install only)"
+        )
+    try:
+        check_entry(kind, p.entry)
+    except ValueError as e:
+        return str(e)
+    return ""
+
+
+def listed(engine: str, kind: str, version: str, launcher_sha256: str, digest: str) -> bool:
+    """True if the table holds exactly this pin and it can be matched (re-checked on every grant use)."""
     return any(
-        (p.version, p.launcher_sha256, p.target_sha256) == (version, launcher_sha256, digest) for p in _for(engine)
+        (p.version, p.launcher_sha256, p.target_sha256) == (version, launcher_sha256, digest) and not _unusable(p, kind)
+        for p in _for(engine)
     )
 
 
@@ -228,6 +289,9 @@ def match(engine: str, kind: str, launcher_real: str, launcher_sha256: str, note
     seen: dict[str, str] = {}
     why = ""
     for p in near:
+        why = _unusable(p, kind)
+        if why:
+            continue
         try:
             real = resolve_target(launcher_real, p.target)
             if real not in seen:
@@ -247,21 +311,28 @@ def match(engine: str, kind: str, launcher_real: str, launcher_sha256: str, note
 
 
 def measure(
-    engine: str, kind: str, path: str, target: str, *, version: str, platform: str, measured: str, source: str
+    engine: str, kind: str, path: str, target: str, *, version: str, platform: str, measured: str, source: str,
+    entry: tuple[str, ...] = (),
 ) -> Pin:
     """Measure an install on disk into a ``Pin`` (for re-pinning and tests). Nothing is executed.
 
     ``version`` is supplied by whoever measures (release manifest, package metadata or a
-    version read by hand); ``source`` says where the files and the version came from.
+    version read by hand); ``source`` says where the files and the version came from: the
+    real install, never a vendor archive. ``entry`` is what the launcher was read to start.
     """
     if kind not in KINDS:
         raise ValueError(f"unknown pin kind {kind!r}")
+    if archive_sourced(source):
+        raise ValueError(f"pin source {source!r} is a vendor archive; measure a real install")
+    check_entry(kind, entry)
     real = os.path.realpath(path)
     digest, size = sha256_file(real)
+    root = resolve_target(real, target)
+    resolve_entry(root, entry)
     return Pin(
         engine=engine, version=version, launcher_sha256=digest, launcher_bytes=size, target=target,
-        target_sha256=target_sha256(kind, resolve_target(real, target)),
-        platform=platform, measured=measured, source=source,
+        target_sha256=target_sha256(kind, root),
+        platform=platform, measured=measured, source=source, entry=entry,
     )
 
 

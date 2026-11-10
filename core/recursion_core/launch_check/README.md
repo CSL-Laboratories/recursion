@@ -50,12 +50,17 @@ window between `exec_argv()` and the exec itself is still open (CX-1402, see Lim
   re-pinned) and the pinned version must meet the floors (`version_refused`). Nothing is
   run. A Windows `.cmd` or `.ps1` launcher is granted the same way and only this way: its
   SHA-256 must be a recorded launcher pin for that engine and the pinned tree must match,
-  otherwise `pin_mismatch`. See [Pinned routes](#pinned-routes).
+  otherwise `pin_mismatch`. That launcher is a check only and is never executed: the grant
+  records the pin's `entry` (each item a regular file inside the pinned tree, else
+  `pin_mismatch`), and the grant is still issued when the pin has no entry. A pin whose
+  `source` is a vendor archive, or whose `entry` is malformed, is never matched
+  (`pin_mismatch`). See [Pinned routes](#pinned-routes).
 - The grant record holds engine, path, realpath, sha256 (64 hex), size, raw version line,
   exit code, parsed version, both floors, a `beta` tag when the functional floor is
   unset, the floor-table version and the refusal-code version;
   for a pinned route also the pin kind, pin-table version, and the matched target and its
-  digest. The grant is a frozen dataclass whose fields are MACed (HMAC-SHA-256) with a
+  digest; for a pinned Windows `.cmd`/`.ps1` launcher also `entry`, the realpaths of the
+  pin's entry items. The grant is a frozen dataclass whose fields are MACed (HMAC-SHA-256) with a
   per-process key; `launch_plan` refuses anything else (`grant_forged`) and any grant issued
   under another table or code version (`grant_stale`), and re-checks the floors.
 - `launch_plan(grant, argv, env)`: `argv` non-empty (`argv_empty`); `argv[0]` is the bare
@@ -64,7 +69,9 @@ window between `exec_argv()` and the exec itself is still open (CX-1402, see Lim
   `.sh` and others: `wrapper_refused`; this holds for a grant issued on a `.cmd` or `.ps1`
   launcher too, whose `argv[0]` is still the bare engine name); argv plus env under the byte caps, NUL-free text
   (`spawn_too_large`: 128 KiB per item, 256 KiB total). `env` is the child environment
-  already built by the child-env boundary (recursion #320), not `os.environ`.
+  already built by the child-env boundary (recursion #320), not `os.environ`. A grant on a
+  pinned Windows `.cmd`/`.ps1` launcher whose pin records no entry is then refused
+  (`pin_entry_unset`), here and on every plan use.
 - `LaunchPlan.exec_argv()` authenticates and re-verifies on **every use** (C1-37): the
   path must still resolve to the pinned realpath and the whole file is re-hashed. A binary
   swapped behind an unchanged symlink shim, a retargeted link, or a same-size rewrite with
@@ -72,15 +79,21 @@ window between `exec_argv()` and the exec itself is still open (CX-1402, see Lim
   For a pinned route the package tree or binary is re-hashed too, and the pin must still
   be recorded.
   It returns `[realpath, *argv[1:]]`; spawning stays with the child-env launch boundary.
+  For a pinned Windows `.cmd`/`.ps1` launcher it returns `[*entry, *argv[1:]]` instead,
+  never the launcher's path: the launcher digest and the tree digest (which covers the
+  entry files' bytes) are re-checked as above, and each entry path must still resolve to
+  the same file inside the tree (`binary_changed`).
 - `launch_check(path_string)`: one pass over all eight engines; one record each
   (`granted`, `refused` with code, or `absent`). Grants are returned apart from records.
 
 Every failure is a `LaunchRefused` with a code from the closed set `REFUSAL_CODES`
-(`r2a-refusals/1.5.0-candidate-2026-11-09`, 19 codes; 1.5.0 is the same 19 codes as 1.4.0
-and moves a Windows `.cmd`/`.ps1` launcher on a pinned route from `wrapper_refused` to the
-pin check, so it is `pin_mismatch` unless pinned; 1.4.0 removed `sign_in_refused`,
-which only the dropped Gemini CLI row raised). No path returns a grant or plan
-after an error.
+(`r2a-refusals/1.6.0-candidate-2026-11-10`, 20 codes; 1.6.0 adds `pin_entry_unset`: a
+pinned Windows `.cmd`/`.ps1` launcher was accepted as a check, but its pin records no entry
+to execute, so the launch is refused until the entry is measured; 1.5.0 was the same 19
+codes as 1.4.0 and moved a Windows `.cmd`/`.ps1` launcher on a pinned route from
+`wrapper_refused` to the pin check, so it is `pin_mismatch` unless pinned; 1.4.0 removed
+`sign_in_refused`, which only the dropped Gemini CLI row raised). No path returns a grant
+or plan after an error.
 
 ### Zero-egress version probe
 
@@ -123,7 +136,7 @@ table. Whether grok needs a pinned digest or is accepted as is, is open for Luca
 | codex (`codex`) | semver | unset (beta until measured) | 0.131.0 (A-35, 11.6; security floor only) | none measured |
 | opencode (`opencode`, `opencode2`) | semver | unset | 1.18.33 (D2-72) | none measured |
 | grok (`grok`) | semver | unset (O50: once measured) | none | none measured |
-| antigravity (`agy`): Antigravity CLI, the Google subscription route; pinned beta route (`binary+launcher`) | semver | unset | none | none measured |
+| antigravity (`agy`): Antigravity CLI, the Google subscription route; pinned beta route (`binary+launcher`; no pin recorded, so refused) | semver | unset | none | none measured |
 | cursor (`agent`, `cursor-agent`): pinned beta route (`launcher+tree`) | date | unset | 2025.09.17-25b418f (D2-72) | none measured |
 | pi (`pi`): pinned beta route (`launcher+tree`) | semver (assumed) | unset | none | none measured |
 | hermes (`hermes`): pinned beta route (`launcher+tree`) | semver (assumed) | unset | none | none measured |
@@ -176,7 +189,9 @@ for Lucas.
 
 ## Pinned routes
 
-Pin table `r2a-pins/1.3.0-candidate-2026-11-09`. Lucas's owner call of 2026-11-09 (item 2),
+Pin table `r2a-pins/1.4.0-candidate-2026-11-10` (1.4.0 removes the archive-derived
+Antigravity CLI row and adds the optional `entry` field; no other pin changed from 1.3.0).
+Lucas's owner call of 2026-11-09 (item 2),
 with the same rules as the route layer on #321 (`wrapper_pin.py` at `38f41d3b`). Pi, Hermes and Cursor are wrapper installs (JS
 bundles under node, a Python entry point; 11.6, #1087 section 6.2) and Antigravity CLI is
 one Go binary. These four are granted only when the install on disk matches a pin in
@@ -203,12 +218,36 @@ re-pins.
 - A native file that only has the right name and prints a good version line is not a pin:
   `agent`, `agy`, `hermes` and `pi` are `pin_mismatch` unless a pin matches. The
   `hermes-acp` version read is no longer used by any row.
+- A `launcher+tree` pin may carry an `entry`: the program its launcher reaches, as argv
+  items, each a relative `/`-separated path inside the package root (Cursor's would have
+  the shape `("node.exe", "index.js")`; no such entry is committed). Empty means not
+  measured. An entry on a `binary+launcher` pin, an absolute path, an empty item, a `..`
+  that leaves the root or a non-tuple is a table bug: that pin is never matched
+  (`pin_mismatch`).
 
-Recorded pins (measured from real installs only; no hash here is invented):
+### Provenance: real installs only
+
+Lucas's owner call of 2026-11-10 (csl-research PR #1159 comment 6777082374): "pins stay
+measured from a real install only for Nov 11; no archive-derived pins".
+
+- A pin is measured from the files of a real install. A vendor archive may be recorded as
+  a cross-check of a measured pin, never as the pin's source.
+- Enforced, fail closed: a pin whose `source` names a vendor archive is never matched.
+  `pins.match` refuses it at grant time and `pins.listed` on every use of an existing
+  grant, both as `pin_mismatch`. "Names an archive" means the source's path, ignoring any
+  query or fragment, ends in `.tar.gz`, `.tgz`, `.tar.xz`, `.txz`, `.tar.bz2`, `.tbz2`,
+  `.tar.zst`, `.tar`, `.zip` or `.7z`, in any case. `pins.measure` refuses such a source.
+- The Antigravity CLI 1.5.3 linux_amd64 row of table 1.3.0 was hashed with `sha256sum`
+  from the `antigravity` member of the vendor's `cli_linux_x64.tar.gz`, not from an
+  installed `agy`, so it is removed. Antigravity CLI has no pin and is refused
+  `pin_mismatch` on every platform until someone measures one on a real install. The
+  `binary+launcher` pin kind and its logic stay.
+
+Recorded pins (measured from real installs only; no hash here is invented; no entry has
+been measured, so every `entry` is empty):
 
 | Engine | Version | Platform | Launcher SHA-256 (bytes) | Target | Target SHA-256 | Measured | Source |
 |---|---|---|---|---|---|---|---|
-| antigravity | 1.5.3 | linux_amd64 | `7ca212748ca0dfda718efbc39a776a104472e7e9344d4b6ea147c543684f96a3` (246837648) | empty (`agy` is the binary) | `7ca212748ca0dfda718efbc39a776a104472e7e9344d4b6ea147c543684f96a3` | 2026-11-09 | the `antigravity` member of [`cli_linux_x64.tar.gz`](https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.3-6604829099950080/linux-x64/cli_linux_x64.tar.gz), which Google's installer copies to `agy`; version from the installer's `manifest_linux_amd64.json`, whose SHA-512 the archive matched |
 | cursor | 2026.11.05-86047df | windows_amd64 | `b5975caa126e855f4be9b6084791a47eb40dd0babccb297265bf131df033acfc` (2527) | `versions/2026.11.05-86047df` (408 entries, 265684223 bytes, includes an empty `.running` directory) | `d9088fb279e9a004d4098b927df9b1257cd05b367cdc0959ba11d082e291bf23` | 2026-11-09 | launcher `C:\Users\Lucas\AppData\Local\cursor-agent\cursor-agent.ps1` on sentry, installed from https://cursor.com/install?win32=true |
 | pi | 1.5.1 | windows_amd64 | `c56ef3cdd441b3c00d49e6e36d4a163bbcc715bf32e4de3473ece96efd232c4b` (464) | `../install/releases/1.5.1` (16776 entries, 113981899 bytes) | `2c477ce6abcd257434138b4affd6f9b12b92ec2527bc8eb50f04948a25323ac7` | 2026-11-09 | launcher `C:\Users\Lucas\.pi\agent\bin\pi.cmd` on sentry, installed from https://pi.dev/install.ps1; PowerShell resolves `pi` to `pi.ps1` first (SHA-256 `3f422e96483162aad373b8e3e28f282236bdffb5cc1b8bfb6c25a8d918bd31d1`, 500 bytes) |
 | pi | 1.5.1 | windows_amd64 | `3f422e96483162aad373b8e3e28f282236bdffb5cc1b8bfb6c25a8d918bd31d1` (500) | `../install/releases/1.5.1` (16776 entries, 113981899 bytes) | `2c477ce6abcd257434138b4affd6f9b12b92ec2527bc8eb50f04948a25323ac7` | 2026-11-09 | launcher `C:\Users\Lucas\.pi\agent\bin\pi.ps1` on sentry, installed from https://pi.dev/install.ps1 |
@@ -228,19 +267,44 @@ same tree, so the code does not choose between them beyond the search order. The
 tree includes an empty `.running` directory, so its tree pin goes stale if Cursor writes
 into it or removes it.
 
+Lucas's owner call of 2026-11-10 (same comment, calls 13/14): "accept a pinned .cmd/.ps1
+launcher as a check, but execute the pinned entry directly". So the launcher is hashed and
+never executed:
+
+- A grant on a `<name>.cmd` or `<name>.ps1` launcher records the pin's entry as realpaths
+  under the matched tree root. Each item must be a regular file whose realpath is inside
+  that root, else `pin_mismatch`. With no entry in the pin the grant is still issued (the
+  launcher check passed) with an empty `entry`.
+- `launch_plan` and every plan use refuse such a grant with `pin_entry_unset` when it has
+  no entry. With one, `exec_argv()` returns `[*entry, *argv[1:]]`, never the launcher's
+  path, after re-checking the launcher digest, the tree digest (the entry files are inside
+  the tree, so their bytes are covered) and that each entry path still resolves to the same
+  file inside the tree (`binary_changed`). `argv[0]` of the request is still the bare
+  engine name. The entry field is MAC-covered like every other grant field
+  (`grant_forged` if edited).
+- No `cmd.exe` or PowerShell is named or started anywhere, and no environment is set for
+  the entry.
+- The committed Windows pins (Cursor, Pi) have no measured entry, so their grants refuse
+  `pin_entry_unset` at `launch_plan` until one is measured. An interpreter outside the
+  tree cannot be an entry under this rule: Pi's launchers start the Node found on PATH, so
+  Pi's entry cannot be recorded as measured today.
+- Non-Windows grants, bare-name and `.exe` launchers and `binary+launcher` pins are
+  unchanged: `exec_argv()` returns the granted realpath and a pin's entry is not used.
+
 Hermes v0.23.1 (`3b421578588243f920886e6fe79a6faa87ea026e`) was measured on Windows only
 for its launchers (`hermes.exe`, `hermes-acp.exe`) and has no pin. Its Windows checkout
 was 170870 entries (~2.85 GiB), over `MAX_TREE_ENTRIES` (100000), and stock `open()` hit
 `MAX_PATH` under `node_modules/.pnpm`, so no tree hash exists and Hermes stays
 `pin_mismatch`. Pi and Cursor on linux_amd64, or on any other platform or version, still
-have no pin and are refused `pin_mismatch`. Antigravity CLI on another platform, or any
-build but 1.5.3, is refused the same way. `install.sh` is the bootstrapper, not the
-launcher, and is not pinned.
+have no pin and are refused `pin_mismatch`. Antigravity CLI has no pin on any platform
+and is refused the same way (see [Provenance](#provenance-real-installs-only)).
+`install.sh` is the bootstrapper, not the launcher, and is not pinned.
 
-To re-pin: measure the install with `pins.measure(engine, kind, path, target, version=...,
-platform=..., measured=..., source=...)` (it hashes; it runs nothing), add the `Pin` to
-`PINS`, raise `PIN_TABLE_VERSION`, add the row above, and commit that on its own, apart
-from logic, as #336 does for its measured help.
+To re-pin: measure a real install (never an archive member) with `pins.measure(engine,
+kind, path, target, version=..., platform=..., measured=..., source=..., entry=...)` (it
+hashes; it runs nothing; `entry` is optional and is what the launcher was read to start),
+add the `Pin` to `PINS`, raise `PIN_TABLE_VERSION`, add the row above, and commit that on
+its own, apart from logic, as #336 does for its measured help.
 
 ### Gemini CLI is not a route
 
@@ -279,16 +343,31 @@ this package ships.
   shebang paths in a venv, and `__pycache__` files (which are part of the digest, since
   Python runs them). An engine that writes into its own tree drifts to `binary_changed`.
 - A whole package tree is re-hashed on every plan use; a large install costs that each time.
-- Only installs that were measured can match. When an engine updates (Antigravity CLI's
-  installer downloads from a host named as an auto-updater; whether `agy` replaces itself
-  was not observed), its pin goes stale and the route is refused until re-pinned.
+- Only installs that were measured can match. When an engine updates, its pin goes stale
+  and the route is refused until re-pinned. Antigravity CLI has no pin now; when one is
+  measured the same holds for it (its installer downloads from a host named as an
+  auto-updater; whether `agy` replaces itself was not observed).
+- The archive rule reads only the pin's `source` text. A pin hashed from an archive but
+  recorded with another source is not detected; provenance still rests on whoever measures.
 - The tests run on POSIX only. Windows is simulated in them through `binary.is_windows()`
   (the one switch `detect` and `grant` read); no test runs on real Windows. On Windows a
   non-pinned engine's npm `.cmd` shim or `.ps1` launcher is still not grantable (fail closed).
-- `exec_argv()` returns the launcher's realpath. On real Windows a `.cmd` runs through
-  `CreateProcess`'s batch handling, but a `.ps1` is not directly executable and needs
-  PowerShell, whose name `launch_plan` refuses as `argv[0]`. How a granted `.ps1` is
-  spawned is open for Lucas.
+- A pinned Windows `.cmd`/`.ps1` launcher is never executed (Lucas, 2026-11-10: "accept a
+  pinned .cmd/.ps1 launcher as a check, but execute the pinned entry directly").
+  `exec_argv()` returns the pin's entry files and `argv[1:]`. Whatever else the launcher
+  would have done is not reproduced: the environment it sets, its working directory and
+  any arguments it adds between the entry and the user's. Which environment the entry
+  needs is an open question. Committed pins carry no entry, so Cursor and Pi on Windows
+  refuse `pin_entry_unset` at launch; Pi cannot get one while its interpreter is the Node
+  on PATH, outside the tree.
+- The entry is a statement by whoever measures the pin of what the launcher starts. The
+  code checks that the entry files are inside the pinned tree and unchanged, not that the
+  launcher's text actually names them.
+- A grant holds the entry realpaths, not the pin's relative items. A changed entry in the
+  table reaches existing grants through the new `PIN_TABLE_VERSION` (`grant_stale`).
+- The check-only rule keys on the granted path's extension. A bare-name or `.exe` path
+  that resolves to a `.cmd`/`.ps1` file keeps the old behaviour (`exec_argv()` returns its
+  realpath).
 
 ## Tests
 
@@ -305,8 +384,9 @@ given version line and exit code (and can dump its environment for the zero-egre
 without one, copies of `/bin/true` plus a test-only probe seam, and the exec-only tests
 skip. Pinned-route tests (`tests/test_pins.py`) build fake installs (an npm-shaped Pi, a
 venv-shaped Hermes, a Cursor version directory, an `agy` binary with and without a
-launcher), measure them in place and patch the pin table; none of those fake-install pins
-is real. The committed rows in `PINS` are real measurements, checked value by value.
+launcher, and a Windows-shaped Pi whose fake tree holds its own `node.exe` so its pin can
+carry an entry), measure them in place and patch the pin table; none of those fake-install
+pins is real. The committed rows in `PINS` are real measurements, checked value by value.
 No real `claude`, `codex` or other engine, account, provider or network is used.
 `tools/ci_gate.py` runs these files since CSL-795 (#334) merged: each `core/**/test_*.py`
 is run on its own with `core/` on `PYTHONPATH`.

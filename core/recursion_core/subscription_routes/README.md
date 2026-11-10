@@ -14,7 +14,9 @@ reviewed or accepted.
   Pi and Hermes require `wrapper` (see Wrapper pins). Cursor and Antigravity CLI use
   `check_cursor_route` and `check_antigravity_route`.
 - `guard_then_spawn(launcher, argv, ...)` calls `check_route` and only then the launcher,
-  always with the checked env and `shell=False`. It refuses `env`, `shell`, `executable`,
+  with `shell=False` and the checked env rebuilt by `child_env.build_child_env` (a temp name
+  becomes one private temp root; the one checked credential is kept under the harness's own
+  name). That env is never `os.environ`. It refuses `env`, `shell`, `executable`,
   `preexec_fn`, fd, user and group options before any check, forwards `cwd`, and refuses
   any other option (see Launch options). `launcher` and `argv` are trusted, core-owned
   inputs: argv is not parsed beyond `argv[0]` and the model, so it must not carry a
@@ -103,13 +105,15 @@ PRODUCT.md `055cc7a5` section 3.3. `own_loop.py`, checked before any spawn or re
   `GITHUB_PAT`, `GH_PAT`, `GITHUB_PASSWORD`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
   `OPENAI_BASE_URL`, `OPENAI_API_BASE`, for example `ANTHROPIC_API_KEY`) and git's
   config-injection channel (`GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_*`, `GIT_CONFIG_VALUE_*`,
-  `GIT_CONFIG_PARAMETERS`), which can carry an HTTP bearer. An optional `model` is checked
-  (printable, no spaces, at most 128 characters) and carried on the decision. With no
-  stored `copilot` login, no probe, a probe that fails or raises `SystemExit`, or a probe that
-  does not return within 5 seconds (`LOGIN_PROBE_DEADLINE_S`; a caller may pass a shorter
-  `probe_deadline`, not a longer one) the run refuses rather than fall back to `gh`. On POSIX
-  that late probe is SIGKILLed with its process group, so it and children that stayed in the
-  group do not keep running. The probe is the caller's; nothing here opens a login store.
+  `GIT_CONFIG_PARAMETERS`). Anything outside `child_env`'s base allowlist is removed too, and a
+  proxy value with userinfo is removed. What remains is rebuilt with `build_child_env` and started
+  by `spawn_copilot_own_loop`. An optional `model` is checked (printable, no spaces, at most 128
+  characters) and carried on the decision. With no stored `copilot` login, no probe, a probe that
+  fails or raises `SystemExit`, or a probe that does not return within 5 seconds
+  (`LOGIN_PROBE_DEADLINE_S`; a caller may pass a shorter `probe_deadline`, not a longer one) the
+  run refuses rather than fall back to `gh`. On POSIX that late probe is SIGKILLed with its
+  process group, so it and children that stayed in the group do not keep running. The probe is
+  the caller's; nothing here opens a login store.
 - **Nous, "Local proxy"**: `check_nous_own_loop(route, parent_env, ...)` with
   `{"engine": "nous", "auth": "subscription", "method": "hermes_local_proxy", "base_url": ...}`.
   The own loop calls only the user's own Hermes subscription proxy at a loopback IP literal
@@ -117,11 +121,11 @@ PRODUCT.md `055cc7a5` section 3.3. `own_loop.py`, checked before any spawn or re
   and refuse. Adapters are `["nous"]` only; `xai` refuses (`adapter_must_stay_off`). Recursion holds
   no Nous token: token-like route fields and URL credentials refuse. A query string or fragment
   on the proxy URL is treated as a credential, same as userinfo, and the same provider
-  credentials as on the Copilot child (including `GH_PAT`, `AWS_ACCESS_KEY_ID` and
-  `OPENAI_API_BASE`) are removed from the child.
-  Proxy settings (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, any case) are removed too, so
-  loopback-bound traffic cannot be carried off the host. An optional
-  `model` is checked and carried; an adapter-prefixed id must name `nous` (`xai/grok-3` refuses
+  credentials as on the Copilot child are removed. Proxy settings (`HTTP_PROXY`, `HTTPS_PROXY`,
+  `ALL_PROXY`, any case) are removed too, so loopback-bound traffic cannot be carried off the host.
+  Names outside `child_env`'s base allowlist are removed as well. `spawn_nous_own_loop` rebuilds
+  what remains with `build_child_env` and starts the process. An optional `model` is checked and
+  carried; an adapter-prefixed id must name `nous` (`xai/grok-3` refuses
   `adapter_must_stay_off`).
 - `nous_proxy_doctor(base_url, current_user=..., interactive_users=[...])` reports the address,
   refuses one that is not loopback, and warns when other interactive users share the host (any
@@ -221,13 +225,14 @@ pinned file passes, and argv reaches the launcher unchanged. OpenCode has no pin
 `guard_then_spawn` does not bind its `argv[0]`. Full access does not relax this. The check
 compares paths at guard time; it does not hold the file open across the launch.
 
-`guard_then_spawn` launches the env `check_route` accepted, not a second read of the
-caller's mapping. A subscription `model` must appear in argv, or every `--model`,
-`--model=` and `-m` before `--` must name that same model. A second flag with a
-different value refuses `model_not_bound` (the first match does not bind). An empty
-model segment (`anthropic/`) refuses `model_name_empty`. `borrow_claude_code_login`
-is not a profile field. `repr(RouteDecision)` leaves out `child_env`, which holds the
-API key on an API-key route.
+`guard_then_spawn` launches the env `check_route` accepted, rebuilt through `child_env`
+(`validated_launch.launch_env`), not a second read of the caller's mapping and not
+`os.environ`. `spawn_route_process` is the subprocess entry for that same env.
+A subscription `model` must appear in argv, or every `--model`, `--model=` and `-m`
+before `--` must name that same model. A second flag with a different value refuses
+`model_not_bound` (the first match does not bind). An empty model segment (`anthropic/`)
+refuses `model_name_empty`. `borrow_claude_code_login` is not a profile field.
+`repr(RouteDecision)` leaves out `child_env`, which holds the API key on an API-key route.
 
 ### Launch options
 

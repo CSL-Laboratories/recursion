@@ -357,7 +357,111 @@ class OwnLoopSpawnTests(unittest.TestCase):
                 self.argv, home=str(self.home), has_copilot_login=lambda: True,
             )
         self.assertEqual("no_proxy_engine_host", caught.exception.cause)
+        for bypass in ("api.githubcopilot.com", "proxy.enterprise.githubcopilot.com", "*.githubcopilot.com",
+                       "githubcopilot.com"):
+            with self.subTest(bypass=bypass):
+                with mock.patch("subprocess.Popen") as popen, self.assertRaises(EnvRefused) as caught:
+                    spawn_copilot_own_loop(
+                        {"engine": "copilot", "auth": "subscription", "method": "copilot_cli_sign_in"},
+                        {**self.base, "HTTPS_PROXY": "http://127.0.0.1:9", "NO_PROXY": bypass},
+                        self.argv, home=str(self.home), has_copilot_login=lambda: True,
+                    )
+                self.assertEqual("no_proxy_engine_host", caught.exception.cause)
+                popen.assert_not_called()
+        with mock.patch("subprocess.Popen") as popen:
+            spawn_copilot_own_loop(
+                {"engine": "copilot", "auth": "subscription", "method": "copilot_cli_sign_in"},
+                {**self.base, "HTTPS_PROXY": "http://127.0.0.1:9", "NO_PROXY": "notgithubcopilot.com"},
+                self.argv, home=str(self.home), has_copilot_login=lambda: True,
+            )
+        self.assertEqual("notgithubcopilot.com", popen.call_args.kwargs["env"]["NO_PROXY"])
+
+    def test_copilot_home_must_be_a_private_directory(self) -> None:
+        shared = self.root / "shared"
+        shared.mkdir(mode=0o777)
+        shared.chmod(0o777)
+        link = self.home / ".copilot"
+        link.symlink_to(shared)
+        with mock.patch("subprocess.Popen") as popen, self.assertRaises(EnvRefused) as caught:
+            spawn_copilot_own_loop(
+                {"engine": "copilot", "auth": "subscription", "method": "copilot_cli_sign_in"},
+                self.base, self.argv, home=str(self.home), has_copilot_login=lambda: True,
+            )
+        self.assertEqual("COPILOT_HOME", caught.exception.name)
         popen.assert_not_called()
+        link.unlink()
+        writable = self.home / ".copilot"
+        writable.mkdir(mode=0o777)
+        writable.chmod(0o777)
+        with mock.patch("subprocess.Popen") as popen, self.assertRaises(EnvRefused) as caught:
+            spawn_copilot_own_loop(
+                {"engine": "copilot", "auth": "subscription", "method": "copilot_cli_sign_in"},
+                self.base, self.argv, home=str(self.home), has_copilot_login=lambda: True,
+            )
+        self.assertEqual("COPILOT_HOME", caught.exception.name)
+        popen.assert_not_called()
+
+    def test_a_model_value_is_not_also_an_adapter_flag(self) -> None:
+        # "--adapter" is the model value. A second scan must not read it as the adapter flag.
+        url = "http://127.0.0.1:8645/v1"
+        route = {"engine": "nous", "auth": "subscription", "method": "hermes_local_proxy",
+                 "base_url": url, "adapters": ["nous"], "model": "--adapter"}
+        argv = [self.argv[0], "--base-url", url, "--model", "--adapter", "nous"]
+        with mock.patch("subprocess.Popen") as popen, self.assertRaises(OwnLoopRouteRefused) as caught:
+            spawn_nous_own_loop(
+                route, self.base, argv, home=str(self.home), current_user="u", interactive_users=["u"],
+            )
+        self.assertEqual("adapter_not_bound", caught.exception.cause)
+        popen.assert_not_called()
+        # --session consumes the following token on Copilot and Nous too.
+        with mock.patch("subprocess.Popen") as popen, self.assertRaises(OwnLoopRouteRefused) as caught:
+            spawn_nous_own_loop(
+                {"engine": "nous", "auth": "subscription", "method": "hermes_local_proxy",
+                 "base_url": url, "adapters": ["nous"], "model": "nous/good"},
+                self.base, [self.argv[0], "--session", "--model", "nous/good", "--base-url", url, "--adapter", "nous"],
+                home=str(self.home), current_user="u", interactive_users=["u"],
+            )
+        self.assertEqual("model_not_bound", caught.exception.cause)
+        popen.assert_not_called()
+
+    def test_base_url_refusal_does_not_echo_the_path(self) -> None:
+        secret = "private-CANARYSECRET"
+        url = f"http://127.0.0.1:9/{secret}"
+        route = {"engine": "nous", "auth": "subscription", "method": "hermes_local_proxy",
+                 "base_url": url, "adapters": ["nous"], "model": "nous/good"}
+        argv = [self.argv[0], "--base-url", "http://127.0.0.1:1/v1", "--adapter", "nous", "--model", "nous/good"]
+        with mock.patch("subprocess.Popen") as popen, self.assertRaises(OwnLoopRouteRefused) as caught:
+            spawn_nous_own_loop(
+                route, self.base, argv, home=str(self.home), current_user="u", interactive_users=["u"],
+            )
+        self.assertEqual("base_url_not_bound", caught.exception.cause)
+        self.assertNotIn(secret, str(caught.exception))
+        self.assertNotIn("/" + secret, caught.exception.detail)
+        popen.assert_not_called()
+
+    def test_spawn_uses_the_argv_snapshot_from_entry(self) -> None:
+        url = "http://127.0.0.1:8645/v1"
+        good = [self.argv[0], "--base-url", url, "--adapter", "nous", "--model", "nous/good"]
+        bad = [self.argv[0], "--base-url", "https://remote.invalid/v1", "--adapter", "xai", "--model", "xai/bad"]
+
+        class SecondRead(list):
+            def __iter__(self):
+                self._reads = getattr(self, "_reads", 0) + 1
+                if self._reads > 1:
+                    return iter(bad)
+                return list.__iter__(self)
+
+        argv = SecondRead(good)
+        route = {"engine": "nous", "auth": "subscription", "method": "hermes_local_proxy",
+                 "base_url": url, "adapters": ["nous"], "model": "nous/good"}
+        with mock.patch("subprocess.Popen") as popen:
+            spawn_nous_own_loop(
+                route, self.base, argv, home=str(self.home), current_user="u", interactive_users=["u"],
+            )
+        launched = list(popen.call_args.args[0])
+        self.assertEqual(good, launched)
+        self.assertNotIn("https://remote.invalid/v1", launched)
+        popen.assert_called_once()
 
     def test_an_unsafe_path_never_reaches_popen(self) -> None:
         parent = {**self.base, "PATH": "relative-bin"}

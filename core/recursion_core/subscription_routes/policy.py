@@ -65,7 +65,7 @@ import errno
 import os
 import secrets
 import stat
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
 
@@ -773,16 +773,93 @@ def _argv0_is_pinned(argv: list[str], pinned: tuple[str, ...]) -> bool:
 
 
 # Options that take the next argv element as a value, so a following ``--model`` is that value and
-# not a model flag. Pi's ``--system-prompt`` is the case the scanner used to get wrong.
+# not a model flag. Pi's ``--system-prompt`` is one case. ``--session`` takes a value on each of
+# these engines. A consumed value is never read again as a flag.
 _VALUE_OPTIONS = {
-    "pi": frozenset({"--system-prompt", "--append-system-prompt"}),
-    "hermes": frozenset(),
-    "opencode": frozenset(),
-    "copilot": frozenset(),
-    "nous": frozenset(),
+    "pi": frozenset({"--system-prompt", "--append-system-prompt", "--session"}),
+    "hermes": frozenset({"--session"}),
+    "opencode": frozenset({"--session"}),
+    "copilot": frozenset({"--session"}),
+    "nous": frozenset({"--session"}),
 }
 # Engines whose CLIs accept ``--model=VALUE``, ``-m=VALUE`` and an attached ``-mVALUE``.
 _EQUALS_MODEL = frozenset({"opencode", "hermes", "copilot", "nous"})
+
+
+def _scan_argv(argv: Sequence[str], engine: str) -> tuple[list[str], list[str], list[str], bool]:
+    """One left-to-right pass. Each flag's value is consumed once, even when it looks like a flag.
+
+    Returns ``(model values, base-url values, adapter values, saw a model flag)``. ``argv[0]`` is
+    the program. A token after ``--`` is not a flag. ``--model``, ``-m``, ``--base-url`` and
+    ``--adapter`` take the next element. ``opencode``, ``hermes``, ``copilot`` and ``nous`` also
+    accept ``--model=X``, ``-m=X`` and an attached ``-mX``. Engines not listed in
+    ``_VALUE_OPTIONS`` keep that equals form and have no value-taking options. A value option such
+    as ``--session`` or Pi's ``--system-prompt`` consumes the next element, so that element is not
+    a later flag.
+    """
+
+    value_options = _VALUE_OPTIONS.get(engine, frozenset())
+    equals = engine in _EQUALS_MODEL or engine not in _VALUE_OPTIONS
+    models: list[str] = []
+    base_urls: list[str] = []
+    adapters: list[str] = []
+    saw_model = False
+    index = 1
+    while index < len(argv):
+        item = argv[index]
+        if item == "--":
+            break
+        if item in _MODEL_FLAGS:
+            saw_model = True
+            if index + 1 >= len(argv):
+                models.append("")
+                break
+            models.append(argv[index + 1])
+            index += 2
+            continue
+        if item == "--base-url":
+            if index + 1 >= len(argv):
+                base_urls.append("")
+                break
+            base_urls.append(argv[index + 1])
+            index += 2
+            continue
+        if item == "--adapter":
+            if index + 1 >= len(argv):
+                adapters.append("")
+                break
+            adapters.append(argv[index + 1])
+            index += 2
+            continue
+        if equals and item.startswith("--model="):
+            saw_model = True
+            models.append(item[len("--model="):])
+            index += 1
+            continue
+        if equals and item.startswith("-m=") and len(item) > 3:
+            saw_model = True
+            models.append(item[len("-m="):])
+            index += 1
+            continue
+        # Attached short form (-mchatgpt/test-model). ``-m`` alone is the flag with no value.
+        if equals and item.startswith("-m") and len(item) > 2:
+            saw_model = True
+            models.append(item[2:])
+            index += 1
+            continue
+        if item.startswith("--base-url="):
+            base_urls.append(item[len("--base-url="):])
+            index += 1
+            continue
+        if item.startswith("--adapter="):
+            adapters.append(item[len("--adapter="):])
+            index += 1
+            continue
+        if item in value_options:
+            index += 2
+            continue
+        index += 1
+    return models, base_urls, adapters, saw_model
 
 
 def _argv_binds_model(argv: list[str], model: str, engine: str = "opencode") -> bool:
@@ -793,49 +870,17 @@ def _argv_binds_model(argv: list[str], model: str, engine: str = "opencode") -> 
     element, including ``opencode run <model>``, does not bind. A flag after ``--`` does not bind.
     A flag with no value, an empty ``--model=``, or two flags that disagree, does not bind.
 
-    Pi's ``--system-prompt`` and ``--append-system-prompt`` consume the next element, even when that
-    element is spelled like a model flag.
+    Value-taking options (Pi's ``--system-prompt`` and ``--append-system-prompt``, and ``--session``
+    on Pi, OpenCode, Hermes, Copilot and Nous) consume the next element, even when that element is
+    spelled like a model flag. The scan is the one in ``_scan_argv``.
     """
 
     if not model:
         return False
-    value_options = _VALUE_OPTIONS.get(engine, frozenset())
-    equals = engine in _EQUALS_MODEL or engine not in _VALUE_OPTIONS
-    bindings: list[str] = []
-    index = 1  # argv[0] is the program, not a flag
-    while index < len(argv):
-        item = argv[index]
-        if item == "--":
-            break
-        if item in _MODEL_FLAGS:
-            if index + 1 >= len(argv):
-                return False
-            bindings.append(argv[index + 1])
-            index += 2
-            continue
-        if equals and item.startswith("--model="):
-            value = item[len("--model="):]
-            if not value:
-                return False
-            bindings.append(value)
-            index += 1
-            continue
-        if equals and item.startswith("-m=") and len(item) > 3:
-            bindings.append(item[len("-m="):])
-            index += 1
-            continue
-        # Attached short form (-mchatgpt/test-model). ``-m`` alone is the flag with no value.
-        if equals and item.startswith("-m") and len(item) > 2:
-            bindings.append(item[2:])
-            index += 1
-            continue
-        if item in value_options:
-            index += 2  # the next element is the option's value, whatever it looks like
-            continue
-        index += 1
-    if not bindings:
+    models, _base_urls, _adapters, _saw_model = _scan_argv(argv, engine)
+    if not models or any(not value for value in models):
         return False
-    return all(value == model for value in bindings)
+    return all(value == model for value in models)
 
 
 def _refuse_hermes_config(engine: str, detail: str) -> SubscriptionRouteRefused:

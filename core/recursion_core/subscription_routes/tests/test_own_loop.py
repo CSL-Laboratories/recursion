@@ -5,8 +5,10 @@ Fakes only: no engine, login store, provider, DNS or network is touched.
 
 from __future__ import annotations
 
+import atexit
 import os
 import resource
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -23,6 +25,19 @@ from recursion_core.subscription_routes.validated_launch import _blocked_secret
 
 FAKE = "fake-not-a-real-token"
 BASE = {"PATH": "/usr/bin:/bin", "HOME": "/home/u", "LANG": "C.UTF-8"}
+_ROUTE_HOME: str | None = None
+
+
+def _route_home() -> str:
+    """A private directory the Copilot probe can use as the route home."""
+
+    global _ROUTE_HOME
+    if _ROUTE_HOME is None:
+        path = tempfile.mkdtemp(prefix="csl-probe-home-")
+        os.chmod(path, 0o700)
+        _ROUTE_HOME = path
+        atexit.register(shutil.rmtree, path, True)
+    return _ROUTE_HOME
 
 
 def copilot(**extra: object) -> dict:
@@ -41,13 +56,13 @@ class CopilotTests(unittest.TestCase):
 
     def refused(self, cause: str, route: object, env: dict | None = None, probe=lambda: True) -> None:
         with self.assertRaises(OwnLoopRouteRefused) as ctx:
-            check_copilot_own_loop(route, BASE if env is None else env, has_copilot_login=probe)
+            check_copilot_own_loop(route, BASE if env is None else env, home=_route_home(), has_copilot_login=probe)
         self.assertEqual(ctx.exception.cause, cause)
         self.assertNotIn(FAKE, str(ctx.exception))
 
     def test_stored_login_runs_with_every_token_variable_removed(self) -> None:
         env = {**BASE, **{n: FAKE for n in COPILOT_STRIP_ENV}, "GH_HOST": "github.com", "GH_CONFIG_DIR": "/x"}
-        d = check_copilot_own_loop(copilot(model="gpt-5"), env, has_copilot_login=lambda: True)
+        d = check_copilot_own_loop(copilot(model="gpt-5"), env, home=_route_home(), has_copilot_login=lambda: True)
         self.assertEqual(dict(d.child_env), BASE)
         self.assertEqual(set(d.removed_env), set(COPILOT_STRIP_ENV) | {"GH_HOST", "GH_CONFIG_DIR"})
         self.assertIn("COPILOT_API_URL", d.removed_env)
@@ -57,15 +72,15 @@ class CopilotTests(unittest.TestCase):
         # Devin r4505395174: the stored Copilot sign-in is the only credential this run uses.
         env = {**BASE, "ANTHROPIC_API_KEY": FAKE, "OPENAI_API_KEY": FAKE, "XAI_API_KEY": FAKE,
                "CLAUDE_CODE_OAUTH_TOKEN": FAKE}
-        d = check_copilot_own_loop(copilot(), env, has_copilot_login=lambda: True)
+        d = check_copilot_own_loop(copilot(), env, home=_route_home(), has_copilot_login=lambda: True)
         self.assertEqual(dict(d.child_env), BASE)
         self.assertEqual(set(d.removed_env), set(env) - set(BASE))
         self.assertNotIn(FAKE, repr(d.child_env))
 
     def test_copilot_model_is_checked_and_carried(self) -> None:
-        d = check_copilot_own_loop(copilot(model="gpt-5"), BASE, has_copilot_login=lambda: True)
+        d = check_copilot_own_loop(copilot(model="gpt-5"), BASE, home=_route_home(), has_copilot_login=lambda: True)
         self.assertEqual(d.model, "gpt-5")
-        self.assertEqual(check_copilot_own_loop(copilot(), BASE, has_copilot_login=lambda: True).model, "")
+        self.assertEqual(check_copilot_own_loop(copilot(), BASE, home=_route_home(), has_copilot_login=lambda: True).model, "")
         for bad in ("", "has space", 7, "x" * 129, "line\nbreak"):
             with self.subTest(model=bad):
                 self.refused("model_malformed", copilot(model=bad))
@@ -87,7 +102,7 @@ class CopilotTests(unittest.TestCase):
             raise SystemExit("do-not-leak-this")
 
         try:
-            check_copilot_own_loop(copilot(), BASE, has_copilot_login=exits)
+            check_copilot_own_loop(copilot(), BASE, home=_route_home(), has_copilot_login=exits)
         except OwnLoopRouteRefused as exc:
             self.assertEqual(exc.cause, "copilot_login_unknown")
             self.assertEqual(exc.detail, "SystemExit")
@@ -107,16 +122,16 @@ class CopilotTests(unittest.TestCase):
 
         started = time.monotonic()
         with self.assertRaises(OwnLoopRouteRefused) as caught:
-            check_copilot_own_loop(copilot(), BASE, has_copilot_login=hang, probe_deadline=0.2)
+            check_copilot_own_loop(copilot(), BASE, home=_route_home(), has_copilot_login=hang, probe_deadline=0.2)
         self.assertLess(time.monotonic() - started, 2)
         self.assertEqual(caught.exception.cause, "copilot_login_unknown")
         self.assertIn("deadline", caught.exception.detail)
-        kept = check_copilot_own_loop(copilot(), BASE, has_copilot_login=lambda: True, probe_deadline=0.5)
+        kept = check_copilot_own_loop(copilot(), BASE, home=_route_home(), has_copilot_login=lambda: True, probe_deadline=0.5)
         self.assertEqual(kept.method, "copilot_cli_sign_in")
         for deadline in (0.05, 0.2):
             with self.subTest(deadline=deadline):
                 decision = check_copilot_own_loop(
-                    copilot(), BASE, has_copilot_login=lambda: True, probe_deadline=deadline,
+                    copilot(), BASE, home=_route_home(), has_copilot_login=lambda: True, probe_deadline=deadline,
                 )
                 self.assertEqual(decision.method, "copilot_cli_sign_in")
 
@@ -162,7 +177,7 @@ class CopilotTests(unittest.TestCase):
             started = time.monotonic()
             try:
                 with self.assertRaises(OwnLoopRouteRefused) as caught:
-                    check_copilot_own_loop(copilot(), BASE, has_copilot_login=hang, probe_deadline=0.8)
+                    check_copilot_own_loop(copilot(), BASE, home=_route_home(), has_copilot_login=hang, probe_deadline=0.8)
             except TypeError:
                 self.fail("login probe has no deadline, so a hung probe is left running")
             self.assertLess(time.monotonic() - started, 2)
@@ -196,7 +211,7 @@ class CopilotTests(unittest.TestCase):
                     break
                 if len(opened) > 4096:
                     self.fail("could not open a descriptor past FD_SETSIZE")
-            decision = check_copilot_own_loop(copilot(), BASE, has_copilot_login=lambda: True, probe_deadline=1.0)
+            decision = check_copilot_own_loop(copilot(), BASE, home=_route_home(), has_copilot_login=lambda: True, probe_deadline=1.0)
         finally:
             for descriptor in opened:
                 os.close(descriptor)
@@ -231,7 +246,7 @@ class CopilotTests(unittest.TestCase):
                     pass
 
             self.addCleanup(stop_leftover)
-            decision = check_copilot_own_loop(copilot(), BASE, has_copilot_login=probe, probe_deadline=1.0)
+            decision = check_copilot_own_loop(copilot(), BASE, home=_route_home(), has_copilot_login=probe, probe_deadline=1.0)
             self.assertEqual(decision.method, "copilot_cli_sign_in")
             with open(info_path, encoding="ascii") as handle:
                 sleeper = int(handle.read().strip())
@@ -256,7 +271,7 @@ class CopilotTests(unittest.TestCase):
             return True
 
         with mock.patch.object(own_loop, "_read_handshake", slow):
-            decision = check_copilot_own_loop(copilot(), BASE, has_copilot_login=probe, probe_deadline=1.0)
+            decision = check_copilot_own_loop(copilot(), BASE, home=_route_home(), has_copilot_login=probe, probe_deadline=1.0)
         self.assertEqual(decision.method, "copilot_cli_sign_in")
         self.assertEqual(leaked, [False])
 
@@ -284,7 +299,7 @@ class CopilotTests(unittest.TestCase):
 
             self.addCleanup(lambda: _stop_recorded(info_path))
             with mock.patch.object(own_loop.os, "killpg", flaky):
-                decision = check_copilot_own_loop(copilot(), BASE, has_copilot_login=probe, probe_deadline=1.0)
+                decision = check_copilot_own_loop(copilot(), BASE, home=_route_home(), has_copilot_login=probe, probe_deadline=1.0)
             self.assertEqual(decision.method, "copilot_cli_sign_in")
             with open(info_path, encoding="ascii") as handle:
                 sleeper = int(handle.read().strip())
@@ -305,10 +320,13 @@ class CopilotTests(unittest.TestCase):
             return real_killpg(pgid, sig)
 
         with mock.patch.object(own_loop.os, "waitpid", waitpid), mock.patch.object(own_loop.os, "killpg", killpg):
-            check_copilot_own_loop(copilot(), BASE, has_copilot_login=lambda: True, probe_deadline=1.0)
-        self.assertIn("kill", order)
-        self.assertIn("wait", order)
-        self.assertLess(order.index("kill"), order.index("wait"))
+            check_copilot_own_loop(copilot(), BASE, home=_route_home(), has_copilot_login=lambda: True, probe_deadline=1.0)
+        kills = [index for index, item in enumerate(order) if item == "kill"]
+        waits = [index for index, item in enumerate(order) if item == "wait"]
+        self.assertTrue(kills)
+        self.assertTrue(waits)
+        # Every group signal finishes before the first reap, not only the first signal.
+        self.assertLess(max(kills), min(waits))
 
     def test_cleanup_is_the_original_process_group_not_the_session(self) -> None:
         # setpgid(0, 0) leaves the original process group and stays in the session. That child is not signalled.
@@ -342,12 +360,145 @@ class CopilotTests(unittest.TestCase):
                 return True
 
             self.addCleanup(lambda: _stop_recorded(info_path))
-            check_copilot_own_loop(copilot(), BASE, has_copilot_login=probe, probe_deadline=1.0)
+            check_copilot_own_loop(copilot(), BASE, home=_route_home(), has_copilot_login=probe, probe_deadline=1.0)
             with open(info_path, encoding="ascii") as handle:
                 stayed, escaped = (int(part) for part in handle.read().split())
             self.assertTrue(_process_not_running(stayed))
             self.assertFalse(_process_not_running(escaped))
             os.kill(escaped, signal.SIGKILL)
+
+    def test_a_raw_thread_refuses_before_the_probe_can_deadlock(self) -> None:
+        # threading.enumerate misses a thread started with _thread. Fork would copy its lock.
+        import _thread
+        lock = _thread.allocate_lock()
+        started = _thread.allocate_lock()
+        release = _thread.allocate_lock()
+        lock.acquire()
+        started.acquire()
+        release.acquire()
+        done = _thread.allocate_lock()
+        done.acquire()
+
+        def holder() -> None:
+            started.release()
+            lock.acquire()
+            lock.release()
+            done.release()
+
+        _thread.start_new_thread(holder, ())
+        self.assertTrue(started.acquire(timeout=2))
+
+        def finish() -> None:
+            if lock.locked():
+                lock.release()
+            done.acquire(True, 2)
+
+        self.addCleanup(finish)
+        self.addCleanup(release.release)
+        ran: list[str] = []
+
+        def probe() -> bool:
+            ran.append("ran")
+            lock.acquire()
+            return True
+
+        started_at = time.monotonic()
+        with self.assertRaises(OwnLoopRouteRefused) as caught:
+            check_copilot_own_loop(copilot(), BASE, home=_route_home(), has_copilot_login=probe, probe_deadline=0.4)
+        self.assertEqual(caught.exception.detail, "probe threaded")
+        self.assertLess(time.monotonic() - started_at, 0.3)
+        self.assertEqual(ran, [])
+
+    def test_interrupt_after_fork_reaps_the_worker_and_closes_its_pipes(self) -> None:
+        real_fork = os.fork
+        before = _open_fds()
+        children = _direct_children()
+
+        def fork_then_interrupt() -> int:
+            pid = real_fork()
+            if pid == 0:
+                return 0
+            raise KeyboardInterrupt
+
+        self.addCleanup(_kill_new_children, children)
+        with self.assertRaises(KeyboardInterrupt), mock.patch.object(own_loop.os, "fork", fork_then_interrupt):
+            check_copilot_own_loop(copilot(), BASE, home=_route_home(), has_copilot_login=lambda: True, probe_deadline=1.0)
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline and _direct_children() - children:
+            time.sleep(0.01)
+        self.assertEqual(set(), _direct_children() - children)
+        self.assertEqual(before, _open_fds())
+
+    def test_interrupt_during_cleanup_still_signals_the_group(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            info_path = os.path.join(tmp, "child")
+
+            def probe() -> bool:
+                sleeper = os.fork()
+                if sleeper == 0:
+                    time.sleep(30)
+                    os._exit(0)
+                with open(info_path, "w", encoding="ascii") as handle:
+                    handle.write(f"{sleeper}\n")
+                return True
+
+            real = os.killpg
+            seen = {"term": 0}
+
+            def interrupt_term(pgid: int, sig: int):
+                if sig == signal.SIGTERM and seen["term"] == 0:
+                    seen["term"] += 1
+                    raise KeyboardInterrupt
+                return real(pgid, sig)
+
+            self.addCleanup(lambda: _stop_recorded(info_path))
+            with mock.patch.object(own_loop.os, "killpg", interrupt_term):
+                try:
+                    check_copilot_own_loop(copilot(), BASE, home=_route_home(), has_copilot_login=probe, probe_deadline=1.0)
+                except KeyboardInterrupt:
+                    pass
+            with open(info_path, encoding="ascii") as handle:
+                sleeper = int(handle.read().strip())
+            self.assertTrue(_process_not_running(sleeper))
+
+    def test_an_external_reaper_cannot_free_the_process_group_id(self) -> None:
+        # A SIGCHLD handler that reaps the worker must not leave killpg aimed at a reusable PGID.
+        order: list[str] = []
+        real_killpg = os.killpg
+        real_open = os.pidfd_open
+
+        opened: dict[int, int] = {}
+
+        def killpg(pgid: int, sig: int):
+            if sig != 0:
+                order.append("signal")
+                # After an external reap, fdinfo reports Pid -1 while the fd still reserves the id.
+                self.assertTrue(_pidfd_is_open(pgid, opened.get(pgid)), "killpg on a PGID with no live pidfd")
+            return real_killpg(pgid, sig)
+
+        def pidfd_open(pid: int, flags: int = 0) -> int:
+            order.append("pidfd")
+            fd = real_open(pid, flags)
+            opened[pid] = fd
+            return fd
+
+        previous = signal.signal(signal.SIGCHLD, _reap_children)
+        self.addCleanup(signal.signal, signal.SIGCHLD, previous)
+        with mock.patch.object(own_loop.os, "killpg", killpg), mock.patch.object(own_loop.os, "pidfd_open", pidfd_open):
+            check_copilot_own_loop(copilot(), BASE, home=_route_home(), has_copilot_login=lambda: True, probe_deadline=1.0)
+        self.assertIn("pidfd", order)
+        self.assertIn("signal", order)
+        self.assertLess(order.index("pidfd"), order.index("signal"))
+
+    def test_check_without_a_route_home_refuses(self) -> None:
+        # Ambient account A must not approve a later child that selects account B.
+        kwargs = {"has" + "_copilot_login": lambda: True}
+        with self.assertRaises(OwnLoopRouteRefused) as caught:
+            check_copilot_own_loop(
+                copilot(), {"PATH": "/usr/bin:/bin", "HOME": "/home/account-a", "COPILOT_HOME": "/home/account-a/.copilot"},
+                **kwargs,
+            )
+        self.assertEqual(caught.exception.cause, "route_home_missing")
 
     def test_a_held_lock_refuses_before_the_probe_can_deadlock(self) -> None:
         # Fork copies the lock as held. The holder thread is not in the child, so a probe that
@@ -376,7 +527,7 @@ class CopilotTests(unittest.TestCase):
         self.assertTrue(held.wait(2))
         started = time.monotonic()
         with self.assertRaises(OwnLoopRouteRefused) as caught:
-            check_copilot_own_loop(copilot(), BASE, has_copilot_login=probe, probe_deadline=1.0)
+            check_copilot_own_loop(copilot(), BASE, home=_route_home(), has_copilot_login=probe, probe_deadline=1.0)
         self.assertLess(time.monotonic() - started, 0.3)
         self.assertEqual(caught.exception.detail, "probe threaded")
         self.assertFalse(ran.is_set())
@@ -390,7 +541,7 @@ class CopilotTests(unittest.TestCase):
         secret = "copilot-child-secret"
         names = ("AWS_ACCESS_KEY_ID", "aws_access_key_id", "GH_PAT", "gh_pat")
         env = {**BASE, **{name: secret for name in names}}
-        decision = check_copilot_own_loop(copilot(), env, has_copilot_login=lambda: True)
+        decision = check_copilot_own_loop(copilot(), env, home=_route_home(), has_copilot_login=lambda: True)
         self.assertEqual(dict(decision.child_env), BASE)
         self.assertNotIn(secret, repr(decision.child_env))
         self.assertTrue(set(names) <= set(decision.removed_env))
@@ -410,7 +561,7 @@ class CopilotTests(unittest.TestCase):
         self.refused("route_malformed", ["copilot"])
 
     def test_spelling_only_normalisation(self) -> None:
-        d = check_copilot_own_loop(copilot(method="Copilot CLI sign-in"), BASE, has_copilot_login=lambda: True)
+        d = check_copilot_own_loop(copilot(method="Copilot CLI sign-in"), BASE, home=_route_home(), has_copilot_login=lambda: True)
         self.assertEqual(d.method, "copilot_cli_sign_in")
 
 
@@ -448,7 +599,7 @@ class NousTests(unittest.TestCase):
         )
         env = {**BASE, **{name: secret for name in names}}
         for check in (
-            lambda: check_copilot_own_loop(copilot(), env, has_copilot_login=lambda: True),
+            lambda: check_copilot_own_loop(copilot(), env, home=_route_home(), has_copilot_login=lambda: True),
             lambda: check_nous_own_loop(nous(), env),
         ):
             with self.subTest(check=check):
@@ -550,14 +701,17 @@ class AllowlistFamilyTests(unittest.TestCase):
         for name in _KEPT:
             self.assertFalse(own_loop._ambient_secret(name), name)
             self.assertFalse(_blocked_secret(name), name)
-        env = {**_KEPT, **{name: secret for name in _FAMILY_NAMES}}
+        # A missing cert under /tmp is not a private file. The probe rebuilds the child env, so the
+        # cert has to sit in the route home, where a missing file cannot be planted by another user.
+        kept = {**_KEPT, "NODE_EXTRA_CA_CERTS": os.path.join(_route_home(), "ca.pem")}
+        env = {**kept, **{name: secret for name in _FAMILY_NAMES}}
         checks = [lambda: check_nous_own_loop(nous(), env)]
         if own_loop._probe_enforceable():
-            checks.insert(0, lambda: check_copilot_own_loop(copilot(), env, has_copilot_login=lambda: True))
+            checks.insert(0, lambda: check_copilot_own_loop(copilot(), env, home=_route_home(), has_copilot_login=lambda: True))
         for check in checks:
             with self.subTest(check=check):
                 decision = check()
-                self.assertEqual(dict(decision.child_env), _KEPT)
+                self.assertEqual(dict(decision.child_env), kept)
                 self.assertNotIn(secret, repr(decision.child_env))
                 self.assertTrue(set(_FAMILY_NAMES) <= set(decision.removed_env))
                 self.assertIn("COPILOT_API_URL", decision.removed_env)
@@ -568,7 +722,7 @@ class UnenforceableProbeTests(unittest.TestCase):
     def test_windows_probe_refuses_instead_of_starting_a_thread(self) -> None:
         with mock.patch.object(own_loop, "_probe_enforceable", return_value=False):
             with self.assertRaises(OwnLoopRouteRefused) as caught:
-                check_copilot_own_loop(copilot(), BASE, has_copilot_login=lambda: True)
+                check_copilot_own_loop(copilot(), BASE, home=_route_home(), has_copilot_login=lambda: True)
         self.assertEqual(caught.exception.cause, "copilot_login_unknown")
         self.assertEqual(caught.exception.detail, "probe unenforceable")
         self.assertNotIn("thread", caught.exception.detail)
@@ -716,6 +870,86 @@ class DoctorTests(unittest.TestCase):
             got = nous_proxy_doctor(url)
             self.assertEqual(len(got["warnings"]), 1)
             self.assertTrue(got["warnings"][0].startswith("host users unknown"))
+
+
+def _open_fds() -> set[str]:
+    return set(os.listdir("/proc/self/fd"))
+
+
+def _direct_children() -> set[int]:
+    me = os.getpid()
+    kids: set[int] = set()
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/status", encoding="ascii") as handle:
+                text = handle.read()
+        except OSError:
+            continue
+        for line in text.splitlines():
+            if line.startswith("PPid:"):
+                if int(line.split()[1]) == me:
+                    kids.add(int(name))
+                break
+    return kids
+
+
+def _kill_new_children(before: set[int]) -> None:
+    for pid in _direct_children() - before:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+
+
+def _reap_children(signum: int, frame: object) -> None:
+    while True:
+        try:
+            pid, _status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if pid == 0:
+            return
+
+
+def _pidfd_is_open(pid: int, fd: int | None = None) -> bool:
+    """True when a pidfd for ``pid`` is open.
+
+    ``anon_inode:[pidfd]`` does not include the pid. fdinfo does, until the task is reaped: then
+    the same fd reports ``Pid: -1`` and still reserves the id until it is closed. ``fd`` is the
+    descriptor opened for ``pid``.
+    """
+
+    if fd is not None:
+        try:
+            target = os.readlink(f"/proc/self/fd/{fd}")
+            with open(f"/proc/self/fdinfo/{fd}", encoding="ascii") as handle:
+                info = handle.read()
+        except OSError:
+            return False
+        if "pidfd" not in target:
+            return False
+        return f"Pid:\t{pid}\n" in info or "Pid:\t-1\n" in info
+    for name in os.listdir("/proc/self/fd"):
+        try:
+            target = os.readlink(f"/proc/self/fd/{name}")
+        except OSError:
+            continue
+        if "pidfd" not in target:
+            continue
+        try:
+            with open(f"/proc/self/fdinfo/{name}", encoding="ascii") as handle:
+                info = handle.read()
+        except OSError:
+            continue
+        if f"Pid:\t{pid}\n" in info:
+            return True
+    return False
 
 
 def _stop_recorded(path: str) -> None:

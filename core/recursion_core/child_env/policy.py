@@ -228,6 +228,8 @@ class EngineProfile:
     key_name: str | None = None  # the user-entered vendor key, ``api_key`` mode only
     base_url_name: str | None = None  # the route's own base URL, any mode (``subscription``: see ``_route_env``)
     provider_switches: tuple[str, ...] = ()  # set to "1" when picked, ``cloud_provider`` mode only
+    # Apex names. A NO_PROXY entry equal to the apex, or under it, bypasses every host in the family.
+    host_suffixes: tuple[str, ...] = ()
 
 
 _CLAUDE_SCRUB = (
@@ -291,6 +293,7 @@ ENGINE_PROFILES: Mapping[str, EngineProfile] = MappingProxyType(
                 "COPILOT_GITHUB_TOKEN",
                 "COPILOT_API_URL",
             ),
+            host_suffixes=("githubcopilot.com",),
         ),
         # OpenAI API key inside a ValidatedEnv, so spawn's executable checks run. Not the OpenCode harness name.
         "openai": EngineProfile(
@@ -397,7 +400,7 @@ def build_child_env(
     # A bypass only matters when a proxy is set: "*" skips it for every host, an engine-host entry for that engine.
     if any(env.get(name) for name in VALUE_URLS + VALUE_ALL_PROXY):
         for name in [name for name in NO_PROXY_NAMES if name in env]:
-            if (cause := _no_proxy_bypass(env[name], profile.hosts)) is not None:
+            if (cause := _no_proxy_bypass(env[name], profile.hosts, profile.host_suffixes)) is not None:
                 raise EnvRefused(name, cause)
     # N5h option A: a temp name is replaced by one private route temp root, never checked or passed.
     present = [name for name in TEMP_NAMES if name in env]
@@ -558,6 +561,9 @@ def _unsafe_value(name: str, value: str) -> str | None:
         if path.startswith("/"):
             return _unsafe_file(path)
         return "tz_relative_path" if ".." in path.split("/") else None
+    if name == "COPILOT_HOME":
+        # Same rule as HOME: the directory itself is not a symlink, and it is private to this user.
+        return None if _private_dir(value) else "home_unsafe"
     if name in VALUE_FILES:
         return _unsafe_file(value)
     if name in VALUE_DIRS:
@@ -668,8 +674,13 @@ def _unsafe_path(value: str) -> str | None:
     return None
 
 
-def _no_proxy_bypass(value: str, hosts: tuple[str, ...]) -> str | None:
-    """N5i: comma and whitespace split; the union of curl, requests, hyper-util, undici and Codex matchers."""
+def _no_proxy_bypass(value: str, hosts: tuple[str, ...], suffixes: tuple[str, ...] = ()) -> str | None:
+    """N5i: comma and whitespace split; the union of curl, requests, hyper-util, undici and Codex matchers.
+
+    ``suffixes`` are apexes such as ``githubcopilot.com``. An entry on that apex, or any name under
+    it, bypasses the whole family. A wildcard is matched against the apex and a name under it, not
+    only against the literal host strings.
+    """
 
     for entry in re.split(r"[,\s]+", value.strip().lower()):
         entry = re.sub(r"^[a-z][a-z0-9+.-]*://", "", entry).strip("[]")
@@ -678,15 +689,21 @@ def _no_proxy_bypass(value: str, hosts: tuple[str, ...]) -> str | None:
             continue
         if entry.strip("*.") == "":
             return "no_proxy_wildcard"
-        if "*" in entry:
-            pattern = re.compile(".*".join(re.escape(part) for part in entry.split("*")) + r"\Z")
-            hit = any(pattern.match(host) for host in hosts)
-        else:
-            bare = entry.lstrip(".")
-            hit = any(host == bare or host.endswith("." + bare) for host in hosts)
-        if hit:
+        if _proxy_entry_hits(entry, hosts, suffixes):
             return "no_proxy_engine_host"
     return None
+
+
+def _proxy_entry_hits(entry: str, hosts: tuple[str, ...], suffixes: tuple[str, ...]) -> bool:
+    if "*" in entry:
+        pattern = re.compile(".*".join(re.escape(part) for part in entry.split("*")) + r"\Z")
+        if any(pattern.match(host) for host in hosts):
+            return True
+        return any(pattern.match(suffix) or pattern.match("api." + suffix) for suffix in suffixes)
+    bare = entry.lstrip(".")
+    if any(host == bare or host.endswith("." + bare) for host in hosts):
+        return True
+    return any(bare == suffix or bare.endswith("." + suffix) for suffix in suffixes)
 
 
 def _unsafe_proxy(value: str, schemes: tuple[str, ...] = ("http", "https")) -> str | None:

@@ -237,6 +237,37 @@ class AllowlistTests(_Base):
         )
         self.assertEqual(model, decision.model)
 
+    def test_session_consumes_a_flag_shaped_value(self) -> None:
+        # --session takes the next token. A following "--model" is that value, not a binding.
+        cases = (
+            ("pi", "chatgpt", "sign_in_with_chatgpt", self.wrapper.launcher_path, True),
+            ("opencode", "chatgpt", "sign_in_with_chatgpt", "opencode", False),
+            ("hermes", "grok", "grok_sign_in", self.wrapper.launcher_path, True),
+        )
+        for engine, provider, method, argv0, pinned in cases:
+            model = provider + "/test-model"
+            profile = self.sub(provider, method, model=model)
+            if engine == "hermes":
+                profile[HERMES_ADOPT_EXTERNAL_LOGINS] = False
+            kwargs = {"route_home": str(self.home), "parent_env": self.parent(), "operator_home": str(self.operator),
+                      "wrapper": self.wrapper if pinned else None}
+            with self.subTest(engine=engine, bound=False):
+                self.launcher.reset_mock()
+                argv = [argv0, "--session", "--model", model]
+                with self.assertRaises(SubscriptionRouteRefused) as caught:
+                    guard_then_spawn(self.launcher, argv, engine, profile, self.bare_env(), **kwargs)
+                self.assertEqual(caught.exception.cause, "model_not_bound")
+                self.launcher.assert_not_called()
+            with self.subTest(engine=engine, bound=True):
+                self.launcher.reset_mock()
+                bound = [argv0, "--session", "chat", "--model", model]
+                decision, _ = guard_then_spawn(self.launcher, bound, engine, profile, self.bare_env(), **kwargs)
+                self.assertEqual(model, decision.model)
+            if engine == "hermes":
+                cfg = self.home / ".hermes" / "config.yaml"
+                if cfg.is_file() and not cfg.is_symlink():
+                    cfg.unlink()
+
     def test_no_token_rides_along_with_a_sign_in(self) -> None:
         cases = [({"OPENAI_API_KEY": FAKE_KEY}, "credential_env_on_subscription"),
                  ({"ANTHROPIC_API_KEY": FAKE_KEY}, "credential_env_on_subscription"),

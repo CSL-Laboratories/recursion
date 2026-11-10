@@ -35,6 +35,7 @@ import os
 import selectors
 import signal
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -237,14 +238,15 @@ def check_copilot_own_loop(
 
     The login probe is the caller's callable, not an argv. It runs with a deadline
     (``probe_deadline``, at most ``LOGIN_PROBE_DEADLINE_S``). A probe that raises, including
-    ``SystemExit``, or that does not return in time, is not a login. Where a new process group can
+    ``SystemExit``, or that does not return in time, is not a login.     Where a new process group can
     be made, every exit signals that group (SIGTERM, then SIGKILL inside the deadline). A descendant
     that calls ``setpgid`` leaves the group and is not signalled. Where the group cannot be made,
-    or another thread is already running, the route refuses and does not fork.
+    or another thread is already running (including one started with ``_thread``), the route refuses
+    and does not fork. ``home`` is required: without it the probe would see the ambient account.
 
-    When ``home`` is the route home, the probe runs with the environment the child will receive,
-    including ``HOME`` and ``COPILOT_HOME`` (``<home>/.copilot``). Copilot CLI >= 1.0.1 uses
-    ``COPILOT_HOME`` and ignores ``XDG_CONFIG_HOME``, so the probe and the child see one account.
+    The probe runs with the environment the child will receive, including ``HOME`` and
+    ``COPILOT_HOME`` (``<home>/.copilot``). Copilot CLI >= 1.0.1 uses ``COPILOT_HOME`` and ignores
+    ``XDG_CONFIG_HOME``, so the probe and the child see one account.
     """
 
     _common("copilot", route, _COPILOT_FIELDS, "copilot_cli_sign_in")
@@ -256,8 +258,17 @@ def check_copilot_own_loop(
     strip = COPILOT_STRIP_ENV + _GH_FALLBACK_ENV
     # Any other provider credential (ANTHROPIC_API_KEY, OPENAI_API_KEY, ...) is not this run's either.
     # The allowlist then drops whatever the strip does not name (GH_PAT, AWS_*, GIT_CONFIG_*).
+    # A missing home would run the probe in the ambient account and approve a different child account.
+    if not isinstance(home, str) or not home:
+        raise OwnLoopRouteRefused("copilot", "route_home_missing")
+    # Before the env is built, so a platform that cannot enforce the probe never creates the home,
+    # and a live thread never reaches fork.
+    if not _probe_enforceable():
+        raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe unenforceable")
+    if _other_threads():
+        raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe threaded")
     child, removed = _project_child(parent_env, lambda name: name in strip or _is_provider_credential(name))
-    probe_env = _copilot_runtime_env(child, home).to_dict() if home else None
+    probe_env = _copilot_runtime_env(child, home).to_dict()
     present = _probe_login(has_copilot_login, probe_deadline, probe_env)
     if not present:
         raise OwnLoopRouteRefused("copilot", "no_stored_copilot_login", "run `copilot login`; gh fallback refused")
@@ -425,38 +436,58 @@ _ACK = b"\x01"
 
 
 def _probe_enforceable() -> bool:
-    """True when the probe callable can be put in its own process group and that group can be signalled."""
+    """True when the probe can be grouped and that group id cannot be reused before the signal.
+
+    ``pidfd_open`` holds the worker pid until the last signal. Without it a reaped leader's
+    process-group id can be reused, so the probe refuses instead of calling ``killpg``.
+    """
 
     return (
         os.name != "nt"
         and hasattr(os, "fork")
         and hasattr(os, "killpg")
         and hasattr(os, "setsid")
+        and hasattr(os, "pidfd_open")
     )
 
 
 def _other_threads() -> bool:
     """True when some thread other than this one is alive.
 
-    ``fork`` copies only this thread. A lock that thread holds is never released in the child, so
-    the probe deadlocks. The callable is an arbitrary closure and cannot be sent to a forkserver.
+    ``threading.enumerate`` misses a thread started with ``_thread``. ``sys._current_frames`` sees
+    Python threads, and ``/proc/self/task`` sees native threads. ``fork`` copies only this thread.
+    A lock another thread holds is never released in the child, so the probe deadlocks. The
+    callable is an arbitrary closure and cannot be sent to a forkserver.
     """
 
     current = threading.current_thread()
-    return any(thread is not current and thread.is_alive() for thread in threading.enumerate())
+    if any(thread is not current and thread.is_alive() for thread in threading.enumerate()):
+        return True
+    if len(sys._current_frames()) > 1:
+        return True
+    task_dir = "/proc/self/task"
+    if os.path.isdir(task_dir):
+        try:
+            tasks = os.listdir(task_dir)
+        except OSError:
+            tasks = []
+        if len(tasks) > 1:
+            return True
+    return False
 
 
 def _probe_login(probe: Callable[[], bool], deadline: float, env: Mapping[str, str] | None = None) -> bool:
     """Run ``probe`` until ``deadline``. ``SystemExit`` and a missed deadline are not a login.
 
     ``probe`` stays a callable: it is the caller's check, not a command this module can turn into
-    argv. On a platform that can ``fork``, the callable runs in a new process group. Every exit,
-    including a login that is present, signals that group: SIGTERM, then a short grace still inside
-    ``deadline``, then SIGKILL. The group is the one confirmed by the handshake byte. A descendant
-    that calls ``setpgid(0, 0)`` leaves the group and is not signalled. Where that group cannot be
-    enforced, the route refuses ``probe unenforceable``. Where another thread is alive, it refuses
-    ``probe threaded`` and does not fork. A thread started after that check and before ``fork`` is
-    still a race; refusing is what a non-picklable callable can do.
+    argv. On a platform that can ``fork`` and hold a pidfd, the callable runs in a new process
+    group. Every exit, including a login that is present, signals that group: SIGTERM, then a short
+    grace still inside ``deadline``, then SIGKILL. The group is the one confirmed by the handshake
+    byte. A descendant that calls ``setpgid(0, 0)`` leaves the group and is not signalled. Where
+    that group cannot be enforced, the route refuses ``probe unenforceable``. Where another thread
+    is alive, including a ``_thread`` or native thread, it refuses ``probe threaded`` and does not
+    fork. A thread started after that check and before ``fork`` is still a race; refusing is what a
+    non-picklable callable can do.
     """
 
     if (isinstance(deadline, bool) or not isinstance(deadline, (int, float)) or not math.isfinite(deadline)
@@ -469,70 +500,135 @@ def _probe_login(probe: Callable[[], bool], deadline: float, env: Mapping[str, s
     return _probe_login_group(probe, deadline, env)
 
 
+def _direct_child_pids() -> set[int]:
+    """Pids whose parent is this process. Empty when ``/proc`` cannot be read."""
+
+    me = os.getpid()
+    found: set[int] = set()
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return found
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/status", encoding="ascii") as handle:
+                text = handle.read()
+        except OSError:
+            continue
+        for line in text.splitlines():
+            if line.startswith("PPid:"):
+                if int(line.split()[1]) == me:
+                    found.add(int(name))
+                break
+    return found
+
+
+def _kill_untracked(before: set[int]) -> None:
+    """Kill and reap direct children that appeared after ``before``.
+
+    Used when ``fork`` itself raises after creating the child, so the parent never received the
+    pid. SIGKILL is retried if a ``KeyboardInterrupt`` arrives during the signal.
+    """
+
+    for child in _direct_child_pids() - before:
+        for _ in range(8):
+            try:
+                os.kill(child, signal.SIGKILL)
+                break
+            except KeyboardInterrupt:
+                continue
+            except OSError:
+                break
+        try:
+            os.waitpid(child, 0)
+        except ChildProcessError:
+            pass
+        except KeyboardInterrupt:
+            try:
+                os.waitpid(child, 0)
+            except (ChildProcessError, KeyboardInterrupt):
+                pass
+
+
 def _probe_login_group(
     probe: Callable[[], bool], deadline: float, env: Mapping[str, str] | None,
 ) -> bool:
-    """Run ``probe`` in its own process group and signal that group on every exit path."""
+    """Run ``probe`` in its own process group and signal that group on every exit path.
 
-    status_r, status_w = os.pipe()
-    try:
-        ack_r, ack_w = os.pipe()
-    except OSError:
-        _close_fd(status_r)
-        _close_fd(status_w)
-        raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe failed") from None
-    opened = (status_r, status_w, ack_r, ack_w)
+    Pipe fds, the worker and its pidfd are released on every exit, including ``KeyboardInterrupt``
+    raised by ``fork`` or during the later signal. The pidfd stays open until after the last
+    signal so the process-group id cannot be reused if another handler reaps the worker first.
+    """
+
+    status_r = status_w = ack_r = ack_w = -1
     pid: int | None = None
-    try:
-        for fd in opened:
-            os.set_inheritable(fd, False)
-        os.set_blocking(status_r, False)
-        if _other_threads():
-            raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe threaded")
-        pid = os.fork()
-    except OwnLoopRouteRefused:
-        for fd in opened:
-            _close_fd(fd)
-        raise
-    except OSError:
-        for fd in opened:
-            _close_fd(fd)
-        raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe failed") from None
-    if pid == 0:
-        _probe_child(probe, status_r, status_w, ack_r, ack_w, env)
-    _close_fd(status_w)
-    _close_fd(ack_r)
-    selector: selectors.BaseSelector | None = None
     pgid: int | None = None
+    pidfd: int | None = None
+    selector: selectors.BaseSelector | None = None
     outcome: dict[str, object] = {}
     started = time.monotonic()
+    before_fork: set[int] = set()
     try:
-        selector = selectors.DefaultSelector()
-        selector.register(status_r, selectors.EVENT_READ)
-        pgid, reason = _read_handshake(selector, status_r, pid, started, deadline)
-        if pgid is None:
-            detail = "probe deadline" if reason == "deadline" else "probe failed"
-            outcome["refused"] = OwnLoopRouteRefused("copilot", "copilot_login_unknown", detail)
-        else:
-            # The group id is recorded before the child is allowed to run the callable.
-            _write_ack(ack_w)
-            line, complete, timed_out = _read_status(selector, status_r, started, deadline)
-            if timed_out or not complete:
-                detail = "probe deadline" if timed_out else "probe failed"
+        try:
+            status_r, status_w = os.pipe()
+            ack_r, ack_w = os.pipe()
+            for fd in (status_r, status_w, ack_r, ack_w):
+                os.set_inheritable(fd, False)
+            os.set_blocking(status_r, False)
+            if _other_threads():
+                raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe threaded")
+            before_fork = _direct_child_pids()
+            pid = os.fork()
+            if pid == 0:
+                _probe_child(probe, status_r, status_w, ack_r, ack_w, env)
+            try:
+                pidfd = os.pidfd_open(pid, 0)
+            except OSError:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe unenforceable") from None
+            _close_fd(status_w)
+            status_w = -1
+            _close_fd(ack_r)
+            ack_r = -1
+            selector = selectors.DefaultSelector()
+            selector.register(status_r, selectors.EVENT_READ)
+            pgid, reason = _read_handshake(selector, status_r, pid, started, deadline)
+            if pgid is None:
+                detail = "probe deadline" if reason == "deadline" else "probe failed"
                 outcome["refused"] = OwnLoopRouteRefused("copilot", "copilot_login_unknown", detail)
             else:
-                outcome["line"] = line
-    except BaseException as exc:
-        outcome["error"] = exc
+                # The group id is recorded before the child is allowed to run the callable.
+                _write_ack(ack_w)
+                line, complete, timed_out = _read_status(selector, status_r, started, deadline)
+                if timed_out or not complete:
+                    detail = "probe deadline" if timed_out else "probe failed"
+                    outcome["refused"] = OwnLoopRouteRefused("copilot", "copilot_login_unknown", detail)
+                else:
+                    outcome["line"] = line
+        except OwnLoopRouteRefused as exc:
+            outcome["refused"] = exc
+        except BaseException as exc:
+            outcome["error"] = exc
     finally:
         try:
             _stop_probe(pid, pgid, started, deadline)
         finally:
             if selector is not None:
                 selector.close()
-            _close_fd(status_r)
-            _close_fd(ack_w)
-            _reap_probe(pid)
+            for fd in (status_r, status_w, ack_r, ack_w):
+                if fd >= 0:
+                    _close_fd(fd)
+            if pidfd is not None and pidfd >= 0:
+                _close_fd(pidfd)
+            if pid is None:
+                _kill_untracked(before_fork)
+            else:
+                _reap_probe(pid)
     return _finish_probe(outcome)
 
 
@@ -761,18 +857,30 @@ def _group_alive(pid: int, pgid: int | None) -> bool:
             return True
 
 
-def _leader_exited(pid: int) -> bool:
-    """True when the direct child has exited. ``WNOWAIT`` observes that without reaping it."""
+def _leader_zombie(pid: int) -> bool:
+    """True when ``/proc/<pid>/stat`` shows a zombie. This is not a wait and does not reap."""
 
-    if not hasattr(os, "waitid") or not hasattr(os, "WNOWAIT"):
-        return False
     try:
-        info = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
-    except ChildProcessError:
-        return True
+        with open(f"/proc/{pid}/stat", encoding="ascii") as handle:
+            text = handle.read()
     except OSError:
         return False
-    return info is not None
+    end = text.rfind(")")
+    if end < 0 or end + 2 >= len(text):
+        return False
+    return text[end + 2:].split(" ", 1)[0] == "Z"
+
+
+def _signal_last(pid: int, pgid: int | None, sig: int) -> None:
+    """Deliver ``sig``. A ``KeyboardInterrupt`` during the call is retried so the signal still lands."""
+
+    for _ in range(8):
+        try:
+            _signal_group(pid, pgid, sig)
+            return
+        except KeyboardInterrupt:
+            continue
+    _signal_group(pid, pgid, sig)
 
 
 def _stop_probe(pid: int | None, pgid: int | None, started: float, deadline: float) -> None:
@@ -781,28 +889,48 @@ def _stop_probe(pid: int | None, pgid: int | None, started: float, deadline: flo
     SIGTERM, then SIGKILL if a live member is still in that process group when the grace runs out.
     A descendant that calls setpgid(0, 0) leaves the process group and is not signalled. This is
     not session cleanup: that descendant stays in the session. The grace is at most 20% of the
-    deadline, and never more than ``_PROBE_GRACE_S`` or past ``started + deadline``. The direct
-    child is not reaped here, so its pid cannot be reused before the signal.
+    deadline, and never more than ``_PROBE_GRACE_S`` or past ``started + deadline``. A zombie
+    leader, seen from ``/proc`` and not by waiting, skips the grace. The direct child is not
+    reaped here. SIGKILL still runs when SIGTERM raises ``KeyboardInterrupt``. SIGINT is blocked
+    for the duration so a real interrupt cannot skip that final signal.
     """
 
     if pid is None or pid <= 0 or pid == os.getpid():
         return
+    blocked = False
+    if hasattr(signal, "pthread_sigmask"):
+        try:
+            signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+            blocked = True
+        except (OSError, ValueError):
+            blocked = False
+    pending = False
     try:
-        _signal_group(pid, pgid, signal.SIGTERM)
-    except OSError:
-        pass
-    if not _leader_exited(pid):
-        remaining = (started + deadline) - time.monotonic()
-        grace = min(_kill_grace(deadline), max(0.0, remaining))
-        stop = time.monotonic() + grace
-        while _group_alive(pid, pgid) and time.monotonic() < stop:
-            if _leader_exited(pid):
-                break
-            time.sleep(0.01)
-    try:
-        _signal_group(pid, pgid, signal.SIGKILL)
-    except OSError:
-        pass
+        try:
+            _signal_group(pid, pgid, signal.SIGTERM)
+        except KeyboardInterrupt:
+            pending = True
+        finally:
+            if not pending and not _leader_zombie(pid) and _group_alive(pid, pgid):
+                try:
+                    remaining = (started + deadline) - time.monotonic()
+                    grace = min(_kill_grace(deadline), max(0.0, remaining))
+                    stop = time.monotonic() + grace
+                    while _group_alive(pid, pgid) and time.monotonic() < stop:
+                        if _leader_zombie(pid):
+                            break
+                        time.sleep(0.01)
+                except KeyboardInterrupt:
+                    pending = True
+            _signal_last(pid, pgid, signal.SIGKILL)
+    finally:
+        if blocked:
+            try:
+                signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})
+            except OSError:
+                pass
+    if pending:
+        raise KeyboardInterrupt
 
 
 def _reap_probe(pid: int | None) -> None:
@@ -843,73 +971,62 @@ def _is_provider_credential(name: str) -> bool:
 
 
 def _copilot_runtime_env(child: Mapping[str, str], home: str):
-    """The environment the Copilot child and, when ``home`` is set, the login probe both receive.
+    """The environment the Copilot child and the login probe both receive.
 
     ``COPILOT_HOME`` is ``<home>/.copilot``. A parent ``COPILOT_HOME`` or ``XDG_CONFIG_HOME`` does
     not select a different account. Copilot CLI >= 1.0.1 reads ``COPILOT_HOME`` and ignores
-    ``XDG_CONFIG_HOME``.
+    ``XDG_CONFIG_HOME``. The directory is created mode ``0700`` when it is absent. An existing
+    entry, including a symlink, is left in place and must already be a private directory.
     """
 
+    copilot_home = os.path.join(home, ".copilot")
+    if not os.path.lexists(copilot_home):
+        try:
+            os.mkdir(copilot_home, 0o700)
+        except FileExistsError:
+            pass
+        else:
+            try:
+                os.chmod(copilot_home, 0o700)
+            except OSError:
+                pass
     parent = {name: value for name, value in child.items() if name != "HOME"}
     return build_child_env(
         "copilot", home=home, auth_mode="subscription", parent=parent,
-        overrides={"COPILOT_HOME": os.path.join(home, ".copilot")},
+        overrides={"COPILOT_HOME": copilot_home},
     )
 
 
-def _flag_values(argv: Sequence[str], flag: str) -> list[str]:
-    """Values of ``flag`` and ``flag=`` before ``--``. A bare flag with no value contributes ``""``."""
+def _refusal_origin(url: str) -> str:
+    """Canonical origin for a refusal. The path, query and fragment are not copied into the text."""
 
-    values: list[str] = []
-    index = 1
-    while index < len(argv):
-        item = argv[index]
-        if item == "--":
-            break
-        if item == flag:
-            if index + 1 >= len(argv):
-                values.append("")
-                return values
-            values.append(argv[index + 1])
-            index += 2
-            continue
-        prefix = flag + "="
-        if item.startswith(prefix):
-            values.append(item[len(prefix):])
-            index += 1
-            continue
-        index += 1
-    return values
-
-
-def _argv_has_model_flag(argv: Sequence[str]) -> bool:
-    for index, item in enumerate(argv):
-        if index == 0:
-            continue
-        if item == "--":
-            break
-        if item in ("--model", "-m") or item.startswith("--model=") or (
-            item.startswith("-m") and len(item) > 2
-        ):
-            return True
-    return False
+    try:
+        origin = _format_origin(urlsplit(url))
+    except (TypeError, ValueError):
+        return "base url"
+    return origin or "base url"
 
 
 def _require_checked_argv(argv: Sequence[str], decision: OwnLoopDecision) -> None:
-    """Refuse caller argv that does not carry the decision's model, base URL and adapters."""
+    """Refuse caller argv that does not carry the decision's model, base URL and adapters.
 
-    from recursion_core.subscription_routes.policy import _argv_binds_model
+    One scan consumes each flag's value, so a model value spelled ``--adapter`` is not also an
+    adapter flag. A refused base URL is reported as its origin only.
+    """
 
+    from recursion_core.subscription_routes.policy import _scan_argv
+
+    models, base_urls, adapters, saw_model = _scan_argv(argv, decision.engine)
     if decision.model:
-        if not _argv_binds_model(list(argv), decision.model, decision.engine):
+        if not models or any(value != decision.model for value in models):
             raise OwnLoopRouteRefused(decision.engine, "model_not_bound", decision.model)
-    elif _argv_has_model_flag(argv):
+    elif saw_model:
         raise OwnLoopRouteRefused(decision.engine, "model_not_bound")
     if decision.base_url:
-        if _flag_values(argv, "--base-url") != [decision.base_url]:
-            raise OwnLoopRouteRefused(decision.engine, "base_url_not_bound", decision.base_url)
+        if base_urls != [decision.base_url]:
+            raise OwnLoopRouteRefused(decision.engine, "base_url_not_bound", _refusal_origin(decision.base_url))
     if decision.adapters:
-        if _flag_values(argv, "--adapter") != list(decision.adapters):
+        if adapters != list(decision.adapters):
             raise OwnLoopRouteRefused(decision.engine, "adapter_not_bound")
 
 
@@ -941,9 +1058,11 @@ def spawn_copilot_own_loop(
 ) -> tuple[OwnLoopDecision, subprocess.Popen]:
     """``check_copilot_own_loop`` then ``child_env.spawn``. A refused env never reaches ``Popen``.
 
-    The login probe sees the same ``HOME`` and ``COPILOT_HOME`` as the child.
+    The login probe sees the same ``HOME`` and ``COPILOT_HOME`` as the child. ``argv`` is copied
+    once here and that copy is what the check and the launch both see.
     """
 
+    argv = tuple(argv)
     decision = check_copilot_own_loop(
         route, parent_env, has_copilot_login=has_copilot_login, home=home,
     )
@@ -959,8 +1078,12 @@ def spawn_nous_own_loop(
     interactive_users: Iterable[str] | None = None,
     cwd: str | None = None,
 ) -> tuple[OwnLoopDecision, subprocess.Popen]:
-    """``check_nous_own_loop`` then ``child_env.spawn``. A refused env never reaches ``Popen``."""
+    """``check_nous_own_loop`` then ``child_env.spawn``. A refused env never reaches ``Popen``.
 
+    ``argv`` is copied once here and that copy is what the check and the launch both see.
+    """
+
+    argv = tuple(argv)
     decision = check_nous_own_loop(
         route, parent_env, current_user=current_user, interactive_users=interactive_users,
     )

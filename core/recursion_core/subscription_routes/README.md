@@ -142,27 +142,38 @@ PRODUCT.md `055cc7a5` section 3.3. `own_loop.py`, checked before any spawn or re
   this package can turn into argv, and nothing here opens a login store. An argv/`Popen` contract
   was not adopted: the caller supplies the check (a lambda or a nested function), and a subprocess
   would need a different product API. The callable is not picklable, so there is no forkserver.
-  Where another thread is already alive, the route refuses `probe threaded` and does not fork: a
-  lock that thread holds is never released in the child. A thread started in the gap before
-  `fork` is still a race. Where `fork`, `setsid` and `killpg` exist, the child calls `setsid`,
-  writes a handshake byte, and does not run the callable until the parent has recorded that
-  process group and written an ack. Every exit, including a probe that returns true, signals that
-  original process group: SIGTERM, then at most 20% of the deadline (never more than 200 ms) and
-  still inside the deadline, then SIGKILL. The direct child is reaped only after those signals.
-  A descendant that calls `setpgid(0, 0)` leaves the process group and stays in the session; it
-  is not signalled. This is not session cleanup. Where the group cannot be enforced (Windows),
-  the route refuses `probe unenforceable` and does not leave a daemon thread running.
-  `spawn_copilot_own_loop` passes the route home into the probe. The probe then runs with the
-  child's final environment: `HOME` is the route home and `COPILOT_HOME` is `<home>/.copilot`.
-  Copilot CLI >= 1.0.1 reads `COPILOT_HOME` (otherwise `~/.copilot`) and ignores
+  Where another thread is already alive, the route refuses `probe threaded` and does not fork.
+  That includes a `threading` thread, a thread started with `_thread`, and any extra native thread
+  in `/proc/self/task`. A lock that thread holds is never released in the child. A thread started
+  in the gap before `fork` is still a race. `home` is required (`route_home_missing` otherwise):
+  a probe without it would approve the ambient account. Where `fork`, `setsid`, `killpg` and
+  `pidfd_open` exist, the child calls `setsid`, writes a handshake byte, and does not run the
+  callable until the parent has recorded that process group and written an ack. The parent holds
+  a pidfd from just after `fork` until after the last signal, so a handler that reaps the worker
+  first cannot free the process-group id for reuse. Every exit, including a probe that returns
+  true, signals that original process group: SIGTERM, then at most 20% of the deadline (never
+  more than 200 ms) and still inside the deadline, then SIGKILL. A `KeyboardInterrupt` during
+  cleanup still delivers SIGKILL, then closes the pipe fds and reaps. The direct child is reaped
+  only after those signals. A descendant that calls `setpgid(0, 0)` leaves the process group and
+  stays in the session; it is not signalled. This is not session cleanup. Where the group cannot
+  be enforced (Windows, or any platform without `pidfd_open`), the route refuses
+  `probe unenforceable` and does not leave a daemon thread running.
+  The probe runs with the child's final environment: `HOME` is the route home and `COPILOT_HOME`
+  is `<home>/.copilot`, created mode `0700` when absent. An existing `COPILOT_HOME` must be a
+  private directory owned by this user, not a symlink and not world-accessible, the same rule as
+  `HOME`. Copilot CLI >= 1.0.1 reads `COPILOT_HOME` (otherwise `~/.copilot`) and ignores
   `XDG_CONFIG_HOME`, which is not on the allowlist. A parent `COPILOT_HOME` does not select
-  another account. A check that does not pass `home` leaves the probe on the process environment.
-- **Spawn argv.** `spawn_copilot_own_loop` and `spawn_nous_own_loop` refuse caller argv that does
-  not carry the decision's model, base URL and adapters (`model_not_bound`, `base_url_not_bound`,
-  `adapter_not_bound`). Copilot is rebuilt on the Copilot `child_env` profile. `NO_PROXY` is
-  matched against Copilot's hosts (GitHub and `githubcopilot.com`), not Codex's, so
-  `NO_PROXY=api.openai.com` is kept. `NO_PROXY=api.github.com` with a proxy still refuses.
-  The host list is the public Copilot service names used for that check.
+  another account.
+- **Spawn argv.** `spawn_copilot_own_loop` and `spawn_nous_own_loop` copy `argv` once at entry
+  and use that copy for the check and the launch. They refuse caller argv that does not carry
+  the decision's model, base URL and adapters (`model_not_bound`, `base_url_not_bound`,
+  `adapter_not_bound`). One scan consumes each flag's value, so a model value of `--adapter` is
+  not also an adapter flag. A `base_url_not_bound` refusal names the canonical origin only, not
+  the path. Copilot is rebuilt on the Copilot `child_env` profile. `NO_PROXY` is matched against
+  Copilot's hosts and the `githubcopilot.com` family, not Codex's, so `NO_PROXY=api.openai.com`
+  is kept. `NO_PROXY=api.github.com`, `NO_PROXY=api.githubcopilot.com` and
+  `NO_PROXY=*.githubcopilot.com` with a proxy refuse. `notgithubcopilot.com` does not match the
+  family. The literal host list is the public Copilot service names used for that check.
 - **Harness credential.** `launch_env` injects only `ANTHROPIC_API_KEY` (Claude profile) or
   `OPENAI_API_KEY` (OpenAI profile), both inside the `ValidatedEnv`. Every launch, including an
   OpenAI key, goes through `child_env.spawn`, so a world-writable executable is refused.
@@ -172,9 +183,10 @@ PRODUCT.md `055cc7a5` section 3.3. `own_loop.py`, checked before any spawn or re
   `HERMES_*` and `NOUS_*` name, including ones that are not tokens; a second `--model` / `-m` that
   names a different model (real CLIs often take the last flag). A subscription model binds only
   before `--`, as `--model X` or `-m X`. `opencode`, `hermes`, `copilot` and `nous` also accept
-  `--model=X`, `-m=X` and an attached `-mX`. Pi's `--system-prompt` and `--append-system-prompt`
-  consume the next element, even when it is spelled like a model flag. `argv[0]` and a bare
-  element do not bind. `opencode run chatgpt/good` refuses `model_not_bound`.
+  `--model=X`, `-m=X` and an attached `-mX`. Pi's `--system-prompt` and `--append-system-prompt`,
+  and `--session` on Pi, OpenCode, Hermes, Copilot and Nous, consume the next element, even when
+  it is spelled like a model flag. `argv[0]` and a bare element do not bind.
+  `opencode run chatgpt/good` refuses `model_not_bound`.
 - **Env families dropped on top of the allowlist**, for both Copilot and Nous: suffixes `_SECRET`,
   `_PASSWORD`, `_KEY`, `_PAT`, `_CREDENTIALS`; prefixes `AWS_`, `AZURE_`, `ARM_`, `GOOGLE_`,
   `CLOUDSDK_`, `GCLOUD_`, `DYLD_`; and `SSH_AUTH_SOCK`, `SSH_ASKPASS`, `GIT_ASKPASS`, `GIT_SSH`,

@@ -15,14 +15,22 @@ it also needs ``found >= functional``. When it is unset, the engine still runs
 under the beta tag.
 Identity is checked positively only where the real version line is recorded and
 names the engine (``ident_required``): claude_code (``2.1.318 (Claude Code)``),
-codex (``codex-cli 0.160.0``), opencode (``opencode v2.2.5``) and hermes (read via
-``hermes-acp 0.9.1``). For these, a line that does not match ``ident`` is refused
-(``identity_mismatch``). An engine with no identity rule (``ident=None``; Pi) is
-refused (``identity_unverified``) before its binary is run. For grok, antigravity,
-cursor and gemini the real line is bare or unread, so no format is invented: a
-native binary with the right name printing a bare version that passes the floors
+codex (``codex-cli 0.160.0``) and opencode (``opencode v2.2.5``). For these, a line
+that does not match ``ident`` is refused (``identity_mismatch``). An engine with no
+identity rule and no pin is refused (``identity_unverified``) before its binary is
+run. For grok and gemini the real line is bare or unread, so no format is invented:
+a native binary with the right name printing a bare version that passes the floors
 is granted, and the only identity check is that the line names no other engine.
-Whether those four need a pinned digest or are accepted as is, is open for Lucas.
+Whether those two need a pinned digest or are accepted as is, is open for Lucas.
+
+Pinned routes (``pin``; Lucas's owner call of 2026-11-09): pi, hermes and cursor
+(``launcher+tree``) and antigravity (``binary+launcher``) are granted only when the
+install matches a pin in ``pins.py``; the pin is their identity and their version,
+nothing is run, and the grant is beta. Any mismatch is ``pin_mismatch`` until
+re-pinned. Gemini CLI is kept as an API-key route only (``api_key_only``): Google
+ended sign-in for it on 2026-06-18 and the Google subscription route is Antigravity
+CLI (``agy``). A Gemini launch plan needs ``auth="api_key"``; anything else is
+``sign_in_refused``. It gets no pin, so a real Gemini CLI (a JS bundle) stays refused.
 A floor change is a new ``FLOOR_TABLE_VERSION``, never an in-place edit; grants
 issued under another table version are refused (``grant_stale``).
 """
@@ -35,9 +43,10 @@ import re
 from dataclasses import dataclass
 from types import MappingProxyType
 
+from recursion_core.launch_check import pins
 from recursion_core.launch_check.refusals import LaunchRefused
 
-FLOOR_TABLE_VERSION = "r2a-floors/1.3.0-candidate-2026-11-09"
+FLOOR_TABLE_VERSION = "r2a-floors/1.4.0-candidate-2026-11-09"
 
 
 @dataclass(frozen=True)
@@ -53,6 +62,9 @@ class EngineSpec:
     ident_required: bool = False  # the real line names the engine: require an ident match
     probe_name: str | None = None  # sibling binary read for the version, if not the engine itself
     probe_env: tuple[tuple[str, str], ...] = ()  # extra fixed probe variables (no secrets)
+    pin: str | None = None  # pinned route kind (pins.KINDS): granted only on a pin match, as beta
+    api_key_only: bool = False  # no subscription sign-in route: a launch plan needs auth="api_key"
+    note: str = ""  # route note appended to this engine's wrapper and pin refusals
 
 
 _SPECS = (
@@ -84,35 +96,42 @@ _SPECS = (
         "O50: Grok's once measured; not measured", "none derived (D2-72)",
         ident=r"\bgrok\b",
     ),
+    # Antigravity CLI: the Google subscription route since Gemini CLI stopped serving
+    # individual accounts (2026-06-18). One Go binary; pinned by version, binary and launcher.
     EngineSpec(
         "antigravity", ("agy",), "semver", None, None,
-        "never read or measured; version format assumed semver", "none recorded",
+        "no conformance measurement; pinned beta route", "none recorded",
         ident=r"\bantigravity\b|\bagy\b",
+        pin="binary+launcher",
+        note="Antigravity CLI (agy) runs as beta only when its version, binary and launcher match a pin",
     ),
     EngineSpec(
         "cursor", ("agent", "cursor-agent"), "date", None, "2025.09.17-25b418f",
-        "no conformance measurement", "D2-72 (codex-verify348 record)",
+        "no conformance measurement; pinned beta route", "D2-72 (codex-verify348 record)",
         ident=r"\bcursor\b",
+        pin="launcher+tree",
     ),
+    # Gemini CLI: API-key route only. No pin, so the real JS bundle stays wrapper_refused.
     EngineSpec(
         "gemini", ("gemini",), "semver", None, "0.39.1",
         "no conformance measurement", "D2-72 (CVE map)",
         ident=r"\bgemini\b",
+        api_key_only=True,
+        note="Gemini CLI is kept as an API-key route only; the Google subscription route is Antigravity CLI (agy)",
     ),
+    # Pi, Hermes: a JS bundle and a Python entry point (11.6). "pi" is too short to search
+    # for safely, so Pi has no ident; for both, the pin is the identity and the version.
     EngineSpec(
         "pi", ("pi",), "semver", None, None,
-        "no record", "none recorded",
-        # "pi" is too short to search for safely, and the real Pi is a JS bundle (11.6), so a
-        # native `pi` is some other tool. No identity rule: refused (identity_unverified).
+        "no record; pinned beta route", "none recorded",
         ident=None,
+        pin="launcher+tree",
     ),
-    # Hermes: read with `hermes-acp --version`, which skips the network update check
-    # (PRODUCT.md 11.6, CSL-712 engine CLIs record).
     EngineSpec(
         "hermes", ("hermes",), "semver", None, None,
-        "no record", "none recorded",
-        ident=r"\bhermes\b", ident_required=True,
-        probe_name="hermes-acp",
+        "no record; pinned beta route", "none recorded",
+        ident=r"\bhermes\b",
+        pin="launcher+tree",
     ),
 )
 
@@ -195,9 +214,13 @@ def _floor_key(spec: EngineSpec, floor: str) -> tuple[int, ...]:
     return parsed.key
 
 
+def with_note(spec: EngineSpec, detail: str) -> str:
+    return f"{detail}. {spec.note}" if spec.note else detail
+
+
 def check_identity(spec: EngineSpec) -> None:
-    """Refuse an engine with no identity rule: its name and a version line alone prove nothing."""
-    if spec.ident is None:
+    """Refuse an engine with no identity rule and no pin: its name and a version line alone prove nothing."""
+    if spec.ident is None and spec.pin is None:
         raise LaunchRefused(
             "identity_unverified", spec.engine,
             "no identity rule or pinned digest for this engine; a name plus a version line is not enough",
@@ -241,6 +264,7 @@ def table_record() -> dict[str, object]:
     """The floor table as plain data, for the route record and the README."""
     return {
         "floor_table": FLOOR_TABLE_VERSION,
+        **pins.table_record(),
         "engines": {
             s.engine: {
                 "names": list(s.names),
@@ -250,7 +274,9 @@ def table_record() -> dict[str, object]:
                 "functional_basis": s.functional_basis,
                 "security_basis": s.security_basis,
                 "probe_name": s.probe_name,
-                "identity": "required" if s.ident_required else ("rule" if s.ident else "unverified"),
+                "identity": "pin" if s.pin else "required" if s.ident_required else ("rule" if s.ident else "unverified"),
+                "pin": s.pin,
+                "api_key_only": s.api_key_only,
             }
             for s in _SPECS
         },

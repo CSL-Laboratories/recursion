@@ -58,6 +58,7 @@ EXPECTED_CODES = {
     "engine_unknown", "path_not_absolute", "binary_missing", "wrapper_refused", "name_mismatch",
     "version_probe_failed", "binary_changed", "engine_mismatch", "identity_mismatch", "identity_unverified", "version_unparsed", "floor_unset",
     "version_refused", "argv_empty", "argv0_mismatch", "grant_forged", "grant_stale", "spawn_too_large",
+    "pin_mismatch", "sign_in_refused",
 }
 needs_exec = unittest.skipUnless(os.name == "posix", "POSIX fixtures")
 
@@ -76,6 +77,20 @@ class Base(unittest.TestCase):
 
     def claude(self, line: str = CLAUDE, **kw) -> str:
         return F.make("claude", line, **kw)
+
+    def unpinned(self, engine: str, **changes):
+        """The floor table with one pinned row turned back into a probed native row.
+
+        Pi, Hermes, Cursor and Antigravity are pinned routes since 2026-11-09 (test_pins.py).
+        The probed-path rules they used to exercise (date scheme, sibling probe binary) stay
+        covered here on a patched row.
+        """
+        table = dict(floors_mod.FLOORS)
+        table[engine] = dataclasses.replace(table[engine], pin=None, **changes)
+        return mock.patch.object(floors_mod, "FLOORS", table)
+
+    def probed_hermes(self):
+        return self.unpinned("hermes", probe_name="hermes-acp", ident_required=True)
 
 
 class RefusalCodeTests(Base):
@@ -137,15 +152,15 @@ class GrantTests(Base):
             ("opencode", "opencode2", "opencode v2.2.5", None),
             ("opencode", "opencode", "opencode 1.18.32", "version_refused"),
             ("opencode", "opencode", "opencode 1.18.33", None),
-            ("cursor", "agent", "2026.10.22", None),
-            ("cursor", "cursor-agent", "2026.10.01-e373342", None),
-            ("cursor", "agent", "2025.09.16-abcdef0", "version_refused"),
-            ("cursor", "agent", "2025.09.17-25b418f", None),
             ("gemini", "gemini", "0.39.0", "version_refused"),
             ("gemini", "gemini", "0.39.1", None),
             ("grok", "grok", "grok 1.0.0", None),
-            ("antigravity", "agy", "1.2.3", None),
-            ("pi", "pi", "0.30.2", "identity_unverified"),
+            # Pinned routes: a native file with the right name and a good version line is not a pin.
+            ("cursor", "agent", "2026.10.22", "pin_mismatch"),
+            ("cursor", "cursor-agent", "2026.10.01-e373342", "pin_mismatch"),
+            ("antigravity", "agy", "1.2.3", "pin_mismatch"),
+            ("pi", "pi", "0.30.2", "pin_mismatch"),
+            ("hermes", "hermes", "hermes 0.9.1", "pin_mismatch"),
         ]
         for engine, name, line, want in cells:
             for i in range(N):
@@ -162,20 +177,36 @@ class GrantTests(Base):
                     else:
                         self.refused(want, self.g, engine, p)
 
+    def test_date_scheme_floor_boundaries_on_a_probed_row(self) -> None:
+        cells = [
+            ("agent", "2026.10.22", None),
+            ("cursor-agent", "2026.10.01-e373342", None),
+            ("agent", "2025.09.16-abcdef0", "version_refused"),
+            ("agent", "2025.09.17-25b418f", None),
+        ]
+        with self.unpinned("cursor"):
+            for name, line, want in cells:
+                with self.subTest(line=line):
+                    p = F.make(name, line)
+                    if want is None:
+                        self.assertTrue(self.g("cursor", p).record()["beta"])
+                    else:
+                        self.refused(want, self.g, "cursor", p)
+
     def test_security_refusal_names_the_security_floor(self) -> None:
         r = self.refused("version_refused", self.g, "claude_code", self.claude("2.1.259 (Claude Code)"))
         self.assertIn("security", r.detail)
 
-    def test_hermes_reads_version_from_hermes_acp(self) -> None:
+    def test_probe_name_row_reads_version_from_the_sibling_binary(self) -> None:
+        # Hermes was this row until it became a pinned route; the probe_name rule is kept.
         d = F.dir()
         F.make("hermes", "", where=d)
         F.make("hermes-acp", "hermes-acp 0.9.1", where=d)
-        g = self.g("hermes", os.path.join(d, "hermes"))
-        self.assertTrue(g.record()["beta"])
-        self.assertEqual("0.9.1", g.version)
-        table = dict(floors_mod.FLOORS)
-        table["hermes"] = dataclasses.replace(table["hermes"], functional="0.9.0")
-        with mock.patch.object(floors_mod, "FLOORS", table):
+        with self.probed_hermes():
+            g = self.g("hermes", os.path.join(d, "hermes"))
+            self.assertTrue(g.record()["beta"])
+            self.assertEqual("0.9.1", g.version)
+        with self.unpinned("hermes", probe_name="hermes-acp", ident_required=True, functional="0.9.0"):
             g = self.g("hermes", os.path.join(d, "hermes"))
             self.assertFalse(g.record()["beta"])
             self.assertEqual(os.path.join(d, "hermes-acp"), g.probe_path)
@@ -185,10 +216,11 @@ class GrantTests(Base):
             F.make("hermes-acp", "hermes-acp 0.9.1", where=d)  # swapped probe binary
             self.refused("binary_changed", plan.exec_argv)
 
-    def test_hermes_without_hermes_acp_is_missing(self) -> None:
+    def test_probe_name_row_without_the_sibling_binary_is_missing(self) -> None:
         d = F.dir()
         F.make("hermes", "hermes 0.9.1", where=d)
-        self.refused("binary_missing", self.g, "hermes", os.path.join(d, "hermes"))
+        with self.probed_hermes():
+            self.refused("binary_missing", self.g, "hermes", os.path.join(d, "hermes"))
 
     def test_grant_is_immutable(self) -> None:
         g = self.g("claude_code", self.claude())
@@ -314,6 +346,7 @@ class GrantRefusalTests(Base):
     def test_native_pi_printing_a_semver_is_refused_unprobed(self) -> None:
         # Red-team F3 (#323): Pi has no identity rule and the real Pi is a JS bundle, so a native
         # `pi` printing a clean semver is some other tool. Refused before its binary is run.
+        # Since 2026-11-09 Pi is a pinned route: its identity is the pin, and this is pin_mismatch.
         calls: list[str] = []
 
         def counting_probe(spec, realpath, timeout):
@@ -323,20 +356,23 @@ class GrantRefusalTests(Base):
         for line in ("0.30.2", "pi 1.0.0", "v2.0.0"):
             with self.subTest(line=line):
                 p = F.make("pi", line)
-                r = self.refused("identity_unverified", grant, "pi", p, probe=counting_probe)
+                r = self.refused("pin_mismatch", grant, "pi", p, probe=counting_probe)
                 self.assertEqual("pi", r.engine)
-        self.assertEqual([], calls)
         if F.compiled:  # the real probe path too: the fixture must never be executed
-            self.refused("identity_unverified", grant, "pi", F.make("pi", "0.30.2"))
-        # A JS-bundle pi is still wrapper_refused first.
+            d = F.dir()
+            ran = os.path.join(d, "ran")
+            self.refused("pin_mismatch", grant, "pi", F.make("pi", "0.30.2", where=d, dump=ran))
+            self.assertFalse(os.path.exists(ran))
+        # A JS-bundle pi with no pin is refused the same way, and never run.
         d = F.dir()
-        self.refused("wrapper_refused", self.g, "pi", F.script(os.path.join(d, "pi"), "#!/usr/bin/env node\n"))
+        self.refused("pin_mismatch", grant, "pi", F.script(os.path.join(d, "pi"), "#!/usr/bin/env node\n"), probe=counting_probe)
+        self.assertEqual([], calls)
 
     def test_self_naming_engines_require_their_name_in_the_version_line(self) -> None:
         # Red-team round 2 F1 (#323): identity was only ever a refusal (another engine named),
         # never a requirement. Engines whose real line names them now need a positive match.
         required = sorted(e for e, s in FLOORS.items() if s.ident_required)
-        self.assertEqual(["claude_code", "codex", "hermes", "opencode"], required)
+        self.assertEqual(["claude_code", "codex", "opencode"], required)
         cells = [
             ("claude_code", "claude", "2.1.400"),
             ("claude_code", "claude", "v2.1.400"),
@@ -352,22 +388,26 @@ class GrantRefusalTests(Base):
                 with self.subTest(engine=engine, line=line, i=i):
                     r = self.refused("identity_mismatch", self.g, engine, F.make(name, line))
                     self.assertIn("does not name the engine", r.detail)
-        self.refused("identity_mismatch", self.g, "hermes", self._hermes("0.9.1"))
+        with self.probed_hermes():
+            self.refused("identity_mismatch", self.g, "hermes", self._hermes("0.9.1"))
         # Real-format lines still grant.
         for engine, name, line in (("claude_code", "claude", CLAUDE), ("claude_code", "claude", "2.1.400 (claude code)"),
                                    ("codex", "codex", CODEX), ("opencode", "opencode", "opencode v2.2.5")):
             with self.subTest(engine=engine, line=line):
                 self.assertEqual(engine, self.g(engine, F.make(name, line)).engine)
-        self.assertEqual("0.9.1", self.g("hermes", self._hermes("hermes-acp 0.9.1")).version)
+        with self.probed_hermes():
+            self.assertEqual("0.9.1", self.g("hermes", self._hermes("hermes-acp 0.9.1")).version)
 
     def test_bare_line_engines_have_no_positive_identity_check(self) -> None:
-        # Gemini, Cursor, Antigravity and Grok: the real line is bare or unread, so no format is
-        # invented (open for Lucas: pinned digest vs accept). A bare line passing the floors grants.
-        for engine, name, line in (("gemini", "gemini", "0.39.1"), ("cursor", "agent", "2026.10.22"),
-                                   ("antigravity", "agy", "1.2.3"), ("grok", "grok", "1.0.0")):
+        # Gemini and Grok: the real line is bare or unread, so no format is invented. A bare line
+        # passing the floors grants. Cursor and Antigravity were here until Lucas's 2026-11-09
+        # call made them pinned routes (test_pins.py).
+        for engine, name, line in (("gemini", "gemini", "0.39.1"), ("grok", "grok", "1.0.0")):
             with self.subTest(engine=engine):
                 self.assertFalse(FLOORS[engine].ident_required)
+                self.assertIsNone(FLOORS[engine].pin)
                 self.assertEqual(engine, self.g(engine, F.make(name, line)).engine)
+        self.assertEqual(["gemini", "grok"], sorted(e for e, s in FLOORS.items() if not s.ident_required and s.pin is None))
 
     def test_self_naming_rechecked_at_launch_plan(self) -> None:
         g = self.g("grok", F.make("grok", "1.0.0"))
@@ -377,8 +417,9 @@ class GrantRefusalTests(Base):
             self.refused("identity_mismatch", launch_plan, g, ["grok"])
 
     def test_every_engine_without_an_identity_rule_is_refused(self) -> None:
-        unverified = [e for e, s in FLOORS.items() if s.ident is None]
-        self.assertEqual(["pi"], unverified)
+        # Pi has no identity rule; its identity is its pin. No probed row is without a rule.
+        self.assertEqual(["pi"], [e for e, s in FLOORS.items() if s.ident is None])
+        self.assertEqual([], [e for e, s in FLOORS.items() if s.ident is None and s.pin is None])
         table = dict(floors_mod.FLOORS)
         table["grok"] = dataclasses.replace(table["grok"], ident=None)
         with mock.patch.object(floors_mod, "FLOORS", table):
@@ -395,7 +436,8 @@ class GrantRefusalTests(Base):
         self.refused("engine_mismatch", self.g, "claude_code", self.claude(CODEX))
         self.refused("engine_mismatch", self.g, "codex", F.make("codex", CLAUDE))
         self.refused("engine_mismatch", self.g, "opencode", F.make("opencode", "gemini 0.40.0"))
-        self.refused("engine_mismatch", self.g, "hermes", self._hermes("codex-cli 0.160.0"))
+        with self.probed_hermes():
+            self.refused("engine_mismatch", self.g, "hermes", self._hermes("codex-cli 0.160.0"))
 
     def _hermes(self, acp_line: str) -> str:
         d = F.dir()
@@ -410,7 +452,7 @@ class GrantRefusalTests(Base):
             with self.subTest(line=line):
                 self.refused("version_unparsed", self.g, "claude_code", self.claude(line))
         for line in ("2026.13.01", "2026.10.22-zz", "26.10.22", "2026.10.22.1"):
-            with self.subTest(line=line):
+            with self.subTest(line=line), self.unpinned("cursor"):
                 self.refused("version_unparsed", self.g, "cursor", F.make("agent", line))
 
     def test_version_line_from_stderr_when_stdout_empty(self) -> None:

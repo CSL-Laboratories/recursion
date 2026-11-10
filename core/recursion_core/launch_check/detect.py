@@ -5,7 +5,9 @@ resolve symlinks and keep native targets only. Nothing found here is executed: a
 is read, never run. The one shim followed is Codex's npm ``codex`` -> ``bin/codex.js``,
 and only when the package layout is recognised and the vendored binary is native;
 any other script, shim or non-native target is reported and left without a candidate,
-so ``grant()`` is never offered a wrapper.
+so ``grant()`` is never offered a wrapper. The exception is a pinned route (pi, hermes,
+cursor, antigravity): its first PATH hit is offered whatever its kind, because ``grant()``
+decides it against the pin table and runs nothing.
 """
 
 from __future__ import annotations
@@ -14,7 +16,8 @@ import os
 import platform
 from dataclasses import dataclass
 
-from recursion_core.launch_check.binary import file_kind
+from recursion_core.launch_check import pins
+from recursion_core.launch_check.binary import file_kind, sha256_file
 from recursion_core.launch_check.floors import FLOORS, spec_for
 
 
@@ -79,6 +82,13 @@ def codex_vendored_binary(js_realpath: str) -> str | None:
     return found[0] if len(found) == 1 else None
 
 
+def _launcher_pinned(engine: str, realpath: str) -> bool:
+    try:
+        return pins.launcher_listed(engine, sha256_file(realpath)[0])
+    except OSError:
+        return False
+
+
 def path_hits(name: str, path_string: str) -> list[str]:
     exts = ("", ".exe") if os.name == "nt" else ("",)
     hits: list[str] = []
@@ -97,7 +107,8 @@ def detect(engine: str, path_string: str) -> Detection:
     """Return the engine's PATH hits and a native candidate, or None (fail closed).
 
     Only the first PATH hit of each binary name counts (it is what that name runs);
-    a later native copy shadowed by a wrapper is not offered.
+    a later native copy shadowed by a wrapper is not offered. A pinned route offers
+    its first hit of any kind; with several names, the first whose launcher is pinned.
     """
     spec = spec_for(engine)
     hits: list[Hit] = []
@@ -108,6 +119,11 @@ def detect(engine: str, path_string: str) -> Detection:
             hits.append(Hit(p, real, _kind(real)))
             if i == 0:
                 firsts.append(hits[-1])
+    if spec.pin is not None and firsts:
+        pick = firsts[0]
+        if len(firsts) > 1:
+            pick = next((h for h in firsts if _launcher_pinned(spec.engine, h.realpath)), pick)
+        return Detection(spec.engine, tuple(hits), pick.path, f"pinned route ({spec.pin}): {pick.kind} on PATH")
     notes = []
     for h in firsts:
         if h.kind == "native":
@@ -120,6 +136,8 @@ def detect(engine: str, path_string: str) -> Detection:
         else:
             notes.append(f"{h.path}: {h.kind}")
     note = "; ".join(notes) + "; fail closed" if hits else "absent from PATH"
+    if hits and spec.note:
+        note = f"{note}. {spec.note}"
     return Detection(spec.engine, tuple(hits), None, note)
 
 

@@ -55,8 +55,13 @@ class FloorTableTests(unittest.TestCase):
             },
             names,
         )
-        self.assertEqual("hermes-acp", FLOORS["hermes"].probe_name)
+        self.assertEqual([], [e for e, s in FLOORS.items() if s.probe_name])
         self.assertEqual("date", FLOORS["cursor"].scheme)
+        self.assertEqual(
+            {"antigravity": "binary+launcher", "cursor": "launcher+tree", "pi": "launcher+tree", "hermes": "launcher+tree"},
+            {e: s.pin for e, s in FLOORS.items() if s.pin},
+        )
+        self.assertEqual(["gemini"], [e for e, s in FLOORS.items() if s.api_key_only])
 
     def test_two_slots(self) -> None:
         slots = {e: (s.functional, s.security) for e, s in FLOORS.items()}
@@ -74,12 +79,15 @@ class FloorTableTests(unittest.TestCase):
 
     def test_identity_column(self) -> None:
         engines = table_record()["engines"]
-        self.assertEqual("unverified", engines["pi"]["identity"])
-        required = {"claude_code", "codex", "opencode", "hermes"}
+        required = {"claude_code", "codex", "opencode"}
+        pinned = {"pi", "hermes", "cursor", "antigravity"}
         for engine in required:
             self.assertEqual("required", engines[engine]["identity"], engine)
-        for engine in set(FLOORS) - required - {"pi"}:
+        for engine in pinned:
+            self.assertEqual("pin", engines[engine]["identity"], engine)
+        for engine in set(FLOORS) - required - pinned:
             self.assertEqual("rule", engines[engine]["identity"], engine)
+        self.assertEqual({"gemini", "grok"}, set(FLOORS) - required - pinned)
 
     def test_table_is_read_only(self) -> None:
         self.assertIsInstance(FLOORS, MappingProxyType)
@@ -217,6 +225,7 @@ class DetectTests(unittest.TestCase):
         F.make("cursor-agent", "2026.10.22", where=d)
         found = detect("cursor", d)
         self.assertEqual(os.path.join(d, "cursor-agent"), found.candidate)
+        self.assertIn("pinned route (launcher+tree)", found.note)
 
     def _npm_codex(self, triple: str | None, layout: str = "vendor") -> tuple[str, str | None]:
         prefix = F.dir()
@@ -269,7 +278,7 @@ class LaunchCheckTests(unittest.TestCase):
         F.make("opencode", "opencode v2.2.5", where=d)
         F.make("gemini", "0.38.0", where=d)
         F.script(os.path.join(d, "agent"), "#!/bin/sh\nexec node index.js \"$@\"\n")
-        F.make("pi", "0.30.2", where=d)  # a native `pi` is not Pi (F3): identity_unverified
+        F.make("pi", "0.30.2", where=d)  # a native `pi` is not Pi (F3): no pin matches it
         grants, records = launch_check(d, probe=F.probe)
         by = {r["engine"]: r for r in records}
         self.assertEqual(set(FLOORS), set(by))
@@ -281,8 +290,8 @@ class LaunchCheckTests(unittest.TestCase):
         self.assertEqual("granted", by["opencode"]["outcome"])
         self.assertTrue(by["opencode"]["beta"])
         self.assertEqual("version_refused", by["gemini"]["refusal"])
-        self.assertEqual("wrapper_refused", by["cursor"]["refusal"])
-        self.assertEqual("identity_unverified", by["pi"]["refusal"])
+        self.assertEqual("pin_mismatch", by["cursor"]["refusal"])
+        self.assertEqual("pin_mismatch", by["pi"]["refusal"])
         for engine in ("grok", "antigravity", "hermes"):
             self.assertEqual("absent", by[engine]["outcome"])
         for r in records:

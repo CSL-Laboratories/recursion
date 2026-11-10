@@ -5,6 +5,14 @@ native binary (path, realpath, full SHA-256, size), reads the version from that 
 with the zero-egress probe, checks the floor table and returns an immutable grant whose
 fields are MACed with a per-process key. Every failure raises ``LaunchRefused``.
 
+A pinned route (``EngineSpec.pin``: pi, hermes, cursor, antigravity) is not probed. Its
+launcher and its package tree or binary must match a pin in ``pins.py``; the version is
+the pin's, and anything else is ``pin_mismatch`` until re-pinned.
+
+An API-key-only engine (``EngineSpec.api_key_only``: Gemini CLI) gets a launch plan only
+when the caller states ``auth="api_key"``; a subscription sign-in, or no statement, is
+``sign_in_refused``. No credential is read here.
+
 ``launch_plan(grant, argv, env)`` authenticates the grant, checks argv and the spawn
 size, re-verifies the binary, and returns a ``LaunchPlan``. Every use of a plan
 (``plan.exec_argv()``) authenticates and re-verifies again: a full re-hash, never a
@@ -24,10 +32,11 @@ import secrets
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, fields
 
-from recursion_core.launch_check import floors
+from recursion_core.launch_check import floors, pins
 from recursion_core.launch_check.binary import HEX64, WRAPPER_EXT, file_kind, is_wrapper_name, sha256_file, stem
 from recursion_core.launch_check.floors import (
     EngineSpec, check_floors, check_identity, check_self_named, other_engine_named, parse_version, spec_for,
+    with_note,
 )
 from recursion_core.launch_check.probe import PROBE_TIMEOUT_S, Probe, run_version_probe
 from recursion_core.launch_check.refusals import REFUSAL_CODES_VERSION, LaunchRefused
@@ -57,6 +66,10 @@ class Grant:
     probe_path: str  # the binary --version ran on (differs for hermes: hermes-acp)
     probe_realpath: str
     probe_sha256: str
+    pin_kind: str = ""  # pinned routes only: the pin kind, table version and matched target
+    pin_table: str = ""
+    pin_target: str = ""  # realpath of the package root or binary
+    pin_sha256: str = ""
     mac: str = ""
 
     def record(self) -> dict[str, object]:
@@ -64,6 +77,8 @@ class Grant:
         out["outcome"] = "granted"
         # O50: no measured functional floor => beta on route.list.
         out["beta"] = self.floor_functional is None
+        spec = floors.FLOORS.get(self.engine)
+        out["api_key_only"] = bool(spec and spec.api_key_only)
         return out
 
 
@@ -86,7 +101,7 @@ def _realpath_native(spec: EngineSpec, path: str, what: str) -> str:
     except OSError as e:
         raise LaunchRefused("binary_missing", spec.engine, f"{what} unreadable: {e.__class__.__name__}") from None
     if kind != "native":
-        raise LaunchRefused("wrapper_refused", spec.engine, f"{what} is not a native executable ({kind})")
+        raise LaunchRefused("wrapper_refused", spec.engine, with_note(spec, f"{what} is not a native executable ({kind})"))
     if not os.access(real, os.X_OK):
         raise LaunchRefused("binary_missing", spec.engine, f"{what} is not executable")
     return real
@@ -108,6 +123,8 @@ def grant(engine: str, path: str, *, timeout: float = PROBE_TIMEOUT_S, probe: Pr
         if is_wrapper_name(path):
             raise LaunchRefused("wrapper_refused", spec.engine, f"{os.path.basename(path)} is a wrapper shape")
         raise LaunchRefused("name_mismatch", spec.engine, f"{stem(path)!r} not in {list(spec.names)}")
+    if spec.pin is not None:
+        return _grant_pinned(spec, path)
     real = _realpath_native(spec, path, "grant path")
     if spec.probe_name is None:
         probe_path, probe_real = path, real
@@ -139,6 +156,31 @@ def grant(engine: str, path: str, *, timeout: float = PROBE_TIMEOUT_S, probe: Pr
         floor_functional=spec.functional, floor_security=spec.security,
         floor_table=floors.FLOOR_TABLE_VERSION, refusal_codes=REFUSAL_CODES_VERSION,
         probe_path=probe_path, probe_realpath=probe_real, probe_sha256=probe_digest,
+        pin_kind="", pin_table="", pin_target="", pin_sha256="",
+    )
+    return Grant(mac=_mac(values), **values)
+
+
+def _grant_pinned(spec: EngineSpec, path: str) -> Grant:
+    """A pinned route: the launcher and its tree or binary must match a pin. Nothing is run."""
+    if not os.path.lexists(path) or not os.path.isfile(path):
+        raise LaunchRefused("binary_missing", spec.engine, f"grant path absent: {path}")
+    real = os.path.realpath(path)
+    if not os.access(real, os.X_OK):
+        raise LaunchRefused("binary_missing", spec.engine, "grant path is not executable")
+    digest, size = _hash(spec, real)
+    found = pins.match(spec.engine, spec.pin, real, digest, spec.note)
+    parsed = parse_version(spec.scheme, found.pin.version)
+    if parsed is None:  # table bug: fail closed
+        raise LaunchRefused("pin_mismatch", spec.engine, f"pin version {found.pin.version!r} does not parse")
+    check_floors(spec, parsed)
+    values: dict[str, object] = dict(
+        engine=spec.engine, path=path, realpath=real, sha256=digest, size=size,
+        version_raw=found.pin.version, version=parsed.text, exit_code=0,
+        floor_functional=spec.functional, floor_security=spec.security,
+        floor_table=floors.FLOOR_TABLE_VERSION, refusal_codes=REFUSAL_CODES_VERSION,
+        probe_path=path, probe_realpath=real, probe_sha256=digest,
+        pin_kind=spec.pin, pin_table=pins.PIN_TABLE_VERSION, pin_target=found.target, pin_sha256=found.target_sha256,
     )
     return Grant(mac=_mac(values), **values)
 
@@ -163,11 +205,18 @@ def authenticate(g: object) -> EngineSpec:
         raise LaunchRefused("grant_forged", engine, "version fields do not re-parse")
     check_self_named(spec, g.version_raw)  # re-checked at the trusted boundary
     check_floors(spec, parsed)  # re-checked at the trusted boundary
+    if (spec.pin or "") != g.pin_kind:
+        raise LaunchRefused("grant_forged", engine, "pin kind does not match the floor table")
+    if spec.pin is not None:
+        if g.pin_table != pins.PIN_TABLE_VERSION:
+            raise LaunchRefused("grant_stale", engine, f"issued under {g.pin_table}; pin table is now {pins.PIN_TABLE_VERSION}")
+        if not pins.listed(engine, g.version_raw, g.sha256, g.pin_sha256):
+            raise LaunchRefused("pin_mismatch", engine, with_note(spec, "the grant's pin is no longer recorded; refused until re-pinned"))
     return spec
 
 
 def verify(g: Grant) -> None:
-    """Re-verify the pinned binary (and probe binary): resolution, then a full re-hash."""
+    """Re-verify the pinned binary (and probe binary, package tree): resolution, then a full re-hash."""
     spec = spec_for(g.engine)
     pairs = [(g.path, g.realpath, g.sha256)]
     if g.probe_path != g.path:
@@ -181,6 +230,15 @@ def verify(g: Grant) -> None:
             raise LaunchRefused("binary_missing", spec.engine, f"{real} is not executable")
         if _hash(spec, real)[0] != digest:
             raise LaunchRefused("binary_changed", spec.engine, f"{real} digest differs from the grant")
+    if g.pin_kind and g.pin_target != g.realpath:  # the pinned tree or binary behind the launcher
+        if os.path.realpath(g.pin_target) != g.pin_target:
+            raise LaunchRefused("binary_changed", spec.engine, f"{g.pin_target} now resolves elsewhere")
+        try:
+            digest = pins.target_sha256(g.pin_kind, g.pin_target)
+        except (OSError, ValueError) as e:
+            raise LaunchRefused("binary_changed", spec.engine, f"{g.pin_target} unreadable: {e.__class__.__name__}") from None
+        if digest != g.pin_sha256:
+            raise LaunchRefused("binary_changed", spec.engine, f"{g.pin_target} digest differs from the grant")
 
 
 def _spawn_bytes(spec: EngineSpec, argv: Sequence[str], env: Mapping[str, str]) -> int:
@@ -210,6 +268,7 @@ class LaunchPlan:
     argv: tuple[str, ...]  # as requested; argv[0] is the bare engine name
     env: tuple[tuple[str, str], ...]
     spawn_bytes: int
+    auth: str | None = None  # the caller's stated auth kind; an API-key-only engine needs "api_key"
 
     def exec_argv(self) -> list[str]:
         """Re-run every ``launch_plan`` check on every use; return ``[realpath, *argv[1:]]``.
@@ -232,22 +291,39 @@ class LaunchPlan:
         if len(dict(env)) != len(env):
             spec = authenticate(self.grant)
             raise LaunchRefused("spawn_too_large", spec.engine, "env repeats a name")
-        size = _checked_launch(self.grant, self.argv, dict(env))
+        size = _checked_launch(self.grant, self.argv, dict(env), self.auth)
         if size != self.spawn_bytes:
             raise LaunchRefused("spawn_too_large", self.grant.engine, "spawn_bytes does not match argv and env")
 
 
-def launch_plan(g: object, argv: Sequence[str], env: Mapping[str, str] | None = None) -> LaunchPlan:
-    """Check a launch against a grant. ``env`` is the already-built child env (child_env), not os.environ."""
+def launch_plan(
+    g: object, argv: Sequence[str], env: Mapping[str, str] | None = None, *, auth: str | None = None
+) -> LaunchPlan:
+    """Check a launch against a grant. ``env`` is the already-built child env (child_env), not os.environ.
+
+    ``auth`` is the caller's statement of how the route signs in. It is checked only for an
+    API-key-only engine (Gemini CLI), which needs exactly ``"api_key"``.
+    """
     argv = tuple(argv) if argv is not None else ()
     env = dict(env or {})
-    size = _checked_launch(g, argv, env)
-    return LaunchPlan(g, argv, tuple(sorted(env.items())), size)
+    size = _checked_launch(g, argv, env, auth)
+    return LaunchPlan(g, argv, tuple(sorted(env.items())), size, auth)
 
 
-def _checked_launch(g: object, argv: Sequence[str], env: dict[str, str]) -> int:
+def check_auth(spec: EngineSpec, auth: object) -> None:
+    """Refuse a launch of an API-key-only engine that is not stated to be an API-key route."""
+    if spec.api_key_only and not (isinstance(auth, str) and auth == "api_key"):
+        stated = repr(auth)[:40] if auth is not None else "not stated"
+        raise LaunchRefused(
+            "sign_in_refused", spec.engine,
+            with_note(spec, f"auth {stated}; this engine launches only with auth='api_key' (no subscription sign-in)"),
+        )
+
+
+def _checked_launch(g: object, argv: Sequence[str], env: dict[str, str], auth: object = None) -> int:
     """Every launch check; returns the spawn size. Used by ``launch_plan`` and again on every plan use."""
     spec = authenticate(g)  # before any field of g is trusted
+    check_auth(spec, auth)
     argv = tuple(argv) if argv is not None else ()
     if not argv:
         raise LaunchRefused("argv_empty", spec.engine, "")

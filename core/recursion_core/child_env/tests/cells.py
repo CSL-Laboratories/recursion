@@ -490,6 +490,58 @@ def cells(s: Scratch) -> list[Cell]:
     for name, engine, value, with_proxy in ordinary:
         parent = {"NO_PROXY": value, **({"HTTPS_PROXY": PROXY} if with_proxy else {})}
         add("no_proxy_ok", name, parent, L(_same(NO_PROXY=value)), engine=engine)
+
+    # CSL-839: the route's own base host is an endpoint too. While a proxy is set, a NO_PROXY entry that matches
+    # it refuses (no_proxy_route_host), by the same matcher as the engine hosts; an IP-literal host is also
+    # matched as an address and by a CIDR block that holds it. A "*" or engine-host entry keeps its own cause.
+    keyed = lambda value: ChildRoute(api_key=USER_KEY, base_url=value)  # noqa: E731
+    sub_gw, v4_url, v6_url = "https://llm.gateway.invalid", "http://10.1.2.3:4000", "https://[::1]:8443/v1/"
+    route_hits = [
+        ("exact", base_url, "gateway.invalid"), ("dot_domain", sub_gw, ".gateway.invalid"),
+        ("bare_domain", sub_gw, "gateway.invalid"), ("tld", base_url, "invalid"), ("glob", sub_gw, "*.gateway.invalid"),
+        ("scheme", base_url, "https://gateway.invalid"), ("port", base_url, "gateway.invalid:443"),
+        ("other_port", base_url, "gateway.invalid:8080"), ("upper", base_url, "GATEWAY.Invalid"),
+        ("trailing_dot", base_url, "gateway.invalid."), ("url_upper", "https://Gateway.INVALID/api", "gateway.invalid"),
+        ("url_trailing_dot", "https://gateway.invalid./api", "gateway.invalid"),
+        ("v4", v4_url, "10.1.2.3"), ("v4_port", v4_url, "10.1.2.3:4000"), ("v4_other_port", v4_url, "10.1.2.3:9"),
+        ("v4_cidr", v4_url, "10.0.0.0/8"), ("v4_cidr_host_bits", v4_url, "10.1.2.3/8"), ("v4_cidr_all", v4_url, "0.0.0.0/0"),
+        ("v6_bracket", v6_url, "[::1]"), ("v6_bracket_port", v6_url, "[::1]:8443"), ("v6_bare", v6_url, "::1"),
+        ("v6_spelling", v6_url, "0:0:0:0:0:0:0:1"), ("v6_cidr", v6_url, "::1/128"),
+        ("v4_mapped", "http://[::ffff:10.1.2.3]:4000", "10.0.0.0/8"),
+        ("one_of_many", base_url, "localhost,127.0.0.1 .corp.example, gateway.invalid"),
+    ]
+    for name, value, entry in route_hits:
+        add("no_proxy_route", f"npr_{name}", {"HTTPS_PROXY": PROXY, "NO_PROXY": entry}, R("no_proxy_route_host"), auth=api,
+            route=keyed(value))
+    for name, parent in (("all_proxy_only", {"ALL_PROXY": socks, "NO_PROXY": "gateway.invalid"}),
+                         ("http_proxy_lower", {"http_proxy": PROXY, "NO_PROXY": "gateway.invalid"}),
+                         ("lower_name", {"HTTPS_PROXY": PROXY, "no_proxy": "gateway.invalid"})):
+        add("no_proxy_route", f"npr_{name}", parent, R("no_proxy_route_host"), auth=api, route=keyed(base_url))
+    add("no_proxy_route", "npr_sub_trusted", {**token, "HTTPS_PROXY": PROXY, "NO_PROXY": "gateway.invalid"},
+        R("no_proxy_route_host"), route=sub_url(base_url, trusted_base_urls=(origin,)))
+    add("no_proxy_route", "npr_cloud", {"HTTPS_PROXY": PROXY, "NO_PROXY": ".invalid"}, R("no_proxy_route_host"), auth=cloud,
+        route=ChildRoute(base_url=base_url, provider_switches=(bedrock,)))
+    # Which cause wins: "*" and an engine host are checked first, in both names, so they report as before.
+    add("no_proxy_route", "npr_star_first", {"HTTPS_PROXY": PROXY, "NO_PROXY": "gateway.invalid *"}, R("no_proxy_wildcard"),
+        auth=api, route=keyed(base_url))
+    add("no_proxy_route", "npr_engine_first", {"HTTPS_PROXY": PROXY, "NO_PROXY": "gateway.invalid", "no_proxy": ".anthropic.com"},
+        R("no_proxy_engine_host"), auth=api, route=keyed(base_url))
+    add("no_proxy_route", "npr_official_is_engine", {"HTTPS_PROXY": PROXY, "NO_PROXY": "api.anthropic.com"},
+        R("no_proxy_engine_host"), route=sub_url(official))
+    route_ok = [
+        ("no_proxy_set", base_url, "gateway.invalid", False), ("unrelated", base_url, corp, True),
+        ("lookalike", base_url, "notgateway.invalid,gateway.invalid.evil", True),
+        ("child_of_host", base_url, "llm.gateway.invalid", True), ("empty", base_url, "", True),
+        ("cidr_is_not_a_name", base_url, "10.0.0.0/8,0.0.0.0/0,::/0", True), ("cidr_other_net", v4_url, "192.168.0.0/16", True),
+        ("v4_other", v4_url, "10.1.2.30,110.1.2.3,10.1.2.4:4000", True), ("v6_other", v6_url, "[::2],::1:0,10.0.0.0/8", True),
+    ]
+    for name, value, entry, with_proxy in route_ok:
+        parent = {"NO_PROXY": entry, **({"HTTPS_PROXY": PROXY} if with_proxy else {})}
+        add("no_proxy_route_ok", f"npr_ok_{name}", parent, L(_same(**{"NO_PROXY": entry, url: value})), auth=api, route=keyed(value))
+    for name, engine in (("no_base_url", cc), ("no_base_url_codex", "codex")):
+        add("no_proxy_route_ok", f"npr_ok_{name}", {"HTTPS_PROXY": PROXY, "NO_PROXY": "gateway.invalid,10.0.0.0/8"},
+            L(both(_same(NO_PROXY="gateway.invalid,10.0.0.0/8"), _absent(url))), engine=engine, auth=api,
+            route=ChildRoute(api_key=USER_KEY))
     return out
 
 

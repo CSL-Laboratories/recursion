@@ -94,6 +94,29 @@ Foundry switches are dropped. The child gets one only from the route:
   and the same host in a proxy value refuses with `proxy_malformed`. On an `api_key` or `cloud_provider`
   route a URL that meets this rule is set as it is. On a `subscription` route it must also
   pass the rule in [Subscription base URL](#subscription-base-url).
+- **`NO_PROXY` may not name the route host (CSL-839).** While a proxy is set (`HTTP_PROXY`,
+  `HTTPS_PROXY`, `ALL_PROXY` or a lowercase name), a `NO_PROXY` / `no_proxy` entry that matches
+  the host of the route's `base_url` refuses with `no_proxy_route_host`: the child would reach
+  the route gateway around the proxy. The refusal names the variable, never the entry or the URL.
+  - Entries are matched as for the engine's own hosts (`no_proxy_engine_host`): the host itself,
+    a parent domain with or without the leading dot (`.gateway.example`, `gateway.example`,
+    `example`), a `*` pattern, in any case, with a scheme prefix, brackets, a `:port` and a
+    trailing dot stripped. The host's own trailing dot is ignored too.
+  - Ports are not compared. `gateway.example:8080` refuses a route on port 443: curl and
+    requests ignore the port, so the entry is treated as a match (fail closed).
+  - An IP-literal host (`10.1.2.3`, `[::1]`) is also matched as an address: by an entry that is
+    that address (`10.1.2.3`, `10.1.2.3:4000`, `[::1]`, `[::1]:8443`, `::1`, another spelling of
+    it such as `0:0:0:0:0:0:0:1`) and by a CIDR block that holds it (`10.0.0.0/8`, `::1/128`,
+    `0.0.0.0/0`). `10.1.2.3` and `[::ffff:10.1.2.3]` are one address (so `::/0` also holds an
+    IPv4 host), and a short, hex or decimal IPv4 host (`127.1`, `0x7f.0.0.1`, `2130706433`) is
+    read as a URL parser reads it.
+  - A CIDR block never matches a host name: nothing is resolved here. CIDR is checked for the
+    route host only; the engine's own hosts are names, so their check is unchanged.
+  - `*` (`no_proxy_wildcard`) and an engine-host entry (`no_proxy_engine_host`) are checked
+    first, in both names, and keep their cause when a route-host entry is also present.
+  - Unchanged: with no proxy set, or no route `base_url`, nothing here refuses. Lookalikes
+    (`notgateway.example`, `gateway.example.evil`) and a child of the host
+    (`api.gateway.example` for `gateway.example`) are not refused.
 - **Key custody.** This package is the launch boundary only. It never reads the OS keyring or
   the owner-only key file (A44), and does no keyring or file I/O. The caller fetches the
   user-entered key from the OS keyring, or from the owner-only file on a host with no

@@ -103,6 +103,10 @@ class CellTests(unittest.TestCase):
         self._assert_all(self._group("bracket_host"), 11)
         self._assert_all(self._group("bracket_host_ok"), 5)
 
+    def test_no_proxy_route_host_cells(self) -> None:
+        self._assert_all(self._group("no_proxy_route"), 33)
+        self._assert_all(self._group("no_proxy_route_ok"), 11)
+
     def test_a_dot_dot_out_of_a_directory_others_can_write_is_refused(self) -> None:
         self._assert_all(self._group("dotdot"), 5)
         self._assert_all(self._group("dotdot_ok"), 4)
@@ -640,6 +644,128 @@ class AuthRouteTests(unittest.TestCase):
                     "claude_code", home, auth_mode=SUB, parent={"PATH": "/usr/bin", "HTTPS_PROXY": value}))
                 self.assertEqual(("HTTPS_PROXY", cause), self._refused(
                     "codex", home, auth_mode=SUB, parent={"PATH": "/usr/bin"}, overrides={"HTTPS_PROXY": value}))
+
+    def _no_proxy_route(self, home: str, base_url: str, parent: dict, mode: str = API, **more: object):
+        route = ChildRoute(api_key=ROUTES[mode].api_key, base_url=base_url, provider_switches=ROUTES[mode].provider_switches)
+        return build_child_env("claude_code", home=home, auth_mode=mode, route=route, parent={"PATH": "/usr/bin", **parent},
+                               **more)
+
+    def test_no_proxy_entry_matching_the_route_host_is_refused_while_a_proxy_is_set(self) -> None:
+        """CSL-839: NO_PROXY was checked against the engine's hosts only, so the route gateway could skip the proxy."""
+
+        home = _home(self)
+        proxy = {"HTTPS_PROXY": "http://127.0.0.1:3128"}
+        gateway, sub = "https://gateway.example/api", "https://llm.gateway.example:8443"
+        hits = (
+            (gateway, "gateway.example"), (sub, ".gateway.example"), (sub, "gateway.example"), (sub, "example"),
+            (sub, "*.gateway.example"), (sub, "llm.*"), (gateway, "https://gateway.example"), (gateway, "http://gateway.example:80"),
+            (gateway, "gateway.example:443"), (sub, "llm.gateway.example:443"),  # another port than the route's: still a hit
+            (gateway, "GATEWAY.Example"), (gateway, "gateway.example."), (gateway, ".gateway.example"),
+            ("https://Gateway.EXAMPLE", "gateway.example"), ("https://gateway.example.", "gateway.example"),
+            (gateway, "localhost,127.0.0.1,.corp.example gateway.example"), (gateway, " gateway.example ,localhost"),
+        )
+        for base_url, entry in hits:
+            for mode in (API, CLOUD):
+                with self.subTest(base_url=base_url, entry=entry, mode=mode):
+                    with self.assertRaises(EnvRefused) as caught:
+                        self._no_proxy_route(home, base_url, {**proxy, "NO_PROXY": entry}, mode)
+                    self.assertEqual(("NO_PROXY", "no_proxy_route_host"), (caught.exception.name, caught.exception.cause))
+                    self.assertEqual("NO_PROXY: no_proxy_route_host", str(caught.exception))  # the name, never a value
+        # Every proxy name counts as a set proxy, and both NO_PROXY names are checked.
+        for proxy_name in policy.VALUE_URLS + policy.VALUE_ALL_PROXY:
+            for name in policy.NO_PROXY_NAMES:
+                with self.subTest(proxy=proxy_name, name=name):
+                    with self.assertRaises(EnvRefused) as caught:
+                        self._no_proxy_route(home, gateway, {proxy_name: "http://127.0.0.1:3128", name: "gateway.example"})
+                    self.assertEqual((name, "no_proxy_route_host"), (caught.exception.name, caught.exception.cause))
+        # Split across parent and override, both ways; and a subscription route the user trusted or acknowledged.
+        for parent, overrides in (({"NO_PROXY": "gateway.example"}, proxy), (proxy, {"no_proxy": "gateway.example"})):
+            with self.subTest(overrides=sorted(overrides)), self.assertRaises(EnvRefused) as caught:
+                self._no_proxy_route(home, gateway, parent, overrides=overrides)
+            self.assertEqual("no_proxy_route_host", caught.exception.cause)
+        for more in ({"trusted_base_urls": ("https://gateway.example",)}, {"full_access_acknowledged": True}):
+            with self.subTest(more=sorted(more)):
+                self.assertEqual(("NO_PROXY", "no_proxy_route_host"), self._refused(
+                    "claude_code", home, auth_mode=SUB, route=ChildRoute(base_url=gateway, **more),
+                    parent={"PATH": "/usr/bin", **proxy, "NO_PROXY": "gateway.example"}))
+
+    def test_no_proxy_ip_and_cidr_entries_match_an_ip_literal_route_host(self) -> None:
+        home = _home(self)
+        proxy = {"HTTPS_PROXY": "http://127.0.0.1:3128"}
+        v4, v6 = "http://10.1.2.3:4000", "https://[2001:db8::1]:8443/v1"
+        hits = (
+            (v4, "10.1.2.3"), (v4, "10.1.2.3:4000"), (v4, "10.1.2.3:9"), (v4, "http://10.1.2.3"), (v4, "10.1.2.3."),
+            (v4, "10.0.0.0/8"), (v4, "10.1.2.3/32"), (v4, "10.1.2.3/8"), (v4, "0.0.0.0/0"), (v4, "10.0.0.0/255.0.0.0"),
+            (v4, "::ffff:10.1.2.3"), (v4, "::ffff:10.0.0.0/104"), (v4, "localhost, 192.168.0.0/16, 10.1.0.0/16"),
+            ("http://10.1.2.3", "10.1.2.3:8080"), ("http://10.1.2.3.", "10.1.2.3"),
+            (v6, "[2001:db8::1]"), (v6, "[2001:db8::1]:8443"), (v6, "[2001:db8::1]:9"), (v6, "2001:db8::1"),
+            (v6, "2001:DB8:0:0:0:0:0:1"), (v6, "https://[2001:db8::1]"), (v6, "2001:db8::/32"), (v6, "[2001:db8::]/32"),
+            (v6, "::/0"), ("https://[2001:DB8:0:0:0:0:0:1]", "2001:db8::1"), ("https://[::1]", "::1"),
+            ("https://[::1]", "[::1]:443"), ("https://[::1]", "::1/128"),
+            ("http://[::ffff:10.1.2.3]:4000", "10.1.2.3"), ("http://[::ffff:10.1.2.3]:4000", "10.0.0.0/8"),
+            # A short, hex or decimal IPv4 host is the address a URL parser makes of it.
+            ("http://127.1:4000", "127.0.0.1"), ("http://0x7f.0.0.1", "127.0.0.0/8"), ("http://2130706433", "127.0.0.1:4000"),
+            ("http://0177.0.1", "127.0.0.1"), ("http://0x7F000001", "127.0.0.1"),
+            (v4, "::/0"),  # fail closed: an IPv4 host is also checked as its IPv4-mapped IPv6 address
+        )
+        for base_url, entry in hits:
+            with self.subTest(base_url=base_url, entry=entry), self.assertRaises(EnvRefused) as caught:
+                self._no_proxy_route(home, base_url, {**proxy, "NO_PROXY": entry})
+            self.assertEqual(("NO_PROXY", "no_proxy_route_host"), (caught.exception.name, caught.exception.cause))
+        kept = (
+            (v4, "10.1.2.4,10.1.2.30,110.1.2.3,10.1.2.4:4000"), (v4, "192.168.0.0/16,10.2.0.0/16,::1/128"), (v4, "10.1.2.3/99"),
+            (v4, "[::1],::1"), (v6, "2001:db8::2,[2001:db8::10]:8443,2001:db9::/32,0.0.0.0/0"), (v6, "db8::1"),
+            ("https://[::1]", "127.0.0.1,localhost,::2/128"), ("http://127.1.example", "127.0.0.1"),
+            ("http://1.2.3.4.5", "1.2.3.4,1.2.3.0/24"), ("http://256.1.1.1", "0.0.0.0/0"), ("http://127.0.0.08", "127.0.0.8"),
+            ("https://gateway.example", "10.0.0.0/8,0.0.0.0/0,::/0,127.0.0.1"),  # a block never matches a name
+        )
+        for base_url, entry in kept:
+            with self.subTest(base_url=base_url, kept=entry):
+                env = self._no_proxy_route(home, base_url, {**proxy, "NO_PROXY": entry})
+                self.assertEqual((entry, base_url), (env["NO_PROXY"], env[URL]))
+
+    def test_no_proxy_route_host_changes_nothing_else(self) -> None:
+        home = _home(self)
+        proxy = {"HTTPS_PROXY": "http://127.0.0.1:3128"}
+        gateway = "https://gateway.example/api"
+        kept = (
+            {"NO_PROXY": "gateway.example"},  # no proxy set: nothing to bypass
+            {"NO_PROXY": "gateway.example", "HTTPS_PROXY": "", "ALL_PROXY": ""},  # an empty proxy is no proxy
+            {**proxy, "NO_PROXY": "localhost,127.0.0.1,.corp.example"},
+            {**proxy, "NO_PROXY": "notgateway.example,gateway.example.evil,xgateway.example"},
+            {**proxy, "NO_PROXY": "api.gateway.example,*.gateway.example"},  # a child of the host, not the host
+            {**proxy, "NO_PROXY": ""}, {**proxy, "NO_PROXY": " , "},
+            {**proxy, "no_proxy": ".openai.com"},
+        )
+        for parent in kept:
+            with self.subTest(parent=sorted(parent.items())):
+                env = self._no_proxy_route(home, gateway, parent)
+                self.assertEqual(gateway, env[URL])
+                self.assertEqual({k: v for k, v in parent.items()}, {k: env[k] for k in parent})
+        # No base URL: the route host rule has nothing to check, for either engine.
+        for engine in ENGINE_PROFILES:
+            with self.subTest(engine=engine):
+                env = build_child_env(engine, home=home, auth_mode=API, route=ROUTES[API],
+                                      parent={"PATH": "/usr/bin", **proxy, "NO_PROXY": "gateway.example,10.0.0.0/8"})
+                self.assertEqual("gateway.example,10.0.0.0/8", env["NO_PROXY"])
+        # "*" and an engine host are checked first in both names, so they report as before; an untrusted
+        # subscription base still refuses before any NO_PROXY check.
+        first = (
+            ({**proxy, "NO_PROXY": "gateway.example,*"}, ("NO_PROXY", "no_proxy_wildcard")),
+            ({**proxy, "NO_PROXY": "gateway.example .anthropic.com"}, ("NO_PROXY", "no_proxy_engine_host")),
+            ({**proxy, "NO_PROXY": "gateway.example", "no_proxy": "claude.ai"}, ("no_proxy", "no_proxy_engine_host")),
+            ({**proxy, "NO_PROXY": "gateway.example", "no_proxy": "*"}, ("no_proxy", "no_proxy_wildcard")),
+        )
+        for parent, expected in first:
+            with self.subTest(parent=sorted(parent.items())), self.assertRaises(EnvRefused) as caught:
+                self._no_proxy_route(home, gateway, parent)
+            self.assertEqual(expected, (caught.exception.name, caught.exception.cause))
+        with self.assertRaises(EnvRefused) as caught:
+            self._no_proxy_route(home, "https://api.anthropic.com", {**proxy, "NO_PROXY": "api.anthropic.com"}, SUB)
+        self.assertEqual(("NO_PROXY", "no_proxy_engine_host"), (caught.exception.name, caught.exception.cause))
+        self.assertEqual((URL, "route_base_url_untrusted"), self._refused(
+            "claude_code", home, auth_mode=SUB, route=ChildRoute(base_url=gateway),
+            parent={"PATH": "/usr/bin", **proxy, "NO_PROXY": "gateway.example"}))
 
     def test_ambient_keys_are_dropped_in_every_mode(self) -> None:
         home = _home(self)

@@ -35,6 +35,9 @@ replacement. It builds the child environment from nothing:
   caller passes that origin as one the user already trusted, or the run uses the named full-access profile
   (owner call; CSLR-D-011): the ``CLAUDE_CODE_OAUTH_TOKEN`` passed through would go to that base. This module
   stores no trusted list and asks nothing; the driver does both;
+* while a proxy is set, a ``NO_PROXY`` entry that matches the route's own base URL host refuses
+  (``no_proxy_route_host``, CSL-839; PRODUCT.md 055cc7a5 / CSLR-D-011): the child would reach the route gateway
+  around the proxy;
 * one change beyond N5h/N5i: links are resolved one component at a time and every
   link met on the way, including links inside a link's target, must be root's or
   ours in a directory chain no one else can write, and no step may enter ``/proc``,
@@ -322,7 +325,9 @@ def build_child_env(
     ``home`` is the route-owned private home the child gets as HOME; the parent's HOME is never passed.
     ``overrides`` are values the core itself sets. An override may only set a name already on this engine's
     allowlist (never HOME, PATH, a credential or a scrubbed name), and it is merged before the checks, so it
-    meets exactly the value, PATH, NO_PROXY and temp rules an inherited value meets.
+    meets exactly the value, PATH, NO_PROXY and temp rules an inherited value meets. While a proxy is set, a
+    NO_PROXY entry that matches the route's base URL host refuses with ``no_proxy_route_host`` (CSL-839); a
+    ``*`` or engine-host entry anywhere in either name is reported first, with its own cause.
     """
 
     if os.name == "nt":
@@ -362,11 +367,20 @@ def build_child_env(
             raise EnvRefused(name, cause)
     if "PATH" in env and (cause := _unsafe_path(env["PATH"])) is not None:
         raise EnvRefused("PATH", cause)
-    # A bypass only matters when a proxy is set: "*" skips it for every host, an engine-host entry for that engine.
+    # A bypass only matters when a proxy is set: "*" skips it for every host, an engine-host entry for that engine,
+    # an entry for the route's base host for the route gateway.
     if any(env.get(name) for name in VALUE_URLS + VALUE_ALL_PROXY):
         for name in [name for name in NO_PROXY_NAMES if name in env]:
             if (cause := _no_proxy_bypass(env[name], profile.hosts)) is not None:
                 raise EnvRefused(name, cause)
+        # CSL-839: the route's own base host is an endpoint too; an entry matching it would send the child to the
+        # route gateway around the proxy. Checked after both names passed the rule above, so a "*" or engine-host
+        # entry keeps its own cause whatever else the lists hold.
+        base = route_env.get(profile.base_url_name) if profile.base_url_name else None
+        if base is not None:
+            for name in [name for name in NO_PROXY_NAMES if name in env]:
+                if _no_proxy_route_bypass(env[name], _BASE_URL.match(base)["host"]):
+                    raise EnvRefused(name, "no_proxy_route_host")
     # N5h option A: a temp name is replaced by one private route temp root, never checked or passed.
     present = [name for name in TEMP_NAMES if name in env]
     if present:
@@ -636,25 +650,121 @@ def _unsafe_path(value: str) -> str | None:
     return None
 
 
+def _no_proxy_entries(value: str) -> list[str]:
+    """A NO_PROXY value as lowercased entries, comma and whitespace split, each without its scheme prefix."""
+
+    return [re.sub(r"^[a-z][a-z0-9+.-]*://", "", entry) for entry in re.split(r"[,\s]+", value.strip().lower())]
+
+
+def _no_proxy_name(entry: str) -> str:
+    """The name an entry is matched by: no brackets, no ``:port``, no trailing dot."""
+
+    return re.sub(r":[0-9]*$", "", entry.strip("[]")).rstrip(".")
+
+
+def _no_proxy_hit(entry: str, hosts: tuple[str, ...]) -> bool:
+    """Whether one entry (after ``_no_proxy_name``) names a host: a ``*`` pattern, the host or a parent domain."""
+
+    if "*" in entry:
+        pattern = re.compile(".*".join(re.escape(part) for part in entry.split("*")) + r"\Z")
+        return any(pattern.match(host) for host in hosts)
+    bare = entry.lstrip(".")
+    return any(host == bare or host.endswith("." + bare) for host in hosts)
+
+
 def _no_proxy_bypass(value: str, hosts: tuple[str, ...]) -> str | None:
     """N5i: comma and whitespace split; the union of curl, requests, hyper-util, undici and Codex matchers."""
 
-    for entry in re.split(r"[,\s]+", value.strip().lower()):
-        entry = re.sub(r"^[a-z][a-z0-9+.-]*://", "", entry).strip("[]")
-        entry = re.sub(r":[0-9]*$", "", entry).rstrip(".")
+    for entry in map(_no_proxy_name, _no_proxy_entries(value)):
         if not entry:
             continue
         if entry.strip("*.") == "":
             return "no_proxy_wildcard"
-        if "*" in entry:
-            pattern = re.compile(".*".join(re.escape(part) for part in entry.split("*")) + r"\Z")
-            hit = any(pattern.match(host) for host in hosts)
-        else:
-            bare = entry.lstrip(".")
-            hit = any(host == bare or host.endswith("." + bare) for host in hosts)
-        if hit:
+        if _no_proxy_hit(entry, hosts):
             return "no_proxy_engine_host"
     return None
+
+
+def _ip_forms(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> set:
+    """An address and its other family's spelling: ``10.1.2.3`` and ``::ffff:10.1.2.3`` are one endpoint."""
+
+    if address.version == 4:
+        return {address, ipaddress.IPv6Address(f"::ffff:{address}")}
+    return {address} | ({address.ipv4_mapped} if address.ipv4_mapped is not None else set())
+
+
+def _host_addresses(host: str) -> set:
+    """The addresses a base URL host names when it is an IP literal, else none. No name is resolved.
+
+    An IPv4 host is read the way URL parsers read it (``127.1``, ``0x7f.0.0.1``, ``2130706433``), so a short or
+    hex spelling of an address a NO_PROXY entry names is still that address.
+    """
+
+    try:
+        return _ip_forms(ipaddress.ip_address(host))
+    except ValueError:
+        pass
+    # One to four dot-separated numbers, decimal, 0x hex or 0-led octal; the last fills the bytes that remain.
+    parts = host.split(".")
+    try:
+        numbers = [int(part, 16 if part.startswith("0x") else 8 if part.startswith("0") and part != "0" else 10)
+                   for part in parts]
+        if len(parts) > 4 or not all(re.fullmatch(r"0x[0-9a-f]*|[0-9]+", part) for part in parts):
+            return set()
+        if any(number > 255 for number in numbers[:-1]) or numbers[-1] >= 256 ** (5 - len(numbers)):
+            return set()
+        packed = sum(number << (8 * (3 - i)) for i, number in enumerate(numbers[:-1])) + numbers[-1]
+        return _ip_forms(ipaddress.IPv4Address(packed))
+    except ValueError:
+        return set()
+
+
+def _no_proxy_ip_hit(entry: str, addresses: set) -> bool | None:
+    """Whether an entry is one of these addresses, or a CIDR block that holds one; None when it is neither shape.
+
+    Read as ``ip``, ``ip:port``, ``[ip]``, ``[ip]:port`` or any of those with ``/prefix``; the port is dropped,
+    as for a name. Addresses are compared parsed, so ``::1`` and ``0:0:0:0:0:0:0:1`` are one.
+    """
+
+    text, slash, prefix = entry.partition("/")
+    bracketed = re.fullmatch(r"\[([^\]]*)\](?::[0-9]*)?", text)
+    if bracketed:
+        text = bracketed[1]
+    elif text.count(":") == 1:  # ip:port; two or more colons are a bare IPv6 address
+        text = text.split(":")[0]
+    text = text.rstrip(".")
+    try:
+        if slash:
+            network = ipaddress.ip_network(f"{text}/{prefix}", strict=False)  # host bits may be set: 10.1.2.3/8
+            return any(address.version == network.version and address in network for address in addresses)
+        return bool(_ip_forms(ipaddress.ip_address(text)) & addresses)
+    except ValueError:
+        return None
+
+
+def _no_proxy_route_bypass(value: str, host: str) -> bool:
+    """CSL-839: whether a NO_PROXY entry matches the route's base URL host (``no_proxy_route_host``).
+
+    The same matcher as ``_no_proxy_bypass``, over the one host: the host itself, a parent domain with or
+    without the leading dot, a ``*`` pattern, with scheme, brackets, ``:port`` and trailing dot stripped from
+    the entry. The entry's port is not compared with the route's: curl and requests ignore it, so another port
+    is still a hit. The host is compared lowercased and without its own trailing dot. An IP-literal host is
+    also matched as an address: by an entry that is that address, and by a CIDR block that holds it (curl
+    7.86+, requests, undici and Go honour CIDR). A CIDR entry never matches a name: no matcher resolves DNS.
+    An entry that is an address or a block is decided as one and not also as a name, so the port strip cannot
+    turn ``::1:0`` into ``::1``.
+    """
+
+    host = host.lower().strip("[]").rstrip(".")
+    addresses = _host_addresses(host)
+    for entry in _no_proxy_entries(value):
+        hit = _no_proxy_ip_hit(entry, addresses)
+        if hit is None:
+            entry = _no_proxy_name(entry)
+            hit = bool(entry) and entry.strip("*.") != "" and _no_proxy_hit(entry, (host,))
+        if hit:
+            return True
+    return False
 
 
 def _unsafe_proxy(value: str, schemes: tuple[str, ...] = ("http", "https")) -> str | None:

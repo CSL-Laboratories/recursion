@@ -6,6 +6,7 @@ from pathlib import Path
 import signal
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -16,6 +17,48 @@ from recursion_core.daemon import (AlreadyRunning, Daemon, Registry, RegistryInt
                                    require_free_threaded)
 
 UNIT_FILE = Path(__file__).resolve().parents[3] / 'systemd' / 'recursion-daemon.service'
+
+# A legacy registry left by kill -9: the WAL still holds committed frames because
+# SQLite only deletes it when the last connection closes.
+_LEAVE_UNCHECKPOINTED_WAL = r'''
+import os, sqlite3, sys
+from pathlib import Path
+directory = Path(sys.argv[1])
+conn = sqlite3.connect(directory / "runs.sqlite3")
+conn.execute("PRAGMA journal_mode=WAL")
+conn.execute("PRAGMA wal_autocheckpoint=0")
+conn.execute("PRAGMA synchronous=FULL")
+conn.execute(
+    "CREATE TABLE runs (run_id TEXT PRIMARY KEY, unit TEXT UNIQUE NOT NULL, "
+    "stop INTEGER NOT NULL, state TEXT NOT NULL, boot_id TEXT, detail TEXT NOT NULL, "
+    "created REAL NOT NULL, updated REAL NOT NULL)")
+conn.execute("PRAGMA user_version=1")
+conn.execute(
+    "INSERT INTO runs VALUES ('one','recursion-run-one.service',0,'starting','boot-a','',1,1)")
+conn.commit()
+conn.execute(
+    "INSERT INTO runs VALUES ('tail','recursion-run-tail.service',0,'starting','boot-a','',2,2)")
+conn.commit()
+os._exit(0)
+'''
+
+# Real os.replace, then the process dies the way kill -9 does: no finally, no close.
+_CRASH_AFTER_REAL_RENAME = r'''
+import os, sys
+from pathlib import Path
+import recursion_core.daemon as daemon
+from recursion_core.daemon import Registry
+directory = Path(sys.argv[1])
+real_replace = daemon.os.replace
+
+def crash_after_real_replace(src, dst, *args, **kwargs):
+    real_replace(src, dst, *args, **kwargs)
+    os._exit(73)
+
+daemon.os.replace = crash_after_real_replace
+Registry(directory).add("two", "boot-a")
+os._exit(0)
+'''
 
 
 class FakeManager:
@@ -137,10 +180,14 @@ class DaemonTests(unittest.TestCase):
             self.daemon.stop('none')
 
     def test_registry_private_directory_and_file(self):
-        bad = self.path / 'bad'
-        bad.mkdir(mode=0o755)
-        with self.assertRaises(PermissionError):
-            Registry(bad)
+        # A directory we own at 0755 is tightened to 0700. It is not refused.
+        loose = self.path / 'loose'
+        loose.mkdir(mode=0o755)
+        self.assertEqual(loose.stat().st_mode & 0o777, 0o755)
+        opened = Registry(loose)
+        self.addCleanup(opened.close)
+        self.assertEqual(loose.stat().st_mode & 0o777, 0o700)
+        self.assertEqual((loose / 'runs.sqlite3').stat().st_mode & 0o777, 0o600)
         self.assertEqual((self.path / 'state' / 'runs.sqlite3').stat().st_mode & 0o777, 0o600)
 
     def test_umask_000_state_and_registry_files_are_private(self):
@@ -218,6 +265,95 @@ class DaemonTests(unittest.TestCase):
         target.write_bytes(good[:64])
         with self.assertRaises(RegistryIntegrityError):
             Registry(directory)
+
+    def _python_env(self):
+        env = os.environ.copy()
+        core = str(Path(__file__).resolve().parents[3])
+        env['PYTHONPATH'] = core + os.pathsep + env.get('PYTHONPATH', '')
+        env['PYTHONUNBUFFERED'] = '1'
+        return env
+
+    def test_crash_after_rename_does_not_replay_a_stale_wal(self):
+        # Uncheckpointed WAL from a killed writer, then a crash in the window
+        # after the new file is renamed into place and before the old -wal/-shm
+        # is removed. SQLite would replay that WAL onto the new file.
+        directory = self.path / 'legacy-wal'
+        directory.mkdir(mode=0o700)
+        os.chmod(directory, 0o700)
+        env = self._python_env()
+        left = subprocess.run([sys.executable, '-c', _LEAVE_UNCHECKPOINTED_WAL, str(directory)],
+                              capture_output=True, text=True, env=env)
+        self.assertEqual(left.returncode, 0, left.stderr)
+        self.assertGreater((directory / 'runs.sqlite3-wal').stat().st_size, 0)
+        crashed = subprocess.run([sys.executable, '-c', _CRASH_AFTER_REAL_RENAME, str(directory)],
+                                 capture_output=True, text=True, env=env)
+        self.assertEqual(crashed.returncode, 73, crashed.stderr)
+        # The old journal must already be gone. Reopening must not be what
+        # deletes it: a WAL left beside the new file is replayed onto it.
+        self.assertFalse((directory / 'runs.sqlite3-wal').exists())
+        self.assertFalse((directory / 'runs.sqlite3-shm').exists())
+        reopened = Registry(directory)
+        self.addCleanup(reopened.close)
+        self.assertEqual([run.run_id for run in reopened.all()], ['one', 'tail', 'two'])
+
+    def test_reopen_failure_after_publish_is_typed(self):
+        self.registry.add('one', 'boot-a')
+
+        def fail_reopen(this, drop_sidecars=False):
+            if this.db is not None:
+                this.db.close()
+                this.db = None
+            raise sqlite3.OperationalError('unable to open database file')
+
+        with patch.object(Registry, '_reopen', fail_reopen):
+            with self.assertRaises(RegistryIntegrityError):
+                self.registry.add('two', 'boot-a')
+            with self.assertRaises(RegistryIntegrityError):
+                self.registry.all()
+            with self.assertRaises(RegistryIntegrityError):
+                self.registry.get('one')
+            with self.assertRaises(RegistryIntegrityError):
+                self.registry.add('three', 'boot-a')
+        # The rename had already published "two". A later open can use it.
+        self.assertEqual([run.run_id for run in self.registry.all()], ['one', 'two'])
+        reopened = Registry(self.path / 'state')
+        self.addCleanup(reopened.close)
+        self.assertEqual([run.run_id for run in reopened.all()], ['one', 'two'])
+
+    def test_directory_fsync_failure_does_not_fail_a_published_write(self):
+        self.registry.add('one', 'boot-a')
+        with patch('recursion_core.daemon._fsync_dir',
+                   side_effect=OSError(errno.ENOSPC, 'No space left on device')):
+            self.registry.add('two', 'boot-a')
+        self.assertEqual([run.run_id for run in self.registry.all()], ['one', 'two'])
+        self.registry.close()
+        reopened = Registry(self.path / 'state')
+        self.addCleanup(reopened.close)
+        self.assertEqual([run.run_id for run in reopened.all()], ['one', 'two'])
+
+    def test_open_removes_temp_files_left_by_dead_pids(self):
+        dead = 1 << 22
+        while dead < (1 << 22) + 1000:
+            try:
+                os.kill(dead, 0)
+            except ProcessLookupError:
+                break
+            dead += 1
+        else:
+            self.fail('no unused pid')
+        directory = self.path / 'state'
+        stale = directory / f'.runs.sqlite3.tmp-{dead}-1'
+        stale_wal = directory / f'.runs.sqlite3.tmp-{dead}-1-wal'
+        stale.write_bytes(b'x' * 64)
+        stale_wal.write_bytes(b'y' * 64)
+        live = directory / f'.runs.sqlite3.tmp-{os.getpid()}-99'
+        live.write_bytes(b'keep')
+        reopened = Registry(directory)
+        self.addCleanup(reopened.close)
+        self.assertFalse(stale.exists())
+        self.assertFalse(stale_wal.exists())
+        self.assertTrue(live.exists())
+        self.assertEqual([run.run_id for run in reopened.all()], [])
 
     def test_registry_symlink_refused(self):
         (self.path / 'link').symlink_to(self.path / 'state')
@@ -715,6 +851,72 @@ class SystemdManagerTests(unittest.TestCase):
             'ExecMainStartTimestampMonotonic=81234567\nMainPID=4242\n'))
         self.assertEqual(self.manager.observe('a'), 'empty')
         self.assertTrue(self.manager.processes_gone('a'))
+
+    def test_unreadable_cgroup_or_proc_is_not_terminated(self):
+        # Only ENOENT/ESRCH mean gone. EACCES, EIO, or any other read error is
+        # unknown, and the daemon must not record terminated.
+        group = '/user.slice/a.service'
+        self.events(group, 0)
+        procs = self.root / group.lstrip('/') / 'cgroup.procs'
+        procs.mkdir()  # read_text raises EISDIR, a real OSError that is not ENOENT
+        self.show(group, active='inactive', sub='dead', invocation='', started='0')
+        self.show(group, active='inactive', sub='dead')
+        self.assertNotEqual(self.manager.observe('a'), 'empty')
+        self.assertFalse(self.manager.processes_gone('a'))
+        procs.rmdir()
+        procs.write_text('4242\n')
+        real_read = Path.read_text
+
+        def read_text(path, *args, **kwargs):
+            if path.name == 'cgroup.procs':
+                error = OSError(errno.EACCES, 'Permission denied')
+                raise error
+            if path.name == 'stat':
+                raise OSError(errno.EIO, 'Input/output error')
+            return real_read(path, *args, **kwargs)
+
+        self.show(group, active='inactive', sub='dead')
+        with patch.object(Path, 'read_text', read_text):
+            self.assertIsNone(self.manager.pid_alive(4242))
+            self.assertNotEqual(self.manager.observe('a'), 'empty')
+            self.assertFalse(self.manager.processes_gone('a'))
+        # The same unit with the process actually gone is an attested end.
+        def read_gone(path, *args, **kwargs):
+            if path.name == 'stat':
+                raise OSError(errno.ENOENT, 'No such file or directory')
+            return real_read(path, *args, **kwargs)
+
+        with patch.object(Path, 'read_text', read_gone):
+            self.assertIs(self.manager.pid_alive(4242), False)
+            self.assertEqual(self.manager.observe('a'), 'empty')
+            self.assertTrue(self.manager.processes_gone('a'))
+        def read_esrch(path, *args, **kwargs):
+            if path.name == 'stat':
+                raise OSError(errno.ESRCH, 'No such process')
+            return real_read(path, *args, **kwargs)
+
+        with patch.object(Path, 'read_text', read_esrch):
+            self.assertIs(self.manager.pid_alive(4242), False)
+
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        registry = Registry(Path(temp.name) / 'state')
+        self.addCleanup(registry.close)
+        run_group = '/user.slice/r.service'
+        self.events(run_group, 0)
+        (self.root / run_group.lstrip('/') / 'cgroup.procs').mkdir()
+        def call(argv):
+            if argv[:3] == ['systemctl', '--user', 'show']:
+                return ('LoadState=loaded\nActiveState=inactive\nSubState=dead\n'
+                        f'ControlGroup={run_group}\nMainPID=4242\n'
+                        'InvocationID=0b5a2f3c9d8e4f60a1b2c3d4e5f60718\n'
+                        'ExecMainStartTimestampMonotonic=81234567\n')
+            return ''
+        self.manager._call = call
+        daemon = Daemon(registry, self.manager, lambda: 'boot-a')
+        self.assertNotEqual(daemon.start('one', ['/fake']).state, 'terminated')
+        self.assertNotEqual(daemon.stop('one').state, 'terminated')
+        self.assertNotEqual(daemon.sweep()[0].state, 'terminated')
 
     def test_populated_one_active_is_running(self):
         self.events('/user.slice/a.service', 1)

@@ -69,8 +69,17 @@ are unaffected:
 - Registry: SQLite with `synchronous=FULL` in `$XDG_STATE_HOME/recursion/`
   (directory 0700, file 0600). Those modes are set with `chmod` / `fchmod`, so a
   process umask of 000 cannot leave the directory world-writable or a registry
-  file group- or world-accessible. Each committed change is written to a temp
-  file in that directory, fsynced, and renamed over `runs.sqlite3`. A zero-length
+  file group- or world-accessible. An existing directory owned by this user is
+  tightened to 0700; a directory owned by someone else is refused. Each committed
+  change is written to a temp file in that directory, fsynced, and renamed over
+  `runs.sqlite3`. Before that rename the live database is checkpointed and its
+  `-wal`, `-shm`, and `-journal` files are removed, so a crash after the rename
+  cannot replay a previous WAL onto the new file, and a crash before the rename
+  leaves the previous file with its committed rows in it. A directory fsync that
+  fails after the rename does not fail the write: the new file is already the
+  live one. If the new file cannot be reopened, later calls raise
+  `RegistryIntegrityError` until an open succeeds. Temp files left by a dead
+  pid are removed on open; a live pid's temp file is left in place. A zero-length
   or truncated registry is refused; it is not opened as an empty registry. A run
   row commits before `systemd-run`; a Stop intent commits before `systemctl stop`.
   Unknown schema versions are refused.
@@ -88,8 +97,11 @@ are unaffected:
   not-found, as when a replayed Stop finds the unit an earlier stop already ended
   and collected; the orphan sweep stops any same-name unit that appears later) and
   `lost_reboot`. A scripted observation that the unit ended, or a listener that is
-  still alive, is not `terminated`. A run with a recorded Stop is never reported
-  `running`. Anything not positively observed is `unknown`, never `terminated`.
+  still alive, is not `terminated`. A read of `cgroup.procs` or `/proc/<pid>/stat`
+  that fails with anything other than ENOENT or ESRCH is unknown, not an empty
+  cgroup and not a dead process, and is not `terminated`. A run with a recorded
+  Stop is never reported `running`. Anything not positively observed is
+  `unknown`, never `terminated`.
 
 ## Reboot
 

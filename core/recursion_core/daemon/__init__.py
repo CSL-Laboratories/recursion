@@ -1,6 +1,7 @@
 """Linux user daemon: durable intent and conservative reconciliation (CSL-738)."""
 from __future__ import annotations
 
+import errno
 import fcntl
 import logging
 import os
@@ -28,6 +29,8 @@ UNIT = re.compile(r'recursion-run-[a-zA-Z0-9_-]{1,64}\.service')
 # cgroup read empty and no listed pid was alive; the loaded unit reached
 # inactive/failed/exited with its cgroup pruned and its main pid gone; or a
 # synchronous systemctl stop returned and the unit was then garbage-collected.
+# ENOENT and ESRCH are the only read errors that mean a pid or cgroup is gone.
+# Any other error reading cgroup.procs or /proc/<pid>/stat is unknown, not death.
 # lost_reboot: the run belongs to an earlier boot (boot_id changed). Its processes
 # cannot exist in this kernel, but nothing saw them end, so it is not "terminated".
 # Nothing is relaunched: workload restart after reboot needs a founder policy.
@@ -103,7 +106,8 @@ def _require_private_dir(directory: Path):
     ``Path.mkdir(parents=True)`` creates missing parents at 0777 masked by the
     process umask, so umask 000 leaves them world-writable. ``os.mkdir``'s mode
     is masked the same way; ``chmod`` is the explicit mode and ignores umask.
-    An existing directory is not chmod'd: it must already be operator-owned 0700.
+    An existing directory this process owns is tightened to 0700. A directory
+    owned by someone else, or a symlink, is refused.
     """
     directory = Path(directory)
     missing = []
@@ -129,10 +133,22 @@ def _require_private_dir(directory: Path):
                 raise PermissionError('Registry directory must be operator-owned mode 0700')
         else:
             os.chmod(path, 0o700)
-    info = directory.lstat()
-    if (stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode)
-            or info.st_uid != os.getuid() or info.st_mode & 0o077):
-        raise PermissionError('Registry directory must be operator-owned mode 0700')
+    try:
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as exc:
+        raise PermissionError('Registry directory must be operator-owned mode 0700') from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            raise PermissionError('Registry directory must be operator-owned mode 0700')
+        # Group/other bits on a directory we own are tightened, not refused.
+        if info.st_mode & 0o077:
+            os.fchmod(fd, 0o700)
+            info = os.fstat(fd)
+            if info.st_mode & 0o077 or info.st_uid != os.getuid():
+                raise PermissionError('Registry directory must be operator-owned mode 0700')
+    finally:
+        os.close(fd)
 
 
 def _create_private_file(path: Path):
@@ -162,6 +178,40 @@ def _fsync_dir(directory: Path):
         os.close(fd)
 
 
+def _sync_directory(directory: Path):
+    """Fsync a directory whose new directory entry is already visible.
+
+    Retry once. The rename has already published the file, so a lasting fsync
+    failure is logged and not reported as a failed write.
+    """
+    last = None
+    for _ in range(2):
+        try:
+            _fsync_dir(directory)
+            return
+        except OSError as exc:
+            last = exc
+    log.warning('registry directory fsync failed after the new file was published: %s', last)
+
+
+def _pid_is_gone(pid):
+    """True only when the kernel reports that ``pid`` does not exist."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    except OSError as exc:
+        return exc.errno in (errno.ENOENT, errno.ESRCH)
+    return False
+
+
+_TEMP_NAME = re.compile(r'^\.runs\.sqlite3\.tmp-(\d+)-\d+(?:-wal|-shm|-journal)?$')
+
+
 _RUNS_TABLE = (
     'CREATE TABLE runs (run_id TEXT PRIMARY KEY, '
     'unit TEXT UNIQUE NOT NULL, stop INTEGER NOT NULL, '
@@ -172,9 +222,13 @@ _RUNS_TABLE = (
 class Registry:
     """Durable run records. A commit is a temp file, fsync, and rename.
 
-    The live ``runs.sqlite3`` is replaced only after the new bytes pass
-    ``integrity_check``. A crash mid-write leaves the previous file. A zero-length
-    or truncated file is refused, not opened as an empty registry.
+    The live file's WAL, SHM, and rollback journal are checkpointed and removed
+    before the rename. A crash after the rename must not leave the previous WAL
+    beside the new file: SQLite would replay it onto the new bytes. A crash
+    before the rename leaves the previous file, with its committed rows
+    checkpointed into it. A zero-length or truncated file is refused. If the
+    new file cannot be reopened, later calls raise RegistryIntegrityError until
+    an open succeeds.
     """
     def __init__(self, directory: Path):
         directory = Path(directory)
@@ -184,13 +238,18 @@ class Registry:
         self.lock = threading.RLock()
         self.closed = False
         self.db = None
+        self._open_error = None
+        self._sweep_stale_temps()
         try:
             self.path.lstat()
         except FileNotFoundError:
             self._publish_new()
         else:
             self._assert_sound(self.path)
-        self._reopen()
+        try:
+            self._reopen()
+        except sqlite3.Error as exc:
+            raise RegistryIntegrityError('registry is not open') from exc
         self._seal_files()
 
     def _temp_path(self):
@@ -202,6 +261,37 @@ class Registry:
                 os.unlink(f'{tmp}{suffix}')
             except FileNotFoundError:
                 pass
+
+    def _sweep_stale_temps(self):
+        """Remove temp copies left by a process that no longer exists.
+
+        A live pid's temp file may belong to an in-flight write and is kept.
+        """
+        try:
+            entries = list(self.directory.iterdir())
+        except OSError:
+            log.warning('could not list registry temps in %s', self.directory, exc_info=True)
+            return
+        own = os.getpid()
+        for entry in entries:
+            match = _TEMP_NAME.fullmatch(entry.name)
+            if match is None:
+                continue
+            pid = int(match.group(1))
+            if pid == own or not _pid_is_gone(pid):
+                continue
+            try:
+                info = entry.lstat()
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                continue
+            try:
+                os.unlink(entry)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                log.warning('could not remove stale registry temp %s', entry, exc_info=True)
 
     def _seal_files(self):
         """Force 0600 on the registry and any sqlite sidecar. umask does not apply."""
@@ -253,10 +343,14 @@ class Registry:
             self._require_intact(dest)
             dest.close()
             dest = None
+            # Nothing is live at this name yet. Remove a journal that SQLite
+            # would replay onto the file this rename is about to publish.
+            self._drop_live_sidecars()
+            if not self._journals_gone():
+                raise RegistryIntegrityError('registry journal was not removed before publish')
             self._publish(tmp)
             published = True
-            self._drop_live_sidecars()
-            _fsync_dir(self.directory)
+            _sync_directory(self.directory)
         except BaseException:
             if dest is not None:
                 dest.close()
@@ -306,12 +400,63 @@ class Registry:
             conn.close()
 
     def _drop_live_sidecars(self):
-        """Remove a journal left beside a file we just replaced with a full copy."""
+        """Unlink journals beside the live name. A missing file is not an error."""
         for suffix in ('-journal', '-wal', '-shm'):
             try:
                 os.unlink(self.directory / f'runs.sqlite3{suffix}')
             except FileNotFoundError:
                 pass
+            except OSError:
+                # The caller checks the names are actually gone.
+                pass
+
+    def _journals_gone(self):
+        for suffix in ('-journal', '-wal', '-shm'):
+            if (self.directory / f'runs.sqlite3{suffix}').exists():
+                return False
+        return True
+
+    def _restore_open(self):
+        """Reopen the file that is still live. A failed reopen stays typed."""
+        if self.closed or self.db is not None:
+            return
+        self._ensure_open()
+
+    def _checkpoint_and_drop_journals(self):
+        """Checkpoint the live database and remove its journals before rename.
+
+        SQLite replays ``runs.sqlite3-wal`` onto whatever inode occupies that
+        name. Checkpoint first so a crash after the journals are gone, and
+        before the rename, still has every committed row in the old file.
+        """
+        conn = self.db
+        if conn is not None:
+            try:
+                conn.execute('PRAGMA query_only=OFF')
+                row = conn.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()
+            except sqlite3.Error as exc:
+                try:
+                    conn.execute('PRAGMA query_only=ON')
+                except sqlite3.Error:
+                    pass
+                raise RegistryIntegrityError('registry checkpoint failed') from exc
+            if row is None or row[0]:
+                try:
+                    conn.execute('PRAGMA query_only=ON')
+                except sqlite3.Error:
+                    pass
+                raise RegistryIntegrityError('registry checkpoint did not finish')
+            try:
+                conn.close()
+            finally:
+                self.db = None
+        self._drop_live_sidecars()
+        if not self._journals_gone():
+            try:
+                self._restore_open()
+            except RegistryIntegrityError:
+                pass
+            raise RegistryIntegrityError('registry journal was not removed before publish')
 
     def _reopen(self, drop_sidecars=False):
         previous = self.db
@@ -319,19 +464,33 @@ class Registry:
             previous.close()
             self.db = None
         if drop_sidecars:
-            # Close the connection that held the old inode before unlinking its journal.
             self._drop_live_sidecars()
-        conn = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
-        conn.execute('PRAGMA synchronous=FULL')
-        conn.execute('PRAGMA query_only=ON')
+        try:
+            conn = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
+            conn.execute('PRAGMA synchronous=FULL')
+            conn.execute('PRAGMA query_only=ON')
+        except sqlite3.Error as exc:
+            self.db = None
+            self._open_error = exc
+            raise
         self.db = conn
+        self._open_error = None
+
+    def _ensure_open(self):
+        """Return with a live connection, or raise RegistryIntegrityError."""
+        if self.closed:
+            raise RuntimeError('Registry closed')
+        if self.db is None:
+            try:
+                self._reopen()
+            except sqlite3.Error as exc:
+                raise RegistryIntegrityError('registry is not open') from exc
 
     @contextmanager
     def _write(self):
         """Apply one change on a copy, then publish it with fsync and rename."""
         with self.lock:
-            if self.closed:
-                raise RuntimeError('Registry closed')
+            self._ensure_open()
             tmp, dest = self._open_temp()
             published = False
             try:
@@ -355,11 +514,21 @@ class Registry:
                 self._require_intact(dest)
                 dest.close()
                 dest = None
-                self._publish(tmp)
+                self._checkpoint_and_drop_journals()
+                try:
+                    self._publish(tmp)
+                except BaseException:
+                    self._restore_open()
+                    raise
                 published = True
-                self._reopen(drop_sidecars=True)
+                try:
+                    self._reopen()
+                except sqlite3.Error as exc:
+                    self.db = None
+                    self._open_error = exc
+                    raise RegistryIntegrityError('registry reopen failed') from exc
                 self._seal_files()
-                _fsync_dir(self.directory)
+                _sync_directory(self.directory)
             except BaseException:
                 if dest is not None:
                     dest.close()
@@ -379,16 +548,14 @@ class Registry:
 
     def all(self):
         with self.lock:
-            if self.closed:
-                raise RuntimeError('Registry closed')
+            self._ensure_open()
             rows = self.db.execute('SELECT run_id, unit, stop, state, boot_id, detail '
                                    'FROM runs ORDER BY run_id').fetchall()
         return [Run(a, b, bool(c), d, e, f) for a, b, c, d, e, f in rows]
 
     def get(self, run_id):
         with self.lock:
-            if self.closed:
-                raise RuntimeError('Registry closed')
+            self._ensure_open()
             row = self.db.execute('SELECT run_id, unit, stop, state, boot_id, detail '
                                   'FROM runs WHERE run_id=?', (run_id,)).fetchone()
         if row is None:
@@ -596,11 +763,22 @@ class SystemdUserManager:
             raise
 
     def pid_alive(self, pid):
-        """True when ``/proc/<pid>`` is a live process. A zombie is not alive."""
+        """True when alive, False when gone, None when the read did not say.
+
+        Only ENOENT and ESRCH mean the process is gone. A zombie is gone. Any
+        other error, including EACCES and EIO, is unknown and must not be treated
+        as death.
+        """
         try:
-            text = Path(f'/proc/{int(pid)}/stat').read_text()
-        except (OSError, ValueError):
+            pid = int(pid)
+        except (TypeError, ValueError):
             return False
+        try:
+            text = Path(f'/proc/{pid}/stat').read_text()
+        except OSError as exc:
+            if exc.errno in (errno.ENOENT, errno.ESRCH):
+                return False
+            return None
         try:
             state = text[text.rindex(')') + 2:].split()[0]
         except (ValueError, IndexError):
@@ -608,11 +786,18 @@ class SystemdUserManager:
         return state not in ('Z', 'X')
 
     def _listed_pids(self, group):
+        """Return listed pids, [] when the cgroup is gone, or None when unreadable.
+
+        ENOENT and ESRCH mean there is no cgroup to list. Any other read error is
+        unknown, not an empty cgroup.
+        """
         path = self.cgroup_root / group.lstrip('/') / 'cgroup.procs'
         try:
             text = path.read_text()
-        except OSError:
-            return []
+        except OSError as exc:
+            if exc.errno in (errno.ENOENT, errno.ESRCH):
+                return []
+            return None
         pids = []
         for token in text.split():
             if not token.isdigit():
@@ -621,21 +806,33 @@ class SystemdUserManager:
         return pids
 
     def _process_still_live(self, props, group):
-        """True when a pid we can see is alive, or the cgroup pid list is unreadable.
+        """True when a listed pid is alive, False when all are gone, None if unknown.
 
         ``populated 0`` or an inactive show line is a scripted observation unless
-        every listed pid, including MainPID, is actually gone.
+        every listed pid, including MainPID, is actually gone. An unreadable
+        cgroup or an unreadable /proc entry is None: not attested death.
         """
         pids = []
         if group:
             listed = self._listed_pids(group)
             if listed is None:
-                return True
+                return None
             pids.extend(listed)
         main = props.get('MainPID', '')
         if str(main).isdigit() and int(main) > 0:
-            pids.append(int(main))
-        return any(self.pid_alive(pid) for pid in pids)
+            main_pid = int(main)
+            if main_pid not in pids:
+                pids.append(main_pid)
+        if not pids:
+            return False
+        unknown = False
+        for pid in pids:
+            alive = self.pid_alive(pid)
+            if alive is True:
+                return True
+            if alive is None:
+                unknown = True
+        return None if unknown else False
 
     def processes_gone(self, unit):
         """Attest the unit's processes are gone. A scripted observe() string is not this."""
@@ -668,7 +865,7 @@ class SystemdUserManager:
                 if load == 'not-found' and active == 'inactive':
                     # Not-found is "gone" only when no MainPID is still alive. A
                     # scripted not-found line with a live listener is not an end.
-                    if self._process_still_live(props, ''):
+                    if self._process_still_live(props, '') is not False:
                         return 'unknown'
                     return 'gone'
                 ran = (props.get('InvocationID', '').strip('0')
@@ -676,7 +873,7 @@ class SystemdUserManager:
                 if (load == 'loaded' and ran and props.get('Job', '') in ('', '0')
                         and (active in ('inactive', 'failed')
                              or (active == 'active' and props.get('SubState') == 'exited'))):
-                    if self._process_still_live(props, ''):
+                    if self._process_still_live(props, '') is not False:
                         return 'unknown'
                     return 'empty'
                 return 'unknown'
@@ -685,7 +882,7 @@ class SystemdUserManager:
             events = (self.cgroup_root / group.lstrip('/') / 'cgroup.events').read_text()
             populated = dict(line.split() for line in events.splitlines()).get('populated')
             if populated == '0':
-                if self._process_still_live(props, group):
+                if self._process_still_live(props, group) is not False:
                     return 'unknown'
                 return 'empty'
             if populated == '1' and props.get('ActiveState') == 'active':

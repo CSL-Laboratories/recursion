@@ -118,6 +118,15 @@ The 21 codes: `engine_unknown`, `path_not_absolute`, `binary_missing`, `wrapper_
 `interpreter_unpinned`, `version_unparsed`, `floor_unset`, `version_refused`, `argv_empty`,
 `argv0_mismatch`, `grant_forged`, `grant_stale`, `spawn_too_large`.
 
+Refusals on a check-only `binary+launcher` grant (Lucas, via Liaison, 2:01pm PST Nov 10):
+
+- `binary_missing`: the pinned binary behind the script launcher is not executable, at
+  grant time or on any later use (lost exec bit). Test:
+  `tests/test_pins.py::MeasuredBinaryEntryTests::test_pinned_binary_without_exec_bit_is_binary_missing_at_grant_and_later_uses`.
+- `pin_entry_unset`: the script-named launcher is itself the pinned binary, so no binary is
+  measured behind it, and the launcher is never executed. Test:
+  `tests/test_pins.py::MeasuredBinaryEntryTests::test_script_named_launcher_that_is_itself_the_binary_has_nothing_behind_it`.
+
 ### Zero-egress version probe
 
 `<realpath> --version` (a row with `probe_name` reads a sibling binary instead, whose

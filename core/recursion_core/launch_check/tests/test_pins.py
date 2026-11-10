@@ -1527,6 +1527,34 @@ class MeasuredBinaryEntryTests(Base):
         with windows(), table(pin):
             self.refused("binary_missing", self.g, inst)
 
+    def test_pinned_binary_without_exec_bit_is_binary_missing_at_grant_and_later_uses(self) -> None:
+        for ext in self.EXTS:
+            with self.subTest(ext=ext):
+                # Grant time: the pinned binary behind the launcher has no exec bit.
+                inst = agy_windows_install(ext)
+                pin = inst.pin()
+                os.chmod(inst.root, 0o644)
+                with windows(), table(pin):
+                    self.refused("binary_missing", self.g, inst)
+                os.chmod(inst.root, 0o755)
+                self.assertFalse(os.path.exists(inst.ran))
+                # Later uses: the exec bit is lost after the grant.
+                inst = agy_windows_install(ext)
+                binary = os.path.realpath(inst.root)
+                with windows(), table(inst.pin()):
+                    g = self.g(inst)
+                    self.assertTrue(g.check_only)
+                    self.assertEqual("binary+launcher", g.pin_kind)
+                    plan = launch_plan(g, ["agy"], {})
+                    self.assertEqual([binary], plan.exec_argv())
+                    os.chmod(binary, 0o644)
+                    self.refused("binary_missing", plan.exec_argv)
+                    self.refused("binary_missing", launch_plan, g, ["agy"], {})
+                    os.chmod(binary, 0o755)
+                    self.assertEqual([binary], plan.exec_argv())
+                    self.assertEqual([binary], launch_plan(g, ["agy"], {}).exec_argv())
+                self.assertFalse(os.path.exists(inst.ran))
+
     def test_launcher_tree_pin_with_no_entry_and_no_interpreter_is_pin_entry_unset(self) -> None:
         inst = pi_windows_install(".cmd", entry=())
         with windows(), table(inst.pin()):

@@ -100,7 +100,7 @@ class CellTests(unittest.TestCase):
         self._assert_all(self._group("sub_base_url_ok"), 9)
 
     def test_a_bracketed_host_must_be_an_ipv6_address_cells(self) -> None:
-        self._assert_all(self._group("bracket_host"), 9)
+        self._assert_all(self._group("bracket_host"), 11)
         self._assert_all(self._group("bracket_host_ok"), 5)
 
     def test_a_dot_dot_out_of_a_directory_others_can_write_is_refused(self) -> None:
@@ -619,6 +619,27 @@ class AuthRouteTests(unittest.TestCase):
                 with self.subTest(name=name, value=scheme + host):
                     parent = {"PATH": "/usr/bin", name: scheme + host}
                     self.assertEqual(scheme + host, build_child_env("claude_code", home=home, auth_mode=SUB, parent=parent)[name])
+
+    def test_userinfo_is_reported_before_a_malformed_bracketed_host(self) -> None:
+        """Devin, "Userinfo refusal lost for malformed hosts": the bracket check ran first and hid the userinfo code."""
+
+        home = _home(self)
+        for url, cause in (("https://user@[:::]", "base_url_userinfo"), ("https://[:::]", "base_url_malformed")):
+            for mode in (API, CLOUD, SUB):
+                with self.subTest(mode=mode, url=url):
+                    route = ChildRoute(api_key=ROUTES[mode].api_key, base_url=url,
+                                       provider_switches=ROUTES[mode].provider_switches)
+                    self.assertEqual((URL, cause), self._refused("claude_code", home, auth_mode=mode, route=route, parent={}))
+            with self.subTest(trusted_entry=url):
+                self.assertEqual((None, "route_trusted_base_urls_malformed"), self._refused(
+                    "claude_code", home, auth_mode=SUB, parent={},
+                    route=ChildRoute(base_url="https://[::1]", trusted_base_urls=("https://[::1]", url))))
+        for value, cause in (("http://u:p@[:::]:8080", "proxy_userinfo"), ("http://[:::]:8080", "proxy_malformed")):
+            with self.subTest(value=value):
+                self.assertEqual(("HTTPS_PROXY", cause), self._refused(
+                    "claude_code", home, auth_mode=SUB, parent={"PATH": "/usr/bin", "HTTPS_PROXY": value}))
+                self.assertEqual(("HTTPS_PROXY", cause), self._refused(
+                    "codex", home, auth_mode=SUB, parent={"PATH": "/usr/bin"}, overrides={"HTTPS_PROXY": value}))
 
     def test_ambient_keys_are_dropped_in_every_mode(self) -> None:
         home = _home(self)

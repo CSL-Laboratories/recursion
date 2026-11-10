@@ -417,6 +417,10 @@ def cells(s: Scratch) -> list[Cell]:
     add("bracket_host", "proxy_colons", {"HTTPS_PROXY": "http://[:::]:3128"}, R("proxy_malformed"))
     add("bracket_host", "proxy_short", {"http_proxy": "[1:2:3]:3128"}, R("proxy_malformed"), engine="codex")
     add("bracket_host", "allproxy_not_hex", {"ALL_PROXY": "socks5://[::g]:1080"}, R("proxy_malformed"))
+    # A user name or password is still reported first (Devin, "Userinfo refusal lost for malformed hosts").
+    add("bracket_host", "base_url_userinfo_first", {}, R("base_url_userinfo"), auth=api,
+        route=ChildRoute(api_key=USER_KEY, base_url="https://user@[:::]"))
+    add("bracket_host", "proxy_userinfo_first", {"HTTPS_PROXY": "http://u:p@[:::]:8080"}, R("proxy_userinfo"))
     add("bracket_host_ok", "base_url_loopback", {}, L(_same(**{key: USER_KEY, url: "https://[::1]:8443/v1/"})), auth=api,
         route=ChildRoute(api_key=USER_KEY, base_url="https://[::1]:8443/v1/"))
     add("bracket_host_ok", "base_url_sub_trusted", token, L(_same(**{url: "https://[2001:db8::1]"}, **token)),

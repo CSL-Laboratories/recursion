@@ -496,10 +496,12 @@ def _unsafe_base_url(value: object) -> str | None:
     if not isinstance(value, str):
         return "base_url_malformed"
     match = _BASE_URL.match(value)
-    if match is None or match["scheme"].lower() not in ("http", "https") or _bad_bracket_host(match["host"]):
+    if match is None or match["scheme"].lower() not in ("http", "https"):
         return "base_url_malformed"
     if match["userinfo"] is not None:
         return "base_url_userinfo"
+    if _bad_bracket_host(match["host"]):
+        return "base_url_malformed"
     if match["port"] is not None and not 0 < int(match["port"]) < 65536:
         return "base_url_malformed"
     if ".." in (match["path"] or "").split("/"):
@@ -661,10 +663,10 @@ def _unsafe_proxy(value: str, schemes: tuple[str, ...] = ("http", "https")) -> s
     match = _PROXY_URL.match(value)
     if match is None or match["scheme"] is not None and match["scheme"].lower() not in schemes:
         return "proxy_malformed"
-    if _bad_bracket_host(match["host"]):
-        return "proxy_malformed"
     if match["userinfo"] is not None:
         return "proxy_userinfo"
+    if _bad_bracket_host(match["host"]):
+        return "proxy_malformed"
     if match["port"] is not None and not 0 < int(match["port"]) < 65536:
         return "proxy_malformed"
     return None

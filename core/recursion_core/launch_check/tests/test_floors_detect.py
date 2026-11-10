@@ -45,13 +45,13 @@ class FloorTableTests(unittest.TestCase):
         self.assertRegex(FLOOR_TABLE_VERSION, r"^r2a-floors/\d+\.\d+\.\d+-candidate-\d{4}-\d{2}-\d{2}$")
         self.assertEqual(FLOOR_TABLE_VERSION, table_record()["floor_table"])
 
-    def test_nine_engines_and_binary_names(self) -> None:
+    def test_eight_engines_and_binary_names(self) -> None:
         names = {e: s.names for e, s in FLOORS.items()}
         self.assertEqual(
             {
                 "claude_code": ("claude",), "codex": ("codex",), "opencode": ("opencode", "opencode2"),
                 "grok": ("grok",), "antigravity": ("agy",), "cursor": ("agent", "cursor-agent"),
-                "gemini": ("gemini",), "pi": ("pi",), "hermes": ("hermes",),
+                "pi": ("pi",), "hermes": ("hermes",),
             },
             names,
         )
@@ -61,7 +61,13 @@ class FloorTableTests(unittest.TestCase):
             {"antigravity": "binary+launcher", "cursor": "launcher+tree", "pi": "launcher+tree", "hermes": "launcher+tree"},
             {e: s.pin for e, s in FLOORS.items() if s.pin},
         )
-        self.assertEqual(["gemini"], [e for e, s in FLOORS.items() if s.api_key_only])
+        # Gemini CLI is dropped (Lucas, 2026-11-09): no row, no binary name, no api_key_only field.
+        self.assertNotIn("gemini", FLOORS)
+        self.assertNotIn("gemini", [n for s in FLOORS.values() for n in s.names])
+        self.assertNotIn("gemini", table_record()["engines"])
+        self.assertFalse(hasattr(FLOORS["grok"], "api_key_only"))
+        self.assertNotIn("api_key_only", table_record()["engines"]["grok"])
+        self.assertEqual("r2a-floors/1.5.0-candidate-2026-11-09", FLOOR_TABLE_VERSION)
 
     def test_two_slots(self) -> None:
         slots = {e: (s.functional, s.security) for e, s in FLOORS.items()}
@@ -69,7 +75,7 @@ class FloorTableTests(unittest.TestCase):
             {
                 "claude_code": ("2.1.314", "2.1.260"), "codex": (None, "0.131.0"),
                 "opencode": (None, "1.18.33"), "grok": (None, None), "antigravity": (None, None),
-                "cursor": (None, "2025.09.17-25b418f"), "gemini": (None, "0.39.1"), "pi": (None, None),
+                "cursor": (None, "2025.09.17-25b418f"), "pi": (None, None),
                 "hermes": (None, None),
             },
             slots,
@@ -87,7 +93,7 @@ class FloorTableTests(unittest.TestCase):
             self.assertEqual("pin", engines[engine]["identity"], engine)
         for engine in set(FLOORS) - required - pinned:
             self.assertEqual("rule", engines[engine]["identity"], engine)
-        self.assertEqual({"gemini", "grok"}, set(FLOORS) - required - pinned)
+        self.assertEqual({"grok"}, set(FLOORS) - required - pinned)
 
     def test_table_is_read_only(self) -> None:
         self.assertIsInstance(FLOORS, MappingProxyType)
@@ -220,6 +226,18 @@ class DetectTests(unittest.TestCase):
             detect("kiro", "/usr/bin")
         self.assertEqual("engine_unknown", cm.exception.code)
 
+    def test_gemini_is_not_an_engine(self) -> None:
+        # Dropped row: `gemini` is an unknown id even with a native `gemini` on PATH.
+        d = F.dir()
+        F.make("gemini", "0.39.1", where=d)
+        with self.assertRaises(LaunchRefused) as cm:
+            detect("gemini", d)
+        self.assertEqual("engine_unknown", cm.exception.code)
+        self.assertNotIn("gemini", detect_all(d))
+        for found in detect_all(d).values():
+            self.assertEqual((), found.hits)
+            self.assertIsNone(found.candidate)
+
     def test_cursor_both_names(self) -> None:
         d = F.dir()
         F.make("cursor-agent", "2026.10.22", where=d)
@@ -276,7 +294,7 @@ class LaunchCheckTests(unittest.TestCase):
         F.make("claude", "2.1.318 (Claude Code)", where=d)
         F.make("codex", "codex-cli 0.160.0", where=d)
         F.make("opencode", "opencode v2.2.5", where=d)
-        F.make("gemini", "0.38.0", where=d)
+        F.make("gemini", "0.39.1", where=d)  # a leftover Gemini CLI: not an engine, never granted
         F.script(os.path.join(d, "agent"), "#!/bin/sh\nexec node index.js \"$@\"\n")
         F.make("pi", "0.30.2", where=d)  # a native `pi` is not Pi (F3): no pin matches it
         grants, records = launch_check(d, probe=F.probe)
@@ -289,7 +307,9 @@ class LaunchCheckTests(unittest.TestCase):
         self.assertTrue(by["codex"]["beta"])
         self.assertEqual("granted", by["opencode"]["outcome"])
         self.assertTrue(by["opencode"]["beta"])
-        self.assertEqual("version_refused", by["gemini"]["refusal"])
+        self.assertNotIn("gemini", by)
+        self.assertNotIn("gemini", grants)
+        self.assertFalse([r for r in records if any(os.path.basename(h) == "gemini" for h in r.get("hits", ()))])
         self.assertEqual("pin_mismatch", by["cursor"]["refusal"])
         self.assertEqual("pin_mismatch", by["pi"]["refusal"])
         for engine in ("grok", "antigravity", "hermes"):

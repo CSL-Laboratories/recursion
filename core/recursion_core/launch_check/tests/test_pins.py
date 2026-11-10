@@ -1,9 +1,9 @@
-"""CSL-732 (B10, R2a): pinned wrapper routes and the Gemini CLI change (candidate tests).
+"""CSL-732 (B10, R2a): pinned wrapper routes and the dropped Gemini CLI row (candidate tests).
 
 Lucas's owner call of 2026-11-09: Pi, Hermes and Cursor run as beta when the launcher and
 the installed package files match a pin; Antigravity CLI (``agy``) when its version, binary
-and launcher match a pin; any mismatch is refused until re-pinned; Gemini CLI is an API-key
-route only. Every install below is a fake built in a temp dir and measured there. No real
+and launcher match a pin; any mismatch is refused until re-pinned. Gemini CLI is not an
+engine here (his call of the same day: drop the row). Every install below is a fake built in a temp dir and measured there. No real
 engine is run and no pin in these tests is a real one.
 
 Run from the repository root:
@@ -561,75 +561,59 @@ class PinnedDetectTests(Base):
 
 
 @unittest.skipUnless(os.name == "posix", "POSIX fixtures")
-class GeminiTests(Base):
-    """Gemini CLI: API-key route only, no pin; its refusals point to Antigravity CLI."""
+class GeminiDroppedTests(Base):
+    """Gemini CLI is not a route (Lucas, 2026-11-09): a `gemini` on PATH is unknown, never granted."""
 
     def gemini_bundle(self) -> str:
         d = F.dir()
         return F.script(os.path.join(d, "gemini"), "#!/usr/bin/env node\nconsole.log('0.40.0')\n")
 
-    def test_gemini_is_api_key_only_and_not_a_pinned_route(self) -> None:
-        self.assertEqual(["gemini"], [e for e, s in FLOORS.items() if s.api_key_only])
-        self.assertIsNone(FLOORS["gemini"].pin)
-        self.assertTrue(table_record()["engines"]["gemini"]["api_key_only"])
-        self.assertFalse(table_record()["engines"]["antigravity"]["api_key_only"])
-        g = grant("gemini", F.make("gemini", "0.39.1"), probe=F.probe)  # a native gemini, as before
-        self.assertTrue(g.record()["api_key_only"] and g.record()["beta"])
-        self.assertFalse(grant("grok", F.make("grok", "grok 1.0.0"), probe=F.probe).record()["api_key_only"])
+    def test_gemini_has_no_row_and_no_name(self) -> None:
+        self.assertNotIn("gemini", FLOORS)
+        self.assertNotIn("gemini", table_record()["engines"])
+        self.assertFalse([e for e, s in FLOORS.items() if "gemini" in s.names])
+        self.assertFalse([p for p in PINS if p.engine == "gemini"])
+        self.assertNotIn("sign_in_refused", REFUSAL_CODES)
+        self.assertNotIn("auth", [f.name for f in dataclasses.fields(grant_mod.LaunchPlan)])
+        self.assertFalse(hasattr(grant_mod, "check_auth"))
 
-    def test_gemini_bundle_refusal_names_antigravity(self) -> None:
-        script = self.gemini_bundle()
-        r = self.refused("wrapper_refused", grant, "gemini", script, probe=self.never_probe)
-        self.assertIn("API-key route only", r.detail)
-        self.assertIn("Antigravity CLI (agy)", r.detail)
-        _, records = launch_check(os.path.dirname(script), probe=self.never_probe)
-        rec = {r["engine"]: r for r in records}["gemini"]
-        self.assertEqual("wrapper_refused", rec["refusal"])
-        self.assertIn("Antigravity CLI (agy)", rec["detail"])
-
-    def test_gemini_launches_only_as_a_stated_api_key_route(self) -> None:
-        g = grant("gemini", F.make("gemini", "0.39.1"), probe=F.probe)
-        for auth in (None, "", "subscription", "oauth", "login_with_google", "google_account", "code_assist",
-                     "API_KEY", "api-key", " api_key", b"api_key", True, ["api_key"]):
-            with self.subTest(auth=auth):
-                r = self.refused("sign_in_refused", launch_plan, g, ["gemini", "-p", "hi"], auth=auth)
+    def test_a_gemini_binary_is_not_granted(self) -> None:
+        # Native with a version that met the old floor, and the real JS-bundle shape: both unknown.
+        for path in (F.make("gemini", "0.39.1"), F.make("gemini", "gemini 9.9.9"), self.gemini_bundle()):
+            with self.subTest(path=path):
+                r = self.refused("engine_unknown", grant, "gemini", path, probe=self.never_probe)
                 self.assertEqual("gemini", r.engine)
-                self.assertIn("API-key route only", r.detail)
-                self.assertIn("Antigravity CLI (agy)", r.detail)
-        self.assertIn("not stated", self.refused("sign_in_refused", launch_plan, g, ["gemini"]).detail)
-        plan = launch_plan(g, ["gemini", "-p", "hi"], auth="api_key")
-        self.assertEqual("api_key", plan.auth)
-        self.assertEqual([g.realpath, "-p", "hi"], plan.exec_argv())
-        self.assertEqual({}, plan.exec_env())
-        # The statement is re-checked on every use: an edited or hand-built plan gets no pass.
-        for auth in (None, "subscription"):
-            with self.subTest(replaced=auth):
-                fake = dataclasses.replace(plan, auth=auth)
-                self.refused("sign_in_refused", fake.exec_argv)
-                self.refused("sign_in_refused", fake.exec_env)
-        self.refused("sign_in_refused", grant_mod.LaunchPlan(g, ("gemini",), (), plan.spawn_bytes).exec_argv)
+                self.refused("engine_unknown", detect, "gemini", os.path.dirname(path))
+                # No other row takes a file named `gemini`.
+                for engine in FLOORS:
+                    r = self.refused("name_mismatch", grant, engine, path, probe=self.never_probe)
+                    self.assertEqual(engine, r.engine)
 
-    def test_auth_is_not_checked_for_other_engines(self) -> None:
-        # Only an API-key-only row needs the statement; the other eight rows are unchanged.
+    def test_launch_check_ignores_a_gemini_on_path(self) -> None:
+        d = F.dir()
+        F.make("gemini", "0.39.1", where=d)
+        grants, records = launch_check(d, probe=self.never_probe)
+        self.assertEqual({}, grants)
+        self.assertEqual(set(FLOORS), {r["engine"] for r in records})
+        self.assertEqual({"absent"}, {r["outcome"] for r in records})
+
+    def test_a_grant_cannot_be_planned_as_gemini(self) -> None:
         g = grant("grok", F.make("grok", "grok 1.0.0"), probe=F.probe)
-        for auth in (None, "api_key", "subscription"):
-            with self.subTest(auth=auth):
-                self.assertEqual([g.realpath], launch_plan(g, ["grok"], auth=auth).exec_argv())
-        for engine, spec in FLOORS.items():
-            if engine != "gemini":
-                grant_mod.check_auth(spec, None)
-        inst = agy_install()
-        with table(inst.pin()):
-            plan = launch_plan(grant("antigravity", inst.path, probe=self.never_probe), ["agy"], auth="subscription")
-            self.assertEqual([os.path.realpath(inst.path)], plan.exec_argv())
+        self.refused("argv0_mismatch", launch_plan, g, ["gemini", "-p", "hi"])
+        self.refused("grant_forged", launch_plan, dataclasses.replace(g, engine="gemini"), ["gemini"])
+        with self.assertRaises(TypeError):  # the auth statement went with the row
+            launch_plan(g, ["grok"], auth="api_key")  # type: ignore[call-arg]
 
-    def test_a_pin_cannot_turn_gemini_into_a_wrapper_route(self) -> None:
+    def test_a_pin_cannot_make_gemini_a_route(self) -> None:
         script = self.gemini_bundle()
         pin = pins_mod.measure("gemini", "launcher+tree", script, ".", version="0.40.0", platform="test",
                                measured="2026-11-09", source="fake")
         with table(pin):
-            self.refused("wrapper_refused", grant, "gemini", script, probe=self.never_probe)
-            self.assertIsNone(detect("gemini", os.path.dirname(script)).candidate)
+            self.refused("engine_unknown", grant, "gemini", script, probe=self.never_probe)
+            self.refused("engine_unknown", detect, "gemini", os.path.dirname(script))
+            grants, records = launch_check(os.path.dirname(script), probe=self.never_probe)
+            self.assertEqual({}, grants)
+            self.assertNotIn("gemini", {r["engine"] for r in records})
 
 
 if __name__ == "__main__":

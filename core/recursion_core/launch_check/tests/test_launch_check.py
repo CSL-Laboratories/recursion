@@ -58,7 +58,7 @@ EXPECTED_CODES = {
     "engine_unknown", "path_not_absolute", "binary_missing", "wrapper_refused", "name_mismatch",
     "version_probe_failed", "binary_changed", "engine_mismatch", "identity_mismatch", "identity_unverified", "version_unparsed", "floor_unset",
     "version_refused", "argv_empty", "argv0_mismatch", "grant_forged", "grant_stale", "spawn_too_large",
-    "pin_mismatch", "sign_in_refused",
+    "pin_mismatch",
 }
 needs_exec = unittest.skipUnless(os.name == "posix", "POSIX fixtures")
 
@@ -97,7 +97,8 @@ class RefusalCodeTests(Base):
     def test_closed_set_is_exactly_the_listed_codes(self) -> None:
         self.assertEqual(EXPECTED_CODES, set(REFUSAL_CODES))
         self.assertIsInstance(REFUSAL_CODES, frozenset)
-        self.assertTrue(REFUSAL_CODES_VERSION.startswith("r2a-refusals/"))
+        self.assertEqual("r2a-refusals/1.4.0-candidate-2026-11-09", REFUSAL_CODES_VERSION)
+        self.assertNotIn("sign_in_refused", REFUSAL_CODES)  # went with the Gemini CLI row
 
     def test_unknown_code_cannot_be_raised(self) -> None:
         with self.assertRaises(ValueError):
@@ -152,8 +153,6 @@ class GrantTests(Base):
             ("opencode", "opencode2", "opencode v2.2.5", None),
             ("opencode", "opencode", "opencode 1.18.32", "version_refused"),
             ("opencode", "opencode", "opencode 1.18.33", None),
-            ("gemini", "gemini", "0.39.0", "version_refused"),
-            ("gemini", "gemini", "0.39.1", None),
             ("grok", "grok", "grok 1.0.0", None),
             # Pinned routes: a native file with the right name and a good version line is not a pin.
             ("cursor", "agent", "2026.10.22", "pin_mismatch"),
@@ -399,15 +398,15 @@ class GrantRefusalTests(Base):
             self.assertEqual("0.9.1", self.g("hermes", self._hermes("hermes-acp 0.9.1")).version)
 
     def test_bare_line_engines_have_no_positive_identity_check(self) -> None:
-        # Gemini and Grok: the real line is bare or unread, so no format is invented. A bare line
-        # passing the floors grants. Cursor and Antigravity were here until Lucas's 2026-11-09
-        # call made them pinned routes (test_pins.py).
-        for engine, name, line in (("gemini", "gemini", "0.39.1"), ("grok", "grok", "1.0.0")):
+        # Grok: the real line was never read, so no format is invented. A bare line passing the
+        # floors grants. Cursor and Antigravity were here until Lucas's 2026-11-09 call made them
+        # pinned routes (test_pins.py); the Gemini CLI row was dropped the same day.
+        for engine, name, line in (("grok", "grok", "1.0.0"),):
             with self.subTest(engine=engine):
                 self.assertFalse(FLOORS[engine].ident_required)
                 self.assertIsNone(FLOORS[engine].pin)
                 self.assertEqual(engine, self.g(engine, F.make(name, line)).engine)
-        self.assertEqual(["gemini", "grok"], sorted(e for e, s in FLOORS.items() if not s.ident_required and s.pin is None))
+        self.assertEqual(["grok"], sorted(e for e, s in FLOORS.items() if not s.ident_required and s.pin is None))
 
     def test_self_naming_rechecked_at_launch_plan(self) -> None:
         g = self.g("grok", F.make("grok", "1.0.0"))
@@ -435,7 +434,9 @@ class GrantRefusalTests(Base):
     def test_engine_mismatch(self) -> None:
         self.refused("engine_mismatch", self.g, "claude_code", self.claude(CODEX))
         self.refused("engine_mismatch", self.g, "codex", F.make("codex", CLAUDE))
-        self.refused("engine_mismatch", self.g, "opencode", F.make("opencode", "gemini 0.40.0"))
+        self.refused("engine_mismatch", self.g, "opencode", F.make("opencode", "grok 0.40.0"))
+        # "gemini" names no engine in the table now: the line just fails opencode's own identity rule.
+        self.refused("identity_mismatch", self.g, "opencode", F.make("opencode", "gemini 0.40.0"))
         with self.probed_hermes():
             self.refused("engine_mismatch", self.g, "hermes", self._hermes("codex-cli 0.160.0"))
 

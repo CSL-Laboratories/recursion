@@ -7,7 +7,7 @@ error: the only way out of a failed check is this exception.
 
 from __future__ import annotations
 
-REFUSAL_CODES_VERSION = "r2a-refusals/1.3.0-candidate-2026-11-09"
+REFUSAL_CODES_VERSION = "r2a-refusals/1.4.0-candidate-2026-11-09"
 
 # Closed set. Adding, removing or renaming a code is a new REFUSAL_CODES_VERSION.
 REFUSAL_CODES = frozenset(
@@ -23,7 +23,6 @@ REFUSAL_CODES = frozenset(
         "identity_mismatch",  # version line does not name an engine whose real line names it
         "identity_unverified",  # engine has no identity rule or pinned digest (refused before probing)
         "pin_mismatch",  # pinned route: launcher, package files or binary match no recorded pin (until re-pinned)
-        "sign_in_refused",  # API-key-only engine (Gemini CLI) launched without auth="api_key"
         "version_unparsed",  # version token does not match the engine's format
         "floor_unset",  # a floor in the table does not parse
         "version_refused",  # below a floor, or a prerelease

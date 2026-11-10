@@ -9,10 +9,6 @@ A pinned route (``EngineSpec.pin``: pi, hermes, cursor, antigravity) is not prob
 launcher and its package tree or binary must match a pin in ``pins.py``; the version is
 the pin's, and anything else is ``pin_mismatch`` until re-pinned.
 
-An API-key-only engine (``EngineSpec.api_key_only``: Gemini CLI) gets a launch plan only
-when the caller states ``auth="api_key"``; a subscription sign-in, or no statement, is
-``sign_in_refused``. No credential is read here.
-
 ``launch_plan(grant, argv, env)`` authenticates the grant, checks argv and the spawn
 size, re-verifies the binary, and returns a ``LaunchPlan``. Every use of a plan
 (``plan.exec_argv()``) authenticates and re-verifies again: a full re-hash, never a
@@ -77,8 +73,6 @@ class Grant:
         out["outcome"] = "granted"
         # O50: no measured functional floor => beta on route.list.
         out["beta"] = self.floor_functional is None
-        spec = floors.FLOORS.get(self.engine)
-        out["api_key_only"] = bool(spec and spec.api_key_only)
         return out
 
 
@@ -268,7 +262,6 @@ class LaunchPlan:
     argv: tuple[str, ...]  # as requested; argv[0] is the bare engine name
     env: tuple[tuple[str, str], ...]
     spawn_bytes: int
-    auth: str | None = None  # the caller's stated auth kind; an API-key-only engine needs "api_key"
 
     def exec_argv(self) -> list[str]:
         """Re-run every ``launch_plan`` check on every use; return ``[realpath, *argv[1:]]``.
@@ -291,39 +284,22 @@ class LaunchPlan:
         if len(dict(env)) != len(env):
             spec = authenticate(self.grant)
             raise LaunchRefused("spawn_too_large", spec.engine, "env repeats a name")
-        size = _checked_launch(self.grant, self.argv, dict(env), self.auth)
+        size = _checked_launch(self.grant, self.argv, dict(env))
         if size != self.spawn_bytes:
             raise LaunchRefused("spawn_too_large", self.grant.engine, "spawn_bytes does not match argv and env")
 
 
-def launch_plan(
-    g: object, argv: Sequence[str], env: Mapping[str, str] | None = None, *, auth: str | None = None
-) -> LaunchPlan:
-    """Check a launch against a grant. ``env`` is the already-built child env (child_env), not os.environ.
-
-    ``auth`` is the caller's statement of how the route signs in. It is checked only for an
-    API-key-only engine (Gemini CLI), which needs exactly ``"api_key"``.
-    """
+def launch_plan(g: object, argv: Sequence[str], env: Mapping[str, str] | None = None) -> LaunchPlan:
+    """Check a launch against a grant. ``env`` is the already-built child env (child_env), not os.environ."""
     argv = tuple(argv) if argv is not None else ()
     env = dict(env or {})
-    size = _checked_launch(g, argv, env, auth)
-    return LaunchPlan(g, argv, tuple(sorted(env.items())), size, auth)
+    size = _checked_launch(g, argv, env)
+    return LaunchPlan(g, argv, tuple(sorted(env.items())), size)
 
 
-def check_auth(spec: EngineSpec, auth: object) -> None:
-    """Refuse a launch of an API-key-only engine that is not stated to be an API-key route."""
-    if spec.api_key_only and not (isinstance(auth, str) and auth == "api_key"):
-        stated = repr(auth)[:40] if auth is not None else "not stated"
-        raise LaunchRefused(
-            "sign_in_refused", spec.engine,
-            with_note(spec, f"auth {stated}; this engine launches only with auth='api_key' (no subscription sign-in)"),
-        )
-
-
-def _checked_launch(g: object, argv: Sequence[str], env: dict[str, str], auth: object = None) -> int:
+def _checked_launch(g: object, argv: Sequence[str], env: dict[str, str]) -> int:
     """Every launch check; returns the spawn size. Used by ``launch_plan`` and again on every plan use."""
     spec = authenticate(g)  # before any field of g is trusted
-    check_auth(spec, auth)
     argv = tuple(argv) if argv is not None else ()
     if not argv:
         raise LaunchRefused("argv_empty", spec.engine, "")

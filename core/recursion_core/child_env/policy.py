@@ -780,44 +780,62 @@ def _prefix_bits(text: str) -> tuple[str, int | None]:
     return "ok", bits
 
 
+def _aton(addr: str) -> bytes | None:
+    try:
+        return socket.inet_aton(addr)
+    except (OSError, ValueError):
+        return None
+
+
+def _ip_literal(addr: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    try:
+        return ipaddress.ip_address(addr)
+    except ValueError:
+        return None
+
+
 def _permissive_cidr(entry: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network | str | None:
     """A CIDR ``ipaddress`` rejected, read the way requests or curl would.
 
     ``10.0/+8`` and ``10.0.0.0/\\t8`` are ``/8`` (requests). ``10.0.0.0/8x`` is ``/8`` (curl).
-    Returns ``'bad'`` when the prefix cannot be read without raising.
+    Curl keeps only the leading prefix digits, so ``10.0.0.0/8/foo`` and ``10.0.0.0/8/24`` are
+    also ``/8``. A second slash on an IPv6 CIDR is not a curl match. A shorthand address
+    (``10.0/8``) is only the single-slash requests reading. Returns ``'bad'`` when the prefix
+    of an address cannot be read without raising.
     """
 
-    if entry.count("/") != 1:
+    if "/" not in entry:
         return None
     addr, bits_s = entry.split("/", 1)
     if not addr:
         return None
+    # curl 8.5 does not ignore a second slash on an IPv6 prefix.
+    slash_tail = "/" in bits_s
+    if slash_tail and ":" in addr:
+        return None
     kind, bits = _prefix_bits(bits_s)
+    literal = _ip_literal(addr)
+    shorthand = None if slash_tail else _aton(addr)
     if kind == "bad":
-        return "bad"
+        if literal is not None or shorthand is not None:
+            return "bad"
+        return None
     if kind != "ok" or bits is None:
         return None
-    if bits <= 32:
+    if shorthand is not None and bits <= 32:
         try:
-            packed = socket.inet_aton(addr)
-        except (OSError, ValueError):
-            packed = None
-        if packed is not None:
-            try:
-                return ipaddress.IPv4Network((ipaddress.IPv4Address(packed), bits), strict=False)
-            except ValueError:
-                return "bad"
-    try:
-        address = ipaddress.ip_address(addr)
-    except ValueError:
+            return ipaddress.IPv4Network((ipaddress.IPv4Address(shorthand), bits), strict=False)
+        except ValueError:
+            return "bad"
+    if literal is None:
         return None
-    limit = 32 if address.version == 4 else 128
+    limit = 32 if literal.version == 4 else 128
     if bits > limit:
         return None
     try:
-        if address.version == 4:
-            return ipaddress.IPv4Network((address, bits), strict=False)
-        return ipaddress.IPv6Network((address, bits), strict=False)
+        if literal.version == 4:
+            return ipaddress.IPv4Network((literal, bits), strict=False)
+        return ipaddress.IPv6Network((literal, bits), strict=False)
     except ValueError:
         return "bad"
 
@@ -886,12 +904,36 @@ def _no_proxy_entries(value: str) -> tuple[str, ...]:
     return tuple(seen)
 
 
+def _uts46_map(text: str) -> str:
+    """The UTS46 mappings Go's lookup profile applies before a name is compared.
+
+    Ideographic and fullwidth dots (U+3002, U+FF0E, U+FF61) become ``.``. A soft hyphen
+    (U+00AD) is removed. Fullwidth ASCII (U+FF01..U+FF5E) becomes ASCII. ``ß`` is not
+    mapped to ``ss``: that is the transitional profile, and Go 1.22 lookup is not transitional.
+    """
+
+    mapped: list[str] = []
+    for char in text:
+        if char in "\u3002\uff0e\uff61":
+            mapped.append(".")
+        elif char == "\u00ad":
+            continue
+        else:
+            code = ord(char)
+            if 0xFF01 <= code <= 0xFF5E:
+                mapped.append(chr(code - 0xFEE0))
+            else:
+                mapped.append(char)
+    return "".join(mapped)
+
+
 def _idna2008_name(body: str) -> str:
     """IDNA2008 / UTS46 nontransitional, per label, the way Go's proxy encodes a name.
 
     ``ß`` stays ``ß`` (``xn--fa-hia``), not ``ss``. ``ẞ`` lowercases to ``ß``, so it is the
     same name. Final sigma ``ς`` stays distinct from ``σ``. This is the Go 1.22
     ``ProxyFromEnvironment`` reading. IDNA2003 (``encode('idna')``) is kept as well.
+    The caller has already applied :func:`_uts46_map`.
     """
 
     labels = []
@@ -909,28 +951,33 @@ def _idna2008_name(body: str) -> str:
 def _idna_forms(label: str) -> set[str] | None:
     """ASCII, IDNA2003, and IDNA2008 spellings of one host or entry.
 
-    A single leading dot is suffix syntax and is not an empty label. None means a
-    non-ASCII label will not encode under IDNA2003. The caller refuses: while a proxy
-    is set, an entry that cannot be compared must not be kept.
+    A single leading dot is suffix syntax and is not an empty label. Dots are stripped
+    after UTS46 mapping and again after each encoding, so ``gateway.invalid。`` is
+    ``gateway.invalid``. None means a non-ASCII label will not encode under IDNA2003.
+    The caller refuses: while a proxy is set, an entry that cannot be compared must not be kept.
     """
 
-    raw = label.rstrip(".")
+    raw = _uts46_map(label).rstrip(".")
     suffix = raw.startswith(".")
     body = raw[1:] if suffix else raw
     if not body:
         return {raw} if raw else set()
     forms: set[str] = set()
     nonascii = any(ord(ch) > 127 for ch in body)
+
+    def _keep(text: str) -> str:
+        return text.rstrip(".")
+
     try:
-        forms.add(body.lower().encode("idna").decode("ascii"))
+        forms.add(_keep(body.lower().encode("idna").decode("ascii")))
     except UnicodeError:
         if nonascii:
             return None
     try:
-        forms.add(_idna2008_name(body))
+        forms.add(_keep(_idna2008_name(body)))
     except UnicodeError:
         pass
-    forms.add(body.lower())
+    forms.add(_keep(body.lower()))
     if suffix:
         forms |= {"." + form for form in list(forms)}
     return {form for form in forms if form}
@@ -1026,7 +1073,8 @@ def _no_proxy_bypass(value: str, hosts: tuple[str, ...]) -> str | None:
 
     ``hosts`` is the engine's own endpoints plus the route base host, when the route has one. A CIDR entry
     matches an IP host it contains, including a requests shorthand (``10.0/8``), a permissive prefix
-    (``+8``, a tab, ``8x``), an IPv4-mapped route host, and an IPv4-mapped CIDR compared as IPv4
+    (``+8``, a tab, ``8x``, and anything after those digits, so ``8/foo`` is 8), an IPv4-mapped route
+    host, and an IPv4-mapped CIDR compared as IPv4
     (Go: ``::ffff:10.0.0.0/104``). It does not match a domain name: none of those matchers resolve DNS.
     ``/0`` covers every IP of both families. A leading ``*.`` also matches the apex (Undici 7.30.1).
     IDNA2003 and IDNA2008 spellings are compared. A plain suffix matches without a dot boundary, which is
@@ -1072,7 +1120,10 @@ def _no_proxy_bypass(value: str, hosts: tuple[str, ...]) -> str | None:
             for host in checked:
                 host_forms = _idna_forms(host)
                 forms.extend(host_forms or ())
-            hit = any(_star_match(entry, host) for host in forms)
+            # The pattern is IDNA-normalised too. ``*.bücher.invalid`` is
+            # ``*.xn--bcher-kva.invalid`` before the star scan.
+            patterns = _idna_forms(entry) or ()
+            hit = any(_star_match(pattern, host) for pattern in patterns for host in forms)
             apex = entry[2:] if entry.startswith("*.") else ""
             if apex and "*" not in apex:
                 hit = hit or any(_exact_name(apex, host) for host in checked)

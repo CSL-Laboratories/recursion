@@ -915,6 +915,39 @@ class AuthRouteTests(unittest.TestCase):
         self.assertEqual(("NO_PROXY", "no_proxy_engine_host"),
                          refused({"NO_PROXY": ".münchen.example"}, munchen))
 
+        # Round 2. Curl ignores everything after the leading prefix digits, including another slash.
+        for entry in ("10.0.0.0/8/foo", "10.0.0.0/8/24", "10.0.0.0/8/", "10.0.0.0/8/8",
+                      "10.0.0.0/8/foo/bar", "10.0.0.0/+8/foo", "10.0.0.0/8x/foo", "10.0.0.0/08/foo"):
+            with self.subTest(entry=entry):
+                self.assertEqual(("NO_PROXY", "no_proxy_engine_host"), refused({"NO_PROXY": entry}, ip))
+        for entry in ("10.0.0.0/24/foo", "192.168.0.0/16/foo", "10.0/8/foo", "::ffff:10.0.0.0/104/foo"):
+            with self.subTest(entry=entry):
+                self.assertEqual(entry, launched({"NO_PROXY": entry}, ip)["NO_PROXY"])
+
+        # UTS46 before comparison. These six are the Go lookup forms of xn--fa-hia.
+        for entry in ("faß\u3002invalid", "faß\uff0einvalid", "faß\uff61invalid",
+                      "\uff46\uff41ß.invalid", "\uff26\uff21ß.INVALID", "fa\u00adß.invalid"):
+            with self.subTest(entry=entry):
+                self.assertEqual(("NO_PROXY", "no_proxy_engine_host"), refused({"NO_PROXY": entry}, sharp))
+        self.assertEqual("faß\u3002invalid", launched({"NO_PROXY": "faß\u3002invalid"}, gateway)["NO_PROXY"])
+
+        # A leading "*." is IDNA-normalised before the star match. The apex comparison stays.
+        bucher = ChildRoute(api_key=USER_KEY, base_url="https://sub.xn--bcher-kva.invalid/api")
+        bucher_apex = ChildRoute(api_key=USER_KEY, base_url="https://xn--bcher-kva.invalid/api")
+        for entry in ("*.bücher.invalid", "*.bücher.invalid:443"):
+            with self.subTest(entry=entry):
+                self.assertEqual(("NO_PROXY", "no_proxy_engine_host"), refused({"NO_PROXY": entry}, bucher))
+        self.assertEqual(("NO_PROXY", "no_proxy_engine_host"),
+                         refused({"NO_PROXY": "*.bücher.invalid"}, bucher_apex))
+        self.assertEqual("*.bücher.invalid", launched({"NO_PROXY": "*.bücher.invalid"}, gateway)["NO_PROXY"])
+
+        # Trailing ideographic and fullwidth dots are ASCII dots after UTS46, then stripped.
+        dotted = ChildRoute(api_key=USER_KEY, base_url="https://gateway.invalid./api")
+        for entry in ("gateway.invalid\u3002", "gateway.invalid\uff0e", "gateway.invalid\uff61"):
+            with self.subTest(entry=entry):
+                self.assertEqual(("NO_PROXY", "no_proxy_engine_host"), refused({"NO_PROXY": entry}, dotted))
+                self.assertEqual(("NO_PROXY", "no_proxy_engine_host"), refused({"NO_PROXY": entry}, gateway))
+
         # C8. Twelve stars must not backtrack. The host is not a match, and the call returns.
         def _too_slow(signum, frame):
             raise AssertionError("wildcard match exceeded 1s")

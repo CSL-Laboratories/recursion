@@ -42,7 +42,8 @@ replacement. It builds the child environment from nothing:
   union of that list's blocks (``0.0.0.0/0``, ``0.0.0.0/1,128.0.0.0/1``, or in IPv6 all of ``::ffff:0:0/96``,
   ``64:ff9b::/96`` or ``::/96``), count as ``*`` on any route (``no_proxy_wildcard``). An entry with a ``/``
   that is no CIDR block with a plain decimal prefix length, or with a ``%``, refuses on any route
-  (``no_proxy_unparseable``, the one refusal whose detail names the entry);
+  (``no_proxy_unparseable``, the one refusal whose detail names the entry; an entry with a ``%`` is never
+  shown, only its variable and position);
 * one change beyond N5h/N5i: links are resolved one component at a time and every
   link met on the way, including links inside a link's target, must be root's or
   ours in a directory chain no one else can write, and no step may enter ``/proc``,
@@ -90,8 +91,11 @@ class EnvRefused(Exception):
 
     ``name`` is the variable (never its value) and ``cause`` a stable reason code. ``detail`` is None except
     for ``no_proxy_unparseable``, where it names the offending entry and says why (owner call, 2026-11-10: a
-    NO_PROXY entry is a host pattern, not a secret). It is one line and follows the cause in ``str()``; userinfo
-    in the entry is masked as ``***@`` and an entry over 120 characters is shortened.
+    NO_PROXY entry is a host pattern, not a secret). It is one line and follows the cause in ``str()``.
+    An entry that contains ``%`` is never shown, in whole or in part: the detail gives only the variable and the
+    entry's position in it (``entry 2 of NO_PROXY``), since a percent escape can hide userinfo (``pw%40host``).
+    Any other entry is shown with its userinfo, everything through the last literal ``@``, masked as ``***@``.
+    An entry over 120 characters is cut to its first 120 characters and ``...``.
     """
 
     code = "env_refused"
@@ -343,7 +347,10 @@ def build_child_env(
     combined list's blocks and bare addresses, covering ``0.0.0.0/0`` or, in IPv6, all of ``::ffff:0:0/96``,
     ``64:ff9b::/96`` or ``::/96``. An entry with a ``/`` that is no CIDR block with a plain decimal prefix
     length (``0/0``, ``10.0.0.0/33``, ``10.0.0.0/255.0.0.0``, ``example.com/``), or with a ``%``, refuses with
-    ``no_proxy_unparseable`` on any route, and its ``EnvRefused.detail`` names the entry.
+    ``no_proxy_unparseable`` on any route, and its ``EnvRefused.detail`` names the entry (userinfo before a
+    literal ``@`` masked, at most 120 characters shown). An entry with a ``%`` is never shown: its detail gives
+    the variable and the entry's position, counted from 1 among that variable's own entries as
+    ``_no_proxy_entries`` splits them.
     """
 
     if os.name == "nt":
@@ -686,7 +693,9 @@ def _no_proxy_shown(entry: str) -> str:
 
     Everything after an optional ``scheme://`` through the last ``@`` becomes ``***@``, so no user name or
     password is shown (``http://user:pw@host/`` is ``'http://***@host/'``). A longer entry is cut to its first
-    120 characters and ``...``. ``repr`` keeps it on one line and escapes control characters.
+    120 characters and ``...``. ``repr`` keeps it on one line and escapes control characters. Only a literal
+    ``@`` is masked and nothing is decoded, so an entry with a ``%`` (``pw%40host``) is never passed here:
+    ``_no_proxy_bypass`` does not show it at all.
     """
 
     scheme = re.match(r"[A-Za-z][A-Za-z0-9+.-]*://", entry)
@@ -722,11 +731,18 @@ def _no_proxy_bypass(lists: list[tuple[str, str]], hosts: tuple[str, ...]) -> tu
     (``_all_address_blocks``), reported at the entry that completes the cover. An entry is unparseable, and
     refuses since a matcher may read it some other way, when it holds a ``%`` (a zone id, a percent escape) or
     holds a ``/`` and is no CIDR block ``_no_proxy_ip`` reads (``0/0``, ``10.0.0.0/33``, ``10.0.0.0/255.0.0.0``,
-    ``example.com/``). Its detail shows the entry as written, by ``repr``, on one line, with any userinfo masked
-    and a long entry shortened (``_no_proxy_shown``).
+    ``example.com/``). The detail of a ``/`` entry shows it as written, by ``repr``, on one line, with any
+    userinfo masked and a long entry cut at 120 characters (``_no_proxy_shown``). An entry with a ``%`` is never
+    shown, whatever else it holds (a ``/``, an ``@``): a percent escape can hide userinfo (``pw%40host``) and
+    nothing here decodes it, so its detail gives only the variable and the entry's position. The position
+    counts from 1 among that variable's own entries as ``_no_proxy_entries`` splits them: the value's outer
+    whitespace is stripped and any run of commas and whitespace is one separator, so a value that starts with
+    a comma has an empty first entry, which counts (``,a%b`` is entry 2), and no_proxy's count does not go on
+    from NO_PROXY's. The ``%`` check comes before the ``/`` check, so ``user:pw%40host/`` takes it too.
     """
 
-    written = [(name, entry) for name, value in lists for entry in _no_proxy_written(value)]
+    written = [(name, position, entry) for name, value in lists
+               for position, entry in enumerate(_no_proxy_written(value), 1)]
     entries = [entry for _, value in lists for entry in _no_proxy_entries(value)]
     # The cover only grows with each entry, so the entry that completes it is found by halving the list.
     completing, last = -1, len(entries) - 1
@@ -739,10 +755,11 @@ def _no_proxy_bypass(lists: list[tuple[str, str]], hosts: tuple[str, ...]) -> tu
             else:
                 completing = middle + 1
     for index, raw in enumerate(entries):
-        name, text = written[index]
+        name, position, text = written[index]
         if "%" in raw:
             return name, "no_proxy_unparseable", (
-                f"entry {_no_proxy_shown(text)} is unparseable: a '%' zone id isn't allowed in a NO_PROXY entry")
+                f"entry {position} of {name} is unparseable: a '%' (zone id or percent escape) isn't allowed in a "
+                "NO_PROXY entry; the entry is not shown")
         if "/" in raw and _no_proxy_ip(raw) is None:
             return name, "no_proxy_unparseable", (
                 f"entry {_no_proxy_shown(text)} is unparseable: a path or trailing slash isn't allowed in a NO_PROXY "

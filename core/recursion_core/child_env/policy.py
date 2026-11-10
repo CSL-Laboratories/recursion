@@ -53,6 +53,7 @@ new core's runtime calls it yet.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 import shutil
@@ -334,6 +335,7 @@ def build_child_env(
     if not isinstance(auth_mode, str) or auth_mode not in AUTH_MODES:
         raise EnvRefused(None, "auth_mode_unknown")
     route_env = _route_env(profile, auth_mode, route)  # refuses before anything is read from the parent
+    route_hosts = _route_proxy_hosts(route)
     if not _private_dir(home):
         raise EnvRefused("HOME", "home_unsafe")
     source = dict(os.environ if parent is None else parent)
@@ -364,7 +366,7 @@ def build_child_env(
     # A bypass only matters when a proxy is set: "*" skips it for every host, an engine-host entry for that engine.
     if any(env.get(name) for name in VALUE_URLS + VALUE_ALL_PROXY):
         for name in [name for name in NO_PROXY_NAMES if name in env]:
-            if (cause := _no_proxy_bypass(env[name], profile.hosts)) is not None:
+            if (cause := _no_proxy_bypass(env[name], profile.hosts + route_hosts)) is not None:
                 raise EnvRefused(name, cause)
     # N5h option A: a temp name is replaced by one private route temp root, never checked or passed.
     present = [name for name in TEMP_NAMES if name in env]
@@ -483,6 +485,12 @@ def _unsafe_base_url(value: object) -> str | None:
         return "base_url_malformed"
     if match["userinfo"] is not None:
         return "base_url_userinfo"
+    host = match["host"]
+    if host.startswith("["):
+        try:
+            ipaddress.IPv6Address(host[1:-1])
+        except ValueError:
+            return "base_url_malformed"
     if match["port"] is not None and not 0 < int(match["port"]) < 65536:
         return "base_url_malformed"
     if ".." in (match["path"] or "").split("/"):
@@ -536,6 +544,11 @@ def _resolve(path: str) -> tuple[str | None, bool, str | None]:
         if part in ("", "."):
             continue
         if part == "..":
+            # A later ".." pops this component out of the path the final chain check sees, and the child
+            # keeps the original string. The directory being left has to be one nobody else can write,
+            # or they can replace this component with a link after the check (review of ade5ba39).
+            if not _owned_chain(current):
+                return None, False, "value_chain_unsafe"
             current = os.path.dirname(current)
             continue
         candidate = os.path.join(current, part)
@@ -612,6 +625,31 @@ def _unsafe_path(value: str) -> str | None:
     return None
 
 
+def _route_proxy_hosts(route: ChildRoute | None) -> tuple[str, ...]:
+    """Host of a route base URL that passed ``_route_env``, so a NO_PROXY entry cannot exempt it.
+
+    The profile hosts are the engine's own endpoints. A route base is another endpoint the child will
+    contact, and the same rule applies to it. Brackets are stripped so ``[::1]`` matches a NO_PROXY
+    entry the checker has already stripped.
+    """
+
+    if type(route) is not ChildRoute or not isinstance(route.base_url, str):
+        return ()
+    if _unsafe_base_url(route.base_url) is not None:
+        return ()
+    host = _origin(route.base_url)[1]
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    return (host,)
+
+
+def _in_network(host: str, network: ipaddress.IPv4Network | ipaddress.IPv6Network) -> bool:
+    try:
+        return ipaddress.ip_address(host.strip("[]")) in network
+    except ValueError:  # a name: curl does not match it against a CIDR
+        return False
+
+
 def _no_proxy_bypass(value: str, hosts: tuple[str, ...]) -> str | None:
     """N5i: comma and whitespace split; the union of curl, requests, hyper-util, undici and Codex matchers."""
 
@@ -619,6 +657,15 @@ def _no_proxy_bypass(value: str, hosts: tuple[str, ...]) -> str | None:
         entry = re.sub(r"^[a-z][a-z0-9+.-]*://", "", entry).strip("[]")
         entry = re.sub(r":[0-9]*$", "", entry).rstrip(".")
         if not entry:
+            continue
+        if "/" in entry:
+            # curl matches a CIDR against a literal-IP URL host; a name is never matched by prefix.
+            try:
+                network = ipaddress.ip_network(entry, strict=False)
+            except ValueError:
+                continue
+            if any(_in_network(host, network) for host in hosts):
+                return "no_proxy_cidr"
             continue
         if entry.strip("*.") == "":
             return "no_proxy_wildcard"

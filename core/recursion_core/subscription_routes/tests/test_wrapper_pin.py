@@ -42,7 +42,7 @@ class WrapperPinTests(_Base):
         env = self.bare()
         env["ANTHROPIC_OAUTH_TOKEN"] = "fake-oauth-token-not-a-credential"
         with self.assertRaises(SubscriptionRouteRefused) as caught:
-            guard_cursor_then_spawn(mock.Mock(), ["cursor"], env, route_home=str(self.home), wrapper=self.wrapper,
+            guard_cursor_then_spawn(mock.Mock(), [self.wrapper.launcher_path], env, route_home=str(self.home), wrapper=self.wrapper,
                                     parent_env=self.parent(), operator_home=str(self.operator))
         self.assertEqual(caught.exception.cause, "claude_subscription_env")
 

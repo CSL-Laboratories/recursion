@@ -5,6 +5,10 @@ Fakes only: no engine, login store, provider, DNS or network is touched.
 
 from __future__ import annotations
 
+import os
+import signal
+import subprocess
+import tempfile
 import threading
 import time
 import unittest
@@ -102,6 +106,73 @@ class CopilotTests(unittest.TestCase):
         kept = check_copilot_own_loop(copilot(), BASE, has_copilot_login=lambda: True, probe_deadline=0.5)
         self.assertEqual(kept.method, "copilot_cli_sign_in")
 
+    @unittest.skipUnless(hasattr(os, "fork") and hasattr(os, "killpg"), "POSIX process-group kill")
+    def test_login_probe_deadline_kills_the_process_group(self) -> None:
+        # A thread join returns while the probe and anything it forked keep running.
+        # The deadline has to SIGKILL the probe's process group, including that child.
+        with tempfile.TemporaryDirectory() as tmp:
+            info_path = os.path.join(tmp, "info")
+
+            def hang() -> bool:
+                sleeper = os.fork()
+                if sleeper == 0:
+                    time.sleep(30)
+                    os._exit(0)
+                with open(info_path, "w", encoding="ascii") as handle:
+                    handle.write(f"{os.getpid()} {os.getpgrp()} {sleeper}\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                time.sleep(30)
+                return True
+
+            def stop_leftovers() -> None:
+                if not os.path.exists(info_path):
+                    return
+                with open(info_path, encoding="ascii") as handle:
+                    parts = handle.read().split()
+                if len(parts) != 3:
+                    return
+                for pid in (int(part) for part in (parts[0], parts[2])):
+                    if pid == os.getpid():
+                        continue
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        os.waitpid(pid, os.WNOHANG)
+                    except ChildProcessError:
+                        pass
+
+            self.addCleanup(stop_leftovers)
+            started = time.monotonic()
+            try:
+                with self.assertRaises(OwnLoopRouteRefused) as caught:
+                    check_copilot_own_loop(copilot(), BASE, has_copilot_login=hang, probe_deadline=0.4)
+            except TypeError:
+                self.fail("login probe has no deadline, so a hung probe is left running")
+            self.assertLess(time.monotonic() - started, 2)
+            self.assertEqual(caught.exception.cause, "copilot_login_unknown")
+            self.assertIn("deadline", caught.exception.detail)
+            self.assertTrue(os.path.exists(info_path), "probe did not record its process group")
+            with open(info_path, encoding="ascii") as handle:
+                probe_pid, pgrp, sleeper = (int(part) for part in handle.read().split())
+            self.assertNotEqual(probe_pid, os.getpid())
+            self.assertEqual(pgrp, probe_pid)
+            self.assertNotEqual(pgrp, os.getpgrp())
+            self.assertTrue(_process_not_running(probe_pid))
+            self.assertTrue(_process_not_running(sleeper))
+
+    def test_aws_access_key_id_and_gh_pat_do_not_reach_the_copilot_child(self) -> None:
+        # Suffix matching catches *_TOKEN and *_API_KEY, not these two names.
+        secret = "copilot-child-secret"
+        names = ("AWS_ACCESS_KEY_ID", "aws_access_key_id", "GH_PAT", "gh_pat")
+        env = {**BASE, **{name: secret for name in names}}
+        decision = check_copilot_own_loop(copilot(), env, has_copilot_login=lambda: True)
+        self.assertEqual(dict(decision.child_env), BASE)
+        self.assertNotIn(secret, repr(decision.child_env))
+        self.assertTrue(set(names) <= set(decision.removed_env))
+
     def test_route_may_not_pass_a_token(self) -> None:
         for name in ("token", "github_token", "COPILOT_GITHUB_TOKEN", "api_key", "bearer"):
             with self.subTest(name=name):
@@ -148,7 +219,8 @@ class NousTests(unittest.TestCase):
         # Names the *_API_KEY / *_TOKEN matcher misses, and git's config-injection channel.
         secret = "bearer-not-a-real-token"
         names = (
-            "GITHUB_PASSWORD", "github_pat", "AWS_SECRET_ACCESS_KEY", "OPENAI_API_BASE",
+            "GITHUB_PASSWORD", "github_pat", "GH_PAT", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+            "OPENAI_API_BASE",
             "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_VALUE",
             "GIT_CONFIG_PARAMETERS",
         )
@@ -263,11 +335,66 @@ class DoctorTests(unittest.TestCase):
                 else:
                     self.fail("credential URL was accepted")
 
+    def test_query_and_fragment_secrets_are_redacted_and_refused(self) -> None:
+        # Userinfo is stripped from the doctor line. A secret in the query or fragment was copied through.
+        secret = "query-fragment-secret"
+        urls = (
+            f"http://127.0.0.1:8645/v1?token={secret}",
+            f"http://127.0.0.1:8645/v1?x=1&access_token={secret}",
+            f"http://[::1]:8645/v1#{secret}",
+            f"http://127.0.0.1:8645/v1?ok=1#{secret}",
+            f"ftp://127.0.0.1/x?password={secret}",
+            f"http://user:pass@127.0.0.1:8645/v1?token={secret}",
+            f"http://10.1.2.3:8645/v1?token={secret}#more-{secret}",
+        )
+        for url in urls:
+            with self.subTest(url=url.split(secret)[0]):
+                report = nous_proxy_doctor(url)
+                self.assertFalse(report["ok"])
+                self.assertNotIn(secret, str(report))
+                self.assertNotIn("?", report["address"])
+                self.assertNotIn("#", report["address"])
+                try:
+                    check_nous_own_loop(nous(base_url=url), BASE)
+                except OwnLoopRouteRefused as exc:
+                    self.assertEqual(exc.cause, "recursion_holds_no_token")
+                    self.assertNotIn(secret, str(exc))
+                    self.assertNotIn(secret, exc.detail)
+                else:
+                    self.fail("query or fragment secret was accepted")
+
     def test_doctor_warns_when_host_users_unknown(self) -> None:
         for url in ("http://127.0.0.1:8645/v1", "http://10.1.2.3:8645"):
             got = nous_proxy_doctor(url)
             self.assertEqual(len(got["warnings"]), 1)
             self.assertTrue(got["warnings"][0].startswith("host users unknown"))
+
+
+def _process_not_running(pid: int) -> bool:
+    """True when ``pid`` is gone or a zombie. A sleeping sleeper is still running."""
+
+    for _ in range(40):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+        if _process_state(pid).startswith("Z"):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _process_state(pid: int) -> str:
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)],
+            check=False, capture_output=True, text=True, timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return out.stdout.strip().split(" ", 1)[0] if out.stdout.strip() else ""
 
 
 if __name__ == "__main__":

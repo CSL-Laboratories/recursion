@@ -24,7 +24,11 @@ from __future__ import annotations
 
 import ipaddress
 import math
+import os
+import select
+import signal
 import threading
+import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -58,13 +62,16 @@ _TOKEN_HINTS = ("token", "key", "secret", "bearer", "password", "credential", "a
 # Proxy settings would send a loopback-bound request to another host (proxy-aware clients honour them).
 _PROXY_ENV = frozenset({"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "FTP_PROXY", "SOCKS_PROXY", "SOCKS5_PROXY"})
 # Credential names the ``*_API_KEY`` / ``*_TOKEN`` suffix misses. ``OPENAI_API_BASE`` is the older
-# spelling of ``OPENAI_BASE_URL``. Git's ``GIT_CONFIG_KEY_*`` / ``GIT_CONFIG_VALUE_*`` channel can
-# carry an HTTP bearer (``http.extraheader``). Matched case-insensitively.
+# spelling of ``OPENAI_BASE_URL``. ``GH_PAT`` and ``AWS_ACCESS_KEY_ID`` do not end in those suffixes.
+# Git's ``GIT_CONFIG_KEY_*`` / ``GIT_CONFIG_VALUE_*`` channel can carry an HTTP bearer
+# (``http.extraheader``). Matched case-insensitively.
 _CREDENTIAL_ENV = frozenset({
     "OPENAI_BASE_URL",
     "OPENAI_API_BASE",
     "GITHUB_PASSWORD",
     "GITHUB_PAT",
+    "GH_PAT",
+    "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
     "GIT_CONFIG_COUNT",
     "GIT_CONFIG_PARAMETERS",
@@ -142,6 +149,7 @@ def check_copilot_own_loop(
 
     The login probe runs with a deadline (``probe_deadline``, at most ``LOGIN_PROBE_DEADLINE_S``).
     A probe that raises, including ``SystemExit``, or that does not return in time, is not a login.
+    On POSIX a missed deadline SIGKILLs the probe's process group, so the probe is not left running.
     """
 
     _common("copilot", route, _COPILOT_FIELDS, "copilot_cli_sign_in")
@@ -161,7 +169,11 @@ def check_copilot_own_loop(
 
 
 def _redact_proxy_address(base_url: object) -> str:
-    """``base_url`` with userinfo removed. Empty when it is not a string ``urlsplit`` can read."""
+    """``base_url`` with userinfo, query and fragment removed.
+
+    Empty when it is not a string ``urlsplit`` can read. A URL with none of those parts is returned
+    unchanged, so a loopback address the doctor accepts keeps the caller's spelling.
+    """
 
     if not isinstance(base_url, str):
         return ""
@@ -172,13 +184,16 @@ def _redact_proxy_address(base_url: object) -> str:
         parts = urlsplit(raw)
     except ValueError:
         return ""
-    if parts.username is None and parts.password is None:
+    has_userinfo = parts.username is not None or parts.password is not None
+    if not has_userinfo and not parts.query and not parts.fragment:
         return raw
     netloc = parts.netloc
-    at = netloc.rfind("@")
-    if at == -1:
-        return ""
-    return urlunsplit((parts.scheme, netloc[at + 1:], parts.path, parts.query, parts.fragment))
+    if has_userinfo:
+        at = netloc.rfind("@")
+        if at == -1:
+            return ""
+        netloc = netloc[at + 1:]
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
 
 
 def _loopback_url(base_url: object) -> str:
@@ -189,8 +204,9 @@ def _loopback_url(base_url: object) -> str:
         parts = urlsplit(raw)
     except ValueError:
         raise OwnLoopRouteRefused("nous", "proxy_address_malformed", "unparseable") from None
-    # Before the scheme check, so an ftp://user:secret@... URL is not copied into the refusal.
-    if parts.username is not None or parts.password is not None:
+    # Before the scheme check, so a secret in userinfo, the query or the fragment is not copied
+    # into the refusal. ``ftp://user:secret@...`` and ``http://127.0.0.1/?token=...#secret`` both stop here.
+    if parts.username is not None or parts.password is not None or parts.query or parts.fragment:
         raise OwnLoopRouteRefused("nous", "recursion_holds_no_token", "credentials in proxy URL")
     try:
         host = parts.hostname
@@ -242,9 +258,9 @@ def nous_proxy_doctor(
     """Doctor line for the Hermes proxy: report the address, refuse non-loopback, warn on shared hosts.
 
     Never raises; returns ``{"ok", "address", "cause", "warnings"}``. ``address`` never includes URL
-    userinfo, including when the scheme is not http(s). ``interactive_users`` is the caller's list of
-    interactive accounts on this host; nothing is probed here. Without it the doctor warns that the
-    host's users are unknown rather than reporting a clean host.
+    userinfo, query or fragment, including when the scheme is not http(s). ``interactive_users`` is the
+    caller's list of interactive accounts on this host; nothing is probed here. Without it the doctor
+    warns that the host's users are unknown rather than reporting a clean host.
     """
 
     warnings = _shared_host_warning(current_user, interactive_users)
@@ -296,16 +312,29 @@ def check_nous_own_loop(
                            _shared_host_warning(current_user, interactive_users), model)
 
 
+# One status line from the probe child: T, F, K, or E<exception type>.
+_PROBE_LINE_MAX = 128
+
+
 def _probe_login(probe: Callable[[], bool], deadline: float) -> bool:
     """Run ``probe`` until ``deadline``. ``SystemExit`` and a missed deadline are not a login.
 
-    A probe that is still running is not killed (a thread cannot be). It is a daemon, so it does
-    not keep the process alive, and its result is ignored.
+    On POSIX the probe runs in a new session. A missed deadline SIGKILLs that process group, so
+    the probe and children that stayed in the group do not keep running. Without ``fork`` and
+    ``killpg`` the probe is a daemon thread, which cannot be killed; its result is ignored.
     """
 
     if (isinstance(deadline, bool) or not isinstance(deadline, (int, float)) or not math.isfinite(deadline)
             or deadline <= 0 or deadline > LOGIN_PROBE_DEADLINE_S):
         raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe deadline")
+    if hasattr(os, "fork") and hasattr(os, "killpg") and hasattr(os, "setsid"):
+        return _probe_login_group(probe, deadline)
+    return _probe_login_thread(probe, deadline)
+
+
+def _probe_login_thread(probe: Callable[[], bool], deadline: float) -> bool:
+    """Thread fallback where a process group cannot be killed. A late probe is left running."""
+
     box: dict[str, object] = {}
 
     def run() -> None:
@@ -325,6 +354,182 @@ def _probe_login(probe: Callable[[], bool], deadline: float) -> bool:
     if exc is not None:
         raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", type(exc).__name__) from None
     return box.get("value") is True
+
+
+def _probe_login_group(probe: Callable[[], bool], deadline: float) -> bool:
+    """Run ``probe`` in its own session and SIGKILL that process group when ``deadline`` passes."""
+
+    read_fd, write_fd = os.pipe()
+    try:
+        os.set_inheritable(read_fd, False)
+        os.set_inheritable(write_fd, False)
+        os.set_blocking(read_fd, False)
+        pid = os.fork()
+    except OSError:
+        os.close(read_fd)
+        os.close(write_fd)
+        raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe failed") from None
+    if pid == 0:
+        _probe_child(probe, read_fd, write_fd)
+    os.close(write_fd)
+    try:
+        return _probe_parent(pid, read_fd, deadline)
+    finally:
+        os.close(read_fd)
+
+
+def _probe_child(probe: Callable[[], bool], read_fd: int, write_fd: int) -> None:
+    """Never returns. ``setsid`` makes this process the leader of a new group the parent can kill."""
+
+    try:
+        os.close(read_fd)
+        os.setsid()
+        _write_all(write_fd, _probe_status(probe))
+    except BaseException:
+        pass
+    os._exit(0)
+
+
+def _probe_status(probe: Callable[[], bool]) -> bytes:
+    try:
+        value = probe()
+    except KeyboardInterrupt:
+        return b"K\n"
+    except BaseException as exc:
+        name = type(exc).__name__
+        if name.isascii() and name.isidentifier():
+            return b"E" + name.encode("ascii") + b"\n"
+        return b"EException\n"
+    return b"T\n" if value is True else b"F\n"
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            return
+        view = view[written:]
+
+
+def _probe_parent(pid: int, read_fd: int, deadline: float) -> bool:
+    end = time.monotonic() + deadline
+    buf = bytearray()
+    timed_out = False
+    while True:
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            timed_out = True
+            break
+        try:
+            ready, _, _ = select.select([read_fd], [], [], remaining)
+        except InterruptedError:
+            continue
+        if not ready:
+            timed_out = True
+            break
+        try:
+            chunk = os.read(read_fd, 256)
+        except BlockingIOError:
+            continue
+        except InterruptedError:
+            continue
+        except OSError:
+            break
+        if not chunk:
+            break
+        buf.extend(chunk)
+        if b"\n" in buf or len(buf) > _PROBE_LINE_MAX:
+            break
+    line, complete = _split_probe_line(buf)
+    if timed_out or not complete:
+        # A result that arrives as the deadline passes is still late: kill, do not use it.
+        if timed_out or _probe_alive(pid):
+            _kill_probe_group(pid)
+        _reap_probe(pid, kill_group=True)
+        if timed_out:
+            raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe deadline")
+        raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe failed")
+    _reap_probe(pid, kill_group=False)
+    return _interpret_probe_line(line)
+
+
+def _split_probe_line(buf: bytearray) -> tuple[bytes, bool]:
+    raw = bytes(buf)
+    if b"\n" not in raw:
+        return raw, False
+    return raw.split(b"\n", 1)[0], True
+
+
+def _interpret_probe_line(line: bytes) -> bool:
+    if line == b"T":
+        return True
+    if line == b"F":
+        return False
+    if line == b"K":
+        raise KeyboardInterrupt
+    if line.startswith(b"E"):
+        name = line[1:].decode("ascii", "replace")
+        if name.isidentifier():
+            raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", name) from None
+    raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe failed") from None
+
+
+def _probe_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _kill_probe_group(pid: int) -> None:
+    """SIGKILL ``pid`` and, when it is not our group, the process group it leads.
+
+    The parent's group is never signalled. A probe that has joined this process's group is
+    killed by pid only, so a missed ``setsid`` cannot take the caller down with it.
+    """
+
+    if pid <= 0 or pid == os.getpid():
+        return
+    try:
+        pgid = os.getpgid(pid)
+    except ProcessLookupError:
+        pgid = 0
+    if pgid > 1 and pgid != os.getpgrp():
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def _reap_probe(pid: int, *, kill_group: bool) -> None:
+    end = time.monotonic() + 2.0
+    while True:
+        try:
+            got, _status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if got == pid:
+            return
+        if time.monotonic() >= end:
+            if kill_group:
+                _kill_probe_group(pid)
+            else:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                return
+            return
+        time.sleep(0.01)
 
 
 def _is_git_config_injection(upper: str) -> bool:

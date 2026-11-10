@@ -100,22 +100,25 @@ PRODUCT.md `055cc7a5` section 3.3. `own_loop.py`, checked before any spawn or re
   `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN` and `COPILOT_API_URL` (plus the `gh`
   selectors `GH_HOST`, `GH_CONFIG_DIR`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`) are
   removed from that run's child, as is every other provider credential (`*_API_KEY`, `*_TOKEN`,
-  `GITHUB_PAT`, `GITHUB_PASSWORD`, `AWS_SECRET_ACCESS_KEY`, `OPENAI_BASE_URL`, `OPENAI_API_BASE`,
-  for example `ANTHROPIC_API_KEY`) and git's config-injection channel (`GIT_CONFIG_COUNT`,
-  `GIT_CONFIG_KEY_*`, `GIT_CONFIG_VALUE_*`, `GIT_CONFIG_PARAMETERS`), which can carry an HTTP
-  bearer. An optional `model` is checked (printable, no spaces, at most 128 characters) and
-  carried on the decision. With no
+  `GITHUB_PAT`, `GH_PAT`, `GITHUB_PASSWORD`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+  `OPENAI_BASE_URL`, `OPENAI_API_BASE`, for example `ANTHROPIC_API_KEY`) and git's
+  config-injection channel (`GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_*`, `GIT_CONFIG_VALUE_*`,
+  `GIT_CONFIG_PARAMETERS`), which can carry an HTTP bearer. An optional `model` is checked
+  (printable, no spaces, at most 128 characters) and carried on the decision. With no
   stored `copilot` login, no probe, a probe that fails or raises `SystemExit`, or a probe that
   does not return within 5 seconds (`LOGIN_PROBE_DEADLINE_S`; a caller may pass a shorter
-  `probe_deadline`, not a longer one) the run refuses rather than fall back to `gh`. The probe is
-  the caller's; nothing here opens a login store.
+  `probe_deadline`, not a longer one) the run refuses rather than fall back to `gh`. On POSIX
+  that late probe is SIGKILLed with its process group, so it and children that stayed in the
+  group do not keep running. The probe is the caller's; nothing here opens a login store.
 - **Nous, "Local proxy"**: `check_nous_own_loop(route, parent_env, ...)` with
   `{"engine": "nous", "auth": "subscription", "method": "hermes_local_proxy", "base_url": ...}`.
   The own loop calls only the user's own Hermes subscription proxy at a loopback IP literal
   (`127.0.0.0/8`, `::1`, or IPv4-mapped loopback); names, including `localhost`, are not resolved
   and refuse. Adapters are `["nous"]` only; `xai` refuses (`adapter_must_stay_off`). Recursion holds
-  no Nous token: token-like route fields and URL credentials refuse, and the same provider
-  credentials as on the Copilot child (including `OPENAI_API_BASE`) are removed from the child.
+  no Nous token: token-like route fields and URL credentials refuse. A query string or fragment
+  on the proxy URL is treated as a credential, same as userinfo, and the same provider
+  credentials as on the Copilot child (including `GH_PAT`, `AWS_ACCESS_KEY_ID` and
+  `OPENAI_API_BASE`) are removed from the child.
   Proxy settings (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, any case) are removed too, so
   loopback-bound traffic cannot be carried off the host. An optional
   `model` is checked and carried; an adapter-prefixed id must name `nous` (`xai/grok-3` refuses
@@ -123,9 +126,9 @@ PRODUCT.md `055cc7a5` section 3.3. `own_loop.py`, checked before any spawn or re
 - `nous_proxy_doctor(base_url, current_user=..., interactive_users=[...])` reports the address,
   refuses one that is not loopback, and warns when other interactive users share the host (any
   local user can reach a loopback proxy, which "accepts any bearer"). The reported address and
-  the refusal text leave out URL userinfo, so `ftp://user:secret@...` and `http://user:secret@...`
-  do not echo that secret. With no
-  `interactive_users`, it and `check_nous_own_loop` warn "host users unknown" instead of
+  the refusal text leave out URL userinfo, query and fragment, so `ftp://user:secret@...`,
+  `http://user:secret@...` and `http://127.0.0.1/?token=secret#secret` do not echo that secret.
+  With no `interactive_users`, it and `check_nous_own_loop` warn "host users unknown" instead of
   reporting a clean host.
 - Still *[to verify]* in PRODUCT.md (O61): GitHub's Generative AI Services terms for Copilot, and
   whether the Nous Portal terms' consent clause covers an app calling through the proxy. No

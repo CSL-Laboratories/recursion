@@ -16,7 +16,7 @@ Spec: CSLR-D-012, PRODUCT.md `d84cdd26a4de2366f3c5d34c4aec5215f822a494` (SHA-256
 - Allowlist: the 29 names the Nov 5 tree carried plus `ALL_PROXY`, `all_proxy` and
   `XDG_RUNTIME_DIR` (32 names, both engines), and for Claude Code also
   `CLAUDE_CODE_CLIENT_CERT`, `CLAUDE_CODE_CLIENT_KEY`, `CLAUDE_CODE_CLIENT_KEY_PASSPHRASE` and
-  `CLAUDE_CODE_CERT_STORE` (PRODUCT.md 055cc7a5 section 3.8, C1-46). `ALL_PROXY` meets the proxy
+  `CLAUDE_CODE_CERT_STORE` (PRODUCT.md d84cdd26 section 11.5, C1-46). `ALL_PROXY` meets the proxy
   rule with SOCKS schemes allowed and counts as a set proxy for the `NO_PROXY` rule; the client
   cert and key meet the file rule when inherited; `XDG_RUNTIME_DIR` meets the directory rule;
   `CLAUDE_CODE_CERT_STORE` must be a comma list of `bundled` / `system`. The client

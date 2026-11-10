@@ -14,7 +14,7 @@ replacement. It builds the child environment from nothing:
   ``submissions/20261103-csl678-envpath-path-noproxy-01``, rule N5i): file, directory,
   proxy, ``TZ``, perspective-path, private temp root, ``PATH`` and per-engine
   ``NO_PROXY`` checks, refused before any spawn;
-* the names PRODUCT.md 055cc7a5 section 3.8 says the Nov 5 list dropped (C1-46, csl-research
+* the names PRODUCT.md d84cdd26 section 11.5 says the Nov 5 list dropped (C1-46, csl-research
   ``20261102-csl653-quota-credential-hardening-grounding-01`` section 5.8): ``ALL_PROXY`` /
   ``all_proxy`` and ``XDG_RUNTIME_DIR`` for both engines, and Claude Code's mTLS and cert-store
   names (``CLAUDE_CODE_CLIENT_CERT``, ``_CLIENT_KEY``, ``_CLIENT_KEY_PASSPHRASE``,
@@ -92,7 +92,7 @@ class EnvRefused(Exception):
 
 # The 29 names the Nov 5 tree's route allowlist carried (csl-research
 # 20261102-csl672-a4-child-env-values-grounding-01 section 5.1: PATH, HOME and 27 more), plus the three
-# engine-neutral names PRODUCT.md 055cc7a5 section 3.8 says it dropped (C1-46): ALL_PROXY, all_proxy and
+# engine-neutral names PRODUCT.md d84cdd26 section 11.5 says it dropped (C1-46): ALL_PROXY, all_proxy and
 # XDG_RUNTIME_DIR. 32 names.
 BASE_NAMES = (
     "PATH",

@@ -35,7 +35,7 @@ from recursion_core.launch_check.binary import file_kind, sha256_file
 from recursion_core.launch_check.refusals import LaunchRefused
 
 # A pin added, removed or changed is a new PIN_TABLE_VERSION; grants under another are grant_stale.
-PIN_TABLE_VERSION = "r2a-pins/1.0.0-candidate-2026-11-09"
+PIN_TABLE_VERSION = "r2a-pins/1.1.0-candidate-2026-11-09"
 
 KINDS = ("launcher+tree", "binary+launcher")
 _WHAT = {"launcher+tree": "installed package files", "binary+launcher": "binary"}
@@ -64,8 +64,23 @@ class Match:
     target_sha256: str
 
 
-# Measured pins only. Empty means every pinned route is refused (pin_mismatch).
-PINS: tuple[Pin, ...] = ()
+# Measured pins only. An engine with no pin here is refused (pin_mismatch).
+PINS: tuple[Pin, ...] = (
+    # Antigravity CLI 1.5.3, linux_amd64: the `antigravity` member of the release archive,
+    # which Google's installer copies to `agy`. The engine name resolves straight to the
+    # binary, so launcher and binary are one file. Version from manifest_linux_amd64.json.
+    Pin(
+        engine="antigravity",
+        version="1.5.3",
+        launcher_sha256="7ca212748ca0dfda718efbc39a776a104472e7e9344d4b6ea147c543684f96a3",
+        launcher_bytes=246837648,
+        target="",
+        target_sha256="7ca212748ca0dfda718efbc39a776a104472e7e9344d4b6ea147c543684f96a3",
+        platform="linux_amd64",
+        measured="2026-11-09",
+        source="https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.3-6604829099950080/linux-x64/cli_linux_x64.tar.gz",
+    ),
+)
 
 
 def tree_sha256(root: str) -> str:

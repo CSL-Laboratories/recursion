@@ -169,7 +169,7 @@ for Lucas.
 
 ## Pinned routes
 
-Pin table `r2a-pins/1.0.0-candidate-2026-11-09`. Lucas's owner call of 2026-11-09 (item 2),
+Pin table `r2a-pins/1.1.0-candidate-2026-11-09`. Lucas's owner call of 2026-11-09 (item 2),
 with the same rules as the route layer on #321 (`wrapper_pin.py` at `38f41d3b`). Pi, Hermes and Cursor are wrapper installs (JS
 bundles under node, a Python entry point; 11.6, #1087 section 6.2) and Antigravity CLI is
 one Go binary. These four are granted only when the install on disk matches a pin in
@@ -201,10 +201,12 @@ Recorded pins (measured from real installs only; no hash here is invented):
 
 | Engine | Version | Platform | Launcher SHA-256 (bytes) | Target | Target SHA-256 | Measured | Source |
 |---|---|---|---|---|---|---|---|
-| none recorded | | | | | | | |
+| antigravity | 1.5.3 | linux_amd64 | `7ca212748ca0dfda718efbc39a776a104472e7e9344d4b6ea147c543684f96a3` (246837648) | empty (`agy` is the binary) | `7ca212748ca0dfda718efbc39a776a104472e7e9344d4b6ea147c543684f96a3` | 2026-11-09 | the `antigravity` member of [`cli_linux_x64.tar.gz`](https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.3-6604829099950080/linux-x64/cli_linux_x64.tar.gz), which Google's installer copies to `agy`; version from the installer's `manifest_linux_amd64.json`, whose SHA-512 the archive matched |
 
-With no pin recorded, Pi, Hermes, Cursor and Antigravity are all refused `pin_mismatch`
-on a real install.
+Pi, Hermes and Cursor were not installed on the box where this was measured, so they have
+no pin and are refused `pin_mismatch` on a real install until someone pins them. Antigravity
+CLI on another platform, or any build but 1.5.3, is refused the same way. `install.sh` is
+the bootstrapper, not the launcher, and is not pinned.
 
 To re-pin: measure the install with `pins.measure(engine, kind, path, target, version=...,
 platform=..., measured=..., source=...)` (it hashes; it runs nothing), add the `Pin` to

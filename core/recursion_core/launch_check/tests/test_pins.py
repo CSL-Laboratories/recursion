@@ -208,6 +208,30 @@ class PinTableTests(unittest.TestCase):
         keys = [(p.engine, p.launcher_sha256, p.target, p.target_sha256) for p in PINS]
         self.assertEqual(len(keys), len(set(keys)))
 
+    def test_committed_antigravity_1_5_3_pin_has_the_measured_values(self) -> None:
+        # Verified fixture, measured 2026-11-09 on linux_amd64 with sha256sum; the 246 MB binary is not committed.
+        self.assertEqual("r2a-pins/1.1.0-candidate-2026-11-09", PIN_TABLE_VERSION)
+        self.assertEqual(
+            (
+                Pin(
+                    engine="antigravity",
+                    version="1.5.3",
+                    launcher_sha256="7ca212748ca0dfda718efbc39a776a104472e7e9344d4b6ea147c543684f96a3",
+                    launcher_bytes=246837648,
+                    target="",
+                    target_sha256="7ca212748ca0dfda718efbc39a776a104472e7e9344d4b6ea147c543684f96a3",
+                    platform="linux_amd64",
+                    measured="2026-11-09",
+                    source="https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.3-6604829099950080/linux-x64/cli_linux_x64.tar.gz",
+                ),
+            ),
+            PINS,
+        )
+        self.assertTrue(pins_mod.listed("antigravity", "1.5.3", "7ca212748ca0dfda718efbc39a776a104472e7e9344d4b6ea147c543684f96a3", "7ca212748ca0dfda718efbc39a776a104472e7e9344d4b6ea147c543684f96a3"))
+        self.assertFalse(pins_mod.listed("antigravity", "1.5.4", "7ca212748ca0dfda718efbc39a776a104472e7e9344d4b6ea147c543684f96a3", "7ca212748ca0dfda718efbc39a776a104472e7e9344d4b6ea147c543684f96a3"))
+        # Pi, Hermes and Cursor were not installed where this was measured: no pin, so they refuse.
+        self.assertEqual({"antigravity"}, {p.engine for p in PINS})
+
     def test_target_must_be_a_plain_relative_path(self) -> None:
         self.assertEqual("/a/b/agy", pins_mod.resolve_target("/a/b/agy", ""))
         self.assertEqual(os.path.realpath("/a/b"), pins_mod.resolve_target("/a/b/agy", "."))

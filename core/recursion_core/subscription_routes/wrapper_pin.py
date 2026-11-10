@@ -322,8 +322,8 @@ def _link_digest(kind: bytes, body: bytes) -> str:
 def _within(real: str, root: str) -> bool:
     """True when ``real`` is ``root`` or inside it."""
 
-    base = root.rstrip("/")
-    return real == base or real.startswith(base + "/")
+    base = root.rstrip(os.sep)
+    return real == base or real.startswith(base + os.sep)
 
 
 def _relative_name(prefix: str, name: str) -> str:

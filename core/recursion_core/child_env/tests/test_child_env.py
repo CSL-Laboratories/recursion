@@ -192,12 +192,10 @@ class ProfileTests(unittest.TestCase):
             os.chmod(home, 0o700)
             with self.assertRaises(EnvRefused) as caught:
                 build_child_env("codex", home=home, auth_mode=SUB, parent={"PATH": "/usr/bin"})
-            # Windows (os.name == "nt") refuses before any helper, even with geteuid missing.
-            # A POSIX process still reaches the home helper, which refuses without an owner.
-            if os.name == "nt":
-                self.assertEqual((None, "platform_unsupported"), (caught.exception.name, caught.exception.cause))
-            else:
-                self.assertEqual(("HOME", "home_unsafe"), (caught.exception.name, caught.exception.cause))
+            # Missing geteuid is platform_unsupported on Windows and on a POSIX
+            # process where the call has been removed. It is not an AttributeError
+            # and it is not a pass.
+            self.assertEqual((None, "platform_unsupported"), (caught.exception.name, caught.exception.cause))
             with mock.patch("recursion_core.child_env.policy.os.name", "nt"), self.assertRaises(EnvRefused) as caught:
                 build_child_env("codex", home=home, auth_mode=SUB, parent={"PATH": "/usr/bin"})
             self.assertEqual((None, "platform_unsupported"), (caught.exception.name, caught.exception.cause))
@@ -225,7 +223,7 @@ class ProfileTests(unittest.TestCase):
             if had and saved is not None:
                 setattr(os, "geteuid", saved)
 
-@unittest.skipUnless(hasattr(os, "geteuid"), "POSIX owner and mode checks need os.geteuid")
+@unittest.skipIf(os.name == "nt" or not hasattr(os, "geteuid"), "POSIX rules")
 class ProfilePosixTests(unittest.TestCase):
     """Owner, mode and home fixtures. Production Windows never reaches these: it refuses with platform_unsupported."""
 
@@ -1200,8 +1198,8 @@ class AuthRouteTests(unittest.TestCase):
 
     def test_child_env_reads_no_keyring_and_no_key_file(self) -> None:
         # Key custody: the caller fetches the key (OS keyring, or the owner-only file); this package is handed it.
-        allowed = {"__future__", "ipaddress", "os", "re", "shutil", "socket", "stat", "subprocess", "tempfile", "threading",
-                   "unicodedata", "collections.abc",
+        allowed = {"__future__", "fcntl", "ipaddress", "os", "re", "shutil", "socket", "stat", "subprocess", "tempfile",
+                   "threading", "unicodedata", "collections.abc",
                    "dataclasses", "pathlib", "types", "recursion_core.child_env.policy", "recursion_core.child_env.launch"}
         for module in (policy, launch):
             tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
@@ -1633,7 +1631,9 @@ class LaunchTests(unittest.TestCase):
         self.assertFalse(env["TMPDIR"].startswith(unsafe + os.sep))
         self.assertEqual([], os.listdir(unsafe))  # the rejected attempt was removed
         st = os.lstat(env["TMPDIR"])
-        self.assertEqual((os.geteuid(), 0), (st.st_uid, st.st_mode & 0o077))
+        geteuid = getattr(os, "geteuid", None)
+        self.assertIsNotNone(geteuid)
+        self.assertEqual((geteuid(), 0), (st.st_uid, st.st_mode & 0o077))
 
     def test_route_temp_root_refuses_when_no_safe_base_exists(self) -> None:
         self._fresh_tmp()
@@ -1649,7 +1649,9 @@ class LaunchTests(unittest.TestCase):
         env = self._env(TMPDIR="/tmp")
         st = os.lstat(env["TMPDIR"])
         self.assertTrue(stat.S_ISDIR(st.st_mode))
-        self.assertEqual((os.geteuid(), 0), (st.st_uid, st.st_mode & 0o077))
+        geteuid = getattr(os, "geteuid", None)
+        self.assertIsNotNone(geteuid)
+        self.assertEqual((geteuid(), 0), (st.st_uid, st.st_mode & 0o077))
 
 
 if __name__ == "__main__":

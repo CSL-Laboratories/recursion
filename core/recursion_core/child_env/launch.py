@@ -19,7 +19,7 @@ import shutil
 import subprocess
 from collections.abc import Callable, Sequence
 
-from recursion_core.child_env.policy import EnvRefused, ValidatedEnv, _unsafe_file
+from recursion_core.child_env.policy import EnvRefused, ValidatedEnv, _posix_supported, _unsafe_file
 
 __all__ = ["spawn"]
 
@@ -38,6 +38,8 @@ def spawn(
 ) -> subprocess.Popen:
     """Start one engine child with exactly ``env``. Raises ``TypeError`` or ``EnvRefused`` before any spawn."""
 
+    if not _posix_supported():
+        raise EnvRefused(None, "platform_unsupported")
     if type(env) is not ValidatedEnv:
         raise TypeError("spawn needs the ValidatedEnv build_child_env returned, not a plain mapping")
     if isinstance(argv, (str, bytes)) or not argv or not all(isinstance(item, str) for item in argv):

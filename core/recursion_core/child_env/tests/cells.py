@@ -62,8 +62,8 @@ def owned_tmpdir(prefix: str) -> str:
     raise ``AttributeError``.
     """
 
-    if not hasattr(os, "geteuid"):
-        raise unittest.SkipTest("POSIX owner and mode checks need os.geteuid")
+    if os.name == "nt" or not hasattr(os, "geteuid") or not hasattr(os, "getuid"):
+        raise unittest.SkipTest("POSIX rules")
     for base in (tempfile.gettempdir(), "/tmp"):
         try:
             path = tempfile.mkdtemp(prefix=prefix, dir=os.path.realpath(base))

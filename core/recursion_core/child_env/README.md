@@ -58,12 +58,13 @@ Spec: CSLR-D-012, PRODUCT.md `d84cdd26a4de2366f3c5d34c4aec5215f822a494` (SHA-256
 - The old route transport (`scripts/v3/route_contract/transport.py`) is frozen and
   unchanged; it still passes `os.environ.copy()`.
 
-POSIX only. On Windows every call refuses with `platform_unsupported` instead of
-passing values the ownership rules cannot judge. A Windows SID/DACL backend is
-future work. Until then the directory-owner, symlink-owner and mode `0o077` checks
-run only where `os.geteuid` exists. Where it does not, they refuse
-(`owner_check_unsupported`, or the owned-chain and private-dir checks return
-false). They never return true and never invent a uid.
+POSIX only. On Windows, and wherever `os.geteuid`, `os.getuid` or the `fcntl`
+module is missing, every call refuses with `platform_unsupported` instead of
+passing values the ownership rules cannot judge or raising `AttributeError`.
+A Windows SID/DACL backend is future work. Until then the directory-owner,
+symlink-owner and mode `0o077` checks run only where `os.geteuid` exists. Where
+it does not, they refuse (`owner_check_unsupported`, or the owned-chain and
+private-dir checks return false). They never return true and never invent a uid.
 
 ## Auth mode and the route
 

@@ -44,7 +44,8 @@ replacement. It builds the child environment from nothing:
 The engine is an explicit profile id, never inferred from argv (ledger CX-082: a
 first-token guess let wrapped or renamed argv through). An unknown engine refuses.
 
-POSIX only. On Windows (``os.name == "nt"``) every call refuses
+POSIX only. On Windows (``os.name == "nt"``), and wherever ``os.geteuid``,
+``os.getuid`` or the ``fcntl`` module is missing, every call refuses
 (``platform_unsupported``) instead of passing values unchecked. The ownership,
 symlink-owner and ``0o077`` mode checks run only where ``os.geteuid`` exists.
 Where it does not, those helpers refuse (``owner_check_unsupported``, or a false
@@ -332,10 +333,10 @@ def build_child_env(
     """
 
     # Windows has no euid and no Unix mode bits these rules read, so the call
-    # refuses instead of passing values unchecked. A SID/DACL backend is future
-    # work. Helpers that would call os.geteuid refuse on their own if it is missing;
-    # they do not run on this path.
-    if os.name == "nt":
+    # refuses instead of passing values unchecked. The same refusal covers a
+    # process where geteuid, getuid or fcntl is missing: those calls must not
+    # raise AttributeError or ImportError. A SID/DACL backend is future work.
+    if not _posix_supported():
         raise EnvRefused(None, "platform_unsupported")
     profile = ENGINE_PROFILES.get(engine) if isinstance(engine, str) else None
     if profile is None:
@@ -587,6 +588,26 @@ def _unsafe_value(name: str, value: str) -> str | None:
         entries = [entry for entry in value.split(os.pathsep) if entry]
         return next((cause for cause in map(_unsafe_dir, entries) if cause), None)
     return None
+
+
+def _posix_supported() -> bool:
+    """False where the POSIX identity and file-descriptor APIs this module uses are absent.
+
+    Windows (``os.name == "nt"``) has none of them. A build that is not Windows but is
+    missing ``os.geteuid``, ``os.getuid`` or the ``fcntl`` module is the same refusal:
+    the call must not raise ``AttributeError`` or ``ImportError``. ``fcntl`` is imported
+    here, not at module import, so importing this module on Windows still succeeds.
+    """
+
+    if os.name == "nt":
+        return False
+    if not hasattr(os, "geteuid") or not hasattr(os, "getuid"):
+        return False
+    try:
+        import fcntl  # noqa: F401  POSIX file-descriptor locks; the module is absent on Windows
+    except ImportError:
+        return False
+    return True
 
 
 def _posix_euid() -> int | None:

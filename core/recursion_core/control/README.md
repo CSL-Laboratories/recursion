@@ -60,6 +60,16 @@ recorded on F60, CSL-762).
   in-memory registry for tests. `find_start` is an indexed lookup. If more than one record carries the
   same `(tenant, client_key)`, the first one stored is the one returned; changing that record's key
   leaves the next one indexed.
+  Every stored record has a `generation`. `put` of an existing run is a compare-and-swap: it stores only
+  when `generation` is the one `get` returned, then increments it. A stale writer raises and does not
+  overwrite a stop. `stopped` is stored only with an attestation (`proof: empty`, the cgroup, the member
+  ids, and that generation) and only when none of those members is still alive; the member rows are then
+  dropped. A later `join_member` on a stopped run is refused. `reap_orphans` drops members whose process
+  is gone and index ids that name no run, and does not by itself record `stopped`.
+  Locks live on the registry (`OwnerLockTable`). Each in-flight call holds them under a token it minted,
+  not under a thread id. One `acquire` sorts its keys, and a start key sorts before a run key, so a start
+  and a stop cannot deadlock by taking those locks in opposite orders. A key is deleted once nobody holds
+  it.
   The durable registry (B8, B9) and the real cgroup/pidfd cleanup (B6) are other build items.
 - `cli.py`: `recursion-control list | status RUN | stop RUN | start --tenant --engine --prompt`. It
   makes one API call, prints the API's answer verbatim as JSON and exits 0 (ok, started, stopped),

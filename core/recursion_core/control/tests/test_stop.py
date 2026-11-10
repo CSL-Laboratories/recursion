@@ -547,7 +547,10 @@ class RegistryIndexTest(unittest.TestCase):
         self.assertEqual(reg.find_start("t", "k0")["run_id"], "r0")
         self.assertEqual(reg.find_start("t", "k2000")["run_id"], "r2000")
         self.assertIsNone(reg.find_start("other", "k1"))
-        reg.put({"run_id": "r1", "tenant": "t", "start_key": None})
+        seen = reg.get("r1")
+        assert seen is not None
+        seen["start_key"] = None
+        reg.put(seen)  # an update has to name the generation it read
         self.assertIsNone(reg.find_start("t", "k1"))
         reg.put({"run_id": "dup", "tenant": "t", "start_key": {"client_key": "k2"}})
         self.assertEqual(reg.find_start("t", "k2")["run_id"], "r2")  # the first run started with a key wins
@@ -557,11 +560,20 @@ class RegistryIndexTest(unittest.TestCase):
         reg = InMemoryRunRegistry()
         reg.put({"run_id": "first", "tenant": "t", "start_key": {"client_key": "k"}})
         reg.put({"run_id": "second", "tenant": "t", "start_key": {"client_key": "k"}})
-        reg.put({"run_id": "first", "tenant": "t", "start_key": {"client_key": "k"}, "state": "running"})
+        seen = reg.get("first")
+        assert seen is not None
+        seen["state"] = "running"
+        reg.put(seen)  # keeping the key stays first; the generation is the one just read
         self.assertEqual(reg.find_start("t", "k")["run_id"], "first")  # an update that keeps the key stays first
-        reg.put({"run_id": "first", "tenant": "t", "start_key": None})
+        seen = reg.get("first")
+        assert seen is not None
+        seen["start_key"] = None
+        reg.put(seen)
         self.assertEqual(reg.find_start("t", "k")["run_id"], "second")
-        reg.put({"run_id": "second", "tenant": "t", "start_key": {"client_key": "other"}})
+        seen = reg.get("second")
+        assert seen is not None
+        seen["start_key"] = {"client_key": "other"}
+        reg.put(seen)
         self.assertIsNone(reg.find_start("t", "k"))
         self.assertEqual(reg.find_start("t", "other")["run_id"], "second")
 

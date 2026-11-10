@@ -51,6 +51,8 @@ retried start with the original run (11.3, B-17).
 
 Stop decisions and launch records are serialised per run, so a slow or hung cleanup on one run never
 queues another run's Stop (11.3, D2-55 / B-19), and a launch never overwrites a Stop that landed during it.
+The registry write is a compare-and-swap on the record's generation, so a stop is also not overwritten by
+a writer that does not hold that lock. ``stopped`` carries an attestation that the member set was empty.
 Starts are serialised only per ``(tenant, client_key)``: a slow or hung starter delays only a retry of the
 same start, never another start. The lock is dropped once that start, and any same-key start waiting on
 it, have returned, so distinct keys do not keep locks for the life of the process (bot review 4517611266).
@@ -61,9 +63,12 @@ from __future__ import annotations
 import hashlib
 import threading
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 
-from recursion_core.control.registry import EMPTY, POPULATED, TIMEOUT, KillTree, RunRegistry
+from recursion_core.control.registry import (
+    EMPTY, POPULATED, TIMEOUT, KillTree, OwnerLockTable, RunRegistry, StaleGeneration,
+)
 
 STARTED, OK, STOPPED, PENDING = "started", "ok", "stopped", "pending"
 RUN_UNKNOWN, REQUEST_INVALID, START_FAILED, METHOD_UNKNOWN = (
@@ -94,11 +99,15 @@ class ControlAPI:
         self._new_run_id = new_run_id
         self._confirm_timeout_s = confirm_timeout_s
         self._locks_lock = threading.Lock()
-        # One stop or launch-record decision per run, so a kill is never sent twice and a Stop that lands
-        # during a launch is never overwritten by it.
-        self._run_locks: dict[str, threading.Lock] = {}
+        # Exclusion is the registry's owner lock table when it has one, so two ControlAPIs over the same
+        # registry take the same locks. The owner is a token minted for the in-flight call, not a thread
+        # id (thread ids are reused). Start keys sort before run keys, and each acquire sorts its keys,
+        # so a start that also takes the run lock cannot deadlock with a stop that takes only the run lock.
+        self._locks: OwnerLockTable = getattr(registry, "locks", None) or OwnerLockTable()
+        self._local = threading.local()
         # A retried start with the same (tenant, client_key) launches once; other starts never wait on it.
-        # Value is [lock, in_flight]. The entry is removed when the count hits zero (bot review 4517611266).
+        # Value is [owner token, in_flight]. The entry is removed when the count hits zero (bot review
+        # 4517611266). The token is not the lock; exclusion is ``self._locks``.
         self._start_locks: dict[tuple[str, str], list] = {}
         # In-memory only (a restart loses them; reconciling then is the CSL-738 startup sweep):
         self._launched: dict[str, dict] = {}  # run_id -> record (with cgroup) of a launch whose write failed
@@ -150,24 +159,29 @@ class ControlAPI:
         except UnicodeEncodeError:
             return {"code": REQUEST_INVALID, "detail": "prompt"}
         key = params.get("client_key")
-        if not isinstance(key, str):
-            return self._start(params)  # no key: a fresh run id, nothing to dedupe
-        slot_key = (params["tenant"], key)
-        with self._locks_lock:
-            slot = self._start_locks.get(slot_key)
-            if slot is None:
-                slot = [threading.Lock(), 0]
-                self._start_locks[slot_key] = slot
-            slot[1] += 1
-            lock = slot[0]
+        self._enter_owner()
         try:
-            with lock:
-                return self._start(params)
-        finally:
+            if not isinstance(key, str):
+                return self._start(params)  # no key: a fresh run id, nothing to dedupe
+            slot_key = (params["tenant"], key)
             with self._locks_lock:
-                slot[1] -= 1
-                if slot[1] == 0 and self._start_locks.get(slot_key) is slot:
-                    del self._start_locks[slot_key]
+                slot = self._start_locks.get(slot_key)
+                if slot is None:
+                    slot = [self._local.owner, 0]
+                    self._start_locks[slot_key] = slot
+                slot[1] += 1
+            lock_key = _start_lock_key(slot_key)
+            self._locks.acquire(self._local.owner, [lock_key])
+            try:
+                return self._start(params)
+            finally:
+                self._locks.release(self._local.owner, [lock_key])
+                with self._locks_lock:
+                    slot[1] -= 1
+                    if slot[1] == 0 and self._start_locks.get(slot_key) is slot:
+                        del self._start_locks[slot_key]
+        finally:
+            self._exit_owner()
 
     def _start(self, params: Mapping) -> dict:
         key = params.get("client_key")
@@ -186,6 +200,13 @@ class ControlAPI:
                 answer = self._retry(self._current(prior))
                 if answer is not None:
                     return answer
+                # The run already has a generation. A relaunch has to CAS that generation; a blind put
+                # would be a stale write and is refused.
+                current = self._current(prior)
+                if current is not None and "generation" in current:
+                    current.update(state="starting", cgroup=None, engine=params["engine"], start_key=start_key,
+                                   started_at=self._clock())
+                    rec = current
             self._reg("put", rec)  # launch intent: nothing runs that the registry cannot list, stop or dedupe
             self._failed.discard(run_id)
         try:
@@ -219,9 +240,8 @@ class ControlAPI:
                 stop = self._stop(current)
                 code = START_UNCONFIRMED if stop.get("recorded") is False else STARTED
                 return {"code": code, "run": current, "duplicate": False, "stop": stop}
-            if not self._try_put(current):
+            if not self._put_running(current, cgroup):
                 return {"code": START_UNCONFIRMED, "run_id": run_id, "detail": "registry_unavailable"}
-            self._launched.pop(run_id, None)
             return {"code": STARTED, "run": current, "duplicate": False}
 
     def _retry(self, prior: dict) -> dict | None:
@@ -246,9 +266,8 @@ class ControlAPI:
             stop = self._stop(prior)  # a kept "stopped" is written back; anything else is continued
             code = START_UNCONFIRMED if stop.get("recorded") is False else STARTED
             return {"code": code, "run": prior, "duplicate": True, "stop": stop}
-        if not self._try_put(prior):
+        if not self._put_running(prior, prior.get("cgroup")):
             return {"code": START_UNCONFIRMED, "run": prior, "duplicate": True, "detail": "registry_unavailable"}
-        self._launched.pop(run_id, None)
         return {"code": STARTED, "run": prior, "duplicate": True}
 
     def _current(self, rec: dict) -> dict:
@@ -260,25 +279,133 @@ class ControlAPI:
         return current if current is not None else dict(rec)
 
     def _try_put(self, rec: dict) -> bool:
+        """Write ``rec`` if its generation is still current. A stale generation is not a successful write."""
         try:
-            self._reg("put", rec)
+            return self._commit(rec) == "ok"
         except _RegistryError:
             return False
+
+    def _commit(self, rec: dict) -> str:
+        """``ok``, ``stale``, or raise ``_RegistryError``. A stale write leaves the registry untouched."""
+        try:
+            self._registry.put(rec)
+        except StaleGeneration:
+            return "stale"
+        except Exception as err:
+            raise _RegistryError(f"put:{type(err).__name__}") from err
+        self._refresh(rec)
+        return "ok"
+
+    def _refresh(self, rec: dict) -> None:
+        try:
+            fresh = self._registry.get(rec["run_id"])
+        except Exception:
+            return
+        if fresh is None:
+            return
+        rec["generation"] = fresh["generation"]
+        rec["members"] = list(fresh.get("members") or [])
+        rec["stop_attestation"] = fresh.get("stop_attestation")
+
+    def _reread(self, rec: dict) -> dict | None:
+        try:
+            return self._reg("get", rec["run_id"])
+        except _RegistryError:
+            return None
+
+    def _put_running(self, rec: dict, cgroup: str | None) -> bool:
+        """CAS ``rec`` as running. A stale generation is retried once from a fresh read.
+
+        If that read already carries a Stop, this does not write ``running`` over it: it continues the
+        Stop and reports success only when that continuation was recorded. Returns False when the
+        registry did not accept a running record and no Stop was carried out.
+        """
+        try:
+            outcome = self._commit(rec)
+        except _RegistryError:
+            return False
+        if outcome == "ok":
+            self._launched.pop(rec["run_id"], None)
+            return True
+        if outcome != "stale":
+            return False
+        fresh = self._reread(rec)
+        if fresh is None:
+            return False
+        if fresh.get("state") == "stopped" or fresh.get("stop") is not None or rec["run_id"] in self._stop_wanted:
+            fresh["cgroup"] = fresh.get("cgroup") or cgroup
+            self._launched[rec["run_id"]] = dict(fresh)
+            if fresh.get("state") != "stopped":
+                self._stop(fresh)
+            rec.clear()
+            rec.update(fresh)
+            return fresh.get("state") == "stopped" or self._launched.get(rec["run_id"]) is None
+        fresh.update(state="running", cgroup=cgroup or fresh.get("cgroup"))
+        self._launched[rec["run_id"]] = dict(fresh)
+        try:
+            outcome = self._commit(fresh)
+        except _RegistryError:
+            outcome = "down"
+        rec.clear()
+        rec.update(fresh)
+        if outcome != "ok":
+            return False
+        self._launched.pop(rec["run_id"], None)
         return True
 
-    def _run_lock(self, run_id: str) -> threading.Lock:
-        with self._locks_lock:
-            return self._run_locks.setdefault(run_id, threading.Lock())
+    def _process_alive(self, pid: int | None) -> bool:
+        checker = getattr(self._registry, "process_alive", None)
+        if checker is None or pid is None:
+            return False
+        return bool(checker(pid))
+
+    def _block_stop(self, rec: dict) -> str | None:
+        """A stop is not attested while a member's process is still alive."""
+        for member in rec.get("members") or []:
+            if self._process_alive(member.get("pid")):
+                return "member_alive"
+        return None
+
+    def _attestation(self, rec: dict) -> dict:
+        members = rec.get("members") or []
+        return {"proof": "empty", "cgroup": rec.get("cgroup"),
+                "member_ids": sorted(member["member_id"] for member in members),
+                "generation": rec["generation"]}
+
+    def _enter_owner(self) -> None:
+        depth = getattr(self._local, "depth", 0)
+        if depth == 0:
+            self._local.owner = uuid.uuid4().hex
+        self._local.depth = depth + 1
+
+    def _exit_owner(self) -> None:
+        self._local.depth -= 1
+        if self._local.depth == 0:
+            self._local.owner = None
+
+    @contextmanager
+    def _run_lock(self, run_id: str) -> Iterator[None]:
+        key = _run_lock_key(run_id)
+        owner = self._local.owner
+        self._locks.acquire(owner, [key])
+        try:
+            yield
+        finally:
+            self._locks.release(owner, [key])
 
     # -- stop ---------------------------------------------------------------------------------
     def stop(self, run_id: str) -> dict:
-        if self._stop_target(run_id) is None:  # no lock is kept for ids that name no run
-            return {"code": RUN_UNKNOWN, "run_id": run_id}
-        with self._run_lock(run_id):
-            rec = self._stop_target(run_id)
-            if rec is None:
+        self._enter_owner()
+        try:
+            if self._stop_target(run_id) is None:  # no lock is kept for ids that name no run
                 return {"code": RUN_UNKNOWN, "run_id": run_id}
-            return self._stop(rec)
+            with self._run_lock(run_id):
+                rec = self._stop_target(run_id)
+                if rec is None:
+                    return {"code": RUN_UNKNOWN, "run_id": run_id}
+                return self._stop(rec)
+        finally:
+            self._exit_owner()
 
     def _stop_target(self, run_id: str) -> dict | None:
         """The registry's record, or, when the registry cannot be read, the record this process kept for a
@@ -327,7 +454,11 @@ class ControlAPI:
             return self._pending(rec, f"cleanup_error:{type(err).__name__}")
         if answer != EMPTY:
             return self._pending(rec, _PENDING_REASON.get(answer, "confirm_unknown"))
+        blocked = self._block_stop(rec)
+        if blocked:  # confirm said empty, but a member is still alive: that is not an attested stop
+            return self._pending(rec, blocked)
         rec["state"] = "stopped"
+        rec["stop_attestation"] = self._attestation(rec)
         rec["stop"].update(checks=rec["stop"]["checks"] + 1, reason=None)
         res = {"code": STOPPED, "run_id": run_id, "state": "stopped", "repeat": not first}
         return self._recorded(res, rec)
@@ -352,10 +483,53 @@ class ControlAPI:
     def _recorded(self, res: dict, rec: dict) -> dict:
         # The cleanup layer's answer is the truth; a failed write-back is reported, not raised. The next
         # stop then sees the old state and asks again, which is safe (cgroup.kill and pidfds repeat).
-        if not self._try_put(rec):
+        # A stale generation is not a failed disk: the record moved under us, so the stop is applied to
+        # the fresh record once. A member that joined in that window keeps the stop pending.
+        try:
+            outcome = self._commit(rec)
+        except _RegistryError:
+            outcome = "down"
+        if outcome == "stale":
+            fresh = self._reread(rec)
+            if fresh is None:
+                outcome = "down"
+            else:
+                fresh["stop"] = dict(rec["stop"]) if rec.get("stop") else fresh.get("stop")
+                if res.get("code") == STOPPED:
+                    blocked = self._block_stop(fresh)
+                    if blocked or not fresh.get("cgroup"):
+                        reason = blocked or "cgroup_unknown"
+                        fresh["state"] = "stop_pending"
+                        if fresh.get("stop") is None:
+                            fresh["stop"] = {"requested_at": self._clock(), "checks": 0, "reason": None,
+                                             "requested": False}
+                        fresh["stop"].update(checks=fresh["stop"].get("checks", 0) + 1, reason=reason)
+                        fresh["stop_attestation"] = None
+                        res = {"code": PENDING, "run_id": rec["run_id"], "state": "pending", "reason": reason}
+                    else:
+                        fresh["state"] = "stopped"
+                        fresh["stop_attestation"] = self._attestation(fresh)
+                else:
+                    fresh["state"] = rec.get("state", fresh.get("state"))
+                    fresh["stop_attestation"] = None
+                try:
+                    outcome = self._commit(fresh)
+                except _RegistryError:
+                    outcome = "down"
+                rec.clear()
+                rec.update(fresh)
+        if outcome != "ok":
             res["recorded"] = False
             if rec["run_id"] in self._launched:  # keep the decision with the launch until a write lands
                 self._launched[rec["run_id"]] = dict(rec, stop=dict(rec["stop"]) if rec.get("stop") else None)
         else:
             self._launched.pop(rec["run_id"], None)  # the cgroup is in the registry now
         return res
+
+
+def _start_lock_key(slot: tuple[str, str]) -> str:
+    return f"a-start:{slot[0]}\0{slot[1]}"
+
+
+def _run_lock_key(run_id: str) -> str:
+    return f"b-run:{run_id}"

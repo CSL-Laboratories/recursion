@@ -192,6 +192,7 @@ Pin shape (owner call 2):
 - Other causes: `wrapper_install_missing`, `wrapper_launcher_missing`,
   `wrapper_package_not_a_file`, `wrapper_file_too_large`, `wrapper_tree_too_large`,
   `wrapper_tree_too_deep`, `wrapper_tree_unreadable`, `wrapper_pin_malformed`.
+  Every hashed file is capped at 1 GiB; a larger one refuses `wrapper_file_too_large`.
 
 ## Launch binding
 

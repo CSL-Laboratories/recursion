@@ -53,7 +53,8 @@ __all__ = [
 
 PACKAGE_WRAPPER_ENGINES = frozenset({"pi", "hermes", "cursor"})
 _MAX_FILES = 100_000
-_MAX_FILE_BYTES = 32 * 1024 * 1024
+# A sanity bound on one hashed file: a real agy 1.5.5 binary is 247,853,456 bytes.
+_MAX_FILE_BYTES = 1024 * 1024 * 1024
 _MAX_DEPTH = 200
 _HEX64 = set("0123456789abcdef")
 

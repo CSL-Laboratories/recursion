@@ -22,11 +22,11 @@ replacement. It builds the child environment from nothing:
   the same value rules as its peers. An override cannot set the client certificate, its
   private key or the passphrase; the parent's own values are still carried;
 * the user's own ``CLAUDE_CODE_OAUTH_TOKEN`` passes through to a Claude child unchanged
-  (PRODUCT.md 055cc7a5 section 3.3, Nov 8 fleet correction: nothing removes a built-in sign-in
+  (PRODUCT.md d84cdd26 section 3.3, Nov 8 fleet correction: nothing removes a built-in sign-in
   method from every run). It is never checked, logged or settable by an override; absent in the
   parent means absent in the child;
 * every call names its auth mode (``subscription``, ``api_key`` or ``cloud_provider``; PRODUCT.md
-  055cc7a5 section 3.3, "Every route starts with an explicit auth mode"; CSLR-D-011). An omitted or
+  d84cdd26 section 3.3, "Every route starts with an explicit auth mode"; CSLR-D-012). An omitted or
   unknown mode refuses. The vendor key, the base URL and the cloud-provider switches are route-owned:
   the parent's values never reach the child in any mode, and the child gets one only from the
   ``ChildRoute`` the caller passes for the route it launched. This module reads no keyring and no key
@@ -175,7 +175,7 @@ _BASE_URL = re.compile(
 _OFFICIAL_ORIGIN = ("https", "api.anthropic.com", 443)
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 _MAX_LINKS = 40
-# The three routes Recursion owns (PRODUCT.md 055cc7a5 section 3.3; CSLR-D-011). Nothing else is a mode.
+# The three routes Recursion owns (PRODUCT.md d84cdd26 section 3.3; CSLR-D-012). Nothing else is a mode.
 AUTH_MODES = ("subscription", "api_key", "cloud_provider")
 
 
@@ -220,7 +220,7 @@ class EngineProfile:
     hosts: tuple[str, ...]  # its own endpoints: a NO_PROXY entry matching one refuses while a proxy is set
     scrub: tuple[str, ...]  # credential and route selectors, asserted absent (they are not allowlisted)
     # The user's own sign-in names: copied from the parent unchanged when present, never checked, never set by
-    # an override, absent when the parent lacks them (PRODUCT.md 055cc7a5 section 3.3, Nov 8 fleet correction).
+    # an override, absent when the parent lacks them (PRODUCT.md d84cdd26 section 3.3, Nov 8 fleet correction).
     passthrough: tuple[str, ...] = ()
     # Route-owned names. Each is on ``scrub``, so the parent's value and an override never set it; the child
     # gets it only from the caller's ``ChildRoute``, in the mode that allows it. None or empty: the engine has
@@ -243,7 +243,7 @@ _CLAUDE_SCRUB = (
     "ANTHROPIC_ORGANIZATION_ID",
     "ANTHROPIC_BASE_URL",
     "CLAUDE_CONFIG_DIR",
-    "CLAUDE_CODE_SIMPLE",  # PRODUCT.md 055cc7a5 section 3.3 names it in the Claude scrub list
+    "CLAUDE_CODE_SIMPLE",  # PRODUCT.md d84cdd26 section 3.3 names it in the Claude scrub list
 )
 _CODEX_SCRUB = ("CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_HOME")
 

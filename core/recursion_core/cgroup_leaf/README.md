@@ -12,7 +12,10 @@ path (normal return, exception, launch failure, cancellation) kills the leaf.
   The launching process must itself be inside that subtree, because cgroup v2
   only lets an unprivileged writer migrate a process when it can write the
   common ancestor's `cgroup.procs`. Leaf names match `run-[A-Za-z0-9_-]{1,64}`;
-  an existing leaf is never reused.
+  an existing leaf is never reused. Creation sets the `user.recursion.leaf`
+  attribute to `recursion-cgroup-leaf/1` on that directory. Sweep and adopt
+  trust a directory only when the name matches and that attribute is present.
+  The `run-` prefix alone is not ownership.
 - No launch race: the parent opens the leaf's `cgroup.procs` and starts a small
   trampoline that writes its own pid there, then execs the target. If the write
   or exec fails, it reports through a close-on-exec pipe and exits without
@@ -41,17 +44,21 @@ path (normal return, exception, launch failure, cancellation) kills the leaf.
   `close()` kills or removes only that directory. If the identity was never
   known, or a different directory is now at the path, the result stays
   `unknown` and that directory is left in place.
-- Restart: `sweep(keep)` kills leftover leaves the durable run registry no longer
-  lists and books them `empty`, not `terminated`, because their exits were not
-  seen. `keep` is required (no kill-everything default) and must name every leaf
-  the registry still owns, including another launcher's on the same root; those
-  leaves are untouched. Names that are not valid leaf ids are still swept when
-  they start with the recursion-owned prefix `run-`. Names outside that prefix,
-  and symlinks, are left alone. `adopt(name)` returns a handle for a kept leaf so the
-  restarted daemon can kill it later; its best outcome is `empty`
+- Restart: `sweep(keep)` returns a `SweepResult`. It kills a leftover directory
+  only when the name is a leaf id and the directory still has the ownership
+  marker written at creation, and it books that leaf `empty`, not `terminated`,
+  because the exit was not seen. `keep` is required (no kill-everything default)
+  and must name every leaf the registry still owns, including another launcher's
+  on the same root; those leaves are untouched. A systemd `run-*.scope`, any
+  other name, a leaf id without the marker, and a symlink are left in place and
+  listed in `reported`. They are not killed. `adopt(name)` returns a handle for
+  a kept, marked leaf so the restarted daemon can kill it later; its best
+  outcome is `empty`. As a context manager that `empty` outcome is success.
+  `CleanupIncomplete` is still raised when the adopted cleanup does not finish
   (PRODUCT.md 055cc7a5 §3.1, Q38/O53).
 - Errors: a cleanup problem never replaces the original exception; it is added
-  as a note. On a clean exit, incomplete cleanup raises `CleanupIncomplete`.
+  as a note. On a clean exit of a launch, anything other than `leaf_empty`
+  raises `CleanupIncomplete`. An adopted leaf's clean exit accepts `empty`.
 - Interrupted cleanup: `finally` can be interrupted (PRODUCT.md 055cc7a5 §3.4,
   C2-10), so an exception raised inside cleanup (a second `KeyboardInterrupt`, for example)
   is noted and the kill retried, up to 5 attempts, on every exit path; the

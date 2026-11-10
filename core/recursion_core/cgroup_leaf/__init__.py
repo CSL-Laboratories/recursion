@@ -39,12 +39,63 @@ from dataclasses import dataclass
 
 log = logging.getLogger(__name__)
 
+# Leaf ids are run-[A-Za-z0-9_-]{1,64}. The dot in a systemd run-*.scope fails
+# this. Another tool can still use run-<id>, so the name is not ownership.
 LEAF_NAME = re.compile(r'run-[a-zA-Z0-9_-]{1,64}')
-OWNED_PREFIX = 'run-'  # recursion-owned names; sweep never leaves this prefix
+OWNERSHIP_XATTR = 'user.recursion.leaf'
+OWNERSHIP_VALUE = b'recursion-cgroup-leaf/1'
 CLEANUP_ATTEMPTS = 5  # bounded: an interrupt storm leaves the leaf to the sweep
 MAX_EBUSY_ATTEMPTS = 32  # dying-task rmdir retries, also cut by the cleanup deadline
 _READ_CAP = 1 << 20
 _MAX_CGROUP_DEPTH = 64
+
+
+def mark_owned(path):
+    """Record that this launcher created ``path``.
+
+    The mark sits on the directory inode. A shared delegated root can hold a
+    systemd ``run-*.scope`` or another tool's ``run-<id>``; neither gets this
+    attribute from us, and sweep does not treat the name as permission to kill.
+    """
+    os.setxattr(os.fspath(path), OWNERSHIP_XATTR, OWNERSHIP_VALUE, follow_symlinks=False)
+
+
+def _marked_owned(target):
+    """True only when ``target`` (path or dirfd) carries the marker we write.
+
+    A dirfd is read with ``fgetxattr`` (no ``follow_symlinks``: CPython rejects
+    that pair, and the fd was opened with ``O_NOFOLLOW``). A path uses
+    ``lgetxattr`` so a symlink cannot borrow the target's marker.
+    """
+    if target is None:
+        return False
+    try:
+        if isinstance(target, int):
+            value = os.getxattr(target, OWNERSHIP_XATTR)
+        else:
+            value = os.getxattr(os.fspath(target), OWNERSHIP_XATTR, follow_symlinks=False)
+    except OSError:
+        return False
+    return value == OWNERSHIP_VALUE
+
+
+def _discard_new_leaf(leaf):
+    """Best-effort undo of a leaf whose ownership marker could not be written."""
+    leaf = Path(leaf)
+    try:
+        for entry in leaf.iterdir():
+            try:
+                if entry.is_symlink() or not entry.is_file():
+                    continue
+                entry.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+    try:
+        os.rmdir(leaf)
+    except OSError:
+        pass
 
 
 def cgroup_identity(path):
@@ -56,12 +107,6 @@ def cgroup_identity(path):
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
         return None
     return (info.st_dev, info.st_ino)
-
-
-def _owned_dirname(name):
-    """A single path component under the recursion-owned ``run-`` prefix."""
-    return (isinstance(name, str) and name.startswith(OWNED_PREFIX)
-            and name not in ('.', '..') and '/' not in name and '\x00' not in name)
 
 
 def _wait_fd(fd, write, deadline):
@@ -110,6 +155,17 @@ class Outcome:
     escape_observable: bool = False  # same uid: a process that left the leaf is unseen
 
 
+@dataclass(frozen=True)
+class SweepResult:
+    """``outcomes`` are leaves this launcher killed. ``reported`` were left in place.
+
+    Each report is ``(name, reason)``. Reasons are ``foreign-name``, ``unmarked``,
+    ``symlink`` and ``unreadable``. A report is not a kill and not a removal.
+    """
+    outcomes: dict
+    reported: tuple
+
+
 class Cgroup2:
     """cgroup v2 filesystem operations. Tests substitute a fake."""
     def __init__(self, mount=Path('/sys/fs/cgroup')):
@@ -117,6 +173,11 @@ class Cgroup2:
 
     def make_leaf(self, leaf: Path):
         os.mkdir(leaf, 0o755)  # exclusive: an existing leaf is never reused
+        try:
+            mark_owned(leaf)
+        except OSError:
+            _discard_new_leaf(leaf)
+            raise
 
     def open_procs(self, leaf: Path) -> int:
         return os.open(leaf / 'cgroup.procs', os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
@@ -341,23 +402,33 @@ class DelegatedRoot:
 
         The pid is not this process's child, so its exit can never be seen here; the
         best close() can book is ``empty`` (S5: never terminated without a seen exit).
+        As a context manager, that ``empty`` outcome is a finished cleanup. A leaf
+        without the ownership marker written at creation is not ours and is refused.
         """
         leaf = self.leaf(name)
         if leaf.is_symlink() or not leaf.is_dir() or os.lstat(leaf).st_uid != os.getuid():
             raise PermissionError('Leaf is not an operator-owned directory')
-        return LeafRun(self.fs, leaf, kill_timeout)
+        run = LeafRun(self.fs, leaf, kill_timeout)
+        run.adopted = True
+        if run.dirfd is None or not _marked_owned(run.dirfd):
+            run._close_dirfd()
+            raise PermissionError('Leaf has no recursion ownership marker')
+        return run
 
     def sweep(self, keep, kill_timeout=5.0):
-        """Kill leftover leaves that the durable run registry does not list.
+        """Kill leftover leaves this launcher created and the registry no longer lists.
 
         ``keep`` is required and must be every leaf name the registry still owns
         (runs to re-adopt and runs of any other launcher on this root). Those leaves
         are not touched; re-adopt them with adopt(). There is deliberately no
         kill-everything default: a daemon restart or upgrade must not end live runs
-        (PRODUCT.md 055cc7a5 section 3.1, grill Q38 / O53). Names that are not valid
-        leaf ids are still swept when they use the recursion-owned ``run-`` prefix;
-        directories outside that prefix, and symlinks, are left alone. Exits of
-        swept leaves are unseen, so they are never booked terminated.
+        (PRODUCT.md 055cc7a5 section 3.1, grill Q38 / O53).
+
+        A directory is killed only when its name is a leaf id and the ownership
+        marker written at creation is on that inode. A systemd ``run-*.scope``,
+        any other name, a leaf id without the marker, and a symlink are left in
+        place and returned in ``reported``. Exits of swept leaves are unseen, so
+        they are never booked terminated.
         """
         if isinstance(keep, (str, bytes)):
             raise TypeError('keep must be a collection of leaf names, not a string')
@@ -365,24 +436,40 @@ class DelegatedRoot:
         for name in keep:
             self.leaf(name)  # validate: a malformed name cannot match a leaf
         outcomes = {}
+        reported = []
+
+        def report(name, reason):
+            reported.append((name, reason))
+            log.warning('cgroup %s left in place during sweep: %s', name, reason)
+
         for leaf in sorted(self.path.iterdir()):
-            # Valid leaf ids are a subset of the prefix. Unregistered names that
-            # still start with run- are leftovers too; anything else is foreign.
-            if leaf.name in keep or not _owned_dirname(leaf.name) or leaf.is_symlink():
+            if leaf.name in keep:
                 continue
             try:
                 info = os.lstat(leaf)
             except OSError:
+                report(leaf.name, 'unreadable')
+                continue
+            if stat.S_ISLNK(info.st_mode):
+                report(leaf.name, 'symlink')
                 continue
             if not stat.S_ISDIR(info.st_mode):
                 continue
+            if LEAF_NAME.fullmatch(leaf.name) is None:
+                report(leaf.name, 'foreign-name')
+                continue
+            # Open first, then read the marker through that dirfd, so a replaced
+            # path cannot borrow a check done against an earlier inode.
             run = LeafRun(self.fs, leaf, kill_timeout)
             try:
+                if run.dirfd is None or not _marked_owned(run.dirfd):
+                    report(leaf.name, 'unmarked')
+                    continue
                 outcomes[leaf.name] = run.close()
             finally:
                 # This handle is not kept for a later retry.
                 run._close_dirfd()
-        return outcomes
+        return SweepResult(outcomes, tuple(reported))
 
 
 class LeafRun:
@@ -395,6 +482,7 @@ class LeafRun:
         self.lock = threading.Lock()
         self.dirfd = None
         self.identity = None
+        self.adopted = False  # adopt() books empty; a launch must reach leaf_empty
         self._open_identity()
 
     def _open_identity(self):
@@ -624,6 +712,19 @@ class LeafRun:
             log.exception('leaf %s cleanup interrupted', self.leaf)
             self._cleanup_after(interrupt)  # retries; the interrupt still propagates
             raise
-        if outcome.state != 'leaf_empty' or outcome.errors:
+        if not self._exit_complete(outcome):
             raise CleanupIncomplete(outcome)
         return False
+
+    def _exit_complete(self, outcome):
+        """True when cleanup finished for this kind of handle.
+
+        A launch is finished only at ``leaf_empty`` (the main exit was seen).
+        An adopted leaf cannot see that exit, so ``empty`` with no error is
+        finished. Anything else, including ``empty`` plus an rmdir error, is not.
+        """
+        if outcome.errors:
+            return False
+        if outcome.state == 'leaf_empty':
+            return True
+        return self.adopted and outcome.state == 'empty'

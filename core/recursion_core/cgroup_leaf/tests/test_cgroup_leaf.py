@@ -53,6 +53,11 @@ class FakeCgroup(Cgroup2):
         os.mkdir(leaf, 0o755)
         for name in ('cgroup.procs', 'cgroup.kill', 'cgroup.events'):
             (leaf / name).touch()
+        try:
+            cgroup_leaf.mark_owned(leaf)
+        except OSError:
+            cgroup_leaf._discard_new_leaf(leaf)
+            raise
 
     def open_procs(self, leaf):
         if self.procs_override:
@@ -125,12 +130,18 @@ class LeafTests(unittest.TestCase):
         self.fs = FakeCgroup(self.mount)
         self.root = DelegatedRoot(self.root_path, self.fs)
         self.cleanup_pids = []
+        self.cleanup_procs = []
 
     def tearDown(self):
         for pid in self.cleanup_pids:
             try:
                 os.killpg(pid, signal.SIGKILL)
             except ProcessLookupError:
+                pass
+        for proc in self.cleanup_procs:
+            try:
+                proc.wait(2)
+            except Exception:
                 pass
         self.temp.cleanup()
 
@@ -296,15 +307,17 @@ class LeafTests(unittest.TestCase):
         self.fs.make_leaf(leaf)
         orphan = subprocess.Popen(['sleep', '60'], start_new_session=True)
         self.cleanup_pids.append(orphan.pid)
+        self.cleanup_procs.append(orphan)
         (leaf / 'cgroup.procs').write_text(str(orphan.pid))
         return orphan
 
     def test_sweep_of_unseen_leaf_is_empty_not_terminated(self):
         orphan = self.orphan_leaf('run-left')
-        outcomes = self.root.sweep(keep=())
+        result = self.root.sweep(keep=())
         orphan.wait(5)
-        self.assertEqual(outcomes['run-left'].state, 'empty')
-        self.assertFalse(outcomes['run-left'].main_exit_seen)
+        self.assertEqual(result.outcomes['run-left'].state, 'empty')
+        self.assertFalse(result.outcomes['run-left'].main_exit_seen)
+        self.assertEqual(result.reported, ())
         self.assertEqual(self.leaves(), [])
 
     # Restart (finding 1): the registry's live runs survive the startup sweep
@@ -312,9 +325,10 @@ class LeafTests(unittest.TestCase):
         live = self.orphan_leaf('run-live')
         other = self.orphan_leaf('run-other-launcher')
         stale = self.orphan_leaf('run-stale')
-        outcomes = self.root.sweep(keep={'run-live', 'run-other-launcher'})
+        result = self.root.sweep(keep={'run-live', 'run-other-launcher'})
         stale.wait(5)
-        self.assertEqual(set(outcomes), {'run-stale'})
+        self.assertEqual(set(result.outcomes), {'run-stale'})
+        self.assertEqual(result.reported, ())
         self.assertTrue(alive(live.pid) and alive(other.pid))
         self.assertEqual(self.leaves(), ['run-live', 'run-other-launcher'])
         outcome = self.root.adopt('run-live').close()
@@ -336,6 +350,37 @@ class LeafTests(unittest.TestCase):
             self.root.adopt('run-missing')
         with self.assertRaises(ValueError):
             self.root.adopt('../run-x')
+
+    def test_adopt_refuses_leaf_without_ownership_marker(self):
+        leaf = self.root_path / 'run-foreign'
+        self.fs.make_leaf(leaf)
+        os.removexattr(leaf, cgroup_leaf.OWNERSHIP_XATTR)
+        with self.assertRaisesRegex(PermissionError, 'ownership marker'):
+            self.root.adopt('run-foreign')
+        self.assertEqual((leaf / 'cgroup.procs').read_text(), '')
+        self.assertTrue(leaf.is_dir())
+
+    def test_adopt_context_accepts_empty_outcome(self):
+        orphan = self.orphan_leaf('run-live')
+        with self.root.adopt('run-live') as run:
+            self.assertIsNone(run.outcome)
+        orphan.wait(5)
+        self.assertEqual(run.outcome.state, 'empty')
+        self.assertEqual(run.outcome.errors, ())
+        self.assertFalse(run.outcome.main_exit_seen)
+        self.assertEqual(self.leaves(), [])
+
+    def test_adopt_context_raises_when_cleanup_does_not_finish(self):
+        orphan = self.orphan_leaf('run-stuck')
+        self.addCleanup(orphan.wait)
+        self.fs.kill_broken = True
+        with self.assertLogs(level='ERROR'), self.assertRaises(CleanupIncomplete) as caught:
+            with self.root.adopt('run-stuck', kill_timeout=0.2):
+                pass
+        self.assertEqual(caught.exception.outcome.state, 'running')
+        self.assertTrue(caught.exception.outcome.errors)
+        self.assertTrue(alive(orphan.pid))
+        self.assertEqual(self.leaves(), ['run-stuck'])
 
     # Unseen exit (finding 4): an empty leaf without a seen exit is kept
     def test_empty_leaf_with_unseen_exit_is_kept_with_its_pidfd(self):
@@ -413,8 +458,8 @@ class LeafTests(unittest.TestCase):
         self.assertTrue(any('abandoned' in n for n in caught.exception.__notes__))
         self.assertIsNone(run.outcome)
         self.assertEqual(self.leaves(), ['run-a'])
-        outcomes = self.root.sweep(keep=())  # the durable backstop after a crash
-        self.assertEqual(outcomes['run-a'].state, 'empty')
+        result = self.root.sweep(keep=())  # the durable backstop after a crash
+        self.assertEqual(result.outcomes['run-a'].state, 'empty')
         run.proc.wait(5)
         self.assertFalse(alive(gc))
 
@@ -527,6 +572,11 @@ class TmpCgroup(Cgroup2):
     def __init__(self, mount):
         super().__init__(mount)
         self.rmdir_calls = []
+        self.killed = []
+
+    def kill(self, leaf, deadline=None):
+        self.killed.append(Path(leaf).name)
+        return super().kill(leaf, deadline)
 
     def _rmdir(self, directory):
         directory = Path(directory)
@@ -693,33 +743,49 @@ class RemovalContractTests(unittest.TestCase):
         self.assertIsNone(box.get('populated'))
         self.assertIn('kill_error', box)
 
-    def test_sweep_removes_unregistered_owned_names_only(self):
-        free = self.root_path / 'run-not.valid'
-        busy = self.root_path / 'run-busy.name'
-        foreign = self.root_path / 'app.slice'
-        write_cgroup(free, procs='')
-        write_cgroup(busy, procs='')
-        (busy / 'cgroup.procs').write_text('5\n')
-        (busy / 'cgroup.events').write_text('populated 0\n')
-        foreign.mkdir()
-        (foreign / 'marker').write_text('foreign')
-        link = self.root_path / 'run-link'
-        link.symlink_to(foreign, target_is_directory=True)
+    def test_sweep_kills_only_a_marked_leaf_id(self):
+        # systemd scope, even with our xattr copied onto it: the name is not a leaf id.
+        scope = self.root_path / 'run-1234.scope'
+        unmarked = self.root_path / 'run-othertool'  # valid leaf id, no marker
+        marked = self.root_path / 'run-ours'
         kept = self.root_path / 'run-kept'
-        write_cgroup(kept, procs='')
+        other = self.root_path / 'app.slice'
+        for path in (scope, unmarked, marked, kept):
+            write_cgroup(path, procs='')
+        other.mkdir()
+        (other / 'payload').write_text('foreign')
+        (scope / 'payload').write_text('systemd')
+        (unmarked / 'payload').write_text('other-tool')
+        cgroup_leaf.mark_owned(scope)
+        cgroup_leaf.mark_owned(marked)
+        cgroup_leaf.mark_owned(kept)
+        link = self.root_path / 'run-link'
+        link.symlink_to(scope, target_is_directory=True)
         root = DelegatedRoot(self.root_path, self.fs)
-        outcomes = root.sweep(keep={'run-kept'})
-        self.assertFalse(free.exists(), outcomes)
-        self.assertTrue(busy.is_dir())
-        self.assertEqual((busy / 'cgroup.procs').read_text(), '5\n')
-        self.assertEqual((foreign / 'marker').read_text(), 'foreign')
+        with self.assertLogs(cgroup_leaf.log.name, level='WARNING'):
+            result = root.sweep(keep={'run-kept'})
+        self.assertEqual(set(result.outcomes), {'run-ours'})
+        self.assertEqual(result.outcomes['run-ours'].state, 'empty')
+        self.assertFalse(marked.exists())
+        self.assertEqual(result.reported, (
+            ('app.slice', 'foreign-name'),
+            ('run-1234.scope', 'foreign-name'),
+            ('run-link', 'symlink'),
+            ('run-othertool', 'unmarked'),
+        ))
+        self.assertEqual((scope / 'payload').read_text(), 'systemd')
+        self.assertEqual((scope / 'cgroup.kill').read_text(), '')
+        self.assertEqual(os.getxattr(scope, cgroup_leaf.OWNERSHIP_XATTR, follow_symlinks=False),
+                         cgroup_leaf.OWNERSHIP_VALUE)
+        self.assertEqual((unmarked / 'payload').read_text(), 'other-tool')
+        self.assertEqual((unmarked / 'cgroup.kill').read_text(), '')
+        with self.assertRaises(OSError):
+            os.getxattr(unmarked, cgroup_leaf.OWNERSHIP_XATTR, follow_symlinks=False)
+        self.assertEqual((other / 'payload').read_text(), 'foreign')
         self.assertTrue(link.is_symlink())
         self.assertTrue(kept.is_dir())
-        self.assertNotIn(busy, self.fs.rmdir_calls)
-        self.assertIn('run-not.valid', outcomes)
-        self.assertNotIn('app.slice', outcomes)
-        self.assertNotIn('run-link', outcomes)
-        self.assertNotIn('run-kept', outcomes)
+        self.assertEqual(self.fs.killed, ['run-ours'])
+        self.assertEqual([path.name for path in self.fs.rmdir_calls], ['run-ours'])
 
     def test_close_does_not_hang_on_slow_events_or_exit(self):
         leaf = self.root_path / 'run-a'

@@ -74,7 +74,7 @@ Same-uid is not a security boundary. The real boundary is a separate OS user or 
 
 Implementation explanation (not Lucas's quoted words): under the same-uid fallback the signed authority profile is tamper evidence, not a
 boundary: it binds honest plugins and records what happened, and the mutants above
-still rewrite it. The in-process Cockpit plugin holds paper-order permission on 2026-11-11.
+still rewrite it. An in-process paper-order plugin holds paper-order permission on 2026-11-11.
 Paper only, by PRODUCT.md 5.2 / CP0-v2 ("order authority stays paper-first"), not by O69: O69 is
 the signed-profile item. This fallback grants no live-order permission; live capital stays
 separately authorised (PRODUCT.md 5.2). The code has one `order` permission.

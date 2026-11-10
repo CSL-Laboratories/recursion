@@ -1,6 +1,6 @@
 """The core's language-neutral boundary (``csl-core/v0``): canonical JSON bytes in and out.
 
-Plugins and consumers (Cockpit included) reach the approval gate, the authority ledger
+Plugins and consumers (including in-process plugins) reach the approval gate, the authority ledger
 and the breaker only through ``CoreService.client_for(caller)``, a callable taking
 request bytes and returning response bytes. The ops, their arguments and the order of
 checks are listed in ``protocol.json`` beside this file, so a later Rust core can be

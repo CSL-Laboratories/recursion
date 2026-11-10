@@ -65,33 +65,53 @@ def _reject_non_ijson(token: str):
 
 
 def _reject_unpaired_surrogates(value) -> None:
-    """I-JSON forbids unpaired surrogates. json.loads keeps them as str."""
-    if isinstance(value, str):
-        try:
-            value.encode("utf-8")
-        except UnicodeEncodeError as exc:
-            raise StrictDecodeError("unpaired surrogate") from exc
-    elif isinstance(value, list):
-        for item in value:
-            _reject_unpaired_surrogates(item)
-    elif isinstance(value, dict):
-        for key, item in value.items():
-            _reject_unpaired_surrogates(key)
-            _reject_unpaired_surrogates(item)
+    """I-JSON forbids unpaired surrogates. json.loads keeps them as str.
+
+    The walk is an explicit stack. json.loads accepts nesting a recursive
+    walk cannot visit (about 999 through 9998 empty arrays at the default
+    recursion limit), and that walk used to raise RecursionError after the
+    json.loads guard had already returned.
+    """
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, str):
+            try:
+                current.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise StrictDecodeError("unpaired surrogate") from exc
+        elif isinstance(current, list):
+            pending.extend(current)
+        elif isinstance(current, dict):
+            pending.extend(current)
+            pending.extend(current.values())
 
 
 def strict_load(path: Path):
-    """I-JSON profile decode: no duplicate keys, floats, -0, NaN/Infinity, or unpaired surrogates."""
+    """I-JSON profile decode: no duplicate keys, floats, -0, NaN/Infinity, or unpaired surrogates.
+
+    Invalid UTF-8 and JSON syntax are ``StrictDecodeError``, the same type as
+    the other profile refusals. Nesting the host decoder cannot walk is also
+    ``StrictDecodeError``. This decoder has no depth cap of its own.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise StrictDecodeError("input is not UTF-8") from exc
     try:
         value = json.loads(
-            path.read_text(encoding="utf-8"),  # invalid UTF-8 raises UnicodeDecodeError
+            text,
             object_pairs_hook=_no_duplicate_keys,
             parse_int=_strict_int,
             parse_float=_reject_non_ijson,
             parse_constant=_reject_non_ijson,
         )
+    except StrictDecodeError:
+        raise
     except RecursionError as exc:
         raise StrictDecodeError("nesting is too deep to decode") from exc
+    except json.JSONDecodeError as exc:
+        raise StrictDecodeError(f"not JSON: {exc.msg}") from exc
     _reject_unpaired_surrogates(value)
     return value
 
@@ -296,20 +316,63 @@ class ContractFixtureTests(unittest.TestCase):
             sys.set_int_max_str_digits(old)
 
     def test_deep_nesting_does_not_crash(self) -> None:
-        # csl-canonical/1 refuses this as depth. The wire decoder must not raise
-        # RecursionError; a clean decode error is enough (no new depth cap).
-        text = "[" * 20000 + "]" * 20000
-        try:
-            self._load_text(text)
-        except RecursionError as exc:
-            self.fail(f"decoder crashed: {exc}")
-        except StrictDecodeError:
-            return
+        # json.loads accepts roughly 999-9998 nested containers and first raises
+        # RecursionError near 9999. The surrogate walk used to recurse on the
+        # accepted tree and crash at 1000 and 5000, while 20000 only hit the
+        # json.loads guard. Those mid depths must decode; 20000 must be a
+        # StrictDecodeError, not a RecursionError. This adds no depth cap.
+        def innermost_list(value, depth: int):
+            for _ in range(depth - 1):
+                self.assertIsInstance(value, list)
+                value = value[0]
+            return value
+
+        for depth in (1000, 5000):
+            with self.subTest(shape="array", depth=depth):
+                value = self._load_text("[" * depth + "]" * depth)
+                self.assertEqual([], innermost_list(value, depth))
+        objects = self._load_text('{"k":' * 1000 + "0" + "}" * 1000)
+        for _ in range(1000):
+            self.assertIsInstance(objects, dict)
+            objects = objects["k"]
+        self.assertEqual(0, objects)
+        with self.assertRaises(StrictDecodeError):
+            self._load_text("[" * 20000 + "]" * 20000)
+
+    def test_decode_failures_are_strict_decode_errors(self) -> None:
+        # Invalid UTF-8, a BOM, and trailing data must not leak the host
+        # exception type. Callers of strict_load only catch StrictDecodeError.
+        cases = {
+            "invalid_utf8": b"\xff",
+            "utf8_bom": b"\xef\xbb\xbf{}",
+            "trailing": b"{}x",
+        }
+        for name, raw in cases.items():
+            with self.subTest(name=name):
+                with tempfile.NamedTemporaryFile(suffix=".json") as handle:
+                    handle.write(raw)
+                    handle.flush()
+                    with self.assertRaises(StrictDecodeError):
+                        strict_load(Path(handle.name))
+
+    def test_decoder_currently_has_no_nesting_cap(self) -> None:
+        # Owner question: csl-canonical/1 refuses 130 empty arrays as depth
+        # (test_depth_counts_empty_containers_one_level_deeper_than_scalars).
+        # This decoder has no cap and accepts 130, 500, and 998. Not changed.
+        def innermost(value, depth: int):
+            for _ in range(depth - 1):
+                value = value[0]
+            return value
+
+        for depth in (130, 500, 998):
+            with self.subTest(depth=depth):
+                self.assertEqual([], innermost(self._load_text("[" * depth + "]" * depth), depth))
 
     def test_unpaired_surrogate_is_rejected(self) -> None:
         # The wire profile says I-JSON: no unpaired surrogates. csl-canonical/1
         # refuses these as lone_surrogate. strict_load currently returns them.
-        for text in ('"\\ud800"', '{"a":"\\ud800"}', '{"\\ud800":1}'):
+        for text in ('"\\ud800"', '{"a":"\\ud800"}', '{"\\ud800":1}',
+                     "[" * 1000 + '"\\ud800"' + "]" * 1000):
             with self.subTest(text=text):
                 with self.assertRaises(StrictDecodeError):
                     self._load_text(text)

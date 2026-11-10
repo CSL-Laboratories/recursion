@@ -24,11 +24,20 @@ The vault records do not establish every name and file each engine reads to pick
 the engine config and home selectors the records do name get their own cause. Stored-credential
 discovery is refused by checking, with ``lstat`` only, that the child's home is route-owned, is
 not the operator's home and holds no Claude Code store and no Pi, Hermes or OpenCode state or
-login entry. No credential file is opened or read.
+login entry. No credential file is opened or read. The one file read is a Hermes
+``.hermes/config.yaml`` that is already exactly the size of the adopt switch Recursion writes there,
+to confirm it is that switch; a config of any other size refuses unread.
 
 ``guard_then_spawn`` takes the launcher and argv as trusted, core-owned inputs: it does not parse
-argv, so an engine flag that selects a provider or config is the caller's responsibility. It
-only refuses launch options that would replace the env or widen the launch.
+argv, so an engine flag that selects a provider or config is the caller's responsibility. On a
+pinned route ``argv[0]`` must be the pinned path. Launch options that would replace the env or
+widen the launch refuse, ``cwd`` is forwarded, and any other option refuses unless the caller
+lists it in ``RouteRequirements.extra_launch_options``.
+
+Configured requirements (2026-11-09, Lucas; PRODUCT.md 055cc7a5 Q20, O44, H-06) come in as explicit
+inputs: a ``RouteRequirements`` value and ``full_access_acknowledged``. Nothing here reads a config
+file, the environment, a keyring or a prompt to find them, and nothing here renders a notice: the
+driver owns prompts, saved configuration and the full-access danger notice.
 
 2026-11-08 briefing (Lucas): allow a subscription sign-in in these harnesses only where the provider names
 that harness. ChatGPT: OpenCode and Pi, through their registered Sign in with ChatGPT method only. Grok:
@@ -67,6 +76,7 @@ from recursion_core.subscription_routes.wrapper_pin import (
     AntigravityPin,
     WrapperInstall,
     WrapperPinRefused,
+    check_link_requirements,
     verify_antigravity_pin,
     verify_package_pin,
 )
@@ -78,7 +88,9 @@ __all__ = [
     "ENGINE_SELECTOR_ENV",
     "ENGINE_STORE_ENTRIES",
     "HERMES_ADOPT_EXTERNAL_LOGINS",
+    "FORWARDED_LAUNCH_OPTIONS",
     "RouteDecision",
+    "RouteRequirements",
     "SAFE_ENV",
     "SubscriptionRouteRefused",
     "check_antigravity_route",
@@ -140,6 +152,12 @@ ENGINE_STORE_ENTRIES = (".pi", ".hermes", ".local/share/opencode", ".config/open
 _FORBIDDEN_LAUNCH = frozenset(
     {"env", "shell", "executable", "preexec_fn", "close_fds", "pass_fds", "user", "group", "extra_groups", "cwd_fd"}
 )
+# Names the guard itself passes to the launcher; a caller may not pass or configure them.
+_RESERVED_LAUNCH = frozenset({"engine_config", "model"})
+# Launch options forwarded to the launcher by default. Anything else that is not forbidden refuses
+# ``launch_option_unknown`` unless the caller lists it in ``RouteRequirements.extra_launch_options``
+# or the run uses the acknowledged full-access profile.
+FORWARDED_LAUNCH_OPTIONS = frozenset({"cwd"})
 # A Claude Code OAuth token in an API-key variable. Inferred prefix (not read from engine source):
 # Hermes routes some Anthropic tokens "down the OAuth path by prefix" (auth.py:203-209).
 _OAUTH_PREFIXES = ("sk-ant-oat",)
@@ -203,6 +221,29 @@ _GOOGLE_LABELS = ("google", "gemini", "antigravity", "google_one", "google_ai")
 
 
 @dataclass(frozen=True)
+class RouteRequirements:
+    """Requirements a user or plugin configured, handed in by the driver. The defaults are the secure ones.
+
+    The guard only compares these values. It never loads them from a file, the environment, a keyring
+    or a prompt; the driver owns prompts and saved configuration.
+
+    * ``allowed_link_targets``: absolute, normalised real paths a package pin may follow a symlink to
+      when the link leaves the install root (the path itself or anything under it). Default: none,
+      so such a link refuses ``package_link_outside_root``.
+    * ``extra_launch_options``: launch option names forwarded to the launcher besides
+      ``FORWARDED_LAUNCH_OPTIONS``. A forbidden or reserved name here refuses
+      ``requirements_forbidden_launch_option``.
+    * ``owned_hermes_home``: the Hermes home the user says they own. When set it must resolve to the
+      route home, or the Hermes route refuses ``hermes_home_not_owned``; ``.hermes/config.yaml`` is
+      written or reused only there. Default ``None``: the route home Recursion created.
+    """
+
+    allowed_link_targets: tuple[str, ...] | frozenset[str] = ()
+    extra_launch_options: tuple[str, ...] | frozenset[str] = ()
+    owned_hermes_home: str | None = None
+
+
+@dataclass(frozen=True)
 class RouteDecision:
     engine: str
     provider: str
@@ -212,14 +253,16 @@ class RouteDecision:
     method: str = ""
     # Engine-native settings the driver must pass to the engine, e.g. Hermes's
     # (("auth.adopt_external_logins", False),). guard_then_spawn also writes Hermes's
-    # config.yaml so a raw launch cannot keep the default (adoption on).
+    # config.yaml (or reuses its own exact copy) so a raw launch cannot keep the default (adoption on).
     engine_config: tuple[tuple[str, object], ...] = ()
     model: str = ""
+    # "full_access_profile_acknowledged" is one of the flags when the run used the full-access profile.
     # True when a Pi, Hermes, Cursor or Antigravity wrapper matched its pin (2026-11-09).
     # OpenCode is not a pinned wrapper here, so its decisions stay False.
     beta: bool = False
     # The exact env check_route accepted. guard_* launches this copy, never a second read.
-    child_env: tuple[tuple[str, str], ...] = ()
+    # Left out of repr: on an API-key route it holds the key.
+    child_env: tuple[tuple[str, str], ...] = field(default=(), repr=False)
     pin_version: str = ""  # Antigravity pin only; empty for every other route
 
 
@@ -232,6 +275,8 @@ def check_route(
     parent_env: Mapping[str, str] | None = None,
     operator_home: str | None = None,
     wrapper: WrapperInstall | None = None,
+    requirements: RouteRequirements | None = None,
+    full_access_acknowledged: bool = False,
 ) -> RouteDecision:
     """Validate one Pi/Hermes/OpenCode profile; raise ``SubscriptionRouteRefused`` or return the decision.
 
@@ -242,11 +287,14 @@ def check_route(
     A Hermes profile needs ``"auth.adopt_external_logins": False``. ``child_env`` is the exact
     environment the core will pass; ``route_home`` its HOME. Pi and Hermes also need ``wrapper``: the
     launcher script and installed package files must match that pin, and the decision is then beta.
+    ``requirements`` and ``full_access_acknowledged`` are the configured inputs (``RouteRequirements``);
+    full access lets a package link leave the install root and relaxes nothing else here.
     """
 
     spec = ENGINES.get(engine) if isinstance(engine, str) else None
     if spec is None:
         raise SubscriptionRouteRefused(engine, "unknown_engine")
+    checked = _checked_requirements(engine, requirements, full_access_acknowledged)
     if not isinstance(profile, Mapping):
         raise SubscriptionRouteRefused(engine, "profile_malformed")
     # borrow_claude_code_login is not accepted. Hermes uses auth.adopt_external_logins (below).
@@ -268,7 +316,7 @@ def check_route(
         engine_config = ((HERMES_ADOPT_EXTERNAL_LOGINS, False),)
     if isinstance(profile.get("auth"), str) and _norm(profile["auth"]) == "subscription":
         return _check_subscription(engine, spec, profile, child_env, route_home, parent_env, operator_home,
-                                   engine_config, wrapper)
+                                   engine_config, wrapper, checked)
     if "method" in profile:
         raise SubscriptionRouteRefused(engine, "method_without_subscription")
     provider, auth, credential = profile.get("provider"), profile.get("auth"), profile.get("credential_env")
@@ -320,8 +368,10 @@ def check_route(
         raise SubscriptionRouteRefused(engine, "child_env_not_allowed", ",".join(extra))
 
     _check_home(engine, env, route_home, parent_env, operator_home)
+    _check_hermes_home(engine, route_home, checked)
     flags = tuple(f"parent_env_has:{name}" for name in CLAUDE_SUBSCRIPTION_ENV if name in (parent_env or {}))
-    return _finish(engine, provider, credential, flags, "api_key", "", engine_config, stored_model, env, wrapper)
+    return _finish(engine, provider, credential, flags, "api_key", "", engine_config, stored_model, env, wrapper,
+                   checked)
 
 
 def _norm(label: str) -> str:
@@ -352,6 +402,7 @@ def _finish(
     model: str,
     env: Mapping[str, str],
     wrapper: WrapperInstall | None,
+    checked: _Checked,
     pin_version: str = "",
 ) -> RouteDecision:
     """Pi and Hermes match a package pin and are beta. Any other engine refuses a pin."""
@@ -360,15 +411,12 @@ def _finish(
     if engine in ("pi", "hermes"):
         if wrapper is None:
             raise SubscriptionRouteRefused(engine, "wrapper_pin_missing")
-        try:
-            verify_package_pin(engine, wrapper)
-        except WrapperPinRefused as exc:
-            raise SubscriptionRouteRefused(engine, exc.cause, exc.detail) from None
+        _verify_wrapper(engine, wrapper, checked)
         beta = True
     elif wrapper is not None:
         raise SubscriptionRouteRefused(engine, "wrapper_pin_not_applicable")
     return RouteDecision(
-        engine, provider, credential, flags, auth, method, engine_config, model, beta,
+        engine, provider, credential, flags + checked.flags, auth, method, engine_config, model, beta,
         tuple(sorted(env.items())), pin_version,
     )
 
@@ -383,6 +431,7 @@ def _check_subscription(
     operator_home: str | None,
     engine_config: tuple[tuple[str, object], ...],
     wrapper: WrapperInstall | None,
+    checked: _Checked,
 ) -> RouteDecision:
     """A subscription sign-in: allowed only for a (provider, method) pair on ``SUBSCRIPTION_SIGN_INS``."""
 
@@ -433,12 +482,16 @@ def _check_subscription(
 
     own = OWN_STORE_ENTRIES[engine]
     _check_home(engine, env, route_home, parent_env, operator_home, own=own)
+    _check_hermes_home(engine, route_home, checked)
     flags = tuple(f"parent_env_has:{name}" for name in CLAUDE_SUBSCRIPTION_ENV if name in (parent_env or {}))
     # The engine's own store was allowed by presence only; whether it holds an adopted Claude or Codex
-    # login, or a Claude provider plugin, was not inspected (open for Lucas).
+    # login, or a Claude provider plugin, was not inspected (open for Lucas). A .hermes that holds only
+    # Recursion's own adopt switch has nothing uninspected in it and gets no flag.
     flags += tuple(f"own_login_store_not_inspected:{entry}" for entry in own
-                   if os.path.lexists(os.path.join(route_home, entry)))
-    return _finish(engine, label, "", flags, "subscription", allowed[label], engine_config, model, env, wrapper)
+                   if os.path.lexists(os.path.join(route_home, entry))
+                   and not (engine == "hermes" and entry == ".hermes" and _hermes_dir_is_only_ours(engine, route_home)))
+    return _finish(engine, label, "", flags, "subscription", allowed[label], engine_config, model, env, wrapper,
+                   checked)
 
 
 def guard_then_spawn(
@@ -452,23 +505,32 @@ def guard_then_spawn(
     parent_env: Mapping[str, str] | None = None,
     operator_home: str | None = None,
     wrapper: WrapperInstall | None = None,
+    requirements: RouteRequirements | None = None,
+    full_access_acknowledged: bool = False,
     **launch_kwargs: object,
 ) -> tuple[RouteDecision, object]:
     """Run ``check_route`` and only then call the launcher with the env that check accepted.
 
     A later change to ``child_env`` is not what launches: the launcher receives ``decision.child_env``.
     A subscription route's ``model`` must be an argv element (or ``--model`` / ``-m``), so the engine is
-    not left to its own default. Hermes's ``auth.adopt_external_logins: false`` is written into the
-    route home's ``.hermes/config.yaml`` before the launcher runs. ``launch_kwargs`` may not replace
-    the env or widen the launch.
+    not left to its own default. On Pi and Hermes ``argv[0]`` must be an absolute path that resolves to
+    the pinned ``wrapper.launcher_path`` (``argv0_not_pinned``); OpenCode has no pin and no such check.
+    Hermes's ``auth.adopt_external_logins: false`` is written into the route home's
+    ``.hermes/config.yaml`` before the launcher runs; a config already there is reused only when it is
+    exactly that file. ``launch_kwargs`` may not replace the env or widen the launch: ``cwd`` and the
+    names in ``requirements.extra_launch_options`` are forwarded, forbidden names refuse
+    ``launch_option_denied`` and any other name refuses ``launch_option_unknown``.
     """
 
-    _reject_launch_shape(engine if isinstance(engine, str) else None, argv, launch_kwargs)
+    name = engine if isinstance(engine, str) else None
+    forward = _reject_launch_shape(name, argv, launch_kwargs, requirements, full_access_acknowledged)
     decision = check_route(
         engine, profile, child_env, route_home=route_home, parent_env=parent_env,
-        operator_home=operator_home, wrapper=wrapper,
+        operator_home=operator_home, wrapper=wrapper, requirements=requirements,
+        full_access_acknowledged=full_access_acknowledged,
     )
-    return _launch_checked(launcher, list(argv), decision, route_home)
+    pinned = (wrapper.launcher_path,) if decision.beta and wrapper is not None else ()
+    return _launch_checked(launcher, list(argv), decision, route_home, pinned, forward)
 
 
 def _looks_like_claude_login(provider: str) -> bool:
@@ -515,6 +577,8 @@ def _check_home(
         if entry in own:
             _check_own_store(engine, route_home, real, entry)
             continue
+        if engine == "hermes" and entry == ".hermes" and _hermes_dir_is_only_ours(engine, route_home):
+            continue  # the adopt switch an earlier launch in this home wrote, and nothing else
         if os.path.lexists(os.path.join(route_home, entry)):  # presence only; never opened or read
             raise SubscriptionRouteRefused(engine, "engine_store_in_route_home", entry)
 
@@ -607,12 +671,88 @@ _MODEL_FLAGS = ("--model", "-m")
 _HERMES_ADOPT_YAML = b"auth:\n  adopt_external_logins: false\n"
 
 
-def _reject_launch_shape(engine: str | None, argv: object, launch_kwargs: Mapping[str, object]) -> None:
-    bad = sorted(_FORBIDDEN_LAUNCH.intersection(launch_kwargs))
+@dataclass(frozen=True)
+class _Checked:
+    """``RouteRequirements`` plus the full-access acknowledgment, after validation."""
+
+    allowed_link_targets: tuple[str, ...] = ()
+    extra_launch_options: frozenset[str] = frozenset()
+    owned_hermes_home: str | None = None
+    full_access: bool = False
+
+    @property
+    def flags(self) -> tuple[str, ...]:
+        return ("full_access_profile_acknowledged",) if self.full_access else ()
+
+
+def _checked_requirements(engine: str | None, requirements: object, full_access_acknowledged: object) -> _Checked:
+    """Validate the configured inputs, fail closed. Only the bool ``True`` turns full access on."""
+
+    if not isinstance(full_access_acknowledged, bool):  # "true", 1 and the like are not an acknowledgment
+        raise SubscriptionRouteRefused(engine, "full_access_ack_not_bool")
+    if requirements is None:
+        requirements = RouteRequirements()
+    if not isinstance(requirements, RouteRequirements):
+        raise SubscriptionRouteRefused(engine, "requirements_malformed", "requirements")
+    try:
+        targets = check_link_requirements(requirements.allowed_link_targets, full_access_acknowledged)
+    except WrapperPinRefused as exc:
+        raise SubscriptionRouteRefused(engine, exc.cause, exc.detail) from None
+    options = requirements.extra_launch_options
+    if not isinstance(options, (tuple, frozenset)) or not all(
+        isinstance(option, str) and option.isidentifier() for option in options
+    ):
+        raise SubscriptionRouteRefused(engine, "requirements_malformed", "extra_launch_options")
+    denied = sorted((_FORBIDDEN_LAUNCH | _RESERVED_LAUNCH).intersection(options))
+    if denied:  # full access does not change this
+        raise SubscriptionRouteRefused(engine, "requirements_forbidden_launch_option", ",".join(denied))
+    owned = requirements.owned_hermes_home
+    if owned is not None and (not isinstance(owned, str) or "\x00" in owned or not os.path.isabs(owned)):
+        raise SubscriptionRouteRefused(engine, "requirements_malformed", "owned_hermes_home")
+    return _Checked(targets, frozenset(options), owned, full_access_acknowledged is True)
+
+
+def _reject_launch_shape(
+    engine: str | None,
+    argv: object,
+    launch_kwargs: Mapping[str, object],
+    requirements: object = None,
+    full_access_acknowledged: object = False,
+) -> dict[str, object]:
+    """Refuse a bad launch shape; return the launch options to forward to the launcher."""
+
+    bad = sorted((_FORBIDDEN_LAUNCH | _RESERVED_LAUNCH).intersection(launch_kwargs))
     if bad:
         raise SubscriptionRouteRefused(engine, "launch_option_denied", ",".join(bad))
     if isinstance(argv, (str, bytes)) or not isinstance(argv, list) or not argv or not all(isinstance(item, str) for item in argv):
         raise SubscriptionRouteRefused(engine, "argv_malformed")
+    checked = _checked_requirements(engine, requirements, full_access_acknowledged)
+    unknown = sorted(set(launch_kwargs) - FORWARDED_LAUNCH_OPTIONS - checked.extra_launch_options)
+    if unknown and not checked.full_access:
+        raise SubscriptionRouteRefused(engine, "launch_option_unknown", ",".join(unknown))
+    return dict(launch_kwargs)
+
+
+def _verify_wrapper(engine: str, wrapper: WrapperInstall, checked: _Checked) -> None:
+    try:
+        verify_package_pin(engine, wrapper, allowed_link_targets=checked.allowed_link_targets,
+                           full_access_acknowledged=checked.full_access)
+    except WrapperPinRefused as exc:
+        raise SubscriptionRouteRefused(engine, exc.cause, exc.detail) from None
+
+
+def _argv0_is_pinned(argv: list[str], pinned: tuple[str, ...]) -> bool:
+    """``argv[0]`` is an absolute path that resolves to one of the pinned paths.
+
+    A bare name such as ``cursor`` would be looked up on PATH by the launcher, so it is not the
+    pinned file however it resolves here.
+    """
+
+    first = argv[0]
+    if "\x00" in first or not os.path.isabs(first):
+        return False
+    real = os.path.realpath(first)
+    return any(isinstance(path, str) and os.path.isabs(path) and os.path.realpath(path) == real for path in pinned)
 
 
 def _argv_binds_model(argv: list[str], model: str) -> bool:
@@ -626,8 +766,72 @@ def _argv_binds_model(argv: list[str], model: str) -> bool:
     return False
 
 
+def _refuse_hermes_config(engine: str, detail: str) -> SubscriptionRouteRefused:
+    return SubscriptionRouteRefused(engine, "hermes_config_blocks_adopt_override", detail)
+
+
+def _hermes_config_is_ours(engine: str, route_home: str) -> bool:
+    """False when ``.hermes/config.yaml`` is absent, True when it is exactly Recursion's adopt switch.
+
+    Anything else refuses: a link, a non-regular file, another owner or any other content. A file
+    of any other size is refused from ``lstat`` alone and never opened, so a config that holds more
+    than the switch (it might hold a credential) is not read.
+    """
+
+    parent = os.path.join(route_home, ".hermes")
+    dest = os.path.join(parent, "config.yaml")
+    try:
+        parent_mode = os.lstat(parent).st_mode
+    except OSError:
+        return False
+    if not stat.S_ISDIR(parent_mode):
+        raise _refuse_hermes_config(engine, ".hermes")
+    try:
+        st = os.lstat(dest)
+    except OSError:
+        return False
+    if not stat.S_ISREG(st.st_mode) or st.st_size != len(_HERMES_ADOPT_YAML) or st.st_uid != os.geteuid():
+        raise _refuse_hermes_config(engine, "config.yaml")
+    try:
+        fd = os.open(dest, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        raise _refuse_hermes_config(engine, "config.yaml") from None
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_size != len(_HERMES_ADOPT_YAML):
+            raise _refuse_hermes_config(engine, "config.yaml")
+        data = os.read(fd, len(_HERMES_ADOPT_YAML) + 1)
+    finally:
+        os.close(fd)
+    if data != _HERMES_ADOPT_YAML:
+        raise _refuse_hermes_config(engine, "config.yaml")
+    return True
+
+
+def _hermes_dir_is_only_ours(engine: str, route_home: str) -> bool:
+    """True when ``.hermes`` is a real directory that holds only Recursion's exact ``config.yaml``."""
+
+    parent = os.path.join(route_home, ".hermes")
+    try:
+        if not stat.S_ISDIR(os.lstat(parent).st_mode) or os.listdir(parent) != ["config.yaml"]:
+            return False
+    except OSError:
+        return False
+    return _hermes_config_is_ours(engine, route_home)
+
+
+def _check_hermes_home(engine: str, route_home: str, checked: _Checked) -> None:
+    """Hermes only: the declared owned home is the route home, and a config already there is ours."""
+
+    if engine != "hermes":
+        return
+    if checked.owned_hermes_home is not None and os.path.realpath(checked.owned_hermes_home) != os.path.realpath(route_home):
+        raise SubscriptionRouteRefused(engine, "hermes_home_not_owned")
+    _hermes_config_is_ours(engine, route_home)
+
+
 def _apply_hermes_adopt_override(decision: RouteDecision, route_home: str) -> None:
-    """Write Hermes's adopt switch. Do not read a config that might hold a credential."""
+    """Write Hermes's adopt switch, or reuse the one an earlier launch in this home wrote."""
 
     if decision.engine != "hermes":
         return
@@ -635,10 +839,10 @@ def _apply_hermes_adopt_override(decision: RouteDecision, route_home: str) -> No
         raise SubscriptionRouteRefused(decision.engine, "hermes_adopt_external_logins_not_off")
     parent = os.path.join(route_home, ".hermes")
     dest = os.path.join(parent, "config.yaml")
-    if os.path.lexists(dest):
-        raise SubscriptionRouteRefused(decision.engine, "hermes_config_blocks_adopt_override", "config.yaml")
+    if _hermes_config_is_ours(decision.engine, route_home):
+        return
     if os.path.lexists(parent) and (os.path.islink(parent) or not os.path.isdir(parent)):
-        raise SubscriptionRouteRefused(decision.engine, "hermes_config_blocks_adopt_override", ".hermes")
+        raise _refuse_hermes_config(decision.engine, ".hermes")
     os.makedirs(parent, mode=0o700, exist_ok=True)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
@@ -646,7 +850,7 @@ def _apply_hermes_adopt_override(decision: RouteDecision, route_home: str) -> No
     try:
         fd = os.open(dest, flags, 0o600)
     except OSError:
-        raise SubscriptionRouteRefused(decision.engine, "hermes_config_blocks_adopt_override", "config.yaml") from None
+        raise _refuse_hermes_config(decision.engine, "config.yaml") from None
     try:
         os.write(fd, _HERMES_ADOPT_YAML)
     finally:
@@ -654,15 +858,23 @@ def _apply_hermes_adopt_override(decision: RouteDecision, route_home: str) -> No
 
 
 def _launch_checked(
-    launcher: Callable[..., object], argv: list[str], decision: RouteDecision, route_home: str
+    launcher: Callable[..., object],
+    argv: list[str],
+    decision: RouteDecision,
+    route_home: str,
+    pinned: tuple[str, ...],
+    forward: Mapping[str, object],
 ) -> tuple[RouteDecision, object]:
+    if pinned and not _argv0_is_pinned(argv, pinned):
+        raise SubscriptionRouteRefused(decision.engine, "argv0_not_pinned")
     if decision.auth == "subscription" and not _argv_binds_model(argv, decision.model):
         raise SubscriptionRouteRefused(decision.engine, "model_not_bound", decision.model)
     _apply_hermes_adopt_override(decision, route_home)
-    # The checked snapshot, not another read of the caller's mapping.
+    # The checked snapshot, not another read of the caller's mapping. ``forward`` holds only the
+    # launch options _reject_launch_shape let through; none can replace env, shell or the model.
     return decision, launcher(
         list(argv), env=dict(decision.child_env), shell=False,
-        engine_config=decision.engine_config, model=decision.model,
+        engine_config=decision.engine_config, model=decision.model, **forward,
     )
 
 
@@ -696,6 +908,8 @@ def check_cursor_route(
     wrapper: WrapperInstall,
     parent_env: Mapping[str, str] | None = None,
     operator_home: str | None = None,
+    requirements: RouteRequirements | None = None,
+    full_access_acknowledged: bool = False,
 ) -> RouteDecision:
     """Cursor runs as beta when its launcher script and package files match ``wrapper``.
 
@@ -704,14 +918,12 @@ def check_cursor_route(
     """
 
     engine = "cursor"
+    checked = _checked_requirements(engine, requirements, full_access_acknowledged)
     if wrapper is None:
         raise SubscriptionRouteRefused(engine, "wrapper_pin_missing")
     frozen = _checked_baseline(engine, child_env, route_home, parent_env, operator_home)
-    try:
-        verify_package_pin(engine, wrapper)
-    except WrapperPinRefused as exc:
-        raise SubscriptionRouteRefused(engine, exc.cause, exc.detail) from None
-    return RouteDecision(engine, "", "", (), "wrapper", "", (), "", True, frozen)
+    _verify_wrapper(engine, wrapper, checked)
+    return RouteDecision(engine, "", "", checked.flags, "wrapper", "", (), "", True, frozen)
 
 
 def guard_cursor_then_spawn(
@@ -723,15 +935,22 @@ def guard_cursor_then_spawn(
     wrapper: WrapperInstall,
     parent_env: Mapping[str, str] | None = None,
     operator_home: str | None = None,
+    requirements: RouteRequirements | None = None,
+    full_access_acknowledged: bool = False,
     **launch_kwargs: object,
 ) -> tuple[RouteDecision, object]:
-    """``check_cursor_route`` then the launcher, with the checked env only."""
+    """``check_cursor_route`` then the launcher, with the checked env only.
 
-    _reject_launch_shape("cursor", argv, launch_kwargs)
+    ``argv[0]`` must be an absolute path that resolves to the pinned ``wrapper.launcher_path``.
+    Launch options follow the same rules as ``guard_then_spawn``.
+    """
+
+    forward = _reject_launch_shape("cursor", argv, launch_kwargs, requirements, full_access_acknowledged)
     decision = check_cursor_route(
         child_env, route_home=route_home, wrapper=wrapper, parent_env=parent_env, operator_home=operator_home,
+        requirements=requirements, full_access_acknowledged=full_access_acknowledged,
     )
-    return _launch_checked(launcher, list(argv), decision, route_home)
+    return _launch_checked(launcher, list(argv), decision, route_home, (wrapper.launcher_path,), forward)
 
 
 def check_antigravity_route(
@@ -744,20 +963,25 @@ def check_antigravity_route(
     route_home: str,
     parent_env: Mapping[str, str] | None = None,
     operator_home: str | None = None,
+    requirements: RouteRequirements | None = None,
+    full_access_acknowledged: bool = False,
 ) -> RouteDecision:
-    """Antigravity CLI (``agy``) as a beta wrapper.
+    """Antigravity CLI (``agy``) as a beta wrapper. This is the Google route.
 
     The pin is the version plus the sha256 of the ``agy`` binary and of its launcher.
     Package files are not hashed. The binary is not executed. The child env carries no credential.
+    ``requirements`` and ``full_access_acknowledged`` are validated; neither relaxes this pin.
     """
 
     engine = "antigravity"
+    checked = _checked_requirements(engine, requirements, full_access_acknowledged)
     frozen = _checked_baseline(engine, child_env, route_home, parent_env, operator_home)
     try:
         measured = verify_antigravity_pin(version, binary_path, launcher_path, pin)
     except WrapperPinRefused as exc:
         raise SubscriptionRouteRefused(engine, exc.cause, exc.detail) from None
-    return RouteDecision(engine, "antigravity", "", (), "wrapper", "", (), "", True, frozen, measured.version)
+    return RouteDecision(engine, "antigravity", "", checked.flags, "wrapper", "", (), "", True, frozen,
+                         measured.version)
 
 
 def guard_antigravity_then_spawn(
@@ -772,13 +996,20 @@ def guard_antigravity_then_spawn(
     route_home: str,
     parent_env: Mapping[str, str] | None = None,
     operator_home: str | None = None,
+    requirements: RouteRequirements | None = None,
+    full_access_acknowledged: bool = False,
     **launch_kwargs: object,
 ) -> tuple[RouteDecision, object]:
-    """``check_antigravity_route`` then the launcher, with the checked env only."""
+    """``check_antigravity_route`` then the launcher, with the checked env only.
 
-    _reject_launch_shape("antigravity", argv, launch_kwargs)
+    Both ``binary_path`` and ``launcher_path`` are in the pin, so ``argv[0]`` must be an absolute path
+    that resolves to one of those two files. Launch options follow the same rules as ``guard_then_spawn``.
+    """
+
+    forward = _reject_launch_shape("antigravity", argv, launch_kwargs, requirements, full_access_acknowledged)
     decision = check_antigravity_route(
         child_env, version=version, binary_path=binary_path, launcher_path=launcher_path, pin=pin,
         route_home=route_home, parent_env=parent_env, operator_home=operator_home,
+        requirements=requirements, full_access_acknowledged=full_access_acknowledged,
     )
-    return _launch_checked(launcher, list(argv), decision, route_home)
+    return _launch_checked(launcher, list(argv), decision, route_home, (binary_path, launcher_path), forward)

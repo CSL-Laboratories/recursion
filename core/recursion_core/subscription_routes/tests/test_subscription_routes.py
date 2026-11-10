@@ -68,7 +68,8 @@ class _Base(unittest.TestCase):
         # section 2, E9). Added here for Hermes unless a test turns it off to show the refusal.
         if hermes_override and engine == "hermes" and HERMES_ADOPT_EXTERNAL_LOGINS not in profile:
             profile = {**profile, HERMES_ADOPT_EXTERNAL_LOGINS: False}
-        argv = [engine, "run"]
+        # Pi and Hermes are pinned: argv[0] must be the pinned launcher path, not a PATH name.
+        argv = [self.wrapper.launcher_path if engine in ("pi", "hermes") else engine, "run"]
         model = profile.get("model")
         if isinstance(model, str) and "/" in model and model.split("/", 1)[1].strip():
             argv.append(model)

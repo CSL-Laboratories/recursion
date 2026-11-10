@@ -207,7 +207,10 @@ class ControlAPI:
                     current.update(state="starting", cgroup=None, engine=params["engine"], start_key=start_key,
                                    started_at=self._clock())
                     rec = current
-            self._reg("put", rec)  # launch intent: nothing runs that the registry cannot list, stop or dedupe
+            # Launch intent, then keep the committed snapshot (its generation) on this record. A later
+            # outage must not leave Stop holding a copy that has no generation.
+            if self._commit(rec) != "ok":
+                raise _RegistryError("put:StaleGeneration")
             self._failed.discard(run_id)
         try:
             handle = self._starter({**params, "run_id": run_id})
@@ -286,13 +289,24 @@ class ControlAPI:
             return False
 
     def _commit(self, rec: dict) -> str:
-        """``ok``, ``stale``, or raise ``_RegistryError``. A stale write leaves the registry untouched."""
+        """``ok``, ``stale``, or raise ``_RegistryError``. A stale write leaves the registry untouched.
+
+        On success ``rec`` becomes the snapshot this put stored, not a later read. A registry that does
+        not return that snapshot is refreshed in full, so a newer generation is never paired with an
+        older payload.
+        """
         try:
-            self._registry.put(rec)
+            payload = dict(rec)
+            payload.pop("_cgroup_reconfirmed", None)
+            stored = self._registry.put(payload)
         except StaleGeneration:
             return "stale"
         except Exception as err:
             raise _RegistryError(f"put:{type(err).__name__}") from err
+        if isinstance(stored, dict):
+            rec.clear()
+            rec.update(stored)
+            return "ok"
         self._refresh(rec)
         return "ok"
 
@@ -303,9 +317,8 @@ class ControlAPI:
             return
         if fresh is None:
             return
-        rec["generation"] = fresh["generation"]
-        rec["members"] = list(fresh.get("members") or [])
-        rec["stop_attestation"] = fresh.get("stop_attestation")
+        rec.clear()
+        rec.update(fresh)
 
     def _reread(self, rec: dict) -> dict | None:
         try:
@@ -335,11 +348,15 @@ class ControlAPI:
         if fresh.get("state") == "stopped" or fresh.get("stop") is not None or rec["run_id"] in self._stop_wanted:
             fresh["cgroup"] = fresh.get("cgroup") or cgroup
             self._launched[rec["run_id"]] = dict(fresh)
-            if fresh.get("state") != "stopped":
-                self._stop(fresh)
+            if fresh.get("state") == "stopped":
+                rec.clear()
+                rec.update(fresh)
+                return True
+            stop = self._stop(fresh)
             rec.clear()
             rec.update(fresh)
-            return fresh.get("state") == "stopped" or self._launched.get(rec["run_id"]) is None
+            # A local "stopped" is not persistence. The stop's recorded flag is the only success signal.
+            return stop.get("recorded") is not False
         fresh.update(state="running", cgroup=cgroup or fresh.get("cgroup"))
         self._launched[rec["run_id"]] = dict(fresh)
         try:
@@ -360,15 +377,25 @@ class ControlAPI:
         return bool(checker(pid))
 
     def _block_stop(self, rec: dict) -> str | None:
-        """A stop is not attested while a member's process is still alive."""
-        for member in rec.get("members") or []:
-            if self._process_alive(member.get("pid")):
-                return "member_alive"
+        """A stop is not attested while a member's process is still alive.
+
+        An error from the process table is not proof the member is gone, so it stays a pending reason
+        instead of escaping ``call``.
+        """
+        try:
+            for member in rec.get("members") or []:
+                if self._process_alive(member.get("pid")):
+                    return "member_alive"
+        except Exception as err:
+            return f"cleanup_error:{type(err).__name__}"
         return None
 
-    def _attestation(self, rec: dict) -> dict:
+    def _attestation(self, rec: dict) -> dict | None:
+        """Proof for the cgroup identity on ``rec``. None when that record has no generation to bind."""
+        if "generation" not in rec:
+            return None
         members = rec.get("members") or []
-        return {"proof": "empty", "cgroup": rec.get("cgroup"),
+        return {"proof": "empty", "cgroup": rec.get("cgroup"), "cgroup_marker": rec.get("cgroup_marker"),
                 "member_ids": sorted(member["member_id"] for member in members),
                 "generation": rec["generation"]}
 
@@ -457,8 +484,14 @@ class ControlAPI:
         blocked = self._block_stop(rec)
         if blocked:  # confirm said empty, but a member is still alive: that is not an attested stop
             return self._pending(rec, blocked)
+        proof = self._attestation(rec)
+        if proof is None:  # cleanup ran, but this copy cannot name a generation: typed, not KeyError
+            res = {"code": STOPPED, "run_id": run_id, "state": "stopped", "repeat": not first, "recorded": False}
+            if run_id in self._launched:
+                self._launched[run_id] = dict(rec, state="stopped")
+            return res
         rec["state"] = "stopped"
-        rec["stop_attestation"] = self._attestation(rec)
+        rec["stop_attestation"] = proof
         rec["stop"].update(checks=rec["stop"]["checks"] + 1, reason=None)
         res = {"code": STOPPED, "run_id": run_id, "state": "stopped", "repeat": not first}
         return self._recorded(res, rec)
@@ -493,6 +526,41 @@ class ControlAPI:
             fresh = self._reread(rec)
             if fresh is None:
                 outcome = "down"
+            elif fresh.get("state") == "stopped":
+                # An older pending or populated result must not demote a stop that already committed.
+                rec.clear()
+                rec.update(fresh)
+                res = {"code": STOPPED, "run_id": fresh["run_id"], "state": "stopped", "repeat": True}
+                outcome = "ok"
+            elif res.get("code") == STOPPED and (
+                fresh.get("cgroup") != rec.get("cgroup") or fresh.get("cgroup_marker") != rec.get("cgroup_marker")
+            ):
+                # The empty result belongs to the cgroup we confirmed, not to the one stored now.
+                # One reconfirm: a second identity change stays pending rather than recursing.
+                if rec.get("_cgroup_reconfirmed"):
+                    fresh["stop"] = dict(rec["stop"]) if rec.get("stop") else fresh.get("stop")
+                    fresh["state"] = "stop_pending"
+                    if fresh.get("stop") is None:
+                        fresh["stop"] = {"requested_at": self._clock(), "checks": 0, "reason": None,
+                                         "requested": False}
+                    fresh["stop"].update(checks=fresh["stop"].get("checks", 0) + 1, reason="cgroup_changed")
+                    fresh["stop_attestation"] = None
+                    res = {"code": PENDING, "run_id": rec["run_id"], "state": "pending", "reason": "cgroup_changed"}
+                    try:
+                        outcome = self._commit(fresh)
+                    except _RegistryError:
+                        outcome = "down"
+                    rec.clear()
+                    rec.update(fresh)
+                else:
+                    if isinstance(fresh.get("stop"), dict):
+                        fresh["stop"] = dict(fresh["stop"])
+                        fresh["stop"]["requested"] = False
+                    fresh["_cgroup_reconfirmed"] = True
+                    result = self._stop(fresh)
+                    rec.clear()
+                    rec.update(fresh)
+                    return result
             else:
                 fresh["stop"] = dict(rec["stop"]) if rec.get("stop") else fresh.get("stop")
                 if res.get("code") == STOPPED:

@@ -300,10 +300,10 @@ class FailingRegistry(InMemoryRunRegistry):
         self.fail_puts: str | bool = False
         self.fail_reads = False
 
-    def put(self, record: dict) -> None:
+    def put(self, record: dict):
         if self.fail_puts is True or self.fail_puts == record["state"]:
             raise OSError("disk")
-        super().put(record)
+        return super().put(record)
 
     def get(self, run_id: str):
         if self.fail_reads:

@@ -9,18 +9,22 @@ control API only sees these two interfaces, and tests fake them. A run record is
      "stop": None | {"requested_at", "checks", "reason", "requested"},
      "start_key": None | {"client_key", "engine", "prompt_sha256"},
      "generation": <int>,
+     "cgroup_marker": None | "<inode-like identity of that cgroup>",
      "members": [{"member_id", "pid"}],
-     "stop_attestation": None | {"proof": "empty", "cgroup", "member_ids", "generation"}}
+     "stop_attestation": None | {"proof": "empty", "cgroup", "cgroup_marker", "member_ids", "generation"}}
 
 ``start_key`` is stored with the record so start dedupe survives a daemon restart: a durable registry
 must persist it and answer ``find_start`` from what it persisted. A ``starting`` record is the launch
 intent the control API writes before it calls the starter; ``cgroup`` is None until the launch is recorded.
 
-Updates are a compare-and-swap on ``generation``. ``put`` of an existing run stores the record only when
-``record["generation"]`` is the generation ``get`` returned; the stored generation becomes that value plus
-one. A writer that read an older generation raises ``StaleGeneration`` and does not overwrite a stop.
-``state == "stopped"`` is stored only with an attestation that names this generation and the current
-member ids, and only when none of those members is still alive. A member join after that stop is refused.
+Updates are a compare-and-swap on ``(generation, state)``. ``put`` of an existing run stores the record
+only when ``record["generation"]`` is the generation ``get`` returned and the write does not leave
+``stopped``; the stored generation becomes that value plus one. A writer that read an older generation,
+or that would reopen a stopped run, raises ``StaleGeneration`` and does not overwrite the stop.
+``state == "stopped"`` is terminal. It is stored only with an attestation that names this generation,
+the cgroup path and its marker, and the current member ids, and only when none of those members is
+still alive. A later update that changes that cgroup identity is refused. A member join after that
+stop is refused.
 """
 
 from __future__ import annotations
@@ -111,9 +115,11 @@ class OwnerLockTable:
 
     def release(self, owner: str, keys: list[str]) -> None:
         with self._cv:
-            for key in sorted(set(keys)):
+            ordered = sorted(set(keys))
+            for key in ordered:  # the whole set must be owned before any key is dropped
                 if self._owner.get(key) != owner:
                     raise LockNotHeld(key)
+            for key in ordered:
                 self._count[key] -= 1
                 if self._count[key] == 0:
                     del self._count[key]
@@ -134,7 +140,7 @@ class RunRegistry(Protocol):
 
     def list(self) -> list[dict]: ...  # copies
 
-    def put(self, record: dict) -> None: ...
+    def put(self, record: dict) -> dict | None: ...  # the stored copy, when the registry returns one
 
     def find_start(self, tenant: str, client_key: str) -> dict | None: ...  # a copy of the run started with it
 
@@ -168,6 +174,7 @@ class InMemoryRunRegistry:
         self._lock = threading.Lock()
         self.locks = OwnerLockTable()
         self._processes = processes
+        self._marker = 0
         self.commit_gate: Callable[[dict], None] | None = None
         self._runs: dict[str, dict] = {}
         self._starts: dict[tuple[str, str], list[str]] = {}  # (tenant, client_key) -> run ids, first seen first
@@ -230,35 +237,37 @@ class InMemoryRunRegistry:
         with self._lock:
             return [copy.deepcopy(self._runs[k]) for k in sorted(self._runs)]
 
-    def put(self, record: dict) -> None:
-        """Insert a new run, or replace one when ``record["generation"]`` is current.
+    def put(self, record: dict) -> dict:
+        """Insert a new run, or replace one when ``(generation, state)`` is still current.
 
-        An update that omits ``generation``, or carries an older one, raises ``StaleGeneration``
-        and leaves the stored record unchanged. A transition to ``stopped`` raises ``StopUnattested``
-        unless the attestation names this generation and every current member is gone.
+        An update that omits ``generation``, carries an older one, or would leave ``stopped``,
+        raises ``StaleGeneration`` and leaves the stored record unchanged. A transition to
+        ``stopped`` raises ``StopUnattested`` unless the attestation names this generation, the
+        cgroup path and its marker, and every current member is gone. Returns the stored copy.
         """
         if self.commit_gate is None:
             with self._lock:
-                self._commit_locked(record)
-            return
+                return self._commit_locked(record)
         with self._lock:
             self._commit_locked(record, store=False)
             snapshot = {"op": "put", "run_id": record["run_id"], "generation": record.get("generation")}
         self.commit_gate(snapshot)
         with self._lock:
-            self._commit_locked(record)
+            return self._commit_locked(record)
 
     def compare_and_swap(self, run_id: str, expected_generation: int, record: dict) -> dict:
         """Store ``record`` only when the run's generation is still ``expected_generation``.
 
         ``expected_generation`` 0 inserts. On success the stored generation is one higher, and the
-        returned value is a copy of what was stored.
+        returned value is a copy of what was stored. ``stopped`` is terminal: a write that keeps the
+        generation but changes the state back to running is a stale compare.
         """
         rec = copy.deepcopy(record)
         rec["run_id"] = run_id
         rec["generation"] = expected_generation
-        self.put(rec)
-        stored = self.get(run_id)
+        stored = self.put(rec)
+        if not isinstance(stored, dict):  # a subclass that does not return the snapshot
+            stored = self.get(run_id)
         if stored is None:  # a gate or a subclass refused the write after a passing check
             raise StaleGeneration(run_id, expected_generation, None)
         return stored
@@ -294,10 +303,11 @@ class InMemoryRunRegistry:
         reaped: list[dict] = []
         with self._lock:
             for run_id, rec in list(self._runs.items()):
-                dead = [member for member in rec.get("members") or [] if not is_alive(member["pid"])]
+                live, dead = [], []
+                for member in rec.get("members") or []:  # one sample per pid; the receipt is that partition
+                    (dead if not is_alive(member["pid"]) else live).append(member)
                 if not dead:
                     continue
-                live = [member for member in rec["members"] if is_alive(member["pid"])]
                 updated = copy.deepcopy(rec)
                 updated["members"] = live
                 updated["generation"] = rec["generation"] + 1
@@ -308,7 +318,7 @@ class InMemoryRunRegistry:
             reaped.extend(self._drop_dangling_index())
         return reaped
 
-    def _commit_locked(self, record: dict, *, store: bool = True) -> None:
+    def _commit_locked(self, record: dict, *, store: bool = True) -> dict:
         run_id = record["run_id"]
         current = self._runs.get(run_id)
         if current is None:
@@ -317,30 +327,73 @@ class InMemoryRunRegistry:
             stored = self._apply(None, 0, record)
         else:
             expected = record.get("generation", None)
-            if expected != current["generation"]:
+            if not isinstance(expected, int) or expected != current["generation"]:
                 raise StaleGeneration(run_id, expected if isinstance(expected, int) else None, current["generation"])
+            # The generation matches a stopped record. A payload that is not itself stopped is a
+            # different state, so the compare fails and the stop stays terminal.
+            if current.get("state") == "stopped" and record.get("state") != "stopped":
+                raise StaleGeneration(run_id, expected, current["generation"])
             stored = self._apply(current, expected, record)
         if store:
             self._store(stored)
+        return copy.deepcopy(stored)
+
+    def _new_marker(self) -> str:
+        self._marker += 1
+        return f"cg-{self._marker}"
+
+    def _bind_cgroup(self, current: dict | None, stored: dict) -> None:
+        """Give ``stored`` a cgroup marker. A new path does not keep the previous path's marker."""
+        path = stored.get("cgroup")
+        if not isinstance(path, str) or not path:
+            stored["cgroup_marker"] = None
+            return
+        previous_path = current.get("cgroup") if current else None
+        previous_marker = current.get("cgroup_marker") if current else None
+        supplied = stored.get("cgroup_marker")
+        if path == previous_path and previous_marker:
+            stored["cgroup_marker"] = supplied or previous_marker
+            return
+        if isinstance(supplied, str) and supplied and supplied != previous_marker:
+            stored["cgroup_marker"] = supplied
+            return
+        stored["cgroup_marker"] = self._new_marker()
 
     def _apply(self, current: dict | None, expected: int, record: dict) -> dict:
         stored = copy.deepcopy(record)
         stored.pop("generation", None)
+        if current is not None and current.get("state") == "stopped":
+            if stored.get("cgroup") != current.get("cgroup"):
+                raise StopUnattested(stored["run_id"])
+            supplied = stored.get("cgroup_marker")
+            if supplied not in (None, current.get("cgroup_marker")):
+                raise StopUnattested(stored["run_id"])
+            attestation = current.get("stop_attestation")
+            if (not isinstance(attestation, dict) or attestation.get("proof") != "empty"
+                    or attestation.get("cgroup") != current.get("cgroup")
+                    or attestation.get("cgroup_marker") != current.get("cgroup_marker")):
+                raise StopUnattested(stored["run_id"])
+            stored["cgroup"] = current["cgroup"]
+            stored["cgroup_marker"] = current["cgroup_marker"]
+            stored["stop_attestation"] = copy.deepcopy(attestation)
+            stored["members"] = []
+            stored["generation"] = expected + 1
+            return stored
+        self._bind_cgroup(current, stored)
         if current is None:
             members = [_member(m) for m in stored.get("members") or []]
         else:
             members = [_member(m) for m in current.get("members") or []]
         if stored.get("state") == "stopped":
-            if current is not None and current.get("state") == "stopped":
-                attestation = current.get("stop_attestation")
-                if not isinstance(attestation, dict) or attestation.get("proof") != "empty":
-                    raise StopUnattested(stored["run_id"])
-                stored["stop_attestation"] = copy.deepcopy(attestation)
-                stored["members"] = []
-            else:
-                if not self._attestation_ok(stored, members, expected):
-                    raise StopUnattested(stored.get("run_id", ""))
-                stored["members"] = []  # proved gone; a stopped run does not keep member rows
+            attestation = stored.get("stop_attestation")
+            minted = current is None or current.get("cgroup") != stored.get("cgroup") or not current.get("cgroup_marker")
+            if (minted and isinstance(attestation, dict) and attestation.get("cgroup_marker") is None
+                    and attestation.get("cgroup") == stored.get("cgroup")):
+                attestation["cgroup_marker"] = stored.get("cgroup_marker")
+                stored["stop_attestation"] = attestation
+            if not self._attestation_ok(stored, members, expected):
+                raise StopUnattested(stored.get("run_id", ""))
+            stored["members"] = []  # proved gone; a stopped run does not keep member rows
         else:
             stored["members"] = members
             stored["stop_attestation"] = None
@@ -353,7 +406,7 @@ class InMemoryRunRegistry:
             return False
         if attestation.get("generation") != expected or attestation.get("cgroup") != record.get("cgroup"):
             return False
-        if not record.get("cgroup"):
+        if not record.get("cgroup") or attestation.get("cgroup_marker") != record.get("cgroup_marker"):
             return False
         member_ids = attestation.get("member_ids")
         if member_ids != sorted(member["member_id"] for member in members):

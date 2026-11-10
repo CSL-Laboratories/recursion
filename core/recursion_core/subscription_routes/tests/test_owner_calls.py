@@ -92,6 +92,9 @@ class _Calls(_Base):
         profile = inputs.pop("use_profile", None) or self.profile()
         if engine == "hermes":
             profile = {**profile, HERMES_ADOPT_EXTERNAL_LOGINS: False}
+            # Hermes is full access only (Lucas, 2026-11-10): a Hermes launch here runs under it
+            # unless the test passes full_access_acknowledged itself.
+            inputs.setdefault("full_access_acknowledged", True)
         env = inputs.pop("use_env", None) or self.env()
         return guard_then_spawn(self.launcher, argv, engine, profile, env, wrapper=self.wrapper, **common, **inputs)
 
@@ -368,7 +371,7 @@ class HermesHomeReuseTests(_Calls):
                 self.refused("hermes_config_blocks_adopt_override", check_route, "hermes",
                              {**self.sub(), HERMES_ADOPT_EXTERNAL_LOGINS: False}, self.bare(),
                              route_home=str(self.home), parent_env=self.parent(), operator_home=str(self.operator),
-                             wrapper=self.wrapper)
+                             wrapper=self.wrapper, full_access_acknowledged=True)
         self.launcher.assert_not_called()
 
     def test_config_that_is_a_link_or_not_a_regular_file_refuses(self) -> None:
@@ -600,7 +603,8 @@ class HermesHomeReuseTests(_Calls):
                 self.refused("route_home_is_operator_home", guard_then_spawn, self.launcher, argv, "hermes", profile,
                              {**self.env(), "HOME": str(home)}, route_home=str(home), parent_env=self.parent(),
                              operator_home=str(self.operator), wrapper=self.wrapper,
-                             requirements=RouteRequirements(owned_hermes_home=str(home)))
+                             requirements=RouteRequirements(owned_hermes_home=str(home)),
+                             full_access_acknowledged=True)
                 self.assertFalse((home / ".hermes").exists())
         self.launcher.assert_not_called()
 
@@ -711,6 +715,10 @@ class FullAccessTests(_Calls):
                 self.assertIn("full_access_profile_acknowledged", decision.flags)
                 self.assertEqual({"env", "shell", "engine_config", "model"}, set(self.launcher.call_args.kwargs))
                 self.launcher.reset_mock()
+                if engine == "hermes":  # full access only: without it there is no decision to carry a flag
+                    self.refused("full_access_required", self.launch, engine, full_access_acknowledged=False)
+                    self.launcher.assert_not_called()
+                    continue
                 decision, _ = self.launch(engine)
                 self.assertNotIn("full_access_profile_acknowledged", decision.flags)
 
@@ -739,6 +747,10 @@ class FullAccessTests(_Calls):
             for engine in self.guards():
                 with self.subTest(engine=engine):
                     self.refused("launch_option_unknown", self.launch, engine, parent_env=parent, start_new_session=True)
+                    if engine == "hermes":  # full access only: the loud environment does not stand in for the bool
+                        self.refused("full_access_required", self.launch, engine, parent_env=parent,
+                                     full_access_acknowledged=False)
+                        continue
                     decision, _ = self.launch(engine, parent_env=parent)
                     self.assertNotIn("full_access_profile_acknowledged", decision.flags)
             os.symlink(self.outside, self.install / "node_modules")
@@ -799,13 +811,15 @@ class GeminiCliDroppedTests(_Calls):
                         profile[HERMES_ADOPT_EXTERNAL_LOGINS] = False
                     self.refused("google_subscription_refused", check_route, engine, profile, self.bare(),
                                  route_home=str(self.home), parent_env=self.parent(),
-                                 operator_home=str(self.operator), wrapper=self.wrapper)
+                                 operator_home=str(self.operator), wrapper=self.wrapper,
+                                 full_access_acknowledged=engine == "hermes")
             # A Gemini API key is not on any engine's API-key list either.
             self.refused("provider_not_allowed", check_route, engine,
                          {**self.profile(provider="gemini", credential_env="GEMINI_API_KEY", model="gemini/m"),
                           **({HERMES_ADOPT_EXTERNAL_LOGINS: False} if engine == "hermes" else {})},
                          {**self.bare(), "GEMINI_API_KEY": FAKE_KEY}, route_home=str(self.home),
-                         parent_env=self.parent(), operator_home=str(self.operator), wrapper=self.wrapper)
+                         parent_env=self.parent(), operator_home=str(self.operator), wrapper=self.wrapper,
+                         full_access_acknowledged=engine == "hermes")
 
     @unittest.skipIf(os.name == "nt", "POSIX home checks")
     def test_antigravity_is_the_google_route(self) -> None:

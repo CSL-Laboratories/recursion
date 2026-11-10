@@ -78,6 +78,8 @@ class _Base(unittest.TestCase):
             parent_env=parent if parent is not None else self.parent(),
             operator_home=str(self.operator),
             wrapper=self.wrapper if engine in ("pi", "hermes") else None,
+            # Hermes is full access only (Lucas, 2026-11-10), so every Hermes case here runs under it.
+            full_access_acknowledged=engine == "hermes",
         )
         # guard_then_spawn writes Hermes's adopt switch into the route home. Drop that file so the
         # next case in this home is not refused for an engine store the test did not create.
@@ -206,7 +208,8 @@ class StoredCredentialTests(_Base):
                 with self.subTest(engine=engine, home=home.name), self.assertRaises(SubscriptionRouteRefused) as caught:
                     profile = self.profile(**({HERMES_ADOPT_EXTERNAL_LOGINS: False} if engine == "hermes" else {}))
                     guard_then_spawn(self.launcher, [engine], engine, profile, self.env(HOME=str(home)),
-                                     route_home=str(home), parent_env=self.parent(), operator_home=str(self.operator))
+                                     route_home=str(home), parent_env=self.parent(), operator_home=str(self.operator),
+                                     full_access_acknowledged=engine == "hermes")
                 self.assertEqual(cause, caught.exception.cause)
         self.launcher.assert_not_called()
 
@@ -357,10 +360,12 @@ class HealthyApiProviderTests(_Base):
                 with self.subTest(engine=engine, provider=provider):
                     env = {"PATH": "/usr/bin:/bin", "HOME": str(self.home), credential: FAKE_KEY}
                     profile = self.profile(provider=provider, credential_env=credential, model=f"{provider}/m")
+                    # A Hermes decision always carries the full-access flag: it only runs that way.
+                    flags = ("full_access_profile_acknowledged",) if engine == "hermes" else ()
                     for _ in range(N):
                         decision, _ = self.spawn(engine, profile, env)
-                        self.assertEqual((engine, provider, credential, ()), (decision.engine, decision.provider,
-                                                                              decision.credential_env, decision.flags))
+                        self.assertEqual((engine, provider, credential, flags), (decision.engine, decision.provider,
+                                                                                 decision.credential_env, decision.flags))
         self.assertEqual(len(ENGINES_UNDER_TEST) * 2 * N, self.launcher.call_count)
         args, kwargs = self.launcher.call_args
         self.assertEqual(env, kwargs["env"])
@@ -368,8 +373,9 @@ class HealthyApiProviderTests(_Base):
     def test_a_parent_subscription_token_is_flagged_when_kept_out_of_the_child(self) -> None:
         parent = self.parent(CLAUDE_CODE_OAUTH_TOKEN=FAKE_OAUTH, ANTHROPIC_OAUTH_TOKEN=FAKE_OAUTH)
         decision, _ = self.spawn("hermes", self.profile(), self.env(), parent)
-        self.assertEqual(("parent_env_has:ANTHROPIC_OAUTH_TOKEN", "parent_env_has:CLAUDE_CODE_OAUTH_TOKEN"),
-                         decision.flags)
+        # Hermes runs under full access only, so its decision carries that flag after the parent flags.
+        self.assertEqual(("parent_env_has:ANTHROPIC_OAUTH_TOKEN", "parent_env_has:CLAUDE_CODE_OAUTH_TOKEN",
+                          "full_access_profile_acknowledged"), decision.flags)
         self.assertNotIn(FAKE_OAUTH, repr(decision))
         self.launcher.assert_called_once()
 

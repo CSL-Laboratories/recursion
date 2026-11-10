@@ -98,7 +98,7 @@ class AllowlistTests(_Base):
         with self.assertRaises(SubscriptionRouteRefused) as caught:
             check_route("hermes", {**self.sub("grok", "grok_sign_in"), HERMES_ADOPT_EXTERNAL_LOGINS: None},
                         self.bare_env(), route_home=str(self.home), parent_env=self.parent(),
-                        operator_home=str(self.operator), wrapper=self.wrapper)
+                        operator_home=str(self.operator), wrapper=self.wrapper, full_access_acknowledged=True)
         self.assertEqual(caught.exception.cause, "hermes_adopt_external_logins_not_off")
         # The Recursion-only key the first draft checked is gone: it is not Hermes's setting.
         self.assertRefusedBeforeSpawn("hermes", self.sub("grok", "grok_sign_in", borrow_claude_code_login=False),
@@ -252,7 +252,8 @@ class AllowlistTests(_Base):
         with mock.patch.object(builtins, "open", guard), mock.patch.object(os, "open", guard):
             decision = check_route("hermes", {**self.sub("grok", "grok_sign_in"), HERMES_ADOPT_EXTERNAL_LOGINS: False},
                                    self.bare_env(), route_home=str(self.home), parent_env=self.parent(),
-                                   operator_home=str(self.operator), wrapper=self.wrapper)
+                                   operator_home=str(self.operator), wrapper=self.wrapper,
+                                   full_access_acknowledged=True)
         self.assertIs(builtins.open, real_open)
         self.assertIn("own_login_store_not_inspected:.hermes", decision.flags)
         self.assertNotIn(FAKE_OAUTH, repr(decision))

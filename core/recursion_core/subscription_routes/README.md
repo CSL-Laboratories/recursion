@@ -11,7 +11,9 @@ reviewed or accepted.
   requirements=..., full_access_acknowledged=...)`
   validates one `pi`, `hermes` or `opencode` profile and the exact child environment, and
   returns a `RouteDecision` or raises `SubscriptionRouteRefused(engine, cause, detail)`.
-  Pi and Hermes require `wrapper` (see Wrapper pins). Cursor and Antigravity CLI use
+  Pi and Hermes require `wrapper` (see Wrapper pins). Hermes is full access only: it also
+  requires `full_access_acknowledged=True` and refuses `hermes_full_access_only` without it
+  (see The full-access profile). Cursor and Antigravity CLI use
   `check_cursor_route` and `check_antigravity_route`.
 - `guard_then_spawn(launcher, argv, ...)` calls `check_route` and only then the launcher,
   always with the checked env and `shell=False`. It refuses `env`, `shell`, `executable`,
@@ -48,7 +50,7 @@ What refuses:
   all (see Hermes route-home reuse).
 
 A subscription variable present only in the parent env is flagged in `RouteDecision.flags`.
-API-key routes (`anthropic`, `openai`) launch.
+API-key routes (`anthropic`, `openai`) launch; on Hermes, only under the full-access profile.
 
 ## Subscription sign-ins (2026-11-08 briefing)
 
@@ -77,6 +79,9 @@ checked against `SUBSCRIPTION_SIGN_INS`:
   `RouteDecision.engine_config` for the driver to pass to Hermes. It is required on every
   platform: on macOS Claude Code's login sits in the login Keychain, which moving HOME does not
   hide. Pi and OpenCode profiles refuse the key as unknown.
+- Every Hermes route (sign-in or API key) also needs the full-access profile; without
+  `full_access_acknowledged=True` it refuses `hermes_full_access_only` before any other check
+  (Lucas, 2026-11-10).
 - The child env carries no credential at all: no API key, no token, no `CODEX_*`. The sign-in
   lives in the engine's own login store in the route home (`.pi`, `.hermes`, or OpenCode's
   `.local/share/opencode` and `.config/opencode`), which the check allows for that engine only,
@@ -157,7 +162,8 @@ under the install root and returns a `PackagePin`. Pass it in a `WrapperInstall`
 `wrapper=` to `check_route` (Pi, Hermes) or `check_cursor_route`. A changed, extra or
 missing file, or a different launcher, refuses `wrapper_pin_mismatch`. OpenCode is not in
 this pin. Cursor's child env carries no credential. A missing pin on Pi or Hermes refuses
-`wrapper_pin_missing`.
+`wrapper_pin_missing`. A Hermes route also needs the full-access profile
+(`hermes_full_access_only` without it); the pin is still required and verified under it.
 
 The rules below hold both when a pin is measured and when it is verified
 (`measure_package_pin` raises `WrapperPinRefused(cause, detail)`; the route checks raise
@@ -232,7 +238,9 @@ Owner call 5. Keyword options passed to a guard are sorted into three groups:
 
 Owner call 4. Hermes's `auth.adopt_external_logins: false` is written to
 `<route_home>/.hermes/config.yaml` before the launcher runs (Hermes defaults that switch to
-true). A second launch in the same home works:
+true). A Hermes route also needs the full-access profile: without it the launch refuses
+`hermes_full_access_only` and nothing below is read or written. A second launch in the same
+home works:
 
 - If `config.yaml` already exists it is reused only when its bytes are exactly
   `auth:\n  adopt_external_logins: false\n` (37 bytes). Any other content, a symlink, a
@@ -320,6 +328,16 @@ meaning match `child_env`'s `ChildRoute.full_access_acknowledged`.
 - This package renders no UI. The driver must show the danger notice when the named
   full-access profile is turned on, and only then pass `True` for that run.
 - A decision made under it carries the flag `full_access_profile_acknowledged`.
+- A Hermes route requires it (Lucas, 2026-11-10: Hermes is full access only and out of the
+  Nov 11 scope). `check_route("hermes", ...)` and `guard_then_spawn` refuse
+  `hermes_full_access_only` unless `full_access_acknowledged=True`. The refusal comes right
+  after the two configured inputs are validated, so a non-bool still refuses
+  `route_full_access_malformed` and a bad `requirements` still refuses
+  `requirements_malformed`; it comes before every profile, env, home and pin check, the
+  launcher is not called and nothing is written to the route home. This is the only
+  Hermes-specific effect: under full access every Hermes rule applies as before, so every
+  Hermes decision carries the flag. Pi, OpenCode, Cursor and Antigravity still launch
+  without it.
 
 What it relaxes:
 
@@ -339,7 +357,9 @@ What it never relaxes:
 - the pin itself (`wrapper_pin_mismatch`, `package_manifest_empty`,
   `install_root_not_absolute`, `launcher_outside_root`, `package_link_dangling`) and the
   `argv[0]` binding (`argv0_not_pinned`);
-- Hermes's `auth.adopt_external_logins: false` and the `config.yaml` rule.
+- Hermes's `auth.adopt_external_logins: false` and the `config.yaml` rule;
+- the pin limits (`wrapper_tree_too_large` at 100,000 entries, `wrapper_file_too_large`,
+  `wrapper_tree_too_deep`) and `engine_store_in_route_home`, for Hermes as for every engine.
 
 ## Refusal codes added on 2026-11-09
 
@@ -363,6 +383,19 @@ What it never relaxes:
 Recursion's own, or a switch that could not be put in place without replacing something
 (the staging rename found `.hermes` filled, or the link into `.hermes` failed). No refusal text or `repr` here carries a key, a token or an env value.
 
+## Refusal codes added on 2026-11-10
+
+| Code | When |
+|---|---|
+| `hermes_full_access_only` | a Hermes route without `full_access_acknowledged=True` (Lucas, 2026-11-10: Hermes is full access only and out of the Nov 11 scope) |
+
+Nothing else changed for Hermes. The 100,000-entry tree cap and the other pin limits, the
+wrapper pin (`wrapper_pin_missing`, `wrapper_pin_mismatch`), the `argv[0]` binding,
+`auth.adopt_external_logins: false`, the exact-bytes `config.yaml` rule and
+`engine_store_in_route_home` are unchanged and still apply under full access. There is no
+auto-update setting and no environment variable for this. `own_loop.py`'s
+`hermes_local_proxy` is not a Hermes launch and is unchanged.
+
 ## Tests
 
 From the repository root (Python 3.11+, standard library only):
@@ -374,7 +407,7 @@ python3 -B -m unittest discover -s core/recursion_core/subscription_routes/tests
 (`-t core` puts `core/` on the import path so `recursion_core` imports; `-t .` fails with
 `ModuleNotFoundError`.) `tools/ci_gate.py` also runs each `core/**/test_*.py` file with `core/`
 on `PYTHONPATH` (CSL-795). `tests/test_owner_calls.py` holds the tests for the 2026-11-09
-owner calls described above.
+owner calls described above, and `tests/test_hermes_full_access.py` the 2026-11-10 one.
 
 ## Evidence
 

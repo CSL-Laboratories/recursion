@@ -97,9 +97,25 @@ Foundry switches are dropped. The child gets one only from the route:
 - **`NO_PROXY` may not name the route host (CSL-839).** While a proxy is set (`HTTP_PROXY`,
   `HTTPS_PROXY`, `ALL_PROXY` or a lowercase name), a `NO_PROXY` / `no_proxy` entry that matches
   the host of the route's `base_url` refuses with `no_proxy_route_host`: the child would reach
-  the route gateway around the proxy. The refusal names the variable, never the entry or the URL.
-  The one exception is `no_proxy_unparseable` (below), whose detail names the entry, unless the
-  entry contains `%`.
+  the route gateway around the proxy.
+  - No `NO_PROXY` refusal shows any text of an entry (owner call, 2026-11-10). That holds for all
+    four causes: `no_proxy_wildcard`, `no_proxy_engine_host`, `no_proxy_route_host` and
+    `no_proxy_unparseable`. Each names only the variable, the entry's position in it and the
+    reason, on one line, for example
+    `NO_PROXY: no_proxy_route_host: entry 2 of NO_PROXY matches the route's base URL host; the entry is not shown`.
+    The position is also on the exception as `EnvRefused.position`, and the text after the cause
+    is `EnvRefused.detail`. Nothing is masked or shortened, because nothing of the entry is
+    printed: an entry can carry userinfo, a comma splits a password across two entries
+    (`http://user:pa,ss@host` is the entries `user:pa` and `ss@host`), and a percent escape can
+    hide an `@` (`pw%40host`). The route URL is never shown either.
+  - The position counts from 1 among that variable's own entries (`no_proxy` does not go on
+    from `NO_PROXY`). The value's outer whitespace is stripped and any run of commas and
+    whitespace is one separator, so a value that starts with a comma has an empty first entry,
+    which counts (`,a%b` is entry 2). For a union cover it is the position of the entry that
+    completes the cover.
+  - The reasons are fixed text: `matches every host` (a `*` entry), `completes a CIDR cover of
+    every IPv4 address`, `matches one of the engine's own hosts`, `matches the route's base URL
+    host`, and the two `is unparseable: ...` reasons below.
   - `NO_PROXY` and `no_proxy` are read as one combined list: the entries of `NO_PROXY`, then
     those of `no_proxy`. Every rule here runs over that list, and a refusal names the variable
     that holds the refusing entry.
@@ -134,35 +150,35 @@ Foundry switches are dropped. The child gets one only from the route:
     `::ffff:0:0/97`, `64:ff9b::/97`, `::/97`) are not a cover. Other IPv4-embedding prefixes
     (`64:ff9b:1::/48`, `2002::/16`, a site NAT64 prefix) are not counted.
   - An entry that cannot be read refuses with its own cause, `no_proxy_unparseable`, on any
-    route (fail closed: a matcher may read it some other way). The detail of this refusal names
-    the entry as written and says why, for example
-    `NO_PROXY: no_proxy_unparseable: entry 'example.com/' is unparseable: a path or trailing slash isn't allowed in a NO_PROXY entry; write a bare host name, or a CIDR block as address/prefix-length`.
-    - The `%` rule: an entry that contains `%` is never shown, in whole or in part, whatever
-      else it holds (a `/`, an `@`), because a percent escape can hide userinfo (`pw%40host`)
-      and nothing here decodes it. Its detail names only the variable and the entry's position:
-      `NO_PROXY: no_proxy_unparseable: entry 2 of NO_PROXY is unparseable: a '%' (zone id or percent escape) isn't allowed in a NO_PROXY entry; the entry is not shown`.
-      The position counts from 1 among that variable's own entries (`no_proxy` does not go on
-      from `NO_PROXY`). The value's outer whitespace is stripped and any run of commas and
-      whitespace is one separator, so a value that starts with a comma has an empty first entry,
-      which counts (`,a%b` is entry 2).
-    - Masking: in any other entry, userinfo is masked. Everything after an optional `scheme://`
-      through the last literal `@` is shown as `***@` (`http://user:pw@host/` is
-      `'http://***@host/'`, `user:pw@host/` is `'***@host/'`).
-    - Cut: an entry longer than 120 characters, after masking, is shown as its first 120
-      characters and `...`; one of exactly 120 is shown whole.
+    route (fail closed: a matcher may read it some other way). Like every `NO_PROXY` refusal it
+    gives the position and the reason, never the entry:
+    `NO_PROXY: no_proxy_unparseable: entry 2 of NO_PROXY is unparseable: a path, a second '/', or a prefix length that isn't plain decimal isn't allowed in a NO_PROXY entry; the entry is not shown`
+    for an entry with a `/`, and
+    `NO_PROXY: no_proxy_unparseable: entry 2 of NO_PROXY is unparseable: a '%' (zone id or percent escape) isn't allowed in a NO_PROXY entry; the entry is not shown`
+    for an entry with a `%`.
 
-    Three kinds of entry are unparseable:
+    Five kinds of entry are unparseable:
     - One that contains `/` and is not a valid CIDR block: `0/0`, `10.0.0.0/33`, `::/129`,
       `abc/8`, `10.0.0.0/`, `/8`. That includes a name with a trailing slash or a path
       (`example.com/`, `http://example.com/`, `.corp/path`, `localhost/`); write the bare name.
-    - One whose part after the last `/` is not a plain decimal prefix length: ASCII digits
+    - One whose part after the `/` is not a plain decimal prefix length: ASCII digits
       only, no sign, no leading zero except `0` itself, within the family's range. A netmask or
       hostmask (`10.0.0.0/255.0.0.0`, `0.0.0.0/0.0.0.0`, `10.0.0.0/0.255.255.255`), `10.0.0.0/08`,
       `10.0.0.0/+8` and `::/0x0` refuse. Such an entry is never matched as a block, for the route
       host or in a union.
+    - One with more than one `/`, counted after a scheme prefix is stripped:
+      `10.1.2.3:8080/path/8`, `a/b/c`, `10.0.0.0/8/8`, `//8`, `http://h/a/b`. Before this rule
+      `10.1.2.3:8080/path/8` was read as the block `10.0.0.0/8`: the prefix was taken after the
+      last `/` and `/path` was dropped with the port. `http://10.0.0.0/8` is still a block: the
+      `//` of the scheme prefix is not counted.
+    - One with a `/` whose IPv4 address carries a `:port` that is not a port: plain ASCII
+      decimal, 1 to 65535, no sign and no leading zero. `1.2.3.4:x/8`, `1.2.3.4:0/8`,
+      `1.2.3.4:65536/8` and `1.2.3.4:/8` refuse. `1.2.3.4:80/8` is read as before: the port is
+      dropped and the entry is the block `1.0.0.0/8`. An entry with no `/` is not touched by this
+      rule.
     - One that contains `%`: an IPv6 zone id (`fe80::1%eth0`, `fe80::1%eth0/64`,
       `[fe80::1%25eth0]`) or a percent escape in a name (`host%2f`). This check runs before the
-      `/` check, so `user:pw%40host/` is reported by position and not shown.
+      `/` check, so `user:pw%40host/` takes the `%` reason.
   - Any other CIDR block never matches a host name: nothing is resolved here. It is checked for
     the route host only; the engine's own hosts are names.
   - `*` or an all-address cover (`no_proxy_wildcard`), an unparseable entry

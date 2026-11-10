@@ -757,6 +757,11 @@ def cells(s: Scratch) -> list[Cell]:
         ("name_slash", "example.com/"), ("url_slash", "http://example.com/"), ("dot_name_path", ".corp/path"),
         ("engine_name_slash", "api.anthropic.com/"), ("localhost_slash", "localhost/"),
         ("in_a_list", "localhost,127.0.0.1 10.0.0.0/33,.corp.example"),
+        # Devin, on 7cd75440; owner call, 2026-11-10: more than one "/" is never a block (the port strip dropped
+        # "/path" and read the first as 10.0.0.0/8), and a ":port" before the "/" must be a decimal port 1-65535.
+        ("port_path_prefix", "10.1.2.3:8080/path/8"), ("three_parts", "a/b/c"), ("two_prefixes", "10.0.0.0/8/8"),
+        ("leading_slashes", "//8"), ("url_two_slashes", "http://h/a/b"), ("port_not_decimal", "1.2.3.4:x/8"),
+        ("port_zero", "1.2.3.4:0/8"), ("port_over", "1.2.3.4:65536/8"),
     ]
     # (2b): what follows the last "/" must be a plain decimal prefix length. A netmask or hostmask, a leading
     # zero, a sign, hex and a non-ASCII digit are not one.
@@ -784,6 +789,10 @@ def cells(s: Scratch) -> list[Cell]:
         for route_name, engine in (("none", cc), ("none_codex", "codex")):
             add("no_proxy_slash_ok", f"nps_ok_noproxy_{name}_{route_name}", {"NO_PROXY": entry},
                 L(both(_same(NO_PROXY=entry), _absent(url))), engine=engine, auth=api, route=no_base)
+    # A decimal port before the one "/" is dropped as before: 1.2.3.4:80/8 is the block 1.0.0.0/8 and launches.
+    for route_name, engine, route in slash_routes:
+        add("no_proxy_slash_ok", f"nps_ok_port_block_{route_name}", {"HTTPS_PROXY": PROXY, "NO_PROXY": "1.2.3.4:80/8"},
+            L(_same(NO_PROXY="1.2.3.4:80/8")), engine=engine, auth=api, route=route)
     return out
 
 

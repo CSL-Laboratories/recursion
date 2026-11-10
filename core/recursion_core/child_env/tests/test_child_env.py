@@ -128,10 +128,10 @@ class CellTests(unittest.TestCase):
         self._assert_all(self._group("no_proxy_open"), 16)
 
     def test_unparseable_no_proxy_entry_cells(self) -> None:
-        self._assert_all(self._group("no_proxy_slash"), 56)
+        self._assert_all(self._group("no_proxy_slash"), 88)
         self._assert_all(self._group("no_proxy_suffix"), 36)
         self._assert_all(self._group("no_proxy_percent"), 24)
-        self._assert_all(self._group("no_proxy_slash_ok"), 8)
+        self._assert_all(self._group("no_proxy_slash_ok"), 12)
 
     def test_a_dot_dot_out_of_a_directory_others_can_write_is_refused(self) -> None:
         self._assert_all(self._group("dotdot"), 5)
@@ -695,8 +695,9 @@ class AuthRouteTests(unittest.TestCase):
                 with self.subTest(base_url=base_url, entry=entry, mode=mode):
                     with self.assertRaises(EnvRefused) as caught:
                         self._no_proxy_route(home, base_url, {**proxy, "NO_PROXY": entry}, mode)
-                    self.assertEqual(("NO_PROXY", "no_proxy_route_host"), (caught.exception.name, caught.exception.cause))
-                    self.assertEqual("NO_PROXY: no_proxy_route_host", str(caught.exception))  # the name, never a value
+                    # The name, the entry's position and the reason, never a value.
+                    position = 4 if entry.startswith("localhost,") else 1
+                    self._assert_position_only(caught.exception, "NO_PROXY", "no_proxy_route_host", position, self.ROUTE_HOST_WHY)
         # Every proxy name counts as a set proxy, and both NO_PROXY names are checked.
         for proxy_name in policy.VALUE_URLS + policy.VALUE_ALL_PROXY:
             for name in policy.NO_PROXY_NAMES:
@@ -852,9 +853,9 @@ class AuthRouteTests(unittest.TestCase):
         gateway, v4 = "https://gateway.example/api", "http://10.1.2.3:4000"
         base_urls = (gateway, v4, "https://[2001:db8::1]:8443", "http://localhost:4000", "http://127.0.0.1:4000", "http://127.1",
                      "http://[::1]:4000", "http://[::ffff:127.0.0.1]:4000")
-        lists = ("{}", "localhost,{}", "localhost,127.0.0.1,::1 {}", "{},localhost", " .corp.example , {} ")
+        lists = (("{}", 1), ("localhost,{}", 2), ("localhost,127.0.0.1,::1 {}", 4), ("{},localhost", 1), (" .corp.example , {} ", 2))
         for entry in all_address:
-            for value in (form.format(entry) for form in lists):
+            for value, position in ((form.format(entry), position) for form, position in lists):
                 for name in policy.NO_PROXY_NAMES:
                     expected = (name, "no_proxy_wildcard")
                     for engine in ENGINE_PROFILES:  # no base URL: the engine-side check alone refuses
@@ -864,8 +865,8 @@ class AuthRouteTests(unittest.TestCase):
                     for base_url in base_urls:
                         with self.subTest(base_url=base_url, value=value, name=name), self.assertRaises(EnvRefused) as caught:
                             self._no_proxy_route(home, base_url, {**proxy, name: value})
-                        self.assertEqual(expected, (caught.exception.name, caught.exception.cause))
-                        self.assertEqual(f"{name}: no_proxy_wildcard", str(caught.exception))  # the name, never a value
+                        # The name, the block's position and the reason, never a value.
+                        self._assert_position_only(caught.exception, name, "no_proxy_wildcard", position, self.COVER_WHY)
         # Every auth mode and every proxy name; split across parent and override, both ways.
         for mode in (SUB, API, CLOUD):
             with self.subTest(mode=mode):
@@ -947,6 +948,8 @@ class AuthRouteTests(unittest.TestCase):
         """While a proxy is set: refused on a no-base-URL route (both engines), a gateway and a loopback gateway."""
 
         proxy = {"HTTPS_PROXY": "http://127.0.0.1:3128"}
+        entries = policy._no_proxy_entries(value)  # the cover is reported at the first entry it is complete at
+        position = next(at for at in range(1, len(entries) + 1) if policy._all_address_blocks(entries[:at]))
         for name in policy.NO_PROXY_NAMES:
             expected = (name, "no_proxy_wildcard")
             for engine in ENGINE_PROFILES:
@@ -957,8 +960,8 @@ class AuthRouteTests(unittest.TestCase):
                              "http://localhost:4000", "http://127.0.0.1:4000", "http://[::1]:4000"):
                 with self.subTest(base_url=base_url, value=value, name=name), self.assertRaises(EnvRefused) as caught:
                     self._no_proxy_route(home, base_url, {**proxy, name: value})
-                self.assertEqual(expected, (caught.exception.name, caught.exception.cause))
-                self.assertEqual(f"{name}: no_proxy_wildcard", str(caught.exception))  # the name, never a value
+                # The name, the completing entry's position and the reason, never a value.
+                self._assert_position_only(caught.exception, name, "no_proxy_wildcard", position, self.COVER_WHY)
 
     def test_the_union_of_no_proxy_blocks_is_a_wildcard_when_it_covers_every_address(self) -> None:
         """Owner call, 2026-11-10 (2a): ``0.0.0.0/1,128.0.0.0/1`` skips the proxy for every host, as ``0.0.0.0/0`` does."""
@@ -1046,18 +1049,18 @@ class AuthRouteTests(unittest.TestCase):
                 self.assertFalse(policy._all_address_blocks(policy._no_proxy_entries(value)), value)
             for parent in ({"NO_PROXY": low, "no_proxy": high}, {"NO_PROXY": high, "no_proxy": low},
                            {"no_proxy": low, "NO_PROXY": high}):
+                # Every block is needed, so the cover is complete at the last block of no_proxy: that entry's position.
+                position = max(at for at, entry in enumerate(policy._no_proxy_entries(parent["no_proxy"]), 1) if "/" in entry)
                 for engine in ENGINE_PROFILES:  # no base URL
                     with self.subTest(engine=engine, split=sorted(parent.items())), self.assertRaises(EnvRefused) as caught:
                         build_child_env(engine, home=home, auth_mode=API, route=ROUTES[API],
                                         parent={"PATH": "/usr/bin", **proxy, **parent})
-                    self.assertEqual(("no_proxy", "no_proxy_wildcard", None),
-                                     (caught.exception.name, caught.exception.cause, caught.exception.detail))
-                    self.assertEqual("no_proxy: no_proxy_wildcard", str(caught.exception))
+                    self._assert_position_only(caught.exception, "no_proxy", "no_proxy_wildcard", position, self.COVER_WHY)
                 for base_url in base_urls:  # a gateway, an IP gateway, loopback gateways
                     with self.subTest(base_url=base_url, split=sorted(parent.items())), self.assertRaises(EnvRefused) as caught:
                         self._no_proxy_route(home, base_url, {**proxy, **parent})
-                    self.assertEqual(("no_proxy", "no_proxy_wildcard"), (caught.exception.name, caught.exception.cause))
-                    self.assertEqual("no_proxy: no_proxy_wildcard", str(caught.exception))  # the name, never a value
+                    # The name, the completing entry's position and the reason, never a value.
+                    self._assert_position_only(caught.exception, "no_proxy", "no_proxy_wildcard", position, self.COVER_WHY)
             # Split across parent and override, both ways; with no proxy set nothing refuses.
             for engine in ENGINE_PROFILES:
                 for parent, overrides in (({**proxy, "NO_PROXY": low}, {"no_proxy": high}), ({"no_proxy": low}, {**proxy, "NO_PROXY": high})):
@@ -1114,8 +1117,7 @@ class AuthRouteTests(unittest.TestCase):
                     self.assertEqual(parent, {k: env[k] for k in parent})
         with self.assertRaises(EnvRefused) as caught:
             self._no_proxy_route(home, v4, {**proxy, "NO_PROXY": "128.0.0.0/2", "no_proxy": "0.0.0.0/1"})
-        self.assertEqual(("no_proxy", "no_proxy_route_host", None),
-                         (caught.exception.name, caught.exception.cause, caught.exception.detail))
+        self._assert_position_only(caught.exception, "no_proxy", "no_proxy_route_host", 1, self.ROUTE_HOST_WHY)
 
     def test_open_no_proxy_covers_still_launch(self) -> None:
         """Open, post-Nov-11 (owner call, 2026-11-10): pinned as launching so closing them is a deliberate change.
@@ -1145,22 +1147,38 @@ class AuthRouteTests(unittest.TestCase):
                                           parent={"PATH": "/usr/bin", **proxy, **parent})
                     self.assertEqual(parent, {k: env[k] for k in parent})
 
-    SLASH_WHY = ("a path or trailing slash isn't allowed in a NO_PROXY entry; write a bare host name, or a CIDR block as "
-                 "address/prefix-length")
+    # What follows "entry N of NAME " in the detail of each NO_PROXY refusal. The text is fixed: it holds nothing of an entry.
+    SLASH_WHY = ("a path, a second '/', or a prefix length that isn't plain decimal isn't allowed in a NO_PROXY entry; "
+                 "the entry is not shown")
     PERCENT_WHY = "a '%' (zone id or percent escape) isn't allowed in a NO_PROXY entry; the entry is not shown"
+    STAR_WHY = "matches every host; the entry is not shown"
+    COVER_WHY = "completes a CIDR cover of every IPv4 address; the entry is not shown"
+    ENGINE_HOST_WHY = "matches one of the engine's own hosts; the entry is not shown"
+    ROUTE_HOST_WHY = "matches the route's base URL host; the entry is not shown"
+    NO_PROXY_WHYS = {
+        "no_proxy_unparseable": ("is unparseable: " + SLASH_WHY, "is unparseable: " + PERCENT_WHY),
+        "no_proxy_wildcard": (STAR_WHY, COVER_WHY),
+        "no_proxy_engine_host": (ENGINE_HOST_WHY,),
+        "no_proxy_route_host": (ROUTE_HOST_WHY,),
+    }
 
-    def _assert_unparseable(self, refused: EnvRefused, name: str, entry: str, why: str, position: int | None = None) -> None:
-        """A "/" entry is shown by repr; a "%" entry (``position`` given) only as its variable and position."""
+    def _assert_position_only(self, refused: EnvRefused, name: str, cause: str, position: int, why: str) -> None:
+        """A NO_PROXY refusal is its variable, its cause, the entry's position and one fixed reason: no entry text."""
 
-        shown = f"entry {entry!r}" if position is None else f"entry {position} of {name}"
-        self.assertEqual((name, "no_proxy_unparseable"), (refused.name, refused.cause))
-        self.assertEqual(f"{shown} is unparseable: {why}", refused.detail)
-        self.assertEqual(f"{name}: no_proxy_unparseable: {shown} is unparseable: {why}", str(refused))
-        self.assertNotIn("wildcard", str(refused))
+        self.assertIn(why, self.NO_PROXY_WHYS[cause])
+        self.assertEqual((name, cause, position), (refused.name, refused.cause, refused.position))
+        self.assertEqual(f"entry {position} of {name} {why}", refused.detail)
+        self.assertEqual(f"{name}: {cause}: entry {position} of {name} {why}", str(refused))  # nothing else is in it
+        self.assertEqual((str(refused),), refused.args)
         self.assertEqual(1, len(str(refused).splitlines()))  # one line, whatever the entry holds
+        self.assertTrue(str(refused).isascii() and str(refused).isprintable())
+        if cause == "no_proxy_unparseable":
+            self.assertNotIn("wildcard", str(refused))
 
-    def _assert_unparseable_on_every_route(self, home: str, value: str, entry: str, why: str,
-                                           position: int | None = None) -> None:
+    def _assert_unparseable(self, refused: EnvRefused, name: str, position: int, why: str) -> None:
+        self._assert_position_only(refused, name, "no_proxy_unparseable", position, "is unparseable: " + why)
+
+    def _assert_unparseable_on_every_route(self, home: str, value: str, position: int, why: str) -> None:
         """While a proxy is set: refused on a no-base-URL route (both engines), a gateway and a loopback gateway."""
 
         proxy = {"HTTPS_PROXY": "http://127.0.0.1:3128"}
@@ -1169,23 +1187,63 @@ class AuthRouteTests(unittest.TestCase):
                 with self.subTest(engine=engine, value=value, name=name), self.assertRaises(EnvRefused) as caught:
                     build_child_env(engine, home=home, auth_mode=API, route=ROUTES[API],
                                     parent={"PATH": "/usr/bin", **proxy, name: value})
-                self._assert_unparseable(caught.exception, name, entry, why, position)
+                self._assert_unparseable(caught.exception, name, position, why)
             for base_url in ("https://gateway.example/api", "http://10.1.2.3:4000", "https://[2001:db8::1]:8443",
                              "http://localhost:4000", "http://127.0.0.1:4000", "http://[::1]:4000"):
                 with self.subTest(base_url=base_url, value=value, name=name), self.assertRaises(EnvRefused) as caught:
                     self._no_proxy_route(home, base_url, {**proxy, name: value})
-                self._assert_unparseable(caught.exception, name, entry, why, position)
+                self._assert_unparseable(caught.exception, name, position, why)
 
     def test_env_refused_shows_a_detail_only_when_it_has_one(self) -> None:
-        plain = EnvRefused("NO_PROXY", "no_proxy_wildcard")
-        self.assertEqual(("NO_PROXY", "no_proxy_wildcard", None, "NO_PROXY: no_proxy_wildcard"),
-                         (plain.name, plain.cause, plain.detail, str(plain)))
+        plain = EnvRefused("PATH", "path_empty_entry")
+        self.assertEqual(("PATH", "path_empty_entry", None, None, "PATH: path_empty_entry"),
+                         (plain.name, plain.cause, plain.detail, plain.position, str(plain)))
         self.assertEqual("-: unknown_engine", str(EnvRefused(None, "unknown_engine")))
-        detailed = EnvRefused("no_proxy", "no_proxy_unparseable", "entry 'a/' is unparseable: why")
-        self.assertEqual(("no_proxy", "no_proxy_unparseable", "entry 'a/' is unparseable: why"),
-                         (detailed.name, detailed.cause, detailed.detail))
-        self.assertEqual("no_proxy: no_proxy_unparseable: entry 'a/' is unparseable: why", str(detailed))
+        detailed = EnvRefused("no_proxy", "no_proxy_unparseable", "entry 2 of no_proxy is unparseable: why", position=2)
+        self.assertEqual(("no_proxy", "no_proxy_unparseable", "entry 2 of no_proxy is unparseable: why", 2),
+                         (detailed.name, detailed.cause, detailed.detail, detailed.position))
+        self.assertEqual("no_proxy: no_proxy_unparseable: entry 2 of no_proxy is unparseable: why", str(detailed))
         self.assertEqual("-: cause: detail", str(EnvRefused(None, "cause", "detail")))
+        self.assertIsNone(EnvRefused(None, "cause", "detail").position)
+        with self.assertRaises(TypeError):  # the position is passed by keyword only
+            EnvRefused("NO_PROXY", "no_proxy_wildcard", "detail", 2)
+
+    def test_every_no_proxy_refusal_gives_the_variable_the_position_and_the_reason(self) -> None:
+        """Owner call, 2026-11-10: one rule for all four NO_PROXY causes. The text of each, written out once."""
+
+        home = _home(self)
+        proxy = {"HTTPS_PROXY": "http://127.0.0.1:3128"}
+        gateway = "https://gateway.example/api"
+        for parent, text in (
+            ({"NO_PROXY": "localhost,*"}, "NO_PROXY: no_proxy_wildcard: entry 2 of NO_PROXY matches every host; the entry is not shown"),
+            ({"NO_PROXY": "localhost", "no_proxy": "0.0.0.0/1,::1,128.0.0.0/1"},
+             "no_proxy: no_proxy_wildcard: entry 3 of no_proxy completes a CIDR cover of every IPv4 address; the entry is not shown"),
+            ({"no_proxy": "0.0.0.0/0"},
+             "no_proxy: no_proxy_wildcard: entry 1 of no_proxy completes a CIDR cover of every IPv4 address; the entry is not shown"),
+            ({"NO_PROXY": "localhost .corp.example,.anthropic.com"},
+             "NO_PROXY: no_proxy_engine_host: entry 3 of NO_PROXY matches one of the engine's own hosts; the entry is not shown"),
+            ({"NO_PROXY": "localhost", "no_proxy": ",gateway.example:8443"},
+             "no_proxy: no_proxy_route_host: entry 2 of no_proxy matches the route's base URL host; the entry is not shown"),
+            ({"NO_PROXY": "localhost,example.com/"},
+             "NO_PROXY: no_proxy_unparseable: entry 2 of NO_PROXY is unparseable: a path, a second '/', or a prefix length that "
+             "isn't plain decimal isn't allowed in a NO_PROXY entry; the entry is not shown"),
+            ({"no_proxy": "fe80::1%eth0/64"},
+             "no_proxy: no_proxy_unparseable: entry 1 of no_proxy is unparseable: a '%' (zone id or percent escape) isn't "
+             "allowed in a NO_PROXY entry; the entry is not shown"),
+        ):
+            with self.subTest(parent=sorted(parent.items())), self.assertRaises(EnvRefused) as caught:
+                self._no_proxy_route(home, gateway, {**proxy, **parent})
+            refused = caught.exception
+            self.assertEqual(text, str(refused))
+            name, cause, detail = text.split(": ", 2)
+            self.assertEqual((name, cause, detail), (refused.name, refused.cause, refused.detail))
+            self._assert_position_only(refused, name, cause, refused.position, detail.split(" ", 4)[4])
+        # A refusal that is not about NO_PROXY has no position and no detail.
+        with self.assertRaises(EnvRefused) as caught:
+            self._no_proxy_route(home, gateway, {"HTTPS_PROXY": "http://u:p@127.0.0.1:3128", "NO_PROXY": "*"})
+        self.assertEqual(("HTTPS_PROXY", "proxy_userinfo", None, None, "HTTPS_PROXY: proxy_userinfo"),
+                         (caught.exception.name, caught.exception.cause, caught.exception.detail, caught.exception.position,
+                          str(caught.exception)))
 
     def test_a_no_proxy_entry_with_a_slash_that_is_no_cidr_block_is_unparseable(self) -> None:
         """Owner calls, 2026-11-10 (1, 2b), fail closed: a matcher may read ``0/0`` or ``10.0.0.0/33`` as a block."""
@@ -1202,26 +1260,26 @@ class AuthRouteTests(unittest.TestCase):
         )
         for entry in malformed:
             self.assertFalse(policy._all_address_blocks(policy._no_proxy_entries(entry)), entry)  # no cover: its own rule
-            for value in (entry, f"localhost,{entry}", f"{entry} 127.0.0.1,::1", f" .corp.example , {entry} "):
-                self._assert_unparseable_on_every_route(home, value, entry, self.SLASH_WHY)
-        # The text itself, written out once: the variable, the cause, the entry as written, and why.
+            for value, position in ((entry, 1), (f"localhost,{entry}", 2), (f"{entry} 127.0.0.1,::1", 1),
+                                    (f" .corp.example , {entry} ", 2)):
+                self._assert_unparseable_on_every_route(home, value, position, self.SLASH_WHY)
+        # The text itself, written out once: the variable, the cause, the entry's position, and why. Never the entry.
         with self.assertRaises(EnvRefused) as caught:
             build_child_env("claude_code", home=home, auth_mode=SUB, parent={"PATH": "/usr/bin", **proxy, "NO_PROXY": "api.anthropic.com/"})
         self.assertEqual(
-            "NO_PROXY: no_proxy_unparseable: entry 'api.anthropic.com/' is unparseable: a path or trailing slash isn't allowed "
-            "in a NO_PROXY entry; write a bare host name, or a CIDR block as address/prefix-length", str(caught.exception))
-        # The entry is shown by repr, so a control character, a direction override or a quote cannot dress the line up.
-        for entry, shown in (("example.com/\x1b[2K", "'example.com/\\x1b[2K'"), ("evil/‮gnp", "'evil/\\u202egnp'"),
-                             ("a'b/", '"a\'b/"'), ("x/\x00", "'x/\\x00'")):
-            with self.subTest(entry=entry), self.assertRaises(EnvRefused) as caught:
+            "NO_PROXY: no_proxy_unparseable: entry 1 of NO_PROXY is unparseable: a path, a second '/', or a prefix length that "
+            "isn't plain decimal isn't allowed in a NO_PROXY entry; the entry is not shown", str(caught.exception))
+        # No text of the entry is shown, so a control character, a direction override or a quote in it cannot dress the line up.
+        for entry in ("example.com/\x1b[2K", "evil/‮gnp", "a'b/", "x/\x00", "a" * 5000 + "/", "10.0.0.0/" + "9" * 5000):
+            with self.subTest(entry=entry[:20]), self.assertRaises(EnvRefused) as caught:
                 build_child_env("codex", home=home, auth_mode=API, route=ROUTES[API],
                                 parent={"PATH": "/usr/bin", **proxy, "no_proxy": f"localhost,{entry}"})
-            self._assert_unparseable(caught.exception, "no_proxy", entry, self.SLASH_WHY)
-            self.assertEqual(f"entry {shown} is unparseable: {self.SLASH_WHY}", caught.exception.detail)
+            self._assert_unparseable(caught.exception, "no_proxy", 2, self.SLASH_WHY)
+            self.assertLess(len(str(caught.exception)), 200)  # the same short line, however long the entry
         with self.assertRaises(EnvRefused) as caught:  # a line break ends the entry: the detail holds none
             build_child_env("codex", home=home, auth_mode=API, route=ROUTES[API],
                             parent={"PATH": "/usr/bin", **proxy, "NO_PROXY": "example.com/\nNO_PROXY: ok"})
-        self._assert_unparseable(caught.exception, "NO_PROXY", "example.com/", self.SLASH_WHY)
+        self._assert_unparseable(caught.exception, "NO_PROXY", 1, self.SLASH_WHY)
         # A "/" entry that is a CIDR block keeps its behaviour, and with no proxy set nothing refuses.
         for engine in ENGINE_PROFILES:
             for parent in ({**proxy, "NO_PROXY": "10.0.0.0/8,10.1.2.3/8,[2001:db8::]/32,10.0.0.0:80/8,10.0.0.0./32,::/128"},
@@ -1241,17 +1299,73 @@ class AuthRouteTests(unittest.TestCase):
             ({"NO_PROXY": "*,10.0.0.0/33"}, ("NO_PROXY", "no_proxy_wildcard")),
             ({"NO_PROXY": "0.0.0.0/0,10.0.0.0/33"}, ("NO_PROXY", "no_proxy_wildcard")),
             ({"NO_PROXY": "10.0.0.0/33,0.0.0.0/0"}, ("NO_PROXY", "no_proxy_unparseable")),
+            # A second "/" keeps the same place in that order: before a route-host, engine-host or "*" entry after it.
+            ({"NO_PROXY": "10.1.2.3:8080/path/8,gateway.example"}, ("NO_PROXY", "no_proxy_unparseable")),
+            ({"NO_PROXY": "10.1.2.3:8080/path/8,api.anthropic.com"}, ("NO_PROXY", "no_proxy_unparseable")),
+            ({"NO_PROXY": "10.1.2.3:8080/path/8,*"}, ("NO_PROXY", "no_proxy_unparseable")),
+            ({"NO_PROXY": "*,10.1.2.3:8080/path/8"}, ("NO_PROXY", "no_proxy_wildcard")),
+            ({"NO_PROXY": "claude.ai", "no_proxy": "a/b/c"}, ("NO_PROXY", "no_proxy_engine_host")),
+            ({"NO_PROXY": "0.0.0.0/1,10.0.0.0/8/8,128.0.0.0/1"}, ("NO_PROXY", "no_proxy_unparseable")),
+            ({"NO_PROXY": "0.0.0.0/1,128.0.0.0/1,10.0.0.0/8/8"}, ("NO_PROXY", "no_proxy_wildcard")),
         ):
             with self.subTest(parent=sorted(parent.items())), self.assertRaises(EnvRefused) as caught:
                 self._no_proxy_route(home, "https://gateway.example/api", {**proxy, **parent})
             self.assertEqual(expected, (caught.exception.name, caught.exception.cause))
-        # Not in scope here, kept as it was: a non-numeric port before the prefix is dropped like a port, so this
-        # is still read as the block 1.0.0.0/8 and launches.
-        self.assertEqual(ipaddress.ip_network("1.0.0.0/8"), policy._no_proxy_ip("1.2.3.4:x/8"))
+
+    def test_a_no_proxy_entry_with_a_second_slash_or_a_bad_port_is_unparseable(self) -> None:
+        """Devin, on 7cd75440; owner call, 2026-11-10: ``10.1.2.3:8080/path/8`` was read as ``10.0.0.0/8`` and launched.
+
+        The prefix was taken after the last "/" and everything after the first ":" was dropped as a port, ``/path``
+        with it. An entry with more than one "/" (after the scheme prefix is stripped) is now unparseable. The port
+        rule follows the reviewer's recommendation to read the whole address-and-port part before dropping a port:
+        in a "/" entry, a ":port" on an IPv4 address must be plain ASCII decimal 1-65535.
+        """
+
+        home = _home(self)
+        proxy = {"HTTPS_PROXY": "http://127.0.0.1:3128"}
+        second_slash = ("10.1.2.3:8080/path/8", "a/b/c", "10.0.0.0/8/8", "//8", "http://h/a/b", "10.1.2.3:8080//8", "/10.0.0.0/8",
+                        "http://10.1.2.3:8080/path/8", "10.1.2.3/path/8", "[::1]:80/x/128", "::/0/0", "0.0.0.0/0/0", "///",
+                        "10.1.2.3:8080/8/path", "HTTPS://10.1.2.3:8080/Path/8")
+        bad_port = ("1.2.3.4:x/8", "1.2.3.4:0/8", "1.2.3.4:65536/8", "1.2.3.4:/8", "1.2.3.4:080/8", "1.2.3.4:00/8", "1.2.3.4:+80/8",
+                    "1.2.3.4:-1/8", "1.2.3.4:8e1/8", "1.2.3.4:0x50/8", "1.2.3.4:99999/8", "1.2.3.4:100000/8", "1.2.3.4:٨٠/8",
+                    "1.2.3.4:８０/8", "1.2.3.4:80x/8", "0.0.0.0:x/0", "http://1.2.3.4:x/8")
+        for entry in second_slash + bad_port:
+            stripped = policy._no_proxy_entries(entry)[0]  # as the rules read it: lowercased, no scheme prefix
+            self.assertIsNone(policy._no_proxy_ip(stripped), entry)
+            self.assertIsNone(policy._no_proxy_ip_hit(stripped, policy._host_addresses("10.1.2.3")), entry)
+            self.assertFalse(policy._all_address_blocks([stripped]), entry)
+            self.assertFalse(policy._no_proxy_route_bypass(entry, "10.1.2.3"), entry)  # never a block that holds the host
+            for value, position in ((entry, 1), (f"localhost,{entry}", 2), (f" .corp.example , {entry} 127.0.0.1", 2)):
+                self._assert_unparseable_on_every_route(home, value, position, self.SLASH_WHY)
+        for entry in second_slash:
+            self.assertGreater(policy._no_proxy_entries(entry)[0].count("/"), 1, entry)
+        # A scheme prefix is stripped before the count, so its "//" is not counted: this is still the block 10.0.0.0/8.
+        self.assertEqual(["10.0.0.0/8"], policy._no_proxy_entries("http://10.0.0.0/8"))
+        # 1.2.3.4:80/8 is read as before: the port is dropped and the entry is the block 1.0.0.0/8. It covers no engine
+        # host and is no all-address cover, so it launches with no base URL, on a gateway outside the block and on a
+        # loopback gateway; on a route whose host is inside the block it refuses with no_proxy_route_host.
+        for entry in ("1.2.3.4:80/8", "1.2.3.4:1/8", "1.2.3.4:65535/8", "http://1.2.3.4:80/8", "10.0.0.0:80/8"):
+            block = "10.0.0.0/8" if entry.startswith("10.") else "1.0.0.0/8"
+            self.assertEqual(ipaddress.ip_network(block), policy._no_proxy_ip(policy._no_proxy_entries(entry)[0]), entry)
+            for engine in ENGINE_PROFILES:
+                env = build_child_env(engine, home=home, auth_mode=API, route=ROUTES[API],
+                                      parent={"PATH": "/usr/bin", **proxy, "NO_PROXY": entry})
+                self.assertEqual(entry, env["NO_PROXY"])
+            for base_url in ("https://gateway.example/api", "http://192.0.2.1:4000", "http://localhost:4000"):
+                self.assertEqual(entry, self._no_proxy_route(home, base_url, {**proxy, "NO_PROXY": entry})["NO_PROXY"])
+            inside = "http://10.1.2.3:4000" if entry.startswith("10.") else "http://1.9.9.9:4000"
+            with self.subTest(entry=entry), self.assertRaises(EnvRefused) as caught:
+                self._no_proxy_route(home, inside, {**proxy, "NO_PROXY": f"localhost,{entry}"})
+            self._assert_position_only(caught.exception, "NO_PROXY", "no_proxy_route_host", 2, self.ROUTE_HOST_WHY)
+        # Unchanged, outside this rule: with no "/" the part after the one ":" is still dropped unread, and a
+        # bracketed address keeps its digits-only port check.
+        self.assertEqual(ipaddress.ip_address("1.2.3.4"), policy._no_proxy_ip("1.2.3.4:x"))
+        self.assertEqual(ipaddress.ip_network("::/96"), policy._no_proxy_ip("[::]:443/96"))
+        # With no proxy set nothing refuses.
         for engine in ENGINE_PROFILES:
-            env = build_child_env(engine, home=home, auth_mode=API, route=ROUTES[API],
-                                  parent={"PATH": "/usr/bin", **proxy, "NO_PROXY": "1.2.3.4:x/8"})
-            self.assertEqual("1.2.3.4:x/8", env["NO_PROXY"])
+            parent = {"NO_PROXY": "10.1.2.3:8080/path/8,1.2.3.4:x/8", "no_proxy": "a/b/c"}
+            env = build_child_env(engine, home=home, auth_mode=API, route=ROUTES[API], parent={"PATH": "/usr/bin", **parent})
+            self.assertEqual(parent, {k: env[k] for k in parent})
 
     def test_a_no_proxy_prefix_that_is_not_a_plain_decimal_length_is_unparseable(self) -> None:
         """Owner call, 2026-11-10 (2b): a netmask, a leading zero, a sign, hex or a non-ASCII digit is no prefix length."""
@@ -1272,10 +1386,10 @@ class AuthRouteTests(unittest.TestCase):
             self.assertIsNone(policy._no_proxy_ip(entry), entry)
             self.assertIsNone(policy._no_proxy_ip_hit(entry, policy._host_addresses("10.1.2.3")), entry)
             self.assertFalse(policy._all_address_blocks([entry]), entry)
-            for value in (entry, f"localhost,{entry}", f" .corp.example , {entry} 127.0.0.1"):
-                self._assert_unparseable_on_every_route(home, value, entry, self.SLASH_WHY)
+            for value, position in ((entry, 1), (f"localhost,{entry}", 2), (f" .corp.example , {entry} 127.0.0.1", 2)):
+                self._assert_unparseable_on_every_route(home, value, position, self.SLASH_WHY)
         # A space is a separator, so "/ 8" is the entry "10.0.0.0/" and then the entry "8".
-        self._assert_unparseable_on_every_route(home, "10.0.0.0/ 8", "10.0.0.0/", self.SLASH_WHY)
+        self._assert_unparseable_on_every_route(home, "10.0.0.0/ 8", 1, self.SLASH_WHY)
         # A netmask block matches as a CIDR block nowhere: not in a union, not for the route host.
         self.assertFalse(policy._all_address_blocks(["0.0.0.0/128.0.0.0", "128.0.0.0/128.0.0.0"]))
         self.assertFalse(policy._all_address_blocks(["0.0.0.0/1", "128.0.0.0/128.0.0.0"]))
@@ -1296,93 +1410,6 @@ class AuthRouteTests(unittest.TestCase):
                              ("::/0", "::/0"), ("::/128", "::/128"), ("2001:db8::/32", "2001:db8::/32")):
             self.assertEqual(ipaddress.ip_network(block), policy._no_proxy_ip(entry), entry)
 
-    MASK_USER, MASK_PASSWORD = "fakeuser", "fake-pw-not-real"
-
-    def _assert_slash_entry_shown(self, home: str, entry: str, shown: str, absent: tuple[str, ...] = ()) -> None:
-        """A "/" entry, alone and in a list, under both names and for both engines, is shown as ``shown``."""
-
-        proxy = {"HTTPS_PROXY": "http://127.0.0.1:3128"}
-        for value in (entry, f"localhost,{entry}", f" .corp.example , {entry} 127.0.0.1"):
-            for name in policy.NO_PROXY_NAMES:
-                for engine in ENGINE_PROFILES:
-                    with self.subTest(engine=engine, value=value, name=name):
-                        with self.assertRaises(EnvRefused) as caught:
-                            build_child_env(engine, home=home, auth_mode=API, route=ROUTES[API],
-                                            parent={"PATH": "/usr/bin", **proxy, name: value})
-                        refused = caught.exception
-                        self.assertEqual((name, "no_proxy_unparseable"), (refused.name, refused.cause))
-                        self.assertEqual(f"entry {shown} is unparseable: {self.SLASH_WHY}", refused.detail)
-                        self.assertEqual(f"{name}: no_proxy_unparseable: {refused.detail}", str(refused))
-                        for secret in absent:
-                            for text in (str(refused), refused.detail, repr(refused), *refused.args):
-                                self.assertNotIn(secret, text)
-
-    def test_the_unparseable_detail_masks_userinfo_after_a_scheme(self) -> None:
-        """Masking, ``scheme://user:pw@host/``: what follows the scheme through the "@" is shown as ``***@``."""
-
-        home = _home(self)
-        user, password = self.MASK_USER, self.MASK_PASSWORD
-        for entry, shown in (
-            (f"http://{user}:{password}@host/", "'http://***@host/'"),
-            (f"HTTPS://{user}:{password}@Gateway.example:8443/v1", "'HTTPS://***@Gateway.example:8443/v1'"),
-            (f"socks5h://{password}@10.0.0.0/33", "'socks5h://***@10.0.0.0/33'"),
-        ):
-            self.assertEqual(shown, policy._no_proxy_shown(entry))
-            self._assert_slash_entry_shown(home, entry, shown, absent=(user, password))
-
-    def test_the_unparseable_detail_masks_userinfo_without_a_scheme(self) -> None:
-        """Masking, ``user:pw@host/``: with no scheme, everything through the "@" is shown as ``***@``."""
-
-        home = _home(self)
-        user, password = self.MASK_USER, self.MASK_PASSWORD
-        for entry, shown in (
-            (f"{user}:{password}@host/", "'***@host/'"),
-            (f"{password}@10.0.0.0/33", "'***@10.0.0.0/33'"),
-            (f"{user}:{password}@Gateway.example:8443/v1", "'***@Gateway.example:8443/v1'"),
-        ):
-            self.assertEqual(shown, policy._no_proxy_shown(entry))
-            self._assert_slash_entry_shown(home, entry, shown, absent=(user, password))
-
-    def test_the_unparseable_detail_masks_through_the_last_at_sign(self) -> None:
-        """Masking, several "@": everything through the last one is masked, so no earlier part is shown."""
-
-        home = _home(self)
-        user, password = self.MASK_USER, self.MASK_PASSWORD
-        for entry, shown in (
-            (f"http://{user}:{password}@other@host/", "'http://***@host/'"),
-            (f"{user}@{password}@host/", "'***@host/'"),
-            (f"{user}@http://{password}@host/", "'***@host/'"),
-            (f"http://{user}@{password}@@host/", "'http://***@host/'"),
-        ):
-            self.assertEqual(shown, policy._no_proxy_shown(entry))
-            self._assert_slash_entry_shown(home, entry, shown, absent=(user, password))
-
-    def test_the_unparseable_detail_cuts_an_entry_after_120_characters(self) -> None:
-        """The cut: an entry of exactly 120 characters is shown whole, one of 121 as its first 120 and ``...``."""
-
-        home = _home(self)
-        at_120, at_121 = "a" * 119 + "/", "a" * 120 + "/"
-        self.assertEqual((120, 121), (len(at_120), len(at_121)))
-        self.assertEqual(repr(at_120), policy._no_proxy_shown(at_120))
-        self.assertEqual(repr("a" * 120 + "..."), policy._no_proxy_shown(at_121))
-        self._assert_slash_entry_shown(home, at_120, repr(at_120))
-        self._assert_slash_entry_shown(home, at_121, repr(at_121[:120] + "..."))
-        long_suffix = "10.0.0.0/" + "9" * 5000  # far over: still its first 120 characters, on one short line
-        self._assert_slash_entry_shown(home, long_suffix, repr(long_suffix[:120] + "..."))
-        with self.assertRaises(EnvRefused) as caught:
-            build_child_env("codex", home=home, auth_mode=SUB,
-                            parent={"PATH": "/usr/bin", "HTTPS_PROXY": "http://127.0.0.1:3128", "no_proxy": long_suffix})
-        self.assertLess(len(str(caught.exception)), 400)
-        self.assertEqual(1, len(str(caught.exception).splitlines()))
-
-    def test_the_unparseable_detail_masks_before_it_cuts(self) -> None:
-        """Masking comes first, so a long userinfo neither shows nor uses up the 120 characters."""
-
-        home = _home(self)
-        user, password = self.MASK_USER, self.MASK_PASSWORD
-        entry = f"http://{user}:{password * 50}@host/" + "p" * 200
-        self._assert_slash_entry_shown(home, entry, repr("http://***@host/" + "p" * 104 + "..."), absent=(user, password))
-
     def test_a_no_proxy_entry_with_a_percent_sign_is_unparseable(self) -> None:
         """Owner call, 2026-11-10 (2c), fail closed for names too: a zone id or a percent escape is read differently by matchers."""
 
@@ -1395,7 +1422,7 @@ class AuthRouteTests(unittest.TestCase):
             # The entry is never shown: the detail gives its variable and its position in that variable's list.
             for value, position in ((entry, 1), (f"localhost,{entry}", 2), (f"{entry} 127.0.0.1,::1", 1),
                                     (f" .corp.example , {entry} ", 2)):
-                self._assert_unparseable_on_every_route(home, value, entry, self.PERCENT_WHY, position)
+                self._assert_unparseable_on_every_route(home, value, position, self.PERCENT_WHY)
         with self.assertRaises(EnvRefused) as caught:
             build_child_env("codex", home=home, auth_mode=SUB, parent={"PATH": "/usr/bin", **proxy, "no_proxy": "fe80::1%eth0/64"})
         self.assertEqual("no_proxy: no_proxy_unparseable: entry 1 of no_proxy is unparseable: a '%' (zone id or percent escape) "
@@ -1444,6 +1471,7 @@ class AuthRouteTests(unittest.TestCase):
                                     parent={"PATH": "/usr/bin", **proxy, **parent})
                 self.assertEqual((name, "no_proxy_unparseable", f"entry {position} of {name} is unparseable: {self.PERCENT_WHY}"),
                                  (caught.exception.name, caught.exception.cause, caught.exception.detail))
+                self.assertEqual(position, caught.exception.position)
 
     SECRET_USER, SECRET_PW = "Us3rN4m3", "S3cr3tPw"
 
@@ -1472,18 +1500,20 @@ class AuthRouteTests(unittest.TestCase):
         """No string an ``EnvRefused`` carries, and no serialized form of it, holds a marker, in any letter case."""
 
         self.assertTrue(all(isinstance(arg, str) for arg in refused.args), refused.args)
-        self.assertLessEqual({type(value) for value in vars(refused).values()}, {str, type(None)})
+        self.assertLessEqual({type(value) for value in vars(refused).values()}, {str, type(None), int})
+        self.assertEqual({"name", "cause", "detail", "position"}, set(vars(refused)))
         self.assertIsNone(refused.__cause__)
         self.assertIsNone(refused.__context__)
         self.assertFalse(hasattr(refused, "__notes__"))
         texts = {"str": str(refused), "repr": repr(refused), "name": refused.name, "cause": refused.cause,
                  "detail": refused.detail, "traceback": "".join(traceback.format_exception(refused))}
         texts.update({f"args[{index}]": arg for index, arg in enumerate(refused.args)})
-        texts.update({f"vars()[{key!r}]": value for key, value in vars(refused).items()})
+        texts.update({f"vars()[{key!r}]": value if value is None else str(value) for key, value in vars(refused).items()})
         # EnvRefused has no to_dict; these are the dict forms a caller can make of it.
         texts["json of vars()"] = json.dumps(vars(refused), sort_keys=True)
         texts["json record"] = json.dumps({"code": refused.code, "name": refused.name, "cause": refused.cause,
-                                           "detail": refused.detail, "message": str(refused), "args": list(refused.args)})
+                                           "detail": refused.detail, "position": refused.position, "message": str(refused),
+                                           "args": list(refused.args)})
         pickled = {protocol: pickle.dumps(refused, protocol) for protocol in range(pickle.HIGHEST_PROTOCOL + 1)}
         for marker in markers:
             for label, text in texts.items():
@@ -1532,27 +1562,12 @@ class AuthRouteTests(unittest.TestCase):
                         checked += 1
         self.assertEqual(13 * 9 * (2 * 2 + 6 + 6), checked)
 
-    def test_the_route_record_of_a_percent_entry_refusal_holds_no_entry_text(self) -> None:
+    def _assert_route_records_hold_none_of(self, home: str, extra: list, markers: tuple[str, ...]) -> None:
         """The record of a launch in this package is the cells harness row: ``run_cell``'s outcome, ``run_all``'s row, its JSON line.
 
         There is no other: ``EnvRefused`` has no ``to_dict``, ``launch.spawn`` builds nothing from a refusal, and no
-        ``ValidatedEnv`` exists when the build refuses.
+        ``ValidatedEnv`` exists when the build refuses. ``extra`` are refused cells of one group.
         """
-
-        home = _home(self)
-        markers = (self.SECRET_PW, self.SECRET_USER)
-        routes = (("none", "claude_code", None), ("none_codex", "codex", None), ("gateway", "claude_code", "https://gateway.example/api"),
-                  ("v4_gateway", "claude_code", "http://10.1.2.3:4000"), ("localhost", "claude_code", "http://localhost:4000"),
-                  ("v6_loopback", "claude_code", "http://[::1]:4000"))
-        extra = []
-        for number, entry in enumerate(self._percent_secret_entries()):
-            for case, (lists, _, _) in enumerate(self._percent_secret_lists(entry)):
-                for route_name, engine, base_url in routes:
-                    extra.append(cells.Cell(
-                        "no_proxy_percent_secret", f"npps_{number}_{case}_{route_name}", engine,
-                        {"PATH": "/usr/bin", "HTTPS_PROXY": cells.PROXY, **lists}, ("refused", "no_proxy_unparseable"),
-                        auth_mode=API, route=ChildRoute(api_key=cells.USER_KEY, base_url=base_url)))
-        self.assertEqual(13 * 9 * 6, len(extra))
 
         def holds_none(record: object, label: str) -> None:
             """Every string in the record, at any depth, and the record's JSON line."""
@@ -1570,20 +1585,131 @@ class AuthRouteTests(unittest.TestCase):
                 for text in strings:
                     self.assertNotIn(marker.lower(), text.lower(), label)
 
+        group = extra[0].group
         for cell in extra:  # the outcome one trial records
             outcome = cells.run_cell(cell, home)
-            self.assertEqual(("refused", "no_proxy_unparseable"), outcome, cell.name)
+            self.assertEqual(cell.expect, outcome, cell.name)
             holds_none(outcome, cell.name)
         real_cells = cells.cells
         with mock.patch.object(cells, "cells", lambda scratch: [*real_cells(scratch), *extra]):
             rows = cells.run_all(1)
-        mine = [row for row in rows if row["group"] == "no_proxy_percent_secret"]
+        mine = [row for row in rows if row["group"] == group]
         self.assertEqual([cell.name for cell in extra], [row["cell"] for row in mine])
-        for row in mine:  # the row run_all builds and __main__ prints as one JSON line
-            self.assertEqual((1, 1, ["refused:no_proxy_unparseable"], "refused:no_proxy_unparseable"),
-                             (row["n"], row["pass"], row["outcomes"], row["expect"]), row["cell"])
+        for cell, row in zip(extra, mine):  # the row run_all builds and __main__ prints as one JSON line
+            expect = f"refused:{cell.expect[1]}"
+            self.assertEqual((1, 1, [expect], expect), (row["n"], row["pass"], row["outcomes"], row["expect"]), row["cell"])
             holds_none(row, row["cell"])
         holds_none(rows, "all rows")
+
+    def test_the_route_record_of_a_percent_entry_refusal_holds_no_entry_text(self) -> None:
+        home = _home(self)
+        routes = (("none", "claude_code", None), ("none_codex", "codex", None), ("gateway", "claude_code", "https://gateway.example/api"),
+                  ("v4_gateway", "claude_code", "http://10.1.2.3:4000"), ("localhost", "claude_code", "http://localhost:4000"),
+                  ("v6_loopback", "claude_code", "http://[::1]:4000"))
+        extra = []
+        for number, entry in enumerate(self._percent_secret_entries()):
+            for case, (lists, _, _) in enumerate(self._percent_secret_lists(entry)):
+                for route_name, engine, base_url in routes:
+                    extra.append(cells.Cell(
+                        "no_proxy_percent_secret", f"npps_{number}_{case}_{route_name}", engine,
+                        {"PATH": "/usr/bin", "HTTPS_PROXY": cells.PROXY, **lists}, ("refused", "no_proxy_unparseable"),
+                        auth_mode=API, route=ChildRoute(api_key=cells.USER_KEY, base_url=base_url)))
+        self.assertEqual(13 * 9 * 6, len(extra))
+        self._assert_route_records_hold_none_of(home, extra, (self.SECRET_PW, self.SECRET_USER))
+
+    SPLIT_PA, SPLIT_SS = "S3cr3tPa", "Ss9Word"  # the two halves of one password, split at a comma
+    _GATEWAY, _HALF_GATEWAY = "https://gateway.example/api", "https://Ss9Word.gateway.example"
+    _NO_BASE = (("claude_code", None), ("codex", None))
+    _CLAUDE_ROUTES = (("claude_code", None), ("claude_code", _GATEWAY), ("claude_code", "http://localhost:4000"),
+                      ("claude_code", "http://127.0.0.1:4000"))
+    _EVERY_ROUTE = (("codex", None), *_CLAUDE_ROUTES)
+
+    def _split_password_cases(self):
+        """(label, NO_PROXY lists, routes, the refusal): a password split at a comma, for every NO_PROXY cause and reason.
+
+        ``http://user:S3cr3tPa,Ss9Word@h`` is two entries, so no rule that hides one entry's userinfo covers both
+        halves; only showing no entry text does. Each route is (engine, base URL or None). The refusal is
+        (variable, cause, position, reason). In some cases the refusing entry itself holds a half.
+        """
+
+        user, pa, ss = self.SECRET_USER, self.SPLIT_PA, self.SPLIT_SS
+        every, slash, percent = self._EVERY_ROUTE, self.SLASH_WHY, self.PERCENT_WHY
+        unparseable, wildcard = "no_proxy_unparseable", "no_proxy_wildcard"
+        engine_host, route_host = "no_proxy_engine_host", "no_proxy_route_host"
+        return (
+            # no_proxy_unparseable, by a "/": the userinfo URL with a trailing slash, a half before the "/", a second
+            # "/", a half as the port.
+            ("slash", {"NO_PROXY": f"http://{user}:{pa},{ss}@h/"}, every, ("NO_PROXY", unparseable, 2, slash)),
+            ("slash_first_half", {"no_proxy": f"localhost,{user}:{pa}/,{ss}@h"}, every, ("no_proxy", unparseable, 2, slash)),
+            ("second_slash", {"NO_PROXY": f"http://{user}:{pa},{ss}@10.1.2.3:8080/path/8"}, every, ("NO_PROXY", unparseable, 2, slash)),
+            ("port", {"NO_PROXY": f"{user}:{pa},{ss}@h,1.2.3.4:{ss}/8"}, every, ("NO_PROXY", unparseable, 3, slash)),
+            # no_proxy_unparseable, by a "%": in the second half, in the first, and with a path.
+            ("percent", {"NO_PROXY": f"http://{user}:{pa},{ss}%40h"}, every, ("NO_PROXY", unparseable, 2, percent)),
+            ("percent_first_half", {"NO_PROXY": f"{user}:{pa}%2C,{ss}@h"}, every, ("NO_PROXY", unparseable, 1, percent)),
+            ("percent_and_slash", {"no_proxy": f"http://{user}:{pa},{ss}%40h/p/q"}, every, ("no_proxy", unparseable, 2, percent)),
+            # no_proxy_wildcard: a "*" after and between the halves; one block; a union cover, in one name and across both.
+            ("star", {"NO_PROXY": f"http://{user}:{pa},{ss}@x,*"}, every, ("NO_PROXY", wildcard, 3, self.STAR_WHY)),
+            ("star_between", {"no_proxy": f"{user}:{pa},*,{ss}@x"}, every, ("no_proxy", wildcard, 2, self.STAR_WHY)),
+            ("block", {"NO_PROXY": f"http://{user}:{pa},{ss}@x,0.0.0.0/0"}, every, ("NO_PROXY", wildcard, 3, self.COVER_WHY)),
+            ("union", {"NO_PROXY": f"http://{user}:{pa},0.0.0.0/1,{ss}@x,128.0.0.0/1"}, every, ("NO_PROXY", wildcard, 4, self.COVER_WHY)),
+            ("union_two_names", {"NO_PROXY": f"http://{user}:{pa},0.0.0.0/1", "no_proxy": f"{ss}@x,128.0.0.0/1"}, every,
+             ("no_proxy", wildcard, 2, self.COVER_WHY)),
+            # no_proxy_engine_host: the halves around each engine's own host entry.
+            ("engine_host", {"NO_PROXY": f"http://{user}:{pa},api.anthropic.com,{ss}@h"}, self._CLAUDE_ROUTES,
+             ("NO_PROXY", engine_host, 2, self.ENGINE_HOST_WHY)),
+            ("engine_host_codex", {"no_proxy": f"{user}:{pa},{ss}@h .openai.com"}, (("codex", None),),
+             ("no_proxy", engine_host, 3, self.ENGINE_HOST_WHY)),
+            # no_proxy_route_host, on a gateway route: the halves around the route host entry, before it in both
+            # names, and a route host entry that holds a half itself.
+            ("route_host", {"NO_PROXY": f"http://{user}:{pa},gateway.example,{ss}@h"}, (("claude_code", self._GATEWAY),),
+             ("NO_PROXY", route_host, 2, self.ROUTE_HOST_WHY)),
+            ("route_host_second_name", {"NO_PROXY": f"{user}:{pa},{ss}@h", "no_proxy": f"{pa},{ss}@h,.gateway.example:8443"},
+             (("claude_code", self._GATEWAY),), ("no_proxy", route_host, 3, self.ROUTE_HOST_WHY)),
+            ("route_host_holds_half", {"NO_PROXY": f"{user}:{pa},{ss}.gateway.example"}, (("claude_code", self._HALF_GATEWAY),),
+             ("NO_PROXY", route_host, 2, self.ROUTE_HOST_WHY)),
+        )
+
+    def test_no_no_proxy_refusal_shows_entry_text_when_a_comma_splits_a_password(self) -> None:
+        """Owner call, 2026-11-10: no NO_PROXY refusal, whatever its cause, shows any text of an entry.
+
+        Masking one entry's userinfo could not do it: ``NO_PROXY='http://user:pa,ss@h'`` splits at the comma, so
+        the two halves of the password sit in two entries. Every cause and every reason is hit here.
+        """
+
+        home = _home(self)
+        proxy = {"HTTPS_PROXY": "http://127.0.0.1:3128"}
+        markers = (self.SPLIT_PA, self.SPLIT_SS, self.SECRET_USER)
+        hit, checked = set(), 0
+        for label, lists, routes, (name, cause, position, why) in self._split_password_cases():
+            written = policy._no_proxy_entries(" ".join(lists.values()))
+            halves = [[index for index, entry in enumerate(written) if half.lower() in entry] for half in markers[:2]]
+            self.assertTrue(all(halves), label)  # both halves are in the value ...
+            self.assertNotEqual(halves[0][:1], halves[1][:1], label)  # ... and a separator parts them
+            why = why if cause != "no_proxy_unparseable" else "is unparseable: " + why
+            for engine, base_url in routes:
+                with self.subTest(case=label, engine=engine, base_url=base_url):
+                    with self.assertRaises(EnvRefused) as caught:
+                        build_child_env(engine, home=home, auth_mode=API, route=ChildRoute(api_key=USER_KEY, base_url=base_url),
+                                        parent={"PATH": "/usr/bin", **proxy, **lists})
+                    self._assert_position_only(caught.exception, name, cause, position, why)  # the intended cause
+                    self._assert_refusal_holds_none_of(caught.exception, markers)
+                    hit.add((cause, why))
+                    checked += 1
+        self.assertEqual({(cause, why) for cause, whys in self.NO_PROXY_WHYS.items() for why in whys}, hit)
+        self.assertEqual(12 * 5 + 4 + 1 + 3, checked)
+
+    def test_the_route_record_of_a_split_password_refusal_holds_no_entry_text(self) -> None:
+        home = _home(self)
+        extra = []
+        for label, lists, routes, (_, cause, _, _) in self._split_password_cases():
+            for number, (engine, base_url) in enumerate(routes):
+                extra.append(cells.Cell(
+                    "no_proxy_split_secret", f"npss_{label}_{number}_{engine}", engine,
+                    {"PATH": "/usr/bin", "HTTPS_PROXY": cells.PROXY, **lists}, ("refused", cause),
+                    auth_mode=API, route=ChildRoute(api_key=cells.USER_KEY, base_url=base_url)))
+        self.assertEqual(12 * 5 + 4 + 1 + 3, len(extra))
+        self.assertEqual(set(self.NO_PROXY_WHYS), {cell.expect[1] for cell in extra})
+        self._assert_route_records_hold_none_of(home, extra, (self.SPLIT_PA, self.SPLIT_SS, self.SECRET_USER))
 
     def test_validated_env_repr_never_shows_a_no_proxy_value(self) -> None:
         """With no proxy set a "%" entry launches; the env's repr is names only, so it shows no entry text."""
@@ -2150,6 +2276,49 @@ class LaunchTests(unittest.TestCase):
             env = self._env(HTTPS_PROXY="http://u:p@127.0.0.1:9")
             spawn(["fake-engine"], env, popen=self.popen)
         self.popen.assert_not_called()
+
+    def test_a_no_proxy_entry_with_a_second_slash_starts_no_process(self) -> None:
+        """Devin, on 7cd75440: ``NO_PROXY=10.1.2.3:8080/path/8`` was read as ``10.0.0.0/8`` and launched.
+
+        Both engines with no base URL, and Claude Code's gateway and loopback routes (a Codex route has no base
+        URL). The build raises, so no ``ValidatedEnv`` exists, nothing reaches a child environment and no process
+        is started.
+        """
+
+        entry = "10.1.2.3:8080/path/8"
+        parent = {"PATH": f"{self.bin}:/usr/bin:/bin", "HTTPS_PROXY": "http://127.0.0.1:3128"}  # fake-engine resolves
+        gateway = "https://gateway.example/api"
+        routes = [(engine, None) for engine in ENGINE_PROFILES]
+        routes += [("claude_code", base_url) for base_url in (gateway, "http://10.1.2.3:4000", "http://localhost:4000",
+                                                              "http://127.0.0.1:4000", "http://[::1]:4000")]
+        refused = 0
+        with mock.patch.object(subprocess, "Popen", side_effect=AssertionError("a process was started")) as real_popen:
+            for name in policy.NO_PROXY_NAMES:
+                for value, position in ((entry, 1), (f"localhost,{entry}", 2), (f"http://{entry}", 1), (f".corp.example {entry},*", 2)):
+                    for engine, base_url in routes:
+                        env = None
+                        with self.subTest(name=name, value=value, engine=engine, base_url=base_url):
+                            with self.assertRaises(EnvRefused) as caught:
+                                env = build_child_env(engine, home=self.home, auth_mode=API, parent={**parent, name: value},
+                                                      route=ChildRoute(api_key=USER_KEY, base_url=base_url))
+                                spawn(["fake-engine"], env, popen=self.popen)
+                            self.assertIsNone(env)  # the build raised: no ValidatedEnv was returned
+                            self.assertEqual((name, "no_proxy_unparseable", position),
+                                             (caught.exception.name, caught.exception.cause, caught.exception.position))
+                            for text in (str(caught.exception), repr(caught.exception), caught.exception.detail):
+                                self.assertNotIn("10.1.2.3", text)
+                            with self.assertRaises(TypeError):  # and the launch boundary takes nothing else
+                                spawn(["fake-engine"], {**parent, name: value}, popen=self.popen)
+                            refused += 1
+            self.assertEqual(2 * 4 * 7, refused)
+            self.popen.assert_not_called()
+            real_popen.assert_not_called()
+        # The same launch with one "/" does start the (stubbed) process, so only the refusal stood in the way.
+        env = build_child_env("claude_code", home=self.home, auth_mode=API, parent={**parent, "NO_PROXY": "10.1.2.3:8080/8"},
+                              route=ChildRoute(api_key=USER_KEY, base_url=gateway))
+        spawn(["fake-engine"], env, popen=self.popen)
+        self.popen.assert_called_once()
+        self.assertEqual("10.1.2.3:8080/8", self.popen.call_args.kwargs["env"]["NO_PROXY"])
 
     def test_a_bad_override_never_reaches_popen(self) -> None:
         overrides = ({"LD_PRELOAD": "/mock/not-loaded.so"}, {"SSL_CERT_FILE": "relative-cert.pem"},

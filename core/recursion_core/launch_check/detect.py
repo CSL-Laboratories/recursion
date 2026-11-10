@@ -7,7 +7,8 @@ and only when the package layout is recognised and the vendored binary is native
 any other script, shim or non-native target is reported and left without a candidate,
 so ``grant()`` is never offered a wrapper. The exception is a pinned route (pi, hermes,
 cursor, antigravity): its first PATH hit is offered whatever its kind, because ``grant()``
-decides it against the pin table and runs nothing.
+decides it against the pin table and runs nothing. On Windows a pinned route's name is also
+searched as ``.cmd`` and ``.ps1`` (after the bare name and ``.exe``); other engines are not.
 """
 
 from __future__ import annotations
@@ -16,8 +17,8 @@ import os
 import platform
 from dataclasses import dataclass
 
-from recursion_core.launch_check import pins
-from recursion_core.launch_check.binary import file_kind, sha256_file
+from recursion_core.launch_check import binary, pins
+from recursion_core.launch_check.binary import PINNED_LAUNCHER_EXT, file_kind, sha256_file
 from recursion_core.launch_check.floors import FLOORS, spec_for
 
 
@@ -89,8 +90,14 @@ def _launcher_pinned(engine: str, realpath: str) -> bool:
         return False
 
 
-def path_hits(name: str, path_string: str) -> list[str]:
-    exts = ("", ".exe") if os.name == "nt" else ("",)
+def path_hits(name: str, path_string: str, pinned: bool = False) -> list[str]:
+    """Executable files named ``name`` on the PATH string, in search order.
+
+    Windows also tries ``.exe``, and for a pinned route (``pinned``) ``.cmd`` then ``.ps1``.
+    """
+    exts: tuple[str, ...] = ("",)
+    if binary.is_windows():
+        exts = ("", ".exe", *PINNED_LAUNCHER_EXT) if pinned else ("", ".exe")
     hits: list[str] = []
     for d in path_string.split(os.pathsep):
         if not d or not os.path.isabs(d):  # empty or relative PATH entries are never searched
@@ -114,7 +121,7 @@ def detect(engine: str, path_string: str) -> Detection:
     hits: list[Hit] = []
     firsts: list[Hit] = []
     for name in spec.names:
-        for i, p in enumerate(path_hits(name, path_string)):
+        for i, p in enumerate(path_hits(name, path_string, spec.pin is not None)):
             real = os.path.realpath(p)
             hits.append(Hit(p, real, _kind(real)))
             if i == 0:

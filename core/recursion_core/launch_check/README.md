@@ -26,13 +26,17 @@ window between `exec_argv()` and the exec itself is still open (CX-1402, see Lim
   to the vendored `vendor/<triple>/codex/codex` only when the layout is recognised;
   otherwise the result is "not grantable". A pinned route (pi, hermes, cursor,
   antigravity) is the exception: its first PATH hit is offered whatever its kind, because
-  `grant` decides it against the pin table and runs nothing.
+  `grant` decides it against the pin table and runs nothing. On Windows each PATH directory
+  is searched for the bare name and `.exe`, and for a pinned route only also `.cmd` then
+  `.ps1`; elsewhere only the bare name is searched.
 - `grant(engine, path)`: the only issuer of a `Grant`. In order: engine in the table
   (`engine_unknown`); absolute path (`path_not_absolute`); file stem is one of the engine's
   names (`name_mismatch`, or `wrapper_refused` for an interpreter or wrapper name); the path
   exists and is executable (`binary_missing`); the resolved file is native and not a
   wrapper name (`wrapper_refused`: shebang scripts, links to scripts, `.cmd`/`.ps1`/`.js`/
-  `.sh`, text). An engine with no identity rule and no pin is then refused
+  `.sh`, text). The one exception: on Windows, a pinned route's `<name>.cmd` or
+  `<name>.ps1` (the name exact, the extension in any case) goes to the pin check below
+  instead of `wrapper_refused`. An engine with no identity rule and no pin is then refused
   (`identity_unverified`) without being run. It hashes the realpath (full SHA-256 and size), runs the zero-egress version
   probe, re-hashes (`binary_changed` if it changed while probing), and refuses a non-zero
   exit or timeout (`version_probe_failed`), a line naming another engine (`engine_mismatch`),
@@ -44,7 +48,9 @@ window between `exec_argv()` and the exec itself is still open (CX-1402, see Lim
   name check: the path exists and is executable (`binary_missing`), then the launcher and
   its package files or binary must match a recorded pin (`pin_mismatch`, refused until
   re-pinned) and the pinned version must meet the floors (`version_refused`). Nothing is
-  run. See [Pinned routes](#pinned-routes).
+  run. A Windows `.cmd` or `.ps1` launcher is granted the same way and only this way: its
+  SHA-256 must be a recorded launcher pin for that engine and the pinned tree must match,
+  otherwise `pin_mismatch`. See [Pinned routes](#pinned-routes).
 - The grant record holds engine, path, realpath, sha256 (64 hex), size, raw version line,
   exit code, parsed version, both floors, a `beta` tag when the functional floor is
   unset, the floor-table version and the refusal-code version;
@@ -55,7 +61,8 @@ window between `exec_argv()` and the exec itself is still open (CX-1402, see Lim
 - `launch_plan(grant, argv, env)`: `argv` non-empty (`argv_empty`); `argv[0]` is the bare
   engine name (`argv0_mismatch`), never an interpreter or wrapper (`sh`, `bash`, `env`,
   `node`, `python`, `npx`, `uv`, `cmd`, `powershell`, `pwsh`, `wsl`, `.cmd`/`.ps1`/`.js`/
-  `.sh` and others: `wrapper_refused`); argv plus env under the byte caps, NUL-free text
+  `.sh` and others: `wrapper_refused`; this holds for a grant issued on a `.cmd` or `.ps1`
+  launcher too, whose `argv[0]` is still the bare engine name); argv plus env under the byte caps, NUL-free text
   (`spawn_too_large`: 128 KiB per item, 256 KiB total). `env` is the child environment
   already built by the child-env boundary (recursion #320), not `os.environ`.
 - `LaunchPlan.exec_argv()` authenticates and re-verifies on **every use** (C1-37): the
@@ -69,7 +76,9 @@ window between `exec_argv()` and the exec itself is still open (CX-1402, see Lim
   (`granted`, `refused` with code, or `absent`). Grants are returned apart from records.
 
 Every failure is a `LaunchRefused` with a code from the closed set `REFUSAL_CODES`
-(`r2a-refusals/1.4.0-candidate-2026-11-09`, 19 codes; 1.4.0 removes `sign_in_refused`,
+(`r2a-refusals/1.5.0-candidate-2026-11-09`, 19 codes; 1.5.0 is the same 19 codes as 1.4.0
+and moves a Windows `.cmd`/`.ps1` launcher on a pinned route from `wrapper_refused` to the
+pin check, so it is `pin_mismatch` unless pinned; 1.4.0 removed `sign_in_refused`,
 which only the dropped Gemini CLI row raised). No path returns a grant or plan
 after an error.
 
@@ -167,7 +176,7 @@ for Lucas.
 
 ## Pinned routes
 
-Pin table `r2a-pins/1.2.0-candidate-2026-11-09`. Lucas's owner call of 2026-11-09 (item 2),
+Pin table `r2a-pins/1.3.0-candidate-2026-11-09`. Lucas's owner call of 2026-11-09 (item 2),
 with the same rules as the route layer on #321 (`wrapper_pin.py` at `38f41d3b`). Pi, Hermes and Cursor are wrapper installs (JS
 bundles under node, a Python entry point; 11.6, #1087 section 6.2) and Antigravity CLI is
 one Go binary. These four are granted only when the install on disk matches a pin in
@@ -201,19 +210,23 @@ Recorded pins (measured from real installs only; no hash here is invented):
 |---|---|---|---|---|---|---|---|
 | antigravity | 1.5.3 | linux_amd64 | `7ca212748ca0dfda718efbc39a776a104472e7e9344d4b6ea147c543684f96a3` (246837648) | empty (`agy` is the binary) | `7ca212748ca0dfda718efbc39a776a104472e7e9344d4b6ea147c543684f96a3` | 2026-11-09 | the `antigravity` member of [`cli_linux_x64.tar.gz`](https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.3-6604829099950080/linux-x64/cli_linux_x64.tar.gz), which Google's installer copies to `agy`; version from the installer's `manifest_linux_amd64.json`, whose SHA-512 the archive matched |
 | cursor | 2026.11.05-86047df | windows_amd64 | `b5975caa126e855f4be9b6084791a47eb40dd0babccb297265bf131df033acfc` (2527) | `versions/2026.11.05-86047df` (408 entries, 265684223 bytes, includes an empty `.running` directory) | `d9088fb279e9a004d4098b927df9b1257cd05b367cdc0959ba11d082e291bf23` | 2026-11-09 | launcher `C:\Users\Lucas\AppData\Local\cursor-agent\cursor-agent.ps1` on sentry, installed from https://cursor.com/install?win32=true |
-| pi | 1.5.1 | windows_amd64 | `c56ef3cdd441b3c00d49e6e36d4a163bbcc715bf32e4de3473ece96efd232c4b` (464) | `../install/releases/1.5.1` (16776 entries, 113981899 bytes) | `2c477ce6abcd257434138b4affd6f9b12b92ec2527bc8eb50f04948a25323ac7` | 2026-11-09 | launcher `C:\Users\Lucas\.pi\agent\bin\pi.cmd` on sentry, installed from https://pi.dev/install.ps1; PowerShell resolves `pi` to `pi.ps1` first (SHA-256 `3f422e96483162aad373b8e3e28f282236bdffb5cc1b8bfb6c25a8d918bd31d1`, 500 bytes), which is not pinned |
+| pi | 1.5.1 | windows_amd64 | `c56ef3cdd441b3c00d49e6e36d4a163bbcc715bf32e4de3473ece96efd232c4b` (464) | `../install/releases/1.5.1` (16776 entries, 113981899 bytes) | `2c477ce6abcd257434138b4affd6f9b12b92ec2527bc8eb50f04948a25323ac7` | 2026-11-09 | launcher `C:\Users\Lucas\.pi\agent\bin\pi.cmd` on sentry, installed from https://pi.dev/install.ps1; PowerShell resolves `pi` to `pi.ps1` first (SHA-256 `3f422e96483162aad373b8e3e28f282236bdffb5cc1b8bfb6c25a8d918bd31d1`, 500 bytes) |
+| pi | 1.5.1 | windows_amd64 | `3f422e96483162aad373b8e3e28f282236bdffb5cc1b8bfb6c25a8d918bd31d1` (500) | `../install/releases/1.5.1` (16776 entries, 113981899 bytes) | `2c477ce6abcd257434138b4affd6f9b12b92ec2527bc8eb50f04948a25323ac7` | 2026-11-09 | launcher `C:\Users\Lucas\.pi\agent\bin\pi.ps1` on sentry, installed from https://pi.dev/install.ps1 |
 
-The two `windows_amd64` rows were measured on Lucas's Windows machine "sentry" with the
-hasher at commit `66fe11b1`. They are recorded data, and a real Windows install still does
-not get a grant (it fails closed). The code does not decide between `pi.cmd` and `pi.ps1`
-on Windows: `detect.path_hits` tries only the bare name and `.exe` there, and `grant()`
-refuses a path whose stem is not the bare engine name or that has a wrapper extension
-(`.cmd`, `.ps1`) as `wrapper_refused` before any pin is checked. So the measured `pi.cmd`
-is the pinned launcher, recorded as measured, and `pi.ps1` (which PowerShell resolves
-first) is not pinned. Cursor is the same: `cursor-agent.ps1` is recorded as measured.
-Which launcher Recursion binds on Windows is an open item for Lucas, and Windows launcher
-resolution is a logic change that is not in this commit. The Cursor tree includes an empty
-`.running` directory, so its tree pin goes stale if Cursor writes into it or removes it.
+The three `windows_amd64` rows were measured on Lucas's Windows machine "sentry" with the
+hasher at commit `66fe11b1`. Lucas's owner call of 2026-11-09: "Yes, accept pinned .cmd and
+.ps1 launchers on Windows, bound to the pin." So on Windows, for pinned routes only,
+`detect.path_hits` tries the bare name, `.exe`, `.cmd` and `.ps1`, in that order, in each
+PATH directory (the first hit of each name still counts). `grant()` accepts a `<name>.cmd`
+or `<name>.ps1` launcher only when its SHA-256 matches a recorded launcher pin for that
+engine and the pinned tree matches; any other `.cmd`/`.ps1` launcher on a pinned route
+(unpinned, or one byte changed) is `pin_mismatch`, and a byte changed after the grant is
+`binary_changed` on the next plan use. Non-pinned engines (`claude.cmd`, `codex.ps1`) and
+every non-Windows platform are unchanged: `wrapper_refused`, as are other wrapper
+extensions (`.bat`, `.js`, `.sh`) on a pinned route. Both Pi launchers are pinned over the
+same tree, so the code does not choose between them beyond the search order. The Cursor
+tree includes an empty `.running` directory, so its tree pin goes stale if Cursor writes
+into it or removes it.
 
 Hermes v0.23.1 (`3b421578588243f920886e6fe79a6faa87ea026e`) was measured on Windows only
 for its launchers (`hermes.exe`, `hermes-acp.exe`) and has no pin. Its Windows checkout
@@ -269,9 +282,13 @@ this package ships.
 - Only installs that were measured can match. When an engine updates (Antigravity CLI's
   installer downloads from a host named as an auto-updater; whether `agy` replaces itself
   was not observed), its pin goes stale and the route is refused until re-pinned.
-- POSIX only in the tests. Windows detection here reads neither npm `.cmd` shims nor
-  `.ps1` launchers, so on Windows such engines are not grantable (fail closed) and the
-  `windows_amd64` pins are not reachable yet.
+- The tests run on POSIX only. Windows is simulated in them through `binary.is_windows()`
+  (the one switch `detect` and `grant` read); no test runs on real Windows. On Windows a
+  non-pinned engine's npm `.cmd` shim or `.ps1` launcher is still not grantable (fail closed).
+- `exec_argv()` returns the launcher's realpath. On real Windows a `.cmd` runs through
+  `CreateProcess`'s batch handling, but a `.ps1` is not directly executable and needs
+  PowerShell, whose name `launch_plan` refuses as `argv[0]`. How a granted `.ps1` is
+  spawned is open for Lucas.
 
 ## Tests
 

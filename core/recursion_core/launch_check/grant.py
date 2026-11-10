@@ -7,7 +7,9 @@ fields are MACed with a per-process key. Every failure raises ``LaunchRefused``.
 
 A pinned route (``EngineSpec.pin``: pi, hermes, cursor, antigravity) is not probed. Its
 launcher and its package tree or binary must match a pin in ``pins.py``; the version is
-the pin's, and anything else is ``pin_mismatch`` until re-pinned.
+the pin's, and anything else is ``pin_mismatch`` until re-pinned. On Windows only, a
+pinned route's ``<name>.cmd`` or ``<name>.ps1`` launcher takes the same pin check; every
+other wrapper extension, engine and platform is still ``wrapper_refused``.
 
 ``launch_plan(grant, argv, env)`` authenticates the grant, checks argv and the spawn
 size, re-verifies the binary, and returns a ``LaunchPlan``. Every use of a plan
@@ -28,8 +30,10 @@ import secrets
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, fields
 
-from recursion_core.launch_check import floors, pins
-from recursion_core.launch_check.binary import HEX64, WRAPPER_EXT, file_kind, is_wrapper_name, sha256_file, stem
+from recursion_core.launch_check import binary, floors, pins
+from recursion_core.launch_check.binary import (
+    HEX64, PINNED_LAUNCHER_EXT, WRAPPER_EXT, file_kind, is_wrapper_name, sha256_file, stem,
+)
 from recursion_core.launch_check.floors import (
     EngineSpec, check_floors, check_identity, check_self_named, other_engine_named, parse_version, spec_for,
     with_note,
@@ -108,12 +112,22 @@ def _hash(spec: EngineSpec, real: str) -> tuple[str, int]:
         raise LaunchRefused("binary_missing", spec.engine, f"hash failed: {e.__class__.__name__}") from None
 
 
+def _pinned_windows_launcher(spec: EngineSpec, path: str) -> bool:
+    """On Windows, a pinned route's ``<name>.cmd`` or ``<name>.ps1``: decided by the pin table, not refused as a wrapper."""
+    if spec.pin is None or not binary.is_windows():
+        return False
+    name, ext = os.path.splitext(os.path.basename(path))
+    return name in spec.names and ext.lower() in PINNED_LAUNCHER_EXT
+
+
 def grant(engine: str, path: str, *, timeout: float = PROBE_TIMEOUT_S, probe: Probe | None = None) -> Grant:
     """Pin one engine. Refuses with a typed code on every failure; never returns after one."""
     spec = spec_for(engine)
     if not isinstance(path, str) or not os.path.isabs(path):
         raise LaunchRefused("path_not_absolute", spec.engine, repr(path))
     if stem(path) not in spec.names:
+        if _pinned_windows_launcher(spec, path):  # granted only bound to a pin; else pin_mismatch
+            return _grant_pinned(spec, path)
         if is_wrapper_name(path):
             raise LaunchRefused("wrapper_refused", spec.engine, f"{os.path.basename(path)} is a wrapper shape")
         raise LaunchRefused("name_mismatch", spec.engine, f"{stem(path)!r} not in {list(spec.names)}")

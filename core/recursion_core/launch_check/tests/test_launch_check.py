@@ -97,7 +97,7 @@ class RefusalCodeTests(Base):
     def test_closed_set_is_exactly_the_listed_codes(self) -> None:
         self.assertEqual(EXPECTED_CODES, set(REFUSAL_CODES))
         self.assertIsInstance(REFUSAL_CODES, frozenset)
-        self.assertEqual("r2a-refusals/1.4.0-candidate-2026-11-09", REFUSAL_CODES_VERSION)
+        self.assertEqual("r2a-refusals/1.5.0-candidate-2026-11-09", REFUSAL_CODES_VERSION)
         self.assertNotIn("sign_in_refused", REFUSAL_CODES)  # went with the Gemini CLI row
 
     def test_unknown_code_cannot_be_raised(self) -> None:

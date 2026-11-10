@@ -8,6 +8,8 @@ and untouched; its `LIVE_ADAPTERS_ENABLED` stays `False`.
 Governing spec: `contracts/PRODUCT.md` at csl-research `055cc7a5c793b7135e5d0565dc4198cf96230531`
 (SHA-256 `e64783152f6d67d4ede774dc41d112fe46c2d7536d53cb2c04e71a3566044daf`), section 3.3
 "R2a defined" (grill Q22), O50 ("Beta until measured") and 11.6 (grill Q43, functional floors), 34b (nine engines).
+This package ships eight of them: Lucas dropped the Gemini CLI row on 2026-11-09 (see
+[Gemini CLI is not a route](#gemini-cli-is-not-a-route)).
 Build-order item 5 (B10). Recursion hard rule 8 still applies: no live provider call until
 R2a merges and `CONTROL_PLANE.md` records each route's account and spend ceiling.
 Facts for that gate (whether merging this package counts as "R2a landed" is open for Lucas):
@@ -45,7 +47,7 @@ window between `exec_argv()` and the exec itself is still open (CX-1402, see Lim
   run. See [Pinned routes](#pinned-routes).
 - The grant record holds engine, path, realpath, sha256 (64 hex), size, raw version line,
   exit code, parsed version, both floors, a `beta` tag when the functional floor is
-  unset, `api_key_only` (Gemini CLI), the floor-table version and the refusal-code version;
+  unset, the floor-table version and the refusal-code version;
   for a pinned route also the pin kind, pin-table version, and the matched target and its
   digest. The grant is a frozen dataclass whose fields are MACed (HMAC-SHA-256) with a
   per-process key; `launch_plan` refuses anything else (`grant_forged`) and any grant issued
@@ -55,10 +57,7 @@ window between `exec_argv()` and the exec itself is still open (CX-1402, see Lim
   `node`, `python`, `npx`, `uv`, `cmd`, `powershell`, `pwsh`, `wsl`, `.cmd`/`.ps1`/`.js`/
   `.sh` and others: `wrapper_refused`); argv plus env under the byte caps, NUL-free text
   (`spawn_too_large`: 128 KiB per item, 256 KiB total). `env` is the child environment
-  already built by the child-env boundary (recursion #320), not `os.environ`. For Gemini
-  CLI, the one API-key-only row, the caller must also state `auth="api_key"`: a
-  subscription sign-in, any other value or no statement is `sign_in_refused`, and the
-  refusal names Antigravity CLI. The other rows ignore `auth`.
+  already built by the child-env boundary (recursion #320), not `os.environ`.
 - `LaunchPlan.exec_argv()` authenticates and re-verifies on **every use** (C1-37): the
   path must still resolve to the pinned realpath and the whole file is re-hashed. A binary
   swapped behind an unchanged symlink shim, a retargeted link, or a same-size rewrite with
@@ -66,11 +65,12 @@ window between `exec_argv()` and the exec itself is still open (CX-1402, see Lim
   For a pinned route the package tree or binary is re-hashed too, and the pin must still
   be recorded.
   It returns `[realpath, *argv[1:]]`; spawning stays with the child-env launch boundary.
-- `launch_check(path_string)`: one pass over all nine engines; one record each
+- `launch_check(path_string)`: one pass over all eight engines; one record each
   (`granted`, `refused` with code, or `absent`). Grants are returned apart from records.
 
 Every failure is a `LaunchRefused` with a code from the closed set `REFUSAL_CODES`
-(`r2a-refusals/1.3.0-candidate-2026-11-09`, 20 codes). No path returns a grant or plan
+(`r2a-refusals/1.4.0-candidate-2026-11-09`, 19 codes; 1.4.0 removes `sign_in_refused`,
+which only the dropped Gemini CLI row raised). No path returns a grant or plan
 after an error.
 
 ### Zero-egress version probe
@@ -87,7 +87,7 @@ Claude Code's `DISABLE_AUTOUPDATER=1` and `DISABLE_UPDATES=1`. No proxy, credent
 config-path or `CLI_VERSION` variable can reach it. Pinned routes are never probed. Limit: this is not a kernel network
 block; a network namespace belongs to the launch sandbox (B6), not this check.
 
-## Floor table `r2a-floors/1.4.0-candidate-2026-11-09`
+## Floor table `r2a-floors/1.5.0-candidate-2026-11-09`
 
 Two slots per engine. A grant needs `found >= security` when a security floor is set.
 When a functional floor is set, it also needs `found >= functional`. With no functional
@@ -96,18 +96,17 @@ until measured"). A floor change is a new table version (grants under the old ve
 become `grant_stale`). `floor_unset` remains in the closed refusal set for a table
 floor that does not parse. An engine with no identity rule (no `ident` regex and no
 pin) is refused `identity_unverified` before its binary is run; no row is in that state
-now.
+now. 1.5.0 removes the Gemini CLI row; no other row changed from 1.4.0.
 
 Identity is checked positively only for the three engines whose real version line is
 recorded and names the engine: claude_code (`2.1.318 (Claude Code)`), codex
 (`codex-cli 0.160.0`) and opencode (`opencode v2.2.5`).
 For these a line that does not match the engine's identity rule is `identity_mismatch`
 (so a native `claude` printing `2.1.400` is refused). For pi, hermes, cursor and
-antigravity the pin is the identity. For grok and gemini the real line is bare (`0.39.1`)
-or was never read, and no format is invented: a native binary with the right name printing
-a bare version that passes the floors is granted; the only identity check is that the line
-names no other engine. Whether those two need a pinned digest or are accepted as is, is
-open for Lucas.
+antigravity the pin is the identity. For grok the real line was never read, and no format
+is invented: a native binary with the right name printing a bare version that passes the
+floors is granted; the only identity check is that the line names no other engine in the
+table. Whether grok needs a pinned digest or is accepted as is, is open for Lucas.
 
 | Engine (binaries) | Scheme | Functional floor (Q43) | Security floor (relayed) | Measured help |
 |---|---|---|---|---|
@@ -117,7 +116,6 @@ open for Lucas.
 | grok (`grok`) | semver | unset (O50: once measured) | none | none measured |
 | antigravity (`agy`): Antigravity CLI, the Google subscription route; pinned beta route (`binary+launcher`) | semver | unset | none | none measured |
 | cursor (`agent`, `cursor-agent`): pinned beta route (`launcher+tree`) | date | unset | 2025.09.17-25b418f (D2-72) | none measured |
-| gemini (`gemini`): Gemini CLI, API-key route only; no Google sign-in route, no pin | semver | unset | 0.39.1 (D2-72) | none measured |
 | pi (`pi`): pinned beta route (`launcher+tree`) | semver (assumed) | unset | none | none measured |
 | hermes (`hermes`): pinned beta route (`launcher+tree`) | semver (assumed) | unset | none | none measured |
 
@@ -128,8 +126,8 @@ on #336 (CSL-726) at `14f8b011`, measured on linux-x64 with
 `env -i PATH=/usr/bin:/bin HOME="$HOME" LANG=C.UTF-8 COLUMNS=80 <claude> --help` (no login,
 no model call); the full method and hashes are in #336's
 [`bare-default-measured-table.md`](https://github.com/CSL-Laboratories/recursion/blob/14f8b0114b673193fe46cd4275f2112fc73c4aed/core/recursion_core/routes/tests/fixtures/bare-default-measured-table.md). "This table" is
-`r2a-floors/1.4.0-candidate-2026-11-09` at this PR's head (the Claude Code floors are
-the same as in 1.3.0).
+`r2a-floors/1.5.0-candidate-2026-11-09` at this PR's head (the Claude Code floors are
+the same as in 1.3.0 and 1.4.0).
 
 | Build | npm tag (2026-11-09 12:17 PST) | This table | Measured help (#336 fixture) | `--bare` default for `-p` (#336 `classify_help`) |
 |---|---|---|---|---|
@@ -213,27 +211,27 @@ platform=..., measured=..., source=...)` (it hashes; it runs nothing), add the `
 `PINS`, raise `PIN_TABLE_VERSION`, add the row above, and commit that on its own, apart
 from logic, as #336 does for its measured help.
 
-### Gemini CLI and Antigravity CLI
+### Gemini CLI is not a route
 
-Google stopped serving Gemini CLI for Google AI Pro, Ultra and free individual accounts on
-2026-06-18; signing in with Google no longer works there. The Google subscription route is
-Antigravity CLI (`agy`), added above as a pinned beta route. The Gemini CLI subscription
-sign-in route is dropped. Gemini CLI stays in the table as an API-key route only
-(`api_key_only: true` in the table record and in its grant record):
+Lucas's owner call of 2026-11-09: drop the Gemini CLI row. Background (Google sources are
+cited in the PR body): Google stopped serving Gemini CLI for Google AI Pro, Ultra and free
+individual accounts on 2026-06-18, and its replacement is Antigravity CLI (`agy`), the
+pinned beta route above. This closes the earlier open item (pin the Gemini bundle or drop
+the row).
 
-- `launch_plan` on a Gemini grant needs `auth="api_key"`, on the first check and on every
-  plan use. `subscription`, `oauth`, a Google sign-in, a Code Assist licence, any other
-  value or no statement is `sign_in_refused`; the refusal says Gemini CLI is an API-key
-  route only and names Antigravity CLI (`agy`). `auth` is the caller's statement: this
-  package reads no credential and cannot see whether a key is paid (#321's
-  `gemini_cli.py` records that statement).
-- Gemini gets no pin. A real Gemini CLI is a JS bundle under node, so on a real install it
-  is still `wrapper_refused`, and that refusal carries the same note. A native `gemini`
-  that meets the 0.39.1 security floor is granted as beta, as before.
+- Gemini CLI is not an engine here: no floor row, no pin, no API-key route. `gemini` is
+  not a binary name any row looks for.
+- `grant("gemini", ...)` and `detect("gemini", ...)` are `engine_unknown`, as for any
+  name outside the table. `launch_check` does not look for a `gemini` binary, so one left
+  on PATH gets no record and no grant. A file named `gemini` passed to another row is
+  `name_mismatch`.
+- A version line saying `gemini` names no engine in the table. Rows whose line must name
+  them (claude_code, codex, opencode) still refuse it (`identity_mismatch`).
+- The `auth` statement on `launch_plan`, the `api_key_only` field and the
+  `sign_in_refused` code existed only for the Gemini API-key row and are removed.
 
-Whether to pin the Gemini bundle so the API-key route runs on a real install, or to drop
-the row, is open for Lucas. The Google sources are cited in the PR body. T3 Code driving
-Antigravity through Google's ACP agent is background only, not a route this package ships.
+T3 Code driving Antigravity through Google's ACP agent is background only, not a route
+this package ships.
 
 ## Limits
 
@@ -253,7 +251,6 @@ Antigravity through Google's ACP agent is background only, not a route this pack
 - Only installs that were measured can match. When an engine updates (Antigravity CLI's
   installer downloads from a host named as an auto-updater; whether `agy` replaces itself
   was not observed), its pin goes stale and the route is refused until re-pinned.
-- `auth` on a launch plan is a statement by the caller, not something this check observes.
 - POSIX only in the tests. Windows detection here does not read npm `.cmd` shims, so on
   Windows such engines are not grantable (fail closed).
 

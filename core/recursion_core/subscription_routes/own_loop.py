@@ -41,7 +41,7 @@ import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from recursion_core.child_env import EnvRefused, build_child_env, spawn
 from recursion_core.child_env.policy import (
@@ -242,25 +242,23 @@ def check_copilot_own_loop(
     be made, every exit signals that group (SIGTERM, then SIGKILL inside the deadline). A descendant
     that calls ``setpgid`` leaves the group and is not signalled. Where the group cannot be made,
     or another thread is already running (including one started with ``_thread``), the route refuses
-    and does not fork. ``home`` is required: without it the probe would see the ambient account.
+    and does not fork.
 
-    The probe runs with the environment the child will receive, including ``HOME`` and
-    ``COPILOT_HOME`` (``<home>/.copilot``). Copilot CLI >= 1.0.1 uses ``COPILOT_HOME`` and ignores
-    ``XDG_CONFIG_HOME``, so the probe and the child see one account.
+    The probe never inherits the process environment. When ``home`` is the route home, the probe
+    runs with the environment the child will receive, including ``HOME`` and ``COPILOT_HOME``
+    (``<home>/.copilot``). Copilot CLI >= 1.0.1 uses ``COPILOT_HOME`` and ignores
+    ``XDG_CONFIG_HOME``, so the probe and the child see one account. Without ``home``, the probe
+    still sees only the screened allowlisted snapshot of the supplied mapping.
     """
 
     _common("copilot", route, _COPILOT_FIELDS, "copilot_cli_sign_in")
-    if not isinstance(parent_env, Mapping):
-        raise OwnLoopRouteRefused("copilot", "parent_env_malformed")
+    parent_env = _screen_parent_env("copilot", parent_env)
     if has_copilot_login is None:
         raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "no stored-login probe; gh fallback refused")
     model = _model("copilot", route.get("model"))
     strip = COPILOT_STRIP_ENV + _GH_FALLBACK_ENV
     # Any other provider credential (ANTHROPIC_API_KEY, OPENAI_API_KEY, ...) is not this run's either.
     # The allowlist then drops whatever the strip does not name (GH_PAT, AWS_*, GIT_CONFIG_*).
-    # A missing home would run the probe in the ambient account and approve a different child account.
-    if not isinstance(home, str) or not home:
-        raise OwnLoopRouteRefused("copilot", "route_home_missing")
     # Before the env is built, so a platform that cannot enforce the probe never creates the home,
     # and a live thread never reaches fork.
     if not _probe_enforceable():
@@ -268,11 +266,51 @@ def check_copilot_own_loop(
     if _other_threads():
         raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe threaded")
     child, removed = _project_child(parent_env, lambda name: name in strip or _is_provider_credential(name))
-    probe_env = _copilot_runtime_env(child, home).to_dict()
+    _screen_kept_values("copilot", child)
+    # None would inherit the process environment. A missing home still gets the snapshot.
+    if isinstance(home, str) and home:
+        probe_env = _copilot_runtime_env(child, home).to_dict()
+    else:
+        probe_env = child
     present = _probe_login(has_copilot_login, probe_deadline, probe_env)
     if not present:
         raise OwnLoopRouteRefused("copilot", "no_stored_copilot_login", "run `copilot login`; gh fallback refused")
     return OwnLoopDecision("copilot", "copilot_cli_sign_in", MappingProxyType(child), removed, model=model)
+
+
+def _screen_parent_env(engine: str, parent_env: object) -> dict[str, str]:
+    """Copy a parent env into a plain dict ``Popen`` can encode.
+
+    The returned dict is the only map the rest of the check reads. A later ``.items()`` on the
+    caller's mapping, or a login callback that mutates that mapping, cannot add a null or a new
+    name. A non-string used to raise ``AttributeError``. A null or an ``=`` in a name used to
+    crash at launch. Value encodability is checked later, and only for names that stay in the
+    child: a dropped credential this process cannot encode is not a reason to refuse the run.
+    """
+
+    if not isinstance(parent_env, Mapping):
+        raise OwnLoopRouteRefused(engine, "parent_env_malformed")
+    snapshot: dict[str, str] = {}
+    for name, value in parent_env.items():
+        if (not isinstance(name, str) or not isinstance(value, str) or "=" in name
+                or "\x00" in name or "\x00" in value):
+            raise OwnLoopRouteRefused(engine, "parent_env_malformed")
+        try:
+            os.fsencode(name)
+        except UnicodeEncodeError:
+            raise OwnLoopRouteRefused(engine, "env_unencodable") from None
+        snapshot[name] = value
+    return snapshot
+
+
+def _screen_kept_values(engine: str, child: Mapping[str, str]) -> None:
+    """Refuse a kept value this process cannot encode. Dropped names are not checked."""
+
+    for value in child.values():
+        try:
+            os.fsencode(value)
+        except UnicodeEncodeError:
+            raise OwnLoopRouteRefused(engine, "env_unencodable") from None
 
 
 def _has_control_char(value: str) -> bool:
@@ -407,8 +445,7 @@ def check_nous_own_loop(
     """
 
     _common("nous", route, _NOUS_FIELDS, "hermes_local_proxy")
-    if not isinstance(parent_env, Mapping):
-        raise OwnLoopRouteRefused("nous", "parent_env_malformed")
+    parent_env = _screen_parent_env("nous", parent_env)
     url = _loopback_url(route.get("base_url"))
     adapters = _adapters(route.get("adapters"))
     model = _model("nous", route.get("model"))
@@ -423,6 +460,7 @@ def check_nous_own_loop(
     child, removed = _project_child(
         parent_env, lambda name: _is_provider_credential(name) or name.upper() in _PROXY_ENV,
     )
+    _screen_kept_values("nous", child)
     return OwnLoopDecision("nous", "hermes_local_proxy", MappingProxyType(child), removed, url, adapters,
                            _shared_host_warning(current_user, interactive_users), model)
 

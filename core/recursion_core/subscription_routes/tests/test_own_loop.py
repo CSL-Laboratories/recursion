@@ -515,15 +515,30 @@ class CopilotTests(unittest.TestCase):
         self.assertEqual(caught.exception.cause, "home_unsafe")
         self.assertFalse(os.path.lexists(os.path.join(home, ".copilot")))
 
-    def test_check_without_a_route_home_refuses(self) -> None:
-        # Ambient account A must not approve a later child that selects account B.
-        kwargs = {"has" + "_copilot_login": lambda: True}
-        with self.assertRaises(OwnLoopRouteRefused) as caught:
-            check_copilot_own_loop(
-                copilot(), {"PATH": "/usr/bin:/bin", "HOME": "/home/account-a", "COPILOT_HOME": "/home/account-a/.copilot"},
-                **kwargs,
+    def test_check_without_a_route_home_uses_the_screened_snapshot(self) -> None:
+        # Ambient account tokens must not reach the probe. Without a route home the probe sees
+        # the supplied mapping after the allowlist, which is the same mapping the child receives.
+        folder = tempfile.mkdtemp(prefix="csl-no-home-")
+        self.addCleanup(shutil.rmtree, folder, True)
+        marker = os.path.join(folder, "seen")
+
+        def probe() -> bool:
+            with open(marker, "w", encoding="ascii") as handle:
+                handle.write(repr((os.environ.get("GITHUB_TOKEN"), os.environ.get("HOME"), os.environ.get("AMBIENT_ONLY"))))
+            return True
+
+        with mock.patch.dict(os.environ, {"GITHUB_TOKEN": "ambient-secret", "AMBIENT_ONLY": "ambient-only",
+                                           "HOME": "/home/ambient"}, clear=False):
+            decision = check_copilot_own_loop(
+                copilot(), {"PATH": "/usr/bin:/bin", "HOME": "/home/account-a", "LANG": "C"},
+                has_copilot_login=probe,
             )
-        self.assertEqual(caught.exception.cause, "route_home_missing")
+            self.assertEqual("ambient-secret", os.environ["GITHUB_TOKEN"])
+        with open(marker, encoding="ascii") as handle:
+            self.assertEqual("(None, '/home/account-a', None)", handle.read())
+        self.assertEqual("/home/account-a", decision.child_env["HOME"])
+        self.assertNotIn("GITHUB_TOKEN", decision.child_env)
+        self.assertNotIn("AMBIENT_ONLY", decision.child_env)
 
     def test_a_held_lock_refuses_before_the_probe_can_deadlock(self) -> None:
         # Fork copies the lock as held. The holder thread is not in the child, so a probe that

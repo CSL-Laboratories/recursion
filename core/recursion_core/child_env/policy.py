@@ -14,7 +14,7 @@ replacement. It builds the child environment from nothing:
   ``submissions/20261103-csl678-envpath-path-noproxy-01``, rule N5i): file, directory,
   proxy, ``TZ``, perspective-path, private temp root, ``PATH`` and per-engine
   ``NO_PROXY`` checks, refused before any spawn;
-* the names PRODUCT.md 055cc7a5 section 3.8 says the Nov 5 list dropped (C1-46, csl-research
+* the names PRODUCT.md d84cdd26 section 3.8 says the Nov 5 list dropped (C1-46, csl-research
   ``20261102-csl653-quota-credential-hardening-grounding-01`` section 5.8): ``ALL_PROXY`` /
   ``all_proxy`` and ``XDG_RUNTIME_DIR`` for both engines, and Claude Code's mTLS and cert-store
   names (``CLAUDE_CODE_CLIENT_CERT``, ``_CLIENT_KEY``, ``_CLIENT_KEY_PASSPHRASE``,
@@ -22,11 +22,11 @@ replacement. It builds the child environment from nothing:
   the same value rules as its peers. An override cannot set the client certificate, its
   private key or the passphrase; the parent's own values are still carried;
 * the user's own ``CLAUDE_CODE_OAUTH_TOKEN`` passes through to a Claude child unchanged
-  (PRODUCT.md 055cc7a5 section 3.3, Nov 8 fleet correction: nothing removes a built-in sign-in
+  (PRODUCT.md d84cdd26 section 3.3, Nov 8 fleet correction: nothing removes a built-in sign-in
   method from every run). It is never checked, logged or settable by an override; absent in the
   parent means absent in the child;
 * every call names its auth mode (``subscription``, ``api_key`` or ``cloud_provider``; PRODUCT.md
-  055cc7a5 section 3.3, "Every route starts with an explicit auth mode"; CSLR-D-011). An omitted or
+  d84cdd26 section 3.3, "Every route starts with an explicit auth mode"; CSLR-D-012). An omitted or
   unknown mode refuses. The vendor key, the base URL and the cloud-provider switches are route-owned:
   the parent's values never reach the child in any mode, and the child gets one only from the
   ``ChildRoute`` the caller passes for the route it launched. This module reads no keyring and no key
@@ -92,7 +92,7 @@ class EnvRefused(Exception):
 
 # The 29 names the Nov 5 tree's route allowlist carried (csl-research
 # 20261102-csl672-a4-child-env-values-grounding-01 section 5.1: PATH, HOME and 27 more), plus the three
-# engine-neutral names PRODUCT.md 055cc7a5 section 3.8 says it dropped (C1-46): ALL_PROXY, all_proxy and
+# engine-neutral names PRODUCT.md d84cdd26 section 3.8 says it dropped (C1-46): ALL_PROXY, all_proxy and
 # XDG_RUNTIME_DIR. 32 names.
 BASE_NAMES = (
     "PATH",
@@ -175,7 +175,7 @@ _BASE_URL = re.compile(
 _OFFICIAL_ORIGIN = ("https", "api.anthropic.com", 443)
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 _MAX_LINKS = 40
-# The three routes Recursion owns (PRODUCT.md 055cc7a5 section 3.3; CSLR-D-011). Nothing else is a mode.
+# The three routes Recursion owns (PRODUCT.md d84cdd26 section 3.3; CSLR-D-012). Nothing else is a mode.
 AUTH_MODES = ("subscription", "api_key", "cloud_provider")
 
 
@@ -220,7 +220,7 @@ class EngineProfile:
     hosts: tuple[str, ...]  # its own endpoints: a NO_PROXY entry matching one refuses while a proxy is set
     scrub: tuple[str, ...]  # credential and route selectors, asserted absent (they are not allowlisted)
     # The user's own sign-in names: copied from the parent unchanged when present, never checked, never set by
-    # an override, absent when the parent lacks them (PRODUCT.md 055cc7a5 section 3.3, Nov 8 fleet correction).
+    # an override, absent when the parent lacks them (PRODUCT.md d84cdd26 section 3.3, Nov 8 fleet correction).
     passthrough: tuple[str, ...] = ()
     # Route-owned names. Each is on ``scrub``, so the parent's value and an override never set it; the child
     # gets it only from the caller's ``ChildRoute``, in the mode that allows it. None or empty: the engine has
@@ -245,7 +245,7 @@ _CLAUDE_SCRUB = (
     "ANTHROPIC_ORGANIZATION_ID",
     "ANTHROPIC_BASE_URL",
     "CLAUDE_CONFIG_DIR",
-    "CLAUDE_CODE_SIMPLE",  # PRODUCT.md 055cc7a5 section 3.3 names it in the Claude scrub list
+    "CLAUDE_CODE_SIMPLE",  # PRODUCT.md d84cdd26 section 3.3 names it in the Claude scrub list
 )
 _CODEX_SCRUB = ("CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_HOME")
 
@@ -370,9 +370,24 @@ def build_child_env(
     if not isinstance(auth_mode, str) or auth_mode not in AUTH_MODES:
         raise EnvRefused(None, "auth_mode_unknown")
     route_env = _route_env(profile, auth_mode, route)  # refuses before anything is read from the parent
+    if isinstance(home, str):
+        if "\0" in home:
+            raise EnvRefused("HOME", "home_unsafe")
+        try:
+            os.fsencode(home)
+        except UnicodeEncodeError:
+            raise EnvRefused("HOME", "value_unencodable") from None
     if not _private_dir(home):
         raise EnvRefused("HOME", "home_unsafe")
-    source = dict(os.environ if parent is None else parent)
+    raw = os.environ if parent is None else parent
+    if not isinstance(raw, Mapping):
+        raise EnvRefused(None, "value_malformed")
+    source = {}
+    for name, value in raw.items():
+        # A non-string name breaks the dropped-name sort; a non-string value breaks Popen.
+        if not isinstance(name, str) or not isinstance(value, str):
+            raise EnvRefused(None, "value_malformed")
+        source[name] = value
     env = {name: source[name] for name in profile.allowed if name in source and name != "HOME"}
     passed = {name: source[name] for name in profile.passthrough if name in source}
     dropped = tuple(sorted(name for name in source if name not in env and name not in passed and name != "HOME"))
@@ -391,6 +406,11 @@ def build_child_env(
             raise EnvRefused(name, "override_denied")
         env[name] = value
 
+    # Before any path is stat'd. A temp value is replaced below and is not read. NO_PROXY is
+    # included even when no proxy is set: a null in it never reaches Popen (ValueError).
+    for name, value in env.items():
+        if name not in TEMP_NAMES:
+            _screen_value(name, value)
     for name in [name for name in env if name not in ("PATH", *TEMP_NAMES, *NO_PROXY_NAMES)]:
         cause = _unsafe_value(name, env[name]) if env[name] else None  # empty: no path or URL to check
         if cause is not None:
@@ -407,13 +427,19 @@ def build_child_env(
     if present:
         env.update(dict.fromkeys(present, _route_tmp()))
     env["HOME"] = home
+    for name, value in passed.items():
+        _screen_value(name, value)  # not read, but Popen still has to encode it
     env.update(passed)  # after every check: the user's own sign-in value is passed as it is, never read here
 
     leaked = sorted(name for name in env if name in profile.scrub
                     or (name not in profile.allowed and name not in profile.passthrough and _DENIED.search(name)))
     if leaked:  # unreachable by construction; kept so a later edit to the allowlist fails closed
         raise EnvRefused(leaked[0], "scrub_failed")
+    for name, value in route_env.items():
+        _screen_value(name, value)
     env.update(route_env)  # last: only what this call's route named, never a parent or override value
+    for name, value in env.items():
+        _screen_value(name, value)
     return ValidatedEnv(env, engine, dropped, auth_mode=auth_mode, _seal=ValidatedEnv._seal)
 
 
@@ -443,6 +469,10 @@ def _route_env(profile: EngineProfile, auth_mode: str, route: ChildRoute | None)
             raise EnvRefused(profile.key_name, "route_key_not_allowed")
         if not isinstance(route.api_key, str) or not route.api_key or "\0" in route.api_key:
             raise EnvRefused(profile.key_name, "route_key_malformed")
+        try:
+            os.fsencode(route.api_key)
+        except UnicodeEncodeError:
+            raise EnvRefused(profile.key_name, "value_unencodable") from None
     if auth_mode == "api_key":
         if profile.key_name is None:
             raise EnvRefused(None, "auth_mode_unsupported")
@@ -542,6 +572,23 @@ def _unsafe_base_url(value: object) -> str | None:
     if ".." in (match["path"] or "").split("/"):
         return "base_url_malformed"
     return None
+
+
+def _screen_value(name: str | None, value: object) -> None:
+    """Refuse a value ``Popen`` cannot put in the child environment.
+
+    A null crashes launch with ``ValueError``. Text this process cannot encode (a non-ASCII
+    value when the filesystem encoding is ASCII, for example) crashes launch with
+    ``UnicodeEncodeError``. Bytes that are not valid UTF-8 arrive as surrogates and
+    ``os.fsencode`` keeps them, so those values stay.
+    """
+
+    if not isinstance(value, str) or "\0" in value:
+        raise EnvRefused(name, "value_malformed")
+    try:
+        os.fsencode(value)
+    except UnicodeEncodeError:
+        raise EnvRefused(name, "value_unencodable") from None
 
 
 def _unsafe_value(name: str, value: str) -> str | None:

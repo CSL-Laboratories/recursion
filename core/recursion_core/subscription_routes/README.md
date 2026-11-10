@@ -1,7 +1,7 @@
 # core/recursion_core/subscription_routes (CSL-786, candidate)
 
 Refuses Claude-subscription routes in Pi, Hermes and OpenCode engine profiles before any
-spawn. Under Q12 as widened 2026-11-08 (PRODUCT.md `055cc7a5`, CSLR-D-011, sections 2 and 3.3) a
+spawn. Under Q12 as widened 2026-11-08 (PRODUCT.md `d84cdd26`, CSLR-D-011, sections 2 and 3.3) a
 subscription runs through another harness's own sign-in only where that provider allows that
 harness; Claude-subscription sign-ins stay refused in these three, and an Anthropic API key
 still works. Candidate code: not yet called by a running core, and not
@@ -74,7 +74,7 @@ checked against `SUBSCRIPTION_SIGN_INS`:
 - A subscription route must name its `model` (`"<provider>/<model>"`, under the signed-in
   provider), so the engine's own default cannot pick a Claude model (`model_missing`).
 - Every Hermes profile (sign-in or API key) must carry Hermes's own setting
-  `"auth.adopt_external_logins": false` (PRODUCT.md `055cc7a5` section 2, E9); missing or any other
+  `"auth.adopt_external_logins": false` (PRODUCT.md `d84cdd26` section 2, E9); missing or any other
   value refuses `hermes_adopt_external_logins_not_off`. The decision records it in
   `RouteDecision.engine_config` for the driver to pass to Hermes. It is required on every
   platform: on macOS Claude Code's login sits in the login Keychain, which moving HOME does not
@@ -93,7 +93,7 @@ checked against `SUBSCRIPTION_SIGN_INS`:
 
 ## Own-loop routes: Copilot and Nous (Lucas, 2026-11-08)
 
-PRODUCT.md `055cc7a5` section 3.3. `own_loop.py`, checked before any spawn or request, fail closed:
+PRODUCT.md `d84cdd26` section 3.3. `own_loop.py`, checked before any spawn or request, fail closed:
 
 - **Copilot, "Copilot's own sign-in"**: `check_copilot_own_loop(route, parent_env, has_copilot_login=...)`
   with `{"engine": "copilot", "auth": "subscription", "method": "copilot_cli_sign_in"}`. The Copilot
@@ -394,7 +394,7 @@ defaults:
 `full_access_acknowledged: bool = False` on `check_route`, `check_cursor_route`,
 `check_antigravity_route`, the three guards and `measure_package_pin`. It means this run
 uses the named full-access profile and the user acknowledged it for this run (CSL-460's
-full-access mode; PRODUCT.md `055cc7a5` section 3.3, grill Q20, O44, H-06). The name and
+full-access mode; PRODUCT.md `d84cdd26` section 3.3, grill Q20, O44, H-06). The name and
 meaning match `child_env`'s `ChildRoute.full_access_acknowledged`.
 
 - Only the bool `True` counts. Any value that is not a bool (`"true"`, `1`, `None`) refuses
@@ -463,8 +463,8 @@ owner calls described above.
 ## Evidence
 
 Governing spec: csl-research `contracts/PRODUCT.md` at
-`055cc7a5c793b7135e5d0565dc4198cf96230531`, SHA-256
-`e64783152f6d67d4ede774dc41d112fe46c2d7536d53cb2c04e71a3566044daf`, CSLR-D-011.
+`d84cdd26a4de2366f3c5d34c4aec5215f822a494`, SHA-256
+`e1d5fb8c02594b2ca88281113ffc14e6f3125daded2a00d45739cfb9d2ed04dd`, CSLR-D-012.
 
 Candidate record this module was written against (research stays in the vault):
 

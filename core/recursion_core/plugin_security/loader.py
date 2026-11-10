@@ -71,6 +71,8 @@ class LoadedPlugin:
     findings: tuple
     developer_key_id: str | None = None
     manifest_raw: bytes = b""
+    # SHA-256 of the bytes that were compiled. Signed trust belongs to this digest.
+    code_sha256: str = ""
 
 
 def _finding(stage: str, code: str, severity: str, detail: str = "") -> dict:
@@ -136,17 +138,18 @@ class PluginLoader:
         return None if plugin is None else plugin.artifact_sha256
 
     def doctor(self, manifest_bytes: bytes, signature: object, artifact: bytes,
-               registry_label: str | None = None) -> list[dict]:
+               registry_label: str | None = None, *, root: str | None = None) -> list[dict]:
         """Run verify and admit only (no code executes) and return every finding."""
         findings: list[dict] = []
         try:
-            self._verify_admit(manifest_bytes, signature, artifact, registry_label, findings)
+            self._verify_admit(manifest_bytes, signature, artifact, registry_label, findings, root)
         except Refused as exc:
             findings.append(_finding(findings[-1]["stage"] if findings else "verify",
                                      exc.code, "refuse", exc.detail))
         return findings
 
-    def _verify_admit(self, manifest_bytes, signature, artifact, registry_label, findings):
+    def _verify_admit(self, manifest_bytes, signature, artifact, registry_label, findings,
+                      root: str | None = None):
         if type(artifact) is not bytes:
             raise Refused("artifact_not_bytes")
         manifest = parse_manifest(manifest_bytes)
@@ -175,6 +178,12 @@ class PluginLoader:
             if perm in perms:
                 findings.append(_finding("admit", perm + "_granted", "warn",
                                          "in-process code is not confined to this grant"))
+        if manifest.install_scripts and root is not None:
+            # Read each script through the directory descriptor. A symlink is refused
+            # here, at the open, rather than by a path checked and opened again later.
+            from .paths import read_within_root
+            for script in manifest.install_scripts:
+                read_within_root(root, script)
         if manifest.install_scripts:
             findings.append(_finding("admit", "install_scripts_present", "warn",
                                      "re-consent on change; scripts are not run by the loader"))
@@ -184,14 +193,32 @@ class PluginLoader:
         return manifest, trust, kid, label, perms
 
     def load(self, manifest_bytes: bytes, signature: object, artifact: bytes,
-             registry_label: str | None = None) -> LoadedPlugin:
+             registry_label: str | None = None, *, root: str | None = None) -> LoadedPlugin:
         with self._lock:
             self._health.require_healthy()
             findings: list[dict] = []
             active: LoadedPlugin | None = None
             try:
+                if type(artifact) is bytes:
+                    try:
+                        preview = parse_manifest(manifest_bytes)
+                    except Refused:
+                        preview = None
+                    if preview is not None:
+                        active = self._active.get(preview.plugin_id)
+                        # Trust is for the bytes that were compiled. Different bytes with
+                        # the same manifest are not that digest, so the recorded signature
+                        # and its permissions no longer apply.
+                        if active is not None and hashlib.sha256(artifact).hexdigest() != active.code_sha256:
+                            findings.append(_finding("verify", "artifact_digest_mismatch", "refuse"))
+                            cleared = replace(
+                                active, trust="unsigned", signer_key_id=None, permissions=(),
+                                findings=tuple(findings), manifest_raw=b"")
+                            self._active[preview.plugin_id] = cleared
+                            self.last_findings = cleared.findings
+                            raise Refused("artifact_digest_mismatch", preview.plugin_id)
                 manifest, trust, kid, label, perms = self._verify_admit(
-                    manifest_bytes, signature, artifact, registry_label, findings)
+                    manifest_bytes, signature, artifact, registry_label, findings, root)
                 active = self._active.get(manifest.plugin_id)
                 if active is not None and active.manifest_raw == manifest.raw and (
                         active.artifact_sha256 == manifest.artifact_sha256):
@@ -228,7 +255,8 @@ class PluginLoader:
                 self._active[manifest.plugin_id] = updated
                 self.last_findings = updated.findings
                 return updated
-            return self._activate(manifest, trust, kid, label, perms, code, findings)
+            return self._activate(manifest, trust, kid, label, perms, code, findings,
+                                  hashlib.sha256(artifact).hexdigest())
 
     def _gil_gate(self, name: str, findings: list) -> bool:
         """Read the GIL; if it is on, poison the core and drop every active plugin."""
@@ -240,7 +268,8 @@ class PluginLoader:
         self.last_findings = tuple(findings)
         return True
 
-    def _activate(self, manifest: Manifest, trust, kid, label, perms, code, findings) -> LoadedPlugin:
+    def _activate(self, manifest: Manifest, trust, kid, label, perms, code, findings,
+                  code_sha256: str) -> LoadedPlugin:
         before = set(sys.modules)
         module = types.ModuleType("csl_plugin_" + manifest.plugin_id.replace(".", "_").replace("-", "_"))
         failure: BaseException | None = None
@@ -264,7 +293,7 @@ class PluginLoader:
         findings.append(_finding("active", "active", "info", "in_process_not_contained"))
         loaded = LoadedPlugin(manifest.plugin_id, manifest.artifact_sha256, trust, kid, label,
                               perms, module, tuple(findings), key_id(manifest.developer_key),
-                              manifest.raw)
+                              manifest.raw, code_sha256)
         self._active[manifest.plugin_id] = loaded
         self.last_findings = loaded.findings
         return loaded

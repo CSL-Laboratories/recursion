@@ -5,11 +5,13 @@ subscription login), never on an engine or model name. Only a typed limit event
 trips it; the core's own timeouts and deadlines never do (S3, S4). A tripped
 connection resets only through a successful leased probe: ``begin_probe`` hands out
 one lease per tripped connection, and ``reset_after_probe`` clears the trip only for
-that lease. Each trip stores a generation. The lease is bound to the generation it
-saw, and a reset deletes the row only when that generation is still current, so a
-probe that finished before a later trip cannot clear it. That holds for two breakers
-on one store: the generation lives in SQLite, not in one process's lease table. A
-lease is one use and expires after ``probe_lease_seconds``.
+that lease. Each trip takes the next value of a per-connection counter that is not
+deleted when the trip is cleared, so a generation is never issued twice. The lease is
+bound to the generation it saw, and a reset deletes the trip row only when that
+generation is still current. A probe that finished before a later trip cannot clear
+it, including after the earlier trip was cleared and the connection tripped again.
+That holds for two breakers on one store: the counter lives in SQLite, not in one
+process's lease table. A lease is one use and expires after ``probe_lease_seconds``.
 
 A run that ended in a fault is recorded here too, so an effect proposed by that run,
 or by any run on a tripped connection, is refused at the approval gate (4.2, B15).
@@ -37,7 +39,7 @@ import time
 from typing import Callable
 
 from .errors import Refused
-from .paths import check_store_path
+from .paths import abandon_store, check_store_path, open_new_store
 
 __all__ = ["ConnectionBreaker", "TYPED_LIMITS", "create_breaker_store"]
 
@@ -55,28 +57,26 @@ def _check_id(value: object, code: str) -> str:
 
 def create_breaker_store(path: str) -> None:
     """Installer step: create the breaker store. Refuses if it exists."""
-    path = check_store_path(path)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    os.close(fd)
+    path = open_new_store(path)
     try:
         db = sqlite3.connect(path, isolation_level=None)
-    except sqlite3.OperationalError as exc:
-        if "unable to open" in str(exc).lower():
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
-            raise Refused("store_path_too_long") from None
-        raise
+    except (sqlite3.Error, OSError, UnicodeEncodeError):
+        abandon_store(path)
+        raise Refused("store_path_too_long") from None
     try:
-        db.execute("PRAGMA journal_mode=WAL")
-        db.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
-        db.execute("CREATE TABLE runs (run_id TEXT PRIMARY KEY, connection TEXT NOT NULL,"
-                   " plugin_id TEXT NOT NULL, provider TEXT NOT NULL, model_version TEXT NOT NULL)")
-        db.execute("CREATE TABLE faulted (run_id TEXT PRIMARY KEY)")
-        db.execute("CREATE TABLE tripped (connection TEXT PRIMARY KEY, event_type TEXT NOT NULL,"
-                   " generation INTEGER NOT NULL)")
-        db.execute("INSERT INTO meta VALUES ('magic', ?)", (_STORE_MAGIC,))
+        try:
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
+            db.execute("CREATE TABLE runs (run_id TEXT PRIMARY KEY, connection TEXT NOT NULL,"
+                       " plugin_id TEXT NOT NULL, provider TEXT NOT NULL, model_version TEXT NOT NULL)")
+            db.execute("CREATE TABLE faulted (run_id TEXT PRIMARY KEY)")
+            db.execute("CREATE TABLE tripped (connection TEXT PRIMARY KEY, event_type TEXT NOT NULL,"
+                       " generation INTEGER NOT NULL)")
+            db.execute("CREATE TABLE trip_seq (connection TEXT PRIMARY KEY, generation INTEGER NOT NULL)")
+            db.execute("INSERT INTO meta VALUES ('magic', ?)", (_STORE_MAGIC,))
+        except BaseException:
+            abandon_store(path)
+            raise
     finally:
         db.close()
 
@@ -136,14 +136,19 @@ class ConnectionBreaker:
         with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
             try:
-                row = self._db.execute(
-                    "SELECT generation FROM tripped WHERE connection=?", (connection,)).fetchone()
-                generation = 1 if row is None or row[0] is None else int(row[0]) + 1
+                # trip_seq is not deleted when the trip row is. The next trip cannot
+                # be given a generation a probe of the cleared trip still holds.
+                self._db.execute(
+                    "INSERT INTO trip_seq (connection, generation) VALUES (?, 1) "
+                    "ON CONFLICT(connection) DO UPDATE SET generation = trip_seq.generation + 1",
+                    (connection,))
+                generation = self._db.execute(
+                    "SELECT generation FROM trip_seq WHERE connection=?", (connection,)).fetchone()
                 self._db.execute(
                     "INSERT INTO tripped (connection, event_type, generation) VALUES (?, ?, ?) "
                     "ON CONFLICT(connection) DO UPDATE SET event_type = excluded.event_type, "
                     "generation = excluded.generation",
-                    (connection, event_type, generation))
+                    (connection, event_type, int(generation[0])))
                 self._db.execute("COMMIT")
             except BaseException:
                 self._db.execute("ROLLBACK")
@@ -188,13 +193,20 @@ class ConnectionBreaker:
             return cursor.rowcount == 1
 
     def _ensure_generation(self) -> None:
-        """Stores created before the trip generation column gain it, starting at 1."""
+        """Stores created before the trip counter gain it. A cleared trip is not reused."""
         columns = [row[1] for row in self._db.execute("PRAGMA table_info(tripped)")]
-        if "generation" in columns:
-            return
         try:
+            if "generation" not in columns:
+                self._db.execute(
+                    "ALTER TABLE tripped ADD COLUMN generation INTEGER NOT NULL DEFAULT 1")
             self._db.execute(
-                "ALTER TABLE tripped ADD COLUMN generation INTEGER NOT NULL DEFAULT 1")
+                "CREATE TABLE IF NOT EXISTS trip_seq ("
+                "connection TEXT PRIMARY KEY, generation INTEGER NOT NULL)")
+            self._db.execute(
+                "INSERT INTO trip_seq (connection, generation) "
+                "SELECT connection, generation FROM tripped WHERE generation IS NOT NULL "
+                "ON CONFLICT(connection) DO UPDATE SET "
+                "generation = MAX(trip_seq.generation, excluded.generation)")
         except sqlite3.DatabaseError:
             self._db.close()
             raise Refused("breaker_store_invalid") from None

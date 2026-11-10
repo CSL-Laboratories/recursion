@@ -82,6 +82,19 @@ class TripGenerationTests(unittest.TestCase):
         self.assertFalse(first.reset_after_probe("conn-a", lease, True))
         self.assertTrue(second.tripped("conn-a"))
 
+    def test_a_cleared_generation_is_not_reused_for_the_next_trip(self) -> None:
+        first = self._open()
+        second = ConnectionBreaker(self.path)
+        self.assertTrue(first.report("conn-a", "rate_limit"))
+        lease_a = first.begin_probe("conn-a")
+        lease_b = second.begin_probe("conn-a")
+        self.assertTrue(second.reset_after_probe("conn-a", lease_b, True))
+        second.close()
+        reopened = self._open()  # the clearer comes back with an empty lease table
+        self.assertTrue(reopened.report("conn-a", "plan_limit"))
+        self.assertFalse(first.reset_after_probe("conn-a", lease_a, True))
+        self.assertTrue(reopened.tripped("conn-a"))
+
 
 class StorePathTests(unittest.TestCase):
     def test_a_505_byte_sqlite_path_is_a_refusal_not_a_crash(self) -> None:
@@ -102,6 +115,56 @@ class StorePathTests(unittest.TestCase):
         self.assertEqual(len(short.encode()), 504)
         create_breaker_store(short)
         self.assertTrue(os.path.isfile(short))
+
+    def test_a_relative_path_is_judged_by_the_path_sqlite_opens(self) -> None:
+        root = temp_dir(self)
+        absolute = _deep_path(root, 520)
+        relative = os.path.relpath(absolute, root)
+        self.assertLessEqual(len(relative.encode()) + len(b"-journal"), 512)
+        self.assertGreater(len(absolute.encode()) + len(b"-journal"), 512)
+        previous = os.getcwd()
+        os.chdir(root)
+        self.addCleanup(os.chdir, previous)
+        for opener in (create_breaker_store, create_revocation_store):
+            with self.subTest(opener=opener.__name__):
+                with self.assertRaises(Refused) as ctx:
+                    opener(relative)
+                self.assertEqual(ctx.exception.code, "store_path_too_long")
+                self.assertFalse(os.path.exists(absolute))
+        with self.assertRaises(Refused) as ctx:
+            create_ledger(relative, "ab" * 32)
+        self.assertEqual(ctx.exception.code, "store_path_too_long")
+        self.assertFalse(os.path.exists(absolute))
+
+    def test_a_component_past_name_max_is_a_refusal_and_leaves_nothing(self) -> None:
+        root = temp_dir(self)
+        path = os.path.join(root, "n" * 256)
+        self.assertLess(len(path.encode()) + len(b"-journal"), 512)
+        for opener in (create_breaker_store, create_revocation_store):
+            with self.subTest(opener=opener.__name__):
+                with self.assertRaises(Refused) as ctx:
+                    opener(path)
+                self.assertEqual(ctx.exception.code, "store_path_too_long")
+                self.assertFalse(os.path.lexists(path))
+        with self.assertRaises(Refused) as ctx:
+            create_ledger(path, "ab" * 32)
+        self.assertEqual(ctx.exception.code, "store_path_too_long")
+        self.assertFalse(os.path.lexists(path))
+
+    def test_uri_and_memory_names_are_not_opened(self) -> None:
+        root = temp_dir(self)
+        previous = os.getcwd()
+        os.chdir(root)
+        self.addCleanup(os.chdir, previous)
+        for name in (":memory:", "file:actual.db?mode=rwc", "file:actual.db"):
+            with self.subTest(name=name):
+                with self.assertRaises(Refused) as ctx:
+                    create_breaker_store(name)
+                self.assertEqual(ctx.exception.code, "store_path_invalid")
+                with self.assertRaises(Refused) as ctx:
+                    create_revocation_store(name)
+                self.assertEqual(ctx.exception.code, "store_path_invalid")
+        self.assertEqual(os.listdir(root), [])
 
     def test_non_encodable_store_path_is_a_refusal(self) -> None:
         root = temp_dir(self)
@@ -153,26 +216,56 @@ class PluginTrustPathTests(unittest.TestCase):
             FakeGilProbe(),
         )
 
-    def test_manifest_paths_cannot_leave_the_trusted_root(self) -> None:
-        from recursion_core.plugin_security.paths import resolve_within_root
+    def test_a_symlinked_install_script_is_refused_by_load(self) -> None:
+        from recursion_core.plugin_security.paths import read_within_root
         outside = temp_dir(self)
-        secret = os.path.join(outside, "secret.json")
+        secret = os.path.join(outside, "secret.sh")
         with open(secret, "wb") as fh:
-            fh.write(b"nope")
-        for declared in ("../" + os.path.basename(outside) + "/secret.json", secret, "foo/../../etc/passwd"):
+            fh.write(b"SECRET\n")
+        script = os.path.join(self.root, "install.sh")
+        with open(script, "wb") as fh:
+            fh.write(b"safe\n")
+        raw = manifest_bytes(self.dev.public, source=self.source, install_scripts=("install.sh",))
+        loaded = self.loader.load(raw, self.dev.sign(raw), self.source, root=self.root)
+        self.assertEqual(loaded.trust, "signed")
+        # The open that load uses must be the same descriptor it read. A later
+        # path-based reopen, after the name is swapped for a symlink, would see SECRET.
+        real_open = os.open
+
+        def open_then_swap(path, flags, mode=0o777, *, dir_fd=None):
+            name = path if isinstance(path, str) else os.fsdecode(path)
+            if name.endswith("install.sh") and not (flags & os.O_NOFOLLOW):
+                if not os.path.islink(script):
+                    os.remove(script)
+                    os.symlink(secret, script)
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        os.open = open_then_swap
+        try:
+            self.assertEqual(read_within_root(self.root, "install.sh"), b"safe\n")
+        finally:
+            os.open = real_open
+        if not os.path.islink(script):
+            os.remove(script)
+            os.symlink(secret, script)
+        with self.assertRaises(Refused) as ctx:
+            self.loader.load(raw, self.dev.sign(raw), self.source, root=self.root)
+        self.assertEqual(ctx.exception.code, "plugin_path_escapes_root")
+        for declared in ("../" + os.path.basename(outside) + "/secret.sh", secret, "foo/../../etc/passwd"):
             with self.subTest(declared=declared):
                 with self.assertRaises(Refused) as ctx:
-                    resolve_within_root(self.root, declared)
+                    read_within_root(self.root, declared)
                 self.assertEqual(ctx.exception.code, "plugin_path_escapes_root")
-        link = os.path.join(self.root, "manifest.json")
-        os.symlink(secret, link)
+
+    def test_swapped_code_with_the_same_manifest_drops_signed_trust(self) -> None:
+        loaded = self.loader.load(self.raw, self.dev.sign(self.raw), self.source)
+        self.assertEqual(loaded.trust, "signed")
+        self.assertIn("order", loaded.permissions)
         with self.assertRaises(Refused) as ctx:
-            resolve_within_root(self.root, "manifest.json")
-        self.assertEqual(ctx.exception.code, "plugin_path_escapes_root")
-        inside = os.path.join(self.root, "kept.json")
-        with open(inside, "wb") as fh:
-            fh.write(self.raw)
-        self.assertEqual(resolve_within_root(self.root, "kept.json"), inside)
+            self.loader.load(self.raw, self.dev.sign(self.raw), self.source + b"\n# tampered\n")
+        self.assertEqual(ctx.exception.code, "artifact_digest_mismatch")
+        self.assertEqual(self.loader._active["demo.plugin"].trust, "unsigned")
+        self.assertNotIn("order", self.loader.permissions("demo.plugin"))
 
     def test_install_scripts_cannot_be_absolute_or_dotdot(self) -> None:
         for script in ("../outside.sh", "/tmp/install.sh", "sub/../../etc/passwd"):
@@ -218,6 +311,22 @@ class RevocationGenerationTests(unittest.TestCase):
         db = sqlite3.connect(path)
         self.addCleanup(db.close)
         self.assertEqual(db.execute("SELECT generation FROM revoked WHERE key_id=?", (kid,)).fetchone()[0], 3)
+
+    def test_a_failed_write_does_not_stick_later_revokes(self) -> None:
+        path = os.path.join(temp_dir(self), "revoked.db")
+        create_revocation_store(path)
+        kid = "ed25519:" + "ab" * 32
+        trust = TrustStore({}, revocation_store=path)
+        self.addCleanup(trust.close)
+        self.assertEqual(trust.revoke(kid), 1)
+        trust._db.execute("PRAGMA query_only=ON")
+        with self.assertRaises(Refused) as ctx:
+            trust.revoke(kid)
+        self.assertEqual(ctx.exception.code, "revocation_not_durable")
+        self.assertEqual(trust.generation(kid), 2)
+        trust._db.execute("PRAGMA query_only=OFF")
+        self.assertEqual(trust.revoke(kid), 3)
+        self.assertEqual(trust.revoke(kid), 4)
 
 
 class ChildEnvEncodingTests(unittest.TestCase):

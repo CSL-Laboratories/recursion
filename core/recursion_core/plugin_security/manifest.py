@@ -133,17 +133,23 @@ def _script_escapes(value: str) -> bool:
 
 def create_revocation_store(path: str) -> None:
     """Installer step: create the durable revoked-key store. Refuses if it exists."""
-    from .paths import check_store_path
-    path = check_store_path(path)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    os.close(fd)
-    db = sqlite3.connect(path, isolation_level=None)
+    from .paths import abandon_store, open_new_store
+    path = open_new_store(path)
     try:
-        db.execute("PRAGMA journal_mode=WAL")
-        db.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
-        db.execute(
-            "CREATE TABLE revoked (key_id TEXT PRIMARY KEY, generation INTEGER NOT NULL)")
-        db.execute("INSERT INTO meta VALUES ('magic', ?)", (_REVOCATION_MAGIC,))
+        db = sqlite3.connect(path, isolation_level=None)
+    except (sqlite3.Error, OSError, UnicodeEncodeError):
+        abandon_store(path)
+        raise Refused("store_path_too_long") from None
+    try:
+        try:
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
+            db.execute(
+                "CREATE TABLE revoked (key_id TEXT PRIMARY KEY, generation INTEGER NOT NULL)")
+            db.execute("INSERT INTO meta VALUES ('magic', ?)", (_REVOCATION_MAGIC,))
+        except BaseException:
+            abandon_store(path)
+            raise
     finally:
         db.close()
 
@@ -176,6 +182,7 @@ class TrustStore:
             keys[key_id(hex_key)] = (label, hex_key)
         self._keys = MappingProxyType(keys)
         self._lock = threading.Lock()
+        self._store_path = revocation_store
         self._db = None if revocation_store is None else self._open_store(revocation_store)
         generations = {}
         if self._db is not None:
@@ -250,22 +257,28 @@ class TrustStore:
             try:
                 # The stored generation only moves forward. A store opened before a
                 # later revoke still holds the old number in memory; writing that
-                # number would roll the row backward. The conflict path adds one to
-                # whatever is stored, and this opener adopts the higher result.
+                # number would roll the row backward. A failed write leaves memory
+                # ahead of the row, so the next successful write takes the higher of
+                # "one past the row" and the generation this opener already holds.
                 self._db.execute("BEGIN IMMEDIATE")
-                self._db.execute(
-                    "INSERT INTO revoked (key_id, generation) VALUES (?, ?) "
-                    "ON CONFLICT(key_id) DO UPDATE SET generation = revoked.generation + 1",
-                    (kid, generation),
-                )
-                row = self._db.execute(
-                    "SELECT generation FROM revoked WHERE key_id = ?", (kid,)).fetchone()
-                self._db.execute("COMMIT")
-            except sqlite3.Error:
                 try:
-                    self._db.execute("ROLLBACK")
-                except sqlite3.Error:
-                    pass
+                    self._db.execute(
+                        "INSERT INTO revoked (key_id, generation) VALUES (?, ?) "
+                        "ON CONFLICT(key_id) DO UPDATE SET "
+                        "generation = MAX(revoked.generation + 1, excluded.generation)",
+                        (kid, generation),
+                    )
+                    row = self._db.execute(
+                        "SELECT generation FROM revoked WHERE key_id = ?", (kid,)).fetchone()
+                    self._db.execute("COMMIT")
+                except BaseException:
+                    try:
+                        self._db.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise
+            except sqlite3.Error:
+                self._reopen_store()
                 raise Refused("revocation_not_durable", kid) from None
             if row is None or type(row[0]) is not int or row[0] < generation:
                 raise Refused("revocation_not_durable", kid)
@@ -275,6 +288,21 @@ class TrustStore:
                 self._generation = MappingProxyType(updated)
                 self._revoked = frozenset(updated)
             return row[0]
+
+    def _reopen_store(self) -> None:
+        """Drop a connection a failed write left unusable and open a fresh one."""
+        db = self._db
+        self._db = None
+        if db is not None:
+            try:
+                db.close()
+            except sqlite3.Error:
+                pass
+        if self._store_path is not None:
+            try:
+                self._db = self._open_store(self._store_path)
+            except Refused:
+                self._db = None
 
     def close(self) -> None:
         db = self._db

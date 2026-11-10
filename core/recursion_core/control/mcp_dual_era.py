@@ -123,6 +123,14 @@ def _iso(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _timestamp(value: object, fallback: float) -> float:
+    """A real epoch number, or ``fallback``. ``bool`` is an ``int`` and is not a timestamp; ``0`` is."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return fallback
+    return float(value)
+
+
 def _run_status(state: str) -> str:
     """F56 run-state map onto the Tasks extension statuses.
 
@@ -170,8 +178,11 @@ class DualEraServer:
     ``tools/call`` for start, poll and cancel. Modern: stateless
     ``server/discover``, a ``_meta`` envelope on every request, ``resultType``
     on every result, and ``CreateTaskResult`` from ``tools/call`` only when that
-    request lists the Tasks extension. ``tasks/list`` and
+    request lists the Tasks extension.     ``tasks/list`` and
     ``notifications/cancelled`` / ``notifications/tasks`` are not emitted.
+    An inbound message with no ``id`` is a notification: it is recorded and
+    answered with nothing, and it does not stop a run. JSON-RPC id ``0`` is a
+    request and is still answered.
     A "list runs" call stays the plain ``recursion_run_list`` tool in both eras.
 
     ``tools/list`` returns the control tool descriptors in both eras. When
@@ -190,10 +201,15 @@ class DualEraServer:
         self.notifications: list[dict] = []
         self.legacy_sessions = 0
 
-    def handle(self, message: Mapping) -> dict:
+    def handle(self, message: Mapping) -> dict | None:
         method = message.get("method")
-        req_id = message.get("id")
         params = message.get("params") if isinstance(message.get("params"), Mapping) else {}
+        if "id" not in message:
+            # A notification has no id. JSON-RPC id 0 is a request and is answered below.
+            # notifications/cancelled names a request id, not a task, and is not a Stop.
+            self.notifications.append({"method": method, "params": dict(params)})
+            return None
+        req_id = message.get("id")
         if method == "initialize":
             return self._ok(req_id, self._initialize(params))
         if method == "server/discover":
@@ -304,8 +320,7 @@ class DualEraServer:
         status_answer = self.api.call("run.status", {"run_id": run_id})
         if status_answer.get("code") == "ok" and isinstance(status_answer.get("run"), Mapping):
             run = status_answer["run"]
-        started = run.get("started_at")
-        now = _iso(started if isinstance(started, (int, float)) else self._clock())
+        now = _iso(_timestamp(run.get("started_at"), self._clock()))
         body = {
             "resultType": "task",
             "taskId": run_id,
@@ -332,15 +347,17 @@ class DualEraServer:
         return self._ok(req_id, body)
 
     def _task_body(self, rec: Mapping, *, extra: dict | None = None) -> dict:
-        now = _iso(rec.get("started_at", self._clock()) if rec.get("started_at") else self._clock())
+        clock = self._clock()
+        started = _timestamp(rec.get("started_at"), clock)
+        now = _iso(started)
         updated = rec.get("stop") or {}
-        last = updated.get("requested_at", rec.get("started_at", self._clock()))
+        last = _timestamp(updated.get("requested_at"), started)
         body = {
             "resultType": "complete",
             "taskId": rec["run_id"],
             "status": _task_status(rec),
-            "createdAt": _iso(rec.get("started_at", self._clock())),
-            "lastUpdatedAt": _iso(last) if isinstance(last, (int, float)) else now,
+            "createdAt": now,
+            "lastUpdatedAt": _iso(last),
             "ttlMs": None,
         }
         if extra:

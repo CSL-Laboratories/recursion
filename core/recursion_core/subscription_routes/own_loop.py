@@ -23,6 +23,7 @@ answered by a caller-supplied probe (``has_copilot_login``), and with no probe t
 from __future__ import annotations
 
 import ipaddress
+import os
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -125,8 +126,7 @@ def check_copilot_own_loop(
     """
 
     _common("copilot", route, _COPILOT_FIELDS, "copilot_cli_sign_in")
-    if not isinstance(parent_env, Mapping):
-        raise OwnLoopRouteRefused("copilot", "parent_env_malformed")
+    parent_env = _screen_parent_env("copilot", parent_env)
     if has_copilot_login is None:
         raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "no stored-login probe; gh fallback refused")
     try:
@@ -143,19 +143,58 @@ def check_copilot_own_loop(
     return OwnLoopDecision("copilot", "copilot_cli_sign_in", MappingProxyType(child), removed, model=model)
 
 
+def _screen_parent_env(engine: str, parent_env: object) -> Mapping[str, str]:
+    """Refuse a parent env that is not a string map ``Popen`` can encode.
+
+    A non-string name used to raise ``AttributeError`` from ``str.upper``. A null or text this
+    process cannot encode used to crash at launch (``ValueError`` or ``UnicodeEncodeError``).
+    """
+
+    if not isinstance(parent_env, Mapping):
+        raise OwnLoopRouteRefused(engine, "parent_env_malformed")
+    for name, value in parent_env.items():
+        if not isinstance(name, str) or not isinstance(value, str) or "\x00" in name or "\x00" in value:
+            raise OwnLoopRouteRefused(engine, "parent_env_malformed")
+        try:
+            os.fsencode(name)
+            os.fsencode(value)
+        except UnicodeEncodeError:
+            raise OwnLoopRouteRefused(engine, "env_unencodable") from None
+    return parent_env
+
+
+def _reported_address(base_url: object) -> str:
+    """The address a doctor line may repeat. A URL with a user or password is not repeated."""
+
+    if not isinstance(base_url, str):
+        return ""
+    try:
+        parts = urlsplit(base_url)
+    except ValueError:
+        return ""
+    if parts.username or parts.password:
+        return ""
+    return base_url
+
+
 def _loopback_url(base_url: object) -> str:
     if not isinstance(base_url, str) or not base_url.strip():
         raise OwnLoopRouteRefused("nous", "proxy_address_missing")
+    text = base_url.strip()
     try:
-        parts = urlsplit(base_url.strip())
+        parts = urlsplit(text)
         host = parts.hostname
-        parts.port  # noqa: B018 - raises on a bad port
-    except ValueError as exc:
-        raise OwnLoopRouteRefused("nous", "proxy_address_malformed", str(exc)) from None
-    if parts.scheme not in _NOUS_SCHEMES or not host:
-        raise OwnLoopRouteRefused("nous", "proxy_address_malformed", base_url)
+    except ValueError:
+        raise OwnLoopRouteRefused("nous", "proxy_address_malformed") from None
+    # Before the scheme check: a bad scheme used to put the whole URL, password included, in the refusal.
     if parts.username or parts.password:
         raise OwnLoopRouteRefused("nous", "recursion_holds_no_token", "credentials in proxy URL")
+    try:
+        parts.port  # noqa: B018 - raises on a bad port
+    except ValueError:
+        raise OwnLoopRouteRefused("nous", "proxy_address_malformed") from None
+    if parts.scheme not in _NOUS_SCHEMES or not host:
+        raise OwnLoopRouteRefused("nous", "proxy_address_malformed")
     try:
         addr = ipaddress.ip_address(host)
     except ValueError:
@@ -207,7 +246,7 @@ def nous_proxy_doctor(
     try:
         url = _loopback_url(base_url)
     except OwnLoopRouteRefused as exc:
-        return {"ok": False, "address": base_url if isinstance(base_url, str) else "", "cause": exc.cause,
+        return {"ok": False, "address": _reported_address(base_url), "cause": exc.cause,
                 "warnings": warnings}
     return {"ok": True, "address": url, "cause": "", "warnings": warnings}
 
@@ -234,8 +273,7 @@ def check_nous_own_loop(
     """
 
     _common("nous", route, _NOUS_FIELDS, "hermes_local_proxy")
-    if not isinstance(parent_env, Mapping):
-        raise OwnLoopRouteRefused("nous", "parent_env_malformed")
+    parent_env = _screen_parent_env("nous", parent_env)
     url = _loopback_url(route.get("base_url"))
     adapters = _adapters(route.get("adapters"))
     model = _model("nous", route.get("model"))

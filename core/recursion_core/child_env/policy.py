@@ -53,6 +53,7 @@ new core's runtime calls it yet.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 import shutil
@@ -473,13 +474,29 @@ def _trusted_origins(value: object) -> frozenset[tuple[str, str, int]] | None:
     return frozenset(origins)
 
 
+def _bad_bracket_host(host: str) -> bool:
+    """A bracketed host that is not an IPv6 address (``[:::]``, ``[1:2:3]``): no engine could reach it.
+
+    The patterns only limit the characters between the brackets, so the address is parsed here
+    (Devin, "Invalid IPv6 gateway reaches child"). A zone id never gets this far: the patterns have no ``%``.
+    """
+
+    if not host.startswith("["):
+        return False
+    try:
+        ipaddress.IPv6Address(host[1:-1])
+    except ValueError:
+        return True
+    return False
+
+
 def _unsafe_base_url(value: object) -> str | None:
     """A route base URL is http(s)://host[:port][/path]: no user name or password, no query, no fragment."""
 
     if not isinstance(value, str):
         return "base_url_malformed"
     match = _BASE_URL.match(value)
-    if match is None or match["scheme"].lower() not in ("http", "https"):
+    if match is None or match["scheme"].lower() not in ("http", "https") or _bad_bracket_host(match["host"]):
         return "base_url_malformed"
     if match["userinfo"] is not None:
         return "base_url_userinfo"
@@ -643,6 +660,8 @@ def _unsafe_proxy(value: str, schemes: tuple[str, ...] = ("http", "https")) -> s
 
     match = _PROXY_URL.match(value)
     if match is None or match["scheme"] is not None and match["scheme"].lower() not in schemes:
+        return "proxy_malformed"
+    if _bad_bracket_host(match["host"]):
         return "proxy_malformed"
     if match["userinfo"] is not None:
         return "proxy_userinfo"

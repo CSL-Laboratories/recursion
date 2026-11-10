@@ -405,6 +405,27 @@ def cells(s: Scratch) -> list[Cell]:
         route=ChildRoute(api_key=USER_KEY, base_url=base_url))
     add("sub_base_url_ok", "cloud_needs_no_trust", {}, L(_same(**{bedrock: "1", url: base_url})), auth=cloud,
         route=ChildRoute(base_url=base_url, provider_switches=(bedrock,)))
+    # A bracketed host must be an IPv6 address (Devin, "Invalid IPv6 gateway reaches child"): the base URL, a
+    # trusted entry and a proxy value refuse as malformed; a real address launches as before.
+    for name, host in (("colons", "[:::]"), ("short", "[1:2:3]"), ("not_hex", "[::g]"), ("dots", "[1.2.3.4]")):
+        add("bracket_host", f"base_url_{name}", {}, R("base_url_malformed"), auth=api,
+            route=ChildRoute(api_key=USER_KEY, base_url=f"https://{host}"))
+    add("bracket_host", "base_url_sub_full_access", token, R("base_url_malformed"),
+        route=sub_url("http://[::g]:8443/v1", full_access_acknowledged=True))
+    add("bracket_host", "trusted_entry", token, R("route_trusted_base_urls_malformed"),
+        route=sub_url(base_url, trusted_base_urls=(origin, "https://[:::]")))
+    add("bracket_host", "proxy_colons", {"HTTPS_PROXY": "http://[:::]:3128"}, R("proxy_malformed"))
+    add("bracket_host", "proxy_short", {"http_proxy": "[1:2:3]:3128"}, R("proxy_malformed"), engine="codex")
+    add("bracket_host", "allproxy_not_hex", {"ALL_PROXY": "socks5://[::g]:1080"}, R("proxy_malformed"))
+    add("bracket_host_ok", "base_url_loopback", {}, L(_same(**{key: USER_KEY, url: "https://[::1]:8443/v1/"})), auth=api,
+        route=ChildRoute(api_key=USER_KEY, base_url="https://[::1]:8443/v1/"))
+    add("bracket_host_ok", "base_url_sub_trusted", token, L(_same(**{url: "https://[2001:db8::1]"}, **token)),
+        route=sub_url("https://[2001:db8::1]", trusted_base_urls=("https://[2001:DB8::1]:443",)))
+    add("bracket_host_ok", "base_url_v4_mapped", {}, L(_same(**{key: USER_KEY, url: "http://[::ffff:127.0.0.1]:4000"})), auth=api,
+        route=ChildRoute(api_key=USER_KEY, base_url="http://[::ffff:127.0.0.1]:4000"))
+    add("bracket_host_ok", "proxy_loopback", {"HTTPS_PROXY": "http://[::1]:3128"}, L(_same(HTTPS_PROXY="http://[::1]:3128")))
+    add("bracket_host_ok", "allproxy_address", {"ALL_PROXY": "socks5h://[2001:db8::1]:1080"},
+        L(_same(ALL_PROXY="socks5h://[2001:db8::1]:1080")))
     add("auth_route_ok", "codex_key_injected", {**ambient, **token},
         L(both(_same(CODEX_API_KEY=USER_KEY), _absent(*(set(gone) - {"CODEX_API_KEY"}), *token))), engine="codex", auth=api,
         route=ChildRoute(api_key=USER_KEY))

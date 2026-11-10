@@ -99,6 +99,10 @@ class CellTests(unittest.TestCase):
         self._assert_all(self._group("sub_base_url"), 12)
         self._assert_all(self._group("sub_base_url_ok"), 9)
 
+    def test_a_bracketed_host_must_be_an_ipv6_address_cells(self) -> None:
+        self._assert_all(self._group("bracket_host"), 9)
+        self._assert_all(self._group("bracket_host_ok"), 5)
+
     def test_a_dot_dot_out_of_a_directory_others_can_write_is_refused(self) -> None:
         self._assert_all(self._group("dotdot"), 5)
         self._assert_all(self._group("dotdot_ok"), 4)
@@ -567,6 +571,55 @@ class AuthRouteTests(unittest.TestCase):
                                        provider_switches=ROUTES[mode].provider_switches)
                     self.assertEqual((URL, cause), self._refused("claude_code", home, auth_mode=mode, route=route, parent={}))
 
+    def test_a_bracketed_base_url_host_must_be_an_ipv6_address(self) -> None:
+        """Devin, "Invalid IPv6 gateway reaches child": the pattern alone let ``https://[:::]`` reach the child."""
+
+        home = _home(self)
+        bad = ("https://[:::]", "https://[1:2:3]", "http://[::g]", "https://[::1::]", "https://[1.2.3.4]", "https://[.]",
+               "https://[12345::1]", "https://[1:2:3:4:5:6:7:8:9]", "https://[::1%eth0]", "https://[::1%25eth0]",
+               "https://[:::]:8443/v1", "https://[]", "https://[::1")
+        good = ("https://[::1]", "http://[::1]:4000", "https://[2001:db8::1]", "https://[2001:DB8::1]:8443/v1/",
+                "https://[0:0:0:0:0:0:0:1]", "https://[::]", "https://[::ffff:127.0.0.1]")
+        for mode in (API, CLOUD):
+            route = lambda url: ChildRoute(api_key=ROUTES[mode].api_key, base_url=url,  # noqa: E731
+                                           provider_switches=ROUTES[mode].provider_switches)
+            for url in bad:
+                with self.subTest(mode=mode, url=url):
+                    self.assertEqual((URL, "base_url_malformed"),
+                                     self._refused("claude_code", home, auth_mode=mode, route=route(url), parent={}))
+            for url in good:
+                with self.subTest(mode=mode, url=url):
+                    env = build_child_env("claude_code", home=home, auth_mode=mode, route=route(url), parent={})
+                    self.assertEqual(url, env[URL])
+        # A subscription route: the value rule runs before trust and under full access; a trusted entry refuses the list.
+        for url in bad:
+            with self.subTest(mode=SUB, url=url):
+                for more in ({}, {"full_access_acknowledged": True}):
+                    self.assertEqual((URL, "base_url_malformed"), self._refused(
+                        "claude_code", home, auth_mode=SUB, route=ChildRoute(base_url=url, **more), parent={}))
+                self.assertEqual((None, "route_trusted_base_urls_malformed"), self._refused(
+                    "claude_code", home, auth_mode=SUB, parent={},
+                    route=ChildRoute(base_url="https://[::1]", trusted_base_urls=("https://[::1]", url))))
+        for url in ("https://[::1]", "https://[2001:db8::1]"):
+            with self.subTest(mode=SUB, url=url):
+                route = ChildRoute(base_url=url, trusted_base_urls=(url,))
+                self.assertEqual(url, build_child_env("claude_code", home=home, auth_mode=SUB, route=route, parent={})[URL])
+
+    def test_a_bracketed_proxy_host_must_be_an_ipv6_address(self) -> None:
+        home = _home(self)
+        for name, scheme in (("HTTPS_PROXY", "http://"), ("http_proxy", ""), ("ALL_PROXY", "socks5://")):
+            for host in ("[:::]", "[1:2:3]", "[::g]", "[1.2.3.4]"):
+                for value in (scheme + host, scheme + host + ":3128"):
+                    with self.subTest(name=name, value=value):
+                        self.assertEqual((name, "proxy_malformed"), self._refused(
+                            "claude_code", home, auth_mode=SUB, parent={"PATH": "/usr/bin", name: value}))
+                        self.assertEqual((name, "proxy_malformed"), self._refused(
+                            "codex", home, auth_mode=SUB, parent={"PATH": "/usr/bin"}, overrides={name: value}))
+            for host in ("[::1]", "[2001:db8::1]:3128", "[::ffff:127.0.0.1]:3128/"):
+                with self.subTest(name=name, value=scheme + host):
+                    parent = {"PATH": "/usr/bin", name: scheme + host}
+                    self.assertEqual(scheme + host, build_child_env("claude_code", home=home, auth_mode=SUB, parent=parent)[name])
+
     def test_ambient_keys_are_dropped_in_every_mode(self) -> None:
         home = _home(self)
         for engine, profile in ENGINE_PROFILES.items():
@@ -726,7 +779,7 @@ class AuthRouteTests(unittest.TestCase):
 
     def test_child_env_reads_no_keyring_and_no_key_file(self) -> None:
         # Key custody: the caller fetches the key (OS keyring, or the owner-only file); this package is handed it.
-        allowed = {"__future__", "os", "re", "shutil", "stat", "subprocess", "tempfile", "threading", "collections.abc",
+        allowed = {"__future__", "ipaddress", "os", "re", "shutil", "stat", "subprocess", "tempfile", "threading", "collections.abc",
                    "dataclasses", "pathlib", "types", "recursion_core.child_env.policy", "recursion_core.child_env.launch"}
         for module in (policy, launch):
             tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))

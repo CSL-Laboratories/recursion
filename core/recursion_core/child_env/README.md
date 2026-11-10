@@ -89,7 +89,9 @@ Foundry switches are dropped. The child gets one only from the route:
   proxy, an OpenRouter-style gateway, another Anthropic-compatible base); with none it is
   unset. The supplied URL must be `http(s)://host[:port][/path]`: a user name or password
   refuses with `base_url_userinfo`, and a missing or other scheme, a query, a fragment, a bad
-  port or a `..` path refuses with `base_url_malformed`. On an `api_key` or `cloud_provider`
+  port or a `..` path refuses with `base_url_malformed`. A bracketed host must be an IPv6
+  address (`[::1]`, `[2001:db8::1]`): `[:::]` or `[1:2:3]` refuses with `base_url_malformed`,
+  and the same host in a proxy value refuses with `proxy_malformed`. On an `api_key` or `cloud_provider`
   route a URL that meets this rule is set as it is. On a `subscription` route it must also
   pass the rule in [Subscription base URL](#subscription-base-url).
 - **Key custody.** This package is the launch boundary only. It never reads the OS keyring or

@@ -416,6 +416,21 @@ class HermesHomeReuseTests(_Calls):
                          requirements=RouteRequirements(owned_hermes_home=bad))
         self.launcher.assert_not_called()
 
+    def test_owned_hermes_home_that_is_an_operator_home_still_refuses(self) -> None:
+        # owned_hermes_home is a check, not a grant: naming the operator's home does not make it a route home.
+        operator = self.operator / "hermes-home"
+        operator.mkdir(mode=0o700)
+        argv = [self.launcher_path, "run", "anthropic/m"]
+        profile = {**self.profile(), HERMES_ADOPT_EXTERNAL_LOGINS: False}
+        for home in (self.operator, operator):  # the operator's home itself, and a directory inside it
+            with self.subTest(home=home.name):
+                self.refused("route_home_is_operator_home", guard_then_spawn, self.launcher, argv, "hermes", profile,
+                             {**self.env(), "HOME": str(home)}, route_home=str(home), parent_env=self.parent(),
+                             operator_home=str(self.operator), wrapper=self.wrapper,
+                             requirements=RouteRequirements(owned_hermes_home=str(home)))
+                self.assertFalse((home / ".hermes").exists())
+        self.launcher.assert_not_called()
+
 
 @unittest.skipIf(os.name == "nt", "POSIX links and home checks")
 class LaunchOptionForwardTests(_Calls):

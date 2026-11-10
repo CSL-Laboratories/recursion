@@ -1,4 +1,4 @@
-"""Own-loop subscription routes for Copilot and Nous (Lucas, Nov 8; CSL-786, candidate).
+"""Own-loop subscription routes for Copilot and Nous (Lucas, 2026-11-08; CSL-786, candidate).
 
 PRODUCT.md at csl-research #1074 head 055cc7a5 (section 3.3):
 

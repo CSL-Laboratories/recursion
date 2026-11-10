@@ -738,6 +738,44 @@ class NotificationAndTimestampTests(unittest.TestCase):
         })
         self.assertEqual(epoch["createdAt"], "1970-01-01T00:00:00Z")
 
+    def test_non_finite_started_at_does_not_escape_tasks_get(self) -> None:
+        clock = 1_762_639_200.0
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=value):
+                api, registry, _, _ = make_api()
+                registry.put(self._record(started_at=value))
+                server = DualEraServer(api, clock=lambda: clock)
+                reply = server.handle({
+                    "jsonrpc": "2.0", "id": 4, "method": "tasks/get",
+                    "params": modern_params(taskId="run-1"),
+                })
+                self.assertEqual(reply["result"]["createdAt"], _iso(clock))
+                self.assertEqual(reply["result"]["lastUpdatedAt"], _iso(clock))
+
+    def test_cancel_fallback_does_not_keep_a_bool_stop_time(self) -> None:
+        # A bool is an int, so isinstance(requested_at, (int, float)) treats True as a stored time.
+        from recursion_core.control.registry import EMPTY
+        registry = _OutageRegistry()
+        api = ControlAPI(registry, FakeKillTree(answers=(EMPTY,)), FakeStarter(), clock=lambda: 1000.0)
+        server = DualEraServer(api, clock=lambda: 2000.0)
+        run_id = started(api)
+        rec = registry.get(run_id)
+        rec["stop"] = {"requested_at": True, "checks": 1, "reason": "populated", "requested": True}
+        registry.put(rec)
+        real_stop = api.stop
+
+        def stop_then_outage(rid: str) -> dict:
+            answer = real_stop(rid)
+            registry.down = True
+            return answer
+
+        api.stop = stop_then_outage
+        body = server.handle({
+            "jsonrpc": "2.0", "id": "tc", "method": "tasks/cancel",
+            "params": modern_params(taskId=run_id),
+        })["result"]
+        self.assertEqual(body["lastUpdatedAt"], _iso(2000.0))
+
 
 if __name__ == "__main__":
     unittest.main()

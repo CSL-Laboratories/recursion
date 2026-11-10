@@ -32,6 +32,7 @@ Deferred (O60 / A45): no pinned pre-release conformance tool has checked the
 from __future__ import annotations
 
 import hmac
+import math
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -124,11 +125,22 @@ def _iso(ts: float) -> str:
 
 
 def _timestamp(value: object, fallback: float) -> float:
-    """A real epoch number, or ``fallback``. ``bool`` is an ``int`` and is not a timestamp; ``0`` is."""
+    """A finite epoch number, or ``fallback``.
+
+    ``bool`` is an ``int`` and is not a timestamp. ``0`` is. ``NaN`` and
+    infinities are not, and neither is a number ``datetime`` cannot format.
+    """
 
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return fallback
-    return float(value)
+    number = float(value)
+    if not math.isfinite(number):
+        return fallback
+    try:
+        datetime.fromtimestamp(number, tz=UTC)
+    except (ValueError, OverflowError, OSError):
+        return fallback
+    return number
 
 
 def _run_status(state: str) -> str:
@@ -178,7 +190,7 @@ class DualEraServer:
     ``tools/call`` for start, poll and cancel. Modern: stateless
     ``server/discover``, a ``_meta`` envelope on every request, ``resultType``
     on every result, and ``CreateTaskResult`` from ``tools/call`` only when that
-    request lists the Tasks extension.     ``tasks/list`` and
+    request lists the Tasks extension. ``tasks/list`` and
     ``notifications/cancelled`` / ``notifications/tasks`` are not emitted.
     An inbound message with no ``id`` is a notification: it is recorded and
     answered with nothing, and it does not stop a run. JSON-RPC id ``0`` is a
@@ -398,7 +410,10 @@ class DualEraServer:
             state = "stopped" if answer["code"] == "stopped" else "stop_pending"
             rec = dict(before["run"], state=state)
             stop = dict(rec.get("stop") or {})
-            if not isinstance(stop.get("requested_at"), (int, float)) and answer.get("recorded") is not False:
+            requested_at = stop.get("requested_at")
+            # bool is an int subclass, so it is not a stored stop time.
+            has_time = not isinstance(requested_at, bool) and isinstance(requested_at, (int, float))
+            if not has_time and answer.get("recorded") is not False:
                 stop["requested_at"] = self._clock()
             if stop:
                 rec["stop"] = stop

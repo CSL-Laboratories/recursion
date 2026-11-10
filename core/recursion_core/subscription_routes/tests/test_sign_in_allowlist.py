@@ -1,4 +1,4 @@
-"""Nov 8 briefing: harness subscription sign-ins (E3 OpenCode, E8 Pi, E9 Hermes) and Gemini CLI (E7).
+"""2026-11-08 briefing: harness subscription sign-ins (E3 OpenCode, E8 Pi, E9 Hermes).
 
 Fakes only: a MagicMock launcher and temp homes. No engine, store, provider or network is touched.
 """
@@ -13,8 +13,7 @@ import unittest
 from unittest import mock
 
 from recursion_core.subscription_routes import (
-    HERMES_ADOPT_EXTERNAL_LOGINS, SUBSCRIPTION_SIGN_INS, GeminiCliRefused, SubscriptionRouteRefused,
-    check_gemini_cli_sign_in, check_route,
+    HERMES_ADOPT_EXTERNAL_LOGINS, SUBSCRIPTION_SIGN_INS, SubscriptionRouteRefused, check_route, guard_then_spawn,
 )
 from recursion_core.subscription_routes.tests.test_subscription_routes import FAKE_KEY, FAKE_OAUTH, _Base
 
@@ -99,11 +98,26 @@ class AllowlistTests(_Base):
         with self.assertRaises(SubscriptionRouteRefused) as caught:
             check_route("hermes", {**self.sub("grok", "grok_sign_in"), HERMES_ADOPT_EXTERNAL_LOGINS: None},
                         self.bare_env(), route_home=str(self.home), parent_env=self.parent(),
-                        operator_home=str(self.operator))
+                        operator_home=str(self.operator), wrapper=self.wrapper)
         self.assertEqual(caught.exception.cause, "hermes_adopt_external_logins_not_off")
         # The Recursion-only key the first draft checked is gone: it is not Hermes's setting.
         self.assertRefusedBeforeSpawn("hermes", self.sub("grok", "grok_sign_in", borrow_claude_code_login=False),
                                       self.bare_env(), "profile_unknown_field")
+
+    def test_an_existing_hermes_config_is_not_opened(self) -> None:
+        # guard_then_spawn must not read a config that may hold a credential. It refuses instead.
+        (self.home / ".hermes").mkdir()
+        (self.home / ".hermes" / "config.yaml").write_text("not-read\n", encoding="ascii")
+        real_open = builtins.open
+
+        def guard(path, *args, **kwargs):
+            if str(path).endswith("config.yaml"):
+                raise AssertionError(f"opened {path}")
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch("builtins.open", guard):
+            self.assertRefusedBeforeSpawn("hermes", self.sub("grok", "grok_sign_in"), self.bare_env(),
+                                          "hermes_config_blocks_adopt_override")
 
     def test_hermes_override_is_recorded_for_the_driver(self) -> None:
         for profile, env in ((self.sub("grok", "grok_sign_in"), self.bare_env()), (self.profile(), self.env())):
@@ -132,6 +146,22 @@ class AllowlistTests(_Base):
         for engine, provider, method in ALLOWED:
             self.assertRefusedBeforeSpawn(engine, self.sub(provider, method, model=None), self.bare_env(),
                                           "model_missing")
+        self.assertRefusedBeforeSpawn("opencode", self.sub("chatgpt", "sign_in_with_chatgpt", model="chatgpt/"),
+                                      self.bare_env(), "model_name_empty")
+
+    def test_subscription_model_must_be_on_the_argv(self) -> None:
+        # Devin r4510802867: a passing model was not bound to the launch.
+        with self.assertRaises(SubscriptionRouteRefused) as caught:
+            guard_then_spawn(
+                self.launcher, ["opencode", "run"], "opencode", self.sub("chatgpt", "sign_in_with_chatgpt"),
+                self.bare_env(), route_home=str(self.home), parent_env=self.parent(),
+                operator_home=str(self.operator),
+            )
+        self.assertEqual(caught.exception.cause, "model_not_bound")
+        self.launcher.assert_not_called()
+        decision, _ = self.spawn("opencode", self.sub("chatgpt", "sign_in_with_chatgpt"), self.bare_env())
+        self.assertEqual("chatgpt/test-model", decision.model)
+        self.assertIn("chatgpt/test-model", self.launcher.call_args.args[0])
 
     def test_no_token_rides_along_with_a_sign_in(self) -> None:
         cases = [({"OPENAI_API_KEY": FAKE_KEY}, "credential_env_on_subscription"),
@@ -178,7 +208,23 @@ class AllowlistTests(_Base):
         (self.home / ".pi" / "agent" / "auth.json").write_text("{}")
         (self.home / ".pi" / "agent" / "alias.json").symlink_to(self.home / ".pi" / "agent" / "auth.json")
         decision, _ = self.spawn("pi", self.sub("chatgpt", "sign_in_with_chatgpt"), self.bare_env())
-        self.assertEqual(decision.engine, "pi")  # a link that stays inside the route home is fine
+        self.assertEqual(decision.engine, "pi")  # a file link that stays inside the route home is fine
+        self.launcher.reset_mock()
+        # Devin r4505333922, still open: a directory link inside the route home is not walked by
+        # os.walk, so a second link in its target can leave the home.
+        shutil.rmtree(self.home / ".pi")
+        (self.home / ".pi").mkdir()
+        side = self.home / "side"
+        side.mkdir()
+        (side / "escape").symlink_to(op_store)
+        (self.home / ".pi" / "jump").symlink_to(side)
+        self.assertRefusedBeforeSpawn("pi", self.sub("chatgpt", "sign_in_with_chatgpt"), self.bare_env(),
+                                      "own_store_links_outside_route_home")
+        (self.home / ".pi" / "jump").unlink()
+        (side / "escape").unlink()
+        (self.home / ".pi" / "jump").symlink_to(side)
+        decision, _ = self.spawn("pi", self.sub("chatgpt", "sign_in_with_chatgpt"), self.bare_env())
+        self.assertEqual(decision.engine, "pi")  # the same directory link with nothing outside is kept
         self.launcher.reset_mock()
         shutil.rmtree(self.home / ".pi")
         (self.home / ".local" / "share").mkdir(parents=True)
@@ -200,11 +246,13 @@ class AllowlistTests(_Base):
         real_open = builtins.open
 
         def guard(path, *args, **kwargs):
-            raise AssertionError(f"opened {path}")
+            if str(self.home) in str(path):
+                raise AssertionError(f"opened {path}")
+            return real_open(path, *args, **kwargs)
         with mock.patch.object(builtins, "open", guard), mock.patch.object(os, "open", guard):
             decision = check_route("hermes", {**self.sub("grok", "grok_sign_in"), HERMES_ADOPT_EXTERNAL_LOGINS: False},
                                    self.bare_env(), route_home=str(self.home), parent_env=self.parent(),
-                                   operator_home=str(self.operator))
+                                   operator_home=str(self.operator), wrapper=self.wrapper)
         self.assertIs(builtins.open, real_open)
         self.assertIn("own_login_store_not_inspected:.hermes", decision.flags)
         self.assertNotIn(FAKE_OAUTH, repr(decision))
@@ -242,45 +290,6 @@ class AllowlistTests(_Base):
             with self.assertRaises(SubscriptionRouteRefused):
                 self.spawn("opencode", self.sub("chatgpt", "sign_in_with_chatgpt", auth=auth), self.bare_env())
         self.launcher.assert_not_called()
-
-
-class GeminiCliTests(unittest.TestCase):
-    def refused(self, route: object, cause: str) -> None:
-        with self.assertRaises(GeminiCliRefused) as caught:
-            check_gemini_cli_sign_in(route)
-        self.assertEqual(caught.exception.cause, cause)
-
-    def test_paid_api_key_works(self) -> None:
-        self.assertEqual(check_gemini_cli_sign_in({"method": "api_key", "paid": True})["method"], "api_key")
-
-    def test_unpaid_or_unstated_key_refused(self) -> None:
-        for paid in (False, None, "yes", 1):
-            route = {"method": "api_key"} if paid is None else {"method": "api_key", "paid": paid}
-            self.refused(route, "api_key_not_paid")
-
-    def test_existing_code_assist_standard_or_enterprise_works(self) -> None:
-        for licence in ("standard", "Enterprise"):
-            got = check_gemini_cli_sign_in({"method": "code_assist", "licence": licence, "existing": True})
-            self.assertEqual(got["licence"], licence.lower())
-
-    def test_new_or_other_licences_refused(self) -> None:
-        self.refused({"method": "code_assist", "licence": "standard"}, "code_assist_licence_not_existing")
-        self.refused({"method": "code_assist", "licence": "standard", "existing": False},
-                     "code_assist_licence_not_existing")
-        for licence in ("individual", "free", "", None):
-            self.refused({"method": "code_assist", "licence": licence, "existing": True},
-                         "code_assist_licence_not_allowed")
-
-    def test_consumer_accounts_refused(self) -> None:
-        for method in ("Login with Google", "google_one", "AI Pro", "ai-ultra", "free", "oauth", "subscription"):
-            self.refused({"method": method}, "consumer_account_ended")
-
-    def test_unknown_or_malformed_refused(self) -> None:
-        self.refused({"method": "vertex_express"}, "method_unconfirmed")
-        self.refused({}, "method_missing")
-        self.refused(None, "route_malformed")
-        self.refused({"method": "api_key", "paid": True, "token": "x"}, "route_unknown_field")
-        self.refused({"method": "api_key", "paid": True, "licence": "standard"}, "route_mixed_methods")
 
 
 if __name__ == "__main__":

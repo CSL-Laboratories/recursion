@@ -106,22 +106,21 @@ PRODUCT.md `055cc7a5` section 3.3. `own_loop.py`, checked before any spawn or re
   `OPENAI_BASE_URL`, `OPENAI_API_BASE`, for example `ANTHROPIC_API_KEY`) and git's
   config-injection channel (`GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_*`, `GIT_CONFIG_VALUE_*`,
   `GIT_CONFIG_PARAMETERS`). Anything outside `child_env`'s base allowlist is removed too, and a
-  proxy value with userinfo is removed. What remains is rebuilt with `build_child_env` and started
-  by `spawn_copilot_own_loop`. An optional `model` is checked (printable, no spaces, at most 128
-  characters) and carried on the decision. With no stored `copilot` login, no probe, a probe that
-  fails or raises `SystemExit`, or a probe that does not return within 5 seconds
-  (`LOGIN_PROBE_DEADLINE_S`; a caller may pass a shorter `probe_deadline`, not a longer one) the
-  run refuses rather than fall back to `gh`. On POSIX that late probe is SIGKILLed with its
-  process group, so it and children that stayed in the group do not keep running. The probe is
-  the caller's; nothing here opens a login store.
+  proxy value with userinfo is removed. The same projection drops the families below even if that
+  allowlist later grows. What remains is rebuilt with `build_child_env` and started by
+  `spawn_copilot_own_loop`. `NODE_EXTRA_CA_CERTS`, `PATH`, `HOME` and the locale names stay.
+  An optional `model` is checked (printable, no spaces, at most 128 characters) and carried on the
+  decision. With no stored `copilot` login, no probe, a probe that fails or raises `SystemExit`,
+  or a probe that does not return within 5 seconds (`LOGIN_PROBE_DEADLINE_S`; a caller may pass a
+  shorter `probe_deadline`, not a longer one) the run refuses rather than fall back to `gh`.
 - **Nous, "Local proxy"**: `check_nous_own_loop(route, parent_env, ...)` with
   `{"engine": "nous", "auth": "subscription", "method": "hermes_local_proxy", "base_url": ...}`.
   The own loop calls only the user's own Hermes subscription proxy at a loopback IP literal
   (`127.0.0.0/8`, `::1`, or IPv4-mapped loopback); names, including `localhost`, are not resolved
   and refuse. Adapters are `["nous"]` only; `xai` refuses (`adapter_must_stay_off`). Recursion holds
-  no Nous token: token-like route fields and URL credentials refuse. A query string or fragment
-  on the proxy URL is treated as a credential, same as userinfo, and the same provider
-  credentials as on the Copilot child are removed. Proxy settings (`HTTP_PROXY`, `HTTPS_PROXY`,
+  no Nous token: token-like route fields and URL credentials refuse. A non-empty query string or
+  fragment on the proxy URL is treated as a credential, same as userinfo (a bare `?` or `#` is
+  not). The same provider credentials as on the Copilot child are removed. Proxy settings (`HTTP_PROXY`, `HTTPS_PROXY`,
   `ALL_PROXY`, any case) are removed too, so loopback-bound traffic cannot be carried off the host.
   Names outside `child_env`'s base allowlist are removed as well. `spawn_nous_own_loop` rebuilds
   what remains with `build_child_env` and starts the process. An optional `model` is checked and
@@ -129,11 +128,36 @@ PRODUCT.md `055cc7a5` section 3.3. `own_loop.py`, checked before any spawn or re
   `adapter_must_stay_off`).
 - `nous_proxy_doctor(base_url, current_user=..., interactive_users=[...])` reports the address,
   refuses one that is not loopback, and warns when other interactive users share the host (any
-  local user can reach a loopback proxy, which "accepts any bearer"). The reported address and
-  the refusal text leave out URL userinfo, query and fragment, so `ftp://user:secret@...`,
-  `http://user:secret@...` and `http://127.0.0.1/?token=secret#secret` do not echo that secret.
-  With no `interactive_users`, it and `check_nous_own_loop` warn "host users unknown" instead of
-  reporting a clean host.
+  local user can reach a loopback proxy, which "accepts any bearer"). The reported address is the
+  canonical origin only (`scheme://host:port`, default port included): no userinfo, path, query or
+  fragment. The decision's `base_url` still keeps the caller's path. Refusal text is the fixed
+  phrase `proxy address`, not the parser's message and not the raw URL, so a bad port named
+  `canary` and `ftp://127.0.0.1/<secret>` do not echo that text. A control character is rejected
+  before parsing. A bare `?` or `#` (empty query or fragment) is accepted; any non-empty query or
+  fragment is refused, including one that is not a credential. With no `interactive_users`, it and
+  `check_nous_own_loop` warn "host users unknown" instead of reporting a clean host.
+- **Login probe.** `has_copilot_login` stays a callable. It is the caller's function, not a command
+  this package can turn into argv, and nothing here opens a login store. An argv/`Popen` contract
+  was not adopted: the caller supplies the check (a lambda or a nested function), and a subprocess
+  would need a different product API. Where `fork`, `setsid` and `killpg` exist, the callable runs
+  in a new session. Every exit, including a probe that returns true, signals that session: SIGTERM,
+  then at most 200 ms and still inside the deadline, then SIGKILL. The session is the one confirmed
+  by a handshake byte written after `setsid`. Descendants that leave the session are out of scope.
+  Where that session cannot be enforced (Windows), the route refuses `probe unenforceable` and does
+  not leave a daemon thread running.
+- **Accepted over-refusals.** These are stricter than a secret-only reading, and they are intended:
+  any non-empty query or fragment; a host name, including `localhost` (it is not resolved); every
+  `HERMES_*` and `NOUS_*` name, including ones that are not tokens; a second `--model` / `-m` that
+  names a different model (real CLIs often take the last flag). A subscription model binds only as
+  `--model X`, `--model=X`, `-m X` or an attached `-mX`, before `--`, and never as `argv[0]` or a
+  bare element. `opencode run chatgpt/good` refuses `model_not_bound`.
+- **Env families dropped on top of the allowlist**, for both Copilot and Nous: suffixes `_SECRET`,
+  `_PASSWORD`, `_KEY`, `_PAT`, `_CREDENTIALS`; prefixes `AWS_`, `AZURE_`, `ARM_`, `GOOGLE_`,
+  `CLOUDSDK_`, `GCLOUD_`, `DYLD_`; and `SSH_AUTH_SOCK`, `SSH_ASKPASS`, `GIT_ASKPASS`, `GIT_SSH`,
+  `GIT_SSH_COMMAND`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `KUBECONFIG`, `DOCKER_CONFIG`,
+  `GITHUB_API_URL`, `COPILOT_API_URL` (Nous as well as Copilot), `LD_PRELOAD`, `LD_LIBRARY_PATH`,
+  `NODE_OPTIONS`, `NODE_PATH`, `PYTHONPATH`, `PYTHONSTARTUP`, `BASH_ENV`, `ENV`. The harness
+  launch uses the same predicate, so a later allowlist growth does not put them on a route child.
 - Still *[to verify]* in PRODUCT.md (O61): GitHub's Generative AI Services terms for Copilot, and
   whether the Nous Portal terms' consent clause covers an app calling through the proxy. No
   provider, DNS or network call is made here.
@@ -228,9 +252,10 @@ compares paths at guard time; it does not hold the file open across the launch.
 `guard_then_spawn` launches the env `check_route` accepted, rebuilt through `child_env`
 (`validated_launch.launch_env`), not a second read of the caller's mapping and not
 `os.environ`. `spawn_route_process` is the subprocess entry for that same env.
-A subscription `model` must appear in argv, or every `--model`, `--model=` and `-m`
-before `--` must name that same model. A second flag with a different value refuses
-`model_not_bound` (the first match does not bind). An empty model segment (`anthropic/`)
+A subscription `model` binds only as `--model X`, `--model=X`, `-m X` or an attached `-mX`,
+and only before `--`. `argv[0]` and a bare element (`opencode run chatgpt/good`) do not bind.
+A second flag with a different value refuses `model_not_bound` (the first match does not bind;
+taking the last flag would launch a different model). An empty model segment (`anthropic/`)
 refuses `model_name_empty`. `borrow_claude_code_login` is not a profile field.
 `repr(RouteDecision)` leaves out `child_env`, which holds the API key on an API-key route.
 

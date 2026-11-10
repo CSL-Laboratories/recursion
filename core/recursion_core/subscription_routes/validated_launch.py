@@ -19,6 +19,7 @@ import subprocess
 from collections.abc import Mapping, Sequence
 
 from recursion_core.child_env import ChildRoute, ValidatedEnv, build_child_env, spawn
+from recursion_core.subscription_routes.own_loop import _ambient_secret
 
 __all__ = ["launch_env", "spawn_route_process"]
 
@@ -39,10 +40,15 @@ _TOKEN_NAMES = frozenset({
 
 
 def _blocked_secret(name: str) -> bool:
-    upper = name.upper()
-    if upper.startswith(("AWS_", "GIT_CONFIG")) or upper.endswith("_PAT"):
+    """The own-loop families, plus harness tokens that do not match those suffixes.
+
+    The route credential is removed from the parent mapping before this runs, then injected under
+    its own name, so ``ANTHROPIC_API_KEY`` / ``OPENAI_API_KEY`` are not dropped by the ``_KEY`` suffix.
+    """
+
+    if _ambient_secret(name):
         return True
-    return upper in _TOKEN_NAMES
+    return name.upper() in _TOKEN_NAMES
 
 
 def launch_env(

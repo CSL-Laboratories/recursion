@@ -328,8 +328,8 @@ class HermesHomeReuseTests(_Calls):
         return {"provider": "grok", "auth": "subscription", "method": "grok_sign_in", "model": "grok/test-model"}
 
     def launch_sub(self, **inputs: object):
-        return self.launch("hermes", [self.launcher_path, "run", "grok/test-model"], use_profile=self.sub(),
-                           use_env=self.bare(), **inputs)
+        return self.launch("hermes", [self.launcher_path, "run", "--model", "grok/test-model"],
+                           use_profile=self.sub(), use_env=self.bare(), **inputs)
 
     def config(self) -> Path:
         return self.home / ".hermes" / "config.yaml"

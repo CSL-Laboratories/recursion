@@ -516,8 +516,9 @@ def guard_then_spawn(
     A later change to ``child_env`` is not what launches. The launcher receives that checked
     snapshot rebuilt by ``child_env.build_child_env`` (a private temp root when a temp name is
     present, and the one checked credential under its own name). It is never ``os.environ``.
-    A subscription route's ``model`` must be an argv element, or every ``--model`` / ``--model=`` / ``-m``
-    before ``--`` must name that model. A second flag with a different value refuses ``model_not_bound``.
+    A subscription route's ``model`` binds only as ``--model X``, ``--model=X``, ``-m X`` or an attached
+    ``-mX``, and only before ``--``. ``argv[0]`` and a bare element (``opencode run <model>``) do not
+    bind. A second flag with a different value refuses ``model_not_bound``.
     On Pi and Hermes ``argv[0]`` must be an absolute path that resolves to
     the pinned ``wrapper.launcher_path`` (``argv0_not_pinned``); OpenCode has no pin and no such check.
     Hermes's ``auth.adopt_external_logins: false`` is written into the route home's
@@ -769,13 +770,16 @@ def _argv0_is_pinned(argv: list[str], pinned: tuple[str, ...]) -> bool:
 
 
 def _argv_binds_model(argv: list[str], model: str) -> bool:
-    """True when argv selects ``model`` and no model flag selects anything else.
+    """True when every model flag before ``--`` names ``model``.
 
-    Real CLIs take the last ``--model``, ``--model=`` or ``-m``. Returning on the first match lets a
-    second flag launch a different model. Every flag before ``--`` must name ``model``. With no model
-    flag, ``model`` must still appear as an argv element. A flag with no value does not bind.
+    Accepted forms are ``--model X``, ``--model=X``, ``-m X`` and an attached ``-mX``. ``argv[0]`` is
+    the program. A bare element, including ``opencode run <model>``, does not bind. A flag after
+    ``--`` does not bind. A flag with no value, an empty ``--model=``, or two flags that disagree,
+    does not bind.
     """
 
+    if not model:
+        return False
     bindings: list[str] = []
     index = 1  # argv[0] is the program, not a flag
     while index < len(argv):
@@ -789,13 +793,21 @@ def _argv_binds_model(argv: list[str], model: str) -> bool:
             index += 2
             continue
         if item.startswith("--model="):
-            bindings.append(item[len("--model="):])
+            value = item[len("--model="):]
+            if not value:
+                return False
+            bindings.append(value)
+            index += 1
+            continue
+        # Attached short form (-mchatgpt/test-model). ``-m`` alone is the flag with no value.
+        if item.startswith("-m") and len(item) > 2:
+            bindings.append(item[2:])
             index += 1
             continue
         index += 1
-    if bindings:
-        return all(value == model for value in bindings)
-    return model in argv
+    if not bindings:
+        return False
+    return all(value == model for value in bindings)
 
 
 def _refuse_hermes_config(engine: str, detail: str) -> SubscriptionRouteRefused:

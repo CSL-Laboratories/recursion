@@ -72,7 +72,15 @@ class _Base(unittest.TestCase):
         argv = [self.wrapper.launcher_path if engine in ("pi", "hermes") else engine, "run"]
         model = profile.get("model")
         if isinstance(model, str) and "/" in model and model.split("/", 1)[1].strip():
-            argv.append(model)
+            # A subscription model binds only as a model flag. An API-key route does not check argv.
+            # Spellings such as "Subscription" are the same auth; check_route normalises them.
+            auth = profile.get("auth")
+            normalised = "_".join(auth.strip().lower().replace("-", " ").replace("_", " ").split()) \
+                if isinstance(auth, str) else ""
+            if normalised == "subscription":
+                argv.extend(["--model", model])
+            else:
+                argv.append(model)
         result = guard_then_spawn(
             self.launcher, argv, engine, profile, env, route_home=str(self.home),
             parent_env=parent if parent is not None else self.parent(),

@@ -6,16 +6,21 @@ Fakes only: no engine, login store, provider, DNS or network is touched.
 from __future__ import annotations
 
 import os
+import resource
 import signal
 import subprocess
 import tempfile
 import threading
 import time
 import unittest
+import warnings
+from unittest import mock
 
+import recursion_core.subscription_routes.own_loop as own_loop
 from recursion_core.subscription_routes import (
     COPILOT_STRIP_ENV, OwnLoopRouteRefused, check_copilot_own_loop, check_nous_own_loop, nous_proxy_doctor,
 )
+from recursion_core.subscription_routes.validated_launch import _blocked_secret
 
 FAKE = "fake-not-a-real-token"
 BASE = {"PATH": "/usr/bin:/bin", "HOME": "/home/u", "LANG": "C.UTF-8"}
@@ -31,6 +36,10 @@ def nous(**extra: object) -> dict:
 
 
 class CopilotTests(unittest.TestCase):
+    def setUp(self) -> None:
+        if not own_loop._probe_enforceable():
+            self.skipTest("login probe cannot be enforced on this platform")
+
     def refused(self, cause: str, route: object, env: dict | None = None, probe=lambda: True) -> None:
         with self.assertRaises(OwnLoopRouteRefused) as ctx:
             check_copilot_own_loop(route, BASE if env is None else env, has_copilot_login=probe)
@@ -148,7 +157,7 @@ class CopilotTests(unittest.TestCase):
             started = time.monotonic()
             try:
                 with self.assertRaises(OwnLoopRouteRefused) as caught:
-                    check_copilot_own_loop(copilot(), BASE, has_copilot_login=hang, probe_deadline=0.4)
+                    check_copilot_own_loop(copilot(), BASE, has_copilot_login=hang, probe_deadline=0.8)
             except TypeError:
                 self.fail("login probe has no deadline, so a hung probe is left running")
             self.assertLess(time.monotonic() - started, 2)
@@ -162,6 +171,94 @@ class CopilotTests(unittest.TestCase):
             self.assertNotEqual(pgrp, os.getpgrp())
             self.assertTrue(_process_not_running(probe_pid))
             self.assertTrue(_process_not_running(sleeper))
+
+    def test_login_probe_with_more_than_1024_open_fds(self) -> None:
+        # select() refuses an fd at or above FD_SETSIZE (1024). The pipe has to sit past that.
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target = 1280
+        limit = hard if hard != resource.RLIM_INFINITY else target
+        if soft < target:
+            if limit < target:
+                self.skipTest("nofile hard limit is below 1280")
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+            self.addCleanup(resource.setrlimit, resource.RLIMIT_NOFILE, (soft, hard))
+        opened: list[int] = []
+        try:
+            while True:
+                descriptor = os.open("/dev/null", os.O_RDONLY)
+                opened.append(descriptor)
+                if descriptor >= 1024:
+                    break
+                if len(opened) > 4096:
+                    self.fail("could not open a descriptor past FD_SETSIZE")
+            decision = check_copilot_own_loop(copilot(), BASE, has_copilot_login=lambda: True, probe_deadline=1.0)
+        finally:
+            for descriptor in opened:
+                os.close(descriptor)
+        self.assertEqual(decision.method, "copilot_cli_sign_in")
+
+    def test_a_probe_that_returns_true_kills_the_child_it_forked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            info_path = os.path.join(tmp, "child")
+
+            def probe() -> bool:
+                sleeper = os.fork()
+                if sleeper == 0:
+                    time.sleep(30)
+                    os._exit(0)
+                with open(info_path, "w", encoding="ascii") as handle:
+                    handle.write(f"{sleeper}\n")
+                return True
+
+            def stop_leftover() -> None:
+                if not os.path.exists(info_path):
+                    return
+                with open(info_path, encoding="ascii") as handle:
+                    text = handle.read().strip()
+                if not text:
+                    return
+                pid = int(text)
+                if pid == os.getpid():
+                    return
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+            self.addCleanup(stop_leftover)
+            decision = check_copilot_own_loop(copilot(), BASE, has_copilot_login=probe, probe_deadline=1.0)
+            self.assertEqual(decision.method, "copilot_cli_sign_in")
+            with open(info_path, encoding="ascii") as handle:
+                sleeper = int(handle.read().strip())
+            self.assertNotEqual(sleeper, os.getpid())
+            self.assertTrue(_process_not_running(sleeper))
+
+    def test_login_probe_returns_while_another_thread_holds_a_lock(self) -> None:
+        lock = threading.Lock()
+        held = threading.Event()
+        release = threading.Event()
+
+        def holder() -> None:
+            lock.acquire()
+            held.set()
+            release.wait(5)
+            lock.release()
+
+        thread = threading.Thread(target=holder)
+        thread.start()
+        self.addCleanup(release.set)
+        self.addCleanup(thread.join, 2)
+        self.assertTrue(held.wait(2))
+        started = time.monotonic()
+        # fork while another thread exists warns; the probe itself never takes the lock.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            decision = check_copilot_own_loop(
+                copilot(), BASE, has_copilot_login=lambda: True, probe_deadline=0.5,
+            )
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual(decision.method, "copilot_cli_sign_in")
+        self.assertTrue(lock.locked())
 
     def test_aws_access_key_id_and_gh_pat_do_not_reach_the_copilot_child(self) -> None:
         # Suffix matching catches *_TOKEN and *_API_KEY, not these two names.
@@ -300,10 +397,64 @@ class NousTests(unittest.TestCase):
         self.assertEqual(d.warnings, ())
 
 
+_FAMILY_NAMES = (
+    "X_SECRET", "x_password", "SOMETHING_KEY", "X_PAT", "X_CREDENTIALS",
+    "AWS_FOO", "AZURE_FOO", "azure_bar", "ARM_FOO", "GOOGLE_FOO", "CLOUDSDK_FOO", "GCLOUD_FOO",
+    "SSH_AUTH_SOCK", "SSH_ASKPASS", "GIT_ASKPASS", "GIT_SSH", "GIT_SSH_COMMAND",
+    "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "KUBECONFIG", "DOCKER_CONFIG",
+    "GITHUB_API_URL", "COPILOT_API_URL",
+    "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES", "dyld_library_path",
+    "NODE_OPTIONS", "NODE_PATH", "PYTHONPATH", "PYTHONSTARTUP", "BASH_ENV", "ENV",
+)
+_KEPT = {
+    "PATH": "/usr/bin:/bin",
+    "HOME": "/home/u",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    "LC_CTYPE": "C.UTF-8",
+    "NODE_EXTRA_CA_CERTS": "/tmp/ca.pem",
+}
+
+
+class AllowlistFamilyTests(unittest.TestCase):
+    def test_each_secret_family_is_stripped_and_the_base_names_stay(self) -> None:
+        secret = "family-not-a-real-secret"
+        for name in _FAMILY_NAMES:
+            self.assertTrue(own_loop._ambient_secret(name), name)
+            self.assertTrue(_blocked_secret(name), name)
+        for name in _KEPT:
+            self.assertFalse(own_loop._ambient_secret(name), name)
+            self.assertFalse(_blocked_secret(name), name)
+        env = {**_KEPT, **{name: secret for name in _FAMILY_NAMES}}
+        checks = [lambda: check_nous_own_loop(nous(), env)]
+        if own_loop._probe_enforceable():
+            checks.insert(0, lambda: check_copilot_own_loop(copilot(), env, has_copilot_login=lambda: True))
+        for check in checks:
+            with self.subTest(check=check):
+                decision = check()
+                self.assertEqual(dict(decision.child_env), _KEPT)
+                self.assertNotIn(secret, repr(decision.child_env))
+                self.assertTrue(set(_FAMILY_NAMES) <= set(decision.removed_env))
+                self.assertIn("COPILOT_API_URL", decision.removed_env)
+                self.assertIn("NODE_EXTRA_CA_CERTS", decision.child_env)
+
+
+class UnenforceableProbeTests(unittest.TestCase):
+    def test_windows_probe_refuses_instead_of_starting_a_thread(self) -> None:
+        with mock.patch.object(own_loop, "_probe_enforceable", return_value=False):
+            with self.assertRaises(OwnLoopRouteRefused) as caught:
+                check_copilot_own_loop(copilot(), BASE, has_copilot_login=lambda: True)
+        self.assertEqual(caught.exception.cause, "copilot_login_unknown")
+        self.assertEqual(caught.exception.detail, "probe unenforceable")
+        self.assertNotIn("thread", caught.exception.detail)
+
+
 class DoctorTests(unittest.TestCase):
     def test_doctor_reports_address_and_never_raises(self) -> None:
         self.assertEqual(nous_proxy_doctor("http://127.0.0.1:8645/v1", current_user="u", interactive_users=["u"]),
-                         {"ok": True, "address": "http://127.0.0.1:8645/v1", "cause": "", "warnings": ()})
+                         {"ok": True, "address": "http://127.0.0.1:8645", "cause": "", "warnings": ()})
+        self.assertEqual(nous_proxy_doctor("https://127.0.0.1")["address"], "https://127.0.0.1:443")
+        self.assertEqual(nous_proxy_doctor("http://[::1]:8645/v1")["address"], "http://[::1]:8645")
         bad = nous_proxy_doctor("http://10.1.2.3:8645")
         self.assertEqual((bad["ok"], bad["address"], bad["cause"]), (False, "http://10.1.2.3:8645", "proxy_not_loopback"))
         self.assertEqual(nous_proxy_doctor(None)["cause"], "proxy_address_missing")
@@ -362,6 +513,52 @@ class DoctorTests(unittest.TestCase):
                     self.assertNotIn(secret, exc.detail)
                 else:
                     self.fail("query or fragment secret was accepted")
+
+    def test_doctor_address_is_the_origin_and_refusal_text_is_fixed(self) -> None:
+        # The port parser's ValueError used to echo the token "canary". The scheme check used to echo the raw URL.
+        canary = "canary"
+        report = nous_proxy_doctor(f"http://127.0.0.1:{canary}/v1")
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["address"], "")
+        self.assertNotIn(canary, str(report))
+        with self.assertRaises(OwnLoopRouteRefused) as caught:
+            check_nous_own_loop(nous(base_url=f"http://127.0.0.1:{canary}/v1"), BASE)
+        self.assertEqual(caught.exception.detail, "proxy address")
+        self.assertNotIn(canary, str(caught.exception))
+        self.assertNotIn(canary, caught.exception.detail)
+
+        path_secret = "path-secret"
+        report = nous_proxy_doctor(f"ftp://127.0.0.1/{path_secret}")
+        self.assertNotIn(path_secret, str(report))
+        self.assertNotIn("/" + path_secret, report["address"])
+        with self.assertRaises(OwnLoopRouteRefused) as caught:
+            check_nous_own_loop(nous(base_url=f"ftp://127.0.0.1/{path_secret}"), BASE)
+        self.assertEqual(caught.exception.detail, "proxy address")
+        self.assertNotIn(path_secret, str(caught.exception))
+
+        control_secret = "control-secret"
+        raw = f"http://127.0.0.1:8645/\n{control_secret}"
+        report = nous_proxy_doctor(raw)
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["address"], "")
+        self.assertNotIn(control_secret, str(report))
+        with self.assertRaises(OwnLoopRouteRefused) as caught:
+            check_nous_own_loop(nous(base_url=raw), BASE)
+        self.assertEqual(caught.exception.cause, "proxy_address_malformed")
+        self.assertEqual(caught.exception.detail, "proxy address")
+        self.assertNotIn(control_secret, str(caught.exception))
+
+    def test_a_bare_query_or_fragment_is_accepted_and_the_decision_keeps_the_path(self) -> None:
+        for url in ("http://127.0.0.1:8645/v1?", "http://127.0.0.1:8645/v1#", "http://127.0.0.1:8645/v1?#"):
+            with self.subTest(url=url):
+                decision = check_nous_own_loop(nous(base_url=url), BASE)
+                self.assertEqual(decision.base_url, url)
+                report = nous_proxy_doctor(url)
+                self.assertTrue(report["ok"])
+                self.assertEqual(report["address"], "http://127.0.0.1:8645")
+                self.assertNotIn("/v1", report["address"])
+                self.assertNotIn("?", report["address"])
+                self.assertNotIn("#", report["address"])
 
     def test_doctor_warns_when_host_users_unknown(self) -> None:
         for url in ("http://127.0.0.1:8645/v1", "http://10.1.2.3:8645"):

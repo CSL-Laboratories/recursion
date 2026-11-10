@@ -148,7 +148,7 @@ class HarnessSpawnTests(_Calls):
                    "model": "chatgpt/test-model"}
         with mock.patch.dict(os.environ, POISON):
             decision, _ = guard_then_spawn(
-                self.launcher, ["opencode", "run", "chatgpt/test-model"], "opencode", profile, env,
+                self.launcher, ["opencode", "run", "--model", "chatgpt/test-model"], "opencode", profile, env,
                 route_home=str(self.home), parent_env=self.parent(), operator_home=str(self.operator),
             )
         got = self.launcher.call_args.kwargs["env"]

@@ -179,6 +179,13 @@ class AllowlistTests(_Base):
             ["opencode", "-m", model, "-m", other],
             ["opencode", "--model", model, "--model=" + other],
             ["opencode", "--model", other, "--", model],
+            ["opencode", model],
+            ["opencode", "--", model, "--model", other],
+            ["opencode", "run", model],
+            [model, "run"],
+            ["opencode", "--model"],
+            ["opencode", "-m"],
+            ["opencode", "--model="],
         )
         for argv in refused:
             with self.subTest(argv=argv):
@@ -186,14 +193,22 @@ class AllowlistTests(_Base):
                     guard_then_spawn(self.launcher, argv, "opencode", profile, env, **kwargs)
                 self.assertEqual(caught.exception.cause, "model_not_bound")
                 self.launcher.assert_not_called()
-        # One flag, the same model twice, a bare element, or a flag only after -- still binds.
+        good = "chatgpt/good"
+        good_profile = self.sub("chatgpt", "sign_in_with_chatgpt", model=good)
+        with self.assertRaises(SubscriptionRouteRefused) as caught:
+            guard_then_spawn(self.launcher, ["opencode", "run", good], "opencode", good_profile, env, **kwargs)
+        self.assertEqual(caught.exception.cause, "model_not_bound")
+        self.launcher.assert_not_called()
+        # One flag, the same model twice, or the attached short form binds. A flag after -- does not.
         accepted = (
             ["opencode", "--model", model],
             ["opencode", "--model=" + model],
             ["opencode", "-m", model],
-            ["opencode", model],
+            ["opencode", "-m" + model],
             ["opencode", "--model", model, "--model", model],
-            ["opencode", "--", model, "--model", other],
+            ["opencode", "--model", model, "--", other],
+            ["opencode", "--model", model, "--", "--model", other],
+            [model, "--model", model],
         )
         for argv in accepted:
             with self.subTest(argv=argv):

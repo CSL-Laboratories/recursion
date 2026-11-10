@@ -103,6 +103,10 @@ class CellTests(unittest.TestCase):
         self._assert_all(self._group("bracket_host"), 11)
         self._assert_all(self._group("bracket_host_ok"), 5)
 
+    def test_no_proxy_covers_the_route_host_and_cidr_cells(self) -> None:
+        self._assert_all(self._group("no_proxy_route"), 5)
+        self._assert_all(self._group("no_proxy_route_ok"), 5)
+
     def test_a_dot_dot_out_of_a_directory_others_can_write_is_refused(self) -> None:
         self._assert_all(self._group("dotdot"), 5)
         self._assert_all(self._group("dotdot_ok"), 4)
@@ -640,6 +644,83 @@ class AuthRouteTests(unittest.TestCase):
                     "claude_code", home, auth_mode=SUB, parent={"PATH": "/usr/bin", "HTTPS_PROXY": value}))
                 self.assertEqual(("HTTPS_PROXY", cause), self._refused(
                     "codex", home, auth_mode=SUB, parent={"PATH": "/usr/bin"}, overrides={"HTTPS_PROXY": value}))
+
+    def test_no_proxy_includes_the_route_host_and_a_cidr_that_contains_it(self) -> None:
+        """A proxy plus NO_PROXY must not exempt the route base host.
+
+        ``_no_proxy_bypass`` used to see only ``profile.hosts``, so ``NO_PROXY=gateway.invalid`` left
+        ``https://gateway.invalid`` direct. A CIDR entry was ignored, so ``10.0.0.0/8`` left ``10.1.2.3`` direct.
+        A CIDR still does not match a domain name, and with no proxy set the list is kept.
+        """
+
+        home = _home(self)
+        proxy = {"HTTPS_PROXY": "http://127.0.0.1:3128"}
+        gateway = ChildRoute(api_key=USER_KEY, base_url="https://gateway.invalid/api")
+
+        def refused(parent: dict, route: ChildRoute, **more: object) -> tuple[str | None, str]:
+            return self._refused("claude_code", home, route=route, parent={"PATH": "/usr/bin", **parent}, **more)
+
+        def launched(parent: dict, route: ChildRoute | None = None, **more: object):
+            return build_child_env("claude_code", home=home, route=route, parent={"PATH": "/usr/bin", **parent}, **more)
+
+        host_cases = (
+            ("gateway.invalid", gateway, API, {}),
+            (".invalid", gateway, API, {}),
+            ("https://Gateway.Invalid:443", gateway, API, {}),
+            ("::1", ChildRoute(api_key=USER_KEY, base_url="https://[::1]:8443/v1/"), API, {}),
+            ("::1", ChildRoute(api_key=USER_KEY, base_url="https://[0:0:0:0:0:0:0:1]"), API, {}),
+            ("10.1.2.3", ChildRoute(api_key=USER_KEY, base_url="http://10.1.2.3:4000"), API, {}),
+            ("gateway.invalid", ChildRoute(base_url="https://gateway.invalid/api",
+                                            trusted_base_urls=("https://gateway.invalid",)), SUB, {}),
+            ("gateway.invalid", ChildRoute(base_url="https://gateway.invalid/api", full_access_acknowledged=True), SUB, {}),
+        )
+        for entry, route, mode, extra in host_cases:
+            with self.subTest(entry=entry, mode=mode):
+                self.assertEqual(("NO_PROXY", "no_proxy_engine_host"),
+                                 refused({**proxy, "NO_PROXY": entry}, route, auth_mode=mode))
+        # The lowercase name, ALL_PROXY, and a value split across parent and override all meet the same rule.
+        self.assertEqual(("no_proxy", "no_proxy_engine_host"),
+                         refused({**proxy, "no_proxy": "gateway.invalid"}, gateway, auth_mode=API))
+        self.assertEqual(("NO_PROXY", "no_proxy_engine_host"),
+                         refused({"ALL_PROXY": "socks5://127.0.0.1:1080", "NO_PROXY": "gateway.invalid"}, gateway, auth_mode=API))
+        self.assertEqual(("NO_PROXY", "no_proxy_engine_host"),
+                         refused({"NO_PROXY": "gateway.invalid"}, gateway, auth_mode=API,
+                                 overrides={"HTTPS_PROXY": "http://proxy.invalid:8080"}))
+        cidr_cases = (
+            ("10.0.0.0/8", "http://10.1.2.3:4000"),
+            ("10.1.2.3/32", "http://10.1.2.3:4000"),
+            ("0.0.0.0/0", "http://192.168.1.50:9"),
+            ("::1/128", "http://[::1]:4000"),
+            ("::/0", "https://[2001:db8::1]"),
+            ("::1/128", "https://[0:0:0:0:0:0:0:1]"),
+        )
+        for entry, url in cidr_cases:
+            with self.subTest(entry=entry, url=url):
+                route = ChildRoute(api_key=USER_KEY, base_url=url)
+                self.assertEqual(("NO_PROXY", "no_proxy_engine_host"),
+                                 refused({**proxy, "NO_PROXY": f"localhost, {entry}"}, route, auth_mode=API))
+        # No false refusal: a CIDR does not cover a domain, another network, or a run with no proxy.
+        kept = (
+            ({**proxy, "NO_PROXY": "10.0.0.0/8"}, gateway, API),
+            ({**proxy, "NO_PROXY": "192.168.0.0/16"}, ChildRoute(api_key=USER_KEY, base_url="http://10.1.2.3:4000"), API),
+            ({"NO_PROXY": "gateway.invalid"}, gateway, API),
+            ({**proxy, "NO_PROXY": "notgateway.invalid,gateway.invalid.example"}, gateway, API),
+            ({**proxy, "NO_PROXY": "0.0.0.0/0,::/0"}, ChildRoute(api_key=USER_KEY, base_url="https://gateway.invalid/api"), API),
+            ({**proxy, "NO_PROXY": "10.0.0.0/8"}, None, SUB),
+        )
+        for parent, route, mode in kept:
+            with self.subTest(parent=parent.get("NO_PROXY"), mode=mode, route=bool(route)):
+                env = launched(parent, route, auth_mode=mode)
+                self.assertEqual(parent["NO_PROXY"], env["NO_PROXY"])
+                if route is not None and route.base_url is not None:
+                    self.assertEqual(route.base_url, env[URL])
+        # Codex has no base URL here. A private CIDR still does not match its domain endpoints.
+        env = build_child_env("codex", home=home, auth_mode=SUB, parent={"PATH": "/usr/bin", **proxy, "NO_PROXY": "10.0.0.0/8"})
+        self.assertEqual("10.0.0.0/8", env["NO_PROXY"])
+        # Trust still runs first: an untrusted subscription base refuses before the proxy check.
+        self.assertEqual((URL, "route_base_url_untrusted"),
+                         refused({**proxy, "NO_PROXY": "gateway.invalid"},
+                                 ChildRoute(base_url="https://gateway.invalid/api"), auth_mode=SUB))
 
     def test_ambient_keys_are_dropped_in_every_mode(self) -> None:
         home = _home(self)

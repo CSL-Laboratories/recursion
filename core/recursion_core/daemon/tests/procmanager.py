@@ -100,6 +100,13 @@ class ProcessGroupManager:
             return 'unknown'
         return 'running' if self._alive(record) else 'empty'
 
+    def processes_gone(self, unit):
+        """Attest from the recorded pid, not from a scripted observe() result."""
+        record = self._record(unit)
+        if record is None:
+            return False
+        return not self._alive(record)
+
     def owned_units(self):
         return {p.name for p in self.directory.iterdir() if p.name.endswith(UNIT_SUFFIX)}
 

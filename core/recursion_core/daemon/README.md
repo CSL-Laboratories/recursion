@@ -67,21 +67,29 @@ are unaffected:
   the lock when the process dies, so a stale file never blocks a restart. The file
   is never unlinked. Different users have different runtime directories.
 - Registry: SQLite with `synchronous=FULL` in `$XDG_STATE_HOME/recursion/`
-  (directory 0700, file 0600). A run row commits before `systemd-run`; a Stop
-  intent commits before `systemctl stop`. Unknown schema versions are refused.
+  (directory 0700, file 0600). Those modes are set with `chmod` / `fchmod`, so a
+  process umask of 000 cannot leave the directory world-writable or a registry
+  file group- or world-accessible. Each committed change is written to a temp
+  file in that directory, fsynced, and renamed over `runs.sqlite3`. A zero-length
+  or truncated registry is refused; it is not opened as an empty registry. A run
+  row commits before `systemd-run`; a Stop intent commits before `systemctl stop`.
+  Unknown schema versions are refused.
 - Each run is its own transient `recursion-run-<id>.service` user unit with its own
   cgroup, not part of the daemon unit. Closing, restarting or `kill -9` of the daemon
   does not stop runs; the sweep re-adopts them. The `recursion-run-` namespace is
   reserved: the sweep stops units there that have no live registry entry.
 - States: `starting`, `running`, `stopping`, `unknown`, and the sticky terminal
-  states `terminated` (systemd saw the run unit end in this boot: its cgroup read
-  `populated 0`; or the loaded unit is `inactive`, `failed` or `active (exited)` with
-  its cgroup already pruned; or a synchronous `systemctl stop` returned and the unit
-  was then garbage-collected; or, for a run with a recorded Stop, `systemctl stop`
-  answered "Unit ... not loaded" (exit 5) and the unit reads not-found, as when a
-  replayed Stop finds the unit an earlier stop already ended and collected; the
-  orphan sweep stops any same-name unit that appears later) and `lost_reboot`. A run with a recorded Stop is never reported `running`.
-  Anything not positively observed is `unknown`, never `terminated`.
+  states `terminated` (the run's process is attested gone in this boot: its cgroup
+  read `populated 0` and no pid in `cgroup.procs` or `MainPID` was still alive; or
+  the loaded unit is `inactive`, `failed` or `active (exited)` with its cgroup
+  already pruned and its main pid gone; or a synchronous `systemctl stop` returned
+  and the unit was then garbage-collected; or, for a run with a recorded Stop,
+  `systemctl stop` answered "Unit ... not loaded" (exit 5) and the unit reads
+  not-found, as when a replayed Stop finds the unit an earlier stop already ended
+  and collected; the orphan sweep stops any same-name unit that appears later) and
+  `lost_reboot`. A scripted observation that the unit ended, or a listener that is
+  still alive, is not `terminated`. A run with a recorded Stop is never reported
+  `running`. Anything not positively observed is `unknown`, never `terminated`.
 
 ## Reboot
 

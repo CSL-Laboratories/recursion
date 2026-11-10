@@ -1,4 +1,5 @@
 """Fake-manager tests for the CSL-738 daemon. Not runtime or live-host certification."""
+import errno
 import multiprocessing
 import os
 from pathlib import Path
@@ -9,17 +10,24 @@ import tempfile
 import threading
 import unittest
 from unittest.mock import patch, Mock
-from recursion_core.daemon import (AlreadyRunning, Daemon, Registry, UserLock,
-                                   SystemdUserManager, UnitNotLoaded, check_operator_linger,
-                                   refuse_engine_user, require_free_threaded)
+from recursion_core.daemon import (AlreadyRunning, Daemon, Registry, RegistryIntegrityError,
+                                   UserLock, SystemdUserManager, UnitNotLoaded,
+                                   check_operator_linger, refuse_engine_user,
+                                   require_free_threaded)
 
 UNIT_FILE = Path(__file__).resolve().parents[3] / 'systemd' / 'recursion-daemon.service'
 
 
 class FakeManager:
-    """Stands in for the systemd user manager. Units persist across daemon objects."""
+    """Stands in for the systemd user manager. Units persist across daemon objects.
+
+    ``listeners`` are processes this fake still attests alive after the unit record
+    has been collected. ``processes_gone`` is that attestation; a scripted
+    ``observe`` return value is not.
+    """
     def __init__(self):
         self.units = {}
+        self.listeners = set()
         self.stops = []
         self.starts = []
         self.fail_stop = False
@@ -39,6 +47,11 @@ class FakeManager:
 
     def observe(self, unit):
         return self.units.get(unit, 'gone')  # not-found, as systemd reports it
+
+    def processes_gone(self, unit):
+        if unit in self.listeners:
+            return False
+        return self.units.get(unit) != 'running'
 
     def owned_units(self):
         return set(self.units)
@@ -129,6 +142,82 @@ class DaemonTests(unittest.TestCase):
         with self.assertRaises(PermissionError):
             Registry(bad)
         self.assertEqual((self.path / 'state' / 'runs.sqlite3').stat().st_mode & 0o777, 0o600)
+
+    def test_umask_000_state_and_registry_files_are_private(self):
+        # umask only clears bits. mkdir(parents=True) creates missing parents at
+        # 0777, and sqlite's own files are created at 0644, so umask 000 leaves
+        # world-writable directories and world-readable registry sidecars.
+        parent = self.path / 'new-state'
+        directory = parent / 'recursion'
+        previous = os.umask(0)
+        try:
+            registry = Registry(directory)
+            registry.add('one', 'boot-a')
+            paths = [parent, directory, *directory.iterdir()]
+            modes = {path: path.stat().st_mode & 0o777 for path in paths}
+            registry.close()
+        finally:
+            os.umask(previous)
+        self.assertTrue(modes)
+        for path, mode in modes.items():
+            self.assertFalse(mode & 0o002, f'{path} is world-writable ({oct(mode)})')
+            if path.is_dir():
+                self.assertEqual(mode, 0o700, path)
+            else:
+                self.assertEqual(mode, 0o600, path)
+
+    def test_scripted_end_or_live_listener_is_not_terminated(self):
+        self.daemon.start('one', ['fake'])
+        unit = 'recursion-run-one.service'
+        # Scripted observation: the fake process is still running, but observe()
+        # claims the unit has ended.
+        self.manager.observe = lambda _unit: 'empty'
+        self.assertFalse(self.manager.processes_gone(unit))
+        self.assertNotEqual(self.daemon.sweep()[0].state, 'terminated')
+        # The unit record is gone and observe agrees, but a listener is still alive.
+        self.manager.listeners.add(unit)
+        self.manager.units.clear()
+        self.manager.observe = lambda _unit: 'gone'
+        self.manager.stop = Mock(side_effect=UnitNotLoaded(unit))
+        stopped = self.daemon.stop('one')
+        self.assertNotEqual(stopped.state, 'terminated')
+        self.assertFalse(self.manager.processes_gone(unit))
+        # Once the listener is actually gone, the same observation may terminate.
+        self.manager.listeners.clear()
+        self.manager.observe = lambda _unit: 'empty'
+        self.assertTrue(self.manager.processes_gone(unit))
+        self.assertEqual(self.daemon.sweep()[0].state, 'terminated')
+
+    def test_torn_registry_and_enospc_do_not_drop_or_trust_partial(self):
+        directory = self.path / 'durable'
+        registry = Registry(directory)
+        registry.add('one', 'boot-a')
+        registry.close()
+        target = directory / 'runs.sqlite3'
+        good = target.read_bytes()
+        # kill -9 while a replacement file is half written: the partial temp is
+        # not the registry, and the previous file is still the registry.
+        (directory / '.runs.sqlite3.tmp-killed').write_bytes(good[:32])
+        reopened = Registry(directory)
+        self.assertEqual([run.run_id for run in reopened.all()], ['one'])
+        before = target.read_bytes()
+        with patch('recursion_core.daemon.os.replace',
+                   side_effect=OSError(errno.ENOSPC, 'No space left on device')):
+            with self.assertRaises(OSError) as caught:
+                reopened.add('two', 'boot-a')
+        self.assertEqual(caught.exception.errno, errno.ENOSPC)
+        self.assertEqual(target.read_bytes(), before)
+        reopened.close()
+        survived = Registry(directory)
+        self.assertEqual([run.run_id for run in survived.all()], ['one'])
+        survived.close()
+        target.write_bytes(b'')
+        with self.assertRaises(RegistryIntegrityError):
+            Registry(directory)
+        self.assertEqual(target.read_bytes(), b'')
+        target.write_bytes(good[:64])
+        with self.assertRaises(RegistryIntegrityError):
+            Registry(directory)
 
     def test_registry_symlink_refused(self):
         (self.path / 'link').symlink_to(self.path / 'state')
@@ -593,6 +682,39 @@ class SystemdManagerTests(unittest.TestCase):
         self.events('/user.slice/a.service', 0)
         self.show('/user.slice/a.service')
         self.assertEqual(self.manager.observe('a'), 'empty')
+
+    def test_scripted_empty_with_live_listener_is_not_empty(self):
+        # populated 0 is scripted, but cgroup.procs still names a live listener.
+        group = '/user.slice/a.service'
+        self.events(group, 0)
+        (self.root / group.lstrip('/') / 'cgroup.procs').write_text('4242\n')
+        self.show(group, active='inactive', sub='dead')
+        self.manager.pid_alive = lambda pid: pid == 4242
+        self.assertNotEqual(self.manager.observe('a'), 'empty')
+        self.assertFalse(self.manager.processes_gone('a'))
+        # A show line that says the unit exited while MainPID is still alive.
+        self.manager._call = Mock(return_value=(
+            'LoadState=loaded\nActiveState=inactive\nSubState=dead\nControlGroup=\n'
+            'InvocationID=0b5a2f3c9d8e4f60a1b2c3d4e5f60718\n'
+            'ExecMainStartTimestampMonotonic=81234567\nMainPID=4242\n'))
+        self.assertNotEqual(self.manager.observe('a'), 'empty')
+        self.assertFalse(self.manager.processes_gone('a'))
+        # not-found is the same: a live MainPID is not a collected unit.
+        self.manager._call = Mock(return_value=(
+            'LoadState=not-found\nActiveState=inactive\nSubState=dead\n'
+            'ControlGroup=\nMainPID=4242\n'))
+        self.assertNotEqual(self.manager.observe('a'), 'gone')
+        self.assertFalse(self.manager.processes_gone('a'))
+        # The same scripts with the listener gone are an attested end.
+        self.manager.pid_alive = lambda pid: False
+        self.assertEqual(self.manager.observe('a'), 'gone')
+        self.assertTrue(self.manager.processes_gone('a'))
+        self.manager._call = Mock(return_value=(
+            'LoadState=loaded\nActiveState=inactive\nSubState=dead\nControlGroup=\n'
+            'InvocationID=0b5a2f3c9d8e4f60a1b2c3d4e5f60718\n'
+            'ExecMainStartTimestampMonotonic=81234567\nMainPID=4242\n'))
+        self.assertEqual(self.manager.observe('a'), 'empty')
+        self.assertTrue(self.manager.processes_gone('a'))
 
     def test_populated_one_active_is_running(self):
         self.events('/user.slice/a.service', 1)

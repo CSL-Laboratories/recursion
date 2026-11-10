@@ -495,7 +495,7 @@ def cells(s: Scratch) -> list[Cell]:
     # it refuses (no_proxy_route_host), by the same matcher as the engine hosts; an IP-literal host is also
     # matched as an address and by a CIDR block that holds it. A "*" or engine-host entry keeps its own cause.
     keyed = lambda value: ChildRoute(api_key=USER_KEY, base_url=value)  # noqa: E731
-    sub_gw, v4_url, v6_url = "https://llm.gateway.invalid", "http://10.1.2.3:4000", "https://[::1]:8443/v1/"
+    sub_gw, v4_url, v6_url = "https://llm.gateway.invalid", "http://10.1.2.3:4000", "https://[2001:db8::1]:8443/v1/"
     route_hits = [
         ("exact", base_url, "gateway.invalid"), ("dot_domain", sub_gw, ".gateway.invalid"),
         ("bare_domain", sub_gw, "gateway.invalid"), ("tld", base_url, "invalid"), ("glob", sub_gw, "*.gateway.invalid"),
@@ -505,10 +505,17 @@ def cells(s: Scratch) -> list[Cell]:
         ("url_trailing_dot", "https://gateway.invalid./api", "gateway.invalid"),
         ("v4", v4_url, "10.1.2.3"), ("v4_port", v4_url, "10.1.2.3:4000"), ("v4_other_port", v4_url, "10.1.2.3:9"),
         ("v4_cidr", v4_url, "10.0.0.0/8"), ("v4_cidr_host_bits", v4_url, "10.1.2.3/8"), ("v4_cidr_all", v4_url, "0.0.0.0/0"),
-        ("v6_bracket", v6_url, "[::1]"), ("v6_bracket_port", v6_url, "[::1]:8443"), ("v6_bare", v6_url, "::1"),
-        ("v6_spelling", v6_url, "0:0:0:0:0:0:0:1"), ("v6_cidr", v6_url, "::1/128"),
+        ("v6_bracket", v6_url, "[2001:db8::1]"), ("v6_bracket_port", v6_url, "[2001:db8::1]:8443"),
+        ("v6_bare", v6_url, "2001:db8::1"), ("v6_spelling", v6_url, "2001:db8:0:0:0:0:0:1"), ("v6_cidr", v6_url, "2001:db8::1/128"),
         ("v4_mapped", "http://[::ffff:10.1.2.3]:4000", "10.0.0.0/8"),
         ("one_of_many", base_url, "localhost,127.0.0.1 .corp.example, gateway.invalid"),
+        # A host that only looks like loopback is not exempt: a longer name, a subdomain, the next address or block.
+        ("like_localhost_com", "http://localhost.example.com:4000", "localhost.example.com"),
+        ("like_localhost_evil", "http://localhost.evil", ".evil"), ("like_mylocalhost", "http://mylocalhost:4000", "mylocalhost"),
+        ("like_sub_localhost", "http://foo.localhost:4000", "localhost"),
+        ("like_v4_name", "http://127.0.0.1.example.com", "example.com"), ("like_v6_two", "http://[::2]:4000", "::2"),
+        ("like_v4_128", "http://128.0.0.1:4000", "128.0.0.1"), ("like_v4_126", "http://126.255.255.255", "126.0.0.0/8"),
+        ("like_v4_mapped_128", "http://[::ffff:128.0.0.1]:4000", "128.0.0.1"),
     ]
     for name, value, entry in route_hits:
         add("no_proxy_route", f"npr_{name}", {"HTTPS_PROXY": PROXY, "NO_PROXY": entry}, R("no_proxy_route_host"), auth=api,
@@ -528,12 +535,31 @@ def cells(s: Scratch) -> list[Cell]:
         R("no_proxy_engine_host"), auth=api, route=keyed(base_url))
     add("no_proxy_route", "npr_official_is_engine", {"HTTPS_PROXY": PROXY, "NO_PROXY": "api.anthropic.com"},
         R("no_proxy_engine_host"), route=sub_url(official))
+    # A loopback route exempts the route-host check only: "*" and an engine host refuse as before.
+    add("no_proxy_route", "npr_lo_star", {"HTTPS_PROXY": PROXY, "NO_PROXY": "*"}, R("no_proxy_wildcard"), auth=api,
+        route=keyed("http://127.0.0.1:4000"))
+    add("no_proxy_route", "npr_lo_engine", {"HTTPS_PROXY": PROXY, "NO_PROXY": "localhost,api.anthropic.com"},
+        R("no_proxy_engine_host"), auth=api, route=keyed("http://localhost:4000"))
+    # Owner call, 2026-11-10: a loopback route host is exempt, so NO_PROXY may name a gateway on this machine.
+    loopback_ok = [
+        ("localhost", "http://localhost:4000", "localhost"), ("localhost_upper_dot", "http://LOCALHOST.:4000", ".localhost"),
+        ("v4", "http://127.0.0.1:4000", "127.0.0.1"), ("v4_other", "http://127.1.2.3:4000", "127.0.0.0/8"),
+        ("v4_short", "http://127.1:4000", "127.0.0.1:4000"), ("v4_hex", "http://0x7f.0.0.1", "127.0.0.1"),
+        ("v4_decimal", "http://2130706433", "127.0.0.1"), ("v4_last", "http://127.255.255.254", "127.255.255.254"),
+        ("v6", "http://[::1]:4000", "::1"), ("v6_port", "http://[::1]:4000", "[::1]:4000"),
+        ("v6_spelling", "http://[0:0:0:0:0:0:0:1]", "::1"), ("v4_mapped", "http://[::ffff:127.0.0.1]:4000", "127.0.0.1"),
+        ("v4_mapped_hex", "http://[::ffff:7f00:1]", "127.0.0.0/8"),
+        ("usual_list", "http://127.0.0.1:4000", "localhost,127.0.0.1,::1,0.0.0.0/0"),
+    ]
+    for name, value, entry in loopback_ok:
+        add("no_proxy_route_ok", f"npr_lo_{name}", {"HTTPS_PROXY": PROXY, "NO_PROXY": entry},
+            L(_same(**{"NO_PROXY": entry, url: value})), auth=api, route=keyed(value))
     route_ok = [
         ("no_proxy_set", base_url, "gateway.invalid", False), ("unrelated", base_url, corp, True),
         ("lookalike", base_url, "notgateway.invalid,gateway.invalid.evil", True),
         ("child_of_host", base_url, "llm.gateway.invalid", True), ("empty", base_url, "", True),
         ("cidr_is_not_a_name", base_url, "10.0.0.0/8,0.0.0.0/0,::/0", True), ("cidr_other_net", v4_url, "192.168.0.0/16", True),
-        ("v4_other", v4_url, "10.1.2.30,110.1.2.3,10.1.2.4:4000", True), ("v6_other", v6_url, "[::2],::1:0,10.0.0.0/8", True),
+        ("v4_other", v4_url, "10.1.2.30,110.1.2.3,10.1.2.4:4000", True), ("v6_other", v6_url, "[2001:db8::2],2001:db8::1:0,::1,10.0.0.0/8", True),
     ]
     for name, value, entry, with_proxy in route_ok:
         parent = {"NO_PROXY": entry, **({"HTTPS_PROXY": PROXY} if with_proxy else {})}

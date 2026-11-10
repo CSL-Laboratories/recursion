@@ -37,7 +37,7 @@ replacement. It builds the child environment from nothing:
   stores no trusted list and asks nothing; the driver does both;
 * while a proxy is set, a ``NO_PROXY`` entry that matches the route's own base URL host refuses
   (``no_proxy_route_host``, CSL-839; PRODUCT.md 055cc7a5 / CSLR-D-011): the child would reach the route gateway
-  around the proxy;
+  around the proxy. A loopback route host (``localhost``, ``127.0.0.0/8``, ``::1``) is exempt;
 * one change beyond N5h/N5i: links are resolved one component at a time and every
   link met on the way, including links inside a link's target, must be root's or
   ours in a directory chain no one else can write, and no step may enter ``/proc``,
@@ -326,8 +326,9 @@ def build_child_env(
     ``overrides`` are values the core itself sets. An override may only set a name already on this engine's
     allowlist (never HOME, PATH, a credential or a scrubbed name), and it is merged before the checks, so it
     meets exactly the value, PATH, NO_PROXY and temp rules an inherited value meets. While a proxy is set, a
-    NO_PROXY entry that matches the route's base URL host refuses with ``no_proxy_route_host`` (CSL-839); a
-    ``*`` or engine-host entry anywhere in either name is reported first, with its own cause.
+    NO_PROXY entry that matches the route's base URL host refuses with ``no_proxy_route_host`` (CSL-839), unless
+    that host is loopback (``localhost``, ``127.0.0.0/8``, ``::1`` or IPv4-mapped loopback); a ``*`` or
+    engine-host entry anywhere in either name is reported first, with its own cause, loopback route or not.
     """
 
     if os.name == "nt":
@@ -375,11 +376,12 @@ def build_child_env(
                 raise EnvRefused(name, cause)
         # CSL-839: the route's own base host is an endpoint too; an entry matching it would send the child to the
         # route gateway around the proxy. Checked after both names passed the rule above, so a "*" or engine-host
-        # entry keeps its own cause whatever else the lists hold.
+        # entry keeps its own cause whatever else the lists hold. A loopback route host is exempt from this check
+        # only (owner call, 2026-11-10): NO_PROXY may name a gateway on this machine.
         base = route_env.get(profile.base_url_name) if profile.base_url_name else None
-        if base is not None:
+        if base is not None and not _loopback_host(host := _BASE_URL.match(base)["host"]):
             for name in [name for name in NO_PROXY_NAMES if name in env]:
-                if _no_proxy_route_bypass(env[name], _BASE_URL.match(base)["host"]):
+                if _no_proxy_route_bypass(env[name], host):
                     raise EnvRefused(name, "no_proxy_route_host")
     # N5h option A: a temp name is replaced by one private route temp root, never checked or passed.
     present = [name for name in TEMP_NAMES if name in env]
@@ -719,6 +721,25 @@ def _host_addresses(host: str) -> set:
         return set()
 
 
+def _loopback_host(host: str) -> bool:
+    """CSL-839: whether a base URL host is loopback, the one kind of route host a NO_PROXY entry may name.
+
+    Loopback is the exact name ``localhost`` (any case, one trailing dot allowed; not a subdomain of it), an
+    address in ``127.0.0.0/8`` in any spelling ``_host_addresses`` reads (``127.1``, ``0x7f.0.0.1``,
+    ``2130706433``), ``::1`` in any spelling, and IPv4-mapped loopback (``::ffff:127.0.0.1``). Nothing is
+    resolved: a name that only looks like one (``localhost.example.com``, ``127.0.0.1.example.com``) is not.
+    """
+
+    host = host.lower().strip("[]")
+    host = host[:-1] if host.endswith(".") else host
+    if host == "localhost":
+        return True
+    # Every form must be loopback; an IPv4-mapped IPv6 form is judged by the IPv4 address it carries.
+    addresses = {address.ipv4_mapped or address if address.version == 6 else address
+                 for address in _host_addresses(host)}
+    return bool(addresses) and all(address.is_loopback for address in addresses)
+
+
 def _no_proxy_ip_hit(entry: str, addresses: set) -> bool | None:
     """Whether an entry is one of these addresses, or a CIDR block that holds one; None when it is neither shape.
 
@@ -752,7 +773,8 @@ def _no_proxy_route_bypass(value: str, host: str) -> bool:
     also matched as an address: by an entry that is that address, and by a CIDR block that holds it (curl
     7.86+, requests, undici and Go honour CIDR). A CIDR entry never matches a name: no matcher resolves DNS.
     An entry that is an address or a block is decided as one and not also as a name, so the port strip cannot
-    turn ``::1:0`` into ``::1``.
+    turn ``::1:0`` into ``::1``. A loopback host never gets here: ``build_child_env`` exempts it
+    (``_loopback_host``).
     """
 
     host = host.lower().strip("[]").rstrip(".")

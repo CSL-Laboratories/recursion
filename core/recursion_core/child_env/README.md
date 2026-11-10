@@ -104,12 +104,14 @@ Foundry switches are dropped. The child gets one only from the route:
     trailing dot stripped. The host's own trailing dot is ignored too.
   - Ports are not compared. `gateway.example:8080` refuses a route on port 443: curl and
     requests ignore the port, so the entry is treated as a match (fail closed).
-  - An IP-literal host (`10.1.2.3`, `[::1]`) is also matched as an address: by an entry that is
-    that address (`10.1.2.3`, `10.1.2.3:4000`, `[::1]`, `[::1]:8443`, `::1`, another spelling of
-    it such as `0:0:0:0:0:0:0:1`) and by a CIDR block that holds it (`10.0.0.0/8`, `::1/128`,
-    `0.0.0.0/0`). `10.1.2.3` and `[::ffff:10.1.2.3]` are one address (so `::/0` also holds an
-    IPv4 host), and a short, hex or decimal IPv4 host (`127.1`, `0x7f.0.0.1`, `2130706433`) is
-    read as a URL parser reads it.
+  - An IP-literal host (`10.1.2.3`, `[2001:db8::1]`) is also matched as an address: by an entry
+    that is that address (`10.1.2.3`, `10.1.2.3:4000`, `[2001:db8::1]`, `[2001:db8::1]:8443`,
+    `2001:db8::1`, another spelling of it such as `2001:db8:0:0:0:0:0:1`) and by a CIDR block
+    that holds it (`10.0.0.0/8`, `2001:db8::/32`, `0.0.0.0/0`). `10.1.2.3` and
+    `[::ffff:10.1.2.3]` are one address (so `::/0` also holds an IPv4 host), and a short, hex or
+    decimal IPv4 host (`10.1`, `0x0a.0.0.1`, `167772161`) is read as a URL parser reads it.
+  - A loopback route host is exempt, and only that: `localhost` (not a subdomain of it),
+    `127.0.0.0/8`, `::1` and IPv4-mapped loopback (`[::ffff:127.0.0.1]`), in any spelling.
   - A CIDR block never matches a host name: nothing is resolved here. CIDR is checked for the
     route host only; the engine's own hosts are names, so their check is unchanged.
   - `*` (`no_proxy_wildcard`) and an engine-host entry (`no_proxy_engine_host`) are checked

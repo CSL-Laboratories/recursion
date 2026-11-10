@@ -104,8 +104,8 @@ class CellTests(unittest.TestCase):
         self._assert_all(self._group("bracket_host_ok"), 5)
 
     def test_no_proxy_route_host_cells(self) -> None:
-        self._assert_all(self._group("no_proxy_route"), 33)
-        self._assert_all(self._group("no_proxy_route_ok"), 11)
+        self._assert_all(self._group("no_proxy_route"), 44)
+        self._assert_all(self._group("no_proxy_route_ok"), 25)
 
     def test_a_dot_dot_out_of_a_directory_others_can_write_is_refused(self) -> None:
         self._assert_all(self._group("dotdot"), 5)
@@ -700,12 +700,13 @@ class AuthRouteTests(unittest.TestCase):
             ("http://10.1.2.3", "10.1.2.3:8080"), ("http://10.1.2.3.", "10.1.2.3"),
             (v6, "[2001:db8::1]"), (v6, "[2001:db8::1]:8443"), (v6, "[2001:db8::1]:9"), (v6, "2001:db8::1"),
             (v6, "2001:DB8:0:0:0:0:0:1"), (v6, "https://[2001:db8::1]"), (v6, "2001:db8::/32"), (v6, "[2001:db8::]/32"),
-            (v6, "::/0"), ("https://[2001:DB8:0:0:0:0:0:1]", "2001:db8::1"), ("https://[::1]", "::1"),
-            ("https://[::1]", "[::1]:443"), ("https://[::1]", "::1/128"),
+            (v6, "::/0"), ("https://[2001:DB8:0:0:0:0:0:1]", "2001:db8::1"), ("https://[::2]", "::2"),
+            ("https://[::2]", "[::2]:443"), ("https://[::2]", "::2/128"),
             ("http://[::ffff:10.1.2.3]:4000", "10.1.2.3"), ("http://[::ffff:10.1.2.3]:4000", "10.0.0.0/8"),
+            ("http://[::ffff:a01:203]:4000", "::ffff:10.1.2.3"),
             # A short, hex or decimal IPv4 host is the address a URL parser makes of it.
-            ("http://127.1:4000", "127.0.0.1"), ("http://0x7f.0.0.1", "127.0.0.0/8"), ("http://2130706433", "127.0.0.1:4000"),
-            ("http://0177.0.1", "127.0.0.1"), ("http://0x7F000001", "127.0.0.1"),
+            ("http://10.1:4000", "10.0.0.1"), ("http://0x0a.0.0.1", "10.0.0.0/8"), ("http://167772161", "10.0.0.1:4000"),
+            ("http://012.0.1", "10.0.0.1"), ("http://0x0A000001", "10.0.0.1"),
             (v4, "::/0"),  # fail closed: an IPv4 host is also checked as its IPv4-mapped IPv6 address
         )
         for base_url, entry in hits:
@@ -723,6 +724,81 @@ class AuthRouteTests(unittest.TestCase):
             with self.subTest(base_url=base_url, kept=entry):
                 env = self._no_proxy_route(home, base_url, {**proxy, "NO_PROXY": entry})
                 self.assertEqual((entry, base_url), (env["NO_PROXY"], env[URL]))
+
+    def test_no_proxy_may_name_a_loopback_route_host(self) -> None:
+        """Owner call, 2026-11-10: loopback only. A gateway on this machine is not refused; a lookalike still is."""
+
+        home = _home(self)
+        proxy = {"HTTPS_PROXY": "http://127.0.0.1:3128"}
+        entries = ("localhost", ".localhost", "LOCALHOST.", "localhost:4000", "127.0.0.1", "127.0.0.1:4000", "127.0.0.0/8",
+                   "127.1.2.3", "127.255.255.254", "::1", "[::1]", "[::1]:4000", "::1/128", "0:0:0:0:0:0:0:1",
+                   "::ffff:127.0.0.1", "0.0.0.0/0", "::/0", "127.*", "local*", "localhost,127.0.0.1,::1")
+        loopback = ("localhost", "LOCALHOST.", "Localhost", "localhost.", "127.0.0.1", "127.0.0.1.", "127.1.2.3", "127.1",
+                    "127.0.1", "0x7f.0.0.1", "0177.0.0.1", "0x7F000001", "2130706433", "127.255.255.254", "127.0.0.0",
+                    "127.255.255.255", "[::1]", "[0:0:0:0:0:0:0:1]", "[0000:0000:0000:0000:0000:0000:0000:0001]",
+                    "[::ffff:127.0.0.1]", "[::ffff:7f00:1]", "[::FFFF:7FFF:FFFE]", "[0:0:0:0:0:ffff:127.1.2.3]")
+        for host in loopback:
+            self.assertTrue(policy._loopback_host(host), host)
+            for base_url in (f"http://{host}:4000", f"https://{host}/v1"):
+                for entry in entries:
+                    for name in policy.NO_PROXY_NAMES:
+                        with self.subTest(base_url=base_url, entry=entry, name=name):
+                            env = self._no_proxy_route(home, base_url, {**proxy, name: entry})
+                            self.assertEqual((entry, base_url), (env[name], env[URL]))
+        # Every auth mode: a trusted subscription route and a cloud route launch too.
+        for mode, more in ((CLOUD, {}), (SUB, {"trusted_base_urls": ("http://localhost:4000",)})):
+            with self.subTest(mode=mode):
+                route = ChildRoute(base_url="http://localhost:4000", provider_switches=ROUTES[mode].provider_switches, **more)
+                env = build_child_env("claude_code", home=home, auth_mode=mode, route=route,
+                                      parent={"PATH": "/usr/bin", **proxy, "NO_PROXY": "localhost"})
+                self.assertEqual(("localhost", "http://localhost:4000"), (env["NO_PROXY"], env[URL]))
+        # Only looks like loopback: each still refuses on an entry that names it.
+        lookalikes = (
+            ("localhost.example.com", "localhost.example.com"), ("localhost.example.com", "example.com"),
+            ("localhost.evil", "localhost.evil"), ("localhost.evil", ".evil"), ("127.0.0.1.example.com", "127.0.0.1.example.com"),
+            ("127.0.0.1.example.com", "example.com"), ("mylocalhost", "mylocalhost"), ("my.localhost", "localhost"),
+            ("foo.localhost", ".localhost"), ("foo.localhost", "foo.localhost"), ("localhost.localdomain", "localdomain"),
+            ("localhost..", "localhost"), ("localhost-", "localhost-"), ("localhost0", "local*"), ("127.0.0.1..", "127.0.0.1"),
+            ("[::2]", "::2"), ("[::]", "::"), ("[::1:0]", "::1:0"), ("[1::1]", "1::/16"), ("[fe80::1]", "fe80::/10"),
+            ("128.0.0.1", "128.0.0.1"), ("128.0.0.1", "128.0.0.0/8"), ("126.255.255.255", "126.255.255.255"),
+            ("126.255.255.255", "126.0.0.0/7"), ("0.0.0.0", "0.0.0.0"), ("0.0.0.0", "0.0.0.0/0"), ("128.1", "128.0.0.1"),
+            ("0x80.0.0.1", "128.0.0.1"), ("2147483649", "128.0.0.1"), ("2130706432.1", "2130706432.1"),
+            ("[::ffff:128.0.0.1]", "128.0.0.1"), ("[::ffff:8000:1]", "::ffff:128.0.0.1"), ("[::ffff:126.255.255.255]", "126.0.0.0/8"),
+            ("[::127.0.0.1]", "::127.0.0.1"), ("[::7f00:1]", "::/96"), ("[64:ff9b::7f00:1]", "64:ff9b::/96"),
+            ("[::fffe:127.0.0.1]", "::fffe:127.0.0.1"), ("10.1.2.3", "10.1.2.3"), ("192.168.1.1", "192.168.0.0/16"),
+            ("169.254.169.254", "169.254.169.254"),
+        )
+        for host, entry in lookalikes:
+            self.assertFalse(policy._loopback_host(host), host)
+            for base_url in (f"http://{host}:4000", f"https://{host}"):
+                with self.subTest(base_url=base_url, entry=entry), self.assertRaises(EnvRefused) as caught:
+                    self._no_proxy_route(home, base_url, {**proxy, "NO_PROXY": entry})
+                self.assertEqual(("NO_PROXY", "no_proxy_route_host"), (caught.exception.name, caught.exception.cause))
+        # No DNS: the policy does not import socket, so no name here is ever looked up.
+        tree = ast.parse(Path(policy.__file__).read_text(encoding="utf-8"))
+        imported = {alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
+        imported |= {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
+        self.assertFalse({name for name in imported if name and name.split(".")[0] == "socket"})
+
+    def test_a_loopback_route_still_refuses_a_wildcard_or_engine_host_entry(self) -> None:
+        """Pins current behaviour: the loopback exemption covers ``no_proxy_route_host`` only."""
+
+        home = _home(self)
+        proxy = {"HTTPS_PROXY": "http://127.0.0.1:3128"}
+        refused = (
+            ({"NO_PROXY": "*"}, ("NO_PROXY", "no_proxy_wildcard")),
+            ({"NO_PROXY": "localhost,127.0.0.1,*"}, ("NO_PROXY", "no_proxy_wildcard")),
+            ({"NO_PROXY": "localhost", "no_proxy": "*"}, ("no_proxy", "no_proxy_wildcard")),
+            ({"NO_PROXY": "api.anthropic.com"}, ("NO_PROXY", "no_proxy_engine_host")),
+            ({"NO_PROXY": "localhost,::1 .anthropic.com"}, ("NO_PROXY", "no_proxy_engine_host")),
+            ({"NO_PROXY": "127.0.0.1", "no_proxy": "claude.ai"}, ("no_proxy", "no_proxy_engine_host")),
+        )
+        for base_url in ("http://localhost:4000", "http://127.0.0.1:4000", "http://127.1", "http://[::1]:4000",
+                         "http://[::ffff:127.0.0.1]:4000"):
+            for parent, expected in refused:
+                with self.subTest(base_url=base_url, parent=sorted(parent.items())), self.assertRaises(EnvRefused) as caught:
+                    self._no_proxy_route(home, base_url, {**proxy, **parent})
+                self.assertEqual(expected, (caught.exception.name, caught.exception.cause))
 
     def test_no_proxy_route_host_changes_nothing_else(self) -> None:
         home = _home(self)

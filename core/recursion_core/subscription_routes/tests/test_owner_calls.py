@@ -716,7 +716,7 @@ class FullAccessTests(_Calls):
                 self.assertEqual({"env", "shell", "engine_config", "model"}, set(self.launcher.call_args.kwargs))
                 self.launcher.reset_mock()
                 if engine == "hermes":  # full access only: without it there is no decision to carry a flag
-                    self.refused("hermes_full_access_only", self.launch, engine, full_access_acknowledged=False)
+                    self.refused("full_access_required", self.launch, engine, full_access_acknowledged=False)
                     self.launcher.assert_not_called()
                     continue
                 decision, _ = self.launch(engine)
@@ -748,7 +748,7 @@ class FullAccessTests(_Calls):
                 with self.subTest(engine=engine):
                     self.refused("launch_option_unknown", self.launch, engine, parent_env=parent, start_new_session=True)
                     if engine == "hermes":  # full access only: the loud environment does not stand in for the bool
-                        self.refused("hermes_full_access_only", self.launch, engine, parent_env=parent,
+                        self.refused("full_access_required", self.launch, engine, parent_env=parent,
                                      full_access_acknowledged=False)
                         continue
                     decision, _ = self.launch(engine, parent_env=parent)

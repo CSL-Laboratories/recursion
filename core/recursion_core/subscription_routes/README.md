@@ -12,7 +12,7 @@ reviewed or accepted.
   validates one `pi`, `hermes` or `opencode` profile and the exact child environment, and
   returns a `RouteDecision` or raises `SubscriptionRouteRefused(engine, cause, detail)`.
   Pi and Hermes require `wrapper` (see Wrapper pins). Hermes is full access only: it also
-  requires `full_access_acknowledged=True` and refuses `hermes_full_access_only` without it
+  requires `full_access_acknowledged=True` and refuses `full_access_required` without it
   (see The full-access profile). Cursor and Antigravity CLI use
   `check_cursor_route` and `check_antigravity_route`.
 - `guard_then_spawn(launcher, argv, ...)` calls `check_route` and only then the launcher,
@@ -80,7 +80,7 @@ checked against `SUBSCRIPTION_SIGN_INS`:
   platform: on macOS Claude Code's login sits in the login Keychain, which moving HOME does not
   hide. Pi and OpenCode profiles refuse the key as unknown.
 - Every Hermes route (sign-in or API key) also needs the full-access profile; without
-  `full_access_acknowledged=True` it refuses `hermes_full_access_only` before any other check
+  `full_access_acknowledged=True` it refuses `full_access_required` before any other check
   (Lucas, 2026-11-10).
 - The child env carries no credential at all: no API key, no token, no `CODEX_*`. The sign-in
   lives in the engine's own login store in the route home (`.pi`, `.hermes`, or OpenCode's
@@ -163,7 +163,7 @@ under the install root and returns a `PackagePin`. Pass it in a `WrapperInstall`
 missing file, or a different launcher, refuses `wrapper_pin_mismatch`. OpenCode is not in
 this pin. Cursor's child env carries no credential. A missing pin on Pi or Hermes refuses
 `wrapper_pin_missing`. A Hermes route also needs the full-access profile
-(`hermes_full_access_only` without it); the pin is still required and verified under it.
+(`full_access_required` without it); the pin is still required and verified under it.
 
 The rules below hold both when a pin is measured and when it is verified
 (`measure_package_pin` raises `WrapperPinRefused(cause, detail)`; the route checks raise
@@ -239,7 +239,7 @@ Owner call 5. Keyword options passed to a guard are sorted into three groups:
 Owner call 4. Hermes's `auth.adopt_external_logins: false` is written to
 `<route_home>/.hermes/config.yaml` before the launcher runs (Hermes defaults that switch to
 true). A Hermes route also needs the full-access profile: without it the launch refuses
-`hermes_full_access_only` and nothing below is read or written. A second launch in the same
+`full_access_required` and nothing below is read or written. A second launch in the same
 home works:
 
 - If `config.yaml` already exists it is reused only when its bytes are exactly
@@ -330,7 +330,9 @@ meaning match `child_env`'s `ChildRoute.full_access_acknowledged`.
 - A decision made under it carries the flag `full_access_profile_acknowledged`.
 - A Hermes route requires it (Lucas, 2026-11-10: Hermes is full access only and out of the
   Nov 11 scope). `check_route("hermes", ...)` and `guard_then_spawn` refuse
-  `hermes_full_access_only` unless `full_access_acknowledged=True`. The refusal comes right
+  `full_access_required` with the engine name (`hermes`) as the detail unless
+  `full_access_acknowledged=True`; `FULL_ACCESS_REQUIRED_ENGINES` in `policy.py` is the set of
+  engines this applies to, and Hermes is its only member. The refusal comes right
   after the two configured inputs are validated, so a non-bool still refuses
   `route_full_access_malformed` and a bad `requirements` still refuses
   `requirements_malformed`; it comes before every profile, env, home and pin check, the
@@ -387,7 +389,11 @@ Recursion's own, or a switch that could not be put in place without replacing so
 
 | Code | When |
 |---|---|
-| `hermes_full_access_only` | a Hermes route without `full_access_acknowledged=True` (Lucas, 2026-11-10: Hermes is full access only and out of the Nov 11 scope) |
+| `full_access_required` | an engine in `FULL_ACCESS_REQUIRED_ENGINES` (today only Hermes) without `full_access_acknowledged=True`; the detail is the engine name (Lucas, 2026-11-10: Hermes is full access only and out of the Nov 11 scope) |
+
+Hermes v0.23.1 still cannot launch even with full access, because measuring its pin trips
+the 100,000-entry tree cap and a second launch in the same route home trips
+`engine_store_in_route_home`; both are post-Nov-11 Research design questions.
 
 Nothing else changed for Hermes. The 100,000-entry tree cap and the other pin limits, the
 wrapper pin (`wrapper_pin_missing`, `wrapper_pin_mismatch`), the `argv[0]` binding,

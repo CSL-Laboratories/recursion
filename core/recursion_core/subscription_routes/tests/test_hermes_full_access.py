@@ -1,8 +1,9 @@
 """2026-11-10 owner call (Lucas, CSL-840): Hermes is full access only.
 
-A Hermes route refuses ``hermes_full_access_only`` unless ``full_access_acknowledged`` is the bool
-``True``, before any other check and before anything is written to the route home. Full access
-relaxes nothing else for Hermes, and the other engines are unchanged.
+A Hermes route refuses ``full_access_required`` (detail ``hermes``) unless
+``full_access_acknowledged`` is the bool ``True``, before any other check and before anything is
+written to the route home. Full access relaxes nothing else for Hermes, and the other engines are
+unchanged.
 
 Fakes only: a MagicMock launcher and temp trees. No engine binary is executed and no network is used.
 """
@@ -15,17 +16,19 @@ import unittest
 from unittest import mock
 
 from recursion_core.subscription_routes import (
+    ENGINES,
     HERMES_ADOPT_EXTERNAL_LOGINS,
     RouteRequirements,
     check_route,
     guard_then_spawn,
     wrapper_pin,
 )
+from recursion_core.subscription_routes.policy import FULL_ACCESS_REQUIRED_ENGINES
 from recursion_core.subscription_routes.tests.test_owner_calls import ADOPT_YAML, _Calls
 from recursion_core.subscription_routes.tests.test_subscription_routes import FAKE_OAUTH
 
 FULL = "full_access_profile_acknowledged"
-ONLY = "hermes_full_access_only"
+ONLY = "full_access_required"
 
 
 @unittest.skipIf(os.name == "nt", "POSIX links and home checks")
@@ -61,8 +64,17 @@ class HermesFullAccessOnlyTests(_Calls):
 
     def assert_only(self, call, *args: object, **inputs: object) -> None:
         exc = self.refused(ONLY, call, *args, **inputs)
-        self.assertEqual(("hermes", ""), (exc.engine, exc.detail))
+        self.assertEqual(("hermes", "full_access_required", "hermes"), (exc.engine, exc.cause, exc.detail))
         self.assertNotIn(FAKE_OAUTH, str(exc))
+
+    def test_hermes_is_the_only_engine_that_requires_full_access(self) -> None:
+        self.assertIsInstance(FULL_ACCESS_REQUIRED_ENGINES, frozenset)
+        self.assertEqual(frozenset({"hermes"}), FULL_ACCESS_REQUIRED_ENGINES)
+        self.assertIn("hermes", ENGINES)
+        for engine in ENGINES:
+            if engine != "hermes":
+                with self.subTest(engine=engine):
+                    self.assertNotIn(engine, FULL_ACCESS_REQUIRED_ENGINES)
 
     def config(self):
         return self.home / ".hermes" / "config.yaml"

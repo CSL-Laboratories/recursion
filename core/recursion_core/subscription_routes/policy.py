@@ -40,11 +40,11 @@ file, the environment, a keyring or a prompt to find them, and nothing here rend
 driver owns prompts, saved configuration and the full-access danger notice.
 
 Hermes is full access only (2026-11-10, Lucas; CSL-840): ``check_route`` refuses a Hermes route
-``hermes_full_access_only`` unless ``full_access_acknowledged`` is ``True``, before any profile, env,
-home or pin check and before anything is written to the route home. Full access relaxes nothing else
-for Hermes: the pin and its limits, the ``argv[0]`` binding, ``auth.adopt_external_logins: false``,
-the exact ``config.yaml`` rule and every env, credential and route-home rule below still apply. Pi and
-OpenCode still launch without full access.
+``full_access_required`` (detail ``hermes``) unless ``full_access_acknowledged`` is ``True``, before
+any profile, env, home or pin check and before anything is written to the route home. Full access
+relaxes nothing else for Hermes: the pin and its limits, the ``argv[0]`` binding,
+``auth.adopt_external_logins: false``, the exact ``config.yaml`` rule and every env, credential and
+route-home rule below still apply. Pi and OpenCode still launch without full access.
 
 2026-11-08 briefing (Lucas): allow a subscription sign-in in these harnesses only where the provider names
 that harness. ChatGPT: OpenCode and Pi, through their registered Sign in with ChatGPT method only. Grok:
@@ -225,9 +225,10 @@ OWN_STORE_ENTRIES: Mapping[str, tuple[str, ...]] = MappingProxyType(
 # Hermes's own config setting that stops it adopting Claude Code's (and other) stored logins
 # (PRODUCT.md 055cc7a5 section 2, E9). Required, exactly False, in every Hermes profile.
 HERMES_ADOPT_EXTERNAL_LOGINS = "auth.adopt_external_logins"
-# Lucas, 2026-11-10 (CSL-840): Hermes is full access only and out of the Nov 11 scope. check_route
-# refuses it hermes_full_access_only without the acknowledgment; with it, no Hermes check is relaxed.
-FULL_ACCESS_ONLY_ENGINES = frozenset({"hermes"})
+# Engines that require the full-access profile. Lucas, 2026-11-10 (CSL-840): Hermes is full access
+# only and out of the Nov 11 scope, and is the only member today. check_route refuses an engine here
+# full_access_required (detail: the engine name) without the acknowledgment; with it, no check is relaxed.
+FULL_ACCESS_REQUIRED_ENGINES = frozenset({"hermes"})
 # Google consumer and subscription labels: refused in all three harnesses.
 _GOOGLE_LABELS = ("google", "gemini", "antigravity", "google_one", "google_ai")
 
@@ -303,16 +304,16 @@ def check_route(
     ``requirements`` and ``full_access_acknowledged`` are the configured inputs (``RouteRequirements``);
     full access lets a package link leave the install root and relaxes nothing else here.
     Hermes is full access only (Lucas, 2026-11-10): once those two inputs validate, a Hermes route
-    without ``full_access_acknowledged=True`` refuses ``hermes_full_access_only`` before any other
-    check. With it, every Hermes check below still runs unchanged.
+    without ``full_access_acknowledged=True`` refuses ``full_access_required`` (the detail is the
+    engine name) before any other check. With it, every Hermes check below still runs unchanged.
     """
 
     spec = ENGINES.get(engine) if isinstance(engine, str) else None
     if spec is None:
         raise SubscriptionRouteRefused(engine, "unknown_engine")
     checked = _checked_requirements(engine, requirements, full_access_acknowledged)
-    if engine in FULL_ACCESS_ONLY_ENGINES and not checked.full_access:
-        raise SubscriptionRouteRefused(engine, "hermes_full_access_only")
+    if engine in FULL_ACCESS_REQUIRED_ENGINES and not checked.full_access:
+        raise SubscriptionRouteRefused(engine, "full_access_required", engine)
     if not isinstance(profile, Mapping):
         raise SubscriptionRouteRefused(engine, "profile_malformed")
     # borrow_claude_code_login is not accepted. Hermes uses auth.adopt_external_logins (below).
@@ -530,7 +531,7 @@ def guard_then_spawn(
     """Run ``check_route`` and only then call the launcher with the env that check accepted.
 
     Hermes is full access only (Lucas, 2026-11-10): without ``full_access_acknowledged=True`` a Hermes
-    launch refuses ``hermes_full_access_only`` in ``check_route``, so the launcher is not called and
+    launch refuses ``full_access_required`` in ``check_route``, so the launcher is not called and
     nothing is written to the route home.
     A later change to ``child_env`` is not what launches: the launcher receives ``decision.child_env``.
     A subscription route's ``model`` must be an argv element (or ``--model`` / ``-m``), so the engine is

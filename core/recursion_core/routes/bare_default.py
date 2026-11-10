@@ -218,17 +218,26 @@ def _bounded_run(argv, *, env=None, stdin=None, stdout=None, stderr=None, timeou
 
     ``subprocess.run`` buffers all of stdout before the cap can apply. This reads at most
     ``HELP_MAX_BYTES + 1`` and then kills and reaps the child, including on timeout.
+
+    A timeout discards bytes already written. The child did not exit, so the buffer is
+    not a finished ``--help`` and is not classified. That is fail-closed (unknown).
+
+    ``stderr`` is ignored. The child always gets ``DEVNULL``. A ``PIPE`` is not drained,
+    and a flood on it would block the child before stdout closed.
     """
     if shell:
         raise ValueError("shell")
     # Never inherit os.environ. An omitted env is empty, not the parent process.
     child_env = {} if env is None else dict(env)
+    # Accept the keyword so callers can pass the subprocess.run shape, then drop it.
+    # STDOUT would mix into the help text; a pipe is not drained.
+    del stderr
     proc = subprocess.Popen(
         list(argv),
         env=child_env,
         stdin=subprocess.DEVNULL if stdin is None else stdin,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL if stderr is None else stderr,
+        stderr=subprocess.DEVNULL,
         shell=False,
     )
     limit = HELP_MAX_BYTES + 1
@@ -259,6 +268,9 @@ def _bounded_run(argv, *, env=None, stdin=None, stdout=None, stderr=None, timeou
         if proc.poll() is None:
             _reap(proc)
     if timed_out:
+        # box["out"] may now hold what the child wrote before the kill closed the
+        # pipe. Leave it off the exception. A partial page is not help text: classifying
+        # it could report absent or present for a read that never finished.
         raise subprocess.TimeoutExpired(list(argv), wait)
     err = box.get("err")
     if isinstance(err, Exception):
@@ -298,7 +310,8 @@ def read_help(binary: str, parent_env: Mapping[str, str], run: Runner = _bounded
     The child gets only ``PATH``, ``HOME`` and ``LANG`` from the explicit ``parent_env`` (never
     ``os.environ``), so no credential variable reaches it. A non-zero exit, timeout, launch failure,
     output over the byte cap, or non-UTF-8 output is ``None`` (classified ``"unknown"``). The read
-    stops at the cap and the child is reaped.
+    stops at the cap and the child is reaped. A timeout is unknown even when the child already
+    wrote a short page and then hung: that page is not a finished ``--help``.
     """
     return _capture(binary, "--help", parent_env, run)
 

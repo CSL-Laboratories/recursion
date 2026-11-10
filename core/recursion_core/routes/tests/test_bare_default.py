@@ -294,6 +294,77 @@ class ReadHelpTest(unittest.TestCase):
             with self.assertRaises(ProcessLookupError):
                 os.kill(pid, 0)
 
+    def test_timeout_discards_under_cap_help_already_written(self) -> None:
+        # Fail-closed on purpose. A child that writes a full under-cap help and then
+        # does not exit has not finished --help. Those bytes must not be classified:
+        # this text would be "absent" if it were a completed read.
+        payload = help_with_bare("Bare default: false")
+        self.assertEqual(bd.classify_help(payload), "absent")
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "payload").write_bytes(payload.encode())
+            script = home / "hanghelp"
+            script.write_text(textwrap.dedent("""\
+                #!/usr/bin/env python3
+                import os, sys, time
+                payload = open(os.environ["HOME"] + "/payload", "rb").read()
+                open(os.environ["HOME"] + "/pid", "w").write(str(os.getpid()))
+                sys.stdout.buffer.write(payload)
+                sys.stdout.flush()
+                time.sleep(60)
+            """))
+            script.chmod(script.stat().st_mode | stat.S_IEXEC)
+            env = {"PATH": os.environ.get("PATH", ""), "HOME": str(home)}
+            old = bd.HELP_TIMEOUT_S
+            bd.HELP_TIMEOUT_S = 0.4
+            try:
+                started = time.monotonic()
+                text = bd.read_help(str(script), env)
+                state = bd.probe(str(script), env)
+                elapsed = time.monotonic() - started
+                with self.assertRaises(subprocess.TimeoutExpired) as ctx:
+                    bd._bounded_run([str(script), "--help"], env=env, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                    timeout=0.4, check=False, shell=False)
+            finally:
+                bd.HELP_TIMEOUT_S = old
+            self.assertIsNone(text)
+            self.assertEqual(state, "unknown")
+            self.assertLess(elapsed, 2.0)
+            self.assertIsNone(ctx.exception.output)
+            pid = int((home / "pid").read_text())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+
+    def test_stderr_pipe_cannot_stall_the_help_read(self) -> None:
+        # _bounded_run accepts stderr= for the subprocess.run shape, but a PIPE is not
+        # drained. A flood on it must not block a short stdout that then exits.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            script = home / "stderrflood"
+            script.write_text(textwrap.dedent("""\
+                #!/usr/bin/env python3
+                import os, sys
+                open(os.environ["HOME"] + "/pid", "w").write(str(os.getpid()))
+                sys.stdout.buffer.write(b"help-ok\\n")
+                sys.stdout.flush()
+                sys.stderr.buffer.write(b"e" * (1 << 20))
+                sys.stderr.flush()
+            """))
+            script.chmod(script.stat().st_mode | stat.S_IEXEC)
+            env = {"PATH": os.environ.get("PATH", ""), "HOME": str(home)}
+            started = time.monotonic()
+            done = bd._bounded_run([str(script), "--help"], env=env, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   timeout=3, check=False, shell=False)
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 1.5)
+            self.assertEqual(done.returncode, 0)
+            self.assertEqual(done.stdout, b"help-ok\n")
+            pid = int((home / "pid").read_text())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+
     @unittest.skipUnless(os.environ.get("RECURSION_LIVE_CLAUDE_HELP") == "1" and shutil.which("claude"),
                          "set RECURSION_LIVE_CLAUDE_HELP=1 with claude on PATH")
     def test_local_claude_help(self) -> None:

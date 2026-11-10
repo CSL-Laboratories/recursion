@@ -10,15 +10,23 @@ import contextlib
 import io
 import os
 import shutil
+import stat
 import subprocess
+import tempfile
 import textwrap
+import threading
+import time
 import unittest
 from pathlib import Path
 
 from recursion_core.routes import bare_default as bd
 from recursion_core.routes import contract as c
-from recursion_core.routes.tests.fakes import MEASURED_HELP_TEXT, claude_limit, claude_ok, request
-from recursion_core.routes.tests.test_driver_and_limits import Harness
+from recursion_core.routes.breaker import ConnectionBreaker
+from recursion_core.routes.claude_code import ClaudeCodeAdapter
+from recursion_core.routes.service import RouteService
+from recursion_core.routes.tests.fakes import (MEASURED_HELP_TEXT, FakeClock, FakeProcess, claude_limit, claude_ok,
+                                               request)
+from recursion_core.routes.tests.test_driver_and_limits import PARENT, Harness
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "claude-2.1.312-help-excerpt.txt"
 HEAD = ("Usage: claude [options] [command] [prompt]\n\n"
@@ -192,6 +200,18 @@ class ClassifyHelpTest(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(bd.classify_help(text), "unknown")
 
+    def test_owner_locked_future_word_masks_a_present_default(self) -> None:
+        # Owner question, not a decision. One sentence that says --bare is the default now
+        # and also uses a future word currently reads absent (the future check wins the sentence).
+        text = help_with_bare("--bare is now the default for -p, and --no-bare is planned.")
+        self.assertEqual(bd.classify_help(text), "absent")
+
+    def test_owner_locked_interactive_false_hides_print_true(self) -> None:
+        # Owner question, not a decision. "default: false" for interactive matches before
+        # "true for -p" in the same sentence, so this currently reads absent.
+        text = help_with_bare("Minimal mode (default: false for interactive; true for -p).")
+        self.assertEqual(bd.classify_help(text), "absent")
+
 
 class ReadHelpTest(unittest.TestCase):
     def _run(self, returncode=0, stdout=b"", exc=None):
@@ -224,6 +244,55 @@ class ReadHelpTest(unittest.TestCase):
         for run in cases:
             with self.subTest(run=run):
                 self.assertEqual(bd.probe("claude", {"PATH": "/usr/bin"}, run), "unknown")
+
+    def test_malformed_probe_inputs_fail_closed(self) -> None:
+        # A bad env or a runner that does not return a process must be unknown, not a crash,
+        # and must not launch.
+        spawned = []
+
+        def boom(argv, **kwargs):
+            spawned.append(argv)
+            raise TypeError("bad argv")
+
+        def junk(argv, **kwargs):
+            spawned.append(argv)
+            return object()
+
+        self.assertIsNone(bd.read_help("claude", None, boom))
+        self.assertEqual(bd.probe("claude", None, boom), "unknown")
+        self.assertEqual(spawned, [])
+        self.assertEqual(bd.probe("claude", {"PATH": "/usr/bin"}, boom), "unknown")
+        self.assertEqual(bd.probe("claude", {"PATH": "/usr/bin"}, junk), "unknown")
+        self.assertIsNone(bd.read_version(None, {"PATH": "/usr/bin"}, boom))
+
+    def test_default_help_read_stops_at_the_byte_cap_and_reaps(self) -> None:
+        # The 1 MiB cap has to stop the read. A child that dumps more than that and then
+        # sleeps must be killed and reaped without waiting out the timeout.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            script = home / "floodhelp"
+            script.write_text(textwrap.dedent(f"""\
+                #!/usr/bin/env python3
+                import os, sys, time
+                open(os.environ["HOME"] + "/pid", "w").write(str(os.getpid()))
+                sys.stdout.buffer.write(b"x" * ({bd.HELP_MAX_BYTES * 2}))
+                sys.stdout.flush()
+                time.sleep(60)
+            """))
+            script.chmod(script.stat().st_mode | stat.S_IEXEC)
+            old = bd.HELP_TIMEOUT_S
+            bd.HELP_TIMEOUT_S = 5
+            try:
+                started = time.monotonic()
+                text = bd.read_help(str(script), {"PATH": os.environ.get("PATH", ""), "HOME": str(home)})
+                elapsed = time.monotonic() - started
+            finally:
+                bd.HELP_TIMEOUT_S = old
+            self.assertIsNone(text)
+            self.assertLess(elapsed, 2.0)
+            pid = int((home / "pid").read_text())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
 
     @unittest.skipUnless(os.environ.get("RECURSION_LIVE_CLAUDE_HELP") == "1" and shutil.which("claude"),
                          "set RECURSION_LIVE_CLAUDE_HELP=1 with claude on PATH")
@@ -376,6 +445,101 @@ class SubscriptionRouteBareDefaultTest(unittest.TestCase):
         self.assertEqual(refused["code"], c.LAUNCH_REFUSED)
         self.assertNotEqual(refused["detail"], "beta")
         self.assertEqual(len(h.launcher.calls), 1)
+
+    def test_surrogate_help_is_a_typed_refusal(self) -> None:
+        # A lone surrogate is not UTF-8. It must refuse before launch, with a typed code,
+        # and the detail must not echo the help bytes.
+        h = Harness([claude_ok()])
+        bad = MEASURED_HELP_TEXT + "\ud800"
+        decision = bd.subscription_beta("2.1.321", bad)
+        self.assertEqual(decision["disposition"], "refuse")
+        self.assertNotIn("\ud800", decision["detail"])
+        res = h.handle(request(claude_build="2.1.321", help_text=bad, bare_default="absent"))
+        self.assertEqual(res["code"], c.LAUNCH_REFUSED)
+        self.assertIn("unknown is not safe", res["detail"])
+        self.assertNotIn("\ud800", res["detail"])
+        self.assertNotEqual(res["detail"], "beta")
+        self.assertEqual(res["breaker_effect"], "none")
+        self.assertEqual(h.launcher.calls, [])
+
+    def test_overlapping_runs_keep_their_own_labels(self) -> None:
+        # One adapter is shared. A beta run blocked in the engine must not lose its label
+        # when another run on that adapter finishes, and the other run must not become beta.
+        for other in ("refusal", "api_key", "beta"):
+            with self.subTest(other=other):
+                _assert_overlapping_labels(self, other)
+
+
+def _assert_overlapping_labels(case: unittest.TestCase, other: str) -> None:
+    started, release = threading.Event(), threading.Event()
+
+    class _Hold(FakeProcess):
+        def __init__(self, script):
+            super().__init__(script)
+            self._held = False
+
+        def read_line(self, timeout_s):
+            if not self._held:
+                self._held = True
+                started.set()
+                if not release.wait(5):
+                    raise AssertionError("overlapping run was not released")
+            return super().read_line(timeout_s)
+
+    class _Launcher:
+        def __init__(self):
+            self.calls = []
+            self._hold = True
+
+        def __call__(self, argv, **kwargs):
+            self.calls.append({"argv": list(argv), "env": dict(kwargs["env"])})
+            if self._hold:
+                self._hold = False
+                return _Hold(claude_ok())
+            return FakeProcess(claude_ok())
+
+    clock = FakeClock()
+    launcher = _Launcher()
+    adapter = ClaudeCodeAdapter(launcher, clock, lambda conn, name: "route-anthropic", PARENT, wall_clock=clock)
+    service = RouteService({"claude_code": adapter}, ConnectionBreaker(clock), clock)
+    results: dict[str, dict] = {}
+    errors: list[BaseException] = []
+
+    def run_first():
+        try:
+            results["first"] = service.handle(request(rid="first"))
+        except BaseException as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=run_first)
+    first.start()
+    case.assertTrue(started.wait(5), "first run did not reach the engine")
+    if other == "refusal":
+        second_req = request(rid="second", conn_id="login-B", measured=False)
+    elif other == "api_key":
+        second_req = request(rid="second", kind="api_key", conn_id="key-2", credential_env="ANTHROPIC_API_KEY")
+    else:
+        second_req = request(rid="second", conn_id="login-B")
+    try:
+        results["second"] = service.handle(second_req)
+    finally:
+        release.set()
+    first.join(5)
+    case.assertFalse(first.is_alive())
+    case.assertEqual(errors, [])
+    case.assertEqual((results["first"]["status"], results["first"]["detail"]), ("ok", "beta"))
+    second = results["second"]
+    if other == "refusal":
+        case.assertEqual(second["code"], c.LAUNCH_REFUSED)
+        case.assertNotEqual(second["detail"], "beta")
+        case.assertEqual(len(launcher.calls), 1)
+    elif other == "api_key":
+        case.assertEqual(second["status"], "ok")
+        case.assertEqual(second["detail"], "")
+        case.assertEqual(len(launcher.calls), 2)
+    else:
+        case.assertEqual((second["status"], second["detail"]), ("ok", "beta"))
+        case.assertEqual(len(launcher.calls), 2)
 
 
 if __name__ == "__main__":

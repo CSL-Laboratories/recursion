@@ -123,7 +123,6 @@ class ClaudeCodeAdapter(RouteAdapter):
         self._binary = binary
 
     def argv(self, request: dict) -> list[str]:
-        self._run_label = None
         route = request["route"]
         kind = route["connection"]["kind"]
         bare = route.get("bare", False)
@@ -135,11 +134,11 @@ class ClaudeCodeAdapter(RouteAdapter):
         auth_args = []
         if kind == "subscription":
             # Every subscription launch goes through the measured-hash gate. Missing
-            # build or help refuses. A beta admission launches with no --bare and
-            # carries the beta label. Unknown is not an allow.
+            # build or help refuses. A beta admission launches with no --bare.
+            # The beta label is request-local (run_label); it is not stored on this adapter.
+            # Unknown is not an allow.
             auth_args = self._subscription_auth_args(route)
             self._check_api_key_helper(route)
-            self._run_label = "beta"
         # --verbose: stream-json output in print mode is documented to need it (unverified on this box).
         return [self._binary, *auth_args, *(["--bare"] if bare else []), "-p", "--input-format", "stream-json",
                 "--output-format", "stream-json", "--verbose", "--model", route["model"]]
@@ -177,6 +176,16 @@ class ClaudeCodeAdapter(RouteAdapter):
                     env[name] = env[name].strip().lower()
             return env
         raise c.RouteError(c.LAUNCH_REFUSED, f"connection kind {kind} not supported for claude_code")
+
+    def run_label(self, request: dict) -> str | None:
+        """Beta only for the subscription run this call admitted. Overlapping runs do not share it."""
+        route = request["route"]
+        if route["connection"]["kind"] != "subscription":
+            return None
+        decision = bd.subscription_beta(route.get("claude_build"), route.get("help_text"))
+        if decision.get("disposition") == "beta" and decision.get("label") == "beta":
+            return "beta"
+        return None
 
     @staticmethod
     def _subscription_auth_args(route: dict) -> list[str]:

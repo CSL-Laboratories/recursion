@@ -16,6 +16,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 from collections.abc import Callable, Mapping
 
 STATES = ("absent", "present", "unknown")
@@ -166,11 +167,11 @@ def subscription_beta(build: object, help_text: object) -> dict:
     if _build_key(version) < HELP_FLOOR:
         return {"disposition": "refuse", "label": None, "build": version, "help_sha256": None,
                 "detail": f"claude {version} is below the 2.1.314 floor"}
-    if (not isinstance(help_text, str) or help_text == ""
-            or len(help_text.encode("utf-8")) > HELP_MAX_BYTES):
+    raw = _help_bytes(help_text)
+    if raw is None:
         return {"disposition": "refuse", "label": None, "build": version, "help_sha256": None,
                 "detail": f"claude {version} help is unknown; unknown is not safe"}
-    digest = help_sha256(help_text)
+    digest = hashlib.sha256(raw).hexdigest()
     entry = next((row for row in MEASURED_HELP if row["help_sha256"] == digest), None)
     if entry is None:
         return {"disposition": "refuse", "label": None, "build": version, "help_sha256": digest,
@@ -183,16 +184,107 @@ def subscription_beta(build: object, help_text: object) -> dict:
 Runner = Callable[..., "subprocess.CompletedProcess[bytes]"]
 
 
+def _help_bytes(text: object) -> bytes | None:
+    """UTF-8 help bytes within ``HELP_MAX_BYTES``, or None when the text is unusable.
+
+    A lone surrogate cannot be encoded. That is unknown help, not an exception, and the
+    text itself is not copied into the refusal.
+    """
+    if not isinstance(text, str) or text == "" or len(text) > HELP_MAX_BYTES:
+        return None
+    try:
+        raw = text.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    if len(raw) > HELP_MAX_BYTES:
+        return None
+    return raw
+
+
+def _reap(proc: subprocess.Popen) -> None:
+    """Kill a child that is still running, then wait so it is not left behind."""
+    if proc.poll() is None:
+        proc.kill()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
+
+
+def _bounded_run(argv, *, env=None, stdin=None, stdout=None, stderr=None, timeout=None,
+                 check=False, shell=False):
+    """Run one argv with ``timeout`` and stop reading after the help cap.
+
+    ``subprocess.run`` buffers all of stdout before the cap can apply. This reads at most
+    ``HELP_MAX_BYTES + 1`` and then kills and reaps the child, including on timeout.
+    """
+    if shell:
+        raise ValueError("shell")
+    # Never inherit os.environ. An omitted env is empty, not the parent process.
+    child_env = {} if env is None else dict(env)
+    proc = subprocess.Popen(
+        list(argv),
+        env=child_env,
+        stdin=subprocess.DEVNULL if stdin is None else stdin,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL if stderr is None else stderr,
+        shell=False,
+    )
+    limit = HELP_MAX_BYTES + 1
+    wait = HELP_TIMEOUT_S if timeout is None else timeout
+    box: dict = {}
+
+    def reader() -> None:
+        try:
+            stream = proc.stdout
+            box["out"] = b"" if stream is None else stream.read(limit)
+        except Exception as exc:
+            box["err"] = exc
+
+    thread = threading.Thread(target=reader, daemon=True)
+    timed_out = False
+    try:
+        thread.start()
+        thread.join(wait)
+        if thread.is_alive():
+            timed_out = True
+            _reap(proc)
+            thread.join(5)
+        else:
+            _reap(proc)
+    finally:
+        if proc.stdout is not None and not proc.stdout.closed:
+            proc.stdout.close()
+        if proc.poll() is None:
+            _reap(proc)
+    if timed_out:
+        raise subprocess.TimeoutExpired(list(argv), wait)
+    err = box.get("err")
+    if isinstance(err, Exception):
+        raise err
+    out = box.get("out")
+    if not isinstance(out, bytes):
+        out = b""
+    code = proc.returncode if isinstance(proc.returncode, int) else 1
+    if check and code != 0:
+        raise subprocess.CalledProcessError(code, list(argv), output=out)
+    return subprocess.CompletedProcess(list(argv), code, stdout=out)
+
+
 def _capture(binary: str, flag: str, parent_env: Mapping[str, str], run: Runner) -> str | None:
     """Run ``<binary> <flag>`` once. The child gets only ``PATH``, ``HOME`` and ``LANG``."""
+    if not isinstance(binary, str) or binary == "" or not isinstance(parent_env, Mapping):
+        return None
     env = {k: parent_env[k] for k in ("PATH", "HOME", "LANG") if isinstance(parent_env.get(k), str)}
     try:
         done = run([binary, flag], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                    stderr=subprocess.DEVNULL, timeout=HELP_TIMEOUT_S, check=False, shell=False)
-    except (OSError, subprocess.SubprocessError, ValueError):
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
         return None
-    out = done.stdout
-    if done.returncode != 0 or not isinstance(out, bytes) or len(out) > HELP_MAX_BYTES:
+    out = getattr(done, "stdout", None)
+    code = getattr(done, "returncode", None)
+    if code != 0 or not isinstance(out, bytes) or len(out) > HELP_MAX_BYTES:
         return None
     try:
         return out.decode("utf-8")
@@ -200,33 +292,34 @@ def _capture(binary: str, flag: str, parent_env: Mapping[str, str], run: Runner)
         return None
 
 
-def read_help(binary: str, parent_env: Mapping[str, str], run: Runner = subprocess.run) -> str | None:
+def read_help(binary: str, parent_env: Mapping[str, str], run: Runner = _bounded_run) -> str | None:
     """Run ``<binary> --help`` once and return its text, or ``None`` if it cannot be read.
 
     The child gets only ``PATH``, ``HOME`` and ``LANG`` from the explicit ``parent_env`` (never
-    ``os.environ``), so no credential variable reaches it. A non-zero exit, timeout, launch failure or
-    non-UTF-8 output is ``None`` (classified ``"unknown"``).
+    ``os.environ``), so no credential variable reaches it. A non-zero exit, timeout, launch failure,
+    output over the byte cap, or non-UTF-8 output is ``None`` (classified ``"unknown"``). The read
+    stops at the cap and the child is reaped.
     """
     return _capture(binary, "--help", parent_env, run)
 
 
-def read_version(binary: str, parent_env: Mapping[str, str], run: Runner = subprocess.run) -> str | None:
+def read_version(binary: str, parent_env: Mapping[str, str], run: Runner = _bounded_run) -> str | None:
     """Run ``<binary> --version`` once under the same limit as ``read_help``, or ``None``."""
     return _capture(binary, "--version", parent_env, run)
 
 
-def probe(binary: str, parent_env: Mapping[str, str], run: Runner = subprocess.run) -> str:
+def probe(binary: str, parent_env: Mapping[str, str], run: Runner = _bounded_run) -> str:
     """``classify_help(read_help(...))``: the value a surface reports as ``route.bare_default``."""
 
     return classify_help(read_help(binary, parent_env, run))
 
 
-def probe_auth_mode(binary: str, parent_env: Mapping[str, str], run: Runner = subprocess.run) -> dict:
+def probe_auth_mode(binary: str, parent_env: Mapping[str, str], run: Runner = _bounded_run) -> dict:
     """Read help once and report the explicit subscription auth-mode capability."""
     return auth_mode(read_help(binary, parent_env, run))
 
 
-def main(argv: list[str] | None = None, run: Runner = subprocess.run) -> int:
+def main(argv: list[str] | None = None, run: Runner = _bounded_run) -> int:
     """Print one build's classification and the help lines it came from.
 
     Runs only ``--version`` and ``--help``.

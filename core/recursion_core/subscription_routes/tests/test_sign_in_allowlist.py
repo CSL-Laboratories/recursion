@@ -209,12 +209,33 @@ class AllowlistTests(_Base):
             ["opencode", "--model", model, "--", other],
             ["opencode", "--model", model, "--", "--model", other],
             [model, "--model", model],
+            ["opencode", "-m=" + model],
+            ["opencode", "--model=" + model],
         )
         for argv in accepted:
             with self.subTest(argv=argv):
                 self.launcher.reset_mock()
                 decision, _ = guard_then_spawn(self.launcher, argv, "opencode", profile, env, **kwargs)
                 self.assertEqual(model, decision.model)
+
+    def test_pi_system_prompt_consumes_a_flag_shaped_value(self) -> None:
+        # pi's --system-prompt takes the next token. "--model" there is prompt text, not a binding.
+        model = "chatgpt/test-model"
+        profile = self.sub("chatgpt", "sign_in_with_chatgpt", model=model)
+        argv = [self.wrapper.launcher_path, "--system-prompt", "--model", model]
+        with self.assertRaises(SubscriptionRouteRefused) as caught:
+            guard_then_spawn(
+                self.launcher, argv, "pi", profile, self.bare_env(), route_home=str(self.home),
+                parent_env=self.parent(), operator_home=str(self.operator), wrapper=self.wrapper,
+            )
+        self.assertEqual(caught.exception.cause, "model_not_bound")
+        self.launcher.assert_not_called()
+        bound = [self.wrapper.launcher_path, "--system-prompt", "be brief", "--model", model]
+        decision, _ = guard_then_spawn(
+            self.launcher, bound, "pi", profile, self.bare_env(), route_home=str(self.home),
+            parent_env=self.parent(), operator_home=str(self.operator), wrapper=self.wrapper,
+        )
+        self.assertEqual(model, decision.model)
 
     def test_no_token_rides_along_with_a_sign_in(self) -> None:
         cases = [({"OPENAI_API_KEY": FAKE_KEY}, "credential_env_on_subscription"),

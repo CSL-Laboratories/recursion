@@ -154,7 +154,7 @@ class ProfileTests(unittest.TestCase):
                 self.assertLessEqual(set(env), set(profile.allowed) | set(profile.passthrough))
                 # The only planted name that may arrive is the user's own sign-in token, on the Claude profile only.
                 self.assertEqual(set(profile.passthrough), set(planted) & set(env))
-                self.assertEqual({"claude_code": {"CLAUDE_CODE_OAUTH_TOKEN"}, "codex": set()}[engine],
+                self.assertEqual({"claude_code": {"CLAUDE_CODE_OAUTH_TOKEN"}}.get(engine, set()),
                                  set(profile.passthrough))
                 self.assertFalse(set(profile.scrub) & set(env))
                 self.assertEqual(home, env["HOME"])
@@ -645,8 +645,10 @@ class AuthRouteTests(unittest.TestCase):
         home = _home(self)
         for engine, profile in ENGINE_PROFILES.items():
             for mode in AUTH_MODES:
-                if engine == "codex" and mode == CLOUD:
-                    continue  # refused: see test_codex_routes
+                if mode == CLOUD and not profile.provider_switches:
+                    continue  # this engine has no cloud-provider route
+                if mode == API and profile.key_name is None:
+                    continue  # this engine has no API-key route
                 with self.subTest(engine=engine, mode=mode):
                     env = build_child_env(engine, home=home, auth_mode=mode, route=ROUTES[mode],
                                           parent={"PATH": "/usr/bin", **self.AMBIENT})

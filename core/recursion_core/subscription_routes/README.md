@@ -129,28 +129,52 @@ PRODUCT.md `055cc7a5` section 3.3. `own_loop.py`, checked before any spawn or re
 - `nous_proxy_doctor(base_url, current_user=..., interactive_users=[...])` reports the address,
   refuses one that is not loopback, and warns when other interactive users share the host (any
   local user can reach a loopback proxy, which "accepts any bearer"). The reported address is the
-  canonical origin only (`scheme://host:port`, default port included): no userinfo, path, query or
-  fragment. The decision's `base_url` still keeps the caller's path. Refusal text is the fixed
-  phrase `proxy address`, not the parser's message and not the raw URL, so a bad port named
-  `canary` and `ftp://127.0.0.1/<secret>` do not echo that text. A control character is rejected
-  before parsing. A bare `?` or `#` (empty query or fragment) is accepted; any non-empty query or
-  fragment is refused, including one that is not a credential. With no `interactive_users`, it and
+  canonical origin only (`scheme://host:port`, default port included) after the URL is an accepted
+  loopback: no userinfo, path, query or fragment. A refusal reports an empty address, so a
+  hostname, a rejected scheme and an IPv6 zone id are not echoed. The decision's `base_url` still
+  keeps the caller's path. Refusal text is a fixed phrase (`proxy address`, or
+  `use 127.0.0.1 or ::1`), not the parser's message and not the raw URL. A control character is
+  rejected before whitespace is stripped, so a leading newline is not a loopback URL. A bare `?`
+  or `#` (empty query or fragment) is accepted; any non-empty query or fragment is refused,
+  including one that is not a credential. With no `interactive_users`, it and
   `check_nous_own_loop` warn "host users unknown" instead of reporting a clean host.
 - **Login probe.** `has_copilot_login` stays a callable. It is the caller's function, not a command
   this package can turn into argv, and nothing here opens a login store. An argv/`Popen` contract
   was not adopted: the caller supplies the check (a lambda or a nested function), and a subprocess
-  would need a different product API. Where `fork`, `setsid` and `killpg` exist, the callable runs
-  in a new session. Every exit, including a probe that returns true, signals that session: SIGTERM,
-  then at most 200 ms and still inside the deadline, then SIGKILL. The session is the one confirmed
-  by a handshake byte written after `setsid`. Descendants that leave the session are out of scope.
-  Where that session cannot be enforced (Windows), the route refuses `probe unenforceable` and does
-  not leave a daemon thread running.
+  would need a different product API. The callable is not picklable, so there is no forkserver.
+  Where another thread is already alive, the route refuses `probe threaded` and does not fork: a
+  lock that thread holds is never released in the child. A thread started in the gap before
+  `fork` is still a race. Where `fork`, `setsid` and `killpg` exist, the child calls `setsid`,
+  writes a handshake byte, and does not run the callable until the parent has recorded that
+  process group and written an ack. Every exit, including a probe that returns true, signals that
+  original process group: SIGTERM, then at most 20% of the deadline (never more than 200 ms) and
+  still inside the deadline, then SIGKILL. The direct child is reaped only after those signals.
+  A descendant that calls `setpgid(0, 0)` leaves the process group and stays in the session; it
+  is not signalled. This is not session cleanup. Where the group cannot be enforced (Windows),
+  the route refuses `probe unenforceable` and does not leave a daemon thread running.
+  `spawn_copilot_own_loop` passes the route home into the probe. The probe then runs with the
+  child's final environment: `HOME` is the route home and `COPILOT_HOME` is `<home>/.copilot`.
+  Copilot CLI >= 1.0.1 reads `COPILOT_HOME` (otherwise `~/.copilot`) and ignores
+  `XDG_CONFIG_HOME`, which is not on the allowlist. A parent `COPILOT_HOME` does not select
+  another account. A check that does not pass `home` leaves the probe on the process environment.
+- **Spawn argv.** `spawn_copilot_own_loop` and `spawn_nous_own_loop` refuse caller argv that does
+  not carry the decision's model, base URL and adapters (`model_not_bound`, `base_url_not_bound`,
+  `adapter_not_bound`). Copilot is rebuilt on the Copilot `child_env` profile. `NO_PROXY` is
+  matched against Copilot's hosts (GitHub and `githubcopilot.com`), not Codex's, so
+  `NO_PROXY=api.openai.com` is kept. `NO_PROXY=api.github.com` with a proxy still refuses.
+  The host list is the public Copilot service names used for that check.
+- **Harness credential.** `launch_env` injects only `ANTHROPIC_API_KEY` (Claude profile) or
+  `OPENAI_API_KEY` (OpenAI profile), both inside the `ValidatedEnv`. Every launch, including an
+  OpenAI key, goes through `child_env.spawn`, so a world-writable executable is refused.
+  `HOME`, `LD_PRELOAD`, `PATH` and any other credential name refuse `credential_env_denied`.
 - **Accepted over-refusals.** These are stricter than a secret-only reading, and they are intended:
   any non-empty query or fragment; a host name, including `localhost` (it is not resolved); every
   `HERMES_*` and `NOUS_*` name, including ones that are not tokens; a second `--model` / `-m` that
-  names a different model (real CLIs often take the last flag). A subscription model binds only as
-  `--model X`, `--model=X`, `-m X` or an attached `-mX`, before `--`, and never as `argv[0]` or a
-  bare element. `opencode run chatgpt/good` refuses `model_not_bound`.
+  names a different model (real CLIs often take the last flag). A subscription model binds only
+  before `--`, as `--model X` or `-m X`. `opencode`, `hermes`, `copilot` and `nous` also accept
+  `--model=X`, `-m=X` and an attached `-mX`. Pi's `--system-prompt` and `--append-system-prompt`
+  consume the next element, even when it is spelled like a model flag. `argv[0]` and a bare
+  element do not bind. `opencode run chatgpt/good` refuses `model_not_bound`.
 - **Env families dropped on top of the allowlist**, for both Copilot and Nous: suffixes `_SECRET`,
   `_PASSWORD`, `_KEY`, `_PAT`, `_CREDENTIALS`; prefixes `AWS_`, `AZURE_`, `ARM_`, `GOOGLE_`,
   `CLOUDSDK_`, `GCLOUD_`, `DYLD_`; and `SSH_AUTH_SOCK`, `SSH_ASKPASS`, `GIT_ASKPASS`, `GIT_SSH`,

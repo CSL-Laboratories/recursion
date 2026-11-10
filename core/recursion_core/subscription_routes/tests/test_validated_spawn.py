@@ -15,6 +15,7 @@ from unittest import mock
 
 from recursion_core.child_env import EnvRefused, build_child_env
 from recursion_core.subscription_routes import (
+    OwnLoopRouteRefused,
     SubscriptionRouteRefused,
     guard_then_spawn,
     launch_env,
@@ -156,6 +157,28 @@ class HarnessSpawnTests(_Calls):
         self.assertEqual({"PATH", "HOME"}, set(got))
         self.assertEqual(got, self._popen_env(decision))
 
+    def test_an_openai_key_still_goes_through_the_executable_check(self) -> None:
+        unsafe = self.bin / "unsafe-engine"
+        unsafe.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+        unsafe.chmod(0o777)
+        env = {"PATH": "/usr/bin:/bin", "HOME": str(self.home), "OPENAI_API_KEY": FAKE_KEY}
+        with mock.patch("subprocess.Popen") as popen, self.assertRaises(EnvRefused) as caught:
+            spawn_route_process(
+                [str(unsafe), "run"], env, route_home=str(self.home), credential_env="OPENAI_API_KEY",
+            )
+        self.assertIn("argv0", caught.exception.cause)
+        popen.assert_not_called()
+
+    def test_credential_env_cannot_restore_home_or_a_loader(self) -> None:
+        for name in ("HOME", "LD_PRELOAD", "PATH"):
+            with self.subTest(name=name):
+                with self.assertRaises(EnvRefused) as caught:
+                    launch_env(
+                        {"PATH": "/usr/bin:/bin", "HOME": str(self.home), name: "/tmp/not-the-route"},
+                        route_home=str(self.home), credential_env=name,
+                    )
+                self.assertEqual("credential_env_denied", caught.exception.cause)
+
     def test_subprocess_run_is_not_the_launch(self) -> None:
         decision, _ = self.launch("cursor")
         with mock.patch("subprocess.run") as run, mock.patch("subprocess.Popen") as popen:
@@ -186,10 +209,17 @@ class OwnLoopSpawnTests(unittest.TestCase):
         self.base = {"PATH": str(self.bin), "HOME": "/home/not-the-route-home", "LANG": "C.UTF-8"}
 
     def _spawn(self, call, route) -> dict:
+        argv = list(self.argv)
+        if route.get("base_url"):
+            argv.extend(["--base-url", str(route["base_url"])])
+        for name in route.get("adapters") or ():
+            argv.extend(["--adapter", name])
+        if route.get("model"):
+            argv.extend(["--model", str(route["model"])])
         parent = {**self.base, **POISON, "HTTP_PROXY": "http://127.0.0.1:9"}
         with mock.patch.dict(os.environ, POISON), mock.patch("subprocess.Popen") as popen, \
                 mock.patch("subprocess.run") as run:
-            decision, _proc = call(route, parent, self.argv, home=str(self.home))
+            decision, _proc = call(route, parent, argv, home=str(self.home))
         run.assert_not_called()
         popen.assert_called_once()
         env = popen.call_args.kwargs["env"]
@@ -198,9 +228,12 @@ class OwnLoopSpawnTests(unittest.TestCase):
         self.assertIsNot(env, os.environ)
         self.assertEqual(str(self.home), env["HOME"])
         self.assertNotEqual("/home/not-the-route-home", env["HOME"])
+        engine = "copilot" if route.get("engine") == "copilot" else "codex"
+        overrides = {"COPILOT_HOME": str(self.home / ".copilot")} if engine == "copilot" else None
         expected = build_child_env(
-            "codex", home=str(self.home), auth_mode="subscription",
+            engine, home=str(self.home), auth_mode="subscription",
             parent={k: v for k, v in decision.child_env.items() if k != "HOME"},
+            overrides=overrides,
         )
         self.assertEqual(expected.to_dict(), env)
         self.assertIs(popen.call_args.kwargs["shell"], False)
@@ -240,6 +273,91 @@ class OwnLoopSpawnTests(unittest.TestCase):
         self.assertNotIn("HTTPS_PROXY", decision.child_env)
         self.assertNotIn("poison-pass", popen.call_args.kwargs["env"].values())
         self.assertNotIn("HTTPS_PROXY", popen.call_args.kwargs["env"])
+
+    def test_probe_sees_the_route_copilot_home_not_the_parent_account(self) -> None:
+        # Copilot CLI >= 1.0.1 reads COPILOT_HOME, else ~/.copilot, and ignores XDG_CONFIG_HOME.
+        operator = self.root / "operator"
+        operator.mkdir(mode=0o700)
+        operator_login = operator / ".copilot"
+        operator_login.mkdir(mode=0o700)
+        (operator_login / "account").write_text("A", encoding="ascii")
+        (operator_login / "login").write_text("yes", encoding="ascii")
+        route_login = self.home / ".copilot"
+        route_login.mkdir(mode=0o700)
+        (route_login / "account").write_text("B", encoding="ascii")
+        (route_login / "login").write_text("yes", encoding="ascii")
+        xdg = self.root / "xdg"
+        xdg.mkdir(mode=0o700)
+        (xdg / "account").write_text("X", encoding="ascii")
+        marker = self.root / "seen"
+
+        def probe() -> bool:
+            home = os.environ.get("COPILOT_HOME") or os.path.join(os.environ.get("HOME", ""), ".copilot")
+            account = os.path.join(home, "account")
+            text = "missing"
+            if os.path.isfile(account):
+                with open(account, encoding="ascii") as handle:
+                    text = handle.read()
+            with open(marker, "w", encoding="ascii") as handle:
+                handle.write(text + "\n" + home + "\n")
+                if "XDG_CONFIG_HOME" in os.environ:
+                    handle.write("xdg\n")
+            return os.path.isfile(os.path.join(home, "login"))
+
+        parent = {
+            **self.base, "HOME": str(operator), "XDG_CONFIG_HOME": str(xdg),
+            "COPILOT_HOME": str(operator_login),
+        }
+        with mock.patch("subprocess.Popen") as popen:
+            spawn_copilot_own_loop(
+                {"engine": "copilot", "auth": "subscription", "method": "copilot_cli_sign_in"},
+                parent, self.argv, home=str(self.home), has_copilot_login=probe,
+            )
+        self.assertEqual("B", marker.read_text(encoding="ascii").splitlines()[0])
+        self.assertNotIn("xdg", marker.read_text(encoding="ascii"))
+        env = popen.call_args.kwargs["env"]
+        self.assertEqual(str(self.home), env["HOME"])
+        self.assertEqual(str(route_login), env["COPILOT_HOME"])
+        self.assertNotIn("XDG_CONFIG_HOME", env)
+        self.assertNotIn("A", env.get("COPILOT_HOME", ""))
+
+    def test_spawn_refuses_argv_that_contradicts_the_checked_route(self) -> None:
+        with mock.patch("subprocess.Popen") as popen, self.assertRaises(OwnLoopRouteRefused) as caught:
+            spawn_copilot_own_loop(
+                {"engine": "copilot", "auth": "subscription", "method": "copilot_cli_sign_in",
+                 "model": "gpt-good"},
+                self.base, [self.argv[0], "--model", "gpt-bad"], home=str(self.home),
+                has_copilot_login=lambda: True,
+            )
+        self.assertEqual(caught.exception.cause, "model_not_bound")
+        popen.assert_not_called()
+        nous = {"engine": "nous", "auth": "subscription", "method": "hermes_local_proxy",
+                "base_url": "http://127.0.0.1:8645/v1", "adapters": ["nous"], "model": "nous/good"}
+        argv = [self.argv[0], "--base-url", "https://evil.example/v1", "--adapter", "xai", "--model", "xai/bad"]
+        with mock.patch("subprocess.Popen") as popen, self.assertRaises(OwnLoopRouteRefused) as caught:
+            spawn_nous_own_loop(
+                nous, self.base, argv, home=str(self.home), current_user="u", interactive_users=["u"],
+            )
+        self.assertIn(caught.exception.cause, {"base_url_not_bound", "adapter_not_bound", "model_not_bound"})
+        popen.assert_not_called()
+
+    def test_copilot_keeps_a_no_proxy_entry_for_an_openai_host(self) -> None:
+        parent = {**self.base, "HTTPS_PROXY": "http://127.0.0.1:9", "NO_PROXY": "api.openai.com"}
+        with mock.patch("subprocess.Popen") as popen:
+            spawn_copilot_own_loop(
+                {"engine": "copilot", "auth": "subscription", "method": "copilot_cli_sign_in"},
+                parent, self.argv, home=str(self.home), has_copilot_login=lambda: True,
+            )
+        launched = popen.call_args.kwargs["env"]
+        self.assertEqual("api.openai.com", launched["NO_PROXY"])
+        with mock.patch("subprocess.Popen") as popen, self.assertRaises(EnvRefused) as caught:
+            spawn_copilot_own_loop(
+                {"engine": "copilot", "auth": "subscription", "method": "copilot_cli_sign_in"},
+                {**self.base, "HTTPS_PROXY": "http://127.0.0.1:9", "NO_PROXY": "api.github.com"},
+                self.argv, home=str(self.home), has_copilot_login=lambda: True,
+            )
+        self.assertEqual("no_proxy_engine_host", caught.exception.cause)
+        popen.assert_not_called()
 
     def test_an_unsafe_path_never_reaches_popen(self) -> None:
         parent = {**self.base, "PATH": "relative-bin"}

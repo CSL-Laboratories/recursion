@@ -13,7 +13,6 @@ import tempfile
 import threading
 import time
 import unittest
-import warnings
 from unittest import mock
 
 import recursion_core.subscription_routes.own_loop as own_loop
@@ -114,6 +113,12 @@ class CopilotTests(unittest.TestCase):
         self.assertIn("deadline", caught.exception.detail)
         kept = check_copilot_own_loop(copilot(), BASE, has_copilot_login=lambda: True, probe_deadline=0.5)
         self.assertEqual(kept.method, "copilot_cli_sign_in")
+        for deadline in (0.05, 0.2):
+            with self.subTest(deadline=deadline):
+                decision = check_copilot_own_loop(
+                    copilot(), BASE, has_copilot_login=lambda: True, probe_deadline=deadline,
+                )
+                self.assertEqual(decision.method, "copilot_cli_sign_in")
 
     @unittest.skipUnless(hasattr(os, "fork") and hasattr(os, "killpg"), "POSIX process-group kill")
     def test_login_probe_deadline_kills_the_process_group(self) -> None:
@@ -233,10 +238,124 @@ class CopilotTests(unittest.TestCase):
             self.assertNotEqual(sleeper, os.getpid())
             self.assertTrue(_process_not_running(sleeper))
 
-    def test_login_probe_returns_while_another_thread_holds_a_lock(self) -> None:
+    def test_the_callable_waits_until_the_parent_records_the_group(self) -> None:
+        marker = os.path.join(tempfile.mkdtemp(prefix="csl786-ack-"), "ran")
+        self.addCleanup(lambda: os.path.isdir(os.path.dirname(marker)) and __import__("shutil").rmtree(os.path.dirname(marker), True))
+        leaked: list[bool] = []
+        real = own_loop._read_handshake
+
+        def slow(selector, fd, pid, started, deadline):
+            pgid, reason = real(selector, fd, pid, started, deadline)
+            time.sleep(0.15)
+            leaked.append(os.path.exists(marker))
+            return pgid, reason
+
+        def probe() -> bool:
+            with open(marker, "w", encoding="ascii") as handle:
+                handle.write("ran")
+            return True
+
+        with mock.patch.object(own_loop, "_read_handshake", slow):
+            decision = check_copilot_own_loop(copilot(), BASE, has_copilot_login=probe, probe_deadline=1.0)
+        self.assertEqual(decision.method, "copilot_cli_sign_in")
+        self.assertEqual(leaked, [False])
+
+    def test_an_interrupted_kill_still_reaches_the_group(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            info_path = os.path.join(tmp, "child")
+
+            def probe() -> bool:
+                sleeper = os.fork()
+                if sleeper == 0:
+                    time.sleep(30)
+                    os._exit(0)
+                with open(info_path, "w", encoding="ascii") as handle:
+                    handle.write(f"{sleeper}\n")
+                return True
+
+            real = os.killpg
+            calls = {"term": 0}
+
+            def flaky(pgid: int, sig: int):
+                if sig == signal.SIGTERM and calls["term"] == 0:
+                    calls["term"] += 1
+                    raise InterruptedError
+                return real(pgid, sig)
+
+            self.addCleanup(lambda: _stop_recorded(info_path))
+            with mock.patch.object(own_loop.os, "killpg", flaky):
+                decision = check_copilot_own_loop(copilot(), BASE, has_copilot_login=probe, probe_deadline=1.0)
+            self.assertEqual(decision.method, "copilot_cli_sign_in")
+            with open(info_path, encoding="ascii") as handle:
+                sleeper = int(handle.read().strip())
+            self.assertTrue(_process_not_running(sleeper))
+
+    def test_the_worker_is_signalled_before_it_is_reaped(self) -> None:
+        order: list[str] = []
+        real_wait = os.waitpid
+        real_killpg = os.killpg
+
+        def waitpid(pid: int, options: int):
+            order.append("wait")
+            return real_wait(pid, options)
+
+        def killpg(pgid: int, sig: int):
+            if sig != 0:
+                order.append("kill")
+            return real_killpg(pgid, sig)
+
+        with mock.patch.object(own_loop.os, "waitpid", waitpid), mock.patch.object(own_loop.os, "killpg", killpg):
+            check_copilot_own_loop(copilot(), BASE, has_copilot_login=lambda: True, probe_deadline=1.0)
+        self.assertIn("kill", order)
+        self.assertIn("wait", order)
+        self.assertLess(order.index("kill"), order.index("wait"))
+
+    def test_cleanup_is_the_original_process_group_not_the_session(self) -> None:
+        # setpgid(0, 0) leaves the original process group and stays in the session. That child is not signalled.
+        text = own_loop._stop_probe.__doc__ or ""
+        self.assertIn("process group", text)
+        self.assertIn("setpgid", text)
+        with tempfile.TemporaryDirectory() as tmp:
+            info_path = os.path.join(tmp, "kids")
+
+            def probe() -> bool:
+                ready_r, ready_w = os.pipe()
+                stayed = os.fork()
+                if stayed == 0:
+                    os.close(ready_r)
+                    os.close(ready_w)
+                    time.sleep(30)
+                    os._exit(0)
+                escaped = os.fork()
+                if escaped == 0:
+                    os.close(ready_r)
+                    os.setpgid(0, 0)
+                    os.write(ready_w, b"1")
+                    os.close(ready_w)
+                    time.sleep(30)
+                    os._exit(0)
+                os.close(ready_w)
+                os.read(ready_r, 1)
+                os.close(ready_r)
+                with open(info_path, "w", encoding="ascii") as handle:
+                    handle.write(f"{stayed} {escaped}\n")
+                return True
+
+            self.addCleanup(lambda: _stop_recorded(info_path))
+            check_copilot_own_loop(copilot(), BASE, has_copilot_login=probe, probe_deadline=1.0)
+            with open(info_path, encoding="ascii") as handle:
+                stayed, escaped = (int(part) for part in handle.read().split())
+            self.assertTrue(_process_not_running(stayed))
+            self.assertFalse(_process_not_running(escaped))
+            os.kill(escaped, signal.SIGKILL)
+
+    def test_a_held_lock_refuses_before_the_probe_can_deadlock(self) -> None:
+        # Fork copies the lock as held. The holder thread is not in the child, so a probe that
+        # acquires the lock never observes a later release and the deadline always fires.
         lock = threading.Lock()
         held = threading.Event()
         release = threading.Event()
+        ran = threading.Event()
 
         def holder() -> None:
             lock.acquire()
@@ -244,21 +363,27 @@ class CopilotTests(unittest.TestCase):
             release.wait(5)
             lock.release()
 
+        def probe() -> bool:
+            ran.set()
+            lock.acquire()
+            lock.release()
+            return True
+
         thread = threading.Thread(target=holder)
         thread.start()
         self.addCleanup(release.set)
         self.addCleanup(thread.join, 2)
         self.assertTrue(held.wait(2))
         started = time.monotonic()
-        # fork while another thread exists warns; the probe itself never takes the lock.
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            decision = check_copilot_own_loop(
-                copilot(), BASE, has_copilot_login=lambda: True, probe_deadline=0.5,
-            )
-        self.assertLess(time.monotonic() - started, 0.5)
-        self.assertEqual(decision.method, "copilot_cli_sign_in")
-        self.assertTrue(lock.locked())
+        with self.assertRaises(OwnLoopRouteRefused) as caught:
+            check_copilot_own_loop(copilot(), BASE, has_copilot_login=probe, probe_deadline=1.0)
+        self.assertLess(time.monotonic() - started, 0.3)
+        self.assertEqual(caught.exception.detail, "probe threaded")
+        self.assertFalse(ran.is_set())
+        release.set()
+        thread.join(2)
+        self.assertTrue(lock.acquire(timeout=1))
+        lock.release()
 
     def test_aws_access_key_id_and_gh_pat_do_not_reach_the_copilot_child(self) -> None:
         # Suffix matching catches *_TOKEN and *_API_KEY, not these two names.
@@ -456,7 +581,8 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(nous_proxy_doctor("https://127.0.0.1")["address"], "https://127.0.0.1:443")
         self.assertEqual(nous_proxy_doctor("http://[::1]:8645/v1")["address"], "http://[::1]:8645")
         bad = nous_proxy_doctor("http://10.1.2.3:8645")
-        self.assertEqual((bad["ok"], bad["address"], bad["cause"]), (False, "http://10.1.2.3:8645", "proxy_not_loopback"))
+        self.assertEqual((bad["ok"], bad["address"], bad["cause"]), (False, "", "proxy_not_loopback"))
+        self.assertNotIn("10.1.2.3", str(bad))
         self.assertEqual(nous_proxy_doctor(None)["cause"], "proxy_address_missing")
         shared = nous_proxy_doctor("http://127.0.0.1:1", current_user="u", interactive_users=["u", "eve"])
         self.assertTrue(shared["ok"])
@@ -548,6 +674,31 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(caught.exception.detail, "proxy address")
         self.assertNotIn(control_secret, str(caught.exception))
 
+    def test_doctor_does_not_echo_host_scheme_or_zone_text(self) -> None:
+        canary = "canary"
+        cases = (
+            f"http://{canary}.invalid:8645/v1",
+            f"{canary}://127.0.0.1:8645/v1",
+            f"http://[::1%{canary}]:8645/v1",
+        )
+        for url in cases:
+            with self.subTest(url=url.split(canary)[0]):
+                report = nous_proxy_doctor(url)
+                self.assertFalse(report["ok"])
+                self.assertEqual(report["address"], "")
+                self.assertNotIn(canary, str(report))
+                with self.assertRaises(OwnLoopRouteRefused) as caught:
+                    check_nous_own_loop(nous(base_url=url), BASE)
+                self.assertNotIn(canary, str(caught.exception))
+                self.assertNotIn(canary, caught.exception.detail)
+        padded = "\nhttp://127.0.0.1:8645/v1"
+        report = nous_proxy_doctor(padded)
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["address"], "")
+        with self.assertRaises(OwnLoopRouteRefused) as caught:
+            check_nous_own_loop(nous(base_url=padded), BASE)
+        self.assertEqual(caught.exception.cause, "proxy_address_malformed")
+
     def test_a_bare_query_or_fragment_is_accepted_and_the_decision_keeps_the_path(self) -> None:
         for url in ("http://127.0.0.1:8645/v1?", "http://127.0.0.1:8645/v1#", "http://127.0.0.1:8645/v1?#"):
             with self.subTest(url=url):
@@ -565,6 +716,21 @@ class DoctorTests(unittest.TestCase):
             got = nous_proxy_doctor(url)
             self.assertEqual(len(got["warnings"]), 1)
             self.assertTrue(got["warnings"][0].startswith("host users unknown"))
+
+
+def _stop_recorded(path: str) -> None:
+    if not os.path.exists(path):
+        return
+    with open(path, encoding="ascii") as handle:
+        parts = handle.read().split()
+    for part in parts:
+        pid = int(part)
+        if pid == os.getpid():
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
 
 def _process_not_running(pid: int) -> bool:

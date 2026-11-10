@@ -268,6 +268,38 @@ ENGINE_PROFILES: Mapping[str, EngineProfile] = MappingProxyType(
             _CODEX_SCRUB,
             key_name="CODEX_API_KEY",  # the variable ``codex exec`` reads; no base URL and no cloud switch here
         ),
+        # Copilot CLI >= 1.0.1 reads COPILOT_HOME, else ~/.copilot, and does not read XDG_CONFIG_HOME.
+        # Hosts are the Copilot service names a NO_PROXY entry must not exempt. OpenAI's hosts are not
+        # among them: a Copilot child may exclude api.openai.com.
+        "copilot": EngineProfile(
+            "copilot",
+            BASE_NAMES + ("COPILOT_HOME",),
+            (
+                "github.com",
+                "api.github.com",
+                "copilot-proxy.githubusercontent.com",
+                "proxy.individual.githubcopilot.com",
+                "api.individual.githubcopilot.com",
+                "api.business.githubcopilot.com",
+                "api.enterprise.githubcopilot.com",
+            ),
+            (
+                "GITHUB_TOKEN",
+                "GH_TOKEN",
+                "GH_PAT",
+                "GITHUB_COPILOT_API_TOKEN",
+                "COPILOT_GITHUB_TOKEN",
+                "COPILOT_API_URL",
+            ),
+        ),
+        # OpenAI API key inside a ValidatedEnv, so spawn's executable checks run. Not the OpenCode harness name.
+        "openai": EngineProfile(
+            "openai",
+            BASE_NAMES,
+            ("api.openai.com", "chatgpt.com"),
+            ("OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"),
+            key_name="OPENAI_API_KEY",
+        ),
     }
 )
 

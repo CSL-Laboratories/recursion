@@ -5,20 +5,18 @@ carry. This module is the only place those decisions become a process environmen
 the checked snapshot with ``build_child_env`` and passes that result to ``Popen``. The parent
 environment and ``os.environ`` are not the mapping ``Popen`` receives.
 
-``child_env`` knows Claude Code and Codex, not these harnesses. An Anthropic API key is the
-Claude profile's route key, so it is inside the ``ValidatedEnv``. Any other credential the route
-policy already accepted (OpenAI's ``OPENAI_API_KEY``) is copied onto that dict under the name the
-harness reads. Copilot and Nous own-loop children have no such credential; they go through
-``spawn`` with the Codex profile, which does not pass a Claude sign-in token through.
+``child_env`` knows Claude Code, Codex and OpenAI. An Anthropic API key is the Claude profile's
+route key. ``OPENAI_API_KEY`` is the OpenAI profile's route key. Both are inside the
+``ValidatedEnv``, and every launch goes through ``spawn``. Any other credential name is refused.
+Copilot and Nous own-loop children are started by ``own_loop``, not here.
 """
 
 from __future__ import annotations
 
-import os
 import subprocess
 from collections.abc import Mapping, Sequence
 
-from recursion_core.child_env import ChildRoute, ValidatedEnv, build_child_env, spawn
+from recursion_core.child_env import ChildRoute, EnvRefused, ValidatedEnv, build_child_env, spawn
 from recursion_core.subscription_routes.own_loop import _ambient_secret
 
 __all__ = ["launch_env", "spawn_route_process"]
@@ -51,6 +49,11 @@ def _blocked_secret(name: str) -> bool:
     return name.upper() in _TOKEN_NAMES
 
 
+# The only names a caller may ask this module to inject. HOME, PATH and loader variables are not
+# credentials: accepting them would put back a value ``build_child_env`` had already refused.
+_CREDENTIAL_NAMES = frozenset({"ANTHROPIC_API_KEY", "OPENAI_API_KEY"})
+
+
 def launch_env(
     child_env: Mapping[str, str],
     *,
@@ -59,14 +62,17 @@ def launch_env(
 ) -> tuple[ValidatedEnv, dict[str, str]]:
     """Rebuild ``child_env`` through ``build_child_env``. The second value is what a process receives.
 
-    ``credential_env`` is the one variable ``check_route`` already accepted. It is injected by the
-    Claude profile when it is ``ANTHROPIC_API_KEY``. Any other checked credential is set on the
-    copy ``ValidatedEnv.to_dict`` returns, under the harness's own name. A secret that arrived only
-    in the parent process is not in ``child_env`` and is not read from ``os.environ``.
+    ``credential_env`` is the one variable ``check_route`` already accepted. ``ANTHROPIC_API_KEY`` is
+    the Claude profile's route key. ``OPENAI_API_KEY`` is the OpenAI profile's route key. Both are
+    inside the ``ValidatedEnv``. Any other name, including ``HOME`` and ``LD_PRELOAD``, is refused.
+    A secret that arrived only in the parent process is not in ``child_env`` and is not read from
+    ``os.environ``.
     """
 
     checked = dict(child_env)
     credential = credential_env if isinstance(credential_env, str) else ""
+    if credential not in _CREDENTIAL_NAMES and credential != "":
+        raise EnvRefused(credential or None, "credential_env_denied")
     parent = {
         name: value for name, value in checked.items()
         if name not in ("HOME", credential) and not _blocked_secret(name)
@@ -76,11 +82,14 @@ def launch_env(
             "claude_code", home=route_home, auth_mode="api_key",
             route=ChildRoute(api_key=checked[credential]), parent=parent,
         )
-        return validated, validated.to_dict()
-    validated = build_child_env("codex", home=route_home, auth_mode="subscription", parent=parent)
+    elif credential == "OPENAI_API_KEY":
+        validated = build_child_env(
+            "openai", home=route_home, auth_mode="api_key",
+            route=ChildRoute(api_key=checked[credential]), parent=parent,
+        )
+    else:
+        validated = build_child_env("codex", home=route_home, auth_mode="subscription", parent=parent)
     launched = validated.to_dict()
-    if credential:
-        launched[credential] = checked[credential]
     return validated, launched
 
 
@@ -94,16 +103,9 @@ def spawn_route_process(
 ) -> subprocess.Popen:
     """Start ``argv`` with ``launch_env``. ``Popen`` is looked up at the call, so a test can patch it.
 
-    When the launched mapping is exactly the ``ValidatedEnv``, ``child_env.spawn`` is the caller.
-    A harness credential that profile does not name is passed as an explicit ``env`` on that same
-    ``Popen``, still not ``os.environ`` and still not the parent mapping.
+    Every launch goes through ``child_env.spawn``, including an OpenAI key. That is the executable,
+    argv and ownership check. The launched mapping is the ``ValidatedEnv``; nothing is appended after it.
     """
 
-    validated, launched = launch_env(child_env, route_home=route_home, credential_env=credential_env)
-    popen = subprocess.Popen
-    if launched == validated.to_dict():
-        return spawn(argv, validated, cwd=cwd, popen=popen)
-    return popen(
-        list(argv), env=dict(launched), cwd=cwd, shell=False, close_fds=True,
-        start_new_session=os.name != "nt",
-    )
+    validated, _launched = launch_env(child_env, route_home=route_home, credential_env=credential_env)
+    return spawn(argv, validated, cwd=cwd, popen=subprocess.Popen)

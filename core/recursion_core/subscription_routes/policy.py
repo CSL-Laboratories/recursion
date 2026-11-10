@@ -516,9 +516,12 @@ def guard_then_spawn(
     A later change to ``child_env`` is not what launches. The launcher receives that checked
     snapshot rebuilt by ``child_env.build_child_env`` (a private temp root when a temp name is
     present, and the one checked credential under its own name). It is never ``os.environ``.
-    A subscription route's ``model`` binds only as ``--model X``, ``--model=X``, ``-m X`` or an attached
-    ``-mX``, and only before ``--``. ``argv[0]`` and a bare element (``opencode run <model>``) do not
-    bind. A second flag with a different value refuses ``model_not_bound``.
+    A subscription route's ``model`` binds only before ``--``, as ``--model X`` or ``-m X``.
+    ``opencode``, ``hermes``, ``copilot`` and ``nous`` also accept ``--model=X``, ``-m=X`` and an
+    attached ``-mX``. Pi's ``--system-prompt`` and ``--append-system-prompt`` consume the next element,
+    so a flag-shaped value there is not a binding. ``argv[0]`` and a bare element
+    (``opencode run <model>``) do not bind. A second flag with a different value refuses
+    ``model_not_bound``.
     On Pi and Hermes ``argv[0]`` must be an absolute path that resolves to
     the pinned ``wrapper.launcher_path`` (``argv0_not_pinned``); OpenCode has no pin and no such check.
     Hermes's ``auth.adopt_external_logins: false`` is written into the route home's
@@ -769,17 +772,35 @@ def _argv0_is_pinned(argv: list[str], pinned: tuple[str, ...]) -> bool:
     return any(isinstance(path, str) and os.path.isabs(path) and os.path.realpath(path) == real for path in pinned)
 
 
-def _argv_binds_model(argv: list[str], model: str) -> bool:
-    """True when every model flag before ``--`` names ``model``.
+# Options that take the next argv element as a value, so a following ``--model`` is that value and
+# not a model flag. Pi's ``--system-prompt`` is the case the scanner used to get wrong.
+_VALUE_OPTIONS = {
+    "pi": frozenset({"--system-prompt", "--append-system-prompt"}),
+    "hermes": frozenset(),
+    "opencode": frozenset(),
+    "copilot": frozenset(),
+    "nous": frozenset(),
+}
+# Engines whose CLIs accept ``--model=VALUE``, ``-m=VALUE`` and an attached ``-mVALUE``.
+_EQUALS_MODEL = frozenset({"opencode", "hermes", "copilot", "nous"})
 
-    Accepted forms are ``--model X``, ``--model=X``, ``-m X`` and an attached ``-mX``. ``argv[0]`` is
-    the program. A bare element, including ``opencode run <model>``, does not bind. A flag after
-    ``--`` does not bind. A flag with no value, an empty ``--model=``, or two flags that disagree,
-    does not bind.
+
+def _argv_binds_model(argv: list[str], model: str, engine: str = "opencode") -> bool:
+    """True when every model flag before ``--`` names ``model`` for ``engine``.
+
+    Accepted forms are ``--model X`` and ``-m X``. ``opencode``, ``hermes``, ``copilot`` and ``nous``
+    also accept ``--model=X``, ``-m=X`` and an attached ``-mX``. ``argv[0]`` is the program. A bare
+    element, including ``opencode run <model>``, does not bind. A flag after ``--`` does not bind.
+    A flag with no value, an empty ``--model=``, or two flags that disagree, does not bind.
+
+    Pi's ``--system-prompt`` and ``--append-system-prompt`` consume the next element, even when that
+    element is spelled like a model flag.
     """
 
     if not model:
         return False
+    value_options = _VALUE_OPTIONS.get(engine, frozenset())
+    equals = engine in _EQUALS_MODEL or engine not in _VALUE_OPTIONS
     bindings: list[str] = []
     index = 1  # argv[0] is the program, not a flag
     while index < len(argv):
@@ -792,17 +813,24 @@ def _argv_binds_model(argv: list[str], model: str) -> bool:
             bindings.append(argv[index + 1])
             index += 2
             continue
-        if item.startswith("--model="):
+        if equals and item.startswith("--model="):
             value = item[len("--model="):]
             if not value:
                 return False
             bindings.append(value)
             index += 1
             continue
+        if equals and item.startswith("-m=") and len(item) > 3:
+            bindings.append(item[len("-m="):])
+            index += 1
+            continue
         # Attached short form (-mchatgpt/test-model). ``-m`` alone is the flag with no value.
-        if item.startswith("-m") and len(item) > 2:
+        if equals and item.startswith("-m") and len(item) > 2:
             bindings.append(item[2:])
             index += 1
+            continue
+        if item in value_options:
+            index += 2  # the next element is the option's value, whatever it looks like
             continue
         index += 1
     if not bindings:
@@ -1045,7 +1073,7 @@ def _launch_checked(
 ) -> tuple[RouteDecision, object]:
     if pinned and not _argv0_is_pinned(argv, pinned):
         raise SubscriptionRouteRefused(decision.engine, "argv0_not_pinned")
-    if decision.auth == "subscription" and not _argv_binds_model(argv, decision.model):
+    if decision.auth == "subscription" and not _argv_binds_model(argv, decision.model, decision.engine):
         raise SubscriptionRouteRefused(decision.engine, "model_not_bound", decision.model)
     # Rebuild before the Hermes write, so a refused environment does not leave a config behind.
     # Imported here: validated_launch does not import this module.

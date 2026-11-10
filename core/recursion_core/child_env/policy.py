@@ -764,16 +764,28 @@ def _prefix_bits(text: str) -> tuple[str, int | None]:
         i += 1
     if i < len(text) and text[i] == "+":
         i += 1
+    zero_at = i
+    while i < len(text) and text[i] == "0":
+        i += 1
+    saw_zero = i > zero_at
     start = i
-    # ASCII digits only. ``²``.isdigit() is true, and int() then raises.
+    # Significant digits only. Leading zeros do not count, so ``00008`` is 8 and a
+    # thousands-long zero run never reaches int(). ``²``.isdigit() is true; it is not a digit here.
     while i < len(text) and text[i] in "0123456789":
         i += 1
         if i - start > 4:
             return "bad", None
+    junk = text[i:].strip("".join(_PREFIX_SPACE))
     if i == start:
-        if text[i:].strip("".join(_PREFIX_SPACE)):
-            return "bad", None
-        return "no", None
+        if not saw_zero:
+            if junk:
+                return "bad", None
+            return "no", None
+        # ``0x8`` and ``0/foo`` are not prefix 0. Curl and the other clients keep the proxy.
+        # A prefix that is only zeros (``0``, ``00``) is 0.
+        if junk:
+            return "no", None
+        return "ok", 0
     bits = int(text[start:i])
     if bits > 128:
         return "no", None
@@ -904,26 +916,42 @@ def _no_proxy_entries(value: str) -> tuple[str, ...]:
     return tuple(seen)
 
 
-def _uts46_map(text: str) -> str:
-    """The UTS46 mappings Go's lookup profile applies before a name is compared.
+def _uts46_ignored(char: str) -> bool:
+    """A UTS46 ignored / default-ignorable character. Joiners are kept.
 
-    Ideographic and fullwidth dots (U+3002, U+FF0E, U+FF61) become ``.``. A soft hyphen
-    (U+00AD) is removed. Fullwidth ASCII (U+FF01..U+FF5E) becomes ASCII. ``ß`` is not
-    mapped to ``ss``: that is the transitional profile, and Go 1.22 lookup is not transitional.
+    ZWNJ and ZWJ are IDNA context joiners, not ignored. Combining accents are not
+    in this set. Variation selectors, the grapheme joiner, and Mongolian free
+    variation selectors are ``Mn`` rather than ``Cf``, so they are named here.
+    """
+
+    code = ord(char)
+    if code in (0x034F, 0x061C, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x180E):
+        return True
+    if 0x180B <= code <= 0x180D or 0xFE00 <= code <= 0xFE0F or 0xE0100 <= code <= 0xE01EF:
+        return True
+    if 0xE0001 <= code <= 0xE007F:
+        return True
+    return unicodedata.category(char) == "Cf" and code not in (0x200C, 0x200D)
+
+
+def _uts46_map(text: str) -> str:
+    """UTS46 nontransitional mapping, without a vendored Idna table.
+
+    NFKC folds compatibility characters (``ª``, ``ᵃ``, fullwidth, circled, mathematical
+    letters). Ideographic dots that NFKC leaves in place (U+3002, and U+FF61 which
+    becomes U+3002) become ``.``. Ignored characters are then dropped. ``ß`` is not
+    mapped to ``ss`` and final sigma is not mapped to small sigma: that would be
+    casefold, and Go's lookup profile does neither.
     """
 
     mapped: list[str] = []
-    for char in text:
-        if char in "\u3002\uff0e\uff61":
+    for char in unicodedata.normalize("NFKC", text):
+        if char in "\u3002\uff61":
             mapped.append(".")
-        elif char == "\u00ad":
+        elif _uts46_ignored(char):
             continue
         else:
-            code = ord(char)
-            if 0xFF01 <= code <= 0xFF5E:
-                mapped.append(chr(code - 0xFEE0))
-            else:
-                mapped.append(char)
+            mapped.append(char)
     return "".join(mapped)
 
 
@@ -958,10 +986,14 @@ def _idna_forms(label: str) -> set[str] | None:
     """
 
     raw = _uts46_map(label).rstrip(".")
+    # Empty, or only dots (``\u00ad``, ``。``, ``．``, ``｡``). Skipping these accepted a
+    # bypass Go and, for a bare dot, requests and urllib still apply. None refuses.
+    if not raw or not raw.strip("."):
+        return None
     suffix = raw.startswith(".")
     body = raw[1:] if suffix else raw
     if not body:
-        return {raw} if raw else set()
+        return None
     forms: set[str] = set()
     nonascii = any(ord(ch) > 127 for ch in body)
 
@@ -1123,6 +1155,13 @@ def _no_proxy_bypass(value: str, hosts: tuple[str, ...]) -> str | None:
             # The pattern is IDNA-normalised too. ``*.bücher.invalid`` is
             # ``*.xn--bcher-kva.invalid`` before the star scan.
             patterns = _idna_forms(entry) or ()
+            # ``.*\u00ad`` maps to ``*``, which would match every host. No client bypasses
+            # that entry. A pure ``*`` / ``.*`` pattern is used only when the entry itself
+            # was already only stars and dots.
+            if any(char not in "*." for char in entry):
+                patterns = tuple(
+                    pattern for pattern in patterns if any(char not in "*." for char in pattern)
+                )
             hit = any(_star_match(pattern, host) for pattern in patterns for host in forms)
             apex = entry[2:] if entry.startswith("*.") else ""
             if apex and "*" not in apex:

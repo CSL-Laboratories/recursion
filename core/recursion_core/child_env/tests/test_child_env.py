@@ -948,6 +948,35 @@ class AuthRouteTests(unittest.TestCase):
                 self.assertEqual(("NO_PROXY", "no_proxy_engine_host"), refused({"NO_PROXY": entry}, dotted))
                 self.assertEqual(("NO_PROXY", "no_proxy_engine_host"), refused({"NO_PROXY": entry}, gateway))
 
+        # Round 3. The rest of UTS46: ignored characters and compatibility letters.
+        # Go's lookup bypasses each of these for xn--fa-hia.
+        for entry in ("fa\u034fß.invalid", "fa\u180bß.invalid", "fa\u180cß.invalid", "fa\u180dß.invalid",
+                      "fa\u200bß.invalid", "fa\u2060ß.invalid", "fa\u2064ß.invalid", "fa\ufeffß.invalid",
+                      "fa\ufe00ß.invalid", "fa\ufe0fß.invalid", "fa\U000E0100ß.invalid",
+                      "fªß.invalid", "fᵃß.invalid", "\U0001D41F\U0001D41Aß.invalid", "\u24d5\u24d0ß.invalid"):
+            with self.subTest(entry=entry):
+                self.assertEqual(("NO_PROXY", "no_proxy_engine_host"), refused({"NO_PROXY": entry}, sharp))
+        # BOM is ignored, so this is final sigma. IDNA2003 also maps it to small sigma.
+        self.assertEqual(("NO_PROXY", "no_proxy_engine_host"), refused({"NO_PROXY": "ς\ufeff.invalid"}, final))
+        self.assertEqual("fªß.invalid", launched({"NO_PROXY": "fªß.invalid"}, gateway)["NO_PROXY"])
+        sharp_sub = ChildRoute(api_key=USER_KEY, base_url="https://sub.xn--fa-hia.invalid/api")
+        for entry in ("*.fªß.invalid", "*.fa\u034fß.invalid"):
+            with self.subTest(entry=entry):
+                self.assertEqual(("NO_PROXY", "no_proxy_engine_host"), refused({"NO_PROXY": entry}, sharp_sub))
+
+        # An entry that normalises to empty or only dots refuses. Round 2 did; this head skipped it.
+        for entry in ("\u00ad", "\u3002", "\uff0e", "\uff61", ".\u00ad", "\u00ad.", ".\u00ad.", "\ufeff"):
+            with self.subTest(entry=entry):
+                self.assertEqual(("NO_PROXY", "no_proxy_engine_host"), refused({"NO_PROXY": entry}, dotted))
+
+        # Curl reads 00008 as 8. 0x8 is not prefix 0. A soft hyphen does not turn ".*" into "*".
+        self.assertEqual(("NO_PROXY", "no_proxy_engine_host"),
+                         refused({"NO_PROXY": "10.0.0.0/00008/foo"}, ip))
+        self.assertEqual("192.168.0.0/00008/foo",
+                         launched({"NO_PROXY": "192.168.0.0/00008/foo"}, ip)["NO_PROXY"])
+        self.assertEqual("10.0.0.0/0x8/foo", launched({"NO_PROXY": "10.0.0.0/0x8/foo"}, ip)["NO_PROXY"])
+        self.assertEqual(".*\u00ad", launched({"NO_PROXY": ".*\u00ad"}, gateway)["NO_PROXY"])
+
         # C8. Twelve stars must not backtrack. The host is not a match, and the call returns.
         def _too_slow(signum, frame):
             raise AssertionError("wildcard match exceeded 1s")

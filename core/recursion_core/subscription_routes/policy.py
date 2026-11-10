@@ -25,8 +25,8 @@ the engine config and home selectors the records do name get their own cause. St
 discovery is refused by checking, with ``lstat`` only, that the child's home is route-owned, is
 not the operator's home and holds no Claude Code store and no Pi, Hermes or OpenCode state or
 login entry. No credential file is opened or read. The one file read is a Hermes
-``.hermes/config.yaml`` that is already exactly the size of the adopt switch Recursion writes there,
-to confirm it is that switch; a config of any other size refuses unread.
+``.hermes/config.yaml`` that is already exactly the size of the adopt switch Recursion writes there
+(37 bytes), to confirm it is that switch; a config of any other size refuses unread.
 
 ``guard_then_spawn`` takes the launcher and argv as trusted, core-owned inputs: it does not parse
 argv, so an engine flag that selects a provider or config is the caller's responsibility. On a
@@ -61,7 +61,9 @@ calls it yet. Provider ids marked unverified below were not read from the engine
 
 from __future__ import annotations
 
+import errno
 import os
+import secrets
 import stat
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -517,9 +519,11 @@ def guard_then_spawn(
     the pinned ``wrapper.launcher_path`` (``argv0_not_pinned``); OpenCode has no pin and no such check.
     Hermes's ``auth.adopt_external_logins: false`` is written into the route home's
     ``.hermes/config.yaml`` before the launcher runs; a config already there is reused only when it is
-    exactly that file. ``launch_kwargs`` may not replace the env or widen the launch: ``cwd`` and the
-    names in ``requirements.extra_launch_options`` are forwarded, forbidden names refuse
-    ``launch_option_denied`` and any other name refuses ``launch_option_unknown``.
+    exactly that file. A missing or empty ``.hermes`` is built in a ``.hermes.recursion-*`` staging
+    directory and renamed into place; a ``.hermes`` that already holds entries gets the file by a
+    hard link that never overwrites. ``launch_kwargs`` may not replace the env or widen the launch:
+    ``cwd`` and the names in ``requirements.extra_launch_options`` are forwarded, forbidden names
+    refuse ``launch_option_denied`` and any other name refuses ``launch_option_unknown``.
     """
 
     name = engine if isinstance(engine, str) else None
@@ -579,6 +583,8 @@ def _check_home(
             continue
         if engine == "hermes" and entry == ".hermes" and _hermes_dir_is_only_ours(engine, route_home):
             continue  # the adopt switch an earlier launch in this home wrote, and nothing else
+        if engine == "hermes" and entry == ".hermes" and _hermes_dir_is_empty(route_home):
+            continue  # an empty real .hermes counts as absent on an API-key Hermes route only
         if os.path.lexists(os.path.join(route_home, entry)):  # presence only; never opened or read
             raise SubscriptionRouteRefused(engine, "engine_store_in_route_home", entry)
 
@@ -668,7 +674,11 @@ def _within(real: str, root: str) -> bool:
 _MODEL_FLAGS = ("--model", "-m")
 # Hermes reads auth.adopt_external_logins from ~/.hermes/config.yaml and defaults it to true
 # (NousResearch/hermes-agent, auth.adopt_external_logins). The route home is the child HOME.
-_HERMES_ADOPT_YAML = b"auth:\n  adopt_external_logins: false\n"
+_HERMES_ADOPT_YAML = b"auth:\n  adopt_external_logins: false\n"  # 37 bytes
+# Staging names the adopt-switch write makes in the route home. Not a store entry: a leftover one
+# (a crash between mkdir and rename) is never read as Hermes state.
+_HERMES_STAGING_PREFIX = ".hermes.recursion-"
+_DIR_OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 
 
 @dataclass(frozen=True)
@@ -775,7 +785,9 @@ def _hermes_config_is_ours(engine: str, route_home: str) -> bool:
 
     Anything else refuses: a link, a non-regular file, another owner or any other content. A file
     of any other size is refused from ``lstat`` alone and never opened, so a config that holds more
-    than the switch (it might hold a credential) is not read.
+    than the switch (it might hold a credential) is not read. A file of exactly that size (37 bytes)
+    is opened relative to a ``.hermes`` opened as a real directory, never as a controlling terminal,
+    and its type, size and owner are checked again on the opened file before the read.
     """
 
     parent = os.path.join(route_home, ".hermes")
@@ -793,16 +805,25 @@ def _hermes_config_is_ours(engine: str, route_home: str) -> bool:
     if not stat.S_ISREG(st.st_mode) or st.st_size != len(_HERMES_ADOPT_YAML) or st.st_uid != os.geteuid():
         raise _refuse_hermes_config(engine, "config.yaml")
     try:
-        fd = os.open(dest, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        dir_fd = os.open(parent, _DIR_OPEN_FLAGS)
     except OSError:
-        raise _refuse_hermes_config(engine, "config.yaml") from None
+        raise _refuse_hermes_config(engine, ".hermes") from None
     try:
-        opened = os.fstat(fd)
-        if not stat.S_ISREG(opened.st_mode) or opened.st_size != len(_HERMES_ADOPT_YAML):
-            raise _refuse_hermes_config(engine, "config.yaml")
-        data = os.read(fd, len(_HERMES_ADOPT_YAML) + 1)
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOCTTY", 0)
+        try:
+            fd = os.open("config.yaml", flags, dir_fd=dir_fd)
+        except OSError:
+            raise _refuse_hermes_config(engine, "config.yaml") from None
+        try:
+            opened = os.fstat(fd)
+            if (not stat.S_ISREG(opened.st_mode) or opened.st_size != len(_HERMES_ADOPT_YAML)
+                    or opened.st_uid != os.geteuid()):
+                raise _refuse_hermes_config(engine, "config.yaml")
+            data = os.read(fd, len(_HERMES_ADOPT_YAML) + 1)
+        finally:
+            os.close(fd)
     finally:
-        os.close(fd)
+        os.close(dir_fd)
     if data != _HERMES_ADOPT_YAML:
         raise _refuse_hermes_config(engine, "config.yaml")
     return True
@@ -820,6 +841,17 @@ def _hermes_dir_is_only_ours(engine: str, route_home: str) -> bool:
     return _hermes_config_is_ours(engine, route_home)
 
 
+def _hermes_dir_is_empty(route_home: str) -> bool:
+    """True when ``.hermes`` is a real directory, owned by the effective user, with nothing in it."""
+
+    parent = os.path.join(route_home, ".hermes")
+    try:
+        st = os.lstat(parent)
+        return stat.S_ISDIR(st.st_mode) and st.st_uid == os.geteuid() and not os.listdir(parent)
+    except OSError:
+        return False
+
+
 def _check_hermes_home(engine: str, route_home: str, checked: _Checked) -> None:
     """Hermes only: the declared owned home is the route home, and a config already there is ours."""
 
@@ -830,6 +862,97 @@ def _check_hermes_home(engine: str, route_home: str, checked: _Checked) -> None:
     _hermes_config_is_ours(engine, route_home)
 
 
+def _fsync_dir(directory: str | int) -> None:
+    """Best effort: a directory that cannot be opened or synced does not fail the write."""
+
+    try:
+        fd = os.open(directory, _DIR_OPEN_FLAGS) if isinstance(directory, str) else directory
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        if isinstance(directory, str):
+            os.close(fd)
+
+
+def _create_adopt_switch(path: str, dir_fd: int | None = None) -> None:
+    """Create ``path`` (it must not exist) mode 0600 holding exactly the adopt switch, and fsync it."""
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600, dir_fd=dir_fd)
+    try:
+        if os.write(fd, _HERMES_ADOPT_YAML) != len(_HERMES_ADOPT_YAML):
+            raise OSError(errno.EIO, "short write of the Hermes adopt switch")
+        os.fsync(fd)
+    except BaseException:
+        try:
+            os.unlink(path, dir_fd=dir_fd)  # the file this call created; O_EXCL means no one else's
+        except OSError:
+            pass
+        raise
+    finally:
+        os.close(fd)
+
+
+def _stage_hermes_dir(engine: str, route_home: str, parent: str) -> None:
+    """``.hermes`` is absent or empty: build it beside its place and rename it in, switch included.
+
+    The rename replaces only a missing or empty directory. If something appeared in ``.hermes``
+    meanwhile (``ENOTEMPTY`` or ``EEXIST``) the launch refuses and the staging directory is removed.
+    """
+
+    staging = os.path.join(route_home, _HERMES_STAGING_PREFIX + secrets.token_hex(8))
+    os.mkdir(staging, 0o700)
+    try:
+        staging_fd = os.open(staging, _DIR_OPEN_FLAGS)
+        try:
+            _create_adopt_switch("config.yaml", dir_fd=staging_fd)
+            _fsync_dir(staging_fd)
+        finally:
+            os.close(staging_fd)
+        try:
+            os.rename(staging, parent)
+        except OSError as exc:
+            if exc.errno in (errno.ENOTEMPTY, errno.EEXIST):
+                raise _refuse_hermes_config(engine, ".hermes") from None
+            raise
+    except BaseException:
+        for remove, path in ((os.unlink, os.path.join(staging, "config.yaml")), (os.rmdir, staging)):
+            try:
+                remove(path)
+            except OSError:
+                pass
+        raise
+    _fsync_dir(route_home)
+
+
+def _link_hermes_config(engine: str, route_home: str, parent: str) -> None:
+    """``.hermes`` holds Hermes's own entries and no ``config.yaml``: add the switch without replacing.
+
+    The switch is written to a temp file in the route home and hard-linked into ``.hermes``. A link
+    never overwrites, so a ``config.yaml`` that appeared meanwhile refuses instead of being replaced.
+    """
+
+    temp = os.path.join(route_home, _HERMES_STAGING_PREFIX + secrets.token_hex(8))
+    try:
+        _create_adopt_switch(temp)
+        try:
+            parent_fd = os.open(parent, _DIR_OPEN_FLAGS)
+            try:
+                os.link(temp, "config.yaml", dst_dir_fd=parent_fd)
+                _fsync_dir(parent_fd)
+            finally:
+                os.close(parent_fd)
+        finally:
+            os.unlink(temp)
+    except OSError:
+        raise _refuse_hermes_config(engine, "config.yaml") from None
+    _fsync_dir(route_home)
+
+
 def _apply_hermes_adopt_override(decision: RouteDecision, route_home: str) -> None:
     """Write Hermes's adopt switch, or reuse the one an earlier launch in this home wrote."""
 
@@ -838,23 +961,14 @@ def _apply_hermes_adopt_override(decision: RouteDecision, route_home: str) -> No
     if decision.engine_config != ((HERMES_ADOPT_EXTERNAL_LOGINS, False),):
         raise SubscriptionRouteRefused(decision.engine, "hermes_adopt_external_logins_not_off")
     parent = os.path.join(route_home, ".hermes")
-    dest = os.path.join(parent, "config.yaml")
     if _hermes_config_is_ours(decision.engine, route_home):
         return
-    if os.path.lexists(parent) and (os.path.islink(parent) or not os.path.isdir(parent)):
+    if not os.path.lexists(parent) or _hermes_dir_is_empty(route_home):
+        _stage_hermes_dir(decision.engine, route_home, parent)
+    elif os.path.islink(parent) or not os.path.isdir(parent):
         raise _refuse_hermes_config(decision.engine, ".hermes")
-    os.makedirs(parent, mode=0o700, exist_ok=True)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    try:
-        fd = os.open(dest, flags, 0o600)
-    except OSError:
-        raise _refuse_hermes_config(decision.engine, "config.yaml") from None
-    try:
-        os.write(fd, _HERMES_ADOPT_YAML)
-    finally:
-        os.close(fd)
+    else:
+        _link_hermes_config(decision.engine, route_home, parent)
 
 
 def _launch_checked(

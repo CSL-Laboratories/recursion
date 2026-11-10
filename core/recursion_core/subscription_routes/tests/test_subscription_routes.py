@@ -288,6 +288,8 @@ class SelectorAndExtraEnvTests(_Base):
                         target.write_text("{}", encoding="ascii")
                     else:
                         target.mkdir()
+                    if entry == ".hermes":  # an empty .hermes counts as absent on an API-key Hermes route
+                        (target / "sessions").mkdir()
                     with mock.patch("builtins.open", spy), mock.patch("io.open", spy):
                         self.assertRefusedBeforeSpawn(engine, self.profile(), self.env(), "engine_store_in_route_home")
                     shutil.rmtree(self.home / entry.split("/")[0])

@@ -6,9 +6,11 @@ Fakes only: a MagicMock launcher and temp trees. No engine binary is executed an
 
 from __future__ import annotations
 
+import errno
 import importlib
 import os
 import shutil
+import stat
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -30,6 +32,7 @@ from recursion_core.subscription_routes import (
     guard_then_spawn,
     measure_antigravity_pin,
     measure_package_pin,
+    policy,
 )
 from recursion_core.subscription_routes.tests.test_subscription_routes import FAKE_KEY, FAKE_OAUTH, _Base
 
@@ -389,9 +392,179 @@ class HermesHomeReuseTests(_Calls):
         self.launcher.reset_mock()
         (self.home / ".hermes" / "auth.json").write_text(FAKE_OAUTH, encoding="ascii")
         self.refused("engine_store_in_route_home", self.launch, "hermes")
-        (self.home / ".hermes" / "auth.json").unlink()
-        self.config().unlink()
-        self.refused("engine_store_in_route_home", self.launch, "hermes")  # an empty .hermes is not ours
+        self.config().unlink()  # other state and no switch
+        self.refused("engine_store_in_route_home", self.launch, "hermes")
+        self.launcher.assert_not_called()
+
+    def stray(self) -> list[str]:
+        return sorted(name for name in os.listdir(self.home) if name != ".hermes")
+
+    def assert_switch_written(self) -> None:
+        self.assertEqual(ADOPT_YAML, self.config().read_bytes())
+        self.assertEqual(37, len(ADOPT_YAML))
+        self.assertEqual(0o700, stat.S_IMODE(os.lstat(self.home / ".hermes").st_mode))
+        self.assertEqual(0o600, stat.S_IMODE(os.lstat(self.config()).st_mode))
+        self.assertEqual(["config.yaml"], os.listdir(self.home / ".hermes"))
+        self.assertEqual([], self.stray())  # no staging directory or temp file left behind
+
+    def test_absent_hermes_dir_gets_a_staged_write_of_exactly_the_switch(self) -> None:
+        real_rename = os.rename
+        with mock.patch.object(policy.os, "rename", side_effect=real_rename) as rename:
+            self.launch("hermes")
+        (staging, dest), _ = rename.call_args
+        self.assertEqual(str(self.home / ".hermes"), dest)
+        self.assertEqual(str(self.home), os.path.dirname(staging))
+        self.assertTrue(os.path.basename(staging).startswith(".hermes.recursion-"))
+        self.assert_switch_written()
+        self.assertEqual(1, self.launcher.call_count)
+
+    def test_empty_hermes_dir_counts_as_absent_on_an_api_key_hermes_route(self) -> None:
+        (self.home / ".hermes").mkdir(mode=0o755)
+        self.launch("hermes")
+        self.assert_switch_written()  # the staged directory replaced the empty one, 0700
+        self.assertEqual(1, self.launcher.call_count)
+
+    def test_empty_hermes_dir_still_refuses_on_other_engines(self) -> None:
+        (self.home / ".hermes").mkdir(mode=0o700)
+        for engine in ("pi", "cursor", "antigravity"):
+            with self.subTest(engine=engine):
+                self.refused("engine_store_in_route_home", self.launch, engine)
+        self.refused("engine_store_in_route_home", guard_then_spawn, self.launcher, ["opencode", "run"], "opencode",
+                     self.profile(), self.env(), route_home=str(self.home), parent_env=self.parent(),
+                     operator_home=str(self.operator))
+        self.assertEqual([], os.listdir(self.home / ".hermes"))
+        self.launcher.assert_not_called()
+
+    def test_hermes_entry_that_is_a_link_to_an_empty_dir_or_an_empty_file_is_not_absent(self) -> None:
+        elsewhere = self.home / "elsewhere"
+        elsewhere.mkdir(mode=0o700)
+        os.symlink(elsewhere, self.home / ".hermes")
+        self.refused("engine_store_in_route_home", self.launch, "hermes")
+        os.unlink(self.home / ".hermes")
+        (self.home / ".hermes").write_bytes(b"")
+        self.refused("engine_store_in_route_home", self.launch, "hermes")
+        self.assertEqual([], os.listdir(elsewhere))
+        self.launcher.assert_not_called()
+
+    def test_rename_that_finds_the_hermes_dir_filled_refuses(self) -> None:
+        for code in (errno.EEXIST, errno.ENOTEMPTY):
+            for start in ("absent", "empty"):
+                with self.subTest(code=errno.errorcode[code], start=start):
+                    shutil.rmtree(self.home / ".hermes", ignore_errors=True)
+                    if start == "empty":
+                        (self.home / ".hermes").mkdir(mode=0o700)
+                    with mock.patch.object(policy.os, "rename", side_effect=OSError(code, os.strerror(code))) as rename:
+                        exc = self.refused("hermes_config_blocks_adopt_override", self.launch, "hermes")
+                    self.assertEqual(".hermes", exc.detail)
+                    self.assertEqual(1, rename.call_count)
+                    self.assertEqual([], self.stray())  # the staging directory is removed
+                    self.assertFalse(self.config().exists())
+        self.launcher.assert_not_called()
+
+    def test_hermes_dir_with_entries_and_no_config_gets_the_switch_by_link(self) -> None:
+        (self.home / ".hermes").mkdir(mode=0o700)
+        (self.home / ".hermes" / "state.db").write_bytes(b"hermes-state")
+        with mock.patch.object(policy.os, "rename") as rename, mock.patch.object(policy.os, "replace") as replace:
+            self.launch_sub()
+        rename.assert_not_called()
+        replace.assert_not_called()
+        self.assertEqual(ADOPT_YAML, self.config().read_bytes())
+        self.assertEqual(0o600, stat.S_IMODE(os.lstat(self.config()).st_mode))
+        self.assertEqual(1, os.lstat(self.config()).st_nlink)  # the temp name is gone
+        self.assertEqual(b"hermes-state", (self.home / ".hermes" / "state.db").read_bytes())
+        self.assertEqual([], self.stray())
+        self.launch_sub()  # and the next launch reuses it
+        self.assertEqual(2, self.launcher.call_count)
+
+    def test_link_failure_refuses_and_leaves_no_temp_file(self) -> None:
+        (self.home / ".hermes").mkdir(mode=0o700)
+        (self.home / ".hermes" / "state.db").write_bytes(b"hermes-state")
+        for failing in ("link", "unlink"):
+            with self.subTest(failing=failing):
+                real = getattr(os, failing)
+                calls = []
+
+                def fail(*args: object, **kwargs: object) -> None:
+                    calls.append(args)
+                    if failing == "unlink":
+                        real(*args, **kwargs)
+                    raise OSError(errno.EEXIST, "File exists")
+
+                with mock.patch.object(policy.os, failing, side_effect=fail):
+                    exc = self.refused("hermes_config_blocks_adopt_override", self.launch_sub)
+                self.assertEqual("config.yaml", exc.detail)
+                self.assertEqual(1, len(calls))
+                self.assertEqual([], self.stray())
+                self.config().unlink(missing_ok=True)
+        self.launcher.assert_not_called()
+
+    def test_config_that_appears_before_the_link_is_not_replaced(self) -> None:
+        (self.home / ".hermes").mkdir(mode=0o700)
+        (self.home / ".hermes" / "state.db").write_bytes(b"hermes-state")
+        real_link = os.link
+
+        def racing_link(*args: object, **kwargs: object) -> None:
+            self.config().write_bytes(b"model: theirs\n")  # written between the check and the link
+            real_link(*args, **kwargs)
+
+        with mock.patch.object(policy.os, "link", side_effect=racing_link):
+            self.refused("hermes_config_blocks_adopt_override", self.launch_sub)
+        self.assertEqual(b"model: theirs\n", self.config().read_bytes())
+        self.assertEqual([], self.stray())
+        self.launcher.assert_not_called()
+
+    def test_zero_length_or_short_config_is_not_adopted(self) -> None:
+        for content in (b"", b"auth:\n", ADOPT_YAML[:-1]):
+            for others in (False, True):
+                with self.subTest(content=content, others=others):
+                    shutil.rmtree(self.home / ".hermes", ignore_errors=True)
+                    (self.home / ".hermes").mkdir(mode=0o700)
+                    self.config().write_bytes(content)
+                    if others:
+                        (self.home / ".hermes" / "state.db").write_bytes(b"hermes-state")
+                    self.refused("hermes_config_blocks_adopt_override", self.launch_sub)
+                    if not others:
+                        self.refused("hermes_config_blocks_adopt_override", self.launch, "hermes")
+                    self.assertEqual(content, self.config().read_bytes())
+                    self.assertEqual([], self.stray())
+        self.launcher.assert_not_called()
+
+    def test_config_read_is_relative_to_the_real_hermes_dir_and_rechecks_the_owner(self) -> None:
+        self.launch("hermes")
+        self.launcher.reset_mock()
+        real_open, real_fstat, real_close = os.open, os.fstat, os.close
+        opens: list[tuple[object, int, object]] = []
+        closed: list[int] = []
+
+        def spy_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+            fd = real_open(path, flags, *args, **kwargs)
+            opens.append((path, flags, kwargs.get("dir_fd")))
+            opens.append(("fd", fd, None))
+            return fd
+
+        def spy_close(fd: int) -> None:
+            closed.append(fd)
+            real_close(fd)
+
+        with mock.patch.object(policy.os, "open", side_effect=spy_open), \
+                mock.patch.object(policy.os, "close", side_effect=spy_close):
+            self.assertTrue(policy._hermes_config_is_ours("hermes", str(self.home)))
+        (dir_path, dir_flags, _), (_, dir_fd, _), (name, flags, used_dir_fd), (_, fd, _) = opens
+        self.assertEqual(str(self.home / ".hermes"), dir_path)
+        self.assertEqual(os.O_DIRECTORY | os.O_NOFOLLOW, dir_flags & (os.O_DIRECTORY | os.O_NOFOLLOW))
+        self.assertEqual(("config.yaml", dir_fd), (name, used_dir_fd))
+        self.assertEqual(os.O_NOCTTY | os.O_NOFOLLOW, flags & (os.O_NOCTTY | os.O_NOFOLLOW))
+        self.assertEqual(sorted([dir_fd, fd]), sorted(closed))
+
+        def other_owner(fd: int) -> os.stat_result:
+            st = real_fstat(fd)
+            return os.stat_result((*st[:4], st.st_uid + 1, *st[5:]))
+
+        closed.clear()
+        with mock.patch.object(policy.os, "fstat", side_effect=other_owner), \
+                mock.patch.object(policy.os, "close", side_effect=spy_close):
+            self.refused("hermes_config_blocks_adopt_override", self.launch, "hermes")
+        self.assertEqual(2, len(closed))
         self.launcher.assert_not_called()
 
     def test_other_engines_still_refuse_a_hermes_dir_that_holds_the_switch(self) -> None:

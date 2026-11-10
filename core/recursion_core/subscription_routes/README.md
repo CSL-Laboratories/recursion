@@ -44,7 +44,8 @@ What refuses:
   `.local/share/opencode`, `.config/opencode`, `.codex/auth.json`). So the route home must
   hold none of these at spawn. Checked with `lstat` only; no credential file is opened.
   One exception, for Hermes routes only: a `.hermes` directory that holds nothing but the
-  `config.yaml` an earlier launch in this home wrote (see Hermes route-home reuse).
+  `config.yaml` an earlier launch in this home wrote, or (API-key Hermes route) nothing at
+  all (see Hermes route-home reuse).
 
 A subscription variable present only in the parent env is flagged in `RouteDecision.flags`.
 API-key routes (`anthropic`, `openai`) launch.
@@ -234,18 +235,44 @@ Owner call 4. Hermes's `auth.adopt_external_logins: false` is written to
 true). A second launch in the same home works:
 
 - If `config.yaml` already exists it is reused only when its bytes are exactly
-  `auth:\n  adopt_external_logins: false\n`. Any other content, a symlink, a non-regular
-  file or another owner refuses `hermes_config_blocks_adopt_override`. `check_route`
-  applies the same rule, so it agrees with the guard.
-- A config of any other size is refused from `lstat` alone and never opened. Only a file
-  already exactly that size is read, to compare it.
+  `auth:\n  adopt_external_logins: false\n` (37 bytes). Any other content, a symlink, a
+  non-regular file or another owner refuses `hermes_config_blocks_adopt_override`.
+  `check_route` applies the same rule, so it agrees with the guard.
+- A config of any other size is refused from `lstat` alone and never opened. That includes
+  a zero-length or short `config.yaml`: it is not adopted or completed. Only a file already
+  exactly 37 bytes is read, to compare it. The read opens `.hermes` as a real directory
+  (`O_DIRECTORY|O_NOFOLLOW`), opens `config.yaml` relative to it with
+  `O_NOFOLLOW|O_NONBLOCK|O_NOCTTY`, and checks type, size and owner again on the opened
+  file.
 - On an API-key Hermes route, a `.hermes` directory that holds only that exact file is
-  accepted. Anything else there (another file, an empty directory, a link) still refuses
+  accepted, and an empty real `.hermes` directory owned by the effective user counts as
+  absent. Anything else there (another file, a link) still refuses
   `engine_store_in_route_home`. Pi, OpenCode, Cursor and Antigravity routes still refuse
-  any `.hermes`.
+  any `.hermes`, empty or not.
 - On a sign-in route `.hermes` is Hermes's own store and may hold its login as before. When
   it holds only Recursion's switch, the `own_login_store_not_inspected:.hermes` flag is not
   set, since nothing in it is uninspected.
+
+How the switch is written:
+
+- `.hermes` absent, or an empty real directory: the guard makes
+  `<route_home>/.hermes.recursion-<random>` (mode 0700), creates `config.yaml` in it
+  (`O_CREAT|O_EXCL|O_NOFOLLOW`, mode 0600), writes the 37 bytes, syncs the file and the
+  staging directory, renames the staging directory onto `.hermes` and syncs the route
+  home. A directory sync that fails is ignored. If the rename fails with `ENOTEMPTY` or
+  `EEXIST` (something appeared in `.hermes` meanwhile) the launch refuses
+  `hermes_config_blocks_adopt_override` and the staging directory is removed.
+- `.hermes` holds entries and no `config.yaml` (a sign-in route's own store): the 37 bytes
+  go to a `.hermes.recursion-<random>` temp file in the route home, which is hard-linked to
+  `.hermes/config.yaml` and then removed. A link never overwrites. Any failure on this path
+  refuses `hermes_config_blocks_adopt_override`.
+- Fallback for any other leftover (a partial or foreign `config.yaml`, a `.hermes` this
+  route refuses): the driver discards the route home and makes a new one. The guard does
+  not repair it.
+- A leftover `.hermes.recursion-*` entry (a crash between the two steps) is not a store
+  entry: no check reads it and it does not refuse a launch. The next launch may remove
+  it. This package does not remove one today; the driver can, or it goes with the route
+  home.
 
 ## Configured requirements
 
@@ -333,7 +360,8 @@ What it never relaxes:
 
 `launch_option_denied` now also covers `engine_config` and `model`.
 `hermes_config_blocks_adopt_override` now means a `config.yaml` that is not exactly
-Recursion's own. No refusal text or `repr` here carries a key, a token or an env value.
+Recursion's own, or a switch that could not be put in place without replacing something
+(the staging rename found `.hermes` filled, or the link into `.hermes` failed). No refusal text or `repr` here carries a key, a token or an env value.
 
 ## Tests
 

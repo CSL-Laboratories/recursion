@@ -129,18 +129,34 @@ def check_copilot_own_loop(
     parent_env = _screen_parent_env("copilot", parent_env)
     if has_copilot_login is None:
         raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "no stored-login probe; gh fallback refused")
-    try:
-        present = has_copilot_login() is True
-    except Exception as exc:  # a failing probe is not a login
-        raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", type(exc).__name__) from None
-    if not present:
-        raise OwnLoopRouteRefused("copilot", "no_stored_copilot_login", "run `copilot login`; gh fallback refused")
     model = _model("copilot", route.get("model"))
     strip = COPILOT_STRIP_ENV + _GH_FALLBACK_ENV
     # Any other provider credential (ANTHROPIC_API_KEY, OPENAI_API_KEY, ...) is not this run's either.
     removed = tuple(n for n in parent_env if n in strip or _is_provider_credential(n))
     child = {k: v for k, v in parent_env.items() if k not in removed}
+    _screen_kept_values("copilot", child)
+    # The probe sees this snapshot even when no route home is set. Passing the process
+    # environment would hand it ambient tokens that were never in the supplied mapping.
+    try:
+        present = _probe_in_screened_env(has_copilot_login, child)
+    except Exception as exc:  # a failing probe is not a login
+        raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", type(exc).__name__) from None
+    if not present:
+        raise OwnLoopRouteRefused("copilot", "no_stored_copilot_login", "run `copilot login`; gh fallback refused")
     return OwnLoopDecision("copilot", "copilot_cli_sign_in", MappingProxyType(child), removed, model=model)
+
+
+def _probe_in_screened_env(probe: Callable[[], bool], child: Mapping[str, str]) -> bool:
+    """Call the login probe with ``child`` as its environment, then restore the process environment."""
+
+    saved = dict(os.environ)
+    try:
+        os.environ.clear()
+        os.environ.update(child)
+        return probe() is True
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
 
 
 def _screen_parent_env(engine: str, parent_env: object) -> dict[str, str]:
@@ -148,8 +164,9 @@ def _screen_parent_env(engine: str, parent_env: object) -> dict[str, str]:
 
     The returned dict is the only map the rest of the check reads. A later ``.items()`` on the
     caller's mapping, or a login callback that mutates that mapping, cannot add a null or a new
-    name. A non-string used to raise ``AttributeError``. A null, an ``=`` in a name, or text this
-    process cannot encode used to crash at launch.
+    name. A non-string used to raise ``AttributeError``. A null or an ``=`` in a name used to
+    crash at launch. Value encodability is checked later, and only for names that stay in the
+    child: a dropped credential this process cannot encode is not a reason to refuse the run.
     """
 
     if not isinstance(parent_env, Mapping):
@@ -161,11 +178,20 @@ def _screen_parent_env(engine: str, parent_env: object) -> dict[str, str]:
             raise OwnLoopRouteRefused(engine, "parent_env_malformed")
         try:
             os.fsencode(name)
-            os.fsencode(value)
         except UnicodeEncodeError:
             raise OwnLoopRouteRefused(engine, "env_unencodable") from None
         snapshot[name] = value
     return snapshot
+
+
+def _screen_kept_values(engine: str, child: Mapping[str, str]) -> None:
+    """Refuse a kept value this process cannot encode. Dropped names are not checked."""
+
+    for value in child.values():
+        try:
+            os.fsencode(value)
+        except UnicodeEncodeError:
+            raise OwnLoopRouteRefused(engine, "env_unencodable") from None
 
 
 _ORIGIN_PORTS = {"http": 80, "https": 443, "ftp": 21}
@@ -325,6 +351,7 @@ def check_nous_own_loop(
     # Provider credentials, and proxy settings that would carry loopback traffic off the host.
     strip = tuple(n for n in parent_env if _is_provider_credential(n) or n.upper() in _PROXY_ENV)
     child = {k: v for k, v in parent_env.items() if k not in strip}
+    _screen_kept_values("nous", child)
     return OwnLoopDecision("nous", "hermes_local_proxy", MappingProxyType(child), strip, url, adapters,
                            _shared_host_warning(current_user, interactive_users), model)
 

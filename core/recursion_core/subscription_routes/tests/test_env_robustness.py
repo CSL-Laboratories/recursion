@@ -380,6 +380,80 @@ class SubscriptionRobustness(unittest.TestCase):
         self.assertEqual("", dict(nous.child_env)["HOME"])
         self.assertNotIn(_SECRET, dict(nous.child_env).values())
 
+    def test_login_probe_sees_only_the_screened_child(self) -> None:
+        marker = self.root / "probe-seen"
+        def probe() -> bool:
+            marker.write_text(
+                repr((os.environ.get("GITHUB_TOKEN"), os.environ.get("LANG"), os.environ.get("AMBIENT_ONLY"))),
+                encoding="ascii",
+            )
+            return True
+        with mock.patch.dict(os.environ, {"GITHUB_TOKEN": "ambient-secret", "AMBIENT_ONLY": "ambient-only"}, clear=False):
+            decision = check_copilot_own_loop(
+                {"engine": "copilot", "auth": "subscription", "method": "copilot_cli_sign_in"},
+                {"PATH": "/usr/bin", "HOME": str(self.home), "LANG": "C"},
+                has_copilot_login=probe,
+            )
+            self.assertEqual("ambient-secret", os.environ["GITHUB_TOKEN"])
+        self.assertEqual("(None, 'C', None)", marker.read_text(encoding="ascii"))
+        self.assertNotIn("GITHUB_TOKEN", decision.child_env)
+        self.assertNotIn("AMBIENT_ONLY", decision.child_env)
+        self.assertEqual("C", decision.child_env["LANG"])
+
+    def test_cwd_path_and_bytes_are_screened(self) -> None:
+        base = dict(
+            launcher=self.calls, argv=[self.launcher_path, "run", "anthropic/m"], engine="hermes",
+            profile=self._profile(), child_env=self._env(), route_home=str(self.home),
+            parent_env={"HOME": str(self.operator), "PATH": "/usr/bin:/bin"},
+            operator_home=str(self.operator), wrapper=self.wrapper,
+        )
+        cases = (
+            Path(str(self.home) + "\0"),
+            os.fsencode(str(self.home)) + b"\0",
+            Path(str(self.home) + "\ud800"),
+        )
+        for cwd in cases:
+            self.calls.reset_mock()
+            with self.assertRaises(SubscriptionRouteRefused) as caught:
+                guard_then_spawn(**base, cwd=cwd)
+            self.assertIn(caught.exception.cause, ("argv_malformed", "value_unencodable"))
+            self.assertNotIn("\x00", str(caught.exception))
+            self.assertNotIn("\\ud800", str(caught.exception).lower())
+            self.calls.assert_not_called()
+        guard_then_spawn(**base, cwd=self.home)
+        self.assertEqual(self.home, self.calls.call_args.kwargs["cwd"])
+
+    def test_dropped_unencodable_value_does_not_refuse(self) -> None:
+        home = str(self.home)
+        out = _ascii_python(
+            _DROPPED_UNENCODABLE,
+            {"PYTHONUTF8": "0", "PYTHONCOERCECLOCALE": "0", "LC_ALL": "C", "LANG": "C"},
+            PROBE_HOME=home,
+        )
+        self.assertEqual("COPILOT_OK\nNOUS_OK", out)
+
+
+_DROPPED_UNENCODABLE = r"""
+import os, sys
+sys.path.insert(0, os.environ["PROBE_CORE"])
+from recursion_core.subscription_routes import check_copilot_own_loop, check_nous_own_loop
+home = os.environ["PROBE_HOME"]
+parent = {"PATH": "/usr/bin", "HOME": home, "LANG": "C", "GITHUB_TOKEN": "caf\u00e9-dropped"}
+decision = check_copilot_own_loop(
+    {"engine": "copilot", "auth": "subscription", "method": "copilot_cli_sign_in"},
+    parent, has_copilot_login=lambda: True,
+)
+assert "GITHUB_TOKEN" not in decision.child_env
+assert decision.child_env["LANG"] == "C"
+nous = check_nous_own_loop(
+    {"engine": "nous", "auth": "subscription", "method": "hermes_local_proxy", "base_url": "http://127.0.0.1:9"},
+    parent,
+)
+assert "GITHUB_TOKEN" not in nous.child_env
+print("COPILOT_OK")
+print("NOUS_OK")
+"""
+
 
 if __name__ == "__main__":
     unittest.main()

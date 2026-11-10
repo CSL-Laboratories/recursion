@@ -757,6 +757,17 @@ def _checked_requirements(engine: str | None, requirements: object, full_access_
     return _Checked(targets, frozenset(options), owned, full_access_acknowledged is True)
 
 
+def _screen_launch_text(engine: str | None, text: str) -> None:
+    """Refuse a launch string that carries a null or cannot be encoded for this process."""
+
+    if "\x00" in text:
+        raise SubscriptionRouteRefused(engine, "argv_malformed")
+    try:
+        os.fsencode(text)
+    except UnicodeEncodeError:
+        raise SubscriptionRouteRefused(engine, "value_unencodable") from None
+
+
 def _reject_launch_shape(
     engine: str | None,
     argv: object,
@@ -772,12 +783,21 @@ def _reject_launch_shape(
     if isinstance(argv, (str, bytes)) or not isinstance(argv, list) or not argv or not all(isinstance(item, str) for item in argv):
         raise SubscriptionRouteRefused(engine, "argv_malformed")
     for item in (*argv, *(value for value in launch_kwargs.values() if isinstance(value, str))):
-        if "\x00" in item:
-            raise SubscriptionRouteRefused(engine, "argv_malformed")
-        try:
-            os.fsencode(item)
-        except UnicodeEncodeError:
-            raise SubscriptionRouteRefused(engine, "value_unencodable") from None
+        _screen_launch_text(engine, item)
+    cwd = launch_kwargs.get("cwd")
+    if cwd is not None and not isinstance(cwd, str):
+        rendered: object = cwd
+        if not isinstance(cwd, (bytes, bytearray)):
+            try:
+                rendered = os.fspath(cwd)
+            except TypeError:
+                rendered = None
+        if isinstance(rendered, (bytes, bytearray)):
+            if b"\x00" in rendered:
+                raise SubscriptionRouteRefused(engine, "argv_malformed")
+            rendered = os.fsdecode(bytes(rendered))
+        if isinstance(rendered, str):
+            _screen_launch_text(engine, rendered)
     checked = _checked_requirements(engine, requirements, full_access_acknowledged)
     unknown = sorted(set(launch_kwargs) - FORWARDED_LAUNCH_OPTIONS - checked.extra_launch_options)
     if unknown:  # full access adds no launch option

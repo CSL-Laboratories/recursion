@@ -37,8 +37,10 @@ from typing import Protocol
 # Answers from KillTree.confirm. Only EMPTY means the run's cgroup holds no process.
 EMPTY, POPULATED, TIMEOUT, UNKNOWN = "empty", "populated", "timeout", "unknown"
 # CPython's int() rejects digit strings past this limit. Stay at the limit so a longer suffix
-# never reaches the conversion.
+# never reaches the conversion. The counter itself only follows a short suffix: the next mint
+# formats that integer, and a 4300-digit value makes the successor raise.
 _MAX_MARKER_DIGITS = 4300
+_COUNTER_DIGITS = 18
 
 
 class StaleGeneration(Exception):
@@ -379,23 +381,40 @@ class InMemoryRunRegistry:
 
     def _commit_locked(self, record: dict, *, store: bool = True) -> dict:
         run_id = record["run_id"]
-        current = self._runs.get(run_id)
-        if current is None:
-            if record.get("generation") not in (None, 0):
-                raise StaleGeneration(run_id, record.get("generation"), None)
-            stored = self._apply(None, 0, record)
-        else:
-            expected = record.get("generation", None)
-            if not isinstance(expected, int) or expected != current["generation"]:
-                raise StaleGeneration(run_id, expected if isinstance(expected, int) else None, current["generation"])
-            # The generation matches a stopped record. A payload that is not itself stopped is a
-            # different state, so the compare fails and the stop stays terminal.
-            if current.get("state") == "stopped" and record.get("state") != "stopped":
-                raise StaleGeneration(run_id, expected, current["generation"])
-            stored = self._apply(current, expected, record)
-        if store:
-            self._store(stored)
+        # A refused proof or a dry run must not retire the marker it only considered.
+        marker_count = self._marker
+        accepted = set(self._accepted_markers)
+        try:
+            current = self._runs.get(run_id)
+            if current is None:
+                if record.get("generation") not in (None, 0):
+                    raise StaleGeneration(run_id, record.get("generation"), None)
+                stored = self._apply(None, 0, record)
+            else:
+                expected = record.get("generation", None)
+                if not isinstance(expected, int) or expected != current["generation"]:
+                    raise StaleGeneration(run_id, expected if isinstance(expected, int) else None, current["generation"])
+                # The generation matches a stopped record. A payload that is not itself stopped is a
+                # different state, so the compare fails and the stop stays terminal.
+                if current.get("state") == "stopped" and record.get("state") != "stopped":
+                    raise StaleGeneration(run_id, expected, current["generation"])
+                stored = self._apply(current, expected, record)
+            if not store:
+                self._restore_markers(marker_count, accepted)
+            else:
+                try:
+                    self._store(stored)
+                except Exception:
+                    self._restore_markers(marker_count, accepted)
+                    raise
+        except Exception:
+            self._restore_markers(marker_count, accepted)
+            raise
         return copy.deepcopy(stored)
+
+    def _restore_markers(self, marker_count: int, accepted: set[str]) -> None:
+        self._marker = marker_count
+        self._accepted_markers = accepted
 
     def _new_marker(self) -> str:
         while True:
@@ -529,12 +548,13 @@ def _marker_seq(marker: object) -> int:
     """The integer in a short ASCII ``cg-N`` marker, or 0 otherwise.
 
     ``str.isdigit`` is true for superscripts and subscripts, and ``int`` rejects those and digit
-    strings past its conversion limit. A restore must ignore both instead of aborting.
+    strings past its conversion limit. A suffix longer than ``_COUNTER_DIGITS`` is still a real
+    marker string, but it does not move the counter: the next mint would have to format the successor.
     """
     if not isinstance(marker, str) or not marker.startswith("cg-"):
         return 0
     suffix = marker[3:]
-    if not suffix or len(suffix) > _MAX_MARKER_DIGITS:
+    if not suffix or len(suffix) > _MAX_MARKER_DIGITS or len(suffix) > _COUNTER_DIGITS:
         return 0
     if not suffix.isascii() or not suffix.isdigit():
         return 0

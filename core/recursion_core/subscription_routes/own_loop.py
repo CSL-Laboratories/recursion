@@ -135,10 +135,12 @@ def check_copilot_own_loop(
     removed = tuple(n for n in parent_env if n in strip or _is_provider_credential(n))
     child = {k: v for k, v in parent_env.items() if k not in removed}
     _screen_kept_values("copilot", child)
-    # The probe sees this snapshot even when no route home is set. Passing the process
-    # environment would hand it ambient tokens that were never in the supplied mapping.
+    # The probe sees this snapshot in its own process. Replacing this process's environment
+    # would publish the snapshot to every other thread and drop their concurrent writes.
     try:
         present = _probe_in_screened_env(has_copilot_login, child)
+    except OwnLoopRouteRefused:
+        raise
     except Exception as exc:  # a failing probe is not a login
         raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", type(exc).__name__) from None
     if not present:
@@ -147,16 +149,84 @@ def check_copilot_own_loop(
 
 
 def _probe_in_screened_env(probe: Callable[[], bool], child: Mapping[str, str]) -> bool:
-    """Call the login probe with ``child`` as its environment, then restore the process environment."""
+    """Run the login probe in a forked child whose environment is ``child``.
 
-    saved = dict(os.environ)
+    The parent environment is left untouched. Applying ``child`` here and restoring it afterwards
+    would show the probe's environment to other threads, and the restore would discard any write
+    those threads made while the probe ran.
+    """
+
+    if not hasattr(os, "fork"):
+        raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe unenforceable")
+    read_fd, write_fd = os.pipe()
     try:
-        os.environ.clear()
-        os.environ.update(child)
-        return probe() is True
+        pid = os.fork()
+    except OSError:
+        os.close(read_fd)
+        os.close(write_fd)
+        raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe failed") from None
+    if pid == 0:
+        try:
+            os.close(read_fd)
+            try:
+                os.environ.clear()
+                os.environ.update(child)
+                ok = probe() is True
+                payload = b"T" if ok else b"F"
+            except BaseException as exc:
+                payload = b"E" + type(exc).__name__.encode("ascii", "replace")
+            _write_all(write_fd, payload[:80])
+        except BaseException:
+            pass
+        os._exit(0)
+    os.close(write_fd)
+    try:
+        status = _read_all(read_fd, 80)
     finally:
-        os.environ.clear()
-        os.environ.update(saved)
+        os.close(read_fd)
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+    if status == b"T":
+        return True
+    if status == b"F":
+        return False
+    if status.startswith(b"E"):
+        name = status[1:].decode("ascii", "replace") or "Exception"
+        if name == "SystemExit":
+            raise SystemExit
+        if name == "KeyboardInterrupt":
+            raise KeyboardInterrupt
+        raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", name)
+    raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe failed")
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        try:
+            written = os.write(fd, view)
+        except InterruptedError:
+            continue
+        if written <= 0:
+            return
+        view = view[written:]
+
+
+def _read_all(fd: int, limit: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = limit
+    while remaining > 0:
+        try:
+            chunk = os.read(fd, remaining)
+        except InterruptedError:
+            continue
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
 
 
 def _screen_parent_env(engine: str, parent_env: object) -> dict[str, str]:

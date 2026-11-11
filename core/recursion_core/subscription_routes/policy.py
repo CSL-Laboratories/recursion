@@ -772,7 +772,8 @@ def _snapshot_cwd(engine: str | None, cwd: object) -> str | bytes:
     """One ``os.fspath`` of ``cwd``, screened, and that value is what the launcher receives.
 
     A path-like object is not forwarded. A later read of it can return a different string, including
-    one with a null, after the check has passed.
+    one with a null, after the check has passed. A ``bytearray`` is accepted and copied to ``bytes``
+    before screening, so a later change to the caller's buffer is not what launches.
     """
 
     if isinstance(cwd, str):

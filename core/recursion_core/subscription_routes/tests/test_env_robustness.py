@@ -20,11 +20,14 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from unittest import mock
 
+import recursion_core.subscription_routes.own_loop as own_loop
 from recursion_core.subscription_routes import (
     HERMES_ADOPT_EXTERNAL_LOGINS,
     OwnLoopRouteRefused,
@@ -400,6 +403,43 @@ class SubscriptionRobustness(unittest.TestCase):
         self.assertNotIn("AMBIENT_ONLY", decision.child_env)
         self.assertEqual("C", decision.child_env["LANG"])
 
+    def test_login_probe_does_not_share_the_process_environment(self) -> None:
+        started = self.root / "probe-started"
+        release = self.root / "probe-release"
+        seen = self.root / "probe-mark"
+
+        def probe() -> bool:
+            started.write_text("1", encoding="ascii")
+            deadline = time.monotonic() + 2
+            while not release.exists():
+                if time.monotonic() > deadline:
+                    return False
+                time.sleep(0.01)
+            seen.write_text(own_loop.os.environ.get("MARK", ""), encoding="ascii")
+            return True
+
+        environ = {"MARK": "original"}
+        with mock.patch.object(own_loop.os, "environ", environ):
+            holder: dict[str, bool] = {}
+
+            def run() -> None:
+                holder["ok"] = own_loop._probe_in_screened_env(probe, {"MARK": "probe"})
+
+            thread = threading.Thread(target=run)
+            thread.start()
+            deadline = time.monotonic() + 2
+            while not started.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(started.exists())
+            self.assertEqual("original", own_loop.os.environ["MARK"])
+            own_loop.os.environ["MARK"] = "concurrent"
+            release.write_text("go", encoding="ascii")
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual("concurrent", own_loop.os.environ["MARK"])
+            self.assertEqual("probe", seen.read_text(encoding="ascii"))
+            self.assertTrue(holder["ok"])
+
     def test_cwd_path_and_bytes_are_screened(self) -> None:
         base = dict(
             launcher=self.calls, argv=[self.launcher_path, "run", "anthropic/m"], engine="hermes",
@@ -438,6 +478,12 @@ class SubscriptionRobustness(unittest.TestCase):
         self.assertEqual(str(self.home), self.calls.call_args.kwargs["cwd"])
         guard_then_spawn(**base, cwd=os.fsencode(str(self.home)))
         self.assertEqual(os.fsencode(str(self.home)), self.calls.call_args.kwargs["cwd"])
+        buffer = bytearray(os.fsencode(str(self.home)))
+        guard_then_spawn(**base, cwd=buffer)
+        self.assertEqual(bytes(buffer), self.calls.call_args.kwargs["cwd"])
+        self.assertIsInstance(self.calls.call_args.kwargs["cwd"], bytes)
+        buffer.extend(b"\0mutated")
+        self.assertNotIn(b"\0", self.calls.call_args.kwargs["cwd"])
 
     def test_dropped_unencodable_value_does_not_refuse(self) -> None:
         home = str(self.home)

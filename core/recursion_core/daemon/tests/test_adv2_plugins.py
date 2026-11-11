@@ -262,7 +262,7 @@ class Adv2FilesystemTests(Adv2HostCase):
         # Observed: three GUI rows share the id plugin:fixture.operator (one loaded, two refused).
         self.assertEqual({r['id'] for r in host.route_records()}, {'plugin:fixture.operator'})
 
-    @unittest.expectedFailure  # ADV2-7: code a granted plugin imports from outside its verified artifact runs with no finding
+    @unittest.expectedFailure  # ADV2-7: owner decision pending (S34 decision 4); code imported from outside the verified artifact runs with no finding
     def test_code_imported_from_outside_the_artifact_is_a_finding(self):
         outside = self.tmp / 'outside'
         outside.mkdir()

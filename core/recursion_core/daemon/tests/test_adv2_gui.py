@@ -317,7 +317,7 @@ class Adv2RenderingTests(GuiCase):
         self.assertEqual(status, 200)
         self.assertGreater(len(page), 2_000_000)
 
-    @unittest.expectedFailure  # ADV2-9: an intervention the daemon refused before sending is shown as "outcome: unknown"
+    @unittest.expectedFailure  # ADV2-9: owner decision pending (S34 GUI wording item); a refused intervention reads "outcome: unknown"
     def test_a_refused_intervention_does_not_read_as_maybe_sent(self):
         host = plugins.PluginHost.__new__(plugins.PluginHost)  # only operator()'s ACTIONS branch runs
         _, transport = control_over(host)

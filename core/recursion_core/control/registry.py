@@ -186,10 +186,11 @@ class InMemoryRunRegistry:
     def _load_record(self, rec: dict) -> None:
         """Accept a snapshot from an older process.
 
-        A cgroup without a marker is given one. A stopped snapshot is rejected when its attestation
-        names another cgroup, a generation newer than the record, or a membership that still lists
-        someone the proof does not cover or who is still alive. A proof older than the record, naming
-        members the row has already dropped, is kept.
+        A cgroup without a marker is given one. A stopped snapshot must name a non-empty cgroup. It is
+        rejected when its attestation names another cgroup, a generation newer than the record, or a
+        membership that still lists someone the proof does not cover or who is still alive. Members
+        that pass that check are dropped, as they are when a stop is recorded. A proof older than the
+        record, naming members the row has already dropped, is kept.
         """
         rec.setdefault("generation", 1)
         rec.setdefault("members", [])
@@ -202,6 +203,8 @@ class InMemoryRunRegistry:
         if rec.get("state") != "stopped":
             return
         run_id = str(rec.get("run_id") or "")
+        if not isinstance(path, str) or not path:
+            raise StopUnattested(run_id)
         if (not isinstance(attestation, dict) or attestation.get("proof") != "empty"
                 or attestation.get("cgroup") != rec.get("cgroup")):
             raise StopUnattested(run_id)
@@ -223,6 +226,7 @@ class InMemoryRunRegistry:
             # A proof may name members the row has already dropped; that history stays valid.
             if not isinstance(member, dict) or member.get("member_id") not in proved or self.process_alive(member.get("pid")):
                 raise StopUnattested(run_id)
+        rec["members"] = []  # proved gone; a stopped run does not keep member rows
 
     def process_alive(self, pid: int | None) -> bool:
         """True when ``pid`` is a member we cannot show is gone."""
@@ -337,11 +341,14 @@ class InMemoryRunRegistry:
         """Drop members whose process is gone, and index ids that name no run.
 
         A reaped member bumps that run's generation and clears a stop attestation, so an in-flight
-        stop has to be proved again. Reaping does not itself record ``stopped``.
+        stop has to be proved again. Reaping does not itself record ``stopped``, and it does not touch
+        a run that is already stopped: that proof stays.
         """
         reaped: list[dict] = []
         with self._lock:
             for run_id, rec in list(self._runs.items()):
+                if rec.get("state") == "stopped":
+                    continue
                 live, dead = [], []
                 for member in rec.get("members") or []:  # one sample per pid; the receipt is that partition
                     (dead if not is_alive(member["pid"]) else live).append(member)

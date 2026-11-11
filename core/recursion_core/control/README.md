@@ -65,10 +65,12 @@ recorded on F60, CSL-762).
   not leave `stopped`, then increments the generation. A stale writer raises and does not overwrite a
   stop. `stopped` is terminal. It is stored only with an attestation (`proof: empty`, the cgroup path,
   that cgroup's marker, the member ids, and that generation) and only when none of those members is
-  still alive; the member rows are then dropped. A later update that changes the cgroup identity is
-  refused, and a later `join_member` on a stopped run is refused. A cleanup request stores the cgroup
-  path and marker it was sent to; a different identity is requested again. `reap_orphans` samples each member
-  once, drops the members that sample says are gone, and does not by itself record `stopped`.
+  still alive; the member rows are then dropped. A loaded `stopped` row must name a cgroup, and its
+  member rows are dropped once the proof has been checked. A later update that changes the cgroup
+  identity is refused, and a later `join_member` on a stopped run is refused. A cleanup request stores
+  the cgroup path and marker it was sent to; a different identity is requested again. `reap_orphans`
+  samples each member once, drops the members that sample says are gone, does not by itself record
+  `stopped`, and does not clear the proof of a run that is already stopped.
   Locks live on the registry (`OwnerLockTable`). Each in-flight call holds them under a token it minted,
   not under a thread id. One `acquire` sorts its keys, and a start key sorts before a run key, so a start
   and a stop cannot deadlock by taking those locks in opposite orders. A key is deleted once nobody holds

@@ -32,6 +32,8 @@ What a loaded plugin may give the daemon (plain values; a plugin imports nothing
 * ``registry()`` returning ``{"panels": [...], "required": {...}}`` for the GUI, with the ``panel``
   permission. The panels go through the GUI's own validation and its one venue-data filter.
 * ``operator(command)`` answering an ``o7.operator.v0`` read command, with the ``read`` permission.
+  Each call runs on its own thread with a deadline; past it the read answers 504, the plugin is
+  marked degraded, and no new call goes to it until the stuck one returns.
 * ``bind_core(call)``, which receives this plugin's ``csl-core/v0`` client (canonical JSON bytes in
   and out) for the approval gate, the authority profile and the breaker.
 
@@ -82,6 +84,13 @@ _INSTALL_KEYS = frozenset({'trusted_keys', 'grants', 'reserved', 'authority_anch
 _GRANT_KEYS = frozenset({'plugin_id', 'artifact_sha256', 'signer_key_id', 'permissions', 'unsigned_order_acknowledged',
                          'order_after_revoked_key', 'order_after_revocation_generation'})
 _SAFE_ID = re.compile(r'[^A-Za-z0-9_.-]')
+# O7 reads (ADV2-3). Uncalibrated defaults: a plugin call that has not answered by its deadline is
+# answered 504 and the plugin is marked degraded; a read that finds another one running waits this
+# long for its turn, then answers busy. A timed-out call cannot be stopped in-process, so while it
+# has not returned no new call goes into that plugin.
+OPERATOR_DEADLINE_S = 10.0
+OPERATOR_TURN_WAIT_S = 1.5
+OPERATOR_TIMED_OUT = 'unavailable: operator plugin timed out'
 
 
 class PluginRefused(Exception):
@@ -180,12 +189,18 @@ class PluginHost:
     """What the running daemon holds of its operator plugins: the inventory, the panels, the O7 reader."""
 
     def __init__(self, config_dir, state_dir, breaker=None, *, plugin_dirs=(), verification_available=None,
-                 gil_probe=None, clock=time.time):
+                 gil_probe=None, clock=time.time, operator_deadline_s=OPERATOR_DEADLINE_S,
+                 operator_turn_wait_s=OPERATOR_TURN_WAIT_S):
         require_launcher_platform()  # Windows: typed PlatformUnsupported; no plugin file is opened
         self._config, self._state = Path(config_dir) / PLUGINS_DIR, Path(state_dir)
         self._gil = gil_probe if gil_probe is not None else GilProbe()
         self._clock = clock
-        self._lock = threading.Lock()
+        # One operator() call at a time: the plugin is in-process code of unknown thread safety.
+        self._turn = threading.Condition()
+        self._busy = False
+        self._stuck = None  # plugin id whose call passed its deadline and has not returned
+        self._operator_deadline_s, self._operator_turn_wait_s = operator_deadline_s, operator_turn_wait_s
+        self.degraded = {}  # plugin id -> operator() calls that passed their deadline
         self.health = CoreHealth()
         self.loader = self.core = self.gate = self.authority = self._trust = None
         self.records, self.registries = [], ()
@@ -313,7 +328,7 @@ class PluginHost:
                     # The GUI's own validation, over every panel already accepted plus these.
                     panel_registry([p for _, entry in self._panels for p in entry.get('panels', ())]
                                    + list(snapshot.get('panels', ())))
-                except Exception as exc:  # noqa: BLE001 - a bad registry costs the plugin its panels, not the daemon
+                except BaseException as exc:  # noqa: BLE001 - a bad registry costs the plugin its panels, not the daemon
                     record['findings'].append(_finding('plugin_registry_invalid', 'refuse',
                                                        f'{type(exc).__name__}: panels not registered'))
                 else:
@@ -331,11 +346,17 @@ class PluginHost:
             try:
                 self._guarded(bind, self.core.client_for(loaded.plugin_id))
                 record['provides'].append('core_client')
-            except Exception as exc:  # noqa: BLE001
+            except BaseException as exc:  # noqa: BLE001 - SystemExit or KeyboardInterrupt included (_guarded)
                 record['findings'].append(_finding('plugin_bind_core_failed', 'warn', type(exc).__name__))
 
     def _guarded(self, call, *args):
-        """Run plugin code, then read the GIL: a plugin that turned it on poisons the core (4.1)."""
+        """Run plugin code, then read the GIL: a plugin that turned it on poisons the core (4.1).
+
+        Callers catch ``BaseException`` from plugin code, ``SystemExit`` and ``KeyboardInterrupt``
+        included: they cost the plugin, not the daemon (ADV2-4). Nothing the daemon needs for its
+        own shutdown is raised there: SIGTERM and SIGINT only set the main loop's stop event
+        (``daemon/__main__.py``), as the loader's import step already assumes.
+        """
         try:
             return call(*args)
         finally:
@@ -350,6 +371,7 @@ class PluginHost:
             item = dict(record)
             if item['state'] == 'loaded' and self.loader is not None:
                 item['permissions'] = list(self.loader.permissions(item['plugin_id']))  # after a revoke or a poison
+                item.update(self._degraded_fields(item['plugin_id']))
             plugins.append(item)
         return {'plugins': plugins, 'verification': self.verification, 'core_poisoned': self.health.poisoned,
                 'authority_profile': self.authority_state, 'approvals_drawn': len(self.pending_approvals),
@@ -365,12 +387,23 @@ class PluginHost:
                 note = 'loaded %s; permissions: %s; provides: %s; in process, not contained' % (
                     record['trust'], ', '.join(self.loader.permissions(record['plugin_id'])) or 'none',
                     ', '.join(record['provides']) or 'nothing')
+                degraded = self._degraded_fields(record['plugin_id'])
+                if degraded:
+                    note += '; degraded: ' + degraded['degraded']
             else:
                 note = 'refused: %s%s' % (record['code'], ': ' + record['detail'] if record['detail'] else '')
             rows.append({'id': 'plugin:' + _SAFE_ID.sub('_', name)[:80], 'class': 'plugin', 'sign_in': '',
                          'configured': record['state'] == 'loaded', 'maturity': 'beta', 'beta': True, 'bars': {},
                          'blocker': note})
         return rows
+
+    def _degraded_fields(self, plugin_id):
+        with self._turn:
+            count, stuck = self.degraded.get(plugin_id, 0), self._stuck == plugin_id
+        if not count:
+            return {}
+        text = f'operator() passed its {self._operator_deadline_s:g} s deadline {count} time(s)'
+        return {'degraded': text + ('; a call has still not returned, reads answer 504' if stuck else '')}
 
     def operator(self, command):
         """One ``o7.operator.v0`` command -> ``(http status, body)``. Reads go to the loaded plugin."""
@@ -393,15 +426,61 @@ class PluginHost:
             return 503, {'error': f'unavailable: {reason}'}
         if len(providers) > 1:
             return 503, {'error': 'unavailable: more than one loaded plugin serves the operator contract'}
-        with self._lock:  # one read at a time: the plugin is in-process code of unknown thread safety
-            try:
-                answer = self._guarded(self._operators[providers[0]], json.loads(json.dumps(command)))
-                body = json.loads(json.dumps(answer))
-            except Exception as exc:  # noqa: BLE001 - the plugin's failure is reported, never guessed around
-                return 502, {'error': f'unavailable: operator plugin failed: {type(exc).__name__}'}
-        if not isinstance(body, dict):
+        plugin_id = providers[0]
+        outcome = self._call_operator(plugin_id, self._operators[plugin_id], json.loads(json.dumps(command)))
+        if isinstance(outcome, tuple):
+            return outcome
+        if 'error' in outcome:
+            return 502, {'error': f'unavailable: operator plugin failed: {type(outcome["error"]).__name__}'}
+        if not isinstance(outcome['body'], dict):
             return 502, {'error': 'unavailable: operator plugin answered a non-object'}
-        return 200, body
+        return 200, outcome['body']
+
+    def _call_operator(self, plugin_id, handler, command):
+        """Run one ``operator()`` call on its own thread, bounded by the read deadline (ADV2-3).
+
+        Returns ``{"body": ...}`` or ``{"error": exc}``, or an ``(http status, body)`` refusal. The
+        caller never waits more than the turn wait plus the deadline, so an O7 read (and the GUI
+        thread serving it) is never held by a plugin that does not answer.
+        """
+        with self._turn:
+            if self._stuck is None and self._busy:
+                self._turn.wait_for(lambda: not self._busy or self._stuck is not None, self._operator_turn_wait_s)
+            if self._stuck is not None:
+                return 504, {'error': f'{OPERATOR_TIMED_OUT}; an earlier call has not returned, so no new call '
+                                      'was made (plugin degraded)'}
+            if self._busy:
+                return 503, {'error': 'unavailable: operator plugin busy with an earlier read; nothing was read'}
+            self._busy = True
+        outcome, done = {}, threading.Event()
+
+        def run():
+            try:
+                outcome['body'] = json.loads(json.dumps(self._guarded(handler, command)))
+            except BaseException as exc:  # noqa: BLE001 - the plugin's failure is reported, never guessed around
+                outcome['error'] = exc
+            finally:
+                with self._turn:
+                    done.set()
+                    self._busy = False
+                    if self._stuck == plugin_id:
+                        self._stuck = None
+                        log.warning('operator plugin %s returned after its deadline; reads go to it again '
+                                    '(it stays marked degraded)', plugin_id)
+                    self._turn.notify_all()
+
+        threading.Thread(target=run, name='recursion-operator-read', daemon=True).start()
+        if done.wait(self._operator_deadline_s):
+            return outcome
+        with self._turn:
+            if done.is_set():
+                return outcome
+            self._stuck = plugin_id
+            self.degraded[plugin_id] = self.degraded.get(plugin_id, 0) + 1
+            self._turn.notify_all()
+        log.error('operator plugin %s did not answer within %.1f s: answered %s; marked degraded, and no new '
+                  'call goes to it until this one returns', plugin_id, self._operator_deadline_s, OPERATOR_TIMED_OUT)
+        return 504, {'error': OPERATOR_TIMED_OUT}
 
     def close(self):
         for item in (self.authority, self._trust):

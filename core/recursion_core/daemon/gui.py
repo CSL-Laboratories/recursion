@@ -11,6 +11,11 @@ arrive within ``HEADER_DEADLINE_S`` of the accept however the bytes are spaced, 
 number of threads is bounded: when every one is taken, the connection that has been sending
 headers longest is closed to make room (ADV1-3). One slow client cannot hold the page or
 its Stop.
+
+Stop has capacity of its own (ADV2-3): when every request thread is busy answering (a slow
+operator plugin, say), up to ``STOP_RESERVED_THREADS`` more connections are still read, and
+only ``POST /stop`` is answered on them; any other request there gets 503. So busy read
+threads never refuse a Stop (PRODUCT.md d84cdd26, 3.4 S6: Stop on every surface).
 """
 from collections.abc import Mapping
 import io
@@ -49,6 +54,7 @@ def _snapshot(plugin):
 
 
 MAX_REQUEST_THREADS = 16
+STOP_RESERVED_THREADS = 2  # beyond MAX_REQUEST_THREADS, for POST /stop only
 RECV_TIMEOUT_S = 2.0      # one read or write
 HEADER_DEADLINE_S = 5.0   # the request line and every header, from the accept
 BODY_DEADLINE_S = 10.0    # the rest of the request, once the headers are in
@@ -88,7 +94,9 @@ class _Handler(WSGIRequestHandler):
     def parse_request(self):
         parsed = super().parse_request()
         self._reader.deadline = time.monotonic() + BODY_DEADLINE_S
-        self.server.headers_read(self.connection)
+        if parsed and not self.server.headers_read(self.connection, self.command, self.path):
+            self.send_error(503, "GUI busy: every request thread is answering; only Stop is taken now")
+            return False
         return parsed
 
     def log_message(self, *_):
@@ -97,19 +105,21 @@ class _Handler(WSGIRequestHandler):
 
 
 class _Server(ThreadingMixIn, WSGIServer):
-    """One daemon thread per connection, at most ``MAX_REQUEST_THREADS`` of them."""
+    """One daemon thread per connection: ``MAX_REQUEST_THREADS``, plus ``STOP_RESERVED_THREADS`` for Stop."""
     daemon_threads = True
 
     def __init__(self, *args):
         self._gate = Lock()
         self._reading = {}    # connections still sending headers, oldest first
-        self._working = set()  # connections whose request is being answered
+        self._working = {}    # connections whose request is being answered -> is it a Stop
         super().__init__(*args)
 
     def process_request(self, request, client_address):
         evicted = None
         with self._gate:
-            full = len(self._reading) + len(self._working) >= MAX_REQUEST_THREADS
+            # Readers fill what answering leaves free, and never fewer than Stop's reserve.
+            readers = max(MAX_REQUEST_THREADS - len(self._working), STOP_RESERVED_THREADS)
+            full = len(self._reading) >= readers
             if full and self._reading:
                 evicted = next(iter(self._reading))
                 del self._reading[evicted]
@@ -137,16 +147,23 @@ class _Server(ThreadingMixIn, WSGIServer):
         finally:
             self._forget(request)
 
-    def headers_read(self, request):
+    def headers_read(self, request, method, path):
+        """Move a connection from reading to answering. False: no thread may answer it now."""
+        stop = (method, path.split("?", 1)[0]) == ("POST", "/stop")
         with self._gate:
-            if request in self._reading:
-                del self._reading[request]
-                self._working.add(request)
+            if request not in self._reading:
+                return True  # evicted: its next read fails and the thread leaves
+            limit = MAX_REQUEST_THREADS + STOP_RESERVED_THREADS if stop else MAX_REQUEST_THREADS
+            if len(self._working) >= limit:
+                return False
+            del self._reading[request]
+            self._working[request] = stop
+            return True
 
     def _forget(self, request):
         with self._gate:
             self._reading.pop(request, None)
-            self._working.discard(request)
+            self._working.pop(request, None)
 
 
 class LoopbackGUI:

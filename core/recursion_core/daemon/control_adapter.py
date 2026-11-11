@@ -61,7 +61,7 @@ from recursion_core.routes import ClaudeCodeAdapter, CodexAdapter, ConnectionBre
 from recursion_core.routes import contract as route_contract
 
 from . import RUN_ID, TERMINAL
-from .breaker import DurableRouteBreaker, open_breaker_store
+from .breaker import DurableRouteBreaker, open_breaker_store, store_probe_lease_s
 from .launcher import (EngineUnitManager, ProductionLauncher, RunContext, UnitKillTree, bound_run,
                        private_dir, require_launcher_platform)
 from .plugins import PluginHost
@@ -421,10 +421,17 @@ class DaemonControl:
                 key = route_connection(entry)
                 if self._breaker is not None and key is not None:
                     state, tripped = self._breaker.state(key), self._breaker.tripped(key)
-                    if tripped and state == 'closed':
+                    if tripped is None:
+                        # The store could not be read: whether it holds a trip is unknown, so is the
+                        # connection; a start on it is refused until the store reads (ADV2-1, ADV2-6).
+                        state = 'unknown'
+                    elif tripped and state == 'closed':
                         state = 'open'  # tripped under an earlier daemon; this one fences it at the first request
                     record['breaker'] = {'connection': key, 'state': state, 'tripped_in_store': tripped}
-                    if tripped or state != 'closed':
+                    if tripped is None:
+                        record['blocker'] = ('breaker state unknown: the breaker store could not be read; '
+                                             f'starts on this connection are refused; {NO_BAR_EVIDENCE}')
+                    elif tripped or state != 'closed':
                         record['blocker'] = f'breaker {state} on this connection (typed limit); {NO_BAR_EVIDENCE}'
             records.append(record)
         records.append({'id': 'surface:cli', 'class': 'surface', 'surface': 'cli', 'sign_in': '', 'configured': True,
@@ -764,14 +771,16 @@ def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.
     config_dir = Path(environ.get('XDG_CONFIG_HOME') or str(Path.home() / '.config')) / 'recursion'
     registry = DurableRunRegistry(daemon.registry, processes=pid_alive(manager))
     stored = breaker = breaker_unavailable = None
+    route_breaker = ConnectionBreaker(clock)
     try:
-        stored, created = open_breaker_store(state_dir, clock=clock)
+        stored, created = open_breaker_store(state_dir, clock=clock,
+                                             probe_lease_seconds=store_probe_lease_s(routes, route_breaker))
     except (Refused, OSError, sqlite3.Error) as exc:
         breaker_unavailable = exc.code if isinstance(exc, Refused) else type(exc).__name__
         log.error('breaker store cannot be opened (%s): every start is refused; reads and Stop still work',
                   breaker_unavailable)
     else:
-        breaker = DurableRouteBreaker(ConnectionBreaker(clock), stored)
+        breaker = DurableRouteBreaker(route_breaker, stored)
         if created and registry.list():
             log.warning('the breaker store was missing and was created empty while run records exist: '
                         'earlier trips, run bindings and faults are not known to this daemon')
@@ -782,7 +791,7 @@ def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.
         launcher = ProductionLauncher(engine, daemon, manager, state_dir)
         options = {'binary': entry['binary']} if entry and entry.get('binary') else {}
         adapters[engine] = cls(launcher, clock, no_custody, environ, **options)
-    service = RouteService(adapters, breaker if breaker is not None else ConnectionBreaker(clock), clock)
+    service = RouteService(adapters, breaker if breaker is not None else route_breaker, clock)
     starter = RouteStarter(service, routes, daemon, state_dir, breaker=breaker,
                            breaker_unavailable=breaker_unavailable)
     api = ControlAPI(registry, UnitKillTree(daemon), starter, time.time, confirm_timeout_s=confirm_timeout_s)

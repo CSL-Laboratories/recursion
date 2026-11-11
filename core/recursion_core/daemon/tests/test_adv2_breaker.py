@@ -79,7 +79,6 @@ class Adv2BreakerTests(unittest.TestCase):
         return self.store()
 
     # -- ADV2-1 ----------------------------------------------------------------------------------
-    @unittest.expectedFailure  # ADV2-1: one failed store read at the first request disables restart fencing for good
     def test_a_transient_store_read_error_does_not_drop_the_restored_trip(self):
         stored = self.tripped_by_an_earlier_daemon()
         durable = daemon_breaker.DurableRouteBreaker(ConnectionBreaker(self.clock), FlakyStore(stored))
@@ -91,6 +90,15 @@ class Adv2BreakerTests(unittest.TestCase):
         self.assertFalse(first['admitted'] and second['admitted'],
                          f'tripped connection admitted twice: {first} {second}')
 
+    def test_a_failed_first_read_fails_closed_and_is_read_again_at_the_next_request(self):
+        stored = self.store()  # nothing tripped
+        durable = daemon_breaker.DurableRouteBreaker(ConnectionBreaker(self.clock), FlakyStore(stored))
+        with self.assertLogs('recursion_core.daemon.breaker', 'ERROR'):
+            first = durable.admit(CONN, 'm', 't1')
+        self.assertEqual((first['admitted'], first['code']), (False, c.BREAKER_OPEN))
+        second = durable.admit(CONN, 'm', 't1')
+        self.assertEqual((second['admitted'], second['code']), (True, None))
+
     def test_control_the_restored_trip_fences_when_the_store_reads(self):
         stored = self.tripped_by_an_earlier_daemon()
         durable = daemon_breaker.DurableRouteBreaker(ConnectionBreaker(self.clock), stored)
@@ -99,7 +107,6 @@ class Adv2BreakerTests(unittest.TestCase):
         self.assertEqual((answer['admitted'], answer['code']), (False, c.BREAKER_OPEN))
 
     # -- ADV2-2 ----------------------------------------------------------------------------------
-    @unittest.expectedFailure  # ADV2-2: a successful probe that runs past the store's 300 s lease never clears the stored trip
     def test_a_long_successful_probe_clears_the_stored_trip(self):
         stored = self.tripped_by_an_earlier_daemon()
         durable = daemon_breaker.DurableRouteBreaker(ConnectionBreaker(self.clock), stored)
@@ -114,6 +121,45 @@ class Adv2BreakerTests(unittest.TestCase):
         self.assertEqual(effect, 'closed')                  # the in-memory breaker closed...
         self.assertEqual(durable.state(CONN), 'closed')
         self.assertFalse(stored.tripped(CONN), 'route closed in memory but still tripped in the store')
+
+    def test_the_store_lease_covers_the_longest_route_deadline(self):
+        routes = {'codex': {'deadline_s': 60.0}, 'claude_code': {'deadline_s': 900.0}}
+        lease_s = daemon_breaker.store_probe_lease_s(routes, ConnectionBreaker(self.clock))
+        self.assertEqual(lease_s, 930.0)  # the route breaker's lease: deadline plus its 30 s grace
+        self.assertEqual(daemon_breaker.store_probe_lease_s({}, ConnectionBreaker(self.clock)),
+                         daemon_breaker.STORE_PROBE_LEASE_S)
+        earlier = self.store()
+        earlier.report(CONN, 'plan_limit')
+        stored, _ = daemon_breaker.open_breaker_store(self.tmp, clock=self.clock, probe_lease_seconds=lease_s)
+        self.addCleanup(stored.close)
+        durable = daemon_breaker.DurableRouteBreaker(ConnectionBreaker(self.clock), stored)
+        with self.assertLogs('recursion_core.daemon.breaker', 'WARNING'):
+            durable.admit(CONN, 'm', 't', deadline_s=900)
+        self.clock.now += 301
+        probe = durable.admit(CONN, 'm', 't', deadline_s=900)
+        self.clock.now += 900  # inside the probe's 930 s lease
+        with self.assertNoLogs('recursion_core.daemon.breaker', 'WARNING'):
+            self.assertEqual(durable.record(CONN, 'm', 't', {'code': None}, probe['probe']), 'closed')
+        self.assertFalse(stored.tripped(CONN))
+
+    def test_a_trip_the_store_will_not_clear_is_not_shown_closed(self):
+        stored = self.tripped_by_an_earlier_daemon()
+
+        class NoReset(FlakyStore):
+            def reset_after_probe(self, connection, lease, probe_ok):
+                return False
+
+        durable = daemon_breaker.DurableRouteBreaker(ConnectionBreaker(self.clock), NoReset(stored, failures=0))
+        with self.assertLogs('recursion_core.daemon.breaker', 'WARNING'):
+            durable.admit(CONN, 'm', 't', deadline_s=60)
+        self.clock.now += 301
+        probe = durable.admit(CONN, 'm', 't', deadline_s=60)
+        with self.assertLogs('recursion_core.daemon.breaker', 'ERROR'):
+            effect = durable.record(CONN, 'm', 't', {'code': None}, probe['probe'])
+        self.assertEqual(effect, 'none')
+        self.assertTrue(stored.tripped(CONN))
+        self.assertNotEqual(durable.state(CONN), 'closed')
+        self.assertEqual(durable.admit(CONN, 'm', 't')['code'], c.BREAKER_OPEN)
 
     def test_control_a_short_successful_probe_clears_the_stored_trip(self):
         stored = self.tripped_by_an_earlier_daemon()
@@ -158,7 +204,6 @@ class Adv2BreakerTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 'breaker_store_invalid')
         self.assertEqual(path.read_bytes()[:16], b'SQLite format 3\x00')
 
-    @unittest.expectedFailure  # ADV2-8: a breaker store path that is a symlink is followed and accepted
     def test_a_store_path_that_is_a_symlink_is_refused(self):
         elsewhere = self.tmp / 'elsewhere'
         elsewhere.mkdir(mode=0o700)
@@ -170,6 +215,25 @@ class Adv2BreakerTests(unittest.TestCase):
         with self.assertRaises((Refused, OSError)):
             stored, _ = daemon_breaker.open_breaker_store(self.tmp, clock=self.clock)
             stored.close()
+
+    def test_symlinked_store_files_and_store_directory_are_refused_typed(self):
+        elsewhere = self.tmp / 'elsewhere'
+        elsewhere.mkdir(mode=0o700)
+        daemon_breaker.create_breaker_store(str(elsewhere / 'empty.sqlite3'))
+        path = daemon_breaker.store_path(self.tmp)
+        path.parent.mkdir(mode=0o700)
+        daemon_breaker.create_breaker_store(str(path))
+        os.symlink(elsewhere / 'other-wal', f'{path}-wal')  # a WAL file elsewhere would redirect writes
+        with self.assertRaises(Refused) as caught:
+            daemon_breaker.open_breaker_store(self.tmp, clock=self.clock)
+        self.assertEqual(caught.exception.code, 'breaker_store_untrusted')
+        os.unlink(f'{path}-wal')
+        os.unlink(path)
+        path.parent.rmdir()
+        os.symlink(elsewhere, path.parent)  # the store's directory itself
+        with self.assertRaises(OSError):
+            daemon_breaker.open_breaker_store(self.tmp, clock=self.clock)
+        self.assertFalse(os.path.lexists(elsewhere / daemon_breaker.STORE_FILE), 'nothing written through the link')
 
     def test_a_deleted_store_is_recreated_and_says_so(self):
         stored = self.store()
@@ -227,7 +291,6 @@ class Adv2BreakerTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 'run_unknown')
 
     # -- the route inventory's view of the store ---------------------------------------------------
-    @unittest.expectedFailure  # ADV2-6: route.list shows a connection whose store read failed as closed, with no blocker
     def test_route_list_does_not_show_an_unreadable_store_as_closed(self):
         stored = self.tripped_by_an_earlier_daemon()
         flaky = FlakyStore(stored, failures=10)
@@ -241,6 +304,8 @@ class Adv2BreakerTests(unittest.TestCase):
         # PRODUCT 3.5, O7's operator rules: "refusal, uncertainty, stale and unreconciled states stay visible as text".
         self.assertNotEqual(row['breaker']['state'], 'closed', row)
         self.assertNotEqual(row['blocker'], adapter.NO_BAR_EVIDENCE, row)
+        self.assertEqual(row['breaker']['state'], 'unknown', row)
+        self.assertIn('could not be read', row['blocker'])
 
 
 @unittest.skipUnless(LINUX, LINUX_ONLY)

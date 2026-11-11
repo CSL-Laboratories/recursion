@@ -90,6 +90,11 @@ class ConnectionBreaker:
         return tuple(slots)
 
     # -- admission ----------------------------------------------------------------------------
+    def probe_lease_s(self, deadline_s: float | None = None) -> float:
+        """How long a probe with this run deadline holds its lease: the deadline plus grace."""
+
+        return self._lease_s if deadline_s is None else float(deadline_s) + self._grace_s
+
     def admit(self, connection: str, model: str, tenant: str, *, deadline_s: float | None = None) -> dict:
         """Decide whether one request may launch. Returns ``{"admitted", "code", "probe", "retry_at", "key"}``.
 
@@ -119,8 +124,7 @@ class ConnectionBreaker:
                 return {"admitted": True, "code": None, "probe": None, "retry_at": None, "key": None}
             rec = self._keys[probe_key]
             token = f"probe-{next(self._tokens)}"
-            lease = self._lease_s if deadline_s is None else float(deadline_s) + self._grace_s
-            rec.update(state=HALF_OPEN, probe=token, lease_until=now + lease)
+            rec.update(state=HALF_OPEN, probe=token, lease_until=now + self.probe_lease_s(deadline_s))
             return {"admitted": True, "code": None, "probe": token, "retry_at": None, "key": self._display(probe_key)}
 
     # -- outcomes -----------------------------------------------------------------------------

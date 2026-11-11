@@ -184,7 +184,13 @@ class TuiApp:
         self.in_flight[method] = max(0, self.in_flight[method] - 1)
         self.last, self.last_method = answer, method
         code = answer.get("code")
-        if method == "run.list":
+        # A Stop answer confirms only the run it was sent for (ADV2-11): one that names another run,
+        # or none, changes no run and is shown as a mismatch, never as this run's Stop.
+        mismatch = (method == "run.stop" and code in ("stopped", "pending")
+                    and answer.get("run_id") != params.get("run_id"))
+        if mismatch:
+            pass
+        elif method == "run.list":
             if code == "ok" and isinstance(answer.get("runs"), list):
                 self.runs = [r for r in answer["runs"] if isinstance(r, dict)]
                 self.snapshot_at, self.refresh_failed = self._clock(), None
@@ -223,7 +229,7 @@ class TuiApp:
                 del self._uncertain[subject]
         # A stopped answer for a run that is not in this snapshot still confirms that Stop.
         # The cleanup above keeps it when the run is absent (bot review 4504133355).
-        if method == "run.stop" and code == "stopped" and isinstance(answer.get("run_id"), str):
+        if method == "run.stop" and code == "stopped" and not mismatch and isinstance(answer.get("run_id"), str):
             self._uncertain.pop(f"run={answer['run_id']}", None)
         labels = ",".join(sorted({label for label, _ in self.answer_conditions})) or "none"
         said = " ".join(x for x in (f"answer {method} status={field(code)}", self._answer_fields(answer)) if x)
@@ -233,7 +239,10 @@ class TuiApp:
         for label, text in self.answer_conditions:
             if label in (p.REFUSED, p.UNAVAILABLE_LABEL):
                 self._error(f"{label}: {method} status={field(code)} {field(text)}")
-        if method == "run.stop":  # the answer line above already said it
+        if mismatch:
+            self._error(f"stop run={field(params.get('run_id'))}: stop_answer_run_mismatch: the control API "
+                        f"answered {field(code)} for run={field(answer.get('run_id'))}; this Stop is not confirmed")
+        elif method == "run.stop":  # the answer line above already said it
             self._notice(f"stop run={field(params.get('run_id'))}: control API answered {field(code)}", speech="")
         self.sync_conditions()
 

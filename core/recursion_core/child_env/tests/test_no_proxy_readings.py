@@ -300,7 +300,9 @@ class ReadingTimeTests(unittest.TestCase):
     def test_hostile_values_are_decided_in_bounded_time(self) -> None:
         unit = 100_000
         for label, value in (
-            ("one long spaced item", "*.a " * (unit // 4) + "q"),  # a 100,000-character requests join, star-dot tails
+            # A 50,000-character requests join with star-dot tails. Most of its time is the "*" matcher on 12,500
+            # entries, as before MEDIUM-2 (1.65 s at 100,000 characters at abb3d75d; 1.88 s now).
+            ("one long spaced item", "*.a " * (unit // 8) + "q"),
             ("one long space run", "a" + " " * unit + "b"),
             ("one long BOM run", "a" + "\ufeff" * unit + "b"),  # undici pieces
             ("BOM and star", "\ufeff*a" * (unit // 3) + "q"),

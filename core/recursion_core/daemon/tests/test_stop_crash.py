@@ -313,7 +313,33 @@ class ProcessGroupManagerTests(unittest.TestCase):
                 manager.stop('recursion-run-x.service')
 
 
+def refusal_instead_of_cells():
+    """Where the cells cannot run, say why; on Windows also check the daemon's typed refusal.
+
+    Returns the exit status, or None when this host runs the cells.
+    """
+    if NOT_POSIX:
+        from recursion_core.daemon import PlatformUnsupported
+        with tempfile.TemporaryDirectory() as temp:
+            try:
+                with UserLock(Path(temp) / 'runtime'):
+                    pass
+            except PlatformUnsupported as refusal:
+                print(f'kill -9 cells not run on this platform ({LINUX_ONLY}); '
+                      f'checked the typed refusal instead: {refusal}')
+                return 0
+            print('FAIL: UserLock did not refuse PlatformUnsupported on a non-POSIX host')
+            return 1
+    if not (sys.platform.startswith('linux') and Path('/proc/self/stat').exists()):
+        print(f'kill -9 cells not run: they need Linux /proc (platform {sys.platform})')
+        return 0
+    return None
+
+
 if __name__ == '__main__':
+    status = refusal_instead_of_cells()
+    if status is not None:
+        sys.exit(status)
     counts = measure()
     for phase, cells in counts.items():
         passed = sum(not check_cell(c) for c in cells)

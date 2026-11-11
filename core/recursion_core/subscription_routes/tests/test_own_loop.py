@@ -6,10 +6,22 @@ Fakes only: no engine, login store, provider, DNS or network is touched.
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
+import recursion_core.subscription_routes.own_loop as own_loop
 from recursion_core.subscription_routes import (
     COPILOT_STRIP_ENV, OwnLoopRouteRefused, check_copilot_own_loop, check_nous_own_loop, nous_proxy_doctor,
 )
+
+# These call the login probe. On a platform that cannot fork one, they skip; the refusal
+# itself is test_unenforceable_platform_refuses_the_probe.
+_NEEDS_PROBE = frozenset({
+    "test_stored_login_runs_with_every_token_variable_removed",
+    "test_unrelated_provider_credentials_do_not_reach_the_copilot_child",
+    "test_copilot_model_is_checked_and_carried",
+    "test_no_stored_login_refuses_and_does_not_fall_back_to_gh",
+    "test_spelling_only_normalisation",
+})
 
 FAKE = "fake-not-a-real-token"
 BASE = {"PATH": "/usr/bin:/bin", "HOME": "/home/u", "LANG": "C.UTF-8"}
@@ -25,6 +37,10 @@ def nous(**extra: object) -> dict:
 
 
 class CopilotTests(unittest.TestCase):
+    def setUp(self) -> None:
+        if self._testMethodName in _NEEDS_PROBE and not own_loop._probe_enforceable():
+            self.skipTest("login probe cannot be enforced on this platform")
+
     def refused(self, cause: str, route: object, env: dict | None = None, probe=lambda: True) -> None:
         with self.assertRaises(OwnLoopRouteRefused) as ctx:
             check_copilot_own_loop(route, BASE if env is None else env, has_copilot_login=probe)
@@ -65,7 +81,8 @@ class CopilotTests(unittest.TestCase):
         def boom() -> bool:
             raise OSError("keychain locked")
         self.refused("copilot_login_unknown", copilot(), probe=boom)
-        self.refused("no_stored_copilot_login", copilot(), probe=lambda: "yes")
+        if own_loop._probe_enforceable():
+            self.refused("no_stored_copilot_login", copilot(), probe=lambda: "yes")
 
     def test_route_may_not_pass_a_token(self) -> None:
         for name in ("token", "github_token", "COPILOT_GITHUB_TOKEN", "api_key", "bearer"):
@@ -84,6 +101,16 @@ class CopilotTests(unittest.TestCase):
     def test_spelling_only_normalisation(self) -> None:
         d = check_copilot_own_loop(copilot(method="Copilot CLI sign-in"), BASE, has_copilot_login=lambda: True)
         self.assertEqual(d.method, "copilot_cli_sign_in")
+
+
+class UnenforceableProbeTests(unittest.TestCase):
+    def test_unenforceable_platform_refuses_the_probe(self) -> None:
+        with mock.patch.object(own_loop, "_probe_enforceable", return_value=False):
+            with self.assertRaises(OwnLoopRouteRefused) as caught:
+                check_copilot_own_loop(copilot(), BASE, has_copilot_login=lambda: True)
+        self.assertEqual(caught.exception.cause, "copilot_login_unknown")
+        self.assertEqual(caught.exception.detail, "probe unenforceable")
+        self.assertNotIn(FAKE, str(caught.exception))
 
 
 class NousTests(unittest.TestCase):

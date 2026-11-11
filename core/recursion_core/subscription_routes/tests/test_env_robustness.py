@@ -759,6 +759,13 @@ class SubscriptionRobustness(unittest.TestCase):
         self.assertEqual("probe unenforceable", caught.exception.detail)
         self.assertEqual([], called)
 
+    def test_interrupt_while_arming_the_probe_closes_the_pipe(self) -> None:
+        before = set(os.listdir("/proc/self/fd"))
+        with mock.patch.object(own_loop.time, "monotonic", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                own_loop._probe_in_screened_env(lambda: True, {"PATH": "/usr/bin"})
+        self.assertEqual(set(), set(os.listdir("/proc/self/fd")) - before)
+
     def test_login_probe_interrupt_kills_the_child(self) -> None:
         def slow() -> bool:
             time.sleep(2)

@@ -191,6 +191,24 @@ def _other_threads() -> bool:
     return False
 
 
+def _probe_enforceable() -> bool:
+    """True when this process can fork a probe child and signal its process group.
+
+    Windows has none of ``fork``, ``killpg``, ``setpgid`` or ``getpgid``. The probe then
+    refuses ``probe unenforceable`` instead of running. The name is the same predicate the
+    CSL-786 follow-up uses for this decision; that branch adds the pidfd checks its own
+    probe requires.
+    """
+
+    return (
+        os.name != "nt"
+        and hasattr(os, "fork")
+        and hasattr(os, "killpg")
+        and hasattr(os, "setpgid")
+        and hasattr(os, "getpgid")
+    )
+
+
 def _probe_in_screened_env(probe: Callable[[], bool], child: Mapping[str, str]) -> bool:
     """Run the login probe in a forked child whose environment is ``child``.
 
@@ -204,16 +222,18 @@ def _probe_in_screened_env(probe: Callable[[], bool], child: Mapping[str, str]) 
     and ``KeyboardInterrupt`` raised by the probe are not a login.
     """
 
-    if not hasattr(os, "fork") or not hasattr(os, "killpg") or not hasattr(os, "setpgid") or not hasattr(os, "getpgid"):
+    if not _probe_enforceable():
         raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe unenforceable")
     if _other_threads():
         raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe threaded")
-    read_fd, write_fd = os.pipe()
     pid: int | None = None
     status: bytes | None = None
-    fds = [read_fd, write_fd]
-    deadline = time.monotonic() + _PROBE_DEADLINE_S
+    fds = [-1, -1]
+    deadline = 0.0
     try:
+        read_fd, write_fd = os.pipe()
+        fds[0], fds[1] = read_fd, write_fd
+        deadline = time.monotonic() + _PROBE_DEADLINE_S
         try:
             pid = os.fork()
         except OSError:

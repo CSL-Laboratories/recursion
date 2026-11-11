@@ -87,7 +87,8 @@ checked against `SUBSCRIPTION_SIGN_INS`:
   `.local/share/opencode` and `.config/opencode`), which the check allows for that engine only,
   by `lstat`. The own store may not be a link or sit under one (`own_store_is_link`), and no link
   inside it may resolve outside the route home (`own_store_links_outside_route_home`), so it cannot
-  reach the operator's store. Every other engine's store, `.codex/auth.json` and every Claude Code store still
+  reach the operator's store. A directory in that walk that cannot be listed is `home_unsafe`.
+  Every other engine's store, `.codex/auth.json` and every Claude Code store still
   refuse. Recursion never stores, copies or ships these tokens and cannot see what else a store
   holds without reading it, which it does not do. So a present own store is flagged in
   `RouteDecision.flags` as `own_login_store_not_inspected:<entry>`: it could hold a login
@@ -147,7 +148,9 @@ PRODUCT.md `055cc7a5` section 3.3. `own_loop.py`, checked before any spawn or re
   would need a different product API. The callable is not picklable, so there is no forkserver.
   Where another thread is already alive, the route refuses `probe threaded` and does not fork.
   That includes a `threading` thread, a thread started with `_thread`, and any extra native thread
-  in `/proc/self/task`. A lock that thread holds is never released in the child. A thread started
+  in `/proc/self/task`. When that directory exists but cannot be listed, the route refuses the
+  same way: a hidden native thread must not be treated as absent. A lock that thread holds is
+  never released in the child. A thread started
   in the gap before `fork` is still a race. `home` is required (`route_home_missing` otherwise):
   a probe without it would approve the ambient account. Where `fork`, `setsid`, `killpg`, `pidfd_open`, `pidfd_send_signal` and `waitid(P_PIDFD)` exist,
   the child calls `setsid`, writes a handshake byte, and does not run the callable until the
@@ -155,7 +158,9 @@ PRODUCT.md `055cc7a5` section 3.3. `own_loop.py`, checked before any spawn or re
   `signal.pidfd_send_signal` when this interpreter has it, otherwise `os.pidfd_send_signal`,
   otherwise the libc function. The parent blocks SIGINT and SIGCHLD from before `fork` until
   after the group is signalled and the direct child is reaped, then restores the previous mask
-  with `SIG_SETMASK`. A signal the caller had already blocked stays blocked. SIGINT stays
+  with `SIG_SETMASK`. If that restore fails, the probe refuses `probe unenforceable` after
+  cleanup, including when the child reported a login. A signal the caller had already blocked
+  stays blocked. SIGINT stays
   blocked across `pidfd_open` and the store of that fd. Before `fork`, and only on Linux LP64
   x86_64 or aarch64 with glibc or musl, the probe reads the real `SIGCHLD` disposition with
   `sigaction` into a 256-byte buffer. musl is only the mapped basename

@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import ExitStack
 from unittest import mock
 
 import recursion_core.subscription_routes.own_loop as own_loop
@@ -116,6 +117,60 @@ class SigactionAbiTests(unittest.TestCase):
             native.run(native_result)
             self.assertTrue(native_result.skipped)
             self.assertFalse(native_result.errors)
+            # A case that needs a successful probe skips too. It must not error on the real probe.
+            stored = CopilotTests("test_stored_login_runs_with_every_token_variable_removed")
+            stored_result = unittest.TestResult()
+            stored.run(stored_result)
+            self.assertTrue(stored_result.skipped)
+            self.assertFalse(stored_result.errors)
+
+    def test_an_unlistable_task_dir_is_another_thread(self) -> None:
+        with mock.patch.object(own_loop.threading, "enumerate", return_value=[threading.current_thread()]), \
+                mock.patch.object(own_loop.sys, "_current_frames", return_value={1: None}), \
+                mock.patch.object(own_loop.os.path, "isdir", return_value=True), \
+                mock.patch.object(own_loop.os, "listdir", side_effect=PermissionError("task")):
+            self.assertTrue(own_loop._other_threads())
+        with mock.patch.object(own_loop.threading, "enumerate", return_value=[threading.current_thread()]), \
+                mock.patch.object(own_loop.sys, "_current_frames", return_value={1: None}), \
+                mock.patch.object(own_loop.os.path, "isdir", return_value=False):
+            self.assertFalse(own_loop._other_threads())
+
+    def test_a_failed_mask_restore_refuses_a_login_line(self) -> None:
+        with ExitStack() as stack:
+            def patch(name: str, **kwargs: object) -> None:
+                stack.enter_context(mock.patch.object(own_loop, name, **kwargs))
+
+            patch("_sigchld_auto_reaps", return_value=False)
+            patch("_other_threads", return_value=False)
+            patch("_read_handshake", return_value=(123, "ok"))
+            patch("_leader_state", return_value="running")
+            patch("_write_ack")
+            patch("_read_status", return_value=(b"T", True, False))
+            patch("_stop_probe", return_value=False)
+            patch("_reap_probe", return_value=False)
+            patch("_close_fd")
+            stack.enter_context(mock.patch.object(own_loop.os, "pipe", side_effect=[(10, 11), (12, 13)]))
+            stack.enter_context(mock.patch.object(own_loop.os, "set_inheritable"))
+            stack.enter_context(mock.patch.object(own_loop.os, "set_blocking"))
+            stack.enter_context(mock.patch.object(own_loop.os, "fork", return_value=123))
+            stack.enter_context(mock.patch.object(own_loop.os, "pidfd_open", return_value=14))
+            stack.enter_context(mock.patch.object(own_loop.selectors, "DefaultSelector"))
+            stack.enter_context(mock.patch.object(
+                own_loop.signal, "pthread_sigmask", side_effect=[set(), OSError("restore failed")],
+            ))
+            with self.assertRaises(OwnLoopRouteRefused) as caught:
+                own_loop._probe_login_group(lambda: True, 1, None)
+        self.assertEqual(caught.exception.cause, "copilot_login_unknown")
+        self.assertEqual(caught.exception.detail, "probe unenforceable")
+
+    def test_write_sigaction_skips_before_it_loads_libc(self) -> None:
+        def cdll(*_args: object, **_kwargs: object) -> None:
+            raise AssertionError("libc")
+
+        with mock.patch.object(own_loop, "_sigaction_abi_supported", return_value=False), \
+                mock.patch.object(ctypes, "CDLL", side_effect=cdll):
+            with self.assertRaises(unittest.SkipTest):
+                _write_sigaction(signal.SIGCHLD, b"\0" * _SIGACTION_BYTES)
 
     def test_a_pid_waitid_error_is_not_treated_as_reaped(self) -> None:
         with mock.patch.object(own_loop.os, "waitid", side_effect=OSError(errno.EINVAL, "waitid")):
@@ -130,9 +185,29 @@ class SigactionAbiTests(unittest.TestCase):
         self.assertTrue(any(call.args[1] == signal.SIGKILL for call in group.call_args_list))
 
 
+# Cases that never run a successful login probe. Everything else in CopilotTests skips unless
+# the platform can both enforce the probe and read the sigaction layout.
+_NO_NATIVE_PROBE = frozenset({
+    "test_a_raw_thread_refuses_before_the_probe_can_deadlock",
+    "test_sigchld_ignored_refuses_before_the_callable",
+    "test_pidfd_send_prefers_the_stdlib_over_libc",
+    "test_pidfd_sender_order_is_stdlib_then_os_then_libc",
+    "test_an_unsafe_home_does_not_leave_a_copilot_directory",
+    "test_a_nul_in_home_is_a_typed_refusal",
+    "test_a_surrogate_in_home_is_a_typed_refusal",
+    "test_an_inherited_or_overridden_surrogate_copilot_home_is_refused",
+    "test_check_without_a_route_home_refuses",
+    "test_a_held_lock_refuses_before_the_probe_can_deadlock",
+    "test_route_may_not_pass_a_token",
+    "test_other_methods_and_fields_refuse",
+})
+
+
 class CopilotTests(unittest.TestCase):
     def setUp(self) -> None:
         if not own_loop._probe_enforceable():
+            self.skipTest("login probe cannot be enforced on this platform")
+        if self._testMethodName not in _NO_NATIVE_PROBE and not own_loop._sigaction_abi_supported():
             self.skipTest("login probe cannot be enforced on this platform")
 
     def refused(self, cause: str, route: object, env: dict | None = None, probe=lambda: True) -> None:
@@ -1308,6 +1383,8 @@ def _sigaction_buffer(raw: bytes) -> ctypes.Array:
 
 
 def _libc_sigaction(signum: int, new: bytes | None, old: ctypes.Array | None) -> int:
+    if not own_loop._sigaction_abi_supported():
+        raise unittest.SkipTest("sigaction layout is not verified for this platform")
     libc = ctypes.CDLL(None, use_errno=True)
     libc.sigaction.argtypes = (ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
     libc.sigaction.restype = ctypes.c_int

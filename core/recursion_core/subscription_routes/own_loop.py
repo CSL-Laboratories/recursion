@@ -471,7 +471,9 @@ def _other_threads() -> bool:
     ``threading.enumerate`` misses a thread started with ``_thread``. ``sys._current_frames`` sees
     Python threads, and ``/proc/self/task`` sees native threads. ``fork`` copies only this thread.
     A lock another thread holds is never released in the child, so the probe deadlocks. The
-    callable is an arbitrary closure and cannot be sent to a forkserver.
+    callable is an arbitrary closure and cannot be sent to a forkserver. When ``/proc/self/task``
+    exists but cannot be listed, a native thread may be hidden, so that is treated as another
+    thread. The "no native threads" fallback is only for a missing ``/proc``.
     """
 
     current = threading.current_thread()
@@ -484,7 +486,7 @@ def _other_threads() -> bool:
         try:
             tasks = os.listdir(task_dir)
         except OSError:
-            tasks = []
+            return True
         if len(tasks) > 1:
             return True
     return False
@@ -692,7 +694,8 @@ def _probe_login_group(
     ``KeyboardInterrupt`` raised after ``fork`` has returned that pid. No other child is
     signalled. ``SIGINT`` and ``SIGCHLD`` are blocked from before ``fork`` until after the
     group is signalled and the worker is reaped, then the caller's mask is restored with
-    ``SIG_SETMASK``. ``SIGCHLD`` ignored refuses before ``fork``. The pidfd is opened and
+    ``SIG_SETMASK``. A failed restore refuses ``probe unenforceable`` after cleanup.
+    ``SIGCHLD`` ignored refuses before ``fork``. The pidfd is opened and
     stored while that mask is held, and it stays open until after the last signal.
     """
 
@@ -781,7 +784,9 @@ def _probe_login_group(
                 try:
                     signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
                 except OSError:
-                    pass
+                    # The caller's SIGINT and SIGCHLD may still be blocked. A T line is not a login.
+                    if not isinstance(outcome.get("error"), (KeyboardInterrupt, SystemExit)):
+                        wait_bad = True
         if wait_bad and not isinstance(outcome.get("error"), (KeyboardInterrupt, SystemExit)):
             outcome.pop("error", None)
             outcome.pop("line", None)

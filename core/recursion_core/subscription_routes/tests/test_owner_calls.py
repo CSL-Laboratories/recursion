@@ -154,6 +154,16 @@ class SurrogateHomeTests(_Calls):
         self.assertEqual("requirements_malformed", owned.exception.cause)
         self.assertEqual("owned_hermes_home", owned.exception.detail)
 
+    def test_an_unlistable_own_store_is_home_unsafe(self) -> None:
+        with mock.patch.object(policy.os.path, "lexists", return_value=True), \
+                mock.patch.object(policy.os.path, "islink", return_value=False), \
+                mock.patch.object(policy.os.path, "isdir", return_value=True), \
+                mock.patch.object(policy.os.path, "realpath", side_effect=lambda path: path), \
+                mock.patch.object(policy.os, "scandir", side_effect=PermissionError("denied")):
+            with self.assertRaises(SubscriptionRouteRefused) as caught:
+                policy._check_own_store("opencode", "/route", "/route", ".local/share/opencode")
+        self.assertEqual("home_unsafe", caught.exception.cause)
+
 
 @unittest.skipIf(os.name == "nt", "POSIX links and home checks")
 class PackageLinkTests(_Calls):

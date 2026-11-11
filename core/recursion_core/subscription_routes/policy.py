@@ -642,7 +642,11 @@ def _check_own_store(engine: str, route_home: str, real_home: str, entry: str) -
         if not _within(real_current, real_home):
             raise SubscriptionRouteRefused(engine, "own_store_links_outside_route_home", entry)
         seen_dirs.add(real_current)
-        for top, dirs, files in os.walk(current, followlinks=False):
+
+        def _unlistable(_error: OSError) -> None:
+            raise SubscriptionRouteRefused(engine, "home_unsafe")
+
+        for top, dirs, files in os.walk(current, followlinks=False, onerror=_unlistable):
             linked_dirs: list[str] = []
             for name in list(dirs):
                 item = os.path.join(top, name)

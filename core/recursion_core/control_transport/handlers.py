@@ -6,6 +6,7 @@ layer above (#327); ``with_ping_health`` answers liveness and hands every other 
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -26,11 +27,17 @@ class Connection:
     observe, control and approval belong to the layer above (D3 scopes, I-42), which can
     tell peers apart by ``peer`` (SO_PEERCRED pid/uid/gid at connect time), keep per-
     connection session state in ``state``, and key it by ``conn_id`` (unique per server).
+
+    ``cancelled`` is set when this request is cancelled or the server's close deadline
+    has passed. The server binds a fresh event for each request. A handler may wait on
+    it. A result returned after it is set is not written, including from a handler that
+    never looks at ``cancelled``: close still drops that result.
     """
 
     conn_id: int
     peer: PeerCred
     state: dict[str, Any] = field(default_factory=dict)
+    cancelled: threading.Event = field(default_factory=threading.Event)
 
 
 Handler = Callable[[Message, Connection], Message]

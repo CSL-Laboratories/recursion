@@ -30,8 +30,9 @@ try:
 except ImportError:  # pragma: no cover - Windows has no fcntl; it is the F40 stub path
     fcntl = None  # type: ignore[assignment]
 
+from .correlation import ACCEPTED, CANCELLED, IGNORED, MISMATCH, MISSING_ID, SETTLED_CAP, RequestTable, same_id
 from .errors import FrameError, InsecureSocketPath, PeerRefused, RemoteBindRefused, TransportBusy
-from .framing import HEADER, MAX_FRAME_BYTES, decode_body, encode_frame, read_frame, write_frame
+from .framing import HEADER, MAX_FRAME_BYTES, decode_body, encode_frame, id_reencodes, read_frame, write_frame
 from .handlers import Connection, Handler, Message
 from .peercred import PeerCred, get_peer_cred
 
@@ -42,6 +43,17 @@ MAX_CONNECTIONS = 16
 # Whole-frame deadline: each request must arrive complete within this long of the server
 # being ready for it (connect or previous reply), however the bytes are spaced.
 IDLE_TIMEOUT_S = 30.0
+# One budget for every handler still running in close(). It is not multiplied by the
+# handler count: N blocked handlers share this deadline, then the ones still running
+# are cancelled and their late results are not written.
+CLOSE_TIMEOUT_S = 5.0
+# After frame_too_large the peer may still be writing the body. The worker returns
+# and frees its slot; this extra fd only reads that tail, on one deadline.
+# The write side is shut first, so a later request on the same socket sees EOF
+# instead of sitting in this drain.
+_PEER_HOLD_S = 2.0
+_peer_holds = threading.BoundedSemaphore(MAX_CONNECTIONS)
+
 # Sent, without reading anything, to an authenticated peer over the connection cap, so a
 # client can tell "not delivered, server busy" from a refusal or a crash.
 BUSY_FRAME = encode_frame(
@@ -219,6 +231,8 @@ class UnixControlServer:
         max_connections: int = MAX_CONNECTIONS,
         idle_timeout_s: float = IDLE_TIMEOUT_S,
         max_frame_bytes: int = MAX_FRAME_BYTES,
+        close_timeout_s: float = CLOSE_TIMEOUT_S,
+        settled_cap: int = SETTLED_CAP,
     ) -> None:
         directory = refuse_remote_bind(directory)
         if not name or "/" in name or name in (".", ".."):
@@ -233,6 +247,7 @@ class UnixControlServer:
         self._slots = threading.BoundedSemaphore(max_connections)
         self._idle_timeout_s = idle_timeout_s
         self._max_frame_bytes = max_frame_bytes
+        self._requests = RequestTable(close_timeout_s=close_timeout_s, settled_cap=settled_cap)
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._sock: socket.socket | None = None
@@ -244,10 +259,15 @@ class UnixControlServer:
         self._next_conn_id = 0
         self.refused: list[str] = []
         self.accepted = 0
+        self.late_dropped = 0
 
     @property
     def path(self) -> str:
         return self._path
+
+    def settled_count(self) -> int:
+        """Settled ids still remembered across open connections."""
+        return self._requests.settled_count()
 
     def start(self) -> None:
         with self._lock:
@@ -287,10 +307,17 @@ class UnixControlServer:
             self._thread.start()
 
     def close(self) -> None:
+        """Stop accepting and drop live connections under one shared deadline.
+
+        Each join waits only for the time still left on that deadline, so N blocked
+        handlers do not cost N timeouts. Handlers still running when the deadline
+        passes are cancelled. ``_serve`` does not write a result that arrives after that.
+        """
         self._stop.set()
+        self._requests.begin_close()
         thread = self._thread
-        if thread is not None:
-            thread.join(timeout=5.0)
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=self._requests.remaining())
         with self._lock:
             workers = list(self._workers)
             conns = list(self._conns)
@@ -300,7 +327,12 @@ class UnixControlServer:
             except OSError:
                 pass
         for worker in workers:
-            worker.join(timeout=self._idle_timeout_s + 1.0)
+            if worker is threading.current_thread():
+                continue
+            worker.join(timeout=self._requests.remaining())
+        # The wait is over. Cancel whoever is still inside a handler, even if the clock
+        # is a hair short of the deadline, and do not give the rest another timeout.
+        self._requests.abandon()
         with self._lock:
             sock, self._sock = self._sock, None
             lock_fd, self._lock_fd = self._lock_fd, None
@@ -380,39 +412,131 @@ class UnixControlServer:
     def _serve(self, conn: socket.socket, connection: Connection) -> None:
         try:
             while not self._stop.is_set():
-                deadline = time.monotonic() + self._idle_timeout_s
-                try:
-                    request = read_frame(conn, max_bytes=self._max_frame_bytes, deadline=deadline)
-                except FrameError as exc:
-                    _send_quietly(conn, {"ok": False, "error": {"code": "bad_frame", "detail": str(exc)}})
-                    return
-                except OSError:
-                    return
+                request = self._read_request(conn)
                 if request is None:
                     return
-                try:
-                    response = self._handler(request, connection)
-                    if not isinstance(response, dict):
-                        raise TypeError("handler returned a non-object")
-                except Exception:
-                    response = {"ok": False, "error": {"code": "internal_error"}}
-                response = _handler_reply(response)
-                if "id" in request and "id" not in response:
-                    response = {**response, "id": request["id"]}
-                try:
-                    conn.settimeout(self._idle_timeout_s)  # sendall's timeout bounds the whole write
-                    write_frame(conn, response, max_bytes=self._max_frame_bytes)
-                except FrameError:
-                    _send_quietly(conn, {"ok": False, "error": {"code": "response_too_large"}})
-                    return
-                except OSError:
+                if request.get("op") == "cancel":
+                    if not self._write_reply(conn, self._cancel_message(request), request):
+                        return
+                    continue
+                if "id" not in request:
+                    claim = self._requests.claim_absent(scope=connection.conn_id)
+                else:
+                    claim = self._requests.claim(request["id"], scope=connection.conn_id)
+                if not claim.accepted:
+                    code = claim.code if claim.code is not None else MISSING_ID
+                    if not self._write_reply(conn, _correlated_error(code, request), request):
+                        return
+                    continue
+                connection.cancelled = claim.event
+                response = self._call_handler(request, connection)
+                outcome = self._requests.finish(claim, response)
+                if outcome == MISMATCH:
+                    # The handler named a different id. That body is not this request's
+                    # reply, so it is not written. The error carries the request's own id.
+                    if not self._write_reply(conn, _correlated_error("internal_error", request), request):
+                        return
+                    continue
+                if outcome == IGNORED:
+                    self._count_late()
+                    # The handler's body is not this request's reply. A live cancel still
+                    # tells that client the request was cancelled; a close does not.
+                    # A handler that never watches cancelled hits this same path: close
+                    # has already abandoned the claim, so the late body is not written.
+                    if self._requests.past_deadline() or claim.request_id is None:
+                        return
+                    if not self._write_reply(conn, _correlated_error(CANCELLED, request), request):
+                        return
+                    continue
+                if outcome == ACCEPTED and claim.request_id is not None and "id" not in response:
+                    response = {**response, "id": claim.request_id}
+                if not self._write_reply(conn, response, request):
                     return
         finally:
+            # The connection's settled ids die with it. A replay on a connection
+            # that is still open is unchanged.
+            self._requests.drop_scope(connection.conn_id)
             conn.close()
             self._slots.release()
             with self._lock:
                 self._workers.discard(threading.current_thread())
                 self._conns.discard(conn)
+
+    def _read_request(self, conn: socket.socket) -> Message | None:
+        """Read one request. A bad frame is answered and ends the connection.
+
+        The answer carries the request id when the frame yielded one, including
+        null, so a client that sent an id does not see ``reply_id_mismatch``.
+        A frame that is not JSON, or whose id cannot be read, is answered with
+        no id. That id-less reply is the one bad_frame the client cannot correlate.
+
+        ``frame_too_large`` shuts the write side after the reply. The next request
+        on that socket fails at once. A duplicate fd keeps reading the rest of the
+        oversized body so the reply is not reset, and that read does not restart.
+        """
+        deadline = time.monotonic() + self._idle_timeout_s
+        try:
+            return read_frame(conn, max_bytes=self._max_frame_bytes, deadline=deadline)
+        except FrameError as exc:
+            reply: Message = {"ok": False, "error": {"code": "bad_frame", "detail": str(exc)}}
+            if exc.id_known:
+                reply["id"] = exc.request_id
+            _send_quietly(conn, reply)
+            if str(exc) == "frame_too_large":
+                # Dup first, so closing this fd cannot reset the peer while the
+                # reply is still unread. Then half-close writes: the client reads
+                # bad_frame and the next recv is EOF, not a 2s drain of a new request.
+                _hold_peer_open(conn)
+                try:
+                    conn.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+            return None
+        except OSError:
+            return None
+
+    def _call_handler(self, request: Message, connection: Connection) -> Message:
+        try:
+            response = self._handler(request, connection)
+            if not isinstance(response, dict):
+                raise TypeError("handler returned a non-object")
+        except Exception:
+            response = {"ok": False, "error": {"code": "internal_error"}}
+        return _handler_reply(response)
+
+    def _cancel_message(self, request: Message) -> Message:
+        code = self._requests.cancel(request["id"] if "id" in request else None)
+        if code == CANCELLED:
+            body: Message = {"ok": True, "op": "cancel", "state": "cancelled"}
+            if "id" in request:
+                body["id"] = request["id"]
+            return body
+        return _correlated_error(code, request)
+
+    def _write_reply(self, conn: socket.socket, message: Message, request: Message | None = None) -> bool:
+        """Write ``message``. A frame that does not fit is ``response_too_large``.
+
+        When ``request`` carried an id, that id is copied onto the error, including
+        null, so the client that sent it does not see ``reply_id_mismatch``.
+        """
+        try:
+            conn.settimeout(self._idle_timeout_s)  # sendall's timeout bounds the whole write
+            write_frame(conn, _drop_unencodable_id(message), max_bytes=self._max_frame_bytes)
+        except FrameError:
+            reply: Message = {"ok": False, "error": {"code": "response_too_large"}}
+            if request is not None and "id" in request:
+                reply["id"] = request["id"]
+            _send_quietly(conn, reply)
+            return False
+        except (OSError, ValueError):
+            # A reply that still cannot be encoded ends this request. It must not
+            # kill the worker.
+            return False
+        return True
+
+    def _count_late(self) -> None:
+        with self._lock:
+            self.late_dropped += 1
 
 
 def _send_busy(conn: socket.socket) -> None:
@@ -449,11 +573,67 @@ def _is_busy(response: Message) -> bool:
     return response == _BUSY_MESSAGE
 
 
+def _hold_peer_open(conn: socket.socket) -> None:
+    """Read the rest of an oversized body on a duplicate fd. Do not answer it.
+
+    The caller shuts the write side, so this drain cannot be a second request.
+    The deadline is fixed. Arriving bytes do not extend it, and the worker has
+    already released its connection slot.
+    """
+    if not _peer_holds.acquire(blocking=False):
+        return
+    try:
+        held = conn.dup()
+    except OSError:
+        _peer_holds.release()
+        return
+
+    def drain() -> None:
+        try:
+            deadline = time.monotonic() + _PEER_HOLD_S
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                held.settimeout(remaining)
+                try:
+                    chunk = held.recv(4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+        finally:
+            held.close()
+            _peer_holds.release()
+
+    thread = threading.Thread(target=drain, name="control-transport-hold", daemon=True)
+    try:
+        thread.start()
+    except RuntimeError:
+        held.close()
+        _peer_holds.release()
+
+
+def _drop_unencodable_id(message: Message) -> Message:
+    """Omit an id that ``encode_frame`` cannot write. The rest of the reply stands."""
+    if "id" not in message or id_reencodes(message["id"]):
+        return message
+    return {key: value for key, value in message.items() if key != "id"}
+
+
 def _send_quietly(conn: socket.socket, message: Message) -> None:
     try:
-        write_frame(conn, message)
-    except (OSError, FrameError):
+        write_frame(conn, _drop_unencodable_id(message))
+    except (OSError, FrameError, ValueError):
         pass
+
+
+def _correlated_error(code: str, request: Message) -> Message:
+    """A refusal that names ``code`` and echoes the request id when the request had one."""
+    body: Message = {"ok": False, "error": {"code": code, "retryable": False}}
+    if "id" in request:
+        body["id"] = request["id"]
+    return body
 
 
 class UnixControlClient:
@@ -512,7 +692,7 @@ class UnixControlClient:
                     raise ConnectionError("server closed the connection")
                 if _is_busy(response):
                     raise TransportBusy("busy: server at its connection cap; request not delivered")
-                if "id" in message and response.get("id") != message["id"]:
+                if "id" in message and not same_id(response.get("id"), message["id"]):
                     raise FrameError("reply_id_mismatch")
             except BaseException:
                 self._sock = None

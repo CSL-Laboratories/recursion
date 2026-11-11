@@ -379,15 +379,17 @@ def check_route(
 def _copy_child_env(engine: str, child_env: Mapping[str, str]) -> dict[str, str]:
     """A child env whose names and values can be passed to ``Popen``.
 
-    A null or a non-string crashes launch. Text this process cannot encode crashes it with
-    ``UnicodeEncodeError``. Non-UTF-8 bytes (surrogates) encode with ``surrogateescape`` and stay.
+    A null, an empty name, an ``=`` in a name, or a non-string crashes launch with
+    ``ValueError``. Text this process cannot encode crashes it with ``UnicodeEncodeError``.
+    Non-UTF-8 bytes (surrogates) encode with ``surrogateescape`` and stay.
     """
 
     if not isinstance(child_env, Mapping):
         raise SubscriptionRouteRefused(engine, "child_env_malformed")
     copied: dict[str, str] = {}
     for name, value in child_env.items():
-        if not isinstance(name, str) or not isinstance(value, str) or "\x00" in name or "\x00" in value:
+        if (not isinstance(name, str) or not isinstance(value, str) or name == "" or "=" in name
+                or "\x00" in name or "\x00" in value):
             raise SubscriptionRouteRefused(engine, "child_env_malformed")
         try:
             os.fsencode(name)

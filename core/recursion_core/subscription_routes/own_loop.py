@@ -24,6 +24,11 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import select
+import signal
+import sys
+import threading
+import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -148,58 +153,136 @@ def check_copilot_own_loop(
     return OwnLoopDecision("copilot", "copilot_cli_sign_in", MappingProxyType(child), removed, model=model)
 
 
+# A stored-login probe is an in-process callable, so it cannot be handed to a fresh interpreter.
+# The child is a fork in its own process group. The parent stops reading at this deadline and
+# SIGKILLs that group. Tests may shorten the deadline.
+_PROBE_DEADLINE_S = 5.0
+
+
+def _other_threads() -> bool:
+    """True when some thread other than this one is alive.
+
+    ``fork`` copies only this thread. A lock another thread holds is never released in the child,
+    so the probe can deadlock. The callable is an arbitrary closure and cannot be sent elsewhere.
+    """
+
+    current = threading.current_thread()
+    if any(thread is not current and thread.is_alive() for thread in threading.enumerate()):
+        return True
+    if len(sys._current_frames()) > 1:
+        return True
+    task_dir = "/proc/self/task"
+    if os.path.isdir(task_dir):
+        try:
+            tasks = os.listdir(task_dir)
+        except OSError:
+            tasks = []
+        if len(tasks) > 1:
+            return True
+    return False
+
+
 def _probe_in_screened_env(probe: Callable[[], bool], child: Mapping[str, str]) -> bool:
     """Run the login probe in a forked child whose environment is ``child``.
 
-    The parent environment is left untouched. Applying ``child`` here and restoring it afterwards
-    would show the probe's environment to other threads, and the restore would discard any write
-    those threads made while the probe ran.
+    The parent environment is left untouched. The child is its own process group, so a deadline
+    or an interrupt in the parent can SIGKILL it and reap it instead of waiting. ``SystemExit``
+    and ``KeyboardInterrupt`` raised by the probe are not a login. Another live thread refuses
+    the probe: forking a multi-threaded process can deadlock the child on a lock it does not hold.
     """
 
-    if not hasattr(os, "fork"):
+    if not hasattr(os, "fork") or not hasattr(os, "killpg") or not hasattr(os, "setpgid"):
         raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe unenforceable")
+    if _other_threads():
+        raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe threaded")
     read_fd, write_fd = os.pipe()
+    pid: int | None = None
+    status: bytes | None = None
+    fds = [read_fd, write_fd]
     try:
-        pid = os.fork()
-    except OSError:
-        os.close(read_fd)
-        os.close(write_fd)
-        raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe failed") from None
-    if pid == 0:
         try:
-            os.close(read_fd)
+            pid = os.fork()
+        except OSError:
+            raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe failed") from None
+        if pid == 0:
             try:
-                os.environ.clear()
-                os.environ.update(child)
-                ok = probe() is True
-                payload = b"T" if ok else b"F"
-            except BaseException as exc:
-                payload = b"E" + type(exc).__name__.encode("ascii", "replace")
-            _write_all(write_fd, payload[:80])
-        except BaseException:
+                try:
+                    os.setpgid(0, 0)
+                except OSError:
+                    pass
+                os.close(read_fd)
+                try:
+                    os.environ.clear()
+                    os.environ.update(child)
+                    ok = probe() is True
+                    payload = b"T" if ok else b"F"
+                except BaseException as exc:
+                    payload = b"E" + type(exc).__name__.encode("ascii", "replace")
+                _write_all(write_fd, payload[:80])
+            except BaseException:
+                pass
+            os._exit(0)
+        try:
+            os.setpgid(pid, pid)
+        except OSError:
             pass
-        os._exit(0)
-    os.close(write_fd)
-    try:
+        os.close(write_fd)
+        fds[1] = -1
         status = _read_all(read_fd, 80)
     finally:
-        os.close(read_fd)
-        try:
-            os.waitpid(pid, 0)
-        except ChildProcessError:
-            pass
+        pending: BaseException | None = None
+        for index, fd in enumerate(fds):
+            if fd < 0:
+                continue
+            try:
+                os.close(fd)
+                fds[index] = -1
+            except OSError:
+                fds[index] = -1
+            except BaseException as exc:
+                try:
+                    os.closerange(fd, fd + 1)
+                except OSError:
+                    pass
+                fds[index] = -1
+                pending = pending or exc
+        if pid:
+            _reap_probe_child(pid, kill=status is None)
+        if pending is not None:
+            raise pending
     if status == b"T":
         return True
     if status == b"F":
         return False
-    if status.startswith(b"E"):
+    if status is not None and status.startswith(b"E"):
         name = status[1:].decode("ascii", "replace") or "Exception"
-        if name == "SystemExit":
-            raise SystemExit
-        if name == "KeyboardInterrupt":
-            raise KeyboardInterrupt
         raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", name)
     raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe failed")
+
+
+def _kill_probe_group(pid: int) -> None:
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except OSError:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def _reap_probe_child(pid: int, *, kill: bool) -> None:
+    """Reap ``pid``. Kill its process group first when the parent has no status byte yet."""
+
+    if kill:
+        _kill_probe_group(pid)
+    while True:
+        try:
+            os.waitpid(pid, 0)
+            return
+        except InterruptedError:
+            _kill_probe_group(pid)
+        except ChildProcessError:
+            return
 
 
 def _write_all(fd: int, data: bytes) -> None:
@@ -215,9 +298,29 @@ def _write_all(fd: int, data: bytes) -> None:
 
 
 def _read_all(fd: int, limit: int) -> bytes:
+    """Read until the child closes the pipe, or until ``_PROBE_DEADLINE_S`` elapses.
+
+    A ``T`` or ``F`` status is one byte and returns as soon as it arrives. A child that never
+    writes raises ``probe timed out`` so the caller can kill the process group.
+    """
+
+    deadline = time.monotonic() + _PROBE_DEADLINE_S
     chunks: list[bytes] = []
     remaining = limit
     while remaining > 0:
+        timeout = deadline - time.monotonic()
+        if timeout <= 0:
+            if chunks:
+                break
+            raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe timed out")
+        try:
+            readable, _, _ = select.select([fd], [], [], timeout)
+        except InterruptedError:
+            continue
+        if not readable:
+            if chunks:
+                break
+            raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe timed out")
         try:
             chunk = os.read(fd, remaining)
         except InterruptedError:
@@ -226,6 +329,8 @@ def _read_all(fd: int, limit: int) -> bytes:
             break
         chunks.append(chunk)
         remaining -= len(chunk)
+        if chunks[0][:1] in (b"T", b"F"):
+            break
     return b"".join(chunks)
 
 

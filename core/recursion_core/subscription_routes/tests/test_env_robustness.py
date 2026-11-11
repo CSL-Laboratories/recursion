@@ -28,6 +28,7 @@ from pathlib import Path
 from unittest import mock
 
 import recursion_core.subscription_routes.own_loop as own_loop
+import recursion_core.subscription_routes.policy as route_policy
 from recursion_core.subscription_routes import (
     HERMES_ADOPT_EXTERNAL_LOGINS,
     OwnLoopRouteRefused,
@@ -404,41 +405,174 @@ class SubscriptionRobustness(unittest.TestCase):
         self.assertEqual("C", decision.child_env["LANG"])
 
     def test_login_probe_does_not_share_the_process_environment(self) -> None:
-        started = self.root / "probe-started"
-        release = self.root / "probe-release"
-        seen = self.root / "probe-mark"
+        # Another live thread makes fork unsafe: the child would copy one thread and could
+        # deadlock on a lock the other thread holds. Refuse before fork, and leave this
+        # process's environment untouched.
+        environ = {"MARK": "original"}
+        forks: list[int] = []
+        real_fork = os.fork
+
+        def tracking_fork() -> int:
+            pid = real_fork()
+            if pid > 0:
+                forks.append(pid)
+            return pid
+
+        gate = threading.Event()
+
+        def hold() -> None:
+            gate.wait(2)
+
+        thread = threading.Thread(target=hold)
+        thread.start()
+        try:
+            with mock.patch.object(own_loop.os, "environ", environ), mock.patch.object(
+                own_loop.os, "fork", tracking_fork
+            ):
+                with self.assertRaises(OwnLoopRouteRefused) as caught:
+                    own_loop._probe_in_screened_env(lambda: True, {"MARK": "probe"})
+                self.assertEqual("copilot_login_unknown", caught.exception.cause)
+                self.assertEqual("probe threaded", caught.exception.detail)
+                self.assertEqual([], forks)
+                self.assertEqual("original", own_loop.os.environ["MARK"])
+                own_loop.os.environ["MARK"] = "concurrent"
+                self.assertEqual("concurrent", own_loop.os.environ["MARK"])
+        finally:
+            gate.set()
+            thread.join(2)
+            for pid in forks:
+                try:
+                    os.kill(pid, 9)
+                except OSError:
+                    pass
+                try:
+                    os.waitpid(pid, 0)
+                except ChildProcessError:
+                    pass
+
+    def test_login_probe_hang_is_killed_at_the_deadline(self) -> None:
+        child_pid = self.root / "hung-pid"
 
         def probe() -> bool:
-            started.write_text("1", encoding="ascii")
-            deadline = time.monotonic() + 2
-            while not release.exists():
-                if time.monotonic() > deadline:
-                    return False
-                time.sleep(0.01)
-            seen.write_text(own_loop.os.environ.get("MARK", ""), encoding="ascii")
+            child_pid.write_text(str(os.getpid()), encoding="ascii")
+            time.sleep(2)
             return True
 
-        environ = {"MARK": "original"}
-        with mock.patch.object(own_loop.os, "environ", environ):
-            holder: dict[str, bool] = {}
+        started = time.monotonic()
+        try:
+            with mock.patch.object(own_loop, "_PROBE_DEADLINE_S", 0.2, create=True):
+                with self.assertRaises(OwnLoopRouteRefused) as caught:
+                    own_loop._probe_in_screened_env(probe, {"PATH": "/usr/bin"})
+            self.assertEqual("copilot_login_unknown", caught.exception.cause)
+            self.assertEqual("probe timed out", caught.exception.detail)
+            self.assertLess(time.monotonic() - started, 1.0)
+            pid = int(child_pid.read_text(encoding="ascii"))
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+        finally:
+            if child_pid.exists():
+                try:
+                    os.kill(int(child_pid.read_text(encoding="ascii")), 9)
+                except (OSError, ValueError):
+                    pass
 
-            def run() -> None:
-                holder["ok"] = own_loop._probe_in_screened_env(probe, {"MARK": "probe"})
+    def test_login_probe_interrupt_kills_the_child(self) -> None:
+        def slow() -> bool:
+            time.sleep(2)
+            return True
 
-            thread = threading.Thread(target=run)
-            thread.start()
-            deadline = time.monotonic() + 2
-            while not started.exists() and time.monotonic() < deadline:
-                time.sleep(0.01)
-            self.assertTrue(started.exists())
-            self.assertEqual("original", own_loop.os.environ["MARK"])
-            own_loop.os.environ["MARK"] = "concurrent"
-            release.write_text("go", encoding="ascii")
-            thread.join(2)
-            self.assertFalse(thread.is_alive())
-            self.assertEqual("concurrent", own_loop.os.environ["MARK"])
-            self.assertEqual("probe", seen.read_text(encoding="ascii"))
-            self.assertTrue(holder["ok"])
+        def interrupt(_fd: int, _limit: int) -> bytes:
+            raise KeyboardInterrupt
+
+        started = time.monotonic()
+        with mock.patch.object(own_loop, "_read_all", interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                own_loop._probe_in_screened_env(slow, {"PATH": "/usr/bin"})
+        self.assertLess(time.monotonic() - started, 0.8)
+
+    def test_probe_system_exit_is_a_typed_refusal(self) -> None:
+        def exited() -> bool:
+            sys.exit(1)
+
+        class SystemExit(Exception):
+            pass
+
+        def named() -> bool:
+            raise SystemExit("no")
+
+        def interrupted() -> bool:
+            raise KeyboardInterrupt
+
+        route = {"engine": "copilot", "auth": "subscription", "method": "copilot_cli_sign_in"}
+        parent = {"PATH": "/usr/bin", "HOME": str(self.home)}
+        for probe in (exited, named):
+            with self.assertRaises(OwnLoopRouteRefused) as caught:
+                check_copilot_own_loop(route, parent, has_copilot_login=probe)
+            self.assertEqual("copilot_login_unknown", caught.exception.cause)
+            self.assertEqual("SystemExit", caught.exception.detail)
+        with self.assertRaises(OwnLoopRouteRefused) as caught:
+            check_copilot_own_loop(route, parent, has_copilot_login=interrupted)
+        self.assertEqual("KeyboardInterrupt", caught.exception.detail)
+
+    def test_login_probe_closes_fds_when_close_is_interrupted(self) -> None:
+        opened: list[tuple[int, int]] = []
+        children: list[int] = []
+        real_pipe = os.pipe
+        real_fork = os.fork
+
+        def tracking_pipe() -> tuple[int, int]:
+            pair = real_pipe()
+            opened.append(pair)
+            return pair
+
+        def tracking_fork() -> int:
+            pid = real_fork()
+            if pid > 0:
+                children.append(pid)
+            return pid
+
+        def interrupting_close(_fd: int) -> None:
+            raise KeyboardInterrupt
+
+        try:
+            with mock.patch.object(own_loop.os, "pipe", tracking_pipe), mock.patch.object(
+                own_loop.os, "fork", tracking_fork
+            ), mock.patch.object(own_loop.os, "close", interrupting_close):
+                with self.assertRaises(KeyboardInterrupt):
+                    own_loop._probe_in_screened_env(lambda: True, {"PATH": "/usr/bin"})
+            for read_fd, _write_fd in opened:
+                with self.assertRaises(OSError):
+                    os.fstat(read_fd)
+            for pid in children:
+                try:
+                    reaped, _status = os.waitpid(pid, os.WNOHANG)
+                except ChildProcessError:
+                    continue
+                self.fail(f"probe child {pid} was not reaped (waitpid returned {reaped})")
+        finally:
+            for read_fd, write_fd in opened:
+                for fd in (read_fd, write_fd):
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+            for pid in children:
+                try:
+                    os.kill(pid, 9)
+                except OSError:
+                    pass
+                try:
+                    os.waitpid(pid, 0)
+                except ChildProcessError:
+                    pass
+
+    def test_child_env_rejects_equals_and_empty_names(self) -> None:
+        for name in ("BAD=NAME", ""):
+            with self.assertRaises(SubscriptionRouteRefused) as caught:
+                route_policy._copy_child_env("opencode", {name: "val"})
+            self.assertEqual("child_env_malformed", caught.exception.cause)
+            self.assertNotIn("BAD=NAME", str(caught.exception))
+            self.assertNotIn("val", str(caught.exception))
 
     def test_cwd_path_and_bytes_are_screened(self) -> None:
         base = dict(

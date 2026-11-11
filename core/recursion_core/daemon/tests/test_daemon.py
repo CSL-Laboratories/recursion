@@ -3,8 +3,6 @@ import errno
 import multiprocessing
 import os
 from pathlib import Path
-import stat
-from types import SimpleNamespace
 import signal
 import sqlite3
 import subprocess
@@ -1095,72 +1093,86 @@ class SystemdManagerTests(unittest.TestCase):
             self.assertFalse(self.manager.processes_gone('a'))
 
     def test_wide_cgroup_listing_stops_before_read_and_stat(self):
-        # Real _cgroup_children, against a fake directory. No host cgroup files.
+        # Real os.scandir on a temp directory, not a host cgroup. The wrapper
+        # counts DirEntries the walk actually pulls from that iterator.
         group = '/user.slice/a.service'
         self.events(group, 0)
-        (self.root / group.lstrip('/') / 'cgroup.procs').write_text('')
         root = self.root / group.lstrip('/')
-        real_lstat = Path.lstat
+        (root / 'cgroup.procs').write_text('')
+        with os.scandir(root) as scan:
+            existing = sum(1 for _ in scan)
+        budget_entries = CGROUP_WALK_MAX_NODES - 1
 
-        def listing(count, produced, stated):
-            def entries(path):
-                # An empty listing for every path except the root. Do not call
-                # Path.iterdir here: 3.12's is lazy, so returning it just ends
-                # this generator, but 3.13 lists immediately and raises
-                # FileNotFoundError for a fake child that was never created.
-                if path != root:
-                    return
-                for i in range(count):
-                    produced.append(path / str(i))
-                    yield path / str(i)
+        def add_files(count, prefix):
+            for i in range(count):
+                fd = os.open(root / f'{prefix}{i}', os.O_CREAT | os.O_WRONLY, 0o600)
+                os.close(fd)
 
-            def info(path):
-                if path != root and not (path.parent == root and path.name.isdigit()):
-                    return real_lstat(path)
-                stated.append(path)
-                inode = 1 if path == root else int(path.name) + 2
-                return SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_dev=1, st_ino=inode)
+        add_files(budget_entries - existing, 'e')
+        self.assertEqual(sum(1 for _ in os.scandir(root)), budget_entries)
+        real_scandir = os.scandir
+        real_listdir = os.listdir
+        pulled = []
+        listdir_calls = []
 
-            return entries, info
+        def counting_scandir(path):
+            iterator = real_scandir(path)
+
+            class Wrap:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    self.close()
+                    return False
+
+                def __iter__(self):
+                    return self
+
+                def __next__(self):
+                    item = next(iterator)
+                    pulled.append(item.name)
+                    return item
+
+                def close(self):
+                    iterator.close()
+
+            return Wrap()
+
+        def counting_listdir(path):
+            listdir_calls.append(path)
+            return real_listdir(path)
 
         show = (
             'LoadState=loaded\nActiveState=inactive\nSubState=dead\n'
             f'ControlGroup={group}\nMainPID=0\n'
             'InvocationID=0b5a2f3c9d8e4f60a1b2c3d4e5f60718\n'
             'ExecMainStartTimestampMonotonic=81234567\n')
-
-        def bounded(before, after):
-            self.assertLessEqual(after - before, CGROUP_WALK_MAX_NODES + 1)
-
-        # The root takes one slot. Exactly the remaining slots, each an empty
-        # child directory, is a finished walk.
-        produced, stated = [], []
-        entries, info = listing(CGROUP_WALK_MAX_NODES - 1, produced, stated)
         self.manager._call = Mock(return_value=show)
-        with patch.object(Path, 'iterdir', entries), \
-             patch.object(Path, 'lstat', info), \
+        with patch.object(os, 'scandir', counting_scandir), \
+             patch.object(os, 'listdir', counting_listdir), \
              patch.object(self.manager, '_read_level', return_value=([], False)):
+            # The root already took one slot. Exactly the remaining entries
+            # is a finished walk, and every name is pulled.
             self.assertEqual(self.manager._subtree(root), ([], False))
-            self.assertEqual(len(produced), CGROUP_WALK_MAX_NODES - 1)
+            self.assertEqual(len(pulled), budget_entries)
+            before = len(pulled)
             self.assertEqual(self.manager.observe('a'), 'empty')
-        # One past the budget is unknown, and that extra name is not stat'd.
-        produced, stated = [], []
-        entries, info = listing(3 * CGROUP_WALK_MAX_NODES, produced, stated)
-        self.manager._call = Mock(return_value=show)
-        with patch.object(Path, 'iterdir', entries), \
-             patch.object(Path, 'lstat', info), \
-             patch.object(self.manager, '_read_level', return_value=([], False)):
-            before = len(produced)
+            self.assertEqual(len(pulled) - before, budget_entries)
+            # One past the budget is unknown. The extra name is peeked and
+            # the iterator is closed before the rest of the directory is read.
+            add_files(3 * CGROUP_WALK_MAX_NODES, 'w')
+            before = len(pulled)
             self.assertIsNone(self.manager._subtree(root))
-            bounded(before, len(produced))
-            before = len(produced)
+            self.assertLessEqual(len(pulled) - before, CGROUP_WALK_MAX_NODES + 1)
+            self.assertLess(len(pulled) - before, 3 * CGROUP_WALK_MAX_NODES)
+            before = len(pulled)
             self.assertNotEqual(self.manager.observe('a'), 'empty')
-            bounded(before, len(produced))
-            before = len(produced)
+            self.assertLessEqual(len(pulled) - before, CGROUP_WALK_MAX_NODES + 1)
+            before = len(pulled)
             self.assertFalse(self.manager.processes_gone('a'))
-            bounded(before, len(produced))
-        child_stats = [path for path in stated if path != root]
-        self.assertLess(len(child_stats), len(produced))
+            self.assertLessEqual(len(pulled) - before, CGROUP_WALK_MAX_NODES + 1)
+        self.assertEqual(listdir_calls, [])
 
     def test_populated_one_active_is_running(self):
         self.events('/user.slice/a.service', 1)

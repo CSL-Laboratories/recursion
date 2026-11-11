@@ -11,9 +11,21 @@ Methods and typed result codes::
                                                                 | start_unconfirmed | registry_unavailable
     run.status {"run_id"}                                    -> ok | run_unknown | request_invalid
                                                                 | registry_unavailable
-    run.list   {}                                            -> ok | registry_unavailable
+    run.list   {"limit"?, "after"?}                          -> ok | request_invalid | registry_unavailable
     run.stop   {"run_id"}                                    -> stopped | pending | run_unknown | request_invalid
                                                                 | registry_unavailable
+
+``run.list`` pages (ADV1-5; PRODUCT.md d84cdd26, CSLR-D-012, section 3.6: the CLI, TUI and GUI are clients
+of the same control API). Runs are listed in ``run_id`` order. ``limit`` (an int, 1 to ``LIST_LIMIT_MAX``)
+caps the page; ``after`` (a ``run_id`` from an earlier answer) starts the page after that run. A page that
+stops before the last run carries ``next_after`` (the last listed ``run_id``); the last page has none.
+``limit`` that is not an int in range answers ``request_invalid`` / ``limit``; ``after`` that is not a
+non-empty string answers ``request_invalid`` / ``after``, and one that names no listed run answers
+``request_invalid`` / ``after_unknown`` (records are never deleted, so a cursor from an earlier page always
+names a run; an unknown one is refused, never answered with an empty page). With neither parameter the
+answer is every run, as before; a surface that cuts the page to fit its transport adds ``next_after``
+itself (``daemon.control_adapter``). ``tui.protocol.list_all_runs`` follows ``next_after`` for the CLI
+and the TUI.
 
 A registry error never escapes ``call``: a read or a start that cannot reach the registry answers
 ``registry_unavailable`` and launches nothing. Once the cleanup layer has answered, Stop returns that
@@ -78,6 +90,7 @@ CODES = frozenset({STARTED, OK, STOPPED, PENDING, RUN_UNKNOWN, REQUEST_INVALID, 
                    START_UNCONFIRMED, REGISTRY_UNAVAILABLE})
 SUCCESS_CODES = frozenset({STARTED, OK, STOPPED})
 _PENDING_REASON = {POPULATED: "cgroup_populated", TIMEOUT: "confirm_timeout"}
+LIST_LIMIT_MAX = 1000  # the most runs one run.list page may ask for
 
 # starter(params) -> {"cgroup"}: the daemon's launch path (route service + cgroup leaf), injected. params
 # carries the API-chosen "run_id", which the starter must launch under.
@@ -128,7 +141,7 @@ class ControlAPI:
 
     def _call(self, method: str, params: dict) -> dict:
         if method == "run.list":
-            return self.list_runs()
+            return self.list_runs(params)
         if method == "run.start":
             return self.start(params)
         handler = {"run.status": self.status, "run.stop": self.stop}.get(method)
@@ -146,8 +159,23 @@ class ControlAPI:
             return {"code": RUN_UNKNOWN, "run_id": run_id}
         return {"code": OK, "run": rec}
 
-    def list_runs(self) -> dict:
-        return {"code": OK, "runs": self._reg("list")}
+    def list_runs(self, params: Mapping | None = None) -> dict:
+        params = params or {}
+        limit, after = params.get("limit"), params.get("after")
+        if limit is not None and (type(limit) is not int or not 1 <= limit <= LIST_LIMIT_MAX):
+            return {"code": REQUEST_INVALID, "detail": "limit"}
+        if after is not None and (not isinstance(after, str) or not after):
+            return {"code": REQUEST_INVALID, "detail": "after"}
+        runs = self._reg("list")
+        if after is not None:
+            at = next((i for i, rec in enumerate(runs) if rec.get("run_id") == after), None)
+            if at is None:
+                return {"code": REQUEST_INVALID, "detail": "after_unknown"}
+            runs = runs[at + 1:]
+        if limit is not None and len(runs) > limit:
+            runs = runs[:limit]
+            return {"code": OK, "runs": runs, "next_after": runs[-1]["run_id"]}
+        return {"code": OK, "runs": runs}
 
     # -- start --------------------------------------------------------------------------------
     def start(self, params: Mapping) -> dict:

@@ -9,6 +9,10 @@ same labels and words as the TUI (``REFUSED``, ``UNCERTAIN``, ``STALE``, ``UNREC
 ``UNAVAILABLE``): ``{"code": ..., "conditions": [{"label": ..., "text": ...}]}``. It adds no control API
 method; the TUI has the same command.
 
+``list`` and ``conditions`` follow ``run.list``'s ``next_after`` until the last page
+(``tui.protocol.list_all_runs``), so every run is read even when the daemon pages the list to fit its frame
+(ADV1-5). A list that fits one page prints exactly what the daemon answered.
+
 Exit codes: 0 ok/started/stopped, 3 pending (stop not confirmed), 4 run_unknown, 1 other API error,
 2 usage error.
 """
@@ -21,7 +25,7 @@ import sys
 from collections.abc import Callable
 from typing import TextIO
 
-from recursion_core.tui.protocol import answer_conditions
+from recursion_core.tui.protocol import answer_conditions, list_all_runs
 
 EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_PENDING, EXIT_UNKNOWN = 0, 1, 2, 3, 4
 _EXIT = {"ok": EXIT_OK, "started": EXIT_OK, "stopped": EXIT_OK, "pending": EXIT_PENDING, "run_unknown": EXIT_UNKNOWN}
@@ -61,13 +65,15 @@ def main(argv: list[str], api, out: TextIO | None = None, err: TextIO | None = N
         print(f"usage error: {exc}", file=err)
         return EXIT_USAGE
     if ns.command == "conditions":  # no state between invocations, so read the list, then show its conditions
-        result = api.call("run.list", {})
+        result = list_all_runs(api.call)
         shown = [{"label": label, "text": text} for label, text in answer_conditions(result)]
         print(json.dumps({"code": result.get("code"), "conditions": shown}, sort_keys=True), file=out)
         return _EXIT.get(result.get("code"), EXIT_ERROR)
     if ns.command == "list":
-        method, params = "run.list", {}
-    elif ns.command in ("status", "stop"):
+        result = list_all_runs(api.call)
+        print(json.dumps(result, sort_keys=True), file=out)
+        return _EXIT.get(result.get("code"), EXIT_ERROR)
+    if ns.command in ("status", "stop"):
         method, params = f"run.{ns.command}", {"run_id": ns.run_id}
     else:
         method = "run.start"

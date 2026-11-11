@@ -56,6 +56,27 @@ recorded on F60, CSL-762).
   return every tenant's records, and `run.stop` stops any run by id, whoever asks. Tenant is only a
   namespace for `client_key`, not an access boundary. Caller scopes (11.8 / D3) are not built here.
 - Reads (`run.status`, `run.list`) return copies, change no state and never call the cleanup layer.
+- **`run.list` paging (ADV1-5).** Spec: PRODUCT.md d84cdd26 (CSLR-D-012), section 3.6 (the TUI is a
+  client of the same control API as the CLI and GUI, and anything the TUI can do the CLI can do).
+  Records are never pruned, so a full list can outgrow the socket's 1 MiB frame (about 1075 runs).
+  `run.list` takes two optional params, both additive:
+
+  | Param | Value | Refusal |
+  |---|---|---|
+  | `limit` | int, 1 to `LIST_LIMIT_MAX` (1000) | `request_invalid` / `limit` |
+  | `after` | a `run_id` from an earlier page | `request_invalid` / `after` (not a non-empty string), `request_invalid` / `after_unknown` (names no run) |
+
+  Runs are listed in `run_id` order, each entry exactly as before. A page that stops before the last
+  run answers `{"code": "ok", "runs": [...], "next_after": "<last run_id on the page>"}`; the last page
+  has no `next_after`. `after` set to the last run is a valid cursor and answers an empty last page;
+  an unknown cursor is refused, never answered with an empty page. With no params the API lists every
+  run; the daemon cuts that list to what one frame carries and adds `next_after` itself (see the
+  daemon README). A no-param list that fits is the same reply, byte for byte, as before.
+  `tui.protocol.list_all_runs` follows `next_after` for the CLI and TUI: it joins the pages, returns a
+  one-page answer unchanged, and answers `list_incomplete` (with a `detail`) when a cursor is not the
+  page's last run or does not move forward, a run is listed twice, or the walk passes 100 000 pages.
+  A failed later page is returned as it came. A run started during a walk whose id sorts before the
+  cursor is read on the next walk.
 - `registry.py`: the `RunRegistry` (`get`, `list`, `put`, `find_start`) and `KillTree` interfaces, plus an
   in-memory registry for tests. `find_start` is an indexed lookup. If more than one record carries the
   same `(tenant, client_key)`, the first one stored is the one returned; changing that record's key
@@ -79,13 +100,18 @@ recorded on F60, CSL-762).
   3 (pending), 4 (run_unknown), 1 (other error) or 2 (usage). It imports no `os`, `signal` or
   `subprocess`. `recursion-control conditions` (CSL-799) reads `run.list` and prints the conditions it
   exposes with the TUI's labels and words (`{"code": ..., "conditions": [{"label", "text"}]}`); the TUI
-  has the same command, and no control API method was added.
+  has the same command, and no control API method was added. `list` and `conditions` read every
+  `run.list` page (`list_all_runs`) and print one joined answer; a list that fits one page prints as
+  before.
 - `mcp_tools.py`: Control MCP tool descriptors with every annotation set explicitly, and `call_tool`,
   which forwards to the control API:
 
   | Tool | readOnlyHint | destructiveHint | idempotentHint | openWorldHint |
   |---|---|---|---|---|
   | `recursion_run_list`, `recursion_run_status` | true | false | true | false |
+
+  `recursion_run_list` takes the optional `limit` and `after` (paging above); the other tools' input
+  schemas are unchanged.
   | `recursion_run_stop` | false | true | true | false |
   | `recursion_run_start` | false | false | false | true |
 

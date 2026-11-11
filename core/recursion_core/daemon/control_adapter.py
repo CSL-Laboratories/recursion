@@ -18,7 +18,9 @@ What a surface reads is the stored record plus what the daemon last observed of 
 the route result once there is one (``result``). The control record's vocabulary has no word for a run that ended on its own
 or was lost at a reboot, so an answer shows ``state: "ended"`` or ``"lost_reboot"`` for such a
 run (``"unknown"`` when the unit could not be observed) and keeps the stored word in
-``recorded_state``. Reads never write.
+``recorded_state``. Reads never write. ``run.list`` is cut to what one socket frame carries, with
+``next_after`` naming the last run sent (ADV1-5; PRODUCT.md d84cdd26, CSLR-D-012, section 3.6: every
+surface is a client of the same control API); a list that fits is answered as it always was.
 
 Reads beyond the run records: ``route.list`` is the route inventory (the engines this daemon
 has adapters for, with what ``routes.json`` configured, the breaker's view of each connection,
@@ -52,6 +54,7 @@ from recursion_core.control.api import ControlAPI
 from recursion_core.control.client import socket_directory
 from recursion_core.control.registry import InMemoryRunRegistry, StaleGeneration
 from recursion_core.control_transport import UnixControlServer, with_ping_health
+from recursion_core.control_transport.framing import MAX_FRAME_BYTES
 from recursion_core.gui.client import ControlClient
 from recursion_core.plugin_security import Refused
 from recursion_core.routes import ClaudeCodeAdapter, CodexAdapter, ConnectionBreaker, RouteService
@@ -78,6 +81,15 @@ NO_BAR_EVIDENCE = 'no bar evidence is recorded by the daemon'
 STOP_RETRY_BASE_S, STOP_RETRY_MAX_S = 30.0, 600.0
 # Socket connections kept for run.stop when every ordinary one is taken (ADV1-4).
 STOP_RESERVED_CONNECTIONS = 4
+# The most bytes a run.list answer may take: the socket's frame, less room for the reply envelope
+# ({"ok":true,"result":...} and next_after). The request's own "id" is counted per call (ADV1-5).
+LIST_ENVELOPE_BYTES = 4096
+LIST_REPLY_BYTES = MAX_FRAME_BYTES - LIST_ENVELOPE_BYTES
+
+
+def _wire_size(value):
+    """Bytes ``value`` takes in a control frame (``framing.encode_frame``'s JSON settings)."""
+    return len(json.dumps(value, separators=(',', ':'), ensure_ascii=False, default=str).encode('utf-8'))
 
 
 # -- registry ------------------------------------------------------------------------------------
@@ -315,8 +327,9 @@ class DaemonControl:
     """``call(method, params) -> dict`` for the socket, the CLI and the GUI."""
 
     def __init__(self, api, registry, daemon, starter, state_dir, *, routes=None, plugins=None, breaker=None,
-                 breaker_store='not composed'):
+                 breaker_store='not composed', list_reply_bytes=LIST_REPLY_BYTES):
         self.api, self.registry, self.daemon, self.starter = api, registry, daemon, starter
+        self._list_reply_bytes = list_reply_bytes
         self._state = Path(state_dir)
         self._routes, self.plugins, self._breaker = dict(routes or {}), plugins, breaker
         self._breaker_store = breaker_store
@@ -326,6 +339,11 @@ class DaemonControl:
 
     # -- calls ---------------------------------------------------------------------------------
     def call(self, method, params=None):
+        return self._answer(method, params, 0)
+
+    def _answer(self, method, params, reserved_bytes):
+        if method == 'run.list':
+            return self._list(params, reserved_bytes)
         if method == 'route.list':
             return {'code': 'ok', 'routes': self.route_records(), 'breaker_store': self._breaker_store}
         if method == 'plugin.list':
@@ -354,6 +372,31 @@ class DaemonControl:
             for run in answer['runs']:
                 if isinstance(run, dict):
                     self._observe(run, full=False)
+        return answer
+
+    def _list(self, params, reserved_bytes):
+        """``run.list``, cut to what one control frame can carry (ADV1-5).
+
+        The API answers the page asked for (``limit`` / ``after``). Each run is observed as before and
+        kept while the answer still fits ``list_reply_bytes`` less ``reserved_bytes``; the first run that
+        would not fit ends the page, and ``next_after`` names the last run kept. An answer that fits is
+        returned unchanged, so a no-parameter list below the frame is what it was. A single run that
+        does not fit alone is still sent: the transport answers ``response_too_large``, never a page
+        that leaves the run out.
+        """
+        answer = self.api.call('run.list', dict(params or {}))
+        runs = answer.get('runs')
+        if answer.get('code') != 'ok' or not isinstance(runs, list):
+            return answer
+        budget = self._list_reply_bytes - reserved_bytes
+        used = _wire_size({k: v for k, v in answer.items() if k != 'next_after'} | {'runs': []})
+        for i, run in enumerate(runs):
+            if isinstance(run, dict):
+                self._observe(run, full=False)
+            used += _wire_size(run) + (1 if i else 0)
+            if used > budget and i:
+                kept = runs[:i]
+                return {**answer, 'runs': kept, 'next_after': kept[-1]['run_id']}
         return answer
 
     def route_records(self):
@@ -542,7 +585,9 @@ class DaemonControl:
             # scopes exist (D3), a peer inside a run unit, or one whose cgroup cannot be read, gets
             # no control at all.
             return {'ok': False, 'error': {'code': 'scope_refused', 'detail': 'peer is inside a run unit'}}
-        return {'ok': True, 'result': self.call(method, params)}
+        # The transport echoes the request's "id" in the reply frame; a run.list page leaves room for it.
+        reserved = _wire_size(message['id']) + len(',"id":') if 'id' in message else 0
+        return {'ok': True, 'result': self._answer(method, params, reserved)}
 
     # -- GUI -----------------------------------------------------------------------------------
     def gui_transport(self, method, path, body):

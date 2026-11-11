@@ -136,6 +136,7 @@ class SubscriptionRouteReuseTest(unittest.TestCase):
         env = self.launcher.calls[0]["env"]
         self.assertEqual(env, {"PATH": "/usr/bin", "HOME": self.home, "ANTHROPIC_API_KEY": "sk-test"})
 
+    @unittest.skipIf(NOT_POSIX, POSIX_ONLY)
     def test_pinned_route_with_a_bare_argv0_refuses_before_launch(self) -> None:
         adapters = profile_adapters(self.launcher, self.clock, lambda cid, name: "sk-test",
                                     {"PATH": "/usr/bin", "HOME": "/home/operator"},

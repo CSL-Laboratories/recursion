@@ -16,9 +16,11 @@ Each simulation is a child interpreter. Before any ``recursion_core`` import it 
   ``WindowsPath``, which this host cannot build or parses wrongly: a host artifact.
 
 The stdlib modules that pick an implementation at import time are imported first, as this host has
-them. Three things run that way: test_child_env.py, each package's test_windows_refusal.py (whose
-``WindowsRefusalTests`` otherwise run only on a real Windows host), and an import of every core
-test module.
+them. Four things run that way: test_child_env.py, each package's test_windows_refusal.py (whose
+``WindowsRefusalTests`` otherwise run only on a real Windows host), an import of every core test
+module, and a run of every other core test file (the hosted windows job stops at the first failing
+file, so it never reached them). ``HOST_LIMITED`` names the few cases this host cannot run as
+Windows would.
 
 Limits: path syntax, file modes, links, sockets, signals and process handling stay POSIX. This
 checks what the code decides from ``os.name``, the ``os`` names present and the importable modules;
@@ -53,6 +55,18 @@ CORE = HERE.parents[2]
 TARGET = HERE / "test_child_env.py"
 REFUSAL_AREAS = ("cgroup_leaf", "child_env", "control", "control_transport", "daemon", "routes", "subscription_routes",
                  "tui")
+# Cases where this host's standard library, not the code under test, decides the outcome under the simulation.
+# Excused by exact test name; any other error or failure in those files still fails.
+HOST_LIMITED = {
+    "recursion_core/control_transport/tests/test_transport.py": {
+        "FrameDeadlineTests.test_read_frame_deadline_bounds_the_whole_frame_not_each_recv":
+            "this host's socket.socketpair() is the POSIX one and needs AF_UNIX; Windows' builds a loopback pair",
+    },
+    "recursion_core/plugin_security/tests/test_authority.py": {
+        "AuthorityTests.test_process_concurrency_never_overspends":
+            "multiprocessing picks its Windows backend (_winapi) from sys.platform, which this host lacks",
+    },
+}
 _FRAME = re.compile(r'^\s*File "(?P<file>[^"]+)", line (?P<line>\d+), in (?P<func>\S+)', re.MULTILINE)
 
 
@@ -135,11 +149,14 @@ def _load(path: str, name: str):
 
 
 def _run_file(path: str) -> dict:
+    import importlib
+
     suite = unittest.defaultTestLoader.loadTestsFromModule(_load(path, "simulated_windows_target"))
     result = unittest.TextTestRunner(stream=sys.stderr, verbosity=2).run(suite)
     skipped = [(".".join(test.id().split(".")[-2:]), reason) for test, reason in result.skipped]
     return {
-        "package": os.path.dirname(sys.modules["recursion_core"].__file__),  # os.path: Path may be WindowsPath here
+        # os.path: Path may be WindowsPath here. import_module: a test may have dropped the package from sys.modules.
+        "package": os.path.dirname(importlib.import_module("recursion_core").__file__),
         "run": result.testsRun,
         "errors": [_describe(test, text) for test, text in result.errors],
         "failures": [_describe(test, text) for test, text in result.failures],
@@ -231,6 +248,19 @@ class SimulatedWindowsTests(unittest.TestCase):
                 self._assert_clean(result)
                 self.assertGreater(result["run"], 0)
                 self.assertEqual([], result["skipped_tests"])
+
+    def test_the_other_core_suites_have_no_error_or_failure_on_simulated_windows(self) -> None:
+        others = sorted(path for path in CORE.glob("recursion_core/*/tests/test_*.py")
+                        if path.parent != HERE and path.name != "test_windows_refusal.py")
+        self.assertGreater(len(others), len(REFUSAL_AREAS))
+        self.assertLessEqual(set(HOST_LIMITED), {path.relative_to(CORE).as_posix() for path in others})
+        for path in others:
+            suite = path.relative_to(CORE).as_posix()
+            with self.subTest(suite=suite):
+                result = simulate(str(path))
+                for kind in ("errors", "failures"):
+                    result[kind] = [row for row in result[kind] if row["test"] not in HOST_LIMITED.get(suite, {})]
+                self._assert_clean(result)
 
     def test_every_gated_area_has_a_windows_refusal_file(self) -> None:
         found = sorted(path.parents[1].name for path in CORE.glob("recursion_core/*/tests/test_windows_refusal.py"))

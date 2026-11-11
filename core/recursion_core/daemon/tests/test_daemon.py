@@ -688,6 +688,7 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'no user manager'):
             refuse_engine_user({'RECURSION_ENGINE_USER': 'csl-engine'})
 
+    @unittest.skipIf(NOT_POSIX, LINUX_ONLY)
     def test_main_checks_only_operator_linger(self):
         import recursion_core.daemon.__main__ as entry
         with patch.object(entry, 'require_free_threaded'), \

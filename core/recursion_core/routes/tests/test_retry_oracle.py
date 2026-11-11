@@ -1017,6 +1017,29 @@ class ReviewFollowupTest(unittest.TestCase):
         slashed = c.redact("https://user:dummy/password@example.invalid/hook")
         self.assertNotIn("password", slashed)
         self.assertIn("example.invalid", slashed)
+        unchanged = (
+            "https://example.com:%34%34%33/search?q=user@host",
+            "https://example.com:44%33/search?q=user@host",
+            "https://example.com:\\u0034\\u0034\\u0033/a@b",
+            "https://example.com%3A%34%34%33/search?q=user@host",
+            "https://example.com:%2534%2534%2533/search?q=user@host",
+            "https://example.com:/search?q=user@host",
+            "https://localhost:/files/a@b.txt",
+        )
+        for raw in unchanged:
+            with self.subTest(raw=raw):
+                self.assertEqual(c.redact(raw), raw)
+        kept = (
+            ("https://user:1234%40example.invalid/hook", "1234"),
+            ("https://user:@example.invalid/hook", "user:@"),
+            ("https://user:dummy/password@example.invalid/hook", "dummy/password"),
+            ("https://user:%34%34%34%34@example.invalid/hook", "%34%34%34%34"),
+        )
+        for raw, secret in kept:
+            with self.subTest(raw=raw):
+                redacted = c.redact(raw)
+                self.assertNotIn(secret, redacted)
+                self.assertIn("example.invalid", redacted)
 
     def test_repeated_urls_redact_within_a_second(self) -> None:
         for unit in ("https://a@b ", "https://example.com/docs "):

@@ -348,10 +348,11 @@ _PCT = re.compile(r"%([0-9a-fA-F]{2})")
 
 
 def _port_end(text: str, index: int) -> int | None:
-    """Index of the delimiter after a numeric port, or the text length when the digits run to the end.
+    """Index of the delimiter after a port, or the text length when the digits run to the end.
 
-    ``None`` means this colon is not a port: no digits, or the digits are followed by something
-    other than an end-delimiter (so ``user:8080@host`` is still a password).
+    A port is an end-delimiter immediately, or logical decimal digits (raw or encoded) and then an
+    end-delimiter. ``None`` means this colon is not a port, so ``user:8080@host`` and
+    ``user:%34%34%34%34@host`` stay passwords. ``@`` is not an end-delimiter.
     """
 
     saw_digit = False
@@ -360,14 +361,14 @@ def _port_end(text: str, index: int) -> int | None:
         token = _read_logical(text, index)
         if token is None:
             break
-        char, end, raw, _bad = token
+        char, end, _raw, _bad = token
         if end <= index:
             end = index + 1
-        if raw and char.isdecimal():
+        if char.isdecimal():
             saw_digit = True
             index = end
             continue
-        if saw_digit and char in _END_CHARS:
+        if char in _END_CHARS:
             return index
         return None
     return index if saw_digit else None
@@ -481,8 +482,9 @@ def _authority_userinfo(text: str) -> list[tuple[int, int]]:
     """Userinfo spans from one forward walk. The token reader is the only delimiter table.
 
     Before a colon, any end-delimiter (raw, or ``/`` ``?`` ``#`` and the other host delimiters in
-    any encoding) ends the authority and there is no credential. A colon followed only by digits
-    and then an end-delimiter is a port, so that authority has no credential either. Any other
+    any encoding) ends the authority and there is no credential. A colon followed by an
+    end-delimiter, or by logical decimal digits and then an end-delimiter, is a port, so that
+    authority has no credential either. The digits may be encoded. Any other
     colon opens the password. In the password, only a raw space, tab, CR or LF ends the run; a
     quote, bracket or encoded slash stays inside it. The
     separator is the last ``@`` or ``%40`` before the first end-delimiter that follows a separator.
@@ -512,7 +514,7 @@ def _authority_userinfo(text: str) -> list[tuple[int, int]]:
                 if char in _END_CHARS:
                     break
                 if char == ":":
-                    # ``:443/`` is a port. ``:8080@`` is a numeric password.
+                    # ``:443/`` and ``:/`` are ports. ``:8080@`` is a numeric password.
                     port_at = _port_end(text, end)
                     if port_at is not None:
                         cursor = port_at

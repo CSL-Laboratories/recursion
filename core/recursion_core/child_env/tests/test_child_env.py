@@ -1027,6 +1027,19 @@ class AuthRouteTests(unittest.TestCase):
         self.assertEqual(("NO_PROXY", "no_proxy_engine_host"), refused({"NO_PROXY": ":4000"}, ip))
         self.assertEqual("3999", launched({"NO_PROXY": "3999"}, gateway)["NO_PROXY"])
 
+        # requests 2.34.2 on an IPv6 route: leading-dot hostname:port, and urllib's last-colon split.
+        ipv6 = ChildRoute(api_key=USER_KEY, base_url="https://[2001:db8::1]:8443/v1")
+        loopback = ChildRoute(api_key=USER_KEY, base_url="https://[::1]:8443/")
+        for entry in (".2001:db8::1:8443", "2001:db8::1:8443", "2001:db8:", ".2001:db8::1"):
+            with self.subTest(entry=entry):
+                self.assertEqual("no_proxy_engine_host",
+                                 policy._no_proxy_bypass(entry, ("[2001:db8::1]",), (8443,)))
+                self.assertEqual(("NO_PROXY", "no_proxy_engine_host"), refused({"NO_PROXY": entry}, ipv6))
+        self.assertEqual("no_proxy_engine_host", policy._no_proxy_bypass(":", ("[::1]",), (8443,)))
+        self.assertEqual(("NO_PROXY", "no_proxy_engine_host"), refused({"NO_PROXY": ":"}, loopback))
+        self.assertIsNone(policy._no_proxy_bypass("unrelated.example", ("[2001:db8::1]",), (8443,)))
+        self.assertEqual("unrelated.example", launched({"NO_PROXY": "unrelated.example"}, ipv6)["NO_PROXY"])
+
         # C8. Twelve stars must not backtrack. The host is not a match, and the call returns.
         def _too_slow(signum, frame):
             raise AssertionError("wildcard match exceeded 1s")
@@ -1252,8 +1265,8 @@ class AuthRouteTests(unittest.TestCase):
         # Key custody: the caller fetches the key (OS keyring, or the owner-only file); this package is handed it.
         allowed = {"__future__", "fcntl", "ipaddress", "os", "re", "shutil", "socket", "stat", "subprocess", "tempfile",
                    "threading", "unicodedata", "collections.abc",
-                   "dataclasses", "pathlib", "types", "recursion_core.child_env.policy", "recursion_core.child_env.launch",
-                   "recursion_core.child_env.uts46"}
+                   "dataclasses", "pathlib", "types", "urllib.request", "recursion_core.child_env.policy",
+                   "recursion_core.child_env.launch", "recursion_core.child_env.uts46"}
         for module in (policy, launch):
             tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
             imported = {alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}

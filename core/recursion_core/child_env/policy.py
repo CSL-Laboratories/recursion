@@ -67,6 +67,7 @@ import stat
 import unicodedata
 import tempfile
 import threading
+import urllib.request
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1193,16 +1194,42 @@ def _trailing_dot_host(host: str) -> bool:
 
 
 def _requests_port_suffix(entry: str, hosts: tuple[str, ...], ports: tuple[int, ...]) -> bool:
-    """requests compares the raw entry with both the hostname and ``hostname:port``.
+    """requests 2.34.2 compares the entry with the unbracketed hostname and ``hostname:port``.
 
-    ``:443``, ``443``, ``43`` and ``3`` are suffixes of ``gateway.invalid:443``. This runs
-    before the port is stripped off the entry, which used to delete ``:443`` and then miss
-    the rest.
+    Leading dots are removed first (``.2001:db8::1:8443`` is ``2001:db8::1:8443``). ``:443``,
+    ``443``, ``43`` and ``3`` are suffixes of ``gateway.invalid:443``. This runs before the
+    port is stripped off the entry, which used to delete ``:443`` and then miss the rest.
+    An empty needle after the strip is not a match: ``"".endswith`` is true for every host.
     """
 
+    needles = [entry]
+    stripped = entry.lstrip(".")
+    if stripped and stripped != entry:
+        needles.append(stripped)
     for host, port in zip(hosts, ports):
         bare = _no_proxy_host(host)
-        if bare.endswith(entry) or f"{bare}:{port}".endswith(entry):
+        candidates = (bare, f"{bare}:{port}")
+        if any(candidate.endswith(needle) for needle in needles for candidate in candidates):
+            return True
+    return False
+
+
+def _urllib_no_proxy_bypass(entry: str, hosts: tuple[str, ...]) -> bool:
+    """True when urllib would bypass a proxy for this entry and an unbracketed host.
+
+    requests hands ``parsed.hostname`` (no brackets) to ``proxy_bypass_environment``.
+    That helper splits the host at its last colon, so ``2001:db8::1`` is compared as
+    ``2001:db8:`` and ``::1`` as ``:``. A bare ``*`` is left to the wildcard rule.
+    The call passes the entry in and does not read the environment or the network.
+    """
+
+    if entry == "*":
+        return False
+    for host in hosts:
+        bare = host.lower()
+        if len(bare) >= 2 and bare[0] == "[" and bare[-1] == "]":
+            bare = bare[1:-1]
+        if bare and urllib.request.proxy_bypass_environment(bare, {"no": entry}):
             return True
     return False
 
@@ -1222,8 +1249,11 @@ def _no_proxy_bypass(value: str, hosts: tuple[str, ...], ports: tuple[int, ...] 
     ``/0`` covers every IP of both families. A leading ``*.`` also matches the apex (Undici 7.30.1).
     IDNA2003 and UTS46 (Unicode 15.1.0, nontransitional) spellings are compared. A code point the
     15.1 table does not cover refuses; IDNA2003 is not used in its place. A plain suffix matches
-    without a dot boundary, which is what requests <=2.32.3 does, on the hostname and on
-    ``hostname:port``, before the entry's port is stripped. A non-empty dot-only entry (``.``,
+    without a dot boundary, which is what requests <=2.32.3 does, on the unbracketed hostname
+    and on ``hostname:port``, before the entry's port is stripped. A leading dot is removed
+    first, so ``.2001:db8::1:8443`` matches ``[2001:db8::1]:8443``. urllib's own matcher is
+    applied to that unbracketed host: it splits at the last colon, so ``2001:db8:`` matches
+    ``2001:db8::1`` and ``:`` matches ``::1``. A non-empty dot-only entry (``.``,
     ``.:443``) matches a host that still has its trailing dot; that comparison happens before the
     trailing dot is stripped. A NUL is ``value_malformed``. A CIDR prefix that cannot be read without
     raising is ``no_proxy_malformed``.
@@ -1262,7 +1292,7 @@ def _no_proxy_bypass(value: str, hosts: tuple[str, ...], ports: tuple[int, ...] 
             return "no_proxy_engine_host"
         # requests: hostname.endswith(entry) or (hostname + ":" + port).endswith(entry),
         # on the entry before its port is removed.
-        if _requests_port_suffix(entry, hosts, ports):
+        if _requests_port_suffix(entry, hosts, ports) or _urllib_no_proxy_bypass(entry, hosts):
             return "no_proxy_engine_host"
         entry = _normalize_no_proxy_entry(entry)
         if not entry:

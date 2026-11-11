@@ -85,11 +85,17 @@ _CHARGES_INDEX = "CREATE INDEX IF NOT EXISTS charges_by_profile ON charges (prof
 
 def create_ledger(path: str, anchor_public_key: str) -> None:
     """Installer step: create the ledger bound to one anchor. Refuses if it exists."""
+    from .paths import abandon_store, check_store_path, init_created_store, open_new_store
+    path = check_store_path(path)
     parse_public_key(anchor_public_key)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    os.close(fd)
-    db = sqlite3.connect(path, isolation_level=None)
+    path = open_new_store(path)
     try:
+        db = sqlite3.connect(path, isolation_level=None)
+    except (sqlite3.Error, OSError, UnicodeEncodeError):
+        abandon_store(path)
+        raise Refused("store_path_too_long") from None
+
+    def build() -> None:
         db.execute("PRAGMA journal_mode=WAL")
         db.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
         db.execute("CREATE TABLE profiles (profile_id TEXT PRIMARY KEY, digest TEXT NOT NULL)")
@@ -98,13 +104,15 @@ def create_ledger(path: str, anchor_public_key: str) -> None:
         db.execute(_CHARGES_INDEX)
         db.execute("INSERT INTO meta VALUES ('magic', ?), ('anchor', ?)",
                    (_LEDGER_MAGIC, key_id(anchor_public_key)))
-    finally:
-        db.close()
+
+    init_created_store(path, db, build)
 
 
 class Authority:
     def __init__(self, anchor_public_key: str, ledger_path: str, clock: Callable[[], int],
                  csl_key_ids: frozenset = frozenset()) -> None:
+        from .paths import check_store_path
+        ledger_path = check_store_path(ledger_path)
         parse_public_key(anchor_public_key)
         self._anchor_id = key_id(anchor_public_key)
         if self._anchor_id in csl_key_ids:

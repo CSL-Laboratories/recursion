@@ -23,6 +23,7 @@ import os
 import re
 import sqlite3
 import threading
+import time
 from dataclasses import dataclass, field
 from types import MappingProxyType
 
@@ -114,6 +115,8 @@ def parse_manifest(raw: bytes) -> Manifest:
         raise Refused("manifest_credential_mismatch")
     scripts = _str_list(data["install_scripts"], re.compile(r"[ -~]{1,200}"), "manifest_install_scripts",
                         ordered=False)
+    if any(_script_escapes(script) for script in scripts):
+        raise Refused("manifest_install_scripts")
     return Manifest(data["plugin_id"], data["version"], data["artifact_sha256"], lock, scripts,
                     data["developer_key"], tuple(perms), nets, creds, raw)
 
@@ -121,19 +124,80 @@ def parse_manifest(raw: bytes) -> Manifest:
 _REVOCATION_MAGIC = "csl-revocation-store/v0"
 
 
+def _schema_locked(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "database table is locked" in text or "database schema is locked" in text or text == "database is locked"
+
+
+def _migrate_revoked_generation(db: sqlite3.Connection) -> None:
+    """Add ``generation`` to a revocation store created before that column existed.
+
+    The schema is read inside ``BEGIN IMMEDIATE``, then migrated there. A second
+    opener waits and reads again, so it does not repeat the ``ALTER TABLE``.
+    ``duplicate column name: generation`` means the other opener already added it.
+    """
+    deadline = time.monotonic() + 30.0
+    while True:
+        try:
+            _alter_revoked_generation(db)
+            return
+        except sqlite3.OperationalError as exc:
+            if _schema_locked(exc) and time.monotonic() < deadline:
+                time.sleep(0.01)
+                continue
+            db.close()
+            raise Refused("revocation_store_invalid") from None
+        except sqlite3.DatabaseError:
+            db.close()
+            raise Refused("revocation_store_invalid") from None
+
+
+def _alter_revoked_generation(db: sqlite3.Connection) -> None:
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        columns = [row[1] for row in db.execute("PRAGMA table_info(revoked)")]
+        if "generation" not in columns:
+            try:
+                db.execute(
+                    "ALTER TABLE revoked ADD COLUMN generation INTEGER NOT NULL DEFAULT 1")
+            except sqlite3.DatabaseError as exc:
+                if "duplicate column name: generation" not in str(exc).lower():
+                    raise
+        db.execute("COMMIT")
+    except BaseException:
+        try:
+            db.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+
+
+def _script_escapes(value: str) -> bool:
+    """An install-script name that is absolute or walks out with ``..``."""
+    if os.path.isabs(value) or "\\" in value:
+        return True
+    parts = value.split("/")
+    return not parts or any(part in ("", ".", "..") for part in parts)
+
+
 def create_revocation_store(path: str) -> None:
     """Installer step: create the durable revoked-key store. Refuses if it exists."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    os.close(fd)
-    db = sqlite3.connect(path, isolation_level=None)
+    from .paths import abandon_store, init_created_store, open_new_store
+    path = open_new_store(path)
     try:
+        db = sqlite3.connect(path, isolation_level=None)
+    except (sqlite3.Error, OSError, UnicodeEncodeError):
+        abandon_store(path)
+        raise Refused("store_path_too_long") from None
+
+    def build() -> None:
         db.execute("PRAGMA journal_mode=WAL")
         db.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
         db.execute(
             "CREATE TABLE revoked (key_id TEXT PRIMARY KEY, generation INTEGER NOT NULL)")
         db.execute("INSERT INTO meta VALUES ('magic', ?)", (_REVOCATION_MAGIC,))
-    finally:
-        db.close()
+
+    init_created_store(path, db, build)
 
 
 class TrustStore:
@@ -164,6 +228,12 @@ class TrustStore:
             keys[key_id(hex_key)] = (label, hex_key)
         self._keys = MappingProxyType(keys)
         self._lock = threading.Lock()
+        # Keep the absolute path resolved now. A later chdir must not make a
+        # failed write reopen a different relative ``rev.db``.
+        if revocation_store is not None:
+            from .paths import check_store_path
+            revocation_store = check_store_path(revocation_store)
+        self._store_path = revocation_store
         self._db = None if revocation_store is None else self._open_store(revocation_store)
         generations = {}
         if self._db is not None:
@@ -184,6 +254,8 @@ class TrustStore:
 
     @staticmethod
     def _open_store(path: str) -> sqlite3.Connection:
+        from .paths import check_store_path
+        path = check_store_path(path)
         if not os.path.isfile(path):
             raise Refused("revocation_store_missing")
         db = sqlite3.connect(path, isolation_level=None, check_same_thread=False, timeout=30)
@@ -198,14 +270,7 @@ class TrustStore:
         if meta.get("magic") != _REVOCATION_MAGIC:
             db.close()
             raise Refused("revocation_store_invalid")
-        columns = [row[1] for row in db.execute("PRAGMA table_info(revoked)")]
-        if "generation" not in columns:
-            try:
-                db.execute(
-                    "ALTER TABLE revoked ADD COLUMN generation INTEGER NOT NULL DEFAULT 1")
-            except sqlite3.DatabaseError:
-                db.close()
-                raise Refused("revocation_store_invalid") from None
+        _migrate_revoked_generation(db)
         return db
 
     @property
@@ -234,18 +299,54 @@ class TrustStore:
             if self._db is None:
                 raise Refused("revocation_not_durable", kid)
             try:
-                self._db.execute(
-                    "INSERT INTO revoked (key_id, generation) VALUES (?, ?) "
-                    "ON CONFLICT(key_id) DO UPDATE SET generation = excluded.generation",
-                    (kid, generation),
-                )
-                row = self._db.execute(
-                    "SELECT generation FROM revoked WHERE key_id = ?", (kid,)).fetchone()
+                # The stored generation only moves forward. A store opened before a
+                # later revoke still holds the old number in memory; writing that
+                # number would roll the row backward. A failed write leaves memory
+                # ahead of the row, so the next successful write takes the higher of
+                # "one past the row" and the generation this opener already holds.
+                self._db.execute("BEGIN IMMEDIATE")
+                try:
+                    self._db.execute(
+                        "INSERT INTO revoked (key_id, generation) VALUES (?, ?) "
+                        "ON CONFLICT(key_id) DO UPDATE SET "
+                        "generation = MAX(revoked.generation + 1, excluded.generation)",
+                        (kid, generation),
+                    )
+                    row = self._db.execute(
+                        "SELECT generation FROM revoked WHERE key_id = ?", (kid,)).fetchone()
+                    self._db.execute("COMMIT")
+                except BaseException:
+                    try:
+                        self._db.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise
             except sqlite3.Error:
+                self._reopen_store()
                 raise Refused("revocation_not_durable", kid) from None
-            if row is None or row[0] != generation:
+            if row is None or type(row[0]) is not int or row[0] < generation:
                 raise Refused("revocation_not_durable", kid)
-            return generation
+            if row[0] != generation:
+                updated = dict(self._generation)
+                updated[kid] = row[0]
+                self._generation = MappingProxyType(updated)
+                self._revoked = frozenset(updated)
+            return row[0]
+
+    def _reopen_store(self) -> None:
+        """Drop a connection a failed write left unusable and open a fresh one."""
+        db = self._db
+        self._db = None
+        if db is not None:
+            try:
+                db.close()
+            except sqlite3.Error:
+                pass
+        if self._store_path is not None:
+            try:
+                self._db = self._open_store(self._store_path)
+            except (Refused, sqlite3.Error, OSError):
+                self._db = None
 
     def close(self) -> None:
         db = self._db

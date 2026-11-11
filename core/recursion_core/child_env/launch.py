@@ -53,7 +53,10 @@ def spawn(
     kwargs.update(env=child_env, cwd=cwd, close_fds=True, shell=False)
     if os.name != "nt":
         kwargs["start_new_session"] = True
-    return popen([executable, *argv[1:]], **kwargs)
+    try:
+        return popen([executable, *argv[1:]], **kwargs)
+    except UnicodeEncodeError:
+        raise EnvRefused(None, "value_not_encodable") from None
 
 
 def _resolve_executable(name: str, env: ValidatedEnv) -> str:

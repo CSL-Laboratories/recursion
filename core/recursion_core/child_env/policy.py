@@ -379,6 +379,12 @@ def build_child_env(
     if leaked:  # unreachable by construction; kept so a later edit to the allowlist fails closed
         raise EnvRefused(leaked[0], "scrub_failed")
     env.update(route_env)  # last: only what this call's route named, never a parent or override value
+    for name, value in env.items():
+        try:
+            os.fsencode(name)
+            os.fsencode(value)
+        except UnicodeEncodeError:
+            raise EnvRefused(name, "value_not_encodable") from None
     return ValidatedEnv(env, engine, dropped, auth_mode=auth_mode, _seal=ValidatedEnv._seal)
 
 
@@ -548,6 +554,10 @@ def _resolve(path: str) -> tuple[str | None, bool, str | None]:
         return None, False, "value_relative"
     if _PERSPECTIVE.match(path):
         return None, False, "value_perspective"
+    try:
+        os.fsencode(path)
+    except UnicodeEncodeError:
+        return None, False, "value_not_encodable"
     euid, hops = os.geteuid(), 0
     pending = list(reversed(Path(path).parts[1:]))
     current = "/"
@@ -570,6 +580,8 @@ def _resolve(path: str) -> tuple[str | None, bool, str | None]:
         except FileNotFoundError:
             rest = [candidate] + [p for p in reversed(pending)]
             return os.path.join(*rest), True, None
+        except UnicodeEncodeError:
+            return None, False, "value_not_encodable"
         except OSError:
             return None, False, "value_unreadable"
         if not stat.S_ISLNK(st.st_mode):
@@ -687,7 +699,7 @@ def _owned_chain(path: str) -> bool:
                 return False
             if st.st_mode & 0o022 and not (i < len(parts) and st.st_uid == 0 and st.st_mode & stat.S_ISVTX):
                 return False
-    except OSError:
+    except (OSError, UnicodeEncodeError):
         return False
     return True
 
@@ -723,7 +735,7 @@ def _private_dir(path: str | None) -> bool:
         if not stat.S_ISDIR(os.lstat(entry).st_mode):
             return False
         st = os.lstat(real)
-    except OSError:
+    except (OSError, UnicodeEncodeError):
         return False
     # The home is ours and 0700. Its parents follow the chain rule on the resolved path, so an accepted link
     # above it (macOS /var -> private/var) is fine, and a root sticky /tmp above it is fine.
@@ -747,7 +759,7 @@ def _make_route_tmp() -> str:
     for base in _tmp_bases():
         try:
             path = tempfile.mkdtemp(prefix="recursion-child-tmp-", dir=os.path.realpath(base))
-        except OSError:
+        except (OSError, UnicodeEncodeError):
             continue
         if _owned_chain(path):
             return path
@@ -766,7 +778,7 @@ def _route_tmp() -> str:
         path = _TMP.get(key)
         try:
             st = os.lstat(path) if path else None
-        except OSError:
+        except (OSError, UnicodeEncodeError):
             st = None
         if (st is None or not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077
                 or not _owned_chain(path)):

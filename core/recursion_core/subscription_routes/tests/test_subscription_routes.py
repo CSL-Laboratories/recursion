@@ -23,8 +23,10 @@ from recursion_core.subscription_routes import (
     HERMES_ADOPT_EXTERNAL_LOGINS,
     SAFE_ENV,
     SubscriptionRouteRefused,
+    WrapperInstall,
     check_route,
     guard_then_spawn,
+    measure_package_pin,
 )
 
 N = 5
@@ -41,7 +43,14 @@ class _Base(unittest.TestCase):
         self.operator.mkdir(mode=0o700)
         self.home = self.root / "route-home"
         self.home.mkdir(mode=0o700)
+        self.install = self.root / "pkg"
+        self.install.mkdir(mode=0o700)
+        (self.install / "launcher.js").write_text("launcher-v1\n", encoding="ascii")
+        (self.install / "lib.js").write_text("lib-v1\n", encoding="ascii")
+        launcher_path = str(self.install / "launcher.js")
+        self.wrapper = WrapperInstall(launcher_path, str(self.install), measure_package_pin(launcher_path, str(self.install)))
         self.launcher = mock.MagicMock(name="launcher")
+        self.hermes_config = ""
 
     def env(self, **extra: str) -> dict:
         return {"PATH": "/usr/bin:/bin", "HOME": str(self.home), "ANTHROPIC_API_KEY": FAKE_KEY, **extra}
@@ -59,9 +68,28 @@ class _Base(unittest.TestCase):
         # section 2, E9). Added here for Hermes unless a test turns it off to show the refusal.
         if hermes_override and engine == "hermes" and HERMES_ADOPT_EXTERNAL_LOGINS not in profile:
             profile = {**profile, HERMES_ADOPT_EXTERNAL_LOGINS: False}
-        return guard_then_spawn(self.launcher, [engine, "run"], engine, profile, env, route_home=str(self.home),
-                                parent_env=parent if parent is not None else self.parent(),
-                                operator_home=str(self.operator))
+        # Pi and Hermes are pinned: argv[0] must be the pinned launcher path, not a PATH name.
+        argv = [self.wrapper.launcher_path if engine in ("pi", "hermes") else engine, "run"]
+        model = profile.get("model")
+        if isinstance(model, str) and "/" in model and model.split("/", 1)[1].strip():
+            argv.append(model)
+        result = guard_then_spawn(
+            self.launcher, argv, engine, profile, env, route_home=str(self.home),
+            parent_env=parent if parent is not None else self.parent(),
+            operator_home=str(self.operator),
+            wrapper=self.wrapper if engine in ("pi", "hermes") else None,
+        )
+        # guard_then_spawn writes Hermes's adopt switch into the route home. Drop that file so the
+        # next case in this home is not refused for an engine store the test did not create.
+        if engine == "hermes":
+            cfg = self.home / ".hermes" / "config.yaml"
+            if cfg.is_file() and not cfg.is_symlink():
+                self.hermes_config = cfg.read_text(encoding="ascii")
+                cfg.unlink()
+            hermes_dir = self.home / ".hermes"
+            if hermes_dir.is_dir() and not hermes_dir.is_symlink() and not any(hermes_dir.iterdir()):
+                hermes_dir.rmdir()
+        return result
 
     def assertRefusedBeforeSpawn(self, engine: str, profile: dict, env: dict, cause: str, parent: dict | None = None,
                                  hermes_override: bool = True):
@@ -260,6 +288,8 @@ class SelectorAndExtraEnvTests(_Base):
                         target.write_text("{}", encoding="ascii")
                     else:
                         target.mkdir()
+                    if entry == ".hermes":  # an empty .hermes counts as absent on an API-key Hermes route
+                        (target / "sessions").mkdir()
                     with mock.patch("builtins.open", spy), mock.patch("io.open", spy):
                         self.assertRefusedBeforeSpawn(engine, self.profile(), self.env(), "engine_store_in_route_home")
                     shutil.rmtree(self.home / entry.split("/")[0])
@@ -292,8 +322,29 @@ class LaunchOptionTests(_Base):
     def test_the_launcher_gets_exactly_the_checked_env_and_no_shell(self) -> None:
         self.spawn("opencode", self.profile(), self.env())
         args, kwargs = self.launcher.call_args
-        self.assertEqual((["opencode", "run"],), args)
-        self.assertEqual({"env": self.env(), "shell": False}, kwargs)
+        self.assertEqual(["opencode", "run", "anthropic/m"], args[0])
+        self.assertEqual(self.env(), kwargs["env"])
+        self.assertIs(kwargs["shell"], False)
+        self.assertEqual((), kwargs["engine_config"])
+        self.assertEqual("anthropic/m", kwargs["model"])
+
+    def test_a_mutated_child_env_does_not_reach_the_launcher(self) -> None:
+        # Devin r4503131880: a second read of child_env after check_route must not launch a token.
+        class SecondRead(dict):
+            def __iter__(self):
+                if getattr(self, "reads", 0):
+                    self["ANTHROPIC_OAUTH_TOKEN"] = FAKE_OAUTH
+                self.reads = getattr(self, "reads", 0) + 1
+                return super().__iter__()
+
+        env = SecondRead(self.env())
+        self.spawn("opencode", self.profile(), env)
+        self.assertNotIn("ANTHROPIC_OAUTH_TOKEN", self.launcher.call_args.kwargs["env"])
+
+    def test_empty_model_name_refuses(self) -> None:
+        # Devin r4503131575: model="anthropic/" used to pass the provider segment and launch.
+        for model in ("anthropic/", "anthropic/ ", "/m", " /m"):
+            self.assertRefusedBeforeSpawn("pi", self.profile(model=model), self.env(), "model_name_empty")
 
 
 @unittest.skipIf(os.name == "nt", "POSIX home checks")
@@ -330,6 +381,46 @@ class HealthyApiProviderTests(_Base):
         check_route("opencode", self.profile(), self.env(), route_home=str(self.home), parent_env=self.parent(),
                     operator_home=str(self.operator))
         self.launcher.assert_not_called()
+
+    def test_operator_home_of_slash_does_not_refuse_every_route_home(self) -> None:
+        # Devin r4503131647: HOME=/ used to make the prefix "/" match every absolute route home.
+        decision, _ = self.spawn(
+            "opencode", self.profile(), self.env(), parent={"PATH": "/usr/bin:/bin", "HOME": "/"},
+        )
+        # spawn() passes operator_home=self.operator, which is not "/". Call check_route for both.
+        self.assertEqual("opencode", decision.engine)
+        decision = check_route(
+            "opencode", self.profile(), self.env(), route_home=str(self.home),
+            parent_env={"PATH": "/usr/bin:/bin", "HOME": "/"}, operator_home="/",
+        )
+        self.assertEqual("opencode", decision.engine)
+        self.assertFalse(decision.beta)
+
+    def test_missing_pwd_still_reaches_the_platform_guard(self) -> None:
+        # Devin r4503131802: import pwd must not crash before platform_unsupported.
+        import recursion_core.subscription_routes.policy as policy
+
+        with mock.patch.object(policy, "pwd", None):
+            self.assertEqual(["/tmp/op"], policy._operator_homes({"HOME": "/tmp/op"}, None))
+            with mock.patch.object(os, "name", "nt"):
+                with self.assertRaises(SubscriptionRouteRefused) as caught:
+                    check_route(
+                        "opencode", self.profile(), self.env(), route_home=str(self.home),
+                        parent_env=self.parent(), operator_home=str(self.operator),
+                    )
+                self.assertEqual("platform_unsupported", caught.exception.cause)
+
+    def test_pi_and_hermes_are_beta_only_when_the_package_pin_matches(self) -> None:
+        for engine in ("pi", "hermes"):
+            decision, _ = self.spawn(engine, self.profile(), self.env())
+            self.assertTrue(decision.beta)
+            self.launcher.reset_mock()
+        decision, _ = self.spawn("opencode", self.profile(), self.env())
+        self.assertFalse(decision.beta)
+        self.assertEqual("auth:\n  adopt_external_logins: false\n", self.hermes_config)
+        (self.install / "lib.js").write_text("lib-v2\n", encoding="ascii")
+        self.launcher.reset_mock()
+        self.assertRefusedBeforeSpawn("pi", self.profile(), self.env(), "wrapper_pin_mismatch")
 
 
 if __name__ == "__main__":

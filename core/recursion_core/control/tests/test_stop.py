@@ -533,6 +533,19 @@ class RegistryIndexTest(unittest.TestCase):
         reg.put({"run_id": "dup", "tenant": "t", "start_key": {"client_key": "k2"}})
         self.assertEqual(reg.find_start("t", "k2")["run_id"], "r2")  # the first run started with a key wins
 
+    def test_changing_the_indexed_run_keeps_a_duplicate_key_visible(self) -> None:
+        # Bot review 4517642164: dropping the indexed run's key must not hide another run that still has it.
+        reg = InMemoryRunRegistry()
+        reg.put({"run_id": "first", "tenant": "t", "start_key": {"client_key": "k"}})
+        reg.put({"run_id": "second", "tenant": "t", "start_key": {"client_key": "k"}})
+        reg.put({"run_id": "first", "tenant": "t", "start_key": {"client_key": "k"}, "state": "running"})
+        self.assertEqual(reg.find_start("t", "k")["run_id"], "first")  # an update that keeps the key stays first
+        reg.put({"run_id": "first", "tenant": "t", "start_key": None})
+        self.assertEqual(reg.find_start("t", "k")["run_id"], "second")
+        reg.put({"run_id": "second", "tenant": "t", "start_key": {"client_key": "other"}})
+        self.assertIsNone(reg.find_start("t", "k"))
+        self.assertEqual(reg.find_start("t", "other")["run_id"], "second")
+
 class StartConcurrencyTest(unittest.TestCase):
     # t1430u X1c (round-3 follow-up): starts were serialised by one API-wide lock held across the starter,
     # so one hung launch blocked every other start, for every tenant.
@@ -588,6 +601,54 @@ class StartConcurrencyTest(unittest.TestCase):
         self.assertEqual(calls, ["run-1"])
         self.assertEqual(sorted(r["duplicate"] for r in out), [False, True, True, True])
         self.assertEqual({r["run"]["run_id"] for r in out}, {"run-1"})
+
+    def test_unpaired_surrogate_prompt_is_request_invalid(self) -> None:
+        # A JSON prompt of \ud800 is a str that strict UTF-8 refuses. Keyed and
+        # unkeyed starts both answer request_invalid and launch nothing.
+        prompt = json.loads(r'"\ud800"')
+        api, registry, _, starter = make_api()
+        for client_key in (None, "k"):
+            params = {"tenant": "t", "engine": "e", "prompt": prompt}
+            if client_key is not None:
+                params["client_key"] = client_key
+            self.assertEqual(api.call("run.start", params), {"code": a.REQUEST_INVALID, "detail": "prompt"})
+            tool = mcp_tools.call_tool(api, "recursion_run_start", params)
+            self.assertEqual(tool["structuredContent"]["code"], a.REQUEST_INVALID)
+            self.assertTrue(tool["isError"])
+        self.assertEqual(starter.calls, [])
+        self.assertEqual(registry.list(), [])
+        self.assertEqual(api._start_locks, {})
+        ok = api.call("run.start", {"tenant": "t", "engine": "e", "prompt": "p", "client_key": "k"})
+        self.assertEqual(ok["code"], a.STARTED)
+
+    def test_distinct_client_keys_do_not_keep_start_locks(self) -> None:
+        api, _, _, starter = make_api()
+        for i in range(40):
+            res = api.call("run.start", {"tenant": "t", "engine": "e", "prompt": "p", "client_key": f"k{i}"})
+            self.assertEqual(res["code"], a.STARTED)
+        self.assertEqual(len(starter.calls), 40)
+        self.assertEqual(api._start_locks, {})
+
+
+class ShutdownLeakTest(unittest.TestCase):
+    def test_a_stop_record_without_requested_still_sends_cleanup(self) -> None:
+        api, registry, kill, _ = make_api(FakeKillTree([EMPTY]))
+        run = started(api)
+        rec = registry.get(run)
+        rec["stop"] = {"requested_at": 1.0, "checks": 0, "reason": "populated"}
+        registry.put(rec)
+        stopped = api.call("run.stop", {"run_id": run})
+        self.assertEqual(stopped["code"], a.STOPPED)
+        self.assertEqual(kill.requests, ["/sys/fs/cgroup/fake/run-1"])
+
+    def test_run_locks_are_dropped_after_the_call_returns(self) -> None:
+        api, _, _, _ = make_api(FakeKillTree([EMPTY]))
+        run = started(api)
+        self.assertEqual(api._run_locks, {})
+        api.call("run.stop", {"run_id": run})
+        self.assertEqual(api._run_locks, {})
+        api.call("run.status", {"run_id": run})
+        self.assertEqual(api._run_locks, {})
 
 
 if __name__ == "__main__":

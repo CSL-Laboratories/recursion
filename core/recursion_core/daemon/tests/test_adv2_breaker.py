@@ -204,7 +204,6 @@ class Adv2BreakerTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 'breaker_store_invalid')
         self.assertEqual(path.read_bytes()[:16], b'SQLite format 3\x00')
 
-    @unittest.expectedFailure  # ADV2-8: a breaker store path that is a symlink is followed and accepted
     def test_a_store_path_that_is_a_symlink_is_refused(self):
         elsewhere = self.tmp / 'elsewhere'
         elsewhere.mkdir(mode=0o700)
@@ -216,6 +215,25 @@ class Adv2BreakerTests(unittest.TestCase):
         with self.assertRaises((Refused, OSError)):
             stored, _ = daemon_breaker.open_breaker_store(self.tmp, clock=self.clock)
             stored.close()
+
+    def test_symlinked_store_files_and_store_directory_are_refused_typed(self):
+        elsewhere = self.tmp / 'elsewhere'
+        elsewhere.mkdir(mode=0o700)
+        daemon_breaker.create_breaker_store(str(elsewhere / 'empty.sqlite3'))
+        path = daemon_breaker.store_path(self.tmp)
+        path.parent.mkdir(mode=0o700)
+        daemon_breaker.create_breaker_store(str(path))
+        os.symlink(elsewhere / 'other-wal', f'{path}-wal')  # a WAL file elsewhere would redirect writes
+        with self.assertRaises(Refused) as caught:
+            daemon_breaker.open_breaker_store(self.tmp, clock=self.clock)
+        self.assertEqual(caught.exception.code, 'breaker_store_untrusted')
+        os.unlink(f'{path}-wal')
+        os.unlink(path)
+        path.parent.rmdir()
+        os.symlink(elsewhere, path.parent)  # the store's directory itself
+        with self.assertRaises(OSError):
+            daemon_breaker.open_breaker_store(self.tmp, clock=self.clock)
+        self.assertFalse(os.path.lexists(elsewhere / daemon_breaker.STORE_FILE), 'nothing written through the link')
 
     def test_a_deleted_store_is_recreated_and_says_so(self):
         stored = self.store()

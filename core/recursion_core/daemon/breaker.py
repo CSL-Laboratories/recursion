@@ -23,7 +23,8 @@ store's module is only called here, never changed.
   by ``host``: a reserved plugin id, so no plugin's effect can cite an operator's run. A run whose
   route result is an error is recorded as faulted.
 
-The store is ``<state dir>/plugin-security/breaker.sqlite3`` (0600 in a 0700 directory). There is
+The store is ``<state dir>/plugin-security/breaker.sqlite3`` (0600 in a 0700 directory; the file, its
+WAL and shm files and the directory must not be symlinks: ``breaker_store_untrusted``). There is
 no installer yet, so the daemon creates it on first start; a store deleted later is created empty
 again and that is logged, not hidden. A store that exists and cannot be read is not replaced: the
 daemon keeps serving reads and Stop, and refuses every start (``breaker_store_unavailable``).
@@ -34,6 +35,7 @@ import logging
 import os
 from pathlib import Path
 import sqlite3
+import stat
 import threading
 
 from recursion_core.plugin_security import ConnectionBreaker as StoredBreaker
@@ -93,8 +95,27 @@ def open_breaker_store(state_dir, *, clock, probe_lease_seconds=None):
         finally:
             os.close(fd)
         created = True
-    lease_s = STORE_PROBE_LEASE_S if probe_lease_seconds is None else float(probe_lease_seconds)
+    for item in (path, Path(f'{path}-wal'), Path(f'{path}-shm')):
+        _require_own_file(item, required=item == path)
+    lease_s =STORE_PROBE_LEASE_S if probe_lease_seconds is None else float(probe_lease_seconds)
     return StoredBreaker(str(path), clock=clock, probe_lease_seconds=lease_s), created
+
+
+def _require_own_file(path, *, required):
+    """Refuse a store file that is a symlink, not a regular file, or not ours (ADV2-8).
+
+    SQLite opens by path, so a symlink here would silently read another store. ``private_dir``
+    already refuses a symlinked directory. Same-uid code can still swap the file after this check
+    (B17).
+    """
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        if required:
+            raise Refused('breaker_store_missing') from None
+        return
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+        raise Refused('breaker_store_untrusted', f'{path.name} must be an operator-owned regular file, not a symlink')
 
 
 class DurableRouteBreaker:

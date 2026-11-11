@@ -25,7 +25,9 @@ V4_GATEWAY = "http://10.1.2.3:4000"
 V6_GATEWAY = "https://[2001:db8::1]:8443/v1"
 IDN_GATEWAY = "https://xn--bcher-kva.example/api"  # the punycode of "bucher.example" with a u-umlaut
 LOOPBACK = "http://127.0.0.1:4000"
-SECONDS = 2.0
+SECONDS = 10.0  # backstop against blow-ups; growth below is the real check (CI runners are slower than a dev box)
+GROWTH = 3.0  # full input vs half: linear is about 2, quadratic about 4
+GROWTH_FLOOR_S = 0.05  # below this, timer noise dominates the ratio
 
 
 def _home(test: unittest.TestCase) -> str:
@@ -298,24 +300,34 @@ class ReadingTimeTests(unittest.TestCase):
         return refused if refused is not None else policy._no_proxy_route_bypass(value, self.LONG_HOST)
 
     def test_hostile_values_are_decided_in_bounded_time(self) -> None:
+        # Each value is built for a size n; it is timed at n and at n / 2. Growth, not wall time, is what proves
+        # "linear-ish": a CI runner may be several times slower than a dev box, but halving the input must still
+        # roughly halve the time (quadratic gives 4x). SECONDS is only a backstop against blow-ups.
         unit = 100_000
-        for label, value in (
+        for label, make in (
             # A 50,000-character requests join with star-dot tails. Most of its time is the "*" matcher on 12,500
             # entries, as before MEDIUM-2 (1.65 s at 100,000 characters at abb3d75d; 1.88 s now).
-            ("one long spaced item", "*.a " * (unit // 8) + "q"),
-            ("one long space run", "a" + " " * unit + "b"),
-            ("one long BOM run", "a" + "\ufeff" * unit + "b"),  # undici pieces
-            ("BOM and star", "\ufeff*a" * (unit // 3) + "q"),
-            ("fullwidth", "\uff41" * unit + "\uff0eexample"),  # one long IDNA fold
-            ("fullwidth spaced", ("\uff41 " * (unit // 2))),
-            ("dashes", "-" * unit), ("dashes in a range", "10.0.0.0-" + "-" * unit + "10.0.0.1"),
-            ("spaced dashes", "1.0.0.0 - " * (unit // 10)),
-            ("many ranges", ",".join(f"10.{i // 256}.{i % 256}.1-10.{i // 256}.{i % 256}.254" for i in range(4000))),
-            ("mixed", ("\ufeff \uff0e*.\xad-1 0.0.0.0/1 ," * (unit // 20))),
+            ("one long spaced item", lambda n: "*.a " * (n // 8) + "q"),
+            ("one long space run", lambda n: "a" + " " * n + "b"),
+            ("one long BOM run", lambda n: "a" + "\ufeff" * n + "b"),  # undici pieces
+            ("BOM and star", lambda n: "\ufeff*a" * (n // 3) + "q"),
+            ("fullwidth", lambda n: "\uff41" * n + "\uff0eexample"),  # one long IDNA fold
+            ("fullwidth spaced", lambda n: "\uff41 " * (n // 2)),
+            ("dashes", lambda n: "-" * n), ("dashes in a range", lambda n: "10.0.0.0-" + "-" * n + "10.0.0.1"),
+            ("spaced dashes", lambda n: "1.0.0.0 - " * (n // 10)),
+            ("many ranges", lambda n: ",".join(f"10.{i // 256}.{i % 256}.1-10.{i // 256}.{i % 256}.254"
+                                               for i in range(n // 25))),
+            ("mixed", lambda n: "\ufeff \uff0e*.\xad-1 0.0.0.0/1 ," * (n // 20)),
         ):
+            value, half = make(unit), make(unit // 2)
             with self.subTest(label=label, length=len(value)):
-                _, elapsed = self._timed(lambda: self._decide(value))
+                for _ in range(3):  # a noisy pair is measured again, twice at most
+                    _, elapsed = self._timed(lambda: self._decide(value))
+                    _, half_elapsed = self._timed(lambda: self._decide(half))
+                    if elapsed < GROWTH * max(half_elapsed, GROWTH_FLOOR_S):
+                        break
                 self.assertLess(elapsed, SECONDS)
+                self.assertLess(elapsed, GROWTH * max(half_elapsed, GROWTH_FLOOR_S))
 
     def test_ranges_cost_one_interval_each(self) -> None:
         # 4,000 distinct ranges of 62 CIDR blocks each would be 248,000 blocks; as intervals they sweep at once.

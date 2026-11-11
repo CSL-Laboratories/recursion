@@ -413,8 +413,15 @@ class ClientResyncTests(_TmpCase):
             self.assertEqual(fresh.request({"op": "ping", "id": "p2"}), {"ok": True, "op": "pong", "id": "p2"})
 
     def test_reply_with_another_id_is_refused_and_closes_the_client(self) -> None:
-        srv = self.server(lambda message, conn: {"ok": True, "op": "stop", "state": "stopped", "id": "s1"})
-        client = UnixControlClient(srv.path)
+        """A peer that answers with someone else's id is refused, and the client closes.
+
+        The server itself does not emit that reply. This peer does, so the client's
+        check still has something to refuse.
+        """
+        path = self._peer(
+            lambda conn: framing.write_frame(conn, {"ok": True, "op": "stop", "state": "stopped", "id": "s1"})
+        )
+        client = UnixControlClient(path)
         self.addCleanup(client.close)
         with self.assertRaises(ct.FrameError) as caught:
             client.request({"op": "ping", "id": "p1"})
@@ -423,13 +430,35 @@ class ClientResyncTests(_TmpCase):
             client.request({"op": "ping", "id": "p2"})
 
     def test_reply_missing_the_request_id_is_refused(self) -> None:
-        def strip_id(message: dict, conn: ct.Connection) -> dict:
-            return {"ok": True, "op": "pong", "id": None}
-
-        srv = self.server(strip_id)
-        with UnixControlClient(srv.path) as client:
+        path = self._peer(lambda conn: framing.write_frame(conn, {"ok": True, "op": "pong", "id": None}))
+        with UnixControlClient(path) as client:
             with self.assertRaises(ct.FrameError):
                 client.request({"op": "ping", "id": "p1"})
+
+    def _peer(self, answer) -> str:
+        """A same-uid socket that reads one request and writes whatever ``answer`` sends."""
+        os.makedirs(self.sock_dir, 0o700, exist_ok=True)
+        path = os.path.join(self.sock_dir, "peer.sock")
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(listener.close)
+        listener.bind(path)
+        listener.listen(1)
+
+        def serve() -> None:
+            conn, _ = listener.accept()
+            with conn:
+                try:
+                    framing.read_frame(conn)
+                    answer(conn)
+                except (OSError, ct.FrameError):
+                    pass
+
+        threading.Thread(target=serve, daemon=True).start()
+        return path
 
     def test_partial_reply_then_timeout_closes_the_client(self) -> None:
         """A frame cut off mid-body must not leave the rest to be read as the next reply."""

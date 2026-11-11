@@ -68,10 +68,12 @@ class _Record:
         request_id: str | int | None,
         event: threading.Event,
         key: tuple[object, str | int] | None,
+        scope: object,
     ) -> None:
         self.request_id = request_id
         self.event = event
         self.key = key
+        self.scope = scope
 
 
 class RequestTable:
@@ -127,12 +129,16 @@ class RequestTable:
                 return self._refused(REPLAYED_ID, request_id)
             return self._start_locked(request_id, key)
 
-    def claim_absent(self) -> Claim:
-        """An omitted id. It is served, and it is not a duplicate of any other omitted id."""
+    def claim_absent(self, *, scope: object = None) -> Claim:
+        """An omitted id on ``scope``. It is served, and it is not a duplicate of another omitted id.
+
+        ``drop_scope`` cancels it with that connection's other in-flight requests.
+        It is not stored under an id, so it takes no settled-id slot.
+        """
         with self._lock:
             if self._past_deadline_locked():
                 return self._refused(CLOSING, None)
-            return self._start_locked(None, None)
+            return self._start_locked(None, None, scope=scope)
 
     def finish(self, claim: Claim, response: dict[str, object]) -> str:
         """``accepted``, ``mismatch``, or ``ignored``.
@@ -233,14 +239,18 @@ class RequestTable:
             return 0 if bucket is None else len(bucket)
 
     def drop_scope(self, scope: object) -> None:
-        """Forget one connection's settled ids and any request still in flight on it."""
+        """Forget one connection's settled ids and cancel every request still in flight on it.
+
+        A request that arrived with no id is cancelled too. Those claims are not
+        stored under an id.
+        """
         with self._lock:
             self._settled.pop(scope, None)
             for token, record in list(self._inflight.items()):
-                key = record.key
-                if key is None or type(key[0]) is not type(scope) or key[0] != scope:
+                if type(record.scope) is not type(scope) or record.scope != scope:
                     continue
-                self._by_id.pop(key, None)
+                if record.key is not None:
+                    self._by_id.pop(record.key, None)
                 del self._inflight[token]
                 record.event.set()
 
@@ -257,11 +267,20 @@ class RequestTable:
     def _refused(self, code: str, request_id: str | int | None) -> Claim:
         return Claim(False, code, request_id, threading.Event(), None)
 
-    def _start_locked(self, request_id: str | int | None, key: tuple[object, str | int] | None) -> Claim:
+    def _start_locked(
+        self,
+        request_id: str | int | None,
+        key: tuple[object, str | int] | None,
+        *,
+        scope: object = None,
+    ) -> Claim:
         self._seq += 1
         token = self._seq
         event = threading.Event()
-        self._inflight[token] = _Record(request_id, event, key)
+        if key is not None:
+            scope = key[0]
+        self._inflight[token] = _Record(request_id, event, key, scope)
+        # An omitted id has no key, so it is not indexed and cannot collide with another.
         if key is not None:
             self._by_id[key] = token
         return Claim(True, None, request_id, event, token)

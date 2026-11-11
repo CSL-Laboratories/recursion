@@ -234,6 +234,32 @@ class RequestIdentityTests(unittest.TestCase):
         self.assertEqual(self.table.finish(first, {"ok": True, "id": "a", "state": "stopped"}), IGNORED)
         self.assertEqual(self.table.finish(second, {"ok": True, "id": "b", "state": "stopped"}), ACCEPTED)
 
+    def test_dropping_a_connection_cancels_a_request_that_has_no_id(self) -> None:
+        """An omitted id belongs to its connection. Closing that connection cancels it.
+
+        It is not filed under an id, so a second omitted id on the same connection
+        is still served, and the settled-id cap does not grow.
+        """
+        table = RequestTable(clock=FakeClock(), close_timeout_s=5.0)
+        first = table.claim_absent(scope="scope-1")
+        second = table.claim_absent(scope="scope-1")
+        other = table.claim_absent(scope="scope-2")
+        named = table.claim("s1", scope="scope-1")
+        self.assertTrue(first.accepted)
+        self.assertTrue(second.accepted)
+        self.assertTrue(named.accepted)
+        table.drop_scope("scope-1")
+        self.assertTrue(first.event.is_set())
+        self.assertTrue(second.event.is_set())
+        self.assertTrue(named.event.is_set())
+        self.assertFalse(other.event.is_set())
+        self.assertEqual(table.finish(first, {"ok": True, "op": "pong"}), IGNORED)
+        self.assertEqual(table.finish(second, {"ok": True, "op": "pong"}), IGNORED)
+        self.assertEqual(table.finish(named, {"ok": True, "id": "s1"}), IGNORED)
+        self.assertEqual(table.settled_count("scope-1"), 0)
+        self.assertEqual(table.settled_count(), 0)
+        self.assertEqual(table.finish(other, {"ok": True, "op": "pong"}), ACCEPTED)
+
     def test_an_omitted_id_is_cancelled_with_everyone_else_at_the_deadline(self) -> None:
         clock = FakeClock()
         table = RequestTable(clock=clock, close_timeout_s=5.0)
@@ -498,6 +524,36 @@ class SocketCorrelationTests(unittest.TestCase):
         self.assertEqual(reply["error"]["code"], "bad_frame")
         self.assertEqual(reply["error"]["detail"], "frame_too_deep")
         self.assertEqual(reply["id"], "s9")
+
+    def test_a_handler_reply_with_the_wrong_id_is_not_forwarded(self) -> None:
+        """A handler body that names another id is not this request's reply.
+
+        The client receives an error for its own id, and the same connection
+        still serves the next request. The foreign id is not on the wire.
+        """
+        seen: list[object] = []
+
+        def handler(message, conn):
+            seen.append(message.get("id"))
+            if message.get("id") == "original-id":
+                return {"ok": True, "op": "stop", "state": "stopped", "id": "mismatched-id"}
+            return {"ok": True, "op": "pong"}
+
+        srv = self.server(handler)
+        with UnixControlClient(srv.path, timeout_s=2) as client:
+            reply = client.request({"op": "stop", "id": "original-id"})
+            self.assertEqual(reply["ok"], False)
+            self.assertEqual(reply["error"]["code"], "internal_error")
+            self.assertFalse(reply["error"]["retryable"])
+            self.assertEqual(reply["id"], "original-id")
+            self.assertNotIn("state", reply)
+            self.assertNotIn("mismatched-id", str(reply))
+            replay = client.request({"op": "stop", "id": "original-id"})
+            self.assertEqual(replay["error"]["code"], REPLAYED_ID)
+            self.assertEqual(replay["id"], "original-id")
+            nxt = client.request({"op": "ping", "id": "next"})
+        self.assertEqual(nxt, {"ok": True, "op": "pong", "id": "next"})
+        self.assertEqual(seen, ["original-id", "next"])
 
     def test_a_handler_that_ignores_cancelled_cannot_write_after_close(self) -> None:
         """Close does not deliver a result from a handler that never watches cancelled.

@@ -30,7 +30,7 @@ try:
 except ImportError:  # pragma: no cover - Windows has no fcntl; it is the F40 stub path
     fcntl = None  # type: ignore[assignment]
 
-from .correlation import ACCEPTED, CANCELLED, IGNORED, MISSING_ID, SETTLED_CAP, RequestTable, same_id
+from .correlation import ACCEPTED, CANCELLED, IGNORED, MISMATCH, MISSING_ID, SETTLED_CAP, RequestTable, same_id
 from .errors import FrameError, InsecureSocketPath, PeerRefused, RemoteBindRefused, TransportBusy
 from .framing import HEADER, MAX_FRAME_BYTES, decode_body, encode_frame, read_frame, write_frame
 from .handlers import Connection, Handler, Message
@@ -413,7 +413,7 @@ class UnixControlServer:
                         return
                     continue
                 if "id" not in request:
-                    claim = self._requests.claim_absent()
+                    claim = self._requests.claim_absent(scope=connection.conn_id)
                 else:
                     claim = self._requests.claim(request["id"], scope=connection.conn_id)
                 if not claim.accepted:
@@ -424,6 +424,12 @@ class UnixControlServer:
                 connection.cancelled = claim.event
                 response = self._call_handler(request, connection)
                 outcome = self._requests.finish(claim, response)
+                if outcome == MISMATCH:
+                    # The handler named a different id. That body is not this request's
+                    # reply, so it is not written. The error carries the request's own id.
+                    if not self._write_reply(conn, _correlated_error("internal_error", request), request):
+                        return
+                    continue
                 if outcome == IGNORED:
                     self._count_late()
                     # The handler's body is not this request's reply. A live cancel still

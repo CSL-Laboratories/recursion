@@ -79,10 +79,19 @@ def plain(api, stdin: Iterable[str], stdout: TextIO, environ: Mapping[str, str],
     return 0
 
 
+class TerminalUnsupported(RuntimeError):
+    """The real terminal driver needs ``termios`` (POSIX); this platform has none (Windows)."""
+
+
 class Tty:
     """The real terminal: cbreak mode, key reads and size. Tests pass a fake with the same methods."""
 
     def __init__(self, stdin: TextIO) -> None:
+        try:
+            import termios  # noqa: F401  absent on Windows; refuse here, before any screen output
+            import tty  # noqa: F401
+        except ImportError as exc:
+            raise TerminalUnsupported("platform_unsupported: the full-screen terminal needs termios") from exc
         self.fd = stdin.fileno()
 
     def size(self) -> os.terminal_size:
@@ -181,5 +190,10 @@ def main(argv: list[str], api_factory: Callable[[], object] | None, *, stdin: Te
 
     if "plain" in modes or environ.get("TERM") == "dumb" or not (is_tty(stdin) and is_tty(stdout)):
         return plain(api, stdin, stdout, environ, clock)
-    return interactive(api, stdout, environ, terminal or Tty(stdin), alt_screen="no_alt_screen" not in modes,
+    try:
+        terminal = terminal or Tty(stdin)
+    except TerminalUnsupported as exc:
+        print(f"status={exc}; nothing sent; --plain works without it", file=stderr)
+        return 1
+    return interactive(api, stdout, environ, terminal, alt_screen="no_alt_screen" not in modes,
                        stderr=stderr)

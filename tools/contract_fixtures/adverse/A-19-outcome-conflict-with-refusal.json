@@ -1,0 +1,10 @@
+{
+  "type": "WireCommandOutcome@1",
+  "command_id": "cmd:admit-0093",
+  "command_digest": "sha256:4c2e9a1f7b5d8e6a0f3c1b9d7a5e2f8b6c4d0e1a3b5c7d9e1f3a5b7c9d1e3f5a",
+  "outcome": "conflict",
+  "refusal": {
+    "reason_code": "stale-epoch",
+    "refusal_class": "permanent"
+  }
+}

@@ -678,56 +678,129 @@ class ReadHelpTest(unittest.TestCase):
                     stderr=subprocess.DEVNULL, timeout=0.1, check=False, shell=False)
         self.assertEqual(len(calls), 1)
 
-    def _reap_against_fake_proc(self, stat_rows: list[bytes]) -> list[tuple[int, int]]:
+    def _reap_collected(self, *, alive: bool, stat_rows: list[bytes] | None) -> list[tuple[int, int]]:
         calls: list[tuple[int, int]] = []
 
         def killpg(pgid: int, sig: int) -> None:
             calls.append((pgid, sig))
 
+        def getpgid(pid: int) -> int:
+            if not alive:
+                raise ProcessLookupError
+            return pid
+
+        def scan(proc_root: str = "/proc"):
+            if stat_rows is None:
+                return None
+            return real_scan(str(root))
+
+        class _Collected:
+            pid = 424242
+            returncode = 0
+
+            @staticmethod
+            def wait(timeout: float | None = None) -> int:
+                return 0
+
+            @staticmethod
+            def kill() -> None:
+                return None
+
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            for raw in stat_rows:
-                pid = raw.split(b" ", 1)[0].decode()
-                slot = root / pid
-                slot.mkdir()
-                (slot / "stat").write_bytes(raw)
+            if stat_rows:
+                for raw in stat_rows:
+                    slot = root / raw.split(b" ", 1)[0].decode()
+                    slot.mkdir()
+                    (slot / "stat").write_bytes(raw)
             real_scan = bd._read_proc_stats
-            seen = {"n": 0}
-
-            def scan(proc_root: str = "/proc"):
-                seen["n"] += 1
-                if seen["n"] == 1:
-                    return real_scan(str(root))
-                return []
-
-            class _Collected:
-                pid = int(stat_rows[0].split(b" ", 1)[0])
-                returncode = 0
-
-                @staticmethod
-                def wait(timeout: float | None = None) -> int:
-                    return 0
-
-                @staticmethod
-                def kill() -> None:
-                    return None
-
-            with patch.object(bd, "_read_proc_stats", scan), patch.object(os, "killpg", killpg):
+            with patch.object(os, "getpgid", getpgid, create=True), patch.object(
+                    bd, "_read_proc_stats", scan), patch.object(os, "killpg", killpg, create=True):
                 bd._reap(_Collected())
         return calls
 
+    @unittest.skipUnless(hasattr(os, "killpg") and hasattr(os, "getpgid"), "POSIX process groups")
     def test_collected_leader_pid_alone_is_not_signaled(self) -> None:
-        # After collection, a live row whose pid is the old leader is a reused
-        # process. killpg would signal it.
-        calls = self._reap_against_fake_proc([b"424242 (leader) S 1 424242 424242 0\n"])
+        # A live row whose pid is the old leader means that pid was reused.
+        calls = self._reap_collected(alive=True, stat_rows=[b"424242 (leader) S 1 424242 424242 0\n"])
         self.assertEqual(calls, [])
 
-    def test_collected_leader_still_signals_another_member(self) -> None:
-        calls = self._reap_against_fake_proc([
+    @unittest.skipUnless(hasattr(os, "killpg") and hasattr(os, "getpgid"), "POSIX process groups")
+    def test_reused_leader_pid_with_a_child_is_not_signaled(self) -> None:
+        # The child of a reused pid is in the new group. killpg would signal it.
+        calls = self._reap_collected(alive=True, stat_rows=[
             b"424242 (leader) S 1 424242 424242 0\n",
             b"424243 (child) S 1 424242 424242 0\n",
         ])
+        self.assertEqual(calls, [])
+
+    @unittest.skipUnless(hasattr(os, "killpg") and hasattr(os, "getpgid"), "POSIX process groups")
+    def test_collected_leader_with_no_proc_still_signals_when_pid_is_free(self) -> None:
+        # ESRCH means the old pid is free, so killpg can hit only a real straggler.
+        # A missing /proc scan must not skip that signal.
+        calls = self._reap_collected(alive=False, stat_rows=None)
         self.assertEqual(calls, [(424242, signal.SIGKILL)])
+
+    @unittest.skipUnless(hasattr(os, "killpg") and hasattr(os, "getpgid"), "POSIX process groups")
+    def test_interrupt_after_collect_signals_once(self) -> None:
+        # _wait collects the leader and then KeyboardInterrupt fires. One reap,
+        # and one killpg, because the old pid is already gone.
+        read_fd, write_fd = os.pipe()
+        os.close(write_fd)
+        reaps: list[int | None] = []
+        kills: list[tuple[int, int]] = []
+        real_reap = bd._reap
+
+        def spy_reap(proc: subprocess.Popen) -> None:
+            reaps.append(proc.returncode)
+            real_reap(proc)
+
+        def killpg(pgid: int, sig: int) -> None:
+            kills.append((pgid, sig))
+
+        def getpgid(pid: int) -> int:
+            raise ProcessLookupError
+
+        class _Out:
+            closed = False
+
+            def fileno(self) -> int:
+                return read_fd
+
+            def close(self) -> None:
+                self.closed = True
+
+        class _Proc:
+            pid = 424242
+            returncode: int | None = None
+            stdout = _Out()
+
+            def _wait(self, timeout: float | None = None) -> int:
+                self.returncode = 0
+                raise KeyboardInterrupt
+
+            def wait(self, timeout: float | None = None) -> int:
+                return 0
+
+            def kill(self) -> None:
+                return None
+
+        def fake_popen(*args, **kwargs):
+            return _Proc()
+
+        try:
+            with patch.object(subprocess, "Popen", fake_popen), patch.object(
+                    bd, "_wait_leader", return_value="exited"), patch.object(
+                    bd, "_reap", spy_reap), patch.object(
+                    bd, "_read_proc_stats", return_value=None), patch.object(
+                    os, "getpgid", getpgid, create=True), patch.object(
+                    os, "killpg", killpg, create=True):
+                with self.assertRaises(KeyboardInterrupt):
+                    bd._bounded_run(["engine"], timeout=2, check=False, shell=False)
+        finally:
+            os.close(read_fd)
+        self.assertEqual(reaps, [0])
+        self.assertEqual(kills, [(424242, signal.SIGKILL)])
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux subreaper")
     def test_subreaper_collects_same_group_zombies(self) -> None:

@@ -303,12 +303,12 @@ def _group_has_live_member(pgid: int, proc_root: str = "/proc") -> bool | None:
 
 
 def _group_has_other_live_member(pgid: int) -> bool | None:
-    """Whether a live member of ``pgid`` has some other pid.
+    """Whether a finished scan sees a live member of ``pgid`` other than ``pgid``.
 
-    ``True`` means one does. ``False`` means a finished scan saw none. ``None``
-    means the scan did not run. The process whose pid equals ``pgid`` does not
-    count. After the leader is collected, that number can belong to a new
-    process, and ``killpg`` would signal it.
+    ``False`` means the scan saw none, so a later kill can be skipped. ``None``
+    means the scan did not run and is not an empty group. A live row whose pid
+    is ``pgid`` is not a straggler. The caller probes that pid before trusting
+    any other row: a live pid means the number was reused.
     """
     rows = _read_proc_stats()
     if rows is None:
@@ -318,6 +318,27 @@ def _group_has_other_live_member(pgid: int) -> bool | None:
         if pgrp == token and member != token and state not in (b"Z", b"X"):
             return True
     return False
+
+
+def _leader_pid_reused(pid: int) -> bool:
+    """True when ``pid`` still names a process after the leader was collected.
+
+    A group id cannot be reused while any process still has it as its pgrp.
+    A live ``pid`` is therefore a new process, and the old group is already
+    empty. ``ESRCH`` means the number is free, so ``killpg`` can reach only a
+    straggler that still carries the old group id.
+
+    ``getpgid`` and the following ``killpg`` are not one step. The pid can be
+    reused in that gap, the same window as a ``/proc`` row going stale before
+    the signal.
+    """
+    try:
+        os.getpgid(pid)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
 
 
 def _collect_our_zombies(pgid: int, rows: list[tuple[bytes, bytes, bytes, bytes]]) -> None:
@@ -429,14 +450,20 @@ def _reap(proc: subprocess.Popen) -> None:
     deadline = time.monotonic() + 2.0
     signaled = False
     if os.name != "nt" and isinstance(pid, int) and pid > 0:
-        # While the leader is unreaped it still holds the group id, so a missing
-        # /proc scan still means kill. After Popen has collected it, that pid can
-        # be reused. killpg then hits an unrelated process, and a missing scan is
-        # not a reason to take that risk. Signal only when some other live member
-        # is actually in the group. A live row whose pid is the leader's number
-        # is that reused process, not our leader.
+        # An unreaped leader still holds the group id, so kill even when /proc
+        # cannot be listed. Once it has been collected, probe the old pid.
+        # Alive means that number was reused: the old group is gone, and a scan
+        # that shows its child must not become a signal. ESRCH means the pid is
+        # free, so killpg reaches only real stragglers. A scan may still skip
+        # that kill when it can see that no other member is running.
         leader_open = proc.returncode is None and _leader_unreaped(pid)
-        if leader_open or _group_has_other_live_member(pid) is True:
+        if leader_open:
+            signal = True
+        elif _leader_pid_reused(pid):
+            signal = False
+        else:
+            signal = _group_has_other_live_member(pid) is not False
+        if signal:
             _signal_group(proc, pid)
             signaled = True
             _until_group_dead(pid, deadline)
@@ -529,7 +556,7 @@ def _bounded_run(argv, *, env=None, stdin=None, stdout=None, stderr=None, timeou
     non-zero exit: ``check=True`` raises ``CalledProcessError``, otherwise the bytes
     come back with a non-zero code. A timeout also kills the session and discards
     bytes already read: the child did not finish, so the buffer is not a finished
-    ``--help``.     An under-cap EOF does not kill. The child may close its output and
+    ``--help``. An under-cap EOF does not kill. The child may close its output and
     still be exiting; it is killed only if it is still running when the deadline hits.
     That collect uses ``Popen._wait``. ``Popen.wait`` catches ``KeyboardInterrupt``
     and reaps the leader before the group can be signaled. The handler reaps once.

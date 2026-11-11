@@ -1162,5 +1162,89 @@ class RoundFiveTest(unittest.TestCase):
         self.assertNotEqual(stored["state"], "stopped")
 
 
+class RoundSixTest(unittest.TestCase):
+    def test_a_copied_generation_cannot_restore_an_old_marker(self) -> None:
+        original = InMemoryRunRegistry()
+        original.put({"run_id": "r", "tenant": "t", "engine": "e", "state": "running",
+                      "cgroup": "X", "stop": None, "start_key": None})
+        rec = original.get("r")
+        assert rec is not None
+        rec["cgroup"] = "A"
+        original.put(rec)
+        held = original.get("r")["cgroup_marker"]
+        reg = InMemoryRunRegistry(original.list())
+
+        class SwapByCopy:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def request_stop(self, cgroup: str) -> None:
+                return None
+
+            def confirm(self, cgroup: str, timeout_s: float) -> str:
+                self.calls += 1
+                if self.calls > 1:
+                    return POPULATED
+                current = reg.get("r")
+                assert current is not None
+                current["cgroup"] = "B"
+                stored = reg.put(current)
+                current["generation"] = stored["generation"]
+                current["cgroup"] = "A"
+                reg.put(current)
+                return EMPTY
+
+        kill = SwapByCopy()
+        api = ControlAPI(reg, kill, lambda _: {}, lambda: 1.0)
+        api.call("run.stop", {"run_id": "r"})
+        stored = reg.get("r")
+        assert stored is not None
+        self.assertGreater(kill.calls, 1)
+        self.assertNotEqual(stored["state"], "stopped")
+        self.assertNotEqual(stored["cgroup_marker"], held)
+
+    def test_a_same_path_update_keeps_the_stored_marker(self) -> None:
+        reg = InMemoryRunRegistry()
+        reg.put({"run_id": "r", "tenant": "t", "engine": "e", "state": "running",
+                 "cgroup": "A", "stop": None, "start_key": None})
+        held = reg.get("r")["cgroup_marker"]
+        current = reg.get("r")
+        assert current is not None
+        current["cgroup_marker"] = "cg-99"
+        stored = reg.put(current)
+        self.assertEqual(stored["cgroup_marker"], held)
+        current = reg.get("r")
+        assert current is not None
+        current["cgroup_marker"] = held
+        current["cgroup"] = "B"
+        moved = reg.put(current)
+        self.assertNotEqual(moved["cgroup_marker"], held)
+        self.assertNotEqual(moved["cgroup_marker"], "cg-99")
+
+    def test_a_marker_that_was_never_stored_is_accepted_on_adoption(self) -> None:
+        reg = InMemoryRunRegistry()
+        reg.put({"run_id": "r", "tenant": "t", "engine": "e", "state": "starting",
+                 "cgroup": None, "stop": None, "start_key": None})
+        current = reg.get("r")
+        assert current is not None
+        current["cgroup"] = "A"
+        current["cgroup_marker"] = "from-handle"
+        stored = reg.put(current)
+        self.assertEqual(stored["cgroup_marker"], "from-handle")
+
+    def test_reload_accepts_a_marker_suffix_int_cannot_parse(self) -> None:
+        for marker in ("cg-\u00b2", "cg-\u2082", "cg-" + "9" * 5000):
+            reg = InMemoryRunRegistry()
+            reg.put({"run_id": "r", "tenant": "t", "engine": "e", "state": "running",
+                     "cgroup": "/cg", "stop": None, "start_key": None})
+            current = reg.get("r")
+            assert current is not None
+            current["stop"] = {"requested_at": 1.0, "checks": 0, "reason": None, "requested": False,
+                               "cgroup_marker": marker}
+            reg.put(current)
+            restored = InMemoryRunRegistry(reg.list())
+            self.assertEqual(restored.get("r")["stop"]["cgroup_marker"], marker)
+
+
 if __name__ == "__main__":
     unittest.main()

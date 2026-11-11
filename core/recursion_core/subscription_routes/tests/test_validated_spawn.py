@@ -169,6 +169,26 @@ class HarnessSpawnTests(_Calls):
         self.assertIn("argv0", caught.exception.cause)
         popen.assert_not_called()
 
+    def test_allowed_credential_values_are_screened_before_spawn(self) -> None:
+        home = str(self.home)
+        base = {"PATH": "/usr/bin:/bin", "HOME": home}
+        cases = (
+            ("nul", "sk-fake\0", "route_key_malformed"),
+            ("int", 7, "route_key_malformed"),
+            ("surrogate", "sk-\ud800", "value_unencodable"),
+        )
+        for label, value, cause in cases:
+            with self.subTest(label=label):
+                child = {**base, "OPENAI_API_KEY": value}
+                with mock.patch("subprocess.Popen") as popen:
+                    with self.assertRaises(EnvRefused) as caught:
+                        spawn_route_process(
+                            [str(self.fake)], child, route_home=home, credential_env="OPENAI_API_KEY",
+                        )
+                popen.assert_not_called()
+                self.assertEqual(cause, caught.exception.cause)
+                self.assertNotIn("sk-fake", str(caught.exception))
+
     def test_credential_env_cannot_restore_home_or_a_loader(self) -> None:
         for name in ("HOME", "LD_PRELOAD", "PATH"):
             with self.subTest(name=name):

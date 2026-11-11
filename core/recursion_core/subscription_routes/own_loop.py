@@ -242,13 +242,11 @@ def check_copilot_own_loop(
     be made, every exit signals that group (SIGTERM, then SIGKILL inside the deadline). A descendant
     that calls ``setpgid`` leaves the group and is not signalled. Where the group cannot be made,
     or another thread is already running (including one started with ``_thread``), the route refuses
-    and does not fork.
+    and does not fork. ``home`` is required: without it the probe would see the ambient account.
 
-    The probe never inherits the process environment. When ``home`` is the route home, the probe
-    runs with the environment the child will receive, including ``HOME`` and ``COPILOT_HOME``
-    (``<home>/.copilot``). Copilot CLI >= 1.0.1 uses ``COPILOT_HOME`` and ignores
-    ``XDG_CONFIG_HOME``, so the probe and the child see one account. Without ``home``, the probe
-    still sees only the screened allowlisted snapshot of the supplied mapping.
+    The probe runs with the environment the child will receive, including ``HOME`` and
+    ``COPILOT_HOME`` (``<home>/.copilot``). Copilot CLI >= 1.0.1 uses ``COPILOT_HOME`` and ignores
+    ``XDG_CONFIG_HOME``, so the probe and the child see one account.
     """
 
     _common("copilot", route, _COPILOT_FIELDS, "copilot_cli_sign_in")
@@ -259,6 +257,9 @@ def check_copilot_own_loop(
     strip = COPILOT_STRIP_ENV + _GH_FALLBACK_ENV
     # Any other provider credential (ANTHROPIC_API_KEY, OPENAI_API_KEY, ...) is not this run's either.
     # The allowlist then drops whatever the strip does not name (GH_PAT, AWS_*, GIT_CONFIG_*).
+    # A missing home would run the probe in the ambient account and approve a different child account.
+    if not isinstance(home, str) or not home:
+        raise OwnLoopRouteRefused("copilot", "route_home_missing")
     # Before the env is built, so a platform that cannot enforce the probe never creates the home,
     # and a live thread never reaches fork.
     if not _probe_enforceable():
@@ -267,11 +268,7 @@ def check_copilot_own_loop(
         raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe threaded")
     child, removed = _project_child(parent_env, lambda name: name in strip or _is_provider_credential(name))
     _screen_kept_values("copilot", child)
-    # None would inherit the process environment. A missing home still gets the snapshot.
-    if isinstance(home, str) and home:
-        probe_env = _copilot_runtime_env(child, home).to_dict()
-    else:
-        probe_env = child
+    probe_env = _copilot_runtime_env(child, home).to_dict()
     present = _probe_login(has_copilot_login, probe_deadline, probe_env)
     if not present:
         raise OwnLoopRouteRefused("copilot", "no_stored_copilot_login", "run `copilot login`; gh fallback refused")
@@ -1099,9 +1096,20 @@ def _copilot_runtime_env(child: Mapping[str, str], home: str):
     ``XDG_CONFIG_HOME``. ``home`` is validated before ``.copilot`` is created, so an unsafe home
     leaves no directory behind. The directory is created mode ``0700`` when it is absent. An
     existing entry, including a symlink, is left in place and must already be a private directory.
+    A null or a character this process cannot encode is refused before ``Path`` or ``lstat`` sees it.
     """
 
-    if not _private_dir(home):
+    if not isinstance(home, str) or "\x00" in home:
+        raise EnvRefused("HOME", "home_unsafe")
+    try:
+        os.fsencode(home)
+    except UnicodeEncodeError:
+        raise EnvRefused("HOME", "value_unencodable") from None
+    try:
+        private = _private_dir(home)
+    except (ValueError, UnicodeEncodeError):
+        raise EnvRefused("HOME", "home_unsafe") from None
+    if not private:
         raise EnvRefused("HOME", "home_unsafe")
     copilot_home = os.path.join(home, ".copilot")
     if not os.path.lexists(copilot_home):

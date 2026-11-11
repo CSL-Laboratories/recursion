@@ -78,7 +78,7 @@ try:
     check_copilot_own_loop(
         {"engine": "copilot", "auth": "subscription", "method": "copilot_cli_sign_in"},
         {"PATH": "/usr/bin", "HOME": home, "LANG": lang},
-        has_copilot_login=lambda: True,
+        has_copilot_login=lambda: True, home=home,
     )
 except OwnLoopRouteRefused as exc:
     blob = str(exc).encode("ascii", "backslashreplace").decode("ascii")
@@ -192,7 +192,7 @@ class SubscriptionRobustness(unittest.TestCase):
 
         copilot = check_copilot_own_loop(
             {"engine": "copilot", "auth": "subscription", "method": "copilot_cli_sign_in"},
-            original, has_copilot_login=mutate,
+            original, has_copilot_login=mutate, home=str(self.home),
         )
         self.assertEqual("C", dict(copilot.child_env).get("LANG"))
         self.assertNotIn("\0", "".join(dict(copilot.child_env).values()))
@@ -282,11 +282,12 @@ class SubscriptionRobustness(unittest.TestCase):
                         route_home=str(self.home), parent_env={"HOME": str(self.operator)},
                         operator_home=str(self.operator))
         self.assertEqual("engine_selector_env", caught.exception.cause)
+        runtime = str(self.home)
         decision = check_copilot_own_loop(
             {"engine": "copilot", "auth": "subscription", "method": "copilot_cli_sign_in"},
             {"PATH": "/usr/bin", "HOME": "rel/home", "XDG_CONFIG_HOME": "rel/cfg", "XDG_DATA_HOME": "rel/data",
-             "XDG_RUNTIME_DIR": "rel/run", "GITHUB_TOKEN": _SECRET},
-            has_copilot_login=lambda: True,
+             "XDG_RUNTIME_DIR": runtime, "GITHUB_TOKEN": _SECRET},
+            has_copilot_login=lambda: True, home=runtime,
         )
         child = dict(decision.child_env)
         self.assertEqual("rel/home", child["HOME"])
@@ -294,7 +295,7 @@ class SubscriptionRobustness(unittest.TestCase):
         self.assertNotIn("XDG_DATA_HOME", child)
         self.assertIn("XDG_CONFIG_HOME", decision.removed_env)
         self.assertIn("XDG_DATA_HOME", decision.removed_env)
-        self.assertEqual("rel/run", child["XDG_RUNTIME_DIR"])
+        self.assertEqual(runtime, child["XDG_RUNTIME_DIR"])
         self.assertNotIn("GITHUB_TOKEN", child)
         self.assertNotIn(_SECRET, child.values())
 
@@ -395,7 +396,7 @@ class SubscriptionRobustness(unittest.TestCase):
             decision = check_copilot_own_loop(
                 {"engine": "copilot", "auth": "subscription", "method": "copilot_cli_sign_in"},
                 {"PATH": "/usr/bin", "HOME": str(self.home), "LANG": "C"},
-                has_copilot_login=probe,
+                has_copilot_login=probe, home=str(self.home),
             )
             self.assertEqual("ambient-secret", os.environ["GITHUB_TOKEN"])
         self.assertEqual("(None, 'C', None)", marker.read_text(encoding="ascii"))
@@ -423,8 +424,24 @@ class SubscriptionRobustness(unittest.TestCase):
             self.assertNotIn("\x00", str(caught.exception))
             self.assertNotIn("\\ud800", str(caught.exception).lower())
             self.calls.assert_not_called()
-        guard_then_spawn(**base, cwd=self.home)
-        self.assertEqual(self.home, self.calls.call_args.kwargs["cwd"])
+        with self.assertRaises(SubscriptionRouteRefused) as caught:
+            guard_then_spawn(**base, cwd=7)
+        self.assertEqual("argv_malformed", caught.exception.cause)
+        self.calls.assert_not_called()
+
+        class _Flip:
+            def __init__(self) -> None:
+                self.reads = 0
+
+            def __fspath__(self) -> str:
+                self.reads += 1
+                return str(self_home) if self.reads == 1 else str(self_home) + "\0bad"
+
+        self_home = self.home
+        guard_then_spawn(**base, cwd=_Flip())
+        self.assertEqual(str(self.home), self.calls.call_args.kwargs["cwd"])
+        guard_then_spawn(**base, cwd=os.fsencode(str(self.home)))
+        self.assertEqual(os.fsencode(str(self.home)), self.calls.call_args.kwargs["cwd"])
 
     def test_dropped_unencodable_value_does_not_refuse(self) -> None:
         home = str(self.home)
@@ -444,7 +461,7 @@ home = os.environ["PROBE_HOME"]
 parent = {"PATH": "/usr/bin", "HOME": home, "LANG": "C", "GITHUB_TOKEN": "caf\u00e9-dropped"}
 decision = check_copilot_own_loop(
     {"engine": "copilot", "auth": "subscription", "method": "copilot_cli_sign_in"},
-    parent, has_copilot_login=lambda: True,
+    parent, has_copilot_login=lambda: True, home=home,
 )
 assert "GITHUB_TOKEN" not in decision.child_env
 assert decision.child_env["LANG"] == "C"

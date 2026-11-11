@@ -515,30 +515,35 @@ class CopilotTests(unittest.TestCase):
         self.assertEqual(caught.exception.cause, "home_unsafe")
         self.assertFalse(os.path.lexists(os.path.join(home, ".copilot")))
 
-    def test_check_without_a_route_home_uses_the_screened_snapshot(self) -> None:
-        # Ambient account tokens must not reach the probe. Without a route home the probe sees
-        # the supplied mapping after the allowlist, which is the same mapping the child receives.
-        folder = tempfile.mkdtemp(prefix="csl-no-home-")
-        self.addCleanup(shutil.rmtree, folder, True)
-        marker = os.path.join(folder, "seen")
+    def test_check_without_a_route_home_refuses(self) -> None:
+        # Ambient account A must not approve a later child that selects account B.
+        called = False
 
         def probe() -> bool:
-            with open(marker, "w", encoding="ascii") as handle:
-                handle.write(repr((os.environ.get("GITHUB_TOKEN"), os.environ.get("HOME"), os.environ.get("AMBIENT_ONLY"))))
+            nonlocal called
+            called = True
             return True
 
-        with mock.patch.dict(os.environ, {"GITHUB_TOKEN": "ambient-secret", "AMBIENT_ONLY": "ambient-only",
-                                           "HOME": "/home/ambient"}, clear=False):
-            decision = check_copilot_own_loop(
-                copilot(), {"PATH": "/usr/bin:/bin", "HOME": "/home/account-a", "LANG": "C"},
-                has_copilot_login=probe,
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(OwnLoopRouteRefused) as caught:
+                check_copilot_own_loop(copilot(), {}, has_copilot_login=probe)
+        self.assertEqual(caught.exception.cause, "route_home_missing")
+        self.assertFalse(called)
+        with self.assertRaises(OwnLoopRouteRefused) as caught:
+            check_copilot_own_loop(
+                copilot(), {"PATH": "/usr/bin:/bin", "HOME": "/home/account-a", "COPILOT_HOME": "/home/account-a/.copilot"},
+                has_copilot_login=lambda: True,
             )
-            self.assertEqual("ambient-secret", os.environ["GITHUB_TOKEN"])
-        with open(marker, encoding="ascii") as handle:
-            self.assertEqual("(None, '/home/account-a', None)", handle.read())
-        self.assertEqual("/home/account-a", decision.child_env["HOME"])
-        self.assertNotIn("GITHUB_TOKEN", decision.child_env)
-        self.assertNotIn("AMBIENT_ONLY", decision.child_env)
+        self.assertEqual(caught.exception.cause, "route_home_missing")
+
+    def test_a_null_or_unencodable_home_is_a_typed_refusal(self) -> None:
+        for home, cause in (("/synthetic\0", "home_unsafe"), ("/synthetic\ud800", "value_unencodable")):
+            with self.subTest(cause=cause):
+                with self.assertRaises(EnvRefused) as caught:
+                    check_copilot_own_loop(copilot(), BASE, home=home, has_copilot_login=lambda: True)
+                self.assertEqual(caught.exception.name, "HOME")
+                self.assertEqual(caught.exception.cause, cause)
+                self.assertNotIn("synthetic", str(caught.exception))
 
     def test_a_held_lock_refuses_before_the_probe_can_deadlock(self) -> None:
         # Fork copies the lock as held. The holder thread is not in the child, so a probe that

@@ -360,7 +360,7 @@ class RestartTest(ComposedBase):
         _, composed = self.boot()
         survivor = self.start(self.api(composed))
         self.shutdown()
-        for bad, error in (('{torn', ValueError), ('[1, 2]', AttributeError),
+        for bad, error in (('{torn', ValueError), ('[1, 2]', adapter.ControlRecordInvalid),
                            (json.dumps({'run_id': 'run-y', 'state': 'stopped', 'cgroup': '/x'}), StopUnattested)):
             with self.subTest(bad=bad):
                 store = Registry(self.state)
@@ -372,27 +372,37 @@ class RestartTest(ComposedBase):
                 self.assertFalse((self.runtime / 'recursion' / 'control.sock').exists())
         self.assertIsNone(self.units.procs[f'recursion-run-{survivor}.service'].poll(), 'the run is still live')
 
-    @unittest.expectedFailure  # ADV1-7
     def test_a_record_with_a_non_string_run_id_does_not_silently_disable_list_and_reconcile(self):
-        """ADV1-7: the daemon starts on such a row, then run.list answers registry_unavailable and every
-        reconcile pass logs "nothing reconciled" (sorting int and str ids raises), with no other signal."""
+        """ADV1-7 (fixed): the daemon used to start on such a row, then run.list answered registry_unavailable
+        and every reconcile pass logged "nothing reconciled". It is now refused at load like the other
+        misshapen rows (S12 decision 11), with a typed error naming the row."""
         _, composed = self.boot()
         survivor = self.start(self.api(composed))
         self.shutdown()
+        for bad in ('{"run_id": 5, "state": "running"}', '{"state": "running"}', '{"run_id": null}',
+                    '{"run_id": ["run-y"]}', json.dumps({'run_id': survivor, 'state': 'running'}), '"run-y"', '7'):
+            with self.subTest(bad=bad):
+                store = Registry(self.state)
+                store.control_put('run-y', bad)
+                store.close()
+                with self.assertRaises(adapter.ControlRecordInvalid) as caught:
+                    self.boot()
+                self.assertIn("'run-y'", str(caught.exception))
+                self.open.clear()
+                self.assertFalse((self.runtime / 'recursion' / 'control.sock').exists())
+        self.assertIsNone(self.units.procs[f'recursion-run-{survivor}.service'].poll(), 'the run is still live')
+        # With the row repaired the daemon starts, lists every run and reconciles without an error.
         store = Registry(self.state)
-        store.control_put('run-y', '{"run_id": 5, "state": "running"}')
+        store.control_put('run-y', json.dumps({'run_id': 'run-y', 'tenant': 't1', 'engine': 'claude_code',
+                                               'state': 'start_failed', 'cgroup': None, 'started_at': 1.0,
+                                               'stop': None, 'start_key': None}))
         store.close()
-        try:
-            _, composed = self.boot()
-        except Exception:  # refusing to start, like the other untrusted rows, is an acceptable answer
-            return
+        _, composed = self.boot()
         listed = self.api(composed).call('run.list')
-        with self.assertLogs(adapter.log, 'ERROR') as logged:
-            composed.control.reconcile()
-            adapter.log.error('marker')
         self.assertEqual(listed['code'], 'ok', listed)
-        self.assertIn(survivor, [r['run_id'] for r in listed['runs']])
-        self.assertEqual(len(logged.output), 1, logged.output)
+        self.assertEqual(sorted(r['run_id'] for r in listed['runs']), sorted([survivor, 'run-y']))
+        with self.assertNoLogs(adapter.log, 'ERROR'):
+            composed.control.reconcile()
 
     def test_repeated_reconcile_passes_are_idempotent_for_settled_records(self):
         daemon, composed = self.boot()

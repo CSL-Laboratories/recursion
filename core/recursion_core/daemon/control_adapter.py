@@ -63,6 +63,10 @@ STOP_RETRY_BASE_S, STOP_RETRY_MAX_S = 30.0, 600.0
 
 
 # -- registry ------------------------------------------------------------------------------------
+class ControlRecordInvalid(ValueError):
+    """A stored control record is not a JSON object for the run it is filed under."""
+
+
 class DurableRunRegistry(InMemoryRunRegistry):
     """The control API's registry, with every stored record written to the daemon registry first.
 
@@ -71,12 +75,19 @@ class DurableRunRegistry(InMemoryRunRegistry):
     earlier daemon stored. A write that cannot be made durable raises, the in-memory copy is
     left as it was, and the control API answers ``registry_unavailable`` or ``recorded: false``.
     A stored ``stopped`` record that fails the attestation check at load is refused with
-    ``StopUnattested``: the daemon does not start on a registry it cannot trust.
+    ``StopUnattested``, and a row that is not a JSON object carrying the run id it is filed under
+    with ``ControlRecordInvalid`` (ADV1-7: a non-string ``run_id`` used to load and then break every
+    list and reconcile). The daemon does not start on a registry it cannot trust.
     """
 
     def __init__(self, store, *, processes=None):
         self._durable = None
-        records = [json.loads(text) for _, text in store.control_all()]
+        records = []
+        for run_id, text in store.control_all():
+            rec = json.loads(text)
+            if not isinstance(rec, dict) or rec.get('run_id') != run_id:
+                raise ControlRecordInvalid(f'control record filed under {run_id!r} is not a record of that run')
+            records.append(rec)
         super().__init__(records, processes=processes)
         self._durable = store
 

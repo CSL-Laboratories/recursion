@@ -230,30 +230,40 @@ def _leader_unreaped(pid: int) -> bool:
 
 
 def _signal_group(proc: subprocess.Popen, pid: int) -> None:
-    """SIGKILL the process group ``pid`` leads. Fall back to the leader alone."""
+    """SIGKILL the process group ``pid`` leads. Fall back to the leader alone.
+
+    ``ESRCH`` and ``EPERM`` mean the group is already gone or not ours to
+    signal. Both are done. A collected leader is not killed by pid: that pid
+    may have been reused.
+    """
     try:
         os.killpg(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
+    except (ProcessLookupError, PermissionError):
+        return
     except OSError:
+        if proc.returncode is not None:
+            return
         try:
             proc.kill()
         except OSError:
             pass
 
 
-def _proc_stats(proc_root: str = "/proc"):
-    """Yield ``(pid, state, ppid, pgrp)`` from ``proc_root``, as bytes.
+def _read_proc_stats(proc_root: str = "/proc") -> list[tuple[bytes, bytes, bytes, bytes]] | None:
+    """Return ``(pid, state, ppid, pgrp)`` rows, or ``None`` if the scan cannot run.
 
-    ``stat`` is read in binary. A process name is an arbitrary byte string, and
-    opening it as text raises ``UnicodeDecodeError`` for a name that is not
-    valid in the locale encoding. One bad entry is skipped; it must not abort
-    the scan.
+    ``None`` is not an empty group. A missing ``/proc`` (macOS) or a failed
+    listing cannot prove the group is empty, so the caller must still signal it.
+    ``stat`` is read in binary: a process name is an arbitrary byte string.
+    One bad entry is skipped.
     """
+    if not os.path.isdir(proc_root):
+        return None
     try:
         names = os.listdir(proc_root)
     except (OSError, UnicodeError, ValueError):
-        return
+        return None
+    rows: list[tuple[bytes, bytes, bytes, bytes]] = []
     for name in names:
         if not str(name).isdigit():
             continue
@@ -263,61 +273,93 @@ def _proc_stats(proc_root: str = "/proc"):
             end = raw.rfind(b")")
             if end < 0:
                 continue
-            pid = raw.split(b" ", 1)[0]
+            member = raw.split(b" ", 1)[0]
             fields = raw[end + 2:].split()
             if len(fields) < 3:
                 continue
             # state, ppid, pgrp. The command name can contain spaces and any
             # bytes, so it is taken off above, at the last ")".
-            yield pid, fields[0], fields[1], fields[2]
+            rows.append((member, fields[0], fields[1], fields[2]))
         except (OSError, UnicodeError, ValueError):
             continue
+    return rows
 
 
-def _group_has_live_member(pgid: int, proc_root: str = "/proc") -> bool:
-    """True if some process in ``pgid`` is still running.
+def _group_has_live_member(pgid: int, proc_root: str = "/proc") -> bool | None:
+    """Whether a running process in ``pgid`` is visible.
 
-    Zombies are not live. ``/proc`` is how a non-parent can see a same-group
-    child that was reparented when the leader exited. Without it, the caller
-    cannot tell, and the answer is false.
+    ``True`` means one is running. ``False`` means a completed scan saw none.
+    ``None`` means the scan could not be completed, which is not proof of an
+    empty group. Zombies are not live.
     """
+    rows = _read_proc_stats(proc_root)
+    if rows is None:
+        return None
     token = str(pgid).encode()
-    for _pid, state, _ppid, pgrp in _proc_stats(proc_root):
+    for _pid, state, _ppid, pgrp in rows:
         if pgrp == token and state not in (b"Z", b"X"):
             return True
     return False
 
 
-def _group_still_blocking(pgid: int) -> bool:
-    """True while a same-group process would still look alive to the caller.
+def _collect_our_zombies(pgid: int, rows: list[tuple[bytes, bytes, bytes, bytes]]) -> None:
+    """Collect same-group zombies that this process parents. Not ``waitpid(-1)``.
 
-    A running member counts. So does a zombie reparented to init: ``kill(pid, 0)``
-    succeeds until that zombie is collected. A zombie we parent, including the
-    leader, is left for our own ``wait``.
+    A subreaper adopts a killed descendant when its parent exits. ``wait`` on
+    the leader does not collect that zombie, and ``kill(pid, 0)`` still succeeds
+    until something does. The leader itself is left for ``Popen.wait``.
     """
     leader = str(pgid).encode()
     me = str(os.getpid()).encode()
-    for pid, state, ppid, pgrp in _proc_stats():
+    for member, state, ppid, pgrp in rows:
+        if pgrp != leader or member == leader or ppid != me or state not in (b"Z", b"X"):
+            continue
+        try:
+            os.waitpid(int(member), os.WNOHANG)
+        except (ChildProcessError, OSError, ValueError):
+            pass
+
+
+def _group_still_blocking(pgid: int, rows: list[tuple[bytes, bytes, bytes, bytes]]) -> bool:
+    """True while a same-group process would still look alive to the caller.
+
+    A running member counts. A zombie does too: ``kill(pid, 0)`` succeeds until
+    it is collected. The leader's own zombie is the exception, because
+    ``Popen.wait`` collects that one and this sweep must not wait out the
+    deadline for it. Every other zombie, including one this process parents,
+    keeps the sweep going until a later snapshot shows it is gone.
+    """
+    leader = str(pgid).encode()
+    for member, state, _ppid, pgrp in rows:
         if pgrp != leader:
             continue
-        if state in (b"Z", b"X") and (pid == leader or ppid == me):
+        if member == leader and state in (b"Z", b"X"):
             continue
         return True
     return False
 
 
-def _until_group_dead(pgid: int) -> None:
-    """Return once ``pgid`` will not look running, without collecting any child.
+def _until_group_dead(pgid: int, deadline: float | None = None) -> None:
+    """Return once ``pgid`` will not look running, and collect our zombies.
 
-    SIGKILL does not finish inside the ``killpg`` call. Collecting the leader
-    immediately lets a caller observe the same-group child still running.
+    SIGKILL does not finish inside the ``killpg`` call. The sweep is bounded by
+    ``deadline`` (two seconds when omitted). Each zombie is collected by its own
+    pid. There is no ``waitpid(-1)``.
     """
+    if deadline is None:
+        deadline = time.monotonic() + 2.0
     if not os.path.isdir("/proc"):
-        time.sleep(0.05)
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(0.05, remaining))
         return
-    deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline:
-        if not _group_still_blocking(pgid):
+        rows = _read_proc_stats()
+        if rows is None:
+            return
+        _collect_our_zombies(pgid, rows)
+        rows = _read_proc_stats()
+        if rows is None or not _group_still_blocking(pgid, rows):
             return
         time.sleep(0.001)
 
@@ -366,16 +408,17 @@ def _reap(proc: subprocess.Popen) -> None:
     deadline instead.
     """
     pid = proc.pid
+    deadline = time.monotonic() + 2.0
     if os.name != "nt" and isinstance(pid, int) and pid > 0:
-        # Signal before collecting. A leader that Popen.wait already collected
-        # (its KeyboardInterrupt handler does that) still names the group while
-        # a same-group child is running.
-        if proc.returncode is None and _leader_unreaped(pid):
+        # Signal before collecting. A scan that cannot prove the group is empty,
+        # including a missing /proc, is not a reason to skip killpg. A leader
+        # that Popen.wait already collected still names the group while a
+        # same-group child is running.
+        leader_open = proc.returncode is None and _leader_unreaped(pid)
+        seen = None if leader_open else _group_has_live_member(pid)
+        if leader_open or seen is not False:
             _signal_group(proc, pid)
-            _until_group_dead(pid)
-        elif _group_has_live_member(pid):
-            _signal_group(proc, pid)
-            _until_group_dead(pid)
+        _until_group_dead(pid, deadline)
     elif os.name == "nt" and proc.returncode is None and proc.poll() is None:
         try:
             proc.kill()
@@ -387,12 +430,16 @@ def _reap(proc: subprocess.Popen) -> None:
         # Still our child, so this pid is still the group id.
         if os.name != "nt" and isinstance(pid, int) and pid > 0 and proc.returncode is None:
             _signal_group(proc, pid)
-            _until_group_dead(pid)
+            _until_group_dead(pid, deadline)
         try:
             proc.kill()
         except OSError:
             pass
         proc.wait(timeout=5)
+    # Reparenting finishes when the leader is collected. A subreaper then owns
+    # the descendant zombie and has to collect it by pid.
+    if os.name != "nt" and isinstance(pid, int) and pid > 0:
+        _until_group_dead(pid, max(deadline, time.monotonic() + 0.05))
 
 
 def _readable(fd: int, remain: float) -> bool:

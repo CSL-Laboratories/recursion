@@ -463,7 +463,12 @@ class ReadHelpTest(unittest.TestCase):
                     os.close(write_fd)
                     write_fd = -1
                     pid = int(os.read(read_fd, 64))
-                    survived[mode] = os.waitpid(pid, os.WNOHANG) == (0, 0)
+                    # A collected zombie raises ChildProcessError. That descendant
+                    # is not running, and it is not left for a later wait.
+                    try:
+                        survived[mode] = os.waitpid(pid, os.WNOHANG) == (0, 0)
+                    except ChildProcessError:
+                        survived[mode] = False
                 finally:
                     if write_fd >= 0:
                         os.close(write_fd)
@@ -558,7 +563,153 @@ class ReadHelpTest(unittest.TestCase):
             (other / "stat").write_bytes(b"8 (ok) S 1 3 1 0\n")
             self.assertTrue(bd._group_has_live_member(77, proc_root=str(root)))
             self.assertTrue(bd._group_has_live_member(3, proc_root=str(root)))
-            self.assertFalse(bd._group_has_live_member(3, proc_root=str(root / "missing")))
+            # A directory that is not there cannot prove the group is empty.
+            self.assertIsNone(bd._group_has_live_member(3, proc_root=str(root / "missing")))
+            # A completed scan that does not see the group is empty, not unknown.
+            self.assertFalse(bd._group_has_live_member(99, proc_root=str(root)))
+
+    @unittest.skipUnless(hasattr(os, "fork") and hasattr(os, "killpg") and hasattr(os, "waitid"),
+                         "POSIX process groups")
+    def test_unavailable_proc_scan_still_signals_the_group(self) -> None:
+        # A missing /proc used to look like an empty group, so Ctrl-C during the
+        # EOF wait never called killpg and the same-group child kept running.
+        # Timeout must signal too. ESRCH after the group is gone is success.
+        calls: list[tuple[int, int]] = []
+        real_killpg = os.killpg
+
+        def spy(pgid: int, sig: int) -> None:
+            calls.append((pgid, sig))
+            real_killpg(pgid, sig)
+
+        def gone(pid: int) -> bool:
+            deadline = time.monotonic() + 1.0
+            while True:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    return True
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.01)
+
+        leader = None
+        try:
+            calls.clear()
+            with patch.object(bd, "_read_proc_stats", return_value=None), patch.object(os, "killpg", spy):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    bd._bounded_run(
+                        [sys.executable, "-B", "-c", "import time; time.sleep(30)"],
+                        env={}, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL, timeout=0.1, check=False, shell=False)
+            self.assertTrue(calls)
+            self.assertTrue(all(sig == signal.SIGKILL for _pgid, sig in calls))
+            leader = calls[0][0]
+            self.assertTrue(gone(leader))
+        finally:
+            if leader is not None:
+                try:
+                    os.kill(leader, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+        read_fd, write_fd = os.pipe()
+        injected = False
+        child = None
+        original = subprocess.Popen._wait
+        code = (
+            "import os, time\n"
+            "if os.fork() == 0:\n"
+            "    os.write(0, str(os.getpid()).encode())\n"
+            "    os.close(1)\n"
+            "    time.sleep(10)\n"
+            "    os._exit(0)\n"
+            "time.sleep(0.15)\n"
+        )
+
+        def interrupted_wait(proc, *args, **kwargs):
+            nonlocal injected
+            if not injected:
+                injected = True
+                raise KeyboardInterrupt
+            return original(proc, *args, **kwargs)
+
+        calls.clear()
+        try:
+            with patch.object(bd, "_read_proc_stats", return_value=None), patch.object(
+                    os, "killpg", spy), patch.object(subprocess.Popen, "_wait", interrupted_wait):
+                try:
+                    bd._bounded_run(
+                        [sys.executable, "-B", "-c", code],
+                        stdin=write_fd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                        timeout=2, check=False, shell=False)
+                except KeyboardInterrupt:
+                    pass
+            os.close(write_fd)
+            write_fd = -1
+            child = int(os.read(read_fd, 64))
+            self.assertTrue(calls)
+            self.assertTrue(all(sig == signal.SIGKILL for _pgid, sig in calls))
+            self.assertTrue(gone(child))
+        finally:
+            if write_fd != -1:
+                os.close(write_fd)
+            os.close(read_fd)
+            if child is not None:
+                try:
+                    os.kill(child, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux subreaper")
+    def test_subreaper_collects_same_group_zombies(self) -> None:
+        # A killed descendant reparents here when this process is a subreaper.
+        # Waiting for the leader alone leaves that zombie, and kill(pid, 0) still
+        # succeeds. The group sweep has to collect it by pid.
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(36, 1, 0, 0, 0):
+            self.skipTest("prctl subreaper is not available")
+        read_fd, write_fd = os.pipe()
+        pid = None
+        code = (
+            "import os, time\n"
+            "if os.fork():\n"
+            "    os._exit(0)\n"
+            "os.write(0, str(os.getpid()).encode())\n"
+            "time.sleep(30)\n"
+        )
+        try:
+            try:
+                bd._bounded_run(
+                    [sys.executable, "-B", "-c", code],
+                    env={}, stdin=write_fd, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL, timeout=0.2, check=False, shell=False)
+            except subprocess.TimeoutExpired:
+                pass
+            os.close(write_fd)
+            write_fd = -1
+            pid = int(os.read(read_fd, 64))
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+            try:
+                waited = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                waited = None
+            self.assertIsNone(waited)
+            self.assertFalse(os.path.exists(f"/proc/{pid}"))
+        finally:
+            if write_fd != -1:
+                os.close(write_fd)
+            os.close(read_fd)
+            if pid is not None:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    os.waitpid(pid, 0)
+                except ChildProcessError:
+                    pass
+            libc.prctl(36, 0, 0, 0, 0)
 
     @unittest.skipUnless(os.environ.get("RECURSION_LIVE_CLAUDE_HELP") == "1" and shutil.which("claude"),
                          "set RECURSION_LIVE_CLAUDE_HELP=1 with claude on PATH")

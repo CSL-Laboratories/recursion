@@ -1041,5 +1041,126 @@ class RoundFourTest(unittest.TestCase):
         self.assertEqual(stored["state"], "stopped")
 
 
+class RoundFiveTest(unittest.TestCase):
+    def test_same_key_retry_keeps_the_cgroup_after_a_failed_stop_write(self) -> None:
+        class FailRunningAndStopped(InMemoryRunRegistry):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fail = True
+
+            def put(self, record: dict):
+                if self.fail and record.get("state") in ("running", "stopped"):
+                    raise OSError("write unavailable")
+                return super().put(record)
+
+        reg = FailRunningAndStopped()
+        api = ControlAPI(reg, FakeKillTree(), lambda _: {"cgroup": "A"}, lambda: 1.0,
+                         new_run_id=lambda: "r")
+        params = {"tenant": "t", "engine": "e", "prompt": "p", "client_key": "k"}
+        api.call("run.start", params)
+        failed = api.call("run.stop", {"run_id": "r"})
+        self.assertIs(failed.get("recorded"), False)
+        current = reg.get("r")
+        assert current is not None
+        current["note"] = "new metadata"
+        reg.put(current)
+        reg.fail = False
+        retried = api.call("run.start", params)
+        self.assertEqual(retried["code"], a.STARTED)
+        stored = reg.get("r")
+        assert stored is not None
+        self.assertEqual(stored["cgroup"], "A")
+        self.assertEqual(stored["note"], "new metadata")
+        self.assertEqual(stored["state"], "stopped")
+        later = api.call("run.stop", {"run_id": "r"})
+        self.assertEqual(later["code"], a.STOPPED)
+        self.assertEqual(reg.get("r")["cgroup"], "A")
+
+    def test_a_cgroupless_pending_write_does_not_drop_the_launch_handle(self) -> None:
+        reg = InMemoryRunRegistry()
+        reg.put({"run_id": "r", "tenant": "t", "engine": "e", "state": "starting",
+                 "cgroup": None, "stop": None, "start_key": None})
+        current = reg.get("r")
+        assert current is not None
+        current["note"] = "meta"
+        reg.put(current)
+        fresh = reg.get("r")
+        assert fresh is not None
+        stale = dict(fresh)
+        stale["generation"] = fresh["generation"] - 1
+        stale["state"] = "stopped"
+        stale["cgroup"] = "A"
+        stale["cgroup_marker"] = "cg-9"
+        stale["stop"] = {"requested_at": 1.0, "checks": 1, "reason": None, "requested": True,
+                         "cgroup": "A", "cgroup_marker": "cg-9"}
+        stale["stop_attestation"] = {"proof": "empty", "cgroup": "A", "cgroup_marker": "cg-9",
+                                     "member_ids": [], "generation": stale["generation"]}
+        api, _, _, _ = make_api(registry=reg)
+        api._launched["r"] = dict(stale)
+        api._recorded({"code": a.STOPPED, "run_id": "r", "state": "stopped", "repeat": True},
+                      dict(stale), reconfirm=False)
+        self.assertEqual(api._launched["r"]["cgroup"], "A")
+        self.assertIsNone(reg.get("r")["cgroup"])
+
+    def test_a_restored_registry_does_not_reissue_a_loaded_marker(self) -> None:
+        original = InMemoryRunRegistry()
+        original.put({"run_id": "r", "tenant": "t", "engine": "e", "state": "running",
+                      "cgroup": "X", "stop": None, "start_key": None})
+        rec = original.get("r")
+        assert rec is not None
+        rec["cgroup"] = "A"
+        original.put(rec)
+        held = original.get("r")["cgroup_marker"]
+        restored = InMemoryRunRegistry(original.list())
+        self.assertEqual(restored.get("r")["cgroup_marker"], held)
+        current = restored.get("r")
+        assert current is not None
+        current["cgroup"] = "B"
+        restored.put(current)
+        current = restored.get("r")
+        assert current is not None
+        current["cgroup"] = "A"
+        restored.put(current)
+        self.assertNotEqual(restored.get("r")["cgroup_marker"], held)
+
+    def test_a_reloaded_marker_cannot_reuse_an_older_empty_result(self) -> None:
+        original = InMemoryRunRegistry()
+        original.put({"run_id": "r", "tenant": "t", "engine": "e", "state": "running",
+                      "cgroup": "X", "stop": None, "start_key": None})
+        rec = original.get("r")
+        assert rec is not None
+        rec["cgroup"] = "A"
+        original.put(rec)
+        held = original.get("r")["cgroup_marker"]
+        reg = InMemoryRunRegistry(original.list())
+
+        class SwapBack:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def request_stop(self, cgroup: str) -> None:
+                return None
+
+            def confirm(self, cgroup: str, timeout_s: float) -> str:
+                self.calls += 1
+                if self.calls > 1:
+                    return POPULATED
+                for path in ("B", "A"):
+                    current = reg.get("r")
+                    assert current is not None
+                    current["cgroup"] = path
+                    reg.put(current)
+                return EMPTY
+
+        kill = SwapBack()
+        api = ControlAPI(reg, kill, lambda _: {}, lambda: 1.0)
+        api.call("run.stop", {"run_id": "r"})
+        stored = reg.get("r")
+        assert stored is not None
+        self.assertGreater(kill.calls, 1)
+        self.assertNotEqual(stored["cgroup_marker"], held)
+        self.assertNotEqual(stored["state"], "stopped")
+
+
 if __name__ == "__main__":
     unittest.main()

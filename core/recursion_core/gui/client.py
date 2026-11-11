@@ -36,9 +36,12 @@ Transport = Callable[[str, str, "bytes | None"], "tuple[int, bytes]"]
 
 
 class ControlError(Exception):
-    def __init__(self, code: str) -> None:
+    """``refused`` is the control API's own reason when it answered with a typed refusal, else None."""
+
+    def __init__(self, code: str, *, refused: str | None = None) -> None:
         super().__init__(code)
         self.code = code
+        self.refused = refused
 
 
 def o7_command(command: str, surface: str, confirmed: bool, request_id: str | None = None) -> dict:
@@ -71,7 +74,12 @@ class ControlClient:
             raise ControlError("control_api_unavailable") from None
         if status != 200:
             code = data.get("error") if type(data) is dict else None
-            raise ControlError("control_api_%d:%s" % (status, code if type(code) is str else "error"))
+            # A typed refusal: the request arrived and the control API answered, with its own
+            # error string, a status it gives before dispatching anything (4xx, 503). Any other
+            # status (502 and 504 follow a dispatch) is not a statement that nothing ran.
+            typed = type(code) is str and type(status) is int and (400 <= status < 500 or status == 503)
+            raise ControlError("control_api_%d:%s" % (status, code if type(code) is str else "error"),
+                               refused=code if typed else None)
         return data
 
     def routes(self) -> list:

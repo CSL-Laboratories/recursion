@@ -477,6 +477,36 @@ class PageTests(GuiHarness):
                 self.assertIn("Check the run and event log before retrying", body)
                 self.assertNotIn("not sent", body.lower())
 
+    def test_typed_daemon_refusal_of_an_intervention_says_not_sent(self) -> None:
+        # ADV2-9: the control API answered with its own refusal before dispatching (4xx, 503).
+        reason = 'unavailable: <b>"x"</b> & more'
+        for status in (400, 404, 409, 503):
+            with self.subTest(status=status):
+                reply = (status, json.dumps({"error": reason}).encode())
+                self.app = Application(ControlClient(lambda *a, reply=reply: reply), _Door(), frozenset({HOST}),
+                                       frozenset({ORIGIN}))
+                body = self.request("POST", "/action", {"command": ACTIONS[0], "confirm": "explicit"})[2]
+                self.assertIn('<p role="status">Not sent: refused by the daemon '
+                              "(unavailable: &lt;b&gt;&quot;x&quot;&lt;/b&gt; &amp; more); "
+                              "run Stop is available</p>", body)
+                self.assertNotIn("<b>", body)
+                self.assertNotIn("outcome: unknown", body)
+                self.assertNotIn("may have reached", body)
+
+    def test_answers_that_are_not_typed_refusals_stay_outcome_unknown(self) -> None:
+        # After a dispatch (502, 504), a server error, or a refusal status with no error string.
+        replies = {"500": (500, b'{"error": "internal"}'), "502": (502, b'{"error": "plugin failed"}'),
+                   "504": (504, b'{"error": "timed out"}'), "503_no_error": (503, b"{}"),
+                   "503_non_string": (503, b'{"error": 7}'), "400_not_object": (400, b"[]")}
+        for name, reply in replies.items():
+            with self.subTest(reply=name):
+                self.app = Application(ControlClient(lambda *a, reply=reply: reply), _Door(), frozenset({HOST}),
+                                       frozenset({ORIGIN}))
+                body = self.request("POST", "/action", {"command": ACTIONS[0], "confirm": "explicit"})[2]
+                self.assertIn("Intervention outcome: unknown", body)
+                self.assertIn("may have reached", body)
+                self.assertNotIn("refused by the daemon", body)
+
     def test_intervention_refused_before_sending_says_not_sent(self) -> None:
         class RefusingClient(ControlClient):
             def operator(self, command, confirmed=False):

@@ -317,15 +317,34 @@ class Adv2RenderingTests(GuiCase):
         self.assertEqual(status, 200)
         self.assertGreater(len(page), 2_000_000)
 
-    @unittest.expectedFailure  # ADV2-9: owner decision pending (S34 GUI wording item); a refused intervention reads "outcome: unknown"
+    # ADV2-9 (owner call Nov 11 2:20am PST): a typed refusal from the daemon reads "Not sent".
     def test_a_refused_intervention_does_not_read_as_maybe_sent(self):
         host = plugins.PluginHost.__new__(plugins.PluginHost)  # only operator()'s ACTIONS branch runs
         _, transport = control_over(host)
         with LoopbackGUI(ControlClient(transport), lambda env: True, port=0) as gui:
             status, page = self.post(gui, '/action', {'command': ACTIONS[0], 'confirm': 'explicit'})
         self.assertEqual(status, 200)
-        self.assertIn('nothing was sent', page)  # the daemon's refusal is visible...
-        self.assertNotIn('may have reached', page)  # ...but the headline says it may have been sent
+        self.assertIn('<p role="status">Not sent: refused by the daemon (unavailable: operator interventions are '
+                      'not wired to the daemon; nothing was sent (run Stop is available)); '
+                      'run Stop is available</p>', page)
+        self.assertIn('<title>Not sent', page)
+        self.assertNotIn('may have reached', page)
+        self.assertNotIn('outcome: unknown', page)
+        self.assertNotIn('outcome unknown', page)
+
+    def test_a_transport_failure_on_an_intervention_still_reads_outcome_unknown(self):
+        sent = []
+
+        def transport(method, path, body):
+            sent.append(path)
+            raise ConnectionResetError('the answer never came back')
+        with LoopbackGUI(ControlClient(transport), lambda env: True, port=0) as gui:
+            status, page = self.post(gui, '/action', {'command': ACTIONS[0], 'confirm': 'explicit'})
+        self.assertEqual((status, sent), (200, ['/v1/operator']))
+        self.assertIn('Intervention outcome: unknown', page)
+        self.assertIn('may have reached', page)
+        self.assertNotIn('Not sent', page)
+        self.assertNotIn('refused by the daemon', page)
 
 
 if __name__ == '__main__':

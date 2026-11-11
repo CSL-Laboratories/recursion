@@ -380,6 +380,10 @@ class Application:
         except ControlError as exc:
             if exc.code in _REFUSED_BEFORE_SENDING:
                 return "Request not sent", '<p role="status">Request not sent: %s</p>' % escape(exc.code)
+            if exc.refused is not None:
+                # ADV2-9: the control API answered with a typed refusal, so nothing was executed.
+                return "Not sent", ('<p role="status">Not sent: refused by the daemon (%s); '
+                                    "run Stop is available</p>" % escape(exc.refused))
             # Sent, but no readable answer: the control API may have recorded it.
             return "Intervention outcome unknown", (
                 '<p role="status">Intervention outcome: unknown. The request may have reached the '

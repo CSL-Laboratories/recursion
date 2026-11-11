@@ -23,7 +23,7 @@ from recursion_core.control.registry import StopUnattested
 from recursion_core.daemon import Daemon, Registry, RUN_ID
 from recursion_core.daemon import control_adapter as adapter
 from recursion_core.daemon import engine_exec, launcher
-from recursion_core.daemon.tests.test_adv1_helpers import BOOT, ComposedBase, ProcessUnitManager, wait_for
+from recursion_core.daemon.tests.adv1_support import BOOT, ComposedBase, ProcessUnitManager, wait_for
 
 LINUX = sys.platform.startswith('linux')
 UNIT = 'recursion-run-run-x.service'

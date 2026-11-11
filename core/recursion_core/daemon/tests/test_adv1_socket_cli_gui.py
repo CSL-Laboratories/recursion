@@ -29,7 +29,7 @@ from recursion_core.daemon import AlreadyRunning, Daemon, Registry, UserLock
 from recursion_core.daemon import control_adapter as adapter
 from recursion_core.daemon import launcher
 from recursion_core.daemon.gui import LoopbackGUI
-from recursion_core.daemon.tests.test_adv1_helpers import BOOT, ComposedBase, wait_for
+from recursion_core.daemon.tests.adv1_support import BOOT, ComposedBase, wait_for
 
 LINUX = sys.platform.startswith('linux')
 CORE = str(Path(launcher.__file__).parents[2])

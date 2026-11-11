@@ -14,6 +14,8 @@ from recursion_core.canonical_form import vectors_build as vb
 from recursion_core.canonical_form.canonical import (
     CanonicalError,
     canonical_bytes,
+    check_value,
+    digest,
     digest_text,
     loads_strict,
 )
@@ -59,6 +61,45 @@ class CanonicalDefectTests(unittest.TestCase):
                 self.assertEqual("not_json", cm.exception.kind)
         self.assertEqual(0, loads_strict(b"0"))
         self.assertEqual(0, loads_strict("0"))
+
+    def test_post_decode_validation_does_not_leak_recursion_error(self) -> None:
+        # json.loads of 128 arrays succeeds on the C scanner, then check_value
+        # and the serializer used to recurse. A caller already near the recursion
+        # limit saw RecursionError instead of a value or CanonicalError("depth").
+        old = sys.getrecursionlimit()
+        sys.setrecursionlimit(100)
+        try:
+            try:
+                value = loads_strict("[" * 128 + "0" + "]" * 128)
+                self.assertTrue(canonical_bytes(value).startswith(b"["))
+                self.assertEqual(64, len(digest(value)))
+                built = 0
+                for _ in range(80):
+                    built = [built]
+                self.assertIsInstance(canonical_bytes(built), bytes)
+                too_deep = 0
+                for _ in range(200):
+                    too_deep = [too_deep]
+                with self.assertRaises(CanonicalError) as cm:
+                    check_value(too_deep)
+                self.assertEqual("depth", cm.exception.kind)
+                with self.assertRaises(CanonicalError) as cm:
+                    canonical_bytes(too_deep)
+                self.assertEqual("depth", cm.exception.kind)
+            except RecursionError as exc:
+                self.fail(f"post-decode validation leaked RecursionError: {exc}")
+        finally:
+            sys.setrecursionlimit(old)
+
+    def test_iterative_validation_keeps_first_fault_order(self) -> None:
+        # The first key is fully checked before the next key's type. A later
+        # non-string key must not hide a lone surrogate in an earlier key.
+        with self.assertRaises(CanonicalError) as cm:
+            check_value({"\ud800": 1, 2: 3})
+        self.assertEqual("lone_surrogate", cm.exception.kind)
+        with self.assertRaises(CanonicalError) as cm:
+            check_value({2: 3, "a": 1})
+        self.assertEqual("non_string_key", cm.exception.kind)
 
 
 class WireProfileAgreementTests(unittest.TestCase):
@@ -149,6 +190,15 @@ class OwnerQuestionLocks(unittest.TestCase):
             self.assertEqual([], run_field_errors({**base, "stop": missing}))
             unconfirmed = {**base["stop"], "confirmed_at": None}
             self.assertEqual([], run_field_errors({**base, "stop": unconfirmed}))
+
+    def test_noncharacters_are_currently_in_domain(self) -> None:
+        # Owner question: RFC 7493 forbids noncharacters, and the wire decoder
+        # rejects them. This profile follows RFC 8785 and currently accepts every
+        # scalar, including U+FDD0 and U+10FFFF. Not changed.
+        for text in ('"\\ufdd0"', '"\\ufffe"', '"\\udbff\\udfff"'):
+            value = loads_strict(text)
+            self.assertEqual(value, loads_strict(canonical_bytes(value)))
+            self.assertEqual(64, len(digest(value)))
 
 
 if __name__ == "__main__":

@@ -108,33 +108,53 @@ def loads_strict(data: str | bytes) -> Any:
 
 
 def check_value(value: Any, depth: int = 0) -> None:
-    """Raise :class:`CanonicalError` if an in-memory value is outside the domain."""
-    if depth > MAX_DEPTH:
-        raise CanonicalError("depth", f"nesting deeper than {MAX_DEPTH}")
-    if isinstance(value, str):
-        try:
-            value.encode("utf-8")
-        except UnicodeEncodeError:
-            raise CanonicalError("lone_surrogate") from None
-    elif isinstance(value, bool) or value is None:
-        pass
-    elif isinstance(value, int):
-        if not -MAX_SAFE <= value <= MAX_SAFE:
-            raise CanonicalError("integer_range")
-    elif isinstance(value, float):
-        raise CanonicalError("non_finite" if value != value or value in (float("inf"), float("-inf"))
-                             else "float")
-    elif isinstance(value, list):
-        for item in value:
-            check_value(item, depth + 1)
-    elif isinstance(value, dict):
-        for key, item in value.items():
+    """Raise :class:`CanonicalError` if an in-memory value is outside the domain.
+
+    The walk is an explicit stack. A recursive walk raises ``RecursionError``
+    for an in-domain value when the caller is already near the recursion limit,
+    and for a too-deep value it leaks that error instead of ``depth``.
+    """
+    # ("check", value, depth) or ("dict", items, next_index, depth).
+    # Dict pairs run left to right: the key is fully checked, then its value,
+    # and a non-string key is reported when that pair is reached, not before
+    # earlier pairs.
+    stack: list[tuple] = [("check", value, depth)]
+    while stack:
+        frame = stack.pop()
+        if frame[0] == "dict":
+            _, items, index, depth = frame
+            if index >= len(items):
+                continue
+            key, item = items[index]
             if not isinstance(key, str):
                 raise CanonicalError("non_string_key")
-            check_value(key, depth + 1)
-            check_value(item, depth + 1)
-    else:
-        raise CanonicalError("unsupported_type", type(value).__name__)
+            stack.append(("dict", items, index + 1, depth))
+            stack.append(("check", item, depth + 1))
+            stack.append(("check", key, depth + 1))
+            continue
+        _, current, depth = frame
+        if depth > MAX_DEPTH:
+            raise CanonicalError("depth", f"nesting deeper than {MAX_DEPTH}")
+        if isinstance(current, str):
+            try:
+                current.encode("utf-8")
+            except UnicodeEncodeError:
+                raise CanonicalError("lone_surrogate") from None
+        elif isinstance(current, bool) or current is None:
+            pass
+        elif isinstance(current, int):
+            if not -MAX_SAFE <= current <= MAX_SAFE:
+                raise CanonicalError("integer_range")
+        elif isinstance(current, float):
+            raise CanonicalError("non_finite" if current != current or current in (float("inf"), float("-inf"))
+                                 else "float")
+        elif isinstance(current, list):
+            for item in reversed(current):
+                stack.append(("check", item, depth + 1))
+        elif isinstance(current, dict):
+            stack.append(("dict", list(current.items()), 0, depth))
+        else:
+            raise CanonicalError("unsupported_type", type(current).__name__)
 
 
 _ESC = {'"': '\\"', "\\": "\\\\", "\b": "\\b", "\t": "\\t", "\n": "\\n", "\f": "\\f", "\r": "\\r"}
@@ -159,32 +179,45 @@ def _utf16_key(s: str) -> bytes:
 
 
 def _serialize(value: Any, out: list[str]) -> None:
-    if value is None:
-        out.append("null")
-    elif value is True:
-        out.append("true")
-    elif value is False:
-        out.append("false")
-    elif isinstance(value, int):
-        out.append(str(value))
-    elif isinstance(value, str):
-        out.append(_string(value))
-    elif isinstance(value, list):
-        out.append("[")
-        for i, item in enumerate(value):
-            if i:
-                out.append(",")
-            _serialize(item, out)
-        out.append("]")
-    else:
-        out.append("{")
-        for i, key in enumerate(sorted(value, key=_utf16_key)):
-            if i:
-                out.append(",")
-            out.append(_string(key))
-            out.append(":")
-            _serialize(value[key], out)
-        out.append("}")
+    """Append canonical JSON for ``value``. Iterative, same bytes as the recursive form.
+
+    ``check_value`` has already rejected anything that is not null, a boolean,
+    an in-range int, a string, a list, or a dict with string keys.
+    """
+    stack: list[tuple] = [("val", value)]
+    while stack:
+        kind, current = stack.pop()
+        if kind == "lit":
+            out.append(current)
+            continue
+        if current is None:
+            out.append("null")
+        elif current is True:
+            out.append("true")
+        elif current is False:
+            out.append("false")
+        elif isinstance(current, int):
+            out.append(str(current))
+        elif isinstance(current, str):
+            out.append(_string(current))
+        elif isinstance(current, list):
+            stack.append(("lit", "]"))
+            for index in range(len(current) - 1, -1, -1):
+                stack.append(("val", current[index]))
+                if index:
+                    stack.append(("lit", ","))
+            stack.append(("lit", "["))
+        else:
+            keys = sorted(current, key=_utf16_key)
+            stack.append(("lit", "}"))
+            for index in range(len(keys) - 1, -1, -1):
+                key = keys[index]
+                stack.append(("val", current[key]))
+                stack.append(("lit", ":"))
+                stack.append(("lit", _string(key)))
+                if index:
+                    stack.append(("lit", ","))
+            stack.append(("lit", "{"))
 
 
 def canonical_bytes(value: Any) -> bytes:

@@ -5,7 +5,7 @@ Provider-free: loads tools/contract_fixtures/manifest.json, validates every
 positive fixture against its declared schema $def and every adverse fixture to
 rejection. Checks beyond JSON Schema are declared in the manifest and enforced
 here: strict I-JSON decoding (duplicate keys, floats, lexical -0, non-I-JSON
-constants, unpaired surrogates), x-sorted-set, x-calendar-date, x-preferred-in-supported and
+constants, unpaired surrogates, Unicode noncharacters), x-sorted-set, x-calendar-date, x-preferred-in-supported and
 x-sunset-subset-of-supported. Manifest "sequences" entries pin the command
 journal's replay/conflict semantics as ordered send/expect scenarios.
 """
@@ -65,12 +65,11 @@ def _reject_non_ijson(token: str):
 
 
 def _reject_unpaired_surrogates(value) -> None:
-    """I-JSON forbids unpaired surrogates. json.loads keeps them as str.
+    """I-JSON forbids unpaired surrogates and Unicode noncharacters.
 
-    The walk is an explicit stack. json.loads accepts nesting a recursive
-    walk cannot visit (about 999 through 9998 empty arrays at the default
-    recursion limit), and that walk used to raise RecursionError after the
-    json.loads guard had already returned.
+    ``json.loads`` keeps both. The walk is an explicit stack: a recursive walk
+    raises ``RecursionError`` on nesting the host decoder can still return
+    (about 999 through 9998 empty arrays at the default recursion limit).
     """
     pending = [value]
     while pending:
@@ -80,6 +79,12 @@ def _reject_unpaired_surrogates(value) -> None:
                 current.encode("utf-8")
             except UnicodeEncodeError as exc:
                 raise StrictDecodeError("unpaired surrogate") from exc
+            # RFC 7493: member names and string values must not contain
+            # noncharacters (U+FDD0..U+FDEF and every plane's U+FFFE/U+FFFF).
+            for char in current:
+                code = ord(char)
+                if 0xFDD0 <= code <= 0xFDEF or (code & 0xFFFF) >= 0xFFFE:
+                    raise StrictDecodeError("unicode noncharacter")
         elif isinstance(current, list):
             pending.extend(current)
         elif isinstance(current, dict):
@@ -88,7 +93,7 @@ def _reject_unpaired_surrogates(value) -> None:
 
 
 def strict_load(path: Path):
-    """I-JSON profile decode: no duplicate keys, floats, -0, NaN/Infinity, or unpaired surrogates.
+    """I-JSON profile decode: no duplicate keys, floats, -0, NaN/Infinity, unpaired surrogates, or noncharacters.
 
     Invalid UTF-8 and JSON syntax are ``StrictDecodeError``, the same type as
     the other profile refusals. Nesting the host decoder cannot walk is also
@@ -295,10 +300,13 @@ class ContractFixtureTests(unittest.TestCase):
                 self.assertEqual(self.run_journal_sequence(doc), [], entry["id"])
 
     def _load_text(self, text: str):
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json") as handle:
-            handle.write(text)
-            handle.flush()
-            return strict_load(Path(handle.name))
+        # Write and close the file before strict_load opens it. A still-open
+        # NamedTemporaryFile cannot be reopened on Windows, and the windows CI
+        # job runs this module.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "doc.json"
+            path.write_text(text, encoding="utf-8")
+            return strict_load(path)
 
     def test_overlong_integer_is_a_decode_error_not_a_crash(self) -> None:
         # Same input csl-canonical/1 refuses as integer_range. Past CPython's
@@ -316,28 +324,52 @@ class ContractFixtureTests(unittest.TestCase):
             sys.set_int_max_str_digits(old)
 
     def test_deep_nesting_does_not_crash(self) -> None:
-        # json.loads accepts roughly 999-9998 nested containers and first raises
-        # RecursionError near 9999. The surrogate walk used to recurse on the
-        # accepted tree and crash at 1000 and 5000, while 20000 only hit the
-        # json.loads guard. Those mid depths must decode; 20000 must be a
-        # StrictDecodeError, not a RecursionError. This adds no depth cap.
-        def innermost_list(value, depth: int):
-            for _ in range(depth - 1):
-                self.assertIsInstance(value, list)
-                value = value[0]
-            return value
+        # A host may accept these depths (CPython's C scanner does, through
+        # about 9998) or refuse them (the pure-Python scanner does). Refusal
+        # is StrictDecodeError. RecursionError is a crash. Success is allowed:
+        # this decoder has no depth cap of its own. The walk itself is tested
+        # on a tree built in Python, not through the host decoder.
+        def accept_or_strict(text: str, check) -> None:
+            try:
+                value = self._load_text(text)
+            except RecursionError as exc:
+                self.fail(f"decoder crashed: {exc}")
+            except StrictDecodeError:
+                return
+            check(value)
 
-        for depth in (1000, 5000):
+        def peel_list(depth: int):
+            def check(value, depth=depth):
+                for _ in range(depth - 1):
+                    self.assertIsInstance(value, list)
+                    value = value[0]
+                self.assertEqual([], value)
+            return check
+
+        for depth in (1000, 5000, 20000):
             with self.subTest(shape="array", depth=depth):
-                value = self._load_text("[" * depth + "]" * depth)
-                self.assertEqual([], innermost_list(value, depth))
-        objects = self._load_text('{"k":' * 1000 + "0" + "}" * 1000)
-        for _ in range(1000):
-            self.assertIsInstance(objects, dict)
-            objects = objects["k"]
-        self.assertEqual(0, objects)
-        with self.assertRaises(StrictDecodeError):
-            self._load_text("[" * 20000 + "]" * 20000)
+                accept_or_strict("[" * depth + "]" * depth, peel_list(depth))
+        def peel_object(value):
+            for _ in range(1000):
+                self.assertIsInstance(value, dict)
+                value = value["k"]
+            self.assertEqual(0, value)
+        with self.subTest(shape="object", depth=1000):
+            accept_or_strict('{"k":' * 1000 + "0" + "}" * 1000, peel_object)
+
+    def test_string_walk_handles_a_python_built_deep_tree(self) -> None:
+        # Independent of json.loads. 5000 is inside the window where a recursive
+        # walk raises RecursionError and the C scanner still returns a value.
+        clean = "ok"
+        for _ in range(5000):
+            clean = [clean]
+        _reject_unpaired_surrogates(clean)
+        surrogate = "\ud800"
+        for _ in range(5000):
+            surrogate = {"k": surrogate}
+        with self.assertRaises(StrictDecodeError) as cm:
+            _reject_unpaired_surrogates(surrogate)
+        self.assertIn("unpaired surrogate", str(cm.exception))
 
     def test_decode_failures_are_strict_decode_errors(self) -> None:
         # Invalid UTF-8, a BOM, and trailing data must not leak the host
@@ -349,33 +381,62 @@ class ContractFixtureTests(unittest.TestCase):
         }
         for name, raw in cases.items():
             with self.subTest(name=name):
-                with tempfile.NamedTemporaryFile(suffix=".json") as handle:
-                    handle.write(raw)
-                    handle.flush()
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "doc.json"
+                    path.write_bytes(raw)
                     with self.assertRaises(StrictDecodeError):
-                        strict_load(Path(handle.name))
+                        strict_load(path)
 
     def test_decoder_currently_has_no_nesting_cap(self) -> None:
         # Owner question: csl-canonical/1 refuses 130 empty arrays as depth
         # (test_depth_counts_empty_containers_one_level_deeper_than_scalars).
-        # This decoder has no cap and accepts 130, 500, and 998. Not changed.
-        def innermost(value, depth: int):
-            for _ in range(depth - 1):
-                value = value[0]
-            return value
-
+        # This decoder adds no cap. A tree built in Python is always accepted.
+        # JSON text is accepted when the host parser can build it, and is
+        # StrictDecodeError when the host cannot. RecursionError is a crash.
         for depth in (130, 500, 998):
             with self.subTest(depth=depth):
-                self.assertEqual([], innermost(self._load_text("[" * depth + "]" * depth), depth))
+                node: object = []
+                for _ in range(depth - 1):
+                    node = [node]
+                _reject_unpaired_surrogates(node)
+                try:
+                    value = self._load_text("[" * depth + "]" * depth)
+                except RecursionError as exc:
+                    self.fail(f"decoder crashed: {exc}")
+                except StrictDecodeError:
+                    continue
+                for _ in range(depth - 1):
+                    self.assertIsInstance(value, list)
+                    value = value[0]
+                self.assertEqual([], value)
 
     def test_unpaired_surrogate_is_rejected(self) -> None:
         # The wire profile says I-JSON: no unpaired surrogates. csl-canonical/1
-        # refuses these as lone_surrogate. strict_load currently returns them.
+        # refuses these as lone_surrogate.
         for text in ('"\\ud800"', '{"a":"\\ud800"}', '{"\\ud800":1}',
                      "[" * 1000 + '"\\ud800"' + "]" * 1000):
             with self.subTest(text=text):
                 with self.assertRaises(StrictDecodeError):
                     self._load_text(text)
+
+    def test_unicode_noncharacters_are_rejected(self) -> None:
+        # RFC 7493 I-JSON forbids noncharacters in member names and string values.
+        codes = [0xFDD0, 0xFDEF, 0xFFFE, 0xFFFF]
+        codes.extend((plane << 16) + slot for plane in range(17) for slot in (0xFFFE, 0xFFFF))
+        for code in codes:
+            char = chr(code)
+            for value in (char, {"x": char}, {char: 1}, ["a", {"b": [char]}]):
+                with self.subTest(code=hex(code), shape=type(value).__name__):
+                    with self.assertRaises(StrictDecodeError) as cm:
+                        _reject_unpaired_surrogates(value)
+                    self.assertIn("noncharacter", str(cm.exception))
+        for text in ('"\\ufdd0"', '{"\\ufdd0":1}', '{"x":"\\ufdd0"}', '["\\udbff\\udfff"]'):
+            with self.subTest(text=text):
+                with self.assertRaises(StrictDecodeError) as cm:
+                    self._load_text(text)
+                self.assertIn("noncharacter", str(cm.exception))
+        for ok in ("\ufffd", "\ufdf0", "\ue000", "\U0010fffd", "\u0001"):
+            self.assertEqual(ok, self._load_text(json.dumps(ok)))
 
     def test_semantic_checks_do_not_crash_on_unhashable_or_scalar_documents(self) -> None:
         fixture = {"target": "wire_version_advertisement"}

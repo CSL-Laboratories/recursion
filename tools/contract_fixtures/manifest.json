@@ -8,7 +8,7 @@
     "reject": "document fails schema validation or a declared semantic rule"
   },
   "semantic_rules": {
-    "strict-decode": "I-JSON profile: no duplicate object keys, floats, lexical -0, or NaN/Infinity literals",
+    "strict-decode": "I-JSON profile: no duplicate object keys, floats, lexical -0, NaN/Infinity literals, unpaired surrogates, or Unicode noncharacters",
     "x-sorted-set": "array must equal its sorted-unique self (ascending Unicode code point)",
     "x-calendar-date": "timestamp must be a real Gregorian date and time",
     "x-preferred-in-supported": "preferred must be a member of supported",
@@ -48,7 +48,9 @@
     { "id": "A-22", "path": "adverse/A-22-outcome-non-cmd-id.json", "target": "wire_command_outcome", "kind": "adverse", "expect": "reject", "note": "command_id outside the cmd: namespace" },
     { "id": "A-23", "path": "adverse/A-23-outcome-cmdid-trailing-newline.json", "target": "wire_command_outcome", "kind": "adverse", "expect": "reject", "note": "trailing newline on command_id — Python-vs-ECMA-262 $ anchor parity" },
     { "id": "A-24", "path": "adverse/A-24-identity-id-trailing-newline.json", "target": "wire_identity_ref", "kind": "adverse", "expect": "reject", "note": "trailing newline on id — Python-vs-ECMA-262 $ anchor parity" },
-    { "id": "A-25", "path": "adverse/A-25-identity-digest-trailing-newline.json", "target": "wire_identity_ref", "kind": "adverse", "expect": "reject", "note": "trailing newline on content_digest — Python-vs-ECMA-262 $ anchor parity" }
+    { "id": "A-25", "path": "adverse/A-25-identity-digest-trailing-newline.json", "target": "wire_identity_ref", "kind": "adverse", "expect": "reject", "note": "trailing newline on content_digest — Python-vs-ECMA-262 $ anchor parity" },
+    { "id": "A-26", "path": "adverse/A-26-identity-noncharacter-value.json", "target": "wire_identity_ref", "kind": "adverse", "expect": "reject", "note": "strict-decode: Unicode noncharacter U+FDD0 in a string value" },
+    { "id": "A-27", "path": "adverse/A-27-identity-noncharacter-key.json", "target": "wire_identity_ref", "kind": "adverse", "expect": "reject", "note": "strict-decode: Unicode noncharacter U+FFFE as an object key" }
   ],
   "sequences": [
     { "id": "S-01", "path": "sequences/S-01-refused-retry-verbatim.json", "kind": "journal-replay", "note": "identical retry of a journaled refused command replays the recorded receipt verbatim — never re-evaluated" },

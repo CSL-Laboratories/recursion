@@ -36,7 +36,7 @@ transport, no host effects.
 Checks beyond JSON Schema are declared in the manifest and annotated in the schema:
 
 - `strict-decode` — I-JSON profile: no duplicate object keys, floats, lexical `-0`,
-  or `NaN`/`Infinity` literals.
+  `NaN`/`Infinity` literals, unpaired surrogates, or Unicode noncharacters.
 - `x-sorted-set` — array equals its sorted-unique self, ascending Unicode code point
   (`uniqueItems` alone cannot express the repo's sorted-set convention).
 - `x-calendar-date` — timestamp is a real Gregorian date, not just digit-shaped.

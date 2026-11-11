@@ -294,7 +294,9 @@ def result(request_id: str, code: str | None, *, text: str = "", limit: dict | N
 # "rate limiting" are hits. A denial cancels only a recognised predicate, and the words may be
 # joined by the same separators as the phrase itself (space, "_" or "-"): "not exhausted",
 # "not_exhausted", "not-rate-limited", "isn't exhausted", "quota is not exhausted" and
-# "quota_is_not_exhausted". "quota is not available" stays a hit: "available" is not one of those
+# "quota_is_not_exhausted". The character before the negator is a token boundary: the start of the
+# string, "_" , or any other non-word character, so '"not exhausted"', "(not exhausted)" and a JSON
+# value are denials. "quota is not available" stays a hit: "available" is not one of those
 # predicates. "no quota" stays a hit.
 _SEP = r"[\s_-]"
 _QUOTA = re.compile(
@@ -302,7 +304,8 @@ _QUOTA = re.compile(
     re.IGNORECASE,
 )
 _QUOTA_NEGATED = re.compile(
-    rf"(?:^|{_SEP})(?:not|never|(?:is|are|was|were|do|does|did|wo|can|could|should|would)n['’]t)"
+    # ``_`` is a word character for ``\w`` and still a token boundary, same as quotes and parentheses.
+    rf"(?:^|[^\w]|_)(?:not|never|(?:is|are|was|were|do|does|did|wo|can|could|should|would)n['’]t)"
     rf"(?:{_SEP}+(?:a|an|the))?{_SEP}+$",
     re.IGNORECASE,
 )
@@ -332,8 +335,9 @@ _URL_USERINFO = re.compile(r"https?://([^\s/@:]+:[^\s/@]+)@", re.IGNORECASE)
 _JSON_U = re.compile(r"\\u([0-9a-fA-F]{4})")
 
 
-# Nested JSON encoding (``\\/`` or ``\u005c/``) needs more than one pass. Eight is enough for a
-# backslash that was escaped several times and still bounded.
+# Nested JSON encoding (``\\/`` or ``\u005c/``) is peeled one layer at a time. Eight passes is the
+# bound. A value that is still changing after that has not reached a fixed point, and the whole
+# field is redacted instead of searching a partial decode.
 _ESCAPE_PASSES = 8
 
 
@@ -365,26 +369,37 @@ def _decode_layer(value: str) -> tuple[str, list[tuple[int, int]], bool]:
     return "".join(out), spans, changed
 
 
-def _match_view(value: str) -> tuple[str, list[tuple[int, int]]]:
-    """Decode nested ``\\uXXXX`` and ``\\/`` layers. Spans point at the original string."""
+def _match_view(value: str) -> tuple[str, list[tuple[int, int]], bool]:
+    """Decode nested ``\\uXXXX`` and ``\\/`` layers. Spans point at the original string.
+
+    The third value is False when eight passes do not reach a fixed point. Callers must not search
+    that partial view.
+    """
 
     text = value
     spans = [(index, index + 1) for index in range(len(value))]
     for _ in range(_ESCAPE_PASSES):
         decoded, layer, changed = _decode_layer(text)
         if not changed:
-            break
+            return text, spans, True
         spans = [(spans[start][0], spans[end - 1][1]) for start, end in layer]
         text = decoded
-    return text, spans
+    still_changing = _decode_layer(text)[2]
+    return text, spans, not still_changing
 
 
 def redact(value: str) -> str:
-    """Replace credential-shaped substrings. Connection ids and ordinary error codes are left as they are."""
+    """Replace credential-shaped substrings. Connection ids and ordinary error codes are left as they are.
+
+    A value whose JSON escapes are still changing after the decode cap is replaced as a whole. A
+    partial decode is not searched, because a leftover escape can hide a credential.
+    """
 
     if not value:
         return value
-    decoded, spans = _match_view(value)
+    decoded, spans, stable = _match_view(value)
+    if not stable:
+        return "[redacted]"
     hits: list[tuple[int, int]] = []
     for match in _URL_USERINFO.finditer(decoded):
         hits.append((spans[match.start(1)][0], spans[match.end(1) - 1][1]))

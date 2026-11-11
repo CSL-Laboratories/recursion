@@ -261,6 +261,9 @@ class ServiceOracleTest(unittest.TestCase):
             ("not_exhausted", c.ENGINE_ERROR),
             ("not-rate-limited", c.ENGINE_ERROR),
             ("quota_is_not_exhausted", c.ENGINE_ERROR),
+            ('"not exhausted"', c.ENGINE_ERROR),
+            ("(not exhausted)", c.ENGINE_ERROR),
+            ('{"status":"not exhausted"}', c.ENGINE_ERROR),
             ("quota_exhausted", c.SHORT_FAULT),
             ("quota is not available", c.SHORT_FAULT),
             ("éexhaustedé", c.ENGINE_ERROR),
@@ -770,6 +773,35 @@ class ReviewFollowupTest(unittest.TestCase):
                 self.assertFalse(c.sounds_like_quota(text))
         self.assertTrue(c.sounds_like_quota("quota_exhausted"))
         self.assertTrue(c.sounds_like_quota("quota is not available"))
+
+    def test_quoted_negation_is_not_a_quota_fault(self) -> None:
+        for text in ('"not exhausted"', "(not exhausted)", '{"status":"not exhausted"}'):
+            with self.subTest(text=text):
+                self.assertFalse(c.sounds_like_quota(text))
+
+    def test_escape_cap_redacts_the_whole_field_past_the_boundary(self) -> None:
+        def escaped(backslashes: int) -> str:
+            slash = "\\" * backslashes + "/"
+            return "prefix https:" + slash + slash + "user:dummy_password@example.invalid/hook suffix"
+
+        def nest(text: str, rounds: int) -> str:
+            for _ in range(rounds):
+                text = text.replace("\\", "\\\\").replace("/", "\\/")
+            return text
+
+        at_cap = c.event("retry", "vendor", {"error": escaped(8)})["data"]["error"]
+        self.assertNotIn("dummy_password", at_cap)
+        self.assertIn("prefix", at_cap)
+        self.assertIn("example.invalid", at_cap)
+        self.assertIn("[redacted]", at_cap)
+        self.assertNotEqual(at_cap, "[redacted]")
+
+        past_cap = c.event("retry", "vendor", {"error": escaped(9)})["data"]["error"]
+        self.assertEqual(past_cap, "[redacted]")
+        self.assertNotIn("dummy_password", past_cap)
+
+        four_rounds = nest("prefix https://user:dummy_password@example.invalid/hook suffix", 4)
+        self.assertEqual(c.event("retry", "vendor", {"error": four_rounds})["data"]["error"], "[redacted]")
 
     def test_opencode_subscription_providers_are_different_breakers(self) -> None:
         chatgpt = request(

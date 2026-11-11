@@ -203,27 +203,107 @@ def _help_bytes(text: object) -> bytes | None:
     return raw
 
 
+def _leader_unreaped(pid: int) -> bool:
+    """True when ``pid`` is still our child, alive or zombie.
+
+    ``waitid`` with ``WNOWAIT`` reports that without collecting the zombie.
+    The leader keeps its process-group id until it is collected. ``poll`` would
+    collect it, and the group id could then be reused.
+    """
+    if not hasattr(os, "waitid") or not hasattr(os, "WNOWAIT"):
+        # No non-collecting wait. A zero signal succeeds for a zombie and fails
+        # once the leader has been collected, and it does not collect the leader.
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
+    flags = os.WEXITED | os.WNOHANG | os.WNOWAIT
+    while True:
+        try:
+            os.waitid(os.P_PID, pid, flags)
+        except InterruptedError:
+            continue
+        except ChildProcessError:
+            return False
+        return True
+
+
+def _signal_group(proc: subprocess.Popen, pid: int) -> None:
+    """SIGKILL the process group ``pid`` leads. Fall back to the leader alone."""
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def _group_has_live_member(pgid: int) -> bool:
+    """True if some process in ``pgid`` is still running.
+
+    Zombies are not live. ``/proc`` is how a non-parent can see a same-group
+    child that was reparented when the leader exited. Without it, the caller
+    cannot tell, and the answer is false.
+    """
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return False
+    token = str(pgid)
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            with open("/proc/" + name + "/stat") as handle:
+                text = handle.read()
+        except OSError:
+            continue
+        end = text.rfind(")")
+        if end < 0:
+            continue
+        fields = text[end + 2:].split()
+        # state, ppid, pgrp. The command name can contain spaces, so it is skipped above.
+        if len(fields) >= 3 and fields[2] == token and fields[0] not in ("Z", "X"):
+            return True
+    return False
+
+
+def _until_group_dead(pgid: int) -> None:
+    """Return once ``pgid`` has no running member, without collecting any child.
+
+    SIGKILL does not finish inside the ``killpg`` call. Collecting the leader
+    immediately lets a caller observe the same-group child still running.
+    """
+    if not os.path.isdir("/proc"):
+        time.sleep(0.05)
+        return
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if not _group_has_live_member(pgid):
+            return
+        time.sleep(0.001)
+
+
 def _reap(proc: subprocess.Popen) -> None:
-    """Kill the child and every process still in its session, then wait.
+    """Kill every process still in the child's session, then wait for the leader.
 
     The child is started in its own session, so its pid is the process-group id.
-    A grandchild that inherited the stdout pipe stays in that group. Killing only
-    the direct child leaves the pipe open. A descendant that has called ``setsid``
-    is no longer in the group; the read loop stops on its deadline instead.
+    Signal that group before collecting the leader, and wait until it has no
+    running member. A leader that has already exited still owns the group until
+    it is reaped; collecting it first leaves a same-group child running.
+    SIGKILL is not finished when ``killpg`` returns. A descendant that has
+    called ``setsid`` is no longer in the group. The read loop stops on its
+    deadline instead.
     """
-    if proc.poll() is not None:
-        return
-    if os.name != "nt" and isinstance(proc.pid, int) and proc.pid > 0:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        except OSError:
-            try:
-                proc.kill()
-            except OSError:
-                pass
-    elif proc.poll() is None:
+    pid = proc.pid
+    if os.name != "nt" and isinstance(pid, int) and pid > 0 and proc.returncode is None and _leader_unreaped(pid):
+        _signal_group(proc, pid)
+        _until_group_dead(pid)
+    elif os.name == "nt" and proc.returncode is None and proc.poll() is None:
         try:
             proc.kill()
         except OSError:
@@ -231,6 +311,10 @@ def _reap(proc: subprocess.Popen) -> None:
     try:
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
+        # Still our child, so this pid is still the group id.
+        if os.name != "nt" and isinstance(pid, int) and pid > 0 and proc.returncode is None:
+            _signal_group(proc, pid)
+            _until_group_dead(pid)
         try:
             proc.kill()
         except OSError:
@@ -289,11 +373,12 @@ def _bounded_run(argv, *, env=None, stdin=None, stdout=None, stderr=None, timeou
     ``HELP_MAX_BYTES + 1`` from the raw pipe. The read shares one deadline with the wait
     for the child to exit.
 
-    Overflow (one byte past the cap) kills the session and returns those bytes with a
-    non-zero code. A timeout also kills the session and discards bytes already read:
-    the child did not finish, so the buffer is not a finished ``--help``. An under-cap
-    EOF does not kill. The child may close its output and still be exiting; it is
-    killed only if it is still running when the deadline hits.
+    Overflow (one byte past the cap) kills the session and finishes like any other
+    non-zero exit: ``check=True`` raises ``CalledProcessError``, otherwise the bytes
+    come back with a non-zero code. A timeout also kills the session and discards
+    bytes already read: the child did not finish, so the buffer is not a finished
+    ``--help``. An under-cap EOF does not kill. The child may close its output and
+    still be exiting; it is killed only if it is still running when the deadline hits.
 
     ``stdout`` and ``stderr`` are ignored. The child always gets a pipe we own and
     ``stderr=DEVNULL``. A stderr ``PIPE`` is not drained, and a flood on it would block
@@ -327,27 +412,31 @@ def _bounded_run(argv, *, env=None, stdin=None, stdout=None, stderr=None, timeou
         waited = HELP_TIMEOUT_S if timeout is None else timeout
         deadline = time.monotonic() + waited
         out, why = _read_capped(fd, deadline)
-        if why == "overflow":
-            _reap(proc)
-            code = proc.returncode if isinstance(proc.returncode, int) and proc.returncode != 0 else 1
-            return subprocess.CompletedProcess(list(argv), code, stdout=out)
         if why == "timeout":
             _reap(proc)
             # Drop whatever was already read. A partial page is not help text:
             # classifying it could report absent or present for a read that never finished.
             raise subprocess.TimeoutExpired(list(argv), waited)
-        try:
-            proc.wait(timeout=max(0.0, deadline - time.monotonic()))
-        except subprocess.TimeoutExpired:
+        if why == "overflow":
             _reap(proc)
-            raise subprocess.TimeoutExpired(list(argv), waited) from None
+        else:
+            try:
+                proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                _reap(proc)
+                raise subprocess.TimeoutExpired(list(argv), waited) from None
         code = proc.returncode if isinstance(proc.returncode, int) else 1
+        # A leader that already exited 0 can still have written past the cap.
+        # That read is not success. check=True and check=False share this result.
+        if why == "overflow" and code == 0:
+            code = 1
         if check and code != 0:
             raise subprocess.CalledProcessError(code, list(argv), output=out)
         return subprocess.CompletedProcess(list(argv), code, stdout=out)
     except BaseException:
-        if proc.poll() is None:
-            _reap(proc)
+        # Signal the group before collecting the leader. poll() would collect an
+        # exited leader and skip the group.
+        _reap(proc)
         raise
     finally:
         if fd is not None:

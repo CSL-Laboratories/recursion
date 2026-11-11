@@ -7,9 +7,11 @@ No provider call. The one optional test runs the local ``claude --help`` (offlin
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import io
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -424,6 +426,73 @@ class ReadHelpTest(unittest.TestCase):
                         os.kill(int(pid_path.read_text()), 9)
                     except ProcessLookupError:
                         pass
+
+    @unittest.skipUnless(hasattr(os, "fork") and hasattr(os, "waitid") and hasattr(os, "WNOWAIT"),
+                         "POSIX waitid")
+    def test_exited_leader_does_not_spare_its_group(self) -> None:
+        # The leader forks and exits. The child stays in that process group.
+        # Reaping the leader first drops the pgid, so the child survives both
+        # a timeout and an over-cap read. This child does not call setsid.
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(36, 1, 0, 0, 0):
+            self.skipTest("prctl subreaper is not available")
+        survived: dict[str, bool] = {}
+        try:
+            for mode in ("timeout", "overflow"):
+                read_fd, write_fd = os.pipe()
+                pid = None
+                code = (
+                    "import os, time\n"
+                    "if os.fork():\n"
+                    "    os._exit(0)\n"
+                    "os.write(0, str(os.getpid()).encode())\n"
+                    + ('os.write(1, b"x" * 1048577)\n' if mode == "overflow" else "")
+                    + "time.sleep(20)\n"
+                )
+                try:
+                    try:
+                        bd._bounded_run(
+                            [sys.executable, "-B", "-c", code],
+                            env={}, stdin=write_fd, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, timeout=0.2, check=False, shell=False)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    os.close(write_fd)
+                    write_fd = -1
+                    pid = int(os.read(read_fd, 64))
+                    survived[mode] = os.waitpid(pid, os.WNOHANG) == (0, 0)
+                finally:
+                    if write_fd >= 0:
+                        os.close(write_fd)
+                    os.close(read_fd)
+                    if pid is not None:
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            os.waitpid(pid, 0)
+                        except ChildProcessError:
+                            pass
+        finally:
+            libc.prctl(36, 0, 0, 0, 0)
+        self.assertEqual(survived, {"timeout": False, "overflow": False})
+
+    def test_overflow_honors_check(self) -> None:
+        # check=True raises on a non-zero exit after a normal read. An over-cap
+        # read is also a failed run, so it takes that same path.
+        argv = [sys.executable, "-B", "-c",
+                'import os, time; os.write(1, b"x" * (2 << 20)); time.sleep(20)']
+        with self.assertRaises(subprocess.CalledProcessError) as caught:
+            bd._bounded_run(argv, env={}, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, timeout=2, check=True, shell=False)
+        self.assertNotEqual(caught.exception.returncode, 0)
+        self.assertEqual(len(caught.exception.output), bd.HELP_MAX_BYTES + 1)
+        done = bd._bounded_run(argv, env={}, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, timeout=2, check=False, shell=False)
+        self.assertIsInstance(done, subprocess.CompletedProcess)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(len(done.stdout), bd.HELP_MAX_BYTES + 1)
 
     @unittest.skipUnless(os.environ.get("RECURSION_LIVE_CLAUDE_HELP") == "1" and shutil.which("claude"),
                          "set RECURSION_LIVE_CLAUDE_HELP=1 with claude on PATH")

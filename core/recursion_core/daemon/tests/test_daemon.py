@@ -3,6 +3,8 @@ import errno
 import multiprocessing
 import os
 from pathlib import Path
+import stat
+from types import SimpleNamespace
 import signal
 import sqlite3
 import subprocess
@@ -1057,18 +1059,21 @@ class SystemdManagerTests(unittest.TestCase):
                 return ('mem', directory.ident)
             return real_identity(directory)
 
-        def children(directory):
+        def children(directory, remaining):
             if isinstance(directory, Node):
-                if directory.child is None:
-                    return []
-                return [directory.child]
-            if directory != root:
-                return real_children(directory)
-            if mode['kind'] == 'deep':
-                return [head]
-            if mode['kind'] == 'cycle':
-                return [loop]
-            return wide
+                kids = [] if directory.child is None else [directory.child]
+            elif directory != root:
+                return real_children(directory, remaining)
+            elif mode['kind'] == 'deep':
+                kids = [head]
+            elif mode['kind'] == 'cycle':
+                kids = [loop]
+            else:
+                kids = wide
+            if len(kids) > remaining[0]:
+                return None
+            remaining[0] -= len(kids)
+            return kids
 
         def read_level(directory):
             if isinstance(directory, Node):
@@ -1088,6 +1093,71 @@ class SystemdManagerTests(unittest.TestCase):
             self.assertIsNone(self.manager._subtree(root))
             self.assertNotEqual(self.manager.observe('a'), 'empty')
             self.assertFalse(self.manager.processes_gone('a'))
+
+    def test_wide_cgroup_listing_stops_before_read_and_stat(self):
+        # Real _cgroup_children, against a fake directory. No host cgroup files.
+        group = '/user.slice/a.service'
+        self.events(group, 0)
+        (self.root / group.lstrip('/') / 'cgroup.procs').write_text('')
+        root = self.root / group.lstrip('/')
+        real_iterdir = Path.iterdir
+        real_lstat = Path.lstat
+
+        def listing(count, produced, stated):
+            def entries(path):
+                if path != root:
+                    return real_iterdir(path)
+                for i in range(count):
+                    produced.append(path / str(i))
+                    yield path / str(i)
+
+            def info(path):
+                if path != root and not (path.parent == root and path.name.isdigit()):
+                    return real_lstat(path)
+                stated.append(path)
+                inode = 1 if path == root else int(path.name) + 2
+                return SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_dev=1, st_ino=inode)
+
+            return entries, info
+
+        show = (
+            'LoadState=loaded\nActiveState=inactive\nSubState=dead\n'
+            f'ControlGroup={group}\nMainPID=0\n'
+            'InvocationID=0b5a2f3c9d8e4f60a1b2c3d4e5f60718\n'
+            'ExecMainStartTimestampMonotonic=81234567\n')
+
+        def bounded(before, after):
+            self.assertLessEqual(after - before, CGROUP_WALK_MAX_NODES + 1)
+
+        # The root takes one slot. Exactly the remaining slots, each an empty
+        # child directory, is a finished walk.
+        produced, stated = [], []
+        entries, info = listing(CGROUP_WALK_MAX_NODES - 1, produced, stated)
+        self.manager._call = Mock(return_value=show)
+        with patch.object(Path, 'iterdir', entries), \
+             patch.object(Path, 'lstat', info), \
+             patch.object(self.manager, '_read_level', return_value=([], False)):
+            self.assertEqual(self.manager._subtree(root), ([], False))
+            self.assertEqual(len(produced), CGROUP_WALK_MAX_NODES - 1)
+            self.assertEqual(self.manager.observe('a'), 'empty')
+        # One past the budget is unknown, and that extra name is not stat'd.
+        produced, stated = [], []
+        entries, info = listing(3 * CGROUP_WALK_MAX_NODES, produced, stated)
+        self.manager._call = Mock(return_value=show)
+        with patch.object(Path, 'iterdir', entries), \
+             patch.object(Path, 'lstat', info), \
+             patch.object(self.manager, '_read_level', return_value=([], False)):
+            before = len(produced)
+            self.assertIsNone(self.manager._subtree(root))
+            bounded(before, len(produced))
+            before = len(produced)
+            self.assertNotEqual(self.manager.observe('a'), 'empty')
+            bounded(before, len(produced))
+            before = len(produced)
+            self.assertFalse(self.manager.processes_gone('a'))
+            bounded(before, len(produced))
+        child_stats = [path for path in stated if path != root]
+        self.assertLess(len(child_stats), len(produced))
 
     def test_populated_one_active_is_running(self):
         self.events('/user.slice/a.service', 1)

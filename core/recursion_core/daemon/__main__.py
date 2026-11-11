@@ -93,7 +93,7 @@ def cli():
     parser.add_argument("--sweep-seconds", type=float, default=None,
                         help="seconds between registry sweeps (default 5)")
     parser.add_argument("--plugin", action="append", default=[], metavar="MODULE:REGISTRY",
-                        help="explicit trusted plugin registry factory, e.g. cockpit.gui.panels:registry")
+                        help="explicit trusted plugin registry factory, e.g. pkg.module:registry")
     args = parser.parse_args()
     extra = {}
     if args.sweep_seconds is not None:

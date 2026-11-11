@@ -8,7 +8,7 @@ state, so it reads ``run.list`` first. There is no approve, deny, order or mid-r
 API has none, and the TUI never gets a command the CLI lacks.
 
 ``conditions`` turns an API answer into text labels, so refusal, uncertainty, stale and unreconciled
-states are readable without colour (Cockpit O7 ``o7.operator.v0`` presentation rules).
+states are readable without colour (the operator plugin's O7 ``o7.operator.v0`` presentation rules).
 """
 
 from __future__ import annotations

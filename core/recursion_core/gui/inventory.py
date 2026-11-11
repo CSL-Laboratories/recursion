@@ -29,7 +29,7 @@ BARS = ("launch_check", "floor", "conformance", "truthful_stop", "venue_switch",
 
 # What the Nov 11 core inventory must cover (F25, PRODUCT.md 3.3, 7; Q42, 34b). Own-loop
 # vendors are this slice's reading of the briefing, flagged for review. Venue uses belong
-# to the Cockpit plugin, which passes its own classes in through ``required``.
+# to the paper-trading plugin, which passes its own classes in through ``required``.
 REQUIRED = {
     "engine": ("claude_code", "codex", "opencode", "grok", "antigravity", "cursor", "gemini", "pi",
                "hermes"),

@@ -17,6 +17,9 @@ NOT_POSIX = os.name == 'nt' or not hasattr(os, 'getuid')
 ENTRY_LINUX_ONLY = ('Linux-only: the daemon entry point needs flock, uid ownership checks and systemd; on Windows '
                     'main() refuses PlatformUnsupported (platform_unsupported) before any GUI is built; covered '
                     'by WindowsRefusalTests in daemon/tests/test_windows_refusal.py')
+CROSS_REPO_PLUGIN_ENV = "RECURSION_CROSS_REPO_PLUGIN"
+CROSS_REPO_SKIP = (f"cross-repo integration: {CROSS_REPO_PLUGIN_ENV} is unset; set it to the operator plugin's "
+                   "pkg.module:registry factory, with that plugin on PYTHONPATH, to run this test")
 
 
 class LoopbackTests(TestCase):
@@ -117,23 +120,22 @@ class LoopbackTests(TestCase):
         with mock.patch.object(entry, "require_free_threaded") as check, \
              mock.patch.object(entry, "importlib") as imports, \
              mock.patch.object(entry, "main") as main, \
-             mock.patch("sys.argv", ["daemon", "--plugin", "cockpit.gui.panels:registry", "--gui-port", "0"]):
+             mock.patch("sys.argv", ["daemon", "--plugin", "pkg.module:registry", "--gui-port", "0"]):
             imports.import_module.return_value = SimpleNamespace(registry=lambda: plugin)
             entry.cli()
-            imports.import_module.assert_called_once_with("cockpit.gui.panels")
+            imports.import_module.assert_called_once_with("pkg.module")
             main.assert_called_once_with(plugins=[plugin], port=0)
             self.assertEqual(check.call_count, 3)
 
-    def test_cli_documented_cockpit_plugin_imports_for_real(self):
-        # Unmocked import of the path documented in --help and the README.
-        try:
-            importlib.import_module("cockpit.gui.panels")
-        except ModuleNotFoundError as exc:
-            if exc.name not in {"cockpit", "cockpit.gui", "cockpit.gui.panels"}:
-                raise
-            self.skipTest("run with Cockpit #318 engine on PYTHONPATH for cross-repo integration")
-        documented = "cockpit.gui.panels:registry"
-        self.assertIn(documented, Path(entry.__file__).read_text())  # the --help example
+    def test_cli_loads_the_real_cross_repo_plugin(self):
+        # Unmocked import through --plugin, in the MODULE:REGISTRY form --help and the README document.
+        documented = os.environ.get(CROSS_REPO_PLUGIN_ENV, "")
+        if not documented:
+            self.skipTest(CROSS_REPO_SKIP)
+        module, sep, name = documented.partition(":")
+        self.assertTrue(sep and module and name.isidentifier(), f"{CROSS_REPO_PLUGIN_ENV} must be pkg.module:registry")
+        importlib.import_module(module)  # set but not importable is a failure, not a skip
+        self.assertIn('metavar="MODULE:REGISTRY"', Path(entry.__file__).read_text())  # the --help form
         with mock.patch.object(entry, "require_free_threaded"), \
              mock.patch.object(entry, "main") as main, \
              mock.patch("sys.argv", ["daemon", "--plugin", documented, "--gui-port", "0"]):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
 import os
 import socket
 import stat
@@ -24,6 +25,16 @@ NOT_POSIX = os.name == "nt" or not hasattr(os, "geteuid")
 POSIX_ONLY = ("POSIX-only: the AF_UNIX transport needs os.geteuid and flock; it refuses PlatformNotSupported "
               "(platform_unsupported) on Windows; covered by WindowsRefusalTests")
 PACKAGE_DIR = Path(ct.__file__).resolve().parent
+PUBLIC_SCOPE_GATE = Path(__file__).resolve().parents[4] / "tools" / "check_public_scope.py"
+
+
+def other_project_pattern():
+    """The other-project identifiers, read from the public-scope gate's own data (never spelled here)."""
+
+    spec = importlib.util.spec_from_file_location("check_public_scope_for_transport_tests", PUBLIC_SCOPE_GATE)
+    gate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gate)
+    return gate.PATTERN
 
 
 def _foreign_uid(sock: socket.socket) -> PeerCred:
@@ -698,7 +709,12 @@ class RemoteBindRefusedTests(_TmpCase):
                 if isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
                     self.assertNotIn(node.module.split(".")[0], banned_modules, f"{path.name}:{node.lineno}")
 
-    def test_cockpit_is_not_imported(self) -> None:
+    def test_no_other_project_is_imported(self) -> None:
+        self.assertTrue(PUBLIC_SCOPE_GATE.is_file(), f"public-scope gate not found: {PUBLIC_SCOPE_GATE}")
+        other_project = other_project_pattern()
+        self.assertTrue(other_project.pattern)
+        for probe in ("pkg.module", "recursion_core.control_transport", "socket"):
+            self.assertIsNone(other_project.search(probe), probe)  # the gate's list is not a catch-all
         for path in PACKAGE_DIR.rglob("*.py"):
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
             for node in ast.walk(tree):
@@ -708,7 +724,8 @@ class RemoteBindRefusedTests(_TmpCase):
                 elif isinstance(node, ast.ImportFrom) and node.module:
                     names = [node.module]
                 for name in names:
-                    self.assertNotIn("cockpit", name.lower(), f"{path.name}:{node.lineno}")
+                    # "_" is a word character to the gate's patterns; split on it so a_name_b is caught too.
+                    self.assertIsNone(other_project.search(name.replace("_", "-")), f"{path.name}:{node.lineno}")
                     self.assertNotEqual(name.split(".")[0], "engine", f"{path.name}:{node.lineno}")
 
 

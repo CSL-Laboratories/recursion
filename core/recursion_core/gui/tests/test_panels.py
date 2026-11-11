@@ -1,5 +1,6 @@
 """Read-only mount and additive plugin inventory regressions."""
 import importlib
+import os
 import re
 import unittest
 from collections.abc import Mapping
@@ -10,6 +11,10 @@ from recursion_core.gui.inventory import BARS, REQUIRED, assess, coverage_gaps
 from recursion_core.gui.panels import filter_venue_rows
 from recursion_core.gui.tests.fakes import wsgi_transport
 from recursion_core.gui.tests.test_surface import GuiHarness, HOST, ORIGIN
+
+CROSS_REPO_PLUGIN_ENV = "RECURSION_CROSS_REPO_PLUGIN"
+CROSS_REPO_SKIP = (f"cross-repo integration: {CROSS_REPO_PLUGIN_ENV} is unset; set it to the operator plugin's "
+                   "pkg.module:registry factory, with that plugin on PYTHONPATH, to run this test")
 
 
 class InventoryTests(unittest.TestCase):
@@ -249,19 +254,19 @@ class PanelTests(GuiHarness):
         self.assertIn("KXDEMO-1", read)
         self.assertIn("stale_data: <strong>absent_not_hidden</strong>", read)
 
-    def test_real_cockpit_registry_renders(self):
-        try:
-            plugin = importlib.import_module("cockpit.gui.panels")
-        except ModuleNotFoundError as exc:
-            if exc.name not in {"cockpit", "cockpit.gui", "cockpit.gui.panels"}:
-                raise
-            self.skipTest("run with Cockpit #318 engine on PYTHONPATH for cross-repo integration")
+    def test_real_plugin_registry_renders(self):
+        spec = os.environ.get(CROSS_REPO_PLUGIN_ENV, "")
+        if not spec:
+            self.skipTest(CROSS_REPO_SKIP)
+        module, sep, name = spec.partition(":")
+        self.assertTrue(sep and module and name.isidentifier(), f"{CROSS_REPO_PLUGIN_ENV} must be pkg.module:registry")
+        plugin = importlib.import_module(module)  # set but not importable is a failure, not a skip
         self.app = compose(ControlClient(wsgi_transport(self.api)), self.door, {HOST}, {ORIGIN},
-                           plugins=(plugin.registry(),))
+                           plugins=(getattr(plugin, name)(),))
         self.assertIsInstance(plugin.PANELS[0], Mapping)
         self.assertIn("gap:engine:hermes", self.request("GET", "/")[2])
         self.api.calls.clear()
-        status, _, body = self.request("GET", "/panel", query="id=cockpit.paper_own_trading")
+        status, _, body = self.request("GET", "/panel", query="id=" + plugin.PANELS[0]["id"])
         self.assertEqual(status, "200 OK")
         self.assertIn(plugin.PANELS[0]["title"], body)
         self.assertEqual([c[2]["command"] for c in self.api.calls], list(plugin.PANELS[0]["reads"]))

@@ -273,7 +273,7 @@ class RubricTests(unittest.TestCase):
         self.assertEqual(len(REQUIRED["engine"]), 9)
         self.assertEqual(REQUIRED["mcp"], ("2025-06-18", "2026-07-28"))
         self.assertTrue(all(g["maturity"] == "beta" and g["blocker"].startswith("upstream") for g in gaps))
-        self.assertNotIn("venue_use", REQUIRED)  # venue uses are the Cockpit plugin's
+        self.assertNotIn("venue_use", REQUIRED)  # venue uses are the paper-trading plugin's
         reported = [_route("e", "engine", engine="codex"), _route("m", "mcp", mcp_version="2025-06-18"),
                     _route("v", "venue_use", venue="kalshi", use="model_fed_read")]
         ids = {g["id"] for g in coverage_gaps(reported)}

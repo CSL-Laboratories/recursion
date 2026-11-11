@@ -2,7 +2,7 @@
 
 Candidate code for build item 8b. Spec: PRODUCT.md at csl-research `550cca0e4f10bcfc9b7610f104841d5f785defa8`
 (SHA-256 `c5730c36c55208e0e54f5e0a0ae00381ba7f665231c86edbe05dd38a4c925ce8`), section 3.6, amendment A36,
-lane G8. Operator presentation rules follow Cockpit O7 (`o7.operator.v0`).
+lane G8. Operator presentation rules follow the operator plugin's O7 (`o7.operator.v0`).
 
 ## What it is
 

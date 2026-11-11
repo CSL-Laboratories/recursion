@@ -1,5 +1,5 @@
-"""The O7 TUI decision packet's two falsifiers (Cockpit docs/replacement/outcomes/O7/tui-decision-packet.json
-at 05918cea) and the CSL-799 brief's two, as tests:
+"""The O7 TUI decision packet's two falsifiers (the operator plugin repository's
+docs/replacement/outcomes/O7/tui-decision-packet.json at 05918cea) and the CSL-799 brief's two, as tests:
 
 O7-1  The TUI hides a refusal, uncertainty, stale or unreconciled state that the shared API exposes.
 O7-2  The TUI submits an order or widens a profile (here: any request outside the CLI's control API set).

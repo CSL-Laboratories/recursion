@@ -2,7 +2,7 @@
 
 ``surface.Application`` is a WSGI app over ``client.ControlClient``; ``inventory`` holds
 the route rubric and the O50 beta tag. No order path, no own Stop, no socket binding.
-Cockpit operator screens are plugin panels in this GUI and do not live here.
+The operator plugin's screens are plugin panels in this GUI and do not live here.
 """
 
 from .surface import Application

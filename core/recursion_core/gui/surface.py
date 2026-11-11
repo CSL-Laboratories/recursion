@@ -16,8 +16,8 @@ The door, in order, on every request:
    belongs to the core adapter; this module never reads or stores a token.
 
 ``Referrer-Policy: same-origin`` is deliberate: ``no-referrer`` makes browsers send
-``Origin: null`` on form posts, which broke every verb in Cockpit's earlier browser
-operator (csl512 gap6 record). Cockpit's operator screens are plugin panels in this GUI,
+``Origin: null`` on form posts, which broke every verb in the operator plugin's earlier
+browser operator (csl512 gap6 record). That plugin's operator screens are plugin panels in this GUI,
 not part of this module. Binding and remote pairing are the composition root's; nothing
 here opens a socket. Accessibility: landmarks, labels, a skip link, visible
 focus, text status, 24 px minimum targets. No WCAG conformance is claimed.
@@ -49,7 +49,7 @@ _CSP = ("default-src 'none'; style-src 'sha256-%s'; form-action 'self'; frame-an
         "base-uri 'none'" % _CSS_HASH)
 _MAX_BODY = 4096
 # O7 operator-response.schema.json: the visibility object is closed to these four keys and values
-# (Cockpit #318, docs/replacement/outcomes/O7). The GUI renders only these fixed strings.
+# (the downstream plugin draft #318, docs/replacement/outcomes/O7). The GUI renders only these fixed strings.
 _VISIBILITY = (
     ("uncertainty", ("visible", "absent_not_hidden")),
     ("refusal", ("visible", "absent_not_hidden")),

@@ -192,11 +192,11 @@ jobs:
       # timeout-minutes: 1 is a backstop whose failure is warned below.
       - name: Performance regression check
         id: perf
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' || github.event_name == 'push'
         timeout-minutes: 1
         continue-on-error: true
         env:
-          CI_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: timeout 55 python -X utf8 -B tools/perf_ci.py || echo "::warning::Performance measurement failed, timed out, or is unavailable"
 
       - name: Warn if performance measurement failed

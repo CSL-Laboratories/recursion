@@ -657,16 +657,49 @@ class GuiDoorAttackTest(ComposedBase):
 
     def test_slow_and_idle_clients_are_cut_off_and_cannot_take_every_gui_thread(self):
         """ADV1-3 (fixed): the headers have one deadline for the whole of them, and a full server closes the
-        connection that has been sending headers longest, so no number of slow clients keeps the operator out."""
+        connection that has been sending headers longest, so no number of slow clients keeps the operator out.
+
+        Three phases on one server: a dripped header is closed by the 1 s header deadline; with both timers
+        at 30 s, idle connections past the thread bound are closed oldest first and the operator is answered
+        in a fraction of that (only eviction can have made the room); idle connections left alone are closed
+        by the 1 s deadline."""
         from recursion_core.daemon import gui as gui_module
         from recursion_core.gui.client import ControlClient
         door = adapter.DeviceDoor(self.runtime / 'recursion')
         self.addCleanup(door.close)
         token = door.path.read_text().strip()
         client = ControlClient(lambda *a: (501, b'{"error": "route_inventory_not_implemented"}'))
+        threads, extra, idle_s = gui_module.MAX_REQUEST_THREADS, 8, 30.0
         with mock.patch.object(gui_module, 'HEADER_DEADLINE_S', 1.0), LoopbackGUI(client, door, port=0) as gui:
             port = gui.address[1]
             good = {'Host': '127.0.0.1:%d' % port, 'Authorization': 'Bearer ' + token}
+            taken, process_request = [], gui.server.process_request
+
+            def counted(request, address):
+                try:
+                    process_request(request, address)
+                finally:
+                    taken.append(address)
+
+            def connect_idle():
+                # One at a time, each after the server took the one before. The listen backlog is 5: a burst
+                # overflows it, the kernel drops a SYN, and that connect (the operator's too) resends it 1 s
+                # later. That delay is the kernel's, not the server's, and it is kept out of this test.
+                before = len(taken)
+                sock = socket.create_connection(('127.0.0.1', port))
+                self.addCleanup(sock.close)
+                self.assertTrue(wait_for(lambda: len(taken) > before, 10), 'the server did not take a connection')
+                return sock
+
+            def closed_by_server(sock, seconds):
+                sock.settimeout(seconds)
+                try:
+                    return sock.recv(1) == b''
+                except (BlockingIOError, TimeoutError):
+                    return False
+                except OSError:
+                    return True
+
             # One byte every 0.3 s never trips the per-read timeout; the header deadline still closes it.
             with socket.create_connection(('127.0.0.1', port)) as drip:
                 started = time.monotonic()
@@ -679,15 +712,40 @@ class GuiDoorAttackTest(ComposedBase):
                     closed = time.monotonic() - started
                 self.assertIsNotNone(closed, 'the server never closed a client that drips its headers')
                 self.assertLess(closed, 4.0)
-            # More idle connections than there are threads: each new one evicts the oldest idle one.
-            idle = [socket.create_connection(('127.0.0.1', port)) for _ in range(gui_module.MAX_REQUEST_THREADS + 8)]
-            self.addCleanup(lambda: [sock.close() for sock in idle])
-            started = time.monotonic()
-            self.assertEqual(self.request(port, 'GET', '/', good, timeout=30)[0], 200)
-            self.assertLess(time.monotonic() - started, 1.0)
-            self.assertLessEqual(len(gui.server._reading) + len(gui.server._working), gui_module.MAX_REQUEST_THREADS)
-            self.assertTrue(wait_for(lambda: not gui.server._reading and not gui.server._working, 5),
-                            'idle connections are gone after the header deadline')
+            self.assertTrue(wait_for(lambda: not gui.server._reading and not gui.server._working, 5))
+            with mock.patch.object(gui.server, 'process_request', counted):
+                # More idle connections than there are threads: each new one evicts the oldest idle one. No
+                # timer closes anything here for idle_s, so the room can only come from eviction.
+                with mock.patch.object(gui_module, 'HEADER_DEADLINE_S', idle_s), \
+                        mock.patch.object(gui_module, 'RECV_TIMEOUT_S', idle_s):
+                    idle = [connect_idle() for _ in range(threads + extra)]
+                    self.assertEqual(len(gui.server._reading), threads)
+                    for index, sock in enumerate(idle):
+                        self.assertEqual(closed_by_server(sock, 5 if index < extra else 0), index < extra,
+                                         'idle connection %d of %d: the oldest %d are evicted, the rest stay'
+                                         % (index, len(idle), extra))
+                    started = time.monotonic()
+                    try:
+                        status = self.request(port, 'GET', '/', good, timeout=idle_s)[0]
+                    except (OSError, http.client.HTTPException) as error:
+                        self.fail('a server full of idle connections did not answer the operator: %r' % (error,))
+                    waited = time.monotonic() - started
+                    self.assertEqual(status, 200)
+                    # Relative, not a wall bound: a quarter of the time any idle connection may still stay.
+                    self.assertLess(waited, idle_s / 4, 'the operator waited on the idle connections')
+                    self.assertTrue(closed_by_server(idle[extra], 5), 'the operator evicts the oldest idle one')
+                    self.assertLessEqual(len(gui.server._reading) + len(gui.server._working), threads)
+                # The rest would hold their threads for idle_s; hanging up frees them at once.
+                for sock in idle:
+                    sock.close()
+                self.assertTrue(wait_for(lambda: not gui.server._reading and not gui.server._working, 5),
+                                'threads of idle connections that hung up are free')
+                # Back on the 1 s header deadline: idle connections nobody evicts or closes are cut off by it.
+                late = [connect_idle() for _ in range(4)]
+                self.assertTrue(wait_for(lambda: not gui.server._reading and not gui.server._working, 5),
+                                'idle connections are gone after the header deadline')
+                for sock in late:
+                    self.assertTrue(closed_by_server(sock, 5), 'the header deadline closes an idle connection')
             self.assertEqual(self.request(port, 'GET', '/', good, timeout=30)[0], 200)
 
     def test_one_slow_client_cannot_hold_the_gui_and_its_stop(self):

@@ -486,10 +486,44 @@ class GuiDoorAttackTest(ComposedBase):
         for offer in ('é' * 64, rotated + '\x00', 'a' * 100000, rotated[:-1] + '\udcff'):
             self.assertFalse(composed.door({'HTTP_AUTHORIZATION': 'Bearer ' + offer}))
 
-    @unittest.expectedFailure  # ADV1-3
+    def test_slow_and_idle_clients_are_cut_off_and_cannot_take_every_gui_thread(self):
+        """ADV1-3 (fixed): the headers have one deadline for the whole of them, and a full server closes the
+        connection that has been sending headers longest, so no number of slow clients keeps the operator out."""
+        from recursion_core.daemon import gui as gui_module
+        from recursion_core.gui.client import ControlClient
+        door = adapter.DeviceDoor(self.runtime / 'recursion')
+        self.addCleanup(door.close)
+        token = door.path.read_text().strip()
+        client = ControlClient(lambda *a: (501, b'{"error": "route_inventory_not_implemented"}'))
+        with mock.patch.object(gui_module, 'HEADER_DEADLINE_S', 1.0), LoopbackGUI(client, door, port=0) as gui:
+            port = gui.address[1]
+            good = {'Host': '127.0.0.1:%d' % port, 'Authorization': 'Bearer ' + token}
+            # One byte every 0.3 s never trips the per-read timeout; the header deadline still closes it.
+            with socket.create_connection(('127.0.0.1', port)) as drip:
+                started = time.monotonic()
+                closed = None
+                try:
+                    for byte in b'GET / HTTP/1.1\r\nX-Pad: ' + b'x' * 40:
+                        drip.send(bytes([byte]))
+                        time.sleep(0.3)
+                except OSError:
+                    closed = time.monotonic() - started
+                self.assertIsNotNone(closed, 'the server never closed a client that drips its headers')
+                self.assertLess(closed, 4.0)
+            # More idle connections than there are threads: each new one evicts the oldest idle one.
+            idle = [socket.create_connection(('127.0.0.1', port)) for _ in range(gui_module.MAX_REQUEST_THREADS + 8)]
+            self.addCleanup(lambda: [sock.close() for sock in idle])
+            started = time.monotonic()
+            self.assertEqual(self.request(port, 'GET', '/', good, timeout=30)[0], 200)
+            self.assertLess(time.monotonic() - started, 1.0)
+            self.assertLessEqual(len(gui.server._reading) + len(gui.server._working), gui_module.MAX_REQUEST_THREADS)
+            self.assertTrue(wait_for(lambda: not gui.server._reading and not gui.server._working, 5),
+                            'idle connections are gone after the header deadline')
+            self.assertEqual(self.request(port, 'GET', '/', good, timeout=30)[0], 200)
+
     def test_one_slow_client_cannot_hold_the_gui_and_its_stop(self):
-        """ADV1-3: the GUI serves one connection at a time with a per-recv 2 s timeout, so a client
-        that sends one byte a second (any local uid can reach 127.0.0.1) holds it indefinitely."""
+        """ADV1-3 (fixed): the GUI served one connection at a time with a per-recv 2 s timeout, so a client
+        that sends one byte a second (any local uid can reach 127.0.0.1) held it indefinitely."""
         door = adapter.DeviceDoor(self.runtime / 'recursion')
         self.addCleanup(door.close)
         token = door.path.read_text().strip()

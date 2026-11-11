@@ -49,6 +49,11 @@ _ID = re.compile(r"[A-Za-z0-9_.:@/-]{1,128}")
 _STORE_MAGIC = "csl-breaker-store/v0"
 
 
+def _schema_locked(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "database table is locked" in text or "database schema is locked" in text or text == "database is locked"
+
+
 def _check_id(value: object, code: str) -> str:
     if type(value) is not str or not _ID.fullmatch(value):
         raise Refused(code)
@@ -190,12 +195,38 @@ class ConnectionBreaker:
             return cursor.rowcount == 1
 
     def _ensure_generation(self) -> None:
-        """Stores created before the trip counter gain it. A cleared trip is not reused."""
-        columns = [row[1] for row in self._db.execute("PRAGMA table_info(tripped)")]
+        """Stores created before the trip counter gain it. A cleared trip is not reused.
+
+        The schema is read inside ``BEGIN IMMEDIATE``, then migrated there. A second
+        opener waits and reads again, so it does not repeat the ``ALTER TABLE``.
+        ``duplicate column name: generation`` means the other opener already added it.
+        """
+        deadline = time.monotonic() + 30.0
+        while True:
+            try:
+                self._migrate_generation()
+                return
+            except sqlite3.OperationalError as exc:
+                if _schema_locked(exc) and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                    continue
+                self._db.close()
+                raise Refused("breaker_store_invalid") from None
+            except sqlite3.DatabaseError:
+                self._db.close()
+                raise Refused("breaker_store_invalid") from None
+
+    def _migrate_generation(self) -> None:
+        self._db.execute("BEGIN IMMEDIATE")
         try:
+            columns = [row[1] for row in self._db.execute("PRAGMA table_info(tripped)")]
             if "generation" not in columns:
-                self._db.execute(
-                    "ALTER TABLE tripped ADD COLUMN generation INTEGER NOT NULL DEFAULT 1")
+                try:
+                    self._db.execute(
+                        "ALTER TABLE tripped ADD COLUMN generation INTEGER NOT NULL DEFAULT 1")
+                except sqlite3.DatabaseError as exc:
+                    if "duplicate column name: generation" not in str(exc).lower():
+                        raise
             self._db.execute(
                 "CREATE TABLE IF NOT EXISTS trip_seq ("
                 "connection TEXT PRIMARY KEY, generation INTEGER NOT NULL)")
@@ -204,9 +235,13 @@ class ConnectionBreaker:
                 "SELECT connection, generation FROM tripped WHERE generation IS NOT NULL "
                 "ON CONFLICT(connection) DO UPDATE SET "
                 "generation = MAX(trip_seq.generation, excluded.generation)")
-        except sqlite3.DatabaseError:
-            self._db.close()
-            raise Refused("breaker_store_invalid") from None
+            self._db.execute("COMMIT")
+        except BaseException:
+            try:
+                self._db.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
 
     def _is_tripped(self, connection: str) -> bool:
         return self._db.execute("SELECT 1 FROM tripped WHERE connection=?", (connection,)).fetchone() is not None

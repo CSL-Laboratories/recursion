@@ -33,6 +33,57 @@ def _deep_path(root: str, total: int) -> str:
     return os.path.join(current, "f" * name_len)
 
 
+class _SchemaRace:
+    """A connection that pauses an unlocked schema read until the other opener has read too.
+
+    The migration under test reads the schema inside its write transaction, so this
+    pause does not run. An unlocked read is the race the second opener used to lose.
+    """
+
+    def __init__(self, db, name, barrier, alters, unlocked):
+        self._db = db
+        self._name = name
+        self._barrier = barrier
+        self._alters = alters
+        self._unlocked = unlocked
+
+    def execute(self, sql, parameters=()):
+        if sql.lstrip().upper().startswith("ALTER TABLE"):
+            self._alters.append(self._name)
+        cursor = self._db.execute(sql, parameters)
+        if "table_info(tripped)" in sql and not self._db.in_transaction:
+            rows = cursor.fetchall()
+            self._unlocked.append(self._name)
+            self._barrier.wait(3)
+            return rows
+        return cursor
+
+    def close(self) -> None:
+        db = self._db
+        self._db = None
+        if db is not None:
+            db.close()
+
+
+class _HideGeneration:
+    """Report ``generation`` as missing so the migration retries an ``ALTER`` that already landed."""
+
+    def __init__(self, db):
+        self._db = db
+
+    def execute(self, sql, parameters=()):
+        cursor = self._db.execute(sql, parameters)
+        if "table_info(tripped)" in sql:
+            return [row for row in cursor.fetchall() if row[1] != "generation"]
+        return cursor
+
+    def close(self) -> None:
+        db = self._db
+        self._db = None
+        if db is not None:
+            db.close()
+
+
 class TripGenerationTests(unittest.TestCase):
     """CSL-804: a probe that ended before a later trip must not clear that trip."""
 
@@ -95,6 +146,60 @@ class TripGenerationTests(unittest.TestCase):
         self.assertTrue(reopened.report("conn-a", "plan_limit"))
         self.assertFalse(first.reset_after_probe("conn-a", lease_a, True))
         self.assertTrue(reopened.tripped("conn-a"))
+
+    def test_two_openers_migrate_a_legacy_store_once(self) -> None:
+        uri = "file:legacy-breaker-migration?mode=memory&cache=shared"
+        setup = sqlite3.connect(uri, uri=True, isolation_level=None, check_same_thread=False)
+        self.addCleanup(setup.close)
+        setup.execute("CREATE TABLE tripped (connection TEXT PRIMARY KEY, event_type TEXT NOT NULL)")
+        setup.execute("INSERT INTO tripped VALUES ('conn-a', 'rate_limit')")
+        barrier = threading.Barrier(2)
+        alters: list[str] = []
+        unlocked: list[str] = []
+        outcome: list[tuple] = []
+        prepared = []
+        for name in ("A", "B"):
+            db = sqlite3.connect(uri, uri=True, isolation_level=None, check_same_thread=False, timeout=5)
+            db.execute("PRAGMA busy_timeout=5000")
+            prepared.append((name, db))
+
+        def open_one(name: str, db) -> None:
+            breaker = ConnectionBreaker.__new__(ConnectionBreaker)
+            breaker._db = _SchemaRace(db, name, barrier, alters, unlocked)
+            try:
+                breaker._ensure_generation()
+                outcome.append((name, None))
+            except BaseException as exc:  # noqa: BLE001 - the assertion is on this thread's result
+                outcome.append((name, exc))
+            finally:
+                breaker._db.close()
+
+        workers = [threading.Thread(target=open_one, args=item) for item in prepared]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(5)
+        self.assertFalse(any(worker.is_alive() for worker in workers))
+        self.assertEqual(sorted(unlocked), [])
+        self.assertEqual([error for _name, error in outcome], [None, None])
+        self.assertEqual(len(alters), 1)
+        self.assertEqual(setup.execute("SELECT generation FROM tripped").fetchone()[0], 1)
+        self.assertEqual(setup.execute("SELECT generation FROM trip_seq").fetchone()[0], 1)
+
+    def test_duplicate_generation_column_is_already_migrated(self) -> None:
+        uri = "file:legacy-breaker-duplicate?mode=memory&cache=shared"
+        db = sqlite3.connect(uri, uri=True, isolation_level=None, check_same_thread=False)
+        db.execute("CREATE TABLE tripped (connection TEXT PRIMARY KEY, event_type TEXT NOT NULL)")
+        db.execute("INSERT INTO tripped VALUES ('conn-a', 'rate_limit')")
+        db.execute("ALTER TABLE tripped ADD COLUMN generation INTEGER NOT NULL DEFAULT 1")
+        db.execute("UPDATE tripped SET generation = 4")
+        breaker = ConnectionBreaker.__new__(ConnectionBreaker)
+        breaker._db = _HideGeneration(db)
+        try:
+            breaker._ensure_generation()
+            self.assertEqual(db.execute("SELECT generation FROM trip_seq").fetchone()[0], 4)
+        finally:
+            breaker._db.close()
 
 
 class StorePathTests(unittest.TestCase):

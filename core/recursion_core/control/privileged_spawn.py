@@ -981,13 +981,47 @@ def _detach_ptrace(pid: int) -> tuple[int, int, str]:
         # ``pending`` or another stop: try detach again, without blocking.
 
 
-def _kill_traced(pid: int) -> None:
-    """SIGKILL a tracee whose detach failed, so it is not left ptrace-stopped."""
+# After a failed detach the tracee is SIGKILLed, then the tracer must collect
+# the death notification. A non-child (sudo's descendant, systemd's MainPID)
+# stays a traced zombie until that wait; the real parent's WNOHANG returns
+# (0, 0) while TracerPid is still the probe. The wait is bounded so a kill
+# that did not land cannot hang the probe.
+_KILL_WAIT_S = 2.0
+_KILL_POLL_S = 0.05
+
+
+def _kill_traced(pid: int) -> str:
+    """SIGKILL ``pid`` and collect its death notification.
+
+    Returns ``reaped`` when ``waitpid`` reports the exit, ``gone`` when the
+    tracee is already reaped (``ECHILD``), or ``unreaped`` when the bounded
+    wait ends with no report. ``EINTR`` is retried inside that bound.
+    """
 
     try:
         os.kill(pid, signal.SIGKILL)
     except OSError:
         pass
+    deadline = time.monotonic() + _KILL_WAIT_S
+    while time.monotonic() < deadline:
+        try:
+            waited, status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return "gone"
+        except OSError as exc:
+            if exc.errno == errno.ECHILD:
+                return "gone"
+            if exc.errno != errno.EINTR:
+                return "unreaped"
+            waited = 0
+            status = 0
+        if waited != 0 and (os.WIFEXITED(status) or os.WIFSIGNALED(status)):
+            return "reaped"
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(_KILL_POLL_S, remaining))
+    return "unreaped"
 
 
 def probe_ptrace(pid: int) -> ProbeOutcome:
@@ -1005,10 +1039,11 @@ def probe_ptrace(pid: int) -> ProbeOutcome:
         state in {"reaped", "exited"} and detach_err in (errno.ESRCH, errno.ECHILD)
     )
     if not released:
-        _kill_traced(pid)
+        reap = _kill_traced(pid)
         detail = (
             f"rc={detach_rc}:errno={detach_err}:"
             f"{os.strerror(detach_err) if detach_err else 'ptrace detach failed'}"
+            f"; kill {reap}"
         )
         return None, f"ptrace detach failed {detail}"
     return False, "attached"

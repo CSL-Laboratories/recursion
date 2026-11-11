@@ -1386,8 +1386,9 @@ class SpawnDefectTests(unittest.TestCase):
         # EINTR is retried (see the stop/detach test). A non-restartable wait
         # error still detaches, and that detach result is the probe result.
         # Dropping an ESRCH and raising the wait error leaves the tracee attached.
+        # The SIGKILL is followed by a wait, or the non-child stays a traced zombie.
         calls: list[int] = []
-        killed: list[tuple[int, int]] = []
+        order: list[tuple[str, int]] = []
 
         def ptrace(request, pid, *args):
             calls.append(request)
@@ -1396,21 +1397,137 @@ class SpawnDefectTests(unittest.TestCase):
             return (0, 0)
 
         def kill(pid, sig):
-            killed.append((pid, sig))
+            order.append(("kill", sig))
+
+        killed = False
+
+        def waitpid(pid, options):
+            nonlocal killed
+            if not killed:
+                raise OSError(errno.EIO, "io error")
+            order.append(("wait", options))
+            return pid, signal.SIGKILL
+
+        def kill_then(pid, sig):
+            nonlocal killed
+            kill(pid, sig)
+            killed = True
 
         with mock.patch.object(privileged_spawn, "_ptrace", side_effect=ptrace):
-            with mock.patch.object(
-                privileged_spawn.os, "waitpid", side_effect=OSError(errno.EIO, "io error")
-            ):
-                with mock.patch.object(privileged_spawn.os, "kill", side_effect=kill):
+            with mock.patch.object(privileged_spawn.os, "waitpid", side_effect=waitpid):
+                with mock.patch.object(privileged_spawn.os, "kill", side_effect=kill_then):
                     result, detail = probe_ptrace(4242)
         self.assertIsNone(result)
         self.assertIn("ptrace detach failed", detail)
+        self.assertIn("kill reaped", detail)
         self.assertIn(str(errno.ESRCH), detail)
         self.assertEqual(
             calls, [privileged_spawn.PTRACE_ATTACH, privileged_spawn.PTRACE_DETACH]
         )
-        self.assertEqual(killed, [(4242, signal.SIGKILL)])
+        self.assertEqual(order[0], ("kill", signal.SIGKILL))
+        self.assertEqual(len(order), 2)
+        self.assertTrue(order[1][1] & os.WNOHANG)
+
+    def _failed_detach_then_kill(self, after_kill):
+        """Attach, exhaust ESRCH detaches, SIGKILL, then ``after_kill`` waits.
+
+        ``after_kill(pid, options, n)`` handles waitpid calls after the kill.
+        ``n`` starts at 1. Returns the probe result.
+        """
+
+        stopped = (signal.SIGSTOP << 8) | 0x7F
+        killed = False
+        after = {"n": 0}
+
+        def ptrace(request, pid, *args):
+            if request == privileged_spawn.PTRACE_DETACH:
+                return (-1, errno.ESRCH)
+            return (0, 0)
+
+        def kill(pid, sig):
+            nonlocal killed
+            self.assertEqual(sig, signal.SIGKILL)
+            killed = True
+
+        def waitpid(pid, options):
+            if killed:
+                after["n"] += 1
+                return after_kill(pid, options, after["n"])
+            if options & os.WNOHANG:
+                return 0, 0
+            return pid, stopped
+
+        with mock.patch.object(privileged_spawn, "_ptrace", side_effect=ptrace):
+            with mock.patch.object(privileged_spawn.os, "waitpid", side_effect=waitpid):
+                with mock.patch.object(privileged_spawn.os, "kill", side_effect=kill):
+                    return probe_ptrace(4242), after["n"]
+
+    def test_esrch_detach_kills_then_waits(self) -> None:
+        # Detach ESRCH is exhausted without a blocking rewait. The death
+        # notification is collected after SIGKILL, not left for the real parent.
+        def after_kill(pid, options, n):
+            self.assertTrue(options & os.WNOHANG)
+            self.assertEqual(n, 1)
+            return pid, signal.SIGKILL
+
+        (result, detail), waits = self._failed_detach_then_kill(after_kill)
+        self.assertIsNone(result)
+        self.assertIn("kill reaped", detail)
+        self.assertEqual(waits, 1)
+
+    def test_kill_wait_retries_eintr_then_reaps(self) -> None:
+        def after_kill(pid, options, n):
+            self.assertTrue(options & os.WNOHANG)
+            if n == 1:
+                raise OSError(errno.EINTR, "interrupted")
+            return pid, signal.SIGKILL
+
+        (result, detail), waits = self._failed_detach_then_kill(after_kill)
+        self.assertIsNone(result)
+        self.assertIn("kill reaped", detail)
+        self.assertEqual(waits, 2)
+
+    def test_kill_wait_treats_echild_as_gone(self) -> None:
+        for exc in (ChildProcessError("reaped"), OSError(errno.ECHILD, "no child")):
+            with self.subTest(exc=type(exc).__name__):
+
+                def after_kill(pid, options, n, exc=exc):
+                    self.assertTrue(options & os.WNOHANG)
+                    raise exc
+
+                (result, detail), waits = self._failed_detach_then_kill(after_kill)
+                self.assertIsNone(result)
+                self.assertIn("kill gone", detail)
+                self.assertEqual(waits, 1)
+
+    def test_kill_wait_gives_up_when_the_tracee_never_reports(self) -> None:
+        # A wait that never reports must return at the deadline, not hang.
+        now = {"t": 1000.0}
+        slept: list[float] = []
+
+        def monotonic():
+            return now["t"]
+
+        def sleep(seconds):
+            self.assertGreater(seconds, 0.0)
+            slept.append(seconds)
+            now["t"] += seconds
+            if len(slept) > 100:
+                raise AssertionError("kill wait did not stop at the deadline")
+
+        def after_kill(pid, options, n):
+            self.assertTrue(options & os.WNOHANG)
+            return 0, 0
+
+        with mock.patch.object(privileged_spawn.time, "monotonic", monotonic):
+            with mock.patch.object(privileged_spawn.time, "sleep", sleep):
+                started = now["t"]
+                (result, detail), waits = self._failed_detach_then_kill(after_kill)
+        self.assertIsNone(result)
+        self.assertIn("kill unreaped", detail)
+        self.assertGreaterEqual(now["t"] - started, privileged_spawn._KILL_WAIT_S)
+        self.assertGreater(waits, 1)
+        self.assertLessEqual(len(slept), 100)
 
     def test_detection_does_not_launch_uid_zero_names(self) -> None:
         seen: list[tuple[str, ...]] = []

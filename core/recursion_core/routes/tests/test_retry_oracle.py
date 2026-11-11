@@ -8,6 +8,7 @@ table. Fakes only: no provider, no network, no real process.
 from __future__ import annotations
 
 import json
+import random
 import threading
 import unittest
 from dataclasses import dataclass, field
@@ -836,6 +837,63 @@ class ReviewFollowupTest(unittest.TestCase):
         self.assertNotEqual(precise, "[redacted]")
         past = "prefix https:" + nested_slash(9) + nested_slash(9) + "user:dummy_password@example.invalid/hook suffix"
         self.assertEqual(c.event("retry", "vendor", {"error": past})["data"]["error"], "[redacted]")
+
+    def test_mixed_url_encodings_do_not_split_or_reorder_the_password(self) -> None:
+        cases = {
+            "PCT_SPLIT": ("prefix https:%2F%2Fuser:dummy%20password@example.invalid/hook suffix", "dummy"),
+            "PCT_SPLIT40": ("prefix https:%2F%2Fuser:dummy%40password@example.invalid/hook suffix", "password@"),
+            "PCT_SPLIT_TAB": ("prefix https:%2F%2Fuser:dummy%09password@example.invalid/hook suffix", "password"),
+            "PCT_SPLIT_SLASH": ("prefix https:%2F%2Fuser:dummy%2Fpassword@example.invalid/hook suffix", "password"),
+            "PCT_ORDER": ("prefix https:%5C%2F%5C%2Fuser:dummy_password@example.invalid/hook suffix", "dummy_password"),
+            "PCT_ORDER_U": ("prefix https:%5Cu002f%5Cu002fuser:dummy_password@example.invalid/hook suffix", "dummy_password"),
+            "JSON_PCT_JSON": ("prefix https:\\u00255c/\\u00255c/user:dummy_password@example.invalid/hook suffix",
+                              "dummy_password"),
+        }
+        for name, (raw, marker) in cases.items():
+            with self.subTest(name=name):
+                error = c.event("retry", "vendor", {"error": raw})["data"]["error"]
+                self.assertNotIn(marker, error)
+                self.assertIn("example.invalid", error)
+                self.assertNotEqual(error, "[redacted]")
+        self.assertEqual(c.redact("rate 100% of %20 budget"), "rate 100% of %20 budget")
+        self.assertEqual(c.redact("a literal % sign"), "a literal % sign")
+
+    def test_random_escape_layers_cannot_preserve_a_url_password(self) -> None:
+        password = "dummy_password"
+        host = "example.invalid"
+        forms = (
+            f"user:{password}",
+            f"user:dummy%20{password}",
+            f"user:dummy%40{password}",
+            f"user:dummy%2F{password}",
+            f"user:dummy%09{password}",
+        )
+        alphabet = {
+            "/": ("%2F", "%2f", "\\/", "\\u002f", "\\u002F"),
+            ":": ("%3A", "%3a", "\\:", "\\u003a", "\\u003A"),
+            "\\": ("%5C", "%5c", "\\u005c"),
+            "@": ("%40",),
+        }
+        rng = random.Random(326)
+
+        def apply_one(text: str) -> str:
+            if rng.random() < 0.5:
+                start, end = 0, len(text)
+            else:
+                cut = text.find(password)
+                start, end = 0, cut if cut > 0 else len(text)
+            chunk = text[start:end]
+            char = rng.choice(tuple(alphabet))
+            chunk = chunk.replace(char, rng.choice(alphabet[char]))
+            return text[:start] + chunk + text[end:]
+
+        for _ in range(40):
+            text = f"prefix https://{rng.choice(forms)}@{host}/hook suffix"
+            for _layer in range(rng.randrange(0, 5)):
+                text = apply_one(text)
+            redacted = c.redact(text)
+            self.assertNotIn(password, redacted, text)
+        self.assertEqual(c.redact("rate 100% of %20 budget"), "rate 100% of %20 budget")
 
     def test_opencode_subscription_providers_are_different_breakers(self) -> None:
         chatgpt = request(

@@ -315,12 +315,11 @@ _QUOTA_DENIED_AFTER = re.compile(
     rf"(?:(?:a|an|the){_SEP}+)?{_QUOTA_PREDICATE}(?=$|{_SEP}|\b)",
     re.IGNORECASE,
 )
-# Credential shapes. Word boundaries so "task-12345678" is not an sk- key. Case-insensitive, and
-# applied after JSON ``\uXXXX`` and ``\/`` escapes are decoded, including a second layer
-# (``\\/``, ``\u005c/``, or a mix of the two) and after ``%HH`` percent-encoding is decoded.
-# A hyphen written as ``\u002d`` and a URL written as ``https:%2F%2Fuser:password@host`` still
-# match. Both views are searched. The decoded text is only a search view: non-secret escapes stay
-# as they were written.
+# Credential shapes. Word boundaries so "task-12345678" is not an sk- key. Case-insensitive.
+# JSON ``\uXXXX`` / ``\/`` and ``%HH`` are peeled in turn, and every intermediate view is searched.
+# A structural view decodes only slash and colon escapes, so ``%20`` and ``%40`` inside a password
+# stay in the match. A hyphen written as ``\u002d`` and a URL written as ``https:%2F%2Fuser:password@host``
+# still match. Decoded text is only a search view: non-secret escapes stay as they were written.
 _SECRET = re.compile(
     r"(?<!\w)eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}(?!\w)"
     r"|(?<!\w)sk-[A-Za-z0-9_-]{8,}(?!\w)"
@@ -333,12 +332,16 @@ _SECRET = re.compile(
     re.IGNORECASE,
 )
 _URL_USERINFO = re.compile(r"https?://([^\s/@:]+:[^\s/@]+)@", re.IGNORECASE)
+# From after :// through the last @ before the host. A slash in the password stays inside the match.
+_URL_USERINFO_WIDE = re.compile(r"https?://(\S+)@(?=[^\s/@])", re.IGNORECASE)
+_URL_SCHEME = re.compile(r"https?://", re.IGNORECASE)
+# ``%40`` is an @ that a structural view deliberately does not decode, so it still has to end userinfo.
+_USERINFO_SEP = re.compile(r"@|%40", re.IGNORECASE)
 _JSON_U = re.compile(r"\\u([0-9a-fA-F]{4})")
 
 
-# Nested JSON encoding (``\\/`` or ``\u005c/``) and nested ``%HH`` are each peeled one layer at a
-# time. Eight passes is the bound for each. A value that is still changing after that has not
-# reached a fixed point, and the whole field is redacted instead of searching a partial decode.
+# One round is a JSON peel and then a percent peel. Eight rounds are shared. A value that is still
+# changing after that has not reached a fixed point, and the whole field is redacted.
 _ESCAPE_PASSES = 8
 _PCT = re.compile(r"%([0-9a-fA-F]{2})")
 
@@ -393,46 +396,129 @@ def _decode_pct_layer(value: str) -> tuple[str, list[tuple[int, int]], bool]:
     return "".join(out), spans, changed
 
 
-def _fixed_point(text: str, spans: list[tuple[int, int]], decode_once) -> tuple[str, list[tuple[int, int]], bool]:
-    """Peel one escape form until it stops changing, or until the cap. Spans stay on the original."""
+def _decode_structural(value: str) -> tuple[str, list[tuple[int, int]], bool]:
+    """Decode only slash and colon escapes. Every other ``%HH`` stays in place.
 
+    ``https:%2F%2Fuser:dummy%20password@host`` is then ``https://user:dummy%20password@host``,
+    so the password is still one userinfo match. ``%40`` is left encoded for the same reason.
+    """
+
+    out: list[str] = []
+    spans: list[tuple[int, int]] = []
+    index = 0
+    length = len(value)
+    changed = False
+    while index < length:
+        window = value[index:index + 6].lower()
+        if window.startswith("%2f"):
+            out.append("/")
+            spans.append((index, index + 3))
+            index += 3
+            changed = True
+            continue
+        if window.startswith("%3a"):
+            out.append(":")
+            spans.append((index, index + 3))
+            index += 3
+            changed = True
+            continue
+        if window.startswith("\\u002f"):
+            out.append("/")
+            spans.append((index, index + 6))
+            index += 6
+            changed = True
+            continue
+        if window.startswith("\\u003a"):
+            out.append(":")
+            spans.append((index, index + 6))
+            index += 6
+            changed = True
+            continue
+        if value.startswith("\\/", index) or value.startswith("\\:", index):
+            out.append("/" if value[index + 1] == "/" else ":")
+            spans.append((index, index + 2))
+            index += 2
+            changed = True
+            continue
+        out.append(value[index])
+        spans.append((index, index + 1))
+        index += 1
+    return "".join(out), spans, changed
+
+
+def _compose(spans: list[tuple[int, int]], layer: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    return [(spans[start][0], spans[end - 1][1]) for start, end in layer]
+
+
+def _decode_views(value: str) -> list[tuple[str, list[tuple[int, int]]]] | None:
+    """Alternate a JSON peel and a percent peel. None means the cap was not a fixed point."""
+
+    text = value
+    spans = [(index, index + 1) for index in range(len(value))]
+    views = [(text, spans)]
     for _ in range(_ESCAPE_PASSES):
-        decoded, layer, changed = decode_once(text)
+        changed = False
+        decoded, layer, json_changed = _decode_layer(text)
+        if json_changed:
+            spans = _compose(spans, layer)
+            text = decoded
+            views.append((text, spans))
+            changed = True
+        decoded, layer, pct_changed = _decode_pct_layer(text)
+        if pct_changed:
+            spans = _compose(spans, layer)
+            text = decoded
+            views.append((text, spans))
+            changed = True
         if not changed:
-            return text, spans, True
-        spans = [(spans[start][0], spans[end - 1][1]) for start, end in layer]
-        text = decoded
-    return text, spans, not decode_once(text)[2]
+            return views
+    if _decode_layer(text)[2] or _decode_pct_layer(text)[2]:
+        return None
+    return views
 
 
 def _collect_secret_hits(text: str, spans: list[tuple[int, int]], hits: list[tuple[int, int]]) -> None:
+    def add(start: int, end: int) -> None:
+        if end > start:
+            hits.append((spans[start][0], spans[end - 1][1]))
+
     for match in _URL_USERINFO.finditer(text):
-        hits.append((spans[match.start(1)][0], spans[match.end(1) - 1][1]))
+        add(match.start(1), match.end(1))
+    for match in _URL_USERINFO_WIDE.finditer(text):
+        add(match.start(1), match.end(1))
+    for scheme in _URL_SCHEME.finditer(text):
+        # Last @ or %40 before the host. This covers a password that contains %20, %40, or a slash.
+        chosen = None
+        rest = text[scheme.end():]
+        for sep in _USERINFO_SEP.finditer(rest):
+            after = rest[sep.end():]
+            if after[:1] not in ("", " ", "\t", "\r", "\n", "/", "@"):
+                chosen = sep
+        if chosen is not None:
+            add(scheme.end(), scheme.end() + chosen.start())
     for match in _SECRET.finditer(text):
-        hits.append((spans[match.start()][0], spans[match.end() - 1][1]))
+        add(match.start(), match.end())
 
 
 def redact(value: str) -> str:
     """Replace credential-shaped substrings. Connection ids and ordinary error codes are left as they are.
 
-    JSON escapes and ``%HH`` are decoded into separate search views. The view from before
-    percent-decoding is still searched, so ``dummy%20password`` stays a userinfo match. A value
-    that is still changing after either cap is replaced as a whole. A partial decode is not
-    searched, because a leftover escape can hide a credential.
+    JSON and percent-encoding are peeled in turn. Every intermediate view is searched, and so is a
+    structural view of each that decodes only slash and colon escapes. A value that is still
+    changing after the shared cap is replaced as a whole.
     """
 
     if not value:
         return value
-    identity = [(index, index + 1) for index in range(len(value))]
-    decoded, spans, stable = _fixed_point(value, identity, _decode_layer)
-    if not stable:
-        return "[redacted]"
-    percent, percent_spans, percent_stable = _fixed_point(decoded, spans, _decode_pct_layer)
-    if not percent_stable:
+    views = _decode_views(value)
+    if views is None:
         return "[redacted]"
     hits: list[tuple[int, int]] = []
-    _collect_secret_hits(decoded, spans, hits)
-    _collect_secret_hits(percent, percent_spans, hits)
+    for text, spans in views:
+        _collect_secret_hits(text, spans, hits)
+        structural, layer, changed = _decode_structural(text)
+        if changed:
+            _collect_secret_hits(structural, _compose(spans, layer), hits)
     if not hits:
         return value
     hits.sort()

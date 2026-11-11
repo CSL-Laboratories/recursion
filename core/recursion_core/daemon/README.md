@@ -129,7 +129,9 @@ Workload checkpoint and restart after reboot is not implemented.
   A process that is still in a descendant cgroup, including one the run created
   because the unit has `Delegate=yes`, is inside the subtree: it is not that gap,
   and it blocks `terminated`. An unfinished walk of the subtree is `unknown`,
-  including one that hits a depth limit, a node limit, or a cycle.
+  including one that hits a depth limit, a node limit, or a cycle. The node
+  limit is charged for each directory entry before that entry is read or
+  stat'd, and for each child still queued.
   `terminated` means the subtree was empty or the unit ended, not that every
   process the run started is gone. Same uid is not a containment or security boundary.
 - If the systemd user manager itself stops (no Linger at last logout, or

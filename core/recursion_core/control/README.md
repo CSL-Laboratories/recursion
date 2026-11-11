@@ -74,8 +74,9 @@ recorded on F60, CSL-762).
   registry continues the `cg-N` sequence past every marker the snapshot already holds. A marker string
   that has been stored is not kept for a new path, and a same-path update keeps the marker already
   stored; a marker that has never been stored is still accepted, so an adopted launch proof matches.
-  A `cg-` suffix that is not ASCII digits, or that is longer than the integer conversion limit, is
-  ignored. An empty result is confirmed again when the identity changed. `reap_orphans`
+  A marker is recorded only when the put is stored: a refused proof or a dry run does not retire it.
+  A `cg-` suffix that is not ASCII digits, or that is longer than 18 digits, does not move the counter.
+  An empty result is confirmed again when the identity changed. `reap_orphans`
   samples each member once, drops the members that sample says are gone, does not by itself record
   `stopped`, and does not clear the proof of a run that is already stopped.
   Locks live on the registry (`OwnerLockTable`). Each in-flight call holds them under a token it minted,

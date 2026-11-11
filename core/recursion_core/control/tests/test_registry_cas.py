@@ -1246,5 +1246,77 @@ class RoundSixTest(unittest.TestCase):
             self.assertEqual(restored.get("r")["stop"]["cgroup_marker"], marker)
 
 
+class RoundSevenTest(unittest.TestCase):
+    def _stopped_fresh(self, reg: InMemoryRunRegistry) -> dict:
+        snap = reg.get("r")
+        assert snap is not None
+        snap.update(cgroup="A", cgroup_marker="fresh", state="stopped")
+        snap["stop_attestation"] = {"proof": "empty", "cgroup": "A", "cgroup_marker": "fresh",
+                                    "member_ids": sorted(member["member_id"] for member in snap["members"]),
+                                    "generation": snap["generation"]}
+        return snap
+
+    def test_a_refused_stop_does_not_retire_the_marker(self) -> None:
+        class Alive:
+            def __init__(self) -> None:
+                self.on = True
+
+            def __call__(self, pid: int) -> bool:
+                return self.on
+
+        alive = Alive()
+        reg = InMemoryRunRegistry(processes=alive)
+        reg.put({"run_id": "r", "tenant": "t", "engine": "e", "state": "running",
+                 "cgroup": "X", "stop": None, "start_key": None})
+        reg.join_member("r", reg.get("r")["generation"], "m", 7)
+        snap = self._stopped_fresh(reg)
+
+        def try_put() -> str:
+            try:
+                reg.put(dict(snap))
+            except StopUnattested:
+                return "unattested"
+            return "stored"
+
+        self.assertEqual(try_put(), "unattested")
+        alive.on = False
+        self.assertEqual(try_put(), "stored")
+        stored = reg.get("r")
+        assert stored is not None
+        self.assertEqual(stored["state"], "stopped")
+        self.assertEqual(stored["cgroup_marker"], "fresh")
+
+    def test_a_dry_run_put_does_not_retire_the_marker(self) -> None:
+        def outcome(gate: bool) -> str:
+            reg = InMemoryRunRegistry()
+            reg.put({"run_id": "r", "tenant": "t", "engine": "e", "state": "running",
+                     "cgroup": "X", "stop": None, "start_key": None})
+            snap = self._stopped_fresh(reg)
+            if gate:
+                reg.commit_gate = lambda _snapshot: None
+            try:
+                reg.put(dict(snap))
+            except StopUnattested:
+                return "unattested"
+            stored = reg.get("r")
+            assert stored is not None
+            return f"{stored['state']} {stored['cgroup_marker']}"
+
+        self.assertEqual(outcome(False), "stopped fresh")
+        self.assertEqual(outcome(True), "stopped fresh")
+
+    def test_a_wide_marker_suffix_does_not_break_the_next_mint(self) -> None:
+        wide = "cg-" + "9" * 4300
+        reg = InMemoryRunRegistry([{"run_id": "r", "tenant": "t", "engine": "e", "state": "running",
+                                   "cgroup": "/cg", "cgroup_marker": wide, "stop": None}])
+        for path in ("/other", "/later"):
+            current = reg.get("r")
+            assert current is not None
+            current["cgroup"] = path
+            stored = reg.put(current)
+            self.assertNotEqual(stored["cgroup_marker"], wide)
+        self.assertEqual(reg.get("r")["state"], "running")
+
+
 if __name__ == "__main__":
     unittest.main()

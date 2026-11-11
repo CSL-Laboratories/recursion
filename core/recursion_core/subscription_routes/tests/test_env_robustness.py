@@ -760,11 +760,72 @@ class SubscriptionRobustness(unittest.TestCase):
         self.assertEqual([], called)
 
     def test_interrupt_while_arming_the_probe_closes_the_pipe(self) -> None:
-        before = set(os.listdir("/proc/self/fd"))
-        with mock.patch.object(own_loop.time, "monotonic", side_effect=KeyboardInterrupt):
+        opened: list[tuple[int, int]] = []
+        closed: list[int] = []
+        real_pipe = os.pipe
+        real_close = os.close
+
+        def tracking_pipe() -> tuple[int, int]:
+            pair = real_pipe()
+            opened.append(pair)
+            return pair
+
+        def tracking_close(fd: int) -> None:
+            closed.append(fd)
+            real_close(fd)
+
+        with mock.patch.object(own_loop.os, "pipe", tracking_pipe), mock.patch.object(
+            own_loop.os, "close", tracking_close
+        ), mock.patch.object(own_loop.time, "monotonic", side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
                 own_loop._probe_in_screened_env(lambda: True, {"PATH": "/usr/bin"})
-        self.assertEqual(set(), set(os.listdir("/proc/self/fd")) - before)
+        self.assertEqual(1, len(opened))
+        read_fd, write_fd = opened[0]
+        self.assertEqual(1, closed.count(read_fd))
+        self.assertEqual(1, closed.count(write_fd))
+        for fd in (read_fd, write_fd):
+            with self.assertRaises(OSError) as caught:
+                os.fstat(fd)
+            self.assertEqual(errno.EBADF, caught.exception.errno)
+
+    def test_a_closed_pipe_fd_is_not_closed_again(self) -> None:
+        # Closing a pipe fd and then forgetting its number lets the kernel reuse that
+        # number. A second close of the old number would close the new file.
+        real_close = os.close
+        real_open = os.open
+        victims: list[int] = []
+
+        def close_then_reuse(fd: int) -> None:
+            real_close(fd)
+            victims.append(real_open("/dev/null", os.O_RDONLY))
+            raise KeyboardInterrupt
+
+        def first_close_reuses(fd: int) -> None:
+            real_close(fd)
+            victims.append(real_open("/dev/null", os.O_RDONLY))
+            if len(victims) == 1:
+                raise KeyboardInterrupt
+
+        try:
+            with mock.patch.object(own_loop.os, "close", close_then_reuse), mock.patch.object(
+                own_loop.time, "monotonic", return_value=0.0
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    own_loop._probe_in_screened_env(lambda: True, {"PATH": "/usr/bin"})
+            with mock.patch.object(own_loop.os, "close", first_close_reuses), mock.patch.object(
+                own_loop.time, "monotonic", side_effect=KeyboardInterrupt
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    own_loop._probe_in_screened_env(lambda: True, {"PATH": "/usr/bin"})
+            self.assertGreaterEqual(len(victims), 2)
+            for fd in victims:
+                os.fstat(fd)
+        finally:
+            for fd in victims:
+                try:
+                    real_close(fd)
+                except OSError:
+                    pass
 
     def test_login_probe_interrupt_kills_the_child(self) -> None:
         def slow() -> bool:
@@ -821,7 +882,10 @@ class SubscriptionRobustness(unittest.TestCase):
                 children.append(pid)
             return pid
 
-        def interrupting_close(_fd: int) -> None:
+        closed_once: list[int] = []
+
+        def interrupting_close(fd: int) -> None:
+            closed_once.append(fd)
             raise KeyboardInterrupt
 
         try:
@@ -830,9 +894,9 @@ class SubscriptionRobustness(unittest.TestCase):
             ), mock.patch.object(own_loop.os, "close", interrupting_close):
                 with self.assertRaises(KeyboardInterrupt):
                     own_loop._probe_in_screened_env(lambda: True, {"PATH": "/usr/bin"})
-            for read_fd, _write_fd in opened:
-                with self.assertRaises(OSError):
-                    os.fstat(read_fd)
+            for read_fd, write_fd in opened:
+                self.assertLessEqual(closed_once.count(read_fd), 1)
+                self.assertLessEqual(closed_once.count(write_fd), 1)
             for pid in children:
                 try:
                     reaped, _status = os.waitpid(pid, os.WNOHANG)

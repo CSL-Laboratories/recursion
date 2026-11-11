@@ -209,6 +209,23 @@ def _probe_enforceable() -> bool:
     )
 
 
+def _close_probe_fd(fds: list[int], index: int) -> None:
+    """Close one recorded pipe end, and never that number again.
+
+    The slot is cleared before ``close``. An interrupt can arrive after the kernel has
+    reused the number; a later close of the recorded value would close the new file.
+    """
+
+    fd = fds[index]
+    if fd < 0:
+        return
+    fds[index] = -1
+    try:
+        os.close(fd)
+    except OSError:
+        return
+
+
 def _probe_in_screened_env(probe: Callable[[], bool], child: Mapping[str, str]) -> bool:
     """Run the login probe in a forked child whose environment is ``child``.
 
@@ -260,25 +277,14 @@ def _probe_in_screened_env(probe: Callable[[], bool], child: Mapping[str, str]) 
             os.setpgid(pid, pid)
         except OSError:
             pass
-        os.close(write_fd)
-        fds[1] = -1
+        _close_probe_fd(fds, 1)
         status = _read_all(read_fd, 80, deadline)
     finally:
         pending: BaseException | None = None
-        for index, fd in enumerate(fds):
-            if fd < 0:
-                continue
+        for index in range(len(fds)):
             try:
-                os.close(fd)
-                fds[index] = -1
-            except OSError:
-                fds[index] = -1
+                _close_probe_fd(fds, index)
             except BaseException as exc:
-                try:
-                    os.closerange(fd, fd + 1)
-                except OSError:
-                    pass
-                fds[index] = -1
                 pending = pending or exc
         leader_reaped = True
         if pid:

@@ -21,6 +21,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from recursion_core.routes import bare_default as bd
 from recursion_core.routes import contract as c
@@ -268,6 +269,7 @@ class ReadHelpTest(unittest.TestCase):
         self.assertEqual(bd.probe("claude", {"PATH": "/usr/bin"}, junk), "unknown")
         self.assertIsNone(bd.read_version(None, {"PATH": "/usr/bin"}, boom))
 
+    @unittest.skipIf(os.name == "nt", "POSIX executable scripts")
     def test_default_help_read_stops_at_the_byte_cap_and_reaps(self) -> None:
         # The 1 MiB cap has to stop the read. A child that dumps more than that and then
         # sleeps must be killed and reaped without waiting out the timeout.
@@ -297,6 +299,7 @@ class ReadHelpTest(unittest.TestCase):
             with self.assertRaises(ProcessLookupError):
                 os.kill(pid, 0)
 
+    @unittest.skipIf(os.name == "nt", "POSIX executable scripts")
     def test_timeout_discards_under_cap_help_already_written(self) -> None:
         # Fail-closed on purpose. A child that writes a full under-cap help and then
         # does not exit has not finished --help. Those bytes must not be classified:
@@ -339,6 +342,7 @@ class ReadHelpTest(unittest.TestCase):
             with self.assertRaises(ProcessLookupError):
                 os.kill(pid, 0)
 
+    @unittest.skipIf(os.name == "nt", "POSIX executable scripts")
     def test_stderr_pipe_cannot_stall_the_help_read(self) -> None:
         # _bounded_run accepts stderr= for the subprocess.run shape, but a PIPE is not
         # drained. A flood on it must not block a short stdout that then exits.
@@ -427,8 +431,7 @@ class ReadHelpTest(unittest.TestCase):
                     except ProcessLookupError:
                         pass
 
-    @unittest.skipUnless(hasattr(os, "fork") and hasattr(os, "waitid") and hasattr(os, "WNOWAIT"),
-                         "POSIX waitid")
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux subreaper")
     def test_exited_leader_does_not_spare_its_group(self) -> None:
         # The leader forks and exits. The child stays in that process group.
         # Reaping the leader first drops the pgid, so the child survives both
@@ -493,6 +496,69 @@ class ReadHelpTest(unittest.TestCase):
         self.assertIsInstance(done, subprocess.CompletedProcess)
         self.assertNotEqual(done.returncode, 0)
         self.assertEqual(len(done.stdout), bd.HELP_MAX_BYTES + 1)
+
+    @unittest.skipUnless(hasattr(os, "fork") and hasattr(os, "waitid"), "POSIX waitid")
+    def test_interrupt_during_eof_wait_kills_the_group(self) -> None:
+        # Popen.wait catches KeyboardInterrupt and collects the leader before
+        # the caller runs again. A same-group child must still be signaled.
+        read_fd, write_fd = os.pipe()
+        injected = False
+        pid = None
+        original = subprocess.Popen._wait
+        code = (
+            "import os, time\n"
+            "if os.fork() == 0:\n"
+            "    os.write(0, str(os.getpid()).encode())\n"
+            "    os.close(1)\n"
+            "    time.sleep(10)\n"
+            "    os._exit(0)\n"
+            "time.sleep(0.15)\n"
+        )
+
+        def interrupted_wait(proc, *args, **kwargs):
+            nonlocal injected
+            if not injected:
+                injected = True
+                raise KeyboardInterrupt
+            return original(proc, *args, **kwargs)
+
+        try:
+            try:
+                with patch.object(subprocess.Popen, "_wait", interrupted_wait):
+                    bd._bounded_run(
+                        [sys.executable, "-B", "-c", code],
+                        stdin=write_fd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                        timeout=2, check=False, shell=False)
+            except KeyboardInterrupt:
+                pass
+            os.close(write_fd)
+            write_fd = -1
+            pid = int(os.read(read_fd, 64))
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+        finally:
+            if write_fd != -1:
+                os.close(write_fd)
+            os.close(read_fd)
+            if pid is not None:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def test_proc_scan_ignores_non_utf8_names(self) -> None:
+        # A comm byte that is not valid UTF-8 must not abort the group scan.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            good = root / "7"
+            good.mkdir()
+            (good / "stat").write_bytes(b"7 (py\xffthon) R 1 77 1 0\n")
+            other = root / "8"
+            other.mkdir()
+            (other / "stat").write_bytes(b"8 (ok) S 1 3 1 0\n")
+            self.assertTrue(bd._group_has_live_member(77, proc_root=str(root)))
+            self.assertTrue(bd._group_has_live_member(3, proc_root=str(root)))
+            self.assertFalse(bd._group_has_live_member(3, proc_root=str(root / "missing")))
 
     @unittest.skipUnless(os.environ.get("RECURSION_LIVE_CLAUDE_HELP") == "1" and shutil.which("claude"),
                          "set RECURSION_LIVE_CLAUDE_HELP=1 with claude on PATH")

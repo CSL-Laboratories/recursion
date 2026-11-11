@@ -242,38 +242,72 @@ def _signal_group(proc: subprocess.Popen, pid: int) -> None:
             pass
 
 
-def _group_has_live_member(pgid: int) -> bool:
+def _proc_stats(proc_root: str = "/proc"):
+    """Yield ``(pid, state, ppid, pgrp)`` from ``proc_root``, as bytes.
+
+    ``stat`` is read in binary. A process name is an arbitrary byte string, and
+    opening it as text raises ``UnicodeDecodeError`` for a name that is not
+    valid in the locale encoding. One bad entry is skipped; it must not abort
+    the scan.
+    """
+    try:
+        names = os.listdir(proc_root)
+    except (OSError, UnicodeError, ValueError):
+        return
+    for name in names:
+        if not str(name).isdigit():
+            continue
+        try:
+            with open(os.path.join(proc_root, str(name), "stat"), "rb") as handle:
+                raw = handle.read()
+            end = raw.rfind(b")")
+            if end < 0:
+                continue
+            pid = raw.split(b" ", 1)[0]
+            fields = raw[end + 2:].split()
+            if len(fields) < 3:
+                continue
+            # state, ppid, pgrp. The command name can contain spaces and any
+            # bytes, so it is taken off above, at the last ")".
+            yield pid, fields[0], fields[1], fields[2]
+        except (OSError, UnicodeError, ValueError):
+            continue
+
+
+def _group_has_live_member(pgid: int, proc_root: str = "/proc") -> bool:
     """True if some process in ``pgid`` is still running.
 
     Zombies are not live. ``/proc`` is how a non-parent can see a same-group
     child that was reparented when the leader exited. Without it, the caller
     cannot tell, and the answer is false.
     """
-    try:
-        names = os.listdir("/proc")
-    except OSError:
-        return False
-    token = str(pgid)
-    for name in names:
-        if not name.isdigit():
-            continue
-        try:
-            with open("/proc/" + name + "/stat") as handle:
-                text = handle.read()
-        except OSError:
-            continue
-        end = text.rfind(")")
-        if end < 0:
-            continue
-        fields = text[end + 2:].split()
-        # state, ppid, pgrp. The command name can contain spaces, so it is skipped above.
-        if len(fields) >= 3 and fields[2] == token and fields[0] not in ("Z", "X"):
+    token = str(pgid).encode()
+    for _pid, state, _ppid, pgrp in _proc_stats(proc_root):
+        if pgrp == token and state not in (b"Z", b"X"):
             return True
     return False
 
 
+def _group_still_blocking(pgid: int) -> bool:
+    """True while a same-group process would still look alive to the caller.
+
+    A running member counts. So does a zombie reparented to init: ``kill(pid, 0)``
+    succeeds until that zombie is collected. A zombie we parent, including the
+    leader, is left for our own ``wait``.
+    """
+    leader = str(pgid).encode()
+    me = str(os.getpid()).encode()
+    for pid, state, ppid, pgrp in _proc_stats():
+        if pgrp != leader:
+            continue
+        if state in (b"Z", b"X") and (pid == leader or ppid == me):
+            continue
+        return True
+    return False
+
+
 def _until_group_dead(pgid: int) -> None:
-    """Return once ``pgid`` has no running member, without collecting any child.
+    """Return once ``pgid`` will not look running, without collecting any child.
 
     SIGKILL does not finish inside the ``killpg`` call. Collecting the leader
     immediately lets a caller observe the same-group child still running.
@@ -283,9 +317,41 @@ def _until_group_dead(pgid: int) -> None:
         return
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline:
-        if not _group_has_live_member(pgid):
+        if not _group_still_blocking(pgid):
             return
         time.sleep(0.001)
+
+
+def _wait_leader(proc: subprocess.Popen, deadline: float) -> str:
+    """Wait until the leader exits or ``deadline`` passes. Do not collect it.
+
+    Returns ``"exited"``, ``"timeout"``, or ``"reaped"``. ``Popen.wait`` catches
+    ``KeyboardInterrupt`` and waits again, and that second wait collects the
+    leader before the caller can signal the group. ``waitid`` with ``WNOWAIT``
+    does not. A ``KeyboardInterrupt`` during this wait leaves the leader unreaped.
+    """
+    pid = proc.pid
+    if (os.name == "nt" or not isinstance(pid, int) or pid <= 0
+            or not hasattr(os, "waitid") or not hasattr(os, "WNOWAIT")):
+        try:
+            proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            return "timeout"
+        return "reaped"
+    flags = os.WEXITED | os.WNOHANG | os.WNOWAIT
+    while True:
+        try:
+            got = os.waitid(os.P_PID, pid, flags)
+        except InterruptedError:
+            continue
+        except ChildProcessError:
+            return "reaped"
+        if got is not None:
+            return "exited"
+        remain = deadline - time.monotonic()
+        if remain <= 0:
+            return "timeout"
+        time.sleep(min(remain, 0.02))
 
 
 def _reap(proc: subprocess.Popen) -> None:
@@ -300,9 +366,16 @@ def _reap(proc: subprocess.Popen) -> None:
     deadline instead.
     """
     pid = proc.pid
-    if os.name != "nt" and isinstance(pid, int) and pid > 0 and proc.returncode is None and _leader_unreaped(pid):
-        _signal_group(proc, pid)
-        _until_group_dead(pid)
+    if os.name != "nt" and isinstance(pid, int) and pid > 0:
+        # Signal before collecting. A leader that Popen.wait already collected
+        # (its KeyboardInterrupt handler does that) still names the group while
+        # a same-group child is running.
+        if proc.returncode is None and _leader_unreaped(pid):
+            _signal_group(proc, pid)
+            _until_group_dead(pid)
+        elif _group_has_live_member(pid):
+            _signal_group(proc, pid)
+            _until_group_dead(pid)
     elif os.name == "nt" and proc.returncode is None and proc.poll() is None:
         try:
             proc.kill()
@@ -379,6 +452,9 @@ def _bounded_run(argv, *, env=None, stdin=None, stdout=None, stderr=None, timeou
     bytes already read: the child did not finish, so the buffer is not a finished
     ``--help``. An under-cap EOF does not kill. The child may close its output and
     still be exiting; it is killed only if it is still running when the deadline hits.
+    That wait does not use ``Popen.wait``: a ``KeyboardInterrupt`` there collects the
+    leader before the group can be signaled. The group is signaled first, including
+    when that interrupt already collected the leader and a same-group child is left.
 
     ``stdout`` and ``stderr`` are ignored. The child always gets a pipe we own and
     ``stderr=DEVNULL``. A stderr ``PIPE`` is not drained, and a flood on it would block
@@ -420,11 +496,16 @@ def _bounded_run(argv, *, env=None, stdin=None, stdout=None, stderr=None, timeou
         if why == "overflow":
             _reap(proc)
         else:
-            try:
-                proc.wait(timeout=max(0.0, deadline - time.monotonic()))
-            except subprocess.TimeoutExpired:
+            state = _wait_leader(proc, deadline)
+            if state == "timeout":
                 _reap(proc)
                 raise subprocess.TimeoutExpired(list(argv), waited) from None
+            if state == "exited" and proc.returncode is None:
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    _reap(proc)
+                    raise subprocess.TimeoutExpired(list(argv), waited) from None
         code = proc.returncode if isinstance(proc.returncode, int) else 1
         # A leader that already exited 0 can still have written past the cap.
         # That read is not success. check=True and check=False share this result.
@@ -434,8 +515,9 @@ def _bounded_run(argv, *, env=None, stdin=None, stdout=None, stderr=None, timeou
             raise subprocess.CalledProcessError(code, list(argv), output=out)
         return subprocess.CompletedProcess(list(argv), code, stdout=out)
     except BaseException:
-        # Signal the group before collecting the leader. poll() would collect an
-        # exited leader and skip the group.
+        # Signal the group before this handler returns. Popen.wait may already
+        # have collected the leader while handling KeyboardInterrupt; _reap
+        # still signals a same-group child that is running.
         _reap(proc)
         raise
     finally:

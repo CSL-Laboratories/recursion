@@ -78,8 +78,8 @@ are unaffected:
   leaves the previous file with its committed rows in it. The directory fsync
   is the barrier after that rename and before the file is reopened. If it
   fails, the published file stays and the call raises `RegistryDurabilityError`:
-  the rename may be visible without being crash-durable, so the daemon does not
-  start or stop a unit until a later directory fsync succeeds. If the new file cannot be reopened, later calls raise
+  the rename may be visible without being crash-durable, so a read, a sweep, a
+  start, or a stop does not run until a later directory fsync succeeds. If the new file cannot be reopened, later calls raise
   `RegistryIntegrityError` until an open succeeds. Temp files left by a dead
   pid are removed on open; a live pid's temp file is left in place. A zero-length
   or truncated registry is refused; it is not opened as an empty registry. A run
@@ -119,7 +119,8 @@ Workload checkpoint and restart after reboot is not implemented.
   it owns, and leave its unit's cgroup subtree. The escaped process is unseen.
   A process that is still in a descendant cgroup, including one the run created
   because the unit has `Delegate=yes`, is inside the subtree: it is not that gap,
-  and it blocks `terminated`. An unfinished walk of the subtree is `unknown`.
+  and it blocks `terminated`. An unfinished walk of the subtree is `unknown`,
+  including one that hits a depth limit, a node limit, or a cycle.
   `terminated` means the subtree was empty or the unit ended, not that every
   process the run started is gone. Same uid is not a containment or security boundary.
 - If the systemd user manager itself stops (no Linger at last logout, or

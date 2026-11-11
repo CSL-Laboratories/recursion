@@ -37,6 +37,10 @@ UNIT = re.compile(r'recursion-run-[a-zA-Z0-9_-]{1,64}\.service')
 # Nothing is relaunched: workload restart after reboot needs a founder policy.
 TERMINAL = frozenset({'terminated', 'lost_reboot'})
 SCHEMA_VERSION = 1
+# A delegated unit cgroup is shallow. Past either bound the walk is not a
+# positive empty result: callers treat None as unknown, never as terminated.
+CGROUP_WALK_MAX_DEPTH = 64
+CGROUP_WALK_MAX_NODES = 4096
 
 
 def require_free_threaded():
@@ -354,8 +358,8 @@ class Registry:
     def _require_dir_durable(self):
         """Retry a directory fsync that an earlier publish left unfinished.
 
-        External start and stop wait on a registry call. Those calls do not
-        return until this succeeds.
+        A read, a sweep, a start, and a stop all wait on this. None of them
+        returns until the directory fsync succeeds.
         """
         if self._dir_durable:
             return
@@ -509,7 +513,12 @@ class Registry:
         self._open_error = None
 
     def _ensure_open(self):
-        """Return with a live connection, or raise RegistryIntegrityError."""
+        """Return with a live connection, or raise RegistryIntegrityError.
+
+        A publish whose directory fsync has not finished is not readable yet.
+        Reopening the file without that fsync would let a sweep act on a Stop
+        that is not crash-durable.
+        """
         if self.closed:
             raise RuntimeError('Registry closed')
         if self.db is None:
@@ -517,6 +526,7 @@ class Registry:
                 self._reopen()
             except sqlite3.Error as exc:
                 raise RegistryIntegrityError('registry is not open') from exc
+        self._require_dir_durable()
 
     @contextmanager
     def _write(self):
@@ -860,12 +870,10 @@ class SystemdUserManager:
             populated = True
         return pids, populated
 
-    def _subtree(self, directory: Path):
-        """Return (pids, any_populated) for this cgroup and its descendants.
+    def _cgroup_identity(self, directory: Path):
+        """Return a stable identity for a real directory, or None if unusable.
 
-        None means the walk could not be finished: a read error, a symlink, or
-        a directory listing that failed. Delegate= lets a run create child
-        cgroups, and a pid in one of those is still inside the unit.
+        A symlink is not followed. The same identity seen twice is a cycle.
         """
         try:
             info = directory.lstat()
@@ -873,16 +881,20 @@ class SystemdUserManager:
             return None
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
             return None
-        level = self._read_level(directory)
-        if level is None:
-            return None
-        pids, populated = level
+        return (info.st_dev, info.st_ino)
+
+    def _cgroup_children(self, directory: Path):
+        """Return child directories, [] if this directory vanished, or None if unreadable.
+
+        A symlink child fails the walk. Children are not descended into here.
+        """
         try:
             entries = list(directory.iterdir())
         except OSError as exc:
             if exc.errno in (errno.ENOENT, errno.ESRCH):
-                return pids, populated
+                return []
             return None
+        children = []
         for entry in entries:
             try:
                 info = entry.lstat()
@@ -892,14 +904,43 @@ class SystemdUserManager:
                 return None
             if stat.S_ISLNK(info.st_mode):
                 return None
-            if not stat.S_ISDIR(info.st_mode) or entry.name in ('.', '..'):
-                continue
-            nested = self._subtree(entry)
-            if nested is None:
+            if stat.S_ISDIR(info.st_mode) and entry.name not in ('.', '..'):
+                children.append(entry)
+        return children
+
+    def _subtree(self, directory: Path):
+        """Return (pids, any_populated) for this cgroup and its descendants.
+
+        None means the walk could not be finished: a read error, a symlink, a
+        cycle, or a tree past the depth or node bound. The walk is iterative.
+        Delegate= lets a run create child cgroups, and a pid in one of those is
+        still inside the unit.
+        """
+        stack = [(directory, 0)]
+        seen = set()
+        nodes = 0
+        pids = []
+        populated = False
+        while stack:
+            current, depth = stack.pop()
+            nodes += 1
+            if depth > CGROUP_WALK_MAX_DEPTH or nodes > CGROUP_WALK_MAX_NODES:
                 return None
-            child_pids, child_populated = nested
-            pids.extend(child_pids)
-            populated = populated or child_populated
+            identity = self._cgroup_identity(current)
+            if identity is None or identity in seen:
+                return None
+            seen.add(identity)
+            level = self._read_level(current)
+            if level is None:
+                return None
+            level_pids, level_populated = level
+            pids.extend(level_pids)
+            populated = populated or level_populated
+            children = self._cgroup_children(current)
+            if children is None:
+                return None
+            for child in children:
+                stack.append((child, depth + 1))
         return pids, populated
 
     def _process_still_live(self, props, group):

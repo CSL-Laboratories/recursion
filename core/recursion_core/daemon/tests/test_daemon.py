@@ -11,8 +11,8 @@ import tempfile
 import threading
 import unittest
 from unittest.mock import patch, Mock
-from recursion_core.daemon import (AlreadyRunning, Daemon, Registry, RegistryDurabilityError,
-                                   RegistryIntegrityError,
+from recursion_core.daemon import (AlreadyRunning, CGROUP_WALK_MAX_NODES, Daemon, Registry,
+                                   RegistryDurabilityError, RegistryIntegrityError,
                                    UserLock, SystemdUserManager, UnitNotLoaded,
                                    check_operator_linger, refuse_engine_user,
                                    require_free_threaded)
@@ -352,6 +352,24 @@ class DaemonTests(unittest.TestCase):
             with self.assertRaises(RegistryDurabilityError):
                 self.registry.add('three', 'boot-a')
         self.assertEqual([run.run_id for run in self.registry.all()], ['one', 'three', 'two'])
+
+    def test_sweep_does_not_stop_while_directory_fsync_is_pending(self):
+        # A Stop whose directory fsync failed must not be acted on by a later
+        # read. all() and sweep() retry the fsync and raise before any signal.
+        self.daemon.start('one', ['fake'])
+        self.assertEqual(self.manager.starts, ['recursion-run-one.service'])
+        with patch('recursion_core.daemon._fsync_dir',
+                   side_effect=OSError(errno.EIO, 'Input/output error')):
+            with self.assertRaises(RegistryDurabilityError):
+                self.daemon.stop('one')
+            self.assertFalse(self.registry._dir_durable)
+            with self.assertRaises(RegistryDurabilityError):
+                self.registry.all()
+            fresh = Daemon(self.registry, self.manager, self.boot)
+            with self.assertRaises(RegistryDurabilityError):
+                fresh.sweep()
+            self.assertEqual(self.manager.stops, [])
+            self.assertEqual(self.manager.starts, ['recursion-run-one.service'])
 
     def test_open_removes_temp_files_left_by_dead_pids(self):
         dead = 1 << 22
@@ -1007,6 +1025,69 @@ class SystemdManagerTests(unittest.TestCase):
         registry.state('one', 'running')
         daemon = Daemon(registry, self.manager, lambda: 'boot-a')
         self.assertNotEqual(daemon.sweep()[0].state, 'terminated')
+
+    def test_deep_cgroup_tree_is_unknown(self):
+        # The chain and the cycle live in memory. Nothing is written under the
+        # host cgroup filesystem; the temp events file only lets observe() enter
+        # the populated-0 branch.
+        class Node:
+            def __init__(self, ident):
+                self.ident = ident
+                self.child = None
+
+        group = '/user.slice/a.service'
+        self.events(group, 0)
+        root = self.root / group.lstrip('/')
+        (root / 'cgroup.procs').write_text('')
+        head = Node(0)
+        cursor = head
+        for ident in range(1, 1100):
+            cursor.child = Node(ident)
+            cursor = cursor.child
+        loop = Node('loop')
+        loop.child = loop
+        wide = [Node(ident) for ident in range(CGROUP_WALK_MAX_NODES)]
+        real_identity = self.manager._cgroup_identity
+        real_children = self.manager._cgroup_children
+        real_read = self.manager._read_level
+        mode = {'kind': 'deep'}
+
+        def identity(directory):
+            if isinstance(directory, Node):
+                return ('mem', directory.ident)
+            return real_identity(directory)
+
+        def children(directory):
+            if isinstance(directory, Node):
+                if directory.child is None:
+                    return []
+                return [directory.child]
+            if directory != root:
+                return real_children(directory)
+            if mode['kind'] == 'deep':
+                return [head]
+            if mode['kind'] == 'cycle':
+                return [loop]
+            return wide
+
+        def read_level(directory):
+            if isinstance(directory, Node):
+                return [], False
+            return real_read(directory)
+
+        self.manager._cgroup_identity = identity
+        self.manager._cgroup_children = children
+        self.manager._read_level = read_level
+        self.manager._call = Mock(return_value=(
+            'LoadState=loaded\nActiveState=inactive\nSubState=dead\n'
+            f'ControlGroup={group}\nMainPID=0\n'
+            'InvocationID=0b5a2f3c9d8e4f60a1b2c3d4e5f60718\n'
+            'ExecMainStartTimestampMonotonic=81234567\n'))
+        for kind in ('deep', 'cycle', 'wide'):
+            mode['kind'] = kind
+            self.assertIsNone(self.manager._subtree(root))
+            self.assertNotEqual(self.manager.observe('a'), 'empty')
+            self.assertFalse(self.manager.processes_gone('a'))
 
     def test_populated_one_active_is_running(self):
         self.events('/user.slice/a.service', 1)

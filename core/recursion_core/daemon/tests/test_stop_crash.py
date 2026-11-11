@@ -34,6 +34,10 @@ import unittest
 from recursion_core.daemon import Daemon, Registry, UserLock
 from recursion_core.daemon.tests.procmanager import ProcessGroupManager, _proc_stat
 
+NOT_POSIX = os.name == 'nt' or not hasattr(os, 'getuid')
+LINUX_ONLY = ('Linux-only: the user daemon needs flock, uid ownership checks and systemd; it refuses '
+              'PlatformUnsupported (platform_unsupported) on Windows; covered by WindowsRefusalTests')
+
 CHILD = Path(__file__).with_name('crash_child.py')
 CELLS = int(os.environ.get('RECURSION_CRASH_CELLS', '10'))
 PHASES = ('running', 'before_signal', 'after_signal', 'signal_sent')
@@ -246,6 +250,7 @@ class StopEscalationWaits(unittest.TestCase):
         self.assertEqual(gone, [True] * CELLS)
 
 
+@unittest.skipIf(NOT_POSIX, LINUX_ONLY)
 class RecordedStopGuard(unittest.TestCase):
     """B14 at the registry: a recorded Stop is never overwritten with running."""
     def setUp(self):
@@ -290,6 +295,7 @@ class RecordedStopGuard(unittest.TestCase):
         self.assertEqual(run.state, 'stopping')
 
 
+@unittest.skipIf(NOT_POSIX, LINUX_ONLY)
 class ProcessGroupManagerTests(unittest.TestCase):
     def test_reused_pid_with_other_start_time_is_not_the_run(self):
         with tempfile.TemporaryDirectory() as temp:

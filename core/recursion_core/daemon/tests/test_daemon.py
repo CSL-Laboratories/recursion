@@ -17,6 +17,10 @@ from recursion_core.daemon import (AlreadyRunning, CGROUP_WALK_MAX_NODES, Daemon
                                    check_operator_linger, refuse_engine_user,
                                    require_free_threaded)
 
+NOT_POSIX = os.name == 'nt' or not hasattr(os, 'getuid')
+LINUX_ONLY = ('Linux-only: the user daemon needs flock, uid ownership checks and systemd; it refuses '
+              'PlatformUnsupported (platform_unsupported) on Windows; covered by WindowsRefusalTests')
+
 UNIT_FILE = Path(__file__).resolve().parents[3] / 'systemd' / 'recursion-daemon.service'
 
 # A legacy registry left by kill -9: the WAL still holds committed frames because
@@ -115,6 +119,7 @@ def lock_child(path, ready):
         signal.pause()
 
 
+@unittest.skipIf(NOT_POSIX, LINUX_ONLY)
 class DaemonTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -709,6 +714,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertNotIn(forbidden, text)
 
 
+@unittest.skipIf(NOT_POSIX, LINUX_ONLY)
 class SystemdManagerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

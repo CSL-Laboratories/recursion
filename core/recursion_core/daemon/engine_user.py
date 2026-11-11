@@ -85,7 +85,10 @@ def check_engine_no_user_manager(user, uid, *, operator_uid=None, call=subproces
         raise ValueError('invalid engine user name')
     if isinstance(uid, bool) or not isinstance(uid, int) or uid <= 0:
         raise ValueError('engine uid must be a positive int (never root)')
-    operator_uid = os.getuid() if operator_uid is None else operator_uid
+    if operator_uid is None:
+        if not hasattr(os, 'getuid'):  # Windows: no uid to compare, so no pass
+            raise EngineManagerPresent('platform_unsupported: no os.getuid to name the operator uid')
+        operator_uid = os.getuid()
     if uid == operator_uid:
         raise EngineManagerPresent('engine uid equals the operator uid, which keeps linger')
     evidence = {}

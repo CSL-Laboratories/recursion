@@ -30,7 +30,7 @@ try:
 except ImportError:  # pragma: no cover - Windows has no fcntl; it is the F40 stub path
     fcntl = None  # type: ignore[assignment]
 
-from .errors import FrameError, InsecureSocketPath, PeerRefused, RemoteBindRefused, TransportBusy
+from .errors import FrameError, InsecureSocketPath, PeerRefused, PlatformNotSupported, RemoteBindRefused, TransportBusy
 from .framing import HEADER, MAX_FRAME_BYTES, decode_body, encode_frame, read_frame, write_frame
 from .handlers import Connection, Handler, Message
 from .peercred import PeerCred, get_peer_cred
@@ -108,6 +108,19 @@ def refuse_remote_bind(address: object) -> str:
     return address
 
 
+def require_unix_transport() -> None:
+    """Refuse where AF_UNIX, ``os.geteuid`` or ``flock`` is missing (Windows), instead of ``AttributeError``.
+
+    Without them the owner checks cannot run, so nothing is bound or connected. Called after the
+    address checks, so a network address still gets ``RemoteBindRefused``.
+    """
+    if os.name == "nt" or fcntl is None or not hasattr(os, "geteuid") or not hasattr(socket, "AF_UNIX"):
+        raise PlatformNotSupported(
+            "platform_unsupported: the AF_UNIX control transport needs POSIX (AF_UNIX, geteuid, flock); "
+            "Windows is the F40 follow-on"
+        )
+
+
 def _is_host(address: str) -> bool:
     if address in ("localhost", "*"):
         return True
@@ -124,6 +137,7 @@ def ensure_private_dir(directory: str) -> None:
     An existing directory that is a symlink, belongs to another uid, or grants any group or
     other bit is refused, not repaired: the caller picked the wrong place.
     """
+    require_unix_transport()
     try:
         os.mkdir(directory, 0o700)
     except FileExistsError:
@@ -229,6 +243,7 @@ class UnixControlServer:
         self._path = refuse_remote_bind(os.path.join(directory, name))
         self._handler = handler
         self._peer_cred = peer_cred
+        require_unix_transport()
         self._uid = os.geteuid()
         self._slots = threading.BoundedSemaphore(max_connections)
         self._idle_timeout_s = idle_timeout_s
@@ -471,6 +486,7 @@ class UnixControlClient:
         max_frame_bytes: int = MAX_FRAME_BYTES,
     ) -> None:
         self.path = refuse_remote_bind(path)
+        require_unix_transport()
         self._timeout_s = timeout_s
         self._max_frame_bytes = max_frame_bytes
         self._lock = threading.Lock()

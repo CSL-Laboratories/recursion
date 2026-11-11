@@ -29,7 +29,7 @@ class PeerCred:
 
 
 def get_peer_cred(sock: socket.socket) -> PeerCred:
-    if sock.family != socket.AF_UNIX:
+    if sock.family != getattr(socket, "AF_UNIX", None):  # Windows CPython has no AF_UNIX
         raise OSError("peer credentials need an AF_UNIX socket")
     if sys.platform.startswith("linux"):
         raw = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, _UCRED.size)

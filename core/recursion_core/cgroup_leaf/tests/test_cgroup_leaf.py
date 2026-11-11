@@ -19,6 +19,10 @@ import recursion_core.cgroup_leaf as cgroup_leaf
 from recursion_core.cgroup_leaf import (Cgroup2, CleanupIncomplete, DelegatedRoot,
                                         LaunchError)
 
+NOT_LINUX = os.name == 'nt' or not hasattr(os, 'pidfd_open')
+LINUX_ONLY = ('Linux-only: the cgroup v2 leaf launcher needs pidfd, pipe2 and uid ownership; it refuses '
+              'platform_unsupported on Windows; covered by WindowsRefusalTests')
+
 
 def alive(pid):
     try:
@@ -107,6 +111,7 @@ class FakeCgroup(Cgroup2):
             raise KeyboardInterrupt('interrupt right after rmdir')
 
 
+@unittest.skipIf(NOT_LINUX, LINUX_ONLY)
 class LeafTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -456,6 +461,7 @@ class LeafTests(unittest.TestCase):
             self.assertNotIn(forbidden, source)
 
 
+@unittest.skipIf(NOT_LINUX, LINUX_ONLY)
 class RealCgroupTests(unittest.TestCase):
     """Live cell: runs only when a founder points RECURSION_CGROUP_ROOT at a delegated root."""
     @unittest.skipUnless(os.environ.get('RECURSION_CGROUP_ROOT'), 'no delegated cgroup root')

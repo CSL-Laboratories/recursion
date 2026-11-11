@@ -59,6 +59,19 @@ class LaunchError(RuntimeError):
     """The target did not start inside the leaf."""
 
 
+class PlatformUnsupported(LaunchError):
+    """No cgroup v2, pidfd or uid ownership here (Windows). Nothing was launched."""
+
+
+def require_linux_calls():
+    """Refuse with a typed error where the calls this launcher needs are missing, instead of AttributeError."""
+    missing = [name for name in ('getuid', 'pidfd_open', 'pipe2', 'O_CLOEXEC', 'O_NOFOLLOW')
+               if not hasattr(os, name)]
+    if os.name == 'nt' or missing:
+        raise PlatformUnsupported('platform_unsupported: the cgroup v2 leaf launcher needs Linux '
+                                  f'(missing: {", ".join(missing) or "POSIX"})')
+
+
 class CleanupIncomplete(RuntimeError):
     def __init__(self, outcome):
         super().__init__(f'leaf cleanup incomplete: {outcome}')
@@ -78,6 +91,7 @@ class Outcome:
 class Cgroup2:
     """cgroup v2 filesystem operations. Tests substitute a fake."""
     def __init__(self, mount=Path('/sys/fs/cgroup')):
+        require_linux_calls()
         self.mount = Path(os.path.realpath(mount))
 
     def make_leaf(self, leaf: Path):
@@ -127,6 +141,7 @@ class DelegatedRoot:
     cgroup.procs.
     """
     def __init__(self, path, fs: Cgroup2 | None = None):
+        require_linux_calls()
         self.fs = fs or Cgroup2()
         path = Path(path)
         real = Path(os.path.realpath(path))
@@ -201,6 +216,7 @@ class DelegatedRoot:
 
 class LeafRun:
     def __init__(self, fs: Cgroup2, leaf: Path, kill_timeout: float):
+        require_linux_calls()
         self.fs, self.leaf, self.kill_timeout = fs, leaf, kill_timeout
         self.proc = None
         self.pidfd = None

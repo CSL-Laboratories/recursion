@@ -25,6 +25,7 @@ import os
 import shutil
 import sys
 import tempfile
+import unittest
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -50,6 +51,10 @@ class Cell:
     route: ChildRoute | None = None
 
 
+POSIX_ONLY = ("POSIX-only: needs os.geteuid owner checks; child_env refuses platform_unsupported on Windows; "
+              "covered by WindowsRefusalTests")
+
+
 def owned_tmpdir(prefix: str) -> str:
     """A fresh 0700 directory whose whole chain passes the owned-chain rule, whatever TMPDIR names.
 
@@ -57,6 +62,8 @@ def owned_tmpdir(prefix: str) -> str:
     that is an error, not a skip: a cell must never pass or fail because of where the host put TMPDIR.
     """
 
+    if not policy._posix_supported():  # before mkdtemp: nothing is left behind where the owner checks cannot run
+        raise unittest.SkipTest(POSIX_ONLY)
     for base in (tempfile.gettempdir(), "/tmp"):
         try:
             path = tempfile.mkdtemp(prefix=prefix, dir=os.path.realpath(base))

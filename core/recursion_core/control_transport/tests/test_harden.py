@@ -27,6 +27,10 @@ from recursion_core.control_transport.peercred import PeerCred, get_peer_cred
 from recursion_core.control_transport.unix import UnixControlClient, UnixControlServer, check_peer
 
 LINUX = sys.platform.startswith("linux")
+
+NOT_POSIX = os.name == "nt" or not hasattr(os, "geteuid")
+POSIX_ONLY = ("POSIX-only: the AF_UNIX transport needs os.geteuid and flock; it refuses PlatformNotSupported "
+              "(platform_unsupported) on Windows; covered by WindowsRefusalTests")
 PACKAGE_DIR = Path(ct.__file__).resolve().parent
 CORE_DIR = PACKAGE_DIR.parents[1]
 
@@ -454,6 +458,7 @@ class WindowsStubHardenTests(_TmpCase):
             for attr in ("start", "request", "path"):
                 self.assertFalse(hasattr(cls, attr), f"{cls.__name__}.{attr} would look usable")
 
+    @unittest.skipIf(NOT_POSIX, POSIX_ONLY)
     def test_linux_factory_never_returns_the_stub(self) -> None:
         for platform in ("linux", "linux2", "darwin", "freebsd14"):
             with self.subTest(platform=platform):

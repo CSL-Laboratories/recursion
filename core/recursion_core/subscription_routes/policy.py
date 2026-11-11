@@ -556,7 +556,7 @@ def _check_home(
     ``own`` lists the engine's own login store entries a subscription sign-in may keep there.
     """
 
-    if os.name == "nt":
+    if os.name == "nt" or not hasattr(os, "geteuid"):
         raise SubscriptionRouteRefused(engine, "platform_unsupported")
     if not isinstance(route_home, str) or not os.path.isabs(route_home):
         raise SubscriptionRouteRefused(engine, "route_home_missing")

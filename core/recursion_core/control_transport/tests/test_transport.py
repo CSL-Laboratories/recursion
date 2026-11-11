@@ -19,6 +19,10 @@ from recursion_core.control_transport.peercred import PeerCred, get_peer_cred
 from recursion_core.control_transport.unix import UnixControlClient, UnixControlServer
 
 LINUX = sys.platform.startswith("linux")
+
+NOT_POSIX = os.name == "nt" or not hasattr(os, "geteuid")
+POSIX_ONLY = ("POSIX-only: the AF_UNIX transport needs os.geteuid and flock; it refuses PlatformNotSupported "
+              "(platform_unsupported) on Windows; covered by WindowsRefusalTests")
 PACKAGE_DIR = Path(ct.__file__).resolve().parent
 
 
@@ -732,6 +736,7 @@ class WindowsStubTests(unittest.TestCase):
         with self.assertRaises(ct.PlatformNotSupported):
             ct.create_server(("127.0.0.1", 0), ct.with_ping_health(), platform="win32")
 
+    @unittest.skipIf(NOT_POSIX, POSIX_ONLY)
     def test_mac_is_designed_in_on_the_unix_path(self) -> None:
         self.assertIn("macOS", ct.__doc__ or "")
         srv = ct.create_server("/tmp/ct-mac-designed-in", ct.with_ping_health(), platform="darwin")

@@ -20,6 +20,9 @@ from recursion_core.routes.tests.fakes import FakeClock, FakeLauncher, codex_scr
 from recursion_core.subscription_routes import WrapperInstall, measure_package_pin
 
 PKG = pathlib.Path(__file__).resolve().parents[1]
+NOT_POSIX = os.name == "nt" or not hasattr(os, "geteuid")
+POSIX_ONLY = ("POSIX-only: the route home owner check needs os.geteuid; subscription_routes refuses "
+              "platform_unsupported on Windows; covered by WindowsRefusalTests")
 
 
 class CodexUpdaterTest(unittest.TestCase):
@@ -93,6 +96,7 @@ class SubscriptionRouteReuseTest(unittest.TestCase):
         return request(engine=engine, model="m", kind="api_key", conn_id="k1", credential_env="ANTHROPIC_API_KEY",
                        profile=profile, home=self.home, **kw)
 
+    @unittest.skipIf(NOT_POSIX, POSIX_ONLY)
     def test_driver_deadline_is_fenced_and_typed(self) -> None:
         def drive(process, req, deadline_at, events):
             raise Deadline()
@@ -117,12 +121,14 @@ class SubscriptionRouteReuseTest(unittest.TestCase):
             self.assertEqual(res["detail"], "claude_subscription_provider")
         self.assertEqual(self.launcher.calls, [])
 
+    @unittest.skipIf(NOT_POSIX, POSIX_ONLY)
     def test_pi_without_a_wrapper_pin_refuses_before_launch(self) -> None:
         profile = {"provider": "anthropic", "auth": "api_key", "credential_env": "ANTHROPIC_API_KEY"}
         res = self.service.handle(self.req("pi", profile))
         self.assertEqual((res["code"], res["detail"]), (c.SUBSCRIPTION_ROUTE_REFUSED, "wrapper_pin_missing"))
         self.assertEqual(self.launcher.calls, [])
 
+    @unittest.skipIf(NOT_POSIX, POSIX_ONLY)
     def test_api_key_profile_passes_the_guard_then_launches(self) -> None:
         profile = {"provider": "anthropic", "auth": "api_key", "credential_env": "ANTHROPIC_API_KEY"}
         res = self.service.handle(self.req("pi", profile, wrapper=self.pin()))

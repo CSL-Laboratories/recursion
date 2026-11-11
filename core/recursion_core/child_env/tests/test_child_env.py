@@ -1734,7 +1734,7 @@ class AuthRouteTests(unittest.TestCase):
             {"NO_PROXY": "gateway.example", "HTTPS_PROXY": "", "ALL_PROXY": ""},  # an empty proxy is no proxy
             {**proxy, "NO_PROXY": "localhost,127.0.0.1,.corp.example"},
             {**proxy, "NO_PROXY": "notgateway.example,gateway.example.evil,xgateway.example"},
-            {**proxy, "NO_PROXY": "api.gateway.example,*.gateway.example"},  # a child of the host, not the host
+            {**proxy, "NO_PROXY": "api.gateway.example,llm.gateway.example:443"},  # a child of the host, not the host
             {**proxy, "NO_PROXY": ""}, {**proxy, "NO_PROXY": " , "},
             {**proxy, "no_proxy": ".openai.com"},
         )
@@ -1928,7 +1928,8 @@ class AuthRouteTests(unittest.TestCase):
     def test_child_env_reads_no_keyring_and_no_key_file(self) -> None:
         # Key custody: the caller fetches the key (OS keyring, or the owner-only file); this package is handed it.
         allowed = {"__future__", "ipaddress", "os", "re", "shutil", "stat", "subprocess", "tempfile", "threading", "collections.abc",
-                   "dataclasses", "pathlib", "types", "recursion_core.child_env.policy", "recursion_core.child_env.launch"}
+                   "dataclasses", "pathlib", "types", "unicodedata", "recursion_core.child_env.policy",
+                   "recursion_core.child_env.launch"}
         for module in (policy, launch):
             tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
             imported = {alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}

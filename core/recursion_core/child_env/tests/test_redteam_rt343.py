@@ -11,10 +11,9 @@ Go 1.27.3 ``net/http.ProxyFromEnvironment``, requests 2.34.2 ``should_bypass_pro
 as "every host", checked offline against that shipped code, while ``build_child_env`` launches. Each expects a
 NO_PROXY refusal of any of the four causes (the fix may pick the cause) that shows no entry text.
 
-Devin's partial rt343 file, brought in with the ``*`` matcher fix. The ``*MatcherGap*`` tests are the MEDIUM-2 items:
-the head launches every one of their cases, and whether to refuse them is the owner's call, so each is an expected
-failure with ``MEDIUM_2`` as its reason, not a skip. ``StarPatternTimeTests`` (MEDIUM-1) and
-``HardeningThatHoldsTests`` pass.
+Devin's partial rt343 file, brought in with the ``*`` matcher fix. The ``*MatcherGap*`` tests are the MEDIUM-2 items.
+They were expected failures until the MEDIUM-2 fix (``policy._no_proxy_readings``) and now pass, as do
+``StarPatternTimeTests`` (MEDIUM-1) and ``HardeningThatHoldsTests``. No test body here changed.
 
 No parent here sets PATH, so the host's /usr layout decides nothing; only the private home needs an owned chain.
 """
@@ -41,17 +40,6 @@ V6_GATEWAY = "https://[2001:db8::1]:8443/v1"
 USER_KEY = "sk-test-FAKE"
 NO_PROXY_CAUSES = ("no_proxy_wildcard", "no_proxy_engine_host", "no_proxy_route_host", "no_proxy_unparseable")
 WILDCARD_CAUSES = ("no_proxy_wildcard", "no_proxy_unparseable")
-MEDIUM_2 = "MEDIUM-2 client-normalization parity: waiting on owner call (Devin rt343)"
-
-
-def _waiting(reason: str):
-    """``unittest.expectedFailure`` with its reason kept on the test (``expected_failure_reason``)."""
-
-    def mark(test):
-        test.expected_failure_reason = reason
-        return unittest.expectedFailure(test)
-
-    return mark
 
 
 def _home(test: unittest.TestCase) -> str:
@@ -101,7 +89,6 @@ class NodeUndiciStarDotMatcherGapTests(_Base):
     checker compiles ``*.gateway.example`` to ``.*\\.gateway\\.example\\Z``, which needs a label before the dot.
     """
 
-    @_waiting(MEDIUM_2)
     def test_a_star_dot_entry_naming_the_route_host_itself_is_refused(self) -> None:
         home = _home(self)
         for base_url, value in ((GATEWAY, "*.gateway.example"), (GATEWAY, "*.gateway.example:443"), (GATEWAY, "*.GATEWAY.Example"),
@@ -111,7 +98,6 @@ class NodeUndiciStarDotMatcherGapTests(_Base):
                 with self.subTest(base_url=base_url, value=value, name=name):
                     self.assert_refused_without_entry_text(home, {**PROXY, name: value}, NO_PROXY_CAUSES, base_url)
 
-    @_waiting(MEDIUM_2)
     def test_a_star_dot_entry_naming_an_engine_host_itself_is_refused(self) -> None:
         """Claude Code engine hosts: the same undici rule. Pre-existing on master a70e9e40 (same ``*`` pattern code)."""
 
@@ -131,14 +117,12 @@ class NodeFeffSeparatorMatcherGapTests(_Base):
     ``\\ufeff*`` (a BOM before ``*``) skips it for every host in Node's built-in matcher.
     """
 
-    @_waiting(MEDIUM_2)
     def test_a_feff_split_entry_naming_the_route_host_is_refused(self) -> None:
         home = _home(self)
         for value in ("\ufeffgateway.example", "x\ufeffgateway.example", "gateway.example\ufeff", "localhost,\ufeffgateway.example"):
             with self.subTest(value=ascii(value)):
                 self.assert_refused_without_entry_text(home, {**PROXY, "NO_PROXY": value}, NO_PROXY_CAUSES)
 
-    @_waiting(MEDIUM_2)
     def test_a_feff_star_is_a_wildcard_on_any_route(self) -> None:
         home = _home(self)
         for value in ("\ufeff*", "*\ufeff", "localhost,\ufeff*"):
@@ -147,7 +131,6 @@ class NodeFeffSeparatorMatcherGapTests(_Base):
                 with self.subTest(value=ascii(value), engine=engine, base_url=base_url):
                     self.assert_refused_without_entry_text(home, {**PROXY, "no_proxy": value}, WILDCARD_CAUSES, base_url, engine)
 
-    @_waiting(MEDIUM_2)
     def test_a_feff_split_entry_naming_an_engine_host_is_refused(self) -> None:
         """Claude Code engine hosts: the same undici split. Pre-existing on master a70e9e40 (same ``[,\\s]+`` split)."""
 
@@ -166,7 +149,6 @@ class RequestsSpaceRemovalMatcherGapTests(_Base):
     checker splits at the space instead, and no fragment matches.
     """
 
-    @_waiting(MEDIUM_2)
     def test_a_space_split_entry_naming_the_route_host_is_refused(self) -> None:
         home = _home(self)
         for base_url, value in ((GATEWAY, "g ateway.example"), (GATEWAY, "localhost,gatew ay.example"),
@@ -174,7 +156,6 @@ class RequestsSpaceRemovalMatcherGapTests(_Base):
             with self.subTest(base_url=base_url, value=value):
                 self.assert_refused_without_entry_text(home, {**PROXY, "NO_PROXY": value}, NO_PROXY_CAUSES, base_url)
 
-    @_waiting(MEDIUM_2)
     def test_a_space_split_union_that_covers_every_ipv4_address_is_a_wildcard(self) -> None:
         """requests reads one name only (``no_proxy`` first), so each value here is a cover on its own."""
 
@@ -194,7 +175,6 @@ class GoIdnaMatcherGapTests(_Base):
     non-ASCII and the checker matches nothing.
     """
 
-    @_waiting(MEDIUM_2)
     def test_an_idna_mapped_entry_naming_the_route_host_is_refused(self) -> None:
         home = _home(self)
         for value in ("\uff47\uff41\uff54\uff45\uff57\uff41\uff59.example", "gateway\u3002example", "gateway\uff0eexample",
@@ -212,14 +192,12 @@ class NodeBuiltinRangeMatcherGapTests(_Base):
     and reads the entry as a name.
     """
 
-    @_waiting(MEDIUM_2)
     def test_an_ipv4_range_holding_the_route_host_is_refused(self) -> None:
         home = _home(self)
         for value in ("10.0.0.0-10.255.255.255", "10.1.2.3-10.1.2.3", "localhost,10.0.0.0 - 10.255.255.255"):
             with self.subTest(value=value):
                 self.assert_refused_without_entry_text(home, {**PROXY, "NO_PROXY": value}, NO_PROXY_CAUSES, V4_GATEWAY)
 
-    @_waiting(MEDIUM_2)
     def test_an_ipv4_range_of_every_address_is_a_wildcard(self) -> None:
         home = _home(self)
         for base_url in (None, "http://127.0.0.1:4000"):

@@ -302,6 +302,24 @@ def _group_has_live_member(pgid: int, proc_root: str = "/proc") -> bool | None:
     return False
 
 
+def _group_has_other_live_member(pgid: int) -> bool | None:
+    """Whether a live member of ``pgid`` has some other pid.
+
+    ``True`` means one does. ``False`` means a finished scan saw none. ``None``
+    means the scan did not run. The process whose pid equals ``pgid`` does not
+    count. After the leader is collected, that number can belong to a new
+    process, and ``killpg`` would signal it.
+    """
+    rows = _read_proc_stats()
+    if rows is None:
+        return None
+    token = str(pgid).encode()
+    for member, state, _ppid, pgrp in rows:
+        if pgrp == token and member != token and state not in (b"Z", b"X"):
+            return True
+    return False
+
+
 def _collect_our_zombies(pgid: int, rows: list[tuple[bytes, bytes, bytes, bytes]]) -> None:
     """Collect same-group zombies that this process parents. Not ``waitpid(-1)``.
 
@@ -409,16 +427,23 @@ def _reap(proc: subprocess.Popen) -> None:
     """
     pid = proc.pid
     deadline = time.monotonic() + 2.0
+    signaled = False
     if os.name != "nt" and isinstance(pid, int) and pid > 0:
-        # Signal before collecting. A scan that cannot prove the group is empty,
-        # including a missing /proc, is not a reason to skip killpg. A leader
-        # that Popen.wait already collected still names the group while a
-        # same-group child is running.
+        # While the leader is unreaped it still holds the group id, so a missing
+        # /proc scan still means kill. After Popen has collected it, that pid can
+        # be reused. killpg then hits an unrelated process, and a missing scan is
+        # not a reason to take that risk. Signal only when some other live member
+        # is actually in the group. A live row whose pid is the leader's number
+        # is that reused process, not our leader.
         leader_open = proc.returncode is None and _leader_unreaped(pid)
-        seen = None if leader_open else _group_has_live_member(pid)
-        if leader_open or seen is not False:
+        if leader_open or _group_has_other_live_member(pid) is True:
             _signal_group(proc, pid)
-        _until_group_dead(pid, deadline)
+            signaled = True
+            _until_group_dead(pid, deadline)
+        else:
+            rows = _read_proc_stats()
+            if rows:
+                _collect_our_zombies(pid, rows)
     elif os.name == "nt" and proc.returncode is None and proc.poll() is None:
         try:
             proc.kill()
@@ -430,6 +455,7 @@ def _reap(proc: subprocess.Popen) -> None:
         # Still our child, so this pid is still the group id.
         if os.name != "nt" and isinstance(pid, int) and pid > 0 and proc.returncode is None:
             _signal_group(proc, pid)
+            signaled = True
             _until_group_dead(pid, deadline)
         try:
             proc.kill()
@@ -437,9 +463,15 @@ def _reap(proc: subprocess.Popen) -> None:
             pass
         proc.wait(timeout=5)
     # Reparenting finishes when the leader is collected. A subreaper then owns
-    # the descendant zombie and has to collect it by pid.
+    # the descendant zombie and has to collect it by pid. Skip the wait when
+    # this pid was not signaled: a reused pid must not hold the sweep open.
     if os.name != "nt" and isinstance(pid, int) and pid > 0:
-        _until_group_dead(pid, max(deadline, time.monotonic() + 0.05))
+        if signaled:
+            _until_group_dead(pid, max(deadline, time.monotonic() + 0.05))
+        else:
+            rows = _read_proc_stats()
+            if rows:
+                _collect_our_zombies(pid, rows)
 
 
 def _readable(fd: int, remain: float) -> bool:
@@ -497,11 +529,12 @@ def _bounded_run(argv, *, env=None, stdin=None, stdout=None, stderr=None, timeou
     non-zero exit: ``check=True`` raises ``CalledProcessError``, otherwise the bytes
     come back with a non-zero code. A timeout also kills the session and discards
     bytes already read: the child did not finish, so the buffer is not a finished
-    ``--help``. An under-cap EOF does not kill. The child may close its output and
+    ``--help``.     An under-cap EOF does not kill. The child may close its output and
     still be exiting; it is killed only if it is still running when the deadline hits.
-    That wait does not use ``Popen.wait``: a ``KeyboardInterrupt`` there collects the
-    leader before the group can be signaled. The group is signaled first, including
-    when that interrupt already collected the leader and a same-group child is left.
+    That collect uses ``Popen._wait``. ``Popen.wait`` catches ``KeyboardInterrupt``
+    and reaps the leader before the group can be signaled. The handler reaps once.
+    A path that already reaped does not reap again: the collected pid can be reused,
+    and a second ``killpg`` would signal that new process.
 
     ``stdout`` and ``stderr`` are ignored. The child always gets a pipe we own and
     ``stderr=DEVNULL``. A stderr ``PIPE`` is not drained, and a flood on it would block
@@ -525,6 +558,7 @@ def _bounded_run(argv, *, env=None, stdin=None, stdout=None, stderr=None, timeou
         popen_kwargs["start_new_session"] = True
     proc = subprocess.Popen(list(argv), **popen_kwargs)
     fd: int | None = None
+    reaped = False
     try:
         if proc.stdout is None:
             raise OSError("stdout")
@@ -537,21 +571,27 @@ def _bounded_run(argv, *, env=None, stdin=None, stdout=None, stderr=None, timeou
         out, why = _read_capped(fd, deadline)
         if why == "timeout":
             _reap(proc)
+            reaped = True
             # Drop whatever was already read. A partial page is not help text:
             # classifying it could report absent or present for a read that never finished.
             raise subprocess.TimeoutExpired(list(argv), waited)
         if why == "overflow":
             _reap(proc)
+            reaped = True
         else:
             state = _wait_leader(proc, deadline)
             if state == "timeout":
                 _reap(proc)
+                reaped = True
                 raise subprocess.TimeoutExpired(list(argv), waited) from None
             if state == "exited" and proc.returncode is None:
                 try:
-                    proc.wait(timeout=5)
+                    # Not wait(): its KeyboardInterrupt handler reaps the leader
+                    # before the caller can signal the group.
+                    proc._wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     _reap(proc)
+                    reaped = True
                     raise subprocess.TimeoutExpired(list(argv), waited) from None
         code = proc.returncode if isinstance(proc.returncode, int) else 1
         # A leader that already exited 0 can still have written past the cap.
@@ -562,10 +602,10 @@ def _bounded_run(argv, *, env=None, stdin=None, stdout=None, stderr=None, timeou
             raise subprocess.CalledProcessError(code, list(argv), output=out)
         return subprocess.CompletedProcess(list(argv), code, stdout=out)
     except BaseException:
-        # Signal the group before this handler returns. Popen.wait may already
-        # have collected the leader while handling KeyboardInterrupt; _reap
-        # still signals a same-group child that is running.
-        _reap(proc)
+        # One reap per child. The explicit path already collected the leader, and
+        # a second killpg can signal a process that has reused its pid.
+        if not reaped:
+            _reap(proc)
         raise
     finally:
         if fd is not None:

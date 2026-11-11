@@ -660,6 +660,75 @@ class ReadHelpTest(unittest.TestCase):
                 except ProcessLookupError:
                     pass
 
+    def test_timeout_reaps_the_child_once(self) -> None:
+        # The read path reaps, then the error handler used to reap again after
+        # the leader's pid was free.
+        calls: list[int | None] = []
+        real_reap = bd._reap
+
+        def spy(proc: subprocess.Popen) -> None:
+            calls.append(proc.returncode)
+            real_reap(proc)
+
+        with patch.object(bd, "_reap", spy):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                bd._bounded_run(
+                    [sys.executable, "-B", "-c", "import time; time.sleep(30)"],
+                    env={}, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL, timeout=0.1, check=False, shell=False)
+        self.assertEqual(len(calls), 1)
+
+    def _reap_against_fake_proc(self, stat_rows: list[bytes]) -> list[tuple[int, int]]:
+        calls: list[tuple[int, int]] = []
+
+        def killpg(pgid: int, sig: int) -> None:
+            calls.append((pgid, sig))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for raw in stat_rows:
+                pid = raw.split(b" ", 1)[0].decode()
+                slot = root / pid
+                slot.mkdir()
+                (slot / "stat").write_bytes(raw)
+            real_scan = bd._read_proc_stats
+            seen = {"n": 0}
+
+            def scan(proc_root: str = "/proc"):
+                seen["n"] += 1
+                if seen["n"] == 1:
+                    return real_scan(str(root))
+                return []
+
+            class _Collected:
+                pid = int(stat_rows[0].split(b" ", 1)[0])
+                returncode = 0
+
+                @staticmethod
+                def wait(timeout: float | None = None) -> int:
+                    return 0
+
+                @staticmethod
+                def kill() -> None:
+                    return None
+
+            with patch.object(bd, "_read_proc_stats", scan), patch.object(os, "killpg", killpg):
+                bd._reap(_Collected())
+        return calls
+
+    def test_collected_leader_pid_alone_is_not_signaled(self) -> None:
+        # After collection, a live row whose pid is the old leader is a reused
+        # process. killpg would signal it.
+        calls = self._reap_against_fake_proc([b"424242 (leader) S 1 424242 424242 0\n"])
+        self.assertEqual(calls, [])
+
+    def test_collected_leader_still_signals_another_member(self) -> None:
+        calls = self._reap_against_fake_proc([
+            b"424242 (leader) S 1 424242 424242 0\n",
+            b"424243 (child) S 1 424242 424242 0\n",
+        ])
+        self.assertEqual(calls, [(424242, signal.SIGKILL)])
+
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux subreaper")
     def test_subreaper_collects_same_group_zombies(self) -> None:
         # A killed descendant reparents here when this process is a subreaper.

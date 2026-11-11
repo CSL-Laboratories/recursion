@@ -79,7 +79,6 @@ class Adv2BreakerTests(unittest.TestCase):
         return self.store()
 
     # -- ADV2-1 ----------------------------------------------------------------------------------
-    @unittest.expectedFailure  # ADV2-1: one failed store read at the first request disables restart fencing for good
     def test_a_transient_store_read_error_does_not_drop_the_restored_trip(self):
         stored = self.tripped_by_an_earlier_daemon()
         durable = daemon_breaker.DurableRouteBreaker(ConnectionBreaker(self.clock), FlakyStore(stored))
@@ -90,6 +89,15 @@ class Adv2BreakerTests(unittest.TestCase):
         # Expected: the trip from the earlier daemon fences this connection (or the start fails closed).
         self.assertFalse(first['admitted'] and second['admitted'],
                          f'tripped connection admitted twice: {first} {second}')
+
+    def test_a_failed_first_read_fails_closed_and_is_read_again_at_the_next_request(self):
+        stored = self.store()  # nothing tripped
+        durable = daemon_breaker.DurableRouteBreaker(ConnectionBreaker(self.clock), FlakyStore(stored))
+        with self.assertLogs('recursion_core.daemon.breaker', 'ERROR'):
+            first = durable.admit(CONN, 'm', 't1')
+        self.assertEqual((first['admitted'], first['code']), (False, c.BREAKER_OPEN))
+        second = durable.admit(CONN, 'm', 't1')
+        self.assertEqual((second['admitted'], second['code']), (True, None))
 
     def test_control_the_restored_trip_fences_when_the_store_reads(self):
         stored = self.tripped_by_an_earlier_daemon()

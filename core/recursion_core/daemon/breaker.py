@@ -13,7 +13,8 @@ store's module is only called here, never changed.
   connection only, and tripping it would fence every model on that login.
 * After a restart the in-memory breaker is empty. The first request on a connection the store
   still calls tripped reopens it in memory with the breaker's own cooldown (the vendor's reset
-  time is not stored), so that request is refused ``breaker_open``. After the cooldown one
+  time is not stored), so that request is refused ``breaker_open``. A request whose store read
+  fails is refused ``breaker_open`` too, and the next request reads the store again. After the cooldown one
   leased probe is admitted; the trip clears in the store only through that probe's lease
   (``begin_probe`` / ``reset_after_probe``), and only when the probe run succeeded.
 * Every run the daemon launches is bound in the store to its connection, engine and model, owned
@@ -133,7 +134,10 @@ class DurableRouteBreaker:
 
     # -- routes.ConnectionBreaker interface ---------------------------------------------------------
     def admit(self, connection, model, tenant, *, deadline_s=None):
-        self._restore(connection, model, tenant)
+        if not self._restore(connection, model, tenant):
+            # The store could not say whether an earlier daemon tripped this connection. Fail closed
+            # as tripped; the next request reads the store again (ADV2-1).
+            return {'admitted': False, 'code': c.BREAKER_OPEN, 'probe': None, 'retry_at': None, 'key': connection}
         answer = self._inner.admit(connection, model, tenant, deadline_s=deadline_s)
         probe = answer.get('probe')
         if answer.get('admitted') and probe is not None and self.tripped(connection):
@@ -168,16 +172,27 @@ class DurableRouteBreaker:
         return effect
 
     def _restore(self, connection, model, tenant):
+        """Take over a trip an earlier daemon stored. False when the store could not be read.
+
+        The connection counts as taken over only once the store was read: a failed read is
+        retried at the next request, never treated as "not tripped" (ADV2-1).
+        """
         with self._lock:
             if connection in self._restored:
-                return
-            self._restored.add(connection)
+                return True
             # Under the lock: a second request on this connection must not be admitted in between.
-            if self.tripped(connection) and self._inner.state(connection) == 'closed':
+            tripped = self.tripped(connection)
+            if tripped is None:
+                log.error('breaker store unreadable at the first request on a connection: refused as '
+                          'tripped (breaker_open); the store is read again at the next request')
+                return False
+            self._restored.add(connection)
+            if tripped and self._inner.state(connection) == 'closed':
                 log.warning('connection is tripped in the breaker store from an earlier daemon; it stays '
                             'fenced for the cooldown, then one probe is admitted')
                 self._inner.record(connection, model, tenant, {
                     'code': c.PLAN_LIMIT, 'limit': c.limit_signal('connection', RESTORED_SOURCE)})
+            return True
 
     def close(self):
         self._stored.close()

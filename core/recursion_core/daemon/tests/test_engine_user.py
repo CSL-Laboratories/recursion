@@ -18,6 +18,10 @@ from recursion_core.daemon.engine_user import (
     check_engine_no_user_manager, refuse_session_launch, signin_without_session_bus)
 from recursion_core.daemon.tests.test_daemon import Boot, FakeManager
 
+NOT_POSIX = os.name == 'nt' or not hasattr(os, 'getuid')
+LINUX_ONLY = ('Linux-only: the user daemon needs flock, uid ownership checks and systemd; it refuses '
+              'PlatformUnsupported (platform_unsupported) on Windows; covered by WindowsRefusalTests')
+
 ENGINE, UID, OPERATOR = 'csl-engine', 1001, 1000
 
 
@@ -36,6 +40,7 @@ class Probe:
         return self.answers[argv[0]]
 
 
+@unittest.skipIf(NOT_POSIX, LINUX_ONLY)
 class EngineManagerProbeTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -148,6 +153,7 @@ class SessionLaunchTests(unittest.TestCase):
             with self.subTest(argv=argv), self.assertRaises(SessionLaunchRefused):
                 refuse_session_launch(argv)
 
+    @unittest.skipIf(NOT_POSIX, LINUX_ONLY)
     def test_same_uid_operator_runs_are_not_filtered(self):
         # The guard is for the later cross-uid engine spawn; it does not restrict same-uid operator
         # commands, and the daemon does not claim to enforce engine-manager absence.
@@ -172,6 +178,7 @@ class SessionLaunchTests(unittest.TestCase):
             self.assertNotIn(word, SPAWN_PATH['path'])
 
 
+@unittest.skipIf(NOT_POSIX, LINUX_ONLY)
 class StopScopeTests(unittest.TestCase):
     def test_stop_ends_just_one_run(self):
         with tempfile.TemporaryDirectory() as temp:

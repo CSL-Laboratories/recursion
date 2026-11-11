@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import errno
-import fcntl
+try:
+    import fcntl
+except ImportError:  # Windows has no fcntl; require_posix() refuses before anything uses it
+    fcntl = None
 import logging
 import os
 from pathlib import Path
@@ -61,6 +64,22 @@ def read_boot_id(path=Path('/proc/sys/kernel/random/boot_id')):
     return value or None
 
 
+class PlatformUnsupported(RuntimeError):
+    """This platform lacks the POSIX calls the user daemon needs (Windows). Nothing was started."""
+
+
+def require_posix():
+    """Refuse where flock, uid ownership or the no-follow open flags are missing.
+
+    The daemon is Linux-only. Windows gets this typed refusal, never an AttributeError
+    or ImportError, and never an unchecked lock, registry or systemd call.
+    """
+    if (os.name == 'nt' or fcntl is None or not hasattr(os, 'getuid')
+            or not hasattr(os, 'O_NOFOLLOW') or not hasattr(os, 'O_DIRECTORY')):
+        raise PlatformUnsupported('platform_unsupported: the user daemon needs Linux '
+                                  '(flock, uid ownership checks, O_NOFOLLOW, systemd user units)')
+
+
 class AlreadyRunning(RuntimeError):
     pass
 
@@ -85,6 +104,7 @@ class UserLock:
         self.fd = None
 
     def __enter__(self):
+        require_posix()
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd = os.open(self.path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
         try:
@@ -251,6 +271,7 @@ class Registry:
     an open succeeds.
     """
     def __init__(self, directory: Path):
+        require_posix()
         directory = Path(directory)
         _require_private_dir(directory)
         self.directory = directory
@@ -668,6 +689,7 @@ class ServiceManager(Protocol):
 class Daemon:
     def __init__(self, registry: Registry, manager: ServiceManager,
                  boot_id: Callable[[], str | None] = read_boot_id):
+        require_posix()
         self.registry, self.manager, self.boot_id = registry, manager, boot_id
         self.lock = threading.RLock()
         self.closed = False
@@ -790,6 +812,7 @@ class Daemon:
 class SystemdUserManager:
     """Independent transient user services: no PartOf/BindsTo daemon relationship."""
     def __init__(self, cgroup_root=Path('/sys/fs/cgroup')):
+        require_posix()
         self.cgroup_root = cgroup_root
 
     def _call(self, argv):

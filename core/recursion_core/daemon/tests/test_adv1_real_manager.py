@@ -182,10 +182,9 @@ class RealManagerAttackTest(unittest.TestCase):
         self.assertEqual(result['outside'].get('error', {}).get('code'), 'scope_refused',
                          'the same engine process got: %s' % json.dumps(result['outside'])[:200])
 
-    @unittest.expectedFailure  # ADV1-11
     def test_unit_argv_reaches_the_engine_verbatim(self):
-        """ADV1-11: systemd-run expands $VAR, ${VAR} and $$ in the unit argv from the user manager's
-        environment; EngineUnitManager.start does not pass --expand-environment=no."""
+        """ADV1-11 (fixed): systemd-run would expand $VAR, ${VAR} and $$ in the unit argv from the user
+        manager's environment; EngineUnitManager.start passes --expand-environment=no."""
         run_id = 'run-adv1argv%d' % os.getpid()
         out = self.tmp / 'argv.json'
         tricky = ['$HOME', '${USER}', '%n', '%h', '%%', 'a b', ';id', '-x', '\\n', 'line\nbreak', '$$']

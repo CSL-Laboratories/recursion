@@ -36,8 +36,10 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import select
 import stat
+import subprocess
 import sys
 try:
     import termios
@@ -63,6 +65,9 @@ ENGINE_EXEC = Path(__file__).with_name('engine_exec.py')
 STOP_PROPERTIES = ('KillSignal=SIGINT', 'TimeoutStopSec=2s', 'SendSIGKILL=yes')
 MAX_LINE_BYTES = 16 * 1024 * 1024
 SEND_TIMEOUT_S = 30.0
+# systemd-run expands $VAR, ${VAR} and $$ in the command line unless told not to, and it can be
+# told only since v254 (--expand-environment=). An older systemd-run is refused, not worked around.
+VERBATIM_ARGV_MIN_SYSTEMD = 254
 _PATH_SAFE = frozenset('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/._-+@,')
 
 _current = threading.local()
@@ -169,6 +174,7 @@ class EngineUnitManager(SystemdUserManager):
         super().__init__(cgroup_root)
         self._pending = {}
         self._pending_lock = threading.Lock()
+        self._verbatim_argv = False
 
     def prepare(self, unit, *, properties=(), working_directory=None):
         with self._pending_lock:
@@ -183,13 +189,33 @@ class EngineUnitManager(SystemdUserManager):
             raise ValueError('Empty launch')
         with self._pending_lock:
             properties, cwd = self._pending.pop(unit, ((), None))
+        self.require_verbatim_argv()
         command = ['systemd-run', '--user', '--quiet', '--unit=' + unit, '--service-type=exec',
+                   '--expand-environment=no',
                    '--property=KillMode=control-group', '--property=Delegate=yes',
                    '--property=RemainAfterExit=yes']
         command += ['--property=' + item for item in (*STOP_PROPERTIES, *properties)]
         if cwd is not None:
             command.append('--working-directory=' + str(cwd))
         self._call([*command, '--', *argv])
+
+    def require_verbatim_argv(self):
+        """Refuse the launch unless this systemd-run can hand the engine its argv unchanged (ADV1-11).
+
+        Without ``--expand-environment=no`` an argument such as ``$HOME`` reaches the engine as the
+        user manager's value for it. A systemd-run too old to know the flag, or one whose version
+        cannot be read, gets a typed refusal; the flag is never dropped to make the launch work.
+        """
+        if self._verbatim_argv:
+            return
+        try:
+            text = self._call(['systemd-run', '--version'])
+        except (OSError, subprocess.SubprocessError):
+            text = ''
+        found = re.match(r'systemd (\d+)', text or '')
+        if found is None or int(found.group(1)) < VERBATIM_ARGV_MIN_SYSTEMD:
+            raise refused('systemd_run_cannot_pass_argv_verbatim')
+        self._verbatim_argv = True
 
     def unit_identity(self, unit):
         """(cgroup path, main pid) as systemd reports them now; blank or 0 when it reports none."""

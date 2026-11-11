@@ -26,7 +26,8 @@ threads, processes and restarts all see one total:
 
 Same-uid limit (B17, stated, not solved): every guard above lives in the daemon's
 process and files, which in-process plugin code running as the same uid can rewrite
-(replace the anchor attribute, patch ``verify``, edit or recreate the ledger). The
+(replace the anchor attribute, patch ``verify``, plant an entry in the per-instance
+verify cache, edit or recreate the ledger). The
 tests record which of those mutants succeed. Containment needs a separate OS user or
 process for the anchor and ledger (F11, F21); F21 is not done.
 
@@ -52,6 +53,7 @@ import os
 import re
 import sqlite3
 import threading
+from collections import OrderedDict
 from typing import Callable
 
 from .approval import SCOPE_FIELDS
@@ -73,6 +75,7 @@ _SCOPE_VALUE = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
 _MODEL_VALUE = re.compile(r"[A-Za-z0-9_.:@/-]{1,128}")
 _KIND = re.compile(r"[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+")
 _LEDGER_MAGIC = "csl-authority-ledger/v0"
+_VERIFY_CACHE_SIZE = 256  # positive signature verdicts kept per Authority
 
 
 def _int(value: object, low: int = 0) -> bool:
@@ -127,6 +130,33 @@ class Authority:
             raise Refused("ledger_anchor_mismatch")
         self._db.execute(_CHARGES_INDEX)  # ledgers created before the index gain it here
         self._lock = threading.Lock()
+        # Positive Ed25519 verdicts for this instance's fixed anchor, keyed by the exact
+        # (signature hex, canonical bytes) pair; LRU, bounded, own lock (free-threaded safe).
+        self._verified: OrderedDict[tuple[str, bytes], None] = OrderedDict()
+        self._verified_lock = threading.Lock()
+
+    def _verify(self, signature: object, raw: bytes) -> bool:
+        """``verify`` against the anchor, remembering only successes for these exact bytes.
+
+        Only the signature verdict is cached. Parsing, field checks, the window, the
+        call's plugin/scope/model/action/amount, idempotency, the ``profile_id`` binding
+        and spend are still decided per charge from the private parse of ``raw``.
+        """
+        key = (signature, raw) if type(signature) is str else None
+        if key is not None:
+            with self._verified_lock:
+                if key in self._verified:
+                    self._verified.move_to_end(key)
+                    return True
+        if not verify(self._anchor, signature, raw):
+            return False
+        if key is not None:
+            with self._verified_lock:
+                self._verified[key] = None
+                self._verified.move_to_end(key)
+                while len(self._verified) > _VERIFY_CACHE_SIZE:
+                    self._verified.popitem(last=False)
+        return True
 
     def _check_profile(self, envelope: object) -> tuple[dict, str]:
         if type(envelope) is not dict or set(envelope) != {"profile", "signature"}:
@@ -136,7 +166,7 @@ class Authority:
             raw = canonical(profile)
         except Refused:
             raise Refused("profile_noncanonical") from None
-        if not verify(self._anchor, envelope["signature"], raw):
+        if not self._verify(envelope["signature"], raw):
             raise Refused("profile_signature_invalid")
         # Every later check, the result and the ledger read a private parse of the exact
         # signed bytes, never the caller's dict: another plugin thread can still change that

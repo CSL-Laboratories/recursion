@@ -146,16 +146,21 @@ class AuthorityToctouTests(unittest.TestCase):
                 "profile_currency_mismatch", self._charge, env, 100, k, currency="EUR")),
         ]
 
-    def _run_refusals(self, hook_name: str, after_true: bool) -> None:
+    def _run_refusals(self, hook_name: str, after_true: bool, warm: bool = False) -> None:
         for name, mutate, call in self._cases():
             with self.subTest(name):
                 self._fresh()
                 env = profile(self.installer)
+                charges = []
+                if warm:  # an honest charge first, so the signature verdict is served from the cache
+                    self._charge(env, 100, "k-warm")
+                    charges = [("k-warm", "prof-1", 100)]
+                    self.assertEqual(len(self.auth._verified), 1)
                 before = self.mutations
                 with self._hook(hook_name, env, mutate, after_true=after_true):
                     call(env, "k-" + name)
                 self.assertEqual(self.mutations, before + 1, "the mutator thread did not run")
-                self.assertEqual(self._ledger(), ([], []))
+                self.assertEqual(self._ledger()[1], charges)
 
     def test_mutation_after_verify_cannot_widen_refusals(self) -> None:
         self._run_refusals("verify", after_true=True)
@@ -163,6 +168,14 @@ class AuthorityToctouTests(unittest.TestCase):
     def test_mutation_after_canonical_cannot_widen_refusals(self) -> None:
         # Hooked at canonical so it also fires when the signature verdict comes from a cache.
         self._run_refusals("canonical", after_true=False)
+
+    def test_mutation_after_cached_verdict_cannot_widen_refusals(self) -> None:
+        real_verify = authority_module.verify
+        calls = []
+        authority_module.verify = lambda *args: calls.append(args) or real_verify(*args)
+        self.addCleanup(setattr, authority_module, "verify", real_verify)
+        self._run_refusals("canonical", after_true=False, warm=True)
+        self.assertEqual(len(calls), len(self._cases()))  # one per warm-up; every hooked charge was a hit
 
     def test_mutation_cannot_extend_expiry(self) -> None:
         for hook_name in ("verify", "canonical"):
@@ -181,11 +194,19 @@ class AuthorityToctouTests(unittest.TestCase):
         signed_digest = hashlib.sha256(authority_module.canonical(env["profile"])).hexdigest()
         self._charge(env, 5_000, "k-a")
         self._charge(env, 5_000, "k-b")  # signed total 10_000 now spent
-        with self._hook("verify", env, lambda p: p.update(
-                budgets={"currency": "USD", "max_effect_minor": 5_000, "total_minor": 10**12}),
-                after_true=True):
-            self._refused("budget_total_exceeded", self._charge, env, 1_000, "k-c")
-        self.assertEqual(self.mutations, 1)
+        signed_budgets = env["profile"]["budgets"]
+        for hook_name in ("canonical", "verify"):
+            with self.subTest(hook_name):
+                env["profile"]["budgets"] = signed_budgets
+                if hook_name == "verify":  # a new instance on the same ledger: cold cache, real verify
+                    self.auth = Authority(self.installer.public, self.path, self.clock)
+                    self.addCleanup(self.auth.close)
+                before = self.mutations
+                with self._hook(hook_name, env, lambda p: p.update(
+                        budgets={"currency": "USD", "max_effect_minor": 5_000, "total_minor": 10**12}),
+                        after_true=hook_name == "verify"):
+                    self._refused("budget_total_exceeded", self._charge, env, 1_000, "k-c")
+                self.assertEqual(self.mutations, before + 1)
         self.assertEqual(self._ledger(), ([("prof-1", signed_digest)],
                                           [("k-a", "prof-1", 5_000), ("k-b", "prof-1", 5_000)]))
 

@@ -11,7 +11,10 @@ from recursion_core.subscription_routes.own_loop import (
     check_copilot_own_loop,
     check_nous_own_loop,
     nous_proxy_doctor,
+    spawn_copilot_own_loop,
+    spawn_nous_own_loop,
 )
+from recursion_core.subscription_routes.validated_launch import launch_env, spawn_route_process
 from recursion_core.subscription_routes.policy import (
     CLAUDE_SUBSCRIPTION_ENV,
     ENGINE_SELECTOR_ENV,
@@ -49,6 +52,10 @@ __all__ = [
     "check_copilot_own_loop",
     "check_nous_own_loop",
     "nous_proxy_doctor",
+    "spawn_copilot_own_loop",
+    "spawn_nous_own_loop",
+    "launch_env",
+    "spawn_route_process",
     "AntigravityPin",
     "PackagePin",
     "WrapperInstall",

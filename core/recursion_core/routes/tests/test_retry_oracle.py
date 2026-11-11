@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from recursion_core.routes import contract as c
 from recursion_core.routes import limits as lim
 from recursion_core.routes.breaker import ConnectionBreaker
+from recursion_core.routes.base import Deadline
 from recursion_core.routes.claude_code import ClaudeCodeAdapter
 from recursion_core.routes.codex import CodexAdapter
 from recursion_core.routes.profile_route import profile_adapters
@@ -257,6 +258,8 @@ class ServiceOracleTest(unittest.TestCase):
             ("not exhausted", c.ENGINE_ERROR),
             ("isn't exhausted", c.ENGINE_ERROR),
             ("quota is not exhausted", c.ENGINE_ERROR),
+            ("quota_exhausted", c.SHORT_FAULT),
+            ("quota is not available", c.SHORT_FAULT),
             ("éexhaustedé", c.ENGINE_ERROR),
             ("rate-limited", c.SHORT_FAULT),
             ("rate limiting", c.SHORT_FAULT),
@@ -634,6 +637,114 @@ class ReviewFollowupTest(unittest.TestCase):
         again = breaker.admit(CONN, "m", "t1")
         self.assertEqual(again["code"], c.BREAKER_OPEN)
         self.assertEqual(again["retry_at"] - clock(), 3600)
+
+    def test_api_key_helper_ignores_credential_env_and_stays_off_the_custody_meter(self) -> None:
+        clock = FakeClock()
+        launcher = FakeLauncher([claude_limit(), claude_ok("custody")], clock)
+        parent = {"PATH": "/usr/bin", "HOME": "/h"}
+        service = RouteService(
+            {"claude_code": ClaudeCodeAdapter(launcher, clock, lambda *_: "sk-test", parent, wall_clock=clock)},
+            ConnectionBreaker(clock), clock)
+        bare = request(rid="h1", kind="api_key", conn_id="helper-1")
+        bare["route"]["connection"]["key_source"] = "api_key_helper"
+        with_env = request(rid="h2", kind="api_key", conn_id="helper-1", credential_env="ANTHROPIC_API_KEY")
+        with_env["route"]["connection"]["key_source"] = "api_key_helper"
+        self.assertEqual(c.breaker_key(bare["route"]), c.breaker_key(with_env["route"]))
+        self.assertEqual(c.breaker_key(bare["route"]), "api_key:anthropic:api_key_helper:helper-1")
+        custody = request(rid="k", kind="api_key", conn_id="helper-1", credential_env="ANTHROPIC_API_KEY")
+        self.assertNotEqual(c.breaker_key(custody["route"]), c.breaker_key(bare["route"]))
+        self.assertEqual(service.handle(bare)["code"], c.PLAN_LIMIT)
+        blocked = service.handle(with_env)
+        self.assertEqual(blocked["code"], c.BREAKER_OPEN)
+        self.assertEqual(len(launcher.calls), 1)
+        self.assertEqual(service.handle(custody)["text"], "custody")
+        self.assertEqual(len(launcher.calls), 2)
+
+    def test_slash_escaped_url_password_is_redacted_in_the_vendor_event(self) -> None:
+        secret_url = "https:\\/\\/user:password@example.invalid/hook"
+        retry = {"type": "system", "subtype": "api_retry", "attempt": 1, "max_retries": 2,
+                 "error_status": 401, "error": f"upstream {secret_url}"}
+        _, _, _, service = ServiceOracleTest._service(self, [[retry, *claude_ok()]])
+        res = service.handle(request())
+        self.assertEqual(res["status"], "ok")
+        blob = json.dumps(res)
+        self.assertNotIn("password", blob)
+        self.assertNotIn("user:password", blob)
+        self.assertIn("[redacted]", res["events"][0]["data"]["error"])
+        self.assertIn("example.invalid", res["events"][0]["data"]["error"])
+
+    def test_a_failed_driver_fence_keeps_the_child_and_chains_under_the_driver_error(self) -> None:
+        class Boom(RuntimeError):
+            pass
+
+        class Proc:
+            def __init__(self) -> None:
+                self.fence_calls = 0
+                self.fenced: list[str] = []
+
+            def send(self, line: str) -> None:
+                raise Boom("driver broke")
+
+            def close_stdin(self) -> None:
+                return None
+
+            def read_line(self, timeout_s: float):
+                return None
+
+            def fence(self, reason: str) -> None:
+                self.fence_calls += 1
+                if self.fence_calls == 1:
+                    raise OSError("fence broke")
+                self.fenced.append(reason)
+
+        clock = FakeClock()
+        proc = Proc()
+        service = RouteService(
+            {"claude_code": ClaudeCodeAdapter(lambda argv, **kwargs: proc, clock, lambda *_: "",
+                                              {"PATH": "/usr/bin"}, wall_clock=clock)},
+            ConnectionBreaker(clock), clock)
+        with self.assertRaises(Boom) as caught:
+            service.handle(request())
+        self.assertIsInstance(caught.exception.__cause__, OSError)
+        self.assertEqual(len(service._live), 1)
+        service.shutdown()
+        self.assertEqual(proc.fenced, ["shutdown"])
+        self.assertEqual(service._live, {})
+
+    def test_a_failed_deadline_fence_keeps_the_child_and_reraises_deadline(self) -> None:
+        class Proc:
+            def __init__(self) -> None:
+                self.fenced: list[str] = []
+                self.fence_calls = 0
+
+            def send(self, line: str) -> None:
+                return None
+
+            def close_stdin(self) -> None:
+                return None
+
+            def read_line(self, timeout_s: float):
+                raise Deadline()
+
+            def fence(self, reason: str) -> None:
+                self.fence_calls += 1
+                if self.fence_calls == 1:
+                    raise OSError("fence broke")
+                self.fenced.append(reason)
+
+        clock = FakeClock()
+        proc = Proc()
+        service = RouteService(
+            {"claude_code": ClaudeCodeAdapter(lambda argv, **kwargs: proc, clock, lambda *_: "",
+                                              {"PATH": "/usr/bin"}, wall_clock=clock)},
+            ConnectionBreaker(clock), clock)
+        with self.assertRaises(Deadline) as caught:
+            service.handle(request())
+        self.assertIsInstance(caught.exception.__cause__, OSError)
+        self.assertEqual(len(service._live), 1)
+        service.shutdown()
+        self.assertEqual(proc.fenced, ["shutdown"])
+        self.assertEqual(service._live, {})
 
 
 if __name__ == "__main__":

@@ -26,9 +26,11 @@ class RouteService:
         self._closed = False
         self._pending = 0  # launches past the closed check that have not registered yet
         self._live: dict[int, object] = {}  # id(proc) -> proc; a handle need not be hashable
+        self._retained: set[int] = set()  # fence failed; drop must not forget these
         self._inflight: set[str] = set()
         for adapter in self._adapters.values():
             adapter._drop_process = self._drop_process
+            adapter._keep_process = self._keep_process
             adapter._launcher = self._wrap_launcher(adapter._launcher)
 
     def shutdown(self) -> None:
@@ -51,6 +53,7 @@ class RouteService:
                 with self._gate:
                     if self._live.get(key) is proc:
                         del self._live[key]
+                    self._retained.discard(key)
             else:
                 errors.append(err)
         if len(errors) == 1:
@@ -93,14 +96,23 @@ class RouteService:
             return err
         return None
 
+    def _keep_process(self, proc) -> None:
+        """A fence failed. Leave the handle for a later shutdown to retry."""
+
+        with self._gate:
+            self._live[id(proc)] = proc
+            self._retained.add(id(proc))
+
     def _drop_process(self, proc) -> None:
         with self._gate:
-            # After a failed shutdown fence the child stays tracked so the next shutdown retries.
-            # A successful fence has already removed it. A normal end, before shutdown, forgets it.
-            if self._closed:
+            # After a failed fence (shutdown, or the driver's own fence) the child stays tracked so
+            # the next shutdown retries. A successful fence has already removed it. A normal end,
+            # before shutdown, forgets it.
+            key = id(proc)
+            if self._closed or key in self._retained:
                 return
-            if self._live.get(id(proc)) is proc:
-                del self._live[id(proc)]
+            if self._live.get(key) is proc:
+                del self._live[key]
 
     def handle(self, request: object) -> dict:
         rid = request.get("request_id") if isinstance(request, Mapping) else None

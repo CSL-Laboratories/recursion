@@ -50,29 +50,48 @@ class RouteAdapter:
         try:
             try:
                 return self.drive(process, request, deadline_at, events)
-            except Deadline:
-                process.fence("deadline")  # fenced for this request only; the breaker never hears of it
+            except Deadline as err:
+                self._abort(process, "deadline", err)  # fenced for this request only; the breaker never hears of it
                 return c.result(rid, c.DEADLINE_EXCEEDED, events=events, detail="recursion deadline")
             except _Protocol as err:
-                process.fence("protocol_error")
+                self._abort(process, "protocol_error", err)
                 return c.result(rid, c.PROTOCOL_ERROR, events=events, detail=str(err))
             except OSError as err:
                 # A child that exits before the request is written raises BrokenPipeError. That stays a
                 # typed result, and the process is fenced, instead of escaping the route boundary.
-                process.fence("io_error")
+                self._abort(process, "io_error", err)
                 return c.result(rid, c.ENGINE_ERROR, events=events, detail=f"engine io: {type(err).__name__}")
             except Exception as err:
                 # A malformed envelope or a driver bug must not escape as an untyped exception, and
                 # must not leave the child running. The detail is the type name, never the message.
-                process.fence("internal")
+                self._abort(process, "internal", err)
                 return c.result(rid, c.ENGINE_ERROR, events=events, detail=type(err).__name__)
-            except BaseException:
-                process.fence("cancelled")
+            except BaseException as err:
+                self._abort(process, "cancelled", err)
                 raise
         finally:
             drop = getattr(self, "_drop_process", None)
             if drop is not None:
                 drop(process)
+
+    def _fence_for(self, process, reason: str) -> BaseException | None:
+        """Fence the child. On failure, keep it tracked and return the fence error."""
+
+        try:
+            process.fence(reason)
+        except BaseException as err:
+            keep = getattr(self, "_keep_process", None)
+            if keep is not None:
+                keep(process)
+            return err
+        return None
+
+    def _abort(self, process, reason: str, err: BaseException) -> None:
+        """Fence after a driver failure. A fence error stays chained under that failure."""
+
+        fence_err = self._fence_for(process, reason)
+        if fence_err is not None:
+            raise err from fence_err
 
     # -- subclass hooks -----------------------------------------------------------------------
     def argv(self, request: dict) -> list[str]:

@@ -74,20 +74,20 @@ class ProfileRouteAdapter(RouteAdapter):
         try:
             try:
                 return self._driver(process, request, deadline_at, events)
-            except Deadline:
-                process.fence("deadline")
+            except Deadline as err:
+                self._abort(process, "deadline", err)
                 return c.result(rid, c.DEADLINE_EXCEEDED, events=events, detail="recursion deadline")
             except _Protocol as err:
-                process.fence("protocol_error")
+                self._abort(process, "protocol_error", err)
                 return c.result(rid, c.PROTOCOL_ERROR, events=events, detail=str(err))
             except OSError as err:
-                process.fence("io_error")
+                self._abort(process, "io_error", err)
                 return c.result(rid, c.ENGINE_ERROR, events=events, detail=f"engine io: {type(err).__name__}")
             except Exception as err:
-                process.fence("internal")
+                self._abort(process, "internal", err)
                 return c.result(rid, c.ENGINE_ERROR, events=events, detail=type(err).__name__)
-            except BaseException:
-                process.fence("cancelled")
+            except BaseException as err:
+                self._abort(process, "cancelled", err)
                 raise
         finally:
             drop = getattr(self, "_drop_process", None)

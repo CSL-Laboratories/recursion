@@ -164,6 +164,8 @@ def breaker_key(route: Mapping) -> str:
     An API key is one meter wherever the same custody lookup runs: billing family, env name, and
     key id. Claude Code's ``ANTHROPIC_API_KEY`` id ``k1`` and an OpenCode anthropic profile with
     that same id and env share a slot. Codex's ``OPENAI_API_KEY`` id ``k1`` is a different key.
+    An ``api_key_helper`` route ignores ``credential_env``: the helper supplies the key, so the
+    meter is ``api_key:anthropic:api_key_helper:<id>`` and does not share the custody slot.
     A subscription login stays on its engine: the same label on Claude and on Codex is not one
     login. A passthrough method bills that cloud account, not the Anthropic key.
     """
@@ -192,7 +194,9 @@ def _api_key_meter(route: Mapping) -> tuple[str, str]:
     if not env and isinstance(profile.get("credential_env"), str):
         env = profile["credential_env"]
     if conn.get("key_source") == "api_key_helper":
-        return "anthropic", env or "api_key_helper"
+        # The adapter does not read credential_env on this route. A caller-supplied name must not
+        # move the meter, and the helper must not share a custody key's slot.
+        return "anthropic", "api_key_helper"
     if engine == "claude_code":
         return "anthropic", env or "ANTHROPIC_API_KEY"
     if engine == "codex":
@@ -269,11 +273,13 @@ def result(request_id: str, code: str | None, *, text: str = "", limit: dict | N
 
 # Phrases that sound like a quota. Seen outside the model payload (a typed error envelope's free text),
 # they make at most a SHORT_FAULT on one model for one tenant (grill Q23); they never make a PLAN_LIMIT.
-# Boundaries are Unicode word characters, so "unexhausted" and "éexhaustedé" are not hits, and
-# "rate-limited" / "rate limiting" are. An immediate denial cancels the hit ("not exhausted",
-# "isn't exhausted", "not a rate limit", "quota is not exhausted"). "no quota" stays a hit.
+# Token edges are letters and digits, including non-ASCII letters, so "unexhausted" and
+# "éexhaustedé" are not hits. "_" separates tokens, so "quota_exhausted" is. "rate-limited" and
+# "rate limiting" are hits. A denial cancels only a recognised predicate ("not exhausted",
+# "isn't exhausted", "quota is not exhausted", "not a rate limit"). "quota is not available"
+# stays a hit: "available" is not one of those predicates. "no quota" stays a hit.
 _QUOTA = re.compile(
-    r"(?<!\w)(?:quotas?|rate[\s-]*limit(?:ed|ing|s)?|usage[\s-]*limits?|limits?[\s-]*reached|exhausted|too many requests)(?!\w)",
+    r"quotas?|rate[\s_-]*limit(?:ed|ing|s)?|usage[\s_-]*limits?|limits?[\s_-]*reached|exhausted|too many requests",
     re.IGNORECASE,
 )
 _QUOTA_NEGATED = re.compile(
@@ -282,12 +288,14 @@ _QUOTA_NEGATED = re.compile(
     re.IGNORECASE,
 )
 _QUOTA_DENIED_AFTER = re.compile(
-    r"^\s*(?:is|are|was|were)?\s*(?:not|never|(?:is|are|was|were)n['’]t)\b",
+    r"^\s*(?:is|are|was|were)?\s*(?:not|never|(?:is|are|was|were)n['’]t)\s+(?:a\s+|an\s+|the\s+)?"
+    r"(?:exhausted|rate[\s_-]*limit(?:ed|ing|s)?|usage[\s_-]*limits?|quotas?)\b",
     re.IGNORECASE,
 )
 # Credential shapes. Word boundaries so "task-12345678" is not an sk- key. Case-insensitive, and
-# applied after JSON ``\uXXXX`` escapes are decoded, so a hyphen written as ``\u002d`` still matches.
-# The decoded text is only a search view: non-secret escapes stay as they were written.
+# applied after JSON ``\uXXXX`` and ``\/`` escapes are decoded, so a hyphen written as ``\u002d``
+# and a URL written as ``https:\/\/user:password@host`` still match. The decoded text is only a
+# search view: non-secret escapes stay as they were written.
 _SECRET = re.compile(
     r"(?<!\w)eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}(?!\w)"
     r"|(?<!\w)sk-[A-Za-z0-9_-]{8,}(?!\w)"
@@ -303,14 +311,19 @@ _URL_USERINFO = re.compile(r"https?://([^\s/@:]+:[^\s/@]+)@", re.IGNORECASE)
 _JSON_U = re.compile(r"\\u([0-9a-fA-F]{4})")
 
 
-def _decode_json_u(value: str) -> tuple[str, list[tuple[int, int]]]:
-    """Decode ``\\uXXXX`` sequences. Each output character maps back to an original span."""
+def _match_view(value: str) -> tuple[str, list[tuple[int, int]]]:
+    """Decode ``\\uXXXX`` and ``\\/`` for matching. Each output character maps to an original span."""
 
     out: list[str] = []
     spans: list[tuple[int, int]] = []
     index = 0
     length = len(value)
     while index < length:
+        if value.startswith("\\/", index):
+            out.append("/")
+            spans.append((index, index + 2))
+            index += 2
+            continue
         match = _JSON_U.match(value, index)
         if match is not None:
             out.append(chr(int(match.group(1), 16)))
@@ -328,7 +341,7 @@ def redact(value: str) -> str:
 
     if not value:
         return value
-    decoded, spans = _decode_json_u(value)
+    decoded, spans = _match_view(value)
     hits: list[tuple[int, int]] = []
     for match in _URL_USERINFO.finditer(decoded):
         hits.append((spans[match.start(1)][0], spans[match.end(1) - 1][1]))
@@ -353,10 +366,21 @@ def redact(value: str) -> str:
     return "".join(pieces)
 
 
+def _token_edge(text: str, index: int) -> bool:
+    """A letter or digit binds. ``_`` and other non-letters separate tokens."""
+
+    if index < 0 or index >= len(text):
+        return True
+    ch = text[index]
+    return ch == "_" or not ch.isalnum()
+
+
 def sounds_like_quota(text: object) -> bool:
     if not isinstance(text, str):
         return False
     for match in _QUOTA.finditer(text):
+        if not _token_edge(text, match.start() - 1) or not _token_edge(text, match.end()):
+            continue
         if _QUOTA_NEGATED.search(text[:match.start()]):
             continue
         if _QUOTA_DENIED_AFTER.match(text[match.end():]):

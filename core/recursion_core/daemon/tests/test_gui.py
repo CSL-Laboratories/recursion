@@ -3,13 +3,18 @@ from http.client import HTTPConnection
 import importlib
 import os
 from pathlib import Path
+import shutil
+import sys
+import tempfile
 from unittest import TestCase, mock, skipIf
 import socket
-from types import SimpleNamespace
 from wsgiref.simple_server import WSGIServer
 
 from recursion_core.daemon import __main__ as entry
 from recursion_core.daemon.gui import LoopbackGUI
+from recursion_core.daemon.tests import plugin_fixture as fx
+from recursion_core.gui import panels as gui_panels
+from recursion_core.gui import surface as gui_surface
 from recursion_core.gui.client import ControlClient
 from recursion_core.gui.tests.fakes import FakeControlAPI, wsgi_transport
 
@@ -20,6 +25,8 @@ ENTRY_LINUX_ONLY = ('Linux-only: the daemon entry point needs flock, uid ownersh
 CROSS_REPO_PLUGIN_ENV = "RECURSION_CROSS_REPO_PLUGIN"
 CROSS_REPO_SKIP = (f"cross-repo integration: {CROSS_REPO_PLUGIN_ENV} is unset; set it to the operator plugin's "
                    "pkg.module:registry factory, with that plugin on PYTHONPATH, to run this test")
+CROSS_REPO_NEEDS = ("cross-repo integration needs Linux (uid ownership checks) and the cryptography package for "
+                    "this interpreter: the daemon refuses to load any plugin it cannot verify")
 
 
 class LoopbackTests(TestCase):
@@ -115,34 +122,80 @@ class LoopbackTests(TestCase):
                             plugins=({"panels": [{"id": "bad", "title": "Bad", "reads": ["stop"]}]},), port=0)
         self.assertEqual(servers, [])  # rejected before any socket is bound
 
-    def test_cli_registers_explicit_plugin_and_checks_runtime_after_import(self):
-        plugin = {"panels": []}
-        with mock.patch.object(entry, "require_free_threaded") as check, \
-             mock.patch.object(entry, "importlib") as imports, \
-             mock.patch.object(entry, "main") as main, \
-             mock.patch("sys.argv", ["daemon", "--plugin", "pkg.module:registry", "--gui-port", "0"]):
-            imports.import_module.return_value = SimpleNamespace(registry=lambda: plugin)
-            entry.cli()
-            imports.import_module.assert_called_once_with("pkg.module")
-            main.assert_called_once_with(plugins=[plugin], port=0)
-            self.assertEqual(check.call_count, 3)
+    def test_declared_venue_filters_rows_after_the_read_through_the_daemons_gui_entry(self):
+        # Through entry._start_gui (what the daemon's main() calls), not gui.compose: the page the daemon
+        # serves filters a declared venue's rows after the read, in the one shared filter (gui/panels.py).
+        self.assertIs(gui_surface.filter_venue_rows, gui_panels.filter_venue_rows)
+        self.api.extra["operator.positions.inspect"] = {"result": {
+            "positions": [{"venue": "kalshi", "symbol": "OWN-VENUE-ROW"}, {"venue": "othervenue", "symbol": "OTHER-VENUE-ROW"}],
+            "total": "UNLABELLED-TOTAL"}}
+        plugin = {"panels": [{"id": "test.positions", "title": "Positions panel", "venue": "kalshi",
+                              "reads": ["operator.positions.inspect"]}]}
+        with mock.patch.object(gui_surface, "filter_venue_rows", wraps=gui_panels.filter_venue_rows) as shared:
+            gui = entry._start_gui(self.client, lambda _: True, (plugin,), 0, announced=False)
+            try:
+                status, _, page = self.request(gui, "/panel?id=test.positions")
+            finally:
+                gui.__exit__(None, None, None)
+        self.assertEqual(status, 200)
+        self.assertEqual([c[2]["command"] for c in self.api.calls], ["operator.positions.inspect"])  # an unscoped read
+        self.assertEqual([call.args[1] for call in shared.call_args_list], ["kalshi"])
+        symbols = [row["symbol"] for row in shared.call_args_list[0].args[0]["result"]["positions"]]
+        self.assertEqual(symbols, ["OWN-VENUE-ROW", "OTHER-VENUE-ROW"])  # both rows came back from the read
+        self.assertIn("OWN-VENUE-ROW", page)
+        self.assertNotIn("OTHER-VENUE-ROW", page)
+        self.assertNotIn("UNLABELLED-TOTAL", page)
+        self.assertIn("Withheld: data not labelled <code>kalshi</code>", page)
 
-    def test_cli_loads_the_real_cross_repo_plugin(self):
-        # Unmocked import through --plugin, in the MODULE:REGISTRY form --help and the README document.
+    def test_cli_passes_plugin_directories_to_the_loader_and_imports_nothing(self):
+        before = set(sys.modules)
+        with mock.patch.object(entry, "require_free_threaded") as check, \
+             mock.patch.object(entry, "main") as main, \
+             mock.patch("sys.argv", ["daemon", "--plugin", "/opt/plugins/one", "--plugin", "/opt/plugins/two",
+                                     "--gui-port", "0"]):
+            entry.cli()
+        main.assert_called_once_with(plugin_dirs=("/opt/plugins/one", "/opt/plugins/two"), port=0)
+        self.assertGreaterEqual(check.call_count, 1)
+        self.assertEqual(set(sys.modules) - before, set())
+        self.assertFalse(hasattr(entry, "importlib"), "the entry point has no import-by-name path for plugins")
+        # The old MODULE:REGISTRY form is refused as a usage error; it is never imported.
+        with mock.patch.object(entry, "require_free_threaded"), mock.patch.object(entry, "main") as main, \
+             mock.patch("sys.argv", ["daemon", "--plugin", "pkg.module:registry"]), \
+             mock.patch("sys.stderr"), self.assertRaises(SystemExit) as stopped:
+            entry.cli()
+        self.assertEqual(stopped.exception.code, 2)
+        main.assert_not_called()
+
+    def test_loader_loads_the_real_cross_repo_plugin(self):
+        # The real plugin's registry factory, reached only through the plugin loader: a one-line artifact
+        # that imports the factory, with an installer grant for its panels. Nothing is mocked.
         documented = os.environ.get(CROSS_REPO_PLUGIN_ENV, "")
         if not documented:
             self.skipTest(CROSS_REPO_SKIP)
+        from recursion_core.daemon import plugins as plugin_host
+        from recursion_core.plugin_security.signing import backend_available
+        if NOT_POSIX or not sys.platform.startswith("linux") or not backend_available():
+            self.skipTest(CROSS_REPO_NEEDS)
         module, sep, name = documented.partition(":")
         self.assertTrue(sep and module and name.isidentifier(), f"{CROSS_REPO_PLUGIN_ENV} must be pkg.module:registry")
         importlib.import_module(module)  # set but not importable is a failure, not a skip
-        self.assertIn('metavar="MODULE:REGISTRY"', Path(entry.__file__).read_text())  # the --help form
-        with mock.patch.object(entry, "require_free_threaded"), \
-             mock.patch.object(entry, "main") as main, \
-             mock.patch("sys.argv", ["daemon", "--plugin", documented, "--gui-port", "0"]):
-            entry.cli()
-        plugin, = main.call_args.kwargs["plugins"]
-        self.assertIn("panels", plugin)
+        tmp = Path(tempfile.mkdtemp(prefix="rc-cross-repo-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        os.chmod(tmp, 0o700)
+        source = f"from {module} import {name} as registry\n".encode()
+        config = tmp / "config" / "recursion"
+        fx.write_install(config, grants=[fx.grant_for(source, plugin_id="cross.repo", permissions=("panel",))])
+        fx.write_plugin(tmp / "cross", source, plugin_id="cross.repo", permissions=("panel",))
+        from recursion_core.plugin_security.tests.support import FakeGilProbe
+        # SIMULATED GIL state (off): this suite also runs on GIL builds, where the real probe poisons the core.
+        host = plugin_host.PluginHost(config, tmp / "state", plugin_dirs=(tmp / "cross",), gil_probe=FakeGilProbe())
+        self.addCleanup(host.close)
+        record, = host.records
+        self.assertEqual((record["state"], record["trust"], record["provides"]), ("loaded", "unsigned", ["panels"]), record)
+        plugin, = host.registries
         self.assertTrue(plugin["panels"])
+        with LoopbackGUI(self.client, lambda _: True, plugins=host.registries, port=0) as gui:
+            self.assertEqual(self.request(gui)[0], 200)
 
     @skipIf(NOT_POSIX, ENTRY_LINUX_ONLY)
     def test_service_entry_point_starts_and_closes_gui(self):

@@ -5,11 +5,12 @@ and the run Stop go through this client to the control API, exactly as the CLI d
 and their results come back unchanged. The transport is supplied by the core's adapter,
 which attaches the device credential; the GUI never sees or stores it.
 
-Routes on the control API (a proposal for item 8's control API, which does not exist
-on any branch this slice could read; integration is open):
+Routes the transport answers. In the running daemon the transport is in process
+(``daemon/control_adapter.py`` ``DaemonControl.gui_transport``):
 
-* ``GET /v1/routes`` -> ``{"routes": [route record, ...]}``
-* ``POST /v1/operator`` with an ``o7.operator.v0`` command -> an O7 response
+* ``GET /v1/routes`` -> ``{"routes": [route record, ...]}``: the daemon's route inventory
+* ``POST /v1/operator`` with an ``o7.operator.v0`` command -> an O7 response from the loaded
+  operator plugin, or a non-200 ``{"error": "unavailable: <reason>"}`` when there is no source
 * ``POST /v1/runs/stop`` with ``{"run_id": ...}`` -> the Stop result as recorded
 """
 

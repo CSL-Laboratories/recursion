@@ -350,9 +350,10 @@ _PCT = re.compile(r"%([0-9a-fA-F]{2})")
 def _port_end(text: str, index: int) -> int | None:
     """Index of the delimiter after a port, or the text length when the digits run to the end.
 
-    A port is an end-delimiter immediately, or logical decimal digits (raw or encoded) and then an
-    end-delimiter. ``None`` means this colon is not a port, so ``user:8080@host`` and
-    ``user:%34%34%34%34@host`` stay passwords. ``@`` is not an end-delimiter.
+    A port is logical ``/`` ``?`` ``#`` immediately, or logical decimal digits (raw or encoded) and then
+    any end-delimiter. With no digits, a quote, bracket, or encoded space is not a port, so a password
+    that starts with one of those is still redacted. ``None`` means this colon is not a port, so
+    ``user:8080@host`` and ``user:%34%34%34%34@host`` stay passwords. ``@`` is not an end-delimiter.
     """
 
     saw_digit = False
@@ -368,7 +369,7 @@ def _port_end(text: str, index: int) -> int | None:
             saw_digit = True
             index = end
             continue
-        if char in _END_CHARS:
+        if char in _END_CHARS and (saw_digit or char in "/?#"):
             return index
         return None
     return index if saw_digit else None
@@ -482,14 +483,14 @@ def _authority_userinfo(text: str) -> list[tuple[int, int]]:
     """Userinfo spans from one forward walk. The token reader is the only delimiter table.
 
     Before a colon, any end-delimiter (raw, or ``/`` ``?`` ``#`` and the other host delimiters in
-    any encoding) ends the authority and there is no credential. A colon followed by an
-    end-delimiter, or by logical decimal digits and then an end-delimiter, is a port, so that
-    authority has no credential either. The digits may be encoded. Any other
-    colon opens the password. In the password, only a raw space, tab, CR or LF ends the run; a
-    quote, bracket or encoded slash stays inside it. The
-    separator is the last ``@`` or ``%40`` before the first end-delimiter that follows a separator.
-    After that separator, any end-delimiter in any form ends the authority. The span stops before
-    the separator, so the host stays.
+    any encoding) ends the authority and there is no credential. A colon followed by logical ``/``
+    ``?`` ``#``, or by logical decimal digits and then any end-delimiter, is a port, so that
+    authority has no credential. The digits may be encoded. With no digits, a quote or space is not
+    a port. Any other colon opens the password. In the password, only a raw space, tab, CR or LF
+    ends the run; a quote, bracket or encoded slash stays inside it. The separator is the last
+    ``@`` or ``%40`` before the first end-delimiter that follows a separator. After that separator,
+    any end-delimiter in any form ends the authority. The span stops before the separator, so the
+    host stays.
     """
 
     found: list[tuple[int, int]] = []

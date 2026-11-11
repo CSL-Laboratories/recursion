@@ -77,8 +77,16 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
 The control API has no event stream. Engine output reaches the TUI through `TuiApp.on_event` /
 `Loop.post_event`, which tests feed from a fake driver. It also has no mid-run verbs (steer, queue,
 interrupt, resume, fork) and no per-client event scoping. Those gaps are raised on CSL-209; this package
-does not add them. No daemon serves the API, and the TUI has no packaged entry point
-(`term.main(argv, api_factory)`).
+does not add them.
+
+## Running it against the daemon
+
+`python -m recursion_core.control.tui [--plain | --screen-reader] [--no-alt-screen] [--no-color]` hands
+`term.main` the control package's socket client (`control/client.py` `SocketAPI`, the daemon's owner-only
+Unix socket), the same factory the CLI uses, so `start`, `list`, `status` and `stop` act on the running
+daemon. The entry point lives in `control/` because this package's import boundary allows no transport.
+With the daemon down every call answers `control_api_unavailable` and the TUI shows `UNAVAILABLE`; nothing
+raises, and a Stop with no answer is never shown as stopped.
 
 ## Tests
 

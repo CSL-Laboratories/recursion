@@ -16,6 +16,7 @@ import unittest
 
 from recursion_core.control import __main__ as entry
 from recursion_core.control import cli
+from recursion_core.control import tui as tui_entry
 from recursion_core.control.client import UNAVAILABLE, SocketAPI, socket_directory, socket_path
 from recursion_core.control_transport import PlatformNotSupported, TransportRefused, UnixControlClient
 
@@ -63,6 +64,16 @@ class WindowsRefusalTests(unittest.TestCase):
                 self.assertNotIn("Traceback", out.getvalue())
                 if argv != ["conditions"]:  # conditions prints the code and its condition rows only
                     self.assertEqual(REFUSAL, answer)
+
+    def test_tui_entry_shows_the_refusal_in_line_mode_and_connects_nowhere(self) -> None:
+        out, err = io.StringIO(), io.StringIO()
+        code = tui_entry.main(["--plain"], stdin=io.StringIO("list\nstop r1\nq\n"), stdout=out, stderr=err, environ={})
+        self.assertEqual((0, ""), (code, err.getvalue()))
+        text = out.getvalue()
+        self.assertIn("answer run.list status=control_api_unavailable", text)
+        self.assertIn("detail=platform_unsupported", text)
+        self.assertNotIn("status=stopped", text)
+        self.assertNotIn("Traceback", text)
 
 
 if __name__ == "__main__":

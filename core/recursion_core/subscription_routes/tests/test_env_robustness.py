@@ -29,6 +29,19 @@ from unittest import mock
 
 import recursion_core.subscription_routes.own_loop as own_loop
 import recursion_core.subscription_routes.policy as route_policy
+
+
+def _process_running(pid: int) -> bool:
+    """True when ``pid`` is alive and not a zombie."""
+
+    try:
+        text = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    except OSError:
+        return False
+    end = text.rfind(")")
+    if end < 0 or end + 2 >= len(text):
+        return True
+    return text[end + 2] not in "ZX"
 from recursion_core.subscription_routes import (
     HERMES_ADOPT_EXTERNAL_LOGINS,
     OwnLoopRouteRefused,
@@ -476,12 +489,167 @@ class SubscriptionRobustness(unittest.TestCase):
                 except (OSError, ValueError):
                     pass
 
+    def test_login_probe_eof_stays_inside_the_deadline(self) -> None:
+        opened: list[tuple[int, int]] = []
+        children: list[int] = []
+        real_pipe = os.pipe
+        real_fork = os.fork
+
+        def tracking_pipe() -> tuple[int, int]:
+            pair = real_pipe()
+            opened.append(pair)
+            return pair
+
+        def tracking_fork() -> int:
+            pid = real_fork()
+            if pid > 0:
+                children.append(pid)
+            return pid
+
+        def probe() -> bool:
+            os.close(opened[0][1])
+            time.sleep(0.6)
+            return True
+
+        started = time.monotonic()
+        try:
+            with mock.patch.object(own_loop.os, "pipe", tracking_pipe), mock.patch.object(
+                own_loop.os, "fork", tracking_fork
+            ), mock.patch.object(own_loop, "_PROBE_DEADLINE_S", 0.1):
+                with self.assertRaises(OwnLoopRouteRefused) as caught:
+                    own_loop._probe_in_screened_env(probe, {"PATH": "/usr/bin"})
+            self.assertEqual("copilot_login_unknown", caught.exception.cause)
+            self.assertLess(time.monotonic() - started, 0.4)
+            for pid in children:
+                self.assertFalse(_process_running(pid))
+        finally:
+            for read_fd, write_fd in opened:
+                for fd in (read_fd, write_fd):
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+            for pid in children:
+                try:
+                    os.kill(pid, 9)
+                except OSError:
+                    pass
+                try:
+                    os.waitpid(pid, 0)
+                except ChildProcessError:
+                    pass
+
+    def test_login_probe_interrupt_during_reap_kills_and_reaps(self) -> None:
+        children: list[int] = []
+        real_fork = os.fork
+        real_wait = os.waitpid
+        waits = {"n": 0}
+
+        def tracking_fork() -> int:
+            pid = real_fork()
+            if pid > 0:
+                children.append(pid)
+            return pid
+
+        def raising_wait(pid: int, flags: int) -> tuple[int, int]:
+            waits["n"] += 1
+            if waits["n"] == 1:
+                raise KeyboardInterrupt
+            return real_wait(pid, flags)
+
+        def slow() -> bool:
+            time.sleep(2)
+            return True
+
+        try:
+            with mock.patch.object(own_loop.os, "fork", tracking_fork), mock.patch.object(
+                own_loop.os, "waitpid", raising_wait
+            ), mock.patch.object(own_loop, "_read_all", lambda *_args: b""):
+                started = time.monotonic()
+                with self.assertRaises(KeyboardInterrupt):
+                    own_loop._probe_in_screened_env(slow, {"PATH": "/usr/bin"})
+                self.assertLess(time.monotonic() - started, 0.8)
+            self.assertTrue(children)
+            pid = children[0]
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+            with self.assertRaises(ChildProcessError):
+                os.waitpid(pid, os.WNOHANG)
+        finally:
+            for pid in children:
+                try:
+                    os.kill(pid, 9)
+                except OSError:
+                    pass
+                try:
+                    os.waitpid(pid, 0)
+                except ChildProcessError:
+                    pass
+
+    def test_probe_kills_helpers_on_every_result(self) -> None:
+        markers = {
+            "yes": self.root / "helper-yes",
+            "no": self.root / "helper-no",
+            "boom": self.root / "helper-boom",
+        }
+
+        def start(name: str) -> None:
+            pid = os.fork()
+            if pid == 0:
+                time.sleep(30)
+                os._exit(0)
+            markers[name].write_text(str(pid), encoding="ascii")
+
+        def yes() -> bool:
+            start("yes")
+            return True
+
+        def no() -> bool:
+            start("no")
+            return False
+
+        def boom() -> bool:
+            start("boom")
+            raise OSError("locked")
+
+        leftovers: list[int] = []
+        try:
+            self.assertTrue(own_loop._probe_in_screened_env(yes, {"PATH": "/usr/bin"}))
+            self.assertFalse(own_loop._probe_in_screened_env(no, {"PATH": "/usr/bin"}))
+            with self.assertRaises(OwnLoopRouteRefused) as caught:
+                own_loop._probe_in_screened_env(boom, {"PATH": "/usr/bin"})
+            self.assertEqual("OSError", caught.exception.detail)
+            for marker in markers.values():
+                leftovers.append(int(marker.read_text(encoding="ascii")))
+            for pid in leftovers:
+                self.assertFalse(_process_running(pid))
+        finally:
+            for pid in leftovers:
+                try:
+                    os.kill(pid, 9)
+                except OSError:
+                    pass
+
+    def test_probe_refuses_when_the_process_group_cannot_be_set(self) -> None:
+        called: list[bool] = []
+
+        def probe() -> bool:
+            called.append(True)
+            return True
+
+        with mock.patch.object(own_loop.os, "setpgid", side_effect=PermissionError):
+            with self.assertRaises(OwnLoopRouteRefused) as caught:
+                own_loop._probe_in_screened_env(probe, {"PATH": "/usr/bin"})
+        self.assertEqual("copilot_login_unknown", caught.exception.cause)
+        self.assertEqual("probe unenforceable", caught.exception.detail)
+        self.assertEqual([], called)
+
     def test_login_probe_interrupt_kills_the_child(self) -> None:
         def slow() -> bool:
             time.sleep(2)
             return True
 
-        def interrupt(_fd: int, _limit: int) -> bytes:
+        def interrupt(_fd: int, _limit: int, _deadline: float | None = None) -> bytes:
             raise KeyboardInterrupt
 
         started = time.monotonic()

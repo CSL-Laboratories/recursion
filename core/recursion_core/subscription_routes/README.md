@@ -103,7 +103,9 @@ PRODUCT.md `055cc7a5` section 3.3. `own_loop.py`, checked before any spawn or re
   example `ANTHROPIC_API_KEY`). An optional `model` is checked (printable, no spaces, at most 128
   characters) and carried on the decision. With no stored `copilot` login (or no probe, or a failing probe)
   the run refuses rather than fall back to `gh`. The probe is the caller's; nothing here opens a
-  login store.
+  login store. Copilot probing is refused in threaded processes (`probe threaded`): the probe runs
+  in a forked child, and `fork` copies only the calling thread. Call it before any other thread is
+  started.
 - **Nous, "Local proxy"**: `check_nous_own_loop(route, parent_env, ...)` with
   `{"engine": "nous", "auth": "subscription", "method": "hermes_local_proxy", "base_url": ...}`.
   The own loop calls only the user's own Hermes subscription proxy at a loopback IP literal

@@ -128,6 +128,10 @@ def check_copilot_own_loop(
     """Decide one Copilot own-loop run. ``route``: engine="copilot", auth="subscription",
     method="copilot_cli_sign_in" (optional ``model``). Returns the child env with every token variable
     and ``COPILOT_API_URL`` removed, or raises ``OwnLoopRouteRefused``.
+
+    Copilot probing is refused in threaded processes. The probe is a callable, so it runs in a
+    forked child, and ``fork`` copies only the calling thread. Call this before starting other
+    threads. A daemon that already has another thread alive is refused with ``probe threaded``.
     """
 
     _common("copilot", route, _COPILOT_FIELDS, "copilot_cli_sign_in")
@@ -154,8 +158,10 @@ def check_copilot_own_loop(
 
 
 # A stored-login probe is an in-process callable, so it cannot be handed to a fresh interpreter.
-# The child is a fork in its own process group. The parent stops reading at this deadline and
-# SIGKILLs that group. Tests may shorten the deadline.
+# Copilot probing is refused in threaded processes. The child is a fork in its own process group.
+# One deadline covers the status read and the reap. Every exit SIGKILLs that group before the
+# leader is reaped, so a helper the probe started cannot keep the group id. Tests may shorten
+# the deadline.
 _PROBE_DEADLINE_S = 5.0
 
 
@@ -185,13 +191,17 @@ def _other_threads() -> bool:
 def _probe_in_screened_env(probe: Callable[[], bool], child: Mapping[str, str]) -> bool:
     """Run the login probe in a forked child whose environment is ``child``.
 
-    The parent environment is left untouched. The child is its own process group, so a deadline
-    or an interrupt in the parent can SIGKILL it and reap it instead of waiting. ``SystemExit``
-    and ``KeyboardInterrupt`` raised by the probe are not a login. Another live thread refuses
-    the probe: forking a multi-threaded process can deadlock the child on a lock it does not hold.
+    The parent environment is left untouched. Copilot probing is refused in threaded processes:
+    forking a multi-threaded process can deadlock the child on a lock it does not hold. The child
+    runs the callable only after ``getpgid`` confirms it is its own process group; otherwise the
+    parent refuses ``probe unenforceable``. One deadline covers the status read and the reap.
+    Every exit, including a present login, SIGKILLs that group before the leader is reaped, so a
+    helper the probe started dies with it and the group id cannot be reused. An empty status
+    while the child is still running is the same deadline, not a blocking wait. ``SystemExit``
+    and ``KeyboardInterrupt`` raised by the probe are not a login.
     """
 
-    if not hasattr(os, "fork") or not hasattr(os, "killpg") or not hasattr(os, "setpgid"):
+    if not hasattr(os, "fork") or not hasattr(os, "killpg") or not hasattr(os, "setpgid") or not hasattr(os, "getpgid"):
         raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe unenforceable")
     if _other_threads():
         raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe threaded")
@@ -199,6 +209,7 @@ def _probe_in_screened_env(probe: Callable[[], bool], child: Mapping[str, str]) 
     pid: int | None = None
     status: bytes | None = None
     fds = [read_fd, write_fd]
+    deadline = time.monotonic() + _PROBE_DEADLINE_S
     try:
         try:
             pid = os.fork()
@@ -206,19 +217,19 @@ def _probe_in_screened_env(probe: Callable[[], bool], child: Mapping[str, str]) 
             raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe failed") from None
         if pid == 0:
             try:
-                try:
-                    os.setpgid(0, 0)
-                except OSError:
-                    pass
                 os.close(read_fd)
-                try:
-                    os.environ.clear()
-                    os.environ.update(child)
-                    ok = probe() is True
-                    payload = b"T" if ok else b"F"
-                except BaseException as exc:
-                    payload = b"E" + type(exc).__name__.encode("ascii", "replace")
-                _write_all(write_fd, payload[:80])
+                grouped = _child_in_own_group()
+                if not grouped:
+                    _write_all(write_fd, b"U")
+                else:
+                    try:
+                        os.environ.clear()
+                        os.environ.update(child)
+                        ok = probe() is True
+                        payload = b"T" if ok else b"F"
+                    except BaseException as exc:
+                        payload = b"E" + type(exc).__name__.encode("ascii", "replace")
+                    _write_all(write_fd, payload[:80])
             except BaseException:
                 pass
             os._exit(0)
@@ -228,7 +239,7 @@ def _probe_in_screened_env(probe: Callable[[], bool], child: Mapping[str, str]) 
             pass
         os.close(write_fd)
         fds[1] = -1
-        status = _read_all(read_fd, 80)
+        status = _read_all(read_fd, 80, deadline)
     finally:
         pending: BaseException | None = None
         for index, fd in enumerate(fds):
@@ -247,20 +258,45 @@ def _probe_in_screened_env(probe: Callable[[], bool], child: Mapping[str, str]) 
                 fds[index] = -1
                 pending = pending or exc
         if pid:
-            _reap_probe_child(pid, kill=status is None)
+            _reap_probe_child(pid, deadline)
         if pending is not None:
             raise pending
     if status == b"T":
         return True
     if status == b"F":
         return False
+    if status == b"U":
+        raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe unenforceable")
     if status is not None and status.startswith(b"E"):
         name = status[1:].decode("ascii", "replace") or "Exception"
         raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", name)
     raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe failed")
 
 
+def _child_in_own_group() -> bool:
+    """True when this process is the leader of its own process group.
+
+    The callable does not run unless this is true. A failed ``setpgid`` used to be ignored, and
+    the probe then ran in the parent's group, where a later ``killpg`` could not be aimed at it.
+    """
+
+    try:
+        os.setpgid(0, 0)
+    except OSError:
+        pass
+    try:
+        return os.getpgid(0) == os.getpid()
+    except OSError:
+        return False
+
+
 def _kill_probe_group(pid: int) -> None:
+    """SIGKILL ``pid``'s group while its leader is still unreaped.
+
+    ``killpg`` falls back to ``kill`` when the child never became a group leader. The leader's
+    pid is not collected here: reaping it first would free the process-group id for reuse.
+    """
+
     try:
         os.killpg(pid, signal.SIGKILL)
     except OSError:
@@ -270,19 +306,91 @@ def _kill_probe_group(pid: int) -> None:
             pass
 
 
-def _reap_probe_child(pid: int, *, kill: bool) -> None:
-    """Reap ``pid``. Kill its process group first when the parent has no status byte yet."""
+def _live_group_members(pgid: int) -> list[int]:
+    """Pids in ``pgid`` that are still running. Zombies and processes that have gone are omitted."""
 
-    if kill:
+    live: list[int] = []
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return live
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/stat", encoding="ascii") as handle:
+                text = handle.read()
+        except OSError:
+            continue
+        end = text.rfind(")")
+        if end < 0:
+            continue
+        fields = text[end + 2:].split()
+        if len(fields) < 3 or fields[0] in "ZX":
+            continue
+        try:
+            member_pgid = int(fields[2])
+        except ValueError:
+            continue
+        if member_pgid == pgid:
+            live.append(int(name))
+    return live
+
+
+def _reap_probe_child(pid: int, deadline: float) -> None:
+    """SIGKILL the probe group, then reap its leader. The deadline bounds a child that survives.
+
+    The signal goes out while the leader is still unreaped, so the group id cannot be reused.
+    Helpers are given that signal time to exit before the leader is collected. A
+    ``BaseException`` during the wait, including ``KeyboardInterrupt``, signals the group and
+    reaps the leader before it propagates.
+    """
+
+    def collect() -> None:
         _kill_probe_group(pid)
-    while True:
+        while True:
+            others = [member for member in _live_group_members(pid) if member != pid]
+            if not others:
+                break
+            if time.monotonic() >= deadline:
+                for member in others:
+                    try:
+                        os.kill(member, signal.SIGKILL)
+                    except OSError:
+                        pass
+                break
+            time.sleep(0.005)
+        while True:
+            try:
+                got, _status = os.waitpid(pid, os.WNOHANG)
+            except InterruptedError:
+                continue
+            except ChildProcessError:
+                return
+            if got:
+                return
+            if time.monotonic() >= deadline:
+                try:
+                    os.waitpid(pid, 0)
+                except ChildProcessError:
+                    return
+                return
+            time.sleep(0.005)
+
+    try:
+        collect()
+    except BaseException:
+        _kill_probe_group(pid)
         try:
             os.waitpid(pid, 0)
-            return
-        except InterruptedError:
-            _kill_probe_group(pid)
         except ChildProcessError:
-            return
+            pass
+        except InterruptedError:
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except (ChildProcessError, InterruptedError, OSError):
+                pass
+        raise
 
 
 def _write_all(fd: int, data: bytes) -> None:
@@ -297,14 +405,17 @@ def _write_all(fd: int, data: bytes) -> None:
         view = view[written:]
 
 
-def _read_all(fd: int, limit: int) -> bytes:
-    """Read until the child closes the pipe, or until ``_PROBE_DEADLINE_S`` elapses.
+def _read_all(fd: int, limit: int, deadline: float | None = None) -> bytes:
+    """Read until a status byte arrives, the child closes the pipe, or ``deadline`` elapses.
 
-    A ``T`` or ``F`` status is one byte and returns as soon as it arrives. A child that never
-    writes raises ``probe timed out`` so the caller can kill the process group.
+    A ``T`` or ``F`` status is one byte and returns as soon as it arrives. Closing the pipe is
+    not success and does not cancel the caller's deadline: an empty read returns, and the caller
+    kills the group when the child has not exited. A child that never writes raises
+    ``probe timed out``.
     """
 
-    deadline = time.monotonic() + _PROBE_DEADLINE_S
+    if deadline is None:
+        deadline = time.monotonic() + _PROBE_DEADLINE_S
     chunks: list[bytes] = []
     remaining = limit
     while remaining > 0:
@@ -329,7 +440,27 @@ def _read_all(fd: int, limit: int) -> bytes:
             break
         chunks.append(chunk)
         remaining -= len(chunk)
-        if chunks[0][:1] in (b"T", b"F"):
+        kind = chunks[0][:1]
+        if kind in (b"T", b"F"):
+            break
+        if kind == b"E":
+            # The status is one write. A helper the probe forked inherits this pipe, so EOF
+            # does not arrive until that helper dies. Drain what is already buffered and stop.
+            while remaining > 0:
+                try:
+                    more, _, _ = select.select([fd], [], [], 0)
+                except InterruptedError:
+                    continue
+                if not more:
+                    break
+                try:
+                    extra = os.read(fd, remaining)
+                except InterruptedError:
+                    continue
+                if not extra:
+                    break
+                chunks.append(extra)
+                remaining -= len(extra)
             break
     return b"".join(chunks)
 

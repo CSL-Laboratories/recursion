@@ -12,6 +12,14 @@ malformed record (not an object, a missing or non-string class, or a non-string 
 shown as a beta row flagged ``malformed_route_record`` and covers no required route.
 There is no score and no majority rule.
 
+``sign_in`` is not part of that rule. These notes do not say whether it must be a
+string, and they do not say a non-string should flag the route malformed. Owner
+question: should it? Until an owner decides, a present value that is not a ``str``
+is not coerced and is not shown; the Sign-in cell reads ``SIGN_IN_REJECTED``. The
+rest of the record is still assessed. A missing ``sign_in`` stays blank. A string
+is shown as text. The page escapes it for HTML, which is not a claim about script
+injection. JSON has no bytes type, so this is not a bytes rule.
+
 O50 ("Beta until measured"): a route the control API or its launch record tags beta
 (``maturity`` exactly ``"beta"``, or ``beta`` set to ``true`` as the R2a launch grant does
 when an engine's functional floor is unset) is shown as beta even when every bar passed.
@@ -23,7 +31,7 @@ from __future__ import annotations
 
 import re
 
-__all__ = ["BARS", "REQUIRED", "assess", "coverage_gaps", "project"]
+__all__ = ["BARS", "REQUIRED", "SIGN_IN_REJECTED", "assess", "coverage_gaps", "project"]
 
 BARS = ("launch_check", "floor", "conformance", "truthful_stop", "venue_switch", "xf_verify")
 
@@ -40,6 +48,8 @@ REQUIRED = {
 }
 _O61_HELD = frozenset({"copilot", "nous"})
 _ID = re.compile(r"[A-Za-z0-9_.:/-]{1,96}")
+# Fixed Sign-in cell text. Not a sign-in name, and not a maturity flag.
+SIGN_IN_REJECTED = "rejected: not a string"
 
 
 def _subject(record: dict) -> str | None:
@@ -60,6 +70,16 @@ def _subject(record: dict) -> str | None:
 
 _SUBJECT_FIELDS = {"engine": ("engine",), "own_loop": ("vendor",), "surface": ("surface",),
                    "mcp": ("mcp_version",), "venue_use": ("venue", "use")}
+
+
+def _sign_in(record: dict) -> str:
+    """A string sign-in, blank when the key is absent, or ``SIGN_IN_REJECTED``."""
+    if "sign_in" not in record:
+        return ""
+    value = record["sign_in"]
+    if type(value) is str:
+        return value
+    return SIGN_IN_REJECTED
 
 
 def _well_formed(record: object) -> bool:
@@ -105,7 +125,7 @@ def assess(record: object) -> dict:
         blocker = "not reported by control API"
     out = {
         "id": route_id, "class": str(record.get("class", "")), "subject": str(_subject(record) or ""),
-        "sign_in": str(record.get("sign_in", "")), "configured": record.get("configured") is True,
+        "sign_in": _sign_in(record), "configured": record.get("configured") is True,
         "maturity": "beta" if (rubric == "beta" or claim != "ok" or tagged) else "mature",
         "claim": claim, "beta_tag": tagged, "failed_bars": failed, "blocker": blocker,
     }

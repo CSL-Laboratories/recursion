@@ -18,8 +18,8 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 from recursion_core.gui.client import ACTIONS, COMMANDS, READS, ControlClient, ControlError, o7_command
-from recursion_core.gui.inventory import BARS, REQUIRED, assess, coverage_gaps, project
-from recursion_core.gui.surface import Application, withhold_venue_data
+from recursion_core.gui.inventory import BARS, REQUIRED, SIGN_IN_REJECTED, assess, coverage_gaps, project
+from recursion_core.gui.surface import Application, _sign_in_cell, withhold_venue_data
 from recursion_core.gui.tests.fakes import PARITY_MATRIX, FakeControlAPI, broken_transport, wsgi_transport
 
 HOST = "127.0.0.1:8765"
@@ -36,6 +36,29 @@ def _bars(**overrides) -> dict:
 def _route(rid: str, cls: str, maturity: str = "beta", bars=None, **extra) -> dict:
     return {"id": rid, "class": cls, "maturity": maturity, "bars": bars if bars is not None else {},
             "configured": True, "blocker": "", **extra}
+
+
+# JSON values for sign_in other than a string. Numbers, bools, lists and dicts include a
+# falsy value: the Sign-in cell used to treat that as missing and to crash on the others.
+_SIGN_IN_NON_STRINGS = (
+    ("number", 0),
+    ("number", 2),
+    ("number", 1.5),
+    ("bool", True),
+    ("bool", False),
+    ("none", None),
+    ("list", ["chatgpt"]),
+    ("list", []),
+    ("dict", {"provider": "chatgpt"}),
+    ("dict", {}),
+)
+
+
+def _sign_in_column(body: str, route_id: str) -> str:
+    row = re.search(r'<tr><th scope="row">%s</th>.*?</tr>' % re.escape(route_id), body)
+    if row is None:
+        raise AssertionError("no route row for %s" % route_id)
+    return re.findall(r"<td>(.*?)</td>", row.group(0))[2]
 
 
 class _Door:
@@ -284,6 +307,38 @@ class RubricTests(unittest.TestCase):
         self.assertEqual({g["id"] for g in coverage_gaps(reported, plugin)},
                          ids | {"gap:venue_use:kalshi:model_fed_propose"})
 
+    def test_non_string_sign_in_is_rejected_by_assess(self) -> None:
+        # The package notes do not say a non-string sign_in is malformed. It is not
+        # coerced, and the rest of the record is still assessed.
+        self.assertEqual(SIGN_IN_REJECTED, "rejected: not a string")
+        missing = assess(_route("engine:sign:absent", "engine", "mature", _bars(), engine="codex"))
+        self.assertEqual(missing["sign_in"], "")
+        blank = assess(_route("engine:sign:blank", "engine", "mature", _bars(), engine="codex", sign_in=""))
+        self.assertEqual(blank["sign_in"], "")
+        text = assess(_route("engine:sign:text", "engine", "mature", _bars(), engine="codex",
+                             sign_in="chat<gpt>"))
+        self.assertEqual(text["sign_in"], "chat<gpt>")
+        self.assertEqual((text["maturity"], text["claim"]), ("mature", "ok"))
+        for kind, value in _SIGN_IN_NON_STRINGS:
+            with self.subTest(path="assess", kind=kind, value=value):
+                row = assess(_route("engine:sign:bad", "engine", "mature", _bars(), engine="codex",
+                                    sign_in=value))
+                self.assertEqual(row["sign_in"], "rejected: not a string")
+                self.assertNotEqual(row["sign_in"], str(value))
+                self.assertEqual((row["maturity"], row["claim"], row["class"]), ("mature", "ok", "engine"))
+
+    def test_non_string_sign_in_is_rejected_by_the_cell(self) -> None:
+        # escape(value or "-") crashes on a truthy non-string and shows a falsy one as
+        # missing. assess() used to hide that by calling str() first. Both are rejected.
+        self.assertEqual(_sign_in_cell(""), "-")
+        self.assertEqual(_sign_in_cell("chat<gpt>"), "chat&lt;gpt&gt;")
+        for kind, value in _SIGN_IN_NON_STRINGS:
+            with self.subTest(path="cell", kind=kind, value=value):
+                shown = _sign_in_cell(value)
+                self.assertEqual(shown, "rejected: not a string")
+                self.assertNotEqual(shown, str(value))
+                self.assertNotEqual(shown, "-")
+
 
 class PageTests(GuiHarness):
     def test_routes_shown_with_beta_badges_and_gaps(self) -> None:
@@ -368,6 +423,31 @@ class PageTests(GuiHarness):
         self.assertEqual(body.count('<span class="badge">MATURE</span>'), 1)
         self.assertIn("gap:engine:hermes", body)
         self.assertNotIn("gap:engine:codex", body)
+
+    def test_non_string_sign_in_is_rejected_on_the_overview(self) -> None:
+        # Through the control-API JSON read and the route table. A string is escaped
+        # for HTML; that is the cell builder, not a claim about script injection.
+        self.api.routes = [
+            _route("engine:sign:text", "engine", "mature", _bars(), engine="codex", sign_in="chat<gpt>"),
+            _route("engine:sign:blank", "engine", "mature", _bars(), engine="opencode", sign_in=""),
+        ]
+        for kind, value in _SIGN_IN_NON_STRINGS:
+            self.api.routes.append(_route("engine:sign:%s:%s" % (kind, _SIGN_IN_NON_STRINGS.index((kind, value))),
+                                          "engine", "mature", _bars(), engine="codex", sign_in=value))
+        status, _, body = self.request("GET", "/")
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(_sign_in_column(body, "engine:sign:text"), "chat&lt;gpt&gt;")
+        self.assertNotIn("<", _sign_in_column(body, "engine:sign:text"))
+        self.assertEqual(_sign_in_column(body, "engine:sign:blank"), "-")
+        for kind, value in _SIGN_IN_NON_STRINGS:
+            route_id = "engine:sign:%s:%s" % (kind, _SIGN_IN_NON_STRINGS.index((kind, value)))
+            with self.subTest(path="overview", kind=kind, value=value):
+                cell = _sign_in_column(body, route_id)
+                self.assertEqual(cell, "rejected: not a string")
+                self.assertNotIn(str(value), cell)
+                row = re.search(r'<tr><th scope="row">%s</th>.*?</tr>' % re.escape(route_id), body).group(0)
+                self.assertIn(">MATURE</span>", row)
+                self.assertNotIn("malformed_route_record", row)
 
     def test_lost_intervention_reply_is_uncertain_not_unsent(self) -> None:
         # Devin r4505409056: a sent intervention with no readable reply has an unknown outcome.

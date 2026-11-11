@@ -94,6 +94,101 @@ Foundry switches are dropped. The child gets one only from the route:
   and the same host in a proxy value refuses with `proxy_malformed`. On an `api_key` or `cloud_provider`
   route a URL that meets this rule is set as it is. On a `subscription` route it must also
   pass the rule in [Subscription base URL](#subscription-base-url).
+- **`NO_PROXY` may not name the route host (CSL-839).** While a proxy is set (`HTTP_PROXY`,
+  `HTTPS_PROXY`, `ALL_PROXY` or a lowercase name), a `NO_PROXY` / `no_proxy` entry that matches
+  the host of the route's `base_url` refuses with `no_proxy_route_host`: the child would reach
+  the route gateway around the proxy.
+  - No `NO_PROXY` refusal shows any text of an entry (owner call, 2026-11-10). That holds for all
+    four causes: `no_proxy_wildcard`, `no_proxy_engine_host`, `no_proxy_route_host` and
+    `no_proxy_unparseable`. Each names only the variable, the entry's position in it and the
+    reason, on one line, for example
+    `NO_PROXY: no_proxy_route_host: entry 2 of NO_PROXY matches the route's base URL host; the entry is not shown`.
+    The position is also on the exception as `EnvRefused.position`, and the text after the cause
+    is `EnvRefused.detail`. Nothing is masked or shortened, because nothing of the entry is
+    printed: an entry can carry userinfo, a comma splits a password across two entries
+    (`http://user:pa,ss@host` is the entries `user:pa` and `ss@host`), and a percent escape can
+    hide an `@` (`pw%40host`). The route URL is never shown either.
+  - The position counts from 1 among that variable's own entries (`no_proxy` does not go on
+    from `NO_PROXY`). The value's outer whitespace is stripped and any run of commas and
+    whitespace is one separator, so a value that starts with a comma has an empty first entry,
+    which counts (`,a%b` is entry 2). For a union cover it is the position of the entry that
+    completes the cover.
+  - The reasons are fixed text: `matches every host` (a `*` entry), `completes a CIDR cover of
+    every IPv4 address`, `matches one of the engine's own hosts`, `matches the route's base URL
+    host`, and the two `is unparseable: ...` reasons below.
+  - `NO_PROXY` and `no_proxy` are read as one combined list: the entries of `NO_PROXY`, then
+    those of `no_proxy`. Every rule here runs over that list, and a refusal names the variable
+    that holds the refusing entry.
+  - Entries are matched as for the engine's own hosts (`no_proxy_engine_host`): the host itself,
+    a parent domain with or without the leading dot (`.gateway.example`, `gateway.example`,
+    `example`), a `*` pattern, in any case, with a scheme prefix, brackets, a `:port` and a
+    trailing dot stripped. The host's own trailing dot is ignored too.
+  - Ports are not compared. `gateway.example:8080` refuses a route on port 443: curl and
+    requests ignore the port, so the entry is treated as a match (fail closed).
+  - An IP-literal host (`10.1.2.3`, `[2001:db8::1]`) is also matched as an address: by an entry
+    that is that address (`10.1.2.3`, `10.1.2.3:4000`, `[2001:db8::1]`, `[2001:db8::1]:8443`,
+    `2001:db8::1`, another spelling of it such as `2001:db8:0:0:0:0:0:1`) and by a CIDR block
+    that holds it (`10.0.0.0/8`, `2001:db8::/32`, `0.0.0.0/1`). `10.1.2.3` and
+    `[::ffff:10.1.2.3]` are one address (so `::ffff:0:0/97` also holds an IPv4 host), and a short, hex or
+    decimal IPv4 host (`10.1`, `0x0a.0.0.1`, `167772161`) is read as a URL parser reads it.
+  - A loopback route host is exempt, and only that: `localhost` (not a subdomain of it),
+    `127.0.0.0/8`, `::1` and IPv4-mapped loopback (`[::ffff:127.0.0.1]`), in any spelling.
+    `NO_PROXY=127.*` on such a route launches. Any other IPv6 embedding of an IPv4 address
+    (`[::127.0.0.1]`, `[64:ff9b::7f00:1]`) is not loopback and is refused by design (fail closed).
+  - CIDR entries that cover every IPv4 address count as `*` on any route, with or without a
+    `base_url`, loopback or not, for either engine: they refuse with `no_proxy_wildcard`. The
+    cover is all of IPv4 (`0.0.0.0/0`) or, in IPv6, all of one of the three blocks that carry
+    IPv4 addresses: `::ffff:0:0/96` (IPv4-mapped), `64:ff9b::/96` (NAT64) and `::/96`
+    (IPv4-compatible). It can be a single block (`0.0.0.0/0`, `::/0`, `::/64`, `64:ff9b::/95`, in
+    any spelling: `[::]/0`, `10.0.0.0/0`, `::ffff:0.0.0.0/96`) or the union of the blocks in the
+    combined list (`0.0.0.0/1,128.0.0.0/1`, `::ffff:0:0/97 ::ffff:8000:0/97`), in any order,
+    with duplicates or overlaps. A bare address joins the union as a single-address block.
+    The union spans both names: `NO_PROXY=0.0.0.0/1` with `no_proxy=128.0.0.0/1` refuses, and
+    the refusal names the variable that holds the entry completing the cover. IPv4 and IPv6
+    blocks are not combined, and neither are halves of two different IPv6 blocks.
+    Blocks that leave a gap (`0.0.0.0/1`, `0.0.0.0/1,192.0.0.0/2`, `8000::/1`, `2000::/3`,
+    `::ffff:0:0/97`, `64:ff9b::/97`, `::/97`) are not a cover. Other IPv4-embedding prefixes
+    (`64:ff9b:1::/48`, `2002::/16`, a site NAT64 prefix) are not counted.
+  - An entry that cannot be read refuses with its own cause, `no_proxy_unparseable`, on any
+    route (fail closed: a matcher may read it some other way). Like every `NO_PROXY` refusal it
+    gives the position and the reason, never the entry:
+    `NO_PROXY: no_proxy_unparseable: entry 2 of NO_PROXY is unparseable: a path, a second '/', or a prefix length that isn't plain decimal isn't allowed in a NO_PROXY entry; the entry is not shown`
+    for an entry with a `/`, and
+    `NO_PROXY: no_proxy_unparseable: entry 2 of NO_PROXY is unparseable: a '%' (zone id or percent escape) isn't allowed in a NO_PROXY entry; the entry is not shown`
+    for an entry with a `%`.
+
+    Five kinds of entry are unparseable:
+    - One that contains `/` and is not a valid CIDR block: `0/0`, `10.0.0.0/33`, `::/129`,
+      `abc/8`, `10.0.0.0/`, `/8`. That includes a name with a trailing slash or a path
+      (`example.com/`, `http://example.com/`, `.corp/path`, `localhost/`); write the bare name.
+    - One whose part after the `/` is not a plain decimal prefix length: ASCII digits
+      only, no sign, no leading zero except `0` itself, within the family's range. A netmask or
+      hostmask (`10.0.0.0/255.0.0.0`, `0.0.0.0/0.0.0.0`, `10.0.0.0/0.255.255.255`), `10.0.0.0/08`,
+      `10.0.0.0/+8` and `::/0x0` refuse. Such an entry is never matched as a block, for the route
+      host or in a union.
+    - One with more than one `/`, counted after a scheme prefix is stripped:
+      `10.1.2.3:8080/path/8`, `a/b/c`, `10.0.0.0/8/8`, `//8`, `http://h/a/b`. Before this rule
+      `10.1.2.3:8080/path/8` was read as the block `10.0.0.0/8`: the prefix was taken after the
+      last `/` and `/path` was dropped with the port. `http://10.0.0.0/8` is still a block: the
+      `//` of the scheme prefix is not counted.
+    - One with a `/` whose IPv4 address carries a `:port` that is not a port: plain ASCII
+      decimal, 1 to 65535, no sign and no leading zero. `1.2.3.4:x/8`, `1.2.3.4:0/8`,
+      `1.2.3.4:65536/8` and `1.2.3.4:/8` refuse. `1.2.3.4:80/8` is read as before: the port is
+      dropped and the entry is the block `1.0.0.0/8`. An entry with no `/` is not touched by this
+      rule.
+    - One that contains `%`: an IPv6 zone id (`fe80::1%eth0`, `fe80::1%eth0/64`,
+      `[fe80::1%25eth0]`) or a percent escape in a name (`host%2f`). This check runs before the
+      `/` check, so `user:pw%40host/` takes the `%` reason.
+  - Any other CIDR block never matches a host name: nothing is resolved here. It is checked for
+    the route host only; the engine's own hosts are names.
+  - `*` or an all-address cover (`no_proxy_wildcard`), an unparseable entry
+    (`no_proxy_unparseable`) and an engine-host entry (`no_proxy_engine_host`) are checked
+    first, over the combined list in entry order, and keep their cause when a route-host entry
+    is also present.
+  - Unchanged: with no proxy set nothing here refuses, and with no route `base_url` only the
+    `no_proxy_wildcard`, `no_proxy_unparseable` and engine-host rules do. Lookalikes
+    (`notgateway.example`, `gateway.example.evil`) and a child of the host
+    (`api.gateway.example` for `gateway.example`) are not refused.
 - **Key custody.** This package is the launch boundary only. It never reads the OS keyring or
   the owner-only key file (A44), and does no keyring or file I/O. The caller fetches the
   user-entered key from the OS keyring, or from the owner-only file on a host with no

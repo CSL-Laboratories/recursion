@@ -35,6 +35,15 @@ replacement. It builds the child environment from nothing:
   caller passes that origin as one the user already trusted, or the run uses the named full-access profile
   (owner call; CSLR-D-011): the ``CLAUDE_CODE_OAUTH_TOKEN`` passed through would go to that base. This module
   stores no trusted list and asks nothing; the driver does both;
+* while a proxy is set, a ``NO_PROXY`` entry that matches the route's own base URL host refuses
+  (``no_proxy_route_host``, CSL-839; PRODUCT.md 055cc7a5 / CSLR-D-011): the child would reach the route gateway
+  around the proxy. A loopback route host (``localhost``, ``127.0.0.0/8``, ``::1``) is exempt. ``NO_PROXY``
+  and ``no_proxy`` are read as one combined list. CIDR entries that cover every IPv4 address, alone or as the
+  union of that list's blocks (``0.0.0.0/0``, ``0.0.0.0/1,128.0.0.0/1``, or in IPv6 all of ``::ffff:0:0/96``,
+  ``64:ff9b::/96`` or ``::/96``), count as ``*`` on any route (``no_proxy_wildcard``). An entry with a ``/``
+  that is no CIDR block with a plain decimal prefix length, with a second ``/``, or with a ``%``, refuses on
+  any route (``no_proxy_unparseable``). No ``NO_PROXY`` refusal shows any text of an entry: it names the
+  variable, the entry's position in it and the reason;
 * one change beyond N5h/N5i: links are resolved one component at a time and every
   link met on the way, including links inside a link's target, must be root's or
   ours in a directory chain no one else can write, and no step may enter ``/proc``,
@@ -82,14 +91,20 @@ __all__ = [
 class EnvRefused(Exception):
     """The child environment cannot be built safely; nothing may be spawned.
 
-    ``name`` is the variable (never its value) and ``cause`` a stable reason code.
+    ``name`` is the variable (never its value) and ``cause`` a stable reason code. ``detail`` and ``position``
+    are None except for the four NO_PROXY refusals (``no_proxy_wildcard``, ``no_proxy_engine_host``,
+    ``no_proxy_route_host``, ``no_proxy_unparseable``). There ``position`` is the refusing entry's place in that
+    variable, counted from 1, and ``detail`` is one line that gives the variable, that position and the reason
+    (``entry 2 of NO_PROXY matches the route's base URL host; the entry is not shown``); it follows the cause in
+    ``str()``. No text of an entry is ever shown, in whole or in part, by any of them (owner call, 2026-11-10):
+    an entry can carry userinfo, a comma splits a password across two entries, and a percent escape hides one.
     """
 
     code = "env_refused"
 
-    def __init__(self, name: str | None, cause: str) -> None:
-        super().__init__(f"{name or '-'}: {cause}")
-        self.name, self.cause = name, cause
+    def __init__(self, name: str | None, cause: str, detail: str | None = None, *, position: int | None = None) -> None:
+        super().__init__(f"{name or '-'}: {cause}" if detail is None else f"{name or '-'}: {cause}: {detail}")
+        self.name, self.cause, self.detail, self.position = name, cause, detail, position
 
 
 # The 29 names the Nov 5 tree's route allowlist carried (csl-research
@@ -324,7 +339,21 @@ def build_child_env(
     ``home`` is the route-owned private home the child gets as HOME; the parent's HOME is never passed.
     ``overrides`` are values the core itself sets. An override may only set a name already on this engine's
     allowlist (never HOME, PATH, a credential or a scrubbed name), and it is merged before the checks, so it
-    meets exactly the value, PATH, NO_PROXY and temp rules an inherited value meets.
+    meets exactly the value, PATH, NO_PROXY and temp rules an inherited value meets. While a proxy is set, a
+    NO_PROXY entry that matches the route's base URL host refuses with ``no_proxy_route_host`` (CSL-839), unless
+    that host is loopback (``localhost``, ``127.0.0.0/8``, ``::1`` or IPv4-mapped loopback); a ``*`` or
+    engine-host entry anywhere in either name is reported first, with its own cause, loopback route or not.
+    NO_PROXY and no_proxy are read as one combined list, NO_PROXY's entries first, and a refusal names the
+    variable that holds the refusing entry and that entry's position, counted from 1 among that variable's own
+    entries as ``_no_proxy_entries`` splits them (``EnvRefused.position``, and in ``EnvRefused.detail`` with the
+    reason). No NO_PROXY refusal shows any text of an entry. CIDR entries that cover every IPv4 address are a ``*``:
+    ``no_proxy_wildcard`` on any route, with or without a base URL. That is one block, or the union of the
+    combined list's blocks and bare addresses, covering ``0.0.0.0/0`` or, in IPv6, all of ``::ffff:0:0/96``,
+    ``64:ff9b::/96`` or ``::/96``; a union cover is reported at the entry that completes it. An entry with a
+    ``/`` that is no CIDR block with a plain decimal prefix length (``0/0``, ``10.0.0.0/33``,
+    ``10.0.0.0/255.0.0.0``, ``example.com/``), with more than one ``/`` (``10.1.2.3:8080/path/8``), with a
+    ``:port`` before the ``/`` that is not a plain decimal 1-65535 (``1.2.3.4:x/8``), or with a ``%``, refuses
+    with ``no_proxy_unparseable`` on any route.
     """
 
     if not _posix_supported():
@@ -364,11 +393,23 @@ def build_child_env(
             raise EnvRefused(name, cause)
     if "PATH" in env and (cause := _unsafe_path(env["PATH"])) is not None:
         raise EnvRefused("PATH", cause)
-    # A bypass only matters when a proxy is set: "*" skips it for every host, an engine-host entry for that engine.
+    # A bypass only matters when a proxy is set: "*" or an all-address CIDR block skips it for every host, an
+    # engine-host entry for that engine, an entry for the route's base host for the route gateway.
     if any(env.get(name) for name in VALUE_URLS + VALUE_ALL_PROXY):
-        for name in [name for name in NO_PROXY_NAMES if name in env]:
-            if (cause := _no_proxy_bypass(env[name], profile.hosts)) is not None:
-                raise EnvRefused(name, cause)
+        # NO_PROXY and no_proxy are one combined list here (owner call, 2026-11-10): the refusal names the variable
+        # that holds the refusing entry and that entry's position in it, never any text of the entry.
+        lists = [(name, env[name]) for name in NO_PROXY_NAMES if name in env]
+        if (refusal := _no_proxy_bypass(lists, profile.hosts)) is not None:
+            raise refusal
+        # CSL-839: the route's own base host is an endpoint too; an entry matching it would send the child to the
+        # route gateway around the proxy. Checked after both names passed the rule above, so a "*", all-address or
+        # engine-host entry keeps its own cause whatever else the lists hold. A loopback route host is exempt from this check
+        # only (owner call, 2026-11-10): NO_PROXY may name a gateway on this machine.
+        base = route_env.get(profile.base_url_name) if profile.base_url_name else None
+        if base is not None and not _loopback_host(host := _BASE_URL.match(base)["host"]):
+            for name in [name for name in NO_PROXY_NAMES if name in env]:
+                if (position := _no_proxy_route_bypass(env[name], host)) is not None:
+                    raise _no_proxy_refused(name, position, "no_proxy_route_host", "matches the route's base URL host")
     # N5h option A: a temp name is replaced by one private route temp root, never checked or passed.
     present = [name for name in TEMP_NAMES if name in env]
     if present:
@@ -663,24 +704,282 @@ def _unsafe_path(value: str) -> str | None:
     return None
 
 
-def _no_proxy_bypass(value: str, hosts: tuple[str, ...]) -> str | None:
-    """N5i: comma and whitespace split; the union of curl, requests, hyper-util, undici and Codex matchers."""
+def _no_proxy_entries(value: str) -> list[str]:
+    """A NO_PROXY value as lowercased entries, comma and whitespace split, each without its scheme prefix.
 
-    for entry in re.split(r"[,\s]+", value.strip().lower()):
-        entry = re.sub(r"^[a-z][a-z0-9+.-]*://", "", entry).strip("[]")
-        entry = re.sub(r":[0-9]*$", "", entry).rstrip(".")
+    An entry's position, as a refusal gives it, is its place in this list counted from 1. The value's outer
+    whitespace is stripped and any run of commas and whitespace is one separator, so a value that starts with a
+    comma has an empty first entry, which counts (``,a%b`` is entry 2).
+    """
+
+    return [re.sub(r"^[a-z][a-z0-9+.-]*://", "", entry) for entry in re.split(r"[,\s]+", value.strip().lower())]
+
+
+def _no_proxy_refused(name: str, position: int, cause: str, reason: str) -> EnvRefused:
+    """A NO_PROXY refusal: the variable, the entry's position in it and the reason, on one line.
+
+    Owner call, 2026-11-10: no text of the entry goes into any NO_PROXY refusal, whatever its cause. An entry may
+    hold userinfo, a comma splits a password across two entries (``http://user:pa,ss@host``) and a percent
+    escape hides an ``@``, so nothing is masked or cut here: nothing of the entry is shown at all.
+    """
+
+    return EnvRefused(name, cause, f"entry {position} of {name} {reason}; the entry is not shown", position=position)
+
+
+def _no_proxy_name(entry: str) -> str:
+    """The name an entry is matched by: no brackets, no ``:port``, no trailing dot."""
+
+    return re.sub(r":[0-9]*$", "", entry.strip("[]")).rstrip(".")
+
+
+def _no_proxy_hit(entry: str, hosts: tuple[str, ...]) -> bool:
+    """Whether one entry (after ``_no_proxy_name``) names a host: a ``*`` pattern, the host or a parent domain."""
+
+    if "*" in entry:
+        return any(_star_match(entry, host) for host in hosts)
+    bare = entry.lstrip(".")
+    return any(host == bare or host.endswith("." + bare) for host in hosts)
+
+
+def _star_match(pattern: str, text: str) -> bool:
+    """Whether a ``*`` pattern matches the whole of ``text``: ``*`` is any run of characters, the rest literal.
+
+    A ``*`` run may be empty and may hold dots, and case is compared as given. No regex: a compiled ``.*a.*a...``
+    backtracks for exponential time on a host that does not match (Devin rt343, MEDIUM-1), and NO_PROXY is the
+    parent's to set. This walks both strings once and, on a mismatch, goes back to the last ``*`` only, so the
+    worst case is len(pattern) * len(text) steps. The results are those of the regex it replaces
+    (``".*".join(map(re.escape, parts)) + r"\\Z"``, matched from the start), which had no DOTALL: a ``*`` never
+    matches a newline, so a newline is matched only by a newline in the pattern. No entry and no host holds one
+    here (``_no_proxy_entries`` splits on whitespace; ``_BASE_URL`` and the engine hosts have none); the rule is
+    kept so that every input gives the result it gave before.
+    """
+
+    lines, texts = pattern.split("\n"), text.split("\n")
+    return len(lines) == len(texts) and all(map(_star_match_line, lines, texts))
+
+
+def _star_match_line(pattern: str, text: str) -> bool:
+    """``_star_match`` for a pattern and a text with no newline: greedy, going back to the last ``*`` only."""
+
+    p = t = 0
+    star, resume = -1, 0  # the last "*" seen in the pattern, and where in the text its run ends for now
+    while t < len(text):
+        if p < len(pattern) and pattern[p] == "*":
+            star, resume = p, t
+            p += 1
+        elif p < len(pattern) and pattern[p] == text[t]:
+            p += 1
+            t += 1
+        elif star >= 0:
+            resume += 1  # the last "*" takes one more character; an earlier "*" taking more could not help
+            p, t = star + 1, resume
+        else:
+            return False
+    return pattern.count("*", p) == len(pattern) - p
+
+
+def _no_proxy_bypass(lists: list[tuple[str, str]], hosts: tuple[str, ...]) -> EnvRefused | None:
+    """N5i: comma and whitespace split; the union of curl, requests, hyper-util, undici and Codex matchers.
+
+    ``lists`` is each NO_PROXY name present with its value, in ``NO_PROXY_NAMES`` order. Owner calls, 2026-11-10
+    (CSL-839): their entries are judged as one combined list, and the first refusing entry is returned as a
+    refusal that gives the variable holding it, the cause, the entry's position and the reason
+    (``_no_proxy_refused``), never any text of the entry. The position counts from 1 among that variable's own
+    entries (``_no_proxy_entries``): no_proxy's count does not go on from NO_PROXY's. Blocks that cover every
+    IPv4 address are a ``*``, alone or as the union of the combined list's blocks (``_all_address_blocks``),
+    reported at the entry that completes the cover. An entry is unparseable, and refuses since a matcher may
+    read it some other way, when it holds a ``%`` (a zone id, a percent escape) or holds a ``/`` and is no CIDR
+    block ``_no_proxy_ip`` reads (``0/0``, ``10.0.0.0/33``, ``10.0.0.0/255.0.0.0``, ``example.com/``, a second
+    ``/`` as in ``10.1.2.3:8080/path/8``, a ``:port`` that is no port as in ``1.2.3.4:x/8``). The ``%`` check
+    comes before the ``/`` check, so ``user:pw%40host/`` takes the ``%`` reason.
+    """
+
+    where = [(name, position) for name, value in lists for position, _ in enumerate(_no_proxy_entries(value), 1)]
+    entries = [entry for _, value in lists for entry in _no_proxy_entries(value)]
+    # The cover only grows with each entry, so the entry that completes it is found by halving the list.
+    completing, last = -1, len(entries) - 1
+    if _all_address_blocks(entries):
+        completing = 0
+        while completing < last:
+            middle = (completing + last) // 2
+            if _all_address_blocks(entries[:middle + 1]):
+                last = middle
+            else:
+                completing = middle + 1
+    for index, raw in enumerate(entries):
+        name, position = where[index]
+        if "%" in raw:
+            return _no_proxy_refused(name, position, "no_proxy_unparseable", "is unparseable: a '%' (zone id or percent "
+                                     "escape) isn't allowed in a NO_PROXY entry")
+        if "/" in raw and _no_proxy_ip(raw) is None:
+            return _no_proxy_refused(name, position, "no_proxy_unparseable", "is unparseable: a path, a second '/', or a "
+                                     "prefix length that isn't plain decimal isn't allowed in a NO_PROXY entry")
+        entry = _no_proxy_name(raw)
         if not entry:
             continue
         if entry.strip("*.") == "":
-            return "no_proxy_wildcard"
-        if "*" in entry:
-            pattern = re.compile(".*".join(re.escape(part) for part in entry.split("*")) + r"\Z")
-            hit = any(pattern.match(host) for host in hosts)
-        else:
-            bare = entry.lstrip(".")
-            hit = any(host == bare or host.endswith("." + bare) for host in hosts)
+            return _no_proxy_refused(name, position, "no_proxy_wildcard", "matches every host")
+        if index == completing:
+            return _no_proxy_refused(name, position, "no_proxy_wildcard", "completes a CIDR cover of every IPv4 address")
+        if _no_proxy_hit(entry, hosts):
+            return _no_proxy_refused(name, position, "no_proxy_engine_host", "matches one of the engine's own hosts")
+    return None
+
+
+def _ip_forms(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> set:
+    """An address and its other family's spelling: ``10.1.2.3`` and ``::ffff:10.1.2.3`` are one endpoint."""
+
+    if address.version == 4:
+        return {address, ipaddress.IPv6Address(f"::ffff:{address}")}
+    return {address} | ({address.ipv4_mapped} if address.ipv4_mapped is not None else set())
+
+
+def _host_addresses(host: str) -> set:
+    """The addresses a base URL host names when it is an IP literal, else none. No name is resolved.
+
+    An IPv4 host is read the way URL parsers read it (``127.1``, ``0x7f.0.0.1``, ``2130706433``), so a short or
+    hex spelling of an address a NO_PROXY entry names is still that address.
+    """
+
+    try:
+        return _ip_forms(ipaddress.ip_address(host))
+    except ValueError:
+        pass
+    # One to four dot-separated numbers, decimal, 0x hex or 0-led octal; the last fills the bytes that remain.
+    parts = host.split(".")
+    try:
+        numbers = [int(part, 16 if part.startswith("0x") else 8 if part.startswith("0") and part != "0" else 10)
+                   for part in parts]
+        if len(parts) > 4 or not all(re.fullmatch(r"0x[0-9a-f]*|[0-9]+", part) for part in parts):
+            return set()
+        if any(number > 255 for number in numbers[:-1]) or numbers[-1] >= 256 ** (5 - len(numbers)):
+            return set()
+        packed = sum(number << (8 * (3 - i)) for i, number in enumerate(numbers[:-1])) + numbers[-1]
+        return _ip_forms(ipaddress.IPv4Address(packed))
+    except ValueError:
+        return set()
+
+
+def _loopback_host(host: str) -> bool:
+    """CSL-839: whether a base URL host is loopback, the one kind of route host a NO_PROXY entry may name.
+
+    Loopback is the exact name ``localhost`` (any case, one trailing dot allowed; not a subdomain of it), an
+    address in ``127.0.0.0/8`` in any spelling ``_host_addresses`` reads (``127.1``, ``0x7f.0.0.1``,
+    ``2130706433``), ``::1`` in any spelling, and IPv4-mapped loopback (``::ffff:127.0.0.1``). Nothing is
+    resolved: a name that only looks like one (``localhost.example.com``, ``127.0.0.1.example.com``) is not.
+    """
+
+    host = host.lower().strip("[]")
+    host = host[:-1] if host.endswith(".") else host
+    if host == "localhost":
+        return True
+    # Every form must be loopback; an IPv4-mapped IPv6 form is judged by the IPv4 address it carries.
+    addresses = {address.ipv4_mapped or address if address.version == 6 else address
+                 for address in _host_addresses(host)}
+    return bool(addresses) and all(address.is_loopback for address in addresses)
+
+
+def _no_proxy_ip(entry: str):
+    """The address or CIDR block (an ``ipaddress`` object) an entry is, or None when it is neither shape.
+
+    Read as ``ip``, ``ip:port``, ``[ip]``, ``[ip]:port`` or any of those with ``/prefix``; the port is dropped,
+    as for a name. Host bits may be set in a block: ``10.1.2.3/8``. The prefix is what follows the one ``/``
+    and must be a plain decimal length in the family's range: ASCII digits, no sign, no leading zero but ``0``
+    itself. So a netmask or hostmask (``10.0.0.0/255.0.0.0``), ``/08`` and ``/0x0`` are no block, and neither is
+    any entry with a ``%`` (owner calls, 2026-11-10). An entry with more than one ``/`` is no block either
+    (``10.1.2.3:8080/path/8``, ``10.0.0.0/8/8``, ``//8``): the port strip must never drop a path. And in a
+    ``/`` entry the ``:port`` dropped from an IPv4 address must itself be a port, plain ASCII decimal 1-65535
+    with no leading zero, so the whole address-and-port part is read before any of it is dropped
+    (``1.2.3.4:80/8`` is ``1.0.0.0/8``; ``1.2.3.4:x/8``, ``1.2.3.4:0/8`` and ``1.2.3.4:65536/8`` are no block).
+    """
+
+    if "%" in entry or entry.count("/") > 1:
+        return None
+    text, slash, prefix = entry.rpartition("/")
+    if not slash:
+        text = entry
+    elif not re.fullmatch(r"0|[1-9][0-9]*", prefix):
+        return None
+    bracketed = re.fullmatch(r"\[([^\]]*)\](?::[0-9]*)?", text)
+    if bracketed:
+        text = bracketed[1]
+    elif text.count(":") == 1:  # ip:port; two or more colons are a bare IPv6 address
+        text, port = text.split(":")
+        if slash and not (re.fullmatch(r"[1-9][0-9]{0,4}", port) and int(port) < 65536):
+            return None
+    text = text.rstrip(".")
+    try:
+        return ipaddress.ip_network(f"{text}/{prefix}", strict=False) if slash else ipaddress.ip_address(text)
+    except ValueError:
+        return None
+
+
+_NETWORKS = (ipaddress.IPv4Network, ipaddress.IPv6Network)
+_ALL_IPV4 = ipaddress.IPv4Network("0.0.0.0/0")
+# The IPv6 blocks that each carry every IPv4 address: IPv4-mapped, the NAT64 well-known prefix, IPv4-compatible.
+_IPV4_MAPPING_BLOCKS = (ipaddress.IPv6Network("::ffff:0:0/96"), ipaddress.IPv6Network("64:ff9b::/96"),
+                        ipaddress.IPv6Network("::/96"))
+
+
+def _all_address_blocks(entries: list[str]) -> bool:
+    """Whether the CIDR blocks among these entries skip the proxy for every IPv4 address, as ``*`` does (CSL-839).
+
+    That is one block, or the union of the blocks, covering all of ``0.0.0.0/0`` (``0.0.0.0/0``, ``10.0.0.0/0``,
+    ``0.0.0.0/1,128.0.0.0/1``) or, in IPv6, all of one of ``_IPV4_MAPPING_BLOCKS`` (``::ffff:0:0/96``, ``::/64``,
+    ``::/0``, ``64:ff9b::/97,64:ff9b::8000:0/97``): a matcher that reads IPv4 through such a block (Go, undici, a
+    NAT64 path) would skip the proxy for every IPv4 host. A bare address joins the union as its single-address
+    block. The two families are not mixed, and blocks that leave a gap (``0.0.0.0/1``, ``0.0.0.0/1,192.0.0.0/2``,
+    ``2000::/3``, ``::ffff:0:0/97``) are not a cover. The shapes are ``_no_proxy_ip``'s.
+    """
+
+    parsed = [ip for ip in map(_no_proxy_ip, entries) if ip is not None]
+    blocks = [ip if isinstance(ip, _NETWORKS) else ipaddress.ip_network(ip) for ip in parsed]
+    for targets in ((_ALL_IPV4,), _IPV4_MAPPING_BLOCKS):
+        # collapse_addresses only merges blocks into larger ones, so a full cover of a target is one merged block.
+        merged = list(ipaddress.collapse_addresses(block for block in blocks if block.version == targets[0].version))
+        if any(block.supernet_of(target) for block in merged for target in targets):
+            return True
+    return False
+
+
+def _no_proxy_ip_hit(entry: str, addresses: set) -> bool | None:
+    """Whether an entry is one of these addresses, or a CIDR block that holds one; None when it is neither shape.
+
+    The shapes are ``_no_proxy_ip``'s. Addresses are compared parsed, so ``::1`` and ``0:0:0:0:0:0:0:1`` are one.
+    """
+
+    parsed = _no_proxy_ip(entry)
+    if parsed is None:
+        return None
+    if isinstance(parsed, _NETWORKS):
+        return any(address.version == parsed.version and address in parsed for address in addresses)
+    return bool(_ip_forms(parsed) & addresses)
+
+
+def _no_proxy_route_bypass(value: str, host: str) -> int | None:
+    """CSL-839: the position, from 1, of the first NO_PROXY entry that matches the route's base URL host, or None.
+
+    The same matcher as ``_no_proxy_bypass``, over the one host: the host itself, a parent domain with or
+    without the leading dot, a ``*`` pattern, with scheme, brackets, ``:port`` and trailing dot stripped from
+    the entry. The entry's port is not compared with the route's: curl and requests ignore it, so another port
+    is still a hit. The host is compared lowercased and without its own trailing dot. An IP-literal host is
+    also matched as an address: by an entry that is that address, and by a CIDR block that holds it (curl
+    7.86+, requests, undici and Go honour CIDR). A CIDR entry never matches a name: no matcher resolves DNS.
+    An entry that is an address or a block is decided as one and not also as a name, so the port strip cannot
+    turn ``::1:0`` into ``::1``. A loopback host never gets here: ``build_child_env`` exempts it
+    (``_loopback_host``). Neither does an all-address cover, a ``/`` entry that is no CIDR block or a ``%``
+    entry: ``_no_proxy_bypass`` refused those first.
+    """
+
+    host = host.lower().strip("[]").rstrip(".")
+    addresses = _host_addresses(host)
+    for position, entry in enumerate(_no_proxy_entries(value), 1):
+        hit = _no_proxy_ip_hit(entry, addresses)
+        if hit is None:
+            entry = _no_proxy_name(entry)
+            hit = bool(entry) and entry.strip("*.") != "" and _no_proxy_hit(entry, (host,))
         if hit:
-            return "no_proxy_engine_host"
+            return position
     return None
 
 

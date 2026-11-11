@@ -522,22 +522,23 @@ class ControlAPI:
         A changed cgroup is cleaned up once more. That budget stays in this frame, so falling back to
         the retained launch cannot open another attempt.
         """
+        # A stopped row stays stopped. Adoption is for a launch that has not been recorded, and it
+        # must not turn a terminal stop into a pending cgroup-unknown answer.
+        if rec.get("state") == "stopped":
+            res = {"code": STOPPED, "run_id": rec["run_id"], "state": "stopped", "repeat": True}
+            # A stopped launch this process still holds was never written: try again now.
+            return self._recorded(res, rec) if rec["run_id"] in self._launched else res
         reconfirms_left = 1
         while True:
             adopted = self._adopt_unrecorded_launch(rec)
             if adopted is not None:
                 return adopted
-            run_id = rec["run_id"]
-            if rec["state"] == "stopped":
-                res = {"code": STOPPED, "run_id": run_id, "state": "stopped", "repeat": True}
-                # A stopped launch this process still holds was never written: try again now.
-                return self._recorded(res, rec) if run_id in self._launched else res
             result = self._stop_attempt(rec, reconfirm=reconfirms_left > 0)
             if not result.pop("_reconfirm", False):
                 return result
             reconfirms_left -= 1
             if reconfirms_left < 0:  # the attempt above already consumed the one reconfirm
-                return {"code": PENDING, "run_id": run_id, "state": "pending", "reason": "cgroup_changed",
+                return {"code": PENDING, "run_id": rec["run_id"], "state": "pending", "reason": "cgroup_changed",
                         "recorded": False}
 
     def _stop_attempt(self, rec: dict, *, reconfirm: bool) -> dict:

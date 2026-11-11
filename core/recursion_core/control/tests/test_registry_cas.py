@@ -990,5 +990,56 @@ class RoundThreeTest(unittest.TestCase):
         self.assertEqual(snap["stop_attestation"]["member_ids"], ["former"])
 
 
+class RoundFourTest(unittest.TestCase):
+    def test_reap_keeps_the_proof_of_a_loaded_stopped_run(self) -> None:
+        legacy = {"run_id": "run-1", "tenant": "t", "engine": "codex", "state": "stopped",
+                  "cgroup": "/cg/run-1", "generation": 2,
+                  "members": [{"member_id": "m1", "pid": 42}],
+                  "stop_attestation": {"proof": "empty", "cgroup": "/cg/run-1", "member_ids": ["m1"],
+                                       "generation": 1}}
+        reg = InMemoryRunRegistry([legacy], processes=lambda _pid: False)
+        loaded = reg.get("run-1")
+        assert loaded is not None
+        self.assertEqual(loaded["members"], [])
+        self.assertEqual(loaded["stop_attestation"]["member_ids"], ["m1"])
+        reg.reap_orphans(lambda _pid: False)
+        rec = reg.get("run-1")
+        assert rec is not None
+        self.assertEqual(rec["state"], "stopped")
+        self.assertEqual(rec["stop_attestation"]["proof"], "empty")
+        self.assertEqual(rec["stop_attestation"]["member_ids"], ["m1"])
+        rec["engine"] = "other"
+        stored = reg.put(rec)
+        self.assertEqual(stored["state"], "stopped")
+        self.assertEqual(stored["engine"], "other")
+        self.assertEqual(stored["stop_attestation"]["proof"], "empty")
+        self.assertEqual(stored["stop_attestation"]["member_ids"], ["m1"])
+
+    def test_a_loaded_stop_without_a_cgroup_is_rejected(self) -> None:
+        legacy = {"run_id": "r1", "tenant": "t", "engine": "codex", "state": "stopped",
+                  "cgroup": None, "generation": 1, "members": [],
+                  "stop_attestation": {"proof": "empty", "cgroup": None, "member_ids": [],
+                                       "generation": 1}}
+        with self.assertRaises(StopUnattested):
+            InMemoryRunRegistry([legacy])
+
+    def test_stop_does_not_demote_a_stopped_run_that_has_no_cgroup(self) -> None:
+        # The loader rejects this shape. A row that still reaches Stop stays stopped.
+        reg = InMemoryRunRegistry()
+        reg.put({"run_id": "r1", "tenant": "t", "engine": "codex", "state": "running",
+                 "cgroup": "/cg/r1", "stop": None, "start_key": None})
+        reg._runs["r1"]["state"] = "stopped"
+        reg._runs["r1"]["cgroup"] = None
+        reg._runs["r1"]["stop_attestation"] = {"proof": "empty", "cgroup": None, "member_ids": [],
+                                               "generation": reg._runs["r1"]["generation"]}
+        api, _, _, _ = make_api(registry=reg)
+        res = api.call("run.stop", {"run_id": "r1"})
+        self.assertEqual((res["code"], res.get("state"), res.get("repeat")), (a.STOPPED, "stopped", True))
+        self.assertNotEqual(res.get("reason"), "cgroup_unknown")
+        stored = reg.get("r1")
+        assert stored is not None
+        self.assertEqual(stored["state"], "stopped")
+
+
 if __name__ == "__main__":
     unittest.main()

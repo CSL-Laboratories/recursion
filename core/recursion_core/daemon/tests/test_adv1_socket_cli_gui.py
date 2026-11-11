@@ -151,17 +151,28 @@ class SocketAttackTest(ComposedBase):
         self.assertEqual(len(winners), 1)
         winners[0].__exit__(None, None, None)
 
-    def test_a_second_composition_without_the_user_lock_clobbers_the_live_daemons_token_file(self):
-        # main() takes UserLock first, so this only matters to an embedder or test that composes twice. The
-        # second compose fails at the socket lock, but it has already rewritten and then unlinked the token
-        # file the live daemon's GUI depends on (DeviceDoor is built before server.start()).
+    def test_a_second_composition_without_the_user_lock_leaves_the_live_daemons_token_file_alone(self):
+        # ADV1-12 (fixed). main() takes UserLock first, so this only matters to an embedder or test that
+        # composes twice. The second compose fails at the socket lock; it used to have rewritten and then
+        # unlinked the token file the live daemon's GUI depends on. The file is now written only after
+        # server.start() succeeds, and a door removes only the file it wrote.
         _, first = self.boot()
         token_file = self.runtime / 'recursion' / 'gui-device-token'
         live = token_file.read_text().strip()
         with self.assertRaises(InsecureSocketPath):
             self.boot()
         self.assertTrue(first.door({'HTTP_AUTHORIZATION': 'Bearer ' + live}))  # in-memory token unchanged
-        self.assertFalse(token_file.exists(), 'documents: the losing composition removed the live token file')
+        self.assertEqual(token_file.read_text().strip(), live, 'the losing composition left the live token file')
+        self.assertEqual(os.listdir(token_file.parent).count('gui-device-token.tmp'), 0)
+        # A door that never published, or whose file was replaced by another door, unlinks nothing.
+        stranger = adapter.DeviceDoor(token_file.parent, publish=False)
+        stranger.close()
+        self.assertEqual(token_file.read_text().strip(), live)
+        other = adapter.DeviceDoor(token_file.parent)  # replaces the file (a successor's door)
+        first.door.close()
+        self.assertTrue(token_file.exists(), 'the older door does not remove its successor\'s file')
+        other.close()
+        self.assertFalse(token_file.exists())
 
     def test_garbage_and_oversized_frames_are_typed_and_the_daemon_keeps_serving(self):
         _, composed = self.boot()

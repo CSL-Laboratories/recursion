@@ -495,20 +495,31 @@ class DeviceDoor:
     lives only in ``$XDG_RUNTIME_DIR/recursion/gui-device-token`` (0600 in a 0700 directory) and is
     never logged. There is no pairing page and no remote path: holding the token means being able
     to read the operator's runtime directory on this machine.
+
+    ``publish=False`` makes the door without writing the file; ``publish()`` writes it. The composition
+    publishes only once the control socket is its own, and ``close`` removes only the file this door
+    wrote, so a composition that loses the socket lock leaves the live daemon's token file alone (ADV1-12).
     """
 
-    def __init__(self, directory):
+    def __init__(self, directory, *, publish=True):
         private_dir(directory)
         self.path = Path(directory) / DEVICE_TOKEN_FILE
         self._token = secrets.token_urlsafe(32)
+        self._published = None  # (device, inode) of the token file this door wrote
+        if publish:
+            self.publish()
+
+    def publish(self):
         tmp = self.path.with_name(DEVICE_TOKEN_FILE + '.tmp')
         fd = os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
         try:
             os.fchmod(fd, 0o600)
             os.write(fd, self._token.encode() + b'\n')
+            info = os.fstat(fd)
         finally:
             os.close(fd)
         os.replace(tmp, self.path)
+        self._published = (info.st_dev, info.st_ino)
 
     def __call__(self, env):
         offered = []
@@ -525,8 +536,11 @@ class DeviceDoor:
                    for value in offered)
 
     def close(self):
+        published, self._published = self._published, None
         try:
-            os.unlink(self.path)
+            info = os.lstat(self.path)
+            if published == (info.st_dev, info.st_ino):  # never a file another door wrote
+                os.unlink(self.path)
         except OSError:
             pass
 
@@ -578,11 +592,12 @@ def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.
     api = ControlAPI(registry, UnitKillTree(daemon), starter, time.time, confirm_timeout_s=confirm_timeout_s)
     control = DaemonControl(api, registry, daemon, starter, state_dir)
     directory = socket_directory(environ)
-    door = DeviceDoor(directory)
+    door = DeviceDoor(directory, publish=False)
     server = UnixControlServer(directory, with_ping_health(control.handle))
+    server.start()
     try:
-        server.start()
+        door.publish()  # only now: the socket lock is ours, so no live daemon's token file is replaced
     except BaseException:
-        door.close()
+        server.close()
         raise
     return Composition(control, server, door)

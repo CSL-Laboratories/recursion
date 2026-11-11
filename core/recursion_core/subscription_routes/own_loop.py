@@ -19,8 +19,8 @@ Both checks run before any spawn or request and fail closed. Nothing here reads 
 login store, resolves a host name or touches the network: whether a stored ``copilot`` login exists is
 answered by a caller-supplied probe (``has_copilot_login``). That probe stays a callable, not an argv.
 With no probe the route refuses. Where a new process group cannot be enforced, or ``SIGCHLD``
-is ignored, it refuses ``probe unenforceable``. Another live thread refuses ``probe threaded``
-before ``fork``.
+is ignored or marked ``SA_NOCLDWAIT``, it refuses ``probe unenforceable``. Another live thread
+refuses ``probe threaded`` before ``fork``.
 
 The child environment is not a copy of the parent. After the Copilot or Nous strip, only names on
 ``child_env``'s base allowlist remain, and a proxy value that carries userinfo or fails the proxy
@@ -30,6 +30,7 @@ with ``build_child_env`` and start the process through ``child_env.spawn``.
 
 from __future__ import annotations
 
+import ctypes
 import errno
 import ipaddress
 import math
@@ -496,9 +497,11 @@ def _probe_login(probe: Callable[[], bool], deadline: float, env: Mapping[str, s
     grace still inside ``deadline``, then SIGKILL. The group is the one confirmed by the handshake
     byte. A descendant that calls ``setpgid(0, 0)`` leaves the group and is not signalled. Where
     that group cannot be enforced, the route refuses ``probe unenforceable``. ``SIGCHLD`` ignored
-    is the same refusal, before ``fork``: the kernel would auto-reap the worker and a later
-    ``killpg`` could name a reused process-group id. Where another thread is alive, including a
-    ``_thread`` or native thread, it refuses ``probe threaded`` and does not fork. A thread started
+    or ``SA_NOCLDWAIT`` is the same refusal, before ``fork``: the kernel would auto-reap the
+    worker and a later ``killpg`` could name a reused process-group id. ``signal.getsignal``
+    does not show ``SA_NOCLDWAIT``; the flags come from ``sigaction``. Where another thread is
+    alive, including a ``_thread`` or native thread, it refuses ``probe threaded`` and does not
+    fork. A thread started
     after that check and before ``fork`` is still a race; refusing is what a non-picklable callable
     can do.
     """
@@ -561,6 +564,44 @@ def _reap_owned(pid: int) -> None:
             return
 
 
+_SA_NOCLDWAIT = 2
+_SIG_IGN_HANDLER = 1
+
+
+class _Sigaction(ctypes.Structure):
+    """Linux glibc ``struct sigaction``: handler, 1024-bit mask, flags, restorer."""
+
+    _fields_ = [
+        ("sa_handler", ctypes.c_void_p),
+        ("sa_mask", ctypes.c_ulong * 16),
+        ("sa_flags", ctypes.c_int),
+        ("sa_restorer", ctypes.c_void_p),
+    ]
+
+
+def _sigchld_auto_reaps() -> bool:
+    """True when the kernel collects ``SIGCHLD`` children without a ``wait``.
+
+    ``signal.getsignal`` returns ``SIG_DFL`` when ``SA_NOCLDWAIT`` is set through
+    ``sigaction``. ``SIG_IGN`` and that flag both drop the zombie, so the process-group
+    id can be reused. A failed read refuses: the probe cannot prove it owns the reap.
+    """
+
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.sigaction.argtypes = (
+            ctypes.c_int, ctypes.POINTER(_Sigaction), ctypes.POINTER(_Sigaction),
+        )
+        libc.sigaction.restype = ctypes.c_int
+        old = _Sigaction()
+        if libc.sigaction(signal.SIGCHLD, None, ctypes.byref(old)) != 0:
+            return True
+    except (AttributeError, OSError):
+        return True
+    handler = int(old.sa_handler or 0)
+    return handler == _SIG_IGN_HANDLER or bool(int(old.sa_flags) & _SA_NOCLDWAIT)
+
+
 def _probe_login_group(
     probe: Callable[[], bool], deadline: float, env: Mapping[str, str] | None,
 ) -> bool:
@@ -582,13 +623,14 @@ def _probe_login_group(
     outcome: dict[str, object] = {}
     started = time.monotonic()
     old_mask: set[int] | None = None
+    wait_bad = False
     try:
         try:
             # Held across fork, pidfd_open and the store of that fd, the group signals and our
             # reap. A handler cannot run in that window. SIG_IGN would still auto-reap, so it
             # refuses before the callable is acked.
             old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGCHLD})
-            if signal.getsignal(signal.SIGCHLD) is signal.SIG_IGN:
+            if _sigchld_auto_reaps():
                 raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe unenforceable")
             status_r, status_w = os.pipe()
             ack_r, ack_w = os.pipe()
@@ -625,6 +667,9 @@ def _probe_login_group(
             if pgid is None:
                 detail = "probe deadline" if reason == "deadline" else "probe failed"
                 outcome["refused"] = OwnLoopRouteRefused("copilot", "copilot_login_unknown", detail)
+            elif _leader_state(pidfd) == "error":
+                # waitid(P_PIDFD) is not usable. Do not ack, so the callable never runs.
+                outcome["refused"] = OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe unenforceable")
             else:
                 # The group id is recorded before the child is allowed to run the callable.
                 _write_ack(ack_w)
@@ -640,7 +685,7 @@ def _probe_login_group(
             outcome["error"] = exc
     finally:
         try:
-            _stop_probe(pid, pgid, started, deadline, pidfd)
+            wait_bad = _stop_probe(pid, pgid, started, deadline, pidfd)
         finally:
             if selector is not None:
                 selector.close()
@@ -656,6 +701,12 @@ def _probe_login_group(
                     signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
                 except OSError:
                     pass
+        if wait_bad and not isinstance(outcome.get("error"), (KeyboardInterrupt, SystemExit)):
+            outcome.pop("error", None)
+            outcome.pop("line", None)
+            outcome["refused"] = OwnLoopRouteRefused(
+                "copilot", "copilot_login_unknown", "probe unenforceable",
+            )
     return _finish_probe(outcome)
 
 
@@ -921,8 +972,13 @@ def _pidfd_send_signal_libc(pidfd: int, sig: int) -> None:
     raise OSError(err, os.strerror(err))
 
 
-def _leader_state(pidfd: int) -> str:
-    """``running``, ``zombie``, or ``reaped``. ``WNOWAIT`` observes the pidfd and does not reap."""
+def _leader_state(pidfd: int, bad: list[int] | None = None) -> str:
+    """``running``, ``zombie``, ``reaped``, or ``error``. ``WNOWAIT`` does not reap.
+
+    ``ECHILD`` is the only error that means the leader was collected. Any other
+    ``waitid`` error is ``error``: the group is still signalled, and ``bad`` records it
+    so the probe refuses.
+    """
 
     while True:
         try:
@@ -931,22 +987,27 @@ def _leader_state(pidfd: int) -> str:
             continue
         except ChildProcessError:
             return "reaped"
-        except OSError:
-            return "reaped"
+        except OSError as exc:
+            if exc.errno == errno.ECHILD:
+                return "reaped"
+            if bad is not None:
+                bad.append(exc.errno or 0)
+            return "error"
         return "zombie" if info is not None else "running"
 
 
-def _killpg_if_unreaped(pidfd: int, pgid: int | None, sig: int) -> None:
-    """``killpg`` only while ``waitid`` says the leader is still unreaped.
+def _killpg_if_unreaped(pidfd: int, pgid: int | None, sig: int, bad: list[int] | None = None) -> None:
+    """``killpg`` unless ``waitid`` says the leader was collected (``ECHILD``).
 
-    A reaped leader's process-group id can be reused, so this returns without signalling.
-    ``SIGCHLD`` is blocked by the caller across this check and the signal. This process's
-    group is never signalled. ``InterruptedError`` is retried.
+    A reaped leader's process-group id can be reused, so ``reaped`` returns without
+    signalling. Any other ``waitid`` error still signals: that failure is not proof the
+    leader is gone. ``SIGCHLD`` is blocked by the caller across this check and the signal.
+    This process's group is never signalled. ``InterruptedError`` is retried.
     """
 
     if pgid is None or pgid <= 1 or pgid == os.getpgrp():
         return
-    if _leader_state(pidfd) == "reaped":
+    if _leader_state(pidfd, bad) == "reaped":
         return
     while True:
         try:
@@ -958,32 +1019,32 @@ def _killpg_if_unreaped(pidfd: int, pgid: int | None, sig: int) -> None:
             return
 
 
-def _deliver(pidfd: int, pgid: int | None, sig: int) -> None:
-    """Signal the leader through its pidfd, then the group only if the leader is unreaped."""
+def _deliver(pidfd: int, pgid: int | None, sig: int, bad: list[int] | None = None) -> None:
+    """Signal the leader through its pidfd, then the group unless the leader was reaped."""
 
     _pidfd_send_signal(pidfd, sig)
-    _killpg_if_unreaped(pidfd, pgid, sig)
+    _killpg_if_unreaped(pidfd, pgid, sig, bad)
 
 
-def _deliver_forcing(pidfd: int, pgid: int | None, sig: int) -> None:
+def _deliver_forcing(pidfd: int, pgid: int | None, sig: int, bad: list[int] | None = None) -> None:
     """``_deliver`` that retries ``KeyboardInterrupt`` so the final signal still lands."""
 
     for _ in range(8):
         try:
-            _deliver(pidfd, pgid, sig)
+            _deliver(pidfd, pgid, sig, bad)
             return
         except KeyboardInterrupt:
             continue
-    _deliver(pidfd, pgid, sig)
+    _deliver(pidfd, pgid, sig, bad)
 
 
-def _group_alive(pidfd: int, pgid: int | None) -> bool:
+def _group_alive(pidfd: int, pgid: int | None, bad: list[int] | None = None) -> bool:
     """True when the leader is unreaped and ``killpg(0)`` sees a live member.
 
     The ``waitid`` check comes first, so a reaped leader is not passed to ``killpg``.
     """
 
-    if _leader_state(pidfd) == "reaped":
+    if _leader_state(pidfd, bad) == "reaped":
         return False
     if pgid is None or pgid <= 1 or pgid == os.getpgrp():
         return False
@@ -999,45 +1060,49 @@ def _group_alive(pidfd: int, pgid: int | None) -> bool:
             return True
 
 
-def _stop_probe(pid: int | None, pgid: int | None, started: float, deadline: float, pidfd: int | None) -> None:
+def _stop_probe(pid: int | None, pgid: int | None, started: float, deadline: float, pidfd: int | None) -> bool:
     """Signal the original process group confirmed by the handshake. The caller reaps after this.
 
-    The caller blocked SIGINT and SIGCHLD before ``fork`` and restores that mask with
-    ``SIG_SETMASK`` after this returns. This function does not unblock either signal. The
-    leader is signalled with ``pidfd_send_signal``. ``killpg`` runs only after
-    ``waitid(P_PIDFD, WNOHANG|WNOWAIT)`` shows that leader is still unreaped. Without a pidfd,
-    the identified pid is signalled only when ``waitid(P_PID)`` still says this process owns
-    it. SIGTERM, then SIGKILL if a live member is still in that process group when the grace
-    runs out. A descendant that calls setpgid(0, 0) leaves the process group and is not
-    signalled. This is not session cleanup: that descendant stays in the session. The grace is
-    at most 20% of the deadline, and never more than ``_PROBE_GRACE_S`` or past
-    ``started + deadline``. A zombie or reaped leader skips the grace. The direct child is not
-    reaped here. SIGKILL still runs when SIGTERM raises ``KeyboardInterrupt``.
+    Returns true when ``waitid(P_PIDFD)`` failed with anything other than ``ECHILD``. The
+    group is still signalled in that case; the caller refuses. The caller blocked SIGINT and
+    SIGCHLD before ``fork`` and restores that mask with ``SIG_SETMASK`` after this returns.
+    This function does not unblock either signal. The leader is signalled with
+    ``pidfd_send_signal``. ``killpg`` runs unless ``waitid`` reports ``ECHILD``. Without a
+    pidfd, the identified pid is signalled only when ``waitid(P_PID)`` still says this
+    process owns it. SIGTERM, then SIGKILL if a live member is still in that process group
+    when the grace runs out. A descendant that calls setpgid(0, 0) leaves the process group
+    and is not signalled. This is not session cleanup: that descendant stays in the session.
+    The grace is at most 20% of the deadline, and never more than ``_PROBE_GRACE_S`` or past
+    ``started + deadline``. A zombie or reaped leader skips the grace. The direct child is
+    not reaped here. SIGKILL still runs when SIGTERM raises ``KeyboardInterrupt``.
     """
 
     if pid is None or pid <= 0 or pid == os.getpid():
-        return
+        return False
     if pidfd is None:
         _signal_owned_pid(pid, signal.SIGKILL)
-        return
+        return False
+    bad: list[int] = []
     pending = False
     try:
-        _deliver(pidfd, pgid, signal.SIGTERM)
+        _deliver(pidfd, pgid, signal.SIGTERM, bad)
     except KeyboardInterrupt:
         pending = True
     finally:
-        if not pending and _leader_state(pidfd) == "running" and _group_alive(pidfd, pgid):
+        if not pending and _leader_state(pidfd, bad) == "running" and _group_alive(pidfd, pgid, bad):
             try:
                 remaining = (started + deadline) - time.monotonic()
                 grace = min(_kill_grace(deadline), max(0.0, remaining))
                 stop = time.monotonic() + grace
-                while time.monotonic() < stop and _leader_state(pidfd) == "running" and _group_alive(pidfd, pgid):
+                while (time.monotonic() < stop and _leader_state(pidfd, bad) == "running"
+                       and _group_alive(pidfd, pgid, bad)):
                     time.sleep(0.01)
             except KeyboardInterrupt:
                 pending = True
-        _deliver_forcing(pidfd, pgid, signal.SIGKILL)
+        _deliver_forcing(pidfd, pgid, signal.SIGKILL, bad)
     if pending:
         raise KeyboardInterrupt
+    return bool(bad)
 
 
 def _reap_probe(pid: int | None) -> None:
@@ -1080,7 +1145,8 @@ def _copilot_runtime_env(child: Mapping[str, str], home: str):
     ``COPILOT_HOME`` is ``<home>/.copilot``. A parent ``COPILOT_HOME`` or ``XDG_CONFIG_HOME`` does
     not select a different account. Copilot CLI >= 1.0.1 reads ``COPILOT_HOME`` and ignores
     ``XDG_CONFIG_HOME``. ``home`` is validated before ``.copilot`` is created, so an unsafe home
-    leaves no directory behind. A home containing NUL or a lone surrogate is ``home_unsafe``,
+    leaves no directory behind. A home containing NUL or a surrogate code point
+    (U+D800–U+DFFF, including the surrogateescape form of a real byte) is ``home_unsafe``,
     the same typed refusal as any other unsafe home. The directory is created mode ``0700`` when
     it is absent. An
     existing entry, including a symlink, is left in place and must already be a private directory.

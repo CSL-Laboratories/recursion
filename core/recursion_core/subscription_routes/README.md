@@ -153,12 +153,15 @@ PRODUCT.md `055cc7a5` section 3.3. `own_loop.py`, checked before any spawn or re
   otherwise the libc function. The parent blocks SIGINT and SIGCHLD from before `fork` until
   after the group is signalled and the direct child is reaped, then restores the previous mask
   with `SIG_SETMASK`. A signal the caller had already blocked stays blocked. SIGINT stays
-  blocked across `pidfd_open` and the store of that fd. `SIGCHLD` ignored (`SIG_IGN`) refuses
-  `probe unenforceable` before `fork`: the kernel would auto-reap, and blocking the signal does
-  not stop that. A custom SIGCHLD handler cannot run while the signal is blocked, so it cannot
-  collect the leader before the group is signalled. The leader is signalled with
-  `pidfd_send_signal`. `killpg` runs only while `waitid(P_PIDFD, WNOHANG|WNOWAIT)` shows that
-  leader is still unreaped. A failed `pidfd_open` signals that identified worker only when
+  blocked across `pidfd_open` and the store of that fd. Before `fork`, the probe reads the
+  real `SIGCHLD` disposition with `sigaction`. `SIG_IGN` or `SA_NOCLDWAIT` refuses
+  `probe unenforceable`: the kernel would auto-reap, `signal.getsignal` still reports
+  `SIG_DFL` for `SA_NOCLDWAIT`, and blocking the signal does not stop that auto-reap. A custom
+  SIGCHLD handler cannot run while the signal is blocked, so it cannot collect the leader
+  before the group is signalled. The leader is signalled with `pidfd_send_signal`.
+  `waitid(P_PIDFD)` is checked before the ack. `killpg` runs unless that `waitid` reports
+  `ECHILD`. Any other `waitid` error still signals the group and the probe refuses
+  `probe unenforceable`. A failed `pidfd_open` signals that identified worker only when
   `waitid` still shows it is this process's unreaped child. Cleanup does not scan the process
   list or signal any other child. Every exit, including a probe that returns true, signals that
   original process group: SIGTERM, then at most 20% of the deadline (never more than 200 ms)
@@ -170,7 +173,8 @@ PRODUCT.md `055cc7a5` section 3.3. `own_loop.py`, checked before any spawn or re
   `probe unenforceable` and does not leave a daemon thread running.
   The probe runs with the child's final environment: `HOME` is the route home and `COPILOT_HOME`
   is `<home>/.copilot`, created mode `0700` when absent and only after `home` itself is a private
-  directory. A home containing NUL or a lone surrogate is `home_unsafe`. An unsafe home leaves
+  directory. A home containing NUL or a surrogate code point (U+D800–U+DFFF) is `home_unsafe`.
+  An unsafe home leaves
   no `.copilot` behind. An existing `COPILOT_HOME` must be a
   private directory owned by this user, not a symlink and not world-accessible, the same rule as
   `HOME`. Copilot CLI >= 1.0.1 reads `COPILOT_HOME` (otherwise `~/.copilot`) and ignores

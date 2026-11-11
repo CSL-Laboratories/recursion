@@ -6,6 +6,7 @@ Fakes only: no engine, login store, provider, DNS or network is touched.
 from __future__ import annotations
 
 import atexit
+import ctypes
 import errno
 import os
 import resource
@@ -566,6 +567,74 @@ class CopilotTests(unittest.TestCase):
         self.assertEqual(killpg_calls, [])
         self.assertEqual(set(), _direct_children() - children)
 
+    def test_sa_nocldwait_refuses_before_the_callable(self) -> None:
+        # libc SA_NOCLDWAIT still reports SIG_DFL from signal.getsignal, and the kernel
+        # auto-reaps. The probe must refuse before fork and must not call killpg.
+        old = _Sigaction()
+        if _libc_sigaction(signal.SIGCHLD, None, old) != 0:
+            self.fail("sigaction")
+        new = _Sigaction()
+        new.sa_flags = _SA_NOCLDWAIT
+        if _libc_sigaction(signal.SIGCHLD, new, None) != 0:
+            self.fail("sigaction")
+        self.addCleanup(_libc_sigaction, signal.SIGCHLD, old, None)
+        self.assertIs(signal.getsignal(signal.SIGCHLD), signal.SIG_DFL)
+        children = _direct_children()
+        self.addCleanup(_kill_new_children, children)
+        ran: list[str] = []
+        killpg_calls: list[int] = []
+
+        def killpg(pgid: int, sig: int) -> None:
+            killpg_calls.append(sig)
+
+        with mock.patch.object(own_loop.os, "killpg", killpg):
+            with self.assertRaises(OwnLoopRouteRefused) as caught:
+                check_copilot_own_loop(
+                    copilot(), BASE, home=_route_home(),
+                    has_copilot_login=lambda: ran.append("ran") or True, probe_deadline=1.0,
+                )
+        self.assertEqual(caught.exception.cause, "copilot_login_unknown")
+        self.assertEqual(caught.exception.detail, "probe unenforceable")
+        self.assertEqual(ran, [])
+        self.assertEqual(killpg_calls, [])
+        self.assertEqual(set(), _direct_children() - children)
+
+    def test_pidfd_waitid_einval_kills_the_descendant_and_refuses(self) -> None:
+        # EINVAL is not ECHILD. The leader is still unreaped, so the group must be
+        # signalled, and the probe refuses.
+        real_waitid = os.waitid
+
+        def waitid(idtype: int, ident: int, options: int):
+            if idtype == os.P_PIDFD:
+                info = real_waitid(idtype, ident, options)
+                if info is not None:
+                    raise OSError(errno.EINVAL, "waitid")
+                return info
+            return real_waitid(idtype, ident, options)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            info_path = os.path.join(tmp, "child")
+
+            def probe() -> bool:
+                sleeper = os.fork()
+                if sleeper == 0:
+                    time.sleep(30)
+                    os._exit(0)
+                with open(info_path, "w", encoding="ascii") as handle:
+                    handle.write(f"{sleeper}\n")
+                return True
+
+            self.addCleanup(lambda: _stop_recorded(info_path))
+            with mock.patch.object(own_loop.os, "waitid", waitid):
+                with self.assertRaises(OwnLoopRouteRefused) as caught:
+                    check_copilot_own_loop(
+                        copilot(), BASE, home=_route_home(), has_copilot_login=probe, probe_deadline=1.0,
+                    )
+            self.assertEqual(caught.exception.detail, "probe unenforceable")
+            with open(info_path, encoding="ascii") as handle:
+                sleeper = int(handle.read().strip())
+            self.assertTrue(_process_not_running(sleeper))
+
     def test_pidfd_open_failure_does_not_signal_a_reaped_pid(self) -> None:
         # The numeric fallback must not run once the worker has already been collected.
         real_fork = os.fork
@@ -676,10 +745,20 @@ class CopilotTests(unittest.TestCase):
         self.assertEqual(caught.exception.cause, "home_unsafe")
 
     def test_a_surrogate_in_home_is_a_typed_refusal(self) -> None:
+        # U+DCFF is the surrogateescape spelling of the directory byte 0xff. The directory
+        # exists and is private; the surrogate is still refused before any filesystem call.
+        root = tempfile.mkdtemp(prefix="csl-surrogate-home-")
+        self.addCleanup(shutil.rmtree, root, True)
+        os.chmod(root, 0o700)
+        raw = os.path.join(os.fsencode(root), b"\xff")
+        os.mkdir(raw, 0o700)
+        home = os.fsdecode(raw)
+        self.assertIn("\udcff", home)
         with self.assertRaises(EnvRefused) as caught:
-            check_copilot_own_loop(copilot(), BASE, home="/tmp/bad\udcff", has_copilot_login=lambda: True)
+            check_copilot_own_loop(copilot(), BASE, home=home, has_copilot_login=lambda: True)
         self.assertEqual(caught.exception.name, "HOME")
         self.assertEqual(caught.exception.cause, "home_unsafe")
+        self.assertFalse(os.path.lexists(os.path.join(raw, b".copilot")))
 
     def test_check_without_a_route_home_refuses(self) -> None:
         # Ambient account A must not approve a later child that selects account B.
@@ -1061,6 +1140,31 @@ class DoctorTests(unittest.TestCase):
             got = nous_proxy_doctor(url)
             self.assertEqual(len(got["warnings"]), 1)
             self.assertTrue(got["warnings"][0].startswith("host users unknown"))
+
+
+_SA_NOCLDWAIT = 2
+
+
+class _Sigaction(ctypes.Structure):
+    _fields_ = [
+        ("sa_handler", ctypes.c_void_p),
+        ("sa_mask", ctypes.c_ulong * 16),
+        ("sa_flags", ctypes.c_int),
+        ("sa_restorer", ctypes.c_void_p),
+    ]
+
+
+def _libc_sigaction(signum: int, new: _Sigaction | None, old: _Sigaction | None) -> int:
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.sigaction.argtypes = (
+        ctypes.c_int, ctypes.POINTER(_Sigaction), ctypes.POINTER(_Sigaction),
+    )
+    libc.sigaction.restype = ctypes.c_int
+    return libc.sigaction(
+        signum,
+        ctypes.byref(new) if new is not None else None,
+        ctypes.byref(old) if old is not None else None,
+    )
 
 
 def _open_fds() -> set[str]:

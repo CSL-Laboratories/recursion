@@ -777,8 +777,11 @@ def _wildcard_intersects_suffix(entry: str, pattern: re.Pattern[str], suffix: st
 
 
 def _private_dir(path: str | None) -> bool:
-    # NUL reaches ``lstat`` as ValueError. A lone surrogate fails while the path is encoded.
-    # Both are an unsafe home, not an exception for the caller to see.
+    # A code point in U+D800–U+DFFF is refused before any filesystem call. U+DCFF is the
+    # surrogateescape form of the byte 0xff, and a private directory of that byte name would
+    # otherwise be accepted. NUL reaches ``lstat`` as ValueError.
+    if isinstance(path, str) and any(0xD800 <= ord(char) <= 0xDFFF for char in path):
+        return False
     try:
         return _private_dir_is(path)
     except (ValueError, UnicodeError):

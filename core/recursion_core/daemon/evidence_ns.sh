@@ -8,10 +8,10 @@
 # "host precondition stubbed: operator Linger (no logind on box)". Product code is not
 # changed by that; the stub is a file on the harness PATH only.
 #
-# Usage: evidence_ns.sh [output directory]
+# Usage: evidence_ns.sh [output directory]   (default: ./evidence-S12 in the current directory)
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-OUT="${1:-/dev/shm/nov11/out/evidence-S12}"
+OUT="${1:-$PWD/evidence-S12}"
 mkdir -p "$OUT"
 : "${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR must be set}"
 
@@ -51,4 +51,12 @@ fi
 # private runtime directory, which disappears with this namespace.
 python3.13 -B "$HERE/evidence_e2e.py" --out "$OUT" --linger-stubbed \
     --exec-dir "$XDG_RUNTIME_DIR/recursion-evidence" 2>&1 | tee "$OUT/harness.log"
-exit "${PIPESTATUS[0]}"
+harness_status="${PIPESTATUS[0]}"
+
+# The one unit test that needs a real user manager (it skips with a reason everywhere else).
+PYTHONPATH="$HERE/../.." python3.13 -B -m unittest -v \
+    recursion_core.daemon.tests.test_composition.RealUserManagerTest >"$OUT/real-user-manager-test.log" 2>&1
+test_status=$?
+tail -n 4 "$OUT/real-user-manager-test.log"
+[ "$harness_status" -eq 0 ] && [ "$test_status" -eq 0 ]
+exit $?

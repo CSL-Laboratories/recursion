@@ -207,11 +207,15 @@ class RouteStarter:
                     log.exception('route request for %s failed', ctx.run_id)
                     result = route_contract.result(ctx.run_id, route_contract.ENGINE_ERROR,
                                                    detail=f'route failure: {type(exc).__name__}')
-            if ctx.process is not None:
+            closing = getattr(self._daemon, 'closed', False)  # shutdown: the run is left to the next daemon
+            if ctx.process is not None and not closing:
                 self._record_result(ctx.run_id, result)
             ctx.finished(result)
             if ctx.process is not None:
-                self._settle(ctx)
+                if closing:
+                    ctx.process.close()
+                else:
+                    self._settle(ctx)
         finally:
             with self._lock:
                 self._active.pop(ctx.run_id, None)
@@ -237,6 +241,8 @@ class RouteStarter:
         try:
             deadline = time.monotonic() + self._exit_grace_s
             while time.monotonic() < deadline:
+                if getattr(self._daemon, 'closed', False):
+                    return  # the daemon is shutting down; it never stops a run on its way out
                 try:
                     if self._daemon.reconcile(ctx.run_id).state in TERMINAL:
                         return
@@ -367,9 +373,11 @@ class DaemonControl:
 
     def _reconcile_one(self, rec, row):
         run_id = rec['run_id']
-        if row is False or self.starter.active(run_id):
+        if row is False:
             return
         if rec.get('state') == 'starting' and not rec.get('cgroup'):
+            if self.starter.active(run_id):
+                return  # this process is still launching it; the start records its own outcome
             if row is None:
                 rec['state'] = 'start_failed'
                 self.registry.put(rec)

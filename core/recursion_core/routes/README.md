@@ -113,7 +113,9 @@ anything; no real limit capture has gone through it.
 
 ## Candidate and unwired
 
-- No daemon calls `RouteService` yet; no real launcher (cgroup v2 leaf + pidfd) is in this module.
+- The daemon calls `RouteService` for Claude Code and Codex with a real launcher
+  (`recursion_core/daemon/launcher.py`, a transient user unit and a pidfd; see `daemon/README.md`,
+  "Composition"). No real launcher is in this module, and Pi, Hermes and OpenCode are not wired.
 - Vendor field and option names marked "unverified" in the code were not read from vendor source
   (Claude `rate_limit_info` inner fields, Codex method names beyond `account/rateLimits/*`,
   `codexErrorInfo` values). `check_for_update_on_startup` was read in openai/codex source at

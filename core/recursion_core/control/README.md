@@ -103,6 +103,13 @@ No daemon serves this API yet, no MCP transport is implemented, the CLI has no p
 API client factory is injected) and no real cleanup layer is wired. Nothing here talks to a real Codex or
 Claude Code client, a provider or the network; tests use fakes only.
 
+**Update (CSL-738 composition).** The daemon now builds this API itself:
+`recursion_core/daemon/control_adapter.py` constructs `ControlAPI` over a durable registry and the
+daemon's cleanup layer and serves it on the owner-only Unix socket. `python -m recursion_core.control`
+is the packaged CLI entry point; its API factory is `control/client.py` `SocketAPI`, and with the daemon
+down it answers `control_api_unavailable` (exit 1). See `daemon/README.md`, "Composition". The Control
+MCP transport is still not implemented. The paragraph below is the state before that composition.
+
 **Not built here, owner not assigned: the daemon adapter.** This PR does not build the production
 adapter that makes the daemon (recursion #324, CSL-738) construct a `ControlAPI`, hand its client to
 this CLI, and give the GUI a device/pairing door onto it. #324's body says #327 owns that adapter; this

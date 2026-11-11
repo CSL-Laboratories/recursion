@@ -127,9 +127,70 @@ Workload checkpoint and restart after reboot is not implemented.
   `user@.service` restart), it stops the run units too. Linger is the guard.
 - Fake-manager tests only. Live restart, `kill -9`, supervisor death, reboot,
   last-SSH-session and the 8 lifecycle cases on a real host remain founder work.
-- No control API, provider launch route or token file here; this lifts no R2a,
-  account or spend gate. The same-uid beta is not a security boundary against a
+- The control API and the launch route are composed in (see "Composition" below);
+  this lifts no R2a, account or spend gate. The same-uid beta is not a security boundary against a
   hostile process of that uid.
+
+## Composition: control API, launcher and surfaces
+
+Spec: PRODUCT.md d84cdd26 (CSLR-D-012), section 3.1 (lines 457-469: one daemon per user, runs
+survive the daemon, runs live outside its unit), section 3.4 S6 (line 888) and section 11.3
+(lines 3039-3041: the #916 procedure).
+
+`python3.14t -X gil=0 -m recursion_core.daemon` composes, after its startup sweep:
+
+- **Control API on a Unix socket.** `control_adapter.compose_control` builds
+  `control.api.ControlAPI` and serves it with `control_transport.UnixControlServer` at
+  `$XDG_RUNTIME_DIR/recursion/control.sock` (directory 0700, socket 0600, peer uid checked
+  on both ends). A peer whose cgroup is a `recursion-run-*` unit, or cannot be read, is
+  refused (`scope_refused`): the uid check alone would let an engine child stop or start
+  runs. Finer scopes do not exist yet.
+- **CLI.** `python -m recursion_core.control list|status|stop|start|conditions` talks to that
+  socket. Daemon down: `{"code": "control_api_unavailable", "delivered": false}`, exit 1.
+- **Durable run records.** `DurableRunRegistry` keeps the control API's records
+  (compare-and-swap, attested Stop, start keys) in `runs.sqlite3`, table `control_runs`,
+  written with the registry's own fsync, rename and directory-fsync steps.
+- **Launcher.** `launcher.ProductionLauncher` is the launcher the Claude Code and Codex
+  route adapters call. One run is one `recursion-run-<run id>.service` transient user unit
+  (`engine_user.SPAWN_PATH`). Its environment is what `child_env.build_child_env` accepts
+  from the adapter's environment (route-owned HOME under
+  `$XDG_STATE_HOME/recursion/homes/<engine>`); it reaches the engine through a FIFO and
+  `engine_exec.py`, never through argv or a unit property. stdout and stderr are files in
+  `$XDG_STATE_HOME/recursion/runs/<run id>/`, so a dead daemon never gives the engine a
+  broken pipe; stdin is a FIFO.
+- **Stop.** Units carry `KillSignal=SIGINT`, `TimeoutStopSec=2s`, `KillMode=control-group`,
+  so `systemctl --user stop` is the #916 procedure. `run.stop` records the Stop intent,
+  stops the unit and answers `stopped` only when the sweep attested the tree gone; anything
+  else is `pending` with a reason. A deadline or protocol error fences the run the same way.
+- **Restart.** After the startup sweep, `DaemonControl.reconcile` finishes any Stop the
+  registry recorded but the control record did not, records the cgroup of a launch the
+  previous daemon did not finish recording, and marks a start that never reached a unit
+  `start_failed`. It runs again after every sweep.
+- **What a surface reads.** `run.status` and `run.list` add `observed` (the unit's last
+  observed state). A record that says `running` while the unit was attested ended reads
+  `state: "ended"` (`"lost_reboot"` after a reboot, `"unknown"` when the unit could not be
+  observed) with the stored word in `recorded_state`. `run.status` also carries the tail
+  of the engine's stdout (`output`) and the route result (`result`).
+- **GUI.** The loopback GUI gets the same object as its client and a real door:
+  `DeviceDoor` accepts only `Authorization: Bearer <token>` or the `recursion_device`
+  cookie matching a per-start random token in
+  `$XDG_RUNTIME_DIR/recursion/gui-device-token` (0600). Its Stop is `run.stop`. The route
+  inventory and the O7 reads answer "not implemented"; the page says so.
+- **Routes.** `$XDG_CONFIG_HOME/recursion/routes.json` (operator-owned, not group or other
+  writable) names the route per engine: `{"routes": {"claude_code": {"model": ...,
+  "connection": {"kind": "subscription", "id": ...}, "api_key_helper": "absent",
+  "deadline_s": 3600, "binary": "/abs/path/claude"}}}`. Nothing is defaulted: an engine
+  with no entry answers `start_failed` / `route_not_configured`.
+
+Not done: credential custody (an API-key route refuses, `no credential`), Pi, Hermes and
+OpenCode, the Control MCP transport, a browser pairing step for the device token, a second
+launch per run (a fallback route refuses `run_already_launched`), re-attaching the route
+driver to a run that outlived a daemon (its output file keeps growing and is readable; its
+route result is not produced), and a durable breaker (the route breaker is in memory).
+
+Evidence: `evidence_ns.sh` runs `evidence_e2e.py`, which drives the real daemon and CLI
+against a real `systemd --user` manager with a stand-in engine
+(`evidence_standin_engine.py`): start, stream, inspect, Stop, cleanup, restart.
 
 ## B14: a recorded Stop survives a daemon crash (kill -9 cells)
 

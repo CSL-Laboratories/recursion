@@ -45,7 +45,8 @@ What refuses:
   `.config/claude`) and no Pi, Hermes or OpenCode state or login entry (`.pi`, `.hermes`,
   `.local/share/opencode`, `.config/opencode`, `.codex/auth.json`). So the route home must
   hold none of these at spawn. A surrogate code point (U+D800–U+DFFF) in that home, the
-  child `HOME`, or an operator home refuses `home_unsafe` before `realpath` or `lstat`.
+  child `HOME`, an operator home, or the passwd home refuses `home_unsafe` before `realpath`
+  or `lstat`. A surrogate `owned_hermes_home` refuses `requirements_malformed` before `realpath`.
   Otherwise checked with `lstat` only; no credential file is opened.
   One exception, for Hermes routes only: a `.hermes` directory that holds nothing but the
   `config.yaml` an earlier launch in this home wrote, or (API-key Hermes route) nothing at
@@ -157,7 +158,9 @@ PRODUCT.md `055cc7a5` section 3.3. `own_loop.py`, checked before any spawn or re
   with `SIG_SETMASK`. A signal the caller had already blocked stays blocked. SIGINT stays
   blocked across `pidfd_open` and the store of that fd. Before `fork`, and only on Linux LP64
   x86_64 or aarch64 with glibc or musl, the probe reads the real `SIGCHLD` disposition with
-  `sigaction` into a 256-byte buffer. Any other platform, word size, machine or C library
+  `sigaction` into a 256-byte buffer. musl is only the mapped basename
+  `ld-musl-<machine>.so.1` or `libc.musl-<machine>.so.1` for this machine. Any other platform,
+  word size, machine or C library
   refuses `probe unenforceable` without calling `libc`. `SIG_IGN` or `SA_NOCLDWAIT` refuses
   the same way: the kernel would auto-reap, `signal.getsignal` still reports `SIG_DFL` for
   `SA_NOCLDWAIT`, and blocking the signal does not stop that auto-reap. A custom

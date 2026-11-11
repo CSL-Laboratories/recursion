@@ -36,6 +36,7 @@ import ipaddress
 import math
 import os
 import platform
+import re
 import selectors
 import signal
 import subprocess
@@ -520,40 +521,54 @@ def _probe_login(probe: Callable[[], bool], deadline: float, env: Mapping[str, s
 
 
 def _pid_state(pid: int) -> str:
-    """``running``, ``zombie``, or ``reaped`` for a direct child. ``WNOWAIT`` does not reap."""
+    """``running``, ``zombie``, ``reaped``, or ``unknown``. ``WNOWAIT`` does not reap.
+
+    ``ECHILD`` is the only error that means this process does not own the pid. Any other
+    ``waitid`` error is ``unknown``: the caller still signals that pid and the probe refuses.
+    """
 
     while True:
         try:
             info = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
         except InterruptedError:
             continue
-        except OSError:
+        except ChildProcessError:
             return "reaped"
+        except OSError as exc:
+            if exc.errno == errno.ECHILD:
+                return "reaped"
+            return "unknown"
         return "zombie" if info is not None else "running"
 
 
-def _signal_owned_pid(pid: int, sig: int) -> None:
+def _signal_owned_pid(pid: int, sig: int) -> bool:
     """Signal one identified child only while ``waitid`` still says this process owns it.
 
-    A reaped pid is not signalled: that number can already belong to another process. ``SIGCHLD``
-    is blocked and is not ignored for the whole probe, so a child this sees as unreaped cannot
-    be collected between the check and the signal. ``KeyboardInterrupt`` is retried.
+    Returns true when ``waitid(P_PID)`` failed for a reason other than ``ECHILD``. The pid is
+    still signalled in that case. A reaped pid is not signalled: that number can already belong
+    to another process. ``SIGCHLD`` is blocked and is not ignored for the whole probe, so a
+    child this sees as unreaped cannot be collected between the check and the signal.
+    ``KeyboardInterrupt`` is retried.
     """
 
-    if pid <= 0 or pid == os.getpid() or _pid_state(pid) == "reaped":
-        return
+    if pid <= 0 or pid == os.getpid():
+        return False
+    state = _pid_state(pid)
+    if state == "reaped":
+        return False
     for _ in range(8):
         try:
             os.kill(pid, sig)
-            return
+            return state == "unknown"
         except KeyboardInterrupt:
             continue
         except OSError:
-            return
+            return state == "unknown"
     try:
         os.kill(pid, sig)
     except OSError:
         pass
+    return state == "unknown"
 
 
 def _reap_owned(pid: int) -> None:
@@ -574,6 +589,9 @@ _SIG_IGN_HANDLER = 1
 _SIGACTION_BYTES = 256
 _SA_FLAGS_OFFSET = 8 + 128
 _SIGACTION_MACHINES = frozenset({"x86_64", "aarch64"})
+# The mapped file's basename, not a substring of the path. A notes file named
+# libc.musl-notes.txt is not musl. Two architectures at once is ambiguous.
+_MUSL_BASENAME = re.compile(rb"^(?:ld-musl-(x86_64|aarch64)|libc\.musl-(x86_64|aarch64))\.so\.1$")
 
 
 def _sigaction_abi_supported() -> bool:
@@ -590,8 +608,29 @@ def _sigaction_abi_supported() -> bool:
     return _libc_family() in {"glibc", "musl"}
 
 
+def _mapped_basenames(blob: bytes) -> list[bytes]:
+    """Basenames of file mappings. ``[heap]`` and a trailing ``(deleted)`` are not names."""
+
+    names: list[bytes] = []
+    for line in blob.splitlines():
+        parts = line.split(None, 5)
+        if len(parts) < 6:
+            continue
+        path = parts[5]
+        if path.endswith(b" (deleted)"):
+            path = path[: -len(b" (deleted)")]
+        if not path or path.startswith(b"["):
+            continue
+        names.append(path.rsplit(b"/", 1)[-1])
+    return names
+
+
 def _libc_family() -> str | None:
-    """``glibc`` or ``musl`` when this process can be told apart from any other C library."""
+    """``glibc`` or ``musl`` when this process can be told apart from any other C library.
+
+    musl is the basename ``ld-musl-<machine>.so.1`` or ``libc.musl-<machine>.so.1`` for this
+    machine only. Any other spelling, or both machines, is not musl.
+    """
 
     try:
         version = os.confstr("CS_GNU_LIBC_VERSION")
@@ -604,7 +643,13 @@ def _libc_family() -> str | None:
             blob = handle.read(4 * 1024 * 1024)
     except OSError:
         return None
-    if b"ld-musl-" in blob or b"libc.musl" in blob:
+    arches: set[bytes] = set()
+    for name in _mapped_basenames(blob):
+        match = _MUSL_BASENAME.fullmatch(name)
+        if match is not None:
+            arches.add(next(group for group in match.groups() if group is not None))
+    machine = platform.machine().encode()
+    if arches == {machine}:
         return "musl"
     return None
 
@@ -1053,9 +1098,17 @@ def _killpg_if_unreaped(pidfd: int, pgid: int | None, sig: int, bad: list[int] |
 
 
 def _deliver(pidfd: int, pgid: int | None, sig: int, bad: list[int] | None = None) -> None:
-    """Signal the leader through its pidfd, then the group unless the leader was reaped."""
+    """Signal the leader through its pidfd, then the group unless the leader was reaped.
 
-    _pidfd_send_signal(pidfd, sig)
+    An ``OSError`` from the pidfd signal is recorded and does not skip ``killpg``. The group
+    is still signalled, and the caller refuses.
+    """
+
+    try:
+        _pidfd_send_signal(pidfd, sig)
+    except OSError as exc:
+        if bad is not None:
+            bad.append(exc.errno or 0)
     _killpg_if_unreaped(pidfd, pgid, sig, bad)
 
 
@@ -1113,8 +1166,7 @@ def _stop_probe(pid: int | None, pgid: int | None, started: float, deadline: flo
     if pid is None or pid <= 0 or pid == os.getpid():
         return False
     if pidfd is None:
-        _signal_owned_pid(pid, signal.SIGKILL)
-        return False
+        return _signal_owned_pid(pid, signal.SIGKILL)
     bad: list[int] = []
     pending = False
     try:

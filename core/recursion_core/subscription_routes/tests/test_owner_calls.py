@@ -137,6 +137,23 @@ class SurrogateHomeTests(_Calls):
                 operator_home=str(self.operator),
             )
 
+    def test_a_passwd_surrogate_and_an_owned_hermes_home_are_refused_before_realpath(self) -> None:
+        bad = "/tmp/\udcff"
+        with mock.patch.object(policy.pwd, "getpwuid", return_value=mock.Mock(pw_dir=bad)), \
+                mock.patch.object(policy.os.path, "realpath", side_effect=lambda path: path) as resolve:
+            with self.assertRaises(SubscriptionRouteRefused) as caught:
+                policy._check_home("opencode", {"HOME": "/missing-route"}, "/missing-route", {}, None)
+        self.assertEqual("home_unsafe", caught.exception.cause)
+        self.assertFalse(any(call.args[0] == bad for call in resolve.call_args_list))
+        checked = policy._checked_requirements(
+            "hermes", RouteRequirements(owned_hermes_home="/tmp/\ud800"), False,
+        )
+        with mock.patch.object(policy.os.path, "realpath", side_effect=AssertionError("realpath")):
+            with self.assertRaises(SubscriptionRouteRefused) as owned:
+                policy._check_hermes_home("hermes", "/tmp/route", checked)
+        self.assertEqual("requirements_malformed", owned.exception.cause)
+        self.assertEqual("owned_hermes_home", owned.exception.detail)
+
 
 @unittest.skipIf(os.name == "nt", "POSIX links and home checks")
 class PackageLinkTests(_Calls):

@@ -13,6 +13,7 @@ import resource
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -72,10 +73,48 @@ class SigactionAbiTests(unittest.TestCase):
             with mock.patch.object(own_loop.ctypes, "sizeof", side_effect=sizeof):
                 self.assertTrue(own_loop._sigchld_auto_reaps())
 
+    def test_a_musl_notes_file_is_not_musl_and_two_architectures_are_ambiguous(self) -> None:
+        notes = b"1000-2000 r--p 00000000 00:00 0 /tmp/libc.musl-notes.txt\n"
+        both = (
+            b"1000-2000 r-xp 00000000 00:00 0 /lib/ld-musl-x86_64.so.1\n"
+            b"2000-3000 r-xp 00000000 00:00 0 /lib/ld-musl-aarch64.so.1\n"
+        )
+        exact = b"1000-2000 r-xp 00000000 00:00 0 /lib/ld-musl-x86_64.so.1\n"
+        with mock.patch.object(own_loop.os, "confstr", return_value=None), \
+                mock.patch.object(own_loop.sys, "platform", "linux"), \
+                mock.patch.object(own_loop.platform, "machine", return_value="x86_64"), \
+                mock.patch.object(own_loop.ctypes, "sizeof", return_value=8):
+            with mock.patch("builtins.open", mock.mock_open(read_data=notes)):
+                self.assertFalse(own_loop._sigaction_abi_supported())
+            with mock.patch("builtins.open", mock.mock_open(read_data=both)):
+                self.assertFalse(own_loop._sigaction_abi_supported())
+            with mock.patch("builtins.open", mock.mock_open(read_data=exact)):
+                self.assertEqual(own_loop._libc_family(), "musl")
+                self.assertTrue(own_loop._sigaction_abi_supported())
+
+    def test_native_cases_skip_when_the_sigaction_abi_is_unverified(self) -> None:
+        case = CopilotTests("test_sa_nocldwait_refuses_before_the_callable")
+        with mock.patch.object(own_loop, "_probe_enforceable", return_value=True), \
+                mock.patch.object(own_loop, "_sigaction_abi_supported", return_value=False):
+            with self.assertRaises(unittest.SkipTest):
+                case.setUp()
+
+    def test_a_pid_waitid_error_is_not_treated_as_reaped(self) -> None:
+        with mock.patch.object(own_loop.os, "waitid", side_effect=OSError(errno.EINVAL, "waitid")):
+            self.assertEqual(own_loop._pid_state(123456), "unknown")
+
+    def test_a_pidfd_signal_error_still_signals_the_group(self) -> None:
+        with mock.patch.object(own_loop, "_pidfd_send_signal", side_effect=OSError(errno.ENOSYS, "pidfd")), \
+                mock.patch.object(own_loop, "_leader_state", return_value="zombie"), \
+                mock.patch.object(own_loop.os, "killpg") as group, \
+                mock.patch.object(own_loop.os, "getpgrp", return_value=20):
+            self.assertTrue(own_loop._stop_probe(123456, 123456, 0, 1, 100))
+        self.assertTrue(any(call.args[1] == signal.SIGKILL for call in group.call_args_list))
+
 
 class CopilotTests(unittest.TestCase):
     def setUp(self) -> None:
-        if not own_loop._probe_enforceable():
+        if not own_loop._probe_enforceable() or not own_loop._sigaction_abi_supported():
             self.skipTest("login probe cannot be enforced on this platform")
 
     def refused(self, cause: str, route: object, env: dict | None = None, probe=lambda: True) -> None:
@@ -591,14 +630,11 @@ class CopilotTests(unittest.TestCase):
     def test_sa_nocldwait_refuses_before_the_callable(self) -> None:
         # libc SA_NOCLDWAIT still reports SIG_DFL from signal.getsignal, and the kernel
         # auto-reaps. The probe must refuse before fork and must not call killpg.
-        old = _Sigaction()
-        if _libc_sigaction(signal.SIGCHLD, None, old) != 0:
-            self.fail("sigaction")
-        new = _Sigaction()
-        new.sa_flags = _SA_NOCLDWAIT
-        if _libc_sigaction(signal.SIGCHLD, new, None) != 0:
-            self.fail("sigaction")
-        self.addCleanup(_libc_sigaction, signal.SIGCHLD, old, None)
+        old = _read_sigaction(signal.SIGCHLD)
+        new = bytearray(_SIGACTION_BYTES)
+        new[_SA_FLAGS_OFFSET:_SA_FLAGS_OFFSET + 4] = _SA_NOCLDWAIT.to_bytes(4, sys.byteorder)
+        _write_sigaction(signal.SIGCHLD, bytes(new))
+        self.addCleanup(_write_sigaction, signal.SIGCHLD, old)
         self.assertIs(signal.getsignal(signal.SIGCHLD), signal.SIG_DFL)
         children = _direct_children()
         self.addCleanup(_kill_new_children, children)
@@ -1233,28 +1269,35 @@ class DoctorTests(unittest.TestCase):
 
 
 _SA_NOCLDWAIT = 2
+_SIGACTION_BYTES = 256
+_SA_FLAGS_OFFSET = 136
 
 
-class _Sigaction(ctypes.Structure):
-    _fields_ = [
-        ("sa_handler", ctypes.c_void_p),
-        ("sa_mask", ctypes.c_ulong * 16),
-        ("sa_flags", ctypes.c_int),
-        ("sa_restorer", ctypes.c_void_p),
-    ]
+def _sigaction_buffer(raw: bytes) -> ctypes.Array:
+    if _SIGACTION_BYTES < 128:
+        raise AssertionError("sigaction buffer")
+    if not own_loop._sigaction_abi_supported():
+        raise unittest.SkipTest("sigaction ABI is not verified")
+    return ctypes.create_string_buffer(raw.ljust(_SIGACTION_BYTES, b"\0")[:_SIGACTION_BYTES])
 
 
-def _libc_sigaction(signum: int, new: _Sigaction | None, old: _Sigaction | None) -> int:
+def _libc_sigaction(signum: int, new: bytes | None, old: ctypes.Array | None) -> int:
     libc = ctypes.CDLL(None, use_errno=True)
-    libc.sigaction.argtypes = (
-        ctypes.c_int, ctypes.POINTER(_Sigaction), ctypes.POINTER(_Sigaction),
-    )
+    libc.sigaction.argtypes = (ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
     libc.sigaction.restype = ctypes.c_int
-    return libc.sigaction(
-        signum,
-        ctypes.byref(new) if new is not None else None,
-        ctypes.byref(old) if old is not None else None,
-    )
+    return libc.sigaction(signum, _sigaction_buffer(new) if new is not None else None, old)
+
+
+def _read_sigaction(signum: int) -> bytes:
+    old = _sigaction_buffer(b"")
+    if _libc_sigaction(signum, None, old) != 0:
+        raise OSError("sigaction")
+    return bytes(old.raw)
+
+
+def _write_sigaction(signum: int, raw: bytes) -> None:
+    if _libc_sigaction(signum, raw, None) != 0:
+        raise OSError("sigaction")
 
 
 def _open_fds() -> set[str]:

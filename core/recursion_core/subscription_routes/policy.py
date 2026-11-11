@@ -570,8 +570,8 @@ def _check_home(
     """The child's home is route-owned, private, not the operator's, and holds no store or engine state entry.
 
     ``own`` lists the engine's own login store entries a subscription sign-in may keep there.
-    A surrogate in the route home, the child HOME, or an operator home is ``home_unsafe``
-    before ``realpath`` or ``lstat``.
+    A surrogate in the route home, the child HOME, an operator home, or the passwd home is
+    ``home_unsafe`` before ``realpath`` or ``lstat``.
     """
 
     if os.name == "nt":
@@ -583,8 +583,11 @@ def _check_home(
         raise SubscriptionRouteRefused(engine, "route_home_missing")
     if env.get("HOME") != route_home:
         raise SubscriptionRouteRefused(engine, "child_home_not_route_home")
+    homes = _operator_homes(parent_env, operator_home)
+    if any(_surrogate(path) for path in homes):
+        raise SubscriptionRouteRefused(engine, "home_unsafe")
     real = os.path.realpath(route_home)
-    operator = {os.path.realpath(path) for path in _operator_homes(parent_env, operator_home)}
+    operator = {os.path.realpath(path) for path in homes}
     # A home of "/" must not use the prefix "/": that matches every absolute path, so a
     # container whose passwd home is missing (HOME=/) could launch no route.
     if any(_operator_contains(real, home) for home in operator):
@@ -740,6 +743,7 @@ def _checked_requirements(engine: str | None, requirements: object, full_access_
     owned = requirements.owned_hermes_home
     if owned is not None and (not isinstance(owned, str) or "\x00" in owned or not os.path.isabs(owned)):
         raise SubscriptionRouteRefused(engine, "requirements_malformed", "owned_hermes_home")
+    # A surrogate is requirements_malformed in _check_hermes_home, before realpath.
     return _Checked(targets, frozenset(options), owned, full_access_acknowledged is True)
 
 
@@ -978,6 +982,8 @@ def _check_hermes_home(engine: str, route_home: str, checked: _Checked) -> None:
 
     if engine != "hermes":
         return
+    if _surrogate(checked.owned_hermes_home):
+        raise SubscriptionRouteRefused(engine, "requirements_malformed", "owned_hermes_home")
     if checked.owned_hermes_home is not None and os.path.realpath(checked.owned_hermes_home) != os.path.realpath(route_home):
         raise SubscriptionRouteRefused(engine, "hermes_home_not_owned")
     _hermes_config_is_ours(engine, route_home)

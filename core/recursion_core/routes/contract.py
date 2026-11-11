@@ -347,54 +347,30 @@ _ESCAPE_PASSES = 8
 _PCT = re.compile(r"%([0-9a-fA-F]{2})")
 
 
-def _decode_layer(value: str) -> tuple[str, list[tuple[int, int]], bool]:
-    """Decode one layer of ``\\uXXXX`` and ``\\/``. Each output character maps into ``value``."""
+def _port_end(text: str, index: int) -> int | None:
+    """Index of the delimiter after a numeric port, or the text length when the digits run to the end.
 
-    out: list[str] = []
-    spans: list[tuple[int, int]] = []
-    index = 0
-    length = len(value)
-    changed = False
+    ``None`` means this colon is not a port: no digits, or the digits are followed by something
+    other than an end-delimiter (so ``user:8080@host`` is still a password).
+    """
+
+    saw_digit = False
+    length = len(text)
     while index < length:
-        if value.startswith("\\/", index):
-            out.append("/")
-            spans.append((index, index + 2))
-            index += 2
-            changed = True
+        token = _read_logical(text, index)
+        if token is None:
+            break
+        char, end, raw, _bad = token
+        if end <= index:
+            end = index + 1
+        if raw and char.isdecimal():
+            saw_digit = True
+            index = end
             continue
-        match = _JSON_U.match(value, index)
-        if match is not None:
-            out.append(chr(int(match.group(1), 16)))
-            spans.append((match.start(), match.end()))
-            index = match.end()
-            changed = True
-            continue
-        out.append(value[index])
-        spans.append((index, index + 1))
-        index += 1
-    return "".join(out), spans, changed
-
-
-def _decode_pct_layer(value: str) -> tuple[str, list[tuple[int, int]], bool]:
-    """Decode one layer of ``%HH``. Each output character maps to three source characters, or one."""
-
-    out: list[str] = []
-    spans: list[tuple[int, int]] = []
-    index = 0
-    length = len(value)
-    changed = False
-    while index < length:
-        match = _PCT.match(value, index)
-        if match is not None:
-            out.append(chr(int(match.group(1), 16)))
-            spans.append((match.start(), match.end()))
-            index = match.end()
-            changed = True
-            continue
-        out.append(value[index])
-        spans.append((index, index + 1))
-        index += 1
-    return "".join(out), spans, changed
+        if saw_digit and char in _END_CHARS:
+            return index
+        return None
+    return index if saw_digit else None
 
 
 def _hex_at(text: str, index: int) -> int | None:
@@ -505,8 +481,10 @@ def _authority_userinfo(text: str) -> list[tuple[int, int]]:
     """Userinfo spans from one forward walk. The token reader is the only delimiter table.
 
     Before a colon, any end-delimiter (raw, or ``/`` ``?`` ``#`` and the other host delimiters in
-    any encoding) ends the authority and there is no credential. In the password, only a raw
-    space, tab, CR or LF ends the run; a quote, bracket or encoded slash stays inside it. The
+    any encoding) ends the authority and there is no credential. A colon followed only by digits
+    and then an end-delimiter is a port, so that authority has no credential either. Any other
+    colon opens the password. In the password, only a raw space, tab, CR or LF ends the run; a
+    quote, bracket or encoded slash stays inside it. The
     separator is the last ``@`` or ``%40`` before the first end-delimiter that follows a separator.
     After that separator, any end-delimiter in any form ends the authority. The span stops before
     the separator, so the host stays.
@@ -534,6 +512,11 @@ def _authority_userinfo(text: str) -> list[tuple[int, int]]:
                 if char in _END_CHARS:
                     break
                 if char == ":":
+                    # ``:443/`` is a port. ``:8080@`` is a numeric password.
+                    port_at = _port_end(text, end)
+                    if port_at is not None:
+                        cursor = port_at
+                        break
                     state = "password"
                 cursor = end
                 continue
@@ -556,41 +539,185 @@ def _authority_userinfo(text: str) -> list[tuple[int, int]]:
     return found
 
 
-def _compose(spans: list[tuple[int, int]], layer: list[tuple[int, int]]) -> list[tuple[int, int]]:
-    return [(spans[start][0], spans[end - 1][1]) for start, end in layer]
+class _SpanMap:
+    """Map a decoded view back to the original string.
+
+    ``runs`` is empty for an identity view. Otherwise each run is
+    ``(out_at, src_at, out_len, src_len)``: a 1:1 stretch, or one decoded character whose source
+    is longer. A plain tail stays one run, so a long field is not a tuple per character.
+    """
+
+    def __init__(self, parent: "_SpanMap | None", runs: list[tuple[int, int, int, int]] | None):
+        self.parent = parent
+        self.runs = runs
+
+    def bounds(self, start: int, end: int) -> tuple[int, int]:
+        if not self.runs:
+            src_start, src_end = start, end
+        else:
+            src_start = self._edge(start, at_end=False)
+            src_end = self._edge(end - 1, at_end=True)
+        if self.parent is None:
+            return src_start, src_end
+        return self.parent.bounds(src_start, src_end)
+
+    def _edge(self, out_index: int, at_end: bool) -> int:
+        runs = self.runs or ()
+        lo = 0
+        hi = len(runs) - 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            out_at, src_at, out_len, src_len = runs[mid]
+            if out_index < out_at:
+                hi = mid - 1
+                continue
+            if out_index >= out_at + out_len:
+                lo = mid + 1
+                continue
+            if out_len == src_len:
+                src = src_at + (out_index - out_at)
+                return src + 1 if at_end else src
+            return src_at + src_len if at_end else src_at
+        raise RuntimeError("span map missed an output index")
 
 
-def _decode_views(value: str) -> list[tuple[str, list[tuple[int, int]]]] | None:
+def _append_run(runs: list[tuple[int, int, int, int]], out_at: int, src_at: int, out_len: int, src_len: int) -> None:
+    if out_len <= 0:
+        return
+    if runs and out_len == src_len:
+        prev_out, prev_src, prev_out_len, prev_src_len = runs[-1]
+        if prev_out_len == prev_src_len and prev_out + prev_out_len == out_at and prev_src + prev_src_len == src_at:
+            runs[-1] = (prev_out, prev_src, prev_out_len + out_len, prev_src_len + src_len)
+            return
+    runs.append((out_at, src_at, out_len, src_len))
+
+
+def _decode_layer(value: str) -> tuple[str, list[tuple[int, int, int, int]] | None, bool]:
+    """Decode one layer of ``\\uXXXX`` and ``\\/``. Unchanged text is one run, not one tuple per character."""
+
+    if "\\" not in value:
+        return value, None, False
+    pieces: list[str] = []
+    runs: list[tuple[int, int, int, int]] = []
+    index = 0
+    out_at = 0
+    length = len(value)
+    changed = False
+    while index < length:
+        if value.startswith("\\/", index):
+            pieces.append("/")
+            _append_run(runs, out_at, index, 1, 2)
+            out_at += 1
+            index += 2
+            changed = True
+            continue
+        match = _JSON_U.match(value, index)
+        if match is not None:
+            pieces.append(chr(int(match.group(1), 16)))
+            _append_run(runs, out_at, index, 1, match.end() - index)
+            out_at += 1
+            index = match.end()
+            changed = True
+            continue
+        nxt = value.find("\\", index)
+        if nxt < 0:
+            nxt = length
+        if nxt == index:
+            nxt = index + 1
+            while (
+                nxt < length
+                and value[nxt] == "\\"
+                and not value.startswith("\\/", nxt)
+                and _JSON_U.match(value, nxt) is None
+            ):
+                nxt += 1
+        pieces.append(value[index:nxt])
+        _append_run(runs, out_at, index, nxt - index, nxt - index)
+        out_at += nxt - index
+        index = nxt
+    if not changed:
+        return value, None, False
+    return "".join(pieces), runs, True
+
+
+def _decode_pct_layer(value: str) -> tuple[str, list[tuple[int, int, int, int]] | None, bool]:
+    """Decode one layer of ``%HH``. A plain stretch stays one run."""
+
+    if "%" not in value:
+        return value, None, False
+    pieces: list[str] = []
+    runs: list[tuple[int, int, int, int]] = []
+    index = 0
+    out_at = 0
+    length = len(value)
+    changed = False
+    while index < length:
+        match = _PCT.match(value, index)
+        if match is not None:
+            pieces.append(chr(int(match.group(1), 16)))
+            _append_run(runs, out_at, index, 1, 3)
+            out_at += 1
+            index = match.end()
+            changed = True
+            continue
+        nxt = value.find("%", index + 1 if value[index] == "%" else index)
+        if nxt < 0:
+            nxt = length
+        if nxt == index:
+            nxt = index + 1
+        pieces.append(value[index:nxt])
+        _append_run(runs, out_at, index, nxt - index, nxt - index)
+        out_at += nxt - index
+        index = nxt
+    if not changed:
+        return value, None, False
+    return "".join(pieces), runs, True
+
+
+def _json_pending(value: str) -> bool:
+    start = 0
+    while True:
+        found = value.find("\\", start)
+        if found < 0:
+            return False
+        if value.startswith("\\/", found) or _JSON_U.match(value, found) is not None:
+            return True
+        start = found + 1
+
+
+def _decode_views(value: str) -> list[tuple[str, _SpanMap]] | None:
     """Alternate a JSON peel and a percent peel. None means the cap was not a fixed point."""
 
+    if "\\" not in value and "%" not in value:
+        return [(value, _SpanMap(None, None))]
     text = value
-    spans = [(index, index + 1) for index in range(len(value))]
+    spans = _SpanMap(None, None)
     views = [(text, spans)]
     for _ in range(_ESCAPE_PASSES):
         changed = False
         decoded, layer, json_changed = _decode_layer(text)
         if json_changed:
-            spans = _compose(spans, layer)
+            spans = _SpanMap(spans, layer)
             text = decoded
             views.append((text, spans))
             changed = True
         decoded, layer, pct_changed = _decode_pct_layer(text)
         if pct_changed:
-            spans = _compose(spans, layer)
+            spans = _SpanMap(spans, layer)
             text = decoded
             views.append((text, spans))
             changed = True
         if not changed:
             return views
-    if _decode_layer(text)[2] or _decode_pct_layer(text)[2]:
+    if _json_pending(text) or _PCT.search(text) is not None:
         return None
     return views
 
 
-def _collect_secret_hits(text: str, spans: list[tuple[int, int]], hits: list[tuple[int, int]]) -> None:
+def _collect_secret_hits(text: str, spans: _SpanMap, hits: list[tuple[int, int]]) -> None:
     def add(start: int, end: int) -> None:
         if end > start:
-            hits.append((spans[start][0], spans[end - 1][1]))
+            hits.append(spans.bounds(start, end))
 
     for start, end in _authority_userinfo(text):
         add(start, end)

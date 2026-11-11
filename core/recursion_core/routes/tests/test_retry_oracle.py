@@ -990,12 +990,52 @@ class ReviewFollowupTest(unittest.TestCase):
                     self.assertNotIn("password", redacted)
                     self.assertIn("example.invalid", redacted)
 
+    def test_a_numeric_port_is_not_a_password(self) -> None:
+        forms = (
+            "/", "%2F", "%2f", "%252F", "\\/", "%5C%2F", "%5C%5C%2F",
+            "?", "%3F", "%3f", "%253F", "\\?",
+            "#", "%23", "%2523", "\\#",
+        )
+        for port in ("443", "8080"):
+            for form in forms:
+                raw = f"https://example.com:{port}{form}user@host"
+                with self.subTest(raw=raw):
+                    self.assertEqual(c.redact(raw), raw)
+        for raw in (
+            "https://example.com:443/search?q=user@host",
+            "https://localhost:8080/files/a@b.txt",
+            "https://example.com:443/a@b/user:dummy_password@example.invalid/hook",
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(c.redact(raw), raw)
+        hosted = c.redact("https://user:dummy_password@example.invalid:443/hook")
+        self.assertNotIn("dummy_password", hosted)
+        self.assertIn("example.invalid:443", hosted)
+        numeric = c.redact("https://user:8080@example.invalid/hook")
+        self.assertNotIn("8080@", numeric)
+        self.assertIn("example.invalid", numeric)
+        slashed = c.redact("https://user:dummy/password@example.invalid/hook")
+        self.assertNotIn("password", slashed)
+        self.assertIn("example.invalid", slashed)
+
     def test_repeated_urls_redact_within_a_second(self) -> None:
         for unit in ("https://a@b ", "https://example.com/docs "):
             blob = (unit * (400_000 // len(unit) + 1))[:400_000]
             started = time.perf_counter()
             c.redact(blob)
             self.assertLess(time.perf_counter() - started, 1.0, unit)
+
+    def test_unsettled_nested_field_redacts_within_a_second(self) -> None:
+        def nest(text: str, rounds: int) -> str:
+            for _ in range(rounds):
+                text = text.replace("\\", "\\\\").replace("/", "\\/")
+            return text
+
+        blob = (nest("https://user:dummy_password@example.invalid/hook", 4) + "a" * 400_000)[:400_000]
+        started = time.perf_counter()
+        redacted = c.redact(blob)
+        self.assertLess(time.perf_counter() - started, 1.0)
+        self.assertNotIn("dummy_password", redacted)
 
     def test_opencode_subscription_providers_are_different_breakers(self) -> None:
         chatgpt = request(

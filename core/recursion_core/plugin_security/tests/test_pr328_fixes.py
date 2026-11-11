@@ -65,6 +65,53 @@ class _SchemaRace:
             db.close()
 
 
+class _RevocationSchemaRace:
+    """Pause an unlocked revocation-schema read until the other opener has read it too."""
+
+    def __init__(self, db, name, barrier, alters, unlocked):
+        self._db = db
+        self._name = name
+        self._barrier = barrier
+        self._alters = alters
+        self._unlocked = unlocked
+
+    def execute(self, sql, parameters=()):
+        if sql.lstrip().upper().startswith("ALTER TABLE"):
+            self._alters.append(self._name)
+        cursor = self._db.execute(sql, parameters)
+        if "table_info(revoked)" in sql and not self._db.in_transaction:
+            rows = cursor.fetchall()
+            self._unlocked.append(self._name)
+            self._barrier.wait(3)
+            return rows
+        return cursor
+
+    def close(self) -> None:
+        db = self._db
+        self._db = None
+        if db is not None:
+            db.close()
+
+
+class _HideRevocationGeneration:
+    """Report ``generation`` as missing so the revocation migration repeats an ``ALTER``."""
+
+    def __init__(self, db):
+        self._db = db
+
+    def execute(self, sql, parameters=()):
+        cursor = self._db.execute(sql, parameters)
+        if "table_info(revoked)" in sql:
+            return [row for row in cursor.fetchall() if row[1] != "generation"]
+        return cursor
+
+    def close(self) -> None:
+        db = self._db
+        self._db = None
+        if db is not None:
+            db.close()
+
+
 class _HideGeneration:
     """Report ``generation`` as missing so the migration retries an ``ALTER`` that already landed."""
 
@@ -536,6 +583,82 @@ class RevocationGenerationTests(unittest.TestCase):
             self.assertEqual(ctx.exception.code, "revocation_not_durable")
         finally:
             sqlite3.connect = real_connect
+
+    def test_two_openers_migrate_a_legacy_revocation_store_once(self) -> None:
+        path = os.path.join(temp_dir(self), "rev.db")
+        kid = "ed25519:" + "ab" * 32
+        db = sqlite3.connect(path, isolation_level=None)
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
+        db.execute("CREATE TABLE revoked (key_id TEXT PRIMARY KEY)")
+        db.execute("INSERT INTO meta VALUES ('magic', 'csl-revocation-store/v0')")
+        db.execute("INSERT INTO revoked (key_id) VALUES (?)", (kid,))
+        db.close()
+        barrier = threading.Barrier(2)
+        alters: list[str] = []
+        unlocked: list[str] = []
+        names = iter(("A", "B"))
+        name_lock = threading.Lock()
+        real_connect = sqlite3.connect
+
+        def connect(database, *args, **kwargs):
+            conn = real_connect(database, *args, **kwargs)
+            if database == path:
+                with name_lock:
+                    name = next(names)
+                return _RevocationSchemaRace(conn, name, barrier, alters, unlocked)
+            return conn
+
+        sqlite3.connect = connect
+        opened: list[TrustStore] = []
+        try:
+            outcome: list[BaseException | None] = []
+
+            def open_one() -> None:
+                try:
+                    opened.append(TrustStore({}, revocation_store=path))
+                    outcome.append(None)
+                except BaseException as exc:  # noqa: BLE001 - asserted on the test thread
+                    outcome.append(exc)
+
+            workers = [threading.Thread(target=open_one) for _ in range(2)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(5)
+            self.assertFalse(any(worker.is_alive() for worker in workers))
+        finally:
+            sqlite3.connect = real_connect
+            for trust in opened:
+                trust.close()
+        self.assertEqual(outcome, [None, None])
+        self.assertEqual(unlocked, [])
+        self.assertEqual(len(alters), 1)
+        self.assertEqual(
+            [trust.generation(kid) for trust in opened], [1, 1])
+
+    def test_duplicate_revocation_generation_column_is_already_migrated(self) -> None:
+        path = os.path.join(temp_dir(self), "rev.db")
+        kid = "ed25519:" + "cd" * 32
+        create_revocation_store(path)
+        db = sqlite3.connect(path, isolation_level=None)
+        db.execute("INSERT INTO revoked (key_id, generation) VALUES (?, 4)", (kid,))
+        db.close()
+        real_connect = sqlite3.connect
+
+        def connect(database, *args, **kwargs):
+            conn = real_connect(database, *args, **kwargs)
+            if database == path:
+                return _HideRevocationGeneration(conn)
+            return conn
+
+        sqlite3.connect = connect
+        try:
+            trust = TrustStore({}, revocation_store=path)
+        finally:
+            sqlite3.connect = real_connect
+        self.addCleanup(trust.close)
+        self.assertEqual(trust.generation(kid), 4)
 
 
 class ChildEnvEncodingTests(unittest.TestCase):

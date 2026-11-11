@@ -23,6 +23,7 @@ import os
 import re
 import sqlite3
 import threading
+import time
 from dataclasses import dataclass, field
 from types import MappingProxyType
 
@@ -123,6 +124,54 @@ def parse_manifest(raw: bytes) -> Manifest:
 _REVOCATION_MAGIC = "csl-revocation-store/v0"
 
 
+def _schema_locked(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "database table is locked" in text or "database schema is locked" in text or text == "database is locked"
+
+
+def _migrate_revoked_generation(db: sqlite3.Connection) -> None:
+    """Add ``generation`` to a revocation store created before that column existed.
+
+    The schema is read inside ``BEGIN IMMEDIATE``, then migrated there. A second
+    opener waits and reads again, so it does not repeat the ``ALTER TABLE``.
+    ``duplicate column name: generation`` means the other opener already added it.
+    """
+    deadline = time.monotonic() + 30.0
+    while True:
+        try:
+            _alter_revoked_generation(db)
+            return
+        except sqlite3.OperationalError as exc:
+            if _schema_locked(exc) and time.monotonic() < deadline:
+                time.sleep(0.01)
+                continue
+            db.close()
+            raise Refused("revocation_store_invalid") from None
+        except sqlite3.DatabaseError:
+            db.close()
+            raise Refused("revocation_store_invalid") from None
+
+
+def _alter_revoked_generation(db: sqlite3.Connection) -> None:
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        columns = [row[1] for row in db.execute("PRAGMA table_info(revoked)")]
+        if "generation" not in columns:
+            try:
+                db.execute(
+                    "ALTER TABLE revoked ADD COLUMN generation INTEGER NOT NULL DEFAULT 1")
+            except sqlite3.DatabaseError as exc:
+                if "duplicate column name: generation" not in str(exc).lower():
+                    raise
+        db.execute("COMMIT")
+    except BaseException:
+        try:
+            db.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+
+
 def _script_escapes(value: str) -> bool:
     """An install-script name that is absolute or walks out with ``..``."""
     if os.path.isabs(value) or "\\" in value:
@@ -221,14 +270,7 @@ class TrustStore:
         if meta.get("magic") != _REVOCATION_MAGIC:
             db.close()
             raise Refused("revocation_store_invalid")
-        columns = [row[1] for row in db.execute("PRAGMA table_info(revoked)")]
-        if "generation" not in columns:
-            try:
-                db.execute(
-                    "ALTER TABLE revoked ADD COLUMN generation INTEGER NOT NULL DEFAULT 1")
-            except sqlite3.DatabaseError:
-                db.close()
-                raise Refused("revocation_store_invalid") from None
+        _migrate_revoked_generation(db)
         return db
 
     @property

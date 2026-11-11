@@ -235,6 +235,8 @@ _RUNS_TABLE = (
     'unit TEXT UNIQUE NOT NULL, stop INTEGER NOT NULL, '
     'state TEXT NOT NULL, boot_id TEXT, detail TEXT NOT NULL, '
     'created REAL NOT NULL, updated REAL NOT NULL)')
+_CONTROL_TABLE = ('CREATE TABLE IF NOT EXISTS control_runs '
+                  '(run_id TEXT PRIMARY KEY, record TEXT NOT NULL)')
 
 
 class Registry:
@@ -635,6 +637,29 @@ class Registry:
                        "AND state NOT IN ('terminated', 'lost_reboot')",
                        (value, value, detail[:500], time.time(), run_id))
 
+    # Control-API run records (CSL-798 record shape), one JSON document per run. They share
+    # this file and its publish discipline, so a control record and the run row it belongs
+    # to are covered by the same fsync, rename and directory-fsync barrier. The table is
+    # additive: SCHEMA_VERSION stays 1 and a daemon that predates it ignores the table.
+    def control_put(self, run_id, document):
+        if not isinstance(run_id, str) or not RUN_ID.fullmatch(run_id):
+            raise ValueError('Invalid run id')
+        if not isinstance(document, str):
+            raise ValueError('control record must be a JSON string')
+        with self._write() as db:
+            db.execute(_CONTROL_TABLE)
+            db.execute('INSERT OR REPLACE INTO control_runs VALUES (?, ?)', (run_id, document))
+
+    def control_all(self):
+        """Every stored control record as (run_id, JSON text). No table yet is no records."""
+        with self.lock:
+            self._ensure_open()
+            table = self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                                    "AND name='control_runs'").fetchone()
+            if table is None:
+                return []
+            return self.db.execute('SELECT run_id, record FROM control_runs ORDER BY run_id').fetchall()
+
     def close(self):
         with self.lock:
             if not self.closed:
@@ -699,6 +724,13 @@ class Daemon:
         with self.lock:
             self._open()
             self.registry.request_stop(run_id)
+            self._reconcile(self.registry.get(run_id))
+            return self.registry.get(run_id)
+
+    def reconcile(self, run_id):
+        """Observe one run now and return its record. Raises KeyError for an unknown id."""
+        with self.lock:
+            self._open()
             self._reconcile(self.registry.get(run_id))
             return self.registry.get(run_id)
 

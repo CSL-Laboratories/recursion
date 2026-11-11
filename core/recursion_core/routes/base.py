@@ -42,6 +42,10 @@ class RouteAdapter:
             return c.result(rid, err.code, detail=err.detail)
         try:
             process = self._launcher(argv, env=env, shell=False)
+        except c.RouteError as err:
+            # The launcher's own typed refusal (for example the child-environment policy refusing a
+            # value). Nothing was started, so this is a refusal before launch, not an engine fault.
+            return c.result(rid, err.code, detail=err.detail)
         except OSError as err:
             return c.result(rid, c.ENGINE_ERROR, detail=f"launch failed: {type(err).__name__}")
         events: list[dict] = []

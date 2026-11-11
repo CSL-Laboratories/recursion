@@ -507,6 +507,56 @@ class SocketCorrelationTests(unittest.TestCase):
         self.assertEqual(junk["error"]["code"], "bad_frame")
         self.assertNotIn("id", junk)
 
+    def test_a_follow_up_after_frame_too_large_is_not_held(self) -> None:
+        """frame_too_large finishes the connection. The next request fails at once.
+
+        The rest of an oversized body may still be in flight. That tail must not
+        reset the socket before the bad_frame reply has been read.
+        """
+        srv = self.server(max_frame_bytes=64)
+        with UnixControlClient(srv.path, timeout_s=5, max_frame_bytes=4000) as client:
+            first = client.request({"id": "s9", "op": "stop", "pad": "y" * 80})
+            self.assertEqual(first["error"]["code"], "bad_frame")
+            self.assertEqual(first["error"]["detail"], "frame_too_large")
+            self.assertEqual(first["id"], "s9")
+            started = time.monotonic()
+            with self.assertRaises(ConnectionError):
+                client.request({"op": "ping", "id": "next"})
+            waited = time.monotonic() - started
+            self.assertLess(waited, 0.5, f"follow-up waited {waited:.3f}s")
+        with UnixControlClient(srv.path, timeout_s=2) as other:
+            self.assertEqual(other.request({"op": "ping", "id": "live"}), {"ok": True, "op": "pong", "id": "live"})
+
+        raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(raw.close)
+        raw.settimeout(2)
+        raw.connect(srv.path)
+        raw.sendall(framing.HEADER.pack((1 << 20) + 50))
+        box: dict[str, object] = {}
+
+        def reader() -> None:
+            try:
+                box["reply"] = framing.read_frame(raw)
+            except Exception as exc:
+                box["reply"] = exc
+
+        reader_thread = threading.Thread(target=reader)
+        reader_thread.start()
+        for _ in range(4):
+            try:
+                raw.sendall(b"{")
+            except OSError as exc:
+                box["send"] = exc
+                break
+            time.sleep(0.05)
+        reader_thread.join(1)
+        self.assertFalse(reader_thread.is_alive())
+        reply = box.get("reply")
+        self.assertIsInstance(reply, dict, reply)
+        assert isinstance(reply, dict)
+        self.assertEqual(reply["error"]["code"], "bad_frame")
+        self.assertEqual(reply["error"]["detail"], "frame_too_large")
+
     def test_a_deep_frame_with_a_leading_id_echoes_it(self) -> None:
         """The id is a shallow field at the front, so a too-deep body can still name it.
 

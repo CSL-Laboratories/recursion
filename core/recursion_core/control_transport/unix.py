@@ -48,8 +48,9 @@ IDLE_TIMEOUT_S = 30.0
 # are cancelled and their late results are not written.
 CLOSE_TIMEOUT_S = 5.0
 # After frame_too_large the peer may still be writing the body. The worker returns
-# and frees its slot; this extra fd stays open so those writes are not reset.
-# One deadline, not restarted by arriving bytes.
+# and frees its slot; this extra fd only reads that tail, on one deadline.
+# The write side is shut first, so a later request on the same socket sees EOF
+# instead of sitting in this drain.
 _PEER_HOLD_S = 2.0
 _peer_holds = threading.BoundedSemaphore(MAX_CONNECTIONS)
 
@@ -468,6 +469,10 @@ class UnixControlServer:
         null, so a client that sent an id does not see ``reply_id_mismatch``.
         A frame that is not JSON, or whose id cannot be read, is answered with
         no id. That id-less reply is the one bad_frame the client cannot correlate.
+
+        ``frame_too_large`` shuts the write side after the reply. The next request
+        on that socket fails at once. A duplicate fd keeps reading the rest of the
+        oversized body so the reply is not reset, and that read does not restart.
         """
         deadline = time.monotonic() + self._idle_timeout_s
         try:
@@ -478,7 +483,14 @@ class UnixControlServer:
                 reply["id"] = exc.request_id
             _send_quietly(conn, reply)
             if str(exc) == "frame_too_large":
+                # Dup first, so closing this fd cannot reset the peer while the
+                # reply is still unread. Then half-close writes: the client reads
+                # bad_frame and the next recv is EOF, not a 2s drain of a new request.
                 _hold_peer_open(conn)
+                try:
+                    conn.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
             return None
         except OSError:
             return None
@@ -562,10 +574,11 @@ def _is_busy(response: Message) -> bool:
 
 
 def _hold_peer_open(conn: socket.socket) -> None:
-    """Keep one extra fd until a short deadline so a peer still writing is not reset.
+    """Read the rest of an oversized body on a duplicate fd. Do not answer it.
 
-    The worker has already answered and is about to release the connection slot.
-    Arriving bytes do not extend the deadline.
+    The caller shuts the write side, so this drain cannot be a second request.
+    The deadline is fixed. Arriving bytes do not extend it, and the worker has
+    already released its connection slot.
     """
     if not _peer_holds.acquire(blocking=False):
         return

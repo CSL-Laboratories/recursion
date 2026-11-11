@@ -937,6 +937,59 @@ class ReviewFollowupTest(unittest.TestCase):
             self.assertNotIn("password", redacted)
             self.assertIn("example.invalid", redacted)
 
+    def test_userinfo_walk_covers_delimiter_and_scheme_forms(self) -> None:
+        hidden = (
+            "prefix https:%2F%2Fuser:dummy%20password@example.invalid/hook suffix",
+            "prefix https:%2F%2Fuser:dummy%40password@example.invalid/hook suffix",
+            "prefix https:%2F%2Fuser:dummy%09password@example.invalid/hook suffix",
+            "prefix https:%2F%2Fuser:dummy%2Fpassword@example.invalid/hook suffix",
+            "prefix https:%5C%2F%5C%2Fuser:dummy_password@example.invalid/hook suffix",
+            "prefix https:%5Cu002f%5Cu002fuser:dummy_password@example.invalid/hook suffix",
+            "prefix https:\\u00255c/\\u00255c/user:dummy_password@example.invalid/hook suffix",
+            "prefix https:%5C%2F%5C%2Fuser:dummy%20password@example.invalid/hook suffix",
+            "prefix https:%5C%3A%2F%2Fuser:dummy%20password@example.invalid/hook suffix",
+            'https://user:dummy"password@example.invalid/hook',
+            "https://user:dummy;password@example.invalid/hook",
+            "https://user:dummy?password@example.invalid/hook",
+            "https://user:dummy_password@example.invalid%5C%2Ffiles%5C%2Fa@b.txt",
+            "https://user:dummy_password@example.invalid\\/files\\/a@b.txt",
+            "https:%255C%252F%255C%252Fuser:dummy%20password@example.invalid/hook",
+            "https:%5C%5C%2F%5C%5C%2Fuser:dummy%20password@example.invalid/hook",
+            "https://user:dummy%40password@example.invalid/hook",
+            "https://user:dummy@password%40example.invalid/hook",
+        )
+        for raw in hidden:
+            with self.subTest(raw=raw):
+                redacted = c.redact(raw)
+                self.assertNotIn("password", redacted)
+                self.assertIn("example.invalid", redacted)
+                self.assertNotEqual(redacted, "[redacted]")
+        unchanged = (
+            "see https://example.com/docs and mail ops@example.com",
+            "https://example.com%3Fq=user@host",
+            "[site](https://example.com)[mail](mailto:ops@example.com)",
+            "ops@example.com",
+            "ping @ops",
+            "rate 100% of %20 budget",
+            "https://example.com\\/files\\/a@b.txt",
+        )
+        slash_forms = (
+            "/", "%2F", "%2f", "%252F", "\\/", "%5C%2F", "%5C%5C%2F", "%255C%252F", "\\u002f", "%5Cu002f",
+        )
+        for form in slash_forms:
+            unchanged += (f"https://example.com{form}files{form}a@b.txt",)
+        for raw in unchanged:
+            with self.subTest(raw=raw):
+                self.assertEqual(c.redact(raw), raw)
+        for char in "\"',;<>()[]{}?#/":
+            hexed = format(ord(char), "02X")
+            for encoded in (char, "%" + hexed, "%25" + hexed, "\\" + char):
+                raw = f"https://user:dummy{encoded}password@example.invalid/hook"
+                with self.subTest(raw=raw):
+                    redacted = c.redact(raw)
+                    self.assertNotIn("password", redacted)
+                    self.assertIn("example.invalid", redacted)
+
     def test_repeated_urls_redact_within_a_second(self) -> None:
         for unit in ("https://a@b ", "https://example.com/docs "):
             blob = (unit * (400_000 // len(unit) + 1))[:400_000]

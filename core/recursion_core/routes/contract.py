@@ -316,11 +316,9 @@ _QUOTA_DENIED_AFTER = re.compile(
     re.IGNORECASE,
 )
 # Credential shapes. Word boundaries so "task-12345678" is not an sk- key. Case-insensitive.
-# JSON ``\uXXXX`` / ``\/`` and ``%HH`` are peeled in turn, and every intermediate view is searched.
-# Userinfo is one forward walk of the authority. The scheme separator may be encoded, including
-# ``%5C%2F`` and ``\%2F``. The walk stops at whitespace, quotes, brackets and the other host
-# delimiters, and at ``%2F`` / ``%3F`` / ``%23`` once ``@`` has been seen or before any colon.
-# Between the colon and ``@`` those encodings stay inside the password. A later ``@`` is left alone.
+# JSON ``\uXXXX`` / ``\/`` and ``%HH`` are peeled in turn, and every intermediate view is searched
+# for secret tokens. Userinfo is not peeled that way: one token reader and one state walk decide
+# every delimiter, so ``%20`` in a password is never turned into a space before the scheme matches.
 # A hyphen written as ``\u002d`` still matches. Decoded text is only a search view.
 _SECRET = re.compile(
     r"(?<!\w)eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}(?!\w)"
@@ -334,14 +332,13 @@ _SECRET = re.compile(
     re.IGNORECASE,
 )
 _JSON_U = re.compile(r"\\u([0-9a-fA-F]{4})")
-# Longest first. ``%5C%2F`` / ``\%2F`` are a slash; ``%5C%3A`` / ``\%3A`` are a colon. The 6-character
-# window is enough for each of them.
-_COLON_FORMS = ("%5c%3a", "\\u003a", "\\%3a", "%3a", "\\:", ":")
-_SLASH_FORMS = ("%5c%2f", "\\u002f", "\\%2f", "%2f", "\\/", "/")
-# Raw host delimiters, plus the encoded slash, query and hash that end an authority once userinfo
-# is over (or before a password colon has been seen).
-_AUTHORITY_END = frozenset(" \t\r\n?#/\"',;<>()[]{}")
-_ENCODED_AUTHORITY_END = ("%2f", "%3f", "%23")
+_HEX = frozenset("0123456789abcdefABCDEF")
+# End-delimiters, raw or decoded. The walk's state decides which of them actually stop.
+_WS = frozenset(" \t\r\n")
+_END_CHARS = frozenset("/?#\"',;<>()[]{}") | _WS
+# A backslash run escapes these into a single token of that character. ``\\/`` is still a slash.
+_ESCAPED = frozenset("/?#:@\\")
+_PEEL_LIMIT = 8
 
 
 # One round is a JSON peel and then a percent peel. Eight rounds are shared. A value that is still
@@ -400,56 +397,90 @@ def _decode_pct_layer(value: str) -> tuple[str, list[tuple[int, int]], bool]:
     return "".join(out), spans, changed
 
 
-def _decode_escaped_backslash(value: str) -> tuple[str, list[tuple[int, int]], bool]:
-    """Decode only ``%5C`` so ``\\:`` and ``\\/`` can be seen. ``%20`` and ``%2F`` stay as written."""
-
-    out: list[str] = []
-    spans: list[tuple[int, int]] = []
-    index = 0
-    length = len(value)
-    changed = False
-    while index < length:
-        if value[index:index + 3].lower() == "%5c":
-            out.append("\\")
-            spans.append((index, index + 3))
-            index += 3
-            changed = True
-            continue
-        out.append(value[index])
-        spans.append((index, index + 1))
-        index += 1
-    return "".join(out), spans, changed
+def _hex_at(text: str, index: int) -> int | None:
+    if index + 1 >= len(text):
+        return None
+    pair = text[index:index + 2]
+    if pair[0] not in _HEX or pair[1] not in _HEX:
+        return None
+    return int(pair, 16)
 
 
-def _take_ci(text: str, index: int, forms: tuple[str, ...]) -> int:
-    """Length of the longest form at ``index``, or 0. Forms are lowercase."""
-
-    window = text[index:index + 6].lower()
-    found = 0
-    for form in forms:
-        if len(form) > found and window.startswith(form):
-            found = len(form)
-    return found
+def _hex4_at(text: str, index: int) -> bool:
+    if index + 3 >= len(text):
+        return False
+    return all(char in _HEX for char in text[index:index + 4])
 
 
-def _two_slashes(text: str, index: int) -> int:
-    """Length of two slash forms at ``index``, or 0."""
+def _from_decoded(char: str, text: str, index: int, depth: int) -> tuple[str, int, bool, bool]:
+    """Finish a peeled ``%`` or ``\\``. Returns char, end, raw, unresolved."""
 
-    first = _take_ci(text, index, _SLASH_FORMS)
-    if not first:
+    if char == "%":
+        if depth > _PEEL_LIMIT:
+            return ("%", index, False, True)
+        byte = _hex_at(text, index)
+        if byte is None:
+            return ("%", index, False, False)
+        return _from_decoded(chr(byte), text, index + 2, depth + 1)
+    if char == "\\":
+        return _from_backslash(text, index, depth)
+    return (char, index, False, False)
+
+
+def _from_backslash(text: str, index: int, depth: int) -> tuple[str, int, bool, bool]:
+    """A backslash run collapses into the escaped character. ``%5C%5C%2F`` is one slash."""
+
+    if depth > _PEEL_LIMIT:
+        return ("\\", index, False, True)
+    if index < len(text) and text[index] in "uU" and _hex4_at(text, index + 1):
+        return _from_decoded(chr(int(text[index + 1:index + 5], 16)), text, index + 5, depth + 1)
+    nxt = _read_logical(text, index, depth)
+    if nxt is None:
+        return ("\\", index, False, False)
+    char, end, _raw, bad = nxt
+    if char == "\\":
+        return _from_backslash(text, end, depth + 1)
+    if char in _ESCAPED:
+        return (char, end, False, bad)
+    return ("\\", index, False, bad)
+
+
+def _read_logical(text: str, index: int, depth: int = 0) -> tuple[str, int, bool, bool] | None:
+    """One logical character at ``index``.
+
+    Percent-encoding, ``%25`` layers, ``\\uXXXX`` and backslash runs are one token. ``raw`` is true
+    only for a single source character, so ``%20`` is a space that is not raw whitespace.
+    The fourth value is true when the peel limit was hit.
+    """
+
+    if index >= len(text):
+        return None
+    if depth > _PEEL_LIMIT:
+        return (text[index], index + 1, True, True)
+    if text[index] == "%" and (byte := _hex_at(text, index + 1)) is not None:
+        return _from_decoded(chr(byte), text, index + 3, depth + 1)
+    if text[index] == "\\":
+        return _from_backslash(text, index + 1, depth + 1)
+    return (text[index], index + 1, True, False)
+
+
+def _slash_pair_end(text: str, index: int) -> int:
+    """Index after two slash tokens, or 0."""
+
+    first = _read_logical(text, index)
+    if first is None or first[0] != "/":
         return 0
-    second = _take_ci(text, index + first, _SLASH_FORMS)
-    if not second:
+    second = _read_logical(text, first[1])
+    if second is None or second[0] != "/":
         return 0
-    return first + second
+    return second[1]
 
 
 def _scheme_authority_start(text: str, index: int) -> int:
     """Index where the authority starts, or 0 when ``index`` is not an http(s) scheme.
 
-    Only the scheme separator is recognised in encoded form. ``https:%5C%3A%2F%2F`` has an encoded
-    colon between the scheme colon and the slashes; that colon is part of the separator, so the
-    password is still matched while ``%20`` is ``%20``. The authority itself is not rewritten.
+    The colon and the slashes are the same tokens the authority walk uses. An encoded colon may
+    sit between the scheme colon and the slashes (``https:%5C%3A%2F%2F``). Nothing else is rewritten.
     """
 
     if text[index:index + 5].lower() == "https":
@@ -458,25 +489,27 @@ def _scheme_authority_start(text: str, index: int) -> int:
         cursor = index + 4
     else:
         return 0
-    colon = _take_ci(text, cursor, _COLON_FORMS)
-    if not colon:
+    colon = _read_logical(text, cursor)
+    if colon is None or colon[0] != ":":
         return 0
-    cursor += colon
-    extra = _take_ci(text, cursor, _COLON_FORMS)
-    if extra and _two_slashes(text, cursor + extra):
-        cursor += extra
-    slashes = _two_slashes(text, cursor)
-    if not slashes:
-        return 0
-    return cursor + slashes
+    cursor = colon[1]
+    extra = _read_logical(text, cursor)
+    if extra is not None and extra[0] == ":":
+        slashes = _slash_pair_end(text, extra[1])
+        if slashes:
+            return slashes
+    return _slash_pair_end(text, cursor)
 
 
 def _authority_userinfo(text: str) -> list[tuple[int, int]]:
-    """Userinfo spans: after the scheme separator, through the last ``@`` or ``%40`` in the authority.
+    """Userinfo spans from one forward walk. The token reader is the only delimiter table.
 
-    One forward pass. The authority ends at whitespace, quotes, brackets, ``?``, ``#`` or a raw ``/``.
-    ``%2F``, ``%3F`` and ``%23`` also end it once ``@`` has been seen, and before any colon. Between
-    the colon and that separator they stay in the password, so ``user:dummy%2Fpassword@host`` is one span.
+    Before a colon, any end-delimiter (raw, or ``/`` ``?`` ``#`` and the other host delimiters in
+    any encoding) ends the authority and there is no credential. In the password, only a raw
+    space, tab, CR or LF ends the run; a quote, bracket or encoded slash stays inside it. The
+    separator is the last ``@`` or ``%40`` before the first end-delimiter that follows a separator.
+    After that separator, any end-delimiter in any form ends the authority. The span stops before
+    the separator, so the host stays.
     """
 
     found: list[tuple[int, int]] = []
@@ -488,46 +521,37 @@ def _authority_userinfo(text: str) -> list[tuple[int, int]]:
             index += 1
             continue
         cursor = auth
-        last = auth
-        seen_colon = False
-        seen_sep = False
+        state = "before"
+        separators: list[int] = []
         while cursor < length:
-            if text[cursor] in "%\\":
-                piece = text[cursor:cursor + 3].lower()
-                if piece == "%40":
-                    last = cursor
-                    seen_sep = True
-                    cursor += 3
-                    continue
-                if piece in _ENCODED_AUTHORITY_END:
-                    if seen_sep or not seen_colon:
-                        break
-                    cursor += 3
-                    continue
-                colon_unit = _take_ci(text, cursor, _COLON_FORMS)
-                if colon_unit:
-                    seen_colon = True
-                    cursor += colon_unit
-                    continue
-                unit = _take_ci(text, cursor, _SLASH_FORMS)
-                if unit:
-                    cursor += unit
-                    continue
-            char = text[cursor]
-            if char in _AUTHORITY_END:
+            token = _read_logical(text, cursor)
+            if token is None:
+                break
+            char, end, raw, _bad = token
+            if end <= cursor:
+                end = cursor + 1
+            if state == "before":
+                if char in _END_CHARS:
+                    break
+                if char == ":":
+                    state = "password"
+                cursor = end
+                continue
+            if state == "password":
+                if raw and char in _WS:
+                    break
+                if char == "@":
+                    separators.append(cursor)
+                    state = "after"
+                cursor = end
+                continue
+            if char in _END_CHARS:
                 break
             if char == "@":
-                last = cursor
-                seen_sep = True
-                cursor += 1
-                continue
-            if char == ":":
-                seen_colon = True
-                cursor += 1
-                continue
-            cursor += 1
-        if last > auth:
-            found.append((auth, last))
+                separators.append(cursor)
+            cursor = end
+        if separators:
+            found.append((auth, separators[-1]))
         index = cursor if cursor > index else index + 1
     return found
 
@@ -577,9 +601,10 @@ def _collect_secret_hits(text: str, spans: list[tuple[int, int]], hits: list[tup
 def redact(value: str) -> str:
     """Replace credential-shaped substrings. Connection ids and ordinary error codes are left as they are.
 
-    JSON and percent-encoding are peeled in turn, and every intermediate view is searched. Userinfo
-    is the authority up to its last ``@`` or ``%40``; the walk stops at the path. A value that is
-    still changing after the shared cap is replaced as a whole.
+    JSON and percent-encoding are peeled in turn, and every intermediate view is searched for secret
+    tokens. Userinfo is one state walk on each view: before a colon any end-delimiter means there
+    is no credential, the password keeps its delimiters, and the host ends at the first delimiter
+    after the last ``@``. A value that is still changing after the shared cap is replaced as a whole.
     """
 
     if not value:
@@ -590,11 +615,6 @@ def redact(value: str) -> str:
     hits: list[tuple[int, int]] = []
     for text, spans in views:
         _collect_secret_hits(text, spans, hits)
-        # A percent-encoded backslash is the scheme separator (\: or \/), not part of the password.
-        # Decoding every %HH here would turn %20 into a space and end the authority early.
-        slashed, layer, changed = _decode_escaped_backslash(text)
-        if changed:
-            _collect_secret_hits(slashed, _compose(spans, layer), hits)
     if not hits:
         return value
     hits.sort()

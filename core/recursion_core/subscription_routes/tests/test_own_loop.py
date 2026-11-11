@@ -27,6 +27,16 @@ from recursion_core.subscription_routes import (
 from recursion_core.child_env import EnvRefused, build_child_env
 from recursion_core.subscription_routes.validated_launch import _blocked_secret
 
+# These call the login probe. On a platform that cannot fork one, they skip; the refusal
+# itself is test_unenforceable_platform_refuses_the_probe.
+_NEEDS_PROBE = frozenset({
+    "test_stored_login_runs_with_every_token_variable_removed",
+    "test_unrelated_provider_credentials_do_not_reach_the_copilot_child",
+    "test_copilot_model_is_checked_and_carried",
+    "test_no_stored_login_refuses_and_does_not_fall_back_to_gh",
+    "test_spelling_only_normalisation",
+})
+
 FAKE = "fake-not-a-real-token"
 BASE = {"PATH": "/usr/bin:/bin", "HOME": "/home/u", "LANG": "C.UTF-8"}
 _ROUTE_HOME: str | None = None
@@ -58,6 +68,8 @@ class SigactionAbiTests(unittest.TestCase):
     def setUp(self) -> None:
         if not hasattr(own_loop.os, "waitid"):
             self.skipTest("waitid is not available")
+        if not own_loop._probe_enforceable():
+            self.skipTest("login probe cannot be enforced on this platform")
 
     def test_an_unverified_sigaction_abi_refuses_without_calling_libc(self) -> None:
         def cdll(*_args: object, **_kwargs: object) -> None:
@@ -244,13 +256,27 @@ _NO_NATIVE_PROBE = frozenset({
     "test_a_held_lock_refuses_before_the_probe_can_deadlock",
     "test_route_may_not_pass_a_token",
     "test_other_methods_and_fields_refuse",
+    "test_missing_or_failing_probe_refuses",
+})
+
+# These still run when _probe_enforceable() is false. The class does not skip as a whole.
+_RUNS_UNENFORCEABLE = frozenset({
+    "test_route_may_not_pass_a_token",
+    "test_other_methods_and_fields_refuse",
+    "test_missing_or_failing_probe_refuses",
 })
 
 
 class CopilotTests(unittest.TestCase):
     def setUp(self) -> None:
+        # Per-method, not class-wide. When the probe cannot be enforced, only the route-shape
+        # tests and the missing-probe refusal run. _NEEDS_PROBE (and every other method) skips.
+        # Where the probe can be enforced, methods outside _NO_NATIVE_PROBE still skip unless
+        # the sigaction ABI is the one the pidfd probe uses.
         if not own_loop._probe_enforceable():
-            self.skipTest("login probe cannot be enforced on this platform")
+            if self._testMethodName in _NEEDS_PROBE or self._testMethodName not in _RUNS_UNENFORCEABLE:
+                self.skipTest("login probe cannot be enforced on this platform")
+            return
         if self._testMethodName not in _NO_NATIVE_PROBE and not own_loop._sigaction_abi_supported():
             self.skipTest("login probe cannot be enforced on this platform")
 
@@ -294,7 +320,8 @@ class CopilotTests(unittest.TestCase):
         def boom() -> bool:
             raise OSError("keychain locked")
         self.refused("copilot_login_unknown", copilot(), probe=boom)
-        self.refused("no_stored_copilot_login", copilot(), probe=lambda: "yes")
+        if own_loop._probe_enforceable():
+            self.refused("no_stored_copilot_login", copilot(), probe=lambda: "yes")
 
     def test_login_probe_systemexit_refuses(self) -> None:
         # SystemExit is a BaseException, so `except Exception` lets a probe sys.exit escape.
@@ -1106,6 +1133,24 @@ class CopilotTests(unittest.TestCase):
         self.assertEqual(d.method, "copilot_cli_sign_in")
 
 
+class UnenforceableProbeTests(unittest.TestCase):
+    def test_unenforceable_platform_refuses_the_probe(self) -> None:
+        with mock.patch.object(own_loop, "_probe_enforceable", return_value=False):
+            with self.assertRaises(OwnLoopRouteRefused) as caught:
+                check_copilot_own_loop(copilot(), BASE, home=_route_home(), has_copilot_login=lambda: True)
+        self.assertEqual(caught.exception.cause, "copilot_login_unknown")
+        self.assertEqual(caught.exception.detail, "probe unenforceable")
+        self.assertNotIn(FAKE, str(caught.exception))
+
+    def test_windows_probe_refuses_instead_of_starting_a_thread(self) -> None:
+        with mock.patch.object(own_loop, "_probe_enforceable", return_value=False):
+            with self.assertRaises(OwnLoopRouteRefused) as caught:
+                check_copilot_own_loop(copilot(), BASE, home=_route_home(), has_copilot_login=lambda: True)
+        self.assertEqual(caught.exception.cause, "copilot_login_unknown")
+        self.assertEqual(caught.exception.detail, "probe unenforceable")
+        self.assertNotIn("thread", caught.exception.detail)
+
+
 class NousTests(unittest.TestCase):
     def refused(self, cause: str, route: object, env: dict | None = None) -> None:
         with self.assertRaises(OwnLoopRouteRefused) as ctx:
@@ -1259,16 +1304,6 @@ class AllowlistFamilyTests(unittest.TestCase):
                 self.assertTrue(set(_FAMILY_NAMES) <= set(decision.removed_env))
                 self.assertIn("COPILOT_API_URL", decision.removed_env)
                 self.assertIn("NODE_EXTRA_CA_CERTS", decision.child_env)
-
-
-class UnenforceableProbeTests(unittest.TestCase):
-    def test_windows_probe_refuses_instead_of_starting_a_thread(self) -> None:
-        with mock.patch.object(own_loop, "_probe_enforceable", return_value=False):
-            with self.assertRaises(OwnLoopRouteRefused) as caught:
-                check_copilot_own_loop(copilot(), BASE, home=_route_home(), has_copilot_login=lambda: True)
-        self.assertEqual(caught.exception.cause, "copilot_login_unknown")
-        self.assertEqual(caught.exception.detail, "probe unenforceable")
-        self.assertNotIn("thread", caught.exception.detail)
 
 
 class DoctorTests(unittest.TestCase):

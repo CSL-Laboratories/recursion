@@ -346,7 +346,7 @@ def check_route(
     if credential not in spec.providers[provider].credential_env:
         raise SubscriptionRouteRefused(engine, "credential_env_not_allowed", credential)
 
-    env = dict(child_env)
+    env = _copy_child_env(engine, child_env)
     present = sorted(name for name in CLAUDE_SUBSCRIPTION_ENV if name in env)
     if present:
         raise SubscriptionRouteRefused(engine, "claude_subscription_env", ",".join(present))
@@ -374,6 +374,34 @@ def check_route(
     flags = tuple(f"parent_env_has:{name}" for name in CLAUDE_SUBSCRIPTION_ENV if name in (parent_env or {}))
     return _finish(engine, provider, credential, flags, "api_key", "", engine_config, stored_model, env, wrapper,
                    checked)
+
+
+def _copy_child_env(engine: str, child_env: Mapping[str, str]) -> dict[str, str]:
+    """A child env whose names and values can be passed to ``Popen``.
+
+    A null, an empty name, an ``=`` in a name, or a non-string crashes launch with
+    ``ValueError``. Text this process cannot encode crashes it with ``UnicodeEncodeError``.
+    Non-UTF-8 bytes (surrogates) encode with ``surrogateescape`` and stay.
+    """
+
+    if not isinstance(child_env, Mapping):
+        raise SubscriptionRouteRefused(engine, "child_env_malformed")
+    copied: dict[str, str] = {}
+    for name, value in child_env.items():
+        if (not isinstance(name, str) or not isinstance(value, str) or name == "" or "=" in name
+                or "\x00" in name or "\x00" in value):
+            raise SubscriptionRouteRefused(engine, "child_env_malformed")
+        # A surrogate home is home_unsafe, the same refusal as the route-home check, not an
+        # encoding error. Other text this process cannot encode is value_unencodable.
+        if name == "HOME" and _surrogate(value):
+            raise SubscriptionRouteRefused(engine, "home_unsafe")
+        try:
+            os.fsencode(name)
+            os.fsencode(value)
+        except UnicodeEncodeError:
+            raise SubscriptionRouteRefused(engine, "value_unencodable") from None
+        copied[name] = value
+    return copied
 
 
 def _norm(label: str) -> str:
@@ -465,7 +493,7 @@ def _check_subscription(
     if model_provider != label:
         raise SubscriptionRouteRefused(engine, "model_provider_mismatch", model_provider)
 
-    env = dict(child_env)
+    env = _copy_child_env(engine, child_env)
     present = sorted(name for name in CLAUDE_SUBSCRIPTION_ENV if name in env)
     if present:
         raise SubscriptionRouteRefused(engine, "claude_subscription_env", ",".join(present))
@@ -579,15 +607,28 @@ def _check_home(
     parent_home = parent_env.get("HOME") if parent_env is not None else None
     if any(_surrogate(item) for item in (route_home, env.get("HOME"), operator_home, parent_home)):
         raise SubscriptionRouteRefused(engine, "home_unsafe")
-    if not isinstance(route_home, str) or not os.path.isabs(route_home):
+    if not isinstance(route_home, str) or not os.path.isabs(route_home) or "\x00" in route_home:
         raise SubscriptionRouteRefused(engine, "route_home_missing")
+    try:
+        os.fsencode(route_home)
+    except UnicodeEncodeError:
+        raise SubscriptionRouteRefused(engine, "value_unencodable") from None
     if env.get("HOME") != route_home:
         raise SubscriptionRouteRefused(engine, "child_home_not_route_home")
     homes = _operator_homes(parent_env, operator_home)
     if any(_surrogate(path) for path in homes):
         raise SubscriptionRouteRefused(engine, "home_unsafe")
     real = os.path.realpath(route_home)
-    operator = {os.path.realpath(path) for path in homes}
+    operator_paths = []
+    for path in homes:
+        try:
+            os.fsencode(path)
+        except UnicodeEncodeError:
+            raise SubscriptionRouteRefused(engine, "value_unencodable") from None
+        if "\x00" in path:
+            raise SubscriptionRouteRefused(engine, "route_home_missing")
+        operator_paths.append(os.path.realpath(path))
+    operator = set(operator_paths)
     # A home of "/" must not use the prefix "/": that matches every absolute path, so a
     # container whose passwd home is missing (HOME=/) could launch no route.
     if any(_operator_contains(real, home) for home in operator):
@@ -751,6 +792,51 @@ def _checked_requirements(engine: str | None, requirements: object, full_access_
     return _Checked(targets, frozenset(options), owned, full_access_acknowledged is True)
 
 
+def _screen_launch_text(engine: str | None, text: str) -> None:
+    """Refuse a launch string that carries a null or cannot be encoded for this process."""
+
+    if "\x00" in text:
+        raise SubscriptionRouteRefused(engine, "argv_malformed")
+    try:
+        os.fsencode(text)
+    except UnicodeEncodeError:
+        raise SubscriptionRouteRefused(engine, "value_unencodable") from None
+
+
+def _snapshot_cwd(engine: str | None, cwd: object) -> str | bytes:
+    """One ``os.fspath`` of ``cwd``, screened, and that value is what the launcher receives.
+
+    A path-like object is not forwarded. A later read of it can return a different string, including
+    one with a null, after the check has passed. A ``bytearray`` is accepted and copied to ``bytes``
+    before screening, so a later change to the caller's buffer is not what launches.
+    """
+
+    if isinstance(cwd, str):
+        rendered: object = cwd
+    elif isinstance(cwd, (bytes, bytearray)):
+        rendered = bytes(cwd)
+    elif isinstance(cwd, os.PathLike):
+        try:
+            rendered = os.fspath(cwd)
+        except (TypeError, ValueError):
+            raise SubscriptionRouteRefused(engine, "argv_malformed") from None
+    else:
+        raise SubscriptionRouteRefused(engine, "argv_malformed")
+    if isinstance(rendered, str):
+        _screen_launch_text(engine, rendered)
+        return rendered
+    if isinstance(rendered, (bytes, bytearray)):
+        snapshot = bytes(rendered)
+        if b"\x00" in snapshot:
+            raise SubscriptionRouteRefused(engine, "argv_malformed")
+        try:
+            os.fsencode(os.fsdecode(snapshot))
+        except UnicodeError:
+            raise SubscriptionRouteRefused(engine, "value_unencodable") from None
+        return snapshot
+    raise SubscriptionRouteRefused(engine, "argv_malformed")
+
+
 def _reject_launch_shape(
     engine: str | None,
     argv: object,
@@ -765,11 +851,16 @@ def _reject_launch_shape(
         raise SubscriptionRouteRefused(engine, "launch_option_denied", ",".join(bad))
     if isinstance(argv, (str, bytes)) or not isinstance(argv, list) or not argv or not all(isinstance(item, str) for item in argv):
         raise SubscriptionRouteRefused(engine, "argv_malformed")
+    forward = dict(launch_kwargs)
+    if forward.get("cwd") is not None:
+        forward["cwd"] = _snapshot_cwd(engine, forward["cwd"])
+    for item in (*argv, *(value for value in forward.values() if isinstance(value, str))):
+        _screen_launch_text(engine, item)
     checked = _checked_requirements(engine, requirements, full_access_acknowledged)
-    unknown = sorted(set(launch_kwargs) - FORWARDED_LAUNCH_OPTIONS - checked.extra_launch_options)
+    unknown = sorted(set(forward) - FORWARDED_LAUNCH_OPTIONS - checked.extra_launch_options)
     if unknown:  # full access adds no launch option
         raise SubscriptionRouteRefused(engine, "launch_option_unknown", ",".join(unknown))
-    return dict(launch_kwargs)
+    return forward
 
 
 def _verify_wrapper(engine: str, wrapper: WrapperInstall, checked: _Checked) -> None:
@@ -944,11 +1035,14 @@ def _hermes_config_is_ours(engine: str, route_home: str) -> bool:
         except OSError:
             raise _refuse_hermes_config(engine, "config.yaml") from None
         try:
-            opened = os.fstat(fd)
-            if (not stat.S_ISREG(opened.st_mode) or opened.st_size != len(_HERMES_ADOPT_YAML)
-                    or opened.st_uid != os.geteuid()):
-                raise _refuse_hermes_config(engine, "config.yaml")
-            data = os.read(fd, len(_HERMES_ADOPT_YAML) + 1)
+            try:
+                opened = os.fstat(fd)
+                if (not stat.S_ISREG(opened.st_mode) or opened.st_size != len(_HERMES_ADOPT_YAML)
+                        or opened.st_uid != os.geteuid()):
+                    raise _refuse_hermes_config(engine, "config.yaml")
+                data = os.read(fd, len(_HERMES_ADOPT_YAML) + 1)
+            except OSError:
+                raise _refuse_hermes_config(engine, "config.yaml") from None
         finally:
             os.close(fd)
     finally:
@@ -1123,13 +1217,18 @@ def _apply_hermes_adopt_override(decision: RouteDecision, route_home: str) -> No
     parent = os.path.join(route_home, ".hermes")
     if _hermes_config_is_ours(decision.engine, route_home):
         return
-    if not os.path.lexists(parent) or _hermes_dir_is_empty(route_home):
-        _stage_hermes_dir(decision.engine, route_home, parent)
-    elif os.path.islink(parent) or not os.path.isdir(parent):
-        raise _refuse_hermes_config(decision.engine, ".hermes")
-    else:
-        _link_hermes_config(decision.engine, route_home, parent)
-    _confirm_hermes_switch(decision.engine, route_home)
+    try:
+        if not os.path.lexists(parent) or _hermes_dir_is_empty(route_home):
+            _stage_hermes_dir(decision.engine, route_home, parent)
+        elif os.path.islink(parent) or not os.path.isdir(parent):
+            raise _refuse_hermes_config(decision.engine, ".hermes")
+        else:
+            _link_hermes_config(decision.engine, route_home, parent)
+        _confirm_hermes_switch(decision.engine, route_home)
+    except OSError:
+        # A read-only route home, a full disk, or a name the kernel rejects must refuse before
+        # the launcher runs. PermissionError is an OSError; it is not a successful launch.
+        raise _refuse_hermes_config(decision.engine, ".hermes") from None
 
 
 def _launch_checked(
@@ -1174,7 +1273,7 @@ def _checked_baseline(
 ) -> tuple[tuple[str, str], ...]:
     """Safe child env only: no Claude subscription name and no credential. Then the home rules."""
 
-    env = dict(child_env)
+    env = _copy_child_env(engine, child_env)
     present = sorted(name for name in CLAUDE_SUBSCRIPTION_ENV if name in env)
     if present:
         raise SubscriptionRouteRefused(engine, "claude_subscription_env", ",".join(present))

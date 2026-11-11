@@ -38,6 +38,7 @@ import os
 import platform
 import re
 import selectors
+import select
 import signal
 import stat
 import subprocess
@@ -256,14 +257,17 @@ def check_copilot_own_loop(
     """
 
     _common("copilot", route, _COPILOT_FIELDS, "copilot_cli_sign_in")
-    if not isinstance(parent_env, Mapping):
-        raise OwnLoopRouteRefused("copilot", "parent_env_malformed")
+    # Empty names, "=", and NULs refuse before the home check, so a missing home is not
+    # reported in place of a malformed parent map.
+    parent_env = _screen_parent_env("copilot", parent_env)
     if has_copilot_login is None:
         raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "no stored-login probe; gh fallback refused")
     model = _model("copilot", route.get("model"))
     strip = COPILOT_STRIP_ENV + _GH_FALLBACK_ENV
     # Any other provider credential (ANTHROPIC_API_KEY, OPENAI_API_KEY, ...) is not this run's either.
     # The allowlist then drops whatever the strip does not name (GH_PAT, AWS_*, GIT_CONFIG_*).
+    child, removed = _project_child(parent_env, lambda name: name in strip or _is_provider_credential(name))
+    _screen_kept_values("copilot", child)
     # A missing home would run the probe in the ambient account and approve a different child account.
     if not isinstance(home, str) or not home:
         raise OwnLoopRouteRefused("copilot", "route_home_missing")
@@ -273,7 +277,6 @@ def check_copilot_own_loop(
         raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe unenforceable")
     if _other_threads():
         raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe threaded")
-    child, removed = _project_child(parent_env, lambda name: name in strip or _is_provider_credential(name))
     probe_env = _copilot_runtime_env(child, home).to_dict()
     present = _probe_login(has_copilot_login, probe_deadline, probe_env)
     if not present:
@@ -413,8 +416,7 @@ def check_nous_own_loop(
     """
 
     _common("nous", route, _NOUS_FIELDS, "hermes_local_proxy")
-    if not isinstance(parent_env, Mapping):
-        raise OwnLoopRouteRefused("nous", "parent_env_malformed")
+    parent_env = _screen_parent_env("nous", parent_env)
     url = _loopback_url(route.get("base_url"))
     adapters = _adapters(route.get("adapters"))
     model = _model("nous", route.get("model"))
@@ -429,6 +431,7 @@ def check_nous_own_loop(
     child, removed = _project_child(
         parent_env, lambda name: _is_provider_credential(name) or name.upper() in _PROXY_ENV,
     )
+    _screen_kept_values("nous", child)
     return OwnLoopDecision("nous", "hermes_local_proxy", MappingProxyType(child), removed, url, adapters,
                            _shared_host_warning(current_user, interactive_users), model)
 
@@ -447,14 +450,17 @@ def _probe_enforceable() -> bool:
     ``pidfd_open`` plus ``pidfd_send_signal`` name the leader after its numeric pid would be
     unsafe. ``waitid(P_PIDFD)`` says whether that leader is still unreaped before any
     ``killpg``. The probe blocks ``SIGINT`` and ``SIGCHLD`` across fork and cleanup, so it
-    also needs ``pthread_sigmask``. Without those, the probe refuses instead of signalling
-    a process-group id.
+    also needs ``pthread_sigmask``. The screened-env fork probe also needs ``setpgid``
+    and ``getpgid`` so its child is a group the parent can signal. Without those, the
+    probe refuses instead of signalling a process-group id.
     """
 
     return (
         os.name != "nt"
         and hasattr(os, "fork")
         and hasattr(os, "killpg")
+        and hasattr(os, "setpgid")
+        and hasattr(os, "getpgid")
         and hasattr(os, "setsid")
         and hasattr(os, "pidfd_open")
         and hasattr(os, "waitid")
@@ -1390,3 +1396,339 @@ def spawn_nous_own_loop(
         route, parent_env, current_user=current_user, interactive_users=interactive_users,
     )
     return decision, _spawn_checked(argv, decision, home, cwd)
+
+
+# Screened-env fork probe. The public Copilot check uses the pidfd probe above.
+# These helpers keep the close-once pipe, the reap deadline, and the empty-name screen
+# that the env-robustness tests and repros drive directly.
+_PROBE_DEADLINE_S = 5.0
+# After the deadline, poll for the leader instead of blocking in waitpid. A child that is still
+# unreaped when this grace ends is left for the system; the probe refuses rather than wait.
+_REAP_GRACE_S = 1.0
+
+
+def _close_probe_fd(fds: list[int], index: int) -> None:
+    """Close one recorded pipe end, and never that number again.
+
+    The slot is cleared before ``close``. An interrupt can arrive after the kernel has
+    reused the number; a later close of the recorded value would close the new file.
+    """
+
+    fd = fds[index]
+    if fd < 0:
+        return
+    fds[index] = -1
+    try:
+        os.close(fd)
+    except OSError:
+        return
+
+
+def _probe_in_screened_env(probe: Callable[[], bool], child: Mapping[str, str]) -> bool:
+    """Run the login probe in a forked child whose environment is ``child``.
+
+    The parent environment is left untouched. Copilot probing is refused in threaded processes:
+    forking a multi-threaded process can deadlock the child on a lock it does not hold. The child
+    runs the callable only after ``getpgid`` confirms it is its own process group; otherwise the
+    parent refuses ``probe unenforceable``. One deadline covers the status read and the reap.
+    Every exit, including a present login, SIGKILLs that group before the leader is reaped, so a
+    helper the probe started dies with it and the group id cannot be reused. An empty status
+    while the child is still running is the same deadline, not a blocking wait. ``SystemExit``
+    and ``KeyboardInterrupt`` raised by the probe are not a login.
+    """
+
+    if not _probe_enforceable():
+        raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe unenforceable")
+    if _other_threads():
+        raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe threaded")
+    pid: int | None = None
+    status: bytes | None = None
+    fds = [-1, -1]
+    deadline = 0.0
+    try:
+        read_fd, write_fd = os.pipe()
+        fds[0], fds[1] = read_fd, write_fd
+        deadline = time.monotonic() + _PROBE_DEADLINE_S
+        try:
+            pid = os.fork()
+        except OSError:
+            raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe failed") from None
+        if pid == 0:
+            try:
+                os.close(read_fd)
+                grouped = _child_in_own_group()
+                if not grouped:
+                    _write_all(write_fd, b"U")
+                else:
+                    try:
+                        os.environ.clear()
+                        os.environ.update(child)
+                        ok = probe() is True
+                        payload = b"T" if ok else b"F"
+                    except BaseException as exc:
+                        payload = b"E" + type(exc).__name__.encode("ascii", "replace")
+                    _write_all(write_fd, payload[:80])
+            except BaseException:
+                pass
+            os._exit(0)
+        try:
+            os.setpgid(pid, pid)
+        except OSError:
+            pass
+        _close_probe_fd(fds, 1)
+        status = _read_all(read_fd, 80, deadline)
+    finally:
+        pending: BaseException | None = None
+        for index in range(len(fds)):
+            try:
+                _close_probe_fd(fds, index)
+            except BaseException as exc:
+                pending = pending or exc
+        leader_reaped = True
+        if pid:
+            leader_reaped = _reap_probe_child(pid, deadline)
+        if pending is not None:
+            raise pending
+        if pid and not leader_reaped:
+            raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe unenforceable")
+    if status == b"T":
+        return True
+    if status == b"F":
+        return False
+    if status == b"U":
+        raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe unenforceable")
+    if status is not None and status.startswith(b"E"):
+        name = status[1:].decode("ascii", "replace") or "Exception"
+        raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", name)
+    raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe failed")
+
+
+def _child_in_own_group() -> bool:
+    """True when this process is the leader of its own process group.
+
+    The callable does not run unless this is true. A failed ``setpgid`` used to be ignored, and
+    the probe then ran in the parent's group, where a later ``killpg`` could not be aimed at it.
+    """
+
+    try:
+        os.setpgid(0, 0)
+    except OSError:
+        pass
+    try:
+        return os.getpgid(0) == os.getpid()
+    except OSError:
+        return False
+
+
+def _kill_probe_group(pid: int) -> None:
+    """SIGKILL ``pid``'s group while its leader is still unreaped.
+
+    ``killpg`` falls back to ``kill`` when the child never became a group leader. The leader's
+    pid is not collected here: reaping it first would free the process-group id for reuse.
+    """
+
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except OSError:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def _live_group_members(pgid: int) -> list[int]:
+    """Pids in ``pgid`` that are still running. Zombies and processes that have gone are omitted."""
+
+    live: list[int] = []
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return live
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/stat", encoding="ascii") as handle:
+                text = handle.read()
+        except OSError:
+            continue
+        end = text.rfind(")")
+        if end < 0:
+            continue
+        fields = text[end + 2:].split()
+        if len(fields) < 3 or fields[0] in "ZX":
+            continue
+        try:
+            member_pgid = int(fields[2])
+        except ValueError:
+            continue
+        if member_pgid == pgid:
+            live.append(int(name))
+    return live
+
+
+def _reap_probe_child(pid: int, deadline: float) -> bool:
+    """SIGKILL the probe group, then reap its leader. True when the leader was collected.
+
+    The signal goes out while the leader is still unreaped, so the group id cannot be reused.
+    Helpers are given that signal time to exit before the leader is collected. After the
+    deadline, the group is signalled again and the leader is only polled, for ``_REAP_GRACE_S``.
+    A leader that is still unreaped then is left unreaped and this returns false. Once a wait
+    has been attempted, a later interrupt does not signal that process-group id again: the wait
+    may already have collected the leader, and the id may have been reused.
+    """
+
+    reaped = False
+    entered_reap = False
+
+    def collect() -> None:
+        nonlocal reaped, entered_reap
+        _kill_probe_group(pid)
+        while True:
+            others = [member for member in _live_group_members(pid) if member != pid]
+            if not others:
+                break
+            if time.monotonic() >= deadline:
+                # The leader is still unreaped here. killpg reaches members still in the group.
+                # Killing the recorded pid on its own can hit a recycled pid.
+                _kill_probe_group(pid)
+                break
+            time.sleep(0.005)
+        grace_end: float | None = None
+        while True:
+            # Set before the call. KeyboardInterrupt can arrive after the kernel has reaped
+            # the leader and before this call returns to the assignment below.
+            entered_reap = True
+            try:
+                got, _status = os.waitpid(pid, os.WNOHANG)
+            except InterruptedError:
+                continue
+            except ChildProcessError:
+                reaped = True
+                return
+            if got:
+                reaped = True
+                return
+            now = time.monotonic()
+            if now >= deadline:
+                if grace_end is None:
+                    grace_end = now + _REAP_GRACE_S
+                if now >= grace_end:
+                    return
+            time.sleep(0.005)
+
+    try:
+        collect()
+    except BaseException:
+        if not reaped and not entered_reap:
+            _kill_probe_group(pid)
+        grace_end = time.monotonic() + _REAP_GRACE_S
+        while not reaped and time.monotonic() < grace_end:
+            try:
+                got, _status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                reaped = True
+                break
+            except InterruptedError:
+                continue
+            if got:
+                reaped = True
+                break
+            time.sleep(0.005)
+        raise
+    return reaped
+
+
+def _read_all(fd: int, limit: int, deadline: float | None = None) -> bytes:
+    """Read until a status byte arrives, the child closes the pipe, or ``deadline`` elapses.
+
+    A ``T`` or ``F`` status is one byte and returns as soon as it arrives. Closing the pipe is
+    not success and does not cancel the caller's deadline: an empty read returns, and the caller
+    kills the group when the child has not exited. A child that never writes raises
+    ``probe timed out``.
+    """
+
+    if deadline is None:
+        deadline = time.monotonic() + _PROBE_DEADLINE_S
+    chunks: list[bytes] = []
+    remaining = limit
+    while remaining > 0:
+        timeout = deadline - time.monotonic()
+        if timeout <= 0:
+            if chunks:
+                break
+            raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe timed out")
+        try:
+            readable, _, _ = select.select([fd], [], [], timeout)
+        except InterruptedError:
+            continue
+        if not readable:
+            if chunks:
+                break
+            raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe timed out")
+        try:
+            chunk = os.read(fd, remaining)
+        except InterruptedError:
+            continue
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+        kind = chunks[0][:1]
+        if kind in (b"T", b"F"):
+            break
+        if kind == b"E":
+            # The status is one write. A helper the probe forked inherits this pipe, so EOF
+            # does not arrive until that helper dies. Drain what is already buffered and stop.
+            while remaining > 0:
+                try:
+                    more, _, _ = select.select([fd], [], [], 0)
+                except InterruptedError:
+                    continue
+                if not more:
+                    break
+                try:
+                    extra = os.read(fd, remaining)
+                except InterruptedError:
+                    continue
+                if not extra:
+                    break
+                chunks.append(extra)
+                remaining -= len(extra)
+            break
+    return b"".join(chunks)
+
+
+def _screen_parent_env(engine: str, parent_env: object) -> dict[str, str]:
+    """Copy a parent env into a plain dict ``Popen`` can encode.
+
+    The returned dict is the only map the rest of the check reads. A later ``.items()`` on the
+    caller's mapping, or a login callback that mutates that mapping, cannot add a null or a new
+    name. A non-string used to raise ``AttributeError``. An empty name, a null, or an ``=`` in a
+    name used to crash at launch. Value encodability is checked later, and only for names that stay in the
+    child: a dropped credential this process cannot encode is not a reason to refuse the run.
+    """
+
+    if not isinstance(parent_env, Mapping):
+        raise OwnLoopRouteRefused(engine, "parent_env_malformed")
+    snapshot: dict[str, str] = {}
+    for name, value in parent_env.items():
+        if (not isinstance(name, str) or not isinstance(value, str) or name == "" or "=" in name
+                or "\x00" in name or "\x00" in value):
+            raise OwnLoopRouteRefused(engine, "parent_env_malformed")
+        try:
+            os.fsencode(name)
+        except UnicodeEncodeError:
+            raise OwnLoopRouteRefused(engine, "env_unencodable") from None
+        snapshot[name] = value
+    return snapshot
+
+
+def _screen_kept_values(engine: str, child: Mapping[str, str]) -> None:
+    """Refuse a kept value this process cannot encode. Dropped names are not checked."""
+
+    for value in child.values():
+        try:
+            os.fsencode(value)
+        except UnicodeEncodeError:
+            raise OwnLoopRouteRefused(engine, "env_unencodable") from None

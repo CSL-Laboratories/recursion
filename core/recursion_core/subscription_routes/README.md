@@ -117,6 +117,8 @@ PRODUCT.md `055cc7a5` section 3.3. `own_loop.py`, checked before any spawn or re
   decision. With no stored `copilot` login, no probe, a probe that fails or raises `SystemExit`,
   or a probe that does not return within 5 seconds (`LOGIN_PROBE_DEADLINE_S`; a caller may pass a
   shorter `probe_deadline`, not a longer one) the run refuses rather than fall back to `gh`.
+  Copilot probing is refused in threaded processes (`probe threaded`): the probe runs in a forked
+  child, and `fork` copies only the calling thread. Call it before any other thread is started.
 - **Nous, "Local proxy"**: `check_nous_own_loop(route, parent_env, ...)` with
   `{"engine": "nous", "auth": "subscription", "method": "hermes_local_proxy", "base_url": ...}`.
   The own loop calls only the user's own Hermes subscription proxy at a loopback IP literal

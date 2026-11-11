@@ -57,6 +57,17 @@ class CodexUpdaterTest(unittest.TestCase):
             self.assertEqual(ctx.exception.code, c.LAUNCH_REFUSED)
 
 
+def pinned_argv(req: dict) -> list[str]:
+    """argv[0] is the pinned wrapper launcher when the route carries a pin, else the bare engine name.
+
+    master's subscription_routes (CSL-786, a7bbe438) refuses a Pi or Hermes launch whose argv[0] is not an
+    absolute path resolving to ``wrapper.launcher_path`` (``argv0_not_pinned``). A production argv factory
+    must do the same; the bare name stays for the cases that must refuse before the launcher is reached.
+    """
+    wrapper = req["route"].get("wrapper")
+    return [wrapper.launcher_path if wrapper is not None else req["route"]["engine"]]
+
+
 class SubscriptionRouteReuseTest(unittest.TestCase):
     def setUp(self) -> None:
         self.home = tempfile.mkdtemp(prefix="route-home-")
@@ -67,7 +78,7 @@ class SubscriptionRouteReuseTest(unittest.TestCase):
         drive = lambda process, req, deadline_at, events: c.result(req["request_id"], None, text="driven")
         adapters = profile_adapters(self.launcher, self.clock, lambda cid, name: {"k1": "sk-test"}[cid],
                                     {"PATH": "/usr/bin", "HOME": "/home/operator", "CLAUDE_CODE_OAUTH_TOKEN": "x"},
-                                    argv=lambda req: [req["route"]["engine"]], driver=drive, operator_home="/home/operator")
+                                    argv=pinned_argv, driver=drive, operator_home="/home/operator")
         self.service = RouteService(adapters, ConnectionBreaker(self.clock), self.clock)
 
     def pin(self) -> WrapperInstall:
@@ -88,7 +99,7 @@ class SubscriptionRouteReuseTest(unittest.TestCase):
 
         adapters = profile_adapters(self.launcher, self.clock, lambda cid, name: "sk-test",
                                     {"PATH": "/usr/bin", "HOME": "/home/operator"},
-                                    argv=lambda req: ["pi"], driver=drive, operator_home="/home/operator")
+                                    argv=pinned_argv, driver=drive, operator_home="/home/operator")
         service = RouteService(adapters, ConnectionBreaker(self.clock), self.clock)
         res = service.handle(self.req("pi", {"provider": "anthropic", "auth": "api_key",
                                               "credential_env": "ANTHROPIC_API_KEY"}, wrapper=self.pin()))
@@ -118,6 +129,16 @@ class SubscriptionRouteReuseTest(unittest.TestCase):
         self.assertEqual((res["status"], res["text"]), ("ok", "driven"))
         env = self.launcher.calls[0]["env"]
         self.assertEqual(env, {"PATH": "/usr/bin", "HOME": self.home, "ANTHROPIC_API_KEY": "sk-test"})
+
+    def test_pinned_route_with_a_bare_argv0_refuses_before_launch(self) -> None:
+        adapters = profile_adapters(self.launcher, self.clock, lambda cid, name: "sk-test",
+                                    {"PATH": "/usr/bin", "HOME": "/home/operator"},
+                                    argv=lambda req: ["pi"], driver=lambda *a: {}, operator_home="/home/operator")
+        service = RouteService(adapters, ConnectionBreaker(self.clock), self.clock)
+        profile = {"provider": "anthropic", "auth": "api_key", "credential_env": "ANTHROPIC_API_KEY"}
+        res = service.handle(self.req("pi", profile, wrapper=self.pin()))
+        self.assertEqual((res["code"], res["detail"]), (c.SUBSCRIPTION_ROUTE_REFUSED, "argv0_not_pinned"))
+        self.assertEqual(self.launcher.calls, [])
 
     def test_missing_custody_key_refuses_instead_of_launching_keyless(self) -> None:
         profile = {"provider": "openai", "auth": "api_key", "credential_env": "OPENAI_API_KEY"}

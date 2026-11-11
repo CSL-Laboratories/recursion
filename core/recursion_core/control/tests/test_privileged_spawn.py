@@ -1384,21 +1384,33 @@ class SpawnDefectTests(unittest.TestCase):
 
     def test_ptrace_detaches_when_waitpid_fails(self) -> None:
         # EINTR is retried (see the stop/detach test). A non-restartable wait
-        # error still detaches before it propagates, so the attach is not left
-        # in place.
+        # error still detaches, and that detach result is the probe result.
+        # Dropping an ESRCH and raising the wait error leaves the tracee attached.
         calls: list[int] = []
+        killed: list[tuple[int, int]] = []
 
         def ptrace(request, pid, *args):
             calls.append(request)
+            if request == privileged_spawn.PTRACE_DETACH:
+                return (-1, errno.ESRCH)
             return (0, 0)
+
+        def kill(pid, sig):
+            killed.append((pid, sig))
 
         with mock.patch.object(privileged_spawn, "_ptrace", side_effect=ptrace):
             with mock.patch.object(
                 privileged_spawn.os, "waitpid", side_effect=OSError(errno.EIO, "io error")
             ):
-                with self.assertRaises(OSError):
-                    probe_ptrace(4242)
-        self.assertEqual(len(calls), 2)
+                with mock.patch.object(privileged_spawn.os, "kill", side_effect=kill):
+                    result, detail = probe_ptrace(4242)
+        self.assertIsNone(result)
+        self.assertIn("ptrace detach failed", detail)
+        self.assertIn(str(errno.ESRCH), detail)
+        self.assertEqual(
+            calls, [privileged_spawn.PTRACE_ATTACH, privileged_spawn.PTRACE_DETACH]
+        )
+        self.assertEqual(killed, [(4242, signal.SIGKILL)])
 
     def test_detection_does_not_launch_uid_zero_names(self) -> None:
         seen: list[tuple[str, ...]] = []
@@ -1550,6 +1562,59 @@ class SpawnDefectTests(unittest.TestCase):
         self.assertIs(result, True)
         self.assertIn(str(errno.EACCES), detail)
 
+    def test_store_read_uses_the_pinned_inode_when_the_name_is_swapped(self) -> None:
+        # The probe directory is 01777. Replacing the leaf between fstat and a
+        # second open-by-name makes EACCES on a different inode look blocked,
+        # while the detail still quotes the pinned mode.
+        real_open = privileged_spawn.os.open
+        seen: dict[str, object] = {}
+
+        def run(cmd, timeout: float) -> ProcResult:
+            exec(cmd[-1], {})
+            path = ast.literal_eval(cmd[-1].split("p=", 1)[1].split(";", 1)[0])
+            os.chmod(path, 0o644)
+            return ProcResult(0, "", "")
+
+        def hooked(path, flags, *args, **kwargs):
+            dir_fd = kwargs.get("dir_fd")
+            leaf_read = dir_fd is not None and not (
+                flags & (os.O_PATH | os.O_DIRECTORY | os.O_WRONLY | os.O_RDWR)
+            )
+            if leaf_read and not seen.get("swapped"):
+                st = os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
+                seen["pinned_mode"] = stat.S_IMODE(st.st_mode)
+                seen["pinned_ino"] = st.st_ino
+                os.unlink(path, dir_fd=dir_fd)
+                fd = real_open(
+                    path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o000, dir_fd=dir_fd
+                )
+                os.close(fd)
+                seen["read_ino"] = os.stat(path, dir_fd=dir_fd, follow_symlinks=False).st_ino
+                seen["swapped"] = True
+            return real_open(path, flags, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            os.chmod(tmp, 0o1777)
+            try:
+                with mock.patch.object(privileged_spawn.os, "open", hooked):
+                    result, detail = probe_abs_store_read(
+                        (), tmp, expected_owner=os.getuid(), run_fn=run
+                    )
+            finally:
+                os.chmod(tmp, 0o700)
+        self.assertIs(result, False, detail)
+        self.assertFalse(seen.get("swapped"))
+        self.assertIn("read ", detail)
+
+    def test_missing_opath_raises_from_the_walk(self) -> None:
+        # O_PATH is not read at import (Windows and macOS have none). A walk
+        # without it is an OSError, not an AttributeError during collection.
+        self.assertNotIn("_DIR_TRAVERSAL", vars(privileged_spawn))
+        with mock.patch.object(privileged_spawn.os, "O_PATH", None, create=True):
+            with self.assertRaises(OSError) as caught:
+                privileged_spawn._open_leaf_nofollow(os.path.join("no", "such"), os.O_RDONLY)
+        self.assertNotIsInstance(caught.exception, AttributeError)
+
     def test_ptrace_retries_eintr_and_detaches_after_the_stop(self) -> None:
         # waitpid EINTR before the attach stop, then PTRACE_DETACH returns
         # ESRCH and the tracee stays attached if that return is ignored.
@@ -1569,11 +1634,21 @@ class SpawnDefectTests(unittest.TestCase):
                 return (0, 0)
             return (0, 0)
 
+        saw_stop = False
+
         def waitpid(pid, options):
-            waits.append(pid)
+            nonlocal saw_stop
+            waits.append(options)
             if len(waits) == 1:
                 raise OSError(errno.EINTR, "interrupted")
-            return pid, stopped
+            if not saw_stop:
+                saw_stop = True
+                return pid, stopped
+            # The stop was consumed. A blocking rewait hangs with the tracee
+            # still attached; only WNOHANG is safe, and it has nothing to report.
+            if options & os.WNOHANG:
+                return 0, 0
+            raise AssertionError("blocking wait after the stop was already consumed")
 
         with mock.patch.object(privileged_spawn, "_ptrace", side_effect=ptrace):
             with mock.patch.object(privileged_spawn.os, "waitpid", side_effect=waitpid):
@@ -1582,6 +1657,8 @@ class SpawnDefectTests(unittest.TestCase):
         self.assertGreaterEqual(detach_after_waits[0], 2)
         self.assertEqual(detach_rcs[0], -1)
         self.assertEqual(detach_rcs[-1], 0)
+        self.assertGreaterEqual(len(waits), 3)
+        self.assertTrue(waits[-1] & os.WNOHANG)
 
     def test_ptrace_esrch_after_reap_is_not_a_live_attachment(self) -> None:
         def ptrace(request, pid, *args):

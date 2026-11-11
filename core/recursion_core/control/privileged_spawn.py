@@ -476,11 +476,35 @@ def _is_setuid_root(st: os.stat_result) -> bool:
     return bool(st.st_mode & stat.S_ISUID) and st.st_uid == 0
 
 
-# Directory walks use O_PATH so a search-only (0111) ancestor still yields a
-# dir fd. O_RDONLY on that directory returns EACCES even when create and read
-# of the leaf would succeed. O_NOFOLLOW applies at every component: a single
-# open of the full path would follow a symlinked ancestor.
-_DIR_TRAVERSAL = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW
+# How many times a detach may be restarted after EINTR, and how many times an
+# ESRCH may be retried once the stop has already been observed. A further
+# blocking waitpid would wait forever: that stop was already consumed.
+_PTRACE_DETACH_EINTR = 8
+_PTRACE_DETACH_RETRIES = 2
+
+
+def _opath_flag() -> int:
+    """``O_PATH``, or ``OSError`` where the platform has no such flag.
+
+    Read at call time. Windows and macOS have no ``O_PATH``, and evaluating it
+    while the module is imported makes test collection fail there.
+    """
+
+    flag = getattr(os, "O_PATH", None)
+    if not isinstance(flag, int):
+        raise OSError(errno.ENOTSUP, "O_PATH is not available")
+    return flag
+
+
+def _dir_traversal_flags() -> int:
+    """``O_PATH|O_DIRECTORY|O_NOFOLLOW`` for one directory step.
+
+    ``O_PATH`` yields a dir fd through a search-only (0111) ancestor.
+    ``O_RDONLY`` on that directory returns ``EACCES`` even when create and
+    read of the leaf would succeed. ``O_NOFOLLOW`` applies at every component.
+    """
+
+    return _opath_flag() | os.O_DIRECTORY | os.O_NOFOLLOW
 
 
 def _open_leaf_nofollow(path: str, flags: int, mode: int = 0o777) -> tuple[int, int, str]:
@@ -489,18 +513,20 @@ def _open_leaf_nofollow(path: str, flags: int, mode: int = 0o777) -> tuple[int, 
     Each directory component is opened with ``O_PATH|O_DIRECTORY|O_NOFOLLOW``,
     then the leaf with ``O_NOFOLLOW``. ``O_NOFOLLOW`` on a single ``open`` of
     the full path only covers the last component. Returns ``(leaf_fd, dir_fd, name)``.
-    The caller closes both descriptors.
+    The caller closes both descriptors. Raises ``OSError`` when ``O_PATH`` is
+    not available.
     """
 
+    traversal = _dir_traversal_flags()
     absolute = os.path.isabs(path)
     parts = [part for part in path.split(os.sep) if part]
     if not parts:
         raise OSError(errno.ENOENT, os.strerror(errno.ENOENT), path)
     name = parts.pop()
-    cur = os.open(os.sep if absolute else ".", _DIR_TRAVERSAL)
+    cur = os.open(os.sep if absolute else ".", traversal)
     try:
         for part in parts:
-            nxt = os.open(part, _DIR_TRAVERSAL, dir_fd=cur)
+            nxt = os.open(part, traversal, dir_fd=cur)
             os.close(cur)
             cur = nxt
         leaf = os.open(name, flags | os.O_NOFOLLOW, mode, dir_fd=cur)
@@ -517,7 +543,7 @@ def _fstat_nofollow(path: str) -> os.stat_result:
     ``O_PATH|O_NOFOLLOW`` and that fd is what ``fstat`` reports.
     """
 
-    fd, dirfd, _name = _open_leaf_nofollow(path, os.O_PATH)
+    fd, dirfd, _name = _open_leaf_nofollow(path, _opath_flag())
     try:
         return os.fstat(fd)
     finally:
@@ -884,38 +910,84 @@ def _await_ptrace_stop(pid: int) -> str:
             return "exited"
 
 
+def _poll_ptrace(pid: int) -> str:
+    """One non-blocking wait after the attach stop was already consumed.
+
+    Returns ``pending`` (nothing new), ``stopped``, ``exited``, or ``reaped``.
+    A blocking ``waitpid`` here waits forever: the stop is gone, and the
+    tracee stays attached until detach succeeds.
+    """
+
+    try:
+        waited, status = os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        return "reaped"
+    except OSError as exc:
+        if exc.errno == errno.ECHILD:
+            return "reaped"
+        if exc.errno == errno.EINTR:
+            return "pending"
+        raise
+    if waited == 0:
+        return "pending"
+    if os.WIFSTOPPED(status):
+        return "stopped"
+    if os.WIFEXITED(status) or os.WIFSIGNALED(status):
+        return "exited"
+    return "pending"
+
+
 def _detach_ptrace(pid: int) -> tuple[int, int, str]:
     """Wait for the attach stop, then detach. Returns ``(rc, errno, state)``.
 
     ``PTRACE_DETACH`` before that stop returns ``ESRCH`` and leaves the
-    tracee attached, so an ``EINTR`` from ``waitpid`` is not a reason to
-    detach yet. ``ESRCH`` after the tracee has been reaped means nothing
-    remains attached. Any other wait error still detaches once, then propagates,
-    so the attach is not abandoned.
+    tracee attached, so an ``EINTR`` from the first ``waitpid`` is retried.
+    Once the stop has been seen, a later ``ESRCH`` is polled with ``WNOHANG``
+    only, and both that retry and a detach ``EINTR`` are bounded. An exit or
+    reap means nothing remains attached. A wait error other than ``EINTR``
+    still detaches once; the detach result is returned and the wait error
+    does not replace it.
     """
 
     try:
         state = _await_ptrace_stop(pid)
     except OSError:
-        _ptrace(PTRACE_DETACH, pid)
-        raise
-    retries = 0
+        rc, err = _ptrace(PTRACE_DETACH, pid)
+        return rc, err, "reaped" if err == errno.ECHILD else "detach-failed"
+    eintr_left = _PTRACE_DETACH_EINTR
+    retries_left = _PTRACE_DETACH_RETRIES
     while True:
         rc, err = _ptrace(PTRACE_DETACH, pid)
-        if rc == 0 or err == errno.EINTR:
-            if rc == 0:
+        if rc == 0:
+            return rc, err, state
+        if err == errno.EINTR:
+            if eintr_left <= 0:
                 return rc, err, state
+            eintr_left -= 1
             continue
-        # Not stopped yet, or the stop raced the detach. Wait again and retry.
-        # A reaped tracee is not still attached.
-        if err == errno.ESRCH and state != "reaped" and retries < 2:
-            retries += 1
-            try:
-                state = _await_ptrace_stop(pid)
-            except OSError:
-                return rc, err, state
-            continue
-        return rc, err, state
+        if err == errno.ESRCH and state in {"reaped", "exited"}:
+            return rc, err, state
+        if err != errno.ESRCH or retries_left <= 0 or state != "stopped":
+            return rc, err, state
+        retries_left -= 1
+        try:
+            polled = _poll_ptrace(pid)
+        except OSError:
+            return rc, err, state
+        if polled == "exited":
+            state = "exited"
+        elif polled == "reaped":
+            state = "reaped"
+        # ``pending`` or another stop: try detach again, without blocking.
+
+
+def _kill_traced(pid: int) -> None:
+    """SIGKILL a tracee whose detach failed, so it is not left ptrace-stopped."""
+
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
 
 
 def probe_ptrace(pid: int) -> ProbeOutcome:
@@ -928,10 +1000,12 @@ def probe_ptrace(pid: int) -> ProbeOutcome:
             return True, detail
         return None, f"not_denied {detail}"
     detach_rc, detach_err, state = _detach_ptrace(pid)
-    # ESRCH after a reap is the tracee already being gone, not a live attach.
-    if detach_rc != 0 and not (
-        state == "reaped" and detach_err in (errno.ESRCH, errno.ECHILD)
-    ):
+    # ESRCH after a reap or exit is the tracee already being gone, not a live attach.
+    released = detach_rc == 0 or (
+        state in {"reaped", "exited"} and detach_err in (errno.ESRCH, errno.ECHILD)
+    )
+    if not released:
+        _kill_traced(pid)
         detail = (
             f"rc={detach_rc}:errno={detach_err}:"
             f"{os.strerror(detach_err) if detach_err else 'ptrace detach failed'}"
@@ -952,11 +1026,12 @@ def probe_abs_store_read(
     A writer that fails, leaves no file, leaves a symlink, or wrote as a uid
     other than ``expected_owner`` is an error (``None``), not a blocked read.
     The read walks the path with ``O_NOFOLLOW`` on every component, not only
-    the leaf. The inode is pinned with ``O_PATH`` and checked (owner and mode)
-    before the read open: a 0600 file owned by another uid is refused at that
-    open, and that ``EACCES``/``EPERM`` is blocked, not a missing store.
-    Callers still pass a directory this process created and a unique final
-    name (``store-<pid>-<ns>.secret``).
+    the leaf. The inode is pinned with ``O_PATH`` and checked (owner and mode).
+    The read reopens that same fd through ``/proc/self/fd``; a 0600 file owned
+    by another uid is refused there, and that ``EACCES``/``EPERM`` is blocked,
+    not a missing store and not a later name in the directory. Callers still
+    pass a directory this process created and a unique final name
+    (``store-<pid>-<ns>.secret``).
     """
 
     store = Path(directory) / f"store-{os.getpid()}-{time.time_ns()}.secret"
@@ -964,7 +1039,7 @@ def probe_abs_store_read(
     if result.returncode != 0:
         return None, f"writer_failed rc={result.returncode} err={(result.stderr or '')[:160]}"
     try:
-        path_fd, dirfd, name = _open_leaf_nofollow(str(store), os.O_PATH)
+        path_fd, dirfd, name = _open_leaf_nofollow(str(store), _opath_flag())
     except OSError as exc:
         # ELOOP: the leaf or an ancestor is a symlink. ENOTDIR: an earlier
         # component is not a directory (O_DIRECTORY|O_NOFOLLOW did not follow it).
@@ -984,7 +1059,9 @@ def probe_abs_store_read(
         if not stat.S_ISREG(st.st_mode):
             return None, f"not_denied store_not_regular mode={oct(st.st_mode)}"
         try:
-            read_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
+            # Reopen the pinned inode. A second lookup of ``name`` can be a
+            # different file by the time it runs (the probe directory is 01777).
+            read_fd = os.open(f"/proc/self/fd/{path_fd}", os.O_RDONLY)
         except OSError as exc:
             detail = (
                 f"{type(exc).__name__}:{exc.errno}:{exc.strerror} "

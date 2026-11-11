@@ -325,8 +325,8 @@ class Adv2RenderingTests(GuiCase):
             status, page = self.post(gui, '/action', {'command': ACTIONS[0], 'confirm': 'explicit'})
         self.assertEqual(status, 200)
         self.assertIn('<p role="status">Not sent: refused by the daemon (unavailable: operator interventions are '
-                      'not wired to the daemon; nothing was sent (run Stop is available)); '
-                      'run Stop is available</p>', page)
+                      'not wired to the daemon; nothing was sent); run Stop is available</p>', page)
+        self.assertEqual(page.count('run Stop is available'), 1)  # the GUI says it; the daemon's reason does not
         self.assertIn('<title>Not sent', page)
         self.assertNotIn('may have reached', page)
         self.assertNotIn('outcome: unknown', page)

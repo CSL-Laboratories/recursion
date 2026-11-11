@@ -448,7 +448,7 @@ class PluginHost:
         name = command.get('command') if isinstance(command, dict) else None
         if name in ACTIONS:
             return 503, {'error': 'unavailable: operator interventions are not wired to the daemon; '
-                                  'nothing was sent (run Stop is available)'}
+                                  'nothing was sent'}
         if name not in READS:
             return 400, {'error': 'command_not_in_operator_contract'}
         if self.health.poisoned:

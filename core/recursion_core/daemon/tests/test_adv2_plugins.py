@@ -127,7 +127,8 @@ class Adv2FaultingPluginTests(Adv2HostCase):
         for action in ACTIONS:
             status, body = host.operator(o7_command(action, 'gui', True))
             self.assertEqual(status, 503)
-            self.assertIn('nothing was sent', body['error'])
+            self.assertEqual(body, {'error': 'unavailable: operator interventions are not wired to the daemon; '
+                                             'nothing was sent'})
         self.assertEqual(host.loader._active['fixture.operator'].module.CALLS, [])
         self.assertEqual(host.operator({'command': 'operator.orders.submit'}), (400, {'error': 'command_not_in_operator_contract'}))
         self.assertEqual(host.operator(['not', 'a', 'dict'])[0], 400)

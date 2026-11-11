@@ -363,7 +363,10 @@ class DualEraServer:
         clock = self._clock()
         started = _timestamp(rec.get("started_at"), clock)
         now = _iso(started)
-        updated = rec.get("stop") or {}
+        # ControlAPI writes a stop mapping. A truthy non-mapping (a corrupt or
+        # foreign record) is not one: tasks/get must still answer, using started_at.
+        stop_val = rec.get("stop")
+        updated = stop_val if isinstance(stop_val, Mapping) else {}
         last = _timestamp(updated.get("requested_at"), started)
         body = {
             "resultType": "complete",

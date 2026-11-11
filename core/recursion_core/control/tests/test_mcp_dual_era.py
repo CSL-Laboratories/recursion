@@ -712,6 +712,25 @@ class NotificationAndTimestampTests(unittest.TestCase):
         self.assertEqual(reply["result"]["createdAt"], _iso(clock))
         self.assertEqual(reply["result"]["lastUpdatedAt"], _iso(clock))
 
+    def test_truthy_non_mapping_stop_does_not_crash_tasks_get(self) -> None:
+        # A corrupt or foreign record can store stop=True. That is not a stop
+        # mapping, so tasks/get must still return a body and keep lastUpdatedAt
+        # on createdAt (started_at), not raise AttributeError.
+        started = 1000.0
+        clock = 2000.0
+        api, registry, _, _ = make_api()
+        registry.put(self._record(started_at=started, stop=True))
+        server = DualEraServer(api, clock=lambda: clock)
+        reply = server.handle({
+            "jsonrpc": "2.0", "id": "g1", "method": "tasks/get",
+            "params": modern_params(taskId="run-1"),
+        })
+        self.assertNotIn("error", reply)
+        body = reply["result"]
+        self.assertEqual(body["createdAt"], _iso(started))
+        self.assertEqual(body["lastUpdatedAt"], body["createdAt"])
+        self.assertNotEqual(body["lastUpdatedAt"], _iso(clock))
+
     def test_bool_started_at_is_not_a_timestamp(self) -> None:
         clock = 1_762_639_200.0
         api, registry, _, _ = make_api()

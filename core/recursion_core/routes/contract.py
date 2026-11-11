@@ -317,10 +317,11 @@ _QUOTA_DENIED_AFTER = re.compile(
 )
 # Credential shapes. Word boundaries so "task-12345678" is not an sk- key. Case-insensitive.
 # JSON ``\uXXXX`` / ``\/`` and ``%HH`` are peeled in turn, and every intermediate view is searched.
-# Userinfo is one forward walk of the authority: the scheme separator may be encoded, then the walk
-# stops at whitespace, ``?``, ``#`` or a raw ``/``. ``%2F`` inside a password is not that slash.
-# A later ``@`` in the path or in the following text is left alone. A hyphen written as ``\u002d``
-# still matches. Decoded text is only a search view: non-secret escapes stay as they were written.
+# Userinfo is one forward walk of the authority. The scheme separator may be encoded, including
+# ``%5C%2F`` and ``\%2F``. The walk stops at whitespace, quotes, brackets and the other host
+# delimiters, and at ``%2F`` / ``%3F`` / ``%23`` once ``@`` has been seen or before any colon.
+# Between the colon and ``@`` those encodings stay inside the password. A later ``@`` is left alone.
+# A hyphen written as ``\u002d`` still matches. Decoded text is only a search view.
 _SECRET = re.compile(
     r"(?<!\w)eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}(?!\w)"
     r"|(?<!\w)sk-[A-Za-z0-9_-]{8,}(?!\w)"
@@ -332,13 +333,15 @@ _SECRET = re.compile(
     r"|(?<!\w)ya29\.[A-Za-z0-9._-]{10,}(?!\w)",
     re.IGNORECASE,
 )
-_URL_USERINFO = re.compile(r"https?://([^\s/@:]+:[^\s/@]+)@", re.IGNORECASE)
 _JSON_U = re.compile(r"\\u([0-9a-fA-F]{4})")
-# Scheme separator, longest first so ``\u003a`` is not read as a bare colon. The authority walk treats
-# the same slash and colon spellings as ordinary characters, not as the end of the authority.
-_COLON_FORMS = ("\\u003a", "%3a", "\\:", ":")
-_SLASH_FORMS = ("\\u002f", "%2f", "\\/", "/")
-_AUTHORITY_ORDINARY = ("\\u002f", "\\u003a", "%2f", "%3a", "\\/", "\\:")
+# Longest first. ``%5C%2F`` / ``\%2F`` are a slash; ``%5C%3A`` / ``\%3A`` are a colon. The 6-character
+# window is enough for each of them.
+_COLON_FORMS = ("%5c%3a", "\\u003a", "\\%3a", "%3a", "\\:", ":")
+_SLASH_FORMS = ("%5c%2f", "\\u002f", "\\%2f", "%2f", "\\/", "/")
+# Raw host delimiters, plus the encoded slash, query and hash that end an authority once userinfo
+# is over (or before a password colon has been seen).
+_AUTHORITY_END = frozenset(" \t\r\n?#/\"',;<>()[]{}")
+_ENCODED_AUTHORITY_END = ("%2f", "%3f", "%23")
 
 
 # One round is a JSON peel and then a percent peel. Eight rounds are shared. A value that is still
@@ -429,11 +432,24 @@ def _take_ci(text: str, index: int, forms: tuple[str, ...]) -> int:
     return found
 
 
+def _two_slashes(text: str, index: int) -> int:
+    """Length of two slash forms at ``index``, or 0."""
+
+    first = _take_ci(text, index, _SLASH_FORMS)
+    if not first:
+        return 0
+    second = _take_ci(text, index + first, _SLASH_FORMS)
+    if not second:
+        return 0
+    return first + second
+
+
 def _scheme_authority_start(text: str, index: int) -> int:
     """Index where the authority starts, or 0 when ``index`` is not an http(s) scheme.
 
-    Only the scheme separator is recognised in encoded form (``%2F``, ``\\/``, ``\\u002f``, and the
-    same spellings of the colon). The authority itself is not rewritten.
+    Only the scheme separator is recognised in encoded form. ``https:%5C%3A%2F%2F`` has an encoded
+    colon between the scheme colon and the slashes; that colon is part of the separator, so the
+    password is still matched while ``%20`` is ``%20``. The authority itself is not rewritten.
     """
 
     if text[index:index + 5].lower() == "https":
@@ -446,20 +462,21 @@ def _scheme_authority_start(text: str, index: int) -> int:
     if not colon:
         return 0
     cursor += colon
-    for _ in range(2):
-        slash = _take_ci(text, cursor, _SLASH_FORMS)
-        if not slash:
-            return 0
-        cursor += slash
-    return cursor
+    extra = _take_ci(text, cursor, _COLON_FORMS)
+    if extra and _two_slashes(text, cursor + extra):
+        cursor += extra
+    slashes = _two_slashes(text, cursor)
+    if not slashes:
+        return 0
+    return cursor + slashes
 
 
 def _authority_userinfo(text: str) -> list[tuple[int, int]]:
     """Userinfo spans: after the scheme separator, through the last ``@`` or ``%40`` in the authority.
 
-    One forward pass. The authority ends at whitespace, ``?``, ``#`` or a raw ``/``. Encoded slashes
-    and colons stay inside it, so a password's ``%2F`` does not end the walk and a later ``@`` does
-    not extend it.
+    One forward pass. The authority ends at whitespace, quotes, brackets, ``?``, ``#`` or a raw ``/``.
+    ``%2F``, ``%3F`` and ``%23`` also end it once ``@`` has been seen, and before any colon. Between
+    the colon and that separator they stay in the password, so ``user:dummy%2Fpassword@host`` is one span.
     """
 
     found: list[tuple[int, int]] = []
@@ -472,21 +489,40 @@ def _authority_userinfo(text: str) -> list[tuple[int, int]]:
             continue
         cursor = auth
         last = auth
+        seen_colon = False
+        seen_sep = False
         while cursor < length:
             if text[cursor] in "%\\":
-                if text[cursor:cursor + 3].lower() == "%40":
+                piece = text[cursor:cursor + 3].lower()
+                if piece == "%40":
                     last = cursor
+                    seen_sep = True
                     cursor += 3
                     continue
-                unit = _take_ci(text, cursor, _AUTHORITY_ORDINARY)
+                if piece in _ENCODED_AUTHORITY_END:
+                    if seen_sep or not seen_colon:
+                        break
+                    cursor += 3
+                    continue
+                colon_unit = _take_ci(text, cursor, _COLON_FORMS)
+                if colon_unit:
+                    seen_colon = True
+                    cursor += colon_unit
+                    continue
+                unit = _take_ci(text, cursor, _SLASH_FORMS)
                 if unit:
                     cursor += unit
                     continue
             char = text[cursor]
-            if char in " \t\r\n?#/":
+            if char in _AUTHORITY_END:
                 break
             if char == "@":
                 last = cursor
+                seen_sep = True
+                cursor += 1
+                continue
+            if char == ":":
+                seen_colon = True
                 cursor += 1
                 continue
             cursor += 1
@@ -532,8 +568,6 @@ def _collect_secret_hits(text: str, spans: list[tuple[int, int]], hits: list[tup
         if end > start:
             hits.append((spans[start][0], spans[end - 1][1]))
 
-    for match in _URL_USERINFO.finditer(text):
-        add(match.start(1), match.end(1))
     for start, end in _authority_userinfo(text):
         add(start, end)
     for match in _SECRET.finditer(text):

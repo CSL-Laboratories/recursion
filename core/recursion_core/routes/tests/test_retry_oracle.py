@@ -910,6 +910,33 @@ class ReviewFollowupTest(unittest.TestCase):
         self.assertIn("example.com/files", redacted)
         self.assertIn("a@b.txt", redacted)
 
+    def test_encoded_scheme_separator_keeps_percent_in_the_password(self) -> None:
+        raw = "prefix https:%5C%2F%5C%2Fuser:dummy%20password@example.invalid/hook suffix"
+        colon = "prefix https:%5C%3A%2F%2Fuser:dummy%20password@example.invalid/hook suffix"
+        for text in (raw, colon):
+            redacted = c.redact(text)
+            self.assertNotIn("dummy%20password", redacted)
+            self.assertIn("example.invalid", redacted)
+
+    def test_authority_stops_before_the_host_delimiter(self) -> None:
+        js = '{"url":"https://user:dummy_password@example.invalid","email":"ops@example.com"}'
+        path = "https://user:dummy_password@example.invalid%2Ffiles%2Fa@b.txt"
+        public = "https://example.com%3Fq=user@host"
+        markdown = "[site](https://example.com)[mail](mailto:ops@example.com)"
+        redacted = c.redact(js)
+        self.assertIn("example.invalid", redacted)
+        self.assertIn("ops@example.com", redacted)
+        self.assertNotIn("dummy_password", redacted)
+        redacted = c.redact(path)
+        self.assertIn("example.invalid%2Ffiles", redacted)
+        self.assertNotIn("dummy_password", redacted)
+        self.assertEqual(c.redact(public), public)
+        self.assertEqual(c.redact(markdown), markdown)
+        for password in ("user:dummy%2Fpassword@example.invalid/hook", "user:dummy%3Fpassword@example.invalid/hook"):
+            redacted = c.redact("https://" + password)
+            self.assertNotIn("password", redacted)
+            self.assertIn("example.invalid", redacted)
+
     def test_repeated_urls_redact_within_a_second(self) -> None:
         for unit in ("https://a@b ", "https://example.com/docs "):
             blob = (unit * (400_000 // len(unit) + 1))[:400_000]

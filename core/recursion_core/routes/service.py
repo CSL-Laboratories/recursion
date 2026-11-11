@@ -7,6 +7,7 @@ contract result with a typed code, so the same tests can drive a later port thro
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable, Mapping
 
 from recursion_core.routes import contract as c
@@ -21,6 +22,97 @@ class RouteService:
         self._adapters, self._breaker, self._clock = dict(adapters), breaker, clock
         # The user's default limit behaviour; a request's own route.limits overrides it. Default: ask.
         self._limits = lim.validate_limits(limits if limits is not None else lim.DEFAULT_LIMITS)
+        self._gate = threading.Condition()
+        self._closed = False
+        self._pending = 0  # launches past the closed check that have not registered yet
+        self._live: dict[int, object] = {}  # id(proc) -> proc; a handle need not be hashable
+        self._retained: set[int] = set()  # fence failed; drop must not forget these
+        self._inflight: set[str] = set()
+        for adapter in self._adapters.values():
+            adapter._drop_process = self._drop_process
+            adapter._keep_process = self._keep_process
+            adapter._launcher = self._wrap_launcher(adapter._launcher)
+
+    def shutdown(self) -> None:
+        """Refuse later requests and fence every child this service still has.
+
+        Waits for a launch that has already passed the closed check, so a child created after
+        this call began is fenced before this call returns. A fence that raises stays in the
+        live set and this call raises; a later shutdown retries it.
+        """
+
+        with self._gate:
+            self._closed = True
+            while self._pending:
+                self._gate.wait()
+            live = list(self._live.items())
+        errors: list[BaseException] = []
+        for key, proc in live:
+            err = self._fence(proc)
+            if err is None:
+                with self._gate:
+                    if self._live.get(key) is proc:
+                        del self._live[key]
+                    self._retained.discard(key)
+            else:
+                errors.append(err)
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise ExceptionGroup("shutdown fence failed", errors)
+
+    def _wrap_launcher(self, inner):
+        def launch(argv, **kwargs):
+            with self._gate:
+                if self._closed:
+                    raise c.RouteError(c.LAUNCH_REFUSED, "shutdown")
+                self._pending += 1
+            try:
+                proc = inner(argv, **kwargs)
+                with self._gate:
+                    closed = self._closed
+                if closed:
+                    err = self._fence(proc)
+                    if err is not None:
+                        with self._gate:
+                            self._live[id(proc)] = proc
+                        raise err
+                    raise c.RouteError(c.LAUNCH_REFUSED, "shutdown")
+                with self._gate:
+                    self._live[id(proc)] = proc
+                return proc
+            finally:
+                with self._gate:
+                    self._pending -= 1
+                    self._gate.notify_all()
+
+        return launch
+
+    @staticmethod
+    def _fence(proc) -> BaseException | None:
+        try:
+            proc.fence("shutdown")
+        except Exception as err:
+            return err
+        return None
+
+    def _keep_process(self, proc) -> None:
+        """A fence failed. Leave the handle for a later shutdown to retry."""
+
+        with self._gate:
+            self._live[id(proc)] = proc
+            self._retained.add(id(proc))
+
+    def _drop_process(self, proc) -> None:
+        with self._gate:
+            # After a failed fence (shutdown, or the driver's own fence) the child stays tracked so
+            # the next shutdown retries. A successful fence has already removed it. A normal end,
+            # before shutdown, forgets it.
+            key = id(proc)
+            if self._closed or key in self._retained:
+                return
+            if self._live.get(key) is proc:
+                del self._live[key]
 
     def handle(self, request: object) -> dict:
         rid = request.get("request_id") if isinstance(request, Mapping) else None
@@ -30,6 +122,20 @@ class RouteService:
             limits = lim.validate_limits(req["route"]["limits"]) if "limits" in req["route"] else self._limits
         except c.RouteError as err:
             return c.result(rid, err.code, detail=err.detail)
+        with self._gate:
+            if self._closed:
+                return c.result(req["request_id"], c.LAUNCH_REFUSED, detail="shutdown")
+            if req["request_id"] in self._inflight:
+                # A second run of the same id would book a second attempt and launch another child.
+                return c.result(req["request_id"], c.LAUNCH_REFUSED, detail="request in flight")
+            self._inflight.add(req["request_id"])
+        try:
+            return self._handle_locked(req, limits)
+        finally:
+            with self._gate:
+                self._inflight.discard(req["request_id"])
+
+    def _handle_locked(self, req: dict, limits: Mapping) -> dict:
         # One absolute deadline for the request, shared by every fallback. A later attempt does not
         # get a fresh deadline_s (11.2: the request stops at the deadline the caller set).
         deadline_at = self._clock() + float(req["deadline_s"])
@@ -65,7 +171,8 @@ class RouteService:
         adapter = self._adapters.get(route["engine"])
         if adapter is None:
             return c.result(rid, c.ENGINE_UNKNOWN, detail=f"no adapter for {route['engine']}")
-        connection, model, tenant = c.connection_key(route), route["model"], req["tenant"]
+        # API keys share a meter by custody lookup. Subscription logins stay per engine.
+        connection, model, tenant = c.breaker_key(route), route["model"], req["tenant"]
         remaining = deadline_at - self._clock()
         if remaining <= 0:
             return c.result(rid, c.DEADLINE_EXCEEDED, detail="recursion deadline")

@@ -110,11 +110,11 @@ class ClaudeCodeTest(unittest.TestCase):
         self.assertEqual(res["events"][0]["kind"], "retry")
         self.assertEqual(res["events"][0]["data"]["error_status"], 429)
         self.assertEqual(res["code"], c.ENGINE_ERROR)
-        self.assertEqual(h.breaker.state("subscription:login-A"), "closed")
+        self.assertEqual(h.breaker.state("claude_code:subscription:login-A"), "closed")
         h = Harness([[retry]])  # stream ends after the retry, with no result
         res = h.handle(request())
         self.assertEqual(res["code"], c.ENGINE_EXITED)
-        self.assertEqual(h.breaker.state("subscription:login-A"), "closed")
+        self.assertEqual(h.breaker.state("claude_code:subscription:login-A"), "closed")
 
     def test_result_rate_limit_info_is_a_plan_limit_even_without_status(self) -> None:
         result = {"type": "result", "subtype": "error_during_execution", "is_error": True,
@@ -133,7 +133,7 @@ class ClaudeCodeTest(unittest.TestCase):
         res = h.handle(request(model="claude-opus-4"))
         self.assertEqual(res["limit"], {"scope": "model", "model": "opus", "reset_at": 1_000_400.0,
                                         "source": "claude.rate_limit_event"})
-        self.assertEqual(h.breaker.state("subscription:login-A"), "closed")
+        self.assertEqual(h.breaker.state("claude_code:subscription:login-A"), "closed")
         self.assertEqual(h.handle(request(rid="s", model="claude-sonnet-4"))["status"], "ok")
         self.assertEqual(h.handle(request(rid="o", model="claude-opus-4-5"))["code"], c.BREAKER_OPEN)
 
@@ -180,7 +180,7 @@ class ClaudeCodeTest(unittest.TestCase):
         self.assertEqual(res["code"], c.ENGINE_ERROR)
         self.assertIn("BrokenPipeError", res["detail"])
         self.assertEqual(pipe.fenced, ["io_error"])
-        self.assertEqual(service._breaker.state("subscription:login-A"), "closed")
+        self.assertEqual(service._breaker.state("claude_code:subscription:login-A"), "closed")
 
     def test_api_retry_without_rate_limit_info_does_not_trip(self) -> None:
         retry = {"type": "system", "subtype": "api_retry", "attempt": 1, "error_status": 529, "error": "overloaded"}
@@ -197,13 +197,13 @@ class ClaudeCodeTest(unittest.TestCase):
         h = Harness([payload])
         res = h.handle(request())
         self.assertEqual((res["status"], res["code"], res["breaker_effect"]), ("ok", None, "none"))
-        self.assertEqual(h.breaker.state("subscription:login-A"), "closed")
+        self.assertEqual(h.breaker.state("claude_code:subscription:login-A"), "closed")
 
     def test_vague_quota_text_is_a_short_fault_on_one_model(self) -> None:
         h = Harness([claude_error("Quota exceeded, try later"), claude_ok(), claude_ok()])
         res = h.handle(request())
         self.assertEqual((res["code"], res["breaker_effect"]), (c.SHORT_FAULT, "short_fault"))
-        self.assertEqual(h.breaker.state("subscription:login-A"), "closed")
+        self.assertEqual(h.breaker.state("claude_code:subscription:login-A"), "closed")
         self.assertEqual(h.handle(request(tenant="t2"))["status"], "ok")
         self.assertEqual(h.handle(request(model="claude-other"))["status"], "ok")
         refused = h.handle(request())
@@ -285,9 +285,9 @@ class CodexTest(unittest.TestCase):
         self.assertEqual(res["limit"]["scope"], "model")
         self.assertEqual(res["limit"]["model"], "gpt-5-bucket")
         # The vendor bucket is the key. The route model is not fenced just because this turn asked for it.
-        self.assertEqual(h.breaker.state("subscription:login-A", "gpt-5"), "closed")
-        self.assertEqual(h.breaker.state("subscription:login-A", "gpt-5-bucket"), "open")
-        self.assertEqual(h.breaker.state("subscription:login-A"), "closed")
+        self.assertEqual(h.breaker.state("codex:subscription:login-A", "gpt-5"), "closed")
+        self.assertEqual(h.breaker.state("codex:subscription:login-A", "gpt-5-bucket"), "open")
+        self.assertEqual(h.breaker.state("codex:subscription:login-A"), "closed")
 
     def test_failed_turn_after_an_exhausted_bucket_opens_that_bucket(self) -> None:
         note = {"method": "account/rateLimits/updated",
@@ -297,7 +297,7 @@ class CodexTest(unittest.TestCase):
         h, res = self.codex([codex_script(notes=[note], turn=turn), codex_script("next")])
         self.assertEqual(res["code"], c.PLAN_LIMIT)
         self.assertEqual(res["limit"]["model"], "gpt-5-bucket")
-        self.assertEqual(h.breaker.state("subscription:login-A", "gpt-5"), "closed")
+        self.assertEqual(h.breaker.state("codex:subscription:login-A", "gpt-5"), "closed")
         self.assertEqual(h.handle(request(rid="other", engine="codex", model="gpt-5"))["text"], "next")
 
     def test_api_key_route_ignores_a_chatgpt_rate_limit_read_error(self) -> None:
@@ -310,7 +310,7 @@ class CodexTest(unittest.TestCase):
                   {"method": "turn/completed", "params": {"turn": {"id": "tu-1", "status": "completed"}}}]
         h, res = self.codex([script], kind="api_key", conn_id="key-1", credential_env="OPENAI_API_KEY")
         self.assertEqual((res["status"], res["text"]), ("ok", "keyed"))
-        self.assertEqual(h.breaker.state("api_key:key-1"), "closed")
+        self.assertEqual(h.breaker.state("api_key:openai:OPENAI_API_KEY:key-1"), "closed")
         methods = [m.get("method") for m in h.launcher.processes[0].sent]
         self.assertIn("turn/start", methods)
 

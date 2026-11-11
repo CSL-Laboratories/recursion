@@ -257,6 +257,10 @@ def _classify_result(rid: str, msg: dict, limit: dict | None, events: list, mode
     if msg.get("error") in ("authentication_failed", "oauth_token_expired") or msg.get("api_error_status") == 401:
         return c.result(rid, c.AUTH_FAILED, events=events, detail=str(msg.get("error") or "401"))
     text = msg.get("result")
-    if c.sounds_like_quota(text) or any(c.sounds_like_quota(e) for e in msg.get("errors") or [] if isinstance(e, str)):
+    errors = msg.get("errors")
+    # A non-list `errors` (a number, a string, an object) is not a list of messages. Treating it as
+    # iterable raises, skips the fence, and leaves the child running.
+    lines = errors if isinstance(errors, list) else ()
+    if c.sounds_like_quota(text) or any(c.sounds_like_quota(e) for e in lines if isinstance(e, str)):
         return c.result(rid, c.SHORT_FAULT, events=events, detail=f"untyped quota-like text on {model}")
     return c.result(rid, c.ENGINE_ERROR, events=events, detail=str(scalar(msg.get("subtype")) or "error"))

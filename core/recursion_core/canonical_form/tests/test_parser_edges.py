@@ -7,7 +7,9 @@ a decision that the behaviour is the rule.
 
 from __future__ import annotations
 
+import json
 import sys
+import tracemalloc
 import unittest
 
 from recursion_core.canonical_form import vectors_build as vb
@@ -63,33 +65,57 @@ class CanonicalDefectTests(unittest.TestCase):
         self.assertEqual(0, loads_strict("0"))
 
     def test_post_decode_validation_does_not_leak_recursion_error(self) -> None:
-        # json.loads of 128 arrays succeeds on the C scanner, then check_value
-        # and the serializer used to recurse. A caller already near the recursion
-        # limit saw RecursionError instead of a value or CanonicalError("depth").
+        # check_value and the serializer used to recurse. A caller already near
+        # the recursion limit saw RecursionError. The trees are built in memory:
+        # the pure-Python JSON scanner refuses 128 arrays at this limit, and
+        # that host refusal is CanonicalError("depth"), not a test error.
         old = sys.getrecursionlimit()
         sys.setrecursionlimit(100)
         try:
+            built = 0
+            for _ in range(128):
+                built = [built]
+            raw = canonical_bytes(built)
+            self.assertEqual(b"[" * 128 + b"0" + b"]" * 128, raw)
+            self.assertEqual(64, len(digest(built)))
+            too_deep = built
+            for _ in range(72):
+                too_deep = [too_deep]
+            with self.assertRaises(CanonicalError) as cm:
+                check_value(too_deep)
+            self.assertEqual("depth", cm.exception.kind)
+            with self.assertRaises(CanonicalError) as cm:
+                canonical_bytes(too_deep)
+            self.assertEqual("depth", cm.exception.kind)
             try:
-                value = loads_strict("[" * 128 + "0" + "]" * 128)
-                self.assertTrue(canonical_bytes(value).startswith(b"["))
-                self.assertEqual(64, len(digest(value)))
-                built = 0
-                for _ in range(80):
-                    built = [built]
-                self.assertIsInstance(canonical_bytes(built), bytes)
-                too_deep = 0
-                for _ in range(200):
-                    too_deep = [too_deep]
-                with self.assertRaises(CanonicalError) as cm:
-                    check_value(too_deep)
-                self.assertEqual("depth", cm.exception.kind)
-                with self.assertRaises(CanonicalError) as cm:
-                    canonical_bytes(too_deep)
-                self.assertEqual("depth", cm.exception.kind)
+                loaded = loads_strict(raw.decode("ascii"))
             except RecursionError as exc:
-                self.fail(f"post-decode validation leaked RecursionError: {exc}")
+                self.fail(f"text decode leaked RecursionError: {exc}")
+            except CanonicalError as exc:
+                self.assertEqual("depth", exc.kind)
+            else:
+                self.assertEqual(raw, canonical_bytes(loaded))
+        except RecursionError as exc:
+            self.fail(f"post-decode validation leaked RecursionError: {exc}")
         finally:
             sys.setrecursionlimit(old)
+
+    def test_wide_list_is_not_copied_onto_the_walk_stack(self) -> None:
+        # Pushing every sibling allocated a frame per element. A flat list the
+        # host decoder accepts must stay in the same order of magnitude.
+        count = 100_000
+        text = "[0" + ",0" * (count - 1) + "]"
+        tracemalloc.start()
+        host = json.loads(text)
+        _, host_peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        del host
+        tracemalloc.start()
+        value = loads_strict(text)
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        self.assertEqual(count, len(value))
+        self.assertLess(peak, host_peak * 2 + 200_000)
 
     def test_iterative_validation_keeps_first_fault_order(self) -> None:
         # The first key is fully checked before the next key's type. A later
@@ -100,6 +126,12 @@ class CanonicalDefectTests(unittest.TestCase):
         with self.assertRaises(CanonicalError) as cm:
             check_value({2: 3, "a": 1})
         self.assertEqual("non_string_key", cm.exception.kind)
+        with self.assertRaises(CanonicalError) as cm:
+            check_value([1.0, {2: 1}])
+        self.assertEqual("float", cm.exception.kind)
+        with self.assertRaises(CanonicalError) as cm:
+            check_value([{"a": "\ud800"}, {2: 1}])
+        self.assertEqual("lone_surrogate", cm.exception.kind)
 
 
 class WireProfileAgreementTests(unittest.TestCase):

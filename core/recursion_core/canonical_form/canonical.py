@@ -110,25 +110,35 @@ def loads_strict(data: str | bytes) -> Any:
 def check_value(value: Any, depth: int = 0) -> None:
     """Raise :class:`CanonicalError` if an in-memory value is outside the domain.
 
-    The walk is an explicit stack. A recursive walk raises ``RecursionError``
-    for an in-domain value when the caller is already near the recursion limit,
-    and for a too-deep value it leaks that error instead of ``depth``.
+    The walk is an explicit stack of continuation frames. Each list or dict
+    frame holds an iterator and advances one child at a time, so the stack is
+    O(depth) and a wide list is not copied onto it. Dict pairs stay in
+    insertion order: a key is fully checked, then its value, and a non-string
+    key is reported when that pair is reached.
     """
-    # ("check", value, depth) or ("dict", items, next_index, depth).
-    # Dict pairs run left to right: the key is fully checked, then its value,
-    # and a non-string key is reported when that pair is reached, not before
-    # earlier pairs.
+    # ("check", value, depth), ("list", iterator, depth), ("dict", iterator, depth).
     stack: list[tuple] = [("check", value, depth)]
     while stack:
         frame = stack.pop()
-        if frame[0] == "dict":
-            _, items, index, depth = frame
-            if index >= len(items):
+        kind = frame[0]
+        if kind == "list":
+            _, iterator, depth = frame
+            try:
+                item = next(iterator)
+            except StopIteration:
                 continue
-            key, item = items[index]
+            stack.append(frame)
+            stack.append(("check", item, depth + 1))
+            continue
+        if kind == "dict":
+            _, iterator, depth = frame
+            try:
+                key, item = next(iterator)
+            except StopIteration:
+                continue
             if not isinstance(key, str):
                 raise CanonicalError("non_string_key")
-            stack.append(("dict", items, index + 1, depth))
+            stack.append(frame)
             stack.append(("check", item, depth + 1))
             stack.append(("check", key, depth + 1))
             continue
@@ -149,10 +159,9 @@ def check_value(value: Any, depth: int = 0) -> None:
             raise CanonicalError("non_finite" if current != current or current in (float("inf"), float("-inf"))
                                  else "float")
         elif isinstance(current, list):
-            for item in reversed(current):
-                stack.append(("check", item, depth + 1))
+            stack.append(("list", iter(current), depth))
         elif isinstance(current, dict):
-            stack.append(("dict", list(current.items()), 0, depth))
+            stack.append(("dict", iter(current.items()), depth))
         else:
             raise CanonicalError("unsupported_type", type(current).__name__)
 
@@ -179,17 +188,50 @@ def _utf16_key(s: str) -> bytes:
 
 
 def _serialize(value: Any, out: list[str]) -> None:
-    """Append canonical JSON for ``value``. Iterative, same bytes as the recursive form.
+    """Append canonical JSON for ``value``. Same bytes as the recursive form.
 
     ``check_value`` has already rejected anything that is not null, a boolean,
-    an in-range int, a string, a list, or a dict with string keys.
+    an in-range int, a string, a list, or a dict with string keys. List and
+    dict frames hold an iterator and emit one child at a time. Dict keys are
+    still sorted by UTF-16 code units before that iterator starts.
     """
+    # ("val", value), ("lit", text), ("list", iterator, started),
+    # ("dict", key_iterator, mapping, started). ``started`` means a child has
+    # already been emitted, so the next child needs a comma.
     stack: list[tuple] = [("val", value)]
     while stack:
-        kind, current = stack.pop()
+        frame = stack.pop()
+        kind = frame[0]
         if kind == "lit":
-            out.append(current)
+            out.append(frame[1])
             continue
+        if kind == "list":
+            _, iterator, started = frame
+            try:
+                item = next(iterator)
+            except StopIteration:
+                out.append("]")
+                continue
+            stack.append(("list", iterator, True))
+            stack.append(("val", item))
+            if started:
+                stack.append(("lit", ","))
+            continue
+        if kind == "dict":
+            _, keys, mapping, started = frame
+            try:
+                key = next(keys)
+            except StopIteration:
+                out.append("}")
+                continue
+            stack.append(("dict", keys, mapping, True))
+            stack.append(("val", mapping[key]))
+            stack.append(("lit", ":"))
+            stack.append(("lit", _string(key)))
+            if started:
+                stack.append(("lit", ","))
+            continue
+        current = frame[1]
         if current is None:
             out.append("null")
         elif current is True:
@@ -201,22 +243,10 @@ def _serialize(value: Any, out: list[str]) -> None:
         elif isinstance(current, str):
             out.append(_string(current))
         elif isinstance(current, list):
-            stack.append(("lit", "]"))
-            for index in range(len(current) - 1, -1, -1):
-                stack.append(("val", current[index]))
-                if index:
-                    stack.append(("lit", ","))
+            stack.append(("list", iter(current), False))
             stack.append(("lit", "["))
         else:
-            keys = sorted(current, key=_utf16_key)
-            stack.append(("lit", "}"))
-            for index in range(len(keys) - 1, -1, -1):
-                key = keys[index]
-                stack.append(("val", current[key]))
-                stack.append(("lit", ":"))
-                stack.append(("lit", _string(key)))
-                if index:
-                    stack.append(("lit", ","))
+            stack.append(("dict", iter(sorted(current, key=_utf16_key)), current, False))
             stack.append(("lit", "{"))
 
 

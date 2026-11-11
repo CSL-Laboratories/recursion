@@ -410,12 +410,12 @@ class DualEraServer:
             # (bot review 4517669064).
             state = "stopped" if answer["code"] == "stopped" else "stop_pending"
             rec = dict(before["run"], state=state)
-            stop = dict(rec.get("stop") or {})
-            # Keep a value already on the record, including a bool or other non-time.
-            # _task_body normalises that to started_at, which is what the next tasks/get
-            # reads. Replacing it here with the server clock makes this reply newer than
-            # that poll. Fill the clock in only for a stop that was stored without a time.
-            if "requested_at" not in stop and answer.get("recorded") is not False:
+            prior = rec.get("stop")
+            stop = dict(prior) if isinstance(prior, Mapping) else {}
+            # A stop that was already on the record keeps whatever time it has, including
+            # none. _task_body then uses started_at, matching the next tasks/get. The
+            # server clock is only for a Stop that created the record and stored it.
+            if not isinstance(prior, Mapping) and answer.get("recorded") is not False:
                 stop["requested_at"] = self._clock()
             if stop:
                 rec["stop"] = stop

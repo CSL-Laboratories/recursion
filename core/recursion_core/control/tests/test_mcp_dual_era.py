@@ -817,6 +817,41 @@ class NotificationAndTimestampTests(unittest.TestCase):
         self.assertNotEqual(body["lastUpdatedAt"], _iso(2000.0))
         self.assertIs(registry.get(run_id)["stop"]["requested_at"], True)
 
+    def test_cancel_fallback_leaves_a_missing_stop_time_absent(self) -> None:
+        # A stop record that already exists but has no requested_at must not gain the
+        # server clock. The stored record stays without that field, and tasks/get
+        # falls back to started_at, so the two replies have to match.
+        from recursion_core.control.registry import EMPTY
+        registry = _OutageRegistry()
+        api = ControlAPI(registry, FakeKillTree(answers=(EMPTY,)), FakeStarter(), clock=lambda: 1000.0)
+        server = DualEraServer(api, clock=lambda: 2000.0)
+        run_id = started(api)
+        rec = registry.get(run_id)
+        rec["stop"] = {"checks": 1, "requested": True}
+        registry.put(rec)
+        real_stop = api.stop
+
+        def stop_then_outage(rid: str) -> dict:
+            answer = real_stop(rid)
+            registry.down = True
+            return answer
+
+        api.stop = stop_then_outage
+        body = server.handle({
+            "jsonrpc": "2.0", "id": "tc", "method": "tasks/cancel",
+            "params": modern_params(taskId=run_id),
+        })["result"]
+        registry.down = False
+        polled = server.handle({
+            "jsonrpc": "2.0", "id": "g", "method": "tasks/get",
+            "params": modern_params(taskId=run_id),
+        })["result"]
+        stored = registry.get(run_id)["stop"]
+        self.assertNotIn("requested_at", stored)
+        self.assertEqual(body["lastUpdatedAt"], _iso(1000.0))
+        self.assertEqual(body["lastUpdatedAt"], polled["lastUpdatedAt"])
+        self.assertNotEqual(body["lastUpdatedAt"], _iso(2000.0))
+
 
 if __name__ == "__main__":
     unittest.main()

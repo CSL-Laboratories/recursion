@@ -317,9 +317,10 @@ _QUOTA_DENIED_AFTER = re.compile(
 )
 # Credential shapes. Word boundaries so "task-12345678" is not an sk- key. Case-insensitive, and
 # applied after JSON ``\uXXXX`` and ``\/`` escapes are decoded, including a second layer
-# (``\\/``, ``\u005c/``, or a mix of the two). A hyphen written as ``\u002d`` and a URL written as
-# ``https:\\/\\/user:password@host`` still match. The decoded text is only a search view:
-# non-secret escapes stay as they were written.
+# (``\\/``, ``\u005c/``, or a mix of the two) and after ``%HH`` percent-encoding is decoded.
+# A hyphen written as ``\u002d`` and a URL written as ``https:%2F%2Fuser:password@host`` still
+# match. Both views are searched. The decoded text is only a search view: non-secret escapes stay
+# as they were written.
 _SECRET = re.compile(
     r"(?<!\w)eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}(?!\w)"
     r"|(?<!\w)sk-[A-Za-z0-9_-]{8,}(?!\w)"
@@ -335,10 +336,11 @@ _URL_USERINFO = re.compile(r"https?://([^\s/@:]+:[^\s/@]+)@", re.IGNORECASE)
 _JSON_U = re.compile(r"\\u([0-9a-fA-F]{4})")
 
 
-# Nested JSON encoding (``\\/`` or ``\u005c/``) is peeled one layer at a time. Eight passes is the
-# bound. A value that is still changing after that has not reached a fixed point, and the whole
-# field is redacted instead of searching a partial decode.
+# Nested JSON encoding (``\\/`` or ``\u005c/``) and nested ``%HH`` are each peeled one layer at a
+# time. Eight passes is the bound for each. A value that is still changing after that has not
+# reached a fixed point, and the whole field is redacted instead of searching a partial decode.
 _ESCAPE_PASSES = 8
+_PCT = re.compile(r"%([0-9a-fA-F]{2})")
 
 
 def _decode_layer(value: str) -> tuple[str, list[tuple[int, int]], bool]:
@@ -369,42 +371,68 @@ def _decode_layer(value: str) -> tuple[str, list[tuple[int, int]], bool]:
     return "".join(out), spans, changed
 
 
-def _match_view(value: str) -> tuple[str, list[tuple[int, int]], bool]:
-    """Decode nested ``\\uXXXX`` and ``\\/`` layers. Spans point at the original string.
+def _decode_pct_layer(value: str) -> tuple[str, list[tuple[int, int]], bool]:
+    """Decode one layer of ``%HH``. Each output character maps to three source characters, or one."""
 
-    The third value is False when eight passes do not reach a fixed point. Callers must not search
-    that partial view.
-    """
+    out: list[str] = []
+    spans: list[tuple[int, int]] = []
+    index = 0
+    length = len(value)
+    changed = False
+    while index < length:
+        match = _PCT.match(value, index)
+        if match is not None:
+            out.append(chr(int(match.group(1), 16)))
+            spans.append((match.start(), match.end()))
+            index = match.end()
+            changed = True
+            continue
+        out.append(value[index])
+        spans.append((index, index + 1))
+        index += 1
+    return "".join(out), spans, changed
 
-    text = value
-    spans = [(index, index + 1) for index in range(len(value))]
+
+def _fixed_point(text: str, spans: list[tuple[int, int]], decode_once) -> tuple[str, list[tuple[int, int]], bool]:
+    """Peel one escape form until it stops changing, or until the cap. Spans stay on the original."""
+
     for _ in range(_ESCAPE_PASSES):
-        decoded, layer, changed = _decode_layer(text)
+        decoded, layer, changed = decode_once(text)
         if not changed:
             return text, spans, True
         spans = [(spans[start][0], spans[end - 1][1]) for start, end in layer]
         text = decoded
-    still_changing = _decode_layer(text)[2]
-    return text, spans, not still_changing
+    return text, spans, not decode_once(text)[2]
+
+
+def _collect_secret_hits(text: str, spans: list[tuple[int, int]], hits: list[tuple[int, int]]) -> None:
+    for match in _URL_USERINFO.finditer(text):
+        hits.append((spans[match.start(1)][0], spans[match.end(1) - 1][1]))
+    for match in _SECRET.finditer(text):
+        hits.append((spans[match.start()][0], spans[match.end() - 1][1]))
 
 
 def redact(value: str) -> str:
     """Replace credential-shaped substrings. Connection ids and ordinary error codes are left as they are.
 
-    A value whose JSON escapes are still changing after the decode cap is replaced as a whole. A
-    partial decode is not searched, because a leftover escape can hide a credential.
+    JSON escapes and ``%HH`` are decoded into separate search views. The view from before
+    percent-decoding is still searched, so ``dummy%20password`` stays a userinfo match. A value
+    that is still changing after either cap is replaced as a whole. A partial decode is not
+    searched, because a leftover escape can hide a credential.
     """
 
     if not value:
         return value
-    decoded, spans, stable = _match_view(value)
+    identity = [(index, index + 1) for index in range(len(value))]
+    decoded, spans, stable = _fixed_point(value, identity, _decode_layer)
     if not stable:
         return "[redacted]"
+    percent, percent_spans, percent_stable = _fixed_point(decoded, spans, _decode_pct_layer)
+    if not percent_stable:
+        return "[redacted]"
     hits: list[tuple[int, int]] = []
-    for match in _URL_USERINFO.finditer(decoded):
-        hits.append((spans[match.start(1)][0], spans[match.end(1) - 1][1]))
-    for match in _SECRET.finditer(decoded):
-        hits.append((spans[match.start()][0], spans[match.end() - 1][1]))
+    _collect_secret_hits(decoded, spans, hits)
+    _collect_secret_hits(percent, percent_spans, hits)
     if not hits:
         return value
     hits.sort()

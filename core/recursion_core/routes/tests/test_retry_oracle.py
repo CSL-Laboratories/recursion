@@ -803,6 +803,40 @@ class ReviewFollowupTest(unittest.TestCase):
         four_rounds = nest("prefix https://user:dummy_password@example.invalid/hook suffix", 4)
         self.assertEqual(c.event("retry", "vendor", {"error": four_rounds})["data"]["error"], "[redacted]")
 
+    def test_percent_encoded_url_userinfo_is_redacted(self) -> None:
+        samples = (
+            "prefix https:%2F%2Fuser:dummy_password@example.invalid/hook suffix",
+            "prefix https%3A%2F%2Fuser%3Adummy_password%40example.invalid%2Fhook suffix",
+            "prefix https:\\u00252f\\u00252fuser:dummy_password@example.invalid/hook suffix",
+        )
+        for raw in samples:
+            with self.subTest(raw=raw):
+                error = c.event("retry", "vendor", {"error": raw})["data"]["error"]
+                self.assertNotIn("dummy_password", error)
+                self.assertIn("[redacted]", error)
+                self.assertIn("example.invalid", error)
+                self.assertIn("prefix", error)
+                self.assertNotEqual(error, "[redacted]")
+        control = c.event("retry", "vendor", {"error": "https://user:dummy%20password@host"})["data"]["error"]
+        self.assertNotIn("dummy%20password", control)
+        self.assertIn("https://", control)
+        self.assertIn("[redacted]", control)
+
+        def nested_slash(depth: int) -> str:
+            encoded = "%2F"
+            for _ in range(depth - 1):
+                encoded = "%25" + encoded[1:]
+            return encoded
+
+        at_cap = "prefix https:" + nested_slash(8) + nested_slash(8) + "user:dummy_password@example.invalid/hook suffix"
+        precise = c.event("retry", "vendor", {"error": at_cap})["data"]["error"]
+        self.assertNotIn("dummy_password", precise)
+        self.assertIn("prefix", precise)
+        self.assertIn("example.invalid", precise)
+        self.assertNotEqual(precise, "[redacted]")
+        past = "prefix https:" + nested_slash(9) + nested_slash(9) + "user:dummy_password@example.invalid/hook suffix"
+        self.assertEqual(c.event("retry", "vendor", {"error": past})["data"]["error"], "[redacted]")
+
     def test_opencode_subscription_providers_are_different_breakers(self) -> None:
         chatgpt = request(
             rid="cg", engine="opencode", model="chatgpt/gpt", kind="subscription", conn_id="shared",

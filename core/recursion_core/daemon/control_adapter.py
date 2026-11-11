@@ -278,10 +278,23 @@ class DaemonControl:
         self.api, self.registry, self.daemon, self.starter = api, registry, daemon, starter
         self._state = Path(state_dir)
         self._stop_retry = {}  # run_id -> (not before, wait) for a Stop reconcile() could not get sent
+        self._starts_lock = threading.Lock()
+        self._starts_in_flight = 0  # run.start calls of this process that have not answered yet
 
     # -- calls ---------------------------------------------------------------------------------
     def call(self, method, params=None):
-        answer = self.api.call(method, dict(params or {}))
+        if method != 'run.start':
+            answer = self.api.call(method, dict(params or {}))
+        else:
+            # The API writes the launch intent before the starter knows the run. reconcile() must not
+            # read that gap as a start that never reached a unit (ADV1-8).
+            with self._starts_lock:
+                self._starts_in_flight += 1
+            try:
+                answer = self.api.call(method, dict(params or {}))
+            finally:
+                with self._starts_lock:
+                    self._starts_in_flight -= 1
         if method == 'run.start' and answer.get('code') == 'start_failed':
             failure = self.starter.failures.get(answer.get('run_id'))
             if failure is not None:
@@ -371,7 +384,8 @@ class DaemonControl:
           request, confirm and attestation path as any Stop.
         * A ``starting`` record with no cgroup that this process is not launching is a start the
           previous daemon did not finish recording. With a unit row, the unit's cgroup is recorded
-          so Stop can reach it; with none, no unit was ever started and it is ``start_failed``.
+          so Stop can reach it; with none, no unit was ever started and it is ``start_failed``
+          (decided only while no ``run.start`` of this process is in flight).
         """
         try:
             records = self.registry.list()
@@ -395,6 +409,9 @@ class DaemonControl:
             if self.starter.active(run_id):
                 return  # this process is still launching it; the start records its own outcome
             if row is None:
+                with self._starts_lock:
+                    if self._starts_in_flight:
+                        return  # it may be a start in flight here; a start left by an earlier daemon waits a pass
                 rec['state'] = 'start_failed'
                 self.registry.put(rec)
                 return

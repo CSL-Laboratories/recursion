@@ -470,10 +470,9 @@ class RestartTest(ComposedBase):
         self.assertEqual(composed.control.registry.get(run_id)['state'], 'stopped')
         self.assertIsNotNone(proc.poll())
 
-    @unittest.expectedFailure  # ADV1-8
     def test_reconcile_racing_a_start_does_not_mark_it_failed(self):
-        """ADV1-8: reconcile() in the window between the API's launch-intent write and RouteStarter
-        registering the run writes start_failed for a start that then succeeds (record flaps)."""
+        """ADV1-8 (fixed): reconcile() in the window between the API's launch-intent write and RouteStarter
+        registering the run wrote start_failed for a start that then succeeded (the record flapped)."""
         daemon, composed = self.boot()
         api = self.api(composed)
         starter = composed.control.starter
@@ -500,6 +499,13 @@ class RestartTest(ComposedBase):
         run_id = answer['run']['run_id']
         self.assertEqual(api.call('run.status', {'run_id': run_id})['run']['state'], 'running')
         self.assertNotIn('start_failed', seen, 'the record flapped starting -> start_failed -> running')
+        self.assertEqual(seen, ['starting'])
+        # A start nobody is running any more (left by an earlier daemon) is still settled on the next pass.
+        composed.control.registry.put({'run_id': 'run-left', 'tenant': 't1', 'engine': 'claude_code',
+                                       'state': 'starting', 'cgroup': None, 'started_at': 1.0, 'stop': None,
+                                       'start_key': None})
+        composed.control.reconcile()
+        self.assertEqual(composed.control.registry.get('run-left')['state'], 'start_failed')
 
 
 @unittest.skipUnless(LINUX, 'the daemon is Linux only')

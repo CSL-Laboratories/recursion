@@ -16,7 +16,9 @@ store's module is only called here, never changed.
   time is not stored), so that request is refused ``breaker_open``. A request whose store read
   fails is refused ``breaker_open`` too, and the next request reads the store again. After the cooldown one
   leased probe is admitted; the trip clears in the store only through that probe's lease
-  (``begin_probe`` / ``reset_after_probe``), and only when the probe run succeeded.
+  (``begin_probe`` / ``reset_after_probe``), and only when the probe run succeeded. The store's
+  lease is as long as the longest route deadline plus the route breaker's grace; a trip the store
+  still holds after a successful probe is logged and fenced again, never shown closed.
 * Every run the daemon launches is bound in the store to its connection, engine and model, owned
   by ``host``: a reserved plugin id, so no plugin's effect can cite an operator's run. A run whose
   route result is an error is recorded as faulted.
@@ -46,17 +48,31 @@ STORE_DIR = 'plugin-security'
 STORE_FILE = 'breaker.sqlite3'
 HOST = 'host'  # plugin_security.protocol.HOST: reserved, so no plugin manifest can carry it
 RESTORED_SOURCE = 'recursion.breaker_store'
+STORE_PROBE_LEASE_S = 300.0  # plugin_security.ConnectionBreaker's default probe_lease_seconds
 
 
 def store_path(state_dir):
     return Path(state_dir) / STORE_DIR / STORE_FILE
 
 
-def open_breaker_store(state_dir, *, clock):
+def store_probe_lease_s(routes, route_breaker):
+    """The store's probe lease: at least as long as the longest probe the route breaker can lease.
+
+    The route breaker leases a probe for the run's deadline plus its grace; the store's lease is one
+    length per store, so it is the longest of those over every configured route (ADV2-2), and never
+    shorter than the store's own default.
+    """
+    deadlines = [entry['deadline_s'] for entry in (routes or {}).values()]
+    return max([STORE_PROBE_LEASE_S, route_breaker.probe_lease_s()]
+               + [route_breaker.probe_lease_s(deadline) for deadline in deadlines])
+
+
+def open_breaker_store(state_dir, *, clock, probe_lease_seconds=None):
     """Open the daemon's breaker store, creating it when there is none. Returns ``(store, created)``.
 
     A new store is built under a temporary name and renamed, so a daemon killed part-way never
-    leaves a half-made file that a later start would have to refuse.
+    leaves a half-made file that a later start would have to refuse. ``probe_lease_seconds`` is
+    ``store_probe_lease_s`` of the loaded routes (the store's default when None).
     """
     require_launcher_platform()  # Windows: typed PlatformUnsupported before any directory or file
     path = store_path(state_dir)
@@ -77,7 +93,8 @@ def open_breaker_store(state_dir, *, clock):
         finally:
             os.close(fd)
         created = True
-    return StoredBreaker(str(path), clock=clock), created
+    lease_s = STORE_PROBE_LEASE_S if probe_lease_seconds is None else float(probe_lease_seconds)
+    return StoredBreaker(str(path), clock=clock, probe_lease_seconds=lease_s), created
 
 
 class DurableRouteBreaker:
@@ -160,16 +177,39 @@ class DurableRouteBreaker:
                 if isinstance(limit, dict) and limit.get('scope') == 'connection':
                     self._stored.report(connection, c.PLAN_LIMIT)  # also drops any lease the store held
             elif effect == 'closed':
-                if self._stored.tripped(connection):
-                    if lease is None:
-                        lease = self._stored.begin_probe(connection)
-                    self._stored.reset_after_probe(connection, lease, True)
+                if self._stored.tripped(connection) and not self._clear_stored_trip(connection, lease):
+                    # The store still calls the connection tripped: do not show it closed (ADV2-2).
+                    log.error('a successful probe could not clear the trip in the breaker store; the '
+                              'connection is fenced again for the cooldown')
+                    self._inner.record(connection, model, tenant, {
+                        'code': c.PLAN_LIMIT, 'limit': c.limit_signal('connection', RESTORED_SOURCE)})
+                    return 'none'
             elif lease is not None:
                 self._stored.reset_after_probe(connection, lease, False)  # the probe proved nothing: spend it
         except (Refused, sqlite3.Error) as exc:
             # The in-memory breaker already holds the outcome; what did not reach the store is said.
             log.error('breaker store was not updated (%s after %s): the change is not durable', _code(exc), effect)
+            if effect == 'closed':
+                with self._lock:
+                    self._restored.discard(connection)  # the next request reads the store again first
         return effect
+
+    def _clear_stored_trip(self, connection, lease):
+        """Clear the stored trip after the route breaker closed on a successful probe. True when cleared.
+
+        The route breaker closes only for its own live probe (leased for the run's deadline plus
+        grace). The store's lease is one length for every probe; when it ran out first, or was never
+        taken, the trip is cleared under a fresh store lease, and that is logged.
+        """
+        try:
+            if lease is not None and self._stored.reset_after_probe(connection, lease, True):
+                return True
+            if lease is not None:
+                log.warning("the breaker store's probe lease ended before the probe did; leasing again to clear the trip")
+            return self._stored.reset_after_probe(connection, self._stored.begin_probe(connection), True)
+        except (Refused, sqlite3.Error) as exc:  # e.g. probe_lease_held: the trip stays in the store
+            log.error('breaker store trip not cleared: %s', _code(exc))
+            return False
 
     def _restore(self, connection, model, tenant):
         """Take over a trip an earlier daemon stored. False when the store could not be read.

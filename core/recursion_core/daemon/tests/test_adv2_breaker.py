@@ -107,7 +107,6 @@ class Adv2BreakerTests(unittest.TestCase):
         self.assertEqual((answer['admitted'], answer['code']), (False, c.BREAKER_OPEN))
 
     # -- ADV2-2 ----------------------------------------------------------------------------------
-    @unittest.expectedFailure  # ADV2-2: a successful probe that runs past the store's 300 s lease never clears the stored trip
     def test_a_long_successful_probe_clears_the_stored_trip(self):
         stored = self.tripped_by_an_earlier_daemon()
         durable = daemon_breaker.DurableRouteBreaker(ConnectionBreaker(self.clock), stored)
@@ -122,6 +121,45 @@ class Adv2BreakerTests(unittest.TestCase):
         self.assertEqual(effect, 'closed')                  # the in-memory breaker closed...
         self.assertEqual(durable.state(CONN), 'closed')
         self.assertFalse(stored.tripped(CONN), 'route closed in memory but still tripped in the store')
+
+    def test_the_store_lease_covers_the_longest_route_deadline(self):
+        routes = {'codex': {'deadline_s': 60.0}, 'claude_code': {'deadline_s': 900.0}}
+        lease_s = daemon_breaker.store_probe_lease_s(routes, ConnectionBreaker(self.clock))
+        self.assertEqual(lease_s, 930.0)  # the route breaker's lease: deadline plus its 30 s grace
+        self.assertEqual(daemon_breaker.store_probe_lease_s({}, ConnectionBreaker(self.clock)),
+                         daemon_breaker.STORE_PROBE_LEASE_S)
+        earlier = self.store()
+        earlier.report(CONN, 'plan_limit')
+        stored, _ = daemon_breaker.open_breaker_store(self.tmp, clock=self.clock, probe_lease_seconds=lease_s)
+        self.addCleanup(stored.close)
+        durable = daemon_breaker.DurableRouteBreaker(ConnectionBreaker(self.clock), stored)
+        with self.assertLogs('recursion_core.daemon.breaker', 'WARNING'):
+            durable.admit(CONN, 'm', 't', deadline_s=900)
+        self.clock.now += 301
+        probe = durable.admit(CONN, 'm', 't', deadline_s=900)
+        self.clock.now += 900  # inside the probe's 930 s lease
+        with self.assertNoLogs('recursion_core.daemon.breaker', 'WARNING'):
+            self.assertEqual(durable.record(CONN, 'm', 't', {'code': None}, probe['probe']), 'closed')
+        self.assertFalse(stored.tripped(CONN))
+
+    def test_a_trip_the_store_will_not_clear_is_not_shown_closed(self):
+        stored = self.tripped_by_an_earlier_daemon()
+
+        class NoReset(FlakyStore):
+            def reset_after_probe(self, connection, lease, probe_ok):
+                return False
+
+        durable = daemon_breaker.DurableRouteBreaker(ConnectionBreaker(self.clock), NoReset(stored, failures=0))
+        with self.assertLogs('recursion_core.daemon.breaker', 'WARNING'):
+            durable.admit(CONN, 'm', 't', deadline_s=60)
+        self.clock.now += 301
+        probe = durable.admit(CONN, 'm', 't', deadline_s=60)
+        with self.assertLogs('recursion_core.daemon.breaker', 'ERROR'):
+            effect = durable.record(CONN, 'm', 't', {'code': None}, probe['probe'])
+        self.assertEqual(effect, 'none')
+        self.assertTrue(stored.tripped(CONN))
+        self.assertNotEqual(durable.state(CONN), 'closed')
+        self.assertEqual(durable.admit(CONN, 'm', 't')['code'], c.BREAKER_OPEN)
 
     def test_control_a_short_successful_probe_clears_the_stored_trip(self):
         stored = self.tripped_by_an_earlier_daemon()

@@ -7,18 +7,30 @@ No provider call. The one optional test runs the local ``claude --help`` (offlin
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import io
 import os
 import shutil
+import signal
+import stat
 import subprocess
+import sys
+import tempfile
 import textwrap
+import threading
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from recursion_core.routes import bare_default as bd
 from recursion_core.routes import contract as c
-from recursion_core.routes.tests.fakes import MEASURED_HELP_TEXT, claude_limit, claude_ok, request
-from recursion_core.routes.tests.test_driver_and_limits import Harness
+from recursion_core.routes.breaker import ConnectionBreaker
+from recursion_core.routes.claude_code import ClaudeCodeAdapter
+from recursion_core.routes.service import RouteService
+from recursion_core.routes.tests.fakes import (MEASURED_HELP_TEXT, FakeClock, FakeProcess, claude_limit, claude_ok,
+                                               request)
+from recursion_core.routes.tests.test_driver_and_limits import PARENT, Harness
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "claude-2.1.312-help-excerpt.txt"
 HEAD = ("Usage: claude [options] [command] [prompt]\n\n"
@@ -192,6 +204,18 @@ class ClassifyHelpTest(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(bd.classify_help(text), "unknown")
 
+    def test_owner_locked_future_word_masks_a_present_default(self) -> None:
+        # Owner question, not a decision. One sentence that says --bare is the default now
+        # and also uses a future word currently reads absent (the future check wins the sentence).
+        text = help_with_bare("--bare is now the default for -p, and --no-bare is planned.")
+        self.assertEqual(bd.classify_help(text), "absent")
+
+    def test_owner_locked_interactive_false_hides_print_true(self) -> None:
+        # Owner question, not a decision. "default: false" for interactive matches before
+        # "true for -p" in the same sentence, so this currently reads absent.
+        text = help_with_bare("Minimal mode (default: false for interactive; true for -p).")
+        self.assertEqual(bd.classify_help(text), "absent")
+
 
 class ReadHelpTest(unittest.TestCase):
     def _run(self, returncode=0, stdout=b"", exc=None):
@@ -224,6 +248,610 @@ class ReadHelpTest(unittest.TestCase):
         for run in cases:
             with self.subTest(run=run):
                 self.assertEqual(bd.probe("claude", {"PATH": "/usr/bin"}, run), "unknown")
+
+    def test_malformed_probe_inputs_fail_closed(self) -> None:
+        # A bad env or a runner that does not return a process must be unknown, not a crash,
+        # and must not launch.
+        spawned = []
+
+        def boom(argv, **kwargs):
+            spawned.append(argv)
+            raise TypeError("bad argv")
+
+        def junk(argv, **kwargs):
+            spawned.append(argv)
+            return object()
+
+        self.assertIsNone(bd.read_help("claude", None, boom))
+        self.assertEqual(bd.probe("claude", None, boom), "unknown")
+        self.assertEqual(spawned, [])
+        self.assertEqual(bd.probe("claude", {"PATH": "/usr/bin"}, boom), "unknown")
+        self.assertEqual(bd.probe("claude", {"PATH": "/usr/bin"}, junk), "unknown")
+        self.assertIsNone(bd.read_version(None, {"PATH": "/usr/bin"}, boom))
+
+    @unittest.skipIf(os.name == "nt", "POSIX executable scripts")
+    def test_default_help_read_stops_at_the_byte_cap_and_reaps(self) -> None:
+        # The 1 MiB cap has to stop the read. A child that dumps more than that and then
+        # sleeps must be killed and reaped without waiting out the timeout.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            script = home / "floodhelp"
+            script.write_text(textwrap.dedent(f"""\
+                #!/usr/bin/env python3
+                import os, sys, time
+                open(os.environ["HOME"] + "/pid", "w").write(str(os.getpid()))
+                sys.stdout.buffer.write(b"x" * ({bd.HELP_MAX_BYTES * 2}))
+                sys.stdout.flush()
+                time.sleep(60)
+            """))
+            script.chmod(script.stat().st_mode | stat.S_IEXEC)
+            old = bd.HELP_TIMEOUT_S
+            bd.HELP_TIMEOUT_S = 5
+            try:
+                started = time.monotonic()
+                text = bd.read_help(str(script), {"PATH": os.environ.get("PATH", ""), "HOME": str(home)})
+                elapsed = time.monotonic() - started
+            finally:
+                bd.HELP_TIMEOUT_S = old
+            self.assertIsNone(text)
+            self.assertLess(elapsed, 2.0)
+            pid = int((home / "pid").read_text())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+
+    @unittest.skipIf(os.name == "nt", "POSIX executable scripts")
+    def test_timeout_discards_under_cap_help_already_written(self) -> None:
+        # Fail-closed on purpose. A child that writes a full under-cap help and then
+        # does not exit has not finished --help. Those bytes must not be classified:
+        # this text would be "absent" if it were a completed read.
+        payload = help_with_bare("Bare default: false")
+        self.assertEqual(bd.classify_help(payload), "absent")
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "payload").write_bytes(payload.encode())
+            script = home / "hanghelp"
+            script.write_text(textwrap.dedent("""\
+                #!/usr/bin/env python3
+                import os, sys, time
+                payload = open(os.environ["HOME"] + "/payload", "rb").read()
+                open(os.environ["HOME"] + "/pid", "w").write(str(os.getpid()))
+                sys.stdout.buffer.write(payload)
+                sys.stdout.flush()
+                time.sleep(60)
+            """))
+            script.chmod(script.stat().st_mode | stat.S_IEXEC)
+            env = {"PATH": os.environ.get("PATH", ""), "HOME": str(home)}
+            old = bd.HELP_TIMEOUT_S
+            bd.HELP_TIMEOUT_S = 0.4
+            try:
+                started = time.monotonic()
+                text = bd.read_help(str(script), env)
+                state = bd.probe(str(script), env)
+                elapsed = time.monotonic() - started
+                with self.assertRaises(subprocess.TimeoutExpired) as ctx:
+                    bd._bounded_run([str(script), "--help"], env=env, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                    timeout=0.4, check=False, shell=False)
+            finally:
+                bd.HELP_TIMEOUT_S = old
+            self.assertIsNone(text)
+            self.assertEqual(state, "unknown")
+            self.assertLess(elapsed, 2.0)
+            self.assertIsNone(ctx.exception.output)
+            pid = int((home / "pid").read_text())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+
+    @unittest.skipIf(os.name == "nt", "POSIX executable scripts")
+    def test_stderr_pipe_cannot_stall_the_help_read(self) -> None:
+        # _bounded_run accepts stderr= for the subprocess.run shape, but a PIPE is not
+        # drained. A flood on it must not block a short stdout that then exits.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            script = home / "stderrflood"
+            script.write_text(textwrap.dedent("""\
+                #!/usr/bin/env python3
+                import os, sys
+                open(os.environ["HOME"] + "/pid", "w").write(str(os.getpid()))
+                sys.stdout.buffer.write(b"help-ok\\n")
+                sys.stdout.flush()
+                sys.stderr.buffer.write(b"e" * (1 << 20))
+                sys.stderr.flush()
+            """))
+            script.chmod(script.stat().st_mode | stat.S_IEXEC)
+            env = {"PATH": os.environ.get("PATH", ""), "HOME": str(home)}
+            started = time.monotonic()
+            done = bd._bounded_run([str(script), "--help"], env=env, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   timeout=3, check=False, shell=False)
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 1.5)
+            self.assertEqual(done.returncode, 0)
+            self.assertEqual(done.stdout, b"help-ok\n")
+            pid = int((home / "pid").read_text())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+
+    def test_child_that_closes_stdout_early_is_not_killed(self) -> None:
+        # Closing stdout is EOF, not failure. The child may still be exiting.
+        # Killing it there turns a successful help read into unknown.
+        argv = [sys.executable, "-B", "-c",
+                'import os, time; os.write(1, b"help-ok\\n"); os.close(1); time.sleep(0.2)']
+        done = bd._bounded_run(argv, env={}, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, timeout=2, check=False, shell=False)
+        self.assertEqual(done.returncode, 0)
+        self.assertEqual(done.stdout, b"help-ok\n")
+
+    @unittest.skipUnless(hasattr(os, "fork"), "POSIX fork")
+    def test_forked_descendant_cannot_hold_the_help_timeout(self) -> None:
+        # A grandchild that inherits the stdout pipe must not stretch a 0.1 s
+        # timeout out to the grandchild's lifetime.
+        started = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired) as caught:
+            bd._bounded_run(
+                [sys.executable, "-B", "-c", "import os, time; os.fork(); time.sleep(7)"],
+                env={}, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, timeout=0.1, check=False, shell=False)
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertIsNone(caught.exception.output)
+
+    @unittest.skipUnless(hasattr(os, "fork") and hasattr(os, "setsid"), "POSIX setsid")
+    def test_setsid_descendant_cannot_hold_the_help_timeout(self) -> None:
+        # A descendant that leaves the session still holds the pipe. The read
+        # has to hit its deadline anyway; the test then stops that leftover.
+        code = (
+            "import os, time\n"
+            "if os.fork() == 0:\n"
+            "    os.setsid()\n"
+            "    open(os.environ['HOME'] + '/gpid', 'w').write(str(os.getpid()))\n"
+            "    time.sleep(7)\n"
+            "else:\n"
+            "    time.sleep(7)\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            env = {"HOME": str(home), "PATH": os.environ.get("PATH", "")}
+            started = time.monotonic()
+            try:
+                with self.assertRaises(subprocess.TimeoutExpired) as caught:
+                    bd._bounded_run(
+                        [sys.executable, "-B", "-c", code],
+                        env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL, timeout=0.1, check=False, shell=False)
+                self.assertLess(time.monotonic() - started, 1.0)
+                self.assertIsNone(caught.exception.output)
+            finally:
+                deadline = time.monotonic() + 1.0
+                pid_path = home / "gpid"
+                while time.monotonic() < deadline and not pid_path.exists():
+                    time.sleep(0.02)
+                if pid_path.exists():
+                    try:
+                        os.kill(int(pid_path.read_text()), 9)
+                    except ProcessLookupError:
+                        pass
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux subreaper")
+    def test_exited_leader_does_not_spare_its_group(self) -> None:
+        # The leader forks and exits. The child stays in that process group.
+        # Reaping the leader first drops the pgid, so the child survives both
+        # a timeout and an over-cap read. This child does not call setsid.
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(36, 1, 0, 0, 0):
+            self.skipTest("prctl subreaper is not available")
+        survived: dict[str, bool] = {}
+        try:
+            for mode in ("timeout", "overflow"):
+                read_fd, write_fd = os.pipe()
+                pid = None
+                code = (
+                    "import os, time\n"
+                    "if os.fork():\n"
+                    "    os._exit(0)\n"
+                    "os.write(0, str(os.getpid()).encode())\n"
+                    + ('os.write(1, b"x" * 1048577)\n' if mode == "overflow" else "")
+                    + "time.sleep(20)\n"
+                )
+                try:
+                    try:
+                        bd._bounded_run(
+                            [sys.executable, "-B", "-c", code],
+                            env={}, stdin=write_fd, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, timeout=0.2, check=False, shell=False)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    os.close(write_fd)
+                    write_fd = -1
+                    pid = int(os.read(read_fd, 64))
+                    # A collected zombie raises ChildProcessError. That descendant
+                    # is not running, and it is not left for a later wait.
+                    try:
+                        survived[mode] = os.waitpid(pid, os.WNOHANG) == (0, 0)
+                    except ChildProcessError:
+                        survived[mode] = False
+                finally:
+                    if write_fd >= 0:
+                        os.close(write_fd)
+                    os.close(read_fd)
+                    if pid is not None:
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            os.waitpid(pid, 0)
+                        except ChildProcessError:
+                            pass
+        finally:
+            libc.prctl(36, 0, 0, 0, 0)
+        self.assertEqual(survived, {"timeout": False, "overflow": False})
+
+    def test_overflow_honors_check(self) -> None:
+        # check=True raises on a non-zero exit after a normal read. An over-cap
+        # read is also a failed run, so it takes that same path.
+        argv = [sys.executable, "-B", "-c",
+                'import os, time; os.write(1, b"x" * (2 << 20)); time.sleep(20)']
+        with self.assertRaises(subprocess.CalledProcessError) as caught:
+            bd._bounded_run(argv, env={}, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, timeout=2, check=True, shell=False)
+        self.assertNotEqual(caught.exception.returncode, 0)
+        self.assertEqual(len(caught.exception.output), bd.HELP_MAX_BYTES + 1)
+        done = bd._bounded_run(argv, env={}, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, timeout=2, check=False, shell=False)
+        self.assertIsInstance(done, subprocess.CompletedProcess)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(len(done.stdout), bd.HELP_MAX_BYTES + 1)
+
+    @unittest.skipUnless(hasattr(os, "fork") and hasattr(os, "waitid"), "POSIX waitid")
+    def test_interrupt_during_eof_wait_kills_the_group(self) -> None:
+        # Popen.wait catches KeyboardInterrupt and collects the leader before
+        # the caller runs again. A same-group child must still be signaled.
+        read_fd, write_fd = os.pipe()
+        injected = False
+        pid = None
+        original = subprocess.Popen._wait
+        code = (
+            "import os, time\n"
+            "if os.fork() == 0:\n"
+            "    os.write(0, str(os.getpid()).encode())\n"
+            "    os.close(1)\n"
+            "    time.sleep(10)\n"
+            "    os._exit(0)\n"
+            "time.sleep(0.15)\n"
+        )
+
+        def interrupted_wait(proc, *args, **kwargs):
+            nonlocal injected
+            if not injected:
+                injected = True
+                raise KeyboardInterrupt
+            return original(proc, *args, **kwargs)
+
+        try:
+            try:
+                with patch.object(subprocess.Popen, "_wait", interrupted_wait):
+                    bd._bounded_run(
+                        [sys.executable, "-B", "-c", code],
+                        stdin=write_fd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                        timeout=2, check=False, shell=False)
+            except KeyboardInterrupt:
+                pass
+            os.close(write_fd)
+            write_fd = -1
+            pid = int(os.read(read_fd, 64))
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+        finally:
+            if write_fd != -1:
+                os.close(write_fd)
+            os.close(read_fd)
+            if pid is not None:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def test_proc_scan_ignores_non_utf8_names(self) -> None:
+        # A comm byte that is not valid UTF-8 must not abort the group scan.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            good = root / "7"
+            good.mkdir()
+            (good / "stat").write_bytes(b"7 (py\xffthon) R 1 77 1 0\n")
+            other = root / "8"
+            other.mkdir()
+            (other / "stat").write_bytes(b"8 (ok) S 1 3 1 0\n")
+            self.assertTrue(bd._group_has_live_member(77, proc_root=str(root)))
+            self.assertTrue(bd._group_has_live_member(3, proc_root=str(root)))
+            # A directory that is not there cannot prove the group is empty.
+            self.assertIsNone(bd._group_has_live_member(3, proc_root=str(root / "missing")))
+            # A completed scan that does not see the group is empty, not unknown.
+            self.assertFalse(bd._group_has_live_member(99, proc_root=str(root)))
+
+    @unittest.skipUnless(hasattr(os, "fork") and hasattr(os, "killpg") and hasattr(os, "waitid"),
+                         "POSIX process groups")
+    def test_unavailable_proc_scan_still_signals_the_group(self) -> None:
+        # A missing /proc used to look like an empty group, so Ctrl-C during the
+        # EOF wait never called killpg and the same-group child kept running.
+        # Timeout must signal too. ESRCH after the group is gone is success.
+        calls: list[tuple[int, int]] = []
+        real_killpg = os.killpg
+
+        def spy(pgid: int, sig: int) -> None:
+            calls.append((pgid, sig))
+            real_killpg(pgid, sig)
+
+        def gone(pid: int) -> bool:
+            deadline = time.monotonic() + 1.0
+            while True:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    return True
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.01)
+
+        leader = None
+        try:
+            calls.clear()
+            with patch.object(bd, "_read_proc_stats", return_value=None), patch.object(os, "killpg", spy):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    bd._bounded_run(
+                        [sys.executable, "-B", "-c", "import time; time.sleep(30)"],
+                        env={}, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL, timeout=0.1, check=False, shell=False)
+            self.assertTrue(calls)
+            self.assertTrue(all(sig == signal.SIGKILL for _pgid, sig in calls))
+            leader = calls[0][0]
+            self.assertTrue(gone(leader))
+        finally:
+            if leader is not None:
+                try:
+                    os.kill(leader, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+        read_fd, write_fd = os.pipe()
+        injected = False
+        child = None
+        original = subprocess.Popen._wait
+        code = (
+            "import os, time\n"
+            "if os.fork() == 0:\n"
+            "    os.write(0, str(os.getpid()).encode())\n"
+            "    os.close(1)\n"
+            "    time.sleep(10)\n"
+            "    os._exit(0)\n"
+            "time.sleep(0.15)\n"
+        )
+
+        def interrupted_wait(proc, *args, **kwargs):
+            nonlocal injected
+            if not injected:
+                injected = True
+                raise KeyboardInterrupt
+            return original(proc, *args, **kwargs)
+
+        calls.clear()
+        try:
+            with patch.object(bd, "_read_proc_stats", return_value=None), patch.object(
+                    os, "killpg", spy), patch.object(subprocess.Popen, "_wait", interrupted_wait):
+                try:
+                    bd._bounded_run(
+                        [sys.executable, "-B", "-c", code],
+                        stdin=write_fd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                        timeout=2, check=False, shell=False)
+                except KeyboardInterrupt:
+                    pass
+            os.close(write_fd)
+            write_fd = -1
+            child = int(os.read(read_fd, 64))
+            self.assertTrue(calls)
+            self.assertTrue(all(sig == signal.SIGKILL for _pgid, sig in calls))
+            self.assertTrue(gone(child))
+        finally:
+            if write_fd != -1:
+                os.close(write_fd)
+            os.close(read_fd)
+            if child is not None:
+                try:
+                    os.kill(child, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def test_timeout_reaps_the_child_once(self) -> None:
+        # The read path reaps, then the error handler used to reap again after
+        # the leader's pid was free.
+        calls: list[int | None] = []
+        real_reap = bd._reap
+
+        def spy(proc: subprocess.Popen) -> None:
+            calls.append(proc.returncode)
+            real_reap(proc)
+
+        with patch.object(bd, "_reap", spy):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                bd._bounded_run(
+                    [sys.executable, "-B", "-c", "import time; time.sleep(30)"],
+                    env={}, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL, timeout=0.1, check=False, shell=False)
+        self.assertEqual(len(calls), 1)
+
+    def _reap_collected(self, *, alive: bool, stat_rows: list[bytes] | None) -> list[tuple[int, int]]:
+        calls: list[tuple[int, int]] = []
+
+        def killpg(pgid: int, sig: int) -> None:
+            calls.append((pgid, sig))
+
+        def getpgid(pid: int) -> int:
+            if not alive:
+                raise ProcessLookupError
+            return pid
+
+        def scan(proc_root: str = "/proc"):
+            if stat_rows is None:
+                return None
+            return real_scan(str(root))
+
+        class _Collected:
+            pid = 424242
+            returncode = 0
+
+            @staticmethod
+            def wait(timeout: float | None = None) -> int:
+                return 0
+
+            @staticmethod
+            def kill() -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            if stat_rows:
+                for raw in stat_rows:
+                    slot = root / raw.split(b" ", 1)[0].decode()
+                    slot.mkdir()
+                    (slot / "stat").write_bytes(raw)
+            real_scan = bd._read_proc_stats
+            with patch.object(os, "getpgid", getpgid, create=True), patch.object(
+                    bd, "_read_proc_stats", scan), patch.object(os, "killpg", killpg, create=True):
+                bd._reap(_Collected())
+        return calls
+
+    @unittest.skipUnless(hasattr(os, "killpg") and hasattr(os, "getpgid"), "POSIX process groups")
+    def test_collected_leader_pid_alone_is_not_signaled(self) -> None:
+        # A live row whose pid is the old leader means that pid was reused.
+        calls = self._reap_collected(alive=True, stat_rows=[b"424242 (leader) S 1 424242 424242 0\n"])
+        self.assertEqual(calls, [])
+
+    @unittest.skipUnless(hasattr(os, "killpg") and hasattr(os, "getpgid"), "POSIX process groups")
+    def test_reused_leader_pid_with_a_child_is_not_signaled(self) -> None:
+        # The child of a reused pid is in the new group. killpg would signal it.
+        calls = self._reap_collected(alive=True, stat_rows=[
+            b"424242 (leader) S 1 424242 424242 0\n",
+            b"424243 (child) S 1 424242 424242 0\n",
+        ])
+        self.assertEqual(calls, [])
+
+    @unittest.skipUnless(hasattr(os, "killpg") and hasattr(os, "getpgid"), "POSIX process groups")
+    def test_collected_leader_with_no_proc_still_signals_when_pid_is_free(self) -> None:
+        # ESRCH means the old pid is free, so killpg can hit only a real straggler.
+        # A missing /proc scan must not skip that signal.
+        calls = self._reap_collected(alive=False, stat_rows=None)
+        self.assertEqual(calls, [(424242, signal.SIGKILL)])
+
+    @unittest.skipUnless(hasattr(os, "killpg") and hasattr(os, "getpgid"), "POSIX process groups")
+    def test_interrupt_after_collect_signals_once(self) -> None:
+        # _wait collects the leader and then KeyboardInterrupt fires. One reap,
+        # and one killpg, because the old pid is already gone.
+        read_fd, write_fd = os.pipe()
+        os.close(write_fd)
+        reaps: list[int | None] = []
+        kills: list[tuple[int, int]] = []
+        real_reap = bd._reap
+
+        def spy_reap(proc: subprocess.Popen) -> None:
+            reaps.append(proc.returncode)
+            real_reap(proc)
+
+        def killpg(pgid: int, sig: int) -> None:
+            kills.append((pgid, sig))
+
+        def getpgid(pid: int) -> int:
+            raise ProcessLookupError
+
+        class _Out:
+            closed = False
+
+            def fileno(self) -> int:
+                return read_fd
+
+            def close(self) -> None:
+                self.closed = True
+
+        class _Proc:
+            pid = 424242
+            returncode: int | None = None
+            stdout = _Out()
+
+            def _wait(self, timeout: float | None = None) -> int:
+                self.returncode = 0
+                raise KeyboardInterrupt
+
+            def wait(self, timeout: float | None = None) -> int:
+                return 0
+
+            def kill(self) -> None:
+                return None
+
+        def fake_popen(*args, **kwargs):
+            return _Proc()
+
+        try:
+            with patch.object(subprocess, "Popen", fake_popen), patch.object(
+                    bd, "_wait_leader", return_value="exited"), patch.object(
+                    bd, "_reap", spy_reap), patch.object(
+                    bd, "_read_proc_stats", return_value=None), patch.object(
+                    os, "getpgid", getpgid, create=True), patch.object(
+                    os, "killpg", killpg, create=True):
+                with self.assertRaises(KeyboardInterrupt):
+                    bd._bounded_run(["engine"], timeout=2, check=False, shell=False)
+        finally:
+            os.close(read_fd)
+        self.assertEqual(reaps, [0])
+        self.assertEqual(kills, [(424242, signal.SIGKILL)])
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux subreaper")
+    def test_subreaper_collects_same_group_zombies(self) -> None:
+        # A killed descendant reparents here when this process is a subreaper.
+        # Waiting for the leader alone leaves that zombie, and kill(pid, 0) still
+        # succeeds. The group sweep has to collect it by pid.
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(36, 1, 0, 0, 0):
+            self.skipTest("prctl subreaper is not available")
+        read_fd, write_fd = os.pipe()
+        pid = None
+        code = (
+            "import os, time\n"
+            "if os.fork():\n"
+            "    os._exit(0)\n"
+            "os.write(0, str(os.getpid()).encode())\n"
+            "time.sleep(30)\n"
+        )
+        try:
+            try:
+                bd._bounded_run(
+                    [sys.executable, "-B", "-c", code],
+                    env={}, stdin=write_fd, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL, timeout=0.2, check=False, shell=False)
+            except subprocess.TimeoutExpired:
+                pass
+            os.close(write_fd)
+            write_fd = -1
+            pid = int(os.read(read_fd, 64))
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+            try:
+                waited = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                waited = None
+            self.assertIsNone(waited)
+            self.assertFalse(os.path.exists(f"/proc/{pid}"))
+        finally:
+            if write_fd != -1:
+                os.close(write_fd)
+            os.close(read_fd)
+            if pid is not None:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    os.waitpid(pid, 0)
+                except ChildProcessError:
+                    pass
+            libc.prctl(36, 0, 0, 0, 0)
 
     @unittest.skipUnless(os.environ.get("RECURSION_LIVE_CLAUDE_HELP") == "1" and shutil.which("claude"),
                          "set RECURSION_LIVE_CLAUDE_HELP=1 with claude on PATH")
@@ -376,6 +1004,101 @@ class SubscriptionRouteBareDefaultTest(unittest.TestCase):
         self.assertEqual(refused["code"], c.LAUNCH_REFUSED)
         self.assertNotEqual(refused["detail"], "beta")
         self.assertEqual(len(h.launcher.calls), 1)
+
+    def test_surrogate_help_is_a_typed_refusal(self) -> None:
+        # A lone surrogate is not UTF-8. It must refuse before launch, with a typed code,
+        # and the detail must not echo the help bytes.
+        h = Harness([claude_ok()])
+        bad = MEASURED_HELP_TEXT + "\ud800"
+        decision = bd.subscription_beta("2.1.321", bad)
+        self.assertEqual(decision["disposition"], "refuse")
+        self.assertNotIn("\ud800", decision["detail"])
+        res = h.handle(request(claude_build="2.1.321", help_text=bad, bare_default="absent"))
+        self.assertEqual(res["code"], c.LAUNCH_REFUSED)
+        self.assertIn("unknown is not safe", res["detail"])
+        self.assertNotIn("\ud800", res["detail"])
+        self.assertNotEqual(res["detail"], "beta")
+        self.assertEqual(res["breaker_effect"], "none")
+        self.assertEqual(h.launcher.calls, [])
+
+    def test_overlapping_runs_keep_their_own_labels(self) -> None:
+        # One adapter is shared. A beta run blocked in the engine must not lose its label
+        # when another run on that adapter finishes, and the other run must not become beta.
+        for other in ("refusal", "api_key", "beta"):
+            with self.subTest(other=other):
+                _assert_overlapping_labels(self, other)
+
+
+def _assert_overlapping_labels(case: unittest.TestCase, other: str) -> None:
+    started, release = threading.Event(), threading.Event()
+
+    class _Hold(FakeProcess):
+        def __init__(self, script):
+            super().__init__(script)
+            self._held = False
+
+        def read_line(self, timeout_s):
+            if not self._held:
+                self._held = True
+                started.set()
+                if not release.wait(5):
+                    raise AssertionError("overlapping run was not released")
+            return super().read_line(timeout_s)
+
+    class _Launcher:
+        def __init__(self):
+            self.calls = []
+            self._hold = True
+
+        def __call__(self, argv, **kwargs):
+            self.calls.append({"argv": list(argv), "env": dict(kwargs["env"])})
+            if self._hold:
+                self._hold = False
+                return _Hold(claude_ok())
+            return FakeProcess(claude_ok())
+
+    clock = FakeClock()
+    launcher = _Launcher()
+    adapter = ClaudeCodeAdapter(launcher, clock, lambda conn, name: "route-anthropic", PARENT, wall_clock=clock)
+    service = RouteService({"claude_code": adapter}, ConnectionBreaker(clock), clock)
+    results: dict[str, dict] = {}
+    errors: list[BaseException] = []
+
+    def run_first():
+        try:
+            results["first"] = service.handle(request(rid="first"))
+        except BaseException as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=run_first)
+    first.start()
+    case.assertTrue(started.wait(5), "first run did not reach the engine")
+    if other == "refusal":
+        second_req = request(rid="second", conn_id="login-B", measured=False)
+    elif other == "api_key":
+        second_req = request(rid="second", kind="api_key", conn_id="key-2", credential_env="ANTHROPIC_API_KEY")
+    else:
+        second_req = request(rid="second", conn_id="login-B")
+    try:
+        results["second"] = service.handle(second_req)
+    finally:
+        release.set()
+    first.join(5)
+    case.assertFalse(first.is_alive())
+    case.assertEqual(errors, [])
+    case.assertEqual((results["first"]["status"], results["first"]["detail"]), ("ok", "beta"))
+    second = results["second"]
+    if other == "refusal":
+        case.assertEqual(second["code"], c.LAUNCH_REFUSED)
+        case.assertNotEqual(second["detail"], "beta")
+        case.assertEqual(len(launcher.calls), 1)
+    elif other == "api_key":
+        case.assertEqual(second["status"], "ok")
+        case.assertEqual(second["detail"], "")
+        case.assertEqual(len(launcher.calls), 2)
+    else:
+        case.assertEqual((second["status"], second["detail"]), ("ok", "beta"))
+        case.assertEqual(len(launcher.calls), 2)
 
 
 if __name__ == "__main__":

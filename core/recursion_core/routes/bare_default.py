@@ -14,8 +14,11 @@ import argparse
 import hashlib
 import os
 import re
+import select
+import signal
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Mapping
 
 STATES = ("absent", "present", "unknown")
@@ -166,11 +169,11 @@ def subscription_beta(build: object, help_text: object) -> dict:
     if _build_key(version) < HELP_FLOOR:
         return {"disposition": "refuse", "label": None, "build": version, "help_sha256": None,
                 "detail": f"claude {version} is below the 2.1.314 floor"}
-    if (not isinstance(help_text, str) or help_text == ""
-            or len(help_text.encode("utf-8")) > HELP_MAX_BYTES):
+    raw = _help_bytes(help_text)
+    if raw is None:
         return {"disposition": "refuse", "label": None, "build": version, "help_sha256": None,
                 "detail": f"claude {version} help is unknown; unknown is not safe"}
-    digest = help_sha256(help_text)
+    digest = hashlib.sha256(raw).hexdigest()
     entry = next((row for row in MEASURED_HELP if row["help_sha256"] == digest), None)
     if entry is None:
         return {"disposition": "refuse", "label": None, "build": version, "help_sha256": digest,
@@ -183,16 +186,477 @@ def subscription_beta(build: object, help_text: object) -> dict:
 Runner = Callable[..., "subprocess.CompletedProcess[bytes]"]
 
 
+def _help_bytes(text: object) -> bytes | None:
+    """UTF-8 help bytes within ``HELP_MAX_BYTES``, or None when the text is unusable.
+
+    A lone surrogate cannot be encoded. That is unknown help, not an exception, and the
+    text itself is not copied into the refusal.
+    """
+    if not isinstance(text, str) or text == "" or len(text) > HELP_MAX_BYTES:
+        return None
+    try:
+        raw = text.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    if len(raw) > HELP_MAX_BYTES:
+        return None
+    return raw
+
+
+def _leader_unreaped(pid: int) -> bool:
+    """True when ``pid`` is still our child, alive or zombie.
+
+    ``waitid`` with ``WNOWAIT`` reports that without collecting the zombie.
+    The leader keeps its process-group id until it is collected. ``poll`` would
+    collect it, and the group id could then be reused.
+    """
+    if not hasattr(os, "waitid") or not hasattr(os, "WNOWAIT"):
+        # No non-collecting wait. A zero signal succeeds for a zombie and fails
+        # once the leader has been collected, and it does not collect the leader.
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
+    flags = os.WEXITED | os.WNOHANG | os.WNOWAIT
+    while True:
+        try:
+            os.waitid(os.P_PID, pid, flags)
+        except InterruptedError:
+            continue
+        except ChildProcessError:
+            return False
+        return True
+
+
+def _signal_group(proc: subprocess.Popen, pid: int) -> None:
+    """SIGKILL the process group ``pid`` leads. Fall back to the leader alone.
+
+    ``ESRCH`` and ``EPERM`` mean the group is already gone or not ours to
+    signal. Both are done. A collected leader is not killed by pid: that pid
+    may have been reused.
+    """
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        return
+    except OSError:
+        if proc.returncode is not None:
+            return
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def _read_proc_stats(proc_root: str = "/proc") -> list[tuple[bytes, bytes, bytes, bytes]] | None:
+    """Return ``(pid, state, ppid, pgrp)`` rows, or ``None`` if the scan cannot run.
+
+    ``None`` is not an empty group. A missing ``/proc`` (macOS) or a failed
+    listing cannot prove the group is empty, so the caller must still signal it.
+    ``stat`` is read in binary: a process name is an arbitrary byte string.
+    One bad entry is skipped.
+    """
+    if not os.path.isdir(proc_root):
+        return None
+    try:
+        names = os.listdir(proc_root)
+    except (OSError, UnicodeError, ValueError):
+        return None
+    rows: list[tuple[bytes, bytes, bytes, bytes]] = []
+    for name in names:
+        if not str(name).isdigit():
+            continue
+        try:
+            with open(os.path.join(proc_root, str(name), "stat"), "rb") as handle:
+                raw = handle.read()
+            end = raw.rfind(b")")
+            if end < 0:
+                continue
+            member = raw.split(b" ", 1)[0]
+            fields = raw[end + 2:].split()
+            if len(fields) < 3:
+                continue
+            # state, ppid, pgrp. The command name can contain spaces and any
+            # bytes, so it is taken off above, at the last ")".
+            rows.append((member, fields[0], fields[1], fields[2]))
+        except (OSError, UnicodeError, ValueError):
+            continue
+    return rows
+
+
+def _group_has_live_member(pgid: int, proc_root: str = "/proc") -> bool | None:
+    """Whether a running process in ``pgid`` is visible.
+
+    ``True`` means one is running. ``False`` means a completed scan saw none.
+    ``None`` means the scan could not be completed, which is not proof of an
+    empty group. Zombies are not live.
+    """
+    rows = _read_proc_stats(proc_root)
+    if rows is None:
+        return None
+    token = str(pgid).encode()
+    for _pid, state, _ppid, pgrp in rows:
+        if pgrp == token and state not in (b"Z", b"X"):
+            return True
+    return False
+
+
+def _group_has_other_live_member(pgid: int) -> bool | None:
+    """Whether a finished scan sees a live member of ``pgid`` other than ``pgid``.
+
+    ``False`` means the scan saw none, so a later kill can be skipped. ``None``
+    means the scan did not run and is not an empty group. A live row whose pid
+    is ``pgid`` is not a straggler. The caller probes that pid before trusting
+    any other row: a live pid means the number was reused.
+    """
+    rows = _read_proc_stats()
+    if rows is None:
+        return None
+    token = str(pgid).encode()
+    for member, state, _ppid, pgrp in rows:
+        if pgrp == token and member != token and state not in (b"Z", b"X"):
+            return True
+    return False
+
+
+def _leader_pid_reused(pid: int) -> bool:
+    """True when ``pid`` still names a process after the leader was collected.
+
+    A group id cannot be reused while any process still has it as its pgrp.
+    A live ``pid`` is therefore a new process, and the old group is already
+    empty. ``ESRCH`` means the number is free, so ``killpg`` can reach only a
+    straggler that still carries the old group id.
+
+    ``getpgid`` and the following ``killpg`` are not one step. The pid can be
+    reused in that gap, the same window as a ``/proc`` row going stale before
+    the signal.
+    """
+    try:
+        os.getpgid(pid)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _collect_our_zombies(pgid: int, rows: list[tuple[bytes, bytes, bytes, bytes]]) -> None:
+    """Collect same-group zombies that this process parents. Not ``waitpid(-1)``.
+
+    A subreaper adopts a killed descendant when its parent exits. ``wait`` on
+    the leader does not collect that zombie, and ``kill(pid, 0)`` still succeeds
+    until something does. The leader itself is left for ``Popen.wait``.
+    """
+    leader = str(pgid).encode()
+    me = str(os.getpid()).encode()
+    for member, state, ppid, pgrp in rows:
+        if pgrp != leader or member == leader or ppid != me or state not in (b"Z", b"X"):
+            continue
+        try:
+            os.waitpid(int(member), os.WNOHANG)
+        except (ChildProcessError, OSError, ValueError):
+            pass
+
+
+def _group_still_blocking(pgid: int, rows: list[tuple[bytes, bytes, bytes, bytes]]) -> bool:
+    """True while a same-group process would still look alive to the caller.
+
+    A running member counts. A zombie does too: ``kill(pid, 0)`` succeeds until
+    it is collected. The leader's own zombie is the exception, because
+    ``Popen.wait`` collects that one and this sweep must not wait out the
+    deadline for it. Every other zombie, including one this process parents,
+    keeps the sweep going until a later snapshot shows it is gone.
+    """
+    leader = str(pgid).encode()
+    for member, state, _ppid, pgrp in rows:
+        if pgrp != leader:
+            continue
+        if member == leader and state in (b"Z", b"X"):
+            continue
+        return True
+    return False
+
+
+def _until_group_dead(pgid: int, deadline: float | None = None) -> None:
+    """Return once ``pgid`` will not look running, and collect our zombies.
+
+    SIGKILL does not finish inside the ``killpg`` call. The sweep is bounded by
+    ``deadline`` (two seconds when omitted). Each zombie is collected by its own
+    pid. There is no ``waitpid(-1)``.
+    """
+    if deadline is None:
+        deadline = time.monotonic() + 2.0
+    if not os.path.isdir("/proc"):
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(0.05, remaining))
+        return
+    while time.monotonic() < deadline:
+        rows = _read_proc_stats()
+        if rows is None:
+            return
+        _collect_our_zombies(pgid, rows)
+        rows = _read_proc_stats()
+        if rows is None or not _group_still_blocking(pgid, rows):
+            return
+        time.sleep(0.001)
+
+
+def _wait_leader(proc: subprocess.Popen, deadline: float) -> str:
+    """Wait until the leader exits or ``deadline`` passes. Do not collect it.
+
+    Returns ``"exited"``, ``"timeout"``, or ``"reaped"``. ``Popen.wait`` catches
+    ``KeyboardInterrupt`` and waits again, and that second wait collects the
+    leader before the caller can signal the group. ``waitid`` with ``WNOWAIT``
+    does not. A ``KeyboardInterrupt`` during this wait leaves the leader unreaped.
+    """
+    pid = proc.pid
+    if (os.name == "nt" or not isinstance(pid, int) or pid <= 0
+            or not hasattr(os, "waitid") or not hasattr(os, "WNOWAIT")):
+        try:
+            proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            return "timeout"
+        return "reaped"
+    flags = os.WEXITED | os.WNOHANG | os.WNOWAIT
+    while True:
+        try:
+            got = os.waitid(os.P_PID, pid, flags)
+        except InterruptedError:
+            continue
+        except ChildProcessError:
+            return "reaped"
+        if got is not None:
+            return "exited"
+        remain = deadline - time.monotonic()
+        if remain <= 0:
+            return "timeout"
+        time.sleep(min(remain, 0.02))
+
+
+def _reap(proc: subprocess.Popen) -> None:
+    """Kill every process still in the child's session, then wait for the leader.
+
+    The child is started in its own session, so its pid is the process-group id.
+    Signal that group before collecting the leader, and wait until it has no
+    running member. A leader that has already exited still owns the group until
+    it is reaped; collecting it first leaves a same-group child running.
+    SIGKILL is not finished when ``killpg`` returns. A descendant that has
+    called ``setsid`` is no longer in the group. The read loop stops on its
+    deadline instead.
+    """
+    pid = proc.pid
+    deadline = time.monotonic() + 2.0
+    signaled = False
+    if os.name != "nt" and isinstance(pid, int) and pid > 0:
+        # An unreaped leader still holds the group id, so kill even when /proc
+        # cannot be listed. Once it has been collected, probe the old pid.
+        # Alive means that number was reused: the old group is gone, and a scan
+        # that shows its child must not become a signal. ESRCH means the pid is
+        # free, so killpg reaches only real stragglers. A scan may still skip
+        # that kill when it can see that no other member is running.
+        leader_open = proc.returncode is None and _leader_unreaped(pid)
+        if leader_open:
+            signal = True
+        elif _leader_pid_reused(pid):
+            signal = False
+        else:
+            signal = _group_has_other_live_member(pid) is not False
+        if signal:
+            _signal_group(proc, pid)
+            signaled = True
+            _until_group_dead(pid, deadline)
+        else:
+            rows = _read_proc_stats()
+            if rows:
+                _collect_our_zombies(pid, rows)
+    elif os.name == "nt" and proc.returncode is None and proc.poll() is None:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        # Still our child, so this pid is still the group id.
+        if os.name != "nt" and isinstance(pid, int) and pid > 0 and proc.returncode is None:
+            _signal_group(proc, pid)
+            signaled = True
+            _until_group_dead(pid, deadline)
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        proc.wait(timeout=5)
+    # Reparenting finishes when the leader is collected. A subreaper then owns
+    # the descendant zombie and has to collect it by pid. Skip the wait when
+    # this pid was not signaled: a reused pid must not hold the sweep open.
+    if os.name != "nt" and isinstance(pid, int) and pid > 0:
+        if signaled:
+            _until_group_dead(pid, max(deadline, time.monotonic() + 0.05))
+        else:
+            rows = _read_proc_stats()
+            if rows:
+                _collect_our_zombies(pid, rows)
+
+
+def _readable(fd: int, remain: float) -> bool:
+    """Wait until ``fd`` can be read, or until ``remain`` seconds have passed."""
+    if remain <= 0:
+        return False
+    # select() does not accept pipes on Windows, and poll() is not there either.
+    if os.name == "nt" or not hasattr(select, "poll"):
+        time.sleep(min(remain, 0.02))
+        return True
+    try:
+        waiter = select.poll()
+        waiter.register(fd, select.POLLIN)
+        return bool(waiter.poll(remain * 1000.0))
+    except InterruptedError:
+        return True
+
+
+def _read_capped(fd: int, deadline: float) -> tuple[bytes, str]:
+    """Read at most one byte past the help cap. Status is eof, overflow, or timeout.
+
+    The fd is non-blocking. Nothing here waits past ``deadline``, including when a
+    descendant still holds the write end.
+    """
+    os.set_blocking(fd, False)
+    chunks: list[bytes] = []
+    total = 0
+    limit = HELP_MAX_BYTES + 1
+    while total < limit:
+        try:
+            chunk = os.read(fd, min(65536, limit - total))
+        except BlockingIOError:
+            remain = deadline - time.monotonic()
+            if remain <= 0 or not _readable(fd, remain):
+                return b"".join(chunks), "timeout"
+            continue
+        except InterruptedError:
+            continue
+        if not chunk:
+            return b"".join(chunks), "eof"
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks), "overflow"
+
+
+def _bounded_run(argv, *, env=None, stdin=None, stdout=None, stderr=None, timeout=None,
+                 check=False, shell=False):
+    """Run one argv with ``timeout`` and stop reading after the help cap.
+
+    ``subprocess.run`` buffers all of stdout before the cap can apply. This reads at most
+    ``HELP_MAX_BYTES + 1`` from the raw pipe. The read shares one deadline with the wait
+    for the child to exit.
+
+    Overflow (one byte past the cap) kills the session and finishes like any other
+    non-zero exit: ``check=True`` raises ``CalledProcessError``, otherwise the bytes
+    come back with a non-zero code. A timeout also kills the session and discards
+    bytes already read: the child did not finish, so the buffer is not a finished
+    ``--help``. An under-cap EOF does not kill. The child may close its output and
+    still be exiting; it is killed only if it is still running when the deadline hits.
+    That collect uses ``Popen._wait``. ``Popen.wait`` catches ``KeyboardInterrupt``
+    and reaps the leader before the group can be signaled. The handler reaps once.
+    A path that already reaped does not reap again: the collected pid can be reused,
+    and a second ``killpg`` would signal that new process.
+
+    ``stdout`` and ``stderr`` are ignored. The child always gets a pipe we own and
+    ``stderr=DEVNULL``. A stderr ``PIPE`` is not drained, and a flood on it would block
+    the child before stdout closed.
+    """
+    if shell:
+        raise ValueError("shell")
+    # Never inherit os.environ. An omitted env is empty, not the parent process.
+    child_env = {} if env is None else dict(env)
+    # Accept the keywords so callers can pass the subprocess.run shape, then drop them.
+    del stdout, stderr
+    popen_kwargs: dict = {
+        "env": child_env,
+        "stdin": subprocess.DEVNULL if stdin is None else stdin,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.DEVNULL,
+        "shell": False,
+    }
+    # Own session so a grandchild stays in this process group. Windows rejects the flag.
+    if os.name != "nt":
+        popen_kwargs["start_new_session"] = True
+    proc = subprocess.Popen(list(argv), **popen_kwargs)
+    fd: int | None = None
+    reaped = False
+    try:
+        if proc.stdout is None:
+            raise OSError("stdout")
+        # Dup first, then close the buffered stream. Nothing else is reading it, so
+        # close() cannot block on another thread's read lock. The dup is what we read.
+        fd = os.dup(proc.stdout.fileno())
+        proc.stdout.close()
+        waited = HELP_TIMEOUT_S if timeout is None else timeout
+        deadline = time.monotonic() + waited
+        out, why = _read_capped(fd, deadline)
+        if why == "timeout":
+            _reap(proc)
+            reaped = True
+            # Drop whatever was already read. A partial page is not help text:
+            # classifying it could report absent or present for a read that never finished.
+            raise subprocess.TimeoutExpired(list(argv), waited)
+        if why == "overflow":
+            _reap(proc)
+            reaped = True
+        else:
+            state = _wait_leader(proc, deadline)
+            if state == "timeout":
+                _reap(proc)
+                reaped = True
+                raise subprocess.TimeoutExpired(list(argv), waited) from None
+            if state == "exited" and proc.returncode is None:
+                try:
+                    # Not wait(): its KeyboardInterrupt handler reaps the leader
+                    # before the caller can signal the group.
+                    proc._wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    _reap(proc)
+                    reaped = True
+                    raise subprocess.TimeoutExpired(list(argv), waited) from None
+        code = proc.returncode if isinstance(proc.returncode, int) else 1
+        # A leader that already exited 0 can still have written past the cap.
+        # That read is not success. check=True and check=False share this result.
+        if why == "overflow" and code == 0:
+            code = 1
+        if check and code != 0:
+            raise subprocess.CalledProcessError(code, list(argv), output=out)
+        return subprocess.CompletedProcess(list(argv), code, stdout=out)
+    except BaseException:
+        # One reap per child. The explicit path already collected the leader, and
+        # a second killpg can signal a process that has reused its pid.
+        if not reaped:
+            _reap(proc)
+        raise
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if proc.stdout is not None and not proc.stdout.closed:
+            proc.stdout.close()
+
+
 def _capture(binary: str, flag: str, parent_env: Mapping[str, str], run: Runner) -> str | None:
     """Run ``<binary> <flag>`` once. The child gets only ``PATH``, ``HOME`` and ``LANG``."""
+    if not isinstance(binary, str) or binary == "" or not isinstance(parent_env, Mapping):
+        return None
     env = {k: parent_env[k] for k in ("PATH", "HOME", "LANG") if isinstance(parent_env.get(k), str)}
     try:
         done = run([binary, flag], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                    stderr=subprocess.DEVNULL, timeout=HELP_TIMEOUT_S, check=False, shell=False)
-    except (OSError, subprocess.SubprocessError, ValueError):
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
         return None
-    out = done.stdout
-    if done.returncode != 0 or not isinstance(out, bytes) or len(out) > HELP_MAX_BYTES:
+    out = getattr(done, "stdout", None)
+    code = getattr(done, "returncode", None)
+    if code != 0 or not isinstance(out, bytes) or len(out) > HELP_MAX_BYTES:
         return None
     try:
         return out.decode("utf-8")
@@ -200,33 +664,37 @@ def _capture(binary: str, flag: str, parent_env: Mapping[str, str], run: Runner)
         return None
 
 
-def read_help(binary: str, parent_env: Mapping[str, str], run: Runner = subprocess.run) -> str | None:
+def read_help(binary: str, parent_env: Mapping[str, str], run: Runner = _bounded_run) -> str | None:
     """Run ``<binary> --help`` once and return its text, or ``None`` if it cannot be read.
 
     The child gets only ``PATH``, ``HOME`` and ``LANG`` from the explicit ``parent_env`` (never
-    ``os.environ``), so no credential variable reaches it. A non-zero exit, timeout, launch failure or
-    non-UTF-8 output is ``None`` (classified ``"unknown"``).
+    ``os.environ``), so no credential variable reaches it. A non-zero exit, timeout, launch failure,
+    output over the byte cap, or non-UTF-8 output is ``None`` (classified ``"unknown"``). The read
+    stops at the cap and the child is reaped. A timeout is unknown even when the child already
+    wrote a short page and then hung: that page is not a finished ``--help``. A grandchild that
+    keeps the pipe open cannot stretch that timeout. Closing stdout is not itself a failure:
+    the child is allowed to exit within the time still left.
     """
     return _capture(binary, "--help", parent_env, run)
 
 
-def read_version(binary: str, parent_env: Mapping[str, str], run: Runner = subprocess.run) -> str | None:
+def read_version(binary: str, parent_env: Mapping[str, str], run: Runner = _bounded_run) -> str | None:
     """Run ``<binary> --version`` once under the same limit as ``read_help``, or ``None``."""
     return _capture(binary, "--version", parent_env, run)
 
 
-def probe(binary: str, parent_env: Mapping[str, str], run: Runner = subprocess.run) -> str:
+def probe(binary: str, parent_env: Mapping[str, str], run: Runner = _bounded_run) -> str:
     """``classify_help(read_help(...))``: the value a surface reports as ``route.bare_default``."""
 
     return classify_help(read_help(binary, parent_env, run))
 
 
-def probe_auth_mode(binary: str, parent_env: Mapping[str, str], run: Runner = subprocess.run) -> dict:
+def probe_auth_mode(binary: str, parent_env: Mapping[str, str], run: Runner = _bounded_run) -> dict:
     """Read help once and report the explicit subscription auth-mode capability."""
     return auth_mode(read_help(binary, parent_env, run))
 
 
-def main(argv: list[str] | None = None, run: Runner = subprocess.run) -> int:
+def main(argv: list[str] | None = None, run: Runner = _bounded_run) -> int:
     """Print one build's classification and the help lines it came from.
 
     Runs only ``--version`` and ``--help``.

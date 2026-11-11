@@ -19,6 +19,15 @@ from recursion_core.routes.service import RouteService
 from recursion_core.routes.tests.fakes import FakeClock, FakeLauncher, codex_script, request
 from recursion_core.subscription_routes import WrapperInstall, measure_package_pin
 
+
+def _pinned_argv(req: dict) -> list[str]:
+    """argv[0] is the measured launcher when the route carries a pin; otherwise the engine name."""
+    wrapper = req["route"].get("wrapper")
+    path = getattr(wrapper, "launcher_path", None)
+    if isinstance(path, str) and path:
+        return [path]
+    return [req["route"]["engine"]]
+
 PKG = pathlib.Path(__file__).resolve().parents[1]
 
 
@@ -65,9 +74,10 @@ class SubscriptionRouteReuseTest(unittest.TestCase):
         self.clock = FakeClock()
         self.launcher = FakeLauncher(lambda argv, env: [{"ok": True}], self.clock)
         drive = lambda process, req, deadline_at, events: c.result(req["request_id"], None, text="driven")
+        # Pi and Hermes launch only when argv[0] is the pinned launcher (argv0_not_pinned).
         adapters = profile_adapters(self.launcher, self.clock, lambda cid, name: {"k1": "sk-test"}[cid],
                                     {"PATH": "/usr/bin", "HOME": "/home/operator", "CLAUDE_CODE_OAUTH_TOKEN": "x"},
-                                    argv=lambda req: [req["route"]["engine"]], driver=drive, operator_home="/home/operator")
+                                    argv=_pinned_argv, driver=drive, operator_home="/home/operator")
         self.service = RouteService(adapters, ConnectionBreaker(self.clock), self.clock)
 
     def pin(self) -> WrapperInstall:
@@ -86,12 +96,14 @@ class SubscriptionRouteReuseTest(unittest.TestCase):
         def drive(process, req, deadline_at, events):
             raise Deadline()
 
+        pin = self.pin()
         adapters = profile_adapters(self.launcher, self.clock, lambda cid, name: "sk-test",
                                     {"PATH": "/usr/bin", "HOME": "/home/operator"},
-                                    argv=lambda req: ["pi"], driver=drive, operator_home="/home/operator")
+                                    argv=lambda req: [pin.launcher_path], driver=drive,
+                                    operator_home="/home/operator")
         service = RouteService(adapters, ConnectionBreaker(self.clock), self.clock)
         res = service.handle(self.req("pi", {"provider": "anthropic", "auth": "api_key",
-                                              "credential_env": "ANTHROPIC_API_KEY"}, wrapper=self.pin()))
+                                              "credential_env": "ANTHROPIC_API_KEY"}, wrapper=pin))
         self.assertEqual(res["code"], c.DEADLINE_EXCEEDED)
         self.assertEqual(self.launcher.processes[-1].fenced, ["deadline"])
 

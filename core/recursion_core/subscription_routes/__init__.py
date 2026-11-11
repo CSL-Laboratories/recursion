@@ -1,7 +1,7 @@
 """Claude-subscription route refusal for Pi, Hermes and OpenCode profiles, plus the 2026-11-08 Copilot and Nous
-own-loop routes and the 2026-11-09 wrapper pins (CSL-786, candidate). See README.md."""
+own-loop routes and the 2026-11-09 wrapper pins (CSL-786, candidate). The Gemini CLI route was dropped by
+owner call; Antigravity CLI is the Google route. See README.md."""
 
-from recursion_core.subscription_routes.gemini_cli import GeminiCliRefused, check_gemini_cli_sign_in
 from recursion_core.subscription_routes.own_loop import (
     COPILOT_STRIP_ENV,
     COPILOT_TOKEN_ENV,
@@ -17,10 +17,12 @@ from recursion_core.subscription_routes.policy import (
     ENGINE_SELECTOR_ENV,
     ENGINE_STORE_ENTRIES,
     ENGINES,
+    FORWARDED_LAUNCH_OPTIONS,
     HERMES_ADOPT_EXTERNAL_LOGINS,
     SAFE_ENV,
     SUBSCRIPTION_SIGN_INS,
     RouteDecision,
+    RouteRequirements,
     SubscriptionRouteRefused,
     check_antigravity_route,
     check_cursor_route,
@@ -33,6 +35,7 @@ from recursion_core.subscription_routes.wrapper_pin import (
     AntigravityPin,
     PackagePin,
     WrapperInstall,
+    WrapperPinRefused,
     measure_antigravity_pin,
     measure_package_pin,
 )
@@ -46,11 +49,10 @@ __all__ = [
     "check_copilot_own_loop",
     "check_nous_own_loop",
     "nous_proxy_doctor",
-    "GeminiCliRefused",
-    "check_gemini_cli_sign_in",
     "AntigravityPin",
     "PackagePin",
     "WrapperInstall",
+    "WrapperPinRefused",
     "measure_antigravity_pin",
     "measure_package_pin",
     "CLAUDE_SUBSCRIPTION_ENV",
@@ -58,7 +60,9 @@ __all__ = [
     "ENGINE_SELECTOR_ENV",
     "HERMES_ADOPT_EXTERNAL_LOGINS",
     "ENGINE_STORE_ENTRIES",
+    "FORWARDED_LAUNCH_OPTIONS",
     "RouteDecision",
+    "RouteRequirements",
     "SAFE_ENV",
     "SUBSCRIPTION_SIGN_INS",
     "SubscriptionRouteRefused",

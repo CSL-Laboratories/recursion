@@ -1,4 +1,4 @@
-"""2026-11-08 briefing: harness subscription sign-ins (E3 OpenCode, E8 Pi, E9 Hermes) and Gemini CLI (E7).
+"""2026-11-08 briefing: harness subscription sign-ins (E3 OpenCode, E8 Pi, E9 Hermes).
 
 Fakes only: a MagicMock launcher and temp homes. No engine, store, provider or network is touched.
 """
@@ -13,8 +13,7 @@ import unittest
 from unittest import mock
 
 from recursion_core.subscription_routes import (
-    HERMES_ADOPT_EXTERNAL_LOGINS, SUBSCRIPTION_SIGN_INS, GeminiCliRefused, SubscriptionRouteRefused,
-    check_gemini_cli_sign_in, check_route, guard_then_spawn,
+    HERMES_ADOPT_EXTERNAL_LOGINS, SUBSCRIPTION_SIGN_INS, SubscriptionRouteRefused, check_route, guard_then_spawn,
 )
 from recursion_core.subscription_routes.tests.test_subscription_routes import FAKE_KEY, FAKE_OAUTH, _Base
 
@@ -291,42 +290,6 @@ class AllowlistTests(_Base):
             with self.assertRaises(SubscriptionRouteRefused):
                 self.spawn("opencode", self.sub("chatgpt", "sign_in_with_chatgpt", auth=auth), self.bare_env())
         self.launcher.assert_not_called()
-
-
-class GeminiCliTests(unittest.TestCase):
-    def refused(self, route: object, cause: str) -> None:
-        with self.assertRaises(GeminiCliRefused) as caught:
-            check_gemini_cli_sign_in(route)
-        self.assertEqual(caught.exception.cause, cause)
-
-    def test_paid_api_key_works(self) -> None:
-        self.assertEqual(check_gemini_cli_sign_in({"method": "api_key", "paid": True})["method"], "api_key")
-
-    def test_unpaid_or_unstated_key_refused(self) -> None:
-        for paid in (False, None, "yes", 1):
-            route = {"method": "api_key"} if paid is None else {"method": "api_key", "paid": paid}
-            self.refused(route, "api_key_not_paid")
-
-    def test_code_assist_subscription_sign_in_is_dropped(self) -> None:
-        # 2026-11-09: Gemini CLI stays only as a paid API-key route. Code Assist is not that route.
-        for route in (
-            {"method": "code_assist", "licence": "standard", "existing": True},
-            {"method": "code_assist", "licence": "Enterprise", "existing": True},
-            {"method": "code_assist", "licence": "standard"},
-            {"method": "code_assist", "licence": "individual", "existing": True},
-        ):
-            self.refused(route, "subscription_sign_in_dropped")
-
-    def test_consumer_accounts_refused(self) -> None:
-        for method in ("Login with Google", "google_one", "AI Pro", "ai-ultra", "free", "oauth", "subscription"):
-            self.refused({"method": method}, "consumer_account_ended")
-
-    def test_unknown_or_malformed_refused(self) -> None:
-        self.refused({"method": "vertex_express"}, "method_unconfirmed")
-        self.refused({}, "method_missing")
-        self.refused(None, "route_malformed")
-        self.refused({"method": "api_key", "paid": True, "token": "x"}, "route_unknown_field")
-        self.refused({"method": "api_key", "paid": True, "licence": "standard"}, "route_mixed_methods")
 
 
 if __name__ == "__main__":

@@ -9,7 +9,6 @@ import atexit
 import ctypes
 import errno
 import os
-import resource
 import shutil
 import signal
 import subprocess
@@ -53,7 +52,12 @@ def nous(**extra: object) -> dict:
             "base_url": "http://127.0.0.1:8645/v1", **extra}
 
 
+@unittest.skipUnless(hasattr(os, "waitid"), "waitid is not available")
 class SigactionAbiTests(unittest.TestCase):
+    def setUp(self) -> None:
+        if not hasattr(own_loop.os, "waitid"):
+            self.skipTest("waitid is not available")
+
     def test_an_unverified_sigaction_abi_refuses_without_calling_libc(self) -> None:
         def cdll(*_args: object, **_kwargs: object) -> None:
             raise AssertionError("libc")
@@ -75,6 +79,10 @@ class SigactionAbiTests(unittest.TestCase):
 
     def test_a_musl_notes_file_is_not_musl_and_two_architectures_are_ambiguous(self) -> None:
         notes = b"1000-2000 r--p 00000000 00:00 0 /tmp/libc.musl-notes.txt\n"
+        named_deleted = (
+            b"1000-2000 r--p 00000000 08:01 123 "
+            b"/tmp/ld-musl-x86_64.so.1 (deleted)\n"
+        )
         both = (
             b"1000-2000 r-xp 00000000 00:00 0 /lib/ld-musl-x86_64.so.1\n"
             b"2000-3000 r-xp 00000000 00:00 0 /lib/ld-musl-aarch64.so.1\n"
@@ -86,6 +94,8 @@ class SigactionAbiTests(unittest.TestCase):
                 mock.patch.object(own_loop.ctypes, "sizeof", return_value=8):
             with mock.patch("builtins.open", mock.mock_open(read_data=notes)):
                 self.assertFalse(own_loop._sigaction_abi_supported())
+            with mock.patch("builtins.open", mock.mock_open(read_data=named_deleted)):
+                self.assertIsNone(own_loop._libc_family())
             with mock.patch("builtins.open", mock.mock_open(read_data=both)):
                 self.assertFalse(own_loop._sigaction_abi_supported())
             with mock.patch("builtins.open", mock.mock_open(read_data=exact)):
@@ -93,11 +103,19 @@ class SigactionAbiTests(unittest.TestCase):
                 self.assertTrue(own_loop._sigaction_abi_supported())
 
     def test_native_cases_skip_when_the_sigaction_abi_is_unverified(self) -> None:
-        case = CopilotTests("test_sa_nocldwait_refuses_before_the_callable")
+        # Only the libc sigaction case skips. A pure mock case still runs.
+        native = CopilotTests("test_sa_nocldwait_refuses_before_the_callable")
+        pure = CopilotTests("test_pidfd_sender_order_is_stdlib_then_os_then_libc")
         with mock.patch.object(own_loop, "_probe_enforceable", return_value=True), \
                 mock.patch.object(own_loop, "_sigaction_abi_supported", return_value=False):
-            with self.assertRaises(unittest.SkipTest):
-                case.setUp()
+            pure_result = unittest.TestResult()
+            pure.run(pure_result)
+            self.assertFalse(pure_result.skipped)
+            self.assertTrue(pure_result.wasSuccessful())
+            native_result = unittest.TestResult()
+            native.run(native_result)
+            self.assertTrue(native_result.skipped)
+            self.assertFalse(native_result.errors)
 
     def test_a_pid_waitid_error_is_not_treated_as_reaped(self) -> None:
         with mock.patch.object(own_loop.os, "waitid", side_effect=OSError(errno.EINVAL, "waitid")):
@@ -114,7 +132,7 @@ class SigactionAbiTests(unittest.TestCase):
 
 class CopilotTests(unittest.TestCase):
     def setUp(self) -> None:
-        if not own_loop._probe_enforceable() or not own_loop._sigaction_abi_supported():
+        if not own_loop._probe_enforceable():
             self.skipTest("login probe cannot be enforced on this platform")
 
     def refused(self, cause: str, route: object, env: dict | None = None, probe=lambda: True) -> None:
@@ -257,6 +275,14 @@ class CopilotTests(unittest.TestCase):
 
     def test_login_probe_with_more_than_1024_open_fds(self) -> None:
         # select() refuses an fd at or above FD_SETSIZE (1024). The pipe has to sit past that.
+        # resource is POSIX-only. Importing it at module level breaks the Windows ci:full job,
+        # which imports this file while collecting tests.
+        if os.name != "posix":
+            self.skipTest("POSIX rlimits are required")
+        try:
+            import resource
+        except ImportError:
+            self.skipTest("POSIX rlimits are required")
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
         target = 1280
         limit = hard if hard != resource.RLIM_INFINITY else target

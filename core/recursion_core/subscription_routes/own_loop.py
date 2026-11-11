@@ -609,7 +609,12 @@ def _sigaction_abi_supported() -> bool:
 
 
 def _mapped_basenames(blob: bytes) -> list[bytes]:
-    """Basenames of file mappings. ``[heap]`` and a trailing ``(deleted)`` are not names."""
+    """Basenames of file mappings. ``[heap]`` is not a name.
+
+    A path ending in `` (deleted)`` is not evidence. That suffix is what proc adds for a
+    mapping that is gone, and it is also a legal live filename, so stripping it would
+    accept a file that is not the musl loader.
+    """
 
     names: list[bytes] = []
     for line in blob.splitlines():
@@ -617,9 +622,7 @@ def _mapped_basenames(blob: bytes) -> list[bytes]:
         if len(parts) < 6:
             continue
         path = parts[5]
-        if path.endswith(b" (deleted)"):
-            path = path[: -len(b" (deleted)")]
-        if not path or path.startswith(b"["):
+        if not path or path.startswith(b"[") or path.endswith(b" (deleted)"):
             continue
         names.append(path.rsplit(b"/", 1)[-1])
     return names
@@ -773,7 +776,7 @@ def _probe_login_group(
             if pidfd is not None and pidfd >= 0:
                 _close_fd(pidfd)
             if pid is not None:
-                _reap_probe(pid)
+                wait_bad = _reap_probe(pid) or wait_bad
             if old_mask is not None:
                 try:
                     signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
@@ -1190,24 +1193,30 @@ def _stop_probe(pid: int | None, pgid: int | None, started: float, deadline: flo
     return bool(bad)
 
 
-def _reap_probe(pid: int | None) -> None:
+def _reap_probe(pid: int | None) -> bool:
+    """Reap ``pid``. True when the timeout path saw a non-``ECHILD`` ``waitid`` error.
+
+    That unknown state still receives ``SIGKILL``. The caller refuses: a successful probe
+    line does not outrank it.
+    """
+
     if pid is None or pid <= 0:
-        return
+        return False
     end = time.monotonic() + 0.5
     while True:
         try:
             got, _status = os.waitpid(pid, os.WNOHANG)
         except ChildProcessError:
-            return
+            return False
         if got == pid:
-            return
+            return False
         if time.monotonic() >= end:
-            _signal_owned_pid(pid, signal.SIGKILL)
+            unknown = _signal_owned_pid(pid, signal.SIGKILL)
             try:
                 os.waitpid(pid, 0)
             except ChildProcessError:
-                return
-            return
+                return unknown
+            return unknown
         time.sleep(0.01)
 
 

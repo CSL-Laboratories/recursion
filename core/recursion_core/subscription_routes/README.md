@@ -146,23 +146,32 @@ PRODUCT.md `055cc7a5` section 3.3. `own_loop.py`, checked before any spawn or re
   That includes a `threading` thread, a thread started with `_thread`, and any extra native thread
   in `/proc/self/task`. A lock that thread holds is never released in the child. A thread started
   in the gap before `fork` is still a race. `home` is required (`route_home_missing` otherwise):
-  a probe without it would approve the ambient account.   Where `fork`, `setsid`, `killpg`, `pidfd_open`, `pidfd_send_signal` and `waitid(P_PIDFD)` exist,
+  a probe without it would approve the ambient account. Where `fork`, `setsid`, `killpg`, `pidfd_open`, `pidfd_send_signal` and `waitid(P_PIDFD)` exist,
   the child calls `setsid`, writes a handshake byte, and does not run the callable until the
-  parent has recorded that process group and written an ack. The parent holds a pidfd from just
-  after `fork` until after the last signal. The leader is signalled with `pidfd_send_signal`.
-  `killpg` runs only after `waitid(P_PIDFD, WNOHANG|WNOWAIT)` shows that leader is still unreaped,
-  with `SIGCHLD` blocked across the check and the signal, so a handler that has already reaped
-  the worker cannot make `killpg` hit a reused process-group id. Every exit, including a probe
-  that returns true, signals that original process group: SIGTERM, then at most 20% of the
-  deadline (never more than 200 ms) and still inside the deadline, then SIGKILL. A
-  `KeyboardInterrupt` during cleanup still delivers SIGKILL, then closes the pipe fds and reaps.
-  The direct child is reaped only after those signals. A descendant that calls `setpgid(0, 0)`
-  leaves the process group and stays in the session; it is not signalled. This is not session
-  cleanup. Where the group cannot be enforced (Windows, or any platform without a pidfd signal),
-  the route refuses `probe unenforceable` and does not leave a daemon thread running.
+  parent has recorded that process group and written an ack. `pidfd_send_signal` is
+  `signal.pidfd_send_signal` when this interpreter has it, otherwise `os.pidfd_send_signal`,
+  otherwise the libc function. The parent blocks SIGINT and SIGCHLD from before `fork` until
+  after the group is signalled and the direct child is reaped, then restores the previous mask
+  with `SIG_SETMASK`. A signal the caller had already blocked stays blocked. SIGINT stays
+  blocked across `pidfd_open` and the store of that fd. `SIGCHLD` ignored (`SIG_IGN`) refuses
+  `probe unenforceable` before `fork`: the kernel would auto-reap, and blocking the signal does
+  not stop that. A custom SIGCHLD handler cannot run while the signal is blocked, so it cannot
+  collect the leader before the group is signalled. The leader is signalled with
+  `pidfd_send_signal`. `killpg` runs only while `waitid(P_PIDFD, WNOHANG|WNOWAIT)` shows that
+  leader is still unreaped. A failed `pidfd_open` signals that identified worker only when
+  `waitid` still shows it is this process's unreaped child. Cleanup does not scan the process
+  list or signal any other child. Every exit, including a probe that returns true, signals that
+  original process group: SIGTERM, then at most 20% of the deadline (never more than 200 ms)
+  and still inside the deadline, then SIGKILL. A `KeyboardInterrupt` during cleanup still
+  delivers SIGKILL, then closes the pipe fds and reaps. The direct child is reaped only after
+  those signals. A descendant that calls `setpgid(0, 0)` leaves the process group and stays
+  in the session; it is not signalled. This is not session cleanup. Where the group cannot be
+  enforced (Windows, or any platform without a pidfd signal), the route refuses
+  `probe unenforceable` and does not leave a daemon thread running.
   The probe runs with the child's final environment: `HOME` is the route home and `COPILOT_HOME`
   is `<home>/.copilot`, created mode `0700` when absent and only after `home` itself is a private
-  directory. An unsafe home leaves no `.copilot` behind. An existing `COPILOT_HOME` must be a
+  directory. A home containing NUL or a lone surrogate is `home_unsafe`. An unsafe home leaves
+  no `.copilot` behind. An existing `COPILOT_HOME` must be a
   private directory owned by this user, not a symlink and not world-accessible, the same rule as
   `HOME`. Copilot CLI >= 1.0.1 reads `COPILOT_HOME` (otherwise `~/.copilot`) and ignores
   `XDG_CONFIG_HOME`, which is not on the allowlist. A parent `COPILOT_HOME` does not select
@@ -174,9 +183,11 @@ PRODUCT.md `055cc7a5` section 3.3. `own_loop.py`, checked before any spawn or re
   not also an adapter flag. A `base_url_not_bound` refusal names the canonical origin only, not
   the path. Copilot is rebuilt on the Copilot `child_env` profile. `NO_PROXY` is matched against
   Copilot's hosts and the `githubcopilot.com` family, not Codex's, so `NO_PROXY=api.openai.com`
-  is kept. `NO_PROXY=api.github.com`, `NO_PROXY=api.githubcopilot.com` and
-  `NO_PROXY=*.githubcopilot.com` with a proxy refuse. `notgithubcopilot.com` does not match the
-  family. The literal host list is the public Copilot service names used for that check.
+  is kept. `NO_PROXY=api.github.com`, `NO_PROXY=api.githubcopilot.com`,
+  `NO_PROXY=*.githubcopilot.com` and a wildcard that can name any host under `githubcopilot.com`
+  (including `proxy.enterprise.githubcopilot.*`) with a proxy refuse. `notgithubcopilot.com` and
+  `*.example.com` do not match the family. The literal host list is the public Copilot service
+  names used for that check.
 - **Harness credential.** `launch_env` injects only `ANTHROPIC_API_KEY` (Claude profile) or
   `OPENAI_API_KEY` (OpenAI profile), both inside the `ValidatedEnv`. Every launch, including an
   OpenAI key, goes through `child_env.spawn`, so a world-writable executable is refused.

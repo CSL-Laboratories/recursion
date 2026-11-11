@@ -6,6 +6,7 @@ Fakes only: no engine, login store, provider, DNS or network is touched.
 from __future__ import annotations
 
 import atexit
+import errno
 import os
 import resource
 import shutil
@@ -411,18 +412,22 @@ class CopilotTests(unittest.TestCase):
         self.assertEqual(ran, [])
 
     def test_interrupt_after_fork_reaps_the_worker_and_closes_its_pipes(self) -> None:
+        # The interrupt lands after fork has returned the pid, and before that pidfd is stored.
+        # Cleanup signals that identified worker. It does not scan the process list.
         real_fork = os.fork
         before = _open_fds()
         children = _direct_children()
 
-        def fork_then_interrupt() -> int:
-            pid = real_fork()
-            if pid == 0:
-                return 0
+        def fork() -> int:
+            return real_fork()
+
+        def pidfd_open(pid: int, flags: int = 0) -> int:
             raise KeyboardInterrupt
 
         self.addCleanup(_kill_new_children, children)
-        with self.assertRaises(KeyboardInterrupt), mock.patch.object(own_loop.os, "fork", fork_then_interrupt):
+        with self.assertRaises(KeyboardInterrupt), \
+                mock.patch.object(own_loop.os, "fork", fork), \
+                mock.patch.object(own_loop.os, "pidfd_open", pidfd_open):
             check_copilot_own_loop(copilot(), BASE, home=_route_home(), has_copilot_login=lambda: True, probe_deadline=1.0)
         deadline = time.monotonic() + 1
         while time.monotonic() < deadline and _direct_children() - children:
@@ -462,20 +467,47 @@ class CopilotTests(unittest.TestCase):
                 sleeper = int(handle.read().strip())
             self.assertTrue(_process_not_running(sleeper))
 
-    def test_an_external_reaper_cannot_free_the_process_group_id(self) -> None:
-        # Once a SIGCHLD handler has reaped the leader, killpg must not run: the process-group id
-        # can be reused. The leader is signalled through its pidfd instead.
-        events: list[tuple[str, int]] = []
+    def test_a_pipe_failure_does_not_kill_an_existing_child(self) -> None:
+        # An EMFILE from os.pipe happens before any worker exists. Cleanup must not SIGKILL
+        # direct children the caller already had.
+        child = os.fork()
+        if child == 0:
+            time.sleep(60)
+            os._exit(0)
+
+        def stop() -> None:
+            try:
+                os.kill(child, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(child, 0)
+            except ChildProcessError:
+                pass
+
+        self.addCleanup(stop)
+
+        def boom() -> tuple[int, int]:
+            raise OSError(errno.EMFILE, "too many open files")
+
+        with mock.patch.object(own_loop.os, "pipe", boom):
+            with self.assertRaises(OwnLoopRouteRefused) as caught:
+                check_copilot_own_loop(
+                    copilot(), BASE, home=_route_home(), has_copilot_login=lambda: True, probe_deadline=1.0,
+                )
+        self.assertEqual(caught.exception.detail, "probe failed")
+        os.kill(child, 0)
+
+    def test_a_reaping_handler_still_signals_a_same_group_descendant(self) -> None:
+        # A SIGCHLD handler that waitpids must not collect the leader before the group is
+        # signalled. The descendant shares that group and has to die.
+        events: list[str] = []
         real_killpg = os.killpg
-        real_send = own_loop._pidfd_send_signal
 
         def killpg(pgid: int, sig: int):
-            events.append(("killpg", sig))
+            if sig != 0:
+                events.append("killpg")
             return real_killpg(pgid, sig)
-
-        def send(pidfd: int, sig: int) -> None:
-            events.append(("pidfd", sig))
-            real_send(pidfd, sig)
 
         def note_reap(signum: int, frame: object) -> None:
             while True:
@@ -485,22 +517,144 @@ class CopilotTests(unittest.TestCase):
                     return
                 if pid == 0:
                     return
-                events.append(("reap", pid))
 
         previous = signal.signal(signal.SIGCHLD, note_reap)
         self.addCleanup(signal.signal, signal.SIGCHLD, previous)
-        with mock.patch.object(own_loop.os, "killpg", killpg), \
-                mock.patch.object(own_loop, "_pidfd_send_signal", send):
+        with tempfile.TemporaryDirectory() as tmp:
+            info_path = os.path.join(tmp, "child")
+
+            def probe() -> bool:
+                sleeper = os.fork()
+                if sleeper == 0:
+                    time.sleep(30)
+                    os._exit(0)
+                with open(info_path, "w", encoding="ascii") as handle:
+                    handle.write(f"{sleeper}\n")
+                return True
+
+            self.addCleanup(lambda: _stop_recorded(info_path))
+            with mock.patch.object(own_loop.os, "killpg", killpg):
+                check_copilot_own_loop(
+                    copilot(), BASE, home=_route_home(), has_copilot_login=probe, probe_deadline=1.0,
+                )
+            with open(info_path, encoding="ascii") as handle:
+                sleeper = int(handle.read().strip())
+            self.assertIn("killpg", events)
+            self.assertTrue(_process_not_running(sleeper))
+
+    def test_sigchld_ignored_refuses_before_the_callable(self) -> None:
+        # SIG_IGN auto-reaps even while SIGCHLD is blocked. The callable must not run, and
+        # killpg must not see a process-group id the kernel has already freed.
+        previous = signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+        self.addCleanup(signal.signal, signal.SIGCHLD, previous)
+        children = _direct_children()
+        self.addCleanup(_kill_new_children, children)
+        ran: list[str] = []
+        killpg_calls: list[int] = []
+
+        def killpg(pgid: int, sig: int) -> None:
+            killpg_calls.append(sig)
+
+        with mock.patch.object(own_loop.os, "killpg", killpg):
+            with self.assertRaises(OwnLoopRouteRefused) as caught:
+                check_copilot_own_loop(
+                    copilot(), BASE, home=_route_home(),
+                    has_copilot_login=lambda: ran.append("ran") or True, probe_deadline=1.0,
+                )
+        self.assertEqual(caught.exception.detail, "probe unenforceable")
+        self.assertEqual(ran, [])
+        self.assertEqual(killpg_calls, [])
+        self.assertEqual(set(), _direct_children() - children)
+
+    def test_pidfd_open_failure_does_not_signal_a_reaped_pid(self) -> None:
+        # The numeric fallback must not run once the worker has already been collected.
+        real_fork = os.fork
+        killed: list[tuple[int, int]] = []
+
+        def fork() -> int:
+            pid = real_fork()
+            if pid == 0:
+                os._exit(0)
+            os.waitpid(pid, 0)
+            return pid
+
+        def pidfd_open(pid: int, flags: int = 0) -> int:
+            raise OSError(errno.ENOSYS, "pidfd_open")
+
+        def kill(pid: int, sig: int) -> None:
+            killed.append((pid, sig))
+
+        with mock.patch.object(own_loop.os, "fork", fork), \
+                mock.patch.object(own_loop.os, "pidfd_open", pidfd_open), \
+                mock.patch.object(own_loop.os, "kill", kill):
+            with self.assertRaises(OwnLoopRouteRefused) as caught:
+                check_copilot_own_loop(
+                    copilot(), BASE, home=_route_home(), has_copilot_login=lambda: True, probe_deadline=1.0,
+                )
+        self.assertEqual(caught.exception.detail, "probe unenforceable")
+        self.assertEqual(killed, [])
+
+    def test_pidfd_open_failure_reaps_the_identified_worker(self) -> None:
+        children = _direct_children()
+        before = _open_fds()
+        self.addCleanup(_kill_new_children, children)
+
+        def pidfd_open(pid: int, flags: int = 0) -> int:
+            raise OSError(errno.ENOSYS, "pidfd_open")
+
+        with mock.patch.object(own_loop.os, "pidfd_open", pidfd_open):
+            with self.assertRaises(OwnLoopRouteRefused) as caught:
+                check_copilot_own_loop(
+                    copilot(), BASE, home=_route_home(), has_copilot_login=lambda: True, probe_deadline=1.0,
+                )
+        self.assertEqual(caught.exception.detail, "probe unenforceable")
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline and _direct_children() - children:
+            time.sleep(0.01)
+        self.assertEqual(set(), _direct_children() - children)
+        self.assertEqual(before, _open_fds())
+
+    def test_cleanup_restores_a_mask_the_caller_had_blocked(self) -> None:
+        previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+        self.addCleanup(signal.pthread_sigmask, signal.SIG_SETMASK, previous)
+        check_copilot_own_loop(copilot(), BASE, home=_route_home(), has_copilot_login=lambda: True, probe_deadline=1.0)
+        self.assertEqual(previous | {signal.SIGINT}, signal.pthread_sigmask(signal.SIG_BLOCK, set()))
+
+    def test_sigint_is_blocked_across_pidfd_acquisition(self) -> None:
+        real_open = os.pidfd_open
+        seen: list[bool] = []
+
+        def pidfd_open(pid: int, flags: int = 0) -> int:
+            blocked = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+            seen.append(signal.SIGINT in blocked)
+            return real_open(pid, flags)
+
+        before = _open_fds()
+        with mock.patch.object(own_loop.os, "pidfd_open", pidfd_open):
             check_copilot_own_loop(copilot(), BASE, home=_route_home(), has_copilot_login=lambda: True, probe_deadline=1.0)
-        self.assertTrue(any(kind == "reap" for kind, _sig in events), events)
-        self.assertTrue(any(kind == "pidfd" for kind, _sig in events), events)
-        for index, (kind, _sig) in enumerate(events):
-            if kind != "killpg":
-                continue
-            self.assertFalse(
-                any(events[earlier][0] == "reap" for earlier in range(index)),
-                events,
-            )
+        self.assertEqual(seen, [True])
+        self.assertEqual(before, _open_fds())
+
+    def test_pidfd_send_prefers_the_stdlib_over_libc(self) -> None:
+        seen: list[int] = []
+
+        def fake(pidfd: int, sig: int, *args: object, **kwargs: object) -> None:
+            seen.append(sig)
+
+        def libc(pidfd: int, sig: int) -> None:
+            raise AssertionError("libc pidfd_send_signal used")
+
+        with mock.patch.object(signal, "pidfd_send_signal", fake), \
+                mock.patch.object(own_loop, "_pidfd_send_signal_libc", libc):
+            own_loop._pidfd_send_signal(7, signal.SIGTERM)
+        self.assertEqual(seen, [signal.SIGTERM])
+
+    def test_pidfd_sender_order_is_stdlib_then_os_then_libc(self) -> None:
+        stdlib, posix, libc = object(), object(), object()
+        self.assertIs(own_loop._select_pidfd_sender(stdlib, posix, libc), stdlib)
+        self.assertIs(own_loop._select_pidfd_sender(None, posix, libc), posix)
+        self.assertIs(own_loop._select_pidfd_sender(None, None, libc), libc)
+        self.assertIsNone(own_loop._select_pidfd_sender(None, None, None))
 
     def test_an_unsafe_home_does_not_leave_a_copilot_directory(self) -> None:
         root = tempfile.mkdtemp(prefix="csl-unsafe-home-")
@@ -514,6 +668,18 @@ class CopilotTests(unittest.TestCase):
         self.assertEqual(caught.exception.name, "HOME")
         self.assertEqual(caught.exception.cause, "home_unsafe")
         self.assertFalse(os.path.lexists(os.path.join(home, ".copilot")))
+
+    def test_a_nul_in_home_is_a_typed_refusal(self) -> None:
+        with self.assertRaises(EnvRefused) as caught:
+            check_copilot_own_loop(copilot(), BASE, home="/tmp/bad\0home", has_copilot_login=lambda: True)
+        self.assertEqual(caught.exception.name, "HOME")
+        self.assertEqual(caught.exception.cause, "home_unsafe")
+
+    def test_a_surrogate_in_home_is_a_typed_refusal(self) -> None:
+        with self.assertRaises(EnvRefused) as caught:
+            check_copilot_own_loop(copilot(), BASE, home="/tmp/bad\udcff", has_copilot_login=lambda: True)
+        self.assertEqual(caught.exception.name, "HOME")
+        self.assertEqual(caught.exception.cause, "home_unsafe")
 
     def test_check_without_a_route_home_refuses(self) -> None:
         # Ambient account A must not approve a later child that selects account B.

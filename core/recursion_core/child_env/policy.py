@@ -678,8 +678,8 @@ def _no_proxy_bypass(value: str, hosts: tuple[str, ...], suffixes: tuple[str, ..
     """N5i: comma and whitespace split; the union of curl, requests, hyper-util, undici and Codex matchers.
 
     ``suffixes`` are apexes such as ``githubcopilot.com``. An entry on that apex, or any name under
-    it, bypasses the whole family. A wildcard is matched against the apex and a name under it, not
-    only against the literal host strings.
+    it, bypasses the whole family. A wildcard that can match the apex or any name under it refuses,
+    not only a pattern that matches the apex or ``api.<apex>``.
     """
 
     for entry in re.split(r"[,\s]+", value.strip().lower()):
@@ -699,7 +699,7 @@ def _proxy_entry_hits(entry: str, hosts: tuple[str, ...], suffixes: tuple[str, .
         pattern = re.compile(".*".join(re.escape(part) for part in entry.split("*")) + r"\Z")
         if any(pattern.match(host) for host in hosts):
             return True
-        return any(pattern.match(suffix) or pattern.match("api." + suffix) for suffix in suffixes)
+        return any(_wildcard_intersects_suffix(entry, pattern, suffix) for suffix in suffixes)
     bare = entry.lstrip(".")
     if any(host == bare or host.endswith("." + bare) for host in hosts):
         return True
@@ -759,7 +759,33 @@ def _lexical_dir(path: str) -> str:
     return str(Path(path))
 
 
+def _wildcard_intersects_suffix(entry: str, pattern: re.Pattern[str], suffix: str) -> bool:
+    """True when the glob can match ``suffix`` or some name under it.
+
+    ``*`` is any string, including dots, the same as the host match above. A trailing ``*`` can
+    always be completed to ``.<suffix>``. Otherwise every match ends with the last literal, so
+    that literal and ``.<suffix>`` have to be the same ending.
+    """
+
+    if pattern.match(suffix):
+        return True
+    last = entry.split("*")[-1]
+    if last == "":
+        return True
+    tail = "." + suffix
+    return last.endswith(tail) or tail.endswith(last)
+
+
 def _private_dir(path: str | None) -> bool:
+    # NUL reaches ``lstat`` as ValueError. A lone surrogate fails while the path is encoded.
+    # Both are an unsafe home, not an exception for the caller to see.
+    try:
+        return _private_dir_is(path)
+    except (ValueError, UnicodeError):
+        return False
+
+
+def _private_dir_is(path: str | None) -> bool:
     if not isinstance(path, str) or not os.path.isabs(path):
         return False
     entry = _lexical_dir(path)  # the home itself may not be a link, whatever the trailing spelling

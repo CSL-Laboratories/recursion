@@ -319,7 +319,6 @@ class OwnLoopSpawnTests(unittest.TestCase):
         self.assertEqual(str(self.home), env["HOME"])
         self.assertEqual(str(route_login), env["COPILOT_HOME"])
         self.assertNotIn("XDG_CONFIG_HOME", env)
-        self.assertNotIn("A", env.get("COPILOT_HOME", ""))
 
     def test_spawn_refuses_argv_that_contradicts_the_checked_route(self) -> None:
         with mock.patch("subprocess.Popen") as popen, self.assertRaises(OwnLoopRouteRefused) as caught:
@@ -358,7 +357,7 @@ class OwnLoopSpawnTests(unittest.TestCase):
             )
         self.assertEqual("no_proxy_engine_host", caught.exception.cause)
         for bypass in ("api.githubcopilot.com", "proxy.enterprise.githubcopilot.com", "*.githubcopilot.com",
-                       "githubcopilot.com"):
+                       "githubcopilot.com", "proxy.enterprise.githubcopilot.*", "foo.githubcopilot.*"):
             with self.subTest(bypass=bypass):
                 with mock.patch("subprocess.Popen") as popen, self.assertRaises(EnvRefused) as caught:
                     spawn_copilot_own_loop(
@@ -375,6 +374,13 @@ class OwnLoopSpawnTests(unittest.TestCase):
                 self.argv, home=str(self.home), has_copilot_login=lambda: True,
             )
         self.assertEqual("notgithubcopilot.com", popen.call_args.kwargs["env"]["NO_PROXY"])
+        with mock.patch("subprocess.Popen") as popen:
+            spawn_copilot_own_loop(
+                {"engine": "copilot", "auth": "subscription", "method": "copilot_cli_sign_in"},
+                {**self.base, "HTTPS_PROXY": "http://127.0.0.1:9", "NO_PROXY": "*.example.com"},
+                self.argv, home=str(self.home), has_copilot_login=lambda: True,
+            )
+        self.assertEqual("*.example.com", popen.call_args.kwargs["env"]["NO_PROXY"])
 
     def test_copilot_home_must_be_a_private_directory(self) -> None:
         shared = self.root / "shared"

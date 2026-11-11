@@ -258,6 +258,9 @@ class ServiceOracleTest(unittest.TestCase):
             ("not exhausted", c.ENGINE_ERROR),
             ("isn't exhausted", c.ENGINE_ERROR),
             ("quota is not exhausted", c.ENGINE_ERROR),
+            ("not_exhausted", c.ENGINE_ERROR),
+            ("not-rate-limited", c.ENGINE_ERROR),
+            ("quota_is_not_exhausted", c.ENGINE_ERROR),
             ("quota_exhausted", c.SHORT_FAULT),
             ("quota is not available", c.SHORT_FAULT),
             ("éexhaustedé", c.ENGINE_ERROR),
@@ -745,6 +748,57 @@ class ReviewFollowupTest(unittest.TestCase):
         service.shutdown()
         self.assertEqual(proc.fenced, ["shutdown"])
         self.assertEqual(service._live, {})
+
+    def test_nested_url_escapes_are_redacted_in_the_vendor_event(self) -> None:
+        rows = (
+            r"prefix https:\\/\\/user:password@example.invalid/hook suffix",
+            r"prefix https:\u005c/\u005c/user:password@example.invalid/hook suffix",
+            r"prefix https:\\/\u005c/user:password@example.invalid/hook suffix",
+        )
+        for error in rows:
+            with self.subTest(error=error):
+                event = c.event("retry", "vendor", {"error": error})
+                blob = json.dumps(event)
+                self.assertNotIn("password", blob)
+                self.assertNotIn("user:password", blob)
+                self.assertIn("[redacted]", event["data"]["error"])
+                self.assertIn("example.invalid", event["data"]["error"])
+
+    def test_negated_quota_predicates_use_the_same_separators(self) -> None:
+        for text in ("not_exhausted", "not-rate-limited", "quota_is_not_exhausted"):
+            with self.subTest(text=text):
+                self.assertFalse(c.sounds_like_quota(text))
+        self.assertTrue(c.sounds_like_quota("quota_exhausted"))
+        self.assertTrue(c.sounds_like_quota("quota is not available"))
+
+    def test_opencode_subscription_providers_are_different_breakers(self) -> None:
+        chatgpt = request(
+            rid="cg", engine="opencode", model="chatgpt/gpt", kind="subscription", conn_id="shared",
+            profile={"provider": "chatgpt", "auth": "subscription", "method": "sign_in_with_chatgpt",
+                     "model": "chatgpt/gpt"})
+        grok = request(
+            rid="gk", engine="opencode", model="grok/g", kind="subscription", conn_id="shared",
+            profile={"provider": "grok", "auth": "subscription", "method": "grok_sign_in",
+                     "model": "grok/g"})
+        spelled = request(
+            rid="sp", engine="opencode", model="chatgpt/gpt", kind="subscription", conn_id="shared",
+            profile={"provider": "ChatGPT", "auth": "subscription", "method": "Sign in with ChatGPT",
+                     "model": "chatgpt/gpt"})
+        chatgpt_key = c.breaker_key(chatgpt["route"])
+        grok_key = c.breaker_key(grok["route"])
+        self.assertEqual(chatgpt_key, "opencode:subscription:chatgpt:sign_in_with_chatgpt:shared")
+        self.assertEqual(grok_key, "opencode:subscription:grok:grok_sign_in:shared")
+        self.assertNotEqual(chatgpt_key, grok_key)
+        self.assertEqual(c.breaker_key(spelled["route"]), chatgpt_key)
+        clock = FakeClock()
+        breaker = ConnectionBreaker(clock)
+        breaker.record(chatgpt_key, "chatgpt/gpt", "t1",
+                       c.result("cg", c.PLAN_LIMIT, limit=c.limit_signal("connection", "vendor")))
+        self.assertEqual(breaker.state(chatgpt_key), "open")
+        self.assertEqual(breaker.state(grok_key), "closed")
+        grok_admit = breaker.admit(grok_key, "grok/g", "t1")
+        self.assertTrue(grok_admit["admitted"])
+        self.assertFalse(breaker.admit(chatgpt_key, "chatgpt/gpt", "t1")["admitted"])
 
 
 if __name__ == "__main__":

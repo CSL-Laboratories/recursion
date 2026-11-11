@@ -167,7 +167,9 @@ def breaker_key(route: Mapping) -> str:
     An ``api_key_helper`` route ignores ``credential_env``: the helper supplies the key, so the
     meter is ``api_key:anthropic:api_key_helper:<id>`` and does not share the custody slot.
     A subscription login stays on its engine: the same label on Claude and on Codex is not one
-    login. A passthrough method bills that cloud account, not the Anthropic key.
+    login. On Pi, Hermes and OpenCode the login is the normalised provider and sign-in method, so
+    OpenCode ChatGPT and OpenCode Grok with the same connection id are two meters. A passthrough
+    method bills that cloud account, not the Anthropic key.
     """
 
     conn = route["connection"]
@@ -179,7 +181,21 @@ def breaker_key(route: Mapping) -> str:
     if kind == "passthrough":
         method = conn.get("method") if isinstance(conn.get("method"), str) else ""
         return f"{engine}:passthrough:{method}:{ident}"
+    if kind == "subscription" and engine in PROFILE_ENGINES:
+        provider, method = _sign_in_identity(route)
+        return f"{engine}:subscription:{provider}:{method}:{ident}"
     return f"{engine}:{kind}:{ident}"
+
+
+def _sign_in_identity(route: Mapping) -> tuple[str, str]:
+    """Normalised provider and sign-in method. Same spelling rule as the sign-in allowlist."""
+
+    profile = route.get("profile") if isinstance(route.get("profile"), Mapping) else {}
+    provider = profile.get("provider") if isinstance(profile.get("provider"), str) else ""
+    method = profile.get("method") if isinstance(profile.get("method"), str) else ""
+    from recursion_core.subscription_routes.policy import _norm
+
+    return _norm(provider), _norm(method)
 
 
 def _api_key_meter(route: Mapping) -> tuple[str, str]:
@@ -275,27 +291,32 @@ def result(request_id: str, code: str | None, *, text: str = "", limit: dict | N
 # they make at most a SHORT_FAULT on one model for one tenant (grill Q23); they never make a PLAN_LIMIT.
 # Token edges are letters and digits, including non-ASCII letters, so "unexhausted" and
 # "éexhaustedé" are not hits. "_" separates tokens, so "quota_exhausted" is. "rate-limited" and
-# "rate limiting" are hits. A denial cancels only a recognised predicate ("not exhausted",
-# "isn't exhausted", "quota is not exhausted", "not a rate limit"). "quota is not available"
-# stays a hit: "available" is not one of those predicates. "no quota" stays a hit.
+# "rate limiting" are hits. A denial cancels only a recognised predicate, and the words may be
+# joined by the same separators as the phrase itself (space, "_" or "-"): "not exhausted",
+# "not_exhausted", "not-rate-limited", "isn't exhausted", "quota is not exhausted" and
+# "quota_is_not_exhausted". "quota is not available" stays a hit: "available" is not one of those
+# predicates. "no quota" stays a hit.
+_SEP = r"[\s_-]"
 _QUOTA = re.compile(
-    r"quotas?|rate[\s_-]*limit(?:ed|ing|s)?|usage[\s_-]*limits?|limits?[\s_-]*reached|exhausted|too many requests",
+    rf"quotas?|rate{_SEP}*limit(?:ed|ing|s)?|usage{_SEP}*limits?|limits?{_SEP}*reached|exhausted|too many requests",
     re.IGNORECASE,
 )
 _QUOTA_NEGATED = re.compile(
-    r"(?:^|[^\w])(?:not|never|(?:is|are|was|were|do|does|did|wo|can|could|should|would)n['’]t)"
-    r"(?:\s+(?:a|an|the))?\s+$",
+    rf"(?:^|{_SEP})(?:not|never|(?:is|are|was|were|do|does|did|wo|can|could|should|would)n['’]t)"
+    rf"(?:{_SEP}+(?:a|an|the))?{_SEP}+$",
     re.IGNORECASE,
 )
+_QUOTA_PREDICATE = rf"(?:exhausted|rate{_SEP}*limit(?:ed|ing|s)?|usage{_SEP}*limits?|quotas?)"
 _QUOTA_DENIED_AFTER = re.compile(
-    r"^\s*(?:is|are|was|were)?\s*(?:not|never|(?:is|are|was|were)n['’]t)\s+(?:a\s+|an\s+|the\s+)?"
-    r"(?:exhausted|rate[\s_-]*limit(?:ed|ing|s)?|usage[\s_-]*limits?|quotas?)\b",
+    rf"^{_SEP}*(?:is|are|was|were)?{_SEP}*(?:not|never|(?:is|are|was|were)n['’]t){_SEP}+"
+    rf"(?:(?:a|an|the){_SEP}+)?{_QUOTA_PREDICATE}(?=$|{_SEP}|\b)",
     re.IGNORECASE,
 )
 # Credential shapes. Word boundaries so "task-12345678" is not an sk- key. Case-insensitive, and
-# applied after JSON ``\uXXXX`` and ``\/`` escapes are decoded, so a hyphen written as ``\u002d``
-# and a URL written as ``https:\/\/user:password@host`` still match. The decoded text is only a
-# search view: non-secret escapes stay as they were written.
+# applied after JSON ``\uXXXX`` and ``\/`` escapes are decoded, including a second layer
+# (``\\/``, ``\u005c/``, or a mix of the two). A hyphen written as ``\u002d`` and a URL written as
+# ``https:\\/\\/user:password@host`` still match. The decoded text is only a search view:
+# non-secret escapes stay as they were written.
 _SECRET = re.compile(
     r"(?<!\w)eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}(?!\w)"
     r"|(?<!\w)sk-[A-Za-z0-9_-]{8,}(?!\w)"
@@ -311,29 +332,51 @@ _URL_USERINFO = re.compile(r"https?://([^\s/@:]+:[^\s/@]+)@", re.IGNORECASE)
 _JSON_U = re.compile(r"\\u([0-9a-fA-F]{4})")
 
 
-def _match_view(value: str) -> tuple[str, list[tuple[int, int]]]:
-    """Decode ``\\uXXXX`` and ``\\/`` for matching. Each output character maps to an original span."""
+# Nested JSON encoding (``\\/`` or ``\u005c/``) needs more than one pass. Eight is enough for a
+# backslash that was escaped several times and still bounded.
+_ESCAPE_PASSES = 8
+
+
+def _decode_layer(value: str) -> tuple[str, list[tuple[int, int]], bool]:
+    """Decode one layer of ``\\uXXXX`` and ``\\/``. Each output character maps into ``value``."""
 
     out: list[str] = []
     spans: list[tuple[int, int]] = []
     index = 0
     length = len(value)
+    changed = False
     while index < length:
         if value.startswith("\\/", index):
             out.append("/")
             spans.append((index, index + 2))
             index += 2
+            changed = True
             continue
         match = _JSON_U.match(value, index)
         if match is not None:
             out.append(chr(int(match.group(1), 16)))
             spans.append((match.start(), match.end()))
             index = match.end()
+            changed = True
             continue
         out.append(value[index])
         spans.append((index, index + 1))
         index += 1
-    return "".join(out), spans
+    return "".join(out), spans, changed
+
+
+def _match_view(value: str) -> tuple[str, list[tuple[int, int]]]:
+    """Decode nested ``\\uXXXX`` and ``\\/`` layers. Spans point at the original string."""
+
+    text = value
+    spans = [(index, index + 1) for index in range(len(value))]
+    for _ in range(_ESCAPE_PASSES):
+        decoded, layer, changed = _decode_layer(text)
+        if not changed:
+            break
+        spans = [(spans[start][0], spans[end - 1][1]) for start, end in layer]
+        text = decoded
+    return text, spans
 
 
 def redact(value: str) -> str:

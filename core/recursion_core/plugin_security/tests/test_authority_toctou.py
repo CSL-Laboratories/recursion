@@ -157,16 +157,13 @@ class AuthorityToctouTests(unittest.TestCase):
                 self.assertEqual(self.mutations, before + 1, "the mutator thread did not run")
                 self.assertEqual(self._ledger(), ([], []))
 
-    @unittest.expectedFailure  # TOCTOU: fields read from the live object after verify
     def test_mutation_after_verify_cannot_widen_refusals(self) -> None:
         self._run_refusals("verify", after_true=True)
 
-    @unittest.expectedFailure  # TOCTOU: fields read from the live object after verify
     def test_mutation_after_canonical_cannot_widen_refusals(self) -> None:
         # Hooked at canonical so it also fires when the signature verdict comes from a cache.
         self._run_refusals("canonical", after_true=False)
 
-    @unittest.expectedFailure  # TOCTOU: fields read from the live object after verify
     def test_mutation_cannot_extend_expiry(self) -> None:
         for hook_name in ("verify", "canonical"):
             with self.subTest(hook_name):
@@ -179,7 +176,6 @@ class AuthorityToctouTests(unittest.TestCase):
                 self.assertEqual(env["profile"]["expires_at"], 10**12)  # the live dict really changed
                 self.assertEqual(self._ledger(), ([], []))
 
-    @unittest.expectedFailure  # TOCTOU: fields read from the live object after verify
     def test_mutation_cannot_raise_total_budget(self) -> None:
         env = profile(self.installer)
         signed_digest = hashlib.sha256(authority_module.canonical(env["profile"])).hexdigest()
@@ -193,7 +189,6 @@ class AuthorityToctouTests(unittest.TestCase):
         self.assertEqual(self._ledger(), ([("prof-1", signed_digest)],
                                           [("k-a", "prof-1", 5_000), ("k-b", "prof-1", 5_000)]))
 
-    @unittest.expectedFailure  # TOCTOU: fields read from the live object after verify
     def test_ledger_and_result_use_signed_id_and_budget(self) -> None:
         for hook_name in ("verify", "canonical"):
             with self.subTest(hook_name):
@@ -211,7 +206,6 @@ class AuthorityToctouTests(unittest.TestCase):
                 self.assertEqual(out, {"profile_id": "prof-1", "spent_minor": 1_000, "remaining_minor": 9_000})
                 self.assertEqual(self._ledger(), ([("prof-1", signed_digest)], [("k-1", "prof-1", 1_000)]))
 
-    @unittest.expectedFailure  # TOCTOU: fields read from the live object after verify
     def test_unhooked_race_never_lets_a_mutated_profile_charge(self) -> None:
         # No hook: a real thread keeps flipping max_effect_minor while the main thread charges
         # 6_000 against a signed max of 5_000. Each charge must refuse, either because the bytes

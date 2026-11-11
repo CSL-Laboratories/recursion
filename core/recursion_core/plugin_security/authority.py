@@ -55,7 +55,7 @@ import threading
 from typing import Callable
 
 from .approval import SCOPE_FIELDS
-from .canonical import MAX_INT, canonical
+from .canonical import MAX_INT, canonical, parse
 from .errors import Refused
 from .signing import key_id, parse_public_key, verify
 
@@ -138,6 +138,13 @@ class Authority:
             raise Refused("profile_noncanonical") from None
         if not verify(self._anchor, envelope["signature"], raw):
             raise Refused("profile_signature_invalid")
+        # Every later check, the result and the ledger read a private parse of the exact
+        # signed bytes, never the caller's dict: another plugin thread can still change that
+        # dict after the check (3.14t, GIL off).
+        try:
+            profile = parse(raw)
+        except Refused:  # pragma: no cover - canonical() output always round-trips
+            raise Refused("profile_noncanonical") from None
         if type(profile) is not dict or set(profile) != _FIELDS or profile["schema"] != PROFILE_SCHEMA:
             raise Refused("profile_fields")
         if profile["issuer"] != "installer" or profile["permission"] != "order":

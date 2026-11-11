@@ -36,8 +36,8 @@ Stop: the first call asks the cleanup layer to stop the run's tree, then asks it
 confirmed empty cgroup yields ``stopped``; a populated cgroup, a confirm timeout, an unknown answer or a
 cleanup error yields ``pending`` with that reason. A repeat stop on a stopped run sends nothing; on a
 pending run it only re-checks, unless the earlier cleanup request was never sent (``stop.requested`` is
-false: it raised, or it is a stop intent from before the launch was recorded), in which case it sends it
-(``cgroup.kill`` and pidfd signals are safe to repeat).
+false or absent: it raised, it is a stop intent from before the launch was recorded, or the flag was
+never written), in which case it sends it (``cgroup.kill`` and pidfd signals are safe to repeat).
 Reads never change state and never call the cleanup layer.
 
 ``client_key`` dedupes a retried start per tenant and is bound to that start's engine and prompt (the
@@ -51,6 +51,7 @@ retried start with the original run (11.3, B-17).
 
 Stop decisions and launch records are serialised per run, so a slow or hung cleanup on one run never
 queues another run's Stop (11.3, D2-55 / B-19), and a launch never overwrites a Stop that landed during it.
+The per-run lock is dropped once that call, and any call waiting on it, have returned.
 Starts are serialised only per ``(tenant, client_key)``: a slow or hung starter delays only a retry of the
 same start, never another start. The lock is dropped once that start, and any same-key start waiting on
 it, have returned, so distinct keys do not keep locks for the life of the process (bot review 4517611266).
@@ -62,6 +63,7 @@ import hashlib
 import threading
 import uuid
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 
 from recursion_core.control.registry import EMPTY, POPULATED, TIMEOUT, KillTree, RunRegistry
 
@@ -95,8 +97,8 @@ class ControlAPI:
         self._confirm_timeout_s = confirm_timeout_s
         self._locks_lock = threading.Lock()
         # One stop or launch-record decision per run, so a kill is never sent twice and a Stop that lands
-        # during a launch is never overwritten by it.
-        self._run_locks: dict[str, threading.Lock] = {}
+        # during a launch is never overwritten by it. Value is [lock, in_flight], dropped at zero.
+        self._run_locks: dict[str, list] = {}
         # A retried start with the same (tenant, client_key) launches once; other starts never wait on it.
         # Value is [lock, in_flight]. The entry is removed when the count hits zero (bot review 4517611266).
         self._start_locks: dict[tuple[str, str], list] = {}
@@ -266,9 +268,23 @@ class ControlAPI:
             return False
         return True
 
-    def _run_lock(self, run_id: str) -> threading.Lock:
+    @contextmanager
+    def _run_lock(self, run_id: str):
         with self._locks_lock:
-            return self._run_locks.setdefault(run_id, threading.Lock())
+            slot = self._run_locks.get(run_id)
+            if slot is None:
+                slot = [threading.Lock(), 0]
+                self._run_locks[run_id] = slot
+            slot[1] += 1
+            lock = slot[0]
+        try:
+            with lock:
+                yield
+        finally:
+            with self._locks_lock:
+                slot[1] -= 1
+                if slot[1] == 0 and self._run_locks.get(run_id) is slot:
+                    del self._run_locks[run_id]
 
     # -- stop ---------------------------------------------------------------------------------
     def stop(self, run_id: str) -> dict:
@@ -313,9 +329,9 @@ class ControlAPI:
         first = rec["state"] != "stop_pending"
         if rec.get("stop") is None:
             rec["stop"] = {"requested_at": self._clock(), "checks": 0, "reason": None, "requested": False}
-        if not rec["stop"].get("requested", True):
-            # First stop, a stop intent left during launch, or an earlier request raised before it was known
-            # to be sent: (re)send it.
+        if not rec["stop"].get("requested", False):
+            # First stop, a stop intent left during launch, a record whose requested flag was never
+            # written, or an earlier request raised before it was known to be sent: (re)send it.
             try:
                 self._kill.request_stop(rec["cgroup"])
             except Exception as err:

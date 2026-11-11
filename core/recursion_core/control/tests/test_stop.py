@@ -659,5 +659,26 @@ class StartConcurrencyTest(unittest.TestCase):
         self.assertEqual(api._start_locks, {})
 
 
+class ShutdownLeakTest(unittest.TestCase):
+    def test_a_stop_record_without_requested_still_sends_cleanup(self) -> None:
+        api, registry, kill, _ = make_api(FakeKillTree([EMPTY]))
+        run = started(api)
+        rec = registry.get(run)
+        rec["stop"] = {"requested_at": 1.0, "checks": 0, "reason": "populated"}
+        registry.put(rec)
+        stopped = api.call("run.stop", {"run_id": run})
+        self.assertEqual(stopped["code"], a.STOPPED)
+        self.assertEqual(kill.requests, ["/sys/fs/cgroup/fake/run-1"])
+
+    def test_run_locks_are_dropped_after_the_call_returns(self) -> None:
+        api, _, _, _ = make_api(FakeKillTree([EMPTY]))
+        run = started(api)
+        self.assertEqual(api._run_locks, {})
+        api.call("run.stop", {"run_id": run})
+        self.assertEqual(api._run_locks, {})
+        api.call("run.status", {"run_id": run})
+        self.assertEqual(api._run_locks, {})
+
+
 if __name__ == "__main__":
     unittest.main()

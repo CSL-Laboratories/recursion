@@ -20,13 +20,14 @@ from recursion_core.control.mcp_dual_era import (
     TASKS_EXTENSION,
     DualEraServer,
     Negotiation,
+    _iso,
     claude_code_negotiate,
     modern_params,
     negotiation_mode,
 )
 from recursion_core.control import mcp_tools
 from recursion_core.control.api import ControlAPI
-from recursion_core.control.registry import POPULATED
+from recursion_core.control.registry import EMPTY, POPULATED
 from recursion_core.control.tests.fakes import FakeKillTree, FakeStarter, InMemoryRunRegistry, make_api, started
 
 N = 5
@@ -329,6 +330,7 @@ class SameRunAndStopTests(unittest.TestCase):
                                 "params": modern_params(taskId="run-launching")})["result"]
         self.assertEqual((cancel["status"], cancel["statusMessage"]), ("working", "pending"))
         self.assertEqual(kill.requests, [])
+        self.assertEqual(server.notifications, [])
 
     def test_create_task_reads_pending_when_a_stop_lands_during_the_launch(self) -> None:
         # Red-team r2 finding 1: the CreateTaskResult itself carries S6 "pending" when a Stop lands while
@@ -645,6 +647,229 @@ class SameRunAndStopTests(unittest.TestCase):
             "params": modern_params(taskId="a" * 129),
         })
         self.assertIn("error", too_long)
+
+
+class NotificationAndTimestampTests(unittest.TestCase):
+    def _record(self, **overrides) -> dict:
+        rec = {
+            "run_id": "run-1", "tenant": "t1", "engine": "codex", "state": "running",
+            "cgroup": "/cg/run-1", "started_at": 1_762_639_200.0, "stop": None, "start_key": None,
+        }
+        rec.update(overrides)
+        return rec
+
+    def test_inbound_notification_is_not_a_response_and_does_not_stop_a_run(self) -> None:
+        api, registry, kill, _ = make_api(FakeKillTree([EMPTY]))
+        server = DualEraServer(api)
+        run = started(api)
+        reply = server.handle({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {"requestId": 0, "reason": "stop"},
+        })
+        self.assertIsNone(reply)
+        self.assertEqual(registry.get(run)["state"], "running")
+        self.assertEqual(kill.requests, [])
+        self.assertEqual(server.notifications, [{
+            "method": "notifications/cancelled",
+            "params": {"requestId": 0, "reason": "stop"},
+        }])
+        other = server.handle({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        self.assertIsNone(other)
+        self.assertEqual(registry.get(run)["state"], "running")
+
+    def test_request_id_zero_is_answered(self) -> None:
+        server, *_ = _server()
+        reply = server.handle({"jsonrpc": "2.0", "id": 0, "method": "tools/list", "params": {}})
+        self.assertEqual(reply["id"], 0)
+        self.assertIn("tools", reply["result"])
+        null_id = server.handle({"jsonrpc": "2.0", "id": None, "method": "tools/list", "params": {}})
+        self.assertIsInstance(null_id, dict)
+        self.assertIn("id", null_id)
+        self.assertIsNone(null_id["id"])
+
+    def test_started_at_zero_stays_the_epoch_when_stop_time_is_not_numeric(self) -> None:
+        clock = 1_762_639_200.0
+        api, registry, _, _ = make_api()
+        registry.put(self._record(started_at=0, stop={"requested_at": "nope"}))
+        server = DualEraServer(api, clock=lambda: clock)
+        poll = server.handle({
+            "jsonrpc": "2.0", "id": 1, "method": "tasks/get",
+            "params": modern_params(taskId="run-1"),
+        })["result"]
+        self.assertEqual(poll["createdAt"], "1970-01-01T00:00:00Z")
+        self.assertEqual(poll["lastUpdatedAt"], "1970-01-01T00:00:00Z")
+
+    def test_non_numeric_started_at_does_not_escape_tasks_get(self) -> None:
+        clock = 1_762_639_200.0
+        api, registry, _, _ = make_api()
+        registry.put(self._record(started_at="yesterday"))
+        server = DualEraServer(api, clock=lambda: clock)
+        reply = server.handle({
+            "jsonrpc": "2.0", "id": 2, "method": "tasks/get",
+            "params": modern_params(taskId="run-1"),
+        })
+        self.assertEqual(reply["result"]["createdAt"], _iso(clock))
+        self.assertEqual(reply["result"]["lastUpdatedAt"], _iso(clock))
+
+    def test_truthy_non_mapping_stop_does_not_crash_tasks_get(self) -> None:
+        # A corrupt or foreign record can store stop=True. That is not a stop
+        # mapping, so tasks/get must still return a body and keep lastUpdatedAt
+        # on createdAt (started_at), not raise AttributeError.
+        started = 1000.0
+        clock = 2000.0
+        api, registry, _, _ = make_api()
+        registry.put(self._record(started_at=started, stop=True))
+        server = DualEraServer(api, clock=lambda: clock)
+        reply = server.handle({
+            "jsonrpc": "2.0", "id": "g1", "method": "tasks/get",
+            "params": modern_params(taskId="run-1"),
+        })
+        self.assertNotIn("error", reply)
+        body = reply["result"]
+        self.assertEqual(body["createdAt"], _iso(started))
+        self.assertEqual(body["lastUpdatedAt"], body["createdAt"])
+        self.assertNotEqual(body["lastUpdatedAt"], _iso(clock))
+
+    def test_bool_started_at_is_not_a_timestamp(self) -> None:
+        clock = 1_762_639_200.0
+        api, registry, _, _ = make_api()
+        registry.put(self._record(started_at=True, stop={"requested_at": True}))
+        server = DualEraServer(api, clock=lambda: clock)
+        poll = server.handle({
+            "jsonrpc": "2.0", "id": 3, "method": "tasks/get",
+            "params": modern_params(taskId="run-1"),
+        })["result"]
+        self.assertEqual(poll["createdAt"], _iso(clock))
+        self.assertEqual(poll["lastUpdatedAt"], _iso(clock))
+        created = server._create_task({
+            "structuredContent": {
+                "code": "started",
+                "run": {"run_id": "missing", "state": "running", "started_at": True},
+            }
+        })
+        self.assertEqual(created["createdAt"], _iso(clock))
+        epoch = server._create_task({
+            "structuredContent": {
+                "code": "started",
+                "run": {"run_id": "missing", "state": "running", "started_at": 0},
+            }
+        })
+        self.assertEqual(epoch["createdAt"], "1970-01-01T00:00:00Z")
+
+    def test_non_finite_started_at_does_not_escape_tasks_get(self) -> None:
+        clock = 1_762_639_200.0
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=value):
+                api, registry, _, _ = make_api()
+                registry.put(self._record(started_at=value))
+                server = DualEraServer(api, clock=lambda: clock)
+                reply = server.handle({
+                    "jsonrpc": "2.0", "id": 4, "method": "tasks/get",
+                    "params": modern_params(taskId="run-1"),
+                })
+                self.assertEqual(reply["result"]["createdAt"], _iso(clock))
+                self.assertEqual(reply["result"]["lastUpdatedAt"], _iso(clock))
+
+    def test_oversized_int_timestamps_do_not_escape(self) -> None:
+        # float(10**400) raises OverflowError before fromtimestamp. JSON can carry that integer.
+        clock = 1_762_639_200.0
+        started = 1000.0
+        for value in (10**400, -(10**400)):
+            with self.subTest(value=value):
+                api, registry, _, _ = make_api()
+                registry.put(self._record(started_at=value))
+                server = DualEraServer(api, clock=lambda: clock)
+                reply = server.handle({
+                    "jsonrpc": "2.0", "id": 5, "method": "tasks/get",
+                    "params": modern_params(taskId="run-1"),
+                })
+                self.assertEqual(reply["result"]["createdAt"], _iso(clock))
+                self.assertEqual(reply["result"]["lastUpdatedAt"], _iso(clock))
+                created = server._create_task({
+                    "structuredContent": {
+                        "code": "started",
+                        "run": {"run_id": "missing", "state": "running", "started_at": value},
+                    }
+                })
+                self.assertEqual(created["createdAt"], _iso(clock))
+                self.assertEqual(created["lastUpdatedAt"], _iso(clock))
+                registry.put(self._record(started_at=started, stop={"requested_at": value}))
+                poll = server.handle({
+                    "jsonrpc": "2.0", "id": 6, "method": "tasks/get",
+                    "params": modern_params(taskId="run-1"),
+                })["result"]
+                self.assertEqual(poll["createdAt"], _iso(started))
+                self.assertEqual(poll["lastUpdatedAt"], _iso(started))
+
+    def test_cancel_fallback_keeps_a_bool_stop_time_aligned_with_tasks_get(self) -> None:
+        # An existing bool requested_at is not a time, but replacing it with the server clock
+        # in this reply makes the next tasks/get look older: the stored value is still the bool,
+        # and _task_body then falls back to started_at.
+        from recursion_core.control.registry import EMPTY
+        registry = _OutageRegistry()
+        api = ControlAPI(registry, FakeKillTree(answers=(EMPTY,)), FakeStarter(), clock=lambda: 1000.0)
+        server = DualEraServer(api, clock=lambda: 2000.0)
+        run_id = started(api)
+        rec = registry.get(run_id)
+        rec["stop"] = {"requested_at": True, "checks": 1, "reason": "populated", "requested": True}
+        registry.put(rec)
+        real_stop = api.stop
+
+        def stop_then_outage(rid: str) -> dict:
+            answer = real_stop(rid)
+            registry.down = True
+            return answer
+
+        api.stop = stop_then_outage
+        body = server.handle({
+            "jsonrpc": "2.0", "id": "tc", "method": "tasks/cancel",
+            "params": modern_params(taskId=run_id),
+        })["result"]
+        registry.down = False
+        polled = server.handle({
+            "jsonrpc": "2.0", "id": "g", "method": "tasks/get",
+            "params": modern_params(taskId=run_id),
+        })["result"]
+        self.assertEqual(body["lastUpdatedAt"], _iso(1000.0))
+        self.assertEqual(body["lastUpdatedAt"], polled["lastUpdatedAt"])
+        self.assertNotEqual(body["lastUpdatedAt"], _iso(2000.0))
+        self.assertIs(registry.get(run_id)["stop"]["requested_at"], True)
+
+    def test_cancel_fallback_leaves_a_missing_stop_time_absent(self) -> None:
+        # A stop record that already exists but has no requested_at must not gain the
+        # server clock. The stored record stays without that field, and tasks/get
+        # falls back to started_at, so the two replies have to match.
+        from recursion_core.control.registry import EMPTY
+        registry = _OutageRegistry()
+        api = ControlAPI(registry, FakeKillTree(answers=(EMPTY,)), FakeStarter(), clock=lambda: 1000.0)
+        server = DualEraServer(api, clock=lambda: 2000.0)
+        run_id = started(api)
+        rec = registry.get(run_id)
+        rec["stop"] = {"checks": 1, "requested": True}
+        registry.put(rec)
+        real_stop = api.stop
+
+        def stop_then_outage(rid: str) -> dict:
+            answer = real_stop(rid)
+            registry.down = True
+            return answer
+
+        api.stop = stop_then_outage
+        body = server.handle({
+            "jsonrpc": "2.0", "id": "tc", "method": "tasks/cancel",
+            "params": modern_params(taskId=run_id),
+        })["result"]
+        registry.down = False
+        polled = server.handle({
+            "jsonrpc": "2.0", "id": "g", "method": "tasks/get",
+            "params": modern_params(taskId=run_id),
+        })["result"]
+        stored = registry.get(run_id)["stop"]
+        self.assertNotIn("requested_at", stored)
+        self.assertEqual(body["lastUpdatedAt"], _iso(1000.0))
+        self.assertEqual(body["lastUpdatedAt"], polled["lastUpdatedAt"])
+        self.assertNotEqual(body["lastUpdatedAt"], _iso(2000.0))
 
 
 if __name__ == "__main__":

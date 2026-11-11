@@ -26,7 +26,9 @@ recorded on F60, CSL-762).
   nothing is launched (`registry_unavailable`). If the write after launch fails, the answer is
   `start_unconfirmed` and the record stays `starting`, but the API keeps the starter's cgroup in memory:
   `run.stop` aims the cleanup layer at it (even when the registry cannot be read at all, answering
-  `"recorded": false`), and a same-key retry records it once the registry answers.
+  `"recorded": false`), and a same-key retry records it once the registry answers. That retry stops the
+  registry's current row and lets adoption overlay the retained cgroup; the handle is dropped only
+  after that cgroup, or a stopped record that names one, is what got stored.
   A `run.stop` that arrives before the launch is recorded answers `pending` / `cgroup_unknown` and is
   kept as a stop intent; the start acts on it once the launch is recorded and returns that stop result
   under `stop`. A same-key retry never upgrades an unconfirmed or failed start to `started`: a starter
@@ -60,6 +62,27 @@ recorded on F60, CSL-762).
   in-memory registry for tests. `find_start` is an indexed lookup. If more than one record carries the
   same `(tenant, client_key)`, the first one stored is the one returned; changing that record's key
   leaves the next one indexed.
+  Every stored record has a `generation`. `put` of an existing run is a compare-and-swap on
+  `(generation, state)`: it stores only when `generation` is the one `get` returned and the write does
+  not leave `stopped`, then increments the generation. A stale writer raises and does not overwrite a
+  stop. `stopped` is terminal. It is stored only with an attestation (`proof: empty`, the cgroup path,
+  that cgroup's marker, the member ids, and that generation) and only when none of those members is
+  still alive; the member rows are then dropped. A loaded `stopped` row must name a cgroup, and its
+  member rows are dropped once the proof has been checked. A later update that changes the cgroup
+  identity is refused, and a later `join_member` on a stopped run is refused. A cleanup request stores
+  the cgroup path and marker it was sent to; a different identity is requested again. A restored
+  registry continues the `cg-N` sequence past every marker the snapshot already holds. A marker string
+  that has been stored is not kept for a new path, and a same-path update keeps the marker already
+  stored; a marker that has never been stored is still accepted, so an adopted launch proof matches.
+  A marker is recorded only when the put is stored: a refused proof or a dry run does not retire it.
+  A `cg-` suffix that is not ASCII digits, or that is longer than 18 digits, does not move the counter.
+  An empty result is confirmed again when the identity changed. `reap_orphans`
+  samples each member once, drops the members that sample says are gone, does not by itself record
+  `stopped`, and does not clear the proof of a run that is already stopped.
+  Locks live on the registry (`OwnerLockTable`). Each in-flight call holds them under a token it minted,
+  not under a thread id. One `acquire` sorts its keys, and a start key sorts before a run key, so a start
+  and a stop cannot deadlock by taking those locks in opposite orders. A key is deleted once nobody holds
+  it.
   The durable registry (B8, B9) and the real cgroup/pidfd cleanup (B6) are other build items.
 - `cli.py`: `recursion-control list | status RUN | stop RUN | start --tenant --engine --prompt`. It
   makes one API call, prints the API's answer verbatim as JSON and exits 0 (ok, started, stopped),

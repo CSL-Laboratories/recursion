@@ -159,6 +159,18 @@ survive the daemon, runs live outside its unit), section 3.4 S6 (line 888) and s
   left its unit's cgroup passes this check (see Limits). Finer scopes do not exist yet.
 - **CLI.** `python -m recursion_core.control list|status|stop|start|conditions` talks to that
   socket. Daemon down: `{"code": "control_api_unavailable", "delivered": false}`, exit 1.
+- **`run.list` fits the frame (ADV1-5).** Spec: PRODUCT.md d84cdd26 (CSLR-D-012), section 3.6.
+  Control records are never pruned, and at about 975 bytes per listed run a full list passed the
+  1 MiB frame near 1075 runs (`daemon:response_too_large`). `DaemonControl` now observes the runs of
+  the page the API answered (all runs, or `limit` / `after`) one at a time and stops before the reply
+  would pass `LIST_REPLY_BYTES` (the frame less 4096 bytes of envelope) less the size of the
+  request's echoed `id`. A cut page answers `ok` with `next_after` naming the last run sent. A list
+  that fits is returned unchanged. A single run too large for a frame on its own is still sent, and
+  the transport answers `response_too_large` as before; it is never skipped. The CLI's `list` and
+  `conditions` and the TUI follow `next_after` to the last page (`tui.protocol.list_all_runs`); the
+  GUI has no run list. Nothing is pruned or deleted, and the frame limit is unchanged. The other
+  readers of every run (`reconcile`, the breaker-store check at start) read the registry in process
+  and never go through a frame. Params, codes and the follow rules: `control/README.md`.
 - **Durable run records.** `DurableRunRegistry` keeps the control API's records
   (compare-and-swap, attested Stop, start keys) in `runs.sqlite3`, table `control_runs`,
   written with the registry's own fsync, rename and directory-fsync steps.

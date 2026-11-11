@@ -7,6 +7,9 @@ demand: the TUI answers it from what it already knows and sends nothing; the one
 state, so it reads ``run.list`` first. There is no approve, deny, order or mid-run verb: the control
 API has none, and the TUI never gets a command the CLI lacks.
 
+``list_all_runs`` is how both surfaces read the run list: it follows ``run.list``'s ``next_after`` until
+the last page (ADV1-5), so the CLI's ``list`` / ``conditions`` and the TUI's list see every run.
+
 ``conditions`` turns an API answer into text labels, so refusal, uncertainty, stale and unreconciled
 states are readable without colour (the operator plugin's O7 ``o7.operator.v0`` presentation rules).
 """
@@ -15,7 +18,7 @@ from __future__ import annotations
 
 import argparse
 import shlex
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 from recursion_core.tui.sanitize import field
 
@@ -33,6 +36,9 @@ SURFACE = "cli"
 REFUSED, UNCERTAIN, STALE, UNRECONCILED, UNAVAILABLE_LABEL = (
     "REFUSED", "UNCERTAIN", "STALE", "UNRECONCILED", "UNAVAILABLE")
 LABELS = (UNAVAILABLE_LABEL, UNRECONCILED, STALE, REFUSED, UNCERTAIN)
+# list_all_runs: the most pages one walk follows, and the code it answers when a walk cannot finish.
+LIST_FOLLOW_MAX_PAGES = 100_000
+LIST_INCOMPLETE = "list_incomplete"
 
 
 class CommandError(ValueError):
@@ -138,3 +144,55 @@ def answer_conditions(answer: Mapping) -> list[tuple[str, str]]:
     """Conditions one API answer exposes, as (label, plain text). Nothing the answer says is dropped."""
 
     return [(label, text) for label, _, text in keyed_conditions(answer)]
+
+
+def list_all_runs(call: Callable[[str, dict], dict], params: Mapping | None = None) -> dict:
+    """Read every run: ``run.list``, then ``run.list {"after": next_after}`` until a page has no ``next_after``.
+
+    ``call`` is any ``call(method, params) -> dict`` (the in-process API, ``SocketAPI``). An answer with no
+    ``next_after`` is returned as it came, so a list that fits one page reads exactly as before. Otherwise
+    the pages are joined into one ``ok`` answer (the first page's other fields, ``stale`` if any page was
+    stale). A later page that is not ``ok`` is returned as it came: what was read before it is not shown
+    as the list. A cursor that is not the page's last run or does not move forward, a run listed twice,
+    or more than ``LIST_FOLLOW_MAX_PAGES`` pages answers ``list_incomplete`` with a ``detail``, never a
+    short list. Runs started during a walk whose id sorts before the cursor show on the next walk.
+    """
+
+    base = dict(params or {})
+    answer = call("run.list", dict(base))
+    if not isinstance(answer, dict) or answer.get("code") != "ok" or "next_after" not in answer:
+        return answer
+    joined = {k: v for k, v in answer.items() if k != "next_after"}
+    runs: list = []
+    seen: set = set()
+    cursor, pages = None, 1
+    while True:
+        page = answer.get("runs")
+        if not isinstance(page, list):
+            return {"code": LIST_INCOMPLETE, "detail": "runs_not_a_list", "pages": pages}
+        for run in page:
+            run_id = run.get("run_id") if isinstance(run, dict) else None
+            if not isinstance(run_id, str):
+                return {"code": LIST_INCOMPLETE, "detail": "run_without_id", "pages": pages}
+            if run_id in seen:
+                return {"code": LIST_INCOMPLETE, "detail": f"run_listed_twice:{run_id}", "pages": pages}
+            seen.add(run_id)
+            runs.append(run)
+        if answer.get("stale") is True:
+            joined["stale"] = True
+        if "next_after" not in answer:
+            joined["runs"] = runs
+            return joined
+        nxt = answer["next_after"]
+        if (not page or not isinstance(nxt, str) or nxt != page[-1].get("run_id")
+                or (cursor is not None and not nxt > cursor)):
+            return {"code": LIST_INCOMPLETE, "detail": f"cursor_not_advancing:{nxt}", "pages": pages}
+        if pages >= LIST_FOLLOW_MAX_PAGES:
+            return {"code": LIST_INCOMPLETE, "detail": "too_many_pages", "pages": pages}
+        cursor = nxt
+        answer = call("run.list", {**base, "after": cursor})
+        pages += 1
+        if not isinstance(answer, dict):
+            return {"code": LIST_INCOMPLETE, "detail": "answer_not_object", "pages": pages}
+        if answer.get("code") != "ok":
+            return answer

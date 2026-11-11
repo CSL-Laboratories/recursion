@@ -4,7 +4,7 @@
 copy of engine output and one ordered event log (``events.EventLog``). It owns no session, run,
 approval or plugin state. Opening reads ``run.list``; attaching reads ``run.status``; closing sends
 nothing. Every request goes through the injected ``api.call(method, params)``, the same surface the
-CLI uses.
+CLI uses; ``run.list`` follows ``next_after`` to the last page as the CLI does (``protocol.list_all_runs``).
 
 Every request, answer, condition edge, engine output chunk, notice and error is appended to the log
 before anything shows it. The full-screen frame, the inline painter and the linear (screen-reader)
@@ -633,7 +633,8 @@ def call_api(api, method: str, params: dict) -> dict:
     """One control API call. A transport failure becomes a typed answer, not a crash."""
 
     try:
-        answer = api.call(method, dict(params))
+        # run.list follows next_after to the last page, as the CLI's list does (ADV1-5).
+        answer = p.list_all_runs(api.call, params) if method == "run.list" else api.call(method, dict(params))
     except Exception as err:  # the API client's own failure is shown as unavailable, never as success
         return {"code": p.UNAVAILABLE, "detail": type(err).__name__}
     if not isinstance(answer, dict):

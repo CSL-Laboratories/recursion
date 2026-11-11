@@ -1,8 +1,7 @@
 """ADV1 red team of the composed daemon's surfaces: control socket, CLI and GUI door (CSL-738 candidate).
 
-Each test is one attack, written against 0beb782f. The defects fixed since (ADV1-3, -4, -12,
--13) now pass and say "(fixed)". A test still marked ``expectedFailure`` names a finding
-that waits for an owner decision (ADV1-5); the others pass and record that the hardening held.
+Each test is one attack, written against 0beb782f. The defects fixed since (ADV1-3, -4, -5, -12,
+-13) now pass and say "(fixed)"; the others pass and record that the hardening held.
 """
 import contextlib
 import http.client
@@ -22,14 +21,18 @@ import unittest
 from unittest import mock
 
 from recursion_core.control import cli
+from recursion_core.control.api import LIST_LIMIT_MAX
+from recursion_core.control.tests.fakes import make_api, started
 from recursion_core.control.client import SocketAPI
 from recursion_core.control_transport import InsecureSocketPath
+from recursion_core.control_transport.framing import encode_frame
 from recursion_core.control_transport.unix import MAX_CONNECTIONS
 from recursion_core.daemon import AlreadyRunning, Daemon, Registry, UserLock
 from recursion_core.daemon import control_adapter as adapter
 from recursion_core.daemon import launcher
 from recursion_core.daemon.gui import LoopbackGUI
 from recursion_core.daemon.tests.adv1_support import BOOT, ComposedBase, wait_for
+from recursion_core.tui import protocol
 
 LINUX = sys.platform.startswith('linux')
 CORE = str(Path(launcher.__file__).parents[2])
@@ -302,14 +305,12 @@ class SocketAttackTest(ComposedBase):
         self.assertEqual(receipt['code'], 'stopped', receipt)
         self.assertEqual((again['code'], again.get('repeat')), ('stopped', True), again)
 
-    @unittest.expectedFailure  # ADV1-5: owner decision pending (pagination or pruning changes the API shape)
-    def test_run_list_still_answers_after_a_thousand_runs(self):
-        """ADV1-5 (owner decision pending: paginating or pruning run.list changes the control API's shape):
-        control records are never pruned; run.list outgrows the 1 MiB frame at ~1075 runs."""
+    def seed_settled_runs(self, count):
+        """``count`` settled runs with systemd's real cgroup paths, as ADV1-5 measured them (~975 bytes each)."""
         store = Registry(self.state)
-        count = 1300  # ~975 bytes per listed run with systemd's real cgroup paths: 1 MiB / 975 ~= 1075
         long_group = ('/user.slice/user-1000.slice/user@1000.service/app.slice/'
                       'recursion-run-run-%s.service')
+        ids = []
         for i in range(count):
             run_id = 'run-%032x' % i
             store.add(run_id, BOOT)
@@ -323,11 +324,97 @@ class SocketAttackTest(ComposedBase):
                 'generation': 4, 'members': [], 'cgroup_marker': marker,
                 'stop_attestation': {'proof': 'empty', 'cgroup': group, 'cgroup_marker': marker,
                                      'member_ids': [], 'generation': 3}}, sort_keys=True))
+            ids.append(run_id)
         store.close()
+        return ids
+
+    @staticmethod
+    def unpaged_list(composed):
+        """run.list as the daemon answered it before paging: every record, each with its ``observed`` block."""
+        answer = composed.control.api.call('run.list', {})
+        for run in answer['runs']:
+            composed.control._observe(run, full=False)
+        return answer
+
+    def test_run_list_still_answers_after_a_thousand_runs(self):
+        """ADV1-5 (fixed): past ~1075 runs the full list outgrew the 1 MiB frame and the socket answered
+        ``daemon:response_too_large``. run.list now answers ``ok`` with the first page and ``next_after``;
+        following it reads every run exactly once, in order, with each entry as before. Nothing is pruned."""
+        count = 1300  # ~975 bytes per listed run with systemd's real cgroup paths: 1 MiB / 975 ~= 1075
+        ids = self.seed_settled_runs(count)
         _, composed = self.boot()
-        listed = self.api(composed).call('run.list')
+        api = self.api(composed)
+        expected = self.unpaged_list(composed)['runs']
+        self.assertEqual([run['run_id'] for run in expected], ids)
+
+        listed = api.call('run.list')
         self.assertEqual(listed['code'], 'ok', {k: listed.get(k) for k in ('code', 'detail', 'delivered')})
-        self.assertEqual(len(listed['runs']), count)
+        self.assertLess(len(listed['runs']), count)
+        self.assertEqual(listed['next_after'], listed['runs'][-1]['run_id'])
+        walked, pages, answer = list(listed['runs']), 1, listed
+        while 'next_after' in answer:
+            answer = api.call('run.list', {'after': answer['next_after']})
+            self.assertEqual(answer['code'], 'ok', answer.get('detail'))
+            self.assertTrue(answer['runs'])
+            walked.extend(answer['runs'])
+            pages += 1
+            self.assertLess(pages, 10)
+        self.assertEqual(walked, expected)  # every run once, same order, every field as the unpaged entry
+        self.assertEqual(len({run['run_id'] for run in walked}), count)
+
+        limited = api.call('run.list', {'limit': 100})
+        self.assertEqual((limited['code'], len(limited['runs']), limited['next_after']),
+                         ('ok', 100, ids[99]))
+        self.assertEqual(limited['runs'], expected[:100])
+        last = api.call('run.list', {'after': ids[-2], 'limit': 5})
+        self.assertEqual(last, {'code': 'ok', 'runs': expected[-1:]})  # the last page has no next_after
+
+        out, err = io.StringIO(), io.StringIO()
+        self.assertEqual(cli.main(['list'], api, out, err), cli.EXIT_OK, out.getvalue()[:300])
+        printed = json.loads(out.getvalue())
+        self.assertEqual([run['run_id'] for run in printed['runs']], ids)
+        self.assertNotIn('next_after', printed)
+        out = io.StringIO()
+        self.assertEqual(cli.main(['conditions'], api, out, io.StringIO()), cli.EXIT_OK, out.getvalue()[:300])
+        self.assertEqual(json.loads(out.getvalue()), {'code': 'ok', 'conditions': []})
+
+    def test_run_list_without_parameters_below_the_frame_is_byte_for_byte_unchanged(self):
+        """ADV1-5: the paging is additive. A list that fits one frame is the same reply frame as before."""
+        self.seed_settled_runs(3)
+        _, composed = self.boot()
+        request = frame({'op': 'control', 'method': 'run.list', 'params': {}})
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(10)
+            sock.connect(composed.server.path)
+            sock.sendall(request)
+            data = b''
+            while len(data) < 4 or len(data) < 4 + struct.unpack('>I', data[:4])[0]:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+        before = encode_frame({'ok': True, 'result': self.unpaged_list(composed)})
+        self.assertEqual(data, before)
+        self.assertEqual(sorted(json.loads(data[4:])['result']), ['code', 'runs'])
+
+    def test_run_list_refuses_a_stale_or_unknown_cursor_and_a_limit_out_of_bounds(self):
+        """ADV1-5: a cursor that names no run is ``request_invalid``, never an empty page; ``limit`` is 1..cap."""
+        ids = self.seed_settled_runs(4)
+        _, composed = self.boot()
+        api = self.api(composed)
+        for after, detail in (('run-not-listed', 'after_unknown'), ('run-%032x' % 99, 'after_unknown'),
+                              ('', 'after'), (5, 'after'), (['run-1'], 'after')):
+            with self.subTest(after=after):
+                self.assertEqual(api.call('run.list', {'after': after}), {'code': 'request_invalid', 'detail': detail})
+        for limit in (0, -1, LIST_LIMIT_MAX + 1, True, '5', 1.5):
+            with self.subTest(limit=limit):
+                self.assertEqual(api.call('run.list', {'limit': limit}), {'code': 'request_invalid', 'detail': 'limit'})
+        self.assertEqual([r['run_id'] for r in api.call('run.list', {'limit': LIST_LIMIT_MAX})['runs']], ids)
+        one = api.call('run.list', {'limit': 1})
+        self.assertEqual(([r['run_id'] for r in one['runs']], one['next_after']), ([ids[0]], ids[0]))
+        self.assertNotIn('next_after', api.call('run.list', {'limit': 4}))
+        self.assertEqual(api.call('run.list', {'after': ids[-1]}), {'code': 'ok', 'runs': []})  # past the end
+        self.assertEqual(len(api.call('run.list', {'after': ids[0]})['runs']), 3)
 
 
 @unittest.skipUnless(LINUX, 'the daemon is Linux only')
@@ -454,6 +541,53 @@ class CliTruthTest(unittest.TestCase):
                                  ({'code': 'STOPPED'}, 1), ({}, 1)):
             out = io.StringIO()
             self.assertEqual(cli.main(['stop', 'r'], API(answer), out=out), expected, answer)
+
+
+class ListBudgetTest(unittest.TestCase):
+    """ADV1-5: DaemonControl cuts run.list to the bytes one reply frame can carry, and says where it cut."""
+
+    def control(self, count, budget):
+        api = make_api()[0]
+        for _ in range(count):
+            started(api)
+        daemon = mock.Mock()
+        daemon.registry.get.side_effect = KeyError
+        starter = mock.Mock(results={}, failures={})
+        tmp = tempfile.mkdtemp(prefix='rc-adv15-')
+        self.addCleanup(__import__('shutil').rmtree, tmp, True)
+        return adapter.DaemonControl(api, api._registry, daemon, starter, tmp, list_reply_bytes=budget)
+
+    def test_a_list_that_fits_is_unchanged_and_one_that_does_not_is_paged_to_fit(self):
+        whole = self.control(12, adapter.LIST_REPLY_BYTES).call('run.list')
+        self.assertEqual(sorted(whole), ['code', 'runs'])
+        budget = adapter._wire_size({'code': 'ok', 'runs': whole['runs'][:3]})
+        control = self.control(12, budget)
+        first = control.call('run.list')
+        self.assertEqual((len(first['runs']), first['next_after']), (3, whole['runs'][2]['run_id']))
+        self.assertLessEqual(adapter._wire_size({k: v for k, v in first.items() if k != 'next_after'}), budget)
+        self.assertEqual(protocol.list_all_runs(control.call), whole)
+        # A limit the frame cannot carry is cut further; the cursor still names the last run sent.
+        limited = control.call('run.list', {'limit': 10})
+        self.assertEqual((len(limited['runs']), limited['next_after']), (3, whole['runs'][2]['run_id']))
+
+    def test_the_request_id_echoed_in_the_reply_is_counted(self):
+        whole = self.control(6, adapter.LIST_REPLY_BYTES).call('run.list')
+        budget = adapter._wire_size({'code': 'ok', 'runs': whole['runs'][:3]})
+        control = self.control(6, budget)
+        conn = mock.Mock()
+        conn.peer.pid = os.getpid()
+        with mock.patch.object(adapter, 'peer_is_engine', return_value=False):
+            plain = control.handle({'op': 'control', 'method': 'run.list', 'params': {}}, conn)['result']
+            big_id = control.handle({'op': 'control', 'method': 'run.list', 'params': {}, 'id': 'x' * 400}, conn)
+        self.assertEqual(len(plain['runs']), 3)
+        self.assertLess(len(big_id['result']['runs']), 3)
+
+    def test_a_run_too_large_for_a_frame_alone_is_still_sent_never_skipped(self):
+        control = self.control(3, 10)
+        first = control.call('run.list')
+        self.assertEqual(len(first['runs']), 1)
+        self.assertEqual(first['next_after'], first['runs'][0]['run_id'])
+        self.assertEqual(len(protocol.list_all_runs(control.call)['runs']), 3)
 
 
 @unittest.skipUnless(LINUX, 'the daemon is Linux only')

@@ -21,11 +21,15 @@ from __future__ import annotations
 
 import json
 
-from recursion_core.control.api import SUCCESS_CODES, ControlAPI
+from recursion_core.control.api import LIST_LIMIT_MAX, SUCCESS_CODES, ControlAPI
 
 _RUN_ID = {"type": "object", "properties": {"run_id": {"type": "string", "minLength": 1}},
            "required": ["run_id"], "additionalProperties": False}
-_EMPTY = {"type": "object", "properties": {}, "additionalProperties": False}
+# run.list paging (ADV1-5): both optional; with neither, every run is listed.
+_LIST = {"type": "object",
+         "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": LIST_LIMIT_MAX},
+                        "after": {"type": "string", "minLength": 1}},
+         "additionalProperties": False}
 _START = {
     "type": "object",
     "properties": {"tenant": {"type": "string"}, "engine": {"type": "string"}, "prompt": {"type": "string"},
@@ -42,7 +46,9 @@ STOP_TOOL = "recursion_run_stop"
 
 TOOLS = (
     {"name": "recursion_run_list", "method": "run.list", "title": "List runs",
-     "description": "List runs and their states. Read only.", "inputSchema": _EMPTY, "annotations": READ},
+     "description": "List runs and their states, in run_id order. A page that is not the last carries "
+                    "next_after; pass it back as after for the next page. Read only.",
+     "inputSchema": _LIST, "annotations": READ},
     {"name": "recursion_run_status", "method": "run.status", "title": "Run status",
      "description": "Read one run's state. Read only.", "inputSchema": _RUN_ID, "annotations": READ},
     {"name": "recursion_run_start", "method": "run.start", "title": "Start a run",

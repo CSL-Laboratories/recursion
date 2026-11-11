@@ -1,8 +1,9 @@
 """Daemon-owned loopback socket for the shared GUI. No remote bind or auth bypass.
 
-The control transport and device door are injected by the control-API adapter.
-Until that adapter is attached, authentication refuses every request; the fallback
-transport reports unavailable, never an invented empty route inventory.
+The control transport and device door are injected by the control-API adapter
+(``control_adapter.compose_control`` in the running daemon). Constructed without
+them, authentication refuses every request and the fallback transport reports
+unavailable, never an invented empty route inventory.
 """
 from collections.abc import Mapping
 from threading import Thread

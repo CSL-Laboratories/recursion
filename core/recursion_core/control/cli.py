@@ -85,4 +85,10 @@ def run(argv: list[str], api_factory: Callable[[], object] | None) -> int:
     if api_factory is None:
         print(json.dumps({"code": "control_api_unavailable"}), file=sys.stdout)
         return EXIT_ERROR
-    return main(argv, api_factory())
+    try:
+        api = api_factory()
+    except Exception as err:  # noqa: BLE001 - a client that cannot be built is the API being unavailable
+        print(json.dumps({"code": "control_api_unavailable", "detail": f"factory:{type(err).__name__}"}),
+              file=sys.stdout)
+        return EXIT_ERROR
+    return main(argv, api)

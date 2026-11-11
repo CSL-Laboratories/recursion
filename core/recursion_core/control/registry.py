@@ -178,8 +178,16 @@ class InMemoryRunRegistry:
         self.commit_gate: Callable[[dict], None] | None = None
         self._runs: dict[str, dict] = {}
         self._starts: dict[tuple[str, str], list[str]] = {}  # (tenant, client_key) -> run ids, first seen first
-        for raw in records or []:
-            rec = copy.deepcopy(raw)
+        loaded = [copy.deepcopy(raw) for raw in records or []]
+        for rec in loaded:  # continue past every marker the snapshot already holds, before any new one is issued
+            self._note_marker(rec.get("cgroup_marker"))
+            attestation = rec.get("stop_attestation")
+            if isinstance(attestation, dict):
+                self._note_marker(attestation.get("cgroup_marker"))
+            stop = rec.get("stop")
+            if isinstance(stop, dict):
+                self._note_marker(stop.get("cgroup_marker"))
+        for rec in loaded:
             self._load_record(rec)
             self._store(rec)
 
@@ -200,6 +208,7 @@ class InMemoryRunRegistry:
         path = rec.get("cgroup")
         if isinstance(path, str) and path and not rec.get("cgroup_marker"):
             rec["cgroup_marker"] = attested_marker or self._new_marker()
+        self._note_marker(rec.get("cgroup_marker"))
         if rec.get("state") != "stopped":
             return
         run_id = str(rec.get("run_id") or "")
@@ -388,6 +397,12 @@ class InMemoryRunRegistry:
         self._marker += 1
         return f"cg-{self._marker}"
 
+    def _note_marker(self, marker: object) -> None:
+        """Remember a ``cg-N`` so a later mint cannot repeat it, including across a restore."""
+        value = _marker_seq(marker)
+        if value > self._marker:
+            self._marker = value
+
     def _bind_cgroup(self, current: dict | None, stored: dict) -> None:
         """Give ``stored`` a cgroup marker. A new path does not keep the previous path's marker."""
         path = stored.get("cgroup")
@@ -399,11 +414,11 @@ class InMemoryRunRegistry:
         supplied = stored.get("cgroup_marker")
         if path == previous_path and previous_marker:
             stored["cgroup_marker"] = supplied or previous_marker
-            return
-        if isinstance(supplied, str) and supplied and supplied != previous_marker:
+        elif isinstance(supplied, str) and supplied and supplied != previous_marker:
             stored["cgroup_marker"] = supplied
-            return
-        stored["cgroup_marker"] = self._new_marker()
+        else:
+            stored["cgroup_marker"] = self._new_marker()
+        self._note_marker(stored.get("cgroup_marker"))
 
     def _apply(self, current: dict | None, expected: int, record: dict) -> dict:
         stored = copy.deepcopy(record)
@@ -494,6 +509,16 @@ class InMemoryRunRegistry:
                 if rec is not None:
                     return copy.deepcopy(rec)
             return None
+
+
+def _marker_seq(marker: object) -> int:
+    """The integer in a ``cg-N`` marker, or 0 when ``marker`` is not one."""
+    if not isinstance(marker, str) or not marker.startswith("cg-"):
+        return 0
+    suffix = marker[3:]
+    if not suffix.isdigit():
+        return 0
+    return int(suffix)
 
 
 def _member(member: dict) -> dict:

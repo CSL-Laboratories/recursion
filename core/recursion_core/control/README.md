@@ -26,7 +26,9 @@ recorded on F60, CSL-762).
   nothing is launched (`registry_unavailable`). If the write after launch fails, the answer is
   `start_unconfirmed` and the record stays `starting`, but the API keeps the starter's cgroup in memory:
   `run.stop` aims the cleanup layer at it (even when the registry cannot be read at all, answering
-  `"recorded": false`), and a same-key retry records it once the registry answers.
+  `"recorded": false`), and a same-key retry records it once the registry answers. That retry stops the
+  registry's current row and lets adoption overlay the retained cgroup; the handle is dropped only
+  after that cgroup, or a stopped record that names one, is what got stored.
   A `run.stop` that arrives before the launch is recorded answers `pending` / `cgroup_unknown` and is
   kept as a stop intent; the start acts on it once the launch is recorded and returns that stop result
   under `stop`. A same-key retry never upgrades an unconfirmed or failed start to `started`: a starter
@@ -68,7 +70,9 @@ recorded on F60, CSL-762).
   still alive; the member rows are then dropped. A loaded `stopped` row must name a cgroup, and its
   member rows are dropped once the proof has been checked. A later update that changes the cgroup
   identity is refused, and a later `join_member` on a stopped run is refused. A cleanup request stores
-  the cgroup path and marker it was sent to; a different identity is requested again. `reap_orphans`
+  the cgroup path and marker it was sent to; a different identity is requested again. A restored
+  registry continues the `cg-N` sequence past every marker the snapshot already holds, so a marker is
+  not issued again and an empty result is confirmed again when the identity changed. `reap_orphans`
   samples each member once, drops the members that sample says are gone, does not by itself record
   `stopped`, and does not clear the proof of a run that is already stopped.
   Locks live on the registry (`OwnerLockTable`). Each in-flight call holds them under a token it minted,

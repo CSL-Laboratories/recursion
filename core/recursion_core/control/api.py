@@ -262,16 +262,18 @@ class ControlAPI:
         launched = self._launched.get(run_id)
         if launched is None:  # starter handle had no cgroup, or a restart lost it: nothing confirms the launch
             return {"code": START_UNCONFIRMED, "run": prior, "duplicate": True, "detail": "launch_unconfirmed"}
-        # Launched here, but the write after launch failed. The kept record carries any Stop decided since
-        # (its write-back failed too): carry it out or record it, never record a bare "running" over it.
-        prior = dict(launched)
-        if prior.get("stop") is not None:
-            stop = self._stop(prior)  # a kept "stopped" is written back; anything else is continued
+        # Launched here, but the write after launch failed. The registry row may have moved since (a
+        # metadata write can land while running and stopped writes fail). Stop that row: adoption overlays
+        # the retained cgroup and the proof is built for its generation. The cached payload is not written
+        # over the fresh row, and a bare "running" is never recorded over a Stop.
+        if prior.get("stop") is not None or launched.get("stop") is not None or run_id in self._stop_wanted:
+            stop = self._stop(prior)
             code = START_UNCONFIRMED if stop.get("recorded") is False else STARTED
             return {"code": code, "run": prior, "duplicate": True, "stop": stop}
-        if not self._put_running(prior, prior.get("cgroup")):
+        kept = dict(launched)
+        if not self._put_running(kept, kept.get("cgroup")):
             return {"code": START_UNCONFIRMED, "run": prior, "duplicate": True, "detail": "registry_unavailable"}
-        return {"code": STARTED, "run": prior, "duplicate": True}
+        return {"code": STARTED, "run": kept, "duplicate": True}
 
     def _current(self, rec: dict) -> dict:
         """The registry's copy of ``rec``, or ``rec`` itself if the registry cannot answer."""
@@ -336,7 +338,7 @@ class ControlAPI:
         except _RegistryError:
             return False
         if outcome == "ok":
-            self._launched.pop(rec["run_id"], None)
+            self._forget_launch_if_persisted(rec)
             return True
         if outcome != "stale":
             return False
@@ -365,7 +367,7 @@ class ControlAPI:
         rec.update(fresh)
         if outcome != "ok":
             return False
-        self._launched.pop(rec["run_id"], None)
+        self._forget_launch_if_persisted(fresh)
         return True
 
     def _process_alive(self, pid: int | None) -> bool:
@@ -637,10 +639,36 @@ class ControlAPI:
         if outcome != "ok":
             res["recorded"] = False
             if rec["run_id"] in self._launched:  # keep the decision with the launch until a write lands
-                self._launched[rec["run_id"]] = dict(rec, stop=dict(rec["stop"]) if rec.get("stop") else None)
+                self._launched[rec["run_id"]] = self._launch_snapshot(rec)
         else:
-            self._launched.pop(rec["run_id"], None)  # the cgroup is in the registry now
+            # A pending row that lost the cgroup is not persistence. The retained handle stays until the
+            # cgroup, or a stopped proof that names one, is what got stored.
+            self._forget_launch_if_persisted(rec)
         return res
+
+    def _launch_persisted(self, rec: dict) -> bool:
+        """True when ``rec`` stores the launched cgroup, or a stopped proof that names one."""
+        if rec.get("cgroup"):
+            return True
+        attestation = rec.get("stop_attestation")
+        return (rec.get("state") == "stopped" and isinstance(attestation, dict)
+                and attestation.get("proof") == "empty" and bool(attestation.get("cgroup")))
+
+    def _forget_launch_if_persisted(self, rec: dict) -> None:
+        if self._launch_persisted(rec):
+            self._launched.pop(rec["run_id"], None)
+
+    def _launch_snapshot(self, rec: dict) -> dict:
+        """The handle to keep after a failed write. A cgroup-less copy does not replace a retained cgroup."""
+        retained = self._launched.get(rec["run_id"])
+        kept = dict(rec)
+        if isinstance(rec.get("stop"), dict):
+            kept["stop"] = dict(rec["stop"])
+        if not kept.get("cgroup") and isinstance(retained, dict) and retained.get("cgroup"):
+            kept["cgroup"] = retained["cgroup"]
+            if not kept.get("cgroup_marker"):
+                kept["cgroup_marker"] = retained.get("cgroup_marker")
+        return kept
 
 
 def _start_lock_key(slot: tuple[str, str]) -> str:

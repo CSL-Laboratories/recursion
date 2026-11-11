@@ -35,6 +35,7 @@ import errno
 import ipaddress
 import math
 import os
+import platform
 import selectors
 import signal
 import subprocess
@@ -499,7 +500,9 @@ def _probe_login(probe: Callable[[], bool], deadline: float, env: Mapping[str, s
     that group cannot be enforced, the route refuses ``probe unenforceable``. ``SIGCHLD`` ignored
     or ``SA_NOCLDWAIT`` is the same refusal, before ``fork``: the kernel would auto-reap the
     worker and a later ``killpg`` could name a reused process-group id. ``signal.getsignal``
-    does not show ``SA_NOCLDWAIT``; the flags come from ``sigaction``. Where another thread is
+    does not show ``SA_NOCLDWAIT``; the flags come from ``sigaction``. That read runs only on
+    Linux LP64 x86_64 or aarch64 with glibc or musl. Any other ABI refuses before ``libc`` is
+    called. Where another thread is
     alive, including a ``_thread`` or native thread, it refuses ``probe threaded`` and does not
     fork. A thread started
     after that check and before ``fork`` is still a race; refusing is what a non-picklable callable
@@ -566,17 +569,44 @@ def _reap_owned(pid: int) -> None:
 
 _SA_NOCLDWAIT = 2
 _SIG_IGN_HANDLER = 1
+# LP64 Linux (glibc and musl, x86_64 and aarch64): 8-byte handler, 128-byte mask, then flags.
+# The buffer is larger than that struct so a short read cannot overflow it.
+_SIGACTION_BYTES = 256
+_SA_FLAGS_OFFSET = 8 + 128
+_SIGACTION_MACHINES = frozenset({"x86_64", "aarch64"})
 
 
-class _Sigaction(ctypes.Structure):
-    """Linux glibc ``struct sigaction``: handler, 1024-bit mask, flags, restorer."""
+def _sigaction_abi_supported() -> bool:
+    """True only for the ``sigaction`` layout this read was checked against.
 
-    _fields_ = [
-        ("sa_handler", ctypes.c_void_p),
-        ("sa_mask", ctypes.c_ulong * 16),
-        ("sa_flags", ctypes.c_int),
-        ("sa_restorer", ctypes.c_void_p),
-    ]
+    Anything else refuses before ``libc`` is called. A 32-bit ``c_ulong`` mask, or a
+    machine that puts the flags somewhere else, would otherwise miss ``SA_NOCLDWAIT``.
+    """
+
+    if sys.platform != "linux" or ctypes.sizeof(ctypes.c_void_p) != 8:
+        return False
+    if platform.machine() not in _SIGACTION_MACHINES:
+        return False
+    return _libc_family() in {"glibc", "musl"}
+
+
+def _libc_family() -> str | None:
+    """``glibc`` or ``musl`` when this process can be told apart from any other C library."""
+
+    try:
+        version = os.confstr("CS_GNU_LIBC_VERSION")
+    except (ValueError, OSError):
+        version = None
+    if isinstance(version, str) and version.startswith("glibc"):
+        return "glibc"
+    try:
+        with open("/proc/self/maps", "rb") as handle:
+            blob = handle.read(4 * 1024 * 1024)
+    except OSError:
+        return None
+    if b"ld-musl-" in blob or b"libc.musl" in blob:
+        return "musl"
+    return None
 
 
 def _sigchld_auto_reaps() -> bool:
@@ -584,22 +614,25 @@ def _sigchld_auto_reaps() -> bool:
 
     ``signal.getsignal`` returns ``SIG_DFL`` when ``SA_NOCLDWAIT`` is set through
     ``sigaction``. ``SIG_IGN`` and that flag both drop the zombie, so the process-group
-    id can be reused. A failed read refuses: the probe cannot prove it owns the reap.
+    id can be reused. An ABI this read was not written for, or a failed read, refuses:
+    the probe cannot prove it owns the reap. ``libc`` is not called in that case.
     """
 
+    if not _sigaction_abi_supported():
+        return True
     try:
         libc = ctypes.CDLL(None, use_errno=True)
-        libc.sigaction.argtypes = (
-            ctypes.c_int, ctypes.POINTER(_Sigaction), ctypes.POINTER(_Sigaction),
-        )
+        libc.sigaction.argtypes = (ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
         libc.sigaction.restype = ctypes.c_int
-        old = _Sigaction()
-        if libc.sigaction(signal.SIGCHLD, None, ctypes.byref(old)) != 0:
+        old = ctypes.create_string_buffer(_SIGACTION_BYTES)
+        if libc.sigaction(signal.SIGCHLD, None, old) != 0:
             return True
     except (AttributeError, OSError):
         return True
-    handler = int(old.sa_handler or 0)
-    return handler == _SIG_IGN_HANDLER or bool(int(old.sa_flags) & _SA_NOCLDWAIT)
+    raw = old.raw
+    handler = int.from_bytes(raw[:8], sys.byteorder)
+    flags = int.from_bytes(raw[_SA_FLAGS_OFFSET:_SA_FLAGS_OFFSET + 4], sys.byteorder)
+    return handler == _SIG_IGN_HANDLER or bool(flags & _SA_NOCLDWAIT)
 
 
 def _probe_login_group(

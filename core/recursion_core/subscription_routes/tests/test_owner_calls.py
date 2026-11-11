@@ -109,6 +109,36 @@ class _Calls(_Base):
 
 
 @unittest.skipIf(os.name == "nt", "POSIX links and home checks")
+class SurrogateHomeTests(_Calls):
+    def test_a_surrogate_home_is_refused_before_the_filesystem(self) -> None:
+        homes = ["/tmp/review-home-\ud800"]
+        root = os.fsencode(self.root)
+        raw = os.path.join(root, b"\xff")
+        os.mkdir(raw, 0o700)
+        existing = os.fsdecode(raw)
+        self.assertIn("\udcff", existing)
+        homes.append(existing)
+        for home in homes:
+            env = {"PATH": "/usr/bin:/bin", "HOME": home, "OPENAI_API_KEY": "fake"}
+            profile = {"provider": "openai", "auth": "api_key", "credential_env": "OPENAI_API_KEY"}
+            self.refused(
+                "home_unsafe", check_route, "opencode", profile, env, route_home=home,
+                parent_env=self.parent(), operator_home=str(self.operator),
+            )
+            bare = {"PATH": "/usr/bin:/bin", "HOME": home}
+            self.refused(
+                "home_unsafe", check_cursor_route, bare, route_home=home, wrapper=self.wrapper,
+                parent_env=self.parent(), operator_home=str(self.operator),
+            )
+            self.refused(
+                "home_unsafe", check_antigravity_route, bare, version="1.2.3",
+                binary_path=str(self.agy / "agy"), launcher_path=str(self.agy / "agy-launch"),
+                pin=self.agy_pin, route_home=home, parent_env=self.parent(),
+                operator_home=str(self.operator),
+            )
+
+
+@unittest.skipIf(os.name == "nt", "POSIX links and home checks")
 class PackageLinkTests(_Calls):
     """Call 1: a link is followed and what it resolves to is hashed; a link out of the root refuses."""
 

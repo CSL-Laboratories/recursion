@@ -23,7 +23,7 @@ import recursion_core.subscription_routes.own_loop as own_loop
 from recursion_core.subscription_routes import (
     COPILOT_STRIP_ENV, OwnLoopRouteRefused, check_copilot_own_loop, check_nous_own_loop, nous_proxy_doctor,
 )
-from recursion_core.child_env import EnvRefused
+from recursion_core.child_env import EnvRefused, build_child_env
 from recursion_core.subscription_routes.validated_launch import _blocked_secret
 
 FAKE = "fake-not-a-real-token"
@@ -50,6 +50,27 @@ def copilot(**extra: object) -> dict:
 def nous(**extra: object) -> dict:
     return {"engine": "nous", "auth": "subscription", "method": "hermes_local_proxy",
             "base_url": "http://127.0.0.1:8645/v1", **extra}
+
+
+class SigactionAbiTests(unittest.TestCase):
+    def test_an_unverified_sigaction_abi_refuses_without_calling_libc(self) -> None:
+        def cdll(*_args: object, **_kwargs: object) -> None:
+            raise AssertionError("libc")
+
+        real_sizeof = ctypes.sizeof
+
+        def sizeof(obj: object) -> int:
+            if obj is ctypes.c_void_p:
+                return 4
+            return real_sizeof(obj)  # type: ignore[arg-type]
+
+        with mock.patch.object(own_loop.ctypes, "CDLL", side_effect=cdll):
+            with mock.patch.object(own_loop.sys, "platform", "unknown"):
+                self.assertTrue(own_loop._sigchld_auto_reaps())
+            with mock.patch.object(own_loop.platform, "machine", return_value="mips"):
+                self.assertTrue(own_loop._sigchld_auto_reaps())
+            with mock.patch.object(own_loop.ctypes, "sizeof", side_effect=sizeof):
+                self.assertTrue(own_loop._sigchld_auto_reaps())
 
 
 class CopilotTests(unittest.TestCase):
@@ -581,36 +602,80 @@ class CopilotTests(unittest.TestCase):
         self.assertIs(signal.getsignal(signal.SIGCHLD), signal.SIG_DFL)
         children = _direct_children()
         self.addCleanup(_kill_new_children, children)
-        ran: list[str] = []
+        forks: list[int] = []
         killpg_calls: list[int] = []
+        real_fork = os.fork
+
+        def fork() -> int:
+            forks.append(1)
+            return real_fork()
 
         def killpg(pgid: int, sig: int) -> None:
             killpg_calls.append(sig)
 
-        with mock.patch.object(own_loop.os, "killpg", killpg):
+        with mock.patch.object(own_loop.os, "fork", fork), mock.patch.object(own_loop.os, "killpg", killpg):
             with self.assertRaises(OwnLoopRouteRefused) as caught:
                 check_copilot_own_loop(
-                    copilot(), BASE, home=_route_home(),
-                    has_copilot_login=lambda: ran.append("ran") or True, probe_deadline=1.0,
+                    copilot(), BASE, home=_route_home(), has_copilot_login=lambda: True, probe_deadline=1.0,
                 )
         self.assertEqual(caught.exception.cause, "copilot_login_unknown")
         self.assertEqual(caught.exception.detail, "probe unenforceable")
-        self.assertEqual(ran, [])
+        self.assertEqual(forks, [])
         self.assertEqual(killpg_calls, [])
         self.assertEqual(set(), _direct_children() - children)
 
-    def test_pidfd_waitid_einval_kills_the_descendant_and_refuses(self) -> None:
-        # EINVAL is not ECHILD. The leader is still unreaped, so the group must be
-        # signalled, and the probe refuses.
+    def test_pidfd_waitid_einval_before_ack_does_not_run_the_callable(self) -> None:
+        # Every P_PIDFD observation is EINVAL, including the one before the ack.
         real_waitid = os.waitid
 
         def waitid(idtype: int, ident: int, options: int):
             if idtype == os.P_PIDFD:
-                info = real_waitid(idtype, ident, options)
-                if info is not None:
-                    raise OSError(errno.EINVAL, "waitid")
-                return info
+                raise OSError(errno.EINVAL, "waitid")
             return real_waitid(idtype, ident, options)
+
+        children = _direct_children()
+        self.addCleanup(_kill_new_children, children)
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = os.path.join(tmp, "ran")
+
+            def probe() -> bool:
+                with open(marker, "w", encoding="ascii") as handle:
+                    handle.write("ran")
+                return True
+
+            with mock.patch.object(own_loop.os, "waitid", waitid):
+                with self.assertRaises(OwnLoopRouteRefused) as caught:
+                    check_copilot_own_loop(
+                        copilot(), BASE, home=_route_home(), has_copilot_login=probe, probe_deadline=1.0,
+                    )
+            self.assertEqual(caught.exception.detail, "probe unenforceable")
+            self.assertFalse(os.path.exists(marker))
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline and _direct_children() - children:
+            time.sleep(0.01)
+        self.assertEqual(set(), _direct_children() - children)
+
+    def test_pidfd_waitid_einval_during_cleanup_signals_the_group(self) -> None:
+        # The pre-ack observation is scripted as still running. Every later P_PIDFD
+        # observation is EINVAL, whether or not the leader has exited.
+        real_waitid = os.waitid
+        seen = {"n": 0}
+
+        def waitid(idtype: int, ident: int, options: int):
+            if idtype == os.P_PIDFD:
+                seen["n"] += 1
+                if seen["n"] == 1:
+                    return None
+                raise OSError(errno.EINVAL, "waitid")
+            return real_waitid(idtype, ident, options)
+
+        real_killpg = os.killpg
+        signals: list[int] = []
+
+        def killpg(pgid: int, sig: int):
+            if sig != 0:
+                signals.append(sig)
+            return real_killpg(pgid, sig)
 
         with tempfile.TemporaryDirectory() as tmp:
             info_path = os.path.join(tmp, "child")
@@ -625,12 +690,15 @@ class CopilotTests(unittest.TestCase):
                 return True
 
             self.addCleanup(lambda: _stop_recorded(info_path))
-            with mock.patch.object(own_loop.os, "waitid", waitid):
+            with mock.patch.object(own_loop.os, "waitid", waitid), \
+                    mock.patch.object(own_loop.os, "killpg", killpg):
                 with self.assertRaises(OwnLoopRouteRefused) as caught:
                     check_copilot_own_loop(
                         copilot(), BASE, home=_route_home(), has_copilot_login=probe, probe_deadline=1.0,
                     )
             self.assertEqual(caught.exception.detail, "probe unenforceable")
+            self.assertGreater(seen["n"], 1)
+            self.assertIn(signal.SIGKILL, signals)
             with open(info_path, encoding="ascii") as handle:
                 sleeper = int(handle.read().strip())
             self.assertTrue(_process_not_running(sleeper))
@@ -758,6 +826,28 @@ class CopilotTests(unittest.TestCase):
             check_copilot_own_loop(copilot(), BASE, home=home, has_copilot_login=lambda: True)
         self.assertEqual(caught.exception.name, "HOME")
         self.assertEqual(caught.exception.cause, "home_unsafe")
+        self.assertFalse(os.path.lexists(os.path.join(raw, b".copilot")))
+
+    def test_an_inherited_or_overridden_surrogate_copilot_home_is_refused(self) -> None:
+        root = tempfile.mkdtemp(prefix="csl-copilot-home-")
+        self.addCleanup(shutil.rmtree, root, True)
+        os.chmod(root, 0o700)
+        raw = os.path.join(os.fsencode(root), b"\xff")
+        os.mkdir(raw, 0o700)
+        copilot_home = os.fsdecode(raw)
+        self.assertIn("\udcff", copilot_home)
+        parent = {"PATH": "/usr/bin:/bin", "COPILOT_HOME": copilot_home}
+        with self.assertRaises(EnvRefused) as inherited:
+            build_child_env("copilot", home=_route_home(), auth_mode="subscription", parent=parent)
+        self.assertEqual(inherited.exception.name, "COPILOT_HOME")
+        self.assertEqual(inherited.exception.cause, "home_unsafe")
+        with self.assertRaises(EnvRefused) as overridden:
+            build_child_env(
+                "copilot", home=_route_home(), auth_mode="subscription",
+                parent={"PATH": "/usr/bin:/bin"}, overrides={"COPILOT_HOME": copilot_home},
+            )
+        self.assertEqual(overridden.exception.name, "COPILOT_HOME")
+        self.assertEqual(overridden.exception.cause, "home_unsafe")
         self.assertFalse(os.path.lexists(os.path.join(raw, b".copilot")))
 
     def test_check_without_a_route_home_refuses(self) -> None:

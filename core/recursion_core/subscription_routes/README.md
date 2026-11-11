@@ -44,7 +44,9 @@ What refuses:
   operator's home, and must hold no Claude Code store entry (`.claude`, `.claude.json`,
   `.config/claude`) and no Pi, Hermes or OpenCode state or login entry (`.pi`, `.hermes`,
   `.local/share/opencode`, `.config/opencode`, `.codex/auth.json`). So the route home must
-  hold none of these at spawn. Checked with `lstat` only; no credential file is opened.
+  hold none of these at spawn. A surrogate code point (U+D800–U+DFFF) in that home, the
+  child `HOME`, or an operator home refuses `home_unsafe` before `realpath` or `lstat`.
+  Otherwise checked with `lstat` only; no credential file is opened.
   One exception, for Hermes routes only: a `.hermes` directory that holds nothing but the
   `config.yaml` an earlier launch in this home wrote, or (API-key Hermes route) nothing at
   all (see Hermes route-home reuse).
@@ -153,10 +155,12 @@ PRODUCT.md `055cc7a5` section 3.3. `own_loop.py`, checked before any spawn or re
   otherwise the libc function. The parent blocks SIGINT and SIGCHLD from before `fork` until
   after the group is signalled and the direct child is reaped, then restores the previous mask
   with `SIG_SETMASK`. A signal the caller had already blocked stays blocked. SIGINT stays
-  blocked across `pidfd_open` and the store of that fd. Before `fork`, the probe reads the
-  real `SIGCHLD` disposition with `sigaction`. `SIG_IGN` or `SA_NOCLDWAIT` refuses
-  `probe unenforceable`: the kernel would auto-reap, `signal.getsignal` still reports
-  `SIG_DFL` for `SA_NOCLDWAIT`, and blocking the signal does not stop that auto-reap. A custom
+  blocked across `pidfd_open` and the store of that fd. Before `fork`, and only on Linux LP64
+  x86_64 or aarch64 with glibc or musl, the probe reads the real `SIGCHLD` disposition with
+  `sigaction` into a 256-byte buffer. Any other platform, word size, machine or C library
+  refuses `probe unenforceable` without calling `libc`. `SIG_IGN` or `SA_NOCLDWAIT` refuses
+  the same way: the kernel would auto-reap, `signal.getsignal` still reports `SIG_DFL` for
+  `SA_NOCLDWAIT`, and blocking the signal does not stop that auto-reap. A custom
   SIGCHLD handler cannot run while the signal is blocked, so it cannot collect the leader
   before the group is signalled. The leader is signalled with `pidfd_send_signal`.
   `waitid(P_PIDFD)` is checked before the ack. `killpg` runs unless that `waitid` reports

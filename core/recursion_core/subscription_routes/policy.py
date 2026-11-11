@@ -550,6 +550,15 @@ def _looks_like_claude_login(provider: str) -> bool:
     return squashed.startswith("claude") or squashed.endswith(("-oauth", "-subscription")) and "anthropic" in squashed
 
 
+def _surrogate(value: object) -> bool:
+    """True when ``value`` holds a code point in U+D800–U+DFFF.
+
+    U+DCFF is the surrogateescape form of the byte 0xff. Checked before any filesystem call.
+    """
+
+    return isinstance(value, str) and any(0xD800 <= ord(char) <= 0xDFFF for char in value)
+
+
 def _check_home(
     engine: str,
     env: Mapping[str, str],
@@ -561,10 +570,15 @@ def _check_home(
     """The child's home is route-owned, private, not the operator's, and holds no store or engine state entry.
 
     ``own`` lists the engine's own login store entries a subscription sign-in may keep there.
+    A surrogate in the route home, the child HOME, or an operator home is ``home_unsafe``
+    before ``realpath`` or ``lstat``.
     """
 
     if os.name == "nt":
         raise SubscriptionRouteRefused(engine, "platform_unsupported")
+    parent_home = parent_env.get("HOME") if parent_env is not None else None
+    if any(_surrogate(item) for item in (route_home, env.get("HOME"), operator_home, parent_home)):
+        raise SubscriptionRouteRefused(engine, "home_unsafe")
     if not isinstance(route_home, str) or not os.path.isabs(route_home):
         raise SubscriptionRouteRefused(engine, "route_home_missing")
     if env.get("HOME") != route_home:

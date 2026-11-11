@@ -747,5 +747,149 @@ class ReviewFindingsTest(unittest.TestCase):
         self.assertEqual(reaped_ids, {"gone", "stays"} - stored_ids)
 
 
+class _SwapKill:
+    """On confirm, move the stored run to the next cgroup, then return ``answer``."""
+
+    def __init__(self, registry: InMemoryRunRegistry, swaps: list[str], answer: str) -> None:
+        self.registry = registry
+        self.swaps = list(swaps)
+        self.answer = answer
+        self.requests: list[str] = []
+        self.confirms: list[str] = []
+
+    def request_stop(self, cgroup: str) -> None:
+        self.requests.append(cgroup)
+
+    def confirm(self, cgroup: str, timeout_s: float) -> str:
+        self.confirms.append(cgroup)
+        if self.swaps:
+            current = self.registry.list()[0]
+            current["cgroup"] = self.swaps.pop(0)
+            self.registry.compare_and_swap(current["run_id"], current["generation"], current)
+        return self.answer
+
+
+class RoundTwoTest(unittest.TestCase):
+    def test_a_second_cgroup_change_does_not_inherit_an_unsent_request(self) -> None:
+        reg = InMemoryRunRegistry()
+        kill = _SwapKill(reg, ["/cg/B", "/cg/C"], EMPTY)
+        api, _, _, _ = make_api(kill=kill, registry=reg)
+        run = _start(api)
+        first = api.call("run.stop", {"run_id": run})
+        self.assertEqual(first["code"], a.PENDING)
+        stored = reg.get(run)
+        assert stored is not None
+        self.assertEqual(stored["cgroup"], "/cg/C")
+        self.assertIs(stored["stop"]["requested"], False)
+        second = api.call("run.stop", {"run_id": run})
+        self.assertEqual(second["code"], a.STOPPED)
+        self.assertEqual(kill.requests[-1], "/cg/C")
+        self.assertEqual(kill.confirms[-1], "/cg/C")
+
+    def test_a_populated_confirm_does_not_carry_requested_onto_a_new_cgroup(self) -> None:
+        reg = InMemoryRunRegistry()
+        kill = _SwapKill(reg, ["/cg/B"], POPULATED)
+        api, _, _, _ = make_api(kill=kill, registry=reg)
+        run = _start(api)
+        first = api.call("run.stop", {"run_id": run})
+        self.assertEqual((first["code"], first["reason"]), (a.PENDING, "cgroup_populated"))
+        stored = reg.get(run)
+        assert stored is not None
+        self.assertEqual(stored["cgroup"], "/cg/B")
+        self.assertIs(stored["stop"]["requested"], False)
+        api.call("run.stop", {"run_id": run})
+        self.assertIn("/cg/B", kill.requests)
+
+    def test_stop_records_a_recovered_launch_with_the_fresh_generation(self) -> None:
+        class HideSnapshot(InMemoryRunRegistry):
+            """``put`` stores but returns None, which the registry protocol still allows."""
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.puts = 0
+                self.reads_down = False
+
+            def put(self, record: dict):
+                self.puts += 1
+                super().put(record)
+                if record.get("state") == "starting":
+                    self.reads_down = True
+                return None
+
+            def get(self, run_id: str):
+                if self.reads_down:
+                    raise OSError("disk")
+                return super().get(run_id)
+
+        reg = HideSnapshot()
+        api, _, _, _ = make_api(registry=reg)
+        started = api.call("run.start", {"tenant": "t", "engine": "e", "prompt": "p", "client_key": "k"})
+        self.assertEqual(started["code"], a.START_UNCONFIRMED)
+        self.assertNotIn("generation", api._launched["run-1"])
+        reg.reads_down = False
+        reg.puts = 0
+        stop = api.call("run.stop", {"run_id": "run-1"})
+        self.assertLess(reg.puts, 5)
+        self.assertEqual(stop["code"], a.STOPPED)
+        self.assertIsNot(stop.get("recorded"), False)
+        self.assertEqual(reg.get("run-1")["state"], "stopped")
+        self.assertEqual(reg.get("run-1")["cgroup"], "/sys/fs/cgroup/fake/run-1")
+
+    def test_a_stale_launch_handle_cannot_retry_without_a_bound(self) -> None:
+        reg = InMemoryRunRegistry()
+        reg.put({"run_id": "run-1", "tenant": "t", "engine": "e", "state": "starting",
+                 "cgroup": None, "stop": None, "start_key": None})
+        current = reg.get("run-1")
+        assert current is not None
+        current["engine"] = "e2"
+        reg.put(current)
+        puts = {"n": 0}
+        real_put = reg.put
+
+        def counting_put(record: dict):
+            puts["n"] += 1
+            if puts["n"] > 20:
+                raise AssertionError("stop retried without a bound")
+            return real_put(record)
+
+        reg.put = counting_put  # type: ignore[method-assign]
+        api, _, _, _ = make_api(registry=reg)
+        api._launched["run-1"] = {"run_id": "run-1", "tenant": "t", "engine": "e", "state": "running",
+                                  "cgroup": "/cg/run-1", "stop": None, "start_key": None, "generation": 1}
+        stop = api.call("run.stop", {"run_id": "run-1"})
+        self.assertLess(puts["n"], 5)
+        self.assertEqual(stop["code"], a.STOPPED)
+        self.assertIsNot(stop.get("recorded"), False)
+        stored = reg.get("run-1")
+        assert stored is not None
+        self.assertEqual(stored["state"], "stopped")
+        self.assertEqual(stored["cgroup"], "/cg/run-1")
+
+    def test_a_loaded_stopped_snapshot_without_a_marker_can_be_updated(self) -> None:
+        legacy = {"run_id": "run-1", "tenant": "t", "engine": "codex", "state": "stopped",
+                  "cgroup": "/cg/run-1", "generation": 2, "members": [],
+                  "stop_attestation": {"proof": "empty", "cgroup": "/cg/run-1", "member_ids": [],
+                                       "generation": 1}}
+        reg = InMemoryRunRegistry([legacy])
+        snap = reg.get("run-1")
+        assert snap is not None
+        self.assertTrue(snap.get("cgroup_marker"))
+        self.assertEqual(snap["stop_attestation"]["cgroup_marker"], snap["cgroup_marker"])
+        snap["engine"] = "other"
+        stored = reg.put(snap)
+        self.assertEqual(stored["state"], "stopped")
+        self.assertEqual(stored["engine"], "other")
+        self.assertEqual(stored["cgroup_marker"], snap["cgroup_marker"])
+        self.assertEqual(reg.get("run-1")["stop_attestation"]["cgroup"], "/cg/run-1")
+
+    def test_a_loaded_stopped_snapshot_with_a_foreign_cgroup_is_rejected(self) -> None:
+        legacy = {"run_id": "run-1", "tenant": "t", "engine": "codex", "state": "stopped",
+                  "cgroup": "/cg/run-1", "generation": 2, "members": [],
+                  "stop_attestation": {"proof": "empty", "cgroup": "/cg/other", "member_ids": [],
+                                       "generation": 1}}
+        with self.assertRaises(StopUnattested):
+            InMemoryRunRegistry([legacy])
+
+
 if __name__ == "__main__":
     unittest.main()

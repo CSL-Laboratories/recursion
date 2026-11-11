@@ -180,10 +180,34 @@ class InMemoryRunRegistry:
         self._starts: dict[tuple[str, str], list[str]] = {}  # (tenant, client_key) -> run ids, first seen first
         for raw in records or []:
             rec = copy.deepcopy(raw)
-            rec.setdefault("generation", 1)
-            rec.setdefault("members", [])
-            rec.setdefault("stop_attestation", None)
+            self._load_record(rec)
             self._store(rec)
+
+    def _load_record(self, rec: dict) -> None:
+        """Accept a snapshot from an older process.
+
+        A cgroup without a marker is given one. A stopped snapshot whose attestation names a different
+        cgroup is rejected here, instead of failing later with ``KeyError``.
+        """
+        rec.setdefault("generation", 1)
+        rec.setdefault("members", [])
+        rec.setdefault("stop_attestation", None)
+        attestation = rec.get("stop_attestation") if rec.get("state") == "stopped" else None
+        attested_marker = attestation.get("cgroup_marker") if isinstance(attestation, dict) else None
+        path = rec.get("cgroup")
+        if isinstance(path, str) and path and not rec.get("cgroup_marker"):
+            rec["cgroup_marker"] = attested_marker or self._new_marker()
+        if rec.get("state") != "stopped":
+            return
+        run_id = str(rec.get("run_id") or "")
+        if (not isinstance(attestation, dict) or attestation.get("proof") != "empty"
+                or attestation.get("cgroup") != rec.get("cgroup")):
+            raise StopUnattested(run_id)
+        marker = attestation.get("cgroup_marker")
+        if marker is None:
+            attestation["cgroup_marker"] = rec.get("cgroup_marker")
+        elif marker != rec.get("cgroup_marker"):
+            raise StopUnattested(run_id)
 
     def process_alive(self, pid: int | None) -> bool:
         """True when ``pid`` is a member we cannot show is gone."""

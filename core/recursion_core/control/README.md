@@ -66,7 +66,8 @@ recorded on F60, CSL-762).
   stop. `stopped` is terminal. It is stored only with an attestation (`proof: empty`, the cgroup path,
   that cgroup's marker, the member ids, and that generation) and only when none of those members is
   still alive; the member rows are then dropped. A later update that changes the cgroup identity is
-  refused, and a later `join_member` on a stopped run is refused. `reap_orphans` samples each member
+  refused, and a later `join_member` on a stopped run is refused. A cleanup request belongs to the
+  cgroup identity it was sent to; a different path or marker is requested again. `reap_orphans` samples each member
   once, drops the members that sample says are gone, and does not by itself record `stopped`.
   Locks live on the registry (`OwnerLockTable`). Each in-flight call holds them under a token it minted,
   not under a thread id. One `acquire` sorts its keys, and a start key sorts before a run key, so a start

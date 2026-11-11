@@ -9,7 +9,6 @@ import errno
 import inspect
 import os
 from pathlib import Path
-import stat
 import signal
 import subprocess
 import tempfile
@@ -19,7 +18,7 @@ import unittest
 from unittest.mock import patch
 import recursion_core.cgroup_leaf as cgroup_leaf
 from recursion_core.cgroup_leaf import (Cgroup2, CleanupIncomplete, DelegatedRoot,
-                                        LaunchError, LeafRun)
+                                        LaunchError, LeafRun, cgroup_identity)
 
 
 def alive(pid):
@@ -546,17 +545,6 @@ class LeafTests(unittest.TestCase):
         self.assertEqual((leaf / 'marker').read_text(), 'foreign')
 
 
-def cgroup_identity(path):
-    st = os.lstat(path)
-    if stat_is_symlink(st) or not stat.S_ISDIR(st.st_mode):
-        return None
-    return (st.st_dev, st.st_ino)
-
-
-def stat_is_symlink(st):
-    return stat.S_ISLNK(st.st_mode)
-
-
 def write_cgroup(path, procs=''):
     """A tmpdir stand-in for one cgroup directory. Never a host cgroupfs path."""
     path.mkdir(parents=True, exist_ok=True)
@@ -673,6 +661,16 @@ class RemovalContractTests(unittest.TestCase):
         self.fs.remove(leaf, identity=cgroup_identity(leaf),
                        deadline=time.monotonic() + 1)
         self.assertFalse(leaf.exists())
+
+    def test_read_text_returns_none_when_read_raises(self):
+        # ENODEV/EIO while a cgroup is torn down must not escape cleanup.
+        leaf = self.root_path / 'run-a'
+        write_cgroup(leaf, procs='')
+        deadline = time.monotonic() + 1
+        with patch.object(cgroup_leaf.os, 'read', side_effect=OSError(errno.ENODEV, 'gone')):
+            self.assertIsNone(self.fs._read_text(leaf / 'cgroup.procs', deadline))
+            self.assertIsNone(self.fs.populated(leaf, deadline=deadline))
+            self.assertIs(self.fs._procs_empty(leaf, deadline), False)
 
     def test_unknown_identity_does_not_remove_directory(self):
         leaf = self.root_path / 'run-foreign'

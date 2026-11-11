@@ -206,7 +206,9 @@ class Cgroup2:
                     return None
                 try:
                     chunk = os.read(fd, 4096)
-                except BlockingIOError:
+                except OSError:
+                    # BlockingIOError, and also ENODEV or EIO while the cgroup
+                    # is going away. The caller treats None as "could not read".
                     return None
                 if not chunk:
                     return b''.join(chunks).decode(errors='replace')
@@ -261,12 +263,8 @@ class Cgroup2:
             if text is None:
                 return False
             for line in text.splitlines():
-                token = line.strip()
-                if not token:
-                    continue
-                if not token.isdigit():
+                if line.strip():
                     return False
-                return False
         return True
 
     def _confirmed_empty(self, directory, deadline):

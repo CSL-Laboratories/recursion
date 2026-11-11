@@ -752,8 +752,41 @@ class NotificationAndTimestampTests(unittest.TestCase):
                 self.assertEqual(reply["result"]["createdAt"], _iso(clock))
                 self.assertEqual(reply["result"]["lastUpdatedAt"], _iso(clock))
 
-    def test_cancel_fallback_does_not_keep_a_bool_stop_time(self) -> None:
-        # A bool is an int, so isinstance(requested_at, (int, float)) treats True as a stored time.
+    def test_oversized_int_timestamps_do_not_escape(self) -> None:
+        # float(10**400) raises OverflowError before fromtimestamp. JSON can carry that integer.
+        clock = 1_762_639_200.0
+        started = 1000.0
+        for value in (10**400, -(10**400)):
+            with self.subTest(value=value):
+                api, registry, _, _ = make_api()
+                registry.put(self._record(started_at=value))
+                server = DualEraServer(api, clock=lambda: clock)
+                reply = server.handle({
+                    "jsonrpc": "2.0", "id": 5, "method": "tasks/get",
+                    "params": modern_params(taskId="run-1"),
+                })
+                self.assertEqual(reply["result"]["createdAt"], _iso(clock))
+                self.assertEqual(reply["result"]["lastUpdatedAt"], _iso(clock))
+                created = server._create_task({
+                    "structuredContent": {
+                        "code": "started",
+                        "run": {"run_id": "missing", "state": "running", "started_at": value},
+                    }
+                })
+                self.assertEqual(created["createdAt"], _iso(clock))
+                self.assertEqual(created["lastUpdatedAt"], _iso(clock))
+                registry.put(self._record(started_at=started, stop={"requested_at": value}))
+                poll = server.handle({
+                    "jsonrpc": "2.0", "id": 6, "method": "tasks/get",
+                    "params": modern_params(taskId="run-1"),
+                })["result"]
+                self.assertEqual(poll["createdAt"], _iso(started))
+                self.assertEqual(poll["lastUpdatedAt"], _iso(started))
+
+    def test_cancel_fallback_keeps_a_bool_stop_time_aligned_with_tasks_get(self) -> None:
+        # An existing bool requested_at is not a time, but replacing it with the server clock
+        # in this reply makes the next tasks/get look older: the stored value is still the bool,
+        # and _task_body then falls back to started_at.
         from recursion_core.control.registry import EMPTY
         registry = _OutageRegistry()
         api = ControlAPI(registry, FakeKillTree(answers=(EMPTY,)), FakeStarter(), clock=lambda: 1000.0)
@@ -774,7 +807,15 @@ class NotificationAndTimestampTests(unittest.TestCase):
             "jsonrpc": "2.0", "id": "tc", "method": "tasks/cancel",
             "params": modern_params(taskId=run_id),
         })["result"]
-        self.assertEqual(body["lastUpdatedAt"], _iso(2000.0))
+        registry.down = False
+        polled = server.handle({
+            "jsonrpc": "2.0", "id": "g", "method": "tasks/get",
+            "params": modern_params(taskId=run_id),
+        })["result"]
+        self.assertEqual(body["lastUpdatedAt"], _iso(1000.0))
+        self.assertEqual(body["lastUpdatedAt"], polled["lastUpdatedAt"])
+        self.assertNotEqual(body["lastUpdatedAt"], _iso(2000.0))
+        self.assertIs(registry.get(run_id)["stop"]["requested_at"], True)
 
 
 if __name__ == "__main__":

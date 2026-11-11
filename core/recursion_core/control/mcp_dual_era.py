@@ -133,10 +133,11 @@ def _timestamp(value: object, fallback: float) -> float:
 
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return fallback
-    number = float(value)
-    if not math.isfinite(number):
-        return fallback
     try:
+        # float(10**400) raises OverflowError before fromtimestamp can.
+        number = float(value)
+        if not math.isfinite(number):
+            return fallback
         datetime.fromtimestamp(number, tz=UTC)
     except (ValueError, OverflowError, OSError):
         return fallback
@@ -410,10 +411,11 @@ class DualEraServer:
             state = "stopped" if answer["code"] == "stopped" else "stop_pending"
             rec = dict(before["run"], state=state)
             stop = dict(rec.get("stop") or {})
-            requested_at = stop.get("requested_at")
-            # bool is an int subclass, so it is not a stored stop time.
-            has_time = not isinstance(requested_at, bool) and isinstance(requested_at, (int, float))
-            if not has_time and answer.get("recorded") is not False:
+            # Keep a value already on the record, including a bool or other non-time.
+            # _task_body normalises that to started_at, which is what the next tasks/get
+            # reads. Replacing it here with the server clock makes this reply newer than
+            # that poll. Fill the clock in only for a stop that was stored without a time.
+            if "requested_at" not in stop and answer.get("recorded") is not False:
                 stop["requested_at"] = self._clock()
             if stop:
                 rec["stop"] = stop

@@ -8,6 +8,10 @@
 # "host precondition stubbed: operator Linger (no logind on box)". Product code is not
 # changed by that; the stub is a file on the harness PATH only.
 #
+# The daemon's interpreter must import `cryptography` (the harness loads a signed test plugin):
+# set RECURSION_EVIDENCE_PYTHON, or write its path on the first line of ./evidence-python (read by
+# evidence_e2e.py from the current directory, for callers whose environment is reset).
+#
 # Usage: evidence_ns.sh [output directory]   (default: ./evidence-S12 in the current directory)
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

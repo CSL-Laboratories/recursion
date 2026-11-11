@@ -75,9 +75,11 @@ are unaffected:
   `runs.sqlite3`. Before that rename the live database is checkpointed and its
   `-wal`, `-shm`, and `-journal` files are removed, so a crash after the rename
   cannot replay a previous WAL onto the new file, and a crash before the rename
-  leaves the previous file with its committed rows in it. A directory fsync that
-  fails after the rename does not fail the write: the new file is already the
-  live one. If the new file cannot be reopened, later calls raise
+  leaves the previous file with its committed rows in it. The directory fsync
+  is the barrier after that rename and before the file is reopened. If it
+  fails, the published file stays and the call raises `RegistryDurabilityError`:
+  the rename may be visible without being crash-durable, so the daemon does not
+  start or stop a unit until a later directory fsync succeeds. If the new file cannot be reopened, later calls raise
   `RegistryIntegrityError` until an open succeeds. Temp files left by a dead
   pid are removed on open; a live pid's temp file is left in place. A zero-length
   or truncated registry is refused; it is not opened as an empty registry. A run
@@ -89,7 +91,7 @@ are unaffected:
   reserved: the sweep stops units there that have no live registry entry.
 - States: `starting`, `running`, `stopping`, `unknown`, and the sticky terminal
   states `terminated` (the run's process is attested gone in this boot: its cgroup
-  read `populated 0` and no pid in `cgroup.procs` or `MainPID` was still alive; or
+  subtree read `populated 0` and no pid in any descendant `cgroup.procs` or `MainPID` was still alive; or
   the loaded unit is `inactive`, `failed` or `active (exited)` with its cgroup
   already pruned and its main pid gone; or a synchronous `systemctl stop` returned
   and the unit was then garbage-collected; or, for a run with a recorded Stop,
@@ -114,10 +116,12 @@ Workload checkpoint and restart after reboot is not implemented.
 ## Limits
 
 - Same uid: a run can call `systemd-run --user`, or write another `cgroup.procs`
-  it owns, and leave its unit's cgroup. The escaped process is unseen, and the
-  unit can read empty while it lives. `terminated` means systemd saw the run unit's
-  cgroup empty or the unit end, not that every process the run started is gone. Same uid is not a
-  containment or security boundary.
+  it owns, and leave its unit's cgroup subtree. The escaped process is unseen.
+  A process that is still in a descendant cgroup, including one the run created
+  because the unit has `Delegate=yes`, is inside the subtree: it is not that gap,
+  and it blocks `terminated`. An unfinished walk of the subtree is `unknown`.
+  `terminated` means the subtree was empty or the unit ended, not that every
+  process the run started is gone. Same uid is not a containment or security boundary.
 - If the systemd user manager itself stops (no Linger at last logout, or
   `user@.service` restart), it stops the run units too. Linger is the guard.
 - Fake-manager tests only. Live restart, `kill -9`, supervisor death, reboot,

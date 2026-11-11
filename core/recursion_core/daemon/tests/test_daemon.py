@@ -11,7 +11,8 @@ import tempfile
 import threading
 import unittest
 from unittest.mock import patch, Mock
-from recursion_core.daemon import (AlreadyRunning, Daemon, Registry, RegistryIntegrityError,
+from recursion_core.daemon import (AlreadyRunning, Daemon, Registry, RegistryDurabilityError,
+                                   RegistryIntegrityError,
                                    UserLock, SystemdUserManager, UnitNotLoaded,
                                    check_operator_linger, refuse_engine_user,
                                    require_free_threaded)
@@ -320,16 +321,37 @@ class DaemonTests(unittest.TestCase):
         self.addCleanup(reopened.close)
         self.assertEqual([run.run_id for run in reopened.all()], ['one', 'two'])
 
-    def test_directory_fsync_failure_does_not_fail_a_published_write(self):
-        self.registry.add('one', 'boot-a')
+    def test_directory_fsync_failure_blocks_start_and_stop(self):
+        # The rename is kept, but it is not an acknowledged commit. Start and
+        # stop are external effects and do not run until a directory fsync works.
+        with patch('recursion_core.daemon._fsync_dir',
+                   side_effect=OSError(errno.EIO, 'Input/output error')):
+            with self.assertRaises(RegistryDurabilityError) as caught:
+                self.daemon.start('one', ['fake'])
+            self.assertEqual(caught.exception.errno, errno.EIO)
+        self.assertEqual(self.manager.starts, [])
+        self.assertEqual([run.run_id for run in self.registry.all()], ['one'])
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.daemon.start('one', ['fake'])
+        self.assertEqual(self.manager.starts, [])
+        self.daemon.start('two', ['fake'])
+        self.assertEqual(self.manager.starts, ['recursion-run-two.service'])
+        with patch('recursion_core.daemon._fsync_dir',
+                   side_effect=OSError(errno.EDQUOT, 'Disk quota exceeded')):
+            with self.assertRaises(RegistryDurabilityError) as caught:
+                self.daemon.stop('two')
+            self.assertEqual(caught.exception.errno, errno.EDQUOT)
+        self.assertEqual(self.manager.stops, [])
+        self.assertTrue(self.registry.get('two').stop_requested)
+        # The failed stop left the directory unsynced. The same stop reaches
+        # the unit only after a later directory fsync succeeds.
+        self.assertEqual(self.daemon.stop('two').state, 'terminated')
+        self.assertEqual(self.manager.stops, ['recursion-run-two.service'])
         with patch('recursion_core.daemon._fsync_dir',
                    side_effect=OSError(errno.ENOSPC, 'No space left on device')):
-            self.registry.add('two', 'boot-a')
-        self.assertEqual([run.run_id for run in self.registry.all()], ['one', 'two'])
-        self.registry.close()
-        reopened = Registry(self.path / 'state')
-        self.addCleanup(reopened.close)
-        self.assertEqual([run.run_id for run in reopened.all()], ['one', 'two'])
+            with self.assertRaises(RegistryDurabilityError):
+                self.registry.add('three', 'boot-a')
+        self.assertEqual([run.run_id for run in self.registry.all()], ['one', 'three', 'two'])
 
     def test_open_removes_temp_files_left_by_dead_pids(self):
         dead = 1 << 22
@@ -916,6 +938,74 @@ class SystemdManagerTests(unittest.TestCase):
         daemon = Daemon(registry, self.manager, lambda: 'boot-a')
         self.assertNotEqual(daemon.start('one', ['/fake']).state, 'terminated')
         self.assertNotEqual(daemon.stop('one').state, 'terminated')
+        self.assertNotEqual(daemon.sweep()[0].state, 'terminated')
+
+    def test_delegated_descendant_pid_is_not_terminated(self):
+        # Delegate= child cgroups are inside the unit. A stale populated 0 and
+        # an empty cgroup.procs on the unit itself do not make a live descendant gone.
+        group = '/user.slice/a.service'
+        self.events(group, 0)
+        root = self.root / group.lstrip('/')
+        (root / 'cgroup.procs').write_text('')
+        nested = root / 'delegated' / 'nested'
+        nested.mkdir(parents=True)
+        (root / 'delegated' / 'cgroup.procs').write_text('')
+        (root / 'delegated' / 'cgroup.events').write_text('populated 0\nfrozen 0\n')
+        (nested / 'cgroup.procs').write_text('4242\n')
+        (nested / 'cgroup.events').write_text('populated 0\nfrozen 0\n')
+        self.manager.pid_alive = lambda pid: pid == 4242
+        self.manager._call = Mock(return_value=(
+            'LoadState=loaded\nActiveState=inactive\nSubState=dead\n'
+            f'ControlGroup={group}\nMainPID=0\n'
+            'InvocationID=0b5a2f3c9d8e4f60a1b2c3d4e5f60718\n'
+            'ExecMainStartTimestampMonotonic=81234567\n'))
+        self.assertNotEqual(self.manager.observe('a'), 'empty')
+        self.assertFalse(self.manager.processes_gone('a'))
+        # Hierarchical populated, with no pid listed, is still not an empty tree.
+        (nested / 'cgroup.procs').write_text('')
+        (nested / 'cgroup.events').write_text('populated 1\nfrozen 0\n')
+        self.manager.pid_alive = lambda pid: False
+        self.assertNotEqual(self.manager.observe('a'), 'empty')
+        self.assertFalse(self.manager.processes_gone('a'))
+        # A descendant that cannot be read fails closed.
+        (nested / 'cgroup.events').write_text('populated 0\nfrozen 0\n')
+        (nested / 'cgroup.procs').unlink()
+        (nested / 'cgroup.procs').mkdir()
+        self.assertNotEqual(self.manager.observe('a'), 'empty')
+        self.assertFalse(self.manager.processes_gone('a'))
+        # A symlink child is not followed and is not treated as empty.
+        (nested / 'cgroup.procs').rmdir()
+        (nested / 'cgroup.procs').write_text('')
+        outside = self.root / 'outside'
+        outside.mkdir()
+        (outside / 'cgroup.procs').write_text('4242\n')
+        link = root / 'linked'
+        link.symlink_to(outside, target_is_directory=True)
+        self.manager.pid_alive = lambda pid: pid == 4242
+        self.assertNotEqual(self.manager.observe('a'), 'empty')
+        self.assertFalse(self.manager.processes_gone('a'))
+        link.unlink()
+        (nested / 'cgroup.procs').unlink()
+        (nested / 'cgroup.events').unlink()
+        nested.rmdir()
+        (root / 'delegated' / 'cgroup.procs').unlink()
+        (root / 'delegated' / 'cgroup.events').unlink()
+        (root / 'delegated').rmdir()
+        (root / 'cgroup.procs').write_text('')
+        self.manager.pid_alive = lambda pid: False
+        self.assertEqual(self.manager.observe('a'), 'empty')
+        self.assertTrue(self.manager.processes_gone('a'))
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        registry = Registry(Path(temp.name) / 'state')
+        self.addCleanup(registry.close)
+        (root / 'delegated').mkdir()
+        (root / 'delegated' / 'cgroup.procs').write_text('4242\n')
+        (root / 'delegated' / 'cgroup.events').write_text('populated 0\nfrozen 0\n')
+        self.manager.pid_alive = lambda pid: pid == 4242
+        registry.add('one', 'boot-a')
+        registry.state('one', 'running')
+        daemon = Daemon(registry, self.manager, lambda: 'boot-a')
         self.assertNotEqual(daemon.sweep()[0].state, 'terminated')
 
     def test_populated_one_active_is_running(self):

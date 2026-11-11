@@ -26,7 +26,8 @@ UNIT = re.compile(r'recursion-run-[a-zA-Z0-9_-]{1,64}\.service')
 # Terminal states are sticky: once recorded they are never re-observed or re-adopted.
 # terminated: the run's process is attested gone in this boot. A scripted "ended"
 # observation is not enough while a listener is still alive. Attested ends are: the
-# cgroup read empty and no listed pid was alive; the loaded unit reached
+# cgroup subtree read empty and no listed pid, including a descendant cgroup,
+# was alive; the loaded unit reached
 # inactive/failed/exited with its cgroup pruned and its main pid gone; or a
 # synchronous systemctl stop returned and the unit was then garbage-collected.
 # ENOENT and ESRCH are the only read errors that mean a pid or cgroup is gone.
@@ -62,6 +63,15 @@ class AlreadyRunning(RuntimeError):
 
 class RegistryIntegrityError(RuntimeError):
     """The registry file is torn or partial. It is not a fresh empty registry."""
+
+
+class RegistryDurabilityError(OSError):
+    """The new registry file is published, but the directory fsync did not finish.
+
+    The rename can be visible to the next open without being crash-durable.
+    The file stays in place. Callers must not start or stop a unit until a
+    later directory fsync succeeds.
+    """
 
 
 class UserLock:
@@ -179,10 +189,12 @@ def _fsync_dir(directory: Path):
 
 
 def _sync_directory(directory: Path):
-    """Fsync a directory whose new directory entry is already visible.
+    """Fsync a directory immediately after its new entry is renamed into place.
 
-    Retry once. The rename has already published the file, so a lasting fsync
-    failure is logged and not reported as a failed write.
+    Two attempts. The renamed file is already visible, so a lasting failure is
+    not a rolled-back write and not an acknowledged commit: it raises
+    RegistryDurabilityError. Callers must not take an external action until a
+    later call gets a directory fsync to succeed.
     """
     last = None
     for _ in range(2):
@@ -191,7 +203,9 @@ def _sync_directory(directory: Path):
             return
         except OSError as exc:
             last = exc
-    log.warning('registry directory fsync failed after the new file was published: %s', last)
+    err = last.errno if last is not None and last.errno is not None else errno.EIO
+    raise RegistryDurabilityError(
+        err, 'registry directory fsync did not finish; commit is not durable') from last
 
 
 def _pid_is_gone(pid):
@@ -226,7 +240,9 @@ class Registry:
     before the rename. A crash after the rename must not leave the previous WAL
     beside the new file: SQLite would replay it onto the new bytes. A crash
     before the rename leaves the previous file, with its committed rows
-    checkpointed into it. A zero-length or truncated file is refused. If the
+    checkpointed into it.     A zero-length or truncated file is refused. The directory fsync is the
+    barrier after the rename and before the file is reopened: if it fails the
+    published file stays, and the error is RegistryDurabilityError. If the
     new file cannot be reopened, later calls raise RegistryIntegrityError until
     an open succeeds.
     """
@@ -239,6 +255,7 @@ class Registry:
         self.closed = False
         self.db = None
         self._open_error = None
+        self._dir_durable = False
         self._sweep_stale_temps()
         try:
             self.path.lstat()
@@ -246,6 +263,10 @@ class Registry:
             self._publish_new()
         else:
             self._assert_sound(self.path)
+            # The name already on disk is not acknowledged until its directory
+            # entry is durable.
+            _sync_directory(self.directory)
+        self._dir_durable = True
         try:
             self._reopen()
         except sqlite3.Error as exc:
@@ -324,11 +345,22 @@ class Registry:
     def _publish(self, tmp: Path):
         """Fsync the temp file and rename it onto the live registry.
 
-        The directory fsync is the caller's, after it has reopened the new
-        file: a failure there must not discard bytes the rename already published.
+        The caller fsyncs the directory before it reopens the new file. A
+        failure there must not discard bytes the rename already published.
         """
         _fsync_file(tmp)
         os.replace(tmp, self.path)
+
+    def _require_dir_durable(self):
+        """Retry a directory fsync that an earlier publish left unfinished.
+
+        External start and stop wait on a registry call. Those calls do not
+        return until this succeeds.
+        """
+        if self._dir_durable:
+            return
+        _sync_directory(self.directory)
+        self._dir_durable = True
 
     def _publish_new(self):
         tmp, dest = self._open_temp()
@@ -491,6 +523,7 @@ class Registry:
         """Apply one change on a copy, then publish it with fsync and rename."""
         with self.lock:
             self._ensure_open()
+            self._require_dir_durable()
             tmp, dest = self._open_temp()
             published = False
             try:
@@ -521,6 +554,14 @@ class Registry:
                     self._restore_open()
                     raise
                 published = True
+                # Barrier: the rename is visible. Do not reopen, and do not
+                # return, until the directory entry is durable.
+                try:
+                    _sync_directory(self.directory)
+                except RegistryDurabilityError:
+                    self._dir_durable = False
+                    raise
+                self._dir_durable = True
                 try:
                     self._reopen()
                 except sqlite3.Error as exc:
@@ -528,7 +569,6 @@ class Registry:
                     self._open_error = exc
                     raise RegistryIntegrityError('registry reopen failed') from exc
                 self._seal_files()
-                _sync_directory(self.directory)
             except BaseException:
                 if dest is not None:
                     dest.close()
@@ -785,46 +825,103 @@ class SystemdUserManager:
             return True
         return state not in ('Z', 'X')
 
-    def _listed_pids(self, group):
-        """Return listed pids, [] when the cgroup is gone, or None when unreadable.
+    def _read_level(self, directory: Path):
+        """Return (pids, populated) for one cgroup directory, or None if unreadable.
 
-        ENOENT and ESRCH mean there is no cgroup to list. Any other read error is
-        unknown, not an empty cgroup.
+        A missing ``cgroup.procs`` is an empty level, not an error. Any other
+        read error is an incomplete look at this level. ``populated`` is True
+        only when this directory's own ``cgroup.events`` says so.
         """
-        path = self.cgroup_root / group.lstrip('/') / 'cgroup.procs'
         try:
-            text = path.read_text()
+            text = (directory / 'cgroup.procs').read_text()
         except OSError as exc:
-            if exc.errno in (errno.ENOENT, errno.ESRCH):
-                return []
-            return None
+            if exc.errno not in (errno.ENOENT, errno.ESRCH):
+                return None
+            text = ''
         pids = []
         for token in text.split():
             if not token.isdigit():
                 return None
             pids.append(int(token))
-        return pids
+        populated = False
+        try:
+            events = (directory / 'cgroup.events').read_text()
+        except OSError as exc:
+            if exc.errno not in (errno.ENOENT, errno.ESRCH):
+                return None
+            events = ''
+        try:
+            fields = dict(line.split() for line in events.splitlines() if line.strip())
+        except ValueError:
+            return None
+        if fields.get('populated') not in (None, '0', '1'):
+            return None
+        if fields.get('populated') == '1':
+            populated = True
+        return pids, populated
+
+    def _subtree(self, directory: Path):
+        """Return (pids, any_populated) for this cgroup and its descendants.
+
+        None means the walk could not be finished: a read error, a symlink, or
+        a directory listing that failed. Delegate= lets a run create child
+        cgroups, and a pid in one of those is still inside the unit.
+        """
+        try:
+            info = directory.lstat()
+        except OSError:
+            return None
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            return None
+        level = self._read_level(directory)
+        if level is None:
+            return None
+        pids, populated = level
+        try:
+            entries = list(directory.iterdir())
+        except OSError as exc:
+            if exc.errno in (errno.ENOENT, errno.ESRCH):
+                return pids, populated
+            return None
+        for entry in entries:
+            try:
+                info = entry.lstat()
+            except OSError as exc:
+                if exc.errno in (errno.ENOENT, errno.ESRCH):
+                    continue
+                return None
+            if stat.S_ISLNK(info.st_mode):
+                return None
+            if not stat.S_ISDIR(info.st_mode) or entry.name in ('.', '..'):
+                continue
+            nested = self._subtree(entry)
+            if nested is None:
+                return None
+            child_pids, child_populated = nested
+            pids.extend(child_pids)
+            populated = populated or child_populated
+        return pids, populated
 
     def _process_still_live(self, props, group):
         """True when a listed pid is alive, False when all are gone, None if unknown.
 
-        ``populated 0`` or an inactive show line is a scripted observation unless
-        every listed pid, including MainPID, is actually gone. An unreadable
-        cgroup or an unreadable /proc entry is None: not attested death.
+        ``populated 0`` on the unit cgroup is not enough. Every descendant
+        cgroup is walked, and each directory's populated bit is rechecked.
+        An incomplete walk, a hierarchical populated bit with no confirmed
+        death, or an unreadable /proc entry is None: not attested death.
         """
         pids = []
+        subtree_populated = False
         if group:
-            listed = self._listed_pids(group)
-            if listed is None:
+            walked = self._subtree(self.cgroup_root / group.lstrip('/'))
+            if walked is None:
                 return None
-            pids.extend(listed)
+            pids, subtree_populated = walked
         main = props.get('MainPID', '')
         if str(main).isdigit() and int(main) > 0:
             main_pid = int(main)
             if main_pid not in pids:
                 pids.append(main_pid)
-        if not pids:
-            return False
         unknown = False
         for pid in pids:
             alive = self.pid_alive(pid)
@@ -832,7 +929,9 @@ class SystemdUserManager:
                 return True
             if alive is None:
                 unknown = True
-        return None if unknown else False
+        if unknown or subtree_populated:
+            return None
+        return False
 
     def processes_gone(self, unit):
         """Attest the unit's processes are gone. A scripted observe() string is not this."""
@@ -850,9 +949,11 @@ class SystemdUserManager:
         ran (an InvocationID or a main-process start time), no queued job, and no live
         MainPID. A unit whose start job is still queued (systemd-run timed out, or the
         daemon died mid-launch) also reads loaded/inactive/dead with no cgroup; that is
-        unknown. A cgroup that still exists is read directly, and ``populated 0`` is
-        ended only when ``cgroup.procs`` has no live pid. Not-found is gone
-        (garbage-collected or never launched).
+        unknown. A cgroup that still exists is read directly, including every
+        descendant cgroup (Delegate= child cgroups stay inside the unit).
+        ``populated 0`` is ended only when the whole subtree was walked, no
+        directory still says populated, and no listed pid was alive. Not-found
+        is gone (garbage-collected or never launched).
         """
         try:
             text = self._call(['systemctl', '--user', 'show', '--property=LoadState,'

@@ -249,6 +249,46 @@ class SubscriptionRobustness(unittest.TestCase):
         self.assertEqual("parent_env_malformed", caught.exception.cause)
         self.assertNotIn("BAD=NAME", str(caught.exception))
 
+    def test_empty_env_name_is_malformed_on_both_routes(self) -> None:
+        parent = {"PATH": "/usr/bin", "HOME": str(self.home), "": "val"}
+        forks: list[int] = []
+        real_fork = os.fork
+
+        def tracking_fork() -> int:
+            pid = real_fork()
+            if pid > 0:
+                forks.append(pid)
+            return pid
+
+        try:
+            with self.assertRaises(OwnLoopRouteRefused) as nous_caught:
+                check_nous_own_loop(
+                    {"engine": "nous", "auth": "subscription", "method": "hermes_local_proxy",
+                     "base_url": "http://127.0.0.1:9"},
+                    parent,
+                )
+            self.assertEqual("parent_env_malformed", nous_caught.exception.cause)
+            self.assertNotIn("val", str(nous_caught.exception))
+            with mock.patch.object(own_loop.os, "fork", tracking_fork):
+                with self.assertRaises(OwnLoopRouteRefused) as copilot_caught:
+                    check_copilot_own_loop(
+                        {"engine": "copilot", "auth": "subscription", "method": "copilot_cli_sign_in"},
+                        parent,
+                        has_copilot_login=lambda: True,
+                    )
+            self.assertEqual("parent_env_malformed", copilot_caught.exception.cause)
+            self.assertEqual([], forks)
+        finally:
+            for pid in forks:
+                try:
+                    os.kill(pid, 9)
+                except OSError:
+                    pass
+                try:
+                    os.waitpid(pid, 0)
+                except ChildProcessError:
+                    pass
+
     def test_hermes_config_read_eio_refuses(self) -> None:
         hermes = self.home / ".hermes"
         hermes.mkdir(mode=0o700)
@@ -575,6 +615,81 @@ class SubscriptionRobustness(unittest.TestCase):
                 os.kill(pid, 0)
             with self.assertRaises(ChildProcessError):
                 os.waitpid(pid, os.WNOHANG)
+        finally:
+            for pid in children:
+                try:
+                    os.kill(pid, 9)
+                except OSError:
+                    pass
+                try:
+                    os.waitpid(pid, 0)
+                except ChildProcessError:
+                    pass
+
+    def test_reap_does_not_signal_after_the_leader_is_collected(self) -> None:
+        events: list[str] = []
+        calls = {"n": 0}
+
+        def waitpid(pid: int, flags: int) -> tuple[int, int]:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                events.append("reaped")
+                raise KeyboardInterrupt
+            raise ChildProcessError
+
+        with mock.patch.object(own_loop, "_kill_probe_group", side_effect=lambda pid: events.append("signal")), \
+                mock.patch.object(own_loop, "_live_group_members", return_value=[]), \
+                mock.patch.object(own_loop.os, "waitpid", side_effect=waitpid):
+            with self.assertRaises(KeyboardInterrupt):
+                own_loop._reap_probe_child(123, time.monotonic() + 1)
+        self.assertEqual(["signal", "reaped"], events)
+
+    def test_reap_does_not_kill_a_member_pid_after_the_deadline(self) -> None:
+        signals: list[int] = []
+        with mock.patch.object(own_loop, "_kill_probe_group"), \
+                mock.patch.object(own_loop, "_live_group_members", return_value=[123, 456]), \
+                mock.patch.object(own_loop.os, "kill", side_effect=lambda pid, sig: signals.append(pid)), \
+                mock.patch.object(own_loop.os, "waitpid", return_value=(123, 0)):
+            own_loop._reap_probe_child(123, time.monotonic() - 1)
+        self.assertEqual([], signals)
+
+    def test_reap_after_the_deadline_does_not_block(self) -> None:
+        waits: list[int] = []
+
+        def waitpid(pid: int, flags: int) -> tuple[int, int]:
+            waits.append(flags)
+            return (0, 0) if flags == os.WNOHANG else (pid, 0)
+
+        with mock.patch.object(own_loop, "_kill_probe_group"), \
+                mock.patch.object(own_loop, "_live_group_members", return_value=[]), \
+                mock.patch.object(own_loop.os, "waitpid", side_effect=waitpid), \
+                mock.patch.object(own_loop, "_REAP_GRACE_S", 0.05, create=True):
+            own_loop._reap_probe_child(123, time.monotonic() - 1)
+        self.assertNotIn(0, waits)
+        self.assertTrue(waits)
+
+    def test_unreaped_probe_leader_is_unenforceable(self) -> None:
+        children: list[int] = []
+        real_fork = os.fork
+
+        def tracking_fork() -> int:
+            pid = real_fork()
+            if pid > 0:
+                children.append(pid)
+            return pid
+
+        def never_reap(pid: int, flags: int) -> tuple[int, int]:
+            return (0, 0)
+
+        try:
+            with mock.patch.object(own_loop.os, "fork", tracking_fork), mock.patch.object(
+                own_loop.os, "waitpid", never_reap
+            ), mock.patch.object(own_loop, "_PROBE_DEADLINE_S", 0.05), mock.patch.object(
+                own_loop, "_REAP_GRACE_S", 0.05, create=True
+            ):
+                with self.assertRaises(OwnLoopRouteRefused) as caught:
+                    own_loop._probe_in_screened_env(lambda: time.sleep(2) or True, {"PATH": "/usr/bin"})
+            self.assertEqual("probe unenforceable", caught.exception.detail)
         finally:
             for pid in children:
                 try:

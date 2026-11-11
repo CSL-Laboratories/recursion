@@ -163,6 +163,9 @@ def check_copilot_own_loop(
 # leader is reaped, so a helper the probe started cannot keep the group id. Tests may shorten
 # the deadline.
 _PROBE_DEADLINE_S = 5.0
+# After the deadline, poll for the leader instead of blocking in waitpid. A child that is still
+# unreaped when this grace ends is left for the system; the probe refuses rather than wait.
+_REAP_GRACE_S = 1.0
 
 
 def _other_threads() -> bool:
@@ -257,10 +260,13 @@ def _probe_in_screened_env(probe: Callable[[], bool], child: Mapping[str, str]) 
                     pass
                 fds[index] = -1
                 pending = pending or exc
+        leader_reaped = True
         if pid:
-            _reap_probe_child(pid, deadline)
+            leader_reaped = _reap_probe_child(pid, deadline)
         if pending is not None:
             raise pending
+        if pid and not leader_reaped:
+            raise OwnLoopRouteRefused("copilot", "copilot_login_unknown", "probe unenforceable")
     if status == b"T":
         return True
     if status == b"F":
@@ -337,60 +343,76 @@ def _live_group_members(pgid: int) -> list[int]:
     return live
 
 
-def _reap_probe_child(pid: int, deadline: float) -> None:
-    """SIGKILL the probe group, then reap its leader. The deadline bounds a child that survives.
+def _reap_probe_child(pid: int, deadline: float) -> bool:
+    """SIGKILL the probe group, then reap its leader. True when the leader was collected.
 
     The signal goes out while the leader is still unreaped, so the group id cannot be reused.
-    Helpers are given that signal time to exit before the leader is collected. A
-    ``BaseException`` during the wait, including ``KeyboardInterrupt``, signals the group and
-    reaps the leader before it propagates.
+    Helpers are given that signal time to exit before the leader is collected. After the
+    deadline, the group is signalled again and the leader is only polled, for ``_REAP_GRACE_S``.
+    A leader that is still unreaped then is left unreaped and this returns false. Once a wait
+    has been attempted, a later interrupt does not signal that process-group id again: the wait
+    may already have collected the leader, and the id may have been reused.
     """
 
+    reaped = False
+    entered_reap = False
+
     def collect() -> None:
+        nonlocal reaped, entered_reap
         _kill_probe_group(pid)
         while True:
             others = [member for member in _live_group_members(pid) if member != pid]
             if not others:
                 break
             if time.monotonic() >= deadline:
-                for member in others:
-                    try:
-                        os.kill(member, signal.SIGKILL)
-                    except OSError:
-                        pass
+                # The leader is still unreaped here. killpg reaches members still in the group.
+                # Killing the recorded pid on its own can hit a recycled pid.
+                _kill_probe_group(pid)
                 break
             time.sleep(0.005)
+        grace_end: float | None = None
         while True:
+            # Set before the call. KeyboardInterrupt can arrive after the kernel has reaped
+            # the leader and before this call returns to the assignment below.
+            entered_reap = True
             try:
                 got, _status = os.waitpid(pid, os.WNOHANG)
             except InterruptedError:
                 continue
             except ChildProcessError:
+                reaped = True
                 return
             if got:
+                reaped = True
                 return
-            if time.monotonic() >= deadline:
-                try:
-                    os.waitpid(pid, 0)
-                except ChildProcessError:
+            now = time.monotonic()
+            if now >= deadline:
+                if grace_end is None:
+                    grace_end = now + _REAP_GRACE_S
+                if now >= grace_end:
                     return
-                return
             time.sleep(0.005)
 
     try:
         collect()
     except BaseException:
-        _kill_probe_group(pid)
-        try:
-            os.waitpid(pid, 0)
-        except ChildProcessError:
-            pass
-        except InterruptedError:
+        if not reaped and not entered_reap:
+            _kill_probe_group(pid)
+        grace_end = time.monotonic() + _REAP_GRACE_S
+        while not reaped and time.monotonic() < grace_end:
             try:
-                os.waitpid(pid, os.WNOHANG)
-            except (ChildProcessError, InterruptedError, OSError):
-                pass
+                got, _status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                reaped = True
+                break
+            except InterruptedError:
+                continue
+            if got:
+                reaped = True
+                break
+            time.sleep(0.005)
         raise
+    return reaped
 
 
 def _write_all(fd: int, data: bytes) -> None:
@@ -470,8 +492,8 @@ def _screen_parent_env(engine: str, parent_env: object) -> dict[str, str]:
 
     The returned dict is the only map the rest of the check reads. A later ``.items()`` on the
     caller's mapping, or a login callback that mutates that mapping, cannot add a null or a new
-    name. A non-string used to raise ``AttributeError``. A null or an ``=`` in a name used to
-    crash at launch. Value encodability is checked later, and only for names that stay in the
+    name. A non-string used to raise ``AttributeError``. An empty name, a null, or an ``=`` in a
+    name used to crash at launch. Value encodability is checked later, and only for names that stay in the
     child: a dropped credential this process cannot encode is not a reason to refuse the run.
     """
 
@@ -479,7 +501,7 @@ def _screen_parent_env(engine: str, parent_env: object) -> dict[str, str]:
         raise OwnLoopRouteRefused(engine, "parent_env_malformed")
     snapshot: dict[str, str] = {}
     for name, value in parent_env.items():
-        if (not isinstance(name, str) or not isinstance(value, str) or "=" in name
+        if (not isinstance(name, str) or not isinstance(value, str) or name == "" or "=" in name
                 or "\x00" in name or "\x00" in value):
             raise OwnLoopRouteRefused(engine, "parent_env_malformed")
         try:

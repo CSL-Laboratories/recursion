@@ -290,7 +290,7 @@ def cells(s: Scratch) -> list[Cell]:
     add("dotdot_ok", "dotdot_ok_path", {"PATH": up_path}, L(_same(PATH=up_path)))
     add("dotdot_ok", "dotdot_ok_link", {"SSL_CERT_FILE": f"{op}/up"}, L(_same(SSL_CERT_FILE=f"{op}/up")))
 
-    # C1-46 (PRODUCT.md 055cc7a5 section 3.8): the names the Nov 5 list dropped, now carried under the same rules.
+    # C1-46 (PRODUCT.md d84cdd26 section 11.5): the names the Nov 5 list dropped, now carried under the same rules.
     socks = "socks5h://127.0.0.1:1080"
     add("c1_46", "allproxy_userinfo", {"ALL_PROXY": "socks5://fakeuser:fakepass@127.0.0.1:1080"}, R("proxy_userinfo"))
     add("c1_46", "allproxy_scheme", {"all_proxy": "ftp://127.0.0.1:21"}, R("proxy_malformed"), engine="codex")

@@ -163,7 +163,7 @@ class ProfileTests(unittest.TestCase):
                 self.assertNotIn(FAKE, repr(env))
 
     def test_allowlist_counts(self) -> None:
-        # 29 Nov 5 names + ALL_PROXY, all_proxy, XDG_RUNTIME_DIR (PRODUCT.md 055cc7a5 section 3.8, C1-46).
+        # 29 Nov 5 names + ALL_PROXY, all_proxy, XDG_RUNTIME_DIR (PRODUCT.md d84cdd26 section 11.5, C1-46).
         self.assertEqual(32, len(BASE_NAMES))
         self.assertEqual(32, len(set(BASE_NAMES)))
         self.assertLessEqual({"ALL_PROXY", "all_proxy", "XDG_RUNTIME_DIR"}, set(BASE_NAMES))

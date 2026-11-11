@@ -25,6 +25,13 @@ NATIVE_MAGIC = (b"\x7fELF", b"MZ", b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\
                 b"\xfe\xed\xfa\xce", b"\xca\xfe\xba\xbe")
 _PYTHON_VERSIONED = re.compile(r"python\d+(\.\d+)*[a-z]?$")
 HEX64 = re.compile(r"[0-9a-f]{64}")
+# Windows launcher extensions a pinned route may be granted through, bound to a pin (grant()).
+PINNED_LAUNCHER_EXT = (".cmd", ".ps1")
+
+
+def is_windows() -> bool:
+    """The one Windows switch for detect and grant; tests patch it, never ``os.name``."""
+    return os.name == "nt"
 
 
 def stem(path: str) -> str:

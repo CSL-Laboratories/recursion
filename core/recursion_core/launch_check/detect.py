@@ -5,7 +5,12 @@ resolve symlinks and keep native targets only. Nothing found here is executed: a
 is read, never run. The one shim followed is Codex's npm ``codex`` -> ``bin/codex.js``,
 and only when the package layout is recognised and the vendored binary is native;
 any other script, shim or non-native target is reported and left without a candidate,
-so ``grant()`` is never offered a wrapper.
+so ``grant()`` is never offered a wrapper. The exception is a pinned route (pi, hermes,
+cursor, antigravity): its first PATH hit is offered whatever its kind, because ``grant()``
+decides it against the pin table and runs nothing. On Windows a pinned route's name is also
+searched as ``.cmd`` and ``.ps1`` (after the bare name and ``.exe``); other engines are not.
+A ``hermes`` hit in the unofficial npm ``hermes-agent`` bridge is named and never offered,
+pinned route or not (B27, CSL-772).
 """
 
 from __future__ import annotations
@@ -16,7 +21,8 @@ import platform
 import stat
 from dataclasses import dataclass
 
-from recursion_core.launch_check.binary import file_kind
+from recursion_core.launch_check import binary, pins
+from recursion_core.launch_check.binary import PINNED_LAUNCHER_EXT, file_kind, sha256_file
 from recursion_core.launch_check.floors import FLOORS, spec_for
 
 
@@ -176,8 +182,21 @@ def npm_hermes_agent_root(path: str) -> str | None:
     return None
 
 
-def path_hits(name: str, path_string: str) -> list[str]:
-    exts = ("", ".exe") if os.name == "nt" else ("",)
+def _launcher_pinned(engine: str, realpath: str) -> bool:
+    try:
+        return pins.launcher_listed(engine, sha256_file(realpath)[0])
+    except OSError:
+        return False
+
+
+def path_hits(name: str, path_string: str, pinned: bool = False) -> list[str]:
+    """Executable files named ``name`` on the PATH string, in search order.
+
+    Windows also tries ``.exe``, and for a pinned route (``pinned``) ``.cmd`` then ``.ps1``.
+    """
+    exts: tuple[str, ...] = ("",)
+    if binary.is_windows():
+        exts = ("", ".exe", *PINNED_LAUNCHER_EXT) if pinned else ("", ".exe")
     hits: list[str] = []
     for d in path_string.split(os.pathsep):
         if not d or not os.path.isabs(d):  # empty or relative PATH entries are never searched
@@ -194,26 +213,37 @@ def detect(engine: str, path_string: str) -> Detection:
     """Return the engine's PATH hits and a native candidate, or None (fail closed).
 
     Only the first PATH hit of each binary name counts (it is what that name runs);
-    a later native copy shadowed by a wrapper is not offered.
+    a later native copy shadowed by a wrapper is not offered. A pinned route offers
+    its first hit of any kind; with several names, the first whose launcher is pinned.
+    A ``hermes`` hit in the npm ``hermes-agent`` bridge is named in the note and never offered.
     """
     spec = spec_for(engine)
     hits: list[Hit] = []
     firsts: list[Hit] = []
     for name in spec.names:
-        for i, p in enumerate(path_hits(name, path_string)):
+        for i, p in enumerate(path_hits(name, path_string, spec.pin is not None)):
             real = os.path.realpath(p)
             hits.append(Hit(p, real, _kind(real)))
             if i == 0:
                 firsts.append(hits[-1])
     notes = []
-    for h in firsts:
-        if spec.engine == "hermes":
+    if spec.engine == "hermes":  # B27: a hit in the npm bridge is named and never offered, pinned route or not
+        kept: list[Hit] = []
+        for h in firsts:
             bridge = npm_hermes_agent_root(h.path)
-            if bridge is not None:
+            if bridge is None:
+                kept.append(h)
+            else:
                 notes.append(
                     f"{h.path}: npm {NPM_HERMES_PACKAGE} bridge at {bridge} (unofficial, not upstream Hermes); refused"
                 )
-                continue
+        firsts = kept
+    if spec.pin is not None and firsts:
+        pick = firsts[0]
+        if len(firsts) > 1:
+            pick = next((h for h in firsts if _launcher_pinned(spec.engine, h.realpath)), pick)
+        return Detection(spec.engine, tuple(hits), pick.path, f"pinned route ({spec.pin}): {pick.kind} on PATH")
+    for h in firsts:
         if h.kind == "native":
             return Detection(spec.engine, tuple(hits), h.path, "native on PATH")
         if spec.engine == "codex" and h.kind == "script":
@@ -224,6 +254,8 @@ def detect(engine: str, path_string: str) -> Detection:
         else:
             notes.append(f"{h.path}: {h.kind}")
     note = "; ".join(notes) + "; fail closed" if hits else "absent from PATH"
+    if hits and spec.note:
+        note = f"{note}. {spec.note}"
     return Detection(spec.engine, tuple(hits), None, note)
 
 

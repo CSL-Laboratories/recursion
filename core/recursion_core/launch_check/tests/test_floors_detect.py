@@ -7,6 +7,7 @@ Fake binaries only; no real engine, network or credential.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import re
 import threading
@@ -29,6 +30,9 @@ from recursion_core.launch_check import (
     table_record,
     verify,
 )
+from recursion_core.launch_check import binary as binary_mod
+from recursion_core.launch_check import floors as floors_mod
+from recursion_core.launch_check import pins as pins_mod
 from recursion_core.launch_check.detect import _triples
 from recursion_core.launch_check.tests.fixtures import Factory
 
@@ -49,18 +53,29 @@ class FloorTableTests(unittest.TestCase):
         self.assertRegex(FLOOR_TABLE_VERSION, r"^r2a-floors/\d+\.\d+\.\d+-candidate-\d{4}-\d{2}-\d{2}$")
         self.assertEqual(FLOOR_TABLE_VERSION, table_record()["floor_table"])
 
-    def test_nine_engines_and_binary_names(self) -> None:
+    def test_eight_engines_and_binary_names(self) -> None:
         names = {e: s.names for e, s in FLOORS.items()}
         self.assertEqual(
             {
                 "claude_code": ("claude",), "codex": ("codex",), "opencode": ("opencode", "opencode2"),
                 "grok": ("grok",), "antigravity": ("agy",), "cursor": ("agent", "cursor-agent"),
-                "gemini": ("gemini",), "pi": ("pi",), "hermes": ("hermes",),
+                "pi": ("pi",), "hermes": ("hermes",),
             },
             names,
         )
-        self.assertEqual("hermes-acp", FLOORS["hermes"].probe_name)
+        self.assertEqual([], [e for e, s in FLOORS.items() if s.probe_name])
         self.assertEqual("date", FLOORS["cursor"].scheme)
+        self.assertEqual(
+            {"antigravity": "binary+launcher", "cursor": "launcher+tree", "pi": "launcher+tree", "hermes": "launcher+tree"},
+            {e: s.pin for e, s in FLOORS.items() if s.pin},
+        )
+        # Gemini CLI is dropped (Lucas, 2026-11-09): no row, no binary name, no api_key_only field.
+        self.assertNotIn("gemini", FLOORS)
+        self.assertNotIn("gemini", [n for s in FLOORS.values() for n in s.names])
+        self.assertNotIn("gemini", table_record()["engines"])
+        self.assertFalse(hasattr(FLOORS["grok"], "api_key_only"))
+        self.assertNotIn("api_key_only", table_record()["engines"]["grok"])
+        self.assertEqual("r2a-floors/1.5.0-candidate-2026-11-09", FLOOR_TABLE_VERSION)
 
     def test_two_slots(self) -> None:
         slots = {e: (s.functional, s.security) for e, s in FLOORS.items()}
@@ -68,7 +83,7 @@ class FloorTableTests(unittest.TestCase):
             {
                 "claude_code": ("2.1.314", "2.1.260"), "codex": (None, "0.131.0"),
                 "opencode": (None, "1.18.33"), "grok": (None, None), "antigravity": (None, None),
-                "cursor": (None, "2025.09.17-25b418f"), "gemini": (None, "0.39.1"), "pi": (None, None),
+                "cursor": (None, "2025.09.17-25b418f"), "pi": (None, None),
                 "hermes": (None, None),
             },
             slots,
@@ -78,12 +93,15 @@ class FloorTableTests(unittest.TestCase):
 
     def test_identity_column(self) -> None:
         engines = table_record()["engines"]
-        self.assertEqual("unverified", engines["pi"]["identity"])
-        required = {"claude_code", "codex", "opencode", "hermes"}
+        required = {"claude_code", "codex", "opencode"}
+        pinned = {"pi", "hermes", "cursor", "antigravity"}
         for engine in required:
             self.assertEqual("required", engines[engine]["identity"], engine)
-        for engine in set(FLOORS) - required - {"pi"}:
+        for engine in pinned:
+            self.assertEqual("pin", engines[engine]["identity"], engine)
+        for engine in set(FLOORS) - required - pinned:
             self.assertEqual("rule", engines[engine]["identity"], engine)
+        self.assertEqual({"grok"}, set(FLOORS) - required - pinned)
 
     def test_table_is_read_only(self) -> None:
         self.assertIsInstance(FLOORS, MappingProxyType)
@@ -216,11 +234,24 @@ class DetectTests(unittest.TestCase):
             detect("kiro", "/usr/bin")
         self.assertEqual("engine_unknown", cm.exception.code)
 
+    def test_gemini_is_not_an_engine(self) -> None:
+        # Dropped row: `gemini` is an unknown id even with a native `gemini` on PATH.
+        d = F.dir()
+        F.make("gemini", "0.39.1", where=d)
+        with self.assertRaises(LaunchRefused) as cm:
+            detect("gemini", d)
+        self.assertEqual("engine_unknown", cm.exception.code)
+        self.assertNotIn("gemini", detect_all(d))
+        for found in detect_all(d).values():
+            self.assertEqual((), found.hits)
+            self.assertIsNone(found.candidate)
+
     def test_cursor_both_names(self) -> None:
         d = F.dir()
         F.make("cursor-agent", "2026.10.22", where=d)
         found = detect("cursor", d)
         self.assertEqual(os.path.join(d, "cursor-agent"), found.candidate)
+        self.assertIn("pinned route (launcher+tree)", found.note)
 
     def _npm_codex(self, triple: str | None, layout: str = "vendor") -> tuple[str, str | None]:
         prefix = F.dir()
@@ -429,6 +460,18 @@ class NpmHermesBridgeGrantTests(unittest.TestCase):
     def _no_probe(self, *a: object) -> None:
         self.fail("the version probe ran on the npm hermes-agent bridge")
 
+    def _probed_hermes(self) -> None:
+        """Hermes as the probed native row it was before it became a pinned route (CSL-732, 2026-11-09).
+
+        The ``hermes-acp`` probe and the native-path rules stay covered on this patched row, as in
+        ``test_launch_check.py``; the pinned row is covered by ``NpmHermesBridgePinnedTests``.
+        """
+        table = dict(floors_mod.FLOORS)
+        table["hermes"] = dataclasses.replace(table["hermes"], pin=None, probe_name="hermes-acp", ident_required=True)
+        patch = mock.patch.object(floors_mod, "FLOORS", table)
+        patch.start()
+        self.addCleanup(patch.stop)
+
     def _refused(self, fn, *a, **kw) -> LaunchRefused:
         with self.assertRaises(LaunchRefused) as cm:
             fn(*a, **kw)
@@ -451,6 +494,7 @@ class NpmHermesBridgeGrantTests(unittest.TestCase):
         F.make("hermes", "hermes 0.9.1", where=bindir)
         os.symlink(F.make("hermes-acp-native", "hermes-acp 0.9.1", where=os.path.join(root, "bin")),
                    os.path.join(bindir, "hermes-acp"))
+        self._probed_hermes()
         r = self._refused(grant, "hermes", os.path.join(bindir, "hermes"), probe=self._no_probe)
         self.assertIn("hermes-acp", r.detail)
         with mock.patch("recursion_core.launch_check.grant.run_version_probe", side_effect=self._no_probe) as run:
@@ -467,6 +511,7 @@ class NpmHermesBridgeGrantTests(unittest.TestCase):
         os.makedirs(bindir)
         F.make("hermes", "hermes 0.9.1", where=bindir)
         F.make("hermes-acp", "hermes-acp 0.9.1", where=bindir)
+        self._probed_hermes()
         g = grant("hermes", os.path.join(bindir, "hermes"), probe=F.probe)
         plan = launch_plan(g, ["hermes", "acp"])
         with open(os.path.join(prefix, "package.json"), "w") as f:
@@ -494,6 +539,7 @@ class NpmHermesBridgeGrantTests(unittest.TestCase):
         F.make("hermes-acp", "hermes-acp 0.9.1", where=src)
         link = os.path.join(prefix, "link")
         os.symlink(src, link)
+        self._probed_hermes()
         g = grant("hermes", os.path.join(link, "hermes"), probe=F.probe)
         verify(g)
         nm = os.path.join(prefix, "node_modules")
@@ -514,15 +560,169 @@ class NpmHermesBridgeGrantTests(unittest.TestCase):
 
 
 @unittest.skipUnless(os.name == "posix", "POSIX fixtures")
+class NpmHermesBridgePinnedTests(unittest.TestCase):
+    """B27 (CSL-772) on the pinned Hermes route (CSL-732): the bridge is refused before any hash or pin lookup.
+
+    Fake installs measured in place into a patched pin table; Windows is simulated through
+    ``binary.is_windows()``. No pin here is real.
+    """
+
+    LAUNCHERS = ("hermes", "hermes.cmd", "hermes.ps1")
+
+    def _no_probe(self, *a: object) -> None:
+        self.fail("the version probe ran on the npm hermes-agent bridge")
+
+    def _refused(self, fn, *a, **kw) -> LaunchRefused:
+        with self.assertRaises(LaunchRefused) as cm:
+            fn(*a, **kw)
+        self.assertEqual("wrapper_refused", cm.exception.code, cm.exception)
+        self.assertIn("npm hermes-agent bridge", cm.exception.detail)
+        return cm.exception
+
+    @staticmethod
+    def _windows():
+        return mock.patch.object(binary_mod, "is_windows", return_value=True)
+
+    @staticmethod
+    def _pin(path: str, target: str, entry: tuple[str, ...] = ()) -> pins_mod.Pin:
+        return pins_mod.measure(
+            "hermes", "launcher+tree", path, target, version="0.9.1", platform="test", measured="2026-11-10",
+            source="fake install built by test_floors_detect.py", entry=entry,
+        )
+
+    @staticmethod
+    def _table(*pins: pins_mod.Pin):
+        return mock.patch.object(pins_mod, "PINS", tuple(pins))
+
+    @staticmethod
+    def _bridge_root() -> tuple[str, str]:
+        prefix = F.dir()
+        root = os.path.join(prefix, "lib", "node_modules", "hermes-agent")
+        os.makedirs(os.path.join(root, "bin"))
+        os.makedirs(os.path.join(prefix, "bin"))
+        return prefix, root
+
+    @staticmethod
+    def _install(package: str, launcher: str = "hermes") -> tuple[str, str]:
+        """A script ``<prefix>/bin/<launcher>`` in front of the tree ``<prefix>/lib/<package>``; returns launcher, prefix."""
+        prefix = F.dir()
+        root = os.path.join(prefix, "lib", *package.split("/"))
+        os.makedirs(root)
+        F.script(os.path.join(root, "cli.js"), "#!/usr/bin/env node\n")
+        F.make("node.exe", "v22.0.0", where=root)
+        os.makedirs(os.path.join(prefix, "bin"))
+        return F.script(os.path.join(prefix, "bin", launcher), "#!/bin/sh\n"), prefix
+
+    def test_pinned_grant_refuses_the_bridge_before_hashing_or_pin_lookup(self) -> None:
+        # Even a pin that matches the bridge byte for byte does not get it granted.
+        for launcher in self.LAUNCHERS:
+            with self.subTest(launcher=launcher):
+                _prefix, root = self._bridge_root()
+                path = F.script(os.path.join(root, "bin", launcher), "#!/usr/bin/env node\n")
+                pin = self._pin(path, "..")
+                with self._windows(), self._table(pin), \
+                        mock.patch("recursion_core.launch_check.grant.sha256_file") as hashed, \
+                        mock.patch.object(pins_mod, "match") as matched:
+                    self._refused(grant, "hermes", path, probe=self._no_probe)
+                hashed.assert_not_called()
+                matched.assert_not_called()
+
+    def test_pinned_grant_refuses_a_launcher_linked_into_the_bridge(self) -> None:
+        # bin/hermes, bin/hermes.cmd or bin/hermes.ps1 outside the tree, each a link into it.
+        for launcher in self.LAUNCHERS:
+            with self.subTest(launcher=launcher):
+                prefix, root = self._bridge_root()
+                js = F.script(os.path.join(root, "bin", "hermes.js"), "#!/usr/bin/env node\n")
+                path = os.path.join(prefix, "bin", launcher)
+                os.symlink(js, path)
+                with self._windows(), self._table(self._pin(path, "..")), \
+                        mock.patch("recursion_core.launch_check.grant.sha256_file") as hashed:
+                    self._refused(grant, "hermes", path, probe=self._no_probe)
+                    found = detect("hermes", os.path.dirname(path))
+                hashed.assert_not_called()
+                self.assertEqual([path], [h.path for h in found.hits])
+                self.assertIsNone(found.candidate)
+                self.assertIn("npm hermes-agent bridge", found.note)
+
+    def test_pinned_route_detection_names_the_bridge_and_offers_nothing(self) -> None:
+        self.assertIsNotNone(FLOORS["hermes"].pin)
+        bindir, _src, _nm = NpmHermesBridgeTests._linked_bridge()
+        found = detect("hermes", bindir)
+        self.assertIsNone(found.candidate)
+        self.assertIn("npm hermes-agent bridge", found.note)
+        self.assertIn("fail closed", found.note)
+        _grants, records = launch_check(bindir, probe=self._no_probe)
+        rec = next(r for r in records if r["engine"] == "hermes")
+        self.assertEqual(("refused", "wrapper_refused"), (rec["outcome"], rec["refusal"]))
+
+    def test_a_pinned_hermes_outside_the_bridge_is_still_offered_and_granted(self) -> None:
+        path, _prefix = self._install("hermes_agent")
+        with self._table(self._pin(path, "../lib/hermes_agent")):
+            found = detect("hermes", os.path.dirname(path))
+            self.assertEqual(path, found.candidate)
+            g = grant("hermes", path, probe=self._no_probe)
+            verify(g)
+        self.assertEqual("launcher+tree", g.pin_kind)
+
+    def test_pinned_tree_in_the_bridge_is_refused_behind_a_launcher_outside_it(self) -> None:
+        # The launcher is outside the bridge; the tree its pin names (what a check-only launch executes) is in it.
+        for launcher in self.LAUNCHERS:
+            with self.subTest(launcher=launcher):
+                path, _prefix = self._install("node_modules/hermes-agent", launcher)
+                pin = self._pin(path, "../lib/node_modules/hermes-agent", ("node.exe", "cli.js"))
+                with self._windows(), self._table(pin):
+                    r = self._refused(grant, "hermes", path, probe=self._no_probe)
+                self.assertIn("pinned target", r.detail)
+
+    def test_verify_refuses_a_pinned_grant_whose_launcher_became_the_bridge(self) -> None:
+        # package.json lands in bin/, outside the pinned tree: every digest still matches the grant.
+        for launcher in self.LAUNCHERS:
+            with self.subTest(launcher=launcher):
+                path, prefix = self._install("hermes_agent", launcher)
+                with self._windows(), self._table(self._pin(path, "../lib/hermes_agent", ("node.exe", "cli.js"))):
+                    g = grant("hermes", path, probe=self._no_probe)
+                    self.assertTrue(g.check_only)
+                    plan = launch_plan(g, ["hermes"], {})
+                    plan.exec_argv()
+                    with open(os.path.join(prefix, "bin", "package.json"), "w") as f:
+                        f.write('{"name": "hermes-agent"}')
+                    with mock.patch("recursion_core.launch_check.grant.sha256_file") as hashed:
+                        self._refused(verify, g)
+                        self._refused(plan.exec_argv)
+                    hashed.assert_not_called()
+
+    def test_verify_refuses_a_pinned_grant_whose_tree_became_the_bridge(self) -> None:
+        # package.json lands above the pinned tree, outside it and not above the launcher.
+        path, prefix = self._install("hermes_agent", "hermes.cmd")
+        with self._windows(), self._table(self._pin(path, "../lib/hermes_agent", ("node.exe", "cli.js"))):
+            g = grant("hermes", path, probe=self._no_probe)
+            plan = launch_plan(g, ["hermes"], {})
+            with open(os.path.join(prefix, "lib", "package.json"), "w") as f:
+                f.write('{"name": "hermes-agent"}')
+            with mock.patch.object(pins_mod, "target_sha256") as hashed:
+                r = self._refused(verify, g)
+                self._refused(plan.exec_argv)
+            hashed.assert_not_called()
+        self.assertIn("pinned target", r.detail)
+
+    def test_other_pinned_routes_are_not_judged_by_the_hermes_bridge_rule(self) -> None:
+        _prefix, root = self._bridge_root()
+        path = F.script(os.path.join(root, "bin", "pi"), "#!/usr/bin/env node\n")
+        pin = dataclasses.replace(self._pin(path, ".."), engine="pi")
+        with self._table(pin):
+            self.assertEqual(path, grant("pi", path, probe=self._no_probe).path)
+
+
+@unittest.skipUnless(os.name == "posix", "POSIX fixtures")
 class LaunchCheckTests(unittest.TestCase):
     def test_one_record_per_engine_and_grants_only_when_clean(self) -> None:
         d = F.dir()
         F.make("claude", "2.1.318 (Claude Code)", where=d)
         F.make("codex", "codex-cli 0.160.0", where=d)
         F.make("opencode", "opencode v2.2.5", where=d)
-        F.make("gemini", "0.38.0", where=d)
+        F.make("gemini", "0.39.1", where=d)  # a leftover Gemini CLI: not an engine, never granted
         F.script(os.path.join(d, "agent"), "#!/bin/sh\nexec node index.js \"$@\"\n")
-        F.make("pi", "0.30.2", where=d)  # a native `pi` is not Pi (F3): identity_unverified
+        F.make("pi", "0.30.2", where=d)  # a native `pi` is not Pi (F3): no pin matches it
         grants, records = launch_check(d, probe=F.probe)
         by = {r["engine"]: r for r in records}
         self.assertEqual(set(FLOORS), set(by))
@@ -533,9 +733,11 @@ class LaunchCheckTests(unittest.TestCase):
         self.assertTrue(by["codex"]["beta"])
         self.assertEqual("granted", by["opencode"]["outcome"])
         self.assertTrue(by["opencode"]["beta"])
-        self.assertEqual("version_refused", by["gemini"]["refusal"])
-        self.assertEqual("wrapper_refused", by["cursor"]["refusal"])
-        self.assertEqual("identity_unverified", by["pi"]["refusal"])
+        self.assertNotIn("gemini", by)
+        self.assertNotIn("gemini", grants)
+        self.assertFalse([r for r in records if any(os.path.basename(h) == "gemini" for h in r.get("hits", ()))])
+        self.assertEqual("pin_mismatch", by["cursor"]["refusal"])
+        self.assertEqual("pin_mismatch", by["pi"]["refusal"])
         for engine in ("grok", "antigravity", "hermes"):
             self.assertEqual("absent", by[engine]["outcome"])
         for r in records:

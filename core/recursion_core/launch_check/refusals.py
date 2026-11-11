@@ -7,7 +7,17 @@ error: the only way out of a failed check is this exception.
 
 from __future__ import annotations
 
-REFUSAL_CODES_VERSION = "r2a-refusals/1.2.0-candidate-2026-11-09"
+# 1.7.0: 21 codes; adds interpreter_unpinned. A launch on a pin whose launcher starts an interpreter
+# from outside the pinned tree is refused (Lucas, 2026-11-10: "A Windows Pi launch whose interpreter
+# (Node from PATH) is outside the pinned tree must refuse with a new typed code
+# `interpreter_unpinned`."). The check-only rule now also covers a bare or .exe path that resolves
+# to a script.
+# 1.6.0: 20 codes; adds pin_entry_unset. A pinned route's Windows .cmd/.ps1 launcher is a check
+# only and is never executed (Lucas, 2026-11-10: "accept a pinned .cmd/.ps1 launcher as a check,
+# but execute the pinned entry directly"); with no entry in the pin, the launch is refused.
+# 1.5.0: the same 19 codes as 1.4.0; a Windows .cmd/.ps1 launcher on a pinned route moves from
+# wrapper_refused to the pin check (pin_mismatch unless pinned).
+REFUSAL_CODES_VERSION = "r2a-refusals/1.7.0-candidate-2026-11-10"
 
 # Closed set. Adding, removing or renaming a code is a new REFUSAL_CODES_VERSION.
 REFUSAL_CODES = frozenset(
@@ -15,13 +25,22 @@ REFUSAL_CODES = frozenset(
         "engine_unknown",  # engine id not in the floor table (detected allow-list)
         "path_not_absolute",  # grant path is relative
         "binary_missing",  # path, target or probe binary absent or unspawnable
-        "wrapper_refused",  # script, shim, interpreter or non-native file
+        # script, shim, interpreter or non-native file (not a pinned route's Windows .cmd/.ps1 launcher)
+        "wrapper_refused",
         "name_mismatch",  # file stem is not one of the engine's binary names
         "version_probe_failed",  # --version exited non-zero, timed out or flooded
         "binary_changed",  # digest or resolution differs from the grant
         "engine_mismatch",  # version line names another engine
         "identity_mismatch",  # version line does not name an engine whose real line names it
         "identity_unverified",  # engine has no identity rule or pinned digest (refused before probing)
+        # pinned route: launcher (on Windows also <name>.cmd/.ps1), package files or binary match no
+        # recorded pin (until re-pinned); an archive-sourced pin or a bad pin entry is never matched
+        "pin_mismatch",
+        # pinned script launcher (.cmd/.ps1, or a bare or .exe name that resolves to one) accepted as a
+        # check, but its pin records no entry to execute
+        "pin_entry_unset",
+        # the pin records an interpreter outside the pinned tree (Pi's Node from PATH); it is not hashed
+        "interpreter_unpinned",
         "version_unparsed",  # version token does not match the engine's format
         "floor_unset",  # a floor in the table does not parse
         "version_refused",  # below a floor, or a prerelease

@@ -43,7 +43,12 @@ replacement. It builds the child environment from nothing:
   ``64:ff9b::/96`` or ``::/96``), count as ``*`` on any route (``no_proxy_wildcard``). An entry with a ``/``
   that is no CIDR block with a plain decimal prefix length, with a second ``/``, or with a ``%``, refuses on
   any route (``no_proxy_unparseable``). No ``NO_PROXY`` refusal shows any text of an entry: it names the
-  variable, the entry's position in it and the reason;
+  variable, the entry's position in it and the reason. Each entry is also read the looser ways real client
+  matchers read it (Devin rt343 MEDIUM-2; PRODUCT.md d84cdd26 / CSLR-D-012, section 3.4 row S8 and section 11.5
+  on the child environment and N5i's ``NO_PROXY`` rule), and any one of those readings refuses: ``*.host`` is
+  ``host`` too (undici), U+FEFF is whitespace (undici, Node), spaces inside an entry are deleted (requests),
+  ``a-b`` is an IPv4 range (Node), and names are folded as IDNA would (Go). An entry that cannot be folded
+  with confidence refuses as ``no_proxy_unparseable`` (``_no_proxy_readings``);
 * one change beyond N5h/N5i: links are resolved one component at a time and every
   link met on the way, including links inside a link's target, must be root's or
   ours in a directory chain no one else can write, and no step may enter ``/proc``,
@@ -69,6 +74,7 @@ import shutil
 import stat
 import tempfile
 import threading
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -406,8 +412,8 @@ def build_child_env(
         base = route_env.get(profile.base_url_name) if profile.base_url_name else None
         if base is not None and not _loopback_host(host := _BASE_URL.match(base)["host"]):
             for name in [name for name in NO_PROXY_NAMES if name in env]:
-                if (position := _no_proxy_route_bypass(env[name], host)) is not None:
-                    raise _no_proxy_refused(name, position, "no_proxy_route_host", "matches the route's base URL host")
+                if (found := _no_proxy_route_bypass(env[name], host)) is not None:
+                    raise _no_proxy_refused(name, *found)
     # N5h option A: a temp name is replaced by one private route temp root, never checked or passed.
     present = [name for name in TEMP_NAMES if name in env]
     if present:
@@ -685,7 +691,148 @@ def _no_proxy_entries(value: str) -> list[str]:
     comma has an empty first entry, which counts (``,a%b`` is entry 2).
     """
 
-    return [re.sub(r"^[a-z][a-z0-9+.-]*://", "", entry) for entry in re.split(r"[,\s]+", value.strip().lower())]
+    low, spans = _no_proxy_spans(value)
+    return [_SCHEME_PREFIX.sub("", low[start:end]) for start, end in spans]
+
+
+_SCHEME_PREFIX = re.compile(r"^[a-z][a-z0-9+.-]*://")
+_SEPARATORS = re.compile(r"[,\s]+")
+# Python's whitespace (str.isspace) and JavaScript's (\s, String.prototype.trim): the same set but U+FEFF, which
+# only JavaScript counts, and U+001C-U+001F and U+0085, which only Python does. Spelled out so str.strip is linear.
+_SPACES = ("\t\n\x0b\x0c\r\x1c\x1d\x1e\x1f \x85\xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008"
+           "\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
+# Default_Ignorable_Code_Point (Unicode DerivedCoreProperties). UTS 46 maps the ones it allows to nothing, so Go's
+# idna drops them (U+00AD, U+200B, U+FEFF); it disallows the rest, and dropping those too only refuses more.
+_IGNORABLE = re.compile("[\xad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u202a-\u202e"
+                        "\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufff8\U0001bca0-\U0001bca3"
+                        "\U0001d173-\U0001d17a\U000e0000-\U000e0fff]")
+# UTS 46 maps these full stops to "."; NFKC maps only U+FF0E there, and U+FF61 to U+3002.
+_FULL_STOPS = str.maketrans("\u3002\uff0e\uff61", "...")
+
+
+def _no_proxy_spans(value: str) -> tuple[str, list[tuple[int, int]]]:
+    """The value stripped and lowercased, and where each ``_no_proxy_entries`` entry is in it (scheme still on)."""
+
+    low, spans, start = value.strip().lower(), [], 0
+    for separator in _SEPARATORS.finditer(low):
+        spans.append((start, separator.start()))
+        start = separator.end()
+    spans.append((start, len(low)))
+    return low, spans
+
+
+def _idna_fold(text: str, case=str.casefold) -> str | None:
+    """A name mapped as UTS 46 maps it for Go's ``idna.Lookup``, or more widely; None when it is not certain.
+
+    The UTS 46 mapping is close to NFKC_Casefold: NFKC, full case folding and default ignorables removed, with
+    U+3002, U+FF0E and U+FF61 mapped to ".". This applies those, stdlib only, until the text stops changing.
+    Folding a sharp s (U+00DF) to ``ss`` (transitional) and dropping ZWJ (rejected by Go in most places) map
+    more names to ASCII than Go does, never fewer; ``case=str.lower`` keeps the sharp s, as Go does. Not
+    certain: a text that still changes after four rounds, or one with a code point this Python's Unicode data
+    does not assign (Go's tables can be newer, and map some of those to ASCII: U+1CCD6 is ``a`` there).
+    """
+
+    if any(unicodedata.category(char) == "Cn" for char in text):
+        return None
+    for _ in range(4):
+        folded = case(unicodedata.normalize("NFKC", text.translate(_FULL_STOPS)))
+        folded = _IGNORABLE.sub("", folded).translate(_FULL_STOPS)
+        if folded == text:
+            return text
+        text = folded
+    return None
+
+
+def _ipv4_range(text: str) -> tuple[int, int] | None:
+    """Node's built-in matcher reads ``a-b`` as the IPv4 range from ``a`` to ``b``: both ends in, as integers.
+
+    As ``ProxyConfig.shouldUseProxy`` does: split on ``-``, take the first two parts, trim each and require a
+    dotted-decimal IPv4 address in both (``net.isIPv4``; ``ipaddress`` takes the same spelling). An empty range
+    (``a`` after ``b``) holds nothing.
+    """
+
+    first, dash, rest = text.partition("-")
+    if not dash:
+        return None
+    try:
+        start, end = (int(ipaddress.IPv4Address(part.strip(_SPACES))) for part in (first, rest.partition("-")[0]))
+    except ValueError:
+        return None
+    return (start, end) if start <= end else None
+
+
+@dataclass
+class _Readings:
+    """One entry of ``_no_proxy_entries`` and the other ways client matchers read it (``_no_proxy_readings``)."""
+
+    checked: list[str]  # the entry, then the pieces of its IDNA fold: the "%" and "/" rules apply to these
+    matched: list[str] = field(default_factory=list)  # matched by name or address only, with no "*" patterns
+    joined: list[str] = field(default_factory=list)  # comma items with their spaces deleted, as requests reads them
+    ranges: list[tuple[int, int]] = field(default_factory=list)  # IPv4 ranges, (first, last)
+    foreign: bool = False  # a folded piece is still not ASCII: Go would send it as punycode
+    unfolded: bool = False  # the fold did not settle
+
+
+def _no_proxy_readings(value: str) -> list[_Readings]:
+    """Devin rt343 MEDIUM-2: each entry of ``_no_proxy_entries(value)``, in order, read every way a client reads it.
+
+    Real matchers normalise entries more loosely than the split here, so an entry refuses when any one of these
+    readings refuses (PRODUCT.md d84cdd26 / CSLR-D-012, section 11.5: N5i's per-engine ``NO_PROXY`` rule):
+
+    * Go (``httpproxy`` maps each name through ``idna.Lookup``): the entry folded by ``_idna_fold``, split again
+      where the fold made a separator. Fullwidth letters and dots, U+3002, U+FF61 and U+00AD fold to ASCII. The
+      ``%`` and ``/`` rules apply to the pieces as to the entry. A fold that does not settle is ``unfolded``; a
+      piece still not ASCII is ``foreign``, since Go would compare its punycode, which is not computed here.
+    * undici (splits on JavaScript's ``\\s``) and Node's built-in matcher (trims each comma item): the pieces
+      between U+FEFF characters, the one JavaScript space Python's ``\\s`` lacks.
+    * undici strips one leading ``*.`` or ``.``: every reading that starts with ``*.`` is also read with its
+      leading run of ``*`` and ``.`` removed, so ``*.host`` names ``host`` itself.
+    * requests (``no_proxy.replace(" ", "").split(",")``): a comma item with spaces inside, joined, on the entry
+      the item starts in (``joined``). It is matched like ``matched``, but only its IPv4 blocks join the cover,
+      since requests reads CIDR for IPv4 only: ``0.0.0.0/1,1 28.0.0.0/1`` is a cover of every IPv4 address, and
+      ``::1 0.0.0.0/0`` stays the cover it was at ``0.0.0.0/0``, not an IPv6 ``::10.0.0.0/0`` one entry earlier.
+    * Node's built-in matcher: an ``a-b`` IPv4 range (``_ipv4_range``), read from the entry and from the trimmed
+      comma item, on the entry the item starts in.
+
+    Only the entry itself is matched as a ``*`` pattern: no client that reads the other forms has patterns, and
+    a ``*`` left in one names no host, so the extra matching stays linear in the value's length.
+    """
+
+    low, spans = _no_proxy_spans(value)
+    readings = []
+    for start, end in spans:
+        entry = _SCHEME_PREFIX.sub("", low[start:end])
+        reading = _Readings([entry])
+        if not entry.isascii():
+            folded = _idna_fold(entry)
+            if folded is None:
+                reading.unfolded = True
+            else:
+                # Not ASCII, or ASCII only by folding a sharp s (U+00DF) that Go keeps and sends as punycode.
+                reading.foreign = not folded.isascii() or not (_idna_fold(entry, str.lower) or "").isascii()
+                if folded != entry:
+                    reading.checked += [_SCHEME_PREFIX.sub("", piece) for piece in _SEPARATORS.split(folded.strip())]
+            if "\ufeff" in entry:
+                reading.matched += [_SCHEME_PREFIX.sub("", piece) for piece in entry.split("\ufeff")]
+        if (span := _ipv4_range(entry)) is not None:
+            reading.ranges.append(span)
+        readings.append(reading)
+    index = offset = 0
+    for item in low.split(","):
+        stripped, begin = item.strip(), offset + len(item) - len(item.lstrip())
+        offset += len(item) + 1
+        if not stripped:
+            continue
+        while index + 1 < len(spans) and spans[index + 1][0] <= begin:  # the entry the item starts in
+            index += 1
+        reading = readings[index]
+        if " " in stripped and "*" not in (joined := stripped.replace(" ", "")):
+            reading.joined.append(_SCHEME_PREFIX.sub("", joined))
+        if (span := _ipv4_range(item)) is not None:
+            reading.ranges.append(span)
+    for reading in readings:
+        reading.matched += [text.lstrip("*.") for text in reading.checked + reading.matched if text.startswith("*.")]
+    return readings
 
 
 def _no_proxy_refused(name: str, position: int, cause: str, reason: str) -> EnvRefused:
@@ -710,8 +857,20 @@ def _no_proxy_hit(entry: str, hosts: tuple[str, ...]) -> bool:
 
     if "*" in entry:
         return any(_star_match(entry, host) for host in hosts)
+    return _name_hit(entry, hosts)
+
+
+def _name_hit(entry: str, hosts: tuple[str, ...]) -> bool:
+    """Whether a name, read with no ``*`` patterns, is one of the hosts or a parent domain of one."""
+
     bare = entry.lstrip(".")
     return any(host == bare or host.endswith("." + bare) for host in hosts)
+
+
+def _idna_hosts(hosts: tuple[str, ...]) -> bool:
+    """Whether a host has a punycode (``xn--``) label, the only kind a ``foreign`` reading could match in Go."""
+
+    return any(label.startswith("xn--") for host in hosts for label in host.split("."))
 
 
 def _star_match(pattern: str, text: str) -> bool:
@@ -765,38 +924,62 @@ def _no_proxy_bypass(lists: list[tuple[str, str]], hosts: tuple[str, ...]) -> En
     block ``_no_proxy_ip`` reads (``0/0``, ``10.0.0.0/33``, ``10.0.0.0/255.0.0.0``, ``example.com/``, a second
     ``/`` as in ``10.1.2.3:8080/path/8``, a ``:port`` that is no port as in ``1.2.3.4:x/8``). The ``%`` check
     comes before the ``/`` check, so ``user:pw%40host/`` takes the ``%`` reason.
+
+    MEDIUM-2: each entry is judged by all its ``_no_proxy_readings``, and each rule above refuses when any reading
+    meets it, in the same order (the ``%`` and ``/`` rules on the entry and its IDNA fold). The cover takes the
+    blocks and IPv4 ranges of every reading. A fold that does not settle refuses as unparseable after the ``/``
+    rule; a fold still not ASCII refuses so only when a host has an ``xn--`` label, after the host rule.
     """
 
-    where = [(name, position) for name, value in lists for position, _ in enumerate(_no_proxy_entries(value), 1)]
-    entries = [entry for _, value in lists for entry in _no_proxy_entries(value)]
+    where, readings = [], []
+    for name, value in lists:
+        for position, reading in enumerate(_no_proxy_readings(value), 1):
+            where.append((name, position))
+            readings.append(reading)
+    blocks = [[ip for ip in map(_no_proxy_ip, reading.checked + reading.matched) if ip is not None]
+              + [ip for ip in map(_no_proxy_ip, reading.joined) if ip is not None and ip.version == 4]
+              for reading in readings]
+
+    def covered(count: int) -> bool:
+        return _covers_every_address([ip for ips in blocks[:count] for ip in ips],
+                                     [span for reading in readings[:count] for span in reading.ranges])
+
     # The cover only grows with each entry, so the entry that completes it is found by halving the list.
-    completing, last = -1, len(entries) - 1
-    if _all_address_blocks(entries):
+    completing, last = -1, len(readings) - 1
+    if covered(len(readings)):
         completing = 0
         while completing < last:
             middle = (completing + last) // 2
-            if _all_address_blocks(entries[:middle + 1]):
+            if covered(middle + 1):
                 last = middle
             else:
                 completing = middle + 1
-    for index, raw in enumerate(entries):
+    for index, reading in enumerate(readings):
         name, position = where[index]
-        if "%" in raw:
-            return _no_proxy_refused(name, position, "no_proxy_unparseable", "is unparseable: a '%' (zone id or percent "
-                                     "escape) isn't allowed in a NO_PROXY entry")
-        if "/" in raw and _no_proxy_ip(raw) is None:
-            return _no_proxy_refused(name, position, "no_proxy_unparseable", "is unparseable: a path, a second '/', or a "
-                                     "prefix length that isn't plain decimal isn't allowed in a NO_PROXY entry")
-        entry = _no_proxy_name(raw)
-        if not entry:
-            continue
-        if entry.strip("*.") == "":
+        for raw in reading.checked:
+            if "%" in raw:
+                return _no_proxy_refused(name, position, "no_proxy_unparseable", "is unparseable: a '%' (zone id or "
+                                         "percent escape) isn't allowed in a NO_PROXY entry")
+            if "/" in raw and _no_proxy_ip(raw) is None:
+                return _no_proxy_refused(name, position, "no_proxy_unparseable", "is unparseable: a path, a second '/', "
+                                         "or a prefix length that isn't plain decimal isn't allowed in a NO_PROXY entry")
+        if reading.unfolded:
+            return _no_proxy_refused(name, position, "no_proxy_unparseable", _UNFOLDED_WHY)
+        entry, *others = map(_no_proxy_name, reading.checked + reading.matched + reading.joined)
+        if any(text and text.strip("*.") == "" for text in (entry, *others)):
             return _no_proxy_refused(name, position, "no_proxy_wildcard", "matches every host")
         if index == completing:
-            return _no_proxy_refused(name, position, "no_proxy_wildcard", "completes a CIDR cover of every IPv4 address")
-        if _no_proxy_hit(entry, hosts):
+            return _no_proxy_refused(name, position, "no_proxy_wildcard", "completes a cover of every IPv4 address"
+                                     if reading.ranges else "completes a CIDR cover of every IPv4 address")
+        if (entry and _no_proxy_hit(entry, hosts)) or any(text and _name_hit(text, hosts) for text in others):
             return _no_proxy_refused(name, position, "no_proxy_engine_host", "matches one of the engine's own hosts")
+        if reading.foreign and _idna_hosts(hosts):
+            return _no_proxy_refused(name, position, "no_proxy_unparseable", _FOREIGN_WHY)
     return None
+
+
+_UNFOLDED_WHY = "is unparseable: its characters don't fold to a host name with confidence"
+_FOREIGN_WHY = "is unparseable: a name that is not ASCII after folding can't be compared with a punycode (xn--) host"
 
 
 def _ip_forms(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> set:
@@ -894,7 +1077,7 @@ _IPV4_MAPPING_BLOCKS = (ipaddress.IPv6Network("::ffff:0:0/96"), ipaddress.IPv6Ne
                         ipaddress.IPv6Network("::/96"))
 
 
-def _all_address_blocks(entries: list[str]) -> bool:
+def _all_address_blocks(entries: list[str], ranges=()) -> bool:
     """Whether the CIDR blocks among these entries skip the proxy for every IPv4 address, as ``*`` does (CSL-839).
 
     That is one block, or the union of the blocks, covering all of ``0.0.0.0/0`` (``0.0.0.0/0``, ``10.0.0.0/0``,
@@ -902,17 +1085,31 @@ def _all_address_blocks(entries: list[str]) -> bool:
     ``::/0``, ``64:ff9b::/97,64:ff9b::8000:0/97``): a matcher that reads IPv4 through such a block (Go, undici, a
     NAT64 path) would skip the proxy for every IPv4 host. A bare address joins the union as its single-address
     block. The two families are not mixed, and blocks that leave a gap (``0.0.0.0/1``, ``0.0.0.0/1,192.0.0.0/2``,
-    ``2000::/3``, ``::ffff:0:0/97``) are not a cover. The shapes are ``_no_proxy_ip``'s.
+    ``2000::/3``, ``::ffff:0:0/97``) are not a cover. The shapes are ``_no_proxy_ip``'s. ``ranges`` are IPv4
+    ranges (``_ipv4_range``, MEDIUM-2) that join the IPv4 union.
     """
 
-    parsed = [ip for ip in map(_no_proxy_ip, entries) if ip is not None]
+    return _covers_every_address([ip for ip in map(_no_proxy_ip, entries) if ip is not None], ranges)
+
+
+def _covers_every_address(parsed: list, ranges=()) -> bool:
+    """``_all_address_blocks`` over parsed addresses and blocks and IPv4 ``(first, last)`` ranges.
+
+    The IPv4 union is swept as sorted integer intervals, so many ranges cost n log n, not a block per range.
+    """
+
     blocks = [ip if isinstance(ip, _NETWORKS) else ipaddress.ip_network(ip) for ip in parsed]
-    for targets in ((_ALL_IPV4,), _IPV4_MAPPING_BLOCKS):
-        # collapse_addresses only merges blocks into larger ones, so a full cover of a target is one merged block.
-        merged = list(ipaddress.collapse_addresses(block for block in blocks if block.version == targets[0].version))
-        if any(block.supernet_of(target) for block in merged for target in targets):
-            return True
-    return False
+    spans = sorted([(int(block[0]), int(block[-1])) for block in blocks if block.version == 4] + list(ranges))
+    reach = -1  # every IPv4 address up to here is covered
+    for first, last in spans:
+        if first > reach + 1:
+            break
+        reach = max(reach, last)
+    if reach >= int(_ALL_IPV4[-1]):
+        return True
+    # collapse_addresses only merges blocks into larger ones, so a full cover of a target is one merged block.
+    merged = list(ipaddress.collapse_addresses(block for block in blocks if block.version == 6))
+    return any(block.supernet_of(target) for block in merged for target in _IPV4_MAPPING_BLOCKS)
 
 
 def _no_proxy_ip_hit(entry: str, addresses: set) -> bool | None:
@@ -929,8 +1126,8 @@ def _no_proxy_ip_hit(entry: str, addresses: set) -> bool | None:
     return bool(_ip_forms(parsed) & addresses)
 
 
-def _no_proxy_route_bypass(value: str, host: str) -> int | None:
-    """CSL-839: the position, from 1, of the first NO_PROXY entry that matches the route's base URL host, or None.
+def _no_proxy_route_bypass(value: str, host: str) -> tuple[int, str, str] | None:
+    """CSL-839: the first NO_PROXY entry that matches the route's base URL host, by position from 1, or None.
 
     The same matcher as ``_no_proxy_bypass``, over the one host: the host itself, a parent domain with or
     without the leading dot, a ``*`` pattern, with scheme, brackets, ``:port`` and trailing dot stripped from
@@ -942,17 +1139,29 @@ def _no_proxy_route_bypass(value: str, host: str) -> int | None:
     turn ``::1:0`` into ``::1``. A loopback host never gets here: ``build_child_env`` exempts it
     (``_loopback_host``). Neither does an all-address cover, a ``/`` entry that is no CIDR block or a ``%``
     entry: ``_no_proxy_bypass`` refused those first.
+
+    MEDIUM-2: every reading of an entry (``_no_proxy_readings``) is matched the same way, the entry itself as a
+    ``*`` pattern and the others by name or address only, and an IPv4 range that holds the host is a hit. The
+    result is ``(position, cause, reason)`` for ``_no_proxy_refused``: ``no_proxy_route_host`` for a hit, or
+    ``no_proxy_unparseable`` for an entry still not ASCII after folding when the host has an ``xn--`` label.
     """
 
     host = host.lower().strip("[]").rstrip(".")
     addresses = _host_addresses(host)
-    for position, entry in enumerate(_no_proxy_entries(value), 1):
-        hit = _no_proxy_ip_hit(entry, addresses)
-        if hit is None:
-            entry = _no_proxy_name(entry)
-            hit = bool(entry) and entry.strip("*.") != "" and _no_proxy_hit(entry, (host,))
-        if hit:
-            return position
+    v4 = [int(address) for address in addresses if address.version == 4]
+    for position, reading in enumerate(_no_proxy_readings(value), 1):
+        for index, entry in enumerate(reading.checked + reading.matched + reading.joined):
+            hit = _no_proxy_ip_hit(entry, addresses)
+            if hit is None:
+                entry = _no_proxy_name(entry)
+                matcher = _no_proxy_hit if index == 0 else _name_hit  # only the entry itself is a "*" pattern
+                hit = bool(entry) and entry.strip("*.") != "" and matcher(entry, (host,))
+            if hit:
+                return position, "no_proxy_route_host", "matches the route's base URL host"
+        if any(first <= address <= last for first, last in reading.ranges for address in v4):
+            return position, "no_proxy_route_host", "matches the route's base URL host"
+        if reading.foreign and _idna_hosts((host,)):
+            return position, "no_proxy_unparseable", _FOREIGN_WHY
     return None
 
 

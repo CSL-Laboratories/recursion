@@ -108,8 +108,9 @@ Foundry switches are dropped. The child gets one only from the route:
   `::1/128` covers `::1`), including a requests shorthand (`10.0/8` via `socket.inet_aton`),
   a permissive prefix (`10.0.0.0/+8`, `10.0.0.0/\t8` from requests, `10.0.0.0/8x` from curl;
   curl also ignores whatever follows those digits, so `10.0.0.0/8/foo` and `10.0.0.0/8/24` are `/8`;
-  leading zeros do not change the value, so `10.0.0.0/00008/foo` is `/8`. A zero with junk
-  after it is not a prefix: `10.0.0.0/0x8/foo` is not `/0`),
+  leading zeros do not change the value, so `10.0.0.0/00008/foo` is `/8`. requests' `int()`
+  of the whole suffix is also read, so `10.0.0.0/0_8`, `10.0.0.0/+0_8` and a fullwidth `8`
+  are `/8`. A zero with junk that `int()` rejects is not a prefix: `10.0.0.0/0x8/foo` is not `/0`),
   the IPv4 address inside `[::ffff:10.1.2.3]`, and an IPv4-mapped CIDR compared as IPv4
   (Go: `::ffff:10.0.0.0/104` is `10.0.0.0/8`, `::ffff:0:0/96` is every IPv4). `::/0` stays IPv6.
   A prefix of 0 covers that whole address family (`0.0.0.0/0`, `::/0`); a bare `/0` covers every
@@ -117,11 +118,13 @@ Foundry switches are dropped. The child gets one only from the route:
   raising (`10/²`, a thousands-digit mask) refuses with `no_proxy_malformed`. A NUL in the value
   refuses with `value_malformed`. A bracketed IPv6 entry (`[::1]`) is that address. IDNA2003 and
   IDNA2008 spellings both match (`bücher.invalid`, `faß.invalid` and `xn--fa-hia.invalid`,
-  `FAẞ.INVALID`, a trailing dot).   Before that, UTS46 mapping is NFKC plus the ignored characters (soft hyphen, ZWSP, word joiner,
-  BOM, variation selectors, U+034F, Mongolian free variation selectors) and the ideographic dots.
-  `ß` stays `ß` and final sigma stays final sigma. `faß。invalid`, `ｆａß.invalid`, `fªß.invalid`
+  `FAẞ.INVALID`, a trailing dot). Before that, names are mapped with the Unicode 15.1.0
+  UTS46 table, nontransitional (deviation characters stay: `ß` stays `ß`, final sigma stays
+  final sigma). Ignored characters include U+180F. Cherokee U+13A0 stays U+13A0 (`xn--58d`);
+  U+1C80 maps to U+0432 (`xn--b1a`). `faß。invalid`, `ｆａß.invalid`, `fªß.invalid`
   and `fa` plus a variation selector match `xn--fa-hia.invalid`. An entry that maps to empty or
-  only dots (`\u00ad`, `。`) refuses. Trailing dots are stripped again after that mapping.
+  only dots (`\u00ad`, `。`, and a literal `.` or `.:443` against a trailing-dot host) refuses.
+  Trailing dots are stripped again after that mapping.
   A leading `*.` is normalised the same way, so `*.bücher.invalid` matches
   `sub.xn--bcher-kva.invalid`. Dropping an ignored character does not turn `.*` into a
   match-all. Final sigma

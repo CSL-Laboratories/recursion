@@ -72,6 +72,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 
+from recursion_core.child_env.uts46 import UTS46_IGNORED, UTS46_MAPPED, UTS46_VALID
+
 __all__ = [
     "BASE_NAMES",
     "ENGINE_PROFILES",
@@ -835,6 +837,12 @@ def _permissive_cidr(entry: str) -> ipaddress.IPv4Network | ipaddress.IPv6Networ
     also ``/8``. A second slash on an IPv6 CIDR is not a curl match. A shorthand address
     (``10.0/8``) is only the single-slash requests reading. Returns ``'bad'`` when the prefix
     of an address cannot be read without raising.
+
+    requests ``is_valid_cidr`` takes ``int()`` of the whole suffix (underscores, an optional
+    sign, Unicode decimal digits) and keeps a mask in 1..32. ``10.0.0.0/0_8``,
+    ``10.0.0.0/+0_8`` and ``10.0.0.0/0`` + U+FF18 are ``/8``. That reading is combined with
+    the curl prefix: either one covering the host refuses. ``10.0.0.0/0x8/foo`` is neither
+    (``int("0x8/foo")`` raises, and a zero followed by junk is not curl's prefix 0).
     """
 
     if "/" not in entry:
@@ -846,31 +854,58 @@ def _permissive_cidr(entry: str) -> ipaddress.IPv4Network | ipaddress.IPv6Networ
     slash_tail = "/" in bits_s
     if slash_tail and ":" in addr:
         return None
-    kind, bits = _prefix_bits(bits_s)
+    kind, curl_bits = _prefix_bits(bits_s)
     literal = _ip_literal(addr)
     shorthand = None if slash_tail else _aton(addr)
-    if kind == "bad":
-        if literal is not None or shorthand is not None:
-            return "bad"
-        return None
-    if kind != "ok" or bits is None:
-        return None
-    if shorthand is not None and bits <= 32:
+    ipv4: ipaddress.IPv4Address | None = None
+    if shorthand is not None:
+        ipv4 = ipaddress.IPv4Address(shorthand)
+    elif isinstance(literal, ipaddress.IPv4Address):
+        ipv4 = literal
+    # requests rejects a second slash and does not parse an IPv6 CIDR here.
+    req_bits = None if slash_tail or ipv4 is None else _requests_ipv4_bits(bits_s)
+    candidates: list[int] = []
+    if kind == "ok" and curl_bits is not None:
+        candidates.append(curl_bits)
+    if req_bits is not None:
+        candidates.append(req_bits)
+    best: ipaddress.IPv4Network | ipaddress.IPv6Network | None = None
+    for bits in candidates:
         try:
-            return ipaddress.IPv4Network((ipaddress.IPv4Address(shorthand), bits), strict=False)
+            if ipv4 is not None and bits <= 32:
+                network: ipaddress.IPv4Network | ipaddress.IPv6Network = ipaddress.IPv4Network((ipv4, bits), strict=False)
+            elif literal is not None and literal.version == 6 and bits <= 128:
+                network = ipaddress.IPv6Network((literal, bits), strict=False)
+            else:
+                continue
         except ValueError:
-            return "bad"
-    if literal is None:
-        return None
-    limit = 32 if literal.version == 4 else 128
-    if bits > limit:
+            continue
+        if best is None or network.prefixlen < best.prefixlen:
+            best = network
+    if best is not None:
+        return best
+    if kind == "bad" and (literal is not None or shorthand is not None):
+        return "bad"
+    return None
+
+
+def _requests_ipv4_bits(text: str) -> int | None:
+    """The mask requests would take from one CIDR suffix, or None.
+
+    ``int(suffix, 10)`` accepts a sign, underscores between digits and Unicode
+    decimal digits. requests then keeps only 1..32. ``0x8`` and ``8/foo`` raise.
+    A mask of 0 is not a requests CIDR (``mask < 1``).
+    """
+
+    if "/" in text or "\0" in text:
         return None
     try:
-        if literal.version == 4:
-            return ipaddress.IPv4Network((literal, bits), strict=False)
-        return ipaddress.IPv6Network((literal, bits), strict=False)
-    except ValueError:
-        return "bad"
+        bits = int(text, 10)
+    except (ValueError, OverflowError):
+        return None
+    if 1 <= bits <= 32:
+        return bits
+    return None
 
 
 def _no_proxy_network(entry: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network | str | None:
@@ -937,56 +972,60 @@ def _no_proxy_entries(value: str) -> tuple[str, ...]:
     return tuple(seen)
 
 
-def _uts46_ignored(char: str) -> bool:
-    """A UTS46 ignored / default-ignorable character. Joiners are kept.
-
-    ZWNJ and ZWJ are IDNA context joiners, not ignored. Combining accents are not
-    in this set. Variation selectors, the grapheme joiner, and Mongolian free
-    variation selectors are ``Mn`` rather than ``Cf``, so they are named here.
-    """
-
-    code = ord(char)
-    if code in (0x034F, 0x061C, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x180E):
-        return True
-    if 0x180B <= code <= 0x180D or 0xFE00 <= code <= 0xFE0F or 0xE0100 <= code <= 0xE01EF:
-        return True
-    if 0xE0001 <= code <= 0xE007F:
-        return True
-    return unicodedata.category(char) == "Cf" and code not in (0x200C, 0x200D)
-
-
-def _uts46_map(text: str) -> str:
-    """UTS46 nontransitional mapping, without a vendored Idna table.
-
-    NFKC folds compatibility characters (``ª``, ``ᵃ``, fullwidth, circled, mathematical
-    letters). Ideographic dots that NFKC leaves in place (U+3002, and U+FF61 which
-    becomes U+3002) become ``.``. Ignored characters are then dropped. ``ß`` is not
-    mapped to ``ss`` and final sigma is not mapped to small sigma: that would be
-    casefold, and Go's lookup profile does neither.
-    """
-
-    mapped: list[str] = []
-    for char in unicodedata.normalize("NFKC", text):
-        if char in "\u3002\uff61":
-            mapped.append(".")
-        elif _uts46_ignored(char):
-            continue
+def _uts46_range_has(ranges: tuple[tuple[int, int], ...], code: int) -> bool:
+    lo, hi = 0, len(ranges) - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        start, end = ranges[mid]
+        if code < start:
+            hi = mid - 1
+        elif code > end:
+            lo = mid + 1
         else:
-            mapped.append(char)
-    return "".join(mapped)
+            return True
+    return False
+
+
+def _uts46_map(text: str) -> str | None:
+    """UTS46 nontransitional map from the Unicode 15.1.0 IdnaMappingTable, then NFC.
+
+    ``ß`` stays ``ß`` and final sigma stays final sigma (deviation, not transitional).
+    U+180F is ignored. Cherokee capitals stay the capital (U+13A0 is ``xn--58d``);
+    U+AB70 maps to that capital. U+1C80 maps to U+0432 (``xn--b1a``). ASCII that
+    STD3 disallows (``*``) is kept, because it is pattern syntax parsed after this
+    map. None means a non-ASCII code point is disallowed or absent from the table:
+    there is no Go lookup form to compare.
+    """
+
+    out: list[str] = []
+    for char in text:
+        code = ord(char)
+        replacement = UTS46_MAPPED.get(code)
+        if replacement is not None:
+            out.append(replacement)
+            continue
+        if _uts46_range_has(UTS46_IGNORED, code):
+            continue
+        if _uts46_range_has(UTS46_VALID, code) or code < 128:
+            out.append(char)
+            continue
+        return None
+    return unicodedata.normalize("NFC", "".join(out))
 
 
 def _idna2008_name(body: str) -> str:
     """IDNA2008 / UTS46 nontransitional, per label, the way Go's proxy encodes a name.
 
-    ``ß`` stays ``ß`` (``xn--fa-hia``), not ``ss``. ``ẞ`` lowercases to ``ß``, so it is the
-    same name. Final sigma ``ς`` stays distinct from ``σ``. This is the Go 1.22
-    ``ProxyFromEnvironment`` reading. IDNA2003 (``encode('idna')``) is kept as well.
-    The caller has already applied :func:`_uts46_map`.
+    ``ß`` stays ``ß`` (``xn--fa-hia``), not ``ss``. ``ẞ`` maps to ``ß``, so it is the
+    same name. Final sigma ``ς`` stays distinct from ``σ``. Cherokee U+13A0 stays
+    U+13A0 (``xn--58d``); it is not the Unicode lowercase U+AB70. This is the Go
+    lookup reading. IDNA2003 (``encode('idna')``) is kept as well. The caller has
+    already applied :func:`_uts46_map`, so this does not call ``str.lower``: that
+    would rewrite U+13A0.
     """
 
     labels = []
-    for label in body.lower().split("."):
+    for label in body.split("."):
         if not label:
             raise UnicodeError("empty label")
         text = unicodedata.normalize("NFC", label)
@@ -1006,7 +1045,15 @@ def _idna_forms(label: str) -> set[str] | None:
     The caller refuses: while a proxy is set, an entry that cannot be compared must not be kept.
     """
 
-    raw = _uts46_map(label).rstrip(".")
+    mapped = _uts46_map(label)
+    if mapped is None:
+        # No Go form. IDNA2003 may still encode the original; if it cannot, refuse.
+        try:
+            encoded = label.rstrip(".").encode("idna").decode("ascii").rstrip(".")
+        except UnicodeError:
+            return None
+        return {encoded} if encoded and encoded.strip(".") else None
+    raw = mapped.rstrip(".")
     # Empty, or only dots (``\u00ad``, ``。``, ``．``, ``｡``). Skipping these accepted a
     # bypass Go and, for a bare dot, requests and urllib still apply. None refuses.
     if not raw or not raw.strip("."):
@@ -1021,16 +1068,21 @@ def _idna_forms(label: str) -> set[str] | None:
     def _keep(text: str) -> str:
         return text.rstrip(".")
 
+    idna_ok = False
     try:
-        forms.add(_keep(body.lower().encode("idna").decode("ascii")))
-    except UnicodeError:
-        if nonascii:
-            return None
-    try:
-        forms.add(_keep(_idna2008_name(body)))
+        forms.add(_keep(body.encode("idna").decode("ascii")))
+        idna_ok = True
     except UnicodeError:
         pass
-    forms.add(_keep(body.lower()))
+    uts_ok = False
+    try:
+        forms.add(_keep(_idna2008_name(body)))
+        uts_ok = True
+    except UnicodeError:
+        pass
+    if nonascii and not idna_ok and not uts_ok:
+        return None
+    forms.add(_keep(body))
     if suffix:
         forms |= {"." + form for form in list(forms)}
     return {form for form in forms if form}
@@ -1121,6 +1173,22 @@ def _names_match(entry: str, host: str) -> bool:
     return False
 
 
+def _dot_only_entry(entry: str) -> bool:
+    """True for a non-empty dot-only name, with or without a trailing port (``.``, ``.:443``)."""
+
+    if entry.count(":") > 1:
+        return False
+    body = re.sub(r":[0-9]*$", "", entry.strip("[]"))
+    return bool(body) and not body.strip(".")
+
+
+def _trailing_dot_host(host: str) -> bool:
+    host = host.lower()
+    if len(host) >= 2 and host[0] == "[" and host[-1] == "]":
+        host = host[1:-1]
+    return host.endswith(".")
+
+
 def _no_proxy_bypass(value: str, hosts: tuple[str, ...]) -> str | None:
     """N5i: the union of curl, requests, hyper-util, undici, Go and Codex matchers.
 
@@ -1128,10 +1196,14 @@ def _no_proxy_bypass(value: str, hosts: tuple[str, ...]) -> str | None:
     matches an IP host it contains, including a requests shorthand (``10.0/8``), a permissive prefix
     (``+8``, a tab, ``8x``, and anything after those digits, so ``8/foo`` is 8), an IPv4-mapped route
     host, and an IPv4-mapped CIDR compared as IPv4
-    (Go: ``::ffff:10.0.0.0/104``). It does not match a domain name: none of those matchers resolve DNS.
+    (Go: ``::ffff:10.0.0.0/104``). requests' ``int()`` of the whole suffix is included, so
+    ``10.0.0.0/0_8``, ``/+0_8`` and a fullwidth ``8`` are ``/8``. ``/0x8/foo`` is not.
+    It does not match a domain name: none of those matchers resolve DNS.
     ``/0`` covers every IP of both families. A leading ``*.`` also matches the apex (Undici 7.30.1).
-    IDNA2003 and IDNA2008 spellings are compared. A plain suffix matches without a dot boundary, which is
-    what requests <=2.32.3 does. A NUL is ``value_malformed``. A CIDR prefix that cannot be read without
+    IDNA2003 and UTS46 (Unicode 15.1.0, nontransitional) spellings are compared. A plain suffix matches
+    without a dot boundary, which is what requests <=2.32.3 does. A non-empty dot-only entry (``.``,
+    ``.:443``) matches a host that still has its trailing dot; that comparison happens before the
+    trailing dot is stripped. A NUL is ``value_malformed``. A CIDR prefix that cannot be read without
     raising is ``no_proxy_malformed``.
     """
 
@@ -1159,6 +1231,11 @@ def _no_proxy_bypass(value: str, hosts: tuple[str, ...]) -> str | None:
             if _network_covers(network, checked):
                 return "no_proxy_engine_host"
             continue
+        # "." and ".:443" become empty once the trailing dot is stripped, and were skipped.
+        # urllib matches a trailing-dot host against "."; requests also matches ".:443"
+        # once the port is attached to that host. Judge this before the strip.
+        if _dot_only_entry(entry) and any(_trailing_dot_host(host) for host in hosts):
+            return "no_proxy_engine_host"
         entry = _normalize_no_proxy_entry(entry)
         if not entry:
             continue

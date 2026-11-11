@@ -975,6 +975,38 @@ class AuthRouteTests(unittest.TestCase):
         self.assertEqual("10.0.0.0/0x8/foo", launched({"NO_PROXY": "10.0.0.0/0x8/foo"}, ip)["NO_PROXY"])
         self.assertEqual(".*\u00ad", launched({"NO_PROXY": ".*\u00ad"}, gateway)["NO_PROXY"])
 
+        # Requests int() of the whole suffix: underscores, a sign, and Unicode decimal digits.
+        # 0x8/foo stays a non-match. A /8 of a different address does not cover 10.1.2.3.
+        for entry in ("10.0.0.0/0_8", "10.0.0.0/+0_8", "10.0.0.0/0\uff18"):
+            with self.subTest(entry=entry):
+                self.assertEqual("no_proxy_engine_host", policy._no_proxy_bypass(entry, ("10.1.2.3",)))
+                self.assertEqual(("NO_PROXY", "no_proxy_engine_host"), refused({"NO_PROXY": entry}, ip))
+        self.assertIsNone(policy._no_proxy_bypass("10.0.0.0/0x8/foo", ("10.1.2.3",)))
+        self.assertEqual("10.0.0.0/0x8/foo", launched({"NO_PROXY": "10.0.0.0/0x8/foo"}, ip)["NO_PROXY"])
+        self.assertEqual("192.168.0.0/0_8", launched({"NO_PROXY": "192.168.0.0/0_8"}, ip)["NO_PROXY"])
+
+        # UTS46 15.1.0, the Go nontransitional forms the NFKC map missed.
+        sharp_go = (
+            ("fa\u180f\u00df.invalid", "xn--fa-hia.invalid", sharp),
+            ("\u13a0.invalid", "xn--58d.invalid", ChildRoute(api_key=USER_KEY, base_url="https://xn--58d.invalid/api")),
+            ("\uab70.invalid", "xn--58d.invalid", ChildRoute(api_key=USER_KEY, base_url="https://xn--58d.invalid/api")),
+            ("\u1c80.invalid", "xn--b1a.invalid", ChildRoute(api_key=USER_KEY, base_url="https://xn--b1a.invalid/api")),
+        )
+        for entry, host, route in sharp_go:
+            with self.subTest(entry=entry):
+                self.assertEqual("no_proxy_engine_host", policy._no_proxy_bypass(entry, (host,)))
+                self.assertEqual(("NO_PROXY", "no_proxy_engine_host"), refused({"NO_PROXY": entry}, route))
+        self.assertEqual("\u13a0.invalid", launched({"NO_PROXY": "\u13a0.invalid"}, gateway)["NO_PROXY"])
+
+        # A dot-only entry matches a host that still has its trailing dot, including with a port.
+        dotted = ChildRoute(api_key=USER_KEY, base_url="https://gateway.invalid./api")
+        for entry in (".", ".:443", ".."):
+            with self.subTest(entry=entry):
+                self.assertEqual("no_proxy_engine_host", policy._no_proxy_bypass(entry, ("gateway.invalid.",)))
+                self.assertEqual(("NO_PROXY", "no_proxy_engine_host"), refused({"NO_PROXY": entry}, dotted))
+        self.assertIsNone(policy._no_proxy_bypass(".", ("gateway.invalid",)))
+        self.assertEqual(".", launched({"NO_PROXY": "."}, gateway)["NO_PROXY"])
+
         # C8. Twelve stars must not backtrack. The host is not a match, and the call returns.
         def _too_slow(signum, frame):
             raise AssertionError("wildcard match exceeded 1s")
@@ -1200,7 +1232,8 @@ class AuthRouteTests(unittest.TestCase):
         # Key custody: the caller fetches the key (OS keyring, or the owner-only file); this package is handed it.
         allowed = {"__future__", "fcntl", "ipaddress", "os", "re", "shutil", "socket", "stat", "subprocess", "tempfile",
                    "threading", "unicodedata", "collections.abc",
-                   "dataclasses", "pathlib", "types", "recursion_core.child_env.policy", "recursion_core.child_env.launch"}
+                   "dataclasses", "pathlib", "types", "recursion_core.child_env.policy", "recursion_core.child_env.launch",
+                   "recursion_core.child_env.uts46"}
         for module in (policy, launch):
             tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
             imported = {alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}

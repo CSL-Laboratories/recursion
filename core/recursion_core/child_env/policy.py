@@ -46,6 +46,8 @@ first-token guess let wrapped or renamed argv through). An unknown engine refuse
 
 POSIX only. On Windows the ownership checks the rules rely on do not exist here, so
 every call refuses (``platform_unsupported``) instead of passing values unchecked.
+The same holds for any build without ``os.geteuid``, and the owner helpers refuse
+(``owner_check_unsupported``, or a false owned-chain / private-dir result) there.
 
 Candidate code: no engine, provider or network is used, and nothing here claims the
 new core's runtime calls it yet.
@@ -325,7 +327,7 @@ def build_child_env(
     meets exactly the value, PATH, NO_PROXY and temp rules an inherited value meets.
     """
 
-    if os.name == "nt":
+    if not _posix_supported():
         raise EnvRefused(None, "platform_unsupported")
     profile = ENGINE_PROFILES.get(engine) if isinstance(engine, str) else None
     if profile is None:
@@ -535,6 +537,26 @@ def _unsafe_value(name: str, value: str) -> str | None:
     return None
 
 
+def _posix_supported() -> bool:
+    """False on Windows (``os.name == "nt"``) and on any build without ``os.geteuid``.
+
+    The public entry points refuse ``platform_unsupported`` there instead of raising ``AttributeError``.
+    """
+
+    return os.name != "nt" and hasattr(os, "geteuid")
+
+
+def _posix_euid() -> int | None:
+    """Effective uid where the POSIX owner checks can run, else None.
+
+    None is not a pass and not a stand-in for uid 0: callers refuse the path
+    (``owner_check_unsupported``, or a false owned-chain / private-dir result).
+    """
+
+    geteuid = getattr(os, "geteuid", None)
+    return None if geteuid is None else geteuid()
+
+
 def _resolve(path: str) -> tuple[str | None, bool, str | None]:
     """Resolve ``path`` one component at a time: (real path, leaf missing, cause).
 
@@ -548,7 +570,9 @@ def _resolve(path: str) -> tuple[str | None, bool, str | None]:
         return None, False, "value_relative"
     if _PERSPECTIVE.match(path):
         return None, False, "value_perspective"
-    euid, hops = os.geteuid(), 0
+    euid, hops = _posix_euid(), 0
+    if euid is None:
+        return None, False, "owner_check_unsupported"
     pending = list(reversed(Path(path).parts[1:]))
     current = "/"
     while pending:
@@ -596,7 +620,10 @@ def _unsafe_file(path: str) -> str | None:
     if missing:  # harmless only where no one else can create it
         return None if _owned_chain(_existing_ancestor(real)) else "value_missing"
     st = os.stat(real)
-    if not stat.S_ISREG(st.st_mode) or st.st_uid not in (0, os.geteuid()) or st.st_mode & 0o022:
+    euid = _posix_euid()
+    if euid is None:
+        return "owner_check_unsupported"
+    if not stat.S_ISREG(st.st_mode) or st.st_uid not in (0, euid) or st.st_mode & 0o022:
         return "value_file_unsafe"
     return None if _owned_chain(os.path.dirname(real)) else "value_chain_unsafe"
 
@@ -679,7 +706,9 @@ def _owned_chain(path: str) -> bool:
     rename the entry (OpenSSH ``safe_path``). Same rule as the Nov 5 tree's ``transport._owned_chain``.
     """
 
-    euid, parts = os.geteuid(), Path(path).parts
+    euid, parts = _posix_euid(), Path(path).parts
+    if euid is None:
+        return False
     try:
         for i in range(1, len(parts) + 1):
             st = os.lstat(os.path.join(*parts[:i]))
@@ -727,7 +756,10 @@ def _private_dir(path: str | None) -> bool:
         return False
     # The home is ours and 0700. Its parents follow the chain rule on the resolved path, so an accepted link
     # above it (macOS /var -> private/var) is fine, and a root sticky /tmp above it is fine.
-    return stat.S_ISDIR(st.st_mode) and st.st_uid == os.geteuid() and not st.st_mode & 0o077 and _owned_chain(real)
+    euid = _posix_euid()
+    if euid is None:
+        return False
+    return stat.S_ISDIR(st.st_mode) and st.st_uid == euid and not st.st_mode & 0o077 and _owned_chain(real)
 
 
 _TMP: dict[int, str] = {}
@@ -768,7 +800,10 @@ def _route_tmp() -> str:
             st = os.lstat(path) if path else None
         except OSError:
             st = None
-        if (st is None or not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077
+        euid = _posix_euid()
+        if euid is None:
+            raise EnvRefused("TMPDIR", "tmp_root_unsafe")
+        if (st is None or not stat.S_ISDIR(st.st_mode) or st.st_uid != euid or st.st_mode & 0o077
                 or not _owned_chain(path)):
             path = _TMP[key] = _make_route_tmp()
         return path

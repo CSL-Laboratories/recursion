@@ -195,9 +195,14 @@ jobs:
         if: github.event_name == 'pull_request' || github.event_name == 'push'
         timeout-minutes: 1
         continue-on-error: true
+        # Owner call Nov 11 2:20am PST (CSL-738): push runs on the Nov 11
+        # candidate branch compare perf against master a70e9e40, not the
+        # previous push. Every other event and branch keeps the usual base.
         env:
-          CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-        run: timeout 55 python -X utf8 -B tools/perf_ci.py || echo "::warning::Performance measurement failed, timed out, or is unavailable"
+          CI_BASE_SHA: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/csl-nov11-integrated-candidate-20261110') && 'a70e9e40b85151da66b5e2ddb684929bf351c3f2' || github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          echo "perf base: $CI_BASE_SHA"
+          timeout 55 python -X utf8 -B tools/perf_ci.py || echo "::warning::Performance measurement failed, timed out, or is unavailable"
 
       - name: Warn if performance measurement failed
         if: always() && steps.perf.outcome == 'failure'

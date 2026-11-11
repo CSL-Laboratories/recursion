@@ -356,6 +356,27 @@ class WorkflowShapeTests(unittest.TestCase):
             if line.lstrip().startswith("run:"):
                 self.assertNotIn("${{", line, "expressions reach shells via env, not interpolation")
 
+    def test_perf_base_pin_is_scoped_to_the_candidate_push(self) -> None:
+        # Owner call Nov 11 2:20am PST (CSL-738): only push runs on the candidate branch
+        # compare perf against master a70e9e40; everything else keeps the usual base.
+        usual = "github.event.pull_request.base.sha || github.event.before"
+        pin = "a70e9e40b85151da66b5e2ddb684929bf351c3f2"
+        scope = "(github.event_name == 'push' && github.ref == 'refs/heads/csl-nov11-integrated-candidate-20261110')"
+        tests = job_block("linux-tests")
+        perf = step_block(tests, "Performance regression check")
+        self.assertEqual(step_env(perf), {"CI_BASE_SHA": f"${{{{ {scope} && '{pin}' || {usual} }}}}"})
+        self.assertEqual(step_run(perf), (
+            'echo "perf base: $CI_BASE_SHA"\n'
+            'timeout 55 python -X utf8 -B tools/perf_ci.py || '
+            'echo "::warning::Performance measurement failed, timed out, or is unavailable"\n'
+        ))
+        self.assertEqual(step_env(step_block(tests, "Provider-free gate")), {"CI_BASE_SHA": f"${{{{ {usual} }}}}"})
+        # The pin and the branch ref appear nowhere but in the perf step's base.
+        code = "\n".join(line for line in TEXT.splitlines() if not line.lstrip().startswith("#"))
+        self.assertEqual(code.count(pin), 1)
+        self.assertEqual(code.count("github.ref == "), 1)
+        self.assertEqual(code.count(f"${{{{ {usual} }}}}"), 3)
+
     def test_full_matrix_pip_matches_ci_isolation(self) -> None:
         matrix = (ROOT / ".github" / "workflows" / "ci-full-matrix.yml").read_text(encoding="utf-8")
         pip = 'python -P -m pip install --only-binary=:all: -r "$REQUIREMENTS_CI"'

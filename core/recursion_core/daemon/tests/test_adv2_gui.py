@@ -303,10 +303,11 @@ class Adv2RenderingTests(GuiCase):
             page = self.get(gui, '/panel?id=adv2.kalshi')[1]
         self.assertNotIn('LEAK-OTHER-VENUE-ROW', page)
         self.assertIn("withheld by this panel&#x27;s venue filter", page)
-        own = {'venue': 'kalshi', 'status_code': 'ok', 'result': {'symbol': 'OWN'}}
-        with self.gui_for(own) as gui:
-            page = self.get(gui, '/panel?id=adv2.kalshi')[1]
-        self.assertIn('<strong>ok</strong>', page)  # kept by the filter: an answer labelled with the panel's venue
+        for status in ('ok', 'refused'):  # O7's fixed status strings stay visible on a venue panel (3.5)
+            answer = {'status_code': status, 'result': {'positions': [{'venue': 'other', 'symbol': 'x'}]}}
+            with self.gui_for(answer) as gui:
+                page = self.get(gui, '/panel?id=adv2.kalshi')[1]
+            self.assertIn('<strong>%s</strong>' % status, page)
 
     def test_a_huge_answer_is_rendered_whole(self):
         # No size bound on an O7 answer: observed, not a refusal. 2 MB in, more than 2 MB out.

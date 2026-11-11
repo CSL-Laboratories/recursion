@@ -57,6 +57,9 @@ _VISIBILITY = (
     ("reconciliation", ("reconciled", "unreconciled_visible")),
 )
 _VISIBILITY_KEYS = frozenset(k for k, _ in _VISIBILITY)
+# The status_code values of O7's oracle responses (tests/fixtures/o7-responses.json, from the same
+# draft). Not checked against the schema's enum; any other status text is not shown on a venue panel.
+_O7_STATUS = frozenset({"ok", "refused", "stale_or_unreconciled", "unavailable"})
 # Codes the client raises before anything is sent; every other failure is after sending.
 _REFUSED_BEFORE_SENDING = frozenset({"command_not_in_operator_contract", "confirmation_required"})
 _LABELS = {
@@ -273,13 +276,17 @@ class Application:
         return "<pre>%s</pre>" % escape(json.dumps(shown, indent=2, sort_keys=True))
 
     def _o7_view(self, command: str, data: dict, shown: object = None) -> str:
-        # A venue panel prints only what the venue filter kept: status_code is not one of its
-        # response-level exceptions, so it is read from the filtered view (ADV2-10).
-        source = data if shown is None else shown
-        status = source.get("status_code") if isinstance(source, dict) else None
-        if type(status) is not str:
-            status = ("not reported" if shown is None or "status_code" not in data
-                      else "withheld by this panel's venue filter")
+        status = data.get("status_code") if type(data.get("status_code")) is str else "not reported"
+        if shown is not None:
+            # A venue panel prints the response's own text only where the venue filter kept it.
+            # status_code is not one of the filter's response-level exceptions (ADV2-10), so an
+            # unfiltered status is shown only as one of the fixed O7 status strings, like the
+            # visibility block; any other text is withheld, never echoed.
+            kept = shown.get("status_code") if isinstance(shown, dict) else None
+            if type(kept) is str:
+                status = kept
+            elif status != "not reported" and status not in _O7_STATUS:
+                status = "withheld by this panel's venue filter"
         result = data.get("result") if type(data.get("result")) is dict else {}
         warn = ""
         if result.get("order_submitted") is not False and command in ACTIONS:

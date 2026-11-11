@@ -215,6 +215,23 @@ Cursor: `[v]YYYY.M.D[-HH-MM-SS][-<hex commit>]`, compared numerically as
 unparsed. Real-shape lines covered: `2.1.318 (Claude Code)`, `codex-cli 0.160.0`,
 `opencode v2.2.5`, `2026.10.01-e373342`, `hermes-acp 0.9.1`.
 
+Hermes detector (B27, CSL-772): the unofficial npm `hermes-agent` bridge (0.23.0, bins `hermes`,
+`hermes-npm`, `hermes-agent` as `bin/*.js` under node) is not upstream Hermes. `detect()` names it
+(a `node_modules/hermes-agent/` segment or a `package.json` named `hermes-agent` in any ancestor
+directory, checked on the path as written, after each symlink hop and on the realpath, so an
+`npm link`ed or `npm install -g <folder>` root and a native outside `bin/` are caught too),
+reports it in the detection note, and gives it no candidate even if a native file sat in its tree.
+`grant()` and `verify()` apply the same rule to the `hermes` path (`wrapper_refused` before anything
+is hashed, looked up in the pin table or run), so a configured path cannot get past detection.
+Hermes is a pinned route (see [Pinned routes](#pinned-routes)), and the rule comes first on every
+path that route has: a bare or `.exe` launcher, a Windows `hermes.cmd` or `hermes.ps1`, and a
+check-only launcher. A pin whose tree is inside the bridge is refused the same way at grant time
+and on every plan use, once the pin has matched and before the grant is issued, so no pin can
+bless the bridge. The `hermes-acp` version read is used by no row now; the rule still guards it
+for a row with a `probe_name`. `package.json` is read only if it is a regular file (opened
+non-blocking). Nothing is executed. A `hermes` outside the bridge is still judged by the pin rules
+below; this adds a named refusal reason, not a new refusal code.
+
 The `beta` field is `true` exactly when no functional floor is set; Claude Code (2.1.314,
 not yet measured, CX-956) therefore shows `beta: false`. What `beta` should mean is open
 for Lucas.

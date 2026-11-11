@@ -70,6 +70,7 @@ from recursion_core.launch_check import binary, floors, pins
 from recursion_core.launch_check.binary import (
     HEX64, PINNED_LAUNCHER_EXT, WRAPPER_EXT, file_kind, is_wrapper_name, sha256_file, stem,
 )
+from recursion_core.launch_check.detect import NPM_HERMES_PACKAGE, npm_hermes_agent_root
 from recursion_core.launch_check.floors import (
     EngineSpec, check_floors, check_identity, check_self_named, other_engine_named, parse_version, spec_for,
     with_note,
@@ -139,6 +140,7 @@ def _realpath_native(spec: EngineSpec, path: str, what: str) -> str:
     real = os.path.realpath(path)
     if is_wrapper_name(real):
         raise LaunchRefused("wrapper_refused", spec.engine, f"{what} resolves to a wrapper name: {os.path.basename(real)}")
+    _refuse_npm_hermes_bridge(spec, path, what)
     try:
         kind = file_kind(real)
     except OSError as e:
@@ -148,6 +150,27 @@ def _realpath_native(spec: EngineSpec, path: str, what: str) -> str:
     if not os.access(real, os.X_OK):
         raise LaunchRefused("binary_missing", spec.engine, f"{what} is not executable")
     return real
+
+
+def _refuse_npm_hermes_bridge(spec: EngineSpec, path: str, what: str) -> None:
+    """B27 (CSL-772): no file inside the unofficial npm hermes-agent tree is granted, probed or launched.
+
+    ``path`` is the configured path, not its realpath, so each symlink hop is judged too.
+    """
+    if spec.engine != "hermes":
+        return
+    bridge = npm_hermes_agent_root(path)
+    if bridge is not None:
+        raise LaunchRefused(
+            "wrapper_refused", spec.engine,
+            f"{what} is in the npm {NPM_HERMES_PACKAGE} bridge at {bridge} (unofficial, not upstream Hermes)",
+        )
+
+
+def _refuse_npm_hermes_bridge_target(spec: EngineSpec, kind: str, target: str) -> None:
+    """B27 for what a pinned route would execute: the pinned tree (any file in it) or binary is not in the bridge."""
+    inner = os.path.join(target, "package.json") if kind == "launcher+tree" else target
+    _refuse_npm_hermes_bridge(spec, inner, "pinned target")
 
 
 def _hash(spec: EngineSpec, real: str) -> tuple[str, int]:
@@ -244,11 +267,13 @@ def _grant_pinned(spec: EngineSpec, path: str) -> Grant:
     """A pinned route: the launcher and its tree or binary must match a pin. Nothing is run."""
     if not os.path.lexists(path) or not os.path.isfile(path):
         raise LaunchRefused("binary_missing", spec.engine, f"grant path absent: {path}")
+    _refuse_npm_hermes_bridge(spec, path, "grant path")  # B27: before any hashing or pin lookup
     real = os.path.realpath(path)
     if not os.access(real, os.X_OK):
         raise LaunchRefused("binary_missing", spec.engine, "grant path is not executable")
     digest, size = _hash(spec, real)
     found = pins.match(spec.engine, spec.pin, real, digest, spec.note)
+    _refuse_npm_hermes_bridge_target(spec, spec.pin, found.target)
     parsed = parse_version(spec.scheme, found.pin.version)
     if parsed is None:  # table bug: fail closed
         raise LaunchRefused("pin_mismatch", spec.engine, f"pin version {found.pin.version!r} does not parse")
@@ -343,6 +368,7 @@ def verify(g: Grant) -> None:
             raise LaunchRefused("binary_missing", spec.engine, path)
         if os.path.realpath(path) != real:
             raise LaunchRefused("binary_changed", spec.engine, f"{path} now resolves elsewhere")
+        _refuse_npm_hermes_bridge(spec, path, path)
         if not os.access(real, os.X_OK):  # exec bit removed after the grant: refuse here, not at spawn
             raise LaunchRefused("binary_missing", spec.engine, f"{real} is not executable")
         if _hash(spec, real)[0] != digest:
@@ -350,6 +376,7 @@ def verify(g: Grant) -> None:
     if g.pin_kind and g.pin_target != g.realpath:  # the pinned tree or binary behind the launcher
         if os.path.realpath(g.pin_target) != g.pin_target:
             raise LaunchRefused("binary_changed", spec.engine, f"{g.pin_target} now resolves elsewhere")
+        _refuse_npm_hermes_bridge_target(spec, g.pin_kind, g.pin_target)
         try:
             digest = pins.target_sha256(g.pin_kind, g.pin_target)
         except (OSError, ValueError) as e:

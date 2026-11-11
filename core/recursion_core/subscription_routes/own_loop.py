@@ -39,6 +39,7 @@ import platform
 import re
 import selectors
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -473,7 +474,9 @@ def _other_threads() -> bool:
     A lock another thread holds is never released in the child, so the probe deadlocks. The
     callable is an arbitrary closure and cannot be sent to a forkserver. When ``/proc/self/task``
     exists but cannot be listed, a native thread may be hidden, so that is treated as another
-    thread. The "no native threads" fallback is only for a missing ``/proc``.
+    thread. ``os.path.isdir`` turns a ``stat`` error into "not a directory", so the check uses
+    ``os.stat``: ``FileNotFoundError`` is a missing ``/proc``, and any other ``OSError`` is
+    another thread.
     """
 
     current = threading.current_thread()
@@ -482,14 +485,19 @@ def _other_threads() -> bool:
     if len(sys._current_frames()) > 1:
         return True
     task_dir = "/proc/self/task"
-    if os.path.isdir(task_dir):
-        try:
-            tasks = os.listdir(task_dir)
-        except OSError:
-            return True
-        if len(tasks) > 1:
-            return True
-    return False
+    try:
+        info = os.stat(task_dir)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    if not stat.S_ISDIR(info.st_mode):
+        return False
+    try:
+        tasks = os.listdir(task_dir)
+    except OSError:
+        return True
+    return len(tasks) > 1
 
 
 def _probe_login(probe: Callable[[], bool], deadline: float, env: Mapping[str, str] | None = None) -> bool:
@@ -694,8 +702,9 @@ def _probe_login_group(
     ``KeyboardInterrupt`` raised after ``fork`` has returned that pid. No other child is
     signalled. ``SIGINT`` and ``SIGCHLD`` are blocked from before ``fork`` until after the
     group is signalled and the worker is reaped, then the caller's mask is restored with
-    ``SIG_SETMASK``. A failed restore refuses ``probe unenforceable`` after cleanup.
-    ``SIGCHLD`` ignored refuses before ``fork``. The pidfd is opened and
+    ``SIG_SETMASK``. A failed restore refuses ``probe unenforceable`` after cleanup, including
+    when cleanup raises ``KeyboardInterrupt``. ``SIGCHLD`` ignored refuses before ``fork``.
+    The pidfd is opened and
     stored while that mask is held, and it stays open until after the last signal.
     """
 
@@ -768,9 +777,15 @@ def _probe_login_group(
         except BaseException as exc:
             outcome["error"] = exc
     finally:
+        # A KeyboardInterrupt from cleanup must not skip the mask restore. The failure is
+        # recorded here, before that interrupt is raised again.
+        stop_exc: BaseException | None = None
         try:
             wait_bad = _stop_probe(pid, pgid, started, deadline, pidfd)
-        finally:
+        except BaseException as exc:
+            stop_exc = exc
+        mask_lost = False
+        try:
             if selector is not None:
                 selector.close()
             for fd in (status_r, status_w, ack_r, ack_w):
@@ -780,19 +795,32 @@ def _probe_login_group(
                 _close_fd(pidfd)
             if pid is not None:
                 wait_bad = _reap_probe(pid) or wait_bad
+        except BaseException as exc:
+            if stop_exc is None:
+                stop_exc = exc
+        finally:
             if old_mask is not None:
                 try:
                     signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
                 except OSError:
-                    # The caller's SIGINT and SIGCHLD may still be blocked. A T line is not a login.
-                    if not isinstance(outcome.get("error"), (KeyboardInterrupt, SystemExit)):
-                        wait_bad = True
-        if wait_bad and not isinstance(outcome.get("error"), (KeyboardInterrupt, SystemExit)):
+                    mask_lost = True
+        if mask_lost:
+            # SIGINT and SIGCHLD may still be blocked. That outranks the interrupt.
             outcome.pop("error", None)
             outcome.pop("line", None)
             outcome["refused"] = OwnLoopRouteRefused(
                 "copilot", "copilot_login_unknown", "probe unenforceable",
             )
+        elif isinstance(stop_exc, (KeyboardInterrupt, SystemExit)):
+            raise stop_exc
+        elif wait_bad and not isinstance(outcome.get("error"), (KeyboardInterrupt, SystemExit)):
+            outcome.pop("error", None)
+            outcome.pop("line", None)
+            outcome["refused"] = OwnLoopRouteRefused(
+                "copilot", "copilot_login_unknown", "probe unenforceable",
+            )
+        elif stop_exc is not None:
+            raise stop_exc
     return _finish_probe(outcome)
 
 

@@ -125,14 +125,24 @@ class SigactionAbiTests(unittest.TestCase):
             self.assertFalse(stored_result.errors)
 
     def test_an_unlistable_task_dir_is_another_thread(self) -> None:
+        import stat as stat_mode
+
+        directory = mock.Mock(st_mode=stat_mode.S_IFDIR)
+        frames = {1: None}
         with mock.patch.object(own_loop.threading, "enumerate", return_value=[threading.current_thread()]), \
-                mock.patch.object(own_loop.sys, "_current_frames", return_value={1: None}), \
-                mock.patch.object(own_loop.os.path, "isdir", return_value=True), \
+                mock.patch.object(own_loop.sys, "_current_frames", return_value=frames), \
+                mock.patch.object(own_loop.os, "stat", return_value=directory), \
                 mock.patch.object(own_loop.os, "listdir", side_effect=PermissionError("task")):
             self.assertTrue(own_loop._other_threads())
         with mock.patch.object(own_loop.threading, "enumerate", return_value=[threading.current_thread()]), \
-                mock.patch.object(own_loop.sys, "_current_frames", return_value={1: None}), \
-                mock.patch.object(own_loop.os.path, "isdir", return_value=False):
+                mock.patch.object(own_loop.sys, "_current_frames", return_value=frames), \
+                mock.patch.object(own_loop.os, "stat", side_effect=PermissionError("task")) as stat_call, \
+                mock.patch.object(own_loop.os, "listdir", side_effect=AssertionError("listdir")):
+            self.assertTrue(own_loop._other_threads())
+            stat_call.assert_called()
+        with mock.patch.object(own_loop.threading, "enumerate", return_value=[threading.current_thread()]), \
+                mock.patch.object(own_loop.sys, "_current_frames", return_value=frames), \
+                mock.patch.object(own_loop.os, "stat", side_effect=FileNotFoundError("task")):
             self.assertFalse(own_loop._other_threads())
 
     def test_a_failed_mask_restore_refuses_a_login_line(self) -> None:
@@ -153,7 +163,7 @@ class SigactionAbiTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(own_loop.os, "set_inheritable"))
             stack.enter_context(mock.patch.object(own_loop.os, "set_blocking"))
             stack.enter_context(mock.patch.object(own_loop.os, "fork", return_value=123))
-            stack.enter_context(mock.patch.object(own_loop.os, "pidfd_open", return_value=14))
+            stack.enter_context(mock.patch.object(own_loop.os, "pidfd_open", return_value=14, create=True))
             stack.enter_context(mock.patch.object(own_loop.selectors, "DefaultSelector"))
             stack.enter_context(mock.patch.object(
                 own_loop.signal, "pthread_sigmask", side_effect=[set(), OSError("restore failed")],
@@ -162,6 +172,40 @@ class SigactionAbiTests(unittest.TestCase):
                 own_loop._probe_login_group(lambda: True, 1, None)
         self.assertEqual(caught.exception.cause, "copilot_login_unknown")
         self.assertEqual(caught.exception.detail, "probe unenforceable")
+
+    def test_a_failed_mask_restore_outranks_a_cleanup_interrupt(self) -> None:
+        calls: list[int] = []
+
+        def sigmask(how: int, mask: set[int]) -> set[int]:
+            calls.append(how)
+            if len(calls) == 1:
+                return set()
+            raise OSError("restore failed")
+
+        with ExitStack() as stack:
+            def patch(name: str, **kwargs: object) -> None:
+                stack.enter_context(mock.patch.object(own_loop, name, **kwargs))
+
+            patch("_sigchld_auto_reaps", return_value=False)
+            patch("_other_threads", return_value=False)
+            patch("_read_handshake", return_value=(123, "ok"))
+            patch("_leader_state", return_value="running")
+            patch("_write_ack")
+            patch("_read_status", return_value=(b"T", True, False))
+            patch("_stop_probe", side_effect=KeyboardInterrupt)
+            patch("_reap_probe", return_value=False)
+            patch("_close_fd")
+            stack.enter_context(mock.patch.object(own_loop.os, "pipe", side_effect=[(10, 11), (12, 13)]))
+            stack.enter_context(mock.patch.object(own_loop.os, "set_inheritable"))
+            stack.enter_context(mock.patch.object(own_loop.os, "set_blocking"))
+            stack.enter_context(mock.patch.object(own_loop.os, "fork", return_value=123))
+            stack.enter_context(mock.patch.object(own_loop.os, "pidfd_open", return_value=14, create=True))
+            stack.enter_context(mock.patch.object(own_loop.selectors, "DefaultSelector"))
+            stack.enter_context(mock.patch.object(own_loop.signal, "pthread_sigmask", side_effect=sigmask))
+            with self.assertRaises(OwnLoopRouteRefused) as caught:
+                own_loop._probe_login_group(lambda: True, 1, None)
+        self.assertEqual(caught.exception.detail, "probe unenforceable")
+        self.assertEqual(calls, [signal.SIG_BLOCK, signal.SIG_SETMASK])
 
     def test_write_sigaction_skips_before_it_loads_libc(self) -> None:
         def cdll(*_args: object, **_kwargs: object) -> None:
@@ -1095,10 +1139,12 @@ class NousTests(unittest.TestCase):
             "GIT_CONFIG_PARAMETERS",
         )
         env = {**BASE, **{name: secret for name in names}}
-        for check in (
-            lambda: check_copilot_own_loop(copilot(), env, home=_route_home(), has_copilot_login=lambda: True),
-            lambda: check_nous_own_loop(nous(), env),
-        ):
+        checks = [lambda: check_nous_own_loop(nous(), env)]
+        if own_loop._probe_enforceable():
+            checks.insert(0, lambda: check_copilot_own_loop(
+                copilot(), env, home=_route_home(), has_copilot_login=lambda: True,
+            ))
+        for check in checks:
             with self.subTest(check=check):
                 decision = check()
                 self.assertEqual(dict(decision.child_env), BASE)

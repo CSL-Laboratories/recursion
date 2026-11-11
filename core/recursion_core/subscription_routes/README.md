@@ -148,8 +148,9 @@ PRODUCT.md `055cc7a5` section 3.3. `own_loop.py`, checked before any spawn or re
   would need a different product API. The callable is not picklable, so there is no forkserver.
   Where another thread is already alive, the route refuses `probe threaded` and does not fork.
   That includes a `threading` thread, a thread started with `_thread`, and any extra native thread
-  in `/proc/self/task`. When that directory exists but cannot be listed, the route refuses the
-  same way: a hidden native thread must not be treated as absent. A lock that thread holds is
+  in `/proc/self/task`. When that directory exists but cannot be listed, or `stat` fails with
+  anything other than a missing `/proc`, the route refuses the same way: a hidden native thread
+  must not be treated as absent. A lock that thread holds is
   never released in the child. A thread started
   in the gap before `fork` is still a race. `home` is required (`route_home_missing` otherwise):
   a probe without it would approve the ambient account. Where `fork`, `setsid`, `killpg`, `pidfd_open`, `pidfd_send_signal` and `waitid(P_PIDFD)` exist,
@@ -159,7 +160,8 @@ PRODUCT.md `055cc7a5` section 3.3. `own_loop.py`, checked before any spawn or re
   otherwise the libc function. The parent blocks SIGINT and SIGCHLD from before `fork` until
   after the group is signalled and the direct child is reaped, then restores the previous mask
   with `SIG_SETMASK`. If that restore fails, the probe refuses `probe unenforceable` after
-  cleanup, including when the child reported a login. A signal the caller had already blocked
+  cleanup, including when the child reported a login and when cleanup raises
+  `KeyboardInterrupt`. A signal the caller had already blocked
   stays blocked. SIGINT stays
   blocked across `pidfd_open` and the store of that fd. Before `fork`, and only on Linux LP64
   x86_64 or aarch64 with glibc or musl, the probe reads the real `SIGCHLD` disposition with

@@ -109,18 +109,78 @@ class StopTruthTest(unittest.TestCase):
         self.assertEqual(answer['code'], 'pending', answer)
         self.assertNotEqual(answer.get('state'), 'stopped', answer)
 
-    @unittest.expectedFailure  # ADV1-1
+    def forgotten(self):
+        """A manager that no longer knows the unit: stop says "not loaded", show says not-found."""
+        return ScriptedManager(self.root, show(LoadState='not-found', ActiveState='inactive', SubState='dead',
+                                               ControlGroup='', InvocationID='', MainPID='0',
+                                               ExecMainStartTimestampMonotonic='0'), stop='not_loaded')
+
     def test_unit_forgotten_by_the_manager_while_its_cgroup_still_holds_a_process_is_not_stopped(self):
-        """ADV1-1: "not loaded" + "not-found" is attested as terminated without reading the recorded cgroup."""
+        """ADV1-1 (fixed): "not loaded" + "not-found" is not an end while the recorded cgroup holds a process."""
         proc = self.victim()
         self.cgroup(GROUP, [proc.pid])
-        manager = ScriptedManager(self.root, show(LoadState='not-found', ActiveState='inactive', SubState='dead',
-                                                  ControlGroup='', InvocationID='', MainPID='0',
-                                                  ExecMainStartTimestampMonotonic='0'), stop='not_loaded')
-        api, _ = self.api(manager)
+        api, daemon = self.api(self.forgotten())
         answer = api.call('run.stop', {'run_id': 'run-x'})
         self.assertIsNone(proc.poll(), 'the process in the recorded cgroup is alive')
         self.assertNotStopped(answer)
+        self.assertEqual(answer.get('reason'), 'cgroup_populated', answer)
+        row = daemon.registry.get('run-x')
+        self.assertEqual((row.state, row.detail), ('stopping', 'unit gone; the recorded cgroup still holds a process'))
+        # A child cgroup of the recorded one counts too, and so does a walk that cannot be finished.
+        self.cgroup(GROUP, [])
+        self.cgroup(GROUP + '/sub', [proc.pid])
+        self.assertNotStopped(api.call('run.stop', {'run_id': 'run-x'}))
+        os.symlink(self.root, self.root / GROUP.lstrip('/') / 'loop')
+        self.assertNotStopped(api.call('run.stop', {'run_id': 'run-x'}))
+
+    def test_unit_forgotten_by_the_manager_is_stopped_only_from_its_recorded_cgroup(self):
+        """ADV1-1 (fixed): the attestation comes from the recorded cgroup being absent or empty."""
+        for name in ('absent', 'empty', 'dead_pid'):
+            with self.subTest(case=name):
+                if name == 'empty':
+                    self.cgroup(GROUP, [])
+                elif name == 'dead_pid':
+                    proc = self.victim()
+                    proc.kill()
+                    proc.wait()
+                    self.cgroup(GROUP, [proc.pid], populated=0)
+                api, daemon = self.api(self.forgotten())
+                answer = api.call('run.stop', {'run_id': 'run-x'})
+                self.assertEqual((answer['code'], answer['state']), ('stopped', 'stopped'), answer)
+                self.assertEqual(daemon.registry.get('run-x').state, 'terminated')
+                daemon.close()
+                shutil.rmtree(self.tmp / 'state')
+                shutil.rmtree(self.root, True)
+
+    def test_a_live_recorded_cgroup_is_killed_through_the_cgroup_and_stays_pending_until_empty(self):
+        """ADV1-1 (fixed): the kill goes to the recorded cgroup's cgroup.kill; only an empty re-read is an end."""
+        proc = self.victim()
+        directory = self.cgroup(GROUP, [proc.pid])
+        (directory / 'cgroup.kill').write_text('')  # a plain file here: the write lands, nothing dies
+        manager = self.forgotten()
+        manager.recorded_kill_wait_s = 0.2
+        api, _ = self.api(manager)
+        self.assertNotStopped(api.call('run.stop', {'run_id': 'run-x'}))
+        self.assertEqual((directory / 'cgroup.kill').read_text(), '1')
+        self.assertIsNone(proc.poll())
+        # Without cgroup.kill the pids are signalled one by one, but only a pid /proc places in that cgroup:
+        # this one is in the test's own cgroup, so it is left alone and the Stop stays pending.
+        (directory / 'cgroup.kill').unlink()
+        self.assertNotStopped(api.call('run.stop', {'run_id': 'run-x'}))
+        self.assertIsNone(proc.poll())
+        self.assertFalse(manager._kill_member(proc.pid, GROUP))
+        # Once the cgroup reads empty the same Stop is attested.
+        proc.kill()
+        proc.wait()
+        self.cgroup(GROUP, [])
+        self.assertEqual(api.call('run.stop', {'run_id': 'run-x'})['code'], 'stopped')
+
+    def test_a_recorded_cgroup_that_does_not_name_the_unit_is_never_walked_or_killed(self):
+        manager = self.forgotten()
+        for group in ('/app.slice/other.service', '/app.slice/../' + UNIT, 'app.slice/' + UNIT, '', None,
+                      '/app.slice/' + UNIT + '/child'):
+            self.assertIsNone(manager.recorded_cgroup_clear(UNIT, group), group)
+        self.assertIsNone(manager.recorded_cgroup_clear('sshd.service', '/system.slice/sshd.service'))
 
     def test_systemctl_that_hangs_fails_or_is_missing_never_yields_stopped(self):
         for mode in ('hang', 1, 3, 143, 'oserror'):

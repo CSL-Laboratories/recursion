@@ -139,6 +139,16 @@ class RealManagerAttackTest(unittest.TestCase):
             time.sleep(0.05)
         self.fail(f'{path} never written')
 
+    def test_a_recorded_cgroup_is_killed_through_the_cgroup_without_the_manager(self):
+        """ADV1-1 (fixed): the kill a forgotten unit gets. No systemctl stop is sent here."""
+        run_id = 'run-adv1kill%d' % os.getpid()
+        unit, group, main = self.launch(run_id, [sys.executable, '-I', '-c', 'import time; time.sleep(300)'])
+        self.assertTrue(alive(main))
+        self.assertIsNone(self.manager.recorded_cgroup_clear(unit, group + '-other'))
+        self.assertTrue(alive(main))
+        self.assertIs(self.manager.recorded_cgroup_clear(unit, group), True)
+        self.assertFalse(alive(main))
+
     @unittest.expectedFailure  # ADV1-2
     def test_a_descendant_that_moves_out_of_the_unit_cgroup_outlives_an_attested_stop(self):
         """ADV1-2: same-uid engine, operator-owned user-manager subtree: one cgroup.procs write escapes Stop."""
